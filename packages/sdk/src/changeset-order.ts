@@ -4,6 +4,8 @@ export const CHANGESET_ORDER_TABLE = "__fsqlite_changeset_order";
 export const CHANGESET_ORDER_HEAD_TABLE = "__fsqlite_changeset_order_head";
 const TABLE = `main."${CHANGESET_ORDER_TABLE}"`;
 const HEAD = `main."${CHANGESET_ORDER_HEAD_TABLE}"`;
+const RETENTION_NAME = "__fsqlite_changeset_order_retention";
+const RETENTION = `main."${RETENTION_NAME}"`;
 const NAMES = ["seq", "receiver_id", "source_id", "delivery_id", "sha256", "byte_length", "applied", "omitted"];
 const TYPES = ["INTEGER", "TEXT", "TEXT", "TEXT", "TEXT", "INTEGER", "INTEGER", "INTEGER"];
 const ZERO_HASH = "0".repeat(64);
@@ -59,7 +61,7 @@ export class ChangesetOrderError extends Error {
       "ERR_FSQLITE_ORDER_BINDING" | "ERR_FSQLITE_ORDER_GAP" |
       "ERR_FSQLITE_ORDER_REUSE" | "ERR_FSQLITE_ORDER_FULL" |
       "ERR_FSQLITE_ORDER_BUSY" | "ERR_FSQLITE_ORDER_CANCELLED" |
-      "ERR_FSQLITE_ORDER_TIMEOUT",
+      "ERR_FSQLITE_ORDER_TIMEOUT" | "ERR_FSQLITE_ORDER_EXPIRED",
     message: string,
   ) {
     super(message);
@@ -184,16 +186,16 @@ async function ensure(tx: ChangesetExecutor): Promise<boolean> {
   }
   return true;
 }
-async function ensureHead(tx: ChangesetExecutor): Promise<boolean> {
-  const objects = await query(tx, "SELECT type FROM main.sqlite_schema WHERE name=? COLLATE NOCASE", [CHANGESET_ORDER_HEAD_TABLE]);
+async function ensureHead(tx: ChangesetExecutor, tableName = CHANGESET_ORDER_HEAD_TABLE): Promise<boolean> {
+  const objects = await query(tx, "SELECT type FROM main.sqlite_schema WHERE name=? COLLATE NOCASE", [tableName]);
   if (!objects.length) return false;
   if (objects.length !== 1 || objects[0]![0] !== "table")
     fail("ERR_FSQLITE_ORDER_SCHEMA", "The order head must be an ordinary table");
-  const listed = (await query(tx, `PRAGMA main.table_list('${CHANGESET_ORDER_HEAD_TABLE}')`))
-    .filter(row => row[0] === "main" && row[1] === CHANGESET_ORDER_HEAD_TABLE);
+  const listed = (await query(tx, `PRAGMA main.table_list('${tableName}')`))
+    .filter(row => row[0] === "main" && row[1] === tableName);
   if (listed.length !== 1 || listed[0]![2] !== "table" || count(listed[0]![3]) !== 2 || count(listed[0]![4]) !== 0)
     fail("ERR_FSQLITE_ORDER_SCHEMA", "Invalid order-head layout");
-  const columns = await query(tx, `PRAGMA main.table_xinfo('${CHANGESET_ORDER_HEAD_TABLE}')`);
+  const columns = await query(tx, `PRAGMA main.table_xinfo('${tableName}')`);
   if (columns.length !== 2) fail("ERR_FSQLITE_ORDER_SCHEMA", "Invalid order-head columns");
   for (let i = 0; i < columns.length; i++) {
     const row = columns[i]!;
@@ -202,11 +204,11 @@ async function ensureHead(tx: ChangesetExecutor): Promise<boolean> {
       (i === 1 && count(row[3]) !== 1) || row[4] !== null || count(row[5]) !== (i === 0 ? 1 : 0) || count(row[6]) !== 0)
       fail("ERR_FSQLITE_ORDER_SCHEMA", "Invalid order-head column definition");
   }
-  if ((await query(tx, `PRAGMA main.index_list('${CHANGESET_ORDER_HEAD_TABLE}')`)).length ||
-    (await query(tx, `PRAGMA main.foreign_key_list('${CHANGESET_ORDER_HEAD_TABLE}')`)).length)
+  if ((await query(tx, `PRAGMA main.index_list('${tableName}')`)).length ||
+    (await query(tx, `PRAGMA main.foreign_key_list('${tableName}')`)).length)
     fail("ERR_FSQLITE_ORDER_SCHEMA", "Indexes and foreign keys on the order head are not supported");
   for (const ns of ["main", "temp"]) {
-    if ((await query(tx, `SELECT 1 FROM ${ns}.sqlite_schema WHERE type='trigger' AND tbl_name=? COLLATE NOCASE LIMIT 1`, [CHANGESET_ORDER_HEAD_TABLE])).length)
+    if ((await query(tx, `SELECT 1 FROM ${ns}.sqlite_schema WHERE type='trigger' AND tbl_name=? COLLATE NOCASE LIMIT 1`, [tableName])).length)
       fail("ERR_FSQLITE_ORDER_SCHEMA", "Triggers on the order head are not supported");
   }
   return true;
@@ -230,6 +232,45 @@ function metadata(row: readonly unknown[]): Stored {
 }
 function fingerprint(row: Stored): string {
   return JSON.stringify({ ...row, sequence: row.sequence.toString() });
+}
+
+interface Retention {
+  readonly protectedThrough: bigint;
+  readonly anchor: Stored;
+}
+function retentionFingerprint(value: Retention | null): string | null {
+  return value === null ? null : JSON.stringify({
+    version: 1, protectedThrough: value.protectedThrough.toString(),
+    ...value.anchor, sequence: value.anchor.sequence.toString(),
+  });
+}
+async function readRetention(tx: ChangesetExecutor): Promise<Retention | null> {
+  if (!await ensureHead(tx, RETENTION_NAME)) return null;
+  const rows = await query(tx, `SELECT slot, CASE WHEN typeof(receipt)='text' AND ` +
+    `length(CAST(receipt AS BLOB))<=16384 AND instr(receipt,char(0))=0 THEN receipt END FROM ${RETENTION} LIMIT 2`);
+  if (rows.length !== 1 || rows[0]!.length !== 2 || count(rows[0]![0]) !== 1 || typeof rows[0]![1] !== "string")
+    fail("ERR_FSQLITE_ORDER_CORRUPT", "Missing or malformed order-retention anchor");
+  try {
+    const raw = rows[0]![1] as string;
+    const record = JSON.parse(raw) as Record<string, unknown>;
+    if (record === null || typeof record !== "object" || Array.isArray(record) || record.version !== 1 ||
+        typeof record.protectedThrough !== "string" || !/^(0|[1-9][0-9]{0,18})$/.test(record.protectedThrough))
+      fail("ERR_FSQLITE_ORDER_CORRUPT", "Invalid order-retention policy");
+    const protectedThrough = BigInt(record.protectedThrough);
+    const anchor = metadata([record.sequence, record.receiverId, record.sourceId, record.deliveryId,
+      record.sha256, record.byteLength, record.applied, record.omitted]);
+    const retained = { protectedThrough, anchor };
+    if (protectedThrough >= anchor.sequence || retentionFingerprint(retained) !== raw)
+      fail("ERR_FSQLITE_ORDER_CORRUPT", "Invalid order-retention boundary or encoding");
+    return retained;
+  } catch (error) {
+    if (error instanceof ChangesetOrderError) throw error;
+    return fail("ERR_FSQLITE_ORDER_CORRUPT", "Invalid order-retention metadata");
+  }
+}
+function protectedPrefix(bootstrap: string | null): bigint {
+  // requireInstalledBootstrap already admitted this locally bound manifest.
+  return bootstrap === null ? 0n : BigInt((JSON.parse(bootstrap) as { chunks: number }).chunks);
 }
 
 /**
@@ -464,7 +505,7 @@ export class ChangesetOrder {
     this.#entries = bound(options.maxEntries, 100_000, 100_000);
     this.#bytes = bound(options.maxMessageBytes, 8 * 1024 * 1024, 64 * 1024 * 1024);
   }
-  async #head(tx: ChangesetExecutor): Promise<Stored> {
+  async #view(tx: ChangesetExecutor): Promise<{ head: Stored; entries: number; retention: Retention | null }> {
     if (!(await ensure(tx))) fail("ERR_FSQLITE_ORDER_UNINITIALIZED", "Explicitly initialize a new ordered receiver before delivery");
     if (!(await ensureHead(tx))) fail("ERR_FSQLITE_ORDER_CORRUPT", "The order ledger lost its independently retained head");
     const extent = await query(tx, `SELECT count(*), CAST(min(seq) AS TEXT), CAST(max(seq) AS TEXT) FROM ${TABLE}`);
@@ -472,8 +513,24 @@ export class ChangesetOrder {
       typeof extent[0]![2] !== "string" || !/^(0|[1-9][0-9]{0,18})$/.test(extent[0]![2] as string))
       fail("ERR_FSQLITE_ORDER_CORRUPT", "Missing order-ledger binding or invalid sequence extent");
     const last = BigInt(extent[0]![2] as string);
-    if (last > MAX_SEQUENCE || BigInt(count(extent[0]![0])) !== last + 1n)
+    const population = count(extent[0]![0]), retention = await readRetention(tx);
+    const expected = retention === null ? last + 1n :
+      retention.protectedThrough + 1n + last - retention.anchor.sequence + 1n;
+    if (last > MAX_SEQUENCE || BigInt(population) !== expected ||
+        (retention !== null && retention.anchor.sequence > last))
       fail("ERR_FSQLITE_ORDER_CORRUPT", "The retained order ledger has gaps; do not reset or reseed it");
+    if (retention !== null) {
+      // Uniqueness, exact population and the two allowed intervals together
+      // establish contiguous protected and live ranges; a hole cannot hide in
+      // the intentionally retired interval by replacing some other receipt.
+      const allowed = await query(tx, `SELECT count(*) FROM ${TABLE} WHERE seq<=? OR seq>=?`,
+        [retention.protectedThrough, retention.anchor.sequence]);
+      const anchor = await query(tx, `SELECT ${META} FROM ${TABLE} WHERE seq=?`, [retention.anchor.sequence]);
+      if (allowed.length !== 1 || allowed[0]!.length !== 1 || count(allowed[0]![0]) !== population ||
+          anchor.length !== 1 || fingerprint(metadata(anchor[0]!)) !== fingerprint(retention.anchor) ||
+          retention.anchor.receiverId !== this.#receiver || retention.anchor.sourceId !== this.#source)
+        fail("ERR_FSQLITE_ORDER_CORRUPT", "Retired order range disagrees with its retained anchor");
+    }
     const rows = await query(tx, `SELECT ${META} FROM ${TABLE} WHERE seq=0 OR seq=? ORDER BY seq`, [last]);
     if (rows.length !== (last === 0n ? 1 : 2)) fail("ERR_FSQLITE_ORDER_CORRUPT", "Missing ledger endpoints");
     for (const row of rows) {
@@ -488,8 +545,11 @@ export class ChangesetOrder {
     const heads = await query(tx, `SELECT slot, CASE WHEN typeof(receipt)='text' AND length(CAST(receipt AS BLOB))<=16384 THEN receipt END FROM ${HEAD} LIMIT 2`);
     if (heads.length !== 1 || count(heads[0]![0]) !== 1 || heads[0]![1] !== fingerprint(lastEntry))
       fail("ERR_FSQLITE_ORDER_CORRUPT", "Retained head disagrees with the ledger; a committed tail may be missing");
-    return lastEntry;
+    if (retention !== null && protectedPrefix(await requireInstalledBootstrap(tx, lastEntry)) !== retention.protectedThrough)
+      fail("ERR_FSQLITE_ORDER_CORRUPT", "Retirement changed its protected bootstrap prefix");
+    return { head: lastEntry, entries: population - 1, retention };
   }
+  async #head(tx: ChangesetExecutor): Promise<Stored> { return (await this.#view(tx)).head; }
   /**
    * Explicit NEW-stream enrollment; never performed by apply(). Reopening the
    * same binding is idempotent. A damaged existing ledger is never recreated.
@@ -500,7 +560,8 @@ export class ChangesetOrder {
     return this.#target.transaction(async tx => {
       b.checkpoint();
       const ledger = await ensure(tx), headExists = await ensureHead(tx);
-      if (ledger !== headExists) fail("ERR_FSQLITE_ORDER_CORRUPT", "Partial ordered-delivery state must not be reinitialized");
+      if (ledger !== headExists || (!ledger && await ensureHead(tx, RETENTION_NAME)))
+        fail("ERR_FSQLITE_ORDER_CORRUPT", "Partial ordered-delivery state must not be reinitialized");
       if (!ledger) {
         await tx.execute(DDL);
         await tx.execute(`INSERT INTO ${TABLE} VALUES (0,?,?,?, ?,0,0,0)`, [this.#receiver, this.#source, "", ZERO_HASH]);
@@ -521,6 +582,86 @@ export class ChangesetOrder {
       return head;
     }, b.transactionOptions());
   }
+  /**
+   * Explicitly end replay/identity retention for old INCREMENTAL receipts.
+   * Call only after the source durably acknowledged them and the retry horizon
+   * has ended. This does not prove that external condition or confirm storage.
+   * Keep genesis, the complete installed bootstrap prefix, the selected anchor
+   * and every newer receipt. Retired sequences reject rather than reapply SQL.
+   * Delivery IDs must never be reused for different work, even after retirement.
+   */
+  async retireBefore(sequence: bigint, options: ChangesetOrderOperationOptions = {}): Promise<{
+    readonly removed: number;
+    readonly retiredBefore: bigint;
+    readonly protectedThrough: bigint;
+    readonly retainedEntries: number;
+  }> {
+    if (this.#active) fail("ERR_FSQLITE_ORDER_BUSY", "This ordered receiver is active; nothing was queued");
+    this.#active = true;
+    try {
+      if (typeof sequence !== "bigint" || sequence < 1n || sequence > MAX_SEQUENCE)
+        fail("ERR_FSQLITE_ORDER_INPUT", "Retirement requires a positive int64 sequence");
+      const b = budget(options);
+      return await this.#target.transaction(async tx => {
+        b.checkpoint();
+        const before = await this.#view(tx), bootstrap = await requireInstalledBootstrap(tx, before.head);
+        b.checkpoint();
+        if (sequence > before.head.sequence)
+          fail("ERR_FSQLITE_ORDER_GAP", "Cannot retire beyond the committed order head");
+        const protectedThrough = protectedPrefix(bootstrap);
+        const previous = before.retention?.anchor.sequence ?? protectedThrough + 1n;
+        const result = (removed: number, retiredBefore: bigint, retainedEntries: number) =>
+          Object.freeze({ removed, retiredBefore, protectedThrough, retainedEntries });
+        if (sequence <= previous) return result(0, previous, before.entries);
+        const anchors = await query(tx, `SELECT ${META} FROM ${TABLE} WHERE seq=?`, [sequence]);
+        if (anchors.length !== 1) fail("ERR_FSQLITE_ORDER_CORRUPT", "Missing retirement anchor receipt");
+        const anchor = metadata(anchors[0]!);
+        if (anchor.receiverId !== this.#receiver || anchor.sourceId !== this.#source)
+          fail("ERR_FSQLITE_ORDER_BINDING", "Retirement anchor belongs to another stream");
+        const receipt = retentionFingerprint({ protectedThrough, anchor })!;
+        const removed = Number(sequence - previous);
+        if (!Number.isSafeInteger(removed) || removed > before.entries)
+          fail("ERR_FSQLITE_ORDER_CORRUPT", "Invalid retirement population");
+        // Validate the retiring range, not just its endpoints, before erasing
+        // its evidence. Keyset pages bound temporary metadata and cancellation.
+        let cursor = previous;
+        while (cursor < sequence) {
+          b.checkpoint();
+          const page = await query(tx, `SELECT ${META} FROM ${TABLE} WHERE seq>=? AND seq<? ORDER BY seq LIMIT 32`,
+            [cursor, sequence]);
+          if (!page.length || page.length > 32)
+            fail("ERR_FSQLITE_ORDER_CORRUPT", "Missing or oversized retirement metadata page");
+          for (const row of page) {
+            b.checkpoint();
+            const entry = metadata(row);
+            if (entry.sequence !== cursor || entry.sequence >= sequence ||
+                entry.receiverId !== this.#receiver || entry.sourceId !== this.#source)
+              fail("ERR_FSQLITE_ORDER_CORRUPT", "Retiring receipt has invalid ordering or ownership");
+            cursor++;
+          }
+        }
+        b.checkpoint();
+        if (before.retention === null) {
+          await tx.execute(`CREATE TABLE ${RETENTION} (slot INTEGER PRIMARY KEY, receipt TEXT NOT NULL)`);
+          if (await tx.execute(`INSERT OR ABORT INTO ${RETENTION} VALUES (1,?)`, [receipt]) !== 1)
+            fail("ERR_FSQLITE_ORDER_CORRUPT", "Retirement anchor was not inserted exactly once");
+        } else if (await tx.execute(`UPDATE OR ABORT ${RETENTION} SET receipt=? WHERE slot=1 AND receipt=? COLLATE BINARY`,
+            [receipt, retentionFingerprint(before.retention)!]) !== 1) {
+          fail("ERR_FSQLITE_ORDER_CORRUPT", "Retirement anchor did not advance atomically");
+        }
+        b.checkpoint();
+        if (await tx.execute(`DELETE FROM ${TABLE} WHERE seq>? AND seq<?`, [protectedThrough, sequence]) !== removed)
+          fail("ERR_FSQLITE_ORDER_CORRUPT", "Retirement removed an unexpected receipt population");
+        b.checkpoint();
+        const after = await this.#view(tx);
+        if (after.entries !== before.entries - removed || fingerprint(after.head) !== fingerprint(before.head) ||
+            retentionFingerprint(after.retention) !== receipt)
+          fail("ERR_FSQLITE_ORDER_CORRUPT", "Retirement publication did not preserve the committed frontier");
+        b.checkpoint();
+        return result(removed, sequence, after.entries);
+      }, b.transactionOptions());
+    } finally { this.#active = false; }
+  }
   async apply(
     message: OrderedChangeset,
     apply: OrderedChangesetApply,
@@ -539,10 +680,12 @@ export class ChangesetOrder {
       b.checkpoint();
       return await this.#target.transaction(async tx => {
         b.checkpoint();
-        const before = await this.#head(tx);
+        const view = await this.#view(tx), before = view.head;
         const bootstrap = await requireInstalledBootstrap(tx, before);
         b.checkpoint();
         if (sequence > before.sequence + 1n) fail("ERR_FSQLITE_ORDER_GAP", "A source predecessor is missing; no rows were applied");
+        if (view.retention !== null && sequence > view.retention.protectedThrough && sequence < view.retention.anchor.sequence)
+          fail("ERR_FSQLITE_ORDER_EXPIRED", "This sequence was explicitly retired; it cannot be acknowledged or applied again");
         if (sequence <= before.sequence) {
           const rows = await query(tx, `SELECT ${META} FROM ${TABLE} WHERE seq=?`, [sequence]);
           if (rows.length !== 1) fail("ERR_FSQLITE_ORDER_CORRUPT", "Missing ordered replay receipt");
@@ -553,7 +696,7 @@ export class ChangesetOrder {
           b.checkpoint();
           return Object.freeze({ ...saved, replayed: true });
         }
-        if (before.sequence >= BigInt(this.#entries)) fail("ERR_FSQLITE_ORDER_FULL", "Order-ledger identity retention limit reached");
+        if (view.entries >= this.#entries) fail("ERR_FSQLITE_ORDER_FULL", "Order-ledger identity retention limit reached");
         if ((await query(tx, `SELECT 1 FROM ${TABLE} WHERE delivery_id=? LIMIT 1`, [deliveryId])).length)
           fail("ERR_FSQLITE_ORDER_REUSE", "A delivery identity was reused at a new sequence");
         b.checkpoint();
@@ -566,8 +709,10 @@ export class ChangesetOrder {
         const applied = count(field(result, "applied")), omitted = count(field(result, "omitted"));
         if (field(result, "replayed") !== false || applied + omitted > 100_000)
           fail("ERR_FSQLITE_ORDER_REUSE", "Fresh ordered work must not reuse an unordered receipt");
-        if (fingerprint(await this.#head(tx)) !== fingerprint(before))
-          fail("ERR_FSQLITE_ORDER_CORRUPT", "Application work changed the order ledger");
+        const checked = await this.#view(tx);
+        if (fingerprint(checked.head) !== fingerprint(before) ||
+            retentionFingerprint(checked.retention) !== retentionFingerprint(view.retention))
+          fail("ERR_FSQLITE_ORDER_CORRUPT", "Application work changed the order ledger or its retirement policy");
         if (await requireInstalledBootstrap(tx, before) !== bootstrap)
           fail("ERR_FSQLITE_ORDER_CORRUPT", "Application work changed its bootstrap authority");
         b.checkpoint();
