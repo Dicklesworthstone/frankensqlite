@@ -278,3 +278,11 @@ export type {
 } from "./changeset-ordered-delivery";
 export { CHANGESET_ORDER_PROTOCOL, OrderedChangesetDeliveryError, createOrderedChangesetReceiver, createOrderedChangesetTransport } from "./changeset-ordered-delivery";
 export { ChangesetForeignKeyError, withDeferredForeignKeys } from "./changeset-foreign-keys";
+export { ChangesetBootstrapTransfer, BootstrapTransferError } from "./changeset-bootstrap-transfer";
+export type {
+  BootstrapTransferTransport,
+  BootstrapTransferOptions,
+  BootstrapTransferRunOptions,
+  BootstrapTransferResult,
+  BootstrapTransferPhase,
+} from "./changeset-bootstrap-transfer";

@@ -1,0 +1,11 @@
+import { Source, Receiver } from './bootstrap-transfer-fixture.mjs';
+import { ChangesetBootstrapTransfer } from '../../src/changeset-bootstrap-transfer.ts';
+const [sourcePath,receiverPath,cut]=process.argv.slice(2);
+const source=new Source({filename:sourcePath,initialize:false});
+const receiver=new Receiver(source,{filename:receiverPath,initialize:false});
+const stop=async()=>{process.send(cut);await new Promise(()=>{});};
+if(cut==='stage') receiver.hooks.afterStage=async(_m,index,p)=>{if(index===0)await stop();return p;};
+if(cut==='receiver-commit') receiver.hooks.afterInstall=async r=>{await stop();return r;};
+if(cut==='source-ack') source.hooks.afterAck=stop;
+await new ChangesetBootstrapTransfer(source,{receiverId:'east',deliveryId:'source:seed',tables:['t'],transport:receiver,confirmSource:()=>source.confirm()}).run();
+throw Error('expected kill boundary not reached');
