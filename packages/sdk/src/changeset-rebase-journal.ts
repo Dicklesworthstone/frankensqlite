@@ -116,6 +116,11 @@ const HEADS = `main."${REBASE_JOURNAL_HEADS_TABLE}"`;
 const ENTRIES = `main."${REBASE_JOURNAL_ENTRIES_TABLE}"`;
 const LOCALS = `main."${REBASE_JOURNAL_LOCALS_TABLE}"`;
 const MAX_WIRE = 64 * 1024 * 1024;
+const LOCAL_PUBLICATION_FORMAT = "fsqlite-rebase-outbox-v1";
+const encodeJson = (value: unknown): Uint8Array => new TextEncoder().encode(JSON.stringify(value));
+async function localDeliveryId(journalId: string, operationId: string): Promise<string> {
+  return `${LOCAL_PUBLICATION_FORMAT}:${await hash(encodeJson([journalId, operationId]))}`;
+}
 function fail(kind: "INPUT" | "SCHEMA" | "CORRUPT" | "LIMIT" | "MISSING" | "HISTORY" | "CANCELLED" | "TIMEOUT", message: string): never {
   throw new RebaseJournalError(`ERR_FSQLITE_REBASE_JOURNAL_${kind}`, message);
 }
@@ -215,6 +220,17 @@ function operation(options: RebaseJournalOperationOptions = {}) {
   return { checkpoint, transactionOptions };
 }
 type Operation = ReturnType<typeof operation>;
+/** Preserve the caller's original deadline through shared storage helpers. */
+function storageExecutor(owner: ChangesetExecutor, op: Operation): ChangesetExecutor {
+  return {
+    execute: async (sql, params) => {
+      op.checkpoint(); const n = await owner.execute(sql, params); op.checkpoint(); return n;
+    },
+    query: async (sql, params) => {
+      op.checkpoint(); const rows = await owner.query(sql, params); op.checkpoint(); return rows;
+    },
+  };
+}
 async function query(tx: ChangesetExecutor, op: Operation, sql: string, params: readonly ChangesetValue[] = []) {
   op.checkpoint();
   const result = await tx.query(sql, params);
@@ -309,7 +325,8 @@ async function localRecordDigest(record: Omit<RebaseJournalLocalRecord, "changes
  * rows and delivery receipt. A replay MUST find its original journal entry.
  * Bounded retention refuses new applications rather than dropping needed history.
  * enqueueLocal explicitly retains rebased output in the same database outbox.
- * No pruning, native replication, or automatic retry is implied.
+ * retireLocal explicitly releases acknowledged originals, not remote history.
+ * No automatic pruning, native replication, or retry is implied.
  *
  * The target must own transactions. A nested target remains provisional until
  * its outer commit; browser snapshots still require explicit checkpointing.
@@ -352,6 +369,7 @@ export class ChangesetRebaseJournal {
     const op: Operation = capture;
     const tables = capture.tables.map((name) => name.replace(/[A-Z]/g, (c) => c.toLowerCase())).sort();
     const scope = await hash(new TextEncoder().encode(JSON.stringify(["fsqlite-local-scope-v1", tables, capture.indirect])));
+    const publishedId = await localDeliveryId(this.#id, id);
     op.checkpoint();
     return this.#target.transaction(async (tx) => {
       await ensureLocals(tx, op, true);
@@ -360,10 +378,19 @@ export class ChangesetRebaseJournal {
         if (prior.scope !== scope) fail("HISTORY", "Local operation ID already belongs to a different capture scope");
         return Object.freeze({ replayed: true, record: prior.record });
       }
+      // A surviving publication is evidence of prior work even after its original
+      // is explicitly retired (or lost). Never rerun that business callback.
+      const unpublished = async () => {
+        const storage = storageExecutor(tx, op);
+        if (await ensureOutbox(storage, false) && await findOutbox(storage, publishedId) !== null)
+          fail("HISTORY", "A published local operation cannot be recaptured after its original was retired or lost");
+      };
+      await unpublished();
       const usage = await this.#localUsage(tx, op);
       if (usage.entries >= this.#maxLocalEntries) fail("LIMIT", "Local changeset retention is full; work was not started");
       const basis = await this.#currentBookmark(tx, op);
       const captured = await capture.run(tx);
+      await unpublished();
       await ensureLocals(tx, op, false);
       const after = await this.#currentBookmark(tx, op);
       if (after.position !== basis.position || after.sha256 !== basis.sha256)
@@ -433,21 +460,14 @@ export class ChangesetRebaseJournal {
     const through = end === undefined ? undefined : boundary(end, this.#id);
     const maxEntries = bound(options.maxEntries, 10_000, 100_000);
     const maxBytes = bound(options.maxPayloadBytes, MAX_WIRE, 1024 ** 3);
-    const op = operation(options), format = "fsqlite-rebase-outbox-v1";
-    const encode = (value: unknown) => new TextEncoder().encode(JSON.stringify(value));
-    const deliveryId = `${format}:${await hash(encode([this.#id, id]))}`;
+    const op = operation(options), format = LOCAL_PUBLICATION_FORMAT;
+    const encode = encodeJson;
+    const deliveryId = await localDeliveryId(this.#id, id);
     op.checkpoint();
     return this.#target.transaction(async owner => {
       // Storage helpers use the same owner and deadline, without nested BEGINs
       // or escaping SQL. Nothing invokes business callbacks or touches user rows.
-      const tx: ChangesetExecutor = {
-        execute: async (sql, params) => {
-          op.checkpoint(); const n = await owner.execute(sql, params); op.checkpoint(); return n;
-        },
-        query: async (sql, params) => {
-          op.checkpoint(); const rows = await owner.query(sql, params); op.checkpoint(); return rows;
-        },
-      };
+      const tx = storageExecutor(owner, op);
       const fanout = await captureFanoutGuard(tx);
       const present = await ensureOutbox(tx, false);
       const prior = present ? await findOutbox(tx, deliveryId) : null;
@@ -532,6 +552,93 @@ export class ChangesetRebaseJournal {
     }, op.transactionOptions);
   }
 
+  /**
+   * Explicitly release one original AFTER its exact sealed outbox publication
+   * is acknowledged under the configured single/all-replica policy. Keep that
+   * publication identity, source numbering, remote history and application rows.
+   * Supply the original recordSha256, not the outgoing (possibly rebased) hash.
+   * This is SQL cleanup, not proof of remote durability or a storage checkpoint.
+   * Never recycle operation IDs, especially after separately forgetting outbox
+   * identities. A missing original returns removed:false, not proof of why it
+   * disappeared; matching acknowledged publication evidence is still required.
+   */
+  async retireLocal(
+    operationId: string,
+    recordSha256: string,
+    options: RebaseJournalOperationOptions = {},
+  ): Promise<{
+    readonly removed: boolean;
+    readonly byteLength: number;
+    readonly recordSha256: string;
+    readonly delivery: OutboxDelivery;
+  }> {
+    const id = identity(operationId);
+    if (typeof recordSha256 !== "string" || !/^[0-9a-f]{64}$/.test(recordSha256))
+      fail("INPUT", "Retirement requires the exact original record SHA-256");
+    const op = operation(options), deliveryId = await localDeliveryId(this.#id, id);
+    op.checkpoint();
+    return this.#target.transaction(async owner => {
+      const tx = storageExecutor(owner, op);
+      const fanout = await captureFanoutGuard(tx);
+      if (!await ensureOutbox(tx, false)) fail("MISSING", "The original has no retained outbox publication");
+      const published = await findOutbox(tx, deliveryId);
+      if (published === null) fail("MISSING", "The original has no retained outbox publication");
+      if (published.delivery.deliveryId !== deliveryId || !published.delivery.acknowledged || published.stream !== null)
+        fail("HISTORY", "Every required receiver must acknowledge the exact local publication before retirement");
+      // findOutbox has already bounded/validated the canonical table list and
+      // reclaimed BLOB shape. Bind the entire publication, not just its ACK bit.
+      const raw = JSON.parse(published.scope) as {
+        tables: string[]; indirect: boolean;
+        rebasedLocal?: { format?: unknown; journalId?: unknown; operationId?: unknown;
+          recordSha256?: unknown; afterBookmark?: unknown; throughBookmark?: unknown };
+      };
+      const retained = raw.rebasedLocal;
+      if (retained === null || typeof retained !== "object" || Array.isArray(retained) ||
+          retained.format !== LOCAL_PUBLICATION_FORMAT || retained.journalId !== this.#id ||
+          retained.operationId !== id || retained.recordSha256 !== recordSha256)
+        fail("HISTORY", "Retirement does not identify the retained original publication");
+      const after = boundary(retained.afterBookmark, this.#id), through = boundary(retained.throughBookmark, this.#id);
+      if (after.sha256 === null || through.sha256 === null || after.position > through.position)
+        fail("CORRUPT", "Invalid retained local publication bookmarks");
+      const bookmark = (b: HistoryBoundary) => Object.freeze({ format: BOOKMARK_FORMAT,
+        journalId: this.#id, position: b.position, sha256: b.sha256! });
+      const choice = { format: LOCAL_PUBLICATION_FORMAT, journalId: this.#id, operationId: id,
+        recordSha256, afterBookmark: bookmark(after), throughBookmark: bookmark(through) };
+      const d = published.delivery;
+      const seal = await hash(encodeJson([choice, raw.tables, raw.indirect, deliveryId,
+        d.sha256, d.byteLength, d.changes]));
+      if (JSON.stringify({ tables: raw.tables, indirect: raw.indirect, rebasedLocal: { ...choice, seal } }) !== published.scope)
+        fail("CORRUPT", "Retained local publication seal or canonical scope changed");
+      await loadOutbox(tx, published);
+      if (!await ensureLocals(tx, op, false)) fail("MISSING", "Original local storage is missing; do not manufacture cleanup evidence");
+      const saved = await this.#localEntry(tx, op, id);
+      const result = (removed: boolean, byteLength: number) => Object.freeze({
+        removed, byteLength, recordSha256, delivery: d,
+      });
+      if (saved === null) return result(false, 0);
+      if (saved.record.recordSha256 !== recordSha256 ||
+          JSON.stringify(saved.record.basis) !== JSON.stringify(choice.afterBookmark) ||
+          saved.scope !== await hash(encodeJson(["fsqlite-local-scope-v1", raw.tables, raw.indirect])))
+        fail("HISTORY", "Retained original disagrees with its acknowledged publication");
+      // Cleanup must remain usable when aggregate retention exceeds a newly
+      // lowered cap. Still verify the one original under its codec byte budget.
+      const before = await this.#localUsage(tx, op, false);
+      await write(tx, op, `DELETE FROM ${LOCALS} WHERE journal_id=? AND operation_id=? AND record_sha256=? COLLATE BINARY`,
+        [this.#id, id, recordSha256]);
+      const remaining = await this.#localUsage(tx, op, false);
+      const latest = await findOutbox(tx, deliveryId);
+      if ((await query(tx, op, `SELECT 1 FROM ${LOCALS} WHERE journal_id=? AND operation_id=? LIMIT 1`, [this.#id, id])).length ||
+          remaining.entries !== before.entries - 1 || remaining.bytes !== before.bytes - saved.record.byteLength ||
+          latest === null || latest.scope !== published.scope || latest.delivery.sequence !== d.sequence ||
+          latest.delivery.sha256 !== d.sha256 || latest.delivery.byteLength !== d.byteLength ||
+          latest.delivery.changes !== d.changes || !latest.delivery.acknowledged ||
+          await captureFanoutGuard(tx) !== fanout)
+        fail("CORRUPT", "Local retirement changed unexpected source or replica state");
+      op.checkpoint();
+      return result(true, saved.record.byteLength);
+    }, op.transactionOptions);
+  }
+
   /** Read-only recovery; remains usable even if the saved remote basis is missing. */
   async readLocal(operationId: string, options?: RebaseJournalOperationOptions): Promise<RebaseJournalLocalRecord | null> {
     const id = identity(operationId), op = operation(options);
@@ -541,13 +648,13 @@ export class ChangesetRebaseJournal {
     }, op.transactionOptions);
   }
 
-  async #localUsage(tx: ChangesetExecutor, op: Operation): Promise<{ entries: number; bytes: number }> {
+  async #localUsage(tx: ChangesetExecutor, op: Operation, enforceLimits = true): Promise<{ entries: number; bytes: number }> {
     const valid = `typeof(byte_length)='integer' AND byte_length BETWEEN 0 AND ${MAX_WIRE} AND typeof(changeset)='blob' AND length(changeset)=byte_length`;
     const rows = await query(tx, op, `SELECT count(*), coalesce(sum(CASE WHEN ${valid} THEN byte_length ELSE 0 END),0), count(CASE WHEN ${valid} THEN 1 END) FROM ${LOCALS} WHERE journal_id=?`, [this.#id]);
     if (rows.length !== 1 || rows[0]!.length !== 3) fail("CORRUPT", "Invalid local retention accounting");
     const entries = integer(rows[0]![0]), bytes = integer(rows[0]![1]);
     if (integer(rows[0]![2]) !== entries) fail("CORRUPT", "Invalid retained local payload shape");
-    if (entries > this.#maxLocalEntries || bytes > this.#maxLocalBytes) fail("LIMIT", "Local retention exceeds configured limits");
+    if (enforceLimits && (entries > this.#maxLocalEntries || bytes > this.#maxLocalBytes)) fail("LIMIT", "Local retention exceeds configured limits");
     return { entries, bytes };
   }
 
