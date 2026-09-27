@@ -471,6 +471,7 @@ export class ChangesetRebaseJournal {
     const tables = Array.from({ length: source.length }, (_, i) => identity(source[i]));
     if (tables.some((s) => s.toLowerCase().startsWith("__fsqlite_"))) fail("INPUT", "Journal metadata cannot be a direct changeset target");
     const onConflict = options.onConflict;
+    const generatedColumns = options.generatedColumns, foreignKeys = options.foreignKeys;
     const op = operation(options);
     const wire = owned(bytes, this.#policy.maxBytes);
     let saved: RebaseJournalEntry | null = null;
@@ -493,6 +494,8 @@ export class ChangesetRebaseJournal {
     };
     const applyOptions: ApplyChangesetOptions = {
       tables, deliveryId, limits: this.#policy, ...op.transactionOptions,
+      ...(generatedColumns === undefined ? {} : { generatedColumns }),
+      ...(foreignKeys === undefined ? {} : { foreignKeys }),
       onRebase: async (tx, info) => {
         await ensure(tx, op, false);
         const head = await this.#head(tx, op, false);

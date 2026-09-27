@@ -65,6 +65,10 @@ export class ChangesetDeliveryError extends Error {
   }
 }
 export interface ChangesetReceiverOptions {
+  /** Trusted local schema policy; never accepted from a received envelope. */
+  generatedColumns?: ApplyChangesetOptions["generatedColumns"];
+  /** One FK-clean scope for rows, journal and receipt; enforcement must be ON. */
+  foreignKeys?: ApplyChangesetOptions["foreignKeys"];
   /** Routing identity, NOT authentication. Authenticate callers in the transport. */
   receiverId: string;
   tables: readonly string[];
@@ -256,6 +260,7 @@ export class ChangesetReceiver {
   readonly #confirm: () => Promise<unknown>;
   readonly #onConflict: ApplyChangesetOptions["onConflict"];
   readonly #rebaseJournal: ChangesetRebaseJournal | null;
+  readonly #applicationPolicy: Readonly<Pick<ApplyChangesetOptions, "generatedColumns" | "foreignKeys">>;
   readonly #maxBytes: number;
   #active = false;
   constructor(target: ChangesetTarget, options: ChangesetReceiverOptions) {
@@ -265,6 +270,15 @@ export class ChangesetReceiver {
       confirm = options?.confirmCommit,
       onConflict = options?.onConflict;
     const rebaseJournal = options?.rebaseJournal;
+    const generatedColumns = options?.generatedColumns, foreignKeys = options?.foreignKeys;
+    if (generatedColumns !== undefined && generatedColumns !== "recompute")
+      input("generatedColumns must be recompute when supplied");
+    if (foreignKeys !== undefined && foreignKeys !== "defer")
+      input("foreignKeys must be defer when supplied");
+    this.#applicationPolicy = Object.freeze({
+      ...(generatedColumns === undefined ? {} : { generatedColumns }),
+      ...(foreignKeys === undefined ? {} : { foreignKeys }),
+    });
     this.#maxBytes = bound(options?.maxMessageBytes, 8 * 1024 * 1024, HARD_BYTES);
     if (!Array.isArray(source) || source.length > 256)
       input("An explicit table allowlist is required");
@@ -332,6 +346,7 @@ export class ChangesetReceiver {
       budget.checkpoint();
       phase = "receiver-apply";
       const applyOptions: ApplyChangesetOptions & { deliveryId: string } = {
+        ...this.#applicationPolicy,
         tables: this.#tables,
         deliveryId: id,
         signal: budget.signal,
