@@ -10,6 +10,10 @@ import { decodeChangeset, decodeRebaseInfo, resolveChangesetLimits } from "./cha
 import { ChangesetRebaser } from "./changeset-rebase";
 import type { CaptureChangesetOptions } from "./changeset-capture";
 import { prepareChangesetCapture } from "./changeset-capture";
+import type { ChangesetOutboxOptions, OutboxDelivery } from "./changeset-outbox-store";
+import { TABLE as OUTBOX, ensure as ensureOutbox, find as findOutbox,
+  load as loadOutbox, store as storeOutbox } from "./changeset-outbox-store";
+import { captureFanoutGuard } from "./changeset-fanout";
 
 export const REBASE_JOURNAL_HEADS_TABLE = "__fsqlite_rebase_journal_heads";
 export const REBASE_JOURNAL_ENTRIES_TABLE = "__fsqlite_rebase_journal_entries";
@@ -304,7 +308,8 @@ async function localRecordDigest(record: Omit<RebaseJournalLocalRecord, "changes
  * Ordered persistent conflict decisions, atomically coupled to applyChangeset's
  * rows and delivery receipt. A replay MUST find its original journal entry.
  * Bounded retention refuses new applications rather than dropping needed history.
- * No pruning, outbox mutation, native replication, or automatic retry is implied.
+ * enqueueLocal explicitly retains rebased output in the same database outbox.
+ * No pruning, native replication, or automatic retry is implied.
  *
  * The target must own transactions. A nested target remains provisional until
  * its outer commit; browser snapshots still require explicit checkpointing.
@@ -383,6 +388,147 @@ export class ChangesetRebaseJournal {
         fail("CORRUPT", "Original local changeset was not retained exactly");
       // No post-commit checkpoint: a durable success is not a rollback.
       return Object.freeze({ replayed: false, value: captured.value, record: saved.record });
+    }, op.transactionOptions);
+  }
+
+  /**
+   * Freeze one ORIGINAL local operation's rebased output in this database's
+   * ordinary outbox. The derived delivery ID is stable for (journalId, operationId):
+   * retries recover the same choice, never rebase it against newer remote history.
+   * Use a globally source-qualified journalId and enqueue operations in application
+   * order. This is SQL publication, not transport, acknowledgement or a checkpoint.
+   */
+  async enqueueLocal(
+    operationId: string,
+    options: Omit<RebaseJournalRangeOptions, "after"> & ChangesetOutboxOptions & {
+      /** Same table scope used for the original capture, including empty tables. */
+      tables: readonly string[];
+    },
+  ): Promise<{
+    readonly replayed: boolean;
+    readonly delivery: OutboxDelivery;
+    readonly recordSha256: string;
+    readonly afterBookmark: RebaseJournalBookmark;
+    readonly throughBookmark: RebaseJournalBookmark;
+  }> {
+    const id = identity(operationId);
+    if (typeof options !== "object" || options === null ||
+        (options as RebaseJournalRangeOptions).after !== undefined)
+      fail("INPUT", "Publication requires the original operation's saved basis");
+    const input = options.tables;
+    if (!Array.isArray(input) || !input.length || input.length > 64)
+      fail("INPUT", "Publication requires the original 1..64 table scope");
+    const tables = Array.from({ length: input.length }, (_, i) => {
+      const value: unknown = input[i];
+      if (typeof value !== "string" || !value.length || value.length > 1024 || value.includes("\0"))
+        fail("INPUT", "Invalid publication table name");
+      const bytes = new TextEncoder().encode(value);
+      if (bytes.length > 1024 || new TextDecoder("utf-8", { ignoreBOM: true }).decode(bytes) !== value)
+        fail("INPUT", "Invalid publication table UTF-8");
+      return value.replace(/[A-Z]/g, c => c.toLowerCase());
+    }).sort();
+    if (tables.some((value, i) => value.startsWith("sqlite_") || value.startsWith("__fsqlite_") ||
+        (i > 0 && tables[i - 1] === value))) fail("INPUT", "Publication requires distinct application tables");
+    const end = options.through;
+    const through = end === undefined ? undefined : boundary(end, this.#id);
+    const maxEntries = bound(options.maxEntries, 10_000, 100_000);
+    const maxBytes = bound(options.maxPayloadBytes, MAX_WIRE, 1024 ** 3);
+    const op = operation(options), format = "fsqlite-rebase-outbox-v1";
+    const encode = (value: unknown) => new TextEncoder().encode(JSON.stringify(value));
+    const deliveryId = `${format}:${await hash(encode([this.#id, id]))}`;
+    op.checkpoint();
+    return this.#target.transaction(async owner => {
+      // Storage helpers use the same owner and deadline, without nested BEGINs
+      // or escaping SQL. Nothing invokes business callbacks or touches user rows.
+      const tx: ChangesetExecutor = {
+        execute: async (sql, params) => {
+          op.checkpoint(); const n = await owner.execute(sql, params); op.checkpoint(); return n;
+        },
+        query: async (sql, params) => {
+          op.checkpoint(); const rows = await owner.query(sql, params); op.checkpoint(); return rows;
+        },
+      };
+      const fanout = await captureFanoutGuard(tx);
+      const present = await ensureOutbox(tx, false);
+      const prior = present ? await findOutbox(tx, deliveryId) : null;
+      const usage = async () => {
+        const valid = `typeof(acknowledged)='integer' AND acknowledged IN (0,1) AND ` +
+          `typeof(byte_length)='integer' AND byte_length BETWEEN 0 AND ${MAX_WIRE} AND ` +
+          `typeof(payload)='blob' AND length(payload)=CASE acknowledged WHEN 1 THEN 0 ELSE byte_length END`;
+        const rows = await query(tx, op, `SELECT count(*),coalesce(sum(length(payload)),0),` +
+          `count(CASE WHEN ${valid} THEN 1 END) FROM ${OUTBOX}`);
+        if (rows.length !== 1 || rows[0]!.length !== 3 || integer(rows[0]![0]) !== integer(rows[0]![2]))
+          fail("CORRUPT", "Invalid outbox publication accounting");
+        return { entries: integer(rows[0]![0]), bytes: integer(rows[0]![1]) };
+      };
+      const before = present && prior === null ? await usage() : { entries: 0, bytes: 0 };
+      if (prior === null && (before.entries >= maxEntries || before.bytes > maxBytes))
+        fail("LIMIT", "Outbox retention is full; no rebasing was started");
+      if (!await ensureLocals(tx, op, false)) fail("MISSING", "Original local changeset is not retained");
+      const saved = await this.#localEntry(tx, op, id);
+      if (saved === null) fail("MISSING", "Original local changeset is not retained");
+      // The stored capture scope also covers net-zero originals, whose wire
+      // contains no table header or indirect flag from which to infer policy.
+      let indirect = false;
+      if (await hash(encode(["fsqlite-local-scope-v1", tables, false])) !== saved.scope) {
+        indirect = true;
+        if (await hash(encode(["fsqlite-local-scope-v1", tables, true])) !== saved.scope)
+          fail("HISTORY", "Publication table scope differs from the original capture");
+      }
+      const original = saved.record;
+      const scopeFor = async (
+        tip: RebaseJournalBookmark,
+        payload: { sha256: string; byteLength: number; changes: number },
+      ): Promise<string> => {
+        const choice = { format, journalId: this.#id, operationId: id,
+          recordSha256: original.recordSha256, afterBookmark: original.basis, throughBookmark: tip };
+        const seal = await hash(encode([choice, tables, indirect, deliveryId,
+          payload.sha256, payload.byteLength, payload.changes]));
+        op.checkpoint();
+        return JSON.stringify({ tables, indirect, rebasedLocal: { ...choice, seal } });
+      };
+      const result = (replayed: boolean, delivery: OutboxDelivery, tip: RebaseJournalBookmark) =>
+        Object.freeze({ replayed, delivery, recordSha256: original.recordSha256,
+          afterBookmark: original.basis, throughBookmark: tip });
+      if (prior !== null) {
+        const record = JSON.parse(prior.scope) as { rebasedLocal?: { throughBookmark?: unknown } };
+        const value = record.rebasedLocal?.throughBookmark;
+        if (value === null || typeof value !== "object") fail("HISTORY", "Delivery ID belongs to other source work");
+        const at = boundary(value, this.#id);
+        if (at.sha256 === null || at.position < original.basis.position || prior.stream !== null)
+          fail("CORRUPT", "Invalid retained publication history boundary");
+        const tip: RebaseJournalBookmark = Object.freeze({ format: BOOKMARK_FORMAT,
+          journalId: this.#id, position: at.position, sha256: at.sha256 });
+        if (through !== undefined && (through.position !== tip.position ||
+            (through.sha256 !== null && through.sha256 !== tip.sha256)))
+          fail("HISTORY", "This operation already published a different history boundary");
+        if (await scopeFor(tip, prior.delivery) !== prior.scope)
+          fail("CORRUPT", "Retained publication identity, scope or decision was changed");
+        if (prior.delivery.byteLength > this.#policy.maxBytes)
+          fail("LIMIT", "Retained publication exceeds the configured message limit");
+        await loadOutbox(tx, prior);
+        // Do not consult newer (or lost) remote history when recovering already
+        // retained output. The original and sealed publication are the evidence.
+        return result(true, prior.delivery, tip);
+      }
+      const rebased = await this.#rebaseAt(tx, op, original.changeset,
+        boundary(original.basis, this.#id), through);
+      const bytes = rebased.changeset;
+      if (bytes.length > maxBytes - before.bytes) fail("LIMIT", "Rebased output exceeds outbox capacity");
+      const changes = decodeChangeset(bytes, this.#policy).reduce((n, table) => n + table.changes.length, 0);
+      const scope = await scopeFor(rebased.throughBookmark,
+        { sha256: await hash(bytes), byteLength: bytes.length, changes });
+      await ensureOutbox(tx, true);
+      const delivery = await storeOutbox(tx, deliveryId, scope, { changeset: bytes, changes }, op.checkpoint);
+      const retained = await findOutbox(tx, deliveryId);
+      if (retained === null) fail("CORRUPT", "Published changeset disappeared");
+      await loadOutbox(tx, retained);
+      const after = await usage();
+      if (after.entries !== before.entries + 1 || after.bytes !== before.bytes + bytes.length ||
+          await captureFanoutGuard(tx) !== fanout)
+        fail("CORRUPT", "Publication changed unrelated outbox or replica state");
+      op.checkpoint();
+      return result(false, delivery, rebased.throughBookmark);
     }, op.transactionOptions);
   }
 
