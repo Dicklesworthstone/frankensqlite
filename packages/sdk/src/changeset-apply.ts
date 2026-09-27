@@ -73,6 +73,8 @@ export interface ApplyChangesetOptions<Change extends PatchsetChange = Changeset
    * Fresh full changesets only, after row application but BEFORE commit. Save
    * these owned bytes with tx, never publish them externally from this hook.
    * Replay skips the hook: recover prior decisions from the journal you saved.
+   * Admitted hook SQL drains before the receipt or rollback; saved executors
+   * expire when the hook exits. Any failed admitted SQL aborts even if caught.
    * Throws/cancellation/commit failure roll back journal, rows and receipt.
    */
   onRebase?: ChangesetRebaseHook;
@@ -645,6 +647,45 @@ function recordRebase<Change extends PatchsetChange>(
   });
 }
 
+/** Drain hook SQL before receipt publication or rollback; saved handles expire. */
+async function runRebaseHook(
+  tx: ChangesetExecutor,
+  hook: ChangesetRebaseHook,
+  bytes: Uint8Array,
+  checkpoint: () => void,
+): Promise<void> {
+  let accepting = true, failed = false;
+  let firstFailure: unknown;
+  const pending = new Set<Promise<unknown>>();
+  const submit = <T>(operation: () => Promise<T>): Promise<T> => {
+    if (!accepting) return Promise.reject(new ChangesetApplyError(
+      "ERR_FSQLITE_CHANGESET_INPUT", "Changeset rebase hook SQL scope has ended",
+    ));
+    const task = (async () => {
+      checkpoint();
+      const result = await operation();
+      checkpoint();
+      return result;
+    })();
+    pending.add(task);
+    void task.then(() => pending.delete(task), error => {
+      pending.delete(task);
+      if (!failed) { failed = true; firstFailure = error; }
+    });
+    return task;
+  };
+  const scoped = Object.freeze({
+    execute: (sql, params) => submit(() => tx.execute(sql, params)),
+    query: (sql, params) => submit(() => tx.query(sql, params)),
+  } satisfies ChangesetExecutor);
+  // A callback failure takes precedence, but cannot abandon its admitted SQL.
+  // Closing admission first makes a single allSettled snapshot sufficient.
+  try { await hook(scoped, bytes); }
+  finally { accepting = false; await Promise.allSettled(pending); }
+  if (failed) throw firstFailure;
+  checkpoint();
+}
+
 /**
  * Apply bounded SQLite session wire changes through real owned SQL. Schema and
  * explicit before-image conflicts fail closed by default. This is NOT the full
@@ -722,7 +763,7 @@ async function applySession<Change extends PatchsetChange>(
       settings.checkpoint();
       const info = encodeRebaseInfo([...settings.rebase.values()], settings.limits);
       settings.checkpoint();
-      await settings.onRebase(tx, info);
+      await runRebaseHook(tx, settings.onRebase, info, settings.checkpoint);
       settings.checkpoint();
     }
     if (delivery !== null) {
