@@ -465,6 +465,53 @@ async function collect(
   return changes.length ? { name: p.table, primaryKey: p.pk, changes } : null;
 }
 
+/** @internal Drain admitted callback SQL before collection, cleanup or rollback. */
+export async function runCaptureWork<T>(
+  tx: ChangesetExecutor,
+  work: (tx: ChangesetExecutor) => T | Promise<T>,
+  checkpoint: () => void,
+): Promise<T> {
+  let accepting = true, failed = false;
+  let firstFailure: unknown;
+  const pending = new Set<Promise<unknown>>();
+  const submit = <U>(operation: () => Promise<U>): Promise<U> => {
+    // Late use must not enter the adapter, retain this scope's state, or poison
+    // an unrelated transaction. Never enqueue another operation after closure.
+    if (!accepting) return Promise.reject(new ChangesetCaptureError(
+      "ERR_FSQLITE_CAPTURE_INPUT", "Capture callback SQL scope has ended"));
+    const task = (async () => {
+      checkpoint();
+      const result = await operation();
+      checkpoint();
+      return result;
+    })();
+    pending.add(task);
+    // Observe every rejection even when the callback drops or catches it. Keep
+    // only the first cause; repeatedly caught failures must not build an array.
+    void task.then(() => pending.delete(task), error => {
+      pending.delete(task);
+      if (!failed) { failed = true; firstFailure = error; }
+    });
+    return task;
+  };
+  const scoped = Object.freeze({
+    execute: (sql, params) => submit(() => tx.execute(sql, params)),
+    query: (sql, params) => submit(() => tx.query(sql, params)),
+  } satisfies ChangesetExecutor);
+  let value: T;
+  try { value = await work(scoped); }
+  finally {
+    accepting = false;
+    // Cancellation and callback failure cannot race a rollback against SQL
+    // already handed to the owner. The owner still provides its own admission
+    // limits and execution ordering; no extra writer lock or queue is added.
+    await Promise.allSettled(pending);
+  }
+  if (failed) throw firstFailure;
+  checkpoint();
+  return value;
+}
+
 /**
  * Capture callback DML through real SQL triggers inside one owned transaction.
  * Requires recursive_triggers=ON and no application triggers on captured tables.
@@ -520,7 +567,7 @@ export function prepareChangesetCapture<T>(
       for (const p of plans) await install(tx, s, p);
       const mainVersion = await scalar(tx, s, "PRAGMA main.schema_version");
       const tempVersion = await scalar(tx, s, "PRAGMA temp.schema_version");
-      const value = await work(tx);
+      const value = await runCaptureWork(tx, work, s.checkpoint);
       s.checkpoint();
       if (
         (await scalar(tx, s, "PRAGMA main.schema_version")) !== mainVersion ||

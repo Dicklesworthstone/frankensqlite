@@ -1,5 +1,5 @@
 import type { ChangesetExecutor, ChangesetTarget } from "./changeset-apply";
-import { ChangesetCaptureError, prepareSnapshotChangesetStream } from "./changeset-capture";
+import { ChangesetCaptureError, prepareSnapshotChangesetStream, runCaptureWork } from "./changeset-capture";
 import type { ChangesetSnapshot, SnapshotChangesetOptions } from "./changeset-capture";
 import { decodeChangeset, encodeChangeset } from "./changeset-codec";
 import type { ChangesetChange, ChangesetField, ChangesetLimits, ChangesetTable, ChangesetValue } from "./changeset-codec";
@@ -57,30 +57,6 @@ async function schemaVersion(tx: ChangesetExecutor, namespace: "main" | "temp"):
     fail("RESULT", "Invalid schema version during snapshot capture");
   return String(value);
 }
-/** A callback cannot leave admitted SQL running into collection or use its executor afterward. */
-async function runWork<T>(tx: ChangesetExecutor, work: (tx: ChangesetExecutor) => T | Promise<T>, check: () => void): Promise<T> {
-  let accepting = true;
-  const pending = new Set<Promise<unknown>>(), failures: unknown[] = [];
-  const submit = <U>(operation: () => Promise<U>): Promise<U> => {
-    const task = (async () => {
-      if (!accepting) fail("INPUT", "Snapshot capture callback SQL scope has ended");
-      check(); const value = await operation(); check(); return value;
-    })();
-    pending.add(task);
-    void task.then(() => pending.delete(task), error => { pending.delete(task); failures.push(error); });
-    return task;
-  };
-  const scoped = Object.freeze({
-    execute: (sql, params) => submit(() => tx.execute(sql, params)),
-    query: (sql, params) => submit(() => tx.query(sql, params)),
-  } satisfies ChangesetExecutor);
-  let value: T;
-  try { value = await work(scoped); }
-  finally { accepting = false; await Promise.allSettled(pending); }
-  if (failures.length) throw failures[0];
-  check(); return value;
-}
-
 /**
  * Opt-in full-scope before/after capture for tables with application triggers,
  * view-driven writes and foreign-key effects. No observation triggers are added.
@@ -136,7 +112,7 @@ export function prepareSnapshotCapture<T>(
           }
         }
       });
-      const value = await runWork(tx, work, stream.checkpoint);
+      const value = await runCaptureWork(tx, work, stream.checkpoint);
       const checkSchema = async () => {
         stream.checkpoint();
         if (await schemaVersion(tx, "main") !== mainVersion || await schemaVersion(tx, "temp") !== tempVersion)
