@@ -170,6 +170,13 @@ function digest(value: unknown): string {
   if (typeof value !== "string" || !/^[0-9a-f]{64}$/.test(value)) fail("CORRUPT", "Invalid journal digest");
   return value;
 }
+/** Internal column names only. Bound SQL text before the adapter decodes it. */
+function storedDigest(column: string): string {
+  // A 64-character ASCII digest occupies 128 bytes in either UTF-16 encoding.
+  // length(TEXT) alone cannot bound a NUL-hidden tail. Public digest validation
+  // still requires exactly 64 lowercase hexadecimal characters after retrieval.
+  return `CASE WHEN typeof(${column})='text' AND length(CAST(${column} AS BLOB))<=128 AND length(${column})=64 AND instr(${column},char(0))=0 THEN ${column} END`;
+}
 function owned(value: Uint8Array, maximum: number): Uint8Array {
   if (!(value instanceof Uint8Array)) fail("INPUT", "Expected Uint8Array bytes");
   const proto = Object.getPrototypeOf(Uint8Array.prototype) as object;
@@ -399,7 +406,7 @@ export class ChangesetRebaseJournal {
   }
 
   async #localEntry(tx: ChangesetExecutor, op: Operation, id: string): Promise<{ scope: string; record: RebaseJournalLocalRecord } | null> {
-    const hashes = ["scope_sha256", "basis_sha256", "sha256", "record_sha256"].map((c) => `CASE WHEN typeof(${c})='text' AND length(CAST(${c} AS BLOB))=64 THEN ${c} END`);
+    const hashes = ["scope_sha256", "basis_sha256", "sha256", "record_sha256"].map(storedDigest);
     const counters = ["basis_position", "byte_length", "change_count", "touched_rows"].map((c) => `CASE WHEN typeof(${c})='integer' THEN ${c} END`);
     const rows = await query(tx, op, `SELECT ${[...hashes, ...counters].join(",")}, CASE WHEN typeof(byte_length)='integer' AND byte_length BETWEEN 0 AND ${this.#policy.maxBytes} AND typeof(changeset)='blob' AND length(changeset)=byte_length THEN changeset END FROM ${LOCALS} WHERE journal_id=? AND operation_id=? LIMIT 2`, [this.#id, id]);
     if (!rows.length) return null;
@@ -439,7 +446,7 @@ export class ChangesetRebaseJournal {
     return Object.freeze({ journalId: this.#id, position, byteLength });
   }
   async #entry(tx: ChangesetExecutor, op: Operation, column: "position" | "delivery_id", value: number | string): Promise<RebaseJournalEntry | null> {
-    const rows = await query(tx, op, `SELECT position, CASE WHEN typeof(delivery_id)='text' AND length(CAST(delivery_id AS BLOB))<=512 THEN delivery_id END, CASE WHEN typeof(message_sha256)='text' AND length(message_sha256)=64 THEN message_sha256 END, CASE WHEN typeof(message_bytes)='integer' THEN message_bytes END, CASE WHEN typeof(sha256)='text' AND length(sha256)=64 THEN sha256 END, CASE WHEN typeof(byte_length)='integer' AND byte_length BETWEEN 0 AND ${this.#policy.maxBytes} AND typeof(rebase_info)='blob' AND length(rebase_info)=byte_length THEN rebase_info END FROM ${ENTRIES} WHERE journal_id=? AND ${column}=? LIMIT 2`, [this.#id, typeof value === "number" ? BigInt(value) : value]);
+    const rows = await query(tx, op, `SELECT position, CASE WHEN typeof(delivery_id)='text' AND length(CAST(delivery_id AS BLOB))<=1024 AND instr(delivery_id,char(0))=0 THEN delivery_id END, ${storedDigest("message_sha256")}, CASE WHEN typeof(message_bytes)='integer' THEN message_bytes END, ${storedDigest("sha256")}, CASE WHEN typeof(byte_length)='integer' AND byte_length BETWEEN 0 AND ${this.#policy.maxBytes} AND typeof(rebase_info)='blob' AND length(rebase_info)=byte_length THEN rebase_info END FROM ${ENTRIES} WHERE journal_id=? AND ${column}=? LIMIT 2`, [this.#id, typeof value === "number" ? BigInt(value) : value]);
     if (!rows.length) return null;
     if (rows.length !== 1 || rows[0]!.length !== 6) fail("CORRUPT", "Invalid journal entry");
     const r = rows[0]!, position = integer(r[0]), deliveryId = identity(r[1]), messageSha256 = digest(r[2]), messageBytes = integer(r[3]), sha256 = digest(r[4]);
@@ -448,7 +455,7 @@ export class ChangesetRebaseJournal {
     if (await hash(rebaseInfo) !== sha256) fail("CORRUPT", "Journal decision checksum mismatch");
     op.checkpoint();
     decodeRebaseInfo(rebaseInfo, this.#policy);
-    const receipt = await query(tx, op, `SELECT CASE WHEN typeof(sha256)='text' AND length(sha256)=64 THEN sha256 END, CASE WHEN typeof(byte_length)='integer' THEN byte_length END FROM main."${CHANGESET_RECEIPTS_TABLE}" WHERE delivery_id=? COLLATE BINARY LIMIT 2`, [deliveryId]);
+    const receipt = await query(tx, op, `SELECT ${storedDigest("sha256")}, CASE WHEN typeof(byte_length)='integer' THEN byte_length END FROM main."${CHANGESET_RECEIPTS_TABLE}" WHERE delivery_id=? COLLATE BINARY LIMIT 2`, [deliveryId]);
     if (receipt.length !== 1 || receipt[0]![0] !== messageSha256 || integer(receipt[0]![1]) !== messageBytes) fail("CORRUPT", "Journal entry does not match its application receipt");
     return Object.freeze({ journalId: this.#id, position, deliveryId, messageSha256, messageBytes, sha256, rebaseInfo });
   }
