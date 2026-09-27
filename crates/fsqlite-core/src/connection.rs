@@ -13199,6 +13199,17 @@ pub struct Connection {
     /// `SharedMvccState::data_version_global` — the shared per-database
     /// write-commit counter this connection subtracts its own commits from.
     data_version_global: Arc<AtomicU64>,
+    /// bd-11sz4: the per-database count of concurrent write commits, bumped
+    /// under the commit registry guard after each commit is physically
+    /// visible. Unlike commit sequence numbers, which each pager derives from
+    /// WAL state and which can disagree across TRUNCATE checkpoints, it is a
+    /// dense, shared order of in-process write commits.
+    concurrent_write_generation: Arc<AtomicU64>,
+    /// `concurrent_write_generation` sampled before this connection's current
+    /// concurrent transaction bound its pager snapshot. A schema change whose
+    /// sample no longer matches at commit may have built derived structures
+    /// (a new index) from a snapshot that misses a peer's committed rows.
+    concurrent_begin_write_generation: Cell<u64>,
     /// One-shot self-read fast path for the exact live VTAB instances enlisted
     /// in a validated local commit. The receipt is tied to that commit sequence;
     /// any other committed write clears it before a later reload can reuse it.
@@ -14818,6 +14829,8 @@ impl Connection {
             next_commit_seq: Arc::clone(&shared_mvcc_state.next_commit_seq),
             stable_commit_seq: Arc::clone(&shared_mvcc_state.stable_commit_seq),
             data_version_global: Arc::clone(&shared_mvcc_state.data_version_global),
+            concurrent_write_generation: Arc::clone(&shared_mvcc_state.concurrent_write_generation),
+            concurrent_begin_write_generation: Cell::new(0),
             committed_schema_cookie: Arc::clone(&shared_mvcc_state.committed_schema_cookie),
             memdb_visible_commit_seq: RefCell::new(initial_visible_commit_seq),
             // Never hydrate rows — this is the whole point of schema-only.
@@ -15360,6 +15373,8 @@ impl Connection {
             next_commit_seq: Arc::clone(&shared_mvcc_state.next_commit_seq),
             stable_commit_seq: Arc::clone(&shared_mvcc_state.stable_commit_seq),
             data_version_global: Arc::clone(&shared_mvcc_state.data_version_global),
+            concurrent_write_generation: Arc::clone(&shared_mvcc_state.concurrent_write_generation),
+            concurrent_begin_write_generation: Cell::new(0),
             committed_schema_cookie: Arc::clone(&shared_mvcc_state.committed_schema_cookie),
             memdb_visible_commit_seq: RefCell::new(initial_visible_commit_seq),
             memdb_rows_loaded: Cell::new(eager_memdb_rows),
@@ -57387,6 +57402,12 @@ impl Connection {
             return Ok(true);
         }
 
+        if is_concurrent {
+            // Sample before any snapshot binds, so every write commit this
+            // transaction's views could miss is counted after the sample.
+            self.concurrent_begin_write_generation
+                .set(self.concurrent_write_generation.load(AtomicOrdering::Acquire));
+        }
         let mut concurrent_snapshot = if is_concurrent {
             // bd-db300.8.2 / H2: forced single-writer mode does not need the
             // pre-BEGIN publication bind. The opened pager txn already exposes
@@ -70960,6 +70981,11 @@ impl Connection {
         };
 
         let hydrate_rows_at_begin = self.should_hydrate_memdb_rows_for_explicit_begin();
+        if is_concurrent {
+            // Sample before any snapshot binds (see the autocommit begin).
+            self.concurrent_begin_write_generation
+                .set(self.concurrent_write_generation.load(AtomicOrdering::Acquire));
+        }
         let prebound_publication = if is_concurrent {
             Some(
                 match self
@@ -71152,7 +71178,17 @@ impl Connection {
         })?;
         let begin_seq = handle.snapshot().high;
         drop(handle);
-        Ok(self.current_global_commit_seq() > begin_seq)
+        // bd-11sz4: commit sequence numbers come from each pager's view of WAL
+        // state and can disagree across TRUNCATE checkpoints, so a peer commit
+        // can carry a number at or below this snapshot. The dense in-process
+        // write generation cannot: any concurrent write commit since this
+        // transaction began invalidates a schema change built on its snapshot
+        // (for example a CREATE INDEX that would miss the peer's rows).
+        let peer_committed_since_begin = self
+            .concurrent_write_generation
+            .load(AtomicOrdering::Acquire)
+            != self.concurrent_begin_write_generation.get();
+        Ok(self.current_global_commit_seq() > begin_seq || peer_committed_since_begin)
     }
 
     fn capture_ssi_snapshot(handle: &ConcurrentHandle) -> SsiTxnEvidenceSnapshot {
@@ -71777,6 +71813,11 @@ impl Connection {
                 "mvcc commit finalized"
             );
         }
+        // bd-11sz4: the commit is physically visible and the registry guard is
+        // still held, so a concurrent schema change validating under the same
+        // guard either sees this bump or was ordered entirely before it.
+        self.concurrent_write_generation
+            .fetch_add(1, AtomicOrdering::AcqRel);
         let should_record_commit_evidence = Self::should_record_ssi_commit_evidence(&plan);
         let session_id = plan.session_id();
         finalize_prepared_concurrent_commit_with_ssi(
@@ -113474,6 +113515,10 @@ struct SharedMvccCoordinationState {
     /// this minus the reading connection's own write-commit count, so it moves
     /// only when ANOTHER connection commits (stock semantics).
     data_version_global: Arc<AtomicU64>,
+    /// bd-11sz4: dense count of concurrent write commits, bumped under the
+    /// commit registry guard once the commit is physically visible. See
+    /// `Connection::concurrent_write_generation`.
+    concurrent_write_generation: Arc<AtomicU64>,
     /// File-scoped background-worker poison, shared by EVERY connection to the
     /// same file regardless of which [`RuntimeContext`] opened it.
     ///
@@ -113528,6 +113573,7 @@ impl SharedMvccCoordinationState {
             committed_schema_cookie: Arc::new(AtomicU32::new(0)),
             open_connection_count: Arc::new(AtomicUsize::new(0)),
             data_version_global: Arc::new(AtomicU64::new(0)),
+            concurrent_write_generation: Arc::new(AtomicU64::new(0)),
             is_poisoned: AtomicBool::new(false),
             poison_cause: Mutex::new(None),
         }
@@ -113547,6 +113593,7 @@ struct SharedMvccState {
     committed_schema_cookie: Arc<AtomicU32>,
     open_connection_count: Arc<AtomicUsize>,
     data_version_global: Arc<AtomicU64>,
+    concurrent_write_generation: Arc<AtomicU64>,
     _coordination: Arc<SharedMvccCoordinationState>,
     _runtime: Arc<RuntimeContext>,
     runtime_state: Mutex<SharedRuntimeState>,
@@ -113608,6 +113655,7 @@ impl SharedMvccState {
             committed_schema_cookie: Arc::clone(&coordination.committed_schema_cookie),
             open_connection_count: Arc::clone(&coordination.open_connection_count),
             data_version_global: Arc::clone(&coordination.data_version_global),
+            concurrent_write_generation: Arc::clone(&coordination.concurrent_write_generation),
             _coordination: coordination,
             _runtime: runtime,
             runtime_state: Mutex::new(SharedRuntimeState {
