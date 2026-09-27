@@ -80481,6 +80481,183 @@ impl Connection {
         without_rowid
     }
 
+    /// GH#420: stream a lone table-valued function into simple aggregates.
+    ///
+    /// `SELECT sum(value) FROM generate_series(1, 1000000)` and its grouped and
+    /// filtered forms fold each cursor row straight into the streaming
+    /// accumulators. The general path would materialize the scan, re-project
+    /// every row and group them first. Every result column must be a builtin
+    /// count/sum/avg/min/max over `*` or a bare column, or a GROUP BY term. The
+    /// WHERE and GROUP BY must be plain expressions (no subquery, aggregate,
+    /// window function or collation). Without either, the scan reads only the
+    /// columns the aggregates use.
+    #[allow(clippy::too_many_lines)]
+    async fn try_execute_streaming_table_function_aggregate(
+        &self,
+        select: &SelectStatement,
+        params: Option<&[SqliteValue]>,
+        col_map: &[(String, String, bool)],
+    ) -> Result<Option<Vec<Row>>> {
+        let SelectCore::Select {
+            columns,
+            from: Some(from),
+            where_clause,
+            group_by,
+            having: None,
+            windows,
+            ..
+        } = &select.body.select
+        else {
+            return Ok(None);
+        };
+        let TableOrSubquery::TableFunction { name, args, .. } = &from.source else {
+            return Ok(None);
+        };
+        let plain_clause = |expr: &Expr| {
+            !expr_has_any_subquery(expr)
+                && !expr_contains_agg(expr)
+                && !expr_has_window_function(expr)
+                && join_expr_effective_collation(expr, col_map).is_none()
+        };
+        if select.with.is_some()
+            || !select.body.compounds.is_empty()
+            || !select.order_by.is_empty()
+            || !from.joins.is_empty()
+            || !windows.is_empty()
+            || self.scalar_function_overridden.get()
+            || self.custom_aggregate_registered.get()
+            || where_clause
+                .as_deref()
+                .is_some_and(|predicate| !plain_clause(predicate))
+        {
+            return Ok(None);
+        }
+        let mut group_by_exprs = group_by.clone();
+        resolve_group_by_aliases(&mut group_by_exprs, columns, col_map);
+        if !group_by_exprs.iter().all(plain_clause) {
+            return Ok(None);
+        }
+
+        // A WHERE or GROUP BY term may read any column; otherwise only the
+        // aggregates' columns are fetched.
+        let mut needed_columns =
+            vec![where_clause.is_some() || !group_by_exprs.is_empty(); col_map.len()];
+        let mut outputs = Vec::with_capacity(columns.len());
+        for column in columns {
+            let ResultColumn::Expr { expr, .. } = column else {
+                return Ok(None);
+            };
+            // A GROUP BY term has one value per group, which the group's
+            // representative row carries.
+            if group_by_exprs
+                .iter()
+                .any(|group_expr| exprs_match(expr, group_expr))
+            {
+                outputs.push(SimpleStreamingGroupByOutput::Plain(Box::new(expr.clone())));
+                continue;
+            }
+            let Expr::FunctionCall {
+                name: function,
+                args: function_args,
+                distinct: false,
+                order_by,
+                filter: None,
+                over: None,
+                ..
+            } = expr
+            else {
+                return Ok(None);
+            };
+            if !order_by.is_empty() {
+                return Ok(None);
+            }
+            let arg_col = match function_args {
+                FunctionArgs::Star if function.eq_ignore_ascii_case("count") => None,
+                FunctionArgs::List(exprs) if exprs.len() == 1 => {
+                    let Expr::Column(column_ref, _) = &exprs[0] else {
+                        return Ok(None);
+                    };
+                    let Ok(index) = find_col_in_map(
+                        col_map,
+                        column_ref.table.as_deref(),
+                        &column_ref.column,
+                        None,
+                    ) else {
+                        return Ok(None);
+                    };
+                    needed_columns[index] = true;
+                    Some(index)
+                }
+                _ => return Ok(None),
+            };
+            let output = match function.to_ascii_lowercase().as_str() {
+                "count" if arg_col.is_none() => SimpleStreamingGroupByOutput::CountStar,
+                "count" => SimpleStreamingGroupByOutput::CountValue {
+                    arg_col,
+                    arg_expr: None,
+                },
+                "sum" => SimpleStreamingGroupByOutput::SumValue {
+                    arg_col,
+                    arg_expr: None,
+                },
+                "avg" => SimpleStreamingGroupByOutput::AvgValue {
+                    arg_col,
+                    arg_expr: None,
+                },
+                "min" => SimpleStreamingGroupByOutput::MinValue {
+                    arg_col,
+                    arg_expr: None,
+                },
+                "max" => SimpleStreamingGroupByOutput::MaxValue {
+                    arg_col,
+                    arg_expr: None,
+                },
+                _ => return Ok(None),
+            };
+            outputs.push(output);
+        }
+
+        // Evaluate the WHERE and GROUP BY terms in the same collation and
+        // affinity context the materializing path uses.
+        let column_collations = self.build_join_col_collations(select);
+        let column_affinities = self.build_join_col_affinities(select);
+        let using_column_projections = self.build_join_using_column_projections(
+            select,
+            &column_collations,
+            &column_affinities,
+        );
+        let _join_eval_collation_guard =
+            JoinEvalCollationContextGuard::push(JoinEvalCollationContext {
+                declared_json_keys: HashSet::new(),
+                column_collations,
+                column_affinities,
+                using_column_projections,
+                registry: lock_unpoisoned(self.collation_registry.as_ref()).clone(),
+            });
+        let include_hidden_rowid = col_map.iter().any(|(_, _, hidden)| *hidden);
+        let predicate = where_clause.as_deref();
+        let mut grouping = SimpleStreamingGroupBy::new(&group_by_exprs, &outputs, col_map);
+        self.scan_table_function_rows(
+            name,
+            args,
+            params,
+            include_hidden_rowid,
+            Some(&needed_columns),
+            &mut |row| {
+                self.with_fallback_function_registry(|| {
+                    if let Some(predicate) = predicate
+                        && !eval_join_predicate(predicate, &row, col_map)?
+                    {
+                        return Ok(());
+                    }
+                    grouping.push(row)
+                })
+            },
+        )
+        .await?;
+        grouping.finish().map(Some)
+    }
+
     /// Handle GROUP BY + JOIN by materializing the join first, then applying
     /// GROUP BY aggregation directly on the joined rows.
     #[allow(clippy::too_many_lines)]
@@ -80495,6 +80672,12 @@ impl Connection {
         // the internal join scan can project hidden rowid slots in the same
         // order later aggregation uses.
         let col_map = self.build_join_col_map(select);
+        if let Some(rows) = self
+            .try_execute_streaming_table_function_aggregate(select, params, &col_map)
+            .await?
+        {
+            return Ok(rows);
+        }
         // Indices that JOIN ... USING / NATURAL JOIN coalesce away, so an
         // unqualified reference to a shared column (e.g. `GROUP BY dept_id`)
         // resolves to the single surviving occurrence instead of being
@@ -85488,10 +85671,32 @@ impl Connection {
         params: Option<&[SqliteValue]>,
         include_hidden_rowid: bool,
     ) -> Result<Vec<Vec<SqliteValue>>> {
+        let mut rows = Vec::new();
+        self.scan_table_function_rows(name, args, params, include_hidden_rowid, None, &mut |row| {
+            rows.push(row);
+            Ok(())
+        })
+        .await?;
+        Ok(rows)
+    }
+
+    /// Run a table-valued function and hand each row to `on_row` as the cursor
+    /// produces it. With `needed_columns`, a column (or the hidden rowid, the
+    /// slot after the last column) whose mask entry is false is left NULL
+    /// without calling into the cursor for it.
+    async fn scan_table_function_rows(
+        &self,
+        name: &str,
+        args: &[Expr],
+        params: Option<&[SqliteValue]>,
+        include_hidden_rowid: bool,
+        needed_columns: Option<&[bool]>,
+        on_row: &mut dyn FnMut(Vec<SqliteValue>) -> Result<()>,
+    ) -> Result<()> {
         // bd-1hn48: `pragma_<name>(arg)` table-valued functions reuse the
         // existing PRAGMA row generators by synthesizing a PRAGMA statement.
         if let Some(columns) = pragma_table_function_columns(name) {
-            return self
+            let rows = self
                 .execute_pragma_table_function_rows(
                     name,
                     columns.len(),
@@ -85499,7 +85704,8 @@ impl Connection {
                     params,
                     include_hidden_rowid,
                 )
-                .await;
+                .await?;
+            return rows.into_iter().try_for_each(on_row);
         }
 
         let empty_row: Vec<SqliteValue> = Vec::new();
@@ -85557,12 +85763,14 @@ impl Connection {
             &arg_values,
             column_count,
             include_hidden_rowid,
+            needed_columns,
+            on_row,
         );
         let cleanup_result = pending_instance.cleanup();
         match (scan_result, cleanup_result) {
-            (Ok(rows), Ok(())) => Ok(rows),
+            (Ok(()), Ok(())) => Ok(()),
             (Err(scan_error), Ok(())) => Err(scan_error),
-            (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
+            (Ok(()), Err(cleanup_error)) => Err(cleanup_error),
             (Err(scan_error), Err(cleanup_error)) => Err(FrankenError::Internal(format!(
                 "table-valued function {name} scan failed: {scan_error}; disconnect failed: {cleanup_error}"
             ))),
@@ -85632,7 +85840,9 @@ impl Connection {
         args: &[SqliteValue],
         column_count: usize,
         include_hidden_rowid: bool,
-    ) -> Result<Vec<Vec<SqliteValue>>> {
+        needed_columns: Option<&[bool]>,
+        on_row: &mut dyn FnMut(Vec<SqliteValue>) -> Result<()>,
+    ) -> Result<()> {
         let cx = self.op_cx()?;
         let mut cursor = self.invoke_live_vtab_callback("xOpen", || {
             vtab.open_cursor()
@@ -85640,10 +85850,14 @@ impl Connection {
         })?;
         self.invoke_live_vtab_callback("xFilter", || cursor.erased_filter(&cx, 0, None, args))?;
 
-        let mut rows = Vec::new();
+        let needed = |slot: usize| needed_columns.is_none_or(|mask| mask.get(slot) == Some(&true));
         while !self.invoke_live_vtab_callback("xEof", || Ok(cursor.erased_eof()))? {
             let mut row = Vec::with_capacity(column_count + usize::from(include_hidden_rowid));
             for col in 0..column_count {
+                if !needed(col) {
+                    row.push(SqliteValue::Null);
+                    continue;
+                }
                 let mut ctx = ColumnContext::new();
                 let col_idx = i32::try_from(col).map_err(|_| {
                     FrankenError::Internal(format!(
@@ -85656,15 +85870,19 @@ impl Connection {
                 row.push(ctx.take_value().unwrap_or(SqliteValue::Null));
             }
             if include_hidden_rowid {
-                row.push(SqliteValue::Integer(
-                    self.invoke_live_vtab_callback("xRowid", || cursor.erased_rowid())?,
-                ));
+                row.push(if needed(column_count) {
+                    SqliteValue::Integer(
+                        self.invoke_live_vtab_callback("xRowid", || cursor.erased_rowid())?,
+                    )
+                } else {
+                    SqliteValue::Null
+                });
             }
-            rows.push(row);
+            on_row(row)?;
             self.invoke_live_vtab_callback("xNext", || cursor.erased_next(&cx))?;
         }
 
-        Ok(rows)
+        Ok(())
     }
 
     /// Execute a GROUP BY aggregate SELECT via post-execution processing:
@@ -120302,7 +120520,98 @@ fn finalize_simple_streaming_group_by_row(
         .collect()
 }
 
-#[allow(clippy::too_many_lines)]
+/// Groups rows one at a time into [`SimpleStreamingGroupByState`]s, for
+/// callers that produce rows from a loop they cannot turn into an iterator.
+struct SimpleStreamingGroupBy<'a> {
+    groups: BTreeMap<Vec<SqliteValue>, SimpleStreamingGroupByState>,
+    group_by_exprs: &'a [Expr],
+    outputs: &'a [SimpleStreamingGroupByOutput],
+    col_map: &'a [(String, String, bool)],
+}
+
+impl<'a> SimpleStreamingGroupBy<'a> {
+    fn new(
+        group_by_exprs: &'a [Expr],
+        outputs: &'a [SimpleStreamingGroupByOutput],
+        col_map: &'a [(String, String, bool)],
+    ) -> Self {
+        Self {
+            groups: BTreeMap::new(),
+            group_by_exprs,
+            outputs,
+            col_map,
+        }
+    }
+
+    fn push(&mut self, row_values: Vec<SqliteValue>) -> Result<()> {
+        let key: Vec<SqliteValue> = self
+            .group_by_exprs
+            .iter()
+            .map(|expr| eval_join_expr(expr, &row_values, self.col_map))
+            .collect::<Result<_>>()?;
+        match self.groups.entry(key) {
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                update_simple_streaming_group_by_state(
+                    entry.get_mut(),
+                    self.outputs,
+                    &row_values,
+                    self.col_map,
+                )?;
+            }
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                let mut state = SimpleStreamingGroupByState::new(row_values.clone(), self.outputs);
+                update_simple_streaming_group_by_state(
+                    &mut state,
+                    self.outputs,
+                    &row_values,
+                    self.col_map,
+                )?;
+                entry.insert(state);
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<Vec<Row>> {
+        let Self {
+            mut groups,
+            group_by_exprs,
+            outputs,
+            col_map,
+        } = self;
+        if groups.is_empty() && group_by_exprs.is_empty() {
+            groups.insert(
+                Vec::new(),
+                SimpleStreamingGroupByState::new(Vec::new(), outputs),
+            );
+        }
+
+        // The map groups by value equality (encoding-independent) but iterates in
+        // canonical UTF-8 order; stock emits groups in BINARY order of the stored
+        // encoding.
+        let encoding = statement_text_encoding();
+        let mut groups: Vec<(Vec<SqliteValue>, SimpleStreamingGroupByState)> =
+            groups.into_iter().collect();
+        if !matches!(encoding, TextEncoding::Utf8) {
+            groups.sort_by(|(a, _), (b, _)| {
+                a.iter()
+                    .zip(b)
+                    .map(|(a, b)| a.cmp_binary_in(b, encoding))
+                    .find(|ordering| ordering.is_ne())
+                    .unwrap_or_else(|| a.len().cmp(&b.len()))
+            });
+        }
+        groups
+            .into_iter()
+            .map(|(_, state)| {
+                Ok(Row {
+                    values: finalize_simple_streaming_group_by_row(&state, outputs, col_map)?,
+                })
+            })
+            .collect()
+    }
+}
+
 fn execute_simple_streaming_group_by_rows<I>(
     raw_rows: I,
     group_by_exprs: &[Expr],
@@ -120312,61 +120621,11 @@ fn execute_simple_streaming_group_by_rows<I>(
 where
     I: IntoIterator<Item = Vec<SqliteValue>>,
 {
-    let mut groups: BTreeMap<Vec<SqliteValue>, SimpleStreamingGroupByState> = BTreeMap::new();
-
+    let mut grouping = SimpleStreamingGroupBy::new(group_by_exprs, outputs, col_map);
     for row in raw_rows {
-        let row_values = row;
-        let key: Vec<SqliteValue> = group_by_exprs
-            .iter()
-            .map(|expr| eval_join_expr(expr, &row_values, col_map))
-            .collect::<Result<_>>()?;
-        match groups.entry(key) {
-            std::collections::btree_map::Entry::Occupied(mut entry) => {
-                update_simple_streaming_group_by_state(
-                    entry.get_mut(),
-                    outputs,
-                    &row_values,
-                    col_map,
-                )?;
-            }
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                let mut state = SimpleStreamingGroupByState::new(row_values.clone(), outputs);
-                update_simple_streaming_group_by_state(&mut state, outputs, &row_values, col_map)?;
-                entry.insert(state);
-            }
-        }
+        grouping.push(row)?;
     }
-
-    if groups.is_empty() && group_by_exprs.is_empty() {
-        groups.insert(
-            Vec::new(),
-            SimpleStreamingGroupByState::new(Vec::new(), outputs),
-        );
-    }
-
-    // The map groups by value equality (encoding-independent) but iterates in
-    // canonical UTF-8 order; stock emits groups in BINARY order of the stored
-    // encoding.
-    let encoding = statement_text_encoding();
-    let mut groups: Vec<(Vec<SqliteValue>, SimpleStreamingGroupByState)> =
-        groups.into_iter().collect();
-    if !matches!(encoding, TextEncoding::Utf8) {
-        groups.sort_by(|(a, _), (b, _)| {
-            a.iter()
-                .zip(b)
-                .map(|(a, b)| a.cmp_binary_in(b, encoding))
-                .find(|ordering| ordering.is_ne())
-                .unwrap_or_else(|| a.len().cmp(&b.len()))
-        });
-    }
-    groups
-        .into_iter()
-        .map(|(_, state)| {
-            Ok(Row {
-                values: finalize_simple_streaming_group_by_row(&state, outputs, col_map)?,
-            })
-        })
-        .collect()
+    grouping.finish()
 }
 
 fn execute_simple_streaming_group_by_select(
@@ -196910,6 +197169,141 @@ mod tests {
                     vec![SqliteValue::Integer(4)],
                     vec![SqliteValue::Integer(6)],
                 ],
+            );
+        });
+    }
+
+    /// GH#420: aggregates over a lone table-valued function stream the cursor.
+    #[test]
+    fn test_table_function_aggregate_streams_with_stock_results() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            let one_row = |sql: &'static str| {
+                let conn = &conn;
+                async move {
+                    let rows = conn.query(sql).await.unwrap();
+                    assert_eq!(rows.len(), 1, "{sql}");
+                    row_values(&rows[0])
+                }
+            };
+            assert_eq!(
+                one_row(
+                    "SELECT sum(value), count(*), count(value), avg(value), min(value), max(value) \
+                     FROM generate_series(1, 100000)"
+                )
+                .await,
+                vec![
+                    SqliteValue::Integer(5_000_050_000),
+                    SqliteValue::Integer(100_000),
+                    SqliteValue::Integer(100_000),
+                    SqliteValue::Float(50_000.5),
+                    SqliteValue::Integer(1),
+                    SqliteValue::Integer(100_000),
+                ],
+            );
+            assert_eq!(
+                one_row(
+                    "SELECT sum(value), count(*), avg(value), min(value), max(value) \
+                     FROM generate_series(5, 1)"
+                )
+                .await,
+                vec![
+                    SqliteValue::Null,
+                    SqliteValue::Integer(0),
+                    SqliteValue::Null,
+                    SqliteValue::Null,
+                    SqliteValue::Null,
+                ],
+            );
+            // Hidden columns and the rowid read through the alias agree with
+            // the materializing path.
+            let mut last_rowid = one_row(
+                "SELECT gs.rowid FROM generate_series(10, 20, 5) AS gs ORDER BY 1 DESC LIMIT 1",
+            )
+            .await;
+            let last_rowid = last_rowid.remove(0);
+            assert_eq!(
+                one_row(
+                    "SELECT max(gs.rowid), min(gs.step), max(gs.value) \
+                     FROM generate_series(10, 20, 5) AS gs"
+                )
+                .await,
+                vec![last_rowid, SqliteValue::Integer(5), SqliteValue::Integer(20)],
+            );
+            assert_eq!(
+                one_row("SELECT DISTINCT count(*) FROM generate_series(1, 3) LIMIT 1").await,
+                vec![SqliteValue::Integer(3)],
+            );
+            assert_eq!(
+                one_row(
+                    "SELECT count(*), sum(value) FROM generate_series(1, 100) \
+                     WHERE value % 7 = 0"
+                )
+                .await,
+                vec![SqliteValue::Integer(14), SqliteValue::Integer(735)],
+            );
+            assert_eq!(
+                one_row("SELECT count(*) FROM generate_series(1, 10, 2) WHERE step = 2").await,
+                vec![SqliteValue::Integer(5)],
+            );
+            assert_eq!(
+                one_row("SELECT count(*), sum(value) FROM generate_series(1, 10) WHERE value > 99")
+                    .await,
+                vec![SqliteValue::Integer(0), SqliteValue::Null],
+            );
+            let grouped = |sql: &'static str| {
+                let conn = &conn;
+                async move {
+                    conn.query(sql)
+                        .await
+                        .unwrap()
+                        .iter()
+                        .map(row_values)
+                        .collect::<Vec<_>>()
+                }
+            };
+            let int = SqliteValue::Integer;
+            assert_eq!(
+                grouped(
+                    "SELECT value % 3, count(*), sum(value) FROM generate_series(1, 10) GROUP BY 1"
+                )
+                .await,
+                vec![
+                    vec![int(0), int(3), int(18)],
+                    vec![int(1), int(4), int(22)],
+                    vec![int(2), int(3), int(15)],
+                ],
+            );
+            assert_eq!(
+                grouped(
+                    "SELECT value % 2 AS parity, max(value) FROM generate_series(1, 9) \
+                     WHERE value > 3 GROUP BY parity"
+                )
+                .await,
+                vec![vec![int(0), int(8)], vec![int(1), int(9)]],
+            );
+            // HAVING keeps the materializing path.
+            assert_eq!(
+                grouped(
+                    "SELECT value, count(*) FROM generate_series(1, 3) \
+                     GROUP BY value HAVING count(*) > 0"
+                )
+                .await,
+                vec![
+                    vec![int(1), int(1)],
+                    vec![int(2), int(1)],
+                    vec![int(3), int(1)],
+                ],
+            );
+            let overflow = conn
+                .query(
+                    "SELECT sum(value) \
+                     FROM generate_series(9223372036854775000, 9223372036854775807, 400)",
+                )
+                .await;
+            assert!(
+                matches!(overflow, Err(FrankenError::IntegerOverflow)),
+                "{overflow:?}"
             );
         });
     }
