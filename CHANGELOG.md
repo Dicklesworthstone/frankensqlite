@@ -385,6 +385,13 @@ this CHANGELOG), never a working tree.
   and pass in isolation. Pre-existing reds: `crates/fsqlite/tests/generate_series_constraints.rs`
   (bd-cpa8b, fixed on main after this release) and the `crates/fsqlite/tests/update_rowid_in_oracle.rs`
   plan-shape assertion (bd-4x6tm).
+- **bd-4iaoi (P0, also present in v0.4.4 and earlier; fix pending for 0.4.7):** a schema change inside an
+  explicit `BEGIN IMMEDIATE` or `BEGIN EXCLUSIVE` transaction (for example `CREATE INDEX`, or `DROP` followed
+  by `CREATE`) can leave rows missing from the index, persistently. The missing rows belong to another
+  connection in the same process that autocommits writes in the default concurrent mode while the schema
+  change commits. Cross-process peers have not yet been characterized. Deferred `BEGIN`, which is promoted to
+  CONCURRENT by default, and autocommit DDL are not affected. Until 0.4.7, run explicit-transaction DDL only
+  while no concurrent writers are active, or use autocommit DDL.
 
 ---
 
