@@ -97757,6 +97757,9 @@ impl Connection {
                     max_root_page,
                     &header,
                     &free_pages,
+                    // cass#503: only the deferred-FTS5 repair open may bind
+                    // a missing FTS5 shadow autoindex; it drops the shadow.
+                    self.defer_fts5_hydration,
                 )?;
 
             // Parse each sqlite_master row and rebuild schema + MemDatabase.

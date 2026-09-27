@@ -199,6 +199,11 @@ pub(crate) enum BoundImplicitAutoindexStorage {
     TableRoot,
     /// A physical implicit index backed by its own B-tree root.
     IndexRoot(i32),
+    /// The declared implicit index of an FTS5 shadow table has no
+    /// sqlite_master row (GH cass#503: archives written before the #434
+    /// writer fix). Bound only for the deferred-FTS5 repair open, which drops
+    /// and recreates the shadow; no index schema is produced for it.
+    AbsentFts5ShadowIndex,
 }
 
 #[derive(Debug, Clone)]
@@ -222,7 +227,8 @@ impl BoundTableAutoindexes {
         self.slots
             .iter()
             .filter_map(|bound| match bound.storage {
-                BoundImplicitAutoindexStorage::TableRoot => None,
+                BoundImplicitAutoindexStorage::TableRoot
+                | BoundImplicitAutoindexStorage::AbsentFts5ShadowIndex => None,
                 BoundImplicitAutoindexStorage::IndexRoot(root_page) => Some(
                     bound
                         .slot
@@ -593,11 +599,19 @@ fn claim_sqlite_master_root(
 /// paths must prove the complete expected implicit-index set and root ownership
 /// before either mutates `MemDatabase`, because `create_table_at` replaces an
 /// existing root on collision.
+///
+/// `tolerate_missing_fts5_shadow_autoindexes` is set only by the deferred-FTS5
+/// repair open. It binds a missing implicit autoindex of an FTS5 shadow table
+/// (`<vtab>_data|_idx|_content|_docsize|_config` of a declared `fts5` virtual
+/// table) as [`BoundImplicitAutoindexStorage::AbsentFts5ShadowIndex`] instead
+/// of refusing the whole open, so the repair can drop and recreate that
+/// derived shadow. Every other table, and every other open, stays strict.
 pub(crate) fn bind_implicit_autoindex_catalog(
     master_entries: &[Vec<SqliteValue>],
     max_root_page: u32,
     header: &DatabaseHeader,
     free_pages: &HashSet<PageNumber>,
+    tolerate_missing_fts5_shadow_autoindexes: bool,
 ) -> Result<BoundImplicitAutoindexCatalog> {
     if max_root_page == 0 {
         return Err(sqlite_master_corrupt(
@@ -954,6 +968,21 @@ pub(crate) fn bind_implicit_autoindex_catalog(
         }
     }
 
+    let fts5_shadow_tables: HashSet<String> = if tolerate_missing_fts5_shadow_autoindexes {
+        virtual_table_variants
+            .values()
+            .flatten()
+            .filter(|variant| variant.module.eq_ignore_ascii_case("fts5"))
+            .flat_map(|variant| {
+                let vtab = variant.name.to_ascii_lowercase();
+                ["data", "idx", "content", "docsize", "config"]
+                    .into_iter()
+                    .map(move |suffix| format!("{vtab}_{suffix}"))
+            })
+            .collect()
+    } else {
+        HashSet::new()
+    };
     let mut by_table = HashMap::with_capacity(pending_by_table.len());
     for (table_key, pending) in pending_by_table {
         let mut bound_slots = Vec::with_capacity(pending.slots.len());
@@ -961,14 +990,20 @@ pub(crate) fn bind_implicit_autoindex_catalog(
             let ordinal = slot_index + 1;
             let storage = if slot.is_hidden_without_rowid_primary_key() {
                 BoundImplicitAutoindexStorage::TableRoot
-            } else {
-                let root_page = pending.physical_roots[slot_index].ok_or_else(|| {
-                    sqlite_master_corrupt(format!(
-                        "sqlite_master is missing implicit autoindex slot {ordinal} for table `{}`",
-                        pending.table_name
-                    ))
-                })?;
+            } else if let Some(root_page) = pending.physical_roots[slot_index] {
                 BoundImplicitAutoindexStorage::IndexRoot(root_page)
+            } else if fts5_shadow_tables.contains(&table_key) {
+                tracing::warn!(
+                    table = %pending.table_name,
+                    ordinal,
+                    "sqlite_master is missing the implicit autoindex of an FTS5 shadow table; bound as absent for the deferred-FTS5 repair open"
+                );
+                BoundImplicitAutoindexStorage::AbsentFts5ShadowIndex
+            } else {
+                return Err(sqlite_master_corrupt(format!(
+                    "sqlite_master is missing implicit autoindex slot {ordinal} for table `{}`",
+                    pending.table_name
+                )));
             };
             bound_slots.push(BoundImplicitAutoindexSlot {
                 ordinal,
@@ -1869,7 +1904,7 @@ pub async fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
 
     let free_pages = txn.live_freelist_pages().into_iter().collect();
     let bound_implicit_autoindexes =
-        bind_implicit_autoindex_catalog(&master_entries, max_root_page, &header, &free_pages)?;
+        bind_implicit_autoindex_catalog(&master_entries, max_root_page, &header, &free_pages, false)?;
 
     // Parse each sqlite_master row.
     // Columns: type(0), name(1), tbl_name(2), rootpage(3), sql(4)
@@ -6436,7 +6471,7 @@ PRAGMA integrity_check;
         free_pages: &HashSet<PageNumber>,
         detail_needle: &str,
     ) {
-        let error = bind_implicit_autoindex_catalog(entries, max_root_page, header, free_pages)
+        let error = bind_implicit_autoindex_catalog(entries, max_root_page, header, free_pages, false)
             .unwrap_err();
         let FrankenError::DatabaseCorrupt { detail } = error else {
             panic!("{case_name}: expected DatabaseCorrupt, found {error:?}");
@@ -6558,6 +6593,7 @@ PRAGMA integrity_check;
                 2,
                 &DatabaseHeader::default(),
                 &HashSet::new(),
+                false,
             )
             .unwrap_or_else(|error| panic!("{case_name}: unexpected bind failure: {error}"));
             for row_index in 0..entries.len() {
@@ -6613,6 +6649,7 @@ PRAGMA integrity_check;
             8,
             &DatabaseHeader::default(),
             &HashSet::new(),
+            false,
         )
         .unwrap();
         let ordinary = catalog.table("T").unwrap();
@@ -6713,6 +6750,7 @@ PRAGMA integrity_check;
             3,
             &DatabaseHeader::default(),
             &HashSet::new(),
+            false,
         )
         .unwrap();
         assert!(catalog.table("PLAIN").is_some());
