@@ -104,6 +104,7 @@ export class RebaseJournalError extends Error {
       | "ERR_FSQLITE_REBASE_JOURNAL_LIMIT"
       | "ERR_FSQLITE_REBASE_JOURNAL_MISSING"
       | "ERR_FSQLITE_REBASE_JOURNAL_HISTORY"
+      | "ERR_FSQLITE_REBASE_JOURNAL_EXPIRED"
       | "ERR_FSQLITE_REBASE_JOURNAL_CANCELLED"
       | "ERR_FSQLITE_REBASE_JOURNAL_TIMEOUT",
     message: string,
@@ -116,12 +117,15 @@ const HEADS = `main."${REBASE_JOURNAL_HEADS_TABLE}"`;
 const ENTRIES = `main."${REBASE_JOURNAL_ENTRIES_TABLE}"`;
 const LOCALS = `main."${REBASE_JOURNAL_LOCALS_TABLE}"`;
 const MAX_WIRE = 64 * 1024 * 1024;
+const MAX_POSITION = Number.MAX_SAFE_INTEGER;
+const RETENTION_NAME = "__fsqlite_rebase_journal_retention";
+const RETENTION = `main."${RETENTION_NAME}"`;
 const LOCAL_PUBLICATION_FORMAT = "fsqlite-rebase-outbox-v1";
 const encodeJson = (value: unknown): Uint8Array => new TextEncoder().encode(JSON.stringify(value));
 async function localDeliveryId(journalId: string, operationId: string): Promise<string> {
   return `${LOCAL_PUBLICATION_FORMAT}:${await hash(encodeJson([journalId, operationId]))}`;
 }
-function fail(kind: "INPUT" | "SCHEMA" | "CORRUPT" | "LIMIT" | "MISSING" | "HISTORY" | "CANCELLED" | "TIMEOUT", message: string): never {
+function fail(kind: "INPUT" | "SCHEMA" | "CORRUPT" | "LIMIT" | "MISSING" | "HISTORY" | "EXPIRED" | "CANCELLED" | "TIMEOUT", message: string): never {
   throw new RebaseJournalError(`ERR_FSQLITE_REBASE_JOURNAL_${kind}`, message);
 }
 function identity(value: unknown): string {
@@ -144,8 +148,8 @@ function bound(value: unknown, fallback: number, maximum: number): number {
   return n;
 }
 function position(value: unknown): number {
-  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0 || value > 100_000)
-    fail("INPUT", "Journal positions must be integers in 0..100000");
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0)
+    fail("INPUT", "Journal positions must be nonnegative safe integers");
   return value;
 }
 interface HistoryBoundary {
@@ -253,6 +257,8 @@ const layouts = [
 async function ensure(tx: ChangesetExecutor, op: Operation, create: boolean): Promise<boolean> {
   const found = await query(tx, op, "SELECT name FROM main.sqlite_schema WHERE name COLLATE NOCASE IN (?, ?)", [REBASE_JOURNAL_HEADS_TABLE, REBASE_JOURNAL_ENTRIES_TABLE]);
   if (found.length === 0) {
+    if (await ensureRetention(tx, op, false))
+      fail("CORRUPT", "Retained history checkpoint lost its journal tables; do not reinitialize");
     if (!create) return false;
     op.checkpoint();
     await tx.execute(`CREATE TABLE ${HEADS} (journal_id TEXT NOT NULL COLLATE BINARY PRIMARY KEY, position INTEGER NOT NULL, byte_length INTEGER NOT NULL) WITHOUT ROWID`);
@@ -320,12 +326,51 @@ async function localRecordDigest(record: Omit<RebaseJournalLocalRecord, "changes
   ])));
 }
 
+const retentionLayout: JournalLayout = {
+  name: RETENTION_NAME,
+  columns: ["journal_id", "position", "sha256", "record_sha256"],
+  types: ["TEXT", "INTEGER", "TEXT", "TEXT"],
+  keys: [["journal_id"]],
+};
+async function ensureRetention(tx: ChangesetExecutor, op: Operation, create: boolean): Promise<boolean> {
+  const objects = await query(tx, op,
+    "SELECT 1 FROM main.sqlite_schema WHERE name=? COLLATE NOCASE LIMIT 2", [RETENTION_NAME]);
+  if (!objects.length) {
+    if (!create) return false;
+    await tx.execute(`CREATE TABLE ${RETENTION} (journal_id TEXT NOT NULL COLLATE BINARY PRIMARY KEY, position INTEGER NOT NULL, sha256 TEXT NOT NULL, record_sha256 TEXT NOT NULL) WITHOUT ROWID`);
+  } else if (objects.length !== 1) fail("SCHEMA", "Ambiguous journal retention storage");
+  await validateLayouts(tx, op, [retentionLayout]);
+  return true;
+}
+function floorSeal(floor: RebaseJournalBookmark): Promise<string> {
+  return hash(encodeJson(["fsqlite-rebase-retention-v1", floor.journalId, floor.position, floor.sha256]));
+}
+async function historyFloor(tx: ChangesetExecutor, op: Operation, journalId: string): Promise<RebaseJournalBookmark> {
+  if (await ensureRetention(tx, op, false)) {
+    const rows = await query(tx, op, `SELECT CASE WHEN typeof(position)='integer' THEN position END, ${storedDigest("sha256")}, ${storedDigest("record_sha256")} FROM ${RETENTION} WHERE journal_id=? LIMIT 2`, [journalId]);
+    if (rows.length) {
+      if (rows.length !== 1 || rows[0]!.length !== 3) fail("CORRUPT", "Invalid history checkpoint row");
+      const row = rows[0]!;
+      const floor = Object.freeze({ format: BOOKMARK_FORMAT, journalId,
+        position: integer(row[0]), sha256: digest(row[1]) });
+      if (floor.position === 0 || await floorSeal(floor) !== digest(row[2]))
+        fail("CORRUPT", "History checkpoint identity or checksum mismatch");
+      op.checkpoint();
+      return floor;
+    }
+  }
+  const sha256 = await hash(encodeJson([BOOKMARK_FORMAT, journalId]));
+  op.checkpoint();
+  return Object.freeze({ format: BOOKMARK_FORMAT, journalId, position: 0, sha256 });
+}
+
 /**
  * Ordered persistent conflict decisions, atomically coupled to applyChangeset's
  * rows and delivery receipt. A replay MUST find its original journal entry.
  * Bounded retention refuses new applications rather than dropping needed history.
  * enqueueLocal explicitly retains rebased output in the same database outbox.
- * retireLocal explicitly releases acknowledged originals, not remote history.
+ * retireLocal releases acknowledged originals; retireThrough explicitly ends
+ * older remote-decision retention without removing duplicate-delivery receipts.
  * No automatic pruning, native replication, or retry is implied.
  *
  * The target must own transactions. A nested target remains provisional until
@@ -666,7 +711,7 @@ export class ChangesetRebaseJournal {
     if (rows.length !== 1 || rows[0]!.length !== 9) fail("CORRUPT", "Invalid original local record");
     const r = rows[0]!, scope = digest(r[0]), basisSha = digest(r[1]), sha256 = digest(r[2]), recordSha256 = digest(r[3]);
     const at = integer(r[4]), byteLength = integer(r[5]), changes = integer(r[6]), touchedRows = integer(r[7]);
-    if (at > 100_000 || byteLength > this.#policy.maxBytes || changes > this.#policy.maxChanges || touchedRows > 100_000 || !(r[8] instanceof Uint8Array))
+    if (byteLength > this.#policy.maxBytes || changes > this.#policy.maxChanges || touchedRows > 100_000 || !(r[8] instanceof Uint8Array))
       fail("CORRUPT", "Invalid or over-limit original local metadata");
     const changeset = owned(r[8], this.#policy.maxBytes);
     const basis: RebaseJournalBookmark = Object.freeze({ format: BOOKMARK_FORMAT, journalId: this.#id, position: at, sha256: basisSha });
@@ -683,17 +728,21 @@ export class ChangesetRebaseJournal {
   async #currentBookmark(tx: ChangesetExecutor, op: Operation): Promise<RebaseJournalBookmark> {
     const present = await ensure(tx, op, false);
     const head = present ? await this.#head(tx, op, false) : { position: 0 };
-    return (await this.#history(tx, op, { position: 0, sha256: null }, { position: head.position, sha256: null })).throughBookmark;
+    const floor = await historyFloor(tx, op, this.#id);
+    return (await this.#history(tx, op, floor, { position: head.position, sha256: null })).throughBookmark;
   }
 
-  async #head(tx: ChangesetExecutor, op: Operation, create: boolean): Promise<RebaseJournalHead> {
+  async #head(tx: ChangesetExecutor, op: Operation, create: boolean, enforceLimits = true): Promise<RebaseJournalHead> {
     const rows = await query(tx, op, `SELECT CASE WHEN typeof(position)='integer' THEN position END, CASE WHEN typeof(byte_length)='integer' THEN byte_length END FROM ${HEADS} WHERE journal_id=?`, [this.#id]);
     if (rows.length > 1) fail("CORRUPT", "Duplicate journal head");
     const position = rows.length ? integer(rows[0]![0]) : 0, byteLength = rows.length ? integer(rows[0]![1]) : 0;
-    if (position > this.#maxEntries || byteLength > this.#maxBytes) fail("LIMIT", "Retained journal exceeds configured limits");
+    const floor = await historyFloor(tx, op, this.#id), retained = position - floor.position;
+    if (retained < 0 || retained > 100_000 || (!rows.length && floor.position !== 0))
+      fail("CORRUPT", "Journal head disagrees with its history checkpoint");
+    if (enforceLimits && (retained > this.#maxEntries || byteLength > this.#maxBytes)) fail("LIMIT", "Retained journal exceeds configured limits");
     const totals = await query(tx, op, `SELECT count(*), coalesce(min(position),0), coalesce(max(position),0), coalesce(sum(CASE WHEN typeof(byte_length)='integer' AND byte_length BETWEEN 0 AND ${MAX_WIRE} THEN byte_length ELSE 0 END),0), count(CASE WHEN typeof(position)='integer' AND position>0 AND typeof(byte_length)='integer' AND byte_length BETWEEN 0 AND ${MAX_WIRE} AND typeof(rebase_info)='blob' AND length(rebase_info)=byte_length THEN 1 END) FROM ${ENTRIES} WHERE journal_id=?`, [this.#id]);
     const r = totals[0];
-    if (totals.length !== 1 || r?.length !== 5 || integer(r[0]) !== position || integer(r[1]) !== (position ? 1 : 0) || integer(r[2]) !== position || integer(r[3]) !== byteLength || integer(r[4]) !== position)
+    if (totals.length !== 1 || r?.length !== 5 || integer(r[0]) !== retained || integer(r[1]) !== (retained ? floor.position + 1 : 0) || integer(r[2]) !== (retained ? position : 0) || integer(r[3]) !== byteLength || integer(r[4]) !== retained)
       fail("CORRUPT", "Journal history has a gap, missing head, or invalid byte accounting");
     if (!rows.length && create) await write(tx, op, `INSERT OR ABORT INTO ${HEADS} VALUES (?,0,0)`, [this.#id]);
     return Object.freeze({ journalId: this.#id, position, byteLength });
@@ -703,7 +752,7 @@ export class ChangesetRebaseJournal {
     if (!rows.length) return null;
     if (rows.length !== 1 || rows[0]!.length !== 6) fail("CORRUPT", "Invalid journal entry");
     const r = rows[0]!, position = integer(r[0]), deliveryId = identity(r[1]), messageSha256 = digest(r[2]), messageBytes = integer(r[3]), sha256 = digest(r[4]);
-    if (!position || position > this.#maxEntries || messageBytes > MAX_WIRE || !(r[5] instanceof Uint8Array)) fail("CORRUPT", "Invalid or over-limit journal record");
+    if (!position || messageBytes > MAX_WIRE || !(r[5] instanceof Uint8Array)) fail("CORRUPT", "Invalid or over-limit journal record");
     const rebaseInfo = owned(r[5], this.#policy.maxBytes);
     if (await hash(rebaseInfo) !== sha256) fail("CORRUPT", "Journal decision checksum mismatch");
     op.checkpoint();
@@ -729,16 +778,20 @@ export class ChangesetRebaseJournal {
     const wire = owned(bytes, this.#policy.maxBytes);
     let saved: RebaseJournalEntry | null = null;
     let before: RebaseJournalHead | undefined;
+    let beforeFloor: RebaseJournalBookmark | undefined;
     let messageSha256 = "";
     const target: ChangesetTarget = {
       transaction: (work, transactionOptions) => this.#target.transaction(async (tx) => {
         await ensure(tx, op, true);
         before = await this.#head(tx, op, true);
+        beforeFloor = await historyFloor(tx, op, this.#id);
         messageSha256 = await hash(wire);
         op.checkpoint();
         const result = await work(tx);
         await ensure(tx, op, false);
         await this.#head(tx, op, false);
+        if (JSON.stringify(await historyFloor(tx, op, this.#id)) !== JSON.stringify(beforeFloor))
+          fail("CORRUPT", "Application changed the retained history checkpoint");
         saved = await this.#entry(tx, op, "delivery_id", deliveryId);
         if (saved === null) fail("MISSING", "The application receipt has no original journal decision; do not fabricate or replay it");
         if (saved.messageSha256 !== messageSha256 || saved.messageBytes !== wire.length) fail("CORRUPT", "Journal entry identifies different input bytes");
@@ -752,8 +805,10 @@ export class ChangesetRebaseJournal {
       onRebase: async (tx, info) => {
         await ensure(tx, op, false);
         const head = await this.#head(tx, op, false);
-        if (!before || head.position !== before.position || head.byteLength !== before.byteLength) fail("CORRUPT", "Journal history changed during application");
-        if (head.position >= this.#maxEntries || info.length > this.#maxBytes - head.byteLength) fail("LIMIT", "Rebase journal is full; application must roll back");
+        const floor = await historyFloor(tx, op, this.#id);
+        if (!before || head.position !== before.position || head.byteLength !== before.byteLength ||
+            JSON.stringify(floor) !== JSON.stringify(beforeFloor)) fail("CORRUPT", "Journal history changed during application");
+        if (head.position === MAX_POSITION || head.position - floor.position >= this.#maxEntries || info.length > this.#maxBytes - head.byteLength) fail("LIMIT", "Rebase journal is full; application must roll back");
         const sha256 = await hash(info);
         op.checkpoint();
         const next = head.position + 1;
@@ -770,6 +825,114 @@ export class ChangesetRebaseJournal {
     // No post-commit cancellation check: success must not be relabeled rollback.
     if (saved === null) fail("MISSING", "Journal transaction returned without a saved decision");
     return Object.freeze({ ...result, entry: saved });
+  }
+
+  /** Current resumable floor and retained decision capacity; never prunes. */
+  async retention(options?: RebaseJournalOperationOptions): Promise<{
+    readonly floor: RebaseJournalBookmark;
+    readonly retainedEntries: number;
+    readonly byteLength: number;
+  }> {
+    const op = operation(options);
+    return this.#target.transaction(async tx => {
+      const present = await ensure(tx, op, false);
+      const head = present ? await this.#head(tx, op, false, false) : { position: 0, byteLength: 0 };
+      const floor = await historyFloor(tx, op, this.#id);
+      return Object.freeze({ floor, retainedEntries: head.position - floor.position, byteLength: head.byteLength });
+    }, op.transactionOptions);
+  }
+
+  /**
+   * Explicitly end remote-decision retention through an EXACT saved bookmark.
+   * Retained originals pin their basis, including already-published originals:
+   * retire those with retireLocal after delivery before crossing their basis.
+   * Call only when external replay/rebase consumers no longer need the prefix.
+   * Inbox receipts remain: old deliveries cannot reapply, but journaled replay
+   * can no longer return a removed decision. No ACK or checkpoint is implied.
+   */
+  async retireThrough(through: RebaseJournalBookmark, options?: RebaseJournalOperationOptions): Promise<{
+    readonly removed: number;
+    readonly byteLength: number;
+    readonly retainedEntries: number;
+    readonly floor: RebaseJournalBookmark;
+  }> {
+    const selected = boundary(through, this.#id);
+    if (selected.sha256 === null) fail("INPUT", "History retirement requires a complete bookmark, not a position");
+    const op = operation(options);
+    return this.#target.transaction(async tx => {
+      const present = await ensure(tx, op, false);
+      // Like original retirement, cleanup is permitted under lowered aggregate
+      // caps. Individual messages and every stored record still validate.
+      const before = present ? await this.#head(tx, op, false, false) : { position: 0, byteLength: 0 };
+      const previous = await historyFloor(tx, op, this.#id);
+      if (selected.position > before.position) fail("MISSING", "Retirement exceeds committed remote history");
+      // Verify the selected prefix AND the live suffix before erasing evidence.
+      // Starting from an earlier retained floor preserves original hash domains.
+      const verified = await this.#history(tx, op, selected, { position: before.position, sha256: null });
+      const floor = verified.afterBookmark, removed = floor.position - previous.position;
+      const result = (bytes: number) => Object.freeze({ removed, byteLength: bytes,
+        retainedEntries: before.position - floor.position, floor });
+      if (removed === 0) return result(0);
+      await this.#checkRetentionPins(tx, op, floor, before.position);
+      const totals = await query(tx, op, `SELECT count(*),coalesce(sum(byte_length),0) FROM ${ENTRIES} WHERE journal_id=? AND position>? AND position<=?`,
+        [this.#id, BigInt(previous.position), BigInt(floor.position)]);
+      if (totals.length !== 1 || totals[0]!.length !== 2 || integer(totals[0]![0]) !== removed)
+        fail("CORRUPT", "Retiring history population changed");
+      const bytes = integer(totals[0]![1]);
+      if (bytes > before.byteLength) fail("CORRUPT", "Retiring history exceeds retained byte accounting");
+      const seal = await floorSeal(floor);
+      op.checkpoint();
+      await ensureRetention(tx, op, true);
+      if (previous.position === 0) {
+        await write(tx, op, `INSERT OR ABORT INTO ${RETENTION} VALUES (?,?,?,?)`,
+          [this.#id, BigInt(floor.position), floor.sha256, seal]);
+      } else {
+        await write(tx, op, `UPDATE OR ABORT ${RETENTION} SET position=?,sha256=?,record_sha256=? WHERE journal_id=? AND position=? AND sha256=? COLLATE BINARY AND record_sha256=? COLLATE BINARY`,
+          [BigInt(floor.position), floor.sha256, seal, this.#id, BigInt(previous.position), previous.sha256, await floorSeal(previous)]);
+      }
+      op.checkpoint();
+      const deleted = await tx.execute(`DELETE FROM ${ENTRIES} WHERE journal_id=? AND position>? AND position<=?`,
+        [this.#id, BigInt(previous.position), BigInt(floor.position)]);
+      op.checkpoint();
+      if (deleted !== removed) fail("CORRUPT", "History retirement removed an unexpected number of decisions");
+      await write(tx, op, `UPDATE OR ABORT ${HEADS} SET byte_length=? WHERE journal_id=? AND position=? AND byte_length=?`,
+        [BigInt(before.byteLength - bytes), this.#id, BigInt(before.position), BigInt(before.byteLength)]);
+      const after = await this.#head(tx, op, false, false);
+      const retained = await historyFloor(tx, op, this.#id);
+      if (after.position !== before.position || after.byteLength !== before.byteLength - bytes ||
+          JSON.stringify(retained) !== JSON.stringify(floor))
+        fail("CORRUPT", "History retirement changed its committed frontier");
+      // The same full-prefix identity must remain recoverable after compaction.
+      await this.#history(tx, op, floor, verified.throughBookmark);
+      op.checkpoint();
+      return result(bytes);
+    }, op.transactionOptions);
+  }
+
+  /** Verify one original at a time; a forged basis counter cannot hide a pin. */
+  async #checkRetentionPins(tx: ChangesetExecutor, op: Operation, floor: RebaseJournalBookmark, tip: number): Promise<void> {
+    if (!await ensureLocals(tx, op, false)) return;
+    const usage = await this.#localUsage(tx, op, false);
+    if (usage.entries > 100_000) fail("LIMIT", "Too many originals to validate for retirement");
+    let cursor: string | null = null, checked = 0;
+    while (checked < usage.entries) {
+      const rows = await query(tx, op, `SELECT CASE WHEN typeof(operation_id)='text' AND length(CAST(operation_id AS BLOB))<=1024 AND instr(operation_id,char(0))=0 THEN operation_id END FROM ${LOCALS} WHERE journal_id=?${cursor === null ? "" : " AND operation_id>? COLLATE BINARY"} ORDER BY operation_id LIMIT 32`,
+        cursor === null ? [this.#id] : [this.#id, cursor]);
+      if (!rows.length || rows.length > 32) fail("CORRUPT", "Missing original retention page");
+      for (const row of rows) {
+        if (row.length !== 1) fail("CORRUPT", "Invalid original retention row");
+        const id = identity(row[0]);
+        if (id === cursor || ++checked > usage.entries) fail("CORRUPT", "Repeated original retention key");
+        const saved = await this.#localEntry(tx, op, id);
+        if (saved === null) fail("CORRUPT", "Retained original disappeared during retirement");
+        const basis = saved.record.basis;
+        if (basis.position < floor.position || basis.position > tip ||
+            (basis.position === floor.position && basis.sha256 !== floor.sha256))
+          fail("HISTORY", "A retained original still requires the retiring history, or has a different basis");
+        cursor = id;
+      }
+    }
+    op.checkpoint();
   }
 
   async head(options?: RebaseJournalOperationOptions): Promise<RebaseJournalHead> {
@@ -793,7 +956,8 @@ export class ChangesetRebaseJournal {
     return this.#target.transaction(async (tx) => {
       const present = await ensure(tx, op, false);
       const head = present ? await this.#head(tx, op, false) : { position: 0 };
-      const result = await this.#history(tx, op, { position: 0, sha256: null }, { position: head.position, sha256: null });
+      const floor = await historyFloor(tx, op, this.#id);
+      const result = await this.#history(tx, op, floor, { position: head.position, sha256: null });
       return result.throughBookmark;
     }, op.transactionOptions);
   }
@@ -804,14 +968,13 @@ export class ChangesetRebaseJournal {
     op.checkpoint();
     // JSON arrays make bounded UTF-8 identities unambiguous. The versioned
     // domain binds the journal; each next digest binds the COMPLETE prefix.
-    let current: RebaseJournalBookmark = Object.freeze({
-      format: BOOKMARK_FORMAT, journalId: this.#id, position: 0,
-      sha256: await hash(encoder.encode(JSON.stringify([BOOKMARK_FORMAT, this.#id]))),
-    });
+    let current = await historyFloor(tx, op, this.#id);
+    if (after.position < current.position || through.position < current.position)
+      fail("EXPIRED", "This rebase history prefix was explicitly retired; do not substitute a newer basis");
     op.checkpoint();
     let afterBookmark = current;
-    if (after.position === 0) verifyBoundary(after, current);
-    for (let i = 1; i <= through.position; i++) {
+    if (after.position === current.position) verifyBoundary(after, current);
+    for (let i = current.position + 1; i <= through.position; i++) {
       const entry = await this.#entry(tx, op, "position", i);
       if (entry === null) fail("MISSING", "A rebase decision is missing from the requested history");
       if (entry.position !== i) fail("CORRUPT", "Journal returned the wrong history position");
