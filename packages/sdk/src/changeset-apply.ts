@@ -56,6 +56,8 @@ export type ChangesetRebaseHook = (
 ) => void | Promise<void>;
 
 export interface ApplyChangesetOptions<Change extends PatchsetChange = ChangesetChange> {
+  /** Opt in: apply writable Session fields and let the trusted target schema recompute generated values. */
+  generatedColumns?: "recompute";
   /** Explicit allowlist of direct target tables in main; NOT a SQL sandbox. */
   tables: readonly string[];
   /** Stable source-qualified delivery identity; atomically recorded with the rows. */
@@ -149,6 +151,9 @@ function capture<Change extends PatchsetChange>(options: ApplyChangesetOptions<C
   const signal = options?.signal,
     timeoutMs = options?.timeoutMs;
   const deliveryId = options?.deliveryId;
+  const generatedColumns = options?.generatedColumns;
+  if (generatedColumns !== undefined && generatedColumns !== "recompute")
+    invalid("generatedColumns must be recompute when supplied");
   if (!Array.isArray(source) || source.length > 256)
     invalid("tables must be an explicit allowlist of at most 256 names");
   const names = new Set<string>();
@@ -220,7 +225,7 @@ function capture<Change extends PatchsetChange>(options: ApplyChangesetOptions<C
     primaryKey: readonly number[];
     changes: ChangesetRebaseTable["changes"][number][];
   }>();
-  return { names, onConflict, onRebase, rebase, limits, deliveryId, transactionOptions, checkpoint };
+  return { names, onConflict, onRebase, rebase, limits, deliveryId, generatedColumns, transactionOptions, checkpoint };
 }
 
 type Settings<Change extends PatchsetChange> = ReturnType<typeof capture<Change>>;
@@ -418,7 +423,7 @@ async function readReceipt(
 
 async function planTable<Change extends PatchsetChange>(
   tx: ChangesetExecutor,
-  settings: Checkpoints,
+  settings: Checkpoints & Pick<Settings<Change>, "generatedColumns">,
   wire: TablePlan<Change>["wire"],
 ): Promise<TablePlan<Change>> {
   const listed = await read(tx, settings, `PRAGMA main.table_list(${literal(wire.name)})`);
@@ -436,19 +441,28 @@ async function planTable<Change extends PatchsetChange>(
   if (info.length !== count) badResult();
   const columns: string[] = [],
     seen = new Set<string>();
+  let writable = 0;
   for (let i = 0; i < count; i++) {
     const row = info[i]!,
       column = identifier(row[1]);
     if (integer(row[0]) !== i || seen.has(fold(column))) badResult();
-    if (integer(row[6]) !== 0) schema(`Generated and hidden columns are not supported: ${name}`);
+    seen.add(fold(column));
+    const hidden = integer(row[6]);
+    if (hidden === 2 || hidden === 3) {
+      if (settings.generatedColumns !== "recompute") schema(`Generated and hidden columns require generatedColumns: recompute: ${name}`);
+      if (integer(row[5]) !== 0) schema(`Generated primary keys are not supported: ${name}`);
+      continue;
+    }
+    if (hidden !== 0) schema(`Hidden columns are not supported: ${name}`);
     // SQLite changesets identify key positions; nonzero ordinal bytes are not
     // required to equal PRAGMA's ordinals (older producers use boolean bytes).
-    if ((integer(row[5]) !== 0) !== (i < wire.primaryKey.length && wire.primaryKey[i] !== 0)) {
+    if ((integer(row[5]) !== 0) !== (writable < wire.primaryKey.length && wire.primaryKey[writable] !== 0)) {
       schema(`Incompatible primary key: ${name}`);
     }
-    seen.add(fold(column));
-    if (i < wire.primaryKey.length) columns.push(column);
+    if (writable < wire.primaryKey.length) columns.push(column);
+    writable++;
   }
+  if (writable < wire.primaryKey.length) schema(`Incompatible writable column count: ${name}`);
   return { wire, name, columns: Object.freeze(columns), sqlName: `main.${quote(name)}` };
 }
 

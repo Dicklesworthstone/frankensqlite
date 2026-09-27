@@ -71,6 +71,8 @@ export interface BootstrapInstallReceipt {
   }>;
 }
 export interface BootstrapReceiverOptions {
+  /** Opt in to recomputation by compatible generated-column destination schemas. */
+  generatedColumns?: "recompute";
   receiverId: string;
   /** Fixed direct-target authority, checked on every operation, including replay. */
   tables: readonly string[];
@@ -546,7 +548,7 @@ async function chunkMeta(tx: ChangesetExecutor, b: Budget, index: number) {
     storedBytes: sqlNumber(r[4], HARD_CHUNK),
   };
 }
-async function emptyTargets(tx: ChangesetExecutor, b: Budget, m: BootstrapManifest): Promise<void> {
+async function emptyTargets(tx: ChangesetExecutor, b: Budget, m: BootstrapManifest, generatedColumns: "recompute" | undefined): Promise<void> {
   for (const table of m.tables) {
     const rows = (await query(tx, b, `PRAGMA main.table_list(${literal(table)})`)).filter(
       (r) => r[0] === "main" && typeof r[1] === "string" && fold(r[1]) === table,
@@ -558,10 +560,12 @@ async function emptyTargets(tx: ChangesetExecutor, b: Budget, m: BootstrapManife
       !info.length ||
       info.length > 2000 ||
       info.length !== sqlNumber(rows[0]![3], 2000) ||
-      info.some((r) => sqlNumber(r[6], 3) !== 0) ||
-      !info.some((r) => sqlNumber(r[5], 2000) > 0)
+      info.some((r, i) => sqlNumber(r[0], 2000) !== i || sqlNumber(r[6], 3) === 1 ||
+        (generatedColumns !== "recompute" && sqlNumber(r[6], 3) !== 0) ||
+        (sqlNumber(r[6], 3) !== 0 && sqlNumber(r[5], 2000) !== 0)) ||
+      !info.some((r) => sqlNumber(r[6], 3) === 0 && sqlNumber(r[5], 2000) > 0)
     )
-      fail("SCHEMA", "Bootstrap needs visible columns and declared primary keys");
+      fail("SCHEMA", "Bootstrap needs writable columns and declared primary keys");
     await noTriggers(tx, b, table);
     if ((await query(tx, b, `SELECT 1 FROM main.${quote(table)} LIMIT 1`)).length)
       fail("STATE", "Initial bootstrap refuses nonempty destination tables");
@@ -584,9 +588,14 @@ export class ChangesetBootstrapReceiver {
   readonly #chunks: number;
   readonly #changes: number;
   readonly #orderedSourceId: string | undefined;
+  readonly #generatedColumns: "recompute" | undefined;
   #active = false;
   constructor(target: ChangesetTarget, options: BootstrapReceiverOptions) {
     this.#target = target;
+    const generatedColumns = options?.generatedColumns;
+    if (generatedColumns !== undefined && generatedColumns !== "recompute")
+      fail("INPUT", "generatedColumns must be recompute when supplied");
+    this.#generatedColumns = generatedColumns;
     this.#id = text(options?.receiverId, 256);
     this.#tables = tableNames(options?.tables);
     const confirm = options?.confirmCommit;
@@ -794,7 +803,7 @@ export class ChangesetBootstrapReceiver {
           await this.#verifyPrefix(tx, b, m, true);
           return true;
         }
-        await emptyTargets(tx, b, m);
+        await emptyTargets(tx, b, m, this.#generatedColumns);
         const count = await query(tx, b, `SELECT count(*) FROM ${CHUNKS}`);
         if (
           count.length !== 1 ||
@@ -832,7 +841,9 @@ export class ChangesetBootstrapReceiver {
           bytes += meta.byteLength;
           changes += n;
           b.check();
-          const result = await applyChangeset(inside, chunk, { tables: m.tables, ...b.options() });
+          const result = await applyChangeset(inside, chunk, { tables: m.tables, ...b.options(),
+            ...(this.#generatedColumns === undefined ? {} : { generatedColumns: this.#generatedColumns }),
+          });
           b.check();
           if (result.applied !== n || result.omitted !== 0 || result.replayed)
             fail("CORRUPT", "Bootstrap row application was incomplete");

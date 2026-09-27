@@ -9,6 +9,8 @@ import type {
 import { encodeChangeset } from "./changeset-codec";
 
 export interface CaptureChangesetOptions {
+  /** Opt in to native Session writable-column packing; receivers recompute generated values. */
+  generatedColumns?: "recompute";
   /** Existing ordinary main tables with declared primary keys; at most 64. */
   tables: readonly string[];
   /** Distinct first-touch keys retained in TEMP, including net-zero changes. */
@@ -114,6 +116,9 @@ function bounded(value: unknown, fallback: number, ceiling: number): number {
   return n;
 }
 function settings(options: CaptureChangesetOptions, streaming = false) {
+  const generatedColumns = options?.generatedColumns;
+  if (generatedColumns !== undefined && generatedColumns !== "recompute")
+    fail("INPUT", "generatedColumns must be recompute when supplied");
   const input = options?.tables;
   if (!Array.isArray(input) || !input.length || input.length > 64)
     fail("INPUT", "Capture 1..64 explicit tables");
@@ -181,12 +186,14 @@ function settings(options: CaptureChangesetOptions, streaming = false) {
       );
     }
   }
-  return { tables, maxRows, maxBytes, maxCells, indirect, limits, transactionOptions, checkpoint };
+  return { tables, maxRows, maxBytes, maxCells, indirect, limits, generatedColumns, transactionOptions, checkpoint };
 }
 type Settings = ReturnType<typeof settings>;
 interface Plan {
   table: string;
   columns: string[];
+  /** Physical table_xinfo ordinals for the writable session columns. */
+  cids: number[];
   pk: number[];
   keys: number[];
   journal: string;
@@ -234,15 +241,24 @@ async function plan(
   if (!info.length || info.length > 256 || info.length !== count(matches[0]![3]))
     fail("SCHEMA", "Capture supports 1..256 columns per table");
   const columns: string[] = [],
+    cids: number[] = [],
     pk: number[] = [],
     keys: number[] = [];
   for (let c = 0; c < info.length; c++) {
     const row = info[c]!;
-    if (count(row[0]) !== c || count(row[6]) !== 0)
-      fail("SCHEMA", "Hidden/generated capture columns are not supported");
-    columns.push(name(row[1]));
-    pk.push(count(row[5]));
-    if (pk[c] !== 0) keys.push(c);
+    if (count(row[0]) !== c) fail("RESULT", "Invalid capture column ordinal");
+    const hidden = count(row[6]), key = count(row[5]);
+    // SQLite Session packs only writable columns, not physical table slots.
+    // Generated values are recomputed by the receiver's trusted schema.
+    if (hidden === 2 || hidden === 3) {
+      if (s.generatedColumns !== "recompute") fail("SCHEMA", "Hidden/generated capture columns are not supported without generatedColumns: recompute");
+      if (key !== 0) fail("SCHEMA", "Generated primary keys cannot be captured");
+      continue;
+    }
+    if (hidden !== 0) fail("SCHEMA", "Hidden capture columns are not supported");
+    const column = columns.length;
+    columns.push(name(row[1])); cids.push(c); pk.push(key);
+    if (key !== 0) keys.push(column);
   }
   if (
     !keys.length ||
@@ -270,7 +286,7 @@ async function plan(
       fail("SCHEMA", "Capture tables with application triggers are not supported");
     }
   }
-  const keyType = info[keys[0]!]![2];
+  const keyType = info[cids[keys[0]!]!]![2];
   const rowidAlias =
     count(matches[0]![4]) === 0 &&
     keys.length === 1 &&
@@ -278,7 +294,7 @@ async function plan(
     keyType.toUpperCase() === "INTEGER"
       ? keys[0]!
       : null;
-  return { table, columns, pk, keys, journal: `${PREFIX}${i}`, rowidAlias };
+  return { table, columns, cids, pk, keys, journal: `${PREFIX}${i}`, rowidAlias };
 }
 
 async function textDecoder(tx: ChangesetExecutor, s: Settings): Promise<TextDecoder> {
@@ -633,7 +649,7 @@ async function snapshotKeys(tx: ChangesetExecutor, s: Settings, p: Plan): Promis
   for (const row of index) {
     const key = count(row[5]);
     if (key === 0) continue;
-    const column = count(row[1]),
+    const column = p.cids.indexOf(count(row[1])),
       descending = count(row[3]);
     if (
       key !== 1 ||
