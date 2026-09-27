@@ -178,6 +178,10 @@ pub enum WalNativeRecoveryReason {
     /// A complete unadvertised tail observed under a fresh native WRITE owner.
     /// This survives unwind and requests canonical recovery at later admission.
     UnpublishedWalTail,
+    /// Every in-use reader mark sits above the header's mxFrame: the header is
+    /// older than the WAL it describes, and a reader that cannot publish a
+    /// mark can never be admitted until the index is rebuilt (GH#430).
+    StaleReaderMarks,
 }
 
 /// Reader admission result; ordinary errors never authorize recovery.

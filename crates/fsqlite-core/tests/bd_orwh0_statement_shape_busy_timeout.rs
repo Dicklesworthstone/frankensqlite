@@ -395,3 +395,267 @@ fn statement_shape_busy_table() {
          {BUSY_TIMEOUT_MS}ms.\nA shape with refusals at ~0ms is a bd-orwh0 instance."
     );
 }
+
+// ---- bd-11sz4: a writer must maintain an index a peer re-created across TRUNCATE checkpoints ----
+
+/// Read a positive `usize` knob from the environment, falling back to `default`.
+fn bd_11sz4_knob(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+/// One bd-11sz4 stress run (driven by [`bd_11sz4_stress_parallel_harness`]).
+///
+/// A "checkpointer" connection alternates `PRAGMA wal_checkpoint(TRUNCATE)` with
+/// an `INSERT`, pausing a pseudo-random 0-300 ms between rounds. Meanwhile a
+/// prober connection runs `FSQLITE_BD11SZ4_CYCLES` (default 6) cycles of
+/// CREATE INDEX / DROP INDEX / CREATE INDEX. It keeps each re-created index for
+/// 1 s and runs `PRAGMA integrity_check` before dropping it for the next cycle.
+/// On the first failing mid-run check it stops cycling with the index in place.
+/// It then stops the checkpointer, reopens the database and checks again with no
+/// writer running, so a failure there is persistent on-disk corruption.
+///
+/// The run panics with a greppable marker:
+/// - `V5_PERSISTENT_CORRUPTION final=...`: the quiescent check failed.
+/// - `V5_MIDRUN_ONLY mid=[...] final=ok`: only the mid-run check failed.
+/// - `STARVED_OR_ERROR ...`: a statement stayed busy for 120 s.
+///
+/// The pause schedule is seeded from the process id and depends on timing, so a
+/// failing run cannot be replayed.
+#[test]
+#[ignore = "bd-11sz4 stress run; driven by bd_11sz4_stress_parallel_harness"]
+fn bd_11sz4_stress_writer_keeps_recreated_index() {
+    const CREATE: &str = "CREATE INDEX probe_verbatim ON t(  v  , id )";
+    const DROP: &str = "DROP INDEX probe_verbatim";
+    const CHECK: &str = "__CHECK__";
+    let cycles = bd_11sz4_knob("FSQLITE_BD11SZ4_CYCLES", 6);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("bd11sz4.db");
+    let path = path.to_str().expect("utf-8 path").to_owned();
+    seed(&path);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let midrun_bad: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let checkpointer = {
+        let p = path.clone();
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            asupersync::test_utils::run_test(|| async {
+                let conn = Connection::open(&p).await.expect("open checkpointer");
+                conn.execute(&format!("PRAGMA busy_timeout={BUSY_TIMEOUT_MS}"))
+                    .await
+                    .expect("busy_timeout");
+                let mut rng = u64::from(std::process::id()).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").await;
+                    let _ = conn.execute("INSERT INTO t(v) VALUES('c')").await;
+                    rng ^= rng << 13;
+                    rng ^= rng >> 7;
+                    rng ^= rng << 17;
+                    std::thread::sleep(Duration::from_millis(rng % 301));
+                }
+                conn.close().await.expect("close checkpointer");
+            });
+        })
+    };
+    {
+        let p = path.clone();
+        let midrun_bad = Arc::clone(&midrun_bad);
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(&p).await.expect("open prober");
+            conn.execute(&format!("PRAGMA busy_timeout={BUSY_TIMEOUT_MS}"))
+                .await
+                .expect("busy_timeout");
+            'cycles: for cycle in 0..cycles {
+                let mut steps = vec![CREATE, DROP, CREATE, CHECK];
+                if cycle + 1 < cycles {
+                    steps.push(DROP);
+                }
+                for step in steps {
+                    let started = Instant::now();
+                    if step == CHECK {
+                        // Keep the re-created index while the checkpointer inserts.
+                        std::thread::sleep(Duration::from_secs(1));
+                        let rows = loop {
+                            match conn.query("PRAGMA integrity_check").await {
+                                Ok(rows) => break rows,
+                                Err(error)
+                                    if error.is_transient()
+                                        && started.elapsed() < Duration::from_secs(120) => {}
+                                Err(error) => panic!("STARVED_OR_ERROR integrity_check: {error}"),
+                            }
+                        };
+                        let got = format!("{:?}", rows[0].values()[0]);
+                        if got != "Text(\"ok\")" {
+                            // Leave the index in place for the quiescent check.
+                            *midrun_bad.lock().expect("midrun lock") =
+                                Some(format!("cycle {cycle}: {got}"));
+                            break 'cycles;
+                        }
+                        continue;
+                    }
+                    loop {
+                        match conn.execute(step).await {
+                            Ok(_) => break,
+                            Err(error)
+                                if error.is_transient()
+                                    && started.elapsed() < Duration::from_secs(120) => {}
+                            Err(error) => panic!("STARVED_OR_ERROR cycle {cycle} {step}: {error}"),
+                        }
+                    }
+                }
+            }
+            conn.close().await.expect("close prober");
+        });
+    }
+    std::thread::sleep(Duration::from_secs(2));
+    stop.store(true, Ordering::Relaxed);
+    checkpointer.join().expect("checkpointer thread");
+    let mid = midrun_bad.lock().expect("midrun lock").clone();
+    let final_slot: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+    {
+        let final_slot = Arc::clone(&final_slot);
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(&path).await.expect("reopen");
+            let rows = conn
+                .query("PRAGMA integrity_check")
+                .await
+                .expect("integrity_check");
+            *final_slot.lock().expect("final lock") = format!("{:?}", rows[0].values()[0]);
+            conn.close().await.expect("close");
+        });
+    }
+    let final_got = final_slot.lock().expect("final lock").clone();
+    match (mid, final_got == "Text(\"ok\")") {
+        (_, false) => panic!("V5_PERSISTENT_CORRUPTION final={final_got}"),
+        (Some(mid), true) => panic!("V5_MIDRUN_ONLY mid=[{mid}] final=ok"),
+        (None, true) => {}
+    }
+}
+
+/// bd-11sz4 stress harness: run [`bd_11sz4_stress_writer_keeps_recreated_index`]
+/// in parallel child processes and classify each failure.
+///
+/// ```text
+/// cargo test -p fsqlite-core --test bd_orwh0_statement_shape_busy_timeout -- \
+///     bd_11sz4_stress_parallel_harness --ignored --nocapture
+/// ```
+///
+/// Knobs: `FSQLITE_BD11SZ4_WORKERS` (default 18), `FSQLITE_BD11SZ4_RUNS` (runs per
+/// worker, default 2) and `FSQLITE_BD11SZ4_CYCLES` (default 6). Set
+/// `FSQLITE_BD11SZ4_DUMP` to a directory to keep each persistent failure's full
+/// child output there. The final
+/// `SENS5 SUMMARY` line keeps a stable format for log greps.
+///
+/// How to read it:
+/// - It depends on load. On the regression it reproduced in about 10-16% of the
+///   runs that reached the quiescent check under about 36 concurrent test
+///   processes, and it went silent at low load.
+/// - A clean result means something only alongside a known-bad control that
+///   fails in the same window.
+/// - Only `PERSISTENT_*` failures count. `STARVED_OR_ERROR` runs never reached
+///   the check.
+/// - `MIDRUN_ONLY` with `Text("database is busy")` was bd-svwm7 (integrity_check
+///   reported a transient busy as a result row), not this bug. Since
+///   integrity_check returns that busy as an error, the mid-run check retries it.
+/// - With the bd-11sz4 fix reverted, 24 workers x 2 runs x 4 passes gave 5
+///   persistent missing-from-index failures in 192 runs. The fix gave 0 in 192
+///   in the same window.
+#[test]
+#[ignore = "bd-11sz4 stress harness; load-dependent, see doc comment"]
+fn bd_11sz4_stress_parallel_harness() {
+    use std::process::Command;
+    use std::sync::atomic::AtomicUsize;
+    const NAME: &str = "bd_11sz4_stress_writer_keeps_recreated_index";
+    let workers = bd_11sz4_knob("FSQLITE_BD11SZ4_WORKERS", 18);
+    let runs_per_worker = bd_11sz4_knob("FSQLITE_BD11SZ4_RUNS", 2);
+    let exe = std::env::current_exe().expect("current_exe");
+    let runs = Arc::new(AtomicUsize::new(0));
+    let failures = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+    let handles: Vec<_> = (0..workers)
+        .map(|worker| {
+            let exe = exe.clone();
+            let runs = Arc::clone(&runs);
+            let failures = Arc::clone(&failures);
+            std::thread::spawn(move || {
+                for run in 0..runs_per_worker {
+                    let out = Command::new(&exe)
+                        .args([
+                            "--exact",
+                            NAME,
+                            "--ignored",
+                            "--test-threads=1",
+                            "--nocapture",
+                        ])
+                        .output()
+                        .expect("spawn stress child");
+                    runs.fetch_add(1, Ordering::Relaxed);
+                    if out.status.success() {
+                        continue;
+                    }
+                    let text = format!(
+                        "{}{}",
+                        String::from_utf8_lossy(&out.stdout),
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                    let signature = if text.contains("V5_PERSISTENT_CORRUPTION") {
+                        if text.contains("is missing from index") {
+                            "PERSISTENT_MISSING_FROM_INDEX"
+                        } else {
+                            "PERSISTENT_OTHER"
+                        }
+                    } else if text.contains("V5_MIDRUN_ONLY") {
+                        "MIDRUN_ONLY"
+                    } else if text.contains("is missing from index") {
+                        "MISSING_FROM_INDEX"
+                    } else if text.contains("referenced multiple times") {
+                        "REFERENCED_TWICE"
+                    } else if text.contains("STARVED_OR_ERROR") {
+                        "STARVED_OR_ERROR"
+                    } else {
+                        "OTHER"
+                    };
+                    let detail = text
+                        .lines()
+                        .find(|line| line.contains("V5_") || line.contains("STARVED_OR_ERROR"))
+                        .unwrap_or("")
+                        .chars()
+                        .take(400)
+                        .collect::<String>();
+                    eprintln!("SENS5 FAIL w{worker} r{run} {signature}: {detail}");
+                    if let (true, Ok(dir)) = (
+                        signature.starts_with("PERSISTENT"),
+                        std::env::var("FSQLITE_BD11SZ4_DUMP"),
+                    ) {
+                        let _ = std::fs::create_dir_all(&dir);
+                        let file =
+                            format!("{dir}/fail_{}_w{worker}_r{run}.log", std::process::id());
+                        let _ = std::fs::write(&file, &text);
+                        eprintln!("SENS5 DUMP {file}");
+                    }
+                    failures.lock().expect("failures lock").push(signature);
+                }
+            })
+        })
+        .collect();
+    for handle in handles {
+        handle.join().expect("worker join");
+    }
+    let failures = failures.lock().expect("failures lock");
+    let count = |signature: &str| failures.iter().filter(|seen| **seen == signature).count();
+    eprintln!(
+        "SENS5 SUMMARY runs={} failures={} persistent_missing={} persistent_other={} midrun_only={} missing_from_index={} referenced_twice={} starved_or_error={} other={}",
+        runs.load(Ordering::Relaxed),
+        failures.len(),
+        count("PERSISTENT_MISSING_FROM_INDEX"),
+        count("PERSISTENT_OTHER"),
+        count("MIDRUN_ONLY"),
+        count("MISSING_FROM_INDEX"),
+        count("REFERENCED_TWICE"),
+        count("STARVED_OR_ERROR"),
+        count("OTHER")
+    );
+}

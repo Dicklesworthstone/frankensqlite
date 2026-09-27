@@ -1539,10 +1539,16 @@ impl<F: VfsFile> WalBackendAdapter<F> {
         // generation with fresh salts) is stale, not corrupt: request the
         // same index rebuild read admission performs for this mismatch.
         let wal_header = self.wal.header();
-        if header.page_size().ok() != Some(wal_header.page_size)
-            || header.big_end_cksum != u8::from(wal_header.big_endian_checksum())
-            || header.a_salt != [wal_header.salts.salt1, wal_header.salts.salt2]
-        {
+        // Stock SQLite's unindexed empty header indexes no frame, so it has no
+        // generation to disagree with while the WAL is frame-free (GH#431).
+        let generation_mismatch = if header.is_unindexed_empty() {
+            self.wal.frame_count() != 0
+        } else {
+            header.page_size().ok() != Some(wal_header.page_size)
+                || header.big_end_cksum != u8::from(wal_header.big_endian_checksum())
+                || header.a_salt != [wal_header.salts.salt1, wal_header.salts.salt2]
+        };
+        if generation_mismatch {
             self.native_recovery_requested = Some(WalNativeRecoveryReason::WalGenerationMismatch);
             return Err(FrankenError::BusyRecovery);
         }
@@ -1652,9 +1658,15 @@ impl<F: VfsFile> WalBackendAdapter<F> {
                         Err(error) => return Err(error),
                     }
                 };
+                // Stale reader marks (every in-use mark above mxFrame) wedge a
+                // reader that cannot publish one even under a valid header, so
+                // they force the full rebuild that resets them (GH#430).
                 if terminal.is_some_and(|terminal| {
                     validate_shared_wal_index_wal_binding(&header, self.wal.header(), terminal).is_ok()
-                }) {
+                }) && !fsqlite_wal::wal_index::shared_wal_index_reader_marks_exceed(
+                    &region_zero,
+                    header.mx_frame,
+                )? {
                     self.native_recovery_requested = None;
                     return Ok(());
                 }
@@ -2215,10 +2227,17 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
                 self.wal.refresh(cx).await?;
             }
             let wal_header = self.wal.header();
-            if header.page_size()? != wal_header.page_size
-                || header.big_end_cksum != u8::from(wal_header.big_endian_checksum())
-                || header.a_salt != [wal_header.salts.salt1, wal_header.salts.salt2]
-            {
+            // Stock SQLite's unindexed empty header (GH#431) binds to any
+            // generation only while that generation really has no frames;
+            // otherwise frames exist that the index does not cover.
+            let generation_mismatch = if header.is_unindexed_empty() {
+                self.wal.frame_count() != 0
+            } else {
+                header.page_size()? != wal_header.page_size
+                    || header.big_end_cksum != u8::from(wal_header.big_endian_checksum())
+                    || header.a_salt != [wal_header.salts.salt1, wal_header.salts.salt2]
+            };
+            if generation_mismatch {
                 return Ok(WalNativeReadOutcome::RecoveryRequired(
                     WalNativeRecoveryReason::WalGenerationMismatch,
                 ));

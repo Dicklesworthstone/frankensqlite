@@ -5,11 +5,18 @@ impl Connection {
     pub(super) async fn pragma_integrity_check_rows(
         &self,
         pragma: &fsqlite_ast::PragmaStatement,
-    ) -> Vec<Row> {
+    ) -> Result<Vec<Row>> {
         let quick = pragma.name.name.eq_ignore_ascii_case("quick_check");
         let max_errors = integrity_check_error_limit(pragma.value.as_ref());
         let mut failures = Vec::new();
+        // bd-svwm7: a lock conflict is not a verdict. Stock SQLite fails the
+        // statement with SQLITE_BUSY, so busy_timeout and the autocommit retry
+        // apply; folding it into a row reported "database is busy" as though the
+        // database were damaged. Only genuine findings become rows.
         if let Err(error) = self.validate_database_integrity(quick).await {
+            if error.is_transient() {
+                return Err(error);
+            }
             failures.push(error.to_string());
         } else {
             // Rows are only readable once the B-trees they live in are sound.
@@ -19,6 +26,7 @@ impl Connection {
                 .await
             {
                 Ok(reports) => failures.extend(reports),
+                Err(error) if error.is_transient() => return Err(error),
                 Err(error) => failures.push(error.to_string()),
             }
         }
@@ -47,6 +55,9 @@ impl Connection {
                     })
                     .await
                 {
+                    if error.is_transient() {
+                        return Err(error);
+                    }
                     failures.push(format!("*** in database {schema} ***\n{error}"));
                 }
             }
@@ -87,7 +98,7 @@ impl Connection {
                 )],
             });
         }
-        rows
+        Ok(rows)
     }
 
     /// bd-fjieg.4: stock `integrity_check` and `quick_check` both verify every
