@@ -80492,10 +80492,11 @@ impl Connection {
     /// filtered forms fold each cursor row straight into the streaming
     /// accumulators. The general path would materialize the scan, re-project
     /// every row and group them first. Every result column must be a builtin
-    /// count/sum/avg/min/max over `*` or a bare column, or a GROUP BY term. The
-    /// WHERE and GROUP BY must be plain expressions (no subquery, aggregate,
-    /// window function or collation). Without either, the scan reads only the
-    /// columns the aggregates use.
+    /// count/sum/avg/min/max over `*` or one argument, or a GROUP BY term. The
+    /// WHERE, the GROUP BY and any argument that is not a bare column must be
+    /// plain expressions (no subquery, aggregate, window function or
+    /// collation). When the query reads only bare columns, the scan fetches
+    /// just those.
     #[allow(clippy::too_many_lines)]
     async fn try_execute_streaming_table_function_aggregate(
         &self,
@@ -80576,47 +80577,39 @@ impl Connection {
             if !order_by.is_empty() {
                 return Ok(None);
             }
-            let arg_col = match function_args {
-                FunctionArgs::Star if function.eq_ignore_ascii_case("count") => None,
-                FunctionArgs::List(exprs) if exprs.len() == 1 => {
-                    let Expr::Column(column_ref, _) = &exprs[0] else {
-                        return Ok(None);
-                    };
-                    let Ok(index) = find_col_in_map(
-                        col_map,
-                        column_ref.table.as_deref(),
-                        &column_ref.column,
-                        None,
-                    ) else {
-                        return Ok(None);
-                    };
-                    needed_columns[index] = true;
-                    Some(index)
-                }
+            let (arg_col, arg_expr) = match function_args {
+                FunctionArgs::Star if function.eq_ignore_ascii_case("count") => (None, None),
+                FunctionArgs::List(exprs) if exprs.len() == 1 => match &exprs[0] {
+                    Expr::Column(column_ref, _) => {
+                        let Ok(index) = find_col_in_map(
+                            col_map,
+                            column_ref.table.as_deref(),
+                            &column_ref.column,
+                            None,
+                        ) else {
+                            return Ok(None);
+                        };
+                        needed_columns[index] = true;
+                        (Some(index), None)
+                    }
+                    // An expression argument may read any column.
+                    argument if plain_clause(argument) => {
+                        needed_columns.fill(true);
+                        (None, Some(Box::new(argument.clone())))
+                    }
+                    _ => return Ok(None),
+                },
                 _ => return Ok(None),
             };
             let output = match function.to_ascii_lowercase().as_str() {
-                "count" if arg_col.is_none() => SimpleStreamingGroupByOutput::CountStar,
-                "count" => SimpleStreamingGroupByOutput::CountValue {
-                    arg_col,
-                    arg_expr: None,
-                },
-                "sum" => SimpleStreamingGroupByOutput::SumValue {
-                    arg_col,
-                    arg_expr: None,
-                },
-                "avg" => SimpleStreamingGroupByOutput::AvgValue {
-                    arg_col,
-                    arg_expr: None,
-                },
-                "min" => SimpleStreamingGroupByOutput::MinValue {
-                    arg_col,
-                    arg_expr: None,
-                },
-                "max" => SimpleStreamingGroupByOutput::MaxValue {
-                    arg_col,
-                    arg_expr: None,
-                },
+                "count" if arg_col.is_none() && arg_expr.is_none() => {
+                    SimpleStreamingGroupByOutput::CountStar
+                }
+                "count" => SimpleStreamingGroupByOutput::CountValue { arg_col, arg_expr },
+                "sum" => SimpleStreamingGroupByOutput::SumValue { arg_col, arg_expr },
+                "avg" => SimpleStreamingGroupByOutput::AvgValue { arg_col, arg_expr },
+                "min" => SimpleStreamingGroupByOutput::MinValue { arg_col, arg_expr },
+                "max" => SimpleStreamingGroupByOutput::MaxValue { arg_col, arg_expr },
                 _ => return Ok(None),
             };
             outputs.push(output);
@@ -197328,6 +197321,20 @@ mod tests {
                 one_row("SELECT count(*), sum(value) FROM generate_series(1, 10) WHERE value > 99")
                     .await,
                 vec![SqliteValue::Integer(0), SqliteValue::Null],
+            );
+            // Aggregates over expressions.
+            assert_eq!(
+                one_row(
+                    "SELECT sum(value * 2), count(nullif(value % 3, 0)), max(-value), \
+                     min(value || '') FROM generate_series(1, 10)"
+                )
+                .await,
+                vec![
+                    SqliteValue::Integer(110),
+                    SqliteValue::Integer(7),
+                    SqliteValue::Integer(-1),
+                    SqliteValue::Text("1".into()),
+                ],
             );
             let grouped = |sql: &'static str| {
                 let conn = &conn;
