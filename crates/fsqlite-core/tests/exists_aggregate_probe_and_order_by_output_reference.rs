@@ -295,3 +295,52 @@ fn correlated_column_comparisons_use_sqlite_operand_rules() {
         .await;
     });
 }
+
+/// GH#427 (3): SQLite rejects HAVING at prepare time unless a GROUP BY or an
+/// aggregate in the result list makes the query an aggregate, at any nesting
+/// level. An aggregate only inside the HAVING does not count.
+#[test]
+fn having_on_a_non_aggregate_query_is_rejected_at_every_level() {
+    asupersync::test_utils::run_test(|| async {
+        let conn = Connection::open(":memory:").await.expect("open fsqlite");
+        for statement in SETUP {
+            conn.execute(statement).await.expect("fsqlite setup");
+        }
+        for sql in [
+            "SELECT 1 FROM kx HAVING 0",
+            "SELECT 1 FROM kx HAVING count(*) > 0",
+            "SELECT row_number() OVER () FROM kx HAVING 1",
+            "SELECT EXISTS (SELECT 1 FROM kx HAVING 0)",
+            "SELECT (SELECT 1 FROM kx HAVING 1)",
+            "SELECT 1 FROM kx WHERE EXISTS (SELECT 1 FROM kx HAVING 0)",
+            "SELECT 1 FROM (SELECT 1 FROM kx HAVING 1)",
+            "SELECT 1 WHERE 1 IN (SELECT x FROM kx HAVING 1)",
+            "INSERT INTO kx SELECT 1, 'z' FROM kx HAVING 1",
+        ] {
+            let error = conn
+                .query(sql)
+                .await
+                .expect_err(&format!("{sql} must be rejected"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("HAVING clause on a non-aggregate query"),
+                "{sql}: {error}"
+            );
+        }
+        conn.close().await.expect("close fsqlite");
+    });
+    asupersync::test_utils::run_test(|| async {
+        assert_matches_sqlite("SELECT count(*) FROM kx HAVING 0", &[]).await;
+        assert_matches_sqlite(
+            "SELECT x FROM kx GROUP BY x HAVING x > 1 ORDER BY x",
+            &[&["2"], &["5"]],
+        )
+        .await;
+        assert_matches_sqlite(
+            "SELECT EXISTS (SELECT count(*) FROM kx HAVING count(*) > 5)",
+            &[&["0"]],
+        )
+        .await;
+    });
+}

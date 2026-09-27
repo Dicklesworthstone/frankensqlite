@@ -139086,6 +139086,7 @@ impl<'a> SelectStructureResolver<'a> {
                 columns,
                 from,
                 where_clause,
+                group_by,
                 having,
                 ..
             } => {
@@ -139096,6 +139097,23 @@ impl<'a> SelectStructureResolver<'a> {
                     if let ResultColumn::Expr { expr, .. } = column {
                         self.validate_expr(expr, named_windows)?;
                     }
+                }
+                // SQLite (resolveSelectStep) rejects HAVING unless a GROUP BY
+                // or an aggregate in the result list makes the query an
+                // aggregate, at every nesting level. An aggregate inside the
+                // HAVING or ORDER BY does not count. A CREATE VIEW body is not
+                // resolved until the view is used.
+                if having.is_some()
+                    && !self.view_definition_mode
+                    && group_by.is_empty()
+                    && !columns.iter().any(|column| {
+                        matches!(column, ResultColumn::Expr { expr, .. }
+                            if self.connection.expr_contains_aggregate_with_registry(expr))
+                    })
+                {
+                    return Err(FrankenError::FunctionError(
+                        "HAVING clause on a non-aggregate query".to_owned(),
+                    ));
                 }
                 if let Some(predicate) = having {
                     self.validate_expr(predicate, named_windows)?;
