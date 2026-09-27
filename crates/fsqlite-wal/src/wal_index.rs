@@ -511,7 +511,10 @@ pub fn read_shared_wal_index_read_mark(region: &ShmRegion, slot: u32) -> Result<
 /// a mark proves the header is older than the marks describe: a reader that
 /// cannot publish a mark can never be admitted, and recovery must reset the
 /// marks even when the header itself still validates (GH#430).
-pub fn shared_wal_index_reader_marks_exceed(region: &ShmRegion, maximum_frame: u32) -> Result<bool> {
+pub fn shared_wal_index_reader_marks_exceed(
+    region: &ShmRegion,
+    maximum_frame: u32,
+) -> Result<bool> {
     for slot in 1..WAL_READ_MARK_COUNT {
         let mark = read_shared_wal_index_read_mark(
             region,
@@ -3142,7 +3145,9 @@ mod tests {
         let header = WalIndexHdr::from_bytes(&stock).expect("decode stock header");
         assert_eq!((header.is_init, header.sz_page, header.mx_frame), (1, 0, 0));
         assert!(header.is_unindexed_empty());
-        header.validate().expect("stock's unindexed empty header is valid");
+        header
+            .validate()
+            .expect("stock's unindexed empty header is valid");
 
         let mut with_frames = header;
         with_frames.mx_frame = 3;
