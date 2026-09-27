@@ -1,3 +1,4 @@
+import { withDeferredForeignKeys } from "./changeset-foreign-keys";
 import type {
   ChangesetChange,
   ChangesetLimits,
@@ -56,6 +57,8 @@ export type ChangesetRebaseHook = (
 ) => void | Promise<void>;
 
 export interface ApplyChangesetOptions<Change extends PatchsetChange = ChangesetChange> {
+  /** Opt in to one FK-clean deferred application scope; requires foreign_keys=ON. */
+  foreignKeys?: "defer";
   /** Opt in: apply writable Session fields and let the trusted target schema recompute generated values. */
   generatedColumns?: "recompute";
   /** Explicit allowlist of direct target tables in main; NOT a SQL sandbox. */
@@ -153,6 +156,9 @@ function capture<Change extends PatchsetChange>(options: ApplyChangesetOptions<C
   const signal = options?.signal,
     timeoutMs = options?.timeoutMs;
   const deliveryId = options?.deliveryId;
+  const foreignKeys = options?.foreignKeys;
+  if (foreignKeys !== undefined && foreignKeys !== "defer")
+    invalid("foreignKeys must be defer when supplied");
   const generatedColumns = options?.generatedColumns;
   if (generatedColumns !== undefined && generatedColumns !== "recompute")
     invalid("generatedColumns must be recompute when supplied");
@@ -227,7 +233,7 @@ function capture<Change extends PatchsetChange>(options: ApplyChangesetOptions<C
     primaryKey: readonly number[];
     changes: ChangesetRebaseTable["changes"][number][];
   }>();
-  return { names, onConflict, onRebase, rebase, limits, deliveryId, generatedColumns, transactionOptions, checkpoint };
+  return { names, onConflict, onRebase, rebase, limits, deliveryId, generatedColumns, foreignKeys, transactionOptions, checkpoint };
 }
 
 type Settings<Change extends PatchsetChange> = ReturnType<typeof capture<Change>>;
@@ -690,7 +696,8 @@ async function runRebaseHook(
  * Apply bounded SQLite session wire changes through real owned SQL. Schema and
  * explicit before-image conflicts fail closed by default. This is NOT the full
  * native sqlite3changeset_apply API: triggers/constraints retain ordinary SQL
- * behavior; constraint omission and FK deferral are not synthesized. onRebase
+ * behavior; constraint omission is not synthesized. Explicit foreignKeys: defer
+ * composes the existing FK-clean scope around rows, hook and receipt. onRebase
  * records actual full-changeset decisions inside the owned transaction.
  * Explicit data/primary-key replacement stays inside the owned
  * scope. No manual BEGIN or global writer serialization is introduced.
@@ -741,7 +748,8 @@ async function applySession<Change extends PatchsetChange>(
           tables.reduce((count, table) => count + table.changes.length, 0),
         );
   settings.checkpoint();
-  return target.transaction(async (tx) => {
+  const owner = settings.foreignKeys === "defer" ? withDeferredForeignKeys(target) : target;
+  return owner.transaction(async (tx) => {
     if (delivery !== null) {
       await prepareReceipts(tx, settings, true);
       const prior = await readReceipt(tx, settings, delivery);

@@ -1,3 +1,4 @@
+import { withDeferredForeignKeys } from "./changeset-foreign-keys";
 import type { ChangesetExecutor, ChangesetTarget } from "./changeset-apply";
 import { applyChangeset } from "./changeset-apply";
 import type { ChangesetValue } from "./changeset-codec";
@@ -71,6 +72,8 @@ export interface BootstrapInstallReceipt {
   }>;
 }
 export interface BootstrapReceiverOptions {
+  /** Opt in to deferral across the WHOLE installation, not each staged chunk. */
+  foreignKeys?: "defer";
   /** Opt in to recomputation by compatible generated-column destination schemas. */
   generatedColumns?: "recompute";
   receiverId: string;
@@ -580,6 +583,7 @@ async function emptyTargets(tx: ChangesetExecutor, b: Budget, m: BootstrapManife
  */
 export class ChangesetBootstrapReceiver {
   readonly #target: ChangesetTarget;
+  readonly #installTarget: ChangesetTarget;
   readonly #id: string;
   readonly #tables: readonly string[];
   readonly #confirm: () => Promise<unknown>;
@@ -592,6 +596,12 @@ export class ChangesetBootstrapReceiver {
   #active = false;
   constructor(target: ChangesetTarget, options: BootstrapReceiverOptions) {
     this.#target = target;
+    const foreignKeys = options?.foreignKeys;
+    if (foreignKeys !== undefined && foreignKeys !== "defer")
+      fail("INPUT", "foreignKeys must be defer when supplied");
+    // Stage/status/discard stay on the original owner. Only the complete row
+    // installation (including replay) needs a clean deferred-FK boundary.
+    this.#installTarget = foreignKeys === "defer" ? withDeferredForeignKeys(target) : target;
     const generatedColumns = options?.generatedColumns;
     if (generatedColumns !== undefined && generatedColumns !== "recompute")
       fail("INPUT", "generatedColumns must be recompute when supplied");
@@ -794,7 +804,7 @@ export class ChangesetBootstrapReceiver {
   ): Promise<BootstrapInstallReceipt> {
     const m = this.#admit(manifest);
     return this.#run(options, async (b) => {
-      const replayed = await this.#target.transaction(async (tx) => {
+      const replayed = await this.#installTarget.transaction(async (tx) => {
         if (!(await ensure(tx, b, false))) fail("STATE", "No staged bootstrap");
         const s = await state(tx, b, m, this.#orderedSourceId);
         if (s === null || s.receivedChunks !== m.chunks)
