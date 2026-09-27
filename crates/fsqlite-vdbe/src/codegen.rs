@@ -36558,7 +36558,8 @@ fn extract_exists_index_probe<'a>(
     })
 }
 
-/// Whether the compiled EXISTS emitter seeks instead of scanning (GH#432).
+/// Whether the compiled EXISTS and scalar-subquery emitters seek instead of
+/// scanning (GH#432).
 ///
 /// The correlated `subquery` is evaluated against rows of `outer_table`. It
 /// qualifies with a rowid seek or an index seek per outer row. SELECT routing
@@ -37106,6 +37107,82 @@ fn emit_scalar_subquery(
 
             emit_scalar_subquery_result_value(b, columns, reg, &sub_ctx, outer_ctx);
 
+            b.resolve_label(done_label);
+            return;
+        }
+
+        // GH#432: seek an index on the probed column instead of scanning the
+        // table once per outer row. The index walks equal keys in rowid order,
+        // so its first match is the row a table scan would find first.
+        if subquery.order_by.is_empty()
+            && let Some(where_expr) = where_clause
+            && let Some(index_probe) =
+                extract_exists_index_probe(where_expr, table, sub_alias, outer_ctx)
+        {
+            let idx_cursor = b.alloc_aux_cursor_range(1);
+            let idx_open_done = b.emit_label();
+            b.emit_jump_to_label(Opcode::Once, 0, 0, idx_open_done, P4::None, 0);
+            b.emit_op(
+                Opcode::OpenRead,
+                idx_cursor,
+                index_probe.index.root_page,
+                0,
+                P4::Index(index_probe.index.name.clone()),
+                0,
+            );
+            b.resolve_label(idx_open_done);
+
+            let probe_regs = b.alloc_regs(2);
+            emit_expr_with_fallback(b, index_probe.probe, probe_regs, &sub_ctx, Some(outer_ctx));
+            b.emit_jump_to_label(Opcode::IsNull, probe_regs, 0, done_label, P4::None, 0);
+            if let Some(affinity) = index_probe.affinity {
+                emit_single_column_affinity(b, probe_regs, affinity);
+            }
+            b.emit_op(Opcode::Int64, 0, probe_regs + 1, 0, P4::Int64(i64::MIN), 0);
+            let probe_record = b.alloc_reg();
+            b.emit_op(Opcode::MakeRecord, probe_regs, 2, probe_record, P4::None, 0);
+            b.emit_jump_to_label(
+                Opcode::SeekGE,
+                idx_cursor,
+                probe_record,
+                done_label,
+                P4::None,
+                0,
+            );
+            let loop_top = b.current_addr();
+            let next_label = b.emit_label();
+            let key_reg = b.alloc_reg();
+            b.emit_op(Opcode::Column, idx_cursor, 0, key_reg, P4::None, 0);
+            b.emit_jump_to_label(
+                Opcode::Ne,
+                probe_regs,
+                key_reg,
+                done_label,
+                direct_lookup_index_comparison_p4(index_probe.index),
+                0x10,
+            );
+            let rowid_reg = b.alloc_temp();
+            b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
+            b.emit_jump_to_label(
+                Opcode::SeekRowid,
+                sub_cursor,
+                rowid_reg,
+                next_label,
+                P4::None,
+                0,
+            );
+            b.free_temp(rowid_reg);
+            for residual_term in index_probe.residual_terms {
+                let residual_reg = b.alloc_temp();
+                emit_expr_with_fallback(b, residual_term, residual_reg, &sub_ctx, Some(outer_ctx));
+                b.emit_jump_to_label(Opcode::IfNot, residual_reg, 1, next_label, P4::None, 0);
+                b.free_temp(residual_reg);
+            }
+            emit_scalar_subquery_result_value(b, columns, reg, &sub_ctx, outer_ctx);
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+            b.resolve_label(next_label);
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            b.emit_op(Opcode::Next, idx_cursor, loop_top as i32, 0, P4::None, 0);
             b.resolve_label(done_label);
             return;
         }

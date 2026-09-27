@@ -131,3 +131,95 @@ fn correlated_exists_seeks_an_index_on_the_probed_column() {
         conn.close().await.unwrap();
     });
 }
+
+/// `(id, value)` pairs in id order.
+async fn pairs(conn: &Connection, sql: &str) -> Vec<(i64, SqliteValue)> {
+    let rows = conn
+        .query(sql)
+        .await
+        .unwrap_or_else(|error| panic!("{sql}: {error}"));
+    let mut pairs: Vec<(i64, SqliteValue)> = rows
+        .iter()
+        .map(|row| match row.values() {
+            [SqliteValue::Integer(id), value] => (*id, value.clone()),
+            other => panic!("{sql}: unexpected row {other:?}"),
+        })
+        .collect();
+    pairs.sort_by_key(|(id, _)| *id);
+    pairs
+}
+
+#[test]
+fn correlated_scalar_subquery_seeks_an_index_on_the_probed_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("gh432_scalar.db");
+    let path = path.to_str().unwrap().to_owned();
+    asupersync::test_utils::run_test(|| async {
+        let conn = Connection::open(&path).await.unwrap();
+        conn.execute_batch(SETUP).await.unwrap();
+        conn.close().await.unwrap();
+        let conn = Connection::open(&path).await.unwrap();
+        let int = SqliteValue::Integer;
+        let text = |s: &str| SqliteValue::Text(s.into());
+        let null = SqliteValue::Null;
+
+        conn.set_reject_mem_fallback(true);
+        conn.set_strict_mem_fallback_rejection(true);
+        for (sql, expected) in [
+            (
+                "SELECT id, (SELECT rowid FROM repos WHERE repos.path = evidence.repo) \
+                 FROM evidence",
+                vec![int(1), int(2), null.clone(), null.clone(), null.clone()],
+            ),
+            // Duplicate keys: the first match in rowid order, as a scan finds.
+            (
+                "SELECT id, (SELECT n FROM repos3 WHERE repos3.path = evidence.repo) \
+                 FROM evidence",
+                vec![int(1), int(3), null.clone(), null.clone(), null.clone()],
+            ),
+            (
+                "SELECT id, (SELECT n FROM repos3 WHERE repos3.path = evidence.repo AND n > 1) \
+                 FROM evidence",
+                vec![int(2), int(3), null.clone(), null.clone(), null.clone()],
+            ),
+            (
+                "SELECT id, (SELECT path FROM repos_nc WHERE repos_nc.path = evidence.repo) \
+                 FROM evidence",
+                vec![text("a"), text("b"), null.clone(), null.clone(), text("a")],
+            ),
+        ] {
+            let values: Vec<SqliteValue> = pairs(&conn, sql)
+                .await
+                .into_iter()
+                .map(|(_, value)| value)
+                .collect();
+            assert_eq!(values, expected, "{sql}");
+        }
+        assert_eq!(
+            ids(
+                &conn,
+                "SELECT id FROM evidence \
+                 WHERE (SELECT n FROM repos3 WHERE repos3.path = evidence.repo) = 3",
+            )
+            .await,
+            vec![2],
+        );
+        conn.set_strict_mem_fallback_rejection(false);
+        conn.set_reject_mem_fallback(false);
+
+        // TEXT key probed by an INTEGER column: '1' = 1, which a seek misses.
+        let values: Vec<SqliteValue> = pairs(
+            &conn,
+            "SELECT id, (SELECT s FROM t_txt WHERE t_txt.s = evidence.n) FROM evidence",
+        )
+        .await
+        .into_iter()
+        .map(|(_, value)| value)
+        .collect();
+        assert_eq!(
+            values,
+            vec![text("1"), null.clone(), text("1"), text("1"), text("1")]
+        );
+        conn.close().await.unwrap();
+    });
+}

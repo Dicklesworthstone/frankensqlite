@@ -95623,7 +95623,7 @@ impl Connection {
                     // opcode positions its cursor.
                     let simple_top_level_select = select.with.is_none()
                         && select.body.compounds.is_empty()
-                        && !select_contains_subquery_matching(select, self, |_, _| true);
+                        && !select_contains_subquery_matching(select, self, &|_, _| true);
                     let index_seek = if select_core_is_aggregate(&select.body.select) {
                         crate::explain::aggregate_index_seek_facts(&program)
                     } else if select.order_by.is_empty() {
@@ -110717,16 +110717,43 @@ fn select_has_unsupported_correlated_scalar_subquery(
     select: &SelectStatement,
     conn: &Connection,
 ) -> bool {
-    fn unsupported(subquery: SubqueryExprRef<'_>, conn: &Connection) -> bool {
+    // An indexed non-rowid probe qualifies only when the fallback would read
+    // the pager (see select_correlated_exists_where_requires_fallback).
+    let schema = conn.schema.borrow();
+    let outer =
+        single_table_scan_source(select, &schema).filter(|_| !conn.join_mem_scan_safe());
+    select_contains_subquery_matching(select, conn, &|subquery, conn| {
         matches!(
             subquery,
             SubqueryExprRef::Scalar(inner)
                 if is_correlated_subquery_with_schema(inner, &conn.schema.borrow())
-                    && !scalar_subquery_supported_by_vdbe(inner, conn)
+                    && !scalar_subquery_supported_by_vdbe(inner, conn, outer)
         )
-    }
+    })
+}
 
-    select_contains_subquery_matching(select, conn, unsupported)
+/// The table a SELECT scans when its FROM is exactly one base table, with its
+/// alias.
+fn single_table_scan_source<'s, 'q>(
+    select: &'q SelectStatement,
+    schema: &'s [TableSchema],
+) -> Option<(&'s TableSchema, Option<&'q str>)> {
+    let SelectCore::Select {
+        from: Some(from), ..
+    } = &select.body.select
+    else {
+        return None;
+    };
+    let TableOrSubquery::Table { name, alias, .. } = &from.source else {
+        return None;
+    };
+    if !from.joins.is_empty() {
+        return None;
+    }
+    schema
+        .iter()
+        .find(|table| table.name.eq_ignore_ascii_case(&name.name))
+        .map(|table| (table, alias.as_deref()))
 }
 
 /// Whether a SELECT needs the lexical preflight used before subquery-width and
@@ -110767,7 +110794,7 @@ fn select_requires_column_reference_preflight(select: &SelectStatement, conn: &C
                 || select_core_has_derived_source(core)
                 || core_has_window_function(core)
         })
-        || select_contains_subquery_matching(select, conn, |_, _| true)
+        || select_contains_subquery_matching(select, conn, &|_, _| true)
 }
 
 fn select_core_has_derived_source(core: &SelectCore) -> bool {
@@ -110960,7 +110987,7 @@ fn named_relation_is_view_for_layout(
 fn select_contains_subquery_matching(
     select: &SelectStatement,
     conn: &Connection,
-    predicate: fn(SubqueryExprRef<'_>, &Connection) -> bool,
+    predicate: &dyn Fn(SubqueryExprRef<'_>, &Connection) -> bool,
 ) -> bool {
     select.with.as_ref().is_some_and(|with| {
         with.ctes
@@ -110987,7 +111014,7 @@ fn select_contains_subquery_matching(
 fn select_core_contains_subquery_matching(
     core: &SelectCore,
     conn: &Connection,
-    predicate: fn(SubqueryExprRef<'_>, &Connection) -> bool,
+    predicate: &dyn Fn(SubqueryExprRef<'_>, &Connection) -> bool,
 ) -> bool {
     match core {
         SelectCore::Values(rows) => rows
@@ -111044,7 +111071,7 @@ fn select_core_contains_subquery_matching(
 fn from_clause_contains_subquery_matching(
     from: &FromClause,
     conn: &Connection,
-    predicate: fn(SubqueryExprRef<'_>, &Connection) -> bool,
+    predicate: &dyn Fn(SubqueryExprRef<'_>, &Connection) -> bool,
 ) -> bool {
     table_or_subquery_contains_subquery_matching(&from.source, conn, predicate)
         || from.joins.iter().any(|join| {
@@ -111060,7 +111087,7 @@ fn from_clause_contains_subquery_matching(
 fn table_or_subquery_contains_subquery_matching(
     source: &TableOrSubquery,
     conn: &Connection,
-    predicate: fn(SubqueryExprRef<'_>, &Connection) -> bool,
+    predicate: &dyn Fn(SubqueryExprRef<'_>, &Connection) -> bool,
 ) -> bool {
     match source {
         TableOrSubquery::Table { .. } => false,
@@ -111079,7 +111106,7 @@ fn table_or_subquery_contains_subquery_matching(
 fn frame_bound_contains_subquery_matching(
     bound: &FrameBound,
     conn: &Connection,
-    predicate: fn(SubqueryExprRef<'_>, &Connection) -> bool,
+    predicate: &dyn Fn(SubqueryExprRef<'_>, &Connection) -> bool,
 ) -> bool {
     match bound {
         FrameBound::Preceding(expr) | FrameBound::Following(expr) => {
@@ -111094,7 +111121,7 @@ fn frame_bound_contains_subquery_matching(
 fn expr_contains_subquery_matching_deep(
     expr: &Expr,
     conn: &Connection,
-    predicate: fn(SubqueryExprRef<'_>, &Connection) -> bool,
+    predicate: &dyn Fn(SubqueryExprRef<'_>, &Connection) -> bool,
 ) -> bool {
     expr_contains_subquery_match(expr, &mut |subquery| match subquery {
         SubqueryExprRef::Scalar(inner) => {
@@ -111778,7 +111805,9 @@ fn expr_has_in_subquery_operand_requiring_semantic_fallback(
 fn expr_requires_prepared_select_dispatch(expr: &Expr, conn: &Connection) -> bool {
     expr_has_in_subquery_operand_requiring_semantic_fallback(expr, conn)
         || expr_contains_subquery_match(expr, &mut |subquery| match subquery {
-            SubqueryExprRef::Scalar(subquery) => !scalar_subquery_supported_by_vdbe(subquery, conn),
+            SubqueryExprRef::Scalar(subquery) => {
+                !scalar_subquery_supported_by_vdbe(subquery, conn, None)
+            }
             SubqueryExprRef::Exists(subquery) => !exists_subquery_supported_by_vdbe(subquery, conn),
             SubqueryExprRef::In(subquery) => !in_subquery_supported_by_vdbe(subquery, conn),
         })
@@ -112022,7 +112051,7 @@ fn subquery_is_noncorrelated_nonlowerable(
     match subquery {
         SubqueryExprRef::Scalar(inner) => {
             !rewrite_probe_is_correlated(conn, inner)
-                && !scalar_subquery_supported_by_vdbe(inner, conn)
+                && !scalar_subquery_supported_by_vdbe(inner, conn, None)
         }
         SubqueryExprRef::Exists(inner) => {
             !rewrite_probe_is_correlated(conn, inner)
@@ -112080,11 +112109,11 @@ fn where_should_route_to_fallback_for_shortcircuit(
                 expr_contains_subquery_matching_deep(
                     left,
                     conn,
-                    subquery_is_noncorrelated_nonlowerable,
+                    &subquery_is_noncorrelated_nonlowerable,
                 ) || expr_contains_subquery_matching_deep(
                     right,
                     conn,
-                    subquery_is_noncorrelated_nonlowerable,
+                    &subquery_is_noncorrelated_nonlowerable,
                 )
             }
             Expr::UnaryOp {
@@ -112094,7 +112123,7 @@ fn where_should_route_to_fallback_for_shortcircuit(
             } => expr_contains_subquery_matching_deep(
                 inner,
                 conn,
-                subquery_is_noncorrelated_nonlowerable,
+                &subquery_is_noncorrelated_nonlowerable,
             ),
             _ => false,
         }
@@ -112102,7 +112131,13 @@ fn where_should_route_to_fallback_for_shortcircuit(
     walk(conn, where_expr)
 }
 
-fn scalar_subquery_supported_by_vdbe(sub: &SelectStatement, conn: &Connection) -> bool {
+/// `outer` names the single table the enclosing scan reads, when an indexed
+/// correlated probe may be admitted (GH#432).
+fn scalar_subquery_supported_by_vdbe(
+    sub: &SelectStatement,
+    conn: &Connection,
+    outer: Option<(&TableSchema, Option<&str>)>,
+) -> bool {
     if subquery_references_view(sub, conn)
         || subquery_references_sqlite_schema(sub, conn)
         || sub.with.is_some()
@@ -112191,7 +112226,7 @@ fn scalar_subquery_supported_by_vdbe(sub: &SelectStatement, conn: &Connection) -
             // at most one inner-only residual, per the same recognizer the
             // correlated-EXISTS count-semijoin carve-out uses. Every other
             // correlated shape keeps routing to the connection evaluator.
-            correlated_exists_matches_count_semijoin_shape(sub, &conn.schema.borrow(), None)
+            correlated_exists_matches_count_semijoin_shape(sub, &conn.schema.borrow(), outer)
         }
         SelectCore::Values(_) => false,
     }
@@ -112426,7 +112461,7 @@ fn select_has_ordered_distinct_function_in_fallback_hazard(
         )
     }
 
-    select_contains_subquery_matching(select, conn, is_hazard)
+    select_contains_subquery_matching(select, conn, &is_hazard)
 }
 
 fn in_subquery_contains_semantic_fallback_expr(sub: &SelectStatement) -> bool {
@@ -115668,25 +115703,13 @@ fn select_correlated_exists_in_where_all_match_count_semijoin_shape(
     schema: &[TableSchema],
     admit_index_probe: bool,
 ) -> bool {
-    let SelectCore::Select {
-        from, where_clause, ..
-    } = &select.body.select
-    else {
+    let SelectCore::Select { where_clause, .. } = &select.body.select else {
         return false;
     };
     let Some(where_expr) = where_clause.as_deref() else {
         return false;
     };
-    let outer = from
-        .as_ref()
-        .filter(|_| admit_index_probe)
-        .and_then(|from| match &from.source {
-            TableOrSubquery::Table { name, alias, .. } if from.joins.is_empty() => schema
-                .iter()
-                .find(|table| table.name.eq_ignore_ascii_case(&name.name))
-                .map(|table| (table, alias.as_deref())),
-            _ => None,
-        });
+    let outer = single_table_scan_source(select, schema).filter(|_| admit_index_probe);
     !expr_contains_subquery_match(where_expr, &mut |sub| {
         matches!(
             sub,
@@ -137525,7 +137548,7 @@ impl<'connection, 'select> SelectColumnReferenceResolver<'connection, 'select> {
                         if expr_contains_subquery_matching_deep(
                             &term.expr,
                             self.connection,
-                            |_, _| true,
+                            &|_, _| true,
                         ) {
                             continue;
                         }
