@@ -5520,7 +5520,28 @@ impl<F: VfsFile + 'static> WalIndexShmSource<F> {
         let (slot, read_mark) = match database_slot {
             Some(slot) => (slot, 0),
             None => {
-                let (slot, mark) = self.select_reader_mark(cx, &mut *file, &region, owner, header.mx_frame)?;
+                let (slot, mark) = match self.select_reader_mark(cx, &mut *file, &region, owner, header.mx_frame) {
+                    Ok(selection) => selection,
+                    // GH#430: readers only publish marks at or below the
+                    // mxFrame they saw, so an in-use mark above this header's
+                    // mxFrame proves the header itself is stale (a writer
+                    // appended without advancing it). A read-only opener cannot
+                    // publish a mark to escape, and nothing will ever change the
+                    // header for it, so report recovery instead of a retryable
+                    // busy that never clears.
+                    Err(FrankenError::BusyRecovery)
+                        if !self.can_publish_reader_marks
+                            && fsqlite_wal::wal_index::shared_wal_index_reader_marks_exceed(
+                                &region,
+                                header.mx_frame,
+                            )? =>
+                    {
+                        return Ok(WalNativeReadOutcome::RecoveryRequired(
+                            WalNativeRecoveryReason::StaleReaderMarks,
+                        ));
+                    }
+                    Err(error) => return Err(error),
+                };
                 file.shm_lock(cx, WAL_READ_LOCK_BASE + slot, 1, SQLITE_SHM_LOCK | SQLITE_SHM_SHARED)?;
                 (slot, mark)
             }
@@ -9680,9 +9701,12 @@ impl<F: VfsFile> PagerInner<F> {
                         let header = binding.header();
                         let end = usize::try_from(header.mx_frame)
                             .map_err(|_| FrankenError::BusyRecovery)?.checked_sub(1);
+                        // An unindexed empty header (stock SQLite beside a
+                        // header-only WAL) carries no salts to agree with.
                         if pinned.last_commit_frame != end
-                            || [pinned.generation.salts.salt1, pinned.generation.salts.salt2]
-                                != header.a_salt
+                            || (!header.is_unindexed_empty()
+                                && [pinned.generation.salts.salt1, pinned.generation.salts.salt2]
+                                    != header.a_salt)
                         {
                             return Err(FrankenError::BusyRecovery);
                         }
@@ -17994,6 +18018,14 @@ where
                 traits::WalNativeReadOutcome::RecoveryRequired(reason) => reason,
             };
             if inner.access_mode == PagerAccessMode::ReadOnly || recovered_once {
+                // A stale-marks index never clears for a pager that may not
+                // rebuild it; answer like SQLITE_READONLY_RECOVERY instead of a
+                // retryable busy that callers spin on forever (GH#430).
+                if inner.access_mode == PagerAccessMode::ReadOnly
+                    && reason == traits::WalNativeRecoveryReason::StaleReaderMarks
+                {
+                    return Err(FrankenError::ReadOnly);
+                }
                 return Err(FrankenError::BusyRecovery);
             }
             external_lock.restore().await?;

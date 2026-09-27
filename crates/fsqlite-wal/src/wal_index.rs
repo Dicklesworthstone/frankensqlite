@@ -184,6 +184,15 @@ impl WalIndexHdr {
         Ok([checksum.s1, checksum.s2])
     }
 
+    /// Stock SQLite's initialized, empty index: `mxFrame == 0` with a zero
+    /// page size (and zero salts) because no frame was ever indexed. Stock
+    /// writes exactly this beside a header-only WAL and reads it as valid;
+    /// with no frames there is nothing to bind to a WAL generation (GH#431).
+    #[must_use]
+    pub const fn is_unindexed_empty(&self) -> bool {
+        self.mx_frame == 0 && self.sz_page == 0
+    }
+
     /// Decode the page-size field, including SQLite's 65536-byte sentinel.
     pub fn page_size(&self) -> Result<u32> {
         let size = if self.sz_page == 1 {
@@ -209,7 +218,9 @@ impl WalIndexHdr {
                 detail: "uninitialized or unsupported WAL-index header".to_owned(),
             });
         }
-        self.page_size()?;
+        if !self.is_unindexed_empty() {
+            self.page_size()?;
+        }
         if self.a_cksum != self.computed_checksum()? {
             return Err(FrankenError::WalCorrupt {
                 detail: "WAL-index header checksum mismatch".to_owned(),
@@ -434,11 +445,15 @@ pub fn validate_shared_wal_index_wal_binding(
     terminal: Option<(u32, WalFrameHeader)>,
 ) -> Result<()> {
     header.validate()?;
+    // An unindexed empty header indexes no frame, so it has no page size or
+    // salts to agree with; the terminal check below still requires None.
+    let generation_mismatch = !header.is_unindexed_empty()
+        && (header.page_size()? != wal_header.page_size
+            || header.big_end_cksum != u8::from(wal_header.big_endian_checksum())
+            || header.a_salt != [wal_header.salts.salt1, wal_header.salts.salt2]);
     if wal_header.format_version != crate::WAL_FORMAT_VERSION
         || !matches!(wal_header.magic, crate::WAL_MAGIC_BE | crate::WAL_MAGIC_LE)
-        || header.page_size()? != wal_header.page_size
-        || header.big_end_cksum != u8::from(wal_header.big_endian_checksum())
-        || header.a_salt != [wal_header.salts.salt1, wal_header.salts.salt2]
+        || generation_mismatch
     {
         return Err(FrankenError::WalCorrupt {
             detail: "shared WAL-index header does not match the WAL generation format".to_owned(),
@@ -488,6 +503,25 @@ pub fn read_shared_wal_index_read_mark(region: &ShmRegion, slot: u32) -> Result<
         return Err(FrankenError::BusyRecovery);
     }
     region.atomic_load_u32_ne(2 * WAL_INDEX_HDR_BYTES + 4 + slot * 4, Ordering::Acquire)
+}
+
+/// Whether any in-use reader mark (slots 1..) sits above `maximum_frame`.
+///
+/// Readers only publish marks at or below the mxFrame they observed, so such
+/// a mark proves the header is older than the marks describe: a reader that
+/// cannot publish a mark can never be admitted, and recovery must reset the
+/// marks even when the header itself still validates (GH#430).
+pub fn shared_wal_index_reader_marks_exceed(region: &ShmRegion, maximum_frame: u32) -> Result<bool> {
+    for slot in 1..WAL_READ_MARK_COUNT {
+        let mark = read_shared_wal_index_read_mark(
+            region,
+            u32::try_from(slot).map_err(|_| FrankenError::BusyRecovery)?,
+        )?;
+        if mark != u32::MAX && mark > maximum_frame {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Revalidate a captured publication after acquiring its native reader slot.
@@ -3090,6 +3124,33 @@ mod tests {
             write_shm_header(&mut valid, &invalid, &ckpt).expect("serialize");
             assert!(parse_shm_header(&valid).expect("parse").is_none());
         }
+    }
+
+    /// GH#431: the exact header stock SQLite 3.51 writes beside a header-only
+    /// WAL (native little-endian bytes from the report) is an initialized,
+    /// empty index: its checksum verifies and it must validate, while a zero
+    /// page size with indexed frames stays invalid.
+    #[cfg(target_endian = "little")]
+    #[test]
+    fn test_wal_index_accepts_stock_unindexed_empty_header() {
+        let stock: [u8; WAL_INDEX_HDR_BYTES] = [
+            0x18, 0xe2, 0x2d, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x38, 0x07,
+            0x18, 0x06, 0x35, 0x93, 0xdb, 0x09,
+        ];
+        let header = WalIndexHdr::from_bytes(&stock).expect("decode stock header");
+        assert_eq!((header.is_init, header.sz_page, header.mx_frame), (1, 0, 0));
+        assert!(header.is_unindexed_empty());
+        header.validate().expect("stock's unindexed empty header is valid");
+
+        let mut with_frames = header;
+        with_frames.mx_frame = 3;
+        with_frames.update_checksum().expect("checksum");
+        assert!(
+            with_frames.validate().is_err(),
+            "a zero page size is only legal while no frame is indexed"
+        );
     }
 
     #[test]
