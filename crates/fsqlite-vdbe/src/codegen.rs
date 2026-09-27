@@ -36446,6 +36446,156 @@ fn extract_exists_rowid_probe<'a>(
     probe_expr.map(|probe| (probe, residual_terms))
 }
 
+/// A correlated `inner.col = <outer expr>` EXISTS term that an index on `col`
+/// answers with one seek per outer row (GH#432).
+struct ExistsIndexProbe<'a> {
+    index: &'a IndexSchema,
+    probe: &'a Expr,
+    /// Affinity to apply to the probe value before seeking, when the
+    /// comparison would convert it.
+    affinity: Option<char>,
+    residual_terms: Vec<&'a Expr>,
+}
+
+/// Find an index-seekable equality in a correlated EXISTS WHERE.
+///
+/// The equality must be on the leading column of a single-column index of the
+/// EXISTS table, its other side must be outer-only, and the index order must
+/// agree with SQL `=`. It follows SQLite's `sqlite3IndexAffinityOk`:
+/// - The comparison's collation must be the index key's.
+/// - With no comparison affinity, raw values are compared.
+/// - TEXT comparison affinity needs a TEXT column; the probe gets TEXT affinity.
+/// - Numeric comparison affinity needs a numeric column; the probe gets the
+///   column's affinity.
+fn extract_exists_index_probe<'a>(
+    where_expr: &'a Expr,
+    table: &'a TableSchema,
+    table_alias: Option<&str>,
+    outer_ctx: &ScanCtx<'_>,
+) -> Option<ExistsIndexProbe<'a>> {
+    if table.without_rowid {
+        return None;
+    }
+    let mut terms = Vec::new();
+    flatten_and_terms(where_expr, &mut terms);
+
+    let probe_at = terms.iter().copied().enumerate().find_map(|(position, term)| {
+        let Expr::BinaryOp {
+            left,
+            op: fsqlite_ast::BinaryOp::Eq,
+            right,
+            ..
+        } = term
+        else {
+            return None;
+        };
+        [(left, right, true), (right, left, false)]
+            .into_iter()
+            .find_map(|(inner, other, inner_on_left)| {
+                let Some(SortKeySource::Column(column_index)) =
+                    resolve_column_ref(inner, table, table_alias)
+                else {
+                    return None;
+                };
+                if !matches!(inner.as_ref(), Expr::Column(..))
+                    || extract_collation(other).is_some()
+                    || expr_references_scan(other, table, table_alias)
+                    || expr_contains_bound_outer_value(other)
+                    || expr_contains_nested_subquery(other)
+                {
+                    return None;
+                }
+                let column = table.columns.get(column_index)?;
+                let index = table.indexes.iter().find(|index| {
+                    index.supports_direct_column_lookup()
+                        && index.key_term_count() == 1
+                        && !index.key_term_descending(0)
+                        && index
+                            .columns
+                            .first()
+                            .is_some_and(|name| name.eq_ignore_ascii_case(&column.name))
+                })?;
+                // The left operand's declared collation wins; a probe without
+                // one (an expression) leaves the column's.
+                let column_collation = column.collation.as_deref().unwrap_or("BINARY");
+                let collation = if inner_on_left {
+                    column_collation
+                } else {
+                    declared_collation_ctx(other, Some(outer_ctx)).unwrap_or(column_collation)
+                };
+                if !collation_names_equivalent(Some(collation), index.key_term_collation(0)) {
+                    return None;
+                }
+                let column_affinity = schema_column_expr_affinity(column);
+                let comparison = combine_declared_comparison_affinity(
+                    column_affinity,
+                    true,
+                    expr_affinity(other, Some(outer_ctx)),
+                    expr_has_declared_affinity(other, Some(outer_ctx)),
+                );
+                let affinity = match u8::try_from(comparison).ok()? {
+                    0 => None,
+                    b'B' if column_affinity == b'B' => Some('B'),
+                    b'C' if matches!(column_affinity, b'C' | b'D' | b'E') => {
+                        Some(char::from(column_affinity))
+                    }
+                    _ => return None,
+                };
+                Some((position, index, other.as_ref(), affinity))
+            })
+    });
+    let (position, index, probe, affinity) = probe_at?;
+    let residual_terms = terms
+        .into_iter()
+        .enumerate()
+        .filter_map(|(term_position, term)| (term_position != position).then_some(term))
+        .collect();
+    Some(ExistsIndexProbe {
+        index,
+        probe,
+        affinity,
+        residual_terms,
+    })
+}
+
+/// Whether the compiled EXISTS emitter seeks instead of scanning (GH#432).
+///
+/// The correlated `subquery` is evaluated against rows of `outer_table`. It
+/// qualifies with a rowid seek or an index seek per outer row. SELECT routing
+/// uses this to keep such subqueries on the compiled path.
+#[must_use]
+pub fn correlated_exists_subquery_has_seek_probe(
+    subquery: &SelectStatement,
+    outer_table: &TableSchema,
+    outer_alias: Option<&str>,
+    schema: &[TableSchema],
+) -> bool {
+    let SelectCore::Select {
+        from: Some(from),
+        where_clause: Some(where_expr),
+        ..
+    } = &subquery.body.select
+    else {
+        return false;
+    };
+    let TableOrSubquery::Table { name, alias, .. } = &from.source else {
+        return false;
+    };
+    let Ok(table) = find_table(schema, &name.name) else {
+        return false;
+    };
+    let outer_ctx = ScanCtx {
+        cursor: 0,
+        table: outer_table,
+        table_alias: outer_alias,
+        schema: Some(schema),
+        register_base: None,
+        secondaries: &[],
+    };
+    extract_exists_rowid_probe(where_expr, table, alias.as_deref()).is_some()
+        || extract_exists_index_probe(where_expr, table, alias.as_deref(), &outer_ctx).is_some()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_once_materialized_exists_subquery(
     b: &mut ProgramBuilder,
@@ -36676,6 +36826,84 @@ fn emit_exists_subquery(
 
         let found_val = i32::from(!not);
         b.emit_op(Opcode::Integer, found_val, reg, 0, P4::None, 0);
+        b.resolve_label(done_label);
+        b.emit_op(Opcode::Close, sub_cursor, 0, 0, P4::None, 0);
+        return;
+    }
+
+    // GH#432: seek an index on the probed column instead of scanning the
+    // table once per outer row. The probe key is `(value, i64::MIN)`, so the
+    // seek lands on the first entry equal to the value; the walk stops at the
+    // first entry that differs.
+    if let Some(where_expr) = where_clause
+        && let Some(index_probe) =
+            extract_exists_index_probe(where_expr, table, sub_alias, outer_ctx)
+    {
+        let idx_cursor = sub_cursor + 1;
+        let close_label = b.emit_label();
+        let probe_regs = b.alloc_regs(2);
+        emit_expr_with_fallback(b, index_probe.probe, probe_regs, &sub_ctx, Some(outer_ctx));
+        b.emit_jump_to_label(Opcode::IsNull, probe_regs, 0, done_label, P4::None, 0);
+        if let Some(affinity) = index_probe.affinity {
+            emit_single_column_affinity(b, probe_regs, affinity);
+        }
+        b.emit_op(Opcode::Int64, 0, probe_regs + 1, 0, P4::Int64(i64::MIN), 0);
+        let probe_record = b.alloc_reg();
+        b.emit_op(Opcode::MakeRecord, probe_regs, 2, probe_record, P4::None, 0);
+        b.emit_op(
+            Opcode::OpenRead,
+            idx_cursor,
+            index_probe.index.root_page,
+            0,
+            P4::Index(index_probe.index.name.clone()),
+            0,
+        );
+        b.emit_jump_to_label(
+            Opcode::SeekGE,
+            idx_cursor,
+            probe_record,
+            close_label,
+            P4::None,
+            0,
+        );
+        let loop_top = b.current_addr();
+        let next_label = b.emit_label();
+        let key_reg = b.alloc_reg();
+        b.emit_op(Opcode::Column, idx_cursor, 0, key_reg, P4::None, 0);
+        b.emit_jump_to_label(
+            Opcode::Ne,
+            probe_regs,
+            key_reg,
+            close_label,
+            direct_lookup_index_comparison_p4(index_probe.index),
+            0x10,
+        );
+        if !index_probe.residual_terms.is_empty() {
+            let rowid_reg = b.alloc_temp();
+            b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
+            b.emit_jump_to_label(
+                Opcode::SeekRowid,
+                sub_cursor,
+                rowid_reg,
+                next_label,
+                P4::None,
+                0,
+            );
+            b.free_temp(rowid_reg);
+            for residual_term in index_probe.residual_terms {
+                let residual_reg = b.alloc_temp();
+                emit_expr_with_fallback(b, residual_term, residual_reg, &sub_ctx, Some(outer_ctx));
+                b.emit_jump_to_label(Opcode::IfNot, residual_reg, 1, next_label, P4::None, 0);
+                b.free_temp(residual_reg);
+            }
+        }
+        b.emit_op(Opcode::Integer, i32::from(!not), reg, 0, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, close_label, P4::None, 0);
+        b.resolve_label(next_label);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        b.emit_op(Opcode::Next, idx_cursor, loop_top as i32, 0, P4::None, 0);
+        b.resolve_label(close_label);
+        b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
         b.resolve_label(done_label);
         b.emit_op(Opcode::Close, sub_cursor, 0, 0, P4::None, 0);
         return;

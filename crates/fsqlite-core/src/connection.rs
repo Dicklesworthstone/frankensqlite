@@ -47734,9 +47734,14 @@ impl Connection {
         // Opcode::Variable. When every correlated EXISTS in the WHERE is the
         // one shape the VDBE compiles correctly, stay on the compiled path
         // instead of the per-outer-row nested-statement fallback.
+        //
+        // GH#432: an indexed non-rowid probe also qualifies, but only when the
+        // fallback would read the pager. With the rows loaded in memory the
+        // fallback answers from them faster than the compiled index seek.
         !select_correlated_exists_in_where_all_match_count_semijoin_shape(
             select,
             &self.schema.borrow(),
+            !self.join_mem_scan_safe(),
         )
     }
 
@@ -111802,6 +111807,7 @@ fn exists_subquery_supported_by_vdbe(sub: &SelectStatement, conn: &Connection) -
             && !correlated_exists_matches_count_semijoin_shape(
                 sub,
                 &conn.schema.borrow(),
+                None,
             ))
     {
         return false;
@@ -111828,7 +111834,7 @@ fn exists_subquery_supported_by_vdbe(sub: &SelectStatement, conn: &Connection) -
     // — multiple correlated terms, correlated inequality, multi-table inner
     // — to the fallback.
     if is_correlated_subquery_with_schema(sub, &conn.schema.borrow())
-        && !correlated_exists_matches_count_semijoin_shape(sub, &conn.schema.borrow())
+        && !correlated_exists_matches_count_semijoin_shape(sub, &conn.schema.borrow(), None)
     {
         return false;
     }
@@ -111873,9 +111879,14 @@ fn exists_subquery_supported_by_vdbe(sub: &SelectStatement, conn: &Connection) -
 /// term, so they have either more than one correlated term or a correlated
 /// (non-inner-only) residual, and are rejected here — staying on the
 /// per-row connection fallback.
+///
+/// The probe key must be the inner rowid, unless `outer` names the single
+/// table the enclosing scan reads: then an indexed key the compiled emitter
+/// can seek also qualifies (GH#432).
 fn correlated_exists_matches_count_semijoin_shape(
     sub: &SelectStatement,
     schema: &[TableSchema],
+    outer: Option<(&TableSchema, Option<&str>)>,
 ) -> bool {
     // No inner WITH/compound/ORDER/LIMIT — the recognizer rejects these too.
     // (The caller already screens these, but keep the check local + explicit.)
@@ -111929,10 +111940,19 @@ fn correlated_exists_matches_count_semijoin_shape(
             // scan, is not the supported probe shape.
             if left_external != right_external {
                 let inner = if left_external { right } else { left };
-                if !correlated_exists_probe_is_rowid(inner, &from.source, schema) {
-                    // Native EXISTS only seeks rowids. A text/indexed key here
-                    // otherwise scans the parent for every outer row; the
-                    // fallback binds that key and uses the ordinary index seek.
+                if !correlated_exists_probe_is_rowid(inner, &from.source, schema)
+                    && !outer.is_some_and(|(outer_table, outer_alias)| {
+                        fsqlite_vdbe::codegen::correlated_exists_subquery_has_seek_probe(
+                            sub,
+                            outer_table,
+                            outer_alias,
+                            schema,
+                        )
+                    })
+                {
+                    // Without a seek the compiled EXISTS scans the parent for
+                    // every outer row; the fallback binds that key and uses
+                    // the ordinary index seek.
                     return false;
                 }
                 correlated_probe_terms += 1;
@@ -112171,7 +112191,7 @@ fn scalar_subquery_supported_by_vdbe(sub: &SelectStatement, conn: &Connection) -
             // at most one inner-only residual, per the same recognizer the
             // correlated-EXISTS count-semijoin carve-out uses. Every other
             // correlated shape keeps routing to the connection evaluator.
-            correlated_exists_matches_count_semijoin_shape(sub, &conn.schema.borrow())
+            correlated_exists_matches_count_semijoin_shape(sub, &conn.schema.borrow(), None)
         }
         SelectCore::Values(_) => false,
     }
@@ -115646,19 +115666,33 @@ fn select_has_correlated_exists_in_where(select: &SelectStatement, schema: &[Tab
 fn select_correlated_exists_in_where_all_match_count_semijoin_shape(
     select: &SelectStatement,
     schema: &[TableSchema],
+    admit_index_probe: bool,
 ) -> bool {
-    let SelectCore::Select { where_clause, .. } = &select.body.select else {
+    let SelectCore::Select {
+        from, where_clause, ..
+    } = &select.body.select
+    else {
         return false;
     };
     let Some(where_expr) = where_clause.as_deref() else {
         return false;
     };
+    let outer = from
+        .as_ref()
+        .filter(|_| admit_index_probe)
+        .and_then(|from| match &from.source {
+            TableOrSubquery::Table { name, alias, .. } if from.joins.is_empty() => schema
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case(&name.name))
+                .map(|table| (table, alias.as_deref())),
+            _ => None,
+        });
     !expr_contains_subquery_match(where_expr, &mut |sub| {
         matches!(
             sub,
             SubqueryExprRef::Exists(inner)
                 if is_correlated_subquery_with_schema(inner, schema)
-                    && !correlated_exists_matches_count_semijoin_shape(inner, schema)
+                    && !correlated_exists_matches_count_semijoin_shape(inner, schema, outer)
         )
     })
 }
