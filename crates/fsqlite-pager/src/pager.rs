@@ -12340,6 +12340,15 @@ impl AtomicPublishedPages {
     }
 }
 
+/// Most pages the overflow publication plane keeps resident (64 MiB of
+/// 4 KiB pages). The plane is a cache over committed state: a miss falls
+/// through to the page cache, the WAL, or the database file, so skipping a page
+/// that has no resident image never changes what a reader sees. Unbounded, it
+/// kept every page read or committed while a second connection shared the
+/// pager: 2.4 GB of row reads on a 16 GB database retained 3.2 GB of anonymous
+/// memory, where a lone connection stayed flat at 175 MB.
+const OVERFLOW_PUBLISHED_PAGE_CAP: usize = 16_384;
+
 /// Concurrent overflow publication plane for pages outside the direct-index atomic range.
 #[derive(Debug)]
 struct ConcurrentPublishedPages {
@@ -12360,8 +12369,22 @@ impl ConcurrentPublishedPages {
         self.pages.get(&page_no).map(|page| page.value().clone())
     }
 
+    /// Whether the plane is full and holds no image of `page_no`. Such a page
+    /// is not published; a resident image is always replaced so the plane
+    /// never serves a superseded version.
+    fn skips_at_capacity(&self, page_no: PageNumber, pending_additions: usize) -> bool {
+        self.page_count
+            .load(AtomicOrdering::Acquire)
+            .saturating_add(pending_additions)
+            >= OVERFLOW_PUBLISHED_PAGE_CAP
+            && !self.pages.contains_key(&page_no)
+    }
+
     /// Insert a page into the concurrent overflow plane.
     fn insert(&self, page_no: PageNumber, page: PageData) -> bool {
+        if self.skips_at_capacity(page_no, 0) {
+            return false;
+        }
         let inserted = self.pages.insert(page_no, page).is_none();
         if inserted {
             self.page_count.fetch_add(1, AtomicOrdering::Relaxed);
@@ -12410,6 +12433,9 @@ impl ConcurrentPublishedPages {
     {
         let mut total_added = 0_usize;
         for (page_no, page) in pages {
+            if self.skips_at_capacity(page_no, total_added) {
+                continue;
+            }
             if self.pages.insert(page_no, page).is_none() {
                 total_added = total_added.saturating_add(1);
             }
@@ -58912,6 +58938,78 @@ mod tests {
             "bead_id=bd-uvdnk case=overflow_clear_removes_page"
         );
         assert_eq!(published_pages.len(), 0);
+    }
+
+    #[test]
+    fn test_published_pages_overflow_plane_is_bounded_without_stale_images() {
+        let published_pages = PublishedPages::new(0);
+        let overflow_page = |offset: usize| {
+            PageNumber::new(u32::try_from(70_000 + offset).unwrap()).unwrap()
+        };
+
+        // Single inserts (read-miss publication) stop admitting new pages at the cap.
+        for offset in 0..OVERFLOW_PUBLISHED_PAGE_CAP + 64 {
+            published_pages.insert(overflow_page(offset), PageData::from_vec(sample_page(0x10)));
+        }
+        assert_eq!(
+            published_pages.len(),
+            OVERFLOW_PUBLISHED_PAGE_CAP,
+            "case=single_inserts_bounded_at_cap"
+        );
+        assert!(
+            published_pages
+                .get(overflow_page(OVERFLOW_PUBLISHED_PAGE_CAP))
+                .is_none(),
+            "case=page_past_cap_not_resident"
+        );
+
+        // A resident image is still replaced at the cap, so a later commit can
+        // never leave a superseded version visible.
+        assert!(!published_pages.insert(overflow_page(7), PageData::from_vec(sample_page(0x77))));
+        assert_eq!(
+            published_pages.get(overflow_page(7)),
+            Some(PageData::from_vec(sample_page(0x77))),
+            "case=resident_page_replaced_at_cap"
+        );
+
+        // Commit batches: resident pages are replaced, absent ones skipped.
+        published_pages.insert_batch([
+            (overflow_page(8), PageData::from_vec(sample_page(0x88))),
+            (
+                overflow_page(OVERFLOW_PUBLISHED_PAGE_CAP + 1),
+                PageData::from_vec(sample_page(0x99)),
+            ),
+        ]);
+        assert_eq!(
+            published_pages.get(overflow_page(8)),
+            Some(PageData::from_vec(sample_page(0x88))),
+            "case=batch_replaces_resident_page_at_cap"
+        );
+        assert!(
+            published_pages
+                .get(overflow_page(OVERFLOW_PUBLISHED_PAGE_CAP + 1))
+                .is_none(),
+            "case=batch_skips_absent_page_at_cap"
+        );
+        assert_eq!(published_pages.len(), OVERFLOW_PUBLISHED_PAGE_CAP);
+
+        // A batch that would cross the cap from below admits only up to it.
+        published_pages.clear();
+        published_pages.insert_batch(
+            (0..OVERFLOW_PUBLISHED_PAGE_CAP + 10)
+                .map(|offset| (overflow_page(offset), PageData::from_vec(sample_page(0x20)))),
+        );
+        assert_eq!(
+            published_pages.len(),
+            OVERFLOW_PUBLISHED_PAGE_CAP,
+            "case=batch_bounded_at_cap"
+        );
+
+        // The direct-slot plane for low page numbers is unaffected.
+        assert!(
+            published_pages.insert(PageNumber::new(2).unwrap(), PageData::from_vec(sample_page(0x02)))
+        );
+        assert_eq!(published_pages.len(), OVERFLOW_PUBLISHED_PAGE_CAP + 1);
     }
 
     /// Shape: `PublishedPagerState::publish_clear_if` and the metadata-only
