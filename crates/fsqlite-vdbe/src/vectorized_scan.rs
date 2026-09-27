@@ -1105,6 +1105,11 @@ mod tests {
 
     #[test]
     fn scan_reuses_decode_scratch_and_avoids_full_record_parse_calls() {
+        // The record profile counters are process-global; engine tests reset
+        // them under this lock.
+        let _guard = crate::VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         block_on_test(async {
             let (io, root_page) = build_fixture(257).await;
             let _record_profile_guard = RecordProfileThreadOverrideGuard::enabled();

@@ -84,6 +84,12 @@ impl SchemaEvaluationContext {
 #[cfg(test)]
 mod vectorized_prop_tests;
 
+/// Serializes tests that mutate or assert process-global observability state:
+/// JIT and metrics configuration, and the record-decode profile counters that
+/// `reset_record_profile` zeroes.
+#[cfg(test)]
+pub(crate) static VDBE_OBSERVABILITY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VdbePipelineStage {
     Decode,

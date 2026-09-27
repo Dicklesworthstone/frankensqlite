@@ -34114,11 +34114,7 @@ mod tests {
 
     // ── External Sort Tests (bd-1rw.4) ──────────────────────────────────
 
-    /// Mutex to serialize tests that mutate global VDBE observability settings.
-    ///
-    /// JIT and metrics configuration are both process-global, so tests that
-    /// toggle them must not run concurrently.
-    static VDBE_OBSERVABILITY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use crate::VDBE_OBSERVABILITY_LOCK;
 
     fn run_sorter_metric_program() -> Vec<Vec<SqliteValue>> {
         run_program(|b| {
