@@ -37451,6 +37451,9 @@ impl Connection {
             // so this only pays a cheap FROM-source scan on the common path.
             let rewritten_statement = self.rewrite_statement_bare_pragma_table_functions(statement);
             let statement: &Statement = rewritten_statement.as_ref();
+            // bd-cpa8b: `*` leaves out a table-valued function's HIDDEN columns.
+            let star_expanded_statement = expand_statement_hidden_table_function_stars(statement);
+            let statement: &Statement = star_expanded_statement.as_ref().unwrap_or(statement);
             // bd-l6-view-insert-subquery-numbering-2qtn7: globally number a DML
             // statement's `?` placeholders (recursing into subqueries) BEFORE the
             // pre-dispatch non-correlated-subquery fold runs. Otherwise a `(SELECT ?)`
@@ -106559,6 +106562,190 @@ fn table_function_column_names(name: &str) -> Option<&'static [&'static str]> {
         return Some(&CACHE_PAGES_TABLE_COLUMN_NAME_STRINGS);
     }
     None
+}
+
+/// The columns `*` shows for a table-valued function that declares HIDDEN
+/// columns, which stock leaves out of `*` (bd-cpa8b). `None` means every
+/// column is visible.
+fn table_function_star_columns(name: &str) -> Option<&'static [&'static str]> {
+    // generate_series declares `value, start HIDDEN, stop HIDDEN, step HIDDEN`.
+    name.eq_ignore_ascii_case("generate_series")
+        .then_some(&GENERATE_SERIES_TABLE_COLUMN_NAMES[..1])
+}
+
+/// A FROM source's label and, for a table-valued function with HIDDEN
+/// columns, the columns its `*` shows.
+type StarSource = (String, Option<&'static [&'static str]>);
+
+/// The label and `*` columns of each source of a FROM clause whose `*` can be
+/// rewritten source by source, or `None`. USING and NATURAL joins merge
+/// columns under `*`, and parenthesized joins and unaliased subqueries have
+/// no label to qualify with, so those clauses keep their `*`.
+fn from_star_sources(from: &FromClause) -> Option<Vec<StarSource>> {
+    if from.joins.iter().any(|join| {
+        join.join_type.natural || matches!(join.constraint, Some(JoinConstraint::Using(_)))
+    }) {
+        return None;
+    }
+    std::iter::once(&from.source)
+        .chain(from.joins.iter().map(|join| &join.table))
+        .map(|source| match source {
+            TableOrSubquery::Table { name, alias, .. } => {
+                Some((alias.clone().unwrap_or_else(|| name.name.clone()), None))
+            }
+            TableOrSubquery::Subquery {
+                alias: Some(alias), ..
+            } => Some((alias.clone(), None)),
+            TableOrSubquery::TableFunction { name, alias, .. } => Some((
+                alias.clone().unwrap_or_else(|| name.clone()),
+                table_function_star_columns(name),
+            )),
+            TableOrSubquery::Subquery { alias: None, .. } | TableOrSubquery::ParenJoin(_) => None,
+        })
+        .collect()
+}
+
+/// Whether [`expand_hidden_table_function_stars`] would change `select`.
+fn select_has_hidden_table_function_star(select: &SelectStatement) -> bool {
+    fn core_has(core: &SelectCore) -> bool {
+        let SelectCore::Select {
+            columns,
+            from: Some(from),
+            ..
+        } = core
+        else {
+            return false;
+        };
+        let nested = std::iter::once(&from.source)
+            .chain(from.joins.iter().map(|join| &join.table))
+            .any(|source| {
+                matches!(source, TableOrSubquery::Subquery { query, .. }
+                    if select_has_hidden_table_function_star(query))
+            });
+        nested
+            || from_star_sources(from).is_some_and(|sources| {
+                sources.iter().any(|(_, visible)| visible.is_some())
+                    && columns.iter().any(|column| {
+                        matches!(column, ResultColumn::Star | ResultColumn::TableStar(_))
+                    })
+            })
+    }
+    select.with.as_ref().is_some_and(|with| {
+        with.ctes
+            .iter()
+            .any(|cte| select_has_hidden_table_function_star(&cte.query))
+    }) || core_has(&select.body.select)
+        || select.body.compounds.iter().any(|(_, core)| core_has(core))
+}
+
+/// bd-cpa8b: expand `*` and `<alias>.*` over a table-valued function with
+/// HIDDEN columns into its visible columns, as stock does. The other sources'
+/// share of `*` becomes `<source>.*`. It covers CTE bodies, compound arms and
+/// FROM subqueries, but not subqueries in expressions.
+fn expand_hidden_table_function_stars(select: &mut SelectStatement) {
+    fn expand_core(core: &mut SelectCore) {
+        let SelectCore::Select {
+            columns,
+            from: Some(from),
+            ..
+        } = core
+        else {
+            return;
+        };
+        for source in std::iter::once(&mut from.source)
+            .chain(from.joins.iter_mut().map(|join| &mut join.table))
+        {
+            if let TableOrSubquery::Subquery { query, .. } = source {
+                expand_hidden_table_function_stars(query);
+            }
+        }
+        let Some(sources) = from_star_sources(from) else {
+            return;
+        };
+        if sources.iter().all(|(_, visible)| visible.is_none()) {
+            return;
+        }
+        let visible_columns = |label: &str, visible: &[&str]| {
+            visible
+                .iter()
+                .map(|column| ResultColumn::Expr {
+                    expr: Expr::Column(ColumnRef::qualified(label, *column), Span::ZERO),
+                    alias: None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut expanded = Vec::with_capacity(columns.len());
+        for column in std::mem::take(columns) {
+            match column {
+                ResultColumn::Star => {
+                    for (label, visible) in &sources {
+                        match visible {
+                            Some(visible) => expanded.extend(visible_columns(label, visible)),
+                            None => {
+                                expanded.push(ResultColumn::TableStar(QualifiedName::bare(label)));
+                            }
+                        }
+                    }
+                }
+                ResultColumn::TableStar(table) => {
+                    let hidden_source = sources.iter().find_map(|(label, visible)| {
+                        visible.filter(|_| {
+                            table.schema.is_none() && label.eq_ignore_ascii_case(&table.name)
+                        })
+                        .map(|visible| (label, visible))
+                    });
+                    match hidden_source {
+                        Some((label, visible)) => expanded.extend(visible_columns(label, visible)),
+                        None => expanded.push(ResultColumn::TableStar(table)),
+                    }
+                }
+                other @ ResultColumn::Expr { .. } => expanded.push(other),
+            }
+        }
+        *columns = expanded;
+    }
+
+    if let Some(with) = &mut select.with {
+        for cte in &mut with.ctes {
+            expand_hidden_table_function_stars(&mut cte.query);
+        }
+    }
+    expand_core(&mut select.body.select);
+    for (_, core) in &mut select.body.compounds {
+        expand_core(core);
+    }
+}
+
+/// Apply [`expand_hidden_table_function_stars`] to the SELECT a statement
+/// runs, when it would change anything.
+fn expand_statement_hidden_table_function_stars(statement: &Statement) -> Option<Statement> {
+    let expand = |select: &SelectStatement| {
+        select_has_hidden_table_function_star(select).then(|| {
+            let mut select = select.clone();
+            expand_hidden_table_function_stars(&mut select);
+            select
+        })
+    };
+    match statement {
+        Statement::Select(select) => expand(select).map(Statement::Select),
+        Statement::Insert(insert) => match &insert.source {
+            InsertSource::Select(select) => expand(select).map(|select| {
+                let mut insert = insert.clone();
+                insert.source = InsertSource::Select(Box::new(select));
+                Statement::Insert(insert)
+            }),
+            _ => None,
+        },
+        Statement::CreateTable(create) => match &create.body {
+            CreateTableBody::AsSelect(select) => expand(select).map(|select| {
+                let mut create = create.clone();
+                create.body = CreateTableBody::AsSelect(Box::new(select));
+                Statement::CreateTable(create)
+            }),
+            CreateTableBody::Columns { .. } => None,
+        },
+        _ => None,
+    }
 }
 
 /// Detect whether a SELECT contains at least one MATCH operator.
@@ -197240,6 +197427,65 @@ mod tests {
                     vec![SqliteValue::Integer(4)],
                     vec![SqliteValue::Integer(6)],
                 ],
+            );
+        });
+    }
+
+    /// bd-cpa8b: `*` leaves out generate_series's HIDDEN start/stop/step.
+    #[test]
+    fn test_generate_series_star_hides_hidden_columns() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute_batch("CREATE TABLE t(a); INSERT INTO t VALUES('x'); CREATE TABLE u(v);")
+                .await
+                .unwrap();
+            let rows = |sql: &'static str| {
+                let conn = &conn;
+                async move {
+                    conn.query(sql)
+                        .await
+                        .unwrap_or_else(|error| panic!("{sql}: {error}"))
+                        .iter()
+                        .map(row_values)
+                        .collect::<Vec<_>>()
+                }
+            };
+            let int = SqliteValue::Integer;
+            let x = || SqliteValue::Text("x".into());
+            for (sql, expected) in [
+                (
+                    "SELECT * FROM generate_series(1, 3)",
+                    vec![vec![int(1)], vec![int(2)], vec![int(3)]],
+                ),
+                (
+                    "SELECT gs.* FROM generate_series(1, 2) AS gs",
+                    vec![vec![int(1)], vec![int(2)]],
+                ),
+                (
+                    "SELECT *, start FROM generate_series(5, 6)",
+                    vec![vec![int(5), int(5)], vec![int(6), int(5)]],
+                ),
+                (
+                    "SELECT * FROM t, generate_series(1, 2) ORDER BY 2",
+                    vec![vec![x(), int(1)], vec![x(), int(2)]],
+                ),
+                (
+                    "WITH s AS (SELECT * FROM generate_series(1, 2)) SELECT * FROM s",
+                    vec![vec![int(1)], vec![int(2)]],
+                ),
+                (
+                    "SELECT * FROM (SELECT * FROM generate_series(1, 2))",
+                    vec![vec![int(1)], vec![int(2)]],
+                ),
+            ] {
+                assert_eq!(rows(sql).await, expected, "{sql}");
+            }
+            conn.execute("INSERT INTO u SELECT * FROM generate_series(1, 3)")
+                .await
+                .unwrap();
+            assert_eq!(
+                rows("SELECT count(*), sum(v) FROM u").await,
+                vec![vec![int(3), int(6)]],
             );
         });
     }
