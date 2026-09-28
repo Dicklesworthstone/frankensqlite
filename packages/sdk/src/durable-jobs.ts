@@ -328,6 +328,48 @@ export class DurableJobQueue {
     const keys = this.#keys(lease);
     if (typeof work !== "function") throw new TypeError("An application SQL callback is required");
     if (result !== null) text(result, "result");
+    return this.#completeWork(keys, (tx) => runJobWork(tx, work), result);
+  }
+
+  /**
+   * Commit application effects, follow-up jobs and parent completion together.
+   * Children may target other queues on this SAME database. Use stable child
+   * ids: identical existing jobs deduplicate, conflicting inputs roll back all
+   * effects. At most 128 children / 4 MiB combined UTF-8 payload are admitted.
+   * No handler or external operation runs here, and nothing retries implicitly.
+   */
+  async completeAndEnqueue<T>(
+    lease: DurableJobLease,
+    next: readonly (EnqueueJob & { readonly queue: string })[],
+    work: (tx: DurableJobTransaction) => Promise<T>,
+    result: string | null = null,
+  ): Promise<{
+    readonly value: T;
+    readonly jobs: readonly DurableEnqueueResult[];
+  }> {
+    const keys = this.#keys(lease);
+    if (typeof work !== "function") throw new TypeError("An application SQL callback is required");
+    if (result !== null) text(result, "result");
+    const children = captureJobContinuations(this.name, keys[1]! as string, next);
+    return this.#completeWork(keys, async (tx) => {
+      const value = await runJobWork(tx, work);
+      const jobs: DurableEnqueueResult[] = [];
+      for (const child of children) {
+        // All queues share the existing SQL table. Do not call open/enqueue or
+        // introduce another transaction/checkpoint between these publications.
+        const queue = new DurableJobQueue(this.#db, child.queue, this.#clock);
+        jobs.push(await queue.#enqueueIn(tx, captureJob(child)));
+      }
+      return Object.freeze({ value, jobs: Object.freeze(jobs) });
+    }, result);
+  }
+
+  /** Internal: only private work may use the owner across the final lease check. */
+  #completeWork<T>(
+    keys: readonly Parameter[],
+    work: (tx: DurableJobTransaction) => Promise<T>,
+    result: string | null,
+  ): Promise<T> {
     return this.#db.transaction(async (tx) => {
       const now = this.#now();
       // A conditional write, not an unlocked preflight read: competing claims
@@ -339,7 +381,7 @@ export class DurableJobQueue {
           now,
         ]),
       );
-      const value = await runJobWork(tx, work);
+      const value = await work(tx);
       await this.#completeIn(tx, keys, result);
       return value;
     });
@@ -523,8 +565,8 @@ export class DurableJobQueue {
   }
 }
 
-/** Keep business SQL inside publication, the completion fence and rollback. */
-async function runJobWork<T>(
+/** @internal Shared worker/queue callback drain, not a transaction owner. */
+export async function runJobWork<T>(
   tx: DurableJobTransaction,
   work: (tx: DurableJobTransaction) => Promise<T>,
 ): Promise<T> {
@@ -558,6 +600,39 @@ async function runJobWork<T>(
   }
   if (failed) throw firstFailure;
   return value;
+}
+
+/** @internal Own and validate continuation input before worker heartbeat joins. */
+export function captureJobContinuations(
+  parentQueue: string,
+  parentId: string,
+  next: readonly (EnqueueJob & { readonly queue: string })[],
+): readonly (EnqueueJob & { readonly queue: string })[] {
+  if (!Array.isArray(next) || next.length < 1 || next.length > 128)
+    throw new RangeError("A continuation requires 1..128 follow-up jobs");
+  const children: (EnqueueJob & { readonly queue: string })[] = [];
+  const seen = new Set<string>();
+  let bytes = 0;
+  // Do not use a caller's array iterator or keep mutable input across an await.
+  for (let i = 0, n = next.length; i < n; i++) {
+    const child = next[i]!;
+    const queue = child?.queue;
+    identifier(queue, "follow-up queue name");
+    const input = captureJob(child);
+    if (queue === parentQueue && input.id === parentId)
+      throw new TypeError("A job cannot enqueue itself as a continuation");
+    const key = JSON.stringify([queue, input.id]);
+    if (seen.has(key)) throw new TypeError("Duplicate follow-up job identity");
+    seen.add(key);
+    bytes += new TextEncoder().encode(input.payload).byteLength;
+    if (bytes > 4 * MAX_TEXT_BYTES)
+      throw new RangeError("Follow-up payloads exceed 4 MiB of UTF-8");
+    children.push(Object.freeze({ queue, id: input.id, payload: input.payload,
+      priority: input.priority, maxAttempts: input.maxAttempts,
+      ...(input.availableAt === undefined ? {} : { availableAt: input.availableAt }),
+    }));
+  }
+  return Object.freeze(children);
 }
 
 function fence(): string {

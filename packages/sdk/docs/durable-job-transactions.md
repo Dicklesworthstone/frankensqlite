@@ -51,3 +51,105 @@ UTF-8/UTF-16LE/UTF-16BE, and deferred foreign-key failures at COMMIT. Strict
 TypeScript 5.8.3 checking covers the actual queue module, which has no imports.
 This is SDK-component/reference-SQL evidence, not execution of FrankenSQLite
 Rust/WASM/MVCC, the full worker package, browser durability or physical power loss.
+
+## Atomic follow-up jobs
+
+`queue.completeAndEnqueue(lease, next, work, result?)` completes the parent,
+runs scoped application SQL and retains all follow-up jobs in one transaction.
+This closes the failure window between acknowledging a job and separately
+scheduling its successors. It supports multiple queues on the SAME database;
+there is no distributed transaction across databases or external services.
+
+```ts
+await queue.completeAndEnqueue(lease, [
+  { queue: 'notifications', id: `notify:${lease.id}`, payload: notificationJson },
+  { queue: 'indexing', id: `index:${lease.id}`, payload: indexJson },
+], async tx => {
+  await tx.execute('UPDATE documents SET processed=1 WHERE id=?', [documentId]);
+}, 'processed');
+```
+
+The result contains the callback `value` and frozen `jobs`, in input order.
+Every child result has the ordinary `inserted` flag and retained job snapshot.
+Identical existing child requests deduplicate using the existing enqueue rules;
+completed/dead/cancelled children are not revived. Conflicting payload, priority,
+maximum attempts, or an explicitly different schedule rolls back ALL newly
+inserted children, business effects and parent completion. Choose child ids that
+permanently identify the same work. Deduplication is not an all-parent join barrier.
+
+The parent lease is fenced before work and after all child publications. If it
+expires while business SQL or child publication runs, the group rolls back.
+A stale parent never invokes the callback. A later child conflict or COMMIT
+failure cannot leave a committed prefix. Nested results remain provisional until
+the outer transaction commits. A lost completion acknowledgement requires
+inspection of retained parent/child state: retry with the old lease rejects,
+rather than repeating application work or pretending to prove why it completed.
+
+Input is captured before admission: 1..128 children, at most 1 MiB per payload,
+and at most 4 MiB total payload UTF-8 bytes. Queue and job identifiers retain
+existing limits. Duplicate `(queue,id)` pairs in a single batch and a direct
+self-continuation reject before SQL. This does not detect arbitrary cycles across
+separate workflows. Limits describe logical payloads, not total SQLite memory,
+file size or RSS. No new schema, dependency, writer mutex or retry queue is added.
+
+## Existing worker integration
+
+The already exported `DurableJobCompletion` now accepts optional `next` jobs:
+
+```ts
+const worker = DurableJobWorker.start(queue, async (lease, context) => {
+  const output = await computeOutput(lease.payload, context.signal);
+  return {
+    result: 'processed',
+    next: [{ queue: 'notifications', id: `notify:${lease.id}`, payload: output }],
+    apply: async (tx, scope) => {
+      scope.checkpoint();
+      await tx.execute('INSERT INTO processed_jobs(id) VALUES(?)', [lease.id]);
+    },
+  };
+}, { owner: 'worker-1', stopWhenIdle: true });
+await worker.done;
+```
+
+The worker captures and validates `next` before joining an in-flight heartbeat;
+subsequent mutation of the handler's objects cannot change the chosen successors.
+Legacy queue adapters continue supporting ordinary results. A requested
+continuation on an adapter without `completeAndEnqueue` fails the job before
+application SQL; it is never silently downgraded to ordinary completion.
+
+The worker also joins admitted apply SQL before its final cancellation/monotonic
+lease check, for both ordinary and continuation completion. This keeps a dropped
+statement from escaping a cancellation that arrives while that statement runs.
+Graceful stop drains an admitted group. Once callback work has finished and final
+queue publication is underway, stop (including abort) still joins the transaction:
+the entire group may commit. Cancellation is not proof of rollback. A failed or
+uncertain completion stops the worker under its existing reconciliation policy;
+it does not automatically reschedule the parent. No additional daemon is started.
+
+### Combined verification
+
+```sh
+node --experimental-transform-types \
+  --experimental-loader=./packages/sdk/tests/helpers/production-source-loader.mjs \
+  --test packages/sdk/tests/durable-job-callback-lifetime.test.mjs \
+  packages/sdk/tests/durable-job-continuations.test.mjs \
+  packages/sdk/tests/durable-job-worker-continuations.test.mjs
+```
+
+All 73 tests pass: 30 callback-lifetime, 30 queue-continuation and 13 actual-worker
+integration cases. The source loader resolves extensionless TypeScript imports
+only. Neither production queue nor worker is replaced. SQLite supplies real SQL
+and transaction ownership, including constraints and independently opened WAL
+readers/writers. Tests cover a three-stage consumed workflow, cross-queue fanout,
+exact deduplication, delayed heartbeat receipt/input ownership, cancellation,
+graceful stop, uncertain completion, 4 MiB admission, schema constraints,
+concurrent parent completion and all three database encodings.
+
+Eight child processes report their requested IPC boundary before being SIGKILLed:
+first/last child insertion, parent completion before COMMIT, and committed before
+response, under WAL and DELETE journals. Fresh owners recover all-or-none
+publication. A watchdog kill fails the test rather than becoming a passing crash
+receipt. This establishes process-death recovery, not loss of unsynced storage.
+Strict TypeScript checking includes the actual queue and worker modules. These
+are targeted component tests, not a rerun of the entire SDK, FrankenDB/queue owner,
+FrankenSQLite native/Rust/WASM/MVCC, browser checkpoints, or power-loss tests.
