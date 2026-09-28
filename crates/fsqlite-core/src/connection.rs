@@ -210514,6 +210514,71 @@ mod sqlite_master_btree_tests {
         });
     }
 
+    /// A `sqlite_master` query materializes virtual tables whose MemDatabase
+    /// roots must not collide with pages the pager holds. The clean-root probe
+    /// used to start at the MemDatabase's `next_root_page`, which on a
+    /// schema-only connection stays near page 1, and read forward until it
+    /// found zero pages: every page of the file (a 16 GB archive: ~4M pages
+    /// per query). Pages past the transaction's visible extent are zero by
+    /// construction, so the probe must start there.
+    #[cfg(all(target_os = "linux", feature = "native"))]
+    #[test]
+    fn test_sqlite_master_query_on_schema_only_file_does_not_scan_every_page() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("large.db").to_string_lossy().into_owned();
+            {
+                let conn = Connection::open(db_path.clone()).await.unwrap();
+                conn.execute("CREATE TABLE bulk (id INTEGER PRIMARY KEY, payload BLOB)")
+                    .await
+                    .unwrap();
+                conn.execute("BEGIN").await.unwrap();
+                for id in 0..3_000_i64 {
+                    conn.execute_with_params(
+                        "INSERT INTO bulk (id, payload) VALUES (?1, ?2)",
+                        &[
+                            SqliteValue::Integer(id),
+                            SqliteValue::Blob(Arc::from(vec![7_u8; 3_500].into_boxed_slice())),
+                        ],
+                    )
+                    .await
+                    .unwrap();
+                }
+                conn.execute("COMMIT").await.unwrap();
+            }
+
+            // Bytes returned by read syscalls: the probe's page reads go through
+            // pread, which the page-cache hit/miss counters do not see.
+            let read_bytes = || {
+                std::fs::read_to_string("/proc/self/io")
+                    .ok()
+                    .and_then(|io| {
+                        io.lines()
+                            .find_map(|line| line.strip_prefix("rchar: "))
+                            .and_then(|value| value.trim().parse::<u64>().ok())
+                    })
+                    .expect("/proc/self/io rchar")
+            };
+            let conn = Connection::open_existing_schema_only(db_path).await.unwrap();
+            let before = read_bytes();
+            let rows = conn
+                .query_with_params(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1 LIMIT 1",
+                    &[SqliteValue::Text("bulk".into())],
+                )
+                .await
+                .unwrap();
+            let read = read_bytes() - before;
+            assert_eq!(rows.len(), 1);
+            // The file is ~3,000 pages (~12 MB); a bounded probe reads a few
+            // pages plus schema, not the file.
+            assert!(
+                read < 1024 * 1024,
+                "one sqlite_master query read {read} bytes of a ~12 MB file"
+            );
+        });
+    }
+
     #[test]
     fn test_sqlite_schema_alias_matches_sqlite_master_results() {
         asupersync::test_utils::run_test(|| async {
