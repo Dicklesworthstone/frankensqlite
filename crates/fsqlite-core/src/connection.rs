@@ -14571,14 +14571,23 @@ impl Connection {
         writable: bool,
         defer_fts5_hydration: bool,
     ) -> Result<Self> {
-        Self::open_schema_only_with_optional_expected_identity_and_env_and_disposition(
-            path,
-            expected_identity,
-            env,
-            writable,
-            defer_fts5_hydration,
-            SchemaOnlyPagerDisposition::Ordinary,
-        )
+        // Retry the whole open on Busy/BusyRecovery, as `open_with_page_size_and_env`
+        // does. Only the pager open retries inside; the bootstrap after it (journal
+        // mode, published-snapshot refresh, schema load) can meet a peer's WAL-index
+        // recovery while other connections commit, and a failed attempt has already
+        // closed its connection. Without this, schema-only opens failed where
+        // ordinary opens of the same file under the same load did not.
+        let path = path.into();
+        retry_busy_connection_bootstrap(|| {
+            Self::open_schema_only_with_optional_expected_identity_and_env_and_disposition(
+                path.clone(),
+                expected_identity,
+                env.clone(),
+                writable,
+                defer_fts5_hydration,
+                SchemaOnlyPagerDisposition::Ordinary,
+            )
+        })
         .await
     }
 
@@ -219280,6 +219289,83 @@ fts5(title, body, content=docs, content_rowid=id)'
             assert_eq!(rows[0].values()[1], SqliteValue::Text("alpha".into()));
             assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
             assert_eq!(rows[1].values()[1], SqliteValue::Text("beta".into()));
+        });
+    }
+
+    /// A schema-only open racing committing peers must wait out their WAL-index
+    /// recovery like an ordinary open, not fail. Four threads each open a fresh
+    /// `open_existing_schema_only` connection per write, commit one row, and
+    /// close. Before the whole schema-only open retried Busy/BusyRecovery, 2-9 of
+    /// 400 such opens failed with "database is busy (recovery in progress)" per
+    /// run (cass's concurrent writer pool), while `Connection::open` never did.
+    #[test]
+    fn test_schema_only_opens_racing_committing_peers_do_not_fail_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("schema_only_open_race.db");
+        let db = db_path.to_str().unwrap().to_owned();
+        asupersync::test_utils::run_test(|| {
+            let db = db.clone();
+            async move {
+                let conn = Connection::open(db.as_str()).await.unwrap();
+                conn.execute("PRAGMA journal_mode = WAL;").await.unwrap();
+                conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, t INTEGER, s INTEGER)")
+                    .await
+                    .unwrap();
+                conn.close().await.unwrap();
+            }
+        });
+
+        let workers = 4_i64;
+        let writes = 100_i64;
+        let open_failures = std::sync::Mutex::new(Vec::<String>::new());
+        std::thread::scope(|scope| {
+            for worker in 0..workers {
+                let (db, open_failures) = (&db, &open_failures);
+                scope.spawn(move || {
+                    asupersync::test_utils::run_test(|| async move {
+                        for write in 0..writes {
+                            let conn = match Connection::open_existing_schema_only(db.as_str()).await {
+                                Ok(conn) => conn,
+                                Err(err) => {
+                                    open_failures.lock().unwrap().push(err.to_string());
+                                    continue;
+                                }
+                            };
+                            let sql = format!("INSERT INTO items (t, s) VALUES ({worker}, {write})");
+                            for attempt in 0..200_u64 {
+                                match conn.execute(&sql).await {
+                                    Ok(_) => break,
+                                    Err(
+                                        FrankenError::Busy
+                                        | FrankenError::BusyRecovery
+                                        | FrankenError::BusySnapshot { .. }
+                                        | FrankenError::WriteConflict { .. }
+                                        | FrankenError::SerializationFailure { .. },
+                                    ) if attempt < 199 => {
+                                        std::thread::sleep(std::time::Duration::from_millis(2));
+                                    }
+                                    Err(err) => panic!("insert {worker}/{write}: {err}"),
+                                }
+                            }
+                            conn.close().await.unwrap();
+                        }
+                    });
+                });
+            }
+        });
+
+        let failures = open_failures.into_inner().unwrap();
+        assert!(
+            failures.is_empty(),
+            "{} of {} schema-only opens failed while peers committed: {:?}",
+            failures.len(),
+            workers * writes,
+            failures.iter().take(3).collect::<Vec<_>>()
+        );
+        asupersync::test_utils::run_test(|| async move {
+            let conn = Connection::open(db.as_str()).await.unwrap();
+            let rows = conn.query("SELECT COUNT(*) FROM items;").await.unwrap();
+            assert_eq!(rows[0].values()[0], SqliteValue::Integer(workers * writes));
         });
     }
 
