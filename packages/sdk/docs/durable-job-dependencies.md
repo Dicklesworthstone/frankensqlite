@@ -100,3 +100,63 @@ fail the test. The eight existing continuation crash cases also rerun; they are
 not new prerequisite crash scenarios. Strict TypeScript checks cover both actual
 source modules. This does not qualify FrankenSQLite Rust/WASM/MVCC execution,
 FrankenDB ownership/worker packaging, browser persistence, or physical power loss.
+
+## Atomic workflow graphs
+
+`queue.enqueueBatch(jobs)` publishes an entire bounded workflow in one transaction.
+Each input supplies `queue`, `id`, `payload` and optional `dependsOn`. Queues share
+this queue handle's database; the method does not open another connection. Parents
+may occur later in the input. A bounded iterative topological pass determines
+insertion order, while returned job results remain in the original input order.
+References outside the batch must already exist. Every duplicate job must match
+its original payload, schedule policy, attempts and complete dependency set.
+
+```ts
+await jobs.enqueueBatch([
+  { queue: 'reports', id: 'publish', payload: 'combined report', dependsOn: [
+    { queue: 'reports', id: 'extract' },
+    { queue: 'reports', id: 'analyze' },
+  ] },
+  { queue: 'reports', id: 'analyze', payload: 'source B' },
+  { queue: 'reports', id: 'extract', payload: 'source A' },
+]);
+```
+
+A missing parent, conflicting existing node, statement error or failed commit
+rolls back every newly inserted node and edge. Existing exact jobs are neither
+revived nor rewritten. Retrying the same batch after a lost commit response
+recovers individual node identities; there is no separate global workflow receipt
+or automatic replay of external effects. Enclosing transaction results remain
+provisional until its outer commit. The queue still needs real storage confirmation.
+
+The existing `completeAndEnqueue` and worker `DurableJobCompletion.next` accept the
+same forward-referenced subgraphs. Thus a handler can atomically finish its parent,
+publish business effects, create parallel successors and register their all-parent
+join. Cycles reject before callback SQL or lease mutation. Parent completion retains
+its existing final lease fence, including after subgraph insertion. No committed
+prefix is exposed to other owners.
+
+Batches admit 1..128 jobs, 4 MiB of combined payload and 1,024 prerequisite edges,
+with 128 edges per child. Duplicate identities and internal cycles are rejected
+before SQL. Graph ordering uses only the captured bounded input, not a scan of all
+historical jobs. Queue/job identities must be well-formed Unicode so distinct
+JavaScript strings cannot collapse during SQL binding. Public-API dependencies
+remain immutable; arbitrary direct SQL graph surgery is unsupported.
+
+### Graph verification
+
+Add `packages/sdk/tests/durable-job-graphs.test.mjs` to the command above. The final
+combined run passes 153 tests: 41 dependency cases, 39 graph cases, and the earlier
+73 callback/continuation/worker cases. Two graph regression cases fail against the
+first prerequisite-only increment. Graph cases include reversed forward references,
+cross-queue identities, a 128-node chain, exactly 1,024 edges, byte limits, cycles,
+lost commit replies, input ownership, outer/deferred rollback, independent-reader
+visibility and actual worker fan-out/fan-in in all three database encodings.
+
+Eight additional IPC-confirmed SIGKILL cuts interrupt graph nodes, edges and commit
+under WAL/DELETE. After reopening, all nodes and edges exist together or none do;
+retrying never resets committed job identities. Watchdog terminations fail. The
+full combined run therefore includes 24 process-kill scenarios: eight graph cuts,
+eight prerequisite cuts, and eight prior continuation cuts. Strict TypeScript
+checking covers both actual queue and worker modules. These are reference-SQL
+SDK-component results, not native FrankenSQLite, browser or power-loss evidence.

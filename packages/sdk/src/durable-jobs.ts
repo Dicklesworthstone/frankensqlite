@@ -185,6 +185,19 @@ export class DurableJobQueue {
   }
 
   /**
+   * Publish a bounded cross-queue workflow in one transaction. Input may name
+   * parents later in the batch; cycles reject before SQL. Results retain input
+   * order, not insertion order. External prerequisites must already exist.
+   */
+  async enqueueBatch(
+    input: readonly (EnqueueJob & { readonly queue: string })[],
+  ): Promise<readonly DurableEnqueueResult[]> {
+    const jobs = captureJobBatch(input);
+    const order = dependencyOrder(jobs);
+    return this.#db.transaction(tx => this.#enqueueBatchIn(tx, jobs, order));
+  }
+
+  /**
    * Transactional outbox: application SQL and the new job commit together.
    * Duplicate ids never rerun work. Admitted callback SQL settles before commit
    * or rollback; a caught SQL failure still aborts. Saved handles expire when
@@ -382,17 +395,28 @@ export class DurableJobQueue {
     if (typeof work !== "function") throw new TypeError("An application SQL callback is required");
     if (result !== null) text(result, "result");
     const children = captureJobContinuations(this.name, keys[1]! as string, next);
+    const order = dependencyOrder(children);
     return this.#completeWork(keys, async (tx) => {
       const value = await runJobWork(tx, work);
-      const jobs: DurableEnqueueResult[] = [];
-      for (const child of children) {
-        // All queues share the existing SQL table. Do not call open/enqueue or
-        // introduce another transaction/checkpoint between these publications.
-        const queue = new DurableJobQueue(this.#db, child.queue, this.#clock);
-        jobs.push(await queue.#enqueueIn(tx, captureJob(child)));
-      }
-      return Object.freeze({ value, jobs: Object.freeze(jobs) });
+      const jobs = await this.#enqueueBatchIn(tx, children, order);
+      return Object.freeze({ value, jobs });
     }, result);
+  }
+
+  async #enqueueBatchIn(
+    tx: DurableJobTransaction,
+    children: readonly (EnqueueJob & { readonly queue: string })[],
+    order: readonly number[],
+  ): Promise<readonly DurableEnqueueResult[]> {
+    const jobs = new Array<DurableEnqueueResult>(children.length);
+    for (const index of order) {
+      // All queues share the existing owner. No open(), extra transaction,
+      // checkpoint or worker execution is interleaved with graph publication.
+      const child = children[index]!;
+      const queue = new DurableJobQueue(this.#db, child.queue, this.#clock);
+      jobs[index] = await queue.#enqueueIn(tx, captureJob(child));
+    }
+    return Object.freeze(jobs);
   }
 
   /** Internal: only private work may use the owner across the final lease check. */
@@ -663,6 +687,17 @@ export function captureJobContinuations(
   parentId: string,
   next: readonly (EnqueueJob & { readonly queue: string })[],
 ): readonly (EnqueueJob & { readonly queue: string })[] {
+  const jobs = captureJobBatch(next);
+  if (jobs.some(job => job.queue === parentQueue && job.id === parentId))
+    throw new TypeError("A job cannot enqueue itself as a continuation");
+  // Worker validation runs before joining heartbeats or starting apply effects.
+  dependencyOrder(jobs);
+  return jobs;
+}
+
+function captureJobBatch(
+  next: readonly (EnqueueJob & { readonly queue: string })[],
+): readonly (EnqueueJob & { readonly queue: string })[] {
   if (!Array.isArray(next) || next.length < 1 || next.length > 128)
     throw new RangeError("A continuation requires 1..128 follow-up jobs");
   const children: (EnqueueJob & { readonly queue: string })[] = [];
@@ -675,8 +710,6 @@ export function captureJobContinuations(
     const queue = child?.queue;
     identifier(queue, "follow-up queue name");
     const input = captureJob(child);
-    if (queue === parentQueue && input.id === parentId)
-      throw new TypeError("A job cannot enqueue itself as a continuation");
     const key = JSON.stringify([queue, input.id]);
     if (seen.has(key)) throw new TypeError("Duplicate follow-up job identity");
     seen.add(key);
@@ -692,6 +725,33 @@ export function captureJobContinuations(
     }));
   }
   return Object.freeze(children);
+}
+
+/** Bounded iterative topological ordering, not a recursive whole-database walk. */
+function dependencyOrder(jobs: readonly (EnqueueJob & { readonly queue: string })[]): readonly number[] {
+  const key = (queue: string, id: string) => JSON.stringify([queue, id]);
+  const index = new Map(jobs.map((job, i) => [key(job.queue, job.id), i]));
+  const waiting = jobs.map(() => 0);
+  const dependents: number[][] = jobs.map(() => []);
+  for (let i = 0; i < jobs.length; i++) {
+    for (const ref of jobs[i]!.dependsOn ?? []) {
+      const parent = index.get(key(ref.queue, ref.id));
+      if (parent === undefined) continue;
+      waiting[i] = waiting[i]! + 1;
+      dependents[parent]!.push(i);
+    }
+  }
+  const order: number[] = [];
+  for (let i = 0; i < jobs.length; i++) if (waiting[i] === 0) order.push(i);
+  for (let cursor = 0; cursor < order.length; cursor++) {
+    for (const child of dependents[order[cursor]!]!) {
+      waiting[child] = waiting[child]! - 1;
+      if (waiting[child] === 0) order.push(child);
+    }
+  }
+  if (order.length !== jobs.length)
+    throw new DurableJobError("ERR_FSQLITE_JOB_DEPENDENCY_CYCLE", "The batch contains cyclic job prerequisites");
+  return Object.freeze(order);
 }
 
 function fence(): string {
@@ -776,6 +836,10 @@ function identifier(value: string, label: string): void {
   ) {
     throw new TypeError(`${label} must be a nonempty string of at most 256 characters without NUL`);
   }
+  // Graph keys must survive SQL UTF-8 binding unchanged. Distinct unpaired
+  // surrogate strings otherwise collapse onto the same replacement character.
+  if (new TextDecoder("utf-8", { ignoreBOM: true }).decode(new TextEncoder().encode(value)) !== value)
+    throw new TypeError(`${label} must contain well-formed Unicode`);
 }
 
 function text(value: string, label: string): number {
