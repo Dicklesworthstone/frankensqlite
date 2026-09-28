@@ -401,5 +401,85 @@
         "changes": 1
       }
     ]
+  },
+  {
+    "name": "repeated_index_columns_preserve_residuals",
+    "setup": [
+      "CREATE TABLE kv(a INTEGER,b INTEGER,c INTEGER,v TEXT,gate INTEGER)",
+      "CREATE INDEX kv_aa ON kv(a,a)",
+      "INSERT INTO kv(rowid,a,b,c,v,gate) VALUES(-9,1,2,3,'old',0),(0,1,2,3,'old',1),(7,1,2,3,'old',NULL),(12,2,2,3,'old',1)"
+    ],
+    "mutations": [
+      {
+        "sql": "UPDATE kv SET v=? WHERE a=? AND gate=? RETURNING rowid,v,gate",
+        "params": ["gated",1,1],
+        "changes": 1
+      },
+      {
+        "sql": "UPDATE kv SET v=? WHERE a=? AND a=? RETURNING rowid,v,gate",
+        "params": ["wrong",1,2],
+        "changes": 0
+      },
+      {
+        "sql": "DELETE FROM kv WHERE a=? AND gate=? RETURNING rowid,v,gate",
+        "params": [1,null],
+        "changes": 0
+      },
+      {
+        "sql": "UPDATE kv SET v=? WHERE a=? AND gate IS NULL RETURNING rowid,v,gate",
+        "params": ["null-gate",1],
+        "changes": 1
+      },
+      {
+        "sql": "DELETE FROM kv WHERE a=? AND gate=? RETURNING rowid,v,gate",
+        "params": [1,0],
+        "changes": 1
+      },
+      {
+        "sql": "DELETE FROM kv WHERE a=? AND gate=? RETURNING rowid,v,gate",
+        "params": [1,1],
+        "changes": 1
+      }
+    ]
+  },
+  {
+    "name": "repeated_composite_key_terms_preserve_residuals",
+    "setup": [
+      "CREATE TABLE kv(a INTEGER,b INTEGER,c INTEGER,v TEXT,gate INTEGER)",
+      "CREATE INDEX kv_aab ON kv(a,a,b)",
+      "INSERT INTO kv(rowid,a,b,c,v,gate) VALUES(-9,1,2,3,'old',0),(0,1,2,3,'old',1),(7,1,2,3,'old',NULL),(12,1,9,3,'old',1),(20,2,2,3,'old',1)"
+    ],
+    "mutations": [
+      {
+        "sql": "UPDATE kv SET v=? WHERE b=? AND gate=? AND a=? RETURNING rowid,v,gate",
+        "params": ["gated",2,1,1],
+        "changes": 1
+      },
+      {
+        "sql": "UPDATE kv SET v=? WHERE b=? AND a=? AND a=? RETURNING rowid,v,gate",
+        "params": ["wrong",2,1,2],
+        "changes": 0
+      },
+      {
+        "sql": "DELETE FROM kv WHERE a=? AND b=? AND gate=? RETURNING rowid,v,gate",
+        "params": [1,2,null],
+        "changes": 0
+      },
+      {
+        "sql": "DELETE FROM kv WHERE b=? AND a=? AND gate IS NULL RETURNING rowid,v,gate",
+        "params": [2,1],
+        "changes": 1
+      },
+      {
+        "sql": "DELETE FROM kv WHERE a=? AND b=? AND gate=? RETURNING rowid,v,gate",
+        "params": [1,2,1],
+        "changes": 1
+      },
+      {
+        "sql": "UPDATE kv SET v=? WHERE a=? AND b=? RETURNING rowid,v,gate",
+        "params": ["full-key",1,2],
+        "changes": 1
+      }
+    ]
   }
 ]
