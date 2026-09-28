@@ -5646,6 +5646,10 @@ fn default_vtab_module_registry() -> HashMap<String, Arc<dyn VtabModuleFactory>>
 }
 
 const GENERATE_SERIES_TABLE_COLUMN_NAMES: [&str; 4] = ["value", "start", "stop", "step"];
+
+/// bd-f5sh5: after this many consecutive autocommit schema changes on a
+/// connection lose to concurrent committers, the next one runs IMMEDIATE.
+const SCHEMA_CHANGE_ESCALATION_STREAK: u32 = 3;
 const HTM_METRICS_TABLE_COLUMN_NAMES: [&str; 8] = [
     "attempts",
     "aborts_conflict",
@@ -13210,6 +13214,11 @@ pub struct Connection {
     /// sample no longer matches at commit may have built derived structures
     /// (a new index) from a snapshot that misses a peer's committed rows.
     concurrent_begin_write_generation: Cell<u64>,
+    /// bd-f5sh5: consecutive autocommit schema changes on this connection
+    /// that lost to concurrent committers (Busy / BusySnapshot). At
+    /// [`SCHEMA_CHANGE_ESCALATION_STREAK`] the next autocommit schema change
+    /// runs IMMEDIATE instead of CONCURRENT so it cannot starve.
+    schema_change_conflict_streak: Cell<u32>,
     /// One-shot self-read fast path for the exact live VTAB instances enlisted
     /// in a validated local commit. The receipt is tied to that commit sequence;
     /// any other committed write clears it before a later reload can reuse it.
@@ -14831,6 +14840,7 @@ impl Connection {
             data_version_global: Arc::clone(&shared_mvcc_state.data_version_global),
             concurrent_write_generation: Arc::clone(&shared_mvcc_state.concurrent_write_generation),
             concurrent_begin_write_generation: Cell::new(0),
+            schema_change_conflict_streak: Cell::new(0),
             committed_schema_cookie: Arc::clone(&shared_mvcc_state.committed_schema_cookie),
             memdb_visible_commit_seq: RefCell::new(initial_visible_commit_seq),
             // Never hydrate rows — this is the whole point of schema-only.
@@ -15375,6 +15385,7 @@ impl Connection {
             data_version_global: Arc::clone(&shared_mvcc_state.data_version_global),
             concurrent_write_generation: Arc::clone(&shared_mvcc_state.concurrent_write_generation),
             concurrent_begin_write_generation: Cell::new(0),
+            schema_change_conflict_streak: Cell::new(0),
             committed_schema_cookie: Arc::clone(&shared_mvcc_state.committed_schema_cookie),
             memdb_visible_commit_seq: RefCell::new(initial_visible_commit_seq),
             memdb_rows_loaded: Cell::new(eager_memdb_rows),
@@ -37767,6 +37778,19 @@ impl Connection {
                 && !expression_only_has_subquery(select));
         let was_auto = if is_txn_control || storage_free_select {
             false // transaction-control manages its own transactions
+        } else if is_write
+            && schema_change_boundary
+            && !writable_schema_dml
+            && self.schema_change_conflict_streak.get() >= SCHEMA_CHANGE_ESCALATION_STREAK
+        {
+            // bd-f5sh5: a CONCURRENT schema change must abort whenever a peer
+            // commits during its run, so a steady writer can starve it. After
+            // repeated losses it takes the writer baton for one run, as stock
+            // SQLite's DDL holds the write lock; peers wait in their busy
+            // handler meanwhile. bd-4iaoi's commit-time checks keep the peers'
+            // rows consistent with the new schema.
+            self.ensure_autocommit_txn_mode_with_cx(TransactionMode::Immediate, &op_cx, None)
+                .await?
         } else if is_write {
             self.ensure_autocommit_txn_with_cx(&op_cx).await?
         } else {
@@ -38081,6 +38105,24 @@ impl Connection {
                 .await;
             if armed_full_schema_reload && resolve_result.is_ok() {
                 self.force_full_schema_reload_once.set(false);
+            }
+            if armed_full_schema_reload && !writable_schema_dml {
+                // bd-f5sh5: count consecutive losses to concurrent committers;
+                // any other outcome ends the streak.
+                let lost_race = |outcome: Option<&FrankenError>| {
+                    matches!(
+                        outcome,
+                        Some(FrankenError::Busy | FrankenError::BusySnapshot { .. })
+                    )
+                };
+                let streak = if lost_race(resolve_result.as_ref().err())
+                    || lost_race(result.as_ref().err())
+                {
+                    self.schema_change_conflict_streak.get().saturating_add(1)
+                } else {
+                    0
+                };
+                self.schema_change_conflict_streak.set(streak);
             }
             resolve_result?;
             if ok && writable_schema_dml {
@@ -197506,6 +197548,37 @@ mod tests {
                     vec![SqliteValue::Integer(6)],
                 ],
             );
+        });
+    }
+
+    /// bd-f5sh5: once autocommit schema changes have lost enough races, the
+    /// next one runs IMMEDIATE, commits normally and ends the streak.
+    #[test]
+    fn test_escalated_schema_change_runs_immediate_and_resets_streak() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f5sh5.db");
+        let path = path.to_str().unwrap().to_owned();
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(&path).await.unwrap();
+            conn.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT); INSERT INTO t(v) VALUES ('a');")
+                .await
+                .unwrap();
+            let peer = Connection::open(&path).await.unwrap();
+            peer.execute("INSERT INTO t(v) VALUES ('b')").await.unwrap();
+            conn.schema_change_conflict_streak
+                .set(crate::connection::SCHEMA_CHANGE_ESCALATION_STREAK);
+            conn.execute("CREATE INDEX t_v ON t(v)").await.unwrap();
+            assert_eq!(conn.schema_change_conflict_streak.get(), 0);
+            peer.execute("INSERT INTO t(v) VALUES ('c')").await.unwrap();
+            let rows = conn.query("PRAGMA integrity_check").await.unwrap();
+            assert_eq!(row_values(&rows[0]), vec![SqliteValue::Text("ok".into())]);
+            let rows = conn
+                .query("SELECT count(*) FROM t INDEXED BY t_v WHERE v >= 'a'")
+                .await
+                .unwrap();
+            assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(3)]);
+            peer.close().await.unwrap();
+            conn.close().await.unwrap();
         });
     }
 
