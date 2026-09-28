@@ -70559,6 +70559,21 @@ impl Connection {
             ))
         })?;
         let mut start = self.db.borrow().next_root_page();
+        // Pages past the transaction's visible extent are unallocated, so
+        // they read back as zero: start the probe there. On a schema-only
+        // connection `next_root_page` stays near page 1 and every real page
+        // is non-zero, so starting below the extent read the whole file for
+        // each `sqlite_master` query (~4M pages on a 16 GB database). The
+        // loop below still verifies each candidate page.
+        let visible_extent = txn.visible_db_size_bound();
+        if let Some(past_extent) = i32::try_from(visible_extent)
+            .ok()
+            .and_then(|extent| extent.checked_add(1))
+            && visible_extent > 0
+            && past_extent > start
+        {
+            start = past_extent;
+        }
         let mut clean = 0_i32;
         while clean < needed {
             let page = start + clean;
