@@ -57254,6 +57254,12 @@ impl Connection {
         if self.in_transaction.get() || self.active_txn_is_open_or_borrowed() {
             return Ok(false);
         }
+        // Sample before any snapshot binds, and before the reuse fast paths
+        // below return, so every write commit this transaction's views could
+        // miss is counted after the sample. A serialized transaction's schema
+        // change checks it too (bd-4iaoi).
+        self.concurrent_begin_write_generation
+            .set(self.concurrent_write_generation.load(AtomicOrdering::Acquire));
         let begin_setup_start = hot_path_profile_enabled().then(Instant::now);
         let is_concurrent = mode == TransactionMode::Concurrent;
 
@@ -57410,12 +57416,6 @@ impl Connection {
             return Ok(true);
         }
 
-        if is_concurrent {
-            // Sample before any snapshot binds, so every write commit this
-            // transaction's views could miss is counted after the sample.
-            self.concurrent_begin_write_generation
-                .set(self.concurrent_write_generation.load(AtomicOrdering::Acquire));
-        }
         let mut concurrent_snapshot = if is_concurrent {
             // bd-db300.8.2 / H2: forced single-writer mode does not need the
             // pre-BEGIN publication bind. The opened pager txn already exposes
@@ -59524,18 +59524,36 @@ impl Connection {
         // up the registry and clears `concurrent_session_id`, so the subsequent
         // `abort_current_concurrent_session` early-returns without re-locking;
         // we still drop the guard explicitly first to make that unambiguous.
-        let mut commit_registry_guard = if ok && is_concurrent_txn && txn_has_pending_writes {
-            Some(lock_registry_for_commit(&self.concurrent_registry))
-        } else {
-            None
-        };
+        // bd-4iaoi: a serialized (non-CONCURRENT) autocommit schema change holds
+        // the same guard across validate → physical write → generation bump +
+        // cookie publish, and is stale if any peer committed a write since it
+        // began.
+        let serialized_schema_change =
+            ok && !is_concurrent_txn && txn_has_pending_writes && schema_change_boundary;
+        let mut commit_registry_guard =
+            if (ok && is_concurrent_txn && txn_has_pending_writes) || serialized_schema_change {
+                Some(lock_registry_for_commit(&self.concurrent_registry))
+            } else {
+                None
+            };
         let (txn_result, committed_write, rolled_back_dirty_state) = if ok {
             let concurrent_plan = if let Some(registry) = commit_registry_guard.as_mut() {
-                match self.plan_concurrent_commit_with_registry(
-                    registry,
-                    &pending_conflict_pages,
-                    schema_change_boundary,
-                ) {
+                let planned = if is_concurrent_txn {
+                    self.plan_concurrent_commit_with_registry(
+                        registry,
+                        &pending_conflict_pages,
+                        schema_change_boundary,
+                    )
+                } else if self.concurrent_write_generation.load(AtomicOrdering::Acquire)
+                    != self.concurrent_begin_write_generation.get()
+                {
+                    Err(FrankenError::BusySnapshot {
+                        conflicting_pages: String::new(),
+                    })
+                } else {
+                    Ok(None)
+                };
+                match planned {
                     Ok(plan) => {
                         // End of the under-lock validate/reserve phase. The
                         // physical write follows while this guard remains held.
@@ -59856,6 +59874,13 @@ impl Connection {
                             if self.pager.is_memory() {
                                 self.finish_commit_clock(committed_seq);
                             }
+                        }
+                        if serialized_schema_change {
+                            // bd-4iaoi: count the write and publish the cookie
+                            // before releasing the guard held since validation.
+                            self.concurrent_write_generation
+                                .fetch_add(1, AtomicOrdering::AcqRel);
+                            self.publish_committed_schema_cookie(self.schema_cookie());
                         }
                         record_hot_path_duration(
                             &FSQLITE_COMMIT_FINALIZE_SEQ_TIME_NS,
@@ -71004,11 +71029,9 @@ impl Connection {
         };
 
         let hydrate_rows_at_begin = self.should_hydrate_memdb_rows_for_explicit_begin();
-        if is_concurrent {
-            // Sample before any snapshot binds (see the autocommit begin).
-            self.concurrent_begin_write_generation
-                .set(self.concurrent_write_generation.load(AtomicOrdering::Acquire));
-        }
+        // Sample before any snapshot binds (see the autocommit begin).
+        self.concurrent_begin_write_generation
+            .set(self.concurrent_write_generation.load(AtomicOrdering::Acquire));
         let prebound_publication = if is_concurrent {
             Some(
                 match self
@@ -72096,12 +72119,33 @@ impl Connection {
             // `concurrent_registry`, and the commit-clock helpers lock only
             // `active_commit_seqs`, so holding the registry guard across them is
             // free of lock-order inversion.
-            let mut commit_registry_guard = if is_concurrent_txn && txn_has_pending_writes {
-                Some(lock_registry_for_commit(&self.concurrent_registry))
-            } else {
-                None
-            };
-            let mut concurrent_commit_plan = if let Some(registry) = commit_registry_guard.as_mut()
+            // bd-4iaoi: a serialized (non-CONCURRENT) write commit also holds
+            // the registry guard, from before its physical commit until it has
+            // bumped the write generation and published any new schema cookie.
+            // Concurrent committers validate under this guard, so none can
+            // slip into the gap after the pager commit. A serialized schema
+            // change is also stale, like a concurrent one, if any peer
+            // committed a write since it began: its index was built from a
+            // snapshot that misses the peer's rows.
+            let serialized_write = !is_concurrent_txn && txn_has_pending_writes;
+            let serialized_schema_change = serialized_write && schema_cookie_to_publish.is_some();
+            let mut commit_registry_guard =
+                if (is_concurrent_txn && txn_has_pending_writes) || serialized_write {
+                    Some(lock_registry_for_commit(&self.concurrent_registry))
+                } else {
+                    None
+                };
+            if serialized_schema_change
+                && self.concurrent_write_generation.load(AtomicOrdering::Acquire)
+                    != self.concurrent_begin_write_generation.get()
+            {
+                return Err(FrankenError::BusySnapshot {
+                    conflicting_pages: String::new(),
+                });
+            }
+            let mut concurrent_commit_plan = if let Some(registry) = commit_registry_guard
+                .as_mut()
+                .filter(|_| is_concurrent_txn)
             {
                 let plan = self.plan_concurrent_commit_with_registry(
                     registry,
@@ -72175,11 +72219,20 @@ impl Connection {
                         perform_begin_busy_retry_handoff(wait).await;
                         if reacquire_registry {
                             let mut registry = lock_registry_for_commit(&self.concurrent_registry);
-                            concurrent_commit_plan = self.plan_concurrent_commit_with_registry(
-                                &mut registry,
-                                &pending_conflict_pages,
-                                schema_cookie_to_publish.is_some(),
-                            )?;
+                            if is_concurrent_txn {
+                                concurrent_commit_plan = self.plan_concurrent_commit_with_registry(
+                                    &mut registry,
+                                    &pending_conflict_pages,
+                                    schema_cookie_to_publish.is_some(),
+                                )?;
+                            } else if serialized_schema_change
+                                && self.concurrent_write_generation.load(AtomicOrdering::Acquire)
+                                    != self.concurrent_begin_write_generation.get()
+                            {
+                                return Err(FrankenError::BusySnapshot {
+                                    conflicting_pages: String::new(),
+                                });
+                            }
                             // This re-acquired guard has its own phase clock, so
                             // mark validation again after the retry re-plan.
                             registry.mark_validate_done();
@@ -72373,6 +72426,16 @@ impl Connection {
                     } else {
                         self.sync_filebacked_post_commit_visibility_floor();
                     }
+                    // bd-4iaoi: count the write and publish the new schema
+                    // cookie before releasing the registry guard held since
+                    // the physical commit.
+                    self.concurrent_write_generation
+                        .fetch_add(1, AtomicOrdering::AcqRel);
+                    if serialized_schema_change && let Some(schema_cookie) = schema_cookie_to_publish
+                    {
+                        self.publish_committed_schema_cookie(schema_cookie);
+                    }
+                    drop(commit_registry_guard.take());
                 }
                 record_hot_path_duration(
                     &FSQLITE_COMMIT_FINALIZE_SEQ_TIME_NS,
