@@ -169,7 +169,6 @@ fn text(value: &SqliteValue) -> &str {
 }
 
 #[test]
-#[ignore = "GH-434: known DML full-scan failure; enable after implementing composite seeks"]
 fn gh434_keyed_dml_must_not_walk_the_table() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::tempdir().expect("temporary database directory");
@@ -303,7 +302,7 @@ async fn measure_pair(
 }
 
 #[test]
-#[ignore = "GH-434: known linear scaling; run in release mode with --ignored --nocapture"]
+#[ignore = "GH-434: wall-clock scaling check; run in release mode with --ignored --nocapture"]
 fn gh434_keyed_dml_scaling() {
     asupersync::test_utils::run_test(|| async {
         let mut measurements = Vec::new();
