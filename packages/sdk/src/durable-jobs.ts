@@ -580,6 +580,63 @@ export class DurableJobQueue {
     );
   }
 
+  /**
+   * Explicitly cancel up to limit ready jobs in THIS queue whose immutable
+   * prerequisites include a dead/cancelled job. Repeat bounded pages to reach
+   * descendants made impossible by this same transaction. Other queues require
+   * their own sweep. Missing parents and retryable failures are not terminal
+   * evidence. Never claim work, consume attempts, or run application callbacks.
+   */
+  async cancelBlocked(limit = 100): Promise<number> {
+    integer(limit, "limit", 1, 1000);
+    return this.#db.transaction(async tx => {
+      // This is a live queue operation, not schema initialization or repair.
+      await ensureDependencies(tx, false);
+      const now = this.#now();
+      const reason = "Cancelled because a prerequisite is dead or cancelled";
+      let cancelled = 0;
+      while (cancelled < limit) {
+        const pageSize = Math.min(32, limit - cancelled);
+        const rows = (await tx.query(`SELECT job_id FROM ${TABLE} AS candidate
+          WHERE queue_name=? AND state='ready' AND ${dependenciesFailed("candidate")}
+          ORDER BY job_id LIMIT ?`, [this.name, pageSize])).rows;
+        if (!Array.isArray(rows) || rows.length > pageSize)
+          throw corrupt("Blocked-job selection exceeded its requested page");
+        if (!rows.length) break;
+        const seen = new Set<string>();
+        for (const row of rows) {
+          const id = string(row, "job_id");
+          identifier(id, "blocked job id");
+          if (seen.has(id)) throw corrupt("Blocked-job selection repeated an identity");
+          seen.add(id);
+          // Recheck the terminal prerequisite in the mutation, not just a
+          // preflight read. The owner provides isolation/conflict handling.
+          const changed = await tx.execute(`UPDATE ${TABLE} AS candidate
+            SET state='cancelled',updated_at=?,last_error=?,
+              lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL
+            WHERE queue_name=? AND job_id=? AND state='ready'
+              AND ${dependenciesFailed("candidate")}`, [now, reason, this.name, id]);
+          if (changed !== 1)
+            throw new DurableJobError("ERR_FSQLITE_JOB_CONFLICT",
+              "Blocked job changed during cancellation; the sweep must roll back");
+          const saved = (await tx.query(`SELECT state,updated_at,last_error,
+            lease_owner,lease_token,lease_expires_at FROM ${TABLE}
+            WHERE queue_name=? AND job_id=?`, [this.name, id])).rows;
+          if (saved.length !== 1 || saved[0]!.state !== "cancelled" ||
+              number(saved[0]!, "updated_at") !== now || saved[0]!.last_error !== reason ||
+              saved[0]!.lease_owner !== null || saved[0]!.lease_token !== null ||
+              saved[0]!.lease_expires_at !== null)
+            throw corrupt("Blocked-job cancellation was not retained");
+          cancelled++;
+        }
+        // No cursor: a newly eligible descendant can sort BEFORE its parent.
+        // Every nonempty page advances by at least one of the bounded mutations.
+      }
+      await ensureDependencies(tx, false);
+      return cancelled;
+    });
+  }
+
   /** Bounded crash recovery, including workers that died on their final attempt. */
   async reapExpired(limit = 100): Promise<number> {
     integer(limit, "limit", 1, 1000);
@@ -795,6 +852,15 @@ function dependenciesReady(alias: "candidate" | "NEW"): string {
           AND parent.state='completed'))`;
 }
 
+/** Only known terminal failure, not a missing or still-retryable parent. */
+function dependenciesFailed(alias: "candidate"): string {
+  return `EXISTS (SELECT 1 FROM ${DEPENDENCIES} AS dependency
+    JOIN ${TABLE} AS parent ON parent.queue_name=dependency.parent_queue
+      AND parent.job_id=dependency.parent_id
+    WHERE dependency.queue_name=${alias}.queue_name AND dependency.job_id=${alias}.job_id
+      AND parent.state IN ('dead','cancelled'))`;
+}
+
 async function readDependencies(tx: DurableJobTransaction, queue: string, id: string): Promise<readonly Dependency[]> {
   const rows = (await tx.query(`SELECT parent_queue,parent_id FROM ${DEPENDENCIES}
     WHERE queue_name=? AND job_id=? LIMIT ${MAX_DEPENDENCIES + 1}`, [queue, id])).rows;
@@ -803,7 +869,7 @@ async function readDependencies(tx: DurableJobTransaction, queue: string, id: st
 }
 
 /** Install an immutable edge store and a storage-level claim guard as one unit. */
-async function ensureDependencies(tx: DurableJobTransaction): Promise<void> {
+async function ensureDependencies(tx: DurableJobTransaction, create = true): Promise<void> {
   const objects = [
     { kind: "TABLE", name: DEPENDENCIES_NAME,
       body: "(queue_name TEXT NOT NULL COLLATE BINARY, job_id TEXT NOT NULL COLLATE BINARY, parent_queue TEXT NOT NULL COLLATE BINARY, parent_id TEXT NOT NULL COLLATE BINARY, PRIMARY KEY(queue_name,job_id,parent_queue,parent_id)) WITHOUT ROWID" },
@@ -816,7 +882,7 @@ async function ensureDependencies(tx: DurableJobTransaction): Promise<void> {
   ];
   const read = async () => (await tx.query(`SELECT name,sql FROM main.sqlite_schema WHERE name COLLATE NOCASE IN (${objects.map(() => "?").join(",")})`, objects.map(o => o.name))).rows;
   let rows = await read();
-  if (rows.length === 0) {
+  if (rows.length === 0 && create) {
     for (const object of objects)
       await tx.execute(`CREATE ${object.kind} main."${object.name}" ${object.body}`);
     rows = await read();
