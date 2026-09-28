@@ -22734,7 +22734,7 @@ pub fn codegen_update(
         && rowid_range.is_none()
         && rowid_eq_residual.is_none()
     {
-        index_eq_residual_seek_target(
+        index_key_eq_residual_seek_target(
             stmt.where_clause.as_ref(),
             table,
             stmt.table.alias.as_deref(),
@@ -22930,7 +22930,7 @@ pub fn codegen_update(
                 P4::None,
                 0,
             );
-        } else if let Some((idx_schema, target, aff, has_residual)) = index_eq {
+        } else if let Some((idx_schema, targets, has_residual)) = index_eq {
             // Fresh read cursor beyond the table + registered index-maintenance cursors. The probe and the
             // residual (if any) number from set_placeholder_count + 1, after the SET placeholders (Pass 2).
             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -22939,8 +22939,7 @@ pub fn codegen_update(
                 b,
                 idx_read_cursor,
                 idx_schema,
-                target,
-                aff,
+                &targets,
                 rowset_reg,
                 matched_rowid_reg,
                 table,
@@ -24243,6 +24242,70 @@ fn index_eq_residual_seek_target<'a, 't>(
     None
 }
 
+/// An index seek for DELETE/UPDATE: the index, the probe value and affinity
+/// of each leading key column, and whether other WHERE terms remain.
+type IndexEqSeekTarget<'a, 't> = (&'t IndexSchema, Vec<(&'a Expr, char)>, bool);
+
+/// [`index_eq_residual_seek_target`], extended (GH#434) to an index whose
+/// every key column is pinned by an equality with a literal or a numbered or
+/// named parameter, such as the autoindex of a composite PRIMARY KEY.
+///
+/// Only the full key qualifies: the probe `(v1, ..., vn, i64::MIN)` then
+/// compares its trailing field with the rowid. After a partial prefix it
+/// would compare with the next key column, where NULLs sort first. TEXT key
+/// columns must compare BINARY in both the index and the column, as for
+/// the single-column seek.
+fn index_key_eq_residual_seek_target<'a, 't>(
+    where_clause: Option<&'a Expr>,
+    table: &'t TableSchema,
+    table_alias: Option<&str>,
+) -> Option<IndexEqSeekTarget<'a, 't>> {
+    if let Some((idx, target, aff, has_residual)) =
+        index_eq_residual_seek_target(where_clause, table, table_alias)
+    {
+        return Some((idx, vec![(target, aff)], has_residual));
+    }
+    let where_expr = where_clause?;
+    let mut conjuncts = Vec::new();
+    collect_conjunctive_terms(where_expr, &mut conjuncts);
+    let equalities: Vec<(String, &'a Expr)> = conjuncts
+        .iter()
+        .copied()
+        .filter_map(|term| extract_column_eq_target(Some(term), table, table_alias))
+        .filter(|(_, target)| is_rowid_range_constant(target))
+        .collect();
+    table
+        .indexes
+        .iter()
+        .filter(|idx| idx.supports_direct_column_lookup() && idx.key_term_count() >= 2)
+        .find_map(|idx| {
+            let mut targets = Vec::with_capacity(idx.key_term_count());
+            for (term, column_name) in idx.columns.iter().enumerate() {
+                if idx.key_term_descending(term) {
+                    return None;
+                }
+                let (_, target) = equalities
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(column_name))?;
+                let column = table.columns.get(table.column_index(column_name)?)?;
+                let affinity = column.affinity;
+                if !matches!(affinity, 'D' | 'C' | 'E' | 'B') {
+                    return None;
+                }
+                let binary = |collation: Option<&str>| {
+                    collation.is_none_or(|c| c.eq_ignore_ascii_case("BINARY"))
+                };
+                if affinity == 'B'
+                    && !(binary(idx.key_term_collation(term)) && binary(column.collation.as_deref()))
+                {
+                    return None;
+                }
+                targets.push((*target, affinity));
+            }
+            Some((idx, targets, conjuncts.len() > idx.key_term_count()))
+        })
+}
+
 /// DELETE/UPDATE Pass-1 collection for `WHERE <single-col-ASC-integer-indexed> = <value> [AND
 /// <residual>]`: open a FRESH read cursor on the index (distinct from the table cursor and the registered
 /// index-maintenance cursors, so Pass 2 is unaffected), seek `(val, i64::MIN)`, walk the equal-value run
@@ -24258,10 +24321,10 @@ fn emit_index_eq_rowset_collect(
     b: &mut ProgramBuilder,
     idx_read_cursor: i32,
     idx_schema: &IndexSchema,
-    target_expr: &Expr,
-    // The indexed column's affinity ('D' integer / 'C' numeric / 'E' real / 'B' binary-text) — coerced
-    // onto a runtime-typed probe so it seeks like the affinity-applying comparison would.
-    affinity: char,
+    // One probe value per leading key column, with that column's affinity ('D' integer / 'C' numeric /
+    // 'E' real / 'B' binary-text) — coerced onto a runtime-typed probe so it seeks like the
+    // affinity-applying comparison would. More than one entry covers the index's full key (GH#434).
+    targets: &[(&Expr, char)],
     rowset_reg: i32,
     rowid_reg: i32,
     table: &TableSchema,
@@ -24275,28 +24338,32 @@ fn emit_index_eq_rowset_collect(
     where_placeholder_base: u32,
     residual_filter: bool,
 ) {
-    let probe_key_regs = b.alloc_regs(2);
-    let min_rowid_reg = probe_key_regs + 1;
-    // Emit the probe value, numbering an anon placeholder from the base, and coerce a runtime-typed bound
-    // to the column's INTEGER affinity so the seek positions like the affinity-applying comparison would.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let key_count = targets.len() as i32;
+    let probe_key_regs = b.alloc_regs(key_count + 1);
+    let min_rowid_reg = probe_key_regs + key_count;
+    // Emit the probe values, numbering an anon placeholder from the base, and coerce a runtime-typed bound
+    // to the column's affinity so the seek positions like the affinity-applying comparison would.
     b.set_next_anon_placeholder(where_placeholder_base);
-    emit_expr(b, target_expr, probe_key_regs, None);
-    if !bound_matches_affinity(affinity, target_expr) {
-        b.emit_op(
-            Opcode::Affinity,
-            probe_key_regs,
-            1,
-            0,
-            P4::Affinity(affinity.to_string()),
-            0,
-        );
+    for (offset, (target_expr, affinity)) in (0..).zip(targets) {
+        emit_expr(b, target_expr, probe_key_regs + offset, None);
+        if !bound_matches_affinity(*affinity, target_expr) {
+            b.emit_op(
+                Opcode::Affinity,
+                probe_key_regs + offset,
+                1,
+                0,
+                P4::Affinity(affinity.to_string()),
+                0,
+            );
+        }
     }
     b.emit_op(Opcode::Int64, 0, min_rowid_reg, 0, P4::Int64(i64::MIN), 0);
     let probe_record_reg = b.alloc_reg();
     b.emit_op(
         Opcode::MakeRecord,
         probe_key_regs,
-        2,
+        key_count + 1,
         probe_record_reg,
         P4::None,
         0,
@@ -24320,16 +24387,24 @@ fn emit_index_eq_rowset_collect(
     );
     let loop_top = b.current_addr();
     let skip_label = b.emit_label();
+    // Stop at the first entry whose key differs from the probe in any column. Key columns after the
+    // first compare BINARY (enforced by index_key_eq_residual_seek_target).
     let idx_key_reg = b.alloc_reg();
-    b.emit_op(Opcode::Column, idx_read_cursor, 0, idx_key_reg, P4::None, 0);
-    b.emit_jump_to_label(
-        Opcode::Ne,
-        probe_key_regs,
-        idx_key_reg,
-        close_label,
-        direct_lookup_index_comparison_p4(idx_schema),
-        0x10,
-    );
+    for offset in 0..key_count {
+        b.emit_op(Opcode::Column, idx_read_cursor, offset, idx_key_reg, P4::None, 0);
+        b.emit_jump_to_label(
+            Opcode::Ne,
+            probe_key_regs + offset,
+            idx_key_reg,
+            close_label,
+            if offset == 0 {
+                direct_lookup_index_comparison_p4(idx_schema)
+            } else {
+                P4::None
+            },
+            0x10,
+        );
+    }
     b.emit_op(Opcode::IdxRowid, idx_read_cursor, rowid_reg, 0, P4::None, 0);
     if residual_filter && let Some(where_expr) = where_clause {
         // Position the table cursor on the candidate row and apply the full WHERE; a residual miss skips
@@ -24513,7 +24588,7 @@ pub fn codegen_delete(
         && rowid_range.is_none()
         && rowid_eq_residual.is_none()
     {
-        index_eq_residual_seek_target(
+        index_key_eq_residual_seek_target(
             stmt.where_clause.as_ref(),
             table,
             stmt.table.alias.as_deref(),
@@ -24678,7 +24753,7 @@ pub fn codegen_delete(
             );
         }
         b.emit_op(Opcode::RowSetAdd, rowset_reg, rowid_reg, 0, P4::None, 0);
-    } else if let Some((idx_schema, target, aff, has_residual)) = index_eq {
+    } else if let Some((idx_schema, targets, has_residual)) = index_eq {
         // Fresh read cursor beyond the table + registered index-maintenance cursors.
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let idx_read_cursor = table_cursor + 1 + table.indexes.len() as i32;
@@ -24687,8 +24762,7 @@ pub fn codegen_delete(
             b,
             idx_read_cursor,
             idx_schema,
-            target,
-            aff,
+            &targets,
             rowset_reg,
             rowid_reg,
             table,

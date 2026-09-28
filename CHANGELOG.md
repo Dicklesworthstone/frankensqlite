@@ -17,13 +17,14 @@ as a 28-member Cargo workspace under `crates/`.
 
 Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
-Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.7) (2026-08-20) through [v0.4.4](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.4.4) (2026-09-17). v0.3.2–v0.3.4, v0.3.6–v0.3.18 and v0.4.4 are GitHub Releases; **v0.3.5 is a tag / crates.io snapshot with no GitHub Release**, and **0.4.0–0.4.3 are crates.io publishes with no tag and no GitHub Release** — their changes are documented in the v0.4.4 section. Every release in the window has a per-change section below (the v0.3.12/v0.3.13 sections were reconstructed from their tag ranges on 2026-09-01).
+Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.7) (2026-08-20) through [v0.4.6](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.4.6) (2026-09-27). v0.3.2–v0.3.4, v0.3.6–v0.3.18 and v0.4.4 are GitHub Releases; **v0.3.5 is a tag / crates.io snapshot with no GitHub Release**, and **0.4.0–0.4.3 are crates.io publishes with no tag and no GitHub Release** — their changes are documented in the v0.4.4 section. Every release in the window has a per-change section below (the v0.3.12/v0.3.13 sections were reconstructed from their tag ranges on 2026-09-01).
 
 ## Version Timeline
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| [Unreleased](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.4.4...main) | HEAD | 2026-09-17 | — |
+| [Unreleased](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.4.6...main) | HEAD | 2026-09-27 | — |
+| [v0.4.6](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.4.6) | Release | 2026-09-27 | Uniform release of all 26 public crates (0.4.5 skipped: consumed by the fsqlite-pager backport). Page-referenced-twice fix (bd-b5vmw), lost-index-entry race fix (bd-11sz4), freelist/overflow hardening, WAL-index healing, per-statement busy_timeout (GH#423), UTF-16/collation and numeric parity |
 | [0.4.5](https://crates.io/crates/fsqlite-pager/0.4.5) | crates.io only | 2026-09-25 | `fsqlite-pager` alone: bd-b5vmw backport onto v0.4.4, so a page can no longer end up referenced by both the freelist trunk and a live b-tree across a WAL generation. Tag `fsqlite-pager-v0.4.5`; no GitHub Release. The next uniform release must be >= 0.4.6 |
 | [v0.4.4](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.4.4) | Release | 2026-09-17 | First uniform-version release: all 28 crates publish at 0.4.4 together. Page-accounting repair: abandoned pages reach the durable freelist again on the native WAL-index path, fixing orphans stock `integrity_check` reported as `page N is never used` (bd-u2kmg); pending freelist repair is reserved for real writers (GH#462). Shared-memory foundations for cross-process MVCC (mapped page lock table, Unix MVCC SHM with identity-bound headers, session-owned `BEGIN CONCURRENT` tokens) — infrastructure only; public `Connection` MVCC authority stays process-local (GH#329 open). Native WAL-index SHM with append ownership and reader leases, plus stock WAL-index codec parity (GH#19). Read-only openers join a live WAL; schema-only WAL-index recovery. Scoped WAL-FEC repair pipeline. A substantial new TypeScript SDK / WASM worker: managed transaction scopes, streaming imports, atomic bulk writes, pre-IPC backpressure, versioned IndexedDB snapshots, binary result transfer, snapshot pools, and committed-change streams with live SELECT. SQL fixes: no rowid burned on a discarded row (bd-55kh5), `UNIQUE` violations name the conflicting columns (bd-towj6), bounded `DROP` teardown (bd-fmhvo), VIRTUAL generated-column bounds/NOT NULL/collation (bd-fjieg) |
 | [0.4.3](https://crates.io/crates/fsqlite-pager/0.4.3) | crates.io only | 2026-09-16 | `fsqlite-pager` alone (GH#462 freelist repair); no tag, no GitHub Release. Documented in the v0.4.4 section |
@@ -50,11 +51,347 @@ Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releas
 
 ---
 
-## [Unreleased] -- development on `main` since v0.4.4
+## [Unreleased] -- development on `main` since v0.4.6
 
-Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.4.4...main>
+Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.4.6...main>
 
-No changes yet.
+Entries for changes after v0.4.6 are written at the next release.
+
+---
+
+## [0.4.6] -- 2026-09-27 (GitHub Release)
+
+Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.4.4...v0.4.6>
+
+**What this is.** A uniform-version release: all 26 public workspace crates publish at 0.4.6 together (the two private members, `fsqlite-e2e` and `fsqlite-harness`, are `publish = false`), and the
+tag, the crates.io set and this section describe the same commit. It covers the whole `v0.4.4..v0.4.6`
+range: 370 non-merge commits, 2026-09-17 through 2026-09-26.
+
+**Why not 0.4.5.** `main` was bumped to a uniform 0.4.5 but never published at that version. Earlier the
+same day, `fsqlite-pager` 0.4.5 had gone out as a crates.io-only backport of bd-b5vmw onto v0.4.4 (see the
+0.4.5 entry), and crates.io versions are immutable. 0.4.6 therefore supersedes both.
+
+### Page accounting and on-disk integrity
+
+- **Page referenced twice across a WAL generation (bd-b5vmw).** A live B-tree page could be freed and
+  granted again, so `integrity_check` reported `page N is referenced multiple times` (freelist trunk plus
+  index, or two index paths). This is the same fix as the 0.4.5 pager backport
+  ([a712b8ea4](https://github.com/Dicklesworthstone/frankensqlite/commit/a712b8ea4)).
+- **Freelist sizing.** Freelist trunks are sized by usable size rather than page size, which matters for
+  databases with reserved bytes. A rebuilt image's freelist is sized by the header it publishes
+  ([d13743008](https://github.com/Dicklesworthstone/frankensqlite/commit/d13743008),
+  [e1306af2f](https://github.com/Dicklesworthstone/frankensqlite/commit/e1306af2f)).
+- **B-tree readers reject corrupt structure instead of propagating it.**
+  - Corrupt freelist references and duplicate free pages are refused
+    ([0645b9c3b](https://github.com/Dicklesworthstone/frankensqlite/commit/0645b9c3b)).
+  - Invalid overflow links and corrupt overflow chains are rejected before a row payload is reconstructed
+    ([6a3cfda20](https://github.com/Dicklesworthstone/frankensqlite/commit/6a3cfda20),
+    [9be5de33b](https://github.com/Dicklesworthstone/frankensqlite/commit/9be5de33b)).
+  - Failed overflow reservations are compensated, and allocation identities are validated
+    ([a44068249](https://github.com/Dicklesworthstone/frankensqlite/commit/a44068249)).
+  - Reserved bytes are excluded from cell headers and copy spans
+    ([a2997f963](https://github.com/Dicklesworthstone/frankensqlite/commit/a2997f963)).
+- **Collated indexes.** Collated-index corruption and lossy key comparisons are fixed; UTF-16 read/order
+  parity is restored; and collated UNIQUE probes seek instead of scanning
+  ([8086a0cbe](https://github.com/Dicklesworthstone/frankensqlite/commit/8086a0cbe)).
+- **`integrity_check` reporting.** It reports stored NOT NULL and CHECK violations the way stock SQLite
+  does, and its vectorized scan decodes UTF-16 databases
+  ([76b38991a](https://github.com/Dicklesworthstone/frankensqlite/commit/76b38991a)).
+
+### WAL, recovery and repair
+
+- **WAL-index and companion lifecycle.**
+  - A stale WAL-index is healed on journal-mode re-entry, and a commit is never acknowledged into an
+    unlinked WAL ([363b4dd4d](https://github.com/Dicklesworthstone/frankensqlite/commit/363b4dd4d)).
+  - A missing WAL companion is treated as an ordinary state rather than a dead end, bd-7zs8a
+    ([2fc898296](https://github.com/Dicklesworthstone/frankensqlite/commit/2fc898296)).
+  - The native path no longer creates a companion file
+    ([e0c23cc78](https://github.com/Dicklesworthstone/frankensqlite/commit/e0c23cc78)).
+- **Fail-closed recovery.**
+  - Native recovery and compaction fail closed
+    ([49890c89c](https://github.com/Dicklesworthstone/frankensqlite/commit/49890c89c)).
+  - Stale WAL pairings are rejected for rollback-mode recovery sources
+    ([6b6acfff4](https://github.com/Dicklesworthstone/frankensqlite/commit/6b6acfff4)).
+  - Page bodies are verified before checkpoint checksum evidence is accepted
+    ([15fd3c042](https://github.com/Dicklesworthstone/frankensqlite/commit/15fd3c042)).
+  - Recovery exports can no longer poison the source database's companions
+    ([e6af81d72](https://github.com/Dicklesworthstone/frankensqlite/commit/e6af81d72)).
+- **Readers and waiters.** Sidecar readers wait out an in-flight mutation, and fence waiters back off
+  starting at 1 ms ([e2eb7afdc](https://github.com/Dicklesworthstone/frankensqlite/commit/e2eb7afdc)).
+  Passive checkpoints report their progress and post-truncate counts accurately
+  ([0449e2487](https://github.com/Dicklesworthstone/frankensqlite/commit/0449e2487)).
+- **WAL-FEC recovery building blocks (bd-1hi.11).**
+  - Verified WAL images are reconstructed from FEC repair groups.
+  - Complete recovered snapshots are materialized.
+  - A guarded, non-destructive recovery export command is added.
+  - Recovery is anchored to surviving checksums and identity-bound commit certificates.
+  - A source WAL can be repaired with a verified backup and a native index rebuild.
+  - Commits: [8e28f4844](https://github.com/Dicklesworthstone/frankensqlite/commit/8e28f4844),
+    [4b00a78bc](https://github.com/Dicklesworthstone/frankensqlite/commit/4b00a78bc),
+    [6e40b6063](https://github.com/Dicklesworthstone/frankensqlite/commit/6e40b6063),
+    [7226e6db5](https://github.com/Dicklesworthstone/frankensqlite/commit/7226e6db5),
+    [5131151e5](https://github.com/Dicklesworthstone/frankensqlite/commit/5131151e5).
+  - Torn terminal payloads are recovered, and native repairs are settled with exact-length rollback
+    ([750e8a259](https://github.com/Dicklesworthstone/frankensqlite/commit/750e8a259),
+    [255ec1366](https://github.com/Dicklesworthstone/frankensqlite/commit/255ec1366)).
+  - **Scope:** the complete WAL-FEC recovery algorithm (bd-1hi.11) remains open. The compatibility
+    runtime's ordinary commit path still does not write repair symbols.
+- **Stale reader marks.** Stale WAL reader marks are recovered or fail fast, and stock SQLite's
+  unindexed empty WAL index is accepted (GH#430, GH#431; [e85717e0a](https://github.com/Dicklesworthstone/frankensqlite/commit/e85717e0a)).
+
+### Concurrency, busy handling and MVCC
+
+- **`busy_timeout` semantics.**
+  - Each statement now gets one `busy_timeout` budget (GH#423), shared across its retries through
+    poll-scoped machinery ([0280838fb](https://github.com/Dicklesworthstone/frankensqlite/commit/0280838fb),
+    [e550fe45c](https://github.com/Dicklesworthstone/frankensqlite/commit/e550fe45c)).
+  - DDL, SAVEPOINT and ANALYZE honor `busy_timeout` (bd-orwh0), and so does BEGIN under checkpoint
+    contention (bd-udetu). Commits:
+    [4c018b93b](https://github.com/Dicklesworthstone/frankensqlite/commit/4c018b93b),
+    [ea6430afe](https://github.com/Dicklesworthstone/frankensqlite/commit/ea6430afe),
+    [2cce5f3d8](https://github.com/Dicklesworthstone/frankensqlite/commit/2cce5f3d8).
+  - VACUUM is no longer armed for retry
+    ([61a81b141](https://github.com/Dicklesworthstone/frankensqlite/commit/61a81b141)).
+- **Opt-in whole-transaction retry.** MVCC conflicts can now trigger a whole-transaction retry, but only
+  when the caller opts in ([232554eaa](https://github.com/Dicklesworthstone/frankensqlite/commit/232554eaa)).
+- **MVCC correctness.**
+  - Rowid exhaustion is preserved across durable refresh and savepoints
+    ([0b8318e1d](https://github.com/Dicklesworthstone/frankensqlite/commit/0b8318e1d)).
+  - Retire-batch deadlocks and repeated epoch scans are avoided
+    ([a6174d840](https://github.com/Dicklesworthstone/frankensqlite/commit/a6174d840)).
+  - Timestamp caches are isolated across allocator lifetimes, and ID wraparound is rejected
+    ([88d58831e](https://github.com/Dicklesworthstone/frankensqlite/commit/88d58831e)).
+  - Rebase preserves SQLite predicate and numeric semantics
+    ([d6ee573d3](https://github.com/Dicklesworthstone/frankensqlite/commit/d6ee573d3)).
+  - Intent proofs bind exact raw TEXT bytes
+    ([830cb705a](https://github.com/Dicklesworthstone/frankensqlite/commit/830cb705a)).
+- **Ownership under uncertainty.** When process liveness is inconclusive, snapshot-publisher and rebuild
+  ownership are retained. Hidden Linux processes are distinguished from dead owners. File and SHM ownership
+  survive a failed admission. Commits:
+  [4b8a956af](https://github.com/Dicklesworthstone/frankensqlite/commit/4b8a956af),
+  [91f5aacb7](https://github.com/Dicklesworthstone/frankensqlite/commit/91f5aacb7),
+  [c7cda06ee](https://github.com/Dicklesworthstone/frankensqlite/commit/c7cda06ee),
+  [430ccd3ba](https://github.com/Dicklesworthstone/frankensqlite/commit/430ccd3ba).
+- **Write coordinator shutdown.** The coordinator stops cooperatively before the last close, and closing
+  regions drain cooperatively ([6cf1407d6](https://github.com/Dicklesworthstone/frankensqlite/commit/6cf1407d6),
+  [2bba1e7c6](https://github.com/Dicklesworthstone/frankensqlite/commit/2bba1e7c6)).
+- **Concurrent schema changes.** A concurrent schema change aborts after any peer write commit since its
+  BEGIN, whatever that commit's sequence number (bd-11sz4; [7c81a5cdd](https://github.com/Dicklesworthstone/frankensqlite/commit/7c81a5cdd); see the release gate).
+- **Read-only concurrent COMMIT.** A file-backed read-only concurrent COMMIT no longer adopts the global
+  commit clock (GH#429; [fd8c16a94](https://github.com/Dicklesworthstone/frankensqlite/commit/fd8c16a94)).
+- **`integrity_check` under contention.** A transient conflict is reported as `SQLITE_BUSY`, not as a
+  verdict row (bd-svwm7; [eef5999da](https://github.com/Dicklesworthstone/frankensqlite/commit/eef5999da)).
+
+### SQL and function parity with stock SQLite
+
+- **Query semantics.**
+  - EXISTS over an aggregate, and ORDER BY on a selected literal
+    ([3aff98db3](https://github.com/Dicklesworthstone/frankensqlite/commit/3aff98db3)).
+  - INSERT ... SELECT ... UPSERT keeps its parameter bindings
+    ([746983217](https://github.com/Dicklesworthstone/frankensqlite/commit/746983217)).
+  - Correlated EXISTS seeks treat an explicit `main.table` as MAIN
+    ([83d65ab7e](https://github.com/Dicklesworthstone/frankensqlite/commit/83d65ab7e)).
+- **Numeric semantics.**
+  - Exact integer conversion and SQLite's numeric boundaries are preserved
+    ([4d16c4ff1](https://github.com/Dicklesworthstone/frankensqlite/commit/4d16c4ff1)).
+  - Math coercion and infinities match SQLite
+    ([f176f7135](https://github.com/Dicklesworthstone/frankensqlite/commit/f176f7135)).
+  - `ceil`/`floor`/`trunc` keep exact integer text
+    ([448d37cbb](https://github.com/Dicklesworthstone/frankensqlite/commit/448d37cbb)).
+  - Numeric aggregates are exact, and IEEE special values are preserved
+    ([c407ea7d4](https://github.com/Dicklesworthstone/frankensqlite/commit/c407ea7d4)).
+  - Percentile validation and ranking match SQLite
+    ([78fe1b1c0](https://github.com/Dicklesworthstone/frankensqlite/commit/78fe1b1c0)).
+  - Decimal accepts scientific input and converts exactly to binary64
+    ([ce6936ce9](https://github.com/Dicklesworthstone/frankensqlite/commit/ce6936ce9)).
+- **Text and collation.**
+  - NOCASE comparison, equality keys and ordering (including embedded NULs) match SQLite
+    ([ac4cbf1ad](https://github.com/Dicklesworthstone/frankensqlite/commit/ac4cbf1ad),
+    [6ede4b51c](https://github.com/Dicklesworthstone/frankensqlite/commit/6ede4b51c)).
+  - JSON5 infinities survive typed reads and JSONB
+    ([60140ce39](https://github.com/Dicklesworthstone/frankensqlite/commit/60140ce39)).
+  - The engine and system tables use the database's text encoding
+    ([8926f4b2f](https://github.com/Dicklesworthstone/frankensqlite/commit/8926f4b2f),
+    [54206492c](https://github.com/Dicklesworthstone/frankensqlite/commit/54206492c)).
+- **Schema, TEMP and CTEs.**
+  - WITHOUT ROWID index keys omit overlapping PK columns
+    ([0a75c20dc](https://github.com/Dicklesworthstone/frankensqlite/commit/0a75c20dc)).
+  - TEMP virtual-column UNIQUE and stock rowids are handled, CTE-only WITH skips whole-image hydration, and
+    retried DDL keeps its verbatim text
+    ([971d7115c](https://github.com/Dicklesworthstone/frankensqlite/commit/971d7115c)).
+  - The arbitrary recursive-CTE limit is removed
+    ([7fea195d2](https://github.com/Dicklesworthstone/frankensqlite/commit/7fea195d2)).
+  - Named `generate_series` instances declare their columns, and bounded/ordered series scans are planned
+    ([5c232a4f7](https://github.com/Dicklesworthstone/frankensqlite/commit/5c232a4f7),
+    [38a448f13](https://github.com/Dicklesworthstone/frankensqlite/commit/38a448f13)).
+- **In-memory TEMP lane (MemDatabase).** Failed statements are atomic, the statement boundary is
+  nesting-aware, and explicit ROLLBACK is restored (bd-5bq6u, bd-ndm28). Commits:
+  [e1d15a527](https://github.com/Dicklesworthstone/frankensqlite/commit/e1d15a527),
+  [9e56b36e9](https://github.com/Dicklesworthstone/frankensqlite/commit/9e56b36e9),
+  [e6f106d2e](https://github.com/Dicklesworthstone/frankensqlite/commit/e6f106d2e).
+- **Planner.** Equality indexes are chosen from `sqlite_stat1` rows-per-key
+  ([8258b1a8d](https://github.com/Dicklesworthstone/frankensqlite/commit/8258b1a8d)).
+- **WITHOUT ROWID probes.** Complete UNIQUE keys on WITHOUT ROWID tables are point-probed
+  ([17a2f522f](https://github.com/Dicklesworthstone/frankensqlite/commit/17a2f522f)).
+- **Opening databases.** SQLite URI open modes and filenames are honored
+  ([b009f0267](https://github.com/Dicklesworthstone/frankensqlite/commit/b009f0267)).
+- **EXISTS.** EXISTS result-list semantics and correlated comparison operand rules match stock SQLite
+  ([375e2c060](https://github.com/Dicklesworthstone/frankensqlite/commit/375e2c060)).
+
+### Performance
+
+No throughput numbers are claimed in this entry. Performance claims stay tracked on bd-uh1fv and bd-jyeus.
+
+- **Committed state is re-derived less often.**
+  - Committed state is no longer re-derived per statement, and the WAL is not re-proved inside one held
+    append gate. These address bd-ih8ak and remain partial
+    ([c7402ebf8](https://github.com/Dicklesworthstone/frankensqlite/commit/c7402ebf8),
+    [5c3f0e9a3](https://github.com/Dicklesworthstone/frankensqlite/commit/5c3f0e9a3)).
+  - Begin-path proofs are reused while the WAL header is unchanged, and the refresh signature is carried
+    forward ([81484c140](https://github.com/Dicklesworthstone/frankensqlite/commit/81484c140),
+    [3f8a9dc5f](https://github.com/Dicklesworthstone/frankensqlite/commit/3f8a9dc5f),
+    [cab30cbef](https://github.com/Dicklesworthstone/frankensqlite/commit/cab30cbef)).
+- **Less work per statement.**
+  - Storage-free SELECTs run without an autocommit transaction
+    ([bedbb0ee7](https://github.com/Dicklesworthstone/frankensqlite/commit/bedbb0ee7)).
+  - Page I/O is inline, and the WAL path is proved by stat
+    ([643163ffe](https://github.com/Dicklesworthstone/frankensqlite/commit/643163ffe)).
+  - Small correlated EXISTS probes are scanned rather than compiled per row
+    ([1f09b51fd](https://github.com/Dicklesworthstone/frankensqlite/commit/1f09b51fd)).
+  - Primary join rows are moved rather than copied
+    ([1e6dd92a5](https://github.com/Dicklesworthstone/frankensqlite/commit/1e6dd92a5)).
+- **WAL and B-tree internals.** Checkpoint frame headers are read in 64 KiB runs; the WAL-index hash scan is
+  skipped when the page tail is clean; and B-tree overflow tracking is inline. Commits:
+  [ba73ab0c9](https://github.com/Dicklesworthstone/frankensqlite/commit/ba73ab0c9),
+  [bfeb7a028](https://github.com/Dicklesworthstone/frankensqlite/commit/bfeb7a028),
+  [accb746f9](https://github.com/Dicklesworthstone/frankensqlite/commit/accb746f9).
+- **hfdt-driven work (hfdt-gbou9l).** Seeks of composite literal existence prefixes, direct scans of proven
+  WITHOUT ROWID prefixes, cached integer JSON-key anti-joins, and text-parent seeks during correlated
+  foreign-key checks. Commits:
+  [8a7af2ca8](https://github.com/Dicklesworthstone/frankensqlite/commit/8a7af2ca8),
+  [873bfeb23](https://github.com/Dicklesworthstone/frankensqlite/commit/873bfeb23),
+  [39e48fc43](https://github.com/Dicklesworthstone/frankensqlite/commit/39e48fc43),
+  [b6b392e73](https://github.com/Dicklesworthstone/frankensqlite/commit/b6b392e73).
+
+### Sessions, changesets, replication and snapshots
+
+- **Session changesets** (Rust `fsqlite-ext-session`, plus `(sdk)` items in the TypeScript SDK).
+  - SDK: interoperable SQLite session changeset encoding and inversion
+    ([2f14c089a](https://github.com/Dicklesworthstone/frankensqlite/commit/2f14c089a)).
+  - Changesets and patchsets are applied atomically, with row-local conflict rollback
+    ([011ac4f76](https://github.com/Dicklesworthstone/frankensqlite/commit/011ac4f76),
+    [72fc7e0f8](https://github.com/Dicklesworthstone/frankensqlite/commit/72fc7e0f8),
+    [b65e9c950](https://github.com/Dicklesworthstone/frankensqlite/commit/b65e9c950)).
+  - Bounded changeset streams are applied in one SQL transaction
+    ([8653108ff](https://github.com/Dicklesworthstone/frankensqlite/commit/8653108ff)).
+  - Live native SQL transactions are captured into bounded changesets
+    ([4bb1e8bac](https://github.com/Dicklesworthstone/frankensqlite/commit/4bb1e8bac)).
+- **Replication.**
+  - Source changes and ordered outbox records commit atomically
+    ([0c65c66ce](https://github.com/Dicklesworthstone/frankensqlite/commit/0c65c66ce)).
+  - Ordered, verified changesets are applied with atomic SQL cursors
+    ([26634e799](https://github.com/Dicklesworthstone/frankensqlite/commit/26634e799)).
+  - Fanout progress persists for every required replica
+    ([6b4433a11](https://github.com/Dicklesworthstone/frankensqlite/commit/6b4433a11)).
+  - Bounded native SQLite changeset rebasing
+    ([49bff425e](https://github.com/Dicklesworthstone/frankensqlite/commit/49bff425e)).
+- **Snapshot transfer.**
+  - Authenticated snapshot transfers are bound to canonical manifests
+    ([19ca2d1cc](https://github.com/Dicklesworthstone/frankensqlite/commit/19ca2d1cc)).
+  - Frozen database images stream with bounded block retention
+    ([552f79f7a](https://github.com/Dicklesworthstone/frankensqlite/commit/552f79f7a)).
+  - A snapshot can bootstrap a writable SQL replica, including resuming a partial journaled bootstrap
+    ([731ce3293](https://github.com/Dicklesworthstone/frankensqlite/commit/731ce3293),
+    [50eba2a96](https://github.com/Dicklesworthstone/frankensqlite/commit/50eba2a96)).
+- **TypeScript SDK / worker.**
+  - Durable SQL job queues with fenced leases
+    ([e8adb21c6](https://github.com/Dicklesworthstone/frankensqlite/commit/e8adb21c6)).
+  - OPFS checkpoints with conflict-safe storage and recovery
+    ([4033bf9fd](https://github.com/Dicklesworthstone/frankensqlite/commit/4033bf9fd),
+    [12b17825d](https://github.com/Dicklesworthstone/frankensqlite/commit/12b17825d)).
+  - Whole-transaction recovery with bounded conflict retries
+    ([e6916f33b](https://github.com/Dicklesworthstone/frankensqlite/commit/e6916f33b)).
+  - Verified schema migration plans applied atomically
+    ([fc3359978](https://github.com/Dicklesworthstone/frankensqlite/commit/fc3359978)).
+  - Bounded prepared-statement retention
+    ([f9b1696a1](https://github.com/Dicklesworthstone/frankensqlite/commit/f9b1696a1)).
+  - Snapshot session ownership leases
+    ([1e7c98007](https://github.com/Dicklesworthstone/frankensqlite/commit/1e7c98007)).
+  - Indexed, bounded table-scan paging
+    ([e2bc210dc](https://github.com/Dicklesworthstone/frankensqlite/commit/e2bc210dc)).
+  - CTE live queries ([28631e9b1](https://github.com/Dicklesworthstone/frankensqlite/commit/28631e9b1)).
+  - Bounded HTTP changeset transport with replay-safe receipts
+    ([84f011c65](https://github.com/Dicklesworthstone/frankensqlite/commit/84f011c65)).
+- **Resumable HTTP bootstraps.** Atomic bootstraps resume through confirmed source acknowledgements over
+  bounded, authorized HTTP staging, and installed evidence is verified before replay acknowledgements
+  ([713a75edf](https://github.com/Dicklesworthstone/frankensqlite/commit/713a75edf), [9fe4b460a](https://github.com/Dicklesworthstone/frankensqlite/commit/9fe4b460a), [7619e4d36](https://github.com/Dicklesworthstone/frankensqlite/commit/7619e4d36), [4758cb871](https://github.com/Dicklesworthstone/frankensqlite/commit/4758cb871)).
+- **Trigger-driven capture.** Trigger-driven transactions are captured through bounded before/after
+  snapshots and retained atomically in the outbox ([64c9ca500](https://github.com/Dicklesworthstone/frankensqlite/commit/64c9ca500), [ab1a8890a](https://github.com/Dicklesworthstone/frankensqlite/commit/ab1a8890a)).
+- **Receipts and UTF-16.** Ordered receipt history retires without replaying expired deliveries, and
+  ordered replication supports UTF-16 with bounded fanout identities
+  ([b137b4dd9](https://github.com/Dicklesworthstone/frankensqlite/commit/b137b4dd9), [a266a2632](https://github.com/Dicklesworthstone/frankensqlite/commit/a266a2632)).
+
+### CLI
+
+- **`.timer on|off`** reports statement resource usage via `getrusage`
+  ([117bd4e3c](https://github.com/Dicklesworthstone/frankensqlite/commit/117bd4e3c)).
+- **Page I/O on the shell's thread.** The shell runs page I/O inline on its dedicated thread
+  ([9c2b10ade](https://github.com/Dicklesworthstone/frankensqlite/commit/9c2b10ade)).
+
+### Release gate
+
+Run on trj against an exact `git archive` export of the release tree (df5e599de; the tagged commit adds only
+this CHANGELOG), never a working tree.
+
+- **Build and lint:** `cargo fmt --all --check`, `cargo check --workspace --all-targets --locked`
+  and `cargo clippy --workspace --all-targets --locked -- -D warnings`.
+- **Tests:**
+  - library tests for `fsqlite-pager`, `fsqlite-btree`, `fsqlite-wal` and `fsqlite-core`;
+  - the `bd_orwh0` busy-timeout suite, `gh410_lock_byte_freelist` and `concurrent_freelist_churn`;
+  - the savepoint, q37ep index-churn, WAL-recovery, crash-matrix and isolation e2e suites.
+- **Keeper loop:** 320 runs of the bd-b5vmw keeper
+  (`retried_create_index_persists_verbatim_sql_and_leaves_no_residue`), 8 workers under load, with output
+  captured: 0 failures and 0 corruptions, with the index surviving in 145 runs.
+
+**Caught by the gate and fixed before release (bd-11sz4).**
+- **Symptom:** the first 0.4.6 candidate (95b42608b) failed 3 of 320 keeper runs with
+  ``table `t` rowid N is missing from index `probe_verbatim` ``, which is lost index entries.
+- **Cause:** a concurrent schema change counted as stale only if the global commit sequence had moved past
+  its BEGIN. Commit sequence numbers come from each pager's view of WAL state and can jump across TRUNCATE
+  checkpoints, so a peer's INSERT could commit at or below the DDL's begin sequence. The CREATE INDEX then
+  built from a snapshot that missed those rows.
+- **Fix:** a dense in-process write generation, bumped once each concurrent commit is visible. A schema
+  change is stale if the generation moved since its BEGIN ([7c81a5cdd](https://github.com/Dicklesworthstone/frankensqlite/commit/7c81a5cdd)).
+- **Verification:** a sensitized stress harness (quiescent integrity verdict, a paired control, about 36
+  concurrent processes) found persistent corruption in 5 of 192 control runs and 0 of 192 with the fix.
+- **Scope:** first caught on the 0.4.6 candidate. Cross-process peers still go through the sequence check.
+
+### Known issues carried into this release
+
+- **bd-dd24l (P1, GH#376):** Windows-only `VACUUM INTO` regression; no output file is produced.
+- **bd-sz9j5 (P1):** there is no cross-process protocol version guard. An older engine (0.3.9, pre-GH#399/
+  GH#411) can share a database with a 0.4.x engine undetected, and the layout/protocol version constants have
+  not changed since v0.3.9. Do not mix engine versions on one database.
+- **bd-ih8ak (P1, partially addressed above) and bd-jyeus (P1, macOS):** per-statement committed-state
+  refresh cost, and a CI-gated throughput gap to C SQLite on Apple silicon.
+- **bd-1hi.11 (P0):** the complete WAL-FEC recovery algorithm is not finished (see above).
+- **Long-open multi-writer RELEASE-P0 beads** (filed 2026-08-04..07; v0.3.10 through v0.4.4 all shipped with
+  them open) remain open and are not claimed fixed here, notably
+  `bd-multipage-concurrent-update-missing-row-1fc2c` (a multi-page concurrent UPDATE workload lost a credit
+  under 8 explicit-BEGIN writers) and `bd-gh302-continuous-overlap-freelist-reuse-i5tx4`.
+- **Load-sensitive tests** (test-only; fixes in flight on main): `fsqlite-wal`
+  `test_lane_stager_reuses_lanes_after_worker_churn` and `fsqlite-pager`
+  `test_published_snapshot_retries_during_inflight_publication` can fail under a heavily loaded parallel run
+  and pass in isolation. Pre-existing reds: `crates/fsqlite/tests/generate_series_constraints.rs`
+  (bd-cpa8b, fixed on main after this release) and the `crates/fsqlite/tests/update_rowid_in_oracle.rs`
+  plan-shape assertion (bd-4x6tm).
+- **bd-4iaoi (P0, also present in v0.4.4 and earlier; fix pending for 0.4.7):** a schema change inside an
+  explicit `BEGIN IMMEDIATE` or `BEGIN EXCLUSIVE` transaction (for example `CREATE INDEX`, or `DROP` followed
+  by `CREATE`) can leave rows missing from the index, persistently. The missing rows belong to another
+  connection in the same process that autocommits writes in the default concurrent mode while the schema
+  change commits. Cross-process peers have not yet been characterized. Deferred `BEGIN`, which is promoted to
+  CONCURRENT by default, and autocommit DDL are not affected. Until 0.4.7, run explicit-transaction DDL only
+  while no concurrent writers are active, or use autocommit DDL.
 
 ---
 

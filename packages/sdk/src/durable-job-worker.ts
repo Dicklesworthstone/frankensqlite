@@ -1,11 +1,11 @@
 import type { DurableJobLease, DurableJobQueue, DurableJobTransaction } from "./durable-jobs";
-import { DurableJobError } from "./durable-jobs";
+import { DurableJobError, captureJobContinuations, runJobWork } from "./durable-jobs";
 
 /** The queue, not the runner, owns transactions, persistence and fencing. */
 export type DurableWorkerQueue = Pick<
   DurableJobQueue,
   "claim" | "renew" | "complete" | "completeWith" | "fail" | "reapExpired"
->;
+> & Partial<Pick<DurableJobQueue, "completeAndEnqueue">>;
 
 export interface DurableJobContext {
   /** Observe cancellation and await all child work before returning. */
@@ -17,6 +17,8 @@ export interface DurableJobContext {
 /** Compute outside SQL, then publish effects and completion in one transaction. */
 export interface DurableJobCompletion {
   readonly result?: string | null;
+  /** Atomically publish these same-database follow-ups with effects/completion. */
+  readonly next?: Parameters<DurableJobQueue["completeAndEnqueue"]>[1];
   /** Use only tx, await every operation, and perform no external side effects. */
   readonly apply: (tx: DurableJobTransaction, context: DurableJobContext) => void | Promise<void>;
 }
@@ -426,6 +428,8 @@ export class DurableJobWorker {
     const heartbeat = this.#heartbeat(job, lease);
     let result: string | null = null;
     let apply: DurableJobCompletion["apply"] | undefined;
+    let next: DurableJobCompletion["next"];
+    let completeNext: DurableJobQueue["completeAndEnqueue"] | undefined;
     let failed = false;
     let failure: unknown;
     try {
@@ -436,8 +440,16 @@ export class DurableJobWorker {
           if (typeof value === "object" && value !== null) {
             const capturedApply = value.apply;
             const capturedResult = value.result;
+            const capturedNext = value.next;
             if (typeof capturedApply !== "function")
               throw new TypeError("Job completion requires an apply callback");
+            if (capturedNext !== undefined) {
+              const publish = this.#queue.completeAndEnqueue;
+              if (typeof publish !== "function")
+                throw new TypeError("This job queue does not support atomic continuations");
+              next = captureJobContinuations(lease.queue, lease.id, capturedNext);
+              completeNext = publish.bind(this.#queue);
+            }
             apply = capturedApply;
             value = capturedResult;
           }
@@ -479,20 +491,21 @@ export class DurableJobWorker {
           if (apply === undefined) await this.#queue.complete(lease, result);
           else {
             const application = apply;
-            await this.#queue.completeWith(
-              lease,
-              async (tx) => {
+            const publish = async (tx: DurableJobTransaction) => {
                 this.#armLease(job);
                 try {
                   context.checkpoint();
-                  await application(tx, context);
+                  // Join admitted SQL before the final context checkpoint too:
+                  // cancellation/monotonic expiry during a dropped statement
+                  // must not be hidden by an early-returning apply callback.
+                  await runJobWork(tx, async (scoped) => application(scoped, context));
                   context.checkpoint();
                 } finally {
                   this.#disarmLease(job);
                 }
-              },
-              result,
-            );
+            };
+            if (next === undefined) await this.#queue.completeWith(lease, publish, result);
+            else await completeNext!(lease, next, publish, result);
           }
           this.#completed++;
         }

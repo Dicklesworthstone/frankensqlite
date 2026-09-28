@@ -1,8 +1,13 @@
 /** Persistent job state lives in ordinary SQL, never in the callback scheduler. */
 export const DURABLE_JOBS_TABLE = "__fsqlite_durable_jobs_v1";
-const TABLE = DURABLE_JOBS_TABLE;
+// Queue state must never resolve to a same-named TEMP or attached table.
+// Qualify reads AND writes, including lease fences and continuation postludes.
+const TABLE = `main."${DURABLE_JOBS_TABLE}"`;
 const MAX_TEXT_BYTES = 1024 * 1024;
 const MAX_LEASE_MS = 86_400_000;
+const DEPENDENCIES_NAME = "__fsqlite_job_dependencies_v1";
+const DEPENDENCIES = `main."${DEPENDENCIES_NAME}"`;
+const MAX_DEPENDENCIES = 128;
 type Parameter = string | number | null;
 type SqlRow = Record<string, unknown>;
 
@@ -44,7 +49,10 @@ export interface EnqueueJob {
   availableAt?: number;
   /** Includes the first claim; defaults to 3, range 1..1,000,000. */
   maxAttempts?: number;
+  /** Immutable existing prerequisites on this SAME database; every one must complete. */
+  dependsOn?: readonly { readonly queue: string; readonly id: string }[];
 }
+type Dependency = NonNullable<EnqueueJob["dependsOn"]>[number];
 
 export type DurableJobState = "ready" | "leased" | "completed" | "dead" | "cancelled";
 export interface DurableJob {
@@ -105,6 +113,7 @@ interface CapturedJob {
   readonly priority: number;
   readonly availableAt: number | undefined;
   readonly maxAttempts: number;
+  readonly dependsOn: readonly Dependency[];
 }
 
 export class DurableJobError extends Error {
@@ -159,10 +168,12 @@ export class DurableJobQueue {
         CHECK ((state = 'leased' AND lease_owner IS NOT NULL AND lease_token IS NOT NULL AND lease_expires_at IS NOT NULL)
           OR (state <> 'leased' AND lease_owner IS NULL AND lease_token IS NULL AND lease_expires_at IS NULL))
       )`);
-      await tx.execute(`CREATE INDEX IF NOT EXISTS __fsqlite_jobs_ready_v1 ON ${TABLE}
+      // SQLite qualifies the INDEX name; its table then belongs to that schema.
+      await tx.execute(`CREATE INDEX IF NOT EXISTS main.__fsqlite_jobs_ready_v1 ON "${DURABLE_JOBS_TABLE}"
         (queue_name, state, available_at, priority)`);
-      await tx.execute(`CREATE INDEX IF NOT EXISTS __fsqlite_jobs_expiry_v1 ON ${TABLE}
+      await tx.execute(`CREATE INDEX IF NOT EXISTS main.__fsqlite_jobs_expiry_v1 ON "${DURABLE_JOBS_TABLE}"
         (queue_name, state, lease_expires_at)`);
+      await ensureDependencies(tx);
     });
     return queue;
   }
@@ -174,9 +185,24 @@ export class DurableJobQueue {
   }
 
   /**
+   * Publish a bounded cross-queue workflow in one transaction. Input may name
+   * parents later in the batch; cycles reject before SQL. Results retain input
+   * order, not insertion order. External prerequisites must already exist.
+   */
+  async enqueueBatch(
+    input: readonly (EnqueueJob & { readonly queue: string })[],
+  ): Promise<readonly DurableEnqueueResult[]> {
+    const jobs = captureJobBatch(input);
+    const order = dependencyOrder(jobs);
+    return this.#db.transaction(tx => this.#enqueueBatchIn(tx, jobs, order));
+  }
+
+  /**
    * Transactional outbox: application SQL and the new job commit together.
-   * Duplicate ids never rerun work. Use only tx inside work, await all SQL,
-   * and do not perform external side effects or reenter this queue.
+   * Duplicate ids never rerun work. Admitted callback SQL settles before commit
+   * or rollback; a caught SQL failure still aborts. Saved handles expire when
+   * work exits. Use only tx, await SQL, and never reenter this queue or perform
+   * external side effects. This scope is not a SQL sandbox.
    */
   async enqueueWith<T>(
     input: EnqueueJob,
@@ -186,7 +212,7 @@ export class DurableJobQueue {
     if (typeof work !== "function") throw new TypeError("An application SQL callback is required");
     return this.#db.transaction(async (tx) => {
       const result = await this.#enqueueIn(tx, captured);
-      const value = result.inserted ? await work(tx) : undefined;
+      const value = result.inserted ? await runJobWork(tx, work) : undefined;
       return Object.freeze({ ...result, value });
     });
   }
@@ -196,6 +222,25 @@ export class DurableJobQueue {
     return this.#db.transaction(async (tx) => {
       const row = await this.#row(tx, id);
       return row === null ? null : decodeJob(row);
+    });
+  }
+
+  /** A read-only snapshot of prerequisites. Missing/failed parents never satisfy a join. */
+  async dependencies(id: string): Promise<readonly (Dependency & {
+    readonly state: DurableJobState | null;
+  })[] | null> {
+    identifier(id, "job id");
+    return this.#db.transaction(async tx => {
+      if (await this.#row(tx, id) === null) return null;
+      const refs = await readDependencies(tx, this.name, id);
+      const result: (Dependency & { readonly state: DurableJobState | null })[] = [];
+      for (const ref of refs) {
+        const rows = (await tx.query(`SELECT state FROM ${TABLE} WHERE queue_name=? AND job_id=?`,
+          [ref.queue, ref.id])).rows;
+        if (rows.length > 1) throw corrupt("Ambiguous prerequisite job");
+        result.push(Object.freeze({ ...ref, state: rows[0] === undefined ? null : jobState(rows[0]) }));
+      }
+      return Object.freeze(result);
     });
   }
 
@@ -234,9 +279,10 @@ export class DurableJobQueue {
       // payload before the byte budget has a chance to stop admission.
       const candidates = (
         await tx.query(
-          `SELECT job_id FROM ${TABLE} WHERE queue_name = ?
+          `SELECT job_id FROM ${TABLE} AS candidate WHERE queue_name = ?
         AND attempts < max_attempts AND ((state = 'ready' AND available_at <= ?)
           OR (state = 'leased' AND lease_expires_at <= ?))
+        AND ${dependenciesReady("candidate")}
         ORDER BY priority DESC, available_at, created_at, job_id LIMIT ?`,
           [this.name, now, now, limit],
         )
@@ -315,6 +361,8 @@ export class DurableJobQueue {
    * effects and completion commit together, or all roll back. Compute outside
    * this callback; never do external I/O or call another queue method inside it.
    * The host's committed-but-unacknowledged errors propagate without replay.
+   * Drain every admitted callback statement before the final lease fence;
+   * SQL failures abort even if caught and escaped callback handles expire.
    */
   async completeWith<T>(
     lease: DurableJobLease,
@@ -324,6 +372,59 @@ export class DurableJobQueue {
     const keys = this.#keys(lease);
     if (typeof work !== "function") throw new TypeError("An application SQL callback is required");
     if (result !== null) text(result, "result");
+    return this.#completeWork(keys, (tx) => runJobWork(tx, work), result);
+  }
+
+  /**
+   * Commit application effects, follow-up jobs and parent completion together.
+   * Children may target other queues on this SAME database. Use stable child
+   * ids: identical existing jobs deduplicate, conflicting inputs roll back all
+   * effects. At most 128 children / 4 MiB combined UTF-8 payload are admitted.
+   * No handler or external operation runs here, and nothing retries implicitly.
+   */
+  async completeAndEnqueue<T>(
+    lease: DurableJobLease,
+    next: readonly (EnqueueJob & { readonly queue: string })[],
+    work: (tx: DurableJobTransaction) => Promise<T>,
+    result: string | null = null,
+  ): Promise<{
+    readonly value: T;
+    readonly jobs: readonly DurableEnqueueResult[];
+  }> {
+    const keys = this.#keys(lease);
+    if (typeof work !== "function") throw new TypeError("An application SQL callback is required");
+    if (result !== null) text(result, "result");
+    const children = captureJobContinuations(this.name, keys[1]! as string, next);
+    const order = dependencyOrder(children);
+    return this.#completeWork(keys, async (tx) => {
+      const value = await runJobWork(tx, work);
+      const jobs = await this.#enqueueBatchIn(tx, children, order);
+      return Object.freeze({ value, jobs });
+    }, result);
+  }
+
+  async #enqueueBatchIn(
+    tx: DurableJobTransaction,
+    children: readonly (EnqueueJob & { readonly queue: string })[],
+    order: readonly number[],
+  ): Promise<readonly DurableEnqueueResult[]> {
+    const jobs = new Array<DurableEnqueueResult>(children.length);
+    for (const index of order) {
+      // All queues share the existing owner. No open(), extra transaction,
+      // checkpoint or worker execution is interleaved with graph publication.
+      const child = children[index]!;
+      const queue = new DurableJobQueue(this.#db, child.queue, this.#clock);
+      jobs[index] = await queue.#enqueueIn(tx, captureJob(child));
+    }
+    return Object.freeze(jobs);
+  }
+
+  /** Internal: only private work may use the owner across the final lease check. */
+  #completeWork<T>(
+    keys: readonly Parameter[],
+    work: (tx: DurableJobTransaction) => Promise<T>,
+    result: string | null,
+  ): Promise<T> {
     return this.#db.transaction(async (tx) => {
       const now = this.#now();
       // A conditional write, not an unlocked preflight read: competing claims
@@ -348,9 +449,9 @@ export class DurableJobQueue {
       const rows = (
         await tx.query(
           `SELECT state, COUNT(*) AS n,
-        SUM(CASE WHEN state = 'ready' AND available_at <= ? AND attempts < max_attempts THEN 1 ELSE 0 END) AS available,
+        SUM(CASE WHEN state = 'ready' AND available_at <= ? AND attempts < max_attempts AND ${dependenciesReady("candidate")} THEN 1 ELSE 0 END) AS available,
         SUM(CASE WHEN state = 'leased' AND lease_expires_at <= ? THEN 1 ELSE 0 END) AS expired
-        FROM ${TABLE} WHERE queue_name = ? GROUP BY state`,
+        FROM ${TABLE} AS candidate WHERE queue_name = ? GROUP BY state`,
           [now, now, this.name],
         )
       ).rows;
@@ -396,6 +497,12 @@ export class DurableJobQueue {
 
   async #enqueueIn(tx: DurableJobTransaction, input: CapturedJob): Promise<DurableEnqueueResult> {
     const { id, payload, priority, availableAt, maxAttempts } = input;
+    // Edges only point to jobs that existed before this insertion. Immutable
+    // requirements plus that order prevent cycles without graph-wide traversal.
+    for (const ref of input.dependsOn) {
+      if (ref.queue === this.name && ref.id === id)
+        throw new TypeError("A job cannot depend on itself");
+    }
     const now = this.#now();
     const scheduled = availableAt ?? now;
     const inserted = await tx.execute(
@@ -406,6 +513,24 @@ export class DurableJobQueue {
     );
     const row = await this.#row(tx, id);
     if (row === null) throw corrupt("Enqueued job is missing");
+    if (inserted !== 0 && inserted !== 1) throw corrupt("Invalid enqueue affected-row count");
+    const retained = await readDependencies(tx, this.name, id);
+    if (inserted === 1) {
+      if (retained.length) throw corrupt("A new job has orphan prerequisite metadata");
+      for (const ref of input.dependsOn) {
+        const parent = (await tx.query(`SELECT state FROM ${TABLE} WHERE queue_name=? AND job_id=?`,
+          [ref.queue, ref.id])).rows;
+        if (parent.length !== 1) throw new DurableJobError("ERR_FSQLITE_JOB_DEPENDENCY_MISSING",
+          "Every prerequisite must already exist on the same database");
+        jobState(parent[0]!);
+        if (await tx.execute(`INSERT INTO ${DEPENDENCIES} VALUES (?,?,?,?)`,
+          [this.name, id, ref.queue, ref.id]) !== 1) throw corrupt("Prerequisite was not retained");
+      }
+    } else if (JSON.stringify(retained) !== JSON.stringify(input.dependsOn)) {
+      throw new DurableJobError("ERR_FSQLITE_JOB_ID_CONFLICT", "Job id already identifies different prerequisites");
+    }
+    if (inserted === 1 && JSON.stringify(await readDependencies(tx, this.name, id)) !== JSON.stringify(input.dependsOn))
+      throw corrupt("Job prerequisites were not retained exactly");
     const job = decodeJob(row);
     if (
       job.payload !== payload ||
@@ -519,19 +644,187 @@ export class DurableJobQueue {
   }
 }
 
+/** @internal Shared worker/queue callback drain, not a transaction owner. */
+export async function runJobWork<T>(
+  tx: DurableJobTransaction,
+  work: (tx: DurableJobTransaction) => Promise<T>,
+): Promise<T> {
+  let accepting = true, failed = false;
+  let firstFailure: unknown;
+  const pending = new Set<Promise<unknown>>();
+  const submit = <U>(operation: () => Promise<U>): Promise<U> => {
+    if (!accepting) return Promise.reject(new DurableJobError(
+      "ERR_FSQLITE_JOB_SCOPE_ENDED", "The job callback SQL scope has ended",
+    ));
+    // Convert synchronous adapter throws to observed statement failures too.
+    const task = (async () => operation())();
+    pending.add(task);
+    void task.then(() => pending.delete(task), cause => {
+      pending.delete(task);
+      if (!failed) { failed = true; firstFailure = cause; }
+    });
+    return task;
+  };
+  const scoped = Object.freeze({
+    execute: (sql, params) => submit(() => tx.execute(sql, params)),
+    query: (sql, params) => submit(() => tx.query(sql, params)),
+  } satisfies DurableJobTransaction);
+  let value: T;
+  try { value = await work(scoped); }
+  finally {
+    accepting = false;
+    // A thrown callback (including cancellation) takes precedence, but cannot
+    // leave started SQL racing the owner's rollback. Admission is now closed.
+    await Promise.allSettled(pending);
+  }
+  if (failed) throw firstFailure;
+  return value;
+}
+
+/** @internal Own and validate continuation input before worker heartbeat joins. */
+export function captureJobContinuations(
+  parentQueue: string,
+  parentId: string,
+  next: readonly (EnqueueJob & { readonly queue: string })[],
+): readonly (EnqueueJob & { readonly queue: string })[] {
+  const jobs = captureJobBatch(next);
+  if (jobs.some(job => job.queue === parentQueue && job.id === parentId))
+    throw new TypeError("A job cannot enqueue itself as a continuation");
+  // Worker validation runs before joining heartbeats or starting apply effects.
+  dependencyOrder(jobs);
+  return jobs;
+}
+
+function captureJobBatch(
+  next: readonly (EnqueueJob & { readonly queue: string })[],
+): readonly (EnqueueJob & { readonly queue: string })[] {
+  if (!Array.isArray(next) || next.length < 1 || next.length > 128)
+    throw new RangeError("A continuation requires 1..128 follow-up jobs");
+  const children: (EnqueueJob & { readonly queue: string })[] = [];
+  const seen = new Set<string>();
+  let bytes = 0;
+  let dependencies = 0;
+  // Do not use a caller's array iterator or keep mutable input across an await.
+  for (let i = 0, n = next.length; i < n; i++) {
+    const child = next[i]!;
+    const queue = child?.queue;
+    identifier(queue, "follow-up queue name");
+    const input = captureJob(child);
+    const key = JSON.stringify([queue, input.id]);
+    if (seen.has(key)) throw new TypeError("Duplicate follow-up job identity");
+    seen.add(key);
+    bytes += new TextEncoder().encode(input.payload).byteLength;
+    dependencies += input.dependsOn.length;
+    if (dependencies > 1024) throw new RangeError("Follow-up jobs exceed 1024 prerequisites");
+    if (bytes > 4 * MAX_TEXT_BYTES)
+      throw new RangeError("Follow-up payloads exceed 4 MiB of UTF-8");
+    children.push(Object.freeze({ queue, id: input.id, payload: input.payload,
+      priority: input.priority, maxAttempts: input.maxAttempts,
+      ...(input.availableAt === undefined ? {} : { availableAt: input.availableAt }),
+      ...(input.dependsOn.length ? { dependsOn: input.dependsOn } : {}),
+    }));
+  }
+  return Object.freeze(children);
+}
+
+/** Bounded iterative topological ordering, not a recursive whole-database walk. */
+function dependencyOrder(jobs: readonly (EnqueueJob & { readonly queue: string })[]): readonly number[] {
+  const key = (queue: string, id: string) => JSON.stringify([queue, id]);
+  const index = new Map(jobs.map((job, i) => [key(job.queue, job.id), i]));
+  const waiting = jobs.map(() => 0);
+  const dependents: number[][] = jobs.map(() => []);
+  for (let i = 0; i < jobs.length; i++) {
+    for (const ref of jobs[i]!.dependsOn ?? []) {
+      const parent = index.get(key(ref.queue, ref.id));
+      if (parent === undefined) continue;
+      waiting[i] = waiting[i]! + 1;
+      dependents[parent]!.push(i);
+    }
+  }
+  const order: number[] = [];
+  for (let i = 0; i < jobs.length; i++) if (waiting[i] === 0) order.push(i);
+  for (let cursor = 0; cursor < order.length; cursor++) {
+    for (const child of dependents[order[cursor]!]!) {
+      waiting[child] = waiting[child]! - 1;
+      if (waiting[child] === 0) order.push(child);
+    }
+  }
+  if (order.length !== jobs.length)
+    throw new DurableJobError("ERR_FSQLITE_JOB_DEPENDENCY_CYCLE", "The batch contains cyclic job prerequisites");
+  return Object.freeze(order);
+}
+
 function fence(): string {
   return "queue_name = ? AND job_id = ? AND lease_owner = ? AND lease_token = ? AND attempts = ? AND state = 'leased' AND lease_expires_at > ?";
 }
 
 function captureJob(input: EnqueueJob): CapturedJob {
   // Capture caller-owned getters once, before queue admission can yield.
-  const { id, payload, priority = 0, availableAt, maxAttempts = 3 } = input;
+  const { id, payload, priority = 0, availableAt, maxAttempts = 3, dependsOn } = input;
   identifier(id, "job id");
   text(payload, "payload");
   integer(priority, "priority", -2_147_483_648, 2_147_483_647);
   integer(maxAttempts, "maxAttempts", 1, 1_000_000);
   if (availableAt !== undefined) integer(availableAt, "availableAt");
-  return { id, payload, priority, availableAt, maxAttempts };
+  return { id, payload, priority, availableAt, maxAttempts, dependsOn: captureDependencies(dependsOn) };
+}
+
+function captureDependencies(input: EnqueueJob["dependsOn"]): readonly Dependency[] {
+  if (input === undefined) return Object.freeze([]);
+  if (!Array.isArray(input) || input.length > MAX_DEPENDENCIES)
+    throw new RangeError(`A job supports at most ${MAX_DEPENDENCIES} prerequisites`);
+  const refs: Dependency[] = [];
+  const seen = new Set<string>();
+  for (let i = 0, n = input.length; i < n; i++) {
+    const ref = input[i], queue = ref?.queue, id = ref?.id;
+    identifier(queue, "prerequisite queue"); identifier(id, "prerequisite id");
+    const key = JSON.stringify([queue, id]);
+    if (seen.has(key)) throw new TypeError("Duplicate prerequisite identity");
+    seen.add(key); refs.push(Object.freeze({ queue, id }));
+  }
+  refs.sort((a, b) => a.queue < b.queue ? -1 : a.queue > b.queue ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+  return Object.freeze(refs);
+}
+
+/** Only internal aliases are accepted here; no caller SQL is interpolated. */
+function dependenciesReady(alias: "candidate" | "NEW"): string {
+  return `NOT EXISTS (SELECT 1 FROM ${DEPENDENCIES} AS dependency
+    WHERE dependency.queue_name=${alias}.queue_name AND dependency.job_id=${alias}.job_id
+      AND NOT EXISTS (SELECT 1 FROM ${TABLE} AS parent
+        WHERE parent.queue_name=dependency.parent_queue AND parent.job_id=dependency.parent_id
+          AND parent.state='completed'))`;
+}
+
+async function readDependencies(tx: DurableJobTransaction, queue: string, id: string): Promise<readonly Dependency[]> {
+  const rows = (await tx.query(`SELECT parent_queue,parent_id FROM ${DEPENDENCIES}
+    WHERE queue_name=? AND job_id=? LIMIT ${MAX_DEPENDENCIES + 1}`, [queue, id])).rows;
+  // Canonical JS ordering is independent of the database's UTF-8/UTF-16 order.
+  return captureDependencies(rows.map(row => ({ queue: string(row, "parent_queue"), id: string(row, "parent_id") })));
+}
+
+/** Install an immutable edge store and a storage-level claim guard as one unit. */
+async function ensureDependencies(tx: DurableJobTransaction): Promise<void> {
+  const objects = [
+    { kind: "TABLE", name: DEPENDENCIES_NAME,
+      body: "(queue_name TEXT NOT NULL COLLATE BINARY, job_id TEXT NOT NULL COLLATE BINARY, parent_queue TEXT NOT NULL COLLATE BINARY, parent_id TEXT NOT NULL COLLATE BINARY, PRIMARY KEY(queue_name,job_id,parent_queue,parent_id)) WITHOUT ROWID" },
+    { kind: "TRIGGER", name: "__fsqlite_jobs_dependencies_claim_v1",
+      body: `BEFORE UPDATE OF state ON "${DURABLE_JOBS_TABLE}" WHEN NEW.state='leased' AND NOT (${dependenciesReady("NEW")}) BEGIN SELECT RAISE(ABORT,'Job prerequisites are not completed'); END` },
+    { kind: "TRIGGER", name: "__fsqlite_jobs_dependencies_update_v1",
+      body: `BEFORE UPDATE ON "${DEPENDENCIES_NAME}" BEGIN SELECT RAISE(ABORT,'Job prerequisites are immutable'); END` },
+    { kind: "TRIGGER", name: "__fsqlite_jobs_dependencies_delete_v1",
+      body: `BEFORE DELETE ON "${DEPENDENCIES_NAME}" BEGIN SELECT RAISE(ABORT,'Job prerequisites are immutable'); END` },
+  ];
+  const read = async () => (await tx.query(`SELECT name,sql FROM main.sqlite_schema WHERE name COLLATE NOCASE IN (${objects.map(() => "?").join(",")})`, objects.map(o => o.name))).rows;
+  let rows = await read();
+  if (rows.length === 0) {
+    for (const object of objects)
+      await tx.execute(`CREATE ${object.kind} main."${object.name}" ${object.body}`);
+    rows = await read();
+  }
+  if (rows.length !== objects.length || objects.some(o => !rows.some(r =>
+    r.name === o.name && r.sql === `CREATE ${o.kind} "${o.name}" ${o.body}`))) {
+    throw new DurableJobError("ERR_FSQLITE_JOB_SCHEMA", "Job dependency storage is incomplete or incompatible; it was not repaired");
+  }
 }
 
 function identifier(value: string, label: string): void {
@@ -543,6 +836,10 @@ function identifier(value: string, label: string): void {
   ) {
     throw new TypeError(`${label} must be a nonempty string of at most 256 characters without NUL`);
   }
+  // Graph keys must survive SQL UTF-8 binding unchanged. Distinct unpaired
+  // surrogate strings otherwise collapse onto the same replacement character.
+  if (new TextDecoder("utf-8", { ignoreBOM: true }).decode(new TextEncoder().encode(value)) !== value)
+    throw new TypeError(`${label} must contain well-formed Unicode`);
 }
 
 function text(value: string, label: string): number {

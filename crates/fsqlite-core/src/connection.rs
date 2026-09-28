@@ -5646,6 +5646,10 @@ fn default_vtab_module_registry() -> HashMap<String, Arc<dyn VtabModuleFactory>>
 }
 
 const GENERATE_SERIES_TABLE_COLUMN_NAMES: [&str; 4] = ["value", "start", "stop", "step"];
+
+/// bd-f5sh5: after this many consecutive autocommit schema changes on a
+/// connection lose to concurrent committers, the next one runs IMMEDIATE.
+const SCHEMA_CHANGE_ESCALATION_STREAK: u32 = 3;
 const HTM_METRICS_TABLE_COLUMN_NAMES: [&str; 8] = [
     "attempts",
     "aborts_conflict",
@@ -13210,6 +13214,11 @@ pub struct Connection {
     /// sample no longer matches at commit may have built derived structures
     /// (a new index) from a snapshot that misses a peer's committed rows.
     concurrent_begin_write_generation: Cell<u64>,
+    /// bd-f5sh5: consecutive autocommit schema changes on this connection
+    /// that lost to concurrent committers (Busy / BusySnapshot). At
+    /// [`SCHEMA_CHANGE_ESCALATION_STREAK`] the next autocommit schema change
+    /// runs IMMEDIATE instead of CONCURRENT so it cannot starve.
+    schema_change_conflict_streak: Cell<u32>,
     /// One-shot self-read fast path for the exact live VTAB instances enlisted
     /// in a validated local commit. The receipt is tied to that commit sequence;
     /// any other committed write clears it before a later reload can reuse it.
@@ -14562,14 +14571,23 @@ impl Connection {
         writable: bool,
         defer_fts5_hydration: bool,
     ) -> Result<Self> {
-        Self::open_schema_only_with_optional_expected_identity_and_env_and_disposition(
-            path,
-            expected_identity,
-            env,
-            writable,
-            defer_fts5_hydration,
-            SchemaOnlyPagerDisposition::Ordinary,
-        )
+        // Retry the whole open on Busy/BusyRecovery, as `open_with_page_size_and_env`
+        // does. Only the pager open retries inside; the bootstrap after it (journal
+        // mode, published-snapshot refresh, schema load) can meet a peer's WAL-index
+        // recovery while other connections commit, and a failed attempt has already
+        // closed its connection. Without this, schema-only opens failed where
+        // ordinary opens of the same file under the same load did not.
+        let path = path.into();
+        retry_busy_connection_bootstrap(|| {
+            Self::open_schema_only_with_optional_expected_identity_and_env_and_disposition(
+                path.clone(),
+                expected_identity,
+                env.clone(),
+                writable,
+                defer_fts5_hydration,
+                SchemaOnlyPagerDisposition::Ordinary,
+            )
+        })
         .await
     }
 
@@ -14831,6 +14849,7 @@ impl Connection {
             data_version_global: Arc::clone(&shared_mvcc_state.data_version_global),
             concurrent_write_generation: Arc::clone(&shared_mvcc_state.concurrent_write_generation),
             concurrent_begin_write_generation: Cell::new(0),
+            schema_change_conflict_streak: Cell::new(0),
             committed_schema_cookie: Arc::clone(&shared_mvcc_state.committed_schema_cookie),
             memdb_visible_commit_seq: RefCell::new(initial_visible_commit_seq),
             // Never hydrate rows — this is the whole point of schema-only.
@@ -15375,6 +15394,7 @@ impl Connection {
             data_version_global: Arc::clone(&shared_mvcc_state.data_version_global),
             concurrent_write_generation: Arc::clone(&shared_mvcc_state.concurrent_write_generation),
             concurrent_begin_write_generation: Cell::new(0),
+            schema_change_conflict_streak: Cell::new(0),
             committed_schema_cookie: Arc::clone(&shared_mvcc_state.committed_schema_cookie),
             memdb_visible_commit_seq: RefCell::new(initial_visible_commit_seq),
             memdb_rows_loaded: Cell::new(eager_memdb_rows),
@@ -37767,6 +37787,19 @@ impl Connection {
                 && !expression_only_has_subquery(select));
         let was_auto = if is_txn_control || storage_free_select {
             false // transaction-control manages its own transactions
+        } else if is_write
+            && schema_change_boundary
+            && !writable_schema_dml
+            && self.schema_change_conflict_streak.get() >= SCHEMA_CHANGE_ESCALATION_STREAK
+        {
+            // bd-f5sh5: a CONCURRENT schema change must abort whenever a peer
+            // commits during its run, so a steady writer can starve it. After
+            // repeated losses it takes the writer baton for one run, as stock
+            // SQLite's DDL holds the write lock; peers wait in their busy
+            // handler meanwhile. bd-4iaoi's commit-time checks keep the peers'
+            // rows consistent with the new schema.
+            self.ensure_autocommit_txn_mode_with_cx(TransactionMode::Immediate, &op_cx, None)
+                .await?
         } else if is_write {
             self.ensure_autocommit_txn_with_cx(&op_cx).await?
         } else {
@@ -38081,6 +38114,24 @@ impl Connection {
                 .await;
             if armed_full_schema_reload && resolve_result.is_ok() {
                 self.force_full_schema_reload_once.set(false);
+            }
+            if armed_full_schema_reload && !writable_schema_dml {
+                // bd-f5sh5: count consecutive losses to concurrent committers;
+                // any other outcome ends the streak.
+                let lost_race = |outcome: Option<&FrankenError>| {
+                    matches!(
+                        outcome,
+                        Some(FrankenError::Busy | FrankenError::BusySnapshot { .. })
+                    )
+                };
+                let streak = if lost_race(resolve_result.as_ref().err())
+                    || lost_race(result.as_ref().err())
+                {
+                    self.schema_change_conflict_streak.get().saturating_add(1)
+                } else {
+                    0
+                };
+                self.schema_change_conflict_streak.set(streak);
             }
             resolve_result?;
             if ok && writable_schema_dml {
@@ -41405,6 +41456,11 @@ impl Connection {
             total_changes, total_rows,
             "morsel INSERT should affect exactly as many rows as input"
         );
+        // GH#435: each morsel's replay records its own count as the statement's
+        // changes (and adds it to total_changes), so the last morsel's count
+        // would stand for the whole statement. Report the sum.
+        self.last_changes.set(total_changes);
+        self.sync_change_tracking_context();
         Ok(total_changes)
     }
 
@@ -57254,6 +57310,12 @@ impl Connection {
         if self.in_transaction.get() || self.active_txn_is_open_or_borrowed() {
             return Ok(false);
         }
+        // Sample before any snapshot binds, and before the reuse fast paths
+        // below return, so every write commit this transaction's views could
+        // miss is counted after the sample. A serialized transaction's schema
+        // change checks it too (bd-4iaoi).
+        self.concurrent_begin_write_generation
+            .set(self.concurrent_write_generation.load(AtomicOrdering::Acquire));
         let begin_setup_start = hot_path_profile_enabled().then(Instant::now);
         let is_concurrent = mode == TransactionMode::Concurrent;
 
@@ -57410,12 +57472,6 @@ impl Connection {
             return Ok(true);
         }
 
-        if is_concurrent {
-            // Sample before any snapshot binds, so every write commit this
-            // transaction's views could miss is counted after the sample.
-            self.concurrent_begin_write_generation
-                .set(self.concurrent_write_generation.load(AtomicOrdering::Acquire));
-        }
         let mut concurrent_snapshot = if is_concurrent {
             // bd-db300.8.2 / H2: forced single-writer mode does not need the
             // pre-BEGIN publication bind. The opened pager txn already exposes
@@ -59524,18 +59580,36 @@ impl Connection {
         // up the registry and clears `concurrent_session_id`, so the subsequent
         // `abort_current_concurrent_session` early-returns without re-locking;
         // we still drop the guard explicitly first to make that unambiguous.
-        let mut commit_registry_guard = if ok && is_concurrent_txn && txn_has_pending_writes {
-            Some(lock_registry_for_commit(&self.concurrent_registry))
-        } else {
-            None
-        };
+        // bd-4iaoi: a serialized (non-CONCURRENT) autocommit schema change holds
+        // the same guard across validate → physical write → generation bump +
+        // cookie publish, and is stale if any peer committed a write since it
+        // began.
+        let serialized_schema_change =
+            ok && !is_concurrent_txn && txn_has_pending_writes && schema_change_boundary;
+        let mut commit_registry_guard =
+            if (ok && is_concurrent_txn && txn_has_pending_writes) || serialized_schema_change {
+                Some(lock_registry_for_commit(&self.concurrent_registry))
+            } else {
+                None
+            };
         let (txn_result, committed_write, rolled_back_dirty_state) = if ok {
             let concurrent_plan = if let Some(registry) = commit_registry_guard.as_mut() {
-                match self.plan_concurrent_commit_with_registry(
-                    registry,
-                    &pending_conflict_pages,
-                    schema_change_boundary,
-                ) {
+                let planned = if is_concurrent_txn {
+                    self.plan_concurrent_commit_with_registry(
+                        registry,
+                        &pending_conflict_pages,
+                        schema_change_boundary,
+                    )
+                } else if self.concurrent_write_generation.load(AtomicOrdering::Acquire)
+                    != self.concurrent_begin_write_generation.get()
+                {
+                    Err(FrankenError::BusySnapshot {
+                        conflicting_pages: String::new(),
+                    })
+                } else {
+                    Ok(None)
+                };
+                match planned {
                     Ok(plan) => {
                         // End of the under-lock validate/reserve phase. The
                         // physical write follows while this guard remains held.
@@ -59856,6 +59930,13 @@ impl Connection {
                             if self.pager.is_memory() {
                                 self.finish_commit_clock(committed_seq);
                             }
+                        }
+                        if serialized_schema_change {
+                            // bd-4iaoi: count the write and publish the cookie
+                            // before releasing the guard held since validation.
+                            self.concurrent_write_generation
+                                .fetch_add(1, AtomicOrdering::AcqRel);
+                            self.publish_committed_schema_cookie(self.schema_cookie());
                         }
                         record_hot_path_duration(
                             &FSQLITE_COMMIT_FINALIZE_SEQ_TIME_NS,
@@ -70559,6 +70640,21 @@ impl Connection {
             ))
         })?;
         let mut start = self.db.borrow().next_root_page();
+        // Pages past the transaction's visible extent are unallocated, so
+        // they read back as zero: start the probe there. On a schema-only
+        // connection `next_root_page` stays near page 1 and every real page
+        // is non-zero, so starting below the extent read the whole file for
+        // each `sqlite_master` query (~4M pages on a 16 GB database). The
+        // loop below still verifies each candidate page.
+        let visible_extent = txn.visible_db_size_bound();
+        if let Some(past_extent) = i32::try_from(visible_extent)
+            .ok()
+            .and_then(|extent| extent.checked_add(1))
+            && visible_extent > 0
+            && past_extent > start
+        {
+            start = past_extent;
+        }
         let mut clean = 0_i32;
         while clean < needed {
             let page = start + clean;
@@ -70989,11 +71085,9 @@ impl Connection {
         };
 
         let hydrate_rows_at_begin = self.should_hydrate_memdb_rows_for_explicit_begin();
-        if is_concurrent {
-            // Sample before any snapshot binds (see the autocommit begin).
-            self.concurrent_begin_write_generation
-                .set(self.concurrent_write_generation.load(AtomicOrdering::Acquire));
-        }
+        // Sample before any snapshot binds (see the autocommit begin).
+        self.concurrent_begin_write_generation
+            .set(self.concurrent_write_generation.load(AtomicOrdering::Acquire));
         let prebound_publication = if is_concurrent {
             Some(
                 match self
@@ -72081,12 +72175,33 @@ impl Connection {
             // `concurrent_registry`, and the commit-clock helpers lock only
             // `active_commit_seqs`, so holding the registry guard across them is
             // free of lock-order inversion.
-            let mut commit_registry_guard = if is_concurrent_txn && txn_has_pending_writes {
-                Some(lock_registry_for_commit(&self.concurrent_registry))
-            } else {
-                None
-            };
-            let mut concurrent_commit_plan = if let Some(registry) = commit_registry_guard.as_mut()
+            // bd-4iaoi: a serialized (non-CONCURRENT) write commit also holds
+            // the registry guard, from before its physical commit until it has
+            // bumped the write generation and published any new schema cookie.
+            // Concurrent committers validate under this guard, so none can
+            // slip into the gap after the pager commit. A serialized schema
+            // change is also stale, like a concurrent one, if any peer
+            // committed a write since it began: its index was built from a
+            // snapshot that misses the peer's rows.
+            let serialized_write = !is_concurrent_txn && txn_has_pending_writes;
+            let serialized_schema_change = serialized_write && schema_cookie_to_publish.is_some();
+            let mut commit_registry_guard =
+                if (is_concurrent_txn && txn_has_pending_writes) || serialized_write {
+                    Some(lock_registry_for_commit(&self.concurrent_registry))
+                } else {
+                    None
+                };
+            if serialized_schema_change
+                && self.concurrent_write_generation.load(AtomicOrdering::Acquire)
+                    != self.concurrent_begin_write_generation.get()
+            {
+                return Err(FrankenError::BusySnapshot {
+                    conflicting_pages: String::new(),
+                });
+            }
+            let mut concurrent_commit_plan = if let Some(registry) = commit_registry_guard
+                .as_mut()
+                .filter(|_| is_concurrent_txn)
             {
                 let plan = self.plan_concurrent_commit_with_registry(
                     registry,
@@ -72160,11 +72275,20 @@ impl Connection {
                         perform_begin_busy_retry_handoff(wait).await;
                         if reacquire_registry {
                             let mut registry = lock_registry_for_commit(&self.concurrent_registry);
-                            concurrent_commit_plan = self.plan_concurrent_commit_with_registry(
-                                &mut registry,
-                                &pending_conflict_pages,
-                                schema_cookie_to_publish.is_some(),
-                            )?;
+                            if is_concurrent_txn {
+                                concurrent_commit_plan = self.plan_concurrent_commit_with_registry(
+                                    &mut registry,
+                                    &pending_conflict_pages,
+                                    schema_cookie_to_publish.is_some(),
+                                )?;
+                            } else if serialized_schema_change
+                                && self.concurrent_write_generation.load(AtomicOrdering::Acquire)
+                                    != self.concurrent_begin_write_generation.get()
+                            {
+                                return Err(FrankenError::BusySnapshot {
+                                    conflicting_pages: String::new(),
+                                });
+                            }
                             // This re-acquired guard has its own phase clock, so
                             // mark validation again after the retry re-plan.
                             registry.mark_validate_done();
@@ -72358,6 +72482,16 @@ impl Connection {
                     } else {
                         self.sync_filebacked_post_commit_visibility_floor();
                     }
+                    // bd-4iaoi: count the write and publish the new schema
+                    // cookie before releasing the registry guard held since
+                    // the physical commit.
+                    self.concurrent_write_generation
+                        .fetch_add(1, AtomicOrdering::AcqRel);
+                    if serialized_schema_change && let Some(schema_cookie) = schema_cookie_to_publish
+                    {
+                        self.publish_committed_schema_cookie(schema_cookie);
+                    }
+                    drop(commit_registry_guard.take());
                 }
                 record_hot_path_duration(
                     &FSQLITE_COMMIT_FINALIZE_SEQ_TIME_NS,
@@ -197431,6 +197565,37 @@ mod tests {
         });
     }
 
+    /// bd-f5sh5: once autocommit schema changes have lost enough races, the
+    /// next one runs IMMEDIATE, commits normally and ends the streak.
+    #[test]
+    fn test_escalated_schema_change_runs_immediate_and_resets_streak() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f5sh5.db");
+        let path = path.to_str().unwrap().to_owned();
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(&path).await.unwrap();
+            conn.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT); INSERT INTO t(v) VALUES ('a');")
+                .await
+                .unwrap();
+            let peer = Connection::open(&path).await.unwrap();
+            peer.execute("INSERT INTO t(v) VALUES ('b')").await.unwrap();
+            conn.schema_change_conflict_streak
+                .set(crate::connection::SCHEMA_CHANGE_ESCALATION_STREAK);
+            conn.execute("CREATE INDEX t_v ON t(v)").await.unwrap();
+            assert_eq!(conn.schema_change_conflict_streak.get(), 0);
+            peer.execute("INSERT INTO t(v) VALUES ('c')").await.unwrap();
+            let rows = conn.query("PRAGMA integrity_check").await.unwrap();
+            assert_eq!(row_values(&rows[0]), vec![SqliteValue::Text("ok".into())]);
+            let rows = conn
+                .query("SELECT count(*) FROM t INDEXED BY t_v WHERE v >= 'a'")
+                .await
+                .unwrap();
+            assert_eq!(row_values(&rows[0]), vec![SqliteValue::Integer(3)]);
+            peer.close().await.unwrap();
+            conn.close().await.unwrap();
+        });
+    }
+
     /// bd-cpa8b: `*` leaves out generate_series's HIDDEN start/stop/step.
     #[test]
     fn test_generate_series_star_hides_hidden_columns() {
@@ -210514,6 +210679,71 @@ mod sqlite_master_btree_tests {
         });
     }
 
+    /// A `sqlite_master` query materializes virtual tables whose MemDatabase
+    /// roots must not collide with pages the pager holds. The clean-root probe
+    /// used to start at the MemDatabase's `next_root_page`, which on a
+    /// schema-only connection stays near page 1, and read forward until it
+    /// found zero pages: every page of the file (a 16 GB archive: ~4M pages
+    /// per query). Pages past the transaction's visible extent are zero by
+    /// construction, so the probe must start there.
+    #[cfg(all(target_os = "linux", feature = "native"))]
+    #[test]
+    fn test_sqlite_master_query_on_schema_only_file_does_not_scan_every_page() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("large.db").to_string_lossy().into_owned();
+            {
+                let conn = Connection::open(db_path.clone()).await.unwrap();
+                conn.execute("CREATE TABLE bulk (id INTEGER PRIMARY KEY, payload BLOB)")
+                    .await
+                    .unwrap();
+                conn.execute("BEGIN").await.unwrap();
+                for id in 0..3_000_i64 {
+                    conn.execute_with_params(
+                        "INSERT INTO bulk (id, payload) VALUES (?1, ?2)",
+                        &[
+                            SqliteValue::Integer(id),
+                            SqliteValue::Blob(Arc::from(vec![7_u8; 3_500].into_boxed_slice())),
+                        ],
+                    )
+                    .await
+                    .unwrap();
+                }
+                conn.execute("COMMIT").await.unwrap();
+            }
+
+            // Bytes returned by read syscalls: the probe's page reads go through
+            // pread, which the page-cache hit/miss counters do not see.
+            let read_bytes = || {
+                std::fs::read_to_string("/proc/self/io")
+                    .ok()
+                    .and_then(|io| {
+                        io.lines()
+                            .find_map(|line| line.strip_prefix("rchar: "))
+                            .and_then(|value| value.trim().parse::<u64>().ok())
+                    })
+                    .expect("/proc/self/io rchar")
+            };
+            let conn = Connection::open_existing_schema_only(db_path).await.unwrap();
+            let before = read_bytes();
+            let rows = conn
+                .query_with_params(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1 LIMIT 1",
+                    &[SqliteValue::Text("bulk".into())],
+                )
+                .await
+                .unwrap();
+            let read = read_bytes() - before;
+            assert_eq!(rows.len(), 1);
+            // The file is ~3,000 pages (~12 MB); a bounded probe reads a few
+            // pages plus schema, not the file.
+            assert!(
+                read < 1024 * 1024,
+                "one sqlite_master query read {read} bytes of a ~12 MB file"
+            );
+        });
+    }
+
     #[test]
     fn test_sqlite_schema_alias_matches_sqlite_master_results() {
         asupersync::test_utils::run_test(|| async {
@@ -219059,6 +219289,83 @@ fts5(title, body, content=docs, content_rowid=id)'
             assert_eq!(rows[0].values()[1], SqliteValue::Text("alpha".into()));
             assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
             assert_eq!(rows[1].values()[1], SqliteValue::Text("beta".into()));
+        });
+    }
+
+    /// A schema-only open racing committing peers must wait out their WAL-index
+    /// recovery like an ordinary open, not fail. Four threads each open a fresh
+    /// `open_existing_schema_only` connection per write, commit one row, and
+    /// close. Before the whole schema-only open retried Busy/BusyRecovery, 2-9 of
+    /// 400 such opens failed with "database is busy (recovery in progress)" per
+    /// run (cass's concurrent writer pool), while `Connection::open` never did.
+    #[test]
+    fn test_schema_only_opens_racing_committing_peers_do_not_fail_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("schema_only_open_race.db");
+        let db = db_path.to_str().unwrap().to_owned();
+        asupersync::test_utils::run_test(|| {
+            let db = db.clone();
+            async move {
+                let conn = Connection::open(db.as_str()).await.unwrap();
+                conn.execute("PRAGMA journal_mode = WAL;").await.unwrap();
+                conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, t INTEGER, s INTEGER)")
+                    .await
+                    .unwrap();
+                conn.close().await.unwrap();
+            }
+        });
+
+        let workers = 4_i64;
+        let writes = 100_i64;
+        let open_failures = std::sync::Mutex::new(Vec::<String>::new());
+        std::thread::scope(|scope| {
+            for worker in 0..workers {
+                let (db, open_failures) = (&db, &open_failures);
+                scope.spawn(move || {
+                    asupersync::test_utils::run_test(|| async move {
+                        for write in 0..writes {
+                            let conn = match Connection::open_existing_schema_only(db.as_str()).await {
+                                Ok(conn) => conn,
+                                Err(err) => {
+                                    open_failures.lock().unwrap().push(err.to_string());
+                                    continue;
+                                }
+                            };
+                            let sql = format!("INSERT INTO items (t, s) VALUES ({worker}, {write})");
+                            for attempt in 0..200_u64 {
+                                match conn.execute(&sql).await {
+                                    Ok(_) => break,
+                                    Err(
+                                        FrankenError::Busy
+                                        | FrankenError::BusyRecovery
+                                        | FrankenError::BusySnapshot { .. }
+                                        | FrankenError::WriteConflict { .. }
+                                        | FrankenError::SerializationFailure { .. },
+                                    ) if attempt < 199 => {
+                                        std::thread::sleep(std::time::Duration::from_millis(2));
+                                    }
+                                    Err(err) => panic!("insert {worker}/{write}: {err}"),
+                                }
+                            }
+                            conn.close().await.unwrap();
+                        }
+                    });
+                });
+            }
+        });
+
+        let failures = open_failures.into_inner().unwrap();
+        assert!(
+            failures.is_empty(),
+            "{} of {} schema-only opens failed while peers committed: {:?}",
+            failures.len(),
+            workers * writes,
+            failures.iter().take(3).collect::<Vec<_>>()
+        );
+        asupersync::test_utils::run_test(|| async move {
+            let conn = Connection::open(db.as_str()).await.unwrap();
+            let rows = conn.query("SELECT COUNT(*) FROM items;").await.unwrap();
+            assert_eq!(rows[0].values()[0], SqliteValue::Integer(workers * writes));
         });
     }
 

@@ -529,6 +529,18 @@ fn bd_11sz4_stress_writer_keeps_recreated_index() {
         });
     }
     let final_got = final_slot.lock().expect("final lock").clone();
+    // Keep a persistently corrupt image for offline inspection.
+    if final_got != "Text(\"ok\")"
+        && let Ok(dir) = std::env::var("FSQLITE_BD11SZ4_DUMP")
+    {
+        let _ = std::fs::create_dir_all(&dir);
+        for suffix in ["", "-wal"] {
+            let _ = std::fs::copy(
+                format!("{path}{suffix}"),
+                format!("{dir}/db_{}.db{suffix}", std::process::id()),
+            );
+        }
+    }
     match (mid, final_got == "Text(\"ok\")") {
         (_, false) => panic!("V5_PERSISTENT_CORRUPTION final={final_got}"),
         (Some(mid), true) => panic!("V5_MIDRUN_ONLY mid=[{mid}] final=ok"),
