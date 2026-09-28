@@ -41447,6 +41447,11 @@ impl Connection {
             total_changes, total_rows,
             "morsel INSERT should affect exactly as many rows as input"
         );
+        // GH#435: each morsel's replay records its own count as the statement's
+        // changes (and adds it to total_changes), so the last morsel's count
+        // would stand for the whole statement. Report the sum.
+        self.last_changes.set(total_changes);
+        self.sync_change_tracking_context();
         Ok(total_changes)
     }
 
