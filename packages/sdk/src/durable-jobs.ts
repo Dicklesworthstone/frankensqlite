@@ -1,6 +1,8 @@
 /** Persistent job state lives in ordinary SQL, never in the callback scheduler. */
 export const DURABLE_JOBS_TABLE = "__fsqlite_durable_jobs_v1";
-const TABLE = DURABLE_JOBS_TABLE;
+// Queue state must never resolve to a same-named TEMP or attached table.
+// Qualify reads AND writes, including lease fences and continuation postludes.
+const TABLE = `main."${DURABLE_JOBS_TABLE}"`;
 const MAX_TEXT_BYTES = 1024 * 1024;
 const MAX_LEASE_MS = 86_400_000;
 type Parameter = string | number | null;
@@ -159,9 +161,10 @@ export class DurableJobQueue {
         CHECK ((state = 'leased' AND lease_owner IS NOT NULL AND lease_token IS NOT NULL AND lease_expires_at IS NOT NULL)
           OR (state <> 'leased' AND lease_owner IS NULL AND lease_token IS NULL AND lease_expires_at IS NULL))
       )`);
-      await tx.execute(`CREATE INDEX IF NOT EXISTS __fsqlite_jobs_ready_v1 ON ${TABLE}
+      // SQLite qualifies the INDEX name; its table then belongs to that schema.
+      await tx.execute(`CREATE INDEX IF NOT EXISTS main.__fsqlite_jobs_ready_v1 ON "${DURABLE_JOBS_TABLE}"
         (queue_name, state, available_at, priority)`);
-      await tx.execute(`CREATE INDEX IF NOT EXISTS __fsqlite_jobs_expiry_v1 ON ${TABLE}
+      await tx.execute(`CREATE INDEX IF NOT EXISTS main.__fsqlite_jobs_expiry_v1 ON "${DURABLE_JOBS_TABLE}"
         (queue_name, state, lease_expires_at)`);
     });
     return queue;

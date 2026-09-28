@@ -6,7 +6,7 @@ const db=new JobSqliteTarget(path);
 const q=await DurableJobQueue.open(db,'parents',{clock:()=>100});
 async function stop(){process.send({cut});await new Promise(()=>{});}
 db.afterSql=async(sql,params)=>{
-  if(sql.includes(`INSERT INTO ${DURABLE_JOBS_TABLE}`)&&
+  if(sql.includes(`INSERT INTO main."${DURABLE_JOBS_TABLE}"`)&&
     ((cut==='first-child'&&params[1]==='first')||(cut==='last-child'&&params[1]==='second')))await stop();
   if(cut==='parent-completed'&&sql.includes("state = 'completed'"))await stop();
 };

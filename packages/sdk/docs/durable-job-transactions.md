@@ -153,3 +153,48 @@ receipt. This establishes process-death recovery, not loss of unsynced storage.
 Strict TypeScript checking includes the actual queue and worker modules. These
 are targeted component tests, not a rerun of the entire SDK, FrankenDB/queue owner,
 FrankenSQLite native/Rust/WASM/MVCC, browser checkpoints, or power-loss tests.
+
+## Main-database storage and lease authority
+
+All queue table reads and writes explicitly address
+`main.__fsqlite_durable_jobs_v1`. The two queue indexes are also explicitly
+created in `main`. The exported `DURABLE_JOBS_TABLE` remains the unqualified
+table-name constant for compatibility; it is not an SQL fragment promising
+automatic schema resolution for caller-written SQL.
+
+This fixes a reproduced silent durability failure: with a structurally compatible
+TEMP table of the same name, `enqueue()` returned `inserted: true` while the real
+main table remained empty. That job vanished when the connection closed. A TEMP
+copy of a leased row could also authorize completion after a different owner
+cancelled the main job. The repair binds fencing, reads, statistics, expiry
+recovery and cross-queue continuation publication to the same persistent state.
+
+Existing same-named TEMP tables/views and attached tables are left untouched.
+Opening a queue creates/checks its indexes in main even when TEMP has identically
+named indexes. A live queue whose main table is renamed or lost rejects rather
+than borrowing an attached replacement. No shadow table is dropped or migrated;
+already-lost jobs cannot be reconstructed by this change.
+
+This is namespace isolation, not a sandbox or protection against trusted code
+rewriting main queue metadata. Application callback SQL still chooses its own
+schemas. The adapter must still own transactions and provide genuine storage
+confirmation; a main database opened in memory does not become file-durable.
+
+### Storage-isolation verification
+
+Run the preceding combined command with
+`packages/sdk/tests/durable-job-storage-isolation.test.mjs` as an additional test
+file. All 96 targeted cases pass: the original 73 plus 23 new isolation cases.
+The unchanged pre-fix queue fails 22 of the 23 isolation cases. The new cases
+exercise file reopen under WAL/DELETE in all three SQLite encodings, incompatible
+TEMP tables/views/indexes, the entire claim/renew/fail/complete/cancel/reap
+lifecycle, cancellation by an independent file-backed owner, callback-created
+shadows, missing-main/attached fallback, lost commit responses, and actual worker
+continuations. They use actual queue/worker modules over reference SQLite.
+
+Existing SQL-interruption selectors now match the explicitly qualified table;
+their assertions, requested cuts and watchdog failures are unchanged. All eight
+original continuation SIGKILL/reopen cases rerun successfully; the 23 isolation
+cases do not add new process-kill scenarios. Strict TypeScript checks cover the
+actual queue/worker modules. These are targeted SDK-component tests, not a full
+legacy SDK-suite rerun, native FrankenSQLite execution or power-loss evidence.

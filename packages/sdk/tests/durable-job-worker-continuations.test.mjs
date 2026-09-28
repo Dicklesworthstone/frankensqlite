@@ -4,7 +4,7 @@ import { DurableJobQueue, DURABLE_JOBS_TABLE } from '../src/durable-jobs.ts';
 import { DurableJobWorker } from '../src/durable-job-worker.ts';
 import { JobSqliteTarget, gate, tick } from './helpers/durable-jobs-sqlite-target.mjs';
 
-const table=DURABLE_JOBS_TABLE;
+const table=`main."${DURABLE_JOBS_TABLE}"`;
 const next=()=>[{queue:'children',id:'child',payload:'step two'}];
 const policy={owner:'worker',clock:()=>100,stopWhenIdle:true,leaseMs:30000,heartbeatMs:10000};
 const effect=tx=>tx.execute("INSERT INTO effects VALUES(1,'applied')");

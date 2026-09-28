@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { DurableJobQueue, DURABLE_JOBS_TABLE } from '../src/durable-jobs.ts';
 import { JobSqliteTarget, gate, tick } from './helpers/durable-jobs-sqlite-target.mjs';
 
-const table=DURABLE_JOBS_TABLE;
+const table=`main."${DURABLE_JOBS_TABLE}"`;
 const ddl='CREATE TABLE effects(id INTEGER PRIMARY KEY,value TEXT);';
 const parent={id:'parent',payload:'do work'};
 const next=()=>[{queue:'next',id:'first',payload:'one',priority:7},{queue:'other',id:'second',payload:'two',availableAt:200}];
