@@ -450,18 +450,23 @@ pub fn try_compile_insert(ops: &[VdbeOp]) -> Option<SimpleInsertTemplate> {
 }
 
 /// Find the root page for a cursor by scanning OpenWrite opcodes.
+///
+/// Templates open their cursor by root alone, so a cursor on a non-main
+/// database (p3: TEMP or attached) is not compiled; the interpreter routes it.
 fn find_root_page(ops: &[VdbeOp], cursor_id: i32) -> Option<i32> {
     ops.iter()
         .find(|op| {
             (op.opcode == Opcode::OpenWrite || op.opcode == Opcode::FusedOpenWriteLast)
                 && op.p1 == cursor_id
         })
+        .filter(|op| op.p3 == 0)
         .map(|op| op.p2)
 }
 
 fn find_read_root_page(ops: &[VdbeOp], cursor_id: i32) -> Option<i32> {
     ops.iter()
         .find(|op| op.opcode == Opcode::OpenRead && op.p1 == cursor_id)
+        .filter(|op| op.p3 == 0)
         .map(|op| op.p2)
 }
 
@@ -1007,5 +1012,11 @@ mod tests {
         assert_eq!(template.cursor_id, 0);
         assert_eq!(template.root_page, 3);
         assert_eq!(template.column_indices, vec![0, 1]);
+
+        // bd-cp3yd: the same scan of a TEMP table (OpenRead p3=1) stays
+        // interpreted, which routes the cursor to the TEMP MemDatabase.
+        let mut temp_ops = ops;
+        temp_ops[2].p3 = 1;
+        assert!(try_compile_program(&temp_ops).is_none());
     }
 }
