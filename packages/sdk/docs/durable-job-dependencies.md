@@ -1,0 +1,102 @@
+# Durable all-parent job joins
+
+`EnqueueJob.dependsOn` declares immutable prerequisite job identities on the same
+SQL database. A dependent job is runnable only after **every** named parent is
+`completed`. Ready, leased, dead, cancelled and missing parents do not satisfy
+that condition. Scheduling, priority, attempts and lease fencing still apply.
+
+```ts
+const jobs = await DurableJobQueue.open(database, 'reports');
+await jobs.enqueue({ id: 'extract', payload: 'source A' });
+await jobs.enqueue({ id: 'analyze', payload: 'source B' });
+await jobs.enqueue({
+  id: 'publish', payload: 'combined report',
+  dependsOn: [
+    { queue: 'reports', id: 'extract' },
+    { queue: 'reports', id: 'analyze' },
+  ],
+});
+```
+
+The existing `DurableJobWorker` needs no separate dependency scheduler: its normal
+claim path excludes blocked jobs before applying the page limit. Blocked jobs
+consume no attempts and cannot hide runnable lower-priority jobs. `stats().ready`
+still includes blocked/scheduled jobs; `stats().available` excludes them.
+`stopWhenIdle` means no runnable job at that observation, not that every job is
+finished. `dependencies(id)` returns a frozen snapshot of prerequisite identities
+and their current states, or null for a missing child. No parent payloads/results
+are transferred by that inspection API.
+
+## Publication, identity and recovery
+
+The job and its requirements are inserted in the same transaction, including with
+`enqueueWith` and `completeAndEnqueue`. A failure rolls back both. Existing child
+requests deduplicate only when their complete prerequisite sets also match;
+reordering the same set is allowed, adding/removing an edge is not. Completed,
+cancelled and dead children are not revived. Lost commit responses are reconciled
+with the same input identity rather than new IDs or repeated business callbacks.
+
+Every prerequisite must already exist when a new child is inserted. New edges
+therefore point backward through insertion order; existing jobs cannot acquire
+new requirements. This prevents cycles through the public API without traversing
+all existing jobs. A prerequisite may be a currently leased parent of the same
+`completeAndEnqueue` transaction. Cross-queue joins are supported only within the
+same database, not across independently imported snapshots or remote services.
+
+Inputs are copied and validated before asynchronous admission. A child accepts at
+most 128 distinct prerequisites; a continuation batch accepts at most 1,024 total
+prerequisites in addition to its existing 128-job/4-MiB payload limits. Identities
+are case-sensitive and the existing identifier limits apply. Canonical comparison
+is independent of SQLite UTF-8/UTF-16 sort order. Self-dependencies, missing parents
+and conflicting retries reject rather than partially installing the child.
+
+## Storage enforcement and compatibility
+
+The first updated queue open installs `main.__fsqlite_job_dependencies_v1` and
+three main-schema triggers together. The WITHOUT ROWID edge key serves per-child
+lookup; prerequisite lookup uses the job identity key. A BEFORE UPDATE trigger
+rejects a transition to leased while any prerequisite is incomplete. Thus an older
+client's unfiltered claim cannot bypass dependencies after installation, although
+that client may stop on a blocked highest-priority job instead of skipping it.
+Update/delete guards keep the recorded edge set immutable. Requirements are not
+reclaimed automatically; this feature is not a job/history retention policy.
+
+Repeated open verifies the exact installed schema unit. Partial or incompatible
+storage rejects; it is not silently repaired. Main qualification prevents TEMP or
+attached objects from replacing the gate or parent state. Trusted application SQL
+still owns the database; removing guards or forging parent completion is outside
+this API's trust boundary. No external anti-rollback or distributed authorization
+is implied. Failed parents leave visible blocked work; applications can inspect
+and explicitly cancel the child, rather than silently running it after failure.
+
+No new global writer lock, retry loop or background task is added. Independent
+owners retain their normal transaction conflict semantics. Prerequisite checks
+add indexed lookups per candidate; there is no claim of constant latency or bounded
+total database memory. The host still owns durable commit/checkpoint confirmation.
+
+## Executed verification
+
+```sh
+node --experimental-transform-types \
+  --experimental-loader=./packages/sdk/tests/helpers/production-source-loader.mjs \
+  --test packages/sdk/tests/durable-job-dependencies.test.mjs \
+  packages/sdk/tests/durable-job-callback-lifetime.test.mjs \
+  packages/sdk/tests/durable-job-continuations.test.mjs \
+  packages/sdk/tests/durable-job-worker-continuations.test.mjs
+```
+
+The combined run passes 114 tests: 41 new prerequisite tests and 73 unchanged
+callback/continuation/worker regressions, zero failures or skips. Production queue
+and worker modules execute without substituted job backends over Node 22.16.0 /
+reference SQLite 3.49.1 transaction ownership. Tests cover cross-queue joins,
+blocked priority, failed parents, exact deduplication, canonical Unicode identities,
+all three SQLite encodings, schema isolation, immutable requirements, lost replies,
+independent WAL claimants, and actual worker consumption.
+
+Eight new child processes are SIGKILLed at IPC-confirmed cuts before/after the
+first dependency insert and before/after COMMIT under WAL/DELETE journals. Reopened
+files recover all-or-none job/edge/application-effect publication. Watchdog kills
+fail the test. The eight existing continuation crash cases also rerun; they are
+not new prerequisite crash scenarios. Strict TypeScript checks cover both actual
+source modules. This does not qualify FrankenSQLite Rust/WASM/MVCC execution,
+FrankenDB ownership/worker packaging, browser persistence, or physical power loss.
