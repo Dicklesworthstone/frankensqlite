@@ -175,8 +175,10 @@ export class DurableJobQueue {
 
   /**
    * Transactional outbox: application SQL and the new job commit together.
-   * Duplicate ids never rerun work. Use only tx inside work, await all SQL,
-   * and do not perform external side effects or reenter this queue.
+   * Duplicate ids never rerun work. Admitted callback SQL settles before commit
+   * or rollback; a caught SQL failure still aborts. Saved handles expire when
+   * work exits. Use only tx, await SQL, and never reenter this queue or perform
+   * external side effects. This scope is not a SQL sandbox.
    */
   async enqueueWith<T>(
     input: EnqueueJob,
@@ -186,7 +188,7 @@ export class DurableJobQueue {
     if (typeof work !== "function") throw new TypeError("An application SQL callback is required");
     return this.#db.transaction(async (tx) => {
       const result = await this.#enqueueIn(tx, captured);
-      const value = result.inserted ? await work(tx) : undefined;
+      const value = result.inserted ? await runJobWork(tx, work) : undefined;
       return Object.freeze({ ...result, value });
     });
   }
@@ -315,6 +317,8 @@ export class DurableJobQueue {
    * effects and completion commit together, or all roll back. Compute outside
    * this callback; never do external I/O or call another queue method inside it.
    * The host's committed-but-unacknowledged errors propagate without replay.
+   * Drain every admitted callback statement before the final lease fence;
+   * SQL failures abort even if caught and escaped callback handles expire.
    */
   async completeWith<T>(
     lease: DurableJobLease,
@@ -335,7 +339,7 @@ export class DurableJobQueue {
           now,
         ]),
       );
-      const value = await work(tx);
+      const value = await runJobWork(tx, work);
       await this.#completeIn(tx, keys, result);
       return value;
     });
@@ -517,6 +521,43 @@ export class DurableJobQueue {
       expiresAt: number(row, "lease_expires_at"),
     });
   }
+}
+
+/** Keep business SQL inside publication, the completion fence and rollback. */
+async function runJobWork<T>(
+  tx: DurableJobTransaction,
+  work: (tx: DurableJobTransaction) => Promise<T>,
+): Promise<T> {
+  let accepting = true, failed = false;
+  let firstFailure: unknown;
+  const pending = new Set<Promise<unknown>>();
+  const submit = <U>(operation: () => Promise<U>): Promise<U> => {
+    if (!accepting) return Promise.reject(new DurableJobError(
+      "ERR_FSQLITE_JOB_SCOPE_ENDED", "The job callback SQL scope has ended",
+    ));
+    // Convert synchronous adapter throws to observed statement failures too.
+    const task = (async () => operation())();
+    pending.add(task);
+    void task.then(() => pending.delete(task), cause => {
+      pending.delete(task);
+      if (!failed) { failed = true; firstFailure = cause; }
+    });
+    return task;
+  };
+  const scoped = Object.freeze({
+    execute: (sql, params) => submit(() => tx.execute(sql, params)),
+    query: (sql, params) => submit(() => tx.query(sql, params)),
+  } satisfies DurableJobTransaction);
+  let value: T;
+  try { value = await work(scoped); }
+  finally {
+    accepting = false;
+    // A thrown callback (including cancellation) takes precedence, but cannot
+    // leave started SQL racing the owner's rollback. Admission is now closed.
+    await Promise.allSettled(pending);
+  }
+  if (failed) throw firstFailure;
+  return value;
 }
 
 function fence(): string {
