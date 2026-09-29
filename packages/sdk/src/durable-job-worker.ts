@@ -5,7 +5,7 @@ import { DurableJobError, captureJobContinuations, runJobWork } from "./durable-
 export type DurableWorkerQueue = Pick<
   DurableJobQueue,
   "claim" | "renew" | "complete" | "completeWith" | "fail" | "reapExpired"
-> & Partial<Pick<DurableJobQueue, "completeAndEnqueue">>;
+> & Partial<Pick<DurableJobQueue, "completeAndEnqueue" | "cancelBlocked">>;
 
 export interface DurableJobContext {
   /** Observe cancellation and await all child work before returning. */
@@ -50,6 +50,8 @@ export interface DurableJobWorkerOptions {
   reapIntervalMs?: number;
   /** Maximum expired claims recovered per sweep, 1..1000; defaults to 100. */
   reapLimit?: number;
+  /** Opt in to bounded cancellation of impossible descendants after recovery/idle. */
+  cancelBlockedJobs?: boolean;
   /** Finish when every slot observes no runnable job; defaults to false. */
   stopWhenIdle?: boolean;
   /** Wall clock shared with the queue; defaults to Date.now. Must agree across workers. */
@@ -79,6 +81,8 @@ export interface DurableJobWorkerStats {
   readonly lostLeases: number;
   readonly renewals: number;
   readonly reapedLeases: number;
+  /** Acknowledged ready-to-cancelled transitions caused by failed prerequisites. */
+  readonly blockedCancellations: number;
 }
 
 export type DurableJobWorkerPhase =
@@ -87,6 +91,7 @@ export type DurableJobWorkerPhase =
   | "complete"
   | "fail"
   | "reap"
+  | "cancel-blocked"
   | "lease"
   | "handler"
   | "run";
@@ -141,6 +146,7 @@ export class DurableJobWorker {
   #lostLeases = 0;
   #renewals = 0;
   #reapedLeases = 0;
+  #blockedCancellations = 0;
   readonly done: Promise<void>;
 
   private constructor(
@@ -179,6 +185,8 @@ export class DurableJobWorker {
     ) {
       throw new TypeError("A durable job queue is required");
     }
+    if (policy.cancelBlockedJobs && typeof queue.cancelBlocked !== "function")
+      throw new TypeError("cancelBlockedJobs requires a queue with cancelBlocked support");
     return new DurableJobWorker(queue, handler, policy, signal);
   }
 
@@ -196,6 +204,7 @@ export class DurableJobWorker {
       lostLeases: this.#lostLeases,
       renewals: this.#renewals,
       reapedLeases: this.#reapedLeases,
+      blockedCancellations: this.#blockedCancellations,
     });
   }
 
@@ -234,6 +243,7 @@ export class DurableJobWorker {
       if (this.#state === "running") {
         try {
           this.#reapedLeases += await this.#queue.reapExpired(this.#policy.reapLimit);
+          await this.#cancelBlocked();
         } catch (cause: unknown) {
           this.#halt("reap", cause);
         }
@@ -257,12 +267,31 @@ export class DurableJobWorker {
     if (this.#failure !== null) throw this.#failure;
   }
 
+  /** Use the existing supervisor; never enqueue cleanup after stop or failure. */
+  async #cancelBlocked(): Promise<number> {
+    if (!this.#policy.cancelBlockedJobs || this.#state !== "running") return 0;
+    try {
+      const count = await this.#queue.cancelBlocked!(this.#policy.reapLimit);
+      if (!Number.isSafeInteger(count) || count < 0 || count > this.#policy.reapLimit ||
+          !Number.isSafeInteger(this.#blockedCancellations + count))
+        throw new TypeError("Invalid blocked cancellation acknowledgement");
+      this.#blockedCancellations += count;
+      return count;
+    } catch (cause: unknown) {
+      // A lost reply can follow a committed sweep. Stop every admission path
+      // rather than guessing rollback, counting success, or retrying cleanup.
+      this.#halt("cancel-blocked", cause);
+      return 0;
+    }
+  }
+
   async #reaper(): Promise<void> {
     while (this.#state === "running") {
       await this.#wait(this.#policy.reapIntervalMs);
       if (this.#state !== "running") return;
       try {
         this.#reapedLeases += await this.#queue.reapExpired(this.#policy.reapLimit);
+        await this.#cancelBlocked();
       } catch (cause: unknown) {
         this.#halt("reap", cause);
         return;
@@ -283,7 +312,15 @@ export class DurableJobWorker {
       } finally {
         this.#pendingClaims--;
       }
-      if (lease === null && this.#policy.stopWhenIdle) return;
+      if (lease === null) {
+        if (await this.#cancelBlocked() > 0) {
+          // A full bounded sweep may leave another wave. Yield before checking
+          // again, including stopWhenIdle, without claiming impossible jobs.
+          await this.#wait(0);
+          continue;
+        }
+        if (this.#policy.stopWhenIdle) return;
+      }
       if (lease !== null) {
         this.#claimed++;
         if (this.#failure !== null) return;
@@ -539,11 +576,13 @@ function capturePolicy(
     retryDelayMs = 1000,
     reapIntervalMs = 30_000,
     reapLimit = 100,
+    cancelBlockedJobs = false,
     clock = Date.now,
     stopWhenIdle = false,
     signal,
   } = options;
   if (typeof stopWhenIdle !== "boolean") throw new TypeError("stopWhenIdle must be a boolean");
+  if (typeof cancelBlockedJobs !== "boolean") throw new TypeError("cancelBlockedJobs must be a boolean");
   if (typeof clock !== "function") throw new TypeError("clock must be a function");
   if (
     typeof owner !== "string" ||
@@ -576,6 +615,7 @@ function capturePolicy(
     retryDelayMs,
     reapIntervalMs,
     reapLimit,
+    cancelBlockedJobs,
     clock,
     stopWhenIdle,
     signal,

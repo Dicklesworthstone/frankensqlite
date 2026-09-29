@@ -77,3 +77,56 @@ sources, without dependency declarations or job-backend substitutes.
 
 These are SDK-component/reference-SQL tests, not full FrankenDB packaging,
 FrankenSQLite Rust/WASM/MVCC, browser persistence, or physical power-loss proof.
+
+## Supervised failure propagation
+
+The existing `DurableJobWorker` can opt in with `cancelBlockedJobs: true`:
+
+```ts
+const worker = DurableJobWorker.start(queue, handleJob, {
+  owner: 'workflow-worker',
+  cancelBlockedJobs: true,
+  reapLimit: 100,
+  stopWhenIdle: true,
+});
+await worker.done;
+console.log(worker.stats.blockedCancellations);
+```
+
+The default is false, preserving existing behavior. Opt-in requires the supplied
+queue adapter to implement `cancelBlocked`; unsupported adapters reject at start,
+not after silently losing cleanup. The policy is copied once before asynchronous
+startup and is not controlled by job payloads or handler results.
+
+Sweeps share the existing supervisor: after initial and periodic expiry recovery,
+and after an empty claim. `reapLimit` bounds each sweep. If an idle sweep makes
+progress, the worker yields and checks again, so `stopWhenIdle` can finish chains
+longer than one batch without claiming their cancelled nodes. Healthy branches
+continue through the ordinary handler/continuation path. Retryable parents do
+not cancel descendants. Periodic recovery can cancel impossible branches while
+unrelated handlers are running. Each queue still needs its own supervisor/policy.
+
+`blockedCancellations` counts acknowledged transitions by this worker, separately
+from handler failures and cooperative handler cancellations. Invalid counts or
+throwing/uncertain cleanup stop the worker with phase `cancel-blocked`. No cleanup
+retry, additional claim, or inferred success is admitted after that failure.
+Active handlers are signalled and joined before `done` rejects. A fresh owner must
+reconcile committed state and storage before restart; lost acknowledgements can
+leave cancelled jobs even when the failed worker counted zero.
+
+Graceful or aborting stop joins a sweep already admitted to the transaction
+owner. Such a sweep may commit all of its bounded cancellations; cancellation
+is not proof of rollback. Stop prevents new sweep admission. No extra daemon,
+interval, global writer lock, or statement queue is added by this integration.
+
+The combined targeted run passes 143 tests: 44 new queue cases, 26 new production
+worker cases, and 73 existing callback/continuation/worker regressions. Three
+selected worker cases fail against the queue-only increment without supervisor
+integration. Tests exercise consumed healthy/failing branches, startup and
+periodic recovery, reverse chains beyond a batch, default/legacy behavior, input
+ownership, shutdown joins, malformed acknowledgement counts, lost commit replies
+with file reopen, and sibling cancellation. The combined run includes the eight
+new queue SIGKILL cuts and eight existing continuation cuts rerun unchanged.
+The 26 worker cases add no further process-kill scenarios. Strict TypeScript
+checking uses the actual queue and worker source, without declaration substitutes.
+These remain reference-SQL SDK-component results, not native engine certification.
