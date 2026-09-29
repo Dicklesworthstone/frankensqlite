@@ -245,6 +245,106 @@ export class DurableJobQueue {
   }
 
   /**
+   * Read ALL completed prerequisite results in one lease-checked SQL snapshot.
+   * maxBytes counts database-encoded result bytes (not payloads, JS heap or RSS).
+   * Admission checks every result size before loading any result body. Returned
+   * byteLength uses that same encoding; null and empty text remain distinct.
+   * This read does not renew a lease or authorize later external side effects.
+   */
+  async dependencyResults(
+    lease: DurableJobLease,
+    options: { readonly maxBytes?: number; readonly signal?: AbortSignal; readonly timeoutMs?: number } = {},
+  ): Promise<readonly {
+    readonly queue: string; readonly id: string; readonly result: string | null; readonly byteLength: number;
+  }[]> {
+    const keys = this.#keys(lease);
+    const { maxBytes = 4 * MAX_TEXT_BYTES, signal, timeoutMs } = options;
+    integer(maxBytes, "maxBytes", 0, 64 * MAX_TEXT_BYTES);
+    if (timeoutMs !== undefined) integer(timeoutMs, "timeoutMs", 1, 2_147_483_647);
+    if (signal !== undefined)
+      Object.getOwnPropertyDescriptor(AbortSignal.prototype, "aborted")!.get!.call(signal);
+    const deadline = timeoutMs === undefined ? undefined : performance.now() + timeoutMs;
+    const checkpoint = () => {
+      signal?.throwIfAborted();
+      if (deadline !== undefined && performance.now() >= deadline)
+        throw new DurableJobError("ERR_FSQLITE_JOB_TIMEOUT", "Prerequisite result deadline expired");
+    };
+    checkpoint();
+    return this.#db.transaction(async owner => {
+      const tx: DurableJobTransaction = {
+        execute: async () => { throw corrupt("Result reading cannot execute writes"); },
+        query: async (sql, params) => {
+          checkpoint();
+          const rows = await owner.query(sql, params);
+          checkpoint();
+          if (!Array.isArray(rows.rows)) throw corrupt("Invalid prerequisite query result");
+          return rows;
+        },
+      };
+      const live = async () => {
+        const rows = (await tx.query(`SELECT 1 AS live FROM ${TABLE} WHERE ${fence()} LIMIT 2`,
+          [...keys, this.#now()])).rows;
+        this.#changed(rows.length);
+      };
+      await live();
+      await ensureDependencies(tx, false);
+      const refs = await readDependencies(tx, this.name, keys[1]! as string);
+      const metadata: { type: "text" | "null"; bytes: number }[] = [];
+      let total = 0;
+      // One bounded metadata row per parent. No parent/child payload, result,
+      // error or other variable-size field is selected during admission.
+      for (const ref of refs) {
+        const rows = (await tx.query(`SELECT CASE WHEN state='completed' THEN 1 ELSE 0 END AS completed,
+          typeof(result) AS result_type, CASE WHEN result IS NULL THEN 0 ELSE length(CAST(result AS BLOB)) END AS result_bytes
+          FROM ${TABLE} WHERE queue_name=? AND job_id=? LIMIT 2`, [ref.queue, ref.id])).rows;
+        if (rows.length !== 1 || number(rows[0]!, "completed") !== 1)
+          throw new DurableJobError("ERR_FSQLITE_JOB_DEPENDENCY_INCOMPLETE", "Every prerequisite result requires a completed parent");
+        const row = rows[0]!, type = row.result_type, bytes = number(row, "result_bytes");
+        // A valid 1-MiB UTF-8 result may occupy 2 MiB in a UTF-16 database.
+        if ((type !== "text" && type !== "null") || bytes < 0 || bytes > 2 * MAX_TEXT_BYTES ||
+            (type === "null" && bytes !== 0)) throw corrupt("Invalid prerequisite result shape");
+        if (bytes > maxBytes - total)
+          throw new DurableJobError("ERR_FSQLITE_JOB_RESULT_LIMIT", "Complete prerequisite results exceed maxBytes; no bodies were loaded");
+        total += bytes;
+        metadata.push({ type, bytes });
+      }
+      const encodingRows = (await tx.query("PRAGMA main.encoding")).rows;
+      const encoding = encodingRows[0]?.encoding;
+      if (encodingRows.length !== 1 || (encoding !== "UTF-8" && encoding !== "UTF-16le" && encoding !== "UTF-16be"))
+        throw corrupt("Unsupported prerequisite result encoding");
+      const decoder = new TextDecoder(encoding, { fatal: true, ignoreBOM: true });
+      const result: { readonly queue: string; readonly id: string; readonly result: string | null; readonly byteLength: number }[] = [];
+      for (let i = 0; i < refs.length; i++) {
+        const ref = refs[i]!, meta = metadata[i]!;
+        // Guard the body projection too. A trusted same-owner callback that
+        // changes a result between statements must not bypass its admitted size.
+        const rows = (await tx.query(`SELECT CAST(result AS BLOB) AS result_data FROM ${TABLE}
+          WHERE queue_name=? AND job_id=? AND state='completed' AND typeof(result)=?
+            AND CASE WHEN result IS NULL THEN 0 ELSE length(CAST(result AS BLOB)) END=? LIMIT 2`,
+          [ref.queue, ref.id, meta.type, meta.bytes])).rows;
+        if (rows.length !== 1) throw corrupt("Prerequisite result changed during reading");
+        const data = rows[0]!.result_data;
+        let value: string | null = null;
+        if (meta.type === "null") {
+          if (data !== null) throw corrupt("NULL prerequisite result changed");
+        } else {
+          if (!(data instanceof Uint8Array) || data.byteLength !== meta.bytes)
+            throw corrupt("Invalid prerequisite result bytes");
+          try { value = decoder.decode(data); }
+          catch { throw corrupt("Malformed prerequisite result encoding"); }
+          if (new TextEncoder().encode(value).byteLength > MAX_TEXT_BYTES)
+            throw corrupt("Stored prerequisite result exceeds its UTF-8 limit");
+        }
+        result.push(Object.freeze({ ...ref, result: value, byteLength: meta.bytes }));
+      }
+      await ensureDependencies(tx, false);
+      await live();
+      checkpoint();
+      return Object.freeze(result);
+    });
+  }
+
+  /**
    * Atomically claim ready work or reclaim an expired lease. Priority descends;
    * ties use availability, creation time and id. No user work runs in this txn.
    * Database contention propagates; there is no blind callback replay.
@@ -862,7 +962,10 @@ function dependenciesFailed(alias: "candidate"): string {
 }
 
 async function readDependencies(tx: DurableJobTransaction, queue: string, id: string): Promise<readonly Dependency[]> {
-  const rows = (await tx.query(`SELECT parent_queue,parent_id FROM ${DEPENDENCIES}
+  // Bound database-encoded identity bytes before the SQL adapter decodes text.
+  // 256 UTF-16 code units fit in 1024 UTF-8 bytes and 512 UTF-16 bytes.
+  const stored = (column: string) => `CASE WHEN typeof(${column})='text' AND length(CAST(${column} AS BLOB))<=1024 AND instr(${column},char(0))=0 THEN ${column} END AS ${column}`;
+  const rows = (await tx.query(`SELECT ${stored("parent_queue")},${stored("parent_id")} FROM ${DEPENDENCIES}
     WHERE queue_name=? AND job_id=? LIMIT ${MAX_DEPENDENCIES + 1}`, [queue, id])).rows;
   // Canonical JS ordering is independent of the database's UTF-8/UTF-16 order.
   return captureDependencies(rows.map(row => ({ queue: string(row, "parent_queue"), id: string(row, "parent_id") })));
