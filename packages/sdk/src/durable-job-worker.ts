@@ -5,9 +5,11 @@ import { DurableJobError, captureJobContinuations, runJobWork } from "./durable-
 export type DurableWorkerQueue = Pick<
   DurableJobQueue,
   "claim" | "renew" | "complete" | "completeWith" | "fail" | "reapExpired"
-> & Partial<Pick<DurableJobQueue, "completeAndEnqueue" | "cancelBlocked">>;
+> & Partial<Pick<DurableJobQueue, "completeAndEnqueue" | "cancelBlocked" | "dependencyResults">>;
 
 export interface DurableJobContext {
+  /** Verified parent outputs when loadDependencyResults is enabled; otherwise undefined. */
+  readonly dependencyResults?: Awaited<ReturnType<DurableJobQueue["dependencyResults"]>> | undefined;
   /** Observe cancellation and await all child work before returning. */
   readonly signal: AbortSignal;
   /** Poll expiry even when CPU work or immediate promises starve timers. */
@@ -52,6 +54,10 @@ export interface DurableJobWorkerOptions {
   reapLimit?: number;
   /** Opt in to bounded cancellation of impossible descendants after recovery/idle. */
   cancelBlockedJobs?: boolean;
+  /** Read completed parent outputs before handler admission; default false. */
+  loadDependencyResults?: boolean;
+  /** Per-job database-encoded result bytes, 0..64 MiB; default 4 MiB. */
+  maxDependencyResultBytes?: number;
   /** Finish when every slot observes no runnable job; defaults to false. */
   stopWhenIdle?: boolean;
   /** Wall clock shared with the queue; defaults to Date.now. Must agree across workers. */
@@ -92,6 +98,7 @@ export type DurableJobWorkerPhase =
   | "fail"
   | "reap"
   | "cancel-blocked"
+  | "dependency-results"
   | "lease"
   | "handler"
   | "run";
@@ -187,6 +194,8 @@ export class DurableJobWorker {
     }
     if (policy.cancelBlockedJobs && typeof queue.cancelBlocked !== "function")
       throw new TypeError("cancelBlockedJobs requires a queue with cancelBlocked support");
+    if (policy.loadDependencyResults && typeof queue.dependencyResults !== "function")
+      throw new TypeError("loadDependencyResults requires a queue with dependencyResults support");
     return new DurableJobWorker(queue, handler, policy, signal);
   }
 
@@ -437,6 +446,27 @@ export class DurableJobWorker {
     }
   }
 
+  async #readInputs(job: ActiveJob): Promise<Awaited<ReturnType<DurableJobQueue["dependencyResults"]>> | undefined> {
+    if (!this.#checkLease(job) || job.cancel.signal.aborted) return undefined;
+    try {
+      // Read admission consumes the original claim budget. No heartbeat is
+      // started until this read settles, and no new full lease is invented.
+      const values = await this.#queue.dependencyResults!(job.lease, {
+        maxBytes: this.#policy.maxDependencyResultBytes,
+        signal: job.cancel.signal,
+        timeoutMs: Math.max(1, Math.floor(this.#remaining(job))),
+      });
+      return captureResults(values, this.#policy.maxDependencyResultBytes);
+    } catch (cause: unknown) {
+      if (leaseLost(cause)) this.#lose(job, cause);
+      else if (!(job.cancel.signal.aborted && cause === job.cancel.signal.reason))
+        this.#halt("dependency-results", cause);
+      // An acknowledged cancellation drains through normal lease-aware cleanup.
+      // Other input/storage failures halt; never burn a handler retry for them.
+      return undefined;
+    }
+  }
+
   async #handle(lease: DurableJobLease, claimStarted: number): Promise<void> {
     const job: ActiveJob = {
       cancel: new AbortController(),
@@ -450,7 +480,9 @@ export class DurableJobWorker {
     this.#active.add(job);
     if (this.#state === "aborting") job.cancel.abort(this.#abortReason);
     this.#adoptLease(job, lease, claimStarted);
+    let inputs: Awaited<ReturnType<DurableJobQueue["dependencyResults"]>> | undefined;
     const context: DurableJobContext = Object.freeze({
+      get dependencyResults() { return inputs; },
       signal: job.cancel.signal,
       checkpoint: () => {
         if (job.closed)
@@ -462,7 +494,7 @@ export class DurableJobWorker {
         job.cancel.signal.throwIfAborted();
       },
     });
-    const heartbeat = this.#heartbeat(job, lease);
+    let heartbeat: Promise<void> = Promise.resolve();
     let result: string | null = null;
     let apply: DurableJobCompletion["apply"] | undefined;
     let next: DurableJobCompletion["next"];
@@ -470,6 +502,9 @@ export class DurableJobWorker {
     let failed = false;
     let failure: unknown;
     try {
+      if (this.#policy.loadDependencyResults) inputs = await this.#readInputs(job);
+      if (!this.#checkLease(job)) return;
+      heartbeat = this.#heartbeat(job, lease);
       try {
         if (!job.cancel.signal.aborted) {
           this.#started++;
@@ -560,6 +595,49 @@ export class DurableJobWorker {
   }
 }
 
+/** Own adapter replies before invoking user code; do not expose mutable inputs. */
+function captureResults(value: unknown, maximum: number): Awaited<ReturnType<DurableJobQueue["dependencyResults"]>> {
+  const field = (object: unknown, key: string): unknown => {
+    if (typeof object !== "object" || object === null) throw new TypeError("Invalid prerequisite result record");
+    const descriptor = Object.getOwnPropertyDescriptor(object, key);
+    if (!descriptor || !Object.hasOwn(descriptor, "value"))
+      throw new TypeError("Prerequisite result fields require own data properties");
+    return descriptor.value;
+  };
+  const identity = (value: unknown): string => {
+    if (typeof value !== "string" || !value.length || value.length > 256 || value.includes("\0") ||
+        new TextDecoder("utf-8", { ignoreBOM: true }).decode(new TextEncoder().encode(value)) !== value)
+      throw new TypeError("Invalid prerequisite result identity");
+    return value;
+  };
+  if (!Array.isArray(value) || value.length > 128) throw new TypeError("Invalid prerequisite result array");
+  const results: { queue: string; id: string; result: string | null; byteLength: number }[] = [];
+  const seen = new Set<string>();
+  let total = 0, possibleEncodings = 3;
+  for (let i = 0, length = value.length; i < length; i++) {
+    const row = field(value, String(i)), queue = identity(field(row, "queue")), id = identity(field(row, "id"));
+    const result = field(row, "result"), byteLength = field(row, "byteLength");
+    if (typeof byteLength !== "number" || !Number.isSafeInteger(byteLength) || byteLength < 0 ||
+        byteLength > 2 * 1024 * 1024 || byteLength > maximum - total ||
+        (result !== null && typeof result !== "string")) throw new TypeError("Invalid prerequisite result budget");
+    if (result === null) {
+      if (byteLength !== 0) throw new TypeError("NULL result cannot contain bytes");
+    } else {
+      if (result.length > 1024 * 1024) throw new TypeError("Prerequisite result exceeds its text limit");
+      const bytes = new TextEncoder().encode(result);
+      if (bytes.length > 1024 * 1024 || new TextDecoder("utf-8", { ignoreBOM: true }).decode(bytes) !== result)
+        throw new TypeError("Invalid prerequisite result text");
+      possibleEncodings &= (byteLength === bytes.length ? 1 : 0) | (byteLength === result.length * 2 ? 2 : 0);
+      if (!possibleEncodings) throw new TypeError("Inconsistent prerequisite result encoding lengths");
+    }
+    const key = JSON.stringify([queue, id]);
+    if (seen.has(key)) throw new TypeError("Duplicate prerequisite result identity");
+    seen.add(key); total += byteLength;
+    results.push(Object.freeze({ queue, id, result, byteLength }));
+  }
+  return Object.freeze(results);
+}
+
 function leaseLost(cause: unknown): boolean {
   return cause instanceof DurableJobError && cause.code === "ERR_FSQLITE_JOB_LEASE_LOST";
 }
@@ -577,12 +655,15 @@ function capturePolicy(
     reapIntervalMs = 30_000,
     reapLimit = 100,
     cancelBlockedJobs = false,
+    loadDependencyResults = false,
+    maxDependencyResultBytes = 4 * 1024 * 1024,
     clock = Date.now,
     stopWhenIdle = false,
     signal,
   } = options;
   if (typeof stopWhenIdle !== "boolean") throw new TypeError("stopWhenIdle must be a boolean");
   if (typeof cancelBlockedJobs !== "boolean") throw new TypeError("cancelBlockedJobs must be a boolean");
+  if (typeof loadDependencyResults !== "boolean") throw new TypeError("loadDependencyResults must be a boolean");
   if (typeof clock !== "function") throw new TypeError("clock must be a function");
   if (
     typeof owner !== "string" ||
@@ -600,6 +681,7 @@ function capturePolicy(
     ["retryDelayMs", retryDelayMs, 0, 2_147_483_647],
     ["reapIntervalMs", reapIntervalMs, 1, 2_147_483_647],
     ["reapLimit", reapLimit, 1, 1000],
+    ["maxDependencyResultBytes", maxDependencyResultBytes, 0, 64 * 1024 * 1024],
   ] as const) {
     if (!Number.isSafeInteger(value) || value < min || value > max)
       throw new RangeError(`${key} must be an integer in ${min}..${max}`);
@@ -616,6 +698,8 @@ function capturePolicy(
     reapIntervalMs,
     reapLimit,
     cancelBlockedJobs,
+    loadDependencyResults,
+    maxDependencyResultBytes,
     clock,
     stopWhenIdle,
     signal,

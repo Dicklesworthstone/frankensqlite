@@ -294,9 +294,14 @@ export class DurableJobQueue {
       // One bounded metadata row per parent. No parent/child payload, result,
       // error or other variable-size field is selected during admission.
       for (const ref of refs) {
-        const rows = (await tx.query(`SELECT CASE WHEN state='completed' THEN 1 ELSE 0 END AS completed,
-          typeof(result) AS result_type, CASE WHEN result IS NULL THEN 0 ELSE length(CAST(result AS BLOB)) END AS result_bytes
-          FROM ${TABLE} WHERE queue_name=? AND job_id=? LIMIT 2`, [ref.queue, ref.id])).rows;
+        // Join the actual stored edge, not just its adapter-decoded identity.
+        // Lossy decoding of corrupt key bytes must not select another parent.
+        const rows = (await tx.query(`SELECT CASE WHEN parent.state='completed' THEN 1 ELSE 0 END AS completed,
+          typeof(parent.result) AS result_type, CASE WHEN parent.result IS NULL THEN 0 ELSE length(CAST(parent.result AS BLOB)) END AS result_bytes
+          FROM ${TABLE} AS parent JOIN ${DEPENDENCIES} AS edge
+            ON edge.parent_queue=parent.queue_name COLLATE BINARY AND edge.parent_id=parent.job_id COLLATE BINARY
+          WHERE edge.queue_name=? AND edge.job_id=? AND parent.queue_name=? AND parent.job_id=? LIMIT 2`,
+          [this.name, keys[1]! as string, ref.queue, ref.id])).rows;
         if (rows.length !== 1 || number(rows[0]!, "completed") !== 1)
           throw new DurableJobError("ERR_FSQLITE_JOB_DEPENDENCY_INCOMPLETE", "Every prerequisite result requires a completed parent");
         const row = rows[0]!, type = row.result_type, bytes = number(row, "result_bytes");

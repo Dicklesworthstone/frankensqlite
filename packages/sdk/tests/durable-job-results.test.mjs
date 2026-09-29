@@ -211,3 +211,13 @@ for (const journal of ['WAL','DELETE']) test(`${journal}: a fresh file owner rec
   assert.deepEqual((await q.dependencyResults(lease)).map(r=>r.result),['durable output']);
   assert.equal((await q.get('parent')).attempts,1);
 });
+
+for (const encoding of ['UTF-8','UTF-16le','UTF-16be']) test(`${encoding}: corrupted edge bytes cannot select a replacement-character parent`,async t=>{
+  const db=new JobSqliteTarget(':memory:',`PRAGMA encoding='${encoding}';`);t.after(()=>db.close());
+  const q=await DurableJobQueue.open(db,'q');
+  await q.enqueue({id:'\ufffd',payload:'p'});await q.complete(await q.claim('producer'),'wrong parent');
+  await q.enqueue({id:'join',payload:'j'});const lease=await q.claim('reader');
+  const bytes=encoding==='UTF-8'?"X'ff'":encoding==='UTF-16le'?"X'00d8'":"X'd800'";
+  db.db.exec(`INSERT INTO ${dependencyTable} VALUES('q','join','q',CAST(${bytes} AS TEXT))`);
+  db.statements.length=0;await assert.rejects(q.dependencyResults(lease));assert(!db.statements.some(bodyRead));
+});

@@ -76,7 +76,7 @@ node --experimental-transform-types \
   --test packages/sdk/tests/durable-job-results.test.mjs
 ```
 
-41 tests pass on Node 22.16.0 / reference SQLite 3.49.1 with no skips. They execute
+The first increment passed 41 tests on Node 22.16.0 / reference SQLite 3.49.1 with no skips. They execute
 the actual current queue module and the existing SQL ownership adapter, not a
 replacement job backend. Cases include all three encodings, NUL/BOM/NULL/empty
 results, exact byte boundaries, 128 parents, corruption, stale/reclaimed leases,
@@ -86,3 +86,85 @@ following a lost parent-completion acknowledgement. The tests perform no new
 process-kill or power-loss experiments. Strict TypeScript 5.8.3 checking passes
 on the actual queue source. These are SDK-component/reference-SQL results, not
 full SDK/worker packaging, FrankenSQLite Rust/WASM/MVCC, or browser certification.
+
+## Worker-managed data flow
+
+Enable `loadDependencyResults: true` on the existing `DurableJobWorker` to load
+inputs before a handler is admitted. Results are exposed through the frozen
+`context.dependencyResults` array; roots receive `[]`. With the default false,
+that property is undefined and no input reads occur. Existing adapters remain
+compatible; opt-in requires a `dependencyResults` implementation at startup.
+
+```ts
+const worker = DurableJobWorker.start(jobs, async (lease, context) => {
+  const inputs = context.dependencyResults!;
+  const combined = inputs.map(input => ({ id: input.id, result: input.result }));
+  return {
+    result: JSON.stringify(combined),
+    apply: async tx => {
+      await tx.execute(
+        'INSERT INTO workflow_outputs(job_id, output) VALUES(?, ?)',
+        [lease.id, JSON.stringify(combined)],
+      );
+    },
+  };
+}, {
+  owner: 'dataflow-worker',
+  loadDependencyResults: true,
+  maxDependencyResultBytes: 4 * 1024 * 1024,
+  stopWhenIdle: true,
+});
+await worker.done;
+```
+
+`maxDependencyResultBytes` is a captured per-job stored-encoding quota, 0..64 MiB,
+defaulting to 4 MiB. Inputs consume the ORIGINAL claim's monotonic lease budget.
+The same job does not start a heartbeat transaction while its result read is
+active. After reading, the worker checks lease/cancellation before starting the
+handler and its heartbeat; a slow read cannot create a fresh full lease duration.
+Choose a lease duration that accommodates admission. Across concurrent handlers,
+per-job budgets add up; this is not a global process-memory governor.
+
+Input/storage errors, malformed adapter replies and over-limit joins stop the
+supervisor with phase `dependency-results`, before invoking the handler. It does
+not call handler-failure scheduling or completion for an uncertain input read.
+The already-committed claim may remain leased until explicit reconciliation or
+normal expiry recovery. Sibling handlers are signalled and joined. Known lease
+loss uses the existing lease-loss path. A cancellation acknowledged by the read
+joins SQL cleanup and follows normal lease-aware cancelled-job handling.
+
+Graceful stop drains an admitted input read and job. Abort waits for the read to
+settle, then prevents handler admission; it cannot interrupt arbitrary SQL owners
+or force their promises to settle. No detached read, new scheduler, writer lock,
+or implicit callback replay is introduced. Inputs are copied and validated before
+user code receives them, including identity uniqueness, text limits, own data
+fields, and consistent byte counts. The existing completion fence remains the
+authority for publishing output and any next workflow graph.
+
+The SQL metadata read joins the ORIGINAL stored dependency edge to its parent.
+This prevents a corrupt encoded edge identity that the SQL adapter would decode
+lossily from selecting a different, valid replacement-character job. It does not
+provide authentication against a trusted SQL writer forging the entire graph.
+
+### Combined verification
+
+Run the reader command above together with
+`packages/sdk/tests/durable-job-worker-results.test.mjs`,
+`packages/sdk/tests/durable-job-callback-lifetime.test.mjs`,
+`packages/sdk/tests/durable-job-continuations.test.mjs`, and
+`packages/sdk/tests/durable-job-worker-continuations.test.mjs`.
+
+150 tests pass: 44 result-reader tests (including three encoded-edge regressions),
+33 new worker-input tests, and 73 unchanged callback/continuation/worker tests.
+The production queue and worker execute over reference SQLite transaction owners;
+adapter-reply fault injection explicitly tests the worker's input boundary.
+Cases include actual output-dependent fan-out/fan-in continuations in all three
+encodings, root/default/legacy behavior, immutable inputs, malformed results,
+shutdown joins, read/heartbeat separation, lease expiry, sibling cancellation and
+fresh file owners consuming retained output without rerunning completed parents.
+
+The unchanged continuation suite reruns its eight IPC-confirmed SIGKILL/reopen
+cuts under WAL/DELETE; this feature adds no new process-kill scenarios. Strict
+TypeScript 5.8.3 checks both actual source modules. These remain SDK-component
+results using Node 22.16.0 / SQLite 3.49.1, not native FrankenSQLite Rust/WASM/MVCC,
+full FrankenDB/worker packaging, browser persistence or physical power-loss proof.
