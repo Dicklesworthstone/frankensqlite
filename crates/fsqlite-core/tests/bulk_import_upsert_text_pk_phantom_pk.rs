@@ -2597,13 +2597,15 @@ fn gh399_checkpoint_peer_reader_case(read_only: bool) {
             .compat_reader_acquire_wal_read_lock(&cx, 1, reader_mark)
             .expect("pin WAL_READ_LOCK(1) at the v2a commit boundary");
 
-        // PASSIVE resumes at W, backfills through M, stops there, and is busy.
+        // PASSIVE resumes at W, backfills through M and stops there. Like stock
+        // SQLite it reports busy = 0: sqlite3WalCheckpoint only turns an
+        // incomplete backfill into SQLITE_BUSY for non-PASSIVE modes.
         let passive = gh399_checkpoint(&conn, "PASSIVE").await;
         assert_eq!(
             passive,
-            [1, total_frames, reader_horizon],
+            [0, total_frames, reader_horizon],
             "PASSIVE must resume from the watermark and backfill exactly up to the pinned \
-             legacy reader horizon (busy)"
+             legacy reader horizon"
         );
 
         // TRUNCATE: same clamp (nothing new below M), and the generation must
@@ -2631,9 +2633,11 @@ fn gh399_checkpoint_peer_reader_case(read_only: bool) {
             .shm_lock(&cx, slot, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_SHARED)
             .expect("release WAL_READ_LOCK(1)");
         let truncate = gh399_checkpoint(&conn, "TRUNCATE").await;
+        // A completed TRUNCATE resets the WAL, so (like stock SQLite) it reports
+        // no remaining log frames: 0|0|0.
         assert_eq!(
             truncate,
-            [0, total_frames, total_frames],
+            [0, 0, 0],
             "with the legacy reader gone TRUNCATE completes"
         );
         assert_ne!(
@@ -2680,11 +2684,13 @@ fn gh399_checkpoint_peer_reader_case(read_only: bool) {
         // checkpointed, generation untouched. A short busy budget keeps the
         // excluded attempts prompt.
         conn.execute("PRAGMA busy_timeout=250").await.expect("busy_timeout");
+        // Nothing may be checkpointed past the peer's snapshot. As in stock
+        // SQLite, an incomplete PASSIVE reports busy = 0.
         let passive = gh399_checkpoint(&conn, "PASSIVE").await;
         assert_eq!(
             (passive[0], passive[2]),
-            (1, 0),
-            "PASSIVE is busy with nothing checkpointed while an fsqlite peer pins a snapshot: {passive:?}"
+            (0, 0),
+            "PASSIVE checkpoints nothing while an fsqlite peer pins a snapshot: {passive:?}"
         );
         let truncate = gh399_checkpoint(&conn, "TRUNCATE").await;
         assert_eq!(
@@ -2713,11 +2719,8 @@ fn gh399_checkpoint_peer_reader_case(read_only: bool) {
 
         conn.execute("PRAGMA busy_timeout=5000").await.expect("busy_timeout");
         let truncate = gh399_checkpoint(&conn, "TRUNCATE").await;
-        assert_eq!(
-            truncate,
-            [0, total_v3, total_v3],
-            "with the peer gone TRUNCATE completes"
-        );
+        // Completed: the WAL is reset, reported as 0|0|0 as in stock SQLite.
+        assert_eq!(truncate, [0, 0, 0], "with the peer gone TRUNCATE completes");
         assert_ne!(
             gh399_wal_generation(&wal_path),
             generation_v2,
@@ -2847,7 +2850,9 @@ fn gh399_tip_reader_slot_blocks_wal_reset_until_released() {
             .shm_lock(&cx, slot, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_SHARED)
             .expect("release WAL_READ_LOCK(1)");
         let row = gh399_checkpoint(&conn, "TRUNCATE").await;
-        assert_eq!(row, [0, tip, tip], "with the tip reader gone TRUNCATE completes");
+        // A completed TRUNCATE resets the WAL, so (like stock SQLite) it reports
+        // no remaining log frames: 0|0|0.
+        assert_eq!(row, [0, 0, 0], "with the tip reader gone TRUNCATE completes");
         assert_ne!(
             gh399_wal_generation(&wal_path),
             generation_v1,
