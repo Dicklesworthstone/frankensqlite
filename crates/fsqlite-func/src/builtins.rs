@@ -3796,7 +3796,10 @@ mod tests {
         assert_eq!(run(2.5), SqliteValue::Float(3.0));
         assert_eq!(run(-2.5), SqliteValue::Float(-3.0));
         assert_eq!(run(-0.3), SqliteValue::Float(0.0));
-        assert_eq!(run(4_503_599_627_370_495.5), SqliteValue::Float(4_503_599_627_370_496.0));
+        assert_eq!(
+            run(4_503_599_627_370_495.5),
+            SqliteValue::Float(4_503_599_627_370_496.0)
+        );
         let zero = RoundFunc
             .invoke(&[SqliteValue::Float(2.5), SqliteValue::Integer(0)])
             .unwrap();
