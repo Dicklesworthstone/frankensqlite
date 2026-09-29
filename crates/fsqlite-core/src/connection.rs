@@ -11248,6 +11248,21 @@ fn select_indexed_numeric_probe_spec_for_column(
 #[derive(Debug, Clone)]
 struct DbSnapshot {
     db_version: MemDbVersionToken,
+    sqlite_sequence_cache: HashMap<String, i64>,
+    temp_sqlite_sequence: HashMap<String, i64>,
+    schema_cookie: u32,
+    schema_generation: u64,
+    live_vtab_registry_undo_len: usize,
+    /// The schema metadata. `None` for a statement-level snapshot of a
+    /// statement that cannot change it (plain DML with `writable_schema` off):
+    /// copying every table, index, view and trigger per statement made each
+    /// statement in a transaction O(schema) (bd-ry6x7).
+    schema_state: Option<SchemaSnapshot>,
+}
+
+/// The schema-metadata half of a [`DbSnapshot`].
+#[derive(Debug, Clone)]
+struct SchemaSnapshot {
     schema: Vec<TableSchema>,
     temp_table_names: HashSet<String>,
     // TEMP has no pager header: retain its transactional default here.
@@ -11258,13 +11273,8 @@ struct DbSnapshot {
     triggers: Vec<TriggerDef>,
     rowid_alias_columns: HashMap<String, usize>,
     autoincrement_tables: HashSet<String>,
-    sqlite_sequence_cache: HashMap<String, i64>,
-    temp_sqlite_sequence: HashMap<String, i64>,
     original_ddl_sql: HashMap<String, String>,
     next_master_rowid: i64,
-    schema_cookie: u32,
-    schema_generation: u64,
-    live_vtab_registry_undo_len: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -31794,6 +31804,7 @@ impl Connection {
                 execution_cx,
                 statement_kind,
                 preserve_prior_changes_on_constraint_violation,
+                false,
                 async || {
                     self.with_statement_fk_validation_scope(
                         preserve_prior_changes_on_constraint_violation,
@@ -36451,7 +36462,7 @@ impl Connection {
         F: std::ops::AsyncFnOnce() -> Result<T>,
     {
         let cx = self.op_cx()?;
-        self.with_internal_statement_savepoint_and_cx(&cx, purpose, false, body)
+        self.with_internal_statement_savepoint_and_cx(&cx, purpose, false, true, body)
             .await
     }
 
@@ -36460,6 +36471,9 @@ impl Connection {
         cx: &Cx,
         purpose: &str,
         preserve_constraint_failure_rows: bool,
+        // bd-ry6x7: false for plain DML, whose failure cannot need the schema
+        // metadata restored; skips a full schema copy per statement.
+        schema_may_change: bool,
         body: F,
     ) -> Result<T>
     where
@@ -36470,7 +36484,7 @@ impl Connection {
         // cannot undo earlier statement effects.
         self.flush_pending_direct_write_runs(cx).await?;
         let savepoint_name = self.next_internal_savepoint_name(purpose);
-        let snapshot = self.snapshot();
+        let snapshot = self.statement_snapshot(schema_may_change);
         self.internal_statement_savepoint_depth.set(
             self.internal_statement_savepoint_depth
                 .get()
@@ -38034,6 +38048,10 @@ impl Connection {
                     &op_cx,
                     statement_kind,
                     statement_preserves_prior_changes_on_constraint(statement.as_ref()),
+                    !matches!(
+                        statement.as_ref(),
+                        Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
+                    ),
                     async || {
                         self.execute_statement_dispatch_with_fk_scope(
                             &op_cx,
@@ -41218,6 +41236,7 @@ impl Connection {
                 &op_cx,
                 "insert_select",
                 preserve_prior_changes_on_constraint_violation,
+                false,
                 async || {
                     self.execute_insert_select_materialized_rows(insert, source_rows)
                         .await
@@ -70947,27 +70966,40 @@ impl Connection {
 
     /// Take a snapshot of the current database + schema state.
     fn snapshot(&self) -> DbSnapshot {
+        self.snapshot_with_schema(true)
+    }
+
+    /// bd-ry6x7: a statement-level snapshot copies the schema metadata only
+    /// when the statement can change it. Plain DML cannot (trigger bodies
+    /// cannot run DDL); DML on `sqlite_master` under `writable_schema` can.
+    fn statement_snapshot(&self, schema_may_change: bool) -> DbSnapshot {
+        self.snapshot_with_schema(schema_may_change || self.pragma_state.borrow().writable_schema)
+    }
+
+    fn snapshot_with_schema(&self, with_schema: bool) -> DbSnapshot {
         if hot_path_profile_enabled() {
             FSQLITE_CONNECTION_SNAPSHOTS.fetch_add(1, AtomicOrdering::Relaxed);
         }
         let db_version = self.db.borrow_mut().undo_version();
         DbSnapshot {
             db_version,
-            schema: self.schema.borrow().clone(),
-            temp_table_names: self.temp_table_names.borrow().clone(),
-            temp_default_cache_size: self.pragma_state.borrow().temp_default_cache_size,
-            shadowed_main_tables: self.shadowed_main_tables.borrow().clone(),
-            views: self.views.borrow().clone(),
-            triggers: self.triggers.borrow().clone(),
-            rowid_alias_columns: self.rowid_alias_columns.borrow().clone(),
-            autoincrement_tables: self.autoincrement_tables.borrow().clone(),
             sqlite_sequence_cache: self.sqlite_sequence_cache.borrow().clone(),
             temp_sqlite_sequence: self.temp_sqlite_sequence.borrow().clone(),
-            original_ddl_sql: self.original_ddl_sql.borrow().clone(),
-            next_master_rowid: *self.next_master_rowid.borrow(),
             schema_cookie: *self.schema_cookie.borrow(),
             schema_generation: self.schema_generation.get(),
             live_vtab_registry_undo_len: self.live_vtab_registry_undo.borrow().len(),
+            schema_state: with_schema.then(|| SchemaSnapshot {
+                schema: self.schema.borrow().clone(),
+                temp_table_names: self.temp_table_names.borrow().clone(),
+                temp_default_cache_size: self.pragma_state.borrow().temp_default_cache_size,
+                shadowed_main_tables: self.shadowed_main_tables.borrow().clone(),
+                views: self.views.borrow().clone(),
+                triggers: self.triggers.borrow().clone(),
+                rowid_alias_columns: self.rowid_alias_columns.borrow().clone(),
+                autoincrement_tables: self.autoincrement_tables.borrow().clone(),
+                original_ddl_sql: self.original_ddl_sql.borrow().clone(),
+                next_master_rowid: *self.next_master_rowid.borrow(),
+            }),
         }
     }
 
@@ -71006,41 +71038,46 @@ impl Connection {
     /// cleanup remains owned by the caller on that path.
     fn restore_snapshot_state(&self, snap: &DbSnapshot) {
         self.db.borrow_mut().rollback_to(snap.db_version);
+        (*self.sqlite_sequence_cache.borrow_mut()).clone_from(&snap.sqlite_sequence_cache);
+        (*self.temp_sqlite_sequence.borrow_mut()).clone_from(&snap.temp_sqlite_sequence);
+        // A statement snapshot without schema state belongs to a statement that
+        // could not change the schema metadata: keep the current copy.
+        let Some(state) = snap.schema_state.as_ref() else {
+            return;
+        };
         // bd-e6zfc: rebuild the case-insensitive side indices from the snapshot
         // (positions match the about-to-be-cloned Vecs) and publish each data
         // Vec paired with its index, so `schema_by_name`/`views_by_name`/
         // `triggers_by_name` never lag their backing Vecs. The previous
         // "clone all three Vecs, then `rebuild_schema_indices()`" sequence left
         // a window where a reentrant schema lookup could observe stale indices.
-        let new_schema_by_name: HashMap<String, usize> = snap
+        let new_schema_by_name: HashMap<String, usize> = state
             .schema
             .iter()
             .enumerate()
             .map(|(i, table)| (table.name.to_ascii_lowercase(), i))
             .collect();
-        let new_views_by_name = build_scoped_view_index(&snap.views);
-        let new_triggers_by_name: HashMap<String, usize> = snap
+        let new_views_by_name = build_scoped_view_index(&state.views);
+        let new_triggers_by_name: HashMap<String, usize> = state
             .triggers
             .iter()
             .enumerate()
             .map(|(i, trigger)| (trigger.name.to_ascii_lowercase(), i))
             .collect();
-        (*self.schema.borrow_mut()).clone_from(&snap.schema);
+        (*self.schema.borrow_mut()).clone_from(&state.schema);
         *self.schema_by_name.borrow_mut() = new_schema_by_name;
-        (*self.temp_table_names.borrow_mut()).clone_from(&snap.temp_table_names);
-        self.pragma_state.borrow_mut().temp_default_cache_size = snap.temp_default_cache_size;
-        (*self.shadowed_main_tables.borrow_mut()).clone_from(&snap.shadowed_main_tables);
-        (*self.views.borrow_mut()).clone_from(&snap.views);
+        (*self.temp_table_names.borrow_mut()).clone_from(&state.temp_table_names);
+        self.pragma_state.borrow_mut().temp_default_cache_size = state.temp_default_cache_size;
+        (*self.shadowed_main_tables.borrow_mut()).clone_from(&state.shadowed_main_tables);
+        (*self.views.borrow_mut()).clone_from(&state.views);
         *self.views_by_name.borrow_mut() = new_views_by_name;
-        (*self.triggers.borrow_mut()).clone_from(&snap.triggers);
+        (*self.triggers.borrow_mut()).clone_from(&state.triggers);
         *self.triggers_by_name.borrow_mut() = new_triggers_by_name;
         self.validate_schema_index();
-        (*self.rowid_alias_columns.borrow_mut()).clone_from(&snap.rowid_alias_columns);
-        (*self.autoincrement_tables.borrow_mut()).clone_from(&snap.autoincrement_tables);
-        (*self.sqlite_sequence_cache.borrow_mut()).clone_from(&snap.sqlite_sequence_cache);
-        (*self.temp_sqlite_sequence.borrow_mut()).clone_from(&snap.temp_sqlite_sequence);
-        (*self.original_ddl_sql.borrow_mut()).clone_from(&snap.original_ddl_sql);
-        *self.next_master_rowid.borrow_mut() = snap.next_master_rowid;
+        (*self.rowid_alias_columns.borrow_mut()).clone_from(&state.rowid_alias_columns);
+        (*self.autoincrement_tables.borrow_mut()).clone_from(&state.autoincrement_tables);
+        (*self.original_ddl_sql.borrow_mut()).clone_from(&state.original_ddl_sql);
+        *self.next_master_rowid.borrow_mut() = state.next_master_rowid;
         *self.schema_cookie.borrow_mut() = snap.schema_cookie;
         self.schema_generation.set(snap.schema_generation);
     }
