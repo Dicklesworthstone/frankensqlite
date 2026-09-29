@@ -298,6 +298,23 @@ impl StatementColdState {
     }
 }
 
+/// Highest register a write may create on demand. Hand-built programs can name
+/// arbitrary registers; capping on-demand growth keeps them from allocating
+/// unbounded register files.
+const MAX_ON_DEMAND_REGISTER: i32 = 65_535;
+
+/// Whether a write to register `r` lands. Every register a compiled program
+/// declares is pre-sized into the file (`allocated`), however many there are:
+/// a multi-row `INSERT ... VALUES` with CHECK constraints allocates tens of
+/// registers per row, and silently dropping writes past 65,535 built index
+/// records without their rowid (hfdt-dlkam3). Only undeclared registers past
+/// the on-demand cap are dropped.
+#[inline(always)]
+#[allow(clippy::inline_always, clippy::cast_sign_loss)]
+fn register_write_in_bounds(r: i32, allocated: usize) -> bool {
+    r >= 0 && (r <= MAX_ON_DEMAND_REGISTER || (r as usize) < allocated)
+}
+
 #[inline]
 fn observe_execution_cancellation(cx: &Cx) -> Result<()> {
     cx.checkpoint().map_err(|_| FrankenError::Abort)
@@ -14428,7 +14445,7 @@ impl VdbeEngine {
         if !self.make_record_lookaside.sideband_is_armed_for(r) {
             return;
         }
-        if !(0..=65535).contains(&r) {
+        if !register_write_in_bounds(r, self.registers.len()) {
             self.make_record_lookaside.reset();
             return;
         }
@@ -16429,7 +16446,7 @@ impl VdbeEngine {
     #[inline]
     #[allow(clippy::cast_sign_loss)]
     fn set_reg(&mut self, r: i32, val: SqliteValue) {
-        if !(0..=65535).contains(&r) {
+        if !register_write_in_bounds(r, self.registers.len()) {
             // Drop out-of-bounds register writes to prevent OOM.
             // SQLite defines a max register limit (SQLITE_MAX_COLUMN + some overhead).
             return;
@@ -16461,7 +16478,7 @@ impl VdbeEngine {
     #[allow(clippy::inline_always)]
     #[allow(clippy::cast_sign_loss)]
     fn set_reg_fast(&mut self, r: i32, val: SqliteValue) {
-        if !(0..=65535).contains(&r) {
+        if !register_write_in_bounds(r, self.registers.len()) {
             return;
         }
         let idx = r as usize;
@@ -16502,7 +16519,7 @@ impl VdbeEngine {
     #[inline(always)]
     #[allow(clippy::inline_always, clippy::cast_sign_loss)]
     fn set_reg_null(&mut self, r: i32) {
-        if !(0..=65535).contains(&r) {
+        if !register_write_in_bounds(r, self.registers.len()) {
             return;
         }
         let idx = r as usize;
@@ -16549,7 +16566,7 @@ impl VdbeEngine {
     #[inline(always)]
     #[allow(clippy::inline_always, clippy::cast_sign_loss)]
     fn set_reg_real(&mut self, r: i32, val: f64) {
-        if !(0..=65535).contains(&r) {
+        if !register_write_in_bounds(r, self.registers.len()) {
             return;
         }
         let idx = r as usize;
@@ -16574,7 +16591,7 @@ impl VdbeEngine {
     #[inline]
     #[allow(clippy::cast_sign_loss)]
     fn write_text_to_reg(&mut self, r: i32, text: &str) {
-        if !(0..=65535).contains(&r) {
+        if !register_write_in_bounds(r, self.registers.len()) {
             return;
         }
         let idx = r as usize;
@@ -16597,7 +16614,7 @@ impl VdbeEngine {
     #[inline]
     #[allow(clippy::cast_sign_loss)]
     fn write_blob_to_reg(&mut self, r: i32, blob: &[u8]) {
-        if !(0..=65535).contains(&r) {
+        if !register_write_in_bounds(r, self.registers.len()) {
             return;
         }
         let idx = r as usize;
@@ -16926,7 +16943,7 @@ impl VdbeEngine {
                     // self.storage_cursors) directly into self.registers
                     // (disjoint struct field) — zero clone for matching types.
                     let reg_idx = target as usize;
-                    if (0..=65535).contains(&target) {
+                    if register_write_in_bounds(target, self.registers.len()) {
                         if reg_idx >= self.registers.len() {
                             self.registers.resize(reg_idx + 1, SqliteValue::Null);
                         }
