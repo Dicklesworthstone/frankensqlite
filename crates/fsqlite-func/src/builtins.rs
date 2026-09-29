@@ -968,18 +968,25 @@ impl ScalarFunction for RoundFunc {
             return Ok(SqliteValue::Null);
         }
         let x = args[0].to_float();
-        // Clamp N to [0, 30] matching SQLite behavior. bd-round-ndigits-i32-bv61c:
-        // C SQLite reads N via sqlite3_value_int (i32-truncated) BEFORE clamping,
-        // so a huge i64 like 4294967298 becomes i32 2 (round to 2 places), not a
-        // clamp to 30. i32-truncate first to match.
+        // Clamp N to [0, 30]. SQLite 3.51+/3.53 (the pinned oracle) reads N with
+        // sqlite3_value_int64 and then clamps, so 4294967298 means 30, not the
+        // i32-truncated 2 that 3.46's sqlite3_value_int produced (GH#436).
         let n = if args.len() > 1 {
-            i64::from(args[1].to_integer() as i32).clamp(0, 30)
+            args[1].to_integer().clamp(0, 30)
         } else {
             0
         };
         // Values beyond 2^52 have no fractional part — return unchanged
         if !(-4_503_599_627_370_496.0..=4_503_599_627_370_496.0).contains(&x) {
             return Ok(SqliteValue::Float(x));
+        }
+        // GH#436: SQLite's own N == 0 path, `(double)(i64)(r + (r<0 ? -0.5 : 0.5))`,
+        // with no printf round trip. The float addition is part of the contract:
+        // round(0.49999999999999994) is 1.0 there.
+        if n == 0 {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+            let rounded = (x + if x < 0.0 { -0.5 } else { 0.5 }) as i64 as f64;
+            return Ok(SqliteValue::Float(rounded));
         }
         // SQLite uses "round half away from zero" via its custom printf, while
         // Rust's format! uses "round half to even" (IEEE 754 default). They
@@ -3766,18 +3773,34 @@ mod tests {
     }
 
     #[test]
-    fn test_round_ndigits_i32_bd_bv61c() {
-        // bd-round-ndigits-i32-bv61c. Oracle: sqlite3 3.46.1. round() reads N via
-        // sqlite3_value_int (i32-truncated) BEFORE clamping to [0,30]: 4294967298
-        // -> i32 2, -4294967295 -> i32 1. Normal (i32-range) N is unaffected.
+    fn test_round_ndigits_int64_clamp_matches_3_53() {
+        // Oracle: bundled SQLite 3.53.2 (and 3.51). round() reads N with
+        // sqlite3_value_int64 and clamps to [0,30]: 4294967298 -> 30 and
+        // -4294967295 -> 0. (3.46.1 truncated N to i32 first; bd-bv61c.)
         let run = |x: f64, n: i64| -> SqliteValue {
             RoundFunc
                 .invoke(&[SqliteValue::Float(x), SqliteValue::Integer(n)])
                 .unwrap()
         };
-        assert_eq!(run(1.23456, 4_294_967_298), SqliteValue::Float(1.23));
-        assert_eq!(run(1.23456, -4_294_967_295), SqliteValue::Float(1.2));
-        assert_eq!(run(1.23456, 2), SqliteValue::Float(1.23)); // normal, no regression
+        assert_eq!(run(1.23456, 4_294_967_298), SqliteValue::Float(1.23456));
+        assert_eq!(run(1.23456, -4_294_967_295), SqliteValue::Float(1.0));
+        assert_eq!(run(1.23456, 2), SqliteValue::Float(1.23));
+    }
+
+    #[test]
+    fn test_round_n0_uses_sqlite_add_half_truncate() {
+        // GH#436. SQLite's N == 0 path is (double)(i64)(r + (r<0 ? -0.5 : 0.5)).
+        let run = |x: f64| RoundFunc.invoke(&[SqliteValue::Float(x)]).unwrap();
+        assert_eq!(run(0.499_999_999_999_999_94), SqliteValue::Float(1.0));
+        assert_eq!(run(-0.499_999_999_999_999_94), SqliteValue::Float(-1.0));
+        assert_eq!(run(2.5), SqliteValue::Float(3.0));
+        assert_eq!(run(-2.5), SqliteValue::Float(-3.0));
+        assert_eq!(run(-0.3), SqliteValue::Float(0.0));
+        assert_eq!(run(4_503_599_627_370_495.5), SqliteValue::Float(4_503_599_627_370_496.0));
+        let zero = RoundFunc
+            .invoke(&[SqliteValue::Float(2.5), SqliteValue::Integer(0)])
+            .unwrap();
+        assert_eq!(zero, SqliteValue::Float(3.0));
     }
 
     #[test]

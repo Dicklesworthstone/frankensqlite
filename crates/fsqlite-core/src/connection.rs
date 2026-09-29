@@ -80771,6 +80771,37 @@ impl Connection {
             });
         let include_hidden_rowid = col_map.iter().any(|(_, _, hidden)| *hidden);
         let predicate = where_clause.as_deref();
+        // GH#436: resolve column references and function calls once for the
+        // whole scan, under the registry the rows evaluate with.
+        let _join_expr_bindings_guard = self.with_fallback_function_registry(|| {
+            let mut bindings = JoinExprBindings::default();
+            let mut bind = |expr: &Expr| {
+                bindings.bind_expr(expr, col_map, None);
+                bindings.bind_functions(expr, col_map);
+            };
+            if let Some(predicate) = predicate {
+                bind(predicate);
+            }
+            for expr in &group_by_exprs {
+                bind(expr);
+            }
+            for output in &outputs {
+                match output {
+                    SimpleStreamingGroupByOutput::Plain(expr) => bind(expr),
+                    SimpleStreamingGroupByOutput::CountValue { arg_expr, .. }
+                    | SimpleStreamingGroupByOutput::SumValue { arg_expr, .. }
+                    | SimpleStreamingGroupByOutput::AvgValue { arg_expr, .. }
+                    | SimpleStreamingGroupByOutput::MinValue { arg_expr, .. }
+                    | SimpleStreamingGroupByOutput::MaxValue { arg_expr, .. } => {
+                        if let Some(expr) = arg_expr {
+                            bind(expr);
+                        }
+                    }
+                    SimpleStreamingGroupByOutput::CountStar => {}
+                }
+            }
+            JoinExprBindingsGuard::push(bindings)
+        });
         let mut grouping = SimpleStreamingGroupBy::new(&group_by_exprs, &outputs, col_map);
         self.scan_table_function_rows(
             name,
@@ -147303,9 +147334,63 @@ fn with_current_sync_custom_aggregate_keys<T>(
 #[derive(Default)]
 struct JoinExprBindings {
     column_indices: HashMap<ColumnRef, usize>,
+    /// GH#436: function calls resolved once per query, keyed by the address of
+    /// their `Expr::FunctionCall` node. Only filled by [`Self::bind_functions`],
+    /// which a caller must run under the function registry its rows use.
+    functions: HashMap<usize, Arc<PreparedJoinFunction>>,
+}
+
+/// GH#436: everything `eval_join_expr` derives from a function call's name,
+/// arity and arguments before invoking it, computed once instead of per row.
+struct PreparedJoinFunction {
+    application_kind_is_none: bool,
+    /// `bm25`, `highlight` or `snippet`: the only names the FTS5 checks match.
+    fts5_aux_name: bool,
+    collation: Option<String>,
+    scalar: PreparedJoinScalar,
+}
+
+enum PreparedJoinScalar {
+    Resolved(ResolvedScalarFunction),
+    Misuse(String),
+    /// No registered scalar: `eval_scalar_fn` evaluates it.
+    Builtin,
 }
 
 impl JoinExprBindings {
+    /// GH#436: resolve every function call in `expr` once. Must run under the
+    /// same sync function registry as the rows that evaluate `expr`.
+    fn bind_functions(&mut self, expr: &Expr, col_map: &[(String, String, bool)]) {
+        for_each_function_call_in_expr(expr, &mut |call| {
+            let Expr::FunctionCall { name, args, .. } = call else {
+                return;
+            };
+            let key = std::ptr::from_ref(call) as usize;
+            if self.functions.contains_key(&key) {
+                return;
+            }
+            let arity = aggregate_args_len_for_lookup(args);
+            self.functions.insert(
+                key,
+                Arc::new(PreparedJoinFunction {
+                    application_kind_is_none: current_application_function_kind(name, arity)
+                        .is_none(),
+                    fts5_aux_name: name.eq_ignore_ascii_case("bm25")
+                        || name.eq_ignore_ascii_case("highlight")
+                        || name.eq_ignore_ascii_case("snippet"),
+                    collation: function_argument_collation(args, col_map),
+                    scalar: resolve_current_registered_scalar(name, arity),
+                }),
+            );
+        });
+    }
+
+    fn function(&self, call: &Expr) -> Option<Arc<PreparedJoinFunction>> {
+        self.functions
+            .get(&(std::ptr::from_ref(call) as usize))
+            .cloned()
+    }
+
     fn bind_expr(
         &mut self,
         expr: &Expr,
@@ -147360,6 +147445,63 @@ fn current_join_expr_column_index(col_ref: &ColumnRef) -> Option<usize> {
             .last()
             .and_then(|bindings| bindings.column_index(col_ref))
     })
+}
+
+fn current_join_expr_function(call: &Expr) -> Option<Arc<PreparedJoinFunction>> {
+    CURRENT_JOIN_EXPR_BINDINGS.with(|stack| {
+        stack
+            .borrow()
+            .last()
+            .and_then(|bindings| bindings.function(call))
+    })
+}
+
+/// GH#436: every `Expr::FunctionCall` node reachable through the operators the
+/// join evaluator recurses into. A node it misses just keeps the per-row path.
+fn for_each_function_call_in_expr(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
+    match expr {
+        Expr::FunctionCall { args, .. } => {
+            visit(expr);
+            if let FunctionArgs::List(items) = args {
+                for item in items {
+                    for_each_function_call_in_expr(item, visit);
+                }
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            for_each_function_call_in_expr(left, visit);
+            for_each_function_call_in_expr(right, visit);
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. }
+        | Expr::IsNull { expr, .. } => for_each_function_call_in_expr(expr, visit),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            for_each_function_call_in_expr(expr, visit);
+            for_each_function_call_in_expr(low, visit);
+            for_each_function_call_in_expr(high, visit);
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            if let Some(operand) = operand {
+                for_each_function_call_in_expr(operand, visit);
+            }
+            for (when, then) in whens {
+                for_each_function_call_in_expr(when, visit);
+                for_each_function_call_in_expr(then, visit);
+            }
+            if let Some(else_expr) = else_expr {
+                for_each_function_call_in_expr(else_expr, visit);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn resolve_join_expr_column_index(
@@ -149757,39 +149899,65 @@ fn invoke_current_registered_scalar(
     args: &[SqliteValue],
     collation_name: Option<&str>,
 ) -> Option<Result<SqliteValue>> {
+    let prepared = resolve_current_registered_scalar(name, args.len() as i32);
+    invoke_prepared_scalar(name, &prepared, args, collation_name)
+}
+
+/// The registered scalar `name/arity` resolves to under the current sync
+/// function registry (or the shared builtins when there is none).
+fn resolve_current_registered_scalar(name: &str, arity: i32) -> PreparedJoinScalar {
     let (has_context, current) = with_current_sync_function_registry(|registry| {
         (
             registry.is_some(),
             registry.and_then(|registry| {
                 registry
-                    .resolve_scalar(name, args.len() as i32)
-                    .map(|resolved| {
-                        invoke_scalar_for_sync_evaluation(name, &resolved, args, collation_name)
-                    })
+                    .resolve_scalar(name, arity)
+                    .map(PreparedJoinScalar::Resolved)
                     .or_else(|| {
                         registry
-                            .resolve_application_function(name, args.len() as i32)
+                            .resolve_application_function(name, arity)
                             .filter(|resolution| {
                                 resolution.kind() != ApplicationFunctionKind::Scalar
                             })
                             .map(|resolution| {
-                                Err(FrankenError::function_error(format!(
+                                PreparedJoinScalar::Misuse(format!(
                                     "misuse of {} function {}()",
                                     resolution.kind().label(),
                                     name.to_ascii_lowercase(),
-                                )))
+                                ))
                             })
                     })
             }),
         )
     });
     if has_context {
-        return current;
+        return current.unwrap_or(PreparedJoinScalar::Builtin);
     }
-    let builtin = shared_builtin_function_registry();
-    builtin
-        .resolve_scalar(name, args.len() as i32)
-        .map(|resolved| invoke_scalar_for_sync_evaluation(name, &resolved, args, collation_name))
+    shared_builtin_function_registry()
+        .resolve_scalar(name, arity)
+        .map_or(PreparedJoinScalar::Builtin, PreparedJoinScalar::Resolved)
+}
+
+/// `None` means no registered scalar answers: the caller falls back to
+/// `eval_scalar_fn`.
+fn invoke_prepared_scalar(
+    name: &str,
+    prepared: &PreparedJoinScalar,
+    args: &[SqliteValue],
+    collation_name: Option<&str>,
+) -> Option<Result<SqliteValue>> {
+    match prepared {
+        PreparedJoinScalar::Resolved(resolved) => Some(invoke_scalar_for_sync_evaluation(
+            name,
+            resolved,
+            args,
+            collation_name,
+        )),
+        PreparedJoinScalar::Misuse(message) => {
+            Some(Err(FrankenError::function_error(message.clone())))
+        }
+        PreparedJoinScalar::Builtin => None,
+    }
 }
 
 fn function_argument_collation(
@@ -150258,9 +150426,20 @@ pub(crate) fn eval_join_expr(
             }
         }
         Expr::FunctionCall { name, args, .. } => {
-            let application_kind =
-                current_application_function_kind(name, aggregate_args_len_for_lookup(args));
-            if application_kind.is_none() {
+            // GH#436: a query that prepared its function calls skips the
+            // per-row registry lookups below; the outcome is identical.
+            let prepared = current_join_expr_function(expr);
+            let application_kind_is_none = match &prepared {
+                Some(prepared) => prepared.application_kind_is_none,
+                None => {
+                    current_application_function_kind(name, aggregate_args_len_for_lookup(args))
+                        .is_none()
+                }
+            };
+            let fts5_candidate = prepared
+                .as_ref()
+                .is_none_or(|prepared| prepared.fts5_aux_name);
+            if application_kind_is_none && fts5_candidate {
                 if let Some(result) = try_eval_fts5_aux_function(name, args, row, col_map) {
                     return result;
                 }
@@ -150278,10 +150457,22 @@ pub(crate) fn eval_join_expr(
                 FunctionArgs::Star => vec![],
             };
             #[cfg(feature = "ext-fts5")]
-            if application_kind.is_none()
+            if application_kind_is_none
+                && fts5_candidate
                 && let Some(value) = eval_fts5_scalar_fallback(name, &arg_vals)?
             {
                 return Ok(value);
+            }
+            if let Some(prepared) = prepared {
+                if let Some(result) = invoke_prepared_scalar(
+                    name,
+                    &prepared.scalar,
+                    &arg_vals,
+                    prepared.collation.as_deref(),
+                ) {
+                    return result;
+                }
+                return Ok(eval_scalar_fn(name, &arg_vals));
             }
             let collation = function_argument_collation(args, col_map);
             if let Some(result) =
