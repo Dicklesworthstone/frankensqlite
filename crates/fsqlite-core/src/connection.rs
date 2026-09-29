@@ -14571,14 +14571,8 @@ impl Connection {
         writable: bool,
         defer_fts5_hydration: bool,
     ) -> Result<Self> {
-        // Retry the whole open on Busy/BusyRecovery, as `open_with_page_size_and_env`
-        // does. Only the pager open retries inside; the bootstrap after it (journal
-        // mode, published-snapshot refresh, schema load) can meet a peer's WAL-index
-        // recovery while other connections commit, and a failed attempt has already
-        // closed its connection. Without this, schema-only opens failed where
-        // ordinary opens of the same file under the same load did not.
         let path = path.into();
-        retry_busy_connection_bootstrap(|| {
+        let open = || {
             Self::open_schema_only_with_optional_expected_identity_and_env_and_disposition(
                 path.clone(),
                 expected_identity,
@@ -14587,8 +14581,24 @@ impl Connection {
                 defer_fts5_hydration,
                 SchemaOnlyPagerDisposition::Ordinary,
             )
-        })
-        .await
+        };
+        // A writable open retries the whole open on Busy/BusyRecovery, as
+        // `open_with_page_size_and_env` does. Only the pager open retries
+        // inside; the bootstrap after it (journal mode, published-snapshot
+        // refresh, schema load) can meet a peer's WAL-index recovery while
+        // other connections commit, and a failed attempt has already closed
+        // its connection.
+        //
+        // A read-only open never performs WAL-index recovery, so its
+        // BusyRecovery for a stale index lasts until some writer or explicit
+        // recovery runs. Waiting out the 30 s bootstrap floor there only
+        // delays the refusal its caller retries on its own budget (cass GH#477
+        // strict probes: 0.4.7 took ~30 s per open instead of failing fast).
+        if writable {
+            retry_busy_connection_bootstrap(open).await
+        } else {
+            open().await
+        }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
