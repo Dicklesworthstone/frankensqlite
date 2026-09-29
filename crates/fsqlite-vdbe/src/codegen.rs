@@ -24268,11 +24268,16 @@ fn index_key_eq_residual_seek_target<'a, 't>(
     let where_expr = where_clause?;
     let mut conjuncts = Vec::new();
     collect_conjunctive_terms(where_expr, &mut conjuncts);
-    let equalities: Vec<(String, &'a Expr)> = conjuncts
+    // (column, probe value, index of the conjunct that supplied it)
+    let equalities: Vec<(String, &'a Expr, usize)> = conjuncts
         .iter()
         .copied()
-        .filter_map(|term| extract_column_eq_target(Some(term), table, table_alias))
-        .filter(|(_, target)| is_rowid_range_constant(target))
+        .enumerate()
+        .filter_map(|(conjunct, term)| {
+            extract_column_eq_target(Some(term), table, table_alias)
+                .map(|(column, target)| (column, target, conjunct))
+        })
+        .filter(|(_, target, _)| is_rowid_range_constant(target))
         .collect();
     table
         .indexes
@@ -24280,13 +24285,17 @@ fn index_key_eq_residual_seek_target<'a, 't>(
         .filter(|idx| idx.supports_direct_column_lookup() && idx.key_term_count() >= 2)
         .find_map(|idx| {
             let mut targets = Vec::with_capacity(idx.key_term_count());
+            let mut consumed = Vec::with_capacity(idx.key_term_count());
             for (term, column_name) in idx.columns.iter().enumerate() {
                 if idx.key_term_descending(term) {
                     return None;
                 }
-                let (_, target) = equalities
+                let (_, target, conjunct) = equalities
                     .iter()
-                    .find(|(name, _)| name.eq_ignore_ascii_case(column_name))?;
+                    .find(|(name, _, _)| name.eq_ignore_ascii_case(column_name))?;
+                if !consumed.contains(conjunct) {
+                    consumed.push(*conjunct);
+                }
                 let column = table.columns.get(table.column_index(column_name)?)?;
                 let affinity = column.affinity;
                 if !matches!(affinity, 'D' | 'C' | 'E' | 'B') {
@@ -24302,7 +24311,11 @@ fn index_key_eq_residual_seek_target<'a, 't>(
                 }
                 targets.push((*target, affinity));
             }
-            Some((idx, targets, conjuncts.len() > idx.key_term_count()))
+            // An index can repeat a column (`(a, a)`), so one conjunct may
+            // feed several key terms. The WHERE is fully enforced by the seek
+            // only when every conjunct fed a key term; otherwise the leftover
+            // terms (a gate, a contradictory `a = 2`) run as a residual.
+            Some((idx, targets, consumed.len() < conjuncts.len()))
         })
 }
 
