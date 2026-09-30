@@ -31,8 +31,10 @@ FSQLITE_WASM_TARGET=nodejs ./scripts/build_fsqlite_wasm_package.sh target/fsqlit
 The helper script:
 
 - runs `wasm-pack build`
-- uses the workspace size-optimized `release` profile (`opt-level = "z"`,
-  LTO, one codegen unit, stripped symbols, aborting panics)
+- uses the workspace `release` profile (LTO, one codegen unit, stripped
+  symbols, aborting panics) with `opt-level` overridden to `"z"` through
+  `CARGO_PROFILE_RELEASE_OPT_LEVEL`, since native release builds optimize
+  for speed
 - runs `wasm-opt` explicitly after wasm-bindgen output, with Rust's
   bulk-memory and nontrapping-float feature flags enabled, then keeps the
   optimized output only when it is no larger after gzip, without leaving a

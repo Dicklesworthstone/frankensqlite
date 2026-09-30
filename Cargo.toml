@@ -222,8 +222,11 @@ toml = "1.1"
 syn = { version = "3.0.5", features = ["full", "visit"] }
 proc-macro2 = { version = "1.0.107", features = ["span-locations"] }
 
+# Native release builds (published CLI binaries included) are optimized for
+# speed. The browser package keeps its size budget: the wasm build script
+# overrides `opt-level` to "z" for its own invocation.
 [profile.release]
-opt-level = "z"
+opt-level = 3
 lto = true
 codegen-units = 1
 panic = "abort"

@@ -576,6 +576,12 @@ else
         export RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }-Zlocation-detail=none"
     fi
 
+    # The workspace release profile optimizes for speed (native binaries);
+    # the browser package optimizes for size to stay within its budget.
+    if [[ "${profile}" == "release" ]]; then
+        export CARGO_PROFILE_RELEASE_OPT_LEVEL="${CARGO_PROFILE_RELEASE_OPT_LEVEL:-z}"
+    fi
+
     pushd "${crate_dir}" >/dev/null
     wasm-pack build . \
         --target "${target}" \

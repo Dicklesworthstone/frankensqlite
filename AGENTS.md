@@ -132,7 +132,7 @@ The release build optimizes for binary size:
 
 ```toml
 [profile.release]
-opt-level = "z"     # Optimize for size (lean binary for distribution)
+opt-level = 3       # Optimize for speed (the wasm package overrides to "z")
 lto = true          # Link-time optimization
 codegen-units = 1   # Single codegen unit for better optimization
 panic = "abort"     # Smaller binary, no unwinding overhead

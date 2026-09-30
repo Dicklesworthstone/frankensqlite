@@ -59,7 +59,7 @@ done
 
 required_profile_lines=(
     '[profile.release]'
-    'opt-level = "z"'
+    'opt-level = 3'
     'lto = true'
     'codegen-units = 1'
     'panic = "abort"'
