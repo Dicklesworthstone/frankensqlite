@@ -147709,18 +147709,24 @@ fn with_current_sync_custom_aggregate_keys<T>(
 /// candidate row. `ColumnRef` is the parser-owned, immutable identifier key,
 /// so exact-key lookup avoids repeating case-folded scans of the full column
 /// map in the evaluator hot loop.
+///
+/// These maps are read once per evaluated node per row, and their keys are
+/// node addresses and parser-owned identifiers, so they use a fast fixed-seed
+/// hasher instead of SipHash.
 #[derive(Default)]
 struct JoinExprBindings {
-    column_indices: HashMap<ColumnRef, usize>,
+    column_indices: JoinBindingMap<ColumnRef, usize>,
     /// GH#436: function calls resolved once per query, keyed by the address of
     /// their `Expr::FunctionCall` node. Only filled by [`Self::bind_functions`],
     /// which a caller must run under the function registry its rows use.
-    functions: HashMap<usize, Arc<PreparedJoinFunction>>,
+    functions: JoinBindingMap<usize, Arc<PreparedJoinFunction>>,
     /// GH#419: `first_explicit_collation_name` of comparison operands, keyed
     /// like `functions`. It depends only on the operand's syntax tree, which
     /// it walks, so a correlated probe computes it once instead of per row.
-    explicit_collations: HashMap<usize, Option<String>>,
+    explicit_collations: JoinBindingMap<usize, Option<String>>,
 }
+
+type JoinBindingMap<K, V> = HashMap<K, V, foldhash::fast::FixedState>;
 
 /// GH#436: everything `eval_join_expr` derives from a function call's name,
 /// arity and arguments before invoking it, computed once instead of per row.
