@@ -116874,9 +116874,15 @@ fn resolve_outer_column_expr(
     if column.table.is_none() && lookup.probe_unqualified_external_ref {
         return Some(value_to_literal_expr(SqliteValue::Null));
     }
+    // bd-7s1zz: without a skip set (a correlated subquery in the join's
+    // WHERE), an unqualified USING column appears once per joined side, so
+    // the plain lookup is ambiguous; it names the join's coalesced column.
     if column.table.is_none()
-        && lookup.using_skip.is_some()
-        && find_col_in_map(lookup.col_map, None, &column.column, lookup.using_skip).is_ok()
+        && (if lookup.using_skip.is_some() {
+            find_col_in_map(lookup.col_map, None, &column.column, lookup.using_skip).is_ok()
+        } else {
+            find_col_in_map(lookup.col_map, None, &column.column, None).is_err()
+        })
         && let Some(projection) = current_join_using_column_projection(&column.column)
     {
         let value = projection.value(lookup.row);
