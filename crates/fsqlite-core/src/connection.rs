@@ -13286,6 +13286,12 @@ pub struct Connection {
     /// the old connection while leaving the committed image reopenable.
     #[cfg(test)]
     fail_vacuum_rebind_once: Cell<bool>,
+    /// bd-q1b7z: one-shot failure of an autocommit statement's commit, and of
+    /// the reload that recovers connection state after it.
+    #[cfg(test)]
+    fail_autocommit_commit_once: Cell<bool>,
+    #[cfg(test)]
+    fail_failed_commit_recovery_reload_once: Cell<bool>,
     /// One-shot failure after DROP COLUMN rewrites row storage but before it
     /// updates the catalog. Proves statement-level rollback spans both sides.
     #[cfg(test)]
@@ -14903,6 +14909,10 @@ impl Connection {
             #[cfg(test)]
             fail_vacuum_rebind_once: Cell::new(false),
             #[cfg(test)]
+            fail_autocommit_commit_once: Cell::new(false),
+            #[cfg(test)]
+            fail_failed_commit_recovery_reload_once: Cell::new(false),
+            #[cfg(test)]
             fail_alter_drop_after_storage_once: Cell::new(false),
             root_cx,
             operation_cx_override: RefCell::new(None),
@@ -15446,6 +15456,10 @@ impl Connection {
             cancel_vacuum_after_publish_once: Cell::new(false),
             #[cfg(test)]
             fail_vacuum_rebind_once: Cell::new(false),
+            #[cfg(test)]
+            fail_autocommit_commit_once: Cell::new(false),
+            #[cfg(test)]
+            fail_failed_commit_recovery_reload_once: Cell::new(false),
             #[cfg(test)]
             fail_alter_drop_after_storage_once: Cell::new(false),
             // Cx capability context (bd-2g5.6)
@@ -59405,6 +59419,46 @@ impl Connection {
         }
     }
 
+    /// bd-q1b7z: once a commit attempt has failed and its transaction has been
+    /// rolled back, replace the statement's connection-local effects with
+    /// committed state. Those effects are schema objects, an eagerly bumped
+    /// schema cookie, and mirror rows.
+    ///
+    /// When that can't happen now, because the pager rollback or the reload
+    /// failed, arm the reload for the next statement boundary instead of
+    /// keeping uncommitted state. Otherwise a retried statement meets its own
+    /// rolled-back object: "index ... already exists", or "no such index" on
+    /// the next DROP.
+    async fn recover_connection_state_after_failed_commit(
+        &self,
+        cx: &Cx,
+        txn_had_pending_writes: bool,
+        rollback_succeeded: bool,
+    ) -> Result<()> {
+        if !txn_had_pending_writes {
+            return Ok(());
+        }
+        if rollback_succeeded {
+            #[cfg(test)]
+            let reload = if self.fail_failed_commit_recovery_reload_once.replace(false) {
+                Err(FrankenError::Busy)
+            } else {
+                self.reload_memdb_from_pager(cx).await
+            };
+            #[cfg(not(test))]
+            let reload = self.reload_memdb_from_pager(cx).await;
+            if reload.is_ok() {
+                return Ok(());
+            }
+            self.discard_cached_vdbe_engine();
+            self.memdb_requires_active_txn_reload.set(true);
+            return reload;
+        }
+        self.discard_cached_vdbe_engine();
+        self.memdb_requires_active_txn_reload.set(true);
+        Ok(())
+    }
+
     /// Finalize an implicit (autocommit) transaction: commit on success,
     /// rollback on error.  No-op when `was_auto` is `false`.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -59554,9 +59608,12 @@ impl Connection {
             self.end_concurrent_rowid_session();
             self.txn_metrics_mark_finished();
             self.clear_prepared_direct_insert_append_hint();
-            if txn_has_pending_writes && rollback_succeeded {
-                self.reload_memdb_from_pager(cx).await?;
-            }
+            self.recover_connection_state_after_failed_commit(
+                cx,
+                txn_has_pending_writes,
+                rollback_succeeded,
+            )
+            .await?;
             vtab_rollback_result?;
             registry_rollback_result?;
             // bd-hjkbr.1: Record pre-txn time on vtab-sync-failure path
@@ -59621,7 +59678,9 @@ impl Connection {
             } else {
                 None
             };
-        let (txn_result, committed_write, rolled_back_dirty_state) = if ok {
+        // `failed_commit_rollback`: Some(rollback succeeded) when a transaction
+        // with pending writes was rolled back instead of committed.
+        let (txn_result, committed_write, failed_commit_rollback) = if ok {
             let concurrent_plan = if let Some(registry) = commit_registry_guard.as_mut() {
                 let planned = if is_concurrent_txn {
                     self.plan_concurrent_commit_with_registry(
@@ -59657,9 +59716,12 @@ impl Connection {
                         self.end_concurrent_rowid_session();
                         self.txn_metrics_mark_finished();
                         self.clear_prepared_direct_insert_append_hint();
-                        if txn_has_pending_writes && rollback_succeeded {
-                            self.reload_memdb_from_pager(cx).await?;
-                        }
+                        self.recover_connection_state_after_failed_commit(
+                            cx,
+                            txn_has_pending_writes,
+                            rollback_succeeded,
+                        )
+                        .await?;
                         vtab_rollback_result?;
                         registry_rollback_result?;
                         // bd-hjkbr.1: Record pre-txn time on concurrent-plan-failure
@@ -59906,7 +59968,15 @@ impl Connection {
             }
 
             let commit_txn_roundtrip_start = hot_path_profile_enabled().then(Instant::now);
-            match txn.commit(cx).await {
+            #[cfg(test)]
+            let commit_result = if self.fail_autocommit_commit_once.replace(false) {
+                Err(FrankenError::Busy)
+            } else {
+                txn.commit(cx).await
+            };
+            #[cfg(not(test))]
+            let commit_result = txn.commit(cx).await;
+            match commit_result {
                 Ok(()) => {
                     // End of the under-lock physical write phase. Publication
                     // follows while this same guard remains held.
@@ -59987,7 +60057,7 @@ impl Connection {
                         }
                     }
                     drop(commit_registry_guard.take());
-                    (Ok(()), txn_has_pending_writes, false)
+                    (Ok(()), txn_has_pending_writes, None)
                 }
                 Err(e) => {
                     record_hot_path_duration(
@@ -60021,7 +60091,7 @@ impl Connection {
                             Err(rollback_error) => Err(rollback_error),
                         },
                         false,
-                        txn_has_pending_writes && rollback_succeeded,
+                        txn_has_pending_writes.then_some(rollback_succeeded),
                     )
                 }
             }
@@ -60044,7 +60114,7 @@ impl Connection {
                     Err(rollback_error) => Err(rollback_error),
                 },
                 false,
-                txn_has_pending_writes && rollback_succeeded,
+                txn_has_pending_writes.then_some(rollback_succeeded),
             )
         };
 
@@ -60062,9 +60132,10 @@ impl Connection {
         if retained_autocommit_flush_boundary {
             self.finish_retained_autocommit_count_sum_cache_flush(txn_result.is_ok());
         }
-        if rolled_back_dirty_state {
+        if let Some(rollback_succeeded) = failed_commit_rollback {
             self.discard_cached_vdbe_engine();
-            self.reload_memdb_from_pager(cx).await?;
+            self.recover_connection_state_after_failed_commit(cx, true, rollback_succeeded)
+                .await?;
         }
 
         txn_result?;
@@ -183780,6 +183851,67 @@ mod tests {
                 .collect::<Vec<_>>();
             assert!(leftovers.is_empty(), "{leftovers:?}");
         });
+    }
+
+    /// bd-q1b7z: when an autocommit DDL's commit fails, the connection must
+    /// not keep the uncommitted schema object. That holds even when the
+    /// reload that recovers connection state fails too. A retried CREATE
+    /// then succeeds instead of reporting "index ... already exists".
+    #[test]
+    fn test_failed_autocommit_ddl_commit_keeps_no_uncommitted_schema_object() {
+        for fail_recovery_reload in [false, true] {
+            asupersync::test_utils::run_test(|| async move {
+                let _serial = super::fsqlite_core_test_serializer();
+                let dir = tempfile::tempdir().unwrap();
+                let db_path = dir.path().join("q1b7z-failed-ddl-commit.db");
+                let db_path_text = db_path.to_string_lossy().into_owned();
+                let conn = Connection::open(&db_path_text).await.unwrap();
+                conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);")
+                    .await
+                    .unwrap();
+                conn.execute("INSERT INTO t(v) VALUES ('a'), ('b');")
+                    .await
+                    .unwrap();
+
+                conn.fail_autocommit_commit_once.set(true);
+                conn.fail_failed_commit_recovery_reload_once
+                    .set(fail_recovery_reload);
+                // The connection's own busy retry may re-run the statement;
+                // a caller retries a transient error once more. Neither retry
+                // may meet the rolled-back index.
+                match conn.execute("CREATE INDEX probe ON t(v, id);").await {
+                    Ok(_) => {}
+                    Err(error) if error.is_transient() => {
+                        conn.execute("CREATE INDEX probe ON t(v, id);")
+                            .await
+                            .unwrap_or_else(|error| {
+                                panic!(
+                                    "retry (recovery reload fails: {fail_recovery_reload}): {error}"
+                                )
+                            });
+                    }
+                    Err(error) => {
+                        panic!("recovery reload fails: {fail_recovery_reload}: {error}")
+                    }
+                }
+                conn.execute("INSERT INTO t(v) VALUES ('c');").await.unwrap();
+                drop(conn);
+
+                let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+                let integrity: String = sqlite
+                    .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(integrity, "ok");
+                let indexes: i64 = sqlite
+                    .query_row(
+                        "SELECT count(*) FROM sqlite_master WHERE type = 'index';",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(indexes, 1);
+            });
+        }
     }
 
     #[test]
