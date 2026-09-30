@@ -82,6 +82,7 @@ impl VirtualTable for GenerateSeriesTable {
             done: true,
             scan_end: 0,
             scan_step: 1,
+            rows_until_checkpoint: 0,
         })
     }
 }
@@ -97,6 +98,10 @@ pub struct GenerateSeriesCursor {
     scan_end: i64,
     // Reversing i64::MIN needs the positive stride 2^63.
     scan_step: i128,
+    // Rows to produce before the next cancellation checkpoint. A checkpoint
+    // reads the clock and takes a lock, so it runs once per batch of rows
+    // rather than on every row; 0 means "check on the next row".
+    rows_until_checkpoint: u16,
 }
 
 impl GenerateSeriesCursor {

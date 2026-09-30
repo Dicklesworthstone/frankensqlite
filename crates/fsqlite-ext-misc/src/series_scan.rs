@@ -170,6 +170,7 @@ pub fn filter(
 ) -> Result<()> {
     // An unsuccessful re-filter must not leave the preceding row visible.
     cursor.done = true;
+    cursor.rows_until_checkpoint = 0;
     cx.checkpoint().map_err(|_| FrankenError::Interrupt)?;
     if index == 0 && name.is_none() {
         if args.is_empty() {
@@ -350,13 +351,20 @@ fn intersect_sequence(
 }
 
 pub fn next(cursor: &mut GenerateSeriesCursor, cx: &Cx) -> Result<()> {
+    /// Rows between cancellation checkpoints: frequent enough that an
+    /// interrupt still stops a large series promptly.
+    const ROWS_PER_CHECKPOINT: u16 = 256;
     if cursor.done {
         return Ok(());
     }
-    if cx.checkpoint().is_err() {
-        cursor.done = true;
-        return Err(FrankenError::Interrupt);
+    if cursor.rows_until_checkpoint == 0 {
+        if cx.checkpoint().is_err() {
+            cursor.done = true;
+            return Err(FrankenError::Interrupt);
+        }
+        cursor.rows_until_checkpoint = ROWS_PER_CHECKPOINT;
     }
+    cursor.rows_until_checkpoint -= 1;
     let next = i128::from(cursor.current) + cursor.scan_step;
     match i64::try_from(next) {
         Ok(value) => {
