@@ -11156,7 +11156,62 @@ enum SingleJoinLookupTarget<'a> {
 struct SingleJoinLookupPlan<'a> {
     join_kind: fsqlite_ast::JoinKind,
     probe_source: SortKeySource,
+    /// A key expression over the left table (`t.id = u.id * 17`), evaluated
+    /// per left row in place of `probe_source`.
+    probe_expr: Option<&'a Expr>,
+    /// For an expression probe into an index: the indexed column's affinity,
+    /// which SQLite applies to an affinity-less operand before comparing.
+    probe_affinity: Option<char>,
     lookup_target: SingleJoinLookupTarget<'a>,
+}
+
+/// Whether `expr` is a join key computed from `table`'s columns and literals
+/// using only arithmetic or concatenation. Those operators carry no affinity
+/// or collation, so SQLite compares the result under the lookup column's
+/// rules. A column name that also exists in `other` is refused, because an
+/// unqualified reference to it is ambiguous.
+fn is_join_key_expr_over(
+    expr: &Expr,
+    table: &TableSchema,
+    alias: Option<&str>,
+    other: &TableSchema,
+    other_alias: Option<&str>,
+) -> bool {
+    let operand = |expr: &Expr| match expr {
+        Expr::Literal(..) => true,
+        Expr::Column(col_ref, _) => {
+            resolve_column_ref(expr, table, alias).is_some()
+                && (col_ref.table.is_some() || other.column_index(&col_ref.column).is_none())
+                && resolve_column_ref(expr, other, other_alias).is_none()
+        }
+        _ => is_join_key_expr_over(expr, table, alias, other, other_alias),
+    };
+    match expr {
+        Expr::BinaryOp {
+            left, op, right, ..
+        } => {
+            matches!(
+                op,
+                fsqlite_ast::BinaryOp::Add
+                    | fsqlite_ast::BinaryOp::Subtract
+                    | fsqlite_ast::BinaryOp::Multiply
+                    | fsqlite_ast::BinaryOp::Divide
+                    | fsqlite_ast::BinaryOp::Modulo
+                    | fsqlite_ast::BinaryOp::Concat
+                    | fsqlite_ast::BinaryOp::BitAnd
+                    | fsqlite_ast::BinaryOp::BitOr
+                    | fsqlite_ast::BinaryOp::ShiftLeft
+                    | fsqlite_ast::BinaryOp::ShiftRight
+            ) && operand(left)
+                && operand(right)
+        }
+        Expr::UnaryOp {
+            op: fsqlite_ast::UnaryOp::Negate | fsqlite_ast::UnaryOp::BitNot,
+            expr,
+            ..
+        } => operand(expr),
+        _ => false,
+    }
 }
 
 fn resolve_single_join_lookup_plan<'a>(
@@ -11184,6 +11239,7 @@ fn resolve_single_join_lookup_plan<'a>(
         return None;
     };
 
+    let mut probe_expr = None;
     let (probe_source, lookup_source) = if let (Some(left_probe), Some(right_lookup)) = (
         resolve_column_ref(left, left_table, left_alias),
         resolve_column_ref(right, right_table, right_alias),
@@ -11194,13 +11250,33 @@ fn resolve_single_join_lookup_plan<'a>(
         resolve_column_ref(right, left_table, left_alias),
     ) {
         (right_probe, left_lookup)
+    } else if let Some((lookup, key)) = [(left.as_ref(), right.as_ref()), (right.as_ref(), left.as_ref())]
+        .into_iter()
+        .find_map(|(column, key)| {
+            // The lookup side must be a bare right-table column: a COLLATE
+            // wrapper would change the comparison the seek has to honor.
+            if !matches!(column, Expr::Column(..)) {
+                return None;
+            }
+            let lookup = resolve_column_ref(column, right_table, right_alias)?;
+            is_join_key_expr_over(key, left_table, left_alias, right_table, right_alias)
+                .then_some((lookup, key))
+        })
+    {
+        // Expression key (`t.id = u.id * 17`): evaluated per left row.
+        probe_expr = Some(key);
+        (SortKeySource::Rowid, lookup)
     } else {
         return None;
     };
 
+    let mut probe_affinity = None;
     let lookup_target = match lookup_source {
         SortKeySource::Rowid => SingleJoinLookupTarget::Rowid,
         SortKeySource::Column(col_idx) => {
+            if probe_expr.is_some() {
+                probe_affinity = Some(right_table.columns.get(col_idx)?.affinity);
+            }
             let column_name = &right_table.columns.get(col_idx)?.name;
             let comparison_tables = [(left_table, left_alias), (right_table, right_alias)];
             let comparison_collation =
@@ -11218,6 +11294,8 @@ fn resolve_single_join_lookup_plan<'a>(
     Some(SingleJoinLookupPlan {
         join_kind,
         probe_source,
+        probe_expr,
+        probe_affinity,
         lookup_target,
     })
 }
@@ -11443,16 +11521,25 @@ fn codegen_single_join_lookup_select(
     match &plan.lookup_target {
         SingleJoinLookupTarget::Rowid => {
             let probe_reg = b.alloc_reg();
-            emit_join_probe_source(
-                b,
-                left_cursor,
-                left_table,
-                left_alias,
-                &plan.probe_source,
-                probe_reg,
-            );
+            if let Some(key) = plan.probe_expr {
+                emit_join_expr(b, key, probe_reg, &tables, ctx)?;
+            } else {
+                emit_join_probe_source(
+                    b,
+                    left_cursor,
+                    left_table,
+                    left_alias,
+                    &plan.probe_source,
+                    probe_reg,
+                );
+            }
             let no_match = b.emit_label();
             b.emit_jump_to_label(Opcode::IsNull, probe_reg, 0, no_match, P4::None, 0);
+            if plan.probe_expr.is_some() {
+                // A computed key must name a rowid exactly: 2.5 or 'abc' matches
+                // nothing rather than a truncated rowid, as in SQLite's seek.
+                b.emit_jump_to_label(Opcode::MustBeInt, probe_reg, 0, no_match, P4::None, 0);
+            }
             b.emit_jump_to_label(
                 Opcode::SeekRowid,
                 right_cursor,
@@ -11480,14 +11567,30 @@ fn codegen_single_join_lookup_select(
             let probe_reg = probe_base;
             let min_rowid_reg = probe_base + 1;
             let comparison_p4 = direct_lookup_index_comparison_p4(_index);
-            emit_join_probe_source(
-                b,
-                left_cursor,
-                left_table,
-                left_alias,
-                &plan.probe_source,
-                probe_reg,
-            );
+            if let Some(key) = plan.probe_expr {
+                emit_join_expr(b, key, probe_reg, &tables, ctx)?;
+                if let Some(affinity) = plan.probe_affinity {
+                    // SQLite applies the indexed column's affinity to an
+                    // affinity-less key before comparing.
+                    b.emit_op(
+                        Opcode::Affinity,
+                        probe_reg,
+                        1,
+                        0,
+                        P4::Affinity(affinity.to_string()),
+                        0,
+                    );
+                }
+            } else {
+                emit_join_probe_source(
+                    b,
+                    left_cursor,
+                    left_table,
+                    left_alias,
+                    &plan.probe_source,
+                    probe_reg,
+                );
+            }
             let no_match = b.emit_label();
             let duplicate_run_done = b.emit_label();
             b.emit_jump_to_label(Opcode::IsNull, probe_reg, 0, no_match, P4::None, 0);

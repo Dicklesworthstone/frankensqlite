@@ -93822,6 +93822,12 @@ impl Connection {
                 .collect()
         };
 
+        let from_joins_are_all_inner = from.joins.iter().all(|join| {
+            matches!(
+                join.join_type.kind,
+                fsqlite_ast::JoinKind::Inner | fsqlite_ast::JoinKind::Cross
+            )
+        });
         for (join_idx, join) in from.joins.iter().enumerate() {
             if keyset_stream_active {
                 // GH#386: join already applied by the streaming keyset lane.
@@ -93869,6 +93875,29 @@ impl Connection {
                 }
             } else {
                 join.constraint.as_ref()
+            };
+            // An implicit join's equality lives in the WHERE. With only inner
+            // and cross joins in the FROM, copy the equalities that link this
+            // step's two sides into its ON so the hash join can use them.
+            let where_equi_constraint;
+            let effective_constraint = match (effective_constraint, effective_where_clause_for_eval)
+            {
+                (None | Some(JoinConstraint::On(_)), Some(where_expr))
+                    if from_joins_are_all_inner && !lateral_tvf[join_idx + 1] =>
+                {
+                    let mut terms =
+                        where_equi_terms_for_join_step(where_expr, &col_map, current_width, right_width);
+                    if terms.is_empty() {
+                        effective_constraint
+                    } else {
+                        if let Some(JoinConstraint::On(on_expr)) = effective_constraint {
+                            terms.insert(0, on_expr.clone());
+                        }
+                        where_equi_constraint = rebuild_and_terms(terms).map(JoinConstraint::On);
+                        where_equi_constraint.as_ref()
+                    }
+                }
+                (constraint, _) => constraint,
             };
 
             // bd-tfwym: a lateral table-valued function (its argument reads a
@@ -104914,8 +104943,9 @@ fn join_on_expr_has_hash_equi_conjunct(expr: &Expr) -> bool {
             right,
             ..
         } => {
-            matches!(left.as_ref(), Expr::Column(_, _))
-                && matches!(right.as_ref(), Expr::Column(_, _))
+            let is_column = |expr: &Expr| matches!(expr, Expr::Column(_, _));
+            (is_column(left) && (is_column(right) || is_syntactic_join_key_expr(right)))
+                || (is_column(right) && is_syntactic_join_key_expr(left))
         }
         Expr::BinaryOp {
             left,
@@ -104925,6 +104955,41 @@ fn join_on_expr_has_hash_equi_conjunct(expr: &Expr) -> bool {
         } => {
             join_on_expr_has_hash_equi_conjunct(left) || join_on_expr_has_hash_equi_conjunct(right)
         }
+        _ => false,
+    }
+}
+
+/// The syntactic shape `try_expression_keyed_join` can hash: arithmetic or
+/// concatenation over columns and literals, for example `u.id * 17`. Which
+/// side each column belongs to is checked when the join runs.
+fn is_syntactic_join_key_expr(expr: &Expr) -> bool {
+    let operand = |expr: &Expr| {
+        matches!(expr, Expr::Column(_, _) | Expr::Literal(..)) || is_syntactic_join_key_expr(expr)
+    };
+    match expr {
+        Expr::BinaryOp {
+            left, op, right, ..
+        } => {
+            matches!(
+                op,
+                BinaryOp::Add
+                    | BinaryOp::Subtract
+                    | BinaryOp::Multiply
+                    | BinaryOp::Divide
+                    | BinaryOp::Modulo
+                    | BinaryOp::Concat
+                    | BinaryOp::BitAnd
+                    | BinaryOp::BitOr
+                    | BinaryOp::ShiftLeft
+                    | BinaryOp::ShiftRight
+            ) && operand(left)
+                && operand(right)
+        }
+        Expr::UnaryOp {
+            op: UnaryOp::Negate | UnaryOp::BitNot,
+            expr,
+            ..
+        } => operand(expr),
         _ => false,
     }
 }
@@ -147529,13 +147594,16 @@ fn current_join_eval_collation_context_snapshot() -> Option<Arc<JoinEvalCollatio
 }
 
 fn current_join_using_column_projection(column_name: &str) -> Option<JoinUsingProjection> {
-    with_current_join_eval_collation_context(|context| {
-        context.and_then(|context| {
-            context
-                .using_column_projections
-                .get(&column_name.to_ascii_lowercase())
-                .cloned()
-        })
+    // Evaluated for every unqualified column reference on every row. Borrow
+    // the current context in place (nothing here re-enters the stack), and
+    // skip the case-folding allocation when the join has no USING columns.
+    CURRENT_JOIN_EVAL_COLLATION_CONTEXT.with(|stack| {
+        let stack = stack.borrow();
+        let projections = &stack.last()?.using_column_projections;
+        if projections.is_empty() {
+            return None;
+        }
+        projections.get(&column_name.to_ascii_lowercase()).cloned()
     })
 }
 
@@ -148489,6 +148557,49 @@ fn try_extract_equi_join_pair(
     }
 }
 
+/// WHERE conjuncts `a = b` in which one column belongs to the tables joined so
+/// far (`..left_width`) and the other to the table this join step adds
+/// (`left_width..left_width + right_width`).
+///
+/// In a FROM clause made only of inner and cross joins, the same equality
+/// holds in the step's ON condition as in the WHERE. Adding it there lets an
+/// implicit join (`FROM a, b WHERE a.x = b.y`) take the hash-join path
+/// instead of building the full cross product and filtering it. The WHERE
+/// still runs over the joined rows, so the result is unchanged.
+fn where_equi_terms_for_join_step(
+    where_expr: &Expr,
+    col_map: &[(String, String, bool)],
+    left_width: usize,
+    right_width: usize,
+) -> Vec<Expr> {
+    let right_range = left_width..left_width + right_width;
+    let mut terms = Vec::new();
+    flatten_and_terms(where_expr, &mut terms);
+    terms
+        .into_iter()
+        .filter(|term| {
+            let Expr::BinaryOp {
+                left,
+                op: BinaryOp::Eq,
+                right,
+                ..
+            } = term
+            else {
+                return false;
+            };
+            let (Some(a), Some(b)) = (
+                resolve_hash_join_column_index(left, col_map),
+                resolve_hash_join_column_index(right, col_map),
+            ) else {
+                return false;
+            };
+            (a < left_width && right_range.contains(&b))
+                || (b < left_width && right_range.contains(&a))
+        })
+        .cloned()
+        .collect()
+}
+
 /// Try to extract equi-join column index pairs from an ON expression.
 /// Returns `Some(pairs)` only when every conjunct is a cross-side equality.
 fn try_extract_equi_join_indices(
@@ -149102,6 +149213,19 @@ fn execute_single_join(
             col_map,
         );
     }
+    if let Some(JoinConstraint::On(expr)) = constraint
+        && let Some(joined) = try_expression_keyed_join(
+            left,
+            right,
+            right_width,
+            left_width,
+            kind,
+            expr,
+            col_map,
+        )
+    {
+        return joined;
+    }
     if let Some(JoinConstraint::Using(cols)) = constraint {
         let mut equi_pairs = Vec::with_capacity(cols.len());
         let mut all_found = true;
@@ -149235,6 +149359,189 @@ fn execute_single_join(
     }
 
     Ok(result)
+}
+
+/// Whether `expr` computes a value from left-side columns (`..left_width`)
+/// and literals using only operators that carry no affinity or collation of
+/// their own. A bare column, `+x` and CAST keep an operand's affinity or
+/// collation, and a function call may be overridden or non-deterministic, so
+/// all of those are refused.
+fn is_left_only_affinityless_key_expr(
+    expr: &Expr,
+    col_map: &[(String, String, bool)],
+    left_width: usize,
+) -> bool {
+    fn operand(expr: &Expr, col_map: &[(String, String, bool)], left_width: usize) -> bool {
+        match expr {
+            Expr::Literal(..) => true,
+            Expr::Column(..) => {
+                resolve_hash_join_column_index(expr, col_map).is_some_and(|index| index < left_width)
+            }
+            _ => is_left_only_affinityless_key_expr(expr, col_map, left_width),
+        }
+    }
+    match expr {
+        Expr::BinaryOp {
+            left, op, right, ..
+        } => {
+            matches!(
+                op,
+                BinaryOp::Add
+                    | BinaryOp::Subtract
+                    | BinaryOp::Multiply
+                    | BinaryOp::Divide
+                    | BinaryOp::Modulo
+                    | BinaryOp::Concat
+                    | BinaryOp::BitAnd
+                    | BinaryOp::BitOr
+                    | BinaryOp::ShiftLeft
+                    | BinaryOp::ShiftRight
+            ) && operand(left, col_map, left_width)
+                && operand(right, col_map, left_width)
+        }
+        Expr::UnaryOp {
+            op: UnaryOp::Negate | UnaryOp::BitNot,
+            expr,
+            ..
+        } => operand(expr, col_map, left_width),
+        _ => false,
+    }
+}
+
+/// An ON conjunct `right_col = <key expression over left columns>`, for
+/// example `t.id = u.id * 17`: the right column's index within the right
+/// row and the key expression.
+fn find_expression_keyed_join_term<'a>(
+    on_expr: &'a Expr,
+    col_map: &[(String, String, bool)],
+    left_width: usize,
+    right_width: usize,
+) -> Option<(usize, &'a Expr)> {
+    let right_range = left_width..left_width + right_width;
+    let mut terms = Vec::new();
+    flatten_and_terms(on_expr, &mut terms);
+    terms.into_iter().find_map(|term| {
+        let Expr::BinaryOp {
+            left,
+            op: BinaryOp::Eq,
+            right,
+            ..
+        } = term
+        else {
+            return None;
+        };
+        [(left.as_ref(), right.as_ref()), (right.as_ref(), left.as_ref())]
+            .into_iter()
+            .find_map(|(column, key)| {
+                let index = resolve_hash_join_column_index(column, col_map)?;
+                if right_range.contains(&index)
+                    && is_left_only_affinityless_key_expr(key, col_map, left_width)
+                {
+                    Some((index - left_width, key))
+                } else {
+                    None
+                }
+            })
+    })
+}
+
+/// Hash join for an ON equality between a right-side column and an
+/// expression over the left side, such as `t.id = u.id * 17`. The column
+/// path in [`plan_hash_join_predicate`] only pairs two columns, so this
+/// shape used to take the O(n*m) nested loop.
+///
+/// Right rows are hashed on the column, using the comparison affinity SQLite
+/// applies between that column and an affinity-less expression. Each left row
+/// computes its key once. Every candidate then goes through the full ON
+/// predicate, so the hash only has to avoid missing a match. Output keeps the
+/// nested loop's left-major, right-scan order. `None` falls back to the nested
+/// loop: that covers RIGHT/FULL joins, a non-BINARY right column, and any key
+/// evaluation error (the nested loop decides whether that error surfaces).
+fn try_expression_keyed_join(
+    left: &[Vec<SqliteValue>],
+    right: &[Vec<SqliteValue>],
+    right_width: usize,
+    left_width: usize,
+    kind: JoinKind,
+    on_expr: &Expr,
+    col_map: &[(String, String, bool)],
+) -> Option<Result<Vec<Vec<SqliteValue>>>> {
+    if !matches!(kind, JoinKind::Inner | JoinKind::Cross | JoinKind::Left)
+        || left.is_empty()
+        || right.is_empty()
+        || expr_has_any_subquery(on_expr)
+    {
+        return None;
+    }
+    let (right_idx, key_expr) =
+        find_expression_keyed_join_term(on_expr, col_map, left_width, right_width)?;
+    let mode = with_current_join_eval_collation_context(|context| {
+        let context = context?;
+        if context
+            .column_collations
+            .get(left_width + right_idx)
+            .is_none_or(Option::is_some)
+        {
+            return None;
+        }
+        let affinity = context.column_affinities.get(left_width + right_idx).copied()?;
+        Some(
+            match TypeAffinity::comparison_affinity(affinity, TypeAffinity::Blob) {
+                Some(TypeAffinity::Text) => HashJoinKeyMode::Text,
+                Some(TypeAffinity::Integer | TypeAffinity::Real | TypeAffinity::Numeric) => {
+                    HashJoinKeyMode::NumericCandidate
+                }
+                None | Some(TypeAffinity::Blob) => HashJoinKeyMode::Raw,
+            },
+        )
+    })?;
+    let pair = [HashJoinPair {
+        left_idx: 0,
+        right_idx,
+        mode,
+    }];
+
+    let mut buckets: HashMap<CanonicalHashJoinKey, Vec<usize>> = HashMap::new();
+    for (index, row) in right.iter().enumerate() {
+        if let Some(key) = build_canonical_hash_join_key(row, &pair, true) {
+            buckets.entry(key).or_default().push(index);
+        }
+    }
+
+    let combined_width = left_width + right_width;
+    let mut scratch: Vec<SqliteValue> = Vec::with_capacity(combined_width);
+    let mut result = Vec::new();
+    for left_row in left {
+        scratch.clear();
+        scratch.extend_from_slice(&left_row[..left_width]);
+        scratch.extend(std::iter::repeat_n(SqliteValue::Null, right_width));
+        let key_value = eval_join_expr(key_expr, &scratch, col_map).ok()?;
+        let key = build_canonical_hash_join_key(std::slice::from_ref(&key_value), &[HashJoinPair {
+            left_idx: 0,
+            right_idx: 0,
+            mode,
+        }], true);
+        let mut matched = false;
+        for &right_index in key.as_ref().and_then(|key| buckets.get(key)).into_iter().flatten() {
+            scratch.truncate(left_width);
+            scratch.extend_from_slice(&right[right_index][..right_width]);
+            match eval_join_predicate(on_expr, &scratch, col_map) {
+                Ok(true) => {
+                    matched = true;
+                    result.push(scratch.clone());
+                }
+                Ok(false) => {}
+                Err(error) => return Some(Err(error)),
+            }
+        }
+        if !matched && matches!(kind, JoinKind::Left) {
+            let mut combined = Vec::with_capacity(combined_width);
+            combined.extend_from_slice(&left_row[..left_width]);
+            combined.extend(std::iter::repeat_n(SqliteValue::Null, right_width));
+            result.push(combined);
+        }
+    }
+    Some(Ok(result))
 }
 
 fn flatten_and_terms<'a>(expr: &'a Expr, terms: &mut Vec<&'a Expr>) {
