@@ -8,6 +8,9 @@ const MAX_LEASE_MS = 86_400_000;
 const DEPENDENCIES_NAME = "__fsqlite_job_dependencies_v1";
 const DEPENDENCIES = `main."${DEPENDENCIES_NAME}"`;
 const MAX_DEPENDENCIES = 128;
+const WORKFLOWS_NAME = "__fsqlite_job_workflows_v1";
+const WORKFLOWS = `main."${WORKFLOWS_NAME}"`;
+const WORKFLOW_FORMAT = "fsqlite-job-workflow-v1";
 type Parameter = string | number | null;
 type SqlRow = Record<string, unknown>;
 
@@ -116,6 +119,15 @@ interface CapturedJob {
   readonly dependsOn: readonly Dependency[];
 }
 
+interface WorkflowReceipt {
+  readonly queue: string;
+  readonly workflowId: string;
+  readonly sha256: string;
+  readonly jobCount: number;
+  readonly dependencyCount: number;
+  readonly createdAt: number;
+}
+
 export class DurableJobError extends Error {
   constructor(
     readonly code: string,
@@ -195,6 +207,118 @@ export class DurableJobQueue {
     const jobs = captureJobBatch(input);
     const order = dependencyOrder(jobs);
     return this.#db.transaction(tx => this.#enqueueBatchIn(tx, jobs, order));
+  }
+
+  /**
+   * Publish business SQL and a complete graph under one retained workflow ID.
+   * First submission requires unused node identities; external parents may
+   * already exist. A matching retry verifies the retained graph and skips work.
+   * The callback value is not persisted. Use a stable ID for the SAME business
+   * operation: function bodies and external effects cannot be fingerprinted.
+   */
+  async enqueueWorkflow<T>(
+    workflowId: string,
+    input: readonly (EnqueueJob & { readonly queue: string })[],
+    work: (tx: DurableJobTransaction) => Promise<T>,
+  ): Promise<{
+    readonly replayed: boolean;
+    readonly receipt: WorkflowReceipt;
+    readonly value: T | undefined;
+  }> {
+    const queueName = this.name;
+    identifier(queueName, "workflow queue name");
+    identifier(workflowId, "workflow id");
+    if (typeof work !== "function") throw new TypeError("An application SQL callback is required");
+    const jobs = captureJobBatch(input);
+    const order = dependencyOrder(jobs);
+    // Only owned, validated fields enter the digest. Batch order is not identity;
+    // unspecified schedule is distinct from an explicitly supplied timestamp.
+    const canonical = [...jobs].sort((a, b) => a.queue < b.queue ? -1 : a.queue > b.queue ? 1
+      : a.id < b.id ? -1 : a.id > b.id ? 1 : 0).map(job => [job.queue, job.id,
+      job.payload, job.priority, job.availableAt ?? null, job.maxAttempts,
+      (job.dependsOn ?? []).map(parent => [parent.queue, parent.id])]);
+    const sha256 = await workflowHash([WORKFLOW_FORMAT, queueName, workflowId, canonical]);
+    const dependencyCount = jobs.reduce((count, job) => count + (job.dependsOn?.length ?? 0), 0);
+    return this.#db.transaction(async tx => {
+      await ensureDependencies(tx, false);
+      await ensureWorkflows(tx, true);
+      const prior = await readWorkflow(tx, queueName, workflowId);
+      if (prior !== null) {
+        if (prior.sha256 !== sha256 || prior.jobCount !== jobs.length || prior.dependencyCount !== dependencyCount)
+          throw new DurableJobError("ERR_FSQLITE_JOB_WORKFLOW_CONFLICT", "Workflow id already identifies a different graph");
+        // Never use enqueue/UPSERT here: a missing node is damaged evidence,
+        // not permission to recreate a job or rerun already-committed effects.
+        await this.#verifyWorkflowJobs(tx, jobs);
+        return Object.freeze({ replayed: true, receipt: prior, value: undefined });
+      }
+      for (const job of jobs) {
+        const rows = (await tx.query(`SELECT 1 FROM ${TABLE}
+          WHERE queue_name=? COLLATE BINARY AND job_id=? COLLATE BINARY LIMIT 1`, [job.queue, job.id])).rows;
+        if (rows.length)
+          throw new DurableJobError("ERR_FSQLITE_JOB_WORKFLOW_CONFLICT",
+            "A new workflow requires unused job identities; prior work was not adopted");
+      }
+      const createdAt = this.#now();
+      const inserted = await this.#enqueueBatchIn(tx, jobs, order);
+      if (inserted.some(result => !result.inserted))
+        throw new DurableJobError("ERR_FSQLITE_JOB_WORKFLOW_CONFLICT", "Workflow nodes were not all newly inserted");
+      const value = await runJobWork(tx, work);
+      // Business SQL cannot change the just-published graph or its authority.
+      // Validation and the publication receipt remain inside this SAME owner.
+      await ensureDependencies(tx, false);
+      await ensureWorkflows(tx, false);
+      await this.#verifyWorkflowJobs(tx, jobs, inserted);
+      const receipt = Object.freeze({ queue: queueName, workflowId, sha256,
+        jobCount: jobs.length, dependencyCount, createdAt });
+      const seal = await workflowSeal(receipt);
+      if (await tx.execute(`INSERT INTO ${WORKFLOWS} VALUES (?,?,?,?,?,?,?)`,
+        [queueName, workflowId, sha256, jobs.length, dependencyCount, createdAt, seal]) !== 1)
+        throw corrupt("Workflow publication receipt was not inserted");
+      const saved = await readWorkflow(tx, queueName, workflowId);
+      if (JSON.stringify(saved) !== JSON.stringify(receipt))
+        throw corrupt("Workflow publication receipt was not retained exactly");
+      return Object.freeze({ replayed: false, receipt, value });
+    });
+  }
+
+  /** Compare immutable input without returning retained payload/result bodies. */
+  async #verifyWorkflowJobs(
+    tx: DurableJobTransaction,
+    jobs: readonly (EnqueueJob & { readonly queue: string })[],
+    fresh?: readonly DurableEnqueueResult[],
+  ): Promise<void> {
+    for (let i = 0; i < jobs.length; i++) {
+      const job = jobs[i]!;
+      const params: Parameter[] = [job.queue, job.id, job.payload, job.priority!, job.maxAttempts!];
+      let extra = "";
+      if (job.availableAt !== undefined) {
+        extra += " AND scheduled_at=?";
+        params.push(job.availableAt);
+      }
+      if (fresh !== undefined) {
+        const original = fresh[i]!.job;
+        extra += " AND state='ready' AND attempts=0 AND lease_owner IS NULL AND lease_token IS NULL" +
+          " AND lease_expires_at IS NULL AND result IS NULL AND last_error IS NULL" +
+          " AND scheduled_at=? AND available_at=? AND created_at=? AND updated_at=?";
+        params.push(original.availableAt, original.availableAt, original.createdAt, original.updatedAt);
+      }
+      const rows = (await tx.query(`SELECT 1 AS valid FROM ${TABLE}
+        WHERE queue_name=? COLLATE BINARY AND job_id=? COLLATE BINARY
+          AND typeof(payload)='text' AND payload=? COLLATE BINARY
+          AND priority=? AND max_attempts=?
+          AND state IN ('ready','leased','completed','dead','cancelled')${extra} LIMIT 2`, params)).rows;
+      if (rows.length !== 1)
+        throw corrupt("A workflow job is missing or differs from its original publication");
+      const refs = await readDependencies(tx, job.queue, job.id);
+      if (JSON.stringify(refs) !== JSON.stringify(job.dependsOn ?? []))
+        throw corrupt("Workflow prerequisite evidence differs from its original publication");
+      for (const ref of refs) {
+        const parents = (await tx.query(`SELECT state FROM ${TABLE}
+          WHERE queue_name=? COLLATE BINARY AND job_id=? COLLATE BINARY LIMIT 2`, [ref.queue, ref.id])).rows;
+        if (parents.length !== 1) throw corrupt("A workflow prerequisite is missing");
+        jobState(parents[0]!);
+      }
+    }
   }
 
   /**
@@ -999,6 +1123,68 @@ async function ensureDependencies(tx: DurableJobTransaction, create = true): Pro
     r.name === o.name && r.sql === `CREATE ${o.kind} "${o.name}" ${o.body}`))) {
     throw new DurableJobError("ERR_FSQLITE_JOB_SCHEMA", "Job dependency storage is incomplete or incompatible; it was not repaired");
   }
+}
+
+async function workflowHash(value: unknown): Promise<string> {
+  if (!globalThis.crypto?.subtle) throw new TypeError("Workflow receipts require Web Crypto SHA-256");
+  const bytes = new TextEncoder().encode(JSON.stringify(value));
+  const hash = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+  return Array.from(hash, byte => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function workflowSeal(receipt: WorkflowReceipt): Promise<string> {
+  return workflowHash([WORKFLOW_FORMAT, "receipt", receipt.queue, receipt.workflowId,
+    receipt.sha256, receipt.jobCount, receipt.dependencyCount, receipt.createdAt]);
+}
+
+/** Receipts are permanent publication identities, not a workflow status table. */
+async function ensureWorkflows(tx: DurableJobTransaction, create: boolean): Promise<void> {
+  const objects = [
+    { kind: "TABLE", name: WORKFLOWS_NAME,
+      body: "(queue_name TEXT NOT NULL COLLATE BINARY, workflow_id TEXT NOT NULL COLLATE BINARY, sha256 TEXT NOT NULL, job_count INTEGER NOT NULL, dependency_count INTEGER NOT NULL, created_at INTEGER NOT NULL, seal TEXT NOT NULL, PRIMARY KEY(queue_name,workflow_id)) WITHOUT ROWID" },
+    { kind: "TRIGGER", name: "__fsqlite_job_workflows_update_v1",
+      body: `BEFORE UPDATE ON "${WORKFLOWS_NAME}" BEGIN SELECT RAISE(ABORT,'Workflow receipts are immutable'); END` },
+    { kind: "TRIGGER", name: "__fsqlite_job_workflows_delete_v1",
+      body: `BEFORE DELETE ON "${WORKFLOWS_NAME}" BEGIN SELECT RAISE(ABORT,'Workflow receipts are immutable'); END` },
+  ];
+  const read = async () => (await tx.query(`SELECT name,
+    CASE WHEN length(CAST(sql AS BLOB))<=16384 THEN sql END AS sql
+    FROM main.sqlite_schema WHERE name COLLATE NOCASE IN (?,?,?)
+      OR (type='trigger' AND tbl_name=? COLLATE NOCASE)`,
+    [...objects.map(object => object.name), WORKFLOWS_NAME])).rows;
+  let rows = await read();
+  if (!rows.length && create) {
+    for (const object of objects)
+      await tx.execute(`CREATE ${object.kind} main."${object.name}" ${object.body}`);
+    rows = await read();
+  }
+  const temporary = (await tx.query("SELECT 1 FROM temp.sqlite_schema WHERE type='trigger' AND tbl_name=? COLLATE NOCASE LIMIT 1",
+    [WORKFLOWS_NAME])).rows;
+  if (temporary.length || rows.length !== objects.length || objects.some(object => !rows.some(row =>
+    row.name === object.name && row.sql === `CREATE ${object.kind} "${object.name}" ${object.body}`)))
+    throw new DurableJobError("ERR_FSQLITE_JOB_SCHEMA", "Workflow receipt storage is incomplete or incompatible; it was not repaired");
+}
+
+async function readWorkflow(tx: DurableJobTransaction, queue: string, workflowId: string): Promise<WorkflowReceipt | null> {
+  const hashColumn = (column: "sha256" | "seal") =>
+    `CASE WHEN typeof(${column})='text' AND length(CAST(${column} AS BLOB))<=128 THEN ${column} END AS ${column}`;
+  const rows = (await tx.query(`SELECT ${hashColumn("sha256")},${hashColumn("seal")},
+    CASE WHEN typeof(job_count)='integer' THEN job_count END AS job_count,
+    CASE WHEN typeof(dependency_count)='integer' THEN dependency_count END AS dependency_count,
+    CASE WHEN typeof(created_at)='integer' THEN created_at END AS created_at
+    FROM ${WORKFLOWS} WHERE queue_name=? COLLATE BINARY AND workflow_id=? COLLATE BINARY LIMIT 2`,
+    [queue, workflowId])).rows;
+  if (!rows.length) return null;
+  if (rows.length !== 1) throw corrupt("Ambiguous workflow receipt");
+  const row = rows[0]!, sha256 = string(row, "sha256"), seal = string(row, "seal");
+  const jobCount = number(row, "job_count"), dependencyCount = number(row, "dependency_count");
+  const createdAt = number(row, "created_at");
+  if (!/^[0-9a-f]{64}$/.test(sha256) || !/^[0-9a-f]{64}$/.test(seal) ||
+      jobCount < 1 || jobCount > 128 || dependencyCount < 0 || dependencyCount > 1024 || createdAt < 0)
+    throw corrupt("Invalid workflow receipt");
+  const receipt = Object.freeze({ queue, workflowId, sha256, jobCount, dependencyCount, createdAt });
+  if (await workflowSeal(receipt) !== seal) throw corrupt("Workflow receipt checksum mismatch");
+  return receipt;
 }
 
 function identifier(value: string, label: string): void {
