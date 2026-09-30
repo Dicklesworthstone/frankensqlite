@@ -41182,11 +41182,22 @@ impl Connection {
         //     (self-modifying query like INSERT INTO t SELECT FROM t).
         //     Chunking would cause each batch's SELECT to see rows inserted
         //     by prior batches, producing incorrect results.
-        if select_stmt.limit.is_some() || insert.with.is_some() || {
-            let target = &insert.table.name;
-            let sources = Self::extract_table_names_from_select(select_stmt);
-            sources.iter().any(|s| s.eq_ignore_ascii_case(target))
-        } {
+        //  4. The SELECT reads only table-valued functions (GH#438). Each
+        //     chunk would re-run the function from its first row and
+        //     materialize every row up to its OFFSET before discarding them.
+        //     That is quadratic in the row count:
+        //     `generate_series(1, 1000000)` took about five minutes. The
+        //     rows are generated, not read from a large table, so they are
+        //     computed once here.
+        if select_stmt.limit.is_some()
+            || insert.with.is_some()
+            || {
+                let target = &insert.table.name;
+                let sources = Self::extract_table_names_from_select(select_stmt);
+                sources.iter().any(|s| s.eq_ignore_ascii_case(target))
+            }
+            || select_reads_only_table_functions(select_stmt)
+        {
             let source_rows = self
                 .materialize_insert_select_source_rows(insert, select_stmt, params)
                 .await?;
@@ -102186,6 +102197,23 @@ fn expr_has_nested_aggregate(expr: &Expr) -> bool {
 /// selects, VALUES, aggregates/GROUP BY/HAVING (an aggregate always yields one
 /// row), window functions, result aliases (WHERE may reference them), and
 /// DISTINCT under a LIMIT (the distinct count then decides existence).
+/// GH#438: whether every row source in the SELECT's FROM is a table-valued
+/// function, with no base table, view or subquery.
+fn select_reads_only_table_functions(select: &SelectStatement) -> bool {
+    if !select.body.compounds.is_empty() {
+        return false;
+    }
+    let SelectCore::Select {
+        from: Some(from), ..
+    } = &select.body.select
+    else {
+        return false;
+    };
+    let is_table_function =
+        |source: &TableOrSubquery| matches!(source, TableOrSubquery::TableFunction { .. });
+    is_table_function(&from.source) && from.joins.iter().all(|join| is_table_function(&join.table))
+}
+
 fn strip_exists_subquery_projection(select: &mut SelectStatement) {
     if !select.body.compounds.is_empty() {
         return;
