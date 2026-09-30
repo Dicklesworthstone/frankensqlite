@@ -74214,17 +74214,14 @@ impl Connection {
                 ),
             });
         }
-        if with_alias_valid
-            && (!without_alias_valid || matches!(value_at_alias_position, SqliteValue::Null))
-        {
-            // C SQLite short rows use a NULL placeholder for the rowid alias.
-            // If both alignments remain plausible, keep that canonical
-            // interpretation.
+        // The slot holds NULL or this row's own rowid, which is how SQLite's
+        // format stores the alias; older FrankenSQLite wrote the rowid there.
+        // After ALTER TABLE ADD COLUMN such rows are one column short, so
+        // prefer the SQLite alignment whenever it satisfies NOT NULL. The
+        // legacy omitted-slot layout is taken only when SQLite's is invalid.
+        if with_alias_valid {
             Ok(with_alias)
         } else {
-            // A shifted user integer can coincidentally equal the rowid. When
-            // both alignments are otherwise plausible, preserve the
-            // FrankenSQLite legacy omitted-alias interpretation.
             Ok(without_alias)
         }
     }
@@ -221302,6 +221299,48 @@ fts5(title, body, content=docs, content_rowid=id)'
     }
 
     #[test]
+    fn test_rowid_alias_inflater_reads_own_rowid_in_short_row_slot_as_present() {
+        let column =
+            |name: &str, affinity: char, is_ipk: bool| ColumnInfo::basic(name, affinity, is_ipk);
+        let table = TableSchema {
+            name: "t".to_owned(),
+            root_page: 2,
+            columns: vec![
+                column("id", 'D', true),
+                column("source_id", 'D', false),
+                column("locality", 'B', false),
+                column("session", 'B', false),
+            ],
+            indexes: Vec::new(),
+            strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+        };
+        // FrankenSQLite 0.3.x stored the rowid in the slot; after ADD COLUMN
+        // the row is one short and SQLite still reads the slot as present.
+        let payload_values = [
+            SqliteValue::Integer(1),
+            SqliteValue::Integer(7),
+            SqliteValue::Text("local".into()),
+        ];
+
+        let values = Connection::inflate_table_row_values_for_storage_reload_for_test(
+            &table,
+            1,
+            &payload_values,
+            Some(0),
+        )
+        .unwrap();
+
+        assert_eq!(values[0], SqliteValue::Integer(1));
+        assert_eq!(values[1], SqliteValue::Integer(7));
+        assert_eq!(values[2], SqliteValue::Text("local".into()));
+        assert_eq!(values[3], SqliteValue::Null);
+    }
+
+    #[test]
     fn test_rowid_alias_inflater_keeps_shifted_integer_payload_column_alignment() {
         let column =
             |name: &str, affinity: char, is_ipk: bool| ColumnInfo::basic(name, affinity, is_ipk);
@@ -221321,8 +221360,10 @@ fts5(title, body, content=docs, content_rowid=id)'
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
         };
+        // Legacy FrankenSQLite rows omit the slot. A first stored value that
+        // is not the rowid cannot be the slot, so the row stays shifted.
         let payload_values = [
-            SqliteValue::Integer(1),
+            SqliteValue::Integer(2),
             SqliteValue::Text("local".into()),
             SqliteValue::Text("dup-session".into()),
         ];
@@ -221336,7 +221377,7 @@ fts5(title, body, content=docs, content_rowid=id)'
         .unwrap();
 
         assert_eq!(values[0], SqliteValue::Integer(1));
-        assert_eq!(values[1], SqliteValue::Integer(1));
+        assert_eq!(values[1], SqliteValue::Integer(2));
         assert_eq!(values[2], SqliteValue::Text("local".into()));
         assert_eq!(values[3], SqliteValue::Text("dup-session".into()));
     }

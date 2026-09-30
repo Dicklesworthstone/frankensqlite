@@ -16654,18 +16654,7 @@ impl VdbeEngine {
 
         let ipk_col_idx = cursor.ipk_col_idx;
         let payload_includes = if let Some(ipk) = ipk_col_idx {
-            if let Some(cached) = cursor.payload_includes_rowid_alias {
-                cached
-            } else {
-                let includes = payload_includes_rowid_alias_without_rowid(
-                    &cursor.row_decode,
-                    ipk,
-                    cursor.table_column_count,
-                    cursor.first_not_null_non_ipk_col,
-                );
-                cursor.payload_includes_rowid_alias = Some(includes);
-                includes
-            }
+            storage_cursor_payload_includes_rowid_alias(cursor, ipk, collect_vdbe_metrics).await?
         } else {
             false
         };
@@ -16787,18 +16776,7 @@ impl VdbeEngine {
 
         let ipk_col_idx = cursor.ipk_col_idx;
         let payload_includes = if let Some(ipk) = ipk_col_idx {
-            if let Some(cached) = cursor.payload_includes_rowid_alias {
-                cached
-            } else {
-                let includes = payload_includes_rowid_alias_without_rowid(
-                    &cursor.row_decode,
-                    ipk,
-                    cursor.table_column_count,
-                    cursor.first_not_null_non_ipk_col,
-                );
-                cursor.payload_includes_rowid_alias = Some(includes);
-                includes
-            }
+            storage_cursor_payload_includes_rowid_alias(cursor, ipk, collect_vdbe_metrics).await?
         } else {
             false
         };
@@ -16875,18 +16853,8 @@ impl VdbeEngine {
         // ── Resolve IPK alias and payload column index ────────────
         let ipk_col_idx = cursor.ipk_col_idx;
         let payload_includes = if let Some(ipk) = ipk_col_idx {
-            if let Some(cached) = cursor.payload_includes_rowid_alias {
-                cached
-            } else {
-                let includes = payload_includes_rowid_alias_without_rowid(
-                    &cursor.row_decode,
-                    ipk,
-                    cursor.table_column_count,
-                    cursor.first_not_null_non_ipk_col,
-                );
-                cursor.payload_includes_rowid_alias = Some(includes);
-                includes
-            }
+            storage_cursor_payload_includes_rowid_alias(cursor, ipk, self.collect_vdbe_metrics)
+                .await?
         } else {
             false
         };
@@ -17061,18 +17029,12 @@ impl VdbeEngine {
 
             let ipk_col_idx = cursor.ipk_col_idx;
             let payload_includes_rowid_alias = if let Some(ipk_col_idx) = ipk_col_idx {
-                if let Some(cached) = cursor.payload_includes_rowid_alias {
-                    cached
-                } else {
-                    let includes = payload_includes_rowid_alias_without_rowid(
-                        &cursor.row_decode,
-                        ipk_col_idx,
-                        cursor.table_column_count,
-                        cursor.first_not_null_non_ipk_col,
-                    );
-                    cursor.payload_includes_rowid_alias = Some(includes);
-                    includes
-                }
+                storage_cursor_payload_includes_rowid_alias(
+                    cursor,
+                    ipk_col_idx,
+                    collect_vdbe_metrics,
+                )
+                .await?
             } else {
                 false
             };
@@ -18766,6 +18728,51 @@ async fn storage_cursor_cached_rowid(cursor: &mut StorageCursor) -> Result<i64> 
     Ok(rowid)
 }
 
+/// Whether the current row's payload stores the INTEGER PRIMARY KEY slot,
+/// cached per row. Call after `ensure_storage_cursor_row_layout`.
+///
+/// Beyond the header-only rules, a short payload whose slot holds this row's
+/// own rowid stores the slot: older FrankenSQLite wrote the rowid there
+/// instead of SQLite's NULL, and ALTER TABLE ADD COLUMN leaves such rows one
+/// column short. SQLite always reads the slot as present.
+async fn storage_cursor_payload_includes_rowid_alias(
+    cursor: &mut StorageCursor,
+    ipk_col_idx: usize,
+    collect_vdbe_metrics: bool,
+) -> Result<bool> {
+    if let Some(cached) = cursor.payload_includes_rowid_alias {
+        return Ok(cached);
+    }
+    let mut includes = payload_includes_rowid_alias_without_rowid(
+        &cursor.row_decode,
+        ipk_col_idx,
+        cursor.table_column_count,
+        cursor.first_not_null_non_ipk_col,
+    );
+    if !includes
+        && cursor
+            .table_column_count
+            .is_some_and(|table_cols| cursor.row_decode.column_count() < table_cols)
+        && let Some(slot) = cursor.row_decode.column_offset(ipk_col_idx).copied()
+        && matches!(
+            classify_serial_type(slot.serial_type),
+            SerialTypeClass::Integer | SerialTypeClass::Zero | SerialTypeClass::One
+        )
+    {
+        let slot_end = column_payload_end(&slot).ok_or_else(|| FrankenError::DatabaseCorrupt {
+            detail: format!("malformed column {ipk_col_idx} payload length"),
+        })?;
+        ensure_storage_cursor_row_layout(cursor, slot_end, collect_vdbe_metrics).await?;
+        let rowid = storage_cursor_cached_rowid(cursor).await?;
+        includes = matches!(
+            fsqlite_types::record::decode_numeric_column_from_offset(&cursor.payload_buf, &slot),
+            Some(fsqlite_types::record::NumericColumnValue::Integer(v)) if v == rowid
+        );
+    }
+    cursor.payload_includes_rowid_alias = Some(includes);
+    Ok(includes)
+}
+
 async fn storage_cursor_first_index_key_column_offset(
     cursor: &mut StorageCursor,
     malformed_detail: &'static str,
@@ -19459,7 +19466,7 @@ fn encode_record_with_encoding(values: &[SqliteValue], encoding: TextEncoding) -
 #[allow(dead_code)]
 fn payload_includes_rowid_alias(
     payload_values: &[SqliteValue],
-    _rowid: i64,
+    rowid: i64,
     ipk_col_idx: usize,
     table_column_count: Option<usize>,
     first_not_null_non_ipk_col_idx: Option<usize>,
@@ -19493,7 +19500,10 @@ fn payload_includes_rowid_alias(
         if matches!(payload_values.get(ipk_col_idx), Some(SqliteValue::Null)) {
             return true;
         }
-        return false;
+        // Older FrankenSQLite stored the rowid itself in the slot, which
+        // SQLite reads as present; see `storage_cursor_payload_includes_rowid_alias`.
+        return payload_cols < table_cols
+            && matches!(payload_values.get(ipk_col_idx), Some(SqliteValue::Integer(v)) if *v == rowid);
     }
     if payload_cols <= ipk_col_idx {
         return false;
@@ -20592,8 +20602,7 @@ mod tests {
     }
 
     #[test]
-    fn test_payload_includes_rowid_alias_does_not_false_positive_when_first_stored_value_matches_rowid()
-     {
+    fn test_payload_includes_rowid_alias_short_row_with_rowid_in_slot_keeps_slot() {
         let payload_values = vec![
             SqliteValue::Integer(1),
             SqliteValue::Text("local".into()),
@@ -20601,8 +20610,16 @@ mod tests {
         ];
 
         assert!(
-            !payload_includes_rowid_alias(&payload_values, 1, 0, Some(4), Some(1)),
-            "omitted INTEGER PRIMARY KEY aliases must be detected by payload width, not by a coincidental value match"
+            payload_includes_rowid_alias(&payload_values, 1, 0, Some(4), Some(1)),
+            "a short row whose slot holds its own rowid is SQLite's layout after ADD COLUMN"
+        );
+        assert!(
+            payload_includes_rowid_alias(&payload_values, 1, 0, Some(5), Some(1)),
+            "the same holds after several ADD COLUMNs"
+        );
+        assert!(
+            !payload_includes_rowid_alias(&payload_values, 2, 0, Some(4), Some(1)),
+            "an integer that is not the rowid still reads as the legacy omitted slot"
         );
         assert!(
             !payload_includes_rowid_alias(&payload_values, 1, 0, None, Some(1)),

@@ -3762,9 +3762,10 @@ fn inflate_loaded_table_row_values_from_payload(
             ),
         });
     }
-    if with_alias_valid
-        && (!without_alias_valid || matches!(value_at_alias_position, SqliteValue::Null))
-    {
+    // NULL or this row's own rowid in the slot is SQLite's layout (older
+    // FrankenSQLite wrote the rowid there); prefer it whenever it satisfies
+    // NOT NULL, as `Connection` does.
+    if with_alias_valid {
         Ok(with_alias)
     } else {
         Ok(without_alias)
