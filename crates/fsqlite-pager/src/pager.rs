@@ -26484,6 +26484,22 @@ where
                     if !wal.native_reader_required() {
                         let _ = wal.refresh_published_snapshot(cx).await?;
                     }
+                    // bd-sx5w2: the pool was judged against the WAL generation
+                    // this pager last refreshed at. A peer's TRUNCATE or
+                    // RESTART checkpoint can start a new generation while this
+                    // transaction runs. A page the peer made live and then
+                    // checkpointed into the database file carries no frame in
+                    // the new generation, and the no-frame test below would
+                    // free it while an index still references it (one page in
+                    // two b-trees). Every candidate is in range, so drop them,
+                    // as `preserve_above_extent_at_generation_boundary` does at
+                    // the boundary itself: an unreferenced page is repairable,
+                    // a double grant is not.
+                    let fold_generation = wal.published_snapshot().map(|s| s.generation);
+                    if fold_generation.is_some() && inner.committed_wal_generation != fold_generation
+                    {
+                        abandoned_candidates.clear();
+                    }
                     let mut dw8oe_reclaimed = 0_usize;
                     let mut dw8oe_framed = 0_usize;
                     let mut dw8oe_errs = 0_usize;
@@ -31200,6 +31216,78 @@ mod tests {
             txn.restore_not_committed_wal_attempt().unwrap();
             txn.rollback(&cx).await.unwrap();
         });
+    }
+
+    /// bd-sx5w2: the commit-time fold must not reclaim an abandonment-pool
+    /// page that was judged in an older WAL generation. After a peer's
+    /// TRUNCATE checkpoint, a page the peer made live has no frame in the new
+    /// generation. Reclaiming it published a live page as free, and a later
+    /// allocation granted it to a second b-tree. In the current generation, a
+    /// frameless in-range pool page is still reclaimed.
+    #[test]
+    fn test_sx5w2_commit_fold_skips_pool_judged_in_an_older_wal_generation() {
+        for pool_generation_is_current in [true, false] {
+            asupersync::test_utils::run_test(|| async move {
+                MOCK_WAL_PUBLISHES_SNAPSHOTS.with(|flag| flag.set(true));
+                let (pager, frames) = wal_pager().await;
+                let cx = Cx::new();
+                let ps = PageSize::DEFAULT.as_usize();
+
+                let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                let mut pages = Vec::new();
+                for _ in 0..4 {
+                    let page = txn.allocate_page(&cx).await.unwrap();
+                    txn.write_page(&cx, page, &vec![0x11; ps]).await.unwrap();
+                    pages.push(page);
+                }
+                txn.commit(&cx).await.unwrap();
+
+                // A checkpoint moved this page into the database file: it is
+                // in range but has no frame in the (mock) WAL. (The last frame
+                // carries the commit marker, so strip a middle page's frame.)
+                let live = pages[1];
+                frames
+                    .lock()
+                    .unwrap()
+                    .retain(|frame| frame.0 != live.get() || frame.2 > 0);
+
+                let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                {
+                    let mut inner = txn
+                        .inner
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let mock_generation = WalGenerationIdentity {
+                        checkpoint_seq: 0,
+                        salts: fsqlite_wal::checksum::WalSalts { salt1: 0, salt2: 0 },
+                    };
+                    inner.committed_wal_generation = Some(if pool_generation_is_current {
+                        mock_generation
+                    } else {
+                        WalGenerationIdentity {
+                            checkpoint_seq: 7,
+                            ..mock_generation
+                        }
+                    });
+                    inner.abandoned_eof_reservations.push(live);
+                }
+                txn.write_page(&cx, pages[0], &vec![0x22; ps]).await.unwrap();
+                txn.commit(&cx).await.unwrap();
+
+                let inner = pager
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let freed = inner.freelist.contains(&live)
+                    || inner.durable_freelist_view.contains(&live.get());
+                MOCK_WAL_PUBLISHES_SNAPSHOTS.with(|flag| flag.set(false));
+                assert_eq!(
+                    freed, pool_generation_is_current,
+                    "pool generation current={pool_generation_is_current}: page {} freed={freed}",
+                    live.get()
+                );
+            });
+        }
     }
 
     #[test]
@@ -39371,6 +39459,14 @@ mod tests {
         publish_after_begin: Option<(Arc<PublishedPagerState>, PublishedPagerUpdate)>,
     }
 
+    thread_local! {
+        /// Opt-in: `MockWalBackend::published_snapshot` reports the frame
+        /// log's snapshot (default `None`, like a backend without a published
+        /// plane). Only tests that need a WAL generation at commit time set it.
+        static MOCK_WAL_PUBLISHES_SNAPSHOTS: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+
     /// Derive a publication snapshot from the shared mock frame log: commit
     /// frames are those carrying a nonzero `db_size_if_commit`, matching how
     /// every mock-based test encodes commits.
@@ -40681,6 +40777,12 @@ mod tests {
 
         fn pinned_read_snapshot(&self) -> Option<traits::WalPublicationSnapshot> {
             *self.pinned_snapshot.lock().unwrap()
+        }
+
+        fn published_snapshot(&self) -> Option<traits::WalPublicationSnapshot> {
+            MOCK_WAL_PUBLISHES_SNAPSHOTS
+                .with(std::cell::Cell::get)
+                .then(|| mock_wal_publication_snapshot(&self.frames.lock().unwrap()))
         }
 
         fn conflicting_pages_since_snapshot<'a>(
