@@ -84299,6 +84299,21 @@ impl Connection {
     /// *indexed* table declines too: the nested statement can seek it, while
     /// this path is a linear scan.
     fn try_scan_correlated_exists_probe(&self, subquery: &SelectStatement) -> Option<Result<bool>> {
+        let (plan, where_expr) = self.plan_scan_correlated_exists_probe(subquery)?;
+        let _join_eval_collation_guard =
+            JoinEvalCollationContextGuard::push_shared(Arc::clone(&plan.context));
+        let bindings = plan.bind(where_expr);
+        self.run_scan_correlated_exists_probe(&plan, where_expr, bindings)
+    }
+
+    /// GH#419: the checks and table metadata of
+    /// [`Self::try_scan_correlated_exists_probe`], which depend only on the
+    /// subquery's shape and the schema. Returns the plan and the subquery's
+    /// WHERE, or `None` when the probe does not apply.
+    fn plan_scan_correlated_exists_probe<'s>(
+        &self,
+        subquery: &'s SelectStatement,
+    ) -> Option<(ScanExistsProbePlan, &'s Expr)> {
         if !self.join_mem_scan_safe() || self.scalar_function_overridden.get() {
             return None;
         }
@@ -84405,35 +84420,169 @@ impl Connection {
             (table.root_page, col_map, collations, affinities)
         };
         let rowid_alias_column_index = self.rowid_alias_columns.borrow().get(&table_key).copied();
-        let _join_eval_collation_guard =
-            JoinEvalCollationContextGuard::push(JoinEvalCollationContext {
-                declared_json_keys: HashSet::new(),
-                column_collations,
-                column_affinities,
-                using_column_projections: HashMap::new(),
-                registry: lock_unpoisoned(self.collation_registry.as_ref()).clone(),
-            });
+        let context = Arc::new(JoinEvalCollationContext {
+            declared_json_keys: HashSet::new(),
+            column_collations,
+            column_affinities,
+            using_column_projections: HashMap::new(),
+            registry: lock_unpoisoned(self.collation_registry.as_ref()).clone(),
+        });
+        Some((
+            ScanExistsProbePlan {
+                root_page,
+                col_map,
+                rowid_alias_column_index,
+                context,
+            },
+            where_expr.as_ref(),
+        ))
+    }
+
+    /// GH#419: scan the probe table and stop at the first row that satisfies
+    /// `where_expr`. The caller has pushed `plan.context`; `bindings` must
+    /// have been bound over this exact `where_expr` tree under it.
+    fn run_scan_correlated_exists_probe(
+        &self,
+        plan: &ScanExistsProbePlan,
+        where_expr: &Expr,
+        bindings: Arc<JoinExprBindings>,
+    ) -> Option<Result<bool>> {
+        let _join_expr_bindings_guard = JoinExprBindingsGuard::push_shared(bindings);
         let db = self.db.borrow();
-        let table = db.get_table(root_page)?;
-        let mut row: Vec<SqliteValue> = Vec::with_capacity(col_map.len());
+        let table = db.get_table(plan.root_page)?;
+        let mut row: Vec<SqliteValue> = Vec::with_capacity(plan.col_map.len());
         for (rowid, values) in table.iter_rows() {
             row.clear();
             row.extend_from_slice(values);
             // Short physical records (pre-ALTER ADD COLUMN) read as NULL,
             // exactly as the join scan pads them.
-            row.resize(col_map.len(), SqliteValue::Null);
-            if let Some(alias_index) = rowid_alias_column_index
+            row.resize(plan.col_map.len(), SqliteValue::Null);
+            if let Some(alias_index) = plan.rowid_alias_column_index
                 && let Some(alias_value) = row.get_mut(alias_index)
             {
                 *alias_value = SqliteValue::Integer(rowid);
             }
-            match eval_join_predicate(where_expr, &row, &col_map) {
+            match eval_join_predicate(where_expr, &row, &plan.col_map) {
                 Ok(true) => return Some(Ok(true)),
                 Ok(false) => {}
                 Err(error) => return Some(Err(error)),
             }
         }
         Some(Ok(false))
+    }
+
+    /// GH#419: the scan probe through a per-query template, so a correlated
+    /// `EXISTS` is not cloned and re-substituted for every outer row.
+    ///
+    /// The first probe runs the ordinary outer-reference substitution once,
+    /// against a row of unique sentinel values. The leaves that come back
+    /// carrying sentinel `i` are exactly the ones substitution fills from
+    /// outer column `i`, with metadata that depends on the schema and the
+    /// outer column, never on the value. Later probes refill those leaves in
+    /// place from the real row. The function and collation bindings then stay
+    /// valid across probes, because refilling never moves a node. The
+    /// template lives in the query-scoped EXISTS memo, and each probe checks
+    /// it against the subquery itself, since a transient AST can reuse an
+    /// address. `None` falls back to the per-probe clone path.
+    fn try_templated_scan_exists_probe(
+        &self,
+        subquery: &SelectStatement,
+        row: &[SqliteValue],
+        col_map: &[(String, String, bool)],
+    ) -> Option<Result<bool>> {
+        let key = std::ptr::from_ref(subquery) as usize;
+        let outer_context = current_join_eval_collation_context_snapshot();
+        let cached = {
+            let mut memo = self.exists_probe_memo.borrow_mut();
+            if memo.depth == 0 {
+                return None;
+            }
+            memo.scan_templates.remove(&key)
+        };
+        let mut template = match cached {
+            Some(template)
+                if template.matches(subquery, col_map, row.len(), outer_context.as_ref()) =>
+            {
+                template
+            }
+            _ => self.build_scan_exists_template(subquery, col_map, row.len(), outer_context),
+        };
+        let result = template.ready.as_mut().and_then(|ready| {
+            let where_expr = scan_template_where_mut(&mut ready.substituted)?;
+            let mut cursor = 0;
+            if !refill_scan_template_slots(where_expr, &ready.slots, &mut cursor, row) {
+                return None;
+            }
+            let where_expr = scan_template_where(&ready.substituted)?;
+            let _join_eval_collation_guard =
+                JoinEvalCollationContextGuard::push_shared(Arc::clone(&ready.plan.context));
+            self.run_scan_correlated_exists_probe(
+                &ready.plan,
+                where_expr,
+                Arc::clone(&ready.bindings),
+            )
+        });
+        self.exists_probe_memo
+            .borrow_mut()
+            .scan_templates
+            .insert(key, template);
+        result
+    }
+
+    fn build_scan_exists_template(
+        &self,
+        subquery: &SelectStatement,
+        col_map: &[(String, String, bool)],
+        outer_width: usize,
+        outer_context: Option<Arc<JoinEvalCollationContext>>,
+    ) -> ScanExistsProbeTemplate {
+        let mut template = ScanExistsProbeTemplate {
+            original: subquery.clone(),
+            outer_col_map: col_map.to_vec(),
+            outer_width,
+            outer_context,
+            ready: None,
+        };
+        // A USING/NATURAL projection substitutes a coalesced value that no
+        // single outer column can refill.
+        if template
+            .outer_context
+            .as_ref()
+            .is_some_and(|context| !context.using_column_projections.is_empty())
+        {
+            return template;
+        }
+        let sentinel_row: Vec<SqliteValue> = (0..outer_width)
+            .map(|slot| SqliteValue::from(scan_template_sentinel(slot)))
+            .collect();
+        let mut substituted = Box::new(subquery.clone());
+        self.substitute_outer_refs_for_current_schema(&mut substituted, &sentinel_row, col_map, None);
+        strip_exists_subquery_projection(&mut substituted);
+        let Some((plan, _)) = self.plan_scan_correlated_exists_probe(&substituted) else {
+            return template;
+        };
+        let (Some(original_where), Some(substituted_where)) = (
+            scan_template_where(subquery),
+            scan_template_where(&substituted),
+        ) else {
+            return template;
+        };
+        let mut slots = Vec::new();
+        if !collect_scan_template_slots(original_where, substituted_where, outer_width, &mut slots) {
+            return template;
+        }
+        let bindings = {
+            let _join_eval_collation_guard =
+                JoinEvalCollationContextGuard::push_shared(Arc::clone(&plan.context));
+            plan.bind(substituted_where)
+        };
+        template.ready = Some(ScanExistsProbeReady {
+            substituted,
+            slots,
+            plan,
+            bindings,
+        });
+        template
     }
 
     /// bd-nd2ju (#377, L3): after outer-ref substitution, relax each correlated
@@ -84680,6 +84829,9 @@ impl Connection {
         params: Option<&'a [SqliteValue]>,
     ) -> Pin<Box<dyn Future<Output = Result<SqliteValue>> + 'a>> {
         Box::pin(async move {
+            // The fallback's future is tens of KB. Box it so this future,
+            // allocated on every call (once per row per subquery predicate),
+            // stays small (GH#419).
             let execute_nested_select = async |select: SelectStatement| -> Result<Vec<Row>> {
                 if self.skip_statement_memdb_refresh.get()
                     && matches!(
@@ -84687,8 +84839,7 @@ impl Connection {
                         SelectCore::Select { from: Some(_), .. }
                     )
                 {
-                    self.execute_select_via_memdb_fallback(&select, params)
-                        .await
+                    Box::pin(self.execute_select_via_memdb_fallback(&select, params)).await
                 } else {
                     self.execute_statement(&Statement::Select(select), params)
                         .await
@@ -84729,6 +84880,15 @@ impl Connection {
                         self.try_direct_exists_probe(subquery, *not, row, col_map)
                     {
                         return probe_result;
+                    }
+                    // GH#419: the scan probe through a template substituted
+                    // once per query instead of once per outer row.
+                    if let Some(scanned) =
+                        self.try_templated_scan_exists_probe(subquery, row, col_map)
+                    {
+                        let exists = scanned?;
+                        let truth = if *not { !exists } else { exists };
+                        return Ok(SqliteValue::Integer(i64::from(truth)));
                     }
                     // Fallback: clone + substitute + execute for complex shapes.
                     let mut sub_clone = subquery.as_ref().clone();
@@ -128976,6 +129136,71 @@ struct ExistsProbeMemo {
     /// full-column value-set build.
     linear_rows_scanned: std::collections::HashMap<ExistsProbeMemoKey, usize>,
     sets: std::collections::HashMap<ExistsProbeMemoKey, ExistsValueSet>,
+    /// GH#419: scan-probe templates keyed by the `EXISTS` subquery's address,
+    /// each validated against the subquery before use.
+    scan_templates: std::collections::HashMap<usize, ScanExistsProbeTemplate>,
+}
+
+/// GH#419: what the correlated-EXISTS scan probe derives from the subquery's
+/// shape and the schema before it reads a row.
+struct ScanExistsProbePlan {
+    root_page: i32,
+    col_map: Vec<(String, String, bool)>,
+    rowid_alias_column_index: Option<usize>,
+    context: Arc<JoinEvalCollationContext>,
+}
+
+impl ScanExistsProbePlan {
+    /// Resolve the function calls and comparison collations of `where_expr`
+    /// once. Must run with `self.context` pushed, as the rows evaluate.
+    fn bind(&self, where_expr: &Expr) -> Arc<JoinExprBindings> {
+        let mut bindings = JoinExprBindings::default();
+        bindings.bind_functions(where_expr, &self.col_map);
+        bindings.bind_comparison_collations(where_expr);
+        Arc::new(bindings)
+    }
+}
+
+/// GH#419: one correlated `EXISTS` subquery, substituted once for the scan
+/// probe. See `Connection::try_templated_scan_exists_probe`.
+struct ScanExistsProbeTemplate {
+    original: SelectStatement,
+    outer_col_map: Vec<(String, String, bool)>,
+    outer_width: usize,
+    outer_context: Option<Arc<JoinEvalCollationContext>>,
+    /// `None` when the subquery cannot use a template; it then keeps the
+    /// per-probe path without rebuilding the template on every row.
+    ready: Option<ScanExistsProbeReady>,
+}
+
+struct ScanExistsProbeReady {
+    /// Boxed so the bound node addresses survive moves of the template.
+    substituted: Box<SelectStatement>,
+    /// One entry per literal or bound-value leaf of the substituted WHERE, in
+    /// `refill_scan_template_slots` order: the outer column that fills it, or
+    /// `None` for a literal the query wrote.
+    slots: Vec<Option<usize>>,
+    plan: ScanExistsProbePlan,
+    bindings: Arc<JoinExprBindings>,
+}
+
+impl ScanExistsProbeTemplate {
+    fn matches(
+        &self,
+        subquery: &SelectStatement,
+        col_map: &[(String, String, bool)],
+        outer_width: usize,
+        outer_context: Option<&Arc<JoinEvalCollationContext>>,
+    ) -> bool {
+        self.outer_width == outer_width
+            && match (self.outer_context.as_ref(), outer_context) {
+                (None, None) => true,
+                (Some(ours), Some(theirs)) => Arc::ptr_eq(ours, theirs),
+                _ => false,
+            }
+            && self.outer_col_map == col_map
+            && self.original == *subquery
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -129176,6 +129401,7 @@ impl Drop for ExistsProbeMemoGuard<'_> {
         if memo.depth == 0 {
             memo.linear_rows_scanned.clear();
             memo.sets.clear();
+            memo.scan_templates.clear();
         }
     }
 }
@@ -147385,6 +147611,10 @@ struct JoinExprBindings {
     /// their `Expr::FunctionCall` node. Only filled by [`Self::bind_functions`],
     /// which a caller must run under the function registry its rows use.
     functions: HashMap<usize, Arc<PreparedJoinFunction>>,
+    /// GH#419: `first_explicit_collation_name` of comparison operands, keyed
+    /// like `functions`. It depends only on the operand's syntax tree, which
+    /// it walks, so a correlated probe computes it once instead of per row.
+    explicit_collations: HashMap<usize, Option<String>>,
 }
 
 /// GH#436: everything `eval_join_expr` derives from a function call's name,
@@ -147432,6 +147662,15 @@ impl JoinExprBindings {
         });
     }
 
+    /// GH#419: memoize the explicit collation of every comparison operand.
+    fn bind_comparison_collations(&mut self, expr: &Expr) {
+        for_each_comparison_operand_in_expr(expr, &mut |operand| {
+            self.explicit_collations
+                .entry(std::ptr::from_ref(operand) as usize)
+                .or_insert_with(|| first_explicit_collation_name(operand).map(str::to_owned));
+        });
+    }
+
     fn function(&self, call: &Expr) -> Option<Arc<PreparedJoinFunction>> {
         self.functions
             .get(&(std::ptr::from_ref(call) as usize))
@@ -147473,7 +147712,11 @@ struct JoinExprBindingsGuard;
 
 impl JoinExprBindingsGuard {
     fn push(bindings: JoinExprBindings) -> Self {
-        CURRENT_JOIN_EXPR_BINDINGS.with(|stack| stack.borrow_mut().push(Arc::new(bindings)));
+        Self::push_shared(Arc::new(bindings))
+    }
+
+    fn push_shared(bindings: Arc<JoinExprBindings>) -> Self {
+        CURRENT_JOIN_EXPR_BINDINGS.with(|stack| stack.borrow_mut().push(bindings));
         Self
     }
 }
@@ -147501,6 +147744,283 @@ fn current_join_expr_function(call: &Expr) -> Option<Arc<PreparedJoinFunction>> 
             .last()
             .and_then(|bindings| bindings.function(call))
     })
+}
+
+/// GH#419: both operands of every comparison reachable through the operators
+/// the join evaluator recurses into. A node it misses just keeps the per-row
+/// path.
+fn for_each_comparison_operand_in_expr(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
+    match expr {
+        Expr::BinaryOp {
+            left, op, right, ..
+        } => {
+            if matches!(
+                op,
+                BinaryOp::Eq
+                    | BinaryOp::Ne
+                    | BinaryOp::Lt
+                    | BinaryOp::Le
+                    | BinaryOp::Gt
+                    | BinaryOp::Ge
+                    | BinaryOp::Is
+                    | BinaryOp::IsNot
+            ) {
+                visit(left);
+                visit(right);
+            }
+            for_each_comparison_operand_in_expr(left, visit);
+            for_each_comparison_operand_in_expr(right, visit);
+        }
+        Expr::FunctionCall {
+            args: FunctionArgs::List(items),
+            ..
+        } => {
+            for item in items {
+                for_each_comparison_operand_in_expr(item, visit);
+            }
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. }
+        | Expr::IsNull { expr, .. } => for_each_comparison_operand_in_expr(expr, visit),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            for_each_comparison_operand_in_expr(expr, visit);
+            for_each_comparison_operand_in_expr(low, visit);
+            for_each_comparison_operand_in_expr(high, visit);
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            if let Some(operand) = operand {
+                for_each_comparison_operand_in_expr(operand, visit);
+            }
+            for (when, then) in whens {
+                for_each_comparison_operand_in_expr(when, visit);
+                for_each_comparison_operand_in_expr(then, visit);
+            }
+            if let Some(else_expr) = else_expr {
+                for_each_comparison_operand_in_expr(else_expr, visit);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn scan_template_where(select: &SelectStatement) -> Option<&Expr> {
+    match &select.body.select {
+        SelectCore::Select {
+            where_clause: Some(where_expr),
+            ..
+        } => Some(where_expr),
+        _ => None,
+    }
+}
+
+fn scan_template_where_mut(select: &mut SelectStatement) -> Option<&mut Expr> {
+    match &mut select.body.select {
+        SelectCore::Select {
+            where_clause: Some(where_expr),
+            ..
+        } => Some(where_expr),
+        _ => None,
+    }
+}
+
+/// GH#419: the placeholder value a scan-probe template substitutes for outer
+/// column `slot`. Only the template walk reads it back; it never meets data.
+fn scan_template_sentinel(slot: usize) -> String {
+    format!("\u{0}fsqlite-gh419-outer-slot-{slot}\u{0}")
+}
+
+fn scan_template_sentinel_slot(text: &str) -> Option<usize> {
+    let slot = text
+        .strip_prefix("\u{0}fsqlite-gh419-outer-slot-")?
+        .strip_suffix('\u{0}')?
+        .parse()
+        .ok()?;
+    (scan_template_sentinel(slot) == text).then_some(slot)
+}
+
+/// GH#419: walk the subquery's WHERE (`original`) beside its sentinel
+/// substitution and record, for each literal or bound-value leaf of the
+/// substitution, the outer column that fills it (`None` for a literal of the
+/// query's own). False when a node kind is outside the refillable set or a
+/// replaced leaf does not carry exactly one outer column's sentinel.
+fn collect_scan_template_slots(
+    original: &Expr,
+    substituted: &Expr,
+    outer_width: usize,
+    slots: &mut Vec<Option<usize>>,
+) -> bool {
+    let mut pair = |original: &Expr, substituted: &Expr| {
+        collect_scan_template_slots(original, substituted, outer_width, slots)
+    };
+    match (original, substituted) {
+        (Expr::Column(..), Expr::Column(..)) => true,
+        (Expr::Column(..), Expr::Literal(Literal::String(text), _)) => {
+            match scan_template_sentinel_slot(text) {
+                Some(slot) if slot < outer_width => {
+                    slots.push(Some(slot));
+                    true
+                }
+                _ => false,
+            }
+        }
+        (
+            Expr::Column(..),
+            Expr::BoundOuterValue {
+                value: SqliteValue::Text(text),
+                ..
+            },
+        ) => match scan_template_sentinel_slot(text.as_str()) {
+            Some(slot) if slot < outer_width => {
+                slots.push(Some(slot));
+                true
+            }
+            _ => false,
+        },
+        (Expr::Literal(..), Expr::Literal(..)) => {
+            slots.push(None);
+            true
+        }
+        (
+            Expr::BinaryOp {
+                left: original_left,
+                right: original_right,
+                ..
+            },
+            Expr::BinaryOp { left, right, .. },
+        ) => pair(original_left, left) && pair(original_right, right),
+        (Expr::UnaryOp { expr: original, .. }, Expr::UnaryOp { expr, .. })
+        | (Expr::Cast { expr: original, .. }, Expr::Cast { expr, .. })
+        | (Expr::Collate { expr: original, .. }, Expr::Collate { expr, .. })
+        | (Expr::IsNull { expr: original, .. }, Expr::IsNull { expr, .. }) => pair(original, expr),
+        (
+            Expr::Between {
+                expr: original_expr,
+                low: original_low,
+                high: original_high,
+                ..
+            },
+            Expr::Between {
+                expr, low, high, ..
+            },
+        ) => pair(original_expr, expr) && pair(original_low, low) && pair(original_high, high),
+        (
+            Expr::FunctionCall {
+                args: FunctionArgs::List(original_items),
+                ..
+            },
+            Expr::FunctionCall {
+                args: FunctionArgs::List(items),
+                ..
+            },
+        ) => {
+            original_items.len() == items.len()
+                && original_items
+                    .iter()
+                    .zip(items)
+                    .all(|(original, item)| pair(original, item))
+        }
+        (
+            Expr::Case {
+                operand: original_operand,
+                whens: original_whens,
+                else_expr: original_else,
+                ..
+            },
+            Expr::Case {
+                operand,
+                whens,
+                else_expr,
+                ..
+            },
+        ) => {
+            let operands = match (original_operand, operand) {
+                (None, None) => true,
+                (Some(original), Some(operand)) => pair(original, operand),
+                _ => false,
+            };
+            operands
+                && original_whens.len() == whens.len()
+                && original_whens
+                    .iter()
+                    .zip(whens)
+                    .all(|((original_when, original_then), (when, then))| {
+                        pair(original_when, when) && pair(original_then, then)
+                    })
+                && match (original_else, else_expr) {
+                    (None, None) => true,
+                    (Some(original), Some(else_expr)) => pair(original, else_expr),
+                    _ => false,
+                }
+        }
+        _ => false,
+    }
+}
+
+/// GH#419: fill the template's outer-column leaves from `row`, visiting
+/// leaves in the order `collect_scan_template_slots` recorded them. A filled
+/// leaf equals what substitution builds for that value: a bound value keeps
+/// its metadata, and a literal is rebuilt by `value_to_literal_expr`.
+fn refill_scan_template_slots(
+    expr: &mut Expr,
+    slots: &[Option<usize>],
+    cursor: &mut usize,
+    row: &[SqliteValue],
+) -> bool {
+    let mut refill = |expr: &mut Expr| refill_scan_template_slots(expr, slots, cursor, row);
+    match expr {
+        Expr::Literal(..) | Expr::BoundOuterValue { .. } => {
+            let Some(slot) = slots.get(*cursor).copied() else {
+                return false;
+            };
+            *cursor += 1;
+            let Some(column) = slot else {
+                return true;
+            };
+            let Some(value) = row.get(column) else {
+                return false;
+            };
+            if let Expr::BoundOuterValue { value: bound, .. } = expr {
+                *bound = value.clone();
+            } else {
+                *expr = value_to_literal_expr(value.clone());
+            }
+            true
+        }
+        Expr::Column(..) => true,
+        Expr::BinaryOp { left, right, .. } => refill(left) && refill(right),
+        Expr::UnaryOp { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. }
+        | Expr::IsNull { expr, .. } => refill(expr),
+        Expr::Between {
+            expr, low, high, ..
+        } => refill(expr) && refill(low) && refill(high),
+        Expr::FunctionCall {
+            args: FunctionArgs::List(items),
+            ..
+        } => items.iter_mut().all(&mut refill),
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            operand.as_deref_mut().is_none_or(&mut refill)
+                && whens
+                    .iter_mut()
+                    .all(|(when, then)| refill(when) && refill(then))
+                && else_expr.as_deref_mut().is_none_or(&mut refill)
+        }
+        _ => false,
+    }
 }
 
 /// GH#436: every `Expr::FunctionCall` node reachable through the operators the
@@ -148084,13 +148604,26 @@ fn join_resolved_bound_collation(collation: &BoundCollation) -> Option<JoinResol
 }
 
 fn join_expr_explicit_collation(expr: &Expr) -> Option<JoinResolvedCollation> {
-    first_explicit_collation_name(expr).map(|collation| {
+    let resolve = |collation: &str| {
         if collation.eq_ignore_ascii_case("BINARY") {
             JoinResolvedCollation::Binary
         } else {
             JoinResolvedCollation::Named(collation.to_owned())
         }
-    })
+    };
+    // GH#419: a memoized entry, including a memoized "none", skips the walk.
+    let memoized = CURRENT_JOIN_EXPR_BINDINGS.with(|stack| {
+        stack.borrow().last().and_then(|bindings| {
+            bindings
+                .explicit_collations
+                .get(&(std::ptr::from_ref(expr) as usize))
+                .map(|collation| collation.as_deref().map(resolve))
+        })
+    });
+    if let Some(resolved) = memoized {
+        return resolved;
+    }
+    first_explicit_collation_name(expr).map(resolve)
 }
 
 fn join_expr_declared_collation(

@@ -234,6 +234,24 @@ fn gh419_correlated_exists_scan_probe_matches_sqlite() {
             "WITH RECURSIVE c(n, s) AS (SELECT 1, 'x' UNION ALL SELECT n+1, s || n FROM c, o2 WHERE n < 3 AND NOT EXISTS (SELECT 1 FROM kc WHERE kc.name = o2.w OR kc.tag = substr(c.s, n, 1))) SELECT n, s, count(*) FROM c GROUP BY n, s ORDER BY n, s",
             "probe correlated with both the working table and a joined table",
         ),
+        // The scan probe reuses one substituted template per query and
+        // refills its outer-column leaves for each outer row.
+        (
+            "SELECT x, y, z FROM o1 WHERE EXISTS (SELECT 1 FROM k WHERE k.t = CAST(o1.x AS TEXT) COLLATE NOCASE OR k.i BETWEEN o1.z - 1 AND o1.z + 1 OR CASE WHEN o1.y IS NULL THEN k.t IS NULL ELSE k.t = o1.y END) ORDER BY rowid",
+            "template refills outer references inside CAST, COLLATE, BETWEEN and CASE",
+        ),
+        (
+            "SELECT x, (SELECT count(*) FROM o2 WHERE EXISTS (SELECT 1 FROM kc WHERE kc.name = o2.w OR kc.tag = o1.y)) FROM o1 ORDER BY rowid",
+            "probe inside a per-row scalar subquery, correlated to both levels",
+        ),
+        (
+            "SELECT x FROM o1 WHERE EXISTS (SELECT 1 FROM k WHERE k.i = o1.z) AND NOT EXISTS (SELECT 1 FROM k WHERE k.i = o1.z OR k.t = o1.y) AND EXISTS (SELECT 1 FROM k WHERE k.i = o1.z) ORDER BY rowid",
+            "several probes over one table in one WHERE",
+        ),
+        (
+            "SELECT o1.x, p.y FROM o1 JOIN o1 AS p USING (z) WHERE EXISTS (SELECT 1 FROM k WHERE k.i = o1.z OR k.t = p.y) ORDER BY o1.rowid, p.rowid",
+            "USING join in the outer scope keeps the per-probe path",
+        ),
     ];
     asupersync::test_utils::run_test(|| async {
         for (sql, msg) in CASES {
