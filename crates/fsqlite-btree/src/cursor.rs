@@ -969,6 +969,24 @@ struct CellSlotCache {
     entries: Vec<CellSlotCacheEntry>,
 }
 
+/// Look up a page's cached cell. `slots` is sorted by cell index, so a
+/// sequential scan (which appends cell after cell) and a lookup both stay
+/// cheap on a leaf with hundreds of cells; an unsorted list made every new
+/// cell scan all the earlier ones.
+fn find_cached_cell_slot(slots: &CachedCellSlots, cell_idx: u16) -> Option<CachedCellSlot> {
+    slots
+        .binary_search_by_key(&cell_idx, |(idx, _)| *idx)
+        .ok()
+        .map(|pos| slots[pos].1)
+}
+
+fn store_cached_cell_slot(slots: &mut CachedCellSlots, cell_idx: u16, slot: CachedCellSlot) {
+    match slots.binary_search_by_key(&cell_idx, |(idx, _)| *idx) {
+        Ok(pos) => slots[pos].1 = slot,
+        Err(pos) => slots.insert(pos, (cell_idx, slot)),
+    }
+}
+
 /// bd-yafor.2 + bd-o92pn.2: cell-slot cache hit/miss accounting, classified.
 ///
 /// Incremented by `CellSlotCache::get` under `Relaxed` ordering so the cost is
@@ -1067,10 +1085,7 @@ impl CellSlotCache {
         // just to rediscover the MRU page.
         let front_page_match = if let Some(front) = self.entries.first() {
             if front.page_no == page_no && front.mutation_counter == mutation_counter {
-                let slot = front
-                    .slots
-                    .iter()
-                    .find_map(|(idx, slot)| (*idx == cell_idx).then_some(*slot));
+                let slot = find_cached_cell_slot(&front.slots, cell_idx);
                 if crate::instrumentation::copy_profile_enabled() {
                     if slot.is_some() {
                         CELL_SLOT_CACHE_HITS.fetch_add(1, Relaxed);
@@ -1122,10 +1137,7 @@ impl CellSlotCache {
             }
             return None;
         };
-        let slot = self.entries[entry_idx]
-            .slots
-            .iter()
-            .find_map(|(idx, slot)| (*idx == cell_idx).then_some(*slot));
+        let slot = find_cached_cell_slot(&self.entries[entry_idx].slots, cell_idx);
         match slot {
             Some(found) => {
                 if crate::instrumentation::copy_profile_enabled() {
@@ -1164,11 +1176,7 @@ impl CellSlotCache {
             && front.page_no == page_no
             && front.mutation_counter == mutation_counter
         {
-            if let Some((_, existing)) = front.slots.iter_mut().find(|(idx, _)| *idx == cell_idx) {
-                *existing = slot;
-            } else {
-                front.slots.push((cell_idx, slot));
-            }
+            store_cached_cell_slot(&mut front.slots, cell_idx, slot);
             return;
         }
         self.insert_slow(page_no, mutation_counter, cell_idx, slot);
@@ -1194,11 +1202,7 @@ impl CellSlotCache {
             }
         };
 
-        if let Some((_, existing)) = entry.slots.iter_mut().find(|(idx, _)| *idx == cell_idx) {
-            *existing = slot;
-        } else {
-            entry.slots.push((cell_idx, slot));
-        }
+        store_cached_cell_slot(&mut entry.slots, cell_idx, slot);
 
         self.entries.insert(0, entry);
         self.entries.truncate(CELL_SLOT_CACHE_ENTRIES);
@@ -2181,6 +2185,11 @@ pub struct BtCursor<P> {
     /// the page on a single miss, which made point probes pay for unrelated
     /// cells and left `CellRef::parse` as a top MT 8t hotspot.
     cell_slot_cache: RefCell<CellSlotCache>,
+    /// The cell last parsed by a positioned read (`payload*`, `rowid`), keyed
+    /// like `cell_slot_cache`. A scan reads each cell once or twice (Column,
+    /// then IdxRowid) and moves on, so these reads stay out of the LRU, which
+    /// serves binary-search probes that revisit cells.
+    current_cell_memo: std::cell::Cell<Option<(PageNumber, u64, u16, CachedCellSlot)>>,
     /// Last rowid successfully inserted via `table_insert`.
     ///
     /// Set on successful leaf insert or balance-for-insert.  Used by the VDBE
@@ -2219,6 +2228,11 @@ pub enum FirstIndexKeyIntegerLocalRunSegment {
 }
 
 impl<P> BtCursor<P> {
+    fn clear_cell_slot_caches(&mut self) {
+        self.cell_slot_cache.get_mut().clear();
+        self.current_cell_memo.set(None);
+    }
+
     /// Force the cursor into EOF state (not positioned on any row).
     ///
     /// Used by `OP_NullRow` to ensure subsequent `Column`/`Rowid` reads
@@ -2229,7 +2243,7 @@ impl<P> BtCursor<P> {
         self.rightmost_leaf_cache = None;
         self.last_known_depth = None;
         self.seek_cache.fill(None);
-        self.cell_slot_cache.get_mut().clear();
+        self.clear_cell_slot_caches();
         self.bump_row_image_epoch();
     }
 
@@ -2287,7 +2301,7 @@ impl<P> BtCursor<P> {
             self.usable_size
         );
         self.page_size = page_size;
-        self.cell_slot_cache.get_mut().clear();
+        self.clear_cell_slot_caches();
     }
 
     fn clear_seek_cache(&mut self) {
@@ -2735,6 +2749,7 @@ impl<P: PageReader> BtCursor<P> {
             defrag_ptrs_scratch: Vec::new(),
             defrag_cells_scratch: Vec::new(),
             cell_slot_cache: RefCell::new(CellSlotCache::default()),
+            current_cell_memo: std::cell::Cell::new(None),
             last_insert_rowid: None,
             rightmost_leaf_cache: None,
             last_known_depth: None,
@@ -3545,6 +3560,25 @@ impl<P: PageReader> BtCursor<P> {
             .borrow_mut()
             .insert(entry.page_no, entry.mutation_counter, idx, slot);
         Ok(slot.into_cell_ref())
+    }
+
+    /// Parse the cell a positioned read targets; see `current_cell_memo`.
+    fn parse_current_cell(&self, entry: &StackEntry, idx: u16) -> Result<CellRef> {
+        if let Some((page_no, mutation_counter, cell_idx, slot)) = self.current_cell_memo.get()
+            && page_no == entry.page_no
+            && mutation_counter == entry.mutation_counter
+            && cell_idx == idx
+        {
+            return Ok(slot.into_cell_ref());
+        }
+        let cell = self.parse_cell_at_uncached(entry, idx)?;
+        self.current_cell_memo.set(Some((
+            entry.page_no,
+            entry.mutation_counter,
+            idx,
+            CachedCellSlot::from_cell_ref(&cell),
+        )));
+        Ok(cell)
     }
 
     /// Parse a cell without updating the cursor-local cell-slot cache.
@@ -6070,7 +6104,7 @@ impl<P: PageWriter> BtCursor<P> {
             self.last_insert_rowid = records.last().map(|record| record.0);
             self.clear_rightmost_leaf_cache();
             self.clear_seek_cache();
-            self.cell_slot_cache.get_mut().clear();
+            self.clear_cell_slot_caches();
             self.last_known_depth = Some(1);
             self.bump_row_image_epoch();
             return Ok(true);
@@ -6124,7 +6158,7 @@ impl<P: PageWriter> BtCursor<P> {
                 self.last_insert_rowid = records.last().map(|record| record.0);
                 self.clear_rightmost_leaf_cache();
                 self.clear_seek_cache();
-                self.cell_slot_cache.get_mut().clear();
+                self.clear_cell_slot_caches();
                 self.last_known_depth = Some(depth);
                 self.bump_row_image_epoch();
                 return Ok(true);
@@ -6397,7 +6431,7 @@ impl<P: PageWriter> BtCursor<P> {
         self.last_insert_rowid = records.last().map(|record| record.0);
         self.clear_rightmost_leaf_cache();
         self.clear_seek_cache();
-        self.cell_slot_cache.get_mut().clear();
+        self.clear_cell_slot_caches();
         self.last_known_depth = Some(2);
         self.bump_row_image_epoch();
         Ok(true)
@@ -10660,7 +10694,7 @@ impl<P: PageWriter> BtCursor<P> {
         self.at_eof = true;
         self.clear_rightmost_leaf_cache();
         self.clear_seek_cache();
-        self.cell_slot_cache.get_mut().clear();
+        self.clear_cell_slot_caches();
         self.bump_row_image_epoch();
         Ok(())
     }
@@ -10700,7 +10734,7 @@ impl<P: PageWriter> BtCursor<P> {
         self.at_eof = true;
         self.clear_rightmost_leaf_cache();
         self.clear_seek_cache();
-        self.cell_slot_cache.get_mut().clear();
+        self.clear_cell_slot_caches();
         self.bump_row_image_epoch();
         Ok(())
     }
@@ -11520,7 +11554,7 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
             instrumentation::record_owned_payload_materialization(payload.len());
             return Ok(payload.to_vec());
         }
-        let cell = self.parse_cell_at(top, top.cell_idx)?;
+        let cell = self.parse_current_cell(top, top.cell_idx)?;
         match self.read_cell_payload(cx, top, &cell).await? {
             Cow::Borrowed(bytes) => {
                 instrumentation::record_owned_payload_materialization(bytes.len());
@@ -11541,7 +11575,7 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
         if self.local_leaf_table_payload_into(top, top.cell_idx, buf)? {
             return Ok(());
         }
-        let cell = self.parse_cell_at(top, top.cell_idx)?;
+        let cell = self.parse_current_cell(top, top.cell_idx)?;
 
         self.read_cell_payload_into(cx, top, &cell, buf).await
     }
@@ -11618,7 +11652,7 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
         if self.local_leaf_table_payload_prefix_into(top, top.cell_idx, max_prefix_bytes, buf)? {
             return Ok(());
         }
-        let cell = self.parse_cell_at(top, top.cell_idx)?;
+        let cell = self.parse_current_cell(top, top.cell_idx)?;
 
         self.read_cell_payload_prefix_into(cx, top, &cell, max_prefix_bytes, buf)
             .await
@@ -11639,7 +11673,7 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
         }
         let cell = {
             let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::BtreeCursor);
-            self.parse_cell_at(top, top.cell_idx)?
+            self.parse_current_cell(top, top.cell_idx)?
         };
         if let Some(rowid) = cell.rowid {
             return Ok(rowid);
