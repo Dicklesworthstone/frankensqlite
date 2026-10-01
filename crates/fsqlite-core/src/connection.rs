@@ -81061,8 +81061,21 @@ impl Connection {
 
     /// Handle GROUP BY + JOIN by materializing the join first, then applying
     /// GROUP BY aggregation directly on the joined rows.
-    #[allow(clippy::too_many_lines)]
     async fn execute_group_by_join_select(
+        &self,
+        cx: &Cx,
+        select: &SelectStatement,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Vec<Row>> {
+        // bd-24pa2: a reference to a column no source has surfaces from the
+        // row evaluator as an internal error; report it as SQLite does.
+        self.execute_group_by_join_select_inner(cx, select, params)
+            .await
+            .map_err(nested_order_column_error)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn execute_group_by_join_select_inner(
         &self,
         cx: &Cx,
         select: &SelectStatement,

@@ -124,6 +124,35 @@ async fn opcodes(conn: &Connection, sql: &str) -> Vec<String> {
         .collect()
 }
 
+/// bd-24pa2: an aggregate over a join that names a column no source has
+/// reports SQLite's `no such column`, not an internal error.
+#[test]
+fn join_aggregate_unknown_column_reports_no_such_column() {
+    for path in [None, Some("join_aggregate_unknown_column.db")] {
+        asupersync::test_utils::run_test(|| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let target = path.map_or_else(
+                || ":memory:".to_owned(),
+                |name| dir.path().join(name).to_string_lossy().into_owned(),
+            );
+            let f = Connection::open(&target).await.unwrap();
+            for sql in SETUP {
+                f.execute(sql).await.unwrap();
+            }
+            for sql in [
+                "SELECT count(*), sum(zz.c) FROM u JOIN e ON e.a = u.a",
+                "SELECT u.b, max(zz.c) FROM u JOIN t ON t.a = u.a GROUP BY u.b",
+            ] {
+                let err = f.query(sql).await.expect_err(sql).to_string();
+                assert!(
+                    err.contains("no such column: zz.c") && !err.contains("internal"),
+                    "`{sql}`: {err}"
+                );
+            }
+        });
+    }
+}
+
 #[test]
 fn join_aggregates_over_lookups_match_sqlite() {
     for indexed in [false, true] {
