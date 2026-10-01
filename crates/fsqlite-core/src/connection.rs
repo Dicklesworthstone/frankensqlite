@@ -38663,6 +38663,15 @@ impl Connection {
                 {
                     return Ok(rows);
                 }
+                if implicit_aggregate
+                    && !custom_implicit_aggregate
+                    && self.select_join_aggregate_is_vdbe_candidate(select)
+                    && let Some(rows) =
+                        Box::pin(self.try_execute_join_aggregate_program(cx, select, params))
+                            .await?
+                {
+                    return Ok(rows);
+                }
                 // Check if this is an expression-only SELECT (no FROM clause).
                 if is_expression_only_select(select) {
                     // Fallback codegen: eagerly rewrite IN subqueries.
@@ -47515,6 +47524,106 @@ impl Connection {
         }
 
         resolve_qualified_column(sum_arg_col).is_some()
+    }
+
+    /// bd-41o3t: an implicit aggregate over one INNER or LEFT join of two
+    /// base tables (`SELECT count(*) FROM u JOIN t ON t.a = u.a`). VDBE
+    /// codegen compiles the single-lookup form into a loop that feeds each
+    /// match to AggStep; `try_execute_join_aggregate_program` falls back to
+    /// the general join-aggregate path for any shape codegen declines.
+    fn select_join_aggregate_is_vdbe_candidate(&self, select: &SelectStatement) -> bool {
+        use fsqlite_ast::{FunctionArgs, JoinConstraint, JoinKind};
+
+        let SelectCore::Select {
+            columns,
+            from: Some(from),
+            where_clause,
+            group_by,
+            having,
+            distinct,
+            ..
+        } = &select.body.select
+        else {
+            return false;
+        };
+        if !self.pager.is_file_backed()
+            || self.time_travel_active.get()
+            || from.joins.len() != 1
+            || !group_by.is_empty()
+            || having.is_some()
+            || *distinct != Distinctness::All
+            || select.with.is_some()
+            || !select.body.compounds.is_empty()
+            || !select.order_by.is_empty()
+            || select.limit.is_some()
+            || has_ordered_aggregate(select)
+            || has_window_functions(select)
+            || has_fallback_from_source(select)
+            || has_table_function_source(select)
+            || select_contains_match_operator(select)
+            || select_contains_rewritable_subquery(select)
+            || select_has_correlated_join_subquery(select)
+            || self.has_primary_live_vtab_source(select)
+        {
+            return false;
+        }
+        let join = &from.joins[0];
+        let vdbe_expr = |expr: &Expr| !expr_has_any_subquery(expr) && join_expr_is_vdbe_eligible(expr);
+        let base_table = |source: &TableOrSubquery| {
+            matches!(source, TableOrSubquery::Table { .. })
+                && !table_or_subquery_in_attached_schema(source)
+        };
+        if !base_table(&from.source)
+            || !base_table(&join.table)
+            || !matches!(join.join_type.kind, JoinKind::Inner | JoinKind::Left)
+            || join.join_type.natural
+            || !matches!(&join.constraint, Some(JoinConstraint::On(on)) if vdbe_expr(on))
+            || where_clause.as_ref().is_some_and(|expr| !vdbe_expr(expr))
+        {
+            return false;
+        }
+        columns.iter().all(|column| {
+            let ResultColumn::Expr {
+                expr: Expr::FunctionCall { name, args, .. },
+                ..
+            } = column
+            else {
+                return false;
+            };
+            self.function_call_is_current_aggregate(name, args)
+                && current_application_function_kind(name, aggregate_args_len_for_lookup(args))
+                    .is_none()
+                && match args {
+                    FunctionArgs::Star => true,
+                    FunctionArgs::List(args) => args.iter().all(vdbe_expr),
+                }
+        })
+    }
+
+    /// Run an implicit aggregate over a join through VDBE codegen. `None`
+    /// when codegen declines the shape (only single-lookup joins compile).
+    async fn try_execute_join_aggregate_program(
+        &self,
+        cx: &Cx,
+        select: &SelectStatement,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Option<Vec<Row>>> {
+        // Any compile error, including a genuine one, falls back: the general
+        // path reports it the way it always has.
+        let Ok(program) = self.compile_table_select(select).await else {
+            return Ok(None);
+        };
+        let (rows, _, _) = self
+            .execute_table_program_with_cx(
+                &program,
+                params,
+                false,
+                TableExecutionRuntimeRequirements::read_path(),
+                cx,
+                false,
+            )
+            .await?;
+        Ok(Some(rows))
     }
 
     fn prepared_count_indexed_rowid_probe_fast_path(

@@ -2949,6 +2949,27 @@ pub fn codegen_select(
             }
         )
     });
+    if !from_clause.joins.is_empty()
+        && group_by.is_empty()
+        && having.is_none()
+        && distinct == Distinctness::All
+        && stmt.order_by.is_empty()
+        && stmt.limit.is_none()
+        && time_travel.is_none()
+        && !join_has_time_travel
+        && let Some(aggregates) = join_aggregate_terms(columns)
+    {
+        return codegen_join_aggregate_select(
+            b,
+            stmt,
+            from_clause,
+            columns,
+            where_clause.as_deref(),
+            &aggregates,
+            schema,
+            ctx,
+        );
+    }
     if !from_clause.joins.is_empty() {
         let simple_join_eligible = !has_aggregate_columns(columns)
             && group_by.is_empty()
@@ -11165,6 +11186,211 @@ struct SingleJoinLookupPlan<'a> {
     lookup_target: SingleJoinLookupTarget<'a>,
 }
 
+/// One result column of an implicit aggregate over a single-lookup join
+/// (`SELECT count(*), sum(t.c) FROM u JOIN t ON t.a = u.a`).
+struct JoinAggregateTerm<'a> {
+    /// Lowercase builtin name: count, sum, total, avg, min or max.
+    name: String,
+    /// The argument; `None` for `count(*)`.
+    arg: Option<&'a Expr>,
+}
+
+/// The aggregate terms when every result column is a plain builtin
+/// count/sum/total/avg/min/max call (no DISTINCT, FILTER, ORDER BY or OVER)
+/// that an application function does not override.
+fn join_aggregate_terms(columns: &[ResultColumn]) -> Option<Vec<JoinAggregateTerm<'_>>> {
+    use fsqlite_ast::FunctionArgs;
+
+    columns
+        .iter()
+        .map(|column| {
+            let ResultColumn::Expr {
+                expr:
+                    Expr::FunctionCall {
+                        name,
+                        args,
+                        distinct: false,
+                        order_by,
+                        filter: None,
+                        over: None,
+                        ..
+                    },
+                ..
+            } = column
+            else {
+                return None;
+            };
+            if !order_by.is_empty() {
+                return None;
+            }
+            let name = name.to_ascii_lowercase();
+            let arg = match args {
+                FunctionArgs::Star if name == "count" => None,
+                FunctionArgs::List(args)
+                    if args.len() == 1
+                        && matches!(
+                            name.as_str(),
+                            "count" | "sum" | "total" | "avg" | "min" | "max"
+                        ) =>
+                {
+                    Some(&args[0])
+                }
+                _ => return None,
+            };
+            let arity = i32::from(arg.is_some());
+            builtin_aggregate_semantics_available(&name, arity)
+                .then_some(JoinAggregateTerm { name, arg })
+        })
+        .collect()
+}
+
+/// Whether an aggregate argument is a value the join loop can compute:
+/// columns of the two tables and literals under arithmetic or concatenation.
+/// For min/max, a column with a non-BINARY collation is refused, since the
+/// comparison would have to honor it.
+fn join_aggregate_arg_supported(
+    expr: &Expr,
+    tables: &[(&TableSchema, Option<&str>)],
+    min_or_max: bool,
+) -> bool {
+    match expr {
+        Expr::Literal(..) => true,
+        Expr::Column(col_ref, _) => {
+            resolve_join_column(col_ref.table.as_deref(), &col_ref.column, tables).is_ok_and(
+                |(cursor, col_idx)| {
+                    !min_or_max
+                        || tables[cursor as usize].0.columns[col_idx]
+                            .collation
+                            .as_deref()
+                            .is_none_or(|collation| collation.eq_ignore_ascii_case("BINARY"))
+                },
+            )
+        }
+        Expr::BinaryOp {
+            left, op, right, ..
+        } => {
+            matches!(
+                op,
+                fsqlite_ast::BinaryOp::Add
+                    | fsqlite_ast::BinaryOp::Subtract
+                    | fsqlite_ast::BinaryOp::Multiply
+                    | fsqlite_ast::BinaryOp::Divide
+                    | fsqlite_ast::BinaryOp::Modulo
+                    | fsqlite_ast::BinaryOp::Concat
+            ) && join_aggregate_arg_supported(left, tables, min_or_max)
+                && join_aggregate_arg_supported(right, tables, min_or_max)
+        }
+        Expr::UnaryOp {
+            op: fsqlite_ast::UnaryOp::Negate,
+            expr,
+            ..
+        } => join_aggregate_arg_supported(expr, tables, min_or_max),
+        _ => false,
+    }
+}
+
+/// Compile an implicit aggregate over one INNER or LEFT join whose ON is a
+/// single rowid or index lookup. Each match feeds AggStep directly instead of
+/// materializing joined rows. Any other shape is `Unsupported`, so the
+/// connection runs its general join-aggregate path.
+#[allow(clippy::too_many_arguments)]
+fn codegen_join_aggregate_select(
+    b: &mut ProgramBuilder,
+    stmt: &SelectStatement,
+    from: &FromClause,
+    columns: &[ResultColumn],
+    where_clause: Option<&Expr>,
+    aggregates: &[JoinAggregateTerm<'_>],
+    schema: &[TableSchema],
+    ctx: &CodegenContext,
+) -> Result<(), CodegenError> {
+    use fsqlite_ast::{JoinConstraint, JoinKind, TableOrSubquery};
+
+    let unsupported =
+        || CodegenError::Unsupported("aggregate over this JOIN shape in VDBE codegen".to_owned());
+    let ([join], TableOrSubquery::Table { name, alias, .. }) = (from.joins.as_slice(), &from.source)
+    else {
+        return Err(unsupported());
+    };
+    let TableOrSubquery::Table {
+        name: right_name,
+        alias: right_alias,
+        ..
+    } = &join.table
+    else {
+        return Err(unsupported());
+    };
+    let (Some(JoinConstraint::On(on_expr)), false, JoinKind::Inner | JoinKind::Left) = (
+        join.constraint.as_ref(),
+        join.join_type.natural,
+        join.join_type.kind,
+    ) else {
+        return Err(unsupported());
+    };
+    let left_table = find_table(schema, &name.name)?;
+    let right_table = find_table(schema, &right_name.name)?;
+    let (left_alias, right_alias) = (alias.as_deref(), right_alias.as_deref());
+    let tables = [(left_table, left_alias), (right_table, right_alias)];
+    if !aggregates.iter().all(|term| {
+        term.arg.is_none_or(|arg| {
+            join_aggregate_arg_supported(arg, &tables, matches!(term.name.as_str(), "min" | "max"))
+        })
+    }) {
+        return Err(unsupported());
+    }
+
+    let kind = join.join_type.kind;
+    if let Some(plan) = resolve_single_join_lookup_plan(
+        left_table,
+        left_alias,
+        right_table,
+        right_alias,
+        kind,
+        Some(on_expr),
+    ) {
+        return codegen_single_join_lookup_select(
+            b,
+            stmt,
+            columns,
+            where_clause,
+            left_table,
+            left_alias,
+            right_table,
+            right_alias,
+            &plan,
+            ctx,
+            aggregates,
+        );
+    }
+    // An inner join may drive from either side. SQLite also drives from the
+    // side that lets the other be looked up.
+    if kind == JoinKind::Inner
+        && let Some(plan) = resolve_single_join_lookup_plan(
+            right_table,
+            right_alias,
+            left_table,
+            left_alias,
+            kind,
+            Some(on_expr),
+        )
+    {
+        return codegen_single_join_lookup_select(
+            b,
+            stmt,
+            columns,
+            where_clause,
+            right_table,
+            right_alias,
+            left_table,
+            left_alias,
+            &plan,
+            ctx,
+            aggregates,
+        );
+    }
+    Err(unsupported())
+}
+
 /// Whether `expr` is a join key computed from `table`'s columns and literals
 /// using only arithmetic or concatenation. Those operators carry no affinity
 /// or collation, so SQLite compares the result under the lookup column's
@@ -11422,6 +11648,49 @@ fn emit_join_output_or_sort(
     Ok(())
 }
 
+/// Feed the current joined row to each aggregate's accumulator.
+fn emit_join_aggregate_steps(
+    b: &mut ProgramBuilder,
+    aggregates: &[JoinAggregateTerm<'_>],
+    accum_base: i32,
+    tables: &[(&TableSchema, Option<&str>)],
+    ctx: &CodegenContext,
+) -> Result<(), CodegenError> {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    for (i, term) in aggregates.iter().enumerate() {
+        let accum_reg = accum_base + i as i32;
+        let p4 = P4::FuncName(term.name.clone());
+        if let Some(arg) = term.arg {
+            let arg_reg = b.alloc_reg();
+            emit_join_expr(b, arg, arg_reg, tables, ctx)?;
+            b.emit_op(Opcode::AggStep, 0, arg_reg, accum_reg, p4, 1);
+        } else {
+            b.emit_op(Opcode::AggStep, 0, 0, accum_reg, p4, 0);
+        }
+    }
+    Ok(())
+}
+
+/// Emit a joined row: fold it into the aggregates when there are any,
+/// otherwise output it (or feed the ORDER BY sorter).
+#[allow(clippy::too_many_arguments)]
+fn emit_join_lookup_match(
+    b: &mut ProgramBuilder,
+    columns: &[ResultColumn],
+    out_regs: i32,
+    tables: &[(&TableSchema, Option<&str>)],
+    ctx: &CodegenContext,
+    sorter: Option<(i32, i32, usize, i32)>,
+    order_by: &[OrderingTerm],
+    aggregates: &[JoinAggregateTerm<'_>],
+    accum_base: Option<i32>,
+) -> Result<(), CodegenError> {
+    match accum_base {
+        Some(base) => emit_join_aggregate_steps(b, aggregates, base, tables, ctx),
+        None => emit_join_output_or_sort(b, columns, out_regs, tables, ctx, sorter, order_by),
+    }
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn codegen_single_join_lookup_select(
     b: &mut ProgramBuilder,
@@ -11434,6 +11703,9 @@ fn codegen_single_join_lookup_select(
     right_alias: Option<&str>,
     plan: &SingleJoinLookupPlan<'_>,
     ctx: &CodegenContext,
+    // Non-empty: fold each joined row into these aggregates and emit one
+    // result row at the end, instead of one row per match.
+    aggregates: &[JoinAggregateTerm<'_>],
 ) -> Result<(), CodegenError> {
     let end_label = b.emit_label();
     let done_label = b.emit_label();
@@ -11443,6 +11715,22 @@ fn codegen_single_join_lookup_select(
     let tables = [(left_table, left_alias), (right_table, right_alias)];
     let out_col_count = resolve_join_output_count(columns, &tables);
     let out_regs = b.alloc_regs(out_col_count as i32);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let accum_base = (!aggregates.is_empty()).then(|| {
+        let base = b.alloc_regs(aggregates.len() as i32);
+        for i in 0..aggregates.len() as i32 {
+            b.emit_op(Opcode::Null, 0, base + i, 0, P4::None, 0);
+        }
+        base
+    });
+    // An aggregate that reads no right-table column (count(*) over an index
+    // lookup) needs only the index entry, not the table row.
+    let seek_right_row = accum_base.is_none()
+        || where_clause.is_some_and(|expr| expr_references_scan(expr, right_table, right_alias))
+        || aggregates.iter().any(|term| {
+            term.arg
+                .is_some_and(|arg| expr_references_scan(arg, right_table, right_alias))
+        });
 
     let left_cursor = 0_i32;
     let right_cursor = 1_i32;
@@ -11557,7 +11845,17 @@ fn codegen_single_join_lookup_select(
                 emit_join_expr(b, where_expr, cond_reg, &tables, ctx)?;
                 b.emit_jump_to_label(Opcode::IfNot, cond_reg, 1, matched_skip, P4::None, 0);
             }
-            emit_join_output_or_sort(b, columns, out_regs, &tables, ctx, sorter, &stmt.order_by)?;
+            emit_join_lookup_match(
+                b,
+                columns,
+                out_regs,
+                &tables,
+                ctx,
+                sorter,
+                &stmt.order_by,
+                aggregates,
+                accum_base,
+            )?;
             b.resolve_label(matched_skip);
             b.resolve_label(no_match);
         }
@@ -11623,17 +11921,19 @@ fn codegen_single_join_lookup_select(
                 comparison_p4,
                 0,
             );
-            let rowid_reg = b.alloc_reg();
-            b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
             let idx_advance = b.emit_label();
-            b.emit_jump_to_label(
-                Opcode::SeekRowid,
-                right_cursor,
-                rowid_reg,
-                idx_advance,
-                P4::None,
-                0,
-            );
+            if seek_right_row {
+                let rowid_reg = b.alloc_reg();
+                b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
+                b.emit_jump_to_label(
+                    Opcode::SeekRowid,
+                    right_cursor,
+                    rowid_reg,
+                    idx_advance,
+                    P4::None,
+                    0,
+                );
+            }
             if let Some(match_reg) = left_join_match_reg {
                 b.emit_op(Opcode::Integer, 1, match_reg, 0, P4::None, 0);
             }
@@ -11642,7 +11942,17 @@ fn codegen_single_join_lookup_select(
                 emit_join_expr(b, where_expr, cond_reg, &tables, ctx)?;
                 b.emit_jump_to_label(Opcode::IfNot, cond_reg, 1, idx_advance, P4::None, 0);
             }
-            emit_join_output_or_sort(b, columns, out_regs, &tables, ctx, sorter, &stmt.order_by)?;
+            emit_join_lookup_match(
+                b,
+                columns,
+                out_regs,
+                &tables,
+                ctx,
+                sorter,
+                &stmt.order_by,
+                aggregates,
+                accum_base,
+            )?;
             b.resolve_label(idx_advance);
             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
             let idx_loop_body = idx_loop_top as i32;
@@ -11675,12 +11985,45 @@ fn codegen_single_join_lookup_select(
                 0,
             );
         }
-        emit_join_output_or_sort(b, columns, out_regs, &tables, ctx, sorter, &stmt.order_by)?;
+        emit_join_lookup_match(
+            b,
+            columns,
+            out_regs,
+            &tables,
+            ctx,
+            sorter,
+            &stmt.order_by,
+            aggregates,
+            accum_base,
+        )?;
         b.resolve_label(skip_left_join_null_row);
     }
 
     b.emit_jump_to_label(Opcode::Next, left_cursor, 0, next_left_label, P4::None, 0);
     b.resolve_label(done_label);
+
+    if let Some(base) = accum_base {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        for (i, term) in aggregates.iter().enumerate() {
+            b.emit_op(
+                Opcode::AggFinal,
+                base + i as i32,
+                i32::from(term.arg.is_some()),
+                0,
+                P4::FuncName(term.name.clone()),
+                0,
+            );
+        }
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        b.emit_op(
+            Opcode::ResultRow,
+            base,
+            aggregates.len() as i32,
+            0,
+            P4::None,
+            0,
+        );
+    }
 
     if let Some((sort_cursor, sort_regs, sort_key_count, _sort_record_reg)) = sorter {
         let sort_loop = b.emit_label();
@@ -12382,6 +12725,7 @@ fn codegen_join_select(
             right_alias.as_deref(),
             &plan,
             ctx,
+            &[],
         );
     }
 
