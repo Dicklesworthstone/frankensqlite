@@ -81291,6 +81291,18 @@ impl Connection {
             })
             .collect();
 
+        // Snapshot collation registry once before the O(N log N) sorts.
+        let coll_snap = lock_unpoisoned(self.collation_registry.as_ref()).clone();
+        let cmp_group_keys = |k1: &[SqliteValue], k2: &[SqliteValue]| {
+            for (i, (av, bv)) in k1.iter().zip(k2.iter()).enumerate() {
+                let coll = group_collations.get(i).and_then(|c| c.as_deref());
+                let ord = cmp_sqlite_values_collated_snapshot(av, bv, coll, &coll_snap);
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+            std::cmp::Ordering::Equal
+        };
         let mut groups: Vec<(Vec<SqliteValue>, Vec<Vec<SqliteValue>>)> = Vec::new();
         if !group_by_exprs.is_empty() && group_keys_support_hash_grouping(&group_collations) {
             let mut group_index: HashMap<HashableJoinKey, usize> = HashMap::new();
@@ -81318,6 +81330,9 @@ impl Connection {
                     group_index.insert(key_hash, group_idx);
                 }
             }
+            // SQLite emits groups in key order (its sorter, or an index that
+            // yields that order), not in first-seen order.
+            groups.sort_by(|(k1, _), (k2, _)| cmp_group_keys(k1, k2));
         } else {
             // Step 5: Group the joined rows by evaluating GROUP BY expressions.
             // Optimization: Sort rows by group key to avoid O(N*M) linear scans.
@@ -81336,18 +81351,7 @@ impl Connection {
                 keyed_rows.push((key, row.values));
             }
 
-            // Snapshot collation registry once before the O(N log N) sort.
-            let coll_snap = lock_unpoisoned(self.collation_registry.as_ref()).clone();
-            keyed_rows.sort_by(|(k1, _), (k2, _)| {
-                for (i, (av, bv)) in k1.iter().zip(k2.iter()).enumerate() {
-                    let coll = group_collations.get(i).and_then(|c| c.as_deref());
-                    let ord = cmp_sqlite_values_collated_snapshot(av, bv, coll, &coll_snap);
-                    if ord != std::cmp::Ordering::Equal {
-                        return ord;
-                    }
-                }
-                std::cmp::Ordering::Equal
-            });
+            keyed_rows.sort_by(|(k1, _), (k2, _)| cmp_group_keys(k1, k2));
 
             for (key, row_values) in keyed_rows {
                 if let Some(last_group) = groups.last_mut()
@@ -81366,7 +81370,6 @@ impl Connection {
         }
 
         // Step 6: Build result rows from groups.
-        let coll_snap = lock_unpoisoned(self.collation_registry.as_ref()).clone();
         let empty_group_row = vec![SqliteValue::Null; col_map.len()];
         let mut result = Vec::with_capacity(groups.len());
         let mut result_group_indices = Vec::with_capacity(groups.len());

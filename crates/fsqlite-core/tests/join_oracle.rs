@@ -191,3 +191,29 @@ fn cross_using_natural_derived() {
         agree(D, "SELECT a.name, s.total FROM a JOIN (SELECT aid, sum(val) total FROM b GROUP BY aid) s ON s.aid = a.id ORDER BY a.name", "join against a derived table").await;
     });
 }
+
+/// Rows reach each group out of key order: first-seen tags are b, a, NULL.
+const G: &[&str] = &[
+    "CREATE TABLE u(id INTEGER PRIMARY KEY, tag TEXT, k INT)",
+    "CREATE TABLE t(id INTEGER PRIMARY KEY, uid INT, v INT)",
+    "INSERT INTO u VALUES (1,'b',2),(2,'a',1),(3,'c',NULL),(4,'B',2),(5,NULL,3),(6,'a',1)",
+    "INSERT INTO t VALUES (1,1,10),(2,2,20),(3,5,30),(4,4,40),(5,3,50),(6,6,60),(7,1,70)",
+];
+
+/// Without ORDER BY, SQLite emits the groups of a join in GROUP BY key order.
+#[test]
+fn join_group_by_without_order_by_emits_key_order() {
+    asupersync::test_utils::run_test(|| async {
+        for sql in [
+            "SELECT u.tag, count(*) FROM u JOIN t ON t.uid = u.id GROUP BY u.tag",
+            "SELECT u.tag, count(*) FROM t JOIN u ON u.id = t.uid GROUP BY u.tag",
+            "SELECT u.tag, count(*) FROM u, t WHERE t.uid = u.id GROUP BY u.tag",
+            "SELECT u.k, u.tag, sum(t.v) FROM u JOIN t ON t.uid = u.id GROUP BY u.k, u.tag",
+            "SELECT count(*), sum(t.v) FROM u JOIN t ON t.uid = u.id GROUP BY u.tag COLLATE NOCASE",
+            "SELECT t.v % 3, count(u.id) FROM t LEFT JOIN u ON u.id = t.uid + 1 GROUP BY 1",
+            "SELECT u.tag, max(t.v) FROM u JOIN t ON t.uid = u.id GROUP BY u.tag HAVING count(*) > 0",
+        ] {
+            agree(G, sql, "GROUP BY over a join without ORDER BY").await;
+        }
+    });
+}
