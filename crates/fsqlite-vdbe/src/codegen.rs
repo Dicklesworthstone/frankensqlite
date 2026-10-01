@@ -10928,6 +10928,8 @@ fn codegen_grouped_inner_join_count_sum_select(
             );
             let no_match = b.emit_label();
             b.emit_jump_to_label(Opcode::IsNull, probe_reg, 0, no_match, P4::None, 0);
+            // 2.5 or 'abc' names no rowid; '2' names rowid 2 (SQLite's seek).
+            b.emit_jump_to_label(Opcode::MustBeInt, probe_reg, 0, no_match, P4::None, 0);
             b.emit_jump_to_label(
                 Opcode::SeekRowid,
                 right_cursor,
@@ -11502,6 +11504,13 @@ fn resolve_single_join_lookup_plan<'a>(
         SortKeySource::Column(col_idx) => {
             if probe_expr.is_some() {
                 probe_affinity = Some(right_table.columns.get(col_idx)?.affinity);
+            } else if !join_lookup_column_pair_compares_raw(
+                left_table,
+                &probe_source,
+                right_table,
+                col_idx,
+            )? {
+                return None;
             }
             let column_name = &right_table.columns.get(col_idx)?.name;
             let comparison_tables = [(left_table, left_alias), (right_table, right_alias)];
@@ -11524,6 +11533,34 @@ fn resolve_single_join_lookup_plan<'a>(
         probe_affinity,
         lookup_target,
     })
+}
+
+/// Whether a plain `probe_column = lookup_column` join key can drive an index
+/// lookup with the raw probe value.
+///
+/// SQLite applies comparison affinity to `=`: a numeric column coerces a TEXT
+/// or typeless operand to a number, so `t.a = u.b` with `t.a` INTEGER and
+/// `u.b` TEXT `'1'` matches `1`. An index lookup that seeks with the raw probe
+/// misses such rows, and a numeric probe into a TEXT or typeless index cannot
+/// be served at all (`sqlite3IndexAffinityOk`). The index lanes therefore take
+/// a column pair only when the comparison converts nothing, and leave every
+/// other pair to the general join. Rowid lookups do not need this check: their
+/// probe goes through `MustBeInt`, which applies the same numeric coercion.
+fn join_lookup_column_pair_compares_raw(
+    probe_table: &TableSchema,
+    probe_source: &SortKeySource,
+    lookup_table: &TableSchema,
+    lookup_col_idx: usize,
+) -> Option<bool> {
+    let probe_affinity = match probe_source {
+        SortKeySource::Rowid => b'D',
+        SortKeySource::Column(probe_col_idx) => {
+            schema_column_expr_affinity(probe_table.columns.get(*probe_col_idx)?)
+        }
+        SortKeySource::Expression(_) => return None,
+    };
+    let lookup_affinity = schema_column_expr_affinity(lookup_table.columns.get(lookup_col_idx)?);
+    Some(combine_declared_comparison_affinity(lookup_affinity, true, probe_affinity, true) == 0)
 }
 
 fn emit_join_probe_source(
@@ -11823,11 +11860,10 @@ fn codegen_single_join_lookup_select(
             }
             let no_match = b.emit_label();
             b.emit_jump_to_label(Opcode::IsNull, probe_reg, 0, no_match, P4::None, 0);
-            if plan.probe_expr.is_some() {
-                // A computed key must name a rowid exactly: 2.5 or 'abc' matches
-                // nothing rather than a truncated rowid, as in SQLite's seek.
-                b.emit_jump_to_label(Opcode::MustBeInt, probe_reg, 0, no_match, P4::None, 0);
-            }
+            // The key must name a rowid exactly, computed or a plain column:
+            // 2.5 or 'abc' matches nothing rather than a truncated rowid, and
+            // '2' finds rowid 2, as in SQLite's seek.
+            b.emit_jump_to_label(Opcode::MustBeInt, probe_reg, 0, no_match, P4::None, 0);
             b.emit_jump_to_label(
                 Opcode::SeekRowid,
                 right_cursor,
@@ -12205,6 +12241,14 @@ fn resolve_multi_join_lookup_plan<'a>(
         let lookup_target = match lookup_source {
             SortKeySource::Rowid => SingleJoinLookupTarget::Rowid,
             SortKeySource::Column(col_idx) => {
+                if !join_lookup_column_pair_compares_raw(
+                    tables.get(probe_table_index)?.0,
+                    &probe_source,
+                    right_table,
+                    col_idx,
+                )? {
+                    return None;
+                }
                 let column_name = &right_table.columns.get(col_idx)?.name;
                 // The multi-join fast path is only correct when the probe key
                 // yields at most one row. Pick any direct-lookup single-column
@@ -12419,6 +12463,8 @@ fn codegen_multi_join_lookup_select(
 
         match &step.lookup_target {
             SingleJoinLookupTarget::Rowid => {
+                // 2.5 or 'abc' names no rowid; '2' names rowid 2 (SQLite's seek).
+                b.emit_jump_to_label(Opcode::MustBeInt, probe_base, 0, miss_label, P4::None, 0);
                 b.emit_jump_to_label(
                     Opcode::SeekRowid,
                     right_cursor,
