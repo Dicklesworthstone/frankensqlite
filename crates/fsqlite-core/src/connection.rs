@@ -9187,11 +9187,7 @@ impl PreparedStatement<'_> {
             self.prepared_table_program_runtime_inputs();
         let runtime_inputs = match static_runtime_inputs {
             Some(inputs) => inputs,
-            None => {
-                self.conn
-                    .table_execution_runtime_inputs(runtime_requirements)
-                    .await
-            }
+            None => self.conn.table_execution_runtime_inputs(runtime_requirements),
         };
         let cookie = *self.conn.schema_cookie.borrow();
         let txn = self.conn.active_txn.borrow_mut().take().ok_or_else(|| {
@@ -9366,11 +9362,7 @@ impl PreparedStatement<'_> {
             self.prepared_table_program_runtime_inputs();
         let runtime_inputs = match static_runtime_inputs {
             Some(inputs) => inputs,
-            None => {
-                self.conn
-                    .table_execution_runtime_inputs(runtime_requirements)
-                    .await
-            }
+            None => self.conn.table_execution_runtime_inputs(runtime_requirements),
         };
         let cookie = *self.conn.schema_cookie.borrow();
         let had_active_txn = self.conn.active_txn.borrow().is_some();
@@ -9555,11 +9547,7 @@ impl PreparedStatement<'_> {
             self.prepared_table_program_runtime_inputs();
         let runtime_inputs = match static_runtime_inputs {
             Some(inputs) => inputs,
-            None => {
-                self.conn
-                    .table_execution_runtime_inputs(runtime_requirements)
-                    .await
-            }
+            None => self.conn.table_execution_runtime_inputs(runtime_requirements),
         };
         let cookie = *self.conn.schema_cookie.borrow();
         let had_active_txn = self.conn.active_txn.borrow().is_some();
@@ -11903,9 +11891,10 @@ struct Stat1Hints {
 
 /// Schema-scoped execution metadata reused by table-backed VDBE runs.
 ///
-/// This caches only structural data derived from the schema graph. Values that
-/// are intentionally dynamic at execution time, such as evaluated column
-/// defaults or sqlite_sequence high-water marks, stay uncached.
+/// This caches only data derived from the schema graph. Values that are
+/// dynamic at execution time, such as sqlite_sequence high-water marks, stay
+/// uncached. Short-record column defaults are a pure function of the DEFAULT
+/// text (see `short_record_default_value`), so they are cached here (GH#440).
 #[derive(Clone)]
 struct TableExecutionMetadataCacheEntry {
     schema_generation: u64,
@@ -11920,14 +11909,16 @@ struct TableExecutionMetadataCacheEntry {
     /// report a rowid/IPK collision as `UNIQUE constraint failed: t.k` (matching
     /// stock) instead of the bare `PRIMARY KEY constraint failed`.
     ipk_label_by_root_page: Arc<HbHashMap<i32, String>>,
-    column_default_sql_by_root_page: Arc<HbHashMap<i32, Vec<Option<String>>>>,
+    /// Values a record that predates a column (ALTER TABLE ADD COLUMN) reads
+    /// for it, affinity-coerced; only tables with at least one default.
+    column_defaults_by_root_page: Arc<HbHashMap<i32, Vec<Option<SqliteValue>>>>,
     index_desc_flags_by_root_page: Arc<HbHashMap<i32, Vec<bool>>>,
     index_collations_by_root_page: Arc<HbHashMap<i32, Vec<Option<String>>>>,
     /// Declared->physical column permutation for WITHOUT ROWID tables whose
     /// PRIMARY KEY is non-leading/reordered (keyed by table root page). Absent
     /// for leading-PK tables (identity permutation). See `without_rowid_*`.
     wr_storage_order_by_root_page: Arc<HbHashMap<i32, Vec<usize>>>,
-    cached_read_runtime_inputs_no_defaults: Option<TableExecutionRuntimeInputs>,
+    cached_read_runtime_inputs: TableExecutionRuntimeInputs,
 }
 
 #[derive(Debug, Clone)]
@@ -13469,10 +13460,6 @@ pub struct Connection {
     /// statements. Avoids rebuilding structural root-page maps on every VDBE
     /// run while leaving dynamic defaults and sqlite_sequence values live.
     table_execution_metadata_cache: RefCell<Option<Arc<TableExecutionMetadataCacheEntry>>>,
-    /// Re-entrancy guard for evaluating column defaults via nested SELECTs.
-    /// Without this, runtime-input construction can recursively try to
-    /// rebuild the same default map while already evaluating a default.
-    column_default_eval_depth: Cell<usize>,
     /// Nesting depth of statement dispatch. Zero means the outermost
     /// (top-level) statement; a nested subquery / CTE sub-execution runs at
     /// depth > 0. Used so the `'now'` cache is reset only when a new top-level
@@ -13555,19 +13542,6 @@ pub struct Connection {
     /// falls back to the slow/instrumented path until the relevant
     /// state-transition site explicitly opens its bit.
     fast_path_gate: AtomicU32,
-}
-
-struct ColumnDefaultEvalGuard<'a> {
-    conn: &'a Connection,
-}
-
-impl Drop for ColumnDefaultEvalGuard<'_> {
-    fn drop(&mut self) {
-        let depth = self.conn.column_default_eval_depth.get();
-        self.conn
-            .column_default_eval_depth
-            .set(depth.saturating_sub(1));
-    }
 }
 
 /// RAII guard that raises `statement_exec_depth` for the lifetime of a statement
@@ -14966,7 +14940,6 @@ impl Connection {
             prepared_count_indexed_rowid_probe_last_result: RefCell::new(None),
             group_by_bucket_fast_memo: RefCell::new(None),
             table_execution_metadata_cache: RefCell::new(None),
-            column_default_eval_depth: Cell::new(0),
             statement_exec_depth: Cell::new(0),
             attached_schemas: RefCell::new(SchemaRegistry::new()),
             attach_env,
@@ -15530,7 +15503,6 @@ impl Connection {
             prepared_count_indexed_rowid_probe_last_result: RefCell::new(None),
             group_by_bucket_fast_memo: RefCell::new(None),
             table_execution_metadata_cache: RefCell::new(None),
-            column_default_eval_depth: Cell::new(0),
             statement_exec_depth: Cell::new(0),
             // ATTACH/DETACH schema registry (§12.11, bd-7pxb)
             attached_schemas: RefCell::new(SchemaRegistry::new()),
@@ -18116,7 +18088,7 @@ impl Connection {
     ) -> Result<BoundedDatabaseValidationStats> {
         self.validate_bounded_schema_support()?;
         let rowid_aliases = self.rowid_alias_column_by_root_page();
-        let column_defaults = self.column_defaults_by_root_page().await;
+        let column_defaults = self.column_defaults_by_root_page();
         self.with_integrity_txn(async |cx, txn| {
             let structural = self
                 .bounded_validate_structure_in_txn(cx, txn, spool_parent)
@@ -29194,7 +29166,7 @@ impl Connection {
         );
     }
 
-    async fn decode_table_row_values_from_payload(
+    fn decode_table_row_values_from_payload(
         &self,
         table: &TableSchema,
         rowid: i64,
@@ -29216,13 +29188,12 @@ impl Connection {
                 ),
             },
         )?;
-        self.inflate_table_row_values_for_storage_reload(
+        Self::inflate_table_row_values_for_storage_reload(
             table,
             rowid,
             &values,
             rowid_alias_column_index,
         )
-        .await
     }
 
     fn numeric_column_value_from_sqlite_value(value: SqliteValue) -> NumericColumnValue {
@@ -29234,7 +29205,7 @@ impl Connection {
         }
     }
 
-    async fn projected_table_row_numeric_sum_value_from_payload(
+    fn projected_table_row_numeric_sum_value_from_payload(
         &self,
         table: &TableSchema,
         rowid: i64,
@@ -29312,14 +29283,12 @@ impl Connection {
                     }
                 }
             } else {
-                let values = self
-                    .decode_table_row_values_from_payload(
-                        table,
-                        rowid,
-                        payload,
-                        rowid_alias_column_index,
-                    )
-                    .await?;
+                let values = self.decode_table_row_values_from_payload(
+                    table,
+                    rowid,
+                    payload,
+                    rowid_alias_column_index,
+                )?;
                 let value = memdb_row_value_with_rowid_alias(
                     rowid,
                     &values,
@@ -29349,21 +29318,20 @@ impl Connection {
             });
         }
 
-        let default_value = match table
+        let default_value = table
             .columns
             .get(column_index)
-            .and_then(|column| column.default_value.as_ref())
-        {
-            Some(default_sql) => {
-                self.evaluate_column_default_value(Some(default_sql))
-                    .await?
-            }
-            None => SqliteValue::Null,
-        };
+            .and_then(|column| {
+                column.default_value.as_deref().map(|sql| {
+                    Self::short_record_default_value(sql)
+                        .apply_affinity(affinity_char_to_type(column.affinity))
+                })
+            })
+            .unwrap_or(SqliteValue::Null);
         Ok(Self::numeric_column_value_from_sqlite_value(default_value))
     }
 
-    async fn projected_table_row_value_from_payload(
+    fn projected_table_row_value_from_payload(
         &self,
         table: &TableSchema,
         rowid: i64,
@@ -29439,14 +29407,12 @@ impl Connection {
                     }
                 }
             } else {
-                let values = self
-                    .decode_table_row_values_from_payload(
-                        table,
-                        rowid,
-                        payload,
-                        rowid_alias_column_index,
-                    )
-                    .await?;
+                let values = self.decode_table_row_values_from_payload(
+                    table,
+                    rowid,
+                    payload,
+                    rowid_alias_column_index,
+                )?;
                 return Ok(memdb_row_value_with_rowid_alias(
                     rowid,
                     &values,
@@ -29479,21 +29445,20 @@ impl Connection {
             });
         }
 
-        let default_value = match table
+        let default_value = table
             .columns
             .get(column_index)
-            .and_then(|column| column.default_value.as_ref())
-        {
-            Some(default_sql) => {
-                self.evaluate_column_default_value(Some(default_sql))
-                    .await?
-            }
-            None => SqliteValue::Null,
-        };
+            .and_then(|column| {
+                column.default_value.as_deref().map(|sql| {
+                    Self::short_record_default_value(sql)
+                        .apply_affinity(affinity_char_to_type(column.affinity))
+                })
+            })
+            .unwrap_or(SqliteValue::Null);
         Ok(default_value)
     }
 
-    async fn row_from_txn_payload(
+    fn row_from_txn_payload(
         &self,
         table: &TableSchema,
         rowid: i64,
@@ -29501,18 +29466,16 @@ impl Connection {
         rowid_alias_column_index: Option<usize>,
     ) -> Result<Row> {
         Ok(Row {
-            values: self
-                .decode_table_row_values_from_payload(
-                    table,
-                    rowid,
-                    payload,
-                    rowid_alias_column_index,
-                )
-                .await?,
+            values: self.decode_table_row_values_from_payload(
+                table,
+                rowid,
+                payload,
+                rowid_alias_column_index,
+            )?,
         })
     }
 
-    async fn row_from_txn_value_sources(
+    fn row_from_txn_value_sources(
         &self,
         table: &TableSchema,
         rowid: i64,
@@ -29520,9 +29483,8 @@ impl Connection {
         rowid_alias_column_index: Option<usize>,
         sources: &[PreparedMemValueSource],
     ) -> Result<Row> {
-        let values = self
-            .decode_table_row_values_from_payload(table, rowid, payload, rowid_alias_column_index)
-            .await?;
+        let values =
+            self.decode_table_row_values_from_payload(table, rowid, payload, rowid_alias_column_index)?;
         Ok(row_from_memdb_value_sources(
             rowid,
             &values,
@@ -29568,8 +29530,7 @@ impl Connection {
                         payload.as_ref(),
                         rowid_alias_column_index,
                         sum_column_index,
-                    )
-                    .await?
+                    )?
                 };
                 count = count.checked_add(1).ok_or_else(|| {
                     FrankenError::Internal(format!(
@@ -29626,8 +29587,7 @@ impl Connection {
                             rowid_alias_column_index,
                             sum_column_index,
                             &mut column_offsets,
-                        )
-                        .await?
+                        )?
                     };
                     if !value.is_null() {
                         sum_values.push(value);
@@ -29686,16 +29646,14 @@ impl Connection {
             loop {
                 let rowid = cursor.rowid(cx).await?;
                 let payload = cursor.payload(cx).await?;
-                let value = self
-                    .projected_table_row_value_from_payload(
-                        table,
-                        rowid,
-                        &payload,
-                        rowid_alias_column_index,
-                        column_index,
-                        &mut column_offsets,
-                    )
-                    .await?;
+                let value = self.projected_table_row_value_from_payload(
+                    table,
+                    rowid,
+                    &payload,
+                    rowid_alias_column_index,
+                    column_index,
+                    &mut column_offsets,
+                )?;
                 if value == *probe_value {
                     rows.push(match projections {
                         Some(projections) => {
@@ -29705,18 +29663,14 @@ impl Connection {
                                 &payload,
                                 rowid_alias_column_index,
                                 projections,
-                            )
-                            .await?
+                            )?
                         }
-                        None => {
-                            self.row_from_txn_payload(
-                                table,
-                                rowid,
-                                &payload,
-                                rowid_alias_column_index,
-                            )
-                            .await?
-                        }
+                        None => self.row_from_txn_payload(
+                            table,
+                            rowid,
+                            &payload,
+                            rowid_alias_column_index,
+                        )?,
                     });
                 }
                 if !cursor.next(cx).await? {
@@ -29826,8 +29780,7 @@ impl Connection {
                                 rowid,
                                 &payload,
                                 rowid_alias_column_index,
-                            )
-                            .await?,
+                            )?,
                         ])
                     }
                 }
@@ -29857,8 +29810,7 @@ impl Connection {
                                 &payload,
                                 rowid_alias_column_index,
                                 projections.as_ref(),
-                            )
-                            .await?,
+                            )?,
                         ])
                     }
                 }
@@ -29929,8 +29881,7 @@ impl Connection {
                                     rowid,
                                     &payload,
                                     rowid_alias_column_index,
-                                )
-                                .await?,
+                                )?,
                             );
                             if !cursor.next(cx).await? {
                                 break;
@@ -55167,12 +55118,6 @@ impl Connection {
         }
     }
 
-    fn suppress_column_default_runtime_inputs(&self) -> ColumnDefaultEvalGuard<'_> {
-        let next_depth = self.column_default_eval_depth.get().saturating_add(1);
-        self.column_default_eval_depth.set(next_depth);
-        ColumnDefaultEvalGuard { conn: self }
-    }
-
     /// Raise the statement-dispatch nesting depth for the duration of the
     /// returned guard. Entered once per statement dispatch (after the `'now'`
     /// reset decision), so nested subquery / CTE sub-executions see depth > 0
@@ -55181,10 +55126,6 @@ impl Connection {
         let next_depth = self.statement_exec_depth.get().saturating_add(1);
         self.statement_exec_depth.set(next_depth);
         StatementExecDepthGuard { conn: self }
-    }
-
-    fn is_evaluating_column_default(&self) -> bool {
-        self.column_default_eval_depth.get() > 0
     }
 
     async fn evaluate_default_row_from_sqls(
@@ -55279,7 +55220,6 @@ impl Connection {
                 }
             }
 
-            let _guard = self.suppress_column_default_runtime_inputs();
             let rows = self
                 .execute_statement(&statement, None)
                 .await
@@ -62188,15 +62128,13 @@ impl Connection {
             .collect()
     }
 
-    async fn table_execution_runtime_inputs(
+    fn table_execution_runtime_inputs(
         &self,
         requirements: TableExecutionRuntimeRequirements,
     ) -> TableExecutionRuntimeInputs {
         let metadata = self.table_execution_metadata();
-        if requirements == TableExecutionRuntimeRequirements::read_path()
-            && let Some(cached) = metadata.cached_read_runtime_inputs_no_defaults.as_ref()
-        {
-            return cached.clone();
+        if requirements == TableExecutionRuntimeRequirements::read_path() {
+            return metadata.cached_read_runtime_inputs.clone();
         }
 
         let autoincrement_seq_by_root_page =
@@ -62213,71 +62151,10 @@ impl Connection {
                 HbHashMap::new()
             };
 
-        let column_defaults_by_root_page = if !requirements.needs_column_defaults
-            || self.is_evaluating_column_default()
-            || metadata.column_default_sql_by_root_page.is_empty()
-        {
-            empty_column_defaults_arc()
+        let column_defaults_by_root_page = if requirements.needs_column_defaults {
+            Arc::clone(&metadata.column_defaults_by_root_page)
         } else {
-            if hot_path_profile_enabled() {
-                FSQLITE_COLUMN_DEFAULT_EVALUATION_PASSES.fetch_add(1, AtomicOrdering::Relaxed);
-            }
-            // Coerce each synthesized ADD COLUMN default through its column's
-            // declared affinity so the read storage class matches a normal INSERT
-            // default (e.g. INTEGER col DEFAULT '42' -> int 42, TEXT col
-            // DEFAULT 100 -> text '100'). bd-v7y8q. This is the hot-path builder
-            // feeding the VDBE storage-cursor default synthesis (cursor_column).
-            let affinity_by_root_page: HbHashMap<i32, Vec<TypeAffinity>> = {
-                let schema = self.schema.borrow();
-                schema
-                    .iter()
-                    .filter(|table| {
-                        metadata
-                            .column_default_sql_by_root_page
-                            .contains_key(&table.root_page)
-                    })
-                    .map(|table| {
-                        (
-                            table.root_page,
-                            table
-                                .columns
-                                .iter()
-                                .map(|column| affinity_char_to_type(column.affinity))
-                                .collect(),
-                        )
-                    })
-                    .collect()
-            };
-            let default_entries: Vec<(i32, Vec<Option<String>>)> = metadata
-                .column_default_sql_by_root_page
-                .iter()
-                .map(|(root_page, default_sqls)| (*root_page, default_sqls.clone()))
-                .collect();
-            let mut built: HbHashMap<i32, Vec<Option<SqliteValue>>> = HbHashMap::new();
-            for (root_page, default_sqls) in default_entries {
-                let affinities = affinity_by_root_page.get(&root_page);
-                let mut defaults: Vec<Option<SqliteValue>> = Vec::with_capacity(default_sqls.len());
-                for (col_idx, default_sql) in default_sqls.iter().enumerate() {
-                    let value = match default_sql.as_deref() {
-                        Some(sql) => self
-                            .evaluate_column_default_value(Some(sql))
-                            .await
-                            .ok()
-                            .map(|value| {
-                                match affinities.and_then(|affs| affs.get(col_idx).copied()) {
-                                    Some(aff) => value.apply_affinity(aff),
-                                    None => value,
-                                }
-                            }),
-                        None => None,
-                    };
-                    defaults.push(value);
-                }
-                if defaults.iter().any(Option::is_some) {
-                    built.insert(root_page, defaults);
-                }
-            }
-            Arc::new(built)
+            empty_column_defaults_arc()
         };
 
         TableExecutionRuntimeInputs {
@@ -62322,7 +62199,7 @@ impl Connection {
         // for tables with an INTEGER PRIMARY KEY alias, "table.rowid" for other
         // rowid tables; WITHOUT ROWID tables have no entry.
         let mut ipk_label_by_root_page: HbHashMap<i32, String> = HbHashMap::new();
-        let mut column_default_sql_by_root_page = HbHashMap::new();
+        let mut column_defaults_by_root_page = HbHashMap::new();
         let index_count: usize = schema.iter().map(|table| table.indexes.len()).sum();
         let mut index_desc_flags_by_root_page = HbHashMap::with_capacity(index_count);
         let mut index_collations_by_root_page = HbHashMap::with_capacity(index_count);
@@ -62409,13 +62286,33 @@ impl Connection {
             } else if !table.without_rowid {
                 ipk_label_by_root_page.insert(table.root_page, format!("{}.rowid", table.name));
             }
-            let column_default_sqls: Vec<Option<String>> = table
+            // Coerce each short-record default through its column's declared
+            // affinity so the read storage class matches a normal INSERT
+            // default (e.g. INTEGER col DEFAULT '42' -> int 42, TEXT col
+            // DEFAULT 100 -> text '100'). bd-v7y8q. Built once per schema
+            // generation: re-deriving it per execution re-parsed every
+            // table's defaults for every statement (GH#440).
+            if table
                 .columns
                 .iter()
-                .map(|column| column.default_value.clone())
-                .collect();
-            if column_default_sqls.iter().any(Option::is_some) {
-                column_default_sql_by_root_page.insert(table.root_page, column_default_sqls);
+                .any(|column| column.default_value.is_some())
+            {
+                if hot_path_profile_enabled() {
+                    FSQLITE_COLUMN_DEFAULT_EVALUATION_PASSES.fetch_add(1, AtomicOrdering::Relaxed);
+                }
+                column_defaults_by_root_page.insert(
+                    table.root_page,
+                    table
+                        .columns
+                        .iter()
+                        .map(|column| {
+                            column.default_value.as_deref().map(|sql| {
+                                Self::short_record_default_value(sql)
+                                    .apply_affinity(affinity_char_to_type(column.affinity))
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                );
             }
             for index in &table.indexes {
                 index_desc_flags_by_root_page.insert(
@@ -62491,25 +62388,27 @@ impl Connection {
         let first_not_null_non_ipk_col_by_root_page =
             Arc::new(first_not_null_non_ipk_col_by_root_page);
         let ipk_label_by_root_page = Arc::new(ipk_label_by_root_page);
-        let column_default_sql_by_root_page = Arc::new(column_default_sql_by_root_page);
+        let column_defaults_by_root_page = if column_defaults_by_root_page.is_empty() {
+            empty_column_defaults_arc()
+        } else {
+            Arc::new(column_defaults_by_root_page)
+        };
         let index_desc_flags_by_root_page = Arc::new(index_desc_flags_by_root_page);
         let index_collations_by_root_page = Arc::new(index_collations_by_root_page);
         let wr_storage_order_by_root_page = Arc::new(wr_storage_order_by_root_page);
-        let cached_read_runtime_inputs_no_defaults = column_default_sql_by_root_page
-            .is_empty()
-            .then(|| TableExecutionRuntimeInputs {
-                autoincrement_seq_by_root_page: HbHashMap::new(),
-                rowid_alias_col_by_root_page: Arc::clone(&rowid_alias_col_by_root_page),
-                table_column_count_by_root_page: Arc::clone(&table_column_count_by_root_page),
-                first_not_null_non_ipk_col_by_root_page: Arc::clone(
-                    &first_not_null_non_ipk_col_by_root_page,
-                ),
-                ipk_label_by_root_page: Arc::clone(&ipk_label_by_root_page),
-                column_defaults_by_root_page: empty_column_defaults_arc(),
-                index_desc_flags_by_root_page: Arc::clone(&index_desc_flags_by_root_page),
-                index_collations_by_root_page: Arc::clone(&index_collations_by_root_page),
-                wr_storage_order_by_root_page: Arc::clone(&wr_storage_order_by_root_page),
-            });
+        let cached_read_runtime_inputs = TableExecutionRuntimeInputs {
+            autoincrement_seq_by_root_page: HbHashMap::new(),
+            rowid_alias_col_by_root_page: Arc::clone(&rowid_alias_col_by_root_page),
+            table_column_count_by_root_page: Arc::clone(&table_column_count_by_root_page),
+            first_not_null_non_ipk_col_by_root_page: Arc::clone(
+                &first_not_null_non_ipk_col_by_root_page,
+            ),
+            ipk_label_by_root_page: Arc::clone(&ipk_label_by_root_page),
+            column_defaults_by_root_page: Arc::clone(&column_defaults_by_root_page),
+            index_desc_flags_by_root_page: Arc::clone(&index_desc_flags_by_root_page),
+            index_collations_by_root_page: Arc::clone(&index_collations_by_root_page),
+            wr_storage_order_by_root_page: Arc::clone(&wr_storage_order_by_root_page),
+        };
 
         let entry = Arc::new(TableExecutionMetadataCacheEntry {
             schema_generation,
@@ -62519,84 +62418,25 @@ impl Connection {
             table_column_count_by_root_page,
             first_not_null_non_ipk_col_by_root_page,
             ipk_label_by_root_page,
-            column_default_sql_by_root_page,
+            column_defaults_by_root_page,
             index_desc_flags_by_root_page,
             index_collations_by_root_page,
             wr_storage_order_by_root_page,
-            cached_read_runtime_inputs_no_defaults,
+            cached_read_runtime_inputs,
         });
         *self.table_execution_metadata_cache.borrow_mut() = Some(Arc::clone(&entry));
         entry
     }
 
-    /// Build evaluated column default values keyed by root page.
+    /// Short-record column default values keyed by root page.
     /// Used by the VDBE engine to apply ALTER TABLE ADD COLUMN defaults
     /// when a row's record has fewer columns than the current schema.
-    async fn column_defaults_by_root_page(&self) -> HashMap<i32, Vec<Option<SqliteValue>>> {
-        let metadata = self.table_execution_metadata();
-        if self.is_evaluating_column_default()
-            || metadata.column_default_sql_by_root_page.is_empty()
-        {
-            return HashMap::new();
-        }
-        if hot_path_profile_enabled() {
-            FSQLITE_COLUMN_DEFAULT_EVALUATION_PASSES.fetch_add(1, AtomicOrdering::Relaxed);
-        }
-        // Per-column affinities so each synthesized ADD COLUMN default is coerced
-        // through its column's declared affinity, matching how a normal INSERT
-        // stores a column default (e.g. INTEGER col DEFAULT '42' -> int 42,
-        // TEXT col DEFAULT 100 -> text '100'). bd-v7y8q.
-        let affinity_by_root_page: HashMap<i32, Vec<TypeAffinity>> = {
-            let schema = self.schema.borrow();
-            schema
-                .iter()
-                .filter(|table| {
-                    metadata
-                        .column_default_sql_by_root_page
-                        .contains_key(&table.root_page)
-                })
-                .map(|table| {
-                    (
-                        table.root_page,
-                        table
-                            .columns
-                            .iter()
-                            .map(|column| affinity_char_to_type(column.affinity))
-                            .collect(),
-                    )
-                })
-                .collect()
-        };
-        let entries: Vec<(i32, Vec<Option<String>>)> = metadata
-            .column_default_sql_by_root_page
+    fn column_defaults_by_root_page(&self) -> HashMap<i32, Vec<Option<SqliteValue>>> {
+        self.table_execution_metadata()
+            .column_defaults_by_root_page
             .iter()
-            .map(|(root_page, default_sqls)| (*root_page, default_sqls.clone()))
-            .collect();
-        let mut out: HashMap<i32, Vec<Option<SqliteValue>>> = HashMap::new();
-        for (root_page, default_sqls) in entries {
-            let affinities = affinity_by_root_page.get(&root_page);
-            let mut defaults: Vec<Option<SqliteValue>> = Vec::with_capacity(default_sqls.len());
-            for (col_idx, default_sql) in default_sqls.iter().enumerate() {
-                let value = match default_sql.as_deref() {
-                    Some(sql) => self
-                        .evaluate_column_default_value(Some(sql))
-                        .await
-                        .ok()
-                        .map(|value| {
-                            match affinities.and_then(|affs| affs.get(col_idx).copied()) {
-                                Some(aff) => value.apply_affinity(aff),
-                                None => value,
-                            }
-                        }),
-                    None => None,
-                };
-                defaults.push(value);
-            }
-            if defaults.iter().any(Option::is_some) {
-                out.insert(root_page, defaults);
-            }
-        }
-        out
+            .map(|(root_page, defaults)| (*root_page, defaults.clone()))
+            .collect()
     }
 
     /// Process a CREATE TABLE statement: register the schema and create the
@@ -74013,41 +73853,33 @@ impl Connection {
 
     // Reachable from DEFAULT evaluation (which re-enters statement execution),
     // so the future is boxed to break the recursive type.
-    fn inflate_table_row_values_for_storage_reload<'a>(
-        &'a self,
-        table: &'a TableSchema,
+    fn inflate_table_row_values_for_storage_reload(
+        table: &TableSchema,
         rowid: i64,
-        payload_values: &'a [SqliteValue],
+        payload_values: &[SqliteValue],
         rowid_alias_col_idx: Option<usize>,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<SqliteValue>>> + 'a>> {
-        Box::pin(async move {
-            // Column DEFAULT evaluation is `async` now, but the shared inflater takes a
-            // synchronous callback. Defaults are only ever consulted for columns the
-            // stored payload does not cover (the ALTER TABLE ADD COLUMN back-fill case),
-            // so pre-evaluate exactly then and keep the full-width hot path allocation-
-            // and evaluation-free.
-            let mut precomputed: Vec<Option<SqliteValue>> = Vec::new();
-            if payload_values.len() < table.columns.len() {
-                precomputed.reserve_exact(table.columns.len());
-                for column in &table.columns {
-                    let value = match column.default_value.as_ref() {
-                        Some(default_sql) => Some(
-                            self.evaluate_column_default_value(Some(default_sql))
-                                .await?,
-                        ),
-                        None => None,
-                    };
-                    precomputed.push(value);
-                }
+    ) -> Result<Vec<SqliteValue>> {
+        // Defaults are only ever consulted for columns the stored payload does
+        // not cover (the ALTER TABLE ADD COLUMN back-fill case), so pre-compute
+        // them exactly then and keep the full-width hot path allocation- and
+        // evaluation-free.
+        let mut precomputed: Vec<Option<SqliteValue>> = Vec::new();
+        if payload_values.len() < table.columns.len() {
+            precomputed.reserve_exact(table.columns.len());
+            for column in &table.columns {
+                precomputed.push(column.default_value.as_deref().map(|sql| {
+                    Self::short_record_default_value(sql)
+                        .apply_affinity(affinity_char_to_type(column.affinity))
+                }));
             }
-            Self::inflate_table_row_values_from_payload_values(
-                table,
-                rowid,
-                payload_values,
-                rowid_alias_col_idx,
-                |col_idx| Ok(precomputed.get(col_idx).cloned().flatten()),
-            )
-        })
+        }
+        Self::inflate_table_row_values_from_payload_values(
+            table,
+            rowid,
+            payload_values,
+            rowid_alias_col_idx,
+            |col_idx| Ok(precomputed.get(col_idx).cloned().flatten()),
+        )
     }
 
     #[cfg(test)]
@@ -75254,7 +75086,7 @@ impl Connection {
         let column_defaults_by_root_page = if quick {
             None
         } else {
-            Some(self.column_defaults_by_root_page().await)
+            Some(self.column_defaults_by_root_page())
         };
 
         if !quick {
@@ -88030,14 +87862,12 @@ impl Connection {
                             ),
                         }
                     })?;
-                    let mut values = self
-                        .inflate_table_row_values_for_storage_reload(
-                            &table_schema,
-                            rowid,
-                            &payload_values,
-                            rowid_alias_column_index,
-                        )
-                        .await?;
+                    let mut values = Self::inflate_table_row_values_for_storage_reload(
+                        &table_schema,
+                        rowid,
+                        &payload_values,
+                        rowid_alias_column_index,
+                    )?;
                     if src.hidden_rowid_projection.is_some() {
                         values.push(SqliteValue::Integer(rowid));
                     }
@@ -88442,14 +88272,12 @@ impl Connection {
                     ),
                 }
             })?;
-            let mut row = self
-                .inflate_table_row_values_for_storage_reload(
-                    table_schema,
-                    rowid,
-                    &payload_values,
-                    Some(ipk_idx),
-                )
-                .await?;
+            let mut row = Self::inflate_table_row_values_for_storage_reload(
+                table_schema,
+                rowid,
+                &payload_values,
+                Some(ipk_idx),
+            )?;
             *visited_outer += 1;
             #[cfg(test)]
             {
@@ -96419,9 +96247,7 @@ impl Connection {
         self.flush_pending_direct_write_runs(execution_cx).await?;
         let func_reg = self.func_registry.borrow().clone();
         let reject_mem = *self.reject_mem_fallback.borrow();
-        let runtime_inputs = self
-            .table_execution_runtime_inputs(runtime_requirements)
-            .await;
+        let runtime_inputs = self.table_execution_runtime_inputs(runtime_requirements);
         let page_size = page_size_from_pragma_state(self.pragma_state.borrow().page_size)?;
 
         // Lend the active transaction to the VDBE engine so that storage
@@ -96857,6 +96683,72 @@ impl Connection {
         }
     }
 
+    /// The value a record that predates a column (ALTER TABLE ADD COLUMN)
+    /// reads for it, given the column's DEFAULT SQL. Mirrors stock's
+    /// `sqlite3ColumnDefault` / `sqlite3ValueFromExpr`: only literals, signed
+    /// numeric literals and CAST of those produce a value. Functions,
+    /// CURRENT_* and other expressions read as NULL, which matches stock and
+    /// is unreachable through ALTER anyway (it refuses non-constant defaults
+    /// on a non-empty table). The result is a pure function of the DEFAULT
+    /// text, so callers cache it per schema generation (GH#440).
+    fn short_record_default_value(default_sql: &str) -> SqliteValue {
+        fn value_of(expr: &Expr) -> Option<SqliteValue> {
+            match expr {
+                Expr::Literal(
+                    Literal::CurrentTime | Literal::CurrentDate | Literal::CurrentTimestamp,
+                    _,
+                ) => None,
+                Expr::Literal(literal, _) => Some(literal_to_join_value(literal)),
+                // stock parses `DEFAULT name` as the string 'name'.
+                Expr::Column(col_ref, _) if col_ref.table.is_none() => {
+                    Some(SqliteValue::Text(col_ref.column.clone().into()))
+                }
+                Expr::UnaryOp {
+                    op: UnaryOp::Plus,
+                    expr: inner,
+                    ..
+                }
+                | Expr::Collate { expr: inner, .. } => value_of(inner),
+                Expr::UnaryOp {
+                    op: UnaryOp::Negate,
+                    expr: inner,
+                    ..
+                } => match value_of(inner)?.apply_affinity(TypeAffinity::Numeric) {
+                    SqliteValue::Integer(n) => Some(n.checked_neg().map_or_else(
+                        || SqliteValue::Float(-(n as f64)),
+                        SqliteValue::Integer,
+                    )),
+                    SqliteValue::Float(f) => Some(SqliteValue::Float(-f)),
+                    _ => None,
+                },
+                Expr::Cast {
+                    expr: inner,
+                    type_name,
+                    ..
+                } => Some(apply_cast(value_of(inner)?, &type_name.name)),
+                _ => None,
+            }
+        }
+
+        let trimmed = default_sql.trim();
+        let literal_sql = Self::strip_wrapping_default_parens(trimmed);
+        if literal_sql.is_empty() {
+            return SqliteValue::Null;
+        }
+        if let Some(value) = Self::parse_wrapped_default_text(literal_sql, '\'')
+            .or_else(|| Self::parse_wrapped_default_text(literal_sql, '"'))
+        {
+            return value;
+        }
+        if let Ok(Statement::Select(select)) = parse_single_statement(&format!("SELECT {trimmed}"))
+            && let SelectCore::Select { columns, .. } = &select.body.select
+            && let [ResultColumn::Expr { expr, .. }] = columns.as_slice()
+        {
+            return value_of(expr).unwrap_or(SqliteValue::Null);
+        }
+        SqliteValue::Null
+    }
+
     fn parse_wrapped_default_text(default_sql: &str, quote: char) -> Option<SqliteValue> {
         if !default_sql.starts_with(quote) {
             return None;
@@ -97132,14 +97024,12 @@ impl Connection {
                                 table.name
                             ),
                         })?;
-                        let values = self
-                            .inflate_table_row_values_for_storage_reload(
-                                table,
-                                synthetic_rowid,
-                                &values,
-                                None,
-                            )
-                            .await?;
+                        let values = Self::inflate_table_row_values_for_storage_reload(
+                            table,
+                            synthetic_rowid,
+                            &values,
+                            None,
+                        )?;
                         if let Some(mem_table) = new_db.get_table_mut(table.root_page) {
                             mem_table.insert_row(synthetic_rowid, values);
                         }
@@ -97172,14 +97062,12 @@ impl Connection {
                     {
                         new_sqlite_sequence_cache.insert(tbl_name.to_ascii_lowercase(), *seq);
                     }
-                    values = self
-                        .inflate_table_row_values_for_storage_reload(
-                            table,
-                            rowid,
-                            &values,
-                            ipk_col_idx,
-                        )
-                        .await?;
+                    values = Self::inflate_table_row_values_for_storage_reload(
+                        table,
+                        rowid,
+                        &values,
+                        ipk_col_idx,
+                    )?;
                     if let Some(mem_table) = new_db.get_table_mut(table.root_page) {
                         mem_table.insert_row(rowid, values);
                     }
@@ -97243,14 +97131,12 @@ impl Connection {
                             ),
                         },
                     )?;
-                    let values = self
-                        .inflate_table_row_values_for_storage_reload(
-                            table,
-                            synthetic_rowid,
-                            &values,
-                            None,
-                        )
-                        .await?;
+                    let values = Self::inflate_table_row_values_for_storage_reload(
+                        table,
+                        synthetic_rowid,
+                        &values,
+                        None,
+                    )?;
                     rows.push((synthetic_rowid, values));
                     synthetic_rowid = synthetic_rowid.saturating_add(1);
                     if !cursor.next(cx).await? {
@@ -97270,9 +97156,12 @@ impl Connection {
                         ),
                     },
                 )?;
-                values = self
-                    .inflate_table_row_values_for_storage_reload(table, rowid, &values, ipk_col_idx)
-                    .await?;
+                values = Self::inflate_table_row_values_for_storage_reload(
+                    table,
+                    rowid,
+                    &values,
+                    ipk_col_idx,
+                )?;
                 rows.push((rowid, values));
                 if !cursor.next(cx).await? {
                     break;
@@ -98864,14 +98753,12 @@ impl Connection {
                                             "schema reload lost table metadata for `{name}`"
                                         ))
                                     })?;
-                                    let values = self
-                                        .inflate_table_row_values_for_storage_reload(
-                                            tbl_schema,
-                                            synthetic_rowid,
-                                            &values,
-                                            None,
-                                        )
-                                        .await?;
+                                    let values = Self::inflate_table_row_values_for_storage_reload(
+                                        tbl_schema,
+                                        synthetic_rowid,
+                                        &values,
+                                        None,
+                                    )?;
                                     if let Some(mem_table) = new_db.tables.get_mut(&real_root_page)
                                     {
                                         mem_table.insert_row(synthetic_rowid, values);
@@ -98918,14 +98805,12 @@ impl Connection {
                                         "schema reload lost table metadata for `{name}`"
                                     ))
                                 })?;
-                                values = self
-                                    .inflate_table_row_values_for_storage_reload(
-                                        tbl_schema,
-                                        rowid,
-                                        &values,
-                                        ipk_col_idx,
-                                    )
-                                    .await?;
+                                values = Self::inflate_table_row_values_for_storage_reload(
+                                    tbl_schema,
+                                    rowid,
+                                    &values,
+                                    ipk_col_idx,
+                                )?;
                                 if let Some(mem_table) = new_db.tables.get_mut(&real_root_page) {
                                     mem_table.insert_row(rowid, values);
                                     // bd-qteu2: measure hydration cost so the
@@ -164833,8 +164718,7 @@ mod tests {
             let read_path = conn
                 .table_execution_runtime_inputs(
                     crate::connection::TableExecutionRuntimeRequirements::read_path(),
-                )
-                .await;
+                );
             assert_eq!(
                 read_path.column_defaults_by_root_page.get(&root_page),
                 Some(&vec![None, Some(SqliteValue::Text("[]".into()))]),
@@ -246721,11 +246605,9 @@ mod pager_routing_tests {
                 .unwrap();
 
             let first = conn
-                .table_execution_runtime_inputs(TableExecutionRuntimeRequirements::read_path())
-                .await;
+                .table_execution_runtime_inputs(TableExecutionRuntimeRequirements::read_path());
             let second = conn
-                .table_execution_runtime_inputs(TableExecutionRuntimeRequirements::read_path())
-                .await;
+                .table_execution_runtime_inputs(TableExecutionRuntimeRequirements::read_path());
 
             assert!(
                 Arc::ptr_eq(
@@ -246766,7 +246648,7 @@ mod pager_routing_tests {
     }
 
     #[test]
-    fn test_table_execution_metadata_caches_no_default_read_runtime_inputs_only_when_safe() {
+    fn test_table_execution_metadata_caches_read_runtime_inputs_per_schema_generation() {
         asupersync::test_utils::run_test(|| async {
             let no_default_conn = Connection::open(":memory:").await.unwrap();
             no_default_conn
@@ -246776,10 +246658,7 @@ mod pager_routing_tests {
                 .await
                 .unwrap();
             let no_default_metadata = no_default_conn.table_execution_metadata();
-            let cached = no_default_metadata
-                .cached_read_runtime_inputs_no_defaults
-                .as_ref()
-                .expect("default-free schemas should cache the read runtime bundle");
+            let cached = &no_default_metadata.cached_read_runtime_inputs;
             assert!(
                 cached.autoincrement_seq_by_root_page.is_empty(),
                 "cached read runtime bundle must not carry AUTOINCREMENT state"
@@ -246792,6 +246671,9 @@ mod pager_routing_tests {
                 "default-free cached read runtime bundle should reuse the shared empty defaults map"
             );
 
+            // GH#440: a schema with defaults caches its short-record default
+            // map too, instead of re-parsing every DEFAULT per execution, and
+            // a DDL change rebuilds it.
             let default_conn = Connection::open(":memory:").await.unwrap();
             default_conn
                 .execute(
@@ -246802,14 +246684,65 @@ mod pager_routing_tests {
                 )
                 .await
                 .unwrap();
-            let default_metadata = default_conn.table_execution_metadata();
+            let first =
+                default_conn.table_execution_runtime_inputs(TableExecutionRuntimeRequirements::read_path());
+            let second =
+                default_conn.table_execution_runtime_inputs(TableExecutionRuntimeRequirements::read_path());
             assert!(
-                default_metadata
-                    .cached_read_runtime_inputs_no_defaults
-                    .is_none(),
-                "schemas with runtime-evaluated defaults must not cache the read runtime bundle"
+                Arc::ptr_eq(
+                    &first.column_defaults_by_root_page,
+                    &second.column_defaults_by_root_page
+                ),
+                "schemas with defaults should reuse the cached short-record default map"
+            );
+            default_conn
+                .execute("ALTER TABLE runtime_inputs_cached_read_defaults ADD COLUMN n INTEGER DEFAULT '7';")
+                .await
+                .unwrap();
+            let after_alter =
+                default_conn.table_execution_runtime_inputs(TableExecutionRuntimeRequirements::read_path());
+            assert_eq!(
+                after_alter.column_defaults_by_root_page.values().next(),
+                Some(&vec![
+                    None,
+                    Some(SqliteValue::Text("pending".into())),
+                    Some(SqliteValue::Integer(7)),
+                ]),
+                "ALTER TABLE ADD COLUMN must rebuild the cached default map"
             );
         });
+    }
+
+    #[test]
+    fn test_short_record_default_value_matches_stock_value_from_expr() {
+        // Stock 3.46.1 oracle: a record that predates these columns reads
+        // exactly these values (functions, CURRENT_* and arithmetic read NULL).
+        let cases: &[(&str, SqliteValue)] = &[
+            ("5", SqliteValue::Integer(5)),
+            ("(5)", SqliteValue::Integer(5)),
+            ("-2.5", SqliteValue::Float(-2.5)),
+            ("(-7)", SqliteValue::Integer(-7)),
+            ("+3", SqliteValue::Integer(3)),
+            ("-'5'", SqliteValue::Integer(-5)),
+            ("'q'", SqliteValue::Text("q".into())),
+            ("('a)b')", SqliteValue::Text("a)b".into())),
+            ("fallback", SqliteValue::Text("fallback".into())),
+            ("x'ab'", SqliteValue::Blob(Arc::from(&[0xab_u8][..]))),
+            ("TRUE", SqliteValue::Integer(1)),
+            ("NULL", SqliteValue::Null),
+            ("(CAST('7' AS INTEGER))", SqliteValue::Integer(7)),
+            ("(lower('X'))", SqliteValue::Null),
+            ("CURRENT_TIMESTAMP", SqliteValue::Null),
+            ("(1+1)", SqliteValue::Null),
+            ("(strftime('%Y', 'now'))", SqliteValue::Null),
+        ];
+        for (sql, expected) in cases {
+            assert_eq!(
+                &Connection::short_record_default_value(sql),
+                expected,
+                "short-record default for `{sql}`"
+            );
+        }
     }
 
     #[test]
@@ -246865,8 +246798,7 @@ mod pager_routing_tests {
                 .expect("other table root page should exist");
 
             let read_path = conn
-                .table_execution_runtime_inputs(TableExecutionRuntimeRequirements::read_path())
-                .await;
+                .table_execution_runtime_inputs(TableExecutionRuntimeRequirements::read_path());
             assert!(
                 read_path.autoincrement_seq_by_root_page.is_empty(),
                 "read/update/delete paths should not rebuild AUTOINCREMENT sequence metadata"
@@ -246881,8 +246813,7 @@ mod pager_routing_tests {
                 .table_execution_runtime_inputs(TableExecutionRuntimeRequirements::write_path(
                     Some(root_page),
                     false,
-                ))
-                .await;
+                ));
             assert!(
                 simple_insert.column_defaults_by_root_page.is_empty(),
                 "simple insert executions should not rebuild the legacy read-default map"
