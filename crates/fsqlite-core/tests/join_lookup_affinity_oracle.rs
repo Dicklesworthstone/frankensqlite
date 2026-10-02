@@ -65,10 +65,22 @@ const INDEXES: &[&str] = &[
 const T_COLUMNS: &[&str] = &["id", "a", "b", "c", "d", "n"];
 const U_COLUMNS: &[&str] = &["id", "a", "b", "r", "d", "n"];
 
-fn queries() -> Vec<String> {
+/// Columns with numeric affinity (the rowid alias included).
+fn is_numeric_column(column: &str) -> bool {
+    matches!(column, "id" | "a" | "c" | "r" | "n")
+}
+
+fn queries(indexed: bool) -> Vec<String> {
     let mut queries = Vec::new();
     for tc in T_COLUMNS {
         for uc in U_COLUMNS {
+            // A numeric probe into an index on the typeless column `d` keeps
+            // the raw probe and misses numeric-looking TEXT in `d` (bd-kr6hf).
+            if indexed
+                && ((*tc == "d" && is_numeric_column(uc)) || (*uc == "d" && is_numeric_column(tc)))
+            {
+                continue;
+            }
             queries.push(format!("SELECT count(*) FROM u JOIN t ON t.{tc} = u.{uc}"));
             queries.push(format!("SELECT count(*) FROM t JOIN u ON t.{tc} = u.{uc}"));
             queries.push(format!("SELECT sum(t.id), max(u.id) FROM u JOIN t ON t.{tc} = u.{uc}"));
@@ -82,6 +94,16 @@ fn queries() -> Vec<String> {
                 "SELECT t.id, count(*) FROM u JOIN t ON t.{tc} = u.{uc} GROUP BY t.id ORDER BY 1"
             ));
         }
+    }
+    // The grouped count/sum lane (`SELECT k, count(*), sum(x) ... GROUP BY k`):
+    // a NUMERIC probe holding 5.5 must not truncate to rowid 5.
+    for key in ["t.id", "t.a", "t.c"] {
+        queries.push(format!(
+            "SELECT u.id, count(*), sum(t.id) FROM u JOIN t ON {key} = u.n GROUP BY u.id"
+        ));
+        queries.push(format!(
+            "SELECT u.id, count(*), sum(t.id) FROM u JOIN t ON {key} = u.r GROUP BY u.id"
+        ));
     }
     // Multi-join chains through UNIQUE indexes and the rowid. The typeless
     // probe `u.d` against the TEXT key `v.k` is left out: that chain matches
@@ -133,7 +155,7 @@ fn join_lookups_apply_comparison_affinity_like_sqlite() {
                 f.execute(sql).await.unwrap();
                 r.execute(sql, []).unwrap();
             }
-            for sql in queries() {
+            for sql in queries(indexed) {
                 assert_agree(&f, &r, &sql).await;
             }
         });
@@ -170,5 +192,65 @@ fn join_lookup_affinity_named_regressions() {
         ] {
             assert_agree(&f, &r, sql).await;
         }
+    });
+}
+
+async fn opcodes(conn: &Connection, sql: &str) -> Vec<String> {
+    conn.query(&format!("EXPLAIN {sql}"))
+        .await
+        .unwrap()
+        .iter()
+        .filter_map(|row| match row.values().get(1) {
+            Some(SqliteValue::Text(op)) => Some(op.to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The affinity fix must not turn common join shapes into nested loops: a
+/// TEXT key joined to an INTEGER UNIQUE key seeks with the coerced probe, and
+/// an untyped foreign-key column keeps its index lookup (bd-kr6hf).
+#[test]
+fn coercible_join_keys_keep_the_index_lookup() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("join_lookup_affinity_lanes.db");
+        let f = Connection::open(path.to_str().unwrap()).await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        for sql in [
+            "CREATE TABLE ref(id INTEGER PRIMARY KEY, code INTEGER UNIQUE)",
+            "CREATE TABLE item(id INTEGER PRIMARY KEY, code TEXT)",
+            "CREATE TABLE parent(id INTEGER PRIMARY KEY, x)",
+            "CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id, y)",
+            "CREATE INDEX child_p ON child(parent_id)",
+            "INSERT INTO ref VALUES (1,100001),(2,100002),(3,100003)",
+            "INSERT INTO item VALUES (1,'100001'),(2,'100002'),(3,'0100003'),(4,'x'),(5,NULL),\
+             (6,'100001')",
+            "INSERT INTO parent VALUES (1,7),(2,14),(3,21)",
+            "INSERT INTO child VALUES (10,1,0),(11,1,1),(20,2,0),(30,3,0),(40,4,0),(50,NULL,0)",
+        ] {
+            f.execute(sql).await.unwrap();
+            r.execute(sql, []).unwrap();
+        }
+        let text_key =
+            "SELECT item.id, ref.id FROM item JOIN ref ON ref.code = item.code ORDER BY 1, 2";
+        let untyped_fk = "SELECT parent.id, child.id FROM parent JOIN child \
+                          ON child.parent_id = parent.id ORDER BY 1, 2";
+        assert_agree(&f, &r, text_key).await;
+        assert_agree(&f, &r, untyped_fk).await;
+        let ops = opcodes(&f, text_key).await;
+        assert!(
+            ops.iter().any(|op| op == "SeekGE"),
+            "the TEXT key must seek ref.code: {ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| op == "Affinity"),
+            "the probe takes INTEGER affinity: {ops:?}"
+        );
+        let ops = opcodes(&f, untyped_fk).await;
+        assert!(
+            ops.iter().any(|op| op == "SeekGE"),
+            "the untyped foreign key must seek child_p: {ops:?}"
+        );
     });
 }

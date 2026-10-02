@@ -10963,6 +10963,17 @@ fn codegen_grouped_inner_join_count_sum_select(
                 &plan.join_lookup.probe_source,
                 probe_reg,
             );
+            if let Some(affinity) = plan.join_lookup.probe_affinity {
+                // The comparison coerces the key to the indexed column's affinity.
+                b.emit_op(
+                    Opcode::Affinity,
+                    probe_reg,
+                    1,
+                    0,
+                    P4::Affinity(affinity.to_string()),
+                    0,
+                );
+            }
             let no_match = b.emit_label();
             let duplicate_run_done = b.emit_label();
             b.emit_jump_to_label(Opcode::IsNull, probe_reg, 0, no_match, P4::None, 0);
@@ -11504,13 +11515,16 @@ fn resolve_single_join_lookup_plan<'a>(
         SortKeySource::Column(col_idx) => {
             if probe_expr.is_some() {
                 probe_affinity = Some(right_table.columns.get(col_idx)?.affinity);
-            } else if !join_lookup_column_pair_compares_raw(
-                left_table,
-                &probe_source,
-                right_table,
-                col_idx,
-            )? {
-                return None;
+            } else {
+                probe_affinity = match join_lookup_column_pair_probe(
+                    left_table,
+                    &probe_source,
+                    right_table,
+                    col_idx,
+                )? {
+                    JoinLookupProbe::Raw => None,
+                    JoinLookupProbe::Coerce(affinity) => Some(affinity),
+                };
             }
             let column_name = &right_table.columns.get(col_idx)?.name;
             let comparison_tables = [(left_table, left_alias), (right_table, right_alias)];
@@ -11535,23 +11549,43 @@ fn resolve_single_join_lookup_plan<'a>(
     })
 }
 
-/// Whether a plain `probe_column = lookup_column` join key can drive an index
-/// lookup with the raw probe value.
+/// How a plain column-pair join key probes the lookup index.
+enum JoinLookupProbe {
+    /// Seek with the raw probe value.
+    Raw,
+    /// Apply this affinity (the indexed column's) to the probe, then seek.
+    Coerce(char),
+}
+
+/// How a plain `probe_column = lookup_column` join key can drive an index
+/// lookup, or `None` when it cannot.
 ///
 /// SQLite applies comparison affinity to `=`: a numeric column coerces a TEXT
 /// or typeless operand to a number, so `t.a = u.b` with `t.a` INTEGER and
-/// `u.b` TEXT `'1'` matches `1`. An index lookup that seeks with the raw probe
-/// misses such rows, and a numeric probe into a TEXT or typeless index cannot
-/// be served at all (`sqlite3IndexAffinityOk`). The index lanes therefore take
-/// a column pair only when the comparison converts nothing, and leave every
-/// other pair to the general join. Rowid lookups do not need this check: their
-/// probe goes through `MustBeInt`, which applies the same numeric coercion.
-fn join_lookup_column_pair_compares_raw(
+/// `u.b` TEXT `'1'` matches `1`. This follows `sqlite3IndexAffinityOk`, as the
+/// correlated EXISTS probe does (GH#432):
+/// - No comparison affinity (GH#428: two declared non-numeric columns, or two
+///   numeric ones): raw values compare.
+/// - Numeric comparison affinity needs a numeric index column, and the probe
+///   gets that column's affinity.
+/// - A numeric probe into a TEXT index cannot be served (a raw probe never
+///   matches text keys); the general join compares those pairs.
+/// - A numeric probe into a typeless index keeps the raw probe, as before
+///   0.4.8. It finds every row whose stored value is a number, and misses
+///   only numeric-looking TEXT stored in the typeless column, which SQLite
+///   would coerce (bd-kr6hf). The general join would be exact but turns a
+///   common shape (an untyped foreign-key column, `FROM parent JOIN child ON
+///   child.parent_id = parent.id`) into a nested loop, since this path does
+///   not reorder the join to a rowid lookup as SQLite does.
+///
+/// Rowid lookups do not need this: their probe goes through `MustBeInt`,
+/// which applies the same numeric coercion.
+fn join_lookup_column_pair_probe(
     probe_table: &TableSchema,
     probe_source: &SortKeySource,
     lookup_table: &TableSchema,
     lookup_col_idx: usize,
-) -> Option<bool> {
+) -> Option<JoinLookupProbe> {
     let probe_affinity = match probe_source {
         SortKeySource::Rowid => b'D',
         SortKeySource::Column(probe_col_idx) => {
@@ -11560,7 +11594,21 @@ fn join_lookup_column_pair_compares_raw(
         SortKeySource::Expression(_) => return None,
     };
     let lookup_affinity = schema_column_expr_affinity(lookup_table.columns.get(lookup_col_idx)?);
-    Some(combine_declared_comparison_affinity(lookup_affinity, true, probe_affinity, true) == 0)
+    match u8::try_from(combine_declared_comparison_affinity(
+        lookup_affinity,
+        true,
+        probe_affinity,
+        true,
+    ))
+    .ok()?
+    {
+        0 => Some(JoinLookupProbe::Raw),
+        b'C' if matches!(lookup_affinity, b'C' | b'D' | b'E') => {
+            Some(JoinLookupProbe::Coerce(char::from(lookup_affinity)))
+        }
+        b'C' if lookup_affinity == b'A' => Some(JoinLookupProbe::Raw),
+        _ => None,
+    }
 }
 
 fn emit_join_probe_source(
@@ -11903,18 +11951,6 @@ fn codegen_single_join_lookup_select(
             let comparison_p4 = direct_lookup_index_comparison_p4(_index);
             if let Some(key) = plan.probe_expr {
                 emit_join_expr(b, key, probe_reg, &tables, ctx)?;
-                if let Some(affinity) = plan.probe_affinity {
-                    // SQLite applies the indexed column's affinity to an
-                    // affinity-less key before comparing.
-                    b.emit_op(
-                        Opcode::Affinity,
-                        probe_reg,
-                        1,
-                        0,
-                        P4::Affinity(affinity.to_string()),
-                        0,
-                    );
-                }
             } else {
                 emit_join_probe_source(
                     b,
@@ -11923,6 +11959,20 @@ fn codegen_single_join_lookup_select(
                     left_alias,
                     &plan.probe_source,
                     probe_reg,
+                );
+            }
+            if let Some(affinity) = plan.probe_affinity {
+                // SQLite applies the indexed column's affinity to the key
+                // before comparing: an affinity-less computed key, or a
+                // column key the comparison coerces (`t.a = u.b`, INTEGER
+                // `t.a`, TEXT '1' in `u.b`).
+                b.emit_op(
+                    Opcode::Affinity,
+                    probe_reg,
+                    1,
+                    0,
+                    P4::Affinity(affinity.to_string()),
+                    0,
                 );
             }
             let no_match = b.emit_label();
@@ -12241,12 +12291,17 @@ fn resolve_multi_join_lookup_plan<'a>(
         let lookup_target = match lookup_source {
             SortKeySource::Rowid => SingleJoinLookupTarget::Rowid,
             SortKeySource::Column(col_idx) => {
-                if !join_lookup_column_pair_compares_raw(
-                    tables.get(probe_table_index)?.0,
-                    &probe_source,
-                    right_table,
-                    col_idx,
-                )? {
+                // The chain emitter probes with the raw value, so it takes only
+                // pairs whose comparison converts nothing.
+                if matches!(
+                    join_lookup_column_pair_probe(
+                        tables.get(probe_table_index)?.0,
+                        &probe_source,
+                        right_table,
+                        col_idx,
+                    )?,
+                    JoinLookupProbe::Coerce(_)
+                ) {
                     return None;
                 }
                 let column_name = &right_table.columns.get(col_idx)?.name;
