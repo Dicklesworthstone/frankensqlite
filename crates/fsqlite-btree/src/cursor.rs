@@ -35,7 +35,7 @@ use fsqlite_types::record::{
     parse_record_projected_column_offsets, parse_record_with_encoding,
 };
 use fsqlite_types::serial_type::{
-    SerialTypeClass, classify_serial_type, read_varint, serial_type_len, write_varint,
+    SerialTypeClass, classify_serial_type, read_varint, serial_type_len, varint_len, write_varint,
 };
 use fsqlite_types::sync_primitives::Instant;
 use fsqlite_types::value::binary_text_cmp;
@@ -7187,6 +7187,51 @@ impl<P: PageWriter> BtCursor<P> {
         Ok(true)
     }
 
+    /// Whether an in-place append of a table-leaf cell carrying `payload_len`
+    /// bytes can succeed on this leaf, decided before the cell is encoded.
+    ///
+    /// Encoding a payload that spills to overflow pages allocates and writes
+    /// its whole chain. The append fast paths used to encode first and, when
+    /// the leaf turned out to be full, free that chain and fall back to a path
+    /// that encodes a second chain. The freed pages are not reused within the
+    /// transaction, so every large-row append into a full leaf left its chain
+    /// on the freelist: a VACUUM rebuild of overflow rows came out 44-64% free
+    /// pages (GH#441), and ordinary bulk inserts wrote each chain twice.
+    ///
+    /// Payloads that fit locally return `true`: their encoding allocates
+    /// nothing, so the fast path may try and fail cheaply as before. The fit
+    /// test mirrors [`Self::try_append_leaf_page_in_place`].
+    fn table_leaf_overflow_append_fits(
+        usable_size: u32,
+        leaf_page_no: PageNumber,
+        header: &BtreePageHeader,
+        rowid: i64,
+        payload_len: usize,
+    ) -> bool {
+        let Ok(payload_size) = u32::try_from(payload_len) else {
+            return true;
+        };
+        let local_size =
+            cell::local_payload_size(payload_size, usable_size, cell::BtreePageType::LeafTable)
+                as usize;
+        if local_size >= payload_len {
+            return true;
+        }
+        let cell_len = varint_len(u64::from(payload_size))
+            + varint_len(u64::from_ne_bytes(rowid.to_ne_bytes()))
+            + local_size
+            + 4;
+        let alloc_len = cell_len.max(cell::MIN_CELL_ALLOCATION);
+        let Some(new_content_offset) = header.content_offset(usable_size).checked_sub(alloc_len)
+        else {
+            return false;
+        };
+        let ptr_array_end = cell::header_offset_for_page(leaf_page_no)
+            + usize::from(header.page_type.header_size())
+            + (usize::from(header.cell_count) + 1) * 2;
+        ptr_array_end <= new_content_offset
+    }
+
     async fn try_append_leaf_page_in_place(
         &mut self,
         cx: &Cx,
@@ -9314,6 +9359,20 @@ impl<P: PageWriter> BtCursor<P> {
             return Ok(true);
         }
 
+        // GH#441: decide fit before an overflow chain is allocated.
+        if !Self::table_leaf_overflow_append_fits(
+            self.usable_size,
+            cached.page_no,
+            &cached.header,
+            rowid,
+            data.len(),
+        ) {
+            self.stack.clear();
+            self.at_eof = true;
+            self.clear_rightmost_leaf_cache();
+            return Ok(false);
+        }
+
         let mut cell_data = std::mem::take(&mut self.cell_buf);
         let overflow_head = match self
             .encode_table_leaf_cell_into(cx, rowid, data, &mut cell_data)
@@ -9432,6 +9491,21 @@ impl<P: PageWriter> BtCursor<P> {
         }
 
         self.at_eof = true;
+        // GH#441: decide fit before an overflow chain is allocated.
+        let fits = self.stack.last().is_some_and(|entry| {
+            Self::table_leaf_overflow_append_fits(
+                self.usable_size,
+                entry.page_no,
+                &entry.header,
+                rowid,
+                data.len(),
+            )
+        });
+        if !fits {
+            self.stack.clear();
+            self.clear_rightmost_leaf_cache();
+            return Ok(false);
+        }
         let mut cell_data = std::mem::take(&mut self.cell_buf);
         let overflow_head = match self
             .encode_table_leaf_cell_into(cx, rowid, data, &mut cell_data)
@@ -9623,6 +9697,18 @@ impl<P: PageWriter> BtCursor<P> {
                 page_data: Some(page_data),
                 header,
             }));
+        }
+
+        // GH#441: decide fit before an overflow chain is allocated.
+        if !Self::table_leaf_overflow_append_fits(
+            self.usable_size,
+            hinted_leaf_page,
+            &header,
+            rowid,
+            data.len(),
+        ) {
+            self.clear_rightmost_leaf_cache();
+            return Ok(None);
         }
 
         let mut cell_data = std::mem::take(&mut self.cell_buf);
