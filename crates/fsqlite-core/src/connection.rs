@@ -41381,14 +41381,34 @@ impl Connection {
         self.schema.borrow_mut().push(table_schema);
         self.rebuild_schema_indices();
         if !rows.is_empty() {
-            let placeholders: String = (1..=width)
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let insert_sql = format!("INSERT INTO \"{table_name}\" VALUES ({placeholders})");
-            for row in rows {
-                self.execute_with_params(&insert_sql, row.values()).await?;
-            }
+            // Replay the rows through one prepared INSERT, as INSERT ... SELECT
+            // does, instead of a full `execute_with_params` per row. Stock
+            // SQLite's CREATE TABLE ... AS SELECT leaves changes(),
+            // total_changes() and last_insert_rowid() as they were, so the
+            // replay's bookkeeping is undone afterwards.
+            let Statement::Insert(insert) = parse_single_statement(&format!(
+                "INSERT INTO {} VALUES (NULL)",
+                quote_identifier(&table_name)
+            ))?
+            else {
+                return Err(FrankenError::internal(
+                    "CREATE TABLE ... AS SELECT replay did not parse as an INSERT",
+                ));
+            };
+            let previous_changes = (
+                self.last_changes.get(),
+                self.total_changes.get(),
+                self.last_insert_rowid.get(),
+            );
+            let replayed = self
+                .execute_insert_select_materialized_rows_outcome(&insert, rows)
+                .await;
+            self.restore_change_tracking_state(
+                previous_changes.0,
+                previous_changes.1,
+                previous_changes.2,
+            );
+            replayed?;
         }
         self.insert_sqlite_master_row("table", &table_name, &table_name, root_page, &create_sql)
             .await?;
@@ -132716,7 +132736,7 @@ fn take_exactly_one_engine_row(engine: &mut VdbeEngine) -> QueryRowCollectionOut
     match engine.take_exactly_one_result_row() {
         ExactResultRowOutcome::NoRows => QueryRowCollectionOutcome::NoRows,
         ExactResultRowOutcome::Row(values) => QueryRowCollectionOutcome::Row(Row {
-            values: (*values).into_vec(),
+            values: values.into_vec(),
         }),
         ExactResultRowOutcome::MultipleRows => QueryRowCollectionOutcome::MultipleRows,
     }

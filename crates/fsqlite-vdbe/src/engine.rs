@@ -6438,8 +6438,23 @@ type RegisterFile = smallvec::SmallVec<[SqliteValue; 32]>;
 /// Bound parameter storage for `?1`, `?2`, ... lookups during execution.
 type BindingStorage = smallvec::SmallVec<[SqliteValue; 8]>;
 
+/// One retained result row, sized to its column count.
+pub type ResultRow = Box<[SqliteValue]>;
+
 /// Buffered result-row storage retained by the engine when row collection is on.
-type ResultRowStorage = Vec<smallvec::SmallVec<[SqliteValue; 16]>>;
+///
+/// Rows are boxed slices rather than the 16-value inline `SmallVec` the
+/// register drain produces: that is over 500 bytes per row whatever the
+/// width, so a million-row materialized SELECT (CREATE TABLE ... AS SELECT,
+/// a FROM-clause subquery) grew and copied a half-gigabyte buffer. Every
+/// consumer turns the row into a `Vec` anyway, which a boxed slice does
+/// without copying.
+type ResultRowStorage = Vec<ResultRow>;
+
+#[inline]
+fn retained_result_row(row: smallvec::SmallVec<[SqliteValue; 16]>) -> ResultRow {
+    row.into_vec().into_boxed_slice()
+}
 
 #[derive(Debug, Default)]
 struct MakeRecordStatementLookaside {
@@ -6791,7 +6806,7 @@ type ResultRowCallback<'a> = dyn FnMut(smallvec::SmallVec<[SqliteValue; 16]>) ->
 #[derive(Debug, PartialEq, Eq)]
 pub enum ExactResultRowOutcome {
     NoRows,
-    Row(Box<smallvec::SmallVec<[SqliteValue; 16]>>),
+    Row(ResultRow),
     MultipleRows,
 }
 
@@ -14368,12 +14383,12 @@ impl VdbeEngine {
     }
 
     /// Get the collected result rows.
-    pub fn results(&self) -> &[smallvec::SmallVec<[SqliteValue; 16]>] {
+    pub fn results(&self) -> &[ResultRow] {
         &self.results
     }
 
     /// Take the result rows, consuming them.
-    pub fn take_results(&mut self) -> Vec<smallvec::SmallVec<[SqliteValue; 16]>> {
+    pub fn take_results(&mut self) -> Vec<ResultRow> {
         let mut results = Vec::with_capacity(self.results.capacity());
         std::mem::swap(&mut results, &mut self.results);
         results
@@ -14383,11 +14398,11 @@ impl VdbeEngine {
     pub fn take_exactly_one_result_row(&mut self) -> ExactResultRowOutcome {
         match self.results.len() {
             0 => ExactResultRowOutcome::NoRows,
-            1 => ExactResultRowOutcome::Row(Box::new(
+            1 => ExactResultRowOutcome::Row(
                 self.results
                     .pop()
                     .expect("one-row result set should contain one row"),
-            )),
+            ),
             _ => {
                 self.results.clear();
                 ExactResultRowOutcome::MultipleRows
@@ -15153,7 +15168,7 @@ impl VdbeEngine {
                     if let Some(handler) = row_handler.as_mut() {
                         (*handler)(row)?;
                     } else {
-                        self.results.push(row);
+                        self.results.push(retained_result_row(row));
                     }
                 } else {
                     // No retention: still drain the register to match the
@@ -15404,7 +15419,7 @@ impl VdbeEngine {
             if let Some(handler) = row_handler.as_mut() {
                 (*handler)(row)?;
             } else {
-                self.results.push(row);
+                self.results.push(retained_result_row(row));
             }
         } else {
             self.discard_reg_range(op.p1, count);
@@ -15438,7 +15453,7 @@ impl VdbeEngine {
             if let Some(handler) = row_handler.as_mut() {
                 (*handler)(row)?;
             } else {
-                self.results.push(row);
+                self.results.push(retained_result_row(row));
             }
         }
         Ok(())
@@ -21804,7 +21819,7 @@ mod tests {
         assert_eq!(outcome, ExecOutcome::Done);
         assert_eq!(
             engine.take_exactly_one_result_row(),
-            ExactResultRowOutcome::Row(Box::new(smallvec::smallvec![SqliteValue::Integer(7)])),
+            ExactResultRowOutcome::Row(Box::new([SqliteValue::Integer(7)])),
         );
         assert_eq!(
             engine.result_buffer_capacity(),

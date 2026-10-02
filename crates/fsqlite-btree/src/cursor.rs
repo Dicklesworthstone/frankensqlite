@@ -1190,22 +1190,43 @@ impl CellSlotCache {
         cell_idx: u16,
         slot: CachedCellSlot,
     ) {
-        let mut entry = if let Some(existing_idx) = self.entries.iter().position(|entry| {
-            entry.page_no == page_no && entry.mutation_counter == mutation_counter
-        }) {
-            self.entries.remove(existing_idx)
-        } else {
-            CellSlotCacheEntry {
-                page_no,
-                mutation_counter,
-                slots: CachedCellSlots::new(),
-            }
+        // Each entry carries its slots inline (about 1 KiB), so shifting the
+        // whole LRU costs tens of KiB of memmove. A write to a page bumps its
+        // image token, which used to make every row of an UPDATE or DELETE
+        // pass through here with a fresh key: one full-LRU shift per row,
+        // with the cache filling up with dead images of the same leaf.
+        // Reuse the page's entry whatever its image (a superseded image is
+        // rarely read again, and then it only misses and reparses), and
+        // rotate only the prefix in front of it, which is empty when the page
+        // is already MRU.
+        let reuse_idx = self
+            .entries
+            .iter()
+            .position(|entry| entry.page_no == page_no)
+            .or_else(|| {
+                (self.entries.len() >= CELL_SLOT_CACHE_ENTRIES).then(|| self.entries.len() - 1)
+            });
+        let Some(idx) = reuse_idx else {
+            let mut slots = CachedCellSlots::new();
+            store_cached_cell_slot(&mut slots, cell_idx, slot);
+            self.entries.insert(
+                0,
+                CellSlotCacheEntry {
+                    page_no,
+                    mutation_counter,
+                    slots,
+                },
+            );
+            return;
         };
-
+        let entry = &mut self.entries[idx];
+        if entry.page_no != page_no || entry.mutation_counter != mutation_counter {
+            entry.page_no = page_no;
+            entry.mutation_counter = mutation_counter;
+            entry.slots.clear();
+        }
         store_cached_cell_slot(&mut entry.slots, cell_idx, slot);
-
-        self.entries.insert(0, entry);
-        self.entries.truncate(CELL_SLOT_CACHE_ENTRIES);
+        self.entries[..=idx].rotate_right(1);
     }
 }
 
@@ -13484,8 +13505,65 @@ mod tests {
             assert_ne!(mutated_entry.mutation_counter, first_counter);
             let mutated_cell = cursor.parse_cell_at(&mutated_entry, 0).unwrap();
             assert_eq!(mutated_cell.rowid, Some(10));
-            assert_eq!(cursor.cell_slot_cache.borrow().entries.len(), 2);
+            // The new image takes over the page's entry: the old image's slots
+            // are dropped rather than kept as a second entry for the page.
+            let cache = cursor.cell_slot_cache.borrow();
+            assert_eq!(cache.entries.len(), 1);
+            assert_eq!(
+                cache.entries[0].mutation_counter,
+                mutated_entry.mutation_counter
+            );
+            assert_eq!(cache.entries[0].slots.len(), 1);
         });
+    }
+
+    /// GH#439: every row an UPDATE or DELETE rewrites gives its leaf a new
+    /// image token. The cache must keep reusing that page's entry in place
+    /// (no growth, no shifting of the other entries) and still evict the
+    /// least recently used page once it is full.
+    #[test]
+    fn test_cell_slot_cache_reuses_page_entry_across_images() {
+        let slot = |rowid: i64| CachedCellSlot {
+            left_child: None,
+            rowid: Some(rowid),
+            payload_size: 8,
+            local_size: 8,
+            payload_offset: 100,
+            overflow_page: None,
+        };
+        let mut cache = CellSlotCache::default();
+        let others = u32::try_from(CELL_SLOT_CACHE_ENTRIES).unwrap() - 1;
+        for page in 0..others {
+            cache.insert(pn(page + 10), 1, 0, slot(i64::from(page)));
+        }
+        let hot = pn(3);
+        for image in 0..1_000_u64 {
+            cache.insert(hot, image, 5, slot(7));
+            assert_eq!(cache.get(hot, image, 5), Some(slot(7)));
+            if image > 0 {
+                assert_eq!(cache.get(hot, image - 1, 5), None, "stale image must miss");
+            }
+        }
+        assert_eq!(cache.entries.len(), CELL_SLOT_CACHE_ENTRIES);
+        assert_eq!(
+            cache
+                .entries
+                .iter()
+                .filter(|entry| entry.page_no == hot)
+                .count(),
+            1
+        );
+        // Every other page is still cached.
+        for page in 0..others {
+            assert_eq!(cache.get(pn(page + 10), 1, 0), Some(slot(i64::from(page))));
+        }
+
+        // A page the cache has never seen evicts the least recently used one.
+        let lru = cache.entries.last().unwrap().page_no;
+        cache.insert(pn(5_000), 1, 0, slot(1));
+        assert_eq!(cache.entries.len(), CELL_SLOT_CACHE_ENTRIES);
+        assert_eq!(cache.entries[0].page_no, pn(5_000));
+        assert!(cache.entries.iter().all(|entry| entry.page_no != lru));
     }
 
     #[test]
