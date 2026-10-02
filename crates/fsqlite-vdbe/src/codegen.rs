@@ -5379,12 +5379,29 @@ fn codegen_select_index_equality_scan(
             _ => false,
         }
     });
-    // A partial index cannot make a 0-match seek authoritative: rows the index
-    // predicate excludes are absent from it but can still satisfy the WHERE, so
-    // those keep the fallback scan.
-    let exact_seek = idx_schema.key_term_count() == 1
-        && !idx_schema.key_term_descending(0)
-        && idx_schema.supports_direct_column_lookup()
+    // A partial index makes a 0-match seek authoritative only when the WHERE implies its predicate:
+    // otherwise rows the predicate excludes are absent from the index but can still satisfy the WHERE,
+    // so those keep the fallback scan. GH#444: `k = 'v'` implies `k IS NOT NULL`, the common shape of a
+    // partial UNIQUE index guarded by a trigger WHEN probe.
+    let index_holds_every_candidate = idx_schema.where_clause.is_none()
+        || where_clause.is_some_and(|where_expr| {
+            let mut conjuncts = Vec::new();
+            collect_conjunctive_terms(where_expr, &mut conjuncts);
+            index_partial_predicate_is_covered_by_query_conjuncts(
+                idx_schema,
+                &conjuncts,
+                table,
+                table_alias,
+            )
+        });
+    // GH#444: the argument above concerns only the leading key term, so it holds for a composite index
+    // too. The one-field prefix probe lands on the first entry whose leading column equals the literal,
+    // that column's matching rows form one contiguous block, and a probe that finds no such block
+    // cannot have missed a matching row.
+    let exact_seek = !idx_schema.key_term_descending(0)
+        && !idx_schema.columns.is_empty()
+        && idx_schema.columns.len() == idx_schema.key_term_count()
+        && index_holds_every_candidate
         && probe_needs_no_affinity_conversion;
     let seek_miss_label = if exact_seek {
         fast_path_done_label
@@ -16924,8 +16941,64 @@ fn index_partial_predicate_is_covered_by_query_conjuncts(
     predicate_conjuncts.iter().all(|predicate_conjunct| {
         query_conjuncts.iter().any(|query_conjunct| {
             expressions_match_table_locally(query_conjunct, predicate_conjunct, table, table_alias)
+                || query_conjunct_proves_is_not_null(
+                    query_conjunct,
+                    predicate_conjunct,
+                    table,
+                    table_alias,
+                )
         })
     })
+}
+
+/// GH#444: a query conjunct proves a partial-index predicate `x IS NOT NULL`
+/// when it can only be TRUE for a non-NULL `x`. Ordinary comparisons propagate
+/// NULL, so `x = <anything but an explicit NULL>` (and `<`, `<=`, `>`, `>=`,
+/// `<>`) does; `x IS <non-NULL literal>` does too, while `x IS ?` may bind NULL
+/// and stays fail-closed. Mirrors the planner's `direct_comparison_guarantees_non_null`.
+fn query_conjunct_proves_is_not_null(
+    query_conjunct: &Expr,
+    predicate_conjunct: &Expr,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> bool {
+    let Expr::IsNull {
+        expr: predicate_operand,
+        not: true,
+        ..
+    } = predicate_conjunct
+    else {
+        return false;
+    };
+    let Expr::BinaryOp {
+        left, op, right, ..
+    } = query_conjunct
+    else {
+        return false;
+    };
+    let is_operand = |side: &Expr| {
+        expressions_match_table_locally(side, predicate_operand, table, table_alias)
+    };
+    match op {
+        BinaryOp::Eq
+        | BinaryOp::Ne
+        | BinaryOp::Lt
+        | BinaryOp::Le
+        | BinaryOp::Gt
+        | BinaryOp::Ge => {
+            let is_explicit_null = |side: &Expr| matches!(side, Expr::Literal(Literal::Null, _));
+            (is_operand(left) && !is_explicit_null(right))
+                || (is_operand(right) && !is_explicit_null(left))
+        }
+        BinaryOp::Is => {
+            let is_non_null_literal = |side: &Expr| {
+                matches!(side, Expr::Literal(literal, _) if !matches!(literal, Literal::Null))
+            };
+            (is_operand(left) && is_non_null_literal(right))
+                || (is_operand(right) && is_non_null_literal(left))
+        }
+        _ => false,
+    }
 }
 
 /// Emit one value's index seek + duplicate-run accumulate for the aggregate IN-list path.
@@ -17652,14 +17725,30 @@ fn codegen_select_aggregate(
         // full-scan fallback (an affinity safety net for mixed-type columns) is unnecessary: a miss
         // finalizes to the empty-aggregate result (COUNT=0 / SUM=NULL) directly, making an absent-key
         // lookup O(log n) not the O(n) fallback scan. (Non-exact keeps the fallback.) bd-eq-seek-fallback-zero-match.
+        // GH#444: a string literal against a TEXT column is exact on the same terms as the single-column
+        // seek (GH#409) — no affinity conversion is implied, and BINARY on both the index term and the
+        // column makes the index order the comparison order — so it qualifies per term too.
         let exact_seek = prefix_exprs.iter().enumerate().all(|(i, e)| {
-            matches!(e, Expr::Literal(Literal::Integer(_), _))
-                && idx_schema
-                    .columns
-                    .get(i)
-                    .and_then(|name| table.column_index(name))
-                    .and_then(|ci| table.columns.get(ci))
-                    .is_some_and(|c| c.affinity == 'D')
+            let Some(column) = idx_schema
+                .columns
+                .get(i)
+                .and_then(|name| table.column_index(name))
+                .and_then(|ci| table.columns.get(ci))
+            else {
+                return false;
+            };
+            let binary = |collation: Option<&str>| {
+                collation.is_none_or(|c| c.eq_ignore_ascii_case("BINARY"))
+            };
+            match e {
+                Expr::Literal(Literal::Integer(_), _) => column.affinity == 'D',
+                Expr::Literal(Literal::String(_), _) => {
+                    column.affinity == 'B'
+                        && binary(idx_schema.key_term_collation(i))
+                        && binary(column.collation.as_deref())
+                }
+                _ => false,
+            }
         });
         let seek_miss_label = if exact_seek {
             finalize_label
