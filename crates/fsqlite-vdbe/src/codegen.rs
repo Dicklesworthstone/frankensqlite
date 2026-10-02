@@ -3926,8 +3926,9 @@ pub fn codegen_select(
     // (multi-column PK, or a WHERE that is not a bare single equality). EQP
     // flips SCAN->SEARCH through the same program-verified `FullTableScan` arm.
     // A competing secondary equality index must not displace a complete PK
-    // probe. Override that directive only for native literal comparisons on
-    // a proven ascending BINARY PK; explicit index hints remain authoritative.
+    // probe. Override that directive only for literal or numbered-parameter
+    // comparisons on a proven ascending BINARY PK; explicit index hints remain
+    // authoritative.
     if table.without_rowid
         && !is_aggregate
         && from_index_hint.is_none()
@@ -3950,8 +3951,16 @@ pub fn codegen_select(
                             .iter()
                             .zip(&pk_targets)
                             .all(|(column, target)| {
-                                matches!(target, Expr::Literal(..))
-                                    && index_range_bound_is_seek_safe(
+                                // bd-ry6x7: a numbered parameter is coerced to the PK
+                                // column's affinity by the seek's `Affinity` op.
+                                matches!(
+                                    target,
+                                    Expr::Literal(..)
+                                        | Expr::Placeholder(
+                                            fsqlite_ast::PlaceholderType::Numbered(_),
+                                            _
+                                        )
+                                ) && index_range_bound_is_seek_safe(
                                         table,
                                         table_alias,
                                         schema,
@@ -5398,13 +5407,41 @@ fn codegen_select_index_equality_scan(
     // too. The one-field prefix probe lands on the first entry whose leading column equals the literal,
     // that column's matching rows form one contiguous block, and a probe that finds no such block
     // cannot have missed a matching row.
-    let exact_seek = !idx_schema.key_term_descending(0)
+    let leading_key_block_is_exact = !idx_schema.key_term_descending(0)
         && !idx_schema.columns.is_empty()
         && idx_schema.columns.len() == idx_schema.key_term_count()
-        && index_holds_every_candidate
-        && probe_needs_no_affinity_conversion;
+        && index_holds_every_candidate;
+    let exact_seek = leading_key_block_is_exact && probe_needs_no_affinity_conversion;
+    // bd-ry6x7: a bound parameter's storage class is only known at run time, so the GH#409 argument
+    // above is checked there instead: a 0-match seek is authoritative when the parameter holds the
+    // storage class the column's affinity leaves unconverted (INTEGER for INTEGER affinity; TEXT for
+    // TEXT affinity under BINARY on both the index and the column). Any other value keeps the
+    // fallback. Trigger WHEN subqueries bind OLD/NEW this way, and their "no row holds this key yet"
+    // probes miss on every insert; without this each miss scanned the whole table.
+    let runtime_exact_type_mask = if leading_key_block_is_exact
+        && !exact_seek
+        && matches!(target_expr, Expr::Placeholder(..))
+    {
+        probe_column.and_then(|column| match column.affinity {
+            'D' => Some(0x01_u16),
+            'B' if index_collation_is_binary
+                && column
+                    .collation
+                    .as_deref()
+                    .is_none_or(|collation| collation.eq_ignore_ascii_case("BINARY")) =>
+            {
+                Some(0x04_u16)
+            }
+            _ => None,
+        })
+    } else {
+        None
+    };
+    let runtime_exact_check = runtime_exact_type_mask.map(|_| b.emit_label());
     let seek_miss_label = if exact_seek {
         fast_path_done_label
+    } else if let Some(check) = runtime_exact_check {
+        check
     } else {
         full_scan_fallback
     };
@@ -5615,6 +5652,20 @@ fn codegen_select_index_equality_scan(
     );
     // Exact seek: 0 matches is authoritative → the empty result, not the O(n) fallback scan.
     b.emit_jump_to_label(Opcode::Goto, 0, 0, seek_miss_label, P4::None, 0);
+
+    if let (Some(check), Some(mask)) = (runtime_exact_check, runtime_exact_type_mask) {
+        // bd-ry6x7: the miss is authoritative when the parameter's storage class is the one the
+        // column's affinity leaves unconverted; anything else falls through to the scan.
+        b.resolve_label(check);
+        b.emit_jump_to_label(
+            Opcode::IsType,
+            -1,
+            probe_key_regs,
+            fast_path_done_label,
+            P4::None,
+            mask,
+        );
+    }
 
     b.resolve_label(full_scan_fallback);
     if !needs_table_lookup {
@@ -31268,12 +31319,15 @@ fn literal_exists_exclusion_index<'a, 's>(
         } else {
             (column_name(right, table, table_alias)?, left.as_ref())
         };
+        // bd-ry6x7: a numbered parameter qualifies too. The preflight only concludes "no row
+        // differs" when both extrema are raw-equal to the bound, which no affinity or BINARY
+        // comparison can turn unequal; any other outcome runs the ordinary plan.
         if !matches!(
             bound,
             Expr::Literal(
                 Literal::Integer(_) | Literal::Float(_) | Literal::String(_) | Literal::Blob(_),
                 _
-            )
+            ) | Expr::Placeholder(fsqlite_ast::PlaceholderType::Numbered(_), _)
         ) || !index_range_bound_is_seek_safe(table, table_alias, schema, &column, bound)
         {
             return None;
@@ -31366,12 +31420,14 @@ fn literal_exists_pk_prefix<'a>(
             } else {
                 return None;
             };
+            // bd-ry6x7: a numbered parameter qualifies too; the probe coerces it to the key
+            // column's affinity before seeking (see `codegen_select_without_rowid_exists_prefix`).
             (matches!(
                 target,
                 Expr::Literal(
                     Literal::Integer(_) | Literal::Float(_) | Literal::String(_) | Literal::Blob(_),
                     _
-                )
+                ) | Expr::Placeholder(fsqlite_ast::PlaceholderType::Numbered(_), _)
             ) && index_range_bound_is_seek_safe(table, table_alias, schema, column, target))
             .then_some(target)
         });
@@ -31400,8 +31456,29 @@ fn codegen_select_without_rowid_exists_prefix(
     let bound_width = u16::try_from(targets.len())
         .map_err(|_| CodegenError::Unsupported("primary key prefix too wide".to_owned()))?;
     let keys = b.alloc_regs(width);
+    let pk = table.primary_key_constraints.first();
     for (offset, target) in targets.iter().enumerate() {
-        emit_expr(b, target, keys + offset as i32, None);
+        let key = keys + offset as i32;
+        emit_expr(b, target, key, None);
+        // bd-ry6x7: a parameter key takes its column's affinity before the seek, as the
+        // equality filter applies it, so its storage class matches the stored keys.
+        if is_placeholder_bound(target)
+            && let Some(affinity) = pk
+                .and_then(|pk| pk.get(offset))
+                .and_then(|name| table.column_index(name))
+                .and_then(|index| table.columns.get(index))
+                .map(|column| column.affinity)
+            && matches!(affinity, 'B' | 'C' | 'D' | 'E')
+        {
+            b.emit_op(
+                Opcode::Affinity,
+                key,
+                1,
+                0,
+                P4::Affinity(affinity.to_string()),
+                0,
+            );
+        }
     }
     let record = b.alloc_reg();
     b.emit_op(Opcode::MakeRecord, keys, width, record, P4::None, 0);

@@ -10205,16 +10205,19 @@ async fn trigger_when_matches(
         return Ok(true);
     };
     let mut bound_expr = expr.clone();
-    if let Some(active_frame) = frame {
-        bind_trigger_columns_in_expr(&mut bound_expr, active_frame);
-    }
+    // bd-ry6x7: OLD/NEW inside the clause's EXISTS guards bind as parameters,
+    // so each guard compiles once and is reused for every firing row.
+    let subquery_params = frame.map_or_else(Vec::new, |active_frame| {
+        bind_trigger_when_expr(&mut bound_expr, active_frame)
+    });
+    let params = (!subquery_params.is_empty()).then_some(subquery_params.as_slice());
     let row: [SqliteValue; 0] = [];
     let col_map: [(String, String, bool); 0] = [];
     // WHEN is a truthiness context: stock compiles it through ExprIfTrue, so
     // the boolean skeleton short-circuits and a FALSE guard arm keeps later
     // arms (and any error they would raise) from ever being evaluated.
     connection
-        .eval_expr_truthiness(&bound_expr, true, &row, &col_map, None)
+        .eval_expr_truthiness(&bound_expr, true, &row, &col_map, params)
         .await
         .map(|truth| truth.unwrap_or(false))
 }
@@ -84974,7 +84977,12 @@ impl Connection {
                             offset: None,
                         });
                     }
-                    let _cache_guard = BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true);
+                    // bd-ry6x7: a parameterized probe (a trigger WHEN guard)
+                    // is identified by its text and reuses its program.
+                    let _cache_guard = BoolCellRestoreGuard::new(
+                        &self.bypass_compiled_cache,
+                        !nested_exists_reuses_compiled_program(&sub_clone),
+                    );
                     let rows = execute_nested_select(sub_clone).await?;
                     let exists = !rows.is_empty();
                     let truth = if *not { !exists } else { exists };
@@ -111049,7 +111057,38 @@ fn combine_where_clauses(
 /// `*_subquery_supported_by_vdbe` routing predicates, which must keep
 /// parameter-dependent subqueries on dispatch paths that bind at execution.
 fn select_contains_any_placeholder(select: &SelectStatement) -> bool {
-    fn core(core: &SelectCore) -> bool {
+    select_contains_expr_leaf(select, ExprLeaf::Placeholder)
+}
+
+/// bd-ry6x7: whether a nested EXISTS probe evaluated per outer row may use the
+/// compiled-statement cache. One whose per-row values arrive as bind
+/// parameters (a trigger WHEN guard) has the same SQL text for every row, so
+/// the text identifies its program exactly as it does for a prepared
+/// statement. One carrying substituted literal or [`Expr::BoundOuterValue`]
+/// leaves would only churn the cache with single-use programs, or (for the
+/// latter) reuse a program compiled for another donor's affinity and
+/// collation, so it keeps recompiling.
+fn nested_exists_reuses_compiled_program(select: &SelectStatement) -> bool {
+    select_contains_any_placeholder(select) && !select_contains_bound_outer_value(select)
+}
+
+/// Returns true when any expression position inside the SELECT carries an
+/// outer-row value substituted as [`Expr::BoundOuterValue`]. Its display omits
+/// the donor's affinity and collation, so the SQL text of such a SELECT does
+/// not identify a reusable compiled program.
+fn select_contains_bound_outer_value(select: &SelectStatement) -> bool {
+    select_contains_expr_leaf(select, ExprLeaf::BoundOuterValue)
+}
+
+/// The leaf expression kinds [`select_contains_expr_leaf`] can search for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExprLeaf {
+    Placeholder,
+    BoundOuterValue,
+}
+
+fn select_contains_expr_leaf(select: &SelectStatement, leaf: ExprLeaf) -> bool {
+    fn core(core: &SelectCore, leaf: ExprLeaf) -> bool {
         match core {
             SelectCore::Select {
                 columns,
@@ -111061,74 +111100,81 @@ fn select_contains_any_placeholder(select: &SelectStatement) -> bool {
                 ..
             } => {
                 columns.iter().any(|column| match column {
-                    ResultColumn::Expr { expr: e, .. } => expr(e),
+                    ResultColumn::Expr { expr: e, .. } => expr(e, leaf),
                     ResultColumn::Star | ResultColumn::TableStar(_) => false,
-                }) || from.as_ref().is_some_and(from_clause)
-                    || where_clause.as_deref().is_some_and(expr)
-                    || group_by.iter().any(expr)
-                    || having.as_deref().is_some_and(expr)
-                    || windows.iter().any(|window| window_spec(&window.spec))
+                }) || from.as_ref().is_some_and(|from| from_clause(from, leaf))
+                    || where_clause.as_deref().is_some_and(|e| expr(e, leaf))
+                    || group_by.iter().any(|e| expr(e, leaf))
+                    || having.as_deref().is_some_and(|e| expr(e, leaf))
+                    || windows
+                        .iter()
+                        .any(|window| window_spec(&window.spec, leaf))
             }
-            SelectCore::Values(rows) => rows.iter().flatten().any(expr),
+            SelectCore::Values(rows) => rows.iter().flatten().any(|e| expr(e, leaf)),
         }
     }
-    fn from_clause(from: &fsqlite_ast::FromClause) -> bool {
-        source(&from.source)
+    fn from_clause(from: &fsqlite_ast::FromClause, leaf: ExprLeaf) -> bool {
+        source(&from.source, leaf)
             || from.joins.iter().any(|join| {
-                source(&join.table)
-                    || matches!(&join.constraint, Some(JoinConstraint::On(e)) if expr(e))
+                source(&join.table, leaf)
+                    || matches!(&join.constraint, Some(JoinConstraint::On(e)) if expr(e, leaf))
             })
     }
-    fn source(src: &TableOrSubquery) -> bool {
+    fn source(src: &TableOrSubquery, leaf: ExprLeaf) -> bool {
         match src {
             TableOrSubquery::Table { .. } => false,
-            TableOrSubquery::Subquery { query, .. } => select_contains_any_placeholder(query),
-            TableOrSubquery::TableFunction { args, .. } => args.iter().any(expr),
-            TableOrSubquery::ParenJoin(from) => from_clause(from),
+            TableOrSubquery::Subquery { query, .. } => select_contains_expr_leaf(query, leaf),
+            TableOrSubquery::TableFunction { args, .. } => args.iter().any(|e| expr(e, leaf)),
+            TableOrSubquery::ParenJoin(from) => from_clause(from, leaf),
         }
     }
-    fn window_spec(spec: &fsqlite_ast::WindowSpec) -> bool {
-        spec.partition_by.iter().any(expr)
-            || spec.order_by.iter().any(|ordering| expr(&ordering.expr))
+    fn window_spec(spec: &fsqlite_ast::WindowSpec, leaf: ExprLeaf) -> bool {
+        spec.partition_by.iter().any(|e| expr(e, leaf))
+            || spec
+                .order_by
+                .iter()
+                .any(|ordering| expr(&ordering.expr, leaf))
             || spec.frame.as_ref().is_some_and(|frame| {
-                frame_bound(&frame.start) || frame.end.as_ref().is_some_and(frame_bound)
+                frame_bound(&frame.start, leaf)
+                    || frame
+                        .end
+                        .as_ref()
+                        .is_some_and(|bound| frame_bound(bound, leaf))
             })
     }
-    fn frame_bound(bound: &fsqlite_ast::FrameBound) -> bool {
+    fn frame_bound(bound: &fsqlite_ast::FrameBound, leaf: ExprLeaf) -> bool {
         match bound {
             fsqlite_ast::FrameBound::Preceding(e) | fsqlite_ast::FrameBound::Following(e) => {
-                expr(e)
+                expr(e, leaf)
             }
             fsqlite_ast::FrameBound::UnboundedPreceding
             | fsqlite_ast::FrameBound::CurrentRow
             | fsqlite_ast::FrameBound::UnboundedFollowing => false,
         }
     }
-    fn expr(e: &Expr) -> bool {
+    fn expr(e: &Expr, leaf: ExprLeaf) -> bool {
         match e {
-            Expr::Placeholder(_, _) => true,
-            Expr::BoundOuterValue { .. }
-            | Expr::Literal(_, _)
-            | Expr::Column(_, _)
-            | Expr::Raise { .. } => false,
-            Expr::BinaryOp { left, right, .. } => expr(left) || expr(right),
+            Expr::Placeholder(_, _) => leaf == ExprLeaf::Placeholder,
+            Expr::BoundOuterValue { .. } => leaf == ExprLeaf::BoundOuterValue,
+            Expr::Literal(_, _) | Expr::Column(_, _) | Expr::Raise { .. } => false,
+            Expr::BinaryOp { left, right, .. } => expr(left, leaf) || expr(right, leaf),
             Expr::UnaryOp { expr: inner, .. }
             | Expr::IsNull { expr: inner, .. }
             | Expr::Cast { expr: inner, .. }
-            | Expr::Collate { expr: inner, .. } => expr(inner),
+            | Expr::Collate { expr: inner, .. } => expr(inner, leaf),
             Expr::Between {
                 expr: inner,
                 low,
                 high,
                 ..
-            } => expr(inner) || expr(low) || expr(high),
+            } => expr(inner, leaf) || expr(low, leaf) || expr(high, leaf),
             Expr::In {
                 expr: inner, set, ..
             } => {
-                expr(inner)
+                expr(inner, leaf)
                     || match set {
-                        InSet::List(values) => values.iter().any(expr),
-                        InSet::Subquery(query) => select_contains_any_placeholder(query),
+                        InSet::List(values) => values.iter().any(|e| expr(e, leaf)),
+                        InSet::Subquery(query) => select_contains_expr_leaf(query, leaf),
                         InSet::Table(_) => false,
                     }
             }
@@ -111137,19 +111183,25 @@ fn select_contains_any_placeholder(select: &SelectStatement) -> bool {
                 pattern,
                 escape,
                 ..
-            } => expr(inner) || expr(pattern) || escape.as_deref().is_some_and(expr),
+            } => {
+                expr(inner, leaf)
+                    || expr(pattern, leaf)
+                    || escape.as_deref().is_some_and(|e| expr(e, leaf))
+            }
             Expr::Case {
                 operand,
                 whens,
                 else_expr,
                 ..
             } => {
-                operand.as_deref().is_some_and(expr)
-                    || whens.iter().any(|(when, then)| expr(when) || expr(then))
-                    || else_expr.as_deref().is_some_and(expr)
+                operand.as_deref().is_some_and(|e| expr(e, leaf))
+                    || whens
+                        .iter()
+                        .any(|(when, then)| expr(when, leaf) || expr(then, leaf))
+                    || else_expr.as_deref().is_some_and(|e| expr(e, leaf))
             }
-            Expr::Exists { subquery, .. } => select_contains_any_placeholder(subquery),
-            Expr::Subquery(query, _) => select_contains_any_placeholder(query),
+            Expr::Exists { subquery, .. } => select_contains_expr_leaf(subquery, leaf),
+            Expr::Subquery(query, _) => select_contains_expr_leaf(query, leaf),
             Expr::FunctionCall {
                 args,
                 order_by,
@@ -111157,28 +111209,27 @@ fn select_contains_any_placeholder(select: &SelectStatement) -> bool {
                 over,
                 ..
             } => {
-                matches!(args, FunctionArgs::List(list) if list.iter().any(expr))
-                    || order_by.iter().any(|ordering| expr(&ordering.expr))
-                    || filter.as_deref().is_some_and(expr)
-                    || over.as_ref().is_some_and(window_spec)
+                matches!(args, FunctionArgs::List(list) if list.iter().any(|e| expr(e, leaf)))
+                    || order_by.iter().any(|ordering| expr(&ordering.expr, leaf))
+                    || filter.as_deref().is_some_and(|e| expr(e, leaf))
+                    || over.as_ref().is_some_and(|spec| window_spec(spec, leaf))
             }
             Expr::JsonAccess {
                 expr: inner, path, ..
-            } => expr(inner) || expr(path),
-            Expr::RowValue(values, _) => values.iter().any(expr),
+            } => expr(inner, leaf) || expr(path, leaf),
+            Expr::RowValue(values, _) => values.iter().any(|e| expr(e, leaf)),
         }
     }
-    core(&select.body.select)
-        || select.body.compounds.iter().any(|(_, c)| core(c))
-        || select.order_by.iter().any(|term| expr(&term.expr))
-        || select
-            .limit
-            .as_ref()
-            .is_some_and(|limit| expr(&limit.limit) || limit.offset.as_ref().is_some_and(expr))
+    core(&select.body.select, leaf)
+        || select.body.compounds.iter().any(|(_, c)| core(c, leaf))
+        || select.order_by.iter().any(|term| expr(&term.expr, leaf))
+        || select.limit.as_ref().is_some_and(|limit| {
+            expr(&limit.limit, leaf) || limit.offset.as_ref().is_some_and(|e| expr(e, leaf))
+        })
         || select.with.as_ref().is_some_and(|with| {
             with.ctes
                 .iter()
-                .any(|cte| select_contains_any_placeholder(&cte.query))
+                .any(|cte| select_contains_expr_leaf(&cte.query, leaf))
         })
 }
 
@@ -146390,6 +146441,141 @@ fn bind_trigger_columns_in_frame_bound(
     }
 }
 
+/// bd-ry6x7: OLD/NEW values bound inside the EXISTS subqueries of a trigger
+/// WHEN clause, collected while [`bind_trigger_when_expr`] runs.
+///
+/// Inside those subqueries a bound reference becomes a numbered parameter
+/// instead of a literal, so the subquery's SQL text is the same for every
+/// firing row and its compiled program is reused from the statement cache.
+/// With literals every row produced a new statement that was validated,
+/// planned and compiled from scratch, which made bulk writes guarded by
+/// `WHEN EXISTS (...)` validators cost a full compile per row and guard. A
+/// parameter carries no affinity or collation, exactly like the literal it
+/// replaces, so the comparison contract is unchanged.
+struct TriggerWhenSubqueryParams {
+    /// Nesting depth of parameterized EXISTS subqueries at the binding point.
+    subquery_depth: usize,
+    /// Lowercased `(qualifier, column)` of each parameter, for reuse when the
+    /// same reference appears more than once.
+    keys: Vec<(Option<String>, String)>,
+    values: Vec<SqliteValue>,
+}
+
+thread_local! {
+    static TRIGGER_WHEN_SUBQUERY_PARAMS: RefCell<Option<TriggerWhenSubqueryParams>> =
+        const { RefCell::new(None) };
+}
+
+/// Marks the binder as inside a parameterized EXISTS subquery for its lifetime.
+struct TriggerWhenSubqueryScope;
+
+impl TriggerWhenSubqueryScope {
+    fn enter() -> Self {
+        TRIGGER_WHEN_SUBQUERY_PARAMS.with(|cell| {
+            if let Some(params) = cell.borrow_mut().as_mut() {
+                params.subquery_depth += 1;
+            }
+        });
+        Self
+    }
+}
+
+impl Drop for TriggerWhenSubqueryScope {
+    fn drop(&mut self) {
+        TRIGGER_WHEN_SUBQUERY_PARAMS.with(|cell| {
+            if let Some(params) = cell.borrow_mut().as_mut() {
+                params.subquery_depth = params.subquery_depth.saturating_sub(1);
+            }
+        });
+    }
+}
+
+/// The parameter standing for a bound OLD/NEW reference, when the WHEN
+/// binder is active and inside a subquery; `None` keeps the literal.
+fn trigger_when_subquery_param(
+    table_prefix: Option<&str>,
+    column_name: &str,
+    value: &SqliteValue,
+) -> Option<Expr> {
+    TRIGGER_WHEN_SUBQUERY_PARAMS.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let params = slot.as_mut().filter(|params| params.subquery_depth > 0)?;
+        let key = (
+            table_prefix.map(str::to_ascii_lowercase),
+            column_name.to_ascii_lowercase(),
+        );
+        let index = if let Some(index) = params.keys.iter().position(|existing| *existing == key)
+        {
+            index
+        } else {
+            params.keys.push(key);
+            params.values.push(value.clone());
+            params.values.len() - 1
+        };
+        let number = u32::try_from(index + 1).ok()?;
+        Some(Expr::Placeholder(PlaceholderType::Numbered(number), Span::ZERO))
+    })
+}
+
+/// Bind a trigger WHEN clause against `frame` (bd-ry6x7). OLD/NEW references
+/// inside an EXISTS that is a leaf of the clause's AND / OR / NOT skeleton
+/// become `?N` parameters, whose values are returned in order; every other
+/// reference becomes a literal, as in all other trigger bindings.
+///
+/// Only those EXISTS leaves are parameterized because the WHEN evaluator runs
+/// them as nested statements with the parameters bound. Other subquery
+/// positions (a comparison operand, for one) are materialized through helpers
+/// that execute without parameters, so they keep literals.
+fn bind_trigger_when_expr(expr: &mut Expr, frame: &TriggerFrame) -> Vec<SqliteValue> {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TRIGGER_WHEN_SUBQUERY_PARAMS.with(|cell| cell.borrow_mut().take());
+        }
+    }
+    TRIGGER_WHEN_SUBQUERY_PARAMS.with(|cell| {
+        *cell.borrow_mut() = Some(TriggerWhenSubqueryParams {
+            subquery_depth: 0,
+            keys: Vec::new(),
+            values: Vec::new(),
+        });
+    });
+    let reset = Reset;
+    bind_trigger_when_skeleton(expr, frame);
+    let values = TRIGGER_WHEN_SUBQUERY_PARAMS
+        .with(|cell| cell.borrow_mut().take())
+        .map(|params| params.values)
+        .unwrap_or_default();
+    drop(reset);
+    values
+}
+
+/// Walk the AND / OR / NOT skeleton of a WHEN clause: EXISTS leaves bind with
+/// parameters, everything else through the ordinary literal binder.
+fn bind_trigger_when_skeleton(expr: &mut Expr, frame: &TriggerFrame) {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOp::And | BinaryOp::Or,
+            right,
+            ..
+        } => {
+            bind_trigger_when_skeleton(left, frame);
+            bind_trigger_when_skeleton(right, frame);
+        }
+        Expr::UnaryOp {
+            op: UnaryOp::Not,
+            expr: inner,
+            ..
+        } => bind_trigger_when_skeleton(inner, frame),
+        Expr::Exists { subquery, .. } => {
+            let _subquery_scope = TriggerWhenSubqueryScope::enter();
+            bind_trigger_columns_in_select_statement(subquery, frame);
+        }
+        _ => bind_trigger_columns_in_expr(expr, frame),
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn bind_trigger_columns_in_expr(expr: &mut Expr, frame: &TriggerFrame) {
     bind_trigger_columns_in_expr_inner(expr, frame, false, false);
@@ -146444,7 +146630,8 @@ fn bind_trigger_columns_in_expr_inner(
             if frame.references_pseudo_column(table_prefix, &column_name)
                 && let Some(value) = frame.lookup_value(table_prefix, &column_name)
             {
-                *expr = value_to_literal_expr(value);
+                *expr = trigger_when_subquery_param(table_prefix, &column_name, &value)
+                    .unwrap_or_else(|| value_to_literal_expr(value));
             }
         }
         Expr::BinaryOp { left, right, .. } => {
