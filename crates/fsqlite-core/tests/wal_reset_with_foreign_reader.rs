@@ -1712,3 +1712,91 @@ fn gh19_wal_initialization_refuses_foreign_reader_without_mutation() {
         wal.close(&cx).unwrap();
     });
 }
+
+/// GH#443 (cass GH#509): a stock read-only connection opened and closed on a
+/// WAL database rewrites the WAL-index header in `-shm` for the empty WAL it
+/// sees (iChange 0, page size 0, fresh salts). A later fsqlite writer must still
+/// commit. Before the fix every read-write COMMIT returned `BusyRecovery`, and a
+/// retrying process never cleared it.
+#[cfg(all(unix, feature = "native"))]
+#[test]
+fn gh443_writer_commits_after_a_stock_readonly_connection_rewrote_shm() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("gh443.db");
+    let path_text = path.to_str().unwrap().to_owned();
+    asupersync::test_utils::run_test(|| {
+        let path_text = path_text.clone();
+        async move {
+            let writer = Connection::open(path_text.as_str()).await.unwrap();
+            writer.execute("PRAGMA journal_mode = WAL;").await.unwrap();
+            writer.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT)").await.unwrap();
+            writer.execute("INSERT INTO t VALUES(1, 'before-stock')").await.unwrap();
+            // Leave the WAL header-only beside fsqlite's own index, the state an
+            // application's final TRUNCATE checkpoint leaves (cass GH#509).
+            writer.execute("PRAGMA wal_checkpoint(TRUNCATE);").await.unwrap();
+            writer.close().await.unwrap();
+        }
+    });
+    // Bytes 14..16 hold the WAL-index page size; 16..20 hold mxFrame.
+    let index_fields = |shm: &[u8]| {
+        (
+            u16::from_ne_bytes([shm[14], shm[15]]),
+            u32::from_ne_bytes([shm[16], shm[17], shm[18], shm[19]]),
+        )
+    };
+    assert!(wal_len(&path) <= 32, "the WAL holds no frames before the stock reader");
+    let shm_before = std::fs::read(sidecar(&path, "-shm")).unwrap();
+    assert_ne!(index_fields(&shm_before).0, 0, "fsqlite indexed its own WAL generation");
+
+    // Exactly what `sqlite3 -readonly db 'PRAGMA quick_check'` does to the files.
+    let stock = std::process::Command::new("python3")
+        .args([
+            "-c",
+            "import sqlite3,sys; c=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro', uri=True); \
+             print(c.execute('select count(*) from t').fetchone()[0]); c.close()",
+        ])
+        .arg(&path)
+        .output()
+        .expect("Python sqlite3 is required for the GH#443 stock reader");
+    assert!(stock.status.success(), "{}", String::from_utf8_lossy(&stock.stderr));
+    assert_eq!(String::from_utf8_lossy(&stock.stdout).trim(), "1");
+    let shm_after = std::fs::read(sidecar(&path, "-shm")).unwrap();
+    assert_eq!(
+        index_fields(&shm_after),
+        (0, 0),
+        "the stock reader must leave its unindexed empty header (page size 0, no frames)"
+    );
+
+    for round in 0..2_i64 {
+        let path_text = path_text.clone();
+        asupersync::test_utils::run_test(|| async move {
+            let writer = Connection::open(path_text.as_str()).await.unwrap();
+            writer.execute("BEGIN").await.unwrap();
+            writer
+                .execute(&format!("CREATE TABLE IF NOT EXISTS u{round}(x INTEGER)"))
+                .await
+                .unwrap();
+            writer
+                .execute(&format!("INSERT INTO t VALUES({}, 'after-stock')", round + 2))
+                .await
+                .unwrap();
+            writer
+                .execute("COMMIT")
+                .await
+                .expect("a writer must commit beside a stock-rewritten WAL index");
+            assert_eq!(scalar_i64(&writer.query("SELECT COUNT(*) FROM t").await.unwrap()), round + 2);
+            writer.close().await.unwrap();
+        });
+    }
+
+    let integrity = std::process::Command::new("python3")
+        .args([
+            "-c",
+            "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); \
+             print(c.execute('pragma integrity_check').fetchone()[0], c.execute('select count(*) from t').fetchone()[0])",
+        ])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&integrity.stdout).trim(), "ok 3");
+}

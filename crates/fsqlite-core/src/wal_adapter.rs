@@ -1502,6 +1502,12 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             return Err(FrankenError::BusyRecovery);
         }
         let mut target = plan.baseline();
+        if target.is_unindexed_empty() {
+            // GH#443: a stock read-only connection left this header for the
+            // frame-free WAL. Index this WAL's generation, as stock recovery
+            // would, instead of refusing every commit with BusyRecovery.
+            target.bind_wal_generation(self.wal.header())?;
+        }
         target.mx_frame = u32::try_from(index).ok().and_then(|frame| frame.checked_add(1))
             .ok_or(FrankenError::DatabaseFull)?;
         target.n_page = marker.db_size;

@@ -193,6 +193,23 @@ impl WalIndexHdr {
         self.mx_frame == 0 && self.sz_page == 0
     }
 
+    /// Bind the generation fields to the WAL this header will index.
+    ///
+    /// Stock SQLite writes an unindexed empty header (page size 0, its own
+    /// salts) for a frame-free WAL. The first publication over it must take
+    /// the page size, checksum byte order and salts from the WAL, as stock
+    /// recovery does (GH#443).
+    pub fn bind_wal_generation(&mut self, wal_header: &WalHeader) -> Result<()> {
+        self.sz_page = if wal_header.page_size == 65_536 {
+            1
+        } else {
+            u16::try_from(wal_header.page_size).map_err(|_| FrankenError::TooBig)?
+        };
+        self.big_end_cksum = u8::from(wal_header.big_endian_checksum());
+        self.a_salt = [wal_header.salts.salt1, wal_header.salts.salt2];
+        Ok(())
+    }
+
     /// Decode the page-size field, including SQLite's 65536-byte sentinel.
     pub fn page_size(&self) -> Result<u32> {
         let size = if self.sz_page == 1 {
@@ -1141,10 +1158,13 @@ impl SharedWalIndexAppendPlan {
         entries: Vec<(u32, u32, bool)>,
     ) -> Result<Self> {
         baseline.validate()?;
+        // An unindexed empty baseline indexes no frame, so its salts bind
+        // nothing; the publication binds them to this generation (GH#443).
         if regions.first().is_none_or(|(region, _)| *region != 0)
             || regions.windows(2).any(|pair| pair[0].0 >= pair[1].0)
             || entries.is_empty()
-            || baseline.a_salt != [generation.salts.salt1, generation.salts.salt2]
+            || (!baseline.is_unindexed_empty()
+                && baseline.a_salt != [generation.salts.salt1, generation.salts.salt2])
         {
             return Err(FrankenError::BusyRecovery);
         }
@@ -1226,6 +1246,19 @@ impl SharedWalIndexAppendPlan {
         matches!(self.phase, SharedWalPublicationPhase::Prepared) && self.target.is_none()
     }
 
+    /// An indexed baseline fixes the header's generation fields. An unindexed
+    /// empty one (stock SQLite's header for a frame-free WAL) indexes nothing,
+    /// so the publication must bind them to this plan's generation (GH#443).
+    fn target_keeps_generation(&self, target: &WalIndexHdr) -> bool {
+        if self.baseline.is_unindexed_empty() {
+            target.a_salt == [self.generation.salts.salt1, self.generation.salts.salt2]
+        } else {
+            target.big_end_cksum == self.baseline.big_end_cksum
+                && target.sz_page == self.baseline.sz_page
+                && target.a_salt == self.baseline.a_salt
+        }
+    }
+
     /// Count newly published commit markers, excluding a later staged suffix.
     pub fn publication_change(&self, maximum_frame: u32) -> Result<u32> {
         let mut change = self.baseline.i_change;
@@ -1260,9 +1293,7 @@ impl SharedWalIndexAppendPlan {
             || target.i_version != self.baseline.i_version
             || target.unused != self.baseline.unused
             || target.is_init != self.baseline.is_init
-            || target.big_end_cksum != self.baseline.big_end_cksum
-            || target.sz_page != self.baseline.sz_page
-            || target.a_salt != self.baseline.a_salt
+            || !self.target_keeps_generation(&target)
             || target.i_change != self.publication_change(target.mx_frame)?
             || self.target.is_some_and(|previous| previous != target)
         {
@@ -2306,6 +2337,88 @@ mod tests {
             invalid_format.format_version += 1;
             assert!(validate_shared_wal_index_wal_binding(&header, &invalid_format, None).is_err());
         }
+    }
+
+    /// GH#443: stock SQLite leaves an unindexed empty header (page size 0, its
+    /// own salts) for a frame-free WAL. The first append binds the header to
+    /// the WAL generation; an indexed baseline keeps its strict salt check.
+    #[test]
+    fn test_shared_append_plan_binds_an_unindexed_empty_stock_header() {
+        let region = ShmRegion::new(WAL_SHM_SEGMENT_BYTES);
+        let mut stock = WalIndexHdr {
+            i_version: WAL_INDEX_VERSION,
+            unused: 0,
+            i_change: 0,
+            is_init: 1,
+            big_end_cksum: 0,
+            sz_page: 0,
+            mx_frame: 0,
+            n_page: 0,
+            a_frame_cksum: [0, 0],
+            a_salt: [102_238_008, 165_385_013],
+            a_cksum: [0; 2],
+        };
+        stock.update_checksum().unwrap();
+        assert!(stock.is_unindexed_empty());
+        publish_shared_wal_index_header(&region, &stock).unwrap();
+        let wal_header = WalHeader {
+            magic: crate::WAL_MAGIC_LE,
+            format_version: crate::WAL_FORMAT_VERSION,
+            page_size: 4096,
+            checkpoint_seq: 3,
+            salts: crate::WalSalts {
+                salt1: 0x0bad_cafe,
+                salt2: 0x1234_5678,
+            },
+            checksum: crate::checksum::SqliteWalChecksum { s1: 0, s2: 0 },
+        };
+        let generation = WalGenerationIdentity::from_header(&wal_header);
+        let mut plan = SharedWalIndexAppendPlan::prepare(
+            stock,
+            generation,
+            vec![(0, region.share())],
+            vec![(1, 2, true)],
+        )
+        .expect("an unindexed empty baseline admits the first append");
+
+        // A publication that keeps the stock salts is not bound to this WAL.
+        let mut unbound = stock;
+        unbound.sz_page = 4096;
+        unbound.mx_frame = 1;
+        unbound.n_page = 2;
+        unbound.a_frame_cksum = [5, 6];
+        unbound.i_change = plan.publication_change(1).unwrap();
+        unbound.update_checksum().unwrap();
+        assert!(plan.publish(unbound).is_err());
+        assert_eq!(read_shared_wal_index_header(&region).unwrap(), Some(stock));
+
+        let mut target = stock;
+        target.bind_wal_generation(&wal_header).unwrap();
+        target.mx_frame = 1;
+        target.n_page = 2;
+        target.a_frame_cksum = [5, 6];
+        target.i_change = plan.publication_change(1).unwrap();
+        target.update_checksum().unwrap();
+        assert_eq!(target.page_size().unwrap(), 4096);
+        assert_eq!(target.a_salt, [0x0bad_cafe, 0x1234_5678]);
+        plan.publish(target).unwrap();
+        assert_eq!(read_shared_wal_index_header(&region).unwrap(), Some(target));
+
+        // An indexed baseline carrying another generation's salts stays refused.
+        let indexed_region = ShmRegion::new(WAL_SHM_SEGMENT_BYTES);
+        let mut indexed = stock;
+        indexed.sz_page = 4096;
+        indexed.update_checksum().unwrap();
+        publish_shared_wal_index_header(&indexed_region, &indexed).unwrap();
+        assert!(matches!(
+            SharedWalIndexAppendPlan::prepare(
+                indexed,
+                generation,
+                vec![(0, indexed_region.share())],
+                vec![(1, 2, true)],
+            ),
+            Err(FrankenError::BusyRecovery)
+        ));
     }
 
     #[test]
