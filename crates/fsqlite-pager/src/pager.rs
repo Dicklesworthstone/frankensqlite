@@ -4390,6 +4390,17 @@ impl NativeReaderAttempt {
     }
 }
 
+/// Which cross-process fence a pager maintenance operation needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MaintenanceFence {
+    /// The operation replaces or rewrites the whole main-database image.
+    WholeImage,
+    /// The operation only reads a stable main-database image (a VACUUM
+    /// source receipt). In WAL mode this excludes appenders and checkpointers
+    /// but admits idle foreign WAL attachments; otherwise it is `WholeImage`.
+    ImageRead,
+}
+
 enum WalReaderWindow {
     Registered(u32),
     Native(NativeReaderAttempt),
@@ -15200,13 +15211,29 @@ where
         Ok(())
     }
 
+    async fn with_exclusive_maintenance<S, T>(
+        &self,
+        cx: &Cx,
+        state: &mut S,
+        operation: impl for<'a> FnOnce(
+            &'a Self,
+            &'a Cx,
+            &'a mut PagerInner<V::File>,
+            &'a mut S,
+        ) -> LocalPagerFuture<'a, T>,
+    ) -> Result<T> {
+        self.with_maintenance_fence(cx, MaintenanceFence::WholeImage, state, operation)
+            .await
+    }
+
     // bd-h9o9r: a sync mutex guard is held across an await in this
     // function's body; reachable-deadlock audit and lock-scope repair
     // belong to the Phase-C pager reconstruction.
     #[allow(clippy::await_holding_lock)]
-    async fn with_exclusive_maintenance<S, T>(
+    async fn with_maintenance_fence<S, T>(
         &self,
         cx: &Cx,
+        fence: MaintenanceFence,
         state: &mut S,
         operation: impl for<'a> FnOnce(
             &'a Self,
@@ -15306,10 +15333,18 @@ where
         // Acquire one VFS-defined fence over every lock surface relevant to a
         // whole-image replacement. Each native backend composes its main-file
         // and shared-memory lock surfaces according to its platform protocol.
+        // GH#442: a WAL-mode image *read* only needs to keep appenders and
+        // checkpointers out, so it takes the checkpoint fence, which admits
+        // idle foreign WAL-lifetime SHARED claims.
         let wal_mode = inner.journal_mode == JournalMode::Wal;
+        let read_only_wal_fence = wal_mode && fence == MaintenanceFence::ImageRead;
         let mut external_lock =
             BeginExternalLockState::new(&self.group_commit_queue, Arc::clone(&inner.db_file), cx);
-        let maintenance_lock_result = external_lock.acquire_maintenance(cx, wal_mode).await;
+        let maintenance_lock_result = if read_only_wal_fence {
+            external_lock.acquire_wal_checkpoint(cx).await
+        } else {
+            external_lock.acquire_maintenance(cx, wal_mode).await
+        };
         if let Err(err) = maintenance_lock_result {
             // Terminalize synchronously or publish the process-root retry
             // before advertising that maintenance is inactive.
@@ -15318,11 +15353,16 @@ where
         }
 
         let preflight = async {
-            self.prepare_fresh_journal_for_maintenance(cx).await?;
+            // An image read writes nothing, so it neither needs nor may
+            // delete a leftover journal under the weaker WAL fence.
+            if !read_only_wal_fence {
+                self.prepare_fresh_journal_for_maintenance(cx).await?;
+            }
             if let Some(wal_handle) = wal_handle.as_ref() {
                 let mut wal = async_rwlock_write(wal_handle, cx, "WAL backend").await?;
-                // Refresh from the durable WAL while the main-file EXCLUSIVE
-                // lock prevents external SQLite readers/writers from entering.
+                // Refresh from the durable WAL while the fence keeps every
+                // native and stock appender (and checkpointer) out, so the
+                // main file cannot change and the WAL cannot grow.
                 wal.begin_transaction(cx).await?;
                 if wal.frame_count() != 0 {
                     return Err(FrankenError::Busy);
@@ -16008,12 +16048,20 @@ where
         if self.is_readonly() {
             return self.capture_vacuum_source_image_readonly(cx).await;
         }
-        self.with_exclusive_maintenance(cx, &mut (), |_, cx, inner, ()| {
-            Box::pin(async move {
-                let db_file = shared_db_file_read(&inner.db_file, cx).await?;
-                vacuum_source_receipt_for_open_file(cx, &*db_file, inner.page_size).await
-            })
-        })
+        // GH#442: the capture only reads the image, so it must not need the
+        // whole-image EXCLUSIVE fence that an idle peer's WAL-lifetime SHARED
+        // claim refuses. Publication recomputes this receipt under that fence.
+        self.with_maintenance_fence(
+            cx,
+            MaintenanceFence::ImageRead,
+            &mut (),
+            |_, cx, inner, ()| {
+                Box::pin(async move {
+                    let db_file = shared_db_file_read(&inner.db_file, cx).await?;
+                    vacuum_source_receipt_for_open_file(cx, &*db_file, inner.page_size).await
+                })
+            },
+        )
         .await
     }
 
