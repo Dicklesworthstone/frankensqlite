@@ -17,13 +17,14 @@ as a 28-member Cargo workspace under `crates/`.
 
 Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
-Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.7) (2026-08-20) through [v0.4.7](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.4.7) (2026-09-29). v0.3.2–v0.3.4, v0.3.6–v0.3.18 and v0.4.4 are GitHub Releases; **v0.3.5 is a tag / crates.io snapshot with no GitHub Release**, and **0.4.0–0.4.3 are crates.io publishes with no tag and no GitHub Release** — their changes are documented in the v0.4.4 section. Every release in the window has a per-change section below (the v0.3.12/v0.3.13 sections were reconstructed from their tag ranges on 2026-09-01).
+Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.7) (2026-08-20) through [v0.4.8](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.4.8) (2026-10-02). v0.3.2–v0.3.4, v0.3.6–v0.3.18 and v0.4.4 are GitHub Releases; **v0.3.5 is a tag / crates.io snapshot with no GitHub Release**, and **0.4.0–0.4.3 are crates.io publishes with no tag and no GitHub Release** — their changes are documented in the v0.4.4 section. Every release in the window has a per-change section below (the v0.3.12/v0.3.13 sections were reconstructed from their tag ranges on 2026-09-01).
 
 ## Version Timeline
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| [Unreleased](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.4.7...main) | HEAD | 2026-09-29 | — |
+| [Unreleased](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.4.8...main) | HEAD | 2026-10-02 | — |
+| [v0.4.8](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.4.8) | Release | 2026-10-02 | Uniform release of all 26 public crates. Strict read-only opens refuse a stale WAL index promptly again (0.4.7 regression; consumers that pinned 0.4.6 can move up); double-granted page under TRUNCATE checkpoints fixed (bd-sx5w2, the 0.4.7 P0 known issue); join lookups honor comparison affinity (wrong rows for mixed-affinity join keys, found in release review); failed autocommit commit no longer leaves uncommitted schema (bd-q1b7z); GROUP BY over a join in key order; join, INSERT ... SELECT and index-scan performance; release binaries at opt-level 3 |
 | [v0.4.7](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.4.7) | Release | 2026-09-29 | Prompt fix release of all 26 public crates. Large multi-row INSERT wrote index entries without their rowid and skipped UNIQUE checks past register 65,535 (hfdt-dlkam3); serialized-DDL index race (bd-4iaoi); composite-key DML seek (GH#434) with residual fix; autocommit DDL starvation (bd-f5sh5); GH#435 changes(); streaming aggregate and correlated-subquery performance (GH#420, GH#432, GH#436) |
 | [v0.4.6](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.4.6) | Release | 2026-09-27 | Uniform release of all 26 public crates (0.4.5 skipped: consumed by the fsqlite-pager backport). Page-referenced-twice fix (bd-b5vmw), lost-index-entry race fix (bd-11sz4), freelist/overflow hardening, WAL-index healing, per-statement busy_timeout (GH#423), UTF-16/collation and numeric parity |
 | [0.4.5](https://crates.io/crates/fsqlite-pager/0.4.5) | crates.io only | 2026-09-25 | `fsqlite-pager` alone: bd-b5vmw backport onto v0.4.4, so a page can no longer end up referenced by both the freelist trunk and a live b-tree across a WAL generation. Tag `fsqlite-pager-v0.4.5`; no GitHub Release. The next uniform release must be >= 0.4.6 |
@@ -57,6 +58,139 @@ Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releas
 Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.4.7...main>
 
 Entries for changes after v0.4.7 are written at the next release.
+
+---
+
+## [0.4.8] -- 2026-10-02 (GitHub Release)
+
+Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.4.7...v0.4.8>
+
+**What this is.** A uniform release of all 26 public crates. It restores 0.4.6's prompt refusal for strict
+read-only opens, which 0.4.7 regressed (consumers that pinned 0.4.6 for that reason can move up). It also
+fixes the rare double-granted page that 0.4.7 listed as a known issue (bd-sx5w2) and wrong join results
+under mixed column affinities, and it carries the fixes and performance work landed on `main` since v0.4.7.
+
+### Data integrity
+
+- **Concurrent writers with TRUNCATE checkpoints could grant one page to two b-trees (bd-sx5w2,
+  [566494d57](https://github.com/Dicklesworthstone/frankensqlite/commit/566494d57)).** A commit folded
+  abandoned end-of-file pages into the freelist after judging them against a WAL generation that a
+  checkpoint had already ended, so a page a peer had made live was published as free and granted again
+  (stock `integrity_check`: "wrong # of entries in index"). The fold now drops candidates judged in an
+  older generation instead of freeing them; at worst that leaves an unreferenced page for orphan repair.
+  This was the P0 known issue in 0.4.7.
+- **A failed autocommit commit no longer leaves uncommitted schema in the connection (bd-q1b7z,
+  [549d83e8e](https://github.com/Dicklesworthstone/frankensqlite/commit/549d83e8e)).** A `CREATE INDEX`
+  whose commit lost a race could fail with "index already exists" when retried, and a later `DROP INDEX`
+  with "no such index". The database file was always correct.
+- **Bounded `DROP` teardown counts overflow pages (bd-fmhvo,
+  [685eedbf8](https://github.com/Dicklesworthstone/frankensqlite/commit/685eedbf8)).**
+
+### Availability
+
+- **Strict read-only opens refuse a stale WAL index promptly again
+  ([48c6cf6b2](https://github.com/Dicklesworthstone/frankensqlite/commit/48c6cf6b2)).** 0.4.7 retried
+  every schema-only open for at least 30 s on `BusyRecovery`. A read-only open never performs WAL-index
+  recovery, so a strict open beside a stale index waited 30 s per attempt instead of failing at once
+  (cass's GH477 status/health probes took ~744 s or failed). Only writable opens retry the whole bootstrap
+  now.
+
+### SQL correctness
+
+- **Join lookups honor comparison affinity (found in the 0.4.8 release review,
+  [dc4926c30](https://github.com/Dicklesworthstone/frankensqlite/commit/dc4926c30), [8f3f4271d](https://github.com/Dicklesworthstone/frankensqlite/commit/8f3f4271d)).**
+  `t.a = u.b` with an INTEGER `t.a` and a TEXT `u.b` holding `'1'` is true in SQLite, but the direct
+  rowid/index lookup lanes probed with the raw value: an index probe of `'1'` missed the key `1` (a join of
+  a TEXT code column to an `INTEGER UNIQUE` key returned no rows at all), and a rowid probe truncated `1.5`
+  to rowid 1. Rows were dropped or added in row output, grouped joins and multi-join chains, and, through
+  the 0.4.8 single-lookup aggregate lane (1aee0b458), in `count`/`sum`/`min`/`max` that 0.4.7 still
+  answered correctly. Rowid probes now go through `MustBeInt`; an index lookup coerces a TEXT or typeless
+  probe to the indexed column's numeric affinity (SQLite's `sqlite3IndexAffinityOk`) and keeps the seek; a
+  numeric probe into a TEXT index uses the general join.
+- `GROUP BY` over a join emits groups in key order, as SQLite does
+  ([c1b7f7b51](https://github.com/Dicklesworthstone/frankensqlite/commit/c1b7f7b51)).
+- Rows whose INTEGER PRIMARY KEY slot holds the rowid read correctly after `ALTER TABLE ADD COLUMN`
+  ([a2398978a](https://github.com/Dicklesworthstone/frankensqlite/commit/a2398978a)). This repairs files
+  written by 0.3.x. A row written by a pre-March-2026 build that omitted the slot and whose first stored
+  value equals its rowid can now read shifted.
+- An unqualified `USING` column resolves inside a correlated subquery (bd-7s1zz,
+  [a915766b0](https://github.com/Dicklesworthstone/frankensqlite/commit/a915766b0)).
+- An aggregate over a join naming an unknown column reports "no such column" (bd-24pa2,
+  [5975efd76](https://github.com/Dicklesworthstone/frankensqlite/commit/5975efd76)).
+
+### Performance
+
+- Native release binaries are built at `opt-level = 3` instead of `"z"`; the wasm package keeps `"z"`
+  ([86945ae73](https://github.com/Dicklesworthstone/frankensqlite/commit/86945ae73)).
+- `count`/`sum`/`min`/`max` over a single-lookup join compile to VDBE instead of materializing and sorting
+  every joined row (bd-41o3t, [1aee0b458](https://github.com/Dicklesworthstone/frankensqlite/commit/1aee0b458)).
+- Implicit-join `WHERE` equalities and expression join keys use hash joins and seeks
+  ([9a42732a4](https://github.com/Dicklesworthstone/frankensqlite/commit/9a42732a4)).
+- `INSERT ... SELECT` from table-valued functions is linear again (GH#438,
+  [e51cc5c7c](https://github.com/Dicklesworthstone/frankensqlite/commit/e51cc5c7c)).
+- Correlated `EXISTS` scan probes reuse one substituted template per query (GH#419,
+  [160d930e3](https://github.com/Dicklesworthstone/frankensqlite/commit/160d930e3)).
+- A DML statement's savepoint snapshot no longer copies the whole schema (bd-ry6x7,
+  [1f724e542](https://github.com/Dicklesworthstone/frankensqlite/commit/1f724e542)).
+- Index scans stop paying quadratic cell-slot cache costs
+  ([26d959970](https://github.com/Dicklesworthstone/frankensqlite/commit/26d959970)); join-expression
+  bindings hash with foldhash ([939972af2](https://github.com/Dicklesworthstone/frankensqlite/commit/939972af2));
+  `generate_series` checks for cancellation every 256 rows
+  ([95eda7139](https://github.com/Dicklesworthstone/frankensqlite/commit/95eda7139)).
+
+### TypeScript SDK
+
+Durable workflows: atomic recoverable workflow submissions, verified parent outputs fed into handlers, and
+bounded prerequisite results read in one lease-checked snapshot.
+
+### Dependencies
+
+Semver-compatible lockfile updates (cc, clap, syn, thiserror, zerocopy, rand, rustix, smallvec, xxhash-rust,
+zlib-rs and others). The wasm-bindgen family stays at 0.2.128: wasm-bindgen-futures 0.4.79 would add
+tokio to the lockfile.
+
+### Release gate
+
+Run through rch against exact `git archive` exports of the release tree (origin/main plus the version bump and
+lockfile updates), with the toolchain pinned (`nightly-2026-08-31`).
+
+- **Build and lint:** `cargo fmt --all --check`, `cargo check --workspace --all-targets --locked` and
+  `cargo clippy --workspace --all-targets --locked -- -D warnings` pass.
+- **Library tests:** fsqlite-pager 1007/0, fsqlite-btree 517/0 (`--test-threads=1`), fsqlite-wal 973/0,
+  fsqlite-vdbe 1180/0, fsqlite-func 512/0, fsqlite-ext-misc 110/0, fsqlite-core 3968/0.
+- **Integration tests (fsqlite-core), 224 passed / 0 failed across 19 targets:** the 0.4.7 set
+  (`hfdt_dlkam3_multirow_insert_indexes`, `gh434_keyed_dml`, `gh435_multirow_replace_changes`,
+  `gh436_streaming_function_calls`, `bd_4iaoi_serialized_ddl_misses_peer_rows`, `bd_cp3yd_jit_temp_scan`,
+  `bd_orwh0_statement_shape_busy_timeout`, `gh410_lock_byte_freelist`), every test file added or changed since
+  0.4.7, the new `join_lookup_affinity_oracle`, and `wal_reset_with_foreign_reader` (13/13), whose
+  `cass_gh477_explicit_index_recovery_preserves_database_and_wal` guards the strict read-only fix (it took
+  30.07 s on 0.4.7 against a 5 s bound).
+- **Facade (`fsqlite` crate) test suite:** 1037 passed, 0 failed (113 test targets plus unit tests).
+- The GH#434 ABORT keeper added after 0.4.7 expected an error variant `fsqlite-core` never returns; it now
+  checks stock's message ([b897c8566](https://github.com/Dicklesworthstone/frankensqlite/commit/b897c8566)).
+- The library, integration and facade suites ran on the release tree as it stood before 8f3f4271d's helper
+  changed from `Option<Option<char>>` to an enum for clippy (a type-only change with the same behavior). The
+  final tree then passed fmt, check, clippy, the fsqlite-vdbe library suite and the join, GH#434 and
+  `wal_reset_with_foreign_reader` integration targets.
+- **Not covered:** the full workspace test suite and all-features validation (bd-dybn7), as in 0.4.7.
+
+### Known issues
+
+- **Three-table join, typeless column against a TEXT key (bd-y5mc8):** `FROM u JOIN v ON v.k = u.d JOIN
+  t ON t.id = v.m`, where `v.k` is TEXT UNIQUE and `u.d` is typeless, matches integer 2 to `'2'`. SQLite
+  applies no affinity there. Present in 0.4.7; the two-table form is correct. Joins of three or more tables
+  run through the hash join, whose key comparison applies TEXT affinity to the typeless side.
+- **Numeric probe into a typeless-column index (bd-kr6hf):** `FROM parent JOIN child ON child.parent_id =
+  parent.id` with an untyped, indexed `parent_id` keeps 0.4.7's index lookup, which misses a `parent_id`
+  stored as numeric-looking TEXT (`'2'`); SQLite would match it. Values stored as numbers are found. The
+  exact alternative is a nested loop until the join can be reordered to a rowid lookup as SQLite does.
+- **#443:** a read-write COMMIT returns `BusyRecovery` and a retrying process stalls when a stock
+  read-only connection left `-shm` beside a 0-byte `-wal` (since 0.4.6).
+- **#442:** `VACUUM INTO` fails busy while another process has the WAL database open, even idle (since
+  0.4.4; fails closed).
+- Carried from 0.4.7: trigger WHEN clauses with a subquery are re-parsed per row; bd-dd24l (Windows
+  `VACUUM INTO`), bd-sz9j5 (no cross-process protocol version guard: do not mix engine versions on one
+  database), bd-1hi.11 (WAL-FEC recovery unfinished), and the long-open multi-writer RELEASE-P0 beads.
 
 ---
 
