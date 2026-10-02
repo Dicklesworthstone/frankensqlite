@@ -1141,10 +1141,14 @@ impl SharedWalIndexAppendPlan {
         entries: Vec<(u32, u32, bool)>,
     ) -> Result<Self> {
         baseline.validate()?;
+        // Stock SQLite's unindexed empty header (GH#431) has no salts yet; the
+        // first append adopts this generation's, as stock's first frame does
+        // (GH#443).
         if regions.first().is_none_or(|(region, _)| *region != 0)
             || regions.windows(2).any(|pair| pair[0].0 >= pair[1].0)
             || entries.is_empty()
-            || baseline.a_salt != [generation.salts.salt1, generation.salts.salt2]
+            || (!baseline.is_unindexed_empty()
+                && baseline.a_salt != [generation.salts.salt1, generation.salts.salt2])
         {
             return Err(FrankenError::BusyRecovery);
         }
@@ -1252,6 +1256,16 @@ impl SharedWalIndexAppendPlan {
     /// after header publication never clears newly visible mappings.
     pub fn publish(&mut self, target: WalIndexHdr) -> Result<()> {
         target.validate()?;
+        // Over stock's unindexed empty header the first publication adopts
+        // the generation's page size, checksum order and salts (GH#443);
+        // `validate` above already proved the adopted page size.
+        let generation_mismatch = if self.baseline.is_unindexed_empty() {
+            target.a_salt != [self.generation.salts.salt1, self.generation.salts.salt2]
+        } else {
+            target.big_end_cksum != self.baseline.big_end_cksum
+                || target.sz_page != self.baseline.sz_page
+                || target.a_salt != self.baseline.a_salt
+        };
         if target.mx_frame <= self.baseline.mx_frame
             || self
                 .entries
@@ -1260,9 +1274,7 @@ impl SharedWalIndexAppendPlan {
             || target.i_version != self.baseline.i_version
             || target.unused != self.baseline.unused
             || target.is_init != self.baseline.is_init
-            || target.big_end_cksum != self.baseline.big_end_cksum
-            || target.sz_page != self.baseline.sz_page
-            || target.a_salt != self.baseline.a_salt
+            || generation_mismatch
             || target.i_change != self.publication_change(target.mx_frame)?
             || self.target.is_some_and(|previous| previous != target)
         {
@@ -2459,6 +2471,65 @@ mod tests {
         next.update_checksum().unwrap();
         assert!(stale.publish(next).is_err());
         assert_eq!(region.lock().to_vec(), foreign_bytes);
+    }
+
+    #[test]
+    fn test_shared_append_plan_binds_stock_unindexed_empty_baseline_to_generation() {
+        // GH#443: stock's unindexed empty header (no page size, zero salts)
+        // takes the writer's generation with the first published frame.
+        let region = ShmRegion::new(WAL_SHM_SEGMENT_BYTES);
+        let mut baseline = shared_header_fixture(4096, 0);
+        baseline.mx_frame = 0;
+        baseline.sz_page = 0;
+        baseline.a_salt = [0, 0];
+        baseline.update_checksum().unwrap();
+        assert!(baseline.is_unindexed_empty());
+        publish_shared_wal_index_header(&region, &baseline).unwrap();
+        let generation = WalGenerationIdentity {
+            checkpoint_seq: 0,
+            salts: crate::WalSalts {
+                salt1: 0x4a43_1c55,
+                salt2: 0x0123_9e77,
+            },
+        };
+        let mut plan = SharedWalIndexAppendPlan::prepare(
+            baseline,
+            generation,
+            vec![(0, region.share())],
+            vec![(1, 2, true)],
+        )
+        .unwrap();
+        let mut target = baseline;
+        target.mx_frame = 1;
+        target.n_page = 2;
+        target.i_change = plan.publication_change(1).unwrap();
+        target.sz_page = 4096;
+        let mut foreign = target;
+        foreign.a_salt = [7, 8];
+        foreign.update_checksum().unwrap();
+        assert!(
+            plan.publish(foreign).is_err(),
+            "only this generation's salts bind"
+        );
+        target.a_salt = [generation.salts.salt1, generation.salts.salt2];
+        target.update_checksum().unwrap();
+        plan.publish(target).unwrap();
+        assert_eq!(read_shared_wal_index_header(&region).unwrap(), Some(target));
+
+        // A bound (non-empty) baseline still refuses another generation.
+        let other = WalGenerationIdentity {
+            checkpoint_seq: 1,
+            salts: crate::WalSalts { salt1: 1, salt2: 2 },
+        };
+        assert!(
+            SharedWalIndexAppendPlan::prepare(
+                target,
+                other,
+                vec![(0, region.share())],
+                vec![(2, 3, true)],
+            )
+            .is_err()
+        );
     }
 
     #[test]

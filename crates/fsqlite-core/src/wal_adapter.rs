@@ -1502,6 +1502,18 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             return Err(FrankenError::BusyRecovery);
         }
         let mut target = plan.baseline();
+        if target.is_unindexed_empty() {
+            // Stock's unindexed empty header has no generation yet; the first
+            // published frame binds it to this WAL, as stock's does (GH#443).
+            let wal_header = self.wal.header();
+            target.sz_page = if wal_header.page_size == 65_536 {
+                1
+            } else {
+                u16::try_from(wal_header.page_size).map_err(|_| FrankenError::DatabaseFull)?
+            };
+            target.big_end_cksum = u8::from(wal_header.big_endian_checksum());
+            target.a_salt = [wal_header.salts.salt1, wal_header.salts.salt2];
+        }
         target.mx_frame = u32::try_from(index).ok().and_then(|frame| frame.checked_add(1))
             .ok_or(FrankenError::DatabaseFull)?;
         target.n_page = marker.db_size;
