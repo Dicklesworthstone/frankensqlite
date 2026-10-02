@@ -230,9 +230,14 @@ fn gh434_keyed_dml_abort_rollback_and_savepoint_match_sqlite() {
                     if rollback_outer {
                         begin.expect("OR ROLLBACK must have released the outer transaction");
                     } else {
-                        assert!(
-                            matches!(begin, Err(FrankenError::NestedTransaction)),
-                            "{context}: ABORT must preserve the outer transaction: {begin:?}"
+                        // The refusal carries stock's message under SQLITE_ERROR
+                        // (bd-3nppp), so compare the message, not the variant.
+                        let refusal = begin.expect_err("ABORT must preserve the outer transaction");
+                        let oracle_refusal = oracle_begin.expect_err("oracle BEGIN refusal");
+                        assert_eq!(
+                            refusal.to_string(),
+                            "cannot start a transaction within a transaction",
+                            "{context}: ABORT must preserve the outer transaction ({oracle_refusal})"
                         );
                     }
                     execute_both(&frank, &stock, "SAVEPOINT keyed_retry").await;
