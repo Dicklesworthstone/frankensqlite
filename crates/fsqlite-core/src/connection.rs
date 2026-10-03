@@ -110622,9 +110622,15 @@ fn flatten_simple_from_subquery_select(select: &SelectStatement) -> Option<Selec
 
     if inner_query.with.is_some()
         || !inner_query.body.compounds.is_empty()
-        || !inner_query.order_by.is_empty()
         || inner_query.limit.is_some()
     {
+        return None;
+    }
+    // bd-5ap77: an inner ORDER BY cannot change the result of an outer query
+    // whose every output is a count/min/max aggregate (one row, order-free), so
+    // it is dropped and the subquery flattens; any other outer shape keeps it.
+    let drops_inner_order_by = !inner_query.order_by.is_empty();
+    if drops_inner_order_by && !outer_columns_are_order_insensitive_aggregates(outer_columns) {
         return None;
     }
 
@@ -110641,9 +110647,10 @@ fn flatten_simple_from_subquery_select(select: &SelectStatement) -> Option<Selec
         return None;
     };
 
+    let inner_is_table_function = matches!(inner_from.source, TableOrSubquery::TableFunction { .. });
     if *distinct != Distinctness::All
         || !inner_from.joins.is_empty()
-        || !matches!(inner_from.source, TableOrSubquery::Table { .. })
+        || !(matches!(inner_from.source, TableOrSubquery::Table { .. }) || inner_is_table_function)
         || !inner_group_by.is_empty()
         || inner_having.is_some()
         || !inner_windows.is_empty()
@@ -110651,7 +110658,49 @@ fn flatten_simple_from_subquery_select(select: &SelectStatement) -> Option<Selec
         return None;
     }
 
-    let projection_map = build_flatten_projection_map(inner_columns)?;
+    // bd-5ap77: shapes beyond the original bare-column flattener (outer
+    // expressions/aggregates, table-function sources, inner expression
+    // projections, a dropped ORDER BY) resolve names strictly: a reference the
+    // subquery does not expose blocks flattening instead of silently binding to
+    // an unexposed column of the inner source.
+    let outer_has_expressions = outer_columns
+        .iter()
+        .any(|column| matches!(column, ResultColumn::Expr { expr, .. } if !matches!(expr, Expr::Column(..))));
+    let inner_has_expressions = inner_columns
+        .iter()
+        .any(|column| matches!(column, ResultColumn::Expr { expr, .. } if !matches!(expr, Expr::Column(..))));
+    let strict = outer_has_expressions
+        || inner_has_expressions
+        || inner_is_table_function
+        || drops_inner_order_by;
+    if strict
+        && (outer_where.as_deref().is_some_and(expr_has_any_subquery)
+            || select
+                .order_by
+                .iter()
+                .any(|term| expr_has_any_subquery(&term.expr)))
+    {
+        return None;
+    }
+
+    let mut projection_map = build_flatten_projection_map(inner_columns)?;
+    // A table function's hidden argument columns are not exposed by `*`.
+    if inner_is_table_function && projection_map.passthrough_columns {
+        return None;
+    }
+    if strict {
+        projection_map.strict_outer_aliases = Some(
+            outer_columns
+                .iter()
+                .filter_map(|column| match column {
+                    ResultColumn::Expr {
+                        alias: Some(alias), ..
+                    } => Some(alias.to_ascii_lowercase()),
+                    _ => None,
+                })
+                .collect(),
+        );
+    }
     let flattened_columns = flatten_outer_result_columns(
         outer_columns,
         inner_columns,
@@ -110686,6 +110735,99 @@ fn flatten_simple_from_subquery_select(select: &SelectStatement) -> Option<Selec
 struct FlattenProjectionMap {
     passthrough_columns: bool,
     columns: HashMap<String, Expr>,
+    /// bd-5ap77: `Some(outer result aliases)` turns on strict resolution, where
+    /// a column reference that is neither exposed by the subquery nor an outer
+    /// alias blocks flattening.
+    strict_outer_aliases: Option<HashSet<String>>,
+}
+
+/// bd-5ap77: true when every outer result column is a single-argument (or
+/// `count(*)`) `count`/`min`/`max` aggregate, so the outer query yields one row
+/// whose value cannot depend on the order the subquery produces its rows in.
+/// Multi-argument `min`/`max` are scalar functions and do not qualify.
+fn outer_columns_are_order_insensitive_aggregates(columns: &[ResultColumn]) -> bool {
+    !columns.is_empty()
+        && columns.iter().all(|column| {
+            let ResultColumn::Expr {
+                expr:
+                    Expr::FunctionCall {
+                        name,
+                        args,
+                        order_by,
+                        over: None,
+                        ..
+                    },
+                ..
+            } = column
+            else {
+                return false;
+            };
+            if !order_by.is_empty() {
+                return false;
+            }
+            let args_ok = match args {
+                FunctionArgs::Star => name.eq_ignore_ascii_case("count"),
+                FunctionArgs::List(args) => {
+                    args.len() == 1
+                        && !expr_has_aggregate(&args[0])
+                        && !expr_has_any_subquery(&args[0])
+                }
+            };
+            args_ok
+                && (name.eq_ignore_ascii_case("count")
+                    || name.eq_ignore_ascii_case("min")
+                    || name.eq_ignore_ascii_case("max"))
+        })
+}
+
+/// bd-5ap77: an inner projection expression that may be substituted for every
+/// outer reference to its alias: built only from columns, literals and
+/// side-effect-free operators. Function calls (non-deterministic or aggregate),
+/// subqueries, placeholders and RAISE keep the subquery materialized.
+fn flatten_inner_expr_is_substitutable(expr: &Expr) -> bool {
+    match expr {
+        Expr::Column(..) | Expr::Literal(..) => true,
+        Expr::BinaryOp { left, right, .. } => {
+            flatten_inner_expr_is_substitutable(left) && flatten_inner_expr_is_substitutable(right)
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. }
+        | Expr::IsNull { expr, .. } => flatten_inner_expr_is_substitutable(expr),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            flatten_inner_expr_is_substitutable(expr)
+                && flatten_inner_expr_is_substitutable(low)
+                && flatten_inner_expr_is_substitutable(high)
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            operand
+                .as_deref()
+                .is_none_or(flatten_inner_expr_is_substitutable)
+                && whens.iter().all(|(when_expr, then_expr)| {
+                    flatten_inner_expr_is_substitutable(when_expr)
+                        && flatten_inner_expr_is_substitutable(then_expr)
+                })
+                && else_expr
+                    .as_deref()
+                    .is_none_or(flatten_inner_expr_is_substitutable)
+        }
+        Expr::In {
+            expr,
+            set: InSet::List(items),
+            ..
+        } => {
+            flatten_inner_expr_is_substitutable(expr)
+                && items.iter().all(flatten_inner_expr_is_substitutable)
+        }
+        _ => false,
+    }
 }
 
 fn build_flatten_projection_map(columns: &[ResultColumn]) -> Option<FlattenProjectionMap> {
@@ -110710,6 +110852,16 @@ fn build_flatten_projection_map(columns: &[ResultColumn]) -> Option<FlattenProje
                 projection
                     .columns
                     .insert(exposed_name, Expr::Column(column_ref.clone(), *span));
+            }
+            ResultColumn::Expr {
+                expr,
+                alias: Some(alias),
+            } if flatten_inner_expr_is_substitutable(expr) => {
+                let exposed_name = alias.to_ascii_lowercase();
+                if projection.columns.contains_key(&exposed_name) {
+                    return None;
+                }
+                projection.columns.insert(exposed_name, expr.clone());
             }
             ResultColumn::Expr { .. } => return None,
         }
@@ -110755,7 +110907,22 @@ fn flatten_outer_result_columns(
                         .or_else(|| Some(column_ref.column.to_string())),
                 });
             }
-            ResultColumn::Expr { .. } => return None,
+            // bd-5ap77: any other outer expression (aggregates included) is
+            // rewritten in place, provided resolution is strict and the
+            // expression carries no subquery or window whose own name scope the
+            // rewrite cannot see into.
+            ResultColumn::Expr { expr, alias } => {
+                if projection_map.strict_outer_aliases.is_none()
+                    || expr_has_any_subquery(expr)
+                    || expr_has_window_function(expr)
+                {
+                    return None;
+                }
+                flattened.push(ResultColumn::Expr {
+                    expr: flatten_expr_tree(expr, outer_alias, projection_map)?,
+                    alias: alias.clone(),
+                });
+            }
         }
     }
 
@@ -111012,12 +111179,27 @@ fn flatten_column_ref(
             return Some(mapped.clone());
         }
         if projection_map.passthrough_columns {
+            // A `*` subquery does not expose its source's rowid.
+            if projection_map.strict_outer_aliases.is_some()
+                && ["rowid", "oid", "_rowid_"].contains(&exposed_name.as_str())
+            {
+                return None;
+            }
             return Some(Expr::Column(
                 ColumnRef::bare(column_ref.column.clone()),
                 span,
             ));
         }
         if explicitly_qualified {
+            return None;
+        }
+    }
+
+    if let Some(outer_aliases) = &projection_map.strict_outer_aliases {
+        // bd-5ap77: strict resolution keeps only unqualified references to an
+        // outer result alias; anything else (an unexposed inner column, an
+        // enclosing-query correlation) stays on the materializing path.
+        if column_ref.table.is_some() || !outer_aliases.contains(&exposed_name) {
             return None;
         }
     }
