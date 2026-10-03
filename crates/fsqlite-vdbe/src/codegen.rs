@@ -11833,23 +11833,122 @@ fn sorter_order_char(term: &OrderingTerm) -> char {
     }
 }
 
-/// Emit one ORDER BY key of a join. An in-range integer ordinal names a result
-/// column (counting columns expanded from `*`), whose value the caller has
-/// already emitted at `out_regs`; anything else is an expression.
+/// The result column a join's ORDER BY term names: an in-range integer ordinal
+/// (counting columns expanded from `*`), or a bare identifier equal to a result
+/// alias, which SQLite resolves before any table column.
+fn join_order_output_slot(
+    order_expr: &Expr,
+    columns: &[ResultColumn],
+    out_col_count: usize,
+    tables: &[(&TableSchema, Option<&str>)],
+) -> Option<usize> {
+    if let Some(ordinal) = order_by_integer_ordinal(order_expr) {
+        return usize::try_from(ordinal)
+            .ok()
+            .and_then(|ordinal| ordinal.checked_sub(1))
+            .filter(|slot| *slot < out_col_count);
+    }
+    let Expr::Column(col_ref, _) = order_expr else {
+        return None;
+    };
+    if col_ref.table.is_some() {
+        return None;
+    }
+    let mut slot = 0usize;
+    for column in columns {
+        match column {
+            ResultColumn::Expr {
+                alias: Some(alias), ..
+            } if alias.eq_ignore_ascii_case(&col_ref.column) => return Some(slot),
+            ResultColumn::Expr { .. } => slot += 1,
+            star => slot += resolve_join_output_count(std::slice::from_ref(star), tables),
+        }
+    }
+    None
+}
+
+/// The declared collation of a join's result column `slot`, expanding `*`.
+fn join_output_slot_collation<'a>(
+    slot: usize,
+    columns: &'a [ResultColumn],
+    tables: &[(&'a TableSchema, Option<&str>)],
+) -> Option<&'a str> {
+    let mut start = 0usize;
+    for column in columns {
+        match column {
+            ResultColumn::Expr { expr, .. } => {
+                if start == slot {
+                    return extract_collation(expr).or_else(|| join_declared_collation(expr, tables));
+                }
+                start += 1;
+            }
+            ResultColumn::Star | ResultColumn::TableStar(_) => {
+                for (table, alias) in tables {
+                    if let ResultColumn::TableStar(name) = column
+                        && !join_qualifier_matches(Some(&name.name), table, *alias)
+                    {
+                        continue;
+                    }
+                    if let Some(relative) = slot.checked_sub(start)
+                        && relative < table.columns.len()
+                    {
+                        return table.columns[relative].collation.as_deref();
+                    }
+                    start += table.columns.len();
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The SorterOpen P4 of a join: one direction character per ORDER BY key and,
+/// when any key sorts under a non-BINARY collation, `|` plus the per-key
+/// collation names (the same encoding as the single-table ordered scan). A key
+/// takes its explicit COLLATE, else the collation of the result column it names,
+/// else the declared collation of the column it reads.
+fn join_sorter_open_p4(
+    order_by: &[OrderingTerm],
+    columns: &[ResultColumn],
+    out_col_count: usize,
+    tables: &[(&TableSchema, Option<&str>)],
+) -> P4 {
+    let sort_order: String = order_by.iter().map(sorter_order_char).collect();
+    let collations: Vec<&str> = order_by
+        .iter()
+        .map(|term| {
+            extract_collation(&term.expr)
+                .or_else(|| {
+                    join_order_output_slot(&term.expr, columns, out_col_count, tables)
+                        .and_then(|slot| join_output_slot_collation(slot, columns, tables))
+                })
+                .or_else(|| join_declared_collation(&term.expr, tables))
+                .filter(|collation| !collation.eq_ignore_ascii_case("BINARY"))
+                .unwrap_or("")
+        })
+        .collect();
+    if collations.iter().all(|collation| collation.is_empty()) {
+        P4::Str(sort_order)
+    } else {
+        P4::Str(format!("{sort_order}|{}", collations.join(",")))
+    }
+}
+
+/// Emit one ORDER BY key of a join. A term naming a result column (see
+/// [`join_order_output_slot`]) copies the value the caller already emitted at
+/// `out_regs`; anything else is an expression.
 #[allow(clippy::too_many_arguments)]
 fn emit_join_order_key(
     b: &mut ProgramBuilder,
     order_expr: &Expr,
     target: i32,
     out_regs: i32,
+    columns: &[ResultColumn],
     out_col_count: usize,
     tables: &[(&TableSchema, Option<&str>)],
     ctx: &CodegenContext,
 ) -> Result<(), CodegenError> {
-    if let Some(slot) = order_by_integer_ordinal(order_expr)
-        .and_then(|ordinal| usize::try_from(ordinal).ok())
-        .and_then(|ordinal| ordinal.checked_sub(1))
-        .filter(|slot| *slot < out_col_count)
+    if let Some(slot) = join_order_output_slot(order_expr, columns, out_col_count, tables)
         .and_then(|slot| i32::try_from(slot).ok())
     {
         b.emit_op(Opcode::SCopy, out_regs + slot, target, 0, P4::None, 0);
@@ -11872,7 +11971,16 @@ fn emit_join_output_or_sort(
     if let Some((sort_cursor, sort_regs, sort_key_count, sort_record_reg)) = sorter {
         for (i, term) in order_by.iter().enumerate() {
             let sort_reg = sort_regs + i as i32;
-            emit_join_order_key(b, &term.expr, sort_reg, out_regs, out_col_count, tables, ctx)?;
+            emit_join_order_key(
+                b,
+                &term.expr,
+                sort_reg,
+                out_regs,
+                columns,
+                out_col_count,
+                tables,
+                ctx,
+            )?;
         }
         for i in 0..out_col_count {
             let src = out_regs + i as i32;
@@ -12032,18 +12140,67 @@ fn codegen_single_join_lookup_select(
         let sort_regs = b.alloc_regs(total_sort_cols as i32);
         let sort_record_reg = b.alloc_reg();
         // P2 counts the key columns; the output columns ride along unsorted.
-        let sort_order = stmt.order_by.iter().map(sorter_order_char).collect::<String>();
+        let sorter_p4 = join_sorter_open_p4(&stmt.order_by, columns, out_col_count, &tables);
         b.emit_op(
             Opcode::SorterOpen,
             sort_cursor,
             sort_key_count as i32,
             0,
-            P4::Str(sort_order),
+            sorter_p4,
             0,
         );
         Some((sort_cursor, sort_regs, sort_key_count, sort_record_reg))
     } else {
         None
+    };
+
+    // bd-673gw: the numeric TEXT walk below only finds keys when the index
+    // holds TEXT at all. Look once, before the outer loop, so a column with
+    // no TEXT keys pays nothing per probe. The statement reads one snapshot,
+    // so the answer holds for every probe.
+    let index_has_text_reg = match (&plan.lookup_target, index_cursor) {
+        (SingleJoinLookupTarget::Index(_), Some(idx_cursor)) if plan.numeric_text_walk => {
+            let has_text_reg = b.alloc_reg();
+            b.emit_op(Opcode::Integer, 0, has_text_reg, 0, P4::None, 0);
+            let text_probe_done = b.emit_label();
+            let text_base = b.alloc_regs(2);
+            b.emit_op(Opcode::String8, 0, text_base, 0, P4::Str(String::new()), 0);
+            b.emit_op(Opcode::Int64, 0, text_base + 1, 0, P4::Int64(i64::MIN), 0);
+            let text_record_reg = b.alloc_reg();
+            b.emit_op(
+                Opcode::MakeRecord,
+                text_base,
+                2,
+                text_record_reg,
+                P4::None,
+                0,
+            );
+            b.emit_jump_to_label(
+                Opcode::SeekGE,
+                idx_cursor,
+                text_record_reg,
+                text_probe_done,
+                P4::None,
+                0,
+            );
+            let first_key_reg = b.alloc_reg();
+            b.emit_op(Opcode::Column, idx_cursor, 0, first_key_reg, P4::None, 0);
+            let blob_floor_reg = b.alloc_reg();
+            b.emit_op(Opcode::Blob, 0, blob_floor_reg, 0, P4::Blob(Vec::new()), 0);
+            // `key >= x''`: the first key past the numbers is a BLOB.
+            b.emit_jump_to_label(
+                Opcode::Ge,
+                blob_floor_reg,
+                first_key_reg,
+                text_probe_done,
+                P4::None,
+                0,
+            );
+            b.emit_op(Opcode::Integer, 1, has_text_reg, 0, P4::None, 0);
+            b.resolve_label(text_probe_done);
+            Some(has_text_reg)
+        }
+        _ => None,
     };
 
     let next_left_label = b.emit_label();
@@ -12223,6 +12380,9 @@ fn codegen_single_join_lookup_select(
                 // the first TEXT key and test each one until a BLOB or the
                 // end. Only a numeric probe can match there: a TEXT probe's
                 // equal keys were all in the run above.
+                if let Some(has_text_reg) = index_has_text_reg {
+                    b.emit_jump_to_label(Opcode::IfNot, has_text_reg, 1, no_match, P4::None, 0);
+                }
                 let text_base = b.alloc_regs(2);
                 b.emit_op(Opcode::String8, 0, text_base, 0, P4::Str(String::new()), 0);
                 // `probe >= ''`: the probe is TEXT or a BLOB.
@@ -12647,13 +12807,13 @@ fn codegen_multi_join_lookup_select(
         let sort_regs = b.alloc_regs(total_sort_cols as i32);
         let sort_record_reg = b.alloc_reg();
         // P2 counts the key columns; the output columns ride along unsorted.
-        let sort_order = stmt.order_by.iter().map(sorter_order_char).collect::<String>();
+        let sorter_p4 = join_sorter_open_p4(&stmt.order_by, columns, out_col_count, &all_tables);
         b.emit_op(
             Opcode::SorterOpen,
             sort_cursor,
             sort_key_count as i32,
             0,
-            P4::Str(sort_order),
+            sorter_p4,
             0,
         );
         Some((sort_cursor, sort_regs, sort_key_count, sort_record_reg))
@@ -12818,6 +12978,7 @@ fn codegen_multi_join_lookup_select(
                 &term.expr,
                 sort_reg,
                 out_regs,
+                columns,
                 out_col_count,
                 &all_tables,
                 ctx,
@@ -12885,6 +13046,7 @@ fn codegen_multi_join_lookup_select(
                 &term.expr,
                 sort_reg,
                 out_regs,
+                columns,
                 out_col_count,
                 &all_tables,
                 ctx,
@@ -13161,13 +13323,13 @@ fn codegen_join_select(
         let sort_regs = b.alloc_regs(total_sort_cols as i32);
         let sort_record_reg = b.alloc_reg();
         // P2 counts the key columns; the output columns ride along unsorted.
-        let sort_order = stmt.order_by.iter().map(sorter_order_char).collect::<String>();
+        let sorter_p4 = join_sorter_open_p4(&stmt.order_by, columns, out_col_count, &all_tables);
         b.emit_op(
             Opcode::SorterOpen,
             sort_cursor,
             sort_key_count as i32,
             0,
-            P4::Str(sort_order),
+            sorter_p4,
             0,
         );
         Some((sort_cursor, sort_regs, sort_key_count, sort_record_reg))
@@ -13231,6 +13393,7 @@ fn codegen_join_select(
                 &term.expr,
                 sort_reg,
                 out_regs,
+                columns,
                 out_col_count,
                 &all_tables,
                 ctx,
@@ -13308,6 +13471,7 @@ fn codegen_join_select(
                 &term.expr,
                 sort_reg,
                 out_regs,
+                columns,
                 out_col_count,
                 &all_tables,
                 ctx,

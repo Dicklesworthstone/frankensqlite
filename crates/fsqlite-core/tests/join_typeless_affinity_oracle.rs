@@ -342,10 +342,12 @@ fn typeless_join_keys_keep_lookup_plans() {
                 && ops.iter().filter(|op| *op == "Rewind").count() == 1,
             "the inner join must scan child once and seek parent by rowid: {ops:?}"
         );
+        // Once before the loop for whether child_p holds TEXT at all
+        // (bd-673gw), then per probe for the number and for its TEXT keys.
         for sql in [left, star] {
             let ops = opcodes(&f, sql).await;
             assert!(
-                ops.iter().filter(|op| *op == "SeekGE").count() == 2
+                ops.iter().filter(|op| *op == "SeekGE").count() == 3
                     && ops.iter().filter(|op| *op == "Rewind").count() == 1,
                 "`{sql}` must seek child_p for the number and for its TEXT keys: {ops:?}"
             );
