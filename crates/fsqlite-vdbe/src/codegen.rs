@@ -220,6 +220,9 @@ const OPFLAG_REPLACE_VICTIM: u16 = 0x20;
 /// Counts a successful clustered-table `IdxInsert` as one logical row change.
 /// Secondary-index maintenance must never carry this flag.
 const OPFLAG_IDX_NCHANGE: u16 = 0x40;
+/// Marks the `Delete`/`Insert` pair of an UPDATE whose rowid cannot change; the
+/// engine then rewrites the row in place instead of deleting and re-inserting.
+const OPFLAG_UPDATE_KEEPS_ROWID: u16 = 0x80;
 /// Marks a non-mutating UNIQUE constraint halt. P4 carries the column label.
 const OPFLAG_HALT_UNIQUE: u16 = 0x01;
 
@@ -23817,6 +23820,22 @@ pub fn codegen_update(
     // terms are re-read from the table cursor's still-current old row.
     emit_index_deletes_for_update(b, table, table_cursor, &update_index_mask);
 
+    // Determine destination rowid for re-insertion.
+    let mut rowid_reg = matched_rowid_reg;
+    let rowid_alias_col_idx = ctx
+        .rowid_alias_col_idx
+        .or_else(|| table.columns.iter().position(|col| col.is_ipk));
+    // bd-9ag5r: when neither the hidden rowid nor its INTEGER PRIMARY KEY alias
+    // is assigned, the rowid cannot change, so the engine rewrites the row in
+    // place (stock overwrites the cell) instead of delete + seek + insert.
+    let keeps_rowid_flag = if assignment_targets.assigns_hidden_rowid
+        || rowid_alias_col_idx.is_some_and(|idx| assignment_targets.columns.contains(&idx))
+    {
+        0
+    } else {
+        OPFLAG_UPDATE_KEEPS_ROWID
+    };
+
     // UPDATE is delete+insert: remove the current row first, then insert the
     // rewritten record (possibly at a new rowid).
     b.emit_op(
@@ -23825,14 +23844,8 @@ pub fn codegen_update(
         0,
         0,
         P4::None,
-        OPFLAG_ISUPDATE,
+        OPFLAG_ISUPDATE | keeps_rowid_flag,
     );
-
-    // Determine destination rowid for re-insertion.
-    let mut rowid_reg = matched_rowid_reg;
-    let rowid_alias_col_idx = ctx
-        .rowid_alias_col_idx
-        .or_else(|| table.columns.iter().position(|col| col.is_ipk));
     if let Some(new_rowid_reg) = hidden_rowid_reg {
         // bd-p1h2r: the statement assigned the hidden rowid; the (already
         // MustBeInt-coerced) value is the new key. A table that reaches here

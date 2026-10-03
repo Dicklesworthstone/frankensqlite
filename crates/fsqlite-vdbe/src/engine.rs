@@ -250,6 +250,12 @@ const OPFLAG_REPLACE_VICTIM: u16 = 0x20;
 /// Counts a successful clustered-table `IdxInsert` as one logical row change.
 /// This is reserved for WITHOUT ROWID table roots, never secondary indexes.
 const OPFLAG_IDX_NCHANGE: u16 = 0x40;
+/// Marks the `Delete`/`Insert` pair of an UPDATE whose rowid cannot change
+/// (no rowid or INTEGER PRIMARY KEY assignment). The `Delete` only records the
+/// row; the paired `Insert` then rewrites it in place, overwriting the cell
+/// when the new record has the same size (stock `btreeOverwriteCell`) instead
+/// of a delete, a re-seek and an insert per row.
+const OPFLAG_UPDATE_KEEPS_ROWID: u16 = 0x80;
 /// Marks a `Halt(SQLITE_CONSTRAINT)` emitted after a non-mutating UNIQUE
 /// preflight. P4 contains the constraint's column label.
 const OPFLAG_HALT_UNIQUE: u16 = 0x01;
@@ -4378,6 +4384,27 @@ impl CursorBackend {
         }
     }
 
+    async fn table_overwrite_current_payload_same_size_no_overflow(
+        &mut self,
+        cx: &Cx,
+        rowid: i64,
+        data: &[u8],
+    ) -> Result<bool> {
+        match self {
+            Self::Mem(c) => {
+                c.table_overwrite_current_payload_same_size_no_overflow(cx, rowid, data)
+                    .await
+            }
+            Self::Txn(c) => {
+                c.table_overwrite_current_payload_same_size_no_overflow(cx, rowid, data)
+                    .await
+            }
+            Self::TimeTravel(_) => Err(FrankenError::Internal(
+                "time-travel cursors are read-only: table_insert not permitted".to_owned(),
+            )),
+        }
+    }
+
     async fn table_refresh_rightmost_leaf_cache_after_insert(
         &mut self,
         cx: &Cx,
@@ -7066,6 +7093,9 @@ struct ColdVdbeState {
     /// Deleted-row state for UPDATE's delete+insert rewrite. When the
     /// replacement row later conflicts, we must restore the original row.
     pending_update_restore: Option<PendingUpdateRestore>,
+    /// `(cursor_id, rowid)` of a row an `OPFLAG_UPDATE_KEEPS_ROWID` `Delete`
+    /// left in place for its paired `Insert` to overwrite.
+    deferred_update_delete: Option<(i32, i64)>,
     /// Provisional table insert metadata kept until later `IdxInsert`
     /// opcodes either succeed or roll the row back after a secondary-index
     /// conflict.
@@ -7103,6 +7133,7 @@ impl ColdVdbeState {
         Self {
             aggregates: SwissIndex::new(),
             pending_update_restore: None,
+            deferred_update_delete: None,
             pending_insert_rollback: None,
             conflict_skip_idx: false,
             pending_idx_entries: Vec::new(),
@@ -7403,6 +7434,33 @@ impl VdbeEngine {
         } else if let Some(cold_state) = self.cold_state_mut() {
             cold_state.pending_update_restore = None;
         }
+    }
+
+    #[inline]
+    fn take_deferred_update_delete(&mut self) -> Option<(i32, i64)> {
+        self.cold_state_mut()
+            .and_then(|cold_state| cold_state.deferred_update_delete.take())
+    }
+
+    /// Perform the delete an `OPFLAG_UPDATE_KEEPS_ROWID` `Delete` deferred, for
+    /// any path that does not end in the paired same-rowid `Insert`.
+    async fn materialize_deferred_update_delete(&mut self, cursor_id: i32, rowid: i64) -> Result<()> {
+        let Some(sc) = self.storage_cursors.get_mut(&cursor_id) else {
+            return Ok(());
+        };
+        let positioned = !sc.cursor.eof() && sc.cursor.rowid(&sc.cx).await? == rowid;
+        if !positioned && !sc.cursor.table_move_to(&sc.cx, rowid).await?.is_found() {
+            return Ok(());
+        }
+        sc.cursor.delete(&sc.cx).await?;
+        invalidate_storage_cursor_row_cache_with_reason(
+            sc,
+            self.collect_vdbe_metrics,
+            DecodeCacheInvalidationReason::WriteMutation,
+        );
+        self.sync_storage_table_delete_into_memdb_mirror(cursor_id, rowid);
+        self.pending_next_after_delete.insert(cursor_id);
+        Ok(())
     }
 
     #[inline]
@@ -11164,6 +11222,14 @@ impl VdbeEngine {
                     let cursor_id = op.p1;
                     let target = op.p2;
                     let concurrent_mode = op.p3 != 0;
+                    // bd-9ag5r: the max-rowid probe must not see a row an
+                    // UPDATE's Delete has only deferred.
+                    if let Some((deferred_cursor, deferred_rowid)) =
+                        self.take_deferred_update_delete()
+                    {
+                        self.materialize_deferred_update_delete(deferred_cursor, deferred_rowid)
+                            .await?;
+                    }
                     let concurrent_allocator = if concurrent_mode {
                         self.concurrent_rowid_allocator.clone()
                     } else {
@@ -11264,6 +11330,22 @@ impl VdbeEngine {
                     let concurrent_schema_epoch = self.concurrent_rowid_schema_epoch;
                     let previous_last_insert_rowid = self.last_insert_rowid;
                     let previous_last_insert_rowid_valid = self.last_insert_rowid_valid;
+                    // bd-9ag5r: a same-rowid UPDATE rewrites the row its Delete
+                    // left in place; anything else performs that delete first.
+                    let mut overwrite_in_place = false;
+                    if let Some((deferred_cursor, deferred_rowid)) =
+                        self.take_deferred_update_delete()
+                    {
+                        if is_update && deferred_cursor == cursor_id && deferred_rowid == rowid {
+                            overwrite_in_place = true;
+                        } else {
+                            self.materialize_deferred_update_delete(
+                                deferred_cursor,
+                                deferred_rowid,
+                            )
+                            .await?;
+                        }
+                    }
                     let pending_update_restore = if is_update {
                         self.take_pending_update_restore()
                     } else {
@@ -11323,6 +11405,55 @@ impl VdbeEngine {
                                 } else {
                                     record_blob_bytes(&record_val)
                                 };
+                                if overwrite_in_place {
+                                    // The cursor is still on the old row: overwrite
+                                    // a same-size cell, else replace it at the same
+                                    // position (delete, then insert into the gap).
+                                    if !sc
+                                        .cursor
+                                        .table_overwrite_current_payload_same_size_no_overflow(
+                                            &sc.cx, rowid, blob,
+                                        )
+                                        .await?
+                                    {
+                                        let positioned = !sc.cursor.eof()
+                                            && sc.cursor.rowid(&sc.cx).await? == rowid;
+                                        if positioned
+                                            || sc.cursor.table_move_to(&sc.cx, rowid).await?.is_found()
+                                        {
+                                            sc.cursor.delete(&sc.cx).await?;
+                                            sc.cursor
+                                                .table_insert_prechecked_absent(&sc.cx, rowid, blob)
+                                                .await?;
+                                        } else {
+                                            sc.cursor.table_insert(&sc.cx, rowid, blob).await?;
+                                        }
+                                    }
+                                    if rowid == sc.last_alloc_rowid {
+                                        sc.last_alloc_landed = true;
+                                    }
+                                    invalidate_storage_cursor_row_cache_with_reason(
+                                        sc,
+                                        self.collect_vdbe_metrics,
+                                        DecodeCacheInvalidationReason::WriteMutation,
+                                    );
+                                    if let Some(allocator) = concurrent_allocator.as_ref() {
+                                        Self::bump_concurrent_storage_rowid_floor(
+                                            allocator,
+                                            concurrent_schema_epoch,
+                                            root_page,
+                                            rowid_mode,
+                                            autoinc_max,
+                                            sc,
+                                            rowid,
+                                        )
+                                        .await?;
+                                    }
+                                    inserted_via_storage = true;
+                                    inserted_root_page = Some(root_page);
+                                    actually_inserted = true;
+                                    return Ok(None);
+                                }
                                 // bd-p666i: Append fast-path — if the new rowid
                                 // is strictly greater than the last successfully
                                 // inserted rowid on this cursor, the row cannot
@@ -11721,8 +11852,10 @@ impl VdbeEngine {
                     // Delete the row at the current cursor position.
                     let cursor_id = op.p1;
                     let is_update = (op.p5 & OPFLAG_ISUPDATE) != 0;
+                    let keeps_rowid = is_update && (op.p5 & OPFLAG_UPDATE_KEEPS_ROWID) != 0;
                     let mut deleted = false;
                     let mut deleted_storage_rowid = None;
+                    let mut deferred_rowid = None;
                     let mut update_restore = None;
                     // Phase 5B.3 (bd-1r0d): write-through — route ONLY through
                     // storage cursor when one exists; fall back to MemDatabase
@@ -11737,13 +11870,19 @@ impl VdbeEngine {
                                     payload: sc.cursor.payload(&sc.cx).await?,
                                 });
                             }
-                            sc.cursor.delete(&sc.cx).await?;
-                            invalidate_storage_cursor_row_cache_with_reason(
-                                sc,
-                                self.collect_vdbe_metrics,
-                                DecodeCacheInvalidationReason::WriteMutation,
-                            );
-                            deleted_storage_rowid = Some(current_rowid);
+                            if keeps_rowid {
+                                // bd-9ag5r: leave the row (and the cursor on it)
+                                // for the paired Insert to rewrite in place.
+                                deferred_rowid = Some(current_rowid);
+                            } else {
+                                sc.cursor.delete(&sc.cx).await?;
+                                invalidate_storage_cursor_row_cache_with_reason(
+                                    sc,
+                                    self.collect_vdbe_metrics,
+                                    DecodeCacheInvalidationReason::WriteMutation,
+                                );
+                                deleted_storage_rowid = Some(current_rowid);
+                            }
                             deleted = true;
                         }
                     } else if let Some(cursor) = self.cursors.get(&cursor_id) {
@@ -11791,7 +11930,12 @@ impl VdbeEngine {
                         if op.p5 & 1 != 0 {
                             self.changes += 1;
                         }
-                        self.pending_next_after_delete.insert(cursor_id);
+                        if let Some(rowid) = deferred_rowid {
+                            self.ensure_cold_state_for(StatementColdState::CONFLICT_TRACKING)
+                                .deferred_update_delete = Some((cursor_id, rowid));
+                        } else {
+                            self.pending_next_after_delete.insert(cursor_id);
+                        }
                     } else if is_update {
                         self.set_pending_update_restore(None);
                     }
