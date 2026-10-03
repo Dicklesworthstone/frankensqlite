@@ -41490,7 +41490,7 @@ impl Connection {
         &self,
         create: &fsqlite_ast::CreateTableStatement,
         target_is_temp: bool,
-        col_infos: Vec<ColumnInfo>,
+        mut col_infos: Vec<ColumnInfo>,
         rows: &[Row],
     ) -> Result<()> {
         let table_name = create.name.name.clone();
@@ -41521,6 +41521,19 @@ impl Connection {
             return Err(FrankenError::FunctionError(format!(
                 "{kind} {table_name} already exists",
             )));
+        }
+        // Re-parsing an ordinary CREATE must retain the SELECT's inferred
+        // affinities. CTAS inference has no original declared type names;
+        // omitting them here would make every recreated column typeless.
+        for column in &mut col_infos {
+            column.type_name = match Self::type_affinity_for_direct_insert(column.affinity) {
+                TypeAffinity::Blob => None,
+                TypeAffinity::Text => Some("TEXT"),
+                TypeAffinity::Numeric => Some("NUM"),
+                TypeAffinity::Integer => Some("INT"),
+                TypeAffinity::Real => Some("REAL"),
+            }
+            .map(str::to_owned);
         }
         let create_sql = crate::compat_persist::build_create_table_sql(&TableSchema {
             name: table_name.clone(),
@@ -67624,10 +67637,12 @@ impl Connection {
                 .iter()
                 .enumerate()
                 .map(|(index, value)| match table_schema.columns.get(index) {
-                    Some(column) => value
+                    Some(column) if column.strict_type != Some(StrictColumnType::Any) => value
                         .clone()
                         .apply_affinity(Self::type_affinity_for_direct_insert(column.affinity)),
-                    None => value.clone(),
+                    // STRICT ANY preserves the exact input storage class,
+                    // including numeric-looking text in BEFORE triggers.
+                    _ => value.clone(),
                 })
                 .collect()
         });
