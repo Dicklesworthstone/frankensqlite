@@ -33,7 +33,7 @@ pub use be_tree::{
 pub use cell::{
     BtreePageHeader, BtreePageType, CellRef, has_overflow, header_offset_for_page,
     local_payload_size, max_local_payload, min_local_payload, read_cell_pointers,
-    read_cell_pointers_into, write_cell_pointers,
+    read_cell_pointers_into, usable_prefix, write_cell_pointers,
 };
 pub use cooling::{
     CoolingConfig, CoolingMetricsSnapshot, CoolingStateMachine, cooling_metrics_snapshot,

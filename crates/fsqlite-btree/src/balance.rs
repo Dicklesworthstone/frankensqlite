@@ -15,7 +15,7 @@
 
 use crate::cell::{
     BtreePageHeader, BtreePageType, CellRef, MIN_CELL_ALLOCATION, header_offset_for_page,
-    parse_page_header, read_cell_pointers, write_cell_pointers,
+    parse_page_header, read_cell_pointers, usable_prefix, write_cell_pointers,
 };
 use crate::cursor::PageWriter;
 use crate::instrumentation;
@@ -540,15 +540,17 @@ async fn quick_balance_divider_rowid<W: PageWriter>(
     if leaf_header.cell_count == 0 {
         return Ok(overflow_rowid.saturating_sub(1));
     }
-    let leaf_ptrs = read_cell_pointers(leaf_data.as_bytes(), &leaf_header, leaf_offset)?;
+    // GH#426 / bd-i2pad: decode from the usable prefix so a malformed last
+    // cell cannot turn reserved trailer bytes into the divider rowid.
+    let leaf_usable = usable_prefix(leaf_data.as_bytes(), usable_size);
+    let leaf_ptrs = read_cell_pointers(leaf_usable, &leaf_header, leaf_offset)?;
     let last_ptr = leaf_ptrs[leaf_header.cell_count as usize - 1] as usize;
     // bd-ah597.2: same "caller only needs the rowid" pattern as commit
     // b35f091c (predecessor_idx). The divider computed by quick-balance is
     // just the last LeafTable cell's rowid; decoding local_size /
     // overflow_page / payload_offset via the full `CellRef::parse` is dead
     // work on this hot split path.
-    let _ = usable_size;
-    CellRef::parse_leaf_table_rowid(leaf_data.as_bytes(), last_ptr)
+    CellRef::parse_leaf_table_rowid(leaf_usable, last_ptr)
 }
 
 // ---------------------------------------------------------------------------
@@ -579,7 +581,11 @@ pub(crate) async fn balance_nonroot<W: PageWriter>(
     let parent_data = writer.read_page_data(cx, parent_page_no).await?;
     let parent_offset = header_offset_for_page(parent_page_no);
     let parent_header = parse_page_header(parent_data.as_bytes(), parent_page_no)?;
-    let parent_ptrs = read_cell_pointers(parent_data.as_bytes(), &parent_header, parent_offset)?;
+    let parent_ptrs = read_cell_pointers(
+        usable_prefix(parent_data.as_bytes(), usable_size),
+        &parent_header,
+        parent_offset,
+    )?;
 
     let total_children = parent_header.cell_count as usize + 1;
 
@@ -976,13 +982,11 @@ fn child_page_number(
             // Use the public `CellRef::read_interior_left_child` helper
             // instead of a full `CellRef::parse` — the cell's first 4 bytes
             // are the child pointer; decoding the rowid varint, local-size
-            // math, and overflow bounds are dead work here. `usable_size`
-            // stays in the signature because the shared-sibling helper
-            // `read_cell_pointers` and the `compute_sibling_range` plumbing
-            // both expect it.
-            let _ = usable_size;
+            // math, and overflow bounds are dead work here. The read is
+            // bounded at `usable_size` so a cell pointer into the reserved
+            // trailer is corruption, not a child page (GH#426, bd-i2pad).
             let ptr = parent_ptrs[child_idx] as usize;
-            CellRef::read_interior_left_child(parent_data, ptr)
+            CellRef::read_interior_left_child(usable_prefix(parent_data, usable_size), ptr)
         }
         std::cmp::Ordering::Equal => {
             parent_header

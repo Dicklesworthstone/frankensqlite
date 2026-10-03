@@ -336,10 +336,60 @@ pub fn read_cell_pointers_into(
     // `c[1]` that `chunks_exact(2).map(|c| [c[0], c[1]])` was still
     // paying — same array-conversion bounds-elide pattern that took
     // `BtreePageHeader::parse` from 10.7 ns to 3.7 ns (commit 1f266968).
+    //
+    // bd-i2pad: every cell must start after the pointer array and before
+    // the end of `page`. Callers pass the usable prefix (see
+    // [`usable_prefix`]), so a pointer into the reserved trailer is
+    // rejected here instead of decoding trailer bytes as a cell (stock's
+    // `btreeCellSizeCheck` bounds). `p - lo >= span` with wrapping u16
+    // arithmetic tests both ends at once. The test rides along in the copy
+    // loop (non-short-circuiting OR), so valid pages pay no second pass.
+    // `ptr_array_end` is at least 8 and at most `page.len()` <= 65536, so
+    // both fit in u16.
+    let lo = u16::try_from(ptr_array_end).unwrap_or(u16::MAX);
+    let span = u16::try_from(page.len() - ptr_array_end).unwrap_or(u16::MAX);
+    let mut out_of_range = false;
     let ptr_bytes = &page[ptr_array_start..ptr_array_end];
     let (chunks, _) = ptr_bytes.as_chunks::<2>();
-    buf.extend(chunks.iter().map(|c| u16::from_be_bytes(*c)));
+    buf.extend(chunks.iter().map(|c| {
+        let ptr = u16::from_be_bytes(*c);
+        out_of_range |= ptr.wrapping_sub(lo) >= span;
+        ptr
+    }));
+    if out_of_range {
+        return Err(cell_pointer_out_of_range(buf, ptr_array_end, page.len()));
+    }
     Ok(())
+}
+
+#[cold]
+#[inline(never)]
+fn cell_pointer_out_of_range(
+    pointers: &[u16],
+    ptr_array_end: usize,
+    usable_len: usize,
+) -> FrankenError {
+    let min_ptr = pointers.iter().copied().min().unwrap_or(0);
+    let max_ptr = pointers.iter().copied().max().unwrap_or(0);
+    FrankenError::DatabaseCorrupt {
+        detail: format!(
+            "cell pointer outside the cell content area: pointers span [{min_ptr}, {max_ptr}], \
+             valid range is [{ptr_array_end}, {usable_len})"
+        ),
+    }
+}
+
+/// The usable prefix of a page image: the bytes a b-tree page may use, with
+/// the reserved trailer (`page_size - usable_size` bytes) cut off.
+///
+/// Decode cells from this slice, not the full page, so that a malformed cell
+/// pointer or a truncated varint can never read reserved trailer bytes as
+/// cell data (GH#426, bd-i2pad). The slice is clamped to `page.len()`.
+#[must_use]
+#[inline]
+pub fn usable_prefix(page: &[u8], usable_size: u32) -> &[u8] {
+    let usable = usize::try_from(usable_size).unwrap_or(usize::MAX);
+    &page[..usable.min(page.len())]
 }
 
 /// Write the cell pointer array into a page.
@@ -1355,6 +1405,78 @@ mod tests {
 
         let err = read_cell_pointers(&page, &header, 0).unwrap_err();
         assert!(err.to_string().contains("starts outside page"));
+    }
+
+    /// bd-i2pad (GH#426): with the page's usable prefix, a pointer into the
+    /// reserved trailer is corruption; the same pointers on the full image are
+    /// still accepted (the trailer is part of the page buffer).
+    #[test]
+    fn test_read_cell_pointers_rejects_pointer_into_reserved_trailer() {
+        const USABLE: u32 = 4064;
+        let header = BtreePageHeader {
+            page_type: BtreePageType::LeafTable,
+            first_freeblock: 0,
+            cell_count: 3,
+            cell_content_offset: 3900,
+            fragmented_free_bytes: 0,
+            right_child: None,
+        };
+        let mut page = vec![0u8; 4096];
+        header.write(&mut page, 0);
+
+        write_cell_pointers(&mut page, 0, &header, &[3900, 3950, 4063]);
+        assert_eq!(
+            read_cell_pointers(usable_prefix(&page, USABLE), &header, 0).unwrap(),
+            vec![3900, 3950, 4063],
+            "the last usable byte is a legal cell start"
+        );
+
+        for trailer_ptr in [4064u16, 4070, 4095] {
+            write_cell_pointers(&mut page, 0, &header, &[3900, trailer_ptr, 3950]);
+            let err = read_cell_pointers(usable_prefix(&page, USABLE), &header, 0).unwrap_err();
+            assert!(
+                matches!(err, FrankenError::DatabaseCorrupt { .. }),
+                "pointer {trailer_ptr}: {err}"
+            );
+            assert!(err.to_string().contains("outside the cell content area"));
+        }
+        // A pointer at or past the end of the buffer is corruption even
+        // without reserved bytes.
+        write_cell_pointers(&mut page, 0, &header, &[3900, 4096, 3950]);
+        assert!(read_cell_pointers(&page, &header, 0).is_err());
+    }
+
+    #[test]
+    fn test_read_cell_pointers_rejects_pointer_into_header_or_pointer_array() {
+        let header = BtreePageHeader {
+            page_type: BtreePageType::LeafTable,
+            first_freeblock: 0,
+            cell_count: 3,
+            cell_content_offset: 3900,
+            fragmented_free_bytes: 0,
+            right_child: None,
+        };
+        let mut page = vec![0u8; 4096];
+        header.write(&mut page, 0);
+        // Pointer array ends at 8 + 3 * 2 = 14.
+        for low_ptr in [0u16, 7, 13] {
+            write_cell_pointers(&mut page, 0, &header, &[3900, low_ptr, 3950]);
+            let err = read_cell_pointers(&page, &header, 0).unwrap_err();
+            assert!(
+                err.to_string().contains("outside the cell content area"),
+                "{low_ptr}: {err}"
+            );
+        }
+        write_cell_pointers(&mut page, 0, &header, &[3900, 14, 3950]);
+        assert!(read_cell_pointers(&page, &header, 0).is_ok());
+    }
+
+    #[test]
+    fn test_usable_prefix_clamps_to_page_length() {
+        let page = vec![0u8; 512];
+        assert_eq!(usable_prefix(&page, 480).len(), 480);
+        assert_eq!(usable_prefix(&page, 512).len(), 512);
+        assert_eq!(usable_prefix(&page, 65536).len(), 512);
     }
 
     // -- Local payload calculation tests --

@@ -874,6 +874,10 @@ struct StackEntry {
     cell_pointers: Vec<u16>,
     /// Page-image mutation signature for validating cached cell-slot parses.
     mutation_counter: u64,
+    /// Usable bytes per page (page size minus reserved trailer). Raw cell
+    /// decoders read through [`StackEntry::usable_bytes`] so a malformed cell
+    /// can never decode reserved trailer bytes (GH#426, bd-i2pad).
+    usable_size: u32,
     /// Current cell index. For interior pages, this indicates which child
     /// was descended into. For leaf pages, this is the current position.
     /// A value equal to `cell_count` means "past the right-most child" on
@@ -891,8 +895,19 @@ impl Clone for StackEntry {
             header: self.header,
             cell_pointers,
             mutation_counter: self.mutation_counter,
+            usable_size: self.usable_size,
             cell_idx: self.cell_idx,
         }
+    }
+}
+
+impl StackEntry {
+    /// The page image without its reserved trailer. Every raw cell decoder
+    /// (rowid / child-pointer / varint reads that bypass `CellRef::parse`)
+    /// must read from this slice.
+    #[inline]
+    fn usable_bytes(&self) -> &[u8] {
+        cell::usable_prefix(self.page_data.as_bytes(), self.usable_size)
     }
 }
 
@@ -1400,15 +1415,16 @@ impl TableLeafPayloadPatchRun {
                     ),
                 })?;
         let offset = usize::from(offset);
-        let cell_data = entry.page_data.as_bytes().get(offset..).ok_or_else(|| {
-            FrankenError::DatabaseCorrupt {
+        let page = entry.usable_bytes();
+        let cell_data = page
+            .get(offset..)
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
                 detail: format!(
-                    "table leaf cell pointer {} points past page end (len {})",
+                    "table leaf cell pointer {} points past usable page end ({})",
                     offset,
-                    entry.page_data.as_bytes().len()
+                    page.len()
                 ),
-            }
-        })?;
+            })?;
         let Some((_, payload_varint_len)) = read_varint(cell_data) else {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: "table leaf cell has invalid payload size varint".to_owned(),
@@ -2459,6 +2475,7 @@ impl<P: PageReader> BtCursor<P> {
         if page_type.is_table() {
             return Ok(None);
         }
+        let page = cell::usable_prefix(page, self.usable_size);
 
         let mut pos = cell_offset;
         if page_type.is_interior() {
@@ -3108,7 +3125,8 @@ impl<P: PageReader> BtCursor<P> {
             self.record_range_page_witness(cx, current_page);
 
             let page_data = self.pager.read_btree_page_data(cx, current_page).await?;
-            let page_bytes = page_data.as_bytes();
+            // Raw child reads below must not see the reserved trailer.
+            let page_bytes = cell::usable_prefix(page_data.as_bytes(), self.usable_size);
             let header = cell::parse_page_header(page_bytes, current_page)?;
 
             if header.page_type.is_leaf() {
@@ -3212,12 +3230,7 @@ impl<P: PageReader> BtCursor<P> {
         }
 
         let header_size = usize::from(entry.header.page_type.header_size());
-        Self::read_cell_pointer_inline(
-            entry.page_data.as_bytes(),
-            entry.page_no,
-            header_size,
-            cell_idx,
-        )
+        Self::read_cell_pointer_inline(entry.usable_bytes(), entry.page_no, header_size, cell_idx)
     }
 
     #[inline]
@@ -3232,7 +3245,7 @@ impl<P: PageReader> BtCursor<P> {
         }
 
         let cell_offset = usize::from(Self::read_stack_entry_cell_pointer_inline(entry, cell_idx)?);
-        Self::read_child_at_offset(entry.page_data.as_bytes(), cell_offset)
+        Self::read_child_at_offset(entry.usable_bytes(), cell_offset)
     }
 
     /// Decode the routing rowid stored in an interior table cell.
@@ -3251,15 +3264,14 @@ impl<P: PageReader> BtCursor<P> {
         }
 
         let cell_offset = usize::from(Self::read_stack_entry_cell_pointer_inline(entry, cell_idx)?);
-        let cell_data = entry
-            .page_data
-            .as_bytes()
+        let page = entry.usable_bytes();
+        let cell_data = page
             .get(cell_offset..)
             .ok_or_else(|| FrankenError::DatabaseCorrupt {
                 detail: format!(
-                    "interior table cell pointer {} points past page end (len {})",
+                    "interior table cell pointer {} points past usable page end ({})",
                     cell_offset,
-                    entry.page_data.as_bytes().len()
+                    page.len()
                 ),
             })?;
         let rowid_bytes = cell_data
@@ -3480,7 +3492,7 @@ impl<P: PageReader> BtCursor<P> {
         let header = cell::parse_page_header(page_data.as_bytes(), page_no)?;
         let mut cell_pointers = take_pooled_cell_pointers();
         cell::read_cell_pointers_into(
-            page_data.as_bytes(),
+            cell::usable_prefix(page_data.as_bytes(), self.usable_size),
             &header,
             header_offset,
             &mut cell_pointers,
@@ -3493,6 +3505,7 @@ impl<P: PageReader> BtCursor<P> {
             header,
             cell_pointers,
             mutation_counter,
+            usable_size: self.usable_size,
             cell_idx: 0,
         })
     }
@@ -3510,7 +3523,7 @@ impl<P: PageReader> BtCursor<P> {
         let header = cell::parse_page_header(page_data.as_bytes(), page_no)?;
         let mut cell_pointers = take_pooled_cell_pointers();
         cell::read_cell_pointers_into(
-            page_data.as_bytes(),
+            cell::usable_prefix(page_data.as_bytes(), self.usable_size),
             &header,
             header_offset,
             &mut cell_pointers,
@@ -3522,6 +3535,7 @@ impl<P: PageReader> BtCursor<P> {
             header,
             cell_pointers,
             mutation_counter,
+            usable_size: self.usable_size,
             cell_idx: 0,
         })
     }
@@ -4339,15 +4353,16 @@ impl<P: PageReader> BtCursor<P> {
         }
 
         let offset = usize::from(entry.cell_pointers[idx]);
-        let cell_data = entry.page_data.as_bytes().get(offset..).ok_or_else(|| {
-            FrankenError::DatabaseCorrupt {
+        let page = entry.usable_bytes();
+        let cell_data = page
+            .get(offset..)
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
                 detail: format!(
-                    "table leaf cell pointer {} points past page end (len {})",
+                    "table leaf cell pointer {} points past usable page end ({})",
                     offset,
-                    entry.page_data.as_bytes().len()
+                    page.len()
                 ),
-            }
-        })?;
+            })?;
         if let Some((_, payload_varint_len)) = read_varint(cell_data) {
             if let Some((rowid, _)) = read_varint(&cell_data[payload_varint_len..]) {
                 #[allow(clippy::cast_possible_wrap)]
@@ -6247,16 +6262,14 @@ impl<P: PageWriter> BtCursor<P> {
             return Ok(false);
         }
         let old_right_header_offset = cell::header_offset_for_page(old_right_child);
-        let old_right_ptrs = cell::read_cell_pointers(
-            old_right_data.as_bytes(),
-            &old_right_header,
-            old_right_header_offset,
-        )?;
+        let old_right_usable = cell::usable_prefix(old_right_data.as_bytes(), self.usable_size);
+        let old_right_ptrs =
+            cell::read_cell_pointers(old_right_usable, &old_right_header, old_right_header_offset)?;
         let Some(last_ptr) = old_right_ptrs.last().copied() else {
             return Ok(false);
         };
         let Some(old_max_rowid) =
-            cell::read_table_leaf_rowid_at_offset(old_right_data.as_bytes(), usize::from(last_ptr))
+            cell::read_table_leaf_rowid_at_offset(old_right_usable, usize::from(last_ptr))
         else {
             return Ok(false);
         };
@@ -6318,16 +6331,14 @@ impl<P: PageWriter> BtCursor<P> {
             return Ok(false);
         }
         let old_right_header_offset = cell::header_offset_for_page(old_right_child);
-        let old_right_ptrs = cell::read_cell_pointers(
-            old_right_data.as_bytes(),
-            &old_right_header,
-            old_right_header_offset,
-        )?;
+        let old_right_usable = cell::usable_prefix(old_right_data.as_bytes(), self.usable_size);
+        let old_right_ptrs =
+            cell::read_cell_pointers(old_right_usable, &old_right_header, old_right_header_offset)?;
         let Some(last_ptr) = old_right_ptrs.last().copied() else {
             return Ok(false);
         };
         let Some(old_max_rowid) =
-            cell::read_table_leaf_rowid_at_offset(old_right_data.as_bytes(), usize::from(last_ptr))
+            cell::read_table_leaf_rowid_at_offset(old_right_usable, usize::from(last_ptr))
         else {
             return Ok(false);
         };
@@ -6491,6 +6502,7 @@ impl<P: PageWriter> BtCursor<P> {
                     header,
                     cell_pointers,
                     mutation_counter,
+                    usable_size: self.usable_size,
                     cell_idx,
                 });
                 self.at_eof = false;
@@ -8711,6 +8723,7 @@ impl<P: PageWriter> BtCursor<P> {
             header,
             cell_pointers: ptrs,
             mutation_counter,
+            usable_size: self.usable_size,
             cell_idx: 0,
         };
         if new_count == 0 {
@@ -8975,7 +8988,7 @@ impl<P: PageWriter> BtCursor<P> {
             predecessor_idx,
         )?);
         let new_rowid =
-            CellRef::parse_leaf_table_rowid(leaf_entry.page_data.as_bytes(), predecessor_offset)?;
+            CellRef::parse_leaf_table_rowid(leaf_entry.usable_bytes(), predecessor_offset)?;
 
         Ok(Some((separator.page_no, separator.cell_idx, new_rowid)))
     }
@@ -9373,6 +9386,7 @@ impl<P: PageWriter> BtCursor<P> {
                 header: cached.header,
                 cell_pointers: stack_cell_pointers,
                 mutation_counter,
+                usable_size: self.usable_size,
                 cell_idx: insert_idx,
             });
             self.at_eof = false;
@@ -9432,6 +9446,7 @@ impl<P: PageWriter> BtCursor<P> {
                     header: cached.header,
                     cell_pointers: stack_cell_pointers,
                     mutation_counter,
+                    usable_size: self.usable_size,
                     cell_idx: insert_idx,
                 });
                 self.at_eof = false;
@@ -9644,9 +9659,10 @@ impl<P: PageWriter> BtCursor<P> {
         // leading varints (payload_size, rowid) which avoids parsing the
         // local payload bounds / overflow pointer validation on every
         // append.
-        let Some(actual_last_rowid) =
-            cell::read_table_leaf_rowid_at_offset(page_data.as_bytes(), usize::from(last_ptr))
-        else {
+        let Some(actual_last_rowid) = cell::read_table_leaf_rowid_at_offset(
+            cell::usable_prefix(page_data.as_bytes(), self.usable_size),
+            usize::from(last_ptr),
+        ) else {
             self.clear_rightmost_leaf_cache();
             return Ok(None);
         };
@@ -9676,7 +9692,7 @@ impl<P: PageWriter> BtCursor<P> {
             self.last_known_depth = Some(hinted_tree_depth);
             let parent_page = if refresh_cursor_cache {
                 let mut cell_pointers = cell::read_cell_pointers(
-                    page_data.as_bytes(),
+                    cell::usable_prefix(page_data.as_bytes(), self.usable_size),
                     &pre_append_header,
                     header_offset,
                 )?;
@@ -9690,6 +9706,7 @@ impl<P: PageWriter> BtCursor<P> {
                     header,
                     cell_pointers: stack_cell_pointers,
                     mutation_counter,
+                    usable_size: self.usable_size,
                     cell_idx: insert_idx,
                 });
                 self.at_eof = false;
@@ -9759,7 +9776,7 @@ impl<P: PageWriter> BtCursor<P> {
                 self.last_known_depth = Some(hinted_tree_depth);
                 let parent_page = if refresh_cursor_cache {
                     let mut cell_pointers = cell::read_cell_pointers(
-                        page_data.as_bytes(),
+                        cell::usable_prefix(page_data.as_bytes(), self.usable_size),
                         &pre_append_header,
                         header_offset,
                     )?;
@@ -9772,6 +9789,7 @@ impl<P: PageWriter> BtCursor<P> {
                         header,
                         cell_pointers: cell_pointers.clone(),
                         mutation_counter,
+                        usable_size: self.usable_size,
                         cell_idx: insert_idx,
                     });
                     self.at_eof = false;
@@ -10930,7 +10948,7 @@ impl<P: PageWriter> BtCursor<P> {
             });
         }
 
-        let page = entry.page_data.as_bytes();
+        let page = entry.usable_bytes();
         let idx_usize = usize::from(idx);
         let cell_offset = if idx_usize < entry.cell_pointers.len() {
             usize::from(entry.cell_pointers[idx_usize])
@@ -13571,21 +13589,34 @@ mod tests {
         run_async(async {
             let cx = Cx::new();
             let root = pn(2);
-            let mut page = build_leaf_table(&[(1, b"one"), (2, b"two")]);
-            page[8..10].copy_from_slice(&u16::MAX.to_be_bytes());
+            let page = build_leaf_table(&[(1, b"one"), (2, b"two")]);
+            let mut corrupt = page.clone();
+            corrupt[8..10].copy_from_slice(&u16::MAX.to_be_bytes());
 
+            // bd-i2pad: the page load rejects the pointer outright.
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(root.get(), corrupt);
+            let mut cursor = BtCursor::new(store, root, USABLE, true);
+            let err = cursor
+                .load_page(&cx, root)
+                .await
+                .expect_err("out-of-range cell pointer must fail the page load");
+            assert!(
+                matches!(&err, FrankenError::DatabaseCorrupt { detail } if detail.contains("outside the cell content area")),
+                "unexpected error: {err:?}"
+            );
+
+            // The decoder keeps its own guard for entries built from cached
+            // pointers.
             let mut store = MemPageStore::new(USABLE);
             store.pages.insert(root.get(), page);
             let mut cursor = BtCursor::new(store, root, USABLE, true);
-            let entry = cursor
-                .load_page(&cx, root)
-                .await
-                .expect("page header loads");
-
+            let mut entry = cursor.load_page(&cx, root).await.expect("valid page loads");
+            entry.cell_pointers[0] = u16::MAX;
             let err = BtCursor::<MemPageStore>::table_leaf_rowid_at(&entry, 0)
                 .expect_err("out-of-range cell pointer must be corruption, not panic");
             assert!(
-                matches!(&err, FrankenError::DatabaseCorrupt { detail } if detail.contains("points past page end")),
+                matches!(&err, FrankenError::DatabaseCorrupt { detail } if detail.contains("points past usable page end")),
                 "unexpected error: {err:?}"
             );
         });
@@ -13602,15 +13633,14 @@ mod tests {
             let mut store = MemPageStore::new(USABLE);
             store.pages.insert(root.get(), page);
             let mut cursor = BtCursor::new(store, root, USABLE, true);
-            let entry = cursor
+            // bd-i2pad: the page load rejects the pointer before any
+            // interior search can decode it.
+            let err = cursor
                 .load_page(&cx, root)
                 .await
-                .expect("page header loads");
-
-            let err = BtCursor::<MemPageStore>::binary_search_table_interior(&cx, &entry, 5)
-                .expect_err("out-of-range interior pointer must be corruption, not panic");
+                .expect_err("out-of-range interior pointer must fail the page load");
             assert!(
-                matches!(&err, FrankenError::DatabaseCorrupt { detail } if detail.contains("points past page end")),
+                matches!(&err, FrankenError::DatabaseCorrupt { detail } if detail.contains("outside the cell content area")),
                 "unexpected error: {err:?}"
             );
         });
