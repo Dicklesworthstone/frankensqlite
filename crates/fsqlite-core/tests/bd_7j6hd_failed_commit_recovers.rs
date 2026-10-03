@@ -5,6 +5,11 @@
 //! same connection or a fresh one, must proceed promptly, and the file must
 //! stay consistent for stock SQLite.
 //!
+//! bd-no6zz: the caller's answer must match what was committed. An INSERT
+//! whose commit settled durable reports success, so an application never
+//! retries a committed row; one that settled not committed reports the
+//! original error, never an internal rollback error.
+//!
 //! Requires `--features fault-injection` (the WAL hooks are compiled out
 //! otherwise).
 
@@ -75,6 +80,12 @@ fn run_scenario(db: &Path, fault: Fault) -> (bool, Vec<i64>) {
             ))
             .ok();
             tx.send(format!("acknowledged={}", failed.is_ok())).ok();
+            if let Err(error) = &failed {
+                assert!(
+                    !matches!(error, fsqlite_error::FrankenError::Internal(_)),
+                    "{fault:?}: a failed commit must report its own error, not {error:?}"
+                );
+            }
             assert_eq!(fired.len(), 1, "{fault:?} hook must fire exactly once");
 
             // Same connection, next write.
@@ -148,15 +159,19 @@ fn assert_outcome(fault: Fault, acknowledged: bool, rows: &[i64]) {
             assert!(acknowledged, "{fault:?}: a retried pre-write busy must commit");
             assert_eq!(rows, [1, 2, 3, 4], "{fault:?}: committed rows");
         }
-        // The commit marker may be on disk: the caller gets an error, and
-        // row 2's fate is reconciliation's durability verdict (present when
-        // it proves the marker durable). Every other row is an ordinary
-        // acknowledged commit and must be present.
+        // The commit marker may be on disk, so row 2's fate is
+        // reconciliation's durability verdict. Whatever it is, the caller's
+        // answer must agree with it (bd-no6zz): success exactly when row 2 is
+        // committed. Every other row is an ordinary acknowledged commit.
         Fault::SyncAfterAppend | Fault::AfterAppend => {
-            assert!(!acknowledged, "{fault:?}: an in-doubt commit must not report success");
             assert!(
                 rows == [1, 3, 4] || rows == [1, 2, 3, 4],
                 "{fault:?}: unexpected committed rows {rows:?}"
+            );
+            assert_eq!(
+                acknowledged,
+                rows.contains(&2),
+                "{fault:?}: the INSERT's result must match whether row 2 committed (rows {rows:?})"
             );
         }
     }

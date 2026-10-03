@@ -1625,6 +1625,58 @@ enum PhysicalCommitOutcome {
     },
 }
 
+/// bd-no6zz: settle a failed autocommit COMMIT before any rollback runs.
+///
+/// A commit error is not proof that the physical commit was rejected: a WAL
+/// sync or append can fail after the commit frame is written, leaving the
+/// attempt in doubt. Rolling back such an attempt cannot undo it, and the
+/// statement used to fail with an internal error while its row was committed,
+/// inviting a retry that inserts the row twice. Like the explicit COMMIT path,
+/// settle the same attempt to a terminal pager state first.
+///
+/// Returns `Ok(())` when the attempt settled as committed: the caller completes
+/// the statement as committed and the original error is only logged. Returns
+/// the original error when the attempt is not committed, so rollback applies.
+async fn settle_failed_commit_obligation<T: TransactionHandle + ?Sized>(
+    txn: &mut T,
+    cx: &Cx,
+    error: FrankenError,
+) -> Result<()> {
+    let mut attempt = 0_u32;
+    loop {
+        match txn.pager_commit_state() {
+            PagerCommitState::NotCommitted => return Err(error),
+            PagerCommitState::Committed => {
+                tracing::warn!(
+                    %error,
+                    caller_outcome = "committed",
+                    "autocommit completed a durable commit after a local commit error"
+                );
+                return Ok(());
+            }
+            PagerCommitState::InDoubt | PagerCommitState::DurableNeedsPublication => {
+                attempt = attempt.saturating_add(1);
+                perform_begin_busy_retry_handoff(BeginBusyRetryWait {
+                    attempt,
+                    spin_loops: begin_busy_retry_spin_loops(attempt),
+                    sleep_for: begin_busy_retry_sleep(attempt),
+                })
+                .await;
+                let cleanup_cx = cx.create_child();
+                let _cleanup_mask = cleanup_cx.masked();
+                if let Err(settle_error) = txn.settle_commit(&cleanup_cx).await {
+                    tracing::debug!(
+                        %error,
+                        %settle_error,
+                        attempt,
+                        "settling an in-doubt autocommit attempt failed; retrying"
+                    );
+                }
+            }
+        }
+    }
+}
+
 static FSQLITE_PARSE_SINGLE_CALLS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PARSE_MULTI_CALLS: AtomicU64 = AtomicU64::new(0);
 static FSQLITE_PARSE_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
@@ -58009,6 +58061,13 @@ impl Connection {
         };
         #[cfg(not(test))]
         let commit_attempt = txn.commit(cx).await;
+        // bd-no6zz: an in-doubt attempt is settled, not rolled back.
+        let commit_attempt = match commit_attempt {
+            Err(error) if txn.pager_commit_state().retains_commit_obligation() => {
+                settle_failed_commit_obligation(&mut txn, cx, error).await
+            }
+            other => other,
+        };
         let commit_result = match commit_attempt {
             Ok(()) => Ok(()),
             Err(commit_error) => {
@@ -60246,6 +60305,13 @@ impl Connection {
             };
             #[cfg(not(test))]
             let commit_result = txn.commit(cx).await;
+            // bd-no6zz: an in-doubt attempt is settled, not rolled back.
+            let commit_result = match commit_result {
+                Err(error) if txn.pager_commit_state().retains_commit_obligation() => {
+                    settle_failed_commit_obligation(&mut txn, cx, error).await
+                }
+                other => other,
+            };
             match commit_result {
                 Ok(()) => {
                     // End of the under-lock physical write phase. Publication
@@ -60566,7 +60632,14 @@ impl Connection {
             let mut guard = self.active_txn.borrow_mut();
             let finalize_err = if let Some(txn) = guard.as_mut() {
                 if result.is_ok() {
-                    match txn.commit(&cx).await {
+                    // bd-no6zz: an in-doubt attempt is settled, not dropped.
+                    let commit_result = match txn.commit(&cx).await {
+                        Err(error) if txn.pager_commit_state().retains_commit_obligation() => {
+                            settle_failed_commit_obligation(txn, &cx, error).await
+                        }
+                        other => other,
+                    };
+                    match commit_result {
                         Ok(()) => {
                             let committed_seq = if self.pager.is_memory() {
                                 let committed_seq = self.advance_commit_clock();
