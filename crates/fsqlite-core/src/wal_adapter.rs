@@ -3719,6 +3719,25 @@ where
         self.inner.attach_wal_index_shm_source(source)
     }
 
+    /// Reserve repair-queue capacity for a durable range before its fsync.
+    ///
+    /// A full queue defers admission instead of refusing the write. The worker
+    /// runs on the caller's runtime, so a caller whose statements never yield
+    /// (a current-thread shell with inline page I/O) cannot drain it; refusing
+    /// with `Busy` made every later statement on the connection fail. A
+    /// deferred range stays unadmitted, and the next admission (or restart
+    /// catch-up) covers it from the last admitted boundary.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    fn reserve_fec_admission(
+        producer: &fsqlite_wal::wal_fec::WalFecRepairProducer,
+    ) -> Result<Option<fsqlite_wal::wal_fec::WalFecRepairPermit<'_>>> {
+        match producer.try_reserve() {
+            Ok(permit) => Ok(Some(permit)),
+            Err(FrankenError::Busy) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
     fn pending_fec_range(&mut self, cx: &Cx) -> Result<Option<fsqlite_wal::wal_fec::WalFecCommittedRange>> {
         let Some(producer) = &self.fec_producer else { return Ok(None) };
@@ -3758,11 +3777,16 @@ where
         #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
         let producer = self.fec_producer.clone();
         #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
-        let permit = if range.as_ref().is_some_and(|range| range.repair_symbols != 0) {
-            producer.as_ref().map(|producer| producer.try_reserve()).transpose()?
-        } else {
-            None
+        let wants_repair = range.as_ref().is_some_and(|range| range.repair_symbols != 0);
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+        let permit = match producer.as_ref() {
+            Some(producer) if wants_repair => Self::reserve_fec_admission(producer)?,
+            _ => None,
         };
+        // `pending_fec_range` yields a range only with a producer attached, so
+        // a repair-wanting range without a permit met a full queue.
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+        let deferred = wants_repair && permit.is_none();
         let result = if publish_pending {
             self.inner.sync(cx)
         } else {
@@ -3775,7 +3799,7 @@ where
             && self.inner.wal.last_fsynced_frame_count() >= range.end_frame_no as usize
         {
             let boundary = (range.header, range.end_frame_no, range.end_checksum);
-            let submitted = permit.is_none_or(|permit| permit.submit(range));
+            let submitted = !deferred && permit.is_none_or(|permit| permit.submit(range));
             if submitted {
                 self.fec_admitted = Some(boundary);
             }
@@ -6270,12 +6294,15 @@ where
         self.fec_producer = producer;
         if let Some(producer) = &self.fec_producer {
             let header = WalHeader::from_bytes(&self.inner.wal.header().to_bytes()?)?;
+            // A full queue leaves the generation uninspected for a later attach.
             if self.fec_inspected_generation != Some(header)
-                && producer.try_reserve()?.submit(fsqlite_wal::wal_fec::WalFecCommittedRange {
-                    wal_path: self.wal_path.clone(), header,
-                    start_frame_no: 1, end_frame_no: 0,
-                    previous_checksum: header.checksum, end_checksum: header.checksum,
-                    repair_symbols: 0,
+                && Self::reserve_fec_admission(producer)?.is_some_and(|permit| {
+                    permit.submit(fsqlite_wal::wal_fec::WalFecCommittedRange {
+                        wal_path: self.wal_path.clone(), header,
+                        start_frame_no: 1, end_frame_no: 0,
+                        previous_checksum: header.checksum, end_checksum: header.checksum,
+                        repair_symbols: 0,
+                    })
                 })
             {
                 self.fec_inspected_generation = Some(header);
@@ -6291,9 +6318,14 @@ where
             let submitted = if range.repair_symbols == 0 {
                 true
             } else if let Some(producer) = &self.fec_producer {
-                let permit = producer.try_reserve()?;
-                self.inner.wal.sync(cx, SyncFlags::NORMAL)?;
-                permit.submit(range)
+                // A full queue leaves this prefix for the next admission.
+                match Self::reserve_fec_admission(producer)? {
+                    Some(permit) => {
+                        self.inner.wal.sync(cx, SyncFlags::NORMAL)?;
+                        permit.submit(range)
+                    }
+                    None => false,
+                }
             } else {
                 false
             };
@@ -11903,7 +11935,7 @@ mod tests {
 
     #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
     #[test]
-    fn wal_fec_failed_sync_and_full_queue_do_not_admit_or_publish() {
+    fn wal_fec_failed_sync_does_not_admit_and_full_queue_defers_admission() {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .blocking_threads(1, 1).build().unwrap();
         let handle = runtime.handle();
@@ -11934,19 +11966,27 @@ mod tests {
             assert!(backend.fec_admitted.is_none());
             assert_publication_unchanged(&backend.inner, "failed WAL-FEC sync");
 
+            // A full queue must not refuse the write: the worker runs on the
+            // caller's runtime and cannot drain while the caller is refused.
+            // The commit becomes durable and published, nothing is queued
+            // without capacity, and the range stays unadmitted.
             let occupied = producer.try_reserve().unwrap();
-            let _ = vfs.take_sync_observations();
-            assert!(matches!(backend.sync(&cx), Err(FrankenError::Busy)));
-            assert!(vfs.take_sync_observations().is_empty(), "backpressure must precede fsync");
+            backend.sync(&cx).expect("a full WAL-FEC queue defers admission");
+            assert_eq!(backend.inner.wal.last_fsynced_frame_count(), 2, "the commit still fsyncs");
+            assert!(backend.fec_admitted.is_none(), "a deferred range is not admitted");
             assert_eq!(pipeline.stats().pending_jobs, 0);
-            assert_publication_unchanged(&backend.inner, "full WAL-FEC queue");
+            assert_eq!(backend.inner.published_snapshot.last_commit_frame, Some(1));
             drop(occupied);
 
-            backend.sync(&cx).expect("retry after capacity and durability recover");
-            assert_eq!(backend.inner.wal.last_fsynced_frame_count(), 2);
-            assert_eq!(backend.fec_admitted.unwrap().1, 2);
+            // The next commit's admission covers the deferred frames too.
+            let (p3, p4) = commit_batch_pages();
+            backend.inner.append_frame(&cx, 3, &p3, 0).await.unwrap();
+            backend.inner.append_frame(&cx, 4, &p4, 4).await.unwrap();
+            backend.sync(&cx).expect("admit after capacity recovers");
+            assert_eq!(backend.inner.wal.last_fsynced_frame_count(), 4);
+            assert_eq!(backend.fec_admitted.unwrap().1, 4);
             assert_eq!(pipeline.stats().pending_jobs, 1);
-            assert_eq!(backend.inner.published_snapshot.last_commit_frame, Some(1));
+            assert_eq!(backend.inner.published_snapshot.last_commit_frame, Some(3));
             // This is a VFS fault test, not OS-sidecar coverage. Cancel before
             // yielding to the worker; the SQL integration suite covers its I/O.
             pipeline.cancel();

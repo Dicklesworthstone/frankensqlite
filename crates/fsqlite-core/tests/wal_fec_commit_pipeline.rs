@@ -105,6 +105,45 @@ fn real_commit_returns_while_sidecar_is_busy_then_close_drains() {
     });
 }
 
+/// A repair worker that cannot drain (here: another owner holds the sidecar)
+/// fills the 64-slot queue. Autocommit writes at `synchronous=FULL` used to
+/// fail with "database is busy" from then on, and so did every later statement
+/// on the connection: the worker runs on the caller's runtime, and a refused
+/// caller never yields to it. Stock never reports BUSY to a lone connection.
+/// A full queue now defers admission; the next admission covers the gap.
+#[test]
+fn full_repair_queue_defers_admission_instead_of_refusing_writes() {
+    run_with_repair_pool(async {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("full-queue.db");
+        let conn = open(&db).await;
+        conn.execute("CREATE TABLE t(value INTEGER);").await.unwrap();
+        wait_for_last_group(&db).await;
+        let sidecar = wal_fec_path_for_wal(&wal_path(&db));
+        let guard = hold_sidecar_guard(&sidecar).await;
+        for value in 1..=150 {
+            if let Err(error) = conn.execute(&format!("INSERT INTO t VALUES ({value});")).await {
+                panic!("autocommit INSERT #{value} with a full repair queue: {error:?}");
+            }
+        }
+        assert_eq!(conn.query("SELECT COUNT(*) FROM t;").await.unwrap()[0].values(), &[SqliteValue::Integer(150)]);
+        drop(guard);
+        // Close drains the queued work; restart catch-up admits the deferred
+        // frames, and the next commit is repaired with them.
+        conn.close_without_checkpoint().await.unwrap();
+        let conn = open(&db).await;
+        conn.execute("INSERT INTO t VALUES (151);").await.unwrap();
+        wait_for_last_group(&db).await;
+        conn.close_without_checkpoint().await.unwrap();
+        let scan = scan_wal_fec(&sidecar).unwrap();
+        assert!(!scan.truncated_tail);
+        assert!(scan.groups.windows(2).all(|pair| pair[0].meta.end_frame_no < pair[1].meta.start_frame_no));
+        let stock = rusqlite::Connection::open(&db).unwrap();
+        assert_eq!(stock.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0)).unwrap(), "ok");
+        assert_eq!(stock.query_row("SELECT SUM(value) FROM t", [], |row| row.get::<_, i64>(0)).unwrap(), 151 * 152 / 2);
+    });
+}
+
 #[test]
 fn checkpoint_rejects_late_generation_and_next_commit_is_repairable() {
     run_with_repair_pool(async {
@@ -492,8 +531,13 @@ fn real_commit_overhead_and_hundred_commit_catch_up() {
             elapsed.push(start.elapsed());
             conn.close_without_checkpoint().await.unwrap();
             if budget != 0 {
+                // Commits that met a full repair queue were admitted with a
+                // later commit or by restart catch-up, so groups can span
+                // several commits. Every durable frame must still be covered.
+                let conn = open(&db).await;
+                wait_for_last_group(&db).await;
+                conn.close_without_checkpoint().await.unwrap();
                 let scan = scan_wal_fec(&wal_fec_path_for_wal(&wal_path(&db))).unwrap();
-                assert!(scan.groups.len() >= 100);
                 assert!(!scan.truncated_tail);
             }
         }
