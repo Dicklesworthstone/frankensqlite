@@ -105,6 +105,64 @@ fn real_commit_returns_while_sidecar_is_busy_then_close_drains() {
     });
 }
 
+/// bd-sid3o: the repair worker is a task on the caller's runtime. A caller
+/// that runs each statement under its own `block_on` on a current-thread
+/// runtime and then blocks (the shell reading stdin, `*_sync` wrappers) polled
+/// it only when a statement happened to pend: repair lagged by a full queue
+/// (~64 commits) and made no progress at all while the caller was idle.
+/// Statement entry now yields to a worker with queued work, which hands the
+/// next range to the blocking pool, so coverage keeps up between statements.
+#[test]
+fn repair_keeps_up_with_a_caller_that_blocks_between_statements() {
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .blocking_threads(1, 2).build().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("idle-caller.db");
+    let conn = runtime.block_on(open(&db));
+    runtime.block_on(conn.execute("CREATE TABLE t(value INTEGER);")).unwrap();
+    for value in 1..=200 {
+        runtime.block_on(conn.execute(&format!("INSERT INTO t VALUES ({value});"))).unwrap();
+    }
+    // The caller is now idle: nothing polls the runtime. Repair already
+    // handed to the blocking pool finishes; nothing else can.
+    let wal = wal_path(&db);
+    let sidecar = wal_fec_path_for_wal(&wal);
+    let bytes = fs::read(&wal).unwrap();
+    let header = WalHeader::from_bytes(&bytes).unwrap();
+    let last = u32::try_from((bytes.len() - 32) / (24 + header.page_size as usize)).unwrap();
+    let covered = || {
+        scan_wal_fec(&sidecar).unwrap().groups.iter()
+            .filter(|group| (group.meta.wal_salt1, group.meta.wal_salt2) == (header.salts.salt1, header.salts.salt2))
+            .map(|group| group.meta.end_frame_no)
+            .max()
+            .unwrap_or(0)
+    };
+    // Each autocommit INSERT writes a frame or two; allow the last few commits.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while last - covered() > 8 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        last - covered() <= 8,
+        "repair stalled while the caller was idle: frames covered through {} of {last}",
+        covered()
+    );
+    runtime.block_on(conn.close_without_checkpoint()).unwrap();
+    // Restart catch-up covers whatever close left unadmitted.
+    runtime.block_on(async {
+        let conn = open(&db).await;
+        conn.execute("INSERT INTO t VALUES (201);").await.unwrap();
+        wait_for_last_group(&db).await;
+        conn.close_without_checkpoint().await.unwrap();
+    });
+    let scan = scan_wal_fec(&sidecar).unwrap();
+    assert!(!scan.truncated_tail);
+    assert!(scan.groups.windows(2).all(|pair| pair[0].meta.end_frame_no < pair[1].meta.start_frame_no));
+    let stock = rusqlite::Connection::open(&db).unwrap();
+    assert_eq!(stock.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0)).unwrap(), "ok");
+    assert_eq!(stock.query_row("SELECT SUM(value) FROM t", [], |row| row.get::<_, i64>(0)).unwrap(), 201 * 202 / 2);
+}
+
 /// A repair worker that cannot drain (here: another owner holds the sidecar)
 /// fills the 64-slot queue. Autocommit writes at `synchronous=FULL` used to
 /// fail with "database is busy" from then on, and so did every later statement

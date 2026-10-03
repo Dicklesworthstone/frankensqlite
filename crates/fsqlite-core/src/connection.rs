@@ -27542,6 +27542,9 @@ impl Connection {
     /// silently running inside a half-rolled-back transaction; the error
     /// surfaces to the caller of whichever statement discharged it.
     async fn settle_pending_transaction_cleanup(&self) -> Result<()> {
+        // Every public entry point passes here first, holding no guard.
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+        self.yield_to_wal_fec_worker().await;
         if !self.pending_transaction_cleanup.get() {
             return Ok(());
         }
@@ -27815,6 +27818,10 @@ impl Connection {
             // size (and be copied with) this block on every prepared execution.
             if self.pending_transaction_cleanup.get() {
                 Box::pin(self.settle_pending_transaction_cleanup()).await?;
+            } else {
+                // Settlement yields to the WAL-FEC worker itself (bd-sid3o).
+                #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+                self.yield_to_wal_fec_worker().await;
             }
             self.execute_prepared_autocommit_with_conflict_retry(stmt, params)
                 .await
@@ -79733,6 +79740,27 @@ impl Connection {
     async fn apply_current_journal_mode_to_pager(&self) -> Result<()> {
         let journal_mode = self.pragma_state.borrow().journal_mode.clone();
         self.apply_journal_mode_to_pager(&journal_mode).await
+    }
+
+    /// Let the WAL-FEC repair worker run once when it has queued work.
+    ///
+    /// The worker is a task on the caller's runtime. A caller that drives each
+    /// statement with `block_on` on a current-thread runtime and then blocks
+    /// (the shell reading stdin) polls it only when a statement happens to
+    /// pend, so repair lagged by a full queue and made no progress while the
+    /// caller was idle (bd-sid3o). One yield lets the worker hand the next
+    /// range to the blocking pool, where encoding and the sidecar append run
+    /// whether or not the caller polls again.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    async fn yield_to_wal_fec_worker(&self) {
+        let pending = self
+            .wal_fec_pipeline
+            .borrow()
+            .as_ref()
+            .is_some_and(fsqlite_wal::wal_fec::WalFecRepairPipeline::has_pending_work);
+        if pending {
+            asupersync::runtime::yield_now().await;
+        }
     }
 
     #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]

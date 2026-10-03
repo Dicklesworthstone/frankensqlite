@@ -1809,6 +1809,8 @@ struct WalFecRepairWorkerState {
     canceled_jobs: Arc<AtomicUsize>,
     worker_failure: Arc<Mutex<Option<String>>>,
     diagnostics: Arc<WalFecRepairDiagnostics>,
+    /// Sidecar group map carried between committed ranges (bd-sid3o).
+    sidecar_cache: Arc<Mutex<Option<CommittedRangeSidecarCache>>>,
 }
 
 impl WalFecRepairWorkerState {
@@ -1937,6 +1939,7 @@ impl WalFecRepairPipeline {
             canceled_jobs: Arc::clone(&canceled_jobs),
             worker_failure: Arc::clone(&worker_failure),
             diagnostics: Arc::clone(&diagnostics),
+            sidecar_cache: Arc::new(Mutex::new(None)),
         };
 
         // bd-gwoi0: `create_child_for_spawn` is the spawn-correct primitive for a
@@ -2057,6 +2060,12 @@ impl WalFecRepairPipeline {
             }
             yield_now().await;
         }
+    }
+
+    /// Whether queued or in-flight repair work is waiting on the worker.
+    #[must_use]
+    pub fn has_pending_work(&self) -> bool {
+        self.pending_jobs.load(Ordering::Acquire) != 0
     }
 
     /// Read current counters.
@@ -2242,6 +2251,7 @@ async fn run_repair_pipeline_worker<G: Send + Sync + 'static>(
                     let work_region_task = Arc::clone(&region_task);
                     let work_for_attempt = Arc::clone(&work);
                     let diagnostics = Arc::clone(&state.diagnostics);
+                    let sidecar_cache = Arc::clone(&state.sidecar_cache);
                     let outcome = spawn_blocking(move || {
                         // Retain region accounting even if cancellation drops
                         // the async waiter before this closure exits.
@@ -2263,6 +2273,7 @@ async fn run_repair_pipeline_worker<G: Send + Sync + 'static>(
                                         &cancel_flag_for_work,
                                         per_symbol_delay,
                                         &diagnostics,
+                                        &sidecar_cache,
                                     )
                                 }
                                 WalFecPipelineMessage::Shutdown => unreachable!(),
@@ -2458,6 +2469,7 @@ fn process_committed_wal_range(
     cancel_flag: &AtomicBool,
     per_symbol_delay: Duration,
     diagnostics: &WalFecRepairDiagnostics,
+    sidecar_cache: &Mutex<Option<CommittedRangeSidecarCache>>,
 ) -> Result<WalFecWorkOutcome> {
     if range.end_frame_no == 0 {
         return reclaim_retired_fec_on_open(range, cx, cancel_flag);
@@ -2486,7 +2498,10 @@ fn process_committed_wal_range(
     if !wal_fec_generation_matches(&range.wal_path, range.header)? {
         return Ok(WalFecWorkOutcome::Canceled);
     }
-    let mut sidecar = CommittedRangeSidecar::load(range)?;
+    // Taken, not borrowed: any early return (error, cancellation) leaves the
+    // cache empty, so the next range reloads the whole file.
+    let cached = lock_unpoisoned(sidecar_cache).take();
+    let mut sidecar = CommittedRangeSidecar::load(range, cached)?;
     let page_size =
         usize::try_from(range.header.page_size).map_err(|_| FrankenError::DatabaseFull)?;
     let frame_size = crate::WAL_FRAME_HEADER_SIZE + page_size;
@@ -2592,6 +2607,7 @@ fn process_committed_wal_range(
         });
     }
     sidecar.sync()?;
+    *lock_unpoisoned(sidecar_cache) = sidecar.into_cache()?;
     Ok(WalFecWorkOutcome::Completed)
 }
 
@@ -2642,15 +2658,51 @@ fn reclaim_retired_fec_on_open(
     Ok(WalFecWorkOutcome::Completed)
 }
 
+/// The sidecar group map a worker keeps between committed ranges.
+///
+/// Loading used to read, parse and validate the whole sidecar for every range,
+/// so a session of N commits did O(N^2) sidecar I/O (2000 `synchronous=FULL`
+/// autocommits: a 17 MB sidecar re-read per commit, 28 s CPU, bd-sid3o). The
+/// map is reused while the file keeps its identity and only grew: every other
+/// mutation (retirement, tail repair, header migration) replaces the file
+/// through a rename, and every mutation holds the sidecar guard, so the same
+/// inode with a longer length means records were only appended. The appended
+/// suffix is scanned; anything else reloads the whole file.
+#[derive(Debug)]
+struct CommittedRangeSidecarCache {
+    path: PathBuf,
+    salts: WalSalts,
+    identity: (u64, u64),
+    len: u64,
+    present: HashMap<WalFecGroupId, WalFecGroupMeta>,
+}
+
+/// `(device, inode)` of the sidecar. Without one (non-Unix) nothing is reused.
+#[cfg_attr(unix, allow(clippy::unnecessary_wraps))] // `None` off Unix.
+fn wal_fec_sidecar_identity(metadata: &fs::Metadata) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some((metadata.dev(), metadata.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
+    }
+}
+
 /// One committed range's view of the sidecar, taken under the sidecar guard.
 ///
 /// The sidecar is read and validated once per range. Catch-up used to re-read,
 /// re-parse and re-validate the whole sidecar for every commit group —
 /// quadratic at open (a 1500-commit WAL took ~30 s to reopen) and on every
 /// commit of a long session — and encoded repair symbols for groups it then
-/// found already present.
+/// found already present. Across ranges the worker carries the group map in a
+/// [`CommittedRangeSidecarCache`].
 struct CommittedRangeSidecar {
     path: PathBuf,
+    salts: WalSalts,
     /// Metadata of the durable groups of the current WAL generation.
     present: HashMap<WalFecGroupId, WalFecGroupMeta>,
     /// Whether the sidecar did not exist or was empty (the first sync also
@@ -2667,8 +2719,68 @@ impl CommittedRangeSidecar {
     /// unusable suffix or retired generations are replaced atomically now,
     /// preserving the configuration header and every complete validated group,
     /// so later groups only append.
-    fn load(range: &WalFecCommittedRange) -> Result<Self> {
+    fn load(
+        range: &WalFecCommittedRange,
+        cached: Option<CommittedRangeSidecarCache>,
+    ) -> Result<Self> {
         let path = wal_fec_path_for_wal(&range.wal_path);
+        if let Some(cached) = cached
+            && cached.path == path
+            && cached.salts == range.header.salts
+            && let Some(sidecar) = Self::extend_cached(cached)?
+        {
+            return Ok(sidecar);
+        }
+        Self::load_full(range, path)
+    }
+
+    /// Reuse a cached group map if the sidecar only grew since it was taken,
+    /// scanning just the appended records. `None` means reload the whole file.
+    fn extend_cached(cached: CommittedRangeSidecarCache) -> Result<Option<Self>> {
+        let metadata = match fs::metadata(&cached.path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err.into()),
+        };
+        let len = metadata.len();
+        if wal_fec_sidecar_identity(&metadata) != Some(cached.identity) || len < cached.len {
+            return Ok(None);
+        }
+        let mut present = cached.present;
+        if len > cached.len {
+            let mut file = fs::File::open(&cached.path)?;
+            file.seek(SeekFrom::Start(cached.len))?;
+            let mut suffix = Vec::new();
+            file.read_to_end(&mut suffix)?;
+            let scan = scan_wal_fec_groups_from(&cached.path, &suffix, 0)?;
+            // A torn append or another generation's records need the full
+            // load, which rewrites the file around them.
+            if scan.truncated_tail
+                || scan.groups.iter().any(|group| {
+                    (group.meta.wal_salt1, group.meta.wal_salt2)
+                        != (cached.salts.salt1, cached.salts.salt2)
+                })
+            {
+                return Ok(None);
+            }
+            present.extend(
+                scan.groups
+                    .into_iter()
+                    .map(|group| (group.meta.group_id(), group.meta)),
+            );
+        }
+        Ok(Some(Self {
+            path: cached.path,
+            salts: cached.salts,
+            present,
+            created: len == 0,
+            output: None,
+        }))
+    }
+
+    fn load_full(range: &WalFecCommittedRange, path: PathBuf) -> Result<Self> {
+        #[cfg(test)]
+        tests::FULL_SIDECAR_LOADS.with(|loads| loads.set(loads.get() + 1));
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
@@ -2696,6 +2808,7 @@ impl CommittedRangeSidecar {
         }
         Ok(Self {
             path,
+            salts: range.header.salts,
             present: scan
                 .groups
                 .into_iter()
@@ -2704,6 +2817,27 @@ impl CommittedRangeSidecar {
             created: bytes.is_empty(),
             output: None,
         })
+    }
+
+    /// The group map to carry to the next range, taken after [`Self::sync`]
+    /// while the caller still holds the sidecar guard, so the recorded length
+    /// is exactly the records this map describes.
+    fn into_cache(self) -> Result<Option<CommittedRangeSidecarCache>> {
+        debug_assert!(self.output.is_none(), "into_cache follows sync");
+        let metadata = match fs::metadata(&self.path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err.into()),
+        };
+        Ok(
+            wal_fec_sidecar_identity(&metadata).map(|identity| CommittedRangeSidecarCache {
+                path: self.path,
+                salts: self.salts,
+                identity,
+                len: metadata.len(),
+                present: self.present,
+            }),
+        )
     }
 
     /// Whether an identical group is already durable. A group with the same
@@ -3321,7 +3455,17 @@ pub fn scan_wal_fec(sidecar_path: &Path) -> Result<WalFecScanResult> {
 }
 
 fn scan_wal_fec_bytes(sidecar_path: &Path, bytes: &[u8]) -> Result<WalFecScanResult> {
-    let mut cursor = scan_offset_after_optional_pragma_header(bytes)?;
+    let cursor = scan_offset_after_optional_pragma_header(bytes)?;
+    scan_wal_fec_groups_from(sidecar_path, bytes, cursor)
+}
+
+/// Parse the group records in `bytes[cursor..]`. Group records carry no
+/// header, so this also scans a suffix appended after an already-known prefix.
+fn scan_wal_fec_groups_from(
+    sidecar_path: &Path,
+    bytes: &[u8],
+    mut cursor: usize,
+) -> Result<WalFecScanResult> {
     let mut groups = Vec::new();
     let mut truncated_tail = false;
 
@@ -4395,6 +4539,12 @@ mod tests {
     use std::sync::{Mutex, OnceLock};
 
     use tempfile::tempdir;
+
+    std::thread_local! {
+        /// Whole-sidecar loads by committed-range processing on this thread.
+        pub(super) static FULL_SIDECAR_LOADS: std::cell::Cell<usize> =
+            const { std::cell::Cell::new(0) };
+    }
 
     fn telemetry_test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -5911,5 +6061,151 @@ mod tests {
         assert_eq!(proof.recovered_frame_nos.len(), 4);
         let dbg = format!("{proof:?}");
         assert!(dbg.contains("WalFecDecodeProof"));
+    }
+
+    /// bd-sid3o: a session of N commits loaded and validated the whole sidecar
+    /// once per commit (quadratic). The worker now carries the group map
+    /// between ranges and reloads only when the file was replaced or its
+    /// appended suffix is unusable.
+    #[cfg(all(unix, feature = "native"))]
+    #[test]
+    fn test_committed_ranges_reuse_the_sidecar_group_map() {
+        use crate::test_support::FutureResultTestExt as _;
+        use crate::wal::WalFile;
+        use fsqlite_types::flags::{SyncFlags, VfsOpenFlags};
+        use fsqlite_vfs::traits::Vfs as _;
+
+        let dir = tempdir().expect("tempdir");
+        let wal_path = dir.path().join("reuse.db-wal");
+        let sidecar_path = wal_fec_path_for_wal(&wal_path);
+        let cx = Cx::default();
+        let vfs = fsqlite_vfs::UnixVfs::new();
+        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
+        let (file, _) = vfs.open(&cx, Some(&wal_path), flags).expect("open WAL");
+        let salts = WalSalts {
+            salt1: 0x5151_D30D,
+            salt2: 0x0BAD_F00D,
+        };
+        let mut wal = WalFile::create(&cx, file, 4096, 0, salts).expect("create WAL");
+        let commit = |wal: &mut WalFile<_>, page: u32| {
+            let previous_checksum = wal.running_checksum();
+            let data = vec![u8::try_from(page % 251).unwrap(); 4096];
+            wal.append_frame(&cx, page, &data, page)
+                .expect("append commit frame");
+            wal.sync(&cx, SyncFlags::NORMAL).expect("sync WAL");
+            WalFecCommittedRange {
+                wal_path: wal_path.clone(),
+                header: *wal.header(),
+                start_frame_no: page,
+                end_frame_no: page,
+                previous_checksum,
+                end_checksum: wal.running_checksum(),
+                repair_symbols: 2,
+            }
+        };
+        let diagnostics = WalFecRepairDiagnostics {
+            pipeline_id: 0,
+            queue_capacity: 1,
+            rejected_admissions: AtomicUsize::new(0),
+            processed_groups: AtomicUsize::new(0),
+        };
+        let cancel = AtomicBool::new(false);
+        let process = |range: &WalFecCommittedRange,
+                       cache: &Mutex<Option<CommittedRangeSidecarCache>>| {
+            let outcome = process_committed_wal_range(
+                range,
+                &cx,
+                &cancel,
+                Duration::ZERO,
+                &diagnostics,
+                cache,
+            )
+            .expect("process committed range");
+            assert_eq!(outcome, WalFecWorkOutcome::Completed);
+        };
+        let loads = || FULL_SIDECAR_LOADS.with(std::cell::Cell::get);
+        let groups = || {
+            scan_wal_fec(&sidecar_path)
+                .expect("scan sidecar")
+                .groups
+                .len()
+        };
+
+        // Twenty commits through one worker: one whole-file load in total.
+        let cache = Mutex::new(None);
+        let before = loads();
+        for page in 1..=20 {
+            let range = commit(&mut wal, page);
+            process(&range, &cache);
+        }
+        assert_eq!(
+            loads() - before,
+            1,
+            "the group map is carried between ranges"
+        );
+        assert_eq!(groups(), 20);
+
+        // Another worker appends a group: this worker scans only the suffix,
+        // and then knows that group (re-processing its range appends nothing).
+        let peer_range = commit(&mut wal, 21);
+        process(&peer_range, &Mutex::new(None));
+        let before = loads();
+        process(&peer_range, &cache);
+        assert_eq!(
+            loads() - before,
+            0,
+            "an appended suffix is scanned, not the file"
+        );
+        assert_eq!(groups(), 21, "the peer's group is recognised as durable");
+
+        // Replacement (retirement, tail repair, header migration) renames a new
+        // file in place: the cached map is discarded.
+        let bytes = fs::read(&sidecar_path).unwrap();
+        let permissions = fs::metadata(&sidecar_path).unwrap().permissions();
+        replace_wal_fec_sidecar(&sidecar_path, permissions, |output| {
+            output.write_all(&bytes)?;
+            Ok(())
+        })
+        .unwrap();
+        let before = loads();
+        let range = commit(&mut wal, 22);
+        process(&range, &cache);
+        assert_eq!(loads() - before, 1, "a replaced sidecar is reloaded");
+        assert_eq!(groups(), 22);
+
+        // A torn append is repaired by the whole-file load, not trusted.
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&sidecar_path)
+            .unwrap()
+            .write_all(&[0xFF, 0x00, 0x00])
+            .unwrap();
+        let before = loads();
+        let range = commit(&mut wal, 23);
+        process(&range, &cache);
+        assert_eq!(
+            loads() - before,
+            1,
+            "a torn suffix forces the whole-file load"
+        );
+        let scan = scan_wal_fec(&sidecar_path).unwrap();
+        assert!(
+            !scan.truncated_tail,
+            "the whole-file load replaced the torn tail"
+        );
+        assert_eq!(scan.groups.len(), 23);
+
+        // A failed or canceled range leaves no cache behind.
+        let range = commit(&mut wal, 24);
+        cancel.store(true, Ordering::SeqCst);
+        let outcome =
+            process_committed_wal_range(&range, &cx, &cancel, Duration::ZERO, &diagnostics, &cache)
+                .unwrap();
+        assert_eq!(outcome, WalFecWorkOutcome::Canceled);
+        cancel.store(false, Ordering::SeqCst);
+        let before = loads();
+        process(&range, &cache);
+        assert!(loads() - before <= 1);
+        assert_eq!(groups(), 24);
     }
 }
