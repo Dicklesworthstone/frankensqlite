@@ -10,6 +10,10 @@
 //!   AFTER INSERT/UPDATE triggers and their WHEN clauses. fsqlite used to show
 //!   `INSERT ... VALUES('1')` into an INTEGER column as the text '1', and a
 //!   `WHEN NEW.k = 1` trigger never fired.
+//! - bd-5pt42: a multi-row DELETE runs each row's BEFORE trigger, delete and
+//!   AFTER trigger before the next row's, so trigger bodies observe the rows
+//!   already deleted. fsqlite used to fire every BEFORE trigger, then delete
+//!   every row, then fire every AFTER trigger.
 
 use fsqlite_core::connection::Connection;
 use fsqlite_types::SqliteValue;
@@ -162,5 +166,71 @@ fn trigger_new_values_carry_column_affinity() {
         }
         compare(&frank, &stock, "SELECT w, v, ty FROM log ORDER BY rowid").await;
         compare(&frank, &stock, "SELECT k, typeof(k), s, typeof(s) FROM t ORDER BY rowid").await;
+    });
+}
+
+#[test]
+fn multi_row_delete_interleaves_before_and_after_triggers_per_row() {
+    for_each_backing(|frank, stock| async move {
+        for sql in [
+            "CREATE TABLE log(w, k, c, m)",
+            // INTEGER PRIMARY KEY table, BEFORE and AFTER triggers.
+            "CREATE TABLE t(k INTEGER PRIMARY KEY, v)",
+            "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')",
+            "CREATE TRIGGER bd BEFORE DELETE ON t BEGIN \
+               INSERT INTO log VALUES('bd', OLD.k, (SELECT count(*) FROM t), \
+                                      (SELECT max(k) FROM t)); END",
+            "CREATE TRIGGER ad AFTER DELETE ON t BEGIN \
+               INSERT INTO log VALUES('ad', OLD.k, (SELECT count(*) FROM t), \
+                                      (SELECT max(k) FROM t)); END",
+            "DELETE FROM t WHERE k >= 2",
+            // Rowid table with a BEFORE trigger only, deleting every row.
+            "CREATE TABLE u(k, v)",
+            "INSERT INTO u VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+            "CREATE TRIGGER ubd BEFORE DELETE ON u BEGIN \
+               INSERT INTO log VALUES('ubd', OLD.k, (SELECT count(*) FROM u), \
+                                      (SELECT group_concat(k) FROM u)); END",
+            "DELETE FROM u",
+            // WITHOUT ROWID table.
+            "CREATE TABLE w(k TEXT PRIMARY KEY, v) WITHOUT ROWID",
+            "INSERT INTO w VALUES ('a', 1), ('b', 2), ('c', 3)",
+            "CREATE TRIGGER wbd BEFORE DELETE ON w BEGIN \
+               INSERT INTO log VALUES('wbd', OLD.k, (SELECT count(*) FROM w), \
+                                      (SELECT group_concat(k) FROM w)); END",
+            "DELETE FROM w WHERE v > 1",
+            // A BEFORE trigger deleting a later target row: that row is skipped
+            // (no second delete, no triggers), and changes() counts only the
+            // outer statement's own deletes.
+            "CREATE TABLE s(k INTEGER PRIMARY KEY)",
+            "INSERT INTO s VALUES (1), (2), (3), (4)",
+            "CREATE TRIGGER sbd BEFORE DELETE ON s BEGIN \
+               INSERT INTO log VALUES('sbd', OLD.k, (SELECT count(*) FROM s), NULL); \
+               DELETE FROM s WHERE k = OLD.k + 1; END",
+            "CREATE TRIGGER sad AFTER DELETE ON s BEGIN \
+               INSERT INTO log VALUES('sad', OLD.k, (SELECT count(*) FROM s), NULL); END",
+            "DELETE FROM s WHERE k IN (1, 2, 3)",
+        ] {
+            run_both(&frank, &stock, sql).await;
+        }
+        compare(&frank, &stock, "SELECT changes()").await;
+        compare(&frank, &stock, "SELECT w, k, c, m FROM log ORDER BY rowid").await;
+        for table in ["t", "u", "w", "s"] {
+            compare(&frank, &stock, &format!("SELECT * FROM {table} ORDER BY k")).await;
+        }
+        // RETURNING across the row-by-row replay, and RAISE(IGNORE) skipping one row.
+        for sql in [
+            "CREATE TABLE r(k INTEGER PRIMARY KEY, v)",
+            "INSERT INTO r VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')",
+            "CREATE TRIGGER rbd BEFORE DELETE ON r WHEN OLD.k = 2 BEGIN \
+               SELECT RAISE(IGNORE); END",
+            "CREATE TRIGGER rad AFTER DELETE ON r BEGIN \
+               INSERT INTO log VALUES('rad', OLD.k, (SELECT count(*) FROM r), NULL); END",
+        ] {
+            run_both(&frank, &stock, sql).await;
+        }
+        compare(&frank, &stock, "DELETE FROM r WHERE k > 0 RETURNING k, v").await;
+        compare(&frank, &stock, "SELECT changes()").await;
+        compare(&frank, &stock, "SELECT * FROM r ORDER BY k").await;
+        compare(&frank, &stock, "SELECT w, k, c, m FROM log WHERE w = 'rad' ORDER BY rowid").await;
     });
 }

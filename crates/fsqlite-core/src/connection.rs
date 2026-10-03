@@ -39878,7 +39878,11 @@ impl Connection {
                         || self.fk_cascade_propagation_enabled());
                 if needs_row_by_row_replay
                     && let Some((locator_columns, locator_rows)) = self
-                        .materialize_update_replay_locators(&effective_update, params)
+                        .materialize_dml_replay_locators(
+                            &effective_update.table,
+                            effective_update.where_clause.as_ref(),
+                            params,
+                        )
                         .await?
                     && locator_rows.len() > 1
                 {
@@ -39886,8 +39890,8 @@ impl Connection {
                         "update",
                         "update_row_by_row_trigger_or_fk_fallback",
                     )?;
-                    return Box::pin(self.execute_update_row_by_row(
-                        &effective_update,
+                    return Box::pin(self.execute_dml_row_by_row(
+                        DmlRowReplay::Update(&effective_update),
                         params,
                         &locator_columns,
                         &locator_rows,
@@ -40234,6 +40238,39 @@ impl Connection {
                     fsqlite_ast::TriggerTiming::After,
                     &delete_event,
                 );
+                // bd-5pt42: stock SQLite deletes a multi-row target one row at a
+                // time — row N's BEFORE triggers, delete, FK actions and AFTER
+                // triggers all run before row N+1's BEFORE triggers, so each
+                // trigger body observes the rows already deleted. Replay each
+                // frozen row as its own single-row DELETE to get that order.
+                if (has_before_delete || has_after_delete)
+                    && !self.has_live_vtab_instance(table_name)
+                    && self.delete_trigger_order_is_observable(
+                        table_name,
+                        has_before_delete,
+                        has_after_delete,
+                    )
+                    && let Some((locator_columns, locator_rows)) = self
+                        .materialize_dml_replay_locators(
+                            &effective_delete.table,
+                            effective_delete.where_clause.as_ref(),
+                            params,
+                        )
+                        .await?
+                    && locator_rows.len() > 1
+                {
+                    self.log_mem_execution_fallback(
+                        "delete",
+                        "delete_row_by_row_trigger_fallback",
+                    )?;
+                    return Box::pin(self.execute_dml_row_by_row(
+                        DmlRowReplay::Delete(&effective_delete),
+                        params,
+                        &locator_columns,
+                        &locator_rows,
+                    ))
+                    .await;
+                }
                 let mut trigger_old_rows = if has_before_delete || has_after_delete {
                     self.collect_delete_trigger_rows(&effective_delete, params)
                         .await?
@@ -40423,8 +40460,10 @@ impl Connection {
                     Box::pin(self.execute_fk_delete_action(action)).await?;
                 }
 
-                // Phase 5G.3: Fire AFTER DELETE triggers.
-                if has_after_delete {
+                // Phase 5G.3: Fire AFTER DELETE triggers. A lone target row that
+                // its own BEFORE trigger already removed is not deleted again
+                // and, as in stock, fires no AFTER trigger.
+                if has_after_delete && !(affected == 0 && trigger_old_rows.len() == 1) {
                     for (old_rowid, old_values) in &trigger_old_rows {
                         Box::pin(self.fire_after_triggers(
                             table_name,
@@ -51619,16 +51658,18 @@ impl Connection {
         ))
     }
 
-    /// Freeze stable row locators for a multi-row UPDATE before its first
-    /// mutation. Rowid tables use an unshadowed hidden rowid alias (or INTEGER
-    /// PRIMARY KEY); WITHOUT ROWID tables use the complete declared primary key.
-    async fn materialize_update_replay_locators(
+    /// Freeze stable row locators for a multi-row UPDATE or DELETE before its
+    /// first mutation. Rowid tables use an unshadowed hidden rowid alias (or
+    /// INTEGER PRIMARY KEY); WITHOUT ROWID tables use the complete declared
+    /// primary key.
+    async fn materialize_dml_replay_locators(
         &self,
-        update: &fsqlite_ast::UpdateStatement,
+        table_ref: &fsqlite_ast::QualifiedTableRef,
+        where_clause: Option<&Expr>,
         params: Option<&[SqliteValue]>,
     ) -> Result<Option<(Vec<String>, Vec<Vec<SqliteValue>>)>> {
-        let table_name = &update.table.name.name;
-        let targets_shadowed_main = self.targets_shadowed_main(&update.table.name);
+        let table_name = &table_ref.name.name;
+        let targets_shadowed_main = self.targets_shadowed_main(&table_ref.name);
         let visible_schema = self.schema.borrow();
         let shadowed_schema = self.shadowed_main_tables.borrow();
         let table = if targets_shadowed_main {
@@ -51674,17 +51715,12 @@ impl Connection {
         let projections = locator_columns
             .iter()
             .map(|column| ResultColumn::Expr {
-                expr: Self::build_limit_scope_projection_expr(&update.table, column),
+                expr: Self::build_limit_scope_projection_expr(table_ref, column),
                 alias: None,
             })
             .collect();
-        let select = Self::build_single_table_select(
-            &update.table,
-            projections,
-            update.where_clause.as_ref(),
-            &[],
-            None,
-        );
+        let select =
+            Self::build_single_table_select(table_ref, projections, where_clause, &[], None);
         let locator_rows = self
             .execute_statement(&Statement::Select(select), params)
             .await?
@@ -51727,15 +51763,26 @@ impl Connection {
         }))
     }
 
-    async fn execute_update_row_by_row(
+    /// Replay a multi-row UPDATE or DELETE one row at a time, each restricted
+    /// to the row's frozen locator, so every row's BEFORE triggers, change,
+    /// FK actions and AFTER triggers complete before the next row starts — the
+    /// order stock SQLite uses. A row a previous row's trigger already removed
+    /// matches nothing and fires nothing.
+    async fn execute_dml_row_by_row(
         &self,
-        update: &fsqlite_ast::UpdateStatement,
+        statement: DmlRowReplay<'_>,
         params: Option<&[SqliteValue]>,
         locator_columns: &[String],
         locator_rows: &[Vec<SqliteValue>],
     ) -> Result<Vec<Row>> {
-        let preserve_constraint_failure_rows =
-            update.or_conflict == Some(fsqlite_ast::ConflictAction::Fail);
+        let (table_ref, preserve_constraint_failure_rows, kind) = match statement {
+            DmlRowReplay::Update(update) => (
+                &update.table,
+                update.or_conflict == Some(fsqlite_ast::ConflictAction::Fail),
+                "UPDATE",
+            ),
+            DmlRowReplay::Delete(delete) => (&delete.table, false, "DELETE"),
+        };
         let previous_total_changes = self.total_changes.get();
         let previous_last_insert_rowid = self.current_last_insert_rowid();
 
@@ -51743,18 +51790,31 @@ impl Connection {
             let mut statement_changes = 0usize;
             let mut returning_rows = Vec::new();
             for (row_index, locator_values) in locator_rows.iter().enumerate() {
-                let mut row_update = update.clone();
-                row_update.where_clause = Some(Self::build_update_replay_locator_filter(
-                    &row_update.table,
+                let locator = Self::build_update_replay_locator_filter(
+                    table_ref,
                     locator_columns,
                     locator_values,
-                )?);
-                row_update.order_by.clear();
-                row_update.limit = None;
+                )?;
+                let row_statement = match statement {
+                    DmlRowReplay::Update(update) => {
+                        let mut row_update = update.clone();
+                        row_update.where_clause = Some(locator);
+                        row_update.order_by.clear();
+                        row_update.limit = None;
+                        Statement::Update(row_update)
+                    }
+                    DmlRowReplay::Delete(delete) => {
+                        let mut row_delete = delete.clone();
+                        row_delete.where_clause = Some(locator);
+                        row_delete.order_by.clear();
+                        row_delete.limit = None;
+                        Statement::Delete(row_delete)
+                    }
+                };
 
                 match self
                     .execute_statement_impl_after_background_status(
-                        &Statement::Update(row_update),
+                        &row_statement,
                         params,
                         None,
                         false,
@@ -51791,12 +51851,13 @@ impl Connection {
                         }
                         tracing::debug!(
                             target: "fsqlite.statement",
-                            table = %update.table.name.name,
+                            table = %table_ref.name.name,
+                            statement = kind,
                             row_index,
                             locator_columns = ?locator_columns,
                             locator_values = ?locator_values,
                             error = %error,
-                            "row-replayed UPDATE failed"
+                            "row-replayed DML failed"
                         );
                         return Err(error);
                     }
@@ -69200,6 +69261,96 @@ impl Connection {
             trigger.table_name.eq_ignore_ascii_case(table_name)
                 && trigger.timing == timing
                 && trigger_event_matches(&trigger.event, event)
+        })
+    }
+
+    /// bd-5pt42: whether a multi-row DELETE on `table_name` must run row by row
+    /// (each row's BEFORE triggers, delete, FK actions and AFTER triggers
+    /// before the next row's) because the difference from firing every BEFORE
+    /// trigger, deleting every row, then firing every AFTER trigger could be
+    /// observed. The batched order is kept only when it is provably
+    /// indistinguishable, since a per-row replay costs a statement per row:
+    ///
+    /// - only one of BEFORE / AFTER DELETE triggers exists (with both, their
+    ///   side effects would interleave differently);
+    /// - the table is not an FK parent with actions to propagate;
+    /// - no trigger WHEN or body names the target table, a view, a virtual
+    ///   table, or a table that has triggers or foreign keys (any of which
+    ///   could read or react to the partially deleted table), and none uses
+    ///   `FAIL` (RAISE(FAIL) / OR FAIL keep the rows done so far) or reads
+    ///   `changes()` / `total_changes()`.
+    ///
+    /// The scan is over the triggers' tokens, so a column or alias spelled
+    /// like a table conservatively selects the row-by-row path.
+    fn delete_trigger_order_is_observable(
+        &self,
+        table_name: &str,
+        has_before: bool,
+        has_after: bool,
+    ) -> bool {
+        if has_before && has_after {
+            return true;
+        }
+        if self.fk_cascade_propagation_enabled() && self.table_is_foreign_key_parent(table_name) {
+            return true;
+        }
+        let delete_event = fsqlite_ast::TriggerEvent::Delete;
+        let mut trigger_text = String::new();
+        for trigger in self.triggers.borrow().iter().filter(|trigger| {
+            trigger.table_name.eq_ignore_ascii_case(table_name)
+                && trigger.timing != fsqlite_ast::TriggerTiming::InsteadOf
+                && trigger_event_matches(&trigger.event, &delete_event)
+        }) {
+            if let Some(when) = &trigger.when_clause {
+                trigger_text.push_str(&when.to_string());
+                trigger_text.push_str(" ; ");
+            }
+            for statement in &trigger.body {
+                trigger_text.push_str(&statement.to_string());
+                trigger_text.push_str(" ; ");
+            }
+        }
+        let schema = self.schema.borrow();
+        let shadowed = self.shadowed_main_tables.borrow();
+        let views = self.views.borrow();
+        let triggers = self.triggers.borrow();
+        Lexer::tokenize(&trigger_text).iter().any(|token| {
+            let name: &str = match &token.kind {
+                fsqlite_parser::TokenKind::Id(name)
+                | fsqlite_parser::TokenKind::QuotedId(name, _) => name,
+                _ => trigger_text
+                    .get(token.span.start as usize..token.span.end as usize)
+                    .unwrap_or_default(),
+            };
+            if name.is_empty() {
+                return false;
+            }
+            if name.eq_ignore_ascii_case(table_name)
+                || name.eq_ignore_ascii_case("fail")
+                || name.eq_ignore_ascii_case("changes")
+                || name.eq_ignore_ascii_case("total_changes")
+                || views.iter().any(|view| view.name.eq_ignore_ascii_case(name))
+                || self.table_name_is_virtual(name)
+            {
+                return true;
+            }
+            let lower = name.to_ascii_lowercase();
+            schema
+                .iter()
+                .filter(|table| table.name.eq_ignore_ascii_case(name))
+                .chain(shadowed.get(&lower))
+                .any(|table| {
+                    !table.foreign_keys.is_empty()
+                        || schema.iter().any(|other| {
+                            other
+                                .foreign_keys
+                                .iter()
+                                .any(|fk| fk.parent_table.eq_ignore_ascii_case(name))
+                        })
+                        || triggers
+                            .iter()
+                            .any(|trigger| trigger.table_name.eq_ignore_ascii_case(name))
+                })
         })
     }
 
@@ -148788,6 +148939,13 @@ struct DirectLiveVtabInsertProjection {
 enum InsertTarget {
     Column(usize),
     HiddenRowid,
+}
+
+/// The statement a row-by-row DML replay re-runs once per frozen row locator.
+#[derive(Clone, Copy)]
+enum DmlRowReplay<'a> {
+    Update(&'a fsqlite_ast::UpdateStatement),
+    Delete(&'a fsqlite_ast::DeleteStatement),
 }
 
 #[derive(Default)]
