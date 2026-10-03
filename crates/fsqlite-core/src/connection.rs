@@ -41354,6 +41354,27 @@ impl Connection {
             ));
         }
         let table_name = create.name.name.clone();
+        let target_is_temp = create.temporary
+            || create
+                .name
+                .schema
+                .as_deref()
+                .is_some_and(|s| s.eq_ignore_ascii_case("temp"));
+        if target_is_temp
+            || self
+                .temp_table_names
+                .borrow()
+                .contains(&table_name.to_ascii_lowercase())
+        {
+            return self
+                .execute_materialized_create_table_as_select_via_column_list(
+                    create,
+                    target_is_temp,
+                    col_infos,
+                    rows,
+                )
+                .await;
+        }
 
         if self.schema_index_of(&table_name).is_some() {
             if create.if_not_exists {
@@ -41416,6 +41437,98 @@ impl Connection {
         self.insert_sqlite_master_row("table", &table_name, &table_name, root_page, &create_sql)
             .await?;
         self.increment_schema_cookie().await?;
+        Ok(())
+    }
+
+    /// bd-y26jy: `CREATE TEMP TABLE x AS SELECT ...` (or `temp.x`) creates the
+    /// table in the connection-local temp namespace, as stock does, and a main
+    /// `CREATE TABLE x AS SELECT ...` may sit under a same-named temp table.
+    /// The column list inferred from the SELECT becomes an ordinary column-list
+    /// CREATE, so namespace registration, shadowing and the `sqlite_master`
+    /// listing are exactly those of `CREATE [TEMP] TABLE x(...)`; the rows are
+    /// then replayed into it. Change counters are left as they were.
+    async fn execute_materialized_create_table_as_select_via_column_list(
+        &self,
+        create: &fsqlite_ast::CreateTableStatement,
+        target_is_temp: bool,
+        col_infos: Vec<ColumnInfo>,
+        rows: &[Row],
+    ) -> Result<()> {
+        let table_name = create.name.name.clone();
+        let name_lc = table_name.to_ascii_lowercase();
+        let temp_exists = self.temp_table_names.borrow().contains(&name_lc);
+        let exists = if target_is_temp {
+            temp_exists
+        } else {
+            (!temp_exists
+                && self
+                    .schema
+                    .borrow()
+                    .iter()
+                    .any(|table| table.name.eq_ignore_ascii_case(&table_name)))
+                || self.shadowed_main_tables.borrow().contains_key(&name_lc)
+        };
+        let scope = if target_is_temp {
+            PragmaSchemaScope::Temp
+        } else {
+            PragmaSchemaScope::Main
+        };
+        let view_exists = self.view_index_for_scope(&table_name, scope).is_some();
+        if exists || view_exists {
+            if create.if_not_exists {
+                return Ok(());
+            }
+            let kind = if exists { "table" } else { "view" };
+            return Err(FrankenError::FunctionError(format!(
+                "{kind} {table_name} already exists",
+            )));
+        }
+        let create_sql = crate::compat_persist::build_create_table_sql(&TableSchema {
+            name: table_name.clone(),
+            root_page: 0,
+            columns: col_infos,
+            indexes: Vec::new(),
+            strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+        });
+        let Statement::CreateTable(mut column_create) = parse_single_statement(&create_sql)? else {
+            return Err(FrankenError::internal(
+                "CREATE TEMP TABLE ... AS SELECT column list did not parse as a CREATE TABLE",
+            ));
+        };
+        column_create.temporary = target_is_temp;
+        column_create.name.schema = None;
+        *self.pending_ddl_source.borrow_mut() = Some(create_sql);
+        Box::pin(self.execute_create_table(&column_create)).await?;
+        if !rows.is_empty() {
+            let Statement::Insert(insert) = parse_single_statement(&format!(
+                "INSERT INTO {}.{} VALUES (NULL)",
+                if target_is_temp { "temp" } else { "main" },
+                quote_identifier(&table_name)
+            ))?
+            else {
+                return Err(FrankenError::internal(
+                    "CREATE TABLE ... AS SELECT replay did not parse as an INSERT",
+                ));
+            };
+            let previous_changes = (
+                self.last_changes.get(),
+                self.total_changes.get(),
+                self.last_insert_rowid.get(),
+            );
+            let replayed = self
+                .execute_insert_select_materialized_rows_outcome(&insert, rows)
+                .await;
+            self.restore_change_tracking_state(
+                previous_changes.0,
+                previous_changes.1,
+                previous_changes.2,
+            );
+            replayed?;
+        }
         Ok(())
     }
 
