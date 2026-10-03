@@ -67553,13 +67553,30 @@ impl Connection {
             .map(|column| column.name.clone())
             .collect();
         let rowid_alias_col_idx = table_schema.columns.iter().position(|column| column.is_ipk);
+        // bd-oh34i: stock applies each column's affinity to the NEW record
+        // before any BEFORE or AFTER trigger reads it (sqlite3TableAffinity),
+        // so `INSERT ... VALUES('1')` into an INTEGER column shows NEW.k as the
+        // integer 1 in trigger bodies and WHEN clauses. OLD rows come from
+        // storage and already carry their stored classes.
+        let new_row = new_values.map(|values| {
+            values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| match table_schema.columns.get(index) {
+                    Some(column) => value
+                        .clone()
+                        .apply_affinity(Self::type_affinity_for_direct_insert(column.affinity)),
+                    None => value.clone(),
+                })
+                .collect()
+        });
         Ok(TriggerFrame {
             table_name: table_schema.name.clone(),
             trigger_name: String::new(), // set per-trigger in the fire loop
             column_names,
             rowid_alias_col_idx,
             old_row: old_values.map(ToOwned::to_owned),
-            new_row: new_values.map(ToOwned::to_owned),
+            new_row,
             old_rowid,
             new_rowid,
         })

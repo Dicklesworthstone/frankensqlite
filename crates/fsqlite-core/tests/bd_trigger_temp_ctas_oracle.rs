@@ -6,6 +6,10 @@
 //! - bd-y26jy: `CREATE TEMP TABLE x AS SELECT ...` (and `temp.x`) creates the
 //!   table in the temp schema, so `CREATE INDEX temp.i ON x(...)` works and
 //!   `temp.sqlite_master` lists it. fsqlite used to create a main table.
+//! - bd-oh34i: trigger NEW values carry the column's affinity, in BEFORE and
+//!   AFTER INSERT/UPDATE triggers and their WHEN clauses. fsqlite used to show
+//!   `INSERT ... VALUES('1')` into an INTEGER column as the text '1', and a
+//!   `WHEN NEW.k = 1` trigger never fired.
 
 use fsqlite_core::connection::Connection;
 use fsqlite_types::SqliteValue;
@@ -112,5 +116,51 @@ fn create_temp_table_as_select_lives_in_temp_schema() {
         let duplicate = "CREATE TEMP TABLE x AS SELECT 1";
         assert!(frank.execute(duplicate).await.is_err());
         assert!(stock.execute_batch(duplicate).is_err());
+    });
+}
+
+#[test]
+fn trigger_new_values_carry_column_affinity() {
+    for_each_backing(|frank, stock| async move {
+        for sql in [
+            "CREATE TABLE t(k INTEGER, r REAL, s TEXT, n NUMERIC, b BLOB, u)",
+            "CREATE TABLE log(w, v, ty)",
+            "CREATE TRIGGER bi BEFORE INSERT ON t BEGIN \
+               INSERT INTO log VALUES('bi-k', NEW.k, typeof(NEW.k)); \
+               INSERT INTO log VALUES('bi-r', NEW.r, typeof(NEW.r)); \
+               INSERT INTO log VALUES('bi-s', NEW.s, typeof(NEW.s)); \
+               INSERT INTO log VALUES('bi-n', NEW.n, typeof(NEW.n)); \
+               INSERT INTO log VALUES('bi-b', NEW.b, typeof(NEW.b)); \
+               INSERT INTO log VALUES('bi-u', NEW.u, typeof(NEW.u)); END",
+            "CREATE TRIGGER ai AFTER INSERT ON t BEGIN \
+               INSERT INTO log VALUES('ai-k', NEW.k, typeof(NEW.k)); \
+               INSERT INTO log VALUES('ai-r', NEW.r, typeof(NEW.r)); \
+               INSERT INTO log VALUES('ai-s', NEW.s, typeof(NEW.s)); END",
+            "CREATE TRIGGER bw BEFORE INSERT ON t WHEN NEW.k = 1 BEGIN \
+               INSERT INTO log VALUES('bw', NEW.k, typeof(NEW.k)); END",
+            "CREATE TRIGGER aw AFTER INSERT ON t WHEN NEW.s = '3' BEGIN \
+               INSERT INTO log VALUES('aw', NEW.s, typeof(NEW.s)); END",
+            "INSERT INTO t VALUES('1', '2', 3, '4.0', 'x', '5')",
+            "INSERT INTO t VALUES('abc', 'x1', 2.5, '7e0', 8, 9)",
+            "CREATE TRIGGER bu BEFORE UPDATE ON t BEGIN \
+               INSERT INTO log VALUES('bu-new', NEW.k, typeof(NEW.k)); \
+               INSERT INTO log VALUES('bu-old', OLD.k, typeof(OLD.k)); END",
+            "CREATE TRIGGER au AFTER UPDATE ON t WHEN NEW.k = 7 BEGIN \
+               INSERT INTO log VALUES('au-new', NEW.k, typeof(NEW.k)); \
+               INSERT INTO log VALUES('au-s', NEW.s, typeof(NEW.s)); END",
+            "UPDATE t SET k = '7', s = 8 WHERE k = 1",
+            "CREATE TABLE p(id INTEGER PRIMARY KEY, v INTEGER)",
+            "CREATE TRIGGER pbi BEFORE INSERT ON p BEGIN \
+               INSERT INTO log VALUES('pbi-v', NEW.v, typeof(NEW.v)); END",
+            "CREATE TRIGGER pai AFTER INSERT ON p BEGIN \
+               INSERT INTO log VALUES('pai-id', NEW.id, typeof(NEW.id)); \
+               INSERT INTO log VALUES('pai-v', NEW.v, typeof(NEW.v)); END",
+            "INSERT INTO p VALUES('10', '11')",
+            "INSERT INTO p(v) VALUES('12')",
+        ] {
+            run_both(&frank, &stock, sql).await;
+        }
+        compare(&frank, &stock, "SELECT w, v, ty FROM log ORDER BY rowid").await;
+        compare(&frank, &stock, "SELECT k, typeof(k), s, typeof(s) FROM t ORDER BY rowid").await;
     });
 }
