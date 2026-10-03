@@ -356,6 +356,67 @@ pub fn program_seeks_named_index(program: &VdbeProgram, index_name: &str) -> boo
     })
 }
 
+/// How many leading key columns of `index_name` every range seek on it binds.
+///
+/// bd-xml0z: `EXPLAIN QUERY PLAN` named only an index's first column even when
+/// the program seeks on a two-column key. Read the width off the opcodes: each
+/// `Seek*` on a cursor opened on the index takes its key from the `MakeRecord`
+/// that last wrote the seek's key register, and the record's fields are the
+/// bound key columns up to the rowid floor/ceiling sentinel (`Int64` of
+/// `i64::MIN`/`i64::MAX`) that positions the seek before or after equal keys.
+///
+/// Returns the minimum over all such seeks, or `None` when the index is never
+/// range-seeked or a seek key does not come from a `MakeRecord`.
+#[must_use]
+pub fn program_index_seek_key_width(program: &VdbeProgram, index_name: &str) -> Option<usize> {
+    let ops = program.ops();
+    let index_cursors: HashSet<i32> = ops
+        .iter()
+        .filter(|op| {
+            matches!(op.opcode, Opcode::OpenRead | Opcode::OpenWrite)
+                && matches!(&op.p4, P4::Index(name) if name == index_name)
+        })
+        .map(|op| op.p1)
+        .collect();
+    let mut bound: Option<usize> = None;
+    for (seek_addr, op) in ops.iter().enumerate() {
+        if !(matches!(
+            op.opcode,
+            Opcode::SeekGE | Opcode::SeekGT | Opcode::SeekLE | Opcode::SeekLT
+        ) && index_cursors.contains(&op.p1))
+        {
+            continue;
+        }
+        let (record_addr, record) =
+            ops[..seek_addr]
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, candidate)| {
+                    candidate.opcode == Opcode::MakeRecord && candidate.p3 == op.p3
+                })?;
+        let first_field = record.p1;
+        let field_count = usize::try_from(record.p2).ok()?;
+        let mut key_columns = 0;
+        for field in 0..field_count {
+            let register = first_field + i32::try_from(field).ok()?;
+            let is_rowid_sentinel = ops[..record_addr]
+                .iter()
+                .rev()
+                .find(|writer| writer.opcode == Opcode::Int64 && writer.p2 == register)
+                .is_some_and(|writer| {
+                    matches!(writer.p4, P4::Int64(value) if value == i64::MIN || value == i64::MAX)
+                });
+            if is_rowid_sentinel {
+                break;
+            }
+            key_columns += 1;
+        }
+        bound = Some(bound.map_or(key_columns, |current| current.min(key_columns)));
+    }
+    bound
+}
+
 /// True when the emitted program probes a cursor opened on `table_name`
 /// directly by rowid (`SeekRowid`/`NotExists`).
 ///

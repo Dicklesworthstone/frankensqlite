@@ -5045,6 +5045,7 @@ mod tests {
             prepared_direct_insert_page_run_row_append_fallback_flushes: 0,
             prepared_direct_insert_page_run_row_append_fallback_rows: 0,
             memdb_txn_schema_full_scans: 0,
+            memdb_pager_reloads: 0,
             fts5_reload_documents_retokenized: 0,
             fts5_reload_shadow_rows_decoded: 0,
             fts5_reload_lazy_binds: 0,

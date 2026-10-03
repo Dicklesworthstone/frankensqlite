@@ -1760,6 +1760,10 @@ static FSQLITE_MEMDB_REFRESH_COUNT: AtomicU64 = AtomicU64::new(0);
 // A per-write in-txn refresh that took the fast path (bd-ixf69) never lands
 // here; N INSERTs in one txn must keep this O(1), not O(N).
 static FSQLITE_MEMDB_TXN_SCHEMA_FULL_SCANS: AtomicU64 = AtomicU64::new(0);
+// bd-xml0z: whole MemDatabase reloads from the pager (each binds a publication
+// and begins its own read transaction). Must not scale with the number of
+// prepared reads on an unchanged database.
+static FSQLITE_MEMDB_PAGER_RELOADS: AtomicU64 = AtomicU64::new(0);
 // GH#408: documents re-tokenized by the schema reload's live-vtab rebuild
 // (`rebuild_materialized_live_vtab_instances_from_reload` ->
 // `Fts5Table::rebuild_documents`). A reload that rebinds persisted segments,
@@ -2130,6 +2134,10 @@ pub struct HotPathProfileSnapshot {
     /// scan (the schema-cookie fast path missed). Must stay O(1) per transaction
     /// regardless of write-statement count.
     pub memdb_txn_schema_full_scans: u64,
+    /// bd-xml0z: whole MemDatabase reloads from the pager
+    /// (`reload_memdb_from_pager`). Repeated prepared reads of an unchanged
+    /// file-backed database must not pay one per execution.
+    pub memdb_pager_reloads: u64,
     /// GH#408: documents re-tokenized by the schema reload's live-vtab rebuild.
     /// Proportional to the FTS5 table size on every reload that re-derives the
     /// in-memory index; zero when the reload rebinds persisted segments or
@@ -2631,6 +2639,7 @@ pub fn reset_hot_path_profile() {
     FSQLITE_COMMIT_REFRESH_COUNT.store(0, AtomicOrdering::Relaxed);
     FSQLITE_MEMDB_REFRESH_COUNT.store(0, AtomicOrdering::Relaxed);
     FSQLITE_MEMDB_TXN_SCHEMA_FULL_SCANS.store(0, AtomicOrdering::Relaxed);
+    FSQLITE_MEMDB_PAGER_RELOADS.store(0, AtomicOrdering::Relaxed);
     FSQLITE_FTS5_RELOAD_DOCUMENTS_RETOKENIZED.store(0, AtomicOrdering::Relaxed);
     FSQLITE_FTS5_RELOAD_SHADOW_ROWS_DECODED.store(0, AtomicOrdering::Relaxed);
     FSQLITE_FTS5_RELOAD_LAZY_BINDS.store(0, AtomicOrdering::Relaxed);
@@ -2847,6 +2856,7 @@ pub fn hot_path_profile_snapshot() -> HotPathProfileSnapshot {
         memdb_refresh_count: FSQLITE_MEMDB_REFRESH_COUNT.load(AtomicOrdering::Relaxed),
         memdb_txn_schema_full_scans: FSQLITE_MEMDB_TXN_SCHEMA_FULL_SCANS
             .load(AtomicOrdering::Relaxed),
+        memdb_pager_reloads: FSQLITE_MEMDB_PAGER_RELOADS.load(AtomicOrdering::Relaxed),
         fts5_reload_documents_retokenized: FSQLITE_FTS5_RELOAD_DOCUMENTS_RETOKENIZED
             .load(AtomicOrdering::Relaxed),
         fts5_reload_shadow_rows_decoded: FSQLITE_FTS5_RELOAD_SHADOW_ROWS_DECODED
@@ -58284,9 +58294,17 @@ impl Connection {
                         true,
                     )
                     .await?;
-            } else if !self.memdb_rows_loaded.get() {
+            } else if !self.memdb_rows_loaded.get() && self.should_eagerly_hydrate_memdb_rows() {
                 self.reload_memdb_from_pager(cx).await?;
             } else {
+                // A file connection that rejects the MemDatabase row fallback
+                // keeps rows unloaded by design: its reads go through pager
+                // cursors. Reloading here on "unloaded" bound a publication,
+                // began a whole extra read transaction and reloaded the schema
+                // on every execution (bd-xml0z), the prepared twin of what
+                // `refresh_memdb_from_active_txn_if_dirty` stopped doing for
+                // unprepared statements. The staleness refresh still reloads
+                // as soon as a commit is published past the mirror.
                 self.refresh_memdb_if_stale(cx).await?;
             }
         }
@@ -96486,6 +96504,7 @@ impl Connection {
                     Self::planner_select_directive(select, &schema)
                 };
                 if let Some(directive) = directive {
+                    let mut directive_seek_key_columns = None;
                     let verified = match directive.access_kind {
                         PlannerSelectAccessKind::FullTableScan => {
                             // bd-2fong red 3 (bd-jyyae family): a FullTableScan
@@ -96537,25 +96556,47 @@ impl Connection {
                         }
                         PlannerSelectAccessKind::IndexEquality
                         | PlannerSelectAccessKind::IndexRange => {
-                            match self.compile_table_select(select).await {
-                                Ok(program) => {
-                                    directive.index_name.as_deref().is_some_and(|index_name| {
-                                        crate::explain::program_seeks_named_index(
+                            match (
+                                self.compile_table_select(select).await,
+                                directive.index_name.as_deref(),
+                            ) {
+                                (Ok(program), Some(index_name))
+                                    if crate::explain::program_seeks_named_index(
+                                        &program, index_name,
+                                    ) =>
+                                {
+                                    directive_seek_key_columns =
+                                        crate::explain::program_index_seek_key_width(
                                             &program, index_name,
-                                        )
-                                    })
+                                        );
+                                    true
                                 }
-                                Err(_) => false,
+                                _ => false,
                             }
                         }
                     };
                     if verified {
-                        return vec![to_row(
-                            2,
-                            0,
-                            0,
-                            explain_query_plan_detail_from_directive(&directive),
-                        )];
+                        let detail = if matches!(
+                            directive.access_kind,
+                            PlannerSelectAccessKind::IndexEquality
+                        ) && !directive.index_key_is_expression
+                            && let Some(key_terms) =
+                                directive_index_equality_key_terms(
+                                    select,
+                                    &directive,
+                                    directive_seek_key_columns,
+                                    &self.schema.borrow(),
+                                ) {
+                            format!(
+                                "SEARCH {} USING {}INDEX {} ({key_terms})",
+                                directive.table_name,
+                                if directive.covering { "COVERING " } else { "" },
+                                directive.index_name.as_deref().unwrap_or("(unknown)"),
+                            )
+                        } else {
+                            explain_query_plan_detail_from_directive(&directive)
+                        };
+                        return vec![to_row(2, 0, 0, detail)];
                     }
                 }
 
@@ -96569,17 +96610,37 @@ impl Connection {
                     let simple_top_level_select = select.with.is_none()
                         && select.body.compounds.is_empty()
                         && !select_contains_subquery_matching(select, self, &|_, _| true);
-                    let index_seek = if select_core_is_aggregate(&select.body.select) {
+                    let aggregate = select_core_is_aggregate(&select.body.select);
+                    let index_seek = if aggregate {
                         crate::explain::aggregate_index_seek_facts(&program)
-                    } else if select.order_by.is_empty() {
-                        None
                     } else {
                         crate::explain::program_index_seek_facts(&program)
                     };
+                    let seek_key_columns = index_seek.as_ref().and_then(|seek| {
+                        crate::explain::program_index_seek_key_width(&program, &seek.index_name)
+                    });
+                    // bd-xml0z: without ORDER BY or an aggregate, report the
+                    // seek only when the program binds a multi-column equality
+                    // key, which the generic bytecode explain renders as
+                    // `SCAN t` + `SCAN INDEX i`.
+                    let index_seek = index_seek.filter(|seek| {
+                        aggregate
+                            || !select.order_by.is_empty()
+                            || index_seek_binds_multi_column_equality_key(
+                                select,
+                                seek,
+                                seek_key_columns,
+                                &self.schema.borrow(),
+                            )
+                    });
                     if simple_top_level_select
                         && let Some(seek) = index_seek
-                        && let Some(detail) =
-                            index_seek_eqp_detail(select, &seek, &self.schema.borrow())
+                        && let Some(detail) = index_seek_eqp_detail(
+                            select,
+                            &seek,
+                            seek_key_columns,
+                            &self.schema.borrow(),
+                        )
                     {
                         return vec![to_row(2, 0, 0, detail)];
                     }
@@ -97320,6 +97381,9 @@ impl Connection {
     ///
     /// Returns an error if the pager cannot be read or if B-tree traversal fails.
     async fn reload_memdb_from_pager(&self, cx: &Cx) -> Result<()> {
+        if hot_path_profile_enabled() {
+            FSQLITE_MEMDB_PAGER_RELOADS.fetch_add(1, AtomicOrdering::Relaxed);
+        }
         self.reload_memdb_from_pager_with_mode(cx, self.should_eagerly_hydrate_memdb_rows())
             .await
     }
@@ -132248,6 +132312,116 @@ fn first_source_eqp_detail_from_table_or_subquery(source: &TableOrSubquery) -> O
     }
 }
 
+/// Stock-style key terms (`a=? AND b=?`) for an index seek that binds more than
+/// the index's first column (bd-xml0z).
+///
+/// `seek_key_columns` is the key width the emitted program actually seeks on
+/// (`program_index_seek_key_width`). Each of those leading index
+/// columns must also carry a top-level equality term in the WHERE clause;
+/// otherwise the extra fields are range bounds or something else this renderer
+/// does not describe, and the caller keeps its single-column detail.
+fn index_seek_eqp_equality_key_terms(
+    where_clause: Option<&Expr>,
+    table_name: &str,
+    table_alias: Option<&str>,
+    index: &IndexSchema,
+    seek_key_columns: Option<usize>,
+) -> Option<String> {
+    let bound = seek_key_columns?.min(index.columns.len());
+    if bound < 2 || index.columns.len() != index.key_term_count() {
+        return None;
+    }
+    let where_terms: Vec<_> = decompose_where(where_clause?)
+        .into_iter()
+        .map(classify_where_term)
+        .collect();
+    let key_columns = &index.columns[..bound];
+    key_columns
+        .iter()
+        .all(|key_column| {
+            where_terms.iter().any(|term| {
+                matches!(term.kind, WhereTermKind::Equality)
+                    && term.column.as_ref().is_some_and(|column| {
+                        planner_where_column_matches(column, table_name, table_alias, key_column)
+                    })
+            })
+        })
+        .then(|| {
+            key_columns
+                .iter()
+                .map(|key_column| format!("{key_column}=?"))
+                .collect::<Vec<_>>()
+                .join(" AND ")
+        })
+}
+
+/// The single table a plain top-level SELECT reads, with its alias and WHERE.
+fn single_table_select_source<'a>(
+    select: &'a SelectStatement,
+    schema: &'a [TableSchema],
+) -> Option<(&'a TableSchema, Option<&'a str>, Option<&'a Expr>)> {
+    let SelectCore::Select {
+        from, where_clause, ..
+    } = &select.body.select
+    else {
+        return None;
+    };
+    let from = from.as_ref()?;
+    if !from.joins.is_empty() {
+        return None;
+    }
+    let TableOrSubquery::Table { name, alias, .. } = &from.source else {
+        return None;
+    };
+    let table = schema
+        .iter()
+        .find(|candidate| candidate.name.eq_ignore_ascii_case(&name.name))?;
+    Some((table, alias.as_deref(), where_clause.as_deref()))
+}
+
+/// Multi-column key terms for a verified planner IndexEquality directive.
+fn directive_index_equality_key_terms(
+    select: &SelectStatement,
+    directive: &SelectPlannerDirective,
+    seek_key_columns: Option<usize>,
+    schema: &[TableSchema],
+) -> Option<String> {
+    let (table, alias, where_clause) = single_table_select_source(select, schema)?;
+    let index_name = directive.index_name.as_deref()?;
+    let index = table
+        .indexes
+        .iter()
+        .find(|candidate| candidate.name.eq_ignore_ascii_case(index_name))?;
+    index_seek_eqp_equality_key_terms(where_clause, &table.name, alias, index, seek_key_columns)
+}
+
+/// True when a program-derived index seek binds two or more leading index
+/// columns that the WHERE clause pins by equality.
+fn index_seek_binds_multi_column_equality_key(
+    select: &SelectStatement,
+    seek: &crate::explain::IndexSeek,
+    seek_key_columns: Option<usize>,
+    schema: &[TableSchema],
+) -> bool {
+    single_table_select_source(select, schema).is_some_and(|(table, alias, where_clause)| {
+        !table.without_rowid
+            && table
+                .indexes
+                .iter()
+                .find(|candidate| candidate.name.eq_ignore_ascii_case(&seek.index_name))
+                .is_some_and(|index| {
+                    index_seek_eqp_equality_key_terms(
+                        where_clause,
+                        &table.name,
+                        alias,
+                        index,
+                        seek_key_columns,
+                    )
+                    .is_some()
+                })
+    })
+}
+
 /// `EXPLAIN QUERY PLAN` detail for a program that seeks an index.
 ///
 /// bd-2dgf5 / bd-jyyae. The *decision* — SEARCH vs SCAN, COVERING vs not — arrives in
@@ -132259,6 +132433,7 @@ fn first_source_eqp_detail_from_table_or_subquery(source: &TableOrSubquery) -> O
 fn index_seek_eqp_detail(
     select: &SelectStatement,
     seek: &crate::explain::IndexSeek,
+    seek_key_columns: Option<usize>,
     schema: &[TableSchema],
 ) -> Option<String> {
     let SelectCore::Select { from, .. } = &select.body.select else {
@@ -132285,10 +132460,21 @@ fn index_seek_eqp_detail(
         .iter()
         .find(|candidate| candidate.name.eq_ignore_ascii_case(&seek.index_name))?;
     let key_column = index.columns.first()?;
+    let SelectCore::Select { where_clause, .. } = &select.body.select else {
+        return None;
+    };
+    let key_terms = index_seek_eqp_equality_key_terms(
+        where_clause.as_deref(),
+        &table.name,
+        alias.as_deref(),
+        index,
+        seek_key_columns,
+    )
+    .unwrap_or_else(|| format!("{key_column}=?"));
     let displayed = alias.as_deref().unwrap_or(&table.name);
     let covering = if seek.covering { "COVERING " } else { "" };
     Some(format!(
-        "SEARCH {displayed} USING {covering}INDEX {} ({key_column}=?)",
+        "SEARCH {displayed} USING {covering}INDEX {} ({key_terms})",
         index.name
     ))
 }
