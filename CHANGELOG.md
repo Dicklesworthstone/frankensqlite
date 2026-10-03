@@ -17,13 +17,14 @@ as a 28-member Cargo workspace under `crates/`.
 
 Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
-Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.7) (2026-08-20) through [v0.4.8](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.4.8) (2026-10-02). v0.3.2–v0.3.4, v0.3.6–v0.3.18 and v0.4.4 are GitHub Releases; **v0.3.5 is a tag / crates.io snapshot with no GitHub Release**, and **0.4.0–0.4.3 are crates.io publishes with no tag and no GitHub Release** — their changes are documented in the v0.4.4 section. Every release in the window has a per-change section below (the v0.3.12/v0.3.13 sections were reconstructed from their tag ranges on 2026-09-01).
+Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.7) (2026-08-20) through the frozen v0.4.9 replacement release source (2026-10-03). v0.4.8 remains an unchanged, withdrawn tag without a GitHub Release or crates.io publication. v0.3.2–v0.3.4, v0.3.6–v0.3.18 and v0.4.4 are GitHub Releases; **v0.3.5 is a tag / crates.io snapshot with no GitHub Release**, and **0.4.0–0.4.3 are crates.io publishes with no tag and no GitHub Release** — their changes are documented in the v0.4.4 section. Every release in the window has a per-change section below (the v0.3.12/v0.3.13 sections were reconstructed from their tag ranges on 2026-09-01).
 
 ## Version Timeline
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| [Unreleased](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.4.8...main) | HEAD | 2026-10-02 | — |
+| [Unreleased](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.4.9...main) | HEAD | 2026-10-03 | Later main commits are excluded from v0.4.9 and reserved for v0.4.10. |
+| [v0.4.9](https://github.com/Dicklesworthstone/frankensqlite/tree/v0.4.9) | Replacement release source | 2026-10-03 | Frozen runtime source 23697702; CTAS wrong-table write fixed. All 26 public crates use 0.4.9. Full gate qualified with documented failures; signed assets and publication evidence are recorded with the release. |
 | [v0.4.8](https://github.com/Dicklesworthstone/frankensqlite/tree/v0.4.8) | Withdrawn tag | 2026-10-02 | Withdrawn before publication: CREATE TABLE AS SELECT with a quoted table name could write its copied rows into another existing table. The tag remains unchanged and unreleased; v0.4.9 will supersede it. Planned changes are retained below. |
 | [v0.4.7](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.4.7) | Release | 2026-09-29 | Prompt fix release of all 26 public crates. Large multi-row INSERT wrote index entries without their rowid and skipped UNIQUE checks past register 65,535 (hfdt-dlkam3); serialized-DDL index race (bd-4iaoi); composite-key DML seek (GH#434) with residual fix; autocommit DDL starvation (bd-f5sh5); GH#435 changes(); streaming aggregate and correlated-subquery performance (GH#420, GH#432, GH#436) |
 | [v0.4.6](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.4.6) | Release | 2026-09-27 | Uniform release of all 26 public crates (0.4.5 skipped: consumed by the fsqlite-pager backport). Page-referenced-twice fix (bd-b5vmw), lost-index-entry race fix (bd-11sz4), freelist/overflow hardening, WAL-index healing, per-statement busy_timeout (GH#423), UTF-16/collation and numeric parity |
@@ -53,11 +54,260 @@ Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releas
 
 ---
 
-## [Unreleased] -- development on `main` since v0.4.7
+## [Unreleased] -- later development on `main`, excluded from v0.4.9
 
-Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.4.7...main>
+Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.4.9...main>
 
-Entries for changes after v0.4.7 are written at the next release.
+The v0.4.9 runtime is frozen at 23697702. Later owner commits are reserved for v0.4.10.
+
+---
+
+## [0.4.9] -- 2026-10-03 (replacement for withdrawn v0.4.8)
+
+Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.4.7...v0.4.9>
+
+A uniform release of all 26 public crates, superseding the unchanged, unreleased v0.4.8 tag.
+It carries the fixes and performance improvements described in the withdrawn candidate section below,
+plus subsequent changes through frozen source `23697702`. Later main commits are excluded
+and will ride in 0.4.10, including WAL-FEC full-queue admission deferral (e82a0a9c2)
+and reserved-trailer B-tree decoder bounds (540740799).
+
+### Correctness and availability
+
+- CREATE TABLE AS SELECT quotes the destination identifier before replaying rows into one prepared
+  INSERT. Embedded quotes cannot redirect copied rows into an existing table (GH#447,
+  [c23ca7fb4](https://github.com/Dicklesworthstone/frankensqlite/commit/c23ca7fb4)). The stock-SQLite
+  regression checks copied rows, preservation of the original table, transactions and rollback.
+- CTAS preserves changes(), total_changes() and last_insert_rowid(), matching SQLite (GH#439).
+- CREATE TEMP TABLE AS SELECT uses the TEMP namespace; TEMP and main CTAS under a TEMP
+  shadow retain inferred affinities for later INSERTs. STRICT ANY preserves numeric-looking text
+  in BEFORE trigger frames; row-level DELETE triggers observe each preceding row deletion
+  (bd-y26jy, bd-oh34i, bd-5pt42, 7ab6b88a9).
+- A first write after stock SQLite's empty, unindexed WAL establishes the WAL generation instead of
+  refusing BusyRecovery (GH#443, 4b48c95d8).
+- VACUUM INTO can complete beside an idle peer process (GH#442, cf0621d0c).
+- Append fit checks happen before allocating overflow chains (GH#441, 157826d97).
+- A rejected UPDATE restores the exact index entries removed by that row, including
+  expression and partial indexes, and leaves unchanged indexes alone (GH#449, bd-c1vth,
+  574c26216, 36b2bbf09). Skipped UPDATE rows do not run parent foreign-key actions or
+  AFTER UPDATE triggers; completed trigger steps remain in total_changes(). The regression
+  closes the connection, then requires stock SQLite first reopen to report one indexed row
+  and a clean integrity check. This prevents new duplicates; it does not repair affected files.
+- Autocommit settles an in-doubt physical commit before answering the caller. A write
+  that is durably committed reports success, preventing a retry of an already committed row
+  (bd-no6zz, 4802106f4).
+- Prepared statements re-prepare after another connection changes the schema, matching
+  sqlite3_prepare_v2 (bd-9zuif, a5bc1e3c4). UPDATE FROM resolves source tables when
+  UPDATE triggers or foreign-key work select the replay path (bd-2jbl5, 2b6215390).
+- Join keys apply SQLite comparison-affinity rules across lookup, nested and hash paths,
+  including numeric-looking TEXT in typeless columns and three-table TEXT-affinity
+  chains (GH#445/GH#446, bd-kr6hf, bd-y5mc8, 23697702a). Join ORDER BY honors
+  ordinal references and DESC.
+- Bare columns beside one min()/max() come from the extremum row on general source and
+  join paths, including HAVING that repeats the aggregate. Unaliased result expressions
+  are named by their source text (bd-xik4y, 14d607a51).
+- FROM-subquery flattening preserves an inner ORDER BY and keeps mixed-star expression projections
+  materialized, preserving aggregate tie values and the first exposed duplicate column name. Ordinary
+  aggregate and expression projections can still flatten (bd-5ap77).
+
+### Performance
+
+- Repeated prepared VDBE reads on unchanged file databases avoid a whole MemDatabase
+  reload per execution; publication/schema checks still guard peer changes. EXPLAIN
+  QUERY PLAN names every equality-bound key column (bd-xml0z, 43ec7360d).
+
+- UPDATE rewrites rows in place when the rowid cannot change, with position-revalidated
+  fallback for resized records; rowid-changing assignments retain the existing path
+  (bd-9ag5r, GH#439, a31225e8b).
+- Cell-slot entries are reused across row rewrites, reducing UPDATE/DELETE cache churn. CTAS retains
+  rows at their actual width and uses prepared row replay (GH#438/GH#439, c23ca7fb4).
+- Short-record DEFAULT values are cached per schema generation instead of re-parsed per execution
+  (GH#440, 5c18621ef).
+- Exact zero-match seeks on implied partial/composite indexes avoid fallback full scans
+  (GH#444, 71556d531).
+- Trigger WHEN subqueries compile once and bind per row (bd-ry6x7, 36f13401a).
+- FROM-subqueries beneath outer aggregate/expression projections can flatten; table-function sources
+  and deterministic aliased expressions are included when their name scope is unambiguous (bd-5ap77).
+
+### Qualification
+
+Pinned-nightly remote formatting and workspace/all-target Clippy pass. The complete frozen
+workspace gate executes 74 bounded jobs over all 28 members (26 public crates), including
+all 1,136 default integration targets, units, binaries, doctests and declared required-feature
+supplements. Reported results are 25,211 passed, 68 failed and 208 ignored; these are result
+rows rather than a unique-test count. All original failures are retained, independently reviewed
+and classified below under the release ruling. An optional test=false pager benchmark is
+compiled only, without a timing claim. This qualification does not claim that every assertion
+passes. Locked Cargo metadata and workspace check pass after the metadata-only version bump.
+
+The release uses a direct metadata-only child of frozen runtime 23697702; every other Git blob
+and mode is preserved. Native build, signed-asset and published installer/upgrade evidence
+is recorded separately with the release. Later main changes are reserved for 0.4.10.
+
+### Known issues
+
+Concurrent-DDL qualification expects an old-schema writer to commit after a
+peer publishes a schema change, but both versions refuse with BusySnapshot
+(GH#476); later row/integrity assertions do not run. The fresh-reader checkpoint
+campaign also exceeds its idle progress budget on both versions (GH#477),
+without any successful nonempty TRUNCATE. The old run additionally reports
+four reader Busy errors absent from frozen source; campaign equivalence and
+corruption are not established. A local-DDL prepared-statement keeper rejects
+the same invalid-arity error on both versions (GH#478), separately from the
+peer-DDL reprepare change. Original assertions and failures remain recorded.
+
+Table-free constant row-value equality predicates return an explicit unsupported
+expression error instead of SQLite results (GH#450). The full stock-oracle
+target reproduces exactly on v0.4.7 and frozen source, with four other tests
+passing. This known SQL limitation remains unfixed; the repro performs no
+persistent writes and does not demonstrate corruption.
+
+Four Turso provenance/report qualification checks require Git custody absent
+from remote source copies (GH#474); all four failures reproduce on v0.4.7,
+and their contract assertions remain uncompleted. Three synthetic SSI timing
+budgets also fail on both versions (GH#475). The unchanged workload exercises
+in-memory MVCC transactions and simulated CPU work; it does not qualify SQL
+throughput or file durability. Its false-positive counters are heuristic.
+No performance equivalence or satisfaction of those budgets is claimed.
+
+The forced-index range opcode keeper conflates any `IdxRowid` traversal with
+a range-bound seek (GH#473). Both v0.4.7 and frozen source reproduce the same
+assertion for an explicitly forced unrelated index; the seven stock-SQLite
+result cases pass, including that query. The original keeper is retained.
+
+Three contention/publication qualification failures also reproduce on v0.4.7
+(GH#470–472). The SSI workload requires a local publication sequence after every
+COMMIT, including read-only paths; the failed operation is unlogged, so that
+specific explanation remains a source-review hypothesis. The WAL mode fixture
+counts four JSON publication events against seven durable certificates; all
+seven certificate epochs appear on the console, and stock-row/integrity checks
+pass before its count assertion. Its thread-local logger misses main-thread JSON
+events. A two-second cross-table progress keeper can expire before worker
+connections finish opening. These inherited failures remain recorded with the
+original expectations unchanged; they do not establish equivalent performance,
+indefinite starvation or database corruption.
+
+The two-second four-writer fairness keeper can fall below its existing Jain-index
+bound (GH#469). A paired same-host comparison of unchanged compiled full targets
+reproduces this failure on both v0.4.7 and frozen source. This establishes a
+previous-release bounded-measurement failure, without demonstrating equivalent
+performance, persistent starvation, data correctness or durability. The release
+keeps the keeper and its original failure recorded.
+
+The reference-index target expects 15 files from an uninitialized pinned SQLite
+submodule and flags three unchanged explanatory comments as direct imports (GH#467).
+An actual v0.4.7 run reproduces all four failures with identical reported paths
+and markers. The RaptorQ debug decode timing keeper also exceeds its existing
+computed bound on both revisions (GH#468); decoder correctness checks pass.
+These verified previous-release qualification failures remain recorded without
+weakening the source audit or timing assertion.
+
+The corpus hash lock and runtime-stub source inventory also fail on v0.4.7
+(GH#466). Both revisions observe the same hash mismatch across the same 35
+conformance files. Stub complaints include inherited gaps plus intentional
+function movement and a new aggregate-JOIN optimization decline that retains
+the general fallback. These source/fixture contract failures do not report wrong
+SQL rows. The frozen release preserves the contracts and records their follow-up.
+
+The direct in-memory SSI witness scenario refuses both writers after forming an
+active dangerous dependency structure, while its fixture expects the first writer
+to commit (GH#463). The test and MVCC source are unchanged since v0.4.7, where an
+actual comparison run reproduces the same three failures. This synthetic direct-API target
+does not execute Connection SQL or persist a database, and demonstrates no wrong
+committed state. Follow-up must retain both commit errors and validate the resulting
+state rather than weaken SSI checks.
+
+Two synthetic performance-harness assertions fail under parallel load (GH#464):
+swizzle traversal result checks pass, but relative timing/depth checks fail; an
+isolated arena GC fixture exceeds its existing 5 ms tail limit once. The relevant
+source and fixtures are unchanged since v0.4.7; exact previous-release runtime
+comparisons pass both targets and do not reproduce the current timing failures.
+No correctness or persistence failure is reported by
+these targets, and this release makes no performance claim from those measurements.
+
+The core SQL checksum manifest has 24 parser and four execution mismatches
+(GH#465). Actual v0.4.7 and frozen-source runs produce exactly the same mismatch
+records, including all four execution hashes. This verified pre-existing failure
+remains recorded; hash-only output does not establish stock-SQLite parity, and
+the frozen release leaves the golden manifest unchanged.
+
+Two autocommit prepared-schema unit tests still require `SchemaChanged` after
+unrelated peer DDL, while the intended sqlite3_prepare_v2 behavior now re-prepares
+and succeeds (GH#462). The complete core target reports 3,967 passes, these two
+expectation failures and four ignored tests; exact filtered reruns receive the
+correct alpha row and one inserted row. The peer-DDL stock oracle and a held
+prepared-statement stock oracle pass, including explicit-transaction boundaries.
+Both old unit tests pass on v0.4.7; these new expectation mismatches follow the
+intentional compatibility change rather than a wrong SQL result.
+The old zero-refresh assertions describe the superseded refusal path and need
+fixture alignment; the frozen release leaves them recorded without weakening them.
+
+Four golden bytecode records are stale after the intended rowid affinity,
+UPDATE conflict/row-rewrite and three-table DESC fixes (GH#461). The snapshot target
+passes on v0.4.7 and reports these four expectation mismatches on frozen source;
+independent review checks the changed opcode flags and sorter key/direction fields.
+The release keeps the frozen source and records the fixture follow-up.
+
+Under heavy parallel load, the Linux cancellation keeper missed its 5 ms wall-clock
+bound once; isolated current and v0.4.7 keepers both pass the existing bound (GH#459). The
+cancellation implementation is unchanged. A pager mock fault keeper also missed its
+coalesced-batch setup, then passed in isolation (GH#460). Original failures remain
+recorded; thresholds and durability assertions are unchanged.
+
+In an explicitly embedded process that also links stock SQLite, the Unix WAL peer
+probe can release a live stock reader's POSIX locks when namespace contention causes
+a temporary main/SHM descriptor probe (GH#455). A refused open reproduced this with
+a separate legacy namespace holder: TRUNCATE changed from Busy to success while the
+stock reader stayed open. The reproducer proves lost lock protection, without checking
+reader results or persistent corruption. The default engine/CLI graph does not link
+stock SQLite; this mixed-library interoperability limitation needs a robust fix.
+
+Two auxiliary harness failures also reproduce on released v0.4.7: e2e-runner reports
+RawIdentical with logical_match=false (GH#456), and the mt-oltp tiny-run reader encounters
+a snapshot-binding Busy refusal (GH#457). Their binary source is unchanged. These
+remain follow-ups; neither failure alone establishes physical corruption.
+
+The optional verification-contract scorecard fixture sets an invalid release threshold
+of 0.0 below its 0.70 floor (GH#458), so its base-gate assertion fails before contract
+evaluation. The fixture and validation code are unchanged since v0.4.7.
+
+The source-policy check for direct Cx constructors flags compound-cfg test modules
+plus the separate recovery utility (GH#452). The scanner and reported source files are
+unchanged since v0.4.7, where the same test fails with the same reported locations.
+This pre-existing source-policy failure remains a follow-up.
+
+The optional strict parity-certification inventory is missing the DELETE row-replay and
+SELECT short-circuit/subquery decision reasons (GH#454). Its source-coverage check
+fails; this is an inventory follow-up and does not establish a normal SQL-result failure.
+
+The WAL-FEC sidecar integration suite can intermittently report Busy during parallel
+fixture mutations (GH#453); the same target also fails on v0.4.7 with unchanged source
+and tests. The isolated v0.4.7 reclaim test passes. The checkpoint caller defers sidecar
+reclamation errors after a durable reset and retries later; this test failure does not
+establish primary-WAL corruption.
+
+A BEFORE DELETE trigger that raises FAIL can leave `changes()` at zero instead of the
+number of rows deleted before the error (GH#448). The counter mismatch also reproduces
+on released v0.4.7; row-level FAIL/ABORT effects on current main pass the stock oracle.
+
+GH#445/GH#446 are addressed by the frozen source and its focused stock-SQLite join
+oracles pass. Published-release checks remain pending. Cross-process WAL
+compatibility changes also remain under qualification. Windows VACUUM INTO and
+WAL-FEC recovery remain as described in the prior-release section.
+
+- Auxiliary source/tracker audits remain red: [#479](https://github.com/Dicklesworthstone/frankensqlite/issues/479) reproduces the previous release's missing Git-custody failures; [#480](https://github.com/Dicklesworthstone/frankensqlite/issues/480) reports 31 inherited missing acceptance criteria plus six additional task records. These are documented metadata gaps, with original failing receipts retained.
+
+- Workspace-layering fixtures retain eight previous-release member/feature checks and two stale native `opt-level="z"` checks after the intentional switch to optimization level 3 ([#481](https://github.com/Dicklesworthstone/frankensqlite/issues/481)). The wasm release script retains its size optimization override. This classification makes no measured performance or size claim.
+
+- **Unfixed inherited FTS posting loss** ([#211](https://github.com/Dicklesworthstone/frankensqlite/issues/211)): renaming an explicitly declared external-content table and requesting rebuild succeeds instead of refusing the missing source. A known posting disappears from live queries and stock SQLite's first reopen after an awaited close, on both v0.4.7 and frozen source. Primary content rows survive and ordinary integrity checks pass; those checks do not establish FTS consistency. FTS5 is built by default. This release records the defect under JE's pre-existing-defect ruling and does not claim a fix, whole-index preservation or successful recovery.
+- JSON5 read-function differences also reproduce exactly on v0.4.7 ([#482](https://github.com/Dicklesworthstone/frankensqlite/issues/482)): two constant SELECT expressions return results where the reference records an error, and a returned JSON TEXT array uses different escape spelling despite equivalent decoded strings. Original oracle failures are retained; no persistent table writes are involved.
+
+- A custom R-tree module is unavailable to its first SELECT after awaited close, reopen and re-registration ([#483](https://github.com/Dicklesworthstone/frankensqlite/issues/483)). The full v0.4.7 target reproduces the same refusal after the live UPDATE/rollback/delete-refusal assertions pass. This is an inherited module lifecycle defect; persisted row erasure is not established. Built-in R-tree update cases pass.
+- The snapshot sender fixture with a 65,536-byte page and one-byte symbols refuses during prepare() with TooBig on both versions ([#484](https://github.com/Dicklesworthstone/frankensqlite/issues/484)). Its intended oversized repair-symbol assertions are not reached; no snapshot recovery claim is made.
+
+- Two unchanged debug timing keepers missed their original limits in the full frozen gate ([#485](https://github.com/Dicklesworthstone/frankensqlite/issues/485)): covering-index probes averaged 125,311 ns against 100,000 ns, and FK insert growth was 2.51x against 2.5x. Both complete targets pass on v0.4.7 and frozen source in the same-host comparison (39 tests passed, four ignored); frozen probes average 65,997 ns and FK growth is 0.95x. These are intermittent test-profile qualification failures, not established inherited failed thresholds or a persistent performance regression. FK inserts exercise an ordinary SQL path. Original failures and limits remain intact; performance equivalence is not claimed.
+
+- Three inherited durability/concurrency qualification failures reproduce in the complete v0.4.7 targets ([#486](https://github.com/Dicklesworthstone/frankensqlite/issues/486), [#487](https://github.com/Dicklesworthstone/frankensqlite/issues/487), [#488](https://github.com/Dicklesworthstone/frankensqlite/issues/488)). The crash fixture incorrectly expects two acknowledged FULL-synchronous autocommit mutations to disappear; stock first reopen preserves exactly their 5,000 surviving rows and passes integrity checking on both versions. A concurrent schema/DML keeper excludes SchemaChanged from its retry class and stops before final index/row checks. A file-backed keeper reads unattributed global profiling counters and fails before durability checks (old parks=1, frozen parks=2); its complete unchanged frozen case passes in isolation with stock-peer rows before close and both-engine reopen checks. Original failures remain recorded; no broad durability, campaign-integrity or performance-equivalence claim follows.
 
 ---
 
