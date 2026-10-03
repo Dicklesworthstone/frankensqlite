@@ -39986,8 +39986,14 @@ impl Connection {
                         "UPDATE of the implicit rowid ({alias}) on a table with UPDATE triggers"
                     )));
                 }
-                let needs_row_by_row_replay =
-                    has_before_update || has_after_update || self.fk_cascade_propagation_enabled();
+                let needs_row_by_row_replay = (has_before_update
+                    || has_after_update
+                    || self.fk_cascade_propagation_enabled())
+                    && (effective_update.from.is_some()
+                        || !self.dml_where_pins_one_row(
+                            &effective_update.table,
+                            effective_update.where_clause.as_ref(),
+                        ));
                 let replay_locators = if !needs_row_by_row_replay {
                     None
                 } else if effective_update.from.is_some() {
@@ -40382,6 +40388,10 @@ impl Connection {
                 // frozen row as its own single-row DELETE to get that order.
                 if (has_before_delete || has_after_delete)
                     && !self.has_live_vtab_instance(table_name)
+                    && !self.dml_where_pins_one_row(
+                        &effective_delete.table,
+                        effective_delete.where_clause.as_ref(),
+                    )
                     && self.delete_trigger_order_is_observable(
                         table_name,
                         has_before_delete,
@@ -51852,12 +51862,13 @@ impl Connection {
         Ok(Some((locator_columns, locator_rows)))
     }
 
-    /// The columns that locate one row of `table_ref` for a row-by-row DML
-    /// replay, or `None` when no stable locator exists.
-    fn dml_replay_locator_columns(
+    /// Run `f` on the schema of the table a DML statement targets (the
+    /// shadowed main table when `table_ref` names one behind a temp table).
+    fn with_dml_target_table<R>(
         &self,
         table_ref: &fsqlite_ast::QualifiedTableRef,
-    ) -> Result<Option<Vec<String>>> {
+        f: impl FnOnce(&TableSchema) -> R,
+    ) -> Result<R> {
         let table_name = &table_ref.name.name;
         let targets_shadowed_main = self.targets_shadowed_main(&table_ref.name);
         let visible_schema = self.schema.borrow();
@@ -51872,31 +51883,135 @@ impl Connection {
         .ok_or_else(|| FrankenError::NoSuchTable {
             name: table_name.to_owned(),
         })?;
+        Ok(f(table))
+    }
 
-        let locator_columns = if table.without_rowid {
-            let indices = without_rowid_pk_indices(table).map_err(codegen_error_to_franken)?;
-            indices
-                .into_iter()
-                .filter_map(|index| table.columns.get(index).map(|column| column.name.clone()))
-                .collect::<Vec<_>>()
-        } else {
-            let shadowed = table
-                .columns
-                .iter()
-                .map(|column| column.name.to_ascii_lowercase())
-                .collect::<HashSet<_>>();
-            if let Some(hidden_rowid) = ["rowid", "_rowid_", "oid"]
-                .into_iter()
-                .find(|candidate| !shadowed.contains(*candidate))
-            {
+    /// The columns that locate one row of `table_ref` for a row-by-row DML
+    /// replay, or `None` when no stable locator exists.
+    fn dml_replay_locator_columns(
+        &self,
+        table_ref: &fsqlite_ast::QualifiedTableRef,
+    ) -> Result<Option<Vec<String>>> {
+        self.with_dml_target_table(table_ref, |table| {
+            let locator_columns = if table.without_rowid {
+                let indices = without_rowid_pk_indices(table).map_err(codegen_error_to_franken)?;
+                indices
+                    .into_iter()
+                    .filter_map(|index| table.columns.get(index).map(|column| column.name.clone()))
+                    .collect::<Vec<_>>()
+            } else if let Some(hidden_rowid) = unshadowed_hidden_rowid_alias(table) {
                 vec![hidden_rowid.to_owned()]
             } else if let Some(ipk_column) = table.columns.iter().find(|column| column.is_ipk) {
                 vec![ipk_column.name.clone()]
             } else {
                 return Ok(None);
+            };
+            Ok((!locator_columns.is_empty()).then_some(locator_columns))
+        })?
+    }
+
+    /// bd-so2el: whether `where_clause` can match at most one row of the DML
+    /// target because its top-level AND terms pin the whole unique row key —
+    /// the rowid (or its INTEGER PRIMARY KEY alias), or every column of a
+    /// WITHOUT ROWID primary key — with `=` to a constant or bound parameter.
+    /// Such a statement never needs a row-by-row replay, so the locator
+    /// SELECT that would only discover that can be skipped. A row-by-row
+    /// replay's own per-row statements always take this shape.
+    fn dml_where_pins_one_row(
+        &self,
+        table_ref: &fsqlite_ast::QualifiedTableRef,
+        where_clause: Option<&Expr>,
+    ) -> bool {
+        fn is_row_independent_value(expr: &Expr) -> bool {
+            match expr {
+                Expr::Literal(..) | Expr::Placeholder(..) => true,
+                Expr::UnaryOp {
+                    op: fsqlite_ast::UnaryOp::Negate | fsqlite_ast::UnaryOp::Plus,
+                    expr,
+                    ..
+                } => matches!(expr.as_ref(), Expr::Literal(..)),
+                _ => false,
             }
+        }
+        fn pinned_columns<'e>(
+            expr: &'e Expr,
+            table_ref: &fsqlite_ast::QualifiedTableRef,
+            out: &mut Vec<&'e str>,
+        ) {
+            let target_column = |expr: &'e Expr| match expr {
+                Expr::Column(column, _)
+                    if column.schema.is_none()
+                        && column.table.as_deref().is_none_or(|qualifier| {
+                            table_ref.alias.as_deref().map_or_else(
+                                || qualifier.eq_ignore_ascii_case(&table_ref.name.name),
+                                |alias| qualifier.eq_ignore_ascii_case(alias),
+                            )
+                        }) =>
+                {
+                    Some(&*column.column)
+                }
+                _ => None,
+            };
+            match expr {
+                Expr::BinaryOp {
+                    left,
+                    op: BinaryOp::And,
+                    right,
+                    ..
+                } => {
+                    pinned_columns(left, table_ref, out);
+                    pinned_columns(right, table_ref, out);
+                }
+                Expr::BinaryOp {
+                    left,
+                    op: BinaryOp::Eq,
+                    right,
+                    ..
+                } => {
+                    if let Some(column) = target_column(left).filter(|_| is_row_independent_value(right))
+                    {
+                        out.push(column);
+                    } else if let Some(column) =
+                        target_column(right).filter(|_| is_row_independent_value(left))
+                    {
+                        out.push(column);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let Some(where_clause) = where_clause else {
+            return false;
         };
-        Ok((!locator_columns.is_empty()).then_some(locator_columns))
+        let mut pinned = Vec::new();
+        pinned_columns(where_clause, table_ref, &mut pinned);
+        if pinned.is_empty() {
+            return false;
+        }
+        let is_pinned = |name: &str| pinned.iter().any(|column| column.eq_ignore_ascii_case(name));
+        self.with_dml_target_table(table_ref, |table| {
+            if table.without_rowid {
+                without_rowid_pk_indices(table).is_ok_and(|indices| {
+                    !indices.is_empty()
+                        && indices.into_iter().all(|index| {
+                            table.columns.get(index).is_some_and(|column| is_pinned(&column.name))
+                        })
+                })
+            } else {
+                ["rowid", "_rowid_", "oid"].into_iter().any(|alias| {
+                    is_pinned(alias)
+                        && !table
+                            .columns
+                            .iter()
+                            .any(|column| column.name.eq_ignore_ascii_case(alias))
+                }) || table
+                    .columns
+                    .iter()
+                    .any(|column| column.is_ipk && is_pinned(&column.name))
+            }
+        })
+        .unwrap_or(false)
     }
 
     /// The name an `UPDATE ... FROM` target's columns are qualified with: its
@@ -52020,7 +52135,7 @@ impl Connection {
     fn build_update_replay_locator_filter(
         table_ref: &fsqlite_ast::QualifiedTableRef,
         locator_columns: &[String],
-        locator_values: &[SqliteValue],
+        locator_values: Vec<Expr>,
     ) -> Result<Expr> {
         if locator_columns.len() != locator_values.len() || locator_columns.is_empty() {
             return Err(FrankenError::Internal(format!(
@@ -52036,7 +52151,7 @@ impl Connection {
             .map(|(column, value)| Expr::BinaryOp {
                 left: Box::new(Self::build_limit_scope_projection_expr(table_ref, column)),
                 op: BinaryOp::Eq,
-                right: Box::new(value_to_literal_expr(value.clone())),
+                right: Box::new(value),
                 span: Span::ZERO,
             });
         let first = predicates.next().ok_or_else(|| {
@@ -52050,11 +52165,98 @@ impl Connection {
         }))
     }
 
+    /// The single-row statement a row-by-row replay runs for one frozen row:
+    /// `statement` restricted to the row's locator and, for `UPDATE ... FROM`,
+    /// assigning the SET values computed for it. `locator_values` and
+    /// `set_values` are the expressions standing for the row's values, either
+    /// literals or bind parameters.
+    fn build_dml_replay_row_statement(
+        statement: DmlRowReplay<'_>,
+        locator_columns: &[String],
+        locator_values: Vec<Expr>,
+        set_values: Vec<Expr>,
+    ) -> Result<Statement> {
+        Ok(match statement {
+            DmlRowReplay::UpdateFrom {
+                update,
+                set_columns,
+            } => {
+                // bd-2jbl5: as in stock, the join was evaluated once up front;
+                // each row is a plain UPDATE of the target that assigns the SET
+                // values computed for it.
+                let mut row_update = update.clone();
+                row_update.with = None;
+                row_update.from = None;
+                row_update.assignments = set_columns
+                    .iter()
+                    .zip(set_values)
+                    .map(|(column, value)| fsqlite_ast::Assignment {
+                        target: fsqlite_ast::AssignmentTarget::Column(column.clone()),
+                        value,
+                    })
+                    .collect();
+                row_update.where_clause = Some(Self::build_update_replay_locator_filter(
+                    &update.table,
+                    locator_columns,
+                    locator_values,
+                )?);
+                row_update.order_by.clear();
+                row_update.limit = None;
+                Statement::Update(row_update)
+            }
+            DmlRowReplay::Update(update) => {
+                let mut row_update = update.clone();
+                row_update.where_clause = Some(Self::build_update_replay_locator_filter(
+                    &update.table,
+                    locator_columns,
+                    locator_values,
+                )?);
+                row_update.order_by.clear();
+                row_update.limit = None;
+                Statement::Update(row_update)
+            }
+            DmlRowReplay::Delete(delete) => {
+                let mut row_delete = delete.clone();
+                row_delete.where_clause = Some(Self::build_update_replay_locator_filter(
+                    &delete.table,
+                    locator_columns,
+                    locator_values,
+                )?);
+                row_delete.order_by.clear();
+                row_delete.limit = None;
+                Statement::Delete(row_delete)
+            }
+        })
+    }
+
+    /// The highest bind-parameter slot `statement` itself can read: every
+    /// `?NNN` it names and every slot its anonymous and named placeholders
+    /// claim. A replay's own per-row parameters are numbered after it.
+    fn dml_replay_statement_parameter_slots(statement: DmlRowReplay<'_>) -> Result<usize> {
+        let mut bind_state = BindParamState::default();
+        match statement {
+            DmlRowReplay::Update(update) | DmlRowReplay::UpdateFrom { update, .. } => {
+                canonicalize_update_placeholders_with_state(update, &mut bind_state)?;
+            }
+            DmlRowReplay::Delete(delete) => {
+                canonicalize_delete_placeholders_with_state(delete, &mut bind_state)?;
+            }
+        }
+        Ok(usize::try_from(bind_state.next_index.saturating_sub(1)).unwrap_or(0))
+    }
+
     /// Replay a multi-row UPDATE or DELETE one row at a time, each restricted
     /// to the row's frozen locator, so every row's BEFORE triggers, change,
     /// FK actions and AFTER triggers complete before the next row starts — the
     /// order stock SQLite uses. A row a previous row's trigger already removed
     /// matches nothing and fires nothing.
+    ///
+    /// bd-so2el: the row's locator (and `UPDATE ... FROM` SET) values are bound
+    /// as parameters numbered after every slot the statement already uses, so
+    /// every row runs the same SQL text and reuses one compiled program instead
+    /// of compiling a statement with literal values per row. A literal and a
+    /// bound value both compare and assign without affinity, so the per-row
+    /// statement means the same thing either way.
     async fn execute_dml_row_by_row(
         &self,
         statement: DmlRowReplay<'_>,
@@ -52073,60 +52275,66 @@ impl Connection {
         let previous_total_changes = self.total_changes.get();
         let previous_last_insert_rowid = self.current_last_insert_rowid();
 
+        let set_count = match statement {
+            DmlRowReplay::UpdateFrom { set_columns, .. } => set_columns.len(),
+            DmlRowReplay::Update(_) | DmlRowReplay::Delete(_) => 0,
+        };
+        let row_value_count = locator_columns.len() + set_count;
+        let caller_params = params.unwrap_or(&[]);
+        let parameter_base = Self::dml_replay_statement_parameter_slots(statement)?
+            .max(caller_params.len());
+        // A statement already using slots near the variable limit keeps the
+        // per-row literal statements rather than overflowing it.
+        let parameterized_statement = if parameter_base + row_value_count
+            <= usize::try_from(MAX_VARIABLE_NUMBER).unwrap_or(usize::MAX)
+        {
+            let mut slots = (parameter_base + 1..).map(|slot| {
+                Expr::Placeholder(
+                    PlaceholderType::Numbered(u32::try_from(slot).unwrap_or(u32::MAX)),
+                    Span::ZERO,
+                )
+            });
+            let locator_slots = slots.by_ref().take(locator_columns.len()).collect();
+            let set_slots = slots.take(set_count).collect();
+            Some(Self::build_dml_replay_row_statement(
+                statement,
+                locator_columns,
+                locator_slots,
+                set_slots,
+            )?)
+        } else {
+            None
+        };
+
         self.with_statement_fk_validation_scope(preserve_constraint_failure_rows, async || {
+            let mut row_params = Vec::with_capacity(parameter_base + row_value_count);
             let mut statement_changes = 0usize;
             let mut returning_rows = Vec::new();
             for (row_index, locator_row) in locator_rows.iter().enumerate() {
                 let (locator_values, set_values) = locator_row.split_at(locator_columns.len());
-                let locator = Self::build_update_replay_locator_filter(
-                    table_ref,
-                    locator_columns,
-                    locator_values,
-                )?;
-                let row_statement = match statement {
-                    DmlRowReplay::UpdateFrom {
-                        update,
-                        set_columns,
-                    } => {
-                        // bd-2jbl5: as in stock, the join was evaluated once up
-                        // front; each row is a plain UPDATE of the target that
-                        // assigns the SET values computed for it.
-                        let mut row_update = update.clone();
-                        row_update.with = None;
-                        row_update.from = None;
-                        row_update.assignments = set_columns
-                            .iter()
-                            .zip(set_values)
-                            .map(|(column, value)| fsqlite_ast::Assignment {
-                                target: fsqlite_ast::AssignmentTarget::Column(column.clone()),
-                                value: value_to_literal_expr(value.clone()),
-                            })
-                            .collect();
-                        row_update.where_clause = Some(locator);
-                        row_update.order_by.clear();
-                        row_update.limit = None;
-                        Statement::Update(row_update)
-                    }
-                    DmlRowReplay::Update(update) => {
-                        let mut row_update = update.clone();
-                        row_update.where_clause = Some(locator);
-                        row_update.order_by.clear();
-                        row_update.limit = None;
-                        Statement::Update(row_update)
-                    }
-                    DmlRowReplay::Delete(delete) => {
-                        let mut row_delete = delete.clone();
-                        row_delete.where_clause = Some(locator);
-                        row_delete.order_by.clear();
-                        row_delete.limit = None;
-                        Statement::Delete(row_delete)
-                    }
+                let literal_statement;
+                let (row_statement, row_statement_params) = if let Some(parameterized) =
+                    &parameterized_statement
+                {
+                    row_params.clear();
+                    row_params.extend_from_slice(caller_params);
+                    row_params.resize(parameter_base, SqliteValue::Null);
+                    row_params.extend_from_slice(locator_row);
+                    (parameterized, Some(row_params.as_slice()))
+                } else {
+                    literal_statement = Self::build_dml_replay_row_statement(
+                        statement,
+                        locator_columns,
+                        locator_values.iter().cloned().map(value_to_literal_expr).collect(),
+                        set_values.iter().cloned().map(value_to_literal_expr).collect(),
+                    )?;
+                    (&literal_statement, params)
                 };
 
                 match self
                     .execute_statement_impl_after_background_status(
-                        &row_statement,
-                        params,
+                        row_statement,
+                        row_statement_params,
                         None,
                         false,
                     )
@@ -146636,35 +146844,41 @@ fn placeholder_to_index(
 fn canonicalize_update_placeholders(
     update: &fsqlite_ast::UpdateStatement,
 ) -> Result<fsqlite_ast::UpdateStatement> {
+    canonicalize_update_placeholders_with_state(update, &mut BindParamState::default())
+}
+
+fn canonicalize_update_placeholders_with_state(
+    update: &fsqlite_ast::UpdateStatement,
+    bind_state: &mut BindParamState,
+) -> Result<fsqlite_ast::UpdateStatement> {
     let mut normalized = update.clone();
-    let mut bind_state = BindParamState::default();
 
     if let Some(with_clause) = &mut normalized.with {
         for cte in &mut with_clause.ctes {
-            canonicalize_select_placeholders_in_statement(&mut cte.query, &mut bind_state)?;
+            canonicalize_select_placeholders_in_statement(&mut cte.query, bind_state)?;
         }
     }
     for assignment in &mut normalized.assignments {
-        canonicalize_expr_placeholders(&mut assignment.value, &mut bind_state)?;
+        canonicalize_expr_placeholders(&mut assignment.value, bind_state)?;
     }
     if let Some(from_clause) = &mut normalized.from {
-        canonicalize_placeholders_in_from_clause(from_clause, &mut bind_state)?;
+        canonicalize_placeholders_in_from_clause(from_clause, bind_state)?;
     }
     if let Some(where_clause) = &mut normalized.where_clause {
-        canonicalize_expr_placeholders(where_clause, &mut bind_state)?;
+        canonicalize_expr_placeholders(where_clause, bind_state)?;
     }
     for column in &mut normalized.returning {
         if let ResultColumn::Expr { expr, .. } = column {
-            canonicalize_expr_placeholders(expr, &mut bind_state)?;
+            canonicalize_expr_placeholders(expr, bind_state)?;
         }
     }
     for ordering in &mut normalized.order_by {
-        canonicalize_expr_placeholders(&mut ordering.expr, &mut bind_state)?;
+        canonicalize_expr_placeholders(&mut ordering.expr, bind_state)?;
     }
     if let Some(limit_clause) = &mut normalized.limit {
-        canonicalize_expr_placeholders(&mut limit_clause.limit, &mut bind_state)?;
+        canonicalize_expr_placeholders(&mut limit_clause.limit, bind_state)?;
         if let Some(offset) = &mut limit_clause.offset {
-            canonicalize_expr_placeholders(offset, &mut bind_state)?;
+            canonicalize_expr_placeholders(offset, bind_state)?;
         }
     }
 
@@ -146678,28 +146892,34 @@ fn canonicalize_update_placeholders(
 fn canonicalize_delete_placeholders(
     delete: &fsqlite_ast::DeleteStatement,
 ) -> Result<fsqlite_ast::DeleteStatement> {
+    canonicalize_delete_placeholders_with_state(delete, &mut BindParamState::default())
+}
+
+fn canonicalize_delete_placeholders_with_state(
+    delete: &fsqlite_ast::DeleteStatement,
+    bind_state: &mut BindParamState,
+) -> Result<fsqlite_ast::DeleteStatement> {
     let mut normalized = delete.clone();
-    let mut bind_state = BindParamState::default();
     if let Some(with_clause) = &mut normalized.with {
         for cte in &mut with_clause.ctes {
-            canonicalize_select_placeholders_in_statement(&mut cte.query, &mut bind_state)?;
+            canonicalize_select_placeholders_in_statement(&mut cte.query, bind_state)?;
         }
     }
     if let Some(where_clause) = &mut normalized.where_clause {
-        canonicalize_expr_placeholders(where_clause, &mut bind_state)?;
+        canonicalize_expr_placeholders(where_clause, bind_state)?;
     }
     for column in &mut normalized.returning {
         if let ResultColumn::Expr { expr, .. } = column {
-            canonicalize_expr_placeholders(expr, &mut bind_state)?;
+            canonicalize_expr_placeholders(expr, bind_state)?;
         }
     }
     for ordering in &mut normalized.order_by {
-        canonicalize_expr_placeholders(&mut ordering.expr, &mut bind_state)?;
+        canonicalize_expr_placeholders(&mut ordering.expr, bind_state)?;
     }
     if let Some(limit_clause) = &mut normalized.limit {
-        canonicalize_expr_placeholders(&mut limit_clause.limit, &mut bind_state)?;
+        canonicalize_expr_placeholders(&mut limit_clause.limit, bind_state)?;
         if let Some(offset) = &mut limit_clause.offset {
-            canonicalize_expr_placeholders(offset, &mut bind_state)?;
+            canonicalize_expr_placeholders(offset, bind_state)?;
         }
     }
     Ok(normalized)
@@ -149835,6 +150055,17 @@ struct DirectLiveVtabInsertProjection {
 enum InsertTarget {
     Column(usize),
     HiddenRowid,
+}
+
+/// The first hidden rowid alias (`rowid`, `_rowid_`, `oid`) that no declared
+/// column of `table` shadows.
+fn unshadowed_hidden_rowid_alias(table: &TableSchema) -> Option<&'static str> {
+    ["rowid", "_rowid_", "oid"].into_iter().find(|alias| {
+        !table
+            .columns
+            .iter()
+            .any(|column| column.name.eq_ignore_ascii_case(alias))
+    })
 }
 
 /// The statement a row-by-row DML replay re-runs once per frozen row locator.
