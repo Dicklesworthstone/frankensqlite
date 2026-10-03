@@ -44533,9 +44533,15 @@ impl Connection {
         }
         let col_affinities =
             col_affinities_for_sources(&all_sources, &table_sources, &schema_snapshot);
+        let mut declared_blob_columns = self.builtin_json_key_columns(&all_sources, &col_map);
+        declared_blob_columns.extend(typeless_base_table_columns(
+            &all_sources,
+            &table_sources,
+            &schema_snapshot,
+        ));
         let _join_eval_collation_guard =
             JoinEvalCollationContextGuard::push(JoinEvalCollationContext {
-                declared_json_keys: HashSet::new(),
+                declared_json_keys: declared_blob_columns.clone(),
                 column_collations: col_collations.clone(),
                 column_affinities: col_affinities.clone(),
                 using_column_projections: HashMap::new(),
@@ -44666,6 +44672,7 @@ impl Connection {
             col_map,
             column_collations: col_collations,
             column_affinities: col_affinities,
+            declared_blob_columns,
             total_width,
             primary_width,
         }))
@@ -44705,7 +44712,7 @@ impl Connection {
     {
         let _join_eval_collation_guard =
             JoinEvalCollationContextGuard::push(JoinEvalCollationContext {
-                declared_json_keys: HashSet::new(),
+                declared_json_keys: prepared.declared_blob_columns.clone(),
                 column_collations: prepared.column_collations.clone(),
                 column_affinities: prepared.column_affinities.clone(),
                 using_column_projections: HashMap::new(),
@@ -81576,7 +81583,7 @@ impl Connection {
         );
         let _join_eval_collation_guard =
             JoinEvalCollationContextGuard::push(JoinEvalCollationContext {
-                declared_json_keys: HashSet::new(),
+                declared_json_keys: self.build_join_declared_blob_columns(select),
                 column_collations,
                 column_affinities,
                 using_column_projections,
@@ -81747,7 +81754,7 @@ impl Connection {
         );
         let _join_eval_collation_guard =
             JoinEvalCollationContextGuard::push(JoinEvalCollationContext {
-                declared_json_keys: HashSet::new(),
+                declared_json_keys: self.build_join_declared_blob_columns(select),
                 column_collations,
                 column_affinities,
                 using_column_projections,
@@ -83120,6 +83127,52 @@ impl Connection {
             }
         }
         affinities
+    }
+
+    /// Indices, in the [`Self::build_join_col_affinities`] layout, of base-table
+    /// columns declared without a type. Their BLOB affinity is real, unlike the
+    /// BLOB placeholder a computed source column gets, so a comparison with a
+    /// TEXT column converts nothing (GH#428).
+    fn build_join_declared_blob_columns(&self, select: &SelectStatement) -> HashSet<usize> {
+        let mut declared = HashSet::new();
+        let SelectCore::Select {
+            from: Some(from), ..
+        } = &select.body.select
+        else {
+            return declared;
+        };
+        let schema = self.schema.borrow().clone();
+        let mut visible_ctes = Vec::new();
+        if let Some(with) = &select.with {
+            visible_ctes.extend(with.ctes.clone());
+        }
+        let mut offset = 0usize;
+        for source in std::iter::once(&from.source).chain(from.joins.iter().map(|join| &join.table))
+        {
+            let column_names = self.source_column_names_for_join_layout(source, &visible_ctes);
+            if let TableOrSubquery::Table { name, .. } = source
+                && !visible_ctes
+                    .iter()
+                    .any(|cte| cte.name.eq_ignore_ascii_case(&name.name))
+                && let Some(table) = schema
+                    .iter()
+                    .find(|table| table.name.eq_ignore_ascii_case(&name.name))
+            {
+                for (index, column) in table.columns.iter().enumerate().take(column_names.len()) {
+                    if affinity_char_to_type(column.affinity) == TypeAffinity::Blob {
+                        declared.insert(offset + index);
+                    }
+                }
+            }
+            offset += column_names.len();
+            if self
+                .hidden_rowid_projection_for_source(source, &column_names)
+                .is_some()
+            {
+                offset += 1;
+            }
+        }
+        declared
     }
 
     fn hidden_rowid_projection_for_source(
@@ -149936,6 +149989,26 @@ fn hash_join_pairs_with_modes(
                     .column_affinities
                     .get(left_width + right_idx)
                     .copied()?;
+                // GH#428 (bd-y5mc8): a TEXT column against a declared typeless
+                // column has no comparison affinity, so the integer 2 does not
+                // equal '2'. A BLOB entry that is not declared may stand for a
+                // computed column with no affinity, which does take TEXT.
+                let declared_typeless_against_text = match (left_affinity, right_affinity) {
+                    (TypeAffinity::Text, TypeAffinity::Blob) => {
+                        context.declared_json_keys.contains(&(left_width + right_idx))
+                    }
+                    (TypeAffinity::Blob, TypeAffinity::Text) => {
+                        context.declared_json_keys.contains(&left_idx)
+                    }
+                    _ => false,
+                };
+                if declared_typeless_against_text {
+                    return Some(HashJoinPair {
+                        left_idx,
+                        right_idx,
+                        mode: HashJoinKeyMode::Raw,
+                    });
+                }
                 let mode = match TypeAffinity::comparison_affinity(left_affinity, right_affinity) {
                     None => HashJoinKeyMode::Raw,
                     Some(TypeAffinity::Text) => HashJoinKeyMode::Text,
@@ -150181,6 +150254,8 @@ struct PreparedStreamingJoinRows {
     col_map: Vec<(String, String, bool)>,
     column_collations: Vec<Option<String>>,
     column_affinities: Vec<TypeAffinity>,
+    /// Combined-row indices of declared typeless (BLOB) base-table columns.
+    declared_blob_columns: HashSet<usize>,
     total_width: usize,
     primary_width: usize,
 }

@@ -65,22 +65,10 @@ const INDEXES: &[&str] = &[
 const T_COLUMNS: &[&str] = &["id", "a", "b", "c", "d", "n"];
 const U_COLUMNS: &[&str] = &["id", "a", "b", "r", "d", "n"];
 
-/// Columns with numeric affinity (the rowid alias included).
-fn is_numeric_column(column: &str) -> bool {
-    matches!(column, "id" | "a" | "c" | "r" | "n")
-}
-
-fn queries(indexed: bool) -> Vec<String> {
+fn queries() -> Vec<String> {
     let mut queries = Vec::new();
     for tc in T_COLUMNS {
         for uc in U_COLUMNS {
-            // A numeric probe into an index on the typeless column `d` keeps
-            // the raw probe and misses numeric-looking TEXT in `d` (bd-kr6hf).
-            if indexed
-                && ((*tc == "d" && is_numeric_column(uc)) || (*uc == "d" && is_numeric_column(tc)))
-            {
-                continue;
-            }
             queries.push(format!("SELECT count(*) FROM u JOIN t ON t.{tc} = u.{uc}"));
             queries.push(format!("SELECT count(*) FROM t JOIN u ON t.{tc} = u.{uc}"));
             queries.push(format!("SELECT sum(t.id), max(u.id) FROM u JOIN t ON t.{tc} = u.{uc}"));
@@ -106,10 +94,9 @@ fn queries(indexed: bool) -> Vec<String> {
         ));
     }
     // Multi-join chains through UNIQUE indexes and the rowid. The typeless
-    // probe `u.d` against the TEXT key `v.k` is left out: that chain matches
-    // integer 2 to '2' already in 0.4.7, by a path this change does not touch
-    // (bd-y5mc8).
-    for probe in ["u.a", "u.b", "u.r", "u.n"] {
+    // probe `u.d` against the TEXT key `v.k` compares without conversion, so
+    // integer 2 does not match '2' (bd-y5mc8).
+    for probe in ["u.a", "u.b", "u.r", "u.d", "u.n"] {
         queries.push(format!(
             "SELECT u.id, v.id, t.id FROM u JOIN v ON v.k = {probe} JOIN t ON t.id = v.m ORDER BY 1, 2, 3"
         ));
@@ -155,7 +142,7 @@ fn join_lookups_apply_comparison_affinity_like_sqlite() {
                 f.execute(sql).await.unwrap();
                 r.execute(sql, []).unwrap();
             }
-            for sql in queries(indexed) {
+            for sql in queries() {
                 assert_agree(&f, &r, &sql).await;
             }
         });
@@ -209,7 +196,8 @@ async fn opcodes(conn: &Connection, sql: &str) -> Vec<String> {
 
 /// The affinity fix must not turn common join shapes into nested loops: a
 /// TEXT key joined to an INTEGER UNIQUE key seeks with the coerced probe, and
-/// an untyped foreign-key column keeps its index lookup (bd-kr6hf).
+/// an untyped foreign-key column drives the join and looks the parent up by
+/// rowid, as SQLite does (bd-kr6hf).
 #[test]
 fn coercible_join_keys_keep_the_index_lookup() {
     asupersync::test_utils::run_test(|| async {
@@ -249,8 +237,10 @@ fn coercible_join_keys_keep_the_index_lookup() {
         );
         let ops = opcodes(&f, untyped_fk).await;
         assert!(
-            ops.iter().any(|op| op == "SeekGE"),
-            "the untyped foreign key must seek child_p: {ops:?}"
+            ops.iter().any(|op| op == "SeekRowid")
+                && !ops.iter().any(|op| op == "SeekGE")
+                && ops.iter().filter(|op| *op == "Rewind").count() == 1,
+            "the untyped foreign key must scan child once and seek parent by rowid: {ops:?}"
         );
     });
 }

@@ -9822,23 +9822,7 @@ fn codegen_select_ordered_scan(
     // Open sorter: p2 = number of key columns, p4 = sort order + collation.
     // Sort order chars: '+' = ASC (nulls first), '-' = DESC (nulls last),
     // '>' = ASC NULLS LAST, '<' = DESC NULLS FIRST.
-    let sort_order: String = order_by
-        .iter()
-        .map(|term| {
-            let is_desc = term.direction == Some(SortDirection::Desc);
-            let nulls_last = match term.nulls {
-                Some(NullsOrder::Last) => true,
-                Some(NullsOrder::First) => false,
-                None => is_desc, // SQLite default: ASC→nulls first, DESC→nulls last
-            };
-            match (is_desc, nulls_last) {
-                (false, false) => '+', // ASC NULLS FIRST (default)
-                (false, true) => '>',  // ASC NULLS LAST
-                (true, true) => '-',   // DESC NULLS LAST (default)
-                (true, false) => '<',  // DESC NULLS FIRST
-            }
-        })
-        .collect();
+    let sort_order: String = order_by.iter().map(sorter_order_char).collect();
     // Build per-key collation info from the resolved sort keys.
     let sort_collations: Vec<String> = sort_keys
         .iter()
@@ -10908,6 +10892,10 @@ fn grouped_inner_join_count_sum_plan<'a>(
     ) else {
         return Ok(None);
     };
+    // This lane's index loop matches only keys equal to the raw probe.
+    if join_lookup.numeric_text_walk {
+        return Ok(None);
+    }
 
     Ok(Some(GroupedInnerJoinCountSumPlan {
         left_table,
@@ -11264,9 +11252,13 @@ struct SingleJoinLookupPlan<'a> {
     /// A key expression over the left table (`t.id = u.id * 17`), evaluated
     /// per left row in place of `probe_source`.
     probe_expr: Option<&'a Expr>,
-    /// For an expression probe into an index: the indexed column's affinity,
-    /// which SQLite applies to an affinity-less operand before comparing.
+    /// The index key affinity SQLite applies to the probe before seeking: an
+    /// affinity-less expression key, or a column key the comparison coerces.
     probe_affinity: Option<char>,
+    /// A numeric probe into an index on a typeless column (bd-kr6hf): after
+    /// the run of keys equal to the raw probe, also walk the index's TEXT
+    /// keys and match those equal to the probe under NUMERIC affinity.
+    numeric_text_walk: bool,
     lookup_target: SingleJoinLookupTarget<'a>,
 }
 
@@ -11432,6 +11424,28 @@ fn codegen_join_aggregate_select(
         kind,
         Some(on_expr),
     ) {
+        if let Some(swapped) = swapped_join_lookup_plan_avoiding_text_walk(
+            &plan,
+            left_table,
+            left_alias,
+            right_table,
+            right_alias,
+            Some(on_expr),
+        ) {
+            return codegen_single_join_lookup_select(
+                b,
+                stmt,
+                columns,
+                where_clause,
+                right_table,
+                right_alias,
+                left_table,
+                left_alias,
+                &swapped,
+                ctx,
+                aggregates,
+            );
+        }
         return codegen_single_join_lookup_select(
             b,
             stmt,
@@ -11581,21 +11595,24 @@ fn resolve_single_join_lookup_plan<'a>(
     };
 
     let mut probe_affinity = None;
+    let mut numeric_text_walk = false;
     let lookup_target = match lookup_source {
         SortKeySource::Rowid => SingleJoinLookupTarget::Rowid,
         SortKeySource::Column(col_idx) => {
             if probe_expr.is_some() {
-                probe_affinity = Some(right_table.columns.get(col_idx)?.affinity);
+                let affinity = right_table.columns.get(col_idx)?.affinity;
+                probe_affinity = Some(index_key_affinity(affinity));
             } else {
-                probe_affinity = match join_lookup_column_pair_probe(
+                match join_lookup_column_pair_probe(
                     left_table,
                     &probe_source,
                     right_table,
                     col_idx,
                 )? {
-                    JoinLookupProbe::Raw => None,
-                    JoinLookupProbe::Coerce(affinity) => Some(affinity),
-                };
+                    JoinLookupProbe::Raw => {}
+                    JoinLookupProbe::Coerce(affinity) => probe_affinity = Some(affinity),
+                    JoinLookupProbe::RawThenNumericText => numeric_text_walk = true,
+                }
             }
             let column_name = &right_table.columns.get(col_idx)?.name;
             let comparison_tables = [(left_table, left_alias), (right_table, right_alias)];
@@ -11616,16 +11633,57 @@ fn resolve_single_join_lookup_plan<'a>(
         probe_source,
         probe_expr,
         probe_affinity,
+        numeric_text_walk,
         lookup_target,
     })
+}
+
+/// For an inner join whose written-order lookup must walk an index's TEXT keys
+/// (a numeric probe into a typeless index, bd-kr6hf), the plan that drives
+/// from the other table instead, when that one is an exact lookup without a
+/// walk. SQLite makes the same choice: it cannot use the typeless index for
+/// that comparison, so it scans the typeless side and looks the numeric side
+/// up by rowid or by its numeric index.
+fn swapped_join_lookup_plan_avoiding_text_walk<'a>(
+    written: &SingleJoinLookupPlan<'_>,
+    left_table: &'a TableSchema,
+    left_alias: Option<&'a str>,
+    right_table: &'a TableSchema,
+    right_alias: Option<&'a str>,
+    on_expr: Option<&'a Expr>,
+) -> Option<SingleJoinLookupPlan<'a>> {
+    if !written.numeric_text_walk || written.join_kind != fsqlite_ast::JoinKind::Inner {
+        return None;
+    }
+    resolve_single_join_lookup_plan(
+        right_table,
+        right_alias,
+        left_table,
+        left_alias,
+        written.join_kind,
+        on_expr,
+    )
+    .filter(|swapped| !swapped.numeric_text_walk)
+}
+
+/// The affinity SQLite applies to a probe of an index on a column with
+/// `affinity`: INTEGER and REAL are capped at NUMERIC (`sqlite3IndexAffinityStr`).
+fn index_key_affinity(affinity: char) -> char {
+    match affinity.to_ascii_uppercase() {
+        'D' | 'E' => 'C',
+        other => other,
+    }
 }
 
 /// How a plain column-pair join key probes the lookup index.
 enum JoinLookupProbe {
     /// Seek with the raw probe value.
     Raw,
-    /// Apply this affinity (the indexed column's) to the probe, then seek.
+    /// Apply this affinity (the index key's, NUMERIC) to the probe, then seek.
     Coerce(char),
+    /// Seek with the raw probe, then, when the probe is a number, also match
+    /// the index's TEXT keys that equal it under NUMERIC affinity.
+    RawThenNumericText,
 }
 
 /// How a plain `probe_column = lookup_column` join key can drive an index
@@ -11638,16 +11696,16 @@ enum JoinLookupProbe {
 /// - No comparison affinity (GH#428: two declared non-numeric columns, or two
 ///   numeric ones): raw values compare.
 /// - Numeric comparison affinity needs a numeric index column, and the probe
-///   gets that column's affinity.
+///   gets NUMERIC affinity (SQLite's index affinity for INTEGER and REAL).
 /// - A numeric probe into a TEXT index cannot be served (a raw probe never
 ///   matches text keys); the general join compares those pairs.
-/// - A numeric probe into a typeless index keeps the raw probe, as before
-///   0.4.8. It finds every row whose stored value is a number, and misses
-///   only numeric-looking TEXT stored in the typeless column, which SQLite
-///   would coerce (bd-kr6hf). The general join would be exact but turns a
-///   common shape (an untyped foreign-key column, `FROM parent JOIN child ON
-///   child.parent_id = parent.id`) into a nested loop, since this path does
-///   not reorder the join to a rowid lookup as SQLite does.
+/// - A numeric probe into a typeless index seeks with the raw probe, which
+///   finds every row stored as a number, and then walks the index's TEXT keys
+///   for numeric-looking text that NUMERIC affinity makes equal (`'2'`,
+///   `' 2'`, `'2.0'`; bd-kr6hf). The walk costs one extra seek when the
+///   column holds no text. An inner join prefers driving from the typeless
+///   side instead when the numeric side has a rowid or numeric-index lookup,
+///   as SQLite does, since that needs no walk at all.
 ///
 /// Rowid lookups do not need this: their probe goes through `MustBeInt`,
 /// which applies the same numeric coercion.
@@ -11674,10 +11732,13 @@ fn join_lookup_column_pair_probe(
     .ok()?
     {
         0 => Some(JoinLookupProbe::Raw),
+        // SQLite's index affinity caps INTEGER and REAL at NUMERIC, so the
+        // probe keeps an integer that a REAL column would store as a real:
+        // '9223372036854775807' must not become 9223372036854775808.0.
         b'C' if matches!(lookup_affinity, b'C' | b'D' | b'E') => {
-            Some(JoinLookupProbe::Coerce(char::from(lookup_affinity)))
+            Some(JoinLookupProbe::Coerce('C'))
         }
-        b'C' if lookup_affinity == b'A' => Some(JoinLookupProbe::Raw),
+        b'C' if lookup_affinity == b'A' => Some(JoinLookupProbe::RawThenNumericText),
         _ => None,
     }
 }
@@ -11754,6 +11815,49 @@ fn direct_lookup_index_comparison_p4(index: &IndexSchema) -> P4 {
         .map_or(P4::None, |collation| P4::Collation(collation.to_owned()))
 }
 
+/// The sorter's direction character for an ORDER BY term: '+' ASC NULLS
+/// FIRST (default), '>' ASC NULLS LAST, '-' DESC NULLS LAST (default), '<'
+/// DESC NULLS FIRST.
+fn sorter_order_char(term: &OrderingTerm) -> char {
+    let is_desc = term.direction == Some(SortDirection::Desc);
+    let nulls_last = match term.nulls {
+        Some(NullsOrder::Last) => true,
+        Some(NullsOrder::First) => false,
+        None => is_desc, // SQLite default: ASC→nulls first, DESC→nulls last
+    };
+    match (is_desc, nulls_last) {
+        (false, false) => '+',
+        (false, true) => '>',
+        (true, true) => '-',
+        (true, false) => '<',
+    }
+}
+
+/// Emit one ORDER BY key of a join. An in-range integer ordinal names a result
+/// column (counting columns expanded from `*`), whose value the caller has
+/// already emitted at `out_regs`; anything else is an expression.
+#[allow(clippy::too_many_arguments)]
+fn emit_join_order_key(
+    b: &mut ProgramBuilder,
+    order_expr: &Expr,
+    target: i32,
+    out_regs: i32,
+    out_col_count: usize,
+    tables: &[(&TableSchema, Option<&str>)],
+    ctx: &CodegenContext,
+) -> Result<(), CodegenError> {
+    if let Some(slot) = order_by_integer_ordinal(order_expr)
+        .and_then(|ordinal| usize::try_from(ordinal).ok())
+        .and_then(|ordinal| ordinal.checked_sub(1))
+        .filter(|slot| *slot < out_col_count)
+        .and_then(|slot| i32::try_from(slot).ok())
+    {
+        b.emit_op(Opcode::SCopy, out_regs + slot, target, 0, P4::None, 0);
+        return Ok(());
+    }
+    emit_join_expr(b, order_expr, target, tables, ctx)
+}
+
 fn emit_join_output_or_sort(
     b: &mut ProgramBuilder,
     columns: &[ResultColumn],
@@ -11768,7 +11872,7 @@ fn emit_join_output_or_sort(
     if let Some((sort_cursor, sort_regs, sort_key_count, sort_record_reg)) = sorter {
         for (i, term) in order_by.iter().enumerate() {
             let sort_reg = sort_regs + i as i32;
-            emit_join_expr(b, &term.expr, sort_reg, tables, ctx)?;
+            emit_join_order_key(b, &term.expr, sort_reg, out_regs, out_col_count, tables, ctx)?;
         }
         for i in 0..out_col_count {
             let src = out_regs + i as i32;
@@ -11927,23 +12031,14 @@ fn codegen_single_join_lookup_select(
         let total_sort_cols = sort_key_count + out_col_count;
         let sort_regs = b.alloc_regs(total_sort_cols as i32);
         let sort_record_reg = b.alloc_reg();
-        let sort_order = stmt
-            .order_by
-            .iter()
-            .map(|term| {
-                if term.direction == Some(fsqlite_ast::SortDirection::Desc) {
-                    '-'
-                } else {
-                    '+'
-                }
-            })
-            .collect::<String>();
+        // P2 counts the key columns; the output columns ride along unsorted.
+        let sort_order = stmt.order_by.iter().map(sorter_order_char).collect::<String>();
         b.emit_op(
             Opcode::SorterOpen,
             sort_cursor,
-            total_sort_cols as i32,
+            sort_key_count as i32,
             0,
-            P4::Affinity(sort_order),
+            P4::Str(sort_order),
             0,
         );
         Some((sort_cursor, sort_regs, sort_key_count, sort_record_reg))
@@ -12067,6 +12162,41 @@ fn codegen_single_join_lookup_select(
                 P4::None,
                 0,
             );
+            // The index entry under the cursor matched: fetch its row, then
+            // filter and emit it, or continue at `advance`.
+            let emit_entry_match = |b: &mut ProgramBuilder, advance: Label| {
+                if seek_right_row {
+                    let rowid_reg = b.alloc_reg();
+                    b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
+                    b.emit_jump_to_label(
+                        Opcode::SeekRowid,
+                        right_cursor,
+                        rowid_reg,
+                        advance,
+                        P4::None,
+                        0,
+                    );
+                }
+                if let Some(match_reg) = left_join_match_reg {
+                    b.emit_op(Opcode::Integer, 1, match_reg, 0, P4::None, 0);
+                }
+                if let Some(where_expr) = where_clause {
+                    let cond_reg = b.alloc_reg();
+                    emit_join_expr(b, where_expr, cond_reg, &tables, ctx)?;
+                    b.emit_jump_to_label(Opcode::IfNot, cond_reg, 1, advance, P4::None, 0);
+                }
+                emit_join_lookup_match(
+                    b,
+                    columns,
+                    out_regs,
+                    &tables,
+                    ctx,
+                    sorter,
+                    &stmt.order_by,
+                    aggregates,
+                    accum_base,
+                )
+            };
             let idx_loop_top = b.current_addr();
             let idx_key_reg = b.alloc_reg();
             b.emit_op(Opcode::Column, idx_cursor, 0, idx_key_reg, P4::None, 0);
@@ -12079,42 +12209,58 @@ fn codegen_single_join_lookup_select(
                 0,
             );
             let idx_advance = b.emit_label();
-            if seek_right_row {
-                let rowid_reg = b.alloc_reg();
-                b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
-                b.emit_jump_to_label(
-                    Opcode::SeekRowid,
-                    right_cursor,
-                    rowid_reg,
-                    idx_advance,
-                    P4::None,
-                    0,
-                );
-            }
-            if let Some(match_reg) = left_join_match_reg {
-                b.emit_op(Opcode::Integer, 1, match_reg, 0, P4::None, 0);
-            }
-            if let Some(where_expr) = where_clause {
-                let cond_reg = b.alloc_reg();
-                emit_join_expr(b, where_expr, cond_reg, &tables, ctx)?;
-                b.emit_jump_to_label(Opcode::IfNot, cond_reg, 1, idx_advance, P4::None, 0);
-            }
-            emit_join_lookup_match(
-                b,
-                columns,
-                out_regs,
-                &tables,
-                ctx,
-                sorter,
-                &stmt.order_by,
-                aggregates,
-                accum_base,
-            )?;
+            emit_entry_match(b, idx_advance)?;
             b.resolve_label(idx_advance);
             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
             let idx_loop_body = idx_loop_top as i32;
             b.emit_op(Opcode::Next, idx_cursor, idx_loop_body, 0, P4::None, 0);
             b.resolve_label(duplicate_run_done);
+            if plan.numeric_text_walk {
+                // bd-kr6hf: SQLite compares a numeric probe with a typeless
+                // column under NUMERIC affinity, so TEXT keys such as '2',
+                // ' 2' or '2.0' equal the probe 2. Index order puts every
+                // TEXT key after the numbers and before the BLOBs, so seek to
+                // the first TEXT key and test each one until a BLOB or the
+                // end. Only a numeric probe can match there: a TEXT probe's
+                // equal keys were all in the run above.
+                let text_base = b.alloc_regs(2);
+                b.emit_op(Opcode::String8, 0, text_base, 0, P4::Str(String::new()), 0);
+                // `probe >= ''`: the probe is TEXT or a BLOB.
+                b.emit_jump_to_label(Opcode::Ge, text_base, probe_reg, no_match, P4::None, 0);
+                b.emit_op(Opcode::Int64, 0, text_base + 1, 0, P4::Int64(i64::MIN), 0);
+                let text_record_reg = b.alloc_reg();
+                b.emit_op(
+                    Opcode::MakeRecord,
+                    text_base,
+                    2,
+                    text_record_reg,
+                    P4::None,
+                    0,
+                );
+                b.emit_jump_to_label(
+                    Opcode::SeekGE,
+                    idx_cursor,
+                    text_record_reg,
+                    no_match,
+                    P4::None,
+                    0,
+                );
+                let blob_floor_reg = b.alloc_reg();
+                b.emit_op(Opcode::Blob, 0, blob_floor_reg, 0, P4::Blob(Vec::new()), 0);
+                let text_loop_top = b.current_addr();
+                let text_key_reg = b.alloc_reg();
+                b.emit_op(Opcode::Column, idx_cursor, 0, text_key_reg, P4::None, 0);
+                // `key >= x''`: past the TEXT keys.
+                b.emit_jump_to_label(Opcode::Ge, blob_floor_reg, text_key_reg, no_match, P4::None, 0);
+                b.emit_op(Opcode::Affinity, text_key_reg, 1, 0, P4::Affinity("C".to_owned()), 0);
+                let text_advance = b.emit_label();
+                b.emit_jump_to_label(Opcode::Ne, probe_reg, text_key_reg, text_advance, P4::None, 0);
+                emit_entry_match(b, text_advance)?;
+                b.resolve_label(text_advance);
+                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                let text_loop_body = text_loop_top as i32;
+                b.emit_op(Opcode::Next, idx_cursor, text_loop_body, 0, P4::None, 0);
+            }
             b.resolve_label(no_match);
         }
     }
@@ -12364,14 +12510,14 @@ fn resolve_multi_join_lookup_plan<'a>(
             SortKeySource::Column(col_idx) => {
                 // The chain emitter probes with the raw value, so it takes only
                 // pairs whose comparison converts nothing.
-                if matches!(
+                if !matches!(
                     join_lookup_column_pair_probe(
                         tables.get(probe_table_index)?.0,
                         &probe_source,
                         right_table,
                         col_idx,
                     )?,
-                    JoinLookupProbe::Coerce(_)
+                    JoinLookupProbe::Raw
                 ) {
                     return None;
                 }
@@ -12500,23 +12646,14 @@ fn codegen_multi_join_lookup_select(
         let total_sort_cols = sort_key_count + out_col_count;
         let sort_regs = b.alloc_regs(total_sort_cols as i32);
         let sort_record_reg = b.alloc_reg();
-        let sort_order = stmt
-            .order_by
-            .iter()
-            .map(|term| {
-                if term.direction == Some(fsqlite_ast::SortDirection::Desc) {
-                    '-'
-                } else {
-                    '+'
-                }
-            })
-            .collect::<String>();
+        // P2 counts the key columns; the output columns ride along unsorted.
+        let sort_order = stmt.order_by.iter().map(sorter_order_char).collect::<String>();
         b.emit_op(
             Opcode::SorterOpen,
             sort_cursor,
-            total_sort_cols as i32,
+            sort_key_count as i32,
             0,
-            P4::Affinity(sort_order),
+            P4::Str(sort_order),
             0,
         );
         Some((sort_cursor, sort_regs, sort_key_count, sort_record_reg))
@@ -12676,7 +12813,15 @@ fn codegen_multi_join_lookup_select(
     if let Some((sort_cursor, sort_regs, sort_key_count, sort_record_reg)) = sorter {
         for (i, term) in stmt.order_by.iter().enumerate() {
             let sort_reg = sort_regs + i as i32;
-            emit_join_expr(b, &term.expr, sort_reg, &all_tables, ctx)?;
+            emit_join_order_key(
+                b,
+                &term.expr,
+                sort_reg,
+                out_regs,
+                out_col_count,
+                &all_tables,
+                ctx,
+            )?;
         }
         for i in 0..out_col_count {
             let src = out_regs + i as i32;
@@ -12735,7 +12880,15 @@ fn codegen_multi_join_lookup_select(
         if let Some((sort_cursor, sort_regs, sort_key_count, sort_record_reg)) = sorter {
             for (i, term) in stmt.order_by.iter().enumerate() {
                 let sort_reg = sort_regs + i as i32;
-                emit_join_expr(b, &term.expr, sort_reg, &all_tables, ctx)?;
+                emit_join_order_key(
+                b,
+                &term.expr,
+                sort_reg,
+                out_regs,
+                out_col_count,
+                &all_tables,
+                ctx,
+            )?;
             }
             for i in 0..out_col_count {
                 let src = out_regs + i as i32;
@@ -12886,6 +13039,31 @@ fn codegen_join_select(
             *on_expr,
         )
     {
+        // `*` lists columns in cursor order, so it keeps the written order.
+        if !columns.iter().any(|column| matches!(column, ResultColumn::Star))
+            && let Some(swapped) = swapped_join_lookup_plan_avoiding_text_walk(
+                &plan,
+                left_table,
+                left_alias,
+                right_table,
+                right_alias.as_deref(),
+                *on_expr,
+            )
+        {
+            return codegen_single_join_lookup_select(
+                b,
+                stmt,
+                columns,
+                where_clause,
+                right_table,
+                right_alias.as_deref(),
+                left_table,
+                left_alias,
+                &swapped,
+                ctx,
+                &[],
+            );
+        }
         return codegen_single_join_lookup_select(
             b,
             stmt,
@@ -12982,23 +13160,14 @@ fn codegen_join_select(
         let total_sort_cols = sort_key_count + out_col_count;
         let sort_regs = b.alloc_regs(total_sort_cols as i32);
         let sort_record_reg = b.alloc_reg();
-        let sort_order = stmt
-            .order_by
-            .iter()
-            .map(|term| {
-                if term.direction == Some(fsqlite_ast::SortDirection::Desc) {
-                    '-'
-                } else {
-                    '+'
-                }
-            })
-            .collect::<String>();
+        // P2 counts the key columns; the output columns ride along unsorted.
+        let sort_order = stmt.order_by.iter().map(sorter_order_char).collect::<String>();
         b.emit_op(
             Opcode::SorterOpen,
             sort_cursor,
-            total_sort_cols as i32,
+            sort_key_count as i32,
             0,
-            P4::Affinity(sort_order),
+            P4::Str(sort_order),
             0,
         );
         Some((sort_cursor, sort_regs, sort_key_count, sort_record_reg))
@@ -13057,7 +13226,15 @@ fn codegen_join_select(
         // Copy sort keys then output columns into sorter registers.
         for (i, term) in stmt.order_by.iter().enumerate() {
             let sort_reg = sort_regs + i as i32;
-            emit_join_expr(b, &term.expr, sort_reg, &all_tables, ctx)?;
+            emit_join_order_key(
+                b,
+                &term.expr,
+                sort_reg,
+                out_regs,
+                out_col_count,
+                &all_tables,
+                ctx,
+            )?;
         }
         for i in 0..out_col_count {
             let src = out_regs + i as i32;
@@ -13126,7 +13303,15 @@ fn codegen_join_select(
         if let Some((sort_cursor, sort_regs, sort_key_count, sort_record_reg)) = sorter {
             for (i, term) in stmt.order_by.iter().enumerate() {
                 let sort_reg = sort_regs + i as i32;
-                emit_join_expr(b, &term.expr, sort_reg, &all_tables, ctx)?;
+                emit_join_order_key(
+                b,
+                &term.expr,
+                sort_reg,
+                out_regs,
+                out_col_count,
+                &all_tables,
+                ctx,
+            )?;
             }
             for i in 0..out_col_count {
                 let src = out_regs + i as i32;
