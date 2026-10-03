@@ -263,14 +263,6 @@ fn update_conflict_restore_keeps_every_index_consistent() {
                         &[""]
                     };
                     for mode in modes {
-                        // UPDATE OR IGNORE / OR REPLACE ... FROM fails to
-                        // resolve the FROM alias ("no such column: v.k"), a
-                        // separate open bug; the other modes cover the path.
-                        if template.contains("FROM src")
-                            && matches!(*mode, "OR IGNORE " | "OR REPLACE ")
-                        {
-                            continue;
-                        }
                         let sql = template.replace("{or}", mode);
                         run_case(&schema, indexes, &sql, &mut failures).await;
                         cases += 1;

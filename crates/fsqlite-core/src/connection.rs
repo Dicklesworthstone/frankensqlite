@@ -36500,7 +36500,12 @@ impl Connection {
         {
             return Ok(());
         }
-        if !self.in_transaction.get() && self.active_txn.borrow().is_none() {
+        // Without an explicit transaction the statement runs inside an
+        // autocommit one (a nested statement of a row-by-row replay or a
+        // trigger step): its constraint error propagates and the enclosing
+        // autocommit statement rolls back. A ROLLBACK here would fail with
+        // "no transaction is active" and replace the constraint error.
+        if !self.in_transaction.get() {
             return Ok(());
         }
         let rollback_stmt = fsqlite_ast::RollbackStatement { to_savepoint: None };
@@ -39956,26 +39961,39 @@ impl Connection {
                         "UPDATE of the implicit rowid ({alias}) on a table with UPDATE triggers"
                     )));
                 }
-                let needs_row_by_row_replay = effective_update.from.is_none()
-                    && (has_before_update
-                        || has_after_update
-                        || self.fk_cascade_propagation_enabled());
-                if needs_row_by_row_replay
-                    && let Some((locator_columns, locator_rows)) = self
-                        .materialize_dml_replay_locators(
-                            &effective_update.table,
-                            effective_update.where_clause.as_ref(),
-                            params,
-                        )
+                let needs_row_by_row_replay =
+                    has_before_update || has_after_update || self.fk_cascade_propagation_enabled();
+                let replay_locators = if !needs_row_by_row_replay {
+                    None
+                } else if effective_update.from.is_some() {
+                    self.materialize_update_from_replay_locators(&effective_update, params)
                         .await?
+                        .map(|(columns, set_columns, rows)| (columns, Some(set_columns), rows))
+                } else {
+                    self.materialize_dml_replay_locators(
+                        &effective_update.table,
+                        effective_update.where_clause.as_ref(),
+                        params,
+                    )
+                    .await?
+                    .map(|(columns, rows)| (columns, None, rows))
+                };
+                if let Some((locator_columns, set_columns, locator_rows)) = replay_locators
                     && locator_rows.len() > 1
                 {
                     self.log_mem_execution_fallback(
                         "update",
                         "update_row_by_row_trigger_or_fk_fallback",
                     )?;
+                    let replay = match &set_columns {
+                        Some(set_columns) => DmlRowReplay::UpdateFrom {
+                            update: &effective_update,
+                            set_columns,
+                        },
+                        None => DmlRowReplay::Update(&effective_update),
+                    };
                     return Box::pin(self.execute_dml_row_by_row(
-                        DmlRowReplay::Update(&effective_update),
+                        replay,
                         params,
                         &locator_columns,
                         &locator_rows,
@@ -51781,6 +51799,33 @@ impl Connection {
         where_clause: Option<&Expr>,
         params: Option<&[SqliteValue]>,
     ) -> Result<Option<(Vec<String>, Vec<Vec<SqliteValue>>)>> {
+        let Some(locator_columns) = self.dml_replay_locator_columns(table_ref)? else {
+            return Ok(None);
+        };
+        let projections = locator_columns
+            .iter()
+            .map(|column| ResultColumn::Expr {
+                expr: Self::build_limit_scope_projection_expr(table_ref, column),
+                alias: None,
+            })
+            .collect();
+        let select =
+            Self::build_single_table_select(table_ref, projections, where_clause, &[], None);
+        let locator_rows = self
+            .execute_statement(&Statement::Select(select), params)
+            .await?
+            .into_iter()
+            .map(|row| row.values().to_vec())
+            .collect();
+        Ok(Some((locator_columns, locator_rows)))
+    }
+
+    /// The columns that locate one row of `table_ref` for a row-by-row DML
+    /// replay, or `None` when no stable locator exists.
+    fn dml_replay_locator_columns(
+        &self,
+        table_ref: &fsqlite_ast::QualifiedTableRef,
+    ) -> Result<Option<Vec<String>>> {
         let table_name = &table_ref.name.name;
         let targets_shadowed_main = self.targets_shadowed_main(&table_ref.name);
         let visible_schema = self.schema.borrow();
@@ -51819,28 +51864,125 @@ impl Connection {
                 return Ok(None);
             }
         };
-        drop(visible_schema);
-        drop(shadowed_schema);
+        Ok((!locator_columns.is_empty()).then_some(locator_columns))
+    }
 
-        if locator_columns.is_empty() {
-            return Ok(None);
+    /// The name an `UPDATE ... FROM` target's columns are qualified with: its
+    /// alias, else its table name. Bare names are ambiguous once the FROM
+    /// sources join in (every rowid table has a `rowid`).
+    fn update_from_target_label(table_ref: &fsqlite_ast::QualifiedTableRef) -> &str {
+        table_ref
+            .alias
+            .as_deref()
+            .unwrap_or(table_ref.name.name.as_str())
+    }
+
+    fn update_from_target_column(table_ref: &fsqlite_ast::QualifiedTableRef, column: &str) -> Expr {
+        Expr::Column(
+            ColumnRef {
+                schema: None,
+                table: Some(Self::update_from_target_label(table_ref).into()),
+                column: column.into(),
+            },
+            Span::ZERO,
+        )
+    }
+
+    /// bd-2jbl5: the SELECT that finds the rows an `UPDATE ... FROM` touches.
+    /// The target leads and the FROM sources cross-join after it, so the WHERE
+    /// (and any ON) can name both the target and the FROM aliases, as in the
+    /// UPDATE itself. Anonymous placeholders keep their order: projected SET
+    /// values come before FROM and WHERE in both statements.
+    fn build_update_from_target_select(
+        update: &fsqlite_ast::UpdateStatement,
+        columns: Vec<ResultColumn>,
+        where_clause: Option<&Expr>,
+    ) -> SelectStatement {
+        let mut select = Self::build_single_table_select(&update.table, columns, where_clause, &[], None);
+        select.with.clone_from(&update.with);
+        if let (Some(from), SelectCore::Select { from: Some(target_from), .. }) =
+            (&update.from, &mut select.body.select)
+        {
+            target_from.joins.reserve(1 + from.joins.len());
+            target_from.joins.push(fsqlite_ast::JoinClause {
+                join_type: fsqlite_ast::JoinType {
+                    natural: false,
+                    kind: JoinKind::Cross,
+                },
+                table: from.source.clone(),
+                constraint: None,
+            });
+            target_from.joins.extend(from.joins.iter().cloned());
         }
+        select
+    }
+
+    /// Evaluate a multi-row `UPDATE ... FROM` join once, as stock does before
+    /// it changes any row: one row per target row in join order, holding its
+    /// locator values followed by the SET values computed for it. A target row
+    /// that several FROM rows match is updated once, from its first match.
+    /// Returns the locator columns, the SET target columns and the rows.
+    async fn materialize_update_from_replay_locators(
+        &self,
+        update: &fsqlite_ast::UpdateStatement,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Option<(Vec<String>, Vec<String>, Vec<Vec<SqliteValue>>)>> {
+        let Some(locator_columns) = self.dml_replay_locator_columns(&update.table)? else {
+            return Ok(None);
+        };
+        let set_pairs = Self::update_set_pairs(update)?;
         let projections = locator_columns
             .iter()
-            .map(|column| ResultColumn::Expr {
-                expr: Self::build_limit_scope_projection_expr(table_ref, column),
-                alias: None,
-            })
+            .map(|column| Self::update_from_target_column(&update.table, column))
+            .chain(set_pairs.iter().map(|(_, value)| (*value).clone()))
+            .map(|expr| ResultColumn::Expr { expr, alias: None })
             .collect();
         let select =
-            Self::build_single_table_select(table_ref, projections, where_clause, &[], None);
-        let locator_rows = self
+            Self::build_update_from_target_select(update, projections, update.where_clause.as_ref());
+        let mut seen = BTreeSet::new();
+        let rows = self
             .execute_statement(&Statement::Select(select), params)
             .await?
             .into_iter()
             .map(|row| row.values().to_vec())
+            .filter(|values| seen.insert(values[..locator_columns.len()].to_vec()))
             .collect();
-        Ok(Some((locator_columns, locator_rows)))
+        let set_columns = set_pairs
+            .into_iter()
+            .map(|(column, _)| column.to_owned())
+            .collect();
+        Ok(Some((locator_columns, set_columns, rows)))
+    }
+
+    /// An UPDATE's SET list flattened to (target column, value) pairs in order;
+    /// `(a, b) = (x, y)` becomes `a = x, b = y`.
+    fn update_set_pairs(update: &fsqlite_ast::UpdateStatement) -> Result<Vec<(&str, &Expr)>> {
+        let mut set_pairs = Vec::with_capacity(update.assignments.len());
+        for assignment in &update.assignments {
+            match &assignment.target {
+                fsqlite_ast::AssignmentTarget::Column(column_name) => {
+                    set_pairs.push((column_name.as_str(), &assignment.value));
+                }
+                fsqlite_ast::AssignmentTarget::ColumnList(columns) if columns.len() == 1 => {
+                    let value_expr = match &assignment.value {
+                        Expr::RowValue(values, _) if values.len() == 1 => &values[0],
+                        other => other,
+                    };
+                    set_pairs.push((columns[0].as_str(), value_expr));
+                }
+                fsqlite_ast::AssignmentTarget::ColumnList(columns) => match &assignment.value {
+                    Expr::RowValue(values, _) if values.len() == columns.len() => {
+                        set_pairs.extend(columns.iter().map(String::as_str).zip(values));
+                    }
+                    _ => {
+                        return Err(FrankenError::Internal(
+                            "UPDATE trigger snapshot: column-list assignment requires row-value expression of matching arity".to_owned(),
+                        ));
+                    }
+                },
+            }
+        }
+        Ok(set_pairs)
     }
 
     fn build_update_replay_locator_filter(
@@ -51889,7 +52031,7 @@ impl Connection {
         locator_rows: &[Vec<SqliteValue>],
     ) -> Result<Vec<Row>> {
         let (table_ref, preserve_constraint_failure_rows, kind) = match statement {
-            DmlRowReplay::Update(update) => (
+            DmlRowReplay::Update(update) | DmlRowReplay::UpdateFrom { update, .. } => (
                 &update.table,
                 update.or_conflict == Some(fsqlite_ast::ConflictAction::Fail),
                 "UPDATE",
@@ -51902,13 +52044,37 @@ impl Connection {
         self.with_statement_fk_validation_scope(preserve_constraint_failure_rows, async || {
             let mut statement_changes = 0usize;
             let mut returning_rows = Vec::new();
-            for (row_index, locator_values) in locator_rows.iter().enumerate() {
+            for (row_index, locator_row) in locator_rows.iter().enumerate() {
+                let (locator_values, set_values) = locator_row.split_at(locator_columns.len());
                 let locator = Self::build_update_replay_locator_filter(
                     table_ref,
                     locator_columns,
                     locator_values,
                 )?;
                 let row_statement = match statement {
+                    DmlRowReplay::UpdateFrom {
+                        update,
+                        set_columns,
+                    } => {
+                        // bd-2jbl5: as in stock, the join was evaluated once up
+                        // front; each row is a plain UPDATE of the target that
+                        // assigns the SET values computed for it.
+                        let mut row_update = update.clone();
+                        row_update.with = None;
+                        row_update.from = None;
+                        row_update.assignments = set_columns
+                            .iter()
+                            .zip(set_values)
+                            .map(|(column, value)| fsqlite_ast::Assignment {
+                                target: fsqlite_ast::AssignmentTarget::Column(column.clone()),
+                                value: value_to_literal_expr(value.clone()),
+                            })
+                            .collect();
+                        row_update.where_clause = Some(locator);
+                        row_update.order_by.clear();
+                        row_update.limit = None;
+                        Statement::Update(row_update)
+                    }
                     DmlRowReplay::Update(update) => {
                         let mut row_update = update.clone();
                         row_update.where_clause = Some(locator);
@@ -55582,6 +55748,11 @@ impl Connection {
                 .find(|table| table.name.eq_ignore_ascii_case(&update.table.name.name))
                 .is_none_or(|table| !table.without_rowid)
         };
+        if update.from.is_some() {
+            return self
+                .collect_update_from_trigger_rows_with_rowids(update, params, is_rowid_table)
+                .await;
+        }
         let projected_columns = if is_rowid_table {
             // Project the IMPLICIT rowid via the shadow-aware alias, mirroring the
             // DELETE collector (bd-uur1d) and the RAISE(IGNORE) UPDATE rewrite's
@@ -55756,6 +55927,104 @@ impl Connection {
                 }
             }
 
+            trigger_rows.push((row_rowid, old_values, new_values));
+        }
+        Ok(trigger_rows)
+    }
+
+    /// bd-2jbl5: OLD/NEW images for `UPDATE ... FROM`. The WHERE and the SET
+    /// values may name the FROM sources, so the matched rows come from the
+    /// target joined with them and the SET values are projected by that same
+    /// SELECT instead of being evaluated against the target row alone. A target
+    /// row several FROM rows match is updated once, from its first match.
+    async fn collect_update_from_trigger_rows_with_rowids(
+        &self,
+        update: &fsqlite_ast::UpdateStatement,
+        params: Option<&[SqliteValue]>,
+        is_rowid_table: bool,
+    ) -> Result<Vec<(Option<i64>, Vec<SqliteValue>, Vec<SqliteValue>)>> {
+        let table_name = &update.table.name.name;
+        let (column_names, set_target_shape) = {
+            let targets_shadowed_main = self.targets_shadowed_main(&update.table.name);
+            let visible_schema = self.schema.borrow();
+            let shadowed_schema = self.shadowed_main_tables.borrow();
+            let table = if targets_shadowed_main {
+                shadowed_schema.get(&table_name.to_ascii_lowercase())
+            } else {
+                visible_schema
+                    .iter()
+                    .find(|table| table.name.eq_ignore_ascii_case(table_name))
+            }
+            .ok_or_else(|| FrankenError::NoSuchTable {
+                name: table_name.clone(),
+            })?;
+            (
+                table.columns.iter().map(|col| col.name.clone()).collect::<Vec<_>>(),
+                UpdateSetTargetShape {
+                    ipk_idx: table.columns.iter().position(|col| col.is_ipk),
+                    without_rowid: table.without_rowid,
+                },
+            )
+        };
+
+        let set_pairs = Self::update_set_pairs(update)?;
+        let label = Self::update_from_target_label(&update.table).to_owned();
+        let mut projections = Vec::with_capacity(2 + set_pairs.len());
+        if is_rowid_table {
+            let rowid_alias = self.ignore_skip_rowid_alias(table_name);
+            projections.push(ResultColumn::Expr {
+                expr: Self::update_from_target_column(&update.table, rowid_alias),
+                alias: None,
+            });
+        }
+        projections.push(ResultColumn::TableStar(QualifiedName {
+            schema: None,
+            name: label,
+        }));
+        projections.extend(set_pairs.iter().map(|(_, value)| ResultColumn::Expr {
+            expr: (*value).clone(),
+            alias: None,
+        }));
+        let select =
+            Self::build_update_from_target_select(update, projections, update.where_clause.as_ref());
+        let matched_rows = self
+            .execute_statement(&Statement::Select(select), params)
+            .await?;
+
+        let lead = usize::from(is_rowid_table);
+        let n_cols = column_names.len();
+        let mut seen = BTreeSet::new();
+        let mut trigger_rows = Vec::with_capacity(matched_rows.len());
+        for row in matched_rows {
+            let values = row.values();
+            if values.len() != lead + n_cols + set_pairs.len() {
+                return Err(FrankenError::Internal(format!(
+                    "UPDATE ... FROM trigger snapshot: expected {} columns, got {}",
+                    lead + n_cols + set_pairs.len(),
+                    values.len()
+                )));
+            }
+            let row_rowid = match values.first() {
+                Some(SqliteValue::Integer(n)) if is_rowid_table => Some(*n),
+                _ => None,
+            };
+            let old_values = values[lead..lead + n_cols].to_vec();
+            let key = if is_rowid_table {
+                values[..1].to_vec()
+            } else {
+                old_values.clone()
+            };
+            if !seen.insert(key) {
+                continue;
+            }
+            let mut new_values = old_values.clone();
+            for ((column_name, _), value) in set_pairs.iter().zip(&values[lead + n_cols..]) {
+                if let Some(target_index) =
+                    set_target_shape.snapshot_index(&column_names, column_name)?
+                {
+                    new_values[target_index] = value.clone();
+                }
+            }
             trigger_rows.push((row_rowid, old_values, new_values));
         }
         Ok(trigger_rows)
@@ -149473,6 +149742,12 @@ enum InsertTarget {
 #[derive(Clone, Copy)]
 enum DmlRowReplay<'a> {
     Update(&'a fsqlite_ast::UpdateStatement),
+    /// An `UPDATE ... FROM` whose join ran once: each locator row carries the
+    /// SET values for `set_columns` after the locator values.
+    UpdateFrom {
+        update: &'a fsqlite_ast::UpdateStatement,
+        set_columns: &'a [String],
+    },
     Delete(&'a fsqlite_ast::DeleteStatement),
 }
 
