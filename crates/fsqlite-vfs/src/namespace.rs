@@ -152,7 +152,39 @@ pub struct PendingNamespaceOpen {
 impl PendingNamespaceOpen {
     /// Begin namespace admission for an already-resolved absolute database
     /// path.  This operation is non-blocking; lock contention returns BUSY.
+    ///
+    /// bd-sz9j5: a read-write ([`NamespaceOpenIntent::Shared`]) admission
+    /// that would join a live WAL-mode generation first checks that some other
+    /// process visibly participates in the WAL the way every 0.4.x engine
+    /// does. A live namespace with no such participant is held by a pre-0.4
+    /// engine (no `-shm` publication, no reader registration), and joining it
+    /// can corrupt the file, so the admission is refused with
+    /// [`FrankenError::IncompatiblePeerEngine`] before anything is written.
+    /// A 0.4.x peer caught between its own admission and its WAL attach, or
+    /// one that is closing, looks the same for a moment; admission is
+    /// therefore restarted with a short backoff (about 0.6 s in total) and
+    /// refuses only if the signature persists while the namespace stays live.
+    /// Peers this process already has open, non-WAL files, and filesystems
+    /// whose locks cannot be probed are never refused.
     pub fn begin(stable_path: &Path, intent: NamespaceOpenIntent) -> Result<Self> {
+        const LEGACY_PEER_RETRY_DELAYS_MS: [u64; 7] = [5, 10, 20, 40, 80, 160, 320];
+        let mut delays = LEGACY_PEER_RETRY_DELAYS_MS.iter();
+        loop {
+            if let Some(admission) = Self::begin_attempt(stable_path, intent)? {
+                return Ok(admission);
+            }
+            let Some(&delay_ms) = delays.next() else {
+                return Err(FrankenError::IncompatiblePeerEngine {
+                    path: stable_path.to_owned(),
+                });
+            };
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        }
+    }
+
+    /// One admission attempt. `Ok(None)` means a live WAL generation shows no
+    /// 0.4.x participant (bd-sz9j5); no lock is retained in that case.
+    fn begin_attempt(stable_path: &Path, intent: NamespaceOpenIntent) -> Result<Option<Self>> {
         validate_stable_path(stable_path)?;
         let (gate, mut use_file) = if matches!(
             intent,
@@ -177,10 +209,10 @@ impl PendingNamespaceOpen {
                 if intent == NamespaceOpenIntent::ExistingCompanion {
                     return Err(cannot_open(stable_path));
                 }
-                return Ok(Self {
+                return Ok(Some(Self {
                     stable_path: stable_path.to_owned(),
                     lease: Some(PendingLease::ReadOnlyUnadmitted),
-                });
+                }));
             }
             (
                 open_existing_secure_lock_file(stable_path, &gate_path)?,
@@ -211,6 +243,17 @@ impl PendingNamespaceOpen {
                 match AdvisoryFileLock::try_lock(&use_file, FileLockMode::Exclusive) {
                     Ok(()) => PendingLease::NewShared { gate, use_file },
                     Err(FileLockError::AlreadyLocked) => {
+                        // bd-sz9j5: probe before taking `use` shared. Until
+                        // then this descriptor holds no namespace lock, so a
+                        // restarted attempt's exclusive `use` lock proves
+                        // whether the live peers have gone.
+                        #[cfg(unix)]
+                        if crate::unix::probe_foreign_wal_participation(stable_path)
+                            == crate::traits::ForeignWalParticipation::NoParticipant
+                        {
+                            release_namespace_locks(&gate, &use_file);
+                            return Ok(None);
+                        }
                         if let Err(error) = try_lock(&use_file, FileLockMode::Shared) {
                             release_namespace_locks(&gate, &use_file);
                             return Err(error);
@@ -255,10 +298,10 @@ impl PendingNamespaceOpen {
             }
         };
 
-        Ok(Self {
+        Ok(Some(Self {
             stable_path: stable_path.to_owned(),
             lease: Some(lease),
-        })
+        }))
     }
 
     /// Identity of the live generation this admission must join.  When this

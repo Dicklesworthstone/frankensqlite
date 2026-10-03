@@ -76,6 +76,18 @@ pub enum FrankenError {
     )]
     NewerFormat { on_disk: u32, supported: u32 },
 
+    /// Another process has this WAL database open with an fsqlite engine that
+    /// predates the cross-process WAL contract (0.3.x: no `-shm` commit
+    /// publication or reader registration), so joining it could corrupt the
+    /// file (bd-sz9j5). Detected from the peer's lock signature: it holds the
+    /// namespace lease but neither the main-file WAL read lock nor the `-shm`
+    /// DMS byte that every 0.4.x WAL connection holds. Maps to
+    /// [`SQLITE_OPEN_INCOMPATIBLE_PEER`].
+    #[error(
+        "database '{path}' is open in another process by an older, incompatible fsqlite engine (0.3.x); refusing to join it to prevent corruption. Close or upgrade that process"
+    )]
+    IncompatiblePeerEngine { path: PathBuf },
+
     /// Database is full (max page count reached).
     #[error("database is full")]
     DatabaseFull,
@@ -467,6 +479,15 @@ pub enum ErrorCode {
 /// whose primary code is [`ErrorCode::CantOpen`].
 pub const SQLITE_OPEN_NEWER_FORMAT: i32 = 0x0E | (0x7F << 8);
 
+/// Extended result code for a refused open beside a live, older fsqlite engine
+/// that does not speak the cross-process WAL contract (bd-sz9j5).
+///
+/// FrankenSQLite-private extended code on the `SQLITE_CANTOPEN` (14) base:
+/// `14 | (0x7E << 8) = 32270`, next to [`SQLITE_OPEN_NEWER_FORMAT`]. Returned by
+/// [`FrankenError::extended_error_code`] for
+/// [`FrankenError::IncompatiblePeerEngine`].
+pub const SQLITE_OPEN_INCOMPATIBLE_PEER: i32 = 0x0E | (0x7E << 8);
+
 impl FrankenError {
     /// Map this error to a SQLite error code for compatibility.
     #[allow(clippy::match_same_arms)]
@@ -481,7 +502,7 @@ impl FrankenError {
             // Refusing to open a newer on-disk format is an open failure
             // (SQLITE_CANTOPEN base); see `SQLITE_OPEN_NEWER_FORMAT` for the
             // FrankenSQLite-private extended code (bd-yaomh.6).
-            Self::NewerFormat { .. } => ErrorCode::CantOpen,
+            Self::NewerFormat { .. } | Self::IncompatiblePeerEngine { .. } => ErrorCode::CantOpen,
             Self::DatabaseFull => ErrorCode::Full,
             Self::SchemaChanged => ErrorCode::Schema,
             Self::Io(_)
@@ -675,6 +696,8 @@ impl FrankenError {
             Self::BusySnapshot { .. } => 5 | (2 << 8),            // SQLITE_BUSY_SNAPSHOT = 517
             Self::DatatypeViolation { .. } => 3091,               // SQLITE_CONSTRAINT_DATATYPE
             Self::NewerFormat { .. } => SQLITE_OPEN_NEWER_FORMAT, // 14 | (0x7F << 8) = 32526
+            // 14 | (0x7E << 8) = 32270
+            Self::IncompatiblePeerEngine { .. } => SQLITE_OPEN_INCOMPATIBLE_PEER,
             _ => self.error_code() as i32,
         }
     }

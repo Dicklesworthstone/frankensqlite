@@ -419,10 +419,11 @@ pub use namespace::{
 };
 pub use shm::ShmRegion;
 pub use traits::{
-    FileIdentity, PrivateDatabaseCleanupDurability, PrivateDatabaseCleanupEntryReceipt,
-    PrivateDatabaseCleanupEntryState, PrivateDatabaseCleanupFailure,
-    PrivateDatabaseCleanupFailureStage, PrivateDatabaseCleanupOutcome, SyncKind, Vfs, VfsFile,
-    VfsWriteCompletion, VfsWriteCompletionState, VfsWriteCompletionWait,
+    FileIdentity, ForeignWalParticipation, PrivateDatabaseCleanupDurability,
+    PrivateDatabaseCleanupEntryReceipt, PrivateDatabaseCleanupEntryState,
+    PrivateDatabaseCleanupFailure, PrivateDatabaseCleanupFailureStage,
+    PrivateDatabaseCleanupOutcome, SyncKind, Vfs, VfsFile, VfsWriteCompletion,
+    VfsWriteCompletionState, VfsWriteCompletionWait,
 };
 #[cfg(all(feature = "native", unix))]
 pub use unix::{UnixFile, UnixVfs};

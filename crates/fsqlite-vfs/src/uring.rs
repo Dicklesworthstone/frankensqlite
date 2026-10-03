@@ -1185,6 +1185,14 @@ impl Vfs for IoUringVfs {
         self.unix.path_file_identity(cx, path)
     }
 
+    fn probe_foreign_wal_participation(
+        &self,
+        cx: &Cx,
+        path: &Path,
+    ) -> Result<crate::traits::ForeignWalParticipation> {
+        self.unix.probe_foreign_wal_participation(cx, path)
+    }
+
     fn full_pathname(&self, cx: &Cx, path: &Path) -> Result<PathBuf> {
         self.unix.full_pathname(cx, path)
     }

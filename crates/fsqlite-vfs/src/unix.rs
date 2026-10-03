@@ -46,7 +46,8 @@ use crate::shm::{
     wal_read_lock_slot,
 };
 use crate::traits::{
-    FileIdentity, SyncKind, Vfs, VfsFile, VfsWriteCompletion, VfsWriteCompletionSource,
+    FileIdentity, ForeignWalParticipation, SyncKind, Vfs, VfsFile, VfsWriteCompletion,
+    VfsWriteCompletionSource,
 };
 
 fn checkpoint_or_abort(cx: &Cx) -> Result<()> {
@@ -1410,6 +1411,166 @@ fn sqlite_shm_path(path: &Path) -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
+// bd-sz9j5: foreign WAL-participation probe
+// ---------------------------------------------------------------------------
+
+/// Outcome of one lock-neutral `F_GETLK` probe through a temporary descriptor.
+enum TempDescriptorProbe {
+    /// Another process holds a lock conflicting with a write lock on the range.
+    Locked,
+    /// No other process holds a lock on the range.
+    Unlocked,
+    /// Not provable (this process owns the file, the file changed or is
+    /// missing, or the filesystem cannot report byte-range locks).
+    Unknown,
+}
+
+/// Whether some other process holds any lock on `[start, start + len)` of
+/// `file`. Probe failures (including flock-only filesystems that reject
+/// byte-range queries) are `None`, never a verdict.
+fn foreign_lock_on_range(file: &File, start: u64, len: u64) -> Option<bool> {
+    let flock = posix_getlk(file, libc::F_WRLCK, start, len).ok()?;
+    #[allow(clippy::cast_possible_truncation)]
+    let unlocked: libc::c_short = libc::F_UNLCK as libc::c_short;
+    Some(flock.l_type != unlocked)
+}
+
+/// Whether `F_GETLK` on this file's filesystem reports other processes'
+/// locks. On Linux it does on every filesystem fsqlite locks with fcntl. On
+/// other Unixes a non-local mount (AFP, SMB, ...) may have downgraded peers to
+/// whole-file `flock(2)` (see [`flock_whole_file_fallback`]), which `F_GETLK`
+/// cannot see, so only local filesystems can produce a verdict.
+#[cfg(target_os = "linux")]
+fn byte_range_locks_are_reportable(_file: &File) -> bool {
+    true
+}
+
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+fn byte_range_locks_are_reportable(file: &File) -> bool {
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+    // SAFETY: `file` is an open descriptor and `stat` points to writable
+    // memory of the exact `struct statfs` size the call fills.
+    let ret = unsafe { libc::fstatfs(std::os::fd::AsRawFd::as_raw_fd(file), stat.as_mut_ptr()) };
+    if ret != 0 {
+        return false;
+    }
+    // SAFETY: `fstatfs` returned 0, so it initialized the whole struct.
+    let stat = unsafe { stat.assume_init() };
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    let local = u64::from(stat.f_flags) & (libc::MNT_LOCAL as u64) != 0;
+    local
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "freebsd")))]
+fn byte_range_locks_are_reportable(_file: &File) -> bool {
+    false
+}
+
+impl InodeTable {
+    /// Probe the main file at `path` through a temporary read-only descriptor
+    /// only while no descriptor for its inode is registered in this process.
+    ///
+    /// Closing any descriptor of an inode drops every classic POSIX lock this
+    /// process holds on it, so the shard mutex is held from the registration
+    /// check through the close: no thread of this process can register (and
+    /// lock) the inode in between. A registered inode means this process
+    /// already participates, and its own locks are invisible to `F_GETLK`.
+    fn probe_unregistered_main_file(&self, path: &Path) -> TempDescriptorProbe {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(meta) = fs::metadata(path) else {
+            return TempDescriptorProbe::Unknown;
+        };
+        let key = FileIdentity::from_unix_parts(meta.dev(), meta.ino());
+        let map = self.shards[self.shard_idx(key)]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if map.contains_key(&key) {
+            return TempDescriptorProbe::Unknown;
+        }
+        let Ok(file) = OpenOptions::new().read(true).open(path) else {
+            return TempDescriptorProbe::Unknown;
+        };
+        if inode_key_from_file(&file).ok() != Some(key) {
+            // The path was replaced after the stat. This descriptor names an
+            // inode whose registration was never checked; closing it could
+            // drop another connection's locks, so retain it for the process
+            // lifetime instead (a vanishingly rare race).
+            std::mem::forget(file);
+            return TempDescriptorProbe::Unknown;
+        }
+        // Only a WAL-mode database (header bytes 18/19 == 2) has WAL peers.
+        let mut header = [0_u8; 20];
+        let is_wal = std::os::unix::fs::FileExt::read_exact_at(&file, &mut header, 0).is_ok()
+            && header[18] == 2
+            && header[19] == 2;
+        let verdict = if is_wal && byte_range_locks_are_reportable(&file) {
+            match foreign_lock_on_range(&file, SHARED_FIRST, SHARED_SIZE) {
+                Some(true) => TempDescriptorProbe::Locked,
+                Some(false) => TempDescriptorProbe::Unlocked,
+                None => TempDescriptorProbe::Unknown,
+            }
+        } else {
+            TempDescriptorProbe::Unknown
+        };
+        drop(file);
+        drop(map);
+        verdict
+    }
+}
+
+impl ShmTable {
+    /// Probe the stock `-shm` DMS byte through a temporary descriptor only
+    /// while this process has no canonical `-shm` entry (see
+    /// [`InodeTable::probe_unregistered_main_file`] for why the table lock
+    /// spans the close). A missing `-shm` has no DMS holder.
+    fn probe_unregistered_dms(&self, shm_path: &Path) -> TempDescriptorProbe {
+        let map = self
+            .map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if map.contains_key(shm_path) {
+            return TempDescriptorProbe::Unknown;
+        }
+        let file = match OpenOptions::new().read(true).open(shm_path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return TempDescriptorProbe::Unlocked;
+            }
+            Err(_) => return TempDescriptorProbe::Unknown,
+        };
+        let verdict = match foreign_lock_on_range(&file, sqlite_shm_dms_lock_byte(), 1) {
+            Some(true) => TempDescriptorProbe::Locked,
+            Some(false) => TempDescriptorProbe::Unlocked,
+            None => TempDescriptorProbe::Unknown,
+        };
+        drop(file);
+        drop(map);
+        verdict
+    }
+}
+
+/// bd-sz9j5: lock-neutral probe for another process's 0.4.x-style WAL
+/// participation in the database at `path`.
+///
+/// Every 0.4.x WAL connection holds, for its whole attachment, a SHARED claim
+/// on the main file's SQLite shared-lock range (0.4.4+) and the stock `-shm`
+/// DMS byte (0.4.0+). A pre-0.4 engine holds neither: it never maps `-shm`
+/// outside its tests and takes main-file locks only inside transactions.
+/// Takes no lock and never waits.
+pub(crate) fn probe_foreign_wal_participation(path: &Path) -> ForeignWalParticipation {
+    match global_inode_table().probe_unregistered_main_file(path) {
+        TempDescriptorProbe::Locked => return ForeignWalParticipation::Participant,
+        TempDescriptorProbe::Unknown => return ForeignWalParticipation::Unknown,
+        TempDescriptorProbe::Unlocked => {}
+    }
+    match global_shm_table().probe_unregistered_dms(&sqlite_shm_path(path)) {
+        TempDescriptorProbe::Locked => ForeignWalParticipation::Participant,
+        TempDescriptorProbe::Unlocked => ForeignWalParticipation::NoParticipant,
+        TempDescriptorProbe::Unknown => ForeignWalParticipation::Unknown,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // UnixVfs
 // ---------------------------------------------------------------------------
 
@@ -1633,6 +1794,14 @@ impl Vfs for UnixVfs {
         Ok(fs::metadata(path)
             .ok()
             .map(|meta| FileIdentity::from_unix_parts(meta.dev(), meta.ino())))
+    }
+
+    fn probe_foreign_wal_participation(
+        &self,
+        _cx: &Cx,
+        path: &Path,
+    ) -> Result<ForeignWalParticipation> {
+        Ok(probe_foreign_wal_participation(path))
     }
 
     fn full_pathname(&self, _cx: &Cx, path: &Path) -> Result<PathBuf> {
@@ -9166,6 +9335,58 @@ mod tests {
         let byte = sqlite_shm_dms_lock_byte();
         // WAL_WRITE_LOCK is slot 0, lock byte 120, plus WAL_TOTAL_LOCKS (8) = 128.
         assert_eq!(byte, 128);
+    }
+
+    #[test]
+    fn probe_foreign_wal_participation_is_lock_neutral_and_skips_own_inodes() {
+        // bd-sz9j5: foreign participants are covered by the cross-process
+        // keeper in fsqlite-core; here, the verdicts this process can reach.
+        let (_dir, path) = make_temp_path("probe.db");
+        assert_eq!(
+            probe_foreign_wal_participation(&path),
+            ForeignWalParticipation::Unknown,
+            "a missing file proves nothing"
+        );
+        let mut header = vec![0_u8; 100];
+        std::fs::write(&path, &header).unwrap();
+        assert_eq!(
+            probe_foreign_wal_participation(&path),
+            ForeignWalParticipation::Unknown,
+            "a rollback-journal file has no WAL participants"
+        );
+        header[18] = 2;
+        header[19] = 2;
+        std::fs::write(&path, &header).unwrap();
+        assert_eq!(
+            probe_foreign_wal_participation(&path),
+            ForeignWalParticipation::NoParticipant
+        );
+        // An unlocked `-shm` is still no participant.
+        std::fs::write(sqlite_shm_path(&path), vec![0_u8; 32_768]).unwrap();
+        assert_eq!(
+            probe_foreign_wal_participation(&path),
+            ForeignWalParticipation::NoParticipant
+        );
+
+        // Once this process registers the inode, its own locks are invisible
+        // to F_GETLK, so the probe must not claim a verdict (and returns
+        // before opening the temporary descriptor whose close would drop
+        // this process's locks).
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (mut file, _) = vfs
+            .open(
+                &cx,
+                Some(&path),
+                VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB,
+            )
+            .unwrap();
+        file.lock(&cx, LockLevel::Shared).unwrap();
+        assert_eq!(
+            vfs.probe_foreign_wal_participation(&cx, &path).unwrap(),
+            ForeignWalParticipation::Unknown
+        );
+        file.unlock(&cx, LockLevel::None).unwrap();
     }
 
     #[test]

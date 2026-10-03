@@ -611,6 +611,22 @@ mod file_identity_tests {
     }
 }
 
+/// bd-sz9j5: what a lock-neutral probe can prove about other processes'
+/// participation in a WAL-mode database
+/// (see [`Vfs::probe_foreign_wal_participation`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ForeignWalParticipation {
+    /// Another process holds the main-file WAL read lock or the `-shm` DMS
+    /// byte, as every 0.4.x WAL connection does for its whole lifetime.
+    Participant,
+    /// The file is in WAL mode and no other process holds either lock.
+    NoParticipant,
+    /// Not provable: not WAL mode, this process already has the file or its
+    /// `-shm` open (its own locks are invisible to the probe), the filesystem
+    /// cannot report byte-range locks, or the VFS cannot probe.
+    Unknown,
+}
+
 /// Durability level for `VfsFile::durable_sync`.
 ///
 /// Centralizes per-filesystem sync policy so callers express intent
@@ -760,6 +776,23 @@ pub trait Vfs: Send + Sync {
     /// stable identities); callers must then take their open-and-inspect path.
     fn path_file_identity(&self, _cx: &Cx, _path: &Path) -> Result<Option<FileIdentity>> {
         Ok(None)
+    }
+
+    /// bd-sz9j5: report whether another process visibly participates in the
+    /// WAL-mode database at `path` the way every 0.4.x engine does, without
+    /// taking, waiting for, or disturbing any lock.
+    ///
+    /// Only meaningful while the caller has joined a live fsqlite namespace:
+    /// a live peer that shows no participation is a pre-0.4 engine (or a
+    /// 0.4.x peer caught between admission and WAL attach, which a retry
+    /// resolves). VFSes that cannot answer return
+    /// [`ForeignWalParticipation::Unknown`], which callers treat as "proceed".
+    fn probe_foreign_wal_participation(
+        &self,
+        _cx: &Cx,
+        _path: &Path,
+    ) -> Result<ForeignWalParticipation> {
+        Ok(ForeignWalParticipation::Unknown)
     }
 
     /// Resolve a potentially relative path into an absolute path.
