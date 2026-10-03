@@ -24,7 +24,7 @@ Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releas
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
 | [Unreleased](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.4.8...main) | HEAD | 2026-10-02 | — |
-| [v0.4.8](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.4.8) | Release | 2026-10-02 | Uniform release of all 26 public crates. Strict read-only opens refuse a stale WAL index promptly again (0.4.7 regression; consumers that pinned 0.4.6 can move up); double-granted page under TRUNCATE checkpoints fixed (bd-sx5w2, the 0.4.7 P0 known issue); join lookups honor comparison affinity (wrong rows for mixed-affinity join keys, found in release review); failed autocommit commit no longer leaves uncommitted schema (bd-q1b7z); GROUP BY over a join in key order; join, INSERT ... SELECT and index-scan performance; release binaries at opt-level 3 |
+| [v0.4.8](https://github.com/Dicklesworthstone/frankensqlite/tree/v0.4.8) | Withdrawn tag | 2026-10-02 | Withdrawn before publication: CREATE TABLE AS SELECT with a quoted table name could write its copied rows into another existing table. The tag remains unchanged and unreleased; v0.4.9 will supersede it. Planned changes are retained below. |
 | [v0.4.7](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.4.7) | Release | 2026-09-29 | Prompt fix release of all 26 public crates. Large multi-row INSERT wrote index entries without their rowid and skipped UNIQUE checks past register 65,535 (hfdt-dlkam3); serialized-DDL index race (bd-4iaoi); composite-key DML seek (GH#434) with residual fix; autocommit DDL starvation (bd-f5sh5); GH#435 changes(); streaming aggregate and correlated-subquery performance (GH#420, GH#432, GH#436) |
 | [v0.4.6](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.4.6) | Release | 2026-09-27 | Uniform release of all 26 public crates (0.4.5 skipped: consumed by the fsqlite-pager backport). Page-referenced-twice fix (bd-b5vmw), lost-index-entry race fix (bd-11sz4), freelist/overflow hardening, WAL-index healing, per-statement busy_timeout (GH#423), UTF-16/collation and numeric parity |
 | [0.4.5](https://crates.io/crates/fsqlite-pager/0.4.5) | crates.io only | 2026-09-25 | `fsqlite-pager` alone: bd-b5vmw backport onto v0.4.4, so a page can no longer end up referenced by both the freelist trunk and a live b-tree across a WAL generation. Tag `fsqlite-pager-v0.4.5`; no GitHub Release. The next uniform release must be >= 0.4.6 |
@@ -61,11 +61,18 @@ Entries for changes after v0.4.7 are written at the next release.
 
 ---
 
-## [0.4.8] -- 2026-10-02 (GitHub Release)
+## [0.4.8] -- 2026-10-02 (withdrawn; unreleased tag)
 
 Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.4.7...v0.4.8>
 
-**What this is.** A uniform release of all 26 public crates. It restores 0.4.6's prompt refusal for strict
+**Withdrawn before publication.** Release qualification found that `CREATE TABLE ... AS SELECT`
+with an embedded quote in its table name could write the copied rows into a different existing table,
+leaving the requested copy empty. The optimized v0.4.8 candidate reproduced the wrong-table write
+against stock SQLite. The v0.4.8 tag stays unchanged and unreleased. The fix already on `main`
+([c23ca7fb4](https://github.com/Dicklesworthstone/frankensqlite/commit/c23ca7fb4)) escapes the table name
+before prepared row replay; v0.4.9 will carry that fix and its stock-SQLite regression test.
+
+**Planned scope, retained for history.** A uniform release of all 26 public crates. It restores 0.4.6's prompt refusal for strict
 read-only opens, which 0.4.7 regressed (consumers that pinned 0.4.6 for that reason can move up). It also
 fixes the rare double-granted page that 0.4.7 listed as a known issue (bd-sx5w2) and wrong join results
 under mixed column affinities, and it carries the fixes and performance work landed on `main` since v0.4.7.
