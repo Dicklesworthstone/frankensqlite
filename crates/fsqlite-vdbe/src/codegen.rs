@@ -24826,6 +24826,35 @@ fn codegen_update_from(
         );
     }
 
+    // bd-b5j26: UPDATE ... FROM runs in two passes, as SQLite's does. Pass 1
+    // evaluates the join and the SET expressions against the unmodified table
+    // and stashes one record per match; pass 2 re-seeks each target row by its
+    // old rowid and rewrites it. Rewriting the target while its own scan cursor
+    // walks it lost every match after the first on file-backed tables, applied
+    // a row once per matching FROM row, and let an IPK rewrite move rows the
+    // scan had not reached yet.
+    //
+    // Stash record: [old rowid, seq, NEW image (n_cols), hidden rowid?]. `seq`
+    // counts down per match, so the sorter orders each target row's matches
+    // newest first; pass 2 applies only the first record of each rowid run.
+    // That is SQLite's outcome: its pass-1 table is keyed by rowid, so the last
+    // matching FROM row wins and each target row is updated (and counted) once.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let sorter_cursor = (1 + n_indexes + secondaries.len()) as i32;
+    let stash_width = 2 + n_cols + usize::from(assignment_targets.assigns_hidden_rowid);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let stash_width_i32 = stash_width as i32;
+    b.emit_op(
+        Opcode::SorterOpen,
+        sorter_cursor,
+        stash_width_i32,
+        0,
+        P4::Str("+".repeat(stash_width)),
+        0,
+    );
+    let seq_reg = b.alloc_reg();
+    b.emit_op(Opcode::Integer, 0, seq_reg, 0, P4::None, 0);
+
     // Emit one nested scan loop per FROM source (outermost = first source),
     // recording each loop's body address (Next target) and done label.
     struct LoopFrame {
@@ -24895,9 +24924,12 @@ fn codegen_update_from(
         }
     }
 
-    // Read ALL existing columns from target into registers.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    let col_regs = b.alloc_regs(n_cols as i32);
+    // Pass 1 match: read ALL existing columns of the target row into the
+    // stash's NEW-image slots, then apply the SET assignments in place. The
+    // scan cursor still points at the OLD row, so `SET x = x + 1` observes the
+    // pre-update value and FROM columns resolve through the live join cursors.
+    let stash_base = b.alloc_regs(stash_width_i32);
+    let col_regs = stash_base + 2;
     for i in 0..n_cols {
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let target_reg = col_regs + i as i32;
@@ -24916,13 +24948,12 @@ fn codegen_update_from(
         }
     }
 
-    // Evaluate SET assignments. Reset placeholder counter to 1 (SET first in SQL
-    // text). The scan cursor still points at the OLD row here, so `SET x = x + 1`
-    // observes the pre-update value.
+    // Evaluate SET assignments (SET placeholders come first in SQL text).
     b.set_next_anon_placeholder(1);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let hidden_rowid_reg = assignment_targets
         .assigns_hidden_rowid
-        .then(|| b.alloc_reg());
+        .then_some(col_regs + n_cols as i32);
     emit_update_assignments(
         b,
         &stmt.assignments,
@@ -24937,9 +24968,114 @@ fn codegen_update_from(
         b.emit_op(Opcode::MustBeInt, reg, 0, 0, P4::None, 0);
     }
 
-    // Capture the old rowid before any destructive mutation (re-insertion base).
+    // Stash [old rowid, seq, NEW image, hidden rowid?] for pass 2.
+    b.emit_op(Opcode::Rowid, target_cursor, stash_base, 0, P4::None, 0);
+    b.emit_op(Opcode::AddImm, seq_reg, -1, 0, P4::None, 0);
+    b.emit_op(Opcode::Copy, seq_reg, stash_base + 1, 0, P4::None, 0);
+    let stash_rec = b.alloc_reg();
+    b.emit_op(
+        Opcode::MakeRecord,
+        stash_base,
+        stash_width_i32,
+        stash_rec,
+        P4::None,
+        0,
+    );
+    b.emit_op(
+        Opcode::SorterInsert,
+        sorter_cursor,
+        stash_rec,
+        0,
+        P4::None,
+        0,
+    );
+
+    // Skip label for filtered-out rows.
+    b.resolve_label(skip_label);
+
+    // Innermost (target) Next: loop back to the target loop body.
+    b.emit_op(Opcode::Next, target_cursor, target_body, 0, P4::None, 0);
+    b.resolve_label(target_done_label);
+
+    // Unwind the FROM-source loops from innermost to outermost. Each loop's
+    // Next jumps back to its body; its done label lands here so an exhausted or
+    // empty source falls through to the next-outer loop's Next.
+    for frame in frames.iter().rev() {
+        b.emit_op(Opcode::Next, frame.cursor, frame.body, 0, P4::None, 0);
+        b.resolve_label(frame.done);
+    }
+
+    // The FROM read cursors are no longer needed once the collect pass is done.
+    for sec in &secondaries {
+        b.emit_op(Opcode::Close, sec.cursor, 0, 0, P4::None, 0);
+    }
+
+    // --- Pass 2: re-seek each stashed target row by old rowid and rewrite it.
+    let prev_rowid_reg = b.alloc_reg();
+    b.emit_op(Opcode::Null, 0, prev_rowid_reg, 0, P4::None, 0);
+    let pass2_done = b.emit_label();
+    b.emit_jump_to_label(
+        Opcode::SorterSort,
+        sorter_cursor,
+        0,
+        pass2_done,
+        P4::None,
+        0,
+    );
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let pass2_body = b.current_addr() as i32;
+    let row_done = b.emit_label();
+    let sorted_reg = b.alloc_reg();
+    b.emit_op(
+        Opcode::SorterData,
+        sorter_cursor,
+        sorted_reg,
+        0,
+        P4::None,
+        0,
+    );
     let old_rowid_reg = b.alloc_reg();
-    b.emit_op(Opcode::Rowid, target_cursor, old_rowid_reg, 0, P4::None, 0);
+    b.emit_op(
+        Opcode::Column,
+        sorter_cursor,
+        0,
+        old_rowid_reg,
+        P4::None,
+        0,
+    );
+    // Only the newest match of each target row applies (see the stash layout).
+    b.emit_jump_to_label(
+        Opcode::Eq,
+        prev_rowid_reg,
+        old_rowid_reg,
+        row_done,
+        P4::None,
+        0,
+    );
+    b.emit_op(Opcode::Copy, old_rowid_reg, prev_rowid_reg, 0, P4::None, 0);
+    let new_regs = b.alloc_regs(stash_width_i32 - 2);
+    for i in 0..stash_width - 2 {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        b.emit_op(
+            Opcode::Column,
+            sorter_cursor,
+            (2 + i) as i32,
+            new_regs + i as i32,
+            P4::None,
+            0,
+        );
+    }
+    let col_regs = new_regs;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let hidden_rowid_reg = hidden_rowid_reg.map(|_| new_regs + n_cols as i32);
+    b.emit_jump_to_label(
+        Opcode::SeekRowid,
+        target_cursor,
+        old_rowid_reg,
+        row_done,
+        P4::None,
+        0,
+    );
 
     // Recompute STORED generated columns, then validate CHECK / NOT NULL on the
     // NEW row image BEFORE any destructive mutation — so an `UPDATE OR IGNORE
@@ -24947,8 +25083,8 @@ fn codegen_update_from(
     // having already deleted the old one (bd-xoixz). This mirrors the plain
     // `codegen_update` path, which defers the index deletes + row Delete until
     // after constraint validation. `constraint_ignore_label` routes a violation
-    // to the innermost loop's Next (`skip_label`); the FROM-path uniqueness /
-    // RETURNING conflict skip already uses this same label (IfConflictSkip).
+    // to this row's end (`row_done`); the uniqueness / RETURNING conflict skip
+    // uses the same label (IfConflictSkip).
     emit_stored_generated_columns(b, target, col_regs);
     emit_strict_type_check(b, target, col_regs);
     // GH #169: coerce to column affinity before CHECK/NOT NULL so the
@@ -24964,7 +25100,7 @@ fn codegen_update_from(
     );
     let constraint_ignore_label =
         if matches!(stmt.or_conflict.as_ref(), Some(ConflictAction::Ignore)) {
-            Some(skip_label)
+            Some(row_done)
         } else {
             None
         };
@@ -24977,24 +25113,36 @@ fn codegen_update_from(
         constraint_ignore_label,
     );
 
-    // Constraints passed: NOW perform the destructive delete+insert. Old index
-    // entries are read from the cursor (still positioned on the unchanged old
-    // row) before the row Delete.
-    emit_index_deletes_for_update(b, target, target_cursor, None);
-    b.emit_op(
-        Opcode::Delete,
-        target_cursor,
-        0,
-        0,
-        P4::None,
-        OPFLAG_ISUPDATE,
-    );
+    // Constraints passed: NOW perform the destructive rewrite. Old index
+    // entries are read from the cursor (re-seeked onto the unchanged old row)
+    // before the row Delete; only indexes the assignments can change are
+    // touched, as in the plain UPDATE lane.
+    let update_index_mask = update_index_maintenance_mask(target, &assignment_targets);
+    emit_index_deletes_for_update(b, target, target_cursor, Some(&update_index_mask));
 
     // Determine destination rowid.
     let mut rowid_reg = old_rowid_reg;
     let rowid_alias_col_idx = ctx
         .rowid_alias_col_idx
         .or_else(|| target.columns.iter().position(|col| col.is_ipk));
+    // bd-9ag5r: when neither the hidden rowid nor its INTEGER PRIMARY KEY alias
+    // is assigned, the rowid cannot change, so the engine rewrites the row in
+    // place instead of delete + seek + insert.
+    let keeps_rowid_flag = if assignment_targets.assigns_hidden_rowid
+        || rowid_alias_col_idx.is_some_and(|idx| assignment_targets.columns.contains(&idx))
+    {
+        0
+    } else {
+        OPFLAG_UPDATE_KEEPS_ROWID
+    };
+    b.emit_op(
+        Opcode::Delete,
+        target_cursor,
+        0,
+        0,
+        P4::None,
+        OPFLAG_ISUPDATE | keeps_rowid_flag,
+    );
     if let Some(new_rowid_reg) = hidden_rowid_reg {
         // bd-p1h2r: hidden-rowid assignment supplies the new key directly.
         rowid_reg = new_rowid_reg;
@@ -25060,23 +25208,23 @@ fn codegen_update_from(
     );
 
     // Insert new index entries.
-    emit_index_inserts(
+    emit_index_inserts_for_update(
         b,
         target,
         target_cursor,
         col_regs,
         rowid_reg,
         stmt.or_conflict,
+        &update_index_mask,
     );
 
     // RETURNING clause (numbered after SET + ON + WHERE placeholders).
     if !stmt.returning.is_empty() {
         // GH #159: as in the plain UPDATE path, an OR IGNORE row whose insert
         // the engine suppressed on a rowid/UNIQUE conflict must not emit a
-        // RETURNING row. Jump past RETURNING to the loop's skip label when the
-        // engine's conflict_skip_idx is set.
+        // RETURNING row.
         if matches!(stmt.or_conflict.as_ref(), Some(ConflictAction::Ignore)) {
-            b.emit_jump_to_label(Opcode::IfConflictSkip, 0, 0, skip_label, P4::None, 0);
+            b.emit_jump_to_label(Opcode::IfConflictSkip, 0, 0, row_done, P4::None, 0);
         }
         b.set_next_anon_placeholder(
             set_placeholder_count + on_placeholder_count + where_placeholder_count + 1,
@@ -25091,25 +25239,19 @@ fn codegen_update_from(
         )?;
     }
 
-    // Skip label for filtered-out rows.
-    b.resolve_label(skip_label);
-
-    // Innermost (target) Next: loop back to the target loop body.
-    b.emit_op(Opcode::Next, target_cursor, target_body, 0, P4::None, 0);
-    b.resolve_label(target_done_label);
-
-    // Unwind the FROM-source loops from innermost to outermost. Each loop's
-    // Next jumps back to its body; its done label lands here so an exhausted or
-    // empty source falls through to the next-outer loop's Next.
-    for frame in frames.iter().rev() {
-        b.emit_op(Opcode::Next, frame.cursor, frame.body, 0, P4::None, 0);
-        b.resolve_label(frame.done);
-    }
+    b.resolve_label(row_done);
+    b.emit_op(
+        Opcode::SorterNext,
+        sorter_cursor,
+        pass2_body,
+        0,
+        P4::None,
+        0,
+    );
+    b.resolve_label(pass2_done);
 
     // Close all cursors.
-    for sec in &secondaries {
-        b.emit_op(Opcode::Close, sec.cursor, 0, 0, P4::None, 0);
-    }
+    b.emit_op(Opcode::Close, sorter_cursor, 0, 0, P4::None, 0);
     #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
     for idx_offset in 0..target.indexes.len() {
         let idx_cursor = target_cursor + 1 + idx_offset as i32;
@@ -28568,15 +28710,22 @@ fn codegen_update_from_without_rowid(
         );
     }
 
-    // Sorter holds [OLD image (n_cols) || NEW image (n_cols)].
+    // Sorter holds [OLD image (n_cols) || seq || NEW image (n_cols)]. `seq`
+    // counts down per match, so a target row's matches sort newest first and
+    // pass 2 applies only the first of each OLD-key run: each target row is
+    // rewritten (and counted) once, with the last matching FROM row winning,
+    // as in SQLite (bd-b5j26). Re-applying a stale OLD image corrupted the
+    // secondary indexes.
     b.emit_op(
         Opcode::SorterOpen,
         sorter_cursor,
-        (2 * n_cols) as i32,
+        (2 * n_cols + 1) as i32,
         0,
-        P4::Str("+".repeat(2 * n_cols)),
+        P4::Str("+".repeat(2 * n_cols + 1)),
         0,
     );
+    let seq_reg = b.alloc_reg();
+    b.emit_op(Opcode::Integer, 0, seq_reg, 0, P4::None, 0);
 
     // Anonymous-placeholder base counts in SQL textual order: SET, ON, WHERE,
     // RETURNING.
@@ -28643,10 +28792,11 @@ fn codegen_update_from_without_rowid(
 
     // Match: build the OLD image, seed the NEW image from it, apply the
     // assignments (RHS resolves target cols via the cursor and FROM cols via the
-    // secondaries), validate, and stash [OLD || NEW] into the sorter.
-    let row_regs = b.alloc_regs((2 * n_cols) as i32);
+    // secondaries), validate, and stash [OLD || seq || NEW] into the sorter.
+    let row_regs = b.alloc_regs((2 * n_cols + 1) as i32);
     let old_regs = row_regs;
-    let new_regs = row_regs + n_cols as i32;
+    let seq_slot = row_regs + n_cols as i32;
+    let new_regs = seq_slot + 1;
     for i in 0..n_cols {
         b.emit_op(
             Opcode::Column,
@@ -28682,11 +28832,13 @@ fn codegen_update_from_without_rowid(
     );
     emit_check_constraints(b, table, new_regs, None);
     emit_not_null_constraints(b, table, new_regs, stmt.or_conflict, None);
+    b.emit_op(Opcode::AddImm, seq_reg, -1, 0, P4::None, 0);
+    b.emit_op(Opcode::Copy, seq_reg, seq_slot, 0, P4::None, 0);
     let stash_rec = b.alloc_reg();
     b.emit_op(
         Opcode::MakeRecord,
         row_regs,
-        (2 * n_cols) as i32,
+        (2 * n_cols + 1) as i32,
         stash_rec,
         P4::None,
         0,
@@ -28716,6 +28868,8 @@ fn codegen_update_from_without_rowid(
     }
 
     // --- Pass 2: re-seek each collected row by OLD primary key and rewrite. ---
+    let prev_pk_rec = b.alloc_reg();
+    b.emit_op(Opcode::Null, 0, prev_pk_rec, 0, P4::None, 0);
     let pass2_done = b.emit_label();
     b.emit_jump_to_label(
         Opcode::SorterSort,
@@ -28751,7 +28905,7 @@ fn codegen_update_from_without_rowid(
         b.emit_op(
             Opcode::Column,
             sorter_cursor,
-            (n_cols + i) as i32,
+            (n_cols + 1 + i) as i32,
             new_img + i as i32,
             P4::None,
             0,
@@ -28780,6 +28934,13 @@ fn codegen_update_from_without_rowid(
         0,
     );
     let row_done = b.emit_label();
+    // Only the newest match of each target row applies (see the stash layout).
+    // Copy materializes the probe record into a plain register for the
+    // byte-wise comparison with the previous row's key.
+    let cur_pk_rec = b.alloc_reg();
+    b.emit_op(Opcode::Copy, pk_probe_rec, cur_pk_rec, 0, P4::None, 0);
+    b.emit_jump_to_label(Opcode::Eq, prev_pk_rec, cur_pk_rec, row_done, P4::None, 0);
+    b.emit_op(Opcode::Copy, cur_pk_rec, prev_pk_rec, 0, P4::None, 0);
     b.emit_jump_to_label(
         Opcode::NoConflict,
         target_cursor,

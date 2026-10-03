@@ -249,18 +249,6 @@ fn update_from_with_triggers_and_fks_matches_stock_in_every_conflict_mode() {
             for trigger in TRIGGERS {
                 for fk in [false, true] {
                     for template in STATEMENTS {
-                        // Without triggers or FKs this shape runs as one VDBE
-                        // UPDATE ... FROM, which on a file-backed rowid table
-                        // with an index on the assigned column updates one of
-                        // the two matching rows (pre-existing, also in 0.4.7;
-                        // a separate bug). The replayed paths are covered.
-                        if trigger.0 == "none"
-                            && !fk
-                            && schema.name != "without_rowid"
-                            && template.contains("u.a > 3")
-                        {
-                            continue;
-                        }
                         for mode in MODES {
                             let sql = template.replace("{or}", mode);
                             run_case(schema, trigger, fk, &sql, &mut failures).await;
