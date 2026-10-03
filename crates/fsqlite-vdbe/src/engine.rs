@@ -8515,6 +8515,19 @@ impl VdbeEngine {
                         );
                         let key_bytes =
                             encode_record_with_encoding(&key_values, self.text_encoding);
+                        // UPDATE only removes indexes whose keys may change.
+                        // A rejected update must leave untouched old entries
+                        // in place rather than restore a second copy of them.
+                        if self
+                            .storage_cursor_find_exact_index_key(
+                                meta.cursor_id,
+                                &key_bytes,
+                                "UPDATE conflict restore: missing collation registry for collated exact probe",
+                            )
+                            .await?
+                        {
+                            continue;
+                        }
                         if let Some(sc) = self.storage_cursors.get_mut(&meta.cursor_id)
                             && sc.writable
                         {
