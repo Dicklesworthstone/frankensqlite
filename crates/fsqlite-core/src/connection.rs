@@ -12902,6 +12902,12 @@ pub struct Connection {
     last_insert_rowid: Cell<i64>,
     /// Cumulative number of rows changed on this connection.
     total_changes: Cell<usize>,
+    /// Monotonic count of rows changed by completed trigger-body DML steps
+    /// (bd-c1vth). Stock adds each trigger step's changes to
+    /// `total_changes()` when the step completes (`OP_ResetCount`), so they
+    /// stay counted when the outer statement later aborts; a failed
+    /// statement's counter restore adds the delta since it started.
+    trigger_step_changes: Cell<usize>,
     /// Error-time VDBE change tracking captured before higher layers decide
     /// whether a failing statement should preserve partial progress.
     last_table_program_error_state: RefCell<Option<TableProgramErrorState>>,
@@ -14841,6 +14847,7 @@ impl Connection {
             last_changes: Cell::new(0),
             last_insert_rowid: Cell::new(0),
             total_changes: Cell::new(0),
+            trigger_step_changes: Cell::new(0),
             last_table_program_error_state: RefCell::new(None),
             internal_statement_savepoint_depth: Cell::new(0),
             implicit_txn: Cell::new(false),
@@ -15386,6 +15393,7 @@ impl Connection {
             last_changes: Cell::new(0),
             last_insert_rowid: Cell::new(0),
             total_changes: Cell::new(0),
+            trigger_step_changes: Cell::new(0),
             last_table_program_error_state: RefCell::new(None),
             internal_statement_savepoint_depth: Cell::new(0),
             implicit_txn: Cell::new(false),
@@ -23110,9 +23118,17 @@ impl Connection {
         preserve_prior_changes_on_constraint_violation: bool,
         error: &FrankenError,
         previous_total_changes: usize,
+        previous_trigger_step_changes: usize,
         previous_last_insert_rowid: i64,
     ) -> bool {
         let error_state = self.take_table_program_error_state();
+        // bd-c1vth: trigger steps that completed during the failed statement
+        // stay counted, as in stock; the statement's own rows do not.
+        let previous_total_changes = previous_total_changes.saturating_add(
+            self.trigger_step_changes
+                .get()
+                .saturating_sub(previous_trigger_step_changes),
+        );
         if preserve_prior_changes_on_constraint_violation
             && error_is_constraint_violation(error)
             && let Some(state) = error_state
@@ -31807,6 +31823,7 @@ impl Connection {
         }
 
         let previous_total_changes = self.total_changes.get();
+        let previous_trigger_step_changes = self.trigger_step_changes.get();
         let previous_last_insert_rowid = self.current_last_insert_rowid();
         self.txn_metrics_note_write();
         // bd-01qa9: the skip-statement-savepoint optimization (bd-pktso) is only
@@ -31852,6 +31869,7 @@ impl Connection {
                     preserve_prior_changes_on_constraint_violation,
                     &error,
                     previous_total_changes,
+                    previous_trigger_step_changes,
                     previous_last_insert_rowid,
                 );
                 match Box::pin(self.maybe_rollback_transaction_for_conflict_action(
@@ -38034,6 +38052,7 @@ impl Connection {
                 was_auto,
             } = self.plan_statement_execution(statement.as_ref()).await?;
             let previous_total_changes = self.total_changes.get();
+            let previous_trigger_step_changes = self.trigger_step_changes.get();
             let previous_last_insert_rowid = self.current_last_insert_rowid();
             if !is_txn_control {
                 if is_write {
@@ -38109,6 +38128,7 @@ impl Connection {
                             statement_preserves_prior_changes_on_constraint(statement.as_ref()),
                             &error,
                             previous_total_changes,
+                            previous_trigger_step_changes,
                             previous_last_insert_rowid,
                         );
                     }
@@ -40131,6 +40151,16 @@ impl Connection {
                 // existing parent UPDATE actions and AFTER UPDATE processing.
                 Box::pin(self.enforce_fk_on_replace_victims(table_name)).await?;
 
+                // bd-c1vth: when the program updated no row (UPDATE OR IGNORE
+                // skipped it on a conflict, or a BEFORE trigger removed it), no
+                // parent FK action runs and no AFTER UPDATE trigger fires, as in
+                // stock. Multi-row trigger and FK statements are replayed one
+                // row at a time above, so each skipped row arrives here alone.
+                let no_row_updated = affected == 0;
+                if no_row_updated {
+                    pending_fk_actions.clear();
+                }
+
                 // SQLite's FK programs observe the updated parent row and run
                 // before the parent's AFTER UPDATE triggers.
                 for action in &pending_fk_actions {
@@ -40138,7 +40168,7 @@ impl Connection {
                 }
 
                 // Phase 5G.3: Fire AFTER UPDATE triggers.
-                if has_after_update {
+                if has_after_update && !no_row_updated {
                     for (row_rowid, old_values, new_values) in &trigger_rows {
                         Box::pin(self.fire_after_triggers(
                             table_name,
@@ -69572,7 +69602,18 @@ impl Connection {
         // changes() and last_insert_rowid() when control returns to the outer
         // statement. Restore those two values even when the trigger fails.
         let _change_tracking_guard = TriggerChangeTrackingRestoreGuard::new(self);
+        let counts_changes = matches!(
+            &statement,
+            Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
+        );
         self.execute_statement(&statement, None).await?;
+        if counts_changes {
+            self.trigger_step_changes.set(
+                self.trigger_step_changes
+                    .get()
+                    .saturating_add(self.last_changes.get()),
+            );
+        }
         Ok(TriggerStatementOutcome::Continue)
     }
 

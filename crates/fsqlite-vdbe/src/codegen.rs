@@ -22124,7 +22124,7 @@ fn emit_upsert_do_update_apply(
     );
     emit_check_constraints(b, table, existing_regs, None);
     emit_not_null_constraints(b, table, existing_regs, stmt_level, None);
-    emit_index_deletes(b, table, cursor);
+    emit_index_deletes_for_update(b, table, cursor, None);
     b.emit_op(Opcode::Delete, cursor, 0, 0, P4::None, OPFLAG_ISUPDATE);
 
     // An UPSERT assignment may rewrite the INTEGER PRIMARY KEY. Reinsert at the
@@ -23818,7 +23818,7 @@ pub fn codegen_update(
     // Constraints passed: now perform the destructive delete+insert rewrite.
     // Index maintenance (bd-2f9t): Delete OLD index entries. The indexed key
     // terms are re-read from the table cursor's still-current old row.
-    emit_index_deletes_for_update(b, table, table_cursor, &update_index_mask);
+    emit_index_deletes_for_update(b, table, table_cursor, Some(&update_index_mask));
 
     // Determine destination rowid for re-insertion.
     let mut rowid_reg = matched_rowid_reg;
@@ -24631,7 +24631,7 @@ fn codegen_update_from(
     // Constraints passed: NOW perform the destructive delete+insert. Old index
     // entries are read from the cursor (still positioned on the unchanged old
     // row) before the row Delete.
-    emit_index_deletes(b, target, target_cursor);
+    emit_index_deletes_for_update(b, target, target_cursor, None);
     b.emit_op(
         Opcode::Delete,
         target_cursor,
@@ -29191,17 +29191,21 @@ fn emit_index_inserts_filtered(
 /// * `table_cursor` - Cursor ID for the table (index cursors are table_cursor + 1, +2, etc.)
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 fn emit_index_deletes(b: &mut ProgramBuilder, table: &TableSchema, table_cursor: i32) {
-    emit_index_deletes_filtered(b, table, table_cursor, None);
+    emit_index_deletes_filtered(b, table, table_cursor, None, 0);
 }
 
+/// Emit the old-entry `IdxDelete`s of an UPDATE rewrite (UPDATE, UPDATE ...
+/// FROM, UPSERT DO UPDATE), restricted to `update_index_mask` when given. They
+/// carry `OPFLAG_ISUPDATE` so the engine records each removed entry and a
+/// conflict restore re-inserts exactly those (bd-c1vth).
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 fn emit_index_deletes_for_update(
     b: &mut ProgramBuilder,
     table: &TableSchema,
     table_cursor: i32,
-    update_index_mask: &[bool],
+    update_index_mask: Option<&[bool]>,
 ) {
-    emit_index_deletes_filtered(b, table, table_cursor, Some(update_index_mask));
+    emit_index_deletes_filtered(b, table, table_cursor, update_index_mask, OPFLAG_ISUPDATE);
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -29210,6 +29214,7 @@ fn emit_index_deletes_filtered(
     table: &TableSchema,
     table_cursor: i32,
     update_index_mask: Option<&[bool]>,
+    idx_delete_p5: u16,
 ) {
     for (idx_offset, index) in table.indexes.iter().enumerate() {
         if update_index_mask.is_some_and(|mask| !mask.get(idx_offset).copied().unwrap_or(true)) {
@@ -29249,7 +29254,7 @@ fn emit_index_deletes_filtered(
             idx_key_regs,
             (n_idx_cols + 1) as i32,
             P4::Table(index.name.clone()),
-            0,
+            idx_delete_p5,
         );
 
         b.resolve_label(skip_label);
@@ -45407,6 +45412,11 @@ mod tests {
             idx_delete.p3 > 0,
             "IdxDelete must carry key register count (p3 > 0) so engine seeks by key"
         );
+        assert_eq!(
+            idx_delete.p5 & OPFLAG_ISUPDATE,
+            OPFLAG_ISUPDATE,
+            "UPDATE IdxDelete must carry OPFLAG_ISUPDATE so a conflict restore re-inserts exactly the entries it removed (bd-c1vth)"
+        );
     }
 
     #[test]
@@ -45571,6 +45581,11 @@ mod tests {
         assert!(
             idx_delete.p3 > 0,
             "IdxDelete must carry key register count (p3 > 0) so engine seeks by key"
+        );
+        assert_eq!(
+            idx_delete.p5 & OPFLAG_ISUPDATE,
+            0,
+            "DELETE IdxDelete must not pay for UPDATE conflict-restore entry capture (bd-c1vth)"
         );
     }
 

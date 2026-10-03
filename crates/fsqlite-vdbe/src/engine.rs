@@ -243,6 +243,10 @@ fn validate_schema_function_invocation(
 ///
 /// The low 4 bits of `Insert.p5` are reserved for OE_* conflict behavior in
 /// this engine, so the UPDATE marker must live above them.
+///
+/// On a secondary-index `IdxDelete` it marks the removal of an UPDATE row's
+/// old entry: the engine records the exact entry so a conflict restore puts
+/// back precisely the entries that row's UPDATE removed (bd-c1vth).
 const OPFLAG_ISUPDATE: u16 = 0x10;
 /// Marks a WITHOUT ROWID table-row `IdxDelete` whose deleted logical row is an
 /// exact REPLACE victim needed by connection-layer inbound FK enforcement.
@@ -7048,6 +7052,11 @@ enum PendingUpdateRestore {
         cursor_id: i32,
         rowid: i64,
         payload: Vec<u8>,
+        /// `(index cursor, exact stored key)` of every secondary-index entry
+        /// the UPDATE removed for this row (bd-c1vth). An UPDATE only rewrites
+        /// the indexes whose key it changes, so the restore must re-insert
+        /// exactly these and touch no other index.
+        index_entries: Vec<(i32, Vec<u8>)>,
     },
     Mem {
         root_page: i32,
@@ -7108,6 +7117,10 @@ struct ColdVdbeState {
     /// On secondary-index conflict rollback, these entries must be deleted to
     /// avoid phantom index entries blocking future inserts.
     pending_idx_entries: Vec<(i32, Vec<u8>)>,
+    /// Secondary-index entries removed by the current UPDATE row's
+    /// `IdxDelete | OPFLAG_ISUPDATE` opcodes (cursor_id, exact stored key).
+    /// The row's `Delete` moves them into its `PendingUpdateRestore`.
+    pending_update_idx_deletes: Vec<(i32, Vec<u8>)>,
     /// RowSet data structures for OR-optimized queries (keyed by register).
     rowsets: SwissIndex<i32, RowSet>,
     /// Per-cursor monotonic sequence counters for `Opcode::Sequence`.
@@ -7137,6 +7150,7 @@ impl ColdVdbeState {
             pending_insert_rollback: None,
             conflict_skip_idx: false,
             pending_idx_entries: Vec::new(),
+            pending_update_idx_deletes: Vec::new(),
             rowsets: SwissIndex::new(),
             sequence_counters: HashMap::new(),
             vtab_cursors: SwissIndex::new(),
@@ -7491,6 +7505,13 @@ impl VdbeEngine {
         if let Some(cold_state) = self.cold_state_mut() {
             cold_state.pending_idx_entries.clear();
         }
+    }
+
+    #[inline]
+    fn take_pending_update_idx_deletes(&mut self) -> Vec<(i32, Vec<u8>)> {
+        self.cold_state_mut().map_or_else(Vec::new, |cold_state| {
+            std::mem::take(&mut cold_state.pending_update_idx_deletes)
+        })
     }
 
     #[inline]
@@ -8475,6 +8496,7 @@ impl VdbeEngine {
                 cursor_id,
                 rowid,
                 payload,
+                index_entries,
             } => {
                 let tsc = self.storage_cursors.get_mut(&cursor_id).ok_or_else(|| {
                     FrankenError::internal("table cursor missing during UPDATE conflict restore")
@@ -8486,59 +8508,27 @@ impl VdbeEngine {
                     DecodeCacheInvalidationReason::WriteMutation,
                 );
 
-                let table_index_meta = Arc::clone(&self.table_index_meta);
-                let table_root_page = self.table_root_page_for_cursor(cursor_id);
-                if let Some(index_metas) = table_index_meta.get(&cursor_id) {
-                    // Decode in the DB text encoding to match the encoding-aware
-                    // index-key re-encode below (bd-o3rz4): a UTF-8-hardcoded
-                    // decode on a UTF-16 DB would restore a wrong index key.
-                    let old_row = parse_record_with_encoding(&payload, self.text_encoding)
+                // bd-c1vth: put back exactly the entries this row's UPDATE
+                // removed. Re-deriving keys for every index of the table
+                // duplicated the entry of each index the UPDATE never touched
+                // and dropped the entry of a rewritten expression or partial
+                // index.
+                for (index_cursor_id, key_bytes) in index_entries {
+                    let sc = self
+                        .storage_cursors
+                        .get_mut(&index_cursor_id)
+                        .filter(|sc| sc.writable)
                         .ok_or_else(|| {
                             FrankenError::internal(
-                                "UPDATE conflict restore could not decode original row payload",
+                                "index cursor missing during UPDATE conflict restore",
                             )
                         })?;
-                    for meta in index_metas.iter() {
-                        // Empty column metadata denotes an expression or
-                        // partial index. These indexes were not restorable by
-                        // this path before they were registered for REPLACE
-                        // cleanup, so do not synthesize an invalid `(rowid)`
-                        // key here.
-                        if meta.column_indices.is_empty() {
-                            continue;
-                        }
-                        let key_values = self.index_key_values_from_table_payload(
-                            table_root_page,
-                            &old_row,
-                            rowid,
-                            &meta.column_indices,
-                        );
-                        let key_bytes =
-                            encode_record_with_encoding(&key_values, self.text_encoding);
-                        // UPDATE only removes indexes whose keys may change.
-                        // A rejected update must leave untouched old entries
-                        // in place rather than restore a second copy of them.
-                        if self
-                            .storage_cursor_find_exact_index_key(
-                                meta.cursor_id,
-                                &key_bytes,
-                                "UPDATE conflict restore: missing collation registry for collated exact probe",
-                            )
-                            .await?
-                        {
-                            continue;
-                        }
-                        if let Some(sc) = self.storage_cursors.get_mut(&meta.cursor_id)
-                            && sc.writable
-                        {
-                            sc.cursor.index_insert(&sc.cx, &key_bytes).await?;
-                            invalidate_storage_cursor_row_cache_with_reason(
-                                sc,
-                                self.collect_vdbe_metrics,
-                                DecodeCacheInvalidationReason::WriteMutation,
-                            );
-                        }
-                    }
+                    sc.cursor.index_insert(&sc.cx, &key_bytes).await?;
+                    invalidate_storage_cursor_row_cache_with_reason(
+                        sc,
+                        self.collect_vdbe_metrics,
+                        DecodeCacheInvalidationReason::WriteMutation,
+                    );
                 }
                 self.sync_storage_table_restore_into_memdb_mirror(cursor_id, rowid, &payload);
             }
@@ -11881,6 +11871,7 @@ impl VdbeEngine {
                                     cursor_id,
                                     rowid: current_rowid,
                                     payload: sc.cursor.payload(&sc.cx).await?,
+                                    index_entries: Vec::new(),
                                 });
                             }
                             if keeps_rowid {
@@ -11927,6 +11918,14 @@ impl VdbeEngine {
                     }
                     if let Some(storage_rowid) = deleted_storage_rowid {
                         self.sync_storage_table_delete_into_memdb_mirror(cursor_id, storage_rowid);
+                    }
+                    // bd-c1vth: the index entries this row's UPDATE removed
+                    // belong to its restore; any other Delete discards them.
+                    let removed_index_entries = self.take_pending_update_idx_deletes();
+                    if let Some(PendingUpdateRestore::Storage { index_entries, .. }) =
+                        update_restore.as_mut()
+                    {
+                        *index_entries = removed_index_entries;
                     }
                     if deleted {
                         if is_update && update_restore.is_some() {
@@ -12488,9 +12487,15 @@ impl VdbeEngine {
                             )
                             .await?
                         {
+                            let mut removed_entry = None;
                             if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
                                 sc.last_rightmost_unique_index_prefix = None;
                                 sc.last_rightmost_unique_index_position = None;
+                                // bd-c1vth: record the exact stored entry an
+                                // UPDATE row removes, for its conflict restore.
+                                if op.p5 & OPFLAG_ISUPDATE != 0 {
+                                    removed_entry = Some(sc.cursor.payload(&sc.cx).await?);
+                                }
                                 sc.cursor.delete(&sc.cx).await?;
                                 deleted = true;
                                 invalidate_storage_cursor_row_cache_with_reason(
@@ -12498,6 +12503,11 @@ impl VdbeEngine {
                                     self.collect_vdbe_metrics,
                                     DecodeCacheInvalidationReason::WriteMutation,
                                 );
+                            }
+                            if let Some(entry) = removed_entry {
+                                self.ensure_cold_state_for(StatementColdState::CONFLICT_TRACKING)
+                                    .pending_update_idx_deletes
+                                    .push((cursor_id, entry));
                             }
                         }
                     } else if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
@@ -31199,11 +31209,14 @@ mod tests {
         let logical_idx = encode_record(&[SqliteValue::Integer(1), SqliteValue::Integer(1)]);
         let raw_payload_idx = encode_record(&[SqliteValue::Null, SqliteValue::Integer(1)]);
 
+        // The restore re-inserts exactly the entries the UPDATE's `IdxDelete`
+        // removed: the stored key, which carries the logical rowid alias.
         run_async(
             engine.restore_pending_update_after_conflict(PendingUpdateRestore::Storage {
                 cursor_id: 0,
                 rowid: 1,
                 payload: restored_row,
+                index_entries: vec![(1, logical_idx.clone())],
             }),
         )
         .unwrap();
