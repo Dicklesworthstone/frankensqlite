@@ -2242,7 +2242,7 @@ mod tests {
                 .expect("statement should prepare");
 
             assert_eq!(stmt.column_count(), 3);
-            assert_eq!(stmt.column_names(), &["user_id", "name", "_c2"]);
+            assert_eq!(stmt.column_names(), &["user_id", "name", "1 + 2"]);
         });
     }
 

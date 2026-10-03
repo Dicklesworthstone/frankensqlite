@@ -26685,7 +26685,9 @@ impl Connection {
                     span
                 });
             let _plan_guard = plan_span.as_ref().map(tracing::Span::enter);
-            let prepared_result = self.compile_and_wrap(&canonical_sql, sql, &statement).await;
+            let prepared_result = self
+                .compile_and_wrap(&canonical_sql, sql, &statement, parsed.as_ref())
+                .await;
 
             // User module metadata callbacks are deliberately reentrant and
             // may replace a scalar while preparation is in progress. Neither
@@ -45295,11 +45297,17 @@ impl Connection {
         sql: &str,
         original_sql: &str,
         statement: &Statement,
+        original_statement: &Statement,
     ) -> Result<PreparedStatement<'_>> {
         // Column metadata can invoke user vtab factories, which may re-register
         // modules or functions. Finish every callback-capable metadata lookup
         // before snapshotting the callable registry and its generation.
-        let prepared_column_names = self.prepared_statement_column_names(statement);
+        let mut prepared_column_names = self.prepared_statement_column_names(statement);
+        overlay_result_expression_source_names(
+            &mut prepared_column_names,
+            original_statement,
+            original_sql,
+        );
         // The prepared names already carry the deferred SELECT result width.
         // Asking for the count separately would call user vtab metadata a
         // second time, allowing a stateful or self-replacing factory to return
@@ -81715,6 +81723,25 @@ impl Connection {
             groups.push((Vec::new(), Vec::new()));
         }
 
+        // bd-xik4y: when the query's only aggregate is a single min()/max() and
+        // it has bare columns, SQLite reads those bare columns from the row that
+        // produced the extremum. Everything below reads bare values from a
+        // group's first row (plain columns, aggregates nested in an expression,
+        // correlated subqueries, HAVING, ORDER BY), so move that row to the
+        // front. The lone min()/max() does not depend on row order.
+        if let Some(tracking) = self.select_uses_builtin_minmax_bare_tracking(select) {
+            for (_key, group_rows) in &mut groups {
+                if let Some(index) = self
+                    .join_minmax_bare_extremum_index(
+                        &tracking, group_rows, &col_map, using_skip, &coll_snap,
+                    )
+                    .await?
+                {
+                    group_rows.swap(0, index);
+                }
+            }
+        }
+
         // Step 6: Build result rows from groups.
         let empty_group_row = vec![SqliteValue::Null; col_map.len()];
         let mut result = Vec::with_capacity(groups.len());
@@ -82206,6 +82233,57 @@ impl Connection {
         }
 
         Ok(result)
+    }
+
+    /// bd-xik4y: index of the row in `group_rows` whose tracked min()/max()
+    /// argument is the group's extremum: the first row holding it in scan
+    /// order, skipping NULLs and rows the aggregate's FILTER rejects, compared
+    /// under the argument's effective collation. `None` when no row qualifies
+    /// (SQLite then keeps an arbitrary row; the group's first row stays).
+    async fn join_minmax_bare_extremum_index(
+        &self,
+        tracking: &(bool, Expr, Option<Expr>),
+        group_rows: &[Vec<SqliteValue>],
+        col_map: &[(String, String, bool)],
+        using_skip: Option<&HashSet<usize>>,
+        coll_snap: &CollationRegistry,
+    ) -> Result<Option<usize>> {
+        let (is_max, arg, filter) = tracking;
+        let collation = join_expr_effective_collation(arg, col_map);
+        let mut best: Option<(usize, SqliteValue)> = None;
+        for (index, row) in group_rows.iter().enumerate() {
+            if let Some(filter) = filter {
+                let keep = self
+                    .eval_row_expr_allowing_subqueries_with_using(filter, row, col_map, using_skip)
+                    .await?;
+                if !is_sqlite_truthy(&keep) {
+                    continue;
+                }
+            }
+            let value = self
+                .eval_row_expr_allowing_subqueries_with_using(arg, row, col_map, using_skip)
+                .await?;
+            if value.is_null() {
+                continue;
+            }
+            let replace = best.as_ref().is_none_or(|(_, best_value)| {
+                let ordering = cmp_sqlite_values_collated_snapshot(
+                    &value,
+                    best_value,
+                    collation.as_deref(),
+                    coll_snap,
+                );
+                if *is_max {
+                    ordering == std::cmp::Ordering::Greater
+                } else {
+                    ordering == std::cmp::Ordering::Less
+                }
+            });
+            if replace {
+                best = Some((index, value));
+            }
+        }
+        Ok(best.map(|(index, _)| index))
     }
 
     /// Stable-reorder the materialized rows of a GROUP BY + JOIN so that, within
@@ -102309,11 +102387,6 @@ fn select_minmax_bare_tracking(select: &SelectStatement) -> Option<(bool, Expr, 
     else {
         return None;
     };
-    // Leave HAVING queries on the existing path; the optimization interacts with
-    // post-aggregate filtering in ways not exercised here.
-    if having.is_some() {
-        return None;
-    }
     let mut state = MinMaxBareTrackingWalk::default();
     for col in columns {
         let ResultColumn::Expr { expr, .. } = col else {
@@ -102324,10 +102397,41 @@ fn select_minmax_bare_tracking(select: &SelectStatement) -> Option<(bool, Expr, 
             return None;
         }
     }
-    if state.agg_count == 1 && state.has_bare {
-        state.minmax
-    } else {
-        None
+    if state.agg_count != 1 || !state.has_bare {
+        return None;
+    }
+    // bd-xik4y: SQLite keeps tracking the extremum row under a HAVING clause
+    // (`SELECT max(v), b ... HAVING max(v) > 0`). Admit a HAVING whose only
+    // aggregates repeat the tracked min()/max(), so the query still has a single
+    // aggregate. HAVING is evaluated against the group's unordered rows, so a
+    // bare column or subquery inside it stays on the existing path.
+    if let Some(having) = having.as_deref() {
+        let tracked = state.minmax.as_ref()?;
+        if !having_admits_minmax_bare_tracking(having, group_by, tracked) {
+            return None;
+        }
+    }
+    state.minmax
+}
+
+/// bd-xik4y: whether `expr` (a HAVING clause) keeps the single-min()/max()
+/// bare-column rule intact: every aggregate call in it is the tracked one, and
+/// it reads no bare column (outside GROUP BY keys and the tracked aggregate's
+/// argument) and no subquery.
+fn having_admits_minmax_bare_tracking(
+    expr: &Expr,
+    group_by: &[Expr],
+    tracked: &(bool, Expr, Option<Expr>),
+) -> bool {
+    let mut state = MinMaxBareTrackingWalk::default();
+    walk_minmax_bare_tracking(expr, group_by, &mut state);
+    if state.bail || state.has_bare {
+        return false;
+    }
+    match (&state.minmax, state.agg_count) {
+        (None, 0) => true,
+        (Some(found), 1) => found == tracked,
+        _ => false,
     }
 }
 
@@ -109923,6 +110027,115 @@ fn compound_op_error_name(op: CompoundOp) -> &'static str {
 }
 
 /// Infer column names from a SELECT statement's result columns.
+/// bd-xik4y: SQLite names an unaliased result expression that is not a plain
+/// column reference by its source text (`max(v)`, `count(*)`, `x + 1`,
+/// `(a)`), where the name derivation above falls back to a positional `_cN`.
+/// `original` must be the statement parsed from `sql` (its spans index into
+/// it), not a rewritten one. Lists with `*` are left alone because their
+/// expansion shifts result positions.
+fn overlay_result_expression_source_names(names: &mut [String], original: &Statement, sql: &str) {
+    let Statement::Select(select) = original else {
+        return;
+    };
+    let SelectCore::Select { columns, .. } = &select.body.select else {
+        return;
+    };
+    if columns.len() != names.len()
+        || columns
+            .iter()
+            .any(|column| matches!(column, ResultColumn::Star | ResultColumn::TableStar(_)))
+    {
+        return;
+    }
+    let mut tokens: Option<Vec<fsqlite_parser::Token>> = None;
+    for (name, column) in names.iter_mut().zip(columns) {
+        let ResultColumn::Expr { expr, alias: None } = column else {
+            continue;
+        };
+        if matches!(expr, Expr::Column(..)) {
+            continue;
+        }
+        let tokens = tokens.get_or_insert_with(|| Lexer::tokenize(sql));
+        if let Some(text) = result_expression_source_text(expr, sql, tokens) {
+            text.clone_into(name);
+        }
+    }
+}
+
+/// Source text of one top-level result expression: from its first token,
+/// widened over any parentheses that enclose it, to the last token before the
+/// next top-level `,` or the clause that ends the result list. The parser
+/// gives a parenthesized operand the span of its contents, so the expression's
+/// own span can neither start nor end the text reliably.
+fn result_expression_source_text<'s>(
+    expr: &Expr,
+    sql: &'s str,
+    tokens: &[fsqlite_parser::Token],
+) -> Option<&'s str> {
+    use fsqlite_parser::TokenKind;
+
+    let mut start = usize::try_from(expr.span().start).ok()?;
+    if start >= sql.len() || !sql.is_char_boundary(start) {
+        return None;
+    }
+    // Only `(` and whitespace can sit between the list separator (`SELECT`,
+    // `DISTINCT`, `,`) and an expression's first operand.
+    let bytes = sql.as_bytes();
+    let mut probe = start;
+    while probe > 0 {
+        match bytes[probe - 1] {
+            b'(' => {
+                probe -= 1;
+                start = probe;
+            }
+            b' ' | b'\t' | b'\n' | b'\r' => probe -= 1,
+            _ => break,
+        }
+    }
+    // Like SQLite's parser, the text runs up to the start of the token that
+    // ends the expression (so a trailing comment is kept), then trailing
+    // whitespace is trimmed.
+    let first = tokens.partition_point(|token| (token.span.start as usize) < start);
+    let mut depth = 0usize;
+    let mut end = sql.len();
+    for token in &tokens[first..] {
+        let stops = match &token.kind {
+            TokenKind::LeftParen => {
+                depth += 1;
+                false
+            }
+            TokenKind::RightParen if depth == 0 => true,
+            TokenKind::RightParen => {
+                depth -= 1;
+                false
+            }
+            TokenKind::Eof | TokenKind::Error(_) | TokenKind::Semicolon => true,
+            TokenKind::Comma
+            | TokenKind::KwFrom
+            | TokenKind::KwWhere
+            | TokenKind::KwGroup
+            | TokenKind::KwHaving
+            | TokenKind::KwWindow
+            | TokenKind::KwOrder
+            | TokenKind::KwLimit
+            | TokenKind::KwUnion
+            | TokenKind::KwIntersect
+            | TokenKind::KwExcept => depth == 0,
+            _ => false,
+        };
+        if stops {
+            end = token.span.start as usize;
+            break;
+        }
+    }
+    if depth != 0 || end <= start {
+        return None;
+    }
+    sql.get(start..end)
+        .map(str::trim_end)
+        .filter(|text| !text.is_empty())
+}
+
 fn infer_select_column_names(select: &SelectStatement) -> Vec<String> {
     let core = &select.body.select;
     match core {
