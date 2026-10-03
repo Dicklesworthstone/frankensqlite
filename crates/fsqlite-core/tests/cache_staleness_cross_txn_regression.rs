@@ -1,7 +1,6 @@
 #![recursion_limit = "512"]
 
 use fsqlite_core::connection::Connection;
-use fsqlite_error::FrankenError;
 use fsqlite_types::SqliteValue;
 use std::error::Error;
 
@@ -510,7 +509,7 @@ fn memory_unique_text_statement_warmed_before_first_write_tx_sees_committed_row(
 }
 
 #[test]
-fn stale_prepared_statement_rejects_schema_change_from_other_connection() -> TestResult {
+fn stale_prepared_statement_reprepares_after_schema_change_from_other_connection() -> TestResult {
     let mut outcome: TestResult = Ok(());
     asupersync::test_utils::run_test(|| async {
         outcome = async {
@@ -532,11 +531,11 @@ fn stale_prepared_statement_rejects_schema_change_from_other_connection() -> Tes
                 .execute("ALTER TABLE t ADD COLUMN extra TEXT DEFAULT 'fresh'")
                 .await?;
 
-            let schema_result = stmt.query_with_params(&[SqliteValue::Integer(1)]).await;
-            assert!(
-                matches!(schema_result, Err(FrankenError::SchemaChanged)),
-                "stale prepared statement should reject schema change, got {schema_result:?}"
-            );
+            // bd-9zuif: outside an explicit transaction the stale statement
+            // re-prepares against the new schema, as sqlite3_prepare_v2 does.
+            let reprepared_rows = stmt.query_with_params(&[SqliteValue::Integer(1)]).await?;
+            assert_eq!(reprepared_rows.len(), 1);
+            assert_eq!(text_at(&reprepared_rows[0], 0)?, "one");
 
             let fresh_stmt = conn_b.prepare("SELECT extra FROM t WHERE pk = ?1").await?;
             let fresh_rows = fresh_stmt

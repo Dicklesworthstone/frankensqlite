@@ -8215,7 +8215,8 @@ pub struct PreparedStatement<'conn> {
     /// Same-connection DDL epoch captured at prepare time. Compared against
     /// `Connection::local_ddl_epoch()` to decide whether a `SchemaChanged`
     /// originated from a same-connection DDL (transparently re-prepare, GH
-    /// #239) or a cross-connection change (preserve `SchemaChanged`).
+    /// #239) or a cross-connection change (re-prepared outside an explicit
+    /// transaction, bd-9zuif).
     local_ddl_epoch: u64,
     /// Function-registry generation captured at prepare time so cached plans
     /// and prepared handles fail fast after any UDF redefinition.
@@ -8425,12 +8426,29 @@ impl<'conn> PreparedStatement<'conn> {
     /// schema change made on THIS connection (a bumped `local_ddl_epoch`),
     /// rather than a cross-connection change (only the shared cookie moved).
     ///
-    /// Same-connection changes are re-prepared transparently to match stock
-    /// SQLite (GH #239); cross-connection changes retain the existing
-    /// `SchemaChanged` contract so the MVCC / concurrent-writer behavior that
-    /// the cross-connection tests pin is preserved unchanged.
+    /// Same-connection changes are always re-prepared transparently to match
+    /// stock SQLite (GH #239); see [`Self::schema_change_is_reprepareable`] for
+    /// cross-connection changes.
     fn schema_change_is_same_connection(&self) -> bool {
         self.conn.local_ddl_epoch() != self.local_ddl_epoch
+    }
+
+    /// True when the `SchemaChanged` this statement raised is answered by
+    /// re-preparing, as `sqlite3_prepare_v2` does: a schema change made on this
+    /// connection (GH #239), or (bd-9zuif) a schema cookie another connection
+    /// committed, seen while this connection has no explicit transaction open.
+    /// Such a statement starts from the committed schema anyway, so recompiling
+    /// against it is what stock's `sqlite3_step` does.
+    ///
+    /// Inside an explicit transaction a cross-connection change keeps
+    /// `SchemaChanged`: the transaction has already read under the old schema.
+    /// So does a function, collation or module redefinition, which leaves the
+    /// cookie alone.
+    fn schema_change_is_reprepareable(&self) -> bool {
+        self.schema_change_is_same_connection()
+            || (!self.conn.in_transaction()
+                && self.conn.function_registry_generation() == self.function_registry_generation
+                && self.conn.schema_cookie() != self.schema_cookie)
     }
 
     /// Re-parse / re-plan / re-compile this statement's ORIGINAL SQL against the
@@ -8465,10 +8483,10 @@ impl<'conn> PreparedStatement<'conn> {
     /// same-connection DDL, transparently re-prepare against the current schema
     /// and retry — up to `PREPARED_SCHEMA_REPREPARE_LIMIT` times (GH #239).
     ///
-    /// A `SchemaChanged` from a cross-connection change (or any other error) is
-    /// returned unchanged, preserving the existing concurrency contract. If a
-    /// re-prepare itself fails because the object no longer exists, that real
-    /// error propagates.
+    /// Which `SchemaChanged` errors re-prepare is decided by
+    /// [`Self::schema_change_is_reprepareable`]; any other error is returned
+    /// unchanged. If a re-prepare itself fails because the object no longer
+    /// exists, that real error propagates.
     async fn with_same_connection_schema_reprepare<T, Op>(&self, op: Op) -> Result<T>
     where
         Op: std::ops::AsyncFnMut(&Self) -> Result<T>,
@@ -8500,14 +8518,14 @@ impl<'conn> PreparedStatement<'conn> {
     {
         match op(self).await {
             Err(FrankenError::SchemaChanged)
-                if self.schema_change_is_same_connection() && can_retry() => {}
+                if self.schema_change_is_reprepareable() && can_retry() => {}
             other => return other,
         }
         let mut reprepared = self.reprepared_for_current_schema().await?;
         for _ in 0..PREPARED_SCHEMA_REPREPARE_LIMIT {
             match op(&reprepared).await {
                 Err(FrankenError::SchemaChanged)
-                    if reprepared.schema_change_is_same_connection() && can_retry() => {}
+                    if reprepared.schema_change_is_reprepareable() && can_retry() => {}
                 other => return other,
             }
             reprepared = reprepared.reprepared_for_current_schema().await?;

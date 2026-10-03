@@ -18,7 +18,6 @@ use fsqlite_core::connection::{
     Connection, hot_path_profile_enabled, hot_path_profile_snapshot, reset_hot_path_profile,
     set_hot_path_profile_enabled,
 };
-use fsqlite_error::FrankenError;
 use fsqlite_types::SqliteValue;
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
@@ -246,11 +245,16 @@ fn test_prepared_full_reload_reuses_publication_after_cross_connection_ddl() {
             .await
             .unwrap();
 
-        let err = stale_stmt
-            .execute_with_params(&[SqliteValue::Integer(1), SqliteValue::Text("stale".into())])
+        // bd-9zuif: the stale INSERT re-prepares against conn2's schema, as
+        // sqlite3_prepare_v2 does, instead of failing with SchemaChanged.
+        let affected = stale_stmt
+            .execute_with_params(&[
+                SqliteValue::Integer(100),
+                SqliteValue::Text("stale".into()),
+            ])
             .await
-            .expect_err("cross-connection DDL must invalidate the stale prepared INSERT");
-        assert!(matches!(err, FrankenError::SchemaChanged));
+            .expect("cross-connection DDL re-prepares the stale prepared INSERT");
+        assert_eq!(affected, 1);
 
         // Force future stale prepared executions onto the full-reload path while
         // keeping schema identity stable for the measured window.
@@ -311,11 +315,13 @@ fn test_prepared_full_reload_reuses_publication_after_cross_connection_ddl() {
             .query("SELECT id, val FROM prep_full_reload_pub ORDER BY id")
             .await
             .unwrap();
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
         assert_eq!(rows[0].values()[1], SqliteValue::Text("from_conn2".into()));
         assert_eq!(rows[1].values()[0], SqliteValue::Integer(2));
         assert_eq!(rows[1].values()[1], SqliteValue::Text("from_conn1".into()));
+        assert_eq!(rows[2].values()[0], SqliteValue::Integer(100));
+        assert_eq!(rows[2].values()[1], SqliteValue::Text("stale".into()));
     });
 }
 
