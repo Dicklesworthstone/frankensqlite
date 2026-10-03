@@ -110620,17 +110620,13 @@ fn flatten_simple_from_subquery_select(select: &SelectStatement) -> Option<Selec
         return None;
     };
 
+    // MIN/MAX ties retain the first value's type and collation-equivalent text;
+    // even a count-only projection must still validate and evaluate inner ORDER BY.
     if inner_query.with.is_some()
         || !inner_query.body.compounds.is_empty()
+        || !inner_query.order_by.is_empty()
         || inner_query.limit.is_some()
     {
-        return None;
-    }
-    // bd-5ap77: an inner ORDER BY cannot change the result of an outer query
-    // whose every output is a count/min/max aggregate (one row, order-free), so
-    // it is dropped and the subquery flattens; any other outer shape keeps it.
-    let drops_inner_order_by = !inner_query.order_by.is_empty();
-    if drops_inner_order_by && !outer_columns_are_order_insensitive_aggregates(outer_columns) {
         return None;
     }
 
@@ -110660,7 +110656,7 @@ fn flatten_simple_from_subquery_select(select: &SelectStatement) -> Option<Selec
 
     // bd-5ap77: shapes beyond the original bare-column flattener (outer
     // expressions/aggregates, table-function sources, inner expression
-    // projections, a dropped ORDER BY) resolve names strictly: a reference the
+    // projections) resolve names strictly: a reference the
     // subquery does not expose blocks flattening instead of silently binding to
     // an unexposed column of the inner source.
     let outer_has_expressions = outer_columns
@@ -110669,10 +110665,7 @@ fn flatten_simple_from_subquery_select(select: &SelectStatement) -> Option<Selec
     let inner_has_expressions = inner_columns
         .iter()
         .any(|column| matches!(column, ResultColumn::Expr { expr, .. } if !matches!(expr, Expr::Column(..))));
-    let strict = outer_has_expressions
-        || inner_has_expressions
-        || inner_is_table_function
-        || drops_inner_order_by;
+    let strict = outer_has_expressions || inner_has_expressions || inner_is_table_function;
     if strict
         && (outer_where.as_deref().is_some_and(expr_has_any_subquery)
             || select
@@ -110684,6 +110677,12 @@ fn flatten_simple_from_subquery_select(select: &SelectStatement) -> Option<Selec
     }
 
     let mut projection_map = build_flatten_projection_map(inner_columns)?;
+    // A star may expose a column with the same name as an explicit projection.
+    // Without expanding the source schema, the map cannot prove which name is
+    // the first exposed column. Keep these new shapes on the materializing path.
+    if strict && projection_map.passthrough_columns && !projection_map.columns.is_empty() {
+        return None;
+    }
     // A table function's hidden argument columns are not exposed by `*`.
     if inner_is_table_function && projection_map.passthrough_columns {
         return None;
@@ -110739,45 +110738,6 @@ struct FlattenProjectionMap {
     /// a column reference that is neither exposed by the subquery nor an outer
     /// alias blocks flattening.
     strict_outer_aliases: Option<HashSet<String>>,
-}
-
-/// bd-5ap77: true when every outer result column is a single-argument (or
-/// `count(*)`) `count`/`min`/`max` aggregate, so the outer query yields one row
-/// whose value cannot depend on the order the subquery produces its rows in.
-/// Multi-argument `min`/`max` are scalar functions and do not qualify.
-fn outer_columns_are_order_insensitive_aggregates(columns: &[ResultColumn]) -> bool {
-    !columns.is_empty()
-        && columns.iter().all(|column| {
-            let ResultColumn::Expr {
-                expr:
-                    Expr::FunctionCall {
-                        name,
-                        args,
-                        order_by,
-                        over: None,
-                        ..
-                    },
-                ..
-            } = column
-            else {
-                return false;
-            };
-            if !order_by.is_empty() {
-                return false;
-            }
-            let args_ok = match args {
-                FunctionArgs::Star => name.eq_ignore_ascii_case("count"),
-                FunctionArgs::List(args) => {
-                    args.len() == 1
-                        && !expr_has_aggregate(&args[0])
-                        && !expr_has_any_subquery(&args[0])
-                }
-            };
-            args_ok
-                && (name.eq_ignore_ascii_case("count")
-                    || name.eq_ignore_ascii_case("min")
-                    || name.eq_ignore_ascii_case("max"))
-        })
 }
 
 /// bd-5ap77: an inner projection expression that may be substituted for every
