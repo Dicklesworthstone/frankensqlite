@@ -40590,14 +40590,31 @@ impl Connection {
                 // values rather than evaluating its SET expressions again
                 // against that mutated storage state.
                 let froze_before_update_assignments = has_before_update && trigger_rows.len() == 1;
-                if froze_before_update_assignments {
-                    self.freeze_update_assignments_to_trigger_new_values(
+                let frozen_params;
+                let params = if froze_before_update_assignments {
+                    let parameter_base = if update_contains_rewritable_subquery(&effective_update)
+                    {
+                        None
+                    } else {
+                        Some(
+                            Self::dml_replay_statement_parameter_slots(DmlRowReplay::Update(
+                                &effective_update,
+                            ))?
+                            .max(params.map_or(0, <[SqliteValue]>::len)),
+                        )
+                    };
+                    frozen_params = self.freeze_update_assignments_to_trigger_new_values(
                         table_name,
                         targets_shadowed_main,
                         &mut effective_update.assignments,
                         &trigger_rows[0].2,
+                        params,
+                        parameter_base,
                     )?;
-                }
+                    frozen_params.as_deref().or(params)
+                } else {
+                    params
+                };
 
                 // FK enforcement on UPDATE:
                 // 1. Parent-side: check old values aren't orphaning children
@@ -57128,13 +57145,26 @@ impl Connection {
         predicate
     }
 
+    /// Replace each SET value of a single-row UPDATE with the NEW value its
+    /// BEFORE triggers were given, so the UPDATE applies that precomputed row.
+    ///
+    /// bd-l9j27: the values bind as parameters numbered after
+    /// `parameter_base`, every slot the statement already uses, so a replay
+    /// that freezes one row at a time runs one SQL text and reuses one
+    /// compiled program. Returns the parameters to execute the frozen
+    /// statement with, or `None` when it keeps literals (then `params` still
+    /// apply): when `parameter_base` is `None` (the caller's statement has a
+    /// subquery, see `bind_trigger_body_statement`) or the parameters would
+    /// exceed the variable limit.
     fn freeze_update_assignments_to_trigger_new_values(
         &self,
         table_name: &str,
         targets_shadowed_main: bool,
         assignments: &mut [fsqlite_ast::Assignment],
         new_values: &[SqliteValue],
-    ) -> Result<()> {
+        params: Option<&[SqliteValue]>,
+        parameter_base: Option<usize>,
+    ) -> Result<Option<Vec<SqliteValue>>> {
         let visible_schema = self.schema.borrow();
         let shadowed_schema = self.shadowed_main_tables.borrow();
         let table = if targets_shadowed_main {
@@ -57155,33 +57185,55 @@ impl Connection {
             )));
         }
 
+        let frozen_count: usize = assignments
+            .iter()
+            .map(|assignment| match &assignment.target {
+                fsqlite_ast::AssignmentTarget::Column(_) => 1,
+                fsqlite_ast::AssignmentTarget::ColumnList(columns) => columns.len(),
+            })
+            .sum();
+        let caller_params = params.unwrap_or(&[]);
+        let mut frozen_params = parameter_base
+            .filter(|base| {
+                base + frozen_count <= usize::try_from(MAX_VARIABLE_NUMBER).unwrap_or(usize::MAX)
+            })
+            .map(|base| {
+                let mut frozen = Vec::with_capacity(base + frozen_count);
+                frozen.extend_from_slice(caller_params);
+                frozen.resize(base, SqliteValue::Null);
+                frozen
+            });
+        let mut frozen_value = |column: &str| -> Result<Expr> {
+            let index = table.column_index(column).ok_or_else(|| {
+                FrankenError::Internal(format!(
+                    "UPDATE trigger snapshot: unknown column `{column}`"
+                ))
+            })?;
+            let value = new_values[index].clone();
+            Ok(match frozen_params.as_mut() {
+                Some(frozen) => {
+                    frozen.push(value);
+                    Expr::Placeholder(
+                        PlaceholderType::Numbered(u32::try_from(frozen.len()).unwrap_or(u32::MAX)),
+                        Span::ZERO,
+                    )
+                }
+                None => value_to_literal_expr(value),
+            })
+        };
         for assignment in assignments {
             assignment.value = match &assignment.target {
-                fsqlite_ast::AssignmentTarget::Column(column) => {
-                    let index = table.column_index(column).ok_or_else(|| {
-                        FrankenError::Internal(format!(
-                            "UPDATE trigger snapshot: unknown column `{column}`"
-                        ))
-                    })?;
-                    value_to_literal_expr(new_values[index].clone())
-                }
-                fsqlite_ast::AssignmentTarget::ColumnList(columns) => {
-                    let values = columns
+                fsqlite_ast::AssignmentTarget::Column(column) => frozen_value(column)?,
+                fsqlite_ast::AssignmentTarget::ColumnList(columns) => Expr::RowValue(
+                    columns
                         .iter()
-                        .map(|column| {
-                            let index = table.column_index(column).ok_or_else(|| {
-                                FrankenError::Internal(format!(
-                                    "UPDATE trigger snapshot: unknown column `{column}`"
-                                ))
-                            })?;
-                            Ok(value_to_literal_expr(new_values[index].clone()))
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-                    Expr::RowValue(values, Span::ZERO)
-                }
+                        .map(|column| frozen_value(column))
+                        .collect::<Result<Vec<_>>>()?,
+                    Span::ZERO,
+                ),
             };
         }
-        Ok(())
+        Ok(frozen_params)
     }
 
     async fn collect_delete_trigger_rows(
@@ -70596,9 +70648,12 @@ impl Connection {
         }
     }
 
+    /// Run one trigger body statement bound by [`bind_trigger_body_statement`];
+    /// `params` are the values of the OLD/NEW parameters it binds.
     async fn execute_bound_trigger_statement(
         &self,
         statement: Statement,
+        params: &[SqliteValue],
     ) -> Result<TriggerStatementOutcome> {
         if let Some((directive, predicate)) = trigger_statement_raise_directive(&statement) {
             // GH#305: evaluate the RAISE predicate with the connection-aware
@@ -70684,7 +70739,8 @@ impl Connection {
             &statement,
             Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
         );
-        self.execute_statement(&statement, None).await?;
+        self.execute_statement(&statement, (!params.is_empty()).then_some(params))
+            .await?;
         if counts_changes {
             self.trigger_step_changes.set(
                 self.trigger_step_changes
@@ -70769,9 +70825,11 @@ impl Connection {
             // frame (see TriggerChangeTrackingRestoreGuard).
             let _change_tracking_guard = TriggerChangeTrackingRestoreGuard::new(self);
             for stmt in &trigger.body {
-                let mut bound_stmt = stmt.clone();
-                bind_trigger_columns_in_statement(&mut bound_stmt, &frame);
-                match self.execute_bound_trigger_statement(bound_stmt).await? {
+                let (bound_stmt, bound_params) = bind_trigger_body_statement(stmt, &frame);
+                match self
+                    .execute_bound_trigger_statement(bound_stmt, &bound_params)
+                    .await?
+                {
                     TriggerStatementOutcome::Continue => {}
                     TriggerStatementOutcome::SkipDml => return Ok(true),
                 }
@@ -70844,9 +70902,11 @@ impl Connection {
             // frame (see TriggerChangeTrackingRestoreGuard).
             let _change_tracking_guard = TriggerChangeTrackingRestoreGuard::new(self);
             for stmt in &trigger.body {
-                let mut bound_stmt = stmt.clone();
-                bind_trigger_columns_in_statement(&mut bound_stmt, &frame);
-                match self.execute_bound_trigger_statement(bound_stmt).await? {
+                let (bound_stmt, bound_params) = bind_trigger_body_statement(stmt, &frame);
+                match self
+                    .execute_bound_trigger_statement(bound_stmt, &bound_params)
+                    .await?
+                {
                     TriggerStatementOutcome::Continue => {}
                     TriggerStatementOutcome::SkipDml => return Ok(()),
                 }
@@ -71346,9 +71406,11 @@ impl Connection {
             // TriggerChangeTrackingRestoreGuard).
             let _change_tracking_guard = TriggerChangeTrackingRestoreGuard::new(self);
             for stmt in &trigger.body {
-                let mut bound_stmt = stmt.clone();
-                bind_trigger_columns_in_statement(&mut bound_stmt, &frame);
-                match self.execute_bound_trigger_statement(bound_stmt).await? {
+                let (bound_stmt, bound_params) = bind_trigger_body_statement(stmt, &frame);
+                match self
+                    .execute_bound_trigger_statement(bound_stmt, &bound_params)
+                    .await?
+                {
                     TriggerStatementOutcome::Continue => {}
                     TriggerStatementOutcome::SkipDml => return Ok(true),
                 }
@@ -148727,7 +148789,8 @@ fn expand_trigger_pseudo_table_star(
             frame
                 .lookup_value(Some(prefix), column_name)
                 .map(|value| ResultColumn::Expr {
-                    expr: value_to_literal_expr(value),
+                    expr: trigger_bound_param(Some(prefix), column_name, &value)
+                        .unwrap_or_else(|| value_to_literal_expr(value)),
                     alias: Some(column_name.clone()),
                 })
         })
@@ -148978,18 +149041,22 @@ fn bind_trigger_columns_in_frame_bound(
     }
 }
 
-/// bd-ry6x7: OLD/NEW values bound inside the EXISTS subqueries of a trigger
-/// WHEN clause, collected while [`bind_trigger_when_expr`] runs.
+/// OLD/NEW values bound as parameters while a trigger binder runs: inside the
+/// EXISTS subqueries of a WHEN clause ([`bind_trigger_when_expr`], bd-ry6x7),
+/// or everywhere in a body statement ([`bind_trigger_body_statement`],
+/// bd-l9j27).
 ///
-/// Inside those subqueries a bound reference becomes a numbered parameter
-/// instead of a literal, so the subquery's SQL text is the same for every
-/// firing row and its compiled program is reused from the statement cache.
-/// With literals every row produced a new statement that was validated,
-/// planned and compiled from scratch, which made bulk writes guarded by
-/// `WHEN EXISTS (...)` validators cost a full compile per row and guard. A
-/// parameter carries no affinity or collation, exactly like the literal it
-/// replaces, so the comparison contract is unchanged.
-struct TriggerWhenSubqueryParams {
+/// A bound reference becomes a numbered parameter instead of a literal, so the
+/// statement's SQL text is the same for every firing row and its compiled
+/// program is reused from the statement cache. With literals every row
+/// produced a new statement that was validated, planned and compiled from
+/// scratch, which made every trigger cost a full compile per row and
+/// statement. A parameter carries no affinity or collation, exactly like the
+/// literal it replaces, so the comparison contract is unchanged.
+struct TriggerBoundParams {
+    /// Bind every reference as a parameter, not only those inside a
+    /// parameterized EXISTS subquery.
+    everywhere: bool,
     /// Nesting depth of parameterized EXISTS subqueries at the binding point.
     subquery_depth: usize,
     /// Lowercased `(qualifier, column)` of each parameter, for reuse when the
@@ -148999,8 +149066,37 @@ struct TriggerWhenSubqueryParams {
 }
 
 thread_local! {
-    static TRIGGER_WHEN_SUBQUERY_PARAMS: RefCell<Option<TriggerWhenSubqueryParams>> =
+    static TRIGGER_BOUND_PARAMS: RefCell<Option<TriggerBoundParams>> =
         const { RefCell::new(None) };
+}
+
+/// Run `bind` with the parameter collector active and return the values of
+/// the parameters it created, in order. `everywhere` selects whether every
+/// OLD/NEW reference becomes a parameter or only those inside an EXISTS
+/// subquery entered through [`TriggerWhenSubqueryScope`].
+fn collect_trigger_bound_params(everywhere: bool, bind: impl FnOnce()) -> Vec<SqliteValue> {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TRIGGER_BOUND_PARAMS.with(|cell| cell.borrow_mut().take());
+        }
+    }
+    TRIGGER_BOUND_PARAMS.with(|cell| {
+        *cell.borrow_mut() = Some(TriggerBoundParams {
+            everywhere,
+            subquery_depth: 0,
+            keys: Vec::new(),
+            values: Vec::new(),
+        });
+    });
+    let reset = Reset;
+    bind();
+    let values = TRIGGER_BOUND_PARAMS
+        .with(|cell| cell.borrow_mut().take())
+        .map(|params| params.values)
+        .unwrap_or_default();
+    drop(reset);
+    values
 }
 
 /// Marks the binder as inside a parameterized EXISTS subquery for its lifetime.
@@ -149008,7 +149104,7 @@ struct TriggerWhenSubqueryScope;
 
 impl TriggerWhenSubqueryScope {
     fn enter() -> Self {
-        TRIGGER_WHEN_SUBQUERY_PARAMS.with(|cell| {
+        TRIGGER_BOUND_PARAMS.with(|cell| {
             if let Some(params) = cell.borrow_mut().as_mut() {
                 params.subquery_depth += 1;
             }
@@ -149019,7 +149115,7 @@ impl TriggerWhenSubqueryScope {
 
 impl Drop for TriggerWhenSubqueryScope {
     fn drop(&mut self) {
-        TRIGGER_WHEN_SUBQUERY_PARAMS.with(|cell| {
+        TRIGGER_BOUND_PARAMS.with(|cell| {
             if let Some(params) = cell.borrow_mut().as_mut() {
                 params.subquery_depth = params.subquery_depth.saturating_sub(1);
             }
@@ -149027,16 +149123,18 @@ impl Drop for TriggerWhenSubqueryScope {
     }
 }
 
-/// The parameter standing for a bound OLD/NEW reference, when the WHEN
-/// binder is active and inside a subquery; `None` keeps the literal.
-fn trigger_when_subquery_param(
+/// The parameter standing for a bound OLD/NEW reference, when a parameter
+/// collector is active and binds this position; `None` keeps the literal.
+fn trigger_bound_param(
     table_prefix: Option<&str>,
     column_name: &str,
     value: &SqliteValue,
 ) -> Option<Expr> {
-    TRIGGER_WHEN_SUBQUERY_PARAMS.with(|cell| {
+    TRIGGER_BOUND_PARAMS.with(|cell| {
         let mut slot = cell.borrow_mut();
-        let params = slot.as_mut().filter(|params| params.subquery_depth > 0)?;
+        let params = slot
+            .as_mut()
+            .filter(|params| params.everywhere || params.subquery_depth > 0)?;
         let key = (
             table_prefix.map(str::to_ascii_lowercase),
             column_name.to_ascii_lowercase(),
@@ -149064,27 +149162,34 @@ fn trigger_when_subquery_param(
 /// positions (a comparison operand, for one) are materialized through helpers
 /// that execute without parameters, so they keep literals.
 fn bind_trigger_when_expr(expr: &mut Expr, frame: &TriggerFrame) -> Vec<SqliteValue> {
-    struct Reset;
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            TRIGGER_WHEN_SUBQUERY_PARAMS.with(|cell| cell.borrow_mut().take());
-        }
+    collect_trigger_bound_params(false, || bind_trigger_when_skeleton(expr, frame))
+}
+
+/// Bind one trigger body statement against `frame` (bd-l9j27): every OLD/NEW
+/// reference becomes a `?N` parameter, whose values are returned in order, so
+/// the statement compiles once and is reused for every firing row. Trigger
+/// bodies cannot carry parameters of their own, so the numbering starts at 1.
+///
+/// Two kinds of statement keep literals:
+/// - a RAISE statement, which is not compiled as a statement: its predicate
+///   is evaluated directly by `execute_bound_trigger_statement`;
+/// - a statement with a subquery. Several subquery paths run the subquery
+///   without the statement's parameters, or bake its result into the
+///   compiled program (INSERT VALUES subqueries are resolved at compile
+///   time), so one SQL text shared by every row would read NULL parameters
+///   or a stale result. With literals each row compiles its own program.
+fn bind_trigger_body_statement(
+    statement: &Statement,
+    frame: &TriggerFrame,
+) -> (Statement, Vec<SqliteValue>) {
+    let mut bound = statement.clone();
+    if statement_is_raise_select(statement) || statement_contains_rewritable_subquery(statement) {
+        bind_trigger_columns_in_statement(&mut bound, frame);
+        return (bound, Vec::new());
     }
-    TRIGGER_WHEN_SUBQUERY_PARAMS.with(|cell| {
-        *cell.borrow_mut() = Some(TriggerWhenSubqueryParams {
-            subquery_depth: 0,
-            keys: Vec::new(),
-            values: Vec::new(),
-        });
-    });
-    let reset = Reset;
-    bind_trigger_when_skeleton(expr, frame);
-    let values = TRIGGER_WHEN_SUBQUERY_PARAMS
-        .with(|cell| cell.borrow_mut().take())
-        .map(|params| params.values)
-        .unwrap_or_default();
-    drop(reset);
-    values
+    let params =
+        collect_trigger_bound_params(true, || bind_trigger_columns_in_statement(&mut bound, frame));
+    (bound, params)
 }
 
 /// Walk the AND / OR / NOT skeleton of a WHEN clause: EXISTS leaves bind with
@@ -149167,7 +149272,7 @@ fn bind_trigger_columns_in_expr_inner(
             if frame.references_pseudo_column(table_prefix, &column_name)
                 && let Some(value) = frame.lookup_value(table_prefix, &column_name)
             {
-                *expr = trigger_when_subquery_param(table_prefix, &column_name, &value)
+                *expr = trigger_bound_param(table_prefix, &column_name, &value)
                     .unwrap_or_else(|| value_to_literal_expr(value));
             }
         }
