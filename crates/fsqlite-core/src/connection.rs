@@ -12062,6 +12062,11 @@ struct TimeTravelImage {
     /// from `pager_tables` rather than copied from the connection, whose entry
     /// for a shadowed `main` table's name describes the TEMP table instead.
     rowid_alias_columns: HashMap<String, usize>,
+    /// `(root page, IPK column)` of each TEMP rowid table in `base`. The
+    /// mirror keeps a TEMP row's INTEGER PRIMARY KEY in its rowid and leaves
+    /// the column slot empty, while historical reads take every column from
+    /// the slot (decoded pager tables get it filled by the row reader).
+    mirror_ipk_columns: Vec<(i32, usize)>,
     text_encoding: TextEncoding,
 }
 
@@ -24933,6 +24938,21 @@ impl Connection {
                 Some((table.name.to_ascii_lowercase(), ipk))
             })
             .collect();
+        let mirror_ipk_columns: Vec<(i32, usize)> = {
+            let temp_table_names = self.temp_table_names.borrow();
+            self.schema
+                .borrow()
+                .iter()
+                .filter(|table| {
+                    !table.without_rowid
+                        && temp_table_names.contains(&table.name.to_ascii_lowercase())
+                })
+                .filter_map(|table| {
+                    let ipk = table.columns.iter().position(|column| column.is_ipk)?;
+                    Some((table.root_page, ipk))
+                })
+                .collect()
+        };
         let mut base = self.db.borrow().clone_for_snapshot();
         for root_page in TimeTravelImage::pager_backed_roots(&pager_tables) {
             // Emptying a shared table swaps in fresh storage, so the snapshot
@@ -24947,6 +24967,7 @@ impl Connection {
             base,
             pager_tables,
             rowid_alias_columns,
+            mirror_ipk_columns,
             text_encoding: self.db_text_encoding.get(),
         })
     }
@@ -24988,6 +25009,17 @@ impl Connection {
         image: &TimeTravelImage,
     ) -> Result<MemDatabase> {
         let mut db = image.base.clone_for_snapshot();
+        for &(root_page, ipk) in &image.mirror_ipk_columns {
+            if let Some(table) = db.get_table_mut(root_page) {
+                let rowids: Vec<i64> = table.iter_rows().map(|(rowid, _)| rowid).collect();
+                table.materialize_column_values(
+                    ipk,
+                    rowids
+                        .into_iter()
+                        .map(|rowid| (rowid, SqliteValue::Integer(rowid))),
+                );
+            }
+        }
         let Some(page_one) = image.pages.first() else {
             return Ok(db);
         };
