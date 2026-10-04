@@ -205,6 +205,14 @@ pub struct WalFile<F: VfsFile> {
     /// verify the two-phase commit invariant: fsync must complete before
     /// any CommitIndex publish for the same frames.
     last_fsynced_frame_count: usize,
+    /// First frame index whose bytes a failed sync may have left off stable
+    /// storage (bd-alyrn, "fsyncgate"). Linux reports a writeback error to
+    /// one fsync and may then keep the failed pages clean in the page cache:
+    /// reads still return them and a retried fsync succeeds without writing
+    /// them. While this is set, [`Self::sync`] and [`Self::durable_sync`]
+    /// refuse; [`Self::rewrite_frames_after_failed_sync`] re-dirties the
+    /// frames so the next successful sync really covers them.
+    unsynced_after_failed_sync: Option<usize>,
 }
 
 impl<F: VfsFile> WalFile<F> {
@@ -698,6 +706,7 @@ impl<F: VfsFile> WalFile<F> {
             last_commit: None,
             frame_scratch: Vec::new(),
             last_fsynced_frame_count: 0,
+            unsynced_after_failed_sync: None,
         })
     }
 
@@ -827,6 +836,7 @@ impl<F: VfsFile> WalFile<F> {
             last_commit,
             frame_scratch: Vec::new(),
             last_fsynced_frame_count: last_commit_frames,
+            unsynced_after_failed_sync: None,
         })
     }
 
@@ -1729,18 +1739,29 @@ impl<F: VfsFile> WalFile<F> {
 
     /// Sync the WAL file to stable storage and record every appended frame
     /// covered by the successful sync for the two-phase publish invariant.
+    ///
+    /// After a failed sync this refuses until
+    /// [`Self::rewrite_frames_after_failed_sync`] has re-dirtied the frames
+    /// that sync covered (bd-alyrn).
     pub fn sync(&mut self, cx: &Cx, flags: SyncFlags) -> Result<()> {
+        self.refuse_sync_over_failed_sync()?;
         #[cfg(any(test, feature = "fault-injection"))]
-        crate::fault_hooks::maybe_inject_sync_failure(self.frame_count, flags)?;
+        crate::fault_hooks::maybe_inject_sync_failure(self.frame_count, flags)
+            .inspect_err(|_| self.record_failed_sync())?;
 
         let sync_started = (!metrics::metrics_disabled()).then(Instant::now);
-        self.file.sync(cx, flags)?;
+        self.file
+            .sync(cx, flags)
+            .inspect_err(|_| self.record_failed_sync())?;
         if let Some(started) = sync_started {
             metrics::global()
                 .fsync_duration_seconds
                 .observe(started.elapsed().as_secs_f64());
         }
         self.last_fsynced_frame_count = self.frame_count;
+        // The refusal above passed, so no frame a failed sync covered is
+        // still in this handle's view (rewritten or truncated away).
+        self.unsynced_after_failed_sync = None;
         Ok(())
     }
 
@@ -1785,23 +1806,28 @@ impl<F: VfsFile> WalFile<F> {
     /// This is the intent-preserving form of [`Self::sync`]. Both successful
     /// sync paths advance the invariant tracker before a caller can publish.
     pub fn durable_sync(&mut self, cx: &Cx, kind: SyncKind) -> Result<()> {
+        self.refuse_sync_over_failed_sync()?;
         #[cfg(any(test, feature = "fault-injection"))]
         {
             let flags = match kind {
                 SyncKind::DataOnly => SyncFlags::DATAONLY,
                 SyncKind::DataAndMetadata | SyncKind::FullDurable => SyncFlags::FULL,
             };
-            crate::fault_hooks::maybe_inject_sync_failure(self.frame_count, flags)?;
+            crate::fault_hooks::maybe_inject_sync_failure(self.frame_count, flags)
+                .inspect_err(|_| self.record_failed_sync())?;
         }
 
         let sync_started = (!metrics::metrics_disabled()).then(Instant::now);
-        self.file.durable_sync(cx, kind)?;
+        self.file
+            .durable_sync(cx, kind)
+            .inspect_err(|_| self.record_failed_sync())?;
         if let Some(started) = sync_started {
             metrics::global()
                 .fsync_duration_seconds
                 .observe(started.elapsed().as_secs_f64());
         }
         self.last_fsynced_frame_count = self.frame_count;
+        self.unsynced_after_failed_sync = None;
 
         debug!(
             target: "fsqlite_wal::durability",
@@ -1854,6 +1880,67 @@ impl<F: VfsFile> WalFile<F> {
     #[must_use]
     pub fn last_fsynced_frame_count(&self) -> usize {
         self.last_fsynced_frame_count
+    }
+
+    /// Remember that every frame after the last successful sync may have
+    /// missed stable storage, however many syncs have failed since.
+    fn record_failed_sync(&mut self) {
+        let first = self.last_fsynced_frame_count;
+        self.unsynced_after_failed_sync = Some(
+            self.unsynced_after_failed_sync
+                .map_or(first, |prior| prior.min(first)),
+        );
+    }
+
+    fn refuse_sync_over_failed_sync(&self) -> Result<()> {
+        match self.unsynced_after_failed_sync {
+            Some(first) if first < self.frame_count => {
+                Err(FrankenError::Io(std::io::Error::other(format!(
+                    "WAL frames {first}..{} were covered by a failed sync; they must be \
+                     rewritten before a sync can make them durable (bd-alyrn)",
+                    self.frame_count
+                ))))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Re-dirty every frame an earlier failed sync covered, so the next
+    /// successful sync proves those exact bytes reached stable storage.
+    ///
+    /// A retried fsync after a writeback error can report success over pages
+    /// the kernel kept clean but never wrote (fsyncgate). Writing the bytes
+    /// this handle reads back marks them dirty again; a device that still
+    /// fails then reports a fresh error instead of a false success. Callers
+    /// that must vouch for the content (in-doubt commit reconciliation)
+    /// verify it before rewriting it. A no-op when no sync has failed.
+    pub async fn rewrite_frames_after_failed_sync(&mut self, cx: &Cx) -> Result<()> {
+        const REWRITE_CHUNK_FRAMES: usize = 64;
+        let Some(first) = self.unsynced_after_failed_sync else {
+            return Ok(());
+        };
+        let frame_size = self.frame_size();
+        let mut bytes = Vec::new();
+        let mut index = first;
+        while index < self.frame_count {
+            let frames = (self.frame_count - index).min(REWRITE_CHUNK_FRAMES);
+            let len = frames * frame_size;
+            bytes.resize(len, 0);
+            let offset = self.frame_offset(index);
+            let bytes_read = self.file.read(cx, &mut bytes, offset).await?;
+            if bytes_read != len {
+                return Err(FrankenError::WalCorrupt {
+                    detail: format!(
+                        "short read rewriting frames {index}..{} after a failed sync: got {bytes_read} of {len} bytes",
+                        index + frames
+                    ),
+                });
+            }
+            self.file.write(cx, &bytes, offset).await?;
+            index += frames;
+        }
+        self.unsynced_after_failed_sync = None;
+        Ok(())
     }
 
     /// Reset the WAL for a new checkpoint generation.
@@ -1969,6 +2056,9 @@ impl<F: VfsFile> WalFile<F> {
         self.frame_count = 0;
         self.last_commit = None;
         self.last_fsynced_frame_count = 0;
+        // The synced header starts a new generation; no frame a failed sync
+        // covered can be read through it.
+        self.unsynced_after_failed_sync = None;
         self.frame_scratch.clear();
         crate::metrics::GLOBAL_WAL_METRICS.set_wal_frames_current(0);
 
@@ -3569,6 +3659,29 @@ mod tests {
             "record should capture sync context: {}",
             records[0].detail
         );
+
+        // bd-alyrn: the failed sync may have dropped frame 2 from stable
+        // storage while reads still return it, so a retried fsync could
+        // succeed without writing it. Retries refuse until it is rewritten.
+        let retry = wal
+            .sync(&cx, SyncFlags::NORMAL)
+            .expect_err("a retry must not vouch for frames a failed sync covered");
+        assert!(retry.to_string().contains("bd-alyrn"), "{retry}");
+        wal.durable_sync(&cx, SyncKind::FullDurable)
+            .expect_err("the durable-intent sync refuses the same way");
+        assert_eq!(wal.last_fsynced_frame_count(), 1);
+        wal.rewrite_frames_after_failed_sync(&cx)
+            .expect("rewrite the frames the failed sync covered");
+        assert_eq!(
+            wal.read_frame(&cx, 1).expect("rewritten frame").1,
+            sample_page(0x45),
+            "the rewrite preserves the frame bytes"
+        );
+        wal.sync(&cx, SyncFlags::NORMAL)
+            .expect("a sync after the rewrite covers the frames");
+        assert_eq!(wal.last_fsynced_frame_count(), 2);
+        wal.sync(&cx, SyncFlags::NORMAL)
+            .expect("later syncs are ordinary again");
 
         crate::fault_hooks::clear();
     }

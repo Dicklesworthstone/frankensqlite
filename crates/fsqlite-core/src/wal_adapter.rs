@@ -4962,6 +4962,9 @@ where
         self.reconcile_certificate_sidecar_record(cx, expected_record, true, sync).await?;
         self.inner.wal.repair_uncommitted_tail(cx)?;
         if sync {
+            // bd-alyrn: committed frames a failed sync covered stay suspect
+            // until rewritten; the truncated interval itself needs nothing.
+            self.inner.wal.rewrite_frames_after_failed_sync(cx).await?;
             self.sync_with_fec(cx, false)?;
             self.vfs.sync_parent_directory(cx, &self.wal_path)?;
         }
@@ -6108,6 +6111,11 @@ where
                 }
                 self.inner.authorize_append_reconciliation();
                 if sync {
+                    // bd-alyrn: the in-doubt interval may sit behind a failed
+                    // fsync. Its bytes were just verified against the
+                    // certificate; rewrite them so this sync must write them
+                    // instead of trusting pages a failed writeback left clean.
+                    self.inner.wal.rewrite_frames_after_failed_sync(cx).await?;
                     self.sync_with_fec(cx, false)?;
                     self.vfs.sync_parent_directory(cx, &self.wal_path)?;
                 }
@@ -6608,6 +6616,10 @@ mod tests {
         wal_header_reads_before_failure: Option<usize>,
         wal_header_reads_completed: usize,
         sync_observations: Vec<CertificateSyncObservation>,
+        /// Modelled stable storage of `test.db-wal` once tracking starts
+        /// (bd-alyrn): writes stay volatile until a successful WAL sync.
+        wal_stable: Option<Vec<u8>>,
+        wal_unsynced_writes: Vec<(u64, Vec<u8>)>,
     }
 
     #[derive(Clone, Debug)]
@@ -6700,6 +6712,28 @@ mod tests {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .sync_observations,
             )
+        }
+
+        /// Start modelling `test.db-wal` stable storage from its current
+        /// bytes, which the caller has already synced.
+        fn track_wal_stable_storage(&self, cx: &Cx) {
+            let current = read_fault_injected_wal(self, cx);
+            let mut faults = self
+                .faults
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            faults.wal_stable = Some(current);
+            faults.wal_unsynced_writes.clear();
+        }
+
+        /// What a power loss would leave of `test.db-wal`.
+        fn wal_stable_storage(&self) -> Vec<u8> {
+            self.faults
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .wal_stable
+                .clone()
+                .expect("WAL stable storage is tracked")
         }
 
         fn fail_wal_frame_header_read_after(&self, successful_reads: usize) {
@@ -6852,7 +6886,19 @@ mod tests {
                 Some(CheckpointHandoffWriteFault::Pending) => {
                     std::future::pending::<Result<()>>().await
                 }
-                None => self.inner.write(cx, buf, offset).await,
+                None => {
+                    self.inner.write(cx, buf, offset).await?;
+                    if self.path.as_deref() == Some(Path::new("test.db-wal")) {
+                        let mut faults = self
+                            .faults
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if faults.wal_stable.is_some() {
+                            faults.wal_unsynced_writes.push((offset, buf.to_vec()));
+                        }
+                    }
+                    Ok(())
+                }
             }
         }
 
@@ -6956,6 +7002,31 @@ mod tests {
             } else {
                 self.inner.sync(cx, flags)
             };
+            if self.path.as_deref() == Some(Path::new("test.db-wal")) {
+                let mut faults = self
+                    .faults
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let writes = std::mem::take(&mut faults.wal_unsynced_writes);
+                if let Some(stable) = faults.wal_stable.as_mut() {
+                    // A failed sync drops the unsynced writes from stable
+                    // storage although reads still return them (fsyncgate);
+                    // a successful one lands them.
+                    if result.is_ok() {
+                        for (offset, bytes) in writes {
+                            let start = usize::try_from(offset).expect("offset fits usize");
+                            let end = start + bytes.len();
+                            if stable.len() < end {
+                                stable.resize(end, 0);
+                            }
+                            stable[start..end].copy_from_slice(&bytes);
+                        }
+                        let size = usize::try_from(self.inner.file_size(cx)?)
+                            .expect("WAL size fits usize");
+                        stable.truncate(size);
+                    }
+                }
+            }
             #[cfg(feature = "fault-injection")]
             if result.is_ok() && is_reset_sync {
                 let intervention = self.faults.lock().unwrap().reset_shared_header_after_sync.take();
@@ -8522,6 +8593,55 @@ mod tests {
         );
     }
 
+    /// bd-alyrn ("fsyncgate"): a failed WAL fsync can drop the commit's
+    /// pages from stable storage while reads keep returning them, and a
+    /// retried fsync then succeeds without writing them. In-doubt
+    /// reconciliation that settles such a commit durable must rewrite the
+    /// verified interval before its re-sync.
+    #[test]
+    fn in_doubt_commit_after_failed_wal_sync_reaches_stable_storage_before_it_settles() {
+        let cx = test_cx();
+        let vfs = CheckpointHandoffFaultVfs::new();
+        let (mut backend, _, _) = make_checkpoint_handoff_fault_backend(&vfs, &cx);
+        vfs.track_wal_stable_storage(&cx);
+
+        let page = sample_page(0x5a);
+        let mut certificate = sample_certificate(2, 2, vec![1]);
+        certificate.wal_frame_payload_digest = test_frame_payload_digest(1, &page, 1);
+        certificate.certificate_crc32c = certificate.computed_crc32c();
+        backend
+            .persist_parallel_wal_commit_certificate(&cx, &certificate, 2, 2)
+            .expect("persist the in-doubt interval's certificate");
+        backend
+            .append_frame(&cx, 1, &page, 1)
+            .expect("append the in-doubt commit marker");
+        vfs.fail_next_wal_sync();
+        backend
+            .sync(&cx)
+            .expect_err("injected WAL sync failure leaves the commit in doubt");
+        assert_ne!(
+            vfs.wal_stable_storage(),
+            read_fault_injected_wal(&vfs, &cx),
+            "the failed sync dropped the commit from stable storage; reads still see it"
+        );
+
+        assert_eq!(
+            backend
+                .reconcile_parallel_wal_commit(&cx, &certificate, 2, 2, true)
+                .wait()
+                .expect("settle the in-doubt commit"),
+            ParallelWalCommitReconciliation::Authorized
+        );
+        assert_eq!(
+            vfs.wal_stable_storage(),
+            read_fault_injected_wal(&vfs, &cx),
+            "a commit settled durable must survive a power loss"
+        );
+        backend
+            .sync(&cx)
+            .expect("ordinary syncs resume once the interval is durable");
+    }
+
     #[test]
     fn checkpoint_handoff_write_failure_preserves_authoritative_wal_generation() {
         let cx = test_cx();
@@ -9435,6 +9555,12 @@ mod tests {
         fixture.adapter.refresh_published_snapshot(&cx)
             .expect_err("refresh cannot trim the owned uncommitted suffix");
         assert_eq!(fixture.adapter.wal.frame_count(), 3);
+        // bd-alyrn: a plain retry cannot vouch for frames the failed sync
+        // covered; they publish once rewritten and synced.
+        fixture.adapter.sync(&cx).expect_err("retry refuses until the frames are rewritten");
+        assert_eq!(fixture.region.lock().to_vec(), before);
+        fixture.adapter.wal.rewrite_frames_after_failed_sync(&cx)
+            .expect("rewrite the frames the failed sync covered");
         fixture.adapter.sync(&cx).expect("publish after successful retry");
         let first = read_shared_wal_index_header(&fixture.region).unwrap().unwrap();
         assert_eq!((first.mx_frame, first.i_change, first.n_page), (2, 1, 2));
@@ -11967,6 +12093,14 @@ mod tests {
             // The commit becomes durable and published, nothing is queued
             // without capacity, and the range stays unadmitted.
             let occupied = producer.try_reserve().unwrap();
+            // bd-alyrn: the frames the failed sync covered are rewritten
+            // before any later sync may vouch for them.
+            backend
+                .inner
+                .wal
+                .rewrite_frames_after_failed_sync(&cx)
+                .await
+                .unwrap();
             backend.sync(&cx).expect("a full WAL-FEC queue defers admission");
             assert_eq!(backend.inner.wal.last_fsynced_frame_count(), 2, "the commit still fsyncs");
             assert!(backend.fec_admitted.is_none(), "a deferred range is not admitted");
@@ -12090,7 +12224,19 @@ mod tests {
             "a failed sync must preserve staged frames for retry"
         );
 
-        // Retry: the same staged batch publishes once durability succeeds.
+        // bd-alyrn: a bare retry cannot prove durability for frames the
+        // failed sync covered, so it refuses and publishes nothing.
+        adapter
+            .sync(&cx)
+            .expect_err("a retry must not vouch for frames a failed sync covered");
+        assert_publication_unchanged(&adapter, "bare retry after failed sync");
+
+        // Retry: once the frames are rewritten, the same staged batch
+        // publishes when durability succeeds.
+        adapter
+            .wal
+            .rewrite_frames_after_failed_sync(&cx)
+            .expect("rewrite the frames the failed sync covered");
         adapter.sync(&cx).expect("retry sync must succeed");
 
         assert_eq!(
@@ -12154,7 +12300,12 @@ mod tests {
             "append after a failed sync must carry the staged horizon forward"
         );
 
-        // Durability finally succeeds: the whole preserved batch publishes.
+        // Durability finally succeeds: the whole preserved batch publishes
+        // once the frames the failed sync covered are rewritten (bd-alyrn).
+        adapter
+            .wal
+            .rewrite_frames_after_failed_sync(&cx)
+            .expect("rewrite the frames the failed sync covered");
         adapter.sync(&cx).expect("sync after failed attempt");
         assert_eq!(
             adapter.published_snapshot.last_commit_frame,
@@ -12231,7 +12382,12 @@ mod tests {
         );
         adapter.refresh_before_append = false;
 
-        // The batch is still recoverable: a successful sync publishes it.
+        // The batch is still recoverable: once its frames are rewritten
+        // (bd-alyrn), a successful sync publishes it.
+        adapter
+            .wal
+            .rewrite_frames_after_failed_sync(&cx)
+            .expect("rewrite the frames the failed sync covered");
         adapter.sync(&cx).expect("sync after failed attempt");
         assert_eq!(
             adapter.published_snapshot.last_commit_frame,
@@ -12287,7 +12443,12 @@ mod tests {
             "a refused checkpoint must preserve the staged frames"
         );
 
-        // Retry: durability succeeds and the preserved batch publishes.
+        // Retry: once the frames are rewritten (bd-alyrn), durability
+        // succeeds and the preserved batch publishes.
+        adapter
+            .wal
+            .rewrite_frames_after_failed_sync(&cx)
+            .expect("rewrite the frames the failed sync covered");
         adapter.sync(&cx).expect("retry sync must succeed");
         assert_eq!(
             adapter.published_snapshot.last_commit_frame,
