@@ -3727,13 +3727,18 @@ where
     /// with `Busy` made every later statement on the connection fail. A
     /// deferred range stays unadmitted, and the next admission (or restart
     /// catch-up) covers it from the last admitted boundary.
+    ///
+    /// A worker that has stopped (closing, cancelled, or exited after a
+    /// caught panic) defers the same way: like
+    /// `WalFecRepairPermit::submit`, an auxiliary worker never refuses a
+    /// durable write. The worker records its own failure.
     #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
     fn reserve_fec_admission(
         producer: &fsqlite_wal::wal_fec::WalFecRepairProducer,
     ) -> Result<Option<fsqlite_wal::wal_fec::WalFecRepairPermit<'_>>> {
         match producer.try_reserve() {
             Ok(permit) => Ok(Some(permit)),
-            Err(FrankenError::Busy) => Ok(None),
+            Err(FrankenError::Busy | FrankenError::BackgroundWorkerFailed(_)) => Ok(None),
             Err(error) => Err(error),
         }
     }
@@ -11993,6 +11998,46 @@ mod tests {
             let stats = pipeline.shutdown(&cx).await.unwrap();
             assert_eq!(stats.completed_jobs, 0);
             assert_eq!(stats.canceled_jobs, 1);
+        });
+    }
+
+    /// The admission contract (bd-jyeus) covers a stopped worker as well as a
+    /// full queue: a repair worker that exited (a caught panic under
+    /// `panic = "unwind"`, or cancellation) must not make every later COMMIT
+    /// on the connection fail before its fsync. The write commits and the
+    /// range stays for restart catch-up, as `WalFecRepairPermit::submit`
+    /// already does for a worker that exits during the fsync.
+    #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+    #[test]
+    fn wal_fec_stopped_worker_defers_admission_instead_of_refusing_writes() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(1, 1).build().unwrap();
+        let handle = runtime.handle();
+        runtime.block_on(async {
+            let cx = test_cx();
+            let vfs = CheckpointHandoffFaultVfs::new();
+            let wal = make_fault_adapter(&vfs, &cx).wal;
+            let mut backend = PathRefreshingWalBackend::new(
+                vfs.clone(), "test.db", "test.db-wal", PAGE_SIZE, wal, true,
+                #[cfg(any(unix, windows))]
+                None,
+            );
+            let mut pipeline = fsqlite_wal::WalFecRepairPipeline::start(
+                &handle, &cx, fsqlite_wal::WalFecRepairPipelineConfig {
+                    queue_capacity: 4, per_symbol_delay: std::time::Duration::ZERO,
+                },
+            ).unwrap();
+            backend.fec_producer = Some(pipeline.producer().unwrap());
+            pipeline.cancel();
+
+            let (p1, p2) = commit_batch_pages();
+            backend.inner.append_frame(&cx, 1, &p1, 0).await.unwrap();
+            backend.inner.append_frame(&cx, 2, &p2, 2).await.unwrap();
+            backend.sync(&cx).expect("a stopped WAL-FEC worker defers admission");
+            assert_eq!(backend.inner.wal.last_fsynced_frame_count(), 2, "the commit still fsyncs");
+            assert!(backend.fec_admitted.is_none(), "a deferred range is not admitted");
+            assert_eq!(backend.inner.published_snapshot.last_commit_frame, Some(1));
+            let _ = pipeline.shutdown(&cx).await;
         });
     }
 

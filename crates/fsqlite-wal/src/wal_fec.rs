@@ -1746,9 +1746,10 @@ pub struct WalFecRepairProducer {
 impl WalFecRepairProducer {
     /// Reserve bounded capacity BEFORE syncing the primary WAL. Dropping a
     /// permit after a failed fsync releases capacity without publishing work.
-    /// `Err(Busy)` means the queue is full; per the admission contract on
+    /// `Err(Busy)` means the queue is full and `Err(BackgroundWorkerFailed)`
+    /// that the worker has stopped; per the admission contract on
     /// [`WalFecRepairPipelineConfig::queue_capacity`], callers defer admission
-    /// rather than refuse the write.
+    /// in both cases rather than refuse the write.
     pub fn try_reserve(&self) -> Result<WalFecRepairPermit<'_>> {
         if self.closing.load(Ordering::Acquire) || self.cancel_flag.load(Ordering::Acquire) {
             return Err(FrankenError::BackgroundWorkerFailed(
