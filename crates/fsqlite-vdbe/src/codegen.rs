@@ -4735,6 +4735,7 @@ pub fn codegen_select(
                     &stmt.order_by,
                     distinct,
                     from_index_hint,
+                    schema,
                 )
             })
             .flatten()
@@ -9339,6 +9340,28 @@ fn codegen_select_index_ordered_scan(
             let reg = probe_key_regs + offset as i32;
             emit_expr(b, expr, reg, None);
             b.emit_jump_to_label(Opcode::IsNull, reg, 0, done_label, P4::None, 0);
+            // The probe seeks the index as a raw key, so it first takes the comparison affinity
+            // `col = value` applies, as SQLite's index seeks do: the TEXT '1' probing a NUMERIC,
+            // INTEGER or REAL column becomes the number 1, the integer 1 probing a TEXT column
+            // becomes '1', and a bound parameter is converted at run time.
+            if let Some(column) = index_plan.index.columns.get(offset) {
+                let affinity =
+                    resolved_index_range_comparison(table, table_alias, schema, column, expr)
+                        .cmp_p5
+                        & !0x80;
+                if let Ok(affinity) = u8::try_from(affinity)
+                    && affinity != 0
+                {
+                    b.emit_op(
+                        Opcode::Affinity,
+                        reg,
+                        1,
+                        0,
+                        P4::Affinity(char::from(affinity).to_string()),
+                        0,
+                    );
+                }
+            }
         }
         let probe_record_reg = b.alloc_reg();
         b.emit_op(
@@ -32147,6 +32170,7 @@ fn resolve_order_by_rowid_direction(
     .then_some(term.direction.unwrap_or(SortDirection::Asc))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_order_by_index_plan(
     table: &TableSchema,
     table_alias: Option<&str>,
@@ -32155,6 +32179,7 @@ fn resolve_order_by_index_plan(
     order_by: &[OrderingTerm],
     distinct: Distinctness,
     index_hint: Option<&fsqlite_ast::IndexHint>,
+    schema: &[TableSchema],
 ) -> Option<OrderByIndexPlan> {
     if order_by.is_empty()
         || distinct == Distinctness::Distinct
@@ -32207,8 +32232,28 @@ fn resolve_order_by_index_plan(
             continue;
         }
 
+        // A prefix value seeks the index as a raw key (after the comparison affinity
+        // `codegen_select_index_ordered_scan` applies), so it pins a key term only when the
+        // comparison's own collation, explicit COLLATE included, is the index term's:
+        // `k = 'v' COLLATE NOCASE` cannot seek a BINARY index. Later terms stay residual.
         let equality_prefix_len =
-            extract_index_equality_prefix_exprs(index, table, table_alias, where_clause).len();
+            extract_index_equality_prefix_exprs(index, table, table_alias, where_clause)
+                .iter()
+                .zip(&index.columns)
+                .enumerate()
+                .take_while(|(key_pos, (expr, column))| {
+                    let comparison =
+                        resolved_index_range_comparison(table, table_alias, schema, column, expr);
+                    let comparison_collation = match &comparison.collation_p4 {
+                        P4::Collation(name) => Some(name.as_str()),
+                        _ => None,
+                    };
+                    collation_names_equivalent(
+                        comparison_collation,
+                        index.key_term_collation(*key_pos),
+                    )
+                })
+                .count();
 
         // Equality probes and ORDER BY must agree with the index's collation.
         // In particular, a NOCASE index cannot prove that a BINARY equality
@@ -50145,6 +50190,7 @@ mod tests {
                 &stmt.order_by,
                 Distinctness::All,
                 None,
+                &schema,
             )
             .is_none(),
             "a qualified equality from another scope must not pin this index prefix"
