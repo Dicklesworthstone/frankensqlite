@@ -29048,7 +29048,7 @@ fn emit_default_value(
             Ok(())
         }
         Some(dv) => {
-            let expr = parse_default_expr(dv).ok_or_else(|| {
+            let expr = parse_column_default_value_expr(dv).ok_or_else(|| {
                 CodegenError::Unsupported(format!(
                     "failed to parse DEFAULT expression `{}` for column `{}`",
                     dv.trim(),
@@ -29075,6 +29075,23 @@ fn parse_default_expr(default_sql: &str) -> Option<Expr> {
         return None;
     }
     parse_sql_expr(trimmed).ok()
+}
+
+/// A column DEFAULT's text as the value expression INSERT evaluates. The text
+/// is the DEFAULT as written: an unparenthesized lone identifier (`fallback`,
+/// `"fallback"`, `[fallback]`) can only come from stock's `DEFAULT id`
+/// production, which makes it the string 'fallback' (read as an expression it
+/// would be a column reference); a parenthesized one (`DEFAULT ("x")`) stays an
+/// expression.
+fn parse_column_default_value_expr(default_sql: &str) -> Option<Expr> {
+    match parse_default_expr(default_sql)? {
+        Expr::Column(column_ref, span)
+            if column_ref.table.is_none() && !default_sql.trim().starts_with('(') =>
+        {
+            Some(Expr::Literal(Literal::String(column_ref.column.to_string()), span))
+        }
+        expr => Some(expr),
+    }
 }
 
 fn default_expr_is_self_contained(expr: &Expr) -> bool {

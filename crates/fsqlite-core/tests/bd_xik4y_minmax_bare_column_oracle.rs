@@ -112,6 +112,21 @@ const VALUE_QUERIES: &[&str] = &[
     "SELECT max(v) FILTER (WHERE v IS NULL), b FROM (SELECT a AS v, b FROM z ORDER BY b)",
     "SELECT max(z.a), z.b FROM z JOIN u ON u.a = z.g WHERE z.g = 1",
     "SELECT z.g, max(z.a), z.b FROM z JOIN u ON u.a = z.g GROUP BY z.g ORDER BY z.g",
+    // Still a single min()/max(): a repeat of the same call is the same
+    // aggregate, count() never decides the bare-column row, and a HAVING alias
+    // names the tracked aggregate (single-table, subquery and join paths).
+    "SELECT max(a), b, max(a) + 1 FROM t",
+    "SELECT max(a), count(*), b FROM t",
+    "SELECT count(a), min(a), b FROM t",
+    "SELECT max(a), b, c, count(DISTINCT b) FROM t GROUP BY c ORDER BY c",
+    "SELECT max(a) AS m, b, c FROM t GROUP BY c HAVING m > 1 ORDER BY c",
+    "SELECT max(a), b, c FROM t GROUP BY c HAVING count(*) > 1 ORDER BY c",
+    "SELECT max(a) FILTER (WHERE c < 3), count(*) FILTER (WHERE c = 3), b FROM t",
+    "SELECT max(v), count(*), b FROM (SELECT a AS v, b FROM t ORDER BY a)",
+    "SELECT max(v) AS m, b FROM (SELECT a AS v, b FROM t ORDER BY a) HAVING m > 0",
+    "SELECT max(t.a), count(*), u.x FROM t JOIN u ON u.a = t.a",
+    "SELECT max(t.a), u.x, max(t.a) * 2 FROM t JOIN u ON u.a = t.a",
+    "SELECT max(t.a) AS m, u.x, t.c FROM t JOIN u ON u.a = t.a GROUP BY t.c HAVING m > 1 ORDER BY t.c",
 ];
 
 /// Unaliased result expressions are named by their source text.

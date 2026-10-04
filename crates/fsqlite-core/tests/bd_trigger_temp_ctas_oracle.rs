@@ -290,3 +290,115 @@ fn multi_row_delete_interleaves_before_and_after_triggers_per_row() {
         compare(&frank, &stock, "SELECT w, k, c, m FROM log WHERE w = 'rad' ORDER BY rowid").await;
     });
 }
+
+/// Every row of a multi-row DELETE or UPDATE fires its triggers in a frame
+/// that sees the `changes()` from before the statement, as stock restores it
+/// around each trigger program; an earlier row's count (or the trigger body's
+/// own inserts) never leaks into a later row's triggers. The row-by-row
+/// replay published each row's count, so the second row's AFTER trigger saw 1
+/// where stock sees the previous statement's 3.
+#[test]
+fn replayed_row_triggers_see_the_statement_entry_changes() {
+    for_each_backing(|frank, stock| async move {
+        for sql in [
+            "CREATE TABLE log(w, k, c, tc)",
+            "CREATE TABLE e(k INTEGER PRIMARY KEY, v)",
+            "INSERT INTO e VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+            "CREATE TRIGGER ead AFTER DELETE ON e BEGIN \
+               INSERT INTO log VALUES('ead', OLD.k, changes(), NULL); \
+               INSERT INTO log VALUES('ead2', OLD.k, changes(), NULL); END",
+            "DELETE FROM e WHERE k <= 3",
+            "INSERT INTO e VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')",
+            "CREATE TRIGGER ebd BEFORE DELETE ON e BEGIN \
+               INSERT INTO log VALUES('ebd', OLD.k, changes(), NULL); END",
+            "DELETE FROM e WHERE k >= 2",
+            "CREATE TABLE p(k INTEGER PRIMARY KEY, v)",
+            "INSERT INTO p VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e')",
+            "CREATE TRIGGER pau AFTER UPDATE ON p BEGIN \
+               INSERT INTO log VALUES('pau', NEW.k, changes(), NULL); END",
+            "UPDATE p SET v = v || '!' WHERE k IN (2, 3, 4)",
+        ] {
+            run_both(&frank, &stock, sql).await;
+        }
+        compare(&frank, &stock, "SELECT changes()").await;
+        compare(&frank, &stock, "SELECT w, k, c FROM log ORDER BY rowid").await;
+        compare(&frank, &stock, "SELECT * FROM e ORDER BY k").await;
+        compare(&frank, &stock, "SELECT * FROM p ORDER BY k").await;
+    });
+}
+
+/// `CREATE TABLE ... AS SELECT` writes stock's createTableStmt text: names
+/// quoted only when needed, an unaliased expression named by its source text,
+/// each column's affinity as its declared type, one line while short. The
+/// declared types are what a reopened schema (fsqlite's or stock's) reads the
+/// affinities from; the old text (`CREATE TABLE "x" ("a", "b")`) lost them, so
+/// after a reopen '5' stayed TEXT in an INTEGER-affinity column.
+#[test]
+fn create_table_as_select_writes_stock_schema_text_and_keeps_affinity() {
+    asupersync::test_utils::run_test(|| async {
+        let setup = [
+            "CREATE TABLE src(a INTEGER, b TEXT, c REAL, d NUMERIC, e, \"my col\" INT, [select] TEXT)",
+            "INSERT INTO src VALUES (1, 'x', 1.5, 2, 3, 4, 5)",
+            "CREATE TABLE x AS SELECT * FROM src",
+            "CREATE TABLE y AS SELECT a+1, b || '', CAST(e AS INTEGER), a AS \"Mixed Case\" FROM src",
+            "CREATE TABLE z AS SELECT a, b FROM src",
+            "CREATE TEMP TABLE tz AS SELECT a, b, c, d FROM src",
+        ];
+        // (sqlite_temp_master re-renders every TEMP table's text, CTAS or not,
+        // so the temp table's declared types are checked through table_info.)
+        let checks = [
+            "SELECT name, sql FROM sqlite_master WHERE name IN ('x', 'y', 'z') ORDER BY name",
+            "SELECT name, type FROM pragma_table_info('x') ORDER BY cid",
+            "SELECT name, type FROM pragma_table_info('y') ORDER BY cid",
+            "SELECT name, type FROM pragma_table_info('tz') ORDER BY cid",
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let frank_path = dir.path().join("frank_ctas.db");
+        let stock_path = dir.path().join("stock_ctas.db");
+        {
+            let frank = Connection::open(frank_path.to_str().unwrap()).await.unwrap();
+            let stock = rusqlite::Connection::open(&stock_path).unwrap();
+            for sql in setup {
+                run_both(&frank, &stock, sql).await;
+            }
+            for sql in checks {
+                compare(&frank, &stock, sql).await;
+            }
+            for sql in [
+                "CREATE TEMP TABLE main.bad AS SELECT 1",
+                "CREATE TEMP TABLE main.bad(a)",
+            ] {
+                let frank_error = frank.execute(sql).await.expect_err(sql);
+                let stock_error = stock.execute_batch(sql).expect_err(sql);
+                assert!(
+                    stock_error.to_string().contains("temporary table name must be unqualified")
+                        && frank_error
+                            .to_string()
+                            .contains("temporary table name must be unqualified"),
+                    "`{sql}`: {frank_error:?} vs {stock_error}"
+                );
+            }
+        }
+        // Reopened (by each engine, and the fsqlite file by stock), the
+        // columns keep the SELECT's affinities.
+        let insert = "INSERT INTO x(a, b, c, d) VALUES ('5', 6, '7', '8.0')";
+        let read = "SELECT typeof(a), typeof(b), typeof(c), typeof(d) FROM x ORDER BY rowid";
+        let frank = Connection::open(frank_path.to_str().unwrap()).await.unwrap();
+        let stock = rusqlite::Connection::open(&stock_path).unwrap();
+        run_both(&frank, &stock, insert).await;
+        compare(&frank, &stock, read).await;
+        drop(frank);
+        let stock_reading_frank = rusqlite::Connection::open(&frank_path).unwrap();
+        stock_reading_frank.execute_batch(insert).unwrap();
+        // The fsqlite file now holds the copied row plus the row each engine
+        // inserted; both inserted rows must have the stock-inserted row's types.
+        let stock_types = stock_rows(&stock, read);
+        let mut expected = stock_types.clone();
+        expected.push(stock_types[1].clone());
+        assert_eq!(stock_rows(&stock_reading_frank, read), expected);
+        assert_eq!(
+            stock_rows(&stock_reading_frank, "PRAGMA integrity_check"),
+            vec![vec![SqliteValue::from("ok")]]
+        );
+    });
+}

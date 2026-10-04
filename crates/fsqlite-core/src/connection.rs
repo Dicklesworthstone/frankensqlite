@@ -14270,6 +14270,10 @@ impl Drop for BoolCellRestoreGuard<'_> {
     }
 }
 
+/// Held for one trigger program (all statements of one firing): like stock's
+/// trigger frame (OP_Program saves `nChange`/`lastRowid`, sqlite3VdbeFrameRestore
+/// puts them back), `changes()` and `last_insert_rowid()` move as the body's
+/// statements run and are restored when the body ends, even on error.
 struct TriggerChangeTrackingRestoreGuard<'a> {
     conn: &'a Connection,
     last_changes: usize,
@@ -20218,11 +20222,15 @@ impl Connection {
                                 "table {table_name} already exists",
                             )));
                         }
+                        let ddl_source = self.pending_ddl_source.borrow().clone();
                         let source_rows = self
                             .materialize_create_table_as_select_source_rows(select_stmt, params)
                             .await?;
-                        let col_infos = self
-                            .infer_create_table_as_select_column_infos(select_stmt, &source_rows);
+                        let col_infos = self.infer_create_table_as_select_column_infos(
+                            select_stmt,
+                            &source_rows,
+                            ddl_source.as_deref(),
+                        );
                         self.with_attached_connection_async(&target_schema, async move |conn| {
                             conn.execute_materialized_create_table_as_select_statement(
                                 &rewritten,
@@ -41792,12 +41800,25 @@ impl Connection {
             .await
     }
 
+    /// `ddl_source` is the CREATE text the statement was parsed from, when
+    /// known: like stock (sqlite3ColumnsFromExprList), an unaliased result
+    /// expression names its column by its source text (`a+1`), not `_cN`.
     fn infer_create_table_as_select_column_infos(
         &self,
         select_stmt: &fsqlite_ast::SelectStatement,
         rows: &[Row],
+        ddl_source: Option<&str>,
     ) -> Vec<ColumnInfo> {
-        let col_names = self.select_result_column_names(select_stmt, &[], &mut Vec::new());
+        let mut col_names = self.select_result_column_names(select_stmt, &[], &mut Vec::new());
+        // The spans must index into `ddl_source`, so name from that text's own
+        // parse, and only when it is this same statement.
+        if let Some(sql) = ddl_source
+            && let Ok(Statement::CreateTable(parsed)) = parse_single_statement(sql)
+            && let CreateTableBody::AsSelect(parsed_select) = &parsed.body
+            && **parsed_select == *select_stmt
+        {
+            overlay_select_result_expression_source_names(&mut col_names, parsed_select, sql);
+        }
         // Derive each column's affinity from the SELECT result-column decltype
         // (via the AST), matching C SQLite CTAS. Sniffing the first materialized
         // value instead coerced mixed storage classes to one affinity, e.g.
@@ -41872,7 +41893,9 @@ impl Connection {
                     name,
                     affinity,
                     is_ipk: false,
-                    type_name: None,
+                    // The declared type stock writes for the column's affinity
+                    // (createTableStmt), which a reopened schema reads back.
+                    type_name: create_table_as_select_type_name(affinity).map(str::to_owned),
                     notnull: false,
                     unique: false,
                     default_value: None,
@@ -41943,7 +41966,7 @@ impl Connection {
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
         };
-        let create_sql = crate::compat_persist::build_create_table_sql(&table_schema);
+        let create_sql = create_table_as_select_sql(&table_schema.name, &table_schema.columns);
         let root_page = table_schema.root_page;
         let table_name = table_schema.name.clone();
         self.schema.borrow_mut().push(table_schema);
@@ -41995,9 +42018,20 @@ impl Connection {
         &self,
         create: &fsqlite_ast::CreateTableStatement,
         target_is_temp: bool,
-        mut col_infos: Vec<ColumnInfo>,
+        col_infos: Vec<ColumnInfo>,
         rows: &[Row],
     ) -> Result<()> {
+        if create.temporary
+            && create
+                .name
+                .schema
+                .as_deref()
+                .is_some_and(|schema| !schema.eq_ignore_ascii_case("temp"))
+        {
+            return Err(FrankenError::FunctionError(
+                "temporary table name must be unqualified".to_owned(),
+            ));
+        }
         let table_name = create.name.name.clone();
         let name_lc = table_name.to_ascii_lowercase();
         let temp_exists = self.temp_table_names.borrow().contains(&name_lc);
@@ -42027,30 +42061,9 @@ impl Connection {
                 "{kind} {table_name} already exists",
             )));
         }
-        // Re-parsing an ordinary CREATE must retain the SELECT's inferred
-        // affinities. CTAS inference has no original declared type names;
-        // omitting them here would make every recreated column typeless.
-        for column in &mut col_infos {
-            column.type_name = match Self::type_affinity_for_direct_insert(column.affinity) {
-                TypeAffinity::Blob => None,
-                TypeAffinity::Text => Some("TEXT"),
-                TypeAffinity::Numeric => Some("NUM"),
-                TypeAffinity::Integer => Some("INT"),
-                TypeAffinity::Real => Some("REAL"),
-            }
-            .map(str::to_owned);
-        }
-        let create_sql = crate::compat_persist::build_create_table_sql(&TableSchema {
-            name: table_name.clone(),
-            root_page: 0,
-            columns: col_infos,
-            indexes: Vec::new(),
-            strict: false,
-            without_rowid: false,
-            primary_key_constraints: Vec::new(),
-            foreign_keys: Vec::new(),
-            check_constraints: Vec::new(),
-        });
+        // The CREATE stock writes for the inferred columns, declared types
+        // included, so the recreated columns keep the SELECT's affinities.
+        let create_sql = create_table_as_select_sql(&table_name, &col_infos);
         let Statement::CreateTable(mut column_create) = parse_single_statement(&create_sql)? else {
             return Err(FrankenError::internal(
                 "CREATE TEMP TABLE ... AS SELECT column list did not parse as a CREATE TABLE",
@@ -52642,6 +52655,11 @@ impl Connection {
         };
         let previous_total_changes = self.total_changes.get();
         let previous_last_insert_rowid = self.current_last_insert_rowid();
+        // Each row runs as its own statement, which publishes that row's change
+        // count. Stock runs every row's triggers in a frame that restores the
+        // outer `changes()`, so a trigger on any row sees the value from before
+        // this statement, never an earlier row's count.
+        let previous_changes = self.last_changes.get();
 
         let set_count = match statement {
             DmlRowReplay::UpdateFrom { set_columns, .. } => set_columns.len(),
@@ -52699,6 +52717,7 @@ impl Connection {
                     (&literal_statement, params)
                 };
 
+                self.set_statement_change_count(previous_changes);
                 match self
                     .execute_statement_impl_after_background_status(
                         row_statement,
@@ -63670,6 +63689,21 @@ impl Connection {
     async fn execute_create_table(&self, create: &fsqlite_ast::CreateTableStatement) -> Result<()> {
         let table_name = create.name.name.clone();
 
+        // As in stock's sqlite3StartTable, a TEMP table may only be qualified
+        // with `temp`: `CREATE TEMP TABLE main.t(...)` is an error, checked
+        // before anything else about the name.
+        if create.temporary
+            && create
+                .name
+                .schema
+                .as_deref()
+                .is_some_and(|schema| !schema.eq_ignore_ascii_case("temp"))
+        {
+            return Err(FrankenError::FunctionError(
+                "temporary table name must be unqualified".to_owned(),
+            ));
+        }
+
         // Stock SQLite reserves object names beginning with "sqlite_" (case-
         // insensitive) for internal use; a user CREATE with such a name fails
         // before the existence check (so even IF NOT EXISTS errors). Internal
@@ -64347,10 +64381,15 @@ impl Connection {
                         "CREATE TABLE ... AS SELECT ... STRICT is not yet supported".to_owned(),
                     ));
                 }
+                let ddl_source = self.pending_ddl_source.borrow().clone();
                 let rows = self
                     .materialize_create_table_as_select_source_rows(select_stmt, None)
                     .await?;
-                let col_infos = self.infer_create_table_as_select_column_infos(select_stmt, &rows);
+                let col_infos = self.infer_create_table_as_select_column_infos(
+                    select_stmt,
+                    &rows,
+                    ddl_source.as_deref(),
+                );
                 return self
                     .execute_materialized_create_table_as_select_statement(create, col_infos, &rows)
                     .await;
@@ -70502,10 +70541,11 @@ impl Connection {
         // more boxing.
         #[cfg(test)]
         record_trigger_stack_probe(trigger_probe_site::TRIGGER_REENTRY);
-        // Trigger body DML contributes to total_changes(), but SQLite restores
-        // changes() and last_insert_rowid() when control returns to the outer
-        // statement. Restore those two values even when the trigger fails.
-        let _change_tracking_guard = TriggerChangeTrackingRestoreGuard::new(self);
+        // Trigger body DML contributes to total_changes(). changes() and
+        // last_insert_rowid() are restored by the caller's per-trigger
+        // TriggerChangeTrackingRestoreGuard when the whole body finishes, so a
+        // later statement of the same body sees an earlier one's values, as in
+        // stock (OP_ResetCount after each step, frame restore at the end).
         let counts_changes = matches!(
             &statement,
             Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
@@ -70591,7 +70631,9 @@ impl Connection {
                 continue;
             }
 
-            // Execute each statement in the trigger body.
+            // Execute each statement in the trigger body, in one change-tracking
+            // frame (see TriggerChangeTrackingRestoreGuard).
+            let _change_tracking_guard = TriggerChangeTrackingRestoreGuard::new(self);
             for stmt in &trigger.body {
                 let mut bound_stmt = stmt.clone();
                 bind_trigger_columns_in_statement(&mut bound_stmt, &frame);
@@ -70664,7 +70706,9 @@ impl Connection {
                 continue;
             }
 
-            // Execute each statement in the trigger body.
+            // Execute each statement in the trigger body, in one change-tracking
+            // frame (see TriggerChangeTrackingRestoreGuard).
+            let _change_tracking_guard = TriggerChangeTrackingRestoreGuard::new(self);
             for stmt in &trigger.body {
                 let mut bound_stmt = stmt.clone();
                 bind_trigger_columns_in_statement(&mut bound_stmt, &frame);
@@ -71164,6 +71208,9 @@ impl Connection {
             if !trigger_when_matches(self, trigger.when_clause.as_ref(), Some(&frame)).await? {
                 continue;
             }
+            // One change-tracking frame for the whole trigger body (see
+            // TriggerChangeTrackingRestoreGuard).
+            let _change_tracking_guard = TriggerChangeTrackingRestoreGuard::new(self);
             for stmt in &trigger.body {
                 let mut bound_stmt = stmt.clone();
                 bind_trigger_columns_in_statement(&mut bound_stmt, &frame);
@@ -103590,7 +103637,7 @@ fn select_minmax_bare_tracking(select: &SelectStatement) -> Option<(bool, Expr, 
     // bare column or subquery inside it stays on the existing path.
     if let Some(having) = having.as_deref() {
         let tracked = state.minmax.as_ref()?;
-        if !having_admits_minmax_bare_tracking(having, group_by, tracked) {
+        if !having_admits_minmax_bare_tracking(having, columns, group_by, tracked) {
             return None;
         }
     }
@@ -103598,15 +103645,30 @@ fn select_minmax_bare_tracking(select: &SelectStatement) -> Option<(bool, Expr, 
 }
 
 /// bd-xik4y: whether `expr` (a HAVING clause) keeps the single-min()/max()
-/// bare-column rule intact: every aggregate call in it is the tracked one, and
-/// it reads no bare column (outside GROUP BY keys and the tracked aggregate's
-/// argument) and no subquery.
+/// bare-column rule intact: every aggregate call in it is the tracked one (or a
+/// count()), and it reads no bare column (outside GROUP BY keys and the tracked
+/// aggregate's argument) and no subquery. A bare name that is a result alias
+/// (`SELECT max(a) AS m ... HAVING m > 0`) stands for that result expression,
+/// as HAVING resolves it in SQLite.
 fn having_admits_minmax_bare_tracking(
     expr: &Expr,
+    columns: &[ResultColumn],
     group_by: &[Expr],
     tracked: &(bool, Expr, Option<Expr>),
 ) -> bool {
-    let mut state = MinMaxBareTrackingWalk::default();
+    let mut state = MinMaxBareTrackingWalk {
+        result_aliases: columns
+            .iter()
+            .filter_map(|column| match column {
+                ResultColumn::Expr {
+                    expr,
+                    alias: Some(alias),
+                } => Some((alias.clone(), expr.clone())),
+                _ => None,
+            })
+            .collect(),
+        ..MinMaxBareTrackingWalk::default()
+    };
     walk_minmax_bare_tracking(expr, group_by, &mut state);
     if state.bail || state.has_bare {
         return false;
@@ -103626,13 +103688,17 @@ struct MinMaxBareTrackingWalk {
     /// needed to compute the extremum row when the aggregate is NESTED in a
     /// mixed output expression (no top-level Agg descriptor to borrow it from).
     minmax: Option<(bool, Expr, Option<Expr>)>,
-    /// Count of aggregate function calls seen across all result columns.
+    /// Count of distinct min()/max() calls seen (a repeat of the tracked call
+    /// and count() calls are not counted).
     agg_count: usize,
     /// Whether a bare (non-aggregate, non-GROUP-BY) column reference was found.
     has_bare: bool,
     /// Set when a shape disqualifies the optimization (window function, a
-    /// second aggregate, or a non-min/max aggregate).
+    /// second distinct min()/max(), or an aggregate other than min/max/count).
     bail: bool,
+    /// Result-column aliases a bare name resolves to (set only while walking
+    /// HAVING): the name stands for the aliased result expression.
+    result_aliases: Vec<(String, Expr)>,
 }
 
 /// Walk one result-column expression for [`select_minmax_bare_tracking`],
@@ -103647,7 +103713,21 @@ fn walk_minmax_bare_tracking(expr: &Expr, group_by: &[Expr], state: &mut MinMaxB
         return;
     }
     match expr {
-        Expr::Column(_, _) => {
+        Expr::Column(column_ref, _) => {
+            if column_ref.table.is_none()
+                && let Some(aliased) = state
+                    .result_aliases
+                    .iter()
+                    .find(|(alias, _)| alias.eq_ignore_ascii_case(&column_ref.column))
+                    .map(|(_, aliased)| aliased.clone())
+            {
+                // An alias names a result expression, which cannot itself use
+                // a result alias, so walk it with the aliases cleared.
+                let aliases = std::mem::take(&mut state.result_aliases);
+                walk_minmax_bare_tracking(&aliased, group_by, state);
+                state.result_aliases = aliases;
+                return;
+            }
             state.has_bare = true;
         }
         // A window function disqualifies the optimization outright. (These
@@ -103656,13 +103736,19 @@ fn walk_minmax_bare_tracking(expr: &Expr, group_by: &[Expr], state: &mut MinMaxB
             state.bail = true;
         }
         // An aggregate function call. The optimization requires the query's ONLY
-        // aggregate to be a single builtin min()/max() with one argument.
+        // min()/max() aggregate to be a single builtin call with one argument.
+        // As in stock, a repeat of that same call is the same aggregate (its
+        // AggInfo deduplicates equal expressions), and count() never decides
+        // which row supplies the bare columns (only min()/max() skip the
+        // accumulator load), so neither disqualifies it. count() is exact and
+        // order-free, so the join path may still move the extremum row first.
         Expr::FunctionCall {
             name, args, filter, ..
         } if is_agg_fn(name) && !is_scalar_max_min(name, args) => {
-            state.agg_count += 1;
-            if state.agg_count > 1 {
-                state.bail = true;
+            let lname = name.to_ascii_lowercase();
+            if lname == "count" {
+                // Its argument and FILTER belong to the aggregate, not to the
+                // bare-column set.
                 return;
             }
             let arg = match args {
@@ -103672,12 +103758,21 @@ fn walk_minmax_bare_tracking(expr: &Expr, group_by: &[Expr], state: &mut MinMaxB
                     return;
                 }
             };
-            let lname = name.to_ascii_lowercase();
             if lname != "min" && lname != "max" {
                 state.bail = true;
                 return;
             }
-            state.minmax = Some((lname == "max", arg.clone(), filter.as_deref().cloned()));
+            let call = (lname == "max", arg.clone(), filter.as_deref().cloned());
+            match &state.minmax {
+                Some(tracked) if *tracked == call => return,
+                Some(_) => {
+                    state.bail = true;
+                    return;
+                }
+                None => {}
+            }
+            state.agg_count += 1;
+            state.minmax = Some(call);
             // Do NOT descend into the aggregate argument: its column references
             // belong to the aggregate, not to the bare-column set. A nested
             // aggregate there is a "misuse of aggregate" that other paths reject.
@@ -111220,6 +111315,17 @@ fn overlay_result_expression_source_names(names: &mut [String], original: &State
     let Statement::Select(select) = original else {
         return;
     };
+    overlay_select_result_expression_source_names(names, select, sql);
+}
+
+/// [`overlay_result_expression_source_names`] for a SELECT parsed from `sql`
+/// (also the SELECT of a `CREATE TABLE ... AS SELECT`, whose column names
+/// stock derives the same way in sqlite3ColumnsFromExprList).
+fn overlay_select_result_expression_source_names(
+    names: &mut [String],
+    select: &SelectStatement,
+    sql: &str,
+) {
     let SelectCore::Select { columns, .. } = &select.body.select else {
         return;
     };
@@ -145068,6 +145174,69 @@ mod batch_execution_tests {
             assert!(matches!(error, FrankenError::ParseError { offset: 0, .. }));
         });
     }
+}
+
+/// The declared type stock gives a `CREATE TABLE ... AS SELECT` column of
+/// affinity `affinity` (an affinity char): createTableStmt's azType.
+fn create_table_as_select_type_name(affinity: char) -> Option<&'static str> {
+    match Connection::type_affinity_for_direct_insert(affinity) {
+        TypeAffinity::Blob => None,
+        TypeAffinity::Text => Some("TEXT"),
+        TypeAffinity::Numeric => Some("NUM"),
+        TypeAffinity::Integer => Some("INT"),
+        TypeAffinity::Real => Some("REAL"),
+    }
+}
+
+/// The `sqlite_master.sql` stock writes for `CREATE TABLE ... AS SELECT`
+/// (build.c createTableStmt): `CREATE TABLE name(col TYPE,...)`, each name
+/// quoted only when it needs it (identPut), each column's affinity as its
+/// declared type, on one line while the estimate stays under 50 bytes and one
+/// column per line otherwise. A TEMP table's text has no TEMP keyword.
+fn create_table_as_select_sql(table_name: &str, columns: &[ColumnInfo]) -> String {
+    fn ident_length(name: &str) -> usize {
+        name.len() + name.matches('"').count() + 2
+    }
+    fn ident_put(out: &mut String, name: &str) {
+        let plain = name
+            .bytes()
+            .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            .count();
+        let needs_quote = plain == 0
+            || plain != name.len()
+            || name.as_bytes()[0].is_ascii_digit()
+            || fsqlite_parser::TokenKind::lookup_keyword(name).is_some();
+        if needs_quote {
+            out.push('"');
+            out.push_str(&name.replace('"', "\"\""));
+            out.push('"');
+        } else {
+            out.push_str(name);
+        }
+    }
+    let estimate = columns
+        .iter()
+        .map(|column| ident_length(&column.name) + 5)
+        .sum::<usize>()
+        + ident_length(table_name);
+    let (first_sep, sep, end) = if estimate < 50 {
+        ("", ",", ")")
+    } else {
+        ("\n  ", ",\n  ", "\n)")
+    };
+    let mut sql = String::from("CREATE TABLE ");
+    ident_put(&mut sql, table_name);
+    sql.push('(');
+    for (index, column) in columns.iter().enumerate() {
+        sql.push_str(if index == 0 { first_sep } else { sep });
+        ident_put(&mut sql, &column.name);
+        if let Some(type_name) = create_table_as_select_type_name(column.affinity) {
+            sql.push(' ');
+            sql.push_str(type_name);
+        }
+    }
+    sql.push_str(end);
+    sql
 }
 
 fn quote_identifier(identifier: &str) -> String {

@@ -2111,14 +2111,17 @@ impl Parser {
                 let expr = self.parse_expr()?;
                 self.expect_token(&TokenKind::RightParen)?;
                 ColumnConstraintKind::Default(DefaultValue::ParenExpr(expr))
-            } else if let TokenKind::Id(name) = self.peek().clone() {
-                // SQLite quirk: a BARE (unparenthesized, unquoted) identifier after
-                // DEFAULT is treated as a STRING LITERAL, not a column reference — a
-                // column DEFAULT cannot reference other columns. `DEFAULT abc` yields
-                // the string 'abc'; `DEFAULT (abc)` stays an expression and is later
-                // rejected as non-constant. Keyword constants (TRUE/FALSE/NULL/
-                // CURRENT_*) lex as keywords (not Id), so they fall through to the
-                // normal expression parse below and keep their literal meaning.
+            } else if let TokenKind::Id(name) | TokenKind::QuotedId(name, _) = self.peek().clone() {
+                // SQLite quirk: a BARE (unparenthesized) identifier after DEFAULT is
+                // treated as a STRING LITERAL, not a column reference — a column
+                // DEFAULT cannot reference other columns. Stock's grammar
+                // (`ccons ::= DEFAULT scantok id`) takes any identifier token, so
+                // `DEFAULT abc`, `DEFAULT "abc"`, `DEFAULT [abc]` and
+                // ``DEFAULT `abc` `` all yield the string 'abc'; `DEFAULT (abc)`
+                // stays an expression and is later rejected as non-constant.
+                // Keyword constants (TRUE/FALSE/NULL/CURRENT_*) lex as keywords
+                // (not Id), so they fall through to the normal expression parse
+                // below and keep their literal meaning.
                 let span = self.current_span();
                 self.advance();
                 ColumnConstraintKind::Default(DefaultValue::Expr(Expr::Literal(

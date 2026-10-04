@@ -2450,8 +2450,11 @@ fn append_fk_reference_clause(sql: &mut String, fk: &FkDef) {
     }
 }
 
-/// Reconstruct a `CREATE TABLE` statement from a `TableSchema`.
-pub(crate) fn build_create_table_sql(table: &TableSchema) -> String {
+/// Reconstruct a `CREATE TABLE` statement from a `TableSchema`, treating
+/// autoindex-named indexes as implicit. `CREATE TABLE ... AS SELECT` writes
+/// stock's createTableStmt text instead, so only the generator's tests use it.
+#[cfg(test)]
+fn build_create_table_sql(table: &TableSchema) -> String {
     build_create_table_sql_with_implicit_index_predicate(table, |index| {
         parse_autoindex_ordinal(&index.name, &table.name).is_some()
     })
@@ -3496,9 +3499,11 @@ pub(crate) fn format_default_value(dv: &DefaultValue) -> String {
 /// 1.50` must stay `1.50` rather than the AST's `1.5`. Expression spans omit
 /// grouping parentheses, so a slice that does not reparse to the same
 /// expression falls back to the AST rendering. The stored text is also
-/// re-parsed to evaluate INSERT defaults, so it must parse back to the same
-/// expression: a double-quoted string default (`DEFAULT "dq"`) therefore keeps
-/// its AST rendering `'dq'`, since `"dq"` alone parses as an identifier.
+/// re-parsed to evaluate INSERT defaults, so it must read back as the same
+/// value: an unparenthesized identifier spelling of a string default
+/// (`DEFAULT "dq"`, `DEFAULT dq`, `DEFAULT [dq]`) is kept as written, as stock
+/// reports it, because every DEFAULT evaluator reads a lone identifier as that
+/// string (stock's `DEFAULT id` production).
 pub(crate) fn default_value_source_text(dv: &DefaultValue, sql: &str) -> String {
     let (DefaultValue::Expr(expr) | DefaultValue::ParenExpr(expr)) = dv;
     let span = expr.span();
@@ -3506,11 +3511,34 @@ pub(crate) fn default_value_source_text(dv: &DefaultValue, sql: &str) -> String 
         .get(span.start as usize..span.end as usize)
         .map(str::trim)
         && !text.is_empty()
-        && fsqlite_parser::expr::parse_expr(text).is_ok_and(|parsed| parsed.eq(expr))
+        && (fsqlite_parser::expr::parse_expr(text).is_ok_and(|parsed| parsed.eq(expr))
+            || (matches!(dv, DefaultValue::Expr(_)) && is_identifier_spelling_of(text, expr)))
     {
         return text.to_owned();
     }
     format_default_value(dv)
+}
+
+/// Whether `text` is a single identifier token (bare, `"..."`, `[...]` or
+/// `` `...` ``) naming exactly the string literal `expr`.
+fn is_identifier_spelling_of(text: &str, expr: &Expr) -> bool {
+    let Expr::Literal(Literal::String(value), _) = expr else {
+        return false;
+    };
+    let tokens = fsqlite_parser::Lexer::tokenize(text);
+    match tokens.as_slice() {
+        [token, rest @ ..] => {
+            rest.iter()
+                .all(|token| matches!(token.kind, fsqlite_parser::TokenKind::Eof))
+                && matches!(
+                    &token.kind,
+                    fsqlite_parser::TokenKind::Id(name)
+                        | fsqlite_parser::TokenKind::QuotedId(name, _)
+                        if **name == **value
+                )
+        }
+        [] => false,
+    }
 }
 
 fn indexed_column_name(indexed_column: &fsqlite_ast::IndexedColumn) -> Option<&str> {
@@ -5325,7 +5353,10 @@ PRAGMA integrity_check;
             cols[0].default_value.as_deref(),
             Some("'NOT NULL UNIQUE PRIMARY KEY'")
         );
-        assert_eq!(cols[1].default_value.as_deref(), Some("fallback"));
+        // Kept as written, as stock's PRAGMA table_info dflt_value reports it
+        // (sqlite3 3.53.2: `"fallback"`); every DEFAULT evaluator reads this
+        // lone identifier as the string 'fallback'.
+        assert_eq!(cols[1].default_value.as_deref(), Some("\"fallback\""));
     }
 
     #[test]
