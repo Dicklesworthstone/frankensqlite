@@ -1505,9 +1505,17 @@ const DEFAULT_REPAIR_PIPELINE_QUEUE_CAPACITY: usize = 64;
 /// Pipeline configuration for asynchronous WAL-FEC repair generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WalFecRepairPipelineConfig {
-    /// Maximum queued work items before backpressure.
+    /// Maximum queued work items.
     ///
     /// This is the bounded async repair-latency window in commit-count units.
+    ///
+    /// # Admission contract (bd-jyeus)
+    ///
+    /// The queue is auxiliary to the primary WAL and never refuses a durable
+    /// write. A backend that finds it full commits and publishes anyway and
+    /// leaves the range unadmitted: the next admission covers it from the last
+    /// admitted boundary, connection close admits the durable tail once the
+    /// worker drains, and restart catch-up covers anything still left.
     pub queue_capacity: usize,
     /// Optional deterministic delay per generated repair symbol (test hook).
     pub per_symbol_delay: Duration,
@@ -1558,6 +1566,10 @@ pub struct WalFecRepairPipelineStats {
 // Sample by work count so burst logging is bounded without clocks or logging
 // locks on successful durable admission. Summaries retain the full counters.
 const WAL_FEC_LOG_SAMPLE_INTERVAL: usize = 64;
+/// Committed ranges whose sidecar records may stay unsynced (bd-wqmil). This
+/// bounds the groups a crash can cost to what catch-up regenerates at the next
+/// open; see [`CommittedRangeSidecar::finish_range`].
+const WAL_FEC_SIDECAR_SYNC_RANGES: u32 = 32;
 static NEXT_WAL_FEC_PIPELINE_ID: AtomicUsize = AtomicUsize::new(1);
 
 #[derive(Debug)]
@@ -1734,6 +1746,9 @@ pub struct WalFecRepairProducer {
 impl WalFecRepairProducer {
     /// Reserve bounded capacity BEFORE syncing the primary WAL. Dropping a
     /// permit after a failed fsync releases capacity without publishing work.
+    /// `Err(Busy)` means the queue is full; per the admission contract on
+    /// [`WalFecRepairPipelineConfig::queue_capacity`], callers defer admission
+    /// rather than refuse the write.
     pub fn try_reserve(&self) -> Result<WalFecRepairPermit<'_>> {
         if self.closing.load(Ordering::Acquire) || self.cancel_flag.load(Ordering::Acquire) {
             return Err(FrankenError::BackgroundWorkerFailed(
@@ -2366,7 +2381,46 @@ async fn run_repair_pipeline_worker<G: Send + Sync + 'static>(
             WalFecPipelineMessage::Shutdown => {}
         }
     }
+    if !state.cancel_flag.load(Ordering::Acquire) && worker_cx.checkpoint().is_ok() {
+        sync_wal_fec_sidecar_at_exit(&state.sidecar_cache, &region_task).await;
+    }
     state.log_summary(started, true);
+}
+
+/// Fsync the records that ranges since the last periodic sync appended (see
+/// [`CommittedRangeSidecar::finish_range`]), so a graceful shutdown leaves the
+/// sidecar durable. Best effort: after a crash, catch-up regenerates an
+/// unsynced tail from the durable WAL. `fsync` covers the file's data whatever
+/// descriptor wrote it.
+async fn sync_wal_fec_sidecar_at_exit<G: Send + Sync + 'static>(
+    sidecar_cache: &Mutex<Option<CommittedRangeSidecarCache>>,
+    region_task: &Arc<G>,
+) {
+    let path = match lock_unpoisoned(sidecar_cache).as_mut() {
+        Some(cache) if cache.unsynced_ranges != 0 => {
+            cache.unsynced_ranges = 0;
+            cache.path.clone()
+        }
+        _ => return,
+    };
+    let region_task = Arc::clone(region_task);
+    let outcome = spawn_blocking(move || {
+        // Retain region accounting until the sync finishes.
+        let _region_task = region_task;
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .and_then(|file| file.sync_data())
+    })
+    .await;
+    match outcome {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => warn!(
+            %error,
+            "WAL-FEC sidecar sync at worker exit failed; catch-up regenerates an unsynced tail"
+        ),
+    }
 }
 
 fn record_worker_failure(worker_failure: &Mutex<Option<String>>, detail: String) {
@@ -2639,7 +2693,7 @@ fn process_committed_wal_range(
             detail: "durable WAL-FEC interval ends before a commit marker".to_owned(),
         });
     }
-    sidecar.sync()?;
+    sidecar.finish_range()?;
     *lock_unpoisoned(sidecar_cache) = sidecar.into_cache()?;
     Ok(WalFecWorkOutcome::Completed)
 }
@@ -2708,6 +2762,8 @@ struct CommittedRangeSidecarCache {
     identity: (u64, u64),
     len: u64,
     present: HashMap<WalFecGroupId, WalFecGroupMeta>,
+    /// Ranges whose appended records are not yet fsynced.
+    unsynced_ranges: u32,
 }
 
 /// `(device, inode)` of the sidecar. Without one (non-Unix) nothing is reused.
@@ -2741,10 +2797,12 @@ struct CommittedRangeSidecar {
     /// Whether the sidecar did not exist or was empty (the first sync also
     /// syncs the parent directory).
     created: bool,
-    /// Append handle holding records not yet synced; [`Self::sync`] makes the
-    /// whole range durable with one `fdatasync`. An unsynced tail lost to a
-    /// crash is a truncated suffix, which the next catch-up replaces.
+    /// Append handle holding this range's records; [`Self::finish_range`]
+    /// closes it. An unsynced tail lost to a crash is a truncated suffix,
+    /// which the next catch-up replaces.
     output: Option<fs::File>,
+    /// Earlier ranges whose records are not yet fsynced.
+    unsynced_ranges: u32,
 }
 
 impl CommittedRangeSidecar {
@@ -2808,6 +2866,7 @@ impl CommittedRangeSidecar {
             present,
             created: len == 0,
             output: None,
+            unsynced_ranges: cached.unsynced_ranges,
         }))
     }
 
@@ -2849,14 +2908,15 @@ impl CommittedRangeSidecar {
                 .collect(),
             created: bytes.is_empty(),
             output: None,
+            unsynced_ranges: 0,
         })
     }
 
-    /// The group map to carry to the next range, taken after [`Self::sync`]
-    /// while the caller still holds the sidecar guard, so the recorded length
-    /// is exactly the records this map describes.
+    /// The group map to carry to the next range, taken after
+    /// [`Self::finish_range`] while the caller still holds the sidecar guard,
+    /// so the recorded length is exactly the records this map describes.
     fn into_cache(self) -> Result<Option<CommittedRangeSidecarCache>> {
-        debug_assert!(self.output.is_none(), "into_cache follows sync");
+        debug_assert!(self.output.is_none(), "into_cache follows finish_range");
         let metadata = match fs::metadata(&self.path) {
             Ok(metadata) => metadata,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -2869,6 +2929,7 @@ impl CommittedRangeSidecar {
                 identity,
                 len: metadata.len(),
                 present: self.present,
+                unsynced_ranges: self.unsynced_ranges,
             }),
         )
     }
@@ -2911,14 +2972,28 @@ impl CommittedRangeSidecar {
         Ok(())
     }
 
-    /// Make every group appended for this range durable.
-    fn sync(&mut self) -> Result<()> {
-        if let Some(output) = self.output.take() {
+    /// Close this range's appends, fsyncing them only periodically.
+    ///
+    /// The sidecar is auxiliary to the WAL, which the commit already made
+    /// durable. A crash that loses unsynced records leaves a truncated suffix,
+    /// or a damaged record that a scan treats the same way, and catch-up
+    /// regenerates those groups from the durable WAL frames. So records are
+    /// fsynced when the file is first created (with its directory entry),
+    /// every [`WAL_FEC_SIDECAR_SYNC_RANGES`] ranges, and when the worker
+    /// exits ([`sync_wal_fec_sidecar_at_exit`]), not once per commit: that
+    /// doubled the fsyncs of every `synchronous=FULL` commit (bd-wqmil).
+    fn finish_range(&mut self) -> Result<()> {
+        let Some(output) = self.output.take() else {
+            return Ok(());
+        };
+        self.unsynced_ranges = self.unsynced_ranges.saturating_add(1);
+        if self.created || self.unsynced_ranges >= WAL_FEC_SIDECAR_SYNC_RANGES {
             output.sync_data()?;
             if self.created {
                 sync_wal_fec_parent(&self.path)?;
                 self.created = false;
             }
+            self.unsynced_ranges = 0;
         }
         Ok(())
     }
@@ -2951,15 +3026,33 @@ fn generate_wal_fec_repair_symbols_inner(
     // Derive a deterministic group-level seed for the SystematicEncoder from
     // the group metadata (object_id, salts, frame range, k, r).
     let encoder_seed = derive_repair_seed(meta, 0);
-
-    let encoder = asupersync::raptorq::systematic::SystematicEncoder::new(
-        source_pages,
-        symbol_len,
-        encoder_seed,
-    )
-    .ok_or_else(|| FrankenError::WalCorrupt {
+    let singular = || FrankenError::WalCorrupt {
         detail: "RaptorQ constraint matrix singular during encoding".to_owned(),
-    })?;
+    };
+    let k = source_pages.len();
+    let encoder = if k.saturating_mul(4) <= symbol_len {
+        let first_esi = meta.k_source;
+        let repair_count = u32::try_from(r_repair).map_err(|_| FrankenError::WalCorrupt {
+            detail: format!("r_repair {r_repair} does not fit in u32"),
+        })?;
+        let esis = first_esi..first_esi.checked_add(repair_count).ok_or_else(|| {
+            FrankenError::WalCorrupt {
+                detail: "repair symbol ESI overflow".to_owned(),
+            }
+        })?;
+        WalFecRepairEncoder::Coefficients(
+            wal_fec_repair_coefficients(k, encoder_seed, esis).ok_or_else(singular)?,
+        )
+    } else {
+        WalFecRepairEncoder::Systematic(Box::new(
+            asupersync::raptorq::systematic::SystematicEncoder::new(
+                source_pages,
+                symbol_len,
+                encoder_seed,
+            )
+            .ok_or_else(singular)?,
+        ))
+    };
 
     let mut symbols = Vec::with_capacity(r_repair);
 
@@ -2986,7 +3079,22 @@ fn generate_wal_fec_repair_symbols_inner(
                 detail: "repair symbol ESI overflow".to_owned(),
             })?;
 
-        let payload = encoder.repair_symbol(esi);
+        let payload = match &encoder {
+            WalFecRepairEncoder::Systematic(encoder) => encoder.repair_symbol(esi),
+            WalFecRepairEncoder::Coefficients(rows) => {
+                let mut payload = vec![0_u8; symbol_len];
+                for (page, &coefficient) in source_pages.iter().zip(&rows[repair_index]) {
+                    if coefficient != 0 {
+                        asupersync::raptorq::gf256::gf256_addmul_slice(
+                            &mut payload,
+                            page,
+                            asupersync::raptorq::gf256::Gf256::new(coefficient),
+                        );
+                    }
+                }
+                payload
+            }
+        };
 
         if per_symbol_delay > Duration::ZERO {
             thread::sleep(per_symbol_delay);
@@ -3002,6 +3110,42 @@ fn generate_wal_fec_repair_symbols_inner(
     }
 
     Ok(Some(symbols))
+}
+
+/// How a group's repair symbols are computed. Both produce identical bytes.
+enum WalFecRepairEncoder {
+    /// Page-width systematic encoder, for groups with many source pages.
+    Systematic(Box<asupersync::raptorq::systematic::SystematicEncoder>),
+    /// One row of GF(256) source-page coefficients per repair symbol.
+    Coefficients(Vec<Vec<u8>>),
+}
+
+/// The coefficient of every source page in each repair symbol of `esis`.
+///
+/// The systematic encoder is linear in its source symbols for a fixed K and
+/// seed: elimination pivots on the constraint matrix alone, and a repair
+/// symbol is a sum of intermediate symbols. Encoding the K unit vectors of
+/// length K (source `j` has byte `j` set to 1) therefore yields, as repair
+/// symbol `esi`, the coefficient of each source page in that symbol. The solve
+/// works on K-byte rows instead of page-width rows, so a commit of a few pages
+/// costs a few microseconds of elimination instead of ~570 us (bd-wqmil). The
+/// combination is exact over GF(256): the symbols are byte-identical to the
+/// page-width encoder's, which `test_coefficient_repair_symbols_match_systematic_encoder`
+/// pins. Returns `None` when the constraint matrix is singular.
+fn wal_fec_repair_coefficients(
+    k: usize,
+    seed: u64,
+    esis: std::ops::Range<u32>,
+) -> Option<Vec<Vec<u8>>> {
+    let unit_sources: Vec<Vec<u8>> = (0..k)
+        .map(|j| {
+            let mut unit = vec![0_u8; k];
+            unit[j] = 1;
+            unit
+        })
+        .collect();
+    let encoder = asupersync::raptorq::systematic::SystematicEncoder::new(&unit_sources, k, seed)?;
+    Some(esis.map(|esi| encoder.repair_symbol(esi)).collect())
 }
 
 fn validate_source_pages(meta: &WalFecGroupMeta, source_pages: &[Vec<u8>]) -> Result<()> {
@@ -4845,6 +4989,60 @@ mod tests {
                     high: u64::from(i).wrapping_add(1),
                 })
                 .collect(),
+        }
+    }
+
+    /// bd-wqmil: the coefficient path must emit exactly the page-width
+    /// encoder's repair symbols (the decoder and existing sidecars depend on
+    /// them), on both sides of the path-selection threshold.
+    #[test]
+    fn test_coefficient_repair_symbols_match_systematic_encoder() {
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next_byte = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state.to_le_bytes()[3]
+        };
+        for (k, page_size, r_repair) in [
+            (1_u32, 4096_u32, 2_u32),
+            (2, 4096, 1),
+            (3, 4096, 4),
+            (4, 4096, 2),
+            (7, 4096, 3),
+            (16, 4096, 2),
+            (64, 1024, 2),
+            (128, 512, 2),
+            (129, 512, 2),
+            (200, 512, 3),
+        ] {
+            let mut init = make_test_init(k);
+            init.page_size = page_size;
+            init.r_repair = r_repair;
+            init.oti.f = u64::from(k) * u64::from(page_size);
+            init.oti.t = page_size;
+            let pages: Vec<Vec<u8>> = (0..k)
+                .map(|_| (0..page_size).map(|_| next_byte()).collect())
+                .collect();
+            init.source_page_xxh3_128 = build_source_page_hashes(&pages);
+            let meta = WalFecGroupMeta::from_init(init).expect("meta");
+            let encoder = asupersync::raptorq::systematic::SystematicEncoder::new(
+                &pages,
+                page_size as usize,
+                derive_repair_seed(&meta, 0),
+            )
+            .expect("page-width encoder");
+            let symbols = generate_wal_fec_repair_symbols(&meta, &pages).expect("repair symbols");
+            assert_eq!(symbols.len(), r_repair as usize);
+            for (index, symbol) in symbols.iter().enumerate() {
+                let esi = k + u32::try_from(index).unwrap();
+                assert_eq!(symbol.esi, esi);
+                assert_eq!(
+                    symbol.symbol_data,
+                    encoder.repair_symbol(esi),
+                    "k={k} page_size={page_size} esi={esi}"
+                );
+            }
         }
     }
 

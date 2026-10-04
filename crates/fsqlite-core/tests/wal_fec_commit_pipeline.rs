@@ -186,9 +186,19 @@ fn full_repair_queue_defers_admission_instead_of_refusing_writes() {
         }
         assert_eq!(conn.query("SELECT COUNT(*) FROM t;").await.unwrap()[0].values(), &[SqliteValue::Integer(150)]);
         drop(guard);
-        // Close drains the queued work; restart catch-up admits the deferred
-        // frames, and the next commit is repaired with them.
+        // Close drains the queued work, then admits the deferred durable tail,
+        // so the deferral ends at close rather than at the next open.
         conn.close_without_checkpoint().await.unwrap();
+        let wal = wal_path(&db);
+        let bytes = fs::read(&wal).unwrap();
+        let header = WalHeader::from_bytes(&bytes).unwrap();
+        let last = u32::try_from((bytes.len() - 32) / (24 + header.page_size as usize)).unwrap();
+        let covered = scan_wal_fec(&sidecar).unwrap().groups.iter()
+            .filter(|group| (group.meta.wal_salt1, group.meta.wal_salt2) == (header.salts.salt1, header.salts.salt2))
+            .map(|group| group.meta.end_frame_no)
+            .max()
+            .unwrap_or(0);
+        assert_eq!(covered, last, "close left deferred durable frames unrepaired");
         let conn = open(&db).await;
         conn.execute("INSERT INTO t VALUES (151);").await.unwrap();
         wait_for_last_group(&db).await;

@@ -25775,6 +25775,22 @@ impl Connection {
         );
 
         #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+        if let Some(pipeline) = self.wal_fec_pipeline.get_mut().as_ref()
+            && let Some(producer) = pipeline.producer()
+        {
+            // A full repair queue defers a durable commit's admission instead
+            // of refusing the write (bd-jyeus). Bound that deferral at close:
+            // once the worker has drained, admit the deferred durable tail so
+            // it is repaired now rather than by the next open's catch-up.
+            // Frames a NORMAL-sync commit has not yet fsynced stay with
+            // catch-up, exactly as when no admission was deferred.
+            if pipeline.flush(&cx, Duration::from_secs(30)).await
+                && let Err(error) = self.pager.set_wal_fec_producer(&cx, Some(producer)).await
+            {
+                tracing::warn!(%error, "WAL-FEC close-time admission failed; restart catch-up covers the tail");
+            }
+        }
+        #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
         if self.wal_fec_pipeline.get_mut().is_some() {
             // Close-time checkpointing can perform another WAL sync. Remove
             // admission before stopping the worker so that sync cannot address
