@@ -75890,6 +75890,14 @@ impl Connection {
         result
     }
 
+    /// The library version the last writer stamped at header offset 96
+    /// (bd-6jf9o: the first-open migration pass only targets databases a
+    /// FrankenSQLite build wrote).
+    pub(crate) async fn last_writer_sqlite_version(&self) -> Result<u32> {
+        let cx = self.op_cx()?;
+        Ok(self.current_database_header(&cx).await?.sqlite_version)
+    }
+
     pub(crate) async fn validate_database_integrity(&self, quick: bool) -> Result<()> {
         // GH#113: when a write transaction is active, `with_integrity_txn`
         // reuses it, so the integrity walk reads uncommitted btree pages. But
