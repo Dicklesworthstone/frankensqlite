@@ -27884,7 +27884,7 @@ impl Connection {
         // it first so a stale wrapper cannot resurrect uncommitted writes.
         self.settle_pending_transaction_cleanup().await?;
         let cx = self.op_cx_after_background_status();
-        self.execute_commit_with_cx(&cx).await
+        self.execute_commit_with_attached_participants(&cx).await
     }
 
     /// Roll back the active transaction without reparsing a `ROLLBACK` statement.
@@ -41025,12 +41025,7 @@ impl Connection {
                 Ok(Vec::new())
             }
             Statement::Commit => {
-                Box::pin(self.execute_commit_with_cx(cx)).await?;
-                // GH#244: once the main transaction is durably committed, commit
-                // any attached participants enrolled during it (no-op when none,
-                // so the normal path is unaffected). On a main-commit Err the `?`
-                // above returns early, correctly leaving children mid-txn.
-                Box::pin(self.commit_attached_participants(cx)).await?;
+                Box::pin(self.execute_commit_with_attached_participants(cx)).await?;
                 Ok(Vec::new())
             }
             Statement::Rollback(rb) => {
@@ -73535,6 +73530,18 @@ impl Connection {
         }
     }
 
+    /// Commit the main transaction, then every attached child enrolled in it
+    /// (GH#244). Every way of ending the outer transaction with a commit goes
+    /// through here: `COMMIT`, `commit_transaction()`, and `RELEASE` of the
+    /// savepoint that implicitly began the transaction. Committing main alone
+    /// left an enrolled child's transaction open, so its writes vanished at the
+    /// next ROLLBACK. On a main-commit error the children stay mid-transaction,
+    /// as the error leaves main.
+    async fn execute_commit_with_attached_participants(&self, cx: &Cx) -> Result<()> {
+        Box::pin(self.execute_commit_with_cx(cx)).await?;
+        Box::pin(self.commit_attached_participants(cx)).await
+    }
+
     async fn execute_commit_with_cx(&self, cx: &Cx) -> Result<()> {
         if !self.in_transaction.get() {
             if self.retained_autocommit_txn.borrow().is_some() {
@@ -74794,9 +74801,10 @@ impl Connection {
         // If this is the outermost savepoint of an implicit transaction,
         // RELEASE behaves like COMMIT.  Delegate directly to execute_commit
         // without calling pager release_savepoint first — this avoids leaving
-        // the pager savepoint stack out of sync if the commit fails.
+        // the pager savepoint stack out of sync if the commit fails. The commit
+        // includes attached participants, exactly as COMMIT does.
         if idx == 0 && self.implicit_txn.get() {
-            return self.execute_commit_with_cx(cx).await;
+            return self.execute_commit_with_attached_participants(cx).await;
         }
 
         let pager_release_result = {
@@ -74843,8 +74851,9 @@ impl Connection {
         drop(savepoints);
         self.txn_metrics_set_savepoint_depth(depth);
         // bd-qahvh: RELEASE fans out to enrolled participants. The idx==0 implicit
-        // RELEASE-as-COMMIT above already delegated to execute_commit_with_cx
-        // (which fans out the commit), so this covers only the non-commit release.
+        // RELEASE-as-COMMIT above already committed them through
+        // execute_commit_with_attached_participants, so this covers only the
+        // non-commit release.
         // `Box::pin` breaks the async recursion; no-op when none are enrolled.
         Box::pin(self.release_attached_participants(cx, name)).await?;
         Ok(())

@@ -1,4 +1,4 @@
-//! Keepers for one `:memory:` bug found by the
+//! Keepers for two `:memory:` / attached-database bugs found by the
 //! `memory_mirror_snapshot_differential` review, all present before
 //! fc1f6a537:
 //!
@@ -11,6 +11,9 @@
 //!   of such a page then corrupted data. A rollback that rewound `next_page`
 //!   also left those above-db_size pages on the freelist, so once the freelist
 //!   was used one page could be granted twice.
+//! - RELEASE of the savepoint that implicitly began a transaction, and the
+//!   public `commit_transaction()`, committed main but left an enrolled attached
+//!   database's transaction open, so its writes vanished at the next ROLLBACK.
 
 use fsqlite_core::connection::{Connection, Row};
 use fsqlite_types::value::SqliteValue;
@@ -254,5 +257,97 @@ fn ddl_in_explicit_transaction_then_failed_statement_keeps_roots_off_freelist() 
             one_int(&conn, "SELECT count(*) FROM t WHERE a > ''").await,
             300
         );
+    });
+}
+
+/// RELEASE of the savepoint that began the transaction commits attached
+/// participants too: a later `BEGIN; ROLLBACK` must not discard their rows.
+/// Same for the public `commit_transaction()`. Both attached kinds.
+#[test]
+fn implicit_release_and_commit_transaction_commit_attached_participants() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("aux.db");
+        for target in [":memory:".to_owned(), file.to_string_lossy().into_owned()] {
+            let conn = Connection::open(":memory:").await.expect("open");
+            conn.execute("CREATE TABLE m(x)").await.expect("main table");
+            conn.execute(&format!("ATTACH '{target}' AS aux"))
+                .await
+                .expect("attach");
+            conn.execute("CREATE TABLE aux.t(id INTEGER PRIMARY KEY, a)")
+                .await
+                .expect("aux table");
+
+            conn.execute("SAVEPOINT s").await.expect("savepoint");
+            conn.execute("INSERT INTO aux.t VALUES (16, 1)")
+                .await
+                .expect("aux insert");
+            conn.execute("INSERT INTO m VALUES (1)")
+                .await
+                .expect("main insert");
+            conn.execute("RELEASE s").await.expect("release");
+            conn.execute("BEGIN").await.expect("begin");
+            conn.execute("ROLLBACK").await.expect("rollback");
+            assert_eq!(
+                one_int(&conn, "SELECT count(*) FROM aux.t").await,
+                1,
+                "{target}: RELEASE-as-COMMIT lost the attached row"
+            );
+
+            conn.begin_transaction().await.expect("begin api");
+            conn.execute("INSERT INTO aux.t VALUES (17, 1)")
+                .await
+                .expect("aux insert");
+            conn.commit_transaction().await.expect("commit api");
+            conn.execute("BEGIN").await.expect("begin");
+            conn.execute("ROLLBACK").await.expect("rollback");
+            assert_eq!(
+                render(
+                    &conn
+                        .query("SELECT id FROM aux.t ORDER BY id")
+                        .await
+                        .expect("rows")
+                ),
+                vec![vec!["16".to_owned()], vec!["17".to_owned()]],
+                "{target}: commit_transaction() lost the attached row"
+            );
+
+            // Nested savepoints with a partial rollback still match stock.
+            conn.execute("SAVEPOINT a").await.expect("savepoint a");
+            conn.execute("INSERT INTO m VALUES (2)")
+                .await
+                .expect("m insert");
+            conn.execute("SAVEPOINT b").await.expect("savepoint b");
+            conn.execute("INSERT INTO aux.t VALUES (18, 1)")
+                .await
+                .expect("aux insert");
+            conn.execute("RELEASE b").await.expect("release b");
+            conn.execute("ROLLBACK TO a").await.expect("rollback to a");
+            conn.execute("INSERT INTO aux.t VALUES (19, 1)")
+                .await
+                .expect("aux insert");
+            conn.execute("RELEASE a").await.expect("release a");
+            conn.execute("BEGIN").await.expect("begin");
+            conn.execute("ROLLBACK").await.expect("rollback");
+            assert_eq!(
+                render(
+                    &conn
+                        .query("SELECT id FROM aux.t ORDER BY id")
+                        .await
+                        .expect("rows")
+                ),
+                vec![
+                    vec!["16".to_owned()],
+                    vec!["17".to_owned()],
+                    vec!["19".to_owned()]
+                ],
+                "{target}: nested savepoints"
+            );
+            assert_eq!(
+                one_int(&conn, "SELECT count(*) FROM m").await,
+                1,
+                "{target}"
+            );
+        }
     });
 }
