@@ -8436,18 +8436,21 @@ impl<'conn> PreparedStatement<'conn> {
     /// True when the `SchemaChanged` this statement raised is answered by
     /// re-preparing, as `sqlite3_prepare_v2` does: a schema change made on this
     /// connection (GH #239), or (bd-9zuif) a schema cookie another connection
-    /// committed, seen while this connection has no explicit transaction open.
-    /// Such a statement starts from the committed schema anyway, so recompiling
-    /// against it is what stock's `sqlite3_step` does.
+    /// committed that this connection has since loaded. Recompiling against the
+    /// connection's current schema is what stock's `sqlite3_step` does.
     ///
-    /// Inside an explicit transaction a cross-connection change keeps
-    /// `SchemaChanged`: the transaction has already read under the old schema.
-    /// So does a function, collation or module redefinition, which leaves the
-    /// cookie alone.
+    /// That holds inside an explicit transaction too. A transaction never loads
+    /// a peer's schema mid-flight (`committed_pager_refresh_allowed` is false
+    /// while one is active), so a cookie the statement does not match was
+    /// loaded at or before the transaction began, and every other statement in
+    /// the transaction compiles against it. Refusing there left a handle
+    /// prepared before a peer's DDL failing in every later transaction.
+    ///
+    /// A function, collation or module redefinition, which leaves the cookie
+    /// alone, keeps `SchemaChanged`.
     fn schema_change_is_reprepareable(&self) -> bool {
         self.schema_change_is_same_connection()
-            || (!self.conn.in_transaction()
-                && self.conn.function_registry_generation() == self.function_registry_generation
+            || (self.conn.function_registry_generation() == self.function_registry_generation
                 && self.conn.schema_cookie() != self.schema_cookie)
     }
 
@@ -244511,10 +244514,12 @@ mod pager_routing_tests {
         });
     }
 
+    /// bd-9zuif: a statement prepared before another connection's DDL
+    /// re-prepares against the new schema and runs, as `sqlite3_prepare_v2`
+    /// statements do, instead of failing with `SchemaChanged`.
     #[test]
-    fn test_prepared_select_rejects_cross_connection_schema_change() {
+    fn test_prepared_select_reprepares_after_cross_connection_schema_change() {
         asupersync::test_utils::run_test(|| async {
-            let _profile_guard = StatementReuseHotPathProfileGuard::new();
             let dir = tempfile::tempdir().unwrap();
             let db_path = dir.path().join("prepared_schema_cross_select.db");
             let db = db_path.to_string_lossy().into_owned();
@@ -244539,43 +244544,19 @@ mod pager_routing_tests {
                 .await
                 .unwrap();
 
-            reset_hot_path_profile();
-            let err = stmt
+            let rows = stmt
                 .query()
                 .await
-                .expect_err("cross-connection DDL must invalidate prepared SELECT");
-            assert!(matches!(err, FrankenError::SchemaChanged));
-            let profile = hot_path_profile_snapshot();
-            // A cross-connection DDL bumps the persisted schema cookie. The prepared
-            // statement detects the mismatch via the cheap schema-identity
-            // (cookie/generation) comparison and rejects with SchemaChanged BEFORE
-            // doing any prepared-schema refresh work — it never needs to reload or
-            // re-decode sqlite_master to know the cached plan is stale. This is
-            // strictly cheaper than the historical "full reload, then invalidate"
-            // path and is the behavior that matters: the stale plan is rejected, not
-            // silently executed.
-            assert_eq!(
-                profile.prepared_schema_lightweight_refreshes, 0,
-                "cross-connection DDL rejection must not run the lightweight prepared refresh path: {profile:?}"
-            );
-            assert_eq!(
-                profile.prepared_schema_full_reloads, 0,
-                "cross-connection DDL is caught by the cheap schema-identity check, with no full sqlite_master reload: {profile:?}"
-            );
-            assert_eq!(
-                profile
-                    .record_decode
-                    .callsite_breakdown
-                    .core_connection
-                    .parse_record_calls,
-                0,
-                "rejecting a stale prepared SELECT must not re-decode sqlite_master rows: {profile:?}"
-            );
+                .expect("cross-connection DDL must re-prepare the prepared SELECT");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].values()[0], SqliteValue::Text("alpha".into()));
         });
     }
 
+    /// bd-9zuif: the DML counterpart of
+    /// `test_prepared_select_reprepares_after_cross_connection_schema_change`.
     #[test]
-    fn test_prepared_dml_rejects_cross_connection_schema_change() {
+    fn test_prepared_dml_reprepares_after_cross_connection_schema_change() {
         asupersync::test_utils::run_test(|| async {
             let dir = tempfile::tempdir().unwrap();
             let db_path = dir.path().join("prepared_schema_cross_dml.db");
@@ -244597,17 +244578,17 @@ mod pager_routing_tests {
                 .await
                 .unwrap();
 
-            let err = stmt
+            let affected = stmt
                 .execute_with_params(&[SqliteValue::Integer(1), SqliteValue::Text("alpha".into())])
                 .await
-                .expect_err("cross-connection DDL must invalidate prepared DML");
-            assert!(matches!(err, FrankenError::SchemaChanged));
+                .expect("cross-connection DDL must re-prepare the prepared DML");
+            assert_eq!(affected, 1);
 
             let rows = conn1
                 .query("SELECT COUNT(*) FROM prep_schema_dml;")
                 .await
                 .unwrap();
-            assert_eq!(rows[0].values()[0], SqliteValue::Integer(0));
+            assert_eq!(rows[0].values()[0], SqliteValue::Integer(1));
         });
     }
 

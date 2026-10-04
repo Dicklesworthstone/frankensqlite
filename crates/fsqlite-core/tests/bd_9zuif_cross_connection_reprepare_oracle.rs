@@ -11,9 +11,10 @@
 //! file-backed database with two FrankenSQLite connections and, separately,
 //! two rusqlite connections, and the results must agree.
 //!
-//! Inside an explicit transaction a cross-connection schema change still
-//! surfaces `SchemaChanged` (the transaction already read under the old
-//! schema); the statement re-prepares once the transaction ends.
+//! Inside an explicit transaction the statement re-prepares too, against the
+//! schema the transaction reads: a peer's DDL that commits mid-transaction is
+//! not loaded until the transaction ends, so the statement keeps reading the
+//! transaction's snapshot; one that landed before BEGIN is re-prepared for.
 
 use fsqlite_core::connection::Connection;
 use fsqlite_error::FrankenError;
@@ -248,7 +249,9 @@ async fn run_scenario(scenario: &Scenario, failures: &mut Vec<String>) {
             .await
             .map(|rows| rows.iter().map(|row| row.values().to_vec()).collect())
             .map_err(|e| frank_error_text(&e));
-        let mut check_stmt = stock_b.prepare(scenario.check).expect("stock check prepare");
+        let mut check_stmt = stock_b
+            .prepare(scenario.check)
+            .expect("stock check prepare");
         let stock_check = stock_query(&mut check_stmt, &[]);
         if !outcomes_agree(&frank_check, &stock_check) {
             failures.push(format!(
@@ -364,11 +367,12 @@ fn every_prepared_entry_point_reprepares_after_cross_connection_ddl() {
     });
 }
 
-/// Inside an explicit transaction the cross-connection change still reports
-/// `SchemaChanged` (and does not spin); after the transaction ends the same
-/// statement re-prepares.
+/// A peer's DDL that commits while this connection's explicit transaction is
+/// open is not loaded until the transaction ends: the statement keeps reading
+/// the transaction's snapshot (and does not spin); after the transaction ends
+/// the same statement re-prepares.
 #[test]
-fn explicit_transaction_keeps_schema_changed_then_reprepares_after_commit() {
+fn explicit_transaction_reads_its_snapshot_then_reprepares_after_commit() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("txn.db");
@@ -393,9 +397,8 @@ fn explicit_transaction_keeps_schema_changed_then_reprepares_after_commit() {
         a.execute("ALTER TABLE t ADD COLUMN c").await.expect("ddl");
         let in_txn = stmt.query_with_params(&[SqliteValue::Integer(1)]).await;
         assert!(
-            matches!(&in_txn, Ok(rows) if rows.len() == 1)
-                || matches!(in_txn, Err(FrankenError::SchemaChanged)),
-            "in-transaction outcome must be the old snapshot or SchemaChanged: {in_txn:?}"
+            matches!(&in_txn, Ok(rows) if rows.len() == 1 && rows[0].values() == [SqliteValue::from("x")]),
+            "in-transaction outcome must be the transaction's snapshot: {in_txn:?}"
         );
         b.execute("COMMIT").await.expect("commit");
         let rows = stmt
@@ -404,5 +407,73 @@ fn explicit_transaction_keeps_schema_changed_then_reprepares_after_commit() {
             .expect("re-prepares after the transaction");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values(), &[SqliteValue::from("x")]);
+    });
+}
+
+/// A statement prepared before a peer's DDL, first executed inside a
+/// transaction that began after the DDL, re-prepares there, as stock does
+/// (review of a5bc1e3c4). Refusing it left the handle failing with
+/// `SchemaChanged` in every later transaction.
+#[test]
+fn statement_prepared_before_peer_ddl_reprepares_inside_a_later_transaction() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("later-txn.db");
+        let path = path.to_str().expect("utf-8").to_owned();
+        let a = Connection::open(&path).await.expect("open a");
+        a.execute_batch(
+            "CREATE TABLE t(a INTEGER PRIMARY KEY, b); INSERT INTO t VALUES (1, 'x'), (2, 'y');",
+        )
+        .await
+        .expect("setup");
+        let b = Connection::open(&path).await.expect("open b");
+        let select = b
+            .prepare("SELECT * FROM t WHERE a = ?1")
+            .await
+            .expect("prep select");
+        let update = b
+            .prepare("UPDATE t SET b = b || '!' WHERE a = ?1")
+            .await
+            .expect("prep update");
+        a.execute_batch("ALTER TABLE t ADD COLUMN c DEFAULT 7; CREATE INDEX t_b ON t(b);")
+            .await
+            .expect("ddl");
+
+        // Same shape on stock: the statements re-prepare inside the
+        // transaction and `SELECT *` widens.
+        let stock_dir = tempfile::tempdir().expect("temp dir");
+        let stock_path = stock_dir.path().join("later-txn.db");
+        let sa = rusqlite::Connection::open(&stock_path).expect("stock a");
+        sa.execute_batch(
+            "CREATE TABLE t(a INTEGER PRIMARY KEY, b); INSERT INTO t VALUES (1, 'x'), (2, 'y');",
+        )
+        .expect("stock setup");
+        let sb = rusqlite::Connection::open(&stock_path).expect("stock b");
+        let mut stock_select = sb
+            .prepare("SELECT * FROM t WHERE a = ?1")
+            .expect("stock prep");
+        let mut stock_update = sb
+            .prepare("UPDATE t SET b = b || '!' WHERE a = ?1")
+            .expect("stock prep update");
+        sa.execute_batch("ALTER TABLE t ADD COLUMN c DEFAULT 7; CREATE INDEX t_b ON t(b);")
+            .expect("stock ddl");
+        sb.execute_batch("BEGIN").expect("stock begin");
+        let stock_changed = stock_update.execute([1]).expect("stock update");
+        let stock_rows = stock_query(&mut stock_select, &[SqliteValue::Integer(1)]).expect("stock");
+        sb.execute_batch("COMMIT").expect("stock commit");
+
+        b.execute("BEGIN").await.expect("begin");
+        let changed = update
+            .execute_with_params(&[SqliteValue::Integer(1)])
+            .await
+            .expect("update re-prepares inside the transaction");
+        let rows = select
+            .query_with_params(&[SqliteValue::Integer(1)])
+            .await
+            .expect("select re-prepares inside the transaction");
+        b.execute("COMMIT").await.expect("commit");
+        assert_eq!(changed, stock_changed);
+        let rows: Vec<Vec<SqliteValue>> = rows.iter().map(|row| row.values().to_vec()).collect();
+        assert_eq!(rows, stock_rows);
     });
 }
