@@ -925,7 +925,11 @@ pub struct DatabaseHeader {
     pub freelist_count: u32,
     /// Schema cookie (incremented on schema changes).
     pub schema_cookie: u32,
-    /// Schema format number (currently 4).
+    /// Schema format number: 4, or 0 while the schema is empty.
+    ///
+    /// Stock SQLite leaves this 0 until the first CREATE TABLE / VIEW /
+    /// VIRTUAL TABLE, then stamps its default format 4 (bd-25au0). The legacy
+    /// formats 1..=3 are not supported.
     pub schema_format: u32,
     /// Persistent suggested default page-cache size, from an explicit
     /// `PRAGMA default_cache_size` (header bytes 48..52, big-endian `i32`).
@@ -942,6 +946,14 @@ pub struct DatabaseHeader {
     pub largest_root_page: u32,
     /// Database text encoding (1=UTF8, 2=UTF16le, 3=UTF16be).
     pub text_encoding: TextEncoding,
+    /// The on-disk encoding field is 0 ("not yet chosen").
+    ///
+    /// Stock SQLite writes 0 until the first schema object is created, e.g.
+    /// for a file that only ever saw `PRAGMA user_version`. Such a file reads
+    /// as UTF-8 ([`Self::text_encoding`]) and re-encodes as 0, so the header
+    /// round-trips byte-for-byte until the first DDL stamps an encoding
+    /// (bd-25au0).
+    pub text_encoding_unset: bool,
     /// User version (from `PRAGMA user_version`).
     pub user_version: u32,
     /// Non-zero for incremental vacuum mode.
@@ -1007,6 +1019,7 @@ impl Default for DatabaseHeader {
             default_cache_size: 0,
             largest_root_page: 0,
             text_encoding: TextEncoding::Utf8,
+            text_encoding_unset: false,
             user_version: 0,
             incremental_vacuum: 0,
             application_id: 0,
@@ -1196,9 +1209,10 @@ impl DatabaseHeader {
         let schema_cookie = encoding::read_u32_be(&buf[40..44]).expect("fixed u32 field");
         let schema_format = encoding::read_u32_be(&buf[44..48]).expect("fixed u32 field");
 
-        // This project intentionally does not support legacy schema formats.
-        // See README: "What We Deliberately Exclude".
-        if schema_format != 4 {
+        // This project intentionally does not support the legacy schema formats
+        // 1..=3 (see README: "What We Deliberately Exclude"). 0 is not legacy:
+        // stock writes it while the schema is empty (bd-25au0).
+        if schema_format != 4 && schema_format != 0 {
             return Err(DatabaseHeaderError::InvalidSchemaFormat { raw: schema_format });
         }
 
@@ -1206,8 +1220,11 @@ impl DatabaseHeader {
         let largest_root_page = encoding::read_u32_be(&buf[52..56]).expect("fixed u32 field");
 
         let text_encoding_raw = encoding::read_u32_be(&buf[56..60]).expect("fixed u32 field");
+        let text_encoding_unset = text_encoding_raw == 0;
         let text_encoding = match text_encoding_raw {
-            1 => TextEncoding::Utf8,
+            // Stock leaves 0 until the first schema object exists; the file
+            // holds no text yet, and SQLite's default encoding is UTF-8.
+            0 | 1 => TextEncoding::Utf8,
             2 => TextEncoding::Utf16le,
             3 => TextEncoding::Utf16be,
             _ => {
@@ -1259,6 +1276,7 @@ impl DatabaseHeader {
             default_cache_size,
             largest_root_page,
             text_encoding,
+            text_encoding_unset,
             user_version,
             incremental_vacuum,
             application_id,
@@ -1320,7 +1338,7 @@ impl DatabaseHeader {
         out: &mut [u8; DATABASE_HEADER_SIZE],
     ) -> Result<(), DatabaseHeaderError> {
         // Validate invariants we rely on for interoperability.
-        if self.schema_format != 4 {
+        if self.schema_format != 4 && self.schema_format != 0 {
             return Err(DatabaseHeaderError::InvalidSchemaFormat {
                 raw: self.schema_format,
             });
@@ -1368,6 +1386,9 @@ impl DatabaseHeader {
         encoding::write_u32_be(&mut out[52..56], self.largest_root_page).expect("fixed u32 field");
 
         let text_encoding_u32 = match self.text_encoding {
+            // An unset field re-encodes as 0 only while the encoding is still
+            // the UTF-8 default; a UTF-16 encoding is always written out.
+            TextEncoding::Utf8 if self.text_encoding_unset => 0u32,
             TextEncoding::Utf8 => 1u32,
             TextEncoding::Utf16le => 2u32,
             TextEncoding::Utf16be => 3u32,
@@ -2290,6 +2311,7 @@ mod tests {
             default_cache_size: -2000,
             largest_root_page: 0,
             text_encoding: TextEncoding::Utf8,
+            text_encoding_unset: false,
             user_version: 0,
             incremental_vacuum: 0,
             application_id: 0,
@@ -2837,12 +2859,47 @@ mod tests {
             DatabaseHeaderError::InvalidTextEncoding { raw: 4 }
         ));
 
-        buf[56..60].copy_from_slice(&0u32.to_be_bytes());
+        buf[56..60].copy_from_slice(&5u32.to_be_bytes());
         let err = DatabaseHeader::from_bytes(&buf).unwrap_err();
         assert!(matches!(
             err,
-            DatabaseHeaderError::InvalidTextEncoding { raw: 0 }
+            DatabaseHeaderError::InvalidTextEncoding { raw: 5 }
         ));
+    }
+
+    /// bd-25au0: stock SQLite writes schema format 0 and text encoding 0 while
+    /// the schema is empty (e.g. a file that only saw `PRAGMA user_version`).
+    /// Both parse, read as UTF-8, and re-encode byte-for-byte. The legacy
+    /// formats 1..=3 stay refused.
+    #[test]
+    fn test_header_empty_schema_format_and_encoding_zero_round_trip() {
+        let mut buf = make_header_for_tests().to_bytes().unwrap();
+        buf[44..48].copy_from_slice(&0u32.to_be_bytes());
+        buf[56..60].copy_from_slice(&0u32.to_be_bytes());
+        let parsed = DatabaseHeader::from_bytes(&buf).unwrap();
+        assert_eq!(parsed.schema_format, 0);
+        assert_eq!(parsed.text_encoding, TextEncoding::Utf8);
+        assert!(parsed.text_encoding_unset);
+        assert_eq!(parsed.to_bytes().unwrap(), buf);
+
+        let mut stamped = parsed;
+        stamped.schema_format = 4;
+        stamped.text_encoding_unset = false;
+        let stamped_bytes = stamped.to_bytes().unwrap();
+        assert_eq!(&stamped_bytes[44..48], &4u32.to_be_bytes());
+        assert_eq!(&stamped_bytes[56..60], &1u32.to_be_bytes());
+
+        let mut utf16 = DatabaseHeader::from_bytes(&buf).unwrap();
+        utf16.text_encoding = TextEncoding::Utf16le;
+        assert_eq!(&utf16.to_bytes().unwrap()[56..60], &2u32.to_be_bytes());
+
+        for legacy in 1u32..=3 {
+            buf[44..48].copy_from_slice(&legacy.to_be_bytes());
+            assert!(matches!(
+                DatabaseHeader::from_bytes(&buf).unwrap_err(),
+                DatabaseHeaderError::InvalidSchemaFormat { raw } if raw == legacy
+            ));
+        }
     }
 
     #[test]
@@ -2951,7 +3008,7 @@ mod tests {
                 max_supported: 2,
             },
             DatabaseHeaderError::InvalidTextEncoding { raw: 4 },
-            DatabaseHeaderError::InvalidSchemaFormat { raw: 0 },
+            DatabaseHeaderError::InvalidSchemaFormat { raw: 2 },
         ];
 
         let displays: Vec<String> = errors

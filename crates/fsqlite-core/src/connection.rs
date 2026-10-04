@@ -98090,6 +98090,13 @@ impl Connection {
                 .map_err(|e| FrankenError::internal(format!("invalid database header: {e}")))?;
             if let Some(cookie) = schema_cookie {
                 header.schema_cookie = cookie;
+                // bd-25au0: stock leaves schema format and encoding 0 while the
+                // schema is empty, and stamps format 4 plus the database
+                // encoding when the first schema object is created.
+                if header.schema_format == 0 {
+                    header.schema_format = 4;
+                }
+                header.text_encoding_unset = false;
             }
             if let Some(version) = user_version {
                 header.user_version = version;
@@ -98102,6 +98109,7 @@ impl Connection {
             }
             if let Some(enc) = text_encoding {
                 header.text_encoding = enc;
+                header.text_encoding_unset = false;
             }
             let encoded = header
                 .to_bytes()
@@ -223526,14 +223534,13 @@ fts5(title, body, content=docs, content_rowid=id)'
             let file_bytes = std::fs::read(&db_path).unwrap();
             let mut header_bytes = [0_u8; fsqlite_types::DATABASE_HEADER_SIZE];
             header_bytes.copy_from_slice(&file_bytes[..fsqlite_types::DATABASE_HEADER_SIZE]);
-            let header_err = DatabaseHeader::from_bytes(&header_bytes)
-                .expect_err("main-file header should still be stale while WAL owns page 1");
-            assert!(
-                matches!(
-                    header_err,
-                    fsqlite_types::DatabaseHeaderError::InvalidSchemaFormat { raw: 0 }
-                ),
-                "unexpected stale main-file header error: {header_err:?}"
+            // bd-25au0: the stale bootstrap stub carries stock's empty-schema
+            // stamp (schema format 0), which parses; the WAL still owns page 1.
+            let stale_header = DatabaseHeader::from_bytes(&header_bytes)
+                .expect("stock's empty-schema bootstrap header parses");
+            assert_eq!(
+                stale_header.schema_format, 0,
+                "main-file header should still be the stale bootstrap stub while WAL owns page 1"
             );
 
             let conn = Connection::open(db_str).await.expect(

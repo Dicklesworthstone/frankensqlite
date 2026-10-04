@@ -9799,21 +9799,16 @@ impl<F: VfsFile> PagerInner<F> {
         } else {
             let base_header_bytes = self.read_database_file_header_bytes(cx, file_size).await?;
             let raw_base_change_counter = if self.journal_mode == JournalMode::Wal {
-                match DatabaseHeader::from_bytes(&base_header_bytes) {
-                    Ok(base_header) => base_header.change_counter,
-                    Err(error) => u32::try_from(
-                        stale_main_header_change_counter_under_wal(&base_header_bytes, &error)
-                            .ok_or_else(|| {
-                                map_database_header_error(
-                                    &error,
-                                    "invalid database-file header during WAL refresh",
-                                )
-                            })?,
-                    )
-                    .map_err(|_| {
-                        FrankenError::internal("stale WAL header change counter did not fit u32")
-                    })?,
-                }
+                // A stock bootstrap stub (schema format / encoding 0) parses,
+                // so its change counter is read like any stale main header.
+                DatabaseHeader::from_bytes(&base_header_bytes)
+                    .map_err(|error| {
+                        map_database_header_error(
+                            &error,
+                            "invalid database-file header during WAL refresh",
+                        )
+                    })?
+                    .change_counter
             } else {
                 DatabaseHeader::from_bytes(&base_header_bytes)
                     .map_err(|error| {
@@ -14094,11 +14089,9 @@ fn page_size_from_header_bytes(header_bytes: &[u8; DATABASE_HEADER_SIZE]) -> Opt
 /// genuinely damaged header. Every other header error is corruption, reported
 /// with the caller's `context` for provenance (`"{context}: {error}"`).
 ///
-/// NewerFormat is never WAL-stale-recoverable (see
-/// [`stale_main_header_is_wal_recoverable_error`]), so it always reaches the
-/// mapping fallback at every open/refresh site; routing that fallback through
-/// this helper is sufficient to surface it without disturbing stale-header
-/// recovery.
+/// Stale live-WAL bootstrap stubs parse cleanly (bd-25au0) and are recognized
+/// from their bytes (see [`stale_main_header_can_be_recovered_from_live_wal`]),
+/// so every header error at an open/refresh site reaches this mapping.
 fn map_database_header_error(error: &DatabaseHeaderError, context: &str) -> FrankenError {
     match error {
         DatabaseHeaderError::NewerFormat { on_disk, supported } => FrankenError::NewerFormat {
@@ -14111,33 +14104,17 @@ fn map_database_header_error(error: &DatabaseHeaderError, context: &str) -> Fran
     }
 }
 
-fn stale_main_header_is_wal_recoverable_error(error: &DatabaseHeaderError) -> bool {
-    matches!(
-        error,
-        DatabaseHeaderError::InvalidSchemaFormat { raw: 0 }
-            | DatabaseHeaderError::InvalidTextEncoding { raw: 0 }
-    )
-}
-
-fn change_counter_from_header_bytes(header_bytes: &[u8; DATABASE_HEADER_SIZE]) -> u32 {
-    u32::from_be_bytes([
-        header_bytes[24],
-        header_bytes[25],
-        header_bytes[26],
-        header_bytes[27],
-    ])
-}
-
-fn stale_main_header_change_counter_under_wal(
-    header_bytes: &[u8; DATABASE_HEADER_SIZE],
-    error: &DatabaseHeaderError,
-) -> Option<u64> {
-    if !stale_main_header_is_wal_recoverable_error(error) {
-        return None;
-    }
-
-    page_size_from_header_bytes(header_bytes)?;
-    Some(u64::from(change_counter_from_header_bytes(header_bytes)))
+/// Does this main-file header carry stock's empty-schema stamp (schema format
+/// 0 or text encoding 0)?
+///
+/// Stock writes that stamp on the bootstrap page 1 of a fresh WAL database,
+/// then commits the real page 1 (with tables) to the WAL only. Such a header
+/// is valid on its own (bd-25au0: a stock database that only ever saw
+/// `PRAGMA user_version` looks the same), so it is a stale bootstrap stub only
+/// when a live WAL also holds a committed page 1; see
+/// [`stale_main_header_can_be_recovered_from_live_wal`].
+fn main_header_has_empty_schema_stamp(header_bytes: &[u8; DATABASE_HEADER_SIZE]) -> bool {
+    header_bytes[44..48] == [0; 4] || header_bytes[56..60] == [0; 4]
 }
 
 async fn wal_contains_valid_database_page1<F: VfsFile>(
@@ -14182,10 +14159,9 @@ async fn stale_main_header_can_be_recovered_from_live_wal<V: Vfs>(
     vfs: &V,
     path: &Path,
     header_bytes: &[u8; DATABASE_HEADER_SIZE],
-    error: &DatabaseHeaderError,
     allow_readonly_wal_probe: bool,
 ) -> Result<bool> {
-    if !stale_main_header_is_wal_recoverable_error(error) {
+    if !main_header_has_empty_schema_stamp(header_bytes) {
         return Ok(false);
     }
 
@@ -14326,6 +14302,7 @@ fn bootstrap_header_from_stale_main_file(
         // The authoritative encoding/schema header will be re-read from the
         // WAL-backed page-1 snapshot on the first transaction begin.
         text_encoding: fsqlite_types::TextEncoding::Utf8,
+        text_encoding_unset: false,
         user_version: u32::from_be_bytes([
             header_bytes[60],
             header_bytes[61],
@@ -18974,21 +18951,10 @@ where
             };
 
         let page_size = if let Some(header_bytes) = coherent_header_bytes.as_ref() {
+            // A stale live-WAL bootstrap stub parses too, and its page size is
+            // the WAL's (bd-25au0).
             match DatabaseHeader::from_bytes(header_bytes) {
                 Ok(header) => header.page_size,
-                Err(error)
-                    if stale_main_header_can_be_recovered_from_live_wal(
-                        cx,
-                        &*vfs,
-                        &db_path,
-                        header_bytes,
-                        &error,
-                        false,
-                    )
-                    .await? =>
-                {
-                    page_size_from_header_bytes(header_bytes).unwrap_or(requested_page_size)
-                }
                 Err(error) if disposition == ReadWriteOpenDisposition::ExistingOnly => {
                     return Err(map_database_header_error(&error, "invalid database header"));
                 }
@@ -19120,14 +19086,12 @@ where
             })?;
             let (header, bootstrapped_from_live_wal_stub) =
                 match DatabaseHeader::from_bytes(&header_bytes) {
-                    Ok(header) => (header, false),
-                    Err(error)
+                    Ok(_)
                         if stale_main_header_can_be_recovered_from_live_wal(
                             cx,
                             &*vfs,
                             &db_path,
                             &header_bytes,
-                            &error,
                             false,
                         )
                         .await? =>
@@ -19142,6 +19106,7 @@ where
                             true,
                         )
                     }
+                    Ok(header) => (header, false),
                     Err(error) => {
                         // bd-qgh42 follow-up: a non-empty file with an incoherent
                         // header reached here via the ReservedEmpty open-existing
@@ -19650,28 +19615,23 @@ where
         })
         .await?;
         let (header, page_size) = match DatabaseHeader::from_bytes(&header_bytes) {
-            Ok(header) => {
-                let page_size = header.page_size;
-                (Some(header), page_size)
-            }
-            Err(error)
+            Ok(header)
                 if stale_main_header_can_be_recovered_from_live_wal(
                     cx,
                     &*vfs,
                     &db_path,
                     &header_bytes,
-                    &error,
                     true,
                 )
                 .await? =>
             {
-                let page_size = page_size_from_header_bytes(&header_bytes).ok_or_else(|| {
-                    FrankenError::DatabaseCorrupt {
-                        detail: "live WAL bootstrap could not recover database page size"
-                            .to_owned(),
-                    }
-                })?;
-                (None, page_size)
+                // Stale live-WAL bootstrap stub: the real page 1 lives in the
+                // WAL, so only the page size is taken from the main file.
+                (None, header.page_size)
+            }
+            Ok(header) => {
+                let page_size = header.page_size;
+                (Some(header), page_size)
             }
             Err(error) => {
                 return Err(map_database_header_error(&error, "invalid database header"));
@@ -61135,8 +61095,15 @@ mod tests {
 
             let mut stale_header_bytes = valid_header.to_bytes().expect("base header bytes");
             stale_header_bytes[44..48].fill(0);
-            let stale_error = DatabaseHeader::from_bytes(&stale_header_bytes)
-                .expect_err("schema format 0 must be treated as a stale main-file header");
+            // bd-25au0: stock's empty-schema stamp parses; it is a stale stub
+            // only when a live WAL holds a committed page 1.
+            assert_eq!(
+                DatabaseHeader::from_bytes(&stale_header_bytes)
+                    .expect("schema format 0 parses")
+                    .schema_format,
+                0
+            );
+            assert!(main_header_has_empty_schema_stamp(&stale_header_bytes));
 
             let mut uncommitted_page1 = committed_page1.clone();
             uncommitted_page1[..DATABASE_HEADER_SIZE].copy_from_slice(&stale_header_bytes);
@@ -61165,7 +61132,6 @@ mod tests {
                 &vfs,
                 &db_path,
                 &stale_header_bytes,
-                &stale_error,
                 false,
             )
             .await
@@ -61193,8 +61159,15 @@ mod tests {
             };
             let mut stale_header_bytes = valid_header.to_bytes().expect("base header bytes");
             stale_header_bytes[44..48].fill(0);
-            let stale_error = DatabaseHeader::from_bytes(&stale_header_bytes)
-                .expect_err("schema format 0 must be treated as a stale main-file header");
+            // bd-25au0: stock's empty-schema stamp parses; it is a stale stub
+            // only when a live WAL holds a committed page 1.
+            assert_eq!(
+                DatabaseHeader::from_bytes(&stale_header_bytes)
+                    .expect("schema format 0 parses")
+                    .schema_format,
+                0
+            );
+            assert!(main_header_has_empty_schema_stamp(&stale_header_bytes));
 
             let open_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
             let (mut wal_file, _) = vfs.inner.open(&cx, Some(&wal_path), open_flags).unwrap();
@@ -61205,7 +61178,6 @@ mod tests {
                 &vfs,
                 &db_path,
                 &stale_header_bytes,
-                &stale_error,
                 false,
             )
             .await
@@ -61241,8 +61213,15 @@ mod tests {
 
             let mut stale_header_bytes = valid_header.to_bytes().expect("base header bytes");
             stale_header_bytes[44..48].fill(0);
-            let stale_error = DatabaseHeader::from_bytes(&stale_header_bytes)
-                .expect_err("schema format 0 must be treated as a stale main-file header");
+            // bd-25au0: stock's empty-schema stamp parses; it is a stale stub
+            // only when a live WAL holds a committed page 1.
+            assert_eq!(
+                DatabaseHeader::from_bytes(&stale_header_bytes)
+                    .expect("schema format 0 parses")
+                    .schema_format,
+                0
+            );
+            assert!(main_header_has_empty_schema_stamp(&stale_header_bytes));
 
             let open_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
             let (file, _) = vfs.inner.open(&cx, Some(&wal_path), open_flags).unwrap();
@@ -61265,7 +61244,6 @@ mod tests {
                 &vfs,
                 &db_path,
                 &stale_header_bytes,
-                &stale_error,
                 true,
             )
             .await
