@@ -614,7 +614,12 @@ pub fn resolve_parallel_wal_control_surface_from_env() -> ParallelWalControlSurf
 /// Commit-certificate proof object for the parallel WAL data plane.
 ///
 /// A commit becomes externally publishable only after the certificate is
-/// durably written. The certificate covers a contiguous commit-sequence range,
+/// written ahead of its commit marker and the WAL sync that makes the marker
+/// durable succeeds; that sync is the commit's only durability barrier, and
+/// recovery reads a durable marker whose certificate a power loss dropped as
+/// an uncertified tail commit (bd-qyekq).
+///
+/// The certificate covers a contiguous commit-sequence range,
 /// the lanes that contributed to that range, the exact ordered WAL frame
 /// contents, and the pager-visible metadata that must be published once the
 /// ordered residue completes.

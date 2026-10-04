@@ -217591,7 +217591,6 @@ mod autocommit_txn_tests {
             _certificate: &'a fsqlite_wal::ParallelWalCommitCertificate,
             _wal_frame_start: u64,
             _wal_frame_end: u64,
-            _sync: bool,
         ) -> fsqlite_pager::traits::WalFuture<'a, ()> {
             Box::pin(async { Ok(()) })
         }
@@ -217888,7 +217887,6 @@ mod autocommit_txn_tests {
             certificate: &'a fsqlite_wal::ParallelWalCommitCertificate,
             wal_frame_start: u64,
             wal_frame_end: u64,
-            sync: bool,
         ) -> fsqlite_pager::traits::WalFuture<'a, ()> {
             Box::pin(async move {
                 self.inner
@@ -217897,7 +217895,6 @@ mod autocommit_txn_tests {
                         certificate,
                         wal_frame_start,
                         wal_frame_end,
-                        sync,
                     )
                     .await
             })

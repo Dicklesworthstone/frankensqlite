@@ -4830,26 +4830,37 @@ where
         certificate: &ParallelWalCommitCertificate,
         wal_frame_start: u64,
         wal_frame_end: u64,
-        sync: bool,
     ) -> Result<()> {
         self.append_durable_certificate_record_with_completion(
             cx,
             certificate,
             wal_frame_start,
             wal_frame_end,
-            sync,
             None,
         )
         .await
     }
 
+    /// Append the certificate record for the next WAL interval, ordered
+    /// before that interval's commit marker but never fsynced here.
+    ///
+    /// The WAL fsync that makes the commit marker durable is the commit's
+    /// only durability barrier, as in stock SQLite (bd-qyekq). The record is
+    /// a recovery hint, not a precondition for the commit surviving: a
+    /// power loss can drop any unsynced suffix of this sidecar, exactly as
+    /// it already could under `synchronous=NORMAL`, and recovery then reads
+    /// the commits past the newest surviving record as uncertified tail
+    /// commits (one logical commit per marker; see
+    /// `pinned_logical_read_snapshot`) while a prefix-truncated record is the
+    /// one torn suffix `prepare_certificate_sidecar_for_append` repairs. No
+    /// process outlives the power loss, so every reopening process derives
+    /// the same clock from the same surviving files.
     async fn append_durable_certificate_record_with_completion(
         &self,
         cx: &Cx,
         certificate: &ParallelWalCommitCertificate,
         wal_frame_start: u64,
         wal_frame_end: u64,
-        sync: bool,
         completion: Option<&VfsWriteCompletion>,
     ) -> Result<()> {
         let mut preflight = WalWriteCompletionPreflight::new(completion);
@@ -4887,9 +4898,6 @@ where
             });
         }
         let certificate_path = self.certificate_sidecar_path();
-        let existed = self
-            .vfs
-            .access(cx, &certificate_path, AccessFlags::EXISTS)?;
         let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
         let (mut file, _) = self.vfs.open(cx, Some(&certificate_path), flags)?;
         let append_offset = Self::prepare_certificate_sidecar_for_append(&mut file, cx).await?;
@@ -4920,31 +4928,9 @@ where
             );
         }
 
-        // Match the WAL's configured synchronous policy exactly. Even when
-        // `sync` is false, this ordered sidecar write precedes the WAL marker;
-        // neither write then claims power-loss-stable persistence.
         let finalization_cx = cx.create_child();
         let _finalization_mask = finalization_cx.masked();
-        let sync_result = if sync {
-            file.durable_sync(&finalization_cx, SyncKind::FullDurable)
-        } else {
-            Ok(())
-        };
-        let directory_sync_result = if sync && !existed && sync_result.is_ok() {
-            self.vfs
-                .sync_parent_directory(&finalization_cx, &certificate_path)
-        } else {
-            Ok(())
-        };
-        let close_result = file.close(&finalization_cx);
-        combine_sidecar_io_results(
-            "parallel WAL certificate append finalization failed",
-            [
-                ("file_sync", sync_result),
-                ("directory_sync", directory_sync_result),
-                ("close", close_result),
-            ],
-        )
+        file.close(&finalization_cx)
     }
 
     async fn reconcile_absent_append(
@@ -5995,7 +5981,6 @@ where
         certificate: &'a ParallelWalCommitCertificate,
         wal_frame_start: u64,
         wal_frame_end: u64,
-        sync: bool,
     ) -> WalFuture<'a, ()> {
         Box::pin(async move {
             self.inner.assert_no_pending_append_attempt()?;
@@ -6005,7 +5990,6 @@ where
                 certificate,
                 wal_frame_start,
                 wal_frame_end,
-                sync,
             )
             .await
         })
@@ -6017,7 +6001,6 @@ where
         certificate: &'a ParallelWalCommitCertificate,
         wal_frame_start: u64,
         wal_frame_end: u64,
-        sync: bool,
         completion: VfsWriteCompletion,
     ) -> WalFuture<'a, ()> {
         Box::pin(async move {
@@ -6031,7 +6014,6 @@ where
                 certificate,
                 wal_frame_start,
                 wal_frame_end,
-                sync,
                 Some(&completion),
             )
             .await
@@ -7223,7 +7205,7 @@ mod tests {
         certificate.wal_frame_payload_digest = test_frame_payload_digest(1, &committed_page, 1);
         certificate.certificate_crc32c = certificate.computed_crc32c();
         backend
-            .persist_parallel_wal_commit_certificate(cx, &certificate, 1, 1, true)
+            .persist_parallel_wal_commit_certificate(cx, &certificate, 1, 1)
             .expect("persist authorized certificate");
         backend
             .append_frame(cx, 1, &committed_page, 1)
@@ -7244,7 +7226,7 @@ mod tests {
             test_frame_payload_digest(1, &original_page, certificate.db_size_pages);
         certificate.certificate_crc32c = certificate.computed_crc32c();
         backend
-            .persist_parallel_wal_commit_certificate(&cx, &certificate, 1, 1, true)
+            .persist_parallel_wal_commit_certificate(&cx, &certificate, 1, 1)
             .expect("persist original authorized certificate");
         backend
             .append_frame(&cx, 1, &original_page, certificate.db_size_pages)
@@ -7310,7 +7292,7 @@ mod tests {
         certificate.wal_frame_payload_digest = test_frame_payload_digest(1, &committed_page, 5);
         certificate.certificate_crc32c = certificate.computed_crc32c();
         backend
-            .persist_parallel_wal_commit_certificate(&cx, &certificate, 1, 1, true)
+            .persist_parallel_wal_commit_certificate(&cx, &certificate, 1, 1)
             .expect("persist internally inconsistent certificate fixture");
         backend
             .append_frame(&cx, 1, &committed_page, 5)
@@ -7368,7 +7350,7 @@ mod tests {
         certificate.wal_frame_payload_digest = test_frame_payload_digest(1, &committed_page, 1);
         certificate.certificate_crc32c = certificate.computed_crc32c();
         backend
-            .persist_parallel_wal_commit_certificate(cx, &certificate, 1, 1, true)
+            .persist_parallel_wal_commit_certificate(cx, &certificate, 1, 1)
             .expect("persist authorized certificate");
         backend
             .append_frame(cx, 1, &committed_page, 1)
@@ -7639,7 +7621,7 @@ mod tests {
         certificate.certificate_crc32c = certificate.computed_crc32c();
 
         backend
-            .persist_parallel_wal_commit_certificate(&cx, &certificate, 1, 1, true)
+            .persist_parallel_wal_commit_certificate(&cx, &certificate, 1, 1)
             .expect("persist certificate before WAL commit marker");
         assert_eq!(
             backend.inner.frame_count(),
@@ -7745,7 +7727,7 @@ mod tests {
         certificate.certificate_crc32c = certificate.computed_crc32c();
 
         backend
-            .persist_parallel_wal_commit_certificate(&cx, &certificate, 1, 1, true)
+            .persist_parallel_wal_commit_certificate(&cx, &certificate, 1, 1)
             .expect("persist content-bound certificate");
         backend
             .append_frame(&cx, 1, &actual_page, 1)
@@ -7787,7 +7769,7 @@ mod tests {
         let mut backend = make_path_refreshing_backend(&vfs, &cx);
         let certificate = sample_certificate(1, 1, vec![1]);
         backend
-            .persist_parallel_wal_commit_certificate(&cx, &certificate, 1, 1, true)
+            .persist_parallel_wal_commit_certificate(&cx, &certificate, 1, 1)
             .expect("persist orphan certificate");
 
         let (mut tail_writer, _) = vfs
@@ -7900,7 +7882,7 @@ mod tests {
             );
 
             backend
-                .persist_parallel_wal_commit_certificate(&cx, &orphan, 2, 2, true)
+                .persist_parallel_wal_commit_certificate(&cx, &orphan, 2, 2)
                 .expect("next append repairs the torn suffix first");
             let repaired_sidecar = read_certificate_sidecar(&vfs, &cx);
             assert_eq!(
@@ -7928,7 +7910,7 @@ mod tests {
         replace_certificate_sidecar(&vfs, &cx, &corrupt_sidecar);
         assert_wal_corrupt(
             backend
-                .persist_parallel_wal_commit_certificate(&cx, &orphan, 2, 2, true)
+                .persist_parallel_wal_commit_certificate(&cx, &orphan, 2, 2)
                 .wait(),
             "append-time complete record corruption",
         );
@@ -8052,7 +8034,7 @@ mod tests {
             PARALLEL_WAL_MAX_DURABLE_CERTIFICATE_RECORD_SIZE
         );
         backend
-            .persist_parallel_wal_commit_certificate(&cx, &certificate, 1, 1, true)
+            .persist_parallel_wal_commit_certificate(&cx, &certificate, 1, 1)
             .expect("writer accepts maximum-size record");
         assert!(
             backend
@@ -8410,7 +8392,7 @@ mod tests {
         certificate.wal_frame_payload_digest = test_frame_payload_digest(2, &page, 2);
         certificate.certificate_crc32c = certificate.computed_crc32c();
         backend
-            .persist_parallel_wal_commit_certificate(&cx, &certificate, 2, 2, true)
+            .persist_parallel_wal_commit_certificate(&cx, &certificate, 2, 2)
             .expect("the first append after an upgrade must discard the legacy sidecar, not fail");
         backend
             .append_frame(&cx, 2, &page, 2)
@@ -8482,18 +8464,27 @@ mod tests {
     }
 
     #[test]
-    fn certificate_and_handoff_fences_request_full_durability() {
+    fn certificate_append_leaves_durability_to_the_wal_sync_and_fences_reconcile_and_handoff() {
         let cx = test_cx();
         let vfs = CheckpointHandoffFaultVfs::new();
         let (mut backend, certificate, _) = make_checkpoint_handoff_fault_backend(&vfs, &cx);
 
+        // bd-qyekq: the fixture persisted the certificate, appended its commit
+        // marker and synced the WAL. That WAL sync is the commit's only
+        // barrier, as in stock SQLite; the sidecar append issues no sync of
+        // its own (it was a second fsync on every synchronous=FULL commit).
         assert_eq!(
             vfs.take_sync_observations(),
-            vec![CertificateSyncObservation::Durable(
-                PathBuf::from(CERTIFICATE_PATH),
-                SyncKind::FullDurable,
-            )],
-            "certificate append must use the strongest durability intent"
+            Vec::new(),
+            "certificate append must not sync the sidecar"
+        );
+        assert_eq!(
+            backend
+                .latest_authorized_parallel_wal_commit_certificate(&cx)
+                .wait()
+                .expect("read the appended certificate"),
+            Some(certificate.clone()),
+            "the unsynced record is still appended and authorizes its commit marker"
         );
 
         assert_eq!(
@@ -8658,7 +8649,7 @@ mod tests {
                 request(1, test_frame_payload_digest(1, &first_page, 1)),
                 |certificate| {
                     first_backend
-                        .persist_parallel_wal_commit_certificate(&cx, certificate, 1, 1, true)
+                        .persist_parallel_wal_commit_certificate(&cx, certificate, 1, 1)
                         .wait()
                         .and_then(|()| first_backend.append_frame(&cx, 1, &first_page, 1).wait())
                         .and_then(|()| first_backend.sync(&cx))
@@ -8694,7 +8685,7 @@ mod tests {
             )
             .expect("construct deterministic orphan certificate");
         second_backend
-            .persist_parallel_wal_commit_certificate(&cx, &orphan_receipt.certificate, 2, 2, true)
+            .persist_parallel_wal_commit_certificate(&cx, &orphan_receipt.certificate, 2, 2)
             .expect("persist well-formed orphan certificate tail");
         let authorized_seed = second_backend
             .latest_authorized_parallel_wal_commit_certificate(&cx)
@@ -8712,7 +8703,7 @@ mod tests {
                 request(2, test_frame_payload_digest(1, &second_page, 1)),
                 |certificate| {
                     second_backend
-                        .persist_parallel_wal_commit_certificate(&cx, certificate, 2, 2, true)
+                        .persist_parallel_wal_commit_certificate(&cx, certificate, 2, 2)
                         .wait()
                         .and_then(|()| second_backend.append_frame(&cx, 1, &second_page, 1).wait())
                         .and_then(|()| second_backend.sync(&cx))
@@ -8793,7 +8784,7 @@ mod tests {
                 request(3, test_frame_payload_digest(1, &post_checkpoint_page, 1)),
                 |certificate| {
                     second_backend
-                        .persist_parallel_wal_commit_certificate(&cx, certificate, 1, 1, true)
+                        .persist_parallel_wal_commit_certificate(&cx, certificate, 1, 1)
                         .wait()
                         .and_then(|()| {
                             second_backend
@@ -8901,7 +8892,7 @@ mod tests {
         let mut newer = sample_certificate(2, 2, vec![1]);
         newer.wal_frame_payload_digest = test_frame_payload_digest(1, &page, 2);
         newer.certificate_crc32c = newer.computed_crc32c();
-        backend.persist_parallel_wal_commit_certificate(&cx, &newer, 2, 2, true)
+        backend.persist_parallel_wal_commit_certificate(&cx, &newer, 2, 2)
             .expect("persist newer certificate");
         backend.append_frame(&cx, 1, &page, 2).expect("append newer certified commit");
         backend.sync(&cx).expect("publish newer certified commit");
@@ -9609,7 +9600,7 @@ mod tests {
         let mut certificate = sample_certificate(1, 1, vec![1]);
         certificate.wal_frame_payload_digest = test_frame_payload_digest(1, &page, 1);
         certificate.certificate_crc32c = certificate.computed_crc32c();
-        backend.persist_parallel_wal_commit_certificate(&cx, &certificate, 1, 1, true)
+        backend.persist_parallel_wal_commit_certificate(&cx, &certificate, 1, 1)
             .expect("persist exact authority before append");
         let frames = [WalFrameRef { page_number: 1, page_data: &page, db_size_if_commit: 1 }];
         let completion = VfsWriteCompletion::new();
@@ -11567,7 +11558,7 @@ mod tests {
             let mut certificate = sample_certificate(1, 1, vec![1]);
             certificate.wal_frame_payload_digest = test_frame_payload_digest(1, &page, 1);
             certificate.certificate_crc32c = certificate.computed_crc32c();
-            backend.persist_parallel_wal_commit_certificate(&cx, &certificate, 1, 1, true)
+            backend.persist_parallel_wal_commit_certificate(&cx, &certificate, 1, 1)
                 .expect("persist exact certificate before append");
             let sidecar = read_certificate_sidecar(&vfs.inner, &cx);
             let completion = drop_after_source_success(&mut backend, &vfs, &cx, &page);
@@ -11636,7 +11627,7 @@ mod tests {
             let mut certificate = sample_certificate(2, 2, vec![1]);
             certificate.wal_frame_payload_digest = test_frame_payload_digest(1, &page, 1);
             certificate.certificate_crc32c = certificate.computed_crc32c();
-            backend.persist_parallel_wal_commit_certificate(&cx, &certificate, 2, 2, true)
+            backend.persist_parallel_wal_commit_certificate(&cx, &certificate, 2, 2)
                 .expect("persist certificate for next interval");
             let boundary = CrashBoundary::BeforeWalFrameAppend;
             fault_hooks::arm_crash_boundary(
@@ -11703,7 +11694,7 @@ mod tests {
             certificate.db_size_pages = 3;
             certificate.page_set_size = 2;
             certificate.certificate_crc32c = certificate.computed_crc32c();
-            backend.persist_parallel_wal_commit_certificate(&cx, &certificate, 2, 3, true)
+            backend.persist_parallel_wal_commit_certificate(&cx, &certificate, 2, 3)
                 .expect("persist exact candidate certificate");
             let frame_size = backend.inner.wal.frame_size();
             vfs.fail_next_wal_write_after_prefix(frame_size);

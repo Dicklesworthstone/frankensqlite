@@ -24319,7 +24319,6 @@ where
                                         &certificate,
                                         frames_written_start,
                                         frames_written_end,
-                                        sync_policy.should_sync_on_commit(),
                                         certificate_completion.clone(),
                                     )
                                     .await
@@ -39418,7 +39417,6 @@ mod tests {
         certificate: ParallelWalCommitCertificate,
         wal_frame_start: u64,
         wal_frame_end: u64,
-        sync: bool,
     }
 
     type SharedPersistedParallelWalCommit =
@@ -40964,7 +40962,6 @@ mod tests {
             certificate: &'a ParallelWalCommitCertificate,
             wal_frame_start: u64,
             wal_frame_end: u64,
-            sync: bool,
         ) -> WalFuture<'a, ()> {
             Box::pin(async move {
                 *self.persisted_parallel_wal_commit.lock().unwrap() =
@@ -40972,7 +40969,6 @@ mod tests {
                         certificate: certificate.clone(),
                         wal_frame_start,
                         wal_frame_end,
-                        sync,
                     });
                 Ok(())
             })
@@ -41001,7 +40997,6 @@ mod tests {
                 if &persisted.certificate != certificate
                     || persisted.wal_frame_start != wal_frame_start
                     || persisted.wal_frame_end != wal_frame_end
-                    || persisted.sync != sync
                 {
                     return Err(FrankenError::internal(
                         "mock WAL recovery certificate or interval mismatch",
@@ -41313,14 +41308,12 @@ mod tests {
             certificate: &'a ParallelWalCommitCertificate,
             wal_frame_start: u64,
             wal_frame_end: u64,
-            sync: bool,
         ) -> WalFuture<'a, ()> {
             self.inner.persist_parallel_wal_commit_certificate(
                 cx,
                 certificate,
                 wal_frame_start,
                 wal_frame_end,
-                sync,
             )
         }
 

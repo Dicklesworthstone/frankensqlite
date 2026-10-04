@@ -553,13 +553,14 @@ pub trait WalBackend: Send + Sync {
 
     /// Append the certificate proof that authorizes the next WAL frame
     /// interval. Implementations must bind the record to their current WAL
-    /// generation and make it durable when `sync` is true.
+    /// generation.
     ///
-    /// `sync` is the transaction's existing WAL synchronous policy. `false`
-    /// preserves SQLite-style synchronous-OFF semantics: the ordered VFS write
-    /// must precede the WAL marker write, but neither write claims stable-media
-    /// survival across power loss. The receipt is therefore policy-relative,
-    /// never a stronger persistence guarantee than the matching WAL commit.
+    /// The ordered VFS write must precede the WAL marker write, but the
+    /// record is never fsynced on its own: the WAL sync that makes the commit
+    /// marker durable is the commit's only durability barrier, as in stock
+    /// SQLite (bd-qyekq). Recovery reads a durable commit marker whose
+    /// record a power loss dropped as an uncertified tail commit, so the
+    /// receipt never claims more than the matching WAL commit.
     ///
     /// The record is written before the interval's commit marker. A crash may
     /// therefore leave an orphan certificate, which recovery must ignore
@@ -571,7 +572,6 @@ pub trait WalBackend: Send + Sync {
         _certificate: &'a ParallelWalCommitCertificate,
         _wal_frame_start: u64,
         _wal_frame_end: u64,
-        _sync: bool,
     ) -> WalFuture<'a, ()> {
         Box::pin(async { Err(FrankenError::Unsupported) })
     }
@@ -584,7 +584,6 @@ pub trait WalBackend: Send + Sync {
         certificate: &'a ParallelWalCommitCertificate,
         wal_frame_start: u64,
         wal_frame_end: u64,
-        sync: bool,
         completion: VfsWriteCompletion,
     ) -> WalFuture<'a, ()> {
         let completion = WalTrackedCompletionGuard(completion);
@@ -595,7 +594,6 @@ pub trait WalBackend: Send + Sync {
                     certificate,
                     wal_frame_start,
                     wal_frame_end,
-                    sync,
                 )
                 .await;
             if result.is_ok() {

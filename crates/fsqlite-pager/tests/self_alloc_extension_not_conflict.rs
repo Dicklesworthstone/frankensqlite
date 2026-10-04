@@ -220,7 +220,6 @@ impl WalBackend for SharedWalBackend {
         certificate: &'a ParallelWalCommitCertificate,
         wal_frame_start: u64,
         wal_frame_end: u64,
-        _sync: bool,
     ) -> WalFuture<'a, ()> {
         Box::pin(async move {
             if !certificate.checksum_is_valid() {
