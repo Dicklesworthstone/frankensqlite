@@ -778,10 +778,25 @@ async fn execute_single_txn(
         }
     }
 
+    let commit_seq_before = conn.last_local_commit_seq();
     conn.execute("COMMIT;").await?;
-    let commit_order = conn.last_local_commit_seq().ok_or_else(|| {
-        FrankenError::Internal("missing commit sequence after successful COMMIT".to_owned())
-    })?;
+    let commit_order = if write_set.is_empty() {
+        // A read-only transaction commits nothing: it serializes at the
+        // snapshot it read. A file-backed read-only COMMIT deliberately leaves
+        // `last_local_commit_seq` alone (GH#429), so that value is the previous
+        // write's sequence (or None on a fresh connection), not this one's.
+        start_order
+    } else {
+        let commit_order = conn.last_local_commit_seq().ok_or_else(|| {
+            FrankenError::Internal("missing commit sequence after successful COMMIT".to_owned())
+        })?;
+        if commit_seq_before.is_some_and(|before| commit_order <= before) {
+            return Err(FrankenError::Internal(format!(
+                "write COMMIT did not advance the commit sequence: before={commit_seq_before:?} after={commit_order}"
+            )));
+        }
+        commit_order
+    };
     Ok((
         start_order,
         commit_order,

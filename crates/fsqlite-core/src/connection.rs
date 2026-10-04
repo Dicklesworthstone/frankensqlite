@@ -24216,7 +24216,10 @@ impl Connection {
     /// Returns the most recent commit sequence assigned to a successful
     /// COMMIT on this connection.
     ///
-    /// Returns `None` when this connection has not committed yet.
+    /// Returns `None` when this connection has not committed yet. A read-only
+    /// `BEGIN CONCURRENT` transaction on a file-backed database commits nothing
+    /// and leaves this value unchanged (GH#429); it serializes at its snapshot
+    /// ([`Self::current_concurrent_snapshot_seq`] read before COMMIT).
     #[must_use]
     pub fn last_local_commit_seq(&self) -> Option<u64> {
         (*self.last_local_commit_seq.borrow()).map(CommitSeq::get)
