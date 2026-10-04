@@ -39452,18 +39452,12 @@ fn emit_expr_with_fallback(
             type_name,
             ..
         } => {
+            // A CAST converts (`CAST('abc' AS INTEGER)` is 0, `CAST(x'31' AS TEXT)`
+            // is '1'), which an affinity does not, so emit the same Cast as
+            // `emit_expr`.
             emit_expr_with_fallback(b, inner, reg, inner_ctx, outer_ctx);
             let affinity = type_name_to_affinity(type_name);
-            if affinity != 0 {
-                b.emit_op(
-                    Opcode::Affinity,
-                    reg,
-                    1,
-                    0,
-                    P4::Str(String::from(affinity as char)),
-                    0,
-                );
-            }
+            b.emit_op(Opcode::Cast, reg, i32::from(affinity), 0, P4::None, 0);
         }
         // ── IS [NOT] NULL ──────────────────────────────────────────────
         Expr::IsNull {
