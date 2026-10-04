@@ -217,7 +217,7 @@ use fsqlite_types::value::{
 };
 use fsqlite_types::{
     BTreePageHeader, ComparisonAffinity, DatabaseHeader, EProcessConfig, EProcessOracle,
-    ExprAffinity, PageNumber, PageSize, Region,
+    ExprAffinity, PageData, PageNumber, PageSize, Region,
     StrictColumnType, TextEncoding, TypeAffinity, without_rowid_declared_to_physical,
     without_rowid_pk_is_leading, without_rowid_storage_order,
 };
@@ -12019,17 +12019,57 @@ struct TableExecutionRuntimeInputs {
     wr_storage_order_by_root_page: Arc<HbHashMap<i32, Vec<usize>>>,
 }
 
-// ── Time-travel MemDatabase snapshots ──────────────────────────────────────
-// For :memory: databases (and as a fallback when the MVCC VersionStore is not
-// populated), time-travel queries are satisfied by cloning the MemDatabase at
-// each COMMIT and storing the snapshot keyed by commit_seq + timestamp.
+// ── Time-travel snapshots ──────────────────────────────────────────────────
+// For :memory: databases, time-travel queries are satisfied from snapshots
+// captured at each DDL and explicit COMMIT, keyed by commit_seq + timestamp.
+//
+// bd-jdjee: a snapshot holds the committed page image, not a decoded
+// MemDatabase. Pages a commit did not change are shared with the previous
+// snapshot, so capture costs one pass over the page table plus the changed
+// pages, and memory grows with what changed, not with the database size. The
+// MemDatabase a historical SELECT reads is decoded from the image on demand.
 
 /// A snapshot of the in-memory database captured at COMMIT time.
 #[derive(Debug, Clone)]
 struct TimeTravelSnapshotEntry {
     commit_seq: u64,
     timestamp_ns: u64,
-    db: MemDatabase,
+    image: Rc<TimeTravelImage>,
+}
+
+/// The committed state a time-travel snapshot reproduces.
+///
+/// It holds the same inputs a row-preserving mirror reload uses, so decoding
+/// it yields the mirror the connection would have held right after the
+/// commit.
+#[derive(Debug)]
+struct TimeTravelImage {
+    /// Committed pages `1..=db_size`, in page order.
+    pages: Vec<PageData>,
+    /// The mirror with every pager-backed table emptied. What remains is the
+    /// mirror-only state the pages cannot reproduce: TEMP tables and their
+    /// rows, plus schema-shaped placeholders.
+    base: MemDatabase,
+    /// The tables whose rows the pages carry, as defined at capture time:
+    /// every non-TEMP table with a root page, including `main` tables a
+    /// same-named TEMP table shadows. Decoding with the current schema instead
+    /// would mis-shape rows after a later ALTER TABLE.
+    pager_tables: Vec<TableSchema>,
+    /// IPK column per pager table, keyed like `rowid_alias_columns`. Derived
+    /// from `pager_tables` rather than copied from the connection, whose entry
+    /// for a shadowed `main` table's name describes the TEMP table instead.
+    rowid_alias_columns: HashMap<String, usize>,
+    text_encoding: TextEncoding,
+}
+
+impl TimeTravelImage {
+    /// Roots of the tables and indexes whose rows the pages carry.
+    fn pager_backed_roots(pager_tables: &[TableSchema]) -> impl Iterator<Item = i32> + '_ {
+        pager_tables.iter().flat_map(|table| {
+            std::iter::once(table.root_page)
+                .chain(table.indexes.iter().map(|index| index.root_page))
+        })
+    }
 }
 
 /// Maximum number of retained time-travel snapshots per connection.
@@ -13566,21 +13606,32 @@ pub struct Connection {
     /// attached-schema read delegation path until the VDBE can route across
     /// multiple pager backends directly.
     attached_connections: RefCell<HashMap<String, Box<Self>>>,
-    // ── Time-travel MemDatabase snapshots (#23) ──────────────────────────────
-    /// Ring buffer of MemDatabase snapshots captured at each COMMIT.
+    // ── Time-travel snapshots (#23) ──────────────────────────────────────────
+    /// Ring buffer of page-image snapshots captured at each DDL and COMMIT.
     /// Used for `FOR SYSTEM_TIME AS OF` queries on :memory: databases.
     time_travel_snapshots: RefCell<Vec<TimeTravelSnapshotEntry>>,
+    /// The most recently decoded snapshot, so repeated historical queries
+    /// against one snapshot decode its pages once (bd-jdjee). Holding the
+    /// image `Rc` keys the cache by identity and keeps it valid after the ring
+    /// evicts that snapshot.
+    time_travel_materialized: RefCell<Option<(Rc<TimeTravelImage>, MemDatabase)>>,
+    /// Armed when a `:memory:` time-travel capture point (DDL or explicit
+    /// COMMIT) leaves the row mirror stale; consumed by the next read
+    /// statement outside a transaction, which rebuilds the mirror once
+    /// (bd-jdjee). Capture used to do that rebuild eagerly at every capture
+    /// point. Deferring it keeps commit-only workloads free of it while the
+    /// first read after a write burst still gets the MemDatabase fast paths.
+    memdb_hydrate_at_next_read: Cell<bool>,
     /// When true, `execute_join_select` reads table data directly from
     /// `self.db` (the MemDatabase) instead of calling `self.query()` which
     /// would go through the pager and return current data.
     time_travel_active: Cell<bool>,
-    /// Connection-local opt-out for the eager per-commit MemDatabase clone
-    /// that backs `FOR SYSTEM_TIME AS OF` queries on `:memory:` databases.
+    /// Connection-local opt-out for the per-commit snapshot capture that
+    /// backs `FOR SYSTEM_TIME AS OF` queries on `:memory:` databases.
     ///
-    /// Defaults to `true` for backward compatibility. Disabling it collapses
-    /// the O(existing_rows) commit-path reload + MemDatabase clone that
-    /// otherwise turns a batched-commit INSERT workload from O(delta)
-    /// per-transaction into O(n²) overall. See
+    /// Defaults to `true`. Capture used to reload and deep-clone the whole
+    /// MemDatabase at every commit (O(rows)); since bd-jdjee it reads the
+    /// committed page table and copies only changed pages. See
     /// `PRAGMA fsqlite_capture_time_travel_snapshots = false` for the SQL
     /// surface.
     time_travel_capture_enabled: Cell<bool>,
@@ -15035,6 +15086,8 @@ impl Connection {
             attach_env,
             attached_connections: RefCell::new(HashMap::new()),
             time_travel_snapshots: RefCell::new(Vec::new()),
+            time_travel_materialized: RefCell::new(None),
+            memdb_hydrate_at_next_read: Cell::new(false),
             time_travel_active: Cell::new(false),
             time_travel_capture_enabled: Cell::new(true),
             conformal_retry_budget: RefCell::new(ConformalRetryBudget::default()),
@@ -15601,6 +15654,8 @@ impl Connection {
             attached_connections: RefCell::new(HashMap::new()),
             // Time-travel MemDatabase snapshots (#23)
             time_travel_snapshots: RefCell::new(Vec::new()),
+            time_travel_materialized: RefCell::new(None),
+            memdb_hydrate_at_next_read: Cell::new(false),
             time_travel_active: Cell::new(false),
             time_travel_capture_enabled: Cell::new(true),
             conformal_retry_budget: RefCell::new(ConformalRetryBudget::default()),
@@ -24738,10 +24793,16 @@ impl Connection {
             .then(|| self.version_store())
     }
 
+    /// An explicit BEGIN on a `:memory:` connection leaves a stale row mirror
+    /// to the next read boundary instead of hydrating it up front.
+    ///
+    /// This used to hydrate whenever time-travel capture was on, because the
+    /// capture cloned the mirror. Capture now reads the committed page image
+    /// (bd-jdjee), so with capture on or off, BEGIN on `:memory:` takes the
+    /// same path.
     #[inline]
     fn should_hydrate_memdb_rows_for_explicit_begin(&self) -> bool {
-        self.should_eagerly_hydrate_memdb_rows()
-            && (!self.pager.is_memory() || self.time_travel_capture_enabled.get())
+        self.should_eagerly_hydrate_memdb_rows() && !self.pager.is_memory()
     }
 
     /// Capture a time-travel snapshot of the current database state.
@@ -24755,33 +24816,31 @@ impl Connection {
     /// databases should source historical reads from MVCC/WAL state rather than
     /// cloning the compatibility `MemDatabase` on every commit.
     ///
-    /// Since data lives in the pager (not the MemDatabase), this reloads the
-    /// MemDatabase from the pager before capturing the snapshot.
+    /// bd-jdjee: the snapshot is the committed page image, read through a pager
+    /// read transaction, so the row mirror does not have to be current here.
+    /// This replaced a full mirror reload plus a deep MemDatabase clone, which
+    /// cost O(rows) at every DDL and COMMIT. A failed capture logs and skips
+    /// the snapshot rather than recording one that might be wrong.
     async fn capture_time_travel_snapshot(&self, commit_seq: u64) {
         if self.path != ":memory:" {
             return;
         }
-
-        // Most in-memory explicit-write paths keep the MemDatabase mirror exact
-        // as they execute. In that common case, a full pager reload here just
-        // re-decodes the database before immediately cloning it into the
-        // snapshot ring. Only pay that reload when the connection has marked
-        // the mirror as dirty (or when rows are not currently hydrated).
-        if (self.memdb_requires_active_txn_reload.get() || !self.memdb_rows_loaded.get())
-            && let Ok(cx) = self.op_cx()
-            && let Err(err) = self.reload_memdb_from_pager(&cx).await
-        {
-            tracing::warn!(
-                target: "fsqlite.time_travel",
-                "failed to reload memdb before capturing time-travel snapshot: {err}"
-            );
-        }
+        let image = match self.capture_time_travel_image().await {
+            Ok(image) => image,
+            Err(err) => {
+                tracing::warn!(
+                    target: "fsqlite.time_travel",
+                    commit_seq,
+                    "failed to capture time-travel snapshot: {err}"
+                );
+                return;
+            }
+        };
 
         let observed_timestamp_ns = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
-        let db_snapshot = self.db.borrow().clone();
         let mut snaps = self.time_travel_snapshots.borrow_mut();
         let timestamp_ns = snaps.last().map_or(observed_timestamp_ns, |previous| {
             observed_timestamp_ns.max(previous.timestamp_ns.saturating_add(1))
@@ -24789,12 +24848,226 @@ impl Connection {
         let snapshot = TimeTravelSnapshotEntry {
             commit_seq,
             timestamp_ns,
-            db: db_snapshot,
+            image: Rc::new(image),
         };
         if snaps.len() >= MAX_TIME_TRAVEL_SNAPSHOTS {
             snaps.remove(0);
         }
         snaps.push(snapshot);
+        drop(snaps);
+        // The old capture rebuilt a stale mirror here. Leave that one rebuild
+        // to the next read instead (see `memdb_hydrate_at_next_read`).
+        if self.memdb_requires_active_txn_reload.get() || !self.memdb_rows_loaded.get() {
+            self.memdb_hydrate_at_next_read.set(true);
+        }
+    }
+
+    /// Rebuild the `:memory:` row mirror once if a time-travel capture point
+    /// left it stale (bd-jdjee). Called at read statements only; inside a
+    /// transaction the request stays armed for the first read after it.
+    async fn hydrate_memdb_armed_by_capture(&self, cx: &Cx) -> Result<()> {
+        if !self.memdb_hydrate_at_next_read.get()
+            || self.in_transaction.get()
+            || self.active_txn.borrow().is_some()
+        {
+            return Ok(());
+        }
+        self.memdb_hydrate_at_next_read.set(false);
+        if (self.memdb_rows_loaded.get() && !self.memdb_requires_active_txn_reload.get())
+            || self.memdb_row_hydration_suppressed.get() > 0
+        {
+            return Ok(());
+        }
+        self.reload_memdb_from_pager(cx).await
+    }
+
+    /// Read the committed page image and the mirror-only state for a snapshot.
+    ///
+    /// Each page is compared with the previous snapshot's copy of it and shares
+    /// that copy when it is unchanged, by image token first and then by bytes.
+    async fn capture_time_travel_image(&self) -> Result<TimeTravelImage> {
+        let cx = self.op_cx()?;
+        let previous = self
+            .time_travel_snapshots
+            .borrow()
+            .last()
+            .map(|entry| Rc::clone(&entry.image));
+        let mut txn = self.begin_reload_txn_repairing_empty_page_one(&cx).await?;
+        // The transaction's own fixed size bound: every page below it is
+        // readable in this snapshot, and nothing above it exists in it.
+        let db_size = match txn.snapshot_db_size() {
+            0 => self.pager.published_snapshot().db_size,
+            size => size,
+        };
+        let pages = Self::read_time_travel_pages(&cx, &txn, db_size, previous.as_deref()).await;
+        let _ = txn.rollback(&cx).await;
+        let pages = pages?;
+
+        let pager_tables: Vec<TableSchema> = {
+            let temp_table_names = self.temp_table_names.borrow();
+            self.schema
+                .borrow()
+                .iter()
+                .filter(|table| {
+                    table.root_page > 0
+                        && !temp_table_names.contains(&table.name.to_ascii_lowercase())
+                })
+                .chain(
+                    self.shadowed_main_tables
+                        .borrow()
+                        .values()
+                        .filter(|table| table.root_page > 0),
+                )
+                .cloned()
+                .collect()
+        };
+        // The rule the full reload uses to build `rowid_alias_columns`.
+        let rowid_alias_columns: HashMap<String, usize> = pager_tables
+            .iter()
+            .filter(|table| !table.without_rowid)
+            .filter_map(|table| {
+                let ipk = table.columns.iter().position(|column| column.is_ipk)?;
+                Some((table.name.to_ascii_lowercase(), ipk))
+            })
+            .collect();
+        let mut base = self.db.borrow().clone_for_snapshot();
+        for root_page in TimeTravelImage::pager_backed_roots(&pager_tables) {
+            // Emptying a shared table swaps in fresh storage, so the snapshot
+            // keeps no reference to the live table's rows; a later write to
+            // the live table then does not have to copy them.
+            if let Some(table) = base.get_table_mut(root_page) {
+                table.clear();
+            }
+        }
+        Ok(TimeTravelImage {
+            pages,
+            base,
+            pager_tables,
+            rowid_alias_columns,
+            text_encoding: self.db_text_encoding.get(),
+        })
+    }
+
+    async fn read_time_travel_pages(
+        cx: &Cx,
+        txn: &TransactionKind,
+        db_size: u32,
+        previous: Option<&TimeTravelImage>,
+    ) -> Result<Vec<PageData>> {
+        let page_count = usize::try_from(db_size).unwrap_or(usize::MAX);
+        let mut pages = Vec::with_capacity(page_count);
+        for page_no in 1..=db_size {
+            let Some(page_number) = PageNumber::new(page_no) else {
+                continue;
+            };
+            let page = txn.get_page(cx, page_number).await?;
+            let index = pages.len();
+            let shared = previous
+                .and_then(|image| image.pages.get(index))
+                .filter(|prior| {
+                    prior.image_token() == page.image_token()
+                        || prior.as_bytes() == page.as_bytes()
+                })
+                .cloned();
+            pages.push(shared.unwrap_or(page));
+        }
+        Ok(pages)
+    }
+
+    /// Decode a snapshot into the MemDatabase a historical SELECT reads.
+    ///
+    /// The image's pages are written to a private in-memory database file and
+    /// read through an ordinary pager transaction, table by table, with the
+    /// same row decoder the mirror reload uses.
+    async fn materialize_time_travel_image(
+        &self,
+        cx: &Cx,
+        image: &TimeTravelImage,
+    ) -> Result<MemDatabase> {
+        let mut db = image.base.clone_for_snapshot();
+        let Some(page_one) = image.pages.first() else {
+            return Ok(db);
+        };
+        let page_one_bytes = page_one.as_bytes();
+        if page_one_bytes.len() < DATABASE_HEADER_SIZE || page_one_bytes.iter().all(|&b| b == 0)
+        {
+            // An empty database has no pager-backed rows; the base is complete.
+            return Ok(db);
+        }
+        let header = parse_database_header_checked(page_one_bytes)?;
+        let page_size = header.page_size;
+
+        let vfs = MemoryVfs::new();
+        let path = Path::new("/time-travel-snapshot.db");
+        {
+            let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::MAIN_DB;
+            let (mut file, _) = vfs.open(cx, Some(path), flags)?;
+            let mut offset = 0_u64;
+            for (index, page) in image.pages.iter().enumerate() {
+                if index == 0 {
+                    // Normalize the private copy's header. It is read as a
+                    // rollback-journal database, so clear the WAL version
+                    // bytes (the image already absorbed any WAL). The in-header
+                    // page count must describe the image: a `:memory:` commit
+                    // may leave page 1 untouched (B3.4), so make the count and
+                    // its version-valid-for stamp agree with what was captured.
+                    let mut first = page.as_bytes().to_vec();
+                    first[18] = 1;
+                    first[19] = 1;
+                    let page_count = u32::try_from(image.pages.len()).unwrap_or(u32::MAX);
+                    first[28..32].copy_from_slice(&page_count.to_be_bytes());
+                    let change_counter: [u8; 4] = [first[24], first[25], first[26], first[27]];
+                    first[92..96].copy_from_slice(&change_counter);
+                    file.write(cx, &first, offset).await?;
+                } else {
+                    file.write(cx, page.as_bytes(), offset).await?;
+                }
+                offset += u64::try_from(page.len()).unwrap_or(0);
+            }
+            file.close(cx)?;
+        }
+        let pager = SimplePager::open_with_cx(cx, vfs, path, page_size).await?;
+        let mut txn: TransactionKind = pager.begin(cx, TransactionMode::ReadOnly).await?.into();
+        let decoded = Self::decode_time_travel_tables(cx, &mut txn, &header, image, &mut db).await;
+        let _ = txn.rollback(cx).await;
+        decoded?;
+        Ok(db)
+    }
+
+    async fn decode_time_travel_tables(
+        cx: &Cx,
+        txn: &mut TransactionKind,
+        header: &DatabaseHeader,
+        image: &TimeTravelImage,
+        db: &mut MemDatabase,
+    ) -> Result<()> {
+        for table in &image.pager_tables {
+            let rows = Self::read_storage_table_rows_with_encoding(
+                cx,
+                txn,
+                header.page_size,
+                header.reserved_per_page,
+                table,
+                &image.rowid_alias_columns,
+                image.text_encoding,
+            )
+            .await?;
+            if db.get_table(table.root_page).is_none() {
+                db.create_table_at(table.root_page, table.columns.len());
+            }
+            if let Some(mem_table) = db.get_table_mut(table.root_page) {
+                mem_table.clear();
+                for (rowid, values) in rows {
+                    mem_table.insert_row(rowid, values);
+                }
+            }
+            for index in &table.indexes {
+                if db.get_table(index.root_page).is_none() {
+                    db.create_table_at(index.root_page, 0);
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn bind_pager_publication(
@@ -37828,6 +38101,9 @@ impl Connection {
             Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
         );
         let op_cx = self.op_cx_after_background_status();
+        if !is_write && !is_txn_control && !self.skip_statement_memdb_refresh.get() {
+            self.hydrate_memdb_armed_by_capture(&op_cx).await?;
+        }
         let should_refresh_active_txn_memdb = !self.skip_statement_memdb_refresh.get()
             && (self.memdb_requires_active_txn_reload.get()
                 || !self.pending_memdb_direct_upserts.borrow().is_empty())
@@ -58809,6 +59085,7 @@ impl Connection {
         stmt: &PreparedStatement<'_>,
         cx: &Cx,
     ) -> Result<(bool, PreparedDmlEntryProof)> {
+        self.hydrate_memdb_armed_by_capture(cx).await?;
         self.refresh_memdb_from_active_txn_if_dirty(cx).await?;
         self.refresh_memdb_from_cached_write_txn_if_stale(cx)
             .await?;
@@ -73702,36 +73979,16 @@ impl Connection {
             commit_handle_finalize_start,
         );
         if committed_write {
-            // bd-batched-commit-cliff: Only pay the eager O(existing_rows)
-            // MemDatabase reload when something downstream in the commit
-            // finalize actually consumes a hydrated memdb. The sole consumer
-            // on this path is the in-memory time-travel snapshot capture
-            // below, so if that has been disabled (either because this is a
-            // file-backed connection or because the user opted out via
-            // `PRAGMA fsqlite_capture_time_travel_snapshots=false`) the
-            // reload is pure overhead that turns batched-commit INSERT into
-            // an O(n²) loop.
-            let will_capture_time_travel_snapshot = self.pager.is_memory()
-                && self.time_travel_capture_enabled.get()
-                && self.last_local_commit_seq.borrow().is_some();
-            if will_capture_time_travel_snapshot
-                && self.memdb_requires_active_txn_reload.replace(false)
-            {
-                // The write transaction is already finished. If the pager-backed
-                // committed-state reload fails, leave recovery to the normal
-                // committed-state refresh path instead of preserving a stale
-                // "active txn dirty" marker with no active_txn left to reload.
-                self.reload_memdb_from_pager_with_mode(
-                    cx,
-                    self.should_eagerly_hydrate_memdb_rows(),
-                )
-                .await?;
-            }
+            // bd-batched-commit-cliff / bd-jdjee: there is no eager mirror
+            // reload here. Its only consumer was the time-travel capture below,
+            // which now reads the committed page image instead of the mirror,
+            // so a dirty mirror stays marked dirty and is refreshed lazily at
+            // the next read boundary, as with capture disabled.
             let commit_post_write_maintenance_start = hot_path_profile_enabled().then(Instant::now);
             self.maybe_run_adaptive_autocheckpoint().await;
 
             // Capture time-travel snapshot AFTER cleanup so the write transaction
-            // handle is fully dropped and the pager can serve reads to reload_memdb.
+            // handle is fully dropped and the pager can serve its read transaction.
             let last_local_commit_seq = *self.last_local_commit_seq.borrow();
             if let Some(committed_seq) = last_local_commit_seq {
                 self.emit_differential_commit_invalidations(committed_seq);
@@ -73776,15 +74033,16 @@ impl Connection {
         params: Option<&[SqliteValue]>,
         target: &TimeTravelTarget,
     ) -> Result<Vec<Row>> {
-        let (snapshot_db, resolved_commit_seq, resolved_timestamp_ns) = {
+        let (image, resolved_commit_seq, resolved_timestamp_ns) = {
             let snaps = self.time_travel_snapshots.borrow();
             let snapshot = resolve_time_travel_snapshot_entry(&snaps, target)?;
             (
-                snapshot.db.clone(),
+                Rc::clone(&snapshot.image),
                 snapshot.commit_seq,
                 snapshot.timestamp_ns,
             )
         };
+        let snapshot_db = self.time_travel_snapshot_db(&image).await?;
 
         tracing::info!(
             target: "fsqlite.time_travel",
@@ -73809,6 +74067,22 @@ impl Connection {
         // snapshot) instead of calling self.query() which goes through pager.
         let _time_travel_guard = BoolCellRestoreGuard::new(&self.time_travel_active, true);
         self.execute_join_select(&bound, None).await
+    }
+
+    /// The decoded MemDatabase for a snapshot, served from the one-entry cache
+    /// when the same snapshot was decoded last. The returned copy shares row
+    /// storage with the cache, so handing it to a query costs O(tables).
+    async fn time_travel_snapshot_db(&self, image: &Rc<TimeTravelImage>) -> Result<MemDatabase> {
+        if let Some((cached_image, cached_db)) = self.time_travel_materialized.borrow().as_ref()
+            && Rc::ptr_eq(cached_image, image)
+        {
+            return Ok(cached_db.clone_for_snapshot());
+        }
+        let cx = self.op_cx()?;
+        let db = self.materialize_time_travel_image(&cx, image).await?;
+        let handed_out = db.clone_for_snapshot();
+        *self.time_travel_materialized.borrow_mut() = Some((Rc::clone(image), db));
+        Ok(handed_out)
     }
 
     /// Handle ROLLBACK [TO SAVEPOINT name].
@@ -98422,6 +98696,29 @@ impl Connection {
         table: &TableSchema,
         rowid_alias_columns: &HashMap<String, usize>,
     ) -> Result<Vec<(i64, Vec<SqliteValue>)>> {
+        Self::read_storage_table_rows_with_encoding(
+            cx,
+            txn,
+            page_size,
+            reserved_per_page,
+            table,
+            rowid_alias_columns,
+            self.db_text_encoding.get(),
+        )
+        .await
+    }
+
+    /// Read one table's rows from `txn`, decoded as the mirror reload decodes
+    /// them, under an explicit text encoding.
+    async fn read_storage_table_rows_with_encoding(
+        cx: &Cx,
+        txn: &mut TransactionKind,
+        page_size: PageSize,
+        reserved_per_page: u8,
+        table: &TableSchema,
+        rowid_alias_columns: &HashMap<String, usize>,
+        text_encoding: TextEncoding,
+    ) -> Result<Vec<(i64, Vec<SqliteValue>)>> {
         if table.root_page <= 0 {
             return Ok(Vec::new());
         }
@@ -98437,7 +98734,6 @@ impl Connection {
         let ipk_col_idx = rowid_alias_columns
             .get(&table.name.to_ascii_lowercase())
             .copied();
-        let text_encoding = self.db_text_encoding.get();
         let mut rows = Vec::new();
 
         if cursor.first(cx).await? {
@@ -171540,7 +171836,8 @@ mod tests {
             )
             .await
             .unwrap();
-
+            // bd-jdjee: COMMIT and CREATE INDEX leave the :memory: row mirror
+            // stale; the first read after them (this scan) rebuilds it once.
             let scan_rows = conn
                 .query("SELECT * FROM prep_idx_eq_after_scan")
                 .await
@@ -189097,11 +189394,12 @@ mod tests {
             conn.execute("CREATE INDEX idx_products_category ON products(category_id);")
                 .await
                 .unwrap();
-
-            assert!(
-                conn.memdb_storage_count_shortcuts_safe.get(),
-                "CREATE INDEX on an in-memory table should keep the row mirror exact"
-            );
+            // bd-jdjee: this used to assert that the row mirror was exact right
+            // after CREATE INDEX. That held only because the old time-travel
+            // capture reloaded the mirror at every DDL commit (with capture
+            // disabled it failed). The capture now arms a one-time rebuild for
+            // the next read, so the grouped query below still reaches the
+            // MemDatabase scan fast path.
 
             let rows = conn
                 .query(
@@ -239796,8 +240094,12 @@ mod pager_routing_tests {
             .collect()
     }
 
+    /// bd-jdjee: COMMIT on `:memory:` no longer rebuilds the row mirror. That
+    /// rebuild only fed the old time-travel capture, which cloned the mirror;
+    /// capture now reads the committed pages. A dirty mirror stays dirty until
+    /// the next read boundary, exactly as with capture disabled.
     #[test]
-    fn test_lazy_dirty_clear_on_commit() {
+    fn test_lazy_dirty_commit_leaves_mirror_for_next_read() {
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
             conn.execute(
@@ -239808,7 +240110,6 @@ mod pager_routing_tests {
             conn.execute("INSERT INTO lazy_dirty_commit VALUES (1, 'before'), (2, 'keep');")
                 .await
                 .unwrap();
-            let root_page = test_table_root_page(&conn, "lazy_dirty_commit");
 
             let stmt = conn
                 .prepare("UPDATE lazy_dirty_commit SET val = ?1 WHERE id = ?2")
@@ -239835,28 +240136,20 @@ mod pager_routing_tests {
                 "explicit prepared UPDATE should disable MemDatabase count shortcuts while the mirror is dirty"
             );
 
+            let hydrated_before_commit = conn.memdb_row_hydration_count();
             conn.execute("COMMIT;").await.unwrap();
-            assert!(
-                !conn.memdb_requires_active_txn_reload.get(),
-                "COMMIT should clear the deferred active-transaction MemDatabase reload bit"
-            );
-            assert!(
-                conn.memdb_rows_loaded.get(),
-                "COMMIT should rebuild the MemDatabase row image for :memory: connections"
-            );
-            assert!(
-                conn.memdb_storage_count_shortcuts_safe.get(),
-                "COMMIT should restore exact MemDatabase shortcut safety after rebuilding the mirror"
-            );
             assert_eq!(
-                memdb_column_values(&conn, root_page, 1),
-                vec![
-                    (1, SqliteValue::Text("after".into())),
-                    (2, SqliteValue::Text("keep".into())),
-                ],
-                "COMMIT should leave the MemDatabase mirror exact after a lazy dirty explicit UPDATE"
+                conn.memdb_row_hydration_count(),
+                hydrated_before_commit,
+                "COMMIT must not re-decode the table into the MemDatabase mirror"
+            );
+            assert!(
+                !conn.memdb_rows_loaded.get() && !conn.memdb_storage_count_shortcuts_safe.get(),
+                "a mirror left dirty by the transaction stays marked stale after COMMIT, so no \
+                 MemDatabase shortcut can read it"
             );
 
+            // The next read still sees exactly the committed state.
             let rows = conn
                 .query("SELECT id, val FROM lazy_dirty_commit ORDER BY id")
                 .await
@@ -241285,8 +241578,11 @@ mod pager_routing_tests {
         });
     }
 
+    /// bd-jdjee: a large write-only explicit transaction on `:memory:` keeps
+    /// the mirror lazy through COMMIT (COMMIT used to rebuild it for the old
+    /// time-travel capture) and the next read sees every committed row.
     #[test]
-    fn test_prepared_direct_simple_insert_large_explicit_txn_reloads_memdb_once_at_commit_for_memory()
+    fn test_prepared_direct_simple_insert_large_explicit_txn_keeps_memdb_lazy_through_commit_for_memory()
      {
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
@@ -241321,14 +241617,20 @@ mod pager_routing_tests {
                 "large :memory: explicit transactions should not accumulate queued MemDatabase row deltas"
             );
 
+            let hydrated_before_commit = conn.memdb_row_hydration_count();
             conn.execute("COMMIT;").await.unwrap();
             assert!(
                 conn.pending_memdb_direct_upserts.borrow().is_empty(),
                 "COMMIT should not need queued MemDatabase rows for :memory: direct inserts"
             );
+            assert_eq!(
+                conn.memdb_row_hydration_count(),
+                hydrated_before_commit,
+                "COMMIT must not re-decode the written rows into the MemDatabase mirror"
+            );
             assert!(
-                conn.memdb_rows_loaded.get() && conn.memdb_storage_count_shortcuts_safe.get(),
-                "after COMMIT the in-memory MemDatabase mirror should be rebuilt once so COUNT(*) stays on the fast path"
+                !conn.memdb_rows_loaded.get() && !conn.memdb_storage_count_shortcuts_safe.get(),
+                "the mirror stays marked stale after COMMIT, so COUNT(*) cannot use a stale row image"
             );
             let count = conn
                 .query("SELECT COUNT(*) FROM prep_direct_large_dirty")
@@ -241337,13 +241639,16 @@ mod pager_routing_tests {
             assert_eq!(
                 count[0].values()[0],
                 SqliteValue::Integer(PREPARED_DIRECT_INSERT_PENDING_MEMDB_UPSERT_LIMIT as i64 + 1),
-                "the next read should see every committed row without forcing a pager-backed reload"
+                "the next read should see every committed row"
             );
         });
     }
 
+    /// bd-jdjee: BEGIN on `:memory:` leaves a dirty mirror to the next read
+    /// boundary (it used to hydrate it for the old time-travel capture), and
+    /// lazy direct inserts on top of it still read back correctly.
     #[test]
-    fn test_prepared_direct_simple_insert_begin_refreshes_dirty_mirror_before_lazy_insert() {
+    fn test_prepared_direct_simple_insert_begin_keeps_dirty_mirror_lazy_before_lazy_insert() {
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
             conn.execute(
@@ -241361,10 +241666,16 @@ mod pager_routing_tests {
             conn.memdb_storage_count_shortcuts_safe.set(false);
             conn.memdb_requires_active_txn_reload.set(true);
 
+            let hydrated_before_begin = conn.memdb_row_hydration_count();
             conn.execute("BEGIN;").await.unwrap();
             assert!(
-                !conn.memdb_requires_active_txn_reload.get(),
-                "BEGIN should refresh the dirty MemDatabase mirror from the active transaction before lazy direct inserts start"
+                conn.memdb_requires_active_txn_reload.get(),
+                "BEGIN on :memory: should leave the dirty MemDatabase mirror armed for the next read boundary"
+            );
+            assert_eq!(
+                conn.memdb_row_hydration_count(),
+                hydrated_before_begin,
+                "BEGIN on :memory: should not hydrate the row mirror"
             );
             let affected = conn
                 .execute_prepared_with_params(&stmt, &[SqliteValue::Integer(1)])
@@ -241373,7 +241684,7 @@ mod pager_routing_tests {
             assert_eq!(affected, 1);
             assert!(
                 conn.pending_memdb_direct_upserts.borrow().is_empty(),
-                "once BEGIN refreshes the dirty MemDatabase mirror, the next :memory: direct insert should keep it lazy instead of queueing row deltas"
+                "a :memory: direct insert over a stale mirror should keep it lazy instead of queueing row deltas"
             );
             assert!(
                 conn.memdb_requires_active_txn_reload.get(),
@@ -245642,6 +245953,11 @@ mod pager_routing_tests {
                 .await
                 .unwrap();
             conn.execute("COMMIT;").await.unwrap();
+            // bd-jdjee: COMMIT leaves the :memory: row mirror lazy (it used to
+            // rebuild it for the old time-travel capture). Hydrate it, so this
+            // exercises cache seeding over the exact mirror that path requires.
+            let cx = conn.op_cx().unwrap();
+            conn.reload_memdb_from_pager(&cx).await.unwrap();
 
             let aggregate = conn
                 .prepare("SELECT COUNT(*), SUM(score) FROM mem_retained_count_sum_interest_insert;")
@@ -245859,6 +246175,11 @@ mod pager_routing_tests {
                 .await
                 .unwrap();
             conn.execute("COMMIT;").await.unwrap();
+            // bd-jdjee: COMMIT leaves the :memory: row mirror lazy (it used to
+            // rebuild it for the old time-travel capture). Hydrate it, so this
+            // exercises cache seeding over the exact mirror that path requires.
+            let cx = conn.op_cx().unwrap();
+            conn.reload_memdb_from_pager(&cx).await.unwrap();
 
             let aggregate = conn
                 .prepare("SELECT COUNT(*), SUM(score) FROM mem_retained_count_sum_interest_update;")
@@ -245954,6 +246275,11 @@ mod pager_routing_tests {
                 .await
                 .unwrap();
             conn.execute("COMMIT;").await.unwrap();
+            // bd-jdjee: COMMIT leaves the :memory: row mirror lazy (it used to
+            // rebuild it for the old time-travel capture). Hydrate it, so this
+            // exercises cache seeding over the exact mirror that path requires.
+            let cx = conn.op_cx().unwrap();
+            conn.reload_memdb_from_pager(&cx).await.unwrap();
 
             let aggregate = conn
                 .prepare("SELECT COUNT(*), SUM(score) FROM mem_retained_count_sum_interest_delete;")
@@ -254449,16 +254775,19 @@ mod pager_routing_tests {
                 .unwrap();
             conn.execute("COMMIT;").await.unwrap();
 
-            let snaps = conn.time_travel_snapshots.borrow();
+            let snaps: Vec<(u64, u64, Rc<TimeTravelImage>)> = conn
+                .time_travel_snapshots
+                .borrow()
+                .iter()
+                .map(|snap| (snap.commit_seq, snap.timestamp_ns, Rc::clone(&snap.image)))
+                .collect();
             eprintln!("snapshot count: {}", snaps.len());
-            for snap in snaps.iter() {
-                let table_count = snap.db.tables.len();
-                eprintln!(
-                    "  seq={}, tables={}, timestamp_ns={}",
-                    snap.commit_seq, table_count, snap.timestamp_ns
-                );
+            for (commit_seq, timestamp_ns, image) in &snaps {
+                let db = conn.time_travel_snapshot_db(image).await.unwrap();
+                let table_count = db.tables.len();
+                eprintln!("  seq={commit_seq}, tables={table_count}, timestamp_ns={timestamp_ns}");
                 // Check if the table has rows by looking at the tables.
-                for (root_page, table) in snap.db.tables.iter() {
+                for (root_page, table) in db.tables.iter() {
                     let row_count = table.iter_rows().count();
                     eprintln!(
                         "    root_page={}, num_columns={}, rows={}",
@@ -254466,15 +254795,13 @@ mod pager_routing_tests {
                     );
                 }
             }
-            drop(snaps);
 
             // Verify snapshot at seq 2 has 1 row.
-            let snaps = conn.time_travel_snapshots.borrow();
-            let snap_seq2 = snaps.iter().find(|s| s.commit_seq == 2);
+            let snap_seq2 = snaps.iter().find(|(commit_seq, _, _)| *commit_seq == 2);
             assert!(snap_seq2.is_some(), "snapshot at seq 2 should exist");
-            let snap = snap_seq2.unwrap();
-            let total_rows: usize = snap
-                .db
+            let (_, _, image) = snap_seq2.unwrap();
+            let db = conn.time_travel_snapshot_db(image).await.unwrap();
+            let total_rows: usize = db
                 .tables
                 .iter()
                 .map(|(_, t)| t.iter_rows().count())
@@ -254496,12 +254823,13 @@ mod pager_routing_tests {
                 .unwrap_or(0)
                 .saturating_add(1_000_000_000);
 
+            let seed_image = conn.capture_time_travel_image().await.unwrap();
             conn.time_travel_snapshots
                 .borrow_mut()
                 .push(TimeTravelSnapshotEntry {
                     commit_seq: 41,
                     timestamp_ns: future_timestamp,
-                    db: conn.db.borrow().clone(),
+                    image: Rc::new(seed_image),
                 });
 
             conn.capture_time_travel_snapshot(42).await;

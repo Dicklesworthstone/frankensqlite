@@ -775,14 +775,20 @@ pub struct MemTable {
     /// actual row widths may vary).
     pub num_columns: usize,
     /// Rows kept in ascending rowid order.
-    rows: Vec<MemRow>,
+    ///
+    /// bd-jdjee: shared copy-on-write. Cloning a table (and therefore a whole
+    /// `MemDatabase`, as `:memory:` time-travel snapshots do at every DDL and
+    /// explicit COMMIT) shares the row vector; the first mutation of a shared
+    /// table copies it once through [`Self::rows_mut`]. Every mutation must go
+    /// through `rows_mut`, which `Arc` enforces at compile time.
+    rows: Arc<Vec<MemRow>>,
     /// Next auto-increment rowid.
     next_rowid: i64,
     /// UNIQUE constraints tracked for MemDatabase-side enforcement. Builtin
     /// collations (`BINARY`, `NOCASE`, `RTRIM`) use canonical byte-key
     /// indexes; other collations fall back to an exact row scan through the
-    /// shared collation registry.
-    unique_constraints: Vec<UniqueConstraintState>,
+    /// shared collation registry. Shared copy-on-write like `rows`.
+    unique_constraints: Arc<Vec<UniqueConstraintState>>,
     /// Shared collation registry consulted when a UNIQUE constraint uses a
     /// non-builtin collation that cannot be normalized into a byte key.
     collation_registry: Arc<Mutex<CollationRegistry>>,
@@ -793,11 +799,24 @@ impl MemTable {
     fn new(num_columns: usize) -> Self {
         Self {
             num_columns,
-            rows: Vec::new(),
+            rows: Arc::new(Vec::new()),
             next_rowid: 1,
-            unique_constraints: Vec::new(),
+            unique_constraints: Arc::new(Vec::new()),
             collation_registry: Arc::new(Mutex::new(CollationRegistry::new())),
         }
+    }
+
+    /// Mutable access to the rows, copying them first if a snapshot shares them.
+    #[inline]
+    fn rows_mut(&mut self) -> &mut Vec<MemRow> {
+        Arc::make_mut(&mut self.rows)
+    }
+
+    /// Mutable access to the UNIQUE constraint state, copying it first if a
+    /// snapshot shares it.
+    #[inline]
+    fn unique_constraints_mut(&mut self) -> &mut Vec<UniqueConstraintState> {
+        Arc::make_mut(&mut self.unique_constraints)
     }
 
     pub fn set_collation_registry(&mut self, registry: Arc<Mutex<CollationRegistry>>) {
@@ -832,7 +851,7 @@ impl MemTable {
     ) {
         let mut constraint = UniqueConstraintState::new(cols, collations, label);
         if let Some(index) = constraint.index.as_mut() {
-            for row in &self.rows {
+            for row in self.rows.iter() {
                 if let Some(key) = Self::unique_key_for_constraint(
                     &row.values,
                     &constraint.columns,
@@ -842,7 +861,7 @@ impl MemTable {
                 }
             }
         }
-        self.unique_constraints.push(constraint);
+        self.unique_constraints_mut().push(constraint);
     }
 
     /// Remove one matching UNIQUE constraint from the in-memory table.
@@ -873,7 +892,7 @@ impl MemTable {
         }) else {
             return false;
         };
-        self.unique_constraints.remove(position);
+        self.unique_constraints_mut().remove(position);
         true
     }
 
@@ -891,7 +910,7 @@ impl MemTable {
         let constraint = UniqueConstraintState::new(cols.to_vec(), collations.to_vec(), None);
         if constraint.index.is_some() {
             let mut seen = HashSet::new();
-            for row in &self.rows {
+            for row in self.rows.iter() {
                 if let Some(key) = Self::unique_key_for_constraint(
                     &row.values,
                     &constraint.columns,
@@ -929,7 +948,7 @@ impl MemTable {
     pub fn find_unique_conflicts(&self, new_values: &[SqliteValue]) -> Vec<i64> {
         let mut conflicts = BTreeSet::new();
         let mut collations = None;
-        for constraint in &self.unique_constraints {
+        for constraint in self.unique_constraints.iter() {
             if let Some(index) = &constraint.index {
                 if let Some(key) = Self::unique_key_for_constraint(
                     new_values,
@@ -947,7 +966,7 @@ impl MemTable {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
             });
-            for row in &self.rows {
+            for row in self.rows.iter() {
                 if Self::unique_constraint_matches_row(
                     &row.values,
                     new_values,
@@ -973,7 +992,7 @@ impl MemTable {
     #[must_use]
     pub fn find_unique_conflict_label(&self, new_values: &[SqliteValue]) -> Option<&str> {
         let mut collations = None;
-        for constraint in &self.unique_constraints {
+        for constraint in self.unique_constraints.iter() {
             let violated = if let Some(index) = &constraint.index {
                 Self::unique_key_for_constraint(
                     new_values,
@@ -1041,7 +1060,7 @@ impl MemTable {
         }
         let new_keys = self.unique_keys_for_values(&values);
         if self.rows.last().is_none_or(|row| row.rowid < rowid) {
-            self.rows.push(MemRow { rowid, values });
+            self.rows_mut().push(MemRow { rowid, values });
             self.insert_unique_keys(rowid, &new_keys);
             return;
         }
@@ -1049,14 +1068,14 @@ impl MemTable {
         match self.rows.binary_search_by_key(&rowid, |r| r.rowid) {
             Ok(idx) => {
                 let old_values = {
-                    let row = &mut self.rows[idx];
+                    let row = &mut self.rows_mut()[idx];
                     std::mem::replace(&mut row.values, values)
                 };
                 self.remove_unique_entries(rowid, &old_values);
                 self.insert_unique_keys(rowid, &new_keys);
             }
             Err(idx) => {
-                self.rows.insert(idx, MemRow { rowid, values });
+                self.rows_mut().insert(idx, MemRow { rowid, values });
                 self.insert_unique_keys(rowid, &new_keys);
             }
         }
@@ -1065,7 +1084,7 @@ impl MemTable {
     /// Delete a row by rowid. Returns true if a row was found and deleted.
     pub fn delete_by_rowid(&mut self, rowid: i64) -> bool {
         if let Ok(idx) = self.rows.binary_search_by_key(&rowid, |r| r.rowid) {
-            let row = self.rows.remove(idx);
+            let row = self.rows_mut().remove(idx);
             self.remove_unique_entries(row.rowid, &row.values);
             true
         } else {
@@ -1075,11 +1094,38 @@ impl MemTable {
 
     /// Remove all rows from the table.
     pub fn clear(&mut self) {
-        self.rows.clear();
-        for constraint in &mut self.unique_constraints {
-            if let Some(index) = constraint.index.as_mut() {
-                index.clear();
+        // A shared row vector is replaced rather than copied just to be emptied.
+        match Arc::get_mut(&mut self.rows) {
+            Some(rows) => rows.clear(),
+            None => self.rows = Arc::new(Vec::new()),
+        }
+        if self
+            .unique_constraints
+            .iter()
+            .all(|constraint| constraint.index.as_ref().is_none_or(BTreeMap::is_empty))
+        {
+            return;
+        }
+        if let Some(constraints) = Arc::get_mut(&mut self.unique_constraints) {
+            for constraint in constraints {
+                if let Some(index) = constraint.index.as_mut() {
+                    index.clear();
+                }
             }
+        } else {
+            // Shared with a snapshot: rebuild the constraint list with empty
+            // indexes instead of deep-copying indexes that are about to be dropped.
+            self.unique_constraints = Arc::new(
+                self.unique_constraints
+                    .iter()
+                    .map(|constraint| UniqueConstraintState {
+                        columns: constraint.columns.clone(),
+                        collations: constraint.collations.clone(),
+                        index: constraint.index.as_ref().map(|_| BTreeMap::new()),
+                        label: constraint.label.clone(),
+                    })
+                    .collect(),
+            );
         }
     }
 
@@ -1089,7 +1135,7 @@ impl MemTable {
     /// visible with the new column's default value.
     pub fn pad_rows_to_column_count(&mut self, target_cols: usize, default_val: &SqliteValue) {
         self.num_columns = target_cols;
-        for row in &mut self.rows {
+        for row in self.rows_mut() {
             while row.values.len() < target_cols {
                 row.values.push(default_val.clone());
             }
@@ -1107,7 +1153,7 @@ impl MemTable {
     ) {
         for (rowid, value) in values {
             if let Ok(idx) = self.rows.binary_search_by_key(&rowid, |r| r.rowid)
-                && let Some(cell) = self.rows[idx].values.get_mut(column)
+                && let Some(cell) = self.rows_mut()[idx].values.get_mut(column)
             {
                 *cell = value;
             }
@@ -1122,12 +1168,12 @@ impl MemTable {
     /// rewritten row image when `ALTER TABLE ... DROP COLUMN` removes a slot.
     fn remove_column_from_rows(&mut self, removed_slot: usize) {
         self.num_columns = self.num_columns.saturating_sub(1);
-        for row in &mut self.rows {
+        for row in self.rows_mut() {
             if removed_slot < row.values.len() {
                 row.values.remove(removed_slot);
             }
         }
-        for constraint in &mut self.unique_constraints {
+        for constraint in self.unique_constraints_mut() {
             for column in &mut constraint.columns {
                 if *column > removed_slot {
                     *column -= 1;
@@ -1292,7 +1338,10 @@ impl MemTable {
     }
 
     fn remove_unique_entries(&mut self, rowid: i64, values: &[SqliteValue]) {
-        for constraint in &mut self.unique_constraints {
+        if self.unique_constraints.iter().all(|constraint| constraint.index.is_none()) {
+            return;
+        }
+        for constraint in self.unique_constraints_mut() {
             let Some(index) = constraint.index.as_mut() else {
                 continue;
             };
@@ -1331,7 +1380,10 @@ impl MemTable {
     }
 
     fn insert_unique_keys(&mut self, rowid: i64, keys: &[Option<Vec<u8>>]) {
-        for (maybe_key, constraint) in keys.iter().zip(&mut self.unique_constraints) {
+        if keys.iter().all(Option::is_none) {
+            return;
+        }
+        for (maybe_key, constraint) in keys.iter().zip(self.unique_constraints_mut()) {
             if let (Some(key), Some(index)) = (maybe_key, constraint.index.as_mut()) {
                 index.entry(key.clone()).or_default().insert(rowid);
             }
@@ -1339,13 +1391,17 @@ impl MemTable {
     }
 
     fn rebuild_unique_indexes(&mut self) {
-        for constraint in &mut self.unique_constraints {
+        if self.unique_constraints.iter().all(|constraint| constraint.index.is_none()) {
+            return;
+        }
+        let constraints = Arc::make_mut(&mut self.unique_constraints);
+        for constraint in constraints.iter_mut() {
             if let Some(index) = constraint.index.as_mut() {
                 index.clear();
             }
         }
-        for row in &self.rows {
-            for constraint in &mut self.unique_constraints {
+        for row in self.rows.iter() {
+            for constraint in constraints.iter_mut() {
                 let Some(index) = constraint.index.as_mut() else {
                     continue;
                 };
@@ -4783,6 +4839,24 @@ impl MemDatabase {
         }
     }
 
+    /// Clone for a read-only snapshot (bd-jdjee).
+    ///
+    /// Tables share their row storage copy-on-write, so this costs O(tables),
+    /// not O(rows). The undo and statement bookkeeping start fresh: a snapshot
+    /// never rolls back, and copying an in-flight transaction's undo records
+    /// into it would only pin their memory.
+    #[must_use]
+    pub fn clone_for_snapshot(&self) -> Self {
+        Self {
+            tables: self.tables.clone(),
+            next_root_page: self.next_root_page,
+            undo_enabled: true,
+            undo_log: Vec::new(),
+            statement_undo_marks: Vec::new(),
+            in_explicit_txn: false,
+        }
+    }
+
     /// Propagate a shared collation registry to all tracked MemTables.
     pub fn set_collation_registry(&mut self, registry: Arc<Mutex<CollationRegistry>>) {
         for (_, table) in self.tables.iter_mut() {
@@ -5134,7 +5208,7 @@ impl MemDatabase {
             && let Ok(index) = table.rows.binary_search_by_key(&rowid, |r| r.rowid)
         {
             let prev_next_rowid = table.next_rowid;
-            let row = table.rows.remove(index);
+            let row = table.rows_mut().remove(index);
             table.remove_unique_entries(row.rowid, &row.values);
             self.push_undo(MemDbUndoOp::DeleteRow {
                 root_page,
@@ -5152,7 +5226,7 @@ impl MemDatabase {
         if let Some(table) = self.tables.get_mut(&root_page) {
             if index < table.rows.len() {
                 let prev_next_rowid = table.next_rowid;
-                let row = table.rows.remove(index);
+                let row = table.rows_mut().remove(index);
                 table.remove_unique_entries(row.rowid, &row.values);
                 self.push_undo(MemDbUndoOp::DeleteRow {
                     root_page,
@@ -18101,7 +18175,7 @@ impl VdbeEngine {
         if is_table_btree
             && let Some(table) = self.db.as_ref().and_then(|db| db.get_table(root_page))
         {
-            for row in &table.rows {
+            for row in table.rows.iter() {
                 let payload = encode_record_with_encoding(&row.values, self.text_encoding);
                 if let Err(err) = cursor.table_insert(&cx, row.rowid, &payload).await {
                     return if matches!(err, FrankenError::Abort) {
@@ -30007,7 +30081,7 @@ mod tests {
         table.insert(1, vec![SqliteValue::Integer(42)]);
         // Deliberate inconsistent-state control: a row-only emptiness check
         // would incorrectly leave this unique-key entry in place.
-        table.rows.clear();
+        table.rows_mut().clear();
         assert_eq!(
             table.find_unique_conflicts(&[SqliteValue::Integer(42)]),
             vec![1]
