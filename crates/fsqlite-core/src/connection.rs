@@ -26638,7 +26638,7 @@ impl Connection {
         expr: &Expr,
         values: &[SqliteValue],
         columns: &[ResultColumn],
-        group_rows: &[Vec<SqliteValue>],
+        group_rows: &[&Vec<SqliteValue>],
         col_map: &[(String, String, bool)],
     ) -> Result<bool> {
         self.with_fallback_function_registry(|| {
@@ -83153,11 +83153,13 @@ impl Connection {
                 } else {
                     having
                 };
+                // The min()/max() extremum row was already moved to the front.
+                let group_row_refs: Vec<&Vec<SqliteValue>> = group_rows.iter().collect();
                 if !self.evaluate_having_predicate_with_registry(
                     effective_having,
                     &values,
                     &expanded_columns,
-                    group_rows,
+                    &group_row_refs,
                     &col_map,
                 )? {
                     continue;
@@ -84814,7 +84816,7 @@ impl Connection {
                     effective_having,
                     &values,
                     columns,
-                    &group_rows,
+                    &included_rows,
                     &empty_col_map,
                 )?
             }
@@ -89069,11 +89071,25 @@ impl Connection {
                 } else {
                     having
                 };
+                // bd-xik4y: HAVING's bare columns read the same row as the
+                // result columns — the min()/max() extremum row when that
+                // tracking applies (the evaluator reads bare values from the
+                // first row; the lone min()/max() and count() are order-free).
+                let group_row_refs: Vec<&Vec<SqliteValue>> = if minmax_bare_tracking.is_some()
+                    && let Some(repr) = repr_row
+                {
+                    let mut ordered = Vec::with_capacity(group_rows.len());
+                    ordered.push(repr);
+                    ordered.extend(group_rows.iter().filter(|row| !std::ptr::eq(*row, repr)));
+                    ordered
+                } else {
+                    group_rows.iter().collect()
+                };
                 if !self.evaluate_having_predicate_with_registry(
                     effective_having,
                     &values,
                     &expanded_columns,
-                    group_rows,
+                    &group_row_refs,
                     &col_map,
                 )? {
                     continue;
@@ -89123,7 +89139,22 @@ impl Connection {
                             } else {
                                 expr
                             };
-                            let refs: Vec<&Vec<SqliteValue>> = group_rows.iter().collect();
+                            // bd-xik4y: as for the result columns, bare leaves
+                            // nested in the aggregate expression read the first
+                            // row, so the min()/max() extremum row goes first.
+                            let refs: Vec<&Vec<SqliteValue>> = if minmax_bare_tracking.is_some()
+                                && let Some(index) = result_representative_indices[result_index]
+                                && let Some(repr) = group_rows.get(index)
+                            {
+                                let mut ordered = Vec::with_capacity(group_rows.len());
+                                ordered.push(repr);
+                                ordered.extend(
+                                    group_rows.iter().filter(|row| !std::ptr::eq(*row, repr)),
+                                );
+                                ordered
+                            } else {
+                                group_rows.iter().collect()
+                            };
                             self.with_fallback_function_registry(|| {
                                 eval_group_agg_join_expr(effective, &refs, &col_map)
                             })?
@@ -103667,57 +103698,69 @@ fn select_minmax_bare_tracking(select: &SelectStatement) -> Option<(bool, Expr, 
             return None;
         }
     }
-    if state.agg_count != 1 || !state.has_bare {
-        return None;
-    }
-    // bd-xik4y: SQLite keeps tracking the extremum row under a HAVING clause
-    // (`SELECT max(v), b ... HAVING max(v) > 0`). Admit a HAVING whose only
-    // aggregates repeat the tracked min()/max(), so the query still has a single
-    // aggregate. HAVING is evaluated against the group's unordered rows, so a
-    // bare column or subquery inside it stays on the existing path.
+    // bd-xik4y: SQLite keeps tracking the extremum row under a HAVING clause.
+    // HAVING's aggregates join the same AggInfo, so a min()/max() there is the
+    // tracked aggregate too (`SELECT c, b ... GROUP BY c HAVING max(a) > 0`
+    // reads b from the max row), and HAVING's own bare columns and subqueries
+    // read the same accumulator row as the result columns
+    // (`SELECT max(a), b ... HAVING b LIKE 'y%'` tests the max row's b).
     if let Some(having) = having.as_deref() {
-        let tracked = state.minmax.as_ref()?;
-        if !having_admits_minmax_bare_tracking(having, columns, group_by, tracked) {
+        walk_aliased_minmax_bare_tracking(having, columns, group_by, &mut state);
+        if state.bail {
             return None;
         }
+    }
+    if state.agg_count != 1 {
+        return None;
+    }
+    // ORDER BY reads bare columns from the same row
+    // (`SELECT c, max(a) ... GROUP BY c ORDER BY b` sorts by the max row's b).
+    // Only its bare reads count here: a different min()/max() in ORDER BY
+    // leaves stock's bare-row choice documented-arbitrary, so it does not
+    // switch the tracking off.
+    if !state.has_bare {
+        for term in &select.order_by {
+            let mut order_state = MinMaxBareTrackingWalk {
+                minmax: state.minmax.clone(),
+                ..MinMaxBareTrackingWalk::default()
+            };
+            walk_aliased_minmax_bare_tracking(&term.expr, columns, group_by, &mut order_state);
+            if !order_state.bail && order_state.has_bare {
+                state.has_bare = true;
+                break;
+            }
+        }
+    }
+    if !state.has_bare {
+        return None;
     }
     state.minmax
 }
 
-/// bd-xik4y: whether `expr` (a HAVING clause) keeps the single-min()/max()
-/// bare-column rule intact: every aggregate call in it is the tracked one (or a
-/// count()), and it reads no bare column (outside GROUP BY keys and the tracked
-/// aggregate's argument) and no subquery. A bare name that is a result alias
+/// bd-xik4y: walk a HAVING or ORDER BY expression into `state` for
+/// [`select_minmax_bare_tracking`]. Every aggregate call in it must be the
+/// tracked min()/max() (or a count()); a bare name that is a result alias
 /// (`SELECT max(a) AS m ... HAVING m > 0`) stands for that result expression,
-/// as HAVING resolves it in SQLite.
-fn having_admits_minmax_bare_tracking(
+/// as SQLite resolves it.
+fn walk_aliased_minmax_bare_tracking(
     expr: &Expr,
     columns: &[ResultColumn],
     group_by: &[Expr],
-    tracked: &(bool, Expr, Option<Expr>),
-) -> bool {
-    let mut state = MinMaxBareTrackingWalk {
-        result_aliases: columns
-            .iter()
-            .filter_map(|column| match column {
-                ResultColumn::Expr {
-                    expr,
-                    alias: Some(alias),
-                } => Some((alias.clone(), expr.clone())),
-                _ => None,
-            })
-            .collect(),
-        ..MinMaxBareTrackingWalk::default()
-    };
-    walk_minmax_bare_tracking(expr, group_by, &mut state);
-    if state.bail || state.has_bare {
-        return false;
-    }
-    match (&state.minmax, state.agg_count) {
-        (None, 0) => true,
-        (Some(found), 1) => found == tracked,
-        _ => false,
-    }
+    state: &mut MinMaxBareTrackingWalk,
+) {
+    let aliases = columns
+        .iter()
+        .filter_map(|column| match column {
+            ResultColumn::Expr {
+                expr,
+                alias: Some(alias),
+            } => Some((alias.clone(), expr.clone())),
+            _ => None,
+        })
+        .collect();
+    let previous = std::mem::replace(&mut state.result_aliases, aliases);
+    walk_minmax_bare_tracking(expr, group_by, state);
+    state.result_aliases = previous;
 }
 
 /// Traversal state for [`select_minmax_bare_tracking`].
@@ -130703,11 +130746,13 @@ pub(crate) fn is_sqlite_truthy(v: &SqliteValue) -> bool {
 ///
 /// `group_rows` and `col_map` allow computing aggregates that are not in the
 /// SELECT list (e.g. `HAVING COUNT(*) > 1` when COUNT(*) is not a result column).
+/// Bare columns read the FIRST of `group_rows`, so a caller tracking the
+/// single-min()/max() extremum row passes that row first (bd-xik4y).
 fn evaluate_having_predicate(
     expr: &Expr,
     values: &[SqliteValue],
     columns: &[ResultColumn],
-    group_rows: &[Vec<SqliteValue>],
+    group_rows: &[&Vec<SqliteValue>],
     col_map: &[(String, String, bool)],
 ) -> Result<bool> {
     Ok(is_sqlite_truthy(&evaluate_having_value(
@@ -130748,7 +130793,7 @@ fn evaluate_having_value(
     expr: &Expr,
     values: &[SqliteValue],
     columns: &[ResultColumn],
-    group_rows: &[Vec<SqliteValue>],
+    group_rows: &[&Vec<SqliteValue>],
     col_map: &[(String, String, bool)],
 ) -> Result<SqliteValue> {
     match expr {
@@ -130760,8 +130805,7 @@ fn evaluate_having_value(
         Expr::FunctionCall { name, args, .. }
             if is_current_aggregate_fn(name, args) && !is_scalar_max_min(name, args) =>
         {
-            let group_row_refs = group_rows.iter().collect::<Vec<_>>();
-            eval_group_agg_join_expr(expr, &group_row_refs, col_map)
+            eval_group_agg_join_expr(expr, group_rows, col_map)
         }
 
         // Column reference — find matching plain column in result set or raw data.
@@ -131293,7 +131337,7 @@ fn evaluate_having_value(
                 LikeOp::Like => simple_like_match(&p, &s, esc_char),
                 LikeOp::Glob => simple_glob_match(&p, &s),
                 LikeOp::Match => {
-                    let match_row = group_rows.first().map_or(&[][..], Vec::as_slice);
+                    let match_row = group_rows.first().map_or(&[][..], |row| row.as_slice());
                     match_query_with_table_columns(inner, &p, &s, match_row, col_map)
                 }
                 // REGEXP requires a user-defined function; this fallback

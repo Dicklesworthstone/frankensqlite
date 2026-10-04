@@ -7,7 +7,8 @@
 //! each group's first row:
 //! `SELECT max(v), b FROM (SELECT a AS v, b FROM t ORDER BY a)` returned the
 //! NULL row's `b`. A HAVING that repeats the tracked aggregate also dropped
-//! the tracking on every path.
+//! the tracking on every path, and a HAVING that reads a bare column (or holds
+//! the only min()/max()) was evaluated against the group's first row.
 //!
 //! Unaliased result expressions were named `_cN` by `column_names()`; SQLite
 //! names them by their source text (`max(v)`, `x + 1`, `(a)`).
@@ -127,6 +128,30 @@ const VALUE_QUERIES: &[&str] = &[
     "SELECT max(t.a), count(*), u.x FROM t JOIN u ON u.a = t.a",
     "SELECT max(t.a), u.x, max(t.a) * 2 FROM t JOIN u ON u.a = t.a",
     "SELECT max(t.a) AS m, u.x, t.c FROM t JOIN u ON u.a = t.a GROUP BY t.c HAVING m > 1 ORDER BY t.c",
+    // HAVING reads the same row as the result columns: its bare columns and
+    // subqueries see the extremum row, and a min()/max() that appears only in
+    // HAVING is the tracked aggregate (group c=3's extremum is not its first
+    // row). The single-table path read HAVING's bare columns from the group's
+    // first row, so `HAVING b = 'b6'` could drop the max row's group or keep a
+    // group whose reported row fails the predicate.
+    "SELECT c, max(a), b FROM t GROUP BY c HAVING b > 'b1' ORDER BY c",
+    "SELECT c, max(a) FROM t GROUP BY c HAVING b = 'b5' ORDER BY c",
+    "SELECT c, max(a) FROM t GROUP BY c HAVING (SELECT b) = 'b5' ORDER BY c",
+    "SELECT c, b FROM t GROUP BY c HAVING max(a) > 0 ORDER BY c",
+    "SELECT c, b FROM t GROUP BY c HAVING min(a) IS NOT NULL ORDER BY c",
+    "SELECT c, count(*), b FROM t GROUP BY c HAVING max(a) > 0 ORDER BY c",
+    "SELECT max(a) AS m, c FROM t GROUP BY c HAVING m > 4 AND b > 'b4' ORDER BY c",
+    "SELECT max(a), b FROM t HAVING b = 'b6'",
+    "SELECT max(a), b FROM t HAVING b = 'b1'",
+    "SELECT max(a), b FROM t WHERE c <> 2 HAVING b IS NOT NULL",
+    "SELECT g, max(a), b FROM z GROUP BY g HAVING b <> 'y1' ORDER BY g",
+    "SELECT max(v), b FROM (SELECT a AS v, b FROM t ORDER BY a) HAVING b = 'b6'",
+    "SELECT t.c, max(t.a), u.x FROM t JOIN u ON u.a = t.a GROUP BY t.c HAVING u.x > 'x3' ORDER BY t.c",
+    // ORDER BY sorts by the extremum row's bare columns, also when they are not
+    // result columns or are nested in an expression with the aggregate.
+    "SELECT c, max(a) FROM t GROUP BY c ORDER BY b",
+    "SELECT c, max(a) FROM t GROUP BY c ORDER BY b || max(a)",
+    "SELECT c, max(a), b FROM t GROUP BY c ORDER BY b || max(a) DESC",
 ];
 
 /// Unaliased result expressions are named by their source text.
