@@ -39494,21 +39494,17 @@ impl Connection {
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
                     let limit_clause = bound.limit.take();
-                    // bd-xvtao: a mixed main+attached JOIN with GROUP BY or
-                    // aggregates must run through the aggregation-aware join path;
-                    // execute_join_select alone returns raw un-grouped rows and
-                    // evaluates aggregates (e.g. sum()) as scalars -> NULL.
-                    let needs_grouped_window = self.select_requires_grouped_window_pipeline(select);
-                    let needs_aggregation = has_group_by(select)
-                        || self.has_implicit_aggregation_with_registry(select)
-                        || has_ordered_aggregate(select);
-                    let mut rows = if needs_grouped_window {
-                        Box::pin(self.execute_group_by_window_select(cx, &bound, None)).await?
-                    } else if needs_aggregation && has_joins(select) {
-                        Box::pin(self.execute_group_by_join_select(cx, &bound, None)).await?
-                    } else {
-                        Box::pin(self.execute_join_select(&bound, None)).await?
-                    };
+                    // bd-xvtao / bd-gjlhh: route by shape. The plain join
+                    // executor returns raw un-grouped rows and evaluates
+                    // aggregates as scalars (NULL per row), and rejects a
+                    // FROM-less body ("JOIN on non-SELECT core"), so only a
+                    // join used to get the aggregate path.
+                    let mut rows = Box::pin(self.execute_interpreted_select_by_shape(
+                        cx,
+                        rewritten.as_ref(),
+                        &bound,
+                    ))
+                    .await?;
                     if let Some(limit) = limit_clause {
                         self.apply_limit_clause(&mut rows, &limit, None)?;
                     }
@@ -72931,43 +72927,8 @@ impl Connection {
                     let rewritten = self.rewrite_in_subqueries_select(select, params).await?;
                     let bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
-                    let is_fromless_select = matches!(
-                        &rewritten.body.select,
-                        SelectCore::Select { from: None, .. }
-                    );
-                    if is_fromless_select {
-                        if expression_only_has_window_functions(rewritten.as_ref()) {
-                            self.execute_fromless_window_select(&bound, None).await
-                        } else if self.has_implicit_aggregation_with_registry(rewritten.as_ref())
-                            || has_group_by(rewritten.as_ref())
-                        {
-                            self.execute_fromless_aggregate(&bound, None).await
-                        } else {
-                            self.execute_expression_only_with_subqueries(&bound, None)
-                                .await
-                        }
-                    } else if matches!(&rewritten.body.select, SelectCore::Values(_)) {
-                        // VALUES may contain the same catalog scalar subqueries as
-                        // a FROM-less SELECT, but preserves one output row per
-                        // VALUES tuple rather than the SELECT path's single row.
-                        if expression_only_has_window_functions(rewritten.as_ref()) {
-                            self.execute_fromless_window_select(&bound, None).await
-                        } else {
-                            self.execute_expression_only_with_subqueries(&bound, None)
-                                .await
-                        }
-                    } else if self.select_requires_grouped_window_pipeline(rewritten.as_ref()) {
-                        self.execute_group_by_window_select(&cx, &bound, None).await
-                    } else if has_group_by(rewritten.as_ref())
-                        || self.has_implicit_aggregation_with_registry(rewritten.as_ref())
-                        || has_ordered_aggregate(rewritten.as_ref())
-                    {
-                        self.execute_group_by_join_select(&cx, &bound, None).await
-                    } else if has_window_functions(rewritten.as_ref()) {
-                        self.execute_window_select(&bound, None).await
-                    } else {
-                        self.execute_join_select(&bound, None).await
-                    }
+                    self.execute_interpreted_select_by_shape(&cx, rewritten.as_ref(), &bound)
+                        .await
                 }
                 .await
             }
@@ -73337,6 +73298,50 @@ impl Connection {
                     .any(|shadow| shadow.eq_ignore_ascii_case(table_name))
                     .then(|| table.name.clone())
             })
+    }
+
+    /// Run an already-rewritten and bound SELECT through the connection-level
+    /// interpreted executor that fits its shape: FROM-less and VALUES bodies,
+    /// grouped windows, aggregates over any FROM (joins, a single table, a
+    /// subquery), window functions, or a plain scan. `shape` is the statement
+    /// the routing tests read; `bound` is the one executed.
+    async fn execute_interpreted_select_by_shape(
+        &self,
+        cx: &Cx,
+        shape: &SelectStatement,
+        bound: &SelectStatement,
+    ) -> Result<Vec<Row>> {
+        if matches!(&shape.body.select, SelectCore::Select { from: None, .. }) {
+            if expression_only_has_window_functions(shape) {
+                self.execute_fromless_window_select(bound, None).await
+            } else if self.has_implicit_aggregation_with_registry(shape) || has_group_by(shape) {
+                self.execute_fromless_aggregate(bound, None).await
+            } else {
+                self.execute_expression_only_with_subqueries(bound, None)
+                    .await
+            }
+        } else if matches!(&shape.body.select, SelectCore::Values(_)) {
+            // VALUES may contain the same scalar subqueries as a FROM-less
+            // SELECT, but preserves one output row per VALUES tuple rather
+            // than the SELECT path's single row.
+            if expression_only_has_window_functions(shape) {
+                self.execute_fromless_window_select(bound, None).await
+            } else {
+                self.execute_expression_only_with_subqueries(bound, None)
+                    .await
+            }
+        } else if self.select_requires_grouped_window_pipeline(shape) {
+            self.execute_group_by_window_select(cx, bound, None).await
+        } else if has_group_by(shape)
+            || self.has_implicit_aggregation_with_registry(shape)
+            || has_ordered_aggregate(shape)
+        {
+            self.execute_group_by_join_select(cx, bound, None).await
+        } else if has_window_functions(shape) {
+            self.execute_window_select(bound, None).await
+        } else {
+            self.execute_join_select(bound, None).await
+        }
     }
 
     async fn execute_select_via_memdb_fallback(
@@ -108245,6 +108250,9 @@ fn select_requires_local_attached_mixed_fallback(select: &SelectStatement) -> bo
         || has_table_function_source(select)
         || !select.body.compounds.is_empty()
         || select_contains_rewritable_subquery(select)
+        // bd-gjlhh: a VALUES body whose scalar subqueries span schemas.
+        || matches!(&select.body.select, SelectCore::Values(rows)
+            if rows.iter().flatten().any(expr_has_any_subquery))
         || select
             .order_by
             .iter()
