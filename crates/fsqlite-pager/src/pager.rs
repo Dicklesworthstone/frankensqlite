@@ -10594,6 +10594,25 @@ fn preserve_above_extent_at_generation_boundary<F: VfsFile>(inner: &mut PagerInn
     }
 }
 
+/// Rewind EOF allocation to just past `inner.db_size`, for a writer whose
+/// growth is being discarded. Every page number above db_size becomes
+/// reachable through EOF growth again, so it must also leave the volatile
+/// freelist: an earlier transaction's unused lease tail parked there would
+/// otherwise be granted twice, once by EOF growth and once by a freelist pop
+/// (two b-trees sharing one page). File-backed transactions usually hid this
+/// because each begin replaces the freelist from durable state, which never
+/// lists pages past db_size; a private `:memory:` pager keeps its volatile
+/// freelist across transactions.
+fn rewind_eof_allocation_to_db_size<F: VfsFile>(inner: &mut PagerInner<F>) {
+    let db_size = inner.db_size;
+    inner.next_page = if db_size >= 2 {
+        db_size.saturating_add(1)
+    } else {
+        2
+    };
+    inner.freelist.retain(|page| page.get() <= db_size);
+}
+
 fn return_pages_to_freelist(
     freelist: &mut Vec<PageNumber>,
     pages: impl IntoIterator<Item = PageNumber>,
@@ -20842,10 +20861,10 @@ where
     /// splits. Unused pages are returned to the global next_page on
     /// commit/rollback.
     page_lease: Vec<PageNumber>,
-    /// True only for real `:memory:` databases. Those databases never need
-    /// durable freelist reuse mid-transaction, so allocation can stay on a
-    /// simple bump-only fast path without pulling page 1 into the conflict
-    /// surface.
+    /// True only for real `:memory:` databases. Allocation never pulls page 1
+    /// into their conflict surface, and their commits flush straight to the
+    /// memory file. They still reuse the freelist like any other database
+    /// (see `allocate_page`): skipping it leaked freed pages and lease holes.
     memory_db_bump_alloc: bool,
     /// Pages that were allocated after a savepoint but then rolled back.
     /// These pages should return zeros when read, not BusySnapshot error.
@@ -22533,11 +22552,7 @@ where
             self.page_lease.clear();
             self.allocated_from_eof.clear();
             inner.db_size = self.original_db_size;
-            inner.next_page = if inner.db_size >= 2 {
-                inner.db_size.saturating_add(1)
-            } else {
-                2
-            };
+            rewind_eof_allocation_to_db_size(inner);
         } else {
             // bd-0shxy: NEVER regress the shared EOF high-water mark while
             // other transactions are live. `next_page` is monotonic across
@@ -25991,117 +26006,124 @@ where
                 .lock()
                 .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
 
-            if !self.memory_db_bump_alloc {
-                self.journal_freelist_before_allocation(&inner.freelist);
-                let committed_freelist_is_snapshot_pinned =
-                    self.mode == TransactionMode::Concurrent || inner.active_transactions > 1;
+            // Private `:memory:` databases (`memory_db_bump_alloc`) reuse the
+            // freelist under exactly the same gates. They used to skip this
+            // block and always bump from `next_page`, which leaked two kinds of
+            // page: freed pages (a DELETE's overflow chain, a dropped index)
+            // were never handed out again, and the unused tail of a
+            // concurrent-mode `page_lease` batch went back to the freelist
+            // above db_size while `next_page` stayed past it, so the next EOF
+            // allocation skipped those numbers and left them as "page N is
+            // never used" holes inside the grown database.
+            self.journal_freelist_before_allocation(&inner.freelist);
+            let committed_freelist_is_snapshot_pinned =
+                self.mode == TransactionMode::Concurrent || inner.active_transactions > 1;
 
-                if committed_freelist_is_snapshot_pinned {
-                    // Concurrent writers always read against a fixed snapshot. So do
-                    // immediate/deferred writers when another local transaction is
-                    // still active, because that older reader snapshot can still
-                    // observe the committed image being replaced. In both cases, pages
-                    // at or below db_size are part of some still-visible committed
-                    // state and cannot be safely reused from the live global freelist
-                    // without versioned freelist metadata. Pages above db_size are
-                    // different: they only exist because an earlier transaction
-                    // allocated EOF pages and then rolled back, so reusing them does
-                    // not violate committed-snapshot visibility and avoids
-                    // page-count holes.
-                    //
-                    // Both reuse arms below share one safety gate: this
-                    // transaction must be the pager's ONLY live transaction
-                    // (`active_transactions == 1`) with a current snapshot
-                    // (`published_visible_commit_seq == inner.commit_seq`).
-                    // While another local transaction pins an older view, the
-                    // pager cannot refresh durable metadata, so a page in the
-                    // local `> db_size` pool may meanwhile have been claimed
-                    // and committed by a PEER connection growing the same
-                    // file — handing it out again would alias the peer's
-                    // committed page (pinned by test_concurrent_rollback_
-                    // quarantines_peer_claimed_eof_page_until_refresh). When
-                    // the gate holds, begin-time refresh has replaced the
-                    // freelist from durable state, and any race with a peer
-                    // allocating the same page after our snapshot resolves at
-                    // commit through WAL first-committer-wins conflict
-                    // detection, exactly as for EOF growth.
-                    let sole_current_snapshot = inner.active_transactions == 1
-                        && (snapshot_gate_amplify_enabled()
-                            || self.published_visible_commit_seq.get() == inner.commit_seq);
-                    if sole_current_snapshot
-                        && let Some(idx) = inner.freelist.iter().rposition(|page| {
-                            page.get() > inner.db_size
-                                && page.get() != crate::journal::lock_byte_page(inner.page_size)
-                        })
-                    {
-                        let page = inner.freelist.remove(idx);
-                        if inner.durable_freelist_view.contains(&page.get()) {
-                            self.allocated_from_durable_freelist.insert(page.get());
-                        }
-                        self.allocated_from_freelist.push(page);
-                        alloc_ledger(
-                            std::ptr::from_ref(self) as usize,
-                            "alloc_freelist_hi",
-                            page.get(),
-                            0,
-                        );
-                        return Ok(page);
-                    }
-
-                    // GH#302 bounded snapshot-safe reclamation: committed
-                    // freelist pages at or below db_size ARE reusable under
-                    // the same gate — with only our own (current) snapshot
-                    // live, every page on the committed freelist is already
-                    // free *in our own snapshot* and cannot be live content
-                    // of any tree we can read, so the pop is exactly as safe
-                    // as the non-concurrent arm below. External readers at an
-                    // older mark keep reading the pre-reuse frame through
-                    // WAL/journal versioning, the same way they survive any
-                    // ordinary in-place page rewrite, and a racing external
-                    // writer popping the same committed free page aborts
-                    // second-committer (test_journal_commit_detects_cross_
-                    // connection_committed_freelist_reuse_alias).
-                    //
-                    // Without this arm, default (concurrent) transactions
-                    // never reused committed free pages and every churn
-                    // workload grew the file at EOF without bound.
-                    if sole_current_snapshot
-                        && let Some(page) = pop_allocatable_freelist_page(&mut inner)
-                    {
-                        let durable_origin = inner.durable_freelist_view.contains(&page.get());
-                        if durable_origin {
-                            self.allocated_from_durable_freelist.insert(page.get());
-                        }
-                        if std::env::var_os("RH4_TRACE").is_some() {
-                            eprintln!(
-                                "RH4POP ptr={:x} page={} arm=gated durable={durable_origin} committed_db={}",
-                                std::ptr::from_ref(self) as usize,
-                                page.get(),
-                                inner.db_size
-                            );
-                        }
-                        self.allocated_from_freelist.push(page);
-                        alloc_ledger(
-                            std::ptr::from_ref(self) as usize,
-                            "alloc_freelist_gated",
-                            page.get(),
-                            0,
-                        );
-                        return Ok(page);
-                    }
-                } else if let Some(page) = pop_allocatable_freelist_page(&mut inner) {
+            if committed_freelist_is_snapshot_pinned {
+                // Concurrent writers always read against a fixed snapshot. So do
+                // immediate/deferred writers when another local transaction is
+                // still active, because that older reader snapshot can still
+                // observe the committed image being replaced. In both cases, pages
+                // at or below db_size are part of some still-visible committed
+                // state and cannot be safely reused from the live global freelist
+                // without versioned freelist metadata. Pages above db_size are
+                // different: they only exist because an earlier transaction
+                // allocated EOF pages and then rolled back, so reusing them does
+                // not violate committed-snapshot visibility and avoids
+                // page-count holes.
+                //
+                // Both reuse arms below share one safety gate: this
+                // transaction must be the pager's ONLY live transaction
+                // (`active_transactions == 1`) with a current snapshot
+                // (`published_visible_commit_seq == inner.commit_seq`).
+                // While another local transaction pins an older view, the
+                // pager cannot refresh durable metadata, so a page in the
+                // local `> db_size` pool may meanwhile have been claimed
+                // and committed by a PEER connection growing the same
+                // file — handing it out again would alias the peer's
+                // committed page (pinned by test_concurrent_rollback_
+                // quarantines_peer_claimed_eof_page_until_refresh). When
+                // the gate holds, begin-time refresh has replaced the
+                // freelist from durable state, and any race with a peer
+                // allocating the same page after our snapshot resolves at
+                // commit through WAL first-committer-wins conflict
+                // detection, exactly as for EOF growth.
+                let sole_current_snapshot = inner.active_transactions == 1
+                    && (snapshot_gate_amplify_enabled()
+                        || self.published_visible_commit_seq.get() == inner.commit_seq);
+                if sole_current_snapshot
+                    && let Some(idx) = inner.freelist.iter().rposition(|page| {
+                        page.get() > inner.db_size
+                            && page.get() != crate::journal::lock_byte_page(inner.page_size)
+                    })
+                {
+                    let page = inner.freelist.remove(idx);
                     if inner.durable_freelist_view.contains(&page.get()) {
                         self.allocated_from_durable_freelist.insert(page.get());
                     }
                     self.allocated_from_freelist.push(page);
                     alloc_ledger(
                         std::ptr::from_ref(self) as usize,
-                        "alloc_freelist_nc",
+                        "alloc_freelist_hi",
                         page.get(),
                         0,
                     );
                     return Ok(page);
                 }
+
+                // GH#302 bounded snapshot-safe reclamation: committed
+                // freelist pages at or below db_size ARE reusable under
+                // the same gate — with only our own (current) snapshot
+                // live, every page on the committed freelist is already
+                // free *in our own snapshot* and cannot be live content
+                // of any tree we can read, so the pop is exactly as safe
+                // as the non-concurrent arm below. External readers at an
+                // older mark keep reading the pre-reuse frame through
+                // WAL/journal versioning, the same way they survive any
+                // ordinary in-place page rewrite, and a racing external
+                // writer popping the same committed free page aborts
+                // second-committer (test_journal_commit_detects_cross_
+                // connection_committed_freelist_reuse_alias).
+                //
+                // Without this arm, default (concurrent) transactions
+                // never reused committed free pages and every churn
+                // workload grew the file at EOF without bound.
+                if sole_current_snapshot
+                    && let Some(page) = pop_allocatable_freelist_page(&mut inner)
+                {
+                    let durable_origin = inner.durable_freelist_view.contains(&page.get());
+                    if durable_origin {
+                        self.allocated_from_durable_freelist.insert(page.get());
+                    }
+                    if std::env::var_os("RH4_TRACE").is_some() {
+                        eprintln!(
+                            "RH4POP ptr={:x} page={} arm=gated durable={durable_origin} committed_db={}",
+                            std::ptr::from_ref(self) as usize,
+                            page.get(),
+                            inner.db_size
+                        );
+                    }
+                    self.allocated_from_freelist.push(page);
+                    alloc_ledger(
+                        std::ptr::from_ref(self) as usize,
+                        "alloc_freelist_gated",
+                        page.get(),
+                        0,
+                    );
+                    return Ok(page);
+                }
+            } else if let Some(page) = pop_allocatable_freelist_page(&mut inner) {
+                if inner.durable_freelist_view.contains(&page.get()) {
+                    self.allocated_from_durable_freelist.insert(page.get());
+                }
+                self.allocated_from_freelist.push(page);
+                alloc_ledger(
+                    std::ptr::from_ref(self) as usize,
+                    "alloc_freelist_nc",
+                    page.get(),
+                    0,
+                );
+                return Ok(page);
             }
 
             // ── EOF allocation ──────────────────────────────────────────────
@@ -28279,12 +28301,7 @@ where
 
                     // Reset next_page to avoid holes if we allocated pages that are now discarded.
                     // Logic matches SimplePager::open.
-                    let db_size = inner.db_size;
-                    inner.next_page = if db_size >= 2 {
-                        db_size.saturating_add(1)
-                    } else {
-                        2
-                    };
+                    rewind_eof_allocation_to_db_size(&mut inner);
                 } else if self.is_writer && self.mode == TransactionMode::Concurrent {
                     // Concurrent: next_page is NOT reset, so lease pages and
                     // aborted EOF allocations would become permanent holes once
@@ -28699,11 +28716,7 @@ where
                 self.page_lease.clear();
                 self.savepoint_quarantined_allocations.clear();
                 inner.db_size = self.original_db_size;
-                inner.next_page = if inner.db_size >= 2 {
-                    inner.db_size.saturating_add(1)
-                } else {
-                    2
-                };
+                rewind_eof_allocation_to_db_size(&mut inner);
             } else if self.is_writer && self.mode == TransactionMode::Concurrent {
                 // Concurrent: next_page stays advanced, so return lease
                 // pages and EOF allocations to the freelist.
@@ -55232,7 +55245,7 @@ mod tests {
     }
 
     #[test]
-    fn test_memory_db_allocator_skips_committed_freelist_and_page_one_conflicts() {
+    fn test_memory_db_allocator_reuses_committed_freelist_without_page_one_conflicts() {
         asupersync::test_utils::run_test(|| async {
             let vfs = MemoryVfs::new();
             let pager = SimplePager::open(vfs, Path::new("/:memory:"), PageSize::DEFAULT)
@@ -55267,20 +55280,29 @@ mod tests {
                     .unwrap(),
                 "bead_id={BEAD_ID} case=memory_db_allocate_skips_page_one_conflict_tracking"
             );
+            // The freed page is reused, not skipped: a bump-only allocator
+            // never handed freed `:memory:` pages out again, so every DELETE
+            // or DROP grew the database for good.
             let allocated = txn.allocate_page(&cx).await.unwrap();
-            let expected = PageNumber::new(page_three.get() + 1).unwrap();
             assert_eq!(
                 allocated,
-                expected,
-                "bead_id={BEAD_ID} case=memory_db_allocator_uses_bump_path allocated={} expected={}",
+                page_two,
+                "bead_id={BEAD_ID} case=memory_db_allocator_reuses_freed_page allocated={} freed={} high={}",
                 allocated.get(),
-                expected.get()
+                page_two.get(),
+                page_three.get()
+            );
+            let next = txn.allocate_page(&cx).await.unwrap();
+            assert_eq!(
+                next,
+                PageNumber::new(page_three.get() + 1).unwrap(),
+                "bead_id={BEAD_ID} case=memory_db_allocator_grows_after_freelist_drains"
             );
         });
     }
 
     #[test]
-    fn test_memory_db_allocator_stays_bump_only_after_rollback() {
+    fn test_memory_db_allocator_reuses_abandoned_lease_after_rollback() {
         asupersync::test_utils::run_test(|| async {
             let vfs = MemoryVfs::new();
             let pager = SimplePager::open(vfs, Path::new("/:memory:"), PageSize::DEFAULT)
@@ -55289,23 +55311,18 @@ mod tests {
             let cx = Cx::new();
 
             // Concurrent rollback keeps `next_page` advanced (see the comment at
-            // the "Concurrent: next_page is NOT reset" branch of rollback) so a
-            // later writer in bump-only mode cannot drift into the freelist. The
-            // test relies on that invariant specifically — Immediate rollback
-            // rewinds next_page, so it would be a weaker check.
-            //
-            // The second allocate in Concurrent mode batches
-            // PAGE_LEASE_BATCH_SIZE pages (one returned, the rest leased). After
-            // rollback the bump counter has advanced by exactly
-            // PAGE_LEASE_BATCH_SIZE past the first alloc's page, so the next
-            // alloc lands at page_one + PAGE_LEASE_BATCH_SIZE + 1 (the
-            // "already_allocated" branch also applied on the second call).
-            let abandoned_pages = {
+            // the "Concurrent: next_page is NOT reset" branch of rollback) and
+            // returns its pages, including the unissued lease tail, to the
+            // freelist. The second allocate in Concurrent mode batches
+            // PAGE_LEASE_BATCH_SIZE pages (one returned, the rest leased), so
+            // the rollback leaves pages page_one ..= page_one +
+            // PAGE_LEASE_BATCH_SIZE free and next_page just past them.
+            let page_one = {
                 let mut abandoned = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
                 let page_one = abandoned.allocate_page(&cx).await.unwrap();
-                let page_two = abandoned.allocate_page(&cx).await.unwrap();
+                abandoned.allocate_page(&cx).await.unwrap();
                 abandoned.rollback(&cx).await.unwrap();
-                [page_one, page_two]
+                page_one
             };
 
             let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
@@ -55314,24 +55331,81 @@ mod tests {
                     .unwrap(),
                 "bead_id={BEAD_ID} case=memory_db_post_rollback_allocate_skips_page_one_conflict_tracking"
             );
-            let allocated = txn.allocate_page(&cx).await.unwrap();
-            // next_page after rollback = page_one + 1 (first alloc, batch=1)
-            //                           + PAGE_LEASE_BATCH_SIZE (second alloc, batch=lease_size).
-            let expected_next_page = abandoned_pages[0].get() + 1 + PAGE_LEASE_BATCH_SIZE;
-            let expected = PageNumber::new(expected_next_page).unwrap();
-            assert!(
-                !abandoned_pages.contains(&allocated),
-                "bead_id={BEAD_ID} case=memory_db_allocator_skips_freelist_after_rollback allocated={} abandoned=({}, {})",
-                allocated.get(),
-                abandoned_pages[0].get(),
-                abandoned_pages[1].get()
-            );
+            // The next writer must hand those pages out again, lowest first,
+            // then continue at EOF: no number skipped (a skipped number is a
+            // "page N is never used" hole once the database grows past it) and
+            // none granted twice.
+            let count = PAGE_LEASE_BATCH_SIZE + 2;
+            let mut allocated = Vec::new();
+            for _ in 0..count {
+                allocated.push(txn.allocate_page(&cx).await.unwrap().get());
+            }
             assert_eq!(
-                allocated,
-                expected,
-                "bead_id={BEAD_ID} case=memory_db_allocator_keeps_bump_sequence allocated={} expected={}",
-                allocated.get(),
-                expected.get()
+                allocated[0],
+                page_one.get(),
+                "bead_id={BEAD_ID} case=memory_db_allocator_reuses_abandoned_pages_first allocated={allocated:?}"
+            );
+            allocated.sort_unstable();
+            let expected: Vec<u32> = (page_one.get()..page_one.get() + count).collect();
+            assert_eq!(
+                allocated, expected,
+                "bead_id={BEAD_ID} case=memory_db_allocator_no_holes_no_duplicates"
+            );
+        });
+    }
+
+    #[test]
+    fn test_rewound_eof_allocation_never_regrants_parked_lease_pages() {
+        asupersync::test_utils::run_test(|| async {
+            let vfs = MemoryVfs::new();
+            let pager = SimplePager::open(vfs, Path::new("/:memory:"), PageSize::DEFAULT)
+                .await
+                .unwrap();
+            let cx = Cx::new();
+            let ps = PageSize::DEFAULT.as_usize();
+
+            // A concurrent commit that leases a batch but writes only two pages
+            // parks the unused lease tail on the volatile freelist above
+            // db_size.
+            let committed_high = {
+                let mut txn = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+                let first = txn.allocate_page(&cx).await.unwrap();
+                let second = txn.allocate_page(&cx).await.unwrap();
+                txn.write_page(&cx, first, &vec![0x11; ps]).await.unwrap();
+                txn.write_page(&cx, second, &vec![0x22; ps]).await.unwrap();
+                txn.commit(&cx).await.unwrap();
+                second
+            };
+
+            // An Immediate writer takes one of those parked pages, then rolls
+            // back. Its rollback rewinds next_page to db_size + 1, so every
+            // parked page above db_size is reachable by EOF growth again and
+            // must not also stay on the freelist.
+            {
+                let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                txn.allocate_page(&cx).await.unwrap();
+                txn.rollback(&cx).await.unwrap();
+            }
+
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            let count = PAGE_LEASE_BATCH_SIZE + 2;
+            let mut allocated = Vec::new();
+            for _ in 0..count {
+                allocated.push(txn.allocate_page(&cx).await.unwrap().get());
+            }
+            let mut unique = allocated.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            assert_eq!(
+                unique.len(),
+                allocated.len(),
+                "bead_id={BEAD_ID} case=rewound_eof_allocation_double_grant allocated={allocated:?}"
+            );
+            let expected: Vec<u32> =
+                (committed_high.get() + 1..=committed_high.get() + count).collect();
+            assert_eq!(
+                unique, expected,
+                "bead_id={BEAD_ID} case=rewound_eof_allocation_contiguous allocated={allocated:?}"
             );
         });
     }
