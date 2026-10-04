@@ -52067,7 +52067,10 @@ impl Connection {
     /// Evaluate a multi-row `UPDATE ... FROM` join once, as stock does before
     /// it changes any row: one row per target row in join order, holding its
     /// locator values followed by the SET values computed for it. A target row
-    /// that several FROM rows match is updated once, from its first match.
+    /// that several FROM rows match is updated once, from its LAST match, at
+    /// the position of its first: stock's join output lands in a table keyed
+    /// by the target row, so a later match overwrites an earlier one (and the
+    /// compiled `UPDATE ... FROM` lane keeps the same match).
     /// Returns the locator columns, the SET target columns and the rows.
     async fn materialize_update_from_replay_locators(
         &self,
@@ -52086,14 +52089,21 @@ impl Connection {
             .collect();
         let select =
             Self::build_update_from_target_select(update, projections, update.where_clause.as_ref());
-        let mut seen = BTreeSet::new();
-        let rows = self
+        let mut position_by_locator = BTreeMap::new();
+        let mut rows: Vec<Vec<SqliteValue>> = Vec::new();
+        for row in self
             .execute_statement(&Statement::Select(select), params)
             .await?
-            .into_iter()
-            .map(|row| row.values().to_vec())
-            .filter(|values| seen.insert(values[..locator_columns.len()].to_vec()))
-            .collect();
+        {
+            let values = row.values().to_vec();
+            match position_by_locator.entry(values[..locator_columns.len()].to_vec()) {
+                std::collections::btree_map::Entry::Occupied(slot) => rows[*slot.get()] = values,
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(rows.len());
+                    rows.push(values);
+                }
+            }
+        }
         let set_columns = set_pairs
             .into_iter()
             .map(|(column, _)| column.to_owned())
@@ -56176,7 +56186,8 @@ impl Connection {
     /// values may name the FROM sources, so the matched rows come from the
     /// target joined with them and the SET values are projected by that same
     /// SELECT instead of being evaluated against the target row alone. A target
-    /// row several FROM rows match is updated once, from its first match.
+    /// row several FROM rows match is updated once, from its LAST match, as in
+    /// stock and in `materialize_update_from_replay_locators`.
     async fn collect_update_from_trigger_rows_with_rowids(
         &self,
         update: &fsqlite_ast::UpdateStatement,
@@ -56233,7 +56244,7 @@ impl Connection {
 
         let lead = usize::from(is_rowid_table);
         let n_cols = column_names.len();
-        let mut seen = BTreeSet::new();
+        let mut position_by_key = BTreeMap::new();
         let mut trigger_rows = Vec::with_capacity(matched_rows.len());
         for row in matched_rows {
             let values = row.values();
@@ -56254,9 +56265,6 @@ impl Connection {
             } else {
                 old_values.clone()
             };
-            if !seen.insert(key) {
-                continue;
-            }
             let mut new_values = old_values.clone();
             for ((column_name, _), value) in set_pairs.iter().zip(&values[lead + n_cols..]) {
                 if let Some(target_index) =
@@ -56265,7 +56273,15 @@ impl Connection {
                     new_values[target_index] = value.clone();
                 }
             }
-            trigger_rows.push((row_rowid, old_values, new_values));
+            match position_by_key.entry(key) {
+                std::collections::btree_map::Entry::Occupied(slot) => {
+                    trigger_rows[*slot.get()] = (row_rowid, old_values, new_values);
+                }
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(trigger_rows.len());
+                    trigger_rows.push((row_rowid, old_values, new_values));
+                }
+            }
         }
         Ok(trigger_rows)
     }
