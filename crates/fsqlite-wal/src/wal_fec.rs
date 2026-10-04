@@ -49,6 +49,10 @@ pub const MAX_RAPTORQ_REPAIR_SYMBOLS: u8 = u8::MAX;
 pub const WAL_FEC_PRAGMA_HEADER_MAGIC: [u8; 8] = *b"FSQLWFCP";
 /// Current `.wal-fec` configuration header version.
 pub const WAL_FEC_PRAGMA_HEADER_VERSION: u32 = 1;
+/// Largest RaptorQ source block (RFC 6330 K'max). A WAL-FEC group is one
+/// commit, so a commit of more frames has no repair group; the RaptorQ
+/// encoder and decoder panic beyond this size.
+pub const WAL_FEC_MAX_SOURCE_SYMBOLS: u32 = 56_403;
 
 const LENGTH_PREFIX_BYTES: usize = 4;
 const META_FIXED_PREFIX_BYTES: usize = 8 + 4 + (8 * 4) + 22 + 16;
@@ -533,6 +537,14 @@ impl WalFecGroupMeta {
                 detail: format!(
                     "k_source {} must equal frame span {} ({}..={})",
                     self.k_source, expected_k, self.start_frame_no, self.end_frame_no
+                ),
+            });
+        }
+        if self.k_source > WAL_FEC_MAX_SOURCE_SYMBOLS {
+            return Err(FrankenError::WalCorrupt {
+                detail: format!(
+                    "k_source {} exceeds the RaptorQ source block limit {WAL_FEC_MAX_SOURCE_SYMBOLS}",
+                    self.k_source
                 ),
             });
         }
@@ -2540,9 +2552,29 @@ fn process_committed_wal_range(
             });
         }
         previous = checksum;
-        pages.push(frame[crate::WAL_FRAME_HEADER_SIZE..].to_vec());
-        page_numbers.push(header.page_number);
+        // A commit larger than one RaptorQ source block gets no repair group
+        // (the encoder panics beyond it); stop buffering its pages, but keep
+        // validating its checksum chain.
+        let oversized = frame_no - group_start >= WAL_FEC_MAX_SOURCE_SYMBOLS;
+        if oversized {
+            pages.clear();
+            page_numbers.clear();
+        } else {
+            pages.push(frame[crate::WAL_FRAME_HEADER_SIZE..].to_vec());
+            page_numbers.push(header.page_number);
+        }
         if !header.is_commit() {
+            continue;
+        }
+        if oversized {
+            debug!(
+                wal = %range.wal_path.display(),
+                start_frame_no = group_start,
+                end_frame_no = frame_no,
+                max_source_symbols = WAL_FEC_MAX_SOURCE_SYMBOLS,
+                "WAL-FEC skips a commit larger than one RaptorQ source block"
+            );
+            group_start = frame_no.saturating_add(1);
             continue;
         }
         let hashes = build_source_page_hashes(&pages);
@@ -2601,7 +2633,8 @@ fn process_committed_wal_range(
         pages.clear();
         group_start = frame_no.saturating_add(1);
     }
-    if !pages.is_empty() {
+    // Every frame must belong to a committed group, oversized ones included.
+    if group_start <= range.end_frame_no {
         return Err(FrankenError::WalCorrupt {
             detail: "durable WAL-FEC interval ends before a commit marker".to_owned(),
         });
@@ -2898,6 +2931,15 @@ fn generate_wal_fec_repair_symbols_inner(
     cancel_flag: Option<&AtomicBool>,
     per_symbol_delay: Duration,
 ) -> Result<Option<Vec<SymbolRecord>>> {
+    // The encoder panics beyond RaptorQ's source block limit.
+    if meta.k_source > WAL_FEC_MAX_SOURCE_SYMBOLS {
+        return Err(FrankenError::WalCorrupt {
+            detail: format!(
+                "k_source {} exceeds the RaptorQ source block limit {WAL_FEC_MAX_SOURCE_SYMBOLS}",
+                meta.k_source
+            ),
+        });
+    }
     validate_source_pages(meta, source_pages)?;
     let symbol_len = usize::try_from(meta.oti.t).map_err(|_| FrankenError::WalCorrupt {
         detail: format!("OTI symbol size {} does not fit in usize", meta.oti.t),
@@ -3054,8 +3096,12 @@ pub fn wal_fec_raptorq_decode(
 
     // Must use the same seed as the encoder.
     let encoder_seed = derive_repair_seed(meta, 0);
+    // `new` panics on an unsupported K; sidecar metadata is untrusted input.
     let decoder =
-        asupersync::raptorq::decoder::InactivationDecoder::new(k, symbol_size, encoder_seed);
+        asupersync::raptorq::decoder::InactivationDecoder::try_new(k, symbol_size, encoder_seed)
+            .map_err(|error| FrankenError::WalCorrupt {
+                detail: format!("unsupported WAL-FEC source block: {error:?}"),
+            })?;
 
     // Start with constraint symbols (LDPC + HDPC with zero data).
     let mut received = decoder.constraint_symbols();
@@ -6207,5 +6253,100 @@ mod tests {
         process(&range, &cache);
         assert!(loads() - before <= 1);
         assert_eq!(groups(), 24);
+    }
+
+    /// A WAL-FEC group is one commit, and RaptorQ cannot encode a source
+    /// block beyond `WAL_FEC_MAX_SOURCE_SYMBOLS`: asupersync's encoder panics
+    /// ("unsupported source block size K=84641"), and with `panic = "abort"`
+    /// every process that opened such a WAL aborted in restart catch-up.
+    /// Oversized commits now get no repair group; later commits still do.
+    #[cfg(all(unix, feature = "native"))]
+    #[test]
+    fn test_commit_beyond_raptorq_source_block_limit_is_skipped_not_fatal() {
+        use crate::test_support::FutureResultTestExt as _;
+        use crate::wal::WalFile;
+        use fsqlite_types::flags::{SyncFlags, VfsOpenFlags};
+        use fsqlite_vfs::traits::Vfs as _;
+
+        let dir = tempdir().expect("tempdir");
+        let wal_path = dir.path().join("huge.db-wal");
+        let sidecar_path = wal_fec_path_for_wal(&wal_path);
+        let cx = Cx::default();
+        let vfs = fsqlite_vfs::UnixVfs::new();
+        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
+        let (file, _) = vfs.open(&cx, Some(&wal_path), flags).expect("open WAL");
+        let salts = WalSalts {
+            salt1: 0x0BAD_5EED,
+            salt2: 0x5151_0001,
+        };
+        let page_size = 512_usize;
+        let mut wal = WalFile::create(&cx, file, u32::try_from(page_size).unwrap(), 0, salts)
+            .expect("create WAL");
+        let previous_checksum = wal.running_checksum();
+        let huge = WAL_FEC_MAX_SOURCE_SYMBOLS + 1;
+        for page in 1..=huge {
+            let data = vec![u8::try_from(page % 251).unwrap(); page_size];
+            let db_size = if page == huge { huge } else { 0 };
+            wal.append_frame(&cx, page, &data, db_size)
+                .expect("append oversized-commit frame");
+        }
+        for page in 1..=2_u32 {
+            let data = vec![0xA5_u8; page_size];
+            let db_size = if page == 2 { huge } else { 0 };
+            wal.append_frame(&cx, page, &data, db_size)
+                .expect("append small-commit frame");
+        }
+        wal.sync(&cx, SyncFlags::NORMAL).expect("sync WAL");
+        let range = WalFecCommittedRange {
+            wal_path: wal_path.clone(),
+            header: *wal.header(),
+            start_frame_no: 1,
+            end_frame_no: huge + 2,
+            previous_checksum,
+            end_checksum: wal.running_checksum(),
+            repair_symbols: 2,
+        };
+        let diagnostics = WalFecRepairDiagnostics {
+            pipeline_id: 0,
+            queue_capacity: 1,
+            rejected_admissions: AtomicUsize::new(0),
+            processed_groups: AtomicUsize::new(0),
+        };
+        let outcome = process_committed_wal_range(
+            &range,
+            &cx,
+            &AtomicBool::new(false),
+            Duration::ZERO,
+            &diagnostics,
+            &Mutex::new(None),
+        )
+        .expect("an oversized commit is skipped, not fatal");
+        assert_eq!(outcome, WalFecWorkOutcome::Completed);
+        let groups = scan_wal_fec(&sidecar_path).expect("scan sidecar").groups;
+        assert_eq!(groups.len(), 1, "only the small commit gets a repair group");
+        assert_eq!(
+            (groups[0].meta.start_frame_no, groups[0].meta.end_frame_no),
+            (huge + 1, huge + 2)
+        );
+
+        // Metadata, the encoder and the decoder refuse such a block instead
+        // of panicking (sidecar metadata is untrusted input).
+        let mut meta = groups[0].meta.clone();
+        meta.start_frame_no = 1;
+        meta.end_frame_no = huge;
+        meta.k_source = huge;
+        meta.oti.f = u64::from(huge) * u64::from(meta.page_size);
+        meta.page_numbers = (1..=huge).collect();
+        meta.source_page_xxh3_128 = vec![meta.source_page_xxh3_128[0]; meta.page_numbers.len()];
+        let limit = |result: Result<()>| {
+            let error = result.expect_err("an oversized source block is refused");
+            assert!(
+                error.to_string().contains("source block") || error.to_string().contains("K="),
+                "unexpected refusal: {error}"
+            );
+        };
+        limit(WalFecGroupMeta::from_record_bytes(&meta.to_record_bytes()).map(|_| ()));
+        limit(wal_fec_raptorq_decode(&meta, &[]).map(|_| ()));
+        limit(generate_wal_fec_repair_symbols(&meta, &[]).map(|_| ()));
     }
 }
