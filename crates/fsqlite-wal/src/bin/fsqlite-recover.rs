@@ -108,7 +108,10 @@ output or repaired source before using it; untouched B-tree pages are not checke
         let native = asupersync::Cx::current().ok_or_else(|| {
             FrankenError::BackgroundWorkerFailed("recovery requires a caller runtime".to_owned())
         })?;
-        let cx = Cx::new();
+        // The sanctioned root constructor for runtime crates (bd-smauc), as
+        // `RuntimeContext` uses for its own root; the caller's native cx is
+        // re-attached so recovery runs under the caller's runtime.
+        let cx = Cx::detached_rebind();
         cx.set_native_cx(native);
         Ok(cx)
     }

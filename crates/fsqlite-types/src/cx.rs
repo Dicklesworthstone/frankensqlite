@@ -3599,6 +3599,35 @@ mod tests {
         Ok(())
     }
 
+    /// Whether a line opens a `#[cfg(...)]` attribute that can only be true
+    /// under `cfg(test)`: `#[cfg(test)]`, or `#[cfg(all(...))]` with `test`
+    /// as one of its top-level conjuncts. `any(test, ...)` is not test-only.
+    fn cfg_attr_is_test_only(trimmed: &str) -> bool {
+        if trimmed.starts_with("#[cfg(test)]") {
+            return true;
+        }
+        let Some(rest) = trimmed.strip_prefix("#[cfg(all(") else {
+            return false;
+        };
+        let mut depth = 0_u32;
+        let mut conjunct_start = 0;
+        for (index, ch) in rest.char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' if depth == 0 => return rest[conjunct_start..index].trim() == "test",
+                ')' => depth -= 1,
+                ',' if depth == 0 => {
+                    if rest[conjunct_start..index].trim() == "test" {
+                        return true;
+                    }
+                    conjunct_start = index + 1;
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
     fn scan_file_outside_cfg_test_items(src: &str, patterns: &[&str]) -> Vec<(usize, String)> {
         let mut hits = Vec::new();
 
@@ -3614,13 +3643,13 @@ mod tests {
 
             if skip_until_depth.is_none() {
                 // Handle single-line `#[cfg(test)]` items that open a block immediately.
-                if trimmed.starts_with("#[cfg(test)]") && trimmed.contains('{') {
+                if cfg_attr_is_test_only(trimmed) && trimmed.contains('{') {
                     pending_cfg_test = false;
                     pending_attr_paren_depth = 0;
                     skip_until_depth = Some(brace_depth);
                 } else if trimmed.contains("fn test_") && trimmed.contains('{') {
                     skip_until_depth = Some(brace_depth);
-                } else if trimmed.starts_with("#[cfg(test)]") {
+                } else if cfg_attr_is_test_only(trimmed) {
                     pending_cfg_test = true;
                     pending_attr_paren_depth = 0;
                 } else if pending_cfg_test {
@@ -3684,6 +3713,43 @@ mod tests {
 
         let hits = scan_file_outside_cfg_test_items(src, &["Cx::new(", "Cx::default("]);
         assert_eq!(hits, vec![(3, "Cx::new(".to_string())]);
+    }
+
+    #[test]
+    fn test_scan_file_outside_cfg_test_items_skips_only_test_conjunctions() {
+        // bd-smauc: `all(test, ...)` is test-only and must be skipped; `any(test, ...)`
+        // and an `all(...)` without a top-level `test` conjunct compile into
+        // production builds and must still be scanned.
+        let src = r#"
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod wasm_excluded_tests {
+    fn helper() { let _ = Cx::new(); }
+}
+
+#[cfg(all(feature = "native", test))]
+fn native_test_helper() {
+    let _ = Cx::new();
+}
+
+#[cfg(any(test, feature = "fault-injection"))]
+fn fault_injection_helper() {
+    let _ = Cx::new();
+}
+
+#[cfg(all(feature = "testing", not(test_support)))]
+fn feature_named_like_test() {
+    let _ = Cx::default();
+}
+"#;
+
+        let hits = scan_file_outside_cfg_test_items(src, &["Cx::new(", "Cx::default("]);
+        assert_eq!(
+            hits,
+            vec![
+                (14, "Cx::new(".to_string()),
+                (19, "Cx::default(".to_string())
+            ]
+        );
     }
 
     #[test]
