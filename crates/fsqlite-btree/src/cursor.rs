@@ -10709,12 +10709,15 @@ impl<P: PageWriter> BtCursor<P> {
     /// Overwrite the payload bytes for the currently positioned leaf-table row
     /// when the new record has the same local, non-overflow size.
     ///
-    /// This is a deliberately narrow primitive for direct UPDATE fast paths that
-    /// have already proven the rowid is unchanged and no secondary index or
-    /// trigger maintenance is required.  It preserves the cell header, rowid
-    /// varint, pointer array, freeblock chain, and cursor position; callers fall
-    /// back to delete+insert whenever the record size changes or overflow is
-    /// involved.
+    /// This is a deliberately narrow primitive for UPDATE paths that have
+    /// already proven the rowid is unchanged (the VDBE's same-rowid Insert,
+    /// bd-9ag5r). It rewrites only this table cell: secondary-index entries,
+    /// triggers and conflict restore remain the caller's job. It preserves the
+    /// cell header, rowid varint, pointer array, freeblock chain, and cursor
+    /// position, and publishes the page through the pager like any other write,
+    /// so MVCC page tracking and conflict detection apply unchanged. It returns
+    /// `false`, leaving the page untouched, whenever the record size changes or
+    /// overflow is involved; callers then fall back to delete+insert.
     #[doc(hidden)]
     pub async fn table_overwrite_current_payload_same_size_no_overflow(
         &mut self,
