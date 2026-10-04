@@ -10816,11 +10816,25 @@ impl VdbeEngine {
                     // on index pages. (Fixes br#138-140, #144, #145.)
                     let found = if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
                         if cursor.cursor.is_table_btree() {
-                            // Table seek: key is a rowid (integer).
-                            let key = key_val.to_integer();
+                            // Table seek: the key is compared as a rowid.
+                            let (key, seek_opcode) = match table_seek_target(&key_val, op.opcode) {
+                                TableSeekTarget::Rowid(key, seek_opcode) => (key, seek_opcode),
+                                TableSeekTarget::NoRows => {
+                                    pc = op.p2 as usize;
+                                    continue;
+                                }
+                                TableSeekTarget::Last => {
+                                    if cursor.cursor.last(&cursor.cx).await? {
+                                        pc += 1;
+                                    } else {
+                                        pc = op.p2 as usize;
+                                    }
+                                    continue;
+                                }
+                            };
                             let seek_result = cursor.cursor.table_move_to(&cursor.cx, key).await?;
 
-                            match op.opcode {
+                            match seek_opcode {
                                 Opcode::SeekGE => {
                                     // Need first row >= key.
                                     // table_move_to already positions at key (Found) or
@@ -10904,13 +10918,13 @@ impl VdbeEngine {
                         }
                     } else if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
                         // MemCursor fallback (Phase 4 path).
-                        let key = key_val.to_integer();
+                        let target = table_seek_target(&key_val, op.opcode);
                         if let Some(db) = self.db.as_ref() {
                             if let Some(table) = db.get_table(cursor.root_page) {
                                 if table.rows.is_empty() {
                                     false
-                                } else {
-                                    match op.opcode {
+                                } else if let TableSeekTarget::Rowid(key, seek_opcode) = target {
+                                    match seek_opcode {
                                         Opcode::SeekGE => {
                                             let pos = table
                                                 .rows
@@ -10968,6 +10982,11 @@ impl VdbeEngine {
                                         }
                                         _ => unreachable!(),
                                     }
+                                } else if target == TableSeekTarget::Last {
+                                    cursor.position = Some(table.rows.len() - 1);
+                                    true
+                                } else {
+                                    false
                                 }
                             } else {
                                 false
@@ -19970,6 +19989,74 @@ fn encode_record_refs(values: &[&SqliteValue]) -> Vec<u8> {
     fsqlite_types::record::serialize_record_refs(values)
 }
 
+/// Where a `SeekGE`/`SeekGT`/`SeekLE`/`SeekLT` on a table (intkey) cursor
+/// positions for a non-NULL key, following stock's `OP_SeekGE` (vdbe.c).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TableSeekTarget {
+    /// Seek this rowid with this (possibly adjusted) seek opcode.
+    Rowid(i64, Opcode),
+    /// No row can satisfy the comparison: jump to P2.
+    NoRows,
+    /// Every row satisfies the comparison: position on the last row.
+    Last,
+}
+
+/// Map a table-seek key to an integer rowid seek the way stock does, instead
+/// of truncating it with `to_integer()`: rowid comparisons are numeric, so
+/// text gets NUMERIC affinity first (`rowid >= '7'` seeks 7); text that is not
+/// a number, and a blob, sort above every rowid, so `>=`/`>` find nothing and
+/// `<=`/`<` take every row (`rowid >= 'y'` is empty, not the whole table); a
+/// REAL that is not an integer rounds toward the seek direction by switching
+/// the operator (`rowid >= 2.5` seeks `> 2`, `rowid <= 2.5` seeks `< 3`).
+#[allow(clippy::cast_possible_truncation, clippy::float_cmp)]
+fn table_seek_target(key: &SqliteValue, opcode: Opcode) -> TableSeekTarget {
+    let numeric;
+    let key = if let SqliteValue::Text(_) = key {
+        numeric = key.clone().apply_affinity(fsqlite_types::TypeAffinity::Numeric);
+        &numeric
+    } else {
+        key
+    };
+    match *key {
+        SqliteValue::Integer(rowid) => TableSeekTarget::Rowid(rowid, opcode),
+        SqliteValue::Float(real) => {
+            // stock doubleToInt64 + sqlite3IntFloatCompare: the integer
+            // approximation and whether it lies above or below the real.
+            let (rowid, approximation) = if real >= 9_223_372_036_854_775_808.0 {
+                (i64::MAX, std::cmp::Ordering::Less)
+            } else if real < -9_223_372_036_854_775_808.0 {
+                (i64::MIN, std::cmp::Ordering::Greater)
+            } else {
+                let truncated = real.trunc();
+                (
+                    truncated as i64,
+                    truncated
+                        .partial_cmp(&real)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                )
+            };
+            let opcode = match (approximation, opcode) {
+                // rowid > 4.9 is rowid >= 5 when the approximation is above.
+                (std::cmp::Ordering::Greater, Opcode::SeekGT) => Opcode::SeekGE,
+                (std::cmp::Ordering::Greater, Opcode::SeekLE) => Opcode::SeekLT,
+                // rowid >= 4.1 is rowid > 4 when the approximation is below.
+                (std::cmp::Ordering::Less, Opcode::SeekGE) => Opcode::SeekGT,
+                (std::cmp::Ordering::Less, Opcode::SeekLT) => Opcode::SeekLE,
+                (_, opcode) => opcode,
+            };
+            TableSeekTarget::Rowid(rowid, opcode)
+        }
+        SqliteValue::Null => TableSeekTarget::NoRows,
+        SqliteValue::Text(_) | SqliteValue::Blob(_) => {
+            if matches!(opcode, Opcode::SeekGE | Opcode::SeekGT) {
+                TableSeekTarget::NoRows
+            } else {
+                TableSeekTarget::Last
+            }
+        }
+    }
+}
+
 /// Extract the raw bytes from a record blob value (output of `MakeRecord`).
 fn record_blob_bytes(val: &SqliteValue) -> &[u8] {
     match val {
@@ -20593,6 +20680,43 @@ mod tests {
     use proptest::test_runner::{Config as ProptestConfig, TestCaseError, TestRunner};
     use rusqlite::params_from_iter;
     use rusqlite::types::Value as RusqliteValue;
+
+    #[test]
+    fn test_table_seek_target_follows_stock_intkey_seek_rules() {
+        use TableSeekTarget::{Last, NoRows, Rowid};
+        let text = |v: &str| SqliteValue::Text(v.into());
+        let cases = [
+            (SqliteValue::Integer(7), Opcode::SeekGE, Rowid(7, Opcode::SeekGE)),
+            (text("7"), Opcode::SeekGT, Rowid(7, Opcode::SeekGT)),
+            (text(" 7 "), Opcode::SeekLE, Rowid(7, Opcode::SeekLE)),
+            (text("y"), Opcode::SeekGE, NoRows),
+            (text("y"), Opcode::SeekGT, NoRows),
+            (text("y"), Opcode::SeekLE, Last),
+            (text("y"), Opcode::SeekLT, Last),
+            (SqliteValue::Blob(vec![1].into()), Opcode::SeekGT, NoRows),
+            (SqliteValue::Blob(vec![1].into()), Opcode::SeekLT, Last),
+            (SqliteValue::Float(2.5), Opcode::SeekGE, Rowid(2, Opcode::SeekGT)),
+            (SqliteValue::Float(2.5), Opcode::SeekLT, Rowid(2, Opcode::SeekLE)),
+            (SqliteValue::Float(2.5), Opcode::SeekGT, Rowid(2, Opcode::SeekGT)),
+            (SqliteValue::Float(2.5), Opcode::SeekLE, Rowid(2, Opcode::SeekLE)),
+            (SqliteValue::Float(-2.5), Opcode::SeekGT, Rowid(-2, Opcode::SeekGE)),
+            (SqliteValue::Float(-2.5), Opcode::SeekLE, Rowid(-2, Opcode::SeekLT)),
+            (SqliteValue::Float(-2.5), Opcode::SeekGE, Rowid(-2, Opcode::SeekGE)),
+            (text("2.5"), Opcode::SeekGE, Rowid(2, Opcode::SeekGT)),
+            (SqliteValue::Float(3.0), Opcode::SeekGT, Rowid(3, Opcode::SeekGT)),
+            (SqliteValue::Float(1e30), Opcode::SeekGE, Rowid(i64::MAX, Opcode::SeekGT)),
+            (SqliteValue::Float(-1e30), Opcode::SeekLE, Rowid(i64::MIN, Opcode::SeekLT)),
+            (
+                SqliteValue::Float(-9_223_372_036_854_775_808.0),
+                Opcode::SeekGE,
+                Rowid(i64::MIN, Opcode::SeekGE),
+            ),
+            (SqliteValue::Null, Opcode::SeekGE, NoRows),
+        ];
+        for (key, opcode, expected) in cases {
+            assert_eq!(table_seek_target(&key, opcode), expected, "{key:?} {opcode:?}");
+        }
+    }
 
     #[test]
     fn test_nocase_comparators_match_sqlite_boundaries() {
