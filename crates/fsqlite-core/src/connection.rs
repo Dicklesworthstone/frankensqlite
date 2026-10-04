@@ -45703,7 +45703,11 @@ impl Connection {
                 .iter()
                 .find(|table| table.name.eq_ignore_ascii_case(&insert.table.name))
         }
-        .ok_or_else(|| FrankenError::Internal(format!("table not found: {}", insert.table.name)))?;
+        // INSERT ... SELECT resolves its target here before any other check,
+        // so a missing table is the user's error, reported as stock does.
+        .ok_or_else(|| FrankenError::NoSuchTable {
+            name: insert.table.name.clone(),
+        })?;
         Self::validate_insert_target_columns(table, &insert.table.name, &insert.columns)?;
 
         let table_columns: Vec<String> = table.columns.iter().map(|col| col.name.clone()).collect();
@@ -258107,8 +258111,11 @@ mod pager_routing_tests {
                 .execute("INSERT INTO aux.missing SELECT 1 WHERE 0;")
                 .await
                 .expect_err("missing attached target should not silently succeed on zero rows");
+            // Stock reports a missing INSERT target as "no such table", not an
+            // internal error.
             assert!(
-                matches!(err, FrankenError::Internal(message) if message.contains("table not found"))
+                matches!(&err, FrankenError::NoSuchTable { name } if name == "missing"),
+                "{err:?}"
             );
         });
     }

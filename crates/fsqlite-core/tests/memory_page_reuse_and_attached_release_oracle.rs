@@ -1,4 +1,4 @@
-//! Keepers for two `:memory:` / attached-database bugs found by the
+//! Keepers for three `:memory:` / attached-database bugs found by the
 //! `memory_mirror_snapshot_differential` review, all present before
 //! fc1f6a537:
 //!
@@ -14,6 +14,8 @@
 //! - RELEASE of the savepoint that implicitly began a transaction, and the
 //!   public `commit_transaction()`, committed main but left an enrolled attached
 //!   database's transaction open, so its writes vanished at the next ROLLBACK.
+//! - `INSERT ... SELECT` into a missing table said `internal error: table not
+//!   found` instead of `no such table`.
 
 use fsqlite_core::connection::{Connection, Row};
 use fsqlite_types::value::SqliteValue;
@@ -348,6 +350,29 @@ fn implicit_release_and_commit_transaction_commit_attached_participants() {
                 1,
                 "{target}"
             );
+        }
+    });
+}
+
+/// `INSERT ... SELECT` into a missing table reports `no such table`, like
+/// every other INSERT form and like stock.
+#[test]
+fn insert_select_into_missing_table_says_no_such_table() {
+    asupersync::test_utils::run_test(|| async {
+        let conn = Connection::open(":memory:").await.expect("open");
+        conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, a)")
+            .await
+            .expect("create");
+        conn.execute("INSERT INTO t1 VALUES (1, 2)")
+            .await
+            .expect("insert");
+        for sql in [
+            "INSERT INTO extra SELECT id, a FROM t1",
+            "INSERT OR REPLACE INTO extra SELECT id, a FROM t1",
+            "INSERT INTO extra VALUES (1, 2)",
+        ] {
+            let error = conn.execute(sql).await.expect_err(sql).to_string();
+            assert_eq!(error, "no such table: extra", "{sql}");
         }
     });
 }
