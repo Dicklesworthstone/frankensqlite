@@ -26487,16 +26487,17 @@ impl Connection {
     /// The parser eats the outer `(` before `parse_expr`, so the inner
     /// expression's span already excludes the outer parens; slicing
     /// `pending_ddl_source` (the verbatim issued CREATE/ALTER text the statement
-    /// was parsed from) by that span yields exactly SQLite's output. Falls back
-    /// to the AST render when the source is unavailable (batched statements) or
-    /// the span does not resolve. bd-pragma-table-info-dflt-source-rqvvf.
+    /// was parsed from) by that span yields exactly SQLite's output. An
+    /// unparenthesized default is kept as written too (`1.50`, `1e2`, `0x10`),
+    /// which is also the text a pre-ALTER record's value is read from. Falls
+    /// back to the AST render when the source is unavailable (batched
+    /// statements) or the slice does not reparse to the same expression.
+    /// bd-pragma-table-info-dflt-source-rqvvf.
     fn format_default_value_verbatim(&self, dv: &DefaultValue) -> String {
-        if let DefaultValue::ParenExpr(expr) = dv
-            && let Some(verbatim) = self.expr_verbatim_source(expr)
-        {
-            return verbatim;
+        match self.pending_ddl_source.borrow().as_deref() {
+            Some(sql) => crate::compat_persist::default_value_source_text(dv, sql),
+            None => crate::compat_persist::format_default_value(dv),
         }
-        format_default_value(dv)
     }
 
     /// The VERBATIM source text of `expr` — sliced from `pending_ddl_source`
@@ -29447,8 +29448,7 @@ impl Connection {
             .get(column_index)
             .and_then(|column| {
                 column.default_value.as_deref().map(|sql| {
-                    Self::short_record_default_value(sql)
-                        .apply_affinity(affinity_char_to_type(column.affinity))
+                    Self::short_record_default_value(sql, affinity_char_to_type(column.affinity))
                 })
             })
             .unwrap_or(SqliteValue::Null);
@@ -29574,8 +29574,7 @@ impl Connection {
             .get(column_index)
             .and_then(|column| {
                 column.default_value.as_deref().map(|sql| {
-                    Self::short_record_default_value(sql)
-                        .apply_affinity(affinity_char_to_type(column.affinity))
+                    Self::short_record_default_value(sql, affinity_char_to_type(column.affinity))
                 })
             })
             .unwrap_or(SqliteValue::Null);
@@ -41504,9 +41503,44 @@ impl Connection {
             },
             |row| row.values().len(),
         );
-
-        (0..width)
+        // Result names may repeat (`SELECT a, a ...`), but a table's columns
+        // may not: stock (sqlite3ColumnsFromExprList) renames a repeat to
+        // `name:N`, and a schema with a repeated column name is one stock
+        // refuses to open ("malformed database schema").
+        let mut used_names: HashSet<String> = HashSet::with_capacity(width);
+        let unique_names: Vec<String> = (0..width)
             .map(|i| {
+                let name = col_names
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(|| format!("_c{i}"));
+                if used_names.insert(name.to_ascii_lowercase()) {
+                    return name;
+                }
+                let base = match name.rfind(':') {
+                    Some(colon)
+                        if colon > 0
+                            && name[colon + 1..].bytes().all(|byte| byte.is_ascii_digit()) =>
+                    {
+                        &name[..colon]
+                    }
+                    _ => name.as_str(),
+                };
+                let mut suffix = 0u32;
+                loop {
+                    suffix += 1;
+                    let candidate = format!("{base}:{suffix}");
+                    if used_names.insert(candidate.to_ascii_lowercase()) {
+                        return candidate;
+                    }
+                }
+            })
+            .collect();
+
+        unique_names
+            .into_iter()
+            .enumerate()
+            .map(|(i, name)| {
                 let affinity = select_affinities.get(i).map_or_else(
                     || {
                         // No AST-derived affinity (e.g. an unresolved column) —
@@ -41524,10 +41558,7 @@ impl Connection {
                     |affinity| type_affinity_to_char(*affinity),
                 );
                 ColumnInfo {
-                    name: col_names
-                        .get(i)
-                        .cloned()
-                        .unwrap_or_else(|| format!("_c{i}")),
+                    name,
                     affinity,
                     is_ipk: false,
                     type_name: None,
@@ -63187,8 +63218,10 @@ impl Connection {
                         .iter()
                         .map(|column| {
                             column.default_value.as_deref().map(|sql| {
-                                Self::short_record_default_value(sql)
-                                    .apply_affinity(affinity_char_to_type(column.affinity))
+                                Self::short_record_default_value(
+                                    sql,
+                                    affinity_char_to_type(column.affinity),
+                                )
                             })
                         })
                         .collect::<Vec<_>>(),
@@ -74868,8 +74901,7 @@ impl Connection {
             precomputed.reserve_exact(table.columns.len());
             for column in &table.columns {
                 precomputed.push(column.default_value.as_deref().map(|sql| {
-                    Self::short_record_default_value(sql)
-                        .apply_affinity(affinity_char_to_type(column.affinity))
+                    Self::short_record_default_value(sql, affinity_char_to_type(column.affinity))
                 }));
             }
         }
@@ -82858,9 +82890,11 @@ impl Connection {
 
     /// bd-xik4y: index of the row in `group_rows` whose tracked min()/max()
     /// argument is the group's extremum: the first row holding it in scan
-    /// order, skipping NULLs and rows the aggregate's FILTER rejects, compared
-    /// under the argument's effective collation. `None` when no row qualifies
-    /// (SQLite then keeps an arbitrary row; the group's first row stays).
+    /// order, skipping rows the aggregate's FILTER rejects, compared under the
+    /// argument's effective collation. As in stock's minmaxStep, a NULL
+    /// argument row supplies the bare columns until the first non-NULL value
+    /// appears, so an all-NULL group reports its last such row. `None` when
+    /// the FILTER rejects every row (stock keeps the group's first row).
     async fn join_minmax_bare_extremum_index(
         &self,
         tracking: &(bool, Expr, Option<Expr>),
@@ -82872,6 +82906,7 @@ impl Connection {
         let (is_max, arg, filter) = tracking;
         let collation = join_expr_effective_collation(arg, col_map);
         let mut best: Option<(usize, SqliteValue)> = None;
+        let mut null_row = None;
         for (index, row) in group_rows.iter().enumerate() {
             if let Some(filter) = filter {
                 let keep = self
@@ -82885,6 +82920,9 @@ impl Connection {
                 .eval_row_expr_allowing_subqueries_with_using(arg, row, col_map, using_skip)
                 .await?;
             if value.is_null() {
+                if best.is_none() {
+                    null_row = Some(index);
+                }
                 continue;
             }
             let replace = best.as_ref().is_none_or(|(_, best_value)| {
@@ -82904,7 +82942,7 @@ impl Connection {
                 best = Some((index, value));
             }
         }
-        Ok(best.map(|(index, _)| index))
+        Ok(best.map(|(index, _)| index).or(null_row))
     }
 
     /// Stable-reorder the materialized rows of a GROUP BY + JOIN so that, within
@@ -88174,6 +88212,10 @@ impl Connection {
                     });
 
                 let mut best: Option<(&Vec<SqliteValue>, usize)> = None;
+                // Stock's minmaxStep loads the bare columns from a NULL row
+                // until the first non-NULL value appears, so an all-NULL group
+                // reports its last (FILTER-passing) row.
+                let mut null_row: Option<&Vec<SqliteValue>> = None;
                 let mut aggregate_values = Vec::with_capacity(group_rows.len());
                 for row in group_rows {
                     if let Some(filter_expr) = filter {
@@ -88193,6 +88235,9 @@ impl Connection {
                         SqliteValue::Null
                     };
                     if value.is_null() {
+                        if best.is_none() {
+                            null_row = Some(row);
+                        }
                         continue;
                     }
                     let replace = best.as_ref().is_none_or(|(_, best_index)| {
@@ -88215,7 +88260,9 @@ impl Connection {
                 }
                 Some((
                     descriptor_index,
-                    best.map(|(row, _)| row).or_else(|| group_rows.first()),
+                    best.map(|(row, _)| row)
+                        .or(null_row)
+                        .or_else(|| group_rows.first()),
                     aggregate_values,
                 ))
             } else {
@@ -97875,42 +97922,128 @@ impl Connection {
     /// CURRENT_* and other expressions read as NULL, which matches stock and
     /// is unreachable through ALTER anyway (it refuses non-constant defaults
     /// on a non-empty table). The result is a pure function of the DEFAULT
-    /// text, so callers cache it per schema generation (GH#440).
-    fn short_record_default_value(default_sql: &str) -> SqliteValue {
-        fn value_of(expr: &Expr) -> Option<SqliteValue> {
+    /// text and the column's affinity, so callers cache it per schema
+    /// generation (GH#440).
+    ///
+    /// Like `valueFromExpr`, each step applies `affinity` itself: a numeric
+    /// literal that stock does not hold as a 32-bit integer starts out as its
+    /// source text, so a TEXT column reads `DEFAULT 1.50` as '1.50' and
+    /// `DEFAULT -1e2` as '-1e2'.
+    pub(crate) fn short_record_default_value(
+        default_sql: &str,
+        affinity: TypeAffinity,
+    ) -> SqliteValue {
+        /// A numeric literal (`negate` for one directly under unary minus).
+        /// Integer tokens that fit in 32 bits (stock's EP_IntValue) and hex
+        /// tokens are integers; other decimal tokens are their signed source
+        /// text under TEXT affinity, otherwise their numeric value.
+        fn numeric_literal(
+            literal: &Literal,
+            token: &str,
+            negate: bool,
+            affinity: TypeAffinity,
+        ) -> SqliteValue {
+            let value = match literal {
+                Literal::Integer(n) if negate => n
+                    .checked_neg()
+                    .map_or_else(|| SqliteValue::Float(-(*n as f64)), SqliteValue::Integer),
+                Literal::Integer(n) => SqliteValue::Integer(*n),
+                Literal::Float(f) if negate => SqliteValue::Float(-f),
+                Literal::Float(f) => SqliteValue::Float(*f),
+                _ => return SqliteValue::Null,
+            };
+            let is_hex = token.starts_with("0x") || token.starts_with("0X");
+            let is_int32 = matches!(literal, Literal::Integer(n) if i32::try_from(*n).is_ok())
+                && token.bytes().all(|byte| byte.is_ascii_digit());
+            if affinity == TypeAffinity::Text && !is_hex && !is_int32 {
+                let sign = if negate { "-" } else { "" };
+                return SqliteValue::Text(format!("{sign}{token}").into());
+            }
+            match value.apply_affinity(affinity) {
+                // Stock reaches REAL through the literal's text, which reads
+                // `-0.0` as the integer 0 before realifying it: +0.0.
+                SqliteValue::Float(f)
+                    if affinity == TypeAffinity::Real && f.classify() == std::num::FpCategory::Zero =>
+                {
+                    SqliteValue::Float(0.0)
+                }
+                converted => converted,
+            }
+        }
+
+        fn literal_token<'s>(sql: &'s str, expr: &Expr) -> &'s str {
+            let span = expr.span();
+            sql.get(span.start as usize..span.end as usize)
+                .unwrap_or_default()
+                .trim()
+        }
+
+        fn value_of(expr: &Expr, sql: &str, affinity: TypeAffinity) -> Option<SqliteValue> {
             match expr {
                 Expr::Literal(
                     Literal::CurrentTime | Literal::CurrentDate | Literal::CurrentTimestamp,
                     _,
                 ) => None,
-                Expr::Literal(literal, _) => Some(literal_to_join_value(literal)),
+                Expr::Literal(literal @ (Literal::Integer(_) | Literal::Float(_)), _) => Some(
+                    numeric_literal(literal, literal_token(sql, expr), false, affinity),
+                ),
+                Expr::Literal(literal, _) => {
+                    Some(literal_to_join_value(literal).apply_affinity(affinity))
+                }
                 // stock parses `DEFAULT name` as the string 'name'.
                 Expr::Column(col_ref, _) if col_ref.table.is_none() => {
-                    Some(SqliteValue::Text(col_ref.column.clone().into()))
+                    Some(SqliteValue::Text(col_ref.column.clone().into()).apply_affinity(affinity))
                 }
                 Expr::UnaryOp {
                     op: UnaryOp::Plus,
                     expr: inner,
                     ..
                 }
-                | Expr::Collate { expr: inner, .. } => value_of(inner),
+                | Expr::Collate { expr: inner, .. } => value_of(inner, sql, affinity),
+                // A sign directly on a numeric literal is part of the literal.
                 Expr::UnaryOp {
                     op: UnaryOp::Negate,
                     expr: inner,
                     ..
-                } => match value_of(inner)?.apply_affinity(TypeAffinity::Numeric) {
-                    SqliteValue::Integer(n) => Some(n.checked_neg().map_or_else(
-                        || SqliteValue::Float(-(n as f64)),
-                        SqliteValue::Integer,
-                    )),
-                    SqliteValue::Float(f) => Some(SqliteValue::Float(-f)),
-                    _ => None,
-                },
+                } if matches!(
+                    inner.as_ref(),
+                    Expr::Literal(Literal::Integer(_) | Literal::Float(_), _)
+                ) =>
+                {
+                    let Expr::Literal(literal, _) = inner.as_ref() else {
+                        return None;
+                    };
+                    Some(numeric_literal(
+                        literal,
+                        literal_token(sql, inner),
+                        true,
+                        affinity,
+                    ))
+                }
+                // Any other minus numerifies its operand (`-'5x'` is -5).
+                Expr::UnaryOp {
+                    op: UnaryOp::Negate,
+                    expr: inner,
+                    ..
+                } => {
+                    let negated = match value_of(inner, sql, affinity)?.cast_to_numeric() {
+                        SqliteValue::Integer(n) => n
+                            .checked_neg()
+                            .map_or_else(|| SqliteValue::Float(-(n as f64)), SqliteValue::Integer),
+                        SqliteValue::Float(f) => SqliteValue::Float(-f),
+                        _ => return None,
+                    };
+                    Some(negated.apply_affinity(affinity))
+                }
+                // The operand is read under the CAST's own affinity.
                 Expr::Cast {
                     expr: inner,
                     type_name,
                     ..
-                } => Some(apply_cast(value_of(inner)?, &type_name.name)),
+                } => {
+                    let operand = value_of(inner, sql, cast_type_affinity(&type_name.name))?;
+                    Some(apply_cast(operand, &type_name.name).apply_affinity(affinity))
+                }
                 _ => None,
             }
         }
@@ -97923,13 +98056,14 @@ impl Connection {
         if let Some(value) = Self::parse_wrapped_default_text(literal_sql, '\'')
             .or_else(|| Self::parse_wrapped_default_text(literal_sql, '"'))
         {
-            return value;
+            return value.apply_affinity(affinity);
         }
-        if let Ok(Statement::Select(select)) = parse_single_statement(&format!("SELECT {trimmed}"))
+        let select_sql = format!("SELECT {trimmed}");
+        if let Ok(Statement::Select(select)) = parse_single_statement(&select_sql)
             && let SelectCore::Select { columns, .. } = &select.body.select
             && let [ResultColumn::Expr { expr, .. }] = columns.as_slice()
         {
-            return value_of(expr).unwrap_or(SqliteValue::Null);
+            return value_of(expr, &select_sql, affinity).unwrap_or(SqliteValue::Null);
         }
         SqliteValue::Null
     }
@@ -99739,7 +99873,12 @@ impl Connection {
                 let columns = vtab_factory_columns.unwrap_or_else(|| {
                     parsed_create_table
                         .as_ref()
-                        .and_then(crate::compat_persist::columns_from_create_table_statement)
+                        .and_then(|create| {
+                            crate::compat_persist::columns_from_create_table_statement(
+                                create,
+                                &create_sql,
+                            )
+                        })
                         .unwrap_or_else(|| {
                             crate::compat_persist::parse_columns_from_sqlite_master_sql(&create_sql)
                         })
@@ -112006,8 +112145,14 @@ fn flatten_simple_from_subquery_select(select: &SelectStatement) -> Option<Selec
         outer_alias.as_deref(),
         &projection_map,
     )?;
-    let flattened_order_by =
-        flatten_order_by_terms(&select.order_by, outer_alias.as_deref(), &projection_map)?;
+    let flattened_order_by = flatten_select_order_by_terms(
+        &select.order_by,
+        outer_columns,
+        inner_columns,
+        &flattened_columns,
+        outer_alias.as_deref(),
+        &projection_map,
+    )?;
 
     let mut flattened = select.clone();
     if let SelectCore::Select {
@@ -112196,6 +112341,100 @@ fn flatten_expr_option(
             .map(Some),
         None => Some(None),
     }
+}
+
+/// The flattened statement's own ORDER BY: like [`flatten_order_by_terms`],
+/// except that a bare identifier naming a result column orders by that result
+/// column (an aggregate's `ORDER BY` inside its argument list does not see
+/// result names and uses [`flatten_order_by_terms`] directly).
+fn flatten_select_order_by_terms(
+    order_by: &[OrderingTerm],
+    outer_columns: &[ResultColumn],
+    inner_columns: &[ResultColumn],
+    flattened_columns: &[ResultColumn],
+    outer_alias: Option<&str>,
+    projection_map: &FlattenProjectionMap,
+) -> Option<Vec<OrderingTerm>> {
+    // Without an outer `AS` alias every result name is one the subquery
+    // exposes, which the projection map already resolves the same way.
+    let has_outer_alias = outer_columns
+        .iter()
+        .any(|column| matches!(column, ResultColumn::Expr { alias: Some(_), .. }));
+    if !has_outer_alias {
+        return flatten_order_by_terms(order_by, outer_alias, projection_map);
+    }
+    // The named result columns in order, with each one's position in
+    // `flattened_columns`: an outer `AS` alias, or, through `*` / `alias.*`,
+    // the name each inner column exposes. `None` marks a column whose name
+    // the rewrite cannot know (an inner `*`, an unaliased inner expression).
+    let mut result_names: Vec<Option<(&str, usize)>> = Vec::new();
+    let mut flattened_index = 0usize;
+    for column in outer_columns {
+        match column {
+            ResultColumn::Star | ResultColumn::TableStar(_) => {
+                for inner in inner_columns {
+                    result_names.push(match inner {
+                        ResultColumn::Expr {
+                            alias: Some(alias), ..
+                        } => Some((alias.as_str(), flattened_index)),
+                        ResultColumn::Expr {
+                            expr: Expr::Column(column_ref, _),
+                            alias: None,
+                        } => Some((&*column_ref.column, flattened_index)),
+                        _ => None,
+                    });
+                    flattened_index += 1;
+                }
+            }
+            ResultColumn::Expr { alias, .. } => {
+                if let Some(alias) = alias {
+                    result_names.push(Some((alias.as_str(), flattened_index)));
+                }
+                flattened_index += 1;
+            }
+        }
+    }
+    let mut flattened_order_by = Vec::with_capacity(order_by.len());
+    for term in order_by {
+        // Like SQLite's resolveAsName, a bare ORDER BY identifier names the
+        // first result column called that before any column the subquery
+        // exposes, so it orders by that column's flattened expression
+        // (`SELECT x+0 AS y FROM (SELECT a AS x, b AS y ...) ORDER BY y`
+        // orders by a, not b). An unknowable name ahead of the match keeps
+        // the subquery.
+        if let Expr::Column(column_ref, _) = &term.expr
+            && column_ref.table.is_none()
+        {
+            let mut target = None;
+            for entry in &result_names {
+                match entry {
+                    None => return None,
+                    Some((name, index)) if name.eq_ignore_ascii_case(&column_ref.column) => {
+                        target = Some(*index);
+                        break;
+                    }
+                    Some(_) => {}
+                }
+            }
+            if let Some(index) = target {
+                let ResultColumn::Expr { expr, .. } = flattened_columns.get(index)? else {
+                    return None;
+                };
+                flattened_order_by.push(OrderingTerm {
+                    expr: expr.clone(),
+                    direction: term.direction,
+                    nulls: term.nulls,
+                });
+                continue;
+            }
+        }
+        flattened_order_by.push(OrderingTerm {
+            expr: flatten_expr_tree(&term.expr, outer_alias, projection_map)?,
+            direction: term.direction,
+            nulls: term.nulls,
+        });
+    }
+    Some(flattened_order_by)
 }
 
 fn flatten_order_by_terms(
@@ -132530,7 +132769,7 @@ fn type_name_to_affinity_char(name: &str) -> char {
     }
 }
 
-fn affinity_char_to_type(ch: char) -> TypeAffinity {
+pub(crate) fn affinity_char_to_type(ch: char) -> TypeAffinity {
     match ch {
         'B' | 'b' => TypeAffinity::Text,
         'C' | 'c' => TypeAffinity::Numeric,
@@ -132593,13 +132832,6 @@ fn add_column_default_is_null_literal(dv: &DefaultValue) -> bool {
         DefaultValue::Expr(expr) | DefaultValue::ParenExpr(expr) => expr,
     };
     matches!(expr, Expr::Literal(Literal::Null, _))
-}
-
-fn format_default_value(dv: &DefaultValue) -> String {
-    match dv {
-        DefaultValue::Expr(expr) => expr.to_string(),
-        DefaultValue::ParenExpr(expr) => format!("({})", expr),
-    }
 }
 
 fn default_expr_is_self_contained(expr: &Expr) -> bool {
@@ -248559,12 +248791,57 @@ mod pager_routing_tests {
             ("CURRENT_TIMESTAMP", SqliteValue::Null),
             ("(1+1)", SqliteValue::Null),
             ("(strftime('%Y', 'now'))", SqliteValue::Null),
+            ("-'5x'", SqliteValue::Integer(-5)),
+            ("-0.0", SqliteValue::Float(-0.0)),
+            ("1.0", SqliteValue::Float(1.0)),
+            ("0x10", SqliteValue::Integer(16)),
+            ("-0x10", SqliteValue::Integer(-16)),
         ];
         for (sql, expected) in cases {
             assert_eq!(
-                &Connection::short_record_default_value(sql),
+                &Connection::short_record_default_value(sql, TypeAffinity::Blob),
                 expected,
                 "short-record default for `{sql}`"
+            );
+        }
+        // Under TEXT affinity a decimal literal that stock does not hold as a
+        // 32-bit integer keeps its signed source text; 32-bit and hex integers
+        // and CAST operands read under the CAST's own affinity.
+        let text_cases: &[(&str, &str)] = &[
+            ("1e2", "1e2"),
+            ("1.50", "1.50"),
+            ("-1.50", "-1.50"),
+            ("(+1.50)", "1.50"),
+            ("-0.0", "-0.0"),
+            ("-0", "0"),
+            ("00010", "10"),
+            ("2147483648", "2147483648"),
+            ("-2147483648", "-2147483648"),
+            ("0x80000000", "2147483648"),
+            ("-0x10", "-16"),
+            ("(CAST(1.50 AS TEXT))", "1.50"),
+            ("(CAST('12abc' AS INTEGER))", "12"),
+            ("-'5x'", "-5"),
+        ];
+        for (sql, expected) in text_cases {
+            assert_eq!(
+                Connection::short_record_default_value(sql, TypeAffinity::Text),
+                SqliteValue::Text((*expected).into()),
+                "TEXT short-record default for `{sql}`"
+            );
+        }
+        // Numeric affinities convert as for any stored value.
+        for (sql, affinity, expected) in [
+            ("1.0", TypeAffinity::Numeric, SqliteValue::Integer(1)),
+            ("-0.0", TypeAffinity::Integer, SqliteValue::Integer(0)),
+            ("-0.0", TypeAffinity::Real, SqliteValue::Float(0.0)),
+            ("(CAST(1.50 AS TEXT))", TypeAffinity::Integer, SqliteValue::Float(1.5)),
+            ("'42'", TypeAffinity::Integer, SqliteValue::Integer(42)),
+        ] {
+            assert_eq!(
+                Connection::short_record_default_value(sql, affinity),
+                expected,
+                "short-record default for `{sql}` under {affinity:?}"
             );
         }
     }

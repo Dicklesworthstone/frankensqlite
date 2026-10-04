@@ -25,7 +25,6 @@ use std::sync::Arc;
 use fsqlite_ast::{
     ColumnConstraintKind, CreateTableBody, CreateTableStatement, DefaultValue, Expr,
     GeneratedStorage, Literal, SortDirection, Statement, TableConstraintKind, TriggerTiming,
-    UnaryOp,
 };
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 use fsqlite_btree::BtreeCursorOps;
@@ -48,8 +47,8 @@ use fsqlite_types::record::{
 use fsqlite_types::value::SqliteValue;
 
 use crate::connection::{
-    ImplicitAutoindexSlot, codegen_error_to_franken, collect_primary_key_desc_flags,
-    column_def_is_exact_integer, implicit_autoindex_layout,
+    Connection, ImplicitAutoindexSlot, affinity_char_to_type, codegen_error_to_franken,
+    collect_primary_key_desc_flags, column_def_is_exact_integer, implicit_autoindex_layout,
     validate_builtin_persisted_index_expr_functions,
 };
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
@@ -3484,11 +3483,34 @@ fn parse_single_statement(sql: &str) -> Option<Statement> {
     statements.into_iter().next()
 }
 
-fn format_default_value(dv: &DefaultValue) -> String {
+pub(crate) fn format_default_value(dv: &DefaultValue) -> String {
     match dv {
         DefaultValue::Expr(expr) => expr.to_string(),
         DefaultValue::ParenExpr(expr) => format!("({expr})"),
     }
+}
+
+/// A column DEFAULT as written in `sql`, the statement it was parsed from:
+/// stock reports that text in `dflt_value` (outer parentheses stripped) and
+/// reads a pre-ALTER record's value from its literal spelling, so `DEFAULT
+/// 1.50` must stay `1.50` rather than the AST's `1.5`. Expression spans omit
+/// grouping parentheses, so a slice that does not reparse to the same
+/// expression falls back to the AST rendering. The stored text is also
+/// re-parsed to evaluate INSERT defaults, so it must parse back to the same
+/// expression: a double-quoted string default (`DEFAULT "dq"`) therefore keeps
+/// its AST rendering `'dq'`, since `"dq"` alone parses as an identifier.
+pub(crate) fn default_value_source_text(dv: &DefaultValue, sql: &str) -> String {
+    let (DefaultValue::Expr(expr) | DefaultValue::ParenExpr(expr)) = dv;
+    let span = expr.span();
+    if let Some(text) = sql
+        .get(span.start as usize..span.end as usize)
+        .map(str::trim)
+        && !text.is_empty()
+        && fsqlite_parser::expr::parse_expr(text).is_ok_and(|parsed| parsed.eq(expr))
+    {
+        return text.to_owned();
+    }
+    format_default_value(dv)
 }
 
 fn indexed_column_name(indexed_column: &fsqlite_ast::IndexedColumn) -> Option<&str> {
@@ -3504,141 +3526,6 @@ fn indexed_column_name(indexed_column: &fsqlite_ast::IndexedColumn) -> Option<&s
     }
 
     extract(&indexed_column.expr)
-}
-
-fn strip_wrapping_default_parens(mut default_sql: &str) -> &str {
-    loop {
-        let trimmed = default_sql.trim();
-        let bytes = trimmed.as_bytes();
-        if bytes.first() != Some(&b'(') || bytes.last() != Some(&b')') {
-            return trimmed;
-        }
-
-        let mut depth = 0_i32;
-        let mut idx = 0_usize;
-        let mut wraps_entire_expr = false;
-        while idx < bytes.len() {
-            match bytes[idx] {
-                quote @ (b'\'' | b'"') => {
-                    idx += 1;
-                    while idx < bytes.len() {
-                        if bytes[idx] == quote {
-                            if idx + 1 < bytes.len() && bytes[idx + 1] == quote {
-                                idx += 2;
-                            } else {
-                                idx += 1;
-                                break;
-                            }
-                        } else {
-                            idx += 1;
-                        }
-                    }
-                    continue;
-                }
-                b'(' => depth += 1,
-                b')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        wraps_entire_expr = idx == bytes.len() - 1;
-                        break;
-                    }
-                    if depth < 0 {
-                        return trimmed;
-                    }
-                }
-                _ => {}
-            }
-            idx += 1;
-        }
-
-        if !wraps_entire_expr || depth != 0 {
-            return trimmed;
-        }
-        default_sql = &trimmed[1..trimmed.len() - 1];
-    }
-}
-
-fn parse_wrapped_default_text(default_sql: &str, quote: char) -> Option<SqliteValue> {
-    if !default_sql.starts_with(quote) {
-        return None;
-    }
-    let mut value = String::new();
-    let body = &default_sql[quote.len_utf8()..];
-    let mut chars = body.char_indices().peekable();
-
-    while let Some((offset, ch)) = chars.next() {
-        if ch != quote {
-            value.push(ch);
-            continue;
-        }
-        if let Some((_, next_ch)) = chars.peek()
-            && *next_ch == quote
-        {
-            value.push(quote);
-            let _ = chars.next();
-            continue;
-        }
-        let absolute_end = quote.len_utf8() + offset + ch.len_utf8();
-        return (absolute_end == default_sql.len()).then(|| SqliteValue::Text(value.into()));
-    }
-
-    None
-}
-
-fn loaded_default_literal_value(literal: &Literal) -> Option<SqliteValue> {
-    match literal {
-        Literal::Integer(value) => Some(SqliteValue::Integer(*value)),
-        Literal::Float(value) => Some(SqliteValue::Float(*value)),
-        Literal::String(value) => Some(SqliteValue::Text(value.clone().into())),
-        Literal::Blob(value) => Some(SqliteValue::from(value.clone())),
-        Literal::Null => Some(SqliteValue::Null),
-        Literal::True => Some(SqliteValue::Integer(1)),
-        Literal::False => Some(SqliteValue::Integer(0)),
-        Literal::CurrentTime | Literal::CurrentDate | Literal::CurrentTimestamp => None,
-    }
-}
-
-fn loaded_constant_default_expr_value(expr: &Expr) -> Option<SqliteValue> {
-    match expr {
-        Expr::Literal(literal, _) => loaded_default_literal_value(literal),
-        Expr::UnaryOp {
-            op: UnaryOp::Plus,
-            expr,
-            ..
-        } => match loaded_constant_default_expr_value(expr)? {
-            value @ (SqliteValue::Integer(_) | SqliteValue::Float(_)) => Some(value),
-            _ => None,
-        },
-        Expr::UnaryOp {
-            op: UnaryOp::Negate,
-            expr,
-            ..
-        } => match loaded_constant_default_expr_value(expr)? {
-            SqliteValue::Integer(value) => Some(
-                value
-                    .checked_neg()
-                    .map_or_else(|| SqliteValue::Float(-(value as f64)), SqliteValue::Integer),
-            ),
-            SqliteValue::Float(value) => Some(SqliteValue::Float(-value)),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-fn parse_loaded_column_default_value(default_sql: &str) -> SqliteValue {
-    let default_sql = strip_wrapping_default_parens(default_sql);
-    if let Some(value) = parse_wrapped_default_text(default_sql, '\'')
-        .or_else(|| parse_wrapped_default_text(default_sql, '"'))
-    {
-        return value;
-    }
-    if let Ok(expr) = fsqlite_parser::expr::parse_expr(default_sql)
-        && let Some(value) = loaded_constant_default_expr_value(&expr)
-    {
-        return value;
-    }
-    SqliteValue::Text(default_sql.into())
 }
 
 fn inflate_loaded_table_row_values(
@@ -3793,7 +3680,12 @@ fn inflate_loaded_table_row_values_with_alias_alignment(
             payload_idx += 1;
             value.clone()
         } else if let Some(default_sql) = column.default_value.as_ref() {
-            parse_loaded_column_default_value(default_sql)
+            // A record that predates the column reads its DEFAULT exactly as
+            // every other read path does (stock's valueFromExpr rule).
+            Connection::short_record_default_value(
+                default_sql,
+                affinity_char_to_type(column.affinity),
+            )
         } else {
             SqliteValue::Null
         };
@@ -3848,11 +3740,14 @@ fn try_parse_columns_from_create_sql_ast(sql: &str) -> Option<Vec<ColumnInfo>> {
     let Statement::CreateTable(create) = parse_single_statement(sql)? else {
         return None;
     };
-    columns_from_create_table_statement(&create)
+    columns_from_create_table_statement(&create, sql)
 }
 
+/// `create` must be the statement parsed from `sql`: column DEFAULTs keep the
+/// text written there (see [`default_value_source_text`]).
 pub(crate) fn columns_from_create_table_statement(
     create: &CreateTableStatement,
+    sql: &str,
 ) -> Option<Vec<ColumnInfo>> {
     let CreateTableBody::Columns { columns, .. } = &create.body else {
         return None;
@@ -3937,7 +3832,7 @@ pub(crate) fn columns_from_create_table_statement(
                     .iter()
                     .find_map(|constraint| match &constraint.kind {
                         ColumnConstraintKind::Default(default_value) => {
-                            Some(format_default_value(default_value))
+                            Some(default_value_source_text(default_value, sql))
                         }
                         _ => None,
                     });
@@ -4670,26 +4565,18 @@ mod tests {
 
     #[test]
     fn test_parse_loaded_default_text_requires_complete_quoted_literal() {
-        assert_eq!(
-            parse_loaded_column_default_value("'can''t'"),
-            SqliteValue::Text("can't".into()),
-        );
-        assert_eq!(
-            parse_loaded_column_default_value(r#""a""b""#),
-            SqliteValue::Text("a\"b".into()),
-        );
-        assert_eq!(
-            parse_loaded_column_default_value("'x' || 'y'"),
-            SqliteValue::Text("'x' || 'y'".into()),
-        );
-        assert_eq!(
-            parse_loaded_column_default_value("('a)b')"),
-            SqliteValue::Text("a)b".into()),
-        );
-        assert_eq!(
-            parse_loaded_column_default_value(r#"("a)b")"#),
-            SqliteValue::Text("a)b".into()),
-        );
+        // Loaded short records read their DEFAULT through the same stock
+        // valueFromExpr rule as every other read path: a complete quoted
+        // literal is its text, and an expression that is not a literal (here
+        // a concatenation) reads as NULL, as in stock.
+        let loaded = |sql: &str| {
+            Connection::short_record_default_value(sql, fsqlite_types::TypeAffinity::Blob)
+        };
+        assert_eq!(loaded("'can''t'"), SqliteValue::Text("can't".into()));
+        assert_eq!(loaded(r#""a""b""#), SqliteValue::Text("a\"b".into()));
+        assert_eq!(loaded("'x' || 'y'"), SqliteValue::Null);
+        assert_eq!(loaded("('a)b')"), SqliteValue::Text("a)b".into()));
+        assert_eq!(loaded(r#"("a)b")"#), SqliteValue::Text("a)b".into()));
         assert_eq!(
             extract_default_value("TEXT DEFAULT ('a)b')").as_deref(),
             Some("('a)b')")

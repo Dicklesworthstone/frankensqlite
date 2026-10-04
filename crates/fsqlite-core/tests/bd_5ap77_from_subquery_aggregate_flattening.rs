@@ -91,6 +91,15 @@ const SHAPES: &[&str] = &[
     "SELECT count(*) FROM (SELECT y AS z FROM e) WHERE z = 'abc'",
     "SELECT max(z), min(z) FROM (SELECT y AS z FROM e)",
     "SELECT count(*) FROM (SELECT CAST(d AS TEXT) AS s FROM t) WHERE s = '10'",
+    // A bare ORDER BY identifier names the outer result alias before a column
+    // the subquery exposes under the same name (`b` below is text 'b1'..'b12',
+    // whose order differs from a's).
+    "SELECT x + 0 AS b FROM (SELECT a AS x, b FROM t WHERE a < 13) ORDER BY b",
+    "SELECT x AS b FROM (SELECT a AS x, b FROM t WHERE a < 13) ORDER BY b",
+    "SELECT x AS b FROM (SELECT a AS x, b FROM t WHERE a < 13) ORDER BY b DESC",
+    "SELECT x * 2 AS y FROM (SELECT a AS x, b AS y FROM t WHERE a < 13) ORDER BY y",
+    "SELECT *, x AS y FROM (SELECT a AS x, b AS y FROM t WHERE a < 13) ORDER BY y",
+    "SELECT x AS y FROM (SELECT a AS x, b AS y FROM t WHERE a < 13) WHERE y > 'b5' ORDER BY x",
     // Inner ORDER BY under an outer count/min/max.
     "SELECT max(v) FROM (SELECT a AS v FROM t ORDER BY a DESC)",
     "SELECT min(v), max(v), count(*) FROM (SELECT b AS v FROM t ORDER BY c)",

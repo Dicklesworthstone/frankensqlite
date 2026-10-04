@@ -45,6 +45,10 @@ const SETUP: &[&str] = &[
     "CREATE TABLE n(k TEXT COLLATE NOCASE, tag)",
     "INSERT INTO n VALUES ('b','lower-b'),('A','upper-a'),('B','upper-b'),('a','lower-a')",
     "CREATE VIEW vt AS SELECT a AS v, b, c FROM t",
+    // Group 1 is all NULL, group 2 has leading NULLs before its maximum.
+    "CREATE TABLE z(a, b, g)",
+    "INSERT INTO z VALUES (NULL,'z1',1),(NULL,'z2',1),(NULL,'z3',1),\
+     (NULL,'y1',2),(4,'y2',2),(NULL,'y3',2),(4,'y4',2)",
 ];
 
 /// Single min()/max() with bare columns, over every source shape that reaches
@@ -96,6 +100,18 @@ const VALUE_QUERIES: &[&str] = &[
     "SELECT min(a), b FROM t",
     "SELECT max(a), b, c FROM t GROUP BY c ORDER BY c",
     "SELECT max(a), b FROM t WHERE c < 3",
+    // A NULL argument row supplies the bare columns until the first non-NULL
+    // value (stock's minmaxStep), so an all-NULL group reports its last row.
+    "SELECT max(a), b FROM z WHERE g = 1",
+    "SELECT g, max(a), b FROM z GROUP BY g ORDER BY g",
+    "SELECT g, min(a), b FROM z GROUP BY g ORDER BY g",
+    "SELECT max(v), b FROM (SELECT a AS v, b FROM z WHERE g = 1 ORDER BY b)",
+    "SELECT g, max(v), b FROM (SELECT a AS v, b, g FROM z ORDER BY b) GROUP BY g ORDER BY g",
+    "SELECT max(a) FILTER (WHERE g = 2), b FROM z",
+    "SELECT max(a) FILTER (WHERE a IS NULL), b FROM z",
+    "SELECT max(v) FILTER (WHERE v IS NULL), b FROM (SELECT a AS v, b FROM z ORDER BY b)",
+    "SELECT max(z.a), z.b FROM z JOIN u ON u.a = z.g WHERE z.g = 1",
+    "SELECT z.g, max(z.a), z.b FROM z JOIN u ON u.a = z.g GROUP BY z.g ORDER BY z.g",
 ];
 
 /// Unaliased result expressions are named by their source text.

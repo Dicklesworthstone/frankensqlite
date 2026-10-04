@@ -134,6 +134,86 @@ fn gh440_short_record_defaults_match_stock_value_from_expr() {
     });
 }
 
+/// Every literal shape under every column affinity, read from records that
+/// predate the columns. Stock's `valueFromExpr` starts a decimal literal it
+/// does not hold as a 32-bit integer as its source text, so TEXT columns keep
+/// `1.50`, `1e2` and `-0.0` as written; a minus over a non-literal numerifies
+/// (`-'5x'` is -5); a CAST operand is read under the CAST's affinity.
+#[test]
+fn gh440_short_record_default_literals_match_stock_under_every_affinity() {
+    let _serial = serial();
+    asupersync::test_utils::run_test(|| async {
+        const DEFAULTS: &[&str] = &[
+            "1e2",
+            "1.50",
+            "-1.50",
+            "00010",
+            "2147483647",
+            "2147483648",
+            "-2147483648",
+            "0x10",
+            "0x80000000",
+            "-0x10",
+            "+5",
+            "+''5''",
+            "-''5x''",
+            "TRUE",
+            "''42''",
+            "x''41''",
+            "NULL",
+            "name",
+            "-0",
+            "-0.0",
+            "1.0",
+            "(+1.50)",
+            "(-(-1.50))",
+            "(CAST(''12abc'' AS INTEGER))",
+            "(CAST(1.50 AS TEXT))",
+        ];
+        const AFFINITIES: &[&str] = &["INTEGER", "TEXT", "REAL", "NUMERIC", "BLOB", ""];
+        let mut columns = Vec::new();
+        let mut names = Vec::new();
+        for (d, default) in DEFAULTS.iter().enumerate() {
+            for (a, affinity) in AFFINITIES.iter().enumerate() {
+                let name = format!("c{d}_{a}");
+                columns.push(format!("{name} {affinity} DEFAULT {default}"));
+                names.push(name);
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let stock_path = dir.path().join("stock_matrix.db");
+        let frank_path = dir.path().join("frank_matrix.db");
+        {
+            let r = rusqlite::Connection::open(&stock_path).unwrap();
+            r.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, false)
+                .unwrap();
+            r.execute_batch(&format!(
+                "CREATE TABLE t(a);
+                 INSERT INTO t VALUES (1), (2);
+                 PRAGMA writable_schema = ON;
+                 UPDATE sqlite_master SET sql = 'CREATE TABLE t(a, {})' WHERE name = 't';
+                 PRAGMA writable_schema = OFF;",
+                columns.join(", ")
+            ))
+            .unwrap();
+        }
+        std::fs::copy(&stock_path, &frank_path).unwrap();
+
+        let r = rusqlite::Connection::open(&stock_path).unwrap();
+        let f = Connection::open(frank_path.to_string_lossy().as_ref())
+            .await
+            .unwrap();
+        for name in &names {
+            assert_agree(
+                &f,
+                &r,
+                &format!("SELECT a, {name}, typeof({name}) FROM t ORDER BY a"),
+            )
+            .await;
+        }
+    });
+}
+
 /// The cached default map follows schema changes on the same connection:
 /// ALTER TABLE ADD COLUMN, DROP + re-CREATE under the same name, and a
 /// statement prepared before the change.

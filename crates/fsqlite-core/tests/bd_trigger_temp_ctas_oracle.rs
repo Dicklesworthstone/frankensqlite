@@ -123,6 +123,62 @@ fn create_temp_table_as_select_lives_in_temp_schema() {
     });
 }
 
+/// A CTAS whose result names repeat gets stock's `name:N` column names, in
+/// main and temp. fsqlite used to refuse the temp form ("duplicate column
+/// name") and write the main form with a repeated column name, which stock
+/// then refused to open ("malformed database schema").
+#[test]
+fn create_table_as_select_renames_repeated_result_names() {
+    for_each_backing(|frank, stock| async move {
+        for sql in [
+            "CREATE TABLE src(a INTEGER, b TEXT)",
+            "INSERT INTO src VALUES (1, 'x'), (2, 'y')",
+            "CREATE TABLE m AS SELECT a, a, b AS A, b AS a, b AS \"a:1\" FROM src",
+            "CREATE TEMP TABLE t AS SELECT a, a, b AS A FROM src",
+        ] {
+            run_both(&frank, &stock, sql).await;
+        }
+        for sql in [
+            "SELECT name FROM pragma_table_info('m') ORDER BY cid",
+            "SELECT name FROM pragma_table_info('t', 'temp') ORDER BY cid",
+            "SELECT * FROM m ORDER BY 1",
+            "SELECT * FROM t ORDER BY 1",
+        ] {
+            compare(&frank, &stock, sql).await;
+        }
+    });
+
+    // The file fsqlite wrote must open under stock SQLite.
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ctas_dupes.db");
+        {
+            let frank = Connection::open(path.to_str().unwrap()).await.unwrap();
+            for sql in [
+                "CREATE TABLE src(a INTEGER, b TEXT)",
+                "INSERT INTO src VALUES (1, 'x'), (2, 'y')",
+                "CREATE TABLE m AS SELECT a, a, b AS a FROM src",
+            ] {
+                frank.execute(sql).await.unwrap();
+            }
+            frank.close().await.unwrap();
+        }
+        let stock = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(
+            stock_rows(&stock, "PRAGMA integrity_check"),
+            vec![vec![SqliteValue::from("ok")]]
+        );
+        assert_eq!(
+            stock_rows(&stock, "SELECT name FROM pragma_table_info('m') ORDER BY cid"),
+            vec![
+                vec![SqliteValue::from("a")],
+                vec![SqliteValue::from("a:1")],
+                vec![SqliteValue::from("a:2")],
+            ]
+        );
+    });
+}
+
 #[test]
 fn trigger_new_values_carry_column_affinity() {
     for_each_backing(|frank, stock| async move {
