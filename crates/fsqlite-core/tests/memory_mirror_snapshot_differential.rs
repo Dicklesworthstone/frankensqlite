@@ -83,6 +83,18 @@ struct Rng {
     /// payloads large enough to spill to overflow pages, and DDL inside an
     /// explicit transaction (which may then roll back).
     known_bugs: bool,
+    /// Generate writes that read the row mirror (INSERT ... SELECT over an
+    /// aggregate, UPSERT, UPDATE ... FROM and WITH ... DML, back to back) and
+    /// storage-free reads, in autocommit only. Autocommit writes are parked in a
+    /// retained batch, and a read that touches no table reaches the deferred
+    /// mirror rebuild without flushing it.
+    mirror_writes: bool,
+    /// Statements of a scripted mirror-writes episode still to be issued, last
+    /// first. The harness skips its interleaved reads while one is in flight,
+    /// since a read of a table the batch wrote flushes the batch.
+    queued: Vec<(String, bool)>,
+    /// Episodes queued so far (coverage check).
+    episodes: u32,
 }
 
 impl Rng {
@@ -230,9 +242,192 @@ fn insert_verb(rng: &mut Rng) -> &'static str {
     verbs[rng.below(verbs.len() as u64) as usize]
 }
 
+/// A write that reads table rows through the row mirror, a storage-free read,
+/// or a DDL that arms the deferred mirror rebuild. None of them can fail in
+/// either engine. Review of c52c2f112: a storage-free read consumed the armed
+/// rebuild while a retained autocommit batch was parked, and the rebuilt
+/// mirror lacked the batch's rows, so the next of these writes read the
+/// batch's tables as they were before it.
+fn mirror_sourced_statement(rng: &mut Rng, tables: &[TableModel]) -> (String, bool) {
+    let roll = rng.below(19);
+    mirror_sourced_statement_numbered(rng, tables, roll)
+}
+
+fn mirror_sourced_statement_numbered(
+    rng: &mut Rng,
+    tables: &[TableModel],
+    roll: u64,
+) -> (String, bool) {
+    let t1_cols = tables[0].columns.len();
+    match roll {
+        0 => ("SELECT 1".to_owned(), false),
+        1 => ("SELECT changes()".to_owned(), false),
+        2 => ("SELECT total_changes() > 0".to_owned(), false),
+        // Into t1, which has no UNIQUE column: the same shape into t3 trips a
+        // separate, pre-existing index corruption (see the doc comment on
+        // `mirror_reading_writes_after_storage_free_reads_match_stock`).
+        3 => (
+            "INSERT OR REPLACE INTO t1 (id, a, b, c) SELECT 200 + abs(coalesce(a, 0)) % 50, count(*), \
+             'agg-' || coalesce(a, 'n'), NULL FROM t3 GROUP BY a"
+                .to_owned(),
+            false,
+        ),
+        4 => (
+            "WITH agg AS (SELECT a, count(*) AS n FROM t1 GROUP BY a) \
+             UPDATE t3 SET a = agg.n FROM agg WHERE agg.a = t3.a"
+                .to_owned(),
+            false,
+        ),
+        5 => (
+            "UPDATE t3 SET a = s.a FROM t3 AS s WHERE s.id = t3.id + 1".to_owned(),
+            false,
+        ),
+        6 => (
+            format!(
+                "UPDATE t1 SET a = agg.c FROM (SELECT id % {m} AS k, count(*) AS c FROM t3 GROUP BY 1) \
+                 AS agg WHERE agg.k = t1.id % {m}",
+                m = rng.below(4) + 2
+            ),
+            false,
+        ),
+        7 => (
+            "DELETE FROM t3 WHERE id IN (SELECT max(id) FROM t3 GROUP BY a HAVING count(*) > 1)"
+                .to_owned(),
+            false,
+        ),
+        8 => (
+            format!(
+                "INSERT INTO t3 (id, a, b) SELECT abs(coalesce(a, 0)) % 20 + 1, count(*), NULL FROM t1 \
+                 WHERE id > {} GROUP BY 1 ON CONFLICT(id) DO UPDATE SET a = excluded.a",
+                rng.below(30)
+            ),
+            false,
+        ),
+        9 => (
+            "WITH s AS (SELECT a, sum(id) AS t FROM t1 GROUP BY a) \
+             INSERT OR REPLACE INTO t2 SELECT 'k' || (t % 40), count(*), NULL FROM s GROUP BY 1"
+                .to_owned(),
+            false,
+        ),
+        10 => (
+            "WITH d AS (SELECT a FROM t3 GROUP BY a HAVING count(*) > 1) \
+             DELETE FROM t1 WHERE a IN (SELECT a FROM d)"
+                .to_owned(),
+            false,
+        ),
+        11 => (
+            "INSERT OR REPLACE INTO tmp1 SELECT 500 + count(*), max(a), min(b) FROM t3".to_owned(),
+            false,
+        ),
+        12 => (
+            "UPDATE t2 SET v = agg.n FROM (SELECT b, count(*) AS n FROM t3 GROUP BY b) AS agg \
+             WHERE agg.b = t2.w"
+                .to_owned(),
+            false,
+        ),
+        // DDL that arms the deferred rebuild without allocating a root page
+        // (views have none), so it can repeat for the whole run.
+        13 if t1_cols < 7 => (
+            format!("ALTER TABLE t1 ADD COLUMN d{t1_cols} DEFAULT {}", rng.below(9)),
+            true,
+        ),
+        14 => (
+            "CREATE VIEW IF NOT EXISTS v_agg AS SELECT a, count(*) AS n FROM t1 GROUP BY a".to_owned(),
+            true,
+        ),
+        15 => ("DROP VIEW IF EXISTS v_agg".to_owned(), true),
+        // Plain autocommit writes to the tables the writes above read, so the
+        // retained batch holds rows they must see.
+        16 => (
+            format!(
+                "INSERT OR REPLACE INTO t1 (id, a, b, c) VALUES ({}, {}, {}, x'0102')",
+                rng.below(60) + 1,
+                small_value(rng),
+                padded_text(rng)
+            ),
+            false,
+        ),
+        _ => (
+            format!(
+                "INSERT OR REPLACE INTO t3 (id, a, b) VALUES ({}, {}, {})",
+                rng.below(50) + 1,
+                small_value(rng),
+                small_value(rng)
+            ),
+            false,
+        ),
+    }
+}
+
+/// Queue the exact shape of the c52c2f112 lost-row bug: a DDL that arms the
+/// deferred mirror rebuild, autocommit writes parked in the retained batch, a
+/// storage-free read that reaches the rebuild, and a write that reads the
+/// written table through the mirror.
+fn queue_mirror_episode(rng: &mut Rng, tables: &[TableModel]) {
+    let mut episode = Vec::new();
+    let arm = if rng.chance(50) {
+        "CREATE VIEW IF NOT EXISTS v_agg AS SELECT a, count(*) AS n FROM t1 GROUP BY a"
+    } else {
+        "DROP VIEW IF EXISTS v_agg"
+    };
+    episode.push((arm.to_owned(), true));
+    let on_t1 = rng.chance(50);
+    for _ in 0..=rng.below(2) {
+        let write = if on_t1 {
+            format!(
+                "INSERT OR REPLACE INTO t1 (id, a, b, c) VALUES ({}, {}, {}, x'0102')",
+                rng.below(60) + 1,
+                small_value(rng),
+                padded_text(rng)
+            )
+        } else {
+            format!(
+                "INSERT OR REPLACE INTO t3 (id, a, b) VALUES ({}, {}, {})",
+                rng.below(50) + 1,
+                small_value(rng),
+                small_value(rng)
+            )
+        };
+        episode.push((write, false));
+    }
+    let probe =
+        ["SELECT 1", "SELECT changes()", "SELECT total_changes() > 0"][rng.below(3) as usize];
+    episode.push((probe.to_owned(), false));
+    // Mirror-reading writes over the table just written (see
+    // `mirror_sourced_statement`): t1 sources for 4, 8, 9; t3 for 3, 6, 7, 10, 11, 12.
+    let consumers: &[u64] = if on_t1 {
+        &[4, 8, 9]
+    } else {
+        &[3, 6, 7, 10, 11, 12]
+    };
+    rng.episodes += 1;
+    let pick = consumers[rng.below(consumers.len() as u64) as usize];
+    episode.push(mirror_sourced_statement_numbered(rng, tables, pick));
+    episode.reverse();
+    rng.queued = episode;
+}
+
 /// One random statement, plus whether it can end in a time-travel capture.
 fn random_statement(rng: &mut Rng, tables: &mut [TableModel], in_txn: bool) -> (String, bool) {
+    if let Some(queued) = rng.queued.pop() {
+        return queued;
+    }
+    if rng.mirror_writes && rng.chance(12) {
+        queue_mirror_episode(rng, tables);
+        if let Some(first) = rng.queued.pop() {
+            return first;
+        }
+    }
     let roll = rng.below(100);
+    if rng.mirror_writes
+        && (roll <= 20 || (85..=88).contains(&roll) || roll >= 92 || rng.chance(20))
+    {
+        // Autocommit only: transaction control is replaced (explicit
+        // transactions trip the known page-accounting bugs), and so are the
+        // attached-table writes (this mode attaches nothing) and the generic
+        // tail reads.
+        return mirror_sourced_statement(rng, tables);
+    }
     let allocates_root = matches!(roll, 21..=23 | 25..=26);
     if !rng.known_bugs && (allocates_root || ((21..=26).contains(&roll) && in_txn)) {
         // DDL that allocates or frees a root page after the setup, and any DDL
@@ -451,10 +646,21 @@ async fn compare_history(conn: &Connection, snap: &Snapshot, context: &dyn Fn() 
     }
 }
 
-async fn run_seed(seed: u64, ops: usize, known_bugs: bool) {
+async fn run_seed(seed: u64, ops: usize, known_bugs: bool, mirror_writes: bool) {
     let conn = Connection::open(":memory:").await.expect("open");
     let stock = rusqlite::Connection::open_in_memory().expect("stock");
-    for sql in BASE_DDL.iter().copied().chain(["ATTACH ':memory:' AS aux", "CREATE TABLE aux.t5 (id INTEGER PRIMARY KEY, a)"]) {
+    // An attached database keeps autocommit writes out of a retained batch,
+    // which hides the parked-batch shapes the mirror-writes mode is after, so
+    // that mode attaches nothing.
+    let attach: &[&str] = if mirror_writes {
+        &[]
+    } else {
+        &[
+            "ATTACH ':memory:' AS aux",
+            "CREATE TABLE aux.t5 (id INTEGER PRIMARY KEY, a)",
+        ]
+    };
+    for sql in BASE_DDL.iter().chain(attach).copied() {
         trace(sql);
         conn.execute(sql).await.unwrap_or_else(|e| panic!("seed {seed}: {sql}: {e}"));
         stock.execute_batch(sql).unwrap_or_else(|e| panic!("seed {seed} stock: {sql}: {e}"));
@@ -469,8 +675,20 @@ async fn run_seed(seed: u64, ops: usize, known_bugs: bool) {
         held.push((conn.prepare(sql).await.expect("prepare held"), sql));
     }
 
-    let mut rng = Rng { state: seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1, known_bugs };
+    let mut rng = Rng {
+        state: seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1,
+        known_bugs,
+        mirror_writes,
+        queued: Vec::new(),
+        episodes: 0,
+    };
     let mut tables = initial_tables();
+    if mirror_writes {
+        tables
+            .iter_mut()
+            .filter(|t| t.name == "aux.t5")
+            .for_each(|t| t.exists = false);
+    }
     // Bisection aid: builds before the TEMP INTEGER PRIMARY KEY history fix
     // read that column back as NULL from a snapshot.
     if std::env::var_os("MEMDIFF_SKIP_TEMP_HISTORY").is_some() {
@@ -485,8 +703,29 @@ async fn run_seed(seed: u64, ops: usize, known_bugs: bool) {
         let (sql, may_capture) = random_statement(&mut rng, &mut tables, !stock.is_autocommit());
         let seq_before = conn.last_local_commit_seq();
         trace(&sql);
-        let ours = conn.execute(&sql).await;
-        let theirs = stock.execute_batch(&sql);
+        // Generated SELECTs run as queries, as an application reads: only the
+        // query path reaches the read-statement dispatch (and its deferred
+        // mirror rebuild); `execute` of a SELECT does not. Their rows are
+        // compared with stock's.
+        let (ours, theirs) = if sql.starts_with("SELECT") {
+            let ours = conn.query(&sql).await.map(|rows| render_fsqlite(&rows));
+            let theirs = render_stock(&stock, &sql);
+            if let (Ok(a), Ok(b)) = (&ours, &theirs)
+                && a != b
+            {
+                diverged(format!(
+                    "generated read diverged: {sql}\nfsqlite={a:?}\nstock={b:?}"
+                ));
+            }
+            (
+                ours.map(|_| 0_usize),
+                theirs
+                    .map(|_| ())
+                    .map_err(rusqlite::Error::InvalidParameterName),
+            )
+        } else {
+            (conn.execute(&sql).await, stock.execute_batch(&sql))
+        };
         // ALTER ... ADD COLUMN may fail or be rolled back later; take t1's
         // column list from stock after every statement.
         tables[0].columns = stock_columns(&stock, "t1");
@@ -517,7 +756,11 @@ async fn run_seed(seed: u64, ops: usize, known_bugs: bool) {
             // half the time and let the stale window after the other half
             // meet the random reads.
             let seq_after = conn.last_local_commit_seq();
-            if !in_txn && ours.is_ok() && seq_after != seq_before && rng.chance(50)
+            if !in_txn
+                && ours.is_ok()
+                && seq_after != seq_before
+                && rng.queued.is_empty()
+                && rng.chance(50)
                 && let Some(seq) = seq_after
             {
                 let probe = format!("SELECT count(*) FROM t3 FOR SYSTEM_TIME AS OF COMMITSEQ {seq}");
@@ -534,17 +777,27 @@ async fn run_seed(seed: u64, ops: usize, known_bugs: bool) {
             }
         }
 
-        if rng.chance(45) {
+        // A live read of a table the retained batch wrote flushes the batch, so
+        // the mirror-writes mode checks less often to let stale windows reach
+        // the next mirror-reading write; its losses still show up in later
+        // reads and the final sweep.
+        let (live_chance, prepared_chance) = match (mirror_writes, rng.queued.is_empty()) {
+            (false, _) => (45, 25),
+            (true, true) => (15, 8),
+            // Mid-episode: an interleaved read would flush the batch.
+            (true, false) => (0, 0),
+        };
+        if rng.chance(live_chance) {
             let queries = live_queries(&tables);
             let pick = rng.below(queries.len() as u64) as usize;
             compare_live(&conn, &stock, &queries[pick], &context).await;
             live_reads += 1;
         }
-        if rng.chance(25) {
+        if rng.chance(prepared_chance) {
             compare_prepared(&held, &stock, &mut rng, &context).await;
             prepared_reads += 1;
         }
-        if !snapshots.is_empty() && rng.chance(8) {
+        if !snapshots.is_empty() && rng.queued.is_empty() && rng.chance(8) {
             let pick = rng.below(snapshots.len() as u64) as usize;
             compare_history(&conn, &snapshots[pick], &context).await;
             rechecks += 1;
@@ -579,8 +832,15 @@ async fn run_seed(seed: u64, ops: usize, known_bugs: bool) {
          {captures} snapshots checked at capture, {rechecks} historical rechecks"
     );
     if ops >= 200 {
+        // The mirror-writes mode probes snapshots only between its episodes,
+        // so it counts episodes instead of captures.
+        let exercised = if mirror_writes {
+            rng.episodes >= 5
+        } else {
+            captures > 0
+        };
         assert!(
-            live_reads > 0 && prepared_reads > 0 && captures > 0,
+            live_reads > 0 && prepared_reads > 0 && exercised,
             "seed {seed}: the run exercised too little to mean anything"
         );
     }
@@ -590,13 +850,13 @@ fn env_u64(name: &str, default: u64) -> u64 {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
-fn run_seeds(known_bugs: bool) {
+fn run_seeds(known_bugs: bool, mirror_writes: bool) {
     let seeds = env_u64("MEMDIFF_SEEDS", 6);
     let first = env_u64("MEMDIFF_FIRST_SEED", 1);
     let ops = env_u64("MEMDIFF_OPS", 250) as usize;
     for seed in first..first + seeds {
         asupersync::test_utils::run_test(move || async move {
-            run_seed(seed, ops, known_bugs).await;
+            run_seed(seed, ops, known_bugs, mirror_writes).await;
         });
     }
 }
@@ -620,7 +880,7 @@ fn run_seeds(known_bugs: bool) {
 #[test]
 #[ignore = "pre-existing :memory: page-accounting and attached-database bugs (see doc comment)"]
 fn memory_connection_reads_match_stock_across_random_histories() {
-    run_seeds(false);
+    run_seeds(false, false);
 }
 
 /// Same, with the generator's known-bug shapes left in, which trip the same
@@ -638,7 +898,41 @@ fn memory_connection_reads_match_stock_across_random_histories() {
 #[test]
 #[ignore = "pre-existing :memory: page-accounting bugs (see doc comment)"]
 fn memory_connection_reads_match_stock_across_random_histories_with_known_bug_shapes() {
-    run_seeds(true);
+    run_seeds(true, false);
+}
+
+/// Autocommit-only random histories rich in writes that read the row mirror
+/// (aggregate INSERT ... SELECT, UPSERT, UPDATE ... FROM, WITH ... DML) and in
+/// storage-free reads (`SELECT 1`, `SELECT changes()`), with arming DDL that
+/// allocates no root page. Not ignored: it stays clear of the known
+/// pre-existing shapes (no explicit transactions or savepoints, no overflow
+/// payloads, no root-page DDL after setup).
+///
+/// Review of c52c2f112: a storage-free read consumed the armed mirror rebuild
+/// while autocommit writes were parked in a retained batch. The rebuild read
+/// the published pager image, which lacks them, and marked the mirror current,
+/// so the next mirror-reading write saw those tables as they were before the
+/// batch (an aggregate INSERT ... SELECT inserted nothing). On the unfixed
+/// build every default seed (1-6) diverged, and 11 of seeds 1-12; with the fix
+/// seeds 1-120 match stock. The mode differs from the histories above in three
+/// ways that each hid the bug: it attaches nothing (an attached database keeps
+/// autocommit writes out of a retained batch), it runs generated SELECTs as
+/// queries (`execute` of a SELECT skips the read dispatch), and it scripts
+/// episodes (arming DDL, parked writes, a storage-free read, then a
+/// mirror-reading write of the written table) with no interleaved reads.
+///
+/// Its aggregate INSERT ... SELECT writes t1, not t3: the same statement into
+/// t3 (UNIQUE b) trips a separate, pre-existing corruption that reproduces in
+/// memory and file-backed, before and after bd-jdjee:
+/// `CREATE TABLE t1 (id INTEGER PRIMARY KEY, a INT, b TEXT, c BLOB);
+/// CREATE TABLE t3 (id INTEGER PRIMARY KEY, a, b UNIQUE);
+/// INSERT OR REPLACE INTO t1 (id, a, b, c) VALUES (3, 1.5, 'stuvw', x'0102');
+/// INSERT OR REPLACE INTO t3 (id, a, b) SELECT 200 + abs(coalesce(a, 0)) % 50,
+/// count(*), 'agg-' || coalesce(a, 'n') FROM t1 GROUP BY a;` leaves "index key
+/// record missing trailing integer rowid" (stock integrity_check: malformed).
+#[test]
+fn mirror_reading_writes_after_storage_free_reads_match_stock() {
+    run_seeds(false, true);
 }
 
 /// A TEMP rowid table's INTEGER PRIMARY KEY reads back in a snapshot. The

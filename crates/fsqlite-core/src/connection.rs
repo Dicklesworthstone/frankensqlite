@@ -24884,10 +24884,18 @@ impl Connection {
     /// Rebuild the `:memory:` row mirror once if a time-travel capture point
     /// left it stale (bd-jdjee). Called at read statements only; inside a
     /// transaction the request stays armed for the first read after it.
+    ///
+    /// It also stays armed while a retained autocommit batch is parked: the
+    /// rebuild reads the published pager image, which does not hold that
+    /// batch's rows. Rebuilding then marked the mirror current without them, so
+    /// a later statement that reads the mirror (an INSERT ... SELECT, UPSERT or
+    /// UPDATE ... FROM over an aggregate) saw the batch's tables as they were
+    /// before it (review of c52c2f112).
     async fn hydrate_memdb_armed_by_capture(&self, cx: &Cx) -> Result<()> {
         if !self.memdb_hydrate_at_next_read.get()
             || self.in_transaction.get()
             || self.active_txn.borrow().is_some()
+            || self.retained_autocommit_txn.borrow().is_some()
         {
             return Ok(());
         }
@@ -38187,9 +38195,6 @@ impl Connection {
             Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
         );
         let op_cx = self.op_cx_after_background_status();
-        if !is_write && !is_txn_control && !self.skip_statement_memdb_refresh.get() {
-            self.hydrate_memdb_armed_by_capture(&op_cx).await?;
-        }
         let should_refresh_active_txn_memdb = !self.skip_statement_memdb_refresh.get()
             && (self.memdb_requires_active_txn_reload.get()
                 || !self.pending_memdb_direct_upserts.borrow().is_empty())
@@ -38257,6 +38262,12 @@ impl Connection {
             })
         {
             self.flush_retained_autocommit_txn_for_read(&op_cx).await?;
+        }
+        // bd-jdjee's deferred mirror rebuild runs only after the retained batch
+        // and the cached writer have been settled above, against the state they
+        // leave; it stays armed while a retained batch is still parked.
+        if !is_write && !is_txn_control && !self.skip_statement_memdb_refresh.get() {
+            self.hydrate_memdb_armed_by_capture(&op_cx).await?;
         }
         // A SELECT with no FROM, CTE, compound arm or subquery reads no
         // storage. Like stock SQLite, whose program for it has no Transaction
@@ -59182,7 +59193,6 @@ impl Connection {
         stmt: &PreparedStatement<'_>,
         cx: &Cx,
     ) -> Result<(bool, PreparedDmlEntryProof)> {
-        self.hydrate_memdb_armed_by_capture(cx).await?;
         self.refresh_memdb_from_active_txn_if_dirty(cx).await?;
         self.refresh_memdb_from_cached_write_txn_if_stale(cx)
             .await?;
@@ -59222,6 +59232,9 @@ impl Connection {
                 }
             }
         }
+        // As in statement dispatch: the deferred mirror rebuild runs against
+        // the state the refreshes and the retained-batch flush above leave.
+        self.hydrate_memdb_armed_by_capture(cx).await?;
 
         if self.committed_pager_refresh_allowed() {
             // PR#401 invariant: schema-only opens never bulk-hydrate file rows
@@ -98612,6 +98625,7 @@ impl Connection {
         publication: &BoundPagerPublication,
         hydrate_rows: bool,
     ) -> Result<()> {
+        let hydrate_rows = self.pager_reload_may_hydrate_rows(hydrate_rows);
         let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::CoreConnection);
         let mut txn = self.begin_reload_txn_repairing_empty_page_one(cx).await?;
         let Some(txn_visible_commit_seq) = txn.published_visible_commit_seq_hint() else {
@@ -98644,8 +98658,21 @@ impl Connection {
         Ok(())
     }
 
+    /// Whether a pager reload may hydrate the row mirror. A reload reads the
+    /// published pager image, which lacks the rows of a parked retained
+    /// autocommit batch, and a hydrating reload marks the mirror current. With
+    /// a batch parked it must leave the rows unloaded instead (only the schema
+    /// is reloaded), so nothing trusts mirror rows the batch has outdated until
+    /// the batch is flushed. The established callers flush the batch before
+    /// reloading; this keeps any caller from producing a mirror that looks
+    /// current but is not (review of c52c2f112).
+    fn pager_reload_may_hydrate_rows(&self, hydrate_rows: bool) -> bool {
+        hydrate_rows && self.retained_autocommit_txn.borrow().is_none()
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn reload_memdb_from_pager_with_mode(&self, cx: &Cx, hydrate_rows: bool) -> Result<()> {
+        let hydrate_rows = self.pager_reload_may_hydrate_rows(hydrate_rows);
         let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::CoreConnection);
         // ORCHESTRATOR RULING (2) (bd-dk9ra, release endgame): the reload
         // binds against CURRENT WAL state. An external writer (e.g. a C
