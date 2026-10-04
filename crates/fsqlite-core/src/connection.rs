@@ -26738,6 +26738,83 @@ impl Connection {
         (!self.application_function_replaces_builtin(name, 1)).then_some(tracking)
     }
 
+    /// bd-6hoc8: whether the bytecode aggregate path answers this
+    /// whole-table tracked min()/max() query. Its accumulate loop emits
+    /// SQLite's `OP_CollSeq` skip register (and FILTER "magnet"), so the bare
+    /// columns load from the extremum row. Admitted: one plain table, no
+    /// GROUP BY, subqueries or DISTINCT, every result column a direct
+    /// aggregate call or free of aggregates, and a min()/max() without
+    /// DISTINCT (SQLite tests DISTINCT before its skip register; the bytecode
+    /// keeps the first row there).
+    fn select_minmax_bare_tracking_is_vdbe_eligible(&self, select: &SelectStatement) -> bool {
+        let Some(walk) = select_minmax_bare_tracking_walk(select) else {
+            return false;
+        };
+        let SelectCore::Select {
+            distinct,
+            columns,
+            from: Some(from),
+            group_by,
+            windows,
+            ..
+        } = &select.body.select
+        else {
+            return false;
+        };
+        if walk.minmax_distinct
+            || *distinct == Distinctness::Distinct
+            || !group_by.is_empty()
+            || !windows.is_empty()
+            || !from.joins.is_empty()
+            || !matches!(
+                from.source,
+                TableOrSubquery::Table {
+                    time_travel: None,
+                    ..
+                }
+            )
+            || select.with.is_some()
+            || has_window_functions(select)
+            || has_ordered_aggregate(select)
+            || has_fallback_from_source(select)
+            || has_table_function_source(select)
+            || self.has_primary_live_vtab_source(select)
+            || select_contains_match_operator(select)
+            || select_contains_subquery_matching(select, self, &|_, _| true)
+        {
+            return false;
+        }
+        columns.iter().all(|column| {
+            let ResultColumn::Expr { expr, .. } = column else {
+                return false;
+            };
+            if !self.expr_contains_aggregate_with_registry(expr) {
+                return true;
+            }
+            // Otherwise a direct builtin aggregate call over plain arguments.
+            let Expr::FunctionCall {
+                name,
+                args,
+                over: None,
+                ..
+            } = expr
+            else {
+                return false;
+            };
+            is_agg_fn(name)
+                && !self.application_function_replaces_builtin(
+                    name,
+                    aggregate_args_len_for_lookup(args),
+                )
+                && match args {
+                    FunctionArgs::Star => true,
+                    FunctionArgs::List(args) => args
+                        .iter()
+                        .all(|arg| !self.expr_contains_aggregate_with_registry(arg)),
+                }
+        })
+    }
+
     fn has_implicit_aggregation_with_registry(&self, select: &SelectStatement) -> bool {
         self.with_fallback_function_registry(|| {
             if has_implicit_aggregation(select) {
@@ -39283,12 +39360,14 @@ impl Connection {
                     && self
                         .select_uses_builtin_minmax_bare_tracking(select)
                         .is_some()
+                    && !self.select_minmax_bare_tracking_is_vdbe_eligible(select)
                 {
                     // bd-xplxa: a whole-table query whose only aggregate is a
                     // single min()/max() with bare columns must take the bare
-                    // columns from the extremum row. The plain VDBE max/min fast
-                    // path returns an arbitrary row, so route to the grouped
-                    // interpreter which sources bare columns from that row.
+                    // columns from the extremum row. The bytecode aggregate
+                    // tracks that row for the plain single-table shapes
+                    // (bd-6hoc8); route the rest to the grouped interpreter,
+                    // which sources bare columns from that row.
                     self.log_mem_execution_fallback("select", "minmax_bare_tracking_fallback")?;
                     let rewritten = self.rewrite_in_subqueries_select(select, params).await?;
                     let mut bound =
@@ -103733,6 +103812,12 @@ fn frame_bound_has_expr(bound: &FrameBound, predicate: fn(&Expr) -> bool) -> boo
 /// `OVER`), and a bare column reference anywhere outside that aggregate's
 /// argument (and not a GROUP BY key) satisfies the bare-column requirement.
 fn select_minmax_bare_tracking(select: &SelectStatement) -> Option<(bool, Expr, Option<Expr>)> {
+    select_minmax_bare_tracking_walk(select)?.minmax
+}
+
+/// The completed [`select_minmax_bare_tracking`] walk, for callers that also
+/// need its other findings.
+fn select_minmax_bare_tracking_walk(select: &SelectStatement) -> Option<MinMaxBareTrackingWalk> {
     if !select.body.compounds.is_empty() {
         return None;
     }
@@ -103789,10 +103874,10 @@ fn select_minmax_bare_tracking(select: &SelectStatement) -> Option<(bool, Expr, 
             }
         }
     }
-    if !state.has_bare {
+    if !state.has_bare || state.minmax.is_none() {
         return None;
     }
-    state.minmax
+    Some(state)
 }
 
 /// bd-xik4y: walk a HAVING or ORDER BY expression into `state` for
@@ -103832,6 +103917,8 @@ struct MinMaxBareTrackingWalk {
     /// Count of distinct min()/max() calls seen (a repeat of the tracked call
     /// and count() calls are not counted).
     agg_count: usize,
+    /// bd-6hoc8: whether a call of the tracked min()/max() uses DISTINCT.
+    minmax_distinct: bool,
     /// Whether a bare (non-aggregate, non-GROUP-BY) column reference was found.
     has_bare: bool,
     /// Set when a shape disqualifies the optimization (window function, a
@@ -103884,7 +103971,11 @@ fn walk_minmax_bare_tracking(expr: &Expr, group_by: &[Expr], state: &mut MinMaxB
         // accumulator load), so neither disqualifies it. count() is exact and
         // order-free, so the join path may still move the extremum row first.
         Expr::FunctionCall {
-            name, args, filter, ..
+            name,
+            args,
+            filter,
+            distinct,
+            ..
         } if is_agg_fn(name) && !is_scalar_max_min(name, args) => {
             let lname = name.to_ascii_lowercase();
             if lname == "count" {
@@ -103904,6 +103995,7 @@ fn walk_minmax_bare_tracking(expr: &Expr, group_by: &[Expr], state: &mut MinMaxB
                 return;
             }
             let call = (lname == "max", arg.clone(), filter.as_deref().cloned());
+            state.minmax_distinct |= *distinct;
             match &state.minmax {
                 Some(tracked) if *tracked == call => return,
                 Some(_) => {

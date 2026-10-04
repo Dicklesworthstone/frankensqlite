@@ -16677,6 +16677,64 @@ fn emit_aggregate_accumulate_body_covering(
     }
 }
 
+/// Which scanned row an aggregate query without GROUP BY reads its bare
+/// (non-aggregate) columns from.
+#[derive(Clone, Copy)]
+struct BareRowCapture {
+    /// GH #226: register holding 0 until the first scanned row's bare columns
+    /// have been captured, then 1. Gates row-dependent bare-column stores so an
+    /// aggregate query's bare column keeps the FIRST scanned row (matching stock
+    /// sqlite3) instead of the last. Allocated + zeroed once in the caller's
+    /// shared preamble (before any scan strategy), so a single init serves every
+    /// scan path.
+    first_row_flag: i32,
+    /// bd-6hoc8: set when the query has min()/max() aggregates. As in SQLite,
+    /// an `OP_CollSeq` naming this register precedes each min()/max()
+    /// `AggStep`, which sets it to 1 when the row is not that aggregate's new
+    /// extremum; the bare columns load from every row that leaves it 0, so
+    /// they come from the extremum row instead of the first row.
+    minmax_skip_reg: Option<i32>,
+    /// bd-6hoc8: every min()/max() has a FILTER (SQLite's `regAcc` case).
+    /// Before each one's FILTER test the skip register takes the first-row
+    /// flag, so a row the FILTER rejects loads the bare columns only if it is
+    /// the first row.
+    minmax_filtered_magnet: bool,
+}
+
+/// Whether an aggregate column is a one-argument min() or max().
+fn agg_column_is_minmax(agg: &AggColumn) -> bool {
+    agg.bare_expr.is_none()
+        && agg.num_args == 1
+        && (agg.name.eq_ignore_ascii_case("MIN") || agg.name.eq_ignore_ascii_case("MAX"))
+}
+
+/// bd-6hoc8: whether an aggregate query without GROUP BY reads its bare
+/// columns from the min()/max() extremum row, as SQLite does whenever the
+/// aggregates include a builtin min() or max() (`SQLITE_FUNC_NEEDCOLL`); with
+/// several of them the last one's skip decides, as in SQLite. `None` keeps
+/// the first-row capture: no row-dependent bare column, no min()/max(), or a
+/// DISTINCT one (SQLite tests DISTINCT before its skip register, and counts a
+/// NULL argument as a distinct value). `Some(all_filtered)` reports SQLite's
+/// `regAcc` case, where every min()/max() has a FILTER.
+fn aggregate_bare_columns_minmax_tracking(
+    agg_columns: &[AggColumn],
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> Option<bool> {
+    let has_scan_bare = agg_columns.iter().any(|agg| {
+        agg.bare_expr
+            .as_deref()
+            .is_some_and(|bare| expr_references_scan(bare, table, table_alias))
+    });
+    let mut minmax = agg_columns.iter().filter(|agg| agg_column_is_minmax(agg));
+    let tracked = has_scan_bare
+        && minmax.clone().next().is_some()
+        && minmax
+            .clone()
+            .all(|agg| !agg.distinct && builtin_aggregate_semantics_available(&agg.name, 1));
+    tracked.then(|| minmax.all(|agg| agg.filter.is_some()))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_aggregate_accumulate_body(
     b: &mut ProgramBuilder,
@@ -16686,14 +16744,17 @@ fn emit_aggregate_accumulate_body(
     schema: &[TableSchema],
     agg_columns: &[AggColumn],
     accum_base: i32,
-    // GH #226: register holding 0 until the first scanned row's bare columns
-    // have been captured, then 1. Gates row-dependent bare-column stores so an
-    // aggregate query's bare column keeps the FIRST scanned row (matching stock
-    // sqlite3) instead of the last. Allocated + zeroed once in the caller's
-    // shared preamble (before any scan strategy), so a single init serves every
-    // scan path.
-    first_row_flag: i32,
+    bare_capture: BareRowCapture,
 ) {
+    let first_row_flag = bare_capture.first_row_flag;
+    let scan_ctx = ScanCtx {
+        cursor,
+        table,
+        table_alias,
+        schema: Some(schema),
+        register_base: None,
+        secondaries: &[],
+    };
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     for (i, agg) in agg_columns.iter().enumerate() {
         // Skip sentinel entries used for multi-aggregate wrappers.
@@ -16708,17 +16769,13 @@ fn emit_aggregate_accumulate_body(
             // Row-independent scalars belong to the aggregate output row, not
             // an input row. Defer them until finalization so they are evaluated
             // exactly once and still have a value for an empty input group.
-            if !expr_references_scan(bare, table, table_alias) {
+            // Under min()/max() tracking every bare column loads after the
+            // AggSteps, once their skip register is known.
+            if !expr_references_scan(bare, table, table_alias)
+                || bare_capture.minmax_skip_reg.is_some()
+            {
                 continue;
             }
-            let scan_ctx = ScanCtx {
-                cursor,
-                table,
-                table_alias,
-                schema: Some(schema),
-                register_base: None,
-                secondaries: &[],
-            };
             // GH #226: capture the first scanned row's value; skip on later rows.
             let skip_bare = b.emit_label();
             b.emit_jump_to_label(Opcode::If, first_row_flag, 0, skip_bare, P4::None, 0);
@@ -16729,6 +16786,14 @@ fn emit_aggregate_accumulate_body(
 
         // FILTER clause: evaluate and skip AggStep if false/NULL.
         let filter_skip_label = if let Some(ref filter_expr) = agg.filter {
+            // bd-6hoc8: SQLite's "magnet" copy: a row this FILTER rejects
+            // loads the bare columns only when it is the first row.
+            if bare_capture.minmax_filtered_magnet
+                && let Some(skip_reg) = bare_capture.minmax_skip_reg
+                && agg_column_is_minmax(agg)
+            {
+                b.emit_op(Opcode::Copy, first_row_flag, skip_reg, 0, P4::None, 0);
+            }
             let skip_lbl = b.emit_label();
             let filter_reg = b.alloc_temp();
             let scan_ctx = ScanCtx {
@@ -16826,6 +16891,13 @@ fn emit_aggregate_accumulate_body(
                 }
             }
 
+            // bd-6hoc8: SQLite's OP_CollSeq before a min()/max() step names
+            // the register that step sets when this row is not its extremum.
+            if let Some(skip_reg) = bare_capture.minmax_skip_reg
+                && agg_column_is_minmax(agg)
+            {
+                b.emit_op(Opcode::CollSeq, skip_reg, 0, 0, P4::None, 0);
+            }
             let num_args = u16::try_from(agg.num_args).unwrap_or_default();
             b.emit_op(
                 Opcode::AggStep,
@@ -16841,6 +16913,21 @@ fn emit_aggregate_accumulate_body(
         if let Some(skip_lbl) = filter_skip_label {
             b.resolve_label(skip_lbl);
         }
+    }
+    // bd-6hoc8: load the bare columns from every row the min()/max() steps
+    // did not skip, so they end on the extremum row.
+    if let Some(skip_reg) = bare_capture.minmax_skip_reg {
+        let skip_bare = b.emit_label();
+        b.emit_jump_to_label(Opcode::If, skip_reg, 0, skip_bare, P4::None, 0);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        for (i, agg) in agg_columns.iter().enumerate() {
+            if let Some(bare) = agg.bare_expr.as_deref()
+                && expr_references_scan(bare, table, table_alias)
+            {
+                emit_expr(b, bare, accum_base + i as i32, Some(&scan_ctx));
+            }
+        }
+        b.resolve_label(skip_bare);
     }
     // GH #226: after the first scanned row's bare columns are captured, mark the
     // flag so subsequent rows skip the bare-column store (idempotent each row).
@@ -17459,7 +17546,7 @@ fn emit_aggregate_index_value_seek(
     accum_base: i32,
     // GH #226: forwarded to emit_aggregate_accumulate_body so a bare column
     // keeps the first scanned row on this index-value-seek scan path too.
-    first_row_flag: i32,
+    bare_capture: BareRowCapture,
     value: i64,
     covering: bool,
     residual_where: Option<&Expr>,
@@ -17554,7 +17641,7 @@ fn emit_aggregate_index_value_seek(
             schema,
             agg_columns,
             accum_base,
-            first_row_flag,
+            bare_capture,
         );
         b.resolve_label(skip_row);
     }
@@ -17810,6 +17897,12 @@ fn codegen_select_aggregate(
     // the bare column keeps the FIRST scanned row (stock sqlite3), not the last.
     let first_row_flag = b.alloc_reg();
     b.emit_op(Opcode::Integer, 0, first_row_flag, 0, P4::None, 0);
+    let minmax_tracking = aggregate_bare_columns_minmax_tracking(&agg_columns, table, table_alias);
+    let bare_capture = BareRowCapture {
+        first_row_flag,
+        minmax_skip_reg: minmax_tracking.map(|_| b.alloc_reg()),
+        minmax_filtered_magnet: minmax_tracking == Some(true),
+    };
 
     // bd-2dgf5: indexed-equality seek instead of a full table scan.
     //
@@ -18136,7 +18229,7 @@ fn codegen_select_aggregate(
                 schema,
                 &agg_columns,
                 accum_base,
-                first_row_flag,
+                bare_capture,
             );
         }
         b.resolve_label(idx_skip_label);
@@ -18306,7 +18399,7 @@ fn codegen_select_aggregate(
                 schema,
                 &agg_columns,
                 accum_base,
-                first_row_flag,
+                bare_capture,
             );
         }
 
@@ -18377,7 +18470,7 @@ fn codegen_select_aggregate(
             schema,
             &agg_columns,
             accum_base,
-            first_row_flag,
+            bare_capture,
         );
         skip_scan = true;
     } else if let Some((range, has_residual)) = rowid_range_seek {
@@ -18470,7 +18563,7 @@ fn codegen_select_aggregate(
             schema,
             &agg_columns,
             accum_base,
-            first_row_flag,
+            bare_capture,
         );
         b.resolve_label(range_skip_label);
         b.emit_op(Opcode::Next, cursor, range_loop_top, 0, P4::None, 0);
@@ -18512,7 +18605,7 @@ fn codegen_select_aggregate(
                 schema,
                 &agg_columns,
                 accum_base,
-                first_row_flag,
+                bare_capture,
                 value,
                 covering,
                 residual_where,
@@ -18697,7 +18790,7 @@ fn codegen_select_aggregate(
                 schema,
                 &agg_columns,
                 accum_base,
-                first_row_flag,
+                bare_capture,
             );
         }
 
@@ -18914,7 +19007,7 @@ fn codegen_select_aggregate(
                 schema,
                 &agg_columns,
                 accum_base,
-                first_row_flag,
+                bare_capture,
             );
         }
 
@@ -19030,7 +19123,7 @@ fn codegen_select_aggregate(
             schema,
             &agg_columns,
             accum_base,
-            first_row_flag,
+            bare_capture,
         );
 
         b.resolve_label(skip_label);
@@ -19090,7 +19183,7 @@ fn codegen_select_aggregate(
                 schema,
                 &agg_columns,
                 accum_base,
-                first_row_flag,
+                bare_capture,
             );
             b.resolve_label(skip_label);
         }
@@ -19136,7 +19229,7 @@ fn codegen_select_aggregate(
             schema,
             &agg_columns,
             accum_base,
-            first_row_flag,
+            bare_capture,
         );
         skip_scan = true;
     }
@@ -19179,7 +19272,7 @@ fn codegen_select_aggregate(
             schema,
             &agg_columns,
             accum_base,
-            first_row_flag,
+            bare_capture,
         );
 
         // Skip label for WHERE-filtered rows.

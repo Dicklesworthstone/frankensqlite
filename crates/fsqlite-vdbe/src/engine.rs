@@ -7116,6 +7116,9 @@ struct AggStepCall<'a> {
     /// DB storage encoding so collated MIN/MAX order BINARY in the DB encoding
     /// on a UTF-16 database (bd-bld9w.4).
     text_encoding: TextEncoding,
+    /// bd-6hoc8: report whether a builtin min()/max() left its extremum
+    /// unchanged on this row (an `OP_CollSeq` register precedes the step).
+    track_minmax_skip: bool,
 }
 
 /// Original-row state captured for UPDATE's delete+insert rewrite so the old
@@ -13123,7 +13126,17 @@ impl VdbeEngine {
                     pc += 1;
                 }
 
-                Opcode::Permutation | Opcode::CollSeq | Opcode::ElseEq | Opcode::FkCheck => {
+                Opcode::CollSeq => {
+                    // bd-6hoc8: as in SQLite, a non-zero P1 names the register
+                    // the builtin min()/max() AggStep that follows sets to 1
+                    // when this row is not its new extremum. Clear it per row.
+                    if op.p1 != 0 {
+                        self.set_reg(op.p1, SqliteValue::Integer(0));
+                    }
+                    pc += 1;
+                }
+
+                Opcode::Permutation | Opcode::ElseEq | Opcode::FkCheck => {
                     pc += 1;
                 }
 
@@ -13553,6 +13566,15 @@ impl VdbeEngine {
                     let accum_reg = op.p3;
                     let is_distinct = op.p1 != 0;
                     let arg_count = usize::from(op.p5);
+                    // bd-6hoc8: an OP_CollSeq directly before this AggStep names
+                    // the register a builtin min()/max() sets when this row is not
+                    // its new extremum (SQLite's sqlite3SkipAccumulatorLoad), so
+                    // bare columns load only from the extremum row.
+                    let minmax_skip_reg = pc
+                        .checked_sub(1)
+                        .map(|prev| &ops[prev])
+                        .filter(|prev| prev.opcode == Opcode::CollSeq && prev.p1 != 0)
+                        .map(|prev| prev.p1);
                     // Gather per-argument subtypes (parallel to args) so
                     // subtype-aware aggregates embed a JSON-subtyped argument
                     // rather than quoting it (bd-76x57). Cheap: `register_subtype`
@@ -13564,7 +13586,7 @@ impl VdbeEngine {
                                 .unwrap_or(0)
                         })
                         .collect();
-                    if op.p2 >= 0
+                    let skipped = if op.p2 >= 0
                         && (op.p2 as usize).saturating_add(arg_count) <= self.registers.len()
                     {
                         for offset in 0..arg_count {
@@ -13587,8 +13609,9 @@ impl VdbeEngine {
                                 args,
                                 arg_subtypes: &arg_subtypes,
                                 text_encoding: self.text_encoding,
+                                track_minmax_skip: minmax_skip_reg.is_some(),
                             },
-                        )?;
+                        )?
                     } else {
                         let args = self.collect_reg_range(op.p2, arg_count);
                         let text_encoding = self.text_encoding;
@@ -13605,8 +13628,12 @@ impl VdbeEngine {
                                 args: &args,
                                 arg_subtypes: &arg_subtypes,
                                 text_encoding,
+                                track_minmax_skip: minmax_skip_reg.is_some(),
                             },
-                        )?;
+                        )?
+                    };
+                    if skipped && let Some(skip_reg) = minmax_skip_reg {
+                        self.set_reg(skip_reg, SqliteValue::Integer(1));
                     }
                     pc += 1;
                 }
@@ -16621,7 +16648,7 @@ impl VdbeEngine {
         cold_state: &mut Option<Box<ColdVdbeState>>,
         statement_cold_state: &mut StatementColdState,
         step: AggStepCall<'_>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         statement_cold_state.insert(StatementColdState::AGGREGATES);
         let ctx = cold_state
             .get_or_insert_with(|| Box::new(ColdVdbeState::new()))
@@ -16658,6 +16685,7 @@ impl VdbeEngine {
         };
 
         observe_requested_execution_cancellation(step.execution_cx)?;
+        let mut skipped = false;
         if should_step {
             // Implicit BINARY MIN/MAX on a UTF-16 database must order in the
             // storage encoding like stock; the registry's min/max compares
@@ -16665,10 +16693,19 @@ impl VdbeEngine {
             let min_max_collation = step.agg_collation.or_else(|| {
                 (!matches!(step.text_encoding, TextEncoding::Utf8)).then_some("BINARY")
             });
-            if let Some(collation) = min_max_collation
-                && (step.func_name.eq_ignore_ascii_case("min")
-                    || step.func_name.eq_ignore_ascii_case("max"))
-                && !step.args.is_empty()
+            let is_min_max = (step.func_name.eq_ignore_ascii_case("min")
+                || step.func_name.eq_ignore_ascii_case("max"))
+                && !step.args.is_empty();
+            if step.track_minmax_skip && is_min_max {
+                skipped = agg_step_min_max_tracked(
+                    &mut ctx.state,
+                    &step.args[0],
+                    step.func_name.eq_ignore_ascii_case("max"),
+                    min_max_collation,
+                    step.text_encoding,
+                )?;
+            } else if let Some(collation) = min_max_collation
+                && is_min_max
                 && !step.args[0].is_null()
             {
                 agg_step_min_max_collated(
@@ -16683,7 +16720,8 @@ impl VdbeEngine {
                     .step_with_arg_subtypes(&mut ctx.state, step.args, step.arg_subtypes)?;
             }
         }
-        observe_requested_execution_cancellation(step.execution_cx)
+        observe_requested_execution_cancellation(step.execution_cx)?;
+        Ok(skipped)
     }
 
     #[allow(dead_code)]
@@ -18513,6 +18551,42 @@ fn agg_step_min_max_collated(
                 *current = Some(candidate.clone());
             }
         }
+    }
+}
+
+/// bd-6hoc8: one builtin min()/max() step that also reports whether the row
+/// left the extremum unchanged, as SQLite's `minmaxStep` does through
+/// `sqlite3SkipAccumulatorLoad`. A NULL argument skips once an extremum
+/// exists (before that, the row still loads the bare columns); a non-NULL
+/// one skips unless it is strictly better, so ties keep the earlier row.
+fn agg_step_min_max_tracked(
+    state: &mut Box<dyn Any + Send>,
+    candidate: &SqliteValue,
+    is_max: bool,
+    coll: Option<&str>,
+    enc: TextEncoding,
+) -> Result<bool> {
+    let Some(current) = state.downcast_mut::<Option<SqliteValue>>() else {
+        return Err(FrankenError::Internal(
+            "MIN/MAX aggregate state must be Option<SqliteValue>".to_owned(),
+        ));
+    };
+    if candidate.is_null() {
+        return Ok(current.is_some());
+    }
+    let Some(best) = current.as_ref() else {
+        *current = Some(candidate.clone());
+        return Ok(false);
+    };
+    let ord = match coll {
+        Some(coll) => cmp_sqlite_values_collated(candidate, best, coll, enc),
+        None => candidate.cmp_binary_in(best, enc),
+    };
+    if (is_max && ord == Ordering::Greater) || (!is_max && ord == Ordering::Less) {
+        *current = Some(candidate.clone());
+        Ok(false)
+    } else {
+        Ok(true)
     }
 }
 
