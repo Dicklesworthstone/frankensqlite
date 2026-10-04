@@ -274,4 +274,66 @@ mod unix_only {
         }
         assert_eq!(count_rows(&db), 3);
     }
+
+    /// Records the longest single `poll` of the wrapped future.
+    struct LongestPoll<F> {
+        inner: std::pin::Pin<Box<F>>,
+        longest: Duration,
+    }
+
+    impl<F: std::future::Future> std::future::Future for LongestPoll<F> {
+        type Output = (F::Output, Duration);
+
+        fn poll(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            let started = Instant::now();
+            let polled = self.inner.as_mut().poll(cx);
+            let longest = self.longest.max(started.elapsed());
+            self.longest = longest;
+            polled.map(|output| (output, longest))
+        }
+    }
+
+    /// bd-h644q: the legacy-peer backoff (about 0.6 s) used to run as
+    /// `std::thread::sleep` inside the open, so a single poll of
+    /// `Connection::open` blocked the executor thread for the whole backoff.
+    /// It now waits on the runtime timer: the open still refuses after the
+    /// backoff, but no poll holds the thread for more than a fraction of it.
+    #[test]
+    fn legacy_peer_backoff_does_not_block_the_executor() {
+        if std::env::var(ROLE).is_ok() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("legacy-backoff.db");
+        seed(&db);
+        let legacy = Peer::spawn("legacy", &db);
+        let mut outcome = None;
+        let started = Instant::now();
+        asupersync::test_utils::run_test(|| async {
+            let open = LongestPoll {
+                inner: Box::pin(Connection::open(db.to_str().unwrap())),
+                longest: Duration::ZERO,
+            };
+            let (result, longest) = open.await;
+            outcome = Some((result.err(), longest));
+        });
+        let elapsed = started.elapsed();
+        legacy.finish();
+        let (error, longest) = outcome.expect("open completed");
+        assert!(
+            matches!(&error, Some(FrankenError::IncompatiblePeerEngine { .. })),
+            "the open beside a 0.3.x-style peer still refuses: {error:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(500),
+            "the full backoff still elapses before refusing: {elapsed:?}"
+        );
+        assert!(
+            longest < Duration::from_millis(200),
+            "a single poll blocked the executor for {longest:?} of a {elapsed:?} open"
+        );
+    }
 }

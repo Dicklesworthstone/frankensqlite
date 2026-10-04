@@ -166,25 +166,42 @@ impl PendingNamespaceOpen {
     /// refuses only if the signature persists while the namespace stays live.
     /// Peers this process already has open, non-WAL files, and filesystems
     /// whose locks cannot be probed are never refused.
+    ///
+    /// The backoff blocks the calling thread. Async callers retry
+    /// [`Self::begin_attempt`] on the runtime's timer instead (bd-h644q).
     pub fn begin(stable_path: &Path, intent: NamespaceOpenIntent) -> Result<Self> {
-        const LEGACY_PEER_RETRY_DELAYS_MS: [u64; 7] = [5, 10, 20, 40, 80, 160, 320];
-        let mut delays = LEGACY_PEER_RETRY_DELAYS_MS.iter();
+        let mut delays = Self::LEGACY_PEER_RETRY_DELAYS.iter();
         loop {
             if let Some(admission) = Self::begin_attempt(stable_path, intent)? {
                 return Ok(admission);
             }
-            let Some(&delay_ms) = delays.next() else {
+            let Some(&delay) = delays.next() else {
                 return Err(FrankenError::IncompatiblePeerEngine {
                     path: stable_path.to_owned(),
                 });
             };
-            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            std::thread::sleep(delay);
         }
     }
 
+    /// Backoff between admission attempts while a live WAL generation shows
+    /// no 0.4.x participant (bd-sz9j5): about 0.6 s in total, after which the
+    /// admission is refused with [`FrankenError::IncompatiblePeerEngine`].
+    pub const LEGACY_PEER_RETRY_DELAYS: [std::time::Duration; 7] = [
+        std::time::Duration::from_millis(5),
+        std::time::Duration::from_millis(10),
+        std::time::Duration::from_millis(20),
+        std::time::Duration::from_millis(40),
+        std::time::Duration::from_millis(80),
+        std::time::Duration::from_millis(160),
+        std::time::Duration::from_millis(320),
+    ];
+
     /// One admission attempt. `Ok(None)` means a live WAL generation shows no
-    /// 0.4.x participant (bd-sz9j5); no lock is retained in that case.
-    fn begin_attempt(stable_path: &Path, intent: NamespaceOpenIntent) -> Result<Option<Self>> {
+    /// 0.4.x participant (bd-sz9j5); no lock is retained in that case, and
+    /// the caller retries after the next [`Self::LEGACY_PEER_RETRY_DELAYS`]
+    /// entry or refuses once they are exhausted.
+    pub fn begin_attempt(stable_path: &Path, intent: NamespaceOpenIntent) -> Result<Option<Self>> {
         validate_stable_path(stable_path)?;
         let (gate, mut use_file) = if matches!(
             intent,

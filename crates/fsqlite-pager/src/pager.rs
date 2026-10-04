@@ -7049,6 +7049,30 @@ fn maintenance_gate_for_backend<V: Vfs>(vfs: &V, db_path: &Path) -> Arc<PagerMai
     }
 }
 
+/// [`PendingNamespaceOpen::begin`] for the async opens: the bd-sz9j5
+/// legacy-peer backoff (about 0.6 s, only while a pre-0.4 engine is
+/// suspected) waits on the runtime timer instead of blocking the executor
+/// thread with `std::thread::sleep` (bd-h644q). No namespace lock is held
+/// across the wait.
+#[cfg(all(feature = "native", any(unix, windows)))]
+async fn begin_namespace_admission(
+    stable_path: &Path,
+    intent: NamespaceOpenIntent,
+) -> Result<PendingNamespaceOpen> {
+    let mut delays = PendingNamespaceOpen::LEGACY_PEER_RETRY_DELAYS.iter();
+    loop {
+        if let Some(admission) = PendingNamespaceOpen::begin_attempt(stable_path, intent)? {
+            return Ok(admission);
+        }
+        let Some(&delay) = delays.next() else {
+            return Err(FrankenError::IncompatiblePeerEngine {
+                path: stable_path.to_owned(),
+            });
+        };
+        asupersync::time::sleep(asupersync::time::wall_now(), delay).await;
+    }
+}
+
 fn maintenance_gate_for_identity(identity: FileIdentity) -> Arc<PagerMaintenanceGate> {
     let gates =
         MAINTENANCE_IDENTITY_GATES.get_or_init(|| Mutex::new(IdentityWeakRegistry::default()));
@@ -18614,7 +18638,7 @@ where
             } else {
                 NamespaceOpenIntent::Shared
             };
-            let pending = PendingNamespaceOpen::begin(&db_path, intent)?;
+            let pending = begin_namespace_admission(&db_path, intent).await?;
             // A Shared admission without an expected identity owns both
             // namespace locks exclusively. Its bind may therefore repair a
             // plain copied/corrupt base record after validating the opened
@@ -19463,7 +19487,7 @@ where
                 Ok(pending) => (Some(pending), false),
                 Err(FrankenError::CannotOpen { .. }) => {
                     let pending =
-                        PendingNamespaceOpen::begin(&db_path, NamespaceOpenIntent::Shared)?;
+                        begin_namespace_admission(&db_path, NamespaceOpenIntent::Shared).await?;
                     let replace_record = pending.has_quiescent_record_bytes()?;
                     (Some(pending), replace_record)
                 }
@@ -19511,7 +19535,7 @@ where
                     // instead and the exact-identity open remains fail-closed.
                     drop(pending_namespace.take());
                     let replacement_pending =
-                        PendingNamespaceOpen::begin(&db_path, NamespaceOpenIntent::Shared)?;
+                        begin_namespace_admission(&db_path, NamespaceOpenIntent::Shared).await?;
                     let replacement_expected = replacement_pending.expected_identity();
                     replace_quiescent_namespace_record =
                         replacement_pending.has_quiescent_record_bytes()?;
