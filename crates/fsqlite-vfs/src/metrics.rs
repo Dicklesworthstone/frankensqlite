@@ -483,6 +483,10 @@ impl<F: VfsFile> VfsFile for TracingFile<F> {
         self.inner.holds_main_wal_lifetime_read_lock()
     }
 
+    fn claim_wal_lifetime_before_join(&mut self, cx: &Cx) -> Result<bool> {
+        self.inner.claim_wal_lifetime_before_join(cx)
+    }
+
     fn mvcc_shm_map(&mut self, cx: &Cx, payload_bytes: u64, create: bool) -> Result<ShmRegion> {
         self.inner.mvcc_shm_map(cx, payload_bytes, create)
     }

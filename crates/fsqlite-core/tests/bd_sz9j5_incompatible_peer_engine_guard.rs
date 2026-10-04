@@ -129,6 +129,26 @@ mod unix_only {
                 wait_for(&release, "release");
                 drop(use_file);
             }
+            "pager_joiner" => {
+                // A 0.4.x joiner stopped between namespace `bind` (which
+                // releases the admission gate) and its WAL attach: a pager
+                // opened without the connection bootstrap that attaches the
+                // WAL. It must not show the 0.3.x lock signature.
+                asupersync::test_utils::run_test(|| async {
+                    let cx = fsqlite_types::cx::Cx::new();
+                    let pager = fsqlite_pager::SimplePager::open_with_cx(
+                        &cx,
+                        fsqlite_vfs::UnixVfs::new(),
+                        &db,
+                        fsqlite_types::PageSize::DEFAULT,
+                    )
+                    .await
+                    .unwrap();
+                    std::fs::write(&ready, b"ready").unwrap();
+                    wait_for(&release, "release");
+                    drop(pager);
+                });
+            }
             "seed" | "fsqlite_rw" | "fsqlite_ro" => {
                 asupersync::test_utils::run_test(|| async {
                     let path = db.to_str().unwrap().to_owned();
@@ -195,6 +215,36 @@ mod unix_only {
             conn.execute("INSERT INTO t VALUES (2);").await.unwrap();
             conn.close().await.unwrap();
         });
+        assert_eq!(count_rows(&db), 2);
+    }
+
+    /// A joiner that has bound its namespace admission (releasing the gate)
+    /// but not yet attached the WAL is the only other holder once the
+    /// established peer exits. A stalled joiner (CPU starvation, slow storage)
+    /// can stay there longer than the retry budget, so it must already carry
+    /// a 0.4.x lock; otherwise a third opener falsely refuses with
+    /// `IncompatiblePeerEngine` although every process is 0.4.x.
+    #[test]
+    fn read_write_open_beside_a_joiner_before_wal_attach_is_admitted() {
+        if std::env::var(ROLE).is_ok() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("joiner-window.db");
+        seed(&db);
+        let established = Peer::spawn("fsqlite_rw", &db);
+        let joiner = Peer::spawn("pager_joiner", &db);
+        established.finish();
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(db.to_str().unwrap())
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("open beside a 0.4.x joiner before its WAL attach must be admitted: {error:?}")
+                });
+            conn.execute("INSERT INTO t VALUES (2);").await.unwrap();
+            conn.close().await.unwrap();
+        });
+        joiner.finish();
         assert_eq!(count_rows(&db), 2);
     }
 

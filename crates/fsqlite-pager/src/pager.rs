@@ -7900,6 +7900,31 @@ async fn observe_wal_refresh_signature<V: Vfs>(
     }))
 }
 
+/// bd-sz9j5: a joiner of a live namespace generation takes its WAL-lifetime
+/// main-file claim before `bind` releases the namespace gate. Until its WAL
+/// attach it would otherwise hold only the namespace `use` lock, the lock
+/// signature of a pre-0.4 engine, and a third opener could falsely refuse with
+/// `IncompatiblePeerEngine` if the last established peer exited meanwhile.
+/// Best-effort on contention: a busy PENDING byte leaves the claim to the WAL
+/// attach, as before.
+#[cfg(all(feature = "native", any(unix, windows)))]
+fn claim_wal_lifetime_before_namespace_join<F: VfsFile>(
+    cx: &Cx,
+    pending: Option<&PendingNamespaceOpen>,
+    db_file: &mut F,
+) -> Result<()> {
+    if pending
+        .and_then(PendingNamespaceOpen::expected_identity)
+        .is_none()
+    {
+        return Ok(());
+    }
+    match db_file.claim_wal_lifetime_before_join(cx) {
+        Ok(_) | Err(FrankenError::Busy | FrankenError::BusyRecovery) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 /// The shared WAL-index header, when a native WAL reader is attached and this
 /// process holds the main-file SHARED claim that makes it authoritative.
 async fn observe_vouched_wal_index_header<F: VfsFile>(
@@ -18691,6 +18716,10 @@ where
             };
 
         #[cfg(all(feature = "native", any(unix, windows)))]
+        let mut db_file = db_file;
+        #[cfg(all(feature = "native", any(unix, windows)))]
+        claim_wal_lifetime_before_namespace_join(cx, pending_namespace.as_ref(), &mut db_file)?;
+        #[cfg(all(feature = "native", any(unix, windows)))]
         let namespace_binding = if let Some(pending) = pending_namespace {
             let identity = db_file
                 .file_identity()?
@@ -19526,6 +19555,10 @@ where
             identity_lease
         };
 
+        #[cfg(all(feature = "native", any(unix, windows)))]
+        let mut db_file = db_file;
+        #[cfg(all(feature = "native", any(unix, windows)))]
+        claim_wal_lifetime_before_namespace_join(cx, pending_namespace.as_ref(), &mut db_file)?;
         #[cfg(all(feature = "native", any(unix, windows)))]
         let namespace_binding = if let Some(pending) = pending_namespace {
             let identity = db_file

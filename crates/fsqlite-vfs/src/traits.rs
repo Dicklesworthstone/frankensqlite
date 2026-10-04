@@ -1390,6 +1390,22 @@ pub trait VfsFile: Send + Sync {
         false
     }
 
+    /// bd-sz9j5: take the main-file read claim that this handle's WAL
+    /// shared-memory attachment holds for its lifetime (see
+    /// [`Self::holds_main_wal_lifetime_read_lock`]) now, before the WAL is
+    /// attached, when the file header says WAL mode. Returns whether the claim
+    /// is held. A non-WAL file is left unclaimed.
+    ///
+    /// A joiner calls this before namespace admission releases its gate. In
+    /// between, it would otherwise show other processes only its namespace
+    /// `use` lock, the lock signature of a pre-0.4 engine, and a third opener
+    /// could refuse with `IncompatiblePeerEngine` if the last established
+    /// peer exited during that window. The later attachment reuses this claim;
+    /// close and `shm_unmap` release it. Backends without the claim do nothing.
+    fn claim_wal_lifetime_before_join(&mut self, _cx: &Cx) -> Result<bool> {
+        Ok(false)
+    }
+
     /// Return the sector size for this file.
     ///
     /// The sector size is the minimum write granularity for the underlying

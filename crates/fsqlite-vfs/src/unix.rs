@@ -2180,36 +2180,7 @@ impl UnixFile {
             return Ok(info);
         }
 
-        // SQLite takes EXCLUSIVE on the main file to decide whether its WAL
-        // connection is the last one. Keep a read claim for our entire SHM
-        // attachment, even after a transaction restores its prior prefix.
-        // Reuse the ordinary acquisition protocol so PENDING-byte exclusion
-        // and partial-acquisition cleanup retain their existing guarantees.
-        if self.wal_lifetime_claim == WalLifetimeClaim::Unclaimed {
-            let prior_level = self.lock_level;
-            self.lock(cx, LockLevel::Shared)?;
-            let inode_info = Arc::clone(self.inode_info_ref());
-            let mut info = inode_info
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some(next_lifetime) = info.n_wal_lifetime.checked_add(1) else {
-                return Self::return_after_main_lock_failure(
-                    &mut info,
-                    &mut self.lock_level,
-                    &mut self.transient_shared_pending_gate,
-                    prior_level,
-                    FrankenError::internal("Unix inode WAL lifetime count overflow"),
-                );
-            };
-            info.n_wal_lifetime = next_lifetime;
-            self.wal_lifetime_claim = WalLifetimeClaim::Held;
-            Self::rollback_main_lock_state(
-                &mut info,
-                &mut self.lock_level,
-                &mut self.transient_shared_pending_gate,
-                prior_level,
-            )?;
-        }
+        self.acquire_wal_lifetime_claim(cx)?;
 
         // If SHM open fails, the independent claim remains owned by this
         // handle and is released by unmap/close (including deferred Drop).
@@ -2227,6 +2198,53 @@ impl UnixFile {
         // EXCLUSIVE and truncate the backing file beneath our aliases.
         self.retain_shm_dms_lifetime(&info)?;
         Ok(info)
+    }
+
+    /// SQLite takes EXCLUSIVE on the main file to decide whether its WAL
+    /// connection is the last one. Keep a read claim for our entire SHM
+    /// attachment, even after a transaction restores its prior prefix.
+    /// Reuse the ordinary acquisition protocol so PENDING-byte exclusion
+    /// and partial-acquisition cleanup retain their existing guarantees.
+    /// Idempotent: an already-held claim is not counted twice.
+    fn acquire_wal_lifetime_claim(&mut self, cx: &Cx) -> Result<()> {
+        if self.wal_lifetime_claim == WalLifetimeClaim::Held {
+            return Ok(());
+        }
+        let prior_level = self.lock_level;
+        self.lock(cx, LockLevel::Shared)?;
+        let inode_info = Arc::clone(self.inode_info_ref());
+        let mut info = inode_info
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(next_lifetime) = info.n_wal_lifetime.checked_add(1) else {
+            return Self::return_after_main_lock_failure(
+                &mut info,
+                &mut self.lock_level,
+                &mut self.transient_shared_pending_gate,
+                prior_level,
+                FrankenError::internal("Unix inode WAL lifetime count overflow"),
+            );
+        };
+        info.n_wal_lifetime = next_lifetime;
+        self.wal_lifetime_claim = WalLifetimeClaim::Held;
+        Self::rollback_main_lock_state(
+            &mut info,
+            &mut self.lock_level,
+            &mut self.transient_shared_pending_gate,
+            prior_level,
+        )
+    }
+
+    /// Whether the main file's header (bytes 18/19 == 2) says WAL mode.
+    fn main_header_is_wal(&self) -> bool {
+        let info = self
+            .inode_info_ref()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut header = [0_u8; 20];
+        std::os::unix::fs::FileExt::read_exact_at(&*info.file, &mut header, 0).is_ok()
+            && header[18] == 2
+            && header[19] == 2
     }
 
     fn retain_shm_dms_lifetime(&mut self, info: &Arc<Mutex<ShmInfo>>) -> Result<()> {
@@ -4393,6 +4411,24 @@ impl VfsFile for UnixFile {
 
     fn holds_main_wal_lifetime_read_lock(&self) -> bool {
         self.wal_lifetime_claim == WalLifetimeClaim::Held
+    }
+
+    fn claim_wal_lifetime_before_join(&mut self, cx: &Cx) -> Result<bool> {
+        if self.wal_lifetime_claim == WalLifetimeClaim::Held {
+            return Ok(true);
+        }
+        if !self.main_header_is_wal() {
+            return Ok(false);
+        }
+        self.acquire_wal_lifetime_claim(cx)?;
+        // The claim excludes EXCLUSIVE, so the journal mode is now pinned.
+        // A peer may have left WAL mode between the first read and the claim;
+        // never keep a WAL-lifetime claim on a rollback-journal file.
+        if !self.main_header_is_wal() {
+            self.release_wal_lifetime_claim()?;
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     fn locking_downgraded_to_whole_file_flock(&self) -> bool {
