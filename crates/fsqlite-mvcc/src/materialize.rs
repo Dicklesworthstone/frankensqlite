@@ -22,7 +22,8 @@
 use std::collections::HashMap;
 
 use fsqlite_btree::{
-    BtreePageHeader, BtreePageType, header_offset_for_page, read_cell_pointers, write_cell_pointers,
+    BtreePageHeader, BtreePageType, header_offset_for_page, read_cell_pointers, usable_prefix,
+    write_cell_pointers,
 };
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::limits::CELL_POINTER_SIZE;
@@ -324,8 +325,11 @@ impl WorkingPageState {
         usable_size: u32,
         btree_ref: fsqlite_types::BtreeRef,
     ) -> Result<Self> {
-        let cell_pointers = read_cell_pointers(base.as_bytes(), header, header_offset)?;
-        let page_bytes = base.as_bytes();
+        // Decode only the usable prefix: a cell pointer into the reserved
+        // trailer is corruption, not a cell (bd-9r1et, as bd-i2pad does for
+        // the cursor).
+        let page_bytes = usable_prefix(base.as_bytes(), usable_size);
+        let cell_pointers = read_cell_pointers(page_bytes, header, header_offset)?;
 
         let mut cells = Vec::with_capacity(cell_pointers.len());
         let mut cells_by_key = HashMap::with_capacity(cell_pointers.len());
@@ -1054,6 +1058,38 @@ mod tests {
             cell_data: Vec::new(),
             prev_idx: None,
         }
+    }
+
+    /// bd-9r1et: with reserved bytes, a base-page cell pointer aimed into the
+    /// reserved trailer is corruption. Materialization used to bound pointers
+    /// by the full page and decode the trailer bytes as a live cell.
+    #[test]
+    fn test_materialize_rejects_base_cell_pointer_into_reserved_trailer() {
+        const RESERVED: u32 = 32;
+        let usable_size = PAGE_SIZE - RESERVED;
+        let trailer_cell_offset: u16 = 4070;
+        let mut page = create_empty_leaf_table_page().as_bytes().to_vec();
+        page[3..5].copy_from_slice(&1_u16.to_be_bytes());
+        page[5..7].copy_from_slice(&trailer_cell_offset.to_be_bytes());
+        page[8..10].copy_from_slice(&trailer_cell_offset.to_be_bytes());
+        let cell = create_leaf_table_cell(7, b"abc");
+        let start = usize::from(trailer_cell_offset);
+        page[start..start + cell.len()].copy_from_slice(&cell);
+        assert!(start >= usize::try_from(usable_size).unwrap());
+
+        let result = materialize_page(
+            &PageData::from_vec(page),
+            PageNumber::new(2).unwrap(),
+            &[create_delta_insert(100, b"hello", 5)],
+            &test_snapshot(10),
+            usable_size,
+            MaterializationTrigger::Explicit,
+        );
+        assert!(
+            matches!(result, Err(FrankenError::DatabaseCorrupt { .. })),
+            "a trailer cell must be corruption, got {:?}",
+            result.map(|materialized| materialized_table_payloads(&materialized.page))
+        );
     }
 
     #[test]
