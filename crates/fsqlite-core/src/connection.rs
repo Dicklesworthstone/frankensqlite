@@ -4193,6 +4193,18 @@ impl PagerBackend {
         }
     }
 
+    async fn capture_vacuum_into_source_image(&self, cx: &Cx) -> Result<DatabaseImageReceipt> {
+        match self {
+            Self::Memory(p) => p.capture_vacuum_into_source_image(cx).await,
+            #[cfg(all(feature = "native", target_os = "linux"))]
+            Self::IoUring(p) => p.capture_vacuum_into_source_image(cx).await,
+            #[cfg(all(feature = "native", unix))]
+            Self::Unix(p) => p.capture_vacuum_into_source_image(cx).await,
+            #[cfg(all(feature = "native", target_os = "windows"))]
+            Self::Windows(p) => p.capture_vacuum_into_source_image(cx).await,
+        }
+    }
+
     async fn inspect_database_image(&self, cx: &Cx, path: &Path) -> Result<DatabaseImageReceipt> {
         match self {
             Self::Memory(p) => p.inspect_database_image(cx, path).await,
@@ -68340,8 +68352,19 @@ impl Connection {
         // exported rows are read WAL-aware via reload_memdb_from_pager below, so
         // it is both impossible and unnecessary here. A writable source still
         // checkpoints as before.
+        //
+        // bd-5unvm: VACUUM INTO only reads the logical database. When a peer's
+        // read mark keeps the checkpoint from emptying the WAL, it reads
+        // through the WAL the way stock SQLite does, with the WAL's committed
+        // horizon bound into its source receipt; an in-place VACUUM still
+        // needs the WAL folded into the main file it replaces.
+        let vacuum_into = vacuum_stmt.into.is_some();
         if !self.pager.is_readonly() && self.pager.journal_mode() == JournalMode::Wal {
-            self.pager.checkpoint(&cx, CheckpointMode::Truncate).await?;
+            match self.pager.checkpoint(&cx, CheckpointMode::Truncate).await {
+                Ok(_) => {}
+                Err(FrankenError::Busy) if vacuum_into => {}
+                Err(error) => return Err(error),
+            }
         }
 
         // Evaluate the INTO expression before touching the source, but defer
@@ -68365,15 +68388,19 @@ impl Connection {
             None
         };
 
-        let source_receipt = if self.path != ":memory:" {
-            Some(self.pager.capture_vacuum_source_image(&cx).await?)
-        } else {
+        let source_receipt = if self.path == ":memory:" {
             None
+        } else if vacuum_into {
+            Some(self.pager.capture_vacuum_into_source_image(&cx).await?)
+        } else {
+            Some(self.pager.capture_vacuum_source_image(&cx).await?)
         };
         let restore_hydrated_rows = self.memdb_rows_loaded.get();
+        // A receipt that reads through the WAL carries the main file's
+        // header, which the WAL may supersede; take the logical one.
         let source_header = match source_receipt.as_ref() {
-            Some(receipt) => receipt.header().clone(),
-            None => self.current_database_header(&cx).await?,
+            Some(receipt) if receipt.wal_horizon().is_none() => receipt.header().clone(),
+            _ => self.current_database_header(&cx).await?,
         };
         #[cfg(test)]
         if let Some(hook) = self.vacuum_after_source_receipt_once.borrow_mut().take() {
@@ -68381,7 +68408,11 @@ impl Connection {
         }
         self.reload_memdb_from_pager_with_mode(&cx, true).await?;
         if let Some(source_receipt) = source_receipt.as_ref() {
-            let hydrated_source_receipt = self.pager.capture_vacuum_source_image(&cx).await?;
+            let hydrated_source_receipt = if vacuum_into {
+                self.pager.capture_vacuum_into_source_image(&cx).await?
+            } else {
+                self.pager.capture_vacuum_source_image(&cx).await?
+            };
             if hydrated_source_receipt != *source_receipt {
                 return Err(FrankenError::BusySnapshot {
                     conflicting_pages:

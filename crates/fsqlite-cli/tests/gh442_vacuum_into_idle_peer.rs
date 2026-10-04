@@ -146,3 +146,57 @@ fn assert_vacuum_into_beside_open_peer(peer_sql: &str) {
 fn gh442_vacuum_into_succeeds_beside_idle_peer_process() {
     assert_vacuum_into_beside_open_peer("SELECT count(*) FROM t;\n");
 }
+
+/// bd-5unvm: a peer inside a read transaction pins the WAL frames after its
+/// snapshot, so the TRUNCATE checkpoint cannot empty the WAL and VACUUM INTO
+/// failed "database is busy" at once. Stock SQLite's VACUUM INTO reads
+/// through the WAL; the copy must hold the commit made after the peer's
+/// snapshot.
+#[test]
+fn vacuum_into_reads_through_a_wal_a_reading_peer_pins() {
+    let dir = tempfile::tempdir().expect("create isolated working directory");
+    let seeded = run_sql(
+        dir.path(),
+        "live.db",
+        "CREATE TABLE t(x); INSERT INTO t SELECT value FROM generate_series(1,500);",
+    );
+    assert!(seeded.status.success(), "seed failed: {seeded:?}");
+
+    let (peer, peer_stdin) = open_peer(
+        dir.path(),
+        "live.db",
+        "BEGIN; SELECT count(*) FROM t;\n",
+        "500",
+    );
+    let wrote = run_sql(dir.path(), "live.db", "INSERT INTO t VALUES (501);");
+    assert!(
+        wrote.status.success(),
+        "write beside the reader failed: {wrote:?}"
+    );
+
+    let started = Instant::now();
+    let vacuumed = run_sql(
+        dir.path(),
+        "live.db",
+        "PRAGMA busy_timeout=3000; VACUUM INTO 'copy.db';",
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        vacuumed.status.success(),
+        "bd-5unvm: VACUUM INTO failed beside a reading peer after {elapsed:?}: \
+         stdout={:?} stderr={:?}",
+        stdout_of(&vacuumed),
+        String::from_utf8_lossy(&vacuumed.stderr)
+    );
+
+    let checked = run_sql(
+        dir.path(),
+        "copy.db",
+        "PRAGMA integrity_check; SELECT count(*), sum(x) FROM t;",
+    );
+    assert!(checked.status.success(), "copy check failed: {checked:?}");
+    assert_eq!(stdout_of(&checked), "ok\n501|125751\n");
+
+    drop(peer_stdin);
+    drop(peer);
+}

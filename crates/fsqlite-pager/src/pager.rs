@@ -4412,6 +4412,11 @@ enum MaintenanceFence {
     /// source receipt). In WAL mode this excludes appenders and checkpointers
     /// but admits idle foreign WAL attachments; otherwise it is `WholeImage`.
     ImageRead,
+    /// `ImageRead` for a reader of the logical database (VACUUM INTO): a
+    /// non-empty WAL is admitted, since a peer's read mark can keep a
+    /// TRUNCATE checkpoint from emptying it, and the operation binds the
+    /// WAL's committed horizon into what it captures (bd-5unvm).
+    ImageReadThroughWal,
 }
 
 enum WalReaderWindow {
@@ -13866,9 +13871,31 @@ pub struct DatabaseImageReceipt {
     file_size: u64,
     header: DatabaseHeader,
     logical_hash: [u8; 32],
+    /// The committed WAL horizon the logical image also includes; `None`
+    /// when the WAL was empty, so the main file alone is the image.
+    wal_horizon: Option<WalImageHorizon>,
+}
+
+/// The committed extent of a non-empty WAL in a [`DatabaseImageReceipt`].
+///
+/// A later commit moves the commit frame and count, and a checkpoint that
+/// resets the WAL changes the generation, so an equal horizon over an equal
+/// main file is the same logical database (bd-5unvm).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalImageHorizon {
+    pub generation: WalGenerationIdentity,
+    pub last_commit_frame: Option<usize>,
+    pub commit_count: u64,
 }
 
 impl DatabaseImageReceipt {
+    /// The committed WAL horizon this receipt covers beyond the main file,
+    /// if the WAL was non-empty when it was captured.
+    #[must_use]
+    pub const fn wal_horizon(&self) -> Option<WalImageHorizon> {
+        self.wal_horizon
+    }
+
     #[must_use]
     pub const fn file_size(&self) -> u64 {
         self.file_size
@@ -14034,6 +14061,7 @@ async fn database_image_receipt_for_open_file_with_extent<F: VfsFile>(
         file_size,
         header,
         logical_hash: *hasher.finalize().as_bytes(),
+        wal_horizon: None,
     })
 }
 
@@ -15395,7 +15423,11 @@ where
         // checkpointers out, so it takes the checkpoint fence, which admits
         // idle foreign WAL-lifetime SHARED claims.
         let wal_mode = inner.journal_mode == JournalMode::Wal;
-        let read_only_wal_fence = wal_mode && fence == MaintenanceFence::ImageRead;
+        let read_only_wal_fence = wal_mode
+            && matches!(
+                fence,
+                MaintenanceFence::ImageRead | MaintenanceFence::ImageReadThroughWal
+            );
         let mut external_lock =
             BeginExternalLockState::new(&self.group_commit_queue, Arc::clone(&inner.db_file), cx);
         let maintenance_lock_result = if read_only_wal_fence {
@@ -15422,7 +15454,7 @@ where
                 // native and stock appender (and checkpointer) out, so the
                 // main file cannot change and the WAL cannot grow.
                 wal.begin_transaction(cx).await?;
-                if wal.frame_count() != 0 {
+                if wal.frame_count() != 0 && fence != MaintenanceFence::ImageReadThroughWal {
                     return Err(FrankenError::Busy);
                 }
             }
@@ -16117,6 +16149,57 @@ where
                 Box::pin(async move {
                     let db_file = shared_db_file_read(&inner.db_file, cx).await?;
                     vacuum_source_receipt_for_open_file(cx, &*db_file, inner.page_size).await
+                })
+            },
+        )
+        .await
+    }
+
+    /// Source receipt for `VACUUM INTO`, which reads the logical database
+    /// rather than replacing the main file (bd-5unvm).
+    ///
+    /// When a peer's read mark kept the TRUNCATE checkpoint from emptying the
+    /// WAL, [`Self::capture_vacuum_source_image`] refuses with Busy, where
+    /// stock SQLite's VACUUM INTO simply reads through the WAL. Under the same
+    /// image-read fence this admits the non-empty WAL and binds its committed
+    /// horizon into the receipt, so comparing the receipts taken around the
+    /// row hydration still proves that nothing committed or checkpointed in
+    /// between. The header is then the main file's, not necessarily the
+    /// logical one; callers read the logical header themselves.
+    pub async fn capture_vacuum_into_source_image(
+        &self,
+        cx: &Cx,
+    ) -> Result<DatabaseImageReceipt> {
+        if self.is_readonly() {
+            return self.capture_vacuum_source_image_readonly(cx).await;
+        }
+        self.with_maintenance_fence(
+            cx,
+            MaintenanceFence::ImageReadThroughWal,
+            &mut (),
+            |pager, cx, inner, ()| {
+                Box::pin(async move {
+                    let db_file = shared_db_file_read(&inner.db_file, cx).await?;
+                    let mut receipt =
+                        vacuum_source_receipt_for_open_file(cx, &*db_file, inner.page_size)
+                            .await?;
+                    drop(db_file);
+                    if inner.journal_mode == JournalMode::Wal {
+                        let wal_handle = wal_backend_handle(&pager.wal_backend)?;
+                        let wal = async_rwlock_read(&wal_handle, cx, "WAL backend").await?;
+                        if wal.frame_count() != 0 {
+                            let snapshot = wal
+                                .pinned_read_snapshot()
+                                .or_else(|| wal.published_snapshot())
+                                .ok_or(FrankenError::BusyRecovery)?;
+                            receipt.wal_horizon = Some(WalImageHorizon {
+                                generation: snapshot.generation,
+                                last_commit_frame: snapshot.last_commit_frame,
+                                commit_count: snapshot.commit_count,
+                            });
+                        }
+                    }
+                    Ok(receipt)
                 })
             },
         )
@@ -16993,7 +17076,18 @@ where
                 .await?;
         }
 
-        self.with_exclusive_maintenance(cx, &mut target_full, |pager, cx, inner, target_full| {
+        // bd-5unvm: the copy only reads the source image, so in WAL mode it
+        // takes the image-read fence that VACUUM INTO's receipt uses (GH#442):
+        // appenders and checkpointers stay out, so neither the main file nor
+        // the (empty) WAL can change, while an idle peer's WAL-lifetime SHARED
+        // claim no longer turns the backup into "database is busy". Replacing
+        // the image still needs the whole-image fence, so no peer can swap
+        // the file under the copy either.
+        self.with_maintenance_fence(
+            cx,
+            MaintenanceFence::ImageRead,
+            &mut target_full,
+            |pager, cx, inner, target_full| {
             Box::pin(async move {
                 // The optimistic check above avoids checkpoint work for an
                 // existing target. Repeat it inside the maintenance epoch
