@@ -27469,8 +27469,12 @@ impl Connection {
                 self.with_fallback_function_registry(|| validate_aggregate_window_misuse(select))?;
             }
             let prepared = self.prepare_after_background_status(sql).await?;
-            return self
-                .query_prepared_with_params_after_background_status(&prepared, params)
+            return prepared
+                .with_same_connection_schema_reprepare(async |stmt| {
+                    stmt.conn
+                        .query_prepared_with_params_after_background_status(stmt, params)
+                        .await
+                })
                 .await;
         }
 
@@ -27490,7 +27494,7 @@ impl Connection {
         &self,
         sql: &str,
         params: &[SqliteValue],
-        f: F,
+        mut f: F,
     ) -> Result<()>
     where
         F: FnMut(&Row) -> Result<()>,
@@ -27524,8 +27528,25 @@ impl Connection {
                 self.with_fallback_function_registry(|| validate_aggregate_window_misuse(select))?;
             }
             let prepared = self.prepare_after_background_status(sql).await?;
-            return self
-                .query_prepared_with_params_for_each_after_background_status(&prepared, params, f)
+            // As in `PreparedStatement::query_with_params_for_each`: re-prepare
+            // only while no row has reached `f` (bd-bzd19 L12).
+            let emitted = std::cell::Cell::new(0u64);
+            return prepared
+                .with_same_connection_schema_reprepare_if(
+                    async |stmt| {
+                        stmt.conn
+                            .query_prepared_with_params_for_each_after_background_status(
+                                stmt,
+                                params,
+                                &mut |row: &Row| {
+                                    emitted.set(emitted.get() + 1);
+                                    f(row)
+                                },
+                            )
+                            .await
+                    },
+                    || emitted.get() == 0,
+                )
                 .await;
         }
         let mut rows = Vec::new();
@@ -27569,8 +27590,12 @@ impl Connection {
                 self.with_fallback_function_registry(|| validate_aggregate_window_misuse(select))?;
             }
             let prepared = self.prepare_after_background_status(sql).await?;
-            return self
-                .query_prepared_row_after_background_status(&prepared, None)
+            return prepared
+                .with_same_connection_schema_reprepare(async |stmt| {
+                    stmt.conn
+                        .query_prepared_row_after_background_status(stmt, None)
+                        .await
+                })
                 .await;
         }
 
@@ -27615,8 +27640,12 @@ impl Connection {
                 self.with_fallback_function_registry(|| validate_aggregate_window_misuse(select))?;
             }
             let prepared = self.prepare_after_background_status(sql).await?;
-            return self
-                .query_prepared_row_after_background_status(&prepared, Some(params))
+            return prepared
+                .with_same_connection_schema_reprepare(async |stmt| {
+                    stmt.conn
+                        .query_prepared_row_after_background_status(stmt, Some(params))
+                        .await
+                })
                 .await;
         }
         let mut rows = Vec::new();
@@ -27756,8 +27785,15 @@ impl Connection {
                 self.with_fallback_function_registry(|| validate_aggregate_window_misuse(select))?;
             }
             let prepared = self.prepare_after_background_status(sql).await?;
-            return self
-                .execute_prepared_autocommit_with_conflict_retry(&prepared, &[])
+            // A peer's DDL can land between this prepare and the execution's
+            // schema refresh; re-prepare like `PreparedStatement::execute` and
+            // stock's sqlite3_exec instead of surfacing SchemaChanged.
+            return prepared
+                .with_same_connection_schema_reprepare(async |stmt| {
+                    stmt.conn
+                        .execute_prepared_autocommit_with_conflict_retry(stmt, &[])
+                        .await
+                })
                 .await;
         }
         // Preserve the verbatim CREATE text for a single top-level CREATE so it
@@ -28039,12 +28075,16 @@ impl Connection {
                 self.with_fallback_function_registry(|| validate_aggregate_window_misuse(select))?;
             }
             let prepared = self.prepare_after_background_status(sql).await?;
-            return self
-                .execute_prepared_with_params_after_background_status(
-                    &prepared,
-                    params,
-                    skip_statement_savepoint_in_explicit_txn,
-                )
+            return prepared
+                .with_same_connection_schema_reprepare(async |stmt| {
+                    stmt.conn
+                        .execute_prepared_with_params_after_background_status(
+                            stmt,
+                            params,
+                            skip_statement_savepoint_in_explicit_txn,
+                        )
+                        .await
+                })
                 .await;
         }
         let mut last_count = 0;
