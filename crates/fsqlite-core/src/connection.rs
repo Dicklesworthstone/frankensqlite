@@ -74626,6 +74626,13 @@ impl Connection {
             } else {
                 TransactionMode::Deferred
             };
+            // Sample before any snapshot binds (see the autocommit begin).
+            // Without it the sample is left over from the previous transaction,
+            // so this connection's own earlier write commit (a CREATE TABLE
+            // before `SAVEPOINT s; CREATE INDEX ...; RELEASE s`) reads as a peer
+            // commit since begin and the schema change fails BusySnapshot.
+            self.concurrent_begin_write_generation
+                .set(self.concurrent_write_generation.load(AtomicOrdering::Acquire));
             // Bind the implicit transaction snapshot to the pager's published
             // visibility plane before opening the pager txn.
             let mut concurrent_snapshot = if is_concurrent {
