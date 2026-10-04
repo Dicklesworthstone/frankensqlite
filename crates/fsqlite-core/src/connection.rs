@@ -12173,6 +12173,49 @@ struct TimeTravelImage {
     /// the slot (decoded pager tables get it filled by the row reader).
     mirror_ipk_columns: Vec<(i32, usize)>,
     text_encoding: TextEncoding,
+    /// The catalog a historical SELECT resolves names against.
+    catalog: TimeTravelCatalog,
+}
+
+/// The connection's name-resolution state as it stood at a snapshot's commit
+/// (bd-zjocc). A historical SELECT installs it for its duration: resolving
+/// against the live catalog instead read a table created after the snapshot
+/// from the live database, missed a `main` table that a later TEMP table
+/// shadows, and failed on TEMP tables the snapshot never held.
+#[derive(Debug, Clone)]
+struct TimeTravelCatalog {
+    schema: Vec<TableSchema>,
+    temp_table_names: HashSet<String>,
+    shadowed_main_tables: HashMap<String, TableSchema>,
+    rowid_alias_columns: HashMap<String, usize>,
+}
+
+/// Installs a snapshot's catalog on the connection and restores the live one
+/// when dropped, so an error or cancellation cannot leave it installed. Both
+/// directions rebuild the name index and drop the compilation caches, which
+/// must never hold an entry derived from the other catalog or from the
+/// snapshot's rows.
+struct TimeTravelCatalogGuard<'a> {
+    conn: &'a Connection,
+    live: Option<TimeTravelCatalog>,
+}
+
+impl<'a> TimeTravelCatalogGuard<'a> {
+    fn install(conn: &'a Connection, historical: &TimeTravelCatalog) -> Self {
+        let live = conn.swap_time_travel_catalog(historical.clone());
+        Self {
+            conn,
+            live: Some(live),
+        }
+    }
+}
+
+impl Drop for TimeTravelCatalogGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(live) = self.live.take() {
+            let _historical = self.conn.swap_time_travel_catalog(live);
+        }
+    }
 }
 
 impl TimeTravelImage {
@@ -25170,6 +25213,12 @@ impl Connection {
                 table.clear();
             }
         }
+        let catalog = TimeTravelCatalog {
+            schema: self.schema.borrow().clone(),
+            temp_table_names: self.temp_table_names.borrow().clone(),
+            shadowed_main_tables: self.shadowed_main_tables.borrow().clone(),
+            rowid_alias_columns: self.rowid_alias_columns.borrow().clone(),
+        };
         Ok(TimeTravelImage {
             pages,
             base,
@@ -25177,7 +25226,26 @@ impl Connection {
             rowid_alias_columns,
             mirror_ipk_columns,
             text_encoding: self.db_text_encoding.get(),
+            catalog,
         })
+    }
+
+    /// Replace the connection's name-resolution catalog, returning the one it
+    /// held (bd-zjocc). Only [`TimeTravelCatalogGuard`] calls this.
+    fn swap_time_travel_catalog(&self, catalog: TimeTravelCatalog) -> TimeTravelCatalog {
+        let previous = TimeTravelCatalog {
+            schema: self.schema.replace(catalog.schema),
+            temp_table_names: self.temp_table_names.replace(catalog.temp_table_names),
+            shadowed_main_tables: self
+                .shadowed_main_tables
+                .replace(catalog.shadowed_main_tables),
+            rowid_alias_columns: self
+                .rowid_alias_columns
+                .replace(catalog.rowid_alias_columns),
+        };
+        self.rebuild_schema_indices();
+        self.clear_compilation_reuse_caches();
+        previous
     }
 
     async fn read_time_travel_pages(
@@ -75063,17 +75131,82 @@ impl Connection {
         let mut stripped = select.clone();
         strip_temporal_clauses(&mut stripped);
 
-        // Bind placeholders if present.
-        let bound = bind_placeholders_in_select_for_fallback(&stripped, params)?;
-
-        // Swap in the historical snapshot. The guard restores the live
-        // database if the query completes, errors, or is cancelled.
+        // Swap in the historical snapshot and the catalog it was committed
+        // under. The guards restore the live database and catalog if the
+        // query completes, errors, or is cancelled.
         let _database_guard = MemDatabaseRestoreGuard::new(&self.db, snapshot_db);
+        let _catalog_guard = TimeTravelCatalogGuard::install(self, &image.catalog);
+        self.ensure_time_travel_from_tables_exist(&stripped)?;
 
-        // Tell execute_join_select to read from self.db (the historical
-        // snapshot) instead of calling self.query() which goes through pager.
-        let _time_travel_guard = BoolCellRestoreGuard::new(&self.time_travel_active, true);
-        self.execute_join_select(&bound, None).await
+        // Route like any other MemDatabase-backed SELECT so aggregates, GROUP
+        // BY and window functions reach their executors (bd-zjocc: the plain
+        // join executor returned no row for count(*) over an empty table and
+        // one NULL row per input row otherwise). The router sets
+        // `time_travel_active`, which keeps every scan on `self.db`.
+        self.execute_select_via_memdb_fallback(&stripped, params)
+            .await
+    }
+
+    /// A historical SELECT names tables as they stood at the snapshot's
+    /// commit, so a FROM table created later is "no such table" rather than
+    /// a read of the live table (bd-zjocc). CTE and view names are left to
+    /// the executor, as are attached schemas, which snapshots do not hold.
+    fn ensure_time_travel_from_tables_exist(&self, select: &SelectStatement) -> Result<()> {
+        let SelectCore::Select {
+            from: Some(from), ..
+        } = &select.body.select
+        else {
+            return Ok(());
+        };
+        let schema = self.schema.borrow();
+        let temp_table_names = self.temp_table_names.borrow();
+        let shadowed_main_tables = self.shadowed_main_tables.borrow();
+        let views = self.views.borrow();
+        let sources =
+            std::iter::once(&from.source).chain(from.joins.iter().map(|join| &join.table));
+        for source in sources {
+            let TableOrSubquery::Table { name, .. } = source else {
+                continue;
+            };
+            let is_cte = select.with.as_ref().is_some_and(|with| {
+                with.ctes
+                    .iter()
+                    .any(|cte| cte.name.eq_ignore_ascii_case(&name.name))
+            });
+            if is_cte
+                || views
+                    .iter()
+                    .any(|view| view.name.eq_ignore_ascii_case(&name.name))
+            {
+                continue;
+            }
+            let key = name.name.to_ascii_lowercase();
+            let in_schema = || {
+                schema
+                    .iter()
+                    .any(|table| table.name.eq_ignore_ascii_case(&name.name))
+            };
+            let exists = match name.schema.as_deref() {
+                None => in_schema(),
+                Some(qualifier) if qualifier.eq_ignore_ascii_case("main") => {
+                    shadowed_main_tables.contains_key(&key)
+                        || (!temp_table_names.contains(&key) && in_schema())
+                }
+                Some(qualifier) if qualifier.eq_ignore_ascii_case("temp") => {
+                    temp_table_names.contains(&key) && in_schema()
+                }
+                Some(_) => true,
+            };
+            if !exists {
+                return Err(FrankenError::NoSuchTable {
+                    name: name.schema.as_deref().map_or_else(
+                        || name.name.clone(),
+                        |qualifier| format!("{qualifier}.{}", name.name),
+                    ),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// The decoded MemDatabase for a snapshot, served from the one-entry cache
@@ -83343,8 +83476,14 @@ impl Connection {
         join_select.order_by = Vec::new();
 
         let prefer_memdb_hash_join_dispatch = self.prefer_memdb_hash_join_dispatch(&join_select);
+        // A compiled program reads the pager; while `time_travel_active` pins
+        // reads to `self.db` (a historical snapshot, or freshly materialized
+        // rows), the join must stay on the interpreted path (bd-zjocc).
         let join_rows =
-            if select_join_is_vdbe_eligible(&join_select) && !prefer_memdb_hash_join_dispatch {
+            if select_join_is_vdbe_eligible(&join_select)
+                && !prefer_memdb_hash_join_dispatch
+                && !self.time_travel_active.get()
+            {
                 let program = self.compile_table_select(&join_select).await?;
                 let (rows, _, _) = self
                     .execute_table_program_with_cx(
@@ -90391,6 +90530,42 @@ impl Connection {
         }
     }
 
+    /// The table a local join binding scans, and its rowid-alias column. A
+    /// `main.<name>` binding reaches the main table a same-named TEMP table
+    /// shadows, as codegen's `apply_shadowed_main_substitution` resolves it;
+    /// every other binding takes the visible schema entry (bd-zjocc: scanning
+    /// the visible entry read the TEMP table's rows for `main.<name>`).
+    fn local_join_binding_table(
+        &self,
+        binding_name: &QualifiedName,
+    ) -> Option<(TableSchema, Option<usize>)> {
+        let name_lc = binding_name.name.to_ascii_lowercase();
+        if binding_name
+            .schema
+            .as_deref()
+            .is_some_and(|schema| schema.eq_ignore_ascii_case("main"))
+            && let Some(table) = self.shadowed_main_tables.borrow().get(&name_lc)
+        {
+            // `rowid_alias_columns` is keyed by name, so under a shadow it may
+            // describe the TEMP table; derive the parked table's alias by the
+            // rule the schema reload uses.
+            let rowid_alias_column_index = if table.without_rowid {
+                None
+            } else {
+                table.columns.iter().position(|column| column.is_ipk)
+            };
+            return Some((table.clone(), rowid_alias_column_index));
+        }
+        let table = self
+            .schema
+            .borrow()
+            .iter()
+            .find(|table| table.name.eq_ignore_ascii_case(&binding_name.name))
+            .cloned()?;
+        let rowid_alias_column_index = self.rowid_alias_columns.borrow().get(&name_lc).copied();
+        Some((table, rowid_alias_column_index))
+    }
+
     fn try_scan_join_source_from_memdb(
         &self,
         src: &JoinTableSource,
@@ -90399,18 +90574,8 @@ impl Connection {
             return None;
         }
         let binding_name = src.local_table_binding()?;
-        let rowid_alias_column_index = self
-            .rowid_alias_columns
-            .borrow()
-            .get(&binding_name.name.to_ascii_lowercase())
-            .copied();
-        let table_schema = {
-            let schema = self.schema.borrow();
-            schema
-                .iter()
-                .find(|table| table.name.eq_ignore_ascii_case(&binding_name.name))
-                .cloned()?
-        };
+        let (table_schema, rowid_alias_column_index) =
+            self.local_join_binding_table(binding_name)?;
         let root_page = table_schema.root_page;
         // GH#227: VIRTUAL generated columns are stored as a NULL placeholder in
         // the record, so the memdb mirror row carries NULL in their slot. Left
@@ -90467,18 +90632,9 @@ impl Connection {
             return None;
         }
         let binding_name = src.local_table_binding()?;
-        let rowid_alias_column_index = self
-            .rowid_alias_columns
-            .borrow()
-            .get(&binding_name.name.to_ascii_lowercase())
-            .copied();
-        let (root_page_num, table_schema) = {
-            let schema = self.schema.borrow();
-            schema
-                .iter()
-                .find(|table| table.name.eq_ignore_ascii_case(&binding_name.name))
-                .map(|table| (table.root_page, table.clone()))?
-        };
+        let (table_schema, rowid_alias_column_index) =
+            self.local_join_binding_table(binding_name)?;
+        let root_page_num = table_schema.root_page;
         let cx = &self.root_cx;
         let result: Result<Vec<Vec<SqliteValue>>> = async {
             let mut txn = self.pager.begin(cx, TransactionMode::ReadOnly).await?;
