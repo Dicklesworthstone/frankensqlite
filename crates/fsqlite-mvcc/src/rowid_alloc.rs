@@ -598,12 +598,11 @@ impl ConcurrentRowIdAllocator {
         let r = explicit_rowid.get();
         let before = state.next_rowid;
 
-        // If the allocator is exhausted (wrapped past MAX), do not revive it.
-        if state.next_rowid < 1 {
-            return Err(RowIdAllocError::Exhausted);
-        }
-
-        if r >= state.next_rowid {
+        // An explicit rowid needs no allocator space, so it never fails here. An
+        // allocator that already wrapped past MAX stays exhausted: implicit
+        // rowids keep failing, but explicit inserts into a table holding MAX
+        // succeed, as they do in SQLite.
+        if state.next_rowid >= 1 && r >= state.next_rowid {
             // wrapping_add(1) at MAX → i64::MIN, caught by `start < 1` guard
             // in reserve_range.
             state.next_rowid = r.wrapping_add(1);
@@ -1453,5 +1452,23 @@ mod tests {
         // Next allocation must fail.
         let r = alloc.allocate_one(k);
         assert_eq!(r, Err(RowIdAllocError::Exhausted));
+
+        // Explicit rowids need no allocator space: bumping an exhausted
+        // allocator (MAX again, or any smaller rowid) succeeds and leaves it
+        // exhausted.
+        alloc.bump_explicit(k, RowId::MAX).unwrap();
+        alloc.bump_explicit(k, RowId::new(7)).unwrap();
+        assert_eq!(alloc.allocate_one(k), Err(RowIdAllocError::Exhausted));
+    }
+
+    #[test]
+    fn test_bump_explicit_on_exhausted_autoincrement_keeps_high_water() {
+        let alloc = ConcurrentRowIdAllocator::new(epoch(1));
+        let k = key(1, 1);
+        alloc.init_table(k, Some(RowId::MAX), 0, RowIdMode::AutoIncrement);
+        assert_eq!(alloc.allocate_one(k), Err(RowIdAllocError::Exhausted));
+        alloc.bump_explicit(k, RowId::new(5)).unwrap();
+        assert_eq!(alloc.autoincrement_high_water(&k), Some(i64::MAX));
+        assert_eq!(alloc.allocate_one(k), Err(RowIdAllocError::Exhausted));
     }
 }
