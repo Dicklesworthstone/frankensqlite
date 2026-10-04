@@ -2936,6 +2936,18 @@ still serves as an authoritative reference.
   [#139](https://github.com/Dicklesworthstone/frankensqlite/issues/139) owns
   the native lock-byte receipt). Do not concurrently mix FrankenSQLite and
   stock SQLite WAL connections to the same database on Windows.
+- **Never let a 0.3.x engine share a WAL database with 0.4.x or newer.** The
+  cross-process protocol changed incompatibly between the two lines (GH#399,
+  GH#411), but the on-disk version constants did not. Mixed access has
+  corrupted real stores. Since 1882c9f0e, a read-write open on Unix refuses
+  with `IncompatiblePeerEngine` (`SQLITE_CANTOPEN`) when it detects an idle
+  0.3.x process holding the database. The reverse direction cannot be guarded:
+  a 0.3.x engine joining a database a newer engine has open is not detected,
+  because making 0.3.x refuse would also lock out every 0.4.0-0.4.8 engine.
+  Windows has no detection yet. Upgrade every process that opens a database
+  together, and close all old-engine processes before starting new ones. The
+  reverse guard will ship with the next cross-process contract change, as a
+  one-way namespace-record upgrade.
 - **External-content FTS5 has a residual projection gap.** The
   content-table-rename lifecycle defect
   ([#211](https://github.com/Dicklesworthstone/frankensqlite/issues/211)) is
