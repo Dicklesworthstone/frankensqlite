@@ -1110,6 +1110,17 @@ fn strict_type_code(strict_type: Option<StrictColumnType>) -> char {
     }
 }
 
+/// Stock's `OP_MustBeInt` gate on a caller-supplied rowid or INTEGER PRIMARY
+/// KEY value: converts it to INTEGER in place (`'7'`, `8.0`, `'1e1'`) or fails
+/// the statement with "datatype mismatch" (`1.5`, `'abc'`, a blob, an
+/// out-of-range REAL, and NULL where the caller has not already routed NULL to
+/// `NewRowid`). Without it the row lands at a truncated rowid and every index
+/// entry carries the raw REAL or TEXT value as its trailing rowid, which stock
+/// `integrity_check` rejects as a malformed index record.
+fn emit_rowid_must_be_int(b: &mut ProgramBuilder, reg: i32) {
+    b.emit_op(Opcode::MustBeInt, reg, 0, 0, P4::None, 0);
+}
+
 fn emit_strict_type_check(b: &mut ProgramBuilder, table: &TableSchema, first_reg: i32) {
     if let Some(pattern) = table.strict_type_pattern() {
         #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
@@ -22018,6 +22029,7 @@ pub fn codegen_insert(
                 let done_label = b.emit_label();
 
                 b.emit_jump_to_label(Opcode::IsNull, ipk_reg, 0, auto_label, P4::None, 0);
+                emit_rowid_must_be_int(b, ipk_reg);
                 b.emit_op(Opcode::Copy, ipk_reg, rowid_reg, 0, P4::None, 0);
                 b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
 
@@ -22482,6 +22494,17 @@ fn emit_upsert_do_update_apply(
         existing_hidden_rowid_reg,
         excluded_hidden_rowid_reg,
     )?;
+    // The IPK register holds the old rowid unless an assignment rewrote it;
+    // a rewritten key passes stock's MustBeInt gate (NULL included) before any
+    // constraint check or mutation.
+    if let Some(ipk_idx) = ctx
+        .rowid_alias_col_idx
+        .or_else(|| table.columns.iter().position(|column| column.is_ipk))
+    {
+        #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+        let ipk_reg = existing_regs + ipk_idx as i32;
+        emit_rowid_must_be_int(b, ipk_reg);
+    }
     // Validate the rewritten image before removing the old row.
     emit_strict_type_check(b, table, existing_regs);
     // GH #169: coerce to column affinity before CHECK/NOT NULL so the
@@ -22692,6 +22715,7 @@ fn codegen_insert_values(
 
             b.emit_jump_to_label(Opcode::IsNull, rowid_value_reg, 0, auto_label, P4::None, 0);
             b.emit_op(Opcode::Copy, rowid_value_reg, rowid_reg, 0, P4::None, 0);
+            emit_rowid_must_be_int(b, rowid_reg);
             if let Some(ipk_reg) = ipk_reg {
                 b.emit_op(Opcode::Copy, rowid_reg, ipk_reg, 0, P4::None, 0);
             }
@@ -22720,7 +22744,9 @@ fn codegen_insert_values(
             // If the user-supplied IPK value is NULL, jump to auto-generate.
             b.emit_jump_to_label(Opcode::IsNull, ipk_reg, 0, auto_label, P4::None, 0);
 
-            // Non-NULL path: copy user value into rowid register.
+            // Non-NULL path: coerce the user value to an integer key and copy
+            // it into the rowid register.
+            emit_rowid_must_be_int(b, ipk_reg);
             b.emit_op(Opcode::Copy, ipk_reg, rowid_reg, 0, P4::None, 0);
             b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
 
@@ -23248,6 +23274,7 @@ fn codegen_insert_select(
 
         b.emit_jump_to_label(Opcode::IsNull, rowid_value_reg, 0, auto_label, P4::None, 0);
         b.emit_op(Opcode::Copy, rowid_value_reg, rowid_reg, 0, P4::None, 0);
+        emit_rowid_must_be_int(b, rowid_reg);
         if let Some(ipk_reg) = ipk_reg {
             b.emit_op(Opcode::Copy, rowid_reg, ipk_reg, 0, P4::None, 0);
         }
@@ -23275,7 +23302,9 @@ fn codegen_insert_select(
 
         b.emit_jump_to_label(Opcode::IsNull, ipk_reg, 0, auto_label, P4::None, 0);
 
-        // Non-NULL: use the selected value as rowid.
+        // Non-NULL: coerce the selected value to an integer key and use it
+        // as rowid.
+        emit_rowid_must_be_int(b, ipk_reg);
         b.emit_op(Opcode::Copy, ipk_reg, rowid_reg, 0, P4::None, 0);
         b.emit_jump_to_label(Opcode::Goto, 0, 0, done_rowid, P4::None, 0);
 
@@ -23493,6 +23522,7 @@ fn codegen_insert_select_without_from(
 
         b.emit_jump_to_label(Opcode::IsNull, rowid_value_reg, 0, auto_label, P4::None, 0);
         b.emit_op(Opcode::Copy, rowid_value_reg, rowid_reg, 0, P4::None, 0);
+        emit_rowid_must_be_int(b, rowid_reg);
         if let Some(ipk_reg) = ipk_reg {
             b.emit_op(Opcode::Copy, rowid_reg, ipk_reg, 0, P4::None, 0);
         }
@@ -23518,7 +23548,9 @@ fn codegen_insert_select_without_from(
 
         b.emit_jump_to_label(Opcode::IsNull, ipk_reg, 0, auto_label, P4::None, 0);
 
-        // Non-NULL: use the selected value as rowid.
+        // Non-NULL: coerce the selected value to an integer key and use it
+        // as rowid.
+        emit_rowid_must_be_int(b, ipk_reg);
         b.emit_op(Opcode::Copy, ipk_reg, rowid_reg, 0, P4::None, 0);
         b.emit_jump_to_label(Opcode::Goto, 0, 0, done_rowid, P4::None, 0);
 
@@ -24148,6 +24180,16 @@ pub fn codegen_update(
         // check or mutation: NULL, text that is not an integer, and a
         // non-integral REAL all fail with "datatype mismatch".
         b.emit_op(Opcode::MustBeInt, reg, 0, 0, P4::None, 0);
+    }
+    // The same gate applies when the INTEGER PRIMARY KEY alias is assigned.
+    if let Some(ipk_idx) = ctx
+        .rowid_alias_col_idx
+        .or_else(|| table.columns.iter().position(|col| col.is_ipk))
+        .filter(|idx| assignment_targets.columns.contains(idx))
+    {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let ipk_reg = col_regs + ipk_idx as i32;
+        emit_rowid_must_be_int(b, ipk_reg);
     }
 
     // Recompute STORED generated columns and validate constraints on the NEW
@@ -25099,6 +25141,17 @@ fn codegen_update_from(
         P4::None,
         0,
     );
+    // A rewritten INTEGER PRIMARY KEY passes stock's MustBeInt gate (NULL
+    // included) on the applied match only, before any check or mutation.
+    if let Some(ipk_idx) = ctx
+        .rowid_alias_col_idx
+        .or_else(|| target.columns.iter().position(|col| col.is_ipk))
+        .filter(|idx| assignment_targets.columns.contains(idx))
+    {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let ipk_reg = col_regs + ipk_idx as i32;
+        emit_rowid_must_be_int(b, ipk_reg);
+    }
 
     // Recompute STORED generated columns, then validate CHECK / NOT NULL on the
     // NEW row image BEFORE any destructive mutation — so an `UPDATE OR IGNORE

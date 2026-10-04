@@ -263,13 +263,18 @@ fn mirror_sourced_statement_numbered(
         0 => ("SELECT 1".to_owned(), false),
         1 => ("SELECT changes()".to_owned(), false),
         2 => ("SELECT total_changes() > 0".to_owned(), false),
-        // Into t1, which has no UNIQUE column: the same shape into t3 trips a
-        // separate, pre-existing index corruption (see the doc comment on
-        // `mirror_reading_writes_after_storage_free_reads_match_stock`).
+        // Into t1 or into t3 (UNIQUE b). A REAL `a` makes the key REAL, which
+        // must pass MustBeInt before it reaches t3's UNIQUE index (see the doc
+        // comment on `mirror_reading_writes_after_storage_free_reads_match_stock`).
         3 => (
-            "INSERT OR REPLACE INTO t1 (id, a, b, c) SELECT 200 + abs(coalesce(a, 0)) % 50, count(*), \
-             'agg-' || coalesce(a, 'n'), NULL FROM t3 GROUP BY a"
-                .to_owned(),
+            if rng.below(2) == 0 {
+                "INSERT OR REPLACE INTO t1 (id, a, b, c) SELECT 200 + abs(coalesce(a, 0)) % 50, \
+                 count(*), 'agg-' || coalesce(a, 'n'), NULL FROM t3 GROUP BY a"
+            } else {
+                "INSERT OR REPLACE INTO t3 (id, a, b) SELECT 200 + abs(coalesce(a, 0)) % 50, \
+                 count(*), 'agg-' || coalesce(a, 'n') FROM t1 GROUP BY a"
+            }
+            .to_owned(),
             false,
         ),
         4 => (
@@ -328,11 +333,15 @@ fn mirror_sourced_statement_numbered(
         // DDL that arms the deferred rebuild without allocating a root page
         // (views have none), so it can repeat for the whole run.
         13 if t1_cols < 7 => (
-            format!("ALTER TABLE t1 ADD COLUMN d{t1_cols} DEFAULT {}", rng.below(9)),
+            format!(
+                "ALTER TABLE t1 ADD COLUMN d{t1_cols} DEFAULT {}",
+                rng.below(9)
+            ),
             true,
         ),
         14 => (
-            "CREATE VIEW IF NOT EXISTS v_agg AS SELECT a, count(*) AS n FROM t1 GROUP BY a".to_owned(),
+            "CREATE VIEW IF NOT EXISTS v_agg AS SELECT a, count(*) AS n FROM t1 GROUP BY a"
+                .to_owned(),
             true,
         ),
         15 => ("DROP VIEW IF EXISTS v_agg".to_owned(), true),
@@ -921,15 +930,16 @@ fn memory_connection_reads_match_stock_across_random_histories_with_known_bug_sh
 /// episodes (arming DDL, parked writes, a storage-free read, then a
 /// mirror-reading write of the written table) with no interleaved reads.
 ///
-/// Its aggregate INSERT ... SELECT writes t1, not t3: the same statement into
-/// t3 (UNIQUE b) trips a separate, pre-existing corruption that reproduces in
-/// memory and file-backed, before and after bd-jdjee:
+/// Its aggregate INSERT ... SELECT also writes t3 (UNIQUE b). That shape used
+/// to trip a separate, pre-existing corruption, in memory and file-backed:
 /// `CREATE TABLE t1 (id INTEGER PRIMARY KEY, a INT, b TEXT, c BLOB);
 /// CREATE TABLE t3 (id INTEGER PRIMARY KEY, a, b UNIQUE);
 /// INSERT OR REPLACE INTO t1 (id, a, b, c) VALUES (3, 1.5, 'stuvw', x'0102');
 /// INSERT OR REPLACE INTO t3 (id, a, b) SELECT 200 + abs(coalesce(a, 0)) % 50,
-/// count(*), 'agg-' || coalesce(a, 'n') FROM t1 GROUP BY a;` leaves "index key
-/// record missing trailing integer rowid" (stock integrity_check: malformed).
+/// count(*), 'agg-' || coalesce(a, 'n') FROM t1 GROUP BY a;` left "index key
+/// record missing trailing integer rowid" (stock integrity_check: malformed),
+/// because the REAL key 201.0 reached the UNIQUE index unconverted. Every
+/// caller-supplied rowid now passes MustBeInt (`ipk_value_must_be_int_oracle`).
 #[test]
 fn mirror_reading_writes_after_storage_free_reads_match_stock() {
     run_seeds(false, true);
