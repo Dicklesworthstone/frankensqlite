@@ -27374,11 +27374,21 @@ impl Connection {
     }
 
     /// Consume the raw CREATE source after expression-span users have finished
-    /// with it, then normalize only the copy persisted in `sqlite_master`.
-    fn take_pending_ddl_source_for_storage(&self) -> Option<String> {
+    /// with it, then normalize only the copy persisted in `sqlite_master`,
+    /// ending it where stock ends that kind of object's text.
+    fn take_pending_ddl_source_for_storage(&self, tail: StoredCreateTail) -> Option<String> {
         self.pending_ddl_source.borrow_mut().take().map(|source| {
-            strip_trailing_sql_comments_and_terminator(strip_leading_sql_comments(&source))
-                .to_owned()
+            let source = strip_leading_sql_comments(&source);
+            match tail {
+                StoredCreateTail::LastToken => strip_trailing_sql_comments_and_terminator(source),
+                StoredCreateTail::Terminator => {
+                    &source[..sql_text_terminator_offset(source).unwrap_or(source.len())]
+                }
+                StoredCreateTail::TerminatorTrimmed => source
+                    [..sql_text_terminator_offset(source).unwrap_or(source.len())]
+                    .trim_end(),
+            }
+            .to_owned()
         })
     }
 
@@ -65117,7 +65127,8 @@ impl Connection {
                 // SQLite's ALTER ADD COLUMN relies on that prefix; retaining IF
                 // NOT EXISTS gives it the wrong splice offset. Keep the original
                 // name/body spelling, including comments and semantic parentheses.
-                let pending_create_sql = self.take_pending_ddl_source_for_storage();
+                let pending_create_sql =
+                    self.take_pending_ddl_source_for_storage(StoredCreateTail::LastToken);
                 let create_sql = pending_create_sql
                     .as_deref()
                     .and_then(normalize_create_table_sql_for_storage)
@@ -69137,7 +69148,8 @@ impl Connection {
         // text captured in execute() (byte-faithful to what the user issued,
         // e.g. redundant parens in a partial-index WHERE) when present; fall back
         // to AST re-render for multi-statement batches / internal rewrites.
-        let pending_create_sql = self.take_pending_ddl_source_for_storage();
+        let pending_create_sql =
+            self.take_pending_ddl_source_for_storage(StoredCreateTail::Terminator);
         let create_sql = pending_create_sql
             .as_deref()
             .and_then(normalize_create_object_sql_for_storage)
@@ -69387,7 +69399,8 @@ impl Connection {
         // bd-xfmv9: prefer the verbatim CREATE VIEW text captured in execute()
         // (byte-faithful to the issued statement, incl. redundant parens in the
         // view's SELECT) over an AST re-render; fall back for batches / rewrites.
-        let pending_create_sql = self.take_pending_ddl_source_for_storage();
+        let pending_create_sql =
+            self.take_pending_ddl_source_for_storage(StoredCreateTail::TerminatorTrimmed);
         let create_sql = pending_create_sql
             .as_deref()
             .and_then(normalize_create_object_sql_for_storage)
@@ -69494,7 +69507,8 @@ impl Connection {
         // `WHEN (((a) AND (b)))` parentheses, so a trigger could not round-trip
         // through sqlite_master byte-for-byte (breaking schema-digest consumers
         // and stock sqlite3 tooling). Fall back for batches / internal rewrites.
-        let pending_create_sql = self.take_pending_ddl_source_for_storage();
+        let pending_create_sql =
+            self.take_pending_ddl_source_for_storage(StoredCreateTail::LastToken);
         let create_sql = pending_create_sql
             .as_deref()
             .and_then(normalize_create_object_sql_for_storage)
@@ -111568,6 +111582,70 @@ fn sql_text_end_before_trailing_comments(text: &str) -> usize {
 /// captured verbatim CREATE, mirroring stock sqlite3's sqlite_master text
 /// (which ends at the statement's final token). Alternating comment/`;`
 /// strips handle tails like `); -- done` and `) /* x */ ;`.
+/// Where stock SQLite ends the `sqlite_master.sql` text of a CREATE, which
+/// differs by object kind.
+#[derive(Clone, Copy)]
+enum StoredCreateTail {
+    /// CREATE TABLE and CREATE TRIGGER end at the statement's last token (the
+    /// closing parenthesis or table option, `END`): trailing comments and
+    /// whitespace are dropped.
+    LastToken,
+    /// CREATE INDEX keeps everything up to the terminating `;` (or the end of
+    /// the input), trailing comments and whitespace included: stock's text
+    /// runs to its last token, which is that `;`, minus the `;` itself.
+    Terminator,
+    /// CREATE VIEW runs to the terminating `;` (or the end of the input) like
+    /// an index, then trims trailing whitespace, so trailing comments stay.
+    TerminatorTrimmed,
+}
+
+/// Byte offset of the first `;` in `text` that is a real token, outside
+/// string literals, quoted identifiers and comments; `None` when there is
+/// none. Same scanning rules as [`sql_text_end_before_trailing_comments`].
+fn sql_text_terminator_offset(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            quote @ (b'\'' | b'"' | b'`') => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == quote {
+                        if bytes.get(i + 1) == Some(&quote) {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'[' => {
+                while i < bytes.len() && bytes[i] != b']' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i += 2;
+            }
+            b';' => return Some(i),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
 fn strip_trailing_sql_comments_and_terminator(text: &str) -> &str {
     let mut text = &text[..sql_text_end_before_trailing_comments(text)];
     while let Some(without_semi) = text.trim_end().strip_suffix(';') {

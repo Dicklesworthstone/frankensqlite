@@ -72,6 +72,12 @@ const SETUP: &[&str] = &[
     "CREATE VIEW IF NOT EXISTS mv AS SELECT a FROM m",
     "CREATE VIEW main.mv2 AS SELECT  b  FROM m",
     "CREATE TRIGGER IF NOT EXISTS mtr AFTER INSERT ON m BEGIN SELECT 1; END",
+    // Trailing text after the last token: an index keeps it, a view keeps the
+    // comment but not the whitespace, a trigger and a table keep neither.
+    "CREATE INDEX mk ON m(a, b) /* index tail */  ",
+    "CREATE VIEW mv3 AS SELECT a FROM m /* view tail */  ",
+    "CREATE TRIGGER mtr2 AFTER DELETE ON m BEGIN SELECT 2; END /* trigger tail */ ",
+    "CREATE TABLE n ( z ) /* table tail */ ",
     "ALTER TABLE m ADD COLUMN  c   INTEGER   DEFAULT ( 1 +  2 ) ",
     "ALTER TABLE m ADD d DEFAULT 'x' /* trailing */",
     "ALTER TABLE main.m ADD COLUMN e TEXT  COLLATE nocase ;",
@@ -185,6 +191,84 @@ fn a_failed_create_does_not_lend_its_text_to_a_later_create() {
             stock(&r, "SELECT name FROM pragma_table_info('u')"),
             [["'x'"]],
             "stock reads u with its own columns"
+        );
+    });
+}
+
+/// Stock ends the stored text differently per object kind. An index keeps
+/// everything up to the terminating `;` (or the end of the input), trailing
+/// whitespace and comments included; a view does the same but trims trailing
+/// whitespace; a table and a trigger end at their last token. Text after the
+/// `;` is never stored. A trailing `--` comment stored in an index or view must
+/// not break later reads of the schema: reopen, VACUUM, a RENAME rewrite.
+#[test]
+fn stored_text_ends_where_stock_ends_it_for_each_kind() {
+    const STATEMENTS: &[&str] = &[
+        "CREATE TABLE t(c)",
+        "CREATE INDEX i1 ON t(c) /* t */ ;",
+        "CREATE INDEX i2 ON t(c)   ;   -- after the terminator",
+        "CREATE INDEX i3 ON t(c) WHERE c > 0 /* t */",
+        "CREATE INDEX i4 ON t(c) -- t",
+        "CREATE INDEX i5 ON t(c) WHERE c <> ';' /* ; */ ;",
+        "CREATE VIEW v1 AS SELECT 1 AS one /* t */   ;",
+        "CREATE VIEW v2 AS SELECT 2 AS two   ",
+        "CREATE VIEW v3 AS SELECT ';' AS semi -- t",
+        "CREATE TRIGGER g1 AFTER INSERT ON t BEGIN SELECT 1; END /* t */ ;",
+        "CREATE TABLE t2(a) /* t */ ;",
+    ];
+    const MASTER: &str = "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY name";
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("tail.db");
+        let f = Connection::open(path.to_str().expect("utf-8 path"))
+            .await
+            .expect("open");
+        let r = rusqlite::Connection::open_in_memory().expect("stock open");
+        for sql in STATEMENTS {
+            f.execute(sql).await.expect("frank execute");
+            r.execute_batch(sql).expect("stock execute");
+        }
+        assert_eq!(
+            frank(&f, MASTER).await,
+            stock(&r, MASTER),
+            "statement by statement"
+        );
+        f.close().await.expect("close");
+
+        // The stored tails survive a reopen, a VACUUM and a RENAME rewrite.
+        let f = Connection::open(path.to_str().expect("utf-8 path"))
+            .await
+            .expect("reopen");
+        for sql in [
+            "INSERT INTO t VALUES (1), (2), (';')",
+            "VACUUM",
+            "ALTER TABLE t RENAME TO t_renamed",
+        ] {
+            f.execute(sql).await.expect(sql);
+        }
+        assert_eq!(
+            frank(&f, "SELECT one, two, semi FROM v1, v2, v3").await,
+            [["1", "2", "';'"]]
+        );
+        assert_eq!(
+            frank(
+                &f,
+                "SELECT count(*) FROM t_renamed INDEXED BY i4 WHERE c > 0"
+            )
+            .await,
+            [["3"]]
+        );
+        f.close().await.expect("close");
+        let r = rusqlite::Connection::open(&path).expect("stock open");
+        assert_eq!(
+            stock(&r, "PRAGMA integrity_check"),
+            [["'ok'"]],
+            "stock integrity_check"
+        );
+        assert_eq!(
+            stock(&r, "SELECT count(*) FROM t_renamed WHERE c > 0"),
+            [["3"]],
+            "stock reads the renamed table"
         );
     });
 }
