@@ -12312,6 +12312,23 @@ struct PreparedDirectInsertAppendHint {
     cached_leaf: Option<TableAppendHint>,
 }
 
+/// bd-6i9c5: the direct insert lane's automatic rowid once `max(rowid)` is
+/// 9223372036854775807, as stock's `OP_NewRowid` picks it: the first of up to
+/// 100 random rowids the table does not hold, else SQLITE_FULL. (The lane
+/// never serves an AUTOINCREMENT table, which fails SQLITE_FULL outright.)
+async fn random_unused_direct_insert_rowid<P: PageReader + PageWriter>(
+    cursor: &mut fsqlite_btree::BtCursor<P>,
+    cx: &Cx,
+) -> Result<i64> {
+    for _ in 0..fsqlite_vdbe::engine::RANDOM_ROWID_ATTEMPTS {
+        let candidate = fsqlite_vdbe::engine::random_rowid_candidate();
+        if !cursor.table_move_to(cx, candidate).await?.is_found() {
+            return Ok(candidate);
+        }
+    }
+    Err(FrankenError::DatabaseFull)
+}
+
 /// AAC-P6 regenerative-renewal micro-batch state (ceremony amortization).
 ///
 /// Caches the ceremony fingerprint of the most recent prepared-statement
@@ -33342,23 +33359,25 @@ impl Connection {
                     (rowid, true, false)
                 }
             } else if let Some(hint) = prepared_append_hint.as_ref() {
-                let rowid = hint.last_rowid.checked_add(1).ok_or_else(|| {
-                    FrankenError::VdbeExecutionError {
-                        detail: "rowid overflow: maximum rowid reached".to_owned(),
-                    }
-                })?;
-                (rowid, true, true)
+                match hint.last_rowid.checked_add(1) {
+                    Some(rowid) => (rowid, true, true),
+                    None => (
+                        random_unused_direct_insert_rowid(cursor, execution_cx).await?,
+                        false,
+                        false,
+                    ),
+                }
             } else if let Some(rowid) = memdb_next_rowid_hint {
                 (rowid, true, false)
             } else if cursor.last(execution_cx).await? {
-                let rowid = cursor
-                    .rowid(execution_cx)
-                    .await?
-                    .checked_add(1)
-                    .ok_or_else(|| FrankenError::VdbeExecutionError {
-                        detail: "rowid overflow: maximum rowid reached".to_owned(),
-                    })?;
-                (rowid, true, false)
+                match cursor.rowid(execution_cx).await?.checked_add(1) {
+                    Some(rowid) => (rowid, true, false),
+                    None => (
+                        random_unused_direct_insert_rowid(cursor, execution_cx).await?,
+                        false,
+                        false,
+                    ),
+                }
             } else {
                 (1, true, false)
             };
@@ -59986,9 +60005,12 @@ impl Connection {
             return None;
         }
 
+        // bd-6i9c5: the mirror's next rowid saturates at the top of the range;
+        // a table holding 9223372036854775807 takes a random rowid instead.
         self.db
             .borrow()
             .get_table(root_page)
+            .filter(|table| table.max_visible_rowid() != Some(i64::MAX))
             .map(fsqlite_vdbe::engine::MemTable::next_rowid_hint)
     }
 

@@ -159,7 +159,8 @@ use fsqlite_func::{
 use fsqlite_mvcc::ConcurrentPageState;
 use fsqlite_mvcc::{
     AllocatorKey, CommitIndex, CommitLog, ConcurrentRowIdAllocator, InProcessPageLockTable,
-    MvccError, SharedConcurrentHandle, TimeTravelSnapshot, TimeTravelTarget, VersionStore,
+    MvccError, RowIdAllocError, SharedConcurrentHandle, TimeTravelSnapshot, TimeTravelTarget,
+    VersionStore,
     concurrent_clear_page_state, concurrent_free_page, concurrent_has_page_state,
     concurrent_page_is_synthetic_conflict_only, concurrent_page_read_status, concurrent_page_state,
     concurrent_prepare_write_page, concurrent_restore_page_state,
@@ -1046,6 +1047,19 @@ impl MemTable {
     #[must_use]
     pub fn max_visible_rowid(&self) -> Option<i64> {
         self.rows.last().map(|row| row.rowid)
+    }
+
+    /// bd-6i9c5: a rowid this table does not hold, for an automatic rowid once
+    /// it holds 9223372036854775807 (stock's random `OP_NewRowid` search);
+    /// `None` when every attempt is taken.
+    fn random_unused_rowid(&self) -> Option<i64> {
+        (0..RANDOM_ROWID_ATTEMPTS)
+            .map(|_| random_rowid_candidate())
+            .find(|candidate| {
+                self.rows
+                    .binary_search_by_key(candidate, |row| row.rowid)
+                    .is_err()
+            })
     }
 
     /// Insert a row with the given rowid and values.
@@ -8897,13 +8911,28 @@ impl VdbeEngine {
     /// rowid table takes `max(rowid) + 1` as stock does, so a row discarded by
     /// OR IGNORE burns nothing and a deleted maximum is reused; AUTOINCREMENT
     /// keeps the table's monotonic counter, which never reuses a value.
-    fn alloc_mem_rowid(&mut self, root_page: i32, concurrent_mode: bool) -> i64 {
+    fn alloc_mem_rowid(&mut self, root_page: i32, concurrent_mode: bool) -> Result<i64> {
         let autoincrement = self.autoincrement_seq_by_root_page.contains_key(&root_page);
-        match self.db.as_mut() {
-            Some(db) if autoincrement && !concurrent_mode => db.alloc_rowid(root_page),
-            Some(db) => db.alloc_rowid_concurrent(root_page),
-            None => 1,
+        let Some(db) = self.db.as_mut() else {
+            return Ok(1);
+        };
+        // bd-6i9c5: once the table holds 9223372036854775807 an automatic
+        // rowid is a random unused one, and AUTOINCREMENT fails SQLITE_FULL.
+        if let Some(table) = db.get_table(root_page)
+            && table.max_visible_rowid() == Some(i64::MAX)
+        {
+            if autoincrement {
+                return Err(FrankenError::DatabaseFull);
+            }
+            return table
+                .random_unused_rowid()
+                .ok_or(FrankenError::DatabaseFull);
         }
+        Ok(if autoincrement && !concurrent_mode {
+            db.alloc_rowid(root_page)
+        } else {
+            db.alloc_rowid_concurrent(root_page)
+        })
     }
 
     fn storage_cursor_runtime_meta(&self, root_page: i32) -> (RowIdMode, i64) {
@@ -8962,7 +8991,6 @@ impl VdbeEngine {
     async fn allocate_serialized_storage_rowid(
         sc: &mut StorageCursor,
         autoinc_max: i64,
-        overflow_detail: &'static str,
     ) -> Result<i64> {
         let base = if Self::last_alloc_rowid_tracks_table(sc) {
             sc.last_alloc_rowid.max(autoinc_max)
@@ -8971,14 +8999,38 @@ impl VdbeEngine {
                 .await?
                 .max(autoinc_max)
         };
-        let rowid = base
-            .checked_add(1)
-            .ok_or_else(|| FrankenError::VdbeExecutionError {
-                detail: overflow_detail.into(),
-            })?;
+        let Some(rowid) = base.checked_add(1) else {
+            return Self::allocate_random_storage_rowid(sc).await;
+        };
         sc.last_alloc_rowid = rowid;
         sc.last_alloc_landed = false;
         Ok(rowid)
+    }
+
+    /// bd-6i9c5: stock's `OP_NewRowid` once `max(rowid) + 1` would pass
+    /// 9223372036854775807. An AUTOINCREMENT table fails SQLITE_FULL. Any
+    /// other rowid table tries up to 100 random rowids in `1..=2^62` and takes
+    /// the first one it does not hold, failing SQLITE_FULL when all are taken.
+    /// A random rowid is not the table's `max(rowid)`, so it is not cached as
+    /// one (and the shared concurrent allocator, exhausted, never reserves it).
+    async fn allocate_random_storage_rowid(sc: &mut StorageCursor) -> Result<i64> {
+        if matches!(sc.rowid_mode, RowIdMode::AutoIncrement) {
+            return Err(FrankenError::DatabaseFull);
+        }
+        for _ in 0..RANDOM_ROWID_ATTEMPTS {
+            let candidate = random_rowid_candidate();
+            if !sc
+                .cursor
+                .table_move_to(&sc.cx, candidate)
+                .await?
+                .is_found()
+            {
+                sc.last_alloc_rowid = 0;
+                sc.last_alloc_landed = false;
+                return Ok(candidate);
+            }
+        }
+        Err(FrankenError::DatabaseFull)
     }
 
     // bd-gh-147 added `session_id` (8th arg) to attribute reservations to the
@@ -9018,6 +9070,9 @@ impl VdbeEngine {
                 .await?
                 .max(autoinc_max)
         };
+        if visible_max == i64::MAX {
+            return Self::allocate_random_storage_rowid(sc).await;
+        }
         let key = Self::concurrent_rowid_key(schema_epoch, root_page)?;
         allocator.ensure_table_floor(
             key,
@@ -9025,10 +9080,14 @@ impl VdbeEngine {
             autoinc_max,
             mode,
         );
-        let rowid = allocator
-            .allocate_one_for_session(key, session_id)
-            .map_err(|err| Self::map_rowid_allocator_error(err, overflow_detail))?
-            .get();
+        let rowid = match allocator.allocate_one_for_session(key, session_id) {
+            Ok(rowid) => rowid.get(),
+            // bd-6i9c5: the shared floor reached the top of the rowid range.
+            Err(RowIdAllocError::Exhausted) => {
+                return Self::allocate_random_storage_rowid(sc).await;
+            }
+            Err(err) => return Err(Self::map_rowid_allocator_error(err, overflow_detail)),
+        };
         sc.last_alloc_rowid = rowid;
         sc.last_alloc_landed = false;
         Ok(rowid)
@@ -11442,26 +11501,16 @@ impl VdbeEngine {
                                 )
                                 .await?
                             } else {
-                                Self::allocate_serialized_storage_rowid(
-                                    sc,
-                                    autoinc_max,
-                                    "rowid overflow: maximum rowid reached",
-                                )
-                                .await?
+                                Self::allocate_serialized_storage_rowid(sc, autoinc_max).await?
                             }
                         } else {
-                            Self::allocate_serialized_storage_rowid(
-                                sc,
-                                autoinc_max,
-                                "rowid overflow: maximum rowid reached",
-                            )
-                            .await?
+                            Self::allocate_serialized_storage_rowid(sc, autoinc_max).await?
                         }
                     } else {
                         // MemDatabase fallback (Phase 4 in-memory cursors).
                         let root = self.cursors.get(&cursor_id).map(|c| c.root_page);
                         if let Some(root) = root {
-                            self.alloc_mem_rowid(root, concurrent_mode)
+                            self.alloc_mem_rowid(root, concurrent_mode)?
                         } else {
                             1
                         }
@@ -15332,12 +15381,7 @@ impl VdbeEngine {
                             )
                             .await?
                         } else {
-                            Self::allocate_serialized_storage_rowid(
-                                sc,
-                                autoinc_max,
-                                "rowid overflow in FusedAppendInsert",
-                            )
-                            .await?
+                            Self::allocate_serialized_storage_rowid(sc, autoinc_max).await?
                         };
 
                         // 2. Serialize record from registers into sideband buf.
@@ -15404,7 +15448,7 @@ impl VdbeEngine {
                     // TEMP tables deliberately use the direct MemDatabase
                     // cursor backend. Preserve the fused opcode's semantics
                     // there instead of requiring a pager-backed cursor.
-                    let rowid = self.alloc_mem_rowid(root_page, false);
+                    let rowid = self.alloc_mem_rowid(root_page, false)?;
                     let mut rec_buf = self.make_record_lookaside.take_buf();
                     self.serialize_record_from_register_range(
                         first_reg,
@@ -15930,12 +15974,7 @@ impl VdbeEngine {
                 )
                 .await?
             } else {
-                Self::allocate_serialized_storage_rowid(
-                    sc,
-                    autoinc_max,
-                    "rowid overflow in compiled simple INSERT",
-                )
-                .await?
+                Self::allocate_serialized_storage_rowid(sc, autoinc_max).await?
             };
             rowid
         };
@@ -20190,6 +20229,28 @@ fn ensure_sorter_row_cache(
         refreshed: true,
         eager_values_ready,
     })
+}
+
+/// How many random rowids an automatic rowid tries once `max(rowid)` is
+/// 9223372036854775807 before failing SQLITE_FULL (stock's `OP_NewRowid`).
+pub const RANDOM_ROWID_ATTEMPTS: usize = 100;
+
+/// bd-6i9c5: one candidate for that random rowid search, in `1..=2^62`.
+///
+/// Stock takes `(random & (MAX_ROWID >> 1)) + 1` from `sqlite3_randomness`;
+/// nothing depends on the sequence, so this is splitmix64 over a process-wide
+/// counter.
+#[must_use]
+#[allow(clippy::cast_possible_wrap)]
+pub fn random_rowid_candidate() -> i64 {
+    static STATE: AtomicU64 = AtomicU64::new(0x2545_F491_4F6C_DD1D);
+    let mut x = STATE.fetch_add(0x9E37_79B9_7F4A_7C15, AtomicOrdering::Relaxed);
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^= x >> 31;
+    ((x as i64) & (i64::MAX >> 1)) + 1
 }
 
 fn invalidate_storage_cursor_row_cache_with_reason(
