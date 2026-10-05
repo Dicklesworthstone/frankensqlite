@@ -1921,6 +1921,7 @@ fn test_b3_covering_indexed_equality_profile_stays_seek_bounded() {
 
         reset_hot_path_profile();
         let before = hot_path_profile_snapshot();
+        let thread_opcodes_before = fsqlite_vdbe::engine::vdbe_thread_opcodes_executed();
         let started = std::time::Instant::now();
         let mut row_total = 0_usize;
         for probe in &probes {
@@ -1932,6 +1933,8 @@ fn test_b3_covering_indexed_equality_profile_stays_seek_bounded() {
             std::hint::black_box(rows);
         }
         let elapsed = started.elapsed();
+        let thread_opcodes =
+            fsqlite_vdbe::engine::vdbe_thread_opcodes_executed() - thread_opcodes_before;
         let after = hot_path_profile_snapshot();
 
         let avg_nanos = elapsed.as_nanos() / u128::try_from(PROBES).unwrap();
@@ -1967,9 +1970,25 @@ fn test_b3_covering_indexed_equality_profile_stays_seek_bounded() {
             slow_delta, 0,
             "covering indexed equality should not fall back to slow execution"
         );
+        // bd-iov06: seek-boundedness as an operation count, not a wall-clock
+        // budget (the former 100 us average failed at 102-112 us on a loaded
+        // host). Each probe runs the compiled lookup once and visits its one
+        // matching index entry, so no instruction runs more than twice; a scan
+        // of the 10,000-entry index would run thousands per probe. The count
+        // is this thread's own, so parallel tests cannot inflate it, and it
+        // must be nonzero, which proves the probes ran here.
+        let opcodes_per_probe = thread_opcodes / expected_probes;
+        let opcode_budget = 2 * u64::try_from(covering_opcodes.len()).unwrap();
+        eprintln!(
+            "[bd-iov06] covering_index_lookup opcodes_per_probe={opcodes_per_probe} \
+             program_len={} budget={opcode_budget}",
+            covering_opcodes.len()
+        );
         assert!(
-            avg_nanos < 100_000,
-            "covering indexed equality averaged {avg_nanos}ns, budget 100000ns"
+            opcodes_per_probe > 0 && opcodes_per_probe <= opcode_budget,
+            "covering indexed equality ran {opcodes_per_probe} opcodes per probe; \
+             a seek-bounded lookup of the {}-opcode program runs at most {opcode_budget}",
+            covering_opcodes.len()
         );
 
         reset_hot_path_profile();
@@ -2036,8 +2055,9 @@ fn test_b3_covering_indexed_equality_profile_stays_seek_bounded() {
         // do NOT compare raw wall-clock here: the per-probe difference is on the
         // order of a few hundred nanoseconds and is dominated by scheduler/cache
         // noise, so a `covering_avg_ns < non_covering_avg_ns` assertion flakes
-        // (~3%) without protecting any additional correctness. avg_nanos is still
-        // bounded above by the absolute budget asserted earlier.
+        // (~3%) without protecting any additional correctness. The covering
+        // lookup's work is bounded by the per-probe opcode budget asserted
+        // earlier.
         assert_eq!(
             seek_rowid_total, 0,
             "covering index lookup must perform zero table heap seeks: covering_seek_rowid={seek_rowid_total} non_covering_seek_rowid={non_covering_seek_rowid_total}"

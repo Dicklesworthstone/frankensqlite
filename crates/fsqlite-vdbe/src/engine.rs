@@ -5314,6 +5314,17 @@ thread_local! {
     static FSQLITE_VDBE_DECODE_CACHE_INVALIDATIONS_POSITION_THREAD: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static FSQLITE_VDBE_DECODE_CACHE_INVALIDATIONS_WRITE_THREAD: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static FSQLITE_VDBE_DECODE_CACHE_INVALIDATIONS_PSEUDO_THREAD: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// bd-iov06: the same per-thread mirror for `FSQLITE_VDBE_OPCODES_EXECUTED_TOTAL`,
+    /// so a test can bound a statement's work by opcode count instead of by
+    /// wall-clock time, unaffected by tests running on other threads.
+    static FSQLITE_VDBE_OPCODES_EXECUTED_THREAD: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Opcodes executed by VDBE statements on the calling thread while VDBE
+/// metrics were enabled. Monotonic; callers compare two readings.
+#[must_use]
+pub fn vdbe_thread_opcodes_executed() -> u64 {
+    FSQLITE_VDBE_OPCODES_EXECUTED_THREAD.with(std::cell::Cell::get)
 }
 /// Total number of decode-cache invalidations caused by row-position changes.
 static FSQLITE_VDBE_DECODE_CACHE_INVALIDATIONS_POSITION_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -14721,6 +14732,8 @@ impl VdbeEngine {
                 .as_deref()
                 .expect("opcode metrics buffer exists when VDBE metrics are enabled");
             FSQLITE_VDBE_OPCODES_EXECUTED_TOTAL.fetch_add(opcode_count, AtomicOrdering::Relaxed);
+            FSQLITE_VDBE_OPCODES_EXECUTED_THREAD
+                .with(|c| c.set(c.get().saturating_add(opcode_count)));
             FSQLITE_VDBE_STATEMENTS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
             #[allow(clippy::cast_possible_truncation)]
             FSQLITE_VDBE_STATEMENT_DURATION_US_TOTAL
