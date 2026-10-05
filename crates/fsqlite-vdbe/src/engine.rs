@@ -10416,6 +10416,7 @@ impl VdbeEngine {
                         let cx = self.derive_execution_cx();
                         let mut cursor =
                             BtCursor::new(store, root_pgno, autoindex_page_size, false);
+                        cursor.set_retain_read_witnesses(false);
                         let autoindex_collations = extract_collation_names_owned(&op.p4);
                         if !autoindex_collations.is_empty() {
                             cursor.set_index_collation_context(
@@ -11600,18 +11601,13 @@ impl VdbeEngine {
                                         self.collect_vdbe_metrics,
                                         DecodeCacheInvalidationReason::WriteMutation,
                                     );
-                                    if let Some(allocator) = concurrent_allocator.as_ref() {
-                                        Self::bump_concurrent_storage_rowid_floor(
-                                            allocator,
-                                            concurrent_schema_epoch,
-                                            root_page,
-                                            rowid_mode,
-                                            autoinc_max,
-                                            sc,
-                                            rowid,
-                                        )
-                                        .await?;
-                                    }
+                                    // bd-yb70u: no concurrent rowid-floor bump. The
+                                    // row kept the rowid it already had, so no new
+                                    // key needs reserving (an allocation recomputes
+                                    // the floor from the table itself), and the bump
+                                    // would walk the cursor to the last row, costing
+                                    // a descent and turning the next RowSet probe
+                                    // into a fresh root-to-leaf seek, for every row.
                                     inserted_via_storage = true;
                                     inserted_root_page = Some(root_page);
                                     actually_inserted = true;
@@ -16538,6 +16534,7 @@ impl VdbeEngine {
             );
         }
         configure_btree_cursor_page_size(&mut new_cursor, page_layout);
+        new_cursor.set_retain_read_witnesses(false);
         self.storage_cursors.insert(
             cursor_id,
             StorageCursor {
@@ -17946,6 +17943,7 @@ impl VdbeEngine {
                         );
                     }
                     configure_btree_cursor_page_size(&mut cursor, page_layout);
+                    cursor.set_retain_read_witnesses(false);
                     let ipk_col_idx = self.rowid_alias_col_by_root_page.get(&root_page).copied();
                     let table_column_count = self
                         .table_column_count_by_root_page
@@ -18108,6 +18106,7 @@ impl VdbeEngine {
                         );
                     }
                     configure_btree_cursor_page_size(&mut cursor, page_layout);
+                    cursor.set_retain_read_witnesses(false);
                     let ipk_col_idx = self.rowid_alias_col_by_root_page.get(&root_page).copied();
                     let table_column_count = self
                         .table_column_count_by_root_page
@@ -18284,6 +18283,7 @@ impl VdbeEngine {
                 self.index_desc_flags_for_root(root_page)
             },
         );
+        cursor.set_retain_read_witnesses(false);
         if !is_table_btree {
             cursor.set_index_collation_context(
                 self.index_collations_for_root(root_page),

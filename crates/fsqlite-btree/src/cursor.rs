@@ -2124,6 +2124,16 @@ enum MutationPathTarget {
     ExactIndexKey(Vec<u8>),
 }
 
+/// Whether a cursor keeps its own copy of the read witnesses it records
+/// (bd-yb70u); the pager records every witness either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadWitnessRetention {
+    /// Keep the copy `witness_keys()` returns (the default).
+    Keep,
+    /// Keep none: the owner never reads `witness_keys()`.
+    Discard,
+}
+
 /// A B-tree cursor that navigates through B-tree pages using a page stack.
 ///
 /// Generic over the page I/O backend for testability.
@@ -2179,6 +2189,11 @@ pub struct BtCursor<P> {
     /// witness push, so operators see the policy hit without spamming logs
     /// for every subsequent page.
     read_witness_cap_warned: bool,
+    /// Whether `read_witnesses` keeps the per-cursor copy that
+    /// `witness_keys()` returns (the default). An owner that never reads it
+    /// turns it off with `set_retain_read_witnesses(false)`; the pager still
+    /// records every witness (bd-yb70u).
+    read_witness_retention: ReadWitnessRetention,
     /// Last page number passed to `record_range_page_witness`. Used to dedup
     /// consecutive identical range-page witnesses independently of the
     /// `read_witnesses` vec — without this, enabling `read_witness_cap`
@@ -2785,6 +2800,7 @@ impl<P: PageReader> BtCursor<P> {
             read_witnesses: Vec::new(),
             read_witness_cap: default_read_witness_cap(),
             read_witness_cap_warned: false,
+            read_witness_retention: ReadWitnessRetention::Keep,
             last_range_witness_page: None,
             active_op_stats: None,
             cell_buf: Vec::new(),
@@ -2870,6 +2886,21 @@ impl<P: PageReader> BtCursor<P> {
     #[must_use]
     pub fn read_witness_cap(&self) -> usize {
         self.read_witness_cap
+    }
+
+    /// Keep (`true`, the default) or stop keeping the per-cursor copy of the
+    /// read witnesses that `witness_keys()` returns. Turning it off drops the
+    /// copy already kept. The pager records every witness either way, so SSI
+    /// evidence is unaffected; this only spares an owner that never reads
+    /// `witness_keys()` a vector that grows with every row it seeks to
+    /// (bd-yb70u).
+    pub fn set_retain_read_witnesses(&mut self, retain: bool) {
+        if retain {
+            self.read_witness_retention = ReadWitnessRetention::Keep;
+        } else {
+            self.read_witness_retention = ReadWitnessRetention::Discard;
+            self.read_witnesses = Vec::new();
+        }
     }
 
     /// True if the per-cursor witness vec is at or above the configured cap.
@@ -2960,6 +2991,10 @@ impl<P: PageReader> BtCursor<P> {
         // Canonical SSI evidence still goes to the pager regardless of cap —
         // that's the source of truth for transaction isolation. The cap only
         // bounds the per-cursor copy returned by `witness_keys()`.
+        if self.read_witness_retention == ReadWitnessRetention::Discard {
+            self.pager.record_read_witness(cx, key);
+            return;
+        }
         self.pager.record_read_witness(cx, key.clone());
         if self.read_witness_at_cap() {
             self.maybe_warn_witness_cap_hit();
@@ -2983,6 +3018,10 @@ impl<P: PageReader> BtCursor<P> {
         let key = WitnessKey::Page(page_no);
         // Same split as `record_point_witness`: pager always sees the read,
         // the per-cursor vec respects the cap.
+        if self.read_witness_retention == ReadWitnessRetention::Discard {
+            self.pager.record_read_witness(cx, key);
+            return;
+        }
         self.pager.record_read_witness(cx, key.clone());
         if self.read_witness_at_cap() {
             self.maybe_warn_witness_cap_hit();
@@ -19600,6 +19639,59 @@ mod tests {
                 cursor.witness_keys().len() >= 3,
                 "unbounded default must keep all page witnesses; got {}",
                 cursor.witness_keys().len()
+            );
+        });
+    }
+
+    #[test]
+    fn test_retain_read_witnesses_off_keeps_no_cursor_copy_but_pager_sees_every_read() {
+        run_async(async {
+            // bd-yb70u: the VDBE never reads `witness_keys()`, so its cursors stop
+            // keeping that copy, which otherwise grows by one entry per row a long
+            // UPDATE seeks to. The pager must still record every point and range
+            // witness.
+            let mut store = MemPageStore::new(USABLE);
+            store
+                .pages
+                .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
+            store
+                .pages
+                .insert(3, build_leaf_table(&[(1, b"a"), (5, b"b")]));
+            store
+                .pages
+                .insert(4, build_leaf_table(&[(10, b"c"), (15, b"d")]));
+
+            let cx = Cx::new();
+            let probe = WitnessProbeStore::new(store);
+            let state = probe.state();
+            let mut cursor = BtCursor::new(probe, pn(2), USABLE, true);
+            assert!(cursor.table_move_to(&cx, 5).await.unwrap().is_found());
+            assert_eq!(cursor.witness_keys().len(), 1, "retained by default");
+
+            cursor.set_retain_read_witnesses(false);
+            assert!(cursor.witness_keys().is_empty(), "turning retention off drops the copy");
+            let pager_before = state.borrow().read_witnesses.len();
+
+            assert!(cursor.table_move_to(&cx, 10).await.unwrap().is_found());
+            assert!(cursor.advance_to(&cx, 15).await.unwrap().is_found());
+            assert_eq!(cursor.count_all_rows(&cx).await.unwrap(), 4);
+            assert!(cursor.witness_keys().is_empty());
+
+            let state = state.borrow();
+            let recorded = &state.read_witnesses[pager_before..];
+            assert_eq!(
+                recorded
+                    .iter()
+                    .filter(|key| matches!(key, WitnessKey::Cell { .. }))
+                    .count(),
+                2,
+                "both point reads still reach the pager: {recorded:?}"
+            );
+            assert!(
+                [pn(2), pn(3), pn(4)]
+                    .into_iter()
+                    .all(|page| recorded.contains(&WitnessKey::Page(page))),
+                "the range scan's page witnesses still reach the pager: {recorded:?}"
             );
         });
     }
