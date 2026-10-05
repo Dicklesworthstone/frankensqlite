@@ -32268,28 +32268,63 @@ mod tests {
                 "test precondition: clean database must not have a rollback journal"
             );
 
-            let fence = recovery_fence_for_path(&path);
+            // bd-24tar: the open binds its recovery fence to the file's
+            // identity (`identity_bound_recovery_fence`), not to its path, so
+            // hold exactly that fence. Holding the path-keyed one blocked
+            // nothing, and the test only ever measured how long an open took.
+            let vfs = fsqlite_vfs::UnixVfs::new();
+            let fence = {
+                let (mut probe, _) = vfs
+                    .open(
+                        &cx,
+                        Some(&path),
+                        VfsOpenFlags::READONLY | VfsOpenFlags::MAIN_DB,
+                    )
+                    .expect("open identity probe");
+                let fence = identity_bound_recovery_fence(&vfs, &path, &probe)
+                    .expect("identity-bound recovery fence");
+                probe.close(&cx).expect("close identity probe");
+                fence
+            };
             let held = fence
                 .try_acquire_for_recovery()
                 .expect("hold recovery fence to simulate unrelated opener recovery");
 
-            let started = std::time::Instant::now();
-            let _reopened = SimplePager::open_with_cx(
+            // Counted, not timed: every blocking acquisition that finds the
+            // fence held is counted, so an open that queued behind it at all
+            // shows up here, however loaded the host is.
+            let contended_before = fence.contended_acquisitions();
+            let reopened = SimplePager::open_with_cx(&cx, vfs, &path, PageSize::DEFAULT)
+                .await
+                .expect("clean open should not wait behind recovery fence");
+            assert_eq!(
+                fence.contended_acquisitions(),
+                contended_before,
+                "clean shared-file open should skip the recovery fence when no rollback journal exists"
+            );
+            drop(reopened);
+
+            // Control: with a rollback journal present the same open does
+            // queue behind this fence, which proves the fence held above is
+            // the one the open consults.
+            std::fs::write(&journal_path, b"").expect("create empty rollback journal");
+            let blocked = SimplePager::open_with_cx(
                 &cx,
                 fsqlite_vfs::UnixVfs::new(),
                 &path,
                 PageSize::DEFAULT,
             )
-            .await
-            .expect("clean open should not wait behind recovery fence");
-            let elapsed = started.elapsed();
-            drop(held);
-
+            .await;
             assert!(
-                elapsed < Duration::from_millis(100),
-                "clean shared-file open should skip the recovery fence when no rollback journal exists \
-                 (elapsed {elapsed:?})"
+                matches!(blocked, Err(FrankenError::BusyRecovery)),
+                "an open that must inspect a rollback journal waits for the held fence, got {:?}",
+                blocked.as_ref().map(|_| ())
             );
+            assert!(
+                fence.contended_acquisitions() > contended_before,
+                "the journal-inspecting open must have queued behind the held fence"
+            );
+            drop(held);
         });
     }
 

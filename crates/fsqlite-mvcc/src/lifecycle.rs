@@ -3967,7 +3967,16 @@ mod tests {
 
     #[test]
     fn test_acquisition_ordering_steps_1_through_5() {
-        let m = Arc::new(mgr_with_busy_timeout_ms(200));
+        // bd-24tar: the steps are ordered by the held concurrent lock, not by
+        // time. The drain cannot finish until `conc` is aborted below, so the
+        // serialized writer's busy timeout only has to outlast this thread's
+        // own steps; a short one (formerly 200 ms, with a 50 ms window to see
+        // the indicator) turned scheduler delay on a loaded host into a
+        // spurious drain timeout. The long budget is a hang guard, not a bound.
+        const HANG_GUARD: Duration = Duration::from_secs(60);
+        let m = Arc::new(mgr_with_busy_timeout_ms(
+            u64::try_from(HANG_GUARD.as_millis()).unwrap(),
+        ));
 
         // Hold a concurrent lock so the serialized writer must drain.
         let mut conc = m.begin(BeginKind::Concurrent).unwrap();
@@ -3985,8 +3994,8 @@ mod tests {
         let wait_start = Instant::now();
         while m.shm.check_serialized_writer().is_none() {
             assert!(
-                wait_start.elapsed() <= Duration::from_millis(50),
-                "timed out waiting for serialized writer indicator"
+                wait_start.elapsed() <= HANG_GUARD,
+                "serialized writer indicator never became visible"
             );
             std::thread::yield_now();
         }
@@ -4001,10 +4010,7 @@ mod tests {
         // Release existing concurrent locks so drain can finish.
         m.abort(&mut conc);
 
-        let mut ser = rx
-            .recv_timeout(Duration::from_millis(200))
-            .unwrap()
-            .unwrap();
+        let mut ser = rx.recv_timeout(HANG_GUARD).unwrap().unwrap();
         assert!(ser.serialized_write_lock_held);
         starter.join().expect("begin thread panicked");
 

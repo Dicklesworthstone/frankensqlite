@@ -1561,6 +1561,38 @@ fn txn_memory_retained_autocommit_10k_matches_rusqlite() {
 
 #[test]
 fn txn_file_backed_autocommit_10k_is_committed_before_close_and_matches_rusqlite() {
+    const CHILD: &str = "FSQLITE_FILE_BACKED_AUTOCOMMIT_10K_CHILD";
+    const VERIFIED: &str = "event=file_backed_autocommit_10k_verified rows=10000";
+    if env::var(CHILD).as_deref() != Ok("1") {
+        // bd-24tar: hot-path counters are process-global, and this keeper
+        // asserts an exact commit count. Run alongside other tests it read
+        // 10001 and 10034: their commits landed in the same counter (and a
+        // concurrent profile reset can zero it). Isolate it in its own
+        // process, as the memory-retention keeper already is.
+        let output = Command::new(env::current_exe().expect("current_exe"))
+            .args([
+                "--exact",
+                "txn_file_backed_autocommit_10k_is_committed_before_close_and_matches_rusqlite",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .expect("run isolated file-backed autocommit keeper");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eprintln!("{stdout}\n{stderr}");
+        assert!(
+            output.status.success(),
+            "file-backed autocommit child failed"
+        );
+        assert!(
+            stderr.contains(VERIFIED),
+            "child did not finish the oracle checks"
+        );
+        return;
+    }
+
     asupersync::test_utils::run_test(|| async {
         const ROW_COUNT: i64 = 10_000;
 
@@ -1638,6 +1670,7 @@ fn txn_file_backed_autocommit_10k_is_committed_before_close_and_matches_rusqlite
             fsqlite_query_values(&reopened_f, full_dump_sql).await,
             "10k retained autocommit close+reopen must match the oracle"
         );
+        eprintln!("{VERIFIED}");
     });
 }
 

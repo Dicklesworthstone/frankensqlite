@@ -91,6 +91,10 @@ pub struct RecoveryFence {
     /// re-validation logic that wants to detect whether a parallel recovery
     /// completed between two probes.
     generation: AtomicU64,
+    /// Blocking acquisitions that found the fence already held and had to
+    /// wait for it. Lets a caller prove a path never queued behind another
+    /// recovery without timing it.
+    contended_acquisitions: AtomicU64,
 }
 
 impl RecoveryFence {
@@ -100,6 +104,7 @@ impl RecoveryFence {
         Self {
             in_progress: AtomicBool::new(false),
             generation: AtomicU64::new(0),
+            contended_acquisitions: AtomicU64::new(0),
         }
     }
 
@@ -113,6 +118,13 @@ impl RecoveryFence {
     #[must_use]
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
+    }
+
+    /// Number of [`Self::acquire_for_recovery`] calls that found the fence
+    /// held and had to wait (spin or sleep) for it.
+    #[must_use]
+    pub fn contended_acquisitions(&self) -> u64 {
+        self.contended_acquisitions.load(Ordering::Acquire)
     }
 
     /// Attempt to acquire the fence for recovery without waiting.
@@ -161,6 +173,10 @@ impl RecoveryFence {
         // penalty. `spin_loop` issues `PAUSE` on x86 (hyperthread-
         // friendly) and resolves to a no-op on architectures without
         // an equivalent.
+        if let Some(guard) = self.try_acquire_for_recovery() {
+            return Ok(guard);
+        }
+        self.contended_acquisitions.fetch_add(1, Ordering::AcqRel);
         for _ in 0..RECOVERY_FENCE_SPIN_ATTEMPTS {
             if let Some(guard) = self.try_acquire_for_recovery() {
                 return Ok(guard);
@@ -1282,6 +1298,42 @@ mod tests {
         let _guard = fence.try_acquire_for_recovery().unwrap();
         let result = fence.acquire_for_recovery_with(0, Duration::from_millis(1));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn fence_counts_only_acquisitions_that_had_to_wait() {
+        let fence = RecoveryFence::new();
+        drop(
+            fence
+                .acquire_for_recovery_with(0, Duration::from_millis(1))
+                .unwrap(),
+        );
+        assert_eq!(
+            fence.contended_acquisitions(),
+            0,
+            "a free fence is not contended"
+        );
+
+        let held = fence.try_acquire_for_recovery().unwrap();
+        assert!(fence.try_acquire_for_recovery().is_none());
+        assert_eq!(
+            fence.contended_acquisitions(),
+            0,
+            "a non-blocking probe never waits"
+        );
+        assert!(
+            fence
+                .acquire_for_recovery_with(0, Duration::from_millis(1))
+                .is_err()
+        );
+        assert_eq!(fence.contended_acquisitions(), 1);
+        drop(held);
+        drop(
+            fence
+                .acquire_for_recovery_with(0, Duration::from_millis(1))
+                .unwrap(),
+        );
+        assert_eq!(fence.contended_acquisitions(), 1);
     }
 
     #[test]
