@@ -26738,9 +26738,80 @@ impl Connection {
         &self,
         select: &SelectStatement,
     ) -> Option<(bool, Expr, Option<Expr>)> {
-        let tracking = select_minmax_bare_tracking(select)?;
-        let name = if tracking.0 { "max" } else { "min" };
-        (!self.application_function_replaces_builtin(name, 1)).then_some(tracking)
+        let walk = select_minmax_bare_tracking_walk(
+            select,
+            &self.having_alias_shadowing_column_names(select),
+        )?;
+        let builtin = walk.seen_minmax.iter().all(|(is_max, _, _)| {
+            !self.application_function_replaces_builtin(if *is_max { "max" } else { "min" }, 1)
+        });
+        walk.minmax.filter(|_| builtin)
+    }
+
+    /// GH#174 / bd-6lijo: the result aliases a HAVING name does NOT resolve
+    /// to, because a FROM column of that name comes first. Empty when there
+    /// is no HAVING or alias, or the FROM columns cannot be enumerated.
+    fn having_alias_shadowing_column_names(&self, select: &SelectStatement) -> HashSet<String> {
+        let SelectCore::Select {
+            columns,
+            having: Some(_),
+            ..
+        } = &select.body.select
+        else {
+            return HashSet::new();
+        };
+        let aliases: HashSet<String> = columns
+            .iter()
+            .filter_map(|column| match column {
+                ResultColumn::Expr {
+                    alias: Some(alias), ..
+                } => Some(alias.to_ascii_lowercase()),
+                _ => None,
+            })
+            .collect();
+        if aliases.is_empty() {
+            return HashSet::new();
+        }
+        self.select_from_column_names(select)
+            .map(|names| names.intersection(&aliases).cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// The lowercase column names of every FROM source of `select` (rowid
+    /// aliases included for rowid sources), or `None` when a source is not a
+    /// table or subquery or its columns cannot be enumerated.
+    fn select_from_column_names(&self, select: &SelectStatement) -> Option<HashSet<String>> {
+        let SelectCore::Select { from, .. } = &select.body.select else {
+            return None;
+        };
+        let mut from_columns: HashSet<String> = HashSet::new();
+        let Some(from) = from else {
+            return Some(from_columns);
+        };
+        let visible_ctes = select
+            .with
+            .as_ref()
+            .map_or_else(Vec::new, |with| with.ctes.clone());
+        for source in std::iter::once(&from.source).chain(from.joins.iter().map(|j| &j.table)) {
+            if !matches!(
+                source,
+                TableOrSubquery::Table { .. } | TableOrSubquery::Subquery { .. }
+            ) {
+                return None;
+            }
+            let names = self.source_column_names_for_join_layout(source, &visible_ctes);
+            if names.is_empty() {
+                return None;
+            }
+            if self
+                .hidden_rowid_projection_for_source(source, &names)
+                .is_some()
+            {
+                from_columns.extend(["rowid", "oid", "_rowid_"].map(str::to_owned));
+            }
+            from_columns.extend(names.iter().map(|name| name.to_ascii_lowercase()));
+        }
+        Some(from_columns)
     }
 
     /// bd-z0qqu: SQLite resolves a name inside an ORDER BY *expression* to a
@@ -26757,7 +26828,7 @@ impl Connection {
         if select.order_by.is_empty() || !select.body.compounds.is_empty() {
             return None;
         }
-        let SelectCore::Select { columns, from, .. } = &select.body.select else {
+        let SelectCore::Select { columns, .. } = &select.body.select else {
             return None;
         };
         let aliases: Vec<(String, Expr)> = columns
@@ -26779,33 +26850,7 @@ impl Connection {
         if aliases.is_empty() || !select.order_by.iter().any(is_alias_expression_term) {
             return None;
         }
-        let mut from_columns: HashSet<String> = HashSet::new();
-        if let Some(from) = from {
-            let visible_ctes = select
-                .with
-                .as_ref()
-                .map_or_else(Vec::new, |with| with.ctes.clone());
-            for source in std::iter::once(&from.source).chain(from.joins.iter().map(|j| &j.table))
-            {
-                if !matches!(
-                    source,
-                    TableOrSubquery::Table { .. } | TableOrSubquery::Subquery { .. }
-                ) {
-                    return None;
-                }
-                let names = self.source_column_names_for_join_layout(source, &visible_ctes);
-                if names.is_empty() {
-                    return None;
-                }
-                if self
-                    .hidden_rowid_projection_for_source(source, &names)
-                    .is_some()
-                {
-                    from_columns.extend(["rowid", "oid", "_rowid_"].map(str::to_owned));
-                }
-                from_columns.extend(names.iter().map(|name| name.to_ascii_lowercase()));
-            }
-        }
+        let from_columns = self.select_from_column_names(select)?;
         let mut rewritten = select.clone();
         let mut changed = false;
         for term in &mut rewritten.order_by {
@@ -26825,9 +26870,21 @@ impl Connection {
     /// DISTINCT (SQLite tests DISTINCT before its skip register; the bytecode
     /// keeps the first row there).
     fn select_minmax_bare_tracking_is_vdbe_eligible(&self, select: &SelectStatement) -> bool {
-        let Some(walk) = select_minmax_bare_tracking_walk(select) else {
+        let Some(walk) = select_minmax_bare_tracking_walk(
+            select,
+            &self.having_alias_shadowing_column_names(select),
+        ) else {
             return false;
         };
+        // bd-6lijo: an ORDER BY aggregate takes part in SQLite's bare-row
+        // choice, but the single-row bytecode aggregate never evaluates it.
+        if select
+            .order_by
+            .iter()
+            .any(|term| self.expr_contains_aggregate_with_registry(&term.expr))
+        {
+            return false;
+        }
         let SelectCore::Select {
             distinct,
             columns,
@@ -26869,27 +26926,33 @@ impl Connection {
             if !self.expr_contains_aggregate_with_registry(expr) {
                 return true;
             }
-            // Otherwise a direct builtin aggregate call over plain arguments.
-            let Expr::FunctionCall {
-                name,
-                args,
-                over: None,
-                ..
-            } = expr
-            else {
-                return false;
-            };
-            is_agg_fn(name)
-                && !self.application_function_replaces_builtin(
+            match expr {
+                // A direct builtin aggregate call over plain arguments.
+                Expr::FunctionCall {
                     name,
-                    aggregate_args_len_for_lookup(args),
-                )
-                && match args {
-                    FunctionArgs::Star => true,
-                    FunctionArgs::List(args) => args
-                        .iter()
-                        .all(|arg| !self.expr_contains_aggregate_with_registry(arg)),
+                    args,
+                    over: None,
+                    ..
+                } if is_agg_fn(name) && !is_scalar_max_min(name, args) => {
+                    !self.application_function_replaces_builtin(
+                        name,
+                        aggregate_args_len_for_lookup(args),
+                    ) && match args {
+                        FunctionArgs::Star => true,
+                        FunctionArgs::List(args) => args
+                            .iter()
+                            .all(|arg| !self.expr_contains_aggregate_with_registry(arg)),
+                    }
                 }
+                // bd-6lijo: an expression over aggregates that reads no bare
+                // column (`max(a) - min(a)`) is a wrapper the bytecode
+                // evaluates after the scan.
+                _ => {
+                    let mut aggregates_only = MinMaxBareTrackingWalk::default();
+                    walk_minmax_bare_tracking(expr, &[], &mut aggregates_only);
+                    !aggregates_only.bail && !aggregates_only.has_bare
+                }
+            }
         })
     }
 
@@ -48900,6 +48963,14 @@ impl Connection {
             || (has_join_like_source && !has_vdbe_eligible_join && !has_vdbe_eligible_grouped_join)
             || select_has_correlated_join_subquery(select)
             || self.select_correlated_exists_where_requires_fallback(select)
+            // bd-6lijo: a whole-table min()/max() bare-column shape the
+            // bytecode cannot track takes the same interpreter as ad hoc.
+            || (has_implicit_aggregate
+                && !has_join_like_source
+                && self
+                    .select_uses_builtin_minmax_bare_tracking(select)
+                    .is_some()
+                && !self.select_minmax_bare_tracking_is_vdbe_eligible(select))
     }
 
     fn select_correlated_exists_where_requires_fallback(&self, select: &SelectStatement) -> bool {
@@ -104334,26 +104405,24 @@ fn frame_bound_has_expr(bound: &FrameBound, predicate: fn(&Expr) -> bool) -> boo
 }
 
 /// bd-xplxa / bd-0174u: Detect SQLite's "bare column tracks the min()/max() row"
-/// special case. It applies when a query's ONLY aggregate is a single `min(x)`
-/// or `max(x)` (one argument, no window spec) and at least one result column
-/// references a bare (un-grouped, non-aggregate) value. SQLite then sources
-/// every bare column from the row that produced the extremum rather than an
-/// arbitrary row. Returns `(is_max, arg_expr)` of that aggregate, or `None`.
+/// special case. It applies when a query's aggregates include a `min(x)` or
+/// `max(x)` (one argument, no window spec; besides count()) and at least one
+/// result column references a bare (un-grouped, non-aggregate) value. SQLite
+/// then sources every bare column from the row that produced the extremum
+/// rather than an arbitrary row; with several distinct min()/max() calls, from
+/// the last one's (bd-6lijo). The walk's `minmax` is that aggregate's
+/// `(is_max, arg_expr, filter)`; `None` when the special case does not apply.
 ///
 /// bd-0174u: the aggregate and the bare column(s) may be nested together inside
 /// a single output expression (for example `max(price) || ':' || name`), not
 /// only appear as separate top-level result columns. Every result-column
-/// expression is walked in full: aggregates are tallied anywhere in the tree
-/// (there must be exactly one, a builtin `min`/`max` with one argument and no
-/// `OVER`), and a bare column reference anywhere outside that aggregate's
-/// argument (and not a GROUP BY key) satisfies the bare-column requirement.
-fn select_minmax_bare_tracking(select: &SelectStatement) -> Option<(bool, Expr, Option<Expr>)> {
-    select_minmax_bare_tracking_walk(select)?.minmax
-}
-
-/// The completed [`select_minmax_bare_tracking`] walk, for callers that also
-/// need its other findings.
-fn select_minmax_bare_tracking_walk(select: &SelectStatement) -> Option<MinMaxBareTrackingWalk> {
+/// expression is walked in full: aggregates are tallied anywhere in the tree,
+/// and a bare column reference anywhere outside an aggregate's argument (and
+/// not a GROUP BY key) satisfies the bare-column requirement.
+fn select_minmax_bare_tracking_walk(
+    select: &SelectStatement,
+    having_column_names: &HashSet<String>,
+) -> Option<MinMaxBareTrackingWalk> {
     if !select.body.compounds.is_empty() {
         return None;
     }
@@ -104377,54 +104446,61 @@ fn select_minmax_bare_tracking_walk(select: &SelectStatement) -> Option<MinMaxBa
             return None;
         }
     }
+    // bd-6lijo: SQLite collects the aggregates of the result columns, then of
+    // the ORDER BY, then of HAVING, and the last min()/max() among them decides
+    // the bare-column row. ORDER BY also reads bare columns from that row
+    // (`SELECT c, max(a) ... GROUP BY c ORDER BY b` sorts by the max row's b);
+    // its other aggregates and window functions leave the tracking alone.
+    state.in_order_by = true;
+    for term in &select.order_by {
+        walk_aliased_minmax_bare_tracking(
+            &term.expr,
+            columns,
+            group_by,
+            &HashSet::new(),
+            &mut state,
+        );
+        if state.bail {
+            return None;
+        }
+    }
+    state.in_order_by = false;
     // bd-xik4y: SQLite keeps tracking the extremum row under a HAVING clause.
     // HAVING's aggregates join the same AggInfo, so a min()/max() there is the
     // tracked aggregate too (`SELECT c, b ... GROUP BY c HAVING max(a) > 0`
     // reads b from the max row), and HAVING's own bare columns and subqueries
     // read the same accumulator row as the result columns
     // (`SELECT max(a), b ... HAVING b LIKE 'y%'` tests the max row's b).
+    // GH#174: a HAVING name that is a FROM column is that column even when a
+    // result alias shares it.
     if let Some(having) = having.as_deref() {
-        walk_aliased_minmax_bare_tracking(having, columns, group_by, &mut state);
+        walk_aliased_minmax_bare_tracking(
+            having,
+            columns,
+            group_by,
+            having_column_names,
+            &mut state,
+        );
         if state.bail {
             return None;
         }
     }
-    if state.agg_count != 1 {
-        return None;
-    }
-    // ORDER BY reads bare columns from the same row
-    // (`SELECT c, max(a) ... GROUP BY c ORDER BY b` sorts by the max row's b).
-    // Only its bare reads count here: a different min()/max() in ORDER BY
-    // leaves stock's bare-row choice documented-arbitrary, so it does not
-    // switch the tracking off.
-    if !state.has_bare {
-        for term in &select.order_by {
-            let mut order_state = MinMaxBareTrackingWalk {
-                minmax: state.minmax.clone(),
-                ..MinMaxBareTrackingWalk::default()
-            };
-            walk_aliased_minmax_bare_tracking(&term.expr, columns, group_by, &mut order_state);
-            if !order_state.bail && order_state.has_bare {
-                state.has_bare = true;
-                break;
-            }
-        }
-    }
-    if !state.has_bare || state.minmax.is_none() {
+    if state.agg_count == 0 || !state.has_bare || state.minmax.is_none() {
         return None;
     }
     Some(state)
 }
 
 /// bd-xik4y: walk a HAVING or ORDER BY expression into `state` for
-/// [`select_minmax_bare_tracking`]. Every aggregate call in it must be the
-/// tracked min()/max() (or a count()); a bare name that is a result alias
+/// [`select_minmax_bare_tracking_walk`]. A bare name that is a result alias
 /// (`SELECT max(a) AS m ... HAVING m > 0`) stands for that result expression,
-/// as SQLite resolves it.
+/// as SQLite resolves it, unless it is one of `column_names` (GH#174: HAVING
+/// resolves FROM columns first).
 fn walk_aliased_minmax_bare_tracking(
     expr: &Expr,
     columns: &[ResultColumn],
     group_by: &[Expr],
+    column_names: &HashSet<String>,
     state: &mut MinMaxBareTrackingWalk,
 ) {
     let aliases = columns
@@ -104433,7 +104509,9 @@ fn walk_aliased_minmax_bare_tracking(
             ResultColumn::Expr {
                 expr,
                 alias: Some(alias),
-            } => Some((alias.clone(), expr.clone())),
+            } if !column_names.contains(&alias.to_ascii_lowercase()) => {
+                Some((alias.clone(), expr.clone()))
+            }
             _ => None,
         })
         .collect();
@@ -104442,30 +104520,39 @@ fn walk_aliased_minmax_bare_tracking(
     state.result_aliases = previous;
 }
 
-/// Traversal state for [`select_minmax_bare_tracking`].
+/// Traversal state for [`select_minmax_bare_tracking_walk`].
 #[derive(Default)]
 struct MinMaxBareTrackingWalk {
-    /// The single tracked `(is_max, arg_expr, filter)` once its aggregate is
-    /// found. `filter` is the `min()`/`max()` FILTER clause (bd-3radn M5),
-    /// needed to compute the extremum row when the aggregate is NESTED in a
-    /// mixed output expression (no top-level Agg descriptor to borrow it from).
+    /// The tracked `(is_max, arg_expr, filter)`: the last distinct min()/max()
+    /// call in SQLite's aggregate order (bd-6lijo). `filter` is the
+    /// `min()`/`max()` FILTER clause (bd-3radn M5), needed to compute the
+    /// extremum row when the aggregate is NESTED in a mixed output expression
+    /// (no top-level Agg descriptor to borrow it from).
     minmax: Option<(bool, Expr, Option<Expr>)>,
-    /// Count of distinct min()/max() calls seen (a repeat of the tracked call
-    /// and count() calls are not counted).
+    /// Every distinct min()/max() call seen, in order. SQLite merges a
+    /// repeated call into its first occurrence, so a repeat does not move the
+    /// tracking.
+    seen_minmax: Vec<(bool, Expr, Option<Expr>)>,
+    /// Count of distinct min()/max() calls seen (repeats and count() calls
+    /// are not counted).
     agg_count: usize,
     /// bd-6hoc8: whether a call of the tracked min()/max() uses DISTINCT.
     minmax_distinct: bool,
     /// Whether a bare (non-aggregate, non-GROUP-BY) column reference was found.
     has_bare: bool,
     /// Set when a shape disqualifies the optimization (window function, a
-    /// second distinct min()/max(), or an aggregate other than min/max/count).
+    /// second distinct min()/max() beside a DISTINCT or FILTER one, or an
+    /// aggregate other than min/max/count).
     bail: bool,
+    /// bd-6lijo: walking ORDER BY, where other aggregates and window
+    /// functions leave the tracking alone instead of disqualifying it.
+    in_order_by: bool,
     /// Result-column aliases a bare name resolves to (set only while walking
     /// HAVING): the name stands for the aliased result expression.
     result_aliases: Vec<(String, Expr)>,
 }
 
-/// Walk one result-column expression for [`select_minmax_bare_tracking`],
+/// Walk one result-column expression for [`select_minmax_bare_tracking_walk`],
 /// tallying aggregates and bare column references into `state`.
 fn walk_minmax_bare_tracking(expr: &Expr, group_by: &[Expr], state: &mut MinMaxBareTrackingWalk) {
     if state.bail {
@@ -104496,16 +104583,17 @@ fn walk_minmax_bare_tracking(expr: &Expr, group_by: &[Expr], state: &mut MinMaxB
         }
         // A window function disqualifies the optimization outright. (These
         // queries are routed to the window pipeline elsewhere; bail defensively.)
+        // In ORDER BY it reads no bare column of this query's rows.
         Expr::FunctionCall { over: Some(_), .. } => {
-            state.bail = true;
+            state.bail |= !state.in_order_by;
         }
-        // An aggregate function call. The optimization requires the query's ONLY
-        // min()/max() aggregate to be a single builtin call with one argument.
-        // As in stock, a repeat of that same call is the same aggregate (its
-        // AggInfo deduplicates equal expressions), and count() never decides
-        // which row supplies the bare columns (only min()/max() skip the
-        // accumulator load), so neither disqualifies it. count() is exact and
-        // order-free, so the join path may still move the extremum row first.
+        // An aggregate function call. Only builtin one-argument min()/max()
+        // calls decide which row supplies the bare columns (only they skip the
+        // accumulator load); with several, SQLite's last one does (bd-6lijo),
+        // and a repeat of an earlier call is that same aggregate (its AggInfo
+        // deduplicates equal expressions). count() never decides it and is
+        // exact and order-free, so the join path may still move the extremum
+        // row first.
         Expr::FunctionCall {
             name,
             args,
@@ -104522,24 +104610,32 @@ fn walk_minmax_bare_tracking(expr: &Expr, group_by: &[Expr], state: &mut MinMaxB
             let arg = match args {
                 FunctionArgs::List(a) if a.len() == 1 => &a[0],
                 _ => {
-                    state.bail = true;
+                    state.bail |= !state.in_order_by;
                     return;
                 }
             };
             if lname != "min" && lname != "max" {
-                state.bail = true;
+                state.bail |= !state.in_order_by;
                 return;
             }
             let call = (lname == "max", arg.clone(), filter.as_deref().cloned());
-            state.minmax_distinct |= *distinct;
-            match &state.minmax {
-                Some(tracked) if *tracked == call => return,
-                Some(_) => {
-                    state.bail = true;
-                    return;
-                }
-                None => {}
+            if state.seen_minmax.contains(&call) {
+                state.minmax_distinct |= *distinct;
+                return;
             }
+            // With several min()/max() calls, a DISTINCT or FILTER one makes
+            // SQLite's choice depend on rows some call never steps.
+            if !state.seen_minmax.is_empty()
+                && (*distinct
+                    || state.minmax_distinct
+                    || call.2.is_some()
+                    || state.seen_minmax.iter().any(|seen| seen.2.is_some()))
+            {
+                state.bail = true;
+                return;
+            }
+            state.minmax_distinct |= *distinct;
+            state.seen_minmax.push(call.clone());
             state.agg_count += 1;
             state.minmax = Some(call);
             // Do NOT descend into the aggregate argument: its column references
