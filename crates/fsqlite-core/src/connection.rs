@@ -26743,6 +26743,79 @@ impl Connection {
         (!self.application_function_replaces_builtin(name, 1)).then_some(tracking)
     }
 
+    /// bd-z0qqu: SQLite resolves a name inside an ORDER BY *expression* to a
+    /// FROM column first and only then to a result-column alias, so
+    /// `SELECT a.c AS k ... ORDER BY lower(k)` sorts by `lower(a.c)`. (A bare
+    /// identifier, ordinal or COLLATE-wrapped one is matched against the
+    /// result columns by every execution path already.) Rewrite such alias
+    /// references into their result expressions. `None` when nothing changes,
+    /// for compounds, and when a FROM source's columns cannot be enumerated.
+    fn substitute_order_by_result_aliases(
+        &self,
+        select: &SelectStatement,
+    ) -> Option<SelectStatement> {
+        if select.order_by.is_empty() || !select.body.compounds.is_empty() {
+            return None;
+        }
+        let SelectCore::Select { columns, from, .. } = &select.body.select else {
+            return None;
+        };
+        let aliases: Vec<(String, Expr)> = columns
+            .iter()
+            .filter_map(|column| match column {
+                ResultColumn::Expr {
+                    expr,
+                    alias: Some(alias),
+                } => Some((alias.clone(), expr.clone())),
+                _ => None,
+            })
+            .collect();
+        let is_alias_expression_term = |term: &OrderingTerm| {
+            !matches!(
+                strip_collate_wrappers(&term.expr),
+                Expr::Column(..) | Expr::Literal(..)
+            )
+        };
+        if aliases.is_empty() || !select.order_by.iter().any(is_alias_expression_term) {
+            return None;
+        }
+        let mut from_columns: HashSet<String> = HashSet::new();
+        if let Some(from) = from {
+            let visible_ctes = select
+                .with
+                .as_ref()
+                .map_or_else(Vec::new, |with| with.ctes.clone());
+            for source in std::iter::once(&from.source).chain(from.joins.iter().map(|j| &j.table))
+            {
+                if !matches!(
+                    source,
+                    TableOrSubquery::Table { .. } | TableOrSubquery::Subquery { .. }
+                ) {
+                    return None;
+                }
+                let names = self.source_column_names_for_join_layout(source, &visible_ctes);
+                if names.is_empty() {
+                    return None;
+                }
+                if self
+                    .hidden_rowid_projection_for_source(source, &names)
+                    .is_some()
+                {
+                    from_columns.extend(["rowid", "oid", "_rowid_"].map(str::to_owned));
+                }
+                from_columns.extend(names.iter().map(|name| name.to_ascii_lowercase()));
+            }
+        }
+        let mut rewritten = select.clone();
+        let mut changed = false;
+        for term in &mut rewritten.order_by {
+            if is_alias_expression_term(term) {
+                changed |= substitute_result_aliases_in_expr(&mut term.expr, &aliases, &from_columns);
+            }
+        }
+        changed.then_some(rewritten)
+    }
+
     /// bd-6hoc8: whether the bytecode aggregate path answers this
     /// whole-table tracked min()/max() query. Its accumulate loop emits
     /// SQLite's `OP_CollSeq` skip register (and FILTER "magnet"), so the bare
@@ -39025,6 +39098,16 @@ impl Connection {
                     }
                     None => select,
                 };
+                // bd-z0qqu: a name inside an ORDER BY expression that is no
+                // FROM column names a result alias (`ORDER BY lower(k)`).
+                let alias_select_owner;
+                let select = match self.substitute_order_by_result_aliases(select) {
+                    Some(rewritten) => {
+                        alias_select_owner = rewritten;
+                        &alias_select_owner
+                    }
+                    None => select,
+                };
                 // bd-c9v0f + bd-pw68x: reject out-of-range ORDER BY/GROUP BY
                 // ordinals and unknown INDEXED BY hints, matching SQLite.
                 self.validate_select_ordinals_and_hints(select)?;
@@ -46054,7 +46137,11 @@ impl Connection {
                 })
             }
             Statement::Select(select) => {
-                let canonical_select = canonicalize_select_placeholders(select)?;
+                // bd-z0qqu: compile ORDER BY alias references the way the
+                // execution dispatch resolves them.
+                let alias_select = self.substitute_order_by_result_aliases(select);
+                let canonical_select =
+                    canonicalize_select_placeholders(alias_select.as_ref().unwrap_or(select))?;
                 let distinct = is_distinct_select(select);
                 let prep_collations = if distinct {
                     select_result_collations(select, &self.schema.borrow())
@@ -96157,6 +96244,30 @@ impl Connection {
             if matches!(&term.expr, Expr::Literal(Literal::Integer(_), _)) {
                 continue;
             }
+            // bd-z0qqu: only an `AS` alias outranks the FROM columns for a bare
+            // ORDER BY name. Any other unqualified name resolves among the
+            // sources, so one that two sources share is ambiguous, as in
+            // SQLite, even when it also names an unaliased result column.
+            if let Expr::Column(col_ref, _) = strip_collate_wrappers(&term.expr)
+                && col_ref.table.is_none()
+                && !expanded_columns.iter().any(|column| {
+                    matches!(
+                        column,
+                        ResultColumn::Expr { alias: Some(alias), .. }
+                            if alias.eq_ignore_ascii_case(&col_ref.column)
+                    )
+                })
+                && let Err(error @ FrankenError::AmbiguousColumn { .. }) =
+                    validate_join_column_references(
+                        &term.expr,
+                        &col_map,
+                        using_skip,
+                        &[],
+                        &fts5_rank_table_names,
+                    )
+            {
+                return Err(error);
+            }
             let already_resolved = resolve_order_term_idx(&term.expr, &expanded_columns).is_some();
             if !already_resolved {
                 validate_join_column_references(
@@ -129228,6 +129339,104 @@ fn rename_column_refs_in_expr(expr: &mut Expr, old: &str, new: &str) -> bool {
         }
         Expr::RowValue(values, _) => rename_column_refs_in_exprs(values, old, new),
         Expr::Exists { .. } | Expr::Subquery(..) => false,
+    }
+}
+
+/// bd-z0qqu: replace every unqualified name in `expr` that is not a FROM
+/// column (`from_columns`, lowercase) but is a result-column alias with that
+/// result expression, as SQLite resolves names inside an ORDER BY expression.
+/// Subqueries and window specifications keep their own name scopes.
+fn substitute_result_aliases_in_expr(
+    expr: &mut Expr,
+    aliases: &[(String, Expr)],
+    from_columns: &HashSet<String>,
+) -> bool {
+    let mut substitute = |expr: &mut Expr| substitute_result_aliases_in_expr(expr, aliases, from_columns);
+    match expr {
+        Expr::BoundOuterValue { .. }
+        | Expr::Literal(_, _)
+        | Expr::Placeholder(_, _)
+        | Expr::Raise { .. }
+        | Expr::Exists { .. }
+        | Expr::Subquery(..) => false,
+        Expr::Column(col_ref, _) => {
+            if col_ref.table.is_some()
+                || from_columns.contains(&col_ref.column.to_ascii_lowercase())
+            {
+                return false;
+            }
+            let Some((_, aliased)) = aliases
+                .iter()
+                .find(|(alias, _)| alias.eq_ignore_ascii_case(&col_ref.column))
+            else {
+                return false;
+            };
+            *expr = aliased.clone();
+            true
+        }
+        Expr::BinaryOp { left, right, .. } => substitute(left) | substitute(right),
+        Expr::UnaryOp { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. }
+        | Expr::IsNull { expr, .. } => substitute(expr),
+        Expr::Between {
+            expr, low, high, ..
+        } => substitute(expr) | substitute(low) | substitute(high),
+        Expr::In { expr, set, .. } => {
+            let expr_changed = substitute(expr);
+            let set_changed = match set {
+                InSet::List(values) => values
+                    .iter_mut()
+                    .fold(false, |changed, value| substitute(value) | changed),
+                InSet::Subquery(_) | InSet::Table(_) => false,
+            };
+            expr_changed | set_changed
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            substitute(expr)
+                | substitute(pattern)
+                | escape.as_deref_mut().is_some_and(&mut substitute)
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            let operand_changed = operand.as_deref_mut().is_some_and(&mut substitute);
+            let whens_changed = whens.iter_mut().fold(false, |changed, (when, then)| {
+                changed | substitute(when) | substitute(then)
+            });
+            let else_changed = else_expr.as_deref_mut().is_some_and(&mut substitute);
+            operand_changed | whens_changed | else_changed
+        }
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter,
+            ..
+        } => {
+            let args_changed = match args {
+                FunctionArgs::List(args) => args
+                    .iter_mut()
+                    .fold(false, |changed, arg| substitute(arg) | changed),
+                FunctionArgs::Star => false,
+            };
+            let order_changed = order_by
+                .iter_mut()
+                .fold(false, |changed, term| substitute(&mut term.expr) | changed);
+            let filter_changed = filter.as_deref_mut().is_some_and(&mut substitute);
+            args_changed | order_changed | filter_changed
+        }
+        Expr::JsonAccess { expr, path, .. } => substitute(expr) | substitute(path),
+        Expr::RowValue(values, _) => values
+            .iter_mut()
+            .fold(false, |changed, value| substitute(value) | changed),
     }
 }
 
