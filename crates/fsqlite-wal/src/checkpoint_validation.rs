@@ -20,7 +20,11 @@ pub(super) fn validate_checkpoint_state<F: VfsFile>(
     state: CheckpointState,
 ) -> Result<()> {
     // bd-km8qs: do not turn a stale plan into permission to discard a newer tail.
-    let live_frame_count = u32::try_from(wal.frame_count()).unwrap_or(u32::MAX);
+    let live_frame_count = u32::try_from(wal.frame_count()).map_err(|_| {
+        FrankenError::CheckpointFailed {
+            detail: "WAL frame count exceeds the checkpoint counter domain".to_owned(),
+        }
+    })?;
     if state.total_frames != live_frame_count {
         return Err(FrankenError::CheckpointFailed {
             detail: format!(
@@ -29,6 +33,23 @@ pub(super) fn validate_checkpoint_state<F: VfsFile>(
                  planning and execution",
                 state.total_frames
             ),
+        });
+    }
+
+    // A physically appended suffix is not a committed checkpoint image.
+    // Refuse it rather than copying it into the database or discarding it on
+    // reset. The caller must settle/refresh the append owner before retrying.
+    let ends_at_commit = wal.frame_count() == 0
+        || wal
+            .last_commit_frame_header()
+            .is_some_and(|(index, _)| index == wal.frame_count() - 1);
+    if !ends_at_commit || state.backfilled_frames > state.total_frames {
+        return Err(FrankenError::CheckpointFailed {
+            detail: if ends_at_commit {
+                "checkpoint backfill prefix exceeds the live WAL".to_owned()
+            } else {
+                "checkpoint refused an uncommitted WAL suffix".to_owned()
+            },
         });
     }
     Ok(())

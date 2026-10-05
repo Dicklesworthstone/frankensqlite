@@ -280,3 +280,149 @@ fn checkpoint_integrity_copy_pass_is_bound_to_validated_source_bytes() {
     assert!(target.inner.truncate_to.is_none());
     assert_eq!(wal.frame_count(), 2);
 }
+
+#[test]
+fn checkpoint_integrity_refuses_uncommitted_suffix_without_consuming_retry() {
+    for mode in [
+        CheckpointMode::Passive,
+        CheckpointMode::Full,
+        CheckpointMode::Restart,
+        CheckpointMode::Truncate,
+    ] {
+        for first_committed in [false, true] {
+            let cx = test_cx();
+            let vfs = MemoryVfs::new();
+            let mut wal = WalFile::create(&cx, open_wal_file(&vfs, &cx), PAGE_SIZE, 0, test_salts())
+                .expect("create WAL");
+            let first_size = if first_committed { 1 } else { 0 };
+            wal.append_frame(&cx, 1, &sample_page(1), first_size)
+                .expect("first frame");
+            wal.append_frame(&cx, 2, &sample_page(2), 0)
+                .expect("uncommitted tail");
+            let before = checkpoint_integrity_wal_bytes(&wal, &cx);
+            let header = *wal.header();
+            let mut target = ReadbackTarget::new(&vfs, &cx);
+            let error = execute_checkpoint(
+                &cx,
+                &mut wal,
+                mode,
+                CheckpointState {
+                    total_frames: 2,
+                    backfilled_frames: 0,
+                    oldest_reader_frame: None,
+                },
+                &mut target,
+            )
+            .expect_err("physical frame count is not a committed checkpoint boundary");
+            assert!(matches!(error, FrankenError::CheckpointFailed { .. }));
+            checkpoint_integrity_assert_no_effects(&target);
+            assert_eq!(*wal.header(), header);
+            assert_eq!(wal.frame_count(), 2);
+            assert_eq!(checkpoint_integrity_wal_bytes(&wal, &cx), before);
+
+            // Settle the pending append with a real commit marker, then retry.
+            wal.append_frame(&cx, 2, &sample_page(3), 2)
+                .expect("settle tail");
+            let result = execute_checkpoint(
+                &cx,
+                &mut wal,
+                mode,
+                CheckpointState {
+                    total_frames: 3,
+                    backfilled_frames: 0,
+                    oldest_reader_frame: None,
+                },
+                &mut target,
+            )
+            .expect("committed retry");
+            assert_eq!(result.frames_backfilled, 3);
+            assert_eq!(target.written_pages.len(), 2);
+            assert_eq!(target.published_prefixes, vec![3]);
+        }
+    }
+}
+
+#[test]
+fn checkpoint_integrity_refuses_uncommitted_reset_even_with_no_pending_backfill() {
+    let cx = test_cx();
+    let vfs = MemoryVfs::new();
+    let mut wal = WalFile::create(&cx, open_wal_file(&vfs, &cx), PAGE_SIZE, 0, test_salts())
+        .expect("create WAL");
+    wal.append_frame(&cx, 1, &sample_page(1), 0)
+        .expect("uncommitted frame");
+    let before = checkpoint_integrity_wal_bytes(&wal, &cx);
+    let mut target = ReadbackTarget::new(&vfs, &cx);
+    let error = execute_checkpoint(
+        &cx,
+        &mut wal,
+        CheckpointMode::Truncate,
+        CheckpointState {
+            total_frames: 1,
+            backfilled_frames: 1,
+            oldest_reader_frame: None,
+        },
+        &mut target,
+    )
+    .expect_err("no-copy plan must not discard an uncommitted WAL");
+    assert!(matches!(error, FrankenError::CheckpointFailed { .. }));
+    checkpoint_integrity_assert_no_effects(&target);
+    assert_eq!(checkpoint_integrity_wal_bytes(&wal, &cx), before);
+}
+
+#[test]
+fn checkpoint_integrity_rejects_backfill_counter_beyond_live_wal() {
+    let cx = test_cx();
+    let vfs = MemoryVfs::new();
+    let mut wal = WalFile::create(&cx, open_wal_file(&vfs, &cx), PAGE_SIZE, 0, test_salts())
+        .expect("create WAL");
+    populate_wal(&mut wal, &cx, 2);
+    let before = checkpoint_integrity_wal_bytes(&wal, &cx);
+    let mut target = ReadbackTarget::new(&vfs, &cx);
+    let error = execute_checkpoint(
+        &cx,
+        &mut wal,
+        CheckpointMode::Truncate,
+        CheckpointState {
+            total_frames: 2,
+            backfilled_frames: 3,
+            oldest_reader_frame: None,
+        },
+        &mut target,
+    )
+    .expect_err("normalization must not convert invalid backfill into reset authority");
+    assert!(matches!(error, FrankenError::CheckpointFailed { .. }));
+    checkpoint_integrity_assert_no_effects(&target);
+    assert_eq!(checkpoint_integrity_wal_bytes(&wal, &cx), before);
+}
+
+#[test]
+fn checkpoint_integrity_empty_wal_still_allows_checkpoint_modes() {
+    for mode in [
+        CheckpointMode::Passive,
+        CheckpointMode::Full,
+        CheckpointMode::Restart,
+        CheckpointMode::Truncate,
+    ] {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let mut wal = WalFile::create(&cx, open_wal_file(&vfs, &cx), PAGE_SIZE, 0, test_salts())
+            .expect("create WAL");
+        let mut target = ReadbackTarget::new(&vfs, &cx);
+        let result = execute_checkpoint(
+            &cx,
+            &mut wal,
+            mode,
+            CheckpointState {
+                total_frames: 0,
+                backfilled_frames: 0,
+                oldest_reader_frame: None,
+            },
+            &mut target,
+        )
+        .expect("empty WAL is not an uncommitted suffix");
+        assert_eq!(result.frames_backfilled, 0);
+        assert!(target.written_pages.is_empty());
+        assert_eq!(target.published_prefixes, vec![0]);
+        assert_eq!(result.wal_was_reset, mode == CheckpointMode::Truncate);
+    }
+}
