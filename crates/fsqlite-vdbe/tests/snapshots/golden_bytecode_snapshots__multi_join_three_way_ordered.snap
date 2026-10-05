@@ -17,7 +17,7 @@ addr  opcode           p1    p2    p3    p4                 p5
 2     OpenRead         0     2     0     (tbl)docs          0 
 3     OpenRead         1     3     0     (tbl)categories    0 
 4     OpenRead         2     4     0     (tbl)events        0 
-5     SorterOpen       3     4     0     (aff)-             0 
+5     SorterOpen       3     1     0     (str)-             0 
 6     Rewind           0     33    0                        0 
 7     Rewind           1     32    0                        0 
 8     Rewind           2     31    0                        0 

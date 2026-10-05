@@ -53,8 +53,8 @@ addr  opcode           p1    p2    p3    p4                 p5
 38    Affinity         9     5     0     (aff)XDBBD         0 
 39    Column           0     2     14                       0 
 40    Rowid            0     15    0                        0 
-41    IdxDelete        2     14    2     (tbl)idx_docs_title  0 
-42    Delete           0     0     0                        16
+41    IdxDelete        2     14    2     (tbl)idx_docs_title  16
+42    Delete           0     0     0                        144
 43    IsNull           9     46    0                        0 
 44    Copy             9     16    0                        0 
 45    Goto             0     48    0                        0 

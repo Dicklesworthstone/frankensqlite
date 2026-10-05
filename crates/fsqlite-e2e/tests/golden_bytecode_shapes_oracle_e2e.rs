@@ -568,3 +568,241 @@ fn bare_column_beside_aggregate_matches_stock() {
         .await;
     });
 }
+
+// ---------------------------------------------------------------------------
+// Golden diffs accepted 2026-10-05, each run on the snapshot's own SQL and on
+// data that reaches the changed instruction; the EXPLAIN checks confirm the
+// connection's program for the statement contains that instruction.
+//
+// * `23697702a` (bd-kr6hf / bd-y5mc8): a join's `SorterOpen` keys only the
+//   ORDER BY terms (P2 = 1, P4 Str "-"). Before, P2 counted every sorter column
+//   and P4 was an Affinity, which the sorter does not read as directions, so
+//   `ORDER BY events.score DESC` sorted ascending. multi_join_three_way_ordered.
+// * `dc4926c30`: a join's rowid probe runs `MustBeInt` before `SeekRowid`, so a
+//   non-integer key misses. select_join_lookup.
+// * `59d2d94e6` (bd-8c68u): the WHERE equality on docs.category_id drives the
+//   join's outer loop through an equality seek of idx_docs_category, whose
+//   `SeekRowid` takes the entry's `IdxRowid`. select_join_lookup.
+// * `a31225e8b` (bd-9ag5r): an UPDATE whose rowid cannot change marks its
+//   `Delete` OPFLAG_UPDATE_KEEPS_ROWID (p5 0x80) and rewrites the row in place.
+//   update_with_where_predicate.
+// * `36b2bbf09` (bd-c1vth): an UPDATE's `IdxDelete` carries OPFLAG_ISUPDATE
+//   (p5 0x10) so a conflict restore re-inserts exactly the entries it removed.
+//   update_with_where_predicate, upsert_on_conflict_do_update.
+// * `2894fc314`: a caller-supplied rowid or INTEGER PRIMARY KEY runs
+//   `MustBeInt` on every write path, the DO UPDATE rewrite included.
+//   upsert_on_conflict_do_nothing, upsert_on_conflict_do_update.
+// ---------------------------------------------------------------------------
+
+/// `(opcode, p2, p5)` of each instruction in FrankenSQLite's EXPLAIN of `sql`.
+async fn frank_program(conn: &Connection, sql: &str) -> Vec<(String, i64, i64)> {
+    conn.query(&format!("EXPLAIN {sql}"))
+        .await
+        .unwrap_or_else(|e| panic!("frank EXPLAIN {sql}: {e}"))
+        .iter()
+        .map(|row| {
+            let values = row.values();
+            let text = |i: usize| match values.get(i) {
+                Some(SqliteValue::Text(s)) => s.to_string(),
+                _ => String::new(),
+            };
+            let int = |i: usize| match values.get(i) {
+                Some(SqliteValue::Integer(n)) => *n,
+                _ => 0,
+            };
+            (text(1), int(3), int(6))
+        })
+        .collect()
+}
+
+async fn seeded_frank() -> Connection {
+    let f = Connection::open(":memory:").await.expect("open frank");
+    for s in SCHEMA.iter().chain(SEED) {
+        f.execute(s).await.expect("frank ddl/seed");
+    }
+    f
+}
+
+const THREE_WAY_ORDERED: &str = "SELECT docs.id, categories.name, events.score \
+     FROM docs \
+     JOIN categories ON docs.category_id = categories.id \
+     JOIN events ON events.category_id = categories.id \
+     WHERE docs.category_id = 7 \
+     ORDER BY events.score DESC";
+
+#[test]
+fn three_way_join_sorts_on_its_order_by_terms_like_stock() {
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[],
+            &[],
+            &[
+                // golden: multi_join_three_way_ordered, as rendered. Three docs
+                // tie on every score, so the ties' order is compared too.
+                THREE_WAY_ORDERED,
+                "SELECT docs.id, categories.name, events.score \
+                 FROM docs \
+                 JOIN categories ON docs.category_id = categories.id \
+                 JOIN events ON events.category_id = categories.id \
+                 WHERE docs.category_id = 7 \
+                 ORDER BY 3 DESC",
+                "SELECT docs.id, categories.name, events.score \
+                 FROM docs \
+                 JOIN categories ON docs.category_id = categories.id \
+                 JOIN events ON events.category_id = categories.id \
+                 WHERE docs.category_id = 7 \
+                 ORDER BY events.score",
+            ],
+            "three_way_join_order_by_terms",
+        )
+        .await;
+        let program = frank_program(&seeded_frank().await, THREE_WAY_ORDERED).await;
+        let sorter_open = program
+            .iter()
+            .find(|(opcode, ..)| opcode == "SorterOpen")
+            .unwrap_or_else(|| panic!("no SorterOpen: {program:?}"));
+        assert_eq!(sorter_open.1, 1, "one ORDER BY key: {program:?}");
+    });
+}
+
+#[test]
+fn join_rowid_probe_rejects_non_integer_keys_like_stock() {
+    const JOIN_LOOKUP: &str = "SELECT docs.id, categories.name \
+         FROM docs JOIN categories ON docs.category_id = categories.id \
+         WHERE docs.category_id = 7";
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[],
+            // Keys an INTEGER column keeps as REAL / TEXT, and one it converts.
+            &[
+                "INSERT INTO docs(id, category_id, title, body, score) VALUES \
+               (20, 7.5, 'r', 'r', 1), (21, '7x', 'x', 'x', 1), (22, '7', 's', 's', 1)",
+            ],
+            &[
+                // golden: select_join_lookup.
+                JOIN_LOOKUP,
+                "SELECT docs.id, typeof(docs.category_id), categories.name \
+                 FROM docs JOIN categories ON docs.category_id = categories.id ORDER BY docs.id",
+                "SELECT docs.id, categories.name \
+                 FROM docs LEFT JOIN categories ON docs.category_id = categories.id \
+                 WHERE docs.id >= 20 ORDER BY docs.id",
+            ],
+            "join_rowid_probe_non_integer_keys",
+        )
+        .await;
+        let program = frank_program(&seeded_frank().await, JOIN_LOOKUP).await;
+        assert!(
+            program.iter().any(|(opcode, ..)| opcode == "SeekGE"),
+            "the outer loop seeks idx_docs_category: {program:?}"
+        );
+        assert!(
+            program
+                .windows(2)
+                .any(|w| w[0].0 == "MustBeInt" && w[1].0 == "SeekRowid"),
+            "the probe key is checked first: {program:?}"
+        );
+        // Every other rowid seek takes an index entry's integer rowid.
+        assert!(
+            program
+                .windows(2)
+                .all(|w| w[1].0 != "SeekRowid"
+                    || matches!(w[0].0.as_str(), "MustBeInt" | "IdxRowid")),
+            "no rowid seek on an unchecked key: {program:?}"
+        );
+    });
+}
+
+#[test]
+fn update_rewrites_in_place_and_restores_index_entries_like_stock() {
+    const UPDATE_WHERE: &str =
+        "UPDATE docs SET score = score + 1, title = 'updated' WHERE category_id = 7 AND score < 12";
+    asupersync::test_utils::run_test(|| async {
+        // golden: update_with_where_predicate, rowid unchanged (in place).
+        scenario(
+            &[],
+            &[UPDATE_WHERE],
+            &state_plus(&[
+                "SELECT id FROM docs WHERE title = 'updated' ORDER BY id",
+                "SELECT id FROM docs WHERE category_id = 7 ORDER BY id",
+                "PRAGMA integrity_check",
+            ]),
+            "update_in_place",
+        )
+        .await;
+        // Conflicts the statement ignores: each such row is restored with the
+        // index entries its rewrite removed.
+        scenario(
+            &["CREATE UNIQUE INDEX idx_docs_title_unique ON docs(title)"],
+            &[
+                "UPDATE OR IGNORE docs SET id = id + 1, title = upper(title)",
+                "UPDATE OR IGNORE docs SET title = 'beta', category_id = 9 WHERE id IN (1, 3)",
+            ],
+            &state_plus(&[
+                "SELECT id FROM docs WHERE title = 'alpha'",
+                "SELECT id FROM docs WHERE title = 'EPSILON'",
+                "SELECT id FROM docs WHERE title = 'beta'",
+                "SELECT id FROM docs WHERE category_id = 7 ORDER BY id",
+                "SELECT id FROM docs WHERE category_id = 9 ORDER BY id",
+                "PRAGMA integrity_check",
+            ]),
+            "update_conflict_restore",
+        )
+        .await;
+        let program = frank_program(&seeded_frank().await, UPDATE_WHERE).await;
+        let flags = |name: &str| {
+            program
+                .iter()
+                .filter(|(opcode, ..)| opcode == name)
+                .map(|(_, _, p5)| *p5)
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            flags("Delete").iter().any(|p5| p5 & 0x80 != 0),
+            "the rowid cannot change, so the row is rewritten in place: {program:?}"
+        );
+        assert!(
+            !flags("IdxDelete").is_empty() && flags("IdxDelete").iter().all(|p5| p5 & 0x10 != 0),
+            "UPDATE index deletes carry OPFLAG_ISUPDATE: {program:?}"
+        );
+    });
+}
+
+#[test]
+fn upsert_rowid_must_be_an_integer_like_stock() {
+    const DO_NOTHING: &str = "INSERT INTO docs (id, category_id, title, body, score) \
+         VALUES ('1', 2, 't', 'b', 10) ON CONFLICT (id) DO NOTHING";
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[],
+            &[
+                // golden: upsert_on_conflict_do_nothing, with keys MustBeInt
+                // converts ('1', 1.0) and keys it rejects (1.5, 'abc').
+                DO_NOTHING,
+                "INSERT INTO docs (id, category_id, title, body, score) \
+                 VALUES (1.0, 2, 't', 'b', 10) ON CONFLICT (id) DO NOTHING",
+                "INSERT INTO docs (id, category_id, title, body, score) \
+                 VALUES (1.5, 2, 't', 'b', 10) ON CONFLICT (id) DO NOTHING",
+                "INSERT INTO docs (id, category_id, title, body, score) \
+                 VALUES ('abc', 2, 't', 'b', 10) ON CONFLICT (id) DO NOTHING",
+                // golden: upsert_on_conflict_do_update; the rewrite's new rowid
+                // goes through MustBeInt as well.
+                "INSERT INTO docs (id, category_id, title, body, score) \
+                 VALUES (1, 7, 'x', 'x', 0) ON CONFLICT (id) DO UPDATE SET id = '42'",
+                "INSERT INTO docs (id, category_id, title, body, score) \
+                 VALUES (2, 7, 'x', 'x', 0) ON CONFLICT (id) DO UPDATE SET id = 4.5",
+            ],
+            &state_plus(&[
+                "SELECT id FROM docs WHERE title = 'alpha'",
+                "SELECT id FROM docs WHERE category_id = 7 ORDER BY id",
+                "PRAGMA integrity_check",
+            ]),
+            "upsert_rowid_must_be_int",
+        )
+        .await;
+        let program = frank_program(&seeded_frank().await, DO_NOTHING).await;
+        assert!(
+            program.iter().any(|(opcode, ..)| opcode == "MustBeInt"),
+            "the caller-supplied rowid goes through MustBeInt: {program:?}"
+        );
+    });
+}
