@@ -86574,7 +86574,7 @@ impl Connection {
         {
             return None;
         }
-        let (root_page, col_map, column_collations, column_affinities) = {
+        let (root_page, col_map, column_collations, column_affinities, declared_blob_columns) = {
             let schema = self.schema.borrow();
             let mut matches = schema
                 .iter()
@@ -86608,6 +86608,15 @@ impl Connection {
                 .iter()
                 .map(|column| affinity_char_to_type(column.affinity))
                 .collect();
+            // bd-6i9c5: every probe column is declared, so a typeless one has
+            // real BLOB affinity: `b.aid = CAST(a.id AS TEXT)` compares
+            // without conversion (6 does not match '6'), as on the join path.
+            let declared_blob_columns: HashSet<usize> = affinities
+                .iter()
+                .enumerate()
+                .filter(|(_, affinity)| **affinity == TypeAffinity::Blob)
+                .map(|(index, _)| index)
+                .collect();
             if !table.indexes.is_empty() {
                 let db = self.db.borrow();
                 if db.get_table(table.root_page)?.row_count()
@@ -86616,11 +86625,17 @@ impl Connection {
                     return None;
                 }
             }
-            (table.root_page, col_map, collations, affinities)
+            (
+                table.root_page,
+                col_map,
+                collations,
+                affinities,
+                declared_blob_columns,
+            )
         };
         let rowid_alias_column_index = self.rowid_alias_columns.borrow().get(&table_key).copied();
         let context = Arc::new(JoinEvalCollationContext {
-            declared_json_keys: HashSet::new(),
+            declared_json_keys: declared_blob_columns,
             column_collations,
             column_affinities,
             using_column_projections: HashMap::new(),
