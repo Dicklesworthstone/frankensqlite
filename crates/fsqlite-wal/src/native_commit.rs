@@ -305,7 +305,9 @@ pub struct WriteCoordinator {
 impl WriteCoordinator {
     /// Create a new coordinator for the given mode.
     ///
-    /// `initial_seq` is the highest committed sequence from recovery.
+    /// `initial_seq` sets a sequence baseline only; it does not restore the
+    /// marker chain, clock, or conflict index. Use [`Self::from_recovered_commits`]
+    /// when resuming a native marker stream.
     /// `group_commit_max` is the maximum batch size for group commit.
     #[must_use]
     pub fn new(mode: OperatingMode, initial_seq: CommitSeq, group_commit_max: usize) -> Self {
@@ -328,6 +330,57 @@ impl WriteCoordinator {
         }
     }
 
+    /// Reconstruct the coordinator from a verified stream starting at genesis.
+    ///
+    /// Each item pairs a committed marker with the complete write-set pages
+    /// decoded from its capsule. The caller must first verify capsule identity,
+    /// contents, and durability; this method does not read storage or validate
+    /// SSI proofs. It validates marker integrity, contiguous sequences, chain
+    /// links, and non-decreasing timestamps before restoring FCW history and
+    /// the append position. No partially restored coordinator escapes on error.
+    ///
+    /// This entrypoint requires the whole prefix from genesis, not a suffix
+    /// after a checkpoint whose conflict history is unavailable.
+    ///
+    /// # Errors
+    ///
+    /// Returns `WalCorrupt` if a marker is corrupt or does not extend the prefix.
+    pub fn from_recovered_commits(
+        mode: OperatingMode,
+        commits: impl IntoIterator<Item = (CommitMarker, Vec<PageNumber>)>,
+        group_commit_max: usize,
+    ) -> fsqlite_error::Result<Self> {
+        let mut coordinator = Self::new(mode, CommitSeq::ZERO, group_commit_max);
+        for (marker, pages) in commits {
+            let invalid = |reason: &str| fsqlite_error::FrankenError::WalCorrupt {
+                detail: format!("native commit recovery at {}: {reason}", marker.commit_seq),
+            };
+            if !marker.verify_integrity() {
+                return Err(invalid("marker integrity mismatch"));
+            }
+            if coordinator.commit_seq_tip.get().checked_add(1) != Some(marker.commit_seq.get()) {
+                return Err(invalid("non-contiguous marker sequence"));
+            }
+            if marker.prev_marker != coordinator.prev_marker_id {
+                return Err(invalid("marker chain link mismatch"));
+            }
+            if marker.commit_time_unix_ns < coordinator.last_commit_time_ns {
+                return Err(invalid("commit timestamp moved backwards"));
+            }
+
+            coordinator
+                .commit_index
+                .record_commit(&pages, marker.commit_seq);
+            coordinator.commit_seq_tip = marker.commit_seq;
+            coordinator.allocated_seq_tip = marker.commit_seq;
+            coordinator.last_commit_time_ns = marker.commit_time_unix_ns;
+            coordinator.prev_marker_id = Some(ObjectId::derive_from_canonical_bytes(
+                &marker.to_record_bytes(),
+            ));
+        }
+        Ok(coordinator)
+    }
+
     /// The current operating mode.
     #[must_use]
     pub const fn mode(&self) -> OperatingMode {
@@ -341,7 +394,7 @@ impl WriteCoordinator {
         self.commit_seq_tip
     }
 
-    /// Number of pending commits in the current group batch.
+    /// Number of queued commits, including completed results not yet collected.
     #[must_use]
     pub fn pending_count(&self) -> usize {
         self.batch.len()
@@ -423,7 +476,7 @@ impl WriteCoordinator {
 
         // Step 2: Allocate gap-free commit_seq
         let new_seq = self.allocated_seq_tip.next();
-        let commit_time = now_unix_ns.max(self.last_commit_time_ns.wrapping_add(1));
+        let commit_time = now_unix_ns.max(self.last_commit_time_ns.saturating_add(1));
 
         // Step 3: Build CommitProof (persisted as ECS object)
         let proof = CommitProof {
@@ -581,9 +634,20 @@ impl WriteCoordinator {
     /// span with epoch, group_size, and commit_seq range fields.
     /// Returns the committed results and records metrics.
     pub fn flush_batch(&mut self) -> Vec<CommitResult> {
-        let group_size = self.batch.len();
+        self.complete_pending_batch();
+        self.drain_committed()
+    }
+
+    /// Complete barriers without consuming any writer's acknowledgement.
+    fn complete_pending_batch(&mut self) {
+        let group_size = self
+            .batch
+            .pending
+            .iter()
+            .filter(|pc| !pc.barriers.all_complete())
+            .count();
         if group_size == 0 {
-            return Vec::new();
+            return;
         }
 
         let start = Instant::now();
@@ -601,7 +665,6 @@ impl WriteCoordinator {
 
         let fsync1_count = self.fsync1();
         let markers = self.append_markers_and_fsync2();
-        let results = self.drain_committed();
 
         #[allow(clippy::cast_possible_truncation)]
         let latency_us = start.elapsed().as_micros() as u64;
@@ -613,28 +676,42 @@ impl WriteCoordinator {
             group_size,
             fsync1_count,
             markers_appended = markers.len(),
-            committed = results.len(),
+            committed = group_size,
             latency_us,
             "parallel_wal_commit complete"
         );
-
-        results
     }
 
     /// Convenience: submit, fsync1, append markers, fsync2, drain.
     ///
     /// Processes a single submission through the entire protocol.
     /// In production, submissions are batched; this is for testing and
-    /// single-commit workloads.
+    /// single-commit workloads. Earlier submissions are completed in order,
+    /// but their acknowledgements remain available to [`Self::drain_committed`]
+    /// or [`Self::flush_batch`]; only this submission's result is consumed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal batch loses a successfully submitted entry.
     pub fn submit_and_commit(
         &mut self,
         submission: CommitSubmission,
         now_unix_ns: u64,
     ) -> CommitResult {
         match self.submit(submission, now_unix_ns) {
-            Ok(_seq) => {
-                let mut results = self.flush_batch();
-                results.pop().unwrap_or(CommitResult::ShuttingDown)
+            Ok(seq) => {
+                self.complete_pending_batch();
+                let own = self
+                    .batch
+                    .pending
+                    .pop_back()
+                    .expect("submitted commit is pending");
+                debug_assert_eq!(own.allocated_seq, seq);
+                debug_assert!(own.barriers.all_complete());
+                CommitResult::Committed {
+                    commit_seq: own.allocated_seq,
+                    commit_time_unix_ns: own.allocated_time_ns,
+                }
             }
             Err(result) => result,
         }
@@ -1157,6 +1234,234 @@ mod tests {
         assert_eq!(coord.append_markers_and_fsync2().len(), 2);
         assert_eq!(coord.commit_seq_tip(), CommitSeq::new(12));
         assert_eq!(coord.drain_committed().len(), 2);
+    }
+
+    #[test]
+    fn test_single_commit_preserves_earlier_writer_acknowledgements() {
+        let _metrics_guard = group_commit_metrics_test_guard();
+        let mut coord = WriteCoordinator::new(OperatingMode::Native, CommitSeq::ZERO, 16);
+        coord.submit(make_submission(&[1], 0, 1), 100).unwrap();
+        coord.submit(make_submission(&[2], 0, 2), 200).unwrap();
+
+        assert_eq!(
+            coord.submit_and_commit(make_submission(&[3], 0, 3), 300),
+            CommitResult::Committed {
+                commit_seq: CommitSeq::new(3),
+                commit_time_unix_ns: 300,
+            }
+        );
+        assert_eq!(coord.commit_seq_tip(), CommitSeq::new(3));
+        assert_eq!(coord.pending_count(), 2);
+        assert_eq!(
+            coord.drain_committed(),
+            vec![
+                CommitResult::Committed {
+                    commit_seq: CommitSeq::new(1),
+                    commit_time_unix_ns: 100,
+                },
+                CommitResult::Committed {
+                    commit_seq: CommitSeq::new(2),
+                    commit_time_unix_ns: 200,
+                },
+            ]
+        );
+        assert!(coord.drain_committed().is_empty());
+        assert!(coord.flush_batch().is_empty());
+    }
+
+    #[test]
+    fn test_repeated_single_commits_do_not_recount_uncollected_results() {
+        let _metrics_guard = group_commit_metrics_test_guard();
+        GLOBAL_GROUP_COMMIT_METRICS.reset();
+        let mut coord = WriteCoordinator::new(OperatingMode::Native, CommitSeq::ZERO, 16);
+        coord.submit(make_submission(&[1], 0, 1), 100).unwrap();
+        for seed in 2_u8..=3 {
+            assert!(matches!(
+                coord.submit_and_commit(
+                    make_submission(&[u32::from(seed)], 0, seed),
+                    u64::from(seed) * 100,
+                ),
+                CommitResult::Committed { commit_seq, .. }
+                    if commit_seq.get() == u64::from(seed)
+            ));
+            assert_eq!(coord.pending_count(), 1);
+        }
+
+        assert_eq!(coord.current_epoch(), 2);
+        assert_eq!(
+            coord.flush_batch(),
+            vec![CommitResult::Committed {
+                commit_seq: CommitSeq::new(1),
+                commit_time_unix_ns: 100,
+            }]
+        );
+        assert_eq!(coord.current_epoch(), 2);
+        let metrics = GLOBAL_GROUP_COMMIT_METRICS.snapshot();
+        assert_eq!(metrics.group_commits_total, 2);
+        assert_eq!(metrics.group_commit_size_sum, 3);
+        assert_eq!(metrics.fsync1_total, 2);
+        assert_eq!(metrics.fsync2_total, 2);
+    }
+
+    #[test]
+    fn test_rejected_single_commit_does_not_consume_pending_writers() {
+        let _metrics_guard = group_commit_metrics_test_guard();
+        let mut coord = WriteCoordinator::new(OperatingMode::Native, CommitSeq::ZERO, 16);
+        coord.submit(make_submission(&[1], 0, 1), 100).unwrap();
+        assert!(matches!(
+            coord.submit_and_commit(make_submission(&[1], 0, 2), 200),
+            CommitResult::ConflictFcw { .. }
+        ));
+        assert_eq!(coord.pending_count(), 1);
+        assert_eq!(coord.commit_seq_tip(), CommitSeq::ZERO);
+        assert!(coord.drain_committed().is_empty());
+        coord.initiate_shutdown();
+        assert_eq!(
+            coord.flush_batch(),
+            vec![CommitResult::Committed {
+                commit_seq: CommitSeq::new(1),
+                commit_time_unix_ns: 100,
+            }]
+        );
+        assert!(coord.drain_committed().is_empty());
+    }
+
+    #[test]
+    fn test_recovery_restores_marker_chain_clock_and_fcw() {
+        let _metrics_guard = group_commit_metrics_test_guard();
+        let first = CommitMarker::new(
+            CommitSeq::new(1),
+            100,
+            make_oid(1),
+            make_oid(11),
+            None,
+        );
+        let first_id = ObjectId::derive_from_canonical_bytes(&first.to_record_bytes());
+        let second = CommitMarker::new(
+            CommitSeq::new(2),
+            200,
+            make_oid(2),
+            make_oid(12),
+            Some(first_id),
+        );
+        let second_id = ObjectId::derive_from_canonical_bytes(&second.to_record_bytes());
+        // Exercise actual marker wire encoding, not just copying coordinator fields.
+        let first = CommitMarker::from_record_bytes(&first.to_record_bytes()).unwrap();
+        let second = CommitMarker::from_record_bytes(&second.to_record_bytes()).unwrap();
+        let mut coord = WriteCoordinator::from_recovered_commits(
+            OperatingMode::Native,
+            vec![
+                (first, vec![PageNumber::new(1).unwrap()]),
+                (second, vec![PageNumber::new(2).unwrap()]),
+            ],
+            16,
+        )
+        .unwrap();
+        assert_eq!(coord.commit_seq_tip(), CommitSeq::new(2));
+        assert_eq!(coord.pending_count(), 0);
+        assert!(coord.drain_committed().is_empty());
+        assert!(matches!(
+            coord.validate(&make_submission(&[1], 0, 3)),
+            Err(CommitResult::ConflictFcw { .. })
+        ));
+        assert!(coord.validate(&make_submission(&[1], 1, 3)).is_ok());
+        assert!(matches!(
+            coord.validate(&make_submission(&[2], 1, 3)),
+            Err(CommitResult::ConflictFcw { .. })
+        ));
+
+        assert_eq!(
+            coord.submit(make_submission(&[3], 2, 3), 50).unwrap(),
+            CommitSeq::new(3)
+        );
+        assert_eq!(coord.commit_seq_tip(), CommitSeq::new(2));
+        coord.fsync1();
+        let markers = coord.append_markers_and_fsync2();
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].prev_marker, Some(second_id));
+        assert_eq!(markers[0].commit_time_unix_ns, 201);
+        assert!(markers[0].verify_integrity());
+        assert_eq!(coord.drain_committed().len(), 1);
+    }
+
+    #[test]
+    fn test_recovery_rejects_corrupt_or_discontinuous_marker_streams() {
+        let first = || {
+            CommitMarker::new(CommitSeq::new(1), 100, make_oid(1), make_oid(11), None)
+        };
+        let first_id = ObjectId::derive_from_canonical_bytes(&first().to_record_bytes());
+        let second = |seq, time, previous| {
+            CommitMarker::new(CommitSeq::new(seq), time, make_oid(2), make_oid(12), previous)
+        };
+        let mut corrupt = second(2, 200, Some(first_id));
+        corrupt.commit_time_unix_ns = 201;
+        for (candidate, reason) in [
+            (corrupt, "integrity mismatch"),
+            (second(3, 200, Some(first_id)), "non-contiguous"),
+            (second(1, 200, Some(first_id)), "non-contiguous"),
+            (second(2, 200, None), "chain link mismatch"),
+            (second(2, 200, Some(make_oid(99))), "chain link mismatch"),
+            (second(2, 99, Some(first_id)), "timestamp moved backwards"),
+        ] {
+            let error = WriteCoordinator::from_recovered_commits(
+                OperatingMode::Native,
+                vec![(first(), Vec::new()), (candidate, Vec::new())],
+                16,
+            )
+            .expect_err("invalid stream must not produce a coordinator");
+            assert!(error.to_string().contains(reason), "{error}");
+        }
+        for candidate in [second(0, 100, None), second(10, 100, None)] {
+            assert!(WriteCoordinator::from_recovered_commits(
+                OperatingMode::Native,
+                vec![(candidate, Vec::new())],
+                16,
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn test_recovery_of_empty_stream_starts_at_genesis() {
+        let _metrics_guard = group_commit_metrics_test_guard();
+        let mut coord = WriteCoordinator::from_recovered_commits(
+            OperatingMode::Native,
+            std::iter::empty(),
+            16,
+        )
+        .unwrap();
+        assert_eq!(coord.commit_seq_tip(), CommitSeq::ZERO);
+        coord.submit(make_submission(&[1], 0, 1), 100).unwrap();
+        coord.fsync1();
+        let markers = coord.append_markers_and_fsync2();
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].commit_seq, CommitSeq::new(1));
+        assert!(markers[0].prev_marker.is_none());
+    }
+
+    #[test]
+    fn test_recovered_clock_never_wraps_backwards() {
+        let _metrics_guard = group_commit_metrics_test_guard();
+        let marker = CommitMarker::new(
+            CommitSeq::new(1),
+            u64::MAX,
+            make_oid(1),
+            make_oid(11),
+            None,
+        );
+        let mut coord = WriteCoordinator::from_recovered_commits(
+            OperatingMode::Native,
+            vec![(marker, Vec::new())],
+            16,
+        )
+        .unwrap();
+        assert_eq!(
+            coord.submit_and_commit(make_submission(&[1], 1, 2), 1),
+            CommitResult::Committed {
+                commit_seq: CommitSeq::new(2),
+                commit_time_unix_ns: u64::MAX,
+            }
+        );
     }
 
     // ── bd-14m.2.1: Group commit observability metrics ──
