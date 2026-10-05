@@ -51284,6 +51284,67 @@ mod tests {
     }
 
     #[test]
+    fn test_keyed_wait_slot_single_signal_wakes_every_counted_sync_waiter() {
+        // bd-ih8ak: `signal` skips the condvar wake when it counts no sync
+        // waiter. Each round, every waiter reads the generation before the
+        // signaller signals exactly once, so a waiter that registers in the
+        // gap must still be woken by that one signal. A missed wake is not
+        // reported as TimedOut (wait_timeout_while re-checks the generation,
+        // which has moved by then); it costs the whole wait timeout instead,
+        // so each wait must end well before that timeout.
+        const WAITERS: usize = 4;
+        const ROUNDS: usize = 2_000;
+        const WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+        // A waiter records a missed round instead of panicking (a panic would
+        // leave the others parked on the barrier); every participant reads the
+        // record right after the next barrier, so all of them stop together.
+        const NO_MISS: usize = usize::MAX;
+        let slot = Arc::new(KeyedWaitSlot::default());
+        let observed = Arc::new(std::sync::Barrier::new(WAITERS + 1));
+        let first_missed_round = Arc::new(AtomicUsize::new(NO_MISS));
+        let handles: Vec<_> = (0..WAITERS)
+            .map(|_| {
+                let slot = Arc::clone(&slot);
+                let observed = Arc::clone(&observed);
+                let first_missed_round = Arc::clone(&first_missed_round);
+                std::thread::spawn(move || {
+                    for round in 0..ROUNDS {
+                        let generation = slot.generation();
+                        observed.wait();
+                        if first_missed_round.load(AtomicOrdering::Acquire) != NO_MISS {
+                            return;
+                        }
+                        let started = std::time::Instant::now();
+                        let woken = slot.wait_for_change(generation, WAIT_TIMEOUT)
+                            == KeyedWaitResult::Signaled
+                            && started.elapsed() < WAIT_TIMEOUT / 2;
+                        if !woken {
+                            first_missed_round.fetch_min(round, AtomicOrdering::AcqRel);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for _ in 0..ROUNDS {
+            observed.wait();
+            if first_missed_round.load(AtomicOrdering::Acquire) != NO_MISS {
+                break;
+            }
+            slot.signal();
+        }
+        for handle in handles {
+            handle.join().expect("waiter thread should not panic");
+        }
+        let missed = first_missed_round.load(AtomicOrdering::Acquire);
+        assert_eq!(
+            missed, NO_MISS,
+            "bead_id={BEAD_ID} case=keyed_wait_slot_lost_wakeup: in round {missed} the signal \
+             never woke a waiter, which waited out its timeout"
+        );
+        assert_eq!(slot.sync_waiters.load(AtomicOrdering::Acquire), 0);
+    }
+
+    #[test]
     fn test_epoch_wake_reason_classification_is_mutually_exclusive() {
         assert_eq!(
             completed_epoch_wake_reason(None),

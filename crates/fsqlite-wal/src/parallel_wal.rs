@@ -5877,6 +5877,49 @@ mod tests {
     }
 
     #[test]
+    fn contended_blocking_residue_claims_never_sleep_through_a_release() {
+        // bd-ih8ak: a release notifies only when it counts a blocking
+        // claimant. Each thread holds the residue across a yield so others
+        // contend, sleep and are woken; a lost wakeup strands a claimant once
+        // the other threads finish, which the watchdog turns into a failure.
+        const THREADS: usize = 8;
+        const CLAIMS: usize = 5_000;
+        let combiner = Arc::new(ParallelWalDurabilityCombiner::default());
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let combiner = Arc::clone(&combiner);
+                let done_tx = done_tx.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..CLAIMS {
+                        let guard = combiner.claim_ordered_residue_blocking();
+                        std::thread::yield_now();
+                        drop(guard);
+                    }
+                    done_tx
+                        .send(())
+                        .expect("test should collect every claimant");
+                })
+            })
+            .collect();
+        for _ in 0..THREADS {
+            done_rx
+                .recv_timeout(Duration::from_secs(60))
+                .expect("a blocking claimant slept through a residue release (lost wakeup)");
+        }
+        for handle in handles {
+            handle.join().expect("claimant thread should finish");
+        }
+        assert_eq!(
+            combiner
+                .ordered_residue_blocking_waiters
+                .load(Ordering::Acquire),
+            0
+        );
+        assert!(!combiner.ordered_residue_claimed.load(Ordering::Acquire));
+    }
+
+    #[test]
     fn synchronous_combiner_waits_for_the_active_ordered_residue() {
         let combiner = Arc::new(ParallelWalDurabilityCombiner::default());
         let (first_entered_tx, first_entered_rx) = std::sync::mpsc::channel();
