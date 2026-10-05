@@ -8,6 +8,7 @@ impl Connection {
     ) -> Result<Vec<Row>> {
         let quick = pragma.name.name.eq_ignore_ascii_case("quick_check");
         let max_errors = integrity_check_error_limit(pragma.value.as_ref());
+        let scope = integrity_check_table_scope(pragma.value.as_ref());
         let mut failures = Vec::new();
         // bd-svwm7: a lock conflict is not a verdict. Stock SQLite fails the
         // statement with SQLITE_BUSY, so busy_timeout and the autocommit retry
@@ -20,7 +21,6 @@ impl Connection {
             failures.push(error.to_string());
         } else {
             // Rows are only readable once the B-trees they live in are sound.
-            let scope = integrity_check_table_scope(pragma.value.as_ref());
             match self
                 .integrity_check_row_constraints(scope.as_deref(), max_errors)
                 .await
@@ -34,7 +34,9 @@ impl Connection {
         // Qualified attached PRAGMAs already delegate to their child Connection.
         // Unqualified whole-database checks must also visit every attachment;
         // a clean main database alone cannot establish an aggregate "ok" verdict.
-        if pragma.name.schema.is_none() {
+        // A table argument is a partial check, not a request to inspect the
+        // same table name (or unrelated corruption) in every attached schema.
+        if pragma.name.schema.is_none() && scope.is_none() {
             let attached_schemas = self
                 .attached_schemas
                 .borrow()
@@ -44,21 +46,29 @@ impl Connection {
                 .map(str::to_owned)
                 .collect::<Vec<_>>();
             for schema in attached_schemas {
-                // The existing validator reports at most one failure per
-                // database. N caps diagnostics across the entire traversal.
+                // N caps all findings, not just structural errors, across
+                // the entire traversal. Do not reset the budget per schema.
                 if failures.len() >= max_errors {
                     break;
                 }
-                if let Err(error) = self
+                let remaining = max_errors - failures.len();
+                match self
                     .with_attached_connection_async(&schema, async |child| {
-                        child.validate_database_integrity(quick).await
+                        // A sound B-tree does not establish that its stored
+                        // rows obey NOT NULL/CHECK constraints. Apply exactly
+                        // the same second phase as the main-database check.
+                        child.validate_database_integrity(quick).await?;
+                        child.integrity_check_row_constraints(None, remaining).await
                     })
                     .await
                 {
-                    if error.is_transient() {
-                        return Err(error);
+                    // SQLite's row-constraint diagnostics are not prefixed
+                    // with the database name, including for attached tables.
+                    Ok(reports) => failures.extend(reports),
+                    Err(error) if error.is_transient() => return Err(error),
+                    Err(error) => {
+                        failures.push(format!("*** in database {schema} ***\n{error}"));
                     }
-                    failures.push(format!("*** in database {schema} ***\n{error}"));
                 }
             }
         }
@@ -725,7 +735,7 @@ mod tests {
             conn.execute("CREATE TABLE main_t(id INTEGER PRIMARY KEY);")
                 .await
                 .unwrap();
-            conn.execute("INSERT INTO main_t VALUES (1);")
+            conn.execute("INSERT INTO main_t DEFAULT VALUES;")
                 .await
                 .unwrap();
 
@@ -917,3 +927,6 @@ mod tests {
         });
     }
 }
+
+#[cfg(test)]
+mod integrity_regressions;
