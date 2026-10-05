@@ -4,6 +4,9 @@
 //! This module implements the read-path lookup algorithm used by Native mode:
 //! cache -> presence filter -> index scan -> fetch+materialize.
 
+/// Existing B-tree algorithms backed by native page transactions.
+pub mod btree;
+
 use std::collections::BTreeMap;
 
 use crate::commit_marker::{
