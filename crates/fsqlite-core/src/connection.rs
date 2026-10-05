@@ -134654,34 +134654,34 @@ fn type_affinity_to_char(affinity: TypeAffinity) -> char {
 }
 
 /// Format a `DefaultValue` AST node as SQL text for PRAGMA table_info output.
-/// Whether an ALTER TABLE ADD COLUMN default is a literal constant.
+/// Whether an ALTER TABLE ADD COLUMN default is a constant SQLite can fold.
 ///
-/// On a non-empty table, C SQLite requires the ADD COLUMN default to be a
-/// literal (or a signed number literal) — not an expression, function call, or
-/// CURRENT_TIME/DATE/TIMESTAMP — because it back-fills existing rows with one
-/// evaluated value (bd-gh-alter-add-column-defaults, GH #231).
+/// On a non-empty table, C SQLite back-fills existing rows with one value, so
+/// it accepts exactly the defaults `sqlite3ValueFromExpr` folds to a value:
+/// a literal (not CURRENT_TIME/DATE/TIMESTAMP), unary plus or minus of a
+/// foldable operand at any depth (minus numerifies it, so `-'5x'` is -5), and
+/// a CAST of a foldable operand. Arithmetic, functions and COLLATE are
+/// "non-constant" (bd-gh-alter-add-column-defaults, GH #231, bd-az48n).
 fn add_column_default_is_literal_constant(dv: &DefaultValue) -> bool {
-    use fsqlite_ast::{Expr, Literal, UnaryOp};
     let expr = match dv {
         DefaultValue::Expr(expr) | DefaultValue::ParenExpr(expr) => expr,
     };
-    let is_plain_literal = |lit: &Literal| {
-        !matches!(
+    add_column_default_expr_folds(expr)
+}
+
+fn add_column_default_expr_folds(expr: &Expr) -> bool {
+    use fsqlite_ast::{Literal, UnaryOp};
+    match expr {
+        Expr::Literal(lit, _) => !matches!(
             lit,
             Literal::CurrentTime | Literal::CurrentDate | Literal::CurrentTimestamp
-        )
-    };
-    match expr {
-        Expr::Literal(lit, _) => is_plain_literal(lit),
-        // A signed number literal, e.g. DEFAULT (-5) / DEFAULT (+5).
+        ),
         Expr::UnaryOp {
             op: UnaryOp::Negate | UnaryOp::Plus,
             expr: inner,
             ..
-        } => matches!(
-            inner.as_ref(),
-            Expr::Literal(Literal::Integer(_) | Literal::Float(_), _)
-        ),
+        }
+        | Expr::Cast { expr: inner, .. } => add_column_default_expr_folds(inner),
         _ => false,
     }
 }
