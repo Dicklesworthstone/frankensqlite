@@ -226,7 +226,8 @@ use fsqlite_vdbe::codegen::{
     PlannerIndexRangeBound, PlannerIndexRangeTarget, PlannerSelectAccessKind,
     SelectPlannerDirective, TableSchema, bind_explicit_index, codegen_delete, codegen_insert,
     codegen_select, codegen_update, emit_backfill_column_read, emit_backfill_key_expr,
-    emit_scan_filter, without_rowid_index_appended_pk, without_rowid_pk_indices,
+    emit_scan_filter, join_select_seeks_outer_table, without_rowid_index_appended_pk,
+    without_rowid_pk_indices,
 };
 #[cfg(not(test))]
 use fsqlite_vdbe::engine::set_vdbe_metrics_enabled;
@@ -24240,6 +24241,10 @@ impl Connection {
             && !self.time_travel_active.get()
             && !*self.reject_mem_fallback_strict.borrow()
             && join_prefers_memdb_hash_dispatch(select)
+            // bd-8c68u: the hash join reads both tables in full; a VDBE join
+            // that seeks its outer table to the rows the WHERE pins reads a
+            // handful (a trigger guard's join probe runs once per row).
+            && !join_select_seeks_outer_table(select, &self.schema.borrow())
     }
 
     #[must_use]
@@ -87225,7 +87230,12 @@ impl Connection {
                     // reusable program or planner directive. Recompile this
                     // runtime-bound subquery instead of allowing one outer
                     // source's metadata to poison another's result.
-                    let _cache_guard = BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true);
+                    // bd-8c68u: a parameterized one (a trigger WHEN guard) is
+                    // identified by its text and reuses its program.
+                    let _cache_guard = BoolCellRestoreGuard::new(
+                        &self.bypass_compiled_cache,
+                        !nested_exists_reuses_compiled_program(&sub_clone),
+                    );
                     let rows = execute_nested_select(sub_clone).await?;
                     Ok(rows
                         .into_iter()
@@ -87272,7 +87282,11 @@ impl Connection {
                     // instead of the full scan a bound-outer target otherwise forces —
                     // the quadratic bulk-ingest half of the trigger-WHEN EXISTS guard.
                     self.relax_correlated_exists_equalities_for_seek(&mut sub_clone);
-                    if sub_clone.limit.is_none() {
+                    // bd-8c68u: a join the VDBE compiles (with its index and
+                    // rowid seeks) refuses a LIMIT, which would route the probe
+                    // to the materializing join executor and scan both tables
+                    // per probe. EXISTS needs no LIMIT for its answer.
+                    if sub_clone.limit.is_none() && !select_join_is_vdbe_eligible(&sub_clone) {
                         sub_clone.limit = Some(fsqlite_ast::LimitClause {
                             limit: Expr::Literal(Literal::Integer(1), fsqlite_ast::Span::new(0, 0)),
                             offset: None,
@@ -87406,6 +87420,7 @@ impl Connection {
                                     col_map,
                                     None,
                                     allow_vector_left,
+                                    params,
                                 )
                                 .await?;
                             &left_materialized
@@ -87423,6 +87438,7 @@ impl Connection {
                                     col_map,
                                     None,
                                     allow_vector_right,
+                                    params,
                                 )
                                 .await?;
                             &right_materialized
@@ -97319,6 +97335,9 @@ impl Connection {
         self.inline_subqueries_in_expr_with_using(expr, row, outer_col_map, None)
     }
 
+    /// `params` are the bind parameters of the expression being evaluated; a
+    /// subquery operand runs with them (bd-8c68u: a trigger WHEN guard binds
+    /// OLD/NEW inside it as parameters).
     fn inline_in_comparison_operand<'a>(
         &'a self,
         expr: &'a Expr,
@@ -97326,6 +97345,7 @@ impl Connection {
         outer_col_map: &'a [(String, String, bool)],
         using_skip: Option<&'a HashSet<usize>>,
         allow_vector_subquery: bool,
+        params: Option<&'a [SqliteValue]>,
     ) -> Pin<Box<dyn Future<Output = Result<Expr>> + 'a>> {
         Box::pin(async move {
             match expr {
@@ -97342,9 +97362,15 @@ impl Connection {
                     if !allow_vector_subquery {
                         self.validate_scalar_subquery_column_count(&donor_subquery)?;
                     }
-                    let _cache_guard = BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true);
+                    // As for a scalar subquery in eval_expr_with_subqueries: a
+                    // parameterized one without BoundOuterValue leaves is
+                    // identified by its text and reuses its program.
+                    let _cache_guard = BoolCellRestoreGuard::new(
+                        &self.bypass_compiled_cache,
+                        !nested_exists_reuses_compiled_program(&bound_subquery),
+                    );
                     let rows = self
-                        .execute_statement(&Statement::Select(bound_subquery), None)
+                        .execute_statement(&Statement::Select(bound_subquery), params)
                         .await?;
                     self.materialize_scalar_subquery_in_operand(&donor_subquery, rows, *span)
                 }
@@ -97358,6 +97384,7 @@ impl Connection {
                                 outer_col_map,
                                 using_skip,
                                 false,
+                                params,
                             )
                             .await?,
                         );
@@ -97461,6 +97488,7 @@ impl Connection {
                                 outer_col_map,
                                 using_skip,
                                 allow_vector_left,
+                                None,
                             )
                             .await?;
                         let r = self
@@ -97470,6 +97498,7 @@ impl Connection {
                                 outer_col_map,
                                 using_skip,
                                 allow_vector_right,
+                                None,
                             )
                             .await?;
                         return Ok(Expr::BinaryOp {
@@ -97616,6 +97645,7 @@ impl Connection {
                                         outer_col_map,
                                         using_skip,
                                         false,
+                                        None,
                                     )
                                     .await?,
                                 );
@@ -97625,7 +97655,14 @@ impl Connection {
                         other => other.clone(),
                     };
                     let new_inner = self
-                        .inline_in_comparison_operand(inner, row, outer_col_map, using_skip, true)
+                        .inline_in_comparison_operand(
+                            inner,
+                            row,
+                            outer_col_map,
+                            using_skip,
+                            true,
+                            None,
+                        )
                         .await?;
                     if runtime_empty_subquery {
                         return Ok(empty_in_result_after_evaluating_lhs(new_inner, *not, *span));
@@ -107722,7 +107759,12 @@ fn is_syntactic_join_key_expr(expr: &Expr) -> bool {
 
 fn join_expr_is_vdbe_eligible(expr: &Expr) -> bool {
     match expr {
-        Expr::Column(_, _) | Expr::Literal(_, _) => true,
+        // bd-8c68u: JOIN codegen reads a numbered parameter like a literal; an
+        // anonymous or named one needs statement-wide slot numbering it
+        // does not do.
+        Expr::Column(_, _)
+        | Expr::Literal(_, _)
+        | Expr::Placeholder(fsqlite_ast::PlaceholderType::Numbered(_), _) => true,
         Expr::BinaryOp {
             left, op, right, ..
         } => {
@@ -150053,14 +150095,15 @@ fn trigger_bound_param(
 }
 
 /// Bind a trigger WHEN clause against `frame` (bd-ry6x7). OLD/NEW references
-/// inside an EXISTS that is a leaf of the clause's AND / OR / NOT skeleton
-/// become `?N` parameters, whose values are returned in order; every other
-/// reference becomes a literal, as in all other trigger bindings.
+/// inside an EXISTS or scalar subquery that is a leaf of the clause's AND / OR
+/// / NOT skeleton, or an operand of a comparison leaf (bd-8c68u), become `?N`
+/// parameters, whose values are returned in order; every other reference
+/// becomes a literal, as in all other trigger bindings.
 ///
-/// Only those EXISTS leaves are parameterized because the WHEN evaluator runs
-/// them as nested statements with the parameters bound. Other subquery
-/// positions (a comparison operand, for one) are materialized through helpers
-/// that execute without parameters, so they keep literals.
+/// Only those subqueries are parameterized because the WHEN evaluator runs
+/// them as nested statements with the parameters bound. Subqueries nested
+/// deeper in an expression are materialized through helpers that execute
+/// without parameters, so they keep literals.
 fn bind_trigger_when_expr(expr: &mut Expr, frame: &TriggerFrame) -> Vec<SqliteValue> {
     collect_trigger_bound_params(false, || bind_trigger_when_skeleton(expr, frame))
 }
@@ -150117,9 +150160,38 @@ fn bind_trigger_when_skeleton(expr: &mut Expr, frame: &TriggerFrame) {
             expr: inner,
             ..
         } => bind_trigger_when_skeleton(inner, frame),
-        Expr::Exists { subquery, .. } => {
+        Expr::Exists { subquery, .. } | Expr::Subquery(subquery, _) => {
             let _subquery_scope = TriggerWhenSubqueryScope::enter();
             bind_trigger_columns_in_select_statement(subquery, frame);
+        }
+        // bd-8c68u: a scalar subquery compared with a value (`(SELECT count(*)
+        // FROM u WHERE u.k = NEW.k) = 0`) runs with the clause's parameters
+        // too (eval_expr_with_subqueries / inline_in_comparison_operand), so
+        // it binds them and compiles once.
+        Expr::BinaryOp {
+            left,
+            op:
+                BinaryOp::Eq
+                | BinaryOp::Ne
+                | BinaryOp::Lt
+                | BinaryOp::Le
+                | BinaryOp::Gt
+                | BinaryOp::Ge
+                | BinaryOp::Is
+                | BinaryOp::IsNot,
+            right,
+            ..
+        } if matches!(left.as_ref(), Expr::Subquery(..))
+            || matches!(right.as_ref(), Expr::Subquery(..)) =>
+        {
+            for operand in [left.as_mut(), right.as_mut()] {
+                if let Expr::Subquery(subquery, _) = operand {
+                    let _subquery_scope = TriggerWhenSubqueryScope::enter();
+                    bind_trigger_columns_in_select_statement(subquery, frame);
+                } else {
+                    bind_trigger_columns_in_expr(operand, frame);
+                }
+            }
         }
         _ => bind_trigger_columns_in_expr(expr, frame),
     }

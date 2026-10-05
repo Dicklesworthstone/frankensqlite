@@ -12184,6 +12184,346 @@ fn emit_join_lookup_match(
     }
 }
 
+/// bd-8c68u: how a single-join lookup reaches its outer rows when the WHERE
+/// pins an outer column with `=` to a literal or a numbered parameter,
+/// instead of scanning the whole outer table on every execution (a trigger
+/// guard `EXISTS (SELECT 1 FROM journal JOIN member ON member.id =
+/// journal.mid WHERE journal.pid = ?1 AND ...)` scanned `journal` once per
+/// guarded row). The full WHERE is still evaluated for every row reached, so
+/// a seek only has to reach every outer row whose key equals the probe.
+enum OuterEqualitySeek<'a> {
+    /// `outer.rowid = probe` (or its INTEGER PRIMARY KEY alias): one
+    /// SeekRowid, with the inner rowid lookup's NULL / non-integer handling.
+    Rowid { probe: &'a Expr },
+    /// `outer.col = probe` over an index led by `col` whose key order agrees
+    /// with the comparison (the GH#409 / bd-ry6x7 rule of
+    /// `codegen_select_index_equality_scan`): statically for an INTEGER
+    /// literal on INTEGER affinity or a TEXT literal on BINARY TEXT, or at
+    /// run time for a parameter of that storage class (`runtime_type_mask`,
+    /// any other value scans the outer table as before).
+    Index {
+        index: &'a IndexSchema,
+        probe: &'a Expr,
+        runtime_type_mask: Option<u16>,
+    },
+}
+
+/// bd-8c68u: whether `codegen_join_select` seeks the outer table of `stmt`.
+///
+/// True when the two-table join compiles to the single-join lookup whose
+/// outer loop seeks ([`OuterEqualitySeek`]). That plan reads only the outer
+/// rows the WHERE pins, so a caller choosing between it and a strategy that
+/// reads both tables in full (the in-memory hash join) should take it.
+#[must_use]
+pub fn join_select_seeks_outer_table(stmt: &SelectStatement, schema: &[TableSchema]) -> bool {
+    let SelectCore::Select {
+        columns,
+        from: Some(from),
+        where_clause,
+        ..
+    } = &stmt.body.select
+    else {
+        return false;
+    };
+    let [join] = from.joins.as_slice() else {
+        return false;
+    };
+    let (
+        TableOrSubquery::Table {
+            name: left_name,
+            alias: left_alias,
+            ..
+        },
+        TableOrSubquery::Table {
+            name: right_name,
+            alias: right_alias,
+            ..
+        },
+    ) = (&from.source, &join.table)
+    else {
+        return false;
+    };
+    let (Ok(left_table), Ok(right_table)) = (
+        find_table(schema, &left_name.name),
+        find_table(schema, &right_name.name),
+    ) else {
+        return false;
+    };
+    let Some(fsqlite_ast::JoinConstraint::On(on_expr)) = &join.constraint else {
+        return false;
+    };
+    let (left_alias, right_alias) = (left_alias.as_deref(), right_alias.as_deref());
+    let Some(plan) = resolve_single_join_lookup_plan(
+        left_table,
+        left_alias,
+        right_table,
+        right_alias,
+        join.join_type.kind,
+        Some(on_expr),
+    ) else {
+        return false;
+    };
+    let where_clause = where_clause.as_deref();
+    // Mirror codegen_join_select's choice of the driving table.
+    if !columns
+        .iter()
+        .any(|column| matches!(column, ResultColumn::Star))
+        && swapped_join_lookup_plan_avoiding_text_walk(
+            &plan,
+            left_table,
+            left_alias,
+            right_table,
+            right_alias,
+            Some(on_expr),
+        )
+        .is_some()
+    {
+        return resolve_outer_equality_seek(
+            where_clause,
+            right_table,
+            right_alias,
+            left_table,
+            left_alias,
+        )
+        .is_some();
+    }
+    resolve_outer_equality_seek(where_clause, left_table, left_alias, right_table, right_alias)
+        .is_some()
+}
+
+fn resolve_outer_equality_seek<'a>(
+    where_clause: Option<&'a Expr>,
+    left_table: &'a TableSchema,
+    left_alias: Option<&str>,
+    right_table: &TableSchema,
+    right_alias: Option<&str>,
+) -> Option<OuterEqualitySeek<'a>> {
+    if left_table.without_rowid {
+        return None;
+    }
+    let mut conjuncts = Vec::new();
+    collect_conjunctive_terms(where_clause?, &mut conjuncts);
+    let mut index_seek = None;
+    for term in conjuncts {
+        let Expr::BinaryOp {
+            left,
+            op: BinaryOp::Eq,
+            right,
+            ..
+        } = term
+        else {
+            continue;
+        };
+        for (column, probe) in [(left.as_ref(), right.as_ref()), (right.as_ref(), left.as_ref())] {
+            let Expr::Column(col_ref, _) = column else {
+                continue;
+            };
+            if !matches!(
+                probe,
+                Expr::Literal(Literal::Integer(_) | Literal::String(_), _)
+                    | Expr::Placeholder(fsqlite_ast::PlaceholderType::Numbered(_), _)
+            ) || (col_ref.table.is_none()
+                && resolve_column_ref(column, right_table, right_alias).is_some())
+            {
+                continue;
+            }
+            match resolve_column_ref(column, left_table, left_alias) {
+                Some(SortKeySource::Rowid) => return Some(OuterEqualitySeek::Rowid { probe }),
+                Some(SortKeySource::Column(col_idx)) if index_seek.is_none() => {
+                    index_seek = outer_index_equality_seek(left_table, col_idx, probe);
+                }
+                _ => {}
+            }
+        }
+    }
+    index_seek
+}
+
+fn outer_index_equality_seek<'a>(
+    table: &'a TableSchema,
+    col_idx: usize,
+    probe: &'a Expr,
+) -> Option<OuterEqualitySeek<'a>> {
+    let column = table.columns.get(col_idx)?;
+    let column_binary = column
+        .collation
+        .as_deref()
+        .is_none_or(|collation| collation.eq_ignore_ascii_case("BINARY"));
+    table.indexes.iter().find_map(|index| {
+        let usable = index
+            .columns
+            .first()
+            .is_some_and(|name| name.eq_ignore_ascii_case(&column.name))
+            && index.columns.len() == index.key_term_count()
+            && index.where_clause.is_none()
+            && !index.key_term_descending(0);
+        if !usable {
+            return None;
+        }
+        let text_exact = column.affinity == 'B'
+            && column_binary
+            && index
+                .key_term_collation(0)
+                .is_none_or(|collation| collation.eq_ignore_ascii_case("BINARY"));
+        let runtime_type_mask = match probe {
+            Expr::Literal(Literal::Integer(_), _) if column.affinity == 'D' => None,
+            Expr::Literal(Literal::String(_), _) if text_exact => None,
+            Expr::Placeholder(..) if column.affinity == 'D' => Some(0x01_u16),
+            Expr::Placeholder(..) if text_exact => Some(0x04_u16),
+            _ => return None,
+        };
+        Some(OuterEqualitySeek::Index {
+            index,
+            probe,
+            runtime_type_mask,
+        })
+    })
+}
+
+/// How the outer loop emitted by [`emit_outer_loop_start`] advances.
+enum OuterLoop {
+    /// Rewind/Next over the outer table.
+    Scan,
+    /// The one row a rowid seek found.
+    RowidSeek,
+    /// The equal-key run of an index; with `by_index_reg`, a run-time check
+    /// may instead have chosen the scan (the register holds 1 for the seek).
+    IndexSeek {
+        idx_cursor: i32,
+        by_index_reg: Option<i32>,
+        idx_row: crate::Label,
+        idx_advance: crate::Label,
+    },
+}
+
+/// Open the outer loop of a single-join lookup: position `left_cursor` on its
+/// first row (through `seek` when there is one) and fall through to
+/// `next_left`, which the caller resolves at the loop body; `done` ends the
+/// loop.
+#[allow(clippy::too_many_arguments)]
+fn emit_outer_loop_start(
+    b: &mut ProgramBuilder,
+    seek: Option<&OuterEqualitySeek<'_>>,
+    left_cursor: i32,
+    next_left: crate::Label,
+    done: crate::Label,
+    tables: &[(&TableSchema, Option<&str>)],
+    ctx: &CodegenContext,
+) -> Result<OuterLoop, CodegenError> {
+    match seek {
+        None => {
+            b.emit_jump_to_label(Opcode::Rewind, left_cursor, 0, done, P4::None, 0);
+            Ok(OuterLoop::Scan)
+        }
+        Some(OuterEqualitySeek::Rowid { probe }) => {
+            let probe_reg = b.alloc_reg();
+            emit_join_expr(b, probe, probe_reg, tables, ctx)?;
+            b.emit_jump_to_label(Opcode::IsNull, probe_reg, 0, done, P4::None, 0);
+            b.emit_jump_to_label(Opcode::MustBeInt, probe_reg, 0, done, P4::None, 0);
+            b.emit_jump_to_label(Opcode::SeekRowid, left_cursor, probe_reg, done, P4::None, 0);
+            Ok(OuterLoop::RowidSeek)
+        }
+        Some(OuterEqualitySeek::Index {
+            index,
+            probe,
+            runtime_type_mask,
+        }) => {
+            let idx_cursor = b.alloc_aux_cursor_range(1);
+            let idx_row = b.emit_label();
+            let idx_advance = b.emit_label();
+            let probe_base = b.alloc_regs(2);
+            emit_join_expr(b, probe, probe_base, tables, ctx)?;
+            let by_index_reg = runtime_type_mask.map(|_| b.alloc_reg());
+            let scan_start = b.emit_label();
+            if let Some(mask) = runtime_type_mask {
+                let seek_start = b.emit_label();
+                b.emit_jump_to_label(Opcode::IsType, -1, probe_base, seek_start, P4::None, *mask);
+                b.emit_jump_to_label(Opcode::Goto, 0, 0, scan_start, P4::None, 0);
+                b.resolve_label(seek_start);
+            }
+            b.emit_jump_to_label(Opcode::IsNull, probe_base, 0, done, P4::None, 0);
+            b.emit_op(Opcode::Int64, 0, probe_base + 1, 0, P4::Int64(i64::MIN), 0);
+            let probe_record_reg = b.alloc_reg();
+            b.emit_op(Opcode::MakeRecord, probe_base, 2, probe_record_reg, P4::None, 0);
+            b.emit_op(
+                Opcode::OpenRead,
+                idx_cursor,
+                index.root_page,
+                0,
+                P4::Index(index.name.clone()),
+                0,
+            );
+            b.emit_jump_to_label(
+                Opcode::SeekGE,
+                idx_cursor,
+                probe_record_reg,
+                done,
+                P4::None,
+                0,
+            );
+            if let Some(reg) = by_index_reg {
+                b.emit_op(Opcode::Integer, 1, reg, 0, P4::None, 0);
+                b.emit_jump_to_label(Opcode::Goto, 0, 0, idx_row, P4::None, 0);
+                b.resolve_label(scan_start);
+                b.emit_op(Opcode::Integer, 0, reg, 0, P4::None, 0);
+                b.emit_jump_to_label(Opcode::Rewind, left_cursor, 0, done, P4::None, 0);
+                b.emit_jump_to_label(Opcode::Goto, 0, 0, next_left, P4::None, 0);
+            }
+            b.resolve_label(idx_row);
+            let key_reg = b.alloc_reg();
+            b.emit_op(Opcode::Column, idx_cursor, 0, key_reg, P4::None, 0);
+            b.emit_jump_to_label(
+                Opcode::Ne,
+                probe_base,
+                key_reg,
+                done,
+                direct_lookup_index_comparison_p4(index),
+                0x10,
+            );
+            let rowid_reg = b.alloc_reg();
+            b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::SeekRowid, left_cursor, rowid_reg, idx_advance, P4::None, 0);
+            Ok(OuterLoop::IndexSeek {
+                idx_cursor,
+                by_index_reg,
+                idx_row,
+                idx_advance,
+            })
+        }
+    }
+}
+
+/// Advance the outer loop opened by [`emit_outer_loop_start`]; control
+/// reaches `done` when the outer rows are exhausted.
+fn emit_outer_loop_advance(
+    b: &mut ProgramBuilder,
+    outer_loop: &OuterLoop,
+    left_cursor: i32,
+    next_left: crate::Label,
+    done: crate::Label,
+) {
+    match outer_loop {
+        OuterLoop::Scan => {
+            b.emit_jump_to_label(Opcode::Next, left_cursor, 0, next_left, P4::None, 0);
+        }
+        OuterLoop::RowidSeek => {}
+        OuterLoop::IndexSeek {
+            idx_cursor,
+            by_index_reg,
+            idx_row,
+            idx_advance,
+        } => {
+            if let Some(reg) = by_index_reg {
+                b.emit_jump_to_label(Opcode::If, *reg, 0, *idx_advance, P4::None, 0);
+                b.emit_jump_to_label(Opcode::Next, left_cursor, 0, next_left, P4::None, 0);
+                b.emit_jump_to_label(Opcode::Goto, 0, 0, done, P4::None, 0);
+            }
+            b.resolve_label(*idx_advance);
+            b.emit_jump_to_label(Opcode::Next, *idx_cursor, 0, *idx_row, P4::None, 0);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn codegen_single_join_lookup_select(
     b: &mut ProgramBuilder,
@@ -12364,7 +12704,17 @@ fn codegen_single_join_lookup_select(
     };
 
     let next_left_label = b.emit_label();
-    b.emit_jump_to_label(Opcode::Rewind, left_cursor, 0, done_label, P4::None, 0);
+    let outer_seek =
+        resolve_outer_equality_seek(where_clause, left_table, left_alias, right_table, right_alias);
+    let outer_loop = emit_outer_loop_start(
+        b,
+        outer_seek.as_ref(),
+        left_cursor,
+        next_left_label,
+        done_label,
+        &tables,
+        ctx,
+    )?;
     b.resolve_label(next_left_label);
     let left_join_match_reg = if matches!(plan.join_kind, fsqlite_ast::JoinKind::Left) {
         let reg = b.alloc_temp();
@@ -12628,8 +12978,11 @@ fn codegen_single_join_lookup_select(
         b.resolve_label(skip_left_join_null_row);
     }
 
-    b.emit_jump_to_label(Opcode::Next, left_cursor, 0, next_left_label, P4::None, 0);
+    emit_outer_loop_advance(b, &outer_loop, left_cursor, next_left_label, done_label);
     b.resolve_label(done_label);
+    if let OuterLoop::IndexSeek { idx_cursor, .. } = outer_loop {
+        b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
+    }
 
     if let Some(base) = accum_base {
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -13868,6 +14221,17 @@ fn emit_join_expr(
         }
         Expr::BoundOuterValue { value, .. } => {
             emit_sqlite_value(b, value, target);
+            Ok(())
+        }
+        // bd-8c68u: a numbered parameter reads its bound value, as in
+        // single-table expressions; like a literal it carries no affinity.
+        // An anonymous or named placeholder keeps the join executor: its slot
+        // depends on the order the statement's placeholders are emitted in.
+        Expr::Placeholder(fsqlite_ast::PlaceholderType::Numbered(index), _) => {
+            let index = i32::try_from(*index).map_err(|_| {
+                CodegenError::Unsupported(format!("parameter ?{index} in JOIN codegen"))
+            })?;
+            b.emit_op(Opcode::Variable, index, target, 0, P4::None, 0);
             Ok(())
         }
         Expr::BinaryOp {
