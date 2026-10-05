@@ -367,3 +367,67 @@ fn test_issue_122_null_test_precedence_matches_c_sqlite() {
         }
     });
 }
+
+/// A migration-scale flat `OR` chain in a column CHECK must store verbatim
+/// (no parenthesis spine), reopen without recursive parser exhaustion, keep
+/// every term reachable, and leave a database stock SQLite accepts.
+#[test]
+fn test_wide_boolean_check_schema_stays_flat_and_reopenable() {
+    asupersync::test_utils::run_test(|| async {
+        const TERM_COUNT: usize = 512;
+        let predicate = (0..TERM_COUNT)
+            .map(|value| format!("kind = {value}"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let create_sql =
+            format!("CREATE TABLE wide(kind INTEGER CHECK ({predicate}), payload TEXT) STRICT");
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("wide.db");
+        let path = path.to_str().expect("utf-8 temp path").to_owned();
+
+        {
+            let conn = Connection::open(&path).await.expect("open file db");
+            conn.execute(&create_sql).await.expect("create wide table");
+            conn.close().await.expect("close after create");
+        }
+
+        let conn = Connection::open(&path)
+            .await
+            .expect("wide flat CHECK must reopen without recursive parser exhaustion");
+        let rows = conn
+            .query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'wide'")
+            .await
+            .expect("read stored schema text");
+        let stored_sql = match rows.as_slice() {
+            [row] => match &row.values()[0] {
+                SqliteValue::Text(sql) => sql.to_string(),
+                other => panic!("expected stored schema TEXT, got {other:?}"),
+            },
+            other => panic!("expected exactly one schema row, got {other:?}"),
+        };
+        // Stock SQLite stores the CREATE text verbatim: every term survives
+        // and no parenthesis spine is added around the flat OR chain.
+        assert_eq!(
+            stored_sql, create_sql,
+            "flat OR chain must be stored verbatim"
+        );
+        conn.execute("INSERT INTO wide VALUES (511, 'accepted')")
+            .await
+            .expect("last predicate term must remain reachable");
+        let error = conn
+            .execute("INSERT INTO wide VALUES (512, 'rejected')")
+            .await
+            .expect_err("out-of-domain value must still violate the CHECK");
+        assert!(
+            matches!(error, FrankenError::CheckViolation { .. }),
+            "expected a CHECK violation, got {error:?}"
+        );
+        conn.close().await.expect("close after reopen");
+
+        let stock = rusqlite::Connection::open(&path).expect("stock open");
+        let integrity: String = stock
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .expect("stock integrity_check");
+        assert_eq!(integrity, "ok");
+    });
+}
