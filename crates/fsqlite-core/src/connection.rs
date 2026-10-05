@@ -10283,11 +10283,16 @@ async fn trigger_when_matches(
     connection: &Connection,
     when_clause: Option<&Expr>,
     frame: Option<&TriggerFrame>,
+    pin_main_relations: bool,
 ) -> Result<bool> {
     let Some(expr) = when_clause else {
         return Ok(true);
     };
     let mut bound_expr = expr.clone();
+    // bd-f5s4w: see `bind_trigger_body_statement`.
+    if pin_main_relations {
+        qualify_persistent_view_expr(&mut bound_expr, &mut Vec::new());
+    }
     // bd-ry6x7: OLD/NEW inside the clause's EXISTS guards bind as parameters,
     // so each guard compiles once and is reused for every firing row.
     let subquery_params = frame.map_or_else(Vec::new, |active_frame| {
@@ -70678,6 +70683,14 @@ impl Connection {
     }
 
     /// Verify that changing FK-referenced parent values doesn't orphan children.
+    /// bd-f5s4w: whether `trigger`'s statements must have their relations
+    /// pinned to MAIN — a non-TEMP trigger while some TEMP table shadows a
+    /// main table of the same name (otherwise every unqualified name already
+    /// resolves to the main table, and nothing is rewritten).
+    fn trigger_pins_main_relations(&self, trigger: &TriggerDef) -> bool {
+        !trigger.temporary && !self.shadowed_main_tables.borrow().is_empty()
+    }
+
     fn has_matching_triggers(
         &self,
         table_name: &str,
@@ -71001,7 +71014,15 @@ impl Connection {
             frame.trigger_name.clone_from(&trigger.name);
             let _frame_guard = self.push_trigger_frame(frame.clone());
             // Evaluate the bound WHEN predicate against the current OLD/NEW frame.
-            if !trigger_when_matches(self, trigger.when_clause.as_ref(), Some(&frame)).await? {
+            let pin_main_relations = self.trigger_pins_main_relations(&trigger);
+            if !trigger_when_matches(
+                self,
+                trigger.when_clause.as_ref(),
+                Some(&frame),
+                pin_main_relations,
+            )
+            .await?
+            {
                 continue;
             }
 
@@ -71009,7 +71030,8 @@ impl Connection {
             // frame (see TriggerChangeTrackingRestoreGuard).
             let _change_tracking_guard = TriggerChangeTrackingRestoreGuard::new(self);
             for stmt in &trigger.body {
-                let (bound_stmt, bound_params) = bind_trigger_body_statement(stmt, &frame);
+                let (bound_stmt, bound_params) =
+                    bind_trigger_body_statement(stmt, &frame, pin_main_relations);
                 match self
                     .execute_bound_trigger_statement(bound_stmt, &bound_params)
                     .await?
@@ -71078,7 +71100,15 @@ impl Connection {
             let mut frame = base_frame.clone();
             frame.trigger_name.clone_from(&trigger.name);
             let _frame_guard = self.push_trigger_frame(frame.clone());
-            if !trigger_when_matches(self, trigger.when_clause.as_ref(), Some(&frame)).await? {
+            let pin_main_relations = self.trigger_pins_main_relations(&trigger);
+            if !trigger_when_matches(
+                self,
+                trigger.when_clause.as_ref(),
+                Some(&frame),
+                pin_main_relations,
+            )
+            .await?
+            {
                 continue;
             }
 
@@ -71086,7 +71116,8 @@ impl Connection {
             // frame (see TriggerChangeTrackingRestoreGuard).
             let _change_tracking_guard = TriggerChangeTrackingRestoreGuard::new(self);
             for stmt in &trigger.body {
-                let (bound_stmt, bound_params) = bind_trigger_body_statement(stmt, &frame);
+                let (bound_stmt, bound_params) =
+                    bind_trigger_body_statement(stmt, &frame, pin_main_relations);
                 match self
                     .execute_bound_trigger_statement(bound_stmt, &bound_params)
                     .await?
@@ -71583,14 +71614,23 @@ impl Connection {
             let mut frame = base_frame.clone();
             frame.trigger_name.clone_from(&trigger.name);
             let _frame_guard = self.push_trigger_frame(frame.clone());
-            if !trigger_when_matches(self, trigger.when_clause.as_ref(), Some(&frame)).await? {
+            let pin_main_relations = self.trigger_pins_main_relations(&trigger);
+            if !trigger_when_matches(
+                self,
+                trigger.when_clause.as_ref(),
+                Some(&frame),
+                pin_main_relations,
+            )
+            .await?
+            {
                 continue;
             }
             // One change-tracking frame for the whole trigger body (see
             // TriggerChangeTrackingRestoreGuard).
             let _change_tracking_guard = TriggerChangeTrackingRestoreGuard::new(self);
             for stmt in &trigger.body {
-                let (bound_stmt, bound_params) = bind_trigger_body_statement(stmt, &frame);
+                let (bound_stmt, bound_params) =
+                    bind_trigger_body_statement(stmt, &frame, pin_main_relations);
                 match self
                     .execute_bound_trigger_statement(bound_stmt, &bound_params)
                     .await?
@@ -107719,6 +107759,116 @@ fn validate_persistent_view_schema_references(
 /// not be rebound through a connection-local TEMP shadow at execution time.
 fn qualify_persistent_view_relations(select: &mut SelectStatement) {
     qualify_persistent_view_select(select, &mut Vec::new());
+}
+
+/// bd-f5s4w: pin every catalog relation a non-TEMP trigger's body statement
+/// (or WHEN clause, through [`qualify_persistent_view_expr`]) names to MAIN,
+/// the trigger's own schema, as stock resolves it: a same-named TEMP table
+/// must not capture an unqualified name. CTE references stay lexical, as in
+/// [`qualify_persistent_view_relations`].
+fn qualify_persistent_trigger_statement(statement: &mut Statement) {
+    fn result_columns(columns: &mut [ResultColumn], scopes: &mut Vec<HashSet<String>>) {
+        for column in columns {
+            if let ResultColumn::Expr { expr, .. } = column {
+                qualify_persistent_view_expr(expr, scopes);
+            }
+        }
+    }
+    fn tail(
+        order_by: &mut [OrderingTerm],
+        limit: Option<&mut LimitClause>,
+        scopes: &mut Vec<HashSet<String>>,
+    ) {
+        for term in order_by {
+            qualify_persistent_view_expr(&mut term.expr, scopes);
+        }
+        if let Some(limit) = limit {
+            qualify_persistent_view_expr(&mut limit.limit, scopes);
+            if let Some(offset) = &mut limit.offset {
+                qualify_persistent_view_expr(offset, scopes);
+            }
+        }
+    }
+    fn with_scope(with: Option<&mut fsqlite_ast::WithClause>, scopes: &mut Vec<HashSet<String>>) {
+        if let Some(with) = with {
+            scopes.push(
+                with.ctes
+                    .iter()
+                    .map(|cte| cte.name.to_ascii_lowercase())
+                    .collect(),
+            );
+            for cte in &mut with.ctes {
+                qualify_persistent_view_select(&mut cte.query, scopes);
+            }
+        }
+    }
+
+    let mut scopes = Vec::new();
+    match statement {
+        Statement::Select(select) => qualify_persistent_view_select(select, &mut scopes),
+        Statement::Insert(insert) => {
+            with_scope(insert.with.as_mut(), &mut scopes);
+            qualify_persistent_view_name(&mut insert.table, &scopes);
+            match &mut insert.source {
+                fsqlite_ast::InsertSource::Values(rows) => {
+                    for expr in rows.iter_mut().flatten() {
+                        qualify_persistent_view_expr(expr, &mut scopes);
+                    }
+                }
+                fsqlite_ast::InsertSource::Select(select) => {
+                    qualify_persistent_view_select(select, &mut scopes);
+                }
+                fsqlite_ast::InsertSource::DefaultValues => {}
+            }
+            for upsert in &mut insert.upsert {
+                if let Some(predicate) = upsert
+                    .target
+                    .as_mut()
+                    .and_then(|target| target.where_clause.as_mut())
+                {
+                    qualify_persistent_view_expr(predicate, &mut scopes);
+                }
+                if let fsqlite_ast::UpsertAction::Update {
+                    assignments,
+                    where_clause,
+                } = &mut upsert.action
+                {
+                    for assignment in assignments {
+                        qualify_persistent_view_expr(&mut assignment.value, &mut scopes);
+                    }
+                    if let Some(predicate) = where_clause {
+                        qualify_persistent_view_expr(predicate, &mut scopes);
+                    }
+                }
+            }
+            result_columns(&mut insert.returning, &mut scopes);
+        }
+        Statement::Update(update) => {
+            with_scope(update.with.as_mut(), &mut scopes);
+            qualify_persistent_view_name(&mut update.table.name, &scopes);
+            for assignment in &mut update.assignments {
+                qualify_persistent_view_expr(&mut assignment.value, &mut scopes);
+            }
+            if let Some(from) = &mut update.from {
+                qualify_persistent_view_from(from, &mut scopes);
+            }
+            if let Some(predicate) = &mut update.where_clause {
+                qualify_persistent_view_expr(predicate, &mut scopes);
+            }
+            result_columns(&mut update.returning, &mut scopes);
+            tail(&mut update.order_by, update.limit.as_mut(), &mut scopes);
+        }
+        Statement::Delete(delete) => {
+            with_scope(delete.with.as_mut(), &mut scopes);
+            qualify_persistent_view_name(&mut delete.table.name, &scopes);
+            if let Some(predicate) = &mut delete.where_clause {
+                qualify_persistent_view_expr(predicate, &mut scopes);
+            }
+            result_columns(&mut delete.returning, &mut scopes);
+            tail(&mut delete.order_by, delete.limit.as_mut(), &mut scopes);
+        }
+        _ => {}
+    }
 }
 
 fn qualify_persistent_view_name(name: &mut QualifiedName, scopes: &[HashSet<String>]) {
@@ -149099,6 +149249,15 @@ fn bind_trigger_columns_in_select_statement(select: &mut SelectStatement, frame:
 
     let trigger_table_name_shadowed =
         select_statement_has_visible_source_named(select, &frame.table_name);
+    // bd-f5s4w: the ORDER BY and LIMIT of a SELECT with a FROM clause resolve
+    // bare names against its own sources and result columns, exactly as its
+    // WHERE does (`bind_trigger_columns_in_select_core`): only explicit
+    // NEW./OLD. references are the trigger row. Binding a bare `k` in
+    // `SELECT k FROM g ORDER BY abs(k - NEW.k)` to NEW.k made every sort key
+    // equal (and a bare integer term a column position).
+    let prefix_only = std::iter::once(&select.body.select)
+        .chain(select.body.compounds.iter().map(|(_, core)| core))
+        .any(|core| matches!(core, SelectCore::Select { from: Some(_), .. }));
 
     bind_trigger_columns_in_select_core(&mut select.body.select, frame);
     for (_, core) in &mut select.body.compounds {
@@ -149109,7 +149268,7 @@ fn bind_trigger_columns_in_select_statement(select: &mut SelectStatement, frame:
         bind_trigger_columns_in_expr_inner(
             &mut ordering.expr,
             frame,
-            false,
+            prefix_only,
             trigger_table_name_shadowed,
         );
     }
@@ -149117,11 +149276,16 @@ fn bind_trigger_columns_in_select_statement(select: &mut SelectStatement, frame:
         bind_trigger_columns_in_expr_inner(
             &mut limit_clause.limit,
             frame,
-            false,
+            prefix_only,
             trigger_table_name_shadowed,
         );
         if let Some(offset) = &mut limit_clause.offset {
-            bind_trigger_columns_in_expr_inner(offset, frame, false, trigger_table_name_shadowed);
+            bind_trigger_columns_in_expr_inner(
+                offset,
+                frame,
+                prefix_only,
+                trigger_table_name_shadowed,
+            );
         }
     }
 }
@@ -149423,11 +149587,18 @@ fn bind_trigger_when_expr(expr: &mut Expr, frame: &TriggerFrame) -> Vec<SqliteVa
 ///   compiled program (INSERT VALUES subqueries are resolved at compile
 ///   time), so one SQL text shared by every row would read NULL parameters
 ///   or a stale result. With literals each row compiles its own program.
+///
+/// `pin_main_relations` pins the statement's relations to MAIN first (a
+/// non-TEMP trigger while a TEMP table shadows a main one, bd-f5s4w).
 fn bind_trigger_body_statement(
     statement: &Statement,
     frame: &TriggerFrame,
+    pin_main_relations: bool,
 ) -> (Statement, Vec<SqliteValue>) {
     let mut bound = statement.clone();
+    if pin_main_relations {
+        qualify_persistent_trigger_statement(&mut bound);
+    }
     if statement_is_raise_select(statement) || statement_contains_rewritable_subquery(statement) {
         bind_trigger_columns_in_statement(&mut bound, frame);
         return (bound, Vec::new());
