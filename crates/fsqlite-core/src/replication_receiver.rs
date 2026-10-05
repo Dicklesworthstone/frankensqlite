@@ -2,11 +2,11 @@
 //!
 //! Implements the receiver-side state machine for fountain-coded database
 //! replication. Listens for UDP packets, collects symbols per changeset,
-//! decodes when sufficient, validates and applies recovered pages.
+//! decodes when sufficient, validates and hands recovered pages to the caller.
 //!
 //! State machine: LISTENING → COLLECTING → DECODING → APPLYING → COMPLETE
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::ObjectId;
@@ -19,6 +19,9 @@ use crate::replication_sender::{
     ReplicationPacket, ReplicationWireVersion, compute_changeset_id,
 };
 use crate::source_block_partition::K_MAX;
+
+#[path = "replication_handoff.rs"]
+mod handoff;
 
 const BEAD_ID: &str = "bd-1hi.14";
 const DEFAULT_MAX_INFLIGHT_DECODERS: usize = 128;
@@ -174,9 +177,9 @@ pub enum ReceiverState {
     Collecting,
     /// Sufficient symbols collected; decoding in progress.
     Decoding,
-    /// Pages decoded; applying to local database.
+    /// Pages decoded; awaiting application handoff.
     Applying,
-    /// All pages applied; ready for next changeset.
+    /// All decoded pages handed off; not a database durability receipt.
     Complete,
 }
 
@@ -326,9 +329,11 @@ pub struct ReplicationReceiver {
     received_counts: HashMap<ChangesetId, u32>,
     /// Total bytes currently buffered across all decoder symbol sets.
     buffered_symbol_bytes: usize,
+    /// Decoded page bytes still charged to the receiver's payload budget.
+    pending_payload_bytes: usize,
     /// Decoded results waiting for application.
-    pending_results: Vec<DecodeResult>,
-    /// Applied results (for metrics/ACK).
+    pending_results: VecDeque<DecodeResult>,
+    /// Results handed to a caller, not a count of durable database commits.
     applied_count: u64,
     /// Decode-proof audit entries emitted by this receiver.
     decode_audit: Vec<DecodeAuditEntry>,
@@ -378,9 +383,10 @@ pub struct ReceiverConfig {
     pub auth_key: Option<[u8; 32]>,
     /// Decode proof emission hooks.
     pub decode_proof_policy: DecodeProofEmissionPolicy,
-    /// Maximum number of concurrent in-flight changeset decoders.
+    /// Maximum resident changesets, including decoded batches awaiting handoff.
     pub max_inflight_decoders: usize,
-    /// Maximum total bytes buffered across all decoder symbol maps.
+    /// Maximum retained symbol plus decoded-page payload bytes. Codec scratch,
+    /// collection metadata, and audit proofs are accounted separately.
     pub max_buffered_symbol_bytes: usize,
 }
 
@@ -427,7 +433,8 @@ impl ReplicationReceiver {
             decoders: HashMap::new(),
             received_counts: HashMap::new(),
             buffered_symbol_bytes: 0,
-            pending_results: Vec::new(),
+            pending_payload_bytes: 0,
+            pending_results: VecDeque::new(),
             applied_count: 0,
             decode_audit: Vec::new(),
             decode_audit_seq: 0,
@@ -446,7 +453,8 @@ impl ReplicationReceiver {
         self.state
     }
 
-    /// Number of changesets successfully applied.
+    /// Number of changesets handed off to a caller. This is not evidence that
+    /// the caller applied or durably committed those changesets.
     #[must_use]
     pub const fn applied_count(&self) -> u64 {
         self.applied_count
@@ -557,12 +565,11 @@ impl ReplicationReceiver {
             });
         }
 
-        // Transition LISTENING → COLLECTING on first packet.
-        if self.state == ReceiverState::Listening {
-            self.state = ReceiverState::Collecting;
-            info!(bead_id = BEAD_ID, "first packet received, now COLLECTING");
+        // Late source/repair packets cannot create another queued copy of
+        // an object still owned by the receiver. Admission above still applies.
+        if self.pending_retransmission(packet)? {
+            return Ok(PacketResult::Duplicate);
         }
-
         let changeset_id = packet.changeset_id;
         let mut created_decoder = false;
 
@@ -608,15 +615,7 @@ impl ReplicationReceiver {
                 });
             }
         } else {
-            if self.decoders.len() >= self.config.max_inflight_decoders {
-                warn!(
-                    bead_id = BEAD_ID,
-                    active_decoders = self.decoders.len(),
-                    max_inflight_decoders = self.config.max_inflight_decoders,
-                    "decoder cap reached; rejecting new changeset"
-                );
-                return Err(FrankenError::Busy);
-            }
+            self.check_new_changeset_slot()?;
             // Create new decoder state.
             let expected_seed =
                 crate::replication_sender::derive_seed_from_changeset_id(&changeset_id);
@@ -646,31 +645,17 @@ impl ReplicationReceiver {
             created_decoder = true;
         }
 
-        // Enforce global buffered-symbol bound before accepting a new symbol.
+        // Decoded pages remain charged until handoff; completing an object
+        // must not create an unbounded second queue outside the symbol budget.
         if let Some(decoder) = self.decoders.get(&changeset_id)
             && !decoder.has_symbol(packet.esi)
+            && !self.incoming_payload_fits(packet.symbol_data.len())
         {
-            let next_total = self
-                .buffered_symbol_bytes
-                .saturating_add(packet.symbol_data.len());
-            if next_total > self.config.max_buffered_symbol_bytes {
-                warn!(
-                    bead_id = BEAD_ID,
-                    buffered_symbol_bytes = self.buffered_symbol_bytes,
-                    incoming_symbol_bytes = packet.symbol_data.len(),
-                    max_buffered_symbol_bytes = self.config.max_buffered_symbol_bytes,
-                    "buffered symbol budget exceeded"
-                );
-                if created_decoder {
-                    self.remove_decoder(changeset_id);
-                    self.state = if self.decoders.is_empty() {
-                        ReceiverState::Listening
-                    } else {
-                        ReceiverState::Collecting
-                    };
-                }
-                return Err(FrankenError::TooBig);
+            if created_decoder {
+                self.remove_decoder(changeset_id);
             }
+            self.refresh_collection_state();
+            return Err(FrankenError::TooBig);
         }
 
         // Add symbol to decoder (with ISI deduplication) and capture decode context.
@@ -746,25 +731,7 @@ impl ReplicationReceiver {
         let decoded = match decoded_padded {
             Ok(decoded) => decoded,
             Err(error) => {
-                let decoder = self
-                    .decoders
-                    .get_mut(&changeset_id)
-                    .expect("active decoder");
-                decoder.symbols.remove(&packet.esi);
-                decoder.received_isis.remove(&packet.esi);
-                self.buffered_symbol_bytes -= packet.symbol_data.len();
-                *self
-                    .received_counts
-                    .get_mut(&changeset_id)
-                    .expect("active count") -= 1;
-                if created_decoder {
-                    self.remove_decoder(changeset_id);
-                }
-                self.state = if self.decoders.is_empty() {
-                    ReceiverState::Listening
-                } else {
-                    ReceiverState::Collecting
-                };
+                self.rollback_received_symbol(changeset_id, packet.esi, created_decoder);
                 return Err(error);
             }
         };
@@ -804,18 +771,15 @@ impl ReplicationReceiver {
                             k_source_ctx
                         };
                         let n_pages = result.pages.len();
-                        if let Some(proof) = success_proof {
-                            self.record_decode_proof(proof.clone());
-                            result.decode_proof = Some(proof);
+                        result.decode_proof = success_proof;
+                        if let Err(error) = self.enqueue_decoded(result) {
+                            self.rollback_received_symbol(changeset_id, packet.esi, created_decoder);
+                            return Err(error);
                         }
-                        self.pending_results.push(result);
-                        self.state = ReceiverState::Applying;
                         info!(
                             bead_id = BEAD_ID,
                             n_pages, "decode succeeded, ready to apply"
                         );
-                        // Clean up decoder for this changeset.
-                        self.remove_decoder(changeset_id);
                         return Ok(PacketResult::DecodeReady);
                     }
                     Err(e) => {
@@ -824,13 +788,10 @@ impl ReplicationReceiver {
                             error = %e,
                             "changeset validation failed after decode"
                         );
-                        // Clean up failed decoder.
+                        // Clean up only the failed decoder; an already-ready
+                        // peer must remain visible in the Applying state.
                         self.remove_decoder(changeset_id);
-                        self.state = if self.decoders.is_empty() {
-                            ReceiverState::Listening
-                        } else {
-                            ReceiverState::Collecting
-                        };
+                        self.refresh_collection_state();
                         return Err(e);
                     }
                 }
@@ -856,10 +817,11 @@ impl ReplicationReceiver {
                 k_source = k_source_ctx,
                 "decode failed at K_source, continuing collection"
             );
-            self.state = ReceiverState::Collecting;
+            self.refresh_collection_state();
             return Ok(PacketResult::NeedMore);
         }
 
+        self.refresh_collection_state();
         Ok(PacketResult::Accepted)
     }
 
@@ -1005,12 +967,13 @@ impl ReplicationReceiver {
             });
         }
 
-        if pages
-            .windows(2)
-            .any(|pair| pair[0].page_number > pair[1].page_number)
+        if pages.iter().any(|page| fsqlite_types::PageNumber::new(page.page_number).is_none())
+            || pages
+                .windows(2)
+                .any(|pair| pair[0].page_number >= pair[1].page_number)
         {
             return Err(FrankenError::DatabaseCorrupt {
-                detail: "changeset pages are not ordered by page number".to_owned(),
+                detail: "changeset pages must have valid, unique, increasing page numbers".to_owned(),
             });
         }
 
@@ -1046,35 +1009,14 @@ impl ReplicationReceiver {
     }
 
     /// Drain validated changesets for the caller to apply to its database.
+    /// Ownership and payload accounting transfer to the caller; this does not
+    /// perform database writes or authorize a durability acknowledgement.
     ///
     /// # Errors
     ///
-    /// Returns error if there are no pending results.
+    /// Returns error if there are no pending results or allocation fails.
     pub fn apply_pending(&mut self) -> Result<Vec<DecodeResult>> {
-        if self.pending_results.is_empty() {
-            return Err(FrankenError::Internal(format!(
-                "receiver has no pending changesets, current state: {:?}",
-                self.state
-            )));
-        }
-
-        let results = std::mem::take(&mut self.pending_results);
-        let n = results.len();
-        self.applied_count += u64::try_from(n).unwrap_or(u64::MAX);
-
-        info!(
-            bead_id = BEAD_ID,
-            applied = n,
-            total_applied = self.applied_count,
-            "applied pending changesets"
-        );
-
-        self.state = if self.decoders.is_empty() {
-            ReceiverState::Complete
-        } else {
-            ReceiverState::Collecting
-        };
-        Ok(results)
+        self.take_pending_results()
     }
 
     /// Transition from COMPLETE back to LISTENING for the next changeset.
@@ -1099,6 +1041,7 @@ impl ReplicationReceiver {
         self.decoders.clear();
         self.received_counts.clear();
         self.buffered_symbol_bytes = 0;
+        self.pending_payload_bytes = 0;
         self.pending_results.clear();
         self.state = ReceiverState::Listening;
         warn!(bead_id = BEAD_ID, "receiver force-reset to LISTENING");
@@ -1118,7 +1061,7 @@ pub enum PacketResult {
     Accepted,
     /// Integrity/auth invalid; packet ignored as erasure.
     Erasure,
-    /// Duplicate ISI, silently ignored.
+    /// Duplicate ISI or an object already queued for handoff; silently ignored.
     Duplicate,
     /// Enough symbols collected, decode succeeded and ready to apply.
     DecodeReady,
