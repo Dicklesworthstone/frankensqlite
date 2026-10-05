@@ -15,7 +15,7 @@ use crate::replication_sender::{
 impl ReplicationReceiver {
     /// Number of decoded changesets still owned by this receiver.
     #[must_use]
-    pub const fn pending_changesets(&self) -> usize {
+    pub fn pending_changesets(&self) -> usize {
         self.pending_results.len()
     }
 
