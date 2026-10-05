@@ -32,6 +32,7 @@ pub mod fault_hooks;
 pub mod group_commit;
 pub mod metrics;
 pub mod native_commit;
+pub mod native_durability;
 #[cfg(all(feature = "native", not(target_arch = "wasm32"), any(unix, windows)))]
 pub mod native_recovery;
 pub mod parallel_wal;
