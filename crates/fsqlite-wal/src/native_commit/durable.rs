@@ -7,6 +7,9 @@
 //! This module does not replace that live witness authority or activate SQL
 //! native mode. Namespace/append-owner authority must obey the log's contract.
 
+#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+pub mod codec;
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
@@ -18,7 +21,10 @@ use fsqlite_vfs::{VfsFile, VfsWriteCompletion};
 
 use super::{CommitResult, CommitSubmission, FsyncBarriers, WriteCoordinator};
 use crate::metrics::GLOBAL_GROUP_COMMIT_METRICS;
-use crate::native_durability::{NativeDurabilityLog, NativeDurabilityReceipt};
+use crate::native_durability::{
+    NativeDurabilityLimits, NativeDurabilityLog, NativeDurabilityReceipt,
+    NativeDurabilityRecovery,
+};
 
 /// Maximum bytes in one canonical admission proof.
 pub const MAX_NATIVE_PROOF_BYTES: usize = 1024 * 1024;
@@ -239,20 +245,134 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> DurableWriteCoordinator<S, M,
     /// # Errors
     /// Rejects non-genesis/recovery-blocked storage or invalid queue bounds.
     pub fn new(log: NativeDurabilityLog<S, M>, codec: C, max_pending: usize) -> Result<Self> {
-        if max_pending == 0 || max_pending > MAX_PENDING_COMMITS {
-            return Err(FrankenError::OutOfRange {
-                what: "native coordinator max_pending".to_owned(), value: max_pending.to_string(),
-            });
-        }
+        validate_capacity(max_pending)?;
         if log.published_tip() != CommitSeq::ZERO || log.needs_recovery() {
             return Err(FrankenError::BusyRecovery);
         }
-        Ok(Self {
-            coordinator: WriteCoordinator::new(OperatingMode::Native, CommitSeq::ZERO, max_pending),
+        Ok(Self::from_parts(
+            WriteCoordinator::new(OperatingMode::Native, CommitSeq::ZERO, max_pending),
+            log,
+            codec,
+        ))
+    }
+
+    fn from_parts(
+        coordinator: WriteCoordinator,
+        log: NativeDurabilityLog<S, M>,
+        codec: C,
+    ) -> Self {
+        Self {
+            coordinator,
             log, codec, proofs: BTreeMap::new(), proof_bytes: 0,
             metadata_sizes: BTreeMap::new(), metadata_bytes: 0,
             recovery_required: false, closing: false,
-        })
+        }
+    }
+
+    /// Recover the sequencer and conflict index from stored, bound proofs.
+    ///
+    /// The lower log verifies the complete marker prefix and re-synchronizes
+    /// referents before markers. For each marker this method additionally
+    /// decodes its admission proof, binds sequence/time/capsule identity, checks
+    /// the capsule digest, and resolves every immediate evidence reference.
+    /// `validate` must bind the write set to capsule semantics and verify the
+    /// historical SSI evidence. It is called in commit order, with only one
+    /// commit's decoded objects retained at a time. A failed validation never
+    /// returns a partly reconstructed driver; it does NOT undo stored commits.
+    ///
+    /// The returned report describes recovered commits, not new replies to
+    /// old callers. The acknowledgement queue starts empty. Retained torn
+    /// tails continue to block admission; no file is truncated or replaced.
+    /// The caller must settle old writes and hold the log's append-owner and
+    /// namespace authority for this entire operation.
+    ///
+    /// # Errors
+    /// Returns storage/codec errors or rejects missing, mismatched or invalid
+    /// proofs/evidence. No caller-supplied list can substitute for stored FCW
+    /// pages. Parent-directory durability and historical SSI authority remain
+    /// explicit caller obligations, not inferred from successful decoding.
+    pub async fn recover<V>(
+        cx: &Cx,
+        symbols: S,
+        markers: M,
+        limits: NativeDurabilityLimits,
+        codec: C,
+        max_pending: usize,
+        mut validate: V,
+    ) -> Result<(Self, NativeDurabilityRecovery)>
+    where
+        V: FnMut(&NativeCommitCandidate, &BTreeMap<ObjectId, Arc<[u8]>>) -> Result<()>,
+    {
+        validate_capacity(max_pending)?;
+        let (log, report) = NativeDurabilityLog::recover(
+            cx,
+            symbols,
+            markers,
+            limits,
+            |id, records| std::future::ready(codec.decode(cx, id, &records).map(|_| ())),
+        )
+        .await?;
+        let mut coordinator =
+            WriteCoordinator::new(OperatingMode::Native, CommitSeq::ZERO, max_pending);
+        for marker in &report.markers {
+            checkpoint(cx)?;
+            let proof_records = log.read_object(cx, marker.proof_object_id).await?;
+            let proof_bytes = codec.decode(cx, marker.proof_object_id, &proof_records)?;
+            let proof = NativeCommitProof::from_bytes(&proof_bytes)?;
+            if proof.commit_seq != marker.commit_seq
+                || proof.commit_time_unix_ns != marker.commit_time_unix_ns
+                || proof.submission.capsule_object_id != marker.capsule_object_id
+            {
+                return Err(corrupt("native recovery proof is not bound to its marker"));
+            }
+            let mut objects = BTreeMap::<ObjectId, Arc<[u8]>>::new();
+            let mut decoded_bytes = 0_usize;
+            for id in std::iter::once(&proof.submission.capsule_object_id)
+                .chain(&proof.submission.witness_refs)
+                .chain(&proof.submission.edge_ids)
+                .chain(&proof.submission.merge_witness_ids)
+            {
+                if objects.contains_key(id) {
+                    continue;
+                }
+                let records = log.read_object(cx, *id).await?;
+                let payload = codec.decode(cx, *id, &records)?;
+                decoded_bytes = decoded_bytes
+                    .checked_add(payload.len())
+                    .filter(|n| *n <= MAX_NATIVE_VALIDATION_BYTES)
+                    .ok_or(FrankenError::TooBig)?;
+                objects.insert(*id, Arc::from(payload));
+            }
+            let capsule = Arc::clone(
+                objects.get(&marker.capsule_object_id)
+                    .ok_or_else(|| corrupt("native recovery capsule is missing"))?,
+            );
+            if blake3::hash(&capsule).as_bytes() != &proof.submission.capsule_digest {
+                return Err(corrupt("native recovery capsule digest mismatch"));
+            }
+            let candidate = NativeCommitCandidate {
+                proof,
+                proof_object_id: marker.proof_object_id,
+                capsule,
+            };
+            validate(&candidate, &objects)?;
+            // The lower log established a contiguous genesis prefix. Only
+            // bound, semantically validated metadata may restore its FCW map.
+            coordinator.commit_index.record_commit(
+                &candidate.proof.submission.write_set_pages,
+                marker.commit_seq,
+            );
+            coordinator.commit_seq_tip = marker.commit_seq;
+            coordinator.allocated_seq_tip = marker.commit_seq;
+            coordinator.last_commit_time_ns = marker.commit_time_unix_ns;
+            coordinator.prev_marker_id = Some(ObjectId::derive_from_canonical_bytes(
+                &marker.to_record_bytes(),
+            ));
+        }
+        if coordinator.commit_seq_tip != log.published_tip() {
+            return Err(corrupt("native recovery coordinator/log tip mismatch"));
+        }
+        Ok((Self::from_parts(coordinator, log, codec), report))
     }
 
     #[must_use]
@@ -466,3 +586,13 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> DurableWriteCoordinator<S, M,
 
 fn checkpoint(cx: &Cx) -> Result<()> { cx.checkpoint().map_err(|_| FrankenError::Interrupt) }
 fn corrupt(detail: &str) -> FrankenError { FrankenError::WalCorrupt { detail: detail.to_owned() } }
+
+fn validate_capacity(max_pending: usize) -> Result<()> {
+    if max_pending == 0 || max_pending > MAX_PENDING_COMMITS {
+        return Err(FrankenError::OutOfRange {
+            what: "native coordinator max_pending".to_owned(),
+            value: max_pending.to_string(),
+        });
+    }
+    Ok(())
+}
