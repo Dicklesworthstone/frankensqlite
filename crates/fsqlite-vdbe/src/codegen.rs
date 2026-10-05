@@ -5310,6 +5310,79 @@ fn codegen_select_without_rowid_unique_seek(
     Ok(())
 }
 
+/// bd-gtjlv: the literals that pin a composite index's key terms after the
+/// leading one in `where_clause` (`a = 1 AND k = 'x' AND <residual>` on
+/// `(a, k)`), in key order, stopping at the first term that no exact
+/// `column = literal` conjunct pins. Exact means the comparison implies no
+/// conversion and orders like the index (an integer literal against INTEGER
+/// affinity, or a string literal against TEXT affinity with BINARY on the
+/// column and the ASC key term), so a longer probe prefix lands on exactly the
+/// rows the leading-column block would have kept.
+fn composite_equality_scan_extra_prefix<'e>(
+    idx: &IndexSchema,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    where_clause: Option<&'e Expr>,
+) -> Vec<&'e Expr> {
+    let Some(where_expr) = where_clause else {
+        return Vec::new();
+    };
+    let mut conjuncts = Vec::new();
+    collect_conjunctive_terms(where_expr, &mut conjuncts);
+    let mut extra = Vec::new();
+    for term in 1..idx.key_term_count() {
+        let Some(col_idx) = idx
+            .columns
+            .get(term)
+            .and_then(|name| table.column_index(name))
+        else {
+            break;
+        };
+        let column = &table.columns[col_idx];
+        let binary = |collation: Option<&str>| {
+            collation.is_none_or(|collation| collation.eq_ignore_ascii_case("BINARY"))
+        };
+        if idx.key_term_descending(term)
+            || !binary(idx.key_term_collation(term))
+            || !binary(column.collation.as_deref())
+            || column.generated_expr.is_some()
+        {
+            break;
+        }
+        let pins_column = |operand: &Expr| {
+            matches!(
+                resolve_column_ref(operand, table, table_alias),
+                Some(SortKeySource::Column(index)) if index == col_idx
+            )
+        };
+        let literal = conjuncts.iter().find_map(|conjunct| match conjunct {
+            Expr::BinaryOp {
+                left,
+                op: BinaryOp::Eq,
+                right,
+                ..
+            } if pins_column(left) => Some(right.as_ref()),
+            Expr::BinaryOp {
+                left,
+                op: BinaryOp::Eq,
+                right,
+                ..
+            } if pins_column(right) => Some(left.as_ref()),
+            _ => None,
+        });
+        let exact = literal.is_some_and(|literal| match literal {
+            Expr::Literal(Literal::Integer(_), _) => column.affinity == 'D',
+            Expr::Literal(Literal::String(_), _) => column.affinity == 'B',
+            _ => false,
+        });
+        match literal {
+            Some(literal) if exact => extra.push(literal),
+            _ => break,
+        }
+    }
+    extra
+}
+
 #[allow(clippy::too_many_arguments)]
 fn codegen_select_index_equality_scan(
     b: &mut ProgramBuilder,
@@ -5470,7 +5543,21 @@ fn codegen_select_index_equality_scan(
     // region and silently skip preceding non-NULL entries. Single-key indexes
     // retain the exact `(key, rowid-floor)` record needed for rowid-order walks.
     let composite_prefix_probe = idx_schema.key_term_count() > 1;
-    let probe_field_count = if composite_prefix_probe { 1 } else { 2 };
+    // bd-gtjlv: with a residual, further key terms the WHERE pins exactly
+    // join the prefix, so `a = 1 AND k = 'x' AND ...` on `(a, k)` seeks the
+    // `(1, 'x')` block instead of walking every `a = 1` entry. The residual
+    // filter still checks the whole WHERE on each row.
+    let extra_prefix = if composite_prefix_probe && residual_filter && !descending {
+        composite_equality_scan_extra_prefix(idx_schema, table, table_alias, where_clause)
+    } else {
+        Vec::new()
+    };
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let probe_field_count = if composite_prefix_probe {
+        1 + extra_prefix.len() as i32
+    } else {
+        2
+    };
     let probe_key_regs = b.alloc_regs(probe_field_count);
     emit_expr(b, target_expr, probe_key_regs, None);
     b.emit_jump_to_label(
@@ -5481,6 +5568,10 @@ fn codegen_select_index_equality_scan(
         P4::None,
         0,
     );
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    for (offset, literal) in extra_prefix.iter().enumerate() {
+        emit_expr(b, literal, probe_key_regs + 1 + offset as i32, None);
+    }
 
     let saw_index_match_reg = b.alloc_reg();
     b.emit_op(Opcode::Integer, 0, saw_index_match_reg, 0, P4::None, 0);
