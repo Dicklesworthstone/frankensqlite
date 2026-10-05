@@ -11,9 +11,11 @@
 //! skipped instead, so an UPDATE that did rewrite one lost its entry.
 //!
 //! Each case runs on a fresh file-backed FrankenSQLite database and on stock
-//! SQLite (rusqlite), and compares the outcome (ok / error), the rows,
-//! `changes()`, the `total_changes()` delta and an AFTER UPDATE trigger log
-//! after every statement. A follow-up range UPDATE over the indexed columns
+//! SQLite (rusqlite), and compares the outcome (ok, or the primary error code
+//! and message), the rows, `changes()`, the `total_changes()` delta and an
+//! AFTER UPDATE trigger log after every statement (bd-v9dk8: an ok-vs-error
+//! comparison alone let a statement fail for the wrong reason and still pass).
+//! A follow-up range UPDATE over the indexed columns
 //! catches rows visited twice. The FrankenSQLite file is then closed and
 //! checked with stock `PRAGMA integrity_check`.
 
@@ -53,6 +55,32 @@ fn stock_rows(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<SqliteValue>> {
     .unwrap()
     .collect::<rusqlite::Result<Vec<_>>>()
     .unwrap()
+}
+
+/// A statement outcome as stock reports it: `ok`, or the primary result code
+/// and the engine's own message. Comparing only success against failure let a
+/// statement fail for the wrong reason, or roll back a different amount of
+/// work, and still pass (bd-v9dk8).
+///
+/// The primary code, not the extended one: FrankenSQLite reports every
+/// UNIQUE / PRIMARY KEY failure as plain SQLITE_CONSTRAINT (19), where stock
+/// distinguishes SQLITE_CONSTRAINT_UNIQUE (2067), _PRIMARYKEY (1555) and
+/// _ROWID (2579). That gap is tracked separately.
+fn frank_outcome(result: &Result<(), fsqlite_error::FrankenError>) -> String {
+    match result {
+        Ok(()) => "ok".to_owned(),
+        Err(e) => format!("error {}: {e}", e.error_code() as i32),
+    }
+}
+
+fn stock_outcome(result: &rusqlite::Result<()>) -> String {
+    match result {
+        Ok(()) => "ok".to_owned(),
+        Err(rusqlite::Error::SqliteFailure(e, Some(message))) => {
+            format!("error {}: {message}", e.extended_code & 0xff)
+        }
+        Err(other) => format!("non-engine error: {other}"),
+    }
 }
 
 fn single_integer(rows: &[Vec<SqliteValue>]) -> i64 {
@@ -199,9 +227,9 @@ async fn run_case(schema: &Schema, indexes: &str, sql: &str, failures: &mut Vec<
     for step in [sql, FOLLOW_UP] {
         let frank_before = single_integer(&frank_rows(&frank, "SELECT total_changes()").await);
         let stock_before = single_integer(&stock_rows(&stock, "SELECT total_changes()"));
-        let frank_result = frank.execute_batch(step).await;
-        let stock_result = stock.execute_batch(step);
-        if frank_result.is_ok() != stock_result.is_ok() {
+        let frank_result = frank_outcome(&frank.execute_batch(step).await);
+        let stock_result = stock_outcome(&stock.execute_batch(step));
+        if frank_result != stock_result {
             failures.push(format!(
                 "{label} :: `{step}` outcome: FrankenSQLite {frank_result:?} vs SQLite {stock_result:?}"
             ));
@@ -355,9 +383,9 @@ fn skipped_and_failed_updates_match_stock_side_effects() {
             "UPDATE u SET b = 30 WHERE a = 1",
             "UPDATE OR IGNORE u SET b = 30 WHERE a = 1",
         ] {
-            let f = frank.execute_batch(sql).await;
-            let s = stock.execute_batch(sql);
-            assert_eq!(f.is_ok(), s.is_ok(), "`{sql}`: {f:?} vs {s:?}");
+            let f = frank_outcome(&frank.execute_batch(sql).await);
+            let s = stock_outcome(&stock.execute_batch(sql));
+            assert_eq!(f, s, "`{sql}` outcome");
             assert_eq!(
                 frank_rows(&frank, check).await,
                 stock_rows(&stock, check),
