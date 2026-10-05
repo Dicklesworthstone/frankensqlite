@@ -11017,8 +11017,13 @@ fn grouped_inner_join_count_sum_plan<'a>(
     ) else {
         return Ok(None);
     };
-    // This lane's index loop matches only keys equal to the raw probe.
-    if join_lookup.numeric_text_walk {
+    // This lane's index loop matches only keys equal to the raw probe, on a
+    // one-key lookup that consumes the whole ON clause.
+    if join_lookup.numeric_text_walk
+        || join_lookup.prefix_probe
+        || !join_lookup.extra_keys.is_empty()
+        || !join_lookup.on_residual.is_empty()
+    {
         return Ok(None);
     }
 
@@ -11385,6 +11390,19 @@ struct SingleJoinLookupPlan<'a> {
     /// keys and match those equal to the probe under NUMERIC affinity.
     numeric_text_walk: bool,
     lookup_target: SingleJoinLookupTarget<'a>,
+    /// The index key terms after the first that further ON equalities pin,
+    /// in key order, each with its probe column and probe affinity: the
+    /// lookup seeks the composite key prefix (`t.a = u.a AND t.k = u.k` on
+    /// an index of `t(a, k)`).
+    extra_keys: Vec<(SortKeySource, Option<char>)>,
+    /// The ON conjuncts the lookup does not consume. A looked-up row is a
+    /// match only when they hold, so a LEFT JOIN row that no right row
+    /// satisfies still gets its NULL row.
+    on_residual: Vec<&'a Expr>,
+    /// The lookup index has more key terms than the single-key lookup
+    /// probes, so the probe record is the pinned key prefix alone (no rowid
+    /// floor) and the run ends when any pinned key term changes.
+    prefix_probe: bool,
 }
 
 /// One result column of an implicit aggregate over a single-lookup join
@@ -11671,6 +11689,36 @@ fn resolve_single_join_lookup_plan<'a>(
     join_kind: fsqlite_ast::JoinKind,
     on_expr: Option<&'a Expr>,
 ) -> Option<SingleJoinLookupPlan<'a>> {
+    resolve_single_eq_join_lookup_plan(
+        left_table,
+        left_alias,
+        right_table,
+        right_alias,
+        join_kind,
+        on_expr,
+    )
+    .or_else(|| {
+        resolve_conjunctive_join_lookup_plan(
+            left_table,
+            left_alias,
+            right_table,
+            right_alias,
+            join_kind,
+            on_expr?,
+        )
+    })
+}
+
+/// The lookup plan for an ON clause that is one equality with a rowid or a
+/// single-column index lookup on the right table.
+fn resolve_single_eq_join_lookup_plan<'a>(
+    left_table: &'a TableSchema,
+    left_alias: Option<&'a str>,
+    right_table: &'a TableSchema,
+    right_alias: Option<&'a str>,
+    join_kind: fsqlite_ast::JoinKind,
+    on_expr: Option<&'a Expr>,
+) -> Option<SingleJoinLookupPlan<'a>> {
     // The lookup lane fetches rows via IdxRowid + SeekRowid, which assumes
     // rowid-table index format; WITHOUT ROWID index entries carry a PK suffix
     // instead (bd-rjaff), so fall back to the generic join path.
@@ -11760,7 +11808,188 @@ fn resolve_single_join_lookup_plan<'a>(
         probe_affinity,
         numeric_text_walk,
         lookup_target,
+        extra_keys: Vec::new(),
+        on_residual: Vec::new(),
+        prefix_probe: false,
     })
+}
+
+/// One `left column = right column` conjunct of a join's ON clause.
+struct JoinOnColumnPair<'a> {
+    /// The conjunct's position in the ON clause.
+    at: usize,
+    probe: SortKeySource,
+    lookup: SortKeySource,
+    left: &'a Expr,
+    right: &'a Expr,
+}
+
+/// The lookup plan for an ON clause that is a conjunction (`t.a = u.a AND
+/// t.k = u.k AND t.v > 0`), or for a single equality whose only index is a
+/// composite one: the right table's rows found by rowid when a conjunct
+/// pins it, else by the index whose leading key terms the most column-pair
+/// equalities pin exactly (no conversion the probe cannot reproduce, the
+/// index term's collation, ASC); every other conjunct is checked on each
+/// looked-up row. SQLite plans the same lookups (`SEARCH t USING INDEX
+/// t_ak (a=? AND k=?)`).
+fn resolve_conjunctive_join_lookup_plan<'a>(
+    left_table: &'a TableSchema,
+    left_alias: Option<&'a str>,
+    right_table: &'a TableSchema,
+    right_alias: Option<&'a str>,
+    join_kind: fsqlite_ast::JoinKind,
+    on_expr: &'a Expr,
+) -> Option<SingleJoinLookupPlan<'a>> {
+    if left_table.without_rowid || right_table.without_rowid {
+        return None;
+    }
+    let mut conjuncts = Vec::new();
+    collect_conjunctive_terms(on_expr, &mut conjuncts);
+    let pairs: Vec<JoinOnColumnPair<'a>> = conjuncts
+        .iter()
+        .enumerate()
+        .filter_map(|(at, term)| {
+            let Expr::BinaryOp {
+                left,
+                op: fsqlite_ast::BinaryOp::Eq,
+                right,
+                ..
+            } = term
+            else {
+                return None;
+            };
+            let (left, right) = (left.as_ref(), right.as_ref());
+            if let (Some(probe), Some(lookup)) = (
+                resolve_column_ref(left, left_table, left_alias),
+                resolve_column_ref(right, right_table, right_alias),
+            ) {
+                return Some(JoinOnColumnPair {
+                    at,
+                    probe,
+                    lookup,
+                    left,
+                    right,
+                });
+            }
+            let (Some(lookup), Some(probe)) = (
+                resolve_column_ref(left, right_table, right_alias),
+                resolve_column_ref(right, left_table, left_alias),
+            ) else {
+                return None;
+            };
+            Some(JoinOnColumnPair {
+                at,
+                probe,
+                lookup,
+                left,
+                right,
+            })
+        })
+        .collect();
+    let residual_without = |consumed: &[usize]| -> Vec<&'a Expr> {
+        conjuncts
+            .iter()
+            .enumerate()
+            .filter(|(at, _)| !consumed.contains(at))
+            .map(|(_, term)| *term)
+            .collect()
+    };
+    let plan = |probe_source: SortKeySource,
+                probe_affinity: Option<char>,
+                lookup_target: SingleJoinLookupTarget<'a>,
+                extra_keys: Vec<(SortKeySource, Option<char>)>,
+                consumed: &[usize],
+                prefix_probe: bool| SingleJoinLookupPlan {
+        join_kind,
+        probe_source,
+        probe_expr: None,
+        probe_affinity,
+        numeric_text_walk: false,
+        lookup_target,
+        extra_keys,
+        on_residual: residual_without(consumed),
+        prefix_probe,
+    };
+
+    // A conjunct that names the right table's rowid finds its row directly;
+    // the probe goes through MustBeInt like the single-key rowid lookup.
+    if let Some(pair) = pairs
+        .iter()
+        .find(|pair| matches!(pair.lookup, SortKeySource::Rowid))
+        && !matches!(pair.probe, SortKeySource::Expression(_))
+    {
+        return Some(plan(
+            pair.probe.clone(),
+            None,
+            SingleJoinLookupTarget::Rowid,
+            Vec::new(),
+            &[pair.at],
+            false,
+        ));
+    }
+
+    // Per pinned key term: the column pair that pins it and its probe affinity.
+    type PinnedTerms = Vec<(usize, Option<char>)>;
+    let comparison_tables = [(left_table, left_alias), (right_table, right_alias)];
+    let mut best: Option<(&'a IndexSchema, PinnedTerms)> = None;
+    for index in &right_table.indexes {
+        if !index.supports_direct_column_lookup() {
+            continue;
+        }
+        let mut pinned: PinnedTerms = Vec::new();
+        for term in 0..index.key_term_count() {
+            if index.key_term_descending(term) {
+                break;
+            }
+            let Some(col_idx) = index
+                .columns
+                .get(term)
+                .and_then(|name| right_table.column_index(name))
+            else {
+                break;
+            };
+            let found = pairs.iter().enumerate().find_map(|(pair_idx, pair)| {
+                if pinned.iter().any(|(used, _)| *used == pair_idx)
+                    || !matches!(pair.lookup, SortKeySource::Column(lookup) if lookup == col_idx)
+                {
+                    return None;
+                }
+                let affinity =
+                    match join_lookup_column_pair_probe(left_table, &pair.probe, right_table, col_idx)?
+                    {
+                        JoinLookupProbe::Raw => None,
+                        JoinLookupProbe::Coerce(affinity) => Some(affinity),
+                        JoinLookupProbe::RawThenNumericText => return None,
+                    };
+                let collation =
+                    join_lookup_effective_collation(pair.left, pair.right, &comparison_tables);
+                collation_names_equivalent(collation, index.key_term_collation(term))
+                    .then_some((pair_idx, affinity))
+            });
+            let Some(pinned_term) = found else {
+                break;
+            };
+            pinned.push(pinned_term);
+        }
+        if !pinned.is_empty() && best.as_ref().is_none_or(|(_, kept)| pinned.len() > kept.len()) {
+            best = Some((index, pinned));
+        }
+    }
+    let (index, pinned) = best?;
+    let consumed: Vec<usize> = pinned.iter().map(|(pair_idx, _)| pairs[*pair_idx].at).collect();
+    let (first_pair, first_affinity) = pinned[0];
+    let extra_keys = pinned[1..]
+        .iter()
+        .map(|(pair_idx, affinity)| (pairs[*pair_idx].probe.clone(), *affinity))
+        .collect();
+    Some(plan(
+        pairs[first_pair].probe.clone(),
+        first_affinity,
+        SingleJoinLookupTarget::Index(index),
+        extra_keys,
+        &consumed,
+        index.key_term_count() > 1,
+    ))
 }
 
 /// For an inner join whose written-order lookup must walk an index's TEXT keys
@@ -11934,10 +12163,33 @@ fn direct_lookup_index_collation_matches_join(
 }
 
 fn direct_lookup_index_comparison_p4(index: &IndexSchema) -> P4 {
+    index_term_comparison_p4(index, 0)
+}
+
+/// The P4 that compares a probe with key term `term` of `index` under the
+/// term's collation.
+fn index_term_comparison_p4(index: &IndexSchema, term: usize) -> P4 {
     index
-        .key_term_collation(0)
+        .key_term_collation(term)
         .filter(|collation| !collation.eq_ignore_ascii_case("BINARY"))
         .map_or(P4::None, |collation| P4::Collation(collation.to_owned()))
+}
+
+/// Jump to `skip` unless every ON conjunct a join lookup did not consume
+/// holds for the joined row (NULL is not a match, as in ON).
+fn emit_join_on_residual(
+    b: &mut ProgramBuilder,
+    residual: &[&Expr],
+    skip: Label,
+    tables: &[(&TableSchema, Option<&str>)],
+    ctx: &CodegenContext,
+) -> Result<(), CodegenError> {
+    for term in residual {
+        let cond_reg = b.alloc_reg();
+        emit_join_expr(b, term, cond_reg, tables, ctx)?;
+        b.emit_jump_to_label(Opcode::IfNot, cond_reg, 1, skip, P4::None, 0);
+    }
+    Ok(())
 }
 
 /// The sorter's direction character for an ORDER BY term: '+' ASC NULLS
@@ -12560,6 +12812,10 @@ fn codegen_single_join_lookup_select(
     // lookup) needs only the index entry, not the table row.
     let seek_right_row = accum_base.is_none()
         || where_clause.is_some_and(|expr| expr_references_scan(expr, right_table, right_alias))
+        || plan
+            .on_residual
+            .iter()
+            .any(|expr| expr_references_scan(expr, right_table, right_alias))
         || aggregates.iter().any(|term| {
             term.arg
                 .is_some_and(|arg| expr_references_scan(arg, right_table, right_alias))
@@ -12753,6 +13009,7 @@ fn codegen_single_join_lookup_select(
                 P4::None,
                 0,
             );
+            emit_join_on_residual(b, &plan.on_residual, no_match, &tables, ctx)?;
             if let Some(match_reg) = left_join_match_reg {
                 b.emit_op(Opcode::Integer, 1, match_reg, 0, P4::None, 0);
             }
@@ -12778,9 +13035,17 @@ fn codegen_single_join_lookup_select(
         }
         SingleJoinLookupTarget::Index(_index) => {
             let idx_cursor = index_cursor.expect("index lookup join must open index cursor");
-            let probe_base = b.alloc_regs(2);
+            // The pinned key terms; a single-key probe of a one-term index
+            // also carries a rowid floor.
+            let key_count = 1 + plan.extra_keys.len();
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            let probe_fields = if plan.prefix_probe {
+                key_count as i32
+            } else {
+                2
+            };
+            let probe_base = b.alloc_regs(probe_fields);
             let probe_reg = probe_base;
-            let min_rowid_reg = probe_base + 1;
             let comparison_p4 = direct_lookup_index_comparison_p4(_index);
             if let Some(key) = plan.probe_expr {
                 emit_join_expr(b, key, probe_reg, &tables, ctx)?;
@@ -12811,12 +13076,30 @@ fn codegen_single_join_lookup_select(
             let no_match = b.emit_label();
             let duplicate_run_done = b.emit_label();
             b.emit_jump_to_label(Opcode::IsNull, probe_reg, 0, no_match, P4::None, 0);
-            b.emit_op(Opcode::Int64, 0, min_rowid_reg, 0, P4::Int64(i64::MIN), 0);
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            for (offset, (source, affinity)) in plan.extra_keys.iter().enumerate() {
+                let key_reg = probe_base + 1 + offset as i32;
+                emit_join_probe_source(b, left_cursor, left_table, left_alias, source, key_reg);
+                if let Some(affinity) = affinity {
+                    b.emit_op(
+                        Opcode::Affinity,
+                        key_reg,
+                        1,
+                        0,
+                        P4::Affinity(affinity.to_string()),
+                        0,
+                    );
+                }
+                b.emit_jump_to_label(Opcode::IsNull, key_reg, 0, no_match, P4::None, 0);
+            }
+            if !plan.prefix_probe {
+                b.emit_op(Opcode::Int64, 0, probe_base + 1, 0, P4::Int64(i64::MIN), 0);
+            }
             let probe_record_reg = b.alloc_reg();
             b.emit_op(
                 Opcode::MakeRecord,
                 probe_base,
-                2,
+                probe_fields,
                 probe_record_reg,
                 P4::None,
                 0,
@@ -12844,6 +13127,7 @@ fn codegen_single_join_lookup_select(
                         0,
                     );
                 }
+                emit_join_on_residual(b, &plan.on_residual, advance, &tables, ctx)?;
                 if let Some(match_reg) = left_join_match_reg {
                     b.emit_op(Opcode::Integer, 1, match_reg, 0, P4::None, 0);
                 }
@@ -12875,6 +13159,20 @@ fn codegen_single_join_lookup_select(
                 comparison_p4,
                 0,
             );
+            // The run of a composite prefix ends when any pinned term changes.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            for term in 1..key_count {
+                let term_reg = b.alloc_reg();
+                b.emit_op(Opcode::Column, idx_cursor, term as i32, term_reg, P4::None, 0);
+                b.emit_jump_to_label(
+                    Opcode::Ne,
+                    probe_base + term as i32,
+                    term_reg,
+                    duplicate_run_done,
+                    index_term_comparison_p4(_index, term),
+                    0,
+                );
+            }
             let idx_advance = b.emit_label();
             emit_entry_match(b, idx_advance)?;
             b.resolve_label(idx_advance);
@@ -55694,31 +55992,39 @@ mod tests {
     }
 
     #[test]
-    fn test_codegen_single_join_rejects_composite_lookup_index() {
+    fn test_codegen_single_join_seeks_composite_lookup_index_by_prefix() {
         let stmt = collation_matching_single_join_lookup_stmt();
         let schema = test_schema_single_join_rejects_composite_lookup_index();
         let ctx = CodegenContext::default();
         let mut b = ProgramBuilder::new();
         codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
         let prog = b.finish().unwrap();
+        let ops = prog.ops();
 
-        let rewind_count = prog
-            .ops()
-            .iter()
-            .filter(|op| op.opcode == Opcode::Rewind)
-            .count();
-
+        let rewind_count = ops.iter().filter(|op| op.opcode == Opcode::Rewind).count();
         assert_eq!(
-            rewind_count, 2,
-            "single-join lookup fast path must reject composite indexes because it only emits a single-key seek record"
+            rewind_count, 1,
+            "the composite index's leading term serves the lookup, so only the left table is scanned"
         );
-        assert!(
-            !prog
-                .ops()
-                .iter()
-                .any(|op| matches!(&op.p4, P4::Index(name) if name == "idx_orders_region_amount")),
-            "falling back to the generic nested-loop join must avoid opening the composite sibling index as a direct lookup cursor"
-        );
+        let index_cursor = ops
+            .iter()
+            .find(|op| {
+                op.opcode == Opcode::OpenRead
+                    && matches!(&op.p4, P4::Index(name) if name == "idx_orders_region_amount")
+            })
+            .map(|op| op.p1)
+            .expect("the lookup opens the composite index");
+        // The probe is the one-term prefix: a rowid floor in its second field
+        // would compare against the index's second key term and skip rows.
+        let seek = ops
+            .iter()
+            .find(|op| op.opcode == Opcode::SeekGE && op.p1 == index_cursor)
+            .expect("the lookup seeks the composite index");
+        let probe_record = ops
+            .iter()
+            .find(|op| op.opcode == Opcode::MakeRecord && op.p3 == seek.p3)
+            .expect("the seek record is built");
+        assert_eq!(probe_record.p2, 1, "one-term prefix probe: {ops:?}");
     }
 
     #[test]
