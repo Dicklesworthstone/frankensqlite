@@ -40,6 +40,9 @@ use fsqlite_parser::Parser;
 
 use crate::{Connection, FrankenError, Row, SqliteValue};
 
+#[path = "changeset_dependencies.rs"]
+pub mod dependencies;
+
 /// Counts become a receipt only after the enclosing transaction commits.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SqlChangesetApplyReport {
@@ -735,64 +738,32 @@ pub async fn apply_changeset(
 /// deleted. A failed savepoint rollback, I/O, cancellation or lost transaction
 /// cannot be omitted. Counts describe only the successfully committed result.
 ///
-/// Rows run in supplied order. Unlike the C session applier, this adapter does
-/// not retry deferred uniqueness dependencies or temporarily defer foreign
-/// keys: immediate FK errors are row CONSTRAINTs and a deferred FK failure at
-/// COMMIT aborts the transaction. No global FOREIGN_KEY omit callback, rebasing
-/// or operation reordering is provided. Normal target triggers remain enabled.
+/// Secondary uniqueness failures may depend on a later row releasing a key.
+/// Buffered application retries these after the table section, within
+/// [`dependencies::RetryLimits::default`], before reporting a final CONSTRAINT.
+/// Original row indices are retained. Handler-resolved DATA/primary-key
+/// replacements are not automatically replayed. Streaming keeps its one-row
+/// memory contract and does not perform these dependency retries.
+///
+/// Foreign-key policy is unchanged: immediate FK errors are row CONSTRAINTs
+/// and a deferred FK failure at COMMIT aborts the transaction. No global
+/// FOREIGN_KEY omit callback or rebasing is provided. Target triggers remain
+/// enabled; external effects of SQL functions cannot be rolled back on retry.
 pub async fn apply_changeset_with_handler<F>(
     conn: &mut Connection,
     changeset: &Changeset,
-    mut handler: F,
+    handler: F,
 ) -> ApplyResult<SqlChangesetApplyReport>
 where
     F: FnMut(SqlChangesetConflict<'_>) -> ConflictAction,
 {
-    validate(changeset)?;
-    if conn.in_transaction() {
-        return Err(FrankenError::NestedTransaction.into());
-    }
-    if changeset.tables.iter().all(|table| table.rows.is_empty()) {
-        return Ok(SqlChangesetApplyReport::default());
-    }
-    let mut transaction = ApplyTransaction { conn, armed: true };
-    // Arm before BEGIN can suspend, not after it returns successfully.
-    if let Err(error) = conn.begin_transaction().await {
-        return Err(transaction.rollback(error.into()).await);
-    }
-    let result = async {
-        let mut plans = Vec::new();
-        for table in changeset
-            .tables
-            .iter()
-            .filter(|table| !table.rows.is_empty())
-        {
-            plans.push((table, TablePlan::load(conn, table).await?));
-        }
-        let mut report = SqlChangesetApplyReport::default();
-        for (table, plan) in plans {
-            for (index, change) in table.rows.iter().enumerate() {
-                match apply_row(conn, &plan, index, change, &mut handler).await? {
-                    RowOutcome::Applied { replaced } => {
-                        report.applied += 1;
-                        report.replaced += usize::from(replaced);
-                    }
-                    RowOutcome::Skipped => report.skipped += 1,
-                }
-            }
-        }
-        Ok(report)
-    }
-    .await;
-    let report = match result {
-        Ok(report) => report,
-        Err(error) => return Err(transaction.rollback(error).await),
-    };
-    if let Err(error) = conn.commit_transaction().await {
-        return Err(transaction.rollback(error.into()).await);
-    }
-    transaction.armed = false;
-    Ok(report)
+    dependencies::apply_with_limits(
+        conn,
+        changeset,
+        dependencies::RetryLimits::default(),
+        handler,
+    )
+    .await
 }
 
 /// Bounded changeset ingestion into one real SQL transaction.
@@ -917,11 +888,13 @@ pub mod streaming {
     ///
     /// Conflict semantics, parameter binding, target affinity/collation,
     /// primary-key-only replacement and per-row savepoints are shared with
-    /// the ordinary SQL applier. Table plans are rebuilt at section boundaries,
-    /// including repeated sections naming the same table. Row indices in
-    /// callbacks and invalid-change errors refer to the original section.
-    /// Unlike an already buffered changeset, later schemas are checked as they
-    /// arrive; no effects become committed until the entire input is accepted.
+    /// the ordinary SQL applier. Unlike buffered application, this path does
+    /// not retain or retry UNIQUE-dependency rows: it preserves one-row input
+    /// retention and reports constraints immediately. Table plans are rebuilt
+    /// at section boundaries, including repeated sections naming the same
+    /// table. Row indices in callbacks and invalid-change errors refer to the
+    /// original section. Later schemas are checked as they arrive; no effects
+    /// become committed until the entire input is accepted.
     pub async fn apply_with_handler<R, F>(
         conn: &mut Connection,
         cx: &Cx,
