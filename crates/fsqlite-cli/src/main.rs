@@ -1940,6 +1940,24 @@ where
         return DotCommandResult::Continue;
     }
 
+    if let Some(arg) = print_command_arg(trimmed) {
+        // Stock `.print STRING...`: the arguments joined by one space, then a
+        // newline (bd-5heqk).
+        let mut line = Vec::new();
+        for (index, word) in split_dot_command_args(arg).iter().enumerate() {
+            if index > 0 {
+                line.push(b' ');
+            }
+            line.extend_from_slice(word);
+        }
+        line.push(b'\n');
+        if let Err(error) = out.write_all(&line) {
+            let _ = writeln!(err, "error: {error}");
+            *had_error = true;
+        }
+        return DotCommandResult::Continue;
+    }
+
     if trimmed.starts_with('.') {
         let _ = writeln!(err, "error: unknown dot command `{trimmed}`");
         *had_error = true;
@@ -1957,6 +1975,115 @@ fn dot_command_arg<'a>(trimmed: &'a str, command: &str) -> Option<&'a str> {
         return None;
     }
     Some(rest.trim())
+}
+
+/// The argument text of a `.print` line. Like the stock shell, any prefix of
+/// `print` at least three letters long names the command.
+fn print_command_arg(trimmed: &str) -> Option<&str> {
+    let rest = trimmed.strip_prefix('.')?;
+    let name_len = rest
+        .bytes()
+        .position(is_dot_command_space)
+        .unwrap_or(rest.len());
+    let name = &rest[..name_len];
+    if name.len() >= 3 && "print".starts_with(name) {
+        Some(&rest[name_len..])
+    } else {
+        None
+    }
+}
+
+/// The stock shell's `isspace` separators between dot-command arguments.
+const fn is_dot_command_space(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
+}
+
+/// Split dot-command arguments the way the stock shell does: whitespace
+/// separates words, `'...'` and `"..."` quote them (a closing quote also ends
+/// the word, and an unterminated quote runs to the end of the line), and only
+/// double-quoted words resolve backslash escapes. The stock shell keeps at
+/// most 51 words including the command name, so at most 50 arguments; the
+/// rest of the line is ignored.
+fn split_dot_command_args(line: &str) -> Vec<Vec<u8>> {
+    const MAX_ARGS: usize = 50;
+    let bytes = line.as_bytes();
+    let mut args = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() && args.len() < MAX_ARGS {
+        while at < bytes.len() && is_dot_command_space(bytes[at]) {
+            at += 1;
+        }
+        if at == bytes.len() {
+            break;
+        }
+        let delimiter = bytes[at];
+        if delimiter == b'\'' || delimiter == b'"' {
+            at += 1;
+            let start = at;
+            while at < bytes.len() && bytes[at] != delimiter {
+                if bytes[at] == b'\\' && delimiter == b'"' && at + 1 < bytes.len() {
+                    at += 1;
+                }
+                at += 1;
+            }
+            let word = &bytes[start..at];
+            if at < bytes.len() {
+                at += 1;
+            }
+            args.push(if delimiter == b'"' {
+                resolve_backslashes(word)
+            } else {
+                word.to_vec()
+            });
+        } else {
+            let start = at;
+            while at < bytes.len() && !is_dot_command_space(bytes[at]) {
+                at += 1;
+            }
+            args.push(bytes[start..at].to_vec());
+        }
+    }
+    args
+}
+
+/// The stock shell's `resolve_backslashes`: `\a \b \t \n \v \f \r \" \' \\`,
+/// up to three octal digits (truncated to a byte), and any other escaped
+/// character stands for itself.
+fn resolve_backslashes(word: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(word.len());
+    let mut at = 0;
+    while at < word.len() {
+        let mut byte = word[at];
+        if byte == b'\\' && at + 1 < word.len() {
+            at += 1;
+            byte = match word[at] {
+                b'a' => 0x07,
+                b'b' => 0x08,
+                b't' => b'\t',
+                b'n' => b'\n',
+                b'v' => 0x0b,
+                b'f' => 0x0c,
+                b'r' => b'\r',
+                digit @ b'0'..=b'7' => {
+                    let mut value = digit - b'0';
+                    for _ in 0..2 {
+                        match word.get(at + 1) {
+                            Some(next @ b'0'..=b'7') => {
+                                value = value.wrapping_shl(3).wrapping_add(next - b'0');
+                                at += 1;
+                            }
+                            _ => break,
+                        }
+                    }
+                    value
+                }
+                other => other,
+            };
+        }
+        out.push(byte);
+        at += 1;
+    }
+    out
 }
 
 fn parse_optional_quoted_arg(raw: &str) -> Option<String> {
@@ -3113,6 +3240,44 @@ INSERT INTO r VALUES(9e999), (-9e999), (1.5);\n\
                 assert!(err.is_empty(), "SQL: {sql}; stderr: {err:?}");
                 assert_eq!(out, expected.as_bytes(), "SQL: {sql}");
             }
+        });
+    }
+
+    #[test]
+    fn test_print_dot_command_matches_stock_shell() {
+        asupersync::test_utils::run_test(|| async {
+            // bd-5heqk. Expected bytes are the stock sqlite3 3.46.1 shell's
+            // output for the same script: words joined by one space, quotes
+            // grouping and ending words, escapes only inside double quotes,
+            // and `.pri`/`.prin` as abbreviations.
+            let numbers = (1..=60).map(|n| n.to_string()).collect::<Vec<_>>();
+            let script = format!(
+                ".print hello\n.print\n.print a b   c\n.print \"a  b\" 'c  d'\n\
+                 .print \"tab\\there\" 'no\\tescape'\n.print \"q\\\"uote\" 'it''s'\n\
+                 .print \"oct\\101\\60z\" \"bs\\\\x\" \"\\q\"\n.print   lead   trail   \n\
+                 .print 'unterminated\n.print \"x\"y z\n.print a\x0bb\nSELECT 1;\n\
+                 .pri abbrev\n.prin x\n.print {}\n.print done\n",
+                numbers.join(" ")
+            );
+            let mut input = Cursor::new(script.into_bytes());
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let args = vec![OsString::from("fsqlite")];
+            let exit_code =
+                run_with_shell_options(args, &mut input, &mut out, &mut err, ShellOptions::batch())
+                    .await;
+            assert_eq!(exit_code, 0, "stderr: {}", String::from_utf8_lossy(&err));
+            assert!(err.is_empty(), "stderr: {}", String::from_utf8_lossy(&err));
+            let expected = format!(
+                "hello\n\na b c\na  b c  d\ntab\there no\\tescape\nq\"uote it s\n\
+                 octA0z bs\\x q\nlead trail\nunterminated\nx y z\na b\n1\nabbrev\nx\n{}\ndone\n",
+                numbers[..50].join(" ")
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&out),
+                expected,
+                "`.print` output differs from the stock shell"
+            );
         });
     }
 
