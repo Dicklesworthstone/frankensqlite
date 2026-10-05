@@ -41144,6 +41144,21 @@ impl Connection {
                 } else {
                     Vec::new()
                 };
+                // bd-yb70u: the triggers fire in row-key order, as in stock.
+                if trigger_old_rows.len() > 1 {
+                    match self.without_rowid_row_key_order(&effective_delete.table)? {
+                        None => trigger_old_rows.sort_by_key(|(rowid, _)| *rowid),
+                        Some(key_order) => {
+                            let registry =
+                                lock_unpoisoned(self.collation_registry.as_ref()).clone();
+                            trigger_old_rows.sort_by(|(_, left), (_, right)| {
+                                compare_without_rowid_row_keys(&key_order, &registry, |_, term| {
+                                    (left.get(term.column), right.get(term.column))
+                                })
+                            });
+                        }
+                    }
+                }
 
                 // Phase 5G.2 (bd-iqam): Fire BEFORE DELETE triggers.
                 //
@@ -52635,6 +52650,12 @@ impl Connection {
     /// first mutation. Rowid tables use an unshadowed hidden rowid alias (or
     /// INTEGER PRIMARY KEY); WITHOUT ROWID tables use the complete declared
     /// primary key.
+    ///
+    /// bd-yb70u: the locators come back in row-key order, not in the order the
+    /// WHERE scan found them. Stock collects such a statement's rows into a
+    /// table keyed by the row key (an ephemeral rowid table, or one keyed like
+    /// the PRIMARY KEY), so its triggers fire in rowid / primary-key order even
+    /// when the WHERE scan walks an index.
     async fn materialize_dml_replay_locators(
         &self,
         table_ref: &fsqlite_ast::QualifiedTableRef,
@@ -52653,13 +52674,62 @@ impl Connection {
             .collect();
         let select =
             Self::build_single_table_select(table_ref, projections, where_clause, &[], None);
-        let locator_rows = self
+        let mut locator_rows: Vec<Vec<SqliteValue>> = self
             .execute_statement(&Statement::Select(select), params)
             .await?
             .into_iter()
             .map(|row| row.values().to_vec())
             .collect();
+        if locator_rows.len() > 1 {
+            match self.without_rowid_row_key_order(table_ref)? {
+                None => locator_rows.sort_by(|left, right| cmp_sqlite_values(&left[0], &right[0])),
+                Some(key_order) => {
+                    let registry = lock_unpoisoned(self.collation_registry.as_ref()).clone();
+                    // A locator holds the primary key columns in key order.
+                    locator_rows.sort_by(|left, right| {
+                        compare_without_rowid_row_keys(&key_order, &registry, |position, _| {
+                            (left.get(position), right.get(position))
+                        })
+                    });
+                }
+            }
+        }
         Ok(Some((locator_columns, locator_rows)))
+    }
+
+    /// bd-yb70u: how the target's rows are ordered by row key, the order stock
+    /// visits the rows of a multi-row UPDATE / DELETE with triggers in. `None`
+    /// for a rowid table (ascending rowid); otherwise one `(declared column
+    /// index, descending, collation)` per WITHOUT ROWID primary key column,
+    /// compared the way the table's storage compares them.
+    fn without_rowid_row_key_order(
+        &self,
+        table_ref: &fsqlite_ast::QualifiedTableRef,
+    ) -> Result<Option<Vec<WithoutRowidKeyTerm>>> {
+        self.with_dml_target_table(table_ref, |table| {
+            if !table.without_rowid {
+                return Ok(None);
+            }
+            let pk_indices = without_rowid_pk_indices(table).map_err(codegen_error_to_franken)?;
+            let desc_flags = self
+                .without_rowid_pk_desc
+                .borrow()
+                .get(&table.name.to_ascii_lowercase())
+                .filter(|flags| flags.len() == pk_indices.len())
+                .cloned()
+                .unwrap_or_else(|| vec![false; pk_indices.len()]);
+            Ok(Some(
+                pk_indices
+                    .into_iter()
+                    .zip(desc_flags)
+                    .map(|(column, descending)| WithoutRowidKeyTerm {
+                        column,
+                        descending,
+                        collation: table.columns[column].collation.clone(),
+                    })
+                    .collect(),
+            ))
+        })?
     }
 
     /// Run `f` on the schema of the table a DML statement targets (the
@@ -133989,6 +134059,43 @@ fn cmp_sqlite_values_collated_snapshot(
         return compare_text_bytes_collated_snapshot(at.as_bytes(), bt.as_bytes(), coll, registry);
     }
     cmp_sqlite_values(a, b)
+}
+
+/// bd-yb70u: one WITHOUT ROWID primary key column, ordered as its storage
+/// orders it.
+struct WithoutRowidKeyTerm {
+    /// Declared column index.
+    column: usize,
+    descending: bool,
+    collation: Option<String>,
+}
+
+/// Compare two rows by WITHOUT ROWID primary key. `key_values(position, term)`
+/// yields the left and right values of the `position`th key column.
+fn compare_without_rowid_row_keys<'a>(
+    key_order: &[WithoutRowidKeyTerm],
+    registry: &CollationRegistry,
+    key_values: impl Fn(
+        usize,
+        &WithoutRowidKeyTerm,
+    ) -> (Option<&'a SqliteValue>, Option<&'a SqliteValue>),
+) -> std::cmp::Ordering {
+    for (position, term) in key_order.iter().enumerate() {
+        let (Some(left), Some(right)) = key_values(position, term) else {
+            continue;
+        };
+        let ordering =
+            cmp_sqlite_values_collated_snapshot(left, right, term.collation.as_deref(), registry);
+        let ordering = if term.descending {
+            ordering.reverse()
+        } else {
+            ordering
+        };
+        if ordering.is_ne() {
+            return ordering;
+        }
+    }
+    std::cmp::Ordering::Equal
 }
 
 /// Compare two GROUP BY key vectors with per-element collation.
