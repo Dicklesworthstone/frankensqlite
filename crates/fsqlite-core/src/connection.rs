@@ -10043,6 +10043,9 @@ struct ViewDef {
     /// connection's persistent MAIN catalog. Attached databases use their own
     /// child `Connection`, so they do not need a third durable scope here.
     temporary: bool,
+    /// The `sqlite_temp_master.sql` text of a TEMP view, as stored at CREATE
+    /// (bd-i95tk). MAIN views keep theirs in `sqlite_master`.
+    temp_create_sql: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -13206,6 +13209,11 @@ pub struct Connection {
     /// parentheses. `None` for multi-statement batches and non-CREATE statements;
     /// consumed (taken) by the CREATE handler.
     pending_ddl_source: RefCell<Option<String>>,
+    /// Verbatim source of the `ALTER TABLE ... ADD COLUMN` statement currently
+    /// being executed, so the added column's text and default are stored as
+    /// written (bd-i95tk). Separate from `pending_ddl_source`, which nested
+    /// statements run by DDL handlers reset; taken before any of them run.
+    pending_alter_source: RefCell<Option<String>>,
     /// Set of table names (lowercased) declared as
     /// `INTEGER PRIMARY KEY AUTOINCREMENT`.
     autoincrement_tables: RefCell<HashSet<String>>,
@@ -15079,6 +15087,7 @@ impl Connection {
             without_rowid_pk_desc: RefCell::new(HashMap::new()),
             original_ddl_sql: RefCell::new(HashMap::new()),
             pending_ddl_source: RefCell::new(None),
+            pending_alter_source: RefCell::new(None),
             autoincrement_tables: RefCell::new(HashSet::new()),
             sqlite_sequence_cache: RefCell::new(HashMap::new()),
             temp_sqlite_sequence: RefCell::new(HashMap::new()),
@@ -15629,6 +15638,7 @@ impl Connection {
             without_rowid_pk_desc: RefCell::new(HashMap::new()),
             original_ddl_sql: RefCell::new(HashMap::new()),
             pending_ddl_source: RefCell::new(None),
+            pending_alter_source: RefCell::new(None),
             autoincrement_tables: RefCell::new(HashSet::new()),
             sqlite_sequence_cache: RefCell::new(HashMap::new()),
             temp_sqlite_sequence: RefCell::new(HashMap::new()),
@@ -27757,13 +27767,40 @@ impl Connection {
             self.cached_parse_multi(sql)?
         };
         let mut rows = Vec::new();
-        for statement in statements {
+        for (statement, source) in statements_with_verbatim_sources(sql, statements) {
             rows = self
-                .execute_statement_after_background_status(statement.as_ref(), None)
+                .execute_top_level_statement(statement.as_ref(), source)
                 .await?;
             self.note_connection_statement_execution_count(1);
         }
         Ok(rows)
+    }
+
+    /// Execute one statement of an `execute` / `query` call. A statement whose
+    /// text the schema keeps (CREATE, ALTER TABLE ... ADD COLUMN) gets its own
+    /// source for exactly its own execution (bd-i95tk): set before, cleared
+    /// after, so text of a statement that failed before consuming it can never
+    /// be stored for a later one. Other statements leave the slots alone, so
+    /// the reads a DDL handler runs internally cannot clear its text.
+    async fn execute_top_level_statement(
+        &self,
+        statement: &Statement,
+        source: Option<&str>,
+    ) -> Result<Vec<Row>> {
+        if !statement_keeps_verbatim_source(statement) {
+            return self
+                .execute_statement_after_background_status(statement, None)
+                .await;
+        }
+        let is_alter = matches!(statement, Statement::AlterTable(_));
+        *self.pending_ddl_source.borrow_mut() = source.filter(|_| !is_alter).map(str::to_owned);
+        *self.pending_alter_source.borrow_mut() = source.filter(|_| is_alter).map(str::to_owned);
+        let result = self
+            .execute_statement_after_background_status(statement, None)
+            .await;
+        self.pending_ddl_source.borrow_mut().take();
+        self.pending_alter_source.borrow_mut().take();
+        result
     }
 
     /// Prepare and execute SQL as a query with bound SQL parameters.
@@ -28160,14 +28197,15 @@ impl Connection {
                 })
                 .await;
         }
-        // Preserve the verbatim CREATE text for a single top-level CREATE so it
-        // persists into sqlite_master exactly as written (matching stock SQLite),
-        // rather than a re-serialized AST form that can drop semantically necessary
-        // parentheses. Covers CREATE TABLE / INDEX / VIEW / TRIGGER — every object
-        // whose definition round-trips through sqlite_master.sql. An internal
-        // ALTER->CREATE rewrite never reaches here (those paths re-render via
-        // render_create_* and write sqlite_master directly, without going through
-        // execute()); multi-statement batches fall back to AST serialization.
+        // Preserve the verbatim text of every top-level CREATE so it persists
+        // into sqlite_master exactly as written (matching stock SQLite), rather
+        // than a re-serialized AST form that can drop semantically necessary
+        // parentheses. Covers CREATE TABLE / INDEX / VIEW / TRIGGER — every
+        // object whose definition round-trips through sqlite_master.sql — and
+        // the column text ALTER TABLE ... ADD COLUMN splices in, inside a
+        // multi-statement batch too (`statements_with_verbatim_sources`). An
+        // internal ALTER->CREATE rewrite never reaches here (those paths
+        // re-render via render_create_* and write sqlite_master directly).
         //
         // Keep the raw source here because expression spans are offsets into
         // this exact input. Stripping a leading comment before CHECK/default
@@ -28175,23 +28213,14 @@ impl Connection {
         // silently attach unrelated source bytes to a constraint. The CREATE
         // handlers normalize the consumed copy immediately before persisting it
         // to sqlite_master, which still must begin at the first CREATE token.
-        *self.pending_ddl_source.borrow_mut() = (statements.len() == 1
-            && matches!(
-                statements[0].as_ref(),
-                Statement::CreateTable(_)
-                    | Statement::CreateIndex(_)
-                    | Statement::CreateView(_)
-                    | Statement::CreateTrigger(_)
-            ))
-        .then(|| sql.to_owned());
         let mut last_count = 0;
-        for statement in statements {
+        for (statement, source) in statements_with_verbatim_sources(sql, statements) {
             let is_dml = matches!(
                 statement.as_ref(),
                 Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
             );
             let rows = self
-                .execute_statement_after_background_status(statement.as_ref(), None)
+                .execute_top_level_statement(statement.as_ref(), source)
                 .await?;
             self.note_connection_statement_execution_count(1);
             last_count = if is_dml {
@@ -65952,6 +65981,12 @@ impl Connection {
         &self,
         alter: &fsqlite_ast::AlterTableStatement,
     ) -> Result<()> {
+        // bd-i95tk: the ADD COLUMN statement's own text, taken before any
+        // nested statement this handler runs can reset it.
+        let alter_source = self.pending_alter_source.borrow_mut().take();
+        let added_column_source = alter_source
+            .as_deref()
+            .and_then(alter_add_column_definition_source);
         let table_name = &alter.table.name;
         if matches!(alter.action, AlterTableAction::RenameTo(_))
             && self.has_live_vtab_instance(table_name)
@@ -66103,6 +66138,7 @@ impl Connection {
                 &original_sql,
                 &old_name,
                 &alter.action,
+                added_column_source,
             )?)
         };
 
@@ -66463,7 +66499,11 @@ impl Connection {
                                 "Cannot add a column with non-constant default".to_owned(),
                             ));
                         }
-                        Ok(self.format_default_value_verbatim(dv))
+                        // bd-i95tk: the default as the ALTER wrote it.
+                        Ok(alter_source.as_deref().map_or_else(
+                            || self.format_default_value_verbatim(dv),
+                            |source| crate::compat_persist::default_value_source_text(dv, source),
+                        ))
                     })
                     .transpose()?;
                 let (generated_expr, generated_stored) = col_def
@@ -68895,13 +68935,15 @@ impl Connection {
         // e.g. redundant parens in a partial-index WHERE) when present; fall back
         // to AST re-render for multi-statement batches / internal rewrites.
         let pending_create_sql = self.take_pending_ddl_source_for_storage();
-        let create_sql = if stmt.name.schema.is_some() {
-            let mut stored_stmt = stmt.clone();
-            stored_stmt.name.schema = None;
-            stored_stmt.to_string()
-        } else {
-            pending_create_sql.unwrap_or_else(|| stmt.to_string())
-        };
+        let create_sql = pending_create_sql
+            .as_deref()
+            .and_then(normalize_create_object_sql_for_storage)
+            .unwrap_or_else(|| {
+                let mut stored_stmt = stmt.clone();
+                stored_stmt.name.schema = None;
+                stored_stmt.if_not_exists = false;
+                stored_stmt.to_string()
+            });
         if !target_is_temp {
             self.insert_sqlite_master_row("index", &index_name, table_name, root_page, &create_sql)
                 .await?;
@@ -69143,18 +69185,22 @@ impl Connection {
         // (byte-faithful to the issued statement, incl. redundant parens in the
         // view's SELECT) over an AST re-render; fall back for batches / rewrites.
         let pending_create_sql = self.take_pending_ddl_source_for_storage();
-        let create_sql = if stmt.name.schema.is_some() {
-            let mut stored_stmt = stmt.clone();
-            stored_stmt.name.schema = None;
-            stored_stmt.to_string()
-        } else {
-            pending_create_sql.unwrap_or_else(|| stmt.to_string())
-        };
+        let create_sql = pending_create_sql
+            .as_deref()
+            .and_then(normalize_create_object_sql_for_storage)
+            .unwrap_or_else(|| {
+                let mut stored_stmt = stmt.clone();
+                stored_stmt.name.schema = None;
+                stored_stmt.if_not_exists = false;
+                stored_stmt.temporary = false;
+                stored_stmt.to_string()
+            });
         self.views.borrow_mut().push(ViewDef {
             name: view_name.clone(),
             columns: stmt.columns.clone(),
             query: stmt.query.clone(),
             temporary: target_is_temp,
+            temp_create_sql: target_is_temp.then(|| create_sql.clone()),
         });
         self.rebuild_schema_indices();
 
@@ -69246,13 +69292,16 @@ impl Connection {
         // through sqlite_master byte-for-byte (breaking schema-digest consumers
         // and stock sqlite3 tooling). Fall back for batches / internal rewrites.
         let pending_create_sql = self.take_pending_ddl_source_for_storage();
-        let create_sql = if stmt.name.schema.is_some() {
-            let mut stored_stmt = stmt.clone();
-            stored_stmt.name.schema = None;
-            stored_stmt.to_string()
-        } else {
-            pending_create_sql.unwrap_or_else(|| stmt.to_string())
-        };
+        let create_sql = pending_create_sql
+            .as_deref()
+            .and_then(normalize_create_object_sql_for_storage)
+            .unwrap_or_else(|| {
+                let mut stored_stmt = stmt.clone();
+                stored_stmt.name.schema = None;
+                stored_stmt.if_not_exists = false;
+                stored_stmt.temporary = false;
+                stored_stmt.to_string()
+            });
         self.triggers
             .borrow_mut()
             .push(TriggerDef::from_create_statement(stmt, create_sql.clone()));
@@ -73121,9 +73170,10 @@ impl Connection {
         }
 
         for view in views.iter().filter(|view| view.temporary) {
-            let view_sql = ddl_cache
-                .get(&view.name.to_ascii_lowercase())
-                .cloned()
+            let view_sql = view
+                .temp_create_sql
+                .clone()
+                .or_else(|| ddl_cache.get(&view.name.to_ascii_lowercase()).cloned())
                 .unwrap_or_else(|| format!("CREATE VIEW {}", view.name));
             rows.push(vec![
                 SqliteValue::Text("view".into()),
@@ -101221,6 +101271,7 @@ impl Connection {
                         columns: stmt.columns.clone(),
                         query: stmt.query.clone(),
                         temporary: false,
+                        temp_create_sql: None,
                     });
                     continue;
                 }
@@ -111243,6 +111294,148 @@ fn normalize_create_table_sql_for_storage(source: &str) -> Option<String> {
     Some(format!("CREATE TABLE {suffix}"))
 }
 
+/// The `sqlite_master.sql` text stock SQLite stores for `CREATE [UNIQUE] INDEX`,
+/// `CREATE [TEMP] VIEW` or `CREATE [TEMP] TRIGGER`: `CREATE [UNIQUE ]<KIND> `
+/// followed by the source from the object name onward, verbatim. `TEMP`, `IF
+/// NOT EXISTS` and a schema qualifier are dropped (bd-i95tk).
+fn normalize_create_object_sql_for_storage(source: &str) -> Option<String> {
+    use fsqlite_parser::{Lexer, TokenKind};
+
+    let mut lexer = Lexer::new(source);
+    if lexer.next_token().kind != TokenKind::KwCreate {
+        return None;
+    }
+    let mut token = lexer.next_token();
+    let unique = token.kind == TokenKind::KwUnique;
+    if unique || matches!(token.kind, TokenKind::KwTemp | TokenKind::KwTemporary) {
+        token = lexer.next_token();
+    }
+    let kind = match token.kind {
+        TokenKind::KwIndex => "INDEX",
+        TokenKind::KwView if !unique => "VIEW",
+        TokenKind::KwTrigger if !unique => "TRIGGER",
+        _ => return None,
+    };
+    let mut name = lexer.next_token();
+    if name.kind == TokenKind::KwIf {
+        if lexer.next_token().kind != TokenKind::KwNot
+            || lexer.next_token().kind != TokenKind::KwExists
+        {
+            return None;
+        }
+        name = lexer.next_token();
+    }
+    if lexer.next_token().kind == TokenKind::Dot {
+        name = lexer.next_token();
+    }
+    let suffix = source.get(usize::try_from(name.span.start).ok()?..)?;
+    let unique = if unique { "UNIQUE " } else { "" };
+    Some(format!("CREATE {unique}{kind} {suffix}"))
+}
+
+/// Statements whose source text is persisted (or spliced) into the schema as
+/// written: every CREATE that stores `sqlite_master.sql`, and ADD COLUMN.
+fn statement_keeps_verbatim_source(statement: &Statement) -> bool {
+    match statement {
+        Statement::CreateTable(_)
+        | Statement::CreateIndex(_)
+        | Statement::CreateView(_)
+        | Statement::CreateTrigger(_) => true,
+        Statement::AlterTable(alter) => matches!(alter.action, AlterTableAction::AddColumn(_)),
+        _ => false,
+    }
+}
+
+/// Pair each statement of an `execute` / `query` call with the source text the
+/// schema keeps for it (bd-i95tk). A lone statement's source is the whole
+/// input. Inside a multi-statement batch a CREATE or ADD COLUMN is reparsed
+/// from its own slice, because the batch parse's expression spans are offsets
+/// into the whole batch; a batch that does not split cleanly leaves its text to
+/// the AST rendering, as before.
+fn statements_with_verbatim_sources(
+    sql: &str,
+    statements: Vec<Arc<Statement>>,
+) -> Vec<(Arc<Statement>, Option<&str>)> {
+    if statements.len() == 1 {
+        return statements
+            .into_iter()
+            .map(|statement| (statement, Some(sql)))
+            .collect();
+    }
+    let batch_sources = statements
+        .iter()
+        .any(|statement| statement_keeps_verbatim_source(statement))
+        .then(|| batch_statement_sources(sql))
+        .flatten()
+        .filter(|sources| sources.len() == statements.len());
+    statements
+        .into_iter()
+        .enumerate()
+        .map(|(index, statement)| {
+            if statement_keeps_verbatim_source(&statement)
+                && let Some(source) = batch_sources.as_ref().map(|sources| sources[index])
+                && let Ok(Some((reparsed, _))) =
+                    fsqlite_parser::parse_first_statement_with_tail(source)
+            {
+                return (Arc::new(reparsed), Some(source));
+            }
+            (statement, None)
+        })
+        .collect()
+}
+
+/// The source text of each statement of a multi-statement batch, in order,
+/// or `None` when the batch does not split cleanly. One parser walks the
+/// whole batch, which is tokenized once: restarting a parse on each remaining
+/// tail would re-tokenize it per statement, quadratic in the batch.
+fn batch_statement_sources(sql: &str) -> Option<Vec<&str>> {
+    let mut parser = fsqlite_parser::Parser::from_sql(sql);
+    let mut sources = Vec::new();
+    let mut start = 0;
+    while let Some((_, end)) = parser.parse_next_statement_with_tail().ok()? {
+        if end <= start {
+            return None;
+        }
+        sources.push(sql.get(start..end)?);
+        start = end;
+    }
+    Some(sources)
+}
+
+/// The column definition of `ALTER TABLE [schema.]name ADD [COLUMN] <def>`
+/// exactly as written: from the column name to the end of the statement,
+/// trailing whitespace and `;` removed but comments kept, which is the text
+/// stock SQLite splices into the table's stored CREATE (bd-i95tk).
+fn alter_add_column_definition_source(source: &str) -> Option<&str> {
+    use fsqlite_parser::{Lexer, TokenKind};
+
+    let (_, end) = fsqlite_parser::parse_first_statement_with_tail(source).ok()??;
+    let statement = source.get(..end)?;
+    let mut lexer = Lexer::new(statement);
+    if lexer.next_token().kind != TokenKind::KwAlter
+        || lexer.next_token().kind != TokenKind::KwTable
+    {
+        return None;
+    }
+    let _table_name = lexer.next_token();
+    let mut token = lexer.next_token();
+    if token.kind == TokenKind::Dot {
+        let _qualified_name = lexer.next_token();
+        token = lexer.next_token();
+    }
+    if token.kind != TokenKind::KwAdd {
+        return None;
+    }
+    token = lexer.next_token();
+    if token.kind == TokenKind::KwColumn {
+        token = lexer.next_token();
+    }
+    let definition = statement
+        .get(usize::try_from(token.span.start).ok()?..)?
+        .trim_end_matches(|c: char| c == ';' || c.is_ascii_whitespace());
+    (!definition.is_empty()).then_some(definition)
+}
+
 /// bd-67tdh Phase 2: stock sqlite3 3.46.1 (oracle) implements ALTER TABLE ADD
 /// COLUMN by splicing the new column definition into the *original* CREATE text
 /// verbatim -- immediately after the last column definition and before any
@@ -111477,6 +111670,7 @@ fn rewrite_create_table_sql_for_alter(
     original_sql: &str,
     expected_table_name: &str,
     action: &AlterTableAction,
+    added_column_source: Option<&str>,
 ) -> Result<String> {
     let mut create = parse_create_table_for_schema_rewrite(original_sql, expected_table_name)?;
     let self_table_name = create.name.name.clone();
@@ -111551,11 +111745,22 @@ fn rewrite_create_table_sql_for_alter(
             // so a verbatim-stored CREATE stays byte-faithful to `.schema` across
             // ADD COLUMN. Fall back to AST re-serialization when the column-list
             // structure cannot be located.
-            if !had_schema_qualifier
-                && let Some(spliced) =
-                splice_added_column_into_create_sql(original_sql, &column.to_string())
-            {
-                return Ok(spliced);
+            //
+            // bd-i95tk: the spliced column is the ALTER's own text when it is
+            // known, as in stock. Verbatim text that would not reparse (a
+            // trailing `--` comment swallows the closing parenthesis; stock
+            // rejects that ALTER) falls back to the rendered column.
+            if !had_schema_qualifier {
+                let verbatim = added_column_source.and_then(|source| {
+                    splice_added_column_into_create_sql(original_sql, source).filter(|spliced| {
+                        parse_create_table_for_schema_rewrite(spliced, expected_table_name).is_ok()
+                    })
+                });
+                if let Some(spliced) = verbatim.or_else(|| {
+                    splice_added_column_into_create_sql(original_sql, &column.to_string())
+                }) {
+                    return Ok(spliced);
+                }
             }
             let (columns, _) = create_table_columns_and_constraints_mut(&mut create)?;
             columns.push(column.clone());
