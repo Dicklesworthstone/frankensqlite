@@ -949,6 +949,11 @@ fn nonterminal_epoch_wake_reason(wait_result: KeyedWaitResult) -> EpochWakeReaso
 struct KeyedWaitSlot {
     state: Mutex<u64>,
     cv: Condvar,
+    /// Threads parked on `cv`, counted under `state`. std's futex condvar
+    /// makes a FUTEX_WAKE syscall on every `notify_all`, waiter or not, and
+    /// the group-commit queue signals on every transaction begin and exit
+    /// (bd-ih8ak); a zero count lets `signal` skip that syscall.
+    sync_waiters: AtomicUsize,
     notify: Notify,
     #[cfg(test)]
     drop_next_async_notify: AtomicBool,
@@ -1038,6 +1043,7 @@ impl Default for KeyedWaitSlot {
         Self {
             state: Mutex::new(0),
             cv: Condvar::new(),
+            sync_waiters: AtomicUsize::new(0),
             notify: Notify::new(),
             #[cfg(test)]
             drop_next_async_notify: AtomicBool::new(false),
@@ -1067,12 +1073,17 @@ impl KeyedWaitSlot {
         if *guard != observed_generation {
             return KeyedWaitResult::Signaled;
         }
-        let (_guard, timeout_result) = self
+        // Registered while `state` is held, before `cv` releases it, so a
+        // `signal` that finds no waiter cannot be racing one into its sleep.
+        self.sync_waiters.fetch_add(1, AtomicOrdering::Relaxed);
+        let (guard, timeout_result) = self
             .cv
             .wait_timeout_while(guard, timeout, |generation| {
                 *generation == observed_generation
             })
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.sync_waiters.fetch_sub(1, AtomicOrdering::Relaxed);
+        drop(guard);
         if timeout_result.timed_out() {
             KeyedWaitResult::TimedOut
         } else {
@@ -1166,7 +1177,9 @@ impl KeyedWaitSlot {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *generation = generation.wrapping_add(1);
-        self.cv.notify_all();
+        if self.sync_waiters.load(AtomicOrdering::Relaxed) > 0 {
+            self.cv.notify_all();
+        }
         self.notify.notify_waiters();
     }
 }

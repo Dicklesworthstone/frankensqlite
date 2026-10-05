@@ -25,7 +25,7 @@ use std::future::Future;
 use std::hash::BuildHasher;
 use std::io::{self, BufReader, BufWriter, Read, Seek, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -1381,8 +1381,11 @@ pub struct ParallelWalDurabilityCombiner {
     ordered_residue_claimed: AtomicBool,
     ordered_residue_wait_lock: Mutex<()>,
     ordered_residue_wait: Condvar,
-    #[cfg(test)]
-    ordered_residue_blocking_waiters: std::sync::atomic::AtomicUsize,
+    /// Threads in [`Self::claim_ordered_residue_blocking`]. Releasing the
+    /// residue notifies `ordered_residue_wait` only when this is nonzero:
+    /// std's futex condvar makes a FUTEX_WAKE syscall on every `notify_all`,
+    /// waiter or not, and the residue is released on every commit (bd-ih8ak).
+    ordered_residue_blocking_waiters: AtomicUsize,
     next_pending_publication_id: AtomicU64,
     pending_publication: Mutex<Option<PendingParallelWalPublicationState>>,
     state: Mutex<ParallelWalCombinerState>,
@@ -1392,19 +1395,41 @@ struct ParallelWalOrderedResidueGuard<'a> {
     claimed: &'a AtomicBool,
     wait_lock: &'a Mutex<()>,
     wait: &'a Condvar,
+    blocking_waiters: &'a AtomicUsize,
     release_claim_on_drop: bool,
 }
 
-#[cfg(test)]
 struct ParallelWalBlockingWaiterGuard<'a> {
-    waiters: &'a std::sync::atomic::AtomicUsize,
+    waiters: &'a AtomicUsize,
 }
 
-#[cfg(test)]
 impl Drop for ParallelWalBlockingWaiterGuard<'_> {
     fn drop(&mut self) {
         self.waiters.fetch_sub(1, Ordering::AcqRel);
     }
+}
+
+/// Release the ordered-residue claim and wake blocking claimants, if any.
+/// Returns whether the claim was held.
+///
+/// A blocking claimant counts itself before it takes `wait_lock` and retries
+/// its claim under that lock before sleeping, so a release that reads zero
+/// under the same lock has no claimant to wake: one that has not yet taken
+/// the lock will see the claim free on its retry.
+fn release_ordered_residue_claim(
+    claimed: &AtomicBool,
+    wait_lock: &Mutex<()>,
+    wait: &Condvar,
+    blocking_waiters: &AtomicUsize,
+) -> bool {
+    let _wait_guard = wait_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let was_claimed = claimed.swap(false, Ordering::Release);
+    if blocking_waiters.load(Ordering::Acquire) > 0 {
+        wait.notify_all();
+    }
+    was_claimed
 }
 
 impl Drop for ParallelWalOrderedResidueGuard<'_> {
@@ -1412,12 +1437,12 @@ impl Drop for ParallelWalOrderedResidueGuard<'_> {
         if !self.release_claim_on_drop {
             return;
         }
-        let _wait_guard = self
-            .wait_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.claimed.store(false, Ordering::Release);
-        self.wait.notify_all();
+        let _ = release_ordered_residue_claim(
+            self.claimed,
+            self.wait_lock,
+            self.wait,
+            self.blocking_waiters,
+        );
     }
 }
 
@@ -1455,8 +1480,7 @@ impl ParallelWalDurabilityCombiner {
             ordered_residue_claimed: AtomicBool::new(false),
             ordered_residue_wait_lock: Mutex::new(()),
             ordered_residue_wait: Condvar::new(),
-            #[cfg(test)]
-            ordered_residue_blocking_waiters: std::sync::atomic::AtomicUsize::new(0),
+            ordered_residue_blocking_waiters: AtomicUsize::new(0),
             next_pending_publication_id: AtomicU64::new(0),
             pending_publication: Mutex::new(None),
             state: Mutex::new(ParallelWalCombinerState {
@@ -1597,6 +1621,7 @@ impl ParallelWalDurabilityCombiner {
             claimed: &self.ordered_residue_claimed,
             wait_lock: &self.ordered_residue_wait_lock,
             wait: &self.ordered_residue_wait,
+            blocking_waiters: &self.ordered_residue_blocking_waiters,
             release_claim_on_drop: true,
         })
     }
@@ -1606,7 +1631,6 @@ impl ParallelWalDurabilityCombiner {
             return guard;
         }
 
-        #[cfg(test)]
         let _waiter_guard = {
             self.ordered_residue_blocking_waiters
                 .fetch_add(1, Ordering::AcqRel);
@@ -1846,16 +1870,16 @@ impl ParallelWalDurabilityCombiner {
     }
 
     fn release_retained_ordered_residue(&self) {
-        let _wait_guard = self
-            .ordered_residue_wait_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let was_claimed = self.ordered_residue_claimed.swap(false, Ordering::Release);
+        let was_claimed = release_ordered_residue_claim(
+            &self.ordered_residue_claimed,
+            &self.ordered_residue_wait_lock,
+            &self.ordered_residue_wait,
+            &self.ordered_residue_blocking_waiters,
+        );
         debug_assert!(
             was_claimed,
             "a retained publication must own the ordered residue"
         );
-        self.ordered_residue_wait.notify_all();
     }
 
     /// Publish an exact pending interval after durable recovery evidence
