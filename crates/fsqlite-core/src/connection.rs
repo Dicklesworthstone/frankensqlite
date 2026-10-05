@@ -112411,12 +112411,15 @@ async fn rewrite_in_select_core(
 /// named-table reference to a freshly-minted CTE, accumulating the CTE in `ctes`.
 /// Non-subquery sources pass through unchanged.
 ///
-/// An aliased subquery keeps its alias as the CTE name so every `alias.col`
-/// reference resolves to the materialized relation by name. An unaliased
-/// subquery (legal but rare, e.g. `FROM src, (SELECT 1)`) gets a synthetic,
-/// collision-resistant name derived from its FROM position; its columns remain
+/// The CTE gets a synthetic, collision-resistant name derived from its FROM
+/// position, and the reference keeps the subquery's alias, so every
+/// `alias.col` reference resolves to the materialized relation. An unaliased
+/// subquery (legal but rare, e.g. `FROM src, (SELECT 1)`) keeps its columns
 /// reachable only unqualified, exactly as SQLite treats an unaliased FROM
-/// subquery.
+/// subquery. bd-hhh47: naming the CTE after the alias made a body that reads a
+/// table of the alias's name (`FROM (SELECT * FROM s) AS s`) a CTE
+/// self-reference ("circular reference: s"), and shadowed that table anywhere
+/// else in the statement.
 fn hoist_update_from_source_to_cte(
     src: &TableOrSubquery,
     position: usize,
@@ -112425,10 +112428,7 @@ fn hoist_update_from_source_to_cte(
     let TableOrSubquery::Subquery { query, alias } = src else {
         return src.clone();
     };
-    let cte_name = match alias {
-        Some(alias) => alias.clone(),
-        None => format!("__fsqlite_update_from_subquery_{position}"),
-    };
+    let cte_name = format!("__fsqlite_update_from_subquery_{position}");
     ctes.push(fsqlite_ast::Cte {
         name: cte_name.clone(),
         columns: Vec::new(),
@@ -112440,7 +112440,7 @@ fn hoist_update_from_source_to_cte(
             schema: None,
             name: cte_name,
         },
-        alias: None,
+        alias: alias.clone(),
         index_hint: None,
         time_travel: None,
     }
