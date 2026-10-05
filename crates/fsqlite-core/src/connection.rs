@@ -19719,6 +19719,28 @@ impl Connection {
         f(conn.as_ref()).await
     }
 
+    /// [`Self::with_attached_connection_async`] for a delegated CREATE or
+    /// ALTER, handing the statement's verbatim source to the attached
+    /// connection for exactly that call (bd-i95tk, bd-az48n). The delegated
+    /// statement's expression spans are offsets into that text, and the
+    /// child's handlers drop the schema qualifier when they store it.
+    async fn with_attached_connection_and_source<T, F>(&self, schema: &str, f: F) -> Result<T>
+    where
+        F: std::ops::AsyncFnOnce(&Self) -> Result<T>,
+    {
+        let ddl_source = self.pending_ddl_source.borrow().clone();
+        let alter_source = self.pending_alter_source.borrow().clone();
+        self.with_attached_connection_async(schema, async move |conn| {
+            *conn.pending_ddl_source.borrow_mut() = ddl_source;
+            *conn.pending_alter_source.borrow_mut() = alter_source;
+            let result = f(conn).await;
+            conn.pending_ddl_source.borrow_mut().take();
+            conn.pending_alter_source.borrow_mut().take();
+            result
+        })
+        .await
+    }
+
     fn validate_attached_target_schema(
         &self,
         name: &QualifiedName,
@@ -20378,7 +20400,7 @@ impl Connection {
                         .await
                         .map(Some)
                     } else {
-                        self.with_attached_connection_async(&target_schema, async |conn| {
+                        self.with_attached_connection_and_source(&target_schema, async |conn| {
                             conn.execute_statement(&Statement::CreateTable(rewritten), params)
                                 .await
                         })
@@ -20408,7 +20430,7 @@ impl Connection {
                         table = %create_index.table,
                         "delegating attached-schema CREATE INDEX to attached connection"
                     );
-                    self.with_attached_connection_async(&target_schema, async |conn| {
+                    self.with_attached_connection_and_source(&target_schema, async |conn| {
                         conn.execute_statement(&Statement::CreateIndex(rewritten), params)
                             .await
                     })
@@ -20855,6 +20877,33 @@ impl Connection {
                     );
                     self.with_attached_connection_async(&target_schema, async |conn| {
                         conn.execute_statement(&Statement::Drop(rewritten), params)
+                            .await
+                    })
+                    .await
+                    .map(Some)
+                }
+                Statement::AlterTable(alter) => {
+                    // bd-az48n: ALTER TABLE on an attached table runs on the
+                    // attached connection, like every other attached write.
+                    let Some(target_schema) = self.attached_target_schema(&alter.table)? else {
+                        return Ok(None);
+                    };
+                    self.prepare_attached_target_write_in_explicit_transaction(
+                        "ALTER TABLE",
+                        alter.table.schema.as_deref().unwrap_or(&target_schema),
+                    )
+                    .await?;
+                    let mut rewritten = alter.clone();
+                    // The attached catalog is the delegated connection's MAIN;
+                    // keep the scope exact as DROP does.
+                    rewritten.table.schema = Some("main".to_owned());
+                    tracing::debug!(
+                        schema = %target_schema,
+                        table = %alter.table.name,
+                        "delegating attached-schema ALTER TABLE to attached connection"
+                    );
+                    self.with_attached_connection_and_source(&target_schema, async |conn| {
+                        conn.execute_statement(&Statement::AlterTable(rewritten), params)
                             .await
                     })
                     .await
