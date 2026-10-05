@@ -139,3 +139,137 @@ fn single_writer_ddl_churn_republication_is_never_snapshot_refused() {
         let _ = std::fs::remove_file(&path);
     });
 }
+
+/// br-qfvd6: retain the real downstream handoff between independent engines.
+/// No connection overlaps the canonical migration/checkpoint interval.
+async fn mixed_engine_bootstrap(path: &str, tables: usize) {
+    let bootstrap = Connection::open(path).await.expect("bootstrap open");
+    bootstrap
+        .execute("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+        .await
+        .expect("bootstrap WAL pragmas");
+    bootstrap
+        .execute(&synthesize_ddl_batch(tables, "base"))
+        .await
+        .expect("bootstrap schema");
+    bootstrap.close().await.expect("close bootstrap connection");
+
+    let canonical = rusqlite::Connection::open(path).expect("canonical migration open");
+    canonical
+        .execute_batch(
+            "PRAGMA journal_mode=WAL;
+             BEGIN IMMEDIATE;
+             CREATE TABLE migration_ledger (version INTEGER PRIMARY KEY);
+             INSERT INTO migration_ledger VALUES (1);
+             CREATE INDEX canonical_payload ON base_0(payload);
+             COMMIT;",
+        )
+        .expect("canonical migration");
+    let checkpoint: (i64, i64, i64) = canonical
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .expect("canonical checkpoint");
+    assert_eq!(checkpoint.0, 0, "checkpoint must complete: {checkpoint:?}");
+    canonical.close().expect("close canonical connection");
+}
+
+async fn mixed_engine_sequential_alter(seed_transactions: i64) {
+    // The small case minimizes the SQL; the 36-table case preserves the
+    // downstream bootstrap's roughly 144 schema-commit clock advances.
+    for tables in [2, 36] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("mixed-bootstrap.db");
+        let path = path.to_str().expect("UTF-8 test path");
+        mixed_engine_bootstrap(path, tables).await;
+        let runtime = Connection::open(path).await.expect("runtime reopen");
+        for id in 0..seed_transactions {
+            runtime
+                .execute(&format!(
+                    "BEGIN IMMEDIATE;
+                     INSERT INTO base_0(id, slug, other_id, payload, created_ts, updated_ts)
+                     VALUES ({id}, 'seed-{id}', {id}, 'payload', 1, 1);
+                     COMMIT;"
+                ))
+                .await
+                .expect("sequential committed seed");
+        }
+        if let Err(error) = runtime
+            .execute("ALTER TABLE base_0 RENAME TO saved_base")
+            .await
+        {
+            let events = runtime.query("PRAGMA fsqlite.commit_events").await;
+            panic!(
+                "sequential ALTER after mixed bootstrap: tables={tables}, \
+                 seed_transactions={seed_transactions}, error={error:?}, events={events:?}"
+            );
+        }
+        assert_eq!(
+            count_schema_objects(
+                &runtime
+                    .query("SELECT COUNT(*) FROM saved_base")
+                    .await
+                    .unwrap()
+            ),
+            seed_transactions
+        );
+        runtime.close().await.expect("close runtime");
+        let oracle = rusqlite::Connection::open(path).expect("oracle reopen");
+        let count: i64 = oracle
+            .query_row("SELECT COUNT(*) FROM saved_base", [], |row| row.get(0))
+            .expect("oracle sees renamed table and committed rows");
+        assert_eq!(count, seed_transactions);
+        let integrity: String = oracle
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .expect("oracle integrity check");
+        assert_eq!(integrity, "ok");
+    }
+}
+
+#[test]
+fn mixed_engine_ddl_immediately_after_reopen() {
+    asupersync::test_utils::run_test(|| mixed_engine_sequential_alter(0));
+}
+
+#[test]
+fn mixed_engine_ddl_after_three_committed_seeds() {
+    asupersync::test_utils::run_test(|| mixed_engine_sequential_alter(3));
+}
+
+/// Control: a real intervening data commit must still invalidate DDL's
+/// snapshot, even when it writes a different table from the schema change.
+#[test]
+fn mixed_engine_ddl_rejects_intervening_data_commit() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("concurrent-control.db");
+        let path = path.to_str().expect("UTF-8 test path");
+        mixed_engine_bootstrap(path, 2).await;
+        let ddl = Connection::open(path).await.expect("DDL open");
+        let writer = Connection::open(path).await.expect("writer open");
+        ddl.execute("BEGIN CONCURRENT").await.expect("DDL begin");
+        writer
+            .execute("BEGIN IMMEDIATE; INSERT INTO migration_ledger VALUES (2); COMMIT;")
+            .await
+            .expect("intervening data commit");
+        ddl.execute("ALTER TABLE base_0 RENAME TO saved_base")
+            .await
+            .expect("stage DDL in old snapshot");
+        let error = ddl.execute("COMMIT").await.expect_err("stale DDL rejected");
+        assert!(
+            matches!(error, fsqlite::FrankenError::BusySnapshot { .. }),
+            "expected snapshot conflict, got {error:?}"
+        );
+        let events = ddl.query("PRAGMA fsqlite.commit_events").await.unwrap();
+        assert!(
+            events.iter().any(|row| matches!(
+                row.values().get(7),
+                Some(SqliteValue::Text(reason)) if reason.as_ref() == "stale_schema_change_snapshot"
+            )),
+            "must reject because of intervening data commit: {events:?}"
+        );
+        ddl.execute("ROLLBACK").await.expect("rollback stale DDL");
+        writer.close().await.expect("close writer");
+        ddl.close().await.expect("close DDL connection");
+    });
+}
