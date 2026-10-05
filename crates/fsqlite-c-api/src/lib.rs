@@ -541,7 +541,7 @@ fn best_effort_exec_callback_column_names(conn: &Connection, sql: &str) -> Optio
     }
 
     match block_on(conn.prepare(&statement.to_string())) {
-        Ok(prepared) => Some(prepared.column_names().to_vec()),
+        Ok(prepared) => Some(prepared.column_names()),
         Err(error) => {
             tracing::warn!(
                 target: "fsqlite.compat",

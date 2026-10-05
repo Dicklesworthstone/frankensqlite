@@ -1376,7 +1376,7 @@ async fn infer_result_column_names(connection: &Connection, sql: &str) -> Option
     let statement = last_sql_statement(sql)?;
     let prepared = connection.prepare(statement).await.ok()?;
     let column_names = prepared.column_names();
-    (!column_names.is_empty()).then(|| column_names.to_vec())
+    (!column_names.is_empty()).then_some(column_names)
 }
 
 fn render_pending_sql_preview(pending_sql: &str, colorize: bool) -> String {

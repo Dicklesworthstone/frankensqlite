@@ -730,7 +730,7 @@ impl FrankenDb {
             .finish(async |conn| {
                 let stmt = conn.prepare(&sql).await?;
                 let rows = stmt.query().await?;
-                query_result_to_js(rows, stmt.column_names(), stmt.column_count())
+                query_result_to_js(rows, &stmt.column_names(), stmt.column_count())
             })
             .await
     }
@@ -744,7 +744,7 @@ impl FrankenDb {
             .finish(async |conn| {
                 let stmt = conn.prepare(&sql).await?;
                 let rows = stmt.query_with_params(&params).await?;
-                query_result_to_js(rows, stmt.column_names(), stmt.column_count())
+                query_result_to_js(rows, &stmt.column_names(), stmt.column_count())
             })
             .await
     }
@@ -761,7 +761,7 @@ impl FrankenDb {
                 let stmt = conn.prepare(&sql).await?;
                 Ok(PreparedMetadata {
                     column_count: stmt.column_count(),
-                    column_names: stmt.column_names().to_vec(),
+                    column_names: stmt.column_names(),
                 })
             })
             .await?;
@@ -1019,7 +1019,7 @@ impl FrankenPreparedStatement {
             .finish(async |conn| {
                 let stmt = conn.prepare(&sql).await?;
                 let rows = stmt.query().await?;
-                query_result_to_js(rows, stmt.column_names(), stmt.column_count())
+                query_result_to_js(rows, &stmt.column_names(), stmt.column_count())
             })
             .await
     }
@@ -1033,7 +1033,7 @@ impl FrankenPreparedStatement {
             .finish(async |conn| {
                 let stmt = conn.prepare(&sql).await?;
                 let rows = stmt.query_with_params(&params).await?;
-                query_result_to_js(rows, stmt.column_names(), stmt.column_count())
+                query_result_to_js(rows, &stmt.column_names(), stmt.column_count())
             })
             .await
     }

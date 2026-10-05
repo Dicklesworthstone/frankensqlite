@@ -130,7 +130,7 @@ SELECT s FROM x WHERE ind=0;
                         .prepare(sql)
                         .await
                         .ok()
-                        .map(|prepared| prepared.column_names().to_vec());
+                        .map(|prepared| prepared.column_names());
                 }
                 let rows = connection.query(sql).await.unwrap_or_else(|error| {
                     panic!(

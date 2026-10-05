@@ -8182,6 +8182,7 @@ impl PreparedStatementTemplate {
             column_names: self.column_names.clone(),
             prepared_query_fast_path: self.prepared_query_fast_path.clone(),
             may_observe_change_tracking: self.may_observe_change_tracking,
+            reprepared: RefCell::new(None),
             conn,
         }
     }
@@ -8247,6 +8248,11 @@ pub struct PreparedStatement<'conn> {
     /// True when the prepared statement tree may read connection-scoped SQL
     /// change-tracking state like `changes()` or `last_insert_rowid()`.
     may_observe_change_tracking: bool,
+    /// bd-tj811: the statement this handle was re-prepared into after a
+    /// schema change. Like the VM stock `sqlite3_step` swaps into the handle,
+    /// it replaces this one for every later execution and for the result
+    /// column metadata; a further schema change replaces it in turn.
+    reprepared: RefCell<Option<Rc<Self>>>,
     /// Reference to the parent Connection that prepared this statement.
     /// Used by `execute_with_params` to delegate DML execution through
     /// the Connection's full execution pipeline (triggers, constraints,
@@ -8522,21 +8528,33 @@ impl<'conn> PreparedStatement<'conn> {
         Op: std::ops::AsyncFnMut(&Self) -> Result<T>,
         Guard: Fn() -> bool,
     {
-        match op(self).await {
+        let swapped = self.reprepared_statement();
+        let current = swapped.as_deref().unwrap_or(self);
+        match op(current).await {
             Err(FrankenError::SchemaChanged)
-                if self.schema_change_is_reprepareable() && can_retry() => {}
+                if current.schema_change_is_reprepareable() && can_retry() => {}
             other => return other,
         }
-        let mut reprepared = self.reprepared_for_current_schema().await?;
+        let mut reprepared = Rc::new(current.reprepared_for_current_schema().await?);
         for _ in 0..PREPARED_SCHEMA_REPREPARE_LIMIT {
+            // bd-tj811: swap the re-prepared statement into this handle before
+            // running it, as stock swaps the new VM into the statement, so later
+            // executions start from it instead of from the stale program.
+            *self.reprepared.borrow_mut() = Some(Rc::clone(&reprepared));
             match op(&reprepared).await {
                 Err(FrankenError::SchemaChanged)
                     if reprepared.schema_change_is_reprepareable() && can_retry() => {}
                 other => return other,
             }
-            reprepared = reprepared.reprepared_for_current_schema().await?;
+            reprepared = Rc::new(reprepared.reprepared_for_current_schema().await?);
         }
         Err(FrankenError::SchemaChanged)
+    }
+
+    /// The statement a schema change re-prepared this handle into, if any
+    /// (bd-tj811). Cloned out so no `RefCell` borrow spans an await.
+    fn reprepared_statement(&self) -> Option<Rc<Self>> {
+        self.reprepared.borrow().clone()
     }
 }
 
@@ -9003,6 +9021,7 @@ impl PreparedStatement<'_> {
             column_names: self.column_names.clone(),
             prepared_query_fast_path: self.prepared_query_fast_path.clone(),
             may_observe_change_tracking: self.may_observe_change_tracking,
+            reprepared: RefCell::new(None),
             conn: self.conn,
         }
     }
@@ -9932,6 +9951,9 @@ impl PreparedStatement<'_> {
     /// Return the number of columns this statement will produce per row.
     #[must_use]
     pub fn column_count(&self) -> usize {
+        if let Some(reprepared) = self.reprepared_statement() {
+            return reprepared.column_count();
+        }
         if let Some(column_count) = self.deferred_query_column_count {
             return column_count;
         }
@@ -9943,10 +9965,14 @@ impl PreparedStatement<'_> {
             .unwrap_or(0)
     }
 
-    /// Return best-effort result column labels inferred at prepare time.
+    /// Return best-effort result column labels inferred at prepare time, or
+    /// at the latest re-prepare after a schema change (bd-tj811).
     #[must_use]
-    pub fn column_names(&self) -> &[String] {
-        &self.column_names
+    pub fn column_names(&self) -> Vec<String> {
+        self.reprepared_statement().map_or_else(
+            || self.column_names.clone(),
+            |reprepared| reprepared.column_names.clone(),
+        )
     }
 
     /// Execute and return affected/output row count.
@@ -9985,6 +10011,9 @@ impl PreparedStatement<'_> {
 
     /// Return an EXPLAIN-style disassembly for the compiled program.
     pub fn explain(&self) -> String {
+        if let Some(reprepared) = self.reprepared_statement() {
+            return reprepared.explain();
+        }
         if self.deferred_query_statement.is_some() {
             return "-- prepared SELECT is dispatched dynamically; no precompiled bytecode"
                 .to_owned();
@@ -28531,6 +28560,10 @@ impl Connection {
                 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
                 self.yield_to_wal_fec_worker().await;
             }
+            // A handle already re-prepared after a schema change runs its
+            // swapped-in statement (bd-tj811).
+            let swapped = stmt.reprepared_statement();
+            let stmt = swapped.as_deref().unwrap_or(stmt);
             self.execute_prepared_autocommit_with_conflict_retry(stmt, params)
                 .await
         }))
@@ -46187,6 +46220,7 @@ impl Connection {
             column_names,
             prepared_query_fast_path: None,
             may_observe_change_tracking,
+            reprepared: RefCell::new(None),
             conn: self,
         })
     }
@@ -46273,6 +46307,7 @@ impl Connection {
                     column_names: prepared_column_names,
                     prepared_query_fast_path,
                     may_observe_change_tracking,
+                    reprepared: RefCell::new(None),
                     conn: self,
                 })
             }
@@ -46309,6 +46344,7 @@ impl Connection {
                     column_names: prepared_column_names,
                     prepared_query_fast_path: None,
                     may_observe_change_tracking,
+                    reprepared: RefCell::new(None),
                     conn: self,
                 })
             }
@@ -46350,6 +46386,7 @@ impl Connection {
                     column_names: prepared_column_names,
                     prepared_query_fast_path,
                     may_observe_change_tracking,
+                    reprepared: RefCell::new(None),
                     conn: self,
                 })
             }
@@ -46450,6 +46487,7 @@ impl Connection {
                         column_names: prepared_column_names.clone(),
                         prepared_query_fast_path: None,
                         may_observe_change_tracking,
+                        reprepared: RefCell::new(None),
                         conn: self,
                     })
                 } else {
@@ -46478,6 +46516,7 @@ impl Connection {
                         column_names: prepared_column_names.clone(),
                         prepared_query_fast_path: None,
                         may_observe_change_tracking,
+                        reprepared: RefCell::new(None),
                         conn: self,
                     })
                 }
@@ -46533,6 +46572,7 @@ impl Connection {
                         column_names: prepared_column_names,
                         prepared_query_fast_path: None,
                         may_observe_change_tracking,
+                        reprepared: RefCell::new(None),
                         conn: self,
                     })
                 } else {
@@ -46558,6 +46598,7 @@ impl Connection {
                         column_names: prepared_column_names,
                         prepared_query_fast_path: None,
                         may_observe_change_tracking,
+                        reprepared: RefCell::new(None),
                         conn: self,
                     })
                 }
@@ -46613,6 +46654,7 @@ impl Connection {
                         column_names: prepared_column_names,
                         prepared_query_fast_path: None,
                         may_observe_change_tracking,
+                        reprepared: RefCell::new(None),
                         conn: self,
                     })
                 } else {
@@ -46638,6 +46680,7 @@ impl Connection {
                         column_names: prepared_column_names,
                         prepared_query_fast_path: None,
                         may_observe_change_tracking,
+                        reprepared: RefCell::new(None),
                         conn: self,
                     })
                 }
@@ -46662,6 +46705,7 @@ impl Connection {
                 column_names: prepared_column_names,
                 prepared_query_fast_path: None,
                 may_observe_change_tracking,
+                reprepared: RefCell::new(None),
                 conn: self,
             }),
             _ => Err(FrankenError::NotImplemented(

@@ -237,7 +237,7 @@ fn unaliased_result_expressions_are_named_by_their_source_text() {
                 .prepare(sql)
                 .await
                 .unwrap_or_else(|e| panic!("franken prepare `{sql}`: {e:?}"));
-            let franken: Vec<String> = prepared.column_names().to_vec();
+            let franken: Vec<String> = prepared.column_names();
             let stmt = r.prepare(sql).expect("rusqlite prepare");
             let stock: Vec<String> = stmt
                 .column_names()
