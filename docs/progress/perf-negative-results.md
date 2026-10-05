@@ -23304,3 +23304,24 @@ bead) — likely the interior descent must propagate the UpperBound bias, or the
 - Retry condition: none for the side map. Any future cursor-reuse scheme
   must keep the parked cursor in place and should check per-cursor caches
   that grow with the cursor's lifetime.
+
+## 2026-10-05 — Skipping the first-open migration pass on a foreign last-writer stamp (bd-6jf9o)
+
+- Workload: first open of a stock-created 1M-row database (47 MB, one index)
+  with no `.fsqlite-migration-state` marker; the bd-zywqc.5 pass runs a full
+  `integrity_check` (trj: 5.5-8.0 s user CPU, ~320 MB RSS on that first open).
+- Candidate: beee7e1a7 (`crates/fsqlite-core/src/migration.rs`). It marked
+  the database without the pass when header offset 96 (last-writer library
+  version) was not FrankenSQLite's 3052000.
+- Result: reverted in review. FrankenSQLite stamps offset 96 only when it
+  creates a database. Its later writes, in WAL or rollback mode, never
+  restamp it: a stock-created database keeps 3046001 after FrankenSQLite
+  inserts, drops and checkpoints (trj, sqlite3 3.46.1 plus the fsqlite CLI).
+  So a stock-created database that a pre-marker FrankenSQLite build damaged,
+  exactly the pass's population, was classified foreign, skipped and marked,
+  so it would never be repaired. Keeper:
+  `migration_first_open_repair::stock_created_database_written_by_frankensqlite_still_gets_the_pass`
+  (fails with the skip, passes with the revert).
+- Retry condition: only with a signal that proves no FrankenSQLite build ever
+  wrote the file (offset 96 cannot), or by making the pass itself cheaper (a
+  page-reference walk instead of a full record-decoding integrity_check).

@@ -164,13 +164,15 @@ fn prefix_corrupt_database_is_repaired_on_first_open() {
     });
 }
 
-/// bd-6jf9o: the pass targets databases an older FrankenSQLite wrote. A
-/// database whose header names stock SQLite as its last writer is stamped
-/// without the full integrity_check (seconds on a large stock database) and
-/// is never "repaired" behind the user's back, even when stock itself would
-/// call it damaged.
+/// AC (1): the migration runs once and only once per (db, version). A second
+/// open sees the marker and does not re-run the repair.
+/// bd-6jf9o review: FrankenSQLite never restamps the header's last-writer
+/// version (offset 96) when it writes a database it did not create, so a
+/// stock-created database that a pre-marker FrankenSQLite build later damaged
+/// still names stock SQLite as its last writer. The pass exists for exactly
+/// that database and must not skip it on the header stamp.
 #[test]
-fn stock_written_database_is_stamped_without_the_pass() {
+fn stock_created_database_written_by_frankensqlite_still_gets_the_pass() {
     asupersync::test_utils::run_test(|| async {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = dir.path().join("stock.db").to_string_lossy().into_owned();
@@ -183,47 +185,69 @@ fn stock_written_database_is_stamped_without_the_pass() {
                      WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 64)
                      INSERT INTO keep SELECT i, 'k' || i FROM n;
                      WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 64)
-                     INSERT INTO dropme SELECT i, 'd' || i FROM n;
-                     DROP TABLE dropme;",
+                     INSERT INTO dropme SELECT i, 'd' || i FROM n;",
                 )
                 .expect("stock seed");
         }
-        // The same freelist hole the pre-fix fixture models, in a database
-        // only stock SQLite ever wrote.
+        let stock_stamp = std::fs::read(&db).expect("read image")[96..100].to_vec();
+        {
+            // FrankenSQLite writes to the stock database, including the DROP
+            // that frees the pages the damage below orphans.
+            let conn = Connection::open(&db).await.expect("open stock database");
+            // As in craft_prefix_corrupt_db: keep the image self-contained.
+            conn.execute("PRAGMA journal_mode=DELETE;")
+                .await
+                .expect("journal_mode");
+            conn.execute("INSERT INTO keep VALUES (100, 'fsqlite');")
+                .await
+                .expect("fsqlite insert");
+            conn.execute("DROP TABLE dropme;")
+                .await
+                .expect("fsqlite drop");
+            conn.close().await.expect("close");
+        }
         let mut bytes = std::fs::read(&db).expect("read image");
+        assert_eq!(
+            &bytes[96..100],
+            stock_stamp.as_slice(),
+            "precondition: FrankenSQLite's writes leave stock's last-writer stamp"
+        );
         assert_ne!(
             &bytes[96..100],
             &fsqlite_types::FRANKENSQLITE_SQLITE_VERSION_NUMBER.to_be_bytes(),
-            "precondition: stock stamped its own library version"
         );
+        // Model a pre-marker FrankenSQLite build: no marker, plus the freelist
+        // hole such builds left behind.
+        let _ = std::fs::remove_file(migration_marker_path(&db));
         assert!(u32::from_be_bytes([bytes[36], bytes[37], bytes[38], bytes[39]]) > 0);
         for b in &mut bytes[32..40] {
             *b = 0;
         }
         std::fs::write(&db, &bytes).expect("write image");
-        let stock_verdict = stock_integrity(&db);
-        assert_ne!(stock_verdict, "ok", "precondition: stock sees the hole");
+        assert_ne!(
+            stock_integrity(&db),
+            "ok",
+            "precondition: stock sees the hole"
+        );
 
-        let conn = Connection::open(&db).await.expect("open stock database");
+        let conn = Connection::open(&db)
+            .await
+            .expect("open triggers migration");
+        assert_eq!(
+            integrity_lines(&conn).await,
+            vec!["ok".to_owned()],
+            "the pass must heal the hole whatever the last-writer stamp says"
+        );
         conn.close().await.unwrap();
 
-        let marker = read_migration_marker(&db).expect("marker stamped");
+        let marker = read_migration_marker(&db).expect("marker written after repair");
         assert_eq!(marker.last_upgrade_version, CURRENT_MIGRATION_VERSION);
-        assert!(marker.repairs_applied.is_empty(), "{marker:?}");
-        assert!(
-            !pre_migration_backup_path(&db).exists(),
-            "the pass never ran, so nothing was backed up"
-        );
-        assert_eq!(
-            stock_integrity(&db),
-            stock_verdict,
-            "the stock database is left exactly as damaged as stock found it"
-        );
+        assert!(!marker.repairs_applied.is_empty(), "{marker:?}");
+        assert!(pre_migration_backup_path(&db).exists());
+        assert_eq!(stock_integrity(&db), "ok");
     });
 }
 
-/// AC (1): the migration runs once and only once per (db, version). A second
-/// open sees the marker and does not re-run the repair.
 #[test]
 fn migration_runs_once_per_version() {
     asupersync::test_utils::run_test(|| async {

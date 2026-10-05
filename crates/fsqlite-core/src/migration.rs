@@ -35,7 +35,6 @@ use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fsqlite_error::{FrankenError, Result};
-use fsqlite_types::FRANKENSQLITE_SQLITE_VERSION_NUMBER;
 use fsqlite_vfs::host_fs;
 use serde::{Deserialize, Serialize};
 
@@ -85,10 +84,6 @@ pub enum MigrationOutcome {
     AlreadyMigrated,
     /// Freshly created database — stamped with the marker at birth.
     MarkedAtBirth,
-    /// Pre-existing database whose header names another SQLite library as its
-    /// last writer — stamped without the pass, which only targets databases
-    /// an older FrankenSQLite wrote (bd-6jf9o).
-    ForeignWriter { sqlite_version: u32 },
     /// Pre-existing database whose `integrity_check` was already clean.
     CleanNoRepair,
     /// Pre-existing database that was repaired; carries the applied-repair names.
@@ -225,32 +220,6 @@ pub(crate) async fn run_first_open_migration(
             tracing::warn!(target: "fsqlite.migration", %err, db = %db_path, "failed to stamp migration marker at birth");
         }
         return MigrationOutcome::MarkedAtBirth;
-    }
-
-    // bd-6jf9o: the pass repairs damage older FrankenSQLite builds left
-    // behind, and every FrankenSQLite since 2026-02 stamps its own version
-    // as the header's last-writer version. A database another library wrote
-    // last (any stock SQLite) is not that population, and its first open paid
-    // a full integrity_check for nothing: 7-9 s and ~320 MB for a stock
-    // million-row table with one index, whose pass could also rewrite a
-    // stock database the user never asked FrankenSQLite to repair.
-    match conn.last_writer_sqlite_version().await {
-        Ok(sqlite_version) if sqlite_version != FRANKENSQLITE_SQLITE_VERSION_NUMBER => {
-            let marker = MigrationMarker {
-                last_upgrade_version: CURRENT_MIGRATION_VERSION,
-                last_run_at: now_unix_secs(),
-                repairs_applied: Vec::new(),
-            };
-            if let Err(err) = write_marker_atomic(&db_path, &marker) {
-                tracing::warn!(target: "fsqlite.migration", %err, db = %db_path, "failed to stamp migration marker for a foreign-written database");
-            }
-            return MigrationOutcome::ForeignWriter { sqlite_version };
-        }
-        Ok(_) => {}
-        Err(err) => {
-            // Fall through to the pass, which reports its own failures.
-            tracing::warn!(target: "fsqlite.migration", %err, db = %db_path, "could not read the last-writer version; running the migration pass");
-        }
     }
 
     let started = Instant::now();
