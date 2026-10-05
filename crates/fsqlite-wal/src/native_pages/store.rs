@@ -7,6 +7,7 @@
 //! an abandoned tracked write settles. The store never creates or deletes files.
 
 use std::collections::{BTreeMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
 use fsqlite_error::{FrankenError, Result};
@@ -59,6 +60,24 @@ pub enum NativePageTransactionState {
     Indeterminate,
 }
 
+/// Opaque marker for a transaction's private overlay. It is neither a commit
+/// receipt nor a database-wide snapshot. Released or foreign markers fail closed.
+#[derive(Clone)]
+pub struct NativePageSavepoint {
+    owner: Arc<()>,
+    token: TxnToken,
+    id: u64,
+}
+
+struct SavedOverlay {
+    id: u64,
+    writes: BTreeMap<PageNumber, Option<Arc<[u8]>>>,
+    payload_bytes: usize,
+}
+
+/// Nested overlay checkpoints are bounded independently of the active overlay.
+pub const MAX_NATIVE_SAVEPOINTS: usize = 32;
+
 /// An owner-bound snapshot and private overlay. Dropping an active transaction
 /// discards only this private overlay and releases its active-session slot.
 /// Already returned page Arcs may outlive it and are caller-owned memory.
@@ -71,6 +90,8 @@ pub struct NativePageTransaction {
     writes: BTreeMap<PageNumber, Option<Arc<[u8]>>>,
     payload_bytes: usize,
     state: NativePageTransactionState,
+    savepoints: Vec<SavedOverlay>,
+    next_savepoint_id: u64,
 }
 impl NativePageTransaction {
     #[must_use]
@@ -80,12 +101,19 @@ impl NativePageTransaction {
     #[must_use]
     pub const fn state(&self) -> NativePageTransactionState { self.state }
 
+    /// Whether this active transaction has a private replacement or tombstone.
+    #[must_use]
+    pub fn is_page_dirty(&self, page: PageNumber) -> bool {
+        self.state == NativePageTransactionState::Active && self.writes.contains_key(&page)
+    }
+
     fn finish(&mut self, state: NativePageTransactionState) {
         self.state = state;
         self.lease = None;
         self.reads.clear();
         self.writes.clear();
         self.payload_bytes = 0;
+        self.savepoints.clear();
     }
 }
 
@@ -187,7 +215,8 @@ impl PageHistory {
 ///
 /// Page writes are buffered independently in transaction handles. Commit-order
 /// read validation is conservative (not SSI). Public SQL dispatch, native root
-/// bootstrap, page allocation, and B-tree predicate tracking remain separate.
+/// bootstrap and B-tree predicate tracking remain separate. Allocation is
+/// append-only: freed/rolled-back page numbers are never recycled by this owner.
 /// File creation/namespace durability and the append lease are caller-owned.
 pub struct NativePageStore<S: VfsFile, M: VfsFile, C: NativeObjectCodec> {
     driver: DurableWriteCoordinator<S, M, SharedCodec<C>>,
@@ -196,6 +225,7 @@ pub struct NativePageStore<S: VfsFile, M: VfsFile, C: NativeObjectCodec> {
     owner: Arc<()>,
     active: Vec<Weak<()>>,
     next_txn_id: u64,
+    page_high_water: AtomicU64,
     recovery_required: bool,
     closed: bool,
 }
@@ -210,6 +240,7 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativePageStore<S, M, C> {
         let driver = DurableWriteCoordinator::new(log, SharedCodec(Arc::clone(&codec)), 1)?;
         Ok(Self {
             driver, codec, history, owner: Arc::new(()), active: Vec::new(), next_txn_id: 1,
+            page_high_water: AtomicU64::new(1), // Page 1 is reserved for the database header.
             recovery_required: false, closed: false,
         })
     }
@@ -247,14 +278,21 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativePageStore<S, M, C> {
             return Err(corrupt("native page replay/driver tip mismatch"));
         }
         let next_txn_id = history.max_txn_id.checked_add(1).ok_or(FrankenError::DatabaseFull)?;
+        // Tombstones retain their page number. An old snapshot may still refer
+        // to a deleted B-tree/overflow page, so recovery must not recycle it.
+        let page_high_water = history.pages.last_key_value()
+            .map_or(1, |(page, _)| u64::from(page.get()).max(1));
         Ok((Self {
             driver, codec, history, owner: Arc::new(()), active: Vec::new(), next_txn_id,
+            page_high_water: AtomicU64::new(page_high_water),
             recovery_required: false, closed: false,
         }, report))
     }
 
     #[must_use]
     pub const fn committed_tip(&self) -> CommitSeq { self.history.tip }
+    #[must_use]
+    pub const fn page_size(&self) -> u32 { self.history.page_size }
     #[must_use]
     pub fn needs_recovery(&self) -> bool { self.recovery_required || self.driver.needs_recovery() }
     #[must_use]
@@ -290,12 +328,18 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativePageStore<S, M, C> {
             token: TxnToken::new(id, TxnEpoch::new(1)), snapshot: self.history.tip,
             reads: BTreeMap::new(), writes: BTreeMap::new(), payload_bytes: 0,
             state: NativePageTransactionState::Active,
+            savepoints: Vec::new(), next_savepoint_id: 1,
         })
     }
 
     fn observe(&self, txn: &mut NativePageTransaction, page: PageNumber) -> Result<()> {
         if !txn.reads.contains_key(&page) {
             overlay_size(txn.reads.len() + 1, txn.writes.len(), txn.payload_bytes)?;
+            // Every retained overlay must remain representable if restored
+            // after this read; rollback cannot throw away its dependencies.
+            for saved in &txn.savepoints {
+                overlay_size(txn.reads.len() + 1, saved.writes.len(), saved.payload_bytes)?;
+            }
             let version = self.history.at(page, txn.snapshot).map_or(CommitSeq::ZERO, |v| v.seq);
             txn.reads.insert(page, version);
         }
@@ -330,8 +374,114 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativePageStore<S, M, C> {
         overlay_size(txn.reads.len() + usize::from(!txn.reads.contains_key(&page)),
             txn.writes.len() + usize::from(!txn.writes.contains_key(&page)), payload_bytes)?;
         self.observe(txn, page)?;
+        // Explicit page writes participate in allocation, even before commit.
+        // Relaxed atomics allocate distinct numbers; they do not publish pages.
+        self.page_high_water.fetch_max(u64::from(page.get()), Ordering::Relaxed);
         txn.writes.insert(page, data.map(Arc::from));
         txn.payload_bytes = payload_bytes;
+        Ok(())
+    }
+
+    /// Reserve a fresh page number and stage a zero-filled private page image.
+    /// Allocation never edits a shared freelist page and does not take a
+    /// transaction-wide lock. Distinct allocation calls get distinct numbers;
+    /// explicit writes still obey ordinary snapshot/conflict validation.
+    /// Gaps after failed or rolled-back allocations are not reused while this
+    /// owner lives. Reopen restores the high water from committed page history.
+    ///
+    /// # Errors
+    /// Refuses invalid handles, cancellation, page-number exhaustion, and
+    /// overlay/allocation limits. No failed call publishes a page.
+    pub fn allocate_page(&self, cx: &Cx, txn: &mut NativePageTransaction) -> Result<PageNumber> {
+        self.transaction(cx, txn)?;
+        let size = usize::try_from(self.history.page_size).map_err(|_| FrankenError::TooBig)?;
+        let mut high = self.page_high_water.load(Ordering::Relaxed);
+        let page = loop {
+            cx.checkpoint().map_err(|_| FrankenError::Interrupt)?;
+            let next = high.checked_add(1).ok_or(FrankenError::DatabaseFull)?;
+            let page = u32::try_from(next).ok().and_then(PageNumber::new)
+                .ok_or(FrankenError::DatabaseFull)?;
+            overlay_size(
+                txn.reads.len() + usize::from(!txn.reads.contains_key(&page)),
+                txn.writes.len() + 1,
+                txn.payload_bytes.checked_add(size)
+                    .ok_or(FrankenError::TooBig)?,
+            )?;
+            match self.page_high_water.compare_exchange_weak(
+                high, next, Ordering::Relaxed, Ordering::Relaxed,
+            ) {
+                Ok(_) => break page,
+                Err(actual) => high = actual,
+            }
+        };
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(size).map_err(|_| FrankenError::OutOfMemory)?;
+        bytes.resize(size, 0);
+        self.write_page(cx, txn, page, Some(&bytes))?;
+        Ok(page)
+    }
+
+    /// Capture a bounded private overlay without copying the page payloads.
+    /// Snapshot observations are intentionally NOT rewound on rollback: a
+    /// read dependency cannot disappear merely because its writes were undone.
+    /// Saved payload accounting is conservative even for shared page Arcs.
+    ///
+    /// # Errors
+    /// Rejects invalid handles, cancellation, depth/retained-overlay limits,
+    /// and exhausted savepoint identifiers.
+    pub fn savepoint(&self, cx: &Cx, txn: &mut NativePageTransaction) -> Result<NativePageSavepoint> {
+        self.transaction(cx, txn)?;
+        if txn.savepoints.len() >= MAX_NATIVE_SAVEPOINTS { return Err(FrankenError::TooBig); }
+        let (writes, payload) = txn.savepoints.iter().try_fold(
+            (txn.writes.len(), txn.payload_bytes),
+            |(writes, payload), saved| {
+                Ok::<_, FrankenError>((
+                    writes.checked_add(saved.writes.len()).ok_or(FrankenError::TooBig)?,
+                    payload.checked_add(saved.payload_bytes).ok_or(FrankenError::TooBig)?,
+                ))
+            },
+        )?;
+        overlay_size(0, writes, payload)?;
+        let id = txn.next_savepoint_id;
+        let next = id.checked_add(1).ok_or(FrankenError::TooBig)?;
+        txn.savepoints.try_reserve(1).map_err(|_| FrankenError::OutOfMemory)?;
+        txn.savepoints.push(SavedOverlay { id, writes: txn.writes.clone(), payload_bytes: txn.payload_bytes });
+        txn.next_savepoint_id = next;
+        Ok(NativePageSavepoint { owner: Arc::clone(&self.owner), token: txn.token, id })
+    }
+
+    fn savepoint_index(&self, txn: &NativePageTransaction, point: &NativePageSavepoint) -> Result<usize> {
+        if !Arc::ptr_eq(&self.owner, &txn.owner) || !Arc::ptr_eq(&self.owner, &point.owner)
+            || point.token != txn.token
+        { return Err(FrankenError::Abort); }
+        if txn.state == NativePageTransactionState::Indeterminate { return Err(FrankenError::BusyRecovery); }
+        if txn.state != NativePageTransactionState::Active { return Err(FrankenError::Abort); }
+        txn.savepoints.iter().position(|saved| saved.id == point.id).ok_or(FrankenError::Abort)
+    }
+
+    /// Restore the named private overlay, discard inner savepoints, and retain
+    /// the named marker for another rollback. This cleanup needs no live Cx;
+    /// cancellation cannot prevent undoing a private failed B-tree operation.
+    /// Neither read observations nor the allocation high water are rewound.
+    ///
+    /// # Errors
+    /// Rejects foreign, released, completed, or indeterminate markers/handles.
+    pub fn rollback_to(&self, txn: &mut NativePageTransaction, point: &NativePageSavepoint) -> Result<()> {
+        let index = self.savepoint_index(txn, point)?;
+        let saved = &txn.savepoints[index];
+        txn.writes = saved.writes.clone();
+        txn.payload_bytes = saved.payload_bytes;
+        txn.savepoints.truncate(index + 1);
+        Ok(())
+    }
+
+    /// Release a marker and all inner markers without changing private writes.
+    ///
+    /// # Errors
+    /// Rejects foreign, released, completed, or indeterminate markers/handles.
+    pub fn release_savepoint(&self, txn: &mut NativePageTransaction, point: &NativePageSavepoint) -> Result<()> {
+        let index = self.savepoint_index(txn, point)?;
+        txn.savepoints.truncate(index);
         Ok(())
     }
 
@@ -446,5 +596,171 @@ fn commit_error(error: DurableCommitError) -> FrankenError {
             FrankenError::BusySnapshot { conflicting_pages: "native validation".to_owned() }
         }
         DurableCommitError::Rejected(_) => FrankenError::Abort,
+    }
+}
+
+#[cfg(test)]
+mod allocation_savepoint_tests {
+    use super::*;
+    use fsqlite_types::{Oti, SymbolRecordFlags, reconstruct_systematic_happy_path};
+    use fsqlite_types::flags::VfsOpenFlags;
+    use fsqlite_vfs::{MemoryVfs, Vfs};
+    use crate::test_support::FutureResultTestExt;
+
+    struct TestCodec;
+    impl NativeObjectCodec for TestCodec {
+        fn encode(&self, _: &Cx, bytes: &[u8]) -> Result<Vec<SymbolRecord>> {
+            let size = u32::try_from(bytes.len()).map_err(|_| FrankenError::TooBig)?;
+            Ok(vec![SymbolRecord::new(ObjectId::derive_from_canonical_bytes(bytes),
+                Oti { f: u64::from(size), al: 1, t: size, z: 1, n: 1 }, 0,
+                bytes.to_vec(), SymbolRecordFlags::SYSTEMATIC_RUN_START)])
+        }
+        fn decode(&self, _: &Cx, id: ObjectId, records: &[SymbolRecord]) -> Result<Vec<u8>> {
+            let bytes = reconstruct_systematic_happy_path(records)
+                .map_err(|error| corrupt(&error.to_string()))?;
+            if ObjectId::derive_from_canonical_bytes(&bytes) != id {
+                return Err(corrupt("test capsule identity mismatch"));
+            }
+            Ok(bytes)
+        }
+    }
+    type Store = NativePageStore<<MemoryVfs as Vfs>::File, <MemoryVfs as Vfs>::File, TestCodec>;
+    fn file(vfs: &MemoryVfs, cx: &Cx, name: &str) -> <MemoryVfs as Vfs>::File {
+        vfs.open(cx, Some(std::path::Path::new(name)),
+            VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL).unwrap().0
+    }
+    fn store(vfs: &MemoryVfs, cx: &Cx) -> Store {
+        let log = NativeDurabilityLog::create(cx, file(vfs, cx, "objects"), file(vfs, cx, "markers"),
+            NativeDurabilityLimits::default()).unwrap();
+        NativePageStore::new(log, TestCodec, 512, NativePageLimits::default()).unwrap()
+    }
+    fn page(n: u32) -> PageNumber { PageNumber::new(n).unwrap() }
+
+    #[test]
+    fn allocations_are_private_and_distinct_across_open_transactions() {
+        let cx = Cx::new(); let vfs = MemoryVfs::new(); let mut db = store(&vfs, &cx);
+        let mut a = db.begin(&cx).unwrap(); let mut b = db.begin(&cx).unwrap();
+        let pa = db.allocate_page(&cx, &mut a).unwrap();
+        let pb = db.allocate_page(&cx, &mut b).unwrap();
+        assert_eq!(pa, page(2)); assert_eq!(pb, page(3));
+        assert_eq!(db.page_size(), 512);
+        assert_eq!(db.read_page(&cx, &mut a, pa).unwrap().unwrap().as_ref(), &[0; 512]);
+        let mut old = db.begin(&cx).unwrap();
+        assert!(db.read_page(&cx, &mut old, pa).unwrap().is_none());
+        db.commit(&cx, &mut b, 100).expect("disjoint writer B commits first");
+        db.commit(&cx, &mut a, 101).expect("disjoint writer A commits second");
+        assert!(db.read_page(&cx, &mut old, pb).unwrap().is_none());
+        db.rollback(&mut old).unwrap(); db.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn direct_writes_rollback_and_tombstones_do_not_recycle_page_numbers() {
+        let cx = Cx::new(); let vfs = MemoryVfs::new(); let mut db = store(&vfs, &cx);
+        let mut first = db.begin(&cx).unwrap();
+        db.write_page(&cx, &mut first, page(20), Some(&[9; 512])).unwrap();
+        let mut second = db.begin(&cx).unwrap();
+        assert_eq!(db.allocate_page(&cx, &mut second).unwrap(), page(21));
+        db.rollback(&mut first).unwrap(); db.rollback(&mut second).unwrap();
+        let mut third = db.begin(&cx).unwrap();
+        let p = db.allocate_page(&cx, &mut third).unwrap();
+        assert_eq!(p, page(22));
+        db.write_page(&cx, &mut third, p, None).unwrap();
+        db.commit(&cx, &mut third, 100).expect("persist deleted allocation");
+        db.close(&cx).unwrap();
+        let (mut reopened, _) = Store::recover(&cx, file(&vfs, &cx, "objects"),
+            file(&vfs, &cx, "markers"), TestCodec, 512, NativeDurabilityLimits::default(),
+            NativePageLimits::default()).expect("recover allocation high water");
+        let mut next = reopened.begin(&cx).unwrap();
+        assert_eq!(reopened.allocate_page(&cx, &mut next).unwrap(), page(23));
+        reopened.rollback(&mut next).unwrap(); reopened.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn allocation_exhaustion_does_not_wrap_or_publish() {
+        let cx = Cx::new(); let vfs = MemoryVfs::new(); let mut db = store(&vfs, &cx);
+        let mut txn = db.begin(&cx).unwrap();
+        db.page_high_water.store(u64::from(u32::MAX), Ordering::Relaxed);
+        assert!(matches!(db.allocate_page(&cx, &mut txn), Err(FrankenError::DatabaseFull)));
+        assert!(txn.writes.is_empty()); assert_eq!(db.committed_tip(), CommitSeq::ZERO);
+        db.rollback(&mut txn).unwrap(); db.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn nested_savepoints_restore_images_tombstones_and_allocations() {
+        let cx = Cx::new(); let vfs = MemoryVfs::new(); let mut db = store(&vfs, &cx);
+        let mut txn = db.begin(&cx).unwrap();
+        let p = db.allocate_page(&cx, &mut txn).unwrap();
+        db.write_page(&cx, &mut txn, p, Some(&[1; 512])).unwrap();
+        let outer = db.savepoint(&cx, &mut txn).unwrap();
+        db.write_page(&cx, &mut txn, p, None).unwrap();
+        let inner = db.savepoint(&cx, &mut txn).unwrap();
+        let abandoned = db.allocate_page(&cx, &mut txn).unwrap();
+        db.rollback_to(&mut txn, &inner).unwrap();
+        assert!(db.read_page(&cx, &mut txn, p).unwrap().is_none());
+        assert!(db.read_page(&cx, &mut txn, abandoned).unwrap().is_none());
+        assert!(db.allocate_page(&cx, &mut txn).unwrap() > abandoned);
+        db.rollback_to(&mut txn, &outer).unwrap();
+        assert!(db.rollback_to(&mut txn, &inner).is_err());
+        assert_eq!(db.read_page(&cx, &mut txn, p).unwrap().unwrap().as_ref(), &[1; 512]);
+        db.write_page(&cx, &mut txn, p, Some(&[2; 512])).unwrap();
+        db.rollback_to(&mut txn, &outer).unwrap(); // Named marker remains usable.
+        db.release_savepoint(&mut txn, &outer).unwrap();
+        assert!(db.rollback_to(&mut txn, &outer).is_err());
+        db.commit(&cx, &mut txn, 100).expect("commit restored image");
+        let mut fresh = db.begin(&cx).unwrap();
+        assert_eq!(db.read_page(&cx, &mut fresh, p).unwrap().unwrap().as_ref(), &[1; 512]);
+        assert!(db.read_page(&cx, &mut fresh, abandoned).unwrap().is_none());
+        db.rollback(&mut fresh).unwrap(); db.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn rollback_to_retains_read_dependencies_and_cannot_hide_write_skew() {
+        let cx = Cx::new(); let vfs = MemoryVfs::new(); let mut db = store(&vfs, &cx);
+        let mut a = db.begin(&cx).unwrap(); let point = db.savepoint(&cx, &mut a).unwrap();
+        assert!(db.read_page(&cx, &mut a, page(9)).unwrap().is_none());
+        let mut b = db.begin(&cx).unwrap();
+        db.write_page(&cx, &mut b, page(9), Some(&[1; 512])).unwrap();
+        db.commit(&cx, &mut b, 100).expect("other writer commits");
+        db.rollback_to(&mut a, &point).unwrap();
+        db.write_page(&cx, &mut a, page(10), Some(&[2; 512])).unwrap();
+        assert!(matches!(db.commit(&cx, &mut a, 101).wait(), Err(FrankenError::BusySnapshot { .. })));
+        assert_eq!(a.state(), NativePageTransactionState::Active);
+        db.rollback(&mut a).unwrap(); db.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn savepoint_cleanup_is_cancel_safe_and_rejects_foreign_or_finished_handles() {
+        let cx = Cx::new(); let vfs = MemoryVfs::new(); let mut db = store(&vfs, &cx);
+        let mut a = db.begin(&cx).unwrap(); let mut b = db.begin(&cx).unwrap();
+        let point = db.savepoint(&cx, &mut a).unwrap();
+        assert!(db.rollback_to(&mut b, &point).is_err());
+        db.allocate_page(&cx, &mut a).unwrap();
+        cx.cancel();
+        assert!(db.savepoint(&cx, &mut a).is_err());
+        db.rollback_to(&mut a, &point).unwrap();
+        assert!(a.writes.is_empty());
+        a.state = NativePageTransactionState::Indeterminate;
+        assert!(matches!(db.rollback_to(&mut a, &point), Err(FrankenError::BusyRecovery)));
+        a.state = NativePageTransactionState::Active; // No I/O occurred in this test.
+        db.rollback(&mut a).unwrap();
+        assert!(db.release_savepoint(&mut a, &point).is_err());
+        db.rollback(&mut b).unwrap(); db.close(&Cx::new()).unwrap();
+    }
+
+    #[test]
+    fn releasing_nested_savepoints_keeps_writes_and_bounds_retention() {
+        let cx = Cx::new(); let vfs = MemoryVfs::new(); let mut db = store(&vfs, &cx);
+        let mut txn = db.begin(&cx).unwrap();
+        let outer = db.savepoint(&cx, &mut txn).unwrap();
+        let inner = db.savepoint(&cx, &mut txn).unwrap();
+        let p = db.allocate_page(&cx, &mut txn).unwrap();
+        db.release_savepoint(&mut txn, &outer).unwrap();
+        assert!(txn.is_page_dirty(p));
+        assert!(db.release_savepoint(&mut txn, &inner).is_err());
+        for _ in 0..MAX_NATIVE_SAVEPOINTS { db.savepoint(&cx, &mut txn).unwrap(); }
+        assert!(matches!(db.savepoint(&cx, &mut txn), Err(FrankenError::TooBig)));
+        assert!(txn.is_page_dirty(p));
+        db.rollback(&mut txn).unwrap();
+        assert!(txn.savepoints.is_empty()); db.close(&cx).unwrap();
     }
 }
