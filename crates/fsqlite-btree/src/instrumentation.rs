@@ -1730,6 +1730,13 @@ pub fn reset_btree_leaf_reuse_profile() {
     BTREE_BULK_TABLE_INTERIOR_PAGE_WRITE_TIME_NS.store(0, Ordering::Relaxed);
 }
 
+/// Serializes any test that reads the leaf-reuse counters, or that flips or
+/// resets the copy-profile gate.
+///
+/// The copy-profile gate (`set_btree_copy_profile_enabled`) also starts the
+/// timers behind the leaf-reuse append/split/delete-run counters, so a test
+/// that turns it off or resets the copy profile mid-run of a leaf-reuse test
+/// loses that test's counter advances (bd-axuql).
 #[cfg(test)]
 pub(crate) static LEAF_REUSE_TEST_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
@@ -1761,7 +1768,7 @@ mod tests {
         btree_leaf_reuse_snapshot, btree_metrics_snapshot, conflict_topology_split_advice,
         record_conflict_topology_heat, record_conservative_reload_fallback,
         record_no_split_reuse_hit, record_operation, record_page_header_rebuild,
-        reset_btree_copy_profile, reset_btree_metrics, reset_conflict_topology_policy_state,
+        reset_btree_copy_profile, reset_conflict_topology_policy_state,
         set_adaptive_fill_factor_enabled, set_btree_copy_profile_enabled,
         set_btree_metrics_enabled, set_conflict_topology_policy_mode,
     };
@@ -1769,10 +1776,8 @@ mod tests {
     use fsqlite_types::PageNumber;
     use fsqlite_types::cx::Cx;
     use std::collections::BTreeSet;
-    use std::sync::{LazyLock, Mutex};
 
     const TEST_USABLE: u32 = 4096;
-    static COPY_PROFILE_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     fn run_async<F: Future>(future: F) -> F::Output {
         RuntimeBuilder::current_thread()
@@ -2336,10 +2341,13 @@ mod tests {
 
     #[test]
     fn copy_profile_tracks_owned_materialization_and_cell_assembly() {
-        let _guard = COPY_PROFILE_TEST_LOCK
+        // bd-axuql: this test used to also call `reset_btree_metrics()` while
+        // holding only a private copy-profile lock. Its assertions never read
+        // those counters, but zeroing them between another test's before/after
+        // snapshots failed that test's `>=` checks (or underflowed its deltas).
+        let _guard = super::LEAF_REUSE_TEST_LOCK
             .lock()
-            .expect("copy-profile test lock");
-        reset_btree_metrics();
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         reset_btree_copy_profile();
         set_btree_copy_profile_enabled(true);
 
@@ -2385,9 +2393,9 @@ mod tests {
 
     #[test]
     fn copy_profile_tracks_overflow_reassembly() {
-        let _guard = COPY_PROFILE_TEST_LOCK
+        let _guard = super::LEAF_REUSE_TEST_LOCK
             .lock()
-            .expect("copy-profile test lock");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         reset_btree_copy_profile();
         set_btree_copy_profile_enabled(true);
 
