@@ -1273,6 +1273,11 @@ fn txn_file_backed_retained_autocommit_interleaved_read_write_close_reopen_match
         let schema_sql = "CREATE TABLE msgs(id INTEGER PRIMARY KEY, val TEXT NOT NULL);";
         c_conn.execute(schema_sql, []).expect("csqlite schema");
         f_conn.execute(schema_sql).await.expect("fsqlite schema");
+        // bd-792q5 present-peer contract: a stock SQLite reader that stays
+        // open across the whole workload must observe every acknowledged
+        // file-backed autocommit statement before the writer does anything
+        // else.
+        let f_observer = rusqlite::Connection::open(&f_path).expect("open external observer");
 
         for step in 1_u32..=24 {
             let rowid = i64::from(step);
@@ -1285,6 +1290,11 @@ fn txn_file_backed_retained_autocommit_interleaved_read_write_close_reopen_match
                 csqlite_query_values(&c_conn, &point_lookup_sql),
                 fsqlite_query_values(&f_conn, &point_lookup_sql).await,
                 "read-after-write point lookup diverged after INSERT step {step}"
+            );
+            assert_eq!(
+                csqlite_query_values(&f_observer, &point_lookup_sql),
+                csqlite_query_values(&c_conn, &point_lookup_sql),
+                "successful INSERT must be visible to an external SQLite reader at step {step}"
             );
 
             if step.is_multiple_of(6) {
@@ -1299,6 +1309,11 @@ fn txn_file_backed_retained_autocommit_interleaved_read_write_close_reopen_match
                     fsqlite_query_values(&f_conn, &verify_update_sql).await,
                     "read-after-write point lookup diverged after UPDATE step {step}"
                 );
+                assert_eq!(
+                    csqlite_query_values(&f_observer, &verify_update_sql),
+                    csqlite_query_values(&c_conn, &verify_update_sql),
+                    "successful UPDATE must be visible to an external SQLite reader at step {step}"
+                );
             }
         }
 
@@ -1312,6 +1327,12 @@ fn txn_file_backed_retained_autocommit_interleaved_read_write_close_reopen_match
             fsqlite_query_values(&f_conn, post_delete_sql).await,
             "post-delete retained autocommit state diverged before close"
         );
+        assert_eq!(
+            csqlite_query_values(&f_observer, post_delete_sql),
+            csqlite_query_values(&c_conn, post_delete_sql),
+            "successful DELETE must be externally visible before close"
+        );
+        drop(f_observer);
 
         let full_dump_sql = "SELECT id, val FROM msgs ORDER BY id;";
         let before_close_c = csqlite_query_values(&c_conn, full_dump_sql);

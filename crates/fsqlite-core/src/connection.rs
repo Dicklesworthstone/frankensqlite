@@ -219693,6 +219693,70 @@ mod autocommit_txn_tests {
     }
 
     #[test]
+    fn test_filebacked_autocommit_commit_failure_preserves_prior_statement_and_connection_image() {
+        // bd-792q5 follow-through: when a file-backed autocommit statement's
+        // immediate commit fails, the failure must surface from that statement,
+        // the earlier acknowledged statement must stay committed, and the
+        // failing connection's own execution image must not keep showing the
+        // unpublished row.
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("autocommit_prior_success.db");
+            let db_str = db_path.to_string_lossy().into_owned();
+
+            let conn = Connection::open(&db_str).await.unwrap();
+            conn.execute("PRAGMA fsqlite.concurrent_mode = OFF;")
+                .await
+                .unwrap();
+            conn.execute("PRAGMA journal_mode = 'wal';").await.unwrap();
+            assert_eq!(conn.pager.journal_mode(), fsqlite_pager::JournalMode::Wal);
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES (1)").await.unwrap();
+
+            install_failing_retained_flush_wal_backend(&conn).await;
+
+            let error = conn
+                .execute("INSERT INTO t VALUES (2)")
+                .await
+                .expect_err("the second statement must report its commit failure");
+            assert!(
+                error
+                    .to_string()
+                    .contains("forced retained autocommit flush failure"),
+                "expected the injected append failure to surface, got {error}"
+            );
+            assert!(conn.active_txn.borrow().is_none());
+            assert!(conn.cached_read_snapshot.borrow().is_none());
+
+            let same_connection_rows = conn.query("SELECT id FROM t ORDER BY id").await.unwrap();
+            assert_eq!(
+                same_connection_rows
+                    .iter()
+                    .map(row_values)
+                    .collect::<Vec<_>>(),
+                vec![vec![SqliteValue::Integer(1)]],
+                "a failed commit must restore the failing connection's execution image"
+            );
+
+            let reopened = Connection::open(&db_str).await.unwrap();
+            let rows_after_failure = reopened
+                .query("SELECT id FROM t ORDER BY id")
+                .await
+                .unwrap();
+            assert_eq!(
+                rows_after_failure
+                    .iter()
+                    .map(row_values)
+                    .collect::<Vec<_>>(),
+                vec![vec![SqliteValue::Integer(1)]],
+                "the failed second statement must not roll back the prior successful statement"
+            );
+        });
+    }
+
+    #[test]
     fn test_retained_autocommit_flush_commit_failure_does_not_silently_retry_bd_irmuw() {
         // bd-irmuw (P0): a dirty-table SELECT that flushes the retained batch,
         // where the flush commit fails transient-Busy, must NOT be silently
