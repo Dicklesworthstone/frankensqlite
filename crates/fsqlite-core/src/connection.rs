@@ -33038,9 +33038,11 @@ impl Connection {
             ));
         };
         let sql_key = Self::sql_hash(stmt.sql.as_ref());
+        let _values_subquery_cache_bypass = insert_values_have_subquery(&insert)
+            .then(|| BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true));
         let program = self
             .compile_with_cache(sql_key, stmt.sql.as_ref(), async |conn| {
-                conn.compile_table_insert(&insert).await
+                conn.compile_table_insert(&insert, params).await
             })
             .await?;
         let fallback_stmt = stmt.clone_with_program(program);
@@ -40214,9 +40216,13 @@ impl Connection {
                     let _plan_guard = plan_span.enter();
                     let sql_text = statement.to_string();
                     let sql_key = Self::sql_hash(&sql_text);
+                    // A program built from resolved VALUES subqueries holds
+                    // their results for this execution: never reuse it.
+                    let _values_subquery_cache_bypass = insert_values_have_subquery(insert)
+                        .then(|| BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true));
                     arc_prog = self
                         .compile_with_cache(sql_key, &sql_text, async |conn| {
-                            conn.compile_table_insert(insert).await
+                            conn.compile_table_insert(insert, params).await
                         })
                         .await?;
                     &arc_prog
@@ -45937,6 +45943,38 @@ impl Connection {
         let may_observe_change_tracking = self.statement_may_observe_change_tracking(statement);
         let registry = Some(Arc::clone(&*self.func_registry.borrow()));
         let function_registry_generation = self.function_registry_generation();
+        // Preparation folds a DML statement's subqueries into literals (with no
+        // parameters bound), and a program compiled from that fold would keep
+        // those values for every execution: a prepared `UPDATE t SET b =
+        // (SELECT count(*) FROM u)` never saw later rows of `u`, and a
+        // parameterized subquery read NULL. Such a statement is dispatched
+        // from its original form on every execution instead, which folds the
+        // subqueries against that execution's parameters and data.
+        if prepared_dml_reads_subquery(original_statement) {
+            // Number the placeholders globally first, as the dispatcher's entry
+            // does: deferred execution enters below that point, and folding a
+            // subquery would otherwise renumber a later `?` (bd-l6 2qtn7).
+            let canonical = match original_statement {
+                Statement::Insert(insert) => {
+                    Statement::Insert(canonicalize_insert_placeholders(insert)?)
+                }
+                Statement::Update(update) => {
+                    Statement::Update(canonicalize_update_placeholders(update)?)
+                }
+                Statement::Delete(delete) => {
+                    Statement::Delete(canonicalize_delete_placeholders(delete)?)
+                }
+                other => other.clone(),
+            };
+            return self.wrap_deferred_prepared_dml(
+                &canonical.to_string(),
+                original_sql,
+                &canonical,
+                registry,
+                prepared_column_names,
+                may_observe_change_tracking,
+            );
+        }
         match statement {
             Statement::Select(_) if self.prepared_select_requires_dispatch(statement) => {
                 Ok(PreparedStatement {
@@ -46085,7 +46123,7 @@ impl Connection {
                     } else {
                         let sql_key = Self::sql_hash(sql);
                         self.compile_with_cache(sql_key, sql, async |conn| {
-                            conn.compile_table_insert(insert).await
+                            conn.compile_table_insert(insert, None).await
                         })
                         .await?
                     };
@@ -46455,7 +46493,7 @@ impl Connection {
         &self,
         insert: &fsqlite_ast::InsertStatement,
     ) -> Result<Option<PreparedDirectSimpleInsert>> {
-        let resolved_insert = self.resolve_insert_values_subqueries(insert).await?;
+        let resolved_insert = self.resolve_insert_values_subqueries(insert, None).await?;
         if !resolved_insert.upsert.is_empty() {
             return Ok(None);
         }
@@ -97364,10 +97402,13 @@ impl Connection {
             .await
     }
 
-    /// Compile an INSERT through the VDBE codegen.
+    /// Compile an INSERT through the VDBE codegen. `params` are the parameters
+    /// the program will execute with, which VALUES subqueries need because
+    /// they are evaluated now (see `resolve_insert_values_subqueries`).
     async fn compile_table_insert(
         &self,
         insert: &fsqlite_ast::InsertStatement,
+        params: Option<&[SqliteValue]>,
     ) -> Result<VdbeProgram> {
         // GH #284: reject direct DML on the schema table with writable_schema
         // OFF (SQLITE_ERROR), rather than the generic "no such table" the
@@ -97382,7 +97423,7 @@ impl Connection {
         // Resolve any subqueries inside VALUES expressions before VDBE codegen,
         // because emit_expr receives None scan context for VALUES rows and
         // cannot handle Expr::Subquery/Expr::Exists.
-        let insert = self.resolve_insert_values_subqueries(insert).await?;
+        let insert = self.resolve_insert_values_subqueries(insert, params).await?;
         let targets_shadowed_main = self.targets_shadowed_main(&insert.table);
         let rowid_alias_col_idx = {
             let visible_schema = self.schema.borrow();
@@ -97447,10 +97488,28 @@ impl Connection {
     /// common case for `INSERT INTO t VALUES (1, 2, 3)`), avoiding a full
     /// deep clone of `InsertStatement` on every prepare. Returns `Cow::Owned`
     /// only when a subquery was rewritten into a literal.
+    ///
+    /// The subqueries run here, before codegen, so `params` (the parameters
+    /// the statement executes with) are bound into each row expression that
+    /// holds one; otherwise `?2 IN (SELECT x FROM t WHERE g = ?3)` compares
+    /// against NULL. The resolved program holds results for these parameters
+    /// and this data, so the caller must not reuse it for another execution
+    /// (see [`insert_values_have_subquery`]).
     async fn resolve_insert_values_subqueries<'a>(
         &self,
         insert: &'a fsqlite_ast::InsertStatement,
+        params: Option<&[SqliteValue]>,
     ) -> Result<Cow<'a, fsqlite_ast::InsertStatement>> {
+        if !insert_values_have_subquery(insert) {
+            return Ok(Cow::Borrowed(insert));
+        }
+        // Number the placeholders as the dispatcher does (idempotent for an
+        // already numbered statement), so binding one row expression at a
+        // time reads the right slots.
+        let mut new_insert = match params {
+            Some(_) => canonicalize_insert_placeholders(insert)?,
+            None => insert.clone(),
+        };
         let empty_row: &[SqliteValue] = &[];
         let empty_col_map: &[(String, String, bool)] = &[];
         let resolve_rows = async |rows: &[Vec<Expr>]| -> Result<Vec<Vec<Expr>>> {
@@ -97459,7 +97518,15 @@ impl Connection {
                 let mut new_row = Vec::with_capacity(row.len());
                 for expr in row {
                     new_row.push(if expr_has_any_subquery(expr) {
-                        self.inline_subqueries_in_expr(expr, empty_row, empty_col_map)
+                        let mut bound = expr.clone();
+                        if let Some(params) = params {
+                            bind_placeholders_in_expr(
+                                &mut bound,
+                                &mut BindParamState::default(),
+                                params,
+                            )?;
+                        }
+                        self.inline_subqueries_in_expr(&bound, empty_row, empty_col_map)
                             .await?
                     } else {
                         expr.clone()
@@ -97469,33 +97536,24 @@ impl Connection {
             }
             Ok(out)
         };
-        match &insert.source {
+        let resolved_source = match &new_insert.source {
             fsqlite_ast::InsertSource::Values(rows) => {
-                if rows.iter().any(|r| r.iter().any(expr_has_any_subquery)) {
-                    let mut new_insert = insert.clone();
-                    new_insert.source =
-                        fsqlite_ast::InsertSource::Values(resolve_rows(rows).await?);
-                    Ok(Cow::Owned(new_insert))
-                } else {
-                    Ok(Cow::Borrowed(insert))
-                }
+                fsqlite_ast::InsertSource::Values(resolve_rows(rows).await?)
             }
             fsqlite_ast::InsertSource::Select(sel) => {
-                if let SelectCore::Values(rows) = &sel.body.select
-                    && rows.iter().any(|r| r.iter().any(expr_has_any_subquery))
-                {
-                    let mut new_insert = insert.clone();
-                    let mut new_sel = sel.as_ref().clone();
-                    let mut new_values = rows.clone();
-                    new_values.replace_rows_preserving_representation(resolve_rows(rows).await?);
-                    new_sel.body.select = SelectCore::Values(new_values);
-                    new_insert.source = fsqlite_ast::InsertSource::Select(Box::new(new_sel));
-                    return Ok(Cow::Owned(new_insert));
-                }
-                Ok(Cow::Borrowed(insert))
+                let SelectCore::Values(rows) = &sel.body.select else {
+                    return Ok(Cow::Borrowed(insert));
+                };
+                let mut new_sel = sel.as_ref().clone();
+                let mut new_values = rows.clone();
+                new_values.replace_rows_preserving_representation(resolve_rows(rows).await?);
+                new_sel.body.select = SelectCore::Values(new_values);
+                fsqlite_ast::InsertSource::Select(Box::new(new_sel))
             }
-            _ => Ok(Cow::Borrowed(insert)),
-        }
+            fsqlite_ast::InsertSource::DefaultValues => return Ok(Cow::Borrowed(insert)),
+        };
+        new_insert.source = resolved_source;
+        Ok(Cow::Owned(new_insert))
     }
 
     /// Compile an UPDATE through the VDBE codegen.
@@ -97635,7 +97693,7 @@ impl Connection {
     async fn try_compile_statement(&self, stmt: &Statement) -> Result<VdbeProgram> {
         match stmt {
             Statement::Select(select) => self.compile_table_select(select).await,
-            Statement::Insert(insert) => self.compile_table_insert(insert).await,
+            Statement::Insert(insert) => self.compile_table_insert(insert, None).await,
             Statement::Update(update) => self.compile_table_update(update),
             Statement::Delete(delete) => self.compile_table_delete(delete),
             _ => Err(FrankenError::not_implemented(format!(
@@ -118840,6 +118898,39 @@ fn cmp_values_sqlite(a: &SqliteValue, b: &SqliteValue) -> std::cmp::Ordering {
 /// Check if an expression tree contains any `Expr::Subquery`.
 fn expr_has_any_subquery(expr: &Expr) -> bool {
     expr_contains_subquery_match(expr, &mut |_| true)
+}
+
+/// Whether a prepared INSERT, UPDATE or DELETE reads a subquery. Preparation
+/// folds such subqueries into literals once, so the statement must instead be
+/// dispatched (and its subqueries folded) on every execution; see
+/// `compile_and_wrap`.
+fn prepared_dml_reads_subquery(statement: &Statement) -> bool {
+    match statement {
+        Statement::Insert(insert) => {
+            insert_values_have_subquery(insert) || insert_contains_rewritable_subquery(insert)
+        }
+        Statement::Update(_) | Statement::Delete(_) => {
+            statement_contains_rewritable_subquery(statement)
+        }
+        _ => false,
+    }
+}
+
+/// Whether an INSERT's VALUES rows hold a subquery. `compile_table_insert`
+/// evaluates such subqueries before codegen and compiles their results into
+/// the program, so that program is only valid for the one execution (its
+/// parameters and its data) it was built for: it must not be cached.
+fn insert_values_have_subquery(insert: &fsqlite_ast::InsertStatement) -> bool {
+    match &insert.source {
+        fsqlite_ast::InsertSource::Values(rows) => {
+            rows.iter().any(|row| row.iter().any(expr_has_any_subquery))
+        }
+        fsqlite_ast::InsertSource::Select(select) => matches!(
+            &select.body.select,
+            SelectCore::Values(rows) if rows.iter().any(|row| row.iter().any(expr_has_any_subquery))
+        ),
+        fsqlite_ast::InsertSource::DefaultValues => false,
+    }
 }
 
 /// Check if an expression contains a correlated scalar subquery whose
@@ -202887,7 +202978,7 @@ mod tests {
                 other => unreachable!("expected INSERT statement, got {other:?}"),
             };
 
-            let program = conn.compile_table_insert(&insert).await.unwrap();
+            let program = conn.compile_table_insert(&insert, None).await.unwrap();
             let blob_ops: Vec<_> = program
                 .ops()
                 .iter()
@@ -202923,7 +203014,7 @@ mod tests {
                 other => unreachable!("expected INSERT statement, got {other:?}"),
             };
 
-            let program = conn.compile_table_insert(&insert).await.unwrap();
+            let program = conn.compile_table_insert(&insert, None).await.unwrap();
             let nr = program
                 .ops()
                 .iter()
@@ -202951,7 +203042,7 @@ mod tests {
                 other => unreachable!("expected INSERT statement, got {other:?}"),
             };
 
-            let program = conn.compile_table_insert(&insert).await.unwrap();
+            let program = conn.compile_table_insert(&insert, None).await.unwrap();
             let nr = program
                 .ops()
                 .iter()
