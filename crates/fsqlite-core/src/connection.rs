@@ -80285,6 +80285,27 @@ impl Connection {
                         }
                     }
                 }
+                // bd-a3g0m: SQLite walks each child table's rows once and
+                // reports a row's violations in foreign-key id order, so a
+                // table's rows come out by rowid, then fkid. (A WITHOUT ROWID
+                // child reports NULL rowids and keeps one block per key.)
+                let table_rank: HashMap<String, usize> = checks
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .map(|(rank, chk)| (chk.child_table.clone(), rank))
+                    .collect();
+                out.sort_by_key(|row| {
+                    let integer = |index: usize| match row.values.get(index) {
+                        Some(SqliteValue::Integer(value)) => Some(*value),
+                        _ => None,
+                    };
+                    let rank = match row.values.first() {
+                        Some(SqliteValue::Text(table)) => table_rank.get(table.as_str()).copied(),
+                        _ => None,
+                    };
+                    (rank, integer(1), integer(3))
+                });
                 Ok(out)
             }
             // PRAGMA foreign_key_list(table_name) — FK constraints.

@@ -23275,3 +23275,32 @@ bead) — likely the interior descent must propagate the UpperBound bias, or the
   controls for reversed operands, explicit COLLATE, NULL, orphan rejection,
   TEMP shadowing and WITHOUT ROWID; do not relax the cost ceiling. Then test
   the retained real image before another unchanged full migration attempt.
+
+## 2026-10-04 — Parking closed read cursors in a side slot map (bd-a3g0m)
+
+- Workload: `PRAGMA foreign_key_check` on one parent/child pair of 100k rows
+  each, parent key `code TEXT UNIQUE` (a correlated NOT EXISTS probe of the
+  parent's autoindex per child row), plus the INTEGER PRIMARY KEY variant and
+  200-pair 300-row variants. Mac release CLI, CPU user+sys medians of 5-7
+  alternating runs against the 28049bf87 incumbent; outputs identical.
+- Candidate: `crates/fsqlite-vdbe/src/engine.rs`. `OP_Close` moved a read
+  cursor out of `storage_cursors` into a second `CursorSlots<StorageCursor>`
+  when `storage_cursors.values().any(writable)` was false, and the next
+  `OpenRead` of the same cursor number and root moved it back.
+- Result: the INTEGER PRIMARY KEY check improved (0.13 -> 0.08 s), but the
+  TEXT UNIQUE check regressed 0.32 -> 0.60 s (and 0.43 -> 0.75 s in a second
+  matrix). `sample` showed `_platform_memmove` at 1,894 samples against 577.
+  Three costs: each `StorageCursor` (inline b-tree stack, decode scratch) was
+  moved four times per probe; every `Close` scanned ~130 cursor slots of
+  that size for a writable cursor; and, the largest, a cursor kept across
+  probes fills `BtCursor`'s 64-entry cell-slot LRU, whose ~1 KiB entries
+  were rotated on every promotion or new page (up to 64 KiB of memmove per
+  probe; a fresh cursor never holds more than the ~3 pages of one descent).
+  Parking in place with a per-execution "writable cursor opened" flag fixed
+  the first two (0.75 -> 0.68 s) but not the third.
+- Kept instead: parking in place plus boxed cell-slot LRU entries, which made
+  the TEXT UNIQUE check 0.43 -> 0.31 s and the long-lived probe cursors of an
+  index join 0.80 -> 0.39 s.
+- Retry condition: none for the side map. Any future cursor-reuse scheme
+  must keep the parked cursor in place and should check per-cursor caches
+  that grow with the cursor's lifetime.

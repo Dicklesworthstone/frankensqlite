@@ -6749,6 +6749,16 @@ pub struct VdbeEngine {
     sorters: CursorSlots<SorterCursor>,
     /// Open storage-backed cursors keyed by cursor number (read and write).
     storage_cursors: CursorSlots<StorageCursor>,
+    /// bd-a3g0m: cursor numbers of the read cursors `OP_Close` parked during
+    /// this execution. A parked cursor stays in its `storage_cursors` slot
+    /// (moving a `StorageCursor` per probe costs more than it saves) for the
+    /// next `OpenRead` of the same root to reuse; everything else treats it
+    /// as closed. Any `OpenWrite`, `take_transaction` and the next reset drop
+    /// them.
+    parked_read_cursor_ids: Vec<i32>,
+    /// bd-a3g0m: set once this execution opens a writable storage cursor, so
+    /// no read cursor is parked from then on.
+    writable_storage_cursor_opened: bool,
     /// Cursors that deleted the current row and should treat the next `Next`
     /// as a no-advance "consume successor" step.
     pending_next_after_delete: HashSet<i32>,
@@ -7396,6 +7406,8 @@ impl VdbeEngine {
             cursors: CursorSlots::new(),
             sorters: CursorSlots::new(),
             storage_cursors: CursorSlots::new(),
+            parked_read_cursor_ids: Vec::new(),
+            writable_storage_cursor_opened: false,
             pending_next_after_delete: HashSet::new(),
             storage_cursors_enabled: true,
             retain_storage_cursors_on_close: false,
@@ -7642,6 +7654,9 @@ impl VdbeEngine {
         // Opcode tracing is engine configuration; reuse preserves the construction-time setting.
         self.collect_vdbe_metrics = false;
         self.results.clear();
+        // bd-a3g0m: a parked read cursor is closed; never retain it.
+        self.drop_parked_read_cursors();
+        self.writable_storage_cursor_opened = false;
         if retain_cursors {
             // Keep cursors + cursor_root_pages + storage_cursors alive.
             // OP_OpenWrite will detect an existing cursor on the same root
@@ -7797,6 +7812,29 @@ impl VdbeEngine {
     fn clear_retained_storage_cursor_statement_state(&mut self) {
         for sc in self.storage_cursors.values_mut() {
             Self::clear_storage_cursor_statement_state(sc);
+        }
+    }
+
+    /// bd-a3g0m: whether `cursor_id`'s slot holds a read cursor `OP_Close`
+    /// parked. (An ephemeral cursor that later took the slot is writable.)
+    fn storage_cursor_is_parked(&self, cursor_id: i32) -> bool {
+        self.parked_read_cursor_ids.contains(&cursor_id)
+            && self
+                .storage_cursors
+                .get(&cursor_id)
+                .is_some_and(|sc| !sc.writable)
+    }
+
+    /// bd-a3g0m: drop every read cursor `OP_Close` parked.
+    fn drop_parked_read_cursors(&mut self) {
+        for cursor_id in self.parked_read_cursor_ids.drain(..) {
+            if self
+                .storage_cursors
+                .get(&cursor_id)
+                .is_some_and(|sc| !sc.writable)
+            {
+                self.storage_cursors.remove(&cursor_id);
+            }
         }
     }
 
@@ -9029,6 +9067,7 @@ impl VdbeEngine {
     pub fn take_transaction(&mut self) -> Result<Option<TransactionKind>> {
         // Drop all storage cursors first to release Rc references.
         self.storage_cursors.clear();
+        self.parked_read_cursor_ids.clear();
         match self.txn_page_io.take() {
             Some(txn_page_io) => Ok(Some(txn_page_io.into_inner()?)),
             None => Ok(None),
@@ -9051,6 +9090,7 @@ impl VdbeEngine {
     /// retained cursors. The Rc inner becomes TransactionKind::Drained
     /// until the next refill_transaction call.
     pub fn drain_transaction(&mut self) -> Option<TransactionKind> {
+        self.drop_parked_read_cursors();
         self.txn_page_io.as_ref().map(|io| io.drain())
     }
 
@@ -9060,8 +9100,14 @@ impl VdbeEngine {
     }
 
     /// bd-perf: Check if storage cursors are empty (for drain vs take decision).
+    /// bd-a3g0m: a parked read cursor counts as closed.
     pub fn storage_cursors_empty(&self) -> bool {
-        self.storage_cursors.is_empty()
+        if self.parked_read_cursor_ids.is_empty() {
+            return self.storage_cursors.is_empty();
+        }
+        self.storage_cursors
+            .iter()
+            .all(|(cursor_id, _)| self.storage_cursor_is_parked(cursor_id))
     }
 
     /// Attach a function registry for `Function`/`PureFunc` opcode dispatch.
@@ -10497,6 +10543,24 @@ impl VdbeEngine {
                     if self.retain_storage_cursors_on_close {
                         if let Some(sc) = self.storage_cursors.get_mut(&op.p1) {
                             Self::clear_storage_cursor_statement_state(sc);
+                        }
+                    } else if !self.writable_storage_cursor_opened
+                        && let Some(sc) = self.storage_cursors.get_mut(&op.p1)
+                        && !sc.writable
+                    {
+                        // bd-a3g0m: a correlated subquery opens and closes its
+                        // read cursors once per outer row. Until this execution
+                        // opens a writable cursor, park a closed read cursor in
+                        // its slot, so the next OpenRead of the same root reuses
+                        // it instead of re-reading the root page and page 1 and
+                        // rebuilding it. It must not carry a decoded row over.
+                        invalidate_storage_cursor_row_cache_with_reason(
+                            sc,
+                            self.collect_vdbe_metrics,
+                            DecodeCacheInvalidationReason::PositionChange,
+                        );
+                        if !self.parked_read_cursor_ids.contains(&op.p1) {
+                            self.parked_read_cursor_ids.push(op.p1);
                         }
                     } else {
                         self.storage_cursors.remove(&op.p1);
@@ -12982,7 +13046,8 @@ impl VdbeEngine {
                 Opcode::IfNotOpen => {
                     // Jump to p2 if cursor p1 is not open.
                     if self.cursors.contains_key(&op.p1)
-                        || self.storage_cursors.contains_key(&op.p1)
+                        || (self.storage_cursors.contains_key(&op.p1)
+                            && !self.storage_cursor_is_parked(op.p1))
                         || self
                             .cold_state()
                             .is_some_and(|cold_state| cold_state.vtab_cursors.contains_key(&op.p1))
@@ -17674,6 +17739,23 @@ impl VdbeEngine {
         let has_txn = self.txn_page_io.is_some();
         let txn_cx = self.derive_execution_cx();
         let (rowid_mode, autoincrement_high_water) = self.storage_cursor_runtime_meta(root_page);
+        // bd-a3g0m: an OpenRead of the same root takes back the read cursor
+        // parked in this slot (the reuse branch below); a parked cursor on
+        // another root is dropped. An OpenWrite drops every parked cursor and
+        // ends parking for this execution, so none outlives a write.
+        if writable {
+            self.writable_storage_cursor_opened = true;
+            self.drop_parked_read_cursors();
+        } else if let Some(at) = self
+            .parked_read_cursor_ids
+            .iter()
+            .position(|&parked| parked == cursor_id)
+        {
+            self.parked_read_cursor_ids.swap_remove(at);
+            if self.cursor_root_pages.get(&cursor_id).copied() != Some(root_page) {
+                self.storage_cursors.remove(&cursor_id);
+            }
+        }
         if self.cursor_root_pages.get(&cursor_id).copied() == Some(root_page)
             && let Some(existing) = self.storage_cursors.get_mut(&cursor_id)
         {
@@ -34283,6 +34365,104 @@ mod tests {
                 .expect("take_transaction should succeed")
                 .is_some()
         );
+    }
+
+    #[test]
+    fn test_close_parks_read_cursor_until_reopen_or_write() {
+        // bd-a3g0m: OP_Close leaves a read cursor parked in its slot for the
+        // next OpenRead of the same root. The program sees it closed, a reopen
+        // on another root reads that root, and an OpenWrite drops it and ends
+        // parking for the execution.
+        let make_db = || {
+            let mut db = MemDatabase::new();
+            let root = db.create_table(1);
+            let other = db.create_table(1);
+            db.get_table_mut(root)
+                .unwrap()
+                .insert(5, vec![SqliteValue::Integer(50)]);
+            db.get_table_mut(other)
+                .unwrap()
+                .insert(5, vec![SqliteValue::Integer(70)]);
+            (db, root, other)
+        };
+        let new_engine = |prog: &VdbeProgram, db: MemDatabase| {
+            let mut engine = VdbeEngine::new(prog.register_count());
+            engine.enable_storage_cursors(true);
+            engine.set_database(db);
+            engine.set_reject_mem_fallback(false);
+            engine
+        };
+        let read_row = |b: &mut ProgramBuilder, root: i32, miss: Label| {
+            b.emit_op(Opcode::OpenRead, 0, root, 0, P4::Int(1), 0);
+            b.emit_jump_to_label(Opcode::SeekGE, 0, 1, miss, P4::None, 0);
+            b.emit_op(Opcode::Column, 0, 0, 2, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, 2, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::Close, 0, 0, 0, P4::None, 0);
+        };
+
+        let (db, root, other) = make_db();
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        let miss = b.emit_label();
+        let closed = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        b.emit_op(Opcode::Integer, 5, 1, 0, P4::None, 0);
+        read_row(&mut b, root, miss);
+        b.emit_op(Opcode::Integer, 1, 3, 0, P4::None, 0);
+        b.emit_jump_to_label(Opcode::IfNotOpen, 0, 0, closed, P4::None, 0);
+        b.emit_op(Opcode::Integer, 0, 3, 0, P4::None, 0);
+        b.resolve_label(closed);
+        b.emit_op(Opcode::ResultRow, 3, 1, 0, P4::None, 0);
+        read_row(&mut b, other, miss);
+        read_row(&mut b, root, miss);
+        b.resolve_label(miss);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+        let prog = b.finish().expect("program should build");
+        let mut engine = new_engine(&prog, db);
+        let outcome = run_async(engine.execute(&prog)).expect("execution should succeed");
+        assert_eq!(outcome, ExecOutcome::Done);
+        let rows: Vec<Vec<SqliteValue>> = engine
+            .take_results()
+            .into_iter()
+            .map(|v| v.into_vec())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                vec![SqliteValue::Integer(50)],
+                vec![SqliteValue::Integer(1)],
+                vec![SqliteValue::Integer(70)],
+                vec![SqliteValue::Integer(50)],
+            ]
+        );
+        assert!(engine.storage_cursors.contains_key(&0));
+        assert_eq!(engine.parked_read_cursor_ids, vec![0]);
+        assert!(engine.storage_cursors_empty());
+        engine.reset_for_reuse(prog.register_count(), &Cx::new(), PageSize::DEFAULT);
+        assert!(engine.storage_cursors.is_empty());
+        assert!(engine.parked_read_cursor_ids.is_empty());
+
+        let (db, root, other) = make_db();
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        let miss = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        b.emit_op(Opcode::Integer, 5, 1, 0, P4::None, 0);
+        read_row(&mut b, root, miss);
+        b.emit_op(Opcode::OpenWrite, 1, other, 0, P4::Int(1), 0);
+        b.emit_op(Opcode::Close, 1, 0, 0, P4::None, 0);
+        read_row(&mut b, root, miss);
+        b.resolve_label(miss);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+        let prog = b.finish().expect("program should build");
+        let mut engine = new_engine(&prog, db);
+        let outcome = run_async(engine.execute(&prog)).expect("execution should succeed");
+        assert_eq!(outcome, ExecOutcome::Done);
+        assert_eq!(engine.take_results().len(), 2);
+        assert!(engine.storage_cursors.is_empty());
+        assert!(engine.parked_read_cursor_ids.is_empty());
     }
 
     // ── bd-3pti: Seek opcode tests ───────────────────────────────────────

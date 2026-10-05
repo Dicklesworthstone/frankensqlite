@@ -981,7 +981,12 @@ struct CellSlotCacheEntry {
 
 #[derive(Debug, Default)]
 struct CellSlotCache {
-    entries: Vec<CellSlotCacheEntry>,
+    /// MRU first. bd-a3g0m: boxed, because an entry carries its slots inline
+    /// (about 1 KiB): a cursor that probes random pages for its whole life (a
+    /// join's inner index, a reused correlated-subquery cursor) keeps the
+    /// LRU full, and every promotion or new page used to shift up to 64 KiB.
+    #[allow(clippy::vec_box)]
+    entries: Vec<Box<CellSlotCacheEntry>>,
 }
 
 /// Look up a page's cached cell. `slots` is sorted by cell index, so a
@@ -1205,15 +1210,14 @@ impl CellSlotCache {
         cell_idx: u16,
         slot: CachedCellSlot,
     ) {
-        // Each entry carries its slots inline (about 1 KiB), so shifting the
-        // whole LRU costs tens of KiB of memmove. A write to a page bumps its
-        // image token, which used to make every row of an UPDATE or DELETE
-        // pass through here with a fresh key: one full-LRU shift per row,
-        // with the cache filling up with dead images of the same leaf.
-        // Reuse the page's entry whatever its image (a superseded image is
-        // rarely read again, and then it only misses and reparses), and
-        // rotate only the prefix in front of it, which is empty when the page
-        // is already MRU.
+        // A write to a page bumps its image token, which used to make every
+        // row of an UPDATE or DELETE pass through here with a fresh key, with
+        // the cache filling up with dead images of the same leaf. Reuse the
+        // page's entry whatever its image (a superseded image is rarely read
+        // again, and then it only misses and reparses), or the LRU entry once
+        // the cache is full, and rotate only the prefix in front of it, which
+        // is empty when the page is already MRU. (The rotation moves boxes,
+        // not the ~1 KiB entries.)
         let reuse_idx = self
             .entries
             .iter()
@@ -1226,11 +1230,11 @@ impl CellSlotCache {
             store_cached_cell_slot(&mut slots, cell_idx, slot);
             self.entries.insert(
                 0,
-                CellSlotCacheEntry {
+                Box::new(CellSlotCacheEntry {
                     page_no,
                     mutation_counter,
                     slots,
-                },
+                }),
             );
             return;
         };
