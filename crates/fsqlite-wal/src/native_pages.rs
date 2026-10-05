@@ -10,6 +10,9 @@
 //! resolve a predicate (including absence); this module does not infer SQL
 //! predicates, schema changes, or row-level conflicts from arbitrary bytes.
 
+mod store;
+pub use store::{NativePageLimits, NativePageStore, NativePageTransaction, NativePageTransactionState};
+
 use std::sync::Arc;
 
 use fsqlite_error::{FrankenError, Result};
