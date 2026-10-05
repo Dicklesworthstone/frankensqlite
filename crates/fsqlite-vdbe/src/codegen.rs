@@ -25327,6 +25327,74 @@ fn emit_secondary_column(
 /// Uses a nested-loop join: outer loop scans the FROM table, inner loop scans
 /// the target table. WHERE clause filters for the join condition.
 #[allow(clippy::too_many_lines)]
+/// bd-7orjo: the key of a top-level ON / WHERE conjunct of `UPDATE ... FROM`
+/// that pins the target's rowid (or its INTEGER PRIMARY KEY) with `=` to a
+/// FROM source's column, a literal or a numbered parameter: pass 1 then
+/// reaches the one target row with that rowid by SeekRowid instead of
+/// scanning the whole target for every FROM row (`UPDATE t SET v = d.nv
+/// FROM d WHERE d.k = t.id` was quadratic). The full ON / WHERE is still
+/// evaluated for the row reached, and IsNull / MustBeInt before the seek give
+/// the key the rowid comparison's semantics, as in the join rowid lookup.
+fn update_from_target_rowid_key<'a>(
+    conditions: &[&'a Expr],
+    target: &TableSchema,
+    target_alias: Option<&str>,
+    sources: &[SecondaryScan<'_>],
+) -> Option<&'a Expr> {
+    let resolves_in_source = |column: &str| {
+        sources.iter().any(|source| {
+            source.table.column_index(column).is_some()
+                || source.table.resolves_to_hidden_rowid(column)
+        })
+    };
+    let mut conjuncts = Vec::new();
+    for condition in conditions {
+        collect_conjunctive_terms(condition, &mut conjuncts);
+    }
+    conjuncts.into_iter().find_map(|term| {
+        let Expr::BinaryOp {
+            left,
+            op: BinaryOp::Eq,
+            right,
+            ..
+        } = term
+        else {
+            return None;
+        };
+        [(left.as_ref(), right.as_ref()), (right.as_ref(), left.as_ref())]
+            .into_iter()
+            .find_map(|(target_side, key)| {
+                let Expr::Column(target_ref, _) = target_side else {
+                    return None;
+                };
+                if !matches!(
+                    resolve_column_ref(target_side, target, target_alias),
+                    Some(SortKeySource::Rowid)
+                ) || (target_ref.table.is_none() && resolves_in_source(&target_ref.column))
+                {
+                    return None;
+                }
+                match key {
+                    Expr::Literal(Literal::Integer(_) | Literal::String(_), _)
+                    | Expr::Placeholder(fsqlite_ast::PlaceholderType::Numbered(_), _) => Some(key),
+                    Expr::Column(key_ref, _) => {
+                        let qualifier = key_ref.table.as_deref()?;
+                        if matches_table_or_alias(qualifier, target, target_alias) {
+                            return None;
+                        }
+                        let source = sources.iter().find(|source| {
+                            matches_table_or_alias(qualifier, source.table, source.table_alias)
+                        })?;
+                        (source.table.column_index(&key_ref.column).is_some()
+                            || source.table.resolves_to_hidden_rowid(&key_ref.column))
+                        .then_some(key)
+                    }
+                    _ => None,
+                }
+            })
+    })
+}
+
 fn codegen_update_from(
     b: &mut ProgramBuilder,
     stmt: &UpdateStatement,
@@ -25536,18 +25604,52 @@ fn codegen_update_from(
         });
     }
 
-    // Innermost loop: scan target table.
+    // Innermost loop: scan target table, or seek its one row when the ON /
+    // WHERE pins its rowid (bd-7orjo).
     let target_done_label = b.emit_label();
-    b.emit_jump_to_label(
-        Opcode::Rewind,
-        target_cursor,
-        0,
-        target_done_label,
-        P4::None,
-        0,
-    );
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    let target_body = b.current_addr() as i32;
+    let filter_conditions: Vec<&Expr> = on_conditions
+        .iter()
+        .copied()
+        .chain(stmt.where_clause.as_ref())
+        .collect();
+    let target_body = if let Some(key) = update_from_target_rowid_key(
+        &filter_conditions,
+        target,
+        stmt.table.alias.as_deref(),
+        &secondaries,
+    ) {
+        let key_reg = b.alloc_reg();
+        emit_expr(b, key, key_reg, Some(&scan));
+        b.emit_jump_to_label(Opcode::IsNull, key_reg, 0, target_done_label, P4::None, 0);
+        b.emit_jump_to_label(
+            Opcode::MustBeInt,
+            key_reg,
+            0,
+            target_done_label,
+            P4::None,
+            0,
+        );
+        b.emit_jump_to_label(
+            Opcode::SeekRowid,
+            target_cursor,
+            key_reg,
+            target_done_label,
+            P4::None,
+            0,
+        );
+        None
+    } else {
+        b.emit_jump_to_label(
+            Opcode::Rewind,
+            target_cursor,
+            0,
+            target_done_label,
+            P4::None,
+            0,
+        );
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        Some(b.current_addr() as i32)
+    };
 
     // Count anonymous placeholders so each clause numbers from the right base.
     // SQL textual order: SET, then FROM (ON conditions), then WHERE, then
@@ -25569,11 +25671,6 @@ fn codegen_update_from(
     // Combined filter: each ON condition (in join order) then the WHERE clause.
     // Any failed condition jumps to skip_label (the innermost loop's Next).
     let skip_label = b.emit_label();
-    let filter_conditions: Vec<&Expr> = on_conditions
-        .iter()
-        .copied()
-        .chain(stmt.where_clause.as_ref())
-        .collect();
     if !filter_conditions.is_empty() {
         // Placeholders in ON/WHERE follow the SET placeholders textually.
         b.set_next_anon_placeholder(set_placeholder_count + 1);
@@ -25654,8 +25751,11 @@ fn codegen_update_from(
     // Skip label for filtered-out rows.
     b.resolve_label(skip_label);
 
-    // Innermost (target) Next: loop back to the target loop body.
-    b.emit_op(Opcode::Next, target_cursor, target_body, 0, P4::None, 0);
+    // Innermost (target) Next: loop back to the target loop body (a rowid
+    // seek reached its only row).
+    if let Some(target_body) = target_body {
+        b.emit_op(Opcode::Next, target_cursor, target_body, 0, P4::None, 0);
+    }
     b.resolve_label(target_done_label);
 
     // Unwind the FROM-source loops from innermost to outermost. Each loop's
