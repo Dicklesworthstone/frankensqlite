@@ -29,6 +29,9 @@ use crate::checksum::{WAL_FRAME_HEADER_SIZE, WalHeader, WalSalts, Xxh3Checksum12
 use crate::recovery_fence::CheckpointChecksumVerdict;
 use crate::wal::WalFile;
 
+#[path = "checkpoint_validation.rs"]
+mod validation;
+
 // ---------------------------------------------------------------------------
 // CheckpointTarget trait
 // ---------------------------------------------------------------------------
@@ -200,25 +203,8 @@ pub async fn execute_checkpoint<F: VfsFile>(
 ) -> Result<CheckpointExecutionResult> {
     let checkpoint_start = fsqlite_types::sync_primitives::Instant::now();
 
-    // bd-km8qs: the plan window, progress, and post-actions all derive from the
-    // caller-supplied CheckpointState; only `end` is clamped to the live WAL.
-    // Revalidate that the state still describes the current WAL BEFORE copying
-    // frames, resetting the WAL, or running post-actions — the production caller
-    // sets `total_frames = wal.frame_count()` under the coordination guard, so a
-    // mismatch means the WAL grew or shrank between planning and execution (a
-    // caller-side locking regression), which would otherwise silently drop the
-    // frames beyond the planned window instead of erroring.
-    let live_frame_count = u32::try_from(wal.frame_count()).unwrap_or(u32::MAX);
-    if state.total_frames != live_frame_count {
-        return Err(FrankenError::CheckpointFailed {
-            detail: format!(
-                "checkpoint state is stale: total_frames={} but the live WAL has \
-                 {live_frame_count} frames — a coordination guard was violated between \
-                 planning and execution",
-                state.total_frames
-            ),
-        });
-    }
+    // Validate the caller's window before copying, publishing, or resetting.
+    validation::validate_checkpoint_state(wal, state)?;
 
     let plan = plan_checkpoint(mode, state);
     let normalized = state.normalized();
@@ -243,23 +229,27 @@ pub async fn execute_checkpoint<F: VfsFile>(
         let count = usize::try_from(plan.frames_to_backfill).unwrap_or(usize::MAX);
         let end = start.saturating_add(count).min(wal.frame_count());
 
-        let mut latest_frames: std::collections::HashMap<PageNumber, usize> =
+        let mut latest_frames: std::collections::HashMap<PageNumber, CheckpointPageExpectation> =
             std::collections::HashMap::new();
 
-        // Pass 1: Find the latest frame index for each page in the checkpoint range.
-        let headers = if start < end {
-            wal.read_frame_headers(cx, start, end).await?
-        } else {
-            Vec::new()
-        };
-        for (frame_idx, header) in (start..end).zip(headers) {
+        // Validate every source frame before deduplication or database mutation.
+        // Readback alone would bless bytes already corrupt before this checkpoint.
+        let headers = validation::read_checkpoint_frame_headers(wal, cx, start, end).await?;
+        for (frame_idx, (header, source_checksum)) in (start..end).zip(headers) {
             let page_no =
                 PageNumber::new(header.page_number).ok_or_else(|| FrankenError::OutOfRange {
                     what: "checkpoint frame page number".to_owned(),
                     value: header.page_number.to_string(),
                 })?;
 
-            latest_frames.insert(page_no, frame_idx);
+            latest_frames.insert(
+                page_no,
+                CheckpointPageExpectation {
+                    page: page_no,
+                    frame_index: frame_idx,
+                    source_checksum,
+                },
+            );
             frames_backfilled += 1;
 
             if header.is_commit() && header.db_size > 0 {
@@ -267,12 +257,14 @@ pub async fn execute_checkpoint<F: VfsFile>(
             }
         }
 
-        // Pass 2: Write deduplicated pages in sorted order to minimize disk seeks.
-        let mut sorted_pages: Vec<(PageNumber, usize)> = latest_frames.into_iter().collect();
-        sorted_pages.sort_unstable_by_key(|(p, _)| p.get());
+        // Pass 2: Bind each sorted write to the bytes validated in pass 1.
+        let mut sorted_pages: Vec<CheckpointPageExpectation> = latest_frames.into_values().collect();
+        sorted_pages.sort_unstable_by_key(|expected| expected.page.get());
 
         let mut frame_buf = vec![0u8; wal.frame_size()];
-        for (fault_page_idx, (page_no, frame_idx)) in sorted_pages.iter().enumerate() {
+        for (fault_page_idx, expected) in sorted_pages.into_iter().enumerate() {
+            let page_no = expected.page;
+            let frame_idx = expected.frame_index;
             #[cfg(not(any(test, feature = "fault-injection")))]
             let _ = fault_page_idx;
             #[cfg(any(test, feature = "fault-injection"))]
@@ -285,18 +277,22 @@ pub async fn execute_checkpoint<F: VfsFile>(
                 }
             }
 
-            wal.read_frame_into(cx, *frame_idx, &mut frame_buf).await?;
+            let header = wal.read_frame_into(cx, frame_idx, &mut frame_buf).await?;
+            if header.page_number != page_no.get()
+                || header.salts != wal.header().salts
+                || !expected.source_checksum.verify(&frame_buf)
+            {
+                return Err(FrankenError::WalCorrupt {
+                    detail: "checkpoint source changed after validation; database write refused"
+                        .to_owned(),
+                });
+            }
             let page_data = &frame_buf[WAL_FRAME_HEADER_SIZE..];
-            target.write_page(cx, *page_no, page_data).await?;
-
-            expected_pages.push(CheckpointPageExpectation {
-                page: *page_no,
-                frame_index: *frame_idx,
-                source_checksum: Xxh3Checksum128::compute(&frame_buf),
-            });
+            target.write_page(cx, page_no, page_data).await?;
+            expected_pages.push(expected);
 
             debug!(
-                frame_idx = *frame_idx,
+                frame_idx,
                 page_number = page_no.get(),
                 "checkpoint: page backfilled"
             );
@@ -2504,4 +2500,6 @@ mod tests {
     fn test_truncate_refuses_reset_when_durability_fence_fails() {
         run_reset_mode_with_failing_fence(CheckpointMode::Truncate);
     }
+
+    include!("checkpoint_integrity_tests.rs");
 }
