@@ -146,3 +146,70 @@ fn commit_binds_stock_unindexed_empty_index_beside_header_only_wal() {
     });
     assert_eq!(stock_rows(&db), vec![7]);
 }
+
+/// The downstream cass GH#509 flow: fsqlite creates the WAL database and its
+/// own WAL index, and the application's final TRUNCATE checkpoint leaves a
+/// header-only WAL beside it. A stock read-only connection (`sqlite3 -readonly
+/// db 'PRAGMA quick_check'`) then rewrites `-shm` to its unindexed empty header
+/// for that frame-free WAL. Every later read-write COMMIT used to fail with
+/// `BusyRecovery`, in every process.
+#[test]
+fn commit_binds_stock_unindexed_empty_index_after_fsqlite_truncate_checkpoint() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("gh443_truncate.db");
+    let path = db.to_str().expect("utf-8").to_owned();
+    asupersync::test_utils::run_test(|| async {
+        let conn = Connection::open(path.as_str()).await.expect("fsqlite open");
+        conn.execute("PRAGMA journal_mode = WAL;")
+            .await
+            .expect("wal");
+        conn.execute(
+            "CREATE TABLE some_table(id INTEGER PRIMARY KEY, v TEXT);
+             INSERT INTO some_table(v) VALUES ('a'), ('b'), ('c');",
+        )
+        .await
+        .expect("seed");
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            .await
+            .expect("truncate checkpoint");
+        conn.close().await.expect("close");
+    });
+
+    // `szPage` is the native-endian u16 at offset 14 of the WAL-index header;
+    // `mxFrame` is the u32 at offset 16.
+    let index_page_size = |shm: &[u8]| u16::from_ne_bytes([shm[14], shm[15]]);
+    let wal_len = std::fs::metadata(sidecar(&db, "-wal")).map_or(0, |meta| meta.len());
+    assert!(
+        wal_len <= 32,
+        "the WAL holds no frames before the stock reader"
+    );
+    let shm = std::fs::read(sidecar(&db, "-shm")).expect("fsqlite leaves -shm");
+    assert_ne!(
+        index_page_size(&shm),
+        0,
+        "fsqlite indexed its own WAL generation"
+    );
+
+    {
+        let conn =
+            rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .expect("stock read-only open");
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM some_table", [], |row| row.get(0))
+            .expect("stock read-only count");
+        assert_eq!(count, SEED_ROWS);
+    }
+    let shm = std::fs::read(sidecar(&db, "-shm")).expect("stock leaves -shm");
+    assert_eq!(
+        (index_page_size(&shm), word(&shm, 16)),
+        (0, 0),
+        "the stock reader leaves its unindexed empty header (no page size, no frames)"
+    );
+
+    asupersync::test_utils::run_test(|| async {
+        commit_ddl_and_row(&path, 1).await;
+        // A second process-like open finds the index the first one bound.
+        commit_ddl_and_row(&path, 2).await;
+    });
+    assert_eq!(stock_rows(&db), vec![1, 2]);
+}
