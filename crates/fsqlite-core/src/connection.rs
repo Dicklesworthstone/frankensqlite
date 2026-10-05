@@ -83772,13 +83772,20 @@ impl Connection {
     }
 
     /// Stable-reorder the materialized rows of a GROUP BY + JOIN so that, within
-    /// each left/group key, the right-table rows are visited in the order
-    /// SQLite's automatic covering index would yield: sorted by the join key,
-    /// then the referenced (covered) right-table columns in column order, then
-    /// the right-table rowid. This mirrors C SQLite for order-sensitive
-    /// aggregates (`group_concat` without an in-aggregate `ORDER BY`) over an
-    /// un-indexed right table. Rows are a permutation of the input, so grouping
-    /// and matching are unaffected — only intra-group order changes.
+    /// each left row, the right-table rows are visited in the order SQLite's
+    /// automatic covering index would yield: sorted by the join key, then the
+    /// referenced (covered) right-table columns in column order, then the
+    /// right-table rowid. This mirrors C SQLite for order-sensitive aggregates
+    /// (`group_concat` without an in-aggregate `ORDER BY`) over an un-indexed
+    /// right table. Rows are a permutation of the input, so grouping and
+    /// matching are unaffected — only intra-group order changes.
+    ///
+    /// bd-54sjx: the left rows, and the rows of a right source that gets no
+    /// automatic index, keep their scan order. The join emits each such row's
+    /// matches contiguously, so each one is keyed by the position of its first
+    /// joined row, never by its column values (sorting by those reordered the
+    /// left rows by BINARY value, which changed `min()` ties under NOCASE,
+    /// `group_concat` order and the bare-column row).
     fn reorder_grouped_join_rows_as_automatic_index(
         &self,
         select: &SelectStatement,
@@ -83837,12 +83844,19 @@ impl Connection {
             for_each_column_ref_in_expr(&term.expr, &mut record_ref);
         }
 
-        // Walk sources in col_map order, accumulating a list of sort keys:
-        // for every base-table right source, (join-key cols, referenced covered
-        // cols, rowid) by absolute col_map index. The primary source's own
-        // columns lead the sort key so left/group order is preserved.
+        // Walk sources in col_map order, accumulating one sort key per source:
+        // a base-table right source sorts by (join-key cols, referenced
+        // covered cols, rowid) by absolute col_map index; the primary source
+        // and any other right source keep their scan order.
+        enum JoinRowOrderKey {
+            /// Columns `0..end` identify the rows of every source so far: order
+            /// by the position of the first joined row that carries them.
+            ScanOrder { end: usize },
+            /// An automatically indexed right source's sort columns.
+            Columns(Vec<usize>),
+        }
         let mut offset = 0usize;
-        let mut sort_indices: Vec<usize> = Vec::new();
+        let mut order_keys: Vec<JoinRowOrderKey> = Vec::new();
 
         let primary_names = self.source_column_names_for_join_layout(&from.source, &visible_ctes);
         let primary_width = primary_names.len()
@@ -83850,10 +83864,8 @@ impl Connection {
                 self.hidden_rowid_projection_for_source(&from.source, &primary_names)
                     .is_some(),
             );
-        // Lead with every primary-source column (visible + rowid) so the left
-        // rows keep their relative scan order across the stable sort.
-        sort_indices.extend(offset..offset + primary_width);
         offset += primary_width;
+        order_keys.push(JoinRowOrderKey::ScanOrder { end: offset });
 
         let mut left_visible_names: Vec<String> = primary_names;
 
@@ -83887,6 +83899,7 @@ impl Connection {
             };
 
             if is_base_table {
+                let mut sort_indices: Vec<usize> = Vec::new();
                 // Key columns first.
                 for key_name in &key_names {
                     if let Some(local) = right_names
@@ -83910,29 +83923,81 @@ impl Connection {
                 if right_hidden_rowid {
                     sort_indices.push(right_start + visible_width);
                 }
+                order_keys.push(JoinRowOrderKey::Columns(sort_indices));
+            } else {
+                order_keys.push(JoinRowOrderKey::ScanOrder { end: offset });
             }
 
             // Right columns become visible to subsequent joins.
             left_visible_names.extend(right_names);
         }
 
-        if sort_indices.len() <= primary_width {
+        if !order_keys
+            .iter()
+            .any(|key| matches!(key, JoinRowOrderKey::Columns(_)))
+        {
             // No base-table right source contributed an ordering key.
             return;
         }
 
-        join_rows.sort_by(|a, b| {
-            for &idx in &sort_indices {
-                let ord = cmp_values_no_affinity(
-                    a.get(idx).unwrap_or(&SqliteValue::Null),
-                    b.get(idx).unwrap_or(&SqliteValue::Null),
-                );
+        // Each scan-order key's position: the index of the first row of the
+        // contiguous run that shares the row's leading columns.
+        let scan_positions: Vec<Vec<usize>> = order_keys
+            .iter()
+            .filter_map(|key| match key {
+                JoinRowOrderKey::ScanOrder { end } => Some(*end),
+                JoinRowOrderKey::Columns(_) => None,
+            })
+            .map(|end| {
+                let leading = |row: &Row| end.min(row.values.len());
+                let mut run_start = 0usize;
+                (0..join_rows.len())
+                    .map(|i| {
+                        let (previous, current) = (&join_rows[i.saturating_sub(1)], &join_rows[i]);
+                        if i > 0
+                            && previous.values[..leading(previous)]
+                                != current.values[..leading(current)]
+                        {
+                            run_start = i;
+                        }
+                        run_start
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let mut order: Vec<usize> = (0..join_rows.len()).collect();
+        order.sort_by(|&a, &b| {
+            let mut positions = scan_positions.iter();
+            for key in &order_keys {
+                let ord = match key {
+                    JoinRowOrderKey::ScanOrder { .. } => positions
+                        .next()
+                        .map_or(std::cmp::Ordering::Equal, |pos| pos[a].cmp(&pos[b])),
+                    JoinRowOrderKey::Columns(indices) => indices
+                        .iter()
+                        .map(|&idx| {
+                            cmp_values_no_affinity(
+                                join_rows[a].get(idx).unwrap_or(&SqliteValue::Null),
+                                join_rows[b].get(idx).unwrap_or(&SqliteValue::Null),
+                            )
+                        })
+                        .find(|ord| *ord != std::cmp::Ordering::Equal)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                };
                 if ord != std::cmp::Ordering::Equal {
                     return ord;
                 }
             }
             std::cmp::Ordering::Equal
         });
+        let mut taken: Vec<Row> = join_rows
+            .iter_mut()
+            .map(|row| std::mem::replace(row, Row { values: Vec::new() }))
+            .collect();
+        for (slot, source) in join_rows.iter_mut().zip(order) {
+            std::mem::swap(slot, &mut taken[source]);
+        }
     }
 
     /// Build a col_map with original table labels for a SELECT with JOINs.
