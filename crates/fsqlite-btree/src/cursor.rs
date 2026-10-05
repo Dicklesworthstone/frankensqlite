@@ -31,8 +31,8 @@ use fsqlite_pager::TransactionHandle;
 use fsqlite_types::cx::Cx;
 use fsqlite_types::limits::BTREE_MAX_DEPTH;
 use fsqlite_types::record::{
-    RecordProfileScope, enter_record_profile_scope, parse_record, parse_record_prefix,
-    parse_record_projected_column_offsets, parse_record_with_encoding,
+    RecordProfileScope, decode_value_with_encoding, enter_record_profile_scope, parse_record,
+    parse_record_prefix, parse_record_projected_column_offsets, parse_record_with_encoding,
 };
 use fsqlite_types::serial_type::{
     SerialTypeClass, classify_serial_type, read_varint, serial_type_len, varint_len, write_varint,
@@ -4995,6 +4995,12 @@ impl<P: PageReader> BtCursor<P> {
         bias: IndexSeekBias,
     ) -> std::cmp::Ordering {
         let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::BtreeCursor);
+        if let Some(rhs_vals) = parsed_rhs
+            && matches!(self.index_key_compare_encoding(), TextEncoding::Utf8)
+            && let Some(ord) = self.compare_index_key_record_with_values(lhs_bytes, rhs_vals, bias)
+        {
+            return ord;
+        }
         match (self.decode_index_key_for_compare(lhs_bytes), parsed_rhs) {
             (Some(lhs_vals), Some(rhs_vals)) => self
                 .compare_index_key_values(&lhs_vals, rhs_vals, bias)
@@ -5054,21 +5060,120 @@ impl<P: PageReader> BtCursor<P> {
         encoding: TextEncoding,
     ) -> Option<std::cmp::Ordering> {
         if let (SqliteValue::Text(left), SqliteValue::Text(right)) = (lhs, rhs) {
-            let (left, right) = (left.as_bytes_direct(), right.as_bytes_direct());
-            return Some(match coll_name {
-                Some(coll_name)
-                    if !(coll_name.eq_ignore_ascii_case("BINARY")
-                        && registry.uses_builtin_implementation("BINARY")) =>
-                {
-                    registry.find(coll_name).map_or_else(
-                        || binary_text_cmp(left, right, encoding),
-                        |collation| collation.compare(left, right),
-                    )
-                }
-                _ => binary_text_cmp(left, right, encoding),
-            });
+            return Some(Self::cmp_index_text_collated(
+                left.as_bytes_direct(),
+                right.as_bytes_direct(),
+                coll_name,
+                registry,
+                encoding,
+            ));
         }
         lhs.partial_cmp(rhs)
+    }
+
+    /// Order two TEXT key terms' exact bytes: built-in BINARY (and a missing
+    /// collation) in `encoding`, any other collation through the registry.
+    fn cmp_index_text_collated(
+        left: &[u8],
+        right: &[u8],
+        coll_name: Option<&str>,
+        registry: &CollationRegistry,
+        encoding: TextEncoding,
+    ) -> std::cmp::Ordering {
+        match coll_name {
+            Some(coll_name)
+                if !(coll_name.eq_ignore_ascii_case("BINARY")
+                    && registry.uses_builtin_implementation("BINARY")) =>
+            {
+                registry.find(coll_name).map_or_else(
+                    || binary_text_cmp(left, right, encoding),
+                    |collation| collation.compare(left, right),
+                )
+            }
+            _ => binary_text_cmp(left, right, encoding),
+        }
+    }
+
+    /// Order a stored index key against the decoded probe key the way
+    /// [`Self::compare_index_key_values`] orders the decoded stored key, but
+    /// straight from the record bytes: one field at a time, stopping at the
+    /// first that differs, with TEXT compared in place and every other field
+    /// decoded alone. A binary search used to decode every visited key into a
+    /// fresh `Vec` (with UTF-8 validation of its TEXT) and lock the collation
+    /// registry for each comparison; the registry is now locked only for a key
+    /// term with a named collation. Only for the UTF-8 compare encoding (the
+    /// stored bytes); `None` for a malformed record, which falls back to the
+    /// decoding comparison.
+    fn compare_index_key_record_with_values(
+        &self,
+        lhs_bytes: &[u8],
+        rhs: &[SqliteValue],
+        bias: IndexSeekBias,
+    ) -> Option<std::cmp::Ordering> {
+        let (header_size, header_varint_len) = read_varint(lhs_bytes)?;
+        let header_size = usize::try_from(header_size).ok()?;
+        if header_size > lhs_bytes.len() || header_size < header_varint_len {
+            return None;
+        }
+        // Validate the whole header first, as a full decode would, so a
+        // malformed record keeps the byte-order fallback.
+        let mut fields: SmallVec<[(u64, usize, usize); 8]> = SmallVec::new();
+        let mut offset = header_varint_len;
+        let mut body = header_size;
+        while offset < header_size {
+            let (serial_type, consumed) = read_varint(&lhs_bytes[offset..header_size])?;
+            offset += consumed;
+            let len = usize::try_from(serial_type_len(serial_type)?).ok()?;
+            let start = body;
+            body = body.checked_add(len)?;
+            if body > lhs_bytes.len() {
+                return None;
+            }
+            fields.push((serial_type, start, len));
+        }
+        if body != lhs_bytes.len() {
+            return None;
+        }
+        let mut registry = None;
+        for (idx, (&(serial_type, start, len), rhs_value)) in fields.iter().zip(rhs).enumerate() {
+            let coll_name = self
+                .index_collations
+                .get(idx)
+                .and_then(|coll| coll.as_deref());
+            let field = &lhs_bytes[start..start + len];
+            let mut ord = match (classify_serial_type(serial_type), rhs_value) {
+                (SerialTypeClass::Text, SqliteValue::Text(right)) => match coll_name {
+                    None => binary_text_cmp(field, right.as_bytes_direct(), TextEncoding::Utf8),
+                    Some(_) => {
+                        let registry = registry.get_or_insert_with(|| {
+                            self.collation_registry
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        });
+                        Self::cmp_index_text_collated(
+                            field,
+                            right.as_bytes_direct(),
+                            coll_name,
+                            registry,
+                            TextEncoding::Utf8,
+                        )
+                    }
+                },
+                _ => decode_value_with_encoding(serial_type, field, TextEncoding::Utf8, false)?
+                    .partial_cmp(rhs_value)?,
+            };
+            if self.index_desc_flags.get(idx).copied().unwrap_or(false) {
+                ord = ord.reverse();
+            }
+            if ord != std::cmp::Ordering::Equal {
+                return Some(ord);
+            }
+        }
+        if bias == IndexSeekBias::UpperBound && rhs.len() <= fields.len() {
+            Some(std::cmp::Ordering::Less)
+        } else {
+            Some(fields.len().cmp(&rhs.len()))
+        }
     }
 
     /// Advance to the next entry. Returns false if at EOF.
@@ -15446,6 +15551,77 @@ mod tests {
                 vec![SqliteValue::Text("beta".into()), SqliteValue::Integer(3)]
             );
         });
+    }
+
+    #[test]
+    fn test_record_key_comparison_orders_like_decoding_both_keys() {
+        // The in-place comparison of a stored key against a decoded probe must
+        // order every pair exactly as decoding both keys does: across storage
+        // classes, DESC key terms, collations and both seek biases.
+        let values = vec![
+            SqliteValue::Null,
+            SqliteValue::Integer(0),
+            SqliteValue::Integer(1),
+            SqliteValue::Integer(-7),
+            SqliteValue::Integer(1 << 40),
+            SqliteValue::Float(1.5),
+            SqliteValue::Float(-0.0),
+            SqliteValue::Float(1.0),
+            SqliteValue::Text("a".into()),
+            SqliteValue::Text("A".into()),
+            SqliteValue::Text("B".into()),
+            SqliteValue::Text("ab".into()),
+            SqliteValue::Text("a  ".into()),
+            SqliteValue::Text(fsqlite_types::SmallText::from_bytes(&[0xff, 0x61])),
+            SqliteValue::Blob(Arc::from(&[0x00_u8][..])),
+            SqliteValue::Blob(Arc::from(&[0xff_u8, 0x01][..])),
+        ];
+        let mut records: Vec<Vec<u8>> = values
+            .iter()
+            .map(|value| serialize_record(std::slice::from_ref(value)))
+            .collect();
+        for first in &values {
+            for second in &values {
+                records.push(serialize_record(&[first.clone(), second.clone()]));
+            }
+        }
+        let configs: [(Vec<bool>, Vec<Option<String>>); 4] = [
+            (Vec::new(), Vec::new()),
+            (vec![true, false], Vec::new()),
+            (vec![false, false], vec![Some("NOCASE".to_owned()), None]),
+            (vec![false, true], vec![None, Some("RTRIM".to_owned())]),
+        ];
+        for (desc, collations) in configs {
+            let mut cursor = BtCursor::new_with_index_desc(
+                MemPageStore::new(USABLE),
+                pn(2),
+                USABLE,
+                false,
+                desc.clone(),
+            );
+            cursor.set_index_collation_context(
+                collations.clone(),
+                Arc::new(Mutex::new(CollationRegistry::new())),
+                fsqlite_types::TextEncoding::Utf8,
+            );
+            for rhs in &records {
+                let parsed_rhs = parse_record(rhs).expect("probe record");
+                for lhs in &records {
+                    let parsed_lhs = parse_record(lhs).expect("stored record");
+                    for bias in [IndexSeekBias::LowerBound, IndexSeekBias::UpperBound] {
+                        let decoded = cursor
+                            .compare_index_key_values(&parsed_lhs, &parsed_rhs, bias)
+                            .unwrap_or_else(|| bias.adjust_byte_order(lhs.cmp(rhs)));
+                        assert_eq!(
+                            cursor.compare_index_key_record_with_values(lhs, &parsed_rhs, bias),
+                            Some(decoded),
+                            "{parsed_lhs:?} vs {parsed_rhs:?}, desc {desc:?}, \
+                             collations {collations:?}, {bias:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
