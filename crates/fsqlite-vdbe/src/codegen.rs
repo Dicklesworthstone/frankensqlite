@@ -22587,6 +22587,10 @@ fn emit_upsert_do_update_apply(
         existing_hidden_rowid_reg,
         excluded_hidden_rowid_reg,
     )?;
+    // The rewritten image's STORED generated columns follow its new base
+    // columns, as in a plain UPDATE and the WITHOUT ROWID apply; without this
+    // the record kept the conflict victim's stale values (bd-u7sv8 review).
+    emit_stored_generated_columns(b, table, existing_regs);
     // The IPK register holds the old rowid unless an assignment rewrote it;
     // a rewritten key passes stock's MustBeInt gate (NULL included) before any
     // constraint check or mutation.

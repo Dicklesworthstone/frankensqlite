@@ -68884,6 +68884,8 @@ impl Connection {
     // BEFORE/AFTER Trigger Firing (Phase 5G.2/5G.3 - bd-iqam, bd-khol)
     // ═══════════════════════════════════════════════════════════════════════════
 
+    /// `new_loaded`, when given, marks the base columns whose NEW value is
+    /// visible to generated columns (see [`Self::before_update_new_loaded_columns`]).
     fn make_trigger_frame(
         &self,
         table_name: &str,
@@ -68891,6 +68893,7 @@ impl Connection {
         new_values: Option<&[SqliteValue]>,
         old_rowid: Option<i64>,
         new_rowid: Option<i64>,
+        new_loaded: Option<&[bool]>,
     ) -> Result<TriggerFrame> {
         let schema = self.schema.borrow();
         let table_schema = schema
@@ -68910,7 +68913,7 @@ impl Connection {
         // so `INSERT ... VALUES('1')` into an INTEGER column shows NEW.k as the
         // integer 1 in trigger bodies and WHEN clauses. OLD rows come from
         // storage and already carry their stored classes.
-        let new_row = new_values.map(|values| {
+        let mut new_row: Option<Vec<SqliteValue>> = new_values.map(|values| {
             values
                 .iter()
                 .enumerate()
@@ -68924,6 +68927,52 @@ impl Connection {
                 })
                 .collect()
         });
+        // bd-u7sv8: the NEW image is assembled from the statement's values
+        // (an INSERT's row, or the OLD row with the SET applied), so its
+        // generated columns are NULL or still hold the OLD values. Stock
+        // computes them from the new base columns before any trigger reads
+        // NEW, VIRTUAL and STORED alike — in BEFORE UPDATE from only the
+        // base columns it loaded (`new_loaded`), the others reading NULL.
+        if let Some(row) = new_row.as_mut() {
+            let rowid = new_rowid.unwrap_or(-1);
+            match new_loaded {
+                None => Self::fill_generated_columns(
+                    table_schema,
+                    rowid,
+                    rowid_alias_col_idx,
+                    row,
+                    true,
+                )?,
+                Some(loaded) => {
+                    let mut partial: Vec<SqliteValue> = row
+                        .iter()
+                        .zip(loaded)
+                        .map(|(value, &loaded)| {
+                            if loaded {
+                                value.clone()
+                            } else {
+                                SqliteValue::Null
+                            }
+                        })
+                        .collect();
+                    Self::fill_generated_columns(
+                        table_schema,
+                        rowid,
+                        rowid_alias_col_idx,
+                        &mut partial,
+                        true,
+                    )?;
+                    for (index, column) in table_schema.columns.iter().enumerate() {
+                        if column.generated_expr.is_some()
+                            && let (Some(slot), Some(computed)) =
+                                (row.get_mut(index), partial.get(index))
+                        {
+                            slot.clone_from(computed);
+                        }
+                    }
+                }
+            }
+        }
         Ok(TriggerFrame {
             table_name: table_schema.name.clone(),
             trigger_name: String::new(), // set per-trigger in the fire loop
@@ -68934,6 +68983,91 @@ impl Connection {
             old_rowid,
             new_rowid,
         })
+    }
+
+    /// bd-u7sv8: the base columns whose NEW value stock loads before it
+    /// computes a BEFORE UPDATE trigger row's generated columns (update.c):
+    /// the columns the UPDATE assigns, those a matching BEFORE trigger reads
+    /// as `NEW.<column>`, the INTEGER PRIMARY KEY (generated columns read it
+    /// as the rowid) and every column past the 32-bit trigger column mask.
+    /// The others hold NULL at that point, so a generated column computed
+    /// from one of them is computed from NULL in BEFORE UPDATE triggers (AFTER
+    /// triggers see it computed from the written row). `None` when every
+    /// column is loaded or the table has no generated column.
+    fn before_update_new_loaded_columns(
+        &self,
+        table_name: &str,
+        assigned_columns: &[String],
+        triggers: &[TriggerDef],
+    ) -> Option<Vec<bool>> {
+        if assigned_columns.is_empty() {
+            return None;
+        }
+        let schema = self.schema.borrow();
+        let table = schema
+            .iter()
+            .find(|table| table.name.eq_ignore_ascii_case(table_name))?;
+        if !table
+            .columns
+            .iter()
+            .any(|column| column.generated_expr.is_some())
+        {
+            return None;
+        }
+        let mut loaded: Vec<bool> = table
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(index, column)| {
+                index > 31
+                    || column.is_ipk
+                    || column.generated_expr.is_some()
+                    || assigned_columns
+                        .iter()
+                        .any(|assigned| assigned.eq_ignore_ascii_case(&column.name))
+            })
+            .collect();
+        let mut trigger_text = String::new();
+        for trigger in triggers {
+            if let Some(when) = &trigger.when_clause {
+                trigger_text.push_str(&when.to_string());
+                trigger_text.push_str(" ; ");
+            }
+            for statement in &trigger.body {
+                trigger_text.push_str(&statement.to_string());
+                trigger_text.push_str(" ; ");
+            }
+        }
+        let token_text = |token: &fsqlite_parser::Token| -> String {
+            match &token.kind {
+                fsqlite_parser::TokenKind::Id(name)
+                | fsqlite_parser::TokenKind::QuotedId(name, _) => name.to_string(),
+                _ => trigger_text
+                    .get(token.span.start as usize..token.span.end as usize)
+                    .unwrap_or_default()
+                    .to_owned(),
+            }
+        };
+        let tokens = Lexer::tokenize(&trigger_text);
+        for window in tokens.windows(3) {
+            if !token_text(&window[0]).eq_ignore_ascii_case("new")
+                || window[1].kind != fsqlite_parser::TokenKind::Dot
+            {
+                continue;
+            }
+            if window[2].kind == fsqlite_parser::TokenKind::Star {
+                return None;
+            }
+            let column_name = token_text(&window[2]);
+            if let Some(index) = table.column_index(&column_name) {
+                // A reference past the mask's 32 bits sets every bit.
+                if index > 31 {
+                    return None;
+                }
+                loaded[index] = true;
+            }
+        }
+        (!loaded.iter().all(|&column_loaded| column_loaded)).then_some(loaded)
     }
 
     fn push_trigger_frame(&self, frame: TriggerFrame) -> TriggerFrameGuard<'_> {
@@ -70830,8 +70964,20 @@ impl Connection {
             return Ok(false);
         }
 
-        let base_frame =
-            self.make_trigger_frame(table_name, old_values, new_values, old_rowid, new_rowid)?;
+        let new_loaded = match event {
+            fsqlite_ast::TriggerEvent::Update(assigned_columns) => {
+                self.before_update_new_loaded_columns(table_name, assigned_columns, &matching)
+            }
+            fsqlite_ast::TriggerEvent::Insert | fsqlite_ast::TriggerEvent::Delete => None,
+        };
+        let base_frame = self.make_trigger_frame(
+            table_name,
+            old_values,
+            new_values,
+            old_rowid,
+            new_rowid,
+            new_loaded.as_deref(),
+        )?;
         for trigger in matching {
             // PRAGMA recursive_triggers (default OFF): when disabled, the
             // same trigger cannot re-enter itself (checked by trigger NAME,
@@ -70914,7 +71060,7 @@ impl Connection {
         }
 
         let base_frame =
-            self.make_trigger_frame(table_name, old_values, new_values, old_rowid, new_rowid)?;
+            self.make_trigger_frame(table_name, old_values, new_values, old_rowid, new_rowid, None)?;
         for trigger in matching {
             // PRAGMA recursive_triggers (default OFF): when disabled, the
             // same trigger cannot re-enter itself (checked by trigger NAME,
@@ -75569,37 +75715,42 @@ impl Connection {
             rowid_alias_col_idx,
             default_value_at,
         )?;
-        Self::fill_virtual_generated_columns(table, rowid, rowid_alias_col_idx, &mut values)?;
+        Self::fill_generated_columns(table, rowid, rowid_alias_col_idx, &mut values, false)?;
         Ok(values)
     }
 
-    /// Compute VIRTUAL generated columns for a freshly inflated, full-width row.
+    /// Compute generated columns for a full-width row: the VIRTUAL ones, and
+    /// with `recompute_stored` the STORED ones too.
     ///
     /// Mirrors the SELECT read path (`emit_table_column_read` in codegen): for
     /// each VIRTUAL generated column, evaluate its generating expression against
     /// the row and coerce the result to the column's declared affinity. STORED
-    /// generated columns are physically materialized in the record and are left
-    /// untouched (so they are never double-computed). Columns are filled in
-    /// declared order, so a VIRTUAL column may reference an earlier one.
+    /// generated columns are physically materialized in a stored record, so a
+    /// row read from storage leaves them untouched (they are never
+    /// double-computed); a row that was never stored (a trigger's NEW row,
+    /// whose base columns are new) passes `recompute_stored`. Columns are
+    /// filled in declared order, so a generated column may reference an
+    /// earlier one.
     ///
     /// Reuses the synchronous `eval_join_expr` interpreter (the same evaluator
     /// used by `build_expected_index_key_for_integrity` for index-on-expression
     /// keys), which resolves scalar functions such as `json_extract` through the
     /// registered/shared builtin function registry.
-    fn fill_virtual_generated_columns(
+    fn fill_generated_columns(
         table: &TableSchema,
         rowid: i64,
         rowid_alias_col_idx: Option<usize>,
         values: &mut [SqliteValue],
+        recompute_stored: bool,
     ) -> Result<()> {
-        // Hot path: nothing to compute when the table has no VIRTUAL generated
-        // columns. `generated_stored == Some(true)` marks STORED columns, which
-        // are physically present and must not be recomputed here.
-        if !table
-            .columns
-            .iter()
-            .any(|column| column.generated_expr.is_some() && column.generated_stored != Some(true))
-        {
+        // Hot path: nothing to compute when the table has no generated column
+        // to fill. `generated_stored == Some(true)` marks STORED columns, which
+        // are physically present in a stored row.
+        let fills = |column: &ColumnInfo| {
+            column.generated_expr.is_some()
+                && (recompute_stored || column.generated_stored != Some(true))
+        };
+        if !table.columns.iter().any(fills) {
             return Ok(());
         }
         // Only operate on a full-width inflated row; a short row cannot resolve
@@ -75609,8 +75760,8 @@ impl Connection {
         }
 
         // Build the evaluation row + column map, mirroring
-        // `build_expected_index_key_for_integrity`. VIRTUAL slots start as their
-        // NULL placeholder and are overwritten in place as they are computed.
+        // `build_expected_index_key_for_integrity`. Generated slots are
+        // overwritten in place as they are computed.
         let mut eval_row = values.to_vec();
         let mut col_map = table
             .columns
@@ -75631,13 +75782,14 @@ impl Connection {
         }
 
         for (col_idx, column) in table.columns.iter().enumerate() {
+            if !fills(column) {
+                // Not generated, or STORED and already materialized in the
+                // record: do not recompute.
+                continue;
+            }
             let Some(expr_sql) = column.generated_expr.as_deref() else {
                 continue;
             };
-            if column.generated_stored == Some(true) {
-                // STORED: already materialized in the record; do not recompute.
-                continue;
-            }
             let mut expr =
                 fsqlite_parser::expr::parse_expr(expr_sql).map_err(|error| {
                     FrankenError::DatabaseCorrupt {
@@ -89629,11 +89781,12 @@ impl Connection {
                         *alias_value = SqliteValue::Integer(rowid);
                     }
                     if has_virtual_generated {
-                        Self::fill_virtual_generated_columns(
+                        Self::fill_generated_columns(
                             &table_schema,
                             rowid,
                             rowid_alias_column_index,
                             &mut row,
+                            false,
                         )
                         .ok()?;
                     }
@@ -89953,11 +90106,12 @@ impl Connection {
                             *alias_value = SqliteValue::Integer(rowid);
                         }
                         if has_virtual_generated
-                            && Self::fill_virtual_generated_columns(
+                            && Self::fill_generated_columns(
                                 &table_schema,
                                 rowid,
                                 Some(ipk_idx),
                                 &mut row,
+                                false,
                             )
                             .is_err()
                         {
