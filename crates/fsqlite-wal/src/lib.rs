@@ -33,6 +33,7 @@ pub mod group_commit;
 pub mod metrics;
 pub mod native_commit;
 pub mod native_durability;
+pub mod native_pages;
 #[cfg(all(feature = "native", not(target_arch = "wasm32"), any(unix, windows)))]
 pub mod native_recovery;
 pub mod parallel_wal;
@@ -148,7 +149,7 @@ pub use wal_fec::{
     WalFecRepairEvidenceCard, WalFecRepairEvidenceQuery, WalFecRepairMetricsSnapshot,
     WalFecRepairPipeline, WalFecRepairPipelineConfig, WalFecRepairPipelineStats,
     WalFecRepairSeverityBucket, WalFecRepairSeverityHistogram, WalFecRepairSource,
-    WalFecRepairWitnessTriple, WalFecRepairWorkItem, WalFecScanResult, WalFrameCandidate,
+    WalFecRepairWitnessTriple, WalFecRepairWorkItem, WalFrameCandidate, WalFecScanResult,
     append_wal_fec_group, build_source_page_hashes, ensure_wal_with_fec_sidecar,
     find_wal_fec_group, generate_wal_fec_repair_symbols, identify_damaged_commit_group,
     persist_wal_fec_raptorq_repair_symbols, query_raptorq_repair_evidence,
