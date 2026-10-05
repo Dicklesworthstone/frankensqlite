@@ -13168,6 +13168,12 @@ pub struct Connection {
     /// statement can protect all nested trigger/FK work without per-substatement
     /// savepoint churn.
     internal_statement_savepoint_depth: Cell<usize>,
+    /// bd-8a8pr: the innermost statement savepoint of a concurrent transaction
+    /// (0 outside one). Its programs allocate implicit rowids in its name, so
+    /// its rollback can give them back to the shared allocator.
+    concurrent_rowid_statement: Cell<u64>,
+    /// bd-8a8pr: the last statement id `concurrent_rowid_statement` was given.
+    last_concurrent_rowid_statement: Cell<u64>,
     /// Whether the current transaction was started implicitly by SAVEPOINT
     /// (as opposed to an explicit BEGIN).  Used by RELEASE to decide whether
     /// to auto-commit when the last savepoint is released.
@@ -14454,6 +14460,26 @@ impl Drop for BoolCellRestoreGuard<'_> {
     }
 }
 
+struct U64CellRestoreGuard<'a> {
+    cell: &'a Cell<u64>,
+    previous: u64,
+}
+
+impl<'a> U64CellRestoreGuard<'a> {
+    fn new(cell: &'a Cell<u64>, value: u64) -> Self {
+        Self {
+            cell,
+            previous: cell.replace(value),
+        }
+    }
+}
+
+impl Drop for U64CellRestoreGuard<'_> {
+    fn drop(&mut self) {
+        self.cell.set(self.previous);
+    }
+}
+
 /// Held for one trigger program (all statements of one firing): like stock's
 /// trigger frame (OP_Program saves `nChange`/`lastRowid`, sqlite3VdbeFrameRestore
 /// puts them back), `changes()` and `last_insert_rowid()` move as the body's
@@ -15125,6 +15151,8 @@ impl Connection {
             trigger_step_changes: Cell::new(0),
             last_table_program_error_state: RefCell::new(None),
             internal_statement_savepoint_depth: Cell::new(0),
+            concurrent_rowid_statement: Cell::new(0),
+            last_concurrent_rowid_statement: Cell::new(0),
             implicit_txn: Cell::new(false),
             concurrent_txn: Cell::new(false),
             pending_transaction_cleanup: Cell::new(false),
@@ -15676,6 +15704,8 @@ impl Connection {
             trigger_step_changes: Cell::new(0),
             last_table_program_error_state: RefCell::new(None),
             internal_statement_savepoint_depth: Cell::new(0),
+            concurrent_rowid_statement: Cell::new(0),
+            last_concurrent_rowid_statement: Cell::new(0),
             implicit_txn: Cell::new(false),
             concurrent_txn: Cell::new(false),
             pending_transaction_cleanup: Cell::new(false),
@@ -24614,6 +24644,7 @@ impl Connection {
             commit_index: Arc::clone(&self.concurrent_commit_index),
             rowid_allocator: Arc::clone(&self._shared_mvcc_state.rowid_allocator),
             schema_epoch: SchemaEpoch::new((*self.schema_cookie.borrow()).into()),
+            rowid_statement: self.concurrent_rowid_statement.get(),
             #[allow(clippy::cast_sign_loss)]
             busy_timeout_ms: self.pragma_state.borrow().busy_timeout_ms.max(0) as u64,
         }))
@@ -37543,6 +37574,22 @@ impl Connection {
                 )
                 .await);
         }
+        // bd-8a8pr: the implicit rowids this statement's programs allocate from
+        // the shared allocator are reserved in its name, so a rollback below
+        // can give them back, as stock's `max(rowid) + 1` reuses them.
+        let rowid_statement = if concurrent_snapshot.is_some() {
+            let statement = self
+                .last_concurrent_rowid_statement
+                .get()
+                .wrapping_add(1)
+                .max(1);
+            self.last_concurrent_rowid_statement.set(statement);
+            statement
+        } else {
+            0
+        };
+        let _rowid_statement_guard =
+            U64CellRestoreGuard::new(&self.concurrent_rowid_statement, rowid_statement);
 
         match body().await {
             Ok(value) => {
@@ -37688,6 +37735,18 @@ impl Connection {
                             ));
                         }
                     }
+                }
+
+                // bd-8a8pr: the statement's rows are gone, so its implicit
+                // rowids go back to the shared allocator wherever no other
+                // writer allocated after them.
+                if pager_rollback_succeeded
+                    && rowid_statement != 0
+                    && let Some(session_id) = *self.concurrent_session_id.borrow()
+                {
+                    self._shared_mvcc_state
+                        .rowid_allocator
+                        .rewind_statement(session_id, rowid_statement);
                 }
 
                 if concurrent_rollback_succeeded && pager_rollback_succeeded {
@@ -136867,6 +136926,8 @@ struct ConcurrentExecContext {
     commit_index: Arc<CommitIndex>,
     rowid_allocator: Arc<ConcurrentRowIdAllocator>,
     schema_epoch: SchemaEpoch,
+    /// bd-8a8pr: the statement the program's implicit rowids belong to.
+    rowid_statement: u64,
     busy_timeout_ms: u64,
 }
 
@@ -137070,6 +137131,7 @@ async fn execute_table_program_with_db(
                 ctx.rowid_allocator,
                 ctx.schema_epoch,
                 ctx.session_id,
+                ctx.rowid_statement,
             );
         } else {
             engine.set_transaction(txn);
@@ -137342,6 +137404,7 @@ async fn execute_table_program_exactly_one_row_with_db(
                 ctx.rowid_allocator,
                 ctx.schema_epoch,
                 ctx.session_id,
+                ctx.rowid_statement,
             );
         } else {
             engine.set_transaction(txn);

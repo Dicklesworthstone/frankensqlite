@@ -6867,6 +6867,10 @@ pub struct VdbeEngine {
     /// the shared allocator can attribute them for a provably-safe savepoint
     /// rewind. 0 when no concurrent transaction is bound.
     concurrent_rowid_session_id: u64,
+    /// The connection's statement that owns this execution's implicit rowid
+    /// reservations, so a rolled-back statement can give them back (bd-8a8pr).
+    /// 0 outside a statement savepoint.
+    concurrent_rowid_statement: u64,
     /// INTEGER PRIMARY KEY alias column positions keyed by root page number.
     /// Used to decode storage-cursor payload columns for rowid tables.
     rowid_alias_col_by_root_page: Arc<HashMap<i32, usize>>,
@@ -7461,6 +7465,7 @@ impl VdbeEngine {
             concurrent_rowid_allocator: None,
             concurrent_rowid_schema_epoch: SchemaEpoch::ZERO,
             concurrent_rowid_session_id: 0,
+            concurrent_rowid_statement: 0,
             rowid_alias_col_by_root_page: Arc::new(HashMap::new()),
             table_column_count_by_root_page: Arc::new(HashMap::new()),
             first_not_null_non_ipk_col_by_root_page: Arc::new(HashMap::new()),
@@ -7738,6 +7743,7 @@ impl VdbeEngine {
             self.concurrent_rowid_allocator = None;
             self.concurrent_rowid_schema_epoch = SchemaEpoch::ZERO;
             self.concurrent_rowid_session_id = 0;
+            self.concurrent_rowid_statement = 0;
         }
         // table_index_meta: kept as-is — execute() overwrites it from the
         // program at the start of each run (line ~4903).
@@ -8906,16 +8912,19 @@ impl VdbeEngine {
         );
     }
 
-    /// Provide the shared concurrent rowid allocator for implicit inserts.
+    /// Provide the shared concurrent rowid allocator for implicit inserts, and
+    /// the session and statement (0 for none, bd-8a8pr) the rowids belong to.
     pub fn set_concurrent_rowid_allocator(
         &mut self,
         allocator: Arc<ConcurrentRowIdAllocator>,
         schema_epoch: SchemaEpoch,
         session_id: u64,
+        statement: u64,
     ) {
         self.concurrent_rowid_allocator = Some(allocator);
         self.concurrent_rowid_schema_epoch = schema_epoch;
         self.concurrent_rowid_session_id = session_id;
+        self.concurrent_rowid_statement = statement;
     }
 
     /// Allocate a rowid on a MemDatabase (TEMP) table. bd-nb49a: an ordinary
@@ -9045,13 +9054,14 @@ impl VdbeEngine {
     }
 
     // bd-gh-147 added `session_id` (8th arg) to attribute reservations to the
-    // concurrent session; the params are a flat threading list, not worth a
-    // dedicated struct.
+    // concurrent session, bd-8a8pr `statement` to the statement within it; the
+    // params are a flat threading list, not worth a dedicated struct.
     #[allow(clippy::too_many_arguments)]
     async fn allocate_concurrent_storage_rowid(
         allocator: &ConcurrentRowIdAllocator,
         schema_epoch: SchemaEpoch,
         session_id: u64,
+        statement: u64,
         root_page: i32,
         mode: RowIdMode,
         autoinc_max: i64,
@@ -9091,7 +9101,7 @@ impl VdbeEngine {
             autoinc_max,
             mode,
         );
-        let rowid = match allocator.allocate_one_for_session(key, session_id) {
+        let rowid = match allocator.allocate_one_for_statement(key, session_id, statement) {
             Ok(rowid) => rowid.get(),
             // bd-6i9c5: the shared floor reached the top of the rowid range.
             Err(RowIdAllocError::Exhausted) => {
@@ -11471,6 +11481,7 @@ impl VdbeEngine {
                     };
                     let concurrent_schema_epoch = self.concurrent_rowid_schema_epoch;
                     let concurrent_rowid_session_id = self.concurrent_rowid_session_id;
+                    let concurrent_rowid_statement = self.concurrent_rowid_statement;
                     // GH #186: capture the AUTOINCREMENT table's root page so the
                     // allocated rowid can be folded into the program-scoped
                     // high-water AFTER the `sc` borrow ends (sqlite_sequence must
@@ -11504,6 +11515,7 @@ impl VdbeEngine {
                                     allocator,
                                     concurrent_schema_epoch,
                                     concurrent_rowid_session_id,
+                                    concurrent_rowid_statement,
                                     root_page,
                                     rowid_mode,
                                     autoinc_max,
@@ -15372,6 +15384,7 @@ impl VdbeEngine {
                 let concurrent_allocator = self.concurrent_rowid_allocator.clone();
                 let concurrent_schema_epoch = self.concurrent_rowid_schema_epoch;
                 let concurrent_rowid_session_id = self.concurrent_rowid_session_id;
+                let concurrent_rowid_statement = self.concurrent_rowid_statement;
                 let previous_last_insert_rowid = self.last_insert_rowid;
                 let previous_last_insert_rowid_valid = self.last_insert_rowid_valid;
 
@@ -15386,6 +15399,7 @@ impl VdbeEngine {
                                 allocator,
                                 concurrent_schema_epoch,
                                 concurrent_rowid_session_id,
+                                concurrent_rowid_statement,
                                 root_page,
                                 rowid_mode,
                                 autoinc_max,
@@ -15959,6 +15973,7 @@ impl VdbeEngine {
         let concurrent_allocator = self.concurrent_rowid_allocator.clone();
         let concurrent_schema_epoch = self.concurrent_rowid_schema_epoch;
         let concurrent_rowid_session_id = self.concurrent_rowid_session_id;
+        let concurrent_rowid_statement = self.concurrent_rowid_statement;
         let previous_last_insert_rowid = self.last_insert_rowid;
         let previous_last_insert_rowid_valid = self.last_insert_rowid_valid;
 
@@ -15979,6 +15994,7 @@ impl VdbeEngine {
                     allocator,
                     concurrent_schema_epoch,
                     concurrent_rowid_session_id,
+                    concurrent_rowid_statement,
                     template.root_page,
                     rowid_mode,
                     autoinc_max,

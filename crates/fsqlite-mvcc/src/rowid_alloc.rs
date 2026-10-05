@@ -256,7 +256,46 @@ pub struct ConcurrentRowIdAllocator {
     /// only when this session reserved the entire contiguous tail since the
     /// savepoint (so no other writer's committed id is ever reissued). A
     /// concurrent writer that intervened leaves the gap intact (§5.10.1.1).
-    session_reservations: Mutex<HashMap<(u64, AllocatorKey), i64>>,
+    session_reservations: Mutex<HashMap<(u64, AllocatorKey), SessionReservations>>,
+}
+
+/// One session's reservations on one table (bd-gh-147, bd-8a8pr).
+#[derive(Debug, Clone, Copy)]
+struct SessionReservations {
+    /// Rowids reserved and not yet rolled back.
+    count: i64,
+    /// bd-8a8pr: `(statement, next_rowid, autoincrement_high_water, count)`
+    /// just before that statement's first reservation on the table, taken
+    /// lazily by [`ConcurrentRowIdAllocator::allocate_one_for_statement`]:
+    /// where a rolled-back statement rewinds to. A later statement's first
+    /// reservation replaces it, so only the latest statement can rewind.
+    statement: Option<(u64, i64, i64, i64)>,
+}
+
+/// Rewind `state` to `(mark_next, mark_high_water)` when its tip sits exactly
+/// `count_since` rowids past `mark_next`: that proves every rowid reserved
+/// since the mark is one of the `count_since` this session is giving back, so
+/// no other writer's rowid is reissued. Otherwise the gap stays.
+fn rewind_reserved_tail(
+    state: &mut TableAllocatorState,
+    mark_next: i64,
+    mark_high_water: i64,
+    count_since: i64,
+) {
+    // Use the reservation path's exact-through-MAX encoding, but only after
+    // proving the count fits the remaining positive domain. Plain signed
+    // addition panics at the final rowid; unchecked wrapping alone could turn
+    // an invalid count into ownership proof.
+    if count_since > 0
+        && mark_next > 0
+        && count_since <= i64::MAX - mark_next + 1
+        && state.next_rowid == mark_next.wrapping_add(count_since)
+    {
+        state.next_rowid = mark_next;
+        if state.mode == RowIdMode::AutoIncrement {
+            state.autoincrement_high_water = mark_high_water;
+        }
+    }
 }
 
 /// A savepoint-time mark of the allocator state relevant to one session.
@@ -282,18 +321,34 @@ impl ConcurrentRowIdAllocator {
         }
     }
 
-    /// Record that `session_id` reserved `count` rowids for `key` (bd-gh-147).
+    /// Record that `session_id` reserved `count` rowids for `key` (bd-gh-147),
+    /// the table's tip and high-water having been `prior` just before.
     /// Called by the reservation path so a later savepoint rewind can prove the
-    /// contiguous tail belongs entirely to this session.
-    fn note_session_reservation(&self, session_id: u64, key: AllocatorKey, count: i64) {
+    /// contiguous tail belongs entirely to this session. With a `statement`
+    /// (non-zero), the first reservation that statement makes on `key` also
+    /// marks where its rollback rewinds to (bd-8a8pr).
+    fn note_session_reservation(
+        &self,
+        session_id: u64,
+        key: AllocatorKey,
+        count: i64,
+        prior: (i64, i64),
+        statement: u64,
+    ) {
         if count <= 0 {
             return;
         }
-        *self
-            .session_reservations
-            .lock()
+        let mut session_reservations = self.session_reservations.lock();
+        let entry = session_reservations
             .entry((session_id, key))
-            .or_insert(0) += count;
+            .or_insert(SessionReservations {
+                count: 0,
+                statement: None,
+            });
+        if statement != 0 && entry.statement.is_none_or(|(marked, ..)| marked != statement) {
+            entry.statement = Some((statement, prior.0, prior.1, entry.count));
+        }
+        entry.count += count;
     }
 
     /// Snapshot the allocator state for `session_id` at a `SAVEPOINT` boundary.
@@ -306,8 +361,7 @@ impl ConcurrentRowIdAllocator {
             .map(|(key, state)| {
                 let count = session_reservations
                     .get(&(session_id, *key))
-                    .copied()
-                    .unwrap_or(0);
+                    .map_or(0, |reservations| reservations.count);
                 (
                     *key,
                     state.next_rowid,
@@ -356,32 +410,59 @@ impl ConcurrentRowIdAllocator {
         {
             let current_count = session_reservations
                 .get(&(mark.session_id, key))
-                .copied()
-                .unwrap_or(0);
-            let my_count_since = current_count - sp_count;
-            // Use the reservation path's exact-through-MAX encoding, but only
-            // after proving the count fits the remaining positive domain.
-            // Plain signed addition panics at the final rowid; unchecked
-            // wrapping alone could turn an invalid count into ownership proof.
-            if my_count_since > 0
-                && sp_next > 0
-                && my_count_since <= i64::MAX - sp_next + 1
-                && let Some(state) = tables.get_mut(&key)
-                && state.next_rowid == sp_next.wrapping_add(my_count_since)
-            {
-                state.next_rowid = sp_next;
-                if state.mode == RowIdMode::AutoIncrement {
-                    state.autoincrement_high_water = sp_high_water;
-                }
+                .map_or(0, |reservations| reservations.count);
+            if let Some(state) = tables.get_mut(&key) {
+                rewind_reserved_tail(state, sp_next, sp_high_water, current_count - sp_count);
             }
             // Every reservation since the mark was rolled back — restore the
             // session's tracked count regardless of whether the tip rewound.
             if sp_count == 0 {
                 session_reservations.remove(&(mark.session_id, key));
-            } else {
-                session_reservations.insert((mark.session_id, key), sp_count);
+            } else if let Some(reservations) =
+                session_reservations.get_mut(&(mark.session_id, key))
+            {
+                reservations.count = sp_count;
+                reservations.statement = None;
             }
         }
+    }
+
+    /// bd-8a8pr: give back the rowids the rolled-back statement `statement`
+    /// reserved, for every table where nothing else reserved one since its
+    /// first reservation there (the same proof as [`Self::rewind_to_mark`]).
+    /// Stock recomputes `max(rowid) + 1`, so a statement that failed part-way
+    /// leaves no gap; neither does this, unless another writer allocated in
+    /// between. A table the statement shared with a nested statement keeps the
+    /// nested statement's mark instead, and keeps its gap.
+    pub fn rewind_statement(&self, session_id: u64, statement: u64) {
+        if statement == 0 {
+            return;
+        }
+        let mut session_reservations = self.session_reservations.lock();
+        let mut tables = self.tables.lock();
+        session_reservations.retain(|&(session, key), reservations| {
+            if session != session_id {
+                return true;
+            }
+            let Some((marked, mark_next, mark_high_water, mark_count)) = reservations.statement
+            else {
+                return true;
+            };
+            if marked != statement {
+                return true;
+            }
+            if let Some(state) = tables.get_mut(&key) {
+                rewind_reserved_tail(
+                    state,
+                    mark_next,
+                    mark_high_water,
+                    reservations.count - mark_count,
+                );
+            }
+            reservations.count = mark_count;
+            reservations.statement = None;
+            mark_count > 0
+        });
     }
 
     /// Drop all reservation tracking for `session_id` (bd-gh-147). Called when
@@ -480,11 +561,25 @@ impl ConcurrentRowIdAllocator {
         key: AllocatorKey,
         count: u32,
     ) -> Result<RangeReservation, RowIdAllocError> {
+        self.reserve_range_reporting_prior(key, count)
+            .map(|(reservation, _)| reservation)
+    }
+
+    /// [`Self::reserve_range`], also returning the AUTOINCREMENT high-water
+    /// the table had just before (its tip before is the range's start).
+    fn reserve_range_reporting_prior(
+        &self,
+        key: AllocatorKey,
+        count: u32,
+    ) -> Result<(RangeReservation, i64), RowIdAllocError> {
         if count == 0 {
-            return Ok(RangeReservation {
-                start_rowid: RowId::new(1),
-                count: 0,
-            });
+            return Ok((
+                RangeReservation {
+                    start_rowid: RowId::new(1),
+                    count: 0,
+                },
+                0,
+            ));
         }
 
         let mut tables = self.tables.lock();
@@ -493,6 +588,7 @@ impl ConcurrentRowIdAllocator {
             .ok_or(RowIdAllocError::NotInitialized(key))?;
 
         let start = state.next_rowid;
+        let prior_high_water = state.autoincrement_high_water;
 
         // In concurrent mode, rowids are always in [1, MAX].  If the allocator
         // wrapped past MAX (via `wrapping_add`), `start` becomes negative and
@@ -544,10 +640,13 @@ impl ConcurrentRowIdAllocator {
             "range reservation"
         );
 
-        Ok(RangeReservation {
-            start_rowid: RowId::new(start),
-            count,
-        })
+        Ok((
+            RangeReservation {
+                start_rowid: RowId::new(start),
+                count,
+            },
+            prior_high_water,
+        ))
     }
 
     /// Allocate a single RowId (convenience wrapper over `reserve_range`).
@@ -563,8 +662,27 @@ impl ConcurrentRowIdAllocator {
         key: AllocatorKey,
         session_id: u64,
     ) -> Result<RowId, RowIdAllocError> {
-        let reservation = self.reserve_range(key, 1)?;
-        self.note_session_reservation(session_id, key, i64::from(reservation.count));
+        self.allocate_one_for_statement(key, session_id, 0)
+    }
+
+    /// Like [`allocate_one_for_session`](Self::allocate_one_for_session), made
+    /// by `statement` (non-zero): its first reservation on `key` marks where
+    /// [`Self::rewind_statement`] gives the statement's rowids back to
+    /// (bd-8a8pr). The mark rides on the locks the reservation takes anyway.
+    pub fn allocate_one_for_statement(
+        &self,
+        key: AllocatorKey,
+        session_id: u64,
+        statement: u64,
+    ) -> Result<RowId, RowIdAllocError> {
+        let (reservation, prior_high_water) = self.reserve_range_reporting_prior(key, 1)?;
+        self.note_session_reservation(
+            session_id,
+            key,
+            i64::from(reservation.count),
+            (reservation.start_rowid.get(), prior_high_water),
+            statement,
+        );
         Ok(reservation.start_rowid)
     }
 
@@ -575,8 +693,14 @@ impl ConcurrentRowIdAllocator {
         count: u32,
         session_id: u64,
     ) -> Result<RangeReservation, RowIdAllocError> {
-        let reservation = self.reserve_range(key, count)?;
-        self.note_session_reservation(session_id, key, i64::from(reservation.count));
+        let (reservation, prior_high_water) = self.reserve_range_reporting_prior(key, count)?;
+        self.note_session_reservation(
+            session_id,
+            key,
+            i64::from(reservation.count),
+            (reservation.start_rowid.get(), prior_high_water),
+            0,
+        );
         Ok(reservation)
     }
 
@@ -968,6 +1092,71 @@ mod tests {
                 4,
                 "CAS must not reissue peer id 3; the gap at 2 stays"
             );
+        }
+    }
+
+    // ── bd-8a8pr: lazy statement marks and clean-abort session rewind ──
+
+    /// A rolled-back statement gives back exactly the rowids it reserved: on
+    /// every table it allocated from, from its first reservation there, and
+    /// never a rowid reserved before it, by another statement, or by a peer.
+    #[test]
+    fn statement_rewind_gives_back_only_the_statement_own_tail() {
+        let (session_a, session_b) = (10u64, 20u64);
+
+        // Alone: the statement's two rowids come back on both tables; rowids
+        // reserved by an earlier statement of the transaction stay.
+        {
+            let alloc = ConcurrentRowIdAllocator::new(epoch(1));
+            let (t, u) = (key(1, 1), key(1, 2));
+            alloc.init_table(t, None, 0, RowIdMode::Normal);
+            alloc.init_table(u, Some(RowId::new(40)), 0, RowIdMode::AutoIncrement);
+            assert_eq!(alloc.allocate_one_for_statement(t, session_a, 1).unwrap().get(), 1);
+            for expected in [2, 3] {
+                assert_eq!(
+                    alloc.allocate_one_for_statement(t, session_a, 2).unwrap().get(),
+                    expected
+                );
+            }
+            assert_eq!(alloc.allocate_one_for_statement(u, session_a, 2).unwrap().get(), 41);
+            alloc.rewind_statement(session_a, 2);
+            assert_eq!(alloc.allocate_one_for_statement(t, session_a, 3).unwrap().get(), 2);
+            assert_eq!(alloc.autoincrement_high_water(&u), Some(40));
+            assert_eq!(alloc.allocate_one_for_statement(u, session_a, 3).unwrap().get(), 41);
+            // A statement that never allocated rewinds nothing.
+            alloc.rewind_statement(session_a, 4);
+            assert_eq!(alloc.allocate_one_for_statement(t, session_a, 5).unwrap().get(), 3);
+        }
+
+        // A peer reserved after the statement's first rowid: the gap stays.
+        {
+            let alloc = ConcurrentRowIdAllocator::new(epoch(1));
+            let t = key(1, 1);
+            alloc.init_table(t, None, 0, RowIdMode::Normal);
+            assert_eq!(alloc.allocate_one_for_statement(t, session_a, 7).unwrap().get(), 1);
+            assert_eq!(alloc.allocate_one_for_statement(t, session_b, 1).unwrap().get(), 2);
+            alloc.rewind_statement(session_a, 7);
+            assert_eq!(
+                alloc.allocate_one_for_statement(t, session_a, 8).unwrap().get(),
+                3,
+                "peer rowid 2 must never be reissued"
+            );
+        }
+
+        // A nested statement replaces the outer statement's mark: its own
+        // rollback gives back only its rowids. The outer statement then marks
+        // afresh, so its rollback gives back what it reserved after that and
+        // leaves its earlier rowid 1 as a gap rather than guessing.
+        {
+            let alloc = ConcurrentRowIdAllocator::new(epoch(1));
+            let t = key(1, 1);
+            alloc.init_table(t, None, 0, RowIdMode::Normal);
+            assert_eq!(alloc.allocate_one_for_statement(t, session_a, 1).unwrap().get(), 1);
+            assert_eq!(alloc.allocate_one_for_statement(t, session_a, 2).unwrap().get(), 2);
+            alloc.rewind_statement(session_a, 2);
+            assert_eq!(alloc.allocate_one_for_statement(t, session_a, 1).unwrap().get(), 2);
+            alloc.rewind_statement(session_a, 1);
+            assert_eq!(alloc.allocate_one_for_statement(t, session_a, 3).unwrap().get(), 2);
         }
     }
 

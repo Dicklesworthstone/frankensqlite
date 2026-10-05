@@ -2967,6 +2967,16 @@ still serves as an authoritative reference.
   same page can still conflict at the page level. The safe write-merge ladder is
   dormant in the live commit path, so current conflicts abort/retry. This is a
   deliberate tradeoff for file format compatibility.
+- **Rolled-back work can leave gaps in implicit rowids.** Writers draw
+  implicit rowids from one allocator that every connection to the database
+  shares, so a rowid, once handed out, is not given back while another writer
+  may hold a later one. A statement that fails inside a transaction gives its
+  rowids back when no other writer allocated after them, matching stock
+  SQLite's `max(rowid) + 1`; a failed autocommit statement on a file-backed
+  database, a `ROLLBACK`, and a statement behind which another writer
+  allocated leave a gap instead (stock SQLite would reuse those values).
+  Rowids stay unique either way, which is all SQLite promises; code that
+  expects consecutive rowids after a failure should not.
 - **Page encryption is not wired, and `PRAGMA key`/`PRAGMA rekey` are
   silently ignored.** Both statements parse and return success with no rows and
   no error, but no key is installed and the database is written unencrypted.
