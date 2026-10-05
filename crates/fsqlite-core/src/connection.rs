@@ -202,10 +202,12 @@ use fsqlite_types::record::{
     enter_record_profile_scope, parse_record, parse_record_header_into,
     parse_record_into_with_encoding, parse_record_projected_column_offsets,
     parse_record_with_encoding, record_profile_enabled, record_profile_snapshot,
-    reset_record_profile, serialize_record, serialize_record_iter_into_with_encoding,
+    reset_record_profile, serialize_record_iter_into_with_encoding,
     serialize_record_iter_with_precomputed_header_into, serialize_record_with_encoding,
     try_build_runtime_precomputed_record_header,
 };
+#[cfg(any(test, feature = "ext-fts5"))]
+use fsqlite_types::record::serialize_record;
 use fsqlite_types::serial_type::{
     serial_type_for_blob, serial_type_for_integer, serial_type_for_text, serial_type_len,
     varint_len, write_varint,
@@ -11456,6 +11458,7 @@ struct PendingLocalLiveVtabPreservation {
 /// Because the proof is over persisted bytes, it holds against *any* writer:
 /// this connection, a peer `Connection` in this process, or a foreign process
 /// writing the same file. A mismatch simply falls back to the full rebuild.
+#[cfg(feature = "ext-fts5")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Fts5PersistedContentStamp {
     create_sql: String,
@@ -13452,6 +13455,7 @@ pub struct Connection {
     /// (re)built from, keyed by UPPERCASE table name. A later reload preserves
     /// the instance instead of re-deriving the index when the table's current
     /// stamp is byte-identical. See [`Fts5PersistedContentStamp`].
+    #[cfg(feature = "ext-fts5")]
     fts5_instance_content_stamp: RefCell<HashMap<String, Fts5PersistedContentStamp>>,
     /// GH#408 test hook: per-connection count of full live-vtab content rebuilds
     /// during schema reloads; the rebuild-counter keeper asserts it stays flat
@@ -13546,6 +13550,7 @@ pub struct Connection {
     /// what made `open` unbounded for large corpora. Non-lazy read/scan
     /// surfaces promote or fall back on demand. This flag says nothing about
     /// the open *mode* — see `schema_only_open` for that.
+    #[cfg(feature = "ext-fts5")]
     allow_lazy_contentless_fts5: bool,
     /// True only for connections created through the schema-only open family
     /// (`open_schema_only*` / `open_existing_schema_only*`, including the
@@ -15103,6 +15108,7 @@ impl Connection {
             last_local_commit_seq: RefCell::new(None),
             data_version_own_commits: Cell::new(0),
             pending_local_live_vtab_preservation: RefCell::new(None),
+            #[cfg(feature = "ext-fts5")]
             fts5_instance_content_stamp: RefCell::new(HashMap::new()),
             fts5_reload_rebuild_count: Cell::new(0),
             closed: RefCell::new(false),
@@ -15139,6 +15145,7 @@ impl Connection {
             // Schema-only connections always use parity-cert mode (pager-backed
             // cursors); the MemDatabase is deliberately left empty.
             reject_mem_fallback: RefCell::new(true),
+            #[cfg(feature = "ext-fts5")]
             allow_lazy_contentless_fts5: true,
             schema_only_open: true,
             defer_fts5_hydration,
@@ -15653,6 +15660,7 @@ impl Connection {
             last_local_commit_seq: RefCell::new(None),
             data_version_own_commits: Cell::new(0),
             pending_local_live_vtab_preservation: RefCell::new(None),
+            #[cfg(feature = "ext-fts5")]
             fts5_instance_content_stamp: RefCell::new(HashMap::new()),
             fts5_reload_rebuild_count: Cell::new(0),
             closed: RefCell::new(false),
@@ -15701,6 +15709,7 @@ impl Connection {
             // reading persisted segments, instead of hydrating the whole corpus
             // into an in-memory index on every connection (the cass runaway).
             // Non-lazy read/scan surfaces promote or fall back on demand.
+            #[cfg(feature = "ext-fts5")]
             allow_lazy_contentless_fts5: true,
             schema_only_open: false,
             defer_fts5_hydration: false,
@@ -21835,6 +21844,7 @@ impl Connection {
         src: &JoinTableSource,
         plan: &LiveVtabScanPlan,
     ) -> Result<Vec<Vec<SqliteValue>>> {
+        #[cfg(feature = "ext-fts5")]
         let key = src.table_name.to_ascii_uppercase();
         let num_cols = src.col_names.len();
 
