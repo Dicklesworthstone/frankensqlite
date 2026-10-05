@@ -119047,6 +119047,7 @@ fn select_core_has_external_column_ref(core: &SelectCore, ancestor_tables: &[Str
             columns,
             from,
             where_clause,
+            group_by,
             having,
             windows,
             ..
@@ -119056,9 +119057,15 @@ fn select_core_has_external_column_ref(core: &SelectCore, ancestor_tables: &[Str
             } else {
                 HashSet::new()
             };
+            // bd-r9dhv: GROUP BY resolves output aliases before any outer
+            // scope, and may then reach an outer column (SQLite 3.53).
+            let group_by_locals = collect_select_core_result_aliases(core);
             columns
                 .iter()
                 .any(|column| result_column_has_external_column_ref(column, &inner_tables))
+                || group_by.iter().any(|expr| {
+                    expr_has_external_column_ref_with_locals(expr, &inner_tables, &group_by_locals)
+                })
                 || from
                     .as_ref()
                     .is_some_and(|from| from_clause_has_external_column_ref(from, &inner_tables))
@@ -120979,6 +120986,7 @@ fn substitute_outer_refs_in_select_core(
             columns,
             from,
             where_clause,
+            group_by,
             having,
             windows,
             ..
@@ -120994,6 +121002,18 @@ fn substitute_outer_refs_in_select_core(
                         opaque_cte_names,
                     );
                 }
+            }
+            // bd-r9dhv: a GROUP BY term may reach an outer column (SQLite
+            // 3.53); output aliases stay local, as for HAVING.
+            for expr in group_by {
+                *expr = substitute_outer_refs_in_expr(
+                    expr,
+                    lookup,
+                    &protected_tables,
+                    protected_unqualified_columns.as_ref(),
+                    &local_output_names,
+                    opaque_cte_names,
+                );
             }
             if let Some(where_clause) = where_clause {
                 **where_clause = substitute_outer_refs_in_expr(
@@ -141952,7 +141972,11 @@ impl<'connection, 'select> SelectColumnReferenceResolver<'connection, 'select> {
                 let scope = self.prepare_core_scope(&select.body.select)?;
                 self.validate_limit(select)?;
                 self.validate_core_before_order(&select.body.select, &scope)?;
-                let saved_outer_scopes = std::mem::take(&mut self.outer_scopes);
+                // bd-r9dhv: SQLite 3.53 (the bundled oracle) resolves an ORDER BY
+                // name against the enclosing queries after this SELECT's own
+                // aliases and sources, so a subquery may order by an outer
+                // column (3.51 and earlier report it missing). The outer scopes
+                // stay visible here; LIMIT/OFFSET still see none.
                 self.named_window_scopes
                     .push(select_core_named_windows(&select.body.select));
                 let order_result: Result<()> = (|| {
@@ -141985,7 +142009,6 @@ impl<'connection, 'select> SelectColumnReferenceResolver<'connection, 'select> {
                     Ok(())
                 })();
                 self.named_window_scopes.pop();
-                self.outer_scopes = saved_outer_scopes;
                 order_result?;
                 self.validate_core_after_order(&select.body.select, &scope)?;
                 return Ok(());
@@ -142153,13 +142176,13 @@ impl<'connection, 'select> SelectColumnReferenceResolver<'connection, 'select> {
             group_by, windows, ..
         } = core
         {
-            let saved_outer_scopes = std::mem::take(&mut self.outer_scopes);
+            // bd-r9dhv: like ORDER BY, SQLite 3.53 resolves a GROUP BY name
+            // against the enclosing queries too.
             self.named_window_scopes.push(windows);
             let result = group_by.iter().try_for_each(|expression| {
                 self.validate_expr(expression, scope, SelectOutputAliasUse::GroupBy)
             });
             self.named_window_scopes.pop();
-            self.outer_scopes = saved_outer_scopes;
             result?;
         }
         Ok(())
@@ -143356,6 +143379,9 @@ struct SelectStructureResolver<'a> {
     semantic_depth: usize,
     view_definition_mode: bool,
     column_reference_preflight_completed: bool,
+    /// bd-r9dhv: the SELECTs being validated, outermost first, for ORDER BY
+    /// names that resolve in an enclosing query. A CTE body sees none.
+    enclosing_selects: Vec<&'a SelectStatement>,
 }
 
 impl<'a> SelectStructureResolver<'a> {
@@ -143367,7 +143393,31 @@ impl<'a> SelectStructureResolver<'a> {
             semantic_depth: 0,
             view_definition_mode: false,
             column_reference_preflight_completed: false,
+            enclosing_selects: Vec::new(),
         }
+    }
+
+    /// bd-r9dhv: whether an ORDER BY column the SELECT's own sources and
+    /// aliases do not supply names a source column of an enclosing SELECT.
+    /// SQLite 3.53 resolves an ORDER BY name outward after those.
+    fn order_column_resolves_in_enclosing_select(&self, expr: &Expr) -> bool {
+        let Some((_, enclosing)) = self.enclosing_selects.split_last() else {
+            return false;
+        };
+        if enclosing.is_empty() {
+            return false;
+        }
+        let outer_ctes = self.visible_ctes();
+        enclosing.iter().rev().any(|select| {
+            let col_map = self
+                .connection
+                .build_join_col_map_with_outer_ctes(select, &outer_ctes);
+            let using_skip = self
+                .connection
+                .build_join_using_skip_indices_with_outer_ctes(select, &outer_ctes);
+            let using_skip = Some(&using_skip).filter(|indices| !indices.is_empty());
+            validate_join_column_references(expr, &col_map, using_skip, &[], &[]).is_ok()
+        })
     }
 
     fn validate_select(&mut self, select: &'a SelectStatement) -> Result<()> {
@@ -143400,6 +143450,8 @@ impl<'a> SelectStructureResolver<'a> {
         let semantic_depth = self.semantic_depth;
         self.semantic_depth = self.semantic_depth.saturating_add(1);
         let scope_depth = self.scopes.len();
+        let enclosing_depth = self.enclosing_selects.len();
+        self.enclosing_selects.push(select);
         let outer_ctes = (!select.body.compounds.is_empty() || !select.order_by.is_empty())
             .then(|| self.visible_ctes());
         if let Some(with) = &select.with {
@@ -143497,6 +143549,7 @@ impl<'a> SelectStructureResolver<'a> {
             Ok(())
         })();
         self.scopes.truncate(scope_depth);
+        self.enclosing_selects.truncate(enclosing_depth);
         self.semantic_depth = semantic_depth;
         result
     }
@@ -143797,6 +143850,12 @@ impl<'a> SelectStructureResolver<'a> {
                         if detail.starts_with("column not found: ")
                             && column.table.is_none()
                             && output_aliases.contains(&column.column.to_ascii_lowercase()) =>
+                    {
+                        Ok(())
+                    }
+                    Err(FrankenError::Internal(detail))
+                        if detail.starts_with("column not found: ")
+                            && self.order_column_resolves_in_enclosing_select(expr) =>
                     {
                         Ok(())
                     }
@@ -144438,7 +144497,11 @@ impl<'a> SelectStructureResolver<'a> {
             return Ok(());
         }
         self.visits.insert(key, CteCollationVisit::Active);
-        self.validate_select(&cte.query)?;
+        // bd-r9dhv: a CTE body is not correlated to the query that names it.
+        let enclosing_selects = std::mem::take(&mut self.enclosing_selects);
+        let body = self.validate_select(&cte.query);
+        self.enclosing_selects = enclosing_selects;
+        body?;
         if !self.view_definition_mode && !cte.columns.is_empty() {
             let value_count = self.connection.select_result_column_count(
                 &cte.query,
@@ -198325,13 +198388,11 @@ mod tests {
                 );
             }
 
-            // bd-2fong red 4: stock SQLite 3.46.1 REJECTS a correlated outer
-            // reference inside an IN-set subquery's statement-level ORDER BY
-            // ('Error: in prepare, no such column: outer_semantics.x' —
-            // oracle-verified 2026-08-12), while projection/CASE/HAVING
-            // correlation is accepted. The previous shape here encoded
-            // anti-parity acceptance of the ORDER BY form; it now asserts
-            // stock's rejection explicitly below instead.
+            // bd-2fong red 4 / bd-r9dhv: SQLite 3.46.1 and 3.51 reject a
+            // correlated outer reference inside an IN-set subquery's
+            // statement-level ORDER BY ('no such column: outer_semantics.x');
+            // SQLite 3.53, the bundled oracle fsqlite follows, resolves it, as
+            // it does the projection/CASE/HAVING correlation below.
             let correlated_sql = "SELECT x, \
                        x IN (SELECT outer_semantics.x FROM rhs_semantics LIMIT 1), \
                        x IN (SELECT x FROM rhs_semantics LIMIT 1), \
@@ -198356,25 +198417,27 @@ mod tests {
                     SqliteValue::Integer(1),
                 ],
             ];
-            let order_by_correlated_err = conn
-                .query(
-                    "SELECT x IN (SELECT y FROM rhs_semantics \
-                     ORDER BY abs(y - outer_semantics.x) LIMIT 1) \
-                     FROM outer_semantics ORDER BY x;",
-                )
+            let order_by_correlated_sql = "SELECT x IN (SELECT y FROM rhs_semantics \
+                 ORDER BY abs(y - outer_semantics.x) LIMIT 1) \
+                 FROM outer_semantics ORDER BY x;";
+            let order_by_correlated = conn.query(order_by_correlated_sql).await.unwrap();
+            assert_eq!(
+                order_by_correlated.iter().map(row_values).collect::<Vec<_>>(),
+                vec![vec![SqliteValue::Integer(1)], vec![SqliteValue::Integer(1)]]
+            );
+            let order_by_correlated_prepared = conn
+                .prepare(order_by_correlated_sql)
                 .await
-                .expect_err(
-                    "stock SQLite rejects a correlated outer reference in an \
-                     IN-set subquery's ORDER BY at prepare; parity requires \
-                     the same rejection",
-                );
-            assert!(
-                matches!(
-                    &order_by_correlated_err,
-                    FrankenError::NoSuchColumn { name } if name == "outer_semantics.x"
-                ),
-                "expected stock-parity NoSuchColumn(outer_semantics.x), got \
-                 {order_by_correlated_err:?}"
+                .unwrap()
+                .query()
+                .await
+                .unwrap();
+            assert_eq!(
+                order_by_correlated_prepared
+                    .iter()
+                    .map(row_values)
+                    .collect::<Vec<_>>(),
+                vec![vec![SqliteValue::Integer(1)], vec![SqliteValue::Integer(1)]]
             );
             let direct = conn.query(correlated_sql).await.unwrap();
             assert_eq!(direct.iter().map(row_values).collect::<Vec<_>>(), expected);
@@ -211566,23 +211629,30 @@ mod tests {
                 .unwrap();
             assert_eq!(shadowed[0].values(), &[SqliteValue::Integer(0)]);
 
+            // bd-r9dhv: SQLite 3.53 (the bundled oracle) resolves ORDER BY and
+            // GROUP BY names outward; LIMIT still sees no outer names.
             for sql in [
                 "SELECT (SELECT inner_only FROM inner_without \
                  ORDER BY outer_t.outer_only LIMIT 1) FROM outer_t;",
-                "SELECT (SELECT inner_only FROM inner_without \
-                 LIMIT outer_t.outer_only) FROM outer_t;",
                 "SELECT (SELECT count(*) FROM inner_without \
                  GROUP BY outer_t.outer_only) FROM outer_t;",
             ] {
-                let error = conn
+                let rows = conn
                     .query(sql)
                     .await
-                    .expect_err("outer references are not visible in ORDER BY/LIMIT/GROUP BY");
-                assert!(
-                    error.to_string().contains("outer_only"),
-                    "unexpected error for `{sql}`: {error}"
-                );
+                    .unwrap_or_else(|error| panic!("`{sql}`: {error}"));
+                assert_eq!(rows[0].values(), &[SqliteValue::Integer(1)], "`{sql}`");
             }
+            let sql = "SELECT (SELECT inner_only FROM inner_without \
+                 LIMIT outer_t.outer_only) FROM outer_t;";
+            let error = conn
+                .query(sql)
+                .await
+                .expect_err("outer references are not visible in LIMIT");
+            assert!(
+                error.to_string().contains("outer_only"),
+                "unexpected error for `{sql}`: {error}"
+            );
 
             conn.execute("CREATE TABLE outer_alias (q INTEGER);")
                 .await
