@@ -23190,8 +23190,9 @@ fn emit_upsert_probe(
     {
         // Omitted conflict target (SQLite 3.35+): DO UPDATE fires on whichever
         // uniqueness constraint the new row violates first. Probe the rowid/IPK
-        // PRIMARY KEY, then every UNIQUE index in schema order; the first hit
-        // supplies the existing row and leaves the table cursor positioned on it.
+        // PRIMARY KEY, then every UNIQUE index in stock's check order; the first
+        // hit supplies the existing row and leaves the table cursor positioned
+        // on it.
         let conflict_label = b.emit_label();
         let found_rowid_reg = b.alloc_reg();
         let pk_miss = b.emit_label();
@@ -23200,7 +23201,7 @@ fn emit_upsert_probe(
         b.emit_jump_to_label(Opcode::Goto, 0, 0, conflict_label, P4::None, 0);
         b.resolve_label(pk_miss);
         #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-        for (idx_offset, index) in table.indexes.iter().enumerate() {
+        for (idx_offset, index) in indexes_in_conflict_check_order(table) {
             if !index.is_unique || !index.supports_direct_column_lookup() {
                 continue;
             }
@@ -27434,7 +27435,9 @@ fn emit_without_rowid_index_inserts(
     stmt_conflict: Option<ConflictAction>,
     unique_conflicts_preflighted: bool,
 ) {
-    for (idx_offset, index) in table.indexes.iter().enumerate() {
+    // Stock's check order, as for rowid tables (`emit_index_inserts_filtered`),
+    // for callers that leave the UNIQUE decisions to these inserts.
+    for (idx_offset, index) in indexes_in_conflict_check_order(table) {
         // When the caller has already resolved every UNIQUE victim in clustered
         // terms, hand the engine ABORT: its OE_REPLACE branch resolves victims
         // by rowid and cannot address a WITHOUT ROWID clustered row.
@@ -27615,16 +27618,15 @@ fn emit_without_rowid_update_rewrite(
     //
     // Ordering follows `emit_without_rowid_row_insert` (and SQLite's
     // `sqlite3GenerateConstraintChecks`): the primary key is resolved first,
-    // then each index in `table.indexes` schema order. Nothing in phase A
-    // deletes: a REPLACE decision only *captures* the victim's primary key, so
-    // a later IGNORE or ABORT on a different index still leaves the database
-    // exactly as it was. Phase B then applies the captured deletions.
+    // then each index in stock's check order (`indexes_in_conflict_check_order`),
+    // which decides which ABORT is reported and whether an IGNORE wins. Nothing
+    // in phase A deletes: a REPLACE decision only *captures* the victim's
+    // primary key, so a later IGNORE or ABORT on a different index still leaves
+    // the database exactly as it was. Phase B then applies the captured
+    // deletions.
     let pk_victim_flag = b.alloc_reg();
     b.emit_op(Opcode::Integer, 0, pk_victim_flag, 0, P4::None, 0);
-    let unique_index_slots: Vec<(usize, i32, i32)> = table
-        .indexes
-        .iter()
-        .enumerate()
+    let unique_index_slots: Vec<(usize, i32, i32)> = indexes_in_conflict_check_order(table)
         .filter(|(_, index)| index.is_unique && index.key_term_count() > 0)
         .map(|(idx_offset, _)| {
             let flag = b.alloc_reg();
@@ -28191,10 +28193,9 @@ fn emit_without_rowid_row_insert(
     }
     b.resolve_label(pk_clear);
 
-    let unique_index_slots: Vec<(usize, i32, i32)> = table
-        .indexes
-        .iter()
-        .enumerate()
+    // Secondary UNIQUE decisions in stock's check order (see
+    // `indexes_in_conflict_check_order`).
+    let unique_index_slots: Vec<(usize, i32, i32)> = indexes_in_conflict_check_order(table)
         .filter(|(_, index)| index.is_unique && index.key_term_count() > 0)
         .map(|(idx_offset, _)| {
             let flag = b.alloc_reg();
@@ -28366,7 +28367,8 @@ fn emit_without_rowid_row_insert(
 ///    bd-yqjjx): probe ONLY that index. A PRIMARY KEY or other-index collision
 ///    is not the named arbiter, so it routes to `no_conflict_label`.
 ///  - omitted target (`probe_unique_secondaries = true`): probe the PRIMARY KEY,
-///    then each UNIQUE secondary index in index order; the first hit wins.
+///    then each UNIQUE secondary index in stock's check order
+///    (`indexes_in_conflict_check_order`); the first hit wins.
 ///  - explicit PRIMARY KEY target (`explicit_target_index = None`,
 ///    `probe_unique_secondaries = false`): probe the PRIMARY KEY only.
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -28476,12 +28478,13 @@ fn emit_without_rowid_upsert_probe(
 
         // Omitted conflict target: SQLite fires DO UPDATE on whichever uniqueness
         // constraint is violated, checked in constraint order — the PRIMARY KEY
-        // (above), then each UNIQUE secondary index in index order. Probe each
-        // UNIQUE index against the attempted-insert values; on the first hit,
-        // position the table cursor on that row via its PK suffix and route to
-        // `conflict_label`. An explicit PRIMARY KEY target skips this (PK-only).
+        // (above), then each UNIQUE secondary index in stock's check order
+        // (`indexes_in_conflict_check_order`). Probe each UNIQUE index against
+        // the attempted-insert values; on the first hit, position the table
+        // cursor on that row via its PK suffix and route to `conflict_label`.
+        // An explicit PRIMARY KEY target skips this (PK-only).
         if probe_unique_secondaries {
-            for (idx_offset, index) in table.indexes.iter().enumerate() {
+            for (idx_offset, index) in indexes_in_conflict_check_order(table) {
                 if !index.is_unique {
                     continue;
                 }
@@ -30640,6 +30643,42 @@ fn emit_not_null_constraints(
     }
 }
 
+/// A table's indexes, with their offsets in `table.indexes`, with the UNIQUE
+/// ones in the order stock SQLite checks them: its `Table.pIndex` list.
+/// `sqlite3CreateIndex` prepends each new index, except that one declared
+/// `ON CONFLICT REPLACE` goes after every index that is not. So every
+/// ABORT / FAIL / ROLLBACK / IGNORE index is checked, newest first, before
+/// any REPLACE index deletes a conflicting row, and the REPLACE indexes follow,
+/// newest first. `table.indexes` is in creation order. Only the UNIQUE indexes
+/// are permuted, among their own positions: where a non-UNIQUE index entry
+/// goes in between decides nothing, and a table with at most one UNIQUE index
+/// keeps its creation order.
+fn indexes_in_conflict_check_order(
+    table: &TableSchema,
+) -> impl Iterator<Item = (usize, &IndexSchema)> {
+    let is_replace =
+        |index: &IndexSchema| matches!(index.conflict_action, Some(ConflictAction::Replace));
+    let unique_newest_first = || {
+        table
+            .indexes
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(_, index)| index.is_unique)
+    };
+    let mut unique_check_order = unique_newest_first()
+        .filter(move |(_, index)| !is_replace(index))
+        .chain(unique_newest_first().filter(move |(_, index)| is_replace(index)));
+    table.indexes.iter().enumerate().map(move |(offset, index)| {
+        if index.is_unique {
+            // One UNIQUE slot per UNIQUE index, so this never falls back.
+            unique_check_order.next().unwrap_or((offset, index))
+        } else {
+            (offset, index)
+        }
+    })
+}
+
 /// Emit `IdxInsert` opcodes for all indexes on the table (bd-so1h: Phase 5I.3).
 ///
 /// For each index, this reads the indexed column values from the provided
@@ -30702,7 +30741,11 @@ fn emit_index_inserts_filtered(
     stmt_conflict: Option<ConflictAction>,
     update_index_mask: Option<&[bool]>,
 ) {
-    for (idx_offset, index) in table.indexes.iter().enumerate() {
+    // The engine decides each UNIQUE conflict at its IdxInsert, and a REPLACE
+    // there deletes the conflicting row at once. Inserting in stock's check
+    // order makes every non-REPLACE decision (ABORT names its constraint,
+    // IGNORE skips the row) before any REPLACE deletion.
+    for (idx_offset, index) in indexes_in_conflict_check_order(table) {
         // A statement-level `INSERT OR <algo>` overrides the index's declared
         // `ON CONFLICT <algo>`; absent both, the default is ABORT.
         let oe_flag = effective_oe(stmt_conflict, index.conflict_action);

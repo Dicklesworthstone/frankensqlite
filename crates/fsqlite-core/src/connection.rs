@@ -80316,7 +80316,7 @@ impl Connection {
                         // Build the entries in creation order first so the hidden
                         // WITHOUT ROWID PRIMARY KEY auto-index can be spliced in at
                         // its canonical ordinal before the reversal below.
-                        let mut entries: Vec<(String, i64, &'static str, i64)> = t
+                        let mut entries: Vec<(String, i64, &'static str, i64, bool)> = t
                             .indexes
                             .iter()
                             .map(|idx| {
@@ -80337,7 +80337,11 @@ impl Connection {
                                 // column is 1 for a partial index (created WITH a
                                 // WHERE clause), matching stock.
                                 let partial = i64::from(idx.where_clause.is_some());
-                                (idx.name.clone(), i64::from(idx.is_unique), origin, partial)
+                                let replace = matches!(
+                                    idx.conflict_action,
+                                    Some(fsqlite_ast::ConflictAction::Replace)
+                                );
+                                (idx.name.clone(), i64::from(idx.is_unique), origin, partial, replace)
                             })
                             .collect();
 
@@ -80363,20 +80367,26 @@ impl Connection {
                                 let name = format!("sqlite_autoindex_{}_{pk_ordinal}", t.name);
                                 let pos = entries
                                     .iter()
-                                    .position(|(nm, _, _, _)| {
+                                    .position(|(nm, _, _, _, _)| {
                                         parse_autoindex_ordinal(nm, &t.name)
                                             .is_some_and(|o| o > pk_ordinal)
                                     })
                                     .unwrap_or(entries.len());
-                                entries.insert(pos, (name, 1, "pk", 0));
+                                entries.insert(pos, (name, 1, "pk", 0, false));
                             }
                         }
 
+                        // Stock lists `Table.pIndex`: newest first, except that
+                        // an index declared ON CONFLICT REPLACE follows every
+                        // index that is not (sqlite3CreateIndex), the order its
+                        // UNIQUE checks run in.
                         let rows = entries
                             .iter()
                             .rev()
+                            .filter(|entry| !entry.4)
+                            .chain(entries.iter().rev().filter(|entry| entry.4))
                             .enumerate()
-                            .map(|(seq, (name, is_unique, origin, partial))| Row {
+                            .map(|(seq, (name, is_unique, origin, partial, _))| Row {
                                 values: vec![
                                     SqliteValue::Integer(i64::try_from(seq).unwrap_or(0)),
                                     SqliteValue::Text(name.clone().into()),
