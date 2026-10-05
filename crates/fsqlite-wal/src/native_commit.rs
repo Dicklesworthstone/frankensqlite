@@ -19,6 +19,10 @@
 //! Both fsyncs are mandatory:
 //! - FSYNC_1 prevents "committed marker, lost data" (worst case).
 //! - FSYNC_2 prevents "client thinks committed, marker not persisted."
+//!
+//! This module tracks the protocol in memory. Its barrier methods do not
+//! perform storage I/O; callers must not treat these transitions alone as
+//! evidence of physical durability.
 
 use fsqlite_types::sync_primitives::Instant;
 use std::collections::VecDeque;
@@ -181,10 +185,15 @@ impl GroupCommitBatch {
         }
     }
 
-    /// Mark FSYNC_2 complete for all pending commits.
+    /// Mark FSYNC_2 complete only for commits covered by FSYNC_1.
+    ///
+    /// A submission may arrive between the barriers. It has no marker yet
+    /// and must not inherit the earlier batch's post-marker barrier.
     fn mark_fsync2_complete(&mut self) {
         for pc in &mut self.pending {
-            pc.barriers.fsync2_complete = true;
+            if pc.barriers.fsync1_complete {
+                pc.barriers.fsync2_complete = true;
+            }
         }
     }
 
@@ -275,8 +284,10 @@ impl Default for CommitIndex {
 pub struct WriteCoordinator {
     /// Current operating mode.
     mode: OperatingMode,
-    /// Monotonic commit sequence tip.
+    /// Highest sequence covered by both protocol barriers.
     commit_seq_tip: CommitSeq,
+    /// Highest reserved sequence, including commits awaiting barriers.
+    allocated_seq_tip: CommitSeq,
     /// Last assigned commit time (monotonic non-decreasing).
     last_commit_time_ns: u64,
     /// Commit index for FCW validation.
@@ -307,6 +318,7 @@ impl WriteCoordinator {
         Self {
             mode,
             commit_seq_tip: initial_seq,
+            allocated_seq_tip: initial_seq,
             last_commit_time_ns: 0,
             commit_index: CommitIndex::new(),
             prev_marker_id: None,
@@ -322,7 +334,8 @@ impl WriteCoordinator {
         self.mode
     }
 
-    /// The current commit sequence tip (highest committed).
+    /// Highest sequence covered by both protocol barriers, excluding
+    /// submissions that have only reserved a sequence.
     #[must_use]
     pub const fn commit_seq_tip(&self) -> CommitSeq {
         self.commit_seq_tip
@@ -409,7 +422,7 @@ impl WriteCoordinator {
         GLOBAL_GROUP_COMMIT_METRICS.record_submission();
 
         // Step 2: Allocate gap-free commit_seq
-        let new_seq = self.commit_seq_tip.next();
+        let new_seq = self.allocated_seq_tip.next();
         let commit_time = now_unix_ns.max(self.last_commit_time_ns.wrapping_add(1));
 
         // Step 3: Build CommitProof (persisted as ECS object)
@@ -421,7 +434,7 @@ impl WriteCoordinator {
         let proof_object_id = Self::derive_proof_object_id(&proof);
 
         // Update coordinator state (inside serialized section)
-        self.commit_seq_tip = new_seq;
+        self.allocated_seq_tip = new_seq;
         self.last_commit_time_ns = commit_time;
         self.commit_index
             .record_commit(&submission.write_set_pages, new_seq);
@@ -456,7 +469,15 @@ impl WriteCoordinator {
     ///
     /// Returns the number of commits covered by this fsync.
     pub fn fsync1(&mut self) -> usize {
-        let count = self.batch.len();
+        let count = self
+            .batch
+            .pending
+            .iter()
+            .filter(|pc| !pc.barriers.fsync1_complete)
+            .count();
+        if count == 0 {
+            return 0;
+        }
         self.batch.mark_fsync1_complete();
         GLOBAL_GROUP_COMMIT_METRICS.record_fsync1();
         debug!(
@@ -478,7 +499,11 @@ impl WriteCoordinator {
         let mut markers = Vec::with_capacity(self.batch.pending.len());
 
         for pc in &mut self.batch.pending {
-            if pc.barriers.fsync1_complete && !pc.barriers.fsync2_complete {
+            // Only a contiguous prefix may enter the marker chain.
+            if !pc.barriers.fsync1_complete {
+                break;
+            }
+            if !pc.barriers.fsync2_complete {
                 // Step 5: Build and append CommitMarker
                 let marker = CommitMarker::new(
                     pc.allocated_seq,
@@ -497,8 +522,13 @@ impl WriteCoordinator {
             }
         }
 
+        let Some(last_marker) = markers.last() else {
+            return markers;
+        };
+
         // Step 6: FSYNC_2 on marker stream
         self.batch.mark_fsync2_complete();
+        self.commit_seq_tip = last_marker.commit_seq;
         GLOBAL_GROUP_COMMIT_METRICS.record_fsync2();
 
         debug!(
@@ -1032,6 +1062,101 @@ mod tests {
 
         barriers.fsync2_complete = true;
         assert!(barriers.all_complete());
+    }
+
+    #[test]
+    fn test_fsync2_before_fsync1_does_not_commit_without_a_marker() {
+        let _metrics_guard = group_commit_metrics_test_guard();
+        let mut coord = WriteCoordinator::new(OperatingMode::Native, CommitSeq::ZERO, 16);
+        coord.submit(make_submission(&[1], 0, 1), 100).unwrap();
+
+        assert!(coord.append_markers_and_fsync2().is_empty());
+        assert!(coord.drain_committed().is_empty());
+        assert_eq!(coord.commit_seq_tip(), CommitSeq::ZERO);
+        assert_eq!(coord.fsync1(), 1);
+        assert!(coord.drain_committed().is_empty());
+        assert_eq!(coord.commit_seq_tip(), CommitSeq::ZERO);
+
+        let markers = coord.append_markers_and_fsync2();
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].commit_seq, CommitSeq::new(1));
+        assert!(markers[0].prev_marker.is_none());
+        assert_eq!(coord.commit_seq_tip(), CommitSeq::new(1));
+        assert_eq!(coord.drain_committed().len(), 1);
+    }
+
+    #[test]
+    fn test_submission_between_barriers_needs_its_own_marker() {
+        let _metrics_guard = group_commit_metrics_test_guard();
+        let mut coord = WriteCoordinator::new(OperatingMode::Native, CommitSeq::ZERO, 16);
+        coord.submit(make_submission(&[1], 0, 1), 100).unwrap();
+        assert_eq!(coord.fsync1(), 1);
+        coord.submit(make_submission(&[2], 0, 2), 200).unwrap();
+
+        let first = coord.append_markers_and_fsync2();
+        assert_eq!(first.len(), 1);
+        assert_eq!(coord.commit_seq_tip(), CommitSeq::new(1));
+        assert_eq!(coord.drain_committed().len(), 1);
+        assert_eq!(coord.pending_count(), 1);
+        assert!(coord.append_markers_and_fsync2().is_empty());
+
+        assert_eq!(coord.fsync1(), 1);
+        assert!(coord.drain_committed().is_empty());
+        let second = coord.append_markers_and_fsync2();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].commit_seq, CommitSeq::new(2));
+        assert_eq!(
+            second[0].prev_marker,
+            Some(ObjectId::derive_from_canonical_bytes(
+                &first[0].to_record_bytes()
+            ))
+        );
+        assert!(second[0].verify_integrity());
+        assert_eq!(coord.commit_seq_tip(), CommitSeq::new(2));
+        assert_eq!(coord.drain_committed().len(), 1);
+        assert_eq!(coord.pending_count(), 0);
+    }
+
+    #[test]
+    fn test_barrier_retries_are_idempotent() {
+        let _metrics_guard = group_commit_metrics_test_guard();
+        GLOBAL_GROUP_COMMIT_METRICS.reset();
+        let mut coord = WriteCoordinator::new(OperatingMode::Native, CommitSeq::ZERO, 16);
+        assert_eq!(coord.fsync1(), 0);
+        assert!(coord.append_markers_and_fsync2().is_empty());
+        coord.submit(make_submission(&[1], 0, 1), 100).unwrap();
+        assert_eq!(coord.fsync1(), 1);
+        assert_eq!(coord.fsync1(), 0);
+        assert_eq!(coord.append_markers_and_fsync2().len(), 1);
+        assert!(coord.append_markers_and_fsync2().is_empty());
+        assert_eq!(coord.drain_committed().len(), 1);
+        assert!(coord.drain_committed().is_empty());
+        assert_eq!(coord.fsync1(), 0);
+        assert!(coord.append_markers_and_fsync2().is_empty());
+
+        let metrics = GLOBAL_GROUP_COMMIT_METRICS.snapshot();
+        assert_eq!(metrics.fsync1_total, 1);
+        assert_eq!(metrics.fsync2_total, 1);
+    }
+
+    #[test]
+    fn test_reserved_sequences_are_not_visible_but_still_conflict() {
+        let _metrics_guard = group_commit_metrics_test_guard();
+        let mut coord = WriteCoordinator::new(OperatingMode::Native, CommitSeq::new(10), 16);
+        let first = coord.submit(make_submission(&[1], 10, 1), 100).unwrap();
+        let second = coord.submit(make_submission(&[2], 10, 2), 200).unwrap();
+        assert_eq!(first, CommitSeq::new(11));
+        assert_eq!(second, CommitSeq::new(12));
+        assert_eq!(coord.commit_seq_tip(), CommitSeq::new(10));
+        assert!(matches!(
+            coord.submit(make_submission(&[1], 10, 3), 300),
+            Err(CommitResult::ConflictFcw { .. })
+        ));
+        coord.fsync1();
+        assert_eq!(coord.commit_seq_tip(), CommitSeq::new(10));
+        assert_eq!(coord.append_markers_and_fsync2().len(), 2);
+        assert_eq!(coord.commit_seq_tip(), CommitSeq::new(12));
+        assert_eq!(coord.drain_committed().len(), 2);
     }
 
     // ── bd-14m.2.1: Group commit observability metrics ──
