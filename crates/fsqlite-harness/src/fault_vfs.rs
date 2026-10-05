@@ -1926,6 +1926,69 @@ mod tests {
     }
 
     #[test]
+    fn tracked_writes_map_fault_decisions_to_exact_terminal_states() {
+        use fsqlite_vfs::traits::VfsWriteCompletionState;
+
+        let vfs = FaultInjectingVfs::new(MemoryVfs::new());
+        let cx = test_cx();
+        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::MAIN_DB;
+        let (file, _) = vfs.open(&cx, Some(Path::new("tracked.db")), flags).unwrap();
+        let read_back = |len: usize| {
+            let mut buf = vec![0_u8; len];
+            run_io(file.read(&cx, &mut buf, 0)).expect("read tracked target");
+            buf
+        };
+
+        // An allowed write hands the caller's exact token to the inner source.
+        let allowed = VfsWriteCompletion::new();
+        run_io(file.write_tracked(&cx, b"allowed!", 0, allowed.clone()))
+            .expect("allowed tracked write");
+        assert_eq!(allowed.state(), VfsWriteCompletionState::Success);
+
+        // A partial write reaches the inner source with only its prefix. That
+        // lower source completes successfully, but the outer logical write
+        // must still terminate as Error.
+        vfs.inject_fault(
+            FaultSpec::partial_write("tracked.db")
+                .bytes_written(2)
+                .build(),
+        );
+        let partial = VfsWriteCompletion::new();
+        run_io(file.write_tracked(&cx, b"PARTIAL!", 0, partial.clone()))
+            .expect_err("injected partial write");
+        assert_eq!(partial.state(), VfsWriteCompletionState::Error);
+        assert_eq!(read_back(8), b"PAlowed!");
+
+        // A zero-byte partial write never reaches the inner source and must
+        // terminate the token itself.
+        vfs.inject_fault(
+            FaultSpec::partial_write("tracked.db")
+                .bytes_written(0)
+                .build(),
+        );
+        let empty_partial = VfsWriteCompletion::new();
+        run_io(file.write_tracked(&cx, b"zzzzzzzz", 0, empty_partial.clone()))
+            .expect_err("injected zero-byte partial write");
+        assert_eq!(empty_partial.state(), VfsWriteCompletionState::Error);
+        assert_eq!(read_back(8), b"PAlowed!");
+
+        // Immediate faults terminate the token without touching the file.
+        vfs.inject_fault(FaultSpec::write_failure("tracked.db").build());
+        let failed = VfsWriteCompletion::new();
+        run_io(file.write_tracked(&cx, b"failed!!", 0, failed.clone()))
+            .expect_err("injected write failure");
+        assert_eq!(failed.state(), VfsWriteCompletionState::Error);
+
+        vfs.inject_fault(FaultSpec::disk_full("tracked.db").build());
+        let full = VfsWriteCompletion::new();
+        let err = run_io(file.write_tracked(&cx, b"full!!!!", 0, full.clone()))
+            .expect_err("injected disk-full write");
+        assert!(matches!(err, FrankenError::DatabaseFull));
+        assert_eq!(full.state(), VfsWriteCompletionState::Error);
+        assert_eq!(read_back(8), b"PAlowed!");
+    }
+
+    #[test]
     fn test_snapshot_isolation_holds_under_schedule_seed_deadbeef() {
         // Structural test: verify FsLab can schedule two tasks deterministically
         // under seed 0xDEAD_BEEF. This tests the scheduling infrastructure
