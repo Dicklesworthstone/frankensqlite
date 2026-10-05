@@ -12279,14 +12279,21 @@ fn codegen_single_join_lookup_select(
         None
     };
 
-    // bd-673gw: the numeric TEXT walk below only finds keys when the index
-    // holds TEXT at all. Look once, before the outer loop, so a column with
-    // no TEXT keys pays nothing per probe. The statement reads one snapshot,
-    // so the answer holds for every probe.
-    let index_has_text_reg = match (&plan.lookup_target, index_cursor) {
+    // bd-673gw / bd-k8ebx: a numeric probe into a typeless index also matches
+    // the TEXT keys NUMERIC affinity makes equal to it. Walking the TEXT keys
+    // once per probe cost every probe the whole TEXT region, so walk them once
+    // here, before the outer loop, and index each key that NUMERIC affinity
+    // turns into a number as `(number, key, rowid)` in an ephemeral index; a
+    // probe then seeks its number there. Other TEXT keys never equal a numeric
+    // probe. The statement reads one snapshot, so the map holds for every
+    // probe. The register holds whether any key went in.
+    let numeric_text_map = match (&plan.lookup_target, index_cursor) {
         (SingleJoinLookupTarget::Index(_), Some(idx_cursor)) if plan.numeric_text_walk => {
+            // Past the left (0), right (1), index (2) and sorter (3) cursors.
+            let map_cursor = 4_i32;
             let has_text_reg = b.alloc_reg();
             b.emit_op(Opcode::Integer, 0, has_text_reg, 0, P4::None, 0);
+            b.emit_op(Opcode::OpenAutoindex, map_cursor, 3, 0, P4::None, 0);
             let text_probe_done = b.emit_label();
             let text_base = b.alloc_regs(2);
             b.emit_op(Opcode::String8, 0, text_base, 0, P4::Str(String::new()), 0);
@@ -12308,22 +12315,50 @@ fn codegen_single_join_lookup_select(
                 P4::None,
                 0,
             );
-            let first_key_reg = b.alloc_reg();
-            b.emit_op(Opcode::Column, idx_cursor, 0, first_key_reg, P4::None, 0);
             let blob_floor_reg = b.alloc_reg();
             b.emit_op(Opcode::Blob, 0, blob_floor_reg, 0, P4::Blob(Vec::new()), 0);
-            // `key >= x''`: the first key past the numbers is a BLOB.
+            // `[number, key, rowid]`, the map entry.
+            let entry_base = b.alloc_regs(3);
+            let entry_record_reg = b.alloc_reg();
+            let text_loop_top = b.current_addr();
+            b.emit_op(Opcode::Column, idx_cursor, 0, entry_base + 1, P4::None, 0);
+            // `key >= x''`: past the TEXT keys.
             b.emit_jump_to_label(
                 Opcode::Ge,
                 blob_floor_reg,
-                first_key_reg,
+                entry_base + 1,
                 text_probe_done,
                 P4::None,
                 0,
             );
+            b.emit_op(Opcode::Copy, entry_base + 1, entry_base, 0, P4::None, 0);
+            b.emit_op(Opcode::Affinity, entry_base, 1, 0, P4::Affinity("C".to_owned()), 0);
+            let next_text_key = b.emit_label();
+            // `number >= ''`: the key stayed TEXT, so no number equals it.
+            b.emit_jump_to_label(Opcode::Ge, text_base, entry_base, next_text_key, P4::None, 0);
+            b.emit_op(Opcode::IdxRowid, idx_cursor, entry_base + 2, 0, P4::None, 0);
+            b.emit_op(
+                Opcode::MakeRecord,
+                entry_base,
+                3,
+                entry_record_reg,
+                P4::None,
+                0,
+            );
+            b.emit_op(Opcode::IdxInsert, map_cursor, entry_record_reg, 0, P4::None, 0);
             b.emit_op(Opcode::Integer, 1, has_text_reg, 0, P4::None, 0);
+            b.resolve_label(next_text_key);
+            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+            b.emit_op(
+                Opcode::Next,
+                idx_cursor,
+                text_loop_top as i32,
+                0,
+                P4::None,
+                0,
+            );
             b.resolve_label(text_probe_done);
-            Some(has_text_reg)
+            Some((has_text_reg, map_cursor))
         }
         _ => None,
     };
@@ -12497,54 +12532,60 @@ fn codegen_single_join_lookup_select(
             let idx_loop_body = idx_loop_top as i32;
             b.emit_op(Opcode::Next, idx_cursor, idx_loop_body, 0, P4::None, 0);
             b.resolve_label(duplicate_run_done);
-            if plan.numeric_text_walk {
+            if let Some((has_text_reg, map_cursor)) = numeric_text_map {
                 // bd-kr6hf: SQLite compares a numeric probe with a typeless
                 // column under NUMERIC affinity, so TEXT keys such as '2',
-                // ' 2' or '2.0' equal the probe 2. Index order puts every
-                // TEXT key after the numbers and before the BLOBs, so seek to
-                // the first TEXT key and test each one until a BLOB or the
-                // end. Only a numeric probe can match there: a TEXT probe's
-                // equal keys were all in the run above.
-                if let Some(has_text_reg) = index_has_text_reg {
-                    b.emit_jump_to_label(Opcode::IfNot, has_text_reg, 1, no_match, P4::None, 0);
-                }
-                let text_base = b.alloc_regs(2);
-                b.emit_op(Opcode::String8, 0, text_base, 0, P4::Str(String::new()), 0);
+                // ' 2' or '2.0' equal the probe 2. Only a numeric probe can
+                // match them: a TEXT probe's equal keys were all in the run
+                // above. bd-k8ebx: the map built before the loop holds each
+                // such key under its number, ordered by (number, key, rowid),
+                // which for one number is the index's own order; seek the
+                // probe there and position the index on each entry it names.
+                b.emit_jump_to_label(Opcode::IfNot, has_text_reg, 1, no_match, P4::None, 0);
+                let text_floor_reg = b.alloc_reg();
+                b.emit_op(Opcode::String8, 0, text_floor_reg, 0, P4::Str(String::new()), 0);
                 // `probe >= ''`: the probe is TEXT or a BLOB.
-                b.emit_jump_to_label(Opcode::Ge, text_base, probe_reg, no_match, P4::None, 0);
-                b.emit_op(Opcode::Int64, 0, text_base + 1, 0, P4::Int64(i64::MIN), 0);
-                let text_record_reg = b.alloc_reg();
-                b.emit_op(
-                    Opcode::MakeRecord,
-                    text_base,
-                    2,
-                    text_record_reg,
-                    P4::None,
-                    0,
-                );
+                b.emit_jump_to_label(Opcode::Ge, text_floor_reg, probe_reg, no_match, P4::None, 0);
+                let map_probe_reg = b.alloc_reg();
+                b.emit_op(Opcode::MakeRecord, probe_reg, 1, map_probe_reg, P4::None, 0);
                 b.emit_jump_to_label(
                     Opcode::SeekGE,
-                    idx_cursor,
-                    text_record_reg,
+                    map_cursor,
+                    map_probe_reg,
                     no_match,
                     P4::None,
                     0,
                 );
-                let blob_floor_reg = b.alloc_reg();
-                b.emit_op(Opcode::Blob, 0, blob_floor_reg, 0, P4::Blob(Vec::new()), 0);
-                let text_loop_top = b.current_addr();
-                let text_key_reg = b.alloc_reg();
-                b.emit_op(Opcode::Column, idx_cursor, 0, text_key_reg, P4::None, 0);
-                // `key >= x''`: past the TEXT keys.
-                b.emit_jump_to_label(Opcode::Ge, blob_floor_reg, text_key_reg, no_match, P4::None, 0);
-                b.emit_op(Opcode::Affinity, text_key_reg, 1, 0, P4::Affinity("C".to_owned()), 0);
-                let text_advance = b.emit_label();
-                b.emit_jump_to_label(Opcode::Ne, probe_reg, text_key_reg, text_advance, P4::None, 0);
-                emit_entry_match(b, text_advance)?;
-                b.resolve_label(text_advance);
+                let map_loop_top = b.current_addr();
+                let number_reg = b.alloc_reg();
+                b.emit_op(Opcode::Column, map_cursor, 0, number_reg, P4::None, 0);
+                b.emit_jump_to_label(Opcode::Ne, probe_reg, number_reg, no_match, P4::None, 0);
+                let index_entry_regs = b.alloc_regs(2);
+                b.emit_op(Opcode::Column, map_cursor, 1, index_entry_regs, P4::None, 0);
+                b.emit_op(Opcode::Column, map_cursor, 2, index_entry_regs + 1, P4::None, 0);
+                let index_entry_record_reg = b.alloc_reg();
+                b.emit_op(
+                    Opcode::MakeRecord,
+                    index_entry_regs,
+                    2,
+                    index_entry_record_reg,
+                    P4::None,
+                    0,
+                );
+                let map_advance = b.emit_label();
+                b.emit_jump_to_label(
+                    Opcode::SeekGE,
+                    idx_cursor,
+                    index_entry_record_reg,
+                    map_advance,
+                    P4::None,
+                    0,
+                );
+                emit_entry_match(b, map_advance)?;
+                b.resolve_label(map_advance);
                 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-                let text_loop_body = text_loop_top as i32;
-                b.emit_op(Opcode::Next, idx_cursor, text_loop_body, 0, P4::None, 0);
+                let map_loop_body = map_loop_top as i32;
+                b.emit_op(Opcode::Next, map_cursor, map_loop_body, 0, P4::None, 0);
             }
             b.resolve_label(no_match);
         }
@@ -12643,6 +12684,9 @@ fn codegen_single_join_lookup_select(
         b.emit_op(Opcode::Close, sort_cursor, 0, 0, P4::None, 0);
     }
 
+    if let Some((_, map_cursor)) = numeric_text_map {
+        b.emit_op(Opcode::Close, map_cursor, 0, 0, P4::None, 0);
+    }
     if let Some(idx_cursor) = index_cursor {
         b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
     }
