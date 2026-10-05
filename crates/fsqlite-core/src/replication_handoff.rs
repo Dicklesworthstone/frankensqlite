@@ -5,6 +5,7 @@
 //! are separate; this is not a bound on the process's total resident memory.
 
 use fsqlite_error::{FrankenError, Result};
+use fsqlite_types::cx::Cx;
 
 use super::{DecodeResult, ReceiverState, ReplicationReceiver};
 use crate::replication_sender::{
@@ -14,16 +15,87 @@ use crate::replication_sender::{
 impl ReplicationReceiver {
     /// Number of decoded changesets still owned by this receiver.
     #[must_use]
-    pub fn pending_changesets(&self) -> usize {
+    pub const fn pending_changesets(&self) -> usize {
         self.pending_results.len()
     }
 
     /// Retained symbol and decoded-page payload bytes, excluding codec scratch
     /// and audit proofs. Draining a result transfers its memory to the caller.
     #[must_use]
-    pub fn buffered_payload_bytes(&self) -> usize {
+    pub const fn buffered_payload_bytes(&self) -> usize {
         self.buffered_symbol_bytes
             .saturating_add(self.pending_payload_bytes)
+    }
+
+    /// Apply the oldest decoded batch without surrendering retry ownership.
+    ///
+    /// The callback borrows the pages in place and may await the caller's
+    /// database transaction. Only an `Ok(())` removes the batch, releases its
+    /// budget, and returns it to the caller. An error, unwinding panic, or
+    /// dropped future leaves the batch and all following batches queued,
+    /// including their payload charges and decode proofs. An empty queue returns `Ok(None)`
+    /// without invoking the callback. No page-sized retry clone is needed.
+    ///
+    /// This uses decode-ready order, not database commit order.
+    /// The caller must validate database identity, generation, and ordering,
+    /// apply each complete changeset atomically, and return success only after
+    /// its required durability boundary. A callback abandoned during I/O must
+    /// roll back or reconcile idempotently using the changeset ID before retry.
+    /// Retaining a batch cannot undo external side effects, and a decoded
+    /// result is not itself a durable commit certificate. Receiver restart or
+    /// raw draining still requires caller-owned replay/deduplication state.
+    ///
+    /// There is deliberately no cancellation checkpoint between callback
+    /// success and removal: an acknowledged apply must not become a retry just
+    /// because cancellation arrived while that successful apply was settling.
+    ///
+    /// # Errors
+    ///
+    /// Propagates cancellation before application, the callback's error, or
+    /// invalid payload accounting before the callback runs. No failed batch
+    /// is consumed. The callback's future need not be `Send`, allowing a
+    /// connection-local async transaction on the caller's executor.
+    #[allow(clippy::future_not_send)]
+    pub async fn apply_next_with<F>(
+        &mut self,
+        cx: &Cx,
+        mut apply: F,
+    ) -> Result<Option<DecodeResult>>
+    where
+        F: for<'a> AsyncFnMut(&'a Cx, &'a DecodeResult) -> Result<()>,
+    {
+        cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+        let Some(batch) = self.pending_results.front() else {
+            return Ok(None);
+        };
+        let page_bytes = batch.pages.iter().try_fold(0_usize, |total, page| {
+            total.checked_add(page.page_data.len()).ok_or_else(|| {
+                FrankenError::Internal("replication payload accounting overflow".to_owned())
+            })
+        })?;
+        let remaining_bytes = self
+            .pending_payload_bytes
+            .checked_sub(page_bytes)
+            .ok_or_else(|| {
+                FrankenError::Internal("replication pending payload accounting underflow".to_owned())
+            })?;
+
+        // `&mut self` remains exclusively borrowed across this await. Nothing
+        // has been drained, so dropping this future cannot lose pending work.
+        apply(cx, batch).await?;
+
+        // No suspension or fallible operation after the apply acknowledgement.
+        let completed = self.pending_results.pop_front();
+        self.pending_payload_bytes = remaining_bytes;
+        self.applied_count = self.applied_count.saturating_add(1);
+        self.state = if !self.pending_results.is_empty() {
+            ReceiverState::Applying
+        } else if self.decoders.is_empty() {
+            ReceiverState::Complete
+        } else {
+            ReceiverState::Collecting
+        };
+        Ok(completed)
     }
 
     pub(super) fn pending_retransmission(&self, packet: &ReplicationPacket) -> Result<bool> {
