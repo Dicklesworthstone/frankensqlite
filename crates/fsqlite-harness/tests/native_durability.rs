@@ -17,9 +17,317 @@ use fsqlite_wal::native_durability::{NativeDurabilityLimits, NativeDurabilityLog
 
 fn run(future: impl Future<Output = ()>) {
     RuntimeBuilder::current_thread()
+        .blocking_threads(1, 2)
         .build()
         .unwrap()
         .block_on(future);
+}
+
+#[test]
+fn recovery_restores_the_chain_and_keeps_orphans_uncommitted() {
+    run(async {
+        let cx = Cx::new();
+        let vfs = FaultInjectingVfs::new(MemoryVfs::new());
+        let mut log = new_log(&vfs, &cx);
+        log.append_symbols(&cx, &[symbol(1), symbol(2)]).await.unwrap();
+        let first = first_marker();
+        log.publish(&cx, std::slice::from_ref(&first), verify).await.unwrap();
+        log.append_symbols(&cx, &[symbol(3), symbol(4)]).await.unwrap();
+        log.close(&cx).unwrap();
+        let (mut recovered, report) = NativeDurabilityLog::recover(
+            &cx,
+            open(&vfs, &cx, "objects"),
+            open(&vfs, &cx, "markers"),
+            NativeDurabilityLimits::default(),
+            verify,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.markers.len(), 1);
+        assert_eq!(report.symbol_records, 4);
+        assert_eq!(report.erased_symbols, 0);
+        assert!(!report.append_blocked());
+        assert_eq!(recovered.published_tip(), CommitSeq::new(1));
+        assert_eq!(vfs.sync_count(), 4); // Publication and recovery each use two.
+        let second = CommitMarker::new(
+            CommitSeq::new(2),
+            101,
+            symbol(3).object_id,
+            symbol(4).object_id,
+            Some(ObjectId::derive_from_canonical_bytes(&first.to_record_bytes())),
+        );
+        recovered.publish(&cx, &[second], verify).await.unwrap();
+        assert_eq!(recovered.published_tip(), CommitSeq::new(2));
+        assert_eq!(vfs.sync_count(), 6);
+        recovered.close(&cx).unwrap();
+    });
+}
+
+#[test]
+fn recovery_reconciles_a_failed_marker_sync_without_losing_the_commit() {
+    run(async {
+        let cx = Cx::new();
+        let vfs = FaultInjectingVfs::new(MemoryVfs::new());
+        let mut log = new_log(&vfs, &cx);
+        log.append_symbols(&cx, &[symbol(1), symbol(2)]).await.unwrap();
+        vfs.inject_fault(FaultSpec::power_cut("markers").after_nth_sync(2).build());
+        assert!(log.publish(&cx, &[first_marker()], verify).await.is_err());
+        assert_eq!(log.published_tip(), CommitSeq::ZERO);
+        vfs.power_on();
+        log.close(&cx).unwrap();
+        let before = vfs.sync_count();
+        let (mut recovered, report) = NativeDurabilityLog::recover(
+            &cx,
+            open(&vfs, &cx, "objects"),
+            open(&vfs, &cx, "markers"),
+            NativeDurabilityLimits::default(),
+            verify,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.markers.len(), 1);
+        assert_eq!(recovered.published_tip(), CommitSeq::new(1));
+        assert_eq!(vfs.sync_count(), before + 2);
+        assert!(!recovered.needs_recovery());
+        recovered.close(&cx).unwrap();
+    });
+}
+
+#[test]
+fn recovery_retains_both_torn_tails_and_refuses_to_append_through_them() {
+    run(async {
+        let cx = Cx::new();
+        let vfs = MemoryVfs::new();
+        let mut log = new_log(&vfs, &cx);
+        log.append_symbols(&cx, &[symbol(1), symbol(2)]).await.unwrap();
+        log.publish(&cx, &[first_marker()], verify).await.unwrap();
+        log.close(&cx).unwrap();
+        let mut objects = open(&vfs, &cx, "objects");
+        let object_end = objects.file_size(&cx).unwrap();
+        objects.write(&cx, &symbol(3).to_bytes()[..60], object_end).await.unwrap();
+        let mut markers = open(&vfs, &cx, "markers");
+        let marker_end = markers.file_size(&cx).unwrap();
+        markers.write(&cx, &[0xAA; 17], marker_end).await.unwrap();
+        objects.close(&cx).unwrap();
+        markers.close(&cx).unwrap();
+        let (mut recovered, report) = NativeDurabilityLog::recover(
+            &cx,
+            open(&vfs, &cx, "objects"),
+            open(&vfs, &cx, "markers"),
+            NativeDurabilityLimits::default(),
+            verify,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.symbol_tail_bytes, 60);
+        assert_eq!(report.marker_tail_bytes, 17);
+        assert!(report.append_blocked());
+        assert!(recovered.needs_recovery());
+        assert_eq!(recovered.published_tip(), CommitSeq::new(1));
+        verify_sync(
+            symbol(1).object_id,
+            &recovered.read_object(&cx, symbol(1).object_id).await.unwrap(),
+        )
+        .unwrap();
+        assert!(recovered.append_symbols(&cx, &[symbol(9)]).await.is_err());
+        assert!(recovered.publish(&cx, &[], verify).await.is_err());
+        let mut objects = open(&vfs, &cx, "objects");
+        let mut markers = open(&vfs, &cx, "markers");
+        assert_eq!(objects.file_size(&cx).unwrap(), object_end + 60);
+        assert_eq!(markers.file_size(&cx).unwrap(), marker_end + 17);
+        objects.close(&cx).unwrap();
+        markers.close(&cx).unwrap();
+        recovered.close(&cx).unwrap();
+    });
+}
+
+#[test]
+fn recovery_never_skips_a_complete_corrupt_or_discontinuous_marker() {
+    run(async {
+        for corrupt_version in [true, false] {
+            let cx = Cx::new();
+            let vfs = FaultInjectingVfs::new(MemoryVfs::new());
+            let mut log = new_log(&vfs, &cx);
+            log.append_symbols(&cx, &[symbol(1), symbol(2)]).await.unwrap();
+            log.close(&cx).unwrap();
+            let marker = CommitMarker::new(
+                CommitSeq::new(if corrupt_version { 1 } else { 2 }),
+                100,
+                symbol(1).object_id,
+                symbol(2).object_id,
+                None,
+            );
+            let mut bytes = marker.to_record_bytes();
+            if corrupt_version {
+                bytes[0] = 0xFF;
+            }
+            let mut file = open(&vfs, &cx, "markers");
+            file.write(&cx, &bytes, 0).await.unwrap();
+            file.close(&cx).unwrap();
+            assert!(
+                NativeDurabilityLog::recover(
+                    &cx,
+                    open(&vfs, &cx, "objects"),
+                    open(&vfs, &cx, "markers"),
+                    NativeDurabilityLimits::default(),
+                    verify,
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(vfs.sync_count(), 0);
+        }
+    });
+}
+
+#[test]
+fn checksum_erasures_require_a_surviving_verified_object() {
+    run(async {
+        for has_redundancy in [true, false] {
+            let cx = Cx::new();
+            let vfs = MemoryVfs::new();
+            let mut log = new_log(&vfs, &cx);
+            log.append_symbols(&cx, &[symbol(1), symbol(2)]).await.unwrap();
+            log.publish(&cx, &[first_marker()], verify).await.unwrap();
+            if has_redundancy {
+                // A duplicate source tests erasure routing, not RaptorQ algebra.
+                log.append_symbols(&cx, &[symbol(1)]).await.unwrap();
+            }
+            log.close(&cx).unwrap();
+            let mut objects = open(&vfs, &cx, "objects");
+            objects.write(&cx, &[0xFF], 51).await.unwrap();
+            objects.close(&cx).unwrap();
+            let result = NativeDurabilityLog::recover(
+                &cx,
+                open(&vfs, &cx, "objects"),
+                open(&vfs, &cx, "markers"),
+                NativeDurabilityLimits::default(),
+                verify,
+            )
+            .await;
+            if has_redundancy {
+                let (mut recovered, report) = result.unwrap();
+                assert_eq!(report.erased_symbols, 1);
+                assert_eq!(report.symbol_records, 3);
+                assert_eq!(recovered.published_tip(), CommitSeq::new(1));
+                recovered.close(&cx).unwrap();
+            } else {
+                assert!(result.is_err());
+            }
+        }
+    });
+}
+
+#[test]
+fn recovery_rejects_payload_identity_spoofing_and_advertised_size_bombs() {
+    run(async {
+        for oversized in [false, true] {
+            let cx = Cx::new();
+            let vfs = FaultInjectingVfs::new(MemoryVfs::new());
+            let original = symbol(1);
+            let mut record = SymbolRecord::new(
+                original.object_id,
+                original.oti,
+                0,
+                vec![9; 4], // Valid envelope, wrong content-addressed identity.
+                SymbolRecordFlags::SYSTEMATIC_RUN_START,
+            );
+            if oversized {
+                record.oti.f = u64::MAX;
+            }
+            let mut objects = open(&vfs, &cx, "objects");
+            let mut bytes = record.to_bytes();
+            bytes.extend_from_slice(&symbol(2).to_bytes());
+            objects.write(&cx, &bytes, 0).await.unwrap();
+            objects.close(&cx).unwrap();
+            let mut markers = open(&vfs, &cx, "markers");
+            markers.write(&cx, &first_marker().to_record_bytes(), 0).await.unwrap();
+            markers.close(&cx).unwrap();
+            assert!(
+                NativeDurabilityLog::recover(
+                    &cx,
+                    open(&vfs, &cx, "objects"),
+                    open(&vfs, &cx, "markers"),
+                    NativeDurabilityLimits::default(),
+                    verify,
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(vfs.sync_count(), 0);
+        }
+    });
+}
+
+#[test]
+fn recovery_must_complete_both_resyncs_before_returning_a_log() {
+    run(async {
+        for (path, ordinal) in [("objects", 1), ("markers", 2)] {
+            let cx = Cx::new();
+            let vfs = FaultInjectingVfs::new(MemoryVfs::new());
+            // Stage valid bytes without assuming they were synced.
+            let mut objects = open(&vfs, &cx, "objects");
+            let mut bytes = symbol(1).to_bytes();
+            bytes.extend_from_slice(&symbol(2).to_bytes());
+            objects.write(&cx, &bytes, 0).await.unwrap();
+            objects.close(&cx).unwrap();
+            let mut markers = open(&vfs, &cx, "markers");
+            markers.write(&cx, &first_marker().to_record_bytes(), 0).await.unwrap();
+            markers.close(&cx).unwrap();
+            vfs.inject_fault(FaultSpec::power_cut(path).after_nth_sync(ordinal).build());
+            assert!(
+                NativeDurabilityLog::recover(
+                    &cx,
+                    open(&vfs, &cx, "objects"),
+                    open(&vfs, &cx, "markers"),
+                    NativeDurabilityLimits::default(),
+                    verify,
+                )
+                .await
+                .is_err()
+            );
+            assert!(vfs.is_powered_off());
+        }
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn native_file_streams_publish_close_and_recover_through_the_caller_runtime() {
+    run(async {
+        let cx = Cx::new();
+        cx.set_native_cx(asupersync::Cx::current().expect("caller runtime context"));
+        let directory = tempfile::tempdir().unwrap();
+        let symbols_path = directory.path().join("objects");
+        let markers_path = directory.path().join("markers");
+        let vfs = fsqlite_vfs::unix::UnixVfs::new();
+        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
+        let mut log = NativeDurabilityLog::create(
+            &cx,
+            vfs.open(&cx, Some(&symbols_path), flags).unwrap().0,
+            vfs.open(&cx, Some(&markers_path), flags).unwrap().0,
+            NativeDurabilityLimits::default(),
+        )
+        .unwrap();
+        log.append_symbols(&cx, &[symbol(1), symbol(2)]).await.unwrap();
+        log.publish(&cx, &[first_marker()], verify).await.unwrap();
+        log.close(&cx).unwrap();
+        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::WAL;
+        let (mut recovered, report) = NativeDurabilityLog::recover(
+            &cx,
+            vfs.open(&cx, Some(&symbols_path), flags).unwrap().0,
+            vfs.open(&cx, Some(&markers_path), flags).unwrap().0,
+            NativeDurabilityLimits::default(),
+            verify,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.markers.len(), 1);
+        assert_eq!(recovered.published_tip(), CommitSeq::new(1));
+        assert_eq!(report.symbol_tail_bytes, 0);
+        assert_eq!(report.marker_tail_bytes, 0);
+        recovered.close(&cx).unwrap();
+    });
 }
 
 fn open<V: Vfs>(vfs: &V, cx: &Cx, path: &str) -> V::File {
@@ -124,7 +432,9 @@ fn staged_objects_are_not_commits_and_a_batch_uses_two_syncs() {
             .zip(&markers)
         {
             assert_eq!(
-                CommitMarker::from_record_bytes(bytes).unwrap().to_record_bytes(),
+                CommitMarker::from_record_bytes(bytes.try_into().unwrap())
+                    .unwrap()
+                    .to_record_bytes(),
                 expected.to_record_bytes(),
             );
         }
@@ -276,5 +586,100 @@ fn preflight_rejects_aliases_nonempty_files_and_oversized_symbols() {
         assert!(log.append_symbols(&cx, &[malformed]).await.is_err());
         assert!(!log.needs_recovery());
         log.close(&cx).unwrap();
+    });
+}
+
+#[test]
+fn recovery_decodes_an_erased_source_from_real_asupersync_repair_symbols() {
+    use fsqlite_core::raptorq_codec::{AsupersyncCodec, unpack_symbol_key};
+    use fsqlite_core::raptorq_integration::{CodecDecodeResult, SymbolCodec};
+
+    run(async {
+        let cx = Cx::new();
+        cx.set_native_cx(asupersync::Cx::current().expect("caller runtime context"));
+        let payload: Vec<u8> = (0_u32..4096)
+            .map(|index| u8::try_from((index * 17 + 37) % 256).unwrap())
+            .collect();
+        let capsule_id = ObjectId::derive_from_canonical_bytes(&payload);
+        let codec = AsupersyncCodec::default();
+        let encoded = codec.encode(&cx, &payload, 512, 2.0).unwrap();
+        let k_source = encoded.k_source;
+        assert_eq!(k_source, 8);
+        assert!(!encoded.repair_symbols.is_empty());
+        let oti = Oti {
+            f: 4096,
+            al: 1,
+            t: 512,
+            z: 1,
+            n: 1,
+        };
+        let records: Vec<SymbolRecord> = encoded
+            .source_symbols
+            .into_iter()
+            .chain(encoded.repair_symbols)
+            .map(|(esi, data)| {
+                SymbolRecord::new(capsule_id, oti, esi, data, SymbolRecordFlags::empty())
+            })
+            .collect();
+        let verifier = |object_id, records: Vec<SymbolRecord>| {
+            let result = if object_id != capsule_id {
+                verify_sync(object_id, &records)
+            } else if records.iter().any(|record| record.oti != oti) {
+                Err(FrankenError::Unsupported)
+            } else {
+                let symbols: Vec<_> = records
+                    .into_iter()
+                    .map(|record| (record.esi, record.symbol_data))
+                    .collect();
+                match codec.decode(&cx, &symbols, k_source, 512) {
+                    Ok(CodecDecodeResult::Success { data, .. }) if data == payload => Ok(()),
+                    _ => Err(FrankenError::WalCorrupt {
+                        detail: "RaptorQ did not reconstruct the exact committed capsule"
+                            .to_owned(),
+                    }),
+                }
+            };
+            ready(result)
+        };
+        let vfs = MemoryVfs::new();
+        let mut log = new_log(&vfs, &cx);
+        log.append_symbols(&cx, &records).await.unwrap();
+        log.append_symbols(&cx, &[symbol(2)]).await.unwrap();
+        let marker = CommitMarker::new(
+            CommitSeq::new(1),
+            100,
+            capsule_id,
+            symbol(2).object_id,
+            None,
+        );
+        log.publish(&cx, &[marker], &verifier).await.unwrap();
+        log.close(&cx).unwrap();
+        let mut objects = open(&vfs, &cx, "objects");
+        objects.write(&cx, &[0xFF], 51).await.unwrap();
+        objects.close(&cx).unwrap();
+        let (mut recovered, report) = NativeDurabilityLog::recover(
+            &cx,
+            open(&vfs, &cx, "objects"),
+            open(&vfs, &cx, "markers"),
+            NativeDurabilityLimits::default(),
+            &verifier,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.erased_symbols, 1);
+        assert_eq!(recovered.published_tip(), CommitSeq::new(1));
+        let surviving = recovered.read_object(&cx, capsule_id).await.unwrap();
+        let sources_only: Vec<_> = surviving
+            .into_iter()
+            .filter(|record| unpack_symbol_key(record.esi).0.is_source())
+            .map(|record| (record.esi, record.symbol_data))
+            .collect();
+        assert_eq!(sources_only.len(), 7);
+        // Negative control: success must depend on the stored repair symbols.
+        assert!(matches!(
+            codec.decode(&cx, &sources_only, k_source, 512).unwrap(),
+            CodecDecodeResult::Failure { .. }
+        ));
+        recovered.close(&cx).unwrap();
     });
 }
