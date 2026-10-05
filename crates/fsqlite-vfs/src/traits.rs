@@ -948,27 +948,51 @@ impl VfsWriteCompletion {
 
     fn complete(&self, terminal: VfsWriteCompletionState) -> bool {
         debug_assert_ne!(terminal, VfsWriteCompletionState::Pending);
-        let (waiters, terminal_relay) = {
-            let mut inner = self
-                .inner
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if inner.state != VfsWriteCompletionState::Pending {
-                return false;
+        // Walk the relay chain iteratively and publish every mapped terminal
+        // state before invoking any waker. Wakers are arbitrary user code: one
+        // that re-enters an outer token must already observe its terminal
+        // state, and one that panics must not strand an outer partial-write
+        // token in `Pending`. Iteration also keeps deep relay chains off the
+        // native stack.
+        let mut completion = self.clone();
+        let mut next_terminal = terminal;
+        let mut completed_source = false;
+        let mut wake_queue = Vec::new();
+
+        loop {
+            let (waiters, terminal_relay) = {
+                let mut inner = completion
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if inner.state != VfsWriteCompletionState::Pending {
+                    break;
+                }
+                inner.state = next_terminal;
+                (
+                    std::mem::take(&mut inner.waiters),
+                    inner.terminal_relay.take(),
+                )
+            };
+            completed_source = true;
+            // Reuse the first token's waiter list so the common unrelayed
+            // completion allocates nothing beyond what it already owned.
+            if wake_queue.is_empty() {
+                wake_queue = waiters;
+            } else {
+                wake_queue.extend(waiters);
             }
-            inner.state = terminal;
-            (
-                std::mem::take(&mut inner.waiters),
-                inner.terminal_relay.take(),
-            )
-        };
-        for (_, waiter) in waiters {
+            let Some((relay, mapped_terminal)) = terminal_relay else {
+                break;
+            };
+            completion = relay;
+            next_terminal = mapped_terminal;
+        }
+
+        for (_, waiter) in wake_queue {
             waiter.wake();
         }
-        if let Some((relay, mapped_terminal)) = terminal_relay {
-            relay.complete(mapped_terminal);
-        }
-        true
+        completed_source
     }
 }
 
@@ -2504,6 +2528,102 @@ mod tests {
             VfsWriteCompletionState::Error,
             "a completed partial-write source must map to outer Error"
         );
+    }
+
+    #[test]
+    fn mapped_relay_terminalizes_before_panicking_reentrant_wake() {
+        use std::future::Future as _;
+        use std::task::Wake;
+
+        struct ReenterOuterThenPanic {
+            outer: VfsWriteCompletion,
+            observation: Arc<Mutex<Option<(VfsWriteCompletionState, bool)>>>,
+        }
+
+        impl ReenterOuterThenPanic {
+            fn reenter_then_panic(&self) -> ! {
+                let observed_state = self.outer.state();
+                let reentrant_transition_won = self.outer.complete_success();
+                *self
+                    .observation
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some((observed_state, reentrant_transition_won));
+                panic!("mapped relay wake panic");
+            }
+        }
+
+        impl Wake for ReenterOuterThenPanic {
+            fn wake(self: Arc<Self>) {
+                self.reenter_then_panic();
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.reenter_then_panic();
+            }
+        }
+
+        std::thread::Builder::new()
+            .name("vfs-write-completion-panicking-relay".to_owned())
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let outer = VfsWriteCompletion::new();
+                let mut source = outer.clone();
+                for _ in 0..10_000 {
+                    source = source.error_mapped_child();
+                }
+
+                let observation = Arc::new(Mutex::new(None));
+                let waker = Waker::from(Arc::new(ReenterOuterThenPanic {
+                    outer: outer.clone(),
+                    observation: Arc::clone(&observation),
+                }));
+                let mut waiter = Box::pin(source.wait());
+                assert!(matches!(
+                    waiter.as_mut().poll(&mut Context::from_waker(&waker)),
+                    Poll::Pending
+                ));
+                drop(waker);
+
+                let completion_result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        source.complete_success();
+                    }));
+                assert!(completion_result.is_err());
+                assert_eq!(source.state(), VfsWriteCompletionState::Success);
+                assert_eq!(outer.state(), VfsWriteCompletionState::Error);
+                assert_eq!(
+                    *observation
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    Some((VfsWriteCompletionState::Error, false)),
+                    "mapped outer state must be terminal before a source waiter can re-enter it"
+                );
+                drop(waiter);
+            })
+            .expect("spawn panicking mapped-relay stack canary")
+            .join()
+            .expect("panicking mapped-relay stack canary panicked");
+    }
+
+    #[test]
+    fn write_completion_error_mapping_is_iterative_on_a_small_stack() {
+        std::thread::Builder::new()
+            .name("vfs-write-completion-relay-depth".to_owned())
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let outer = VfsWriteCompletion::new();
+                let mut source = outer.clone();
+                for _ in 0..10_000 {
+                    source = source.error_mapped_child();
+                }
+                assert!(source.complete_success());
+                assert_eq!(source.state(), VfsWriteCompletionState::Success);
+                assert_eq!(outer.state(), VfsWriteCompletionState::Error);
+            })
+            .expect("spawn write-completion relay stack canary")
+            .join()
+            .expect("write-completion relay stack canary panicked");
     }
 
     struct CompletionLockProbeWake {
