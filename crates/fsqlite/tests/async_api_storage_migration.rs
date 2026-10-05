@@ -10,6 +10,57 @@ use asupersync::runtime::RuntimeBuilder;
 use fsqlite::{AsyncConnection, FrankenError, SqliteValue};
 use fsqlite_types::cx::Cx;
 
+fn assert_send<T: Send + ?Sized>(_: &T) {}
+
+fn assert_send_sync<T: Send + Sync>() {}
+
+/// Construct (never poll) every public async entry point's future and require
+/// it to be `Send`, so callers can drive the actor facade from multi-threaded
+/// runtimes. A future that captures a `!Send` engine handle fails to compile.
+fn assert_connection_futures_are_send(connection: &mut AsyncConnection, cx: &Cx) {
+    assert_send(&AsyncConnection::open(cx, ":memory:"));
+    assert_send(&connection.prepare(cx, "SELECT 1"));
+    assert_send(&connection.query(cx, "SELECT 1"));
+    assert_send(&connection.query_with_params(cx, "SELECT ?1", &[SqliteValue::Integer(1)]));
+    assert_send(&connection.query_row(cx, "SELECT 1"));
+    assert_send(&connection.execute(cx, "SELECT 1"));
+    assert_send(&connection.execute_with_params(cx, "SELECT ?1", &[SqliteValue::Integer(1)]));
+    assert_send(&connection.execute_batch(cx, "SELECT 1"));
+    assert_send(&connection.begin_transaction(cx));
+    assert_send(&connection.commit_transaction(cx));
+    assert_send(&connection.rollback_transaction(cx));
+    assert_send(&connection.close(cx));
+}
+
+#[test]
+fn async_connection_and_its_public_futures_are_send() {
+    assert_send_sync::<AsyncConnection>();
+
+    let runtime = RuntimeBuilder::current_thread()
+        .blocking_threads(1, 1)
+        .build()
+        .expect("test runtime should build");
+    runtime.block_on(async {
+        let cx = Cx::new();
+        let mut connection = AsyncConnection::open(&cx, ":memory:")
+            .await
+            .expect("in-memory async connection should open");
+        assert_connection_futures_are_send(&mut connection, &cx);
+        assert_eq!(
+            connection
+                .query_row(&cx, "SELECT 41 + 1")
+                .await
+                .expect("unpolled futures must leave the connection usable")
+                .get(0),
+            Some(&SqliteValue::Integer(42))
+        );
+        connection
+            .close(&cx)
+            .await
+            .expect("connection should close");
+    });
+}
+
 #[test]
 fn async_facade_drives_file_backed_storage_futures_to_completion() {
     let runtime = RuntimeBuilder::current_thread()
