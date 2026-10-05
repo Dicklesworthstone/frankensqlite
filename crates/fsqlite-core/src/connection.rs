@@ -27230,6 +27230,16 @@ impl Connection {
                 return Some(name.to_string());
             }
         }
+        // bd-clpji: the join / table-valued-source evaluator (`eval_join_expr`)
+        // reports an unresolved name as `column not found: X`
+        // (`printf("%0200d", value) FROM generate_series(1, 3)`).
+        if let Some(name) = msg
+            .strip_prefix("column not found: ")
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            return Some(name.to_string());
+        }
         if let Some(i) = msg.find("column: \"") {
             let rest = &msg[i + "column: \"".len()..];
             if let Some(j) = rest.find('"') {
