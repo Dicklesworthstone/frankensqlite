@@ -10533,6 +10533,70 @@ fn statement_is_raise_select(statement: &Statement) -> bool {
     matches!(expr, Expr::Raise { .. }) || case_wrapped_raise_directive(expr).is_some()
 }
 
+/// A `SELECT RAISE(...)` shape that [`trigger_statement_raise_directive`]
+/// does not evaluate directly — one with a FROM clause, GROUP BY / HAVING,
+/// ORDER BY, LIMIT or a WITH clause, such as the constraint idiom
+/// `SELECT RAISE(ABORT, 'dup') FROM u WHERE u.k = NEW.k`. Stock evaluates
+/// the RAISE for each row the SELECT produces, so it fires exactly when the
+/// SELECT yields a row: return the directive and that SELECT with its result
+/// column replaced by `1` (a CASE-wrapped RAISE's condition joins the WHERE).
+/// `None` for shapes this cannot express: a compound SELECT, or a
+/// CASE-wrapped RAISE over a grouped or aggregate SELECT.
+fn trigger_raise_select_row_probe(
+    statement: &Statement,
+) -> Option<(TriggerRaiseDirective, SelectStatement)> {
+    let Statement::Select(select) = statement else {
+        return None;
+    };
+    if !select.body.compounds.is_empty() {
+        return None;
+    }
+    let mut probe = select.clone();
+    let SelectCore::Select {
+        columns,
+        where_clause,
+        group_by,
+        having,
+        ..
+    } = &mut probe.body.select
+    else {
+        return None;
+    };
+    let [ResultColumn::Expr { expr, .. }] = columns.as_slice() else {
+        return None;
+    };
+    let directive = if let Expr::Raise {
+        action, message, ..
+    } = expr
+    {
+        TriggerRaiseDirective {
+            action: *action,
+            message: message.clone(),
+        }
+    } else {
+        let (action, message, condition) = case_wrapped_raise_directive(expr)?;
+        if !group_by.is_empty() || having.is_some() || expr_has_aggregate(condition) {
+            return None;
+        }
+        let condition = condition.clone();
+        *where_clause = Some(Box::new(match where_clause.take() {
+            Some(existing) => Expr::BinaryOp {
+                left: existing,
+                op: BinaryOp::And,
+                right: Box::new(condition),
+                span: Span::ZERO,
+            },
+            None => condition,
+        }));
+        TriggerRaiseDirective { action, message }
+    };
+    *columns = vec![ResultColumn::Expr {
+        expr: Expr::Literal(Literal::Integer(1), Span::ZERO),
+        alias: None,
+    }];
+    Some((directive, probe))
+}
+
 fn select_is_plain_count_star(select: &SelectStatement) -> bool {
     if select.with.is_some() || !select.order_by.is_empty() || select.limit.is_some() {
         return false;
@@ -71028,11 +71092,22 @@ impl Connection {
                 return self.apply_trigger_raise(directive).await;
             }
         }
-        // Reaching here with a RAISE-shaped SELECT means the WHERE predicate
-        // evaluated to false — the RAISE was not fired.  We must NOT fall
-        // through to execute_statement because the general execution path
-        // cannot evaluate Expr::Raise as a value.  Just skip it (no-op).
+        // Reaching here with a RAISE-shaped SELECT means either the WHERE
+        // predicate of a directly evaluated RAISE was false, or the SELECT has
+        // a shape evaluated as a row probe (a FROM clause, GROUP BY, ...): the
+        // RAISE fires when the probe yields a row. We must NOT fall through to
+        // execute_statement because the general execution path cannot
+        // evaluate Expr::Raise as a value.
         if statement_is_raise_select(&statement) {
+            if trigger_statement_raise_directive(&statement).is_none()
+                && let Some((directive, probe)) = trigger_raise_select_row_probe(&statement)
+                && !self
+                    .execute_statement(&Statement::Select(probe), None)
+                    .await?
+                    .is_empty()
+            {
+                return self.apply_trigger_raise(directive).await;
+            }
             return Ok(TriggerStatementOutcome::Continue);
         }
         if matches!(
