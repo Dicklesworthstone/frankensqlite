@@ -25,6 +25,8 @@ pub mod journal;
 // creating and dropping an unpolled operation must not mutate the transaction.
 #[allow(clippy::unused_async_trait_impl)]
 pub mod native;
+#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+pub mod native_service;
 pub mod page_buf;
 pub mod page_cache;
 pub mod pager;
