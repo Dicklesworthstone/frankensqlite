@@ -1,0 +1,171 @@
+GH#492 candidate implementation -- NOT applied to production by this commit.
+
+This is a normal development patch, not a build-time source transformer.
+The source edits were authored against connection.rs blob
+74e4bb5ee503fd40e0104dbbaa5dadabdef90777. The subsequently observed main blob
+14e10e2384157c97d9d61629d52657b478d1cb6f includes peer changes: reconcile and
+run git apply --check against a complete current checkout before applying.
+Do not replace connection.rs from a partial fetch or overwrite peer edits.
+
+Only optional prepared-read hydration is capped at an 8 MiB logical image.
+Explicit correctness-required hydration keeps its existing boolean behavior.
+The publication-bound check includes WAL growth; this is not an RSS budget or
+an experimentally tuned crossover. FTS5 lazy admission stays independent.
+
+The final two hunks activate the existing and WAL-growth ordinary regressions
+in the keeper shipped with this patch. Apply the implementation and activation
+together. Full-source application, compilation and engine tests have NOT run.
+This artifact does not make #492 fixed or justify closing the issue.
+
+Validation commands after applying to a complete checkout:
+  cargo test -p fsqlite-core --test gh492_bounded_post_commit_hydration -- --nocapture
+  cargo test -p fsqlite-core --test gh409_read_after_commit_scaling --test bd_xml0z_prepared_read_reload_and_eqp
+  cargo check --workspace --all-targets
+  cargo clippy --workspace --all-targets -- -D warnings
+  cargo fmt --check
+
+diff --git a/crates/fsqlite-core/src/connection.rs b/crates/fsqlite-core/src/connection.rs
+--- a/crates/fsqlite-core/src/connection.rs
++++ b/crates/fsqlite-core/src/connection.rs
+@@ -35,4 +35,12 @@
+ mod conformal_retry;
+ mod pragma_maintenance;
+
++/// Required mirror refreshes and optional prepared-read acceleration have
++/// different admission rules. Only the latter may decline row hydration.
++#[derive(Clone, Copy)]
++enum MemdbRowHydrationMode {
++    Explicit(bool),
++    PreparedFastPath,
++}
++
+ use conformal_retry::{ConformalRetryBudget, ConformalRetryBudgetCell};
+@@ -25057,9 +25065,9 @@
+-    /// PR#401 invariant (GH#402 companion): connections opened through the
+-    /// schema-only family promise bounded-memory, pager-backed row reads, so
+-    /// the opportunistic prepared-query MemDB fast path must never bulk-
+-    /// hydrate the whole file into `MemDatabase` on their behalf. Derived
+-    /// from the open mode: `schema_only_open` is set exclusively by the
+-    /// schema-only open family (every variant — read-only, writable
+-    /// existing-only, and deferred-FTS5), never by ordinary opens.
++    /// PR#401 / GH#492: schema-only connections never opt into whole-file row
++    /// hydration; ordinary file connections do so only for small images.
++    /// This cheap candidate check uses the last published logical size, not
++    /// filesystem metadata (which misses WAL-resident growth). The refresh
++    /// rechecks the budget against its freshly bound publication before it
++    /// hydrates, so a peer growing a previously small database cannot bypass
++    /// the bound. A stale large estimate can only decline an optimization.
+     ///
+     /// This used to read `allow_lazy_contentless_fts5`, which happened to
+@@ -25070,4 +25078,16 @@
+     #[inline]
+     fn defer_memdb_row_hydration(&self) -> bool {
+         self.schema_only_open
++            || (!self.pager.is_memory()
++                && !self.file_backed_memdb_hydration_within_budget(
++                    self.pager.published_snapshot().db_size,
++                ))
++    }
++
++    /// Bound the image eligible for optional acceleration, not total RSS or
++    /// correctness-required mirror loads. Decoded rows have their own overhead.
++    #[inline]
++    fn file_backed_memdb_hydration_within_budget(&self, db_size: u32) -> bool {
++        const MAX_IMAGE_BYTES: u64 = 8 * 1024 * 1024;
++        u64::from(db_size) * u64::from(self.pager.page_size().get()) <= MAX_IMAGE_BYTES
+     }
+@@ -25654,5 +25674,5 @@
+         self.refresh_memdb_if_stale_with_publication_and_mode(
+             cx,
+             scenario_id,
+-            self.should_eagerly_hydrate_memdb_rows(),
++            MemdbRowHydrationMode::Explicit(self.should_eagerly_hydrate_memdb_rows()),
+         )
+@@ -25662,14 +25682,27 @@
+     async fn refresh_memdb_if_stale_with_publication_and_mode(
+         &self,
+         cx: &Cx,
+         scenario_id: &'static str,
+-        hydrate_rows: bool,
++        mode: MemdbRowHydrationMode,
+     ) -> Result<BoundPagerPublication> {
++        let hydration_requested = |snapshot: &PagerPublishedSnapshot| match mode {
++            MemdbRowHydrationMode::Explicit(hydrate_rows) => hydrate_rows,
++            MemdbRowHydrationMode::PreparedFastPath => {
++                !self.schema_only_open
++                    && (self.pager.is_memory()
++                        || self.file_backed_memdb_hydration_within_budget(snapshot.db_size))
++            }
++        };
+         if let Some(publication) = self.cached_autocommit_publication(scenario_id)
+-            && (!hydrate_rows || self.memdb_rows_loaded.get())
++            && (!hydration_requested(&publication.snapshot) || self.memdb_rows_loaded.get())
+         {
+             return Ok(publication);
+         }
+
+         let publication = self.bind_pager_publication(cx, scenario_id).await?;
++        // Reevaluate after binding: another connection may have grown the
++        // database since the candidate check. The prebound reload below also
++        // rejects a transaction whose visibility sequence differs from this
++        // publication, rather than hydrating a newer, potentially larger image.
++        let hydrate_rows = hydration_requested(&publication.snapshot);
+         if publication.snapshot.visible_commit_seq > *self.memdb_visible_commit_seq.borrow()
+@@ -29998,7 +30031,11 @@
+         if self.pager.is_memory()
+             && !self.memdb_rows_loaded.get()
+             && !self.memdb_requires_active_txn_reload.get()
+         {
+             let _ = self
+-                .refresh_memdb_if_stale_with_publication_and_mode(cx, "memdb_staleness_check", true)
++                .refresh_memdb_if_stale_with_publication_and_mode(
++                    cx,
++                    "memdb_staleness_check",
++                    MemdbRowHydrationMode::Explicit(true),
++                )
+                 .await?;
+@@ -30049,4 +30086,4 @@
+                 cx,
+                 "clean_file_backed_memdb_staleness_check",
+-                true,
++                MemdbRowHydrationMode::PreparedFastPath,
+             )
+@@ -60016,4 +60053,4 @@
+-            // PR#401 invariant: schema-only opens never bulk-hydrate file rows
+-            // into MemDatabase through the prepared fast path; their reads stay
+-            // pager-backed (see `defer_memdb_row_hydration`).
++            // PR#401 / GH#492: schema-only and large ordinary file connections
++            // keep prepared reads pager-backed. Only small ordinary images
++            // qualify for optional MemDatabase hydration.
+             let hydrate_file_backed_fast_path = !self.defer_memdb_row_hydration()
+@@ -60024,7 +60061,7 @@
+             if hydrate_file_backed_fast_path {
+                 let _ = self
+                     .refresh_memdb_if_stale_with_publication_and_mode(
+                         cx,
+                         "memdb_staleness_check",
+-                        true,
++                        MemdbRowHydrationMode::PreparedFastPath,
+                     )
+@@ -73654,5 +73691,5 @@
+                     .refresh_memdb_if_stale_with_publication_and_mode(
+                         &cx,
+                         "explicit_begin",
+-                        hydrate_rows_at_begin,
++                        MemdbRowHydrationMode::Explicit(hydrate_rows_at_begin),
+                     )
+diff --git a/crates/fsqlite-core/tests/gh492_bounded_post_commit_hydration.rs b/crates/fsqlite-core/tests/gh492_bounded_post_commit_hydration.rs
+--- a/crates/fsqlite-core/tests/gh492_bounded_post_commit_hydration.rs
++++ b/crates/fsqlite-core/tests/gh492_bounded_post_commit_hydration.rs
+@@ -313,5 +313,4 @@
+ #[test]
+-#[ignore = "GH#492 pending production fix; run explicitly with --ignored --nocapture"]
+ fn ordinary_post_commit_reads_are_bounded() {
+     run(OpenMode::Ordinary);
+ }
+@@ -517,5 +516,4 @@
+ #[test]
+-#[ignore = "GH#492 pending production fix; run explicitly with --ignored --nocapture"]
+ fn ordinary_prepared_reads_switch_to_pager_after_wal_only_growth() {
+     run_wal_growth(OpenMode::Ordinary);
+ }

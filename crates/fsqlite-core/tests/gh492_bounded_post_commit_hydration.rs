@@ -14,6 +14,12 @@
 //! Bounds count actual per-connection hydrated rows, not elapsed time or VDBE
 //! opcodes (hydration happens outside the point-read program). A selective
 //! implementation may hydrate the hot table; the bulk table must stay out.
+//!
+//! The WAL-growth case warms both connections while the image is small, then
+//! grows only the unrelated table past the proposed budget. Size diagnostics
+//! run AFTER both first reads, so they cannot refresh away a stale publication.
+//! The ordinary growth case remains ignored until the production patch under
+//! artifacts/gh492 is applied and validated; its schema-only control is active.
 
 use fsqlite_core::connection::{Connection, PreparedStatement};
 use fsqlite_types::value::SqliteValue;
@@ -332,4 +338,189 @@ fn small_ordinary_database_retains_memdb_acceleration() {
         );
         conn.close().await.expect("close tiny db");
     });
+}
+
+async fn pragma_u64(conn: &Connection, sql: &str) -> u64 {
+    let row = conn.query_row(sql).await.expect("read pager geometry");
+    match row.values() {
+        [SqliteValue::Integer(value)] => u64::try_from(*value).expect("nonnegative geometry"),
+        other => panic!("expected one integer from {sql}, got {other:?}"),
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_wal_growth(mode: OpenMode) {
+    asupersync::test_utils::run_test(|| async {
+        const BUDGET_BYTES: u64 = 8 * 1024 * 1024;
+        const GROWN_BULK_ROWS: i64 = 4_096;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("growth.db");
+        seed(&path, 8);
+        let path_text = path.to_string_lossy();
+        let mut failures = Vec::new();
+        let a = open(&path_text, mode, &mut failures).await;
+        a.execute("PRAGMA journal_mode = WAL").await.expect("WAL");
+        a.execute("PRAGMA wal_autocheckpoint = 0")
+            .await
+            .expect("keep growth in the WAL");
+        let b = open(&path_text, mode, &mut failures).await;
+        let mut expected = 1;
+        {
+            let a_stmt = a.prepare(POINT).await.expect("writer statement");
+            let b_stmt = b.prepare(POINT).await.expect("reader statement");
+            for stmt in [&a_stmt, &b_stmt] {
+                let rows = stmt
+                    .query_with_params(&[SqliteValue::Text("h7".into())])
+                    .await
+                    .expect("warm small image");
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].values(), &[SqliteValue::Integer(0)]);
+            }
+            for conn in [&a, &b] {
+                match mode {
+                    OpenMode::Ordinary => assert!(conn.memdb_row_hydration_count() > 0),
+                    OpenMode::SchemaOnly => assert_eq!(conn.memdb_row_hydration_count(), 0),
+                }
+            }
+
+            let before_growth = a.memdb_row_hydration_count();
+            a.execute("BEGIN IMMEDIATE").await.expect("begin growth");
+            let body = SqliteValue::Text("x".repeat(2_048).into());
+            for id in 8..GROWN_BULK_ROWS {
+                a.execute_with_params(
+                    "INSERT INTO bulk VALUES (?1, ?2)",
+                    &[SqliteValue::Integer(id), body.clone()],
+                )
+                .await
+                .expect("grow unrelated table");
+            }
+            // Change the hot row in the SAME commit. Reusing the old small
+            // mirror must fail a value assertion, not merely a work counter.
+            a.execute("UPDATE hot SET v = 1 WHERE id = 'h7'")
+                .await
+                .expect("change hot row during growth");
+            a.execute("COMMIT").await.expect("commit growth");
+            let growth_hydrated = a.memdb_row_hydration_count() - before_growth;
+            if growth_hydrated > 100 {
+                failures.push(format!("growth writes hydrated {growth_hydrated} rows"));
+            }
+
+            let main_bytes = std::fs::metadata(&path).expect("main file").len();
+            let wal_bytes = std::fs::metadata(format!("{path_text}-wal"))
+                .expect("WAL file")
+                .len();
+            assert!(
+                main_bytes < BUDGET_BYTES,
+                "fixture checkpointed: {main_bytes}"
+            );
+            assert!(wal_bytes > BUDGET_BYTES, "fixture did not grow: {wal_bytes}");
+
+            // Do not run a PRAGMA, prepare, or another query on either
+            // connection between the commit and these two first reads.
+            read(
+                &b,
+                &b_stmt,
+                ReadApi::Prepared,
+                expected,
+                "peer WAL growth",
+                &mut failures,
+            )
+            .await;
+            read(
+                &a,
+                &a_stmt,
+                ReadApi::Prepared,
+                expected,
+                "own WAL growth",
+                &mut failures,
+            )
+            .await;
+
+            // A large WAL alone could be repeated writes to a small image.
+            // Prove actual logical growth without priming the reads above.
+            let logical_bytes = pragma_u64(&a, "PRAGMA page_count")
+                .await
+                .checked_mul(pragma_u64(&a, "PRAGMA page_size").await)
+                .expect("logical image size fits u64");
+            assert!(
+                logical_bytes > BUDGET_BYTES,
+                "logical image stayed small: {logical_bytes}"
+            );
+            println!(
+                "GH492 {mode:?} growth: main_bytes={main_bytes} wal_bytes={wal_bytes} \
+                 logical_bytes={logical_bytes} growth_hydrated={growth_hydrated}"
+            );
+
+            for api in [
+                ReadApi::Query,
+                ReadApi::QueryParams,
+                ReadApi::QueryRow,
+                ReadApi::Prepared,
+            ] {
+                update(&a, &mut failures).await;
+                expected += 1;
+                read(&a, &a_stmt, api, expected, "grown writer", &mut failures).await;
+                read(&b, &b_stmt, api, expected, "grown reader", &mut failures).await;
+            }
+
+            b.execute("BEGIN").await.expect("begin grown reader snapshot");
+            read(
+                &b,
+                &b_stmt,
+                ReadApi::Prepared,
+                expected,
+                "pin grown snapshot",
+                &mut failures,
+            )
+            .await;
+            update(&a, &mut failures).await;
+            read(
+                &b,
+                &b_stmt,
+                ReadApi::Prepared,
+                expected,
+                "keep grown snapshot",
+                &mut failures,
+            )
+            .await;
+            expected += 1;
+            b.execute("ROLLBACK").await.expect("release grown snapshot");
+            read(
+                &b,
+                &b_stmt,
+                ReadApi::Prepared,
+                expected,
+                "advance grown snapshot",
+                &mut failures,
+            )
+            .await;
+        }
+        a.close().await.expect("close writer");
+        b.close().await.expect("close reader");
+        let stock = rusqlite::Connection::open(&path).expect("stock verification");
+        let count: i64 = stock
+            .query_row("SELECT count(*) FROM bulk", [], |row| row.get(0))
+            .expect("stock bulk count");
+        assert_eq!(count, GROWN_BULK_ROWS);
+        let value: i64 = stock
+            .query_row(LITERAL_POINT, [], |row| row.get(0))
+            .expect("stock hot value");
+        assert_eq!(value, expected);
+        let integrity: String = stock
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .expect("stock integrity check");
+        assert_eq!(integrity, "ok");
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    });
+}
+
+#[test]
+#[ignore = "GH#492 pending production fix; run explicitly with --ignored --nocapture"]
+fn ordinary_prepared_reads_switch_to_pager_after_wal_only_growth() {
+    run_wal_growth(OpenMode::Ordinary);
+}
+
+#[test]
+fn schema_only_wal_growth_preserves_visibility_without_hydration() {
+    run_wal_growth(OpenMode::SchemaOnly);
 }
