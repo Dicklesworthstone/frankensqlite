@@ -24,7 +24,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 SOURCE = "crates/fsqlite-core/src/connection.rs"
-BASE_BLOB = "74e4bb5ee503fd40e0104dbbaa5dadabdef90777"
+# Reviewed against 6e8fd0d46338d4a452409611ea493e90224c5e55.
+# Its intervening migration, trigger, alias and time-travel fixes are retained.
+BASE_BLOB = "14e10e2384157c97d9d61629d52657b478d1cb6f"
 
 
 @dataclass(frozen=True)

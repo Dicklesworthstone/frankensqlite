@@ -1,4 +1,4 @@
-name: GH493 schema-only CTE reproduction
+name: GH493 native integration gate
 
 on:
   workflow_dispatch:
@@ -6,41 +6,115 @@ on:
     branches: [main]
     paths:
       - .github/workflows/gh493-schema-only-cte.yml
-      - crates/fsqlite-core/tests/gh493_schema_only_cte.rs
+      - artifacts/gh493/**
+  issue_comment:
+    types: [created]
 
 permissions:
   contents: read
 
+concurrency:
+  group: gh493-native-integration
+  cancel-in-progress: false
+
 jobs:
-  baseline:
+  validate-and-stage:
+    if: >-
+      github.event_name != 'issue_comment' ||
+      (github.event.issue.number == 493 &&
+       !github.event.issue.pull_request &&
+       github.event.comment.body == '/gh493-validate' &&
+       github.event.comment.user.login == github.repository_owner)
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    permissions:
+      contents: write
     env:
-      CARGO_BUILD_JOBS: '2'
-      CARGO_PROFILE_DEV_DEBUG: '0'
-      CARGO_PROFILE_TEST_DEBUG: '0'
-      GH493_EXPECT: baseline
+      PYTHONDONTWRITEBYTECODE: '1'
+      CARGO_BUILD_JOBS: '1'
+      CARGO_PROFILE_RELEASE_DEBUG: '0'
+      CARGO_PROFILE_RELEASE_LTO: 'off'
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
+      GH493_RESULTS: ${{ runner.temp }}/gh493-native
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - name: Record exact inputs
-        run: |
-          mkdir -p gh493-results
-          git rev-parse HEAD | tee gh493-results/commit.txt
-          rustc -Vv | tee gh493-results/rustc.txt
-          uname -a | tee gh493-results/system.txt
-      - name: Reproduce in isolated processes
+        with:
+          ref: ${{ github.event_name == 'issue_comment' && 'main' || github.sha }}
+          persist-credentials: false
+      - name: Install the repository-pinned nightly
         shell: bash
         run: |
           set -euo pipefail
-          cargo test --locked -p fsqlite-core --no-default-features --features native,ext-json \
-            --test gh493_schema_only_cte gh493_isolated_profile -- \
-            --ignored --exact --nocapture --test-threads=1 \
-            2>&1 | tee gh493-results/baseline.log
-      - name: Preserve measurements, including failures
+          toolchain="$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')"
+          rustup toolchain install "$toolchain" --profile minimal --component rustfmt --component clippy
+      - name: Native baseline, source application, correctness, lint, and after profile
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 artifacts/gh493/run_native_validation.py --results "$GH493_RESULTS"
+      - name: Stage the validated source commit without updating a branch
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const crypto = require('crypto');
+            const cp = require('child_process');
+            const out = process.env.GH493_RESULTS;
+            const receipt = JSON.parse(fs.readFileSync(path.join(out, 'validated.json'), 'utf8'));
+            const allowed = [
+              'crates/fsqlite-core/src/connection.rs',
+              'crates/fsqlite-core/src/connection/cte_storage.rs',
+              'crates/fsqlite-core/tests/gh493_pager_contract.rs',
+            ];
+            const head = cp.execFileSync('git', ['rev-parse', 'HEAD'], {encoding: 'utf8'}).trim();
+            if (receipt.native_gates_passed !== true || receipt.base_commit !== head ||
+                JSON.stringify(receipt.files.map(f => f.path).sort()) !== JSON.stringify(allowed.sort())) {
+              throw new Error('invalid native validation receipt');
+            }
+            const repo = context.repo;
+            const tree = [];
+            for (const entry of receipt.files) {
+              const bytes = fs.readFileSync(entry.path);
+              const blob = crypto.createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex');
+              const sha256 = crypto.createHash('sha256').update(bytes).digest('hex');
+              if (blob !== entry.blob || sha256 !== entry.sha256) {
+                throw new Error(`source changed after validation: ${entry.path}`);
+              }
+              const created = await github.rest.git.createBlob({...repo, content: bytes.toString('base64'), encoding: 'base64'});
+              if (created.data.sha !== blob) throw new Error(`uploaded blob mismatch: ${entry.path}`);
+              tree.push({path: entry.path, mode: '100644', type: 'blob', sha: blob});
+            }
+            const parent = await github.rest.git.getCommit({...repo, commit_sha: head});
+            const createdTree = await github.rest.git.createTree({...repo, base_tree: parent.data.tree.sha, tree});
+            const message = [
+              'fix(core): keep schema-only CTE persistent sources pager-backed',
+              '',
+              'Use explicitly owned statement-local roots for CTE frontiers and catalog rows.',
+              'Preserve those roots across schema refresh without taking TEMP catalog ownership.',
+              'Suppress persistent hydration for the complete bounded WITH scope and attached calls;',
+              'retain actual time-travel behavior and attached DML conflict/RETURNING tracking.',
+              '',
+              `Native validation base: ${head}`,
+              `Passing test counts by gate: ${JSON.stringify(receipt.tests)}`,
+              `Before profile: ${JSON.stringify(receipt.before_summary)}`,
+              `After profile: ${JSON.stringify(receipt.after_summary)}`,
+              'Both profiles use the same release configuration: LTO off, 16 codegen units.',
+              'Timing/RSS are local fixture measurements, not a general throughput claim.',
+              `Full evidence: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              '',
+              'This commit is staged only. No branch is moved by the validation workflow.',
+            ].join('\n');
+            const commit = await github.rest.git.createCommit({...repo, message, tree: createdTree.data.sha, parents: [head]});
+            receipt.staged_commit = commit.data.sha;
+            receipt.staged_tree = createdTree.data.sha;
+            receipt.remote_ref_updated = false;
+            fs.writeFileSync(path.join(out, 'staged-commit.json'), JSON.stringify(receipt, null, 2) + '\n');
+            core.notice(`Validated commit ${commit.data.sha} staged; main has NOT been updated.`);
+      - name: Preserve actual logs and source diff even when a gate fails
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: gh493-baseline-${{ github.sha }}
-          path: gh493-results/
-          if-no-files-found: error
+          name: gh493-native-${{ github.run_id }}
+          path: ${{ runner.temp }}/gh493-native/
+          if-no-files-found: warn
