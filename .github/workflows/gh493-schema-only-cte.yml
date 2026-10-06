@@ -1,0 +1,46 @@
+name: GH493 schema-only CTE reproduction
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/gh493-schema-only-cte.yml
+      - crates/fsqlite-core/tests/gh493_schema_only_cte.rs
+
+permissions:
+  contents: read
+
+jobs:
+  baseline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      GH493_EXPECT: baseline
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Record exact inputs
+        run: |
+          mkdir -p gh493-results
+          git rev-parse HEAD | tee gh493-results/commit.txt
+          rustc -Vv | tee gh493-results/rustc.txt
+          uname -a | tee gh493-results/system.txt
+      - name: Reproduce in isolated processes
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p fsqlite-core --no-default-features --features native,ext-json \
+            --test gh493_schema_only_cte gh493_isolated_profile -- \
+            --ignored --exact --nocapture --test-threads=1 \
+            2>&1 | tee gh493-results/baseline.log
+      - name: Preserve measurements, including failures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gh493-baseline-${{ github.sha }}
+          path: gh493-results/
+          if-no-files-found: error
