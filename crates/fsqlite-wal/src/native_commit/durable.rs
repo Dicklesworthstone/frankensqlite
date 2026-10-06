@@ -781,6 +781,13 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> DurableWriteCoordinator<S, M,
         self.coordinator.initiate_shutdown();
     }
 
+    /// An enclosing storage owner abandoned this exact publication attempt.
+    /// Retain queued metadata and tracked completion while permanently refusing
+    /// reuse. This authorizes close/recovery, not rollback or an abort verdict.
+    pub(crate) fn abandon_batch(&mut self) {
+        self.recovery_required = true;
+    }
+
     /// Close without silently flushing or discarding a healthy pending batch.
     /// An indeterminate batch may close only after its source-owned write settles.
     ///

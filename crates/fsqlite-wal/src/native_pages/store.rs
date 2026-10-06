@@ -21,7 +21,8 @@ use super::{
     validate_page_size,
 };
 use crate::native_commit::durable::{
-    DurableCommitAcknowledgement, DurableCommitError, DurableWriteCoordinator, NativeObjectCodec,
+    DurableCommitAcknowledgement, DurableCommitError, DurableWriteCoordinator,
+    MAX_NATIVE_VALIDATION_BYTES, NativeObjectCodec,
 };
 use crate::native_commit::{CommitResult, CommitSubmission};
 use crate::native_durability::{
@@ -230,6 +231,41 @@ struct PreparedApply {
     version_count: usize,
     mode: ApplyMode,
 }
+
+struct PageCommitPlan {
+    input_index: usize,
+    seq: CommitSeq,
+    token: TxnToken,
+    capsule: NativePageCapsule,
+}
+
+/// Own unpublished capacity until the complete storage receipt is checked.
+/// A failed/dropped attempt removes only the invisible slots it introduced.
+struct PreparedPageGroup<'a> {
+    history: &'a mut PageHistory,
+    applies: Vec<PreparedApply>,
+    introduced: Vec<PageNumber>,
+}
+
+impl PreparedPageGroup<'_> {
+    fn publish(mut self) {
+        for prepared in self.applies.drain(..) {
+            self.history.apply(prepared);
+        }
+        self.introduced.clear();
+    }
+}
+
+impl Drop for PreparedPageGroup<'_> {
+    fn drop(&mut self) {
+        for page in &self.introduced {
+            if self.history.pages.get(page).is_some_and(Vec::is_empty) {
+                self.history.pages.remove(page);
+            }
+        }
+    }
+}
+
 impl PageHistory {
     fn new(page_size: u32, limits: NativePageLimits) -> Result<Self> {
         validate_page_size(page_size)?;
@@ -262,6 +298,87 @@ impl PageHistory {
             return Err(corrupt("native page store/capsule page-size mismatch"));
         }
         capsule.validate_snapshot(self.tip, |page| self.latest(page))
+    }
+
+    fn validate_group(&self, cx: &Cx, plans: &[PageCommitPlan]) -> Result<()> {
+        let mut tip = self.tip;
+        let mut writes = BTreeMap::new();
+        let mut tokens = HashSet::new();
+        tokens.try_reserve(plans.len()).map_err(|_| FrankenError::OutOfMemory)?;
+        for plan in plans {
+            cx.checkpoint().map_err(|_| FrankenError::Interrupt)?;
+            if tip.get().checked_add(1) != Some(plan.seq.get())
+                || self.tokens.contains(&plan.token) || !tokens.insert(plan.token)
+                || plan.capsule.page_size != self.page_size
+                || plan.capsule.snapshot > self.tip
+            {
+                return Err(corrupt("invalid native page commit group"));
+            }
+            // Replaying only against the pre-batch history would admit write
+            // skew. Earlier members' writes (including tombstones) override
+            // the latest stamp for validation of every later member's reads.
+            plan.capsule.validate_snapshot(tip, |page| {
+                writes.get(&page).copied().unwrap_or_else(|| self.latest(page))
+            })?;
+            for write in &plan.capsule.writes {
+                writes.insert(write.page, plan.seq);
+            }
+            tip = plan.seq;
+        }
+        Ok(())
+    }
+
+    fn projected_group_size(&self, plans: &[PageCommitPlan]) -> Result<(usize, usize)> {
+        let mut versions = self.version_count;
+        let mut bytes = self.payload_bytes;
+        for plan in plans {
+            versions = versions.checked_add(plan.capsule.writes.len())
+                .filter(|n| *n <= self.limits.max_versions).ok_or(FrankenError::TooBig)?;
+            for write in &plan.capsule.writes {
+                bytes = bytes.checked_add(write.data.as_ref().map_or(0, |data| data.len()))
+                    .filter(|n| *n <= self.limits.max_retained_page_bytes)
+                    .ok_or(FrankenError::TooBig)?;
+            }
+        }
+        Ok((versions, bytes))
+    }
+
+    fn prepare_group(&mut self, cx: &Cx, plans: &[PageCommitPlan]) -> Result<PreparedPageGroup<'_>> {
+        self.validate_group(cx, plans)?;
+        self.projected_group_size(plans)?;
+        let total_writes = plans.iter().try_fold(0_usize, |count, plan| {
+            count.checked_add(plan.capsule.writes.len()).ok_or(FrankenError::TooBig)
+        })?;
+        let mut group = PreparedPageGroup {
+            history: self, applies: Vec::new(), introduced: Vec::new(),
+        };
+        group.applies.try_reserve_exact(plans.len()).map_err(|_| FrankenError::OutOfMemory)?;
+        group.introduced.try_reserve_exact(total_writes).map_err(|_| FrankenError::OutOfMemory)?;
+        group.history.tokens.try_reserve(plans.len()).map_err(|_| FrankenError::OutOfMemory)?;
+        let mut version_count = group.history.version_count;
+        let mut payload_bytes = group.history.payload_bytes;
+        for plan in plans {
+            cx.checkpoint().map_err(|_| FrankenError::Interrupt)?;
+            let mut versions = Vec::new();
+            versions.try_reserve_exact(plan.capsule.writes.len()).map_err(|_| FrankenError::OutOfMemory)?;
+            for write in &plan.capsule.writes {
+                if !group.history.pages.contains_key(&write.page) {
+                    group.introduced.push(write.page);
+                }
+                // Each write has a snapshot observation, so ordered validation
+                // rejects overlapping writers. One extra slot per page is enough.
+                group.history.pages.entry(write.page).or_default().try_reserve(1)
+                    .map_err(|_| FrankenError::OutOfMemory)?;
+                versions.push((write.page, Version { seq: plan.seq, data: write.data.clone() }));
+                payload_bytes += write.data.as_ref().map_or(0, |data| data.len());
+            }
+            version_count += plan.capsule.writes.len();
+            group.applies.push(PreparedApply {
+                seq: plan.seq, token: plan.token, versions, payload_bytes,
+                version_count, mode: ApplyMode::Live,
+            });
+        }
+        Ok(group)
     }
     fn projected_size(
         &self,
@@ -426,6 +543,10 @@ pub struct NativePageStore<S: VfsFile, M: VfsFile, C: NativeObjectCodec> {
     closed: bool,
 }
 impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativePageStore<S, M, C> {
+    /// Maximum selected transaction handles in one explicit publication group.
+    /// Aggregate capsule, proof, storage and retained-page limits also apply.
+    pub const MAX_COMMIT_GROUP: usize = 128;
+
     /// Adopt a fresh log. No user data is overwritten and no files are created.
     ///
     /// # Errors
@@ -438,7 +559,10 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativePageStore<S, M, C> {
     ) -> Result<Self> {
         let history = PageHistory::new(page_size, limits)?;
         let codec = Arc::new(codec);
-        let driver = DurableWriteCoordinator::new(log, SharedCodec(Arc::clone(&codec)), 1)?;
+        let driver = DurableWriteCoordinator::new(
+            log, SharedCodec(Arc::clone(&codec)),
+            limits.max_active_transactions.min(Self::MAX_COMMIT_GROUP),
+        )?;
         Ok(Self {
             driver,
             codec,
@@ -486,7 +610,7 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativePageStore<S, M, C> {
             markers,
             storage_limits,
             SharedCodec(Arc::clone(&codec)),
-            1,
+            page_limits.max_active_transactions.min(Self::MAX_COMMIT_GROUP),
             |candidate, _| {
                 let capsule = NativePageCapsule::from_candidate(candidate)?;
                 let prepared = history
@@ -925,8 +1049,8 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativePageStore<S, M, C> {
 
     /// Commit with mandatory page semantics, conflict checks and durable I/O.
     /// Returns `None` for a read-only transaction, which needs no new marker.
-    /// A write conflict or limit failure before staging keeps the overlay active.
-    /// Once staging begins, errors or dropped futures leave both the store and
+    /// A write conflict or limit failure before admission keeps the overlay active.
+    /// Once admitted for publication, errors or dropped futures leave the store and
     /// transaction indeterminate until recovery; no fake rollback is reported.
     ///
     /// # Errors
@@ -937,108 +1061,171 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativePageStore<S, M, C> {
         txn: &mut NativePageTransaction,
         now_unix_ns: u64,
     ) -> Result<Option<DurableCommitAcknowledgement>> {
-        self.transaction(cx, txn)?;
-        if txn.writes.is_empty() {
-            txn.finish(NativePageTransactionState::Committed);
-            return Ok(None);
+        let mut results = self.commit_batch(cx, &mut [txn], now_unix_ns).await?;
+        Ok(results.remove(0))
+    }
+
+    /// Publish an explicit ordered group using one pre-marker sync and one
+    /// post-marker sync. Each writer retains its own capsule, proof, marker,
+    /// sequence and acknowledgement. Read-only members get `None` and consume
+    /// no sequence. Output positions match the supplied handle positions.
+    ///
+    /// Admission validates all members before changing any transaction state.
+    /// Later writers see earlier members' speculative version stamps during
+    /// validation, preventing write skew even with disjoint write sets. Page
+    /// budgets include the whole group and every pinned historical image.
+    /// Encoding, proof admission and publication capacity are prepared before
+    /// I/O; no page becomes visible until the complete receipt is checked.
+    ///
+    /// This shares durability barriers, NOT cross-transaction crash atomicity.
+    /// A torn marker append can leave a committed prefix. After admission any
+    /// error/drop leaves every selected writer indeterminate and the owner
+    /// recovery-blocked; it does not declare them all aborted. Read-only members
+    /// stay active on failure. The caller retains the external append lease
+    /// through outstanding source writes, close and recovery, as for `commit`.
+    ///
+    /// # Errors
+    /// Rejects foreign/finished handles, oversized groups, stale observations,
+    /// resource limits and codec failures before admission. Propagates VFS and
+    /// cancellation errors without inventing a durability or rollback verdict.
+    pub async fn commit_batch(
+        &mut self,
+        cx: &Cx,
+        transactions: &mut [&mut NativePageTransaction],
+        now_unix_ns: u64,
+    ) -> Result<Vec<Option<DurableCommitAcknowledgement>>> {
+        self.ready(cx)?;
+        if transactions.len() > Self::MAX_COMMIT_GROUP {
+            return Err(FrankenError::TooBig);
         }
-        let capsule = NativePageCapsule {
-            page_size: self.history.page_size,
-            snapshot: txn.snapshot,
-            reads: txn.reads.iter().map(|(page, seq)| (*page, *seq)).collect(),
-            writes: txn
-                .writes
-                .iter()
-                .map(|(page, data)| NativePageWrite {
-                    page: *page,
-                    data: data.clone(),
-                })
-                .collect(),
-        };
-        self.history.validate(&capsule)?;
-        if self
-            .history
-            .projected_size(&capsule, ApplyMode::Live)
-            .is_err()
-        {
-            // Start a complete pressure sweep, including pages visited before
-            // older pins were released. This happens before encoding/staging,
-            // so refusal or cancellation leaves the private transaction active.
+        if self.driver.pending_count() != 0 {
+            return Err(FrankenError::BusyRecovery);
+        }
+        let mut results = Vec::new();
+        results.try_reserve_exact(transactions.len()).map_err(|_| FrankenError::OutOfMemory)?;
+        results.resize_with(transactions.len(), || None);
+        let mut plans = Vec::new();
+        plans.try_reserve_exact(transactions.len()).map_err(|_| FrankenError::OutOfMemory)?;
+        let mut seq = self.history.tip;
+        let mut canonical_bytes = 0_usize;
+        for (input_index, txn) in transactions.iter().enumerate() {
+            self.transaction(cx, txn)?;
+            if txn.writes.is_empty() {
+                continue;
+            }
+            let capsule = NativePageCapsule {
+                page_size: self.history.page_size,
+                snapshot: txn.snapshot,
+                reads: txn.reads.iter().map(|(page, seq)| (*page, *seq)).collect(),
+                writes: txn.writes.iter().map(|(page, data)| NativePageWrite {
+                    page: *page, data: data.clone(),
+                }).collect(),
+            };
+            canonical_bytes = canonical_bytes.checked_add(capsule.encoded_len()?)
+                .filter(|n| *n <= MAX_NATIVE_VALIDATION_BYTES).ok_or(FrankenError::TooBig)?;
+            seq = seq.get().checked_add(1).map(CommitSeq::new).ok_or(FrankenError::DatabaseFull)?;
+            plans.push(PageCommitPlan { input_index, seq, token: txn.token, capsule });
+        }
+        self.history.validate_group(cx, &plans)?;
+        if plans.is_empty() {
+            for txn in transactions.iter_mut() {
+                txn.finish(NativePageTransactionState::Committed);
+            }
+            return Ok(results);
+        }
+        if self.history.projected_group_size(&plans).is_err() {
+            // Reclaim before encoding or admission, while every selected and
+            // unselected reader still pins its original snapshot.
             self.history.reclaim_after = None;
             self.reclaim_history(cx, self.history.pages.len().max(1))?;
-            self.history.projected_size(&capsule, ApplyMode::Live)?;
+            self.history.projected_group_size(&plans)?;
         }
-        let bytes = capsule.to_bytes()?;
-        let records = self.codec.encode(cx, &bytes)?;
-        let object_id = records
-            .first()
-            .ok_or_else(|| corrupt("native page encoder returned no symbols"))?
-            .object_id;
-        if self.codec.decode(cx, object_id, &records)? != bytes {
-            return Err(corrupt("native page codec changed canonical capsule bytes"));
+        let mut encoded = Vec::new();
+        let mut submissions = Vec::new();
+        encoded.try_reserve_exact(plans.len()).map_err(|_| FrankenError::OutOfMemory)?;
+        submissions.try_reserve_exact(plans.len()).map_err(|_| FrankenError::OutOfMemory)?;
+        // Bound encoded storage independently of decoded capsule metadata;
+        // neither budget is a total RSS bound or a replacement for codec limits.
+        let mut buffered = 0_usize;
+        for plan in &plans {
+            cx.checkpoint().map_err(|_| FrankenError::Interrupt)?;
+            let bytes = plan.capsule.to_bytes()?;
+            let records = self.codec.encode(cx, &bytes)?;
+            let object_id = records.first()
+                .ok_or_else(|| corrupt("native page encoder returned no symbols"))?.object_id;
+            for record in &records {
+                if record.object_id != object_id || record.symbol_data.len()
+                    != usize::try_from(record.oti.t).map_err(|_| FrankenError::TooBig)?
+                {
+                    return Err(corrupt("inconsistent encoded native page group"));
+                }
+                buffered = buffered.checked_add(record.symbol_data.len())
+                    .and_then(|n| n.checked_add(76))
+                    .filter(|n| *n <= MAX_NATIVE_VALIDATION_BYTES).ok_or(FrankenError::TooBig)?;
+            }
+            if self.codec.decode(cx, object_id, &records)? != bytes {
+                return Err(corrupt("native page codec changed canonical capsule bytes"));
+            }
+            submissions.push(CommitSubmission {
+                capsule_object_id: object_id, capsule_digest: *blake3::hash(&bytes).as_bytes(),
+                write_set_pages: plan.capsule.writes.iter().map(|write| write.page).collect(),
+                witness_refs: Vec::new(), edge_ids: Vec::new(), merge_witness_ids: Vec::new(),
+                txn_token: plan.token, begin_seq: plan.capsule.snapshot,
+            });
+            encoded.push((object_id, records));
         }
-        let seq = self
-            .history
-            .tip
-            .get()
-            .checked_add(1)
-            .map(CommitSeq::new)
-            .ok_or(FrankenError::DatabaseFull)?;
-        let prepared = self
-            .history
-            .prepare(&capsule, seq, txn.token, ApplyMode::Live)?;
-        let submission = CommitSubmission {
-            capsule_object_id: object_id,
-            capsule_digest: *blake3::hash(&bytes).as_bytes(),
-            write_set_pages: capsule.writes.iter().map(|write| write.page).collect(),
-            witness_refs: Vec::new(),
-            edge_ids: Vec::new(),
-            merge_witness_ids: Vec::new(),
-            txn_token: txn.token,
-            begin_seq: txn.snapshot,
-        };
-        if cx.checkpoint().is_err() {
-            // Preparation may have precreated invisible page slots. A caller
-            // can retry after cancellation, so do not retain empty metadata
-            // for arbitrarily many abandoned, never-committed page numbers.
-            self.history
-                .pages
-                .retain(|_, versions| !versions.is_empty());
-            return Err(FrankenError::Interrupt);
-        }
+        let prepared = self.history.prepare_group(cx, &plans)?;
+        let reserved = self.driver.queue_batch(cx, submissions, now_unix_ns).map_err(commit_error)?;
+        // queue_batch never leaves a prefix on a preflight error. After it
+        // succeeds, arm every writer before any possible cancellation or I/O.
         self.recovery_required = true;
-        txn.state = NativePageTransactionState::Indeterminate;
-        self.driver.stage_symbols(cx, &records).await?;
-        let reserved = self
-            .driver
-            .queue(cx, submission, now_unix_ns)
-            .map_err(commit_error)?;
-        if reserved != seq {
+        for plan in &plans {
+            transactions[plan.input_index].state = NativePageTransactionState::Indeterminate;
+        }
+        if !reserved.iter().copied().eq(plans.iter().map(|plan| plan.seq)) {
             return Err(corrupt("native page/coordinator reservation mismatch"));
         }
-        let history = &self.history;
-        self.driver
+        for (_, records) in &encoded {
+            self.driver.stage_symbols(cx, records).await?;
+        }
+        let receipt = self.driver
             .flush(cx, |candidates, _| {
-                if candidates.len() != 1 {
+                if candidates.len() != plans.len() {
                     return Err(corrupt("unexpected native page publication batch"));
                 }
-                let decoded = NativePageCapsule::from_candidate(&candidates[0])?;
-                if decoded != capsule || candidates[0].proof.commit_seq != seq {
-                    return Err(corrupt("native page publication changed after preparation"));
+                for (candidate, plan) in candidates.iter().zip(&plans) {
+                    let decoded = NativePageCapsule::from_candidate(candidate)?;
+                    if decoded != plan.capsule || candidate.proof.commit_seq != plan.seq
+                        || candidate.proof.submission.txn_token != plan.token
+                    {
+                        return Err(corrupt("native page publication changed after preparation"));
+                    }
                 }
-                history.validate(&decoded)
+                prepared.history.validate_group(cx, &plans)
             })
             .await?
             .ok_or_else(|| corrupt("native page commit produced no storage receipt"))?;
-        let acknowledgement = self
-            .driver
-            .take_committed(seq)
-            .ok_or_else(|| corrupt("native page commit produced no acknowledgement"))?;
-        // All page vector/token capacity was reserved before the first write.
-        self.history.apply(prepared);
+        if receipt.commits != plans.len() || receipt.first_seq != plans[0].seq
+            || receipt.last_seq != seq
+        {
+            return Err(corrupt("native page group receipt mismatch"));
+        }
+        for (plan, (object_id, _)) in plans.iter().zip(&encoded) {
+            let ack = self.driver.take_committed(plan.seq)
+                .ok_or_else(|| corrupt("native page commit produced no acknowledgement"))?;
+            if ack.txn_token != plan.token || ack.capsule_object_id != *object_id {
+                return Err(corrupt("native page group acknowledgement mismatch"));
+            }
+            results[plan.input_index] = Some(ack);
+        }
+        // All page vectors, token slots and result slots were reserved before
+        // I/O. No await or codec separates publication from handle completion.
+        prepared.publish();
         self.recovery_required = false;
-        txn.finish(NativePageTransactionState::Committed);
-        Ok(Some(acknowledgement))
+        for txn in transactions.iter_mut() {
+            txn.finish(NativePageTransactionState::Committed);
+        }
+        Ok(results)
     }
 
     /// Close the owned log, refusing to release it beneath a pending VFS write.
@@ -1048,6 +1235,9 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativePageStore<S, M, C> {
     /// Propagates pending-write and VFS close errors; retry remains available.
     pub fn close(&mut self, cx: &Cx) -> Result<()> {
         self.closed = true;
+        if self.recovery_required {
+            self.driver.abandon_batch();
+        }
         self.driver.close(cx)
     }
 }
