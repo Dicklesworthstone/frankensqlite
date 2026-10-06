@@ -378,7 +378,15 @@ mod tests {
         with_runtime(async {
             let directory = tempfile::tempdir().unwrap().keep();
             let source = directory.join(std::ffi::OsString::from_vec(b"source-\xff.db".to_vec()));
-            host_fs::write(&source, b"untouched").unwrap();
+            // A filesystem that accepts only UTF-8 names (APFS, or ZFS with
+            // utf8only) refuses this one with EILSEQ. The request still names
+            // a non-UTF-8 path and must still be refused before recovery.
+            const EILSEQ: i32 = if cfg!(target_vendor = "apple") { 92 } else { 84 };
+            let created = match host_fs::write(&source, b"untouched") {
+                Ok(()) => true,
+                Err(FrankenError::Io(error)) if error.raw_os_error() == Some(EILSEQ) => false,
+                Err(error) => panic!("create the non-UTF-8 source fixture: {error}"),
+            };
             let options = WalRecoveryOptions::new(&source, directory.join("new-backup.wal"));
             let cx = attached_context();
             assert!(matches!(
@@ -386,7 +394,9 @@ mod tests {
                 Err(FrankenError::CannotOpen { .. })
             ));
             assert!(!options.destination.exists());
-            assert_eq!(host_fs::read(&source).unwrap(), b"untouched");
+            if created {
+                assert_eq!(host_fs::read(&source).unwrap(), b"untouched");
+            }
         });
     }
 }

@@ -55,6 +55,32 @@ fn snapshot_directory_files(
         .collect()
 }
 
+/// On Apple targets, accept a change to only the `-shm` ctime.
+///
+/// XNU updates a file's ctime when the last writable `MAP_SHARED` mapping of
+/// it is torn down, even when nothing was written; a read-only mapping does
+/// not. A read-write connection maps `-shm` read-write, as stock SQLite does,
+/// so its close moves that ctime. Measured on macOS 26.2 (APFS): a C probe
+/// that maps read-write, reads and unmaps changes ctime every time, and not
+/// while another writable mapping is held; upstream SQLite 3.53.2 as a lone
+/// reader of a persistent `-shm` changes both its ctime and its mtime on every
+/// read. The `-shm` bytes and mtime, and every other artifact's ctime, are
+/// still compared exactly.
+#[cfg(all(feature = "native", target_vendor = "apple"))]
+fn accept_apple_last_writable_unmap_ctime(
+    before: &std::collections::BTreeMap<std::ffi::OsString, FileSnapshot>,
+    after: &mut std::collections::BTreeMap<std::ffi::OsString, FileSnapshot>,
+    shm: &std::path::Path,
+) {
+    let name = shm.file_name().expect("-shm file name");
+    if let (Some(expected), Some(observed)) = (before.get(name), after.get_mut(name))
+        && observed.bytes == expected.bytes
+        && observed.modified == expected.modified
+    {
+        observed.changed = expected.changed;
+    }
+}
+
 #[cfg(all(feature = "native", any(unix, windows)))]
 fn suffixed_path(path: &std::path::Path, suffix: &str) -> std::path::PathBuf {
     let mut suffixed = path.as_os_str().to_owned();
@@ -1157,8 +1183,12 @@ fn gh294_default_flags_schema_only_open_preserves_every_database_artifact() {
                     .expect("close schema-only default-flag connection without a checkpoint");
             }
 
+            #[cfg_attr(not(target_vendor = "apple"), allow(unused_mut))]
+            let mut after = snapshot_directory_files(dir.path());
+            #[cfg(target_vendor = "apple")]
+            accept_apple_last_writable_unmap_ctime(&before, &mut after, &suffixed_path(&path, "-shm"));
             assert_eq!(
-                snapshot_directory_files(dir.path()),
+                after,
                 before,
                 "GH #294 default-flag schema-only open/query (close_with_checkpoint={close_with_checkpoint}) must preserve exact artifact keys plus all bytes, modification times, and Unix change times"
             );
