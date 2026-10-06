@@ -10571,27 +10571,211 @@ fn statement_is_raise_select(statement: &Statement) -> bool {
     let SelectCore::Select { columns, .. } = &select.body.select else {
         return false;
     };
-    if columns.len() != 1 {
+    if !select.body.compounds.is_empty() {
         return false;
     }
-    let ResultColumn::Expr { expr, .. } = &columns[0] else {
-        return false;
-    };
-    matches!(expr, Expr::Raise { .. }) || case_wrapped_raise_directive(expr).is_some()
+    columns.iter().any(|column| match column {
+        ResultColumn::Expr { expr, .. } => expr_contains_raise(expr),
+        ResultColumn::Star | ResultColumn::TableStar(_) => false,
+    })
 }
 
-/// A `SELECT RAISE(...)` shape that [`trigger_statement_raise_directive`]
-/// does not evaluate directly — one with a FROM clause, GROUP BY / HAVING,
-/// ORDER BY, LIMIT or a WITH clause, such as the constraint idiom
-/// `SELECT RAISE(ABORT, 'dup') FROM u WHERE u.k = NEW.k`. Stock evaluates
-/// the RAISE for each row the SELECT produces, so it fires exactly when the
-/// SELECT yields a row: return the directive and that SELECT with its result
-/// column replaced by `1` (a CASE-wrapped RAISE's condition joins the WHERE).
-/// `None` for shapes this cannot express: a compound SELECT, or a
-/// CASE-wrapped RAISE over a grouped or aggregate SELECT.
-fn trigger_raise_select_row_probe(
+/// Whether `expr` contains a `RAISE(...)` outside its subqueries.
+fn expr_contains_raise(expr: &Expr) -> bool {
+    match expr {
+        Expr::Raise { .. } => true,
+        Expr::BinaryOp { left, right, .. } => expr_contains_raise(left) || expr_contains_raise(right),
+        Expr::UnaryOp { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. }
+        | Expr::IsNull { expr, .. } => expr_contains_raise(expr),
+        Expr::Between {
+            expr, low, high, ..
+        } => expr_contains_raise(expr) || expr_contains_raise(low) || expr_contains_raise(high),
+        Expr::In { expr, set, .. } => {
+            expr_contains_raise(expr)
+                || matches!(set, InSet::List(values) if values.iter().any(expr_contains_raise))
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            expr_contains_raise(expr)
+                || expr_contains_raise(pattern)
+                || escape.as_deref().is_some_and(expr_contains_raise)
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            operand.as_deref().is_some_and(expr_contains_raise)
+                || whens
+                    .iter()
+                    .any(|(when, then)| expr_contains_raise(when) || expr_contains_raise(then))
+                || else_expr.as_deref().is_some_and(expr_contains_raise)
+        }
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter,
+            ..
+        } => {
+            matches!(args, FunctionArgs::List(exprs) if exprs.iter().any(expr_contains_raise))
+                || order_by.iter().any(|term| expr_contains_raise(&term.expr))
+                || filter.as_deref().is_some_and(expr_contains_raise)
+        }
+        Expr::JsonAccess { expr, path, .. } => expr_contains_raise(expr) || expr_contains_raise(path),
+        Expr::RowValue(values, _) => values.iter().any(expr_contains_raise),
+        Expr::Exists { .. }
+        | Expr::Subquery(..)
+        | Expr::BoundOuterValue { .. }
+        | Expr::Literal(_, _)
+        | Expr::Column(_, _)
+        | Expr::Placeholder(_, _) => false,
+    }
+}
+
+/// Map the RAISEs of one trigger SELECT result column to markers: each
+/// `RAISE(...)` in a tail position (the whole column, a CASE branch result at
+/// any depth, an `iif` branch) becomes the integer `n` of the `n`th directive
+/// pushed onto `directives`, and every other tail value becomes NULL, so the
+/// mapped column is non-NULL exactly on a row where stock would reach a RAISE.
+/// `None` when a RAISE sits where this cannot express it (a CASE condition, a
+/// function argument, ...).
+fn map_trigger_raise_tails(
+    expr: &Expr,
+    directives: &mut Vec<TriggerRaiseDirective>,
+) -> Option<RaiseTails> {
+    let null = || Expr::Literal(Literal::Null, Span::ZERO);
+    match expr {
+        Expr::Raise {
+            action, message, ..
+        } => {
+            directives.push(TriggerRaiseDirective {
+                action: *action,
+                message: message.clone(),
+            });
+            let marker = i64::try_from(directives.len()).ok()?;
+            Some(RaiseTails::Mapped(Box::new(Expr::Literal(
+                Literal::Integer(marker),
+                Span::ZERO,
+            ))))
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            span,
+        } => {
+            if operand.as_deref().is_some_and(expr_contains_raise)
+                || whens.iter().any(|(when, _)| expr_contains_raise(when))
+            {
+                return None;
+            }
+            let mut any_raise = false;
+            let mut mapped_whens = Vec::with_capacity(whens.len());
+            for (when, then) in whens {
+                let mapped = match map_trigger_raise_tails(then, directives)? {
+                    RaiseTails::Mapped(mapped) => {
+                        any_raise = true;
+                        *mapped
+                    }
+                    RaiseTails::Absent => null(),
+                };
+                mapped_whens.push((when.clone(), mapped));
+            }
+            let mapped_else = match else_expr.as_deref() {
+                Some(else_expr) => match map_trigger_raise_tails(else_expr, directives)? {
+                    RaiseTails::Mapped(mapped) => {
+                        any_raise = true;
+                        Some(mapped)
+                    }
+                    RaiseTails::Absent => None,
+                },
+                None => None,
+            };
+            if !any_raise {
+                return Some(RaiseTails::Absent);
+            }
+            Some(RaiseTails::Mapped(Box::new(Expr::Case {
+                operand: operand.clone(),
+                whens: mapped_whens,
+                else_expr: mapped_else,
+                span: *span,
+            })))
+        }
+        Expr::FunctionCall {
+            name,
+            args: FunctionArgs::List(args),
+            distinct: false,
+            order_by,
+            filter: None,
+            over: None,
+            span,
+        } if name.eq_ignore_ascii_case("iif") && args.len() == 3 && order_by.is_empty() => {
+            // iif(c, a, b) evaluates like CASE WHEN c THEN a ELSE b END.
+            if expr_contains_raise(&args[0]) {
+                return None;
+            }
+            let then = map_trigger_raise_tails(&args[1], directives)?;
+            let otherwise = map_trigger_raise_tails(&args[2], directives)?;
+            let (then, otherwise) = match (then, otherwise) {
+                (RaiseTails::Absent, RaiseTails::Absent) => return Some(RaiseTails::Absent),
+                (then, otherwise) => (then.into_expr_or(null), otherwise.into_expr_or(null)),
+            };
+            Some(RaiseTails::Mapped(Box::new(Expr::Case {
+                operand: None,
+                whens: vec![(args[0].clone(), then)],
+                else_expr: Some(Box::new(otherwise)),
+                span: *span,
+            })))
+        }
+        _ if expr_contains_raise(expr) => None,
+        _ => Some(RaiseTails::Absent),
+    }
+}
+
+/// What [`map_trigger_raise_tails`] made of an expression.
+enum RaiseTails {
+    /// It reaches no RAISE.
+    Absent,
+    /// Its RAISEs mapped to markers.
+    Mapped(Box<Expr>),
+}
+
+impl RaiseTails {
+    fn into_expr_or(self, absent: impl FnOnce() -> Expr) -> Expr {
+        match self {
+            Self::Absent => absent(),
+            Self::Mapped(expr) => *expr,
+        }
+    }
+}
+
+/// A trigger body SELECT whose result columns reach a `RAISE(...)` that
+/// [`trigger_statement_raise_directive`] does not evaluate directly: one with
+/// a FROM clause, GROUP BY / HAVING, ORDER BY, LIMIT or a WITH clause (the
+/// constraint idiom `SELECT RAISE(ABORT, 'dup') FROM u WHERE u.k = NEW.k`), a
+/// CASE with several RAISE or value branches, a simple `CASE x WHEN`, an
+/// `iif`, or a RAISE beside other result columns. Stock evaluates the result
+/// columns of each row in scan order (before any ORDER BY sort or DISTINCT
+/// dedup), left to right, and stops at the first RAISE it reaches.
+///
+/// Returns the RAISE directives in marker order, the probe SELECT (every
+/// RAISE-bearing column mapped by [`map_trigger_raise_tails`], every other
+/// column kept so aggregate queries stay aggregate; DISTINCT dropped, ORDER BY
+/// dropped unless a LIMIT keeps it, OFFSET folded into that LIMIT), and the
+/// probe positions of the mapped columns. When the SELECT is a plain filter (no
+/// aggregate, GROUP BY, HAVING, window or LIMIT) the probe also keeps only
+/// rows that reach a RAISE and stops at the first one. `None` for a compound
+/// SELECT, a `*` column, or a RAISE this cannot express.
+fn trigger_raise_select_marker_probe(
     statement: &Statement,
-) -> Option<(TriggerRaiseDirective, SelectStatement)> {
+) -> Option<(Vec<TriggerRaiseDirective>, SelectStatement, Vec<usize>)> {
     let Statement::Select(select) = statement else {
         return None;
     };
@@ -10599,49 +10783,98 @@ fn trigger_raise_select_row_probe(
         return None;
     }
     let mut probe = select.clone();
+    // Stock computes the result columns of each row as its scan produces it,
+    // before an ORDER BY sorter (or a DISTINCT dedup) sees the row, so with no
+    // LIMIT every row the WHERE admits is evaluated, in scan order. A LIMIT
+    // with no ORDER BY stops the scan early. With both, stock's top-N sorter
+    // evaluates only the rows that can still enter its LIMIT + OFFSET rows;
+    // the probe keeps the ORDER BY and evaluates that final top-N in sorted
+    // order (it differs from stock only in which RAISE wins when several rows
+    // of the top-N reach different ones, or a row is later pushed out).
+    if !probe.order_by.is_empty() {
+        match probe.limit.take() {
+            None => probe.order_by.clear(),
+            Some(LimitClause { limit, offset }) => {
+                let rows = match offset {
+                    None => limit,
+                    Some(offset) => Expr::BinaryOp {
+                        left: Box::new(limit),
+                        op: BinaryOp::Add,
+                        right: Box::new(offset),
+                        span: Span::ZERO,
+                    },
+                };
+                probe.limit = Some(LimitClause {
+                    limit: rows,
+                    offset: None,
+                });
+            }
+        }
+    }
+    let plain_limit = probe.limit.is_none();
     let SelectCore::Select {
+        distinct,
         columns,
         where_clause,
         group_by,
         having,
+        windows,
         ..
     } = &mut probe.body.select
     else {
         return None;
     };
-    let [ResultColumn::Expr { expr, .. }] = columns.as_slice() else {
-        return None;
-    };
-    let directive = if let Expr::Raise {
-        action, message, ..
-    } = expr
-    {
-        TriggerRaiseDirective {
-            action: *action,
-            message: message.clone(),
-        }
-    } else {
-        let (action, message, condition) = case_wrapped_raise_directive(expr)?;
-        if !group_by.is_empty() || having.is_some() || expr_has_aggregate(condition) {
+    let mut directives = Vec::new();
+    let mut marker_positions = Vec::new();
+    let mut hit: Option<Expr> = None;
+    let mut aggregate = false;
+    for (position, column) in columns.iter_mut().enumerate() {
+        let ResultColumn::Expr { expr, .. } = column else {
             return None;
+        };
+        aggregate |= expr_has_aggregate(expr);
+        if let RaiseTails::Mapped(mapped) = map_trigger_raise_tails(expr, &mut directives)? {
+            let reached = Expr::IsNull {
+                expr: mapped.clone(),
+                not: true,
+                span: Span::ZERO,
+            };
+            hit = Some(match hit.take() {
+                Some(previous) => Expr::BinaryOp {
+                    left: Box::new(previous),
+                    op: BinaryOp::Or,
+                    right: Box::new(reached),
+                    span: Span::ZERO,
+                },
+                None => reached,
+            });
+            *expr = *mapped;
+            marker_positions.push(position);
         }
-        let condition = condition.clone();
+    }
+    let hit = hit?;
+    *distinct = Distinctness::All;
+    if plain_limit
+        && !aggregate
+        && group_by.is_empty()
+        && having.is_none()
+        && windows.is_empty()
+    {
         *where_clause = Some(Box::new(match where_clause.take() {
             Some(existing) => Expr::BinaryOp {
                 left: existing,
                 op: BinaryOp::And,
-                right: Box::new(condition),
+                right: Box::new(hit),
                 span: Span::ZERO,
             },
-            None => condition,
+            None => hit,
         }));
-        TriggerRaiseDirective { action, message }
-    };
-    *columns = vec![ResultColumn::Expr {
-        expr: Expr::Literal(Literal::Integer(1), Span::ZERO),
-        alias: None,
-    }];
-    Some((directive, probe))
+        probe.limit = Some(LimitClause {
+            limit: Expr::Literal(Literal::Integer(1), Span::ZERO),
+            offset: None,
+        });
+    }
+    Some((directives, probe, marker_positions))
 }
 
 fn select_is_plain_count_star(select: &SelectStatement) -> bool {
@@ -39470,6 +39703,22 @@ impl Connection {
                 "cannot modify {name} because it is a view"
             )));
         }
+        // An explicit `main.X` DML target must not fall through to a TEMP-only
+        // X in the merged visible schema; stock fails `no such table: main.X`
+        // (a persistent trigger's pinned body depends on this too, bd-f5s4w).
+        let dml_target = match statement {
+            Statement::Insert(insert) => Some(&insert.table),
+            Statement::Update(update) => Some(&update.table.name),
+            Statement::Delete(delete) => Some(&delete.table.name),
+            _ => None,
+        };
+        if let Some(target) = dml_target
+            && self.main_target_is_temp_only(target)
+        {
+            return Err(FrankenError::NoSuchTable {
+                name: format!("main.{}", target.name),
+            });
+        }
         match statement {
             Statement::CreateTable(create) => {
                 Box::pin(self.execute_create_table(create)).await?;
@@ -47722,6 +47971,7 @@ impl Connection {
             return Ok(true);
         }
         Ok(self.targets_shadowed_main(&insert.table)
+            || self.main_target_is_temp_only(&insert.table)
             || fts5_maintenance_insert_command(insert).is_some()
             || self.attached_target_schema(&insert.table)?.is_some())
     }
@@ -47732,6 +47982,7 @@ impl Connection {
     ) -> Result<bool> {
         let registry = self.attached_schemas.borrow();
         Ok(self.targets_shadowed_main(&update.table.name)
+            || self.main_target_is_temp_only(&update.table.name)
             || determine_attached_update_schema(update, &registry)?.is_some())
     }
 
@@ -47741,6 +47992,7 @@ impl Connection {
     ) -> Result<bool> {
         let registry = self.attached_schemas.borrow();
         Ok(self.targets_shadowed_main(&delete.table.name)
+            || self.main_target_is_temp_only(&delete.table.name)
             || determine_attached_delete_schema(delete, &registry)?.is_some())
     }
 
@@ -71333,11 +71585,16 @@ impl Connection {
 
     /// Verify that changing FK-referenced parent values doesn't orphan children.
     /// bd-f5s4w: whether `trigger`'s statements must have their relations
-    /// pinned to MAIN — a non-TEMP trigger while some TEMP table shadows a
-    /// main table of the same name (otherwise every unqualified name already
-    /// resolves to the main table, and nothing is rewritten).
+    /// pinned to MAIN — a non-TEMP trigger while any TEMP table or view
+    /// exists. Stock binds a persistent trigger's unqualified names to its own
+    /// schema, so a TEMP object must capture neither a name it shadows nor a
+    /// name only TEMP has (`no such table: main.x`). With no TEMP object every
+    /// unqualified name already resolves to MAIN, and nothing is rewritten.
     fn trigger_pins_main_relations(&self, trigger: &TriggerDef) -> bool {
-        !trigger.temporary && !self.shadowed_main_tables.borrow().is_empty()
+        !trigger.temporary
+            && (!self.shadowed_main_tables.borrow().is_empty()
+                || !self.temp_table_names.borrow().is_empty()
+                || self.views.borrow().iter().any(|view| view.temporary))
     }
 
     fn has_matching_triggers(
@@ -71509,21 +71766,36 @@ impl Connection {
                 return self.apply_trigger_raise(directive).await;
             }
         }
-        // Reaching here with a RAISE-shaped SELECT means either the WHERE
-        // predicate of a directly evaluated RAISE was false, or the SELECT has
-        // a shape evaluated as a row probe (a FROM clause, GROUP BY, ...): the
-        // RAISE fires when the probe yields a row. We must NOT fall through to
-        // execute_statement because the general execution path cannot
-        // evaluate Expr::Raise as a value.
+        // Reaching here with a RAISE-bearing SELECT means either the WHERE
+        // predicate of a directly evaluated RAISE was false, or the SELECT is
+        // evaluated as a marker probe (a FROM clause, GROUP BY, a multi-branch
+        // CASE, ...): the first row's leftmost marker names the RAISE stock
+        // reaches first. We must NOT fall through to execute_statement because
+        // the general execution path cannot evaluate Expr::Raise as a value.
         if statement_is_raise_select(&statement) {
             if trigger_statement_raise_directive(&statement).is_none()
-                && let Some((directive, probe)) = trigger_raise_select_row_probe(&statement)
-                && !self
-                    .execute_statement(&Statement::Select(probe), None)
-                    .await?
-                    .is_empty()
+                && let Some((mut directives, probe, marker_positions)) =
+                    trigger_raise_select_marker_probe(&statement)
             {
-                return self.apply_trigger_raise(directive).await;
+                let rows = self
+                    .execute_statement(&Statement::Select(probe), None)
+                    .await?;
+                let reached = rows.iter().find_map(|row| {
+                    let values = row.values();
+                    marker_positions.iter().find_map(|&position| {
+                        match values.get(position) {
+                            Some(SqliteValue::Integer(marker)) => usize::try_from(*marker)
+                                .ok()
+                                .and_then(|marker| marker.checked_sub(1)),
+                            _ => None,
+                        }
+                    })
+                });
+                if let Some(index) = reached
+                    && index < directives.len()
+                {
+                    return self.apply_trigger_raise(directives.swap_remove(index)).await;
+                }
             }
             return Ok(TriggerStatementOutcome::Continue);
         }
@@ -82745,6 +83017,22 @@ impl Connection {
                 .shadowed_main_tables
                 .borrow()
                 .contains_key(&target.name.to_ascii_lowercase())
+    }
+
+    /// Whether `target` is qualified `main.` but names a table only TEMP has
+    /// (a TEMP table that shadows nothing in MAIN). The merged visible schema
+    /// would resolve it to the TEMP table; stock reports `no such table`.
+    fn main_target_is_temp_only(&self, target: &fsqlite_ast::QualifiedName) -> bool {
+        if !target
+            .schema
+            .as_deref()
+            .is_some_and(|schema| schema.eq_ignore_ascii_case("main"))
+        {
+            return false;
+        }
+        let name = target.name.to_ascii_lowercase();
+        self.temp_table_names.borrow().contains(&name)
+            && !self.shadowed_main_tables.borrow().contains_key(&name)
     }
 
     /// Replace only an explicitly `main.`-qualified DML target in a disposable
