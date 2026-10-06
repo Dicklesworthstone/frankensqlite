@@ -452,7 +452,7 @@ impl<S: VfsFile, M: VfsFile> NativeDurabilityLog<S, M> {
             .map_err(|_| FrankenError::OutOfMemory)?;
         for location in locations {
             checkpoint(cx)?;
-            let mut bytes = zeroed(location.len())?;
+            let mut bytes = zeroed(location.len)?;
             read_exact_at(&self.symbols, cx, &mut bytes, location.offset).await?;
             if symbol_wire_len(&bytes, self.limits)? != location.len {
                 return Err(corrupt("native object locator length mismatch"));
