@@ -36071,6 +36071,38 @@ fn in_probe_value_affinity(probe_source: &InProbeSource<'_>, probe_scan: &ScanCt
     }
 }
 
+/// Whether the IN subquery's probe value carries an affinity of its own
+/// (`expr_has_declared_affinity`): the rowid and a column do, a computed
+/// expression only through a CAST or a declared column.
+fn in_probe_value_has_declared_affinity(
+    probe_source: &InProbeSource<'_>,
+    probe_scan: &ScanCtx<'_>,
+) -> bool {
+    match probe_source.value {
+        InProbeValue::Rowid | InProbeValue::FirstColumn => true,
+        InProbeValue::Expr(expr) => expr_has_declared_affinity(expr, Some(probe_scan)),
+    }
+}
+
+/// The comparison affinity of `operand IN (SELECT probe ...)`, as SQLite's
+/// `exprINAffinity` computes it with `sqlite3CompareAffinity`: when both sides
+/// carry an affinity and neither is numeric, nothing is converted, so a
+/// typeless column compared with a TEXT column keeps its integers (GH#428's
+/// rule for `=`, which the IN-subquery lanes did not apply).
+fn in_probe_comparison_affinity(
+    operand_affinity: u8,
+    operand_declared: bool,
+    probe_source: &InProbeSource<'_>,
+    probe_scan: &ScanCtx<'_>,
+) -> u16 {
+    combine_declared_comparison_affinity(
+        operand_affinity,
+        operand_declared,
+        in_probe_value_affinity(probe_source, probe_scan),
+        in_probe_value_has_declared_affinity(probe_source, probe_scan),
+    )
+}
+
 /// Resolve the collation for `lhs IN (SELECT rhs ...)` with SQLite's
 /// comparison precedence: explicit COLLATE on either side (left wins a tie),
 /// then a declared column collation (again left before right).
@@ -36678,12 +36710,21 @@ fn try_emit_complex_in_subquery(
         && distinct_projection_mode == OrderedDistinctProjectionMode::ReprojectRepresentative
         && !table.without_rowid;
 
-    let probe_aff = in_probe_value_affinity(&probe_source, &subq_scan);
-    let operand_affinity = scalar_operand.map_or_else(
-        || expr_affinity(operand, Some(scan_ctx)),
-        |metadata| metadata.affinity,
+    let (operand_affinity, operand_declared) = scalar_operand.map_or_else(
+        || {
+            (
+                expr_affinity(operand, Some(scan_ctx)),
+                expr_has_declared_affinity(operand, Some(scan_ctx)),
+            )
+        },
+        |metadata| (metadata.affinity, metadata.affinity != b'A'),
     );
-    let comparison_affinity = combine_comparison_affinity(operand_affinity, probe_aff);
+    let comparison_affinity = in_probe_comparison_affinity(
+        operand_affinity,
+        operand_declared,
+        &probe_source,
+        &subq_scan,
+    );
     let comparison_affinity_string = u8::try_from(comparison_affinity)
         .ok()
         .filter(|&code| code != 0)
@@ -37380,9 +37421,12 @@ fn emit_in_probe_expr(
     emit_in_probe_value(b, probe_cursor, &probe_source, r_probe, &probe_scan);
     // Apply the comparison affinity between the outer operand and the subquery
     // probe column, mirroring `=`/value-list IN coercion (bd-56aj2 IN-subquery).
-    let probe_aff = in_probe_value_affinity(&probe_source, &probe_scan);
-    let probe_aff_p5 =
-        combine_comparison_affinity(expr_affinity(operand, Some(scan_ctx)), probe_aff);
+    let probe_aff_p5 = in_probe_comparison_affinity(
+        expr_affinity(operand, Some(scan_ctx)),
+        expr_has_declared_affinity(operand, Some(scan_ctx)),
+        &probe_source,
+        &probe_scan,
+    );
     let comparison_collation =
         in_probe_comparison_collation(operand, scan_ctx, &probe_source, &probe_scan)
             .map_or(P4::None, P4::Collation);
@@ -38807,10 +38851,11 @@ fn emit_once_materialized_in_probe_source(
     // Apply the comparison affinity between the outer operand and the subquery
     // probe column to both the materialized values and the probe key, mirroring
     // the per-row IN-subquery path (bd-56aj2 IN-subquery).
-    let probe_aff = in_probe_value_affinity(probe_source, &probe_scan);
-    let in_aff_str: Option<String> = u8::try_from(combine_comparison_affinity(
+    let in_aff_str: Option<String> = u8::try_from(in_probe_comparison_affinity(
         expr_affinity(operand, Some(scan_ctx)),
-        probe_aff,
+        expr_has_declared_affinity(operand, Some(scan_ctx)),
+        probe_source,
+        &probe_scan,
     ))
     .ok()
     .filter(|&code| code != 0)

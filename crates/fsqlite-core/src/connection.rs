@@ -92461,10 +92461,15 @@ impl Connection {
             .collect::<Vec<_>>();
 
         // Use the join materializer for sources the table compiler cannot
-        // scan directly, even when there is only one FROM source.
-        let has_join = from.as_ref().is_some_and(|f| {
-            !f.joins.is_empty() || !matches!(&f.source, TableOrSubquery::Table { .. })
-        });
+        // scan directly, even when there is only one FROM source. While
+        // `time_travel_active` pins reads to `self.db` (a historical snapshot),
+        // a compiled program would read the live pager instead, so a window
+        // query over a single `FOR SYSTEM_TIME` table takes the materializer
+        // too, as the GROUP BY phase one does.
+        let has_join = self.time_travel_active.get()
+            || from.as_ref().is_some_and(|f| {
+                !f.joins.is_empty() || !matches!(&f.source, TableOrSubquery::Table { .. })
+            });
         let join_sources: Vec<&TableOrSubquery> = from
             .as_ref()
             .map(|from_clause| {
@@ -114712,6 +114717,19 @@ fn flatten_simple_from_subquery_select(select: &SelectStatement) -> Option<Selec
         outer_alias.as_deref(),
         &projection_map,
     )?;
+    // A bare ORDER BY name in the flattened statement is matched against its
+    // result aliases first (SQLite's resolveAsName), so an ORDER BY term the
+    // rewrite turned into an unqualified inner column would be captured by a
+    // result alias spelled like that column:
+    // `SELECT * FROM (SELECT a AS b, b AS a FROM x) ORDER BY a` must order by
+    // x.b, but flattened it reads `... ORDER BY b` and the alias `b` (x.a)
+    // takes it. Keep the subquery for such a statement.
+    if flattened_order_by
+        .iter()
+        .any(|term| order_by_term_captured_by_result_alias(&term.expr, &flattened_columns))
+    {
+        return None;
+    }
 
     let mut flattened = select.clone();
     if let SelectCore::Select {
@@ -114994,6 +115012,37 @@ fn flatten_select_order_by_terms(
         });
     }
     Some(flattened_order_by)
+}
+
+/// Whether a flattened ORDER BY term is a bare unqualified column that a
+/// result alias of another meaning would capture when the flattened statement
+/// resolves it (a bare ORDER BY name matches a result alias first). An alias
+/// whose expression is that same unqualified column means the same thing.
+fn order_by_term_captured_by_result_alias(term: &Expr, columns: &[ResultColumn]) -> bool {
+    let Expr::Column(term_ref, _) = strip_collate_wrappers(term) else {
+        return false;
+    };
+    if term_ref.table.is_some() {
+        return false;
+    }
+    columns.iter().any(|column| {
+        let ResultColumn::Expr {
+            expr,
+            alias: Some(alias),
+        } = column
+        else {
+            return false;
+        };
+        if !alias.eq_ignore_ascii_case(&term_ref.column) {
+            return false;
+        }
+        !matches!(
+            strip_collate_wrappers(expr),
+            Expr::Column(alias_ref, _)
+                if alias_ref.table.is_none()
+                    && alias_ref.column.eq_ignore_ascii_case(&term_ref.column)
+        )
+    })
 }
 
 fn flatten_order_by_terms(
