@@ -7,6 +7,7 @@
 //! an abandoned tracked write settles. The store never creates or deletes files.
 
 use std::collections::{BTreeMap, HashSet};
+use std::ops::Bound::{Excluded, Unbounded};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
@@ -21,9 +22,10 @@ use crate::native_commit::durable::{DurableCommitAcknowledgement, DurableCommitE
 use crate::native_durability::{NativeDurabilityLimits, NativeDurabilityLog, NativeDurabilityRecovery};
 
 /// Retained page payload and metadata bounds, not a process-RSS claim.
-/// All historical versions are retained in this first page-store profile.
-/// Reaching a bound refuses new writes before I/O; it never evicts an old
-/// snapshot's version. Compaction/GC is a separate integration requirement.
+/// Obsolete page versions can be reclaimed, but every open snapshot keeps its
+/// floor version and all newer versions. Admission attempts reclamation before
+/// refusing an over-budget write; pinned history is never evicted. This bounds
+/// retained page images, not caller-held Arcs, object indexes, or durable logs.
 #[derive(Debug, Clone, Copy)]
 pub struct NativePageLimits {
     pub max_retained_page_bytes: usize,
@@ -83,7 +85,9 @@ pub const MAX_NATIVE_SAVEPOINTS: usize = 32;
 /// Already returned page Arcs may outlive it and are caller-owned memory.
 pub struct NativePageTransaction {
     owner: Arc<()>,
-    lease: Option<Arc<()>>,
+    // Pin from BEGIN, not from the first page read: lazy readers need their
+    // entire snapshot even when they have not observed a single page yet.
+    lease: Option<Arc<CommitSeq>>,
     token: TxnToken,
     snapshot: CommitSeq,
     reads: BTreeMap<PageNumber, CommitSeq>,
@@ -140,6 +144,7 @@ struct PageHistory {
     payload_bytes: usize,
     version_count: usize,
     limits: NativePageLimits,
+    reclaim_after: Option<PageNumber>,
 }
 struct PreparedApply {
     seq: CommitSeq,
@@ -155,6 +160,7 @@ impl PageHistory {
         Ok(Self {
             page_size, limits, tip: CommitSeq::ZERO, pages: BTreeMap::new(),
             tokens: HashSet::new(), max_txn_id: 0, payload_bytes: 0, version_count: 0,
+            reclaim_after: None,
         })
     }
     fn at(&self, page: PageNumber, snapshot: CommitSeq) -> Option<&Version> {
@@ -172,17 +178,22 @@ impl PageHistory {
         }
         capsule.validate_snapshot(self.tip, |page| self.latest(page))
     }
-    fn prepare(&mut self, capsule: &NativePageCapsule, seq: CommitSeq, token: TxnToken) -> Result<PreparedApply> {
-        self.validate(capsule)?;
-        if self.tip.get().checked_add(1) != Some(seq.get()) || self.tokens.contains(&token) {
-            return Err(corrupt("noncontiguous or duplicate native page commit"));
-        }
+    fn projected_size(&self, capsule: &NativePageCapsule) -> Result<(usize, usize)> {
         let version_count = self.version_count.checked_add(capsule.writes.len())
             .filter(|count| *count <= self.limits.max_versions).ok_or(FrankenError::TooBig)?;
         let payload_bytes = capsule.writes.iter().try_fold(self.payload_bytes, |total, write| {
             total.checked_add(write.data.as_ref().map_or(0, |data| data.len()))
                 .filter(|n| *n <= self.limits.max_retained_page_bytes).ok_or(FrankenError::TooBig)
         })?;
+        Ok((version_count, payload_bytes))
+    }
+
+    fn prepare(&mut self, capsule: &NativePageCapsule, seq: CommitSeq, token: TxnToken) -> Result<PreparedApply> {
+        self.validate(capsule)?;
+        if self.tip.get().checked_add(1) != Some(seq.get()) || self.tokens.contains(&token) {
+            return Err(corrupt("noncontiguous or duplicate native page commit"));
+        }
+        let (version_count, payload_bytes) = self.projected_size(capsule)?;
         let mut versions = Vec::new();
         versions.try_reserve_exact(capsule.writes.len()).map_err(|_| FrankenError::OutOfMemory)?;
         self.tokens.try_reserve(1).map_err(|_| FrankenError::OutOfMemory)?;
@@ -207,6 +218,39 @@ impl PageHistory {
         self.payload_bytes = prepared.payload_bytes;
         self.version_count = prepared.version_count;
     }
+
+    fn reclaim(&mut self, cx: &Cx, floor: CommitSeq, page_budget: usize) -> Result<usize> {
+        let last_page = self.pages.last_key_value().map(|(page, _)| *page);
+        let start = self.reclaim_after.map_or(Unbounded, Excluded);
+        let mut removed = 0;
+        for (page, versions) in self.pages.range_mut((start, Unbounded)).take(page_budget) {
+            cx.checkpoint().map_err(|_| FrankenError::Interrupt)?;
+            // Keep the newest version <= floor, not merely versions >= floor.
+            // A page unchanged for many commits may have a much older floor.
+            // With no version <= floor, preserve all versions (old absence).
+            let prune = versions.partition_point(|version| version.seq <= floor)
+                .saturating_sub(1);
+            if prune != 0 {
+                let bytes: usize = versions[..prune].iter()
+                    .map(|version| version.data.as_ref().map_or(0, |data| data.len()))
+                    .sum();
+                drop(versions.drain(..prune));
+                versions.shrink_to_fit();
+                self.payload_bytes -= bytes;
+                self.version_count -= prune;
+                removed += prune;
+            }
+            // Update progress and counters per page, so cancellation between
+            // pages leaves a coherent history and a resumable sweep cursor.
+            self.reclaim_after = Some(*page);
+        }
+        if self.reclaim_after >= last_page {
+            self.reclaim_after = None;
+        }
+        // In particular, retain the latest tombstone and the exact token set.
+        // Neither absence/conflict stamps nor replay identity are GC garbage.
+        Ok(removed)
+    }
 }
 
 /// Native full-page snapshot transactions, backed by the existing durable
@@ -223,7 +267,7 @@ pub struct NativePageStore<S: VfsFile, M: VfsFile, C: NativeObjectCodec> {
     codec: Arc<C>,
     history: PageHistory,
     owner: Arc<()>,
-    active: Vec<Weak<()>>,
+    active: Vec<Weak<CommitSeq>>,
     next_txn_id: u64,
     page_high_water: AtomicU64,
     recovery_required: bool,
@@ -298,6 +342,46 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativePageStore<S, M, C> {
     #[must_use]
     pub fn outstanding_write(&self) -> Option<VfsWriteCompletion> { self.driver.outstanding_write() }
 
+    /// Bytes of page images retained by this store, including pinned history.
+    /// This excludes private overlays and Arcs retained by callers, and is not RSS.
+    #[must_use]
+    pub const fn retained_page_bytes(&self) -> usize { self.history.payload_bytes }
+
+    /// Number of retained committed page versions, including tombstones.
+    #[must_use]
+    pub const fn retained_version_count(&self) -> usize { self.history.version_count }
+
+    /// Reclaim obsolete in-memory page versions in a resumable, page-budgeted
+    /// sweep. Returns the number of versions removed by this call. Zero does
+    /// not imply a complete sweep: the visited pages may still be pinned.
+    ///
+    /// Each call visits at most `page_budget` page chains, continuing after the
+    /// last visited page and wrapping at the end. Cancellation is checked at
+    /// page boundaries; a chain's size is bounded by `max_versions`. This is
+    /// not a wall-clock pause bound. Dropped/finished transactions release their
+    /// pins automatically; newly begun transactions cannot move the floor back.
+    ///
+    /// No files, marker records, object locators, or conflict stamps are removed.
+    /// Existing returned page Arcs remain valid and may retain their allocations.
+    /// Exclusive access to this owner prevents BEGIN/publication racing a sweep;
+    /// it does not introduce a transaction-wide or cross-process writer lock.
+    ///
+    /// # Errors
+    /// Rejects zero budget, cancellation, closed or indeterminate storage.
+    /// On cancellation, already reclaimed pages and counters remain consistent.
+    pub fn reclaim_history(&mut self, cx: &Cx, page_budget: usize) -> Result<usize> {
+        self.ready(cx)?;
+        if page_budget == 0 {
+            return Err(FrankenError::OutOfRange {
+                what: "native history page budget".to_owned(), value: "0".to_owned(),
+            });
+        }
+        self.active.retain(|lease| lease.strong_count() != 0);
+        let floor = self.active.iter().filter_map(Weak::upgrade)
+            .map(|pin| *pin).min().unwrap_or(self.history.tip);
+        self.history.reclaim(cx, floor, page_budget)
+    }
+
     fn ready(&self, cx: &Cx) -> Result<()> {
         if self.closed || self.needs_recovery() { return Err(FrankenError::BusyRecovery); }
         cx.checkpoint().map_err(|_| FrankenError::Interrupt)
@@ -320,7 +404,7 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativePageStore<S, M, C> {
         if self.active.len() >= self.history.limits.max_active_transactions { return Err(FrankenError::Busy); }
         let id = TxnId::new(self.next_txn_id).ok_or(FrankenError::DatabaseFull)?;
         self.active.try_reserve(1).map_err(|_| FrankenError::OutOfMemory)?;
-        let lease = Arc::new(());
+        let lease = Arc::new(self.history.tip);
         self.active.push(Arc::downgrade(&lease));
         self.next_txn_id += 1; // TxnId's domain is narrower than u64.
         Ok(NativePageTransaction {
@@ -521,6 +605,14 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativePageStore<S, M, C> {
             writes: txn.writes.iter().map(|(page, data)| NativePageWrite { page: *page, data: data.clone() }).collect(),
         };
         self.history.validate(&capsule)?;
+        if self.history.projected_size(&capsule).is_err() {
+            // Start a complete pressure sweep, including pages visited before
+            // older pins were released. This happens before encoding/staging,
+            // so refusal or cancellation leaves the private transaction active.
+            self.history.reclaim_after = None;
+            self.reclaim_history(cx, self.history.pages.len().max(1))?;
+            self.history.projected_size(&capsule)?;
+        }
         let bytes = capsule.to_bytes()?;
         let records = self.codec.encode(cx, &bytes)?;
         let object_id = records.first().ok_or_else(|| corrupt("native page encoder returned no symbols"))?.object_id;
@@ -762,5 +854,183 @@ mod allocation_savepoint_tests {
         assert!(txn.is_page_dirty(p));
         db.rollback(&mut txn).unwrap();
         assert!(txn.savepoints.is_empty()); db.close(&cx).unwrap();
+    }
+
+    fn put(db: &mut Store, cx: &Cx, p: u32, data: Option<&[u8]>, time: u64) {
+        let mut txn = db.begin(cx).unwrap();
+        db.write_page(cx, &mut txn, page(p), data).unwrap();
+        db.commit(cx, &mut txn, time).expect("publish page version");
+    }
+
+    #[test]
+    fn native_gc_pins_unread_snapshots_and_keeps_each_required_floor() {
+        let cx = Cx::new(); let vfs = MemoryVfs::new(); let mut db = store(&vfs, &cx);
+        put(&mut db, &cx, 9, Some(&[1; 512]), 1);
+        let mut oldest = db.begin(&cx).unwrap(); // Deliberately do not read yet.
+        put(&mut db, &cx, 9, Some(&[2; 512]), 2);
+        let mut middle = db.begin(&cx).unwrap();
+        put(&mut db, &cx, 9, Some(&[3; 512]), 3);
+        assert_eq!(db.reclaim_history(&cx, 1).unwrap(), 0);
+        assert_eq!(db.retained_version_count(), 3);
+        let held = db.read_page(&cx, &mut oldest, page(9)).unwrap().unwrap();
+        assert_eq!(held.as_ref(), &[1; 512]);
+        db.rollback(&mut oldest).unwrap();
+        assert_eq!(db.reclaim_history(&cx, 1).unwrap(), 1);
+        assert_eq!(db.retained_page_bytes(), 1024);
+        assert_eq!(db.read_page(&cx, &mut middle, page(9)).unwrap().unwrap().as_ref(), &[2; 512]);
+        drop(middle); // Dropping, not only explicit rollback, releases a pin.
+        assert_eq!(db.reclaim_history(&cx, 1).unwrap(), 1);
+        assert_eq!(db.retained_version_count(), 1);
+        assert_eq!(db.retained_page_bytes(), 512);
+        assert_eq!(held.as_ref(), &[1; 512], "caller-owned Arc must remain valid");
+        assert_eq!(db.history.latest(page(9)), CommitSeq::new(3));
+        db.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn native_gc_keeps_old_absence_and_latest_deletion_stamps() {
+        let cx = Cx::new(); let vfs = MemoryVfs::new(); let mut db = store(&vfs, &cx);
+        let mut absent = db.begin(&cx).unwrap();
+        put(&mut db, &cx, 19, Some(&[7; 512]), 1);
+        put(&mut db, &cx, 19, None, 2);
+        assert_eq!(db.reclaim_history(&cx, 10).unwrap(), 0);
+        assert!(db.read_page(&cx, &mut absent, page(19)).unwrap().is_none());
+        db.write_page(&cx, &mut absent, page(20), Some(&[8; 512])).unwrap();
+        assert!(matches!(db.commit(&cx, &mut absent, 3).wait(),
+            Err(FrankenError::BusySnapshot { .. })));
+        db.rollback(&mut absent).unwrap();
+        assert_eq!(db.reclaim_history(&cx, 10).unwrap(), 1);
+        assert_eq!(db.retained_page_bytes(), 0);
+        assert_eq!(db.retained_version_count(), 1);
+        assert_eq!(db.history.latest(page(19)), CommitSeq::new(2));
+        let mut next = db.begin(&cx).unwrap();
+        assert!(db.read_page(&cx, &mut next, page(19)).unwrap().is_none());
+        assert_eq!(next.reads[&page(19)], CommitSeq::new(2));
+        assert!(db.allocate_page(&cx, &mut next).unwrap() > page(20));
+        db.rollback(&mut next).unwrap(); db.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn native_gc_sweep_resumes_with_a_budget_and_does_not_change_storage() {
+        let cx = Cx::new(); let vfs = MemoryVfs::new(); let mut db = store(&vfs, &cx);
+        for p in [2, 4, 6] {
+            put(&mut db, &cx, p, Some(&[1; 512]), 1);
+            put(&mut db, &cx, p, Some(&[2; 512]), 2);
+        }
+        let mut objects = file(&vfs, &cx, "objects");
+        let mut markers = file(&vfs, &cx, "markers");
+        let lengths = (objects.file_size(&cx).unwrap(), markers.file_size(&cx).unwrap());
+        for remaining in [5, 4, 3] {
+            assert_eq!(db.reclaim_history(&cx, 1).unwrap(), 1);
+            assert_eq!(db.retained_version_count(), remaining);
+        }
+        assert!(db.history.reclaim_after.is_none());
+        assert_eq!(db.reclaim_history(&cx, 3).unwrap(), 0);
+        assert_eq!(db.retained_page_bytes(), 1536);
+        assert_eq!(lengths, (objects.file_size(&cx).unwrap(), markers.file_size(&cx).unwrap()));
+        assert_eq!(db.committed_tip(), CommitSeq::new(6));
+        assert_eq!(db.history.tokens.len(), 6, "GC must not erase replay identities");
+        objects.close(&cx).unwrap(); markers.close(&cx).unwrap(); db.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn native_gc_retains_a_page_floor_older_than_the_global_snapshot() {
+        let cx = Cx::new(); let vfs = MemoryVfs::new(); let mut db = store(&vfs, &cx);
+        put(&mut db, &cx, 2, Some(&[1; 512]), 1);
+        put(&mut db, &cx, 3, Some(&[2; 512]), 2);
+        put(&mut db, &cx, 3, Some(&[3; 512]), 3);
+        let mut pinned = db.begin(&cx).unwrap(); // Global floor 3; page 2 floor 1.
+        put(&mut db, &cx, 2, Some(&[4; 512]), 4);
+        assert_eq!(db.reclaim_history(&cx, 10).unwrap(), 1);
+        assert_eq!(db.history.pages[&page(2)].len(), 2);
+        assert_eq!(db.read_page(&cx, &mut pinned, page(2)).unwrap().unwrap().as_ref(), &[1; 512]);
+        assert_eq!(db.read_page(&cx, &mut pinned, page(3)).unwrap().unwrap().as_ref(), &[3; 512]);
+        db.rollback(&mut pinned).unwrap(); db.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn native_gc_pressure_allows_repeated_updates_without_raising_page_limits() {
+        let cx = Cx::new(); let vfs = MemoryVfs::new();
+        let log = NativeDurabilityLog::create(&cx, file(&vfs, &cx, "objects"),
+            file(&vfs, &cx, "markers"), NativeDurabilityLimits::default()).unwrap();
+        let limits = NativePageLimits {
+            max_retained_page_bytes: 1024, max_versions: 2, ..NativePageLimits::default()
+        };
+        let mut db = NativePageStore::new(log, TestCodec, 512, limits).unwrap();
+        for value in 1_u8..=64 {
+            put(&mut db, &cx, 7, Some(&[value; 512]), u64::from(value));
+            assert_eq!(db.committed_tip(), CommitSeq::new(u64::from(value)));
+            assert!(db.retained_page_bytes() <= 1024);
+            assert!(db.retained_version_count() <= 2);
+            assert!(!db.needs_recovery());
+        }
+        db.reclaim_history(&cx, 1).unwrap();
+        assert_eq!(db.retained_page_bytes(), 512);
+        let mut view = db.begin(&cx).unwrap();
+        assert_eq!(db.read_page(&cx, &mut view, page(7)).unwrap().unwrap().as_ref(), &[64; 512]);
+        db.rollback(&mut view).unwrap(); db.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn native_gc_pressure_refuses_pinned_excess_and_allows_the_same_txn_to_retry() {
+        let cx = Cx::new(); let vfs = MemoryVfs::new();
+        let log = NativeDurabilityLog::create(&cx, file(&vfs, &cx, "objects"),
+            file(&vfs, &cx, "markers"), NativeDurabilityLimits::default()).unwrap();
+        let limits = NativePageLimits {
+            max_retained_page_bytes: 1024, max_versions: 2, ..NativePageLimits::default()
+        };
+        let mut db = NativePageStore::new(log, TestCodec, 512, limits).unwrap();
+        put(&mut db, &cx, 7, Some(&[1; 512]), 1);
+        let mut old = db.begin(&cx).unwrap();
+        put(&mut db, &cx, 7, Some(&[2; 512]), 2);
+        let mut retry = db.begin(&cx).unwrap();
+        db.write_page(&cx, &mut retry, page(7), Some(&[3; 512])).unwrap();
+        let mut objects = file(&vfs, &cx, "objects");
+        let before = objects.file_size(&cx).unwrap();
+        assert!(matches!(db.commit(&cx, &mut retry, 3).wait(), Err(FrankenError::TooBig)));
+        assert_eq!(objects.file_size(&cx).unwrap(), before);
+        assert_eq!(retry.state(), NativePageTransactionState::Active);
+        assert!(!db.needs_recovery());
+        assert_eq!(db.read_page(&cx, &mut old, page(7)).unwrap().unwrap().as_ref(), &[1; 512]);
+        db.rollback(&mut old).unwrap();
+        db.commit(&cx, &mut retry, 3).expect("same overlay fits after old reader exits");
+        assert_eq!(db.committed_tip(), CommitSeq::new(3));
+        objects.close(&cx).unwrap(); db.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn native_gc_cancellation_and_indeterminate_state_do_not_authorize_reclamation() {
+        let cx = Cx::new(); let vfs = MemoryVfs::new(); let mut db = store(&vfs, &cx);
+        put(&mut db, &cx, 2, Some(&[1; 512]), 1);
+        put(&mut db, &cx, 2, Some(&[2; 512]), 2);
+        assert!(db.reclaim_history(&cx, 0).is_err());
+        let cancelled = Cx::new(); cancelled.cancel();
+        assert!(matches!(db.reclaim_history(&cancelled, 1), Err(FrankenError::Interrupt)));
+        assert_eq!(db.retained_version_count(), 2);
+        db.recovery_required = true; // State-boundary unit test; no uncertain I/O.
+        assert!(matches!(db.reclaim_history(&cx, 1), Err(FrankenError::BusyRecovery)));
+        assert_eq!(db.retained_version_count(), 2);
+        db.recovery_required = false;
+        assert_eq!(db.reclaim_history(&cx, 1).unwrap(), 1);
+        db.close(&cx).unwrap();
+        assert!(db.reclaim_history(&cx, 1).is_err());
+    }
+
+    #[test]
+    fn native_gc_does_not_erase_reads_or_saved_overlay_dependencies() {
+        let cx = Cx::new(); let vfs = MemoryVfs::new(); let mut db = store(&vfs, &cx);
+        put(&mut db, &cx, 2, Some(&[1; 512]), 1);
+        let mut old = db.begin(&cx).unwrap();
+        let point = db.savepoint(&cx, &mut old).unwrap();
+        db.write_page(&cx, &mut old, page(2), Some(&[9; 512])).unwrap();
+        put(&mut db, &cx, 2, Some(&[2; 512]), 2);
+        assert_eq!(db.reclaim_history(&cx, 10).unwrap(), 0);
+        db.rollback_to(&mut old, &point).unwrap();
+        assert_eq!(db.read_page(&cx, &mut old, page(2)).unwrap().unwrap().as_ref(), &[1; 512]);
+        db.write_page(&cx, &mut old, page(3), Some(&[3; 512])).unwrap();
+        assert!(matches!(db.commit(&cx, &mut old, 3).wait(), Err(FrankenError::BusySnapshot { .. })));
+        db.rollback(&mut old).unwrap();
+        assert_eq!(db.reclaim_history(&cx, 10).unwrap(), 1);
+        db.close(&cx).unwrap();
     }
 }
