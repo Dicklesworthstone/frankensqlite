@@ -33215,15 +33215,41 @@ fn extract_index_equality_prefix_exprs<'a>(
     collect_conjunctive_terms(where_expr, &mut conjuncts);
 
     let mut prefix_exprs = Vec::new();
-    for index_column in &index.columns {
+    for (key_pos, index_column) in index.columns.iter().enumerate() {
         let Some(expr) = conjuncts.iter().find_map(|term| {
-            extract_index_column_equality_expr(term, table, table_alias, index_column)
+            let probe = extract_index_column_equality_expr(term, table, table_alias, index_column)?;
+            index_equality_term_uses_key_collation(term, table, table_alias, index, key_pos)
+                .then_some(probe)
         }) else {
             break;
         };
         prefix_exprs.push(expr);
     }
     prefix_exprs
+}
+
+/// Whether an indexable `column = constant` term compares under key term
+/// `key_pos`'s collation, so the index's run of equal keys is exactly the
+/// rows the term matches. SQLite compares under an explicit COLLATE on
+/// either operand (the left one first), else the column's declared
+/// collation. A NOCASE or RTRIM key term under a BINARY comparison holds
+/// extra rows, and a BINARY key term under a NOCASE comparison misses rows,
+/// so such a term must not pin the seek.
+fn index_equality_term_uses_key_collation(
+    term: &Expr,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    index: &IndexSchema,
+    key_pos: usize,
+) -> bool {
+    let Expr::BinaryOp { left, right, .. } = term else {
+        return false;
+    };
+    let comparison = extract_collation(left)
+        .or_else(|| extract_collation(right))
+        .or_else(|| column_collation(left, table, table_alias))
+        .or_else(|| column_collation(right, table, table_alias));
+    collation_names_equivalent(comparison, index.key_term_collation(key_pos))
 }
 
 fn resolve_covering_output_sources(
