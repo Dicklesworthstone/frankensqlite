@@ -2533,6 +2533,91 @@ mod tests {
     }
 
     #[test]
+    fn test_shared_append_plan_refuses_unbound_stock_salts_and_frame_free_bound_baseline() {
+        // GH#443 negative cases. Stock's unindexed empty header can carry
+        // non-zero salts of its own. A first publication that keeps them was
+        // never bound to this WAL: it is refused and the live header stays
+        // untouched. A header with a page size but no frames (fsqlite's own
+        // index after a TRUNCATE checkpoint) is already bound, so another
+        // generation's salts stay BusyRecovery even though mxFrame is 0.
+        let region = ShmRegion::new(WAL_SHM_SEGMENT_BYTES);
+        let mut stock = WalIndexHdr {
+            i_version: WAL_INDEX_VERSION,
+            unused: 0,
+            i_change: 0,
+            is_init: 1,
+            big_end_cksum: 0,
+            sz_page: 0,
+            mx_frame: 0,
+            n_page: 0,
+            a_frame_cksum: [0, 0],
+            a_salt: [102_238_008, 165_385_013],
+            a_cksum: [0; 2],
+        };
+        stock.update_checksum().unwrap();
+        assert!(stock.is_unindexed_empty());
+        publish_shared_wal_index_header(&region, &stock).unwrap();
+        let wal_header = WalHeader {
+            magic: crate::WAL_MAGIC_LE,
+            format_version: crate::WAL_FORMAT_VERSION,
+            page_size: 4096,
+            checkpoint_seq: 3,
+            salts: crate::WalSalts {
+                salt1: 0x0bad_cafe,
+                salt2: 0x1234_5678,
+            },
+            checksum: crate::SqliteWalChecksum { s1: 0, s2: 0 },
+        };
+        let generation = WalGenerationIdentity::from_header(&wal_header);
+        let mut plan = SharedWalIndexAppendPlan::prepare(
+            stock,
+            generation,
+            vec![(0, region.share())],
+            vec![(1, 2, true)],
+        )
+        .expect("an unindexed empty baseline admits the first append");
+
+        let mut unbound = stock;
+        unbound.sz_page = 4096;
+        unbound.mx_frame = 1;
+        unbound.n_page = 2;
+        unbound.a_frame_cksum = [5, 6];
+        unbound.i_change = plan.publication_change(1).unwrap();
+        unbound.update_checksum().unwrap();
+        assert!(
+            plan.publish(unbound).is_err(),
+            "a publication keeping stock's salts is not bound to this WAL"
+        );
+        assert_eq!(read_shared_wal_index_header(&region).unwrap(), Some(stock));
+
+        // Bound the way `publish_native_pending` binds it: page size, checksum
+        // order and salts come from the WAL header.
+        let mut target = unbound;
+        target.big_end_cksum = u8::from(wal_header.big_endian_checksum());
+        target.a_salt = [wal_header.salts.salt1, wal_header.salts.salt2];
+        target.update_checksum().unwrap();
+        assert_eq!(target.page_size().unwrap(), 4096);
+        plan.publish(target).unwrap();
+        assert_eq!(read_shared_wal_index_header(&region).unwrap(), Some(target));
+
+        let bound_region = ShmRegion::new(WAL_SHM_SEGMENT_BYTES);
+        let mut frame_free = stock;
+        frame_free.sz_page = 4096;
+        frame_free.update_checksum().unwrap();
+        assert!(!frame_free.is_unindexed_empty());
+        publish_shared_wal_index_header(&bound_region, &frame_free).unwrap();
+        assert!(matches!(
+            SharedWalIndexAppendPlan::prepare(
+                frame_free,
+                generation,
+                vec![(0, bound_region.share())],
+                vec![(1, 2, true)],
+            ),
+            Err(FrankenError::BusyRecovery)
+        ));
+    }
+
+    #[test]
     fn test_shared_append_plan_preflight_refuses_missing_region_and_invalid_entries() {
         let region = ShmRegion::new(WAL_SHM_SEGMENT_BYTES);
         let mut baseline = shared_header_fixture(4096, 0);

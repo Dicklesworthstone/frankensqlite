@@ -24,6 +24,9 @@
 //! perform storage I/O; callers must not treat these transitions alone as
 //! evidence of physical durability.
 
+/// Storage-backed coordinator; unlike the model below, completion requires VFS I/O.
+pub mod durable;
+
 use fsqlite_types::sync_primitives::Instant;
 use std::collections::VecDeque;
 
@@ -42,7 +45,7 @@ use crate::metrics::GLOBAL_GROUP_COMMIT_METRICS;
 ///
 /// Contains everything the coordinator needs to validate and commit the
 /// transaction without decoding the full capsule.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitSubmission {
     /// Content-addressed identity of the persisted capsule.
     pub capsule_object_id: ObjectId,
@@ -472,11 +475,8 @@ impl WriteCoordinator {
         // Step 1: Validate
         self.validate(&submission)?;
 
-        GLOBAL_GROUP_COMMIT_METRICS.record_submission();
-
-        // Step 2: Allocate gap-free commit_seq
+        // Determine the proof's sequence without publishing or reserving it.
         let new_seq = self.allocated_seq_tip.next();
-        let commit_time = now_unix_ns.max(self.last_commit_time_ns.saturating_add(1));
 
         // Step 3: Build CommitProof (persisted as ECS object)
         let proof = CommitProof {
@@ -485,6 +485,22 @@ impl WriteCoordinator {
             evidence_refs: submission.witness_refs.clone(),
         };
         let proof_object_id = Self::derive_proof_object_id(&proof);
+
+        Ok(self.enqueue_validated(submission, now_unix_ns, proof_object_id))
+    }
+
+    /// Reserve a validated submission with the proof chosen by its execution
+    /// path. The durable driver encodes its bound proof before entering here.
+    /// No I/O or externally supplied callback occurs after reservation.
+    fn enqueue_validated(
+        &mut self,
+        submission: CommitSubmission,
+        now_unix_ns: u64,
+        proof_object_id: ObjectId,
+    ) -> CommitSeq {
+        GLOBAL_GROUP_COMMIT_METRICS.record_submission();
+        let new_seq = self.allocated_seq_tip.next();
+        let commit_time = now_unix_ns.max(self.last_commit_time_ns.saturating_add(1));
 
         // Update coordinator state (inside serialized section)
         self.allocated_seq_tip = new_seq;
@@ -511,7 +527,7 @@ impl WriteCoordinator {
             barriers: FsyncBarriers::new(),
         });
 
-        Ok(new_seq)
+        new_seq
     }
 
     /// Execute FSYNC_1 (pre-marker group commit point).
