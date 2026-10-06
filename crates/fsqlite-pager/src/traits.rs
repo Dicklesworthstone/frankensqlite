@@ -109,7 +109,7 @@ pub struct CheckpointResult {
     pub wal_was_reset: bool,
     /// The mode the caller originally requested.
     pub requested_mode: CheckpointMode,
-    /// The mode actually executed (may differ from `requested_mode` if the
+    /// The mode actually executed (may differ from the requested mode if the
     /// pager conservatively downgraded due to safety constraints).
     pub effective_mode: CheckpointMode,
 }
@@ -1892,13 +1892,14 @@ impl TransactionHandle for MemoryMockTransaction {
     }
 }
 
-/// Stack-allocated transaction wrapper used by upper layers to avoid boxing
-/// pager transactions behind `dyn TransactionHandle`.
+/// Transaction dispatcher used by upper layers. Compatibility transactions
+/// stay inline and statically dispatched; native ECS handles use a private
+/// type-erased adapter that preserves their original owner and snapshot.
 #[cfg_attr(
     target_arch = "wasm32",
     expect(
         clippy::large_enum_variant,
-        reason = "native transaction variants are absent on wasm, making the intentional inline memory transaction an apparent size outlier"
+        reason = "platform file-backed variants are absent on wasm, making the intentional inline memory transaction an apparent size outlier"
     )
 )]
 pub enum TransactionKind {
@@ -1913,6 +1914,8 @@ pub enum TransactionKind {
     /// Windows filesystem pager transaction.
     #[cfg(all(feature = "native", target_os = "windows"))]
     Windows(SimpleTransaction<WindowsVfs>),
+    /// Native ECS transaction, never a compatibility WAL or memory mock.
+    Native(crate::native::dispatch::NativeTransactionDispatch),
     /// Generic mock transaction used by cross-crate tests.
     Mock(MockTransaction),
     /// In-memory mock transaction used by cross-crate tests.
@@ -1934,6 +1937,7 @@ impl std::fmt::Debug for TransactionKind {
             Self::Unix(_) => f.write_str("TransactionKind::Unix"),
             #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(_) => f.write_str("TransactionKind::Windows"),
+            Self::Native(_) => f.write_str("TransactionKind::Native"),
             Self::Mock(_) => f.write_str("TransactionKind::Mock"),
             Self::MemoryMock(_) => f.write_str("TransactionKind::MemoryMock"),
             Self::Drained => f.write_str("TransactionKind::Drained"),
@@ -1942,12 +1946,21 @@ impl std::fmt::Debug for TransactionKind {
 }
 
 impl TransactionKind {
+    /// Whether this handle uses native ECS page addresses and durability.
+    /// Native tombstones/holes are not a reusable SQLite freelist; consumers
+    /// must not infer dense-file integrity or journal policy from the extent.
+    #[must_use]
+    pub const fn is_native(&self) -> bool {
+        matches!(self, Self::Native(_))
+    }
+
     /// The pager's live free-page set for this transaction (see
     /// [`SimpleTransaction::live_freelist_pages`]). Used by `PRAGMA
     /// integrity_check` (GH#113) to validate page ownership against the
     /// authoritative in-transaction freelist rather than the deferred,
     /// commit-time on-disk trunk. Mock and drained variants have no freelist
-    /// projection and return an empty set.
+    /// projection and return an empty set. Native ECS also returns an empty
+    /// reusable freelist: versioned tombstones are retained, not recycled.
     #[must_use]
     pub fn live_freelist_pages(&self) -> Vec<PageNumber> {
         match self {
@@ -1958,12 +1971,15 @@ impl TransactionKind {
             Self::Unix(txn) => txn.live_freelist_pages(),
             #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(txn) => txn.live_freelist_pages(),
+            Self::Native(_) => Vec::new(),
             Self::Mock(_) | Self::MemoryMock(_) | Self::Drained => Vec::new(),
         }
     }
 
     /// Free-page ownership over the full live integrity extent. Catalog
     /// reload continues to use [`Self::live_freelist_pages`].
+    /// Native ECS does not expose its sparse address space as a dense SQLite
+    /// freelist; use [`Self::is_native`] before applying dense-file checks.
     #[must_use]
     pub fn live_integrity_freelist_pages(&self) -> Vec<PageNumber> {
         match self {
@@ -1974,6 +1990,7 @@ impl TransactionKind {
             Self::Unix(txn) => txn.live_integrity_freelist_pages(),
             #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(txn) => txn.live_integrity_freelist_pages(),
+            Self::Native(_) => Vec::new(),
             Self::Mock(_) | Self::MemoryMock(_) | Self::Drained => Vec::new(),
         }
     }
@@ -1991,6 +2008,7 @@ impl TransactionKind {
             Self::Unix(txn) => txn.live_reserved_pages(),
             #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(txn) => txn.live_reserved_pages(),
+            Self::Native(txn) => txn.live_reserved_pages(),
             Self::Mock(_) | Self::MemoryMock(_) | Self::Drained => Vec::new(),
         }
     }
@@ -2010,6 +2028,7 @@ impl TransactionKind {
             Self::Unix(txn) => txn.live_db_size(),
             #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(txn) => txn.live_db_size(),
+            Self::Native(txn) => txn.live_db_size(),
             Self::Mock(_) | Self::MemoryMock(_) | Self::Drained => 0,
         }
     }
@@ -2027,6 +2046,7 @@ impl TransactionKind {
             Self::Unix(txn) => txn.snapshot_db_size(),
             #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(txn) => txn.snapshot_db_size(),
+            Self::Native(txn) => txn.snapshot_db_size(),
             Self::Mock(_) | Self::MemoryMock(_) | Self::Drained => 0,
         }
     }
@@ -2044,6 +2064,7 @@ impl TransactionKind {
             Self::Unix(txn) => txn.visible_db_size_bound(),
             #[cfg(all(feature = "native", target_os = "windows"))]
             Self::Windows(txn) => txn.visible_db_size_bound(),
+            Self::Native(txn) => txn.visible_db_size_bound(),
             Self::Mock(_) | Self::MemoryMock(_) | Self::Drained => 0,
         }
     }
@@ -2059,6 +2080,7 @@ macro_rules! dispatch_transaction_kind {
             TransactionKind::Unix($txn) => $body,
             #[cfg(all(feature = "native", target_os = "windows"))]
             TransactionKind::Windows($txn) => $body,
+            TransactionKind::Native($txn) => $body,
             TransactionKind::Mock($txn) => $body,
             TransactionKind::MemoryMock($txn) => $body,
             TransactionKind::Drained => {

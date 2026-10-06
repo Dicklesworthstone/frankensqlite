@@ -4,7 +4,8 @@
 //! can use native durability without substituting a compatibility WAL. This
 //! owner deliberately does not implement `MvccPager`: that trait's journal
 //! configuration currently describes only rollback journals and SQLite WALs.
-//! Public Connection/TransactionKind dispatch is not changed here.
+//! Native handles can enter `TransactionKind` through the sealed dispatch
+//! adapter. Ordinary public Connection admission is still separate.
 //!
 //! Transactions hold private overlays and snapshot pins, not a store lock.
 //! Ordinary page operations briefly share the owner's read guard. Publication
@@ -13,6 +14,8 @@
 //! a parked executor thread. A commit future may be !Send; its handle is Send.
 //! The caller still owns durable namespace creation and the external append
 //! lease, which must outlive abandoned source-owned VFS writes and final close.
+
+pub mod dispatch;
 
 use std::cell::RefCell;
 use std::sync::Arc;
