@@ -1345,13 +1345,7 @@ mod tests {
     #[test]
     fn test_recovery_restores_marker_chain_clock_and_fcw() {
         let _metrics_guard = group_commit_metrics_test_guard();
-        let first = CommitMarker::new(
-            CommitSeq::new(1),
-            100,
-            make_oid(1),
-            make_oid(11),
-            None,
-        );
+        let first = CommitMarker::new(CommitSeq::new(1), 100, make_oid(1), make_oid(11), None);
         let first_id = ObjectId::derive_from_canonical_bytes(&first.to_record_bytes());
         let second = CommitMarker::new(
             CommitSeq::new(2),
@@ -1402,12 +1396,16 @@ mod tests {
 
     #[test]
     fn test_recovery_rejects_corrupt_or_discontinuous_marker_streams() {
-        let first = || {
-            CommitMarker::new(CommitSeq::new(1), 100, make_oid(1), make_oid(11), None)
-        };
+        let first = || CommitMarker::new(CommitSeq::new(1), 100, make_oid(1), make_oid(11), None);
         let first_id = ObjectId::derive_from_canonical_bytes(&first().to_record_bytes());
         let second = |seq, time, previous| {
-            CommitMarker::new(CommitSeq::new(seq), time, make_oid(2), make_oid(12), previous)
+            CommitMarker::new(
+                CommitSeq::new(seq),
+                time,
+                make_oid(2),
+                make_oid(12),
+                previous,
+            )
         };
         let mut corrupt = second(2, 200, Some(first_id));
         corrupt.commit_time_unix_ns = 201;
@@ -1428,24 +1426,23 @@ mod tests {
             assert!(error.to_string().contains(reason), "{error}");
         }
         for candidate in [second(0, 100, None), second(10, 100, None)] {
-            assert!(WriteCoordinator::from_recovered_commits(
-                OperatingMode::Native,
-                vec![(candidate, Vec::new())],
-                16,
-            )
-            .is_err());
+            assert!(
+                WriteCoordinator::from_recovered_commits(
+                    OperatingMode::Native,
+                    vec![(candidate, Vec::new())],
+                    16,
+                )
+                .is_err()
+            );
         }
     }
 
     #[test]
     fn test_recovery_of_empty_stream_starts_at_genesis() {
         let _metrics_guard = group_commit_metrics_test_guard();
-        let mut coord = WriteCoordinator::from_recovered_commits(
-            OperatingMode::Native,
-            std::iter::empty(),
-            16,
-        )
-        .unwrap();
+        let mut coord =
+            WriteCoordinator::from_recovered_commits(OperatingMode::Native, std::iter::empty(), 16)
+                .unwrap();
         assert_eq!(coord.commit_seq_tip(), CommitSeq::ZERO);
         coord.submit(make_submission(&[1], 0, 1), 100).unwrap();
         coord.fsync1();
@@ -1458,13 +1455,8 @@ mod tests {
     #[test]
     fn test_recovered_clock_never_wraps_backwards() {
         let _metrics_guard = group_commit_metrics_test_guard();
-        let marker = CommitMarker::new(
-            CommitSeq::new(1),
-            u64::MAX,
-            make_oid(1),
-            make_oid(11),
-            None,
-        );
+        let marker =
+            CommitMarker::new(CommitSeq::new(1), u64::MAX, make_oid(1), make_oid(11), None);
         let mut coord = WriteCoordinator::from_recovered_commits(
             OperatingMode::Native,
             vec![(marker, Vec::new())],

@@ -264,7 +264,9 @@ impl<S: VfsFile, M: VfsFile> NativeDurabilityLog<S, M> {
             let mut header = [0_u8; SYMBOL_HEADER_BYTES];
             read_exact_at(&log.symbols, cx, &mut header, offset).await?;
             let len = symbol_wire_len(&header, limits)?;
-            let end = offset.checked_add(u64_len(len)?).ok_or(FrankenError::TooBig)?;
+            let end = offset
+                .checked_add(u64_len(len)?)
+                .ok_or(FrankenError::TooBig)?;
             if end > symbol_end {
                 break;
             }
@@ -659,7 +661,9 @@ fn ensure_distinct_files<S: VfsFile, M: VfsFile>(symbols: &S, markers: &M) -> Re
         .refresh_file_identity()?
         .ok_or(FrankenError::Unsupported)?;
     if symbols_id == markers_id {
-        return Err(corrupt("native symbol and marker streams alias the same file"));
+        return Err(corrupt(
+            "native symbol and marker streams alias the same file",
+        ));
     }
     Ok(())
 }

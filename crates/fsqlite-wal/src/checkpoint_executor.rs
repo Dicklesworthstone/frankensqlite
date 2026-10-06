@@ -258,7 +258,8 @@ pub async fn execute_checkpoint<F: VfsFile>(
         }
 
         // Pass 2: Bind each sorted write to the bytes validated in pass 1.
-        let mut sorted_pages: Vec<CheckpointPageExpectation> = latest_frames.into_values().collect();
+        let mut sorted_pages: Vec<CheckpointPageExpectation> =
+            latest_frames.into_values().collect();
         sorted_pages.sort_unstable_by_key(|expected| expected.page.get());
 
         let mut frame_buf = vec![0u8; wal.frame_size()];

@@ -1186,10 +1186,13 @@ fn gh294_default_flags_schema_only_open_preserves_every_database_artifact() {
             #[cfg_attr(not(target_vendor = "apple"), allow(unused_mut))]
             let mut after = snapshot_directory_files(dir.path());
             #[cfg(target_vendor = "apple")]
-            accept_apple_last_writable_unmap_ctime(&before, &mut after, &suffixed_path(&path, "-shm"));
+            accept_apple_last_writable_unmap_ctime(
+                &before,
+                &mut after,
+                &suffixed_path(&path, "-shm"),
+            );
             assert_eq!(
-                after,
-                before,
+                after, before,
                 "GH #294 default-flag schema-only open/query (close_with_checkpoint={close_with_checkpoint}) must preserve exact artifact keys plus all bytes, modification times, and Unix change times"
             );
         }

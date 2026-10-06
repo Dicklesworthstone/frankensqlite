@@ -29,10 +29,16 @@ fn recovery_restores_the_chain_and_keeps_orphans_uncommitted() {
         let cx = Cx::new();
         let vfs = FaultInjectingVfs::new(MemoryVfs::new());
         let mut log = new_log(&vfs, &cx);
-        log.append_symbols(&cx, &[symbol(1), symbol(2)]).await.unwrap();
+        log.append_symbols(&cx, &[symbol(1), symbol(2)])
+            .await
+            .unwrap();
         let first = first_marker();
-        log.publish(&cx, std::slice::from_ref(&first), verify).await.unwrap();
-        log.append_symbols(&cx, &[symbol(3), symbol(4)]).await.unwrap();
+        log.publish(&cx, std::slice::from_ref(&first), verify)
+            .await
+            .unwrap();
+        log.append_symbols(&cx, &[symbol(3), symbol(4)])
+            .await
+            .unwrap();
         log.close(&cx).unwrap();
         let (mut recovered, report) = NativeDurabilityLog::recover(
             &cx,
@@ -54,7 +60,9 @@ fn recovery_restores_the_chain_and_keeps_orphans_uncommitted() {
             101,
             symbol(3).object_id,
             symbol(4).object_id,
-            Some(ObjectId::derive_from_canonical_bytes(&first.to_record_bytes())),
+            Some(ObjectId::derive_from_canonical_bytes(
+                &first.to_record_bytes(),
+            )),
         );
         recovered.publish(&cx, &[second], verify).await.unwrap();
         assert_eq!(recovered.published_tip(), CommitSeq::new(2));
@@ -69,7 +77,9 @@ fn recovery_reconciles_a_failed_marker_sync_without_losing_the_commit() {
         let cx = Cx::new();
         let vfs = FaultInjectingVfs::new(MemoryVfs::new());
         let mut log = new_log(&vfs, &cx);
-        log.append_symbols(&cx, &[symbol(1), symbol(2)]).await.unwrap();
+        log.append_symbols(&cx, &[symbol(1), symbol(2)])
+            .await
+            .unwrap();
         vfs.inject_fault(FaultSpec::power_cut("markers").after_nth_sync(2).build());
         assert!(log.publish(&cx, &[first_marker()], verify).await.is_err());
         assert_eq!(log.published_tip(), CommitSeq::ZERO);
@@ -99,12 +109,17 @@ fn recovery_retains_both_torn_tails_and_refuses_to_append_through_them() {
         let cx = Cx::new();
         let vfs = MemoryVfs::new();
         let mut log = new_log(&vfs, &cx);
-        log.append_symbols(&cx, &[symbol(1), symbol(2)]).await.unwrap();
+        log.append_symbols(&cx, &[symbol(1), symbol(2)])
+            .await
+            .unwrap();
         log.publish(&cx, &[first_marker()], verify).await.unwrap();
         log.close(&cx).unwrap();
         let mut objects = open(&vfs, &cx, "objects");
         let object_end = objects.file_size(&cx).unwrap();
-        objects.write(&cx, &symbol(3).to_bytes()[..60], object_end).await.unwrap();
+        objects
+            .write(&cx, &symbol(3).to_bytes()[..60], object_end)
+            .await
+            .unwrap();
         let mut markers = open(&vfs, &cx, "markers");
         let marker_end = markers.file_size(&cx).unwrap();
         markers.write(&cx, &[0xAA; 17], marker_end).await.unwrap();
@@ -126,7 +141,10 @@ fn recovery_retains_both_torn_tails_and_refuses_to_append_through_them() {
         assert_eq!(recovered.published_tip(), CommitSeq::new(1));
         verify_sync(
             symbol(1).object_id,
-            &recovered.read_object(&cx, symbol(1).object_id).await.unwrap(),
+            &recovered
+                .read_object(&cx, symbol(1).object_id)
+                .await
+                .unwrap(),
         )
         .unwrap();
         assert!(recovered.append_symbols(&cx, &[symbol(9)]).await.is_err());
@@ -148,7 +166,9 @@ fn recovery_never_skips_a_complete_corrupt_or_discontinuous_marker() {
             let cx = Cx::new();
             let vfs = FaultInjectingVfs::new(MemoryVfs::new());
             let mut log = new_log(&vfs, &cx);
-            log.append_symbols(&cx, &[symbol(1), symbol(2)]).await.unwrap();
+            log.append_symbols(&cx, &[symbol(1), symbol(2)])
+                .await
+                .unwrap();
             log.close(&cx).unwrap();
             let marker = CommitMarker::new(
                 CommitSeq::new(if corrupt_version { 1 } else { 2 }),
@@ -187,7 +207,9 @@ fn checksum_erasures_require_a_surviving_verified_object() {
             let cx = Cx::new();
             let vfs = MemoryVfs::new();
             let mut log = new_log(&vfs, &cx);
-            log.append_symbols(&cx, &[symbol(1), symbol(2)]).await.unwrap();
+            log.append_symbols(&cx, &[symbol(1), symbol(2)])
+                .await
+                .unwrap();
             log.publish(&cx, &[first_marker()], verify).await.unwrap();
             if has_redundancy {
                 // A duplicate source tests erasure routing, not RaptorQ algebra.
@@ -241,7 +263,10 @@ fn recovery_rejects_payload_identity_spoofing_and_advertised_size_bombs() {
             objects.write(&cx, &bytes, 0).await.unwrap();
             objects.close(&cx).unwrap();
             let mut markers = open(&vfs, &cx, "markers");
-            markers.write(&cx, &first_marker().to_record_bytes(), 0).await.unwrap();
+            markers
+                .write(&cx, &first_marker().to_record_bytes(), 0)
+                .await
+                .unwrap();
             markers.close(&cx).unwrap();
             assert!(
                 NativeDurabilityLog::recover(
@@ -272,7 +297,10 @@ fn recovery_must_complete_both_resyncs_before_returning_a_log() {
             objects.write(&cx, &bytes, 0).await.unwrap();
             objects.close(&cx).unwrap();
             let mut markers = open(&vfs, &cx, "markers");
-            markers.write(&cx, &first_marker().to_record_bytes(), 0).await.unwrap();
+            markers
+                .write(&cx, &first_marker().to_record_bytes(), 0)
+                .await
+                .unwrap();
             markers.close(&cx).unwrap();
             vfs.inject_fault(FaultSpec::power_cut(path).after_nth_sync(ordinal).build());
             assert!(
@@ -309,7 +337,9 @@ fn native_file_streams_publish_close_and_recover_through_the_caller_runtime() {
             NativeDurabilityLimits::default(),
         )
         .unwrap();
-        log.append_symbols(&cx, &[symbol(1), symbol(2)]).await.unwrap();
+        log.append_symbols(&cx, &[symbol(1), symbol(2)])
+            .await
+            .unwrap();
         log.publish(&cx, &[first_marker()], verify).await.unwrap();
         log.close(&cx).unwrap();
         let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::WAL;
@@ -368,11 +398,10 @@ fn symbol(seed: u8) -> SymbolRecord {
 }
 
 fn verify_sync(object_id: ObjectId, records: &[SymbolRecord]) -> Result<()> {
-    let payload = reconstruct_systematic_happy_path(records).map_err(|error| {
-        FrankenError::WalCorrupt {
+    let payload =
+        reconstruct_systematic_happy_path(records).map_err(|error| FrankenError::WalCorrupt {
             detail: error.to_string(),
-        }
-    })?;
+        })?;
     if ObjectId::derive_from_canonical_bytes(&payload) != object_id {
         return Err(FrankenError::WalCorrupt {
             detail: "test object identity mismatch".to_owned(),
@@ -414,7 +443,9 @@ fn staged_objects_are_not_commits_and_a_batch_uses_two_syncs() {
                 previous,
             );
             log.append_symbols(&cx, &[capsule, proof]).await.unwrap();
-            previous = Some(ObjectId::derive_from_canonical_bytes(&marker.to_record_bytes()));
+            previous = Some(ObjectId::derive_from_canonical_bytes(
+                &marker.to_record_bytes(),
+            ));
             markers.push(marker);
         }
         assert_eq!(log.published_tip(), CommitSeq::ZERO);
@@ -463,9 +494,11 @@ fn missing_or_invalid_objects_and_bad_chains_never_reach_sync() {
         );
         assert!(log.publish(&cx, &[gap], verify).await.is_err());
         assert!(
-            log.publish(&cx, &[first_marker()], |_, _| ready(Err(FrankenError::Unsupported)))
-                .await
-                .is_err()
+            log.publish(&cx, &[first_marker()], |_, _| ready(Err(
+                FrankenError::Unsupported
+            )))
+            .await
+            .is_err()
         );
         assert_eq!(vfs.sync_count(), 0);
         assert_eq!(log.published_tip(), CommitSeq::ZERO);
@@ -483,7 +516,9 @@ fn first_barrier_failure_writes_no_marker_and_latches_recovery() {
         let cx = Cx::new();
         let vfs = FaultInjectingVfs::new(MemoryVfs::new());
         let mut log = new_log(&vfs, &cx);
-        log.append_symbols(&cx, &[symbol(1), symbol(2)]).await.unwrap();
+        log.append_symbols(&cx, &[symbol(1), symbol(2)])
+            .await
+            .unwrap();
         vfs.inject_fault(FaultSpec::power_cut("objects").after_nth_sync(1).build());
         assert!(log.publish(&cx, &[first_marker()], verify).await.is_err());
         assert!(vfs.is_powered_off());
@@ -505,7 +540,9 @@ fn second_barrier_failure_does_not_acknowledge_visible_marker_bytes() {
         let cx = Cx::new();
         let vfs = FaultInjectingVfs::new(MemoryVfs::new());
         let mut log = new_log(&vfs, &cx);
-        log.append_symbols(&cx, &[symbol(1), symbol(2)]).await.unwrap();
+        log.append_symbols(&cx, &[symbol(1), symbol(2)])
+            .await
+            .unwrap();
         vfs.inject_fault(FaultSpec::power_cut("markers").after_nth_sync(2).build());
         assert!(log.publish(&cx, &[first_marker()], verify).await.is_err());
         assert!(vfs.is_powered_off());
@@ -528,7 +565,9 @@ fn torn_marker_write_is_retained_and_never_retried_in_place() {
         let cx = Cx::new();
         let vfs = FaultInjectingVfs::new(MemoryVfs::new());
         let mut log = new_log(&vfs, &cx);
-        log.append_symbols(&cx, &[symbol(1), symbol(2)]).await.unwrap();
+        log.append_symbols(&cx, &[symbol(1), symbol(2)])
+            .await
+            .unwrap();
         vfs.inject_fault(FaultSpec::torn_write("markers").valid_bytes(17).build());
         assert!(log.publish(&cx, &[first_marker()], verify).await.is_err());
         assert_eq!(vfs.triggered_faults().len(), 1);

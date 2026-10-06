@@ -59,7 +59,9 @@ impl NativePageCapsule {
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         let len = self.encoded_len()?;
         let mut bytes = Vec::new();
-        bytes.try_reserve_exact(len).map_err(|_| FrankenError::OutOfMemory)?;
+        bytes
+            .try_reserve_exact(len)
+            .map_err(|_| FrankenError::OutOfMemory)?;
         bytes.extend_from_slice(MAGIC);
         bytes.extend_from_slice(&self.page_size.to_le_bytes());
         bytes.extend_from_slice(&self.snapshot.get().to_le_bytes());
@@ -102,21 +104,26 @@ impl NativePageCapsule {
         if read_count > MAX_CAPSULE_PAGES || write_count == 0 || write_count > MAX_CAPSULE_PAGES {
             return Err(FrankenError::TooBig);
         }
-        let minimum = read_count.checked_mul(12)
+        let minimum = read_count
+            .checked_mul(12)
             .and_then(|n| write_count.checked_mul(8).and_then(|m| n.checked_add(m)))
             .ok_or(FrankenError::TooBig)?;
         if minimum > input.0.len() {
             return Err(corrupt("native page capsule counts exceed its payload"));
         }
         let mut reads = Vec::new();
-        reads.try_reserve_exact(read_count).map_err(|_| FrankenError::OutOfMemory)?;
+        reads
+            .try_reserve_exact(read_count)
+            .map_err(|_| FrankenError::OutOfMemory)?;
         for _ in 0..read_count {
             let page = input.page()?;
             let version = CommitSeq::new(u64::from_le_bytes(input.array()?));
             reads.push((page, version));
         }
         let mut writes = Vec::new();
-        writes.try_reserve_exact(write_count).map_err(|_| FrankenError::OutOfMemory)?;
+        writes
+            .try_reserve_exact(write_count)
+            .map_err(|_| FrankenError::OutOfMemory)?;
         let page_len = usize::try_from(page_size).map_err(|_| FrankenError::TooBig)?;
         for _ in 0..write_count {
             let page = input.page()?;
@@ -130,7 +137,12 @@ impl NativePageCapsule {
         if !input.0.is_empty() {
             return Err(corrupt("trailing native page capsule bytes"));
         }
-        let capsule = Self { page_size, snapshot, reads, writes };
+        let capsule = Self {
+            page_size,
+            snapshot,
+            reads,
+            writes,
+        };
         capsule.encoded_len()?;
         Ok(capsule)
     }
@@ -147,14 +159,21 @@ impl NativePageCapsule {
         let capsule = Self::from_bytes(&candidate.capsule)?;
         let proof = &candidate.proof;
         let submission = &proof.submission;
-        if capsule.snapshot != submission.begin_seq || proof.commit_seq <= capsule.snapshot
+        if capsule.snapshot != submission.begin_seq
+            || proof.commit_seq <= capsule.snapshot
             || blake3::hash(&candidate.capsule).as_bytes() != &submission.capsule_digest
-            || !submission.write_set_pages.iter().copied().eq(capsule.writes.iter().map(|w| w.page))
+            || !submission
+                .write_set_pages
+                .iter()
+                .copied()
+                .eq(capsule.writes.iter().map(|w| w.page))
             || !submission.witness_refs.is_empty()
             || !submission.edge_ids.is_empty()
             || !submission.merge_witness_ids.is_empty()
         {
-            return Err(corrupt("native page capsule does not match its admission proof"));
+            return Err(corrupt(
+                "native page capsule does not match its admission proof",
+            ));
         }
         Ok(capsule)
     }
@@ -179,7 +198,9 @@ impl NativePageCapsule {
         }
         for &(page, observed) in &self.reads {
             if latest(page) != observed {
-                return Err(FrankenError::BusySnapshot { conflicting_pages: page.get().to_string() });
+                return Err(FrankenError::BusySnapshot {
+                    conflicting_pages: page.get().to_string(),
+                });
             }
         }
         Ok(())
@@ -187,7 +208,8 @@ impl NativePageCapsule {
 
     fn encoded_len(&self) -> Result<usize> {
         validate_page_size(self.page_size)?;
-        if self.reads.len() > MAX_CAPSULE_PAGES || self.writes.is_empty()
+        if self.reads.len() > MAX_CAPSULE_PAGES
+            || self.writes.is_empty()
             || self.writes.len() > MAX_CAPSULE_PAGES
         {
             return Err(FrankenError::TooBig);
@@ -198,19 +220,33 @@ impl NativePageCapsule {
         {
             return Err(corrupt("unordered or future native page observations"));
         }
-        let mut len = self.reads.len().checked_mul(12)
-            .and_then(|n| n.checked_add(HEADER_BYTES)).ok_or(FrankenError::TooBig)?;
+        let mut len = self
+            .reads
+            .len()
+            .checked_mul(12)
+            .and_then(|n| n.checked_add(HEADER_BYTES))
+            .ok_or(FrankenError::TooBig)?;
         let page_size = usize::try_from(self.page_size).map_err(|_| FrankenError::TooBig)?;
         for write in &self.writes {
-            if self.reads.binary_search_by_key(&write.page, |(page, _)| *page).is_err() {
+            if self
+                .reads
+                .binary_search_by_key(&write.page, |(page, _)| *page)
+                .is_err()
+            {
                 return Err(corrupt("native page write has no snapshot observation"));
             }
-            if write.data.as_ref().is_some_and(|data| data.len() != page_size) {
+            if write
+                .data
+                .as_ref()
+                .is_some_and(|data| data.len() != page_size)
+            {
                 return Err(corrupt("native page image has the wrong size"));
             }
-            len = len.checked_add(8)
+            len = len
+                .checked_add(8)
                 .and_then(|n| n.checked_add(write.data.as_ref().map_or(0, |data| data.len())))
-                .filter(|n| *n <= MAX_PAGE_CAPSULE_BYTES).ok_or(FrankenError::TooBig)?;
+                .filter(|n| *n <= MAX_PAGE_CAPSULE_BYTES)
+                .ok_or(FrankenError::TooBig)?;
         }
         Ok(len)
     }
@@ -228,19 +264,25 @@ fn count_u32(value: usize) -> Result<u32> {
 }
 
 fn corrupt(detail: &str) -> FrankenError {
-    FrankenError::WalCorrupt { detail: detail.to_owned() }
+    FrankenError::WalCorrupt {
+        detail: detail.to_owned(),
+    }
 }
 
 struct Reader<'a>(&'a [u8]);
 impl<'a> Reader<'a> {
     fn take(&mut self, len: usize) -> Result<&'a [u8]> {
-        let (head, tail) = self.0.split_at_checked(len)
+        let (head, tail) = self
+            .0
+            .split_at_checked(len)
             .ok_or_else(|| corrupt("truncated native page capsule"))?;
         self.0 = tail;
         Ok(head)
     }
     fn array<const N: usize>(&mut self) -> Result<[u8; N]> {
-        self.take(N)?.try_into().map_err(|_| corrupt("truncated native page field"))
+        self.take(N)?
+            .try_into()
+            .map_err(|_| corrupt("truncated native page field"))
     }
     fn page(&mut self) -> Result<PageNumber> {
         PageNumber::new(u32::from_le_bytes(self.array()?))
@@ -255,15 +297,23 @@ mod tests {
     use crate::native_commit::durable::NativeCommitProof;
     use fsqlite_types::{ObjectId, TxnEpoch, TxnId, TxnToken};
 
-    fn page(n: u32) -> PageNumber { PageNumber::new(n).unwrap() }
+    fn page(n: u32) -> PageNumber {
+        PageNumber::new(n).unwrap()
+    }
     fn capsule() -> NativePageCapsule {
         NativePageCapsule {
             page_size: 512,
             snapshot: CommitSeq::new(7),
             reads: vec![(page(1), CommitSeq::new(5)), (page(3), CommitSeq::ZERO)],
             writes: vec![
-                NativePageWrite { page: page(1), data: None },
-                NativePageWrite { page: page(3), data: Some(Arc::from(vec![0xA5; 512])) },
+                NativePageWrite {
+                    page: page(1),
+                    data: None,
+                },
+                NativePageWrite {
+                    page: page(3),
+                    data: Some(Arc::from(vec![0xA5; 512])),
+                },
             ],
         }
     }
@@ -278,7 +328,9 @@ mod tests {
                     capsule_object_id: ObjectId::derive_from_canonical_bytes(&bytes),
                     capsule_digest: *blake3::hash(&bytes).as_bytes(),
                     write_set_pages: vec![page(1), page(3)],
-                    witness_refs: vec![], edge_ids: vec![], merge_witness_ids: vec![],
+                    witness_refs: vec![],
+                    edge_ids: vec![],
+                    merge_witness_ids: vec![],
                     txn_token: TxnToken::new(TxnId::new(1).unwrap(), TxnEpoch::new(1)),
                     begin_seq: CommitSeq::new(7),
                 },
@@ -298,14 +350,20 @@ mod tests {
         assert_eq!(&bytes[20..28], &[2, 0, 0, 0, 2, 0, 0, 0]);
         assert_eq!(&bytes[52..60], &[1, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(NativePageCapsule::from_bytes(&bytes).unwrap(), capsule());
-        assert_eq!(NativePageCapsule::from_candidate(&candidate()).unwrap(), capsule());
+        assert_eq!(
+            NativePageCapsule::from_candidate(&candidate()).unwrap(),
+            capsule()
+        );
     }
 
     #[test]
     fn capsule_rejects_every_truncation_and_trailing_data() {
         let bytes = capsule().to_bytes().unwrap();
         for end in 0..bytes.len() {
-            assert!(NativePageCapsule::from_bytes(&bytes[..end]).is_err(), "end={end}");
+            assert!(
+                NativePageCapsule::from_bytes(&bytes[..end]).is_err(),
+                "end={end}"
+            );
         }
         let mut bytes = bytes;
         bytes.push(0);
@@ -317,7 +375,10 @@ mod tests {
         for (offset, value) in [(4, 2), (20, 0xFF), (24, 0xFF), (28, 0), (56, 2)] {
             let mut bytes = capsule().to_bytes().unwrap();
             bytes[offset] = value;
-            assert!(NativePageCapsule::from_bytes(&bytes).is_err(), "offset={offset}");
+            assert!(
+                NativePageCapsule::from_bytes(&bytes).is_err(),
+                "offset={offset}"
+            );
         }
         let mut bytes = capsule().to_bytes().unwrap();
         bytes[20..24].copy_from_slice(&u32::MAX.to_le_bytes());
@@ -326,27 +387,35 @@ mod tests {
 
     #[test]
     fn capsule_requires_ordered_complete_write_observations() {
-        let mut missing = capsule(); missing.reads.pop();
+        let mut missing = capsule();
+        missing.reads.pop();
         assert!(missing.to_bytes().is_err());
-        let mut duplicate = capsule(); duplicate.reads.push((page(3), CommitSeq::ZERO));
+        let mut duplicate = capsule();
+        duplicate.reads.push((page(3), CommitSeq::ZERO));
         assert!(duplicate.to_bytes().is_err());
-        let mut duplicate = capsule(); duplicate.writes.push(duplicate.writes[1].clone());
+        let mut duplicate = capsule();
+        duplicate.writes.push(duplicate.writes[1].clone());
         assert!(duplicate.to_bytes().is_err());
-        let mut reversed = capsule(); reversed.writes.reverse();
+        let mut reversed = capsule();
+        reversed.writes.reverse();
         assert!(reversed.to_bytes().is_err());
-        let mut future = capsule(); future.reads[0].1 = CommitSeq::new(8);
+        let mut future = capsule();
+        future.reads[0].1 = CommitSeq::new(8);
         assert!(future.to_bytes().is_err());
     }
 
     #[test]
     fn capsule_rejects_invalid_page_images_and_page_sizes() {
         for size in [0, 256, 513, 131_072] {
-            let mut value = capsule(); value.page_size = size;
+            let mut value = capsule();
+            value.page_size = size;
             assert!(value.to_bytes().is_err());
         }
-        let mut short = capsule(); short.writes[1].data = Some(Arc::from(vec![1; 511]));
+        let mut short = capsule();
+        short.writes[1].data = Some(Arc::from(vec![1; 511]));
         assert!(short.to_bytes().is_err());
-        let mut empty = capsule(); empty.writes.clear();
+        let mut empty = capsule();
+        empty.writes.clear();
         assert!(empty.to_bytes().is_err());
     }
 
@@ -356,14 +425,35 @@ mod tests {
             let mut value = candidate();
             match case {
                 0 => value.proof.submission.begin_seq = CommitSeq::new(6),
-                1 => value.proof.submission.write_set_pages.pop().map(|_| ()).unwrap(),
+                1 => value
+                    .proof
+                    .submission
+                    .write_set_pages
+                    .pop()
+                    .map(|_| ())
+                    .unwrap(),
                 2 => value.proof.submission.capsule_digest[0] ^= 1,
-                3 => value.proof.submission.witness_refs.push(ObjectId::from_bytes([9; 16])),
-                4 => value.proof.submission.edge_ids.push(ObjectId::from_bytes([9; 16])),
-                5 => value.proof.submission.merge_witness_ids.push(ObjectId::from_bytes([9; 16])),
+                3 => value
+                    .proof
+                    .submission
+                    .witness_refs
+                    .push(ObjectId::from_bytes([9; 16])),
+                4 => value
+                    .proof
+                    .submission
+                    .edge_ids
+                    .push(ObjectId::from_bytes([9; 16])),
+                5 => value
+                    .proof
+                    .submission
+                    .merge_witness_ids
+                    .push(ObjectId::from_bytes([9; 16])),
                 _ => unreachable!(),
             }
-            assert!(NativePageCapsule::from_candidate(&value).is_err(), "case={case}");
+            assert!(
+                NativePageCapsule::from_candidate(&value).is_err(),
+                "case={case}"
+            );
         }
     }
 
@@ -371,12 +461,23 @@ mod tests {
     fn snapshot_validation_checks_absence_and_not_only_written_images() {
         let mut value = capsule();
         value.reads.push((page(5), CommitSeq::new(6))); // Read-only dependency.
-        let stable = |p: PageNumber| match p.get() { 1 => CommitSeq::new(5), 5 => CommitSeq::new(6), _ => CommitSeq::ZERO };
+        let stable = |p: PageNumber| match p.get() {
+            1 => CommitSeq::new(5),
+            5 => CommitSeq::new(6),
+            _ => CommitSeq::ZERO,
+        };
         value.validate_snapshot(CommitSeq::new(7), stable).unwrap();
         for changed in [1, 3, 5] {
-            assert!(matches!(value.validate_snapshot(CommitSeq::new(8), |p| {
-                if p.get() == changed { CommitSeq::new(8) } else { stable(p) }
-            }), Err(FrankenError::BusySnapshot { .. })));
+            assert!(matches!(
+                value.validate_snapshot(CommitSeq::new(8), |p| {
+                    if p.get() == changed {
+                        CommitSeq::new(8)
+                    } else {
+                        stable(p)
+                    }
+                }),
+                Err(FrankenError::BusySnapshot { .. })
+            ));
         }
         assert!(value.validate_snapshot(CommitSeq::new(6), stable).is_err());
     }

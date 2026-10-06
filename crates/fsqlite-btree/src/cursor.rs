@@ -19845,7 +19845,10 @@ mod tests {
             assert_eq!(cursor.witness_keys().len(), 1, "retained by default");
 
             cursor.set_retain_read_witnesses(false);
-            assert!(cursor.witness_keys().is_empty(), "turning retention off drops the copy");
+            assert!(
+                cursor.witness_keys().is_empty(),
+                "turning retention off drops the copy"
+            );
             let pager_before = state.borrow().read_witnesses.len();
 
             assert!(cursor.table_move_to(&cx, 10).await.unwrap().is_found());

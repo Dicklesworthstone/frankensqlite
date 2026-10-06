@@ -345,7 +345,11 @@ impl ConcurrentRowIdAllocator {
                 count: 0,
                 statement: None,
             });
-        if statement != 0 && entry.statement.is_none_or(|(marked, ..)| marked != statement) {
+        if statement != 0
+            && entry
+                .statement
+                .is_none_or(|(marked, ..)| marked != statement)
+        {
             entry.statement = Some((statement, prior.0, prior.1, entry.count));
         }
         entry.count += count;
@@ -418,8 +422,7 @@ impl ConcurrentRowIdAllocator {
             // session's tracked count regardless of whether the tip rewound.
             if sp_count == 0 {
                 session_reservations.remove(&(mark.session_id, key));
-            } else if let Some(reservations) =
-                session_reservations.get_mut(&(mark.session_id, key))
+            } else if let Some(reservations) = session_reservations.get_mut(&(mark.session_id, key))
             {
                 reservations.count = sp_count;
                 reservations.statement = None;
@@ -1111,21 +1114,54 @@ mod tests {
             let (t, u) = (key(1, 1), key(1, 2));
             alloc.init_table(t, None, 0, RowIdMode::Normal);
             alloc.init_table(u, Some(RowId::new(40)), 0, RowIdMode::AutoIncrement);
-            assert_eq!(alloc.allocate_one_for_statement(t, session_a, 1).unwrap().get(), 1);
+            assert_eq!(
+                alloc
+                    .allocate_one_for_statement(t, session_a, 1)
+                    .unwrap()
+                    .get(),
+                1
+            );
             for expected in [2, 3] {
                 assert_eq!(
-                    alloc.allocate_one_for_statement(t, session_a, 2).unwrap().get(),
+                    alloc
+                        .allocate_one_for_statement(t, session_a, 2)
+                        .unwrap()
+                        .get(),
                     expected
                 );
             }
-            assert_eq!(alloc.allocate_one_for_statement(u, session_a, 2).unwrap().get(), 41);
+            assert_eq!(
+                alloc
+                    .allocate_one_for_statement(u, session_a, 2)
+                    .unwrap()
+                    .get(),
+                41
+            );
             alloc.rewind_statement(session_a, 2);
-            assert_eq!(alloc.allocate_one_for_statement(t, session_a, 3).unwrap().get(), 2);
+            assert_eq!(
+                alloc
+                    .allocate_one_for_statement(t, session_a, 3)
+                    .unwrap()
+                    .get(),
+                2
+            );
             assert_eq!(alloc.autoincrement_high_water(&u), Some(40));
-            assert_eq!(alloc.allocate_one_for_statement(u, session_a, 3).unwrap().get(), 41);
+            assert_eq!(
+                alloc
+                    .allocate_one_for_statement(u, session_a, 3)
+                    .unwrap()
+                    .get(),
+                41
+            );
             // A statement that never allocated rewinds nothing.
             alloc.rewind_statement(session_a, 4);
-            assert_eq!(alloc.allocate_one_for_statement(t, session_a, 5).unwrap().get(), 3);
+            assert_eq!(
+                alloc
+                    .allocate_one_for_statement(t, session_a, 5)
+                    .unwrap()
+                    .get(),
+                3
+            );
         }
 
         // A peer reserved after the statement's first rowid: the gap stays.
@@ -1133,11 +1169,26 @@ mod tests {
             let alloc = ConcurrentRowIdAllocator::new(epoch(1));
             let t = key(1, 1);
             alloc.init_table(t, None, 0, RowIdMode::Normal);
-            assert_eq!(alloc.allocate_one_for_statement(t, session_a, 7).unwrap().get(), 1);
-            assert_eq!(alloc.allocate_one_for_statement(t, session_b, 1).unwrap().get(), 2);
+            assert_eq!(
+                alloc
+                    .allocate_one_for_statement(t, session_a, 7)
+                    .unwrap()
+                    .get(),
+                1
+            );
+            assert_eq!(
+                alloc
+                    .allocate_one_for_statement(t, session_b, 1)
+                    .unwrap()
+                    .get(),
+                2
+            );
             alloc.rewind_statement(session_a, 7);
             assert_eq!(
-                alloc.allocate_one_for_statement(t, session_a, 8).unwrap().get(),
+                alloc
+                    .allocate_one_for_statement(t, session_a, 8)
+                    .unwrap()
+                    .get(),
                 3,
                 "peer rowid 2 must never be reissued"
             );
@@ -1151,12 +1202,36 @@ mod tests {
             let alloc = ConcurrentRowIdAllocator::new(epoch(1));
             let t = key(1, 1);
             alloc.init_table(t, None, 0, RowIdMode::Normal);
-            assert_eq!(alloc.allocate_one_for_statement(t, session_a, 1).unwrap().get(), 1);
-            assert_eq!(alloc.allocate_one_for_statement(t, session_a, 2).unwrap().get(), 2);
+            assert_eq!(
+                alloc
+                    .allocate_one_for_statement(t, session_a, 1)
+                    .unwrap()
+                    .get(),
+                1
+            );
+            assert_eq!(
+                alloc
+                    .allocate_one_for_statement(t, session_a, 2)
+                    .unwrap()
+                    .get(),
+                2
+            );
             alloc.rewind_statement(session_a, 2);
-            assert_eq!(alloc.allocate_one_for_statement(t, session_a, 1).unwrap().get(), 2);
+            assert_eq!(
+                alloc
+                    .allocate_one_for_statement(t, session_a, 1)
+                    .unwrap()
+                    .get(),
+                2
+            );
             alloc.rewind_statement(session_a, 1);
-            assert_eq!(alloc.allocate_one_for_statement(t, session_a, 3).unwrap().get(), 2);
+            assert_eq!(
+                alloc
+                    .allocate_one_for_statement(t, session_a, 3)
+                    .unwrap()
+                    .get(),
+                2
+            );
         }
     }
 

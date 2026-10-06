@@ -381,7 +381,11 @@ mod tests {
             // A filesystem that accepts only UTF-8 names (APFS, or ZFS with
             // utf8only) refuses this one with EILSEQ. The request still names
             // a non-UTF-8 path and must still be refused before recovery.
-            const EILSEQ: i32 = if cfg!(target_vendor = "apple") { 92 } else { 84 };
+            const EILSEQ: i32 = if cfg!(target_vendor = "apple") {
+                92
+            } else {
+                84
+            };
             let created = match host_fs::write(&source, b"untouched") {
                 Ok(()) => true,
                 Err(FrankenError::Io(error)) if error.raw_os_error() == Some(EILSEQ) => false,

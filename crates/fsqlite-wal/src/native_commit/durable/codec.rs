@@ -84,25 +84,39 @@ impl NativeObjectCodec for RaptorQNativeCodec {
             .transport(CollectSymbols::default())
             .build()
             .map_err(|error| corrupt(&format!("native RaptorQ sender: {error}")))?;
-        sender.send_object(&native, CodecObjectId::new_for_test(PIPELINE_OBJECT), payload)
+        sender
+            .send_object(
+                &native,
+                CodecObjectId::new_for_test(PIPELINE_OBJECT),
+                payload,
+            )
             .map_err(|error| codec_error(error.kind(), error.to_string()))?;
         let symbols = std::mem::take(&mut sender.transport_mut().0);
         if symbols.len() > MAX_RECORDS {
             return Err(FrankenError::TooBig);
         }
         let mut records = Vec::new();
-        records.try_reserve_exact(symbols.len()).map_err(|_| FrankenError::OutOfMemory)?;
+        records
+            .try_reserve_exact(symbols.len())
+            .map_err(|_| FrankenError::OutOfMemory)?;
         for symbol in symbols {
             checkpoint(cx)?;
             if symbol.esi() > ESI_MASK || symbol.data().len() != usize::from(SYMBOL_BYTES) {
                 return Err(corrupt("native RaptorQ encoder produced an invalid symbol"));
             }
-            let key = (if symbol.kind().is_repair() { REPAIR_BIT } else { 0 })
-                | (u32::from(symbol.sbn()) << BLOCK_SHIFT)
+            let key = (if symbol.kind().is_repair() {
+                REPAIR_BIT
+            } else {
+                0
+            }) | (u32::from(symbol.sbn()) << BLOCK_SHIFT)
                 | symbol.esi();
             validate_key(key, oti)?;
             let mut record = SymbolRecord::new(
-                object_id, oti, key, symbol.data().to_vec(), SymbolRecordFlags::empty(),
+                object_id,
+                oti,
+                key,
+                symbol.data().to_vec(),
+                SymbolRecordFlags::empty(),
             );
             if let Some(key) = &self.epoch_key {
                 record = record.with_auth_tag(key);
@@ -120,22 +134,29 @@ impl NativeObjectCodec for RaptorQNativeCodec {
         let oti = records[0].oti;
         let len = usize::try_from(oti.f).map_err(|_| FrankenError::TooBig)?;
         if layout(len)? != oti {
-            return Err(corrupt("native RaptorQ object uses a different layout/profile"));
+            return Err(corrupt(
+                "native RaptorQ object uses a different layout/profile",
+            ));
         }
         let native = native_context(cx)?;
         let pipeline_id = CodecObjectId::new_for_test(PIPELINE_OBJECT);
         let mut seen = BTreeMap::<u32, &[u8]>::new();
         let mut symbols = VecDeque::new();
-        symbols.try_reserve(records.len()).map_err(|_| FrankenError::OutOfMemory)?;
+        symbols
+            .try_reserve(records.len())
+            .map_err(|_| FrankenError::OutOfMemory)?;
         for record in records {
             checkpoint(cx)?;
             // Check sizes before SymbolRecord's hashing helpers, which assume
             // symbol_data.len() == OTI.T. Never let malformed input panic there.
-            if record.object_id != object_id || record.oti != oti
+            if record.object_id != object_id
+                || record.oti != oti
                 || record.symbol_data.len() != usize::from(SYMBOL_BYTES)
                 || !record.verify_integrity()
             {
-                return Err(corrupt("native RaptorQ symbol identity/layout/integrity mismatch"));
+                return Err(corrupt(
+                    "native RaptorQ symbol identity/layout/integrity mismatch",
+                ));
             }
             let auth_ok = match &self.epoch_key {
                 Some(key) => record.auth_tag != [0; 16] && record.verify_auth(key),
@@ -151,14 +172,23 @@ impl NativeObjectCodec for RaptorQNativeCodec {
                 }
                 continue;
             }
-            let symbol = Symbol::new(SymbolId::new(pipeline_id, block, esi), record.symbol_data.clone(), kind);
+            let symbol = Symbol::new(
+                SymbolId::new(pipeline_id, block, esi),
+                record.symbol_data.clone(),
+                kind,
+            );
             // Storage authentication above is separate from the pipeline's
             // transport MAC domain. The in-memory stream carries no network MAC.
-            symbols.push_back(AuthenticatedSymbol::from_parts(symbol, AuthenticationTag::zero()));
+            symbols.push_back(AuthenticatedSymbol::from_parts(
+                symbol,
+                AuthenticationTag::zero(),
+            ));
         }
         let block_symbols = len.min(BLOCK_BYTES).div_ceil(usize::from(SYMBOL_BYTES));
         let params = ObjectParams::new(
-            pipeline_id, oti.f, SYMBOL_BYTES,
+            pipeline_id,
+            oti.f,
+            SYMBOL_BYTES,
             u16::try_from(oti.z).map_err(|_| FrankenError::TooBig)?,
             u16::try_from(block_symbols).map_err(|_| FrankenError::TooBig)?,
         );
@@ -167,11 +197,14 @@ impl NativeObjectCodec for RaptorQNativeCodec {
             .source(StoredSymbols(symbols))
             .build()
             .map_err(|error| corrupt(&format!("native RaptorQ receiver: {error}")))?;
-        let outcome = receiver.receive_object(&native, &params)
+        let outcome = receiver
+            .receive_object(&native, &params)
             .map_err(|error| codec_error(error.kind(), error.to_string()))?;
         checkpoint(cx)?;
         if outcome.data.len() != len || Self::object_id(&outcome.data)? != object_id {
-            return Err(corrupt("native RaptorQ decoded payload identity/length mismatch"));
+            return Err(corrupt(
+                "native RaptorQ decoded payload identity/length mismatch",
+            ));
         }
         Ok(outcome.data)
     }
@@ -196,14 +229,26 @@ fn validate_key(key: u32, oti: Oti) -> Result<(SymbolKind, u8, u32)> {
         return Err(corrupt("native RaptorQ symbol block is outside its object"));
     }
     let offset = u64::from(block) * 65_536;
-    let bytes = oti.f.checked_sub(offset).ok_or_else(|| corrupt("native RaptorQ block offset overflow"))?.min(65_536);
+    let bytes = oti
+        .f
+        .checked_sub(offset)
+        .ok_or_else(|| corrupt("native RaptorQ block offset overflow"))?
+        .min(65_536);
     let k = bytes.div_ceil(u64::from(SYMBOL_BYTES));
     let esi = key & ESI_MASK;
     let repair = key & REPAIR_BIT != 0;
     if (repair && u64::from(esi) < k) || (!repair && u64::from(esi) >= k) {
         return Err(corrupt("native RaptorQ symbol kind/ESI mismatch"));
     }
-    Ok((if repair { SymbolKind::Repair } else { SymbolKind::Source }, block, esi))
+    Ok((
+        if repair {
+            SymbolKind::Repair
+        } else {
+            SymbolKind::Source
+        },
+        block,
+        esi,
+    ))
 }
 
 fn configuration() -> RaptorQConfig {
@@ -216,21 +261,30 @@ fn configuration() -> RaptorQConfig {
 
 fn native_context(cx: &Cx) -> Result<NativeCx> {
     checkpoint(cx)?;
-    cx.attached_native_cx().or_else(NativeCx::current).ok_or_else(|| {
-        FrankenError::BackgroundWorkerFailed("native RaptorQ requires the caller's runtime context".to_owned())
-    })
+    cx.attached_native_cx()
+        .or_else(NativeCx::current)
+        .ok_or_else(|| {
+            FrankenError::BackgroundWorkerFailed(
+                "native RaptorQ requires the caller's runtime context".to_owned(),
+            )
+        })
 }
 
 fn checkpoint(cx: &Cx) -> Result<()> {
     cx.checkpoint().map_err(|_| FrankenError::Interrupt)
 }
 fn corrupt(detail: &str) -> FrankenError {
-    FrankenError::WalCorrupt { detail: detail.to_owned() }
+    FrankenError::WalCorrupt {
+        detail: detail.to_owned(),
+    }
 }
 fn codec_error(kind: ErrorKind, detail: String) -> FrankenError {
     match kind {
-        ErrorKind::Cancelled | ErrorKind::CancelTimeout | ErrorKind::DeadlineExceeded
-        | ErrorKind::PollQuotaExhausted | ErrorKind::CostQuotaExhausted => FrankenError::Interrupt,
+        ErrorKind::Cancelled
+        | ErrorKind::CancelTimeout
+        | ErrorKind::DeadlineExceeded
+        | ErrorKind::PollQuotaExhausted
+        | ErrorKind::CostQuotaExhausted => FrankenError::Interrupt,
         _ => corrupt(&format!("native RaptorQ failed: {detail}")),
     }
 }
@@ -238,20 +292,46 @@ fn codec_error(kind: ErrorKind, detail: String) -> FrankenError {
 #[derive(Default)]
 struct CollectSymbols(Vec<Symbol>);
 impl SymbolSink for CollectSymbols {
-    fn poll_send(mut self: Pin<&mut Self>, _: &mut Context<'_>, symbol: AuthenticatedSymbol) -> Poll<std::result::Result<(), SinkError>> {
+    fn poll_send(
+        mut self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        symbol: AuthenticatedSymbol,
+    ) -> Poll<std::result::Result<(), SinkError>> {
         self.0.push(symbol.into_symbol());
         Poll::Ready(Ok(()))
     }
-    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::result::Result<(), SinkError>> { Poll::Ready(Ok(())) }
-    fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::result::Result<(), SinkError>> { Poll::Ready(Ok(())) }
-    fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::result::Result<(), SinkError>> { Poll::Ready(Ok(())) }
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+    ) -> Poll<std::result::Result<(), SinkError>> {
+        Poll::Ready(Ok(()))
+    }
+    fn poll_close(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+    ) -> Poll<std::result::Result<(), SinkError>> {
+        Poll::Ready(Ok(()))
+    }
+    fn poll_ready(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+    ) -> Poll<std::result::Result<(), SinkError>> {
+        Poll::Ready(Ok(()))
+    }
 }
 
 struct StoredSymbols(VecDeque<AuthenticatedSymbol>);
 impl SymbolStream for StoredSymbols {
-    fn poll_next(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<std::result::Result<AuthenticatedSymbol, StreamError>>> {
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+    ) -> Poll<Option<std::result::Result<AuthenticatedSymbol, StreamError>>> {
         Poll::Ready(self.0.pop_front().map(Ok))
     }
-    fn size_hint(&self) -> (usize, Option<usize>) { (self.0.len(), Some(self.0.len())) }
-    fn is_exhausted(&self) -> bool { self.0.is_empty() }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.0.len(), Some(self.0.len()))
+    }
+    fn is_exhausted(&self) -> bool {
+        self.0.is_empty()
+    }
 }

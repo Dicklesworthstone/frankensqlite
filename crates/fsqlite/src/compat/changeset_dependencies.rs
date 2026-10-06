@@ -155,9 +155,7 @@ where
         let before = pending.len();
         let mut retained = 0;
         for position in 0..before {
-            *attempts_left = attempts_left
-                .checked_sub(1)
-                .ok_or(FrankenError::TooBig)?;
+            *attempts_left = attempts_left.checked_sub(1).ok_or(FrankenError::TooBig)?;
             let index = pending[position];
             let change = &table.rows[index];
             let outcome = if resolve {
@@ -201,7 +199,10 @@ async fn pragma_flag(conn: &Connection, name: &'static str) -> ApplyResult<bool>
 /// or constant-memory check on a database with many violations.
 async fn require_clean_foreign_keys(conn: &Connection) -> ApplyResult<()> {
     if !pragma_flag(conn, "foreign_keys").await? {
-        return Err(schema("main", "deferred apply requires PRAGMA foreign_keys=ON"));
+        return Err(schema(
+            "main",
+            "deferred apply requires PRAGMA foreign_keys=ON",
+        ));
     }
     let databases = conn.query("PRAGMA database_list").await?;
     let mut names: Vec<String> = Vec::new();
@@ -222,7 +223,10 @@ async fn require_clean_foreign_keys(conn: &Connection) -> ApplyResult<()> {
     }
     for name in names {
         let violations = conn
-            .query(&format!("PRAGMA {}.foreign_key_check", quote_identifier(&name)))
+            .query(&format!(
+                "PRAGMA {}.foreign_key_check",
+                quote_identifier(&name)
+            ))
             .await?;
         if !violations.is_empty() {
             return Err(FrankenError::ForeignKeyViolation.into());
@@ -317,7 +321,11 @@ where
             }
         }
         let mut plans = Vec::new();
-        for table in changeset.tables.iter().filter(|table| !table.rows.is_empty()) {
+        for table in changeset
+            .tables
+            .iter()
+            .filter(|table| !table.rows.is_empty())
+        {
             plans.push((table, TablePlan::load(conn, table).await?));
         }
         let mut report = SqlChangesetApplyReport::default();
@@ -447,7 +455,10 @@ mod tests {
                     })
                     .await
                     .unwrap();
-                    assert_eq!(calls, 0, "transient UNIQUE failures are not application conflicts");
+                    assert_eq!(
+                        calls, 0,
+                        "transient UNIQUE failures are not application conflicts"
+                    );
                     assert_eq!(report.applied, usize::try_from(count).unwrap());
                     assert_eq!((report.skipped, report.replaced), (0, 0));
                     let stock = rusqlite::Connection::open_in_memory().unwrap();
@@ -455,10 +466,14 @@ mod tests {
                         .execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY,v INTEGER UNIQUE)")
                         .unwrap();
                     for i in 1..=count {
-                        stock.execute("INSERT INTO t VALUES(?1,?2)", [i, i]).unwrap();
+                        stock
+                            .execute("INSERT INTO t VALUES(?1,?2)", [i, i])
+                            .unwrap();
                     }
                     for i in (1..=count).rev() {
-                        stock.execute("UPDATE t SET v=?1 WHERE id=?2", [i + 1, i]).unwrap();
+                        stock
+                            .execute("UPDATE t SET v=?1 WHERE id=?2", [i + 1, i])
+                            .unwrap();
                     }
                     let expected: Vec<(i64, i64)> = stock
                         .prepare("SELECT id,v FROM t ORDER BY id")
@@ -469,7 +484,10 @@ mod tests {
                         .unwrap();
                     assert_eq!(values(&conn).await, expected);
                     assert_eq!(
-                        conn.query_row("PRAGMA integrity_check").await.unwrap().get(0),
+                        conn.query_row("PRAGMA integrity_check")
+                            .await
+                            .unwrap()
+                            .get(0),
                         Some(&SqliteValue::Text("ok".into()))
                     );
                     assert!(!conn.in_transaction());
@@ -482,7 +500,9 @@ mod tests {
     fn insert_waits_for_later_delete_without_leaking_failed_trigger_effects() {
         asupersync::test_utils::run_test(|| async {
             let mut conn = setup(1).await;
-            conn.execute("CREATE TABLE audit(id INTEGER PRIMARY KEY)").await.unwrap();
+            conn.execute("CREATE TABLE audit(id INTEGER PRIMARY KEY)")
+                .await
+                .unwrap();
             conn.execute("CREATE TRIGGER audit_insert BEFORE INSERT ON t BEGIN INSERT INTO audit VALUES(new.id); END").await.unwrap();
             let incoming = changes(vec![
                 insert(2, 1),
@@ -493,7 +513,10 @@ mod tests {
                     new_values: Vec::new(),
                 },
             ]);
-            assert_eq!(apply_changeset(&mut conn, &incoming).await.unwrap().applied, 2);
+            assert_eq!(
+                apply_changeset(&mut conn, &incoming).await.unwrap().applied,
+                2
+            );
             assert_eq!(values(&conn).await, vec![(2, 1)]);
             let audit = conn.query("SELECT id FROM audit").await.unwrap();
             assert_eq!(audit.len(), 1);
@@ -510,15 +533,29 @@ mod tests {
                 let mut seen = Vec::new();
                 let result = apply_changeset_with_handler(&mut conn, &incoming, |conflict| {
                     seen.push((conflict.kind, conflict.row));
-                    if omit { ConflictAction::OmitChange } else { ConflictAction::Abort }
+                    if omit {
+                        ConflictAction::OmitChange
+                    } else {
+                        ConflictAction::Abort
+                    }
                 })
                 .await;
                 assert_eq!(seen, vec![(ConflictType::Constraint, 1)]);
                 if omit {
-                    assert_eq!(result.unwrap(), SqlChangesetApplyReport { applied: 2, skipped: 1, replaced: 0 });
+                    assert_eq!(
+                        result.unwrap(),
+                        SqlChangesetApplyReport {
+                            applied: 2,
+                            skipped: 1,
+                            replaced: 0
+                        }
+                    );
                     assert_eq!(values(&conn).await, vec![(1, 1), (2, 2), (4, 4)]);
                 } else {
-                    assert!(matches!(result, Err(SqlChangesetApplyError::Constraint { row: 1, .. })));
+                    assert!(matches!(
+                        result,
+                        Err(SqlChangesetApplyError::Constraint { row: 1, .. })
+                    ));
                     assert_eq!(values(&conn).await, vec![(1, 1)]);
                 }
                 assert!(!conn.in_transaction());
@@ -530,8 +567,14 @@ mod tests {
     fn retry_resource_exhaustion_rolls_back_all_provisional_progress() {
         asupersync::test_utils::run_test(|| async {
             for limits in [
-                RetryLimits { max_deferred_rows: 1, max_retry_attempts: 100 },
-                RetryLimits { max_deferred_rows: 4, max_retry_attempts: 0 },
+                RetryLimits {
+                    max_deferred_rows: 1,
+                    max_retry_attempts: 100,
+                },
+                RetryLimits {
+                    max_deferred_rows: 4,
+                    max_retry_attempts: 0,
+                },
             ] {
                 let mut conn = setup(3).await;
                 let incoming = changes(vec![update(1, 1, 2), update(2, 2, 3), update(3, 3, 4)]);
@@ -541,11 +584,20 @@ mod tests {
                     ConflictAction::OmitChange
                 })
                 .await;
-                assert!(matches!(result, Err(SqlChangesetApplyError::Database(FrankenError::TooBig))));
-                assert_eq!(calls, 0, "resource admission cannot become an omittable constraint");
+                assert!(matches!(
+                    result,
+                    Err(SqlChangesetApplyError::Database(FrankenError::TooBig))
+                ));
+                assert_eq!(
+                    calls, 0,
+                    "resource admission cannot become an omittable constraint"
+                );
                 assert_eq!(values(&conn).await, vec![(1, 1), (2, 2), (3, 3)]);
                 assert!(!conn.in_transaction());
-                assert_eq!(apply_changeset(&mut conn, &incoming).await.unwrap().applied, 3);
+                assert_eq!(
+                    apply_changeset(&mut conn, &incoming).await.unwrap().applied,
+                    3
+                );
                 assert_eq!(values(&conn).await, vec![(1, 2), (2, 3), (3, 4)]);
             }
         });
@@ -565,7 +617,14 @@ mod tests {
                 },
             ]);
             let result = apply_changeset(&mut conn, &incoming).await;
-            assert!(matches!(result, Err(SqlChangesetApplyError::Conflict { kind: ConflictType::Conflict, row: 0, .. })));
+            assert!(matches!(
+                result,
+                Err(SqlChangesetApplyError::Conflict {
+                    kind: ConflictType::Conflict,
+                    row: 0,
+                    ..
+                })
+            ));
             assert_eq!(values(&conn).await, vec![(1, 1)]);
         });
     }
@@ -577,19 +636,50 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("dependencies.db");
             let mut conn = Connection::open(path.to_str().unwrap()).await.unwrap();
-            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY,v INTEGER UNIQUE)").await.unwrap();
-            conn.execute("INSERT INTO t VALUES(1,1),(2,2),(3,3)").await.unwrap();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY,v INTEGER UNIQUE)")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO t VALUES(1,1),(2,2),(3,3)")
+                .await
+                .unwrap();
             let incoming = changes(vec![update(1, 1, 2), update(2, 2, 3), update(3, 3, 4)]);
-            assert_eq!(apply_changeset(&mut conn, &incoming).await.unwrap().applied, 3);
+            assert_eq!(
+                apply_changeset(&mut conn, &incoming).await.unwrap().applied,
+                3
+            );
             conn.close().await.unwrap();
             let reopened = Connection::open(path.to_str().unwrap()).await.unwrap();
             assert_eq!(values(&reopened).await, vec![(1, 2), (2, 3), (3, 4)]);
-            assert_eq!(reopened.query_row("SELECT id FROM t WHERE v=3").await.unwrap().get(0), Some(&SqliteValue::Integer(2)));
-            assert_eq!(reopened.query_row("PRAGMA integrity_check").await.unwrap().get(0), Some(&SqliteValue::Text("ok".into())));
+            assert_eq!(
+                reopened
+                    .query_row("SELECT id FROM t WHERE v=3")
+                    .await
+                    .unwrap()
+                    .get(0),
+                Some(&SqliteValue::Integer(2))
+            );
+            assert_eq!(
+                reopened
+                    .query_row("PRAGMA integrity_check")
+                    .await
+                    .unwrap()
+                    .get(0),
+                Some(&SqliteValue::Text("ok".into()))
+            );
             reopened.close().await.unwrap();
             let stock = rusqlite::Connection::open(&path).unwrap();
-            assert_eq!(stock.query_row("SELECT id FROM t WHERE v=3", [], |row| row.get::<_, i64>(0)).unwrap(), 2);
-            assert_eq!(stock.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0)).unwrap(), "ok");
+            assert_eq!(
+                stock
+                    .query_row("SELECT id FROM t WHERE v=3", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                2
+            );
+            assert_eq!(
+                stock
+                    .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+                    .unwrap(),
+                "ok"
+            );
         });
     }
 
@@ -605,20 +695,28 @@ mod tests {
             kind: ChangesetKind::Changeset,
             tables: vec![
                 table("t", 2, vec![insert(1, 9)]),
-                table("parent", 1, vec![ChangesetRow {
-                    op: ChangeOp::Insert,
-                    indirect: false,
-                    old_values: Vec::new(),
-                    new_values: vec![ChangesetValue::Integer(9)],
-                }]),
+                table(
+                    "parent",
+                    1,
+                    vec![ChangesetRow {
+                        op: ChangeOp::Insert,
+                        indirect: false,
+                        old_values: Vec::new(),
+                        new_values: vec![ChangesetValue::Integer(9)],
+                    }],
+                ),
             ],
         }
     }
 
     async fn fk_setup(conn: &Connection) {
         conn.execute("PRAGMA foreign_keys=ON").await.unwrap();
-        conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)").await.unwrap();
-        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY,v INTEGER REFERENCES parent(id))").await.unwrap();
+        conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")
+            .await
+            .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY,v INTEGER REFERENCES parent(id))")
+            .await
+            .unwrap();
     }
 
     async fn assert_policy_reset(conn: &Connection) {
@@ -642,18 +740,35 @@ mod tests {
                 };
                 assert!(matches!(
                     apply_changeset(&mut conn, &incoming).await,
-                    Err(SqlChangesetApplyError::Constraint { error: FrankenError::ForeignKeyViolation, .. })
+                    Err(SqlChangesetApplyError::Constraint {
+                        error: FrankenError::ForeignKeyViolation,
+                        ..
+                    })
                 ));
                 assert!(values(&conn).await.is_empty());
                 let mut calls = 0;
                 let report = apply_with_options(&mut conn, &incoming, deferred(), |_| {
                     calls += 1;
                     ConflictAction::Abort
-                }).await.unwrap();
-                assert_eq!(report, SqlChangesetApplyReport { applied: 2, skipped: 0, replaced: 0 });
+                })
+                .await
+                .unwrap();
+                assert_eq!(
+                    report,
+                    SqlChangesetApplyReport {
+                        applied: 2,
+                        skipped: 0,
+                        replaced: 0
+                    }
+                );
                 assert_eq!(calls, 0);
                 assert_eq!(values(&conn).await, vec![(1, 9)]);
-                assert!(conn.query("PRAGMA foreign_key_check").await.unwrap().is_empty());
+                assert!(
+                    conn.query("PRAGMA foreign_key_check")
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
                 assert_policy_reset(&conn).await;
                 assert!(conn.execute("INSERT INTO t VALUES(2,99)").await.is_err());
             }
@@ -665,18 +780,29 @@ mod tests {
         asupersync::test_utils::run_test(|| async {
             let mut conn = setup(3).await;
             conn.execute("PRAGMA foreign_keys=ON").await.unwrap();
-            conn.execute("CREATE TABLE a(id INTEGER PRIMARY KEY,bid REFERENCES b(id))").await.unwrap();
-            conn.execute("CREATE TABLE b(id INTEGER PRIMARY KEY,aid REFERENCES a(id))").await.unwrap();
+            conn.execute("CREATE TABLE a(id INTEGER PRIMARY KEY,bid REFERENCES b(id))")
+                .await
+                .unwrap();
+            conn.execute("CREATE TABLE b(id INTEGER PRIMARY KEY,aid REFERENCES a(id))")
+                .await
+                .unwrap();
             let mut incoming = changes(vec![update(1, 1, 2), update(2, 2, 3), update(3, 3, 4)]);
             incoming.tables.insert(0, table("b", 2, vec![insert(2, 1)]));
             incoming.tables.insert(0, table("a", 2, vec![insert(1, 2)]));
-            let report = apply_with_options(&mut conn, &incoming, deferred(), |_| ConflictAction::Abort)
-                .await.unwrap();
+            let report =
+                apply_with_options(&mut conn, &incoming, deferred(), |_| ConflictAction::Abort)
+                    .await
+                    .unwrap();
             assert_eq!(report.applied, 5);
             assert_eq!(values(&conn).await, vec![(1, 2), (2, 3), (3, 4)]);
             assert_eq!(conn.query("SELECT * FROM a").await.unwrap().len(), 1);
             assert_eq!(conn.query("SELECT * FROM b").await.unwrap().len(), 1);
-            assert!(conn.query("PRAGMA foreign_key_check").await.unwrap().is_empty());
+            assert!(
+                conn.query("PRAGMA foreign_key_check")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
             assert_policy_reset(&conn).await;
         });
     }
@@ -686,31 +812,64 @@ mod tests {
         asupersync::test_utils::run_test(|| async {
             let mut conn = Connection::open(":memory:").await.unwrap();
             conn.execute("PRAGMA foreign_keys=ON").await.unwrap();
-            conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY,v TEXT NOT NULL)").await.unwrap();
-            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY,v REFERENCES parent(id))").await.unwrap();
-            conn.execute("CREATE TABLE audit(id INTEGER PRIMARY KEY)").await.unwrap();
+            conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY,v TEXT NOT NULL)")
+                .await
+                .unwrap();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY,v REFERENCES parent(id))")
+                .await
+                .unwrap();
+            conn.execute("CREATE TABLE audit(id INTEGER PRIMARY KEY)")
+                .await
+                .unwrap();
             conn.execute("CREATE TRIGGER log_t AFTER INSERT ON t BEGIN INSERT INTO audit VALUES(new.id); END").await.unwrap();
             let mut incoming = child_and_parent();
-            incoming.tables[1] = table("parent", 2, vec![ChangesetRow {
-                op: ChangeOp::Insert,
-                indirect: false,
-                old_values: Vec::new(),
-                new_values: vec![ChangesetValue::Integer(9), ChangesetValue::Null],
-            }]);
+            incoming.tables[1] = table(
+                "parent",
+                2,
+                vec![ChangesetRow {
+                    op: ChangeOp::Insert,
+                    indirect: false,
+                    old_values: Vec::new(),
+                    new_values: vec![ChangesetValue::Integer(9), ChangesetValue::Null],
+                }],
+            );
             let mut calls = 0;
             let result = apply_with_options(&mut conn, &incoming, deferred(), |conflict| {
                 calls += 1;
-                assert!(matches!(conflict.error, Some(FrankenError::NotNullViolation { .. })));
+                assert!(matches!(
+                    conflict.error,
+                    Some(FrankenError::NotNullViolation { .. })
+                ));
                 ConflictAction::OmitChange
-            }).await;
-            assert!(matches!(result, Err(SqlChangesetApplyError::Database(FrankenError::ForeignKeyViolation))));
-            assert_eq!(calls, 1, "final FK failure is not an omittable row conflict");
+            })
+            .await;
+            assert!(matches!(
+                result,
+                Err(SqlChangesetApplyError::Database(
+                    FrankenError::ForeignKeyViolation
+                ))
+            ));
+            assert_eq!(
+                calls, 1,
+                "final FK failure is not an omittable row conflict"
+            );
             for name in ["t", "parent", "audit"] {
-                assert!(conn.query(&format!("SELECT * FROM {name}")).await.unwrap().is_empty());
+                assert!(
+                    conn.query(&format!("SELECT * FROM {name}"))
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
             }
             assert_policy_reset(&conn).await;
             incoming.tables[1].rows[0].new_values[1] = ChangesetValue::Text("parent".to_owned());
-            assert_eq!(apply_with_options(&mut conn, &incoming, deferred(), |_| ConflictAction::Abort).await.unwrap().applied, 2);
+            assert_eq!(
+                apply_with_options(&mut conn, &incoming, deferred(), |_| ConflictAction::Abort)
+                    .await
+                    .unwrap()
+                    .applied,
+                2
+            );
             assert_eq!(conn.query("SELECT * FROM audit").await.unwrap().len(), 1);
         });
     }
@@ -721,20 +880,38 @@ mod tests {
             for name in ["main", "temp"] {
                 let mut conn = setup(0).await;
                 conn.execute("PRAGMA foreign_keys=OFF").await.unwrap();
-                conn.execute(&format!("CREATE TABLE {name}.bad_parent(id INTEGER PRIMARY KEY)")).await.unwrap();
+                conn.execute(&format!(
+                    "CREATE TABLE {name}.bad_parent(id INTEGER PRIMARY KEY)"
+                ))
+                .await
+                .unwrap();
                 conn.execute(&format!("CREATE TABLE {name}.bad_child(id INTEGER PRIMARY KEY,pid REFERENCES bad_parent(id))")).await.unwrap();
-                conn.execute(&format!("INSERT INTO {name}.bad_child VALUES(1,99)")).await.unwrap();
+                conn.execute(&format!("INSERT INTO {name}.bad_child VALUES(1,99)"))
+                    .await
+                    .unwrap();
                 conn.execute("PRAGMA foreign_keys=ON").await.unwrap();
                 for incoming in [changes(Vec::new()), changes(vec![insert(1, 1)])] {
                     let mut calls = 0;
                     let result = apply_with_options(&mut conn, &incoming, deferred(), |_| {
                         calls += 1;
                         ConflictAction::OmitChange
-                    }).await;
-                    assert!(matches!(result, Err(SqlChangesetApplyError::Database(FrankenError::ForeignKeyViolation))));
+                    })
+                    .await;
+                    assert!(matches!(
+                        result,
+                        Err(SqlChangesetApplyError::Database(
+                            FrankenError::ForeignKeyViolation
+                        ))
+                    ));
                     assert_eq!(calls, 0);
                     assert!(values(&conn).await.is_empty());
-                    assert_eq!(conn.query(&format!("SELECT * FROM {name}.bad_child")).await.unwrap().len(), 1);
+                    assert_eq!(
+                        conn.query(&format!("SELECT * FROM {name}.bad_child"))
+                            .await
+                            .unwrap()
+                            .len(),
+                        1
+                    );
                     assert_policy_reset(&conn).await;
                 }
             }
@@ -755,14 +932,30 @@ mod tests {
             conn.execute_with_params(
                 "ATTACH DATABASE ?1 AS \"odd\"\"attached\"",
                 &[SqliteValue::Text(path.to_str().unwrap().into())],
-            ).await.unwrap();
-            let result = apply_with_options(&mut conn, &changes(vec![insert(1, 1)]), deferred(), |_| ConflictAction::Abort).await;
-            assert!(matches!(result, Err(SqlChangesetApplyError::Database(FrankenError::ForeignKeyViolation))));
+            )
+            .await
+            .unwrap();
+            let result =
+                apply_with_options(&mut conn, &changes(vec![insert(1, 1)]), deferred(), |_| {
+                    ConflictAction::Abort
+                })
+                .await;
+            assert!(matches!(
+                result,
+                Err(SqlChangesetApplyError::Database(
+                    FrankenError::ForeignKeyViolation
+                ))
+            ));
             assert!(values(&conn).await.is_empty());
             assert_policy_reset(&conn).await;
             conn.close().await.unwrap();
             let stock = rusqlite::Connection::open(&path).unwrap();
-            assert_eq!(stock.query_row("SELECT pid FROM c", [], |row| row.get::<_, i64>(0)).unwrap(), 99);
+            assert_eq!(
+                stock
+                    .query_row("SELECT pid FROM c", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                99
+            );
         });
     }
 
@@ -771,11 +964,24 @@ mod tests {
         asupersync::test_utils::run_test(|| async {
             let mut conn = setup(0).await;
             conn.execute("PRAGMA foreign_keys=ON").await.unwrap();
-            conn.execute("CREATE TEMP TABLE p(id INTEGER PRIMARY KEY)").await.unwrap();
-            conn.execute("CREATE TEMP TABLE c(id INTEGER PRIMARY KEY,pid REFERENCES p(id))").await.unwrap();
+            conn.execute("CREATE TEMP TABLE p(id INTEGER PRIMARY KEY)")
+                .await
+                .unwrap();
+            conn.execute("CREATE TEMP TABLE c(id INTEGER PRIMARY KEY,pid REFERENCES p(id))")
+                .await
+                .unwrap();
             conn.execute("CREATE TEMP TRIGGER log_t AFTER INSERT ON t BEGIN INSERT INTO c VALUES(new.id,new.v); END").await.unwrap();
-            let result = apply_with_options(&mut conn, &changes(vec![insert(1, 99)]), deferred(), |_| ConflictAction::Abort).await;
-            assert!(matches!(result, Err(SqlChangesetApplyError::Database(FrankenError::ForeignKeyViolation))));
+            let result =
+                apply_with_options(&mut conn, &changes(vec![insert(1, 99)]), deferred(), |_| {
+                    ConflictAction::Abort
+                })
+                .await;
+            assert!(matches!(
+                result,
+                Err(SqlChangesetApplyError::Database(
+                    FrankenError::ForeignKeyViolation
+                ))
+            ));
             assert!(values(&conn).await.is_empty());
             assert!(conn.query("SELECT * FROM temp.c").await.unwrap().is_empty());
             assert_policy_reset(&conn).await;
@@ -789,7 +995,8 @@ mod tests {
             conn.execute("PRAGMA foreign_keys=OFF").await.unwrap();
             for incoming in [changes(Vec::new()), changes(vec![insert(1, 1)])] {
                 assert!(matches!(
-                    apply_with_options(&mut conn, &incoming, deferred(), |_| ConflictAction::Abort).await,
+                    apply_with_options(&mut conn, &incoming, deferred(), |_| ConflictAction::Abort)
+                        .await,
                     Err(SqlChangesetApplyError::Schema { .. })
                 ));
                 assert!(values(&conn).await.is_empty());
@@ -801,8 +1008,13 @@ mod tests {
             conn.execute("PRAGMA defer_foreign_keys=ON").await.unwrap();
             conn.execute("INSERT INTO t VALUES(9,9)").await.unwrap();
             assert!(matches!(
-                apply_with_options(&mut conn, &changes(vec![insert(1, 1)]), deferred(), |_| ConflictAction::Abort).await,
-                Err(SqlChangesetApplyError::Database(FrankenError::NestedTransaction))
+                apply_with_options(&mut conn, &changes(vec![insert(1, 1)]), deferred(), |_| {
+                    ConflictAction::Abort
+                })
+                .await,
+                Err(SqlChangesetApplyError::Database(
+                    FrankenError::NestedTransaction
+                ))
             ));
             assert!(conn.in_transaction());
             assert!(pragma_flag(&conn, "defer_foreign_keys").await.unwrap());
@@ -823,19 +1035,31 @@ mod tests {
             fk_setup(&conn).await;
             let mut incoming = child_and_parent();
             incoming.tables[0].rows.push(insert(1, 9));
-            let mut operation = Box::pin(apply_with_options(&mut conn, &incoming, deferred(), |_| {
-                panic!("deferred apply conflict handler panic");
-            }));
-            let panicked = poll_fn(|cx| match catch_unwind(AssertUnwindSafe(|| operation.as_mut().poll(cx))) {
-                Ok(Poll::Pending) => Poll::Pending,
-                Ok(Poll::Ready(_)) => Poll::Ready(false),
-                Err(_) => Poll::Ready(true),
-            }).await;
+            let mut operation =
+                Box::pin(apply_with_options(&mut conn, &incoming, deferred(), |_| {
+                    panic!("deferred apply conflict handler panic");
+                }));
+            let panicked = poll_fn(|cx| {
+                match catch_unwind(AssertUnwindSafe(|| operation.as_mut().poll(cx))) {
+                    Ok(Poll::Pending) => Poll::Pending,
+                    Ok(Poll::Ready(_)) => Poll::Ready(false),
+                    Err(_) => Poll::Ready(true),
+                }
+            })
+            .await;
             assert!(panicked);
             drop(operation);
             assert!(values(&conn).await.is_empty());
             assert_policy_reset(&conn).await;
-            assert_eq!(apply_with_options(&mut conn, &child_and_parent(), deferred(), |_| ConflictAction::Abort).await.unwrap().applied, 2);
+            assert_eq!(
+                apply_with_options(&mut conn, &child_and_parent(), deferred(), |_| {
+                    ConflictAction::Abort
+                })
+                .await
+                .unwrap()
+                .applied,
+                2
+            );
         });
     }
 
@@ -847,20 +1071,66 @@ mod tests {
             let path = directory.path().join("deferred.db");
             let mut conn = Connection::open(path.to_str().unwrap()).await.unwrap();
             fk_setup(&conn).await;
-            conn.execute("CREATE INDEX by_parent ON t(v)").await.unwrap();
+            conn.execute("CREATE INDEX by_parent ON t(v)")
+                .await
+                .unwrap();
             conn.execute("PRAGMA defer_foreign_keys=ON").await.unwrap();
-            assert_eq!(apply_with_options(&mut conn, &child_and_parent(), deferred(), |_| ConflictAction::Abort).await.unwrap().applied, 2);
+            assert_eq!(
+                apply_with_options(&mut conn, &child_and_parent(), deferred(), |_| {
+                    ConflictAction::Abort
+                })
+                .await
+                .unwrap()
+                .applied,
+                2
+            );
             assert_policy_reset(&conn).await;
             conn.close().await.unwrap();
             let reopened = Connection::open(path.to_str().unwrap()).await.unwrap();
             assert_eq!(values(&reopened).await, vec![(1, 9)]);
-            assert_eq!(reopened.query_row("SELECT id FROM t INDEXED BY by_parent WHERE v=9").await.unwrap().get(0), Some(&SqliteValue::Integer(1)));
-            assert!(reopened.query("PRAGMA foreign_key_check").await.unwrap().is_empty());
+            assert_eq!(
+                reopened
+                    .query_row("SELECT id FROM t INDEXED BY by_parent WHERE v=9")
+                    .await
+                    .unwrap()
+                    .get(0),
+                Some(&SqliteValue::Integer(1))
+            );
+            assert!(
+                reopened
+                    .query("PRAGMA foreign_key_check")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
             reopened.close().await.unwrap();
             let stock = rusqlite::Connection::open(&path).unwrap();
-            assert_eq!(stock.query_row("SELECT t.id FROM t JOIN parent ON t.v=parent.id", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
-            assert_eq!(stock.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0)).unwrap(), "ok");
-            assert!(stock.prepare("PRAGMA foreign_key_check").unwrap().query([]).unwrap().next().unwrap().is_none());
+            assert_eq!(
+                stock
+                    .query_row(
+                        "SELECT t.id FROM t JOIN parent ON t.v=parent.id",
+                        [],
+                        |row| row.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                stock
+                    .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+                    .unwrap(),
+                "ok"
+            );
+            assert!(
+                stock
+                    .prepare("PRAGMA foreign_key_check")
+                    .unwrap()
+                    .query([])
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .is_none()
+            );
         });
     }
 }

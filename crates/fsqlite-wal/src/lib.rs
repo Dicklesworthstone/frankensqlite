@@ -149,7 +149,7 @@ pub use wal_fec::{
     WalFecRepairEvidenceCard, WalFecRepairEvidenceQuery, WalFecRepairMetricsSnapshot,
     WalFecRepairPipeline, WalFecRepairPipelineConfig, WalFecRepairPipelineStats,
     WalFecRepairSeverityBucket, WalFecRepairSeverityHistogram, WalFecRepairSource,
-    WalFecRepairWitnessTriple, WalFecRepairWorkItem, WalFrameCandidate, WalFecScanResult,
+    WalFecRepairWitnessTriple, WalFecRepairWorkItem, WalFecScanResult, WalFrameCandidate,
     append_wal_fec_group, build_source_page_hashes, ensure_wal_with_fec_sidecar,
     find_wal_fec_group, generate_wal_fec_repair_symbols, identify_damaged_commit_group,
     persist_wal_fec_raptorq_repair_symbols, query_raptorq_repair_evidence,

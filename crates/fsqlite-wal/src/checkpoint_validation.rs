@@ -20,11 +20,10 @@ pub(super) fn validate_checkpoint_state<F: VfsFile>(
     state: CheckpointState,
 ) -> Result<()> {
     // bd-km8qs: do not turn a stale plan into permission to discard a newer tail.
-    let live_frame_count = u32::try_from(wal.frame_count()).map_err(|_| {
-        FrankenError::CheckpointFailed {
+    let live_frame_count =
+        u32::try_from(wal.frame_count()).map_err(|_| FrankenError::CheckpointFailed {
             detail: "WAL frame count exceeds the checkpoint counter domain".to_owned(),
-        }
-    })?;
+        })?;
     if state.total_frames != live_frame_count {
         return Err(FrankenError::CheckpointFailed {
             detail: format!(
@@ -57,7 +56,10 @@ pub(super) fn validate_checkpoint_state<F: VfsFile>(
 
 /// Verify the physical generation against the handle's accepted header.
 /// A checksum-torn header receives one retry, as in the WAL replay path.
-async fn checkpoint_header_checksum<F: VfsFile>(wal: &WalFile<F>, cx: &Cx) -> Result<SqliteWalChecksum> {
+async fn checkpoint_header_checksum<F: VfsFile>(
+    wal: &WalFile<F>,
+    cx: &Cx,
+) -> Result<SqliteWalChecksum> {
     for _ in 0..2 {
         let mut bytes = [0_u8; WAL_HEADER_SIZE];
         let read = wal.file().read(cx, &mut bytes, 0).await?;
