@@ -20124,7 +20124,7 @@ fn codegen_select_aggregate(
                         table,
                         table_alias,
                         schema: Some(schema),
-                        register_base: Some(null_base),
+                        register_base: Some(RegisterRow::columns(null_base)),
                         secondaries: &[],
                     };
                     emit_expr(b, bare, accum_reg, Some(&null_ctx));
@@ -20478,7 +20478,7 @@ fn emit_agg_wrapper(b: &mut ProgramBuilder, wrapper: &Expr, result_reg: i32) {
         table: &fake_table,
         table_alias: None,
         schema: None,
-        register_base: Some(result_reg),
+        register_base: Some(RegisterRow::columns(result_reg)),
         secondaries: &[],
     };
     let temp = b.alloc_temp();
@@ -20529,7 +20529,7 @@ fn emit_simple_agg_wrapper(
         table: &fake_table,
         table_alias: None,
         schema: None,
-        register_base: Some(accum_reg),
+        register_base: Some(RegisterRow::columns(accum_reg)),
         secondaries: &[],
     };
     let temp = b.alloc_temp();
@@ -20593,7 +20593,7 @@ fn emit_multi_agg_wrapper(
         table: &fake_table,
         table_alias: None,
         schema: None,
-        register_base: Some(fake_base),
+        register_base: Some(RegisterRow::columns(fake_base)),
         secondaries: &[],
     };
     let temp = b.alloc_temp();
@@ -23110,12 +23110,15 @@ fn emit_upsert_probe(
     no_conflict_label: Label,
 ) -> i32 {
     if let Some((idx_offset, index)) = find_upsert_target_index(table, target) {
+        // The attempted row's rowid is already decided (explicit or NewRowid)
+        // before the probe, so a partial predicate naming a rowid alias sees
+        // it, as stock's constraint checks do.
         let attempted_row_ctx = ScanCtx {
             cursor,
             table,
             table_alias,
             schema: None,
-            register_base: Some(val_regs),
+            register_base: Some(RegisterRow::with_rowid(val_regs, rowid_reg)),
             secondaries: &[],
         };
         emit_index_predicate_guard(b, index, &attempted_row_ctx, no_conflict_label);
@@ -23338,7 +23341,7 @@ fn emit_upsert_do_update_apply(
         table,
         table_alias: Some("excluded"),
         schema: Some(schema),
-        register_base: Some(val_regs),
+        register_base: Some(RegisterRow::columns(val_regs)),
         secondaries: &[],
     };
     let existing_ctx = ScanCtx {
@@ -23346,7 +23349,7 @@ fn emit_upsert_do_update_apply(
         table,
         table_alias,
         schema: Some(schema),
-        register_base: Some(existing_regs),
+        register_base: Some(RegisterRow::columns(existing_regs)),
         secondaries: &excluded_secondary,
     };
     let existing_hidden_rowid_reg = ctx
@@ -27458,7 +27461,7 @@ fn emit_without_rowid_index_inserts(
             table,
             table_alias: None,
             schema: None,
-            register_base: Some(col_regs),
+            register_base: Some(RegisterRow::columns(col_regs)),
             secondaries: &[],
         };
         emit_index_predicate_guard(b, index, &scan_ctx, skip_label);
@@ -27534,7 +27537,7 @@ fn emit_without_rowid_index_deletes(
             table,
             table_alias: None,
             schema: None,
-            register_base: col_regs,
+            register_base: col_regs.map(RegisterRow::columns),
             secondaries: &[],
         };
         emit_index_predicate_guard(b, index, &scan_ctx, skip_label);
@@ -27751,7 +27754,7 @@ fn emit_without_rowid_update_rewrite(
             table,
             table_alias: None,
             schema: None,
-            register_base: Some(new_regs),
+            register_base: Some(RegisterRow::columns(new_regs)),
             secondaries: &[],
         };
         emit_index_predicate_guard(b, index, &new_scan_ctx, idx_done);
@@ -28218,7 +28221,7 @@ fn emit_without_rowid_row_insert(
             table,
             table_alias: None,
             schema: None,
-            register_base: Some(val_regs),
+            register_base: Some(RegisterRow::columns(val_regs)),
             secondaries: &[],
         };
         emit_index_predicate_guard(b, index, &scan_ctx, idx_clear);
@@ -28401,7 +28404,7 @@ fn emit_without_rowid_upsert_probe(
             table,
             table_alias: None,
             schema: None,
-            register_base: Some(val_regs),
+            register_base: Some(RegisterRow::columns(val_regs)),
             secondaries: &[],
         };
         let idx_key_regs = b.alloc_regs(n_idx_cols as i32);
@@ -28496,7 +28499,7 @@ fn emit_without_rowid_upsert_probe(
                     table,
                     table_alias: None,
                     schema: None,
-                    register_base: Some(val_regs),
+                    register_base: Some(RegisterRow::columns(val_regs)),
                     secondaries: &[],
                 };
                 let idx_key_regs = b.alloc_regs(n_idx_cols as i32);
@@ -28608,7 +28611,7 @@ fn emit_without_rowid_upsert_do_update_apply(
         table,
         table_alias: Some("excluded"),
         schema: Some(schema),
-        register_base: Some(val_regs),
+        register_base: Some(RegisterRow::columns(val_regs)),
         secondaries: &[],
     };
     let existing_ctx = ScanCtx {
@@ -28616,7 +28619,7 @@ fn emit_without_rowid_upsert_do_update_apply(
         table,
         table_alias: target_alias,
         schema: Some(schema),
-        register_base: Some(existing_regs),
+        register_base: Some(RegisterRow::columns(existing_regs)),
         secondaries: &excluded_secondary,
     };
     // WITHOUT ROWID tables have no hidden rowid, so no column ever resolves to a
@@ -29547,7 +29550,7 @@ fn codegen_update_without_rowid(
         table,
         table_alias: stmt.table.alias.as_deref(),
         schema: Some(schema),
-        register_base: Some(col_regs),
+        register_base: Some(RegisterRow::columns(col_regs)),
         secondaries: &[],
     };
     // Reset the placeholder counter to 1 for the SET expressions (Pass 2): they
@@ -30299,7 +30302,7 @@ fn emit_stored_generated_columns(b: &mut ProgramBuilder, table: &TableSchema, va
                     table,
                     table_alias: None,
                     schema: None,
-                    register_base: Some(val_regs),
+                    register_base: Some(RegisterRow::columns(val_regs)),
                     secondaries: &[],
                 };
                 b.with_schema_evaluation_context(SchemaEvaluationContext::GeneratedColumn, |b| {
@@ -30326,7 +30329,7 @@ fn emit_stored_generated_columns(b: &mut ProgramBuilder, table: &TableSchema, va
             table,
             table_alias: None,
             schema: None,
-            register_base: Some(val_regs),
+            register_base: Some(RegisterRow::columns(val_regs)),
             secondaries: &[],
         };
         for (col_idx, col) in table.columns.iter().enumerate() {
@@ -30534,7 +30537,7 @@ fn emit_check_constraints(
             table,
             table_alias: None,
             schema: None,
-            register_base: Some(val_regs),
+            register_base: Some(RegisterRow::columns(val_regs)),
             secondaries: &[],
         };
 
@@ -30606,7 +30609,7 @@ fn emit_not_null_constraints(
                     table,
                     table_alias: None,
                     schema: None,
-                    register_base: Some(val_regs),
+                    register_base: Some(RegisterRow::columns(val_regs)),
                     secondaries: &[],
                 };
                 emit_virtual_generated_column(b, col_idx, &expr, scratch, &gen_ctx);
@@ -30755,12 +30758,15 @@ fn emit_index_inserts_filtered(
         let idx_cursor = table_cursor + 1 + idx_offset as i32;
         let n_idx_cols = index.key_term_count();
         let skip_label = b.emit_label();
+        // bd-q6sdy: the image carries the row's rowid so a partial-index
+        // predicate naming `rowid` / `_rowid_` / `oid` tests the new row's key
+        // rather than NULL (which skipped the entry and corrupted the index).
         let scan_ctx = ScanCtx {
             cursor: table_cursor,
             table,
             table_alias: None,
             schema: None,
-            register_base: Some(col_regs),
+            register_base: Some(RegisterRow::with_rowid(col_regs, rowid_reg)),
             secondaries: &[],
         };
 
@@ -31136,7 +31142,7 @@ fn emit_table_column_read_from_register_row(
             table,
             table_alias,
             schema,
-            register_base: Some(source_base),
+            register_base: Some(RegisterRow::columns(source_base)),
             secondaries: &[],
         };
         emit_virtual_generated_column(b, column_index, &generated_expr, target, &scan);
@@ -31169,7 +31175,7 @@ fn emit_projection_from_register_row(
         table,
         table_alias,
         schema: Some(schema),
-        register_base: Some(source_base),
+        register_base: Some(RegisterRow::columns(source_base)),
         secondaries: &[],
     };
     let mut target = output_base;
@@ -31320,7 +31326,7 @@ fn emit_returning_from_regs(
                     table,
                     table_alias,
                     schema: Some(schema),
-                    register_base: Some(col_regs),
+                    register_base: Some(RegisterRow::columns(col_regs)),
                     secondaries: &[],
                 };
                 emit_expr(b, expr, reg, Some(&scan));
@@ -35702,10 +35708,11 @@ struct ScanCtx<'a> {
     table: &'a TableSchema,
     table_alias: Option<&'a str>,
     schema: Option<&'a [TableSchema]>,
-    /// When set, column references are resolved by copying from registers
-    /// (`register_base + col_index`) instead of reading from the B-tree cursor.
-    /// Used for generated column expression evaluation during INSERT.
-    register_base: Option<i32>,
+    /// When set, column references are resolved by copying from the row image
+    /// held in registers instead of reading from the B-tree cursor. Used where
+    /// the row exists only in registers, e.g. a row being written (generated
+    /// columns, CHECK, index key terms and partial-index predicates).
+    register_base: Option<RegisterRow>,
     /// Secondary table contexts for UPDATE ... FROM multi-table resolution.
     ///
     /// A single-table `UPDATE ... FROM src` carries one entry; a multi-source
@@ -35713,6 +35720,38 @@ struct ScanCtx<'a> {
     /// source. Column references are resolved against the primary (target)
     /// table first, then each secondary in order.
     secondaries: &'a [SecondaryScan<'a>],
+}
+
+/// A table row image held in registers rather than under a cursor (stock's
+/// `iSelfTab < 0` mode, where the row's rowid register sits beside its column
+/// registers).
+#[derive(Clone, Copy, Debug)]
+struct RegisterRow {
+    /// Column `i` of the row is in register `columns + i`.
+    columns: i32,
+    /// Register holding the row's rowid, when the image has one. The hidden
+    /// rowid aliases (`rowid`, `_rowid_`, `oid`) read it; without it they read
+    /// NULL. bd-q6sdy: an index-maintenance image without its rowid made every
+    /// `WHERE rowid > 0` partial-index predicate NULL, so the entry was skipped.
+    rowid: Option<i32>,
+}
+
+impl RegisterRow {
+    /// A row image that exposes no rowid register.
+    const fn columns(columns: i32) -> Self {
+        Self {
+            columns,
+            rowid: None,
+        }
+    }
+
+    /// A rowid-table row image whose rowid is already decided in `rowid`.
+    const fn with_rowid(columns: i32, rowid: i32) -> Self {
+        Self {
+            columns,
+            rowid: Some(rowid),
+        }
+    }
 }
 
 /// Secondary table scan context for UPDATE ... FROM (and the register-backed
@@ -36007,13 +36046,13 @@ fn emit_in_probe_value(
             // semantics: an INTEGER PRIMARY KEY is stored as the rowid rather
             // than in record column 0, and a VIRTUAL generated column must be
             // computed instead of reading its NULL storage placeholder.
-            if let Some(source_base) = probe_scan.register_base {
+            if let Some(source_row) = probe_scan.register_base {
                 emit_table_column_read_from_register_row(
                     b,
                     probe_source.table,
                     probe_source.table_alias,
                     probe_scan.schema,
-                    source_base,
+                    source_row.columns,
                     0,
                     reg,
                 );
@@ -37035,7 +37074,7 @@ fn try_emit_complex_in_subquery(
                     table,
                     table_alias,
                     schema: Some(schema),
-                    register_base: Some(source_base),
+                    register_base: Some(RegisterRow::columns(source_base)),
                     secondaries: &[],
                 };
                 emit_in_probe_value(b, 0, &probe_source, r_probe, &replay_scan);
@@ -38027,9 +38066,13 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                 b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
                 return;
             }
-            // Register-based resolution for generated column expressions
-            // during INSERT: copy from the register holding that column's value.
-            if let Some(reg_base) = sc.register_base {
+            // Register-based resolution for a row being written: copy from the
+            // register holding that column's value.
+            if let Some(RegisterRow {
+                columns: reg_base,
+                rowid,
+            }) = sc.register_base
+            {
                 if let Some(col_idx) = sc.table.column_index(&col_ref.column) {
                     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
                     if let Some(gen_expr) =
@@ -38045,6 +38088,12 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                     } else {
                         b.emit_op(Opcode::Copy, reg_base + col_idx as i32, reg, 0, P4::None, 0);
                     }
+                } else if let Some(rowid_reg) = rowid
+                    && sc.table.resolves_to_hidden_rowid(&col_ref.column)
+                {
+                    // bd-q6sdy: `rowid` / `_rowid_` / `oid` name the rowid of
+                    // the row being written, as in a partial-index WHERE.
+                    b.emit_op(Opcode::Copy, rowid_reg, reg, 0, P4::None, 0);
                 } else {
                     b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0);
                 }
@@ -60421,7 +60470,7 @@ mod tests {
                             table: &table,
                             table_alias: None,
                             schema: None,
-                            register_base: Some(row),
+                            register_base: Some(RegisterRow::columns(row)),
                             secondaries: &[],
                         };
                         let index = IndexSchema {
@@ -60519,6 +60568,77 @@ mod tests {
                 p5: 0,
             },
         ]);
+    }
+
+    /// bd-q6sdy: index maintenance evaluates a partial-index predicate against
+    /// the row image held in registers. A hidden rowid alias there must read
+    /// that image's rowid register (it read NULL, so the entry was never
+    /// written), while a declared column that shadows the alias keeps reading
+    /// its own column register.
+    #[test]
+    fn test_partial_index_predicate_rowid_alias_reads_row_image_rowid() {
+        fn ops_before_guard(table: &TableSchema, predicate: &str) -> (Vec<VdbeOp>, i32, i32) {
+            let mut table = table.clone();
+            table.indexes = vec![IndexSchema {
+                name: "idx_partial_rowid".to_owned(),
+                root_page: 3,
+                columns: vec!["a".to_owned()],
+                key_expressions: Vec::new(),
+                key_sort_directions: Vec::new(),
+                where_clause: Some(predicate.to_owned()),
+                is_unique: false,
+                key_collations: Vec::new(),
+                conflict_action: None,
+            }];
+            let mut builder = ProgramBuilder::new();
+            let column_count = i32::try_from(table.columns.len()).expect("small test table");
+            let col_regs = builder.alloc_regs(column_count);
+            let rowid_reg = builder.alloc_reg();
+            emit_index_inserts(&mut builder, &table, 0, col_regs, rowid_reg, None);
+            builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            let program = builder
+                .finish()
+                .expect("index maintenance program should build");
+            let ops = program.ops();
+            let guard = ops
+                .iter()
+                .position(|op| op.opcode == Opcode::IfNot)
+                .expect("a partial index emits its predicate guard");
+            (ops[..guard].to_vec(), col_regs, rowid_reg)
+        }
+        fn copies_from(ops: &[VdbeOp], reg: i32) -> bool {
+            ops.iter()
+                .any(|op| op.opcode == Opcode::Copy && op.p1 == reg)
+        }
+
+        let table = test_schema().remove(0);
+        for predicate in [
+            "rowid > 0",
+            "_rowid_ > 0",
+            "oid > 0",
+            "OID > 0",
+            "t.rowid > 0",
+        ] {
+            let (ops, _, rowid_reg) = ops_before_guard(&table, predicate);
+            assert!(
+                copies_from(&ops, rowid_reg),
+                "`{predicate}` must read the row image's rowid register: {ops:?}"
+            );
+        }
+
+        let mut shadowed = test_schema().remove(0);
+        shadowed
+            .columns
+            .push(ColumnInfo::basic("rowid", 'D', false));
+        let (ops, col_regs, rowid_reg) = ops_before_guard(&shadowed, "rowid > 0");
+        assert!(
+            copies_from(&ops, col_regs + 2),
+            "a declared `rowid` column must be read from its column register: {ops:?}"
+        );
+        assert!(
+            !copies_from(&ops, rowid_reg),
+            "a declared `rowid` column shadows the hidden rowid: {ops:?}"
+        );
     }
 
     #[test]
