@@ -146,12 +146,22 @@ struct PageHistory {
     limits: NativePageLimits,
     reclaim_after: Option<PageNumber>,
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ApplyMode {
+    /// Preserve the current head until durability succeeds, and older pins.
+    Live,
+    /// No reader can observe the local recovery builder: retain latest only.
+    Replay,
+}
+
 struct PreparedApply {
     seq: CommitSeq,
     token: TxnToken,
     versions: Vec<(PageNumber, Version)>,
     payload_bytes: usize,
     version_count: usize,
+    mode: ApplyMode,
 }
 impl PageHistory {
     fn new(page_size: u32, limits: NativePageLimits) -> Result<Self> {
@@ -178,39 +188,64 @@ impl PageHistory {
         }
         capsule.validate_snapshot(self.tip, |page| self.latest(page))
     }
-    fn projected_size(&self, capsule: &NativePageCapsule) -> Result<(usize, usize)> {
-        let version_count = self.version_count.checked_add(capsule.writes.len())
+    fn projected_size(&self, capsule: &NativePageCapsule, mode: ApplyMode) -> Result<(usize, usize)> {
+        let mut retained_versions = self.version_count;
+        let mut retained_bytes = self.payload_bytes;
+        if mode == ApplyMode::Replay {
+            // Subtract ALL replaced heads before adding ANY new images. A
+            // deletion may follow an insertion in canonical page order; its
+            // released payload still belongs in the same atomic budget check.
+            // Callers validate unique writes before reaching this function.
+            for write in &capsule.writes {
+                if let Some(versions) = self.pages.get(&write.page) {
+                    retained_versions = retained_versions.checked_sub(versions.len())
+                        .ok_or_else(|| corrupt("native replay version accounting underflow"))?;
+                    for version in versions {
+                        retained_bytes = retained_bytes
+                            .checked_sub(version.data.as_ref().map_or(0, |data| data.len()))
+                            .ok_or_else(|| corrupt("native replay payload accounting underflow"))?;
+                    }
+                }
+            }
+        }
+        let version_count = retained_versions.checked_add(capsule.writes.len())
             .filter(|count| *count <= self.limits.max_versions).ok_or(FrankenError::TooBig)?;
-        let payload_bytes = capsule.writes.iter().try_fold(self.payload_bytes, |total, write| {
+        let payload_bytes = capsule.writes.iter().try_fold(retained_bytes, |total, write| {
             total.checked_add(write.data.as_ref().map_or(0, |data| data.len()))
                 .filter(|n| *n <= self.limits.max_retained_page_bytes).ok_or(FrankenError::TooBig)
         })?;
         Ok((version_count, payload_bytes))
     }
 
-    fn prepare(&mut self, capsule: &NativePageCapsule, seq: CommitSeq, token: TxnToken) -> Result<PreparedApply> {
+    fn prepare(&mut self, capsule: &NativePageCapsule, seq: CommitSeq, token: TxnToken, mode: ApplyMode) -> Result<PreparedApply> {
         self.validate(capsule)?;
         if self.tip.get().checked_add(1) != Some(seq.get()) || self.tokens.contains(&token) {
             return Err(corrupt("noncontiguous or duplicate native page commit"));
         }
-        let (version_count, payload_bytes) = self.projected_size(capsule)?;
+        let (version_count, payload_bytes) = self.projected_size(capsule, mode)?;
         let mut versions = Vec::new();
         versions.try_reserve_exact(capsule.writes.len()).map_err(|_| FrankenError::OutOfMemory)?;
         self.tokens.try_reserve(1).map_err(|_| FrankenError::OutOfMemory)?;
         for write in &capsule.writes {
             // Reserve all publication storage before any irreversible write.
             // Empty precreated entries have no visible page version.
-            if self.pages.entry(write.page).or_default().try_reserve(1).is_err() {
+            let chain = self.pages.entry(write.page).or_default();
+            let extra = usize::from(mode == ApplyMode::Live || chain.is_empty());
+            if chain.try_reserve(extra).is_err() {
                 self.pages.retain(|_, versions| !versions.is_empty());
                 return Err(FrankenError::OutOfMemory);
             }
             versions.push((write.page, Version { seq, data: write.data.clone() }));
         }
-        Ok(PreparedApply { seq, token, versions, payload_bytes, version_count })
+        Ok(PreparedApply { seq, token, versions, payload_bytes, version_count, mode })
     }
     fn apply(&mut self, prepared: PreparedApply) {
         for (page, version) in prepared.versions {
-            self.pages.get_mut(&page).expect("page publication storage was reserved").push(version);
+            let chain = self.pages.get_mut(&page).expect("page publication storage was reserved");
+            if prepared.mode == ApplyMode::Replay {
+                chain.clear();
+            }
+            chain.push(version);
         }
         self.tokens.insert(prepared.token);
         self.max_txn_id = self.max_txn_id.max(prepared.token.id.get());
@@ -289,10 +324,19 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativePageStore<S, M, C> {
         })
     }
 
-    /// Replay all bound capsules into versioned pages, validating their physical
-    /// read histories in commit order. Orphan objects are not replayed. A corrupt
-    /// or unserializable prefix produces no usable store. No supplied metadata
-    /// or validation callback can replace the stored page images/read versions.
+    /// Replay every bound capsule in commit order, retaining only the latest
+    /// version of each page (including tombstones) between replay steps. There
+    /// are no live readers in this private builder; old handles belong to a
+    /// different owner. Each capsule's full read history is still checked
+    /// against the exact latest stamps BEFORE replacing any heads. The exact
+    /// committed-token set is retained for duplicate detection and is bounded
+    /// separately by the storage record limit, not by the page-image budget.
+    ///
+    /// Orphan objects are not replayed. A corrupt or unserializable prefix
+    /// produces no usable store. No supplied metadata or validation callback
+    /// can replace the stored page images/read versions. This is bounded page
+    /// replay, not streaming of the lower log's marker/index metadata, on-disk
+    /// compaction, or a process-RSS bound; decoding uses its own object limits.
     ///
     /// # Errors
     /// Propagates storage/codec errors; rejects invalid history, page-size
@@ -308,7 +352,7 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativePageStore<S, M, C> {
             |candidate, _| {
                 let capsule = NativePageCapsule::from_candidate(candidate)?;
                 let prepared = history.prepare(&capsule, candidate.proof.commit_seq,
-                    candidate.proof.submission.txn_token).map_err(|error| match error {
+                    candidate.proof.submission.txn_token, ApplyMode::Replay).map_err(|error| match error {
                         FrankenError::BusySnapshot { .. } => {
                             corrupt("unserializable committed native page history")
                         }
@@ -605,13 +649,13 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativePageStore<S, M, C> {
             writes: txn.writes.iter().map(|(page, data)| NativePageWrite { page: *page, data: data.clone() }).collect(),
         };
         self.history.validate(&capsule)?;
-        if self.history.projected_size(&capsule).is_err() {
+        if self.history.projected_size(&capsule, ApplyMode::Live).is_err() {
             // Start a complete pressure sweep, including pages visited before
             // older pins were released. This happens before encoding/staging,
             // so refusal or cancellation leaves the private transaction active.
             self.history.reclaim_after = None;
             self.reclaim_history(cx, self.history.pages.len().max(1))?;
-            self.history.projected_size(&capsule)?;
+            self.history.projected_size(&capsule, ApplyMode::Live)?;
         }
         let bytes = capsule.to_bytes()?;
         let records = self.codec.encode(cx, &bytes)?;
@@ -620,7 +664,7 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativePageStore<S, M, C> {
             return Err(corrupt("native page codec changed canonical capsule bytes"));
         }
         let seq = self.history.tip.get().checked_add(1).map(CommitSeq::new).ok_or(FrankenError::DatabaseFull)?;
-        let prepared = self.history.prepare(&capsule, seq, txn.token)?;
+        let prepared = self.history.prepare(&capsule, seq, txn.token, ApplyMode::Live)?;
         let submission = CommitSubmission {
             capsule_object_id: object_id, capsule_digest: *blake3::hash(&bytes).as_bytes(),
             write_set_pages: capsule.writes.iter().map(|write| write.page).collect(),
@@ -1032,5 +1076,206 @@ mod allocation_savepoint_tests {
         db.rollback(&mut old).unwrap();
         assert_eq!(db.reclaim_history(&cx, 10).unwrap(), 1);
         db.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn native_replay_reopens_reclaimed_history_under_the_original_page_budget() {
+        let cx = Cx::new(); let vfs = MemoryVfs::new();
+        let limits = NativePageLimits {
+            max_retained_page_bytes: 1024, max_versions: 2, ..NativePageLimits::default()
+        };
+        let log = NativeDurabilityLog::create(&cx, file(&vfs, &cx, "objects"),
+            file(&vfs, &cx, "markers"), NativeDurabilityLimits::default()).unwrap();
+        let mut db = NativePageStore::new(log, TestCodec, 512, limits).unwrap();
+        for value in 1_u8..=64 {
+            put(&mut db, &cx, 7, Some(&[value; 512]), u64::from(value));
+        }
+        let mut foreign = db.begin(&cx).unwrap();
+        db.close(&cx).unwrap();
+        let (mut recovered, report) = Store::recover(&cx, file(&vfs, &cx, "objects"),
+            file(&vfs, &cx, "markers"), TestCodec, 512, NativeDurabilityLimits::default(),
+            limits).expect("replay must not materialize all 64 historical images");
+        assert_eq!(report.markers.len(), 64);
+        assert_eq!(recovered.retained_page_bytes(), 512);
+        assert_eq!(recovered.retained_version_count(), 1);
+        assert!(recovered.read_page(&cx, &mut foreign, page(7)).is_err());
+        let mut next = recovered.begin(&cx).unwrap();
+        assert_eq!(next.token().id.get(), 65);
+        assert_eq!(recovered.read_page(&cx, &mut next, page(7)).unwrap().unwrap().as_ref(), &[64; 512]);
+        recovered.write_page(&cx, &mut next, page(7), Some(&[65; 512])).unwrap();
+        let ack = recovered.commit(&cx, &mut next, 0).expect("append after bounded replay").unwrap();
+        assert_eq!(ack.commit_seq, CommitSeq::new(65));
+        assert_eq!(ack.commit_time_unix_ns, 65);
+        recovered.close(&cx).unwrap();
+        let (mut again, report) = Store::recover(&cx, file(&vfs, &cx, "objects"),
+            file(&vfs, &cx, "markers"), TestCodec, 512, NativeDurabilityLimits::default(),
+            limits).expect("replay extended chain");
+        assert_eq!(report.markers.len(), 65);
+        assert_eq!(again.retained_version_count(), 1);
+        let mut view = again.begin(&cx).unwrap();
+        assert_eq!(again.read_page(&cx, &mut view, page(7)).unwrap().unwrap().as_ref(), &[65; 512]);
+        again.rollback(&mut view).unwrap(); again.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn native_replay_keeps_tombstones_allocation_high_water_and_exact_tokens() {
+        let cx = Cx::new(); let vfs = MemoryVfs::new(); let mut db = store(&vfs, &cx);
+        put(&mut db, &cx, 99, Some(&[1; 512]), 1);
+        put(&mut db, &cx, 99, Some(&[2; 512]), 2);
+        put(&mut db, &cx, 99, None, 3);
+        db.close(&cx).unwrap();
+        let limits = NativePageLimits {
+            max_retained_page_bytes: 512, max_versions: 1, ..NativePageLimits::default()
+        };
+        let (mut recovered, _) = Store::recover(&cx, file(&vfs, &cx, "objects"),
+            file(&vfs, &cx, "markers"), TestCodec, 512, NativeDurabilityLimits::default(),
+            limits).expect("retain only the latest tombstone");
+        assert_eq!(recovered.retained_page_bytes(), 0);
+        assert_eq!(recovered.retained_version_count(), 1);
+        assert_eq!(recovered.history.tokens.len(), 3);
+        assert_eq!(recovered.history.latest(page(99)), CommitSeq::new(3));
+        let mut view = recovered.begin(&cx).unwrap();
+        assert_eq!(view.token().id.get(), 4);
+        assert!(recovered.read_page(&cx, &mut view, page(99)).unwrap().is_none());
+        assert_eq!(view.reads[&page(99)], CommitSeq::new(3));
+        assert_eq!(recovered.allocate_page(&cx, &mut view).unwrap(), page(100));
+        recovered.rollback(&mut view).unwrap(); recovered.close(&cx).unwrap();
+    }
+
+    fn adversarial_replay_log(vfs: &MemoryVfs, cx: &Cx, duplicate_token: bool) {
+        use crate::native_commit::durable::NativeCommitProof;
+        use fsqlite_types::CommitMarker;
+
+        // Produce envelope-valid but semantically invalid committed inputs
+        // through the lower storage layer. No page-store validator is bypassed
+        // by the tested recovery entrypoint; it must reject this forged history.
+        let mut log = NativeDurabilityLog::create(cx, file(vfs, cx, "objects"),
+            file(vfs, cx, "markers"), NativeDurabilityLimits::default()).unwrap();
+        let mut previous = None;
+        for seq in 1_u64..=3 {
+            let observed = if seq == 3 && !duplicate_token { 1 } else { seq - 1 };
+            let capsule = NativePageCapsule {
+                page_size: 512, snapshot: CommitSeq::new(seq - 1),
+                reads: vec![(page(2), CommitSeq::new(observed))],
+                writes: vec![NativePageWrite {
+                    page: page(2), data: Some(Arc::from(vec![u8::try_from(seq).unwrap(); 512])),
+                }],
+            };
+            let bytes = capsule.to_bytes().unwrap();
+            let capsule_records = TestCodec.encode(cx, &bytes).unwrap();
+            let capsule_id = capsule_records[0].object_id;
+            let token_id = if seq == 3 && duplicate_token { 1 } else { seq };
+            let proof = NativeCommitProof {
+                commit_seq: CommitSeq::new(seq), commit_time_unix_ns: seq,
+                submission: CommitSubmission {
+                    capsule_object_id: capsule_id, capsule_digest: *blake3::hash(&bytes).as_bytes(),
+                    write_set_pages: vec![page(2)], witness_refs: vec![], edge_ids: vec![],
+                    merge_witness_ids: vec![], begin_seq: capsule.snapshot,
+                    txn_token: TxnToken::new(TxnId::new(token_id).unwrap(), TxnEpoch::new(1)),
+                },
+            };
+            let proof_records = TestCodec.encode(cx, &proof.to_bytes().unwrap()).unwrap();
+            let marker = CommitMarker::new(CommitSeq::new(seq), seq, capsule_id,
+                proof_records[0].object_id, previous);
+            log.append_symbols(cx, &capsule_records).expect("stage adversarial capsule");
+            log.append_symbols(cx, &proof_records).expect("stage bound proof");
+            log.publish(cx, std::slice::from_ref(&marker), |id, records| {
+                std::future::ready(TestCodec.decode(cx, id, &records).map(|_| ()))
+            }).expect("lower log checks object bytes, not page semantics");
+            previous = Some(ObjectId::derive_from_canonical_bytes(&marker.to_record_bytes()));
+        }
+        log.close(cx).unwrap();
+    }
+
+    #[test]
+    fn native_replay_rejects_duplicate_tokens_after_replacing_their_page_images() {
+        let cx = Cx::new(); let vfs = MemoryVfs::new();
+        adversarial_replay_log(&vfs, &cx, true);
+        let limits = NativePageLimits {
+            max_retained_page_bytes: 512, max_versions: 1, ..NativePageLimits::default()
+        };
+        let result = Store::recover(&cx, file(&vfs, &cx, "objects"),
+            file(&vfs, &cx, "markers"), TestCodec, 512, NativeDurabilityLimits::default(),
+            limits).wait();
+        assert!(matches!(result, Err(FrankenError::WalCorrupt { detail })
+            if detail.contains("duplicate native page commit")));
+    }
+
+    #[test]
+    fn native_replay_rejects_stale_observations_after_replacing_old_images() {
+        let cx = Cx::new(); let vfs = MemoryVfs::new();
+        adversarial_replay_log(&vfs, &cx, false);
+        let limits = NativePageLimits {
+            max_retained_page_bytes: 512, max_versions: 1, ..NativePageLimits::default()
+        };
+        let result = Store::recover(&cx, file(&vfs, &cx, "objects"),
+            file(&vfs, &cx, "markers"), TestCodec, 512, NativeDurabilityLimits::default(),
+            limits).wait();
+        assert!(matches!(result, Err(FrankenError::WalCorrupt { detail })
+            if detail.contains("unserializable committed native page history")));
+    }
+
+    #[test]
+    fn native_replay_budgets_the_whole_commit_before_applying_any_mutation() {
+        let cx = Cx::new(); let vfs = MemoryVfs::new(); let mut db = store(&vfs, &cx);
+        put(&mut db, &cx, 9, Some(&[1; 512]), 1);
+        let mut txn = db.begin(&cx).unwrap();
+        // The insertion sorts BEFORE the deletion. Replay must account for
+        // both rather than reject a transient double-image total mid-commit.
+        db.write_page(&cx, &mut txn, page(2), Some(&[2; 512])).unwrap();
+        db.write_page(&cx, &mut txn, page(9), None).unwrap();
+        db.commit(&cx, &mut txn, 2).expect("commit atomic page replacement");
+        db.close(&cx).unwrap();
+        let limits = NativePageLimits {
+            max_retained_page_bytes: 512, max_versions: 2, ..NativePageLimits::default()
+        };
+        let (mut recovered, _) = Store::recover(&cx, file(&vfs, &cx, "objects"),
+            file(&vfs, &cx, "markers"), TestCodec, 512, NativeDurabilityLimits::default(),
+            limits).expect("net live page images fit the budget");
+        assert_eq!(recovered.retained_page_bytes(), 512);
+        assert_eq!(recovered.retained_version_count(), 2);
+        let mut view = recovered.begin(&cx).unwrap();
+        assert_eq!(recovered.read_page(&cx, &mut view, page(2)).unwrap().unwrap().as_ref(), &[2; 512]);
+        assert!(recovered.read_page(&cx, &mut view, page(9)).unwrap().is_none());
+        assert_eq!(view.reads[&page(9)], CommitSeq::new(2));
+        recovered.rollback(&mut view).unwrap(); recovered.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn native_replay_does_not_weaken_limits_for_distinct_current_pages() {
+        let cx = Cx::new(); let vfs = MemoryVfs::new(); let mut db = store(&vfs, &cx);
+        let mut txn = db.begin(&cx).unwrap();
+        for p in [2, 3] { db.write_page(&cx, &mut txn, page(p), Some(&[1; 512])).unwrap(); }
+        db.commit(&cx, &mut txn, 1).expect("two current pages"); db.close(&cx).unwrap();
+        for (bytes, versions) in [(512, 2), (1024, 1)] {
+            let limits = NativePageLimits {
+                max_retained_page_bytes: bytes, max_versions: versions, ..NativePageLimits::default()
+            };
+            assert!(matches!(Store::recover(&cx, file(&vfs, &cx, "objects"),
+                file(&vfs, &cx, "markers"), TestCodec, 512, NativeDurabilityLimits::default(),
+                limits).wait(), Err(FrankenError::TooBig)));
+        }
+    }
+
+    #[test]
+    fn native_replay_preserves_out_of_order_writer_ids_and_next_token() {
+        let cx = Cx::new(); let vfs = MemoryVfs::new(); let mut db = store(&vfs, &cx);
+        let mut earlier = db.begin(&cx).unwrap(); let mut later = db.begin(&cx).unwrap();
+        db.write_page(&cx, &mut earlier, page(2), Some(&[1; 512])).unwrap();
+        db.write_page(&cx, &mut later, page(3), Some(&[2; 512])).unwrap();
+        db.commit(&cx, &mut later, 1).expect("later-started writer commits first");
+        db.commit(&cx, &mut earlier, 2).expect("disjoint earlier writer remains valid");
+        db.close(&cx).unwrap();
+        let limits = NativePageLimits {
+            max_retained_page_bytes: 1024, max_versions: 2, ..NativePageLimits::default()
+        };
+        let (mut recovered, _) = Store::recover(&cx, file(&vfs, &cx, "objects"),
+            file(&vfs, &cx, "markers"), TestCodec, 512, NativeDurabilityLimits::default(),
+            limits).expect("token order is not commit order");
+        let mut view = recovered.begin(&cx).unwrap();
+        assert_eq!(view.token().id.get(), 3);
+        assert_eq!(recovered.read_page(&cx, &mut view, page(2)).unwrap().unwrap().as_ref(), &[1; 512]);
+        assert_eq!(recovered.read_page(&cx, &mut view, page(3)).unwrap().unwrap().as_ref(), &[2; 512]);
+        recovered.rollback(&mut view).unwrap(); recovered.close(&cx).unwrap();
     }
 }
