@@ -26,6 +26,15 @@
 //! principal class a bit that the database file does not already grant it
 //! (group bits count as the same principals only when the two files share a
 //! group). See `sidecar_exposure_is_acceptable`.
+//!
+//! Explicit Unix group sharing is available for one existing database via
+//! `FSQLITE_TRUSTED_UNIX_DATABASE` (absolute resolved path) and
+//! `FSQLITE_TRUSTED_UNIX_GID` (numeric GID). Both must be supplied before open.
+//! The caller must be a member of that group, the parent must be `2770`, and
+//! the database and both sidecars must be `0660` with that GID. Sidecar owners
+//! must equal the database owner. Only that owner can create missing sidecars.
+//! The group and directory ancestry are trusted; ACLs must grant no outside
+//! access. This opt-in never authorizes private-candidate cleanup or repairs.
 
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
@@ -1515,6 +1524,17 @@ fn sidecar_path(database_path: &Path, suffix: &str) -> PathBuf {
 }
 
 fn open_secure_lock_file(database_path: &Path, path: &Path) -> Result<File> {
+    #[cfg(unix)]
+    if trusted_unix_group(database_path)?.is_some() {
+        use std::os::unix::fs::MetadataExt as _;
+        let database =
+            std::fs::symlink_metadata(database_path).map_err(|_| cannot_open(database_path))?;
+        if database.uid() != nix::unistd::geteuid().as_raw() {
+            // A peer may use the owner's provisioned locks, but may not
+            // leave a new, foreign-owned lock behind on a failed open.
+            return open_existing_transition_lock_file(database_path, path);
+        }
+    }
     let (file, provenance) = match configured_open_options(true).open(path) {
         Ok(file) => (file, SidecarProvenance::CreatedNow),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (
@@ -1525,6 +1545,29 @@ fn open_secure_lock_file(database_path: &Path, path: &Path) -> Result<File> {
         ),
         Err(_) => return Err(cannot_open(path)),
     };
+    #[cfg(unix)]
+    if matches!(provenance, SidecarProvenance::CreatedNow)
+        && trusted_unix_group(database_path)?.is_some()
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let metadata = file.metadata().map_err(|_| cannot_open(path))?;
+        let database =
+            std::fs::symlink_metadata(database_path).map_err(|_| cannot_open(database_path))?;
+        // Only the database owner provisions a new shared lock domain. Never
+        // chmod an existing sidecar or transfer its ownership.
+        if metadata.uid() != nix::unistd::geteuid().as_raw()
+            || metadata.uid() != database.uid()
+            || metadata.gid() != database.gid()
+            || !metadata.is_file()
+            || metadata.nlink() != 1
+        {
+            return Err(cannot_open(path));
+        }
+        file.set_permissions(std::fs::Permissions::from_mode(0o660))
+            .map_err(|_| cannot_open(path))?;
+        validate_trusted_unix_group_sidecar(database_path, path, &file.metadata()?)?;
+        return Ok(file);
+    }
     validate_secure_lock_file(path, &file, provenance)?;
     Ok(file)
 }
@@ -1627,6 +1670,15 @@ fn open_cleanup_lock_file(database_path: &Path, path: &Path) -> Result<Option<Fi
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err(cannot_open(path)),
     };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        // Trusted group sharing does not grant private-candidate cleanup
+        // authority over another user's files.
+        if file.metadata()?.uid() != nix::unistd::geteuid().as_raw() {
+            return Err(cannot_open(path));
+        }
+    }
     validate_secure_lock_file(path, &file, SidecarProvenance::Existing { database_path })?;
     Ok(Some(file))
 }
@@ -2247,6 +2299,11 @@ fn validate_secure_lock_file(
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
+        if let SidecarProvenance::Existing { database_path } = provenance
+            && trusted_unix_group(database_path)?.is_some()
+        {
+            return validate_trusted_unix_group_sidecar(database_path, path, &metadata).map(|_| ());
+        }
         // SAFETY: `geteuid` has no preconditions and does not dereference data.
         let effective_uid = unsafe { libc::geteuid() };
         if metadata.uid() != effective_uid || metadata.nlink() != 1 {
@@ -2269,6 +2326,134 @@ fn validate_secure_lock_file(
         }
     }
     Ok(())
+}
+
+/// Explicit process-level Unix sharing opt-in. An absent variable preserves
+/// the single-UID policy. Invalid values and unsafe layouts fail closed.
+/// The environment must be fixed before opening any database and must not be
+/// changed while connections or namespace leases are live.
+#[cfg(unix)]
+fn trusted_unix_group(database_path: &Path) -> Result<Option<u32>> {
+    use std::os::unix::fs::MetadataExt as _;
+    let Some(value) = std::env::var_os("FSQLITE_TRUSTED_UNIX_GID") else {
+        if std::env::var_os("FSQLITE_TRUSTED_UNIX_DATABASE").is_some() {
+            return Err(cannot_open(database_path));
+        }
+        return Ok(None);
+    };
+    let selected = std::env::var_os("FSQLITE_TRUSTED_UNIX_DATABASE")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| cannot_open(database_path))?;
+    // Sharing is scoped to one explicit database. In particular, private
+    // snapshot/recovery candidates keep their single-UID policy.
+    if selected != database_path {
+        return Ok(None);
+    }
+    let value = value
+        .to_str()
+        .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+        .ok_or_else(|| cannot_open(database_path))?;
+    let gid = value
+        .parse::<u32>()
+        .map_err(|_| cannot_open(database_path))?;
+    let member = nix::unistd::getegid().as_raw() == gid
+        || nix::unistd::getgroups()
+            .map_err(|_| cannot_open(database_path))?
+            .iter()
+            .any(|group| group.as_raw() == gid);
+    if !member {
+        return Err(cannot_open(database_path));
+    }
+    let database =
+        std::fs::symlink_metadata(database_path).map_err(|_| cannot_open(database_path))?;
+    let parent_path = database_path
+        .parent()
+        .ok_or_else(|| cannot_open(database_path))?;
+    let parent = std::fs::symlink_metadata(parent_path).map_err(|_| cannot_open(parent_path))?;
+    if !database.is_file()
+        || database.nlink() != 1
+        || database.gid() != gid
+        || database.mode() & 0o7777 != 0o660
+        || !parent.is_dir()
+        || parent.uid() != database.uid()
+        || parent.gid() != gid
+        || parent.mode() & 0o7777 != 0o2770
+    {
+        return Err(cannot_open(database_path));
+    }
+    Ok(Some(gid))
+}
+
+/// Validate a retained sidecar descriptor under the explicitly selected Unix group.
+///
+/// Returns false when `FSQLITE_TRUSTED_UNIX_GID` sharing is not enabled.
+/// Callers must supply metadata from a no-follow descriptor and retain that
+/// descriptor through their operation. This does not authorize mode repair,
+/// copying before namespace admission, or private database cleanup.
+///
+/// All group members are trusted to mutate the tracker and its namespace;
+/// the existing cooperative trusted-parent contract still applies. The
+/// database owner must provision both sidecars. ACLs must not grant access to
+/// principals outside the selected trusted group.
+#[cfg(unix)]
+pub fn validate_trusted_unix_group_sidecar(
+    database_path: &Path,
+    sidecar_path: &Path,
+    metadata: &std::fs::Metadata,
+) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt as _;
+    let Some(gid) = trusted_unix_group(database_path)? else {
+        return Ok(false);
+    };
+    let database =
+        std::fs::symlink_metadata(database_path).map_err(|_| cannot_open(database_path))?;
+    let named = std::fs::symlink_metadata(sidecar_path).map_err(|_| cannot_open(sidecar_path))?;
+    if !metadata.is_file()
+        || metadata.nlink() != 1
+        || metadata.uid() != database.uid()
+        || metadata.gid() != gid
+        || metadata.mode() & 0o7777 != 0o660
+        || !named.is_file()
+        || named.nlink() != 1
+        || (
+            named.dev(),
+            named.ino(),
+            named.uid(),
+            named.gid(),
+            named.mode(),
+        ) != (
+            metadata.dev(),
+            metadata.ino(),
+            metadata.uid(),
+            metadata.gid(),
+            metadata.mode(),
+        )
+    {
+        return Err(cannot_open(sidecar_path));
+    }
+    // Recheck the trusted database/parent policy after the pathname check.
+    trusted_unix_group(database_path)?;
+    let rechecked =
+        std::fs::symlink_metadata(database_path).map_err(|_| cannot_open(database_path))?;
+    if (
+        rechecked.dev(),
+        rechecked.ino(),
+        rechecked.uid(),
+        rechecked.gid(),
+        rechecked.mode(),
+        rechecked.nlink(),
+    ) != (
+        database.dev(),
+        database.ino(),
+        database.uid(),
+        database.gid(),
+        database.mode(),
+        database.nlink(),
+    ) {
+        return Err(cannot_open(database_path));
+    }
+    Ok(true)
 }
 
 /// Decide whether a sidecar's group/other permission bits are acceptable.
@@ -2931,6 +3116,229 @@ mod tests {
         FileIdentity::from_file(&file)
             .expect("query test database identity")
             .expect("native filesystem identity")
+    }
+
+    /// Subprocess endpoint: environment and kernel credentials are isolated
+    /// from the parallel test runner, rather than changing its UID or env.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn trusted_group_child() {
+        use std::io::Write as _;
+        let Some(path) = std::env::var_os("FSQLITE_GROUP_TEST_DATABASE") else {
+            return;
+        };
+        let database = PathBuf::from(path);
+        if std::env::var_os("FSQLITE_GROUP_TEST_SWAP").is_some() {
+            let gate = sidecar_path(&database, GATE_SUFFIX);
+            let retained = configured_existing_readonly_open_options()
+                .open(&gate)
+                .unwrap();
+            let metadata = retained.metadata().unwrap();
+            let displaced = database.with_extension("displaced");
+            fs::rename(&gate, &displaced).unwrap();
+            fs::copy(&displaced, &gate).unwrap();
+            assert!(validate_trusted_unix_group_sidecar(&database, &gate, &metadata).is_err());
+            return;
+        }
+        let expected = std::env::var("FSQLITE_GROUP_TEST_ACCEPT").unwrap() == "yes";
+        let result = PendingNamespaceOpen::begin(&database, NamespaceOpenIntent::Shared).and_then(
+            |pending| {
+                let file = File::open(&database)?;
+                let identity =
+                    FileIdentity::from_file(&file)?.ok_or_else(|| cannot_open(&database))?;
+                let binding = pending.bind(identity)?;
+                binding.finish_bootstrap()?;
+                Ok(binding)
+            },
+        );
+        if !expected {
+            assert!(result.is_err(), "unsafe or untrusted admission succeeded");
+            return;
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&database)
+            .unwrap();
+        let binding = result.unwrap();
+        let mut file = file;
+        file.write_all(b"x").unwrap();
+        file.sync_all().unwrap();
+        drop(binding);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn trusted_group_layout_and_scope() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let temp = tempdir().unwrap();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o2770)).unwrap();
+        let database = temp.path().join("tracker.db");
+        fs::write(&database, b"database").unwrap();
+        fs::set_permissions(&database, fs::Permissions::from_mode(0o660)).unwrap();
+        let gid = fs::metadata(&database).unwrap().gid().to_string();
+        let run = |selected: &Path, gid: &str, accept: bool| {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "namespace::tests::trusted_group_child",
+                    "--nocapture",
+                ])
+                .env("FSQLITE_TRUSTED_UNIX_DATABASE", selected)
+                .env("FSQLITE_TRUSTED_UNIX_GID", gid)
+                .env("FSQLITE_GROUP_TEST_DATABASE", &database)
+                .env(
+                    "FSQLITE_GROUP_TEST_ACCEPT",
+                    if accept { "yes" } else { "no" },
+                )
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(&database, &gid, true);
+        run(&database, &gid, true);
+        run(&database, "invalid", false);
+        run(&database, "+0", false);
+        run(Path::new("relative.db"), &gid, false);
+        for mode in [0o600, 0o640, 0o666, 0o1660] {
+            fs::set_permissions(&database, fs::Permissions::from_mode(mode)).unwrap();
+            run(&database, &gid, false);
+        }
+        fs::set_permissions(&database, fs::Permissions::from_mode(0o660)).unwrap();
+        for mode in [0o770, 0o2777, 0o3770] {
+            fs::set_permissions(temp.path(), fs::Permissions::from_mode(mode)).unwrap();
+            run(&database, &gid, false);
+        }
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o2770)).unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "namespace::tests::trusted_group_child",
+                "--nocapture",
+            ])
+            .env("FSQLITE_TRUSTED_UNIX_DATABASE", &database)
+            .env("FSQLITE_TRUSTED_UNIX_GID", &gid)
+            .env("FSQLITE_GROUP_TEST_DATABASE", &database)
+            .env("FSQLITE_GROUP_TEST_SWAP", "yes")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "retained-descriptor path-swap regression: {:?}",
+            output
+        );
+        let gate = sidecar_path(&database, GATE_SUFFIX);
+        let file = File::open(&gate).unwrap();
+        let old_metadata = file.metadata().unwrap();
+        fs::rename(&gate, temp.path().join("displaced")).unwrap();
+        fs::write(&gate, b"replacement").unwrap();
+        fs::set_permissions(&gate, fs::Permissions::from_mode(0o660)).unwrap();
+        // The public validator's environment is absent in this runner; the
+        // subprocess exercises the swapped generation through normal open.
+        // Independently show the retained identity differs from the pathname.
+        assert_ne!(old_metadata.ino(), fs::metadata(&gate).unwrap().ino());
+        fs::hard_link(&gate, temp.path().join("alias")).unwrap();
+        run(&database, &gid, false); // even an owner-created alias is refused
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires root and Linux setpriv for real cross-UID credentials"]
+    fn trusted_group_cross_uid_reopen_and_safety() {
+        use nix::unistd::{Gid, Uid, chown, geteuid};
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        assert!(geteuid().is_root(), "run this regression as root");
+        let temp = tempdir().unwrap();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let shared = temp.path().join("shared");
+        fs::create_dir(&shared).unwrap();
+        chown(
+            &shared,
+            Some(Uid::from_raw(61001)),
+            Some(Gid::from_raw(61000)),
+        )
+        .expect("cross-UID regression requires host root with mapped UIDs/GID 61000..61003 and chown/setpriv privileges");
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o2770)).unwrap();
+        let database = shared.join("tracker.db");
+        fs::write(&database, b"database").unwrap();
+        chown(
+            &database,
+            Some(Uid::from_raw(61001)),
+            Some(Gid::from_raw(61000)),
+        )
+        .unwrap();
+        fs::set_permissions(&database, fs::Permissions::from_mode(0o660)).unwrap();
+        let run = |uid: u32, gid: u32, opt_in: bool, accept: bool| {
+            let mut command = Command::new("setpriv");
+            command
+                .args([
+                    "--reuid",
+                    &uid.to_string(),
+                    "--regid",
+                    &gid.to_string(),
+                    "--clear-groups",
+                ])
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "namespace::tests::trusted_group_child",
+                    "--nocapture",
+                ])
+                .env_remove("FSQLITE_TRUSTED_UNIX_DATABASE")
+                .env_remove("FSQLITE_TRUSTED_UNIX_GID")
+                .env("FSQLITE_GROUP_TEST_DATABASE", &database)
+                .env(
+                    "FSQLITE_GROUP_TEST_ACCEPT",
+                    if accept { "yes" } else { "no" },
+                );
+            if opt_in {
+                command
+                    .env("FSQLITE_TRUSTED_UNIX_DATABASE", &database)
+                    .env("FSQLITE_TRUSTED_UNIX_GID", "61000");
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "child uid {uid}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        // Provision under the owner's restrictive umask; creation must use
+        // the descriptor to establish the explicitly requested shared mode.
+        run(61001, 61000, true, true);
+        for suffix in [GATE_SUFFIX, USE_SUFFIX] {
+            let metadata = fs::metadata(sidecar_path(&database, suffix)).unwrap();
+            assert_eq!(metadata.uid(), 61001);
+            assert_eq!(metadata.gid(), 61000);
+            assert_eq!(metadata.mode() & 0o7777, 0o660);
+        }
+        run(61002, 61000, false, false); // default is still single-UID
+        run(61002, 61000, true, true);
+        run(61001, 61000, true, true); // original owner retains access
+        assert_eq!(fs::read(&database).unwrap(), b"databasexxx");
+        run(61003, 61003, true, false); // selected group membership required
+        fs::set_permissions(&database, fs::Permissions::from_mode(0o666)).unwrap();
+        run(61002, 61000, true, false);
+        fs::set_permissions(&database, fs::Permissions::from_mode(0o660)).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o2777)).unwrap();
+        run(61002, 61000, true, false);
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o2770)).unwrap();
+        let gate = sidecar_path(&database, GATE_SUFFIX);
+        fs::set_permissions(&gate, fs::Permissions::from_mode(0o666)).unwrap();
+        run(61002, 61000, true, false);
+        fs::set_permissions(&gate, fs::Permissions::from_mode(0o660)).unwrap();
+        fs::hard_link(&gate, shared.join("alias")).unwrap();
+        run(61002, 61000, true, false); // hard links remain forbidden
+        let displaced = shared.join("displaced-gate");
+        fs::rename(&gate, &displaced).unwrap();
+        std::os::unix::fs::symlink(&displaced, &gate).unwrap();
+        run(61002, 61000, true, false); // no-follow is retained
     }
 
     fn publish_generation(database: &Path, identity: FileIdentity) {

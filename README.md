@@ -234,6 +234,41 @@ processes that bypass FrankenSQLite can ignore advisory locks, Unix can unlink
 or rename an open file, and the same database must not be opened through
 multiple hard-link aliases.
 
+Unix sidecars default to the effective UID's ownership, one hard link, and
+creation mode `0600`. Group-writable files alone do not opt into sharing.
+For an existing database shared by explicitly trusted Unix users, set both
+variables before starting the process:
+
+```bash
+FSQLITE_TRUSTED_UNIX_DATABASE=/absolute/resolved/path/tracker.db \
+FSQLITE_TRUSTED_UNIX_GID=989 your-application
+```
+
+This policy applies only to that exact resolved database path. Every caller
+must have GID 989 as its effective or supplementary group. The immediate
+parent directory must be owned by the database owner, with that GID and mode
+exactly `2770`; the database and
+both namespace sidecars must have that GID and mode exactly `0660`. Both
+sidecars must be owned by the database owner. Only that owner may provision
+missing namespace sidecars; provision existing `0600` sidecars while all
+connections are closed. No existing file is automatically chmodded or chowned.
+Regular-file, single-link, no-follow, descriptor/path identity, namespace
+generation and lock checks remain in force. Invalid opt-ins fail closed.
+
+Trust every member of the selected group to modify the database and its lock
+records. Protect directory ancestry and do not grant outsiders access through
+ACLs. Keep the variables fixed for the process lifetime. Give other required
+database-family files appropriate group access separately; this policy does
+not change WAL, journal or application-file permissions. Private snapshots
+and cleanup retain their single-UID rules. This opt-in does not extend the
+owner-only `.fsqlite-shm` MVCC transport policy.
+
+Linux cross-UID namespace regression (root and `setpriv` required):
+
+```bash
+cargo test -p fsqlite-vfs trusted_group_cross_uid_reopen_and_safety -- --ignored
+```
+
 ---
 
 ## Transaction Lifecycle Introspection (bd-t6sv2.5)
