@@ -10,8 +10,10 @@
 //! accepts them into the transaction overlay. An error, panic, or dropped
 //! operation future restores that overlay without performing storage I/O.
 //! Durable publication still requires the owner's explicit page-store commit.
-//! Public SQL dispatch, schema/root catalogs, and cross-process admission are
-//! not supplied by this adapter.
+//! The companion [`catalog`] persists schema/root bindings. Public SQL dispatch
+//! and cross-process admission are not supplied by this adapter.
+
+pub mod catalog;
 
 use std::cell::{Cell, RefCell};
 use std::ops::AsyncFnOnce;
