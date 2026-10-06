@@ -6,7 +6,7 @@
 //! The caller retains the native log's namespace/append lease, including while
 //! an abandoned tracked write settles. The store never creates or deletes files.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ops::Bound::{Excluded, Unbounded};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -90,6 +90,11 @@ pub struct NativePageTransaction {
     lease: Option<Arc<CommitSeq>>,
     token: TxnToken,
     snapshot: CommitSeq,
+    // Bounds describe this snapshot, never another writer's reservations.
+    snapshot_extent: u32,
+    issued_extent: u32,
+    completed_extent: u32,
+    reservations: BTreeSet<PageNumber>,
     reads: BTreeMap<PageNumber, CommitSeq>,
     writes: BTreeMap<PageNumber, Option<Arc<[u8]>>>,
     payload_bytes: usize,
@@ -105,6 +110,39 @@ impl NativePageTransaction {
     #[must_use]
     pub const fn state(&self) -> NativePageTransactionState { self.state }
 
+    /// Highest committed page number at BEGIN, including tombstones. This is
+    /// a logical address bound, not a count of present pages or a file length.
+    /// It is unchanged by peer commits, private writes, and history reclamation.
+    #[must_use]
+    pub const fn snapshot_db_size(&self) -> u32 { self.snapshot_extent }
+
+    /// Snapshot extent plus the current private commit surface. ROLLBACK TO
+    /// removes discarded growth from this bound, but not from the allocator.
+    /// A committed handle retains its own terminal extent after overlay cleanup.
+    #[must_use]
+    pub fn live_db_size(&self) -> u32 {
+        if self.state == NativePageTransactionState::Committed {
+            self.completed_extent
+        } else {
+            self.writes.last_key_value()
+                .map_or(self.snapshot_extent, |(page, _)| self.snapshot_extent.max(page.get()))
+        }
+    }
+
+    /// Largest address in the snapshot or successfully issued to this handle.
+    /// Unlike `live_db_size`, this includes private addresses spent by rolled
+    /// back operations. Neither bound authorizes reading an absent page.
+    #[must_use]
+    pub const fn visible_db_size_bound(&self) -> u32 { self.issued_extent }
+
+    /// Newly introduced page addresses owned by this active transaction,
+    /// including addresses spent before ROLLBACK TO. They are not a reusable
+    /// SQLite freelist, and holes are never expanded into an unbounded vector.
+    #[must_use]
+    pub fn live_reserved_pages(&self) -> Vec<PageNumber> {
+        self.reservations.iter().copied().collect()
+    }
+
     /// Whether this active transaction has a private replacement or tombstone.
     #[must_use]
     pub fn is_page_dirty(&self, page: PageNumber) -> bool {
@@ -112,12 +150,16 @@ impl NativePageTransaction {
     }
 
     fn finish(&mut self, state: NativePageTransactionState) {
+        if state == NativePageTransactionState::Committed {
+            self.completed_extent = self.live_db_size();
+        }
         self.state = state;
         self.lease = None;
         self.reads.clear();
         self.writes.clear();
         self.payload_bytes = 0;
         self.savepoints.clear();
+        self.reservations.clear();
     }
 }
 
@@ -451,9 +493,15 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativePageStore<S, M, C> {
         let lease = Arc::new(self.history.tip);
         self.active.push(Arc::downgrade(&lease));
         self.next_txn_id += 1; // TxnId's domain is narrower than u64.
+        // Preallocated, empty publication slots are not committed addresses.
+        // Tombstones ARE committed addresses and remain after reclamation.
+        let snapshot_extent = self.history.pages.iter().rev()
+            .find(|(_, versions)| !versions.is_empty()).map_or(0, |(page, _)| page.get());
         Ok(NativePageTransaction {
             owner: Arc::clone(&self.owner), lease: Some(lease),
             token: TxnToken::new(id, TxnEpoch::new(1)), snapshot: self.history.tip,
+            snapshot_extent, issued_extent: snapshot_extent, completed_extent: snapshot_extent,
+            reservations: BTreeSet::new(),
             reads: BTreeMap::new(), writes: BTreeMap::new(), payload_bytes: 0,
             state: NativePageTransactionState::Active,
             savepoints: Vec::new(), next_savepoint_id: 1,
@@ -497,6 +545,12 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativePageStore<S, M, C> {
         if data.is_some_and(|bytes| bytes.len() != page_size) {
             return Err(corrupt("native page write has the wrong page size"));
         }
+        let introduces_page = self.history.at(page, txn.snapshot).is_none();
+        if introduces_page && !txn.reservations.contains(&page)
+            && txn.reservations.len() >= MAX_CAPSULE_PAGES
+        {
+            return Err(FrankenError::TooBig);
+        }
         let old = txn.writes.get(&page).and_then(|value| value.as_ref()).map_or(0, |value| value.len());
         let payload_bytes = txn.payload_bytes - old + data.map_or(0, |bytes| bytes.len());
         overlay_size(txn.reads.len() + usize::from(!txn.reads.contains_key(&page)),
@@ -506,6 +560,8 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativePageStore<S, M, C> {
         // Relaxed atomics allocate distinct numbers; they do not publish pages.
         self.page_high_water.fetch_max(u64::from(page.get()), Ordering::Relaxed);
         txn.writes.insert(page, data.map(Arc::from));
+        if introduces_page { txn.reservations.insert(page); }
+        txn.issued_extent = txn.issued_extent.max(page.get());
         txn.payload_bytes = payload_bytes;
         Ok(())
     }
@@ -771,6 +827,101 @@ mod allocation_savepoint_tests {
         NativePageStore::new(log, TestCodec, 512, NativePageLimits::default()).unwrap()
     }
     fn page(n: u32) -> PageNumber { PageNumber::new(n).unwrap() }
+
+    #[test]
+    fn native_extent_is_pinned_before_reads_and_excludes_peer_reservations() {
+        let cx = Cx::new(); let vfs = MemoryVfs::new(); let mut db = store(&vfs, &cx);
+        let mut old = db.begin(&cx).unwrap();
+        let mut private = db.begin(&cx).unwrap();
+        db.write_page(&cx, &mut private, page(900), Some(&[9; 512])).unwrap();
+        let mut before = db.begin(&cx).unwrap();
+        assert_eq!(before.snapshot_db_size(), 0);
+        assert_eq!(before.visible_db_size_bound(), 0);
+        let mut peer = db.begin(&cx).unwrap();
+        db.write_page(&cx, &mut peer, page(7), Some(&[7; 512])).unwrap();
+        db.commit(&cx, &mut peer, 1).expect("publish smaller peer address");
+        assert_eq!(peer.snapshot_db_size(), 0);
+        assert_eq!(peer.live_db_size(), 7);
+        assert_eq!(old.snapshot_db_size(), 0);
+        assert_eq!(old.live_db_size(), 0);
+        assert!(db.read_page(&cx, &mut old, page(7)).unwrap().is_none());
+        let mut fresh = db.begin(&cx).unwrap();
+        assert_eq!(fresh.snapshot_db_size(), 7);
+        assert_eq!(private.live_db_size(), 900);
+        db.rollback(&mut private).unwrap();
+        assert_eq!(private.live_db_size(), 0);
+        assert!(private.live_reserved_pages().is_empty());
+        db.rollback(&mut old).unwrap(); db.rollback(&mut before).unwrap();
+        db.rollback(&mut fresh).unwrap(); db.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn native_extent_savepoints_preserve_spent_addresses_but_not_discarded_growth() {
+        let cx = Cx::new(); let vfs = MemoryVfs::new(); let mut db = store(&vfs, &cx);
+        let mut txn = db.begin(&cx).unwrap();
+        db.write_page(&cx, &mut txn, page(2), Some(&[2; 512])).unwrap();
+        let point = db.savepoint(&cx, &mut txn).unwrap();
+        db.write_page(&cx, &mut txn, page(100), Some(&[1; 512])).unwrap();
+        let allocated = db.allocate_page(&cx, &mut txn).unwrap();
+        assert_eq!(allocated, page(101));
+        db.rollback_to(&mut txn, &point).unwrap();
+        assert_eq!(txn.snapshot_db_size(), 0);
+        assert_eq!(txn.live_db_size(), 2);
+        assert_eq!(txn.visible_db_size_bound(), 101);
+        assert_eq!(txn.live_reserved_pages(), vec![page(2), page(100), page(101)]);
+        assert!(db.read_page(&cx, &mut txn, allocated).unwrap().is_none());
+        db.commit(&cx, &mut txn, 1).expect("only surviving growth commits");
+        assert_eq!(txn.live_db_size(), 2);
+        assert!(txn.live_reserved_pages().is_empty());
+        let mut fresh = db.begin(&cx).unwrap();
+        assert_eq!(fresh.snapshot_db_size(), 2);
+        assert_eq!(db.allocate_page(&cx, &mut fresh).unwrap(), page(102));
+        db.rollback(&mut fresh).unwrap(); db.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn native_extent_tombstones_survive_gc_and_recovery_without_dense_hole_lists() {
+        let cx = Cx::new(); let vfs = MemoryVfs::new(); let mut db = store(&vfs, &cx);
+        let mut txn = db.begin(&cx).unwrap();
+        db.write_page(&cx, &mut txn, page(1_000_000), Some(&[1; 512])).unwrap();
+        assert_eq!(txn.live_reserved_pages(), vec![page(1_000_000)]);
+        db.commit(&cx, &mut txn, 1).expect("sparse native extent");
+        let mut delete = db.begin(&cx).unwrap();
+        db.write_page(&cx, &mut delete, page(1_000_000), None).unwrap();
+        assert!(delete.live_reserved_pages().is_empty());
+        db.commit(&cx, &mut delete, 2).expect("retire high address");
+        db.reclaim_history(&cx, 10).unwrap();
+        let mut empty = db.begin(&cx).unwrap();
+        assert_eq!(empty.snapshot_db_size(), 1_000_000);
+        assert!(db.read_page(&cx, &mut empty, page(1_000_000)).unwrap().is_none());
+        db.rollback(&mut empty).unwrap(); db.close(&cx).unwrap();
+        let (mut recovered, _) = Store::recover(&cx, file(&vfs, &cx, "objects"),
+            file(&vfs, &cx, "markers"), TestCodec, 512, NativeDurabilityLimits::default(),
+            NativePageLimits::default()).expect("recover sparse tombstone extent");
+        let mut next = recovered.begin(&cx).unwrap();
+        assert_eq!(next.snapshot_db_size(), 1_000_000);
+        assert_eq!(next.live_db_size(), 1_000_000);
+        assert!(next.live_reserved_pages().is_empty());
+        assert_eq!(recovered.allocate_page(&cx, &mut next).unwrap(), page(1_000_001));
+        recovered.rollback(&mut next).unwrap(); recovered.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn native_extent_ignores_unpublished_preparation_slots() {
+        let cx = Cx::new(); let vfs = MemoryVfs::new(); let mut db = store(&vfs, &cx);
+        db.history.pages.insert(page(900), Vec::new());
+        let mut txn = db.begin(&cx).unwrap();
+        assert_eq!(txn.snapshot_db_size(), 0);
+        assert!(db.write_page(&cx, &mut txn, page(99), Some(&[0; 511])).is_err());
+        assert_eq!(txn.live_db_size(), 0);
+        assert_eq!(txn.visible_db_size_bound(), 0);
+        assert!(txn.live_reserved_pages().is_empty());
+        db.write_page(&cx, &mut txn, page(3), Some(&[3; 512])).unwrap();
+        db.commit(&cx, &mut txn, 1).expect("actual page, not capacity slot, publishes");
+        let mut next = db.begin(&cx).unwrap();
+        assert_eq!(next.snapshot_db_size(), 3);
+        db.rollback(&mut next).unwrap(); db.close(&cx).unwrap();
+    }
 
     #[test]
     fn allocations_are_private_and_distinct_across_open_transactions() {
