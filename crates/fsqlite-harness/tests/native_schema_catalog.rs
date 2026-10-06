@@ -1,9 +1,11 @@
 //! Native schema storage integration, not public Connection/SQL qualification.
+// Native catalog records are canonical UTF-8 by definition, so the fixtures
+// build and inspect them with the UTF-8 record codec.
+#![allow(clippy::disallowed_methods)]
 use std::future::Future;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::task::{Context, Poll, Wake, Waker};
+use std::task::{Context, Poll, Waker};
 
 use asupersync::runtime::RuntimeBuilder;
 use fsqlite_btree::BtreeCursorOps;
@@ -703,11 +705,6 @@ fn unique_index_failure_rolls_back_the_whole_multitree_statement_not_prior_work(
     });
 }
 
-struct NoopWake;
-impl Wake for NoopWake {
-    fn wake(self: Arc<Self>) {}
-}
-
 #[test]
 fn failed_or_dropped_schema_builders_restore_catalog_roots_cookie_and_prior_rows() {
     run(async {
@@ -752,8 +749,7 @@ fn failed_or_dropped_schema_builders_restore_catalog_roots_cookie_and_prior_rows
                 },
             ));
             if abandon {
-                let waker = Waker::from(Arc::new(NoopWake));
-                let mut context = Context::from_waker(&waker);
+                let mut context = Context::from_waker(Waker::noop());
                 assert!(matches!(
                     operation.as_mut().poll(&mut context),
                     Poll::Pending

@@ -1892,7 +1892,9 @@ impl TransactionHandle for MemoryMockTransaction {
     }
 }
 
-/// Transaction dispatcher used by upper layers. Compatibility transactions
+/// Transaction dispatcher used by upper layers.
+///
+/// Compatibility transactions
 /// stay inline and statically dispatched; native ECS handles use a private
 /// type-erased adapter that preserves their original owner and snapshot.
 #[cfg_attr(

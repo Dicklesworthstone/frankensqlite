@@ -459,11 +459,13 @@ fn staged_objects_are_not_commits_and_a_batch_uses_two_syncs() {
         let mut wire = vec![0; COMMIT_MARKER_RECORD_V1_SIZE * 3];
         assert_eq!(reader.read(&cx, &mut wire, 0).await.unwrap(), wire.len());
         for (bytes, expected) in wire
-            .chunks_exact(COMMIT_MARKER_RECORD_V1_SIZE)
+            .as_chunks::<COMMIT_MARKER_RECORD_V1_SIZE>()
+            .0
+            .iter()
             .zip(&markers)
         {
             assert_eq!(
-                CommitMarker::from_record_bytes(bytes.try_into().unwrap())
+                CommitMarker::from_record_bytes(bytes)
                     .unwrap()
                     .to_record_bytes(),
                 expected.to_record_bytes(),

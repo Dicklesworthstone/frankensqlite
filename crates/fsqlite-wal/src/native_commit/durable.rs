@@ -35,8 +35,9 @@ const MAX_PENDING_COMMITS: usize = 1024;
 const PROOF_MAGIC: &[u8; 8] = b"FNCP\x01\0\0\0";
 const PROOF_FIXED_BYTES: usize = 108;
 
-/// An object encoder/decoder, not a claim of durability. Implementations must
-/// verify object identity, envelope integrity, OTI consistency, and required
+/// An object encoder/decoder, not a claim of durability.
+///
+/// Implementations must verify object identity, envelope integrity, OTI consistency, and required
 /// authentication. Decoding must be bounded and must fail on insufficient rank.
 /// `encode` must return real source/repair symbols, never fabricated repairs.
 /// All methods inherit the caller's cancellation/runtime context.
@@ -47,7 +48,9 @@ pub trait NativeObjectCodec {
     fn decode(&self, cx: &Cx, object_id: ObjectId, records: &[SymbolRecord]) -> Result<Vec<u8>>;
 }
 
-/// Canonical durable admission record. This binds the marker to the complete
+/// Canonical durable admission record.
+///
+/// This binds the marker to the complete
 /// submitted metadata, including FCW pages and every immediate evidence ref.
 /// It records what was admitted; independent SSI proof checking still requires
 /// resolving and evaluating the referenced witness/edge/merge objects.
@@ -253,7 +256,9 @@ pub struct DurableCommitAcknowledgement {
     pub commit_time_unix_ns: u64,
 }
 
-/// Input to final admission. The callback must bind metadata to the decoded
+/// Input to final admission.
+///
+/// The callback must bind metadata to the decoded
 /// capsule and revalidate SSI for the complete ordered batch. The object map
 /// passed alongside these candidates contains their immediate evidence bytes.
 #[derive(Clone)]
@@ -268,7 +273,9 @@ struct PreparedProof {
     records: Vec<SymbolRecord>,
 }
 
-/// Owns both the sequencer and its storage path. No mutable accessor exposes
+/// Owns both the sequencer and its storage path.
+///
+/// No mutable accessor exposes
 /// the model's simulated barriers. Completed replies remain in the bounded
 /// queue until individually collected, even when a later batch fails.
 ///

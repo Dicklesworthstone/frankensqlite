@@ -82,6 +82,9 @@ impl NativeSchemaEntry {
     #[must_use]
     pub const fn is_table_btree(&self) -> bool { self.table_btree }
 
+    // The native catalog is this engine's own format, always UTF-8 text in
+    // canonical records; it never carries a database's UTF-16 encoding.
+    #[allow(clippy::disallowed_methods)]
     fn record(&self) -> Vec<u8> {
         serialize_record(&[
             SqliteValue::Text(self.kind.as_str().into()),
@@ -92,6 +95,7 @@ impl NativeSchemaEntry {
         ])
     }
 
+    #[allow(clippy::disallowed_methods)] // canonical UTF-8 native record, see `record`
     fn decode(rowid: i64, bytes: &[u8]) -> Result<Self> {
         if rowid <= 0 || bytes.len() > MAX_NATIVE_SCHEMA_SQL_BYTES + 3 * MAX_NAME_BYTES + 64 {
             return Err(malformed("native schema record exceeds its bounds"));
@@ -127,6 +131,7 @@ impl NativeSchemaEntry {
 }
 
 /// Snapshot-local metadata, not a live mutable cache or an authority token.
+///
 /// Named tree access resolves again through the supplied transaction, so a
 /// descriptor saved by an older transaction cannot silently select today's root.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -226,6 +231,7 @@ fn read_header<S: VfsFile, M: VfsFile, C: NativeObjectCodec>(
 }
 
 /// Initialize page 1's schema tree in a fresh native database transaction.
+///
 /// Repeated initialization validates existing metadata and leaves it untouched.
 /// Missing page 1 in a non-genesis snapshot is corruption, never permission to
 /// erase a schema. The caller commits explicitly; this creates no files.
@@ -268,6 +274,7 @@ pub fn initialize_native_schema<S: VfsFile, M: VfsFile, C: NativeObjectCodec>(
 }
 
 /// Read schema rows from the real catalog B-tree at `txn`'s snapshot.
+///
 /// Only catalog pages are read here, not every table root: independent data
 /// writers must not become coupled by a catalog-wide scan of mutable roots.
 /// Roots are checked when opened by name. Names and roots must be unique, and
@@ -356,6 +363,7 @@ fn bump_cookie<S: VfsFile, M: VfsFile, C: NativeObjectCodec>(
 }
 
 /// Register a parsed table/index definition and initialize its fresh root.
+///
 /// The builder is mandatory: the SQL executor must populate data/index keys
 /// and enforce the definition's semantics. No CREATE statement is executed by
 /// this function, and IF NOT EXISTS does not suppress duplicate admission.
@@ -422,7 +430,9 @@ where
 }
 
 /// Resolve a named root in the transaction's schema snapshot, then run the
-/// existing B-tree cursor. Every access records a catalog dependency as well
+/// existing B-tree cursor.
+///
+/// Every access records a catalog dependency as well
 /// as traversal pages. Old snapshots resolve old names/roots, while a writer
 /// depending on a concurrently changed schema is refused at commit.
 ///
@@ -446,6 +456,7 @@ where
 }
 
 /// Execute a multi-tree statement in one rollback-on-drop private savepoint.
+///
 /// A SQL executor can update the table and all of its indexes here without
 /// leaving an accepted table edit behind when a later index constraint fails.
 /// Callback errors must be propagated; successful completion accepts the
@@ -472,6 +483,7 @@ where
 }
 
 /// Remove a table and its catalog-owned indexes, or just the named index.
+///
 /// Catalog rows, the schema cookie and versioned root deletions are atomic
 /// with respect to the transaction. All roots are checked before any edit.
 /// Old snapshots still resolve the previous schema and root/page versions;
@@ -528,6 +540,7 @@ pub async fn drop_native_schema_tree<S: VfsFile, M: VfsFile, C: NativeObjectCode
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // native catalog records are canonical UTF-8 by definition
 mod tests {
     use super::*;
 

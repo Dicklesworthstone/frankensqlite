@@ -4,7 +4,7 @@
 use std::future::Future;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Wake, Waker};
+use std::task::{Context, Poll, Waker};
 
 use asupersync::runtime::RuntimeBuilder;
 use fsqlite_btree::{BtCursor, BtreeCursorOps, SeekResult, TransactionPageIo};
@@ -435,10 +435,6 @@ impl VfsFile for PausedFile {
         self.inner.shm_unmap(cx, delete)
     }
 }
-struct NoopWake;
-impl Wake for NoopWake {
-    fn wake(self: Arc<Self>) {}
-}
 
 #[test]
 fn dropped_commit_retains_source_completion_and_refuses_premature_close() {
@@ -471,8 +467,7 @@ fn dropped_commit_retains_source_completion_and_refuses_premature_close() {
         assert_eq!(txn.pager_commit_state(), PagerCommitState::NotCommitted);
         {
             let mut commit = Box::pin(txn.commit_at(&cx, 100));
-            let waker = Waker::from(Arc::new(NoopWake));
-            let mut context = Context::from_waker(&waker);
+            let mut context = Context::from_waker(Waker::noop());
             assert!(matches!(commit.as_mut().poll(&mut context), Poll::Pending));
             assert!(
                 source.lock().unwrap().is_some(),

@@ -172,14 +172,15 @@ async fn execute(
     // Negative control: no shadow rows can supply the expected results.
     engine.set_database(MemDatabase::new());
     engine.set_reject_mem_fallback(true);
-    engine.bind_storage_transaction(transaction, 512);
+    engine.set_transaction(transaction);
     assert!(matches!(
         engine.execute(program).await.unwrap(),
         ExecOutcome::Done
     ));
-    let rows = engine.take_results();
+    let rows = engine.take_results().into_iter().map(Vec::from).collect();
     let transaction = engine
-        .take_storage_transaction()
+        .take_transaction()
+        .expect("release the storage cursors")
         .expect("return the original storage owner");
     assert!(transaction.is_native());
     (transaction, rows)

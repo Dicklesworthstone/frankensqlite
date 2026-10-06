@@ -69,6 +69,7 @@ impl NativeDurabilityLimits {
 }
 
 /// Receipt issued only after referent sync, marker append, and marker sync.
+///
 /// The storage/namespace guarantees of the supplied VFS still apply; MemoryVfs
 /// is useful for tests but cannot make a power-loss durability guarantee.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,7 +81,9 @@ pub struct NativeDurabilityReceipt {
     pub marker_stream_bytes: u64,
 }
 
-/// Verified recovery result. Both streams have been re-synchronized before
+/// Verified recovery result.
+///
+/// Both streams have been re-synchronized before
 /// this report is returned. Complete corrupt markers or undecodable referents
 /// fail recovery; they are never reclassified as an uncommitted tail.
 #[derive(Debug)]
@@ -120,6 +123,7 @@ struct SymbolLocation {
 /// succeeds. Settle the source-owned completion, retain the files, and recover
 /// under the same append-owner authority. An error never means "rolled back".
 #[derive(Debug)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct NativeDurabilityLog<S: VfsFile, M: VfsFile> {
     symbols: S,
     markers: M,

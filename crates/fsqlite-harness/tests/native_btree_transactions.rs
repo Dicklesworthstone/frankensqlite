@@ -1,9 +1,8 @@
 //! Existing B-tree algorithms over native capsules, not public SQL qualification.
 use std::future::Future;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::task::{Context, Poll, Wake, Waker};
+use std::task::{Context, Poll, Waker};
 
 use asupersync::runtime::RuntimeBuilder;
 use fsqlite_btree::traits::{BtreeCursorOps, SeekResult};
@@ -376,11 +375,6 @@ fn failed_tree_scope_restores_prior_work_and_preserves_the_original_error() {
     });
 }
 
-struct NoopWake;
-impl Wake for NoopWake {
-    fn wake(self: Arc<Self>) {}
-}
-
 #[test]
 fn dropped_future_restores_a_partially_mutated_tree_before_later_commit() {
     run(async {
@@ -404,8 +398,7 @@ fn dropped_future_restores_a_partially_mutated_tree_before_later_commit() {
                     Ok(())
                 },
             ));
-            let waker = Waker::from(Arc::new(NoopWake));
-            let mut context = Context::from_waker(&waker);
+            let mut context = Context::from_waker(Waker::noop());
             assert!(matches!(
                 operation.as_mut().poll(&mut context),
                 Poll::Pending

@@ -119,6 +119,7 @@ pub struct NativeBtreePageIo<'a, S: VfsFile, M: VfsFile, C: NativeObjectCodec> {
     state: Rc<ScopeState<'a, S, M, C>>,
 }
 
+#[allow(clippy::unused_async_trait_impl)] // lazy futures required by the trait; bodies are synchronous
 impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> PageReader for NativeBtreePageIo<'_, S, M, C> {
     async fn read_page<'a>(&'a self, cx: &'a Cx, page_no: PageNumber) -> Result<Vec<u8>> {
         self.state.access(|txn| {
@@ -137,6 +138,7 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> PageReader for NativeBtreePag
     }
 }
 
+#[allow(clippy::unused_async_trait_impl)] // lazy futures required by the trait; bodies are synchronous
 impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> PageWriter for NativeBtreePageIo<'_, S, M, C> {
     async fn write_page<'a>(&'a mut self, cx: &'a Cx, page_no: PageNumber, data: &'a [u8]) -> Result<()> {
         self.state.access(|txn| self.state.store.write_page(cx, txn, page_no, Some(data)))

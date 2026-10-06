@@ -29,6 +29,7 @@ use crate::native_durability::{
 };
 
 /// Retained page payload and metadata bounds, not a process-RSS claim.
+///
 /// Obsolete page versions can be reclaimed, but every open snapshot keeps its
 /// floor version and all newer versions. Admission attempts reclamation before
 /// refusing an over-budget write; pinned history is never evicted. This bounds
@@ -89,7 +90,9 @@ struct SavedOverlay {
 /// Nested overlay checkpoints are bounded independently of the active overlay.
 pub const MAX_NATIVE_SAVEPOINTS: usize = 32;
 
-/// An owner-bound snapshot and private overlay. Dropping an active transaction
+/// An owner-bound snapshot and private overlay.
+///
+/// Dropping an active transaction
 /// discards only this private overlay and releases its active-session slot.
 /// Already returned page Arcs may outlive it and are caller-owned memory.
 pub struct NativePageTransaction {
@@ -401,7 +404,9 @@ impl PageHistory {
 }
 
 /// Native full-page snapshot transactions, backed by the existing durable
-/// coordinator, object codec, and two-stream recovery path. Its callbacks are
+/// coordinator, object codec, and two-stream recovery path.
+///
+/// Its callbacks are
 /// fixed by this implementation: callers cannot omit page conflict validation.
 ///
 /// Page writes are buffered independently in transaction handles. Commit-order

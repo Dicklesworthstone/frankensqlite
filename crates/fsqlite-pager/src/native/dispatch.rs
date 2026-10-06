@@ -94,7 +94,7 @@ where
         Box::pin(TransactionHandle::commit(self, cx))
     }
     fn commit_at<'a>(&'a mut self, cx: &'a Cx, now_unix_ns: u64) -> NativeFuture<'a, ()> {
-        Box::pin(NativeTransaction::commit_at(self, cx, now_unix_ns))
+        Box::pin(Self::commit_at(self, cx, now_unix_ns))
     }
     fn settle_commit<'a>(&'a mut self, cx: &'a Cx) -> NativeFuture<'a, PagerCommitState> {
         Box::pin(TransactionHandle::settle_commit(self, cx))
@@ -154,9 +154,9 @@ where
     fn rollback_to_savepoint(&mut self, cx: &Cx, name: &str) -> Result<()> {
         TransactionHandle::rollback_to_savepoint(self, cx, name)
     }
-    fn mode(&self) -> TransactionMode { NativeTransaction::mode(self) }
+    fn mode(&self) -> TransactionMode { Self::mode(self) }
     fn acknowledgement(&self) -> Option<&DurableCommitAcknowledgement> {
-        NativeTransaction::acknowledgement(self)
+        Self::acknowledgement(self)
     }
     fn snapshot_db_size(&self) -> u32 { self.transaction.borrow().snapshot_db_size() }
     fn live_db_size(&self) -> u32 { self.transaction.borrow().live_db_size() }
@@ -164,7 +164,9 @@ where
     fn live_reserved_pages(&self) -> Vec<PageNumber> { self.transaction.borrow().live_reserved_pages() }
 }
 
-/// The native variant carried by [`TransactionKind`]. It owns the original
+/// The native variant carried by [`TransactionKind`].
+///
+/// It owns the original
 /// sealed native handle; conversion performs no I/O, snapshot capture, or copy
 /// into a compatibility transaction. It cannot be constructed from arbitrary
 /// `TransactionHandle` implementations and offers no mutable downcast escape.
