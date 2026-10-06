@@ -3,19 +3,22 @@
 use std::future::{Future, poll_fn};
 use std::path::Path;
 use std::pin::Pin;
-use std::task::Poll;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Wake, Waker};
 
 use asupersync::Cx as NativeCx;
 use asupersync::runtime::RuntimeBuilder;
+use fsqlite_btree::{BtCursor, BtreeCursorOps, TransactionPageIo};
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_harness::fault_vfs::{FaultInjectingVfs, FaultSpec};
 use fsqlite_pager::native::NativePager;
 use fsqlite_pager::native_service::NativeCommitService;
 use fsqlite_pager::{PagerCommitState, TransactionHandle, TransactionMode};
 use fsqlite_types::cx::Cx;
-use fsqlite_types::flags::VfsOpenFlags;
-use fsqlite_types::{CommitSeq, ObjectId, Oti, PageNumber, SymbolRecord, SymbolRecordFlags, reconstruct_systematic_happy_path};
-use fsqlite_vfs::{MemoryVfs, Vfs, VfsFile};
+use fsqlite_types::flags::{SyncFlags, VfsOpenFlags};
+use fsqlite_types::{CommitSeq, LockLevel, ObjectId, Oti, PageNumber, SymbolRecord, SymbolRecordFlags, reconstruct_systematic_happy_path};
+use fsqlite_vfs::{FileIdentity, MemoryVfs, ShmRegion, Vfs, VfsFile, VfsWriteCompletion, VfsWriteCompletionState};
 use fsqlite_wal::native_commit::durable::NativeObjectCodec;
 use fsqlite_wal::native_durability::{NativeDurabilityLimits, NativeDurabilityLog};
 use fsqlite_wal::native_pages::{NativePageLimits, NativePageStore};
@@ -365,5 +368,318 @@ fn completed_handle_cannot_be_submitted_as_a_new_commit() {
         assert_eq!(vfs.sync_count(), 2);
         assert_eq!(owner.committed_tip().unwrap(), CommitSeq::new(1));
         owner.close(&cx).unwrap();
+    });
+}
+
+#[derive(Default)]
+struct WakeCounter(AtomicUsize);
+impl Wake for WakeCounter {
+    fn wake(self: Arc<Self>) { self.0.fetch_add(1, Ordering::SeqCst); }
+    fn wake_by_ref(self: &Arc<Self>) { self.0.fetch_add(1, Ordering::SeqCst); }
+}
+
+#[test]
+fn idle_service_is_woken_by_local_cancellation_and_graceful_shutdown() {
+    run(async {
+        for cancel in [true, false] {
+            let (cx, native) = contexts();
+            let vfs = FaultInjectingVfs::new(MemoryVfs::new());
+            let owner = pager(&vfs, &cx);
+            let (sender, worker) = NativeCommitService::new(&owner, 1, 1).unwrap();
+            // Intentionally do NOT attach native: cancelling this local node
+            // must wake the worker without cancelling the unrelated runtime.
+            let local = Cx::new();
+            let wakes = Arc::new(WakeCounter::default());
+            let waker = Waker::from(Arc::clone(&wakes));
+            let mut task_cx = Context::from_waker(&waker);
+            let mut running = Box::pin(worker.run(&local));
+            assert!(running.as_mut().poll(&mut task_cx).is_pending());
+            let before = wakes.0.load(Ordering::SeqCst);
+            if cancel { local.cancel(); } else { sender.request_shutdown(); }
+            assert!(wakes.0.load(Ordering::SeqCst) > before,
+                "the idle future needs a real wake, not an unsolicited manual repoll");
+            if cancel {
+                assert!(matches!(running.as_mut().poll(&mut task_cx),
+                    Poll::Ready(Err(FrankenError::Interrupt))));
+            } else {
+                assert!(matches!(running.as_mut().poll(&mut task_cx), Poll::Ready(Ok(()))));
+            }
+            drop(running);
+            assert!(sender.try_reserve(&native).is_err());
+            assert_eq!(vfs.sync_count(), 0);
+            assert!(!owner.needs_recovery().unwrap());
+            owner.close(&cx).unwrap();
+        }
+    });
+}
+
+#[test]
+fn bounded_producers_and_worker_progress_when_driven_concurrently() {
+    run(async {
+        let (cx, native) = contexts();
+        let vfs = FaultInjectingVfs::new(MemoryVfs::new());
+        let owner = pager(&vfs, &cx);
+        let (sender, worker) = NativeCommitService::new(&owner, 1, 4).unwrap();
+        let mut prepared = Vec::new();
+        for n in 2_u8..=9 {
+            let mut transaction = owner.begin(&cx, TransactionMode::Concurrent).unwrap();
+            transaction.write_page(&cx, page(u32::from(n)), &[n; 512]).await.unwrap();
+            prepared.push(transaction);
+        }
+        let mut producer = Box::pin(async {
+            let mut tickets = Vec::new();
+            for transaction in prepared {
+                // Eight intents cannot all enter a one-slot mailbox before
+                // the worker runs. No sender blocks the executor's thread.
+                let permit = sender.reserve(&native).await.unwrap();
+                tickets.push(permit.send(transaction, 100).unwrap());
+            }
+            sender.request_shutdown();
+            let mut sequences = Vec::new();
+            for mut ticket in tickets {
+                let completion = ticket.wait(&native).await.unwrap();
+                completion.result.unwrap();
+                sequences.push(completion.transaction.acknowledgement().unwrap().commit_seq.get());
+            }
+            sequences
+        });
+        pending_once(producer.as_mut()).await; // First intent queued; second is backpressured.
+        let mut running = Box::pin(worker.run(&cx));
+        let mut produced = None;
+        let mut finished = false;
+        poll_fn(|task_cx| {
+            if produced.is_none() {
+                if let Poll::Ready(sequences) = producer.as_mut().poll(task_cx) {
+                    produced = Some(sequences);
+                }
+            }
+            if !finished {
+                if let Poll::Ready(result) = running.as_mut().poll(task_cx) {
+                    result.unwrap();
+                    finished = true;
+                }
+            }
+            if produced.is_some() && finished { Poll::Ready(()) } else { Poll::Pending }
+        }).await;
+        drop(producer);
+        drop(running);
+        assert_eq!(produced.unwrap(), (1_u64..=8).collect::<Vec<_>>());
+        assert_eq!(owner.committed_tip().unwrap(), CommitSeq::new(8));
+        // Do not bake the coalescing scheduler's exact group sizes into a
+        // throughput claim. Each nonempty publication still has two syncs.
+        assert_eq!(vfs.sync_count() % 2, 0);
+        assert!((2..=16).contains(&vfs.sync_count()));
+        let mut view = owner.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        for n in 2_u8..=9 {
+            assert_eq!(view.get_page(&cx, page(u32::from(n))).await.unwrap().as_bytes(), &[n; 512]);
+        }
+        view.rollback(&cx).await.unwrap();
+        owner.close(&cx).unwrap();
+    });
+}
+
+// Deterministic source-completion pause, not a fabricated background task:
+// write actual marker bytes, retain the source's completion externally, and
+// suspend before its success can be reported to the publisher.
+struct PausedMarkerFile {
+    inner: <MemoryVfs as Vfs>::File,
+    source: Arc<Mutex<Option<VfsWriteCompletion>>>,
+}
+impl VfsFile for PausedMarkerFile {
+    fn close(&mut self, cx: &Cx) -> Result<()> { self.inner.close(cx) }
+    fn file_identity(&self) -> Result<Option<FileIdentity>> { self.inner.file_identity() }
+    fn refresh_file_identity(&self) -> Result<Option<FileIdentity>> { self.inner.refresh_file_identity() }
+    async fn read<'a>(&'a self, cx: &'a Cx, buf: &'a mut [u8], offset: u64) -> Result<usize> {
+        self.inner.read(cx, buf, offset).await
+    }
+    async fn write<'a>(&'a self, cx: &'a Cx, buf: &'a [u8], offset: u64) -> Result<()> {
+        self.inner.write(cx, buf, offset).await
+    }
+    async fn write_tracked<'a>(&'a self, cx: &'a Cx, buf: &'a [u8], offset: u64,
+        completion: VfsWriteCompletion) -> Result<()> {
+        self.inner.write(cx, buf, offset).await?;
+        *self.source.lock().unwrap() = Some(completion);
+        std::future::pending::<Result<()>>().await
+    }
+    fn truncate(&mut self, cx: &Cx, size: u64) -> Result<()> { self.inner.truncate(cx, size) }
+    fn sync(&mut self, cx: &Cx, flags: SyncFlags) -> Result<()> { self.inner.sync(cx, flags) }
+    fn file_size(&self, cx: &Cx) -> Result<u64> { self.inner.file_size(cx) }
+    fn lock(&mut self, cx: &Cx, level: LockLevel) -> Result<()> { self.inner.lock(cx, level) }
+    fn unlock(&mut self, cx: &Cx, level: LockLevel) -> Result<()> { self.inner.unlock(cx, level) }
+    fn lock_external_wal_append(&mut self, cx: &Cx) -> Result<()> { self.inner.lock_external_wal_append(cx) }
+    fn owns_external_wal_append_write(&self, cx: &Cx) -> Result<bool> { self.inner.owns_external_wal_append_write(cx) }
+    fn restore_external_wal_append_attempt(&mut self, cx: &Cx) -> Result<()> { self.inner.restore_external_wal_append_attempt(cx) }
+    fn lock_external_shared_snapshot(&mut self, cx: &Cx) -> Result<()> { self.inner.lock_external_shared_snapshot(cx) }
+    fn restore_external_shared_snapshot_attempt(&mut self, cx: &Cx) -> Result<()> { self.inner.restore_external_shared_snapshot_attempt(cx) }
+    fn lock_external_maintenance(&mut self, cx: &Cx, wal: bool) -> Result<()> { self.inner.lock_external_maintenance(cx, wal) }
+    fn lock_external_wal_recovery(&mut self, cx: &Cx) -> Result<()> { self.inner.lock_external_wal_recovery(cx) }
+    fn restore_external_maintenance_attempt(&mut self, cx: &Cx) -> Result<()> { self.inner.restore_external_maintenance_attempt(cx) }
+    fn check_reserved_lock(&self, cx: &Cx) -> Result<bool> { self.inner.check_reserved_lock(cx) }
+    fn shm_map(&mut self, cx: &Cx, region: u32, size: u32, extend: bool) -> Result<ShmRegion> {
+        self.inner.shm_map(cx, region, size, extend)
+    }
+    fn shm_lock(&mut self, cx: &Cx, offset: u32, n: u32, flags: u32) -> Result<()> {
+        self.inner.shm_lock(cx, offset, n, flags)
+    }
+    fn shm_barrier(&self) { self.inner.shm_barrier(); }
+    fn shm_unmap(&mut self, cx: &Cx, delete: bool) -> Result<()> { self.inner.shm_unmap(cx, delete) }
+}
+
+#[test]
+fn abandoned_worker_keeps_marker_source_completion_and_each_transaction_verdict() {
+    run(async {
+        let (cx, native) = contexts();
+        let vfs = MemoryVfs::new();
+        let source = Arc::new(Mutex::new(None));
+        let log = NativeDurabilityLog::create(&cx, file(&vfs, &cx, "objects"),
+            PausedMarkerFile { inner: file(&vfs, &cx, "markers"), source: Arc::clone(&source) },
+            NativeDurabilityLimits::default(),
+        ).unwrap();
+        let owner = NativePager::new(NativePageStore::new(log, TestCodec, 512,
+            NativePageLimits::default()).unwrap()).unwrap();
+        let (sender, worker) = NativeCommitService::new(&owner, 4, 2).unwrap();
+        let mut tickets = Vec::new();
+        for n in 2_u8..=4 {
+            let mut transaction = owner.begin(&cx, TransactionMode::Concurrent).unwrap();
+            transaction.write_page(&cx, page(u32::from(n)), &[n; 512]).await.unwrap();
+            tickets.push(sender.reserve(&native).await.unwrap().send(transaction, 100).unwrap());
+        }
+        let mut running = Box::pin(worker.run(&cx));
+        pending_once(running.as_mut()).await; // Coalescing yield, still before publication.
+        assert!(source.lock().unwrap().is_none());
+        pending_once(running.as_mut()).await; // Memory I/O reaches the marker source pause.
+        assert!(source.lock().unwrap().is_some(), "the drop must occur AFTER actual marker writes");
+        drop(running);
+        let completion = owner.outstanding_write().unwrap().unwrap();
+        assert_eq!(completion.state(), VfsWriteCompletionState::Pending);
+        assert_eq!(owner.committed_tip().unwrap(), CommitSeq::ZERO);
+        let mut markers = file(&vfs, &cx, "markers");
+        assert_eq!(markers.file_size(&cx).unwrap(),
+            2 * u64::try_from(fsqlite_types::COMMIT_MARKER_RECORD_V1_SIZE).unwrap());
+        markers.close(&cx).unwrap();
+        let mut returned = Vec::new();
+        for mut ticket in tickets { returned.push(ticket.wait(&native).await.unwrap()); }
+        for result in &mut returned[..2] {
+            assert!(matches!(result.result.as_ref().unwrap_err().as_ref(), FrankenError::BusyRecovery));
+            assert_eq!(result.transaction.pager_commit_state(), PagerCommitState::InDoubt);
+            assert!(result.transaction.rollback(&cx).await.is_err());
+            assert!(result.transaction.settle_commit(&cx).await.is_err());
+        }
+        assert_eq!(returned[2].transaction.pager_commit_state(), PagerCommitState::NotCommitted);
+        returned[2].transaction.rollback(&cx).await.unwrap();
+        assert!(matches!(owner.close(&cx), Err(FrankenError::Busy)));
+        drop(returned);
+        assert!(matches!(owner.close(&cx), Err(FrankenError::BusyRecovery)));
+        source.lock().unwrap().take().unwrap().complete_success();
+        assert_eq!(completion.state(), VfsWriteCompletionState::Success);
+        owner.close(&cx).unwrap();
+        let (store, report) = NativePageStore::recover(&cx, file(&vfs, &cx, "objects"),
+            file(&vfs, &cx, "markers"), TestCodec, 512,
+            NativeDurabilityLimits::default(), NativePageLimits::default(),
+        ).await.unwrap();
+        assert_eq!(report.markers.len(), 2);
+        let recovered = NativePager::new(store).unwrap();
+        let mut view = recovered.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        for n in 2_u8..=3 {
+            assert_eq!(view.get_page(&cx, page(u32::from(n))).await.unwrap().as_bytes(), &[n; 512]);
+        }
+        assert!(view.get_page(&cx, page(4)).await.is_err());
+        view.rollback(&cx).await.unwrap();
+        recovered.close(&cx).unwrap();
+    });
+}
+
+async fn table_root<T: TransactionHandle>(transaction: &mut T, cx: &Cx) -> PageNumber {
+    let root = transaction.allocate_page(cx).await.unwrap();
+    let mut bytes = vec![0; transaction.page_size().as_usize()];
+    bytes[0] = 0x0D;
+    bytes[5..7].copy_from_slice(&512_u16.to_be_bytes());
+    transaction.write_page(cx, root, &bytes).await.unwrap();
+    root
+}
+async fn table_rows<T: TransactionHandle>(transaction: &mut T, cx: &Cx, root: PageNumber)
+    -> Vec<(i64, Vec<u8>)> {
+    let mut cursor = BtCursor::new(TransactionPageIo::new(transaction), root, 512, true);
+    let mut rows = Vec::new();
+    if cursor.first(cx).await.unwrap() {
+        loop {
+            rows.push((cursor.rowid(cx).await.unwrap(), cursor.payload(cx).await.unwrap()));
+            if !cursor.next(cx).await.unwrap() { break; }
+        }
+    }
+    rows
+}
+
+#[cfg(unix)]
+#[test]
+fn automatic_service_commits_real_btree_splits_and_authenticated_file_recovery() {
+    use fsqlite_wal::native_commit::durable::codec::RaptorQNativeCodec;
+    run(async {
+        let (cx, native) = contexts();
+        let directory = tempfile::tempdir().unwrap();
+        let objects = directory.path().join("objects");
+        let markers = directory.path().join("markers");
+        let vfs = fsqlite_vfs::unix::UnixVfs::new();
+        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
+        let log = NativeDurabilityLog::create(&cx,
+            vfs.open(&cx, Some(&objects), flags).unwrap().0,
+            vfs.open(&cx, Some(&markers), flags).unwrap().0,
+            NativeDurabilityLimits::default(),
+        ).unwrap();
+        let owner = NativePager::new(NativePageStore::new(log,
+            RaptorQNativeCodec::new(Some([7; 32])), 512, NativePageLimits::default(),
+        ).unwrap()).unwrap();
+        let mut left = owner.begin(&cx, TransactionMode::Concurrent).unwrap();
+        let mut right = owner.begin(&cx, TransactionMode::Concurrent).unwrap();
+        let mut old = owner.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        let left_root = table_root(&mut left, &cx).await;
+        let right_root = table_root(&mut right, &cx).await;
+        let mut expected = Vec::new();
+        for (root, transaction, seed) in [(left_root, &mut left, 17_u8), (right_root, &mut right, 29)] {
+            {
+                let mut cursor = BtCursor::new(TransactionPageIo::new(&mut *transaction), root, 512, true);
+                for row in 0_i64..120 {
+                    cursor.table_insert(&cx, row, &vec![seed; 80]).await.unwrap();
+                }
+                cursor.table_insert(&cx, 999, &vec![seed; 4097]).await.unwrap();
+            }
+            assert_eq!(transaction.get_page(&cx, root).await.unwrap().as_bytes()[0], 0x05,
+                "must exercise an interior B-tree, not a single leaf");
+            assert!(transaction.pending_commit_pages().unwrap().len() > 2);
+            let rows = table_rows(transaction, &cx, root).await;
+            assert_eq!(rows.len(), 121);
+            assert_eq!(rows.last().unwrap(), &(999, vec![seed; 4097]));
+            expected.push((root, rows));
+        }
+        let (sender, worker) = NativeCommitService::new(&owner, 4, 4).unwrap();
+        let mut a = sender.reserve(&native).await.unwrap().send(left, 100).unwrap();
+        let mut b = sender.clone().reserve(&native).await.unwrap().send(right, 100).unwrap();
+        sender.request_shutdown();
+        worker.run(&cx).await.unwrap();
+        let first = a.wait(&native).await.unwrap();
+        first.result.unwrap();
+        assert_eq!(first.transaction.acknowledgement().unwrap().commit_seq, CommitSeq::new(1));
+        let second = b.wait(&native).await.unwrap();
+        second.result.unwrap();
+        assert_eq!(second.transaction.acknowledgement().unwrap().commit_seq, CommitSeq::new(2));
+        assert!(old.get_page(&cx, left_root).await.is_err());
+        assert!(old.get_page(&cx, right_root).await.is_err());
+        old.rollback(&cx).await.unwrap();
+        owner.close(&cx).unwrap();
+        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::WAL;
+        let (store, report) = NativePageStore::recover(&cx,
+            vfs.open(&cx, Some(&objects), flags).unwrap().0,
+            vfs.open(&cx, Some(&markers), flags).unwrap().0,
+            RaptorQNativeCodec::new(Some([7; 32])), 512,
+            NativeDurabilityLimits::default(), NativePageLimits::default(),
+        ).await.unwrap();
+        assert_eq!(report.markers.len(), 2);
+        let recovered = NativePager::new(store).unwrap();
+        let mut reader = recovered.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        for (root, expected) in expected {
+            assert_eq!(table_rows(&mut reader, &cx, root).await, expected);
+        }
+        reader.rollback(&cx).await.unwrap();
+        recovered.close(&cx).unwrap();
     });
 }

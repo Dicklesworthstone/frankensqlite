@@ -12,7 +12,7 @@
 //! source writes settle. Dropping the worker cannot settle a physical write.
 
 use std::fmt;
-use std::future::poll_fn;
+use std::future::{Future, poll_fn};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::Poll;
@@ -157,6 +157,7 @@ impl<T: TransactionHandle> NativeCommitSender<T> {
     /// Seal producer admission and wake the worker to drain accepted requests.
     /// Already reserved but unsent permits return their transactions on send.
     /// Accepted intents still commit even when their tickets have been dropped.
+    /// A send racing this call either returns its handle or joins that drain.
     pub fn request_shutdown(&self) {
         self.closing.store(true, Ordering::Release);
         self.sender.wake_receiver();
@@ -321,15 +322,28 @@ where
         let native = cx.attached_native_cx().or_else(NativeCx::current).ok_or_else(|| {
             FrankenError::BackgroundWorkerFailed("native commit worker requires the caller runtime context".to_owned())
         })?;
+        // Local Cx cancellation need not cancel the current runtime context
+        // used by the mailbox. Register its wakeup independently; checking a
+        // flag only on receipt would leave an idle service asleep indefinitely.
+        let mut local_cancel = std::pin::pin!(cx.wait_for_local_cancellation());
         loop {
             let first = poll_fn(|task_cx| {
                 if self.closing.load(Ordering::Acquire) {
                     self.receiver.close();
                 }
-                if cx.checkpoint().is_err() {
+                if local_cancel.as_mut().poll(task_cx).is_ready() || cx.checkpoint().is_err() {
                     return Poll::Ready(Err(mpsc::RecvError::Cancelled));
                 }
-                self.receiver.poll_recv(&native, task_cx)
+                let received = self.receiver.poll_recv(&native, task_cx);
+                // Shutdown may race the flag check above before the channel
+                // registers its waker. Recheck after Pending: from here the
+                // registered waker covers any later shutdown request.
+                if received.is_pending() && self.closing.load(Ordering::Acquire) {
+                    self.receiver.close();
+                    self.receiver.poll_recv(&native, task_cx)
+                } else {
+                    received
+                }
             }).await;
             match first {
                 Ok(request) => self.batch.push(request),
