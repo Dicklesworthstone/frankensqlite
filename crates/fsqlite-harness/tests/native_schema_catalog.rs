@@ -1,12 +1,16 @@
 //! Native schema storage integration, not public Connection/SQL qualification.
 use std::future::Future;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::task::{Context, Poll, Wake, Waker};
 
 use asupersync::runtime::RuntimeBuilder;
 use fsqlite_btree::BtreeCursorOps;
 use fsqlite_core::native_index::btree::{with_native_btree, catalog::{
     NativeSchemaEntry, NativeSchemaKind, create_native_schema_tree,
     initialize_native_schema, read_native_schema, with_native_schema_tree,
+    drop_native_schema_tree, with_native_schema_statement,
 }};
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
@@ -260,5 +264,178 @@ fn authenticated_native_files_recover_schema_and_resolve_rows_by_name() {
         assert_eq!(named_rows(&cx, &recovered, &mut txn, "file_table").await,
             vec![(1, b"stored by name".to_vec())]);
         recovered.rollback(&mut txn).unwrap(); recovered.close(&cx).unwrap();
+    });
+}
+
+#[test]
+fn table_drop_retires_indexes_and_old_snapshots_keep_their_original_named_roots() {
+    run(async {
+        let cx = Cx::new(); let vfs = MemoryVfs::new(); let mut db = store(&vfs, &cx);
+        let mut txn = db.begin(&cx).unwrap(); initialize_native_schema(&cx, &db, &mut txn).unwrap();
+        let original = table(&cx, &db, &mut txn, "items").await;
+        table(&cx, &db, &mut txn, "other").await;
+        let index = create_native_schema_tree(&cx, &db, &mut txn,
+            "CREATE INDEX by_value ON items(value)", async |_, _| Ok(())).await.unwrap();
+        with_native_schema_tree(&cx, &db, &mut txn, "items", NativeSchemaKind::Table,
+            async |c| c.table_insert(&cx, 1, b"old object").await).await.unwrap();
+        db.commit(&cx, &mut txn, 100).await.unwrap();
+        let mut old = db.begin(&cx).unwrap(); let mut writer = db.begin(&cx).unwrap();
+        with_native_schema_tree(&cx, &db, &mut writer, "items", NativeSchemaKind::Table,
+            async |c| c.table_insert(&cx, 2, b"stale write").await).await.unwrap();
+        let mut ddl = db.begin(&cx).unwrap();
+        let removed = drop_native_schema_tree(&cx, &db, &mut ddl, "ITEMS", NativeSchemaKind::Table).await.unwrap();
+        assert_eq!(removed.len(), 2);
+        for root in [original.root(), index.root()] { assert!(db.read_page(&cx, &mut ddl, root).unwrap().is_none()); }
+        let after_drop = read_native_schema(&cx, &db, &mut ddl).await.unwrap();
+        assert_eq!(after_drop.cookie(), 4); assert_eq!(after_drop.entries().len(), 1);
+        let replacement = table(&cx, &db, &mut ddl, "items").await;
+        assert_ne!(replacement.root(), original.root());
+        db.commit(&cx, &mut ddl, 101).await.unwrap();
+        assert!(matches!(db.commit(&cx, &mut writer, 102).await, Err(FrankenError::BusySnapshot { .. })));
+        assert_eq!(named_rows(&cx, &db, &mut old, "items").await, vec![(1, b"old object".to_vec())]);
+        assert!(read_native_schema(&cx, &db, &mut old).await.unwrap().find("by_value").is_some());
+        db.rollback(&mut writer).unwrap(); db.rollback(&mut old).unwrap(); db.close(&cx).unwrap();
+        let mut recovered = reopen(&vfs, &cx).await; let mut txn = recovered.begin(&cx).unwrap();
+        let schema = read_native_schema(&cx, &recovered, &mut txn).await.unwrap();
+        assert_eq!(schema.cookie(), 5); assert!(schema.find("by_value").is_none());
+        assert_eq!(schema.find("items").unwrap().root(), replacement.root());
+        assert!(named_rows(&cx, &recovered, &mut txn, "items").await.is_empty());
+        assert!(recovered.read_page(&cx, &mut txn, original.root()).unwrap().is_none());
+        recovered.rollback(&mut txn).unwrap(); recovered.close(&cx).unwrap();
+    });
+}
+
+#[test]
+fn unique_index_failure_rolls_back_the_whole_multitree_statement_not_prior_work() {
+    run(async {
+        let cx = Cx::new(); let vfs = MemoryVfs::new(); let mut db = store(&vfs, &cx);
+        let mut txn = db.begin(&cx).unwrap(); initialize_native_schema(&cx, &db, &mut txn).unwrap();
+        table(&cx, &db, &mut txn, "items").await;
+        create_native_schema_tree(&cx, &db, &mut txn, "CREATE UNIQUE INDEX uq ON items(value)",
+            async |_, _| Ok(())).await.unwrap();
+        // Prior private work that must survive the rejected statement.
+        let kept_record = serialize_record(&[SqliteValue::Integer(42)]);
+        with_native_schema_tree(&cx, &db, &mut txn, "items", NativeSchemaKind::Table,
+            async |c| c.table_insert(&cx, 1, &kept_record).await).await.unwrap();
+        let key = serialize_record(&[SqliteValue::Integer(42), SqliteValue::Integer(1)]);
+        with_native_schema_tree(&cx, &db, &mut txn, "uq", NativeSchemaKind::Index,
+            async |c| c.index_insert_unique(&cx, &key, 1, "items.value").await).await.unwrap();
+        let wrote_table = AtomicBool::new(false);
+        let result = with_native_schema_statement(&cx, &db, &mut txn, async |txn| {
+            with_native_schema_tree(&cx, &db, txn, "items", NativeSchemaKind::Table,
+                async |c| c.table_insert(&cx, 2, &kept_record).await).await?;
+            wrote_table.store(true, Ordering::SeqCst);
+            let duplicate = serialize_record(&[SqliteValue::Integer(42), SqliteValue::Integer(2)]);
+            with_native_schema_tree(&cx, &db, txn, "uq", NativeSchemaKind::Index,
+                async |c| c.index_insert_unique(&cx, &duplicate, 1, "items.value").await).await
+        }).await;
+        assert!(wrote_table.load(Ordering::SeqCst));
+        assert!(matches!(result, Err(FrankenError::UniqueViolation { .. })));
+        assert_eq!(named_rows(&cx, &db, &mut txn, "items").await, vec![(1, kept_record.clone())]);
+        db.commit(&cx, &mut txn, 100).await.unwrap(); db.close(&cx).unwrap();
+        let mut recovered = reopen(&vfs, &cx).await; let mut txn = recovered.begin(&cx).unwrap();
+        assert_eq!(named_rows(&cx, &recovered, &mut txn, "items").await, vec![(1, kept_record)]);
+        let keys = with_native_schema_tree(&cx, &recovered, &mut txn, "uq", NativeSchemaKind::Index, async |c| {
+            assert!(c.first(&cx).await?); let key = c.payload(&cx).await?;
+            assert!(!c.next(&cx).await?); Ok(key)
+        }).await.unwrap();
+        assert_eq!(keys, key);
+        recovered.rollback(&mut txn).unwrap(); recovered.close(&cx).unwrap();
+    });
+}
+
+struct NoopWake;
+impl Wake for NoopWake { fn wake(self: Arc<Self>) {} }
+
+#[test]
+fn failed_or_dropped_schema_builders_restore_catalog_roots_cookie_and_prior_rows() {
+    run(async {
+        let cx = Cx::new(); let vfs = MemoryVfs::new(); let mut db = store(&vfs, &cx);
+        let mut txn = db.begin(&cx).unwrap(); initialize_native_schema(&cx, &db, &mut txn).unwrap();
+        table(&cx, &db, &mut txn, "keep").await;
+        with_native_schema_tree(&cx, &db, &mut txn, "keep", NativeSchemaKind::Table,
+            async |c| c.table_insert(&cx, 1, b"prior work").await).await.unwrap();
+        let before = read_native_schema(&cx, &db, &mut txn).await.unwrap();
+        for abandon in [false, true] {
+            let allocated = AtomicU32::new(0); let mutated = AtomicBool::new(false);
+            let mut operation = Box::pin(create_native_schema_tree(&cx, &db, &mut txn,
+                "CREATE TABLE rejected(value TEXT)", async |txn, entry| {
+                    allocated.store(entry.root().get(), Ordering::SeqCst);
+                    with_native_btree(&cx, &db, txn, entry.root(), true, async |c| {
+                        c.table_insert(&cx, 99, &vec![0xEE; 3000]).await
+                    }).await?;
+                    mutated.store(true, Ordering::SeqCst);
+                    if abandon { std::future::pending::<()>().await; }
+                    Err(FrankenError::CheckViolation { name: "original builder error".to_owned() })
+                }));
+            if abandon {
+                let waker = Waker::from(Arc::new(NoopWake)); let mut context = Context::from_waker(&waker);
+                assert!(matches!(operation.as_mut().poll(&mut context), Poll::Pending));
+            } else {
+                assert!(matches!(operation.as_mut().await, Err(FrankenError::CheckViolation { name }) if name == "original builder error"));
+            }
+            assert!(mutated.load(Ordering::SeqCst), "failure must follow actual root/overflow mutations");
+            drop(operation);
+            assert_eq!(read_native_schema(&cx, &db, &mut txn).await.unwrap(), before);
+            assert!(db.read_page(&cx, &mut txn, page(allocated.load(Ordering::SeqCst))).unwrap().is_none());
+            assert_eq!(named_rows(&cx, &db, &mut txn, "keep").await, vec![(1, b"prior work".to_vec())]);
+        }
+        db.commit(&cx, &mut txn, 100).await.unwrap(); db.close(&cx).unwrap();
+        let mut recovered = reopen(&vfs, &cx).await; let mut txn = recovered.begin(&cx).unwrap();
+        assert_eq!(read_native_schema(&cx, &recovered, &mut txn).await.unwrap(), before);
+        recovered.rollback(&mut txn).unwrap(); recovered.close(&cx).unwrap();
+    });
+}
+
+#[test]
+fn drop_index_keeps_its_table_and_cookie_exhaustion_restores_partial_removal() {
+    run(async {
+        let cx = Cx::new(); let vfs = MemoryVfs::new(); let mut db = store(&vfs, &cx);
+        let mut txn = db.begin(&cx).unwrap(); initialize_native_schema(&cx, &db, &mut txn).unwrap();
+        let original = table(&cx, &db, &mut txn, "items").await;
+        create_native_schema_tree(&cx, &db, &mut txn, "CREATE INDEX ix ON items(value)", async |_, _| Ok(())).await.unwrap();
+        assert_eq!(drop_native_schema_tree(&cx, &db, &mut txn, "ix", NativeSchemaKind::Index).await.unwrap().len(), 1);
+        assert!(db.read_page(&cx, &mut txn, original.root()).unwrap().is_some());
+        assert_eq!(read_native_schema(&cx, &db, &mut txn).await.unwrap().entries().len(), 1);
+        let mut p1 = db.read_page(&cx, &mut txn, page(1)).unwrap().unwrap().to_vec();
+        p1[40..44].copy_from_slice(&u32::MAX.to_be_bytes());
+        db.write_page(&cx, &mut txn, page(1), Some(&p1)).unwrap();
+        let before = read_native_schema(&cx, &db, &mut txn).await.unwrap();
+        assert!(matches!(drop_native_schema_tree(&cx, &db, &mut txn, "items", NativeSchemaKind::Table).await,
+            Err(FrankenError::DatabaseFull)));
+        assert_eq!(read_native_schema(&cx, &db, &mut txn).await.unwrap(), before);
+        assert_eq!(db.read_page(&cx, &mut txn, page(1)).unwrap().unwrap().as_ref(), p1);
+        assert!(db.read_page(&cx, &mut txn, original.root()).unwrap().is_some());
+        db.rollback(&mut txn).unwrap(); db.close(&cx).unwrap();
+    });
+}
+
+#[test]
+fn schema_retirement_recovers_atomically_across_both_sync_failure_boundaries() {
+    use fsqlite_harness::fault_vfs::{FaultInjectingVfs, FaultSpec};
+    run(async {
+        for (path, advance, was_committed) in [("objects", 1, false), ("markers", 2, true)] {
+            let cx = Cx::new(); let vfs = FaultInjectingVfs::new(MemoryVfs::new());
+            let log = NativeDurabilityLog::create(&cx, open(&vfs, &cx, "objects"), open(&vfs, &cx, "markers"),
+                NativeDurabilityLimits::default()).unwrap();
+            let mut db = NativePageStore::new(log, TestCodec, 512, NativePageLimits::default()).unwrap();
+            let mut txn = db.begin(&cx).unwrap(); initialize_native_schema(&cx, &db, &mut txn).unwrap();
+            let object = table(&cx, &db, &mut txn, "items").await;
+            db.commit(&cx, &mut txn, 100).await.unwrap();
+            let mut txn = db.begin(&cx).unwrap();
+            drop_native_schema_tree(&cx, &db, &mut txn, "items", NativeSchemaKind::Table).await.unwrap();
+            vfs.inject_fault(FaultSpec::power_cut(path).after_nth_sync(vfs.sync_count() + advance).build());
+            assert!(db.commit(&cx, &mut txn, 101).await.is_err()); assert!(db.needs_recovery());
+            assert!(db.rollback(&mut txn).is_err(), "an uncertain schema commit is not rolled back");
+            vfs.power_on(); db.close(&cx).unwrap();
+            let (mut recovered, _) = NativePageStore::recover(&cx, open(&vfs, &cx, "objects"), open(&vfs, &cx, "markers"),
+                TestCodec, 512, NativeDurabilityLimits::default(), NativePageLimits::default()).await.unwrap();
+            let mut txn = recovered.begin(&cx).unwrap();
+            let schema = read_native_schema(&cx, &recovered, &mut txn).await.unwrap();
+            assert_eq!(schema.find("items").is_none(), was_committed);
+            assert_eq!(schema.cookie(), if was_committed { 2 } else { 1 });
+            assert_eq!(recovered.read_page(&cx, &mut txn, object.root()).unwrap().is_none(), was_committed);
+            recovered.rollback(&mut txn).unwrap(); recovered.close(&cx).unwrap();
+        }
     });
 }

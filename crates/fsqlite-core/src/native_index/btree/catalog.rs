@@ -321,6 +321,7 @@ pub async fn read_native_schema<S: VfsFile, M: VfsFile, C: NativeObjectCodec>(
     Ok(NativeSchemaSnapshot { cookie: header.schema_cookie, entries, encoded_bytes })
 }
 
+#[allow(clippy::await_holding_refcell_ref)] // Private outer scope cannot be re-entered.
 async fn edit<S, M, C, F, T>(
     cx: &Cx, store: &NativePageStore<S, M, C>, txn: &mut NativePageTransaction, operation: F,
 ) -> Result<T>
@@ -442,6 +443,88 @@ where
             NativeSchemaKind::Index => FrankenError::NoSuchIndex { name: name.to_owned() },
         })?;
     with_native_btree(cx, store, txn, entry.root, entry.table_btree, operation).await
+}
+
+/// Execute a multi-tree statement in one rollback-on-drop private savepoint.
+/// A SQL executor can update the table and all of its indexes here without
+/// leaving an accepted table edit behind when a later index constraint fails.
+/// Callback errors must be propagated; successful completion accepts the
+/// overlay but does not publish a commit. Previously staged statements survive
+/// failure, and read observations remain conservative across rollback.
+///
+/// # Errors
+/// Returns schema/state/cancellation errors or the original callback error.
+/// Panics and abandoned futures also restore the private statement overlay.
+pub async fn with_native_schema_statement<S, M, C, F, T>(
+    cx: &Cx, store: &NativePageStore<S, M, C>, txn: &mut NativePageTransaction,
+    operation: F,
+) -> Result<T>
+where
+    S: VfsFile, M: VfsFile, C: NativeObjectCodec,
+    F: for<'a> AsyncFnOnce(&'a mut NativePageTransaction) -> Result<T>,
+{
+    edit(cx, store, txn, async move |txn| {
+        read_native_schema(cx, store, txn).await?;
+        let result = operation(txn).await?;
+        read_native_schema(cx, store, txn).await?;
+        Ok(result)
+    }).await
+}
+
+/// Remove a table and its catalog-owned indexes, or just the named index.
+/// Catalog rows, the schema cookie and versioned root deletions are atomic
+/// with respect to the transaction. All roots are checked before any edit.
+/// Old snapshots still resolve the previous schema and root/page versions;
+/// new snapshots cannot discover the removed object. A name may subsequently
+/// be registered again with a different, freshly allocated root.
+///
+/// This is logical schema retirement, not file deletion or space reclamation.
+/// Descendant and historical pages remain retained for old snapshots and future
+/// compaction. The SQL executor must perform trigger/foreign-key effects in a
+/// surrounding statement scope; this function does not execute DROP SQL.
+///
+/// # Errors
+/// Returns missing/wrong-kind objects, invalid roots, exhaustion, cancellation
+/// and cursor errors. Partial catalog or root edits are restored on failure.
+pub async fn drop_native_schema_tree<S: VfsFile, M: VfsFile, C: NativeObjectCodec>(
+    cx: &Cx, store: &NativePageStore<S, M, C>, txn: &mut NativePageTransaction,
+    name: &str, kind: NativeSchemaKind,
+) -> Result<Vec<NativeSchemaEntry>> {
+    edit(cx, store, txn, async |txn| {
+        let catalog = read_native_schema(cx, store, txn).await?;
+        let target = catalog.find(name).filter(|entry| entry.kind == kind)
+            .ok_or_else(|| match kind {
+                NativeSchemaKind::Table => FrankenError::NoSuchTable { name: name.to_owned() },
+                NativeSchemaKind::Index => FrankenError::NoSuchIndex { name: name.to_owned() },
+            })?;
+        let mut removed = Vec::new();
+        removed.try_reserve_exact(catalog.entries.len()).map_err(|_| FrankenError::OutOfMemory)?;
+        for entry in &catalog.entries {
+            if entry.rowid == target.rowid || (target.kind == NativeSchemaKind::Table
+                && entry.kind == NativeSchemaKind::Index
+                && entry.table_name.eq_ignore_ascii_case(&target.name))
+            {
+                with_native_btree(cx, store, txn, entry.root, entry.table_btree,
+                    async |_| Ok(())).await?;
+                removed.push(entry.clone());
+            }
+        }
+        for entry in &removed {
+            store.write_page(cx, txn, entry.root, None)?;
+        }
+        with_native_btree(cx, store, txn, schema_page(), true, async |cursor| {
+            for entry in &removed {
+                if !cursor.table_move_to(cx, entry.rowid).await?.is_found() {
+                    return Err(malformed("native schema row disappeared during removal"));
+                }
+                cursor.delete(cx).await?;
+            }
+            Ok(())
+        }).await?;
+        bump_cookie(cx, store, txn)?;
+        read_native_schema(cx, store, txn).await?;
+        Ok(removed)
+    }).await
 }
 
 #[cfg(test)]
