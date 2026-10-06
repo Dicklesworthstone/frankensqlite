@@ -1,0 +1,250 @@
+{
+  "engine": "CPython sqlite3 reference only",
+  "sqlite_version": "3.46.1",
+  "fixture_bytes_after_checkpoint": 16842752,
+  "shape_cases": [
+    {
+      "sql": "WITH c AS MATERIALIZED (SELECT id,v FROM a WHERE v<3) SELECT c.id,c.v+b.v FROM c JOIN b USING(id) ORDER BY c.id",
+      "rows": [
+        [
+          "k000",
+          0
+        ],
+        [
+          "k001",
+          3
+        ],
+        [
+          "k002",
+          6
+        ]
+      ]
+    },
+    {
+      "sql": "WITH c AS NOT MATERIALIZED (SELECT id,v FROM a WHERE v<3) SELECT c.id,c.v+b.v FROM c JOIN b USING(id) ORDER BY c.id",
+      "rows": [
+        [
+          "k000",
+          0
+        ],
+        [
+          "k001",
+          3
+        ],
+        [
+          "k002",
+          6
+        ]
+      ]
+    },
+    {
+      "sql": "WITH second AS (SELECT id,v+1 AS v FROM first), first AS (SELECT id,v FROM a WHERE v<3) SELECT second.id,second.v+b.v FROM second JOIN b USING(id) ORDER BY second.id",
+      "rows": [
+        [
+          "k000",
+          1
+        ],
+        [
+          "k001",
+          4
+        ],
+        [
+          "k002",
+          7
+        ]
+      ]
+    },
+    {
+      "sql": "WITH c AS (WITH d AS (SELECT id,v FROM a WHERE v<3) SELECT * FROM d) SELECT c.id,c.v+b.v FROM c JOIN b USING(id) ORDER BY c.id",
+      "rows": [
+        [
+          "k000",
+          0
+        ],
+        [
+          "k001",
+          3
+        ],
+        [
+          "k002",
+          6
+        ]
+      ]
+    },
+    {
+      "sql": "WITH c AS (SELECT id,v FROM a WHERE v<0) SELECT b.id,c.v FROM b LEFT JOIN c USING(id) WHERE b.v<6 ORDER BY b.id",
+      "rows": [
+        [
+          "k000",
+          null
+        ],
+        [
+          "k001",
+          null
+        ],
+        [
+          "k002",
+          null
+        ]
+      ]
+    },
+    {
+      "sql": "WITH c(x) AS (SELECT v FROM a WHERE v<3 UNION SELECT v FROM a WHERE v<3) SELECT x FROM c ORDER BY x",
+      "rows": [
+        [
+          0
+        ],
+        [
+          1
+        ],
+        [
+          2
+        ]
+      ]
+    },
+    {
+      "sql": "WITH c(x) AS (SELECT v FROM a WHERE v<3 UNION ALL SELECT v FROM a WHERE v<3) SELECT x FROM c ORDER BY x",
+      "rows": [
+        [
+          0
+        ],
+        [
+          0
+        ],
+        [
+          1
+        ],
+        [
+          1
+        ],
+        [
+          2
+        ],
+        [
+          2
+        ]
+      ]
+    },
+    {
+      "sql": "WITH c AS (SELECT id,v FROM a WHERE v<3) SELECT (SELECT sum(v) FROM c), count(*) FROM b WHERE id IN (SELECT id FROM c)",
+      "rows": [
+        [
+          3,
+          3
+        ]
+      ]
+    },
+    {
+      "sql": "WITH c AS (SELECT id,v FROM a WHERE v<3) SELECT id,sum(v) OVER (ORDER BY id) FROM c ORDER BY id",
+      "rows": [
+        [
+          "k000",
+          0
+        ],
+        [
+          "k001",
+          1
+        ],
+        [
+          "k002",
+          3
+        ]
+      ]
+    },
+    {
+      "sql": "WITH c AS (SELECT id,v FROM a WHERE v<6) SELECT v%2,sum(v) FROM c GROUP BY v%2 ORDER BY 1",
+      "rows": [
+        [
+          0,
+          6
+        ],
+        [
+          1,
+          9
+        ]
+      ]
+    },
+    {
+      "sql": "WITH c AS (SELECT a.id,a.v FROM a JOIN sqlite_master m ON m.name='a' WHERE m.type='table' AND a.v<3) SELECT c.id,c.v+b.v FROM c JOIN b USING(id) ORDER BY c.id",
+      "rows": [
+        [
+          "k000",
+          0
+        ],
+        [
+          "k001",
+          3
+        ],
+        [
+          "k002",
+          6
+        ]
+      ]
+    },
+    {
+      "sql": "WITH RECURSIVE r(id) AS (SELECT id FROM nodes WHERE id=1 UNION ALL SELECT n.id FROM nodes n JOIN r ON n.parent=r.id) SELECT r.id,n.label FROM r JOIN nodes n ON n.id=r.id ORDER BY r.id",
+      "rows": [
+        [
+          1,
+          "root"
+        ],
+        [
+          2,
+          "branch"
+        ],
+        [
+          3,
+          "left"
+        ],
+        [
+          4,
+          "right"
+        ]
+      ]
+    },
+    {
+      "sql": "WITH RECURSIVE r(x) AS (SELECT 1 UNION SELECT CASE x WHEN 3 THEN 1 ELSE x+1 END FROM r JOIN nodes n ON n.id=r.x WHERE n.id<=3) SELECT x FROM r ORDER BY x",
+      "rows": [
+        [
+          1
+        ],
+        [
+          2
+        ],
+        [
+          3
+        ]
+      ]
+    },
+    {
+      "sql": "WITH RECURSIVE r(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM r) SELECT x FROM r LIMIT 5 OFFSET 2",
+      "rows": [
+        [
+          3
+        ],
+        [
+          4
+        ],
+        [
+          5
+        ],
+        [
+          6
+        ],
+        [
+          7
+        ]
+      ]
+    }
+  ],
+  "local_savepoint_and_rollback": "pass",
+  "wal_reader_snapshot": "pass",
+  "attached_dml_upsert_returning_savepoints_and_reopen": "pass",
+  "overflow_cleanup_and_temp_shadow": "pass",
+  "ipk_cte_shadow_expected_rows": "pass",
+  "integrity_check_main_and_aux": "pass",
+  "rust_compilation": "NOT RUN",
+  "frankensqlite_tests": "NOT RUN",
+  "native_before_after_time_and_rss": "NOT MEASURED",
+  "candidate_integrated": false
+}
