@@ -33,6 +33,7 @@
 
 mod conformal_retry;
 mod pragma_maintenance;
+mod qualified_column_binding;
 
 use conformal_retry::{ConformalRetryBudget, ConformalRetryBudgetCell};
 
@@ -27750,8 +27751,12 @@ impl Connection {
                 let _parse_guard = parse_span.as_ref().map(tracing::Span::enter);
                 self.cached_parse_single(sql)?
             };
+            // bd-at0bx: bind `schema.table.column` references before
+            // validation and compilation, as the direct execute path does.
+            let bound = self.bind_schema_qualified_columns(parsed.as_ref())?;
+            let parsed: &Statement = bound.as_ref().unwrap_or_else(|| parsed.as_ref());
             let snapshot_generation = self.function_registry_generation();
-            let statement_snapshot = self.freeze_statement_values_snapshot(parsed.as_ref());
+            let statement_snapshot = self.freeze_statement_values_snapshot(parsed);
 
             // Structural validation must observe the ORIGINAL parsed AST, exactly
             // like the direct execute path (`validate_statement_select_structure`
@@ -27830,7 +27835,7 @@ impl Connection {
                 });
             let _plan_guard = plan_span.as_ref().map(tracing::Span::enter);
             let prepared_result = self
-                .compile_and_wrap(&canonical_sql, sql, &statement, parsed.as_ref())
+                .compile_and_wrap(&canonical_sql, sql, &statement, parsed)
                 .await;
 
             // User module metadata callbacks are deliberately reentrant and
@@ -38829,6 +38834,11 @@ impl Connection {
             };
             self.refresh_select_schema_before_relation_validation(statement)
                 .await?;
+            // bd-at0bx: bind `schema.table.column` references to the FROM item
+            // of that database (SQLite's `lookupName` with a `zDb`) before any
+            // validator or executor sees them; they match by table name only.
+            let bound_statement = self.bind_schema_qualified_columns(statement)?;
+            let statement: &Statement = bound_statement.as_ref().unwrap_or(statement);
             for attempt in 0..FUNCTION_REGISTRY_STABILITY_ATTEMPTS {
                 let snapshot_generation = self.function_registry_generation();
                 let statement_snapshot = self.freeze_statement_values_snapshot(statement);
@@ -42757,9 +42767,13 @@ impl Connection {
     ) -> Vec<ColumnInfo> {
         let mut col_names = self.select_result_column_names(select_stmt, &[], &mut Vec::new());
         // The spans must index into `ddl_source`, so name from that text's own
-        // parse, and only when it is this same statement.
+        // parse, and only when it is this same statement. bd-at0bx: the
+        // statement executing is that parse after schema-qualified column
+        // binding, which keeps every span.
         if let Some(sql) = ddl_source
-            && let Ok(Statement::CreateTable(parsed)) = parse_single_statement(sql)
+            && let Ok(parsed) = parse_single_statement(sql)
+            && let Ok(bound) = self.bind_schema_qualified_columns(&parsed)
+            && let Statement::CreateTable(parsed) = bound.as_ref().unwrap_or(&parsed)
             && let CreateTableBody::AsSelect(parsed_select) = &parsed.body
             && **parsed_select == *select_stmt
         {

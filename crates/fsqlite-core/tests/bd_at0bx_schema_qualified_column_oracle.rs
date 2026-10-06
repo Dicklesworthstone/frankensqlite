@@ -9,9 +9,21 @@
 //! is not in is "no such column: schema.table.column". Covered: the three
 //! reported shapes, aliases, attached databases, correlated subqueries,
 //! UPDATE/DELETE with a schema-qualified target, and a `main.`/`temp.`
-//! qualifier on a table that exists only in the other schema. Compared with
-//! stock SQLite (rusqlite, bundled): result rows, and the error message of
-//! every failing statement.
+//! qualifier on a table that exists only in the other schema, plus views,
+//! CTEs, FROM subqueries, `table.*`, a compound's ORDER BY, RETURNING, and
+//! the column names of CREATE TABLE AS. Compared with stock SQLite (rusqlite,
+//! bundled): result rows, and the error message of every failing statement
+//! (SQLite's `sqlite3_errmsg` text, which carries no byte offset). Every query
+//! runs through both `Connection::query` and `Connection::prepare(..).query()`,
+//! which bind on different paths.
+//!
+//! Not covered, because they fail on origin/main without any three-part
+//! reference (separate defects): a parenthesized join as the first FROM source
+//! ("not implemented: non-table FROM source"); `users.*` over a
+//! `temp.`-qualified item ("no such table: users"); a subquery reading
+//! `temp.users` inside `UPDATE main.users` (it reads `main.users`); and a
+//! correlated subquery reading `main.users` and comparing with the target
+//! inside `UPDATE temp.users` / `DELETE FROM temp.users` (wrong rows change).
 
 use fsqlite_core::connection::Connection;
 use fsqlite_types::value::SqliteValue;
@@ -36,8 +48,10 @@ fn tag_r(v: &rusqlite::types::Value) -> String {
     }
 }
 
-async fn frank(f: &Connection, sql: &str) -> Vec<Vec<String>> {
-    match f.query(sql).await {
+fn frank_rows(
+    result: fsqlite_error::Result<Vec<fsqlite_core::connection::Row>>,
+) -> Vec<Vec<String>> {
+    match result {
         Ok(rows) => rows
             .iter()
             .map(|r| r.values().iter().map(tag_f).collect())
@@ -46,11 +60,23 @@ async fn frank(f: &Connection, sql: &str) -> Vec<Vec<String>> {
     }
 }
 
+async fn frank(f: &Connection, sql: &str) -> Vec<Vec<String>> {
+    frank_rows(f.query(sql).await)
+}
+
+async fn frank_prepared(f: &Connection, sql: &str) -> Vec<Vec<String>> {
+    match f.prepare(sql).await {
+        Ok(statement) => frank_rows(statement.query().await),
+        Err(e) => frank_rows(Err(e)),
+    }
+}
+
 fn stock(r: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
     let mut st = match r.prepare(sql) {
         Ok(st) => st,
         Err(
-            rusqlite::Error::SqliteFailure(_, Some(m)) | rusqlite::Error::SqlInputError { msg: m, .. },
+            rusqlite::Error::SqliteFailure(_, Some(m))
+            | rusqlite::Error::SqlInputError { msg: m, .. },
         ) => return vec![vec![format!("<ERR {m}>")]],
         Err(e) => return vec![vec![format!("<ERR {e}>")]],
     };
@@ -70,7 +96,8 @@ fn stock(r: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
 }
 
 /// `main.users` holds 'm', `temp.users` holds 't', `aux.users` holds 'a';
-/// `t` exists only in MAIN and `tonly` only in TEMP.
+/// `t` exists only in MAIN and `tonly` only in TEMP; `v` is a MAIN view and
+/// `tv` a TEMP view.
 const SETUP: &[&str] = &[
     "CREATE TABLE main.users(name)",
     "INSERT INTO main.users VALUES ('m')",
@@ -80,6 +107,8 @@ const SETUP: &[&str] = &[
     "INSERT INTO t VALUES (1), (2)",
     "CREATE TEMP TABLE tonly(x)",
     "INSERT INTO tonly VALUES (7)",
+    "CREATE VIEW v AS SELECT x FROM t",
+    "CREATE TEMP VIEW tv AS SELECT x AS y FROM tonly",
     "ATTACH ':memory:' AS aux",
     "CREATE TABLE aux.users(name)",
     "INSERT INTO aux.users VALUES ('a')",
@@ -120,6 +149,25 @@ const MAIN_TEMP: &[&str] = &[
     "SELECT temp.tonly.x FROM tonly",
     "SELECT x FROM temp.t",
     "SELECT x FROM main.tonly",
+    "SELECT main.t.rowid, main.t.x FROM t ORDER BY 1",
+    "SELECT main.t.x AS q FROM t GROUP BY main.t.x HAVING main.t.x > 1",
+    "SELECT users.*, main.users.name FROM main.users JOIN temp.users",
+    // A compound's ORDER BY term is matched against result columns: it must
+    // follow the rewrite of the result column naming the same item.
+    "SELECT main.users.name FROM main.users JOIN temp.users UNION ALL SELECT 'z' ORDER BY main.users.name",
+    "SELECT main.users.name FROM main.users JOIN temp.users UNION SELECT temp.users.name FROM temp.users ORDER BY temp.users.name",
+    "SELECT main.users.name, temp.users.name FROM main.users JOIN temp.users UNION SELECT 'a', 'b' ORDER BY temp.users.name DESC",
+];
+
+/// Views, CTEs and FROM subqueries: a view belongs to its database; a CTE or
+/// subquery belongs to none, so no database qualifier reaches it.
+const VIEWS_AND_SUBQUERIES: &[&str] = &[
+    "SELECT main.v.x FROM v ORDER BY 1",
+    "SELECT temp.v.x FROM v",
+    "SELECT temp.tv.y FROM tv",
+    "SELECT main.tv.y FROM tv",
+    "WITH c AS (SELECT 1 AS z) SELECT main.c.z FROM c",
+    "SELECT main.s.x FROM (SELECT x FROM t) AS s",
 ];
 
 /// Aliases: the qualifier must name the alias, and the alias's FROM item must
@@ -133,6 +181,10 @@ const ALIASES: &[&str] = &[
     "SELECT temp.x.name FROM main.users AS x JOIN temp.users AS y",
     "SELECT main.t.x FROM t AS q",
     "SELECT main.q.x FROM t AS q ORDER BY main.q.x DESC",
+    "SELECT temp.users.name FROM main.users AS users JOIN temp.users AS u2",
+    "SELECT main.users.name FROM main.users, temp.users AS users",
+    "SELECT users.name FROM main.users, temp.users AS users",
+    "SELECT count(*) FROM main.users AS a JOIN temp.users AS b ON main.a.name <> temp.b.name",
 ];
 
 /// Correlated subqueries: a qualified reference that the inner FROM cannot
@@ -145,6 +197,8 @@ const CORRELATED: &[&str] = &[
     "SELECT main.users.name FROM main.users WHERE EXISTS (SELECT 1 FROM temp.users WHERE temp.users.name = 't' AND main.users.name = 'm')",
     "SELECT main.users.name FROM main.users WHERE main.users.name IN (SELECT main.users.name FROM temp.users)",
     "SELECT (SELECT count(*) FROM temp.users WHERE temp.users.name = main.users.name) FROM main.users",
+    "SELECT main.users.name FROM main.users WHERE main.users.name IN (SELECT temp.users.name FROM temp.users UNION SELECT main.users.name)",
+    "SELECT name FROM temp.users WHERE EXISTS (SELECT 1 FROM main.users WHERE main.users.name = temp.users.name)",
 ];
 
 /// An attached database with a table of the same name.
@@ -181,15 +235,40 @@ const DML: &[&str] = &[
     "UPDATE aux.users SET name = main.users.name",
     "DELETE FROM aux.users WHERE main.users.name = 'x'",
     "DELETE FROM temp.users WHERE temp.users.name = 'nope'",
+    "INSERT INTO temp.users SELECT main.users.name || '+' FROM main.users",
+    // The target is what a reference inside a same-named subquery binds to.
+    "UPDATE temp.users SET name = temp.users.name || '!' WHERE EXISTS (SELECT 1 FROM main.users WHERE temp.users.name = 't23' AND main.users.name <> 'x')",
+    // RETURNING never matches a database-qualified reference.
+    "UPDATE main.users SET name = name RETURNING main.users.name",
+    "DELETE FROM temp.users WHERE name = 'nope' RETURNING temp.users.name",
+    "INSERT INTO main.t VALUES (99) RETURNING main.t.x",
+    // CREATE TABLE AS names an expression column by its source text.
+    "CREATE TEMP TABLE ctas AS SELECT main.users.name || temp.users.name, temp.users.name FROM main.users JOIN temp.users",
 ];
 
 const STATE: &[&str] = &[
-    "SELECT name FROM main.users",
-    "SELECT name FROM temp.users",
-    "SELECT name FROM aux.users",
+    "SELECT name FROM main.users ORDER BY name",
+    "SELECT name FROM temp.users ORDER BY name",
+    "SELECT name FROM aux.users ORDER BY name",
     "SELECT x FROM main.t ORDER BY x",
-    "SELECT x FROM temp.tonly",
+    "SELECT x FROM temp.tonly ORDER BY x",
+    "SELECT cid, name FROM pragma_table_info('ctas') ORDER BY cid",
 ];
+
+/// Stock's outcome for one statement: "ok", or SQLite's error message.
+fn stock_execute(r: &rusqlite::Connection, sql: &str) -> String {
+    let outcome = r
+        .prepare(sql)
+        .and_then(|mut statement| statement.execute([]));
+    match outcome {
+        Ok(_) => "ok".to_owned(),
+        Err(
+            rusqlite::Error::SqliteFailure(_, Some(m))
+            | rusqlite::Error::SqlInputError { msg: m, .. },
+        ) => format!("error: {m}"),
+        Err(e) => format!("error: {e}"),
+    }
+}
 
 async fn run_statement(
     f: &Connection,
@@ -201,11 +280,7 @@ async fn run_statement(
         Ok(_) => "ok".to_owned(),
         Err(e) => format!("error: {e}"),
     };
-    let so = match r.execute_batch(sql) {
-        Ok(()) => "ok".to_owned(),
-        Err(rusqlite::Error::SqliteFailure(_, Some(m))) => format!("error: {m}"),
-        Err(e) => format!("error: {e}"),
-    };
+    let so = stock_execute(r, sql);
     if fo != so {
         failures.push(format!("`{sql}`: frank {fo:?} vs stock {so:?}"));
     }
@@ -218,9 +293,16 @@ async fn compare_queries(
     failures: &mut Vec<String>,
 ) {
     for sql in queries {
-        let (fv, sv) = (frank(f, sql).await, stock(r, sql));
+        let sv = stock(r, sql);
+        let fv = frank(f, sql).await;
         if fv != sv {
-            failures.push(format!("`{sql}`:\n  frank {fv:?}\n  stock {sv:?}"));
+            failures.push(format!("`{sql}` (query):\n  frank {fv:?}\n  stock {sv:?}"));
+        }
+        let fp = frank_prepared(f, sql).await;
+        if fp != sv {
+            failures.push(format!(
+                "`{sql}` (prepare):\n  frank {fp:?}\n  stock {sv:?}"
+            ));
         }
     }
 }
@@ -308,6 +390,11 @@ fn main_temp_qualified_columns_match_stock() {
 #[test]
 fn aliased_qualified_columns_match_stock() {
     check_queries("aliases", ALIASES);
+}
+
+#[test]
+fn view_cte_and_subquery_qualified_columns_match_stock() {
+    check_queries("views/subqueries", VIEWS_AND_SUBQUERIES);
 }
 
 #[test]
