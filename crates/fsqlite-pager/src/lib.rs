@@ -21,6 +21,7 @@ pub mod evalue_eviction;
 #[cfg(any(test, feature = "fault-injection"))]
 pub mod fault_hooks;
 pub mod journal;
+pub mod native;
 pub mod page_buf;
 pub mod page_cache;
 pub mod pager;
