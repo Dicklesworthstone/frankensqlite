@@ -2360,10 +2360,9 @@ fn trusted_unix_group(database_path: &Path) -> Result<Option<u32>> {
         .parse::<u32>()
         .map_err(|_| cannot_open(database_path))?;
     let member = nix::unistd::getegid().as_raw() == gid
-        || nix::unistd::getgroups()
+        || supplementary_group_ids()
             .map_err(|_| cannot_open(database_path))?
-            .iter()
-            .any(|group| group.as_raw() == gid);
+            .contains(&gid);
     if !member {
         return Err(cannot_open(database_path));
     }
@@ -2385,6 +2384,43 @@ fn trusted_unix_group(database_path: &Path) -> Result<Option<u32>> {
         return Err(cannot_open(database_path));
     }
     Ok(Some(gid))
+}
+
+/// The process's supplementary group IDs.
+///
+/// nix omits `getgroups` on Apple targets, so they read the process
+/// credential's list through `getgroups(2)` directly. A group missing from
+/// that list only makes trusted sharing fail closed.
+#[cfg(all(unix, not(target_vendor = "apple")))]
+fn supplementary_group_ids() -> std::io::Result<Vec<u32>> {
+    nix::unistd::getgroups()
+        .map(|groups| groups.iter().map(|group| group.as_raw()).collect())
+        .map_err(std::io::Error::from)
+}
+
+#[cfg(all(unix, target_vendor = "apple"))]
+fn supplementary_group_ids() -> std::io::Result<Vec<u32>> {
+    loop {
+        // SAFETY: with a zero count `getgroups` only returns the group count
+        // and writes nothing through the null pointer.
+        let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+        let Ok(capacity) = usize::try_from(count) else {
+            return Err(std::io::Error::last_os_error());
+        };
+        let mut groups: Vec<libc::gid_t> = vec![0; capacity];
+        // SAFETY: `groups` holds `count` writable `gid_t` slots, and
+        // `getgroups` writes at most `count` entries.
+        let written = unsafe { libc::getgroups(count, groups.as_mut_ptr()) };
+        match usize::try_from(written) {
+            Ok(len) => {
+                groups.truncate(len);
+                return Ok(groups);
+            }
+            // The list grew between the two calls: size it again.
+            Err(_) if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL) => {}
+            Err(_) => return Err(std::io::Error::last_os_error()),
+        }
+    }
 }
 
 /// Validate a retained sidecar descriptor under the explicitly selected Unix group.
