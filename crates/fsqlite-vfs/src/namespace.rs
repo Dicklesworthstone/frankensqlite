@@ -212,6 +212,8 @@ impl PendingNamespaceOpen {
     /// entry or refuses once they are exhausted.
     pub fn begin_attempt(stable_path: &Path, intent: NamespaceOpenIntent) -> Result<Option<Self>> {
         validate_stable_path(stable_path)?;
+        #[cfg(unix)]
+        let _ = trusted_unix_group(stable_path)?;
         let (gate, mut use_file) = if matches!(
             intent,
             NamespaceOpenIntent::ReadOnlyExisting | NamespaceOpenIntent::ExistingCompanion
@@ -3141,18 +3143,25 @@ mod tests {
             return;
         }
         let expected = std::env::var("FSQLITE_GROUP_TEST_ACCEPT").unwrap() == "yes";
-        let result = PendingNamespaceOpen::begin(&database, NamespaceOpenIntent::Shared).and_then(
-            |pending| {
-                let file = File::open(&database)?;
-                let identity =
-                    FileIdentity::from_file(&file)?.ok_or_else(|| cannot_open(&database))?;
-                let binding = pending.bind(identity)?;
-                binding.finish_bootstrap()?;
-                Ok(binding)
-            },
-        );
+        let readonly = std::env::var_os("FSQLITE_GROUP_TEST_READONLY").is_some();
+        let intent = if readonly {
+            NamespaceOpenIntent::ReadOnlyExisting
+        } else {
+            NamespaceOpenIntent::Shared
+        };
+        let result = PendingNamespaceOpen::begin(&database, intent).and_then(|pending| {
+            let file = File::open(&database)?;
+            let identity = FileIdentity::from_file(&file)?.ok_or_else(|| cannot_open(&database))?;
+            let binding = pending.bind(identity)?;
+            binding.finish_bootstrap()?;
+            Ok(binding)
+        });
         if !expected {
             assert!(result.is_err(), "unsafe or untrusted admission succeeded");
+            return;
+        }
+        if readonly {
+            drop(result.unwrap());
             return;
         }
         let file = OpenOptions::new()
@@ -3165,6 +3174,42 @@ mod tests {
         file.write_all(b"x").unwrap();
         file.sync_all().unwrap();
         drop(binding);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn trusted_group_readonly_missing_sidecars_checks_policy() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let directory = tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o2770)).unwrap();
+        let database = directory.path().join("tracker.db");
+        fs::write(&database, b"never admitted").unwrap();
+        fs::set_permissions(&database, fs::Permissions::from_mode(0o660)).unwrap();
+        let gid = fs::metadata(&database).unwrap().gid().to_string();
+        for (selected_gid, accept) in [(&gid[..], "yes"), ("invalid", "no")] {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "namespace::tests::trusted_group_child",
+                    "--nocapture",
+                ])
+                .env("FSQLITE_TRUSTED_UNIX_DATABASE", &database)
+                .env("FSQLITE_TRUSTED_UNIX_GID", selected_gid)
+                .env("FSQLITE_GROUP_TEST_DATABASE", &database)
+                .env("FSQLITE_GROUP_TEST_ACCEPT", accept)
+                .env("FSQLITE_GROUP_TEST_READONLY", "yes")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        assert_eq!(fs::read(&database).unwrap(), b"never admitted");
+        assert!(!sidecar_path(&database, GATE_SUFFIX).exists());
+        assert!(!sidecar_path(&database, USE_SUFFIX).exists());
     }
 
     #[cfg(target_os = "linux")]
