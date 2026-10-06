@@ -460,3 +460,130 @@ fn authenticated_file_group_reopens_and_continues_the_same_marker_chain() {
         recovered.close(&cx).unwrap();
     });
 }
+
+#[test]
+fn sealed_pager_groups_keep_modes_savepoints_receipts_and_unselected_reader_slots() {
+    use fsqlite_pager::native::NativePager;
+    use fsqlite_pager::{PagerCommitState, TransactionHandle, TransactionMode};
+
+    run(async {
+        let cx = Cx::new();
+        let vfs = FaultInjectingVfs::new(MemoryVfs::new());
+        let owner = NativePager::new(store(&vfs, &cx, NativePageLimits::default())).unwrap();
+        let mut old = owner.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        let mut a = owner.begin(&cx, TransactionMode::Concurrent).unwrap();
+        let mut b = owner.clone().begin(&cx, TransactionMode::Deferred).unwrap();
+        let mut reader = owner.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        a.write_page(&cx, page(2), &[2; 512]).await.unwrap();
+        a.savepoint(&cx, "before_partial").unwrap();
+        a.write_page(&cx, page(9), &[9; 512]).await.unwrap();
+        a.rollback_to_savepoint(&cx, "before_partial").unwrap();
+        b.write_page(&cx, page(3), &[3; 512]).await.unwrap();
+        assert!(matches!(reader.write_page(&cx, page(10), &[1; 512]).await, Err(FrankenError::ReadOnly)));
+        owner.clone().commit_batch_at(&cx, &mut [&mut b, &mut reader, &mut a], 100).await.unwrap();
+        assert_eq!(vfs.sync_count(), 2);
+        assert_eq!(b.acknowledgement().unwrap().commit_seq, CommitSeq::new(1));
+        assert_eq!(a.acknowledgement().unwrap().commit_seq, CommitSeq::new(2));
+        assert_eq!(a.acknowledgement().unwrap().commit_time_unix_ns, 101);
+        assert!(reader.acknowledgement().is_none());
+        for txn in [&a, &b, &reader] {
+            assert_eq!(txn.pager_commit_state(), PagerCommitState::Committed);
+            assert!(!txn.has_pending_writes());
+            assert_eq!(txn.published_visible_commit_seq_hint(), Some(CommitSeq::ZERO));
+        }
+        assert!(a.rollback_to_savepoint(&cx, "before_partial").is_err());
+        assert!(old.get_page(&cx, page(2)).await.is_err());
+        assert!(matches!(owner.close(&cx), Err(FrankenError::Busy)), "unselected reader still owns its slot");
+        let mut fresh = owner.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        assert_eq!(fresh.get_page(&cx, page(2)).await.unwrap().as_bytes(), &[2; 512]);
+        assert_eq!(fresh.get_page(&cx, page(3)).await.unwrap().as_bytes(), &[3; 512]);
+        assert!(fresh.get_page(&cx, page(9)).await.is_err());
+        fresh.rollback(&cx).await.unwrap();
+        old.rollback(&cx).await.unwrap();
+        owner.close(&cx).unwrap();
+    });
+}
+
+#[test]
+fn sealed_pager_group_rejection_and_pre_poll_drop_preserve_the_original_handles() {
+    use fsqlite_pager::native::NativePager;
+    use fsqlite_pager::{PagerCommitState, TransactionHandle, TransactionMode};
+
+    run(async {
+        let cx = Cx::new();
+        let vfs = FaultInjectingVfs::new(MemoryVfs::new());
+        let other_vfs = FaultInjectingVfs::new(MemoryVfs::new());
+        let owner = NativePager::new(store(&vfs, &cx, NativePageLimits::default())).unwrap();
+        let other = NativePager::new(store(&other_vfs, &cx, NativePageLimits::default())).unwrap();
+        let mut a = owner.begin(&cx, TransactionMode::Concurrent).unwrap();
+        let mut b = owner.begin(&cx, TransactionMode::Concurrent).unwrap();
+        let mut foreign = other.begin(&cx, TransactionMode::Concurrent).unwrap();
+        a.savepoint(&cx, "before").unwrap();
+        a.write_page(&cx, page(2), &[2; 512]).await.unwrap();
+        b.write_page(&cx, page(2), &[3; 512]).await.unwrap();
+        assert!(owner.commit_batch_at(&cx, &mut [&mut a, &mut foreign], 100).await.is_err());
+        assert!(matches!(owner.commit_batch_at(&cx, &mut [&mut a, &mut b], 100).await,
+            Err(FrankenError::BusySnapshot { .. })));
+        {
+            let mut group = [&mut a];
+            drop(owner.commit_batch_at(&cx, &mut group, 100));
+        }
+        for txn in [&a, &b] {
+            assert_eq!(txn.pager_commit_state(), PagerCommitState::NotCommitted);
+            assert_eq!(txn.pending_commit_pages().unwrap(), vec![page(2)]);
+            assert!(txn.acknowledgement().is_none());
+        }
+        assert_eq!(lengths(&vfs, &cx), (0, 0));
+        assert_eq!(vfs.sync_count(), 0);
+        a.rollback_to_savepoint(&cx, "before").unwrap();
+        assert!(!a.has_pending_writes());
+        a.rollback(&cx).await.unwrap();
+        b.rollback(&cx).await.unwrap();
+        foreign.rollback(&cx).await.unwrap();
+        owner.close(&cx).unwrap();
+        other.close(&cx).unwrap();
+    });
+}
+
+#[test]
+fn sealed_pager_failed_group_keeps_every_write_in_doubt_and_can_be_closed_after_drop() {
+    use fsqlite_pager::native::NativePager;
+    use fsqlite_pager::{PagerCommitState, TransactionHandle, TransactionMode};
+
+    run(async {
+        let cx = Cx::new();
+        let vfs = FaultInjectingVfs::new(MemoryVfs::new());
+        let owner = NativePager::new(store(&vfs, &cx, NativePageLimits::default())).unwrap();
+        let mut a = owner.begin(&cx, TransactionMode::Concurrent).unwrap();
+        let mut b = owner.begin(&cx, TransactionMode::Concurrent).unwrap();
+        a.write_page(&cx, page(2), &[2; 512]).await.unwrap();
+        b.write_page(&cx, page(3), &[3; 512]).await.unwrap();
+        vfs.inject_fault(FaultSpec::power_cut("markers").after_nth_sync(2).build());
+        assert!(owner.commit_batch_at(&cx, &mut [&mut a, &mut b], 100).await.is_err());
+        for txn in [&mut a, &mut b] {
+            assert_eq!(txn.pager_commit_state(), PagerCommitState::InDoubt);
+            assert!(txn.acknowledgement().is_none());
+            assert!(txn.has_pending_writes());
+            assert!(txn.settle_commit(&cx).await.is_err());
+            assert!(txn.rollback(&cx).await.is_err());
+        }
+        vfs.power_on();
+        assert!(owner.needs_recovery().unwrap());
+        assert_eq!(owner.committed_tip().unwrap(), CommitSeq::ZERO);
+        assert!(matches!(owner.close(&cx), Err(FrankenError::Busy)));
+        drop(a);
+        drop(b);
+        owner.close(&cx).unwrap();
+        let (recovered, report) = NativePageStore::recover(&cx,
+            open(&vfs, &cx, "objects"), open(&vfs, &cx, "markers"), TestCodec::default(), 512,
+            NativeDurabilityLimits::default(), NativePageLimits::default()).await.unwrap();
+        assert_eq!(report.markers.len(), 2);
+        let reopened = NativePager::new(recovered).unwrap();
+        assert_eq!(reopened.committed_tip().unwrap(), CommitSeq::new(2));
+        let mut reader = reopened.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        assert_eq!(reader.get_page(&cx, page(2)).await.unwrap().as_bytes(), &[2; 512]);
+        assert_eq!(reader.get_page(&cx, page(3)).await.unwrap().as_bytes(), &[3; 512]);
+        reader.rollback(&cx).await.unwrap();
+        reopened.close(&cx).unwrap();
+    });
+}

@@ -109,6 +109,63 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativePager<S, M, C> {
         })
     }
 
+    /// Publish caller-selected handles from this owner through one shared
+    /// two-barrier native commit. Cloned pagers share the same admission domain;
+    /// foreign or terminal handles reject the entire group before publication.
+    /// Each successful writer retains its own acknowledgement; read-only handles
+    /// finish without a marker. Savepoints and snapshot dependencies remain on
+    /// the original handles until the page store reports successful publication.
+    ///
+    /// This is explicit grouping, not an automatic queue or a cross-transaction
+    /// crash-atomic promise. After an uncertain write every affected handle keeps
+    /// `InDoubt`, its dirty projection and its active-slot obligation. Dropping
+    /// the future does not settle the source write or release the external lease.
+    /// No lock is held for a transaction's lifetime; this uses the same exclusive
+    /// publication boundary as a singleton and returns `Busy` on contention.
+    ///
+    /// # Errors
+    /// Rejects invalid handles, cancellation, contention or page/proof limits.
+    /// Propagates conflicts and storage failures without clearing failed handles.
+    #[allow(clippy::await_holding_lock)] // One existing publication boundary for the whole group.
+    pub async fn commit_batch_at(
+        &self,
+        cx: &Cx,
+        transactions: &mut [&mut NativeTransaction<S, M, C>],
+        now_unix_ns: u64,
+    ) -> Result<()> {
+        checkpoint(cx)?;
+        if transactions.len() > NativePageStore::<S, M, C>::MAX_COMMIT_GROUP {
+            return Err(FrankenError::TooBig);
+        }
+        for transaction in transactions.iter() {
+            if !Arc::ptr_eq(&self.shared, &transaction.shared) {
+                return Err(FrankenError::Abort);
+            }
+            transaction.active()?;
+        }
+        let mut store = self.shared.store.try_write().ok_or(FrankenError::Busy)?;
+        if self.shared.closed.load(Ordering::Acquire) {
+            return Err(FrankenError::BusyRecovery);
+        }
+        let acknowledgements = {
+            let mut pages = Vec::new();
+            pages.try_reserve_exact(transactions.len()).map_err(|_| FrankenError::OutOfMemory)?;
+            for transaction in transactions.iter_mut() {
+                pages.push(transaction.transaction.get_mut());
+            }
+            store.commit_batch(cx, &mut pages, now_unix_ns).await?
+        };
+        debug_assert_eq!(acknowledgements.len(), transactions.len());
+        // No await, allocation or callback remains before every handle is
+        // finalized. Close cannot race active-slot release under this guard.
+        for (transaction, acknowledgement) in transactions.iter_mut().zip(acknowledgements) {
+            transaction.acknowledgement = acknowledgement;
+            transaction.complete();
+        }
+        drop(store);
+        Ok(())
+    }
+
     /// Latest fully published page-store sequence, not a reserved sequence.
     ///
     /// # Errors
@@ -237,17 +294,9 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativeTransaction<S, M, C> {
     ///
     /// # Errors
     /// Propagates conflicts, limits, cancellation and uncertain storage failures.
-    #[allow(clippy::await_holding_lock)] // Only the existing exclusive publication boundary.
     pub async fn commit_at(&mut self, cx: &Cx, now_unix_ns: u64) -> Result<()> {
-        self.active()?;
-        checkpoint(cx)?;
-        let mut store = self.shared.store.try_write().ok_or(FrankenError::Busy)?;
-        if self.shared.closed.load(Ordering::Acquire) { return Err(FrankenError::BusyRecovery); }
-        let acknowledgement = store.commit(cx, self.transaction.get_mut(), now_unix_ns).await?;
-        drop(store);
-        self.acknowledgement = acknowledgement;
-        self.complete();
-        Ok(())
+        let owner = NativePager { shared: Arc::clone(&self.shared) };
+        owner.commit_batch_at(cx, &mut [self], now_unix_ns).await
     }
 }
 
