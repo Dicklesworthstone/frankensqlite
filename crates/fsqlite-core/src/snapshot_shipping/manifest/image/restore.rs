@@ -104,7 +104,7 @@ async fn validate_and_confirm(
     checkpoint(cx)?;
     require_private_namespace(vfs, cx, destination)?;
     host_fs::validate_reserved_file_identity(destination, identity)?;
-    let (file, _) = vfs.open(cx, Some(destination), VfsOpenFlags::READWRITE)?;
+    let (mut file, _) = vfs.open(cx, Some(destination), VfsOpenFlags::READWRITE)?;
     if file.file_identity()? != Some(identity) {
         return Err(FrankenError::BusyRecovery);
     }
