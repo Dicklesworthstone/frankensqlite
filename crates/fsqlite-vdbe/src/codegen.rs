@@ -22962,7 +22962,7 @@ pub fn codegen_insert(
                 P4::Affinity(table.affinity_string()),
                 0,
             );
-            emit_check_constraints(b, table, col_regs, None);
+            emit_check_constraints(b, table, RegisterRow::with_rowid(col_regs, rowid_reg), None);
             emit_not_null_constraints(b, table, col_regs, stmt_level, None);
             let pk_oe = effective_oe(
                 stmt_level,
@@ -23395,14 +23395,18 @@ fn emit_upsert_do_update_apply(
     // The IPK register holds the old rowid unless an assignment rewrote it;
     // a rewritten key passes stock's MustBeInt gate (NULL included) before any
     // constraint check or mutation.
-    if let Some(ipk_idx) = ctx
+    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+    let ipk_reg = ctx
         .rowid_alias_col_idx
         .or_else(|| table.columns.iter().position(|column| column.is_ipk))
-    {
-        #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-        let ipk_reg = existing_regs + ipk_idx as i32;
+        .map(|ipk_idx| existing_regs + ipk_idx as i32);
+    if let Some(ipk_reg) = ipk_reg {
         emit_rowid_must_be_int(b, ipk_reg);
     }
+    // bd-8cs1s: the rewritten row's rowid, as its CHECK constraints see it: the
+    // (now integer) INTEGER PRIMARY KEY when the table has one, else the
+    // conflict row's own rowid, which a DO UPDATE without an IPK keeps.
+    let checked_rowid_reg = ipk_reg.unwrap_or(update_rowid_reg);
     // Validate the rewritten image before removing the old row.
     emit_strict_type_check(b, table, existing_regs);
     // GH #169: coerce to column affinity before CHECK/NOT NULL so the
@@ -23415,7 +23419,12 @@ fn emit_upsert_do_update_apply(
         P4::Affinity(table.affinity_string()),
         0,
     );
-    emit_check_constraints(b, table, existing_regs, None);
+    emit_check_constraints(
+        b,
+        table,
+        RegisterRow::with_rowid(existing_regs, checked_rowid_reg),
+        None,
+    );
     emit_not_null_constraints(b, table, existing_regs, stmt_level, None);
     emit_index_deletes_for_update(b, table, cursor, None);
     b.emit_op(Opcode::Delete, cursor, 0, 0, P4::None, OPFLAG_ISUPDATE);
@@ -23711,7 +23720,12 @@ fn codegen_insert_values(
         } else {
             None
         };
-        emit_check_constraints(b, table, val_regs, check_ignore);
+        emit_check_constraints(
+            b,
+            table,
+            RegisterRow::with_rowid(val_regs, rowid_reg),
+            check_ignore,
+        );
         emit_not_null_constraints(b, table, val_regs, stmt_level, ignore_skip);
 
         // Apply column type affinities before packing the record.
@@ -24260,7 +24274,12 @@ fn codegen_insert_select(
     } else {
         None
     };
-    emit_check_constraints(b, target_table, final_regs, check_ignore);
+    emit_check_constraints(
+        b,
+        target_table,
+        RegisterRow::with_rowid(final_regs, rowid_reg),
+        check_ignore,
+    );
     emit_not_null_constraints(b, target_table, final_regs, stmt_level, ignore_target);
     let pk_oe = effective_oe(
         stmt_level,
@@ -24513,7 +24532,12 @@ fn codegen_insert_select_without_from(
         P4::Affinity(target_table.affinity_string()),
         0,
     );
-    emit_check_constraints(b, target_table, final_regs, check_ignore);
+    emit_check_constraints(
+        b,
+        target_table,
+        RegisterRow::with_rowid(final_regs, rowid_reg),
+        check_ignore,
+    );
     emit_not_null_constraints(b, target_table, final_regs, stmt_level, ignore_target);
 
     // Apply column type affinities before packing the record.
@@ -25118,7 +25142,22 @@ pub fn codegen_update(
         P4::Affinity(table.affinity_string()),
         0,
     );
-    emit_check_constraints(b, table, col_regs, constraint_ignore_label);
+    // bd-8cs1s: CHECK sees the row's new rowid, as stock's regNewRowid: the
+    // assigned hidden rowid, else the INTEGER PRIMARY KEY register (the old
+    // rowid unless assigned, and MustBeInt-checked when it is), else the
+    // matched row's unchanged rowid.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let checked_rowid_reg = hidden_rowid_reg.unwrap_or_else(|| {
+        ctx.rowid_alias_col_idx
+            .or_else(|| table.columns.iter().position(|col| col.is_ipk))
+            .map_or(matched_rowid_reg, |ipk_idx| col_regs + ipk_idx as i32)
+    });
+    emit_check_constraints(
+        b,
+        table,
+        RegisterRow::with_rowid(col_regs, checked_rowid_reg),
+        constraint_ignore_label,
+    );
     emit_not_null_constraints(
         b,
         table,
@@ -26178,7 +26217,19 @@ fn codegen_update_from(
         } else {
             None
         };
-    emit_check_constraints(b, target, col_regs, constraint_ignore_label);
+    // bd-8cs1s: CHECK sees the new rowid, chosen as in the plain UPDATE lane.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let checked_rowid_reg = hidden_rowid_reg.unwrap_or_else(|| {
+        ctx.rowid_alias_col_idx
+            .or_else(|| target.columns.iter().position(|col| col.is_ipk))
+            .map_or(old_rowid_reg, |ipk_idx| col_regs + ipk_idx as i32)
+    });
+    emit_check_constraints(
+        b,
+        target,
+        RegisterRow::with_rowid(col_regs, checked_rowid_reg),
+        constraint_ignore_label,
+    );
     emit_not_null_constraints(
         b,
         target,
@@ -28045,7 +28096,7 @@ fn emit_without_rowid_row_insert(
     } else {
         None
     };
-    emit_check_constraints(b, table, val_regs, candidate_skip);
+    emit_check_constraints(b, table, RegisterRow::columns(val_regs), candidate_skip);
     emit_not_null_constraints(b, table, val_regs, stmt_level, candidate_skip);
 
     // UPSERT: a chain of ON CONFLICT clauses (SQLite 3.35+). Each clause probes
@@ -28675,7 +28726,7 @@ fn emit_without_rowid_upsert_do_update_apply(
         P4::Affinity(table.affinity_string()),
         0,
     );
-    emit_check_constraints(b, table, existing_regs, None);
+    emit_check_constraints(b, table, RegisterRow::columns(existing_regs), None);
     emit_not_null_constraints(b, table, existing_regs, stmt_level, None);
 
     // Remove the OLD secondary-index entries (read from the cursor's old row)
@@ -29577,7 +29628,7 @@ fn codegen_update_without_rowid(
     } else {
         None
     };
-    emit_check_constraints(b, table, col_regs, ignore_skip);
+    emit_check_constraints(b, table, RegisterRow::columns(col_regs), ignore_skip);
     emit_not_null_constraints(b, table, col_regs, stmt.or_conflict, ignore_skip);
 
     // Apply column affinities before the primary-key probe so the comparison
@@ -29906,7 +29957,7 @@ fn codegen_update_from_without_rowid(
         P4::Affinity(table.affinity_string()),
         0,
     );
-    emit_check_constraints(b, table, new_regs, None);
+    emit_check_constraints(b, table, RegisterRow::columns(new_regs), None);
     emit_not_null_constraints(b, table, new_regs, stmt.or_conflict, None);
     b.emit_op(Opcode::AddImm, seq_reg, -1, 0, P4::None, 0);
     b.emit_op(Opcode::Copy, seq_reg, seq_slot, 0, P4::None, 0);
@@ -30497,10 +30548,16 @@ fn emit_table_column_read(
 /// Emit CHECK constraint validation for INSERT/UPDATE.
 ///
 /// For each CHECK constraint on the table, parses the constraint expression,
-/// evaluates it using register-based column resolution, and emits a `Halt`
-/// with SQLITE_CONSTRAINT (19) if any constraint evaluates to false (0).
-/// NULL results are treated as passing (SQLite semantics: CHECK passes
-/// unless the expression is explicitly false).
+/// evaluates it against the new row image `row` (register-based column
+/// resolution), and emits a `Halt` with SQLITE_CONSTRAINT (19) if any
+/// constraint evaluates to false (0). NULL results are treated as passing
+/// (SQLite semantics: CHECK passes unless the expression is explicitly false).
+///
+/// A rowid table's caller passes `RegisterRow::with_rowid` holding the row's
+/// final rowid, already decided as stock decides it before its constraint
+/// checks: `rowid` / `_rowid_` / `oid` read that register (bd-8cs1s: without
+/// it they read NULL, and a NULL CHECK passes, so `CHECK(rowid > 1)` was never
+/// enforced). A WITHOUT ROWID table passes `RegisterRow::columns`.
 ///
 /// When `ignore_label` is `Some`, CHECK failures jump there instead of
 /// halting (used for INSERT OR IGNORE to silently skip violating rows).
@@ -30508,7 +30565,7 @@ fn emit_table_column_read(
 fn emit_check_constraints(
     b: &mut ProgramBuilder,
     table: &TableSchema,
-    val_regs: i32,
+    row: RegisterRow,
     ignore_label: Option<Label>,
 ) {
     const SQLITE_CONSTRAINT: i32 = 19;
@@ -30537,7 +30594,7 @@ fn emit_check_constraints(
             table,
             table_alias: None,
             schema: None,
-            register_base: Some(RegisterRow::columns(val_regs)),
+            register_base: Some(row),
             secondaries: &[],
         };
 
@@ -60733,7 +60790,12 @@ mod tests {
         let check_row = check_builder.alloc_regs(
             i32::try_from(check_table.columns.len()).expect("test column count fits i32"),
         );
-        emit_check_constraints(&mut check_builder, &check_table, check_row, None);
+        emit_check_constraints(
+            &mut check_builder,
+            &check_table,
+            RegisterRow::columns(check_row),
+            None,
+        );
         assert_eq!(
             emitted_function_contexts(check_builder),
             [SchemaEvaluationContext::CheckConstraint]
@@ -60752,7 +60814,7 @@ mod tests {
         let row = builder.alloc_regs(
             i32::try_from(table.columns.len()).expect("test column count fits i32"),
         );
-        emit_check_constraints(&mut builder, &table, row, None);
+        emit_check_constraints(&mut builder, &table, RegisterRow::columns(row), None);
         builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
         let program = builder.finish().expect("malformed CHECK program builds");
         assert!(program.ops().iter().any(|op| {
@@ -60763,6 +60825,143 @@ mod tests {
                     P4::Str(message) if message.contains("malformed expression")
                 )
         }));
+    }
+
+    /// bd-8cs1s: CHECK is evaluated against the new row's register image. A
+    /// hidden rowid alias there must read the image's rowid register (it read
+    /// NULL, and a NULL CHECK passes), a declared column that shadows the alias
+    /// keeps reading its own column register, and an image without a rowid
+    /// (WITHOUT ROWID) still has no rowid to read.
+    #[test]
+    fn test_check_constraint_rowid_alias_reads_row_image_rowid() {
+        fn check_ops(
+            table: &TableSchema,
+            check: &str,
+            with_rowid: bool,
+        ) -> (Vec<VdbeOp>, i32, i32) {
+            let mut table = table.clone();
+            table.check_constraints = vec![CheckConstraint {
+                expr: check.to_owned(),
+                owner_column: None,
+                name: None,
+            }];
+            let mut builder = ProgramBuilder::new();
+            let column_count = i32::try_from(table.columns.len()).expect("small test table");
+            let col_regs = builder.alloc_regs(column_count);
+            let rowid_reg = builder.alloc_reg();
+            let row = if with_rowid {
+                RegisterRow::with_rowid(col_regs, rowid_reg)
+            } else {
+                RegisterRow::columns(col_regs)
+            };
+            emit_check_constraints(&mut builder, &table, row, None);
+            builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            let program = builder.finish().expect("CHECK program should build");
+            (program.ops().to_vec(), col_regs, rowid_reg)
+        }
+        fn copies_from(ops: &[VdbeOp], reg: i32) -> bool {
+            ops.iter()
+                .any(|op| op.opcode == Opcode::Copy && op.p1 == reg)
+        }
+
+        let table = test_schema().remove(0);
+        for check in [
+            "rowid > 1",
+            "_rowid_ > 1",
+            "oid > 1",
+            "OID > 1",
+            "t.rowid > 1",
+        ] {
+            let (ops, _, rowid_reg) = check_ops(&table, check, true);
+            assert!(
+                copies_from(&ops, rowid_reg),
+                "`{check}` must read the row image's rowid register: {ops:?}"
+            );
+            let (ops, _, rowid_reg) = check_ops(&table, check, false);
+            assert!(
+                !copies_from(&ops, rowid_reg),
+                "an image without a rowid register has no rowid to read: {ops:?}"
+            );
+        }
+
+        let mut shadowed = test_schema().remove(0);
+        shadowed
+            .columns
+            .push(ColumnInfo::basic("rowid", 'D', false));
+        let (ops, col_regs, rowid_reg) = check_ops(&shadowed, "rowid > 1", true);
+        assert!(
+            copies_from(&ops, col_regs + 2),
+            "a declared `rowid` column must be read from its column register: {ops:?}"
+        );
+        assert!(
+            !copies_from(&ops, rowid_reg),
+            "a declared `rowid` column shadows the hidden rowid: {ops:?}"
+        );
+        let (ops, _, rowid_reg) = check_ops(&shadowed, "oid > 1", true);
+        assert!(
+            copies_from(&ops, rowid_reg),
+            "a declared `rowid` column does not shadow `oid`: {ops:?}"
+        );
+    }
+
+    /// bd-8cs1s: every rowid-table write path hands CHECK the register that
+    /// holds the row's final rowid, i.e. the key the table `Insert` then uses.
+    #[test]
+    fn test_write_paths_check_constraint_reads_the_written_rowid() {
+        let mut table = test_schema().remove(0);
+        table.check_constraints = vec![CheckConstraint {
+            expr: "rowid > 1".to_owned(),
+            owner_column: None,
+            name: None,
+        }];
+        let schema = vec![table];
+        let check_message = "CHECK constraint failed: rowid > 1";
+        for sql in [
+            "INSERT INTO t VALUES (1, 'x')",
+            "INSERT INTO t(rowid, a, b) VALUES (5, 1, 'x')",
+            "INSERT INTO t(a, b) SELECT a, b FROM t",
+            "INSERT INTO t(a, b) SELECT 1, 'x'",
+            "INSERT INTO t DEFAULT VALUES",
+            "REPLACE INTO t(rowid, a, b) VALUES (5, 1, 'x')",
+            "UPDATE t SET a = a + 1",
+            "UPDATE t SET rowid = rowid + 1",
+            "UPDATE t SET oid = 7 WHERE b = 'x'",
+        ] {
+            let Some((statement, tail)) =
+                parse_first_statement_with_tail(sql).expect("test SQL should parse")
+            else {
+                unreachable!("expected parsed statement");
+            };
+            assert_eq!(tail, sql.len(), "parser left trailing SQL");
+            let mut b = ProgramBuilder::new();
+            let ctx = CodegenContext::default();
+            match statement {
+                Statement::Insert(stmt) => codegen_insert(&mut b, &stmt, &schema, &ctx),
+                Statement::Update(stmt) => codegen_update(&mut b, &stmt, &schema, &ctx),
+                other => panic!("unexpected statement {other:?}"),
+            }
+            .unwrap_or_else(|e| panic!("`{sql}` should compile: {e}"));
+            let program = b.finish().expect("program should finish");
+            let ops = program.ops();
+            let check_halt = ops
+                .iter()
+                .position(|op| {
+                    op.opcode == Opcode::Halt
+                        && matches!(&op.p4, P4::Str(message) if message == check_message)
+                })
+                .unwrap_or_else(|| panic!("`{sql}` must emit the CHECK: {ops:?}"));
+            let written_rowid = ops[check_halt..]
+                .iter()
+                .find(|op| op.opcode == Opcode::Insert)
+                .unwrap_or_else(|| panic!("`{sql}` must insert after the CHECK: {ops:?}"))
+                .p3;
+            assert!(
+                ops[..check_halt]
+                    .iter()
+                    .any(|op| op.opcode == Opcode::Copy && op.p1 == written_rowid),
+                "`{sql}`: CHECK must read the written rowid register r{written_rowid}: {ops:?}"
+            );
+        }
     }
 
     #[test]

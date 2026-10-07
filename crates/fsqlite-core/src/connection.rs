@@ -17143,18 +17143,7 @@ impl Connection {
             .iter()
             .map(|column| (table.name.clone(), column.name.clone(), false))
             .collect::<Vec<_>>();
-        let shadowed_names = table
-            .columns
-            .iter()
-            .map(|column| column.name.to_ascii_lowercase())
-            .collect::<HashSet<_>>();
-        if ["rowid", "_rowid_", "oid"]
-            .iter()
-            .any(|alias| !shadowed_names.contains(*alias))
-        {
-            eval_row.push(SqliteValue::Integer(rowid));
-            col_map.push((table.name.clone(), "rowid".to_owned(), true));
-        }
+        push_hidden_rowid_eval_column(table, rowid, &mut eval_row, &mut col_map);
 
         // Reuse the authoritative expression evaluator's collation and
         // affinity context.  A partial predicate such as
@@ -76845,18 +76834,7 @@ impl Connection {
             .iter()
             .map(|column| (table.name.clone(), column.name.clone(), false))
             .collect::<Vec<_>>();
-        let shadowed_names = table
-            .columns
-            .iter()
-            .map(|column| column.name.to_ascii_lowercase())
-            .collect::<HashSet<_>>();
-        if ["rowid", "_rowid_", "oid"]
-            .iter()
-            .any(|alias| !shadowed_names.contains(*alias))
-        {
-            eval_row.push(SqliteValue::Integer(rowid));
-            col_map.push((table.name.clone(), "rowid".to_owned(), true));
-        }
+        push_hidden_rowid_eval_column(table, rowid, &mut eval_row, &mut col_map);
 
         for (col_idx, column) in table.columns.iter().enumerate() {
             if !fills(column) {
@@ -77141,18 +77119,7 @@ impl Connection {
             .iter()
             .map(|column| (table.name.clone(), column.name.clone(), false))
             .collect::<Vec<_>>();
-        let shadowed_names = table
-            .columns
-            .iter()
-            .map(|column| column.name.to_ascii_lowercase())
-            .collect::<HashSet<_>>();
-        if ["rowid", "_rowid_", "oid"]
-            .iter()
-            .any(|alias| !shadowed_names.contains(*alias))
-        {
-            eval_row.push(SqliteValue::Integer(rowid));
-            col_map.push((table.name.clone(), "rowid".to_owned(), true));
-        }
+        push_hidden_rowid_eval_column(table, rowid, &mut eval_row, &mut col_map);
 
         let predicate_value = eval_join_expr(&predicate, &eval_row, &col_map)?;
         Ok(is_sqlite_truthy(&predicate_value))
@@ -77194,18 +77161,7 @@ impl Connection {
                 .iter()
                 .map(|column| (table.name.clone(), column.name.clone(), false))
                 .collect::<Vec<_>>();
-            let shadowed_names = table
-                .columns
-                .iter()
-                .map(|column| column.name.to_ascii_lowercase())
-                .collect::<HashSet<_>>();
-            if ["rowid", "_rowid_", "oid"]
-                .iter()
-                .any(|alias| !shadowed_names.contains(*alias))
-            {
-                eval_row.push(SqliteValue::Integer(rowid));
-                col_map.push((table.name.clone(), "rowid".to_owned(), true));
-            }
+            push_hidden_rowid_eval_column(table, rowid, &mut eval_row, &mut col_map);
             for expression in key_expressions {
                 let mut expression = expression.clone();
                 if let Some(ipk_column) = rowid_alias_col_idx.and_then(|idx| table.columns.get(idx))
@@ -78156,14 +78112,8 @@ impl Connection {
                 let integrity_eval_collation_context = if quick {
                     None
                 } else {
-                    let shadowed_names = table
-                        .columns
-                        .iter()
-                        .map(|column| column.name.to_ascii_lowercase())
-                        .collect::<HashSet<_>>();
-                    let has_hidden_rowid = ["rowid", "_rowid_", "oid"]
-                        .iter()
-                        .any(|alias| !shadowed_names.contains(*alias));
+                    // One slot per `push_hidden_rowid_eval_column` pseudo column.
+                    let has_hidden_rowid = unshadowed_hidden_rowid_alias(table).is_some();
                     let mut column_collations = table
                         .columns
                         .iter()
@@ -102166,7 +102116,12 @@ impl Connection {
                             &create_sql,
                         )
                     },
-                    crate::compat_persist::check_constraints_from_create_table_statement,
+                    |create| {
+                        crate::compat_persist::check_constraints_from_create_table_statement(
+                            create,
+                            &create_sql,
+                        )
+                    },
                 );
 
                 new_schema.push(TableSchema {
@@ -153354,13 +153309,39 @@ enum InsertTarget {
 
 /// The first hidden rowid alias (`rowid`, `_rowid_`, `oid`) that no declared
 /// column of `table` shadows.
-fn unshadowed_hidden_rowid_alias(table: &TableSchema) -> Option<&'static str> {
+pub(crate) fn unshadowed_hidden_rowid_alias(table: &TableSchema) -> Option<&'static str> {
     ["rowid", "_rowid_", "oid"].into_iter().find(|alias| {
         !table
             .columns
             .iter()
             .any(|column| column.name.eq_ignore_ascii_case(alias))
     })
+}
+
+/// Append `table`'s hidden rowid to a single-table `eval_join_expr` row image
+/// (`eval_row` / `col_map` already hold the declared columns), so a rowid
+/// alias in a CHECK, partial-index predicate, index key or generated-column
+/// expression evaluates to the row's rowid.
+///
+/// The pseudo column is named after the first alias no declared column
+/// shadows. `find_col_in_map` resolves any other unshadowed alias to it
+/// through its hidden flag, while a declared column keeps sole ownership of
+/// its own name: `r(rowid INTEGER, ...)` reads its column for `rowid` and the
+/// hidden rowid for `oid` / `_rowid_`, as stock does. bd-uyxzy: the pseudo
+/// column was always named `rowid`, so beside a declared `rowid` column that
+/// name was ambiguous and integrity_check failed with "column not found:
+/// rowid". When every alias is shadowed nothing is appended: no alias can
+/// name the hidden rowid then.
+fn push_hidden_rowid_eval_column(
+    table: &TableSchema,
+    rowid: i64,
+    eval_row: &mut Vec<SqliteValue>,
+    col_map: &mut Vec<(String, String, bool)>,
+) {
+    if let Some(alias) = unshadowed_hidden_rowid_alias(table) {
+        eval_row.push(SqliteValue::Integer(rowid));
+        col_map.push((table.name.clone(), alias.to_owned(), true));
+    }
 }
 
 /// The statement a row-by-row DML replay re-runs once per frozen row locator.
@@ -226503,6 +226484,73 @@ fts5(title, body, content=docs, content_rowid=id)'
         assert_eq!(values[1], SqliteValue::Integer(7));
         assert_eq!(values[2], SqliteValue::Text("local".into()));
         assert_eq!(values[3], SqliteValue::Null);
+    }
+
+    /// bd-uyxzy: in an integrity re-evaluation a declared column named after a
+    /// rowid alias owns that name, while the aliases it does not shadow still
+    /// read the hidden rowid (stock: for `r(rowid INTEGER, value)`, `WHERE
+    /// rowid > 0` tests the column and `WHERE oid > 0` the rowid). The hidden
+    /// rowid's pseudo column was always named `rowid`, so the declared column
+    /// made `rowid` ambiguous and integrity_check failed with "column not
+    /// found: rowid".
+    #[test]
+    fn test_integrity_row_image_declared_rowid_column_shadows_only_its_alias() {
+        let column = |name: &str| ColumnInfo::basic(name, 'D', false);
+        let table = |columns: Vec<ColumnInfo>| TableSchema {
+            name: "r".to_owned(),
+            root_page: 2,
+            columns,
+            indexes: Vec::new(),
+            strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+        };
+        let matches = |table: &TableSchema, row: &[SqliteValue], predicate: &str| {
+            let parsed = fsqlite_parser::expr::parse_expr(predicate).expect("predicate parses");
+            // The hidden rowid of every row below is 7.
+            Connection::row_matches_partial_index_for_integrity(table, Some(&parsed), 7, row, None)
+                .unwrap_or_else(|e| panic!("`{predicate}` must evaluate: {e}"))
+        };
+
+        let declared_rowid = table(vec![column("rowid"), column("value")]);
+        let row = [SqliteValue::Integer(-1), SqliteValue::Integer(10)];
+        assert!(!matches(&declared_rowid, &row, "rowid > 0"));
+        assert!(matches(&declared_rowid, &row, "rowid = -1"));
+        assert!(matches(&declared_rowid, &row, "oid = 7"));
+        assert!(matches(&declared_rowid, &row, "_rowid_ = 7"));
+        assert!(matches(&declared_rowid, &row, "r.oid = 7 AND r.rowid = -1"));
+
+        let declared_oid = table(vec![column("oid"), column("_rowid_"), column("value")]);
+        let row = [
+            SqliteValue::Integer(-2),
+            SqliteValue::Integer(-3),
+            SqliteValue::Integer(10),
+        ];
+        assert!(matches(
+            &declared_oid,
+            &row,
+            "rowid = 7 AND oid = -2 AND _rowid_ = -3"
+        ));
+
+        let all_declared = table(vec![
+            column("rowid"),
+            column("oid"),
+            column("_rowid_"),
+            column("value"),
+        ]);
+        let row = [
+            SqliteValue::Integer(1),
+            SqliteValue::Integer(2),
+            SqliteValue::Integer(3),
+            SqliteValue::Integer(10),
+        ];
+        assert!(matches(
+            &all_declared,
+            &row,
+            "rowid = 1 AND oid = 2 AND _rowid_ = 3"
+        ));
     }
 
     #[test]
