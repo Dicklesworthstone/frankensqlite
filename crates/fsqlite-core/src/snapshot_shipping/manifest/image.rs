@@ -28,6 +28,9 @@ use crate::replication_sender::{
 };
 use crate::snapshot_shipping::DecodedBlock;
 
+#[cfg(all(feature = "native", any(unix, windows), not(target_arch = "wasm32")))]
+mod restore;
+
 /// Completion of exact image readback and both VFS FULL-sync boundaries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SnapshotImageReceipt {
@@ -156,6 +159,28 @@ async fn read_page<F: VfsFile>(file: &F, cx: &Cx, bytes: &mut [u8], offset: u64)
     Ok(())
 }
 
+/// Validate before reserving a native destination or allocating page scratch.
+fn image_geometry(
+    manifest: &SnapshotManifest,
+    expected_id: [u8; 32],
+    max_file_bytes: u64,
+) -> Result<(u32, u64)> {
+    manifest.validate()?;
+    if manifest.id() != expected_id {
+        return Err(corrupt("snapshot image manifest identity mismatch"));
+    }
+    if !(512..=65_536).contains(&manifest.page_size) || !manifest.page_size.is_power_of_two() {
+        return Err(corrupt("snapshot image requires a SQLite page size"));
+    }
+    let count: u64 = manifest.blocks.iter().map(|block| u64::from(block.page_count)).sum();
+    let page_count = u32::try_from(count).map_err(|_| FrankenError::TooBig)?;
+    let byte_len = count.checked_mul(u64::from(manifest.page_size)).ok_or(FrankenError::TooBig)?;
+    if byte_len > max_file_bytes || page_count == u32::MAX {
+        return Err(FrankenError::TooBig);
+    }
+    Ok((page_count, byte_len))
+}
+
 impl<F: VfsFile> SnapshotImageWriter<F> {
     /// Admit a fresh staging file without mutating it. Obtain expected_id from
     /// trusted control-plane state, not from an untrusted manifest's sender.
@@ -167,19 +192,7 @@ impl<F: VfsFile> SnapshotImageWriter<F> {
         max_file_bytes: u64,
     ) -> Result<Self> {
         checkpoint(cx)?;
-        manifest.validate()?;
-        if manifest.id() != expected_id {
-            return Err(corrupt("snapshot image manifest identity mismatch"));
-        }
-        if !(512..=65_536).contains(&manifest.page_size) || !manifest.page_size.is_power_of_two() {
-            return Err(corrupt("snapshot image requires a SQLite page size"));
-        }
-        let count: u64 = manifest.blocks.iter().map(|block| u64::from(block.page_count)).sum();
-        let page_count = u32::try_from(count).map_err(|_| FrankenError::TooBig)?;
-        let byte_len = count.checked_mul(u64::from(manifest.page_size)).ok_or(FrankenError::TooBig)?;
-        if byte_len > max_file_bytes || page_count == u32::MAX {
-            return Err(FrankenError::TooBig);
-        }
+        let (page_count, byte_len) = image_geometry(&manifest, expected_id, max_file_bytes)?;
         if file.file_size(cx)? != 0 {
             return Err(corrupt("snapshot image destination is not empty"));
         }
