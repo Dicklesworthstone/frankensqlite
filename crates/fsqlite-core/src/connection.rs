@@ -20877,7 +20877,7 @@ impl Connection {
                                 }
                                 Err(error) => {
                                     if preserve_prior_changes_on_constraint_violation
-                                        && error_is_constraint_violation(&error)
+                                        && error_is_conflict_resolvable(&error)
                                     {
                                         self.apply_attached_insert_tracking(
                                             changes,
@@ -20914,7 +20914,7 @@ impl Connection {
                                 }
                                 Err(error) => {
                                     if preserve_prior_changes_on_constraint_violation
-                                        && error_is_constraint_violation(&error)
+                                        && error_is_conflict_resolvable(&error)
                                     {
                                         self.apply_attached_insert_tracking(
                                             changes,
@@ -21004,7 +21004,7 @@ impl Connection {
                             if preserve_prior_changes_on_constraint_violation
                                 && matches!(
                                     result.as_ref(),
-                                    Err(error) if error_is_constraint_violation(error)
+                                    Err(error) if error_is_conflict_resolvable(error)
                                 )
                             {
                                 // Attached connections are reused across statements, so
@@ -21021,7 +21021,7 @@ impl Connection {
                         }
                         Err(error) => {
                             if preserve_prior_changes_on_constraint_violation
-                                && error_is_constraint_violation(&error)
+                                && error_is_conflict_resolvable(&error)
                             {
                                 self.apply_attached_statement_tracking(changes);
                                 // UPDATE must preserve the outer connection's
@@ -23733,7 +23733,7 @@ impl Connection {
                 .saturating_sub(previous_trigger_step_changes),
         );
         if preserve_prior_changes_on_constraint_violation
-            && error_is_constraint_violation(error)
+            && error_is_conflict_resolvable(error)
             && let Some(state) = error_state
                 .as_ref()
                 .copied()
@@ -33458,7 +33458,7 @@ impl Connection {
         let commit_autocommit_on_error = preserve_prior_changes_on_constraint_violation
             && matches!(
                 result.as_ref(),
-                Err(error) if error_is_constraint_violation(error)
+                Err(error) if error_is_conflict_resolvable(error)
             );
         let ok = result.is_ok() || commit_autocommit_on_error;
         let autocommit_resolve_start = hot_path_profile_enabled().then(Instant::now);
@@ -36395,7 +36395,7 @@ impl Connection {
         let commit_autocommit_on_error = preserve_prior_changes_on_constraint_violation
             && matches!(
                 result.as_ref(),
-                Err(error) if error_is_constraint_violation(error)
+                Err(error) if error_is_conflict_resolvable(error)
             );
         let ok = result.is_ok() || commit_autocommit_on_error;
         if matches!(result.as_ref(), Ok(0)) {
@@ -37715,10 +37715,9 @@ impl Connection {
         was_auto: bool,
         error: &FrankenError,
     ) -> Result<()> {
-        if !rollback_on_constraint_violation
-            || was_auto
-            || !error_triggers_conflict_action_rollback(error)
-        {
+        // bd-axr5h: an FK or datatype error never ends the transaction, even
+        // under `OR ROLLBACK`; stock resolves both with ABORT.
+        if !rollback_on_constraint_violation || was_auto || !error_is_conflict_resolvable(error) {
             return Ok(());
         }
         // Without an explicit transaction the statement runs inside an
@@ -37888,7 +37887,7 @@ impl Connection {
                 // as on success unless final-image FK validation upgraded the
                 // failure to SQLite's statement-rollback FK semantics.
                 let preserve_constraint_failure = preserve_constraint_failure_rows
-                    && error_is_constraint_violation(&statement_error)
+                    && error_is_conflict_resolvable(&statement_error)
                     && self.constraint_error_state_can_preserve_rows();
                 if matches!(statement_error, FrankenError::RaiseFail(_))
                     || preserve_constraint_failure
@@ -42592,7 +42591,7 @@ impl Connection {
             .await;
         let unwind = outcome.as_ref().is_err_and(|error| {
             let preserve_rows = matches!(error, FrankenError::RaiseFail(_))
-                || (preserve_constraint_failure_rows && error_is_constraint_violation(error));
+                || (preserve_constraint_failure_rows && error_is_conflict_resolvable(error));
             !preserve_rows
         });
         self.db.borrow_mut().end_statement(unwind);
@@ -42714,7 +42713,7 @@ impl Connection {
         let preserved_constraint_failure_rows = preserve_prior_changes_on_constraint_violation
             && matches!(
                 result.as_ref(),
-                Err(error) if error_is_constraint_violation(error)
+                Err(error) if error_is_conflict_resolvable(error)
             )
             && self.constraint_error_state_can_preserve_rows();
         let commit_autocommit_on_error = was_auto
@@ -43243,7 +43242,7 @@ impl InsertSelectReplayEmitter<'_> {
     fn record_error_state(&mut self, error: &FrankenError) {
         self.error_state_recorded = true;
         let preserve_rows = matches!(error, FrankenError::RaiseFail(_))
-            || (self.preserve_constraint_failure_rows && error_is_constraint_violation(error));
+            || (self.preserve_constraint_failure_rows && error_is_conflict_resolvable(error));
         if preserve_rows {
             self.connection
                 .set_statement_change_count(self.statement_changes);
@@ -53812,7 +53811,7 @@ impl Connection {
                     Err(error) => {
                         let preserve_rows = matches!(error, FrankenError::RaiseFail(_))
                             || (preserve_constraint_failure_rows
-                                && error_is_constraint_violation(&error));
+                                && error_is_conflict_resolvable(&error));
                         if preserve_rows {
                             self.set_statement_change_count(statement_changes);
                             self.record_table_program_error_state(
@@ -70268,7 +70267,7 @@ impl Connection {
             Ok(_) => true,
             Err(error) => {
                 matches!(error, FrankenError::RaiseFail(_))
-                    || (preserve_constraint_failure_rows && error_is_constraint_violation(error))
+                    || (preserve_constraint_failure_rows && error_is_conflict_resolvable(error))
             }
         };
         if !validate_retained_rows {
@@ -95401,7 +95400,7 @@ impl Connection {
                     if preserve_prior_changes_on_constraint_violation
                         && matches!(
                             result.as_ref(),
-                            Err(error) if error_is_constraint_violation(error)
+                            Err(error) if error_is_conflict_resolvable(error)
                         )
                     {
                         conn.record_last_insert_rowid(previous_last_insert_rowid);
@@ -95416,7 +95415,7 @@ impl Connection {
                 }
                 Err(error) => {
                     if preserve_prior_changes_on_constraint_violation
-                        && error_is_constraint_violation(&error)
+                        && error_is_conflict_resolvable(&error)
                     {
                         self.apply_attached_statement_tracking(changes);
                         self.record_table_program_error_state(changes, None);
@@ -95485,7 +95484,7 @@ impl Connection {
                 }
                 Err(error) => {
                     if preserve_prior_changes_on_constraint_violation
-                        && error_is_constraint_violation(&error)
+                        && error_is_conflict_resolvable(&error)
                     {
                         self.apply_attached_insert_tracking(changes, last_insert_rowid);
                         self.record_table_program_error_state(changes, last_insert_rowid);
@@ -137710,7 +137709,7 @@ async fn execute_table_program_with_db(
         // applies to retained-row validation.
         let preserve_rows = matches!(failure.error, FrankenError::RaiseFail(_))
             || (program.preserves_rows_on_constraint()
-                && error_is_constraint_violation(&failure.error));
+                && error_is_conflict_resolvable(&failure.error));
         !preserve_rows
     });
     db.borrow_mut().end_statement(unwind);
@@ -137933,7 +137932,7 @@ async fn execute_table_program_exactly_one_row_with_db(
         // applies to retained-row validation.
         let preserve_rows = matches!(failure.error, FrankenError::RaiseFail(_))
             || (program.preserves_rows_on_constraint()
-                && error_is_constraint_violation(&failure.error));
+                && error_is_conflict_resolvable(&failure.error));
         !preserve_rows
     });
     db.borrow_mut().end_statement(unwind);
@@ -154739,8 +154738,19 @@ fn error_is_constraint_violation(error: &FrankenError) -> bool {
     )
 }
 
-fn error_triggers_conflict_action_rollback(error: &FrankenError) -> bool {
-    error_is_constraint_violation(error)
+/// bd-axr5h / bd-nn29x: whether a conflict algorithm (a statement `OR` clause,
+/// or a constraint's own `ON CONFLICT` clause) governs `error`. Only a
+/// uniqueness, NOT NULL or CHECK failure (or a virtual table's constraint)
+/// carries one. A FOREIGN KEY violation and a STRICT datatype error are
+/// SQLITE_CONSTRAINT errors too, but stock resolves both with ABORT whatever
+/// the clauses say (`sqlite3VdbeCheckFk` and `OP_TypeCheck` leave
+/// `Vdbe.errorAction` at OE_Abort): the statement is undone and an explicit
+/// transaction stays open.
+fn error_is_conflict_resolvable(error: &FrankenError) -> bool {
+    !matches!(
+        error,
+        FrankenError::ForeignKeyViolation | FrankenError::DatatypeViolation { .. }
+    ) && error_is_constraint_violation(error)
 }
 
 fn reverse_vtab_constraint_op(op: BinaryOp) -> Option<ConstraintOp> {
