@@ -235,9 +235,9 @@ use fsqlite_vdbe::codegen::{
 #[cfg(not(test))]
 use fsqlite_vdbe::engine::set_vdbe_metrics_enabled;
 use fsqlite_vdbe::engine::{
-    ExactResultRowOutcome, ExecOutcome, MemDatabase, MemDbVersionToken, MemRowValues,
-    ReplaceVictim, ReusableTableExecutionState, SharedTxnPageIo, VdbeEngine, VdbeMetricsSnapshot,
-    reset_vdbe_metrics, vdbe_metrics_snapshot,
+    ConstraintFailureAction, ExactResultRowOutcome, ExecOutcome, MemDatabase, MemDbVersionToken,
+    MemRowValues, ReplaceVictim, ReusableTableExecutionState, SharedTxnPageIo, VdbeEngine,
+    VdbeMetricsSnapshot, reset_vdbe_metrics, vdbe_metrics_snapshot,
 };
 #[cfg(feature = "diagnostic-pragmas")]
 use fsqlite_vdbe::engine::{
@@ -9573,6 +9573,10 @@ impl PreparedStatement<'_> {
                         None
                     },
                 );
+                self.conn.record_constraint_failure_action(
+                    &exec_error.error,
+                    exec_error.constraint_failure_action,
+                );
                 Err(exec_error.error)
             }
         }
@@ -9768,6 +9772,10 @@ impl PreparedStatement<'_> {
                 self.conn.record_table_program_error_state(
                     exec_error.changes,
                     exec_error.last_insert_rowid,
+                );
+                self.conn.record_constraint_failure_action(
+                    &exec_error.error,
+                    exec_error.constraint_failure_action,
                 );
                 Err(exec_error.error)
             }
@@ -9981,6 +9989,10 @@ impl PreparedStatement<'_> {
                     } else {
                         None
                     },
+                );
+                self.conn.record_constraint_failure_action(
+                    &exec_error.error,
+                    exec_error.constraint_failure_action,
                 );
                 Err(exec_error.error)
             }
@@ -13549,6 +13561,17 @@ pub struct Connection {
     /// Error-time VDBE change tracking captured before higher layers decide
     /// whether a failing statement should preserve partial progress.
     last_table_program_error_state: RefCell<Option<TableProgramErrorState>>,
+    /// bd-nn29x: the conflict algorithm the failing constraint check resolved
+    /// to, recorded where the check failed and keyed to the error it raised,
+    /// so every statement boundary that error unwinds through (a trigger body
+    /// statement, a per-row replay, the outer statement) applies the same
+    /// action, as stock's single `Vdbe.errorAction` does.
+    constraint_failure_action: RefCell<Option<RecordedConstraintFailureAction>>,
+    /// bd-nn29x: the `OR` clause of the INSERT/UPDATE statement currently
+    /// executing (`None` for DELETE and outside DML). A trigger it fires runs
+    /// its own INSERT/UPDATE statements under this clause instead of theirs
+    /// when it is set, as stock's `Parse.eOrconf` does.
+    dml_conflict_clause: Cell<Option<fsqlite_ast::ConflictAction>>,
     /// Tracks nested internal statement savepoints so one top-level write
     /// statement can protect all nested trigger/FK work without per-substatement
     /// savepoint churn.
@@ -14845,6 +14868,32 @@ impl Drop for BoolCellRestoreGuard<'_> {
     }
 }
 
+/// bd-nn29x: holds `Connection::dml_conflict_clause` at one DML statement's
+/// `OR` clause while it executes, and restores the enclosing statement's
+/// clause when it finishes (or unwinds).
+struct DmlConflictClauseGuard<'a> {
+    cell: &'a Cell<Option<fsqlite_ast::ConflictAction>>,
+    previous: Option<fsqlite_ast::ConflictAction>,
+}
+
+impl<'a> DmlConflictClauseGuard<'a> {
+    fn new(
+        cell: &'a Cell<Option<fsqlite_ast::ConflictAction>>,
+        clause: Option<fsqlite_ast::ConflictAction>,
+    ) -> Self {
+        Self {
+            cell,
+            previous: cell.replace(clause),
+        }
+    }
+}
+
+impl Drop for DmlConflictClauseGuard<'_> {
+    fn drop(&mut self) {
+        self.cell.set(self.previous);
+    }
+}
+
 struct U64CellRestoreGuard<'a> {
     cell: &'a Cell<u64>,
     previous: u64,
@@ -15548,6 +15597,8 @@ impl Connection {
             total_changes: Cell::new(0),
             trigger_step_changes: Cell::new(0),
             last_table_program_error_state: RefCell::new(None),
+            constraint_failure_action: RefCell::new(None),
+            dml_conflict_clause: Cell::new(None),
             internal_statement_savepoint_depth: Cell::new(0),
             concurrent_rowid_statement: Cell::new(0),
             last_concurrent_rowid_statement: Cell::new(0),
@@ -16101,6 +16152,8 @@ impl Connection {
             total_changes: Cell::new(0),
             trigger_step_changes: Cell::new(0),
             last_table_program_error_state: RefCell::new(None),
+            constraint_failure_action: RefCell::new(None),
+            dml_conflict_clause: Cell::new(None),
             internal_statement_savepoint_depth: Cell::new(0),
             concurrent_rowid_statement: Cell::new(0),
             last_concurrent_rowid_statement: Cell::new(0),
@@ -21011,6 +21064,9 @@ impl Connection {
                                             &source_rows,
                                         )
                                         .await;
+                                    if let Err(error) = result.as_ref() {
+                                        self.adopt_attached_constraint_failure_action(conn, error);
+                                    }
                                     let changes = conn.last_changes.get();
                                     let last_insert_rowid = (changes > 0
                                         && conn.attached_table_supports_last_insert_rowid(
@@ -21029,9 +21085,10 @@ impl Connection {
                                     Ok(Some(Vec::new()))
                                 }
                                 Err(error) => {
-                                    if preserve_prior_changes_on_constraint_violation
-                                        && error_is_constraint_violation(&error)
-                                    {
+                                    if self.statement_failure_keeps_rows(
+                                        preserve_prior_changes_on_constraint_violation,
+                                        &error,
+                                    ) {
                                         self.apply_attached_insert_tracking(
                                             changes,
                                             last_insert_rowid,
@@ -21051,6 +21108,9 @@ impl Connection {
                                     let result = conn
                                         .execute_statement(&Statement::Insert(rewritten), params)
                                         .await;
+                                    if let Err(error) = result.as_ref() {
+                                        self.adopt_attached_constraint_failure_action(conn, error);
+                                    }
                                     let changes = conn.last_changes.get();
                                     let last_insert_rowid = (changes > 0
                                         && conn.attached_table_supports_last_insert_rowid(
@@ -21066,9 +21126,10 @@ impl Connection {
                                     Ok(Some(rows))
                                 }
                                 Err(error) => {
-                                    if preserve_prior_changes_on_constraint_violation
-                                        && error_is_constraint_violation(&error)
-                                    {
+                                    if self.statement_failure_keeps_rows(
+                                        preserve_prior_changes_on_constraint_violation,
+                                        &error,
+                                    ) {
                                         self.apply_attached_insert_tracking(
                                             changes,
                                             last_insert_rowid,
@@ -21154,15 +21215,16 @@ impl Connection {
                                 .execute_statement(&Statement::Update(rewritten), params)
                                 .await;
                             let changes = conn.last_changes.get();
-                            if preserve_prior_changes_on_constraint_violation
-                                && matches!(
-                                    result.as_ref(),
-                                    Err(error) if error_is_constraint_violation(error)
-                                )
-                            {
-                                // Attached connections are reused across statements, so
-                                // preserve their own last_insert_rowid() state too.
-                                conn.record_last_insert_rowid(previous_last_insert_rowid);
+                            if let Err(error) = result.as_ref() {
+                                self.adopt_attached_constraint_failure_action(conn, error);
+                                if conn.statement_failure_keeps_rows(
+                                    preserve_prior_changes_on_constraint_violation,
+                                    error,
+                                ) {
+                                    // Attached connections are reused across statements, so
+                                    // preserve their own last_insert_rowid() state too.
+                                    conn.record_last_insert_rowid(previous_last_insert_rowid);
+                                }
                             }
                             Ok((result, changes))
                         })
@@ -21173,9 +21235,10 @@ impl Connection {
                             Ok(Some(rows))
                         }
                         Err(error) => {
-                            if preserve_prior_changes_on_constraint_violation
-                                && error_is_constraint_violation(&error)
-                            {
+                            if self.statement_failure_keeps_rows(
+                                preserve_prior_changes_on_constraint_violation,
+                                &error,
+                            ) {
                                 self.apply_attached_statement_tracking(changes);
                                 // UPDATE must preserve the outer connection's
                                 // prior last_insert_rowid().
@@ -23865,6 +23928,86 @@ impl Connection {
             .is_some_and(|state| !state.force_statement_rollback)
     }
 
+    /// bd-nn29x: record the algorithm the failing constraint check behind
+    /// `error` resolved to (`None` when it resolved none, which also forgets
+    /// any earlier record). Errors that no conflict algorithm governs are not
+    /// recorded.
+    fn record_constraint_failure_action(
+        &self,
+        error: &FrankenError,
+        action: Option<ConstraintFailureAction>,
+    ) {
+        if !error_is_conflict_resolvable(error) {
+            return;
+        }
+        *self.constraint_failure_action.borrow_mut() =
+            action.map(|action| RecordedConstraintFailureAction {
+                action,
+                code: error.error_code(),
+                message: error.to_string(),
+            });
+    }
+
+    /// bd-nn29x: a new top-level statement starts with no recorded constraint
+    /// failure. Nested statements (trigger bodies, per-row replays, FK
+    /// validation queries) keep the record, which belongs to the error
+    /// unwinding through them.
+    fn forget_constraint_failure_action_at_top_level(&self) {
+        if self.statement_exec_depth.get() == 0 {
+            self.constraint_failure_action.borrow_mut().take();
+        }
+    }
+
+    /// bd-nn29x: a statement delegated to an attached database's connection
+    /// failed there with `error`; carry the algorithm that connection recorded
+    /// for it over to this one, whose statement boundary resolves it.
+    fn adopt_attached_constraint_failure_action(&self, attached: &Self, error: &FrankenError) {
+        if let Some(action) = attached.recorded_constraint_failure_action(error) {
+            self.record_constraint_failure_action(error, Some(action));
+        }
+    }
+
+    /// bd-nn29x: the algorithm recorded for exactly this `error` by the
+    /// constraint check that raised it, if any.
+    fn recorded_constraint_failure_action(
+        &self,
+        error: &FrankenError,
+    ) -> Option<ConstraintFailureAction> {
+        if !error_is_conflict_resolvable(error) {
+            return None;
+        }
+        self.constraint_failure_action
+            .borrow()
+            .as_ref()
+            .filter(|recorded| recorded.is_for(error))
+            .map(|recorded| recorded.action)
+    }
+
+    /// bd-nn29x: does the statement that failed with `error` keep the rows it
+    /// already wrote? See [`constraint_failure_keeps_rows`]; the statement's
+    /// own `OR FAIL` decides only when the failing check recorded nothing.
+    fn statement_failure_keeps_rows(&self, statement_or_fail: bool, error: &FrankenError) -> bool {
+        constraint_failure_keeps_rows(
+            error,
+            self.recorded_constraint_failure_action(error),
+            statement_or_fail,
+        )
+    }
+
+    /// bd-axr5h / bd-nn29x: does the statement that failed with `error` end the
+    /// transaction? See [`constraint_failure_rolls_back_transaction`].
+    fn statement_failure_rolls_back_transaction(
+        &self,
+        statement_or_rollback: bool,
+        error: &FrankenError,
+    ) -> bool {
+        constraint_failure_rolls_back_transaction(
+            error,
+            self.recorded_constraint_failure_action(error),
+            statement_or_rollback,
+        )
+    }
+
     fn take_table_program_error_state(&self) -> Option<TableProgramErrorState> {
         self.last_table_program_error_state.borrow_mut().take()
     }
@@ -23885,13 +24028,23 @@ impl Connection {
                 .get()
                 .saturating_sub(previous_trigger_step_changes),
         );
-        if preserve_prior_changes_on_constraint_violation
-            && error_is_constraint_violation(error)
-            && let Some(state) = error_state
-                .as_ref()
-                .copied()
-                .filter(|state| !state.force_statement_rollback)
-        {
+        // bd-nn29x: the failure's own resolved algorithm decides whether the
+        // statement keeps its rows; the statement's `OR FAIL` decides only when
+        // the failing check recorded none, and then only when the failing
+        // program left an error state that does not force a rollback.
+        let recorded_action = self.recorded_constraint_failure_action(error);
+        let usable_state = error_state
+            .as_ref()
+            .copied()
+            .filter(|state| !state.force_statement_rollback);
+        let keeps_rows = !matches!(error, FrankenError::RaiseFail(_))
+            && constraint_failure_keeps_rows(
+                error,
+                recorded_action,
+                preserve_prior_changes_on_constraint_violation,
+            )
+            && (recorded_action.is_some() || usable_state.is_some());
+        if keeps_rows && let Some(state) = usable_state {
             self.restore_change_tracking_state(
                 state.changes,
                 previous_total_changes
@@ -23914,7 +24067,7 @@ impl Connection {
             previous_total_changes.saturating_add(rollback_visible_total_changes),
             failed_last_insert_rowid,
         );
-        false
+        keeps_rows
     }
 
     fn record_last_insert_rowid(&self, rowid: i64) {
@@ -29154,6 +29307,7 @@ impl Connection {
             // swapped-in statement (bd-tj811).
             let swapped = stmt.reprepared_statement();
             let stmt = swapped.as_deref().unwrap_or(stmt);
+            self.forget_constraint_failure_action_at_top_level();
             self.execute_prepared_autocommit_with_conflict_retry(stmt, params)
                 .await
         }))
@@ -33608,11 +33762,9 @@ impl Connection {
             }
         };
 
-        let commit_autocommit_on_error = preserve_prior_changes_on_constraint_violation
-            && matches!(
-                result.as_ref(),
-                Err(error) if error_is_constraint_violation(error)
-            );
+        let commit_autocommit_on_error = result.as_ref().is_err_and(|error| {
+            self.statement_failure_keeps_rows(preserve_prior_changes_on_constraint_violation, error)
+        });
         let ok = result.is_ok() || commit_autocommit_on_error;
         let autocommit_resolve_start = hot_path_profile_enabled().then(Instant::now);
         if matches!(result.as_ref(), Ok(0)) {
@@ -36545,11 +36697,9 @@ impl Connection {
                 Err(rollback_error) => Err(rollback_error),
             },
         };
-        let commit_autocommit_on_error = preserve_prior_changes_on_constraint_violation
-            && matches!(
-                result.as_ref(),
-                Err(error) if error_is_constraint_violation(error)
-            );
+        let commit_autocommit_on_error = result.as_ref().is_err_and(|error| {
+            self.statement_failure_keeps_rows(preserve_prior_changes_on_constraint_violation, error)
+        });
         let ok = result.is_ok() || commit_autocommit_on_error;
         if matches!(result.as_ref(), Ok(0)) {
             // Direct rowid UPDATE/DELETE can be a true no-op. In a retained
@@ -37868,9 +38018,12 @@ impl Connection {
         was_auto: bool,
         error: &FrankenError,
     ) -> Result<()> {
-        if !rollback_on_constraint_violation
-            || was_auto
-            || !error_triggers_conflict_action_rollback(error)
+        // bd-axr5h / bd-nn29x: the failure's own algorithm decides. An FK or
+        // datatype error never ends the transaction, even under `OR
+        // ROLLBACK`; a column's `ON CONFLICT ROLLBACK` does without one.
+        if was_auto
+            || !self
+                .statement_failure_rolls_back_transaction(rollback_on_constraint_violation, error)
         {
             return Ok(());
         }
@@ -38040,9 +38193,19 @@ impl Connection {
                 // FAIL keeps already-applied rows. Release the savepoint exactly
                 // as on success unless final-image FK validation upgraded the
                 // failure to SQLite's statement-rollback FK semantics.
-                let preserve_constraint_failure = preserve_constraint_failure_rows
-                    && error_is_constraint_violation(&statement_error)
-                    && self.constraint_error_state_can_preserve_rows();
+                // bd-nn29x: the failing check's own algorithm decides when it
+                // recorded one (a column's `ON CONFLICT FAIL`, or a trigger
+                // statement's FAIL failing this statement); the statement's `OR
+                // FAIL` decides otherwise.
+                let preserve_constraint_failure =
+                    match self.recorded_constraint_failure_action(&statement_error) {
+                        Some(action) => action == ConstraintFailureAction::Fail,
+                        None => {
+                            preserve_constraint_failure_rows
+                                && error_is_conflict_resolvable(&statement_error)
+                                && self.constraint_error_state_can_preserve_rows()
+                        }
+                    };
                 if matches!(statement_error, FrankenError::RaiseFail(_))
                     || preserve_constraint_failure
                 {
@@ -39335,12 +39498,22 @@ impl Connection {
             let _record_profile_scope =
                 enter_record_profile_scope(RecordProfileScope::CoreConnection);
             self.clear_table_program_error_state();
+            self.forget_constraint_failure_action_at_top_level();
             self.sync_change_tracking_context();
             // bd-u4hie: raise the dispatch nesting depth AFTER the `'now'` reset
             // decision above, so any nested subquery / CTE that recurses back
             // into this dispatch observes depth > 0 and keeps the top-level
             // statement's captured `'now'`.
             let _statement_exec_depth_guard = self.enter_statement_exec();
+            // bd-nn29x: the triggers this DML statement fires see its `OR`
+            // clause (see `execute_bound_trigger_statement`).
+            let _dml_conflict_clause_guard =
+                statement_passes_dml_conflict_clause(statement).then(|| {
+                    DmlConflictClauseGuard::new(
+                        &self.dml_conflict_clause,
+                        statement_dml_conflict_clause(statement),
+                    )
+                });
             if !select_structure_validated {
                 self.with_fallback_function_registry(|| {
                     self.validate_statement_select_structure(statement)
@@ -41113,6 +41286,12 @@ impl Connection {
                     && *where_true
                     && has_before_update
                 {
+                    // bd-nn29x: stock runs the DO UPDATE, and so the triggers
+                    // it fires, under ABORT whatever this INSERT's clause is.
+                    let _do_update_clause = DmlConflictClauseGuard::new(
+                        &self.dml_conflict_clause,
+                        Some(fsqlite_ast::ConflictAction::Abort),
+                    );
                     Box::pin(self.fire_before_triggers(
                         table_name,
                         &update_event,
@@ -41248,6 +41427,11 @@ impl Connection {
                     && *where_true
                     && has_after_update
                 {
+                    // bd-nn29x: the DO UPDATE's triggers run under ABORT.
+                    let _do_update_clause = DmlConflictClauseGuard::new(
+                        &self.dml_conflict_clause,
+                        Some(fsqlite_ast::ConflictAction::Abort),
+                    );
                     Box::pin(self.fire_after_triggers(
                         table_name,
                         &update_event,
@@ -42744,9 +42928,7 @@ impl Connection {
             })
             .await;
         let unwind = outcome.as_ref().is_err_and(|error| {
-            let preserve_rows = matches!(error, FrankenError::RaiseFail(_))
-                || (preserve_constraint_failure_rows && error_is_constraint_violation(error));
-            !preserve_rows
+            !self.statement_failure_keeps_rows(preserve_constraint_failure_rows, error)
         });
         self.db.borrow_mut().end_statement(unwind);
         outcome
@@ -42864,12 +43046,18 @@ impl Connection {
             self.execute_insert_select_materialized_rows(insert, source_rows)
                 .await
         };
-        let preserved_constraint_failure_rows = preserve_prior_changes_on_constraint_violation
-            && matches!(
-                result.as_ref(),
-                Err(error) if error_is_constraint_violation(error)
-            )
-            && self.constraint_error_state_can_preserve_rows();
+        // bd-nn29x: the failure's recorded algorithm decides when there is
+        // one; otherwise the statement's `OR FAIL`, as before.
+        let preserved_constraint_failure_rows = result.as_ref().is_err_and(|error| {
+            match self.recorded_constraint_failure_action(error) {
+                Some(action) => action == ConstraintFailureAction::Fail,
+                None => {
+                    preserve_prior_changes_on_constraint_violation
+                        && error_is_conflict_resolvable(error)
+                        && self.constraint_error_state_can_preserve_rows()
+                }
+            }
+        });
         let commit_autocommit_on_error = was_auto
             && (preserved_constraint_failure_rows
                 // RAISE(FAIL) in a BEFORE trigger keeps the rows already inserted
@@ -43395,8 +43583,9 @@ struct InsertSelectReplayEmitter<'conn> {
 impl InsertSelectReplayEmitter<'_> {
     fn record_error_state(&mut self, error: &FrankenError) {
         self.error_state_recorded = true;
-        let preserve_rows = matches!(error, FrankenError::RaiseFail(_))
-            || (self.preserve_constraint_failure_rows && error_is_constraint_violation(error));
+        let preserve_rows = self
+            .connection
+            .statement_failure_keeps_rows(self.preserve_constraint_failure_rows, error);
         if preserve_rows {
             self.connection
                 .set_statement_change_count(self.statement_changes);
@@ -53973,9 +54162,8 @@ impl Connection {
                         returning_rows.extend(rows);
                     }
                     Err(error) => {
-                        let preserve_rows = matches!(error, FrankenError::RaiseFail(_))
-                            || (preserve_constraint_failure_rows
-                                && error_is_constraint_violation(&error));
+                        let preserve_rows = self
+                            .statement_failure_keeps_rows(preserve_constraint_failure_rows, &error);
                         if preserve_rows {
                             self.set_statement_change_count(statement_changes);
                             self.record_table_program_error_state(
@@ -70430,8 +70618,7 @@ impl Connection {
         let validate_retained_rows = match result.as_ref() {
             Ok(_) => true,
             Err(error) => {
-                matches!(error, FrankenError::RaiseFail(_))
-                    || (preserve_constraint_failure_rows && error_is_constraint_violation(error))
+                self.statement_failure_keeps_rows(preserve_constraint_failure_rows, error)
             }
         };
         if !validate_retained_rows {
@@ -71419,6 +71606,14 @@ impl Connection {
     }
 
     /// Execute FK cascade/set-null actions for a DELETE operation.
+    ///
+    /// bd-nn29x: an action that rewrites child rows (SET NULL, SET DEFAULT)
+    /// runs as `UPDATE OR ABORT`. Stock codes every FK action as a trigger
+    /// step under OE_Abort (`sqlite3FkActions` passes OE_Abort to
+    /// `sqlite3CodeRowTriggerDirect`), so a child constraint the action
+    /// violates aborts the statement whatever the child column's own `ON
+    /// CONFLICT` clause or the outer statement's clause says, and the child's
+    /// UPDATE triggers run under ABORT. CASCADE's DELETE has no clause.
     async fn execute_fk_delete_action(&self, action: &FkDeleteAction) -> Result<()> {
         match action {
             FkDeleteAction::Allow => Ok(()),
@@ -71459,7 +71654,7 @@ impl Connection {
                     .map(|(i, col)| format!("{} = ?{}", quote_identifier(col), i + 1))
                     .collect();
                 let sql = format!(
-                    "UPDATE {} SET {} WHERE {}",
+                    "UPDATE OR ABORT {} SET {} WHERE {}",
                     quote_identifier(child_table),
                     set_parts.join(", "),
                     where_parts.join(" AND ")
@@ -71488,7 +71683,7 @@ impl Connection {
                     .map(|(i, col)| format!("{} = ?{}", quote_identifier(col), i + 1))
                     .collect();
                 let sql = format!(
-                    "UPDATE {} SET {} WHERE {}",
+                    "UPDATE OR ABORT {} SET {} WHERE {}",
                     quote_identifier(child_table),
                     set_parts.join(", "),
                     where_parts.join(" AND ")
@@ -71676,6 +71871,10 @@ impl Connection {
     }
 
     /// Execute FK cascade/set-null actions for an UPDATE operation.
+    ///
+    /// bd-nn29x: every action here rewrites child rows, so it runs as `UPDATE
+    /// OR ABORT`, as stock's OE_Abort action trigger does (see
+    /// [`Self::execute_fk_delete_action`]).
     async fn execute_fk_update_action(&self, action: &FkUpdateAction) -> Result<()> {
         match action {
             FkUpdateAction::Allow => Ok(()),
@@ -71702,7 +71901,7 @@ impl Connection {
                     })
                     .collect();
                 let sql = format!(
-                    "UPDATE {} SET {} WHERE {}",
+                    "UPDATE OR ABORT {} SET {} WHERE {}",
                     quote_identifier(child_table),
                     set_parts.join(", "),
                     where_parts.join(" AND ")
@@ -71731,7 +71930,7 @@ impl Connection {
                     .map(|(i, col)| format!("{} = ?{}", quote_identifier(col), i + 1))
                     .collect();
                 let sql = format!(
-                    "UPDATE {} SET {} WHERE {}",
+                    "UPDATE OR ABORT {} SET {} WHERE {}",
                     quote_identifier(child_table),
                     set_parts.join(", "),
                     where_parts.join(" AND ")
@@ -71760,7 +71959,7 @@ impl Connection {
                     .map(|(i, col)| format!("{} = ?{}", quote_identifier(col), i + 1))
                     .collect();
                 let sql = format!(
-                    "UPDATE {} SET {} WHERE {}",
+                    "UPDATE OR ABORT {} SET {} WHERE {}",
                     quote_identifier(child_table),
                     set_parts.join(", "),
                     where_parts.join(" AND ")
@@ -71936,9 +72135,15 @@ impl Connection {
     /// `params` are the values of the OLD/NEW parameters it binds.
     async fn execute_bound_trigger_statement(
         &self,
-        statement: Statement,
+        mut statement: Statement,
         params: &[SqliteValue],
     ) -> Result<TriggerStatementOutcome> {
+        // bd-nn29x: a non-default `OR` clause on the statement that fired this
+        // trigger replaces the conflict clause of every INSERT / UPDATE in the
+        // body (stock `codeTriggerProgram`: `eOrconf = orconf == OE_Default ?
+        // pStep->orconf : orconf`). The firing statement's clause is current
+        // here: each body statement restores it when it finishes.
+        apply_trigger_conflict_override(&mut statement, self.dml_conflict_clause.get());
         if let Some((directive, predicate)) = trigger_statement_raise_directive(&statement) {
             // GH#305: evaluate the RAISE predicate with the connection-aware
             // evaluator (parity with trigger WHEN predicates in
@@ -95690,13 +95895,14 @@ impl Connection {
                         )
                         .await;
                     let changes = conn.last_changes.get();
-                    if preserve_prior_changes_on_constraint_violation
-                        && matches!(
-                            result.as_ref(),
-                            Err(error) if error_is_constraint_violation(error)
-                        )
-                    {
-                        conn.record_last_insert_rowid(previous_last_insert_rowid);
+                    if let Err(error) = result.as_ref() {
+                        self.adopt_attached_constraint_failure_action(conn, error);
+                        if conn.statement_failure_keeps_rows(
+                            preserve_prior_changes_on_constraint_violation,
+                            error,
+                        ) {
+                            conn.record_last_insert_rowid(previous_last_insert_rowid);
+                        }
                     }
                     Ok((result, changes))
                 })
@@ -95707,9 +95913,10 @@ impl Connection {
                     Ok(rows)
                 }
                 Err(error) => {
-                    if preserve_prior_changes_on_constraint_violation
-                        && error_is_constraint_violation(&error)
-                    {
+                    if self.statement_failure_keeps_rows(
+                        preserve_prior_changes_on_constraint_violation,
+                        &error,
+                    ) {
                         self.apply_attached_statement_tracking(changes);
                         self.record_table_program_error_state(changes, None);
                     }
@@ -95763,6 +95970,9 @@ impl Connection {
                             params,
                         )
                         .await;
+                    if let Err(error) = result.as_ref() {
+                        self.adopt_attached_constraint_failure_action(conn, error);
+                    }
                     let changes = conn.last_changes.get();
                     let last_insert_rowid = (changes > 0
                         && conn.attached_table_supports_last_insert_rowid(&stripped.table.name))
@@ -95776,9 +95986,10 @@ impl Connection {
                     Ok(rows)
                 }
                 Err(error) => {
-                    if preserve_prior_changes_on_constraint_violation
-                        && error_is_constraint_violation(&error)
-                    {
+                    if self.statement_failure_keeps_rows(
+                        preserve_prior_changes_on_constraint_violation,
+                        &error,
+                    ) {
                         self.apply_attached_insert_tracking(changes, last_insert_rowid);
                         self.record_table_program_error_state(changes, last_insert_rowid);
                     }
@@ -99983,6 +100194,10 @@ impl Connection {
                     } else {
                         None
                     },
+                );
+                self.record_constraint_failure_action(
+                    &exec_error.error,
+                    exec_error.constraint_failure_action,
                 );
                 Err(exec_error.error)
             }
@@ -137688,11 +137903,31 @@ struct TableProgramErrorState {
     force_statement_rollback: bool,
 }
 
+/// bd-nn29x: a failing constraint check's resolved conflict algorithm, with
+/// the identity (result code and message) of the error it raised. Errors
+/// unwind unchanged through the statement boundaries above the check, so a
+/// boundary applies the recorded algorithm only to that same error; any other
+/// error falls back to its own class and the statement's `OR` clause.
+#[derive(Debug, Clone)]
+struct RecordedConstraintFailureAction {
+    action: ConstraintFailureAction,
+    code: ErrorCode,
+    message: String,
+}
+
+impl RecordedConstraintFailureAction {
+    fn is_for(&self, error: &FrankenError) -> bool {
+        self.code == error.error_code() && self.message == error.to_string()
+    }
+}
+
 #[derive(Debug)]
 struct TableProgramExecError {
     error: FrankenError,
     changes: usize,
     last_insert_rowid: Option<i64>,
+    /// bd-nn29x: the engine's resolved algorithm for a failing constraint.
+    constraint_failure_action: Option<ConstraintFailureAction>,
 }
 
 type TableProgramExecResult =
@@ -137812,6 +138047,7 @@ async fn execute_table_program_with_db(
                     error: e,
                     changes: 0,
                     last_insert_rowid: None,
+                    constraint_failure_action: None,
                 }),
                 txn,
             ),
@@ -137959,6 +138195,7 @@ async fn execute_table_program_with_db(
                             error: e,
                             changes: engine.changes(),
                             last_insert_rowid: engine_rowid,
+                            constraint_failure_action: None,
                         }),
                         None,
                     ),
@@ -137991,26 +138228,27 @@ async fn execute_table_program_with_db(
             error: frankenerror_from_vdbe_halt(code, message),
             changes,
             last_insert_rowid: engine_rowid,
+            constraint_failure_action: engine.constraint_failure_action(),
         }),
         Err(e) => Err(TableProgramExecError {
             error: e,
             changes,
             last_insert_rowid: engine_rowid,
+            constraint_failure_action: engine.constraint_failure_action(),
         }),
     };
     // bd-5bq6u: unwind this statement's MemDatabase writes when it failed, so a
     // partially applied TEMP statement does not survive. Not every failure
-    // discards rows: OR FAIL (and RAISE(FAIL)) stop at the offending row but KEEP
-    // the rows already written. That is the same rule
-    // `with_statement_fk_validation_scope` applies to retained-row validation.
+    // discards rows: a failure that resolves with FAIL (and RAISE(FAIL)) stops
+    // at the offending row but KEEPS the rows already written. That is the same
+    // rule `with_statement_fk_validation_scope` applies to retained-row
+    // validation.
     let unwind = result.as_ref().is_err_and(|failure| {
-        // OR FAIL (and RAISE(FAIL)) stop at the offending row but KEEP the rows
-        // already written, which is the rule with_statement_fk_validation_scope
-        // applies to retained-row validation.
-        let preserve_rows = matches!(failure.error, FrankenError::RaiseFail(_))
-            || (program.preserves_rows_on_constraint()
-                && error_is_constraint_violation(&failure.error));
-        !preserve_rows
+        !constraint_failure_keeps_rows(
+            &failure.error,
+            failure.constraint_failure_action,
+            program.preserves_rows_on_constraint(),
+        )
     });
     db.borrow_mut().end_statement(unwind);
     ((result, txn_back), Some(engine))
@@ -138095,6 +138333,7 @@ async fn execute_table_program_exactly_one_row_with_db(
                     error: e,
                     changes: 0,
                     last_insert_rowid: None,
+                    constraint_failure_action: None,
                 }),
                 txn,
             ),
@@ -138195,6 +138434,7 @@ async fn execute_table_program_exactly_one_row_with_db(
                         error: e,
                         changes: engine.changes(),
                         last_insert_rowid: engine_rowid,
+                        constraint_failure_action: None,
                     }),
                     None,
                 ),
@@ -138214,26 +138454,27 @@ async fn execute_table_program_exactly_one_row_with_db(
             error: frankenerror_from_vdbe_halt(code, message),
             changes,
             last_insert_rowid: engine_rowid,
+            constraint_failure_action: engine.constraint_failure_action(),
         }),
         Err(e) => Err(TableProgramExecError {
             error: e,
             changes,
             last_insert_rowid: engine_rowid,
+            constraint_failure_action: engine.constraint_failure_action(),
         }),
     };
     // bd-5bq6u: unwind this statement's MemDatabase writes when it failed, so a
     // partially applied TEMP statement does not survive. Not every failure
-    // discards rows: OR FAIL (and RAISE(FAIL)) stop at the offending row but KEEP
-    // the rows already written. That is the same rule
-    // `with_statement_fk_validation_scope` applies to retained-row validation.
+    // discards rows: a failure that resolves with FAIL (and RAISE(FAIL)) stops
+    // at the offending row but KEEPS the rows already written. That is the same
+    // rule `with_statement_fk_validation_scope` applies to retained-row
+    // validation.
     let unwind = result.as_ref().is_err_and(|failure| {
-        // OR FAIL (and RAISE(FAIL)) stop at the offending row but KEEP the rows
-        // already written, which is the rule with_statement_fk_validation_scope
-        // applies to retained-row validation.
-        let preserve_rows = matches!(failure.error, FrankenError::RaiseFail(_))
-            || (program.preserves_rows_on_constraint()
-                && error_is_constraint_violation(&failure.error));
-        !preserve_rows
+        !constraint_failure_keeps_rows(
+            &failure.error,
+            failure.constraint_failure_action,
+            program.preserves_rows_on_constraint(),
+        )
     });
     db.borrow_mut().end_statement(unwind);
     ((result, txn_back), Some(engine))
@@ -155151,8 +155392,89 @@ fn error_is_constraint_violation(error: &FrankenError) -> bool {
     )
 }
 
-fn error_triggers_conflict_action_rollback(error: &FrankenError) -> bool {
-    error_is_constraint_violation(error)
+/// bd-nn29x: whether `statement` sets the `OR` clause its triggers see. Any
+/// other statement leaves the enclosing statement's clause in force.
+fn statement_passes_dml_conflict_clause(statement: &Statement) -> bool {
+    matches!(
+        statement,
+        Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
+    )
+}
+
+/// bd-nn29x: the `OR` clause an INSERT/UPDATE/DELETE statement passes to the
+/// triggers it fires (`None` = OE_Default, under which a trigger statement
+/// keeps its own clause). DELETE has no clause.
+fn statement_dml_conflict_clause(statement: &Statement) -> Option<fsqlite_ast::ConflictAction> {
+    match statement {
+        Statement::Insert(insert) => insert.or_conflict,
+        Statement::Update(update) => update.or_conflict,
+        _ => None,
+    }
+}
+
+/// bd-nn29x: give an INSERT / UPDATE trigger body statement the firing
+/// statement's `OR` clause when that clause is not the default.
+fn apply_trigger_conflict_override(
+    statement: &mut Statement,
+    firing_clause: Option<fsqlite_ast::ConflictAction>,
+) {
+    let Some(clause) = firing_clause else {
+        return;
+    };
+    match statement {
+        Statement::Insert(insert) => insert.or_conflict = Some(clause),
+        Statement::Update(update) => update.or_conflict = Some(clause),
+        _ => {}
+    }
+}
+
+/// bd-axr5h / bd-nn29x: whether a conflict algorithm (a statement `OR` clause,
+/// or a constraint's own `ON CONFLICT` clause) governs `error`. Only a
+/// uniqueness, NOT NULL or CHECK failure (or a virtual table's constraint)
+/// carries one. A FOREIGN KEY violation and a STRICT datatype error are
+/// SQLITE_CONSTRAINT errors too, but stock resolves both with ABORT whatever
+/// the clauses say (`sqlite3VdbeCheckFk` and `OP_TypeCheck` leave
+/// `Vdbe.errorAction` at OE_Abort): the statement is undone and an explicit
+/// transaction stays open.
+fn error_is_conflict_resolvable(error: &FrankenError) -> bool {
+    !matches!(
+        error,
+        FrankenError::ForeignKeyViolation | FrankenError::DatatypeViolation { .. }
+    ) && error_is_constraint_violation(error)
+}
+
+/// bd-nn29x: does a statement that failed with `error` keep the rows it
+/// already wrote? It does for `RAISE(FAIL)`, and for a conflict-resolvable
+/// failure whose algorithm is FAIL. `resolved` is the algorithm the failing
+/// check recorded; when it recorded none, the statement's own `OR FAIL`
+/// (`statement_or_fail`) decides. Every other failure resolves with ABORT.
+fn constraint_failure_keeps_rows(
+    error: &FrankenError,
+    resolved: Option<ConstraintFailureAction>,
+    statement_or_fail: bool,
+) -> bool {
+    if matches!(error, FrankenError::RaiseFail(_)) {
+        return true;
+    }
+    error_is_conflict_resolvable(error)
+        && resolved.map_or(statement_or_fail, |action| {
+            action == ConstraintFailureAction::Fail
+        })
+}
+
+/// bd-nn29x: does a statement that failed with `error` end the transaction?
+/// Only a conflict-resolvable failure whose algorithm is ROLLBACK does;
+/// `statement_or_rollback` (the statement's own `OR ROLLBACK`) decides when
+/// the failing check recorded no algorithm.
+fn constraint_failure_rolls_back_transaction(
+    error: &FrankenError,
+    resolved: Option<ConstraintFailureAction>,
+    statement_or_rollback: bool,
+) -> bool {
+    error_is_conflict_resolvable(error)
+        && resolved.map_or(statement_or_rollback, |action| {
+            action == ConstraintFailureAction::Rollback
+        })
 }
 
 fn reverse_vtab_constraint_op(op: BinaryOp) -> Option<ConstraintOp> {

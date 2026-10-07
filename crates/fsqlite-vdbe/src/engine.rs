@@ -6547,6 +6547,39 @@ pub enum ExecOutcome {
     Error { code: i32, message: String },
 }
 
+/// bd-nn29x: the conflict algorithm a failed constraint check resolved to.
+///
+/// It decides what the statement boundary does with the failure (stock
+/// `Vdbe.errorAction`). Code generation resolves it per constraint: the
+/// statement's `OR` clause, else the constraint's own `ON CONFLICT` clause,
+/// else ABORT; an UPSERT `DO UPDATE` always uses ABORT.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConstraintFailureAction {
+    /// `OE_ROLLBACK`: the statement fails and the whole transaction rolls back.
+    Rollback,
+    /// `OE_ABORT`: the statement fails and its own changes are undone.
+    Abort,
+    /// `OE_FAIL`: the statement fails and keeps the changes it already made.
+    Fail,
+}
+
+impl ConstraintFailureAction {
+    /// Decode an `OE_*` algorithm from a `Halt` P2 or an `Insert` P5.
+    ///
+    /// For `IdxInsert` the caller passes P5's algorithm bits. IGNORE and
+    /// REPLACE never fail a statement, and 0 means the emitting site did not
+    /// resolve one.
+    #[must_use]
+    pub const fn from_oe(oe: u16) -> Option<Self> {
+        match oe {
+            1 => Some(Self::Rollback),
+            2 => Some(Self::Abort),
+            3 => Some(Self::Fail),
+            _ => None,
+        }
+    }
+}
+
 /// Exact logical row implicitly deleted by REPLACE conflict handling.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplaceVictim {
@@ -6856,6 +6889,11 @@ pub struct VdbeEngine {
     last_insert_cursor_id: Option<i32>,
     /// Foreign key constraint violation counter (deferred FK enforcement).
     fk_counter: i64,
+    /// bd-nn29x: conflict algorithm of the constraint check this execution
+    /// most recently ran (a failing `Halt`, `Insert` or `IdxInsert`). Only a
+    /// uniqueness / NOT NULL / CHECK failure consults it; `None` when the
+    /// emitting site did not resolve an algorithm.
+    constraint_failure_action: Option<ConstraintFailureAction>,
     /// AUTOINCREMENT high-water marks keyed by root page number (bd-31j76).
     /// Populated from `sqlite_sequence` by the Connection before execution.
     autoincrement_seq_by_root_page: HashMap<i32, i64>,
@@ -7461,6 +7499,7 @@ impl VdbeEngine {
             autoinc_alloc_high_water: BTreeMap::new(),
             last_insert_cursor_id: None,
             fk_counter: 0,
+            constraint_failure_action: None,
             autoincrement_seq_by_root_page: HashMap::new(),
             concurrent_rowid_allocator: None,
             concurrent_rowid_schema_epoch: SchemaEpoch::ZERO,
@@ -7736,6 +7775,7 @@ impl VdbeEngine {
         self.autoinc_alloc_high_water.clear();
         self.last_insert_cursor_id = None;
         self.fk_counter = 0;
+        self.constraint_failure_action = None;
         if !preserve_runtime_setup {
             self.autoincrement_seq_by_root_page.clear();
         }
@@ -8047,6 +8087,18 @@ impl VdbeEngine {
     /// Returns the number of rows modified (inserted, deleted, or updated).
     pub fn changes(&self) -> usize {
         self.changes
+    }
+
+    /// bd-nn29x: the conflict algorithm of the constraint check run last.
+    ///
+    /// When the execution failed with a uniqueness, NOT NULL or CHECK
+    /// violation, that is the failing check's resolved algorithm, which
+    /// decides whether the statement keeps its rows (FAIL), undoes them
+    /// (ABORT) or ends the transaction (ROLLBACK). Meaningless for any other
+    /// error, and `None` when the check carried no resolved algorithm.
+    #[must_use]
+    pub fn constraint_failure_action(&self) -> Option<ConstraintFailureAction> {
+        self.constraint_failure_action
     }
 
     /// Drain exact logical rows implicitly deleted by REPLACE before the
@@ -9418,6 +9470,7 @@ impl VdbeEngine {
             self.fk_counter = 0;
             self.cursor_root_pages.clear();
         }
+        self.constraint_failure_action = None;
         self.statement_state_clean = false;
         self.table_index_meta = Arc::clone(program.shared_table_index_meta());
 
@@ -9731,6 +9784,11 @@ impl VdbeEngine {
 
                 Opcode::Halt => {
                     if op.p1 != 0 {
+                        // bd-nn29x: a constraint halt carries its resolved
+                        // conflict algorithm in P2, as stock's OP_Halt does.
+                        self.constraint_failure_action = u16::try_from(op.p2)
+                            .ok()
+                            .and_then(ConstraintFailureAction::from_oe);
                         if op.p1 == ErrorCode::Constraint as i32 && op.p5 == OPFLAG_HALT_UNIQUE {
                             let columns = match &op.p4 {
                                 P4::Str(columns) => columns.clone(),
@@ -11560,6 +11618,9 @@ impl VdbeEngine {
                     let record_reg = op.p2;
                     let rowid_reg = op.p3;
                     let oe_flag = op.p5 & 0x0F; // Low 4 bits for OE_* mode
+                    // bd-nn29x: a rowid / PRIMARY KEY conflict raised below
+                    // resolves with this instruction's algorithm.
+                    self.constraint_failure_action = ConstraintFailureAction::from_oe(oe_flag);
                     let is_update = (op.p5 & OPFLAG_ISUPDATE) != 0;
                     let rowid = self.get_reg(rowid_reg).to_integer();
                     let concurrent_allocator = self.concurrent_rowid_allocator.clone();
@@ -12194,6 +12255,12 @@ impl VdbeEngine {
                     let is_unique = (op.p5 & 1) != 0;
                     #[allow(clippy::cast_possible_truncation)]
                     let oe_flag = ((op.p5 >> 1) & 0x0F) as u8;
+                    // bd-nn29x: a UNIQUE conflict raised below resolves with
+                    // this index's algorithm.
+                    if is_unique {
+                        self.constraint_failure_action =
+                            ConstraintFailureAction::from_oe(u16::from(oe_flag));
+                    }
                     let n_idx_cols = op.p3 as usize;
                     let count_logical_change = (op.p5 & OPFLAG_IDX_NCHANGE) != 0;
                     let mut inserted = false;
@@ -12950,6 +13017,10 @@ impl VdbeEngine {
                 // ── Miscellaneous ───────────────────────────────────────
                 Opcode::HaltIfNull => {
                     if self.get_reg(op.p3).is_null() {
+                        // bd-nn29x: P2 is the resolved conflict algorithm.
+                        self.constraint_failure_action = u16::try_from(op.p2)
+                            .ok()
+                            .and_then(ConstraintFailureAction::from_oe);
                         let msg = match &op.p4 {
                             P4::Str(s) => s.clone(),
                             _ => "NOT NULL constraint failed".to_owned(),
@@ -15516,6 +15587,8 @@ impl VdbeEngine {
                                 || "TEMP table unique constraint".to_owned(),
                                 str::to_owned,
                             );
+                        self.constraint_failure_action =
+                            ConstraintFailureAction::from_oe(op.p5 & 0x0F);
                         return Err(FrankenError::UniqueViolation { columns });
                     }
                     let db = self.db.as_mut().ok_or_else(|| {
