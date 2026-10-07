@@ -30,6 +30,7 @@ pub mod native_service;
 pub mod page_buf;
 pub mod page_cache;
 pub mod pager;
+pub mod persistent_page_map;
 pub mod s3_fifo;
 pub mod submodular_prefetch;
 pub mod thompson_partitioner;
@@ -69,6 +70,7 @@ pub use pager::{
     reset_staged_page_overwrite_steals_total, set_pager_commit_profile_enabled,
     staged_page_overwrite_steals_total,
 };
+pub use persistent_page_map::PersistentPageMap;
 pub use s3_fifo::{
     QueueKind, QueueLocation, RolloutDecision, RolloutMetrics, RolloutPolicy, S3Fifo, S3FifoConfig,
     S3FifoEvent, S3FifoRolloutGate,
