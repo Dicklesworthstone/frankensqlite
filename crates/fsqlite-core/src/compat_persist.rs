@@ -52,7 +52,10 @@ use crate::connection::{
     validate_builtin_persisted_index_expr_functions,
 };
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
-use crate::connection::{eval_join_expr, is_sqlite_truthy, qualified_unique_constraint_label};
+use crate::connection::{
+    eval_join_expr, is_sqlite_truthy, qualified_unique_constraint_label,
+    unshadowed_hidden_rowid_alias,
+};
 use fsqlite_types::{
     DATABASE_HEADER_SIZE, DatabaseHeader, PageNumber, PageSize, without_rowid_storage_order,
 };
@@ -1416,13 +1419,27 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
             Some(create_sql),
         ));
 
-        // Build column map once for evaluating partial index WHERE predicates.
-        // [(table_name, column_name, is_rowid_alias), ...]
-        let col_map: Vec<(String, String, bool)> = table
+        // Build column map once for evaluating partial index WHERE predicates
+        // and expression keys. [(table_name, column_name, is_rowid_alias), ...]
+        let mut col_map: Vec<(String, String, bool)> = table
             .columns
             .iter()
             .map(|c| (table.name.clone(), c.name.clone(), false))
             .collect();
+        // bd-5i5md: a rowid table's row image also carries its hidden rowid,
+        // under the same pseudo column integrity_check evaluates against
+        // (`push_hidden_rowid_eval_column`). Without it `WHERE rowid > 0`
+        // failed to resolve, the row was kept, and the rebuilt index held
+        // every row. A WITHOUT ROWID table's map key is a synthetic counter,
+        // not a rowid, so it is never exposed.
+        let hidden_rowid_slot = if table.without_rowid {
+            false
+        } else if let Some(alias) = unshadowed_hidden_rowid_alias(table) {
+            col_map.push((table.name.clone(), alias.to_owned(), true));
+            true
+        } else {
+            false
+        };
 
         // Write index B-trees for all indexes including autoindexes.
         // Autoindexes (sqlite_autoindex_*) are created for UNIQUE constraints
@@ -1616,12 +1633,25 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
                     // larger than stock's. Stock SQLite's VACUUM sorts index
                     // entries first; mirror that with the cursor's own comparator.
                     let mut index_keys: Vec<Vec<SqliteValue>> = Vec::new();
+                    let evaluates_row = partial_predicate.is_some() || is_expression_index;
+                    let mut row_image: Vec<SqliteValue> = Vec::new();
                     for (rowid, values) in mem_table.iter_rows() {
+                        // The row as predicates and key expressions see it:
+                        // its columns, then its rowid when `col_map` has a
+                        // slot for it.
+                        let eval_row: &[SqliteValue] = if hidden_rowid_slot && evaluates_row {
+                            row_image.clear();
+                            row_image.extend_from_slice(values);
+                            row_image.push(SqliteValue::Integer(rowid));
+                            &row_image
+                        } else {
+                            values
+                        };
                         // For partial indexes, skip rows that don't match
                         // the WHERE predicate. If evaluation fails, include
                         // the row (safe default).
                         if let Some(ref predicate) = partial_predicate
-                            && let Ok(result) = eval_join_expr(predicate, values, &col_map)
+                            && let Ok(result) = eval_join_expr(predicate, eval_row, &col_map)
                             && !is_sqlite_truthy(&result)
                         {
                             continue;
@@ -1631,7 +1661,7 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
                         let mut key_values: Vec<SqliteValue> = Vec::new();
                         if is_expression_index {
                             for expr in &key_exprs {
-                                key_values.push(eval_join_expr(expr, values, &col_map)?);
+                                key_values.push(eval_join_expr(expr, eval_row, &col_map)?);
                             }
                         } else {
                             for col_name in &index.columns {
@@ -3373,7 +3403,7 @@ pub fn extract_check_constraints_from_sql(sql: &str) -> Vec<String> {
 
 pub(crate) fn extract_check_constraints_with_owners_from_sql(sql: &str) -> Vec<CheckConstraint> {
     if let Some(Statement::CreateTable(create)) = parse_single_statement(sql) {
-        return check_constraints_from_create_table_statement(&create);
+        return check_constraints_from_create_table_statement(&create, sql);
     }
 
     extract_check_constraints_with_owners_sql_fallback(sql)
@@ -3422,8 +3452,18 @@ fn extract_check_constraints_with_owners_sql_fallback(sql: &str) -> Vec<CheckCon
     checks
 }
 
+/// The CHECK constraints of a stored `CREATE TABLE`, parsed from `create_sql`
+/// (the text `create` was parsed from).
+///
+/// Each keeps its `CONSTRAINT` name and its expression's source text, as
+/// CREATE TABLE records them: both reach the user in "CHECK constraint
+/// failed: <name or text>", and stock reports the name, else the verbatim
+/// text between the parentheses. bd-8cs1s: the reload dropped the name and
+/// re-rendered the text from the AST (`a <> 2` became `a != 2`), so every
+/// CHECK on a reopened or stock-created file failed with a different message.
 pub(crate) fn check_constraints_from_create_table_statement(
     create: &CreateTableStatement,
+    create_sql: &str,
 ) -> Vec<CheckConstraint> {
     let CreateTableBody::Columns {
         columns,
@@ -3437,9 +3477,9 @@ pub(crate) fn check_constraints_from_create_table_statement(
         for constraint in &column.constraints {
             if let ColumnConstraintKind::Check(expr) = &constraint.kind {
                 checks.push(CheckConstraint {
-                    expr: expr.to_string(),
+                    expr: stored_check_expr_source(expr, create_sql),
                     owner_column: Some(column.name.clone()),
-                    name: None,
+                    name: constraint.name.clone(),
                 });
             }
         }
@@ -3447,13 +3487,30 @@ pub(crate) fn check_constraints_from_create_table_statement(
     for constraint in constraints {
         if let TableConstraintKind::Check(expr) = &constraint.kind {
             checks.push(CheckConstraint {
-                expr: expr.to_string(),
+                expr: stored_check_expr_source(expr, create_sql),
                 owner_column: None,
-                name: None,
+                name: constraint.name.clone(),
             });
         }
     }
     checks
+}
+
+/// `expr`'s verbatim source in `create_sql`, trimmed, when that slice parses
+/// back to the same expression; otherwise the AST rendering. This is the rule
+/// CREATE TABLE applies (`Connection::format_check_expr_source`): a span that
+/// omits grouping parentheses, as in `CHECK((a) AND (b))`, is not a valid
+/// expression on its own and must not replace the constraint.
+fn stored_check_expr_source(expr: &Expr, create_sql: &str) -> String {
+    let span = expr.span();
+    create_sql
+        .get(span.start as usize..span.end as usize)
+        .map(str::trim)
+        .filter(|source| {
+            !source.is_empty()
+                && fsqlite_parser::expr::parse_expr(source).is_ok_and(|parsed| parsed.eq(expr))
+        })
+        .map_or_else(|| expr.to_string(), str::to_owned)
 }
 
 fn parse_column_name_and_remainder(def: &str) -> Option<(String, &str)> {
@@ -6078,25 +6135,73 @@ PRAGMA integrity_check;
 
     #[test]
     fn test_check_constraint_fallback_preserves_column_ownership() {
-        // SQLite accepts a conflict clause after a table CHECK, while the AST
-        // parser currently rejects that suffix. Exercise the fallback so a
-        // neighboring column CHECK does not get flattened into table scope.
+        // SQLite accepts a conflict clause after a table CHECK. The AST parser
+        // now accepts that suffix too, so exercise the SQL-text fallback
+        // directly: a neighboring column CHECK must not get flattened into
+        // table scope. The fallback does not recover constraint names.
         let sql = r#"CREATE TABLE t(
             "owned col" TEXT DEFAULT 'CHECK(fake)' CHECK(length("owned col") > 0),
             b INTEGER,
             CONSTRAINT/*name*/ table_check CHECK/*expr*/(b > 0) ON CONFLICT FAIL
         )"#;
-        let checks = extract_check_constraints_with_owners_from_sql(sql);
+        let owned = CheckConstraint {
+            expr: r#"length("owned col") > 0"#.to_owned(),
+            owner_column: Some("owned col".to_owned()),
+            name: None,
+        };
+        let table_check = CheckConstraint {
+            expr: "b > 0".to_owned(),
+            owner_column: None,
+            name: None,
+        };
         assert_eq!(
-            checks,
+            extract_check_constraints_with_owners_sql_fallback(sql),
+            vec![owned.clone(), table_check.clone()]
+        );
+        // The parsed path keeps the same ownership and also the name, which
+        // stock reports: "CHECK constraint failed: table_check" (bd-8cs1s).
+        assert_eq!(
+            extract_check_constraints_with_owners_from_sql(sql),
+            vec![
+                owned,
+                CheckConstraint {
+                    name: Some("table_check".to_owned()),
+                    ..table_check
+                },
+            ]
+        );
+    }
+
+    /// bd-8cs1s: a reloaded CHECK keeps its `CONSTRAINT` name and the source
+    /// text stock reports in "CHECK constraint failed: ...", rather than the
+    /// AST rendering (`<>` re-rendered as `!=`) with the name dropped.
+    #[test]
+    fn test_reloaded_check_constraints_keep_name_and_source_text() {
+        let sql = "CREATE TABLE t(a CONSTRAINT pos CHECK( a  <>  0 ), b, \
+                   CONSTRAINT ordered CHECK(b <> a), CHECK(rowid <> 2), CHECK((a) AND (b)))";
+        let grouped = fsqlite_parser::expr::parse_expr("(a) AND (b)")
+            .expect("grouped CHECK parses")
+            .to_string();
+        assert_eq!(
+            extract_check_constraints_with_owners_from_sql(sql),
             vec![
                 CheckConstraint {
-                    expr: r#"length("owned col") > 0"#.to_owned(),
-                    owner_column: Some("owned col".to_owned()),
+                    expr: "a  <>  0".to_owned(),
+                    owner_column: Some("a".to_owned()),
+                    name: Some("pos".to_owned()),
+                },
+                CheckConstraint {
+                    expr: "b <> a".to_owned(),
+                    owner_column: None,
+                    name: Some("ordered".to_owned()),
+                },
+                CheckConstraint {
+                    expr: "rowid <> 2".to_owned(),
+                    owner_column: None,
                     name: None,
                 },
                 CheckConstraint {
-                    expr: "b > 0".to_owned(),
+                    expr: grouped,
                     owner_column: None,
                     name: None,
                 },
