@@ -6,6 +6,10 @@
 //! stack overflow at depth 8 on a 2 MiB thread. Stock SQLite expands such
 //! chains without a fixed limit.
 //!
+//! The engine now accepts chains nesting up to `MAX_VIEW_NESTING_DEPTH`
+//! (1000) views on that stack and refuses deeper ones with the typed
+//! `FrankenError::ViewNestingTooDeep`.
+//!
 //! Every workload here runs on a dedicated 2 MiB thread inside a helper
 //! process (this test binary, re-invoked on one test). A stack overflow aborts
 //! the helper, not the test runner, and the parent test fails with the
@@ -16,7 +20,8 @@ use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use fsqlite_core::connection::Connection;
+use fsqlite_core::connection::{Connection, MAX_VIEW_NESTING_DEPTH};
+use fsqlite_error::FrankenError;
 use fsqlite_types::value::SqliteValue;
 
 /// Names the test whose body the helper process should run.
@@ -363,5 +368,126 @@ fn bd_5haia_view_chains_linked_through_with_and_subqueries_match_stock_on_2mib_s
             queries.push(format!("SELECT * FROM {prefix}{CHAIN_DEPTH};"));
         }
         assert_matches_stock(runtime, conn, &setup, &queries);
+    });
+}
+
+/// View bodies that name the view they read with a `schema.table.column`
+/// reference. Materialization renames each body's view sources to TEMP
+/// tables, so these references must be bound (bd-at0bx) before that rename
+/// or `main.v0.x` no longer finds `main.v0`.
+#[test]
+fn bd_5haia_view_chain_with_schema_qualified_columns_matches_stock_on_2mib_stack() {
+    const NAME: &str =
+        "bd_5haia_view_chain_with_schema_qualified_columns_matches_stock_on_2mib_stack";
+    if !is_helper_for(NAME) {
+        run_in_helper_process(NAME);
+        return;
+    }
+    on_small_stack(|runtime, conn| {
+        let mut setup = vec![
+            "CREATE TABLE t(k INTEGER PRIMARY KEY);".to_owned(),
+            "INSERT INTO t(k) VALUES (1), (2), (3);".to_owned(),
+            "CREATE VIEW q0 AS SELECT main.t.k AS x FROM t;".to_owned(),
+        ];
+        setup.extend((1..=CHAIN_DEPTH).map(|level| {
+            let previous = level - 1;
+            format!("CREATE VIEW q{level} AS SELECT main.q{previous}.x + 1 AS x FROM q{previous};")
+        }));
+        setup.extend([
+            format!(
+                "CREATE VIEW joined AS SELECT main.q{CHAIN_DEPTH}.x AS top, main.q0.x AS leaf \
+                 FROM q{CHAIN_DEPTH} JOIN main.q0 ON main.q{CHAIN_DEPTH}.x = main.q0.x + {CHAIN_DEPTH};"
+            ),
+            "CREATE TEMP VIEW tq AS SELECT main.joined.top FROM main.joined;".to_owned(),
+        ]);
+        let queries = [
+            format!("SELECT * FROM q{CHAIN_DEPTH} ORDER BY x;"),
+            "SELECT * FROM joined ORDER BY leaf;".to_owned(),
+            "SELECT * FROM tq ORDER BY top;".to_owned(),
+            format!("SELECT main.q{CHAIN_DEPTH}.x FROM q{CHAIN_DEPTH} ORDER BY 1;"),
+        ];
+        assert_matches_stock(runtime, conn, &setup, &queries);
+    });
+}
+
+/// The deepest chain the engine accepts: `SELECT * FROM v999` over
+/// `v0 <- ... <- v999` nests exactly `MAX_VIEW_NESTING_DEPTH` views. It must
+/// work on the same 2 MiB stack and agree with stock SQLite, so the limit is
+/// a real supported depth rather than a refusal standing in for one.
+#[test]
+fn bd_5haia_view_chain_at_nesting_limit_matches_stock_on_2mib_stack() {
+    const NAME: &str = "bd_5haia_view_chain_at_nesting_limit_matches_stock_on_2mib_stack";
+    if !is_helper_for(NAME) {
+        run_in_helper_process(NAME);
+        return;
+    }
+    on_small_stack(|runtime, conn| {
+        let top = MAX_VIEW_NESTING_DEPTH - 1;
+        let mut setup = bead_chain("v", top);
+        setup.push("CREATE VIEW w0 AS SELECT 0 AS n;".to_owned());
+        setup.extend((1..=top).map(|level| {
+            format!(
+                "CREATE VIEW w{level} AS SELECT n + 1 AS n FROM w{};",
+                level - 1
+            )
+        }));
+        let queries = [
+            format!("SELECT * FROM v{top};"),
+            format!("SELECT n FROM w{top};"),
+            format!("SELECT (SELECT n FROM w{top}) + (SELECT x FROM v{top});"),
+        ];
+        assert_matches_stock(runtime, conn, &setup, &queries);
+    });
+}
+
+/// One view more than the limit fails with the typed error, wherever the
+/// chain is read from, and leaves the connection usable. Stock SQLite has no
+/// dedicated view-nesting limit and returns `1` here; refusing past
+/// `MAX_VIEW_NESTING_DEPTH` is this engine's deliberate bound.
+#[test]
+fn bd_5haia_view_chain_beyond_nesting_limit_is_a_typed_error_on_2mib_stack() {
+    const NAME: &str = "bd_5haia_view_chain_beyond_nesting_limit_is_a_typed_error_on_2mib_stack";
+    if !is_helper_for(NAME) {
+        run_in_helper_process(NAME);
+        return;
+    }
+    on_small_stack(|runtime, conn| {
+        let top = MAX_VIEW_NESTING_DEPTH;
+        for statement in bead_chain("v", top) {
+            runtime
+                .block_on(conn.execute(&statement))
+                .unwrap_or_else(|error| panic!("fsqlite failed `{statement}`: {error:?}"));
+        }
+        for query in [
+            format!("SELECT * FROM v{top};"),
+            format!("SELECT (SELECT x FROM v{top});"),
+            format!("SELECT * FROM (SELECT x FROM v{top});"),
+            format!("SELECT 1 WHERE EXISTS (SELECT 1 FROM v{top});"),
+        ] {
+            let error = runtime
+                .block_on(conn.query(&query))
+                .expect_err("a chain one view past the limit must be refused");
+            assert!(
+                matches!(
+                    error,
+                    FrankenError::ViewNestingTooDeep { max } if max == MAX_VIEW_NESTING_DEPTH
+                ),
+                "`{query}` must fail with ViewNestingTooDeep, got {error:?}"
+            );
+            assert_eq!(
+                error.to_string(),
+                format!("too many levels of view nesting (max {MAX_VIEW_NESTING_DEPTH})")
+            );
+        }
+        // The refusal leaves no materialized state behind: the chain one
+        // level shallower still reads, and so does an unrelated statement.
+        assert_eq!(
+            frank_rows(runtime, conn, &format!("SELECT * FROM v{};", top - 1)),
+            vec![vec!["int:1".to_owned()]]
+        );
+        assert_eq!(
+            frank_rows(runtime, conn, "SELECT 41 + 1;"),
+            vec![vec!["int:42".to_owned()]]
+        );
     });
 }
