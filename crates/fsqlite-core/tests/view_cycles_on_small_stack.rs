@@ -9,8 +9,8 @@
 //! Salvaged from the July 2026 codex phase-C working copy
 //! (`frankensqlite_codex_phasec_clean_20260727`, connection.rs unit tests).
 //! That copy also asserted a 128-level acyclic view chain on the same 1 MiB
-//! stack; that part is not carried here because acyclic view nesting still
-//! costs native stack per level on main.
+//! stack; acyclic chains are covered by `bd_5haia_view_chain_depth.rs`
+//! (bd-5haia), which runs them 128 and 1000 views deep on a 2 MiB thread.
 
 use fsqlite_core::connection::Connection;
 use fsqlite_types::value::SqliteValue;

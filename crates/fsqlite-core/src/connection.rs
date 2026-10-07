@@ -708,6 +708,22 @@ const FUNCTION_REGISTRY_STABILITY_ATTEMPTS: usize = 4;
 /// Stack safety comes from [`ensure_native_stack_headroom`] instead.
 pub const MAX_TRIGGER_PROGRAM_DEPTH: usize = 50;
 
+/// Maximum number of views one statement may expand inside each other
+/// (bd-5haia).
+///
+/// `SELECT * FROM v999` over the chain `v0 <- v1 <- ... <- v999` nests 1000
+/// views and is accepted; one more level fails with the typed
+/// [`FrankenError::ViewNestingTooDeep`]. Stock SQLite has no dedicated view
+/// limit; 1000 matches its other nesting limits (`SQLITE_MAX_EXPR_DEPTH`,
+/// `SQLITE_MAX_TRIGGER_DEPTH`).
+///
+/// Materialization itself no longer recurses per view level (see
+/// `Connection::plan_view_materialization`). The name and metadata resolvers
+/// still expand a chain recursively, continuing on heap-allocated stack
+/// segments once the thread's own stack runs low
+/// (`with_view_expansion_stack`); this cap bounds how far they expand.
+pub const MAX_VIEW_NESTING_DEPTH: usize = 1000;
+
 /// Native stack that must still be free *after* the projected cost of the one
 /// additional trigger/FK-action level being admitted (GH#414).
 ///
@@ -756,6 +772,141 @@ fn remaining_native_stack() -> Option<usize> {
 #[inline]
 const fn remaining_native_stack() -> Option<usize> {
     None
+}
+
+/// Native stack a name/metadata resolver must still have before it expands
+/// one more view level on the running stack (bd-5haia). One level of the
+/// relation resolver measured 4.6 KiB at this workspace's `[profile.dev]`;
+/// the margin covers opt-level 0 consumers and the expression and CTE work a
+/// single view body does between two view expansions.
+const VIEW_EXPANSION_STACK_RED_ZONE_BYTES: usize = 256 * 1024;
+
+/// Size of each heap-allocated stack segment a view expansion moves to once
+/// the running stack is down to [`VIEW_EXPANSION_STACK_RED_ZONE_BYTES`].
+const VIEW_EXPANSION_STACK_SEGMENT_BYTES: usize = 2 * 1024 * 1024;
+
+/// Expand one level of a view chain inside a name or metadata resolver
+/// (bd-5haia).
+///
+/// The resolvers walk a view body by recursing into the views it reads, so a
+/// chain of N views costs N resolver levels of native stack. Up to
+/// [`MAX_VIEW_NESTING_DEPTH`] levels must fit whatever stack the caller's
+/// thread has, so once fewer than [`VIEW_EXPANSION_STACK_RED_ZONE_BYTES`]
+/// remain, the next level runs on a fresh heap-allocated stack segment
+/// (`stacker::maybe_grow`, the mechanism rustc uses for its own deep
+/// recursion) instead of overflowing. Above the red zone this is one
+/// remaining-stack comparison.
+///
+/// wasm32 cannot switch stacks; there the nesting cap alone bounds the depth.
+#[inline]
+fn with_view_expansion_stack<R>(expand: impl FnOnce() -> R) -> R {
+    run_with_native_stack_reserve(
+        VIEW_EXPANSION_STACK_RED_ZONE_BYTES,
+        VIEW_EXPANSION_STACK_SEGMENT_BYTES,
+        expand,
+    )
+}
+
+/// Native stack the execution of one materialized view body must still have
+/// before it starts on the running stack (bd-5haia). A body that reaches
+/// another view through a WITH clause, a derived table or a subquery (rather
+/// than a FROM/JOIN source, which `Connection::plan_view_materialization`
+/// flattens) re-enters view materialization from inside its own execution;
+/// one such level measured roughly 200-400 KiB at this workspace's
+/// `[profile.dev]`.
+const VIEW_BODY_EXECUTION_STACK_RED_ZONE_BYTES: usize = 1024 * 1024;
+
+/// Size of each heap-allocated stack segment a view body's execution moves
+/// to once the running stack is down to
+/// [`VIEW_BODY_EXECUTION_STACK_RED_ZONE_BYTES`]. Segments are mapped lazily,
+/// so only the pages a level touches are committed.
+const VIEW_BODY_EXECUTION_STACK_SEGMENT_BYTES: usize = 8 * 1024 * 1024;
+
+/// Run `run` on the current stack when at least `red_zone` bytes of it are
+/// left, otherwise on a fresh heap-allocated stack of `segment` bytes
+/// (`stacker::maybe_grow`).
+#[cfg(not(target_arch = "wasm32"))]
+#[inline]
+fn run_with_native_stack_reserve<R>(red_zone: usize, segment: usize, run: impl FnOnce() -> R) -> R {
+    stacker::maybe_grow(red_zone, segment, run)
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline]
+fn run_with_native_stack_reserve<R>(
+    _red_zone: usize,
+    _segment: usize,
+    run: impl FnOnce() -> R,
+) -> R {
+    run()
+}
+
+/// Polls the statement future of one materialized view body with at least
+/// [`VIEW_BODY_EXECUTION_STACK_RED_ZONE_BYTES`] of native stack, moving each
+/// poll to a heap-allocated stack segment when the thread's own stack is
+/// shorter than that (bd-5haia). The future's state already lives on the
+/// heap; only the poll frames are placed. This is what keeps view chains
+/// linked through WITH clauses, derived tables or subqueries — which still
+/// re-enter statement execution once per view — from overflowing the
+/// caller's stack before the nesting cap stops them.
+///
+/// That holds only while the work between two view boundaries fits in the
+/// red zone. A view level whose body nests several scalar subqueries
+/// re-enters statement execution once per subquery and can exceed it,
+/// because nested subqueries themselves have no stack checkpoint (bd-5iud6).
+struct ViewBodyExecution<'a> {
+    statement: Pin<Box<dyn Future<Output = Result<Vec<Row>>> + 'a>>,
+}
+
+impl Future for ViewBodyExecution<'_> {
+    type Output = Result<Vec<Row>>;
+
+    fn poll(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let statement = &mut self.get_mut().statement;
+        run_with_native_stack_reserve(
+            VIEW_BODY_EXECUTION_STACK_RED_ZONE_BYTES,
+            VIEW_BODY_EXECUTION_STACK_SEGMENT_BYTES,
+            || statement.as_mut().poll(cx),
+        )
+    }
+}
+
+thread_local! {
+    /// bd-5haia: stored views whose result-column names
+    /// `Connection::named_relation_result_column_names` is inferring on this
+    /// thread, keyed `{connection:p}:{view index}`. That inference is
+    /// infallible and runs ahead of some statements' relation pass, so it
+    /// carries its own cycle guard rather than recursing without end.
+    static VIEWS_IN_COLUMN_NAME_INFERENCE: RefCell<HashSet<String>> =
+        RefCell::new(HashSet::new());
+}
+
+/// Marks one stored view as being inferred for as long as it lives
+/// (bd-5haia).
+struct ViewColumnNameInference {
+    key: String,
+}
+
+impl ViewColumnNameInference {
+    /// `None` when the view is already being inferred on this thread, i.e.
+    /// its definition reaches itself.
+    fn enter(connection: &Connection, view_index: usize) -> Option<Self> {
+        let key = format!("{connection:p}:{view_index}");
+        VIEWS_IN_COLUMN_NAME_INFERENCE
+            .with_borrow_mut(|active| active.insert(key.clone()))
+            .then_some(Self { key })
+    }
+}
+
+impl Drop for ViewColumnNameInference {
+    fn drop(&mut self) {
+        VIEWS_IN_COLUMN_NAME_INFERENCE.with_borrow_mut(|active| {
+            active.remove(&self.key);
+        });
+    }
 }
 
 /// Refuse one more recursive trigger/FK-action program level when the running
@@ -14801,6 +14952,19 @@ impl Drop for MemdbRowHydrationSuppression<'_> {
         let depth = &self.conn.memdb_row_hydration_suppressed;
         depth.set(depth.get() - 1);
     }
+}
+
+/// One view a SELECT reads, ready to materialize (bd-5haia).
+///
+/// Produced in dependency order by `Connection::plan_view_materialization`.
+struct PlannedViewMaterialization {
+    /// Index into the connection's view definitions.
+    view_index: usize,
+    /// Statement-wide temp table the view's rows are materialized into.
+    materialized_name: String,
+    /// The owner-bound view body whose FROM/JOIN view sources already name
+    /// the tables of the views it reads.
+    query: SelectStatement,
 }
 
 struct MaterializedTablesCleanupGuard<'a> {
@@ -53055,7 +53219,17 @@ impl Connection {
                 if !temporary {
                     qualify_persistent_view_relations(&mut query);
                 }
-                return self.select_result_column_names(&query, &[], active_ctes);
+                // bd-5haia: a `SELECT *` chain recurses here once per view.
+                // Re-entering a view still being inferred is a cycle (the
+                // statement's relation pass reports it); fall back to the
+                // body's syntactic names, as the CTE branch does, instead of
+                // recursing without end.
+                let Some(_inference) = ViewColumnNameInference::enter(self, i) else {
+                    return infer_select_column_names(&query);
+                };
+                return with_view_expansion_stack(|| {
+                    self.select_result_column_names(&query, &[], active_ctes)
+                });
             }
         }
 
@@ -72651,7 +72825,7 @@ impl Connection {
         &self,
         source: &mut TableOrSubquery,
         materialized_by_view: &mut HashMap<usize, String>,
-        referenced: &mut Vec<(usize, String)>,
+        referenced: &mut Vec<usize>,
         next_name: &mut usize,
     ) {
         match source {
@@ -72661,12 +72835,11 @@ impl Connection {
                 };
                 let materialized_name = materialized_by_view
                     .entry(view_index)
-                    .or_insert_with(|| {
-                        let generated = self.unused_materialized_view_name(next_name);
-                        referenced.push((view_index, generated.clone()));
-                        generated
-                    })
+                    .or_insert_with(|| self.unused_materialized_view_name(next_name))
                     .clone();
+                if !referenced.contains(&view_index) {
+                    referenced.push(view_index);
+                }
                 if alias.is_none() {
                     *alias = Some(name.name.clone());
                 }
@@ -72692,13 +72865,17 @@ impl Connection {
         }
     }
 
+    /// Point every FROM/JOIN view source of `select` (all compound arms) at
+    /// that view's statement-wide materialized table, allocating a table name
+    /// in `materialized_by_view` the first time a view is seen. Returns the
+    /// distinct views the rewritten sources read, in source order.
     fn rewrite_materialized_view_sources(
         &self,
         select: &mut SelectStatement,
-    ) -> Vec<(usize, String)> {
+        materialized_by_view: &mut HashMap<usize, String>,
+        next_name: &mut usize,
+    ) -> Vec<usize> {
         let mut referenced = Vec::new();
-        let mut materialized_by_view = HashMap::new();
-        let mut next_name = 0;
         let mut rewrite_core = |core: &mut SelectCore| {
             let SelectCore::Select {
                 from: Some(from), ..
@@ -72708,16 +72885,16 @@ impl Connection {
             };
             self.rewrite_materialized_view_source(
                 &mut from.source,
-                &mut materialized_by_view,
+                materialized_by_view,
                 &mut referenced,
-                &mut next_name,
+                next_name,
             );
             for join in &mut from.joins {
                 self.rewrite_materialized_view_source(
                     &mut join.table,
-                    &mut materialized_by_view,
+                    materialized_by_view,
                     &mut referenced,
-                    &mut next_name,
+                    next_name,
                 );
             }
         };
@@ -72726,6 +72903,154 @@ impl Connection {
             rewrite_core(core);
         }
         referenced
+    }
+
+    /// bd-5haia: plan, without recursion, every view a SELECT needs
+    /// materialized.
+    ///
+    /// Materializing a view used to run its body through `execute_statement`,
+    /// whose dispatch re-entered `execute_with_materialized_views` for the
+    /// body's own view sources. Every level of an acyclic view chain therefore
+    /// stacked one more complete statement execution on the native stack
+    /// (~200 KiB per level at this workspace's `[profile.dev]`), so
+    /// `SELECT * FROM v8` over `v0 <- v1 <- ... <- v8` aborted a 2 MiB thread,
+    /// and each level also re-validated the whole chain below it.
+    ///
+    /// This walks the view-dependency graph with an explicit heap stack
+    /// instead. Each visited view body is bound to its owning schema, has its
+    /// `schema.table.column` references bound (bd-at0bx), then has its
+    /// FROM/JOIN view sources rewritten to statement-wide materialized table
+    /// names. Views come back in dependency order (post-order): by the
+    /// time a body executes, every view it reads is already a materialized
+    /// table, so executing it never re-enters view materialization, whatever
+    /// the depth of the chain. A view reached along several paths is planned
+    /// once and materialized once for the whole statement.
+    ///
+    /// A body is rewritten here only when `execute_statement` would route it
+    /// straight to view materialization: a body with a WITH clause (whose CTE
+    /// names may shadow views and which must be materialized first) or a
+    /// time-travel clause keeps its original sources and resolves its views
+    /// itself when it runs, exactly as before.
+    ///
+    /// Views nested deeper than [`MAX_VIEW_NESTING_DEPTH`] are refused with
+    /// [`FrankenError::ViewNestingTooDeep`].
+    fn plan_view_materialization(
+        &self,
+        select: &mut SelectStatement,
+        view_defs: &[ViewDef],
+    ) -> Result<Vec<PlannedViewMaterialization>> {
+        enum Visit {
+            Enter {
+                view_index: usize,
+                depth: usize,
+            },
+            Exit {
+                view_index: usize,
+                query: Box<SelectStatement>,
+            },
+        }
+
+        let mut materialized_by_view = HashMap::new();
+        let mut next_name = 0;
+        let roots = self.rewrite_materialized_view_sources(
+            select,
+            &mut materialized_by_view,
+            &mut next_name,
+        );
+        // `false` while a view's dependencies are being planned, `true` once
+        // the view itself has been planned.
+        let mut planned: HashMap<usize, bool> = HashMap::with_capacity(roots.len());
+        let mut steps = Vec::new();
+        let mut stack: Vec<Visit> = roots
+            .into_iter()
+            .rev()
+            .map(|view_index| Visit::Enter {
+                view_index,
+                depth: 1,
+            })
+            .collect();
+        while let Some(visit) = stack.pop() {
+            match visit {
+                Visit::Enter { view_index, depth } => {
+                    let view = view_defs.get(view_index).ok_or_else(|| {
+                        FrankenError::internal(format!(
+                            "view index {view_index} not found in definitions"
+                        ))
+                    })?;
+                    match planned.get(&view_index) {
+                        Some(true) => continue,
+                        // An Enter popped while the same view is still being
+                        // planned can only come from its own dependencies.
+                        Some(false) => {
+                            return Err(FrankenError::FunctionError(format!(
+                                "view {} is circularly defined",
+                                view.name
+                            )));
+                        }
+                        None => {}
+                    }
+                    if depth > MAX_VIEW_NESTING_DEPTH {
+                        return Err(FrankenError::ViewNestingTooDeep {
+                            max: MAX_VIEW_NESTING_DEPTH,
+                        });
+                    }
+                    let mut query = view.query.clone();
+                    if !view.temporary {
+                        qualify_persistent_view_relations(&mut query);
+                    }
+                    let dependencies =
+                        if query.with.is_none() && extract_temporal_clause(&query).is_none() {
+                            // bd-at0bx binds `schema.table.column` against the
+                            // FROM item of that database. Once a view source
+                            // is renamed to its materialized table (a TEMP
+                            // table), `main.v.c` no longer finds `main.v`, so
+                            // bind first, as executing the original body does.
+                            if let Some(Statement::Select(bound)) = self
+                                .bind_schema_qualified_columns(&Statement::Select(query.clone()))?
+                            {
+                                query = bound;
+                            }
+                            self.rewrite_materialized_view_sources(
+                                &mut query,
+                                &mut materialized_by_view,
+                                &mut next_name,
+                            )
+                        } else {
+                            Vec::new()
+                        };
+                    planned.insert(view_index, false);
+                    stack.push(Visit::Exit {
+                        view_index,
+                        query: Box::new(query),
+                    });
+                    for dependency in dependencies.into_iter().rev() {
+                        if planned.get(&dependency) != Some(&true) {
+                            stack.push(Visit::Enter {
+                                view_index: dependency,
+                                depth: depth + 1,
+                            });
+                        }
+                    }
+                }
+                Visit::Exit { view_index, query } => {
+                    planned.insert(view_index, true);
+                    let materialized_name = materialized_by_view
+                        .get(&view_index)
+                        .cloned()
+                        .ok_or_else(|| {
+                            FrankenError::internal(format!(
+                                "view index {view_index} was planned without a materialized name"
+                            ))
+                        })?;
+                    steps.push(PlannedViewMaterialization {
+                        view_index,
+                        materialized_name,
+                        query: *query,
+                    });
+                }
+            }
+        }
+        Ok(steps)
     }
 
     /// bd-xl98m (GH #207/#213): rewrite a *parenless* eponymous no-arg pragma
@@ -73028,6 +73353,11 @@ impl Connection {
 
     /// Materialize views referenced by a SELECT as temporary tables, execute
     /// the query, then clean up the temp tables.
+    ///
+    /// Every view the statement reads through FROM/JOIN sources, directly or
+    /// through other views, is materialized here in dependency order (see
+    /// [`Self::plan_view_materialization`]), so the native stack this needs
+    /// does not grow with the depth of a view chain (bd-5haia).
     async fn execute_with_materialized_views(
         &self,
         select: &SelectStatement,
@@ -73042,10 +73372,10 @@ impl Connection {
             let metadata_resolver = CteResultMetadataResolver::new(self, &metadata_schema);
 
             let mut executable_select = select.clone();
-            let referenced = self.rewrite_materialized_view_sources(&mut executable_select);
+            let plan = self.plan_view_materialization(&mut executable_select, &view_defs)?;
 
             let exec_result = async {
-                // CRITICAL: probe pager-side cleanliness for `referenced.len()`
+                // CRITICAL: probe pager-side cleanliness for `plan.len()`
                 // contiguous root pages before any `create_table()` call below.
                 //
                 // `MemDatabase::next_root_page` starts at 2 and is only bumped
@@ -73067,21 +73397,33 @@ impl Connection {
                 // sqlite_schema fix never extended. UNION queries reach this
                 // path through `execute_compound_select` recursing into each
                 // arm's `execute_statement`.
-                self.reserve_clean_memdb_root_pages(referenced.len())
-                    .await?;
+                self.reserve_clean_memdb_root_pages(plan.len()).await?;
 
-                // Materialize each referenced view as a temp table.
-                for (view_index, materialized_name) in &referenced {
-                    let view = view_defs.get(*view_index).ok_or_else(|| {
+                // Materialize each planned view as a temp table, dependencies
+                // first. A body's view sources already name the tables of the
+                // views materialized before it.
+                for (
+                    step,
+                    PlannedViewMaterialization {
+                        view_index,
+                        materialized_name,
+                        query: executable_view_query,
+                    },
+                ) in plan.into_iter().enumerate()
+                {
+                    let view = view_defs.get(view_index).ok_or_else(|| {
                         FrankenError::internal(format!(
                             "view index {view_index} not found in definitions"
                         ))
                     })?;
-                    let view_result_metadata = metadata_resolver.resolve_view(*view_index);
-                    let mut executable_view_query = view.query.clone();
-                    if !view.temporary {
-                        qualify_persistent_view_relations(&mut executable_view_query);
+                    // This body may read the tables earlier steps
+                    // materialized; drop reuse caches compiled without them.
+                    if step > 0 {
+                        self.clear_compilation_reuse_caches();
                     }
+                    // Dependencies resolved first, so their metadata is
+                    // already cached and this resolves only one level.
+                    let view_result_metadata = metadata_resolver.resolve_view(view_index);
                     if !view.columns.is_empty() {
                         let actual_width = self.select_result_column_count(
                             &executable_view_query,
@@ -73108,9 +73450,11 @@ impl Connection {
                             &mut Vec::new(),
                         )
                     });
-                    let view_rows = self
-                        .execute_statement(&Statement::Select(executable_view_query), None)
-                        .await?;
+                    let view_rows = ViewBodyExecution {
+                        statement: self
+                            .execute_statement(&Statement::Select(executable_view_query), None),
+                    }
+                    .await?;
                     // bd-ws183: an explicit `CREATE VIEW v(c1, c2, ...)` column
                     // list renames the view's output columns; only fall back to
                     // the SELECT's own result names when no list was declared.
@@ -73154,11 +73498,9 @@ impl Connection {
                         foreign_keys: Vec::new(),
                         check_constraints: Vec::new(),
                     });
-                    materialized.record_owned_temp_marker(materialized_name);
+                    materialized.record_owned_temp_marker(&materialized_name);
                     self.rebuild_schema_indices();
-                    materialized
-                        .tables
-                        .push((materialized_name.clone(), root_page));
+                    materialized.tables.push((materialized_name, root_page));
 
                     for (i, row) in view_rows.iter().enumerate() {
                         let vals = row.values().to_vec();
@@ -103848,13 +104190,15 @@ impl<'a> CteResultMetadataResolver<'a> {
         // the statement that references the view must not leak into its body.
         // Use a short-lived resolver for the cloned query while sharing only
         // the view cache/cycle state needed by nested views.
-        let mut metadata = resolve_select_metadata_with_view_state(
-            self.connection,
-            self.schemas,
-            &query,
-            Rc::clone(&self.view_cache),
-            Rc::clone(&self.active_views),
-        );
+        let mut metadata = with_view_expansion_stack(|| {
+            resolve_select_metadata_with_view_state(
+                self.connection,
+                self.schemas,
+                &query,
+                Rc::clone(&self.view_cache),
+                Rc::clone(&self.active_views),
+            )
+        });
         if !view.columns.is_empty() {
             metadata.names = view.columns;
         }
@@ -141446,6 +141790,11 @@ struct SelectRelationResolver<'connection, 'select> {
     scopes: Vec<&'select [fsqlite_ast::Cte]>,
     visits: HashMap<*const fsqlite_ast::Cte, CteCollationVisit>,
     active_views: HashSet<String>,
+    /// bd-5haia: lexical-column validation state shared by every view body
+    /// this resolver (and the resolvers it nests for views and attached
+    /// schemas) validates, so a view validated or measured once is not
+    /// re-walked for each enclosing view of a chain.
+    column_view_state: Rc<RefCell<SelectViewValidationState>>,
     named_window_scopes: Vec<&'select [fsqlite_ast::WindowDef]>,
     suppressed_window_relations: HashSet<*const WindowSpec>,
 }
@@ -141458,6 +141807,7 @@ impl<'connection, 'select> SelectRelationResolver<'connection, 'select> {
             scopes: Vec::new(),
             visits: HashMap::new(),
             active_views: HashSet::new(),
+            column_view_state: Rc::new(RefCell::new(SelectViewValidationState::default())),
             named_window_scopes: Vec::new(),
             suppressed_window_relations: HashSet::new(),
         }
@@ -141466,6 +141816,7 @@ impl<'connection, 'select> SelectRelationResolver<'connection, 'select> {
     fn with_active_views(
         connection: &'connection Connection,
         active_views: HashSet<String>,
+        column_view_state: Rc<RefCell<SelectViewValidationState>>,
     ) -> Self {
         Self {
             connection,
@@ -141473,6 +141824,7 @@ impl<'connection, 'select> SelectRelationResolver<'connection, 'select> {
             scopes: Vec::new(),
             visits: HashMap::new(),
             active_views,
+            column_view_state,
             named_window_scopes: Vec::new(),
             suppressed_window_relations: HashSet::new(),
         }
@@ -141482,6 +141834,7 @@ impl<'connection, 'select> SelectRelationResolver<'connection, 'select> {
         connection: &'connection Connection,
         owner_label: String,
         active_views: HashSet<String>,
+        column_view_state: Rc<RefCell<SelectViewValidationState>>,
     ) -> Self {
         Self {
             connection,
@@ -141489,6 +141842,7 @@ impl<'connection, 'select> SelectRelationResolver<'connection, 'select> {
             scopes: Vec::new(),
             visits: HashMap::new(),
             active_views,
+            column_view_state,
             named_window_scopes: Vec::new(),
             suppressed_window_relations: HashSet::new(),
         }
@@ -141988,11 +142342,15 @@ impl<'connection, 'select> SelectRelationResolver<'connection, 'select> {
             }
             for attached_schema in self.attached_schema_names() {
                 let active_views = self.active_views.clone();
+                let column_view_state = Rc::clone(&self.column_view_state);
                 let attached_result =
                     self.connection
                         .with_attached_connection(&attached_schema, |attached| {
-                            let mut resolver =
-                                SelectRelationResolver::with_active_views(attached, active_views);
+                            let mut resolver = SelectRelationResolver::with_active_views(
+                                attached,
+                                active_views,
+                                column_view_state,
+                            );
                             resolver.validate_local_catalog_relation(
                                 &name.name,
                                 PragmaSchemaScope::Main,
@@ -142040,10 +142398,14 @@ impl<'connection, 'select> SelectRelationResolver<'connection, 'select> {
         }
 
         let active_views = self.active_views.clone();
+        let column_view_state = Rc::clone(&self.column_view_state);
         self.connection
             .with_attached_connection(schema_name, |attached| {
-                let mut resolver =
-                    SelectRelationResolver::with_active_views(attached, active_views);
+                let mut resolver = SelectRelationResolver::with_active_views(
+                    attached,
+                    active_views,
+                    column_view_state,
+                );
                 resolver.validate_local_catalog_relation(
                     &name.name,
                     PragmaSchemaScope::Main,
@@ -142104,9 +142466,23 @@ impl<'connection, 'select> SelectRelationResolver<'connection, 'select> {
                 "view {relation_name} is circularly defined"
             )));
         }
+        // bd-5haia: `active_views` holds exactly this view and the views
+        // expanding around it. This pass runs before a statement executes, so
+        // the cap fires here first for every statement that reads views.
+        if self.active_views.len() > MAX_VIEW_NESTING_DEPTH {
+            self.active_views.remove(&view_key);
+            return Err(FrankenError::ViewNestingTooDeep {
+                max: MAX_VIEW_NESTING_DEPTH,
+            });
+        }
         let active_views = self.active_views.clone();
+        let column_view_state = Rc::clone(&self.column_view_state);
         let mut resolver = if view.temporary {
-            SelectRelationResolver::with_active_views(self.connection, active_views)
+            SelectRelationResolver::with_active_views(
+                self.connection,
+                active_views,
+                Rc::clone(&column_view_state),
+            )
         } else {
             SelectRelationResolver::for_persistent_owner(
                 self.connection,
@@ -142114,21 +142490,28 @@ impl<'connection, 'select> SelectRelationResolver<'connection, 'select> {
                     .clone()
                     .unwrap_or_else(|| main_label.to_owned()),
                 active_views,
+                Rc::clone(&column_view_state),
             )
         };
-        let result = resolver.validate_select(&view.query).and_then(|()| {
-            // View expansion is part of SQLite's relation/name-resolution
-            // phase, so a broken referenced view must outrank an enclosing
-            // SELECT's LIMIT/OFFSET diagnostic even when the reference is
-            // nested in a scalar subquery or derived table. Relation-only
-            // traversal is insufficient here: validate the expanded view's
-            // lexical columns before returning to the outer SELECT.
-            let mut query = view.query.clone();
-            if !view.temporary {
-                qualify_persistent_view_relations(&mut query);
-            }
-            self.connection.with_fallback_function_registry(|| {
-                SelectColumnReferenceResolver::new(self.connection).validate_select(&query)
+        let result = with_view_expansion_stack(|| {
+            resolver.validate_select(&view.query).and_then(|()| {
+                // View expansion is part of SQLite's relation/name-resolution
+                // phase, so a broken referenced view must outrank an enclosing
+                // SELECT's LIMIT/OFFSET diagnostic even when the reference is
+                // nested in a scalar subquery or derived table. Relation-only
+                // traversal is insufficient here: validate the expanded view's
+                // lexical columns before returning to the outer SELECT.
+                let mut query = view.query.clone();
+                if !view.temporary {
+                    qualify_persistent_view_relations(&mut query);
+                }
+                self.connection.with_fallback_function_registry(|| {
+                    SelectColumnReferenceResolver::with_view_state(
+                        self.connection,
+                        column_view_state,
+                    )
+                    .validate_select(&query)
+                })
             })
         });
         self.active_views.remove(&view_key);
@@ -142876,6 +143259,15 @@ struct SelectCteValidationKey {
 struct SelectViewValidationState {
     active: HashSet<String>,
     validated: HashSet<String>,
+    /// bd-5haia: result-column metadata of stored views, keyed by
+    /// `{connection:p}:{view index}`. A stored view's columns do not depend on
+    /// where it is referenced, so each view is computed once per validation
+    /// instead of once per reference: a chain of N views would otherwise
+    /// recompute the whole chain below every level it validates.
+    view_column_metadata: HashMap<String, SelectResultColumnMetadata>,
+    /// Stored views whose column metadata is being computed, for the
+    /// circularity and nesting checks of that walk (same keys as above).
+    metadata_active: HashSet<String>,
 }
 
 /// Non-executing lexical column resolver used before scalar/vector subquery
@@ -143412,6 +143804,14 @@ impl<'connection, 'select> SelectColumnReferenceResolver<'connection, 'select> {
                     "view {relation_name} is circularly defined"
                 )));
             }
+            // bd-5haia: `active` is this view plus the views expanding
+            // around it in this resolver.
+            if state.active.len() > MAX_VIEW_NESTING_DEPTH {
+                state.active.remove(&view_key);
+                return Err(FrankenError::ViewNestingTooDeep {
+                    max: MAX_VIEW_NESTING_DEPTH,
+                });
+            }
         }
 
         let mut query = view.query.clone();
@@ -143419,9 +143819,11 @@ impl<'connection, 'select> SelectColumnReferenceResolver<'connection, 'select> {
             qualify_persistent_view_relations(&mut query);
         }
         let view_state = Rc::clone(&self.view_state);
-        let result = self.connection.with_fallback_function_registry(|| {
-            SelectColumnReferenceResolver::with_view_state(self.connection, view_state)
-                .validate_select(&query)
+        let result = with_view_expansion_stack(|| {
+            self.connection.with_fallback_function_registry(|| {
+                SelectColumnReferenceResolver::with_view_state(self.connection, view_state)
+                    .validate_select(&query)
+            })
         });
         let mut state = self.view_state.borrow_mut();
         state.active.remove(&view_key);
@@ -143604,13 +144006,42 @@ impl<'connection, 'select> SelectColumnReferenceResolver<'connection, 'select> {
                 width_is_exact: true,
             });
         }
+        let metadata_key = format!("{:p}:{index}", self.connection);
+        {
+            let mut state = self.view_state.borrow_mut();
+            if let Some(metadata) = state.view_column_metadata.get(&metadata_key) {
+                return Ok(metadata.clone());
+            }
+            if !state.metadata_active.insert(metadata_key.clone()) {
+                return Err(FrankenError::FunctionError(format!(
+                    "view {} is circularly defined",
+                    view.name
+                )));
+            }
+            if state.metadata_active.len() > MAX_VIEW_NESTING_DEPTH {
+                state.metadata_active.remove(&metadata_key);
+                return Err(FrankenError::ViewNestingTooDeep {
+                    max: MAX_VIEW_NESTING_DEPTH,
+                });
+            }
+        }
         let mut query = view.query;
         if !view.temporary {
             qualify_persistent_view_relations(&mut query);
         }
         let view_state = Rc::clone(&self.view_state);
-        SelectColumnReferenceResolver::with_view_state(self.connection, view_state)
-            .metadata_select_column_names(&query)
+        let result = with_view_expansion_stack(|| {
+            SelectColumnReferenceResolver::with_view_state(self.connection, view_state)
+                .metadata_select_column_names(&query)
+        });
+        let mut state = self.view_state.borrow_mut();
+        state.metadata_active.remove(&metadata_key);
+        if let Ok(metadata) = &result {
+            state
+                .view_column_metadata
+                .insert(metadata_key, metadata.clone());
+        }
+        result
     }
 
     fn local_unqualified_relation_exists_for_metadata(&self, relation_name: &str) -> bool {
