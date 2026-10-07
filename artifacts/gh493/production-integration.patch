@@ -1,0 +1,625 @@
+diff --git a/crates/fsqlite-core/src/connection.rs b/crates/fsqlite-core/src/connection.rs
+--- a/crates/fsqlite-core/src/connection.rs
++++ b/crates/fsqlite-core/src/connection.rs
+@@ -34,4 +34,5 @@
+ mod conformal_retry;
++mod cte_storage;
+ mod pragma_maintenance;
+ 
+ use conformal_retry::{ConformalRetryBudget, ConformalRetryBudgetCell};
+@@ -1000,4 +1001,8 @@
+     /// roots or advance the ordinary MemDatabase root allocator.
+     next_temp_root_page: Cell<i32>,
++    /// Materialized statement bindings, not persistent TEMP-catalog objects.
++    statement_memdb_roots: RefCell<HashSet<i32>>,
++    /// Inherited only for the lifetime of a bounded WITH operation.
++    pager_backed_cte_scope: Cell<bool>,
+     /// bd-wjrs0: `main` tables currently shadowed by a same-named `TEMP` table,
+     /// keyed by lowercased name. Kept out of `schema` so unqualified references
+@@ -2000,5 +2005,7 @@
+             schema_by_name: RefCell::new(HashMap::new()),
+             temp_table_names: RefCell::new(HashSet::new()),
+             next_temp_root_page: Cell::new(TEMP_MEMDB_ROOT_START),
++            statement_memdb_roots: RefCell::new(HashSet::new()),
++            pager_backed_cte_scope: Cell::new(false),
+             shadowed_main_tables: RefCell::new(HashMap::new()),
+             views: RefCell::new(Vec::new()),
+@@ -3000,5 +3007,7 @@
+             schema_by_name: RefCell::new(HashMap::new()),
+             temp_table_names: RefCell::new(HashSet::new()),
+             next_temp_root_page: Cell::new(TEMP_MEMDB_ROOT_START),
++            statement_memdb_roots: RefCell::new(HashSet::new()),
++            pager_backed_cte_scope: Cell::new(false),
+             shadowed_main_tables: RefCell::new(HashMap::new()),
+             views: RefCell::new(Vec::new()),
+@@ -19800,5 +19809,10 @@
+             &conn.inherited_recursive_program_depth,
+             self.active_recursive_program_depth(),
+         );
++        let _cte_scope = self
++            .pager_backed_cte_scope
++            .get()
++            .then(|| conn.enter_pager_backed_cte_scope(true))
++            .flatten();
+         f(conn.as_ref()).await
+     }
+@@ -24000,6 +24014,6 @@
+     #[inline]
+     fn defer_memdb_row_hydration(&self) -> bool {
+-        self.schema_only_open
++        self.schema_only_open || self.pager_backed_cte_scope.get()
+     }
+ 
+     #[inline]
+@@ -65000,9 +65014,13 @@
+-            if autoincrement_tables.contains(&table_name_key) {
+-                autoincrement_table_name_by_root_page
+-                    .insert(table.root_page, table_name_key.clone());
+-            }
+-            if let Some(&alias_idx) = rowid_alias_columns.get(&table_name_key) {
+-                rowid_alias_col_by_root_page.insert(table.root_page, alias_idx);
++            // A materialized result can shadow a persistent IPK table by name.
++            // Its cells are result values, not the base table's rowid aliases.
++            if !self.is_statement_memdb_root(table.root_page) {
++                if autoincrement_tables.contains(&table_name_key) {
++                    autoincrement_table_name_by_root_page
++                        .insert(table.root_page, table_name_key.clone());
++                }
++                if let Some(&alias_idx) = rowid_alias_columns.get(&table_name_key) {
++                    rowid_alias_col_by_root_page.insert(table.root_page, alias_idx);
++                }
+             }
+             table_column_count_by_root_page.insert(table.root_page, table.columns.len());
+             if let Some((col_idx, _)) = table
+@@ -73125,4 +73143,8 @@
+-                    let root_page = self.db.borrow_mut().create_table(col_infos.len());
++                    let root_page = if self.pager_backed_cte_scope.get() {
++                        self.allocate_statement_memdb_root(col_infos.len()).await?
++                    } else {
++                        self.db.borrow_mut().create_table(col_infos.len())
++                    };
+                     self.schema.borrow_mut().push(TableSchema {
+                         name: materialized_name.clone(),
+                         root_page,
+@@ -73240,12 +73262,18 @@
+             let virtual_columns = sqlite_master_column_infos();
+             let mut materialized = MaterializedTablesCleanupGuard::new(self);
+ 
+-            self.reserve_clean_memdb_root_pages(referenced.len())
+-                .await?;
++            if !self.pager_backed_cte_scope.get() {
++                self.reserve_clean_memdb_root_pages(referenced.len())
++                    .await?;
++            }
+ 
+             for (table_name, is_temp) in referenced {
+                 let virtual_rows = if is_temp { &temp_rows } else { &main_rows };
+-                let root_page = self.db.borrow_mut().create_table(virtual_columns.len());
++                let root_page = if self.pager_backed_cte_scope.get() {
++                    self.allocate_statement_memdb_root(virtual_columns.len()).await?
++                } else {
++                    self.db.borrow_mut().create_table(virtual_columns.len())
++                };
+                 self.schema.borrow_mut().push(TableSchema {
+                     name: table_name.clone(),
+                     root_page,
+@@ -73310,6 +73338,9 @@
+                 // (MemDatabase), where the virtual rows were freshly inserted,
+                 // rather than calling through the pager and potentially seeing
+                 // stale recycled pages.
+-                let _time_travel_guard = BoolCellRestoreGuard::new(&self.time_travel_active, true);
++                // In bounded WITH execution only the registered local roots
++                // are authoritative in memory; persistent roots use the pager.
++                let _time_travel_guard = (!self.pager_backed_cte_scope.get())
++                    .then(|| BoolCellRestoreGuard::new(&self.time_travel_active, true));
+                 async {
+                     let rewritten = self.rewrite_in_subqueries_select(select, params).await?;
+@@ -73510,5 +73541,6 @@
+             .filter(|table| {
+                 !is_sqlite_schema_name(&table.name)
++                    && !self.is_statement_memdb_root(table.root_page)
+                     && !temp_table_names.contains(&table.name.to_ascii_lowercase())
+             })
+             .chain(shadowed_main_tables.values())
+@@ -73630,5 +73662,6 @@
+         for table in schema.iter() {
+             if is_sqlite_schema_name(&table.name)
++                || self.is_statement_memdb_root(table.root_page)
+                 || !temp_table_names.contains(&table.name.to_ascii_lowercase())
+             {
+                 continue;
+@@ -73800,6 +73833,10 @@
+         let implicit_agg = select.body.compounds.is_empty()
+             && self.has_implicit_aggregation_with_registry(select)
+             && !has_group_by(select);
+-        let _time_travel_guard = BoolCellRestoreGuard::new(&self.time_travel_active, true);
++        // A CTE frontier is not a whole-database snapshot. Keep actual time
++        // travel unchanged, but do not make unloaded persistent placeholders
++        // authoritative merely because one source was materialized.
++        let _time_travel_guard = (!self.pager_backed_cte_scope.get())
++            .then(|| BoolCellRestoreGuard::new(&self.time_travel_active, true));
+         if self.select_requires_grouped_window_pipeline(select) {
+             self.execute_group_by_window_select(&cx, &bound, None).await
+@@ -82500,5 +82537,6 @@
+     fn snapshot_temp_tables(&self) -> Vec<CapturedTempTable> {
++        let statement_tables = self.snapshot_statement_memdb_roots();
+         if self.temp_table_names.borrow().is_empty() {
+-            return Vec::new();
++            return statement_tables;
+         }
+         let temp_names = self.temp_table_names.borrow();
+@@ -82510,8 +82548,11 @@
+         temp_names
+             .iter()
+             .filter_map(|name_lc| {
+                 let table = schema
+                     .iter()
+-                    .find(|t| t.name.eq_ignore_ascii_case(name_lc))?;
++                    .find(|table| {
++                        table.name.eq_ignore_ascii_case(name_lc)
++                            && !self.is_statement_memdb_root(table.root_page)
++                    })?;
+                 let rows = db.get_table(table.root_page).map_or_else(Vec::new, |mt| {
+                     mt.iter_rows()
+@@ -82525,4 +82566,5 @@
+                 Some((table.clone(), rows))
+             })
++            .chain(statement_tables)
+             .collect()
+     }
+@@ -82540,5 +82582,17 @@
+         captured: Vec<CapturedTempTable>,
+     ) {
+         for (temp_schema, rows) in captured {
++            if self.is_statement_memdb_root(temp_schema.root_page) {
++                let ordinary_next_root = new_db.next_root_page();
++                new_db.create_table_at(temp_schema.root_page, temp_schema.columns.len());
++                new_db.set_next_root_page(ordinary_next_root);
++                for (rowid, values) in rows {
++                    new_db.upsert_row(temp_schema.root_page, rowid, values);
++                }
++                // Prepend in captured reverse order. Do not park the real
++                // same-named table or acquire its TEMP-catalog marker.
++                new_schema.insert(0, temp_schema);
++                continue;
++            }
+             let name_lc = temp_schema.name.to_ascii_lowercase();
+             // If the rebuild re-materialized a same-named main table, park it so
+@@ -83250,9 +83304,9 @@
+     fn temp_storage_roots(&self) -> HashSet<i32> {
++        let mut roots = self.statement_memdb_roots.borrow().clone();
+         let temp_names = self.temp_table_names.borrow();
+         if temp_names.is_empty() {
+-            return HashSet::new();
++            return roots;
+         }
+         let schema = self.schema.borrow();
+-        let mut roots = HashSet::new();
+         for table in schema
+             .iter()
+@@ -90955,6 +91009,10 @@
+             .iter()
+             .find(|table| table.name.eq_ignore_ascii_case(&binding_name.name))
+             .cloned()?;
+-        let rowid_alias_column_index = self.rowid_alias_columns.borrow().get(&name_lc).copied();
++        let rowid_alias_column_index = if self.is_statement_memdb_root(table.root_page) {
++            None
++        } else {
++            self.rowid_alias_columns.borrow().get(&name_lc).copied()
++        };
+         Some((table, rowid_alias_column_index))
+     }
+@@ -90975,10 +91033,10 @@
+         src: &JoinTableSource,
+     ) -> Option<Vec<Vec<SqliteValue>>> {
+-        if !self.join_mem_scan_safe() {
+-            return None;
+-        }
+         let binding_name = src.local_table_binding()?;
+         let (table_schema, rowid_alias_column_index) =
+             self.local_join_binding_table(binding_name)?;
+         let root_page = table_schema.root_page;
++        if !self.is_connection_local_row_root(root_page) && !self.join_mem_scan_safe() {
++            return None;
++        }
+         // GH#227: VIRTUAL generated columns are stored as a NULL placeholder in
+@@ -91045,5 +91103,8 @@
+         let (table_schema, rowid_alias_column_index) =
+             self.local_join_binding_table(binding_name)?;
+         let root_page_num = table_schema.root_page;
++        if self.is_connection_local_row_root(root_page_num) {
++            return None;
++        }
+         let cx = &self.root_cx;
+         let result: Result<Vec<Vec<SqliteValue>>> = async {
+@@ -91140,6 +91201,14 @@
+         let Some(outer_binding) = outer_src.local_table_binding().cloned() else {
+             refuse("outer table not a local binding");
+             return Ok(None);
+         };
++        if self.local_join_binding_table(&outer_binding).is_some_and(|(table, _)| {
++            self.is_connection_local_row_root(table.root_page)
++        }) {
++            // A computed CTE column is not the IPK of a same-named base
++            // table. Let the generic per-root scan apply ORDER BY and LIMIT.
++            refuse("outer table is a connection-local materialization");
++            return Ok(None);
++        }
+         if inner_src.local_table_binding().is_none() {
+             refuse("inner table not a local binding");
+@@ -93820,6 +93889,7 @@
+     async fn execute_with_ctes(
+         &self,
+         select: &SelectStatement,
+         params: Option<&[SqliteValue]>,
+     ) -> Result<Vec<Row>> {
++        let _cte_scope = self.enter_pager_backed_cte_scope(false);
+         // bd-gh-cte-materialization-hints-sn0yh / GH#204: a NOT MATERIALIZED
+@@ -93900,3 +93970,11 @@
+-                // T1.5: the stripped query references ONLY the attached
++                if self.pager_backed_cte_scope.get() {
++                    strip_attached_schema_from_select(&mut stripped, &target_schema);
++                    return self
++                        .with_attached_connection_async(&target_schema, async move |conn| {
++                            conn.execute_statement(&Statement::Select(stripped), params).await
++                        })
++                        .await;
++                }
++                // T1.5: the stripped query references ONLY the attached
+                 // schema (proved by the branch above returning false).
+                 // The previous code materialized the main-schema CTEs and
+@@ -95200,6 +95278,7 @@
+     async fn execute_delete_with_ctes(
+         &self,
+         delete: &fsqlite_ast::DeleteStatement,
+         params: Option<&[SqliteValue]>,
+     ) -> Result<Vec<Row>> {
++        let _cte_scope = self.enter_pager_backed_cte_scope(false);
+         if let Some(target_schema) = self.attached_target_schema(&delete.table.name)? {
+@@ -95260,6 +95339,7 @@
+     async fn execute_update_with_ctes(
+         &self,
+         update: &fsqlite_ast::UpdateStatement,
+         params: Option<&[SqliteValue]>,
+     ) -> Result<Vec<Row>> {
++        let _cte_scope = self.enter_pager_backed_cte_scope(false);
+         if let Some(target_schema) = self.attached_target_schema(&update.table.name)? {
+@@ -95350,6 +95430,7 @@
+     async fn execute_insert_with_ctes(
+         &self,
+         insert: &fsqlite_ast::InsertStatement,
+         params: Option<&[SqliteValue]>,
+     ) -> Result<Vec<Row>> {
++        let _cte_scope = self.enter_pager_backed_cte_scope(false);
+         if let Some(target_schema) = self.attached_target_schema(&insert.table)? {
+@@ -95480,6 +95561,6 @@
+         let _compiled_cache_guard = BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true);
+-        // Recursive fallback joins read their working table from MemDatabase.
+-        // Hydrate persistent rows before installing any CTE roots so a mixed
+-        // persistent/working-table join uses one complete execution image.
++        // Settle pending writes and refresh schema in the active snapshot.
++        // A bounded WITH scope suppresses persistent-row hydration; only
++        // registered statement-local roots are authoritative in MemDatabase.
+         let op_cx = self.op_cx_after_background_status();
+         self.refresh_memdb_from_active_txn_if_dirty(&op_cx).await?;
+@@ -95500,6 +95581,5 @@
+             let schema = self.schema.borrow().clone();
+             CteResultMetadataResolver::new(self, &schema).resolve_with_clause(with_clause)
+         };
+-        self.reserve_clean_memdb_root_pages(ctes.len()).await?;
+         for cte_index in materialization_order {
+             let cte = &ctes[cte_index];
+@@ -95590,5 +95670,5 @@
+                     .collect();
+                 let num_columns = col_infos.len();
+-                let root_page = self.db.borrow_mut().create_table(num_columns);
++                let root_page = self.allocate_statement_memdb_root(num_columns).await?;
+                 self.schema.borrow_mut().insert(
+                     0,
+@@ -95630,6 +95710,7 @@
+     async fn materialize_with_clause_snapshot(
+         &self,
+         with: Option<&fsqlite_ast::WithClause>,
+         params: Option<&[SqliteValue]>,
+     ) -> Result<Vec<MaterializedTempTable>> {
++        let _cte_scope = self.enter_pager_backed_cte_scope(false);
+         let _mem_fallback_guard = self.disable_mem_fallback_rejection_for_internal_scope(
+@@ -95700,11 +95781,11 @@
+     async fn install_materialized_temp_tables(
+         &self,
+         temp_tables: &[MaterializedTempTable],
+     ) -> Result<Vec<(String, i32)>> {
+-        self.reserve_clean_memdb_root_pages(temp_tables.len())
+-            .await?;
+-        let mut installed = Vec::with_capacity(temp_tables.len());
++        let mut installed = MaterializedTablesCleanupGuard::new(self);
+         for temp_table in temp_tables {
+-            let root_page = self.db.borrow_mut().create_table(temp_table.columns.len());
++            let root_page = self
++                .allocate_statement_memdb_root(temp_table.columns.len())
++                .await?;
+             self.schema.borrow_mut().insert(
+                 0,
+@@ -95720,5 +95801,5 @@
+             );
+             self.rebuild_schema_indices();
+-            installed.push((temp_table.name.clone(), root_page));
++            installed.tables.push((temp_table.name.clone(), root_page));
+             let mut db = self.db.borrow_mut();
+             if let Some(table) = db.get_table_mut(root_page) {
+@@ -95730,4 +95811,4 @@
+-        Ok(installed)
++        Ok(std::mem::take(&mut installed.tables))
+     }
+ 
+     async fn execute_statement_with_materialized_temp_tables(
+@@ -95740,8 +95821,20 @@
+         temp_tables: &[MaterializedTempTable],
+         params: Option<&[SqliteValue]>,
+     ) -> Result<Vec<Row>> {
++        let _cte_scope = self.enter_pager_backed_cte_scope(false);
+         let _mem_fallback_guard = self.disable_mem_fallback_rejection_for_internal_scope(
+             "statement",
+             "materialized_temp_table_execution",
+         )?;
++        if self.pager_backed_cte_scope.get() {
++            let installed = self.install_materialized_temp_tables(temp_tables).await?;
++            let _installed_guard = MaterializedTablesCleanupGuard::from_tables(self, installed);
++            let _compiled_cache_guard =
++                BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true);
++            // The ordinary dispatcher owns retained-write settlement and the
++            // active read/write snapshot. Schema refresh now preserves our
++            // registered local roots, so do not replace it with a global
++            // pager reload or suppress its normal refresh/transaction rules.
++            return self.execute_statement(statement, params).await;
++        }
+         let op_cx = self.op_cx_after_background_status();
+@@ -95800,5 +95893,11 @@
+     fn cleanup_cte_tables(&self, temp_tables: &[(String, i32)]) {
+         let mut any_removed = false;
+         for (name, root_page) in temp_tables {
++            let statement_owned = self.statement_memdb_roots.borrow_mut().remove(root_page);
++            // Even if a rolled-back schema snapshot already removed the
++            // binding, release a root owned by this materialization scope.
++            if statement_owned {
++                self.db.borrow_mut().destroy_table(*root_page);
++            }
+             let mut schema = self.schema.borrow_mut();
+             if let Some(idx) = schema
+@@ -95820,4 +95919,6 @@
+                 schema.remove(idx);
+                 drop(schema);
+-                self.db.borrow_mut().destroy_table(*root_page);
++                if !statement_owned {
++                    self.db.borrow_mut().destroy_table(*root_page);
++                }
+                 // CTE materialization never owns the persistent TEMP-catalog
+@@ -95924,9 +96025,9 @@
+                 conflict_action: None,
+             })
+             .collect();
+         let num_columns = col_infos.len();
+-        let root_page = self.db.borrow_mut().create_table(num_columns);
++        let root_page = self.allocate_statement_memdb_root(num_columns).await?;
+         self.schema.borrow_mut().insert(
+             0,
+             TableSchema {
+                 name: cte_name.clone(),
+diff --git a/crates/fsqlite-core/src/connection/cte_storage.rs b/crates/fsqlite-core/src/connection/cte_storage.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/fsqlite-core/src/connection/cte_storage.rs
+@@ -0,0 +1,139 @@
++//! Pager-backed WITH execution and ownership of statement-local CTE roots.
++//!
++//! CTE bindings are not TEMP-catalog objects. Root ownership, rather than a
++//! table name or an ambient time-travel flag, decides which rows live in memory.
++
++use super::{
++    BoolCellRestoreGuard, CapturedTempTable, Connection, MemdbRowHydrationSuppression,
++    Result,
++};
++
++/// Both guards are connection-local and unwind when an async operation is
++/// dropped. Nested WITH clauses and delegation restore the prior policy.
++pub(super) struct PagerBackedCteScope<'a> {
++    _policy: BoolCellRestoreGuard<'a>,
++    _hydration: MemdbRowHydrationSuppression<'a>,
++}
++
++impl Connection {
++    pub(super) fn enter_pager_backed_cte_scope(
++        &self,
++        inherited: bool,
++    ) -> Option<PagerBackedCteScope<'_>> {
++        if !self.pager.is_file_backed()
++            || self.time_travel_active.get()
++            || !(inherited || self.schema_only_open || self.pager_backed_cte_scope.get())
++        {
++            return None;
++        }
++        Some(PagerBackedCteScope {
++            _policy: BoolCellRestoreGuard::new(&self.pager_backed_cte_scope, true),
++            _hydration: self.suppress_memdb_row_hydration(),
++        })
++    }
++
++    /// Use the existing high, descending MemDatabase-only namespace. In
++    /// particular, never probe or allocate a root in the main database merely
++    /// to hold a CTE frontier. Do not add the binding to temp_table_names.
++    pub(super) async fn allocate_statement_memdb_root(&self, columns: usize) -> Result<i32> {
++        let root = self.allocate_schema_table_root(true, columns, false).await?;
++        self.statement_memdb_roots.borrow_mut().insert(root);
++        Ok(root)
++    }
++
++    pub(super) fn is_statement_memdb_root(&self, root: i32) -> bool {
++        self.statement_memdb_roots.borrow().contains(&root)
++    }
++
++    /// Whether a specific root, independently of the persistent mirror's
++    /// validity, is an authoritative connection-local row source.
++    pub(super) fn is_connection_local_row_root(&self, root: i32) -> bool {
++        if self.is_statement_memdb_root(root) {
++            return true;
++        }
++        let temp_names = self.temp_table_names.borrow();
++        if temp_names.is_empty() {
++            return false;
++        }
++        self.schema.borrow().iter().any(|table| {
++            table.root_page == root
++                && temp_names.contains(&table.name.to_ascii_lowercase())
++        })
++    }
++
++    /// A full schema refresh must preserve materialized CTEs, just as it
++    /// preserves TEMP tables, but must not give a CTE TEMP-catalog ownership.
++    /// Capture reverse binding order: restoration prepends each CTE, restoring
++    /// nested and sibling shadowing in the same order as the live schema.
++    pub(super) fn snapshot_statement_memdb_roots(&self) -> Vec<CapturedTempTable> {
++        let roots = self.statement_memdb_roots.borrow();
++        if roots.is_empty() {
++            return Vec::new();
++        }
++        let schema = self.schema.borrow();
++        let db = self.db.borrow();
++        schema
++            .iter()
++            .rev()
++            .filter(|table| roots.contains(&table.root_page))
++            .map(|table| {
++                let rows = db.get_table(table.root_page).map_or_else(Vec::new, |rows| {
++                    rows.iter_rows()
++                        .map(|(rowid, values)| (rowid, values.to_vec()))
++                        .collect()
++                });
++                (table.clone(), rows)
++            })
++            .collect()
++    }
++}
++
++#[cfg(all(test, feature = "native"))]
++mod tests {
++    use super::Connection;
++    use crate::connection::Row;
++    use fsqlite_types::value::SqliteValue;
++
++    #[test]
++    fn bounded_cte_delegation_preserves_child_policy_and_zero_hydration() {
++        asupersync::test_utils::run_test(|| async {
++            let dir = tempfile::tempdir().unwrap();
++            let main_path = dir.path().join("main.db");
++            let aux_path = dir.path().join("aux.db");
++            {
++                let main = rusqlite::Connection::open(&main_path).unwrap();
++                main.execute_batch("CREATE TABLE anchor(x INTEGER)").unwrap();
++                let mut aux = rusqlite::Connection::open(&aux_path).unwrap();
++                aux.execute_batch("CREATE TABLE bulk(id INTEGER PRIMARY KEY, body TEXT); CREATE TABLE hot(id TEXT PRIMARY KEY, v INTEGER); INSERT INTO hot VALUES ('k042',42)").unwrap();
++                let tx = aux.transaction().unwrap();
++                {
++                    let body = "x".repeat(2048);
++                    let mut stmt = tx.prepare("INSERT INTO bulk VALUES (?1,?2)").unwrap();
++                    for id in 0..4096 {
++                        stmt.execute(rusqlite::params![id, &body]).unwrap();
++                    }
++                }
++                tx.commit().unwrap();
++            }
++            let conn = Connection::open_existing_schema_only(main_path.to_string_lossy().as_ref()).await.unwrap();
++            conn.execute(&format!("ATTACH '{}' AS aux", aux_path.to_string_lossy().replace('\'', "''"))).await.unwrap();
++            let before = conn.with_attached_connection("aux", |child| {
++                Ok((child.memdb_row_hydration_count(), child.schema_only_open,
++                    child.pager_backed_cte_scope.get(), child.memdb_row_hydration_suppressed.get()))
++            }).unwrap();
++            let rows: Vec<Row> = conn.query("WITH c(k) AS (VALUES ('k042')) SELECT c.k,t.v FROM c JOIN aux.hot t ON t.id=c.k").await.unwrap();
++            assert_eq!(rows.len(), 1);
++            assert_eq!(rows[0].values(), &[SqliteValue::Text("k042".into()), SqliteValue::Integer(42)]);
++            assert!(conn.query("WITH c(k) AS (VALUES ('k042')) SELECT abs(-9223372036854775808) FROM c JOIN aux.hot t ON t.id=c.k").await.is_err());
++            let after = conn.with_attached_connection("aux", |child| {
++                Ok((child.memdb_row_hydration_count(), child.schema_only_open,
++                    child.pager_backed_cte_scope.get(), child.memdb_row_hydration_suppressed.get()))
++            }).unwrap();
++            assert_eq!(after, before, "delegation must neither hydrate the child's bulk nor leak bounded policy");
++            assert!(conn.statement_memdb_roots.borrow().is_empty());
++            assert!(!conn.pager_backed_cte_scope.get());
++            assert_eq!(conn.memdb_row_hydration_suppressed.get(), 0);
++            conn.close_without_checkpoint().await.unwrap();
++        });
++    }
++}
+diff --git a/crates/fsqlite-core/tests/gh493_schema_only_contract.rs b/crates/fsqlite-core/tests/gh493_schema_only_contract.rs
+--- a/crates/fsqlite-core/tests/gh493_schema_only_contract.rs
++++ b/crates/fsqlite-core/tests/gh493_schema_only_contract.rs
+@@ -278,4 +278,70 @@
+         assert_bounded(&conn, "after strict refusal");
+         conn.close_without_checkpoint().await.unwrap();
+     });
+ }
++
++#[test]
++fn schema_only_cte_runtime_metadata_and_view_roots_match_stock() {
++    const CASES: &[&str] = &[
++        "WITH c(x) AS MATERIALIZED (VALUES (7)) SELECT c.x, (SELECT count(*) FROM sqlite_master WHERE name='c') FROM c",
++        "WITH nodes(id,parent,label) AS MATERIALIZED (SELECT id+100,parent,label FROM main.nodes) SELECT id FROM nodes ORDER BY id",
++        "WITH nodes(id,parent,label) AS MATERIALIZED (SELECT id+100,parent,label FROM main.nodes) SELECT sum(id),count(*) FROM nodes",
++        "WITH nodes(id,parent,label) AS MATERIALIZED (SELECT id+100,parent,label FROM main.nodes) SELECT n.id,b.v FROM nodes n JOIN b ON b.v=n.id-101 WHERE n.id>100 ORDER BY n.id LIMIT 2",
++        "WITH c AS MATERIALIZED (SELECT g,s FROM grouped) SELECT c.g,c.s+b.v FROM c JOIN b ON b.v=2*c.g ORDER BY c.g",
++    ];
++    asupersync::test_utils::run_test(|| async {
++        let dir = tempfile::tempdir().unwrap();
++        let path = dir.path().join("cte-namespace.db");
++        seed(&path);
++        {
++            let stock = rusqlite::Connection::open(&path).unwrap();
++            stock.execute_batch(
++                "CREATE VIEW grouped AS SELECT v%2 AS g,sum(v) AS s FROM a GROUP BY v%2",
++            ).unwrap();
++        }
++        let expected: Vec<_> = CASES.iter().map(|sql| stock_query(&path, sql)).collect();
++        for (sql, expected) in CASES.iter().zip(expected) {
++            let conn = Connection::open_existing_schema_only(
++                path.to_string_lossy().as_ref(),
++            ).await.unwrap();
++            assert_eq!(query(&conn, sql).await, expected, "direct: {sql}");
++            {
++                let prepared = conn.prepare(sql).await.unwrap();
++                for _ in 0..2 {
++                    let rows = prepared.query_with_params(&[]).await.unwrap();
++                    let values: Vec<_> = rows.iter().map(|row| row.values().to_vec()).collect();
++                    assert_eq!(values, expected, "prepared: {sql}");
++                    assert_bounded(&conn, sql);
++                }
++            }
++            assert_bounded(&conn, sql);
++            conn.close_without_checkpoint().await.unwrap();
++        }
++    });
++}
++
++#[test]
++fn schema_only_cte_shadow_is_not_an_extra_temp_catalog_object() {
++    asupersync::test_utils::run_test(|| async {
++        let dir = tempfile::tempdir().unwrap();
++        let path = dir.path().join("cte-temp-catalog.db");
++        seed(&path);
++        let conn = Connection::open_existing_schema_only(
++            path.to_string_lossy().as_ref(),
++        ).await.unwrap();
++        conn.execute("CREATE TEMP TABLE c(x INTEGER)").await.unwrap();
++        conn.execute("INSERT INTO temp.c VALUES (41)").await.unwrap();
++        let sql = "WITH c(x) AS MATERIALIZED (VALUES (7)) SELECT c.x, \
++            (SELECT count(*) FROM sqlite_temp_master WHERE name='c'), \
++            (SELECT count(*) FROM sqlite_master WHERE name='c') FROM c";
++        for _ in 0..2 {
++            assert_eq!(query(&conn, sql).await, vec![vec![
++                SqliteValue::Integer(7), SqliteValue::Integer(1), SqliteValue::Integer(0),
++            ]]);
++            assert_eq!(query(&conn, "SELECT x FROM temp.c").await,
++                vec![vec![SqliteValue::Integer(41)]]);
++            assert_bounded(&conn, "catalog enumeration and real TEMP shadow cleanup");
++        }
++        conn.close_without_checkpoint().await.unwrap();
++    });
++}
