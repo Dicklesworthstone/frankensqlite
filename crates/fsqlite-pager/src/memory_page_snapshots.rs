@@ -11,8 +11,11 @@
 //! reads walk at most eight directory levels. Native/file-backed and WAL
 //! protocols are deliberately not intercepted by this memory-only owner.
 //!
-//! This API does not by itself change Connection's SQL COMMIT path. That caller
-//! must adopt the owner and use these images instead of its flat page vector.
+//! The transaction implements the sealed `TransactionHandle` used by storage
+//! cursors. Even generic commit/rollback calls stay inside the history owner;
+//! no mutable reference to its underlying transaction can escape. This API
+//! does not by itself change Connection's SQL COMMIT path. That caller must
+//! adopt the owner and use these images instead of its flat page vector.
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
@@ -179,10 +182,13 @@ struct CommitAttempt {
 
 /// Exclusive access to this history owner for one real pager transaction.
 ///
-/// Use `transaction_mut` for ordinary B-tree/page operations and savepoints.
-/// Use this wrapper's commit/rollback methods for finalization. Dropping the
-/// wrapper leaves cleanup to the original pager handle, never an invented
-/// rollback protocol. An interrupted commit invalidates cached image reuse.
+/// Implements the same sealed `TransactionHandle` as an ordinary pager handle,
+/// so generic storage cursors cannot bypass history at finalization. The
+/// inherent commit/settlement methods additionally return the capture outcome;
+/// the trait methods report physical transaction outcomes and log a failed
+/// history capture without turning an already committed write into an error.
+/// Dropping this wrapper leaves cleanup to the original pager handle, never an
+/// invented rollback protocol. An interrupted commit invalidates image reuse.
 pub struct MemorySnapshotTransaction<'a> {
     owner: &'a mut MemoryPageSnapshots,
     inner: SimpleTransaction<MemoryVfs>,
@@ -196,12 +202,30 @@ impl MemorySnapshotTransaction<'_> {
         self.base.capture
     }
 
-    /// No mutation handoff while a commit attempt needs reconciliation.
-    pub fn transaction_mut(&mut self) -> Result<&mut SimpleTransaction<MemoryVfs>> {
+    fn ensure_editable(&self) -> Result<()> {
         if self.finished || self.attempt.is_some() {
             return Err(FrankenError::BusyRecovery);
         }
-        Ok(&mut self.inner)
+        Ok(())
+    }
+
+    /// Borrow the guarded transaction for generic storage code. This is NOT a
+    /// raw pager handle: its commit, retain and rollback entry points also go
+    /// through the snapshot owner. Each mutator rechecks the guard, including
+    /// when a caller retains this borrow across finalization.
+    ///
+    /// ```compile_fail
+    /// use fsqlite_pager::{MemorySnapshotTransaction, SimpleTransaction};
+    /// use fsqlite_vfs::MemoryVfs;
+    /// fn escape<'a, 'owner>(
+    ///     transaction: &'a mut MemorySnapshotTransaction<'owner>,
+    /// ) -> &'a mut SimpleTransaction<MemoryVfs> {
+    ///     transaction.transaction_mut().unwrap()
+    /// }
+    /// ```
+    pub fn transaction_mut(&mut self) -> Result<&mut Self> {
+        self.ensure_editable()?;
+        Ok(self)
     }
 
     pub fn pager_commit_state(&self) -> PagerCommitState {
@@ -211,9 +235,7 @@ impl MemorySnapshotTransaction<'_> {
     /// Commit once, then capture history. An error requires inspecting or
     /// settling this same handle; it is not permission to repeat the write.
     pub async fn commit(&mut self, cx: &Cx) -> Result<MemorySnapshotCommit> {
-        if self.finished || self.attempt.is_some() {
-            return Err(FrankenError::BusyRecovery);
-        }
+        self.ensure_editable()?;
         if self.owner.pager.journal_mode() != JournalMode::Delete {
             return Err(FrankenError::Unsupported);
         }
@@ -321,6 +343,203 @@ impl MemorySnapshotTransaction<'_> {
             }
             Err(error) => MemorySnapshotCommit::CaptureFailed(error),
         }
+    }
+}
+
+impl crate::traits::sealed::Sealed for MemorySnapshotTransaction<'_> {}
+
+impl TransactionHandle for MemorySnapshotTransaction<'_> {
+    async fn get_page<'a>(&'a self, cx: &'a Cx, page: PageNumber) -> Result<PageData> {
+        self.ensure_editable()?;
+        self.inner.get_page(cx, page).await
+    }
+
+    fn prefetch_page_hint(&self, cx: &Cx, page: PageNumber) {
+        if self.ensure_editable().is_ok() {
+            self.inner.prefetch_page_hint(cx, page);
+        }
+    }
+
+    fn forget_cached_page(&self, page: PageNumber) {
+        if self.ensure_editable().is_ok() {
+            self.inner.forget_cached_page(page);
+        }
+    }
+
+    async fn write_page<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        page: PageNumber,
+        data: &'a [u8],
+    ) -> Result<()> {
+        self.ensure_editable()?;
+        self.inner.write_page(cx, page, data).await
+    }
+
+    async fn write_page_data<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        page: PageNumber,
+        data: PageData,
+    ) -> Result<()> {
+        self.ensure_editable()?;
+        self.inner.write_page_data(cx, page, data).await
+    }
+
+    fn try_take_staged_page_data(&mut self, page: PageNumber) -> Option<PageData> {
+        self.ensure_editable().ok()?;
+        self.inner.try_take_staged_page_data(page)
+    }
+
+    fn try_mutate_staged_page_data(
+        &mut self,
+        page: PageNumber,
+        mutate: &mut dyn FnMut(&mut PageData),
+    ) -> bool {
+        self.ensure_editable().is_ok()
+            && self.inner.try_mutate_staged_page_data(page, mutate)
+    }
+
+    async fn restore_staged_page_data<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        page: PageNumber,
+        data: PageData,
+    ) -> Result<()> {
+        self.ensure_editable()?;
+        self.inner.restore_staged_page_data(cx, page, data).await
+    }
+
+    async fn allocate_page<'a>(&'a mut self, cx: &'a Cx) -> Result<PageNumber> {
+        self.ensure_editable()?;
+        self.inner.allocate_page(cx).await
+    }
+
+    async fn free_page<'a>(&'a mut self, cx: &'a Cx, page: PageNumber) -> Result<()> {
+        self.ensure_editable()?;
+        self.inner.free_page(cx, page).await
+    }
+
+    async fn commit<'a>(&'a mut self, cx: &'a Cx) -> Result<()> {
+        report_trait_capture(MemorySnapshotTransaction::commit(self, cx).await?);
+        Ok(())
+    }
+
+    fn pager_commit_state(&self) -> PagerCommitState {
+        self.inner.pager_commit_state()
+    }
+
+    async fn settle_commit<'a>(&'a mut self, cx: &'a Cx) -> Result<PagerCommitState> {
+        if self.finished {
+            return Ok(self.inner.pager_commit_state());
+        }
+        match MemorySnapshotTransaction::settle_commit(self, cx).await? {
+            MemorySnapshotSettlement::NotCommitted => Ok(PagerCommitState::NotCommitted),
+            MemorySnapshotSettlement::Pending(state) => Ok(state),
+            MemorySnapshotSettlement::Committed(outcome) => {
+                report_trait_capture(outcome);
+                Ok(PagerCommitState::Committed)
+            }
+        }
+    }
+
+    async fn commit_and_retain<'a>(&'a mut self, cx: &'a Cx) -> Result<bool> {
+        // The retained memory overlay is not necessarily readable through a
+        // separate pager reader. Use the trait's documented non-retaining
+        // fallback until that protocol can supply an exact captured image.
+        // Never delegate directly and silently lose a committed generation.
+        TransactionHandle::commit(self, cx).await?;
+        Ok(false)
+    }
+
+    fn is_writer(&self) -> bool {
+        self.inner.is_writer()
+    }
+
+    fn has_pending_writes(&self) -> bool {
+        self.inner.has_pending_writes()
+    }
+
+    fn published_visible_commit_seq_hint(&self) -> Option<CommitSeq> {
+        self.inner.published_visible_commit_seq_hint()
+    }
+
+    fn pending_commit_pages(&self) -> Result<Vec<PageNumber>> {
+        self.ensure_editable()?;
+        self.inner.pending_commit_pages()
+    }
+
+    fn pending_conflict_pages(&self) -> Result<Vec<PageNumber>> {
+        self.ensure_editable()?;
+        self.inner.pending_conflict_pages()
+    }
+
+    fn pending_conflict_pages_conservative(&self) -> Vec<PageNumber> {
+        self.inner.pending_conflict_pages_conservative()
+    }
+
+    fn write_set_page_numbers(&self) -> Vec<PageNumber> {
+        self.inner.write_set_page_numbers()
+    }
+
+    fn page_one_in_pending_commit_surface(&self) -> Result<bool> {
+        self.ensure_editable()?;
+        self.inner.page_one_in_pending_commit_surface()
+    }
+
+    fn page_size(&self) -> PageSize {
+        self.inner.page_size()
+    }
+
+    fn allocate_page_requires_page_one_conflict_tracking(&self) -> Result<bool> {
+        self.ensure_editable()?;
+        self.inner.allocate_page_requires_page_one_conflict_tracking()
+    }
+
+    fn free_page_requires_page_one_conflict_tracking(&self, page: PageNumber) -> Result<bool> {
+        self.ensure_editable()?;
+        self.inner.free_page_requires_page_one_conflict_tracking(page)
+    }
+
+    fn write_page_requires_page_one_conflict_tracking(&self, page: PageNumber) -> Result<bool> {
+        self.ensure_editable()?;
+        self.inner.write_page_requires_page_one_conflict_tracking(page)
+    }
+
+    async fn rollback<'a>(&'a mut self, cx: &'a Cx) -> Result<()> {
+        MemorySnapshotTransaction::rollback(self, cx).await
+    }
+
+    fn record_write_witness(&mut self, cx: &Cx, key: fsqlite_types::WitnessKey) {
+        if self.ensure_editable().is_ok() {
+            self.inner.record_write_witness(cx, key);
+        }
+    }
+
+    fn savepoint(&mut self, cx: &Cx, name: &str) -> Result<()> {
+        self.ensure_editable()?;
+        self.inner.savepoint(cx, name)
+    }
+
+    fn release_savepoint(&mut self, cx: &Cx, name: &str) -> Result<()> {
+        self.ensure_editable()?;
+        self.inner.release_savepoint(cx, name)
+    }
+
+    fn rollback_to_savepoint(&mut self, cx: &Cx, name: &str) -> Result<()> {
+        self.ensure_editable()?;
+        self.inner.rollback_to_savepoint(cx, name)
+    }
+}
+
+fn report_trait_capture(outcome: MemorySnapshotCommit) {
+    if let MemorySnapshotCommit::CaptureFailed(error) = outcome {
+        // Trait callers may retry Err as a new transaction. Capture is optional
+        // history AFTER a successful physical commit, not permission to retry.
+        tracing::warn!(
+            target: "fsqlite.memory_snapshot",
+            "memory transaction committed but history capture failed: {error}"
+        );
     }
 }
 
@@ -455,6 +674,200 @@ mod tests {
         let inner = txn.transaction_mut().expect("editable transaction");
         let bytes = vec![tag; inner.page_size().as_usize()];
         inner.write_page(&Cx::new(), page, &bytes).await.expect("overwrite");
+    }
+
+    // Deliberately generic: these are the TransactionHandle entry points a
+    // storage cursor calls, not the wrapper's differently typed inherent API.
+    async fn generic_write<T: TransactionHandle>(txn: &mut T, cx: &Cx, tag: u8) -> PageNumber {
+        let page = txn.allocate_page(cx).await.unwrap();
+        let mut data = PageData::zeroed(txn.page_size());
+        data.as_bytes_mut().fill(tag);
+        txn.write_page_data(cx, page, data).await.unwrap();
+        assert!(txn.has_pending_writes());
+        assert!(txn.pending_commit_pages().unwrap().contains(&page));
+        assert_eq!(txn.get_page(cx, page).await.unwrap().as_bytes()[0], tag);
+        page
+    }
+
+    async fn generic_commit<T: TransactionHandle>(txn: &mut T, cx: &Cx) {
+        txn.commit(cx).await.unwrap();
+    }
+
+    async fn generic_rollback<T: TransactionHandle>(txn: &mut T, cx: &Cx) {
+        txn.rollback(cx).await.unwrap();
+    }
+
+    async fn assert_frozen<T: TransactionHandle>(txn: &mut T, cx: &Cx, page: PageNumber) {
+        let page_size = txn.page_size();
+        let bytes = vec![0xff; page_size.as_usize()];
+        assert!(matches!(txn.write_page(cx, page, &bytes).await, Err(FrankenError::BusyRecovery)));
+        assert!(matches!(txn.write_page_data(cx, page, PageData::zeroed(page_size)).await,
+            Err(FrankenError::BusyRecovery)));
+        assert!(matches!(txn.restore_staged_page_data(cx, page, PageData::zeroed(page_size)).await,
+            Err(FrankenError::BusyRecovery)));
+        assert!(matches!(txn.allocate_page(cx).await, Err(FrankenError::BusyRecovery)));
+        assert!(matches!(txn.free_page(cx, page).await, Err(FrankenError::BusyRecovery)));
+        assert!(matches!(txn.savepoint(cx, "blocked"), Err(FrankenError::BusyRecovery)));
+        assert!(matches!(txn.release_savepoint(cx, "blocked"), Err(FrankenError::BusyRecovery)));
+        assert!(matches!(txn.rollback_to_savepoint(cx, "blocked"), Err(FrankenError::BusyRecovery)));
+        assert!(matches!(txn.pending_commit_pages(), Err(FrankenError::BusyRecovery)));
+        assert!(matches!(txn.get_page(cx, page).await, Err(FrankenError::BusyRecovery)));
+        assert!(txn.try_take_staged_page_data(page).is_none());
+        let mut called = false;
+        assert!(!txn.try_mutate_staged_page_data(page, &mut |_| called = true));
+        assert!(!called, "a frozen handle must not invoke a mutation callback");
+    }
+
+    #[test]
+    fn generic_commit_through_the_handed_out_handle_cannot_bypass_history() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let mut owner = owner().await;
+            let (page, previous_sequence) = {
+                let mut txn = owner.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                let previous_sequence = txn.base.sequence();
+                let handle = txn.transaction_mut().unwrap();
+                let page = generic_write(handle, &cx, 0x35).await;
+                generic_commit(handle, &cx).await;
+                // The borrow obtained before COMMIT is still live here. Merely
+                // guarding the accessor, rather than each operation, is unsafe.
+                assert_frozen(handle, &cx, page).await;
+                assert!(txn.transaction_mut().is_err());
+                (page, previous_sequence)
+            };
+            let image = owner.current().expect("generic commit must publish history");
+            assert_eq!(image.sequence().get(), previous_sequence.get() + 1);
+            assert_eq!(image.get_page(page).unwrap().as_bytes()[0], 0x35);
+            assert_live(&owner, image).await;
+        });
+    }
+
+    #[test]
+    fn generic_retain_entry_point_cannot_escape_history_capture() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let mut owner = owner().await;
+            let page = {
+                let mut txn = owner.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                let handle = txn.transaction_mut().unwrap();
+                let page = generic_write(handle, &cx, 0x46).await;
+                assert!(!handle.commit_and_retain(&cx).await.unwrap(),
+                    "the snapshot handle uses the trait's final-commit fallback");
+                assert_frozen(handle, &cx, page).await;
+                page
+            };
+            let image = owner.current().unwrap().clone();
+            assert_eq!(image.get_page(page).unwrap().as_bytes()[0], 0x46);
+            assert_live(&owner, &image).await;
+            {
+                let mut next = owner.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                assert_eq!(next.baseline_capture_stats().pages_read, 0);
+                overwrite(&mut next, page, 0x47).await;
+                generic_rollback(next.transaction_mut().unwrap(), &cx).await;
+            }
+            assert_eq!(owner.current().unwrap().sequence(), image.sequence());
+            assert_live(&owner, &image).await;
+        });
+    }
+
+    #[test]
+    fn generic_rollback_retires_the_handle_and_keeps_the_committed_image() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let mut owner = owner().await;
+            let (hot, before) = {
+                let mut txn = owner.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                let hot = append(&mut txn, 0x57).await;
+                (hot, captured(txn.commit(&cx).await.unwrap()))
+            };
+            {
+                let mut txn = owner.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                overwrite(&mut txn, hot, 0xee).await;
+                let handle = txn.transaction_mut().unwrap();
+                generic_write(handle, &cx, 0xff).await;
+                generic_rollback(handle, &cx).await;
+                assert_frozen(handle, &cx, hot).await;
+                assert!(txn.transaction_mut().is_err());
+            }
+            assert_eq!(owner.current().unwrap().sequence(), before.sequence());
+            assert_eq!(owner.current().unwrap().get_page(hot).unwrap().as_bytes()[0], 0x57);
+            assert_live(&owner, &before).await;
+        });
+    }
+
+    #[test]
+    fn generic_settlement_keeps_capture_failure_distinct_from_failed_commit() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let mut owner = owner().await;
+            let hot = {
+                let mut txn = owner.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                let hot = append(&mut txn, 0x68).await;
+                captured(txn.commit(&cx).await.unwrap());
+                hot
+            };
+            {
+                let mut txn = owner.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                overwrite(&mut txn, hot, 0x69).await;
+                // A real physical commit interrupted before history capture.
+                txn.attempt = Some(CommitAttempt {
+                    pages: txn.inner.pending_commit_pages().unwrap(),
+                    has_writes: true,
+                });
+                txn.owner.current = None;
+                txn.inner.commit(&cx).await.unwrap();
+                // Advancing the live pager makes capture of our old receipt
+                // fail. That must not make a generic caller retry its SQL.
+                let mut peer = txn.owner.pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                peer.write_page(&cx, hot, &vec![0x6a; PageSize::DEFAULT.as_usize()]).await.unwrap();
+                peer.commit(&cx).await.unwrap();
+                drop(peer);
+                let visible = txn.owner.pager.published_snapshot().visible_commit_seq;
+                assert_eq!(TransactionHandle::settle_commit(&mut txn, &cx).await.unwrap(),
+                    PagerCommitState::Committed);
+                assert!(txn.owner.current.is_none());
+                assert_frozen(&mut txn, &cx, hot).await;
+                assert!(TransactionHandle::rollback(&mut txn, &cx).await.is_err());
+                assert_eq!(TransactionHandle::settle_commit(&mut txn, &cx).await.unwrap(),
+                    PagerCommitState::Committed);
+                assert_eq!(txn.owner.pager.published_snapshot().visible_commit_seq, visible,
+                    "settlement must not create another commit");
+            }
+            let image = {
+                let mut next = owner.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+                assert!(next.baseline_capture_stats().full_capture);
+                captured(next.commit(&cx).await.unwrap())
+            };
+            assert_eq!(image.get_page(hot).unwrap().as_bytes()[0], 0x6a);
+            assert_live(&owner, &image).await;
+        });
+    }
+
+    #[test]
+    fn generic_unpolled_operations_do_not_mutate_or_start_finalization() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let mut owner = owner().await;
+            let image = {
+                let mut txn = owner.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                let page = append(&mut txn, 0x7b).await;
+                let pending = txn.inner.pending_commit_pages().unwrap();
+                let bytes = vec![0xff; PageSize::DEFAULT.as_usize()];
+                drop(TransactionHandle::write_page(&mut txn, &cx, page, &bytes));
+                drop(TransactionHandle::allocate_page(&mut txn, &cx));
+                drop(TransactionHandle::free_page(&mut txn, &cx, page));
+                drop(TransactionHandle::commit(&mut txn, &cx));
+                drop(TransactionHandle::commit_and_retain(&mut txn, &cx));
+                drop(TransactionHandle::rollback(&mut txn, &cx));
+                drop(TransactionHandle::settle_commit(&mut txn, &cx));
+                assert!(txn.attempt.is_none());
+                assert!(!txn.finished);
+                assert_eq!(txn.inner.pending_commit_pages().unwrap(), pending);
+                assert_eq!(txn.get_page(&cx, page).await.unwrap().as_bytes()[0], 0x7b);
+                captured(txn.commit(&cx).await.unwrap())
+            };
+            assert_live(&owner, &image).await;
+        });
     }
 
     // Independent oracle: scan the complete real pager image, not a second
@@ -802,7 +1215,8 @@ mod tests {
                         let mut txn = owner.begin(&cx, TransactionMode::Immediate).await.unwrap();
                         assert_eq!(txn.baseline_capture_stats().pages_read, 0, "resident={resident}");
                         overwrite(&mut txn, hot, (sample % 100 + 3) as u8).await;
-                        captured(txn.commit(&cx).await.unwrap())
+                        generic_commit(txn.transaction_mut().unwrap(), &cx).await;
+                        txn.owner.current.as_ref().unwrap().clone()
                     };
                     assert_eq!(image.capture_stats(), PageImageCaptureStats {
                         full_capture: false, pages_read: 2,
