@@ -1,0 +1,130 @@
+name: GH494 memory commit profile
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/gh494-memory-commit.yml
+      - crates/fsqlite-core/tests/gh494_memory_commit_scaling.rs
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gh494-memory-commit
+  cancel-in-progress: false
+
+jobs:
+  native-profile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_PROFILE_RELEASE_DEBUG: '1'
+      CARGO_PROFILE_RELEASE_LTO: 'off'
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Capture the exact source used by the profile
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/gh494"
+          git rev-parse HEAD | tee "$RUNNER_TEMP/gh494/base-commit.txt"
+          tar -czf "$RUNNER_TEMP/gh494/source.tar.gz" \
+            Cargo.toml Cargo.lock rust-toolchain.toml .cargo \
+            crates/fsqlite-core crates/fsqlite-vdbe crates/fsqlite-pager \
+            crates/fsqlite-vfs crates/fsqlite-btree crates/fsqlite-types
+          python3 - <<'PY' | tee "$RUNNER_TEMP/gh494/commit-path.txt"
+          from pathlib import Path
+          import re
+          p = Path('crates/fsqlite-core/src/connection.rs')
+          lines = p.read_text().splitlines()
+          needles = ('reload_memdb_from_txn_with_mode', 'memdb_dirty', 'publish_memdb')
+          for n, line in enumerate(lines):
+              if any(needle in line for needle in needles):
+                  print(f'{p}:{n + 1}: {line.strip()}')
+          for n, line in enumerate(lines):
+              if re.search(r'fn\s+(?:reload_memdb_from_txn_with_mode|commit_transaction|handle_commit|execute_commit)\b', line):
+                  print(f'\n--- {p}:{n + 1} ---')
+                  print('\n'.join(f'{i + 1}: {lines[i]}' for i in range(max(0, n - 5), min(len(lines), n + 160))))
+          PY
+      - name: Preserve source evidence before compilation
+        uses: actions/upload-artifact@v4
+        with:
+          name: gh494-source-${{ github.run_id }}
+          path: ${{ runner.temp }}/gh494/
+      - name: Install repository toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain="$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')"
+          rustup toolchain install "$toolchain" --profile minimal --component rustfmt --component clippy
+      - name: Measure the issue reproduction without timing assertions
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p crates/fsqlite/examples
+          cat > crates/fsqlite/examples/gh494_commit_profile.rs <<'RS'
+          use fsqlite::Connection;
+          use std::time::Instant;
+
+          async fn profile(path: &str) {
+              let conn = Connection::open(path).await.expect("open");
+              conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload BLOB NOT NULL)")
+                  .await.expect("create");
+              let payload = format!("X'{}'", "ab".repeat(4096));
+              println!("backend,rows_before,mean_begin_us,mean_insert_us,mean_commit_us");
+              for window in 0..8 {
+                  let mut elapsed = [0_u128; 3];
+                  for offset in 1..=200 {
+                      let id = window * 200 + offset;
+                      let sql = format!("INSERT INTO t VALUES ({id}, {payload})");
+                      for (stage, statement) in ["BEGIN", sql.as_str(), "COMMIT"].iter().enumerate() {
+                          let start = Instant::now();
+                          conn.execute(statement).await.expect("transaction");
+                          elapsed[stage] += start.elapsed().as_nanos();
+                      }
+                  }
+                  println!("{path},{},{:.3},{:.3},{:.3}", window * 200,
+                      elapsed[0] as f64 / 200_000.0,
+                      elapsed[1] as f64 / 200_000.0,
+                      elapsed[2] as f64 / 200_000.0);
+              }
+              let rows = conn.query("SELECT count(*), sum(length(payload)) FROM t")
+                  .await.expect("read after commit");
+              println!("final_rows={rows:?}");
+          }
+
+          fn main() {
+              let file = std::env::args().nth(1).expect("fresh database path");
+              asupersync::test_utils::run_test(move || async move {
+                  profile(":memory:").await;
+                  profile(&file).await;
+              });
+          }
+          RS
+          cargo run --release -p fsqlite --no-default-features --features native \
+            --example gh494_commit_profile -- "$RUNNER_TEMP/gh494/profile.db" \
+            2>&1 | tee "$RUNNER_TEMP/gh494/native-profile.log"
+      - name: Run the checked-in correctness and scaling controls when present
+        shell: bash
+        run: |
+          set -euo pipefail
+          if test -f crates/fsqlite-core/tests/gh494_memory_commit_scaling.rs; then
+            cargo test --release -p fsqlite-core --no-default-features --features native \
+              --test gh494_memory_commit_scaling -- --include-ignored --nocapture --test-threads=1 \
+              2>&1 | tee "$RUNNER_TEMP/gh494/native-controls.log"
+          fi
+      - name: Preserve actual measurements and failure logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gh494-profile-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/gh494/*.txt
+            ${{ runner.temp }}/gh494/*.log
+          if-no-files-found: warn
