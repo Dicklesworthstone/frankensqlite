@@ -3373,7 +3373,7 @@ pub fn extract_check_constraints_from_sql(sql: &str) -> Vec<String> {
 
 pub(crate) fn extract_check_constraints_with_owners_from_sql(sql: &str) -> Vec<CheckConstraint> {
     if let Some(Statement::CreateTable(create)) = parse_single_statement(sql) {
-        return check_constraints_from_create_table_statement(&create);
+        return check_constraints_from_create_table_statement(&create, sql);
     }
 
     extract_check_constraints_with_owners_sql_fallback(sql)
@@ -3422,8 +3422,18 @@ fn extract_check_constraints_with_owners_sql_fallback(sql: &str) -> Vec<CheckCon
     checks
 }
 
+/// The CHECK constraints of a stored `CREATE TABLE`, parsed from `create_sql`
+/// (the text `create` was parsed from).
+///
+/// Each keeps its `CONSTRAINT` name and its expression's source text, as
+/// CREATE TABLE records them: both reach the user in "CHECK constraint
+/// failed: <name or text>", and stock reports the name, else the verbatim
+/// text between the parentheses. bd-8cs1s: the reload dropped the name and
+/// re-rendered the text from the AST (`a <> 2` became `a != 2`), so every
+/// CHECK on a reopened or stock-created file failed with a different message.
 pub(crate) fn check_constraints_from_create_table_statement(
     create: &CreateTableStatement,
+    create_sql: &str,
 ) -> Vec<CheckConstraint> {
     let CreateTableBody::Columns {
         columns,
@@ -3437,9 +3447,9 @@ pub(crate) fn check_constraints_from_create_table_statement(
         for constraint in &column.constraints {
             if let ColumnConstraintKind::Check(expr) = &constraint.kind {
                 checks.push(CheckConstraint {
-                    expr: expr.to_string(),
+                    expr: stored_check_expr_source(expr, create_sql),
                     owner_column: Some(column.name.clone()),
-                    name: None,
+                    name: constraint.name.clone(),
                 });
             }
         }
@@ -3447,13 +3457,30 @@ pub(crate) fn check_constraints_from_create_table_statement(
     for constraint in constraints {
         if let TableConstraintKind::Check(expr) = &constraint.kind {
             checks.push(CheckConstraint {
-                expr: expr.to_string(),
+                expr: stored_check_expr_source(expr, create_sql),
                 owner_column: None,
-                name: None,
+                name: constraint.name.clone(),
             });
         }
     }
     checks
+}
+
+/// `expr`'s verbatim source in `create_sql`, trimmed, when that slice parses
+/// back to the same expression; otherwise the AST rendering. This is the rule
+/// CREATE TABLE applies (`Connection::format_check_expr_source`): a span that
+/// omits grouping parentheses, as in `CHECK((a) AND (b))`, is not a valid
+/// expression on its own and must not replace the constraint.
+fn stored_check_expr_source(expr: &Expr, create_sql: &str) -> String {
+    let span = expr.span();
+    create_sql
+        .get(span.start as usize..span.end as usize)
+        .map(str::trim)
+        .filter(|source| {
+            !source.is_empty()
+                && fsqlite_parser::expr::parse_expr(source).is_ok_and(|parsed| parsed.eq(expr))
+        })
+        .map_or_else(|| expr.to_string(), str::to_owned)
 }
 
 fn parse_column_name_and_remainder(def: &str) -> Option<(String, &str)> {
@@ -6078,25 +6105,73 @@ PRAGMA integrity_check;
 
     #[test]
     fn test_check_constraint_fallback_preserves_column_ownership() {
-        // SQLite accepts a conflict clause after a table CHECK, while the AST
-        // parser currently rejects that suffix. Exercise the fallback so a
-        // neighboring column CHECK does not get flattened into table scope.
+        // SQLite accepts a conflict clause after a table CHECK. The AST parser
+        // now accepts that suffix too, so exercise the SQL-text fallback
+        // directly: a neighboring column CHECK must not get flattened into
+        // table scope. The fallback does not recover constraint names.
         let sql = r#"CREATE TABLE t(
             "owned col" TEXT DEFAULT 'CHECK(fake)' CHECK(length("owned col") > 0),
             b INTEGER,
             CONSTRAINT/*name*/ table_check CHECK/*expr*/(b > 0) ON CONFLICT FAIL
         )"#;
-        let checks = extract_check_constraints_with_owners_from_sql(sql);
+        let owned = CheckConstraint {
+            expr: r#"length("owned col") > 0"#.to_owned(),
+            owner_column: Some("owned col".to_owned()),
+            name: None,
+        };
+        let table_check = CheckConstraint {
+            expr: "b > 0".to_owned(),
+            owner_column: None,
+            name: None,
+        };
         assert_eq!(
-            checks,
+            extract_check_constraints_with_owners_sql_fallback(sql),
+            vec![owned.clone(), table_check.clone()]
+        );
+        // The parsed path keeps the same ownership and also the name, which
+        // stock reports: "CHECK constraint failed: table_check" (bd-8cs1s).
+        assert_eq!(
+            extract_check_constraints_with_owners_from_sql(sql),
+            vec![
+                owned,
+                CheckConstraint {
+                    name: Some("table_check".to_owned()),
+                    ..table_check
+                },
+            ]
+        );
+    }
+
+    /// bd-8cs1s: a reloaded CHECK keeps its `CONSTRAINT` name and the source
+    /// text stock reports in "CHECK constraint failed: ...", rather than the
+    /// AST rendering (`<>` re-rendered as `!=`) with the name dropped.
+    #[test]
+    fn test_reloaded_check_constraints_keep_name_and_source_text() {
+        let sql = "CREATE TABLE t(a CONSTRAINT pos CHECK( a  <>  0 ), b, \
+                   CONSTRAINT ordered CHECK(b <> a), CHECK(rowid <> 2), CHECK((a) AND (b)))";
+        let grouped = fsqlite_parser::expr::parse_expr("(a) AND (b)")
+            .expect("grouped CHECK parses")
+            .to_string();
+        assert_eq!(
+            extract_check_constraints_with_owners_from_sql(sql),
             vec![
                 CheckConstraint {
-                    expr: r#"length("owned col") > 0"#.to_owned(),
-                    owner_column: Some("owned col".to_owned()),
+                    expr: "a  <>  0".to_owned(),
+                    owner_column: Some("a".to_owned()),
+                    name: Some("pos".to_owned()),
+                },
+                CheckConstraint {
+                    expr: "b <> a".to_owned(),
+                    owner_column: None,
+                    name: Some("ordered".to_owned()),
+                },
+                CheckConstraint {
+                    expr: "rowid <> 2".to_owned(),
+                    owner_column: None,
                     name: None,
                 },
                 CheckConstraint {
-                    expr: "b > 0".to_owned(),
+                    expr: grouped,
                     owner_column: None,
                     name: None,
                 },

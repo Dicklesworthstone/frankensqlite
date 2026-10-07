@@ -102166,7 +102166,12 @@ impl Connection {
                             &create_sql,
                         )
                     },
-                    crate::compat_persist::check_constraints_from_create_table_statement,
+                    |create| {
+                        crate::compat_persist::check_constraints_from_create_table_statement(
+                            create,
+                            &create_sql,
+                        )
+                    },
                 );
 
                 new_schema.push(TableSchema {
