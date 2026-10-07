@@ -295,30 +295,45 @@ pub const fn varint_len(value: u64) -> usize {
 
 /// Write a varint to a byte buffer, returning the number of bytes written.
 ///
-/// The buffer must have at least 9 bytes available.
+/// The buffer must hold `varint_len(value)` bytes; 9 bytes always suffice.
 #[allow(clippy::cast_possible_truncation)]
+#[inline]
 pub fn write_varint(buf: &mut [u8], value: u64) -> usize {
     let len = varint_len(value);
 
-    if len == 1 {
-        buf[0] = value as u8;
-    } else if len == 9 {
-        // First 8 bytes: each has high bit set, carries 7 bits
-        let mut v = value >> 8;
-        for i in (0..8).rev() {
-            buf[i] = (v as u8 & 0x7F) | 0x80;
-            v >>= 7;
-        }
-        buf[8] = value as u8;
-    } else {
-        let mut v = value;
-        for i in (0..len).rev() {
-            if i == len - 1 {
-                buf[i] = v as u8 & 0x7F;
-            } else {
+    match len {
+        1 => buf[0] = value as u8,
+        // B-tree payload lengths and positive rowids often fit these widths.
+        // Emit them directly rather than running a variable-trip-count loop
+        // with a last-byte branch on every iteration (GH#491).
+        2 => buf[..2].copy_from_slice(&[
+            ((value >> 7) as u8) | 0x80,
+            (value as u8) & 0x7F,
+        ]),
+        3 => buf[..3].copy_from_slice(&[
+            ((value >> 14) as u8) | 0x80,
+            (((value >> 7) as u8) & 0x7F) | 0x80,
+            (value as u8) & 0x7F,
+        ]),
+        9 => {
+            // SQLite's ninth byte carries eight bits, including for negative
+            // rowids cast to u64. This is deliberately NOT LEB128.
+            let mut v = value >> 8;
+            for i in (0..8).rev() {
                 buf[i] = (v as u8 & 0x7F) | 0x80;
+                v >>= 7;
             }
-            v >>= 7;
+            buf[8] = value as u8;
+        }
+        _ => {
+            // Separate the terminal byte so the remaining loop has no
+            // per-byte continuation/termination branch for wider values.
+            buf[len - 1] = value as u8 & 0x7F;
+            let mut v = value >> 7;
+            for i in (0..len - 1).rev() {
+                buf[i] = (v as u8 & 0x7F) | 0x80;
+                v >>= 7;
+            }
         }
     }
 
@@ -328,6 +343,67 @@ pub fn write_varint(buf: &mut [u8], value: u64) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Keep the pre-GH#491 writer as a differential reference. It must not
+    // delegate to write_varint: that would hide changes to persisted bytes.
+    fn write_varint_loop_reference(buf: &mut [u8], value: u64) -> usize {
+        let len = varint_len(value);
+        if len == 1 {
+            buf[0] = value as u8;
+        } else if len == 9 {
+            let mut v = value >> 8;
+            for i in (0..8).rev() {
+                buf[i] = (v as u8 & 0x7F) | 0x80;
+                v >>= 7;
+            }
+            buf[8] = value as u8;
+        } else {
+            let mut v = value;
+            for i in (0..len).rev() {
+                buf[i] = if i == len - 1 {
+                    v as u8 & 0x7F
+                } else {
+                    (v as u8 & 0x7F) | 0x80
+                };
+                v >>= 7;
+            }
+        }
+        len
+    }
+
+    fn assert_varint_matches_loop(value: u64) {
+        let mut expected = [0xCD_u8; 11];
+        let len = write_varint_loop_reference(&mut expected[1..10], value);
+        let mut actual = [0xCD_u8; 11];
+        // Deliberately pass only the exact space available for this cell's
+        // varint; compare the whole buffer to protect both neighboring cells.
+        let written = write_varint(&mut actual[1..1 + len], value);
+        assert_eq!(written, len, "encoded length for {value}");
+        assert_eq!(actual, expected, "encoded bytes and sentinels for {value}");
+    }
+
+    #[test]
+    fn test_varint_short_write_exhaustive_byte_equivalence() {
+        // Every value admitted to the 1/2/3-byte direct-write paths, not just
+        // the reporter's million-row prefix or a handful of boundary samples.
+        for value in 0..=0x001F_FFFF {
+            assert_varint_matches_loop(value);
+        }
+    }
+
+    #[test]
+    fn test_varint_write_equivalence_near_every_width_transition() {
+        for &(minimum, maximum, _) in &BYTE_BOUNDARIES {
+            for delta in 0..=255 {
+                if let Some(value) = minimum.checked_add(delta).filter(|v| *v <= maximum) {
+                    assert_varint_matches_loop(value);
+                }
+                if let Some(value) = maximum.checked_sub(delta).filter(|v| *v >= minimum) {
+                    assert_varint_matches_loop(value);
+                }
+            }
+        }
+    }
 
     #[test]
     fn serial_type_sizes() {
@@ -898,6 +974,9 @@ mod tests {
             (129, &[0x81, 0x01]),
             (16383, &[0xFF, 0x7F]),
             (16384, &[0x81, 0x80, 0x00]),
+            (1_000_000, &[0xBD, 0x84, 0x40]),
+            (2_097_151, &[0xFF, 0xFF, 0x7F]),
+            (2_097_152, &[0x81, 0x80, 0x80, 0x00]),
             (
                 u64::MAX,
                 &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
@@ -943,6 +1022,12 @@ mod tests {
     use proptest::prelude::*;
 
     proptest! {
+        /// Check the persisted bytes, not only agreement with our own reader.
+        #[test]
+        fn prop_varint_writer_matches_previous_bytes(value: u64) {
+            assert_varint_matches_loop(value);
+        }
+
         /// Varint roundtrip: write then read recovers the original value.
         #[test]
         fn prop_varint_roundtrip(value: u64) {
