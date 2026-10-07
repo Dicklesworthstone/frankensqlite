@@ -33958,6 +33958,18 @@ impl Connection {
                 let append_hint = prepared_append_hint.as_mut().ok_or_else(|| {
                     FrankenError::internal("prepared direct insert lost owned append hint state")
                 })?;
+                // bd-obwsy: the retained leaf is appended to WITHOUT rereading
+                // the page (its cached header decides where the cell lands), so
+                // it is only trustworthy while it names exactly the right edge
+                // the outer hint names. A mismatch is an image of a page that a
+                // balance has since reshaped or moved off the right edge; drop
+                // it and let the self-validating known-last-rowid probe decide.
+                if append_hint.cached_leaf.as_ref().is_some_and(|cached_leaf| {
+                    cached_leaf.leaf_page() != append_hint.leaf_page
+                        || cached_leaf.last_rowid() != append_hint.last_rowid
+                }) {
+                    append_hint.cached_leaf = None;
+                }
                 if let Some(cached_leaf) = append_hint.cached_leaf.as_mut()
                     && cursor
                         .table_try_append_cached_rightmost_leaf_hint(
@@ -34009,19 +34021,21 @@ impl Connection {
                     if append_fast_path_candidate {
                         record_append_hint = true;
                         append_leaf_page = append_fast_leaf_page.or_else(|| cursor.current_page());
-                        if prepared_append_hint
-                            .as_ref()
-                            .and_then(|hint| hint.cached_leaf.as_ref())
-                            .is_none()
-                        {
-                            append_cached_leaf =
-                                cursor
-                                    .table_cached_rightmost_leaf_hint()
-                                    .map(|cached_leaf| {
-                                        self.prepare_prepared_direct_insert_cached_leaf_hint(
-                                            cached_leaf,
-                                        )
-                                    });
+                        // bd-obwsy: neither retained-hint lane took this row, so
+                        // the cursor's own insert placed it, possibly through a
+                        // balance that reassigned which page is the right edge.
+                        // Any previously retained leaf image is now stale and must
+                        // be replaced by the cursor's fresh right-edge snapshot
+                        // (or by nothing), never carried forward.
+                        if append_fast_leaf_page.is_none() {
+                            append_cached_leaf = cursor
+                                .table_cached_rightmost_leaf_hint()
+                                .filter(|cached_leaf| cached_leaf.last_rowid() == rowid)
+                                .map(|cached_leaf| {
+                                    self.prepare_prepared_direct_insert_cached_leaf_hint(
+                                        cached_leaf,
+                                    )
+                                });
                             if append_leaf_page.is_none() {
                                 append_leaf_page =
                                     append_cached_leaf.as_ref().map(TableAppendHint::leaf_page);
@@ -34070,7 +34084,9 @@ impl Connection {
                     if let Some(leaf_page) = append_leaf_page {
                         append_hint.leaf_page = leaf_page;
                     }
-                    if append_cached_leaf.is_some() {
+                    // A retained-hint lane already left `cached_leaf` describing
+                    // this row's leaf; otherwise replace it (bd-obwsy).
+                    if append_fast_leaf_page.is_none() {
                         append_hint.cached_leaf = append_cached_leaf;
                     }
                     self.store_prepared_direct_insert_append_hint(Some(append_hint));
