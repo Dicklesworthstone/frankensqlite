@@ -17,13 +17,14 @@ as a 28-member Cargo workspace under `crates/`.
 
 Repository: <https://github.com/Dicklesworthstone/frankensqlite>
 
-Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.7) (2026-08-20) through the frozen v0.4.9 replacement release source (2026-10-03). v0.4.8 remains an unchanged, withdrawn tag without a GitHub Release or crates.io publication. v0.3.2–v0.3.4, v0.3.6–v0.3.18 and v0.4.4 are GitHub Releases; **v0.3.5 is a tag / crates.io snapshot with no GitHub Release**, and **0.4.0–0.4.3 are crates.io publishes with no tag and no GitHub Release** — their changes are documented in the v0.4.4 section. Every release in the window has a per-change section below (the v0.3.12/v0.3.13 sections were reconstructed from their tag ranges on 2026-09-01).
+Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.3.7) (2026-08-20) through [v0.4.10](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.4.10) (2026-10-07). v0.4.8 remains an unchanged, withdrawn tag without a GitHub Release or crates.io publication. v0.3.2–v0.3.4, v0.3.6–v0.3.18 and v0.4.4 are GitHub Releases; **v0.3.5 is a tag / crates.io snapshot with no GitHub Release**, and **0.4.0–0.4.3 are crates.io publishes with no tag and no GitHub Release** — their changes are documented in the v0.4.4 section. Every release in the window has a per-change section below (the v0.3.12/v0.3.13 sections were reconstructed from their tag ranges on 2026-09-01).
 
 ## Version Timeline
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| [Unreleased](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.4.9...main) | HEAD | 2026-10-03 | Later main commits are excluded from v0.4.9 and reserved for v0.4.10. |
+| [Unreleased](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.4.10...main) | HEAD | 2026-10-07 | Development on `main` after v0.4.10. |
+| [v0.4.10](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.4.10) | Release | 2026-10-07 | Uniform release of all 26 public crates, with a **data-integrity advisory**: inserts inside a transaction could silently corrupt a table b-tree (bd-obwsy); UPDATE ... FROM lost or repeated updates (bd-b5j26); non-integer rowid / INTEGER PRIMARY KEY values left malformed index entries (REINDEX); a REPLACE constraint could delete a row an IGNORE constraint then kept out; a retried fsync after a failed WAL sync could vouch for unwritten frames (bd-alyrn). Plus checkpoint source validation, max-rowid and rowid-reuse parity, `:memory:` freelist reuse, stock empty-schema opens, and DML/join/trigger performance work |
 | [v0.4.9](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.4.9) | Release | 2026-10-03 | Published replacement for withdrawn v0.4.8, with frozen runtime source 23697702 and the CTAS wrong-table write fix. All 26 public crates use 0.4.9. The full gate records documented failures; signed assets and publication evidence accompany the release. |
 | [v0.4.8](https://github.com/Dicklesworthstone/frankensqlite/tree/v0.4.8) | Withdrawn tag | 2026-10-02 | Withdrawn before publication: CREATE TABLE AS SELECT with a quoted table name could write its copied rows into another existing table. The tag remains unchanged and unreleased; published v0.4.9 supersedes it. Planned changes are retained below. |
 | [v0.4.7](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.4.7) | Release | 2026-09-29 | Prompt fix release of all 26 public crates. Large multi-row INSERT wrote index entries without their rowid and skipped UNIQUE checks past register 65,535 (hfdt-dlkam3); serialized-DDL index race (bd-4iaoi); composite-key DML seek (GH#434) with residual fix; autocommit DDL starvation (bd-f5sh5); GH#435 changes(); streaming aggregate and correlated-subquery performance (GH#420, GH#432, GH#436) |
@@ -54,11 +55,314 @@ Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releas
 
 ---
 
-## [Unreleased] -- later development on `main`, excluded from v0.4.9
+## [Unreleased] -- development on `main` after v0.4.10
 
-Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.4.9...main>
+Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.4.10...main>
 
-The v0.4.9 runtime is frozen at 23697702. Later owner commits are reserved for v0.4.10.
+---
+
+## [0.4.10] -- 2026-10-07 (GitHub Release)
+
+Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.4.9...v0.4.10>
+(v0.4.9 was cut from a side branch at frozen runtime `23697702`; everything `main` landed after
+that commit ships here.)
+
+**What this is.** A uniform release of all 26 public crates. It carries a set of silent
+data-integrity fixes that affect every earlier release, so upgrading is recommended for all users.
+It also includes the SQL-parity, durability and performance work `main` landed after the v0.4.9
+freeze.
+
+### Upgrade advisory: data integrity
+
+The first three issues can leave a file that stock SQLite's `PRAGMA integrity_check` reports as
+damaged. After upgrading, run `PRAGMA integrity_check;` on databases written by an earlier version.
+If it names an index, run `REINDEX;` (or `REINDEX <index>`). The lost or repeated UPDATE ... FROM
+updates and the REPLACE/IGNORE row loss leave no trace in the file, so no check can find them
+afterwards; review data written by those statement shapes. The last two items are durability and
+checkpoint-safety fixes that prevent losses rather than repair them.
+
+- **Inserts inside an explicit transaction could corrupt a table b-tree (bd-obwsy,
+  [9f7534c5c](https://github.com/Dicklesworthstone/frankensqlite/commit/9f7534c5c), hardened by
+  d55f379da).**
+  0.4.6, 0.4.7 and 0.4.9 are affected (reproduced on their release binaries). A transaction that
+  appends many rows of varying width to a table with no secondary index could write a later row
+  into a leaf that an earlier split had already rewritten, using that leaf's old header. The row
+  overwrote live bytes of another row, on a leaf that was no longer the table's right edge. Inserts
+  report success; stock `integrity_check` reports `Rowid N out of order`, `Multiple uses for byte
+  N` or a cell offset of 0; `count(*)` can gain a phantom row; and full scans or a later
+  `CREATE INDEX` fail as malformed. The owner's report used multi-row `INSERT ... VALUES` through
+  the CLI, which corrupts from 64 rows per statement. Through `Connection::execute`, single-row
+  INSERTs in one transaction hit the same path. The insert path now replaces its cached leaf
+  image whenever the ordinary insert placed a row, and uses it only while it names the current
+  right edge. The b-tree refuses an append whose cached header no longer matches the page, and a
+  quick balance whose leaf is no longer the parent's right child.
+  **Repair:** run `PRAGMA integrity_check` on databases loaded this way. If it reports errors,
+  reload the affected tables from their source data. If no source exists, extract what stock
+  SQLite can still read (`sqlite3 damaged.db .recover > recovered.sql`), load that into a new
+  database, and verify row counts. In the reported file, one row on each damaged leaf was
+  unreadable.
+- **UPDATE ... FROM lost or repeated updates (bd-b5j26,
+  [033d49ac0](https://github.com/Dicklesworthstone/frankensqlite/commit/033d49ac0),
+  [826037063](https://github.com/Dicklesworthstone/frankensqlite/commit/826037063)).** Every release
+  back to at least 0.3.6 is affected. On a rowid table the statement rewrote the target while
+  scanning it:
+  - File-backed databases updated only the first matching row. `:memory:` databases updated only
+    the rows on the first leaf page.
+  - A target row matched by several FROM rows was rewritten once per match, so `SET c = c + d.n`
+    compounded and `changes()` over-counted.
+  - Assigning the INTEGER PRIMARY KEY moved rows ahead of the scan.
+
+  On a WITHOUT ROWID table, a row matched several times left a duplicate secondary-index entry
+  (`wrong # of entries in index ...`; repair with `REINDEX`). UPDATE ... FROM now collects its
+  matches first and applies each target row once, using the last matching FROM row as stock does.
+  The trigger/foreign-key path gets the same last-match rule.
+- **A non-integer rowid or INTEGER PRIMARY KEY value was stored truncated, with malformed index
+  entries ([2894fc314](https://github.com/Dicklesworthstone/frankensqlite/commit/2894fc314)).** This
+  has shipped since at least 0.3.9. INSERT, UPDATE, UPDATE ... FROM and UPSERT copied the key
+  unconverted. The row landed at a truncated rowid (`1.5` became 1, `'abc'` became 0, `'1e1'`
+  became 1), and every secondary-index entry kept the raw REAL or TEXT value as its rowid
+  (`index key record missing trailing integer rowid`; repair with `REINDEX`). The key now passes SQLite's
+  `MustBeInt`: `'7'`, `8.0` and `'1e1'` convert, while `1.5`, `'abc'` and blobs fail with
+  `datatype mismatch`.
+- **A REPLACE constraint could delete a row that a later IGNORE constraint then kept out
+  ([541ca1b6b](https://github.com/Dicklesworthstone/frankensqlite/commit/541ca1b6b)).** UNIQUE
+  constraints were checked in creation order. Take a table with `b UNIQUE ON CONFLICT REPLACE` and
+  `d UNIQUE ON CONFLICT IGNORE`: a new row conflicting on both deleted the `b` victim and was then
+  ignored, losing a row stock keeps. Indexes are now checked in stock's order, so a row that breaks
+  two ABORT constraints is reported against the constraint stock names, and an upsert with no
+  conflict target acts on the row stock picks.
+- **A failed WAL fsync could be followed by a "successful" one that wrote nothing (bd-alyrn,
+  [00104ff64](https://github.com/Dicklesworthstone/frankensqlite/commit/00104ff64)).** On Linux a
+  failed fsync can leave the pages clean in the page cache. In-doubt commit reconciliation re-read
+  them, re-synced and published the commit as durable, so a power loss could drop a commit the
+  application had been told succeeded. The WAL now rewrites every frame a failed sync covered before
+  any later sync can vouch for them.
+- **Checkpoints validate their source frames and refuse an uncommitted WAL tail
+  ([b5aa7af07](https://github.com/Dicklesworthstone/frankensqlite/commit/b5aa7af07),
+  [0f74043c1](https://github.com/Dicklesworthstone/frankensqlite/commit/0f74043c1)).** Before any
+  database write, a checkpoint verifies generation, salts, page numbers and the checksum chain of
+  every frame it copies, and the copy pass re-checks them. A WAL that does not end at a commit
+  marker is not backfilled or reset.
+
+### Storage and durability
+
+- `:memory:` databases reuse their freelist, and a rewound EOF never re-grants parked pages. Before,
+  freed pages were never reused and `integrity_check` could report `page N is never used`
+  ([ea552c9ab](https://github.com/Dicklesworthstone/frankensqlite/commit/ea552c9ab)).
+- Raw cell decoders stop at the page's usable size, so a pointer into the reserved trailer reads as
+  corruption (GH#426, bd-i2pad, [540740799](https://github.com/Dicklesworthstone/frankensqlite/commit/540740799)).
+- Stock databases whose empty schema left the header's schema format and text encoding at 0 now open.
+  Typical sources are a file that only saw `PRAGMA user_version`, or a VACUUMed empty schema
+  (bd-25au0, [b40125341](https://github.com/Dicklesworthstone/frankensqlite/commit/b40125341)).
+- GH#443 follow-up: when a stock read-only connection leaves a header-only WAL and a `-shm` holding
+  stock's unindexed-empty header with its own salts, a writer binds that header instead of failing
+  every commit with `BusyRecovery` (v0.4.9 fixed the 0-byte-WAL shape;
+  [d2a6d655c](https://github.com/Dicklesworthstone/frankensqlite/commit/d2a6d655c)).
+- VACUUM INTO reads through a WAL a reading peer pins (bd-5unvm,
+  [5dc1a17e1](https://github.com/Dicklesworthstone/frankensqlite/commit/5dc1a17e1)).
+- A full WAL-FEC repair queue, or a stopped repair worker, defers repair admission instead of
+  refusing the write. A commit larger than one RaptorQ source block gets no repair group instead of
+  aborting the process (bd-jyeus, [e82a0a9c2](https://github.com/Dicklesworthstone/frankensqlite/commit/e82a0a9c2),
+  [0035a8ff9](https://github.com/Dicklesworthstone/frankensqlite/commit/0035a8ff9),
+  [e1b5f0fd1](https://github.com/Dicklesworthstone/frankensqlite/commit/e1b5f0fd1)).
+- `synchronous=FULL` commits fsync only the WAL, as stock SQLite does. The `-wal-cert` sidecar
+  record is no longer fsynced per commit, because recovery does not depend on it (bd-qyekq,
+  [3fdad335a](https://github.com/Dicklesworthstone/frankensqlite/commit/3fdad335a)).
+- 0.3.x/0.4.x guard follow-up: a namespace joiner holds its WAL-lifetime claim before releasing the
+  gate, so a slow joiner is never refused as a 0.3.x peer
+  ([0e755afaf](https://github.com/Dicklesworthstone/frankensqlite/commit/0e755afaf)). The guard
+  remains one-way: never let a 0.3.x engine share a WAL database with 0.4.x+ (see README).
+- Shared WAL-index words are copied through their atomic access paths
+  ([27c629f14](https://github.com/Dicklesworthstone/frankensqlite/commit/27c629f14)). Mapped
+  write-completion relays publish before waking waiters
+  ([fed3e0676](https://github.com/Dicklesworthstone/frankensqlite/commit/fed3e0676)).
+- `PRAGMA integrity_check` also validates NOT NULL/CHECK constraints in attached databases
+  ([11cf3e7f6](https://github.com/Dicklesworthstone/frankensqlite/commit/11cf3e7f6)).
+- fsqlite-vfs builds on macOS again (`getgroups` on Apple targets,
+  [56ff324eb](https://github.com/Dicklesworthstone/frankensqlite/commit/56ff324eb)).
+
+### SQL correctness (stock-SQLite parity)
+
+- Rowid edge cases:
+  - Once a table holds rowid 9223372036854775807, an automatic rowid is a random unused one, and
+    AUTOINCREMENT fails `SQLITE_FULL` (bd-6i9c5, [864f31114](https://github.com/Dicklesworthstone/frankensqlite/commit/864f31114)).
+  - Explicit rowids keep working in a table that holds the largest rowid
+    ([9308c4bb6](https://github.com/Dicklesworthstone/frankensqlite/commit/9308c4bb6)).
+  - A statement rolled back inside a transaction gives its implicit rowids back (bd-8a8pr,
+    [fc7e91333](https://github.com/Dicklesworthstone/frankensqlite/commit/fc7e91333)).
+- Rowid range seeks with a TEXT, REAL or BLOB key follow stock instead of truncating the key
+  ([cb4a0e0d4](https://github.com/Dicklesworthstone/frankensqlite/commit/cb4a0e0d4)). An index
+  equality pins a seek only under its key's collation, and ORDER BY index scans seek their equality
+  prefix under the comparison's affinity
+  ([2ca04510c](https://github.com/Dicklesworthstone/frankensqlite/commit/2ca04510c),
+  [68e4e4221](https://github.com/Dicklesworthstone/frankensqlite/commit/68e4e4221)).
+- Triggers:
+  - A trigger's `SELECT RAISE(...)` fires for every branch shape.
+  - NEW rows compute generated columns.
+  - Multi-row UPDATE/DELETE fire triggers in rowid/primary-key order.
+  - Trigger subqueries resolve bare ORDER BY/LIMIT names and non-TEMP tables like stock.
+
+  (bd-u7sv8, bd-yb70u, bd-f5s4w, [1711fdd43](https://github.com/Dicklesworthstone/frankensqlite/commit/1711fdd43),
+  [369627058](https://github.com/Dicklesworthstone/frankensqlite/commit/369627058),
+  [cfebcdd66](https://github.com/Dicklesworthstone/frankensqlite/commit/cfebcdd66)).
+- Name resolution:
+  - A subquery's ORDER BY/GROUP BY resolves outer columns, as in SQLite 3.53 (bd-r9dhv).
+  - ORDER BY expressions resolve result aliases after FROM columns (bd-z0qqu).
+  - An UPDATE ... FROM subquery alias no longer shadows a table (bd-hhh47).
+  - A DQS string beside a table-valued source is a literal (bd-clpji).
+- Aggregates and joins:
+  - With several min()/max() aggregates, the last one picks the bare-column row (bd-6lijo).
+  - Aggregates over a join keep scan order (bd-54sjx).
+  - The in-memory EXISTS probe compares typeless columns without conversion.
+  - IN-subquery affinity follows declared operands.
+- Schema and ALTER:
+  - Stored schema text is the statement's own text (bd-i95tk).
+  - ALTER TABLE ADD COLUMN accepts every constant default stock folds.
+  - ALTER on an attached schema runs there (bd-az48n).
+  - A re-prepared statement replaces the stale one in its handle (bd-tj811).
+  - A transaction begun by SAVEPOINT commits its DDL.
+  - INSERT ... SELECT into a missing table says `no such table`.
+- Time travel and attached databases:
+  - `FOR SYSTEM_TIME` queries answer as stock frozen at that commit (bd-zjocc).
+  - Mixed main + attached SELECTs route FROM-less bodies and aggregates correctly (bd-gjlhh).
+  - RELEASE-as-COMMIT commits attached participants.
+- The first-open migration pass also runs on stock-created databases FrankenSQLite wrote last
+  (bd-6jf9o review, [f4bfc92df](https://github.com/Dicklesworthstone/frankensqlite/commit/f4bfc92df)).
+- The shell supports `.print` (bd-5heqk).
+
+### Performance
+
+The numbers below are the measurements recorded in the cited commits; each commit message gives
+its method and the stock `sqlite3` comparison.
+
+- UPDATE ... FROM pass 1 seeks the target row by rowid instead of scanning per FROM row. It had been
+  quadratic: 10k rows took 39.8 s, against stock's 0.05 s (bd-7orjo,
+  [f3754e71e](https://github.com/Dicklesworthstone/frankensqlite/commit/f3754e71e)).
+- A join on several ON equalities seeks the composite index they pin: over 120 s (killed) -> 0.06 s
+  ([07cf6c5a6](https://github.com/Dicklesworthstone/frankensqlite/commit/07cf6c5a6)). Related changes:
+  - A composite equality scan seeks every pinned key term (bd-gtjlv).
+  - A numeric probe into a typeless index seeks a map of its numeric TEXT keys (bd-k8ebx).
+  - Index seeks compare stored keys in place (e8cdc0530).
+- Trigger bodies bind OLD/NEW as parameters and reuse one compiled program (bd-l9j27). Trigger guard
+  probes seek their outer table (bd-8c68u). Row-by-row DML replay reuses one compiled program
+  (bd-so2el).
+- Correlated subqueries reuse their read cursors across outer rows (bd-a3g0m). Whole-table
+  min()/max() bare columns are tracked in bytecode: 1.10 -> 0.60 s (bd-6hoc8,
+  [28049bf87](https://github.com/Dicklesworthstone/frankensqlite/commit/28049bf87)).
+- `:memory:` time-travel snapshots share committed pages. On a 3M-row database a one-row COMMIT went
+  from 0.56-0.62 s to 0.021-0.023 s (bd-jdjee,
+  [c52c2f112](https://github.com/Dicklesworthstone/frankensqlite/commit/c52c2f112)).
+- WAL-FEC keeps its sidecar group map between commits and encodes small groups through source
+  coefficients (bd-sid3o, bd-wqmil).
+- Futex wakes are skipped when nothing waits (bd-ih8ak). The first-open migration pass skips databases
+  another SQLite library wrote last (bd-6jf9o). UPDATE no longer pays per row for a witness copy
+  (bd-yb70u, GH#439).
+
+### Experimental (not reachable from `Connection`)
+
+The `fsqlite-wal`/`fsqlite-pager` native snapshot-transaction stack grew substantially. It covers
+VFS-backed two-barrier commit publication, RaptorQ-authenticated recovery, page history and
+reclamation, native schema catalogs, and engine dispatch of native transactions. Public
+`Connection` does not select it. It ships as library surface for integration work, with no claim
+of production durability. Its commits landed without a compile. The release gate made them build
+and pass `clippy -D warnings` without behaviour changes
+([311e156d0](https://github.com/Dicklesworthstone/frankensqlite/commit/311e156d0)), but several of
+its `fsqlite-harness` integration tests still fail at runtime. One example: VDBE execution over a
+native transaction errors, because the engine-side binding is not implemented yet.
+
+### Not in this release
+
+- GH#492 (prepared-read hydration cost) and GH#493 (schema-only CTE hydration) are **not fixed**.
+  Main carries only unapplied candidate patches under `artifacts/gh492` and `artifacts/gh493`, plus
+  their regression tests. The GH#492 growth case is `#[ignore]`d. Its non-ignored
+  `small_ordinary_database_retains_memdb_acceleration` fails at this release: it expects a point
+  read on a fresh small-database open to hydrate rows into MemDatabase, but current reads use
+  storage cursors without hydration. The test was committed unrun and encodes the candidate
+  patch's intended behaviour.
+- Still open from the v0.4.9 known issues:
+  - **known data loss (GH#211):** renaming an explicitly declared FTS5 external-content table
+    and then requesting `rebuild` can silently drop a posting. Content rows survive and ordinary
+    integrity checks pass;
+  - table-free constant row-value equality returns an unsupported-expression error (GH#450);
+  - the issues filed from the v0.4.9 full-workspace gate, GH#453–GH#488 (mostly qualification
+    harness and timing keepers; see the 0.4.9 section).
+- Still open, newer reports:
+  - **known corruption under concurrency (bd-ujp0h):** with several connections on one file each
+    inserting rows with implicit rowids, two connections can commit the same rowid, silently:
+    every INSERT reports success. Stock `integrity_check` then reports `Rowid N out of order`.
+    Eight writers looping autocommit INSERTs hit it in 1 to 4 of every 12 runs on the Mac, and on
+    Linux, and it predates this release. The prepared-INSERT fast path takes implicit rowids from
+    connection-local state instead of the shared concurrent rowid allocator. Two writers can then
+    take the same `max(rowid) + 1` and land it on different leaves, so the page-level conflict
+    check sees no overlap. A fix is in progress for 0.4.11. Until then, a workload whose rowids
+    must be unique across writers should insert through a single writer connection;
+  - per-statement WARN flood on the trigger/FK INSERT fallback (GH#490);
+  - slow expression-index creation and primary-key inserts (GH#489, GH#491).
+
+### Qualification
+
+All runs used Linux x86_64 rch remote workers, driven from trj with the pinned toolchain
+(nightly-2026-08-31), on 2026-10-06/07. GitHub Actions is off.
+
+The release tree is 311e156d0 plus the bd-obwsy keeper, its fix (9f7534c5c) and the follow-up
+guard (d55f379da), plus the version bump.
+
+- **Release tree:**
+  - `cargo fmt --check`, `cargo check --workspace --all-targets --locked` and `cargo clippy
+    --workspace --all-targets --locked -D warnings` pass.
+  - bd-obwsy keeper: 8/8.
+  - `fsqlite-btree` lib: 525/0.
+  - Insert-path keepers, all pass: `ipk_value_must_be_int_oracle`,
+    `unique_conflict_check_order_oracle`, `rowid_max_explicit_insert_oracle`,
+    `bd_8a8pr_rowid_reuse_after_statement_rollback_oracle`, `bd_b5j26_update_from_rowid_oracle`,
+    `btree_page_geometry_stress_oracle`, `index_seek_random_differential`,
+    `memory_mirror_snapshot_differential`, `gh441_vacuum_overflow_freelist`; facade
+    `concurrent_freelist_churn`.
+  - `fsqlite-core` lib: 3979/0.
+  - The owner's CLI repro (`minimal_repro.py`, run against a debug CLI freshly built from this
+    tree): all 7 cases OK.
+- **Library suites at 1abcf186f/311e156d0, 0 failures each:**
+
+  | Crate | Passed |
+  |---|---|
+  | types | 571 |
+  | vfs | 468 |
+  | wal | 1034 |
+  | pager | 1016 |
+  | mvcc | 1667 |
+  | parser | 613 |
+  | planner | 457 |
+  | vdbe | 1182 |
+  | core | 3979 |
+  | fsqlite | 732 |
+  | c-api | 55 |
+  | btree | 523 |
+  | wasm | 15 |
+- **Keepers at 311e156d0:**
+  - All 92 `fsqlite-core` integration targets on the release keeper list pass except one:
+    `gh492_bounded_post_commit_hydration`'s small-database case (see "Not in this release").
+  - The fault-injection failed-commit keeper passes.
+  - Facade: `compat_tests` 88, `gh444`, `single_writer_ddl_batch_freelist_republication`,
+    `concurrent_freelist_churn`.
+  - CLI: `gh442` VACUUM INTO beside an idle peer.
+  - e2e: SSI serialization, transactions, golden bytecode shapes, savepoint and isolation
+    oracles, q37ep index-churn corruption, WAL-corruption recovery, crash-recovery matrix.
+  - VDBE golden snapshots: 8.
+- `wal_fec_commit_pipeline`: three tests exceeded their 30 s wall-clock budget for the WAL-FEC
+  sidecar lock on a worker at load 25 on 10 cores. A rerun on another worker passed 16/16 in
+  6 s.
+- **Performance of the bd-obwsy fix:** the peer's callgrind run of 200k small rows measured the
+  whole program at -0.3% instructions and `execute_morsel_insert` at +0.44%. Here, same-profile
+  release CLIs (LTO off, 16 codegen units, built from 311e156d0 and this tree) ran 9 alternating
+  rounds each, pinned to 8 cores on trj on 2026-10-07. Median CPU fix/base:
+  - 100k single-row INSERTs: 0.956;
+  - 100k rows in 200-row statements: 1.012;
+  - 6k wide rows in 200-row statements: 0.999.
+
+  The pre-fix binary corrupted the last two workloads (stock `integrity_check` failed); the fixed
+  binary passed every run.
+- **Not run:** the full workspace test suite and the all-features matrix. The experimental
+  native-stack harness tests pass 59/74 (bd-qmadh).
 
 ---
 

@@ -10210,7 +10210,13 @@ impl<P: PageWriter> BtCursor<P> {
         let mut writer_slot = Some(writer);
         let usable_size = self.usable_size;
         let mut mutate_payload_result: Result<Option<(u16, u16)>> = Ok(None);
+        let mut staged_page_moved_on = false;
         let mut mutate_payload_only = |staged_page: &mut PageData| {
+            // bd-obwsy: same fail-closed check as the byte-slice variant.
+            if !Self::retained_leaf_header_matches(staged_page, hint.leaf_page, &hint.header) {
+                staged_page_moved_on = true;
+                return;
+            }
             let Some(writer) = writer_slot.take() else {
                 mutate_payload_result = Err(FrankenError::internal(
                     "retained writer append attempted to consume writer twice",
@@ -10232,6 +10238,10 @@ impl<P: PageWriter> BtCursor<P> {
             .pager
             .try_mutate_staged_page_data(hint.leaf_page, &mut mutate_payload_only)
         {
+            if staged_page_moved_on {
+                hint.clear_page_data();
+                return Ok(false);
+            }
             if mutate_payload_result?.is_some() {
                 self.last_insert_rowid = Some(rowid);
                 self.last_known_depth = Some(hint.tree_depth);

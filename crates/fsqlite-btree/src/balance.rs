@@ -412,6 +412,16 @@ pub(crate) async fn balance_quick_known_divider_rowid<W: PageWriter>(
     let parent_offset = header_offset_for_page(parent_page_no);
     let parent_header = parse_page_header(parent_data.as_bytes(), parent_page_no)?;
 
+    // The append is only an append if `leaf_page_no` is still the parent's
+    // right child. A caller holding a stale leaf/parent hint (bd-obwsy) would
+    // otherwise hang a new right edge off a leaf that a split already moved
+    // away from it; the full balance below re-derives the real position.
+    if parent_header.page_type != BtreePageType::InteriorTable
+        || parent_header.right_child != Some(leaf_page_no)
+    {
+        return Ok(None);
+    }
+
     // Build the exact divider up front so the quick-balance gate uses the
     // space the parent will actually consume, not the worst-case varint size.
     let mut divider = [0u8; 13]; // 4-byte child pointer + up to 9-byte varint.
@@ -3442,6 +3452,60 @@ mod tests {
                 store.write_count(new_pgno),
                 1,
                 "quick balance should write the new sibling once"
+            );
+        });
+    }
+
+    /// bd-obwsy: a leaf that is no longer the parent's right child (a split
+    /// moved the right edge past it) must not get a new right sibling.
+    #[test]
+    fn test_balance_quick_refuses_a_leaf_that_is_not_the_right_child() {
+        run_async(async {
+            let cx = Cx::new();
+            let mut store = RecordingMemPageStore::new(MemPageStore::new(20));
+
+            // Page 3 is now a left child (divider 20); page 5 is the right edge.
+            let parent = build_interior_table(&[(pn(3), 20)], pn(5));
+            store.inner.pages.insert(2, parent.clone());
+            store
+                .inner
+                .pages
+                .insert(3, build_leaf_table(&[(10, b"ten"), (20, b"twenty")]));
+            store
+                .inner
+                .pages
+                .insert(5, build_leaf_table(&[(25, b"twenty-five")]));
+            let next_page_before = store.inner.next_page;
+
+            let mut overflow_cell = [0u8; 64];
+            let mut pos = 0;
+            pos += write_varint(&mut overflow_cell[pos..], 5);
+            pos += write_varint(&mut overflow_cell[pos..], 30);
+            overflow_cell[pos..pos + 5].copy_from_slice(b"hello");
+            pos += 5;
+
+            let result = balance_quick(
+                &cx,
+                &mut store,
+                pn(2),
+                pn(3),
+                &overflow_cell[..pos],
+                30,
+                USABLE,
+                USABLE,
+            )
+            .await
+            .expect("a stale leaf is refused, not an error");
+
+            assert!(
+                result.is_none(),
+                "stale leaf must fall back to a full balance"
+            );
+            assert_eq!(store.write_count(pn(2)), 0, "parent must be untouched");
+            assert_eq!(store.inner.pages.get(&2), Some(&parent));
+            assert_eq!(
+                store.inner.next_page, next_page_before,
+                "no sibling page may be allocated"
             );
         });
     }
