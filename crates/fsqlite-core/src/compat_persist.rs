@@ -52,7 +52,10 @@ use crate::connection::{
     validate_builtin_persisted_index_expr_functions,
 };
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
-use crate::connection::{eval_join_expr, is_sqlite_truthy, qualified_unique_constraint_label};
+use crate::connection::{
+    eval_join_expr, is_sqlite_truthy, qualified_unique_constraint_label,
+    unshadowed_hidden_rowid_alias,
+};
 use fsqlite_types::{
     DATABASE_HEADER_SIZE, DatabaseHeader, PageNumber, PageSize, without_rowid_storage_order,
 };
@@ -1416,13 +1419,27 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
             Some(create_sql),
         ));
 
-        // Build column map once for evaluating partial index WHERE predicates.
-        // [(table_name, column_name, is_rowid_alias), ...]
-        let col_map: Vec<(String, String, bool)> = table
+        // Build column map once for evaluating partial index WHERE predicates
+        // and expression keys. [(table_name, column_name, is_rowid_alias), ...]
+        let mut col_map: Vec<(String, String, bool)> = table
             .columns
             .iter()
             .map(|c| (table.name.clone(), c.name.clone(), false))
             .collect();
+        // bd-5i5md: a rowid table's row image also carries its hidden rowid,
+        // under the same pseudo column integrity_check evaluates against
+        // (`push_hidden_rowid_eval_column`). Without it `WHERE rowid > 0`
+        // failed to resolve, the row was kept, and the rebuilt index held
+        // every row. A WITHOUT ROWID table's map key is a synthetic counter,
+        // not a rowid, so it is never exposed.
+        let hidden_rowid_slot = if table.without_rowid {
+            false
+        } else if let Some(alias) = unshadowed_hidden_rowid_alias(table) {
+            col_map.push((table.name.clone(), alias.to_owned(), true));
+            true
+        } else {
+            false
+        };
 
         // Write index B-trees for all indexes including autoindexes.
         // Autoindexes (sqlite_autoindex_*) are created for UNIQUE constraints
@@ -1616,12 +1633,25 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
                     // larger than stock's. Stock SQLite's VACUUM sorts index
                     // entries first; mirror that with the cursor's own comparator.
                     let mut index_keys: Vec<Vec<SqliteValue>> = Vec::new();
+                    let evaluates_row = partial_predicate.is_some() || is_expression_index;
+                    let mut row_image: Vec<SqliteValue> = Vec::new();
                     for (rowid, values) in mem_table.iter_rows() {
+                        // The row as predicates and key expressions see it:
+                        // its columns, then its rowid when `col_map` has a
+                        // slot for it.
+                        let eval_row: &[SqliteValue] = if hidden_rowid_slot && evaluates_row {
+                            row_image.clear();
+                            row_image.extend_from_slice(values);
+                            row_image.push(SqliteValue::Integer(rowid));
+                            &row_image
+                        } else {
+                            values
+                        };
                         // For partial indexes, skip rows that don't match
                         // the WHERE predicate. If evaluation fails, include
                         // the row (safe default).
                         if let Some(ref predicate) = partial_predicate
-                            && let Ok(result) = eval_join_expr(predicate, values, &col_map)
+                            && let Ok(result) = eval_join_expr(predicate, eval_row, &col_map)
                             && !is_sqlite_truthy(&result)
                         {
                             continue;
@@ -1631,7 +1661,7 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
                         let mut key_values: Vec<SqliteValue> = Vec::new();
                         if is_expression_index {
                             for expr in &key_exprs {
-                                key_values.push(eval_join_expr(expr, values, &col_map)?);
+                                key_values.push(eval_join_expr(expr, eval_row, &col_map)?);
                             }
                         } else {
                             for col_name in &index.columns {

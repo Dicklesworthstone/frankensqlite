@@ -153309,7 +153309,7 @@ enum InsertTarget {
 
 /// The first hidden rowid alias (`rowid`, `_rowid_`, `oid`) that no declared
 /// column of `table` shadows.
-fn unshadowed_hidden_rowid_alias(table: &TableSchema) -> Option<&'static str> {
+pub(crate) fn unshadowed_hidden_rowid_alias(table: &TableSchema) -> Option<&'static str> {
     ["rowid", "_rowid_", "oid"].into_iter().find(|alias| {
         !table
             .columns
