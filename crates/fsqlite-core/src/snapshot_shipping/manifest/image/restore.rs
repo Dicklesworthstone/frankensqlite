@@ -138,12 +138,14 @@ impl Connection {
     /// Failure, cancellation or loss of the response may leave a partial OR
     /// complete candidate. Retain it and the journal; quiesce abandoned backend
     /// I/O before inspecting them. A new restore attempt needs a freshly reopened
-    /// journal and another absent destination. No rollback-by-unlink is attempted.
+    /// journal and another absent destination. A complete, still-private output
+    /// can instead use `confirm_restored_snapshot` to recover confirmation
+    /// without replaying or rewriting it. No rollback-by-unlink is attempted.
     ///
     /// The byte cap governs the image, not total RSS or validation spool space.
     /// Replay retains the journal's decoder limits; verification uses one page
     /// of scratch and the existing disk-spooled semantic validator. That
-    /// validator owns its default ConnectionEnv; `cx` governs replay/readback
+    /// validator owns its default `ConnectionEnv`; `cx` governs replay/readback
     /// and is checked before and after validation, not raced against it. The
     /// receipt confirms the native VFS's sync contract, not hardware power-loss
     /// qualification, SQL foreign-key validity or transport authentication.
@@ -164,6 +166,11 @@ impl Connection {
             return Err(FrankenError::BusyRecovery);
         }
         let vfs = NativeVfs::new();
+        // Refuse the caller's final entry before pathname resolution can
+        // resolve a symlink to a different, possibly absent, destination.
+        if vfs.path_entry_exists(cx, destination)? {
+            return Err(FrankenError::CannotOpen { path: destination.to_owned() });
+        }
         let destination = vfs.full_pathname(cx, destination)?;
         // Reject non-UTF-8 before reservation; Connection uses UTF-8 filenames.
         if destination.to_str().is_none() {
@@ -190,5 +197,64 @@ impl Connection {
             return Err(corrupt("restored snapshot changed after journal replay"));
         }
         Ok(verified)
+    }
+
+    /// Recover a lost restore confirmation by verifying an existing private
+    /// candidate against the ORIGINAL trusted manifest, then freshly syncing
+    /// its file and directory. No old receipt is accepted as evidence.
+    ///
+    /// This never creates, truncates, rewrites, repairs, renames or deletes the
+    /// candidate. Every page is authenticated before the SQL engine opens it;
+    /// the bounded semantic gate then runs read-only, followed by another exact
+    /// byte verification and new sync barriers. Missing/partial/changed files,
+    /// aliases and existing database namespaces fail closed. Unsupported image
+    /// features rejected by the bounded validator do not trigger a fallback.
+    ///
+    /// Keep the same trusted manifest identity after an uncertain outcome; do
+    /// not construct a replacement manifest from potentially damaged bytes.
+    /// Quiesce any abandoned restore I/O BEFORE calling. The caller must own
+    /// the candidate and its directory ancestry exclusively, and must not have
+    /// activated/opened it as a writable database. Confirmation proves image
+    /// contents and the native VFS sync contract, not the provenance of an
+    /// arbitrary transfer journal, atomic replica activation or log continuity.
+    /// The same resource/cancellation qualifications as restore apply.
+    pub async fn confirm_restored_snapshot(
+        cx: &Cx,
+        destination: &Path,
+        manifest: &SnapshotManifest,
+        expected_id: [u8; 32],
+        max_image_bytes: u64,
+    ) -> Result<SnapshotImageReceipt> {
+        checkpoint(cx)?;
+        image_geometry(manifest, expected_id, max_image_bytes)?;
+        let vfs = NativeVfs::new();
+        require_private_namespace(&vfs, cx, destination)?;
+        // Probe the supplied final entry BEFORE canonical pathname resolution,
+        // otherwise a resolving VFS could hide a symlink/reparse-point alias.
+        let probe = host_fs::open_existing_regular_file_no_follow(destination)?;
+        let identity = FileIdentity::from_file(&probe)?.ok_or(FrankenError::BusyRecovery)?;
+        let destination = vfs.full_pathname(cx, destination)?;
+        if destination.to_str().is_none() {
+            return Err(FrankenError::CannotOpen { path: destination });
+        }
+        require_private_namespace(&vfs, cx, &destination)?;
+        // No CREATE flag occurs on this recovery path. Bind the VFS reader to
+        // the exact file admitted by the no-follow probe above.
+        let (file, _) = vfs.open(cx, Some(&destination), VfsOpenFlags::READONLY)?;
+        if file.file_identity()? != Some(identity) {
+            return Err(FrankenError::BusyRecovery);
+        }
+        let before = verify_image(cx, &file, manifest, expected_id, max_image_bytes).await?;
+        // All independent main-file descriptors close BEFORE opening the
+        // engine, so their drops cannot release the validator's POSIX locks.
+        drop(file);
+        drop(probe);
+        let after = validate_and_confirm(
+            cx, &vfs, &destination, identity, manifest, max_image_bytes,
+        ).await?;
+        if before != after {
+            return Err(corrupt("restored snapshot changed during confirmation"));
+        }
+        Ok(after)
     }
 }

@@ -78,7 +78,7 @@ async fn journal(
         let Some(mut packet) = sender.next_packet(cx).await.unwrap() else { break; };
         packet.attach_auth_tag(&KEY);
         spool.append(cx, &packet).await.unwrap();
-        spool.take_decoded_blocks();
+        drop(spool.take_decoded_blocks());
         emitted += 1;
     }
     if packets.is_none() { assert!(spool.receiver().is_complete()); }
@@ -189,6 +189,10 @@ fn native_restore_refuses_authenticated_btree_corruption_without_repair() {
             &cx, &mut spool, &destination, manifest.id(), CAP,
         ).await.is_err());
         assert_eq!(std::fs::read(&destination).unwrap(), bytes, "never repair or delete failed evidence");
+        assert!(Connection::confirm_restored_snapshot(
+            &cx, &destination, &manifest, manifest.id(), CAP,
+        ).await.is_err(), "a matching manifest cannot bypass semantic validation");
+        assert_eq!(std::fs::read(&destination).unwrap(), bytes);
     });
 }
 
@@ -204,5 +208,111 @@ fn native_restore_incomplete_verified_journal_cannot_return_an_image_receipt() {
         ).await.is_err());
         assert!(destination.exists(), "failed reservations are retained, never unlinked");
         assert!(std::fs::read(&destination).unwrap().is_empty());
+    });
+}
+
+#[test]
+fn native_restore_lost_confirmation_is_recovered_without_replay_or_rewrite() {
+    run(async {
+        let dir = tempfile::tempdir().unwrap(); let cx = cx();
+        let (bytes, _) = sql_image(&dir.path().join("oracle.db"), "UTF-8");
+        let (manifest, mut spool) = journal(&cx, &bytes, None).await;
+        let destination = dir.path().join("candidate.db");
+        let first = Connection::restore_snapshot_transfer(
+            &cx, &mut spool, &destination, manifest.id(), CAP,
+        ).await.unwrap();
+        // Model loss of the return value: recovery uses neither the receipt
+        // nor the consumed journal. Only original trusted transfer identity.
+        drop(spool);
+        let identity = {
+            let file = std::fs::File::open(&destination).unwrap();
+            fsqlite_vfs::FileIdentity::from_file(&file).unwrap()
+        };
+        let modified = std::fs::metadata(&destination).unwrap().modified().unwrap();
+        for _ in 0..2 {
+            let confirmed = Connection::confirm_restored_snapshot(
+                &cx, &destination, &manifest, manifest.id(), CAP,
+            ).await.unwrap();
+            assert_eq!(confirmed, first);
+            assert_eq!(std::fs::read(&destination).unwrap(), bytes);
+            assert_eq!(std::fs::metadata(&destination).unwrap().modified().unwrap(), modified);
+            let file = std::fs::File::open(&destination).unwrap();
+            assert_eq!(fsqlite_vfs::FileIdentity::from_file(&file).unwrap(), identity);
+        }
+    });
+}
+
+#[test]
+fn native_confirmation_rejects_partial_or_changed_images_before_sql_open() {
+    run(async {
+        let dir = tempfile::tempdir().unwrap(); let cx = cx();
+        let (bytes, _) = sql_image(&dir.path().join("oracle.db"), "UTF-8");
+        let (manifest, _) = journal(&cx, &bytes, None).await;
+        let mut changed = bytes.clone();
+        changed[72] ^= 1; // Header-reserved byte: geometry still agrees.
+        let destination = dir.path().join("changed.db");
+        std::fs::write(&destination, &changed).unwrap();
+        let error = Connection::confirm_restored_snapshot(
+            &cx, &destination, &manifest, manifest.id(), CAP,
+        ).await.unwrap_err();
+        assert!(error.to_string().contains("does not match its manifest"), "{error}");
+        assert_eq!(std::fs::read(&destination).unwrap(), changed);
+        let truncated = dir.path().join("partial.db");
+        std::fs::write(&truncated, &bytes[..bytes.len() - 1]).unwrap();
+        assert!(Connection::confirm_restored_snapshot(
+            &cx, &truncated, &manifest, manifest.id(), CAP,
+        ).await.is_err());
+        assert_eq!(std::fs::read(&truncated).unwrap(), &bytes[..bytes.len() - 1]);
+        let absent = dir.path().join("absent.db");
+        assert!(Connection::confirm_restored_snapshot(
+            &cx, &absent, &manifest, manifest.id(), CAP,
+        ).await.is_err());
+        assert!(!absent.exists());
+        for candidate in [&destination, &truncated, &absent] {
+            for suffix in ["-wal", "-shm", "-journal", "-fsqlite-ns-gate", "-fsqlite-ns-use"] {
+                assert!(!sidecar(candidate, suffix).exists());
+            }
+        }
+    });
+}
+
+#[test]
+fn native_confirmation_rejects_aliases_admitted_namespaces_and_wrong_identity() {
+    run(async {
+        let dir = tempfile::tempdir().unwrap(); let cx = cx();
+        let (bytes, _) = sql_image(&dir.path().join("oracle.db"), "UTF-8");
+        let (manifest, _) = journal(&cx, &bytes, None).await;
+        let destination = dir.path().join("candidate.db");
+        std::fs::write(&destination, &bytes).unwrap();
+        let cancelled = Cx::new(); cancelled.cancel();
+        assert!(matches!(Connection::confirm_restored_snapshot(
+            &cancelled, &destination, &manifest, manifest.id(), CAP,
+        ).await, Err(FrankenError::Abort)));
+        assert!(Connection::confirm_restored_snapshot(
+            &cx, &destination, &manifest, [0; 32], CAP,
+        ).await.is_err());
+        assert!(matches!(Connection::confirm_restored_snapshot(
+            &cx, &destination, &manifest, manifest.id(), bytes.len() as u64 - 1,
+        ).await, Err(FrankenError::TooBig)));
+        let symlink = dir.path().join("alias.db");
+        std::os::unix::fs::symlink(&destination, &symlink).unwrap();
+        assert!(Connection::confirm_restored_snapshot(
+            &cx, &symlink, &manifest, manifest.id(), CAP,
+        ).await.is_err());
+        let hardlink = dir.path().join("hardlink.db");
+        std::fs::hard_link(&destination, &hardlink).unwrap();
+        assert!(Connection::confirm_restored_snapshot(
+            &cx, &hardlink, &manifest, manifest.id(), CAP,
+        ).await.is_err());
+        assert_eq!(std::fs::read(&destination).unwrap(), bytes);
+        for suffix in ["-wal", "-shm", "-journal", "-fsqlite-ns-gate", "-fsqlite-ns-use"] {
+            let candidate = dir.path().join(format!("admitted{suffix}.db"));
+            std::fs::write(&candidate, &bytes).unwrap();
+            std::fs::write(sidecar(&candidate, suffix), b"existing namespace").unwrap();
+            assert!(Connection::confirm_restored_snapshot(
+                &cx, &candidate, &manifest, manifest.id(), CAP,
+            ).await.is_err());
+            assert_eq!(std::fs::read(&candidate).unwrap(), bytes);
+        }
     });
 }
