@@ -1,6 +1,8 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+mod strict_integrity;
+
 impl Connection {
     pub(super) async fn pragma_integrity_check_rows(
         &self,
@@ -117,7 +119,8 @@ impl Connection {
     /// `CHECK constraint failed in T` per row. The scan asks each constrained
     /// table for its violating rows only, reading short records through their
     /// column defaults and evaluating CHECK exactly as a write does (a NULL
-    /// result passes); a table with no such constraint is not read at all.
+    /// result passes). STRICT tables additionally verify stored datatypes,
+    /// including nullable columns and generated columns, in the same scan.
     async fn integrity_check_row_constraints(
         &self,
         only_table: Option<&str>,
@@ -161,12 +164,17 @@ impl Connection {
                 })
                 .map(|column| column.name.as_str())
                 .collect();
-            if not_null.is_empty() && table.check_constraints.is_empty() {
+            let strict_types = self.integrity_check_strict_type_predicates(table).await?;
+            if not_null.is_empty()
+                && strict_types.is_empty()
+                && table.check_constraints.is_empty()
+            {
                 continue;
             }
             let predicates: Vec<String> = not_null
                 .iter()
                 .map(|column| format!("{} IS NULL", quote_identifier(column)))
+                .chain(strict_types.iter().map(|(predicate, _)| predicate.clone()))
                 .chain(
                     table
                         .check_constraints
@@ -175,7 +183,7 @@ impl Connection {
                 )
                 .collect();
             let sql = format!(
-                "SELECT {} FROM main.{} WHERE {} LIMIT {}",
+                "SELECT {} FROM main.{} NOT INDEXED WHERE {} LIMIT {}",
                 predicates.join(", "),
                 quote_identifier(&table.name),
                 predicates
@@ -187,10 +195,16 @@ impl Connection {
             );
             let is_true = |value: &SqliteValue| matches!(value, SqliteValue::Integer(1));
             for row in self.query(&sql).await? {
-                let (nulls, checks) = row.values().split_at(not_null.len());
+                let (nulls, remaining) = row.values().split_at(not_null.len());
+                let (types, checks) = remaining.split_at(strict_types.len());
                 for (column, value) in not_null.iter().zip(nulls) {
                     if is_true(value) {
                         reports.push(format!("NULL value in {}.{column}", table.name));
+                    }
+                }
+                for ((_, diagnostic), value) in strict_types.iter().zip(types) {
+                    if is_true(value) {
+                        reports.push(diagnostic.clone());
                     }
                 }
                 if checks.iter().any(is_true) {
