@@ -24,6 +24,8 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+mod schema_only_cte;
+
 /// What a FROM item's relation is, as far as column binding needs it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct QualifiedColumnRelation {
@@ -125,14 +127,24 @@ impl Connection {
     /// SQLite does (see the module docs). Returns the rewritten statement,
     /// `None` when there is nothing to rewrite, or stock's "no such column" /
     /// "ambiguous column name" error.
+    ///
+    /// This is the shared pre-execution entry point for direct and prepared
+    /// statements. After binding, schema-only SELECTs may also lower a
+    /// transparent, single-use CTE to an ordinary derived-table read.
     pub(super) fn bind_schema_qualified_columns(
         &self,
         statement: &Statement,
     ) -> Result<Option<Statement>> {
-        if !statement_needs_binding(statement) {
-            return Ok(None);
-        }
-        bind_schema_qualified_columns_with(self, statement)
+        let bound = if statement_needs_binding(statement) {
+            bind_schema_qualified_columns_with(self, statement)?
+        } else {
+            None
+        };
+        // Bind the original WITH scope first: a CTE has no owning database,
+        // and lowering must not make an invalid main.cte.column reference
+        // resolve to a real table with that name.
+        let lowered = self.lower_schema_only_projection_cte(bound.as_ref().unwrap_or(statement));
+        Ok(lowered.or(bound))
     }
 
     /// A table or view of this connection's own MAIN or TEMP database.
