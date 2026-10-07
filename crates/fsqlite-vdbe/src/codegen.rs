@@ -249,6 +249,19 @@ fn effective_oe(
     conflict_action_to_oe(stmt_level.or(constraint_level).as_ref())
 }
 
+/// bd-nn29x: the `OE_*` algorithm a failing constraint `Halt` carries in P2,
+/// which tells the statement boundary to keep the statement's rows (FAIL),
+/// undo them (ABORT) or end the transaction (ROLLBACK), as stock's
+/// `Vdbe.errorAction` does. IGNORE and REPLACE reach a halt only where they
+/// cannot be applied (a CHECK, or a NOT NULL column with no DEFAULT to
+/// substitute), and stock resolves those as ABORT.
+fn halt_conflict_oe(oe: u16) -> i32 {
+    match oe {
+        OE_ROLLBACK | OE_FAIL => i32::from(oe),
+        _ => i32::from(OE_ABORT),
+    }
+}
+
 fn json_access_func_name(arrow: JsonArrow) -> &'static str {
     match arrow {
         JsonArrow::Arrow => "->",
@@ -22962,7 +22975,7 @@ pub fn codegen_insert(
                 P4::Affinity(table.affinity_string()),
                 0,
             );
-            emit_check_constraints(b, table, col_regs, None);
+            emit_check_constraints(b, table, col_regs, stmt_level, None);
             emit_not_null_constraints(b, table, col_regs, stmt_level, None);
             let pk_oe = effective_oe(
                 stmt_level,
@@ -23300,7 +23313,6 @@ fn emit_upsert_do_update_apply(
     n_cols: usize,
     n_cols_i32: i32,
     aff_str: &str,
-    stmt_level: Option<ConflictAction>,
     returning: &[ResultColumn],
     table_alias: Option<&str>,
     ctx: &CodegenContext,
@@ -23415,8 +23427,11 @@ fn emit_upsert_do_update_apply(
         P4::Affinity(table.affinity_string()),
         0,
     );
-    emit_check_constraints(b, table, existing_regs, None);
-    emit_not_null_constraints(b, table, existing_regs, stmt_level, None);
+    // bd-nn29x: stock codes the DO UPDATE as an UPDATE under ABORT
+    // (`sqlite3UpsertDoUpdate` passes OE_Abort), so its constraint failures
+    // undo the whole statement whatever the outer `OR` clause says.
+    emit_check_constraints(b, table, existing_regs, Some(ConflictAction::Abort), None);
+    emit_not_null_constraints(b, table, existing_regs, Some(ConflictAction::Abort), None);
     emit_index_deletes_for_update(b, table, cursor, None);
     b.emit_op(Opcode::Delete, cursor, 0, 0, P4::None, OPFLAG_ISUPDATE);
 
@@ -23711,7 +23726,7 @@ fn codegen_insert_values(
         } else {
             None
         };
-        emit_check_constraints(b, table, val_regs, check_ignore);
+        emit_check_constraints(b, table, val_regs, stmt_level, check_ignore);
         emit_not_null_constraints(b, table, val_regs, stmt_level, ignore_skip);
 
         // Apply column type affinities before packing the record.
@@ -23795,7 +23810,6 @@ fn codegen_insert_values(
                             n_cols,
                             n_cols_i32,
                             &aff_str,
-                            stmt_level,
                             returning,
                             table_alias,
                             ctx,
@@ -24260,7 +24274,7 @@ fn codegen_insert_select(
     } else {
         None
     };
-    emit_check_constraints(b, target_table, final_regs, check_ignore);
+    emit_check_constraints(b, target_table, final_regs, stmt_level, check_ignore);
     emit_not_null_constraints(b, target_table, final_regs, stmt_level, ignore_target);
     let pk_oe = effective_oe(
         stmt_level,
@@ -24513,7 +24527,7 @@ fn codegen_insert_select_without_from(
         P4::Affinity(target_table.affinity_string()),
         0,
     );
-    emit_check_constraints(b, target_table, final_regs, check_ignore);
+    emit_check_constraints(b, target_table, final_regs, stmt_level, check_ignore);
     emit_not_null_constraints(b, target_table, final_regs, stmt_level, ignore_target);
 
     // Apply column type affinities before packing the record.
@@ -25106,6 +25120,20 @@ pub fn codegen_update(
         } else {
             None
         };
+    // bd-nn29x: a NOT NULL column that declares its own `ON CONFLICT IGNORE`
+    // skips the row too when the statement has no `OR` clause, as INSERT
+    // already does; a CHECK has no clause of its own.
+    let not_null_ignore_label = constraint_ignore_label.or_else(|| {
+        table
+            .columns
+            .iter()
+            .any(|column| {
+                column.notnull
+                    && !column.is_ipk
+                    && effective_oe(stmt.or_conflict, column.conflict_action) == OE_IGNORE
+            })
+            .then(|| apply_seek_miss_label.unwrap_or(apply_done_label))
+    });
     emit_strict_type_check(b, table, col_regs);
     // GH #169: coerce to column affinity before CHECK/NOT NULL so the
     // constraints see the affinity-coerced value (SQLite applies affinity, then
@@ -25118,14 +25146,14 @@ pub fn codegen_update(
         P4::Affinity(table.affinity_string()),
         0,
     );
-    emit_check_constraints(b, table, col_regs, constraint_ignore_label);
-    emit_not_null_constraints(
+    emit_check_constraints(
         b,
         table,
         col_regs,
         stmt.or_conflict,
         constraint_ignore_label,
     );
+    emit_not_null_constraints(b, table, col_regs, stmt.or_conflict, not_null_ignore_label);
 
     // Constraints passed: now perform the destructive delete+insert rewrite.
     // Index maintenance (bd-2f9t): Delete OLD index entries. The indexed key
@@ -26178,14 +26206,27 @@ fn codegen_update_from(
         } else {
             None
         };
-    emit_check_constraints(b, target, col_regs, constraint_ignore_label);
-    emit_not_null_constraints(
+    // bd-nn29x: a NOT NULL column's own `ON CONFLICT IGNORE` skips the row
+    // too, as in the plain UPDATE lane.
+    let not_null_ignore_label = constraint_ignore_label.or_else(|| {
+        target
+            .columns
+            .iter()
+            .any(|column| {
+                column.notnull
+                    && !column.is_ipk
+                    && effective_oe(stmt.or_conflict, column.conflict_action) == OE_IGNORE
+            })
+            .then_some(row_done)
+    });
+    emit_check_constraints(
         b,
         target,
         col_regs,
         stmt.or_conflict,
         constraint_ignore_label,
     );
+    emit_not_null_constraints(b, target, col_regs, stmt.or_conflict, not_null_ignore_label);
 
     // Constraints passed: NOW perform the destructive rewrite. Old index
     // entries are read from the cursor (re-seeked onto the unchanged old row)
@@ -28045,7 +28086,7 @@ fn emit_without_rowid_row_insert(
     } else {
         None
     };
-    emit_check_constraints(b, table, val_regs, candidate_skip);
+    emit_check_constraints(b, table, val_regs, stmt_level, candidate_skip);
     emit_not_null_constraints(b, table, val_regs, stmt_level, candidate_skip);
 
     // UPSERT: a chain of ON CONFLICT clauses (SQLite 3.35+). Each clause probes
@@ -28109,7 +28150,6 @@ fn emit_without_rowid_row_insert(
                         table_cursor,
                         val_regs,
                         pk_indices,
-                        stmt_level,
                         assignments,
                         where_clause.as_deref(),
                         target_alias,
@@ -28188,7 +28228,7 @@ fn emit_without_rowid_row_insert(
         b.emit_op(
             Opcode::Halt,
             ErrorCode::Constraint as i32,
-            0,
+            halt_conflict_oe(oe_flag),
             0,
             P4::Str(pk_label.clone()),
             OPFLAG_HALT_UNIQUE,
@@ -28273,7 +28313,7 @@ fn emit_without_rowid_row_insert(
             b.emit_op(
                 Opcode::Halt,
                 ErrorCode::Constraint as i32,
-                0,
+                halt_conflict_oe(idx_oe),
                 0,
                 P4::Str(index.key_label_qualified(&table.name)),
                 OPFLAG_HALT_UNIQUE,
@@ -28571,7 +28611,6 @@ fn emit_without_rowid_upsert_do_update_apply(
     table_cursor: i32,
     val_regs: i32,
     pk_indices: &[usize],
-    stmt_level: Option<ConflictAction>,
     assignments: &[fsqlite_ast::Assignment],
     where_clause: Option<&Expr>,
     target_alias: Option<&str>,
@@ -28675,8 +28714,11 @@ fn emit_without_rowid_upsert_do_update_apply(
         P4::Affinity(table.affinity_string()),
         0,
     );
-    emit_check_constraints(b, table, existing_regs, None);
-    emit_not_null_constraints(b, table, existing_regs, stmt_level, None);
+    // bd-nn29x: the DO UPDATE runs under ABORT whatever the outer `OR` clause
+    // says (stock `sqlite3UpsertDoUpdate` passes OE_Abort), for its CHECK, NOT
+    // NULL and UNIQUE checks alike.
+    emit_check_constraints(b, table, existing_regs, Some(ConflictAction::Abort), None);
+    emit_not_null_constraints(b, table, existing_regs, Some(ConflictAction::Abort), None);
 
     // Remove the OLD secondary-index entries (read from the cursor's old row)
     // and the OLD table row, then insert the rewritten row + new index entries.
@@ -28707,7 +28749,7 @@ fn emit_without_rowid_upsert_do_update_apply(
         table_cursor,
         existing_regs,
         pk_indices,
-        stmt_level,
+        Some(ConflictAction::Abort),
         false,
     );
 
@@ -29577,8 +29619,21 @@ fn codegen_update_without_rowid(
     } else {
         None
     };
-    emit_check_constraints(b, table, col_regs, ignore_skip);
-    emit_not_null_constraints(b, table, col_regs, stmt.or_conflict, ignore_skip);
+    // bd-nn29x: a NOT NULL column's own `ON CONFLICT IGNORE` skips the row
+    // too, as in the rowid-table UPDATE lane.
+    let not_null_ignore_skip = ignore_skip.or_else(|| {
+        table
+            .columns
+            .iter()
+            .any(|column| {
+                column.notnull
+                    && !column.is_ipk
+                    && effective_oe(stmt.or_conflict, column.conflict_action) == OE_IGNORE
+            })
+            .then_some(row_done)
+    });
+    emit_check_constraints(b, table, col_regs, stmt.or_conflict, ignore_skip);
+    emit_not_null_constraints(b, table, col_regs, stmt.or_conflict, not_null_ignore_skip);
 
     // Apply column affinities before the primary-key probe so the comparison
     // and the stored record agree on representation.
@@ -29906,7 +29961,7 @@ fn codegen_update_from_without_rowid(
         P4::Affinity(table.affinity_string()),
         0,
     );
-    emit_check_constraints(b, table, new_regs, None);
+    emit_check_constraints(b, table, new_regs, stmt.or_conflict, None);
     emit_not_null_constraints(b, table, new_regs, stmt.or_conflict, None);
     b.emit_op(Opcode::AddImm, seq_reg, -1, 0, P4::None, 0);
     b.emit_op(Opcode::Copy, seq_reg, seq_slot, 0, P4::None, 0);
@@ -30504,11 +30559,15 @@ fn emit_table_column_read(
 ///
 /// When `ignore_label` is `Some`, CHECK failures jump there instead of
 /// halting (used for INSERT OR IGNORE to silently skip violating rows).
+/// A CHECK constraint has no `ON CONFLICT` clause of its own, so a failing
+/// one resolves with the statement's `stmt_level` algorithm, else ABORT
+/// (bd-nn29x).
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 fn emit_check_constraints(
     b: &mut ProgramBuilder,
     table: &TableSchema,
     val_regs: i32,
+    stmt_level: Option<ConflictAction>,
     ignore_label: Option<Label>,
 ) {
     const SQLITE_CONSTRAINT: i32 = 19;
@@ -30560,7 +30619,7 @@ fn emit_check_constraints(
             b.emit_op(
                 Opcode::Halt,
                 SQLITE_CONSTRAINT,
-                0,
+                halt_conflict_oe(effective_oe(stmt_level, None)),
                 0,
                 P4::Str(match &check.name {
                     Some(name) => format!("CHECK constraint failed: {name}"),
@@ -30628,10 +30687,12 @@ fn emit_not_null_constraints(
                     b.emit_jump_to_label(Opcode::Goto, 0, 0, skip, P4::None, 0);
                 }
                 _ => {
+                    // bd-nn29x: P2 carries the algorithm the statement boundary
+                    // applies, as stock's OP_HaltIfNull P2 does.
                     b.emit_op(
                         Opcode::Halt,
                         SQLITE_CONSTRAINT,
-                        0,
+                        halt_conflict_oe(oe),
                         0,
                         P4::Str(format!(
                             "NOT NULL constraint failed: {}.{}",
@@ -60733,7 +60794,7 @@ mod tests {
         let check_row = check_builder.alloc_regs(
             i32::try_from(check_table.columns.len()).expect("test column count fits i32"),
         );
-        emit_check_constraints(&mut check_builder, &check_table, check_row, None);
+        emit_check_constraints(&mut check_builder, &check_table, check_row, None, None);
         assert_eq!(
             emitted_function_contexts(check_builder),
             [SchemaEvaluationContext::CheckConstraint]
@@ -60752,7 +60813,7 @@ mod tests {
         let row = builder.alloc_regs(
             i32::try_from(table.columns.len()).expect("test column count fits i32"),
         );
-        emit_check_constraints(&mut builder, &table, row, None);
+        emit_check_constraints(&mut builder, &table, row, None, None);
         builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
         let program = builder.finish().expect("malformed CHECK program builds");
         assert!(program.ops().iter().any(|op| {

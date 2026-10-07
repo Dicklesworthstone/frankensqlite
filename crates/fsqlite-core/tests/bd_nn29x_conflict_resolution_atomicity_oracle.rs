@@ -760,3 +760,129 @@ fn bd_nn29x_trigger_statement_conflict_clause_follows_outer_clause() {
     }
     assert_matches_stock("trigger statement conflict clause", &cases);
 }
+
+/// FK actions that rewrite child rows (ON UPDATE CASCADE, SET NULL, SET
+/// DEFAULT) are coded by stock as an UPDATE trigger step under OE_Abort
+/// (`sqlite3FkActions` -> `sqlite3CodeRowTriggerDirect(.., OE_Abort, ..)`).
+/// So a child constraint the action violates aborts the statement whatever
+/// the child column's own ON CONFLICT clause or the outer statement's clause
+/// says, and the child's UPDATE triggers run their INSERT/UPDATE statements
+/// under ABORT. Once a failure carries its own algorithm, an action run
+/// without that override applied the child column's FAIL / ROLLBACK /
+/// IGNORE / REPLACE instead.
+#[test]
+fn bd_nn29x_fk_action_child_update_resolves_with_abort() {
+    let mut cases = Vec::new();
+    for algorithm in ALGORITHMS {
+        for txn in TXNS {
+            for mode in MODES {
+                cases.push(Case {
+                    name: format!(
+                        "ON UPDATE SET NULL into child NOT NULL ON CONFLICT {algorithm}, \
+                         outer `UPDATE {mode}`, {txn:?}"
+                    ),
+                    setup: vec![
+                        "PRAGMA foreign_keys = ON".to_owned(),
+                        "CREATE TABLE p(id INTEGER PRIMARY KEY, tag TEXT)".to_owned(),
+                        format!(
+                            "CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER NOT NULL \
+                             ON CONFLICT {algorithm} REFERENCES p(id) ON UPDATE SET NULL)"
+                        ),
+                        "INSERT INTO p VALUES (1, 'a'), (2, 'b'), (3, 'c')".to_owned(),
+                        "INSERT INTO c VALUES (1, 1), (2, 2), (3, 3)".to_owned(),
+                    ],
+                    steps: in_txn(
+                        txn,
+                        "INSERT INTO p VALUES (50, 'pre')",
+                        format!("UPDATE {mode} p SET id = id + 100 WHERE id < 50"),
+                    ),
+                    queries: strs(&[
+                        "SELECT id, tag FROM p ORDER BY id",
+                        "SELECT id, pid FROM c ORDER BY id",
+                    ]),
+                });
+            }
+            cases.push(Case {
+                name: format!(
+                    "ON DELETE SET DEFAULT into child UNIQUE ON CONFLICT {algorithm}, {txn:?}"
+                ),
+                setup: vec![
+                    "PRAGMA foreign_keys = ON".to_owned(),
+                    "CREATE TABLE p(id INTEGER PRIMARY KEY)".to_owned(),
+                    format!(
+                        "CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER DEFAULT 0 \
+                         UNIQUE ON CONFLICT {algorithm} REFERENCES p(id) ON DELETE SET DEFAULT)"
+                    ),
+                    "INSERT INTO p VALUES (0), (1), (2), (3)".to_owned(),
+                    "INSERT INTO c VALUES (10, 0), (11, 1), (12, 2)".to_owned(),
+                ],
+                steps: in_txn(
+                    txn,
+                    "INSERT INTO p VALUES (50)",
+                    "DELETE FROM p WHERE id IN (1, 3)".to_owned(),
+                ),
+                queries: strs(&[
+                    "SELECT id FROM p ORDER BY id",
+                    "SELECT id, pid FROM c ORDER BY id",
+                ]),
+            });
+        }
+    }
+    for txn in TXNS {
+        for mode in MODES {
+            cases.push(Case {
+                name: format!("ON UPDATE CASCADE into child CHECK, outer `UPDATE {mode}`, {txn:?}"),
+                setup: strs(&[
+                    "PRAGMA foreign_keys = ON",
+                    "CREATE TABLE p(id INTEGER PRIMARY KEY)",
+                    "CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id) \
+                     ON UPDATE CASCADE CHECK (pid < 103))",
+                    "INSERT INTO p VALUES (1), (2), (3)",
+                    "INSERT INTO c VALUES (1, 1), (2, 2), (3, 3)",
+                ]),
+                steps: in_txn(
+                    txn,
+                    "INSERT INTO p VALUES (50)",
+                    format!("UPDATE {mode} p SET id = id + 100 WHERE id < 50"),
+                ),
+                queries: strs(&[
+                    "SELECT id FROM p ORDER BY id",
+                    "SELECT id, pid FROM c ORDER BY id",
+                ]),
+            });
+            for inner in ["OR FAIL", "OR IGNORE", "OR ROLLBACK", "OR REPLACE", ""] {
+                cases.push(Case {
+                    name: format!(
+                        "ON UPDATE CASCADE child trigger `INSERT {inner}`, outer `UPDATE {mode}`, {txn:?}"
+                    ),
+                    setup: vec![
+                        "PRAGMA foreign_keys = ON".to_owned(),
+                        "CREATE TABLE p(id INTEGER PRIMARY KEY)".to_owned(),
+                        "CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id) \
+                         ON UPDATE CASCADE)"
+                            .to_owned(),
+                        "CREATE TABLE log(x INTEGER UNIQUE)".to_owned(),
+                        "INSERT INTO log VALUES (102)".to_owned(),
+                        "INSERT INTO p VALUES (1), (2), (3)".to_owned(),
+                        "INSERT INTO c VALUES (1, 1), (2, 2), (3, 3)".to_owned(),
+                        format!(
+                            "CREATE TRIGGER ct AFTER UPDATE ON c BEGIN \
+                             INSERT {inner} INTO log VALUES (NEW.pid); END"
+                        ),
+                    ],
+                    steps: in_txn(
+                        txn,
+                        "INSERT INTO p VALUES (50)",
+                        format!("UPDATE {mode} p SET id = id + 100 WHERE id < 50"),
+                    ),
+                    queries: strs(&[
+                        "SELECT id FROM p ORDER BY id",
+                        "SELECT id, pid FROM c ORDER BY id",
+                        "SELECT x FROM log ORDER BY x",
+                    ]),
+                });
+            }
+        }
+    }
+    assert_matches_stock("FK action child UPDATE", &cases);
+}
