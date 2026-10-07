@@ -14,8 +14,12 @@
 //! Provision the receiver from the SAME coherent baseline separately. This API
 //! does not verify a snapshot, authenticate a peer, provide encryption or change
 //! the engine's concurrency/durability settings. One route is one downstream
-//! delivery obligation, not a quorum or fanout. Once routed, raw acknowledge()
-//! is refused; bypassing this owner with direct SQL is unsupported.
+//! delivery obligation. Use [`fanout`] for a fixed all-recipient obligation
+//! over the same captured payloads. Once enrolled, single-recipient ACKs are
+//! refused; bypassing either owner with direct SQL is unsupported.
+
+#[path = "changeset_delivery_fanout.rs"]
+pub mod fanout;
 
 use std::fmt;
 
@@ -370,78 +374,81 @@ impl OrderedDelivery {
             if progress.pending_messages == 0 {
                 return Ok(None);
             }
-            let sequence = progress
-                .acknowledged
-                .sequence
-                .checked_add(1)
-                .ok_or(FrankenError::TooBig)?;
-            let parameter =
-                SqliteValue::Integer(i64::try_from(sequence).map_err(|_| FrankenError::TooBig)?);
-            let rows = transaction
-                .query_with_params(
-                    &format!(
-                        "SELECT {META_COLUMNS} FROM main.{} WHERE sequence=?1 LIMIT 2",
-                        quote(QUEUE),
-                    ),
-                    std::slice::from_ref(&parameter),
-                )
-                .await?;
-            let [row] = rows.as_slice() else {
-                return Err(invalid("oldest delivery message is missing"));
-            };
-            let status = self.source.status(row)?;
-            if status.acknowledged
-                || status.receipt.sequence
-                    != i64::try_from(sequence).map_err(|_| FrankenError::TooBig)?
-            {
-                return Err(invalid("invalid oldest delivery message"));
-            }
-            if status.receipt.payload_bytes > max_message_bytes {
-                return Err(CaptureError::Limit("delivery first message bytes").into());
-            }
-            checkpoint(cx)?;
-            let row = transaction
-                .query_row_with_params(
-                    &format!(
-                        "SELECT payload FROM main.{} WHERE sequence=?1",
-                        quote(QUEUE),
-                    ),
-                    &[parameter],
-                )
-                .await?;
-            let Some(SqliteValue::Blob(bytes)) = row.get(0) else {
-                return Err(invalid("delivery payload is not a BLOB"));
-            };
-            if bytes.len() != status.receipt.payload_bytes
-                || *PayloadHash::blake3(bytes.as_ref()).as_bytes() != status.receipt.payload_hash
-            {
-                return Err(invalid(
-                    "delivery payload failed length/digest verification",
-                ));
-            }
-            let frame = ChangesetFrame::for_message(
-                cx,
-                bytes.as_ref(),
-                u64::try_from(max_message_bytes).map_err(|_| FrankenError::TooBig)?,
-            )?;
-            let envelope = ReplicationEnvelope::new(
-                self.baseline.stream_id,
-                sequence,
-                progress.acknowledged.tip,
-                frame,
-            )?;
-            let mut body = Vec::new();
-            body.try_reserve_exact(bytes.len())
-                .map_err(|_| FrankenError::OutOfMemory)?;
-            body.extend_from_slice(bytes.as_ref());
-            Ok(Some(OrderedMessage {
-                source: status.receipt,
-                envelope,
-                body,
-            }))
+            self.message_after(&transaction, cx, progress.acknowledged, max_message_bytes)
+                .await
+                .map(Some)
         }
         .await;
         settle(transaction, cx, result).await
+    }
+
+    // Both routes use the same codec and retained queue. The caller validates
+    // the predecessor and establishes a pending successor in this transaction.
+    async fn message_after(
+        &self,
+        transaction: &Transaction<'_>,
+        cx: &Cx,
+        previous: ReplicaCheckpoint,
+        max_message_bytes: usize,
+    ) -> DeliveryResult<OrderedMessage> {
+        if previous.stream_id != self.baseline.stream_id {
+            return Err(OrderedDeliveryError::ReceiptMismatch);
+        }
+        let sequence = previous.sequence.checked_add(1).ok_or(FrankenError::TooBig)?;
+        let parameter =
+            SqliteValue::Integer(i64::try_from(sequence).map_err(|_| FrankenError::TooBig)?);
+        let rows = transaction
+            .query_with_params(
+                &format!(
+                    "SELECT {META_COLUMNS} FROM main.{} WHERE sequence=?1 LIMIT 2",
+                    quote(QUEUE),
+                ),
+                std::slice::from_ref(&parameter),
+            )
+            .await?;
+        let [row] = rows.as_slice() else {
+            return Err(invalid("oldest delivery message is missing"));
+        };
+        let status = self.source.status(row)?;
+        if status.acknowledged
+            || status.receipt.sequence
+                != i64::try_from(sequence).map_err(|_| FrankenError::TooBig)?
+        {
+            return Err(invalid("invalid oldest delivery message"));
+        }
+        if status.receipt.payload_bytes > max_message_bytes {
+            return Err(CaptureError::Limit("delivery first message bytes").into());
+        }
+        checkpoint(cx)?;
+        let row = transaction
+            .query_row_with_params(
+                &format!("SELECT payload FROM main.{} WHERE sequence=?1", quote(QUEUE)),
+                &[parameter],
+            )
+            .await?;
+        let Some(SqliteValue::Blob(bytes)) = row.get(0) else {
+            return Err(invalid("delivery payload is not a BLOB"));
+        };
+        if bytes.len() != status.receipt.payload_bytes
+            || *PayloadHash::blake3(bytes.as_ref()).as_bytes() != status.receipt.payload_hash
+        {
+            return Err(invalid("delivery payload failed length/digest verification"));
+        }
+        let frame = ChangesetFrame::for_message(
+            cx,
+            bytes.as_ref(),
+            u64::try_from(max_message_bytes).map_err(|_| FrankenError::TooBig)?,
+        )?;
+        let envelope = ReplicationEnvelope::new(
+            self.baseline.stream_id,
+            sequence,
+            previous.tip,
+            frame,
+        )?;
+        let mut body = Vec::new();
+        body.try_reserve_exact(bytes.len()).map_err(|_| FrankenError::OutOfMemory)?;
+        body.extend_from_slice(bytes.as_ref());
+        Ok(OrderedMessage { source: status.receipt, envelope, body })
     }
 
     /// Accept an authenticated receiver's committed checkpoint for this exact
@@ -465,6 +472,9 @@ impl OrderedDelivery {
         checkpoint(cx)?;
         let transaction = conn.transaction().await?;
         let result = async {
+            // An old single-recipient handle must not reclaim a multicast
+            // payload while another configured receiver still needs it.
+            fanout::require_single_recipient(&transaction).await?;
             Self::validate_route(&transaction, cx).await?;
             let before = self.load_progress(&transaction).await?;
             if confirmed.sequence < before.acknowledged.sequence {
@@ -586,7 +596,7 @@ mod tests {
     use crate::compat::changeset::streaming::ordered::{self, ReplicaDisposition};
     use crate::compat::changeset_stream::ChangesetStreamLimits;
 
-    fn route() -> OrderedDelivery {
+    pub(super) fn route() -> OrderedDelivery {
         OrderedDelivery::new(
             ChangesetOutbox::new([7; 16], OutboxLimits::default()).unwrap(),
             ReplicaCheckpoint {
@@ -598,7 +608,7 @@ mod tests {
         .unwrap()
     }
 
-    async fn database() -> Connection {
+    pub(super) async fn database() -> Connection {
         let conn = Connection::open(":memory:").await.unwrap();
         conn.execute_batch(
             "PRAGMA recursive_triggers=ON; CREATE TABLE items(id INTEGER PRIMARY KEY,value TEXT);",
@@ -608,7 +618,7 @@ mod tests {
         conn
     }
 
-    async fn insert(
+    pub(super) async fn insert(
         conn: &mut Connection,
         cx: &Cx,
         route: &OrderedDelivery,
@@ -645,7 +655,7 @@ mod tests {
         }
     }
 
-    async fn receive(
+    pub(super) async fn receive(
         conn: &mut Connection,
         cx: &Cx,
         message: &OrderedMessage,
