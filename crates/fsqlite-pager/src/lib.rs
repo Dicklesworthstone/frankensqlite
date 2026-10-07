@@ -21,6 +21,7 @@ pub mod evalue_eviction;
 #[cfg(any(test, feature = "fault-injection"))]
 pub mod fault_hooks;
 pub mod journal;
+pub mod memory_page_snapshots;
 // Native private-page work is synchronous, but sealed futures must remain lazy:
 // creating and dropping an unpolled operation must not mutate the transaction.
 #[allow(clippy::unused_async_trait_impl)]
@@ -51,6 +52,10 @@ pub use journal::{
     CHECKSUM_STRIDE, JOURNAL_HEADER_SIZE, JOURNAL_MAGIC, JournalError, JournalHeader,
     JournalPageRecord, PENDING_BYTE_OFFSET, checksum_sample_count, journal_checksum,
     lock_byte_page,
+};
+pub use memory_page_snapshots::{
+    MemoryPageImage, MemoryPageSnapshots, MemorySnapshotCommit, MemorySnapshotSettlement,
+    MemorySnapshotTransaction, PageImageCaptureStats,
 };
 pub use page_buf::{
     PageBuf, PageBufPool, PageBufPoolMetricsSnapshot, page_buffer_pool_metrics_snapshot,
