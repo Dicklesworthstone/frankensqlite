@@ -7490,6 +7490,22 @@ impl<P: PageWriter> BtCursor<P> {
         Ok(Some((insert_idx, new_cell_offset)))
     }
 
+    /// bd-obwsy: whether `page` still has exactly the header a retained
+    /// right-edge hint cached for it. The retained-hint append places the new
+    /// cell and pointer slot from that cached header alone, so appending
+    /// through a hint whose page has since been reshaped (for example by a
+    /// balance that redistributed its cells) writes a pointer array and cell
+    /// content that disagree with the page: out-of-order rowids, offset-0
+    /// pointers and overlapping cells that only an integrity check notices.
+    fn retained_leaf_header_matches(
+        page: &PageData,
+        page_no: PageNumber,
+        header: &BtreePageHeader,
+    ) -> bool {
+        BtreePageHeader::parse(page.as_bytes(), cell::header_offset_for_page(page_no))
+            .is_ok_and(|actual| actual == *header)
+    }
+
     fn try_append_table_leaf_payload_in_place_no_overflow_mutate_only(
         usable_size: u32,
         leaf_page_no: PageNumber,
@@ -10008,7 +10024,12 @@ impl<P: PageWriter> BtCursor<P> {
         self.record_range_page_witness(cx, hint.leaf_page);
         let usable_size = self.usable_size;
         let mut mutate_payload_result: Result<Option<(u16, u16)>> = Ok(None);
+        let mut staged_page_moved_on = false;
         let mut mutate_payload_only = |staged_page: &mut PageData| {
+            if !Self::retained_leaf_header_matches(staged_page, hint.leaf_page, &hint.header) {
+                staged_page_moved_on = true;
+                return;
+            }
             mutate_payload_result =
                 Self::try_append_table_leaf_payload_in_place_no_overflow_mutate_only(
                     usable_size,
@@ -10031,6 +10052,12 @@ impl<P: PageWriter> BtCursor<P> {
             self.clear_rightmost_leaf_cache();
             return Ok(true);
         }
+        if staged_page_moved_on {
+            // Any retained image predates the staged page as well; the caller
+            // falls back to a lane that rereads the page.
+            hint.clear_page_data();
+            return Ok(false);
+        }
 
         if let Some(mut page_data) = hint.page_data.take() {
             let result = self
@@ -10049,6 +10076,12 @@ impl<P: PageWriter> BtCursor<P> {
         }
 
         if let Some(mut page_data) = self.pager.try_take_staged_page_data(hint.leaf_page) {
+            if !Self::retained_leaf_header_matches(&page_data, hint.leaf_page, &hint.header) {
+                self.pager
+                    .restore_staged_page_data(cx, hint.leaf_page, page_data)
+                    .await?;
+                return Ok(false);
+            }
             if self
                 .try_append_table_leaf_payload_in_place_no_overflow(
                     cx,
@@ -18269,6 +18302,69 @@ mod tests {
                 }
             }
             assert!(!cursor.next(&cx).await.unwrap());
+        });
+    }
+
+    /// bd-obwsy: a retained hint places the new cell from its cached header,
+    /// so once the cursor's own insert has changed the hinted page, appending
+    /// through the old hint used to overwrite the newer row's pointer slot and
+    /// cell content without any error. It must refuse and leave the page alone.
+    #[test]
+    fn test_cached_rightmost_hint_refuses_page_changed_underneath() {
+        run_async(async {
+            let cx = Cx::new();
+            let root = pn(2);
+            let store = StagedMutationStore::new(MemPageStore::with_empty_table(root, USABLE));
+            let mut cursor = BtCursor::new(store, root, USABLE, true);
+            for rowid in 1..=2_i64 {
+                cursor
+                    .table_append_after_last_position(&cx, rowid, &payload_for_rowid(rowid))
+                    .await
+                    .expect("seed append should succeed");
+            }
+            let mut stale = cursor
+                .table_cached_rightmost_leaf_hint()
+                .expect("seed appends should capture a retained rightmost-leaf hint");
+            assert_eq!((stale.leaf_page(), stale.last_rowid()), (root, 2));
+
+            // The cursor's own lane, not the hint, places row 3 on the same leaf.
+            cursor
+                .table_append_after_last_position(&cx, 3, &payload_for_rowid(3))
+                .await
+                .expect("cursor append should succeed");
+            let before = cursor.pager.inner.pages[&root.get()].clone();
+
+            assert!(
+                !cursor
+                    .table_try_append_cached_rightmost_leaf_hint(
+                        &cx,
+                        &mut stale,
+                        4,
+                        &payload_for_rowid(4),
+                    )
+                    .await
+                    .expect("a stale retained hint must fail closed, not error"),
+                "a retained hint whose page changed underneath must not append"
+            );
+            assert_eq!(
+                cursor.pager.inner.pages[&root.get()],
+                before,
+                "a refused stale-hint append must leave the page byte-identical"
+            );
+
+            cursor
+                .table_append_after_last_position(&cx, 4, &payload_for_rowid(4))
+                .await
+                .expect("caller fallback append should succeed");
+            assert!(cursor.first(&cx).await.unwrap());
+            for expected_rowid in 1..=4_i64 {
+                assert_eq!(cursor.rowid(&cx).await.unwrap(), expected_rowid);
+                assert_eq!(
+                    cursor.payload(&cx).await.unwrap(),
+                    payload_for_rowid(expected_rowid)
+                );
+                assert_eq!(cursor.next(&cx).await.unwrap(), expected_rowid < 4);
+            }
         });
     }
 
