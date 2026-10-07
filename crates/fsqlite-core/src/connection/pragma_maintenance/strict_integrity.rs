@@ -228,4 +228,119 @@ mod tests {
         }
         assert!(strict_type_predicate("a", "NUMERIC").is_err());
     }
+
+    #[test]
+    fn integrity_scan_does_not_assume_stored_not_null_constraints_hold() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("stored-nulls.db");
+        {
+            let stock = rusqlite::Connection::open(&path).unwrap();
+            stock
+                .execute_batch(
+                    "CREATE TABLE nullable(id INTEGER PRIMARY KEY, a TEXT, b INT);
+                     INSERT INTO nullable VALUES(1, NULL, -1),(2, 'valid', NULL),(3, NULL, NULL);
+                     CREATE INDEX nullable_cover ON nullable(a, b);
+                     PRAGMA writable_schema=ON;
+                     UPDATE sqlite_schema SET sql='CREATE TABLE nullable(
+                         id INTEGER PRIMARY KEY, a TEXT NOT NULL, b INT NOT NULL)'
+                         WHERE name='nullable';",
+                )
+                .unwrap();
+        }
+        let expected = reference_reports(&path, "PRAGMA integrity_check");
+        assert_eq!(expected.len(), 4, "fixture must contain four stored NULLs");
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(path.to_str().unwrap()).await.unwrap();
+            for prepared in [false, true] {
+                for pragma in ["integrity_check", "quick_check"] {
+                    let sql = format!("PRAGMA {pragma}");
+                    let rows = if prepared {
+                        conn.prepare(&sql).await.unwrap().query().await.unwrap()
+                    } else {
+                        conn.query(&sql).await.unwrap()
+                    };
+                    assert_eq!(messages(&rows), expected, "{sql}, prepared={prepared}");
+                    let limited = conn.query(&format!("PRAGMA {pragma}(2)")).await.unwrap();
+                    assert_eq!(limited.len(), 2);
+                    assert!(messages(&limited).iter().all(|report| expected.contains(report)));
+                }
+            }
+            conn.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn strict_integrity_enforces_implicit_primary_key_not_null() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("strict-primary-key.db");
+        {
+            let stock = rusqlite::Connection::open(&path).unwrap();
+            stock
+                .execute_batch(
+                    "CREATE TABLE composite_key(a TEXT, b INT, PRIMARY KEY(a, b));
+                     INSERT INTO composite_key VALUES(NULL, 1),('key', NULL);
+                     CREATE TABLE inline_key(a TEXT PRIMARY KEY);
+                     INSERT INTO inline_key VALUES(NULL);
+                     CREATE TABLE ordinary_key(a TEXT PRIMARY KEY);
+                     INSERT INTO ordinary_key VALUES(NULL);
+                     PRAGMA writable_schema=ON;
+                     UPDATE sqlite_schema SET sql=sql || ' STRICT'
+                         WHERE name IN ('composite_key', 'inline_key');",
+                )
+                .unwrap();
+        }
+        let expected = reference_reports(&path, "PRAGMA integrity_check");
+        assert_eq!(expected.len(), 3, "only STRICT primary keys forbid these NULLs");
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(path.to_str().unwrap()).await.unwrap();
+            for pragma in ["integrity_check", "quick_check"] {
+                let rows = conn.query(&format!("PRAGMA {pragma}")).await.unwrap();
+                assert_eq!(messages(&rows), expected);
+                let ordinary = conn
+                    .query(&format!("PRAGMA {pragma}(ordinary_key)"))
+                    .await
+                    .unwrap();
+                assert_eq!(messages(&ordinary), ["ok"]);
+            }
+            conn.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn strict_integrity_checks_generated_without_rowid_and_shadowed_columns() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("strict-layouts.db");
+        {
+            let stock = rusqlite::Connection::open(&path).unwrap();
+            stock
+                .execute_batch(
+                    r#"CREATE TABLE generated(v INT, s INT AS (v) STORED, g INT AS (v) VIRTUAL);
+                       INSERT INTO generated(v) VALUES(x'31'),(NULL),(42);
+                       CREATE TABLE compact(k TEXT PRIMARY KEY, v INT) WITHOUT ROWID;
+                       INSERT INTO compact VALUES('key', x'31');
+                       CREATE TABLE "odd' table"("a""b" TEXT);
+                       INSERT INTO "odd' table" VALUES(x'31');
+                       PRAGMA writable_schema=ON;
+                       UPDATE sqlite_schema SET sql=sql || ' STRICT'
+                           WHERE name IN ('generated', 'odd'' table');
+                       UPDATE sqlite_schema SET sql=sql || ', STRICT' WHERE name='compact';"#,
+                )
+                .unwrap();
+        }
+        let expected = reference_reports(&path, "PRAGMA integrity_check");
+        assert_eq!(expected.len(), 5, "fixture covers all three stored layouts");
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(path.to_str().unwrap()).await.unwrap();
+            // The MAIN table and its xinfo must remain visible to the checker.
+            conn.execute("CREATE TEMP TABLE generated(unrelated TEXT)")
+                .await
+                .unwrap();
+            for pragma in ["integrity_check", "quick_check"] {
+                let rows = conn.query(&format!("PRAGMA main.{pragma}")).await.unwrap();
+                assert_eq!(messages(&rows), expected);
+            }
+            conn.execute("DROP TABLE temp.generated").await.unwrap();
+            conn.close().await.unwrap();
+        });
+    }
 }

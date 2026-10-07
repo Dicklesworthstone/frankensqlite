@@ -147,7 +147,7 @@ impl Connection {
             if reports.len() >= budget {
                 break;
             }
-            let primary_key = if table.without_rowid {
+            let primary_key = if table.without_rowid || table.strict {
                 table.primary_key_constraints.first().cloned().unwrap_or_default()
             } else {
                 Vec::new()
@@ -173,7 +173,9 @@ impl Connection {
             }
             let predicates: Vec<String> = not_null
                 .iter()
-                .map(|column| format!("{} IS NULL", quote_identifier(column)))
+                // IS NULL can be folded to false from the very NOT NULL
+                // declaration whose stored rows we are trying to validate.
+                .map(|column| format!("typeof({}) = 'null'", quote_identifier(column)))
                 .chain(strict_types.iter().map(|(predicate, _)| predicate.clone()))
                 .chain(
                     table
