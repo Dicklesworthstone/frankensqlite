@@ -14,6 +14,13 @@
 //! CARGO_TARGET_DIR=/data/tmp/cc3-target \
 //!   cargo bench -p fsqlite-btree --bench cell_parse_hot_paths
 //! ```
+//!
+//! GH#491 also measures the canonical varint writer against its previous
+//! loop implementation in the SAME invocation. All nine widths, mixed widths,
+//! negative rowids, and the million-row positive prefix are reported, with
+//! alternating order and raw paired samples. This is a codec microbenchmark,
+//! NOT a profile or end-to-end SQLite comparison. Use benchmark_issue_491.py
+//! for the actual INSERT/SELECT and stock-SQLite comparison.
 
 use std::env;
 use std::hint::black_box;
@@ -22,7 +29,7 @@ use std::time::Instant;
 use fsqlite_btree::cell::{
     BtreePageType, CellRef, cell_on_page_size_fast, read_table_leaf_rowid_at_offset,
 };
-use fsqlite_types::serial_type::write_varint;
+use fsqlite_types::serial_type::{varint_len, write_varint};
 
 const USABLE_SIZE: u32 = 4096;
 const PAGE_SIZE: usize = 4096;
@@ -125,6 +132,126 @@ fn bench_on_page_size(
     ns_per_op(start.elapsed().as_secs_f64() * 1_000_000_000.0, iterations)
 }
 
+// Frozen pre-bd70b47 writer: compare the algorithm, not an indirect function
+// call or a new allocation. Both writers get the same inline opportunity.
+#[inline]
+fn previous_write_varint(buf: &mut [u8], value: u64) -> usize {
+    let len = varint_len(value);
+    if len == 1 {
+        buf[0] = value as u8;
+    } else if len == 9 {
+        let mut v = value >> 8;
+        for i in (0..8).rev() {
+            buf[i] = (v as u8 & 0x7F) | 0x80;
+            v >>= 7;
+        }
+        buf[8] = value as u8;
+    } else {
+        let mut v = value;
+        for i in (0..len).rev() {
+            if i == len - 1 {
+                buf[i] = v as u8 & 0x7F;
+            } else {
+                buf[i] = (v as u8 & 0x7F) | 0x80;
+            }
+            v >>= 7;
+        }
+    }
+    len
+}
+
+fn bench_varint_writer<F>(values: &[u64], iterations: u64, mut write: F) -> f64
+where
+    F: FnMut(&mut [u8], u64) -> usize,
+{
+    let mut buf = [0_u8; 9];
+    let mut remaining = iterations;
+    let start = Instant::now();
+    while remaining != 0 {
+        let count = remaining.min(values.len() as u64) as usize;
+        for &value in &values[..count] {
+            let written = write(black_box(&mut buf), black_box(value));
+            black_box((&buf, written));
+        }
+        remaining -= count as u64;
+    }
+    ns_per_op(start.elapsed().as_secs_f64() * 1_000_000_000.0, iterations)
+}
+
+fn compare_varint_writers(label: &str, values: &[u64], iterations: u64) {
+    assert!(!values.is_empty());
+    // Validate outside the timer, including bytes beyond the encoded value.
+    for &value in values {
+        let mut previous = [0xCD; 9];
+        let mut current = [0xCD; 9];
+        let expected = previous_write_varint(&mut previous, value);
+        let actual = write_varint(&mut current, value);
+        assert_eq!(actual, expected, "{label}: length for {value}");
+        assert_eq!(current, previous, "{label}: bytes for {value}");
+    }
+    let warmup = iterations.min(10_000);
+    black_box(bench_varint_writer(values, warmup, previous_write_varint));
+    black_box(bench_varint_writer(values, warmup, write_varint));
+    let mut previous = [0.0_f64; 5];
+    let mut current = [0.0_f64; 5];
+    for sample in 0..previous.len() {
+        if sample % 2 == 0 {
+            previous[sample] = bench_varint_writer(values, iterations, previous_write_varint);
+            current[sample] = bench_varint_writer(values, iterations, write_varint);
+        } else {
+            current[sample] = bench_varint_writer(values, iterations, write_varint);
+            previous[sample] = bench_varint_writer(values, iterations, previous_write_varint);
+        }
+        assert!(previous[sample].is_finite() && previous[sample] > 0.0);
+        assert!(current[sample].is_finite() && current[sample] > 0.0);
+    }
+    println!(
+        "varint_write case={label} previous_ns_per_op_samples={previous:?} current_ns_per_op_samples={current:?} iterations={iterations}"
+    );
+    previous.sort_by(f64::total_cmp);
+    current.sort_by(f64::total_cmp);
+    println!(
+        "varint_write case={label} previous_median_ns_per_op={:.3} current_median_ns_per_op={:.3} current_over_previous={:.6}",
+        previous[2], current[2], current[2] / previous[2]
+    );
+}
+
+fn bench_varint_write_paths(iterations: u64) {
+    let mut by_width = Vec::new();
+    for width in 1_u32..=9 {
+        let minimum = if width == 1 {
+            0
+        } else {
+            1_u64 << (7 * (width - 1))
+        };
+        let maximum = if width == 9 {
+            u64::MAX
+        } else {
+            (1_u64 << (7 * width)) - 1
+        };
+        let span = maximum - minimum + 1;
+        let mut values = vec![minimum, minimum + 1, maximum - 1, maximum];
+        for i in 4_u64..256 {
+            let mixed = i.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(23);
+            values.push(minimum + mixed % span);
+        }
+        assert!(values.iter().all(|&value| varint_len(value) == width as usize));
+        compare_varint_writers(&format!("width_{width}"), &values, iterations);
+        by_width.push(values);
+    }
+    let mut mixed = Vec::with_capacity(9 * 256);
+    for i in 0..256 {
+        for values in &by_width {
+            mixed.push(values[i]);
+        }
+    }
+    compare_varint_writers("mixed_widths", &mixed, iterations);
+    let negative_rowids = [i64::MIN, i64::MIN + 1, -16_384, -128, -2, -1].map(|v| v as u64);
+    compare_varint_writers("negative_rowids", &negative_rowids, iterations);
+    let positive_rowids = (1_u64..=1_000_000).collect::<Vec<_>>();
+    compare_varint_writers("issue491_positive_rowids", &positive_rowids, iterations);
+}
+
 fn parse_iterations() -> u64 {
     let mut args = env::args().skip(1);
     let mut iterations = DEFAULT_ITERATIONS;
@@ -133,8 +260,8 @@ fn parse_iterations() -> u64 {
             && let Some(value) = args.next()
         {
             match value.parse() {
-                Ok(parsed) => iterations = parsed,
-                Err(_) => {
+                Ok(parsed) if parsed > 0 => iterations = parsed,
+                _ => {
                     eprintln!("invalid --iterations value: {value}");
                     std::process::exit(2);
                 }
@@ -195,4 +322,5 @@ fn main() {
         "cell_parse_hot_paths cell_on_page_size_index_leaf_ns_per_op={index_on_page:.2} cells={} iterations={iterations}",
         index_offsets.len()
     );
+    bench_varint_write_paths(iterations);
 }
