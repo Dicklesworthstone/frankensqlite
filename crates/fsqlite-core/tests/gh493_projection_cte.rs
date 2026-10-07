@@ -113,3 +113,136 @@ fn projection_cte_public_reads_are_correct_and_never_hydrate_unrelated_rows() {
         conn.close_without_checkpoint().await.unwrap();
     });
 }
+
+#[test]
+fn projection_cte_forests_public_reads_remain_pager_backed() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("forest.db");
+        seed(&path);
+        let stock = rusqlite::Connection::open_with_flags(
+            &path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        ).unwrap();
+        for sql in [
+            "WITH c AS (SELECT id,v FROM a), d AS (SELECT id,v FROM b) SELECT c.id,c.v+d.v FROM c JOIN d USING(id) ORDER BY c.id",
+            "WITH c AS (SELECT id,v FROM a WHERE v>=40), d AS (SELECT id,v FROM c WHERE v<45) SELECT id,v FROM d ORDER BY id",
+            "WITH d(key,val) AS (SELECT p.id,p.v FROM c p WHERE p.v<3), c AS (SELECT id,v FROM a) SELECT key,val FROM d ORDER BY key",
+            "WITH c AS (SELECT id,v FROM a), d AS (SELECT id,v FROM c WHERE v<3), e AS (SELECT id,v FROM b), f AS (SELECT id,v FROM e WHERE v<6) SELECT d.id,d.v+f.v FROM d JOIN f ON d.id=f.id ORDER BY d.id",
+            "WITH c(key,val) AS (SELECT id,v FROM a), d(k,n) AS (SELECT p.key,p.val FROM c p WHERE p.val<3) SELECT q.k,q.n+b.v FROM d q JOIN b ON b.id=q.k ORDER BY q.k",
+            "WITH c AS (SELECT id,v FROM a), d AS (SELECT id,v FROM c) SELECT id,v FROM d WHERE id='K042'",
+            "WITH c AS (SELECT id,v FROM a WHERE v<3), d AS (SELECT id,v FROM b WHERE v<0) SELECT c.id,d.v FROM c LEFT JOIN d ON c.id=d.id ORDER BY c.id",
+            "WITH c AS (SELECT id AS v,v AS id FROM a), d AS (SELECT id,v FROM c WHERE id<3) SELECT v AS id,id AS v FROM d ORDER BY v DESC",
+            "WITH c AS (SELECT id,v FROM a WHERE v IN (1,2,3)), d AS (SELECT id,v FROM c WHERE v>1) SELECT id,v FROM d ORDER BY id",
+            "WITH c AS NOT MATERIALIZED (SELECT id,v FROM a), d AS NOT MATERIALIZED (SELECT id,v FROM c WHERE v<4) SELECT DISTINCT id,v FROM d ORDER BY id DESC LIMIT 2 OFFSET 1",
+            "WITH StageOne AS (SELECT id,v FROM a), StageTwo AS (SELECT p.id,p.v FROM sTaGeOnE p WHERE p.v<3) SELECT q.id,q.v FROM sTaGeTwO q ORDER BY q.id",
+            "WITH c AS (SELECT id,v FROM a WHERE v<3), d AS (SELECT id,v FROM b WHERE v<6) SELECT * FROM c JOIN d USING(id) ORDER BY id",
+        ] {
+            let expected = stock_rows(&stock, sql);
+            for prepared in [false, true] {
+                let conn = Connection::open_existing_schema_only(
+                    path.to_string_lossy().into_owned(),
+                ).await.unwrap();
+                assert_eq!(conn.memdb_row_hydration_count(), 0);
+                let rows = if prepared {
+                    conn.prepare(sql).await.unwrap().query().await.unwrap()
+                } else {
+                    conn.query(sql).await.unwrap()
+                };
+                let actual: Vec<_> = rows.iter().map(|row| row.values().to_vec()).collect();
+                assert_eq!(actual, expected, "prepared={prepared}: {sql}");
+                assert_eq!(conn.memdb_row_hydration_count(), 0, "prepared={prepared}: {sql}");
+                conn.close_without_checkpoint().await.unwrap();
+            }
+        }
+    });
+}
+
+#[test]
+fn projection_cte_forests_preserve_prepared_rebinding_and_strict_refusal() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("forest-params.db");
+        seed(&path);
+        let sql = "WITH d(key,val) AS (SELECT p.id,p.v FROM c p WHERE p.v>=?2), \
+            c AS (SELECT id,v FROM a WHERE v<?4) \
+            SELECT ?1,q.key,q.val FROM d q WHERE q.key=?3";
+        for prepared in [false, true] {
+            let conn = Connection::open_existing_schema_only(
+                path.to_string_lossy().into_owned(),
+            ).await.unwrap();
+            {
+                let statement = if prepared { Some(conn.prepare(sql).await.unwrap()) } else { None };
+                for (key, low, high, value) in [
+                    ("k042", 40, 50, Some(42)),
+                    ("k003", 0, 10, Some(3)),
+                    ("k042", 43, 50, None),
+                    ("k003", 0, 3, None),
+                    ("K042", 40, 50, Some(42)),
+                ] {
+                    let params = [
+                        SqliteValue::Integer(123), SqliteValue::Integer(low),
+                        SqliteValue::Text(key.into()), SqliteValue::Integer(high),
+                    ];
+                    let rows = if let Some(statement) = &statement {
+                        statement.query_with_params(&params).await.unwrap()
+                    } else {
+                        conn.query_with_params(sql, &params).await.unwrap()
+                    };
+                    let actual: Vec<_> = rows.iter().map(|row| row.values().to_vec()).collect();
+                    let expected: Vec<_> = value.into_iter().map(|value| vec![
+                        SqliteValue::Integer(123),
+                        SqliteValue::Text(key.to_ascii_lowercase().into()),
+                        SqliteValue::Integer(value),
+                    ]).collect();
+                    assert_eq!(actual, expected, "prepared={prepared}, {key}, [{low},{high})");
+                    assert_eq!(conn.memdb_row_hydration_count(), 0);
+                }
+            }
+            conn.set_reject_mem_fallback(true);
+            conn.set_strict_mem_fallback_rejection(true);
+            let error = conn.query(
+                "WITH c AS (SELECT id FROM a), d AS (SELECT id FROM c) SELECT id FROM d",
+            ).await.expect_err("strict mode still refuses the WITH materialization boundary");
+            assert!(error.to_string().contains("with_clause_materialization"), "{error}");
+            assert_eq!(conn.memdb_row_hydration_count(), 0);
+            conn.set_strict_mem_fallback_rejection(false);
+            conn.set_reject_mem_fallback(false);
+            conn.close_without_checkpoint().await.unwrap();
+        }
+    });
+}
+
+#[test]
+fn projection_cte_forests_keep_the_readers_wal_snapshot() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("forest-wal.db");
+        seed(&path);
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        writer.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+        let conn = Connection::open_existing_schema_only(
+            path.to_string_lossy().into_owned(),
+        ).await.unwrap();
+        conn.execute("BEGIN DEFERRED").await.unwrap();
+        let pinned = conn.query("SELECT v FROM a WHERE id='k042'").await.unwrap();
+        assert_eq!(pinned[0].values(), &[SqliteValue::Integer(42)]);
+        writer.execute("UPDATE a SET v=4242 WHERE id='k042'", []).unwrap();
+        let sql = "WITH c AS (SELECT id,v FROM a), d AS (SELECT id,v FROM c) \
+            SELECT v FROM d WHERE id='k042'";
+        assert_eq!(stock_rows(&writer, sql), vec![vec![SqliteValue::Integer(4242)]]);
+        for rows in [
+            conn.query(sql).await.unwrap(),
+            conn.prepare(sql).await.unwrap().query().await.unwrap(),
+        ] {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].values(), &[SqliteValue::Integer(42)]);
+        }
+        assert_eq!(conn.memdb_row_hydration_count(), 0, "pinned CTE read");
+        conn.execute("ROLLBACK").await.unwrap();
+        let rows = conn.query(sql).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values(), &[SqliteValue::Integer(4242)]);
+        assert_eq!(conn.memdb_row_hydration_count(), 0, "fresh CTE snapshot");
+        conn.close_without_checkpoint().await.unwrap();
+    });
+}
