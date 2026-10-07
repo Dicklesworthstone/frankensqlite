@@ -886,3 +886,83 @@ fn bd_nn29x_fk_action_child_update_resolves_with_abort() {
     }
     assert_matches_stock("FK action child UPDATE", &cases);
 }
+
+/// A WITHOUT ROWID UPDATE that resolves a later row's UNIQUE / PRIMARY KEY
+/// conflict with FAIL keeps the rows it already rewrote, as stock does. The
+/// WITHOUT ROWID rewrite used to raise that conflict with an `IdxInsert`,
+/// whose conflict path deletes every index entry inserted since the last
+/// table `Insert`; a WITHOUT ROWID program has no `Insert`, so the earlier
+/// rows' new entries were deleted after their old entries were already gone,
+/// and those rows vanished.
+#[test]
+fn bd_nn29x_without_rowid_update_fail_keeps_rewritten_rows() {
+    let mut cases = Vec::new();
+    for txn in TXNS {
+        for (mode, column_clause) in [
+            ("OR FAIL", ""),
+            ("OR FAIL", " ON CONFLICT ABORT"),
+            ("OR FAIL", " ON CONFLICT REPLACE"),
+            ("", " ON CONFLICT FAIL"),
+            ("OR ABORT", " ON CONFLICT FAIL"),
+            ("", " ON CONFLICT ROLLBACK"),
+        ] {
+            cases.push(Case {
+                name: format!("WITHOUT ROWID UNIQUE{column_clause}, `UPDATE {mode}`, {txn:?}"),
+                setup: vec![
+                    format!(
+                        "CREATE TABLE w(id INTEGER PRIMARY KEY, v INTEGER UNIQUE{column_clause}) \
+                         WITHOUT ROWID"
+                    ),
+                    "INSERT INTO w VALUES (2, 2), (3, 3), (4, 4), (10, 13)".to_owned(),
+                ],
+                steps: in_txn(
+                    txn,
+                    "INSERT INTO w VALUES (1, 1)",
+                    format!("UPDATE {mode} w SET v = v + 10 WHERE id BETWEEN 2 AND 4"),
+                ),
+                queries: strs(&[
+                    "SELECT id, v FROM w ORDER BY id",
+                    "SELECT id FROM w WHERE v > 0 ORDER BY v",
+                ]),
+            });
+            cases.push(Case {
+                name: format!(
+                    "WITHOUT ROWID UNIQUE{column_clause}, `UPDATE {mode}` ... FROM, {txn:?}"
+                ),
+                setup: vec![
+                    format!(
+                        "CREATE TABLE w(id INTEGER PRIMARY KEY, v INTEGER UNIQUE{column_clause}) \
+                         WITHOUT ROWID"
+                    ),
+                    "CREATE TABLE src(id INTEGER PRIMARY KEY, nv INTEGER)".to_owned(),
+                    "INSERT INTO w VALUES (2, 2), (3, 3), (4, 4), (10, 13)".to_owned(),
+                    "INSERT INTO src VALUES (2, 12), (3, 13), (4, 14)".to_owned(),
+                ],
+                steps: in_txn(
+                    txn,
+                    "INSERT INTO w VALUES (1, 1)",
+                    format!("UPDATE {mode} w SET v = src.nv FROM src WHERE src.id = w.id"),
+                ),
+                queries: strs(&[
+                    "SELECT id, v FROM w ORDER BY id",
+                    "SELECT id FROM w WHERE v > 0 ORDER BY v",
+                ]),
+            });
+        }
+        // The primary key moves onto another row's key.
+        cases.push(Case {
+            name: format!("WITHOUT ROWID TEXT PRIMARY KEY, `UPDATE OR FAIL`, {txn:?}"),
+            setup: strs(&[
+                "CREATE TABLE w(k TEXT PRIMARY KEY, v) WITHOUT ROWID",
+                "INSERT INTO w VALUES ('b', 1), ('c', 2), ('d', 3), ('cc', 9)",
+            ]),
+            steps: in_txn(
+                txn,
+                "INSERT INTO w VALUES ('z', 0)",
+                "UPDATE OR FAIL w SET k = k || k WHERE k IN ('b', 'c', 'd')".to_owned(),
+            ),
+            queries: strs(&["SELECT k, v FROM w ORDER BY k"]),
+        });
+    }
+    assert_matches_stock("WITHOUT ROWID UPDATE FAIL", &cases);
+}

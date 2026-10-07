@@ -27743,24 +27743,20 @@ fn emit_without_rowid_update_rewrite(
     } else {
         // ABORT / FAIL / ROLLBACK: raise the UNIQUE violation now, while OLD is
         // still present, so the statement cannot lose the OLD row on the way
-        // out. `NoConflict` fell through, so a conflicting row provably exists
-        // and this insert cannot silently succeed.
-        let abort_rec = b.alloc_reg();
+        // out. `NoConflict` fell through, so a conflicting row provably exists.
+        // Raise it with a constraint `Halt`, as the WITHOUT ROWID INSERT path
+        // does, not with a conflicting `IdxInsert`: the engine answers an
+        // `IdxInsert` conflict by deleting every index entry it inserted since
+        // the last table `Insert`, and a WITHOUT ROWID program has no `Insert`,
+        // so under FAIL that unwound the rows this statement had already
+        // rewritten (bd-nn29x review).
         b.emit_op(
-            Opcode::MakeRecord,
-            new_regs,
-            n_cols as i32,
-            abort_rec,
-            P4::Affinity(aff_str.clone()),
+            Opcode::Halt,
+            ErrorCode::Constraint as i32,
+            halt_conflict_oe(oe_flag),
             0,
-        );
-        b.emit_op(
-            Opcode::IdxInsert,
-            table_cursor,
-            abort_rec,
-            n_pk as i32,
-            P4::Table(pk_label.clone()),
-            1u16 | (oe_flag << 1),
+            P4::Str(pk_label.clone()),
+            OPFLAG_HALT_UNIQUE,
         );
     }
     b.resolve_label(no_victim);
@@ -27782,10 +27778,8 @@ fn emit_without_rowid_update_rewrite(
         let idx_cursor = table_cursor + 1 + idx_offset as i32;
         let n_idx_cols = index.key_term_count();
         // GH #353: deduplicated WITHOUT ROWID key layout — the victim PK is read
-        // from these per-column positions, and the raise key appends only the
-        // non-overlapping PK suffix.
+        // from these per-column positions.
         let read_positions = without_rowid_index_pk_read_positions(table, index, pk_indices);
-        let appended_pk = without_rowid_index_appended_pk(table, index, pk_indices);
         let idx_done = b.emit_label();
 
         // A partial index only constrains rows its predicate admits: when NEW
@@ -27890,48 +27884,17 @@ fn emit_without_rowid_update_rewrite(
             b.emit_op(Opcode::Integer, 1, victim_flag, 0, P4::None, 0);
         } else {
             // ABORT / FAIL / ROLLBACK: raise the UNIQUE violation now, while
-            // OLD and every captured victim are still present. The full
-            // [key || pk] record is what the engine's unique check expects;
-            // `NoConflict` fell through, so a conflicting entry provably exists
-            // and this cannot silently succeed.
-            let n_pk_app = appended_pk.len();
-            let raise_regs = b.alloc_regs((n_idx_cols + n_pk_app) as i32);
-            for key_pos in 0..n_idx_cols {
-                b.emit_op(
-                    Opcode::Copy,
-                    probe_regs + key_pos as i32,
-                    raise_regs + key_pos as i32,
-                    0,
-                    P4::None,
-                    0,
-                );
-            }
-            for (j, &pk_col) in appended_pk.iter().enumerate() {
-                b.emit_op(
-                    Opcode::Copy,
-                    new_regs + pk_col as i32,
-                    raise_regs + (n_idx_cols + j) as i32,
-                    0,
-                    P4::None,
-                    0,
-                );
-            }
-            let raise_rec = b.alloc_reg();
+            // OLD and every captured victim are still present. `NoConflict`
+            // fell through, so a conflicting entry provably exists. A
+            // constraint `Halt`, as on the primary key above and in the INSERT
+            // path, so a FAIL keeps the rows this statement already rewrote.
             b.emit_op(
-                Opcode::MakeRecord,
-                raise_regs,
-                (n_idx_cols + n_pk_app) as i32,
-                raise_rec,
-                P4::None,
+                Opcode::Halt,
+                ErrorCode::Constraint as i32,
+                halt_conflict_oe(idx_oe),
                 0,
-            );
-            b.emit_op(
-                Opcode::IdxInsert,
-                idx_cursor,
-                raise_rec,
-                n_idx_cols as i32,
-                P4::Table(index.key_label_qualified(&table.name)),
-                1u16 | (idx_oe << 1),
+                P4::Str(index.key_label_qualified(&table.name)),
+                OPFLAG_HALT_UNIQUE,
             );
         }
         b.resolve_label(idx_done);
