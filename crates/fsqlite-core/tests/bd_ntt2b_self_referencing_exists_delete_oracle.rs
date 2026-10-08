@@ -8,7 +8,7 @@
 //! WITHOUT ROWID table). Compared with stock SQLite (rusqlite, bundled): the
 //! changed-row count or RETURNING rows, then the table's rows, on `:memory:`
 //! and on a file, through `Connection::execute` and a prepared statement.
-//! WITHOUT ROWID cases run file-backed only for now (bd-pxn52).
+//! WITHOUT ROWID cases run on `:memory:` as well since bd-pxn52.
 
 use fsqlite_core::connection::Connection;
 use fsqlite_types::value::SqliteValue;
@@ -225,15 +225,7 @@ fn self_referencing_exists_delete_matches_stock() {
             } else {
                 &[false, true]
             };
-            // On `:memory:`, the WITHOUT ROWID cases read an unhydrated row
-            // mirror when the DELETE is the first statement after the inserts
-            // (bd-pxn52), so they run file-backed only until that is fixed.
-            let backings: &[bool] = if case.setup[0].contains("WITHOUT ROWID") {
-                &[true]
-            } else {
-                &[false, true]
-            };
-            for &file_backed in backings {
+            for file_backed in [false, true] {
                 for &prepared in modes {
                     failures.extend(check_case(case, file_backed, prepared).await);
                 }

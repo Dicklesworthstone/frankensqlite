@@ -12670,6 +12670,17 @@ impl VdbeEngine {
                     if sideband_active {
                         self.make_record_lookaside.replace_cleared_buf(key_blob);
                     }
+                    // bd-pxn52: a WITHOUT ROWID table's rows are written here, not
+                    // through Insert, so mark the b-tree dirty as Insert does: the
+                    // MemDatabase mirror no longer holds its rows. Left clean, a
+                    // `:memory:` DELETE's nested SELECT read the stale mirror and
+                    // matched nothing. An ephemeral cursor records no root page.
+                    // Once the flag is down (a rowid table's own Insert, or an
+                    // earlier row) there is nothing left to mark, so the per-row
+                    // cost is this check.
+                    if inserted && self.storage_cursor_memdb_count_shortcuts_safe {
+                        self.mark_storage_table_dirty(cursor_id);
+                    }
                     if count_logical_change && inserted {
                         self.changes = self.changes.saturating_add(1);
                     }
@@ -12851,6 +12862,11 @@ impl VdbeEngine {
                     // rows-affected = 0.
                     if deleted && op.p5 & 1 != 0 {
                         self.changes += 1;
+                    }
+                    // bd-pxn52: as for IdxInsert, a WITHOUT ROWID row delete must
+                    // leave the MemDatabase mirror marked stale.
+                    if deleted && self.storage_cursor_memdb_count_shortcuts_safe {
+                        self.mark_storage_table_dirty(cursor_id);
                     }
                     // No MemDatabase fallback for indexes.
                     pc += 1;
