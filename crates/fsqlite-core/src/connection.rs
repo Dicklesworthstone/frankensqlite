@@ -7313,6 +7313,25 @@ impl PreparedDirectSimpleInsert {
             PreparedDirectSimpleInsertLane::ReusableTableProgram
         )
     }
+
+    /// Whether a NOT NULL violation of `violated` (`table.column`, as this
+    /// lane reports it) resolves to IGNORE: the statement's OR clause, else
+    /// the column's `NOT NULL ON CONFLICT` clause.
+    fn not_null_violation_is_ignored(&self, table_name: &str, violated: &str) -> bool {
+        let Some(column_name) = violated
+            .strip_prefix(table_name)
+            .and_then(|rest| rest.strip_prefix('.'))
+        else {
+            return false;
+        };
+        self.columns
+            .iter()
+            .find(|column| column.name.eq_ignore_ascii_case(column_name))
+            .is_some_and(|column| {
+                self.or_conflict.or(column.conflict_action)
+                    == Some(fsqlite_ast::ConflictAction::Ignore)
+            })
+    }
 }
 
 /// A single SET assignment compiled for the direct-simple UPDATE fast path.
@@ -34620,6 +34639,30 @@ impl Connection {
         direct: &PreparedDirectSimpleInsert,
         params: Option<&[SqliteValue]>,
     ) -> Result<Option<i64>> {
+        match self
+            .execute_prepared_direct_simple_insert_row(execution_cx, table_name, direct, params)
+            .await
+        {
+            // bd-m3jt4: a NULL for a NOT NULL column whose conflict resolves
+            // to IGNORE (the statement's OR clause, else the column's NOT NULL
+            // ON CONFLICT) skips the row, as the general path does. This lane
+            // detects the violation while building the row, before writing.
+            Err(FrankenError::NotNullViolation { column })
+                if direct.not_null_violation_is_ignored(table_name, &column) =>
+            {
+                Ok(None)
+            }
+            other => other,
+        }
+    }
+
+    async fn execute_prepared_direct_simple_insert_row(
+        &self,
+        execution_cx: &Cx,
+        table_name: &str,
+        direct: &PreparedDirectSimpleInsert,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Option<i64>> {
         let _lookaside_growth = StatementLookasideGrowthGuard::new(self);
         let profile_enabled = hot_path_profile_enabled();
         if profile_enabled {
@@ -47720,6 +47763,18 @@ impl Connection {
         {
             return Ok(None);
         }
+        // bd-m3jt4: under REPLACE, a NULL for a NOT NULL column that has a
+        // DEFAULT stores the DEFAULT; this lane would reject it, so the
+        // general path takes such statements.
+        if table.columns.iter().any(|column| {
+            column.notnull
+                && !column.is_ipk
+                && column.default_value.is_some()
+                && resolved_insert.or_conflict.or(column.conflict_action)
+                    == Some(fsqlite_ast::ConflictAction::Replace)
+        }) {
+            return Ok(None);
+        }
 
         let rowid_alias_col_idx = self
             .rowid_alias_columns
@@ -48577,6 +48632,17 @@ impl Connection {
             };
             let column = &table.columns[col_idx];
             if column.is_ipk || column.unique {
+                return Ok(None);
+            }
+            // bd-m3jt4: this lane rejects a NULL for a NOT NULL column. Under
+            // IGNORE (skip the row) or REPLACE (store the DEFAULT) the general
+            // path resolves the conflict as stock does.
+            if column.notnull
+                && matches!(
+                    update.or_conflict.or(column.conflict_action),
+                    Some(fsqlite_ast::ConflictAction::Ignore | fsqlite_ast::ConflictAction::Replace)
+                )
+            {
                 return Ok(None);
             }
             let value = match &assignment.value {

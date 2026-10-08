@@ -23775,8 +23775,18 @@ fn codegen_insert_values(
         let n_cols_i32 = n_cols as i32;
         // bd-bld9w.7 family (a): the compile-time preformatted record bakes TEXT as
         // UTF-8, so only use it for a UTF-8 database; for UTF-16 fall through to the
-        // encoding-aware runtime MakeRecord path.
-        let preformatted_record = if matches!(ctx.text_encoding, TextEncoding::Utf8) {
+        // encoding-aware runtime MakeRecord path. bd-m3jt4: REPLACE can store a NOT
+        // NULL column's DEFAULT in its register in place of a NULL, which a record
+        // baked from the literal row would not carry.
+        let not_null_replaces_default = table.columns.iter().any(|c| {
+            c.notnull
+                && !c.is_ipk
+                && c.default_value.is_some()
+                && effective_oe(stmt_level, c.conflict_action) == OE_REPLACE
+        });
+        let preformatted_record = if matches!(ctx.text_encoding, TextEncoding::Utf8)
+            && !not_null_replaces_default
+        {
             try_build_preformatted_insert_record(row_values, table, col_mapping)
         } else {
             None
@@ -30738,9 +30748,19 @@ fn emit_not_null_constraints(
             let ok_label = b.emit_label();
             b.emit_jump_to_label(Opcode::NotNull, reg, 0, ok_label, P4::None, 0);
             // A statement-level `INSERT OR <algo>` overrides the column's
-            // declared `NOT NULL ON CONFLICT <algo>`. Only IGNORE skips the
-            // row; every other action (incl. the default ABORT) errors.
+            // declared `NOT NULL ON CONFLICT <algo>`. IGNORE skips the row;
+            // REPLACE stores the column's DEFAULT instead of the NULL (bd-m3jt4,
+            // as stock's sqlite3GenerateConstraintChecks), and aborts when the
+            // column has no DEFAULT, is generated, or its DEFAULT is NULL too;
+            // every other action (incl. the default ABORT) errors.
             let oe = effective_oe(stmt_level, col.conflict_action);
+            if oe == OE_REPLACE
+                && col.generated_expr.is_none()
+                && col.default_value.is_some()
+                && emit_default_value(b, col, reg).is_ok()
+            {
+                b.emit_jump_to_label(Opcode::NotNull, reg, 0, ok_label, P4::None, 0);
+            }
             match (oe == OE_IGNORE, ignore_label) {
                 (true, Some(skip)) => {
                     b.emit_jump_to_label(Opcode::Goto, 0, 0, skip, P4::None, 0);
