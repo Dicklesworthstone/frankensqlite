@@ -310,11 +310,16 @@ mod tests {
     fn strict_integrity_checks_generated_without_rowid_and_shadowed_columns() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("strict-layouts.db");
+        // bd-hfbgg: the VIRTUAL column stays a valid INT (`v + 0` turns the
+        // BLOB x'31' into 1). Given an invalid value, bundled SQLite 3.53 fails
+        // the whole integrity_check ("cannot store BLOB value in INT column
+        // generated.g") where 3.51 reported "non-INT value in generated.g", so
+        // the reference could not be built.
         {
             let stock = rusqlite::Connection::open(&path).unwrap();
             stock
                 .execute_batch(
-                    r#"CREATE TABLE generated(v INT, s INT AS (v) STORED, g INT AS (v) VIRTUAL);
+                    r#"CREATE TABLE generated(v INT, s INT AS (v) STORED, g INT AS (v + 0) VIRTUAL);
                        INSERT INTO generated(v) VALUES(x'31'),(NULL),(42);
                        CREATE TABLE compact(k TEXT PRIMARY KEY, v INT) WITHOUT ROWID;
                        INSERT INTO compact VALUES('key', x'31');
@@ -328,7 +333,7 @@ mod tests {
                 .unwrap();
         }
         let expected = reference_reports(&path, "PRAGMA integrity_check");
-        assert_eq!(expected.len(), 5, "fixture covers all three stored layouts");
+        assert_eq!(expected.len(), 4, "fixture covers all three stored layouts");
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(path.to_str().unwrap()).await.unwrap();
             // The MAIN table and its xinfo must remain visible to the checker.
