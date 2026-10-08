@@ -83387,32 +83387,114 @@ impl Connection {
             && !self.shadowed_main_tables.borrow().contains_key(&name)
     }
 
-    /// Replace only an explicitly `main.`-qualified DML target in a disposable
-    /// schema snapshot. Unqualified and `temp.` targets retain normal TEMP
-    /// shadowing semantics.
-    fn apply_shadowed_main_target_substitution(
+    /// bd-tjvwc: point every relation an INSERT, UPDATE or DELETE names at its own
+    /// database while a TEMP table shadows a same-named MAIN table. Codegen
+    /// finds a table by bare name in the statement's schema snapshot, which
+    /// holds one entry per name, so `main.users` and `temp.users` (or a plain
+    /// `users`, which TEMP shadows) in one statement read one table: whichever
+    /// held the slot, so a subquery or FROM item naming the other database read
+    /// the target's rows. The target keeps the bare name, since the executors
+    /// key it by table name. When the statement names the shadowed table in
+    /// both databases, the other database's table joins the snapshot under a
+    /// synthetic name (NUL-delimited, like bd-ghiey's SELECT path) and every
+    /// reference to it is renamed; a FROM item without an alias keeps its old
+    /// name as one, so column references still bind to it. When the statement
+    /// names only `main.<name>`, the MAIN table replaces the TEMP entry.
+    ///
+    /// `visit` must call its argument on every qualified name in the
+    /// statement; it is called once to collect and once to rename.
+    fn apply_shadowed_main_dml_substitution(
         &self,
-        schema: &mut [TableSchema],
-        target: &fsqlite_ast::QualifiedName,
+        schema: &mut Vec<TableSchema>,
+        mut visit: impl FnMut(&mut dyn FnMut(&mut QualifiedName, QualifiedNameSite<'_>)),
     ) {
-        if !target
-            .schema
-            .as_deref()
-            .is_some_and(|scope| scope.eq_ignore_ascii_case("main"))
-        {
-            return;
-        }
-        let target_name_lc = target.name.to_ascii_lowercase();
         let shadowed = self.shadowed_main_tables.borrow();
-        let Some(main_table) = shadowed.get(&target_name_lc) else {
+        if shadowed.is_empty() {
             return;
-        };
-        if let Some(slot) = schema
-            .iter_mut()
-            .find(|table| table.name.eq_ignore_ascii_case(&target.name))
-        {
-            *slot = main_table.clone();
         }
+        let reads_main = |name: &QualifiedName| {
+            name.schema
+                .as_deref()
+                .is_some_and(|schema| schema.eq_ignore_ascii_case("main"))
+        };
+        let reads_temp = |name: &QualifiedName| {
+            name.schema
+                .as_deref()
+                .is_none_or(|schema| schema.eq_ignore_ascii_case("temp"))
+        };
+        let mut main_names = BTreeSet::new();
+        let mut temp_names = BTreeSet::new();
+        let mut main_target = None;
+        visit(&mut |name, site| {
+            let name_lc = name.name.to_ascii_lowercase();
+            if matches!(site, QualifiedNameSite::TableStar) || !shadowed.contains_key(&name_lc) {
+                return;
+            }
+            if reads_main(name) {
+                if matches!(site, QualifiedNameSite::Target) {
+                    main_target = Some(name_lc.clone());
+                }
+                main_names.insert(name_lc);
+            } else if reads_temp(name) {
+                temp_names.insert(name_lc);
+            }
+        });
+        // (name, whether its MAIN references move, synthetic name)
+        let mut retarget = Vec::new();
+        for name_lc in main_names {
+            let Some(main_table) = shadowed.get(&name_lc) else {
+                continue;
+            };
+            let Some(slot) = schema
+                .iter()
+                .position(|table| table.name.eq_ignore_ascii_case(&name_lc))
+            else {
+                continue;
+            };
+            if !temp_names.contains(&name_lc) {
+                schema[slot] = main_table.clone();
+            } else if main_target.as_deref() == Some(name_lc.as_str()) {
+                let synthetic = format!("\u{0}temp\u{0}{name_lc}");
+                let mut temp_entry = std::mem::replace(&mut schema[slot], main_table.clone());
+                temp_entry.name.clone_from(&synthetic);
+                schema.push(temp_entry);
+                retarget.push((name_lc, false, synthetic));
+            } else {
+                let synthetic = format!("\u{0}main\u{0}{name_lc}");
+                let mut main_entry = main_table.clone();
+                main_entry.name.clone_from(&synthetic);
+                schema.push(main_entry);
+                retarget.push((name_lc, true, synthetic));
+            }
+        }
+        drop(shadowed);
+        if retarget.is_empty() {
+            return;
+        }
+        visit(&mut |name, site| {
+            let alias = match site {
+                QualifiedNameSite::Target | QualifiedNameSite::TableStar => return,
+                QualifiedNameSite::Source(alias) => Some(alias),
+                QualifiedNameSite::InTable => None,
+            };
+            let Some((_, _, synthetic)) = retarget.iter().find(|(name_lc, moves_main, _)| {
+                name.name.eq_ignore_ascii_case(name_lc)
+                    && if *moves_main {
+                        reads_main(name)
+                    } else {
+                        reads_temp(name)
+                    }
+            }) else {
+                return;
+            };
+            if let Some(alias) = alias
+                && alias.is_none()
+            {
+                *alias = Some(name.name.clone());
+            }
+            name.schema = None;
+            synthetic.clone_into(&mut name.name);
+        });
     }
 
     /// Return every schema root owned by connection-local TEMP tables.
@@ -99226,16 +99308,26 @@ impl Connection {
             ..CodegenContext::default()
         };
         let temp_roots = self.temp_storage_roots();
+        let mut insert = insert;
+        let temp_schema = if temp_roots.is_empty() && !targets_shadowed_main {
+            None
+        } else {
+            let mut schema = self.schema.borrow().clone();
+            // Visits (and so clones a borrowed statement) only while a TEMP
+            // table shadows a MAIN one.
+            self.apply_shadowed_main_dml_substitution(&mut schema, |mut f| {
+                visit_insert_qualified_name_sites_mut(insert.to_mut(), &mut f);
+            });
+            Self::suppress_temp_indexes_for_codegen(&mut schema, &temp_roots);
+            Some(schema)
+        };
         self.with_codegen_function_context(|| {
-            if temp_roots.is_empty() && !targets_shadowed_main {
-                let schema = self.schema.borrow();
-                codegen_insert(&mut builder, insert.as_ref(), &schema, &ctx)
+            if let Some(schema) = &temp_schema {
+                builder.set_materialized_virtual_generated_roots(temp_roots.iter().copied());
+                codegen_insert(&mut builder, insert.as_ref(), schema, &ctx)
                     .map_err(codegen_error_to_franken)
             } else {
-                let mut schema = self.schema.borrow().clone();
-                self.apply_shadowed_main_target_substitution(&mut schema, &insert.table);
-                Self::suppress_temp_indexes_for_codegen(&mut schema, &temp_roots);
-                builder.set_materialized_virtual_generated_roots(temp_roots.iter().copied());
+                let schema = self.schema.borrow();
                 codegen_insert(&mut builder, insert.as_ref(), &schema, &ctx)
                     .map_err(codegen_error_to_franken)
             }
@@ -99326,7 +99418,7 @@ impl Connection {
         // numbers placeholders. Index probes can select a later WHERE term,
         // so bind slots must follow SQL order before codegen reorders emission.
         // Keep the caller's AST and original SQL intact for public metadata.
-        let canonical_update = canonicalize_update_placeholders(update)?;
+        let mut canonical_update = canonicalize_update_placeholders(update)?;
         let update = &canonical_update;
         // Direct DML on the schema table with writable_schema OFF is rejected
         // with SQLITE_ERROR here — the resolve below would otherwise raise the
@@ -99374,16 +99466,24 @@ impl Connection {
             ..CodegenContext::default()
         };
         let temp_roots = self.temp_storage_roots();
+        let temp_schema = if temp_roots.is_empty() && !targets_shadowed_main {
+            None
+        } else {
+            let mut schema = self.schema.borrow().clone();
+            self.apply_shadowed_main_dml_substitution(&mut schema, |mut f| {
+                visit_update_qualified_name_sites_mut(&mut canonical_update, &mut f);
+            });
+            Self::suppress_temp_indexes_for_codegen(&mut schema, &temp_roots);
+            Some(schema)
+        };
+        let update = &canonical_update;
         self.with_codegen_function_context(|| {
-            if temp_roots.is_empty() && !targets_shadowed_main {
-                let schema = self.schema.borrow();
-                codegen_update(&mut builder, update, &schema, &ctx)
+            if let Some(schema) = &temp_schema {
+                builder.set_materialized_virtual_generated_roots(temp_roots.iter().copied());
+                codegen_update(&mut builder, update, schema, &ctx)
                     .map_err(codegen_error_to_franken)
             } else {
-                let mut schema = self.schema.borrow().clone();
-                self.apply_shadowed_main_target_substitution(&mut schema, &update.table.name);
-                Self::suppress_temp_indexes_for_codegen(&mut schema, &temp_roots);
-                builder.set_materialized_virtual_generated_roots(temp_roots.iter().copied());
+                let schema = self.schema.borrow();
                 codegen_update(&mut builder, update, &schema, &ctx)
                     .map_err(codegen_error_to_franken)
             }
@@ -99396,7 +99496,7 @@ impl Connection {
     fn compile_table_delete(&self, delete: &fsqlite_ast::DeleteStatement) -> Result<VdbeProgram> {
         // DELETE shares UPDATE's index-probe emission order: a later indexed
         // conjunct must retain its own bind slot rather than use the first one.
-        let canonical_delete = canonicalize_delete_placeholders(delete)?;
+        let mut canonical_delete = canonicalize_delete_placeholders(delete)?;
         let delete = &canonical_delete;
         // GH #284: reject direct DML on the schema table with writable_schema
         // OFF (SQLITE_ERROR), rather than the generic "no such table" the
@@ -99432,15 +99532,23 @@ impl Connection {
             ..CodegenContext::default()
         };
         let temp_roots = self.temp_storage_roots();
+        let temp_schema = if temp_roots.is_empty() && !targets_shadowed_main {
+            None
+        } else {
+            let mut schema = self.schema.borrow().clone();
+            self.apply_shadowed_main_dml_substitution(&mut schema, |mut f| {
+                visit_delete_qualified_name_sites_mut(&mut canonical_delete, &mut f);
+            });
+            Self::suppress_temp_indexes_for_codegen(&mut schema, &temp_roots);
+            Some(schema)
+        };
+        let delete = &canonical_delete;
         self.with_codegen_function_context(|| {
-            if temp_roots.is_empty() && !targets_shadowed_main {
-                let schema = self.schema.borrow();
-                codegen_delete(&mut builder, delete, &schema, &ctx)
+            if let Some(schema) = &temp_schema {
+                codegen_delete(&mut builder, delete, schema, &ctx)
                     .map_err(codegen_error_to_franken)
             } else {
-                let mut schema = self.schema.borrow().clone();
-                self.apply_shadowed_main_target_substitution(&mut schema, &delete.table.name);
-                Self::suppress_temp_indexes_for_codegen(&mut schema, &temp_roots);
+                let schema = self.schema.borrow();
                 codegen_delete(&mut builder, delete, &schema, &ctx)
                     .map_err(codegen_error_to_franken)
             }
@@ -110593,29 +110701,49 @@ fn visit_select_qualified_names_mut(
     select: &mut SelectStatement,
     f: &mut impl FnMut(&mut QualifiedName),
 ) {
+    visit_select_qualified_name_sites_mut(select, &mut |name, _| f(name));
+}
+
+/// Where a mutable qualified-name visitor found a name. bd-tjvwc: a pass that
+/// renames a FROM item has to keep the qualifier its column references use.
+enum QualifiedNameSite<'a> {
+    /// The INSERT, UPDATE or DELETE target.
+    Target,
+    /// A FROM or JOIN table item, with its alias.
+    Source(&'a mut Option<String>),
+    /// The table of `expr IN [schema.]table`.
+    InTable,
+    /// The qualifier of `[schema.]table.*` in a result list.
+    TableStar,
+}
+
+fn visit_select_qualified_name_sites_mut(
+    select: &mut SelectStatement,
+    f: &mut impl FnMut(&mut QualifiedName, QualifiedNameSite<'_>),
+) {
     if let Some(with) = &mut select.with {
         for cte in &mut with.ctes {
-            visit_select_qualified_names_mut(&mut cte.query, f);
+            visit_select_qualified_name_sites_mut(&mut cte.query, f);
         }
     }
-    visit_select_core_qualified_names_mut(&mut select.body.select, f);
+    visit_select_core_qualified_name_sites_mut(&mut select.body.select, f);
     for (_, core) in &mut select.body.compounds {
-        visit_select_core_qualified_names_mut(core, f);
+        visit_select_core_qualified_name_sites_mut(core, f);
     }
     for term in &mut select.order_by {
-        visit_expr_qualified_names_mut(&mut term.expr, f);
+        visit_expr_qualified_name_sites_mut(&mut term.expr, f);
     }
     if let Some(limit) = &mut select.limit {
-        visit_expr_qualified_names_mut(&mut limit.limit, f);
+        visit_expr_qualified_name_sites_mut(&mut limit.limit, f);
         if let Some(offset) = &mut limit.offset {
-            visit_expr_qualified_names_mut(offset, f);
+            visit_expr_qualified_name_sites_mut(offset, f);
         }
     }
 }
 
-fn visit_select_core_qualified_names_mut(
+fn visit_select_core_qualified_name_sites_mut(
     core: &mut SelectCore,
-    f: &mut impl FnMut(&mut QualifiedName),
+    f: &mut impl FnMut(&mut QualifiedName, QualifiedNameSite<'_>),
 ) {
     match core {
         SelectCore::Select {
@@ -110629,61 +110757,61 @@ fn visit_select_core_qualified_names_mut(
         } => {
             for column in columns {
                 match column {
-                    ResultColumn::Expr { expr, .. } => visit_expr_qualified_names_mut(expr, f),
-                    ResultColumn::TableStar(name) => f(name),
+                    ResultColumn::Expr { expr, .. } => visit_expr_qualified_name_sites_mut(expr, f),
+                    ResultColumn::TableStar(name) => f(name, QualifiedNameSite::TableStar),
                     ResultColumn::Star => {}
                 }
             }
             if let Some(from_clause) = from {
-                visit_table_or_subquery_qualified_names_mut(&mut from_clause.source, f);
+                visit_table_or_subquery_qualified_name_sites_mut(&mut from_clause.source, f);
                 for join in &mut from_clause.joins {
-                    visit_table_or_subquery_qualified_names_mut(&mut join.table, f);
+                    visit_table_or_subquery_qualified_name_sites_mut(&mut join.table, f);
                     if let Some(JoinConstraint::On(expr)) = &mut join.constraint {
-                        visit_expr_qualified_names_mut(expr, f);
+                        visit_expr_qualified_name_sites_mut(expr, f);
                     }
                 }
             }
             if let Some(expr) = where_clause {
-                visit_expr_qualified_names_mut(expr, f);
+                visit_expr_qualified_name_sites_mut(expr, f);
             }
             for expr in group_by {
-                visit_expr_qualified_names_mut(expr, f);
+                visit_expr_qualified_name_sites_mut(expr, f);
             }
             if let Some(expr) = having {
-                visit_expr_qualified_names_mut(expr, f);
+                visit_expr_qualified_name_sites_mut(expr, f);
             }
             for window in windows {
-                visit_window_qualified_names_mut(window, f);
+                visit_window_spec_qualified_name_sites_mut(&mut window.spec, f);
             }
         }
         SelectCore::Values(rows) => {
             for row in rows.iter_mut() {
                 for expr in row {
-                    visit_expr_qualified_names_mut(expr, f);
+                    visit_expr_qualified_name_sites_mut(expr, f);
                 }
             }
         }
     }
 }
 
-fn visit_table_or_subquery_qualified_names_mut(
+fn visit_table_or_subquery_qualified_name_sites_mut(
     source: &mut TableOrSubquery,
-    f: &mut impl FnMut(&mut QualifiedName),
+    f: &mut impl FnMut(&mut QualifiedName, QualifiedNameSite<'_>),
 ) {
     match source {
-        TableOrSubquery::Table { name, .. } => f(name),
-        TableOrSubquery::Subquery { query, .. } => visit_select_qualified_names_mut(query, f),
+        TableOrSubquery::Table { name, alias, .. } => f(name, QualifiedNameSite::Source(alias)),
+        TableOrSubquery::Subquery { query, .. } => visit_select_qualified_name_sites_mut(query, f),
         TableOrSubquery::TableFunction { args, .. } => {
             for expr in args {
-                visit_expr_qualified_names_mut(expr, f);
+                visit_expr_qualified_name_sites_mut(expr, f);
             }
         }
         TableOrSubquery::ParenJoin(from) => {
-            visit_table_or_subquery_qualified_names_mut(&mut from.source, f);
+            visit_table_or_subquery_qualified_name_sites_mut(&mut from.source, f);
             for join in &mut from.joins {
-                visit_table_or_subquery_qualified_names_mut(&mut join.table, f);
+                visit_table_or_subquery_qualified_name_sites_mut(&mut join.table, f);
                 if let Some(JoinConstraint::On(expr)) = &mut join.constraint {
-                    visit_expr_qualified_names_mut(expr, f);
+                    visit_expr_qualified_name_sites_mut(expr, f);
                 }
             }
         }
@@ -110691,6 +110819,13 @@ fn visit_table_or_subquery_qualified_names_mut(
 }
 
 fn visit_expr_qualified_names_mut(expr: &mut Expr, f: &mut impl FnMut(&mut QualifiedName)) {
+    visit_expr_qualified_name_sites_mut(expr, &mut |name, _| f(name));
+}
+
+fn visit_expr_qualified_name_sites_mut(
+    expr: &mut Expr,
+    f: &mut impl FnMut(&mut QualifiedName, QualifiedNameSite<'_>),
+) {
     match expr {
         Expr::BoundOuterValue { .. }
         | Expr::Literal(_, _)
@@ -110698,30 +110833,30 @@ fn visit_expr_qualified_names_mut(expr: &mut Expr, f: &mut impl FnMut(&mut Quali
         | Expr::Raise { .. }
         | Expr::Placeholder(_, _) => {}
         Expr::BinaryOp { left, right, .. } => {
-            visit_expr_qualified_names_mut(left, f);
-            visit_expr_qualified_names_mut(right, f);
+            visit_expr_qualified_name_sites_mut(left, f);
+            visit_expr_qualified_name_sites_mut(right, f);
         }
         Expr::UnaryOp { expr, .. }
         | Expr::IsNull { expr, .. }
         | Expr::Cast { expr, .. }
-        | Expr::Collate { expr, .. } => visit_expr_qualified_names_mut(expr, f),
+        | Expr::Collate { expr, .. } => visit_expr_qualified_name_sites_mut(expr, f),
         Expr::Between {
             expr, low, high, ..
         } => {
-            visit_expr_qualified_names_mut(expr, f);
-            visit_expr_qualified_names_mut(low, f);
-            visit_expr_qualified_names_mut(high, f);
+            visit_expr_qualified_name_sites_mut(expr, f);
+            visit_expr_qualified_name_sites_mut(low, f);
+            visit_expr_qualified_name_sites_mut(high, f);
         }
         Expr::In { expr, set, .. } => {
-            visit_expr_qualified_names_mut(expr, f);
+            visit_expr_qualified_name_sites_mut(expr, f);
             match set {
                 InSet::List(exprs) => {
                     for expr in exprs {
-                        visit_expr_qualified_names_mut(expr, f);
+                        visit_expr_qualified_name_sites_mut(expr, f);
                     }
                 }
-                InSet::Subquery(subquery) => visit_select_qualified_names_mut(subquery, f),
-                InSet::Table(name) => f(name),
+                InSet::Subquery(subquery) => visit_select_qualified_name_sites_mut(subquery, f),
+                InSet::Table(name) => f(name, QualifiedNameSite::InTable),
             }
         }
         Expr::Like {
@@ -110730,10 +110865,10 @@ fn visit_expr_qualified_names_mut(expr: &mut Expr, f: &mut impl FnMut(&mut Quali
             escape,
             ..
         } => {
-            visit_expr_qualified_names_mut(expr, f);
-            visit_expr_qualified_names_mut(pattern, f);
+            visit_expr_qualified_name_sites_mut(expr, f);
+            visit_expr_qualified_name_sites_mut(pattern, f);
             if let Some(escape) = escape {
-                visit_expr_qualified_names_mut(escape, f);
+                visit_expr_qualified_name_sites_mut(escape, f);
             }
         }
         Expr::Case {
@@ -110743,18 +110878,18 @@ fn visit_expr_qualified_names_mut(expr: &mut Expr, f: &mut impl FnMut(&mut Quali
             ..
         } => {
             if let Some(operand) = operand {
-                visit_expr_qualified_names_mut(operand, f);
+                visit_expr_qualified_name_sites_mut(operand, f);
             }
             for (when_expr, then_expr) in whens {
-                visit_expr_qualified_names_mut(when_expr, f);
-                visit_expr_qualified_names_mut(then_expr, f);
+                visit_expr_qualified_name_sites_mut(when_expr, f);
+                visit_expr_qualified_name_sites_mut(then_expr, f);
             }
             if let Some(else_expr) = else_expr {
-                visit_expr_qualified_names_mut(else_expr, f);
+                visit_expr_qualified_name_sites_mut(else_expr, f);
             }
         }
         Expr::Exists { subquery, .. } | Expr::Subquery(subquery, _) => {
-            visit_select_qualified_names_mut(subquery, f);
+            visit_select_qualified_name_sites_mut(subquery, f);
         }
         Expr::FunctionCall {
             args,
@@ -110765,70 +110900,56 @@ fn visit_expr_qualified_names_mut(expr: &mut Expr, f: &mut impl FnMut(&mut Quali
         } => {
             if let FunctionArgs::List(args) = args {
                 for expr in args {
-                    visit_expr_qualified_names_mut(expr, f);
+                    visit_expr_qualified_name_sites_mut(expr, f);
                 }
             }
             for term in order_by {
-                visit_expr_qualified_names_mut(&mut term.expr, f);
+                visit_expr_qualified_name_sites_mut(&mut term.expr, f);
             }
             if let Some(filter) = filter {
-                visit_expr_qualified_names_mut(filter, f);
+                visit_expr_qualified_name_sites_mut(filter, f);
             }
             if let Some(window) = over {
-                visit_window_spec_qualified_names_mut(window, f);
+                visit_window_spec_qualified_name_sites_mut(window, f);
             }
         }
         Expr::JsonAccess { expr, path, .. } => {
-            visit_expr_qualified_names_mut(expr, f);
-            visit_expr_qualified_names_mut(path, f);
+            visit_expr_qualified_name_sites_mut(expr, f);
+            visit_expr_qualified_name_sites_mut(path, f);
         }
         Expr::RowValue(exprs, _) => {
             for expr in exprs {
-                visit_expr_qualified_names_mut(expr, f);
+                visit_expr_qualified_name_sites_mut(expr, f);
             }
         }
     }
 }
 
-fn visit_window_qualified_names_mut(
-    window: &mut fsqlite_ast::WindowDef,
-    f: &mut impl FnMut(&mut QualifiedName),
-) {
-    visit_window_spec_qualified_names_mut(&mut window.spec, f);
-}
-
-fn visit_window_spec_qualified_names_mut(
+fn visit_window_spec_qualified_name_sites_mut(
     window: &mut WindowSpec,
-    f: &mut impl FnMut(&mut QualifiedName),
+    f: &mut impl FnMut(&mut QualifiedName, QualifiedNameSite<'_>),
 ) {
     for expr in &mut window.partition_by {
-        visit_expr_qualified_names_mut(expr, f);
+        visit_expr_qualified_name_sites_mut(expr, f);
     }
     for term in &mut window.order_by {
-        visit_expr_qualified_names_mut(&mut term.expr, f);
+        visit_expr_qualified_name_sites_mut(&mut term.expr, f);
     }
     if let Some(frame) = &mut window.frame {
-        visit_frame_spec_qualified_names_mut(frame, f);
+        visit_frame_bound_qualified_name_sites_mut(&mut frame.start, f);
+        if let Some(end) = &mut frame.end {
+            visit_frame_bound_qualified_name_sites_mut(end, f);
+        }
     }
 }
 
-fn visit_frame_spec_qualified_names_mut(
-    frame: &mut FrameSpec,
-    f: &mut impl FnMut(&mut QualifiedName),
-) {
-    visit_frame_bound_qualified_names_mut(&mut frame.start, f);
-    if let Some(end) = &mut frame.end {
-        visit_frame_bound_qualified_names_mut(end, f);
-    }
-}
-
-fn visit_frame_bound_qualified_names_mut(
+fn visit_frame_bound_qualified_name_sites_mut(
     bound: &mut FrameBound,
-    f: &mut impl FnMut(&mut QualifiedName),
+    f: &mut impl FnMut(&mut QualifiedName, QualifiedNameSite<'_>),
 ) {
     match bound {
         FrameBound::Preceding(expr) | FrameBound::Following(expr) => {
-            visit_expr_qualified_names_mut(expr, f);
+            visit_expr_qualified_name_sites_mut(expr, f);
         }
         FrameBound::UnboundedPreceding
         | FrameBound::CurrentRow
@@ -110875,27 +110996,34 @@ fn visit_insert_qualified_names_mut(
     insert: &mut fsqlite_ast::InsertStatement,
     f: &mut impl FnMut(&mut QualifiedName),
 ) {
-    f(&mut insert.table);
+    visit_insert_qualified_name_sites_mut(insert, &mut |name, _| f(name));
+}
+
+fn visit_insert_qualified_name_sites_mut(
+    insert: &mut fsqlite_ast::InsertStatement,
+    f: &mut impl FnMut(&mut QualifiedName, QualifiedNameSite<'_>),
+) {
+    f(&mut insert.table, QualifiedNameSite::Target);
     match &mut insert.source {
         fsqlite_ast::InsertSource::Values(rows) => {
             for row in rows {
                 for expr in row {
-                    visit_expr_qualified_names_mut(expr, f);
+                    visit_expr_qualified_name_sites_mut(expr, f);
                 }
             }
         }
         fsqlite_ast::InsertSource::Select(select) => {
-            visit_select_qualified_names_mut(select, f);
+            visit_select_qualified_name_sites_mut(select, f);
         }
         fsqlite_ast::InsertSource::DefaultValues => {}
     }
     for upsert in &mut insert.upsert {
         if let Some(target) = &mut upsert.target {
             for column in &mut target.columns {
-                visit_expr_qualified_names_mut(&mut column.expr, f);
+                visit_expr_qualified_name_sites_mut(&mut column.expr, f);
             }
             if let Some(where_clause) = &mut target.where_clause {
-                visit_expr_qualified_names_mut(where_clause, f);
+                visit_expr_qualified_name_sites_mut(where_clause, f);
             }
         }
         if let fsqlite_ast::UpsertAction::Update {
@@ -110904,17 +111032,17 @@ fn visit_insert_qualified_names_mut(
         } = &mut upsert.action
         {
             for assignment in assignments {
-                visit_expr_qualified_names_mut(&mut assignment.value, f);
+                visit_expr_qualified_name_sites_mut(&mut assignment.value, f);
             }
             if let Some(predicate) = where_clause {
-                visit_expr_qualified_names_mut(predicate, f);
+                visit_expr_qualified_name_sites_mut(predicate, f);
             }
         }
     }
     for column in &mut insert.returning {
         match column {
-            ResultColumn::Expr { expr, .. } => visit_expr_qualified_names_mut(expr, f),
-            ResultColumn::TableStar(name) => f(name),
+            ResultColumn::Expr { expr, .. } => visit_expr_qualified_name_sites_mut(expr, f),
+            ResultColumn::TableStar(name) => f(name, QualifiedNameSite::TableStar),
             ResultColumn::Star => {}
         }
     }
@@ -110924,36 +111052,43 @@ fn visit_update_qualified_names_mut(
     update: &mut fsqlite_ast::UpdateStatement,
     f: &mut impl FnMut(&mut QualifiedName),
 ) {
-    f(&mut update.table.name);
+    visit_update_qualified_name_sites_mut(update, &mut |name, _| f(name));
+}
+
+fn visit_update_qualified_name_sites_mut(
+    update: &mut fsqlite_ast::UpdateStatement,
+    f: &mut impl FnMut(&mut QualifiedName, QualifiedNameSite<'_>),
+) {
+    f(&mut update.table.name, QualifiedNameSite::Target);
     for assignment in &mut update.assignments {
-        visit_expr_qualified_names_mut(&mut assignment.value, f);
+        visit_expr_qualified_name_sites_mut(&mut assignment.value, f);
     }
     if let Some(from) = &mut update.from {
-        visit_table_or_subquery_qualified_names_mut(&mut from.source, f);
+        visit_table_or_subquery_qualified_name_sites_mut(&mut from.source, f);
         for join in &mut from.joins {
-            visit_table_or_subquery_qualified_names_mut(&mut join.table, f);
+            visit_table_or_subquery_qualified_name_sites_mut(&mut join.table, f);
             if let Some(JoinConstraint::On(expr)) = &mut join.constraint {
-                visit_expr_qualified_names_mut(expr, f);
+                visit_expr_qualified_name_sites_mut(expr, f);
             }
         }
     }
     if let Some(where_expr) = update.where_clause.as_mut() {
-        visit_expr_qualified_names_mut(where_expr, f);
+        visit_expr_qualified_name_sites_mut(where_expr, f);
     }
     for column in &mut update.returning {
         match column {
-            ResultColumn::Expr { expr, .. } => visit_expr_qualified_names_mut(expr, f),
-            ResultColumn::TableStar(name) => f(name),
+            ResultColumn::Expr { expr, .. } => visit_expr_qualified_name_sites_mut(expr, f),
+            ResultColumn::TableStar(name) => f(name, QualifiedNameSite::TableStar),
             ResultColumn::Star => {}
         }
     }
     for term in &mut update.order_by {
-        visit_expr_qualified_names_mut(&mut term.expr, f);
+        visit_expr_qualified_name_sites_mut(&mut term.expr, f);
     }
     if let Some(limit) = &mut update.limit {
-        visit_expr_qualified_names_mut(&mut limit.limit, f);
+        visit_expr_qualified_name_sites_mut(&mut limit.limit, f);
         if let Some(offset) = limit.offset.as_mut() {
-            visit_expr_qualified_names_mut(offset, f);
+            visit_expr_qualified_name_sites_mut(offset, f);
         }
     }
 }
@@ -110985,24 +111120,31 @@ fn visit_delete_qualified_names_mut(
     delete: &mut fsqlite_ast::DeleteStatement,
     f: &mut impl FnMut(&mut QualifiedName),
 ) {
-    f(&mut delete.table.name);
+    visit_delete_qualified_name_sites_mut(delete, &mut |name, _| f(name));
+}
+
+fn visit_delete_qualified_name_sites_mut(
+    delete: &mut fsqlite_ast::DeleteStatement,
+    f: &mut impl FnMut(&mut QualifiedName, QualifiedNameSite<'_>),
+) {
+    f(&mut delete.table.name, QualifiedNameSite::Target);
     if let Some(where_expr) = delete.where_clause.as_mut() {
-        visit_expr_qualified_names_mut(where_expr, f);
+        visit_expr_qualified_name_sites_mut(where_expr, f);
     }
     for column in &mut delete.returning {
         match column {
-            ResultColumn::Expr { expr, .. } => visit_expr_qualified_names_mut(expr, f),
-            ResultColumn::TableStar(name) => f(name),
+            ResultColumn::Expr { expr, .. } => visit_expr_qualified_name_sites_mut(expr, f),
+            ResultColumn::TableStar(name) => f(name, QualifiedNameSite::TableStar),
             ResultColumn::Star => {}
         }
     }
     for term in &mut delete.order_by {
-        visit_expr_qualified_names_mut(&mut term.expr, f);
+        visit_expr_qualified_name_sites_mut(&mut term.expr, f);
     }
     if let Some(limit) = &mut delete.limit {
-        visit_expr_qualified_names_mut(&mut limit.limit, f);
+        visit_expr_qualified_name_sites_mut(&mut limit.limit, f);
         if let Some(offset) = limit.offset.as_mut() {
-            visit_expr_qualified_names_mut(offset, f);
+            visit_expr_qualified_name_sites_mut(offset, f);
         }
     }
 }
