@@ -53624,6 +53624,10 @@ impl Connection {
     /// via the interpreted SELECT path (which SELECT already uses for correlated
     /// IN, bd-zvk68) and return a `rowid IN (<literals>)` replacement WHERE, so
     /// the DML executes by rowid. Returns `None` to leave the WHERE unchanged.
+    ///
+    /// bd-1jnfu: a WITHOUT ROWID target has no rowid to list, so its matching
+    /// rows are frozen by their full primary key instead, as bd-ntt2b does for
+    /// a self-referencing EXISTS. With ORDER BY or LIMIT it keeps the WHERE.
     async fn rewrite_correlated_in_where_to_rowids(
         &self,
         table_ref: &fsqlite_ast::QualifiedTableRef,
@@ -53634,8 +53638,20 @@ impl Connection {
     ) -> Result<Option<Expr>> {
         let has_correlated_in = where_clause
             .is_some_and(|wh| expr_has_correlated_in_subquery(wh, &self.schema.borrow()));
-        if !has_correlated_in || !self.table_is_rowid_table(&table_ref.name.name) {
+        if !has_correlated_in {
             return Ok(None);
+        }
+        if !self.table_is_rowid_table(&table_ref.name.name) {
+            if !order_by.is_empty() || limit.is_some() {
+                return Ok(None);
+            }
+            return self
+                .materialize_dml_replay_locators(table_ref, where_clause, params)
+                .await?
+                .map(|(locator_columns, locator_rows)| {
+                    Self::locator_rows_filter(table_ref, &locator_columns, locator_rows)
+                })
+                .transpose();
         }
         let rowids = self
             .select_matching_rowids(table_ref, where_clause, order_by, limit, params)
