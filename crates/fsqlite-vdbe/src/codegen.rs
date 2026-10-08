@@ -23028,6 +23028,7 @@ pub fn codegen_insert(
                     table,
                     &stmt.returning,
                     target_alias,
+                    schema,
                     rowid_reg,
                 )?;
             }
@@ -23510,7 +23511,15 @@ fn emit_upsert_do_update_apply(
         Some(ConflictAction::Abort),
     );
     if !returning.is_empty() {
-        emit_returning(b, cursor, table, returning, table_alias, final_rowid_reg)?;
+        emit_returning(
+            b,
+            cursor,
+            table,
+            returning,
+            table_alias,
+            schema,
+            final_rowid_reg,
+        )?;
     }
     if let Some(label) = skip_update_label {
         b.resolve_label(label);
@@ -23861,7 +23870,7 @@ fn codegen_insert_values(
             b.emit_op(Opcode::Insert, cursor, rec_reg, rowid_reg, insert_p4, pk_oe);
             emit_index_inserts(b, table, cursor, val_regs, rowid_reg, stmt_level);
             if !returning.is_empty() {
-                emit_returning(b, cursor, table, returning, table_alias, rowid_reg)?;
+                emit_returning(b, cursor, table, returning, table_alias, schema, rowid_reg)?;
             }
             b.resolve_label(done_label);
         } else {
@@ -23894,7 +23903,7 @@ fn codegen_insert_values(
             b.emit_op(Opcode::Insert, cursor, rec_reg, rowid_reg, insert_p4, pk_oe);
             emit_index_inserts(b, table, cursor, val_regs, rowid_reg, stmt_level);
             if !returning.is_empty() {
-                emit_returning(b, cursor, table, returning, table_alias, rowid_reg)?;
+                emit_returning(b, cursor, table, returning, table_alias, schema, rowid_reg)?;
             }
         }
 
@@ -24084,6 +24093,7 @@ fn codegen_insert_select(
             target_table,
             returning,
             target_alias,
+            schema,
             ctx,
             oe_flag,
             stmt_level,
@@ -24361,6 +24371,7 @@ fn codegen_insert_select(
             target_table,
             returning,
             target_alias,
+            schema,
             rowid_reg,
         )?;
     }
@@ -24392,6 +24403,7 @@ fn codegen_insert_select_without_from(
     target_table: &TableSchema,
     returning: &[ResultColumn],
     target_alias: Option<&str>,
+    schema: &[TableSchema],
     ctx: &CodegenContext,
     oe_flag: u16,
     stmt_level: Option<ConflictAction>,
@@ -24609,6 +24621,7 @@ fn codegen_insert_select_without_from(
             target_table,
             returning,
             target_alias,
+            schema,
             rowid_reg,
         )?;
     }
@@ -25339,6 +25352,7 @@ pub fn codegen_update(
             table,
             &stmt.returning,
             stmt.table.alias.as_deref(),
+            schema,
             rowid_reg,
         )?;
     }
@@ -26401,6 +26415,7 @@ fn codegen_update_from(
             target,
             &stmt.returning,
             stmt.table.alias.as_deref(),
+            schema,
             rowid_reg,
         )?;
     }
@@ -31354,12 +31369,16 @@ fn emit_projection_without_from(
 /// Positions the cursor on the just-inserted row via `SeekRowid`, reads the
 /// requested columns, and emits a `ResultRow`.
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+/// `schema` is the statement's schema: a subquery in RETURNING resolves its
+/// tables there (bd-8sawz: with an empty slice a schema-qualified one read as
+/// NULL).
 fn emit_returning(
     b: &mut ProgramBuilder,
     cursor: i32,
     table: &TableSchema,
     returning: &[ResultColumn],
     table_alias: Option<&str>,
+    schema: &[TableSchema],
     rowid_reg: i32,
 ) -> Result<(), CodegenError> {
     // RETURNING is validated against the DML target, which in these single-table
@@ -31379,7 +31398,7 @@ fn emit_returning(
     );
     let ret_count = result_column_count(returning, table);
     let ret_regs = b.alloc_regs(ret_count);
-    emit_column_reads(b, cursor, returning, table, table_alias, &[], ret_regs)?;
+    emit_column_reads(b, cursor, returning, table, table_alias, schema, ret_regs)?;
     b.emit_op(Opcode::ResultRow, ret_regs, ret_count, 0, P4::None, 0);
     b.resolve_label(skip_returning);
     Ok(())
