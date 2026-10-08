@@ -4764,6 +4764,15 @@ pub fn codegen_select(
             from_index_hint,
         )
     } else if !stmt.order_by.is_empty() {
+        // GH#498: when the WHERE pins a column with `=` that an index can seek, as stock does,
+        // read only the matching rows and sort them, rather than walking a whole index (or the
+        // table) in ORDER BY order and testing every row. An ORDER BY index that the equality
+        // itself seeks (an equality prefix) still wins: it reads the same rows and needs no sort.
+        let ordered_eq_seek = if from_index_hint.is_none() && time_travel.is_none() {
+            resolve_outer_equality_seek(where_clause.as_deref(), table, table_alias, None)
+        } else {
+            None
+        };
         if let Some(index_plan) = ctx
             .index_ordered_scan_reliable
             .then(|| {
@@ -4779,6 +4788,7 @@ pub fn codegen_select(
                 )
             })
             .flatten()
+            .filter(|plan| plan.equality_prefix_len > 0 || ordered_eq_seek.is_none())
         {
             tracing::info!(
                 table = %table.name,
@@ -4820,7 +4830,9 @@ pub fn codegen_select(
         // (`Rewind`+`Next`) or descending (`Last`+`Prev`) and applies the WHERE + LIMIT/OFFSET the same
         // way the sorter path would, so it is byte-identical output with the sort elided.
         if let Some(dir) = rowid_order.filter(|_| {
-            rowid_range_allowed && where_clause.as_deref().is_none_or(where_is_plain_scan_safe)
+            ordered_eq_seek.is_none()
+                && rowid_range_allowed
+                && where_clause.as_deref().is_none_or(where_is_plain_scan_safe)
         }) {
             return codegen_select_full_scan(
                 b,
@@ -4840,7 +4852,7 @@ pub fn codegen_select(
             );
         }
 
-        // --- Full table scan with ORDER BY (sorter path) ---
+        // --- Table scan or equality seek with ORDER BY (sorter path) ---
         codegen_select_ordered_scan(
             b,
             cursor,
@@ -4856,6 +4868,8 @@ pub fn codegen_select(
             out_col_count,
             done_label,
             end_label,
+            ordered_eq_seek.as_ref(),
+            ctx,
         )
     } else if distinct == Distinctness::Distinct {
         // bd-distinct-loose-scan: `SELECT DISTINCT <indexed col>` (no WHERE/GROUP BY/HAVING/LIMIT) is a
@@ -9917,6 +9931,8 @@ fn limit_clause_can_enable_top_n(limit_clause: Option<&LimitClause>) -> bool {
 ///
 /// Uses a two-pass sorter approach:
 /// 1. Scan table rows (with WHERE), pack sort-key + data columns into sorter.
+///    With `eq_seek`, only the rows its seek reaches are read (GH#498); the
+///    full WHERE still filters each of them.
 /// 2. After sorting, iterate sorted rows and emit `ResultRow`.
 ///
 /// LIMIT/OFFSET are applied in pass 2 (on sorted output).
@@ -9941,6 +9957,8 @@ fn codegen_select_ordered_scan(
     out_col_count: i32,
     done_label: crate::Label,
     end_label: crate::Label,
+    eq_seek: Option<&OuterEqualitySeek<'_>>,
+    ctx: &CodegenContext,
 ) -> Result<(), CodegenError> {
     // Connection-level compilation canonicalizes anonymous and named bind
     // parameters to explicit `?NNN` slots before VDBE codegen. Direct callers
@@ -10117,9 +10135,27 @@ fn codegen_select_ordered_scan(
     );
 
     // === Pass 1: Scan rows into sorter ===
-    let scan_start = b.current_addr();
     let scan_done = b.emit_label();
-    b.emit_jump_to_label(Opcode::Rewind, cursor, 0, scan_done, P4::None, 0);
+    let (seek_loop, scan_body) = if let Some(seek) = eq_seek {
+        let seek_row = b.emit_label();
+        let outer_loop = emit_outer_loop_start(
+            b,
+            Some(seek),
+            cursor,
+            seek_row,
+            scan_done,
+            &[(table, table_alias)],
+            ctx,
+        )?;
+        b.resolve_label(seek_row);
+        (Some((outer_loop, seek_row)), 0)
+    } else {
+        let scan_start = b.current_addr();
+        b.emit_jump_to_label(Opcode::Rewind, cursor, 0, scan_done, P4::None, 0);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let scan_body = (scan_start + 1) as i32;
+        (None, scan_body)
+    };
 
     // WHERE filter.
     let skip_label = b.emit_label();
@@ -10269,10 +10305,12 @@ fn codegen_select_ordered_scan(
     // Skip label (for WHERE-filtered rows).
     b.resolve_label(skip_label);
 
-    // Next row in scan.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    let scan_body = (scan_start + 1) as i32;
-    b.emit_op(Opcode::Next, cursor, scan_body, 0, P4::None, 0);
+    // Next row in scan (or in the seek's run).
+    if let Some((outer_loop, seek_row)) = &seek_loop {
+        emit_outer_loop_advance(b, outer_loop, cursor, *seek_row, scan_done);
+    } else {
+        b.emit_op(Opcode::Next, cursor, scan_body, 0, P4::None, 0);
+    }
 
     // End of pass 1. A merged ordered-DISTINCT query on a rowid table keeps
     // this read cursor open so pass 2 can seek and re-evaluate the selected
@@ -12591,21 +12629,28 @@ pub fn join_select_seeks_outer_table(stmt: &SelectStatement, schema: &[TableSche
             where_clause,
             right_table,
             right_alias,
-            left_table,
-            left_alias,
+            Some((left_table, left_alias)),
         )
         .is_some();
     }
-    resolve_outer_equality_seek(where_clause, left_table, left_alias, right_table, right_alias)
-        .is_some()
+    resolve_outer_equality_seek(
+        where_clause,
+        left_table,
+        left_alias,
+        Some((right_table, right_alias)),
+    )
+    .is_some()
 }
 
+/// The [`OuterEqualitySeek`] that reaches every row of `left_table` the WHERE
+/// can accept. `other_table` is the joined table, if any: an unqualified
+/// column it also resolves is ambiguous and not used. The single-table
+/// ORDER BY sorter (GH#498) passes `None`.
 fn resolve_outer_equality_seek<'a>(
     where_clause: Option<&'a Expr>,
     left_table: &'a TableSchema,
     left_alias: Option<&str>,
-    right_table: &TableSchema,
-    right_alias: Option<&str>,
+    other_table: Option<(&TableSchema, Option<&str>)>,
 ) -> Option<OuterEqualitySeek<'a>> {
     if left_table.without_rowid {
         return None;
@@ -12632,7 +12677,9 @@ fn resolve_outer_equality_seek<'a>(
                 Expr::Literal(Literal::Integer(_) | Literal::String(_), _)
                     | Expr::Placeholder(fsqlite_ast::PlaceholderType::Numbered(_), _)
             ) || (col_ref.table.is_none()
-                && resolve_column_ref(column, right_table, right_alias).is_some())
+                && other_table.is_some_and(|(other, other_alias)| {
+                    resolve_column_ref(column, other, other_alias).is_some()
+                }))
             {
                 continue;
             }
@@ -12751,9 +12798,25 @@ fn emit_outer_loop_start(
                 b.resolve_label(seek_start);
             }
             b.emit_jump_to_label(Opcode::IsNull, probe_base, 0, done, P4::None, 0);
-            b.emit_op(Opcode::Int64, 0, probe_base + 1, 0, P4::Int64(i64::MIN), 0);
+            // A single-key index entry is `(key, rowid)`, so `(probe, i64::MIN)` is the floor of
+            // the probe's run. On a composite index the second field would line up with the next
+            // key column instead, and SeekGE would skip the run's entries whose next key is NULL
+            // or a REAL below i64::MIN; a one-field prefix record is the floor there.
+            let probe_fields = if index.key_term_count() > 1 {
+                1
+            } else {
+                b.emit_op(Opcode::Int64, 0, probe_base + 1, 0, P4::Int64(i64::MIN), 0);
+                2
+            };
             let probe_record_reg = b.alloc_reg();
-            b.emit_op(Opcode::MakeRecord, probe_base, 2, probe_record_reg, P4::None, 0);
+            b.emit_op(
+                Opcode::MakeRecord,
+                probe_base,
+                probe_fields,
+                probe_record_reg,
+                P4::None,
+                0,
+            );
             b.emit_op(
                 Opcode::OpenRead,
                 idx_cursor,
@@ -13017,8 +13080,12 @@ fn codegen_single_join_lookup_select(
     };
 
     let next_left_label = b.emit_label();
-    let outer_seek =
-        resolve_outer_equality_seek(where_clause, left_table, left_alias, right_table, right_alias);
+    let outer_seek = resolve_outer_equality_seek(
+        where_clause,
+        left_table,
+        left_alias,
+        Some((right_table, right_alias)),
+    );
     let outer_loop = emit_outer_loop_start(
         b,
         outer_seek.as_ref(),
