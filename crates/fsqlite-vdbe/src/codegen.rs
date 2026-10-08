@@ -3354,8 +3354,19 @@ pub fn codegen_select(
     // visits the IN runs, a superset; the residual narrows to exact). The IN emitter always opens the
     // table, so the residual reads any column and no covering gate is needed; IN is not a single-eq
     // prefix, so it does not collide with the composite-prefix-range path.
+    // bd-5qu8n (GH#497): a TEXT column's string-literal IN list seeks the same way.
     let index_in = if in_list_seek_allowed && rowid_in.is_none() && rowid_in_const.is_none() {
         index_integer_in_list_residual_target(where_clause.as_deref(), table, table_alias)
+            .map(|(idx, ints, has_residual)| {
+                (
+                    idx,
+                    ints.into_iter().map(InListProbe::Int).collect::<Vec<_>>(),
+                    has_residual,
+                )
+            })
+            .or_else(|| {
+                index_text_in_list_residual_target(where_clause.as_deref(), table, table_alias)
+            })
     } else {
         None
     };
@@ -5868,7 +5879,27 @@ fn codegen_select_index_equality_scan(
     Ok(())
 }
 
-/// Codegen for `SELECT <cols> FROM t WHERE <int col> IN (<int literals>)`.
+/// One IN-list member [`codegen_select_index_in_scan`] seeks: an integer literal on an
+/// INTEGER-affinity column, or a string literal on a TEXT-affinity column whose comparison and
+/// index key are both BINARY (bd-5qu8n / GH#497). Either way the literal needs no affinity
+/// conversion, so a 0-match seek is authoritative.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InListProbe {
+    Int(i64),
+    Text(String),
+}
+
+impl InListProbe {
+    fn emit(&self, b: &mut ProgramBuilder, reg: i32) {
+        match self {
+            Self::Int(value) => b.emit_op(Opcode::Int64, 0, reg, 0, P4::Int64(*value), 0),
+            Self::Text(value) => b.emit_op(Opcode::String8, 0, reg, 0, P4::Str(value.clone()), 0),
+        };
+    }
+}
+
+/// Codegen for `SELECT <cols> FROM t WHERE <col> IN (<literals>)`: integer literals on an
+/// INTEGER-affinity column, or string literals on a BINARY TEXT column (bd-5qu8n).
 ///
 /// bd-2dgf5. Seeks the index once per distinct value (ascending, matching C SQLite's
 /// value-then-rowid output order), does the table lookup, and emits `ResultRow`. Non-covering
@@ -5888,7 +5919,7 @@ fn codegen_select_index_in_scan(
     done_label: crate::Label,
     end_label: crate::Label,
     idx_schema: &IndexSchema,
-    values: &[i64],
+    values: &[InListProbe],
     where_clause: Option<&Expr>,
     // When true, the full `where_clause` is applied as a per-row residual filter after positioning on
     // each IN-list run — for `col IN (ints) AND <residual>`. The seek visits a SUPERSET (the IN runs)
@@ -5919,22 +5950,30 @@ fn codegen_select_index_in_scan(
         0,
     );
 
-    for &value in values {
-        let probe_key_regs = b.alloc_regs(2);
-        b.emit_op(Opcode::Int64, 0, probe_key_regs, 0, P4::Int64(value), 0);
-        b.emit_op(
-            Opcode::Int64,
-            0,
-            probe_key_regs + 1,
-            0,
-            P4::Int64(i64::MIN),
-            0,
-        );
+    // A composite `(col, …)` index is probed with a 1-field prefix `[value]`, as
+    // `emit_aggregate_index_value_seek` does: a `[value, i64::MIN]` probe would align its
+    // second field with the trailing key column and skip `(value, NULL)` entries, which sort
+    // before every integer. A single-column index keeps the `[value, rowid floor]` probe.
+    let prefix_probe = idx_schema.key_term_count() > 1;
+    let n_probe: i32 = if prefix_probe { 1 } else { 2 };
+    for value in values {
+        let probe_key_regs = b.alloc_regs(n_probe);
+        value.emit(b, probe_key_regs);
+        if !prefix_probe {
+            b.emit_op(
+                Opcode::Int64,
+                0,
+                probe_key_regs + 1,
+                0,
+                P4::Int64(i64::MIN),
+                0,
+            );
+        }
         let probe_record_reg = b.alloc_reg();
         b.emit_op(
             Opcode::MakeRecord,
             probe_key_regs,
-            2,
+            n_probe,
             probe_record_reg,
             P4::None,
             0,
@@ -17871,6 +17910,86 @@ fn index_integer_in_list_target<'t>(
                 .is_some_and(|c| c.eq_ignore_ascii_case(&col_name))
     })?;
     Some((idx, ints))
+}
+
+/// The index and distinct string values a non-aggregate `WHERE <col> IN ('a', 'b', …)` can seek per
+/// value (bd-5qu8n / GH#497). The TEXT counterpart of [`index_integer_in_list_target`], narrow for
+/// the same reason: `col` has TEXT affinity and BINARY collation and the index key is BINARY, so a
+/// string-literal probe needs no conversion and compares as the index orders it (GH#409's argument);
+/// every member is a string literal; the values are sorted by bytes (BINARY order) and de-duplicated,
+/// so the runs are disjoint and come out in stock's value-then-rowid order. Anything else declines.
+fn index_text_in_list_target<'t>(
+    where_clause: Option<&Expr>,
+    table: &'t TableSchema,
+    table_alias: Option<&str>,
+) -> Option<(&'t IndexSchema, Vec<InListProbe>)> {
+    let Expr::In {
+        expr: column,
+        set: fsqlite_ast::InSet::List(values),
+        not: false,
+        ..
+    } = where_clause?
+    else {
+        return None;
+    };
+    if values.is_empty() {
+        return None;
+    }
+    let col_name = column_name(column, table, table_alias)?;
+    let column_info = table
+        .column_index(&col_name)
+        .and_then(|i| table.columns.get(i))?;
+    let is_binary = |collation: Option<&str>| collation.is_none_or(|c| c.eq_ignore_ascii_case("BINARY"));
+    if column_info.affinity != 'B' || !is_binary(column_info.collation.as_deref()) {
+        return None;
+    }
+    let mut texts = Vec::with_capacity(values.len());
+    for value in values {
+        match value {
+            Expr::Literal(Literal::String(text), _) => texts.push(text.clone()),
+            _ => return None,
+        }
+    }
+    texts.sort_unstable();
+    texts.dedup();
+    let usable = |idx: &&IndexSchema| {
+        idx.supports_direct_column_lookup()
+            && !idx.key_term_descending(0)
+            && is_binary(idx.key_term_collation(0))
+            && idx
+                .columns
+                .first()
+                .is_some_and(|c| c.eq_ignore_ascii_case(&col_name))
+    };
+    // As for integers: prefer a single-column index, else a composite one led by the column.
+    let idx = table
+        .indexes
+        .iter()
+        .filter(usable)
+        .find(|idx| idx.key_term_count() == 1)
+        .or_else(|| table.indexes.iter().filter(usable).find(|idx| idx.key_term_count() > 1))?;
+    Some((idx, texts.into_iter().map(InListProbe::Text).collect()))
+}
+
+/// [`index_text_in_list_target`] for the whole WHERE (`has_residual == false`) or for one
+/// conjunct alongside predicates the caller re-applies as a residual filter (`true`).
+fn index_text_in_list_residual_target<'t>(
+    where_clause: Option<&Expr>,
+    table: &'t TableSchema,
+    table_alias: Option<&str>,
+) -> Option<(&'t IndexSchema, Vec<InListProbe>, bool)> {
+    if let Some((idx, texts)) = index_text_in_list_target(where_clause, table, table_alias) {
+        return Some((idx, texts, false));
+    }
+    let mut conjuncts = Vec::new();
+    collect_conjunctive_terms(where_clause?, &mut conjuncts);
+    if conjuncts.len() < 2 {
+        return None;
+    }
+    conjuncts.iter().find_map(|term| {
+        index_text_in_list_target(Some(term), table, table_alias)
+            .map(|(idx, texts)| (idx, texts, true))
+    })
 }
 
 /// Returns `(index, ints, has_residual)`. `has_residual == false` is the residual-free case above (the
