@@ -18089,13 +18089,27 @@ impl VdbeEngine {
                             0x02 | 0x0A => false, // InteriorIndex / LeafIndex
                             0x05 | 0x0D => true,  // InteriorTable / LeafTable
                             _ => {
+                                // bd-pvv2k: not a B-tree page (damage). Take
+                                // the kind from the schema, so the cursor's
+                                // first page load reports SQLITE_CORRUPT, as
+                                // stock does on first use. A damaged index
+                                // root opened as a table cursor answered every
+                                // index seek (a record key) with "no rows"
+                                // without reading the page: a PK lookup missed
+                                // a live row and NOT EXISTS deleted it.
+                                let is_known_index =
+                                    self.index_desc_flags_by_root_page.contains_key(&root_page)
+                                        || self
+                                            .index_collations_by_root_page
+                                            .contains_key(&root_page);
                                 tracing::warn!(
                                     cursor_id,
                                     page_id = root_page,
                                     type_byte,
-                                    "open_storage_cursor: unparseable header with unknown page-type byte, defaulting to table"
+                                    is_known_index,
+                                    "open_storage_cursor: root page has an unknown page-type byte; its first read reports corruption"
                                 );
-                                true
+                                !is_known_index
                             }
                         };
                         (is_table, None)
