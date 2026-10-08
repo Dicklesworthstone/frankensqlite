@@ -43268,33 +43268,26 @@ impl Connection {
         insert: &fsqlite_ast::InsertStatement,
         source_rows: Vec<Row>,
     ) -> Result<usize> {
-        let total_rows = source_rows.len();
         let scheduler = MorselScheduler::new(1, MORSEL_INSERT_SIZE);
         let value_rows: Vec<Vec<SqliteValue>> = source_rows.into_iter().map(|r| r.values).collect();
         let morsels = scheduler.split_into_morsels(0, 0, value_rows);
-        let mut total_changes = 0usize;
-        for morsel in &morsels {
-            let morsel_rows: Vec<Row> = morsel
-                .rows
-                .iter()
-                .map(|values| Row {
-                    values: values.clone(),
-                })
-                .collect();
-            total_changes += self
-                .execute_insert_select_materialized_rows(insert, &morsel_rows)
-                .await?;
-        }
-        debug_assert_eq!(
-            total_changes, total_rows,
-            "morsel INSERT should affect exactly as many rows as input"
-        );
-        // GH#435: each morsel's replay records its own count as the statement's
-        // changes (and adds it to total_changes), so the last morsel's count
-        // would stand for the whole statement. Report the sum.
-        self.last_changes.set(total_changes);
-        self.sync_change_tracking_context();
-        Ok(total_changes)
+        // GH#435/GH#495: morsels belong to one SQL statement, including its
+        // change count and failure scope. A separate emitter per morsel loses
+        // the earlier counts when OR FAIL preserves a prefix and returns an
+        // error. OR IGNORE can also change fewer rows than the input contains.
+        // Per-row replay already updates total_changes and excludes REPLACE's
+        // implicit deletes; only the statement count is accumulated here.
+        // Boxing retains the indirection needed by recursive row replay.
+        let outcome = Box::pin(self.execute_insert_select_row_stream(insert, async |emitter| {
+            for morsel in &morsels {
+                for row in &morsel.rows {
+                    emitter.emit_row(row).await?;
+                }
+            }
+            Ok(())
+        }))
+        .await?;
+        Ok(outcome.changes)
     }
 
     fn build_insert_select_replay_sql(
