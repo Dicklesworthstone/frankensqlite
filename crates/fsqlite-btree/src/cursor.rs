@@ -428,6 +428,22 @@ pub trait PageWriter: PageReader {
     fn forget_page(&mut self, _page_no: PageNumber) {}
     /// Record a granular write witness for fine-grained SSI.
     fn record_write_witness(&mut self, cx: &Cx, key: WitnessKey);
+
+    /// bd-ujp0h: put `page_no` in this transaction's write-conflict set
+    /// without changing or staging its bytes, so a concurrent transaction that
+    /// writes the page conflicts with this one. A structural change that caps
+    /// a page's keys while leaving the page as it is (a quick balance moving
+    /// the right edge off a leaf) needs exactly that.
+    ///
+    /// Returns `Ok(false)` when this writer keeps no such set; the caller then
+    /// restages the page's current bytes instead, which conflicts the same way.
+    fn claim_write_conflict_page<'a>(
+        &'a mut self,
+        _cx: &'a Cx,
+        _page_no: PageNumber,
+    ) -> impl Future<Output = Result<bool>> + 'a {
+        async { Ok(false) }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -6530,6 +6546,21 @@ impl<P: PageWriter> BtCursor<P> {
             root_content_offset -= divider_len;
         }
 
+        // bd-ujp0h: the new leaves move the right edge off `old_right_child`
+        // (the root's new divider caps its keys) without changing its bytes.
+        // Claim it in the write-conflict set (or restage it as it stands) so
+        // a concurrent session appending to the old right edge conflicts and
+        // retries instead of committing a key past the divider.
+        if !self
+            .pager
+            .claim_write_conflict_page(cx, old_right_child)
+            .await?
+        {
+            self.pager
+                .write_page_data(cx, old_right_child, old_right_data.clone())
+                .await?;
+        }
+
         let mut new_children = Vec::with_capacity(leaf_groups.len());
         for group in &leaf_groups {
             cx.checkpoint().map_err(|_| FrankenError::Abort)?;
@@ -7877,6 +7908,7 @@ impl<P: PageWriter> BtCursor<P> {
                     &mut self.pager,
                     parent_page_no,
                     leaf_entry.page_no,
+                    Some(leaf_entry.page_data.clone()),
                     cell_data,
                     divider_rowid,
                     self.usable_size,
@@ -10150,7 +10182,7 @@ impl<P: PageWriter> BtCursor<P> {
                 Ok(None) => {
                     let quick_balance_result = self
                         .try_quick_balance_on_external_rightmost_leaf_hint(
-                            cx, hint, rowid, &cell_data,
+                            cx, hint, rowid, &cell_data, None,
                         )
                         .await;
                     self.cell_buf = cell_data;
@@ -10351,7 +10383,11 @@ impl<P: PageWriter> BtCursor<P> {
                 let fallback_result: Result<bool> = async {
                     if self
                         .try_quick_balance_on_external_rightmost_leaf_hint(
-                            cx, hint, rowid, &cell_data,
+                            cx,
+                            hint,
+                            rowid,
+                            &cell_data,
+                            Some(page_data.clone()),
                         )
                         .await?
                     {
@@ -10422,12 +10458,15 @@ impl<P: PageWriter> BtCursor<P> {
         }
     }
 
+    /// `leaf_image` is the leaf's current image when the caller holds one
+    /// (the retained-image lane); `None` lets the quick balance read it.
     async fn try_quick_balance_on_external_rightmost_leaf_hint(
         &mut self,
         cx: &Cx,
         hint: &mut TableAppendHint,
         rowid: i64,
         cell_data: &[u8],
+        leaf_image: Option<PageData>,
     ) -> Result<bool> {
         let Some(parent_page) = hint.parent_page else {
             return Ok(false);
@@ -10439,6 +10478,7 @@ impl<P: PageWriter> BtCursor<P> {
             &mut self.pager,
             parent_page,
             hint.leaf_page,
+            leaf_image,
             cell_data,
             hint.last_rowid,
             self.usable_size,
