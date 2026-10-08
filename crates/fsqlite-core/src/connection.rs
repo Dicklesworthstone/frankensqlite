@@ -114157,8 +114157,13 @@ fn qualified_name_matches_table_binding(
     if let Some(alias) = alias {
         return target.schema.is_none() && alias.eq_ignore_ascii_case(&target.name);
     }
-    normalized_attached_schema_name(target.schema.as_deref())
-        == normalized_attached_schema_name(name.schema.as_deref())
+    // A qualifier without a database name matches the binding whatever its
+    // database, as SQLite's lookupName / selectExpander do with no zDb
+    // (bd-x4g7x: `users.*` over `FROM temp.users JOIN solo`); one that names a
+    // database must agree with the binding's.
+    (target.schema.is_none()
+        || normalized_attached_schema_name(target.schema.as_deref())
+            == normalized_attached_schema_name(name.schema.as_deref()))
         && name.name.eq_ignore_ascii_case(&target.name)
 }
 

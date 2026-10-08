@@ -32048,9 +32048,11 @@ fn normalized_schema_qualifier(schema: Option<&str>) -> Option<&str> {
 /// `from_schema` is the schema qualifier written on the binding itself
 /// (`None` for a bare `t`, `Some("main")` for `main.t`, `Some("aux")` for an
 /// attached `aux.t`). An aliased binding is addressable only by its alias, with
-/// no schema qualifier. Otherwise the star's database and the binding's database
-/// must agree after `main`/implicit normalization, so `main.t.*` matches a bare
-/// `FROM t` while `aux.t.*` does not.
+/// no schema qualifier. Otherwise a star without a database name matches the
+/// binding by table name whatever its database (bd-x4g7x: SQLite's
+/// `selectExpander`, so `users.*` expands `FROM temp.users`), and a star that
+/// names a database must agree with the binding's after `main`/implicit
+/// normalization, so `main.t.*` matches a bare `FROM t` while `aux.t.*` does not.
 fn table_star_qualifier_matches_binding(
     qualifier: &QualifiedName,
     table: &TableSchema,
@@ -32061,8 +32063,9 @@ fn table_star_qualifier_matches_binding(
         return qualifier.schema.is_none()
             && matches_table_or_alias(&qualifier.name, table, table_alias);
     }
-    normalized_schema_qualifier(qualifier.schema.as_deref())
-        == normalized_schema_qualifier(from_schema)
+    (qualifier.schema.is_none()
+        || normalized_schema_qualifier(qualifier.schema.as_deref())
+            == normalized_schema_qualifier(from_schema))
         && matches_table_or_alias(&qualifier.name, table, table_alias)
 }
 

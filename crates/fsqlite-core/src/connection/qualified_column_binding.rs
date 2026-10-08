@@ -224,7 +224,13 @@ fn bind_schema_qualified_columns_with(
     if let Some(error) = binder.error.take() {
         return Err(error);
     }
-    if binder.three_part_refs == 0 {
+    // bd-x4g7x: a `name.*` over several same-named items is rewritten one
+    // star per item even when no three-part reference forces the aliases.
+    let splits_table_star = binder
+        .table_star_groups
+        .iter()
+        .any(|group| group.len() > 1);
+    if binder.three_part_refs == 0 && !splits_table_star {
         return Ok(None);
     }
     binder.assign_aliases();
@@ -351,13 +357,16 @@ impl<'a> QualifiedColumnBinder<'a> {
     }
 
     /// Give each item in `needs_alias` a name nothing in the statement uses.
-    /// A `name.*` covering an aliased item is spelled one star per item, so
-    /// every item it covers is aliased and each star addresses its own.
+    /// A `name.*` covering an aliased item, or more than one item (bd-x4g7x:
+    /// `users.*` over `main.users JOIN temp.users` expands both, as SQLite's
+    /// `selectExpander` does), is spelled one star per item, so every item it
+    /// covers is aliased and each star addresses its own.
     fn assign_aliases(&mut self) {
         for group in std::mem::take(&mut self.table_star_groups) {
-            if group
-                .iter()
-                .any(|(id, _)| self.needs_alias.contains_key(id))
+            if group.len() > 1
+                || group
+                    .iter()
+                    .any(|(id, _)| self.needs_alias.contains_key(id))
             {
                 for (id, seed) in group {
                     self.needs_alias.entry(id).or_insert(seed);
@@ -1640,6 +1649,19 @@ mod tests {
         assert_eq!(
             bound,
             r#"SELECT "users@main".*, "users@temp".*, "users@main".name FROM main.users AS "users@main" INNER JOIN "temp".users AS "users@temp""#
+        );
+    }
+
+    /// bd-x4g7x: `name.*` over several same-named items expands each of
+    /// them, with no three-part reference needed to force the aliases.
+    #[test]
+    fn a_table_star_over_same_named_items_is_spelled_per_item() {
+        let bound = bind("SELECT users.* FROM main.users JOIN temp.users")
+            .expect("binds")
+            .expect("rewritten");
+        assert_eq!(
+            bound,
+            r#"SELECT "users@main".*, "users@temp".* FROM main.users AS "users@main" INNER JOIN "temp".users AS "users@temp""#
         );
     }
 
