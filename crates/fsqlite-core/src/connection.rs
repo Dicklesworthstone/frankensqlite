@@ -42527,6 +42527,18 @@ impl Connection {
         statement: &'a Statement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Cow<'a, Statement>> {
+        // bd-1ht9p: a leading parenthesized join is an ordinary join list.
+        if let Statement::Select(select) = statement
+            && select_has_leading_paren_join(select)
+        {
+            let mut flattened = select.clone();
+            flatten_leading_paren_joins(&mut flattened);
+            let flattened = Statement::Select(flattened);
+            let rewritten = Box::pin(self.rewrite_subquery_statement(&flattened, params))
+                .await?
+                .into_owned();
+            return Ok(Cow::Owned(rewritten));
+        }
         let has_rewritable_subquery = statement_contains_rewritable_subquery(statement);
         if has_rewritable_subquery
             && let Statement::Select(select) = statement
@@ -115412,6 +115424,58 @@ fn qualify_column_refs_with_alias(expr: &mut Expr, alias: &Arc<str>) {
         // Do not descend into nested subqueries / window specs: they introduce
         // their own name scope and must not be re-qualified with this alias.
         Expr::Exists { .. } | Expr::Subquery(..) => {}
+    }
+}
+
+/// Whether a core of `select` (its own or a compound arm's) reads its FROM
+/// clause from a parenthesized join first, as in `FROM (t JOIN u) ...`.
+fn select_has_leading_paren_join(select: &SelectStatement) -> bool {
+    std::iter::once(&select.body.select)
+        .chain(select.body.compounds.iter().map(|(_, core)| core))
+        .any(|core| {
+            matches!(
+                core,
+                SelectCore::Select {
+                    from: Some(FromClause {
+                        source: TableOrSubquery::ParenJoin(_),
+                        ..
+                    }),
+                    ..
+                }
+            )
+        })
+}
+
+/// bd-1ht9p: `FROM (a JOIN b ...) JOIN c ...` is `FROM a JOIN b ... JOIN c ...`.
+/// SQLite joins associate to the left, so parentheses around the leading
+/// join group exactly what the bare join list groups, and `(a)` is `a`. Each
+/// core's leading parenthesized joins are spliced into its join list, so the
+/// planner, codegen and the join executor see an ordinary FROM clause. (A
+/// parenthesized join later in the list does regroup and is left alone.)
+fn flatten_leading_paren_joins(select: &mut SelectStatement) {
+    for core in std::iter::once(&mut select.body.select)
+        .chain(select.body.compounds.iter_mut().map(|(_, core)| core))
+    {
+        let SelectCore::Select { from, .. } = core else {
+            continue;
+        };
+        let Some(mut clause) = from.take() else {
+            continue;
+        };
+        loop {
+            match clause.source {
+                TableOrSubquery::ParenJoin(inner) => {
+                    let FromClause { source, mut joins } = *inner;
+                    joins.append(&mut clause.joins);
+                    clause = FromClause { source, joins };
+                }
+                source => {
+                    clause.source = source;
+                    break;
+                }
+            }
+        }
+        *from = Some(clause);
     }
 }
 
