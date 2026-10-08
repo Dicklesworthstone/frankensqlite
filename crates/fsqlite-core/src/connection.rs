@@ -14101,6 +14101,11 @@ pub struct Connection {
     /// certifying runs to fail fast on unsupported fallback paths without
     /// changing default developer ergonomics.
     reject_mem_fallback_strict: RefCell<bool>,
+    /// GH#490: the `(statement kind, decision reason)` pairs of unexpected
+    /// in-memory fallbacks already reported at WARN on this connection.
+    /// Repeats log at DEBUG, so a fallback a workload takes on every statement
+    /// is noticed once instead of flooding the log.
+    warned_mem_fallbacks: RefCell<HashSet<(&'static str, &'static str)>>,
     /// Bounded structured evidence emitted from the authoritative fallback
     /// decision point. This remains active even when tracing is disabled.
     fallback_decision_capture: RefCell<FallbackDecisionCapture>,
@@ -15740,6 +15745,7 @@ impl Connection {
             defer_fts5_hydration,
             skip_statement_memdb_refresh: Cell::new(false),
             reject_mem_fallback_strict: RefCell::new(false),
+            warned_mem_fallbacks: RefCell::new(HashSet::new()),
             fallback_decision_capture: RefCell::new(FallbackDecisionCapture::default()),
             #[cfg(test)]
             join_materialization_profile: RefCell::new(JoinMaterializationProfile::default()),
@@ -16310,6 +16316,7 @@ impl Connection {
             skip_statement_memdb_refresh: Cell::new(false),
             // Strict fallback rejection is opt-in for certifying runs.
             reject_mem_fallback_strict: RefCell::new(false),
+            warned_mem_fallbacks: RefCell::new(HashSet::new()),
             fallback_decision_capture: RefCell::new(FallbackDecisionCapture::default()),
             #[cfg(test)]
             join_materialization_profile: RefCell::new(JoinMaterializationProfile::default()),
@@ -24382,6 +24389,12 @@ impl Connection {
         "match_operator_fallback",
         "join_or_subquery_fallback",
         "insert_select_row_by_row_fallback",
+        // GH#490: stock's row-at-a-time trigger / FK order, replayed row by
+        // row on purpose, and the morsel batching of large VALUES lists.
+        "insert_values_row_by_row_trigger_or_fk_fallback",
+        "update_row_by_row_trigger_or_fk_fallback",
+        "delete_row_by_row_trigger_fallback",
+        "morsel_insert_dispatch",
     ];
 
     #[must_use]
@@ -24565,7 +24578,8 @@ impl Connection {
             // Non-strict parity-cert: known-benign fallbacks log at DEBUG to
             // avoid noisy repeated warnings for expected SQL patterns (WITH,
             // JOIN, GROUP BY, window functions, etc.). Unexpected fallbacks
-            // still emit WARN so they are noticed.
+            // still emit WARN so they are noticed, once per connection and
+            // `(statement kind, reason)` (GH#490); repeats log at DEBUG.
             if Self::KNOWN_BENIGN_FALLBACK_REASONS.contains(&decision_reason) {
                 tracing::debug!(
                     target: "fsqlite.storage_wiring",
@@ -24575,6 +24589,20 @@ impl Connection {
                     statement_kind,
                     decision_reason,
                     "execute_statement_dispatch: using in-memory fallback path (known-benign pattern in parity-cert mode)"
+                );
+            } else if !self
+                .warned_mem_fallbacks
+                .borrow_mut()
+                .insert((statement_kind, decision_reason))
+            {
+                tracing::debug!(
+                    target: "fsqlite.storage_wiring",
+                    backend_kind = "mem",
+                    mode,
+                    strict_reject,
+                    statement_kind,
+                    decision_reason,
+                    "execute_statement_dispatch: using in-memory fallback path again (already reported at WARN on this connection)"
                 );
             } else {
                 tracing::warn!(
