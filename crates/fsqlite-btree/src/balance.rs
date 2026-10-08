@@ -384,6 +384,7 @@ pub async fn balance_quick<W: PageWriter>(
         writer,
         parent_page_no,
         leaf_page_no,
+        None,
         overflow_cell,
         divider_rowid,
         usable_size,
@@ -393,12 +394,16 @@ pub async fn balance_quick<W: PageWriter>(
     .map(|result| result.new_pgno))
 }
 
+/// `leaf_image`, when given, must be the leaf's current image in this
+/// transaction (the caller just failed to fit a cell into it); it is restaged
+/// as is, saving a read. `None` reads the leaf through `writer`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn balance_quick_known_divider_rowid<W: PageWriter>(
     cx: &Cx,
     writer: &mut W,
     parent_page_no: PageNumber,
     leaf_page_no: PageNumber,
+    leaf_image: Option<PageData>,
     overflow_cell: &[u8],
     divider_rowid: i64,
     usable_size: u32,
@@ -442,6 +447,24 @@ pub(crate) async fn balance_quick_known_divider_rowid<W: PageWriter>(
 
     if free_space < required_parent_space {
         return Ok(None);
+    }
+
+    // bd-ujp0h: a quick balance moves the right edge off `leaf_page_no` (the
+    // parent's new divider caps its keys) without changing the leaf's bytes.
+    // This transaction must still hold the leaf: a concurrent session that
+    // sees the leaf as the right edge and appends to it then conflicts on this
+    // page (page lock / first committer wins) and retries against the new
+    // edge. Without it the two page sets were disjoint, both committed, and
+    // the leaf gained a key past its divider: a duplicate implicit rowid across
+    // the two leaves. Claim the leaf in the write-conflict set, which stages
+    // no bytes; a writer without one restages the leaf as it stands (an
+    // in-place overwrite inside a transaction that already wrote it).
+    if !writer.claim_write_conflict_page(cx, leaf_page_no).await? {
+        let leaf_data = match leaf_image {
+            Some(image) => image,
+            None => writer.read_page_data(cx, leaf_page_no).await?,
+        };
+        writer.write_page_data(cx, leaf_page_no, leaf_data).await?;
     }
 
     // Allocate new sibling page.
@@ -2847,6 +2870,10 @@ mod tests {
     struct RecordingMemPageStore {
         inner: MemPageStore,
         writes_by_page: HashMap<u32, usize>,
+        /// Whether `claim_write_conflict_page` accepts claims (a writer with a
+        /// write-conflict set), and the pages it accepted.
+        tracks_conflicts: bool,
+        claimed: Vec<PageNumber>,
     }
 
     impl RecordingMemPageStore {
@@ -2854,6 +2881,15 @@ mod tests {
             Self {
                 inner,
                 writes_by_page: HashMap::new(),
+                tracks_conflicts: false,
+                claimed: Vec::new(),
+            }
+        }
+
+        fn tracking_conflicts(inner: MemPageStore) -> Self {
+            Self {
+                tracks_conflicts: true,
+                ..Self::new(inner)
             }
         }
 
@@ -2905,6 +2941,19 @@ mod tests {
             async move { self.inner.free_page(cx, page_no).await }
         }
         fn record_write_witness(&mut self, _cx: &Cx, _key: WitnessKey) {}
+
+        fn claim_write_conflict_page<'a>(
+            &'a mut self,
+            _cx: &'a Cx,
+            page_no: PageNumber,
+        ) -> impl Future<Output = Result<bool>> + 'a {
+            async move {
+                if self.tracks_conflicts {
+                    self.claimed.push(page_no);
+                }
+                Ok(self.tracks_conflicts)
+            }
+        }
     }
 
     fn pn(n: u32) -> PageNumber {
@@ -3372,7 +3421,9 @@ mod tests {
     fn test_balance_quick_parent_write_failure_frees_new_page_and_preserves_parent() {
         run_async(async {
             let cx = Cx::new();
-            let mut store = FailingMemPageStore::new(MemPageStore::new(20), 2);
+            // Writes in order: the restaged leaf (bd-ujp0h), the new sibling,
+            // then the parent. Fail the third, the parent write.
+            let mut store = FailingMemPageStore::new(MemPageStore::new(20), 3);
 
             let original_parent = build_interior_table(&[(pn(4), 5)], pn(3));
             store.inner.pages.insert(2, original_parent.clone());
@@ -3452,6 +3503,107 @@ mod tests {
                 store.write_count(new_pgno),
                 1,
                 "quick balance should write the new sibling once"
+            );
+        });
+    }
+
+    /// bd-ujp0h: the quick balance caps the old right-edge leaf's keys with a
+    /// new divider, so the leaf must join its write set. A writer with a
+    /// write-conflict set takes a claim that stages no bytes.
+    #[test]
+    fn test_balance_quick_claims_the_leaf_it_moves_the_right_edge_off() {
+        run_async(async {
+            let cx = Cx::new();
+            let mut store = RecordingMemPageStore::tracking_conflicts(MemPageStore::new(20));
+            store
+                .inner
+                .pages
+                .insert(2, build_interior_table(&[(pn(4), 5)], pn(3)));
+            store
+                .inner
+                .pages
+                .insert(3, build_leaf_table(&[(10, b"ten"), (20, b"twenty")]));
+
+            let mut overflow_cell = [0u8; 64];
+            let mut pos = 0;
+            pos += write_varint(&mut overflow_cell[pos..], 5);
+            pos += write_varint(&mut overflow_cell[pos..], 30);
+            overflow_cell[pos..pos + 5].copy_from_slice(b"hello");
+            pos += 5;
+
+            balance_quick(
+                &cx,
+                &mut store,
+                pn(2),
+                pn(3),
+                &overflow_cell[..pos],
+                30,
+                USABLE,
+                USABLE,
+            )
+            .await
+            .expect("quick balance should succeed")
+            .expect("quick balance should allocate a sibling");
+
+            assert_eq!(
+                store.claimed,
+                vec![pn(3)],
+                "the old right-edge leaf is claimed"
+            );
+            assert_eq!(
+                store.write_count(pn(3)),
+                0,
+                "a claimed leaf is not rewritten (no extra WAL frame)"
+            );
+        });
+    }
+
+    /// bd-ujp0h: a writer without a write-conflict set gets the old right-edge
+    /// leaf restaged, unchanged. A concurrent session appending to the old
+    /// edge then conflicts on the leaf instead of committing a key past the
+    /// divider.
+    #[test]
+    fn test_balance_quick_restages_the_leaf_it_moves_the_right_edge_off() {
+        run_async(async {
+            let cx = Cx::new();
+            let mut store = RecordingMemPageStore::new(MemPageStore::new(20));
+            store
+                .inner
+                .pages
+                .insert(2, build_interior_table(&[(pn(4), 5)], pn(3)));
+            let leaf = build_leaf_table(&[(10, b"ten"), (20, b"twenty")]);
+            store.inner.pages.insert(3, leaf.clone());
+
+            let mut overflow_cell = [0u8; 64];
+            let mut pos = 0;
+            pos += write_varint(&mut overflow_cell[pos..], 5);
+            pos += write_varint(&mut overflow_cell[pos..], 30);
+            overflow_cell[pos..pos + 5].copy_from_slice(b"hello");
+            pos += 5;
+
+            balance_quick(
+                &cx,
+                &mut store,
+                pn(2),
+                pn(3),
+                &overflow_cell[..pos],
+                30,
+                USABLE,
+                USABLE,
+            )
+            .await
+            .expect("quick balance should succeed")
+            .expect("quick balance should allocate a sibling");
+
+            assert_eq!(
+                store.write_count(pn(3)),
+                1,
+                "the old right-edge leaf must be in the write set"
+            );
+            assert_eq!(
+                store.inner.pages.get(&3),
+                Some(&leaf),
+                "restaging must not change the leaf's bytes"
             );
         });
     }

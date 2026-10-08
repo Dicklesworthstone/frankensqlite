@@ -4013,6 +4013,25 @@ impl PageWriter for SharedTxnPageIo {
         }
         self.txn.borrow_mut().record_write_witness(cx, key);
     }
+
+    /// bd-ujp0h: a concurrent transaction claims the page as conflict-only
+    /// (page lock plus first-committer-wins tracking, no staged bytes), so a
+    /// structural claim adds no WAL frame. Without a concurrent context the
+    /// caller restages the page instead.
+    fn claim_write_conflict_page<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        page_no: PageNumber,
+    ) -> impl std::future::Future<Output = Result<bool>> + 'a {
+        let claimed = match self.concurrent_context() {
+            Some(ctx) => {
+                track_concurrent_conflict_only_page(cx, &ctx, page_no, "claim_write_conflict_page")
+                    .map(|()| true)
+            }
+            None => Ok(false),
+        };
+        std::future::ready(claimed)
+    }
 }
 
 // ── Time-Travel Page I/O ──────────────────────────────────────────────
