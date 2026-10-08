@@ -41739,46 +41739,28 @@ impl Connection {
                         &effective_delete.table.name.name,
                         &self.schema.borrow(),
                     )
-                }) {
-                    let matched_rows = self
-                        .select_matching_rows(
-                            &effective_delete.table,
-                            effective_delete.where_clause.as_ref(),
-                            &[],
-                            None,
-                            params,
-                        )
-                        .await?;
-                    let rowid_literals: Vec<Expr> = matched_rows
-                        .iter()
-                        .filter_map(|row| {
-                            row.values().first().and_then(|v| {
-                                if let SqliteValue::Integer(i) = v {
-                                    Some(Expr::Literal(
-                                        Literal::Integer(*i),
-                                        fsqlite_ast::Span::new(0, 0),
-                                    ))
-                                } else {
-                                    None
-                                }
-                            })
-                        })
-                        .collect();
-                    if rowid_literals.is_empty() {
+                }) && let Some((locator_columns, locator_rows)) = self
+                    .materialize_dml_replay_locators(
+                        &effective_delete.table,
+                        effective_delete.where_clause.as_ref(),
+                        params,
+                    )
+                    .await?
+                {
+                    // bd-ntt2b: freeze each matching row by its locator (the
+                    // rowid or INTEGER PRIMARY KEY, or the full WITHOUT ROWID
+                    // primary key) and delete exactly those rows. This lane used
+                    // to read `SELECT *` and take each row's first column as
+                    // its rowid, deleting other rows or none.
+                    if locator_rows.is_empty() {
                         self.reset_statement_change_count();
                         return Ok(Vec::new());
                     }
-                    let rowid_alias =
-                        self.ignore_skip_rowid_alias(&effective_delete.table.name.name);
-                    effective_delete.where_clause = Some(Expr::In {
-                        expr: Box::new(Expr::Column(
-                            fsqlite_ast::ColumnRef::bare(rowid_alias),
-                            fsqlite_ast::Span::new(0, 0),
-                        )),
-                        not: false,
-                        set: fsqlite_ast::InSet::List(rowid_literals),
-                        span: fsqlite_ast::Span::new(0, 0),
-                    });
+                    effective_delete.where_clause = Some(Self::locator_rows_filter(
+                        &effective_delete.table,
+                        &locator_columns,
+                        locator_rows,
+                    )?);
                 }
                 // A correlated subquery inside `IN (...)` in the WHERE cannot be
                 // lowered by VDBE codegen; resolve the matching rowids via the
@@ -53777,6 +53759,61 @@ impl Connection {
             right: Box::new(right),
             span: Span::ZERO,
         }))
+    }
+
+    /// bd-ntt2b: a WHERE matching exactly the rows `locator_rows` froze (see
+    /// [`Self::materialize_dml_replay_locators`]): `key IN (...)` for a
+    /// one-column locator, otherwise an OR of per-row key equalities, built
+    /// balanced so a large row set does not nest one level per row.
+    fn locator_rows_filter(
+        table_ref: &fsqlite_ast::QualifiedTableRef,
+        locator_columns: &[String],
+        locator_rows: Vec<Vec<SqliteValue>>,
+    ) -> Result<Expr> {
+        if let [key] = locator_columns {
+            let values = locator_rows
+                .into_iter()
+                .map(|row| row.into_iter().next().map(value_to_literal_expr))
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| {
+                    FrankenError::Internal("DML row locator is missing its key".to_owned())
+                })?;
+            return Ok(Expr::In {
+                expr: Box::new(Self::build_limit_scope_projection_expr(table_ref, key)),
+                set: InSet::List(values),
+                not: false,
+                span: Span::ZERO,
+            });
+        }
+        let mut terms = locator_rows
+            .into_iter()
+            .map(|row| {
+                Self::build_update_replay_locator_filter(
+                    table_ref,
+                    locator_columns,
+                    row.into_iter().map(value_to_literal_expr).collect(),
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        while terms.len() > 1 {
+            let mut pairs = terms.into_iter();
+            let mut joined = Vec::new();
+            while let Some(left) = pairs.next() {
+                joined.push(match pairs.next() {
+                    Some(right) => Expr::BinaryOp {
+                        left: Box::new(left),
+                        op: BinaryOp::Or,
+                        right: Box::new(right),
+                        span: Span::ZERO,
+                    },
+                    None => left,
+                });
+            }
+            terms = joined;
+        }
+        Ok(terms
+            .pop()
+            .unwrap_or(Expr::Literal(Literal::Integer(0), Span::ZERO)))
     }
 
     /// The single-row statement a row-by-row replay runs for one frozen row:
