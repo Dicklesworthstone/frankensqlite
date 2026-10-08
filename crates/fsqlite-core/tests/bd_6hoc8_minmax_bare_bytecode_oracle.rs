@@ -134,19 +134,16 @@ const OTHER_AGGREGATE_QUERIES: &[&str] = &[
     "SELECT max(a), min(a) FILTER (WHERE c <> 2), b FROM t",
 ];
 
-/// Ad-hoc execution keeps the interpreter for these (an aggregate inside a
-/// larger result expression, DISTINCT); prepared statements compile them to
-/// bytecode, which must agree.
+/// Shapes the bytecode does not track (an aggregate inside a larger result
+/// expression, DISTINCT): ad hoc and prepared statements both take the
+/// interpreter, which must agree with SQLite.
 const INTERPRETER_QUERIES: &[&str] = &[
     "SELECT max(a), max(a) + 1, b FROM t",
     "SELECT DISTINCT max(a), b FROM t",
-];
-
-/// Checked ad hoc only, on the interpreter. The prepared bytecode evaluates
-/// an aggregate's wrapper expression after the scan, where a bare column
-/// inside it reads NULL, and keeps the first row for a DISTINCT min()/max()
-/// (both separate, pre-existing prepared-statement gaps).
-const AD_HOC_ONLY_QUERIES: &[&str] = &[
+    // A bare column inside an aggregate's wrapper expression, and a DISTINCT
+    // min()/max(): prepared statements once compiled these to bytecode that
+    // read the wrapper's bare column as NULL and kept the first row; since
+    // bd-6lijo they take the interpreter as ad hoc does (bd-zhnw3).
     "SELECT max(a) || ':' || b FROM t",
     "SELECT max(DISTINCT a), b FROM t",
     "SELECT min(DISTINCT c), b FROM t",
@@ -218,9 +215,6 @@ fn minmax_bare_columns_come_from_the_extremum_row() {
                 let stock = rows_r(&r, sql);
                 assert_eq!(rows_f(&f, sql).await, stock, "query `{sql}`");
                 assert_eq!(rows_prepared(&f, sql).await, stock, "prepared `{sql}`");
-            }
-            for sql in AD_HOC_ONLY_QUERIES {
-                assert_eq!(rows_f(&f, sql).await, rows_r(&r, sql), "query `{sql}`");
             }
         });
     }
