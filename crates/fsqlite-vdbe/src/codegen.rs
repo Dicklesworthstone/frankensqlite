@@ -3370,6 +3370,19 @@ pub fn codegen_select(
     } else {
         None
     };
+    // GH#497 (bd-5qu8n): the same columns' `IN (?1, ?2, ...)` (any bind-time constants), which
+    // a batched key lookup sends, seeks per distinct value through a probe set built at run
+    // time. Time travel is declined because the seek emitter does not pin a snapshot.
+    let index_in_const = if in_list_seek_allowed
+        && time_travel.is_none()
+        && rowid_in.is_none()
+        && rowid_in_const.is_none()
+        && index_in.is_none()
+    {
+        index_const_in_list_residual_target(where_clause.as_deref(), table, table_alias)
+    } else {
+        None
+    };
     // bd-nonagg-rowid-eq-residual: `rowid = <const> AND <residual>` — one SeekRowid on the target row,
     // then the whole WHERE re-applied to it. The planner emits a RowidLookup directive (it sees the eq)
     // but codegen's bare `rowid_target` extraction declines the conjunction, so the directive bypasses
@@ -3465,6 +3478,22 @@ pub fn codegen_select(
             &values,
             where_clause.as_deref(),
             has_residual,
+        );
+    }
+    if let Some(target) = &index_in_const {
+        return codegen_select_index_in_const_scan(
+            b,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            columns,
+            out_regs,
+            out_col_count,
+            done_label,
+            end_label,
+            target,
+            where_clause.as_deref(),
         );
     }
 
@@ -6032,6 +6061,150 @@ fn codegen_select_index_in_scan(
     }
 
     b.resolve_label(done_label);
+    b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
+    b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
+    b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+    b.resolve_label(end_label);
+    Ok(())
+}
+
+/// Codegen for `SELECT <cols> FROM t WHERE <col> IN (<bind-time constants>)` over an index led
+/// by `col` (GH#497 / bd-5qu8n): the parameterized sibling of [`codegen_select_index_in_scan`].
+///
+/// Built like [`codegen_select_rowid_in_const_scan`]: each member is evaluated once, NULLs are
+/// dropped (IN never matches them), the rest take the column's affinity and go into an
+/// ascending, de-duplicated ephemeral index. Each distinct value then seeks its run of the
+/// index as [`codegen_select_index_in_subquery_scan`] does, so rows come out in stock's
+/// value-then-rowid order and the table is never scanned. With a residual, the whole WHERE is
+/// re-applied to each row reached.
+#[allow(clippy::too_many_arguments)]
+fn codegen_select_index_in_const_scan(
+    b: &mut ProgramBuilder,
+    cursor: i32,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    schema: &[TableSchema],
+    columns: &[ResultColumn],
+    out_regs: i32,
+    out_col_count: i32,
+    done_label: crate::Label,
+    end_label: crate::Label,
+    target: &IndexConstInList<'_, '_>,
+    where_clause: Option<&Expr>,
+) -> Result<(), CodegenError> {
+    let idx_schema = target.index;
+    let idx_cursor = cursor + 1;
+    let probe_cursor = cursor + 2;
+    // As in the rowid sibling: the members number their anonymous `?`s from where the WHERE
+    // places them, and whatever follows the WHERE sees the counter past all of it.
+    let where_placeholder_base = b.current_anon_placeholder();
+    b.emit_op(
+        Opcode::OpenRead,
+        cursor,
+        table.root_page,
+        0,
+        P4::Table(table.name.clone()),
+        0,
+    );
+    b.emit_op(
+        Opcode::OpenRead,
+        idx_cursor,
+        idx_schema.root_page,
+        0,
+        P4::Index(idx_schema.name.clone()),
+        0,
+    );
+
+    b.set_next_anon_placeholder(where_placeholder_base + target.anon_offset);
+    b.emit_op(Opcode::OpenAutoindex, probe_cursor, 1, 0, P4::None, 0);
+    let r_value = b.alloc_temp();
+    let r_key = b.alloc_temp();
+    for value in &target.values {
+        let skip_value = b.emit_label();
+        emit_expr(b, value, r_value, None);
+        b.emit_jump_to_label(Opcode::IsNull, r_value, 0, skip_value, P4::None, 0);
+        b.emit_op(
+            Opcode::Affinity,
+            r_value,
+            1,
+            0,
+            P4::Affinity(target.affinity.to_string()),
+            0,
+        );
+        b.emit_op(Opcode::MakeRecord, r_value, 1, r_key, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Found, probe_cursor, r_key, skip_value, P4::None, 0);
+        b.emit_op(Opcode::IdxInsert, probe_cursor, r_key, 0, P4::None, 0);
+        b.resolve_label(skip_value);
+    }
+    b.free_temp(r_key);
+    b.free_temp(r_value);
+    b.set_next_anon_placeholder(
+        where_placeholder_base + where_clause.map_or(0, count_anon_placeholders),
+    );
+
+    // A composite `(col, …)` index is probed with a one-field prefix, a single-column one with
+    // `(value, rowid floor)`, as in [`codegen_select_index_in_scan`]. `MakeRecord` reads the
+    // two registers consecutively.
+    let prefix_probe = idx_schema.key_term_count() > 1;
+    let n_probe: i32 = if prefix_probe { 1 } else { 2 };
+    let r_probe_value = b.alloc_reg();
+    let r_min_rowid = b.alloc_reg();
+    let r_probe_record = b.alloc_reg();
+    let r_current_key = b.alloc_reg();
+    let rowid_reg = b.alloc_reg();
+    b.emit_jump_to_label(Opcode::Rewind, probe_cursor, 0, done_label, P4::None, 0);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let probe_loop_top = b.current_addr() as i32;
+    b.emit_op(Opcode::Column, probe_cursor, 0, r_probe_value, P4::None, 0);
+    if !prefix_probe {
+        b.emit_op(Opcode::Int64, 0, r_min_rowid, 0, P4::Int64(i64::MIN), 0);
+    }
+    b.emit_op(
+        Opcode::MakeRecord,
+        r_probe_value,
+        n_probe,
+        r_probe_record,
+        P4::None,
+        0,
+    );
+    let next_probe = b.emit_label();
+    b.emit_jump_to_label(
+        Opcode::SeekGE,
+        idx_cursor,
+        r_probe_record,
+        next_probe,
+        P4::None,
+        0,
+    );
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let run_top = b.current_addr() as i32;
+    b.emit_op(Opcode::Column, idx_cursor, 0, r_current_key, P4::None, 0);
+    b.emit_jump_to_label(
+        Opcode::Ne,
+        r_probe_value,
+        r_current_key,
+        next_probe,
+        direct_lookup_index_comparison_p4(idx_schema),
+        0x10,
+    );
+    let skip_row = b.emit_label();
+    b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
+    b.emit_jump_to_label(Opcode::SeekRowid, cursor, rowid_reg, skip_row, P4::None, 0);
+    if target.has_residual
+        && let Some(where_expr) = where_clause
+    {
+        b.set_next_anon_placeholder(where_placeholder_base);
+        emit_where_filter(b, where_expr, cursor, table, table_alias, schema, skip_row);
+    }
+    emit_column_reads(b, cursor, columns, table, table_alias, schema, out_regs)?;
+    b.emit_op(Opcode::ResultRow, out_regs, out_col_count, 0, P4::None, 0);
+    b.resolve_label(skip_row);
+    b.emit_op(Opcode::Next, idx_cursor, run_top, 0, P4::None, 0);
+    b.resolve_label(next_probe);
+    b.emit_op(Opcode::Next, probe_cursor, probe_loop_top, 0, P4::None, 0);
+
+    b.resolve_label(done_label);
+    b.emit_op(Opcode::Close, probe_cursor, 0, 0, P4::None, 0);
     b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
     b.emit_op(Opcode::Close, cursor, 0, 0, P4::None, 0);
     b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
@@ -18057,6 +18230,119 @@ fn index_text_in_list_residual_target<'t>(
         index_text_in_list_target(Some(term), table, table_alias)
             .map(|(idx, texts)| (idx, texts, true))
     })
+}
+
+/// A non-aggregate `WHERE <col> IN (<bind-time constants>)` that
+/// [`codegen_select_index_in_const_scan`] seeks per value (GH#497 / bd-5qu8n): the parameterized
+/// sibling of [`index_text_in_list_target`] and [`index_integer_in_list_target`], as GH #415's
+/// [`RowidConstInList`] is for the rowid. `WHERE key IN (?1, ?2, ...)` is what a batched key
+/// lookup sends, and it scanned the whole table.
+struct IndexConstInList<'t, 'a> {
+    /// An index led by the column, its first key term ascending and BINARY.
+    index: &'t IndexSchema,
+    /// The list members, in source order.
+    values: Vec<&'a Expr>,
+    /// The column's affinity (TEXT or INTEGER), which every member takes before it is sought,
+    /// as stock's IN gives a list the left operand's affinity.
+    affinity: char,
+    /// `true` when the membership test is one conjunct of the WHERE; the caller re-applies the
+    /// whole WHERE to each row the seeks reach.
+    has_residual: bool,
+    /// Anonymous `?` placeholders in the conjuncts before the membership test (see
+    /// [`RowidConstInList::anon_offset`]).
+    anon_offset: u32,
+}
+
+/// The index, members and affinity of `<col> IN (<bind-time constants>)` for
+/// [`IndexConstInList`]: `col` is a table column with TEXT or INTEGER affinity and BINARY
+/// collation, and an index led by it has an ascending BINARY first key term. Under BINARY a
+/// member converted to the column's affinity compares as the index orders it, so the seek of
+/// each value reaches every row the IN accepts (GH#409's argument, applied after the conversion
+/// instead of required of the literal).
+fn index_const_in_list_target<'t, 'a>(
+    term: &'a Expr,
+    table: &'t TableSchema,
+    table_alias: Option<&str>,
+) -> Option<(&'t IndexSchema, Vec<&'a Expr>, char)> {
+    let Expr::In {
+        expr: column,
+        set: fsqlite_ast::InSet::List(values),
+        not: false,
+        ..
+    } = term
+    else {
+        return None;
+    };
+    if values.is_empty() || !values.iter().all(rowid_in_probe_value_is_constant) {
+        return None;
+    }
+    let col_name = column_name(column, table, table_alias)?;
+    let column_info = table
+        .column_index(&col_name)
+        .and_then(|i| table.columns.get(i))?;
+    let is_binary = |collation: Option<&str>| collation.is_none_or(|c| c.eq_ignore_ascii_case("BINARY"));
+    if !matches!(column_info.affinity, 'B' | 'D')
+        || column_info.is_ipk
+        || !is_binary(column_info.collation.as_deref())
+    {
+        return None;
+    }
+    let usable = |idx: &&IndexSchema| {
+        idx.supports_direct_column_lookup()
+            && !idx.key_term_descending(0)
+            && is_binary(idx.key_term_collation(0))
+            && idx
+                .columns
+                .first()
+                .is_some_and(|c| c.eq_ignore_ascii_case(&col_name))
+    };
+    let idx = table
+        .indexes
+        .iter()
+        .filter(usable)
+        .find(|idx| idx.key_term_count() == 1)
+        .or_else(|| table.indexes.iter().filter(usable).find(|idx| idx.key_term_count() > 1))?;
+    Some((idx, values.iter().collect(), column_info.affinity))
+}
+
+/// [`index_const_in_list_target`] for the whole WHERE, else for one conjunct of it.
+fn index_const_in_list_residual_target<'t, 'a>(
+    where_clause: Option<&'a Expr>,
+    table: &'t TableSchema,
+    table_alias: Option<&str>,
+) -> Option<IndexConstInList<'t, 'a>> {
+    let where_expr = where_clause?;
+    if let Some((index, values, affinity)) =
+        index_const_in_list_target(where_expr, table, table_alias)
+    {
+        return Some(IndexConstInList {
+            index,
+            values,
+            affinity,
+            has_residual: false,
+            anon_offset: 0,
+        });
+    }
+    let mut conjuncts = Vec::new();
+    collect_conjunctive_terms(where_expr, &mut conjuncts);
+    if conjuncts.len() < 2 {
+        return None;
+    }
+    let mut anon_offset = 0_u32;
+    for term in conjuncts {
+        if let Some((index, values, affinity)) = index_const_in_list_target(term, table, table_alias)
+        {
+            return Some(IndexConstInList {
+                index,
+                values,
+                affinity,
+                has_residual: true,
+                anon_offset,
+            });
+        }
+        anon_offset += count_anon_placeholders(term);
+    }
+    None
 }
 
 /// Returns `(index, ints, has_residual)`. `has_residual == false` is the residual-free case above (the

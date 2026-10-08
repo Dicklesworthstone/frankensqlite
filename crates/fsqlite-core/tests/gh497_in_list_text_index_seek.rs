@@ -8,6 +8,10 @@
 //! Also covered: an integer IN list over a composite index whose trailing key column holds NULL
 //! (the probe is a one-field prefix there), and shapes that must keep the full scan (a NOCASE
 //! column) yet still return stock's rows.
+//!
+//! The issue's impact case, a parameter list `key IN (?1, ?2, ...)`, seeks too: members take the
+//! column's affinity (an integer 5 finds TEXT '5', REAL 2.5 and text '1' on an INTEGER column
+//! behave as stock), NULLs and duplicates drop out, and a residual conjunct still filters.
 
 use fsqlite_core::connection::Connection;
 use fsqlite_types::value::SqliteValue;
@@ -18,9 +22,11 @@ const SETUP: &[&str] = &[
     "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 199) \
      INSERT INTO r9_t SELECT 'id' || i, 'k' || (i % 20), 'v' || i FROM n",
     "INSERT INTO r9_t VALUES ('e1', '', 'empty'), ('u1', 'ключ', 'unicode')",
+    "INSERT INTO r9_t VALUES ('e5', 5, 'five'), ('e6', '5.0', 'five point zero')",
     "CREATE TABLE c (a INT, b INT, v TEXT)",
     "CREATE INDEX c_ab ON c (a, b)",
     "INSERT INTO c VALUES (1, NULL, 'n1'), (1, 2, 'x'), (2, NULL, 'n2'), (3, 4, 'y'), (1, NULL, 'n3')",
+    "INSERT INTO c VALUES (2.5, 7, 'real'), (-1, 0, 'neg'), ('txt', 1, 'text')",
     "CREATE TABLE nc (k TEXT COLLATE NOCASE, v TEXT)",
     "CREATE INDEX nc_k ON nc (k)",
     "INSERT INTO nc VALUES ('A', 'upper'), ('a', 'lower'), ('b', 'other')",
@@ -38,6 +44,26 @@ const QUERIES: &[&str] = &[
     "SELECT v FROM c WHERE a IN (1) AND b IS NULL",
     "SELECT v FROM nc WHERE k IN ('A')",
     "SELECT v FROM nc WHERE k IN ('a', 'B')",
+    // Lists the literal paths decline: mixed classes, numbers on TEXT, text on INTEGER.
+    "SELECT v FROM r9_t WHERE k IN ('k1', 5)",
+    "SELECT v FROM r9_t WHERE k IN (5, 5.0, '5')",
+    "SELECT v FROM c WHERE a IN ('1', 2.0)",
+    "SELECT v FROM c WHERE a IN (-1, 1)",
+];
+
+/// GH#497's impact case: `key IN (?1, ?2, ...)`, a batched key lookup. Each member takes the
+/// column's affinity; NULLs and duplicates are dropped.
+const PARAM_QUERIES: &[(&str, &[SqliteValue])] = &[
+    ("SELECT v FROM r9_t WHERE k IN (?1)", &[SqliteValue::Integer(5)]),
+    ("SELECT v FROM r9_t WHERE k IN (?1, ?2)", &[SqliteValue::Integer(5), SqliteValue::Float(5.0)]),
+    ("SELECT v FROM r9_t WHERE k IN (?1, ?2)", &[SqliteValue::Null, SqliteValue::Integer(5)]),
+    ("SELECT v FROM r9_t WHERE k IN (?1, ?1, ?2)", &[SqliteValue::Null, SqliteValue::Null]),
+    ("SELECT id, v FROM r9_t WHERE k IN ('k3', ?1) AND v LIKE 'v1%'", &[SqliteValue::Integer(5)]),
+    ("SELECT v FROM r9_t WHERE v <> ?1 AND k IN (?2, ?3)", &[SqliteValue::Integer(0), SqliteValue::Integer(5), SqliteValue::Float(5.0)]),
+    ("SELECT v FROM c WHERE a IN (?1, ?2)", &[SqliteValue::Integer(1), SqliteValue::Integer(3)]),
+    ("SELECT v FROM c WHERE a IN (?1, ?2)", &[SqliteValue::Float(1.0), SqliteValue::Float(2.5)]),
+    ("SELECT v FROM c WHERE a IN (?1) AND b IS NULL", &[SqliteValue::Integer(1)]),
+    ("SELECT v FROM nc WHERE k IN (?1)", &[SqliteValue::Null]),
 ];
 
 fn tag_f(v: &SqliteValue) -> String {
@@ -65,11 +91,22 @@ fn sorted(mut rows: Vec<Vec<String>>) -> Vec<Vec<String>> {
     rows
 }
 
-fn stock_rows(r: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
+fn to_rusqlite(v: &SqliteValue) -> rusqlite::types::Value {
+    match v {
+        SqliteValue::Null => rusqlite::types::Value::Null,
+        SqliteValue::Integer(n) => rusqlite::types::Value::Integer(*n),
+        SqliteValue::Float(f) => rusqlite::types::Value::Real(*f),
+        SqliteValue::Text(s) => rusqlite::types::Value::Text(s.to_string()),
+        SqliteValue::Blob(b) => rusqlite::types::Value::Blob(b.to_vec()),
+    }
+}
+
+fn stock_rows(r: &rusqlite::Connection, sql: &str, params: &[SqliteValue]) -> Vec<Vec<String>> {
     let mut statement = r.prepare(sql).expect("stock prepare");
     let n = statement.column_count();
+    let params: Vec<rusqlite::types::Value> = params.iter().map(to_rusqlite).collect();
     let rows = statement
-        .query_map([], |row| {
+        .query_map(rusqlite::params_from_iter(params), |row| {
             Ok((0..n)
                 .map(|i| tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(i)))
                 .collect::<Vec<_>>())
@@ -102,7 +139,7 @@ async fn run(file_backed: bool) -> Vec<String> {
     }
     let mut failures = Vec::new();
     for sql in QUERIES {
-        let stock = stock_rows(&r, sql);
+        let stock = stock_rows(&r, sql, &[]);
         let direct = f.query(sql).await.map(|rows| frank_rows(&rows));
         if direct.as_ref().ok() != Some(&stock) {
             failures.push(format!(
@@ -119,24 +156,58 @@ async fn run(file_backed: bool) -> Vec<String> {
             ));
         }
     }
-    // The index is opened and sought, as for `k = 'k1'`: no table Rewind.
+    for (sql, params) in PARAM_QUERIES {
+        let stock = stock_rows(&r, sql, params);
+        let direct = f
+            .query_with_params(sql, params)
+            .await
+            .map(|rows| frank_rows(&rows));
+        if direct.as_ref().ok() != Some(&stock) {
+            failures.push(format!(
+                "[file_backed={file_backed}] `{sql}` {params:?} (query_with_params): frank \
+                 {direct:?} vs stock {stock:?}"
+            ));
+        }
+        let prepared = match f.prepare(sql).await {
+            Ok(statement) => statement
+                .query_with_params(params)
+                .await
+                .map(|rows| frank_rows(&rows)),
+            Err(e) => Err(e),
+        };
+        if prepared.as_ref().ok() != Some(&stock) {
+            failures.push(format!(
+                "[file_backed={file_backed}] `{sql}` {params:?} (prepare): frank {prepared:?} vs \
+                 stock {stock:?}"
+            ));
+        }
+    }
+    // The index is opened and sought, as for `k = 'k1'`: the table (cursor 0) is never
+    // rewound. A parameter list rewinds only its probe set.
     for sql in [
         "EXPLAIN SELECT v FROM r9_t WHERE k IN ('k1')",
         "EXPLAIN SELECT v FROM r9_t WHERE k IN ('k1', 'k2')",
+        "EXPLAIN SELECT v FROM r9_t WHERE k IN (?1)",
+        "EXPLAIN SELECT v FROM r9_t WHERE k IN (?1, ?2, ?3)",
+        "EXPLAIN SELECT v FROM c WHERE a IN (?1, ?2)",
     ] {
-        let opcodes: Vec<String> = f
+        let program: Vec<(String, i64)> = f
             .query(sql)
             .await
             .expect("explain")
             .iter()
-            .filter_map(|row| match row.values().get(1) {
-                Some(SqliteValue::Text(op)) => Some(op.to_string()),
+            .filter_map(|row| match (row.values().get(1), row.values().get(2)) {
+                (Some(SqliteValue::Text(op)), Some(SqliteValue::Integer(p1))) => {
+                    Some((op.to_string(), *p1))
+                }
                 _ => None,
             })
             .collect();
-        if !opcodes.iter().any(|op| op == "SeekGE") || opcodes.iter().any(|op| op == "Rewind") {
+        let seeks = program.iter().any(|(op, _)| op == "SeekGE");
+        let rewinds_table = program.iter().any(|(op, p1)| op == "Rewind" && *p1 == 0);
+        if !seeks || rewinds_table {
             failures.push(format!(
-                "[file_backed={file_backed}] `{sql}` does not seek the index: {opcodes:?}"
+                "[file_backed={file_backed}] `{sql}` does not seek the index: {program:?}"
             ));
         }
     }
