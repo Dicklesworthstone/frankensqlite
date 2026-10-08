@@ -461,9 +461,14 @@ impl IndexSchema {
     /// non-partial column index.
     #[must_use]
     pub fn supports_direct_column_lookup(&self) -> bool {
-        self.where_clause.is_none()
-            && !self.columns.is_empty()
-            && self.columns.len() == self.key_term_count()
+        self.where_clause.is_none() && self.has_plain_column_key()
+    }
+
+    /// Whether every key term is a plain table column, so a probe key can be
+    /// built from the row's column registers. The index may be partial.
+    #[must_use]
+    pub fn has_plain_column_key(&self) -> bool {
+        !self.columns.is_empty() && self.columns.len() == self.key_term_count()
     }
 
     /// Whether REPLACE cleanup metadata can reconstruct the key from raw row
@@ -22821,7 +22826,9 @@ pub fn codegen_insert(
             && !upsert_target_matches_rowid_primary_key(table, target)
             && !upsert_target_matches_without_rowid_primary_key(table, target)
         {
-            return Err(CodegenError::Unsupported(
+            // An SQL error, as stock reports it (and as the WITHOUT ROWID path does): as
+            // `Unsupported` it surfaced as "not implemented: ..." through prepare().
+            return Err(CodegenError::SqlError(
                 "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint".to_owned(),
             ));
         }
@@ -23125,22 +23132,23 @@ fn emit_upsert_probe(
     cursor: i32,
     val_regs: i32,
     rowid_reg: i32,
-    table_alias: Option<&str>,
     target: Option<&UpsertTarget>,
     no_conflict_label: Label,
 ) -> i32 {
+    // The attempted row's rowid is already decided (explicit or NewRowid)
+    // before the probe, so a partial predicate naming a rowid alias sees it,
+    // as stock's constraint checks do. An index predicate names the table, not
+    // the INSERT's alias (bd-r4g3y: under the alias, `t.col` read NULL and the
+    // probe missed), so it is evaluated with no alias.
+    let attempted_row_ctx = ScanCtx {
+        cursor,
+        table,
+        table_alias: None,
+        schema: None,
+        register_base: Some(RegisterRow::with_rowid(val_regs, rowid_reg)),
+        secondaries: &[],
+    };
     if let Some((idx_offset, index)) = find_upsert_target_index(table, target) {
-        // The attempted row's rowid is already decided (explicit or NewRowid)
-        // before the probe, so a partial predicate naming a rowid alias sees
-        // it, as stock's constraint checks do.
-        let attempted_row_ctx = ScanCtx {
-            cursor,
-            table,
-            table_alias,
-            schema: None,
-            register_base: Some(RegisterRow::with_rowid(val_regs, rowid_reg)),
-            secondaries: &[],
-        };
         emit_index_predicate_guard(b, index, &attempted_row_ctx, no_conflict_label);
 
         // UNIQUE index conflict check.
@@ -23209,13 +23217,15 @@ fn emit_upsert_probe(
         && table
             .indexes
             .iter()
-            .any(|index| index.is_unique && index.supports_direct_column_lookup())
+            .any(|index| index.is_unique && index.has_plain_column_key())
     {
         // Omitted conflict target (SQLite 3.35+): DO UPDATE fires on whichever
         // uniqueness constraint the new row violates first. Probe the rowid/IPK
         // PRIMARY KEY, then every UNIQUE index in stock's check order; the first
         // hit supplies the existing row and leaves the table cursor positioned
-        // on it.
+        // on it. A partial UNIQUE index is probed only for a row its predicate
+        // admits (bd-45puh: it was skipped, so the later insert raised UNIQUE
+        // where stock takes the DO NOTHING / DO UPDATE branch).
         let conflict_label = b.emit_label();
         let found_rowid_reg = b.alloc_reg();
         let pk_miss = b.emit_label();
@@ -23225,10 +23235,11 @@ fn emit_upsert_probe(
         b.resolve_label(pk_miss);
         #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
         for (idx_offset, index) in indexes_in_conflict_check_order(table) {
-            if !index.is_unique || !index.supports_direct_column_lookup() {
+            if !index.is_unique || !index.has_plain_column_key() {
                 continue;
             }
             let idx_miss = b.emit_label();
+            emit_index_predicate_guard(b, index, &attempted_row_ctx, idx_miss);
             let idx_cursor = cursor + 1 + idx_offset as i32;
             let n_key_cols = index.columns.len() as i32;
             let key_val_regs = b.alloc_regs(n_key_cols);
@@ -23825,7 +23836,6 @@ fn codegen_insert_values(
                     cursor,
                     val_regs,
                     rowid_reg,
-                    table_alias,
                     clause.target.as_ref(),
                     no_conflict_label,
                 );
@@ -59801,7 +59811,7 @@ mod tests {
         )
         .expect_err("mismatched partial-index predicate must not fall back to the rowid probe");
         assert!(
-            matches!(error, CodegenError::Unsupported(ref message)
+            matches!(error, CodegenError::SqlError(ref message)
                 if message.contains("does not match any PRIMARY KEY or UNIQUE constraint")),
             "unexpected unmatched-target error: {error:?}"
         );
