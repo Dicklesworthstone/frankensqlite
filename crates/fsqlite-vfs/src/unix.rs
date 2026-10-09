@@ -983,7 +983,7 @@ impl InodeTable {
     /// which registers or defers exactly as before. Opening a redundant
     /// descriptor here only to defer it leaks it for as long as any lock claim
     /// survives, which in WAL mode is the lifetime of every live connection.
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     fn reuse_retained_file(
         &self,
         path: &Path,
@@ -1029,6 +1029,19 @@ impl InodeTable {
         drop(info);
         drop(map);
         Some((inode_info, file))
+    }
+
+    /// Android keeps the behavior from before bd-l0rbc: nix does not expose
+    /// `AT_EACCESS` there, so no retained descriptor is reused and every open
+    /// takes the ordinary path.
+    #[cfg(target_os = "android")]
+    #[allow(clippy::unused_self)]
+    fn reuse_retained_file(
+        &self,
+        _path: &Path,
+        _requested_rw: bool,
+    ) -> Option<(Arc<Mutex<InodeInfo>>, Arc<File>)> {
+        None
     }
 
     /// Register an opened descriptor in the inode's one process-wide lock
