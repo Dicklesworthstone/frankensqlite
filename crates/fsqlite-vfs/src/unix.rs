@@ -973,6 +973,77 @@ impl InodeTable {
         Some((inode_info, file))
     }
 
+    /// Non-Linux counterpart of the `O_PATH` reuse above (bd-l0rbc).
+    ///
+    /// Without `O_PATH`, the inode is identified by a path `stat`. The domain's
+    /// retained canonical descriptor keeps that inode allocated, so a
+    /// `(dev, ino)` match against it cannot name a recycled file. A second
+    /// `stat` after the access and mode checks requires that the path still
+    /// names that inode; otherwise the caller falls back to an ordinary open,
+    /// which registers or defers exactly as before. Opening a redundant
+    /// descriptor here only to defer it leaks it for as long as any lock claim
+    /// survives, which in WAL mode is the lifetime of every live connection.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn reuse_retained_file(
+        &self,
+        path: &Path,
+        requested_rw: bool,
+    ) -> Option<(Arc<Mutex<InodeInfo>>, Arc<File>)> {
+        use nix::fcntl::{AT_FDCWD, AtFlags, FcntlArg, OFlag, fcntl};
+        use std::os::unix::fs::MetadataExt;
+
+        // Follows symlinks exactly as the ordinary open does.
+        let path_key = || {
+            let meta = std::fs::metadata(path).ok()?;
+            meta.is_file()
+                .then(|| FileIdentity::from_unix_parts(meta.dev(), meta.ino()))
+        };
+        let key = path_key()?;
+        let access = if requested_rw {
+            UnixAccessFlags::R_OK | UnixAccessFlags::W_OK
+        } else {
+            UnixAccessFlags::R_OK
+        };
+        nix::unistd::faccessat(AT_FDCWD, path, access, AtFlags::AT_EACCESS).ok()?;
+        let map = self.shards[self.shard_idx(key)]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let inode_info = Arc::clone(map.get(&key)?);
+        let mut info = inode_info
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Only optimize an existing deferred-close domain. The initial open
+        // and first redundant open retain their normal registration semantics.
+        if info.deferred_close_files.is_empty() || inode_key_from_file(&info.file).ok()? != key {
+            return None;
+        }
+        let mode = OFlag::from_bits_truncate(fcntl(&*info.file, FcntlArg::F_GETFL).ok()?);
+        if requested_rw && mode & OFlag::O_ACCMODE != OFlag::O_RDWR {
+            return None;
+        }
+        if path_key()? != key {
+            return None;
+        }
+        info.n_ref = info.n_ref.checked_add(1)?;
+        let file = Arc::clone(&info.file);
+        drop(info);
+        drop(map);
+        Some((inode_info, file))
+    }
+
+    /// Android keeps the behavior from before bd-l0rbc: nix does not expose
+    /// `AT_EACCESS` there, so no retained descriptor is reused and every open
+    /// takes the ordinary path.
+    #[cfg(target_os = "android")]
+    #[allow(clippy::unused_self)]
+    fn reuse_retained_file(
+        &self,
+        _path: &Path,
+        _requested_rw: bool,
+    ) -> Option<(Arc<Mutex<InodeInfo>>, Arc<File>)> {
+        None
+    }
+
     /// Register an opened descriptor in the inode's one process-wide lock
     /// domain and return its canonical descriptor.
     ///
@@ -1667,14 +1738,11 @@ impl Vfs for UnixVfs {
                 .create_new(create_new)
                 .open(&resolved)
         };
-        #[cfg(target_os = "linux")]
         let reused = if !create_new && !delete_on_close && flags.contains(VfsOpenFlags::MAIN_DB) {
             global_inode_table().reuse_retained_file(&resolved, requested_rw)
         } else {
             None
         };
-        #[cfg(not(target_os = "linux"))]
-        let reused = None;
         let (inode_info, file) = if let Some(reused) = reused {
             reused
         } else {
@@ -5862,7 +5930,46 @@ mod tests {
         locked.close(&cx).expect("close locker");
     }
 
-    #[cfg(target_os = "linux")]
+    /// Count this process' open descriptors that name `path`'s file.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn descriptors_naming(path: &Path) -> usize {
+        let canonical = std::fs::canonicalize(path).expect("canonicalize descriptor witness path");
+        let descriptor_paths = std::fs::read_dir(if cfg!(target_os = "linux") {
+            "/proc/self/fd"
+        } else {
+            "/dev/fd"
+        })
+        .expect("inspect actual process descriptors")
+        .filter_map(std::result::Result::ok)
+        .filter_map(|entry| {
+            #[cfg(target_os = "linux")]
+            {
+                std::fs::read_link(entry.path()).ok()
+            }
+            #[cfg(target_os = "macos")]
+            {
+                use std::os::unix::ffi::OsStrExt as _;
+                let fd: libc::c_int = entry.file_name().to_str()?.parse().ok()?;
+                let mut buffer = [0_u8; libc::PATH_MAX as usize];
+                // SAFETY: F_GETPATH writes at most MAXPATHLEN (== PATH_MAX)
+                // bytes, NUL-terminated, into `buffer`; a descriptor that has
+                // closed since the directory listing fails with EBADF.
+                let status = unsafe { libc::fcntl(fd, libc::F_GETPATH, buffer.as_mut_ptr()) };
+                if status == -1 {
+                    return None;
+                }
+                let len = buffer.iter().position(|&byte| byte == 0)?;
+                Some(PathBuf::from(std::ffi::OsStr::from_bytes(&buffer[..len])))
+            }
+        })
+        .collect::<Vec<_>>();
+        descriptor_paths
+            .iter()
+            .filter(|target| **target == canonical)
+            .count()
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn repeated_opens_bound_descriptors_without_releasing_foreign_lock_fence() {
         const PROBE_PATH: &str = "FSQLITE_REPEATED_OPEN_LOCK_PROBE";
@@ -5896,14 +6003,7 @@ mod tests {
             assert!(stdout.contains("foreign-exclusive="));
             stdout.contains("foreign-exclusive=true")
         };
-        let descriptor_count = || {
-            std::fs::read_dir("/proc/self/fd")
-                .expect("inspect actual process descriptors")
-                .filter_map(std::result::Result::ok)
-                .filter_map(|entry| std::fs::read_link(entry.path()).ok())
-                .filter(|target| target == &path)
-                .count()
-        };
+        let descriptor_count = || descriptors_naming(&path);
         assert!(
             !foreign_exclusive(),
             "initial shared lock must exclude writers"
@@ -5928,7 +6028,7 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn retained_descriptor_reuse_preserves_create_and_replacement_semantics() {
         use std::os::unix::fs::PermissionsExt as _;
