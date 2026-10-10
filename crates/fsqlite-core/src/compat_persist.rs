@@ -3828,6 +3828,44 @@ fn try_parse_columns_from_create_sql_ast(sql: &str) -> Option<Vec<ColumnInfo>> {
     columns_from_create_table_statement(&create, sql)
 }
 
+/// Effective NOT NULL metadata must agree for live DDL and catalog reloads.
+/// STRICT primary keys imply NOT NULL except for INTEGER rowid aliases, whose
+/// NULL input is replaced with an allocated rowid. The implied constraint uses
+/// the ordinary NOT NULL conflict action, independently of PRIMARY KEY's action.
+pub(crate) fn column_has_not_null_constraint(
+    create: &CreateTableStatement,
+    column: &fsqlite_ast::ColumnDef,
+    is_ipk: bool,
+) -> bool {
+    if column
+        .constraints
+        .iter()
+        .any(|constraint| matches!(constraint.kind, ColumnConstraintKind::NotNull { .. }))
+    {
+        return true;
+    }
+    if !create.strict || is_ipk {
+        return false;
+    }
+    if column
+        .constraints
+        .iter()
+        .any(|constraint| matches!(constraint.kind, ColumnConstraintKind::PrimaryKey { .. }))
+    {
+        return true;
+    }
+    let CreateTableBody::Columns { constraints, .. } = &create.body else {
+        return false;
+    };
+    constraints.iter().any(|constraint| match &constraint.kind {
+        TableConstraintKind::PrimaryKey { columns, .. } => columns
+            .iter()
+            .filter_map(indexed_column_name)
+            .any(|name| name.eq_ignore_ascii_case(&column.name)),
+        _ => false,
+    })
+}
+
 /// `create` must be the statement parsed from `sql`: column DEFAULTs keep the
 /// text written there (see [`default_value_source_text`]).
 pub(crate) fn columns_from_create_table_statement(
@@ -3902,9 +3940,7 @@ pub(crate) fn columns_from_create_table_statement(
                     .map_or('A', |type_name| type_to_affinity(&type_name.name));
                 let type_name = col.type_name.as_ref().map(std::string::ToString::to_string);
                 let is_ipk = rowid_col_idx.is_some_and(|rowid_index| rowid_index == index);
-                let notnull = col.constraints.iter().any(|constraint| {
-                    matches!(&constraint.kind, ColumnConstraintKind::NotNull { .. })
-                });
+                let notnull = column_has_not_null_constraint(create, col, is_ipk);
                 let has_primary_key = col.constraints.iter().any(|constraint| {
                     matches!(&constraint.kind, ColumnConstraintKind::PrimaryKey { .. })
                 });

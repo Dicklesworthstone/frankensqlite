@@ -65541,16 +65541,15 @@ impl Connection {
                             .map_or('A', |tn| type_name_to_affinity_char(&tn.name));
                         let type_name =
                             col.type_name.as_ref().map(std::string::ToString::to_string);
-                        let notnull = col
-                            .constraints
-                            .iter()
-                            .any(|c| matches!(c.kind, ColumnConstraintKind::NotNull { .. }));
                         let has_primary_key = col
                             .constraints
                             .iter()
                             .any(|c| matches!(c.kind, ColumnConstraintKind::PrimaryKey { .. }));
                         let is_ipk =
                             !create.without_rowid && rowid_col_idx.is_some_and(|idx| idx == i);
+                        let notnull = crate::compat_persist::column_has_not_null_constraint(
+                            create, col, is_ipk,
+                        );
                         let is_non_ipk_pk = has_primary_key && !is_ipk;
                         let unique = is_non_ipk_pk
                             || col
