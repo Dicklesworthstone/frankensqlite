@@ -172,3 +172,49 @@ fn conjunctive_join_keys_seek_the_composite_index_like_sqlite() {
         });
     }
 }
+
+/// GH#502: v0.4.10 returned no rows for a join whose OUTER table is filtered
+/// through an index with a DESC column (`c(a, s DESC)`) while the inner table
+/// is looked up through its own index. Inner and LEFT joins, with or without
+/// GROUP BY, came back empty; the single-table query was right. The fix
+/// landed on main before this keeper; it pins the shape against stock.
+#[test]
+fn join_driven_by_a_desc_column_index_returns_rows_like_sqlite() {
+    const SETUP_502: &[&str] = &[
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, a INTEGER, s INTEGER, x TEXT)",
+        "INSERT INTO c VALUES (1, 1, 1000, 'one'), (2, 1, 2000, 'two'), (3, 2, 3000, 'three')",
+        "CREATE TABLE m (id INTEGER PRIMARY KEY, cid INTEGER)",
+        "CREATE INDEX im ON m(cid)",
+        "INSERT INTO m VALUES (10, 1), (11, 1), (12, 3)",
+        "CREATE INDEX ia ON c(a, s DESC)",
+    ];
+    const QUERIES_502: &[&str] = &[
+        "SELECT c.x, COUNT(m.id) FROM c LEFT JOIN m ON m.cid = c.id WHERE c.a = 1 GROUP BY c.id",
+        "SELECT c.x, m.id FROM c LEFT JOIN m ON m.cid = c.id WHERE c.a = 1 ORDER BY c.id, m.id",
+        "SELECT c.x, m.id FROM c JOIN m ON m.cid = c.id WHERE c.a = 1 ORDER BY c.id, m.id",
+        "SELECT c.x, m.id FROM c JOIN m ON m.cid = c.id WHERE c.a = 1 AND c.s < 1500",
+        "SELECT c.x FROM c WHERE c.a = 1 ORDER BY c.id",
+    ];
+    for file_backed in [false, true] {
+        asupersync::test_utils::run_test(|| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let target = if file_backed {
+                dir.path().join("gh502.db").to_string_lossy().into_owned()
+            } else {
+                ":memory:".to_owned()
+            };
+            let f = Connection::open(&target).await.unwrap();
+            let r = rusqlite::Connection::open_in_memory().unwrap();
+            for sql in SETUP_502 {
+                f.execute(sql).await.unwrap();
+                r.execute(sql, []).unwrap();
+            }
+            for sql in QUERIES_502 {
+                let stock = rows_r(&r, sql);
+                assert!(!stock.is_empty(), "fixture must give `{sql}` rows");
+                assert_eq!(rows_f(&f, sql).await, stock, "query `{sql}`");
+                assert_eq!(rows_prepared(&f, sql).await, stock, "prepared `{sql}`");
+            }
+        });
+    }
+}
