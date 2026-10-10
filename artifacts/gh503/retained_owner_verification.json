@@ -51,5 +51,82 @@
     "Run migration_v21_adds_covering_context_index_without_changing_archive_rows in coding_agent_session_search on Linux, macOS, and Windows when authorized execution capacity is available."
   ],
   "suspect_commit_causation_bisected": false,
-  "performance_measured": false
+  "performance_measured": false,
+  "memory_release_publication_follow_up": {
+    "review_date_utc": "2026-10-10",
+    "baseline_commit": "f85c66feb1dc74c4960a8210d4a10520729746cb",
+    "baseline_pager_blob": "9d8ced383444792bbb15056dc366a2b56170b1d6",
+    "candidate_pager_blob": "b6305507abe94b626e3d198b7f97cea9171b21de",
+    "candidate_pager_sha256": "0694d508790ae2eaac6c8881554ce6f81a4c3bf383f085b88d169d0eef67bac8",
+    "candidate_pager_utf8_bytes": 2841100,
+    "status": "Implemented and independently source-reviewed; new Rust execution remains held",
+    "first_incorrect_transition": "A private-memory release commit can finish its atomic batch and advance commit_seq, then suspend acquiring the exclusive database-file guard for logical exit. Without a decided-outcome receipt, rollback or Drop restores uncommitted allocation/overlay state over that already-replaced image; retry can apply the sequence twice. This additional defect is source-traced, not newly runtime-reproduced in this environment.",
+    "repair": [
+      "Publish the complete memory image and retire transaction-local allocation/overlay ownership synchronously under PagerInner before awaiting logical exit.",
+      "Evict only the flushed page IDs before optional cache admission, so a capacity refusal cannot preserve an old fallback image. Legitimate freelist reuse remains enabled.",
+      "Retain a committed outcome and exit-pending receipt. Commit retry, settle_commit, commit_and_retain, rollback and Drop finish only the remaining exit.",
+      "Use the existing exact-handle DetachedTransactionExit and process-root ownership for abandoned exits; no speculative allocation rollback or old overlay restoration occurs after publication.",
+      "Distinguish a pending exit from a fault after an already-completed exit using the existing maintenance lease, preserving exact-once accounting and the existing Phase-C fault hook.",
+      "Keep publication, cache and unlock timing attributed to their actual operations. No performance result is claimed."
+    ],
+    "new_regressions": [
+      {
+        "name": "test_gh503_cancelled_memory_release_preserves_complete_commit",
+        "cases": 24,
+        "coverage": "Real MemoryVfs, a held shared database-file guard, six completion paths, prior retained overlay on/off, metadata-only/full page publication, freelist reuse plus EOF growth, complete backing/cache/reader bytes, page-1 extent and freelist count, exact commit sequence, and later allocation ownership. Includes Drop with the guard still held and cancellation of detached settlement."
+      },
+      {
+        "name": "test_gh503_memory_release_phase_c_error_finishes_exit_once",
+        "cases": 5,
+        "coverage": "The existing Phase-C fault hook fires after logical exit. An independently active reader keeps transaction-count ownership observable while the original commit is retried, settled, retained, rolled back or dropped."
+      }
+    ],
+    "observed_checks": {
+      "independent_source_review": "The integrating author and an independent pager reviewer reviewed the complete final delta, Rust types/borrows, guard lifetimes, cache ordering, all completion paths, detached requeue ownership, and both deterministic test premises. No source-level blocker remained. This is not compiler or runtime proof.",
+      "pinned_rustfmt": "nightly-2026-08-31 parsed the complete pager candidate through stdin with exit 0 and no stderr; every changed hunk matches its formatted output. Stdin avoids the repository's pager-path ignore rule.",
+      "git_diff_check": "Passed on the restored complete checkout; no whitespace diagnostics.",
+      "source_integrity": "The complete candidate was reconstructed from the clean Git object after an interrupted disk-full write, matched the reviewed checkpoint byte-for-byte, and GitHub create_blob returned the independently computed candidate Git hash.",
+      "workspace_fmt": {
+        "command": "cargo fmt --check",
+        "exit_code": 1,
+        "changed_files_with_diagnostics": [],
+        "unchanged_files_with_diagnostics": [
+          "crates/fsqlite-btree/benches/cell_parse_hot_paths.rs",
+          "crates/fsqlite-harness/tests/native_commit_service.rs",
+          "crates/fsqlite-harness/tests/native_group_commit.rs",
+          "crates/fsqlite-types/src/serial_type.rs",
+          "crates/fsqlite-wal/src/native_commit/durable.rs",
+          "crates/fsqlite-wal/src/native_pages/store.rs",
+          "crates/fsqlite/src/compat/changeset_delivery.rs",
+          "crates/fsqlite/src/compat/changeset_delivery_fanout.rs"
+        ]
+      },
+      "ubs": "pager.rs excluded as required by the repository's mandatory large-file scan hold."
+    },
+    "new_runtime_qualification": {
+      "candidate_compiled": false,
+      "candidate_test_bodies_executed": false,
+      "red_green_executed": false,
+      "reason": "The executor and pinned toolchain became available, but shared disk then exhausted and the cgroup recorded OOM kills. No cold compiler/test job was admitted under those conditions. RCH was unavailable. Source checkpoints and bounded parser/format checks used a small shared-memory staging area; no other work was deleted, no runtime feature was disabled, and GitHub Actions remained off.",
+      "held_commands": [
+        "cargo test --locked -p fsqlite-pager --lib test_gh503_",
+        "cargo test --locked -p fsqlite-pager --lib test_memory_retained_freelist_commit_survives_",
+        "cargo test --locked -p fsqlite-core --test memory_page_reuse_and_attached_release_oracle",
+        "cargo test --locked -p fsqlite-core --test gh494_memory_commit_scaling gh503_",
+        "cargo check --workspace --all-targets",
+        "cargo clippy --workspace --all-targets -- -D warnings"
+      ]
+    },
+    "independent_upstream_evidence": [
+      {
+        "url": "https://github.com/Dicklesworthstone/frankensqlite/issues/503#issuecomment-6094512484",
+        "scope": "Owner-reported RCH red/green at 58fca10f9, reverting only the be9ae2526 and b1f576179 production repairs: fixed pager 5/5, GH494-file GH503 keepers 5/5, memory-page oracle 8/8; reverted versions reproduced the reported corruption. This covers the earlier repair, not this follow-up."
+      },
+      {
+        "url": "https://github.com/Dicklesworthstone/frankensqlite/commit/0a87aedd23a4649e99ca133e7aa3c9c1f6bdb6be",
+        "scope": "The upstream commit reports 1,050 pager library tests passing on Linux for its exact content after the prior retained-owner repairs. This is independently reported earlier-source execution, not a run of the two tests added here."
+      }
+    ],
+    "scope_limit": "This receipt addresses a successful atomic MemoryFile batch followed by interrupted exit. It does not establish recovery from a custom memory VFS implementation whose batch can partially write and then fail. Cross-platform CASS migration qualification and a release carrying the repairs remain outstanding."
+  }
 }

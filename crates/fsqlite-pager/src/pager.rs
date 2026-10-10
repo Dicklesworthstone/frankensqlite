@@ -14709,6 +14709,7 @@ where
                     pending_group_commit_attempt: None,
                     owned_rollback_recovery: None,
                     rollback_commit_finalization_pending: false,
+                    memory_commit_finalization_pending: false,
                     rollback_recovery_pending: Arc::clone(&inner.rollback_recovery_pending),
                     recovery_fence: Arc::clone(&self.recovery_fence),
                     read_only_pager: inner.access_mode.is_readonly(),
@@ -14949,6 +14950,7 @@ where
                 pending_group_commit_attempt: None,
                 owned_rollback_recovery: None,
                 rollback_commit_finalization_pending: false,
+                memory_commit_finalization_pending: false,
                 rollback_recovery_pending,
                 recovery_fence: Arc::clone(&self.recovery_fence),
                 read_only_pager,
@@ -20932,6 +20934,10 @@ where
     /// Phase C did not yet reach terminal transaction exit. Retry and Drop must
     /// preserve that committed outcome instead of replaying or reapplying it.
     rollback_commit_finalization_pending: bool,
+    /// The private-memory batch and all committed page/allocator publication
+    /// are complete, but logical transaction exit can still be suspended.
+    /// Cleanup must finish that exit exactly once, never undo the decided image.
+    memory_commit_finalization_pending: bool,
     /// Pager-wide lock-free recovery gate shared by every live transaction.
     /// This closes the sibling-handle window that a transaction-local flag
     /// cannot observe.
@@ -21290,6 +21296,7 @@ where
         self.pending_group_commit_attempt.is_some()
             || self.owned_rollback_recovery.is_some()
             || self.rollback_commit_finalization_pending
+            || self.memory_commit_finalization_pending
             || self.rollback_recovery_pending.load(AtomicOrdering::Acquire) != 0
     }
 
@@ -21380,6 +21387,51 @@ where
         }
         self.committed = committed;
         self.maintenance_lease.take();
+        self.finished = true;
+        self.scratch_arena.reset();
+        Ok(())
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    async fn finish_published_memory_commit(&mut self, cx: &Cx) -> Result<()> {
+        if !self.memory_commit_finalization_pending || !self.committed {
+            return Err(FrankenError::internal(
+                "memory commit finalization lost its published outcome receipt",
+            ));
+        }
+        if self.maintenance_lease.is_some() {
+            let cleanup_cx = cleanup_child_cx(cx);
+            let _cleanup_mask = cleanup_cx.masked();
+            settle_pending_group_commit_finalization_for_handle(
+                &self.group_commit_queue,
+                shared_db_file_key(&self.db_file),
+            )
+            .await?;
+            let logical_exit_claim = GroupCommitLogicalExitClaim::acquire(
+                &self.group_commit_queue,
+                shared_db_file_key(&self.db_file),
+                &cleanup_cx,
+            )
+            .await?;
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
+            let notify_writer_idle = coordinated_transaction_exit(
+                &self.group_commit_queue,
+                &cleanup_cx,
+                &mut inner,
+                self.mode != TransactionMode::Concurrent,
+                &logical_exit_claim,
+            )
+            .await?;
+            drop(inner);
+            self.maintenance_lease.take();
+            if notify_writer_idle {
+                self.writer_idle.notify_one();
+            }
+        }
+        self.memory_commit_finalization_pending = false;
         self.finished = true;
         self.scratch_arena.reset();
         Ok(())
@@ -22563,6 +22615,53 @@ where
     fn discard_committed_pages(&mut self) {
         self.write_set.clear();
         self.write_pages_sorted.clear();
+    }
+
+    /// Finish the private-memory decision while PagerInner still excludes a
+    /// stale cache refill. Only logical exit may remain after this method.
+    fn publish_memory_release_commit(
+        &mut self,
+        cx: &Cx,
+        update: PublishedPagerUpdate,
+        metadata_only: bool,
+        profile_active: bool,
+    ) {
+        // Cache admission is optional at pool capacity, so evict old images
+        // before attempting to replace them with the flushed committed bytes.
+        let t_cache_evict_start = pager_commit_profile_start(profile_active);
+        for &page_no in &self.write_pages_sorted {
+            self.cache.evict(page_no);
+        }
+        record_pager_commit_duration(&PAGER_COMMIT_CACHE_FINISH_TIME_NS, t_cache_evict_start);
+        let t_publish_start = pager_commit_profile_start(profile_active);
+        if metadata_only {
+            self.publish_single_connection_metadata_only(cx, update);
+        } else {
+            self.publish_committed_state(cx, update);
+        }
+        record_pager_commit_duration(&PAGER_COMMIT_PUBLISH_TIME_NS, t_publish_start);
+        let t_cache_finish_start = pager_commit_profile_start(profile_active);
+        self.drain_committed_cache_pages_into_cache();
+        self.txn_read_cache.borrow_mut().clear();
+        self.retained_memory_overlay_dirty_pages.clear();
+        self.clear_freed_pages();
+        self.clear_savepoints();
+        self.rolled_back_pages.clear();
+        self.allocated_from_freelist.clear();
+        self.allocated_from_durable_freelist.clear();
+        self.allocated_from_eof.clear();
+        self.page_lease.clear();
+        self.savepoint_quarantined_allocations.clear();
+        self.reclaimed_abandoned_reservations.clear();
+        self.reset_current_write_set_accounting();
+        self.writes_observed = false;
+        self.original_db_size = update.db_size;
+        self.published_visible_commit_seq
+            .set(update.visible_commit_seq);
+        self.published_db_size.set(update.db_size);
+        self.committed = true;
+        self.memory_commit_finalization_pending = true;
+        record_pager_commit_duration(&PAGER_COMMIT_CACHE_FINISH_TIME_NS, t_cache_finish_start);
     }
 
     fn collect_unstaged_allocated_pages(&self) -> Vec<PageNumber> {
@@ -26400,6 +26499,9 @@ where
             if self.finished {
                 return Ok(());
             }
+            if self.memory_commit_finalization_pending {
+                return self.finish_published_memory_commit(cx).await;
+            }
             self.seal_savepoints_for_commit()?;
             if self.rollback_commit_finalization_pending {
                 return self.finish_durable_rollback_commit(cx).await;
@@ -27276,6 +27378,17 @@ where
                 // still held so any later multi-connection readers inherit the
                 // committed metadata even if this commit skipped page-plane publish.
                 self.publish_committed_snapshot_from_inner(&inner);
+                if self.memory_db_bump_alloc {
+                    // The batch has replaced the in-memory backing image. Do
+                    // not suspend at external exit while rollback/Drop can
+                    // still restore old overlay bytes or re-grant live pages.
+                    self.publish_memory_release_commit(
+                        cx,
+                        publish_update,
+                        metadata_only_single_connection_fast_path,
+                        pager_commit_profile_active,
+                    );
+                }
                 let t_unlock_start = pager_commit_profile_start(pager_commit_profile_active);
                 let notify_writer_idle = coordinated_transaction_exit(
                     &self.group_commit_queue,
@@ -27288,7 +27401,9 @@ where
                 )
                 .await?;
                 drop(non_wal_exit_claim);
-                if self.rollback_commit_finalization_pending {
+                if self.rollback_commit_finalization_pending
+                    || self.memory_commit_finalization_pending
+                {
                     // External snapshot restoration and active-transaction
                     // accounting are terminal. Preserve this as a local receipt
                     // before any later fault hook can return an error.
@@ -27314,6 +27429,16 @@ where
                     publish_update.visible_commit_seq.get(),
                     publish_update.db_size,
                 )?;
+
+                if self.memory_commit_finalization_pending {
+                    // The exit lease was consumed above. This tail has no
+                    // suspension, so retry/Drop can never repeat the exit or
+                    // publish the now-empty transaction as another commit.
+                    self.memory_commit_finalization_pending = false;
+                    self.finished = true;
+                    self.scratch_arena.reset();
+                    return Ok(());
+                }
 
                 // Phase C2 (outside inner.lock): publish to the shared snapshot
                 // plane. In isolated single-connection mode, only metadata needs
@@ -27479,6 +27604,10 @@ where
             let cleanup_cx = cleanup_child_cx(cx);
             let _cleanup_mask = cleanup_cx.masked();
             let cx = &cleanup_cx;
+            if self.memory_commit_finalization_pending {
+                self.finish_published_memory_commit(cx).await?;
+                return Ok(self.pager_commit_state());
+            }
             if self.rollback_commit_finalization_pending {
                 self.finish_durable_rollback_commit(cx).await?;
                 return Ok(self.pager_commit_state());
@@ -27536,6 +27665,10 @@ where
     #[allow(clippy::await_holding_lock)]
     fn commit_and_retain<'a>(&'a mut self, cx: &'a Cx) -> impl Future<Output = Result<bool>> + 'a {
         async move {
+            if self.memory_commit_finalization_pending {
+                self.finish_published_memory_commit(cx).await?;
+                return Ok(false);
+            }
             self.seal_savepoints_for_commit()?;
             if self.rollback_commit_finalization_pending {
                 self.finish_durable_rollback_commit(cx).await?;
@@ -28168,6 +28301,7 @@ where
         self.pending_group_commit_attempt.is_some()
             || self.owned_rollback_recovery.is_some()
             || self.rollback_commit_finalization_pending
+            || self.memory_commit_finalization_pending
             || !self.write_set.is_empty()
             || !self.reclaimed_abandoned_reservations.is_empty()
             // A global repair belongs to the next actual writer. Read-only
@@ -28311,6 +28445,12 @@ where
         async move {
             if self.finished {
                 return Ok(());
+            }
+            if self.memory_commit_finalization_pending {
+                self.finish_published_memory_commit(cx).await?;
+                return Err(FrankenError::internal(
+                    "rollback could not undo a memory commit whose image was already published",
+                ));
             }
             if self.rollback_commit_finalization_pending {
                 self.finish_durable_rollback_commit(cx).await?;
@@ -28725,6 +28865,49 @@ where
             &self.group_commit_queue,
             shared_db_file_key(&self.db_file),
         ));
+        if self.memory_commit_finalization_pending {
+            if self.maintenance_lease.is_some() {
+                // Publication retired all speculative ownership before the
+                // first exit await. Transfer only the remaining exact-handle
+                // exit; ordinary Drop's allocator/overlay rollback is invalid.
+                let cleanup = DetachedTransactionExit {
+                    queue: Arc::clone(&self.group_commit_queue),
+                    inner: Arc::clone(&self.inner),
+                    db_file: Arc::clone(&self.db_file),
+                    writer_idle: Arc::clone(&self.writer_idle),
+                    cleanup_cx: self.cleanup_cx.clone(),
+                    mode: self.mode,
+                    is_writer: self.is_writer,
+                    maintenance_lease: self.maintenance_lease.take(),
+                    cache: Arc::clone(&self.cache),
+                    retained_memory_overlay: None,
+                };
+                self.group_commit_queue.enqueue_pending_logical_cleanup(
+                    PendingGroupCommitLogicalCleanup::new(
+                        drop_root_attempt.take(),
+                        Box::new(cleanup),
+                    ),
+                );
+                // An uncontended MemoryFile can finish in Drop. If the exit
+                // still suspends, dropping this owned future requeues the same
+                // receipt and process root for the next structured settle.
+                let mut cleanup = Box::pin(
+                    self.group_commit_queue
+                        .resolve_one_pending_logical_cleanup_for_handle(shared_db_file_key(
+                            &self.db_file,
+                        )),
+                );
+                let mut task_cx = std::task::Context::from_waker(std::task::Waker::noop());
+                if let std::task::Poll::Ready(Err(error)) = cleanup.as_mut().poll(&mut task_cx) {
+                    tracing::warn!(%error, "published memory commit exit remains queued for retry");
+                }
+            } else if let Some(root_attempt) = drop_root_attempt.take() {
+                root_attempt.release_after_terminal();
+            }
+            self.memory_commit_finalization_pending = false;
+            self.finished = true;
+            return;
+        }
         if self.rollback_commit_finalization_pending && self.maintenance_lease.is_none() {
             // Logical exit is already terminal, so the remaining publication
             // tail is synchronous and safe to finish in Drop. Never run
@@ -58551,6 +58734,305 @@ mod tests {
             0
         );
         assert!(!pager.group_commit_queue.has_relevant_process_root(handle_key));
+    }
+
+    #[test]
+    fn test_gh503_cancelled_memory_release_preserves_complete_commit() {
+        asupersync::test_utils::run_test(|| async {
+            for completion in ["rollback", "drop", "drop_held", "retry", "settle", "retain"] {
+                for (retained_before_release, connection_count) in
+                    [(false, 1), (true, 1), (false, 2), (true, 2)]
+                {
+                    let case = format!(
+                        "{completion}/retained={retained_before_release}/connections={connection_count}"
+                    );
+                    let pager = private_memory_pager().await;
+                    let shared_connection_count = Arc::new(AtomicUsize::new(1));
+                    pager.bind_shared_connection_count(Arc::clone(&shared_connection_count));
+                    let cx = Cx::new();
+                    let old_first = sample_page(0x31);
+                    let old_second = sample_page(0x32);
+                    let (first, second, reusable) = {
+                        let mut seed = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                        let first = seed.allocate_page(&cx).await.unwrap();
+                        let second = seed.allocate_page(&cx).await.unwrap();
+                        let reusable = seed.allocate_page(&cx).await.unwrap();
+                        seed.write_page(&cx, first, &old_first).await.unwrap();
+                        seed.write_page(&cx, second, &old_second).await.unwrap();
+                        seed.write_page(&cx, reusable, &sample_page(0x33))
+                            .await
+                            .unwrap();
+                        seed.commit(&cx).await.unwrap();
+                        (first, second, reusable)
+                    };
+                    {
+                        let mut freeing =
+                            pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                        freeing.free_page(&cx, reusable).unwrap();
+                        freeing.commit(&cx).await.unwrap();
+                    }
+                    let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                    assert!(txn.live_freelist_pages().contains(&reusable), "case={case}");
+                    if retained_before_release {
+                        txn.write_page(&cx, first, &sample_page(0x41))
+                            .await
+                            .unwrap();
+                        assert!(txn.commit_and_retain(&cx).await.unwrap(), "case={case}");
+                        assert!(
+                            txn.retained_memory_overlay_dirty_pages.contains(&first),
+                            "case={case} requires an acknowledged deferred image"
+                        );
+                        assert_gh503_memory_backing_page(&pager, &cx, first, &old_first).await;
+                    }
+                    shared_connection_count.store(connection_count, AtomicOrdering::Release);
+                    let previous_commit_seq = pager.published_snapshot().visible_commit_seq;
+                    let expected_commit_seq = previous_commit_seq.next();
+                    let committed_first = sample_page(0x51);
+                    let committed_second = sample_page(0x52);
+                    let committed_reused = sample_page(0x53);
+                    let committed_eof = sample_page(0x54);
+                    txn.write_page(&cx, first, &committed_first).await.unwrap();
+                    txn.write_page(&cx, second, &committed_second)
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        txn.allocate_page(&cx).await.unwrap(),
+                        reusable,
+                        "case={case}"
+                    );
+                    txn.write_page(&cx, reusable, &committed_reused)
+                        .await
+                        .unwrap();
+                    let eof = txn.allocate_page(&cx).await.unwrap();
+                    assert!(eof > reusable, "case={case}");
+                    txn.write_page(&cx, eof, &committed_eof).await.unwrap();
+
+                    // A shared guard admits MemoryFile's atomic batch write but
+                    // holds the exclusive restoration at transaction exit. This
+                    // suspends the real commit after all bytes and its sequence
+                    // have advanced, without a fault hook or a timing race.
+                    let db_file = Arc::clone(&txn.db_file);
+                    let handle_key = shared_db_file_key(&db_file);
+                    let mut held_read = Some(shared_db_file_read(&db_file, &cx).await.unwrap());
+                    let mut commit = Box::pin(txn.commit(&cx));
+                    let mut task_cx = std::task::Context::from_waker(std::task::Waker::noop());
+                    assert!(
+                        commit.as_mut().poll(&mut task_cx).is_pending(),
+                        "case={case}"
+                    );
+                    // The suspended future owns PagerInner: release that guard
+                    // before checking the exact point reached by the commit.
+                    drop(commit);
+                    {
+                        let inner = pager.inner.lock().unwrap();
+                        assert_eq!(inner.commit_seq, expected_commit_seq, "case={case}");
+                        assert_eq!(inner.db_size, eof.get(), "case={case}");
+                        assert_eq!(inner.active_transactions, 1, "case={case}");
+                        assert!(inner.writer_active, "case={case}");
+                    }
+                    if completion != "drop_held" {
+                        drop(held_read.take());
+                    }
+                    for (page, expected) in [
+                        (first, &committed_first),
+                        (second, &committed_second),
+                        (reusable, &committed_reused),
+                        (eof, &committed_eof),
+                    ] {
+                        assert_gh503_memory_backing_page(&pager, &cx, page, expected).await;
+                    }
+
+                    let rollback_result = match completion {
+                        "rollback" => {
+                            let result = txn.rollback(&cx).await;
+                            drop(txn);
+                            Some(result)
+                        }
+                        "drop" | "drop_held" => {
+                            drop(txn);
+                            None
+                        }
+                        "retry" => {
+                            txn.commit(&cx).await.unwrap();
+                            drop(txn);
+                            None
+                        }
+                        "settle" => {
+                            assert_eq!(
+                                txn.settle_commit(&cx).await.unwrap(),
+                                crate::traits::PagerCommitState::Committed,
+                                "case={case} settlement must finish the decided commit"
+                            );
+                            drop(txn);
+                            None
+                        }
+                        "retain" => {
+                            assert!(!txn.commit_and_retain(&cx).await.unwrap(), "case={case}");
+                            drop(txn);
+                            None
+                        }
+                        _ => unreachable!(),
+                    };
+                    if held_read.is_some() {
+                        assert!(
+                            pager
+                                .group_commit_queue
+                                .has_relevant_process_root(handle_key)
+                        );
+                        let mut settlement =
+                            Box::pin(settle_pending_group_commit_finalization_for_handle(
+                                &pager.group_commit_queue,
+                                handle_key,
+                            ));
+                        assert!(settlement.as_mut().poll(&mut task_cx).is_pending());
+                        drop(settlement);
+                        assert!(
+                            pager
+                                .group_commit_queue
+                                .has_relevant_process_root(handle_key)
+                        );
+                        drop(held_read.take());
+                    }
+                    settle_pending_group_commit_finalization_for_handle(
+                        &pager.group_commit_queue,
+                        handle_key,
+                    )
+                    .await
+                    .unwrap();
+                    {
+                        let inner = pager.inner.lock().unwrap();
+                        assert_eq!(inner.commit_seq, expected_commit_seq, "case={case}");
+                        assert_eq!(
+                            inner.db_size,
+                            eof.get(),
+                            "case={case} cleanup must not rewind an already committed extent"
+                        );
+                        assert_eq!(inner.active_transactions, 0, "case={case}");
+                        assert!(!inner.writer_active, "case={case}");
+                        assert!(!inner.freelist.contains(&reusable), "case={case}");
+                        assert!(!inner.freelist.contains(&eof), "case={case}");
+                    }
+                    assert_eq!(
+                        pager.published_snapshot().visible_commit_seq,
+                        expected_commit_seq,
+                        "case={case} cleanup must publish the decided commit exactly once"
+                    );
+                    assert_eq!(pager.published_snapshot().db_size, eof.get(), "case={case}");
+                    assert_retained_memory_drop_complete(&pager, expected_commit_seq);
+                    let mut reader = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+                    for (page, expected) in [
+                        (first, &committed_first),
+                        (second, &committed_second),
+                        (reusable, &committed_reused),
+                        (eof, &committed_eof),
+                    ] {
+                        assert_gh503_memory_backing_page(&pager, &cx, page, expected).await;
+                        assert_gh503_shared_cache_page_is_current(&pager, page, expected);
+                        assert_eq!(
+                            reader.get_page(&cx, page).await.unwrap().as_bytes(),
+                            expected.as_slice(),
+                            "case={case} page={page} cleanup must preserve one complete commit"
+                        );
+                        assert!(!reader.live_freelist_pages().contains(&page), "case={case}");
+                    }
+                    let page_one = reader.get_page(&cx, PageNumber::ONE).await.unwrap();
+                    assert_eq!(
+                        u32::from_be_bytes(page_one.as_bytes()[28..32].try_into().unwrap()),
+                        eof.get(),
+                        "case={case} header extent must agree with the committed page owners"
+                    );
+                    assert_eq!(
+                        u32::from_be_bytes(page_one.as_bytes()[36..40].try_into().unwrap()),
+                        0,
+                        "case={case} the reused page is now live, not a freelist owner"
+                    );
+                    reader.rollback(&cx).await.unwrap();
+                    if let Some(result) = rollback_result {
+                        assert!(
+                            result.is_err(),
+                            "case={case} rollback must report that the commit decision already won"
+                        );
+                    }
+                    let mut next = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                    assert_eq!(
+                        next.allocate_page(&cx).await.unwrap().get(),
+                        eof.get() + 1,
+                        "case={case} later allocation must not re-grant a committed live page"
+                    );
+                    next.rollback(&cx).await.unwrap();
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn test_gh503_memory_release_phase_c_error_finishes_exit_once() {
+        asupersync::test_utils::run_test(|| async {
+            let _guard = FAULT_HOOK_TEST_GUARD
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for completion in ["rollback", "drop", "retry", "settle", "retain"] {
+                crate::fault_hooks::clear();
+                let pager = private_memory_pager().await;
+                pager.bind_shared_connection_count(Arc::new(AtomicUsize::new(1)));
+                let cx = Cx::new();
+                let previous_commit_seq = pager.published_snapshot().visible_commit_seq;
+                let expected_commit_seq = previous_commit_seq.next();
+                let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                let page = txn.allocate_page(&cx).await.unwrap();
+                let expected = sample_page(0x75);
+                txn.write_page(&cx, page, &expected).await.unwrap();
+                crate::fault_hooks::arm_during_phase_c(crate::fault_hooks::FaultHookArm::new(
+                    format!("gh503-memory-phase-c-{completion}"),
+                    completion,
+                    "published_memory_commit_exit",
+                ));
+                let error = txn.commit(&cx).await.expect_err("Phase C hook must fire");
+                assert!(error.to_string().contains("fault_inject:during_phase_c"));
+                assert!(txn.memory_commit_finalization_pending);
+                assert!(txn.maintenance_lease.is_none());
+                assert_eq!(
+                    txn.pager_commit_state(),
+                    crate::traits::PagerCommitState::DurableNeedsPublication
+                );
+                crate::fault_hooks::clear();
+
+                // Publication and exit already completed. A new reader can
+                // observe the complete decision before the original owner is
+                // settled; cleanup must not decrement this reader's lease.
+                let mut reader = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+                assert_eq!(
+                    reader.get_page(&cx, page).await.unwrap().as_bytes(),
+                    expected
+                );
+                match completion {
+                    "rollback" => assert!(txn.rollback(&cx).await.is_err()),
+                    "drop" => {}
+                    "retry" => txn.commit(&cx).await.unwrap(),
+                    "settle" => assert_eq!(
+                        txn.settle_commit(&cx).await.unwrap(),
+                        crate::traits::PagerCommitState::Committed
+                    ),
+                    "retain" => assert!(!txn.commit_and_retain(&cx).await.unwrap()),
+                    _ => unreachable!(),
+                }
+                drop(txn);
+                {
+                    let inner = pager.inner.lock().unwrap();
+                    assert_eq!(inner.commit_seq, expected_commit_seq);
+                    assert_eq!(inner.active_transactions, 1);
+                    assert_eq!(inner.db_size, page.get());
+                    assert!(!inner.freelist.contains(&page));
+                }
+                assert_gh503_memory_backing_page(&pager, &cx, page, &expected).await;
+                assert_eq!(
+                    reader.get_page(&cx, page).await.unwrap().as_bytes(),
+                    expected
+                );
+                reader.rollback(&cx).await.unwrap();
+                assert_retained_memory_drop_complete(&pager, expected_commit_seq);
+            }
+        });
     }
 
     #[test]
