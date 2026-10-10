@@ -1,0 +1,55 @@
+{
+  "issue": "https://github.com/Dicklesworthstone/frankensqlite/issues/503",
+  "review_date_utc": "2026-10-10",
+  "candidate_parent_commit": "2db2ec2c58769ca7a6a958036f658bd3dd92998f",
+  "status": "Committed-page lifetime repairs and deterministic pager regressions; independently reviewed source, runtime qualification still pending",
+  "scope": [
+    "The parent commit pins bitmap-owned committed images during free/forget while evicting ordinary cached images.",
+    "Dropping a retained private-memory transaction transfers its committed overlay into exact-handle cleanup, independently of speculative writes.",
+    "Cleanup retains the same payload and process-root identity across partial write failures and cancellation.",
+    "Complete materialization and shared-cache eviction precede writer/count release under the pager inner lock; no additional commit sequence is published.",
+    "One immediate resolver poll completes ordinary MemoryVfs destruction without leaving the last private pager rooted. Failed or contended cleanup remains queued for retry."
+  ],
+  "source_blobs": {
+    "crates/fsqlite-pager/src/pager.rs": "5b296a84d5aaef4085481791d5e8ff98f3e9c978",
+    "crates/fsqlite-core/tests/memory_page_reuse_and_attached_release_oracle.rs": "713d894c71644bfe1680e731c01f7fa77bba426c"
+  },
+  "pager_source_utf8_bytes": 2816405,
+  "added_tests": [
+    "test_gh503_retained_overlay_drop_preserves_committed_pages",
+    "test_gh503_retained_overlay_drop_releases_last_private_pager",
+    "test_gh503_retained_overlay_drop_partial_flush_keeps_owned_retry",
+    "test_gh503_retained_overlay_drop_cancelled_settlement_requeues_same_owner"
+  ],
+  "parent_added_test": "test_gh503_retained_overlay_forget_preserves_rollback_and_freelist_reuse",
+  "static_verification": {
+    "source_review": "Two independent reviewers and the integrating author reviewed ownership, Rust types and borrows, exact-handle cleanup, failure injection, cancellation, and last-owner lifetime. No remaining source-level defect was found in the final blocks. This is not compiler or runtime proof.",
+    "patch_anchors": "Each original replacement anchor and test insertion anchor matched exactly once.",
+    "unchanged_source": "The candidate was reconstructed from non-overlapping replacements; unrelated parent source and the parent pinning regression were preserved.",
+    "shared_flush_helper": "The prior rollback flush implementation was verified identical after relocation, dedentation, and generic parameter substitution.",
+    "whitespace": "No trailing whitespace was introduced in the changed source blocks. This is an in-memory text check, not git diff --check or rustfmt.",
+    "source_integrity": "The implementing reviewer and integrating author independently reproduced the baseline and parent Git blob hashes, then matched the final candidate hash. GitHub create_blob returned the same final source hash.",
+    "formatter": "Not run on these new changes: execution environment unavailable.",
+    "ubs": "Not run on pager.rs, as required by the repository's large-file scan exclusion. The unchanged smaller oracle file's completed scan remains recorded in rollback_verification.json."
+  },
+  "runtime_qualification": {
+    "candidate_rust_test_bodies_executed": false,
+    "candidate_compiled": false,
+    "runtime_repair_verified": false,
+    "blocker": "The executor reported environment_offline (Environment is not connected). A later bounded read-only retry did not complete and was terminated. No new compiler or test job was launched.",
+    "resource_holds": "Existing disk-capacity and compiler-memory limits were respected; no destructive cleanup or runtime-feature relaxation was performed.",
+    "github_actions": "No workflows were enabled or manually dispatched; the repository execution hold remains in force.",
+    "earlier_evidence": "artifacts/gh503/verification.json and artifacts/gh503/rollback_verification.json retain the released-version reproduction, stock controls, and prior qualification results. Those results do not constitute execution of the newly added pager tests."
+  },
+  "remaining_qualification": [
+    "Run current-source red/green checks for the reported SQL sequence and all five new pager lifetime regressions.",
+    "cargo +nightly-2026-08-31 test --locked -p fsqlite-pager --lib test_gh503_",
+    "cargo +nightly-2026-08-31 test --locked -p fsqlite-pager --lib test_memory_retained_freelist_commit_survives_",
+    "cargo +nightly-2026-08-31 test --locked -p fsqlite-core --test memory_page_reuse_and_attached_release_oracle",
+    "cargo +nightly-2026-08-31 test --locked -p fsqlite-core --test gh494_memory_commit_scaling gh503_",
+    "Complete the required workspace check, Clippy, and applicable formatting checks with nightly-2026-08-31 under the existing execution and capacity holds.",
+    "Run migration_v21_adds_covering_context_index_without_changing_archive_rows in coding_agent_session_search on Linux, macOS, and Windows when authorized execution capacity is available."
+  ],
+  "suspect_commit_causation_bisected": false,
+  "performance_measured": false
+}

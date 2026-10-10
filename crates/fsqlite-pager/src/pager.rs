@@ -9208,6 +9208,39 @@ impl<F: VfsFile + 'static> PendingGroupCommitLogicalCleanupOperation
     }
 }
 
+/// Committed private-memory images that must outlive an abandoned retained owner.
+/// The bitmap selects committed images; current speculative writes are never moved.
+struct RetainedMemoryOverlay {
+    page_nos: BTreeSet<PageNumber>,
+    pages: PagePageMap<PageData>,
+    committed_db_size: u32,
+}
+
+async fn flush_retained_memory_overlay_pages_to_db_file<F: VfsFile>(
+    cx: &Cx,
+    inner: &mut PagerInner<F>,
+    original_db_size: u32,
+    overlay_pages: &[(PageNumber, PageData)],
+) -> Result<()> {
+    if overlay_pages.is_empty() {
+        return Ok(());
+    }
+    let page_size_bytes = u64::from(inner.page_size.get());
+    let mut batched_writes: SmallVec<[(u64, &[u8]); 8]> =
+        SmallVec::with_capacity(overlay_pages.len());
+    for (page_no, page) in overlay_pages {
+        let offset = u64::from(page_no.get() - 1) * page_size_bytes;
+        batched_writes.push((offset, page.as_bytes()));
+    }
+    let db_file = shared_db_file_read(&inner.db_file, cx).await?;
+    db_file
+        .write_page_batch(cx, batched_writes.as_slice())
+        .await?;
+    inner.committed_db_file_size_bytes =
+        u64::from(original_db_size) * u64::from(inner.page_size.get());
+    Ok(())
+}
+
 struct DetachedTransactionExit<F: VfsFile + 'static> {
     queue: Arc<GroupCommitQueue>,
     inner: Arc<Mutex<PagerInner<F>>>,
@@ -9218,6 +9251,8 @@ struct DetachedTransactionExit<F: VfsFile + 'static> {
     mode: TransactionMode,
     is_writer: bool,
     maintenance_lease: Option<PagerMaintenanceLease>,
+    cache: Arc<ShardedPageCache>,
+    retained_memory_overlay: Option<RetainedMemoryOverlay>,
 }
 
 impl<F: VfsFile + 'static> PendingGroupCommitLogicalCleanupOperation
@@ -9245,6 +9280,37 @@ impl<F: VfsFile + 'static> PendingGroupCommitLogicalCleanupOperation
                     error.into_inner()
                 }
             };
+            if let Some(overlay) = &self.retained_memory_overlay {
+                let pages = overlay
+                    .page_nos
+                    .iter()
+                    .copied()
+                    .map(|page_no| {
+                        let page = overlay.pages.get(&page_no).cloned().ok_or_else(|| {
+                            FrankenError::internal(format!(
+                                "retained memory overlay missing authoritative page {}",
+                                page_no.get()
+                            ))
+                        })?;
+                        Ok((page_no, page))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                flush_retained_memory_overlay_pages_to_db_file(
+                    &self.cleanup_cx,
+                    &mut inner,
+                    overlay.committed_db_size,
+                    &pages,
+                )
+                .await?;
+                for (page_no, _) in &pages {
+                    self.cache.evict(*page_no);
+                }
+                // An error or cancelled flush keeps the same owned payload in
+                // the queued receipt. Once materialized, later exit retries
+                // need only finish accounting; these commits must not advance
+                // the sequence or write speculative transaction pages.
+                self.retained_memory_overlay = None;
+            }
             let releases_writer_baton = self.is_writer && self.mode != TransactionMode::Concurrent;
             let notify_writer_idle = coordinated_transaction_exit(
                 &self.queue,
@@ -22436,31 +22502,6 @@ where
             .collect::<Result<Vec<_>>>()
     }
 
-    async fn flush_retained_memory_overlay_pages_to_db_file(
-        cx: &Cx,
-        inner: &mut PagerInner<V::File>,
-        original_db_size: u32,
-        overlay_pages: &[(PageNumber, PageData)],
-    ) -> Result<()> {
-        if overlay_pages.is_empty() {
-            return Ok(());
-        }
-        let page_size_bytes = u64::from(inner.page_size.get());
-        let mut batched_writes: SmallVec<[(u64, &[u8]); 8]> =
-            SmallVec::with_capacity(overlay_pages.len());
-        for (page_no, page) in overlay_pages {
-            let offset = u64::from(page_no.get() - 1) * page_size_bytes;
-            batched_writes.push((offset, page.as_bytes()));
-        }
-        let db_file = shared_db_file_read(&inner.db_file, cx).await?;
-        db_file
-            .write_page_batch(cx, batched_writes.as_slice())
-            .await?;
-        inner.committed_db_file_size_bytes =
-            u64::from(original_db_size) * u64::from(inner.page_size.get());
-        Ok(())
-    }
-
     fn retain_committed_pages_in_txn_read_cache(&mut self, invalidate_prior_snapshot: bool) {
         let mut txn_read_cache = self.txn_read_cache.borrow_mut();
         if invalidate_prior_snapshot {
@@ -28335,7 +28376,7 @@ where
                     .inner
                     .lock()
                     .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
-                Self::flush_retained_memory_overlay_pages_to_db_file(
+                flush_retained_memory_overlay_pages_to_db_file(
                     &cleanup_cx,
                     &mut inner,
                     self.original_db_size,
@@ -28845,12 +28886,22 @@ where
             }
         }
 
+        let retained_memory_overlay =
+            (!self.retained_memory_overlay_dirty_pages.is_empty()).then(|| RetainedMemoryOverlay {
+                page_nos: std::mem::take(&mut self.retained_memory_overlay_dirty_pages),
+                pages: std::mem::take(self.txn_read_cache.get_mut()),
+                committed_db_size: self.original_db_size,
+            });
         let logical_exit_claim = GroupCommitLogicalExitClaim::try_register(
             &self.group_commit_queue,
             shared_db_file_key(&self.db_file),
         );
         let mut defer_transaction_exit = logical_exit_claim.is_none();
-        if logical_exit_claim.is_none() {
+        if retained_memory_overlay.is_some() {
+            // Keep writer/accounting ownership until the acknowledged bytes
+            // are materialized by the existing async cleanup queue.
+            defer_transaction_exit = true;
+        } else if logical_exit_claim.is_none() {
             tracing::warn!(
                 "drop-time transaction exit was queued behind a live physical or logical external-lock owner"
             );
@@ -28951,6 +29002,7 @@ where
                     }
                 }
             } else {
+                let try_memory_overlay_cleanup = retained_memory_overlay.is_some();
                 let cleanup = DetachedTransactionExit {
                     queue: Arc::clone(&self.group_commit_queue),
                     inner: Arc::clone(&self.inner),
@@ -28960,6 +29012,8 @@ where
                     mode: self.mode,
                     is_writer: self.is_writer,
                     maintenance_lease: self.maintenance_lease.take(),
+                    cache: Arc::clone(&self.cache),
+                    retained_memory_overlay,
                 };
                 self.group_commit_queue.enqueue_pending_logical_cleanup(
                     PendingGroupCommitLogicalCleanup::new(
@@ -28967,6 +29021,31 @@ where
                         Box::new(cleanup),
                     ),
                 );
+                if try_memory_overlay_cleanup {
+                    // An uncontended MemoryFile completes immediately. Give
+                    // this exact cleanup one poll so dropping the last private
+                    // pager does not leave a root that only a future begin
+                    // could settle. Pending or failed work stays owned by the
+                    // same queued receipt; Drop never waits or runs a runtime.
+                    let mut cleanup = Box::pin(
+                        self.group_commit_queue
+                            .resolve_one_pending_logical_cleanup_for_handle(
+                                shared_db_file_key(&self.db_file),
+                            ),
+                    );
+                    let mut task_cx =
+                        std::task::Context::from_waker(std::task::Waker::noop());
+                    if let std::task::Poll::Ready(Err(error)) =
+                        cleanup.as_mut().poll(&mut task_cx)
+                    {
+                        tracing::warn!(
+                            %error,
+                            "drop-time retained memory overlay flush remains queued for retry"
+                        );
+                    }
+                    // The owned future is dropped at this block's end before
+                    // any later Drop work can observe its requeued receipt.
+                }
             }
         } else {
             direct_cleanup_terminal = true;
@@ -58383,8 +58462,8 @@ mod tests {
         });
     }
 
-    async fn assert_gh503_memory_backing_page(
-        pager: &SimplePager<MemoryVfs>,
+    async fn assert_gh503_memory_backing_page<V: Vfs>(
+        pager: &SimplePager<V>,
         cx: &Cx,
         page_no: PageNumber,
         expected: &[u8],
@@ -58404,8 +58483,8 @@ mod tests {
         );
     }
 
-    fn assert_gh503_shared_cache_page_is_current(
-        pager: &SimplePager<MemoryVfs>,
+    fn assert_gh503_shared_cache_page_is_current<V: Vfs>(
+        pager: &SimplePager<V>,
         page_no: PageNumber,
         expected: &[u8],
     ) {
@@ -58416,6 +58495,329 @@ mod tests {
                 "issue=503 case=published_page_has_no_stale_fallback page={page_no}"
             );
         }
+    }
+
+    fn retained_memory_drop_receipt<V: Vfs>(
+        pager: &SimplePager<V>,
+        committed_seq: CommitSeq,
+    ) -> (u64, u64) {
+        let inner = pager.inner.lock().unwrap();
+        let handle_key = shared_db_file_key(&inner.db_file);
+        assert_eq!(inner.active_transactions, 1);
+        assert!(inner.writer_active);
+        assert_eq!(inner.commit_seq, committed_seq);
+        drop(inner);
+        let queue = &pager.group_commit_queue;
+        assert_eq!(queue.pending_logical_cleanup_count_for_handle(handle_key), 1);
+        assert!(queue.has_relevant_process_root(handle_key));
+        let pending = queue.pending_logical_cleanups.lock().unwrap();
+        let cleanup = pending
+            .iter()
+            .find(|cleanup| cleanup.operation.handle_key() == handle_key)
+            .expect("retained overlay has an exact-handle cleanup");
+        assert!(matches!(
+            cleanup.scope,
+            ProcessRootFinalizationScope::ExactHandle(key) if key == handle_key
+        ));
+        (
+            cleanup.sequence.expect("queued cleanup has a stable sequence"),
+            cleanup
+                .root_attempt
+                .as_ref()
+                .expect("committed overlay retains its process root")
+                .attempt_id,
+        )
+    }
+
+    fn assert_retained_memory_drop_complete<V: Vfs>(
+        pager: &SimplePager<V>,
+        committed_seq: CommitSeq,
+    ) {
+        let inner = pager.inner.lock().unwrap();
+        let handle_key = shared_db_file_key(&inner.db_file);
+        assert_eq!(inner.active_transactions, 0);
+        assert!(!inner.writer_active);
+        assert_eq!(inner.commit_seq, committed_seq);
+        drop(inner);
+        assert_eq!(
+            pager
+                .group_commit_queue
+                .pending_logical_cleanup_count_for_handle(handle_key),
+            0
+        );
+        assert!(!pager.group_commit_queue.has_relevant_process_root(handle_key));
+    }
+
+    #[test]
+    fn test_gh503_retained_overlay_drop_preserves_committed_pages() {
+        asupersync::test_utils::run_test(|| async {
+            for speculative in [false, true] {
+                let pager = private_memory_pager().await;
+                pager.bind_shared_connection_count(Arc::new(AtomicUsize::new(1)));
+                let cx = Cx::new();
+                let old = sample_page(0x51);
+                let committed = sample_page(0x53);
+                let page = {
+                    let mut seed = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                    let page = seed.allocate_page(&cx).await.unwrap();
+                    seed.write_page(&cx, page, &old).await.unwrap();
+                    seed.commit(&cx).await.unwrap();
+                    page
+                };
+                let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                txn.write_page(&cx, page, &sample_page(0x52)).await.unwrap();
+                assert!(txn.commit_and_retain(&cx).await.unwrap());
+                txn.write_page(&cx, page, &committed).await.unwrap();
+                assert!(txn.commit_and_retain(&cx).await.unwrap());
+                assert!(txn.retained_memory_overlay_dirty_pages.contains(&page));
+                assert_eq!(pager.published_snapshot().page_set_size, 0);
+                assert_gh503_memory_backing_page(&pager, &cx, page, &old).await;
+                let committed_seq = pager.published_snapshot().visible_commit_seq;
+                let abandoned = if speculative {
+                    txn.write_page(&cx, page, &sample_page(0xE3)).await.unwrap();
+                    let abandoned = txn.allocate_page(&cx).await.unwrap();
+                    txn.write_page(&cx, abandoned, &sample_page(0xE4))
+                        .await
+                        .unwrap();
+                    Some(abandoned)
+                } else {
+                    None
+                };
+                let handle_key = shared_db_file_key(&txn.db_file);
+                drop(txn);
+                // Uncontended private-memory cleanup finishes in Drop's one
+                // readiness poll, including publication-cache invalidation.
+                assert_retained_memory_drop_complete(&pager, committed_seq);
+                assert_gh503_memory_backing_page(&pager, &cx, page, &committed).await;
+                assert_gh503_shared_cache_page_is_current(&pager, page, &committed);
+                // A second settlement must not decrement ownership or commit twice.
+                settle_pending_group_commit_finalization_for_handle(
+                    &pager.group_commit_queue,
+                    handle_key,
+                )
+                .await
+                .unwrap();
+                assert_retained_memory_drop_complete(&pager, committed_seq);
+                let mut reader = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+                assert_eq!(
+                    reader.get_page(&cx, page).await.unwrap().as_bytes(),
+                    committed.as_slice()
+                );
+                reader.rollback(&cx).await.unwrap();
+                let mut next = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                let reused = next.allocate_page(&cx).await.unwrap();
+                assert_ne!(reused, page);
+                if let Some(abandoned) = abandoned {
+                    assert_eq!(reused, abandoned);
+                }
+                next.write_page(&cx, reused, &sample_page(0x71))
+                    .await
+                    .unwrap();
+                next.commit(&cx).await.unwrap();
+                let mut reader = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+                assert_eq!(
+                    reader.get_page(&cx, page).await.unwrap().as_bytes(),
+                    committed.as_slice()
+                );
+                assert!(!reader.live_freelist_pages().contains(&page));
+                reader.rollback(&cx).await.unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn test_gh503_retained_overlay_drop_releases_last_private_pager() {
+        asupersync::test_utils::run_test(|| async {
+            let (weak_inner, weak_db_file) = {
+                let pager = private_memory_pager().await;
+                pager.bind_shared_connection_count(Arc::new(AtomicUsize::new(1)));
+                let weak_inner = Arc::downgrade(&pager.inner);
+                let weak_db_file = {
+                    let inner = pager.inner.lock().unwrap();
+                    Arc::downgrade(&inner.db_file)
+                };
+                let cx = Cx::new();
+                let page = {
+                    let mut seed = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                    let page = seed.allocate_page(&cx).await.unwrap();
+                    seed.write_page(&cx, page, &sample_page(0x21)).await.unwrap();
+                    seed.commit(&cx).await.unwrap();
+                    page
+                };
+                let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                txn.write_page(&cx, page, &sample_page(0x22)).await.unwrap();
+                assert!(txn.commit_and_retain(&cx).await.unwrap());
+                assert!(txn.retained_memory_overlay_dirty_pages.contains(&page));
+                let committed_seq = pager.published_snapshot().visible_commit_seq;
+                drop(txn);
+                assert_retained_memory_drop_complete(&pager, committed_seq);
+                // No subsequent begin or explicit settlement rescues this
+                // private handle: dropping the pager must release it normally.
+                (weak_inner, weak_db_file)
+            };
+            assert!(weak_inner.upgrade().is_none());
+            assert!(weak_db_file.upgrade().is_none());
+        });
+    }
+
+    #[test]
+    fn test_gh503_retained_overlay_drop_partial_flush_keeps_owned_retry() {
+        asupersync::test_utils::run_test(|| async {
+            let path = PathBuf::from("/:memory:");
+            let vfs = DbWriteFailOnceVfs::new(path.clone());
+            // Keep this fixture's memory fast path enabled.
+            let pager = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT)
+                .await
+                .unwrap();
+            pager.bind_shared_connection_count(Arc::new(AtomicUsize::new(1)));
+            let cx = Cx::new();
+            let old = [sample_page(0x31), sample_page(0x32)];
+            let committed = [sample_page(0x61), sample_page(0x62)];
+            let pages = {
+                let mut seed = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                let first = seed.allocate_page(&cx).await.unwrap();
+                let second = seed.allocate_page(&cx).await.unwrap();
+                for (page, bytes) in [first, second].into_iter().zip(&old) {
+                    seed.write_page(&cx, page, bytes).await.unwrap();
+                }
+                seed.commit(&cx).await.unwrap();
+                [first, second]
+            };
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            for (page, bytes) in pages.into_iter().zip(&committed) {
+                txn.write_page(&cx, page, bytes).await.unwrap();
+            }
+            assert!(txn.commit_and_retain(&cx).await.unwrap());
+            assert_eq!(txn.retained_memory_overlay_dirty_pages.len(), 2);
+            assert_eq!(pager.published_snapshot().page_set_size, 0);
+            let committed_seq = pager.published_snapshot().visible_commit_seq;
+            let handle_key = shared_db_file_key(&txn.db_file);
+            txn.write_page(&cx, pages[0], &sample_page(0xE1))
+                .await
+                .unwrap();
+            let abandoned = txn.allocate_page(&cx).await.unwrap();
+            txn.write_page(&cx, abandoned, &sample_page(0xE2))
+                .await
+                .unwrap();
+            vfs.arm_after_db_writes(1);
+            drop(txn);
+            let receipt = retained_memory_drop_receipt(&pager, committed_seq);
+            let offsets = pages.map(|page| {
+                u64::from(page.get() - 1) * u64::from(PageSize::DEFAULT.get())
+            });
+            // Drop's one readiness poll consumes this one-shot partial fault.
+            assert_eq!(
+                vfs.db_write_fault_observation(),
+                (vec![offsets[0]], Some(offsets[1]))
+            );
+            assert_gh503_memory_backing_page(&pager, &cx, pages[0], &committed[0]).await;
+            assert_gh503_memory_backing_page(&pager, &cx, pages[1], &old[1]).await;
+            // A separate retry failure must also refuse a new transaction
+            // without consuming the queued payload or changing its root.
+            vfs.arm_after_db_writes(0);
+            let error = match pager.begin(&cx, TransactionMode::ReadOnly).await {
+                Err(error) => error,
+                Ok(_) => panic!("failed committed-overlay flush must refuse admission"),
+            };
+            assert!(error.to_string().contains("simulated main-db write failure"));
+            assert_eq!(vfs.db_write_fault_observation(), (vec![], Some(offsets[0])));
+            assert_eq!(retained_memory_drop_receipt(&pager, committed_seq), receipt);
+            settle_pending_group_commit_finalization_for_handle(
+                &pager.group_commit_queue,
+                handle_key,
+            )
+            .await
+            .unwrap();
+            assert_retained_memory_drop_complete(&pager, committed_seq);
+            for (page, bytes) in pages.into_iter().zip(&committed) {
+                assert_gh503_memory_backing_page(&pager, &cx, page, bytes).await;
+                assert_gh503_shared_cache_page_is_current(&pager, page, bytes);
+            }
+            let mut reader = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            for (page, bytes) in pages.into_iter().zip(&committed) {
+                assert_eq!(reader.get_page(&cx, page).await.unwrap().as_bytes(), bytes.as_slice());
+            }
+            reader.rollback(&cx).await.unwrap();
+            let mut next = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            assert_eq!(next.allocate_page(&cx).await.unwrap(), abandoned);
+            next.rollback(&cx).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_gh503_retained_overlay_drop_cancelled_settlement_requeues_same_owner() {
+        asupersync::test_utils::run_test(|| async {
+            let pager = private_memory_pager().await;
+            pager.bind_shared_connection_count(Arc::new(AtomicUsize::new(1)));
+            let cx = Cx::new();
+            let old = sample_page(0x41);
+            let committed = sample_page(0x42);
+            let page = {
+                let mut seed = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                let page = seed.allocate_page(&cx).await.unwrap();
+                seed.write_page(&cx, page, &old).await.unwrap();
+                seed.commit(&cx).await.unwrap();
+                page
+            };
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            txn.write_page(&cx, page, &committed).await.unwrap();
+            assert!(txn.commit_and_retain(&cx).await.unwrap());
+            assert!(txn.retained_memory_overlay_dirty_pages.contains(&page));
+            let committed_seq = pager.published_snapshot().visible_commit_seq;
+            let db_file = Arc::clone(&txn.db_file);
+            let handle_key = shared_db_file_key(&db_file);
+            let blocker = shared_db_file_write(&db_file, &cx).await.unwrap();
+            drop(txn);
+            let receipt = retained_memory_drop_receipt(&pager, committed_seq);
+            let mut settlement = Box::pin(settle_pending_group_commit_finalization_for_handle(
+                &pager.group_commit_queue,
+                handle_key,
+            ));
+            std::future::poll_fn(|poll_cx| {
+                match std::future::Future::poll(settlement.as_mut(), poll_cx) {
+                    std::task::Poll::Pending => std::task::Poll::Ready(()),
+                    std::task::Poll::Ready(result) => {
+                        panic!("held database-file guard must suspend materialization: {result:?}")
+                    }
+                }
+            })
+            .await;
+            assert_eq!(
+                pager
+                    .group_commit_queue
+                    .pending_logical_cleanup_count_for_handle(handle_key),
+                0,
+                "the suspended future must own the claimed cleanup"
+            );
+            assert!(pager.group_commit_queue.has_relevant_process_root(handle_key));
+            // The suspended cleanup holds inner; drop it before inspecting
+            // accounting, then verify its exact queue sequence and root survive.
+            drop(settlement);
+            assert_eq!(retained_memory_drop_receipt(&pager, committed_seq), receipt);
+            drop(blocker);
+            assert_gh503_memory_backing_page(&pager, &cx, page, &old).await;
+            settle_pending_group_commit_finalization_for_handle(
+                &pager.group_commit_queue,
+                handle_key,
+            )
+            .await
+            .unwrap();
+            assert_retained_memory_drop_complete(&pager, committed_seq);
+            assert_gh503_memory_backing_page(&pager, &cx, page, &committed).await;
+            settle_pending_group_commit_finalization_for_handle(
+                &pager.group_commit_queue,
+                handle_key,
+            )
+            .await
+            .unwrap();
+            assert_retained_memory_drop_complete(&pager, committed_seq);
+            let mut reader = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            assert_eq!(
+                reader.get_page(&cx, page).await.unwrap().as_bytes(),
+                committed.as_slice()
+            );
+            reader.rollback(&cx).await.unwrap();
+        });
     }
 
     #[test]
