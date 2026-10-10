@@ -15977,7 +15977,12 @@ where
         producer: Option<fsqlite_wal::wal_fec::WalFecRepairProducer>,
     ) -> Result<()> {
         with_wal_backend(&self.wal_backend, cx, |wal, cx| {
-            Box::pin(async move { wal.set_wal_fec_producer(cx, producer) })
+            Box::pin(async move {
+                if producer.is_some() {
+                    wal.prepare_wal_fec_producer(cx).await?;
+                }
+                wal.set_wal_fec_producer(cx, producer)
+            })
         })
         .await
     }

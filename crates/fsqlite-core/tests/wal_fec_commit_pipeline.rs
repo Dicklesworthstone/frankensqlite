@@ -19,6 +19,15 @@ fn run_with_repair_pool<F: std::future::Future<Output = ()>>(test: F) {
     runtime.block_on(test);
 }
 
+/// A runtime with no blocking pool, stated explicitly: since Asupersync
+/// 0.6 a bare `RuntimeBuilder` (and so `test_utils::run_test`) gets an
+/// on-demand pool by default.
+fn run_without_repair_pool<F: std::future::Future<Output = ()>>(test: F) {
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .blocking_threads(0, 0).build().unwrap();
+    runtime.block_on(test);
+}
+
 async fn open(db: &Path) -> Connection {
     let conn = Connection::open(db.to_str().unwrap()).await.unwrap();
     conn.execute("PRAGMA journal_mode = WAL;").await.unwrap();
@@ -398,6 +407,68 @@ fn restart_regenerates_missing_and_interrupted_sidecar_suffixes() {
     });
 }
 
+/// bd-xsxdz (GH #294 with a repair pool): attaching repair to a WAL whose
+/// every frame the shared index shows backfilled leaves every artifact as it
+/// was, because the database file already holds those frames. The first
+/// commit still covers the WAL from frame 1. A WAL that is the only copy of
+/// its frames is still caught up on attach
+/// (`restart_regenerates_missing_and_interrupted_sidecar_suffixes`).
+#[test]
+fn attaching_to_a_fully_backfilled_wal_creates_no_repair_artifacts() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("backfilled.db");
+    run_without_repair_pool(async {
+        let conn = open(&db).await;
+        conn.execute("CREATE TABLE t(value INTEGER);").await.unwrap();
+        conn.execute("INSERT INTO t VALUES (1);").await.unwrap();
+        // The default close backfills every frame and keeps the WAL.
+        conn.close().await.unwrap();
+    });
+    let wal = wal_path(&db);
+    let sidecar = wal_fec_path_for_wal(&wal);
+    let mut lock = sidecar.as_os_str().to_os_string();
+    lock.push(".lock");
+    let lock = PathBuf::from(lock);
+    assert!(fs::metadata(&wal).unwrap().len() > 32, "the WAL keeps its backfilled frames");
+    assert!(!sidecar.exists() && !lock.exists(), "a writer without a pool produces no sidecar");
+    let artifacts = |dir: &Path| {
+        let mut names: Vec<(String, Vec<u8>)> = fs::read_dir(dir).unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (path.file_name().unwrap().to_string_lossy().into_owned(), fs::read(&path).unwrap())
+            })
+            .filter(|(name, _)| !name.ends_with("-shm"))
+            .collect();
+        names.sort();
+        names
+    };
+    let before = artifacts(dir.path());
+    run_with_repair_pool(async {
+        let reader = open(&db).await;
+        assert_eq!(reader.query("SELECT COUNT(*) FROM t;").await.unwrap()[0].values(), &[SqliteValue::Integer(1)]);
+        reader.close_without_checkpoint().await.unwrap();
+    });
+    assert!(
+        !sidecar.exists() && !lock.exists(),
+        "attaching to a backfilled WAL created repair artifacts: sidecar {} lock {}",
+        sidecar.exists(),
+        lock.exists()
+    );
+    assert_eq!(artifacts(dir.path()), before, "the database and WAL bytes are unchanged");
+    // Honest counterpart: a session that writes covers the WAL from frame 1.
+    run_with_repair_pool(async {
+        let writer = open(&db).await;
+        writer.execute("INSERT INTO t VALUES (2);").await.unwrap();
+        wait_for_last_group(&db).await;
+        writer.close_without_checkpoint().await.unwrap();
+    });
+    let header = WalHeader::from_bytes(&fs::read(&wal).unwrap()).unwrap();
+    let groups: Vec<_> = scan_wal_fec(&sidecar).unwrap().groups.into_iter()
+        .filter(|group| (group.meta.wal_salt1, group.meta.wal_salt2) == (header.salts.salt1, header.salts.salt2))
+        .collect();
+    assert_eq!(groups.iter().map(|group| group.meta.start_frame_no).min(), Some(1), "coverage starts at frame 1");
+}
+
 #[test]
 fn process_exit_after_durable_commit_before_repair_is_recoverable() {
     assert_process_crash_recovery(false);
@@ -663,7 +734,7 @@ fn reopen_reclaims_retired_groups_after_checkpoint_owner_exits() {
 
 #[test]
 fn runtime_without_blocking_pool_preserves_primary_sql() {
-    asupersync::test_utils::run_test(|| async {
+    run_without_repair_pool(async {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("no-pool.db");
         let conn = open(&db).await;

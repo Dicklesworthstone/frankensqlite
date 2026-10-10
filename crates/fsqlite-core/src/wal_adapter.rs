@@ -1576,6 +1576,43 @@ impl<F: VfsFile> WalBackendAdapter<F> {
         Ok(Some(NativeCheckpointView { source, region, header, backfilled_frames }))
     }
 
+    /// Whether the shared WAL index publishes this adapter's WAL, frame for
+    /// frame, with every frame backfilled. Backfill is published only after
+    /// the database file is synced, so the database then holds every frame
+    /// durably and no frame exists only in the WAL (GH #294).
+    ///
+    /// Any doubt answers `false`: no attached index, an empty WAL, an
+    /// unreadable or changing header, another generation, a different frame
+    /// count or terminal frame, or partial backfill. Unlike
+    /// [`Self::native_checkpoint_view`] it neither refreshes the WAL nor
+    /// requests recovery: attaching a repair producer only reads.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    async fn shared_index_backfilled_every_frame(&self, cx: &Cx) -> bool {
+        let Some(source) = self.wal_index_shm_source.clone() else { return false };
+        let frames = self.wal.frame_count();
+        if frames == 0 {
+            return false;
+        }
+        let Ok(region) = source.map_region(cx, 0, false).await else { return false };
+        let Ok(Some(header)) = read_shared_wal_index_header(&region) else { return false };
+        let wal_header = self.wal.header();
+        if header.is_unindexed_empty()
+            || header.page_size().ok() != Some(wal_header.page_size)
+            || header.big_end_cksum != u8::from(wal_header.big_endian_checksum())
+            || header.a_salt != [wal_header.salts.salt1, wal_header.salts.salt2]
+            || usize::try_from(header.mx_frame).ok() != Some(frames)
+        {
+            return false;
+        }
+        let Ok(terminal) = self.wal.read_frame_header(cx, frames - 1).await else { return false };
+        if validate_shared_wal_index_wal_binding(&header, self.wal.header(), Some((header.mx_frame, terminal)))
+            .is_err()
+        {
+            return false;
+        }
+        read_shared_wal_index_backfill(&region, &header).is_ok_and(|backfilled| backfilled == header.mx_frame)
+    }
+
     /// Commit private reset state only after the physical and shared phases succeeded.
     fn finish_checkpoint_reset(&mut self) -> Result<()> {
         let Some(reset) = &self.pending_checkpoint_reset else { return Ok(()); };
@@ -3657,6 +3694,12 @@ where
     fec_admitted: Option<(WalHeader, u32, fsqlite_wal::SqliteWalChecksum)>,
     #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
     fec_inspected_generation: Option<WalHeader>,
+    /// Set by `prepare_wal_fec_producer` and consumed by the attach that
+    /// follows it: the WAL generation and frame count the shared index showed
+    /// fully backfilled, so the attach-time catch-up has nothing the database
+    /// file lacks (GH #294).
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    fec_attach_backfilled: Option<(WalHeader, usize)>,
     inner: WalBackendAdapter<V::File>,
 }
 
@@ -3698,6 +3741,8 @@ where
             fec_admitted: None,
             #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
             fec_inspected_generation: None,
+            #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+            fec_attach_backfilled: None,
             inner: WalBackendAdapter::new(wal),
         }
     }
@@ -6280,6 +6325,18 @@ where
     }
 
     #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    fn prepare_wal_fec_producer<'a>(&'a mut self, cx: &'a Cx) -> WalFuture<'a, ()> {
+        Box::pin(async move {
+            self.fec_attach_backfilled = None;
+            if self.inner.shared_index_backfilled_every_frame(cx).await {
+                let header = WalHeader::from_bytes(&self.inner.wal.header().to_bytes()?)?;
+                self.fec_attach_backfilled = Some((header, self.inner.wal.frame_count()));
+            }
+            Ok(())
+        })
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
     fn set_wal_fec_producer(
         &mut self,
         cx: &Cx,
@@ -6303,10 +6360,26 @@ where
                 self.fec_inspected_generation = Some(header);
             }
         }
+        // GH #294: a session that only reads leaves every artifact as it was.
+        // When the shared index showed this exact WAL fully backfilled, the
+        // database file already holds every frame durably, so the catch-up
+        // waits for this connection's first commit. Nothing is marked admitted:
+        // that commit's range still starts at the last admitted boundary
+        // (frame 1 for a new connection), so the checksum chain stays
+        // repairable from the start for the frames written after it. A WAL
+        // that is the only copy of some frame is caught up now, as before.
+        let wal_backfilled = match self.fec_attach_backfilled.take() {
+            Some((generation, frames)) => {
+                frames == self.inner.wal.frame_count()
+                    && generation == WalHeader::from_bytes(&self.inner.wal.header().to_bytes()?)?
+            }
+            None => false,
+        };
         // Opening validated the checksum chain, but another live connection's
         // NORMAL-sync commits may still be in the OS cache. Establish a real
         // durability barrier before making that prefix repairable on catch-up.
-        if let Some(range) = self.pending_fec_range(cx)?
+        if !wal_backfilled
+            && let Some(range) = self.pending_fec_range(cx)?
             && self.inner.wal.last_fsynced_frame_count() >= range.end_frame_no as usize
         {
             let boundary = (range.header, range.end_frame_no, range.end_checksum);

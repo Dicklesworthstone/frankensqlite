@@ -781,6 +781,18 @@ pub trait WalBackend: Send + Sync {
         Ok(())
     }
 
+    /// Read the shared state that attaching a repair producer depends on,
+    /// immediately before [`Self::set_wal_fec_producer`] (which cannot await)
+    /// under the same exclusive borrow. A native backend records whether the
+    /// shared WAL index shows every frame of its WAL already backfilled into
+    /// the database file, so attaching need not cover frames that are no
+    /// longer only in the WAL (GH #294). Backends without a shared index have
+    /// nothing to read.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    fn prepare_wal_fec_producer<'a>(&'a mut self, _cx: &'a Cx) -> WalFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
     /// Number of valid frames currently in the WAL.
     fn frame_count(&self) -> usize;
 
