@@ -28031,6 +28031,17 @@ where
                     freelist_count: inner.freelist.len(),
                     checkpoint_active: inner.checkpoint_active,
                 };
+                // GH#503: the full retained-memory path flushed these pages to
+                // MemoryFile, but its publication plane is temporary. Evict old
+                // shared-cache images before exposing the new snapshot, or a
+                // later metadata-only commit can uncover a pre-commit table root.
+                // Hold inner so an earlier cache miss cannot refill stale bytes;
+                // use the dense flush list rather than scanning write_set capacity.
+                if wal_publication_intent.is_none() && !metadata_only_single_connection_fast_path {
+                    for &page_no in &self.write_pages_sorted {
+                        self.cache.evict(page_no);
+                    }
+                }
                 // bd-db300.5.3.3.1: publish immutable snapshot while inner is still
                 // held — MUST happen before publish_committed_state (same order as
                 // `commit()`), so concurrent readers see the immutable snapshot
@@ -55478,6 +55489,135 @@ mod tests {
                 PageNumber::new(page_three.get() + 1).unwrap(),
                 "bead_id={BEAD_ID} case=memory_db_allocator_grows_after_freelist_drains"
             );
+        });
+    }
+
+    /// GH#503: reusing a committed-free page makes a retained memory commit
+    /// publish its page images instead of taking the deferred-flush path.
+    /// A later metadata-only commit must not uncover stale shared-cache bytes
+    /// after that publication plane is cleared.
+    async fn assert_memory_retained_freelist_commit_survives_exit(exit: &str) {
+        let pager = private_memory_pager().await;
+        pager.bind_shared_connection_count(Arc::new(AtomicUsize::new(1)));
+        let cx = Cx::new();
+        let original_root = sample_page(0x11);
+        let committed_root = sample_page(0x41);
+
+        let (root, freed) = {
+            let mut seed = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            let root = seed.allocate_page(&cx).await.unwrap();
+            let freed = seed.allocate_page(&cx).await.unwrap();
+            seed.write_page(&cx, root, &original_root).await.unwrap();
+            seed.write_page(&cx, freed, &sample_page(0x22))
+                .await
+                .unwrap();
+            seed.commit(&cx).await.unwrap();
+            (root, freed)
+        };
+        assert!(
+            pager.cache.get_shared(root).unwrap().as_ref() == original_root.as_slice(),
+            "the pre-insert root must be resident naturally, without cache injection"
+        );
+        {
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            txn.free_page(&cx, freed).await.unwrap();
+            txn.commit(&cx).await.unwrap();
+        }
+
+        let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+        assert!(txn.get_page(&cx, root).await.unwrap().as_ref() == original_root.as_slice());
+        let reused = txn.allocate_page(&cx).await.unwrap();
+        let extended = txn.allocate_page(&cx).await.unwrap();
+        assert_eq!(reused, freed, "the committed-free page must really be reused");
+        assert_eq!(extended.get(), freed.get() + 1, "EOF resumes above the reused page");
+        assert_ne!(root, reused, "the live root must never be allocated again");
+        let committed_pages = [
+            (root, committed_root),
+            (reused, sample_page(0x52)),
+            (extended, sample_page(0x63)),
+        ];
+        for (page, bytes) in &committed_pages {
+            txn.write_page(&cx, *page, bytes).await.unwrap();
+        }
+        assert!(txn.freelist_metadata_dirty(), "reuse must change the committed freelist");
+        assert!(txn.commit_and_retain(&cx).await.unwrap());
+
+        // Check the backing image before any subsequent read can repair a cache
+        // miss. The defect lost visibility of correctly written bytes; these
+        // assertions distinguish that from duplicate allocation or a lost flush.
+        let db_file = Arc::clone(&pager.inner.lock().unwrap().db_file);
+        {
+            let file = shared_db_file_read(&db_file, &cx).await.unwrap();
+            for (page, bytes) in &committed_pages {
+                let mut physical = vec![0; bytes.len()];
+                let offset = u64::from(page.get() - 1) * u64::from(PageSize::DEFAULT.get());
+                assert_eq!(file.read(&cx, &mut physical, offset).await.unwrap(), bytes.len());
+                assert!(
+                    physical == *bytes,
+                    "GH#503 {exit}: retained commit must physically preserve page {}",
+                    page.get()
+                );
+            }
+        }
+
+        if exit != "commit" {
+            txn.write_page(&cx, root, &sample_page(0x99)).await.unwrap();
+            let abandoned = txn.allocate_page(&cx).await.unwrap();
+            assert!(abandoned > extended, "rollback may reserve only a fresh EOF page");
+            txn.write_page(&cx, abandoned, &sample_page(0x88))
+                .await
+                .unwrap();
+        }
+        match exit {
+            "commit" => txn.commit(&cx).await.unwrap(),
+            "rollback" => txn.rollback(&cx).await.unwrap(),
+            "drop" => drop(txn),
+            _ => panic!("unknown retained transaction exit {exit}"),
+        }
+
+        // Equivalent to the unrelated CREATE TABLE in the SQL reproducer:
+        // publish a new root while leaving every earlier live page untouched.
+        {
+            let mut unrelated = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            let page = unrelated.allocate_page(&cx).await.unwrap();
+            assert_eq!(page.get(), extended.get() + 1, "GH#503 {exit}: no EOF loss or alias");
+            unrelated.write_page(&cx, page, &sample_page(0x74))
+                .await
+                .unwrap();
+            unrelated.commit(&cx).await.unwrap();
+        }
+        assert_eq!(pager.published_snapshot().page_set_size, 0);
+        let mut reader = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+        for (page, bytes) in &committed_pages {
+            let observed = reader.get_page(&cx, *page).await.unwrap();
+            assert!(
+                observed.as_ref() == bytes.as_slice(),
+                "GH#503 {exit}: clearing the published plane exposed stale page {} (first byte {} instead of {})",
+                page.get(), observed.as_ref()[0], bytes[0]
+            );
+        }
+        assert!(reader.live_freelist_pages().is_empty(), "every reused page remains owned");
+        reader.commit(&cx).await.unwrap();
+    }
+
+    #[test]
+    fn test_memory_retained_freelist_commit_survives_commit() {
+        asupersync::test_utils::run_test(|| async {
+            assert_memory_retained_freelist_commit_survives_exit("commit").await;
+        });
+    }
+
+    #[test]
+    fn test_memory_retained_freelist_commit_survives_rollback() {
+        asupersync::test_utils::run_test(|| async {
+            assert_memory_retained_freelist_commit_survives_exit("rollback").await;
+        });
+    }
+
+    #[test]
+    fn test_memory_retained_freelist_commit_survives_drop() {
+        asupersync::test_utils::run_test(|| async {
+            assert_memory_retained_freelist_commit_survives_exit("drop").await;
         });
     }
 

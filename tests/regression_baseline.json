@@ -311,6 +311,90 @@
       }
     },
     {
+      "source_path": "crates/fsqlite-core/tests/gh494_memory_commit_scaling.rs",
+      "test_name": "gh494_file_unrelated_resident_commit_scaling",
+      "reason": "release-only timing regression; use --release --ignored --nocapture --test-threads=1",
+      "cfg_condition": "all(feature=\"native\",not(target_arch=\"wasm32\"))",
+      "kind": "performance",
+      "policy": "exempt",
+      "evidence": {
+        "requirement": "Run this exact ignored GH494 scaling probe with --release --nocapture --test-threads=1, retaining source, host, toolchain, flags and every reported stage; coarse timing bounds do not establish a win against stock SQLite.",
+        "receipt": null
+      }
+    },
+    {
+      "source_path": "crates/fsqlite-core/tests/gh494_memory_commit_scaling.rs",
+      "test_name": "gh494_file_unrelated_resident_rollback_scaling",
+      "reason": "release-only timing regression; use --release --ignored --nocapture --test-threads=1",
+      "cfg_condition": "all(feature=\"native\",not(target_arch=\"wasm32\"))",
+      "kind": "performance",
+      "policy": "exempt",
+      "evidence": {
+        "requirement": "Run this exact ignored GH494 scaling probe with --release --nocapture --test-threads=1, retaining source, host, toolchain, flags and every reported stage; coarse timing bounds do not establish a win against stock SQLite.",
+        "receipt": null
+      }
+    },
+    {
+      "source_path": "crates/fsqlite-core/tests/gh494_memory_commit_scaling.rs",
+      "test_name": "gh494_memory_unrelated_resident_commit_scaling",
+      "reason": "release-only timing regression; use --release --ignored --nocapture --test-threads=1",
+      "cfg_condition": "all(feature=\"native\",not(target_arch=\"wasm32\"))",
+      "kind": "performance",
+      "policy": "exempt",
+      "evidence": {
+        "requirement": "Run this exact ignored GH494 scaling probe with --release --nocapture --test-threads=1, retaining source, host, toolchain, flags and every reported stage; coarse timing bounds do not establish a win against stock SQLite.",
+        "receipt": null
+      }
+    },
+    {
+      "source_path": "crates/fsqlite-core/tests/gh494_memory_commit_scaling.rs",
+      "test_name": "gh494_memory_unrelated_resident_rollback_scaling",
+      "reason": "release-only timing regression; use --release --ignored --nocapture --test-threads=1",
+      "cfg_condition": "all(feature=\"native\",not(target_arch=\"wasm32\"))",
+      "kind": "performance",
+      "policy": "exempt",
+      "evidence": {
+        "requirement": "Run this exact ignored GH494 scaling probe with --release --nocapture --test-threads=1, retaining source, host, toolchain, flags and every reported stage; coarse timing bounds do not establish a win against stock SQLite.",
+        "receipt": null
+      }
+    },
+    {
+      "source_path": "crates/fsqlite-core/tests/gh494_memory_commit_scaling.rs",
+      "test_name": "gh494_original_file_single_insert_commit_scaling",
+      "reason": "release-only timing regression; use --release --ignored --nocapture --test-threads=1",
+      "cfg_condition": "all(feature=\"native\",not(target_arch=\"wasm32\"))",
+      "kind": "performance",
+      "policy": "exempt",
+      "evidence": {
+        "requirement": "Run this exact ignored GH494 scaling probe with --release --nocapture --test-threads=1, retaining source, host, toolchain, flags and every reported stage; coarse timing bounds do not establish a win against stock SQLite.",
+        "receipt": null
+      }
+    },
+    {
+      "source_path": "crates/fsqlite-core/tests/gh494_memory_commit_scaling.rs",
+      "test_name": "gh494_original_memory_single_insert_commit_scaling",
+      "reason": "release-only timing regression; use --release --ignored --nocapture --test-threads=1",
+      "cfg_condition": "all(feature=\"native\",not(target_arch=\"wasm32\"))",
+      "kind": "performance",
+      "policy": "exempt",
+      "evidence": {
+        "requirement": "Run this exact ignored GH494 scaling probe with --release --nocapture --test-threads=1, retaining source, host, toolchain, flags and every reported stage; coarse timing bounds do not establish a win against stock SQLite.",
+        "receipt": null
+      }
+    },
+    {
+      "source_path": "crates/fsqlite-core/tests/gh494_memory_commit_scaling.rs",
+      "test_name": "gh503_live_stock_overflow_reuse_probe",
+      "reason": "diagnostic paired timing probe; use --release --ignored --exact --nocapture --test-threads=1",
+      "cfg_condition": "all(feature=\"native\",not(target_arch=\"wasm32\"))",
+      "kind": "performance",
+      "policy": "exempt",
+      "evidence": {
+        "requirement": "Run this exact ignored probe with identical optimized baseline/candidate flags and live stock SQLite in each invocation, alternate saved binaries in ABBA order, and retain source, host, toolchain, configuration, raw batch timings and completed-work checks before citing performance.",
+        "receipt": null
+      }
+    },
+    {
       "source_path": "crates/fsqlite-e2e/src/perf_runner.rs",
       "test_name": "tests::focused_disjoint_c8_release_perf_triplet_emits_results",
       "reason": "manual remote perf evidence for the flagship c8 row",
