@@ -25842,18 +25842,15 @@ where
     }
 
     fn forget_cached_page(&self, page_no: PageNumber) {
-        // bd-pirr5 (GH#371): drop a just-freed page from BOTH resident caches so a
-        // bounded DROP teardown keeps only its DFS working set in memory instead
-        // of the whole b-tree (and its overflow chains). Without this a large
-        // WITHOUT-ROWID teardown exhausts the buffer pool / grows RSS with table
-        // size. The page is already on the freelist and re-read fresh if it is
-        // re-allocated, so this only bounds resident memory.
-        //   1. the shared page pool (mirrors the checkpoint/truncate eviction);
-        //   2. the per-transaction read cache, which otherwise retains a cloned
-        //      PageData for every page read during the walk up to the pool
-        //      capacity — the term that made RSS still track table size.
+        // bd-pirr5 (GH#371): discard ordinary read images during bounded DROP
+        // teardown so the cache follows its DFS working set. A deferred
+        // retained commit is different: its bitmap-owned image is still the
+        // authoritative committed version, including when the current
+        // transaction frees the page and may subsequently roll back.
         self.cache.evict(page_no);
-        self.txn_read_cache.borrow_mut().remove(&page_no);
+        if !self.retained_memory_overlay_dirty_pages.contains(&page_no) {
+            self.txn_read_cache.borrow_mut().remove(&page_no);
+        }
     }
 
     fn prefetch_page_hint(&self, _cx: &Cx, page_no: PageNumber) {
@@ -58419,6 +58416,113 @@ mod tests {
                 "issue=503 case=published_page_has_no_stale_fallback page={page_no}"
             );
         }
+    }
+
+    #[test]
+    fn test_gh503_retained_overlay_forget_preserves_rollback_and_freelist_reuse() {
+        asupersync::test_utils::run_test(|| async {
+            let pager = private_memory_pager().await;
+            pager.bind_shared_connection_count(Arc::new(AtomicUsize::new(1)));
+            let cx = Cx::new();
+            let old = sample_page(0x61);
+            let committed = sample_page(0x62);
+            let control_bytes = sample_page(0x71);
+            let (page, control) = {
+                let mut seed = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                let page = seed.allocate_page(&cx).await.unwrap();
+                let control = seed.allocate_page(&cx).await.unwrap();
+                seed.write_page(&cx, page, &old).await.unwrap();
+                seed.write_page(&cx, control, &control_bytes).await.unwrap();
+                seed.commit(&cx).await.unwrap();
+                (page, control)
+            };
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            txn.write_page(&cx, page, &committed).await.unwrap();
+            assert!(txn.commit_and_retain(&cx).await.unwrap());
+            assert!(txn.retained_memory_overlay_dirty_pages.contains(&page));
+            assert_gh503_memory_backing_page(&pager, &cx, page, &old).await;
+            txn.savepoint(&cx, "keep_committed").unwrap();
+            txn.write_page(&cx, page, &sample_page(0xEE)).await.unwrap();
+            txn.free_page(&cx, page).await.unwrap();
+            txn.forget_cached_page(page);
+            assert_eq!(
+                txn.get_page(&cx, control).await.unwrap().as_bytes(),
+                control_bytes.as_slice()
+            );
+            txn.free_page(&cx, control).await.unwrap();
+            txn.forget_cached_page(control);
+            assert!(pager.cache.get_shared(page).is_none());
+            assert!(pager.cache.get_shared(control).is_none());
+            assert_eq!(
+                txn.txn_read_cache.borrow().get(&page).unwrap().as_bytes(),
+                committed.as_slice()
+            );
+            assert!(!txn.txn_read_cache.borrow().contains_key(&control));
+            assert!(!txn.write_set.contains_key(&page));
+            assert!(!txn.write_set.contains_key(&control));
+            assert!(matches!(
+                txn.get_page(&cx, page).await,
+                Err(FrankenError::DatabaseCorrupt { .. })
+            ));
+            txn.rollback_to_savepoint(&cx, "keep_committed").unwrap();
+            assert_eq!(
+                txn.get_page(&cx, page).await.unwrap().as_bytes(),
+                committed.as_slice()
+            );
+            assert_eq!(
+                txn.get_page(&cx, control).await.unwrap().as_bytes(),
+                control_bytes.as_slice()
+            );
+            txn.release_savepoint(&cx, "keep_committed").unwrap();
+            txn.rollback(&cx).await.unwrap();
+            assert_gh503_memory_backing_page(&pager, &cx, page, &committed).await;
+            let mut reader = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            for (page_no, bytes) in [(page, &committed), (control, &control_bytes)] {
+                assert_eq!(
+                    reader.get_page(&cx, page_no).await.unwrap().as_bytes(),
+                    bytes.as_slice()
+                );
+                assert!(!reader.live_freelist_pages().contains(&page_no));
+            }
+            reader.rollback(&cx).await.unwrap();
+
+            // A committed free must still retire the pinned image and reuse
+            // its page once, rather than preserving it as live indefinitely.
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            txn.write_page(&cx, page, &sample_page(0x63)).await.unwrap();
+            assert!(txn.commit_and_retain(&cx).await.unwrap());
+            assert!(txn.retained_memory_overlay_dirty_pages.contains(&page));
+            txn.free_page(&cx, page).await.unwrap();
+            txn.forget_cached_page(page);
+            txn.commit(&cx).await.unwrap();
+            assert_eq!(
+                pager
+                    .inner
+                    .lock()
+                    .unwrap()
+                    .freelist
+                    .iter()
+                    .filter(|&&free| free == page)
+                    .count(),
+                1
+            );
+            let replacement = sample_page(0x64);
+            let mut next = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            assert_eq!(next.allocate_page(&cx).await.unwrap(), page);
+            next.write_page(&cx, page, &replacement).await.unwrap();
+            next.commit(&cx).await.unwrap();
+            let mut reader = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            assert_eq!(
+                reader.get_page(&cx, page).await.unwrap().as_bytes(),
+                replacement.as_slice()
+            );
+            assert_eq!(
+                reader.get_page(&cx, control).await.unwrap().as_bytes(),
+                control_bytes.as_slice()
+            );
+            assert!(!reader.live_freelist_pages().contains(&page));
+            reader.rollback(&cx).await.unwrap();
+        });
     }
 
     #[test]
