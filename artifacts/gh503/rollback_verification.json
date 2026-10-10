@@ -1,0 +1,115 @@
+{
+  "issue": "https://github.com/Dicklesworthstone/frankensqlite/issues/503",
+  "repair_commit": "b1f576179d37168148b8acc35855e549ca36f2d5",
+  "parent_commit": "f84d0fe61fab417078924ad80fba98d86d703c35",
+  "prior_full_retained_commit_repair": "be9ae2526acfbb5b863f5a0beb1b634c76ffd38f",
+  "status": "Rollback repair and regressions published; static and stock-fixture checks completed; FrankenSQLite runtime qualification remains blocked",
+  "scope": "Evict successfully materialized earlier committed memory-overlay pages from the shared fallback cache before rollback releases the pager inner lock. Current uncommitted writes are discarded normally. Preserve legitimate freelist reuse and corruption detection.",
+  "source_blobs": {
+    "crates/fsqlite-pager/src/pager.rs": "09722a1bc46e338937daab5d8ab2056298f22b28",
+    "crates/fsqlite-core/tests/memory_page_reuse_and_attached_release_oracle.rs": "713d894c71644bfe1680e731c01f7fa77bba426c"
+  },
+  "source_sha256": {
+    "crates/fsqlite-pager/src/pager.rs": "82637291bc9447e7f5b5b7aa782f1de3ae8e035e558407504cf2e823ba9278f3",
+    "crates/fsqlite-core/tests/memory_page_reuse_and_attached_release_oracle.rs": "abc0c1c9bc5f319abc0f8ca91beea4eca007d603115e21d3cb41c7a4908b7fd1"
+  },
+  "added_tests": [
+    "test_gh503_materialized_retained_overlay_survives_page_plane_clear",
+    "test_gh503_retained_overlay_rollback_preserves_last_committed_cached_page",
+    "gh503_overflow_boundaries_preserve_contents_and_page_ownership",
+    "gh503_repeated_overflow_and_schema_allocations_reuse_pages_without_aliasing",
+    "gh503_transaction_and_savepoint_rollback_preserve_overflow_ownership"
+  ],
+  "static_verification": {
+    "git_diff_check": "passed",
+    "source_review": "Independent publication-order, ownership, branch-precondition, and Rust API review found no further actionable defect. This is not compiler or runtime proof.",
+    "targeted_formatting": {
+      "toolchain": "nightly-2026-08-31",
+      "edition": "2024",
+      "oracle_file_exit_code": 0,
+      "new_pager_helpers_and_tests_in_isolated_module_exit_code": 0,
+      "scope": "The repository formatter exclusion for the large pager file was preserved. Only the new helper/test section was checked in an isolated module."
+    },
+    "workspace_formatting": {
+      "command": "cargo +nightly-2026-08-31 fmt --check",
+      "exit_code": 1,
+      "modified_file_overlap": [],
+      "existing_difference_paths": [
+        "crates/fsqlite-btree/benches/cell_parse_hot_paths.rs",
+        "crates/fsqlite-harness/tests/native_commit_service.rs",
+        "crates/fsqlite-harness/tests/native_group_commit.rs",
+        "crates/fsqlite-types/src/serial_type.rs",
+        "crates/fsqlite-wal/src/native_commit/durable.rs",
+        "crates/fsqlite-wal/src/native_pages/store.rs",
+        "crates/fsqlite/src/compat/changeset_delivery.rs",
+        "crates/fsqlite/src/compat/changeset_delivery_fanout.rs"
+      ],
+      "log_sha256": "64f5133f020372719e4d37ff21cf5fb9da5e96ae29608c767d4084add7f7ee18"
+    },
+    "ubs": {
+      "version": "5.4.17",
+      "ast_grep_version": "0.45.3",
+      "scope": "Exact published oracle file only; pager excluded under repository policy. Official --no-cargo mode retains static and AST checks and leaves Cargo/dependency phases unevaluated.",
+      "completed_after_repair_commit": true,
+      "input_sha256": "abc0c1c9bc5f319abc0f8ca91beea4eca007d603115e21d3cb41c7a4908b7fd1",
+      "input_still_matches": true,
+      "exit_code": 0,
+      "failed_modules": [],
+      "critical": 0,
+      "warnings": 119,
+      "info": 9,
+      "warning_review": "65 unwrap/expect, 10 explicit panic, and 37 assertion findings are test setup or failure assertions. Both direct-index findings follow exact one-row assertions. Five SQL findings are three constant multiline statements and two bounded integer loop interpolations. No actionable defect or suppression.",
+      "elapsed_seconds": 2.91,
+      "guard_stop": null,
+      "minimum_actual_memory_headroom_bytes": 1363103744,
+      "receipt_sha256": "ff5c56e0721d0c5cca0e8a07e6fd93c871e6aac13980696665792e962a2bcfc6",
+      "findings_sha256": "403e4759db87545a25cc4f0717a0882a1129a458318b3d43191a3d3db801d7be"
+    }
+  },
+  "stock_fixture_verification": {
+    "scope": "Independent Python stock-SQLite execution of the three new Rust fixture matrices, not execution of FrankenSQLite or the Rust test bodies",
+    "sqlite_version": "3.53.1",
+    "sqlite_source_id": "2026-05-05 10:34:17 c88b22011a54b4f6fbd149e9f8e4de77658ce58143a1af0e3785e4e6475127e9",
+    "python_version": "3.12.14",
+    "case_instances": 48,
+    "boundary_instances": 40,
+    "six_cycle_allocation_instances": 4,
+    "transaction_and_savepoint_rollback_instances": 4,
+    "transition_checks": 344,
+    "published_state_conservation_checks": 316,
+    "active_transaction_content_and_integrity_checks": 28,
+    "all_cases_passed": true,
+    "all_six_cycle_page_counts": [25, 25, 25, 25, 25, 25],
+    "retention_note": "Retention labels mirror the Rust matrix. Stock SQLite does not implement the FrankenSQLite pragma, so the corresponding ON/OFF reference executions intentionally use identical SQLite settings.",
+    "checks": "Full patterned BLOB bytes, integer values, row count, schema, integrity, root uniqueness/range, and published root/overflow/freelist page conservation",
+    "receipt_sha256": "29dc6f16938425ce99c13b82b4932d3e1bb61c1ff5cef35e9db2c09f074b6171"
+  },
+  "candidate_workspace_check": {
+    "command": "cargo +nightly-2026-08-31 check --locked --workspace --all-targets",
+    "build_controls": "One Cargo job, compiler -Z threads=1, incremental disabled, development/test debug information disabled, isolated Cargo/target/temp paths. Default runtime and package features preserved.",
+    "returncode": -15,
+    "guard": "less than 384 MiB nonreclaimable memory headroom",
+    "elapsed_seconds": 73.6,
+    "peak_target_bytes": 525309226,
+    "log_sha256": "02355705ce5d853a8adc3b81d60317ca48bf93a76e60a07efc45c0c41397199b",
+    "result": "Stopped the owned compiler process group while checking asupersync, before FrankenSQLite source was checked. No passing compiler or test result is claimed."
+  },
+  "candidate_clippy": {
+    "command": "cargo +nightly-2026-08-31 clippy --locked --workspace --all-targets -- -D warnings",
+    "status": "not_started",
+    "reason": "Bounded preflight could not obtain 3 GiB compiler headroom"
+  },
+  "remaining_qualification": [
+    "Run the exact and pager regressions against their unfixed and repaired implementations; no current-source red/green test body has executed",
+    "cargo +nightly-2026-08-31 test --locked -p fsqlite-pager --lib test_gh503_",
+    "cargo +nightly-2026-08-31 test --locked -p fsqlite-pager --lib test_memory_retained_freelist_commit_survives_",
+    "cargo +nightly-2026-08-31 test --locked -p fsqlite-core --test memory_page_reuse_and_attached_release_oracle",
+    "cargo +nightly-2026-08-31 test --locked -p fsqlite-core --test gh494_memory_commit_scaling gh503_",
+    "Complete workspace check and Clippy under the recorded execution and capacity holds",
+    "Run the downstream CASS migration test on Linux, macOS, and Windows when authorized execution capacity is available"
+  ],
+  "frankensqlite_candidate_test_bodies_executed": false,
+  "runtime_repair_verified": false,
+  "suspect_commit_causation_bisected": false,
+  "performance_measured": false
+}
