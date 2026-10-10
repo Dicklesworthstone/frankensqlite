@@ -84,19 +84,21 @@ static IOWQ_MAX_WORKERS: AtomicU64 = AtomicU64::new(0);
 /// Cap the kernel io-wq worker threads behind this crate's io_uring rings.
 ///
 /// io_uring completes file I/O inline when it can and otherwise hands it to
-/// io-wq worker threads (`iou-wrk-<tid>`), which the kernel creates per
-/// submitting thread and NUMA node. Their default limits scale with the ring
-/// size and the CPU count, so a caller that budgets its threads cannot count
-/// them. Every ring created after this call registers these limits
-/// (`IORING_REGISTER_IOWQ_MAX_WORKERS`, Linux 5.15+): each thread that submits
-/// to such a ring gets at most `bounded` workers for regular-file and block
-/// I/O and `unbounded` for work that may never complete, per NUMA node. `0`
-/// keeps the kernel's limit for that class, and `(0, 0)` stops capping rings
-/// created afterwards. Rings already created keep their limits, so call this
-/// before opening connections (each file-backed connection creates its own
-/// ring). The kernel keeps the limits with the submitting thread's workers,
-/// which it shares across rings, so a thread that has used a capped ring
-/// stays capped.
+/// io-wq worker threads (`iou-wrk-<tid>`), which the kernel keeps per
+/// submitting thread. By default a thread may get up to the smaller of the
+/// ring size and four times the online CPUs for bounded work, and up to its
+/// `RLIMIT_NPROC` for unbounded work, so a caller that budgets its threads
+/// cannot count them. Every ring created after this call registers these
+/// limits (`IORING_REGISTER_IOWQ_MAX_WORKERS`, Linux 5.15+): each thread that
+/// submits to such a ring gets at most `bounded` workers for regular-file and
+/// block I/O and `unbounded` for work that may never complete. Linux 6.4 and
+/// later apply them per thread; Linux 5.15 to 6.3 apply them per thread and
+/// NUMA node. `0` keeps the kernel's limit for that class, and `(0, 0)` stops
+/// capping rings created afterwards. Rings already created keep their limits,
+/// so call this before opening connections (each file-backed connection
+/// creates its own ring). The kernel keeps the limits with the submitting
+/// thread's workers, which it shares across rings, so a thread that has used
+/// a capped ring stays capped.
 ///
 /// A ring whose limits the kernel refuses is not used: its files take the
 /// Unix path, which starts no io-wq workers.
@@ -401,8 +403,8 @@ pub struct IoUringRuntimeStatus {
     pub status: String,
     pub disable_reason: Option<&'static str>,
     /// io-wq worker limits (bounded, unbounded) registered on the ring, per
-    /// submitting thread and NUMA node; `None` when uncapped (see
-    /// [`set_iowq_max_workers`]).
+    /// submitting thread (and NUMA node before Linux 6.4); `None` when
+    /// uncapped (see [`set_iowq_max_workers`]).
     pub iowq_max_workers: Option<[u32; 2]>,
 }
 
@@ -3476,7 +3478,15 @@ mod tests {
 
     #[test]
     fn set_iowq_max_workers_applies_to_rings_created_afterwards() {
+        /// Stops capping even if an assertion fails, so later rings are uncapped.
+        struct Uncap;
+        impl Drop for Uncap {
+            fn drop(&mut self) {
+                set_iowq_max_workers(0, 0);
+            }
+        }
         let _guard = io_uring_test_guard();
+        let _uncap = Uncap;
         let before = IoUringVfs::new();
         set_iowq_max_workers(2, 1);
         assert_eq!(iowq_max_workers(), Some([2, 1]));
