@@ -24,6 +24,7 @@ Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releas
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
 | [Unreleased](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.4.10...main) | HEAD | 2026-10-07 | Development on `main` after v0.4.10. |
+| [0.4.11](https://crates.io/crates/fsqlite-vfs/0.4.11) | crates.io only | 2026-10-09 | `fsqlite-vfs` alone: on macOS and other non-Linux Unix, a redundant main-DB descriptor opened while WAL lifetime locks were held is reused instead of parked forever, so long-running processes stop leaking about 2 fds per fresh connection (bd-l0rbc). Tag `fsqlite-vfs-v0.4.11`; no GitHub Release. The next uniform release must be >= 0.4.12 |
 | [v0.4.10](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.4.10) | Release | 2026-10-07 | Uniform release of all 26 public crates, with a **data-integrity advisory**: inserts inside a transaction could silently corrupt a table b-tree (bd-obwsy); UPDATE ... FROM lost or repeated updates (bd-b5j26); non-integer rowid / INTEGER PRIMARY KEY values left malformed index entries (REINDEX); a REPLACE constraint could delete a row an IGNORE constraint then kept out; a retried fsync after a failed WAL sync could vouch for unwritten frames (bd-alyrn). Plus checkpoint source validation, max-rowid and rowid-reuse parity, `:memory:` freelist reuse, stock empty-schema opens, and DML/join/trigger performance work |
 | [v0.4.9](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.4.9) | Release | 2026-10-03 | Published replacement for withdrawn v0.4.8, with frozen runtime source 23697702 and the CTAS wrong-table write fix. All 26 public crates use 0.4.9. The full gate records documented failures; signed assets and publication evidence accompany the release. |
 | [v0.4.8](https://github.com/Dicklesworthstone/frankensqlite/tree/v0.4.8) | Withdrawn tag | 2026-10-02 | Withdrawn before publication: CREATE TABLE AS SELECT with a quoted table name could write its copied rows into another existing table. The tag remains unchanged and unreleased; published v0.4.9 supersedes it. Planned changes are retained below. |
@@ -58,6 +59,39 @@ Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releas
 ## [Unreleased] -- development on `main` after v0.4.10
 
 Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.4.10...main>
+
+---
+
+## [0.4.11] -- 2026-10-09 (crates.io only: `fsqlite-vfs`)
+
+This is a VFS-only patch, published from tag
+[`fsqlite-vfs-v0.4.11`](https://github.com/Dicklesworthstone/frankensqlite/tree/fsqlite-vfs-v0.4.11)
+(commit `3bb28e731`). It is the v0.4.10 release tree plus one fix, and it follows the 0.4.3 / 0.4.5 precedent.
+
+- **Other crates.** Every other crate stays at 0.4.10 and requires `fsqlite-vfs` by caret, so consumers pick the
+  fix up with `cargo update -p fsqlite-vfs --precise 0.4.11`.
+- **Not shipped here.** There is no GitHub Release and no binaries. `main`'s other changes since v0.4.10 are not
+  included.
+- **Next release.** `main`'s `fsqlite-vfs` manifest still reads 0.4.10, so the next uniform release must use 0.4.12
+  or later.
+
+### Fixed
+
+- **macOS and other non-Linux Unix leaked main-database descriptors.** A main-DB file opened while the inode held
+  lock claims was parked in `deferred_close_files` and closed only once no claim remained. In WAL mode every live
+  connection holds a lifetime claim, so that list never drained, and each fresh connection leaked about 2
+  descriptors (bd-l0rbc; [`23079d4e8`](https://github.com/Dicklesworthstone/frankensqlite/commit/23079d4e8)).
+  A live Agent Mail server on macOS held 4,425 `storage.sqlite3` descriptors after 20.6 hours. The non-Linux open
+  path now reuses the retained canonical descriptor when the path still names the same `(dev, ino)` and the
+  requested access is allowed (`faccessat` with `AT_EACCESS`, then a second `stat`), as Linux has done since 0.4.9
+  with an `O_PATH` witness. Linux behavior is unchanged.
+- **Android keeps the ordinary open path** ([`0a342d809`](https://github.com/Dicklesworthstone/frankensqlite/commit/0a342d809)):
+  nix does not define `AT_EACCESS` there, so the reuse is not compiled for Android and behavior matches 0.4.10.
+
+Verified on the tag tree: Linux x86_64, non-root, 468 passed / 0 failed / 1 ignored; macOS arm64 427 passed /
+0 failed; `cargo publish --locked` verified the package against the published 0.4.10 crates. The crates.io archive
+checksum matches the index, its `.cargo_vcs_info.json` names `3bb28e731`, and its `src/unix.rs` is byte-identical
+to the tag.
 
 ---
 
