@@ -13873,6 +13873,11 @@ pub struct Connection {
     /// Session ID for the current concurrent transaction (if any).
     /// Set by execute_begin() when mode is Concurrent.
     concurrent_session_id: RefCell<Option<u64>>,
+    /// bd-gwoit: the shared rowid allocator's state when the current explicit
+    /// concurrent transaction began. An aborted transaction rewinds to it, the
+    /// way `ROLLBACK TO` rewinds to its savepoint's mark, so the next
+    /// transaction does not continue from rolled-back AUTOINCREMENT values.
+    concurrent_txn_rowid_mark: RefCell<Option<RowidAllocSavepointMark>>,
     /// Private `:memory:` direct-DML roots already registered with the
     /// concurrent write surface for the current session. Direct mutation
     /// fast paths can update transaction-local state before any page bytes are
@@ -15678,6 +15683,7 @@ impl Connection {
             #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
             wal_fec_pipeline: RefCell::new(None),
             concurrent_session_id: RefCell::new(None),
+            concurrent_txn_rowid_mark: RefCell::new(None),
             memory_concurrent_synced_write_roots: RefCell::new(SmallVec::new()),
             cached_concurrent_handle: RefCell::new(None),
             concurrent_lock_table: Arc::clone(&shared_mvcc_state.lock_table),
@@ -16237,6 +16243,7 @@ impl Connection {
             #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
             wal_fec_pipeline: RefCell::new(None),
             concurrent_session_id: RefCell::new(None),
+            concurrent_txn_rowid_mark: RefCell::new(None),
             memory_concurrent_synced_write_roots: RefCell::new(SmallVec::new()),
             cached_concurrent_handle: RefCell::new(None),
             concurrent_lock_table: Arc::clone(&shared_mvcc_state.lock_table),
@@ -60531,6 +60538,22 @@ impl Connection {
         }
     }
 
+    /// bd-gwoit: give the shared allocator back the rowids an aborted explicit
+    /// transaction reserved, as `ROLLBACK TO` does for its savepoint. Stock
+    /// recomputes the next AUTOINCREMENT value from the rolled-back
+    /// `sqlite_sequence`, so a rolled-back insert leaves no gap; neither does
+    /// this unless another writer reserved on the table since (the
+    /// `rewind_to_mark` CAS keeps that gap). Must run before `clear_session`,
+    /// which drops the reservation counts the rewind is proven against. A mark
+    /// from another session (ids are never recycled) is discarded unused.
+    fn rewind_concurrent_txn_rowids(&self, session_id: u64) {
+        if let Some(mark) = self.concurrent_txn_rowid_mark.borrow_mut().take()
+            && mark.session_id() == session_id
+        {
+            self._shared_mvcc_state.rowid_allocator.rewind_to_mark(&mark);
+        }
+    }
+
     /// Abort and unregister the currently active concurrent session, if any.
     fn abort_current_concurrent_session(&self) {
         let Some(session_id) = self.concurrent_session_id.borrow_mut().take() else {
@@ -60543,6 +60566,7 @@ impl Connection {
         }
         self.clear_cached_concurrent_handle();
         registry.remove_and_recycle(session_id);
+        self.rewind_concurrent_txn_rowids(session_id);
         // bd-elcjy: release this session's shared rowid-allocator reservations.
         self._shared_mvcc_state
             .rowid_allocator
@@ -74760,6 +74784,13 @@ impl Connection {
 
         *self.active_txn.borrow_mut() = Some(txn);
         *self.concurrent_session_id.borrow_mut() = concurrent_session;
+        // bd-gwoit: remember the shared rowid allocator at BEGIN so an aborted
+        // transaction can give back the rowids it reserved.
+        *self.concurrent_txn_rowid_mark.borrow_mut() = concurrent_session.map(|session_id| {
+            self._shared_mvcc_state
+                .rowid_allocator
+                .mark_savepoint(session_id)
+        });
         self.db.borrow_mut().begin_undo();
         *self.txn_snapshot.borrow_mut() = Some(self.snapshot());
         self.in_transaction.set(true);
@@ -76617,6 +76648,9 @@ impl Connection {
                     }
                     self.clear_cached_concurrent_handle();
                     registry.remove_and_recycle(session_id);
+                    // bd-gwoit: a full ROLLBACK gives back this transaction's
+                    // rowids, matching stock's AUTOINCREMENT after ROLLBACK.
+                    self.rewind_concurrent_txn_rowids(session_id);
                     // bd-elcjy: release this session's rowid reservations.
                     self._shared_mvcc_state
                         .rowid_allocator
@@ -76774,6 +76808,13 @@ impl Connection {
             self.clear_memory_concurrent_synced_write_roots();
             self.clear_cached_concurrent_handle();
             *self.concurrent_session_id.borrow_mut() = concurrent_session;
+            // bd-gwoit: as at BEGIN, so a full ROLLBACK of this implicit
+            // transaction gives back the rowids it reserved.
+            *self.concurrent_txn_rowid_mark.borrow_mut() = concurrent_session.map(|session_id| {
+                self._shared_mvcc_state
+                    .rowid_allocator
+                    .mark_savepoint(session_id)
+            });
             self.db.borrow_mut().begin_undo();
             *self.txn_snapshot.borrow_mut() = Some(self.snapshot());
             self.in_transaction.set(true);

@@ -132,3 +132,94 @@ fn pre_savepoint_id_retained_post_savepoint_tail_reclaimed() {
         .await;
     });
 }
+
+/// bd-gwoit: a full ROLLBACK gives back the rowids its transaction reserved,
+/// as ROLLBACK TO does for a savepoint, so the next explicit transaction
+/// reuses the rolled-back AUTOINCREMENT value (and `sqlite_sequence` agrees),
+/// matching stock. Before the fix the next BEGIN continued from the
+/// rolled-back tip: `1, 3` and `sqlite_sequence` 3 where stock has `1, 2`.
+#[test]
+fn next_transaction_reuses_ids_given_back_by_a_full_rollback() {
+    asupersync::test_utils::run_test(|| async {
+        let cases: [(&str, &[&str]); 5] = [
+            (
+                "minimal: autocommit row, rolled-back txn, then BEGIN",
+                &[
+                    "CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)",
+                    "INSERT INTO t(v) VALUES ('a')",
+                    "BEGIN",
+                    "INSERT INTO t(v) VALUES ('rolled back')",
+                    "ROLLBACK",
+                    "BEGIN",
+                    "INSERT INTO t(v) VALUES ('b')",
+                    "COMMIT",
+                ],
+            ),
+            (
+                "earlier committed transaction on the same table first",
+                &[
+                    "CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)",
+                    "BEGIN",
+                    "INSERT INTO t(v) VALUES ('a')",
+                    "COMMIT",
+                    "BEGIN",
+                    "INSERT INTO t(v) VALUES ('rolled back 1')",
+                    "INSERT INTO t(v) VALUES ('rolled back 2')",
+                    "ROLLBACK",
+                    "BEGIN",
+                    "INSERT INTO t(v) VALUES ('b')",
+                    "COMMIT",
+                ],
+            ),
+            (
+                "transaction opened by SAVEPOINT, then a full ROLLBACK",
+                &[
+                    "CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)",
+                    "INSERT INTO t(v) VALUES ('a')",
+                    "SAVEPOINT sp",
+                    "INSERT INTO t(v) VALUES ('rolled back')",
+                    "ROLLBACK",
+                    "BEGIN",
+                    "INSERT INTO t(v) VALUES ('b')",
+                    "COMMIT",
+                ],
+            ),
+            (
+                "plain rowid table",
+                &[
+                    "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)",
+                    "INSERT INTO t(v) VALUES ('a')",
+                    "BEGIN",
+                    "INSERT INTO t(v) VALUES ('rolled back')",
+                    "ROLLBACK",
+                    "BEGIN",
+                    "INSERT INTO t(v) VALUES ('b')",
+                    "COMMIT",
+                ],
+            ),
+            (
+                "control: autocommit insert after the ROLLBACK",
+                &[
+                    "CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)",
+                    "INSERT INTO t(v) VALUES ('a')",
+                    "BEGIN",
+                    "INSERT INTO t(v) VALUES ('rolled back')",
+                    "ROLLBACK",
+                    "INSERT INTO t(v) VALUES ('b')",
+                ],
+            ),
+        ];
+        for (name, setup) in cases {
+            agree(setup, "SELECT id, v FROM t ORDER BY id", name).await;
+            // A plain rowid table creates no sqlite_sequence to compare.
+            if setup[0].contains("AUTOINCREMENT") {
+                agree(
+                    setup,
+                    "SELECT name, seq FROM sqlite_sequence ORDER BY name",
+                    name,
+                )
+                .await;
+            }
+        }
+    });
+}

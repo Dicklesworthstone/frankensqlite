@@ -300,14 +300,23 @@ fn rewind_reserved_tail(
 
 /// A savepoint-time mark of the allocator state relevant to one session.
 ///
-/// Taken at `SAVEPOINT` and consumed by
-/// [`ConcurrentRowIdAllocator::rewind_to_mark`] on `ROLLBACK TO`. Entries are
+/// Taken at `SAVEPOINT` (and at `BEGIN`, bd-gwoit) and consumed by
+/// [`ConcurrentRowIdAllocator::rewind_to_mark`] on `ROLLBACK TO` (and on a
+/// full `ROLLBACK`). Entries are
 /// `(key, next_rowid, autoincrement_high_water, session_reservation_count)`
 /// snapshotted at mark time.
 #[derive(Debug, Clone)]
 pub struct RowidAllocSavepointMark {
     session_id: u64,
     entries: Vec<(AllocatorKey, i64, i64, i64)>,
+}
+
+impl RowidAllocSavepointMark {
+    /// The concurrent session this mark was taken for.
+    #[must_use]
+    pub const fn session_id(&self) -> u64 {
+        self.session_id
+    }
 }
 
 impl ConcurrentRowIdAllocator {
