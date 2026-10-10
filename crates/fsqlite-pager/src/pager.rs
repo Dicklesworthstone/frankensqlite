@@ -28345,6 +28345,12 @@ where
                     &overlay_pages,
                 )
                 .await?;
+                // #503: these are earlier committed bytes, not the writes
+                // being rolled back. Evict old fallback images while inner
+                // still excludes new readers from the materialized state.
+                for (page_no, _) in &overlay_pages {
+                    self.cache.evict(*page_no);
+                }
                 drop(inner);
                 self.retained_memory_overlay_dirty_pages.clear();
             }
@@ -58377,6 +58383,169 @@ mod tests {
                 0x22,
                 "bead_id={BEAD_ID} case=metadata_only_single_connection_commit_must_not_leave_stale_page_plane_bytes"
             );
+        });
+    }
+
+    async fn assert_gh503_memory_backing_page(
+        pager: &SimplePager<MemoryVfs>,
+        cx: &Cx,
+        page_no: PageNumber,
+        expected: &[u8],
+    ) {
+        let db_file = Arc::clone(&pager.inner.lock().unwrap().db_file);
+        let db_file = shared_db_file_read(&db_file, cx).await.unwrap();
+        let mut actual = vec![0; PageSize::DEFAULT.as_usize()];
+        let offset = u64::from(page_no.get() - 1) * u64::from(PageSize::DEFAULT.get());
+        assert_eq!(
+            db_file.read(cx, &mut actual, offset).await.unwrap(),
+            actual.len(),
+            "issue=503 case=complete_backing_page page={page_no}"
+        );
+        assert_eq!(
+            actual, expected,
+            "issue=503 case=committed_backing_bytes page={page_no}"
+        );
+    }
+
+    fn assert_gh503_shared_cache_page_is_current(
+        pager: &SimplePager<MemoryVfs>,
+        page_no: PageNumber,
+        expected: &[u8],
+    ) {
+        if let Some(cached) = pager.cache.get_shared(page_no) {
+            assert_eq!(
+                cached.as_bytes(),
+                expected,
+                "issue=503 case=published_page_has_no_stale_fallback page={page_no}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_gh503_materialized_retained_overlay_survives_page_plane_clear() {
+        asupersync::test_utils::run_test(|| async {
+            init_publication_test_tracing();
+            let pager = private_memory_pager().await;
+            pager.bind_shared_connection_count(Arc::new(AtomicUsize::new(1)));
+            let cx = Cx::new();
+            let old_bytes = sample_page(0x31);
+            let new_bytes = sample_page(0x32);
+            let page = {
+                let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                let page = txn.allocate_page(&cx).await.unwrap();
+                txn.write_page(&cx, page, &old_bytes).await.unwrap();
+                txn.commit(&cx).await.unwrap();
+                page
+            };
+            assert_eq!(
+                pager.cache.get_shared(page).unwrap().as_bytes(),
+                old_bytes.as_slice()
+            );
+
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            txn.write_page(&cx, page, &new_bytes).await.unwrap();
+            assert!(txn.commit_and_retain(&cx).await.unwrap());
+            assert!(txn.retained_memory_overlay_dirty_pages.contains(&page));
+            assert_eq!(pager.published_snapshot().page_set_size, 0);
+            assert_gh503_memory_backing_page(&pager, &cx, page, &old_bytes).await;
+            assert_eq!(
+                txn.get_page(&cx, page).await.unwrap().as_bytes(),
+                new_bytes.as_slice()
+            );
+
+            // An explicit page-one write forces full publication, including
+            // the earlier overlay even though this commit does not edit it.
+            let page_one = txn.get_page(&cx, PageNumber::ONE).await.unwrap().into_vec();
+            txn.write_page(&cx, PageNumber::ONE, &page_one)
+                .await
+                .unwrap();
+            assert!(txn.commit_and_retain(&cx).await.unwrap());
+            assert!(txn.retained_memory_overlay_dirty_pages.is_empty());
+            assert!(pager.published_snapshot().page_set_size > 0);
+            assert_eq!(
+                pager.published.try_get_page(page).unwrap().as_bytes(),
+                new_bytes.as_slice()
+            );
+            assert_gh503_memory_backing_page(&pager, &cx, page, &new_bytes).await;
+            assert_gh503_shared_cache_page_is_current(&pager, page, &new_bytes);
+            txn.commit(&cx).await.unwrap();
+
+            let mut ddl = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            let unrelated = ddl.allocate_page(&cx).await.unwrap();
+            assert_ne!(unrelated, page);
+            ddl.write_page(&cx, unrelated, &sample_page(0x33))
+                .await
+                .unwrap();
+            ddl.commit(&cx).await.unwrap();
+            assert_eq!(pager.published_snapshot().page_set_size, 0);
+
+            let mut reader = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            assert_eq!(
+                reader.get_page(&cx, page).await.unwrap().as_bytes(),
+                new_bytes.as_slice(),
+                "issue=503 case=materialized_overlay_survives_page_plane_clear"
+            );
+            reader.rollback(&cx).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_gh503_retained_overlay_rollback_preserves_last_committed_cached_page() {
+        asupersync::test_utils::run_test(|| async {
+            init_publication_test_tracing();
+            let pager = private_memory_pager().await;
+            pager.bind_shared_connection_count(Arc::new(AtomicUsize::new(1)));
+            let cx = Cx::new();
+            let old_bytes = sample_page(0x51);
+            let committed_bytes = sample_page(0x53);
+            let page = {
+                let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                let page = txn.allocate_page(&cx).await.unwrap();
+                txn.write_page(&cx, page, &old_bytes).await.unwrap();
+                txn.commit(&cx).await.unwrap();
+                page
+            };
+            assert_eq!(
+                pager.cache.get_shared(page).unwrap().as_bytes(),
+                old_bytes.as_slice()
+            );
+
+            let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            txn.write_page(&cx, page, &sample_page(0x52)).await.unwrap();
+            assert!(txn.commit_and_retain(&cx).await.unwrap());
+            txn.write_page(&cx, page, &committed_bytes).await.unwrap();
+            assert!(txn.commit_and_retain(&cx).await.unwrap());
+            assert!(txn.retained_memory_overlay_dirty_pages.contains(&page));
+            assert_eq!(pager.published_snapshot().page_set_size, 0);
+            assert_gh503_memory_backing_page(&pager, &cx, page, &old_bytes).await;
+
+            txn.write_page(&cx, page, &sample_page(0xE3)).await.unwrap();
+            let abandoned = txn.allocate_page(&cx).await.unwrap();
+            txn.write_page(&cx, abandoned, &sample_page(0xE4))
+                .await
+                .unwrap();
+            txn.rollback(&cx).await.unwrap();
+            assert!(txn.retained_memory_overlay_dirty_pages.is_empty());
+            assert_gh503_memory_backing_page(&pager, &cx, page, &committed_bytes).await;
+            assert_gh503_shared_cache_page_is_current(&pager, page, &committed_bytes);
+
+            let mut ddl = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            let unrelated = ddl.allocate_page(&cx).await.unwrap();
+            assert_eq!(unrelated, abandoned);
+            assert_ne!(unrelated, page);
+            ddl.write_page(&cx, unrelated, &sample_page(0x54))
+                .await
+                .unwrap();
+            ddl.commit(&cx).await.unwrap();
+
+            let mut reader = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            assert_eq!(
+                reader.get_page(&cx, page).await.unwrap().as_bytes(),
+                committed_bytes.as_slice(),
+                "issue=503 case=rollback_preserves_last_committed_overlay"
+            );
+            assert!(!pager.inner.lock().unwrap().freelist.contains(&page));
+            reader.rollback(&cx).await.unwrap();
         });
     }
 

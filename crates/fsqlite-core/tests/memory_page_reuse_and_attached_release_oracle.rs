@@ -16,6 +16,9 @@
 //!   database's transaction open, so its writes vanished at the next ROLLBACK.
 //! - `INSERT ... SELECT` into a missing table said `internal error: table not
 //!   found` instead of `no such table`.
+//!
+//! GH#503 additionally covers a dropped index reused by an overflow chain,
+//! followed by another schema allocation with autocommit retention disabled.
 
 use fsqlite_core::connection::{Connection, Row};
 use fsqlite_types::value::SqliteValue;
@@ -350,6 +353,456 @@ fn implicit_release_and_commit_transaction_commit_attached_participants() {
                 1,
                 "{target}"
             );
+        }
+    });
+}
+
+const GH503_CREATE_T: &str = "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b BLOB)";
+const GH503_CREATE_INDEX: &str = "CREATE INDEX ta ON t(a)";
+const GH503_CREATE_U: &str = "CREATE TABLE u (k TEXT PRIMARY KEY, v INTEGER)";
+
+async fn gh503_open_pair(
+    file_backed: bool,
+    dir: &std::path::Path,
+) -> (Connection, rusqlite::Connection) {
+    let target = if file_backed {
+        dir.join("fsqlite.db").to_string_lossy().into_owned()
+    } else {
+        ":memory:".to_owned()
+    };
+    let conn = Connection::open(&target).await.expect("GH#503 open");
+    let stock = if file_backed {
+        rusqlite::Connection::open(dir.join("stock.db")).expect("GH#503 stock file")
+    } else {
+        rusqlite::Connection::open_in_memory().expect("GH#503 stock memory")
+    };
+    stock
+        .execute_batch("PRAGMA page_size = 4096")
+        .expect("GH#503 stock page size");
+    (conn, stock)
+}
+
+async fn gh503_create_index_then_set_retention(
+    conn: &Connection,
+    stock: &rusqlite::Connection,
+    retain: bool,
+) {
+    // Preserve the report's ordering: changing retention before either DDL
+    // statement exercises a different cached/retained-transaction history.
+    run_both(conn, stock, GH503_CREATE_T).await;
+    run_both(conn, stock, GH503_CREATE_INDEX).await;
+    conn.execute(if retain {
+        "PRAGMA fsqlite.autocommit_retain = ON"
+    } else {
+        "PRAGMA fsqlite.autocommit_retain = OFF"
+    })
+    .await
+    .expect("GH#503 set retention");
+}
+
+fn gh503_stock_int(stock: &rusqlite::Connection, sql: &str) -> i64 {
+    stock
+        .query_row(sql, [], |row| row.get(0))
+        .unwrap_or_else(|error| panic!("GH#503 stock {sql}: {error}"))
+}
+
+fn gh503_pattern(len: usize, salt: u8) -> Vec<u8> {
+    // Adjacent overflow pages have different contents, so exchanging two
+    // same-sized pages cannot pass a length-only or repeated-byte assertion.
+    (0..len)
+        .map(|offset| {
+            u8::try_from((offset * 37 + (offset / 4092) * 17 + usize::from(salt)) % 256)
+                .expect("pattern byte")
+        })
+        .collect()
+}
+
+async fn gh503_insert_blob(conn: &Connection, stock: &rusqlite::Connection, blob: &[u8]) {
+    let sql = "INSERT INTO t (id, a, b) VALUES (1, 100, ?1)";
+    assert_eq!(
+        conn.execute_with_params(sql, &[SqliteValue::Blob(blob.into())])
+            .await
+            .expect("GH#503 insert bound blob"),
+        1
+    );
+    assert_eq!(
+        stock
+            .execute(sql, rusqlite::params![blob])
+            .expect("GH#503 stock insert bound blob"),
+        1
+    );
+}
+
+fn gh503_assert_blob(actual: &[u8], expected: &[u8], context: &str) {
+    assert_eq!(actual.len(), expected.len(), "{context}: BLOB length");
+    let mismatch = actual
+        .iter()
+        .zip(expected)
+        .position(|(actual, expected)| actual != expected);
+    assert!(
+        mismatch.is_none(),
+        "{context}: BLOB differs at byte {mismatch:?}"
+    );
+}
+
+async fn gh503_assert_contents(
+    conn: &Connection,
+    stock: &rusqlite::Connection,
+    expected_blob: Option<&[u8]>,
+    context: &str,
+) {
+    let sql = "SELECT id, a, b FROM t ORDER BY id";
+    let ours = conn
+        .query(sql)
+        .await
+        .unwrap_or_else(|error| panic!("{context}: fsqlite rows: {error}"));
+    let mut statement = stock.prepare(sql).expect("GH#503 stock prepare rows");
+    let theirs = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
+        })
+        .expect("GH#503 stock query rows")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("GH#503 stock rows");
+    let expected_count = usize::from(expected_blob.is_some());
+    assert_eq!(ours.len(), expected_count, "{context}: fsqlite row count");
+    assert_eq!(theirs.len(), expected_count, "{context}: stock row count");
+    if let Some(expected) = expected_blob {
+        let [
+            SqliteValue::Integer(id),
+            SqliteValue::Integer(a),
+            SqliteValue::Blob(blob),
+        ] = ours[0].values()
+        else {
+            panic!("{context}: fsqlite row must contain INTEGER, INTEGER, BLOB");
+        };
+        assert_eq!((*id, *a), (1, 100), "{context}: fsqlite row values");
+        assert_eq!((theirs[0].0, theirs[0].1), (1, 100), "{context}: stock row");
+        gh503_assert_blob(blob, expected, &format!("{context}: fsqlite"));
+        gh503_assert_blob(&theirs[0].2, expected, &format!("{context}: stock"));
+    }
+
+    let schema = "SELECT type, name, tbl_name FROM sqlite_master ORDER BY name";
+    assert_eq!(
+        render(&conn.query(schema).await.expect("GH#503 schema")),
+        stock_rows(stock, schema),
+        "{context}: schema"
+    );
+    assert_integrity_ok(conn, context).await;
+    assert_eq!(
+        stock_rows(stock, "PRAGMA integrity_check"),
+        vec![vec!["ok".to_owned()]],
+        "{context}: stock integrity"
+    );
+}
+
+async fn gh503_assert_published_state(
+    conn: &Connection,
+    stock: &rusqlite::Connection,
+    expected_blob: Option<&[u8]>,
+    expected_overflow_pages: i64,
+    context: &str,
+) {
+    gh503_assert_contents(conn, stock, expected_blob, context).await;
+    assert_eq!(one_int(conn, "PRAGMA page_size").await, 4096, "{context}");
+    assert_eq!(
+        gh503_stock_int(stock, "PRAGMA page_size"),
+        4096,
+        "{context}"
+    );
+
+    let roots_sql = "SELECT rootpage FROM sqlite_master WHERE rootpage > 0 ORDER BY rootpage";
+    let ours = conn.query(roots_sql).await.expect("GH#503 roots");
+    let ours: Vec<i64> = ours
+        .iter()
+        .map(|row| match row.get(0) {
+            Some(SqliteValue::Integer(root)) => *root,
+            other => panic!("{context}: non-integer root {other:?}"),
+        })
+        .collect();
+    let mut statement = stock.prepare(roots_sql).expect("GH#503 stock roots");
+    let theirs = statement
+        .query_map([], |row| row.get::<_, i64>(0))
+        .expect("GH#503 stock query roots")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("GH#503 stock collect roots");
+
+    for (engine, roots, pages, free) in [
+        (
+            "fsqlite",
+            ours,
+            one_int(conn, "PRAGMA page_count").await,
+            one_int(conn, "PRAGMA freelist_count").await,
+        ),
+        (
+            "stock",
+            theirs,
+            gh503_stock_int(stock, "PRAGMA page_count"),
+            gh503_stock_int(stock, "PRAGMA freelist_count"),
+        ),
+    ] {
+        assert!(free >= 0, "{context}: {engine} negative freelist count");
+        assert!(
+            roots.iter().all(|&root| root > 1 && root <= pages),
+            "{context}: {engine} root outside pages 2..={pages}: {roots:?}"
+        );
+        assert!(
+            roots.windows(2).all(|pair| pair[0] != pair[1]),
+            "{context}: {engine} shared root page: {roots:?}"
+        );
+        // The schema fits on page 1; t has at most one row, and every other
+        // B-tree is empty. Account for every page independently of the
+        // integrity walk, including the dropped index's former root. The
+        // fixture's overflow counts come from SQLite's documented record and
+        // cell layout, not FrankenSQLite's record/overflow implementation.
+        assert_eq!(
+            pages,
+            1 + i64::try_from(roots.len()).expect("root count") + expected_overflow_pages + free,
+            "{context}: {engine} page ownership: roots={roots:?}, \
+             overflow={expected_overflow_pages}, free={free}"
+        );
+    }
+}
+
+/// A=100 occupies one record byte, and the BLOB serial-type varint grows at
+/// length 8186. At 4096-byte pages the record's first three overflow thresholds
+/// therefore fall between BLOB lengths 4055/4056, 8147/8148, and 12238/12239.
+#[test]
+fn gh503_overflow_boundaries_preserve_contents_and_page_ownership() {
+    asupersync::test_utils::run_test(|| async {
+        let cases = [
+            (4054, 0),
+            (4055, 0),
+            (4056, 1),
+            (8146, 1),
+            (8147, 1),
+            (8148, 2),
+            (12237, 2),
+            (12238, 2),
+            (12239, 3),
+            (86016, 21),
+        ];
+        for file_backed in [false, true] {
+            for retain in [false, true] {
+                for (len, overflow_pages) in cases {
+                    let dir = tempfile::tempdir().expect("GH#503 boundary tempdir");
+                    let (conn, stock) = gh503_open_pair(file_backed, dir.path()).await;
+                    let context = format!(
+                        "GH#503 boundary: bytes={len}, file={file_backed}, retain={retain}"
+                    );
+                    gh503_create_index_then_set_retention(&conn, &stock, retain).await;
+                    gh503_assert_published_state(&conn, &stock, None, 0, &context).await;
+                    if !file_backed {
+                        assert_eq!(
+                            one_int(
+                                &conn,
+                                "SELECT rootpage FROM sqlite_master WHERE name = 'ta'"
+                            )
+                            .await,
+                            3,
+                            "{context}: index starts at page 3"
+                        );
+                    }
+                    let free_before_drop = one_int(&conn, "PRAGMA freelist_count").await;
+                    run_both(&conn, &stock, "DROP INDEX ta").await;
+                    gh503_assert_published_state(
+                        &conn,
+                        &stock,
+                        None,
+                        0,
+                        &format!("{context}: drop index"),
+                    )
+                    .await;
+                    assert!(
+                        one_int(&conn, "PRAGMA freelist_count").await > free_before_drop,
+                        "{context}: dropping the index must free its root"
+                    );
+                    if !file_backed {
+                        assert_eq!(
+                            one_int(&conn, "PRAGMA freelist_count").await,
+                            1,
+                            "{context}"
+                        );
+                    }
+                    let blob = gh503_pattern(len, 29);
+                    gh503_insert_blob(&conn, &stock, &blob).await;
+                    gh503_assert_published_state(
+                        &conn,
+                        &stock,
+                        Some(&blob),
+                        overflow_pages,
+                        &format!("{context}: insert"),
+                    )
+                    .await;
+                    if !file_backed {
+                        assert_eq!(
+                            one_int(&conn, "PRAGMA freelist_count").await,
+                            i64::from(overflow_pages == 0),
+                            "{context}: an overflow chain must consume the freed index page"
+                        );
+                        assert_eq!(
+                            one_int(&conn, "PRAGMA page_count").await,
+                            (2 + overflow_pages).max(3),
+                            "{context}: reuse page 3 before extending the database"
+                        );
+                    }
+                    run_both(&conn, &stock, GH503_CREATE_U).await;
+                    gh503_assert_published_state(
+                        &conn,
+                        &stock,
+                        Some(&blob),
+                        overflow_pages,
+                        &format!("{context}: create table and primary-key index"),
+                    )
+                    .await;
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn gh503_repeated_overflow_and_schema_allocations_reuse_pages_without_aliasing() {
+    asupersync::test_utils::run_test(|| async {
+        for file_backed in [false, true] {
+            for retain in [false, true] {
+                let dir = tempfile::tempdir().expect("GH#503 churn tempdir");
+                let (conn, stock) = gh503_open_pair(file_backed, dir.path()).await;
+                gh503_create_index_then_set_retention(&conn, &stock, retain).await;
+                run_both(&conn, &stock, "DROP INDEX ta").await;
+                let mut previous: Option<Vec<u8>> = None;
+                let mut page_counts = Vec::new();
+                for round in 0_u8..6 {
+                    let context =
+                        format!("GH#503 churn: round={round}, file={file_backed}, retain={retain}");
+                    if let Some(blob) = &previous {
+                        run_both(&conn, &stock, "DROP TABLE u").await;
+                        gh503_assert_published_state(
+                            &conn,
+                            &stock,
+                            Some(blob),
+                            21,
+                            &format!("{context}: drop table and index"),
+                        )
+                        .await;
+                        run_both(&conn, &stock, "DELETE FROM t WHERE id = 1").await;
+                        gh503_assert_published_state(
+                            &conn,
+                            &stock,
+                            None,
+                            0,
+                            &format!("{context}: free overflow chain"),
+                        )
+                        .await;
+                        for sql in [GH503_CREATE_INDEX, "DROP INDEX ta"] {
+                            run_both(&conn, &stock, sql).await;
+                            gh503_assert_published_state(&conn, &stock, None, 0, &context).await;
+                        }
+                    }
+                    let blob = gh503_pattern(86016, round);
+                    gh503_insert_blob(&conn, &stock, &blob).await;
+                    gh503_assert_published_state(
+                        &conn,
+                        &stock,
+                        Some(&blob),
+                        21,
+                        &format!("{context}: insert"),
+                    )
+                    .await;
+                    run_both(&conn, &stock, GH503_CREATE_U).await;
+                    gh503_assert_published_state(&conn, &stock, Some(&blob), 21, &context).await;
+                    page_counts.push(one_int(&conn, "PRAGMA page_count").await);
+                    previous = Some(blob);
+                }
+                if !file_backed {
+                    // Private-memory allocation has no concurrent EOF lease:
+                    // identical committed churn must stabilize after warm-up.
+                    // File-backed lease schedules may retain free slack, whose
+                    // ownership is checked after every transition above.
+                    assert!(
+                        page_counts[3..]
+                            .iter()
+                            .all(|&pages| pages == page_counts[3]),
+                        "GH#503 churn: retain={retain}: \
+                         continued growth after warm-up: {page_counts:?}"
+                    );
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn gh503_transaction_and_savepoint_rollback_preserve_overflow_ownership() {
+    asupersync::test_utils::run_test(|| async {
+        for file_backed in [false, true] {
+            for retain in [false, true] {
+                let dir = tempfile::tempdir().expect("GH#503 rollback tempdir");
+                let (conn, stock) = gh503_open_pair(file_backed, dir.path()).await;
+                let context = format!("GH#503 rollback: file={file_backed}, retain={retain}");
+                gh503_create_index_then_set_retention(&conn, &stock, retain).await;
+                run_both(&conn, &stock, "DROP INDEX ta").await;
+                gh503_assert_published_state(&conn, &stock, None, 0, &context).await;
+
+                let original = gh503_pattern(86016, 53);
+                run_both(&conn, &stock, "BEGIN").await;
+                gh503_insert_blob(&conn, &stock, &original).await;
+                // The active transaction's page-1 freelist header is a deferred
+                // commit-time projection (GH#113). The integrity walker checks
+                // live page ownership here; exact header accounting follows
+                // ROLLBACK/COMMIT instead of treating that stale header as live.
+                gh503_assert_contents(&conn, &stock, Some(&original), &context).await;
+                run_both(&conn, &stock, GH503_CREATE_U).await;
+                gh503_assert_contents(&conn, &stock, Some(&original), &context).await;
+                run_both(&conn, &stock, "ROLLBACK").await;
+                gh503_assert_published_state(
+                    &conn,
+                    &stock,
+                    None,
+                    0,
+                    &format!("{context}: full rollback"),
+                )
+                .await;
+
+                gh503_insert_blob(&conn, &stock, &original).await;
+                gh503_assert_published_state(&conn, &stock, Some(&original), 21, &context).await;
+                run_both(&conn, &stock, GH503_CREATE_U).await;
+                gh503_assert_published_state(&conn, &stock, Some(&original), 21, &context).await;
+
+                run_both(&conn, &stock, "BEGIN").await;
+                run_both(&conn, &stock, "SAVEPOINT replace_blob").await;
+                run_both(&conn, &stock, "DELETE FROM t WHERE id = 1").await;
+                gh503_assert_contents(&conn, &stock, None, &context).await;
+                let replacement = gh503_pattern(86016, 197);
+                gh503_insert_blob(&conn, &stock, &replacement).await;
+                gh503_assert_contents(&conn, &stock, Some(&replacement), &context).await;
+                run_both(&conn, &stock, "CREATE TABLE rolled_back (x)").await;
+                gh503_assert_contents(&conn, &stock, Some(&replacement), &context).await;
+                run_both(&conn, &stock, "ROLLBACK TO replace_blob").await;
+                gh503_assert_contents(&conn, &stock, Some(&original), &context).await;
+                run_both(&conn, &stock, "RELEASE replace_blob").await;
+                gh503_assert_contents(&conn, &stock, Some(&original), &context).await;
+                run_both(&conn, &stock, "COMMIT").await;
+                gh503_assert_published_state(
+                    &conn,
+                    &stock,
+                    Some(&original),
+                    21,
+                    &format!("{context}: savepoint rollback then commit"),
+                )
+                .await;
+                // Reallocate after both rollback kinds; discarded reservations
+                // must not let a new root overwrite the restored overflow chain.
+                for sql in ["CREATE TABLE rolled_back (x)", "DROP TABLE rolled_back"] {
+                    run_both(&conn, &stock, sql).await;
+                    gh503_assert_published_state(&conn, &stock, Some(&original), 21, &context)
+                        .await;
+                }
+            }
         }
     });
 }
