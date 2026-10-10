@@ -1,0 +1,123 @@
+{
+  "issue": "https://github.com/Dicklesworthstone/frankensqlite/issues/503",
+  "repair_commit": "be9ae2526acfbb5b863f5a0beb1b634c76ffd38f",
+  "base_commit": "a83609fa08bcc42750ed09153fdc8755c64af759",
+  "status": "Repair and regressions published; candidate runtime verification and performance measurement pending",
+  "causation_scope": "Source review identifies a retained-memory cache-publication gap. Physical-page counterproof and the repaired runtime pass have not executed. Double-allocation and causation by ea552c9ab have not been established.",
+  "source_blobs": {
+    "crates/fsqlite-pager/src/pager.rs": "b1152c09cca59bdfb8a0e740eb5b8327ec08b8b9",
+    "crates/fsqlite-core/tests/gh494_memory_commit_scaling.rs": "01e06d6e1b8b0b29a8080019f52ae72e910176ac",
+    "tests/regression_baseline.json": "05c130a23beff908ffbb1b2b1fedefa08f8fb06a"
+  },
+  "published_receipt_sha256": "1d896108c74694a6626f4943804f07af7c8032563fe93c926055b3c2a853bd29",
+  "published_v0_4_10_receipt": {
+    "recorded_at_utc": "2026-10-10T03:58:09.101026+00:00",
+    "scope": "Published v0.4.10 baseline control only; not current-main or candidate validation",
+    "release": "https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.4.10",
+    "version": "fsqlite 0.4.10",
+    "archive_sha256": "12b8ec599038c74609a3db2c6ed6fb15fd3e3258693ab7dc62830f5dd3d42fc0",
+    "manifest_sha256": "e0877e5a0b1e67b5cc8690f95096d6f3dc8d1040fda3ced91d7320682ee15ad9",
+    "executable_sha256": "c8964fdda2c474cdaad60e6c1e2909e2efadb18dfb74cb657ed39111e1ee76ea",
+    "stock_sqlite_version": "3.53.1",
+    "preliminary_attempt": "The first memory/OFF batch attempt timed out after 20 seconds; a subsequent trivial SELECT 1 completed with exit 0. Host was under heavy compiler memory pressure.",
+    "results": [
+      {
+        "name": "memory_off",
+        "command": [
+          "/workspace/scratch/722ead872eed/validation-tools/fsqlite-published-0.4.10/fsqlite",
+          ":memory:",
+          "--batch"
+        ],
+        "stdin": "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b BLOB);\nCREATE INDEX ta ON t(a);\nPRAGMA fsqlite.autocommit_retain = OFF;\nDROP INDEX ta;\nINSERT INTO t (id, a, b) VALUES (1, 100, zeroblob(86016));\nCREATE TABLE u (k TEXT PRIMARY KEY, v INTEGER);\nSELECT 't_rows', count(*) FROM t;\nPRAGMA integrity_check;\nSELECT id,a,length(b),b=zeroblob(86016) FROM t;\n",
+        "exit_code": 0,
+        "stdout": "0\nt_rows|0\ndatabase disk image is malformed: page 3 is never used\n",
+        "stderr": "",
+        "elapsed_seconds": 0.010892928999965079
+      },
+      {
+        "name": "memory_default",
+        "command": [
+          "/workspace/scratch/722ead872eed/validation-tools/fsqlite-published-0.4.10/fsqlite",
+          ":memory:",
+          "--batch"
+        ],
+        "stdin": "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b BLOB);\nCREATE INDEX ta ON t(a);\nDROP INDEX ta;\nINSERT INTO t (id, a, b) VALUES (1, 100, zeroblob(86016));\nCREATE TABLE u (k TEXT PRIMARY KEY, v INTEGER);\nSELECT 't_rows', count(*) FROM t;\nPRAGMA integrity_check;\nSELECT id,a,length(b),b=zeroblob(86016) FROM t;\n",
+        "exit_code": 0,
+        "stdout": "t_rows|1\nok\n1|100|86016|1\n",
+        "stderr": "",
+        "elapsed_seconds": 0.012039788998663425
+      },
+      {
+        "name": "file_off",
+        "command": [
+          "/workspace/scratch/722ead872eed/validation-tools/fsqlite-published-0.4.10/fsqlite",
+          "/workspace/scratch/722ead872eed/validation-tools/fsqlite-published-0.4.10/file_off.db",
+          "--batch"
+        ],
+        "stdin": "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b BLOB);\nCREATE INDEX ta ON t(a);\nPRAGMA fsqlite.autocommit_retain = OFF;\nDROP INDEX ta;\nINSERT INTO t (id, a, b) VALUES (1, 100, zeroblob(86016));\nCREATE TABLE u (k TEXT PRIMARY KEY, v INTEGER);\nSELECT 't_rows', count(*) FROM t;\nPRAGMA integrity_check;\nSELECT id,a,length(b),b=zeroblob(86016) FROM t;\n",
+        "exit_code": 0,
+        "stdout": "0\nt_rows|1\nok\n1|100|86016|1\n",
+        "stderr": "",
+        "elapsed_seconds": 0.014135876001091674,
+        "stock_readonly": {
+          "rows": 1,
+          "id_a_length": [[1, 100, 86016]],
+          "payload_all_86016_zero_bytes": true,
+          "integrity": [["ok"]]
+        }
+      }
+    ]
+  },
+  "static_verification": {
+    "source_review": "Independent production, fixture, and Rust API compatibility reviews found no actionable issue; this is not compiler or runtime validation",
+    "git_diff_check": "passed",
+    "new_core_test_formatting": "passed targeted rustfmt",
+    "ubs": {
+      "exit_code": 0,
+      "critical": 0,
+      "warnings": 138,
+      "info": 36,
+      "scope": "Changed eligible core test file with AST tooling; warnings reviewed as test setup/assertions/diagnostics; pager excluded by existing repository policy",
+      "session_log_sha256": "adfc5cdf8c1b8ba715bd678bca8e10bcf1aa377f9d1099510bdab30ef19687a1"
+    },
+    "workspace_formatting": {
+      "exit_code": 1,
+      "baseline_and_candidate_output_identical": true,
+      "each_output_bytes": 193646,
+      "each_output_sha256": "15fecfb23dfa9a54e1495134af2f0b2b5cb892bb0b906baab9b60d0425bb9970",
+      "reason": "Existing unrelated formatting differences"
+    },
+    "stock_fixture_checks": "Stock SQLite 3.53.1 passed the exact sequence, all twelve payload/reuse boundary fixtures, both memory rollback variants, and reduced CASS SQL replay with full payload and integrity checks; no FrankenSQLite candidate body ran"
+  },
+  "candidate_workspace_check": {
+    "command": "timeout --signal=TERM --kill-after=30s 900s env PATH=/opt/frankensqlite-validation/rust/bin:$PATH CARGO_HOME=/opt/frankensqlite-validation/cargo-home CARGO_TARGET_DIR=/opt/frankensqlite-validation/target CARGO_BUILD_JOBS=1 CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 RUSTC_WRAPPER=/opt/frankensqlite-validation/rustc-asupersync-single-thread RUST_MIN_STACK=8388608 MALLOC_CONF=dirty_decay_ms:0,muzzy_decay_ms:0,narenas:1 cargo check --locked --offline -Z profile-rustflags --config 'profile.dev.package.asupersync.rustflags=[\"-Z\",\"threads=1\"]' --workspace --all-targets",
+    "rustc": "1.100.0-nightly (908501772 2026-08-30)",
+    "pinned_toolchain": "nightly-2026-08-31",
+    "compiler_wrapper_scope": "Append -Z threads=1 only for asupersync because repository global rustflags otherwise append -Z threads=4 last; no feature or dependency-source changes",
+    "compiler_wrapper_sha256": "c436a025d4297f292cf5fe69961d6543bcd13fbed407e7bd0147ceda32914d1a",
+    "exit_code": 101,
+    "completed_approximately_utc": "2026-10-10T03:58:00Z",
+    "failure": "asupersync 0.5.0 rustc --emit=dep-info,metadata received SIGKILL before timeout and before FrankenSQLite source was checked",
+    "cgroup_memory_limit_bytes": 8589934592,
+    "cgroup_oom_kills_before": 10,
+    "cgroup_oom_kills_after": 11,
+    "last_sampled_compiler_vm_hwm_kib": 4447284,
+    "session_log_sha256": "c136c0cf456d40c54dde4a072d22c77b85e39e8ec9170916791d37b5c2a54642",
+    "session_resource_log_sha256": "cf19c05187724494ec655b0f5473009344b2ab230196e0b26560483d858dcb42"
+  },
+  "remaining_gates": [
+    "Run the three memory_retained_freelist_commit_survives pager guards against the pre-fix implementation and the repair, including physical-page counterproof",
+    "Run the five gh503_ ordinary core SQLite-oracle tests in gh494_memory_commit_scaling",
+    "Run test_ignore_source_collector_reports_scoped_repository_inventory in phase5_regression_guard",
+    "Complete cargo check --workspace --all-targets and cargo clippy --workspace --all-targets -- -D warnings",
+    "Build baseline and candidate with identical release flags, and run gh503_live_stock_overflow_reuse_probe in alternating baseline/candidate order with live stock SQLite in each invocation"
+  ],
+  "performance": {
+    "status": "unmeasured",
+    "published_cli_elapsed_times_are_benchmarks": false,
+    "probe": "crates/fsqlite-core/tests/gh494_memory_commit_scaling.rs::gh503_live_stock_overflow_reuse_probe",
+    "candidate_runtime_fix_verified": false,
+    "full_cass_migration_suite_run": false,
+    "cross_platform_candidate_tests_run": false
+  }
+}
