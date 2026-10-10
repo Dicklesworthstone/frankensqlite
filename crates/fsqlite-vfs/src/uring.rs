@@ -75,6 +75,47 @@ static FORCE_ASUPERSYNC_WRITE_ABORT: AtomicBool = AtomicBool::new(false);
 #[cfg(all(test, feature = "linux-asupersync-uring"))]
 static FORCE_ASUPERSYNC_DRIVER_WAIT_FAIL: AtomicBool = AtomicBool::new(false);
 
+/// Process-wide io-wq worker limits for rings created after
+/// [`set_iowq_max_workers`], bounded in the high 32 bits and unbounded in the
+/// low 32 (one word, so a reader never sees half of an update); `0` keeps the
+/// kernel's limit for a class.
+static IOWQ_MAX_WORKERS: AtomicU64 = AtomicU64::new(0);
+
+/// Cap the kernel io-wq worker threads behind this crate's io_uring rings.
+///
+/// io_uring completes file I/O inline when it can and otherwise hands it to
+/// io-wq worker threads (`iou-wrk-<tid>`), which the kernel creates per
+/// submitting thread and NUMA node. Their default limits scale with the ring
+/// size and the CPU count, so a caller that budgets its threads cannot count
+/// them. Every ring created after this call registers these limits
+/// (`IORING_REGISTER_IOWQ_MAX_WORKERS`, Linux 5.15+): each thread that submits
+/// to such a ring gets at most `bounded` workers for regular-file and block
+/// I/O and `unbounded` for work that may never complete, per NUMA node. `0`
+/// keeps the kernel's limit for that class, and `(0, 0)` stops capping rings
+/// created afterwards. Rings already created keep their limits, so call this
+/// before opening connections (each file-backed connection creates its own
+/// ring). The kernel keeps the limits with the submitting thread's workers,
+/// which it shares across rings, so a thread that has used a capped ring
+/// stays capped.
+///
+/// A ring whose limits the kernel refuses is not used: its files take the
+/// Unix path, which starts no io-wq workers.
+pub fn set_iowq_max_workers(bounded: u32, unbounded: u32) {
+    IOWQ_MAX_WORKERS.store(
+        (u64::from(bounded) << 32) | u64::from(unbounded),
+        Ordering::Release,
+    );
+}
+
+/// The limits set by [`set_iowq_max_workers`], or `None` when neither class
+/// is capped.
+#[must_use]
+pub fn iowq_max_workers() -> Option<[u32; 2]> {
+    let packed = IOWQ_MAX_WORKERS.load(Ordering::Acquire);
+    let limits = [(packed >> 32) as u32, packed as u32];
+    (limits != [0, 0]).then_some(limits)
+}
+
 fn checkpoint_or_abort(cx: &Cx) -> Result<()> {
     cx.checkpoint().map_err(|_| FrankenError::Abort)
 }
@@ -344,6 +385,8 @@ struct IoUringRuntime {
     largest_submission_batch: AtomicU64,
     #[cfg(test)]
     driver_wait: Duration,
+    /// io-wq worker limits registered on `ring`; `None` when uncapped.
+    iowq_max_workers: Option<[u32; 2]>,
     initial_status: String,
     disabled: AtomicBool,
     disable_reason: OnceLock<&'static str>,
@@ -357,6 +400,10 @@ pub struct IoUringRuntimeStatus {
     pub initial_status: String,
     pub status: String,
     pub disable_reason: Option<&'static str>,
+    /// io-wq worker limits (bounded, unbounded) registered on the ring, per
+    /// submitting thread and NUMA node; `None` when uncapped (see
+    /// [`set_iowq_max_workers`]).
+    pub iowq_max_workers: Option<[u32; 2]>,
 }
 
 impl fmt::Debug for IoUringRuntime {
@@ -370,12 +417,20 @@ impl fmt::Debug for IoUringRuntime {
             .field("disabled", &self.disabled.load(Ordering::Relaxed))
             .field("status", &self.status())
             .field("disable_reason", &self.disable_reason())
+            .field("iowq_max_workers", &self.iowq_max_workers)
             .finish_non_exhaustive()
     }
 }
 
 impl IoUringRuntime {
     fn new() -> Self {
+        Self::with_iowq_max_workers(iowq_max_workers())
+    }
+
+    /// A runtime whose ring registers `iowq_max_workers` (bounded,
+    /// unbounded). A ring the kernel refuses them for is left unavailable, so
+    /// no uncapped worker can start behind a caller that asked for a cap.
+    fn with_iowq_max_workers(iowq_max_workers: Option<[u32; 2]>) -> Self {
         #[cfg(feature = "linux-asupersync-uring")]
         {
             #[cfg(test)]
@@ -404,6 +459,20 @@ impl IoUringRuntime {
                 })
             };
             let ring_result = ring_result.and_then(|ring| {
+                if let Some(limits) = iowq_max_workers {
+                    let mut max = limits;
+                    ring.submitter()
+                        .register_iowq_max_workers(&mut max)
+                        .map_err(|error| {
+                            io::Error::new(
+                                error.kind(),
+                                format!("io-wq worker limits {limits:?} unavailable: {error}"),
+                            )
+                        })?;
+                }
+                Ok(ring)
+            });
+            let ring_result = ring_result.and_then(|ring| {
                 EventFd::from_flags(EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK)
                     .map(|wakeup| (ring, wakeup))
                     .map_err(io::Error::from)
@@ -420,6 +489,8 @@ impl IoUringRuntime {
                     format!("unavailable:asupersync-shared-uring:{error}"),
                 ),
             };
+            // Limits are reported only where a ring registered them.
+            let iowq_max_workers = iowq_max_workers.filter(|_| ring.is_some());
             let disable_reason = OnceLock::new();
             if forced_failure {
                 let _ = disable_reason.set(IO_URING_ASUPERSYNC_INIT_FAILED_MSG);
@@ -438,6 +509,7 @@ impl IoUringRuntime {
                 largest_submission_batch: AtomicU64::new(0),
                 #[cfg(test)]
                 driver_wait: IO_URING_DRIVER_WAIT,
+                iowq_max_workers,
                 initial_status,
                 disabled: AtomicBool::new(forced_failure),
                 disable_reason,
@@ -491,6 +563,7 @@ impl IoUringRuntime {
             initial_status: self.initial_status.clone(),
             status: self.status(),
             disable_reason: self.disable_reason(),
+            iowq_max_workers: self.iowq_max_workers,
         }
     }
 
@@ -3237,5 +3310,187 @@ mod tests {
         let status = vfs.status();
         let snap = vfs.status_snapshot();
         assert!(status.contains(snap.backend));
+    }
+
+    /// The calling thread's kernel thread ID.
+    fn current_tid() -> i32 {
+        let link = std::fs::read_link("/proc/thread-self").expect("read /proc/thread-self");
+        link.file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.parse().ok())
+            .expect("a numeric thread ID")
+    }
+
+    /// io-wq workers serving submissions from thread `tid` (the kernel names
+    /// them `iou-wrk-<tid>`), so other tests' workers are not counted.
+    fn iowq_workers_of(tid: i32) -> usize {
+        let name = format!("iou-wrk-{tid}");
+        std::fs::read_dir("/proc/self/task")
+            .expect("list this process's threads")
+            .filter_map(|entry| std::fs::read_to_string(entry.ok()?.path().join("comm")).ok())
+            .filter(|comm| comm.trim_end() == name)
+            .count()
+    }
+
+    /// Submit `n` opens of FIFOs that have no writer from this thread, forced
+    /// to io-wq (`IOSQE_ASYNC`; inline, io_uring would open them non-blocking
+    /// and succeed at once). Each open blocks its worker until a writer
+    /// arrives, so the kernel starts a worker per open up to the limit.
+    /// Returns the most workers this thread had while the opens were blocked;
+    /// then releases and completes every open.
+    fn peak_workers_behind_blocked_opens(runtime: &IoUringRuntime, n: usize) -> usize {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fifos: Vec<PathBuf> = (0..n)
+            .map(|i| dir.path().join(format!("fifo-{i}")))
+            .collect();
+        for fifo in &fifos {
+            let made = std::process::Command::new("mkfifo")
+                .arg(fifo)
+                .status()
+                .expect("run mkfifo");
+            assert!(made.success(), "mkfifo {}", fifo.display());
+        }
+        let paths: Vec<std::ffi::CString> = fifos
+            .iter()
+            .map(|fifo| std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("path"))
+            .collect();
+        let tid = current_tid();
+        let mut ring = runtime
+            .ring
+            .as_ref()
+            .expect("ring")
+            .lock()
+            .expect("ring lock");
+        for (index, path) in paths.iter().enumerate() {
+            let entry = opcode::OpenAt::new(types::Fd(libc::AT_FDCWD), path.as_ptr())
+                .flags(libc::O_RDONLY | libc::O_CLOEXEC)
+                .build()
+                .flags(io_uring::squeue::Flags::ASYNC)
+                .user_data(index as u64);
+            push_submission(&mut ring, &entry).expect("queue open");
+        }
+        assert_eq!(ring.submit().expect("submit opens"), n);
+        let mut peak = 0;
+        let observe_until = Instant::now() + Duration::from_millis(1500);
+        while Instant::now() < observe_until {
+            peak = peak.max(iowq_workers_of(tid));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // A non-blocking writer open succeeds once its reader is waiting
+        // (ENXIO before that), so the writers retry up to a deadline instead
+        // of blocking: a reader that never arrives fails the test, not hangs it.
+        let writers: Vec<_> = fifos
+            .into_iter()
+            .map(|fifo| {
+                std::thread::spawn(move || {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    let deadline = Instant::now() + Duration::from_secs(30);
+                    loop {
+                        match std::fs::OpenOptions::new()
+                            .write(true)
+                            .custom_flags(libc::O_NONBLOCK)
+                            .open(&fifo)
+                        {
+                            Ok(writer) => return writer,
+                            Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
+                                assert!(
+                                    Instant::now() < deadline,
+                                    "no reader for {}",
+                                    fifo.display()
+                                );
+                                std::thread::sleep(Duration::from_millis(5));
+                            }
+                            Err(error) => panic!("open writer {}: {error}", fifo.display()),
+                        }
+                    }
+                })
+            })
+            .collect();
+        let mut completed = 0;
+        let complete_by = Instant::now() + Duration::from_secs(30);
+        while completed < n {
+            assert!(
+                Instant::now() < complete_by,
+                "only {completed} of {n} opens completed"
+            );
+            let wait = types::Timespec::from(Duration::from_millis(100));
+            match ring
+                .submitter()
+                .submit_with_args(1, &types::SubmitArgs::new().timespec(&wait))
+            {
+                Ok(_) => {}
+                Err(error) if error.raw_os_error() == Some(libc::ETIME) => {}
+                Err(error) => panic!("wait for an open: {error}"),
+            }
+            for cqe in ring.completion() {
+                let fd = cqe.result();
+                assert!(fd >= 0, "open {} failed: {fd}", cqe.user_data());
+                // SAFETY: `fd` is the descriptor this test's own OpenAt just
+                // returned; nothing else holds it.
+                unsafe { libc::close(fd) };
+                completed += 1;
+            }
+        }
+        drop(ring);
+        for writer in writers {
+            drop(writer.join().expect("writer thread"));
+        }
+        // `paths` must outlive the completed opens that read them.
+        drop(paths);
+        peak
+    }
+
+    #[test]
+    fn iowq_limits_cap_the_workers_behind_a_submitting_thread() {
+        let _guard = io_uring_test_guard();
+        // io-wq workers belong to the submitting thread and carry the limits
+        // of the rings it used, so each measurement gets a fresh thread.
+        let on_fresh_thread = |runtime: &IoUringRuntime| {
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| peak_workers_behind_blocked_opens(runtime, 6))
+                    .join()
+                    .expect("measurement thread")
+            })
+        };
+        let capped = IoUringRuntime::with_iowq_max_workers(Some([1, 1]));
+        assert!(capped.is_available(), "{}", capped.status());
+        assert_eq!(capped.snapshot().iowq_max_workers, Some([1, 1]));
+        let peak = on_fresh_thread(&capped);
+        assert!(
+            peak <= 1,
+            "six blocked opens on a [1, 1] ring started {peak} workers"
+        );
+        // Honest counterpart: the same blocked opens on an uncapped ring
+        // start several workers, so the probe does see workers.
+        let uncapped = IoUringRuntime::with_iowq_max_workers(None);
+        assert_eq!(uncapped.snapshot().iowq_max_workers, None);
+        let peak = on_fresh_thread(&uncapped);
+        assert!(
+            peak > 1,
+            "six blocked opens on an uncapped ring started {peak} worker(s)"
+        );
+    }
+
+    #[test]
+    fn set_iowq_max_workers_applies_to_rings_created_afterwards() {
+        let _guard = io_uring_test_guard();
+        let before = IoUringVfs::new();
+        set_iowq_max_workers(2, 1);
+        assert_eq!(iowq_max_workers(), Some([2, 1]));
+        let capped = IoUringVfs::new();
+        set_iowq_max_workers(0, 0);
+        assert_eq!(iowq_max_workers(), None);
+        let after = IoUringVfs::new();
+        assert!(capped.is_available(), "{}", capped.status());
+        assert_eq!(capped.status_snapshot().iowq_max_workers, Some([2, 1]));
+        assert_eq!(
+            before.status_snapshot().iowq_max_workers,
+            None,
+            "an earlier ring keeps its limits"
+        );
+        assert_eq!(after.status_snapshot().iowq_max_workers, None);
     }
 }
