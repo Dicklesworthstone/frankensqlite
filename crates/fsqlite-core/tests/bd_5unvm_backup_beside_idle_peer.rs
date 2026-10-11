@@ -78,8 +78,10 @@ fn backup_exact_succeeds_beside_idle_peer_process() {
             let mut line = String::new();
             let read = peer_stdout.read_line(&mut line).expect("read peer stdout");
             assert!(read > 0, "peer exited before reporting readiness");
-            if line.starts_with(READY) {
-                assert_eq!(line.trim(), format!("{READY} 500"));
+            // The peer's libtest writes "test <name> ... " with no newline
+            // before the test body runs, so readiness can share that line.
+            if let Some(at) = line.find(READY) {
+                assert_eq!(line[at..].trim(), format!("{READY} 500"));
                 break;
             }
             assert!(started.elapsed() < Duration::from_secs(60), "peer never became ready");
