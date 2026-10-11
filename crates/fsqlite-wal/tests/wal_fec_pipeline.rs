@@ -242,7 +242,12 @@ fn repair_pipeline_emits_bounded_diagnostics_with_exact_totals() {
 
 #[test]
 fn repair_pipeline_refuses_inline_blocking_fallback() {
-    let runtime = RuntimeBuilder::current_thread().build().unwrap();
+    // No blocking pool, stated explicitly: since Asupersync 0.6 a bare
+    // `RuntimeBuilder` gets an on-demand pool by default.
+    let runtime = RuntimeBuilder::current_thread()
+        .blocking_threads(0, 0)
+        .build()
+        .unwrap();
     let handle = runtime.handle();
     runtime.block_on(async {
         let result =
