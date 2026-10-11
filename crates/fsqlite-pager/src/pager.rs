@@ -58768,7 +58768,7 @@ mod tests {
                     {
                         let mut freeing =
                             pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
-                        freeing.free_page(&cx, reusable).unwrap();
+                        freeing.free_page(&cx, reusable).await.unwrap();
                         freeing.commit(&cx).await.unwrap();
                     }
                     let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
