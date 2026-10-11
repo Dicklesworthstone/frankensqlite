@@ -26995,8 +26995,11 @@ impl Connection {
             "connection close staged drop",
         );
 
+        // Only in WAL mode: leaving it retired the WAL, and the producer with
+        // it, so there is no tail to admit.
         #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
-        if let Some(pipeline) = self.wal_fec_pipeline.get_mut().as_ref()
+        if self.pager.journal_mode() == JournalMode::Wal
+            && let Some(pipeline) = self.wal_fec_pipeline.get_mut().as_ref()
             && let Some(producer) = pipeline.producer()
         {
             // A full repair queue defers a durable commit's admission instead

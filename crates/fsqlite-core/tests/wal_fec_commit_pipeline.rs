@@ -761,13 +761,41 @@ fn normal_sync_close_can_checkpoint_after_repair_worker_drains() {
     });
 }
 
+/// Records the message of every event it is given; filter it to WARN.
+struct WarnCollector(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnCollector {
+    fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+        struct Message(String);
+        impl tracing::field::Visit for Message {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                }
+            }
+        }
+        let mut message = Message(String::new());
+        event.record(&mut message);
+        self.0.lock().unwrap().push(message.0);
+    }
+}
+
 /// Leaving WAL mode drops the WAL backend together with the repair producer it
-/// held, so close has nothing to detach. Close used to fail with "WAL mode
-/// active but no WAL backend installed" whenever the runtime had a blocking
-/// pool (on Asupersync 0.6, every bare `RuntimeBuilder`).
+/// held, so close has nothing to detach and no WAL tail to admit. Close used to
+/// fail with "WAL mode active but no WAL backend installed" whenever the
+/// runtime had a blocking pool (on Asupersync 0.6, every bare `RuntimeBuilder`),
+/// and its close-time admission warned that restart catch-up would cover a WAL
+/// tail that no longer exists.
 #[test]
 fn close_after_leaving_wal_mode_succeeds() {
-    run_with_repair_pool(async {
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let warnings = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    // WARN and above only: enabling DEBUG would move DML to its instrumented path.
+    let collector = WarnCollector(std::sync::Arc::clone(&warnings)).with_filter(tracing_subscriber::filter::LevelFilter::WARN);
+    let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(collector));
+    tracing::dispatcher::with_default(&dispatch, || run_with_repair_pool(async {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("left-wal.db");
         let conn = open(&db).await;
@@ -779,5 +807,7 @@ fn close_after_leaving_wal_mode_succeeds() {
         conn.close().await.expect("close after leaving WAL mode");
         let stock = rusqlite::Connection::open(&db).unwrap();
         assert_eq!(stock.query_row("SELECT COUNT(*) FROM t", [], |row| row.get::<_, i64>(0)).unwrap(), 2);
-    });
+    }));
+    let warnings = warnings.lock().unwrap();
+    assert!(!warnings.iter().any(|warning| warning.contains("close-time admission")), "{warnings:?}");
 }
