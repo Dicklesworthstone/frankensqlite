@@ -15971,13 +15971,21 @@ where
         Ok(())
     }
 
-    /// Attach the connection's region-owned repair producer to the WAL backend.
+    /// Attach the connection's region-owned repair producer to the WAL backend,
+    /// or detach it with `None`.
+    ///
+    /// Detaching succeeds when no WAL backend is installed: leaving WAL mode
+    /// drops the backend together with the producer it held, so there is
+    /// nothing left to detach.
     #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
     pub async fn set_wal_fec_producer(
         &self,
         cx: &Cx,
         producer: Option<fsqlite_wal::wal_fec::WalFecRepairProducer>,
     ) -> Result<()> {
+        if producer.is_none() && !has_wal_backend(&self.wal_backend)? {
+            return Ok(());
+        }
         with_wal_backend(&self.wal_backend, cx, |wal, cx| {
             Box::pin(async move {
                 if producer.is_some() {

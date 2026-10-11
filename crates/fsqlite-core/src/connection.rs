@@ -27012,11 +27012,20 @@ impl Connection {
             }
         }
         #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
-        if self.wal_fec_pipeline.get_mut().is_some() {
+        if self.wal_fec_pipeline.get_mut().is_some()
+            && let Err(error) = self.pager.set_wal_fec_producer(&cx, None).await
+        {
             // Close-time checkpointing can perform another WAL sync. Remove
             // admission before stopping the worker so that sync cannot address
             // a closed queue. Keep the pipeline owned here if detaching fails.
-            self.pager.set_wal_fec_producer(&cx, None).await?;
+            if !best_effort {
+                return Err(error);
+            }
+            // A best-effort close takes no checkpoint, so it stops the worker
+            // and finishes anyway. A later sync through the still-attached
+            // producer finds the queue closed and leaves those frames to
+            // restart catch-up, as after `Drop`.
+            tracing::warn!(%error, "best-effort close: WAL-FEC producer detach failed; stopping the worker anyway");
         }
         #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
         if let Some(mut pipeline) = self.wal_fec_pipeline.get_mut().take() {
@@ -163667,6 +163676,40 @@ mod tests {
 
             // Poisoned runtimes may cause release_connection to fail, so use
             // best-effort close which tolerates cleanup errors.
+            conn.close_best_effort_in_place().await;
+
+            assert!(*conn.closed.get_mut());
+            assert!(!*conn.in_transaction.get_mut());
+            assert!(conn.active_txn.get_mut().is_none());
+        });
+    }
+
+    /// The same on a runtime with a blocking pool, where the connection owns a
+    /// WAL-FEC pipeline and detaching its producer fails on the poisoned
+    /// runtime: the best-effort close must still finish.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+    #[test]
+    fn test_close_best_effort_with_wal_fec_pipeline_cleans_up_poisoned_runtime() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(1, 1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("close-poisoned-runtime-fec.db");
+            let db_path = db_path.to_string_lossy().into_owned();
+
+            let mut conn = Connection::open(&db_path).await.unwrap();
+            conn.execute("CREATE TABLE t (x INTEGER)").await.unwrap();
+            assert!(
+                conn.wal_fec_pipeline.get_mut().is_some(),
+                "a runtime with a blocking pool gives the connection a WAL-FEC pipeline"
+            );
+            conn.execute("BEGIN").await.unwrap();
+            conn.execute("INSERT INTO t VALUES (9)").await.unwrap();
+
+            conn._shared_mvcc_state
+                .poison("simulated poisoned runtime for close");
             conn.close_best_effort_in_place().await;
 
             assert!(*conn.closed.get_mut());

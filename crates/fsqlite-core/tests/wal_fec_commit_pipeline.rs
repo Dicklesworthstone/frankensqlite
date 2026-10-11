@@ -760,3 +760,24 @@ fn normal_sync_close_can_checkpoint_after_repair_worker_drains() {
         assert_eq!(stock.query_row("SELECT value FROM t", [], |row| row.get::<_, i64>(0)).unwrap(), 8);
     });
 }
+
+/// Leaving WAL mode drops the WAL backend together with the repair producer it
+/// held, so close has nothing to detach. Close used to fail with "WAL mode
+/// active but no WAL backend installed" whenever the runtime had a blocking
+/// pool (on Asupersync 0.6, every bare `RuntimeBuilder`).
+#[test]
+fn close_after_leaving_wal_mode_succeeds() {
+    run_with_repair_pool(async {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("left-wal.db");
+        let conn = open(&db).await;
+        conn.execute("CREATE TABLE t(value INTEGER);").await.unwrap();
+        conn.execute("INSERT INTO t VALUES (1);").await.unwrap();
+        wait_for_last_group(&db).await; // The repair pipeline is live.
+        assert_eq!(conn.query("PRAGMA journal_mode = DELETE;").await.unwrap()[0].values(), &[SqliteValue::Text("delete".into())]);
+        conn.execute("INSERT INTO t VALUES (2);").await.unwrap();
+        conn.close().await.expect("close after leaving WAL mode");
+        let stock = rusqlite::Connection::open(&db).unwrap();
+        assert_eq!(stock.query_row("SELECT COUNT(*) FROM t", [], |row| row.get::<_, i64>(0)).unwrap(), 2);
+    });
+}
