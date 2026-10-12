@@ -73,9 +73,9 @@ add these dependencies to the application's `Cargo.toml`:
 
 ```toml
 [dependencies]
-fsqlite-core = "0.3.16"
-fsqlite-types = "0.3.16"
-asupersync = { version = "0.4.10", default-features = false }
+fsqlite-core = "0.4.12"
+fsqlite-types = "0.4.12"
+asupersync = { version = "0.5.0", default-features = false }
 ```
 
 The caller owns the asupersync runtime that polls the engine's futures. This
