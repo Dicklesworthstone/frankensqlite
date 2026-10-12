@@ -504,17 +504,25 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> DurableWriteCoordinator<S, M,
     ) -> std::result::Result<Vec<CommitSeq>, DurableCommitError> {
         self.ready()?;
         checkpoint(cx)?;
-        if self.pending_count().checked_add(submissions.len()).is_none_or(
-            |count| count > self.coordinator.batch.max_batch_size,
-        ) {
+        if self
+            .pending_count()
+            .checked_add(submissions.len())
+            .is_none_or(|count| count > self.coordinator.batch.max_batch_size)
+        {
             return Err(FrankenError::Busy.into());
         }
         let mut prepared = Vec::new();
         let mut sequences = Vec::new();
         let mut tokens = HashSet::new();
-        prepared.try_reserve_exact(submissions.len()).map_err(|_| FrankenError::OutOfMemory)?;
-        sequences.try_reserve_exact(submissions.len()).map_err(|_| FrankenError::OutOfMemory)?;
-        tokens.try_reserve(submissions.len()).map_err(|_| FrankenError::OutOfMemory)?;
+        prepared
+            .try_reserve_exact(submissions.len())
+            .map_err(|_| FrankenError::OutOfMemory)?;
+        sequences
+            .try_reserve_exact(submissions.len())
+            .map_err(|_| FrankenError::OutOfMemory)?;
+        tokens
+            .try_reserve(submissions.len())
+            .map_err(|_| FrankenError::OutOfMemory)?;
         let mut pages = BTreeSet::new();
         let mut seq = self.coordinator.allocated_seq_tip;
         let mut time = self.coordinator.last_commit_time_ns;
@@ -525,46 +533,78 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> DurableWriteCoordinator<S, M,
             if submission.begin_seq > self.committed_tip() {
                 return Err(corrupt("native submission claims an uncommitted snapshot").into());
             }
-            if !tokens.insert(submission.txn_token) || self.coordinator.batch.pending.iter()
-                .any(|pc| pc.submission.txn_token == submission.txn_token)
+            if !tokens.insert(submission.txn_token)
+                || self
+                    .coordinator
+                    .batch
+                    .pending
+                    .iter()
+                    .any(|pc| pc.submission.txn_token == submission.txn_token)
             {
                 return Err(corrupt("native transaction token is already queued").into());
             }
-            self.coordinator.validate(&submission).map_err(DurableCommitError::Rejected)?;
+            self.coordinator
+                .validate(&submission)
+                .map_err(DurableCommitError::Rejected)?;
             // Every member's snapshot is <= the already committed tip, so any
             // page reserved by an earlier member necessarily conflicts.
-            let conflicts: Vec<_> = submission.write_set_pages.iter()
-                .filter(|page| pages.contains(*page)).copied().collect();
+            let conflicts: Vec<_> = submission
+                .write_set_pages
+                .iter()
+                .filter(|page| pages.contains(*page))
+                .copied()
+                .collect();
             if !conflicts.is_empty() {
                 GLOBAL_GROUP_COMMIT_METRICS.record_fcw_conflict();
                 return Err(DurableCommitError::Rejected(CommitResult::ConflictFcw {
                     conflicting_pages: conflicts,
                 }));
             }
-            seq = seq.get().checked_add(1).map(CommitSeq::new)
+            seq = seq
+                .get()
+                .checked_add(1)
+                .map(CommitSeq::new)
                 .ok_or(FrankenError::DatabaseFull)?;
             time = now_unix_ns.max(time.saturating_add(1));
-            let proof = NativeCommitProof { commit_seq: seq, commit_time_unix_ns: time, submission };
+            let proof = NativeCommitProof {
+                commit_seq: seq,
+                commit_time_unix_ns: time,
+                submission,
+            };
             let bytes = proof.to_bytes()?;
             let records = self.codec.encode(cx, &bytes)?;
-            let object_id = records.first()
-                .ok_or_else(|| corrupt("proof encoder returned no symbols"))?.object_id;
+            let object_id = records
+                .first()
+                .ok_or_else(|| corrupt("proof encoder returned no symbols"))?
+                .object_id;
             let encoded_bytes = records.iter().try_fold(bytes.len(), |total, record| {
-                if record.object_id != object_id || record.symbol_data.len()
-                    != usize::try_from(record.oti.t).map_err(|_| FrankenError::TooBig)?
+                if record.object_id != object_id
+                    || record.symbol_data.len()
+                        != usize::try_from(record.oti.t).map_err(|_| FrankenError::TooBig)?
                 {
                     return Err(corrupt("inconsistent encoded proof symbols"));
                 }
-                total.checked_add(record.symbol_data.len()).and_then(|n| n.checked_add(76))
+                total
+                    .checked_add(record.symbol_data.len())
+                    .and_then(|n| n.checked_add(76))
                     .ok_or(FrankenError::TooBig)
             })?;
-            buffered = buffered.checked_add(encoded_bytes).ok_or(FrankenError::TooBig)?;
-            metadata = metadata.checked_add(bytes.len()).ok_or(FrankenError::TooBig)?;
-            if buffered.checked_add(metadata).is_none_or(|n| n > MAX_NATIVE_VALIDATION_BYTES) {
+            buffered = buffered
+                .checked_add(encoded_bytes)
+                .ok_or(FrankenError::TooBig)?;
+            metadata = metadata
+                .checked_add(bytes.len())
+                .ok_or(FrankenError::TooBig)?;
+            if buffered
+                .checked_add(metadata)
+                .is_none_or(|n| n > MAX_NATIVE_VALIDATION_BYTES)
+            {
                 return Err(FrankenError::TooBig.into());
             }
             if self.codec.decode(cx, object_id, &records)? != bytes {
-                return Err(corrupt("proof encoder did not preserve canonical admission bytes").into());
+                return Err(
+                    corrupt("proof encoder did not preserve canonical admission bytes").into(),
+                );
             }
             pages.extend(proof.submission.write_set_pages.iter().copied());
             sequences.push(seq);
@@ -572,14 +612,22 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> DurableWriteCoordinator<S, M,
         }
         // Reserve fallible publication capacity and observe cancellation one
         // final time. No codec, await or Result-returning work follows this.
-        self.coordinator.batch.pending.try_reserve(prepared.len())
+        self.coordinator
+            .batch
+            .pending
+            .try_reserve(prepared.len())
             .map_err(|_| FrankenError::OutOfMemory)?;
-        self.coordinator.commit_index.entries.try_reserve(pages.len())
+        self.coordinator
+            .commit_index
+            .entries
+            .try_reserve(pages.len())
             .map_err(|_| FrankenError::OutOfMemory)?;
         checkpoint(cx)?;
         for (proof, object_id, encoded) in prepared {
             let reserved = self.coordinator.enqueue_validated(
-                proof.submission, proof.commit_time_unix_ns, object_id,
+                proof.submission,
+                proof.commit_time_unix_ns,
+                object_id,
             );
             debug_assert_eq!(reserved, proof.commit_seq);
             self.metadata_sizes.insert(reserved, encoded.bytes.len());
@@ -859,8 +907,16 @@ mod group_admission_tests {
             let size = u32::try_from(bytes.len()).map_err(|_| FrankenError::TooBig)?;
             Ok(vec![SymbolRecord::new(
                 ObjectId::derive_from_canonical_bytes(bytes),
-                Oti { f: u64::from(size), al: 1, t: size, z: 1, n: 1 },
-                0, bytes.to_vec(), SymbolRecordFlags::SYSTEMATIC_RUN_START,
+                Oti {
+                    f: u64::from(size),
+                    al: 1,
+                    t: size,
+                    z: 1,
+                    n: 1,
+                },
+                0,
+                bytes.to_vec(),
+                SymbolRecordFlags::SYSTEMATIC_RUN_START,
             )])
         }
         fn decode(&self, _: &Cx, id: ObjectId, records: &[SymbolRecord]) -> Result<Vec<u8>> {
@@ -876,17 +932,42 @@ mod group_admission_tests {
     type Driver = DurableWriteCoordinator<File, File, Codec>;
 
     fn file(vfs: &MemoryVfs, cx: &Cx, name: &str) -> File {
-        vfs.open(cx, Some(std::path::Path::new(name)),
-            VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL).unwrap().0
+        vfs.open(
+            cx,
+            Some(std::path::Path::new(name)),
+            VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL,
+        )
+        .unwrap()
+        .0
     }
     fn driver(cx: &Cx, max: usize, failure: u8) -> Driver {
         let vfs = MemoryVfs::new();
-        let log = NativeDurabilityLog::create(cx, file(&vfs, cx, "objects"),
-            file(&vfs, cx, "markers"), NativeDurabilityLimits::default()).unwrap();
-        let mut driver = Driver::new(log, Codec { calls: AtomicUsize::new(0), fail_at: 2, failure }, max).unwrap();
-        let plain = Codec { calls: AtomicUsize::new(0), fail_at: 0, failure: 0 };
+        let log = NativeDurabilityLog::create(
+            cx,
+            file(&vfs, cx, "objects"),
+            file(&vfs, cx, "markers"),
+            NativeDurabilityLimits::default(),
+        )
+        .unwrap();
+        let mut driver = Driver::new(
+            log,
+            Codec {
+                calls: AtomicUsize::new(0),
+                fail_at: 2,
+                failure,
+            },
+            max,
+        )
+        .unwrap();
+        let plain = Codec {
+            calls: AtomicUsize::new(0),
+            fail_at: 0,
+            failure: 0,
+        };
         for seed in 1_u8..=8 {
-            driver.stage_symbols(cx, &plain.encode(cx, &[seed; 8]).unwrap()).expect("stage capsule");
+            driver
+                .stage_symbols(cx, &plain.encode(cx, &[seed; 8]).unwrap())
+                .expect("stage capsule");
         }
         driver
     }
@@ -895,13 +976,17 @@ mod group_admission_tests {
             capsule_object_id: ObjectId::derive_from_canonical_bytes(&[seed; 8]),
             capsule_digest: *blake3::hash(&[seed; 8]).as_bytes(),
             write_set_pages: vec![PageNumber::new(u32::from(seed)).unwrap()],
-            witness_refs: vec![], edge_ids: vec![], merge_witness_ids: vec![],
+            witness_refs: vec![],
+            edge_ids: vec![],
+            merge_witness_ids: vec![],
             txn_token: TxnToken::new(TxnId::new(u64::from(seed)).unwrap(), TxnEpoch::new(1)),
             begin_seq: CommitSeq::ZERO,
         }
     }
     fn guard() -> std::sync::MutexGuard<'static, ()> {
-        crate::metrics::GLOBAL_GROUP_COMMIT_METRICS_TEST_LOCK.lock().unwrap()
+        crate::metrics::GLOBAL_GROUP_COMMIT_METRICS_TEST_LOCK
+            .lock()
+            .unwrap()
     }
     fn assert_unreserved(driver: &Driver) {
         assert_eq!(driver.pending_count(), 0);
@@ -919,23 +1004,41 @@ mod group_admission_tests {
     #[test]
     fn native_group_admission_publishes_in_order_without_consuming_other_replies() {
         let _guard = guard();
-        let cx = Cx::new(); let mut driver = driver(&cx, 8, 0);
+        let cx = Cx::new();
+        let mut driver = driver(&cx, 8, 0);
         let first = driver.queue(&cx, submission(1), 100).unwrap();
         driver.flush(&cx, |_, _| Ok(())).expect("first publication");
-        let sequences = driver.queue_batch(&cx, vec![submission(2), submission(3)], 50).unwrap();
+        let sequences = driver
+            .queue_batch(&cx, vec![submission(2), submission(3)], 50)
+            .unwrap();
         assert_eq!(sequences, vec![CommitSeq::new(2), CommitSeq::new(3)]);
         assert_eq!(driver.committed_tip(), first);
         assert!(driver.take_committed(sequences[0]).is_none());
-        let receipt = driver.flush(&cx, |candidates, _| {
-            assert_eq!(candidates.len(), 2);
-            assert_eq!(candidates[0].proof.commit_time_unix_ns, 101);
-            assert_eq!(candidates[1].proof.commit_time_unix_ns, 102);
-            Ok(())
-        }).expect("group publication").unwrap();
+        let receipt = driver
+            .flush(&cx, |candidates, _| {
+                assert_eq!(candidates.len(), 2);
+                assert_eq!(candidates[0].proof.commit_time_unix_ns, 101);
+                assert_eq!(candidates[1].proof.commit_time_unix_ns, 102);
+                Ok(())
+            })
+            .expect("group publication")
+            .unwrap();
         assert_eq!(receipt.commits, 2);
-        assert_eq!(driver.take_committed(sequences[1]).unwrap().txn_token, submission(3).txn_token);
-        assert_eq!(driver.take_committed(first).unwrap().txn_token, submission(1).txn_token);
-        assert_eq!(driver.take_committed(sequences[0]).unwrap().commit_time_unix_ns, 101);
+        assert_eq!(
+            driver.take_committed(sequences[1]).unwrap().txn_token,
+            submission(3).txn_token
+        );
+        assert_eq!(
+            driver.take_committed(first).unwrap().txn_token,
+            submission(1).txn_token
+        );
+        assert_eq!(
+            driver
+                .take_committed(sequences[0])
+                .unwrap()
+                .commit_time_unix_ns,
+            101
+        );
         assert_eq!(driver.pending_count(), 0);
         driver.close(&cx).unwrap();
     }
@@ -944,18 +1047,34 @@ mod group_admission_tests {
     fn native_group_admission_rejects_late_conflicts_tokens_and_future_snapshots_atomically() {
         let _guard = guard();
         for case in 0..3 {
-            let cx = Cx::new(); let mut driver = driver(&cx, 8, 0);
+            let cx = Cx::new();
+            let mut driver = driver(&cx, 8, 0);
             let mut second = submission(2);
             match case {
                 0 => second.write_set_pages = submission(1).write_set_pages,
                 1 => second.txn_token = submission(1).txn_token,
                 _ => second.begin_seq = CommitSeq::new(1),
             }
-            assert!(driver.queue_batch(&cx, vec![submission(1), second], 500).is_err());
+            assert!(
+                driver
+                    .queue_batch(&cx, vec![submission(1), second], 500)
+                    .is_err()
+            );
             assert_unreserved(&driver);
-            assert_eq!(driver.queue(&cx, submission(1), 10).unwrap(), CommitSeq::new(1));
-            driver.flush(&cx, |_, _| Ok(())).expect("rejected group left no FCW residue");
-            assert_eq!(driver.take_committed(CommitSeq::new(1)).unwrap().commit_time_unix_ns, 10);
+            assert_eq!(
+                driver.queue(&cx, submission(1), 10).unwrap(),
+                CommitSeq::new(1)
+            );
+            driver
+                .flush(&cx, |_, _| Ok(()))
+                .expect("rejected group left no FCW residue");
+            assert_eq!(
+                driver
+                    .take_committed(CommitSeq::new(1))
+                    .unwrap()
+                    .commit_time_unix_ns,
+                10
+            );
             driver.close(&cx).unwrap();
         }
     }
@@ -964,16 +1083,25 @@ mod group_admission_tests {
     fn native_group_admission_codec_error_cancel_and_unwind_leave_no_reserved_prefix() {
         let _guard = guard();
         for failure in 1..=3 {
-            let cx = Cx::new(); let mut driver = driver(&cx, 8, failure);
+            let cx = Cx::new();
+            let mut driver = driver(&cx, 8, failure);
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 driver.queue_batch(&cx, vec![submission(1), submission(2)], 500)
             }));
-            if failure == 3 { assert!(outcome.is_err()); }
-            else { assert!(outcome.unwrap().is_err()); }
+            if failure == 3 {
+                assert!(outcome.is_err());
+            } else {
+                assert!(outcome.unwrap().is_err());
+            }
             assert_unreserved(&driver);
             let fresh_cx = Cx::new();
-            assert_eq!(driver.queue(&fresh_cx, submission(1), 10).unwrap(), CommitSeq::new(1));
-            driver.flush(&fresh_cx, |_, _| Ok(())).expect("retry after failed encoding");
+            assert_eq!(
+                driver.queue(&fresh_cx, submission(1), 10).unwrap(),
+                CommitSeq::new(1)
+            );
+            driver
+                .flush(&fresh_cx, |_, _| Ok(()))
+                .expect("retry after failed encoding");
             driver.take_committed(CommitSeq::new(1)).unwrap();
             driver.close(&fresh_cx).unwrap();
         }
@@ -982,20 +1110,29 @@ mod group_admission_tests {
     #[test]
     fn native_group_admission_preserves_existing_queue_when_the_group_cannot_fit() {
         let _guard = guard();
-        let cx = Cx::new(); let mut driver = driver(&cx, 2, 0);
+        let cx = Cx::new();
+        let mut driver = driver(&cx, 2, 0);
         driver.queue(&cx, submission(1), 10).unwrap();
         let before = (driver.proof_bytes, driver.metadata_bytes);
-        assert!(matches!(driver.queue_batch(&cx, vec![submission(2), submission(3)], 500),
-            Err(DurableCommitError::Failure(FrankenError::Busy))));
+        assert!(matches!(
+            driver.queue_batch(&cx, vec![submission(2), submission(3)], 500),
+            Err(DurableCommitError::Failure(FrankenError::Busy))
+        ));
         assert_eq!(driver.pending_count(), 1);
         assert_eq!((driver.proof_bytes, driver.metadata_bytes), before);
         assert_eq!(driver.coordinator.allocated_seq_tip, CommitSeq::new(1));
         let mut overlapping = submission(3);
         overlapping.write_set_pages = submission(1).write_set_pages;
-        assert!(matches!(driver.queue_batch(&cx, vec![overlapping], 500),
-            Err(DurableCommitError::Rejected(CommitResult::ConflictFcw { .. }))));
+        assert!(matches!(
+            driver.queue_batch(&cx, vec![overlapping], 500),
+            Err(DurableCommitError::Rejected(
+                CommitResult::ConflictFcw { .. }
+            ))
+        ));
         driver.queue(&cx, submission(2), 20).unwrap();
-        driver.flush(&cx, |_, _| Ok(())).expect("original queue still publishable");
+        driver
+            .flush(&cx, |_, _| Ok(()))
+            .expect("original queue still publishable");
         driver.take_committed(CommitSeq::new(1)).unwrap();
         driver.take_committed(CommitSeq::new(2)).unwrap();
         driver.close(&cx).unwrap();
@@ -1004,17 +1141,25 @@ mod group_admission_tests {
     #[test]
     fn native_group_admission_size_and_sequence_exhaustion_do_not_allocate_prefixes() {
         let _guard = guard();
-        let cx = Cx::new(); let mut driver = driver(&cx, 8, 0);
+        let cx = Cx::new();
+        let mut driver = driver(&cx, 8, 0);
         let mut oversized = submission(2);
         oversized.witness_refs = vec![ObjectId::from_bytes([9; 16]); 65_536];
-        assert!(matches!(driver.queue_batch(&cx, vec![submission(1), oversized], 500),
-            Err(DurableCommitError::Failure(FrankenError::TooBig))));
+        assert!(matches!(
+            driver.queue_batch(&cx, vec![submission(1), oversized], 500),
+            Err(DurableCommitError::Failure(FrankenError::TooBig))
+        ));
         assert_unreserved(&driver);
         // White-box boundary: exhaustion on member two, before either reserves.
         driver.coordinator.allocated_seq_tip = CommitSeq::new(u64::MAX - 1);
-        assert!(matches!(driver.queue_batch(&cx, vec![submission(1), submission(2)], 500),
-            Err(DurableCommitError::Failure(FrankenError::DatabaseFull))));
-        assert_eq!(driver.coordinator.allocated_seq_tip, CommitSeq::new(u64::MAX - 1));
+        assert!(matches!(
+            driver.queue_batch(&cx, vec![submission(1), submission(2)], 500),
+            Err(DurableCommitError::Failure(FrankenError::DatabaseFull))
+        ));
+        assert_eq!(
+            driver.coordinator.allocated_seq_tip,
+            CommitSeq::new(u64::MAX - 1)
+        );
         assert_eq!(driver.coordinator.last_commit_time_ns, 0);
         assert!(driver.coordinator.commit_index.entries.is_empty());
         assert_eq!(driver.pending_count(), 0);

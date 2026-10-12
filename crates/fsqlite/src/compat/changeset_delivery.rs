@@ -394,7 +394,10 @@ impl OrderedDelivery {
         if previous.stream_id != self.baseline.stream_id {
             return Err(OrderedDeliveryError::ReceiptMismatch);
         }
-        let sequence = previous.sequence.checked_add(1).ok_or(FrankenError::TooBig)?;
+        let sequence = previous
+            .sequence
+            .checked_add(1)
+            .ok_or(FrankenError::TooBig)?;
         let parameter =
             SqliteValue::Integer(i64::try_from(sequence).map_err(|_| FrankenError::TooBig)?);
         let rows = transaction
@@ -422,7 +425,10 @@ impl OrderedDelivery {
         checkpoint(cx)?;
         let row = transaction
             .query_row_with_params(
-                &format!("SELECT payload FROM main.{} WHERE sequence=?1", quote(QUEUE)),
+                &format!(
+                    "SELECT payload FROM main.{} WHERE sequence=?1",
+                    quote(QUEUE)
+                ),
                 &[parameter],
             )
             .await?;
@@ -432,23 +438,26 @@ impl OrderedDelivery {
         if bytes.len() != status.receipt.payload_bytes
             || *PayloadHash::blake3(bytes.as_ref()).as_bytes() != status.receipt.payload_hash
         {
-            return Err(invalid("delivery payload failed length/digest verification"));
+            return Err(invalid(
+                "delivery payload failed length/digest verification",
+            ));
         }
         let frame = ChangesetFrame::for_message(
             cx,
             bytes.as_ref(),
             u64::try_from(max_message_bytes).map_err(|_| FrankenError::TooBig)?,
         )?;
-        let envelope = ReplicationEnvelope::new(
-            self.baseline.stream_id,
-            sequence,
-            previous.tip,
-            frame,
-        )?;
+        let envelope =
+            ReplicationEnvelope::new(self.baseline.stream_id, sequence, previous.tip, frame)?;
         let mut body = Vec::new();
-        body.try_reserve_exact(bytes.len()).map_err(|_| FrankenError::OutOfMemory)?;
+        body.try_reserve_exact(bytes.len())
+            .map_err(|_| FrankenError::OutOfMemory)?;
         body.extend_from_slice(bytes.as_ref());
-        Ok(OrderedMessage { source: status.receipt, envelope, body })
+        Ok(OrderedMessage {
+            source: status.receipt,
+            envelope,
+            body,
+        })
     }
 
     /// Accept an authenticated receiver's committed checkpoint for this exact

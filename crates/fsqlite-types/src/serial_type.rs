@@ -306,10 +306,7 @@ pub fn write_varint(buf: &mut [u8], value: u64) -> usize {
         // B-tree payload lengths and positive rowids often fit these widths.
         // Emit them directly rather than running a variable-trip-count loop
         // with a last-byte branch on every iteration (GH#491).
-        2 => buf[..2].copy_from_slice(&[
-            ((value >> 7) as u8) | 0x80,
-            (value as u8) & 0x7F,
-        ]),
+        2 => buf[..2].copy_from_slice(&[((value >> 7) as u8) | 0x80, (value as u8) & 0x7F]),
         3 => buf[..3].copy_from_slice(&[
             ((value >> 14) as u8) | 0x80,
             (((value >> 7) as u8) & 0x7F) | 0x80,

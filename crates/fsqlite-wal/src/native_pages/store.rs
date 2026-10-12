@@ -304,11 +304,14 @@ impl PageHistory {
         let mut tip = self.tip;
         let mut writes = BTreeMap::new();
         let mut tokens = HashSet::new();
-        tokens.try_reserve(plans.len()).map_err(|_| FrankenError::OutOfMemory)?;
+        tokens
+            .try_reserve(plans.len())
+            .map_err(|_| FrankenError::OutOfMemory)?;
         for plan in plans {
             cx.checkpoint().map_err(|_| FrankenError::Interrupt)?;
             if tip.get().checked_add(1) != Some(plan.seq.get())
-                || self.tokens.contains(&plan.token) || !tokens.insert(plan.token)
+                || self.tokens.contains(&plan.token)
+                || !tokens.insert(plan.token)
                 || plan.capsule.page_size != self.page_size
                 || plan.capsule.snapshot > self.tip
             {
@@ -318,7 +321,10 @@ impl PageHistory {
             // skew. Earlier members' writes (including tombstones) override
             // the latest stamp for validation of every later member's reads.
             plan.capsule.validate_snapshot(tip, |page| {
-                writes.get(&page).copied().unwrap_or_else(|| self.latest(page))
+                writes
+                    .get(&page)
+                    .copied()
+                    .unwrap_or_else(|| self.latest(page))
             })?;
             for write in &plan.capsule.writes {
                 writes.insert(write.page, plan.seq);
@@ -332,10 +338,13 @@ impl PageHistory {
         let mut versions = self.version_count;
         let mut bytes = self.payload_bytes;
         for plan in plans {
-            versions = versions.checked_add(plan.capsule.writes.len())
-                .filter(|n| *n <= self.limits.max_versions).ok_or(FrankenError::TooBig)?;
+            versions = versions
+                .checked_add(plan.capsule.writes.len())
+                .filter(|n| *n <= self.limits.max_versions)
+                .ok_or(FrankenError::TooBig)?;
             for write in &plan.capsule.writes {
-                bytes = bytes.checked_add(write.data.as_ref().map_or(0, |data| data.len()))
+                bytes = bytes
+                    .checked_add(write.data.as_ref().map_or(0, |data| data.len()))
                     .filter(|n| *n <= self.limits.max_retained_page_bytes)
                     .ok_or(FrankenError::TooBig)?;
             }
@@ -343,39 +352,74 @@ impl PageHistory {
         Ok((versions, bytes))
     }
 
-    fn prepare_group(&mut self, cx: &Cx, plans: &[PageCommitPlan]) -> Result<PreparedPageGroup<'_>> {
+    fn prepare_group(
+        &mut self,
+        cx: &Cx,
+        plans: &[PageCommitPlan],
+    ) -> Result<PreparedPageGroup<'_>> {
         self.validate_group(cx, plans)?;
         self.projected_group_size(plans)?;
         let total_writes = plans.iter().try_fold(0_usize, |count, plan| {
-            count.checked_add(plan.capsule.writes.len()).ok_or(FrankenError::TooBig)
+            count
+                .checked_add(plan.capsule.writes.len())
+                .ok_or(FrankenError::TooBig)
         })?;
         let mut group = PreparedPageGroup {
-            history: self, applies: Vec::new(), introduced: Vec::new(),
+            history: self,
+            applies: Vec::new(),
+            introduced: Vec::new(),
         };
-        group.applies.try_reserve_exact(plans.len()).map_err(|_| FrankenError::OutOfMemory)?;
-        group.introduced.try_reserve_exact(total_writes).map_err(|_| FrankenError::OutOfMemory)?;
-        group.history.tokens.try_reserve(plans.len()).map_err(|_| FrankenError::OutOfMemory)?;
+        group
+            .applies
+            .try_reserve_exact(plans.len())
+            .map_err(|_| FrankenError::OutOfMemory)?;
+        group
+            .introduced
+            .try_reserve_exact(total_writes)
+            .map_err(|_| FrankenError::OutOfMemory)?;
+        group
+            .history
+            .tokens
+            .try_reserve(plans.len())
+            .map_err(|_| FrankenError::OutOfMemory)?;
         let mut version_count = group.history.version_count;
         let mut payload_bytes = group.history.payload_bytes;
         for plan in plans {
             cx.checkpoint().map_err(|_| FrankenError::Interrupt)?;
             let mut versions = Vec::new();
-            versions.try_reserve_exact(plan.capsule.writes.len()).map_err(|_| FrankenError::OutOfMemory)?;
+            versions
+                .try_reserve_exact(plan.capsule.writes.len())
+                .map_err(|_| FrankenError::OutOfMemory)?;
             for write in &plan.capsule.writes {
                 if !group.history.pages.contains_key(&write.page) {
                     group.introduced.push(write.page);
                 }
                 // Each write has a snapshot observation, so ordered validation
                 // rejects overlapping writers. One extra slot per page is enough.
-                group.history.pages.entry(write.page).or_default().try_reserve(1)
+                group
+                    .history
+                    .pages
+                    .entry(write.page)
+                    .or_default()
+                    .try_reserve(1)
                     .map_err(|_| FrankenError::OutOfMemory)?;
-                versions.push((write.page, Version { seq: plan.seq, data: write.data.clone() }));
+                versions.push((
+                    write.page,
+                    Version {
+                        seq: plan.seq,
+                        data: write.data.clone(),
+                    },
+                ));
                 payload_bytes += write.data.as_ref().map_or(0, |data| data.len());
             }
             version_count += plan.capsule.writes.len();
             group.applies.push(PreparedApply {
-                seq: plan.seq, token: plan.token, versions, payload_bytes,
-                version_count, mode: ApplyMode::Live,
+                seq: plan.seq,
+                token: plan.token,
+                versions,
+                payload_bytes,
+                version_count,
+                mode: ApplyMode::Live,
             });
         }
         Ok(group)
@@ -560,7 +604,8 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativePageStore<S, M, C> {
         let history = PageHistory::new(page_size, limits)?;
         let codec = Arc::new(codec);
         let driver = DurableWriteCoordinator::new(
-            log, SharedCodec(Arc::clone(&codec)),
+            log,
+            SharedCodec(Arc::clone(&codec)),
             limits.max_active_transactions.min(Self::MAX_COMMIT_GROUP),
         )?;
         Ok(Self {
@@ -610,7 +655,9 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativePageStore<S, M, C> {
             markers,
             storage_limits,
             SharedCodec(Arc::clone(&codec)),
-            page_limits.max_active_transactions.min(Self::MAX_COMMIT_GROUP),
+            page_limits
+                .max_active_transactions
+                .min(Self::MAX_COMMIT_GROUP),
             |candidate, _| {
                 let capsule = NativePageCapsule::from_candidate(candidate)?;
                 let prepared = history
@@ -1102,10 +1149,14 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativePageStore<S, M, C> {
             return Err(FrankenError::BusyRecovery);
         }
         let mut results = Vec::new();
-        results.try_reserve_exact(transactions.len()).map_err(|_| FrankenError::OutOfMemory)?;
+        results
+            .try_reserve_exact(transactions.len())
+            .map_err(|_| FrankenError::OutOfMemory)?;
         results.resize_with(transactions.len(), || None);
         let mut plans = Vec::new();
-        plans.try_reserve_exact(transactions.len()).map_err(|_| FrankenError::OutOfMemory)?;
+        plans
+            .try_reserve_exact(transactions.len())
+            .map_err(|_| FrankenError::OutOfMemory)?;
         let mut seq = self.history.tip;
         let mut canonical_bytes = 0_usize;
         for (input_index, txn) in transactions.iter().enumerate() {
@@ -1117,14 +1168,30 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativePageStore<S, M, C> {
                 page_size: self.history.page_size,
                 snapshot: txn.snapshot,
                 reads: txn.reads.iter().map(|(page, seq)| (*page, *seq)).collect(),
-                writes: txn.writes.iter().map(|(page, data)| NativePageWrite {
-                    page: *page, data: data.clone(),
-                }).collect(),
+                writes: txn
+                    .writes
+                    .iter()
+                    .map(|(page, data)| NativePageWrite {
+                        page: *page,
+                        data: data.clone(),
+                    })
+                    .collect(),
             };
-            canonical_bytes = canonical_bytes.checked_add(capsule.encoded_len()?)
-                .filter(|n| *n <= MAX_NATIVE_VALIDATION_BYTES).ok_or(FrankenError::TooBig)?;
-            seq = seq.get().checked_add(1).map(CommitSeq::new).ok_or(FrankenError::DatabaseFull)?;
-            plans.push(PageCommitPlan { input_index, seq, token: txn.token, capsule });
+            canonical_bytes = canonical_bytes
+                .checked_add(capsule.encoded_len()?)
+                .filter(|n| *n <= MAX_NATIVE_VALIDATION_BYTES)
+                .ok_or(FrankenError::TooBig)?;
+            seq = seq
+                .get()
+                .checked_add(1)
+                .map(CommitSeq::new)
+                .ok_or(FrankenError::DatabaseFull)?;
+            plans.push(PageCommitPlan {
+                input_index,
+                seq,
+                token: txn.token,
+                capsule,
+            });
         }
         self.history.validate_group(cx, &plans)?;
         if plans.is_empty() {
@@ -1142,8 +1209,12 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativePageStore<S, M, C> {
         }
         let mut encoded = Vec::new();
         let mut submissions = Vec::new();
-        encoded.try_reserve_exact(plans.len()).map_err(|_| FrankenError::OutOfMemory)?;
-        submissions.try_reserve_exact(plans.len()).map_err(|_| FrankenError::OutOfMemory)?;
+        encoded
+            .try_reserve_exact(plans.len())
+            .map_err(|_| FrankenError::OutOfMemory)?;
+        submissions
+            .try_reserve_exact(plans.len())
+            .map_err(|_| FrankenError::OutOfMemory)?;
         // Bound encoded storage independently of decoded capsule metadata;
         // neither budget is a total RSS bound or a replacement for codec limits.
         let mut buffered = 0_usize;
@@ -1151,51 +1222,69 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativePageStore<S, M, C> {
             cx.checkpoint().map_err(|_| FrankenError::Interrupt)?;
             let bytes = plan.capsule.to_bytes()?;
             let records = self.codec.encode(cx, &bytes)?;
-            let object_id = records.first()
-                .ok_or_else(|| corrupt("native page encoder returned no symbols"))?.object_id;
+            let object_id = records
+                .first()
+                .ok_or_else(|| corrupt("native page encoder returned no symbols"))?
+                .object_id;
             for record in &records {
-                if record.object_id != object_id || record.symbol_data.len()
-                    != usize::try_from(record.oti.t).map_err(|_| FrankenError::TooBig)?
+                if record.object_id != object_id
+                    || record.symbol_data.len()
+                        != usize::try_from(record.oti.t).map_err(|_| FrankenError::TooBig)?
                 {
                     return Err(corrupt("inconsistent encoded native page group"));
                 }
-                buffered = buffered.checked_add(record.symbol_data.len())
+                buffered = buffered
+                    .checked_add(record.symbol_data.len())
                     .and_then(|n| n.checked_add(76))
-                    .filter(|n| *n <= MAX_NATIVE_VALIDATION_BYTES).ok_or(FrankenError::TooBig)?;
+                    .filter(|n| *n <= MAX_NATIVE_VALIDATION_BYTES)
+                    .ok_or(FrankenError::TooBig)?;
             }
             if self.codec.decode(cx, object_id, &records)? != bytes {
                 return Err(corrupt("native page codec changed canonical capsule bytes"));
             }
             submissions.push(CommitSubmission {
-                capsule_object_id: object_id, capsule_digest: *blake3::hash(&bytes).as_bytes(),
+                capsule_object_id: object_id,
+                capsule_digest: *blake3::hash(&bytes).as_bytes(),
                 write_set_pages: plan.capsule.writes.iter().map(|write| write.page).collect(),
-                witness_refs: Vec::new(), edge_ids: Vec::new(), merge_witness_ids: Vec::new(),
-                txn_token: plan.token, begin_seq: plan.capsule.snapshot,
+                witness_refs: Vec::new(),
+                edge_ids: Vec::new(),
+                merge_witness_ids: Vec::new(),
+                txn_token: plan.token,
+                begin_seq: plan.capsule.snapshot,
             });
             encoded.push((object_id, records));
         }
         let prepared = self.history.prepare_group(cx, &plans)?;
-        let reserved = self.driver.queue_batch(cx, submissions, now_unix_ns).map_err(commit_error)?;
+        let reserved = self
+            .driver
+            .queue_batch(cx, submissions, now_unix_ns)
+            .map_err(commit_error)?;
         // queue_batch never leaves a prefix on a preflight error. After it
         // succeeds, arm every writer before any possible cancellation or I/O.
         self.recovery_required = true;
         for plan in &plans {
             transactions[plan.input_index].state = NativePageTransactionState::Indeterminate;
         }
-        if !reserved.iter().copied().eq(plans.iter().map(|plan| plan.seq)) {
+        if !reserved
+            .iter()
+            .copied()
+            .eq(plans.iter().map(|plan| plan.seq))
+        {
             return Err(corrupt("native page/coordinator reservation mismatch"));
         }
         for (_, records) in &encoded {
             self.driver.stage_symbols(cx, records).await?;
         }
-        let receipt = self.driver
+        let receipt = self
+            .driver
             .flush(cx, |candidates, _| {
                 if candidates.len() != plans.len() {
                     return Err(corrupt("unexpected native page publication batch"));
                 }
                 for (candidate, plan) in candidates.iter().zip(&plans) {
                     let decoded = NativePageCapsule::from_candidate(candidate)?;
-                    if decoded != plan.capsule || candidate.proof.commit_seq != plan.seq
+                    if decoded != plan.capsule
+                        || candidate.proof.commit_seq != plan.seq
                         || candidate.proof.submission.txn_token != plan.token
                     {
                         return Err(corrupt("native page publication changed after preparation"));
@@ -1205,13 +1294,16 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativePageStore<S, M, C> {
             })
             .await?
             .ok_or_else(|| corrupt("native page commit produced no storage receipt"))?;
-        if receipt.commits != plans.len() || receipt.first_seq != plans[0].seq
+        if receipt.commits != plans.len()
+            || receipt.first_seq != plans[0].seq
             || receipt.last_seq != seq
         {
             return Err(corrupt("native page group receipt mismatch"));
         }
         for (plan, (object_id, _)) in plans.iter().zip(&encoded) {
-            let ack = self.driver.take_committed(plan.seq)
+            let ack = self
+                .driver
+                .take_committed(plan.seq)
                 .ok_or_else(|| corrupt("native page commit produced no acknowledgement"))?;
             if ack.txn_token != plan.token || ack.capsule_object_id != *object_id {
                 return Err(corrupt("native page group acknowledgement mismatch"));

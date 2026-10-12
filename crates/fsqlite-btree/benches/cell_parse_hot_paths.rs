@@ -212,7 +212,9 @@ fn compare_varint_writers(label: &str, values: &[u64], iterations: u64) {
     current.sort_by(f64::total_cmp);
     println!(
         "varint_write case={label} previous_median_ns_per_op={:.3} current_median_ns_per_op={:.3} current_over_previous={:.6}",
-        previous[2], current[2], current[2] / previous[2]
+        previous[2],
+        current[2],
+        current[2] / previous[2]
     );
 }
 
@@ -235,7 +237,11 @@ fn bench_varint_write_paths(iterations: u64) {
             let mixed = i.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(23);
             values.push(minimum + mixed % span);
         }
-        assert!(values.iter().all(|&value| varint_len(value) == width as usize));
+        assert!(
+            values
+                .iter()
+                .all(|&value| varint_len(value) == width as usize)
+        );
         compare_varint_writers(&format!("width_{width}"), &values, iterations);
         by_width.push(values);
     }
