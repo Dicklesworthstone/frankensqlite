@@ -223,9 +223,19 @@ fn linux_fiemap_backing(file: &File, target_len: u64) -> io::Result<LinuxBacking
 
     // Linux UAPI linux/fs.h: _IOWR('f', 11, struct fiemap), whose header is
     // 32 bytes. The trailing single extent is accounted for by extent_count.
-    #[cfg(target_os = "linux")]
+    // libc types ioctl's request as c_ulong on glibc and uClibc but as c_int
+    // on musl, OpenHarmony and Android, so the same 32 bits are spelled twice.
+    // With a single c_ulong constant the musl targets, which are the Linux
+    // release targets, fail to compile (E0308 at the ioctl call below).
+    #[cfg(all(
+        target_os = "linux",
+        not(any(target_env = "musl", target_env = "ohos"))
+    ))]
     const FS_IOC_FIEMAP: libc::c_ulong = 0xC020_660B;
-    #[cfg(target_os = "android")]
+    #[cfg(any(
+        target_os = "android",
+        all(target_os = "linux", any(target_env = "musl", target_env = "ohos"))
+    ))]
     const FS_IOC_FIEMAP: libc::c_int = -1_071_618_549;
     // UNKNOWN, DELALLOC, ENCODED, DATA_ENCRYPTED, DATA_INLINE, and DATA_TAIL
     // do not prove independently writable, allocated file storage.
