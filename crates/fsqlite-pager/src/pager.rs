@@ -9845,10 +9845,15 @@ impl<F: VfsFile> PagerInner<F> {
                         let header = binding.header();
                         let end = usize::try_from(header.mx_frame)
                             .map_err(|_| FrankenError::BusyRecovery)?.checked_sub(1);
-                        // An unindexed empty header (stock SQLite beside a
-                        // header-only WAL) carries no salts to agree with.
+                        // The salts must agree only while a frame is visible.
+                        // With none on either side the database file alone is
+                        // the image: stock SQLite's unindexed empty header has
+                        // no salts to agree with, and a WAL a stock writer
+                        // truncated to zero bytes has none of its own, so its
+                        // pinned generation can never match the index's
+                        // (bd-yxqs9).
                         if pinned.last_commit_frame != end
-                            || (!header.is_unindexed_empty()
+                            || (end.is_some()
                                 && [pinned.generation.salts.salt1, pinned.generation.salts.salt2]
                                     != header.a_salt)
                         {

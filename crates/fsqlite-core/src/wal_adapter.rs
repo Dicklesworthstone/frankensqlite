@@ -1553,7 +1553,11 @@ impl<F: VfsFile> WalBackendAdapter<F> {
         let wal_header = self.wal.header();
         // Stock SQLite's unindexed empty header indexes no frame, so it has no
         // generation to disagree with while the WAL is frame-free (GH#431).
-        let generation_mismatch = if header.is_unindexed_empty() {
+        // A header-less WAL (bd-yxqs9) has no generation of its own and binds
+        // only to an index that publishes no frame.
+        let generation_mismatch = if self.wal.is_headerless() {
+            header.mx_frame != 0
+        } else if header.is_unindexed_empty() {
             self.wal.frame_count() != 0
         } else {
             header.page_size().ok() != Some(wal_header.page_size)
@@ -1571,7 +1575,11 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             let index = usize::try_from(header.mx_frame - 1).map_err(|_| FrankenError::DatabaseFull)?;
             Some((header.mx_frame, self.wal.read_frame_header(cx, index).await?))
         };
-        validate_shared_wal_index_wal_binding(&header, self.wal.header(), terminal)?;
+        if self.wal.is_headerless() {
+            header.validate()?;
+        } else {
+            validate_shared_wal_index_wal_binding(&header, self.wal.header(), terminal)?;
+        }
         let backfilled_frames = read_shared_wal_index_backfill(&region, &header)?;
         Ok(Some(NativeCheckpointView { source, region, header, backfilled_frames }))
     }
@@ -2278,8 +2286,12 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
             let wal_header = self.wal.header();
             // Stock SQLite's unindexed empty header (GH#431) binds to any
             // generation only while that generation really has no frames;
-            // otherwise frames exist that the index does not cover.
-            let generation_mismatch = if header.is_unindexed_empty() {
+            // otherwise frames exist that the index does not cover. A
+            // header-less WAL (bd-yxqs9, stock TRUNCATE) has no generation of
+            // its own and binds only to an index that publishes no frame.
+            let generation_mismatch = if self.wal.is_headerless() {
+                header.mx_frame != 0
+            } else if header.is_unindexed_empty() {
                 self.wal.frame_count() != 0
             } else {
                 header.page_size()? != wal_header.page_size
@@ -2305,9 +2317,13 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
                     }
                     None => None,
                 };
-                if validate_shared_wal_index_wal_binding(&header, self.wal.header(), terminal)
-                    .is_err()
-                {
+                let binding_valid = if self.wal.is_headerless() {
+                    terminal.is_none()
+                } else {
+                    validate_shared_wal_index_wal_binding(&header, self.wal.header(), terminal)
+                        .is_ok()
+                };
+                if !binding_valid {
                     return Ok(WalNativeReadOutcome::RecoveryRequired(
                         WalNativeRecoveryReason::WalTerminalMismatch,
                     ));

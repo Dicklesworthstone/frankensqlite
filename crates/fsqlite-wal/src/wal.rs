@@ -21,6 +21,16 @@ use fsqlite_types::sync_primitives::Instant;
 use fsqlite_vfs::{SyncKind, VfsFile, VfsWriteCompletion};
 use tracing::{debug, error, warn};
 
+/// Names each observation of a WAL shorter than its header (bd-yxqs9), so no
+/// two of them share a generation identity. See
+/// [`WalFile::generation_identity`].
+static HEADERLESS_WAL_OBSERVATIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn next_headerless_observation() -> u64 {
+    HEADERLESS_WAL_OBSERVATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Whether the `FRANKENSQLITE_PARANOID_DURABILITY` env var is set.
 /// Checked once at startup to avoid repeated `env::var` calls on the hot path.
 static PARANOID_DURABILITY: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
@@ -56,32 +66,33 @@ fn log_replay_decision(
 /// mid-flight sees a header whose checksum fails; re-read once — mirroring stock
 /// SQLite's `walIndexTryHdr` double read — before concluding the header is
 /// corrupt, so a transient torn read does not spuriously discard a live WAL
-/// generation view. A short read (the file is genuinely too small) and a
-/// structural parse failure remain fatal on the first attempt.
+/// generation view. A structural parse failure remains fatal on the first
+/// attempt.
+///
+/// `Ok(None)` means the file is shorter than a header. Stock SQLite's
+/// `wal_checkpoint(TRUNCATE)` leaves its WAL at zero bytes until the next
+/// commit writes a new header, and stock reads such a WAL as one with no
+/// frames (bd-yxqs9). Each caller decides what that means for it.
 async fn read_wal_header_torn_tolerant<F: VfsFile>(
     file: &F,
     cx: &Cx,
     context: &'static str,
     frame_count: usize,
-) -> Result<(WalHeader, SqliteWalChecksum)> {
+) -> Result<Option<(WalHeader, SqliteWalChecksum)>> {
     const MAX_ATTEMPTS: usize = 2;
     for attempt in 1..=MAX_ATTEMPTS {
         let mut header_buf = [0u8; WAL_HEADER_SIZE];
         let header_read = file.read(cx, &mut header_buf, 0).await?;
         if header_read < WAL_HEADER_SIZE {
-            log_replay_decision(context, 0, frame_count, "header_short_read_corrupt");
-            return Err(FrankenError::WalCorrupt {
-                detail: format!(
-                    "WAL file too small for header during {context}: read {header_read}, need {WAL_HEADER_SIZE}"
-                ),
-            });
+            log_replay_decision(context, 0, frame_count, "header_short_read");
+            return Ok(None);
         }
         let disk_header = WalHeader::from_bytes(&header_buf)?;
         let disk_big_endian = disk_header.big_endian_checksum();
         let disk_header_checksum = read_wal_header_checksum(&header_buf)?;
         let expected_header_checksum = wal_header_checksum(&header_buf, disk_big_endian)?;
         if disk_header_checksum == expected_header_checksum {
-            return Ok((disk_header, disk_header_checksum));
+            return Ok(Some((disk_header, disk_header_checksum)));
         }
         log_replay_decision(
             context,
@@ -213,6 +224,14 @@ pub struct WalFile<F: VfsFile> {
     /// refuse; [`Self::rewrite_frames_after_failed_sync`] re-dirties the
     /// frames so the next successful sync really covers them.
     unsynced_after_failed_sync: Option<usize>,
+    /// Set while the on-disk WAL is shorter than its header (bd-yxqs9). A
+    /// stock writer's `wal_checkpoint(TRUNCATE)` leaves it at zero bytes until
+    /// its next commit writes a new header; stock SQLite reads it as a WAL
+    /// with no frames, so the database file alone is current. The value names
+    /// this observation (see [`Self::generation_identity`]). `header` keeps the
+    /// last header seen, for its page size; nothing may be appended until a
+    /// header is bound again.
+    headerless_observation: Option<u64>,
 }
 
 impl<F: VfsFile> WalFile<F> {
@@ -222,6 +241,14 @@ impl<F: VfsFile> WalFile<F> {
     /// This keeps `frame_count` and `running_checksum` coherent across
     /// multiple concurrently-open `WalFile` handles.
     pub async fn refresh(&mut self, cx: &Cx) -> Result<()> {
+        if self.headerless_observation.is_some() {
+            // A stock writer can commit and truncate again between two
+            // observations of a header-less WAL, leaving nothing on disk that
+            // is certain to differ, so every refresh observes it anew or binds
+            // the header its next commit wrote (bd-yxqs9).
+            log_replay_decision("refresh", 0, 0, "headerless_reobserve");
+            return self.rebuild_state_from_file(cx).await;
+        }
         let frame_size = self.frame_size();
         let expected_size = u64::try_from(WAL_HEADER_SIZE)
             .expect("WAL header size fits u64")
@@ -244,8 +271,13 @@ impl<F: VfsFile> WalFile<F> {
         // This is necessary even if file_size == expected_size to detect ABA
         // where the WAL was reset and then appended back to the exact same size.
         // A torn read of an in-progress header rewrite is retried (bd-mlz2t).
-        let (disk_header, disk_header_checksum) =
-            read_wal_header_torn_tolerant(&self.file, cx, "refresh", self.frame_count).await?;
+        // A file that shrank below its header since the size check is
+        // rebuilt like any other shrink.
+        let Some((disk_header, disk_header_checksum)) =
+            read_wal_header_torn_tolerant(&self.file, cx, "refresh", self.frame_count).await?
+        else {
+            return self.rebuild_state_from_file(cx).await;
+        };
 
         // Header changed under us (e.g., RESET/TRUNCATE checkpoint) — rebuild.
         if disk_header.magic != self.header.magic
@@ -384,9 +416,14 @@ impl<F: VfsFile> WalFile<F> {
                 detail: "retained append prefix belongs to another WAL generation".to_owned(),
             });
         }
-        let (header, header_checksum) =
+        let Some((header, header_checksum)) =
             read_wal_header_torn_tolerant(&self.file, cx, "retained_append", prefix_frame_count)
-                .await?;
+                .await?
+        else {
+            return Err(FrankenError::WalCorrupt {
+                detail: "retained append prefix lost its WAL header".to_owned(),
+            });
+        };
         // create() may retain a zero checksum field; serialization computes
         // the canonical header checksum just as it did for the actual write.
         if header.to_bytes()? != self.header.to_bytes()?
@@ -484,8 +521,18 @@ impl<F: VfsFile> WalFile<F> {
         self.last_fsynced_frame_count = 0;
 
         // A torn read of an in-progress header rewrite is retried (bd-mlz2t).
-        let (header, header_checksum) =
-            read_wal_header_torn_tolerant(&self.file, cx, "rebuild", self.frame_count).await?;
+        let Some((header, header_checksum)) =
+            read_wal_header_torn_tolerant(&self.file, cx, "rebuild", self.frame_count).await?
+        else {
+            // Shorter than a header: no frames, as stock SQLite reads it
+            // (bd-yxqs9). The previous view's frames are gone with it.
+            self.frame_count = 0;
+            self.last_commit = None;
+            self.headerless_observation = Some(next_headerless_observation());
+            log_replay_decision("rebuild", 0, 0, "headerless_no_frames");
+            return Ok(());
+        };
+        self.headerless_observation = None;
         let page_size = usize::try_from(header.page_size).expect("WAL header page size fits usize");
         let big_endian_checksum = header.big_endian_checksum();
 
@@ -601,9 +648,75 @@ impl<F: VfsFile> WalFile<F> {
     }
 
     /// The current WAL generation identity (`checkpoint_seq` + salts).
+    ///
+    /// A header-less WAL has no salts of its own. Each observation of one
+    /// gets salts no other observation in this process shares, so a reader
+    /// that sees the WAL truncated twice never takes its database-file pages
+    /// for unchanged (bd-yxqs9). The values are as unlikely to name a real
+    /// generation as one random salt pair is to repeat another.
     #[must_use]
     pub fn generation_identity(&self) -> WalGenerationIdentity {
-        WalGenerationIdentity::from_header(&self.header)
+        match self.headerless_observation {
+            None => WalGenerationIdentity::from_header(&self.header),
+            Some(observation) => {
+                let high = (observation >> 32) as u32;
+                let low = observation as u32;
+                WalGenerationIdentity {
+                    checkpoint_seq: self.header.checkpoint_seq,
+                    salts: WalSalts {
+                        salt1: !high ^ 0x5eed_0f00,
+                        salt2: !low,
+                    },
+                }
+            }
+        }
+    }
+
+    /// Whether the on-disk WAL was shorter than its header when this handle
+    /// last looked (bd-yxqs9). It then has no frames, and no page size or
+    /// salts of its own to compare with a shared WAL index.
+    #[must_use]
+    pub fn is_headerless(&self) -> bool {
+        self.headerless_observation.is_some()
+    }
+
+    /// Bind a WAL file that is shorter than its header (bd-yxqs9): a
+    /// read-only opener that finds a WAL a stock writer truncated to zero
+    /// bytes reads the database file alone until that writer's next commit
+    /// writes a header, which the next refresh binds. `page_size` is the
+    /// database's.
+    #[must_use]
+    pub fn open_headerless(file: F, page_size: u32) -> Self {
+        let header = WalHeader {
+            magic: WAL_MAGIC_LE,
+            format_version: WAL_FORMAT_VERSION,
+            page_size,
+            checkpoint_seq: 0,
+            salts: WalSalts { salt1: 0, salt2: 0 },
+            checksum: SqliteWalChecksum::default(),
+        };
+        Self {
+            file,
+            page_size: usize::try_from(page_size).expect("page size fits usize"),
+            big_endian_checksum: false,
+            header,
+            running_checksum: SqliteWalChecksum::default(),
+            frame_count: 0,
+            last_commit: None,
+            frame_scratch: Vec::new(),
+            last_fsynced_frame_count: 0,
+            unsynced_after_failed_sync: None,
+            headerless_observation: Some(next_headerless_observation()),
+        }
+    }
+
+    /// Refuse to append to a WAL that has no header to chain frames from: the
+    /// handle's owner must bind a new generation first (bd-yxqs9).
+    fn refuse_append_while_headerless(&self) -> Result<()> {
+        if self.headerless_observation.is_some() {
+            return Err(FrankenError::BusyRecovery);
+        }
+        Ok(())
     }
 
     /// Database page size in bytes.
@@ -707,6 +820,7 @@ impl<F: VfsFile> WalFile<F> {
             frame_scratch: Vec::new(),
             last_fsynced_frame_count: 0,
             unsynced_after_failed_sync: None,
+            headerless_observation: None,
         })
     }
 
@@ -716,9 +830,17 @@ impl<F: VfsFile> WalFile<F> {
     #[allow(clippy::too_many_lines)]
     pub async fn open(cx: &Cx, file: F) -> Result<Self> {
         // Read and parse the 32-byte header, tolerating a torn read of an
-        // in-progress header rewrite (bd-mlz2t / GH #292).
-        let (header, header_checksum) =
-            read_wal_header_torn_tolerant(&file, cx, "startup_open", 0).await?;
+        // in-progress header rewrite (bd-mlz2t / GH #292). Callers open only a
+        // WAL that has a header; there is no page size to bind without one.
+        let Some((header, header_checksum)) =
+            read_wal_header_torn_tolerant(&file, cx, "startup_open", 0).await?
+        else {
+            return Err(FrankenError::WalCorrupt {
+                detail: format!(
+                    "WAL file too small for header during startup_open: need {WAL_HEADER_SIZE} bytes"
+                ),
+            });
+        };
         let page_size = usize::try_from(header.page_size).expect("WAL header page size fits usize");
         let big_endian_checksum = header.big_endian_checksum();
         let frame_size = WAL_FRAME_HEADER_SIZE + page_size;
@@ -837,6 +959,7 @@ impl<F: VfsFile> WalFile<F> {
             frame_scratch: Vec::new(),
             last_fsynced_frame_count: last_commit_frames,
             unsynced_after_failed_sync: None,
+            headerless_observation: None,
         })
     }
 
@@ -892,6 +1015,7 @@ impl<F: VfsFile> WalFile<F> {
                 ),
             });
         }
+        self.refuse_append_while_headerless()?;
 
         // Build the frame: header + page data.
         let frame_size = self.frame_size();
@@ -1251,6 +1375,8 @@ impl<F: VfsFile> WalFile<F> {
             preflight.hand_off();
             return Ok(());
         }
+        // Nothing was written; the preflight terminalizes the completion.
+        self.refuse_append_while_headerless()?;
 
         let new_count = self
             .frame_count
@@ -2059,6 +2185,7 @@ impl<F: VfsFile> WalFile<F> {
         // The synced header starts a new generation; no frame a failed sync
         // covered can be read through it.
         self.unsynced_after_failed_sync = None;
+        self.headerless_observation = None;
         self.frame_scratch.clear();
         crate::metrics::GLOBAL_WAL_METRICS.set_wal_frames_current(0);
 
@@ -2340,7 +2467,8 @@ mod tests {
         // header is accepted, so a live WAL generation view is not discarded.
         let torn = ScriptedHeaderFile::new(vec![corrupt, valid]);
         let (header, _checksum) = read_wal_header_torn_tolerant(&torn, &cx, "test_torn", 0)
-            .expect("torn read recovers on retry");
+            .expect("torn read recovers on retry")
+            .expect("a full header was read");
         assert_eq!(torn.read_count(), 2, "recovery takes exactly two reads");
         assert_eq!(header.page_size, expected_page_size);
 
@@ -2354,7 +2482,11 @@ mod tests {
 
         // Valid on the first read: no retry.
         let good = ScriptedHeaderFile::new(vec![valid]);
-        read_wal_header_torn_tolerant(&good, &cx, "test_good", 0).expect("valid header reads");
+        assert!(
+            read_wal_header_torn_tolerant(&good, &cx, "test_good", 0)
+                .expect("valid header reads")
+                .is_some()
+        );
         assert_eq!(good.read_count(), 1, "a valid header does not retry");
     }
 
@@ -4122,6 +4254,100 @@ mod tests {
             result.is_err(),
             "opening WAL with corrupted header magic should fail"
         );
+    }
+
+    /// bd-yxqs9: stock SQLite's `wal_checkpoint(TRUNCATE)` leaves the WAL at
+    /// zero bytes until its next commit writes a header. A handle refreshing
+    /// then sees no frames instead of `WalCorrupt`, takes a new generation
+    /// identity on every refresh while the WAL stays header-less, refuses to
+    /// append, and binds the next header written.
+    #[test]
+    fn headerless_wal_reads_as_empty_and_binds_the_next_header() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let mut wal = WalFile::create(&cx, open_wal_file(&vfs, &cx), PAGE_SIZE, 0, test_salts())
+            .expect("create WAL");
+        let page = sample_page(0x51);
+        wal.append_frame(&cx, 1, &page, 1).expect("commit");
+        let live = wal.generation_identity();
+
+        // Another handle, standing in for the stock writer, truncates to 0.
+        let mut writer = open_wal_file(&vfs, &cx);
+        writer.truncate(&cx, 0).expect("truncate to zero bytes");
+
+        wal.refresh(&cx).expect("a zero-length WAL is not corrupt");
+        assert_eq!(wal.frame_count(), 0);
+        assert_eq!(wal.last_commit_frame_header(), None);
+        let first = wal.generation_identity();
+        assert_ne!(first, live);
+        wal.refresh(&cx).expect("still header-less");
+        let second = wal.generation_identity();
+        assert_ne!(
+            second, first,
+            "each header-less observation is its own generation"
+        );
+
+        // No frame may be written without a header to chain from.
+        assert!(matches!(
+            wal.append_frame(&cx, 1, &page, 1).wait(),
+            Err(FrankenError::BusyRecovery)
+        ));
+        assert_eq!(
+            wal.file().file_size(&cx).unwrap(),
+            0,
+            "the refused append wrote nothing"
+        );
+
+        // A WAL whose header is still being written is header-less too.
+        writer
+            .write(&cx, &WAL_MAGIC_LE.to_be_bytes(), 0)
+            .expect("partial header");
+        wal.refresh(&cx).expect("a partial header is not corrupt");
+        assert_eq!(wal.frame_count(), 0);
+
+        // The writer's next commit writes a new header; the handle binds it.
+        let next_salts = WalSalts {
+            salt1: 0x0102_0304,
+            salt2: 0x0506_0708,
+        };
+        let mut next =
+            WalFile::create(&cx, writer, PAGE_SIZE, 1, next_salts).expect("new generation");
+        next.append_frame(&cx, 1, &sample_page(0x52), 1)
+            .expect("commit in the new generation");
+        wal.refresh(&cx).expect("bind the new header");
+        assert_eq!(wal.frame_count(), 1);
+        assert_eq!(wal.generation_identity(), next.generation_identity());
+        wal.append_frame(&cx, 2, &page, 2)
+            .expect("appends resume once a header is bound");
+        assert_eq!(wal.frame_count(), 2);
+    }
+
+    /// bd-yxqs9: a read-only opener that finds a zero-byte WAL binds it
+    /// header-less, then binds the header and frames a writer adds later.
+    #[test]
+    fn open_headerless_binds_the_next_writers_header_and_frames() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let reader_file = open_wal_file(&vfs, &cx);
+        assert_eq!(reader_file.file_size(&cx).unwrap(), 0);
+        let mut reader = WalFile::open_headerless(reader_file, PAGE_SIZE);
+        assert!(reader.is_headerless());
+        assert_eq!(reader.frame_count(), 0);
+        assert_eq!(reader.page_size(), usize::try_from(PAGE_SIZE).unwrap());
+        assert!(matches!(
+            reader.append_frame(&cx, 1, &sample_page(0x61), 1).wait(),
+            Err(FrankenError::BusyRecovery)
+        ));
+
+        let mut writer = WalFile::create(&cx, open_wal_file(&vfs, &cx), PAGE_SIZE, 3, test_salts())
+            .expect("writer starts a generation");
+        writer
+            .append_frame(&cx, 1, &sample_page(0x62), 1)
+            .expect("writer commits");
+        reader.refresh(&cx).expect("bind the writer's header");
+        assert!(!reader.is_headerless());
+        assert_eq!(reader.frame_count(), 1);
+        assert_eq!(reader.generation_identity(), writer.generation_identity());
     }
 
     #[test]

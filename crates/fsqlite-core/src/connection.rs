@@ -5721,6 +5721,16 @@ where
         Err(err) => return Err(err),
     };
     if file.file_size(cx)? < u64::try_from(fsqlite_wal::WAL_HEADER_SIZE).unwrap_or(32) {
+        if allow_readonly {
+            // bd-yxqs9: a stock writer's `wal_checkpoint(TRUNCATE)` leaves its
+            // WAL at zero bytes until its next commit writes a header. Bind it
+            // header-less, so this reader sees the database file now and the
+            // commits that later land in that WAL, instead of never installing
+            // a WAL backend and missing every one of them.
+            let wal = WalFile::open_headerless(file, pager.page_size().get());
+            install_opened_wal_backend_bare(pager, cx, wal)?;
+            return Ok(true);
+        }
         let _ = file.close(cx);
         return Ok(false);
     }
