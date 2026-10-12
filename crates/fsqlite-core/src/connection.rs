@@ -89096,6 +89096,33 @@ impl Connection {
                             left_ref, &l, *op, right_ref, &r, col_map,
                         ));
                     }
+                    // GH#450: a row-value comparison with no subquery in either
+                    // operand, e.g. `SELECT 1 WHERE (1,2) = (1,2)`, skips the
+                    // branch above. Evaluating each `RowValue` as a scalar below
+                    // reaches eval_join_expr's missing RowValue arm
+                    // (NotImplemented), so compare element-wise here, exactly as
+                    // the synchronous evaluator does (bd-t7oeo). Neither operand
+                    // holds a subquery at any depth
+                    // (`expr_is_row_value_with_subquery_element` is false for
+                    // both), so the synchronous element evaluator suffices. It
+                    // cannot see bind parameters: a `?` element still raises its
+                    // explicit unsupported-expression error instead of a value.
+                    if (matches!(left.as_ref(), Expr::RowValue(..))
+                        || matches!(right.as_ref(), Expr::RowValue(..)))
+                        && matches!(
+                            op,
+                            BinaryOp::Eq
+                                | BinaryOp::Ne
+                                | BinaryOp::Lt
+                                | BinaryOp::Le
+                                | BinaryOp::Gt
+                                | BinaryOp::Ge
+                                | BinaryOp::Is
+                                | BinaryOp::IsNot
+                        )
+                    {
+                        return eval_join_row_value_comparison(left, *op, right, row, col_map);
+                    }
                     let l = self
                         .eval_expr_with_subqueries(left, row, col_map, params)
                         .await?;

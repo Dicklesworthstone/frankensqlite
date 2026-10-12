@@ -121,3 +121,70 @@ fn row_values_match_rusqlite_oracle() {
         );
     });
 }
+
+/// GH#450: a FROM-less SELECT evaluates its WHERE through the interpreted
+/// evaluator, which had no arm for a row-value comparison without a subquery
+/// operand and raised `eval_join_expr: unsupported expression type: RowValue`.
+/// Stock SQLite must accept every statement here, so a pass can never come
+/// from both engines failing alike.
+#[test]
+fn from_less_where_row_value_comparisons_match_rusqlite_oracle() {
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+
+        let queries = [
+            // The two statements from the report.
+            "SELECT 1 WHERE (1,NULL) = (1,2)",
+            "SELECT 1 WHERE (1,2) = (1,2)",
+            // Each comparison operator, on a true side and a false side.
+            "SELECT 1 WHERE (1,2) = (1,3)",
+            "SELECT 1 WHERE (1,2) <> (1,3)",
+            "SELECT 1 WHERE (1,2) <> (1,2)",
+            "SELECT 1 WHERE (1,2) < (1,3)",
+            "SELECT 1 WHERE (2,1) < (1,9)",
+            "SELECT 1 WHERE (1,2) <= (1,2)",
+            "SELECT 1 WHERE (1,3) > (1,2)",
+            "SELECT 1 WHERE (1,2) >= (1,3)",
+            // A NULL at the deciding position leaves the result unknown; a
+            // decisive element before it settles the result.
+            "SELECT 1 WHERE (1,NULL) < (1,3)",
+            "SELECT 1 WHERE (1,NULL) <> (2,2)",
+            "SELECT 1 WHERE (NULL,2) = (NULL,2)",
+            // IS / IS NOT are NULL-safe and never yield NULL.
+            "SELECT 1 WHERE (1,NULL) IS (1,NULL)",
+            "SELECT 1 WHERE (1,NULL) IS NOT (1,2)",
+            "SELECT 1 WHERE (1,2) IS NOT (1,2)",
+            // Three columns of mixed storage classes, and under AND / NOT.
+            "SELECT 1 WHERE (1,'a',2.5) = (1,'a',2.5)",
+            "SELECT 1 WHERE (1,2) = (1,2) AND (3,4) < (3,5)",
+            "SELECT 1 WHERE NOT ((1,2) = (1,3))",
+        ];
+
+        let mut diffs = Vec::new();
+        for q in queries {
+            let rr = rq(&r, q);
+            assert_ne!(
+                rr,
+                vec![vec!["ERR".to_owned()]],
+                "stock SQLite must accept `{q}`, or comparing against it proves nothing"
+            );
+            let fr: Vec<Vec<String>> = match f.query(q).await {
+                Ok(rows) => rows
+                    .iter()
+                    .map(|row| row.values().iter().map(tag_f).collect())
+                    .collect(),
+                Err(error) => vec![vec![format!("ERR: {error}")]],
+            };
+            if fr != rr {
+                diffs.push(format!("  `{q}`\n     frank= {fr:?}\n     stock= {rr:?}"));
+            }
+        }
+        assert!(
+            diffs.is_empty(),
+            "{} FROM-less row-value divergence(s) vs rusqlite:\n{}",
+            diffs.len(),
+            diffs.join("\n")
+        );
+    });
+}
