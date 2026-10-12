@@ -2237,6 +2237,53 @@ impl UnixFile {
         self.ensure_shm_info_with_create(cx, true)
     }
 
+    /// Establish physical backing before either publishing a larger WAL-index
+    /// extent or exposing a writable mapping (GH #506). Length alone is not an
+    /// allocation receipt: an interrupted older initializer may leave holes.
+    fn ensure_wal_shm_backing(&self, info: &mut ShmInfo, target_len: u64) -> Result<()> {
+        if crate::unix_shm::shm_backing_is_allocated(&info.file, target_len)? {
+            return Ok(());
+        }
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            // The native allocator preserves concurrently updated bytes and
+            // extends monotonically. Do not borrow a writer lock from a peer.
+            crate::unix_shm::ensure_shm_backing(&info.file, target_len)?;
+            Ok(())
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // The portable allocator may need to materialize existing holes.
+            // Reuse our own WRITE claim, or acquire a separately accounted
+            // claim only for this allocation. Existing readers stay admitted.
+            let acquired = self.acquire_shm_exclusive_slot(info, WAL_WRITE_LOCK)?;
+            let allocation = crate::unix_shm::ensure_shm_backing(&info.file, target_len)
+                .map_err(FrankenError::Io);
+            if acquired {
+                let release = self.release_shm_exclusive_slot(info, WAL_WRITE_LOCK);
+                if let Err(error) = release {
+                    if allocation.is_ok() {
+                        return Err(error);
+                    }
+                    // Preserve the original allocation errno. The slot table
+                    // still owns this failed release for normal close/retry.
+                    warn!(%error, "SHM allocation failure retained its WRITE cleanup claim");
+                }
+            }
+            allocation
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+        {
+            // A platform syscall name alone is not a concurrency guarantee:
+            // some native allocation backends rewrite whole existing buffers.
+            // Refuse until a backend that preserves live mapped stores exists.
+            Err(FrankenError::Io(io::Error::from_raw_os_error(
+                libc::EOPNOTSUPP,
+            )))
+        }
+    }
+
     fn ensure_shm_info_with_create(
         &mut self,
         cx: &Cx,
@@ -3177,18 +3224,12 @@ impl UnixFile {
         // grab WAL_WRITE_LOCK just to initialize `*-shm`.
         let shm_info = self.ensure_shm_info(cx)?;
         let shm_file = {
-            let info = shm_info
+            let mut info = shm_info
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.ensure_wal_shm_backing(&mut info, SQLITE_WALINDEX_PGSZ)?;
             Arc::clone(&info.file)
         };
-
-        let len = shm_file.metadata().map_err(FrankenError::Io)?.len();
-        if len < SQLITE_WALINDEX_PGSZ {
-            shm_file
-                .set_len(SQLITE_WALINDEX_PGSZ)
-                .map_err(FrankenError::Io)?;
-        }
 
         let mut header_buf = [0_u8; SQLITE_WAL_SHM_HEADER_BYTES];
         let read = shm_file
@@ -4606,7 +4647,10 @@ impl VfsFile for UnixFile {
         if created {
             mvcc_shm_lock(file, FileLockMode::Exclusive)?;
             checkpoint_or_abort(cx)?;
-            file.set_len(total_bytes)?;
+            // Publish the immutable transport header only after the complete
+            // payload has backing storage. Failure leaves an invalid, unmapped
+            // companion, never a header advertising a sparse writable payload.
+            crate::unix_shm::ensure_shm_backing(file, total_bytes)?;
             write_full_at(
                 |buffer, offset| file.write_at(buffer, offset),
                 &mvcc_shm_transport_header(identity, inode_key_from_file(file)?, payload_bytes),
@@ -4621,6 +4665,17 @@ impl VfsFile for UnixFile {
         mvcc_shm_lock(file, FileLockMode::Shared)?;
         validate_mvcc_shm_backing(file, &backing_path)?;
         validate_mvcc_shm_header(file, identity, payload_bytes)?;
+        if !created && !crate::unix_shm::shm_backing_is_allocated(file, total_bytes)? {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            crate::unix_shm::ensure_shm_backing(file, total_bytes)?;
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            // An existing MVCC payload can have live atomic writers. Unlike
+            // the WAL index, its bytes are not protected by WAL_WRITE_LOCK.
+            // Refuse rather than read/rewrite those bytes to allocate holes.
+            return Err(FrankenError::Io(io::Error::from_raw_os_error(
+                libc::EOPNOTSUPP,
+            )));
+        }
         if inode_key_from_file(main.file_ref())? != identity {
             return Err(FrankenError::CannotOpen {
                 path: database_path,
@@ -4675,7 +4730,7 @@ impl VfsFile for UnixFile {
         })?;
 
         let shm_info = self.ensure_shm_info_with_create(cx, extend)?;
-        let info = shm_info
+        let mut info = shm_info
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
@@ -4700,8 +4755,9 @@ impl VfsFile for UnixFile {
         }
 
         // A cold region may already exist on disk even when it has never
-        // been mapped by this process. Non-extending requests only inspect
-        // the canonical descriptor's length; they never grow the backing.
+        // been mapped by this process. Non-extending requests never grow a
+        // missing/short backing, but still must establish physical backing
+        // for a sufficiently long sparse file before publishing an alias.
         let region_count = u64::from(region) + 1;
         let target_len =
             region_count
@@ -4710,14 +4766,16 @@ impl VfsFile for UnixFile {
                     detail: "shm_map file length overflow".to_string(),
                 })?;
         let current_len = info.file.metadata().map_err(FrankenError::Io)?.len();
-        if target_len > current_len {
-            if !extend {
-                return Err(FrankenError::CannotOpen {
-                    path: self.shm_path.clone(),
-                });
-            }
-            info.file.set_len(target_len).map_err(FrankenError::Io)?;
+        if target_len > current_len && !extend {
+            return Err(FrankenError::CannotOpen {
+                path: self.shm_path.clone(),
+            });
         }
+        // Allocate the whole prefix, including skipped regions: stock SQLite
+        // may map every preceding region after observing this file length.
+        // Never truncate on failure. A peer or an older live alias may already
+        // depend on the successful prefix; the next attempt repairs any holes.
+        self.ensure_wal_shm_backing(&mut info, target_len)?;
 
         // Map the region via mmap(MAP_SHARED).
         let offset = u64::from(region) * u64::from(size);
@@ -9608,6 +9666,372 @@ mod tests {
     }
 
     // -- mmap-backed SHM region tests --
+
+    /// Keep a regression that could SIGBUS inside a bounded child process.
+    fn run_shm_allocation_child(test_name: &str) {
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([test_name, "--exact", "--nocapture", "--test-threads=1"])
+            .env("FSQLITE_SHM_ALLOCATION_CHILD", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                let output = child.wait_with_output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "SHM allocation child failed: {output:?}"
+                );
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                assert!(
+                    stdout.contains(test_name) && stdout.contains("test result: ok. 1 passed"),
+                    "SHM allocation child did not execute the requested test: {output:?}"
+                );
+                break;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!("SHM allocation child timed out: {output:?}");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn shm_506_partial_allocation_errors_preserve_aliases_and_recover() {
+        if std::env::var_os("FSQLITE_SHM_ALLOCATION_CHILD").is_none() {
+            run_shm_allocation_child(
+                "unix::tests::shm_506_partial_allocation_errors_preserve_aliases_and_recover",
+            );
+            return;
+        }
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let segment = usize::try_from(SHM_SEGMENT_SIZE).unwrap();
+        for errno in [libc::ENOSPC, libc::EDQUOT, libc::EIO, libc::EFBIG] {
+            let (_dir, path) = make_temp_path("shm-allocation-retry.db");
+            let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+            let original = file.shm_map(&cx, 0, SHM_SEGMENT_SIZE, true).unwrap();
+            for offset in (0..segment).step_by(4096) {
+                original.write_u32_le(offset, 0x1234_ABCD).unwrap();
+            }
+            let info = Arc::clone(file.shm_info.as_ref().unwrap());
+            let (mut peer, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+            peer.shm_lock(
+                &cx,
+                WAL_WRITE_LOCK,
+                1,
+                SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE,
+            )
+            .unwrap();
+            let inode = Arc::clone(file.inode_info_ref());
+            let references = inode.lock().unwrap().n_ref;
+            {
+                // Simulate a syscall that backed a prefix but left the full
+                // requested length with holes. All calls go through shm_map;
+                // only the allocation syscall is faulted in this thread.
+                let _fault = crate::unix_shm::fail_allocations(
+                    errno,
+                    Some(u64::from(SHM_SEGMENT_SIZE) + 4096),
+                );
+                for _ in 0..2 {
+                    for result in [
+                        file.shm_map(&cx, 0, SHM_SEGMENT_SIZE * 2, true),
+                        file.shm_map(&cx, 1, SHM_SEGMENT_SIZE, false),
+                        peer.shm_map(&cx, 1, SHM_SEGMENT_SIZE, false),
+                    ] {
+                        let error = result.expect_err("an unbacked region must not escape");
+                        assert_eq!(error.error_code(), fsqlite_error::ErrorCode::IoErr);
+                        let FrankenError::Io(error) = error else {
+                            panic!("allocation failure lost its I/O error");
+                        };
+                        assert_eq!(error.raw_os_error(), Some(errno));
+                    }
+                    let cached = file.shm_map(&cx, 0, SHM_SEGMENT_SIZE, false).unwrap();
+                    assert_eq!(cached.len(), segment);
+                    for offset in (0..segment).step_by(4096) {
+                        assert_eq!(cached.read_u32_le(offset).unwrap(), 0x1234_ABCD);
+                    }
+                    let registered = info.lock().unwrap();
+                    assert_eq!(registered.regions.len(), 1);
+                    assert_eq!(registered.regions[&0].len(), segment);
+                    assert_eq!(registered.mapping_owners.len(), 1);
+                    assert_eq!(
+                        registered.slots[WAL_WRITE_LOCK as usize].exclusive_owner,
+                        Some(peer.shm_owner_id),
+                        "allocation must not borrow or release the peer's WRITE lock"
+                    );
+                }
+            }
+            assert_eq!(inode.lock().unwrap().n_ref, references);
+            let expanded = file.shm_map(&cx, 0, SHM_SEGMENT_SIZE * 2, true).unwrap();
+            let next = peer.shm_map(&cx, 1, SHM_SEGMENT_SIZE, false).unwrap();
+            for offset in (0..segment).step_by(4096) {
+                assert_eq!(original.read_u32_le(offset).unwrap(), 0x1234_ABCD);
+                assert_eq!(expanded.read_u32_le(offset).unwrap(), 0x1234_ABCD);
+                next.write_u32_le(offset, 0x5678_CDEF).unwrap();
+                assert_eq!(expanded.read_u32_le(segment + offset).unwrap(), 0x5678_CDEF);
+            }
+            peer.shm_lock(
+                &cx,
+                WAL_WRITE_LOCK,
+                1,
+                SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE,
+            )
+            .unwrap();
+            file.close(&cx).unwrap();
+            peer.close(&cx).unwrap();
+            original.write_u32_le(0, 0xCAFE_BABE).unwrap();
+            assert_eq!(expanded.read_u32_le(0).unwrap(), 0xCAFE_BABE);
+            assert_eq!(next.read_u32_le(segment - 4096).unwrap(), 0x5678_CDEF);
+        }
+    }
+
+    #[test]
+    fn shm_506_concurrent_growth_preserves_existing_readers_and_skipped_regions() {
+        if std::env::var_os("FSQLITE_SHM_ALLOCATION_CHILD").is_none() {
+            run_shm_allocation_child(
+                "unix::tests::shm_506_concurrent_growth_preserves_existing_readers_and_skipped_regions",
+            );
+            return;
+        }
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("shm-concurrent-allocation.db");
+        let (mut reader, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        let original = reader.shm_map(&cx, 0, SHM_SEGMENT_SIZE, true).unwrap();
+        original.write_u32_le(512, 0x7654_3210).unwrap();
+        let start = Arc::new(std::sync::Barrier::new(4));
+        let workers = (1..=4_u32)
+            .map(|region| {
+                let path = path.clone();
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    let cx = Cx::new();
+                    let (mut writer, _) = UnixVfs::new()
+                        .open(&cx, Some(&path), open_flags_create())
+                        .unwrap();
+                    start.wait();
+                    let mapping = writer.shm_map(&cx, region, SHM_SEGMENT_SIZE, true).unwrap();
+                    for offset in (0..SHM_SEGMENT_SIZE as usize).step_by(4096) {
+                        mapping.write_u32_le(offset, region * 100 + 7).unwrap();
+                    }
+                    for _ in 0..8 {
+                        let repeated = writer
+                            .shm_map(&cx, region, SHM_SEGMENT_SIZE, false)
+                            .unwrap();
+                        assert_eq!(repeated.read_u32_le(0).unwrap(), region * 100 + 7);
+                        let first = writer.shm_map(&cx, 0, SHM_SEGMENT_SIZE, false).unwrap();
+                        assert_eq!(first.read_u32_le(512).unwrap(), 0x7654_3210);
+                    }
+                    writer.close(&cx).unwrap();
+                    mapping
+                })
+            })
+            .collect::<Vec<_>>();
+        for (index, worker) in workers.into_iter().enumerate() {
+            let mapping = worker.join().unwrap();
+            for offset in (0..SHM_SEGMENT_SIZE as usize).step_by(4096) {
+                assert_eq!(
+                    mapping.read_u32_le(offset).unwrap(),
+                    (index as u32 + 1) * 100 + 7
+                );
+            }
+            assert_eq!(original.read_u32_le(512).unwrap(), 0x7654_3210);
+        }
+        // Linux exposes a nonmutating allocation query. Other native backends
+        // may establish backing without exposing such a query; their mappings
+        // and preserved bytes were exercised above.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        assert!(
+            crate::unix_shm::shm_backing_is_allocated(
+                &reader.shm_info.as_ref().unwrap().lock().unwrap().file,
+                u64::from(SHM_SEGMENT_SIZE) * 5,
+            )
+            .unwrap()
+        );
+        reader.close(&cx).unwrap();
+        assert_eq!(original.read_u32_le(512).unwrap(), 0x7654_3210);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn shm_506_mvcc_header_is_not_published_after_partial_allocation() {
+        if std::env::var_os("FSQLITE_SHM_ALLOCATION_CHILD").is_none() {
+            run_shm_allocation_child(
+                "unix::tests::shm_506_mvcc_header_is_not_published_after_partial_allocation",
+            );
+            return;
+        }
+        let cx = Cx::new();
+        let (_dir, path, mut file, namespace) = admitted_mvcc_fixture("mvcc-allocation.db");
+        {
+            let _fault = crate::unix_shm::fail_allocations(libc::ENOSPC, Some(4096));
+            let error = file.mvcc_shm_map(&cx, 4096, true).unwrap_err();
+            let FrankenError::Io(error) = error else {
+                panic!("MVCC allocation must propagate its I/O error");
+            };
+            assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
+        }
+        let backing = fs::read(mvcc_shm_path(&path)).unwrap();
+        assert_eq!(
+            &backing[..8],
+            &[0; 8],
+            "no valid header may advertise an unbacked payload"
+        );
+        assert!(matches!(
+            file.mvcc_shm_map(&cx, 4096, false),
+            Err(FrankenError::BusyRecovery)
+        ));
+        file.close(&cx).unwrap();
+        namespace.quiesce();
+    }
+
+    /// Run explicitly on a host permitting unprivileged user/mount namespaces:
+    /// `cargo test -p fsqlite-vfs --lib shm_506_private_tmpfs -- --ignored --nocapture`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires a private user/mount namespace; never fills a shared filesystem"]
+    fn shm_506_private_tmpfs_enospc_preserves_readers_and_recovers() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        const TEST: &str =
+            "unix::tests::shm_506_private_tmpfs_enospc_preserves_readers_and_recovers";
+        const CHILD: &str = "FSQLITE_SHM_PRIVATE_TMPFS_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let mut child = Command::new("unshare")
+                .args([
+                    "--user",
+                    "--map-root-user",
+                    "--mount",
+                    "--fork",
+                    "--kill-child=KILL",
+                ])
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    TEST,
+                    "--exact",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("unshare must be installed to run the private tmpfs keeper");
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                if child.try_wait().unwrap().is_some() {
+                    let output = child.wait_with_output().unwrap();
+                    assert!(
+                        output.status.success(),
+                        "private tmpfs child failed: {output:?}"
+                    );
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    assert!(
+                        stdout.contains("gh506-private-tmpfs-enospc-and-recovery-verified")
+                            && stdout.contains("test result: ok. 1 passed"),
+                        "private tmpfs child did not complete the keeper: {output:?}"
+                    );
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    child.wait().unwrap();
+                    panic!("private tmpfs child timed out");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let mount_path = std::ffi::CString::new(directory.path().as_os_str().as_bytes()).unwrap();
+        // SAFETY: all strings are live NUL-terminated buffers; the parent
+        // launched this test in a fresh mount namespace. This 1 MiB tmpfs is
+        // the only filesystem filled, and disappears with the child process.
+        let mounted = unsafe {
+            libc::mount(
+                c"tmpfs".as_ptr(),
+                mount_path.as_ptr(),
+                c"tmpfs".as_ptr(),
+                libc::MS_NODEV | libc::MS_NOSUID,
+                c"size=1048576".as_ptr().cast(),
+            )
+        };
+        assert_eq!(
+            mounted,
+            0,
+            "private tmpfs mount: {}",
+            io::Error::last_os_error()
+        );
+        let path = directory.path().join("full.db");
+        fs::write(&path, [0x5A; 4096]).unwrap();
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        let original = file.shm_map(&cx, 0, SHM_SEGMENT_SIZE, true).unwrap();
+        for offset in (0..SHM_SEGMENT_SIZE as usize).step_by(4096) {
+            original.write_u32_le(offset, 0xAABB_CCDD).unwrap();
+        }
+        let (mut reader, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        let reader_alias = reader.shm_map(&cx, 0, SHM_SEGMENT_SIZE, false).unwrap();
+        reader
+            .shm_lock(&cx, 3, 1, SQLITE_SHM_LOCK | SQLITE_SHM_SHARED)
+            .unwrap();
+        let mut ballast = File::create(directory.path().join("ballast")).unwrap();
+        loop {
+            match ballast.write_all(&[0x19; 4096]) {
+                Ok(()) => {}
+                Err(error) => {
+                    assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
+                    break;
+                }
+            }
+        }
+        // Leave four pages free, matching the reported health-probe setup.
+        // Extending by a 32 KiB region still needs eight pages.
+        ballast
+            .set_len(ballast.metadata().unwrap().len() - 4 * 4096)
+            .unwrap();
+        for _ in 0..2 {
+            let error = file.shm_map(&cx, 1, SHM_SEGMENT_SIZE, true).unwrap_err();
+            let FrankenError::Io(error) = error else {
+                panic!("exhausted tmpfs must return an allocation I/O error");
+            };
+            assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
+            assert!(reader.shm_map(&cx, 1, SHM_SEGMENT_SIZE, false).is_err());
+            let cached = reader.shm_map(&cx, 0, SHM_SEGMENT_SIZE, false).unwrap();
+            for offset in (0..SHM_SEGMENT_SIZE as usize).step_by(4096) {
+                assert_eq!(cached.read_u32_le(offset).unwrap(), 0xAABB_CCDD);
+                assert_eq!(reader_alias.read_u32_le(offset).unwrap(), 0xAABB_CCDD);
+            }
+        }
+        ballast.set_len(0).unwrap();
+        let recovered = file.shm_map(&cx, 1, SHM_SEGMENT_SIZE, true).unwrap();
+        let recovered_reader = reader.shm_map(&cx, 1, SHM_SEGMENT_SIZE, false).unwrap();
+        for offset in (0..SHM_SEGMENT_SIZE as usize).step_by(4096) {
+            recovered.write_u32_le(offset, 0xEEFF_0011).unwrap();
+            assert_eq!(recovered_reader.read_u32_le(offset).unwrap(), 0xEEFF_0011);
+        }
+        let mut main = [0; 4096];
+        assert_eq!(file.read(&cx, &mut main, 0).unwrap(), main.len());
+        assert_eq!(
+            main, [0x5A; 4096],
+            "allocation must not alter database bytes"
+        );
+        reader
+            .shm_lock(&cx, 3, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_SHARED)
+            .unwrap();
+        file.close(&cx).unwrap();
+        reader.close(&cx).unwrap();
+        assert_eq!(original.read_u32_le(0).unwrap(), 0xAABB_CCDD);
+        println!("gh506-private-tmpfs-enospc-and-recovery-verified");
+    }
 
     #[test]
     fn test_shm_map_nonextend_maps_cold_existing_regions_without_mutation() {

@@ -9,6 +9,8 @@ pub mod shm;
 pub mod traits;
 #[cfg(all(feature = "native", unix))]
 pub mod unix;
+#[cfg(all(feature = "native", unix))]
+mod unix_shm;
 #[cfg(all(feature = "native", target_os = "linux"))]
 pub mod uring;
 #[cfg(all(feature = "native", target_os = "windows"))]
