@@ -382,7 +382,45 @@ mod pager_quarantine {
         Drop,
     }
 
-    async fn seeded_pager() -> (Cx, SimplePager<MemoryVfs>, PageNumber, PageNumber) {
+    struct Fixture {
+        cx: Cx,
+        pager: SimplePager<MemoryVfs>,
+        vfs: MemoryVfs,
+        db_path: PathBuf,
+        wal_path: PathBuf,
+        free: PageNumber,
+        live: PageNumber,
+    }
+
+    impl Fixture {
+        async fn open_peer(&self) -> SimplePager<MemoryVfs> {
+            let peer = SimplePager::open_with_cx(
+                &self.cx,
+                self.vfs.clone(),
+                &self.db_path,
+                PageSize::new(512).unwrap(),
+            )
+            .await
+            .unwrap();
+            let (file, _) = self
+                .vfs
+                .open(
+                    &self.cx,
+                    Some(&self.wal_path),
+                    VfsOpenFlags::READWRITE | VfsOpenFlags::WAL,
+                )
+                .unwrap();
+            let wal = WalFile::open(&self.cx, file).await.unwrap();
+            peer.set_wal_backend(Box::new(WalBackendAdapter::new(wal)))
+                .unwrap();
+            peer.set_journal_mode(&self.cx, JournalMode::Wal)
+                .await
+                .unwrap();
+            peer
+        }
+    }
+
+    async fn seeded_pager() -> Fixture {
         let cx = Cx::new();
         let vfs = MemoryVfs::new();
         let page_size = PageSize::new(512).unwrap();
@@ -445,7 +483,15 @@ mod pager_quarantine {
         }
         assert!(free_frame.is_some_and(|index| last_commit.is_some_and(|end| index <= end)));
         wal.close(&cx).unwrap();
-        (cx, pager, free, live)
+        Fixture {
+            cx,
+            pager,
+            vfs,
+            db_path,
+            wal_path,
+            free,
+            live,
+        }
     }
 
     async fn assert_free_header(
@@ -464,7 +510,9 @@ mod pager_quarantine {
 
     async fn terminal_return(finish: Finish, regrant: bool) {
         for mixed_eof in [false, true] {
-            let (cx, pager, free, live) = seeded_pager().await;
+            let Fixture {
+                cx, pager, free, live, ..
+            } = seeded_pager().await;
             assert_free_header(&pager, &cx, free.get(), 1).await;
             let mut txn = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
             let snapshot = txn.published_visible_commit_seq_hint();
@@ -570,7 +618,9 @@ mod pager_quarantine {
     #[test]
     fn wal_quarantine_regrant_commit_removes_durable_free_entry() {
         asupersync::test_utils::run_test(|| async {
-            let (cx, pager, free, live) = seeded_pager().await;
+            let Fixture {
+                cx, pager, free, live, ..
+            } = seeded_pager().await;
             let mut txn = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
             txn.savepoint(&cx, "before").unwrap();
             assert_eq!(txn.allocate_page(&cx).await.unwrap(), free);
@@ -590,5 +640,127 @@ mod pager_quarantine {
             assert_eq!(reader.get_page(&cx, live).await.unwrap().as_bytes(), &[0x42; PAGE_BYTES]);
             reader.rollback(&cx).await.unwrap();
         });
+    }
+
+    // Two distinct pagers have independent freelist projections of the same
+    // committed WAL. A private quarantine prevents same-pager aliasing, but
+    // cannot prevent a peer from claiming that page after our fixed snapshot.
+    // Re-grant must therefore retain durable-freelist consumption validation.
+    async fn regrant_with_peer(publish_peer: bool) {
+        let fixture = seeded_pager().await;
+        let peer = fixture.open_peer().await;
+        let Fixture {
+            cx, pager, free, live, ..
+        } = fixture;
+        assert_free_header(&peer, &cx, free.get(), 1).await;
+
+        let mut local = pager
+            .begin(&cx, TransactionMode::Concurrent)
+            .await
+            .unwrap();
+        let snapshot = local.published_visible_commit_seq_hint();
+        local.savepoint(&cx, "before").unwrap();
+        for _ in 0..2 {
+            assert_eq!(local.allocate_page(&cx).await.unwrap(), free);
+            local
+                .write_page(&cx, free, &[0x71; PAGE_BYTES])
+                .await
+                .unwrap();
+            local.rollback_to_savepoint(&cx, "before").unwrap();
+            assert_eq!(local.published_visible_commit_seq_hint(), snapshot);
+            assert!(local.live_reserved_pages().contains(&free));
+            assert!(!local.live_freelist_pages().contains(&free));
+        }
+        // A pager marker release is not a transaction commit. Keep the outer
+        // handle alive, with its original snapshot and private reservation.
+        local.release_savepoint(&cx, "before").unwrap();
+
+        let mut competing = peer
+            .begin(&cx, TransactionMode::Concurrent)
+            .await
+            .unwrap();
+        assert_eq!(competing.allocate_page(&cx).await.unwrap(), free);
+        competing
+            .write_page(&cx, free, &[0x52; PAGE_BYTES])
+            .await
+            .unwrap();
+        if publish_peer {
+            competing.commit(&cx).await.unwrap();
+        } else {
+            competing.rollback(&cx).await.unwrap();
+        }
+        drop(competing);
+
+        assert_eq!(local.published_visible_commit_seq_hint(), snapshot);
+        assert_eq!(local.allocate_page(&cx).await.unwrap(), free);
+        let result = match local.write_page(&cx, free, &[0x61; PAGE_BYTES]).await {
+            Ok(()) => local.commit(&cx).await,
+            Err(error) => Err(error),
+        };
+        if publish_peer {
+            let error =
+                result.expect_err("a re-grant must not overwrite the peer's committed page");
+            assert!(
+                matches!(error, fsqlite_error::FrankenError::BusySnapshot { .. }),
+                "expected a snapshot conflict, not a lock or I/O failure: {error}",
+            );
+            local.rollback(&cx).await.unwrap();
+        } else {
+            result.expect("an unpublished peer allocation must not poison the local writer");
+        }
+        drop(local);
+
+        let expected = if publish_peer { 0x52 } else { 0x61 };
+        assert_free_header(&pager, &cx, 0, 0).await;
+        let mut fresh = pager
+            .begin(&cx, TransactionMode::Concurrent)
+            .await
+            .unwrap();
+        assert_eq!(
+            fresh.get_page(&cx, free).await.unwrap().as_bytes(),
+            &[expected; PAGE_BYTES],
+        );
+        assert_eq!(
+            fresh.get_page(&cx, live).await.unwrap().as_bytes(),
+            &[0x42; PAGE_BYTES],
+        );
+        // Full rollback must also retire stale allocation ownership: a new
+        // writer cannot receive the now-live peer page from its local freelist.
+        let new_page = fresh.allocate_page(&cx).await.unwrap();
+        assert!(new_page > live);
+        fresh
+            .write_page(&cx, new_page, &[0x63; PAGE_BYTES])
+            .await
+            .unwrap();
+        fresh.commit(&cx).await.unwrap();
+        drop(fresh);
+
+        let mut reader = peer
+            .begin(&cx, TransactionMode::ReadOnly)
+            .await
+            .unwrap();
+        assert_eq!(
+            reader.get_page(&cx, free).await.unwrap().as_bytes(),
+            &[expected; PAGE_BYTES],
+        );
+        assert_eq!(
+            reader.get_page(&cx, live).await.unwrap().as_bytes(),
+            &[0x42; PAGE_BYTES],
+        );
+        assert_eq!(
+            reader.get_page(&cx, new_page).await.unwrap().as_bytes(),
+            &[0x63; PAGE_BYTES],
+        );
+        reader.rollback(&cx).await.unwrap();
+    }
+
+    #[test]
+    fn wal_quarantine_regrant_rejects_committed_peer_consumption() {
+        asupersync::test_utils::run_test(|| async { regrant_with_peer(true).await });
+    }
+
+    #[test]
+    fn wal_quarantine_regrant_accepts_rolled_back_peer_consumption() {
+        asupersync::test_utils::run_test(|| async { regrant_with_peer(false).await });
     }
 }
