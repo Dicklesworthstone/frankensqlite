@@ -4,7 +4,7 @@ use std::path::Path;
 
 use asupersync::runtime::RuntimeBuilder;
 use fsqlite_error::{FrankenError, Result};
-use fsqlite_harness::fault_vfs::{FaultInjectingVfs, FaultSpec};
+use fsqlite_harness::fault_vfs::{FaultInjectingVfs, FaultKind, FaultSpec};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::VfsOpenFlags;
 use fsqlite_types::{
@@ -344,7 +344,7 @@ fn retained_payload_and_version_limits_refuse_before_storage_mutation() {
 #[test]
 fn both_sync_failures_have_indeterminate_not_rolled_back_outcomes() {
     run(async {
-        for (path, sync, recovered_seq) in [("objects", 1, 0), ("markers", 2, 1)] {
+        for (path, sync_index, recovered_seq) in [("objects", 0, 0), ("markers", 1, 1)] {
             let cx = Cx::new();
             let vfs = FaultInjectingVfs::new(MemoryVfs::new());
             let mut db = store(&vfs, &cx, NativePageLimits::default());
@@ -353,15 +353,37 @@ fn both_sync_failures_have_indeterminate_not_rolled_back_outcomes() {
                 db.write_page(&cx, &mut txn, page(p), Some(&image(9)))
                     .unwrap();
             }
-            vfs.inject_fault(FaultSpec::power_cut(path).after_nth_sync(sync).build());
-            assert!(db.commit(&cx, &mut txn, 100).await.is_err());
+            // GH#508: fault thresholds are zero-based across both streams.
+            // Private page writes must not consume a publication barrier.
+            assert_eq!(vfs.sync_count(), 0);
+            let token = txn.token();
+            vfs.inject_fault(FaultSpec::power_cut(path).after_nth_sync(sync_index).build());
+            assert!(matches!(
+                db.commit(&cx, &mut txn, 100).await,
+                Err(FrankenError::Io(_))
+            ));
             assert!(vfs.is_powered_off());
+            assert_eq!(vfs.sync_count(), sync_index + 1);
+            let faults = vfs.triggered_faults();
+            assert_eq!(faults.len(), 1, "the intended barrier must actually fail");
+            assert_eq!(faults[0].path, Path::new(path));
+            assert_eq!(faults[0].kind, FaultKind::PowerCut);
+            assert_eq!(faults[0].detail, format!("operation=sync index={sync_index}"));
             assert!(db.needs_recovery());
+            assert_eq!(txn.token(), token);
             assert_eq!(txn.state(), NativePageTransactionState::Indeterminate);
-            assert!(db.rollback(&mut txn).is_err());
+            assert!(txn.is_page_dirty(page(1)));
+            assert!(txn.is_page_dirty(page(2)));
+            assert!(matches!(db.rollback(&mut txn), Err(FrankenError::BusyRecovery)));
             assert_eq!(db.committed_tip(), CommitSeq::ZERO);
             vfs.power_on();
+            assert!(matches!(
+                db.commit(&cx, &mut txn, 101).await,
+                Err(FrankenError::BusyRecovery)
+            ));
+            assert!(matches!(db.begin(&cx), Err(FrankenError::BusyRecovery)));
             db.close(&cx).unwrap();
+            assert_eq!(vfs.sync_count(), sync_index + 1, "no implicit retry");
             let (mut recovered, report) = NativePageStore::recover(
                 &cx,
                 open(&vfs, &cx, "objects"),
@@ -373,6 +395,7 @@ fn both_sync_failures_have_indeterminate_not_rolled_back_outcomes() {
             )
             .await
             .unwrap();
+            assert_eq!(vfs.sync_count(), sync_index + 3, "only recovery resyncs");
             assert_eq!(recovered.committed_tip(), CommitSeq::new(recovered_seq));
             assert_eq!(
                 report.markers.len(),
