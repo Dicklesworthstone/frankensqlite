@@ -415,6 +415,8 @@ fn linux_fiemap_backing(_file: &File, _target_len: u64) -> io::Result<LinuxBacki
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
+// Same signature as the Linux probe, which does fail.
+#[allow(clippy::unnecessary_wraps)]
 fn platform_backing_is_allocated(_file: &File, _target_len: u64) -> io::Result<bool> {
     // No allocator, so no receipt. On macOS an F_LOG2PHYS_EXT query was tried
     // as the receipt and removed: it reports no physical extent for freshly
