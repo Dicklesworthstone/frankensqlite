@@ -417,7 +417,7 @@ where
                 self.stopped = Arc::new(FrankenError::Interrupt);
                 return Err(FrankenError::Interrupt);
             }
-            self.publish(cx).await?;
+            self.publish(cx, &native).await?;
             let uncertain = self.batch.iter().any(|request| matches!(
                 request.transaction.pager_commit_state(),
                 PagerCommitState::InDoubt | PagerCommitState::DurableNeedsPublication
@@ -450,7 +450,7 @@ where
         }
     }
 
-    async fn publish(&mut self, cx: &Cx) -> Result<()> {
+    async fn publish(&mut self, cx: &Cx, native: &NativeCx) -> Result<()> {
         let now = self.batch.iter().map(|request| request.now_unix_ns).max().unwrap_or(0);
         let result = {
             let mut transactions = Vec::new();
@@ -474,6 +474,15 @@ where
             return Ok(());
         }
         for request in &mut self.batch {
+            // Each fallback member is a new publication attempt. The initial
+            // group can reject after cancelling the worker, and an earlier
+            // singleton can finish after cancellation. Check the same native
+            // context run resolved, even when cx has no native attachment.
+            // Never race this check against an already admitted source write.
+            if cx.checkpoint().is_err() || native.checkpoint().is_err() {
+                self.stopped = Arc::new(FrankenError::Interrupt);
+                break;
+            }
             // Always use THIS service's owner, including in the fallback.
             // Calling transaction.commit() here would commit a foreign pager.
             let result = self.pager.commit_batch_at(
@@ -484,10 +493,6 @@ where
                 && request.transaction.pager_commit_state().retains_commit_obligation()
             {
                 self.stopped = Arc::new(FrankenError::BusyRecovery);
-                break;
-            }
-            if cx.checkpoint().is_err() {
-                self.stopped = Arc::new(FrankenError::Interrupt);
                 break;
             }
         }
@@ -547,4 +552,211 @@ async fn yield_once() {
             Poll::Pending
         }
     }).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::sync::atomic::AtomicUsize;
+
+    use asupersync::runtime::RuntimeBuilder;
+    use fsqlite_types::flags::VfsOpenFlags;
+    use fsqlite_types::{
+        COMMIT_MARKER_RECORD_V1_SIZE, CommitSeq, ObjectId, Oti, PageNumber, SymbolRecord,
+        SymbolRecordFlags, reconstruct_systematic_happy_path,
+    };
+    use fsqlite_vfs::{MemoryVfs, Vfs};
+    use fsqlite_wal::native_durability::{NativeDurabilityLimits, NativeDurabilityLog};
+    use fsqlite_wal::native_pages::NativePageLimits;
+
+    use super::*;
+    use crate::TransactionMode;
+
+    // A deterministic scheduling fixture, not an erasure-code or power-loss
+    // certificate. A codec is not required to inspect the service's mailbox
+    // context; the service must enforce its own cancellation boundary.
+    struct CancelOnceCodec {
+        source: NativeCx,
+        calls: Arc<AtomicUsize>,
+        reject_first: bool,
+    }
+
+    impl NativeObjectCodec for CancelOnceCodec {
+        fn encode(&self, cx: &Cx, bytes: &[u8]) -> Result<Vec<SymbolRecord>> {
+            cx.checkpoint().map_err(|_| FrankenError::Interrupt)?;
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.source.cancel_with(asupersync::types::CancelKind::User, None);
+                if self.reject_first {
+                    return Err(FrankenError::TooBig);
+                }
+            }
+            let size = u32::try_from(bytes.len()).map_err(|_| FrankenError::TooBig)?;
+            Ok(vec![SymbolRecord::new(
+                ObjectId::derive_from_canonical_bytes(bytes),
+                Oti { f: u64::from(size), al: 1, t: size, z: 1, n: 1 },
+                0,
+                bytes.to_vec(),
+                SymbolRecordFlags::SYSTEMATIC_RUN_START,
+            )])
+        }
+
+        fn decode(&self, _: &Cx, id: ObjectId, records: &[SymbolRecord]) -> Result<Vec<u8>> {
+            let bytes = reconstruct_systematic_happy_path(records)
+                .map_err(|error| FrankenError::Internal(error.to_string()))?;
+            if ObjectId::derive_from_canonical_bytes(&bytes) != id {
+                return Err(FrankenError::Abort);
+            }
+            Ok(bytes)
+        }
+    }
+
+    fn page(number: u32) -> PageNumber {
+        PageNumber::new(number).unwrap()
+    }
+
+    fn file(vfs: &MemoryVfs, cx: &Cx, name: &str, create: bool) -> <MemoryVfs as Vfs>::File {
+        let mut flags = VfsOpenFlags::READWRITE | VfsOpenFlags::WAL;
+        if create {
+            flags |= VfsOpenFlags::CREATE;
+        }
+        vfs.open(cx, Some(Path::new(name)), flags).unwrap().0
+    }
+
+    #[test]
+    fn native_cancel_during_group_rejection_never_starts_split_publication() {
+        check_fallback_cancellation(true);
+    }
+
+    #[test]
+    fn native_cancel_during_split_member_preserves_only_that_committed_receipt() {
+        check_fallback_cancellation(false);
+    }
+
+    fn check_fallback_cancellation(reject_group: bool) {
+        RuntimeBuilder::current_thread()
+            .blocking_threads(1, 2)
+            .build()
+            .unwrap()
+            .block_on(async {
+                let producer = NativeCx::current().expect("caller runtime");
+                let cx = Cx::new();
+                cx.set_native_cx(producer.clone());
+                let source = NativeCx::for_testing();
+                let worker_cx = Cx::new();
+                assert!(worker_cx.attached_native_cx().is_none());
+                let calls = Arc::new(AtomicUsize::new(0));
+                let codec = || CancelOnceCodec {
+                    source: source.clone(),
+                    calls: Arc::clone(&calls),
+                    reject_first: reject_group,
+                };
+                let vfs = MemoryVfs::new();
+                let log = NativeDurabilityLog::create(
+                    &cx,
+                    file(&vfs, &cx, "objects", true),
+                    file(&vfs, &cx, "markers", true),
+                    NativeDurabilityLimits::default(),
+                ).unwrap();
+                let owner = NativePager::new(
+                    NativePageStore::new(log, codec(), 512, NativePageLimits::default()).unwrap(),
+                ).unwrap();
+                // With rejection, the group's first encode cancels the native
+                // context and refuses before I/O. Otherwise overlap rejects the
+                // group before encoding; its first singleton cancels while
+                // running and successfully completes its own publication.
+                let pages = if reject_group { [2, 3, 4, 5] } else { [2, 2, 3, 4] };
+                let committed = if reject_group { 0 } else { 1 };
+                let (sender, worker) = NativeCommitService::new(&owner, 4, 3).unwrap();
+                let mut tickets = Vec::new();
+                for (index, number) in pages.iter().copied().enumerate() {
+                    let mut transaction = owner.begin(&cx, TransactionMode::Concurrent).unwrap();
+                    transaction.savepoint(&cx, "private").unwrap();
+                    transaction.write_page(
+                        &cx, page(number), &[u8::try_from(index + 2).unwrap(); 512],
+                    ).await.unwrap();
+                    tickets.push(sender.reserve(&producer).await.unwrap().send(transaction, 100).unwrap());
+                }
+                let mut running = std::pin::pin!(worker.run(&worker_cx));
+                let result = poll_fn(|task| {
+                    // Install only for this poll, as an executor does. Do not
+                    // attach it to worker_cx or cancel the outer test runtime.
+                    let _current = NativeCx::set_current(Some(source.clone()));
+                    running.as_mut().poll(task)
+                }).await;
+                assert!(matches!(result, Err(FrankenError::Interrupt)));
+                assert!(source.checkpoint().is_err());
+                assert!(worker_cx.checkpoint().is_ok(), "storage cancellation is independent");
+                assert!(worker_cx.attached_native_cx().is_none());
+                assert!(producer.checkpoint().is_ok());
+                assert!(NativeCx::current().unwrap().checkpoint().is_ok());
+                assert!(!owner.needs_recovery().unwrap());
+                assert_eq!(owner.committed_tip().unwrap().get(), committed);
+                let encoded = calls.load(Ordering::SeqCst);
+                assert_eq!(encoded, if reject_group { 1 } else { 2 });
+                assert!(matches!(sender.try_reserve(&producer), Err(FrankenError::Abort)));
+                assert!(matches!(owner.close(&cx), Err(FrankenError::Busy)));
+                for (index, mut ticket) in tickets.into_iter().enumerate() {
+                    let mut completion = ticket.wait(&producer).await.unwrap();
+                    let transaction = &mut completion.transaction;
+                    assert_eq!(transaction.mode(), TransactionMode::Concurrent);
+                    assert_eq!(transaction.published_visible_commit_seq_hint(), Some(CommitSeq::ZERO));
+                    if !reject_group && index == 0 {
+                        completion.result.as_ref().unwrap();
+                        assert_eq!(transaction.pager_commit_state(), PagerCommitState::Committed);
+                        assert_eq!(transaction.acknowledgement().unwrap().commit_seq, CommitSeq::new(1));
+                        assert!(!transaction.has_pending_writes());
+                    } else {
+                        assert!(matches!(completion.result.as_ref().unwrap_err().as_ref(), FrankenError::Interrupt));
+                        assert_eq!(transaction.pager_commit_state(), PagerCommitState::NotCommitted);
+                        assert!(transaction.acknowledgement().is_none());
+                        assert_eq!(transaction.pending_commit_pages().unwrap(), [page(pages[index])]);
+                        assert_eq!(transaction.get_page(&cx, page(pages[index])).await.unwrap().as_bytes(),
+                            &[u8::try_from(index + 2).unwrap(); 512]);
+                        transaction.rollback_to_savepoint(&cx, "private").unwrap();
+                        assert!(!transaction.has_pending_writes());
+                        transaction.rollback(&cx).await.unwrap();
+                    }
+                }
+                assert_eq!(calls.load(Ordering::SeqCst), encoded, "cleanup must not encode or retry");
+                let mut markers = file(&vfs, &cx, "markers", false);
+                assert_eq!(markers.file_size(&cx).unwrap(),
+                    committed * u64::try_from(COMMIT_MARKER_RECORD_V1_SIZE).unwrap());
+                markers.close(&cx).unwrap();
+
+                // The worker is terminal, not the pager. New work on the same
+                // healthy owner needs no recovery and must not replay any of
+                // the returned private overlays.
+                let mut next = owner.begin(&cx, TransactionMode::Concurrent).unwrap();
+                next.write_page(&cx, page(100), &[91; 512]).await.unwrap();
+                let (fresh, worker) = NativeCommitService::new(&owner, 1, 1).unwrap();
+                let mut ticket = fresh.reserve(&producer).await.unwrap().send(next, 1000).unwrap();
+                fresh.request_shutdown();
+                worker.run(&cx).await.unwrap();
+                let completed = ticket.wait(&producer).await.unwrap();
+                completed.result.unwrap();
+                assert_eq!(completed.transaction.acknowledgement().unwrap().commit_seq.get(), committed + 1);
+                owner.close(&cx).unwrap();
+                let (mut recovered, report) = NativePageStore::recover(
+                    &cx,
+                    file(&vfs, &cx, "objects", false),
+                    file(&vfs, &cx, "markers", false),
+                    codec(),
+                    512,
+                    NativeDurabilityLimits::default(),
+                    NativePageLimits::default(),
+                ).await.unwrap();
+                assert_eq!(report.markers.len(), usize::try_from(committed + 1).unwrap());
+                assert_eq!(recovered.committed_tip().get(), committed + 1);
+                let mut view = recovered.begin(&cx).unwrap();
+                for number in pages {
+                    let actual = recovered.read_page(&cx, &mut view, page(number)).unwrap();
+                    let expected = if !reject_group && number == 2 { Some(&[2_u8; 512][..]) } else { None };
+                    assert_eq!(actual.as_deref(), expected, "unattempted overlays must not be replayed");
+                }
+                assert_eq!(recovered.read_page(&cx, &mut view, page(100)).unwrap().as_deref(),
+                    Some(&[91_u8; 512][..]));
+                recovered.rollback(&mut view).unwrap();
+                recovered.close(&cx).unwrap();
+            });
+    }
 }
