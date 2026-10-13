@@ -5,7 +5,7 @@ use std::path::Path;
 
 use asupersync::runtime::RuntimeBuilder;
 use fsqlite_error::{FrankenError, Result};
-use fsqlite_harness::fault_vfs::{FaultInjectingVfs, FaultSpec};
+use fsqlite_harness::fault_vfs::{FaultInjectingVfs, FaultKind, FaultSpec};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::VfsOpenFlags;
 use fsqlite_types::{
@@ -21,6 +21,16 @@ fn run(future: impl Future<Output = ()>) {
         .build()
         .unwrap()
         .block_on(future);
+}
+
+fn assert_power_cut<V: Vfs>(vfs: &FaultInjectingVfs<V>, path: &str, sync_index: u32) {
+    assert!(vfs.is_powered_off());
+    assert_eq!(vfs.sync_count(), sync_index + 1);
+    let faults = vfs.triggered_faults();
+    assert_eq!(faults.len(), 1, "the intended barrier must actually fail");
+    assert_eq!(faults[0].path, Path::new(path));
+    assert_eq!(faults[0].kind, FaultKind::PowerCut);
+    assert_eq!(faults[0].detail, format!("operation=sync index={sync_index}"));
 }
 
 #[test]
@@ -80,12 +90,24 @@ fn recovery_reconciles_a_failed_marker_sync_without_losing_the_commit() {
         log.append_symbols(&cx, &[symbol(1), symbol(2)])
             .await
             .unwrap();
-        vfs.inject_fault(FaultSpec::power_cut("markers").after_nth_sync(2).build());
-        assert!(log.publish(&cx, &[first_marker()], verify).await.is_err());
+        // GH#508: the second barrier has global index one, not two.
+        assert_eq!(vfs.sync_count(), 0);
+        vfs.inject_fault(FaultSpec::power_cut("markers").after_nth_sync(1).build());
+        assert!(matches!(
+            log.publish(&cx, &[first_marker()], verify).await,
+            Err(FrankenError::Io(_))
+        ));
+        assert_power_cut(&vfs, "markers", 1);
+        assert!(log.needs_recovery());
         assert_eq!(log.published_tip(), CommitSeq::ZERO);
         vfs.power_on();
+        assert!(matches!(
+            log.publish(&cx, &[first_marker()], verify).await,
+            Err(FrankenError::BusyRecovery)
+        ));
         log.close(&cx).unwrap();
         let before = vfs.sync_count();
+        assert_eq!(before, 2, "power restoration and close are not recovery");
         let (mut recovered, report) = NativeDurabilityLog::recover(
             &cx,
             open(&vfs, &cx, "objects"),
@@ -287,7 +309,7 @@ fn recovery_rejects_payload_identity_spoofing_and_advertised_size_bombs() {
 #[test]
 fn recovery_must_complete_both_resyncs_before_returning_a_log() {
     run(async {
-        for (path, ordinal) in [("objects", 1), ("markers", 2)] {
+        for (path, sync_index) in [("objects", 0), ("markers", 1)] {
             let cx = Cx::new();
             let vfs = FaultInjectingVfs::new(MemoryVfs::new());
             // Stage valid bytes without assuming they were synced.
@@ -302,8 +324,9 @@ fn recovery_must_complete_both_resyncs_before_returning_a_log() {
                 .await
                 .unwrap();
             markers.close(&cx).unwrap();
-            vfs.inject_fault(FaultSpec::power_cut(path).after_nth_sync(ordinal).build());
-            assert!(
+            assert_eq!(vfs.sync_count(), 0);
+            vfs.inject_fault(FaultSpec::power_cut(path).after_nth_sync(sync_index).build());
+            assert!(matches!(
                 NativeDurabilityLog::recover(
                     &cx,
                     open(&vfs, &cx, "objects"),
@@ -311,10 +334,27 @@ fn recovery_must_complete_both_resyncs_before_returning_a_log() {
                     NativeDurabilityLimits::default(),
                     verify,
                 )
-                .await
-                .is_err()
-            );
-            assert!(vfs.is_powered_off());
+                .await,
+                Err(FrankenError::Io(_))
+            ));
+            assert_power_cut(&vfs, path, sync_index);
+            // A fresh recovery must verify and resynchronize the retained
+            // bytes again; the failed attempt returned no usable log.
+            vfs.power_on();
+            let (mut recovered, report) = NativeDurabilityLog::recover(
+                &cx,
+                open(&vfs, &cx, "objects"),
+                open(&vfs, &cx, "markers"),
+                NativeDurabilityLimits::default(),
+                verify,
+            )
+            .await
+            .unwrap();
+            assert_eq!(vfs.sync_count(), sync_index + 3);
+            assert_eq!(report.markers.len(), 1);
+            assert_eq!(recovered.published_tip(), CommitSeq::new(1));
+            assert!(!recovered.needs_recovery());
+            recovered.close(&cx).unwrap();
         }
     });
 }
@@ -521,18 +561,29 @@ fn first_barrier_failure_writes_no_marker_and_latches_recovery() {
         log.append_symbols(&cx, &[symbol(1), symbol(2)])
             .await
             .unwrap();
-        vfs.inject_fault(FaultSpec::power_cut("objects").after_nth_sync(1).build());
-        assert!(log.publish(&cx, &[first_marker()], verify).await.is_err());
-        assert!(vfs.is_powered_off());
+        assert_eq!(vfs.sync_count(), 0);
+        vfs.inject_fault(FaultSpec::power_cut("objects").after_nth_sync(0).build());
+        assert!(matches!(
+            log.publish(&cx, &[first_marker()], verify).await,
+            Err(FrankenError::Io(_))
+        ));
+        assert_power_cut(&vfs, "objects", 0);
         assert_eq!(log.published_tip(), CommitSeq::ZERO);
         assert!(log.needs_recovery());
         vfs.power_on();
         let mut reader = open(&vfs, &cx, "markers");
         assert_eq!(reader.file_size(&cx).unwrap(), 0);
-        assert!(log.append_symbols(&cx, &[symbol(3)]).await.is_err());
-        assert!(log.publish(&cx, &[first_marker()], verify).await.is_err());
+        assert!(matches!(
+            log.append_symbols(&cx, &[symbol(3)]).await,
+            Err(FrankenError::BusyRecovery)
+        ));
+        assert!(matches!(
+            log.publish(&cx, &[first_marker()], verify).await,
+            Err(FrankenError::BusyRecovery)
+        ));
         reader.close(&cx).unwrap();
         log.close(&cx).unwrap();
+        assert_eq!(vfs.sync_count(), 1, "no implicit retry after power-on");
     });
 }
 
@@ -545,9 +596,13 @@ fn second_barrier_failure_does_not_acknowledge_visible_marker_bytes() {
         log.append_symbols(&cx, &[symbol(1), symbol(2)])
             .await
             .unwrap();
-        vfs.inject_fault(FaultSpec::power_cut("markers").after_nth_sync(2).build());
-        assert!(log.publish(&cx, &[first_marker()], verify).await.is_err());
-        assert!(vfs.is_powered_off());
+        assert_eq!(vfs.sync_count(), 0);
+        vfs.inject_fault(FaultSpec::power_cut("markers").after_nth_sync(1).build());
+        assert!(matches!(
+            log.publish(&cx, &[first_marker()], verify).await,
+            Err(FrankenError::Io(_))
+        ));
+        assert_power_cut(&vfs, "markers", 1);
         assert_eq!(log.published_tip(), CommitSeq::ZERO);
         assert!(log.needs_recovery());
         vfs.power_on();
@@ -556,8 +611,13 @@ fn second_barrier_failure_does_not_acknowledge_visible_marker_bytes() {
             reader.file_size(&cx).unwrap(),
             u64::try_from(COMMIT_MARKER_RECORD_V1_SIZE).unwrap(),
         );
+        assert!(matches!(
+            log.publish(&cx, &[first_marker()], verify).await,
+            Err(FrankenError::BusyRecovery)
+        ));
         reader.close(&cx).unwrap();
         log.close(&cx).unwrap();
+        assert_eq!(vfs.sync_count(), 2, "visible bytes do not authorize retry");
     });
 }
 
