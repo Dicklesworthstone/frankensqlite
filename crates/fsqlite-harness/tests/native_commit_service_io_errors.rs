@@ -3,15 +3,16 @@
 //! result model, not a MemoryVfs or physical power-loss durability certificate.
 #![allow(clippy::future_not_send)] // Native publication is a caller-owned !Send future.
 
-use std::future::Future;
+use std::future::{Future, poll_fn};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Wake, Waker};
 
 use asupersync::Cx as NativeCx;
 use asupersync::runtime::RuntimeBuilder;
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_pager::native::NativePager;
-use fsqlite_pager::native_service::NativeCommitService;
+use fsqlite_pager::native_service::{NativeCommitSender, NativeCommitService};
 use fsqlite_pager::{PagerCommitState, TransactionHandle, TransactionMode};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{SyncFlags, VfsOpenFlags};
@@ -37,6 +38,52 @@ struct Audit {
 }
 
 type Trace = Arc<Mutex<Audit>>;
+
+type ReplyAdmissions = Arc<Mutex<Vec<(usize, &'static str)>>>;
+
+// A reply wake can synchronously re-enter producer admission. Oneshot contains
+// callback panics, so record evidence here and assert outside the callback.
+// Otherwise a swallowed assertion could make a broken stopping test pass.
+struct ReplyAdmissionProbe<T: TransactionHandle> {
+    sender: NativeCommitSender<T>,
+    cx: NativeCx,
+    index: usize,
+    admissions: ReplyAdmissions,
+}
+
+impl<T: TransactionHandle> Wake for ReplyAdmissionProbe<T> {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        let admission = match self.sender.try_reserve(&self.cx) {
+            Ok(permit) => {
+                drop(permit);
+                "open"
+            }
+            Err(FrankenError::Abort) => "closed",
+            Err(FrankenError::Busy) => "full",
+            Err(_) => "unexpected error",
+        };
+        self.admissions.lock().unwrap().push((self.index, admission));
+    }
+}
+
+fn reply_admission_waker<T: TransactionHandle + Send + 'static>(
+    sender: &NativeCommitSender<T>,
+    index: usize,
+    admissions: &ReplyAdmissions,
+) -> Waker {
+    Waker::from(Arc::new(ReplyAdmissionProbe {
+        sender: sender.clone(),
+        // Independent and uncancelled: rejection must be service closure,
+        // not cancellation or a runtime-obligation quota in the test driver.
+        cx: NativeCx::for_testing(),
+        index,
+        admissions: Arc::clone(admissions),
+    }))
+}
 
 struct SyncErrorFile {
     inner: <MemoryVfs as Vfs>::File,
@@ -305,6 +352,9 @@ struct Scenario {
     committed: usize,
     uncertain: usize,
     prior_syncs: usize,
+    // Only a completed earlier group delivered its replies before failure.
+    // A successful singleton in the same split batch has not replied yet.
+    replies_before_failure: usize,
 }
 
 const FIRST: Scenario = Scenario {
@@ -313,6 +363,7 @@ const FIRST: Scenario = Scenario {
     committed: 0,
     uncertain: 2,
     prior_syncs: 0,
+    replies_before_failure: 0,
 };
 const LATER: Scenario = Scenario {
     pages: &[2, 3, 4, 5, 6],
@@ -320,6 +371,7 @@ const LATER: Scenario = Scenario {
     committed: 2,
     uncertain: 2,
     prior_syncs: 2,
+    replies_before_failure: 2,
 };
 const SPLIT_FIRST: Scenario = Scenario {
     pages: &[2, 2, 3, 4],
@@ -327,6 +379,7 @@ const SPLIT_FIRST: Scenario = Scenario {
     committed: 0,
     uncertain: 1,
     prior_syncs: 0,
+    replies_before_failure: 0,
 };
 const SPLIT_LATER: Scenario = Scenario {
     pages: &[2, 3, 3, 4, 5],
@@ -334,6 +387,7 @@ const SPLIT_LATER: Scenario = Scenario {
     committed: 1,
     uncertain: 1,
     prior_syncs: 2,
+    replies_before_failure: 0,
 };
 
 #[test]
@@ -381,7 +435,9 @@ async fn check_service(case: Scenario, marker_barrier: bool) {
     let vfs = MemoryVfs::new();
     let trace = Trace::default();
     let owner = NativePager::new(store(&vfs, &cx, &trace)).unwrap();
-    let (sender, worker) = NativeCommitService::new(&owner, case.pages.len(), case.batch).unwrap();
+    // Spare capacity prevents Full from hiding a still-open terminal service.
+    let (sender, worker) =
+        NativeCommitService::new(&owner, case.pages.len() + 1, case.batch).unwrap();
     let mut tickets = Vec::new();
     for (index, &number) in case.pages.iter().enumerate() {
         let mut txn = owner.begin(&cx, TransactionMode::Concurrent).unwrap();
@@ -398,6 +454,21 @@ async fn check_service(case: Scenario, marker_barrier: bool) {
                 .unwrap(),
         );
     }
+    let admissions = ReplyAdmissions::default();
+    let mut waits: Vec<_> = tickets
+        .iter_mut()
+        .map(|ticket| Box::pin(ticket.wait(&native)))
+        .collect();
+    for (index, waiting) in waits.iter_mut().enumerate() {
+        let waker = reply_admission_waker(&sender, index, &admissions);
+        assert!(
+            waiting
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+    }
+    assert!(admissions.lock().unwrap().is_empty());
     let target = arm(
         &trace,
         case.prior_syncs + if marker_barrier { 2 } else { 1 },
@@ -406,6 +477,23 @@ async fn check_service(case: Scenario, marker_barrier: bool) {
         worker.run(&cx).await,
         Err(FrankenError::BusyRecovery)
     ));
+    let expected: Vec<_> = (0..case.pages.len())
+        .map(|index| {
+            (
+                index,
+                if index < case.replies_before_failure {
+                    "open"
+                } else {
+                    "closed"
+                },
+            )
+        })
+        .collect();
+    assert_eq!(
+        *admissions.lock().unwrap(),
+        expected,
+        "seal terminal admission before any completion callback can re-enter"
+    );
     let failed_stream = if marker_barrier { "markers" } else { "objects" };
     let stopped = {
         let audit = trace.lock().unwrap();
@@ -425,8 +513,8 @@ async fn check_service(case: Scenario, marker_barrier: bool) {
         u64::try_from(case.committed).unwrap()
     );
     let mut returned = Vec::new();
-    for mut ticket in tickets {
-        returned.push(ticket.wait(&native).await.unwrap());
+    for waiting in waits {
+        returned.push(waiting.await.unwrap());
     }
     assert_eq!(returned.len(), case.pages.len());
     let attempted_end = case.committed + case.uncertain;
@@ -537,9 +625,31 @@ async fn resume_service(
         .unwrap()
         .send(next, 1000)
         .unwrap();
+    // Healthy control for the terminal-reply probes: delivery alone must not
+    // close a service. Keep it running until after its actual callback fires.
+    let admissions = ReplyAdmissions::default();
+    let waker = reply_admission_waker(&sender, 0, &admissions);
+    let mut waiting = Box::pin(ticket.wait(native));
+    assert!(
+        waiting
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    let mut running = Box::pin(worker.run(cx));
+    for _ in 0..2 {
+        // First poll coalesces; the second publishes through MemoryVfs and
+        // returns Pending at the worker's fairness yield, after the reply.
+        poll_fn(|task| {
+            assert!(running.as_mut().poll(task).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+    }
+    assert_eq!(*admissions.lock().unwrap(), [(0, "open")]);
     sender.request_shutdown();
-    worker.run(cx).await.unwrap();
-    let completed = ticket.wait(native).await.unwrap();
+    running.await.unwrap();
+    let completed = waiting.await.unwrap();
     completed.result.unwrap();
     let next_seq = CommitSeq::new(u64::try_from(previous_commits + 1).unwrap());
     assert_eq!(

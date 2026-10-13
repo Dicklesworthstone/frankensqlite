@@ -422,8 +422,18 @@ where
                 request.transaction.pager_commit_state(),
                 PagerCommitState::InDoubt | PagerCommitState::DurableNeedsPublication
             ));
-            self.finish_batch();
             if uncertain || matches!(self.pager.needs_recovery(), Ok(true)) {
+                self.stopped = Arc::new(FrankenError::BusyRecovery);
+                // Reply delivery invokes caller wakers synchronously. Keep
+                // the batch owned until Drop seals admission and the mailbox;
+                // otherwise an error reply can admit new work to this failed
+                // service before its closing flag becomes visible.
+                return Err(FrankenError::BusyRecovery);
+            }
+            self.finish_batch();
+            // Preserve the post-delivery health check too: a healthy reply
+            // callback can drive another publisher sharing this pager.
+            if matches!(self.pager.needs_recovery(), Ok(true)) {
                 self.stopped = Arc::new(FrankenError::BusyRecovery);
                 return Err(FrankenError::BusyRecovery);
             }
