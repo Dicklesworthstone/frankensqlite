@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use asupersync::runtime::RuntimeBuilder;
 use fsqlite_error::{FrankenError, Result};
-use fsqlite_harness::fault_vfs::{FaultInjectingVfs, FaultSpec};
+use fsqlite_harness::fault_vfs::{FaultInjectingVfs, FaultKind, FaultSpec};
 use fsqlite_pager::native::NativePager;
 use fsqlite_pager::{PagerCommitState, TransactionHandle, TransactionKind, TransactionMode};
 use fsqlite_types::cx::Cx;
@@ -475,7 +475,7 @@ fn native_dispatch_keeps_read_dependencies_when_writers_touch_disjoint_pages() {
 #[test]
 fn native_dispatch_does_not_turn_either_sync_failure_into_a_rollback_verdict() {
     run(async {
-        for (path, ordinal, recovered_count) in [("objects", 1, 0), ("markers", 2, 1)] {
+        for (path, sync_index, recovered_count) in [("objects", 0, 0), ("markers", 1, 1)] {
             let cx = Cx::new();
             let vfs = FaultInjectingVfs::new(MemoryVfs::new());
             let pager = pager(&vfs, &cx);
@@ -487,10 +487,22 @@ fn native_dispatch_does_not_turn_either_sync_failure_into_a_rollback_verdict() {
                 .write_page(&cx, page(2), &[7; 512])
                 .await
                 .unwrap();
-            vfs.inject_fault(FaultSpec::power_cut(path).after_nth_sync(ordinal).build());
-            assert!(transaction.commit(&cx).await.is_err());
+            // GH#508: the dispatcher must see an actual failed barrier, not
+            // a fault scheduled beyond this transaction's publication pair.
+            assert_eq!(vfs.sync_count(), 0);
+            vfs.inject_fault(FaultSpec::power_cut(path).after_nth_sync(sync_index).build());
+            assert!(matches!(transaction.commit(&cx).await, Err(FrankenError::Io(_))));
             assert!(vfs.is_powered_off());
+            assert_eq!(vfs.sync_count(), sync_index + 1);
+            let faults = vfs.triggered_faults();
+            assert_eq!(faults.len(), 1, "the intended barrier must actually fail");
+            assert_eq!(faults[0].path, Path::new(path));
+            assert_eq!(faults[0].kind, FaultKind::PowerCut);
+            assert_eq!(faults[0].detail, format!("operation=sync index={sync_index}"));
             assert_eq!(transaction.pager_commit_state(), PagerCommitState::InDoubt);
+            assert_eq!(transaction.pending_commit_pages().unwrap(), vec![page(2)]);
+            assert_eq!(pager.committed_tip().unwrap(), CommitSeq::ZERO);
+            assert!(pager.needs_recovery().unwrap());
             assert!(matches!(
                 transaction.settle_commit(&cx).await,
                 Err(FrankenError::BusyRecovery)
@@ -500,13 +512,24 @@ fn native_dispatch_does_not_turn_either_sync_failure_into_a_rollback_verdict() {
                 panic!("lost uncertain native handle")
             };
             assert!(native.acknowledgement().is_none());
-            assert!(
-                pager.close(&cx).is_err(),
-                "live transaction retains its owner"
-            );
+            assert!(matches!(pager.close(&cx), Err(FrankenError::Busy)));
             vfs.power_on();
+            assert!(matches!(
+                transaction.commit(&cx).await,
+                Err(FrankenError::BusyRecovery)
+            ));
+            assert!(matches!(
+                transaction.rollback(&cx).await,
+                Err(FrankenError::BusyRecovery)
+            ));
+            assert!(matches!(
+                pager.begin(&cx, TransactionMode::Concurrent),
+                Err(FrankenError::BusyRecovery)
+            ));
+            assert_eq!(transaction.pending_commit_pages().unwrap(), vec![page(2)]);
             drop(transaction);
             pager.close(&cx).unwrap();
+            assert_eq!(vfs.sync_count(), sync_index + 1, "no implicit retry");
             let (store, report) = NativePageStore::recover(
                 &cx,
                 file(&vfs, &cx, "objects"),
@@ -518,6 +541,7 @@ fn native_dispatch_does_not_turn_either_sync_failure_into_a_rollback_verdict() {
             )
             .await
             .unwrap();
+            assert_eq!(vfs.sync_count(), sync_index + 3, "only recovery resyncs");
             assert_eq!(report.markers.len(), recovered_count);
             let reopened = NativePager::new(store).unwrap();
             let mut transaction: TransactionKind = reopened
