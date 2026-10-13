@@ -685,16 +685,14 @@ fn bounded_producers_and_worker_progress_when_driven_concurrently() {
         let mut produced = None;
         let mut finished = false;
         poll_fn(|task_cx| {
-            if produced.is_none() {
-                if let Poll::Ready(sequences) = producer.as_mut().poll(task_cx) {
-                    produced = Some(sequences);
-                }
+            if produced.is_none()
+                && let Poll::Ready(sequences) = producer.as_mut().poll(task_cx)
+            {
+                produced = Some(sequences);
             }
-            if !finished {
-                if let Poll::Ready(result) = running.as_mut().poll(task_cx) {
-                    result.unwrap();
-                    finished = true;
-                }
+            if !finished && let Poll::Ready(result) = running.as_mut().poll(task_cx) {
+                result.unwrap();
+                finished = true;
             }
             if produced.is_some() && finished {
                 Poll::Ready(())

@@ -282,6 +282,7 @@ where
     ///
     /// # Errors
     /// Refuses zero/excessive bounds or failure to reserve the worker batch.
+    #[allow(clippy::type_complexity)]
     pub fn new(
         pager: &NativePager<S, M, C>,
         queue_capacity: usize,

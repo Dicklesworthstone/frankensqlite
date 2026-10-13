@@ -1,5 +1,6 @@
 //! Stored datatype validation for both integrity-check PRAGMAs.
 
+#[allow(clippy::wildcard_imports)]
 use super::*;
 
 impl Connection {
