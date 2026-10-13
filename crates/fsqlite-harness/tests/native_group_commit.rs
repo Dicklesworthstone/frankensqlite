@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use asupersync::runtime::RuntimeBuilder;
 use fsqlite_error::{FrankenError, Result};
-use fsqlite_harness::fault_vfs::{FaultInjectingVfs, FaultSpec};
+use fsqlite_harness::fault_vfs::{FaultInjectingVfs, FaultKind, FaultSpec};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::VfsOpenFlags;
 use fsqlite_types::{
@@ -124,6 +124,16 @@ fn lengths<V: Vfs>(vfs: &V, cx: &Cx) -> (u64, u64) {
     objects.close(cx).unwrap();
     markers.close(cx).unwrap();
     result
+}
+
+fn assert_power_cut<V: Vfs>(vfs: &FaultInjectingVfs<V>, path: &str, sync_index: u32) {
+    assert!(vfs.is_powered_off());
+    assert_eq!(vfs.sync_count(), sync_index + 1);
+    let faults = vfs.triggered_faults();
+    assert_eq!(faults.len(), 1, "the intended barrier must actually fail");
+    assert_eq!(faults[0].path, Path::new(path));
+    assert_eq!(faults[0].kind, FaultKind::PowerCut);
+    assert_eq!(faults[0].detail, format!("operation=sync index={sync_index}"));
 }
 
 #[test]
@@ -459,24 +469,39 @@ fn both_sync_failures_leave_all_writers_indeterminate_until_actual_log_recovery(
                 .unwrap();
             db.write_page(&cx, &mut b, page(3), Some(&[3; 512]))
                 .unwrap();
-            vfs.inject_fault(FaultSpec::power_cut(path).after_nth_sync(ordinal).build());
-            assert!(
+            // GH#508: after_nth_sync is a zero-based, VFS-wide threshold,
+            // not a one-based ordinal within the matching stream.
+            assert_eq!(vfs.sync_count(), 0);
+            let tokens = (a.token(), reader.token(), b.token());
+            vfs.inject_fault(FaultSpec::power_cut(path).after_nth_sync(ordinal - 1).build());
+            assert!(matches!(
                 db.commit_batch(&cx, &mut [&mut a, &mut reader, &mut b], 100)
-                    .await
-                    .is_err()
-            );
-            assert!(vfs.is_powered_off());
+                    .await,
+                Err(FrankenError::Io(_))
+            ));
+            assert_power_cut(&vfs, path, ordinal - 1);
+            assert_eq!((a.token(), reader.token(), b.token()), tokens);
             assert_eq!(db.committed_tip(), CommitSeq::ZERO);
             assert_eq!(db.retained_version_count(), 0);
             assert!(db.needs_recovery());
             for txn in [&mut a, &mut b] {
                 assert_eq!(txn.state(), NativePageTransactionState::Indeterminate);
-                assert!(db.rollback(txn).is_err());
+                assert!(matches!(db.rollback(txn), Err(FrankenError::BusyRecovery)));
             }
+            assert!(a.is_page_dirty(page(2)));
+            assert!(b.is_page_dirty(page(3)));
             assert_eq!(reader.state(), NativePageTransactionState::Active);
             db.rollback(&mut reader).unwrap();
             vfs.power_on();
+            // Power restoration does not settle an uncertain commit. A retry
+            // must fail closed before issuing any new storage operation.
+            assert!(matches!(
+                db.commit_batch(&cx, &mut [&mut a, &mut b], 101).await,
+                Err(FrankenError::BusyRecovery)
+            ));
+            assert!(matches!(db.begin(&cx), Err(FrankenError::BusyRecovery)));
             db.close(&cx).unwrap();
+            assert_eq!(vfs.sync_count(), ordinal);
             let (mut recovered, report) = NativePageStore::recover(
                 &cx,
                 open(&vfs, &cx, "objects"),
@@ -488,6 +513,8 @@ fn both_sync_failures_leave_all_writers_indeterminate_until_actual_log_recovery(
             )
             .await
             .unwrap();
+            // These two syncs belong to explicit recovery, not worker retry.
+            assert_eq!(vfs.sync_count(), ordinal + 2);
             assert_eq!(report.markers.len(), recovered_count);
             assert_eq!(
                 recovered.committed_tip().get(),
@@ -821,13 +848,15 @@ fn sealed_pager_failed_group_keeps_every_write_in_doubt_and_can_be_closed_after_
         let mut b = owner.begin(&cx, TransactionMode::Concurrent).unwrap();
         a.write_page(&cx, page(2), &[2; 512]).await.unwrap();
         b.write_page(&cx, page(3), &[3; 512]).await.unwrap();
-        vfs.inject_fault(FaultSpec::power_cut("markers").after_nth_sync(2).build());
-        assert!(
+        assert_eq!(vfs.sync_count(), 0);
+        vfs.inject_fault(FaultSpec::power_cut("markers").after_nth_sync(1).build());
+        assert!(matches!(
             owner
                 .commit_batch_at(&cx, &mut [&mut a, &mut b], 100)
-                .await
-                .is_err()
-        );
+                .await,
+            Err(FrankenError::Io(_))
+        ));
+        assert_power_cut(&vfs, "markers", 1);
         for txn in [&mut a, &mut b] {
             assert_eq!(txn.pager_commit_state(), PagerCommitState::InDoubt);
             assert!(txn.acknowledgement().is_none());
@@ -836,12 +865,23 @@ fn sealed_pager_failed_group_keeps_every_write_in_doubt_and_can_be_closed_after_
             assert!(txn.rollback(&cx).await.is_err());
         }
         vfs.power_on();
+        for txn in [&mut a, &mut b] {
+            assert!(matches!(
+                txn.settle_commit(&cx).await,
+                Err(FrankenError::BusyRecovery)
+            ));
+            assert!(matches!(
+                txn.rollback(&cx).await,
+                Err(FrankenError::BusyRecovery)
+            ));
+        }
         assert!(owner.needs_recovery().unwrap());
         assert_eq!(owner.committed_tip().unwrap(), CommitSeq::ZERO);
         assert!(matches!(owner.close(&cx), Err(FrankenError::Busy)));
         drop(a);
         drop(b);
         owner.close(&cx).unwrap();
+        assert_eq!(vfs.sync_count(), 2, "close is not implicit recovery");
         let (recovered, report) = NativePageStore::recover(
             &cx,
             open(&vfs, &cx, "objects"),
@@ -855,6 +895,7 @@ fn sealed_pager_failed_group_keeps_every_write_in_doubt_and_can_be_closed_after_
         .unwrap();
         assert_eq!(report.markers.len(), 2);
         let reopened = NativePager::new(recovered).unwrap();
+        assert_eq!(vfs.sync_count(), 4, "only explicit recovery resynchronizes");
         assert_eq!(reopened.committed_tip().unwrap(), CommitSeq::new(2));
         let mut reader = reopened.begin(&cx, TransactionMode::ReadOnly).unwrap();
         assert_eq!(
