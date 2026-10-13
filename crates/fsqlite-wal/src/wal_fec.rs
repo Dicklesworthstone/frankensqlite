@@ -3358,7 +3358,7 @@ pub fn read_wal_fec_raptorq_repair_symbols(sidecar_path: &Path) -> Result<u8> {
 /// sidecar. Acquire this guard BEFORE opening that replaceable file, and never
 /// unlink the companion during checkpoint/reset. The guard covers FEC metadata
 /// and symbol persistence only; it must never guard primary WAL commits.
-fn try_lock_wal_fec_sidecar(sidecar_path: &Path) -> Result<fs::File> {
+fn try_lock_wal_fec_sidecar(sidecar_path: &Path) -> Result<WalFecSidecarGuard> {
     let mut lock_path = sidecar_path.as_os_str().to_os_string();
     lock_path.push(".lock");
     let file = fs::OpenOptions::new()
@@ -3368,9 +3368,22 @@ fn try_lock_wal_fec_sidecar(sidecar_path: &Path) -> Result<fs::File> {
         .truncate(false)
         .open(Path::new(&lock_path))?;
     match file.try_lock() {
-        Ok(()) => Ok(file),
+        Ok(()) => Ok(WalFecSidecarGuard(file)),
         Err(fs::TryLockError::WouldBlock) => Err(FrankenError::Busy),
         Err(fs::TryLockError::Error(err)) => Err(err.into()),
+    }
+}
+
+/// The sidecar mutation lock, released when dropped.
+struct WalFecSidecarGuard(fs::File);
+
+impl Drop for WalFecSidecarGuard {
+    fn drop(&mut self) {
+        // Closing the descriptor releases the lock only once every copy of it
+        // is closed. A child that another thread forks holds a copy until its
+        // exec, so without this unlock the next mutation of the same sidecar,
+        // microseconds later, could still find it locked and report Busy.
+        let _ = self.0.unlock();
     }
 }
 
@@ -4743,6 +4756,27 @@ mod tests {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }
+    }
+
+    #[test]
+    fn test_sidecar_guard_drop_unlocks_while_a_copy_of_its_descriptor_is_open() {
+        let dir = tempdir().expect("tempdir");
+        let sidecar = dir.path().join("db.wal-fec");
+        let guard = try_lock_wal_fec_sidecar(&sidecar).expect("first guard");
+        // What a child forked by another thread holds until its exec (GH#453).
+        let inherited_copy = guard.0.try_clone().expect("copy the lock descriptor");
+        assert!(matches!(
+            try_lock_wal_fec_sidecar(&sidecar),
+            Err(FrankenError::Busy)
+        ));
+        drop(guard);
+        let reacquired = try_lock_wal_fec_sidecar(&sidecar);
+        drop(inherited_copy);
+        assert!(
+            reacquired.is_ok(),
+            "a dropped guard must not leave the sidecar locked: {:?}",
+            reacquired.err()
+        );
     }
 
     #[test]
