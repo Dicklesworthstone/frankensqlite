@@ -11,7 +11,7 @@ use asupersync::Cx as NativeCx;
 use asupersync::runtime::RuntimeBuilder;
 use fsqlite_btree::{BtCursor, BtreeCursorOps, TransactionPageIo};
 use fsqlite_error::{FrankenError, Result};
-use fsqlite_harness::fault_vfs::{FaultInjectingVfs, FaultSpec};
+use fsqlite_harness::fault_vfs::{FaultInjectingVfs, FaultKind, FaultSpec};
 use fsqlite_pager::native::NativePager;
 use fsqlite_pager::native_service::NativeCommitService;
 use fsqlite_pager::{PagerCommitState, TransactionHandle, TransactionMode};
@@ -22,7 +22,8 @@ use fsqlite_types::{
     reconstruct_systematic_happy_path,
 };
 use fsqlite_vfs::{
-    FileIdentity, MemoryVfs, ShmRegion, Vfs, VfsFile, VfsWriteCompletion, VfsWriteCompletionState,
+    FileIdentity, MemoryVfs, ShmRegion, SyncKind, Vfs, VfsFile, VfsWriteCompletion,
+    VfsWriteCompletionState,
 };
 use fsqlite_wal::native_commit::durable::NativeObjectCodec;
 use fsqlite_wal::native_durability::{NativeDurabilityLimits, NativeDurabilityLog};
@@ -459,87 +460,381 @@ fn cancelled_worker_returns_queued_work_without_starting_storage() {
     });
 }
 
+// Audit outside FaultInjectingFile: its powered-off fast path does not advance
+// sync_count(), so that counter alone cannot detect a retry after a power cut.
+// Preserve the real source-owned write completion and both sync entry points.
+type IoTrace = Arc<Mutex<Vec<(&'static str, &'static str)>>>;
+
+struct AuditedFile {
+    inner: <FaultInjectingVfs<MemoryVfs> as Vfs>::File,
+    path: &'static str,
+    trace: IoTrace,
+}
+
+impl AuditedFile {
+    fn record(&self, operation: &'static str) {
+        self.trace.lock().unwrap().push((self.path, operation));
+    }
+}
+
+fn audited_file(
+    vfs: &FaultInjectingVfs<MemoryVfs>,
+    cx: &Cx,
+    path: &'static str,
+    trace: &IoTrace,
+) -> AuditedFile {
+    AuditedFile {
+        inner: file(vfs, cx, path),
+        path,
+        trace: Arc::clone(trace),
+    }
+}
+
+impl VfsFile for AuditedFile {
+    fn close(&mut self, cx: &Cx) -> Result<()> {
+        self.inner.close(cx)
+    }
+    fn file_identity(&self) -> Result<Option<FileIdentity>> {
+        self.inner.file_identity()
+    }
+    fn refresh_file_identity(&self) -> Result<Option<FileIdentity>> {
+        self.inner.refresh_file_identity()
+    }
+    async fn read<'a>(&'a self, cx: &'a Cx, buf: &'a mut [u8], offset: u64) -> Result<usize> {
+        self.record("read");
+        self.inner.read(cx, buf, offset).await
+    }
+    async fn write<'a>(&'a self, cx: &'a Cx, buf: &'a [u8], offset: u64) -> Result<()> {
+        self.record("write");
+        self.inner.write(cx, buf, offset).await
+    }
+    async fn write_tracked<'a>(
+        &'a self,
+        cx: &'a Cx,
+        buf: &'a [u8],
+        offset: u64,
+        completion: VfsWriteCompletion,
+    ) -> Result<()> {
+        self.record("write_tracked");
+        self.inner.write_tracked(cx, buf, offset, completion).await
+    }
+    fn truncate(&mut self, cx: &Cx, size: u64) -> Result<()> {
+        self.record("truncate");
+        self.inner.truncate(cx, size)
+    }
+    fn sync(&mut self, cx: &Cx, flags: SyncFlags) -> Result<()> {
+        self.record("sync");
+        self.inner.sync(cx, flags)
+    }
+    fn durable_sync(&mut self, cx: &Cx, kind: SyncKind) -> Result<()> {
+        self.record("durable_sync");
+        self.inner.durable_sync(cx, kind)
+    }
+    fn file_size(&self, cx: &Cx) -> Result<u64> {
+        self.inner.file_size(cx)
+    }
+    fn lock(&mut self, cx: &Cx, level: LockLevel) -> Result<()> {
+        self.inner.lock(cx, level)
+    }
+    fn unlock(&mut self, cx: &Cx, level: LockLevel) -> Result<()> {
+        self.inner.unlock(cx, level)
+    }
+    fn lock_external_wal_append(&mut self, cx: &Cx) -> Result<()> {
+        self.inner.lock_external_wal_append(cx)
+    }
+    fn owns_external_wal_append_write(&self, cx: &Cx) -> Result<bool> {
+        self.inner.owns_external_wal_append_write(cx)
+    }
+    fn restore_external_wal_append_attempt(&mut self, cx: &Cx) -> Result<()> {
+        self.inner.restore_external_wal_append_attempt(cx)
+    }
+    fn lock_external_shared_snapshot(&mut self, cx: &Cx) -> Result<()> {
+        self.inner.lock_external_shared_snapshot(cx)
+    }
+    fn restore_external_shared_snapshot_attempt(&mut self, cx: &Cx) -> Result<()> {
+        self.inner.restore_external_shared_snapshot_attempt(cx)
+    }
+    fn lock_external_maintenance(&mut self, cx: &Cx, wal: bool) -> Result<()> {
+        self.inner.lock_external_maintenance(cx, wal)
+    }
+    fn lock_external_wal_recovery(&mut self, cx: &Cx) -> Result<()> {
+        self.inner.lock_external_wal_recovery(cx)
+    }
+    fn restore_external_maintenance_attempt(&mut self, cx: &Cx) -> Result<()> {
+        self.inner.restore_external_maintenance_attempt(cx)
+    }
+    fn check_reserved_lock(&self, cx: &Cx) -> Result<bool> {
+        self.inner.check_reserved_lock(cx)
+    }
+    fn shm_map(&mut self, cx: &Cx, region: u32, size: u32, extend: bool) -> Result<ShmRegion> {
+        self.inner.shm_map(cx, region, size, extend)
+    }
+    fn shm_lock(&mut self, cx: &Cx, offset: u32, n: u32, flags: u32) -> Result<()> {
+        self.inner.shm_lock(cx, offset, n, flags)
+    }
+    fn shm_barrier(&self) {
+        self.inner.shm_barrier();
+    }
+    fn shm_unmap(&mut self, cx: &Cx, delete: bool) -> Result<()> {
+        self.inner.shm_unmap(cx, delete)
+    }
+}
+
+#[test]
+fn sync_audit_observes_powered_off_attempts_on_both_vfs_apis() {
+    run(async {
+        let (cx, _) = contexts();
+        let vfs = FaultInjectingVfs::new(MemoryVfs::new());
+        let trace = IoTrace::default();
+        let mut objects = audited_file(&vfs, &cx, "objects", &trace);
+        let mut markers = audited_file(&vfs, &cx, "markers", &trace);
+        vfs.inject_fault(FaultSpec::power_cut("objects").after_nth_sync(0).build());
+        assert!(objects.durable_sync(&cx, SyncKind::FullDurable).is_err());
+        assert!(markers.sync(&cx, SyncFlags::FULL).is_err());
+        assert!(objects.durable_sync(&cx, SyncKind::FullDurable).is_err());
+        assert_eq!(vfs.sync_count(), 1, "powered-off attempts are not counted");
+        assert_eq!(
+            trace.lock().unwrap().as_slice(),
+            &[
+                ("objects", "durable_sync"),
+                ("markers", "sync"),
+                ("objects", "durable_sync"),
+            ]
+        );
+        vfs.power_on();
+        objects.sync(&cx, SyncFlags::FULL).unwrap();
+        markers.durable_sync(&cx, SyncKind::FullDurable).unwrap();
+        assert_eq!(vfs.sync_count(), 3);
+        assert_eq!(trace.lock().unwrap().len(), 5);
+        assert_eq!(vfs.triggered_faults().len(), 1);
+        objects.close(&cx).unwrap();
+        markers.close(&cx).unwrap();
+    });
+}
+
+#[test]
+fn power_cut_thresholds_use_zero_based_global_sync_indices() {
+    use fsqlite_harness::fault_vfs::{FaultState, SyncDecision};
+
+    // Include the original GH#508 settings: they fault the NEXT group, not
+    // the first one. Nonmatching streams consume indices too.
+    for (path, threshold, calls) in [
+        ("objects", 0, 1),
+        ("markers", 1, 2),
+        ("objects", 1, 3),
+        ("markers", 2, 4),
+    ] {
+        let state = FaultState::new();
+        state.inject_fault(FaultSpec::power_cut(path).after_nth_sync(threshold).build());
+        for (index, stream) in ["objects", "markers", "objects", "markers"]
+            .into_iter()
+            .take(calls)
+            .enumerate()
+        {
+            let expected = if index + 1 == calls {
+                SyncDecision::PowerCut
+            } else {
+                SyncDecision::Allow
+            };
+            assert_eq!(state.check_sync(Path::new(stream)), expected);
+        }
+        assert_eq!(state.sync_count(), u32::try_from(calls).unwrap());
+        let faults = state.triggered_faults();
+        assert_eq!(faults.len(), 1);
+        assert_eq!(faults[0].path, Path::new(path));
+        assert_eq!(faults[0].kind, FaultKind::PowerCut);
+        assert_eq!(faults[0].detail, format!("operation=sync index={}", calls - 1));
+    }
+}
+
 #[test]
 fn uncertain_sync_stops_batching_without_retrying_or_losing_queued_handles() {
-    run(async {
-        for (path, ordinal, recovered_commits) in [("objects", 1, 0), ("markers", 2, 2)] {
-            let (cx, native) = contexts();
-            let vfs = FaultInjectingVfs::new(MemoryVfs::new());
-            let owner = pager(&vfs, &cx);
-            let (sender, worker) = NativeCommitService::new(&owner, 4, 2).unwrap();
-            let mut tickets = Vec::new();
-            for n in 2..=4 {
-                let mut transaction = owner.begin(&cx, TransactionMode::Concurrent).unwrap();
-                transaction
-                    .write_page(&cx, page(n), &[7; 512])
-                    .await
-                    .unwrap();
-                tickets.push(
-                    sender
-                        .reserve(&native)
-                        .await
-                        .unwrap()
-                        .send(transaction, 100)
-                        .unwrap(),
-                );
-            }
-            vfs.inject_fault(FaultSpec::power_cut(path).after_nth_sync(ordinal).build());
-            assert!(matches!(
-                worker.run(&cx).await,
-                Err(FrankenError::BusyRecovery)
-            ));
-            assert_eq!(
-                vfs.sync_count(),
-                ordinal,
-                "an uncertain group must never be split/retried"
-            );
-            assert!(sender.try_reserve(&native).is_err());
-            assert!(owner.needs_recovery().unwrap());
-            let mut completions = Vec::new();
-            for mut ticket in tickets {
-                completions.push(ticket.wait(&native).await.unwrap());
-            }
-            for completion in &completions[..2] {
-                assert!(completion.result.is_err());
-                assert_eq!(
-                    completion.transaction.pager_commit_state(),
-                    PagerCommitState::InDoubt
-                );
-                assert!(completion.transaction.has_pending_writes());
-            }
-            assert_eq!(
-                completions[2].transaction.pager_commit_state(),
-                PagerCommitState::NotCommitted
-            );
-            assert!(completions[2].result.is_err());
-            assert!(matches!(owner.close(&cx), Err(FrankenError::Busy)));
-            vfs.power_on();
-            for completion in &mut completions[..2] {
-                assert!(completion.transaction.settle_commit(&cx).await.is_err());
-                assert!(completion.transaction.rollback(&cx).await.is_err());
-            }
-            completions[2].transaction.rollback(&cx).await.unwrap();
-            drop(completions);
-            owner.close(&cx).unwrap();
-            let (mut reopened, report) = NativePageStore::recover(
-                &cx,
-                file(&vfs, &cx, "objects"),
-                file(&vfs, &cx, "markers"),
-                TestCodec,
-                512,
-                NativeDurabilityLimits::default(),
-                NativePageLimits::default(),
-            )
+    run(assert_uncertain_sync_stops("objects", 0, 0));
+}
+
+#[test]
+fn uncertain_marker_sync_stops_batching_without_retrying_or_losing_queued_handles() {
+    run(assert_uncertain_sync_stops("markers", 1, 2));
+}
+
+async fn assert_uncertain_sync_stops(
+    path: &'static str,
+    sync_index: u32,
+    recovered_commits: usize,
+) {
+    let (cx, native) = contexts();
+    let vfs = FaultInjectingVfs::new(MemoryVfs::new());
+    let trace = IoTrace::default();
+    let log = NativeDurabilityLog::create(
+        &cx,
+        audited_file(&vfs, &cx, "objects", &trace),
+        audited_file(&vfs, &cx, "markers", &trace),
+        NativeDurabilityLimits::default(),
+    )
+    .unwrap();
+    let owner = NativePager::new(
+        NativePageStore::new(log, TestCodec, 512, NativePageLimits::default()).unwrap(),
+    )
+    .unwrap();
+    let (sender, worker) = NativeCommitService::new(&owner, 4, 2).unwrap();
+    let mut tickets = Vec::new();
+    for n in 2_u8..=4 {
+        let mut transaction = owner.begin(&cx, TransactionMode::Concurrent).unwrap();
+        transaction.savepoint(&cx, "before").unwrap();
+        transaction
+            .write_page(&cx, page(u32::from(n)), &[n; 512])
             .await
             .unwrap();
-            assert_eq!(report.markers.len(), recovered_commits);
-            assert_eq!(
-                reopened.committed_tip().get(),
-                u64::try_from(recovered_commits).unwrap()
-            );
-            reopened.close(&cx).unwrap();
-        }
-    });
+        tickets.push(
+            sender
+                .reserve(&native)
+                .await
+                .unwrap()
+                .send(transaction, 100)
+                .unwrap(),
+        );
+    }
+    assert_eq!(vfs.sync_count(), 0);
+    assert!(trace.lock().unwrap().is_empty());
+    vfs.inject_fault(FaultSpec::power_cut(path).after_nth_sync(sync_index).build());
+    assert!(matches!(
+        worker.run(&cx).await,
+        Err(FrankenError::BusyRecovery)
+    ));
+    assert_eq!(vfs.sync_count(), sync_index + 1);
+    assert!(vfs.is_powered_off());
+    let faults = vfs.triggered_faults();
+    assert_eq!(faults.len(), 1);
+    assert_eq!(faults[0].path, Path::new(path));
+    assert_eq!(faults[0].kind, FaultKind::PowerCut);
+    assert_eq!(faults[0].detail, format!("operation=sync index={sync_index}"));
+    let stopped_io = trace.lock().unwrap().clone();
+    let first_barrier = stopped_io
+        .iter()
+        .position(|(_, operation)| matches!(*operation, "sync" | "durable_sync"))
+        .unwrap();
+    let expected: &[(&str, &str)] = if sync_index == 0 {
+        &[("objects", "durable_sync")]
+    } else {
+        &[
+            ("objects", "durable_sync"),
+            ("markers", "write_tracked"),
+            ("markers", "durable_sync"),
+        ]
+    };
+    assert_eq!(
+        &stopped_io[first_barrier..],
+        expected,
+        "no further read/write/truncate/sync may follow the uncertain barrier"
+    );
+    assert!(sender.try_reserve(&native).is_err());
+    assert!(owner.needs_recovery().unwrap());
+    assert_eq!(owner.committed_tip().unwrap(), CommitSeq::ZERO);
+    let mut completions = Vec::new();
+    for mut ticket in tickets {
+        completions.push(ticket.wait(&native).await.unwrap());
+    }
+    for (n, completion) in (2..=4).zip(&completions) {
+        assert_eq!(completion.transaction.mode(), TransactionMode::Concurrent);
+        assert!(completion.transaction.acknowledgement().is_none());
+        assert_eq!(
+            completion.transaction.pending_commit_pages().unwrap(),
+            vec![page(n)]
+        );
+        assert_eq!(
+            completion.transaction.published_visible_commit_seq_hint(),
+            Some(CommitSeq::ZERO)
+        );
+    }
+    for completion in &completions[..2] {
+        assert!(matches!(
+            completion.result.as_ref().unwrap_err().as_ref(),
+            FrankenError::Io(_)
+        ));
+        assert_eq!(
+            completion.transaction.pager_commit_state(),
+            PagerCommitState::InDoubt
+        );
+        assert!(completion.transaction.has_pending_writes());
+    }
+    assert_eq!(
+        completions[2].transaction.pager_commit_state(),
+        PagerCommitState::NotCommitted
+    );
+    assert!(matches!(
+        completions[2].result.as_ref().unwrap_err().as_ref(),
+        FrankenError::BusyRecovery
+    ));
+    assert!(matches!(owner.close(&cx), Err(FrankenError::Busy)));
+    vfs.power_on();
+    for completion in &mut completions[..2] {
+        let transaction = &mut completion.transaction;
+        assert!(matches!(
+            transaction.settle_commit(&cx).await,
+            Err(FrankenError::BusyRecovery)
+        ));
+        assert!(matches!(
+            transaction.commit_at(&cx, 101).await,
+            Err(FrankenError::BusyRecovery)
+        ));
+        assert!(matches!(
+            transaction.rollback(&cx).await,
+            Err(FrankenError::BusyRecovery)
+        ));
+        assert!(matches!(
+            transaction.rollback_to_savepoint(&cx, "before"),
+            Err(FrankenError::BusyRecovery)
+        ));
+    }
+    // The queued handle retains its original private savepoint and slot.
+    completions[2]
+        .transaction
+        .rollback_to_savepoint(&cx, "before")
+        .unwrap();
+    assert!(!completions[2].transaction.has_pending_writes());
+    completions[2].transaction.rollback(&cx).await.unwrap();
+    assert!(matches!(owner.close(&cx), Err(FrankenError::Busy)));
+    drop(completions);
+    owner.close(&cx).unwrap();
+    assert_eq!(trace.lock().unwrap().as_slice(), stopped_io.as_slice());
+    assert_eq!(vfs.sync_count(), sync_index + 1);
+    // MemoryVfs retains written bytes. This is verified replay, not proof
+    // that both markers would survive a physical power failure.
+    let (mut reopened, report) = NativePageStore::recover(
+        &cx,
+        audited_file(&vfs, &cx, "objects", &trace),
+        audited_file(&vfs, &cx, "markers", &trace),
+        TestCodec,
+        512,
+        NativeDurabilityLimits::default(),
+        NativePageLimits::default(),
+    )
+    .await
+    .unwrap();
+    let recovery_syncs: Vec<_> = trace.lock().unwrap()[stopped_io.len()..]
+        .iter()
+        .copied()
+        .filter(|(_, operation)| matches!(*operation, "sync" | "durable_sync"))
+        .collect();
+    assert_eq!(
+        recovery_syncs,
+        [("objects", "durable_sync"), ("markers", "durable_sync")]
+    );
+    assert_eq!(vfs.sync_count(), sync_index + 3);
+    assert_eq!(report.markers.len(), recovered_commits);
+    assert_eq!(
+        reopened.committed_tip().get(),
+        u64::try_from(recovered_commits).unwrap()
+    );
+    let mut view = reopened.begin(&cx).unwrap();
+    for n in 2..=4 {
+        let actual = reopened.read_page(&cx, &mut view, page(n)).unwrap();
+        let expected =
+            (n != 4 && recovered_commits != 0).then(|| vec![u8::try_from(n).unwrap(); 512]);
+        assert_eq!(actual.map(|data| data.to_vec()), expected);
+    }
+    reopened.rollback(&mut view).unwrap();
+    reopened.close(&cx).unwrap();
 }
 
 #[test]
