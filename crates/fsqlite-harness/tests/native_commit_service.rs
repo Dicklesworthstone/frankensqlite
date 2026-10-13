@@ -719,7 +719,7 @@ fn split_fallback_keeps_prior_success_when_a_later_markers_sync_fails() {
     ));
 }
 
- enum FailureShape {
+enum FailureShape {
     FirstGroup,
     LaterGroup,
     SplitFirst,
@@ -1087,6 +1087,149 @@ fn idle_service_is_woken_by_local_cancellation_and_graceful_shutdown() {
             }
             drop(running);
             assert!(sender.try_reserve(&native).is_err());
+            assert_eq!(vfs.sync_count(), 0);
+            assert!(!owner.needs_recovery().unwrap());
+            owner.close(&cx).unwrap();
+        }
+    });
+}
+
+#[test]
+fn idle_service_is_woken_by_attached_native_cancellation() {
+    run(async {
+        let (cx, native) = contexts();
+        let vfs = FaultInjectingVfs::new(MemoryVfs::new());
+        let owner = pager(&vfs, &cx);
+        let (sender, worker) = NativeCommitService::new(&owner, 1, 1).unwrap();
+        // A separate cancellation node exposes reliance on the executor's
+        // current-task wake. No cancellation is sent to the outer test runtime.
+        let source = NativeCx::for_testing();
+        let worker_cx = Cx::new();
+        worker_cx.set_native_cx(source.clone());
+        let old_wakes = Arc::new(WakeCounter::default());
+        let new_wakes = Arc::new(WakeCounter::default());
+        let old_waker = Waker::from(Arc::clone(&old_wakes));
+        let new_waker = Waker::from(Arc::clone(&new_wakes));
+        let mut old_task = Context::from_waker(&old_waker);
+        let mut new_task = Context::from_waker(&new_waker);
+        let mut running = Box::pin(worker.run(&worker_cx));
+        assert!(running.as_mut().poll(&mut old_task).is_pending());
+        assert!(running.as_mut().poll(&mut new_task).is_pending());
+        let old_before = old_wakes.0.load(Ordering::SeqCst);
+        let new_before = new_wakes.0.load(Ordering::SeqCst);
+        source.cancel_with(asupersync::types::CancelKind::User, None);
+        // Assert a real wake BEFORE polling again: an unsolicited poll would
+        // make the old checkpoint-only implementation appear to work.
+        assert!(new_wakes.0.load(Ordering::SeqCst) > new_before);
+        assert_eq!(old_wakes.0.load(Ordering::SeqCst), old_before);
+        assert!(matches!(
+            running.as_mut().poll(&mut new_task),
+            Poll::Ready(Err(FrankenError::Interrupt))
+        ));
+        drop(running);
+        assert!(native.checkpoint().is_ok());
+        assert!(sender.try_reserve(&native).is_err());
+        assert_eq!(vfs.sync_count(), 0);
+        assert!(!owner.needs_recovery().unwrap());
+        assert_eq!(owner.committed_tip().unwrap(), CommitSeq::ZERO);
+        // Completion must retire the native cancellation registration even
+        // while the caller retains its context and its custom task waker.
+        assert_eq!(Arc::strong_count(&new_wakes), 2);
+        owner.close(&cx).unwrap();
+    });
+}
+
+#[test]
+fn backpressured_native_cancellation_preserves_private_and_accepted_work() {
+    run(async {
+        let (cx, native) = contexts();
+        let vfs = FaultInjectingVfs::new(MemoryVfs::new());
+        let owner = pager(&vfs, &cx);
+        let (sender, worker) = NativeCommitService::new(&owner, 1, 1).unwrap();
+        let mut accepted = owner.begin(&cx, TransactionMode::Concurrent).unwrap();
+        accepted.write_page(&cx, page(2), &[2; 512]).await.unwrap();
+        let mut ticket = sender
+            .reserve(&native)
+            .await
+            .unwrap()
+            .send(accepted, 100)
+            .unwrap();
+        let mut private = owner.begin(&cx, TransactionMode::Concurrent).unwrap();
+        private.savepoint(&cx, "before").unwrap();
+        private.write_page(&cx, page(3), &[3; 512]).await.unwrap();
+        let source = NativeCx::for_testing();
+        let wakes = Arc::new(WakeCounter::default());
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut task = Context::from_waker(&waker);
+        let mut waiting = Box::pin(sender.reserve(&source));
+        assert!(waiting.as_mut().poll(&mut task).is_pending());
+        let before = wakes.0.load(Ordering::SeqCst);
+        source.cancel_with(asupersync::types::CancelKind::User, None);
+        assert!(
+            wakes.0.load(Ordering::SeqCst) > before,
+            "cancellation must wake admission without freeing a mailbox slot"
+        );
+        assert!(matches!(
+            waiting.as_mut().poll(&mut task),
+            Poll::Ready(Err(FrankenError::Interrupt))
+        ));
+        drop(waiting);
+        assert_eq!(Arc::strong_count(&wakes), 2);
+        assert_eq!(private.pager_commit_state(), PagerCommitState::NotCommitted);
+        assert_eq!(private.pending_commit_pages().unwrap(), vec![page(3)]);
+        assert_eq!(private.get_page(&cx, page(3)).await.unwrap().as_bytes(), &[3; 512]);
+        assert_eq!(vfs.sync_count(), 0);
+        assert!(matches!(sender.try_reserve(&native), Err(FrankenError::Busy)));
+        // Cancelling this producer cannot revoke a different producer's
+        // accepted commit or strand capacity with a cancelled waiter.
+        sender.request_shutdown();
+        worker.run(&cx).await.unwrap();
+        let completion = ticket.wait(&native).await.unwrap();
+        completion.result.unwrap();
+        assert_eq!(completion.transaction.pager_commit_state(), PagerCommitState::Committed);
+        assert_eq!(owner.committed_tip().unwrap(), CommitSeq::new(1));
+        assert_eq!(vfs.sync_count(), 2);
+        private.rollback_to_savepoint(&cx, "before").unwrap();
+        assert!(!private.has_pending_writes());
+        private.rollback(&cx).await.unwrap();
+        owner.close(&cx).unwrap();
+    });
+}
+
+#[test]
+fn dropped_native_cancellation_waits_release_wakers_and_reserved_capacity() {
+    run(async {
+        for idle_worker in [false, true] {
+            let (cx, native) = contexts();
+            let vfs = FaultInjectingVfs::new(MemoryVfs::new());
+            let owner = pager(&vfs, &cx);
+            let (sender, worker) = NativeCommitService::new(&owner, 1, 1).unwrap();
+            let source = NativeCx::for_testing();
+            let wakes = Arc::new(WakeCounter::default());
+            let waker = Waker::from(Arc::clone(&wakes));
+            let mut task = Context::from_waker(&waker);
+            if idle_worker {
+                let worker_cx = Cx::new();
+                worker_cx.set_native_cx(source.clone());
+                let mut running = Box::pin(worker.run(&worker_cx));
+                assert!(running.as_mut().poll(&mut task).is_pending());
+                drop(running);
+                assert!(sender.try_reserve(&native).is_err());
+            } else {
+                let slot = sender.try_reserve(&native).unwrap();
+                let mut waiting = Box::pin(sender.reserve(&source));
+                assert!(waiting.as_mut().poll(&mut task).is_pending());
+                drop(waiting);
+                drop(slot);
+                // The cancelled reservation must not consume the freed slot.
+                drop(sender.try_reserve(&native).unwrap());
+                sender.request_shutdown();
+                worker.run(&cx).await.unwrap();
+            }
+            let before = wakes.0.load(Ordering::SeqCst);
+            source.cancel_with(asupersync::types::CancelKind::User, None);
+            assert_eq!(wakes.0.load(Ordering::SeqCst), before);
+            assert_eq!(Arc::strong_count(&wakes), 2);
             assert_eq!(vfs.sync_count(), 0);
             assert!(!owner.needs_recovery().unwrap());
             owner.close(&cx).unwrap();

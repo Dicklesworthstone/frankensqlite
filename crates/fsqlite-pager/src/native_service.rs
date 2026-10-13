@@ -118,12 +118,26 @@ impl<T: TransactionHandle> NativeCommitSender<T> {
     /// Wait for a mailbox slot without borrowing or consuming a transaction.
     /// Dropping/cancelling this future releases its reservation/waiter only.
     /// Use the caller's existing Asupersync capability context, not a new root.
+    /// Native cancellation wakes the wait even while the mailbox stays full.
     ///
     /// # Errors
     /// Returns cancellation, shutdown, or checked runtime-admission failure.
     pub async fn reserve<'a>(&'a self, cx: &'a NativeCx) -> Result<NativeCommitPermit<'a, T>> {
         self.check_open()?;
-        let permit = self.sender.reserve_checked(cx).await.map_err(admission_error)?;
+        let permit = {
+            let mut reservation = std::pin::pin!(self.sender.reserve_checked(cx));
+            let mut cancelled = std::pin::pin!(wait_for_native_cancellation(cx));
+            poll_fn(|task_cx| match reservation.as_mut().poll(task_cx) {
+                Poll::Ready(result) => Poll::Ready(result.map_err(admission_error)),
+                Poll::Pending => {
+                    if cancelled.as_mut().poll(task_cx).is_ready() {
+                        Poll::Ready(Err(FrankenError::Interrupt))
+                    } else {
+                        Poll::Pending
+                    }
+                }
+            }).await?
+        };
         self.check_open()?;
         Ok(NativeCommitPermit {
             permit,
@@ -310,6 +324,7 @@ where
     /// Normal shutdown drains accepted intents; cancellation stops admission
     /// and returns unattempted handles. Dropping even an unpolled worker future
     /// reports queued handles without claiming a rollback of in-flight writes.
+    /// An idle worker is woken by either local or attached native cancellation.
     ///
     /// Once physical I/O may have started, no failed group is split or retried.
     /// A purely rejected group may be tried member-by-member so one stale or
@@ -327,6 +342,7 @@ where
         // used by the mailbox. Register its wakeup independently; checking a
         // flag only on receipt would leave an idle service asleep indefinitely.
         let mut local_cancel = std::pin::pin!(cx.wait_for_local_cancellation());
+        let mut native_cancel = std::pin::pin!(wait_for_native_cancellation(&native));
         loop {
             let first = poll_fn(|task_cx| {
                 if self.closing.load(Ordering::Acquire) {
@@ -339,9 +355,17 @@ where
                 // Shutdown may race the flag check above before the channel
                 // registers its waker. Recheck after Pending: from here the
                 // registered waker covers any later shutdown request.
-                if received.is_pending() && self.closing.load(Ordering::Acquire) {
+                let received = if received.is_pending() && self.closing.load(Ordering::Acquire) {
                     self.receiver.close();
                     self.receiver.poll_recv(&native, task_cx)
+                } else {
+                    received
+                };
+                // MPSC's pending receive does not register a native cancel
+                // wake. Do not rely on unrelated mailbox traffic or the
+                // polling task sharing this attached context's runtime waker.
+                if received.is_pending() && native_cancel.as_mut().poll(task_cx).is_ready() {
+                    Poll::Ready(Err(mpsc::RecvError::Cancelled))
                 } else {
                     received
                 }
@@ -458,6 +482,18 @@ fn admission_error(error: mpsc::CheckedSendError<()>) -> FrankenError {
         mpsc::CheckedSendError::Channel(mpsc::SendError::Disconnected(())) => FrankenError::Abort,
         other => FrankenError::BackgroundWorkerFailed(other.to_string()),
     }
+}
+
+// The pinned Asupersync MPSC waits check cancellation only when polled.
+// Its held-open oneshot receive also owns a cancellation-waker registration:
+// it rechecks after registration and unregisters exactly its own entry on
+// Drop. Use that public cancellation-aware wait without creating a runtime,
+// spawning a task, reserving a send obligation, or touching storage. The
+// channel is allocated only when a mailbox operation actually returns Pending.
+async fn wait_for_native_cancellation(cx: &NativeCx) {
+    let (keep_open, mut receiver) = oneshot::channel::<()>();
+    let _ = receiver.recv(cx).await;
+    drop(keep_open);
 }
 
 async fn yield_once() {
