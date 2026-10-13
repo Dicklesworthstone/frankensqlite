@@ -735,6 +735,9 @@ impl<F: VfsFile> VfsFile for FaultInjectingFile<F> {
     }
 
     fn truncate(&mut self, cx: &Cx, size: u64) -> Result<()> {
+        // A simulated outage must not permit metadata mutation that can erase
+        // retained crash evidence before explicit power restoration.
+        self.state.ensure_power_on()?;
         self.inner.truncate(cx, size)
     }
 
@@ -1683,6 +1686,40 @@ mod tests {
             1,
             "powered-off wrapper must fail before delegating"
         );
+    }
+
+    #[test]
+    fn test_fault_vfs_power_cut_blocks_truncate_until_restart() {
+        let vfs = FaultInjectingVfs::new(MemoryVfs::new());
+        let cx = test_cx();
+        let path = Path::new("retained.db");
+        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::MAIN_DB;
+        let (mut file, _) = vfs.open(&cx, Some(path), flags).unwrap();
+
+        run_io(file.write(&cx, b"retained crash bytes", 0)).unwrap();
+        assert_eq!(file.file_size(&cx).unwrap(), 20);
+
+        vfs.inject_fault(FaultSpec::power_cut("retained.db").after_nth_sync(0).build());
+        assert!(matches!(file.sync(&cx, SyncFlags::FULL), Err(FrankenError::Io(_))));
+        assert!(vfs.is_powered_off());
+        assert_eq!(vfs.sync_count(), 1);
+        assert_eq!(vfs.sync_attempt_count(), 1);
+
+        assert!(
+            matches!(file.truncate(&cx, 0), Err(FrankenError::Io(_))),
+            "powered-off truncate must not erase retained crash evidence"
+        );
+
+        vfs.power_on();
+        assert_eq!(
+            file.file_size(&cx).unwrap(),
+            20,
+            "failed powered-off truncate must leave retained bytes untouched"
+        );
+        file.truncate(&cx, 8)
+            .expect("truncate becomes available only after explicit restart");
+        assert_eq!(file.file_size(&cx).unwrap(), 8);
+        file.close(&cx).unwrap();
     }
 
     #[test]
