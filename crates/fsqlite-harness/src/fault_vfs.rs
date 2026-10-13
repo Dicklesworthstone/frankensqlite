@@ -128,8 +128,9 @@ pub struct FaultSpec {
     /// For torn writes: trigger when a write spans this byte offset.
     /// `None` means trigger on any write to a matching file.
     pub at_offset: Option<u64>,
-    /// For power cuts: trigger after the Nth `sync` call on matching files.
-    /// `None` means trigger on first sync.
+    /// For power cuts: zero-based threshold in the shared powered-on sync index.
+    /// Nonmatching files advance the index too; already-powered-off attempts do not.
+    /// `None` and `Some(0)` make the first matching powered-on sync eligible.
     pub after_nth_sync: Option<u32>,
     /// Trigger after this many matching operations (`0` means immediate).
     after_count: Option<u64>,
@@ -338,7 +339,11 @@ impl FaultSpecBuilder {
         self.valid_bytes(n)
     }
 
-    /// For power cuts: trigger after the Nth `sync` call on matching files.
+    /// Set the zero-based VFS-wide powered-on sync index at which a power cut is eligible.
+    ///
+    /// Use [`FaultInjectingVfs::sync_attempt_count`] when asserting that no hidden
+    /// retry occurred after power was lost: [`FaultInjectingVfs::sync_count`] is
+    /// intentionally the fault-selection index and excludes powered-off attempts.
     #[must_use]
     pub fn after_nth_sync(mut self, n: u32) -> Self {
         self.after_nth_sync = Some(n);
@@ -467,10 +472,20 @@ impl<V: Vfs> FaultInjectingVfs<V> {
         self.state.triggered_faults()
     }
 
-    /// Return the total number of sync calls observed.
+    /// Return the powered-on sync checks used as the global fault-selection index.
+    ///
+    /// Calls made after a simulated power cut are excluded so restoring power does
+    /// not shift existing fault thresholds. Use [`Self::sync_attempt_count`] to
+    /// audit all sync API attempts, including powered-off retries.
     #[must_use]
     pub fn sync_count(&self) -> u32 {
         self.state.sync_count()
+    }
+
+    /// Return every call to either sync API, including attempts while powered off.
+    #[must_use]
+    pub fn sync_attempt_count(&self) -> u32 {
+        self.state.sync_attempt_count()
     }
 
     /// Return whether a power-cut fault has been triggered.
@@ -829,6 +844,7 @@ impl<F: VfsFile> VfsFile for FaultInjectingFile<F> {
 pub struct FaultState {
     faults: Mutex<Vec<FaultSpec>>,
     sync_counter: AtomicU32,
+    sync_attempt_counter: AtomicU32,
     powered_off: AtomicBool,
     trigger_log: Mutex<Vec<FaultTriggerRecord>>,
     fault_counters: Mutex<BTreeMap<&'static str, u64>>,
@@ -851,6 +867,7 @@ impl FaultState {
         Self {
             faults: Mutex::new(Vec::new()),
             sync_counter: AtomicU32::new(0),
+            sync_attempt_counter: AtomicU32::new(0),
             powered_off: AtomicBool::new(false),
             trigger_log: Mutex::new(Vec::new()),
             fault_counters: Mutex::new(BTreeMap::new()),
@@ -1115,6 +1132,7 @@ impl FaultState {
     /// Check if a sync should be faulted.
     #[allow(clippy::significant_drop_tightening)]
     pub fn check_sync(&self, path: &Path) -> SyncDecision {
+        self.sync_attempt_counter.fetch_add(1, Ordering::AcqRel);
         if self.powered_off.load(Ordering::Acquire) {
             return SyncDecision::PoweredOff;
         }
@@ -1215,10 +1233,16 @@ impl FaultState {
         self.trigger_log.lock().expect("lock").clone()
     }
 
-    /// Return total sync count.
+    /// Return the powered-on sync count used for fault selection.
     #[must_use]
     pub fn sync_count(&self) -> u32 {
         self.sync_counter.load(Ordering::Acquire)
+    }
+
+    /// Return every sync check, including calls rejected because power is already off.
+    #[must_use]
+    pub fn sync_attempt_count(&self) -> u32 {
+        self.sync_attempt_counter.load(Ordering::Acquire)
     }
 
     /// Return a snapshot of `fsqlite_test_vfs_faults_injected_total`.
@@ -1582,13 +1606,18 @@ mod tests {
 
         // Sync 2 triggers power cut.
         assert_eq!(state.check_sync(wal_path), SyncDecision::PowerCut);
+        assert_eq!(state.sync_count(), 3);
+        assert_eq!(state.sync_attempt_count(), 3);
         assert!(
             state.is_powered_off(),
             "bead_id={TEST_BEAD} power should be off after power cut"
         );
 
-        // Subsequent operations fail.
+        // Subsequent operations fail. The selection index freezes, but the
+        // independent attempt counter exposes forbidden retry attempts.
         assert_eq!(state.check_sync(wal_path), SyncDecision::PoweredOff);
+        assert_eq!(state.sync_count(), 3);
+        assert_eq!(state.sync_attempt_count(), 4);
         assert_eq!(
             state.check_write(wal_path, 0, 100),
             WriteDecision::PoweredOff
@@ -1603,6 +1632,9 @@ mod tests {
         state.power_on();
         assert!(!state.is_powered_off());
         assert_eq!(state.check_write(wal_path, 0, 100), WriteDecision::Allow);
+        assert_eq!(state.check_sync(wal_path), SyncDecision::Allow);
+        assert_eq!(state.sync_count(), 4);
+        assert_eq!(state.sync_attempt_count(), 5);
     }
 
     #[test]
@@ -1671,6 +1703,8 @@ mod tests {
             file.durable_sync(&cx, SyncKind::FullDurable),
             Err(FrankenError::Io(_))
         ));
+        assert_eq!(vfs.sync_count(), 1);
+        assert_eq!(vfs.sync_attempt_count(), 1);
         assert_eq!(
             vfs.state.last_sync_api(),
             Some("durable_sync"),
@@ -1678,6 +1712,8 @@ mod tests {
         );
         file.durable_sync(&cx, SyncKind::FullDurable)
             .expect("one-shot fault must leave later durable syncs delegated");
+        assert_eq!(vfs.sync_count(), 2);
+        assert_eq!(vfs.sync_attempt_count(), 2);
         file.close(&cx).unwrap();
     }
 
