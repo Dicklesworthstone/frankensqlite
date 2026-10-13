@@ -649,19 +649,104 @@ fn power_cut_thresholds_use_zero_based_global_sync_indices() {
 
 #[test]
 fn uncertain_sync_stops_batching_without_retrying_or_losing_queued_handles() {
-    run(assert_uncertain_sync_stops("objects", 0, 0));
+    run(assert_uncertain_sync_stops(
+        "objects",
+        0,
+        FailureShape::FirstGroup,
+    ));
 }
 
 #[test]
 fn uncertain_marker_sync_stops_batching_without_retrying_or_losing_queued_handles() {
-    run(assert_uncertain_sync_stops("markers", 1, 2));
+    run(assert_uncertain_sync_stops(
+        "markers",
+        1,
+        FailureShape::FirstGroup,
+    ));
+}
+
+#[test]
+fn later_objects_failure_preserves_earlier_acknowledgements_and_queued_handles() {
+    run(assert_uncertain_sync_stops(
+        "objects",
+        2,
+        FailureShape::LaterGroup,
+    ));
+}
+
+#[test]
+fn later_markers_failure_preserves_earlier_acknowledgements_and_queued_handles() {
+    run(assert_uncertain_sync_stops(
+        "markers",
+        3,
+        FailureShape::LaterGroup,
+    ));
+}
+
+#[test]
+fn split_fallback_stops_at_uncertain_objects_without_attempting_remaining_members() {
+    run(assert_uncertain_sync_stops(
+        "objects",
+        0,
+        FailureShape::SplitFirst,
+    ));
+}
+
+#[test]
+fn split_fallback_stops_at_uncertain_markers_without_attempting_remaining_members() {
+    run(assert_uncertain_sync_stops(
+        "markers",
+        1,
+        FailureShape::SplitFirst,
+    ));
+}
+
+#[test]
+fn split_fallback_keeps_prior_success_when_a_later_objects_sync_fails() {
+    run(assert_uncertain_sync_stops(
+        "objects",
+        2,
+        FailureShape::SplitAfterCommit,
+    ));
+}
+
+#[test]
+fn split_fallback_keeps_prior_success_when_a_later_markers_sync_fails() {
+    run(assert_uncertain_sync_stops(
+        "markers",
+        3,
+        FailureShape::SplitAfterCommit,
+    ));
+}
+
+ enum FailureShape {
+    FirstGroup,
+    LaterGroup,
+    SplitFirst,
+    SplitAfterCommit,
 }
 
 async fn assert_uncertain_sync_stops(
     path: &'static str,
     sync_index: u32,
-    recovered_commits: usize,
+    shape: FailureShape,
 ) {
+    // All handles are queued before the worker runs. Duplicate pages force
+    // pre-I/O rejection of the selected batch and its individual fallback.
+    // In each split case, some unattempted handles are already worker-owned
+    // and the last one is still in the mailbox when the barrier fails.
+    let (pages, max_batch, committed, in_doubt, syncs_before) = match shape {
+        FailureShape::FirstGroup => (&[2_u32, 3, 4][..], 2, 0, 2, 0),
+        FailureShape::LaterGroup => (&[2, 3, 4, 5, 6][..], 2, 2, 2, 2),
+        FailureShape::SplitFirst => (&[2, 2, 3, 4][..], 3, 0, 1, 0),
+        FailureShape::SplitAfterCommit => (&[2, 3, 3, 4, 5][..], 4, 1, 1, 2),
+    };
+    let attempted_end = committed + in_doubt;
+    let recovered_commits = committed + if path == "markers" { in_doubt } else { 0 };
+    assert_eq!(
+        sync_index,
+        u32::try_from(syncs_before).unwrap() + u32::from(path == "markers")
+    );
     let (cx, native) = contexts();
     let vfs = FaultInjectingVfs::new(MemoryVfs::new());
     let trace = IoTrace::default();
@@ -676,13 +761,16 @@ async fn assert_uncertain_sync_stops(
         NativePageStore::new(log, TestCodec, 512, NativePageLimits::default()).unwrap(),
     )
     .unwrap();
-    let (sender, worker) = NativeCommitService::new(&owner, 4, 2).unwrap();
+    let (sender, worker) = NativeCommitService::new(&owner, pages.len() + 1, max_batch).unwrap();
     let mut tickets = Vec::new();
-    for n in 2_u8..=4 {
+    for (index, &number) in pages.iter().enumerate() {
         let mut transaction = owner.begin(&cx, TransactionMode::Concurrent).unwrap();
         transaction.savepoint(&cx, "before").unwrap();
+        // Distinct payloads expose an accidental commit of an overlapping
+        // unattempted writer; checking only whether its page exists would not.
+        let value = u8::try_from(index + 2).unwrap();
         transaction
-            .write_page(&cx, page(u32::from(n)), &[n; 512])
+            .write_page(&cx, page(number), &[value; 512])
             .await
             .unwrap();
         tickets.push(
@@ -709,11 +797,31 @@ async fn assert_uncertain_sync_stops(
     assert_eq!(faults[0].kind, FaultKind::PowerCut);
     assert_eq!(faults[0].detail, format!("operation=sync index={sync_index}"));
     let stopped_io = trace.lock().unwrap().clone();
+    let syncs: Vec<_> = stopped_io
+        .iter()
+        .copied()
+        .filter(|(_, operation)| matches!(*operation, "sync" | "durable_sync"))
+        .collect();
+    let expected_syncs: Vec<_> = (0..=sync_index)
+        .map(|index| {
+            (
+                if index % 2 == 0 { "objects" } else { "markers" },
+                "durable_sync",
+            )
+        })
+        .collect();
+    assert_eq!(
+        syncs, expected_syncs,
+        "include powered-off retries in the audit"
+    );
     let first_barrier = stopped_io
         .iter()
-        .position(|(_, operation)| matches!(*operation, "sync" | "durable_sync"))
+        .enumerate()
+        .filter(|(_, (_, operation))| matches!(*operation, "sync" | "durable_sync"))
+        .nth(syncs_before)
+        .map(|(index, _)| index)
         .unwrap();
-    let expected: &[(&str, &str)] = if sync_index == 0 {
+    let expected: &[(&str, &str)] = if path == "objects" {
         &[("objects", "durable_sync")]
     } else {
         &[
@@ -729,24 +837,55 @@ async fn assert_uncertain_sync_stops(
     );
     assert!(sender.try_reserve(&native).is_err());
     assert!(owner.needs_recovery().unwrap());
-    assert_eq!(owner.committed_tip().unwrap(), CommitSeq::ZERO);
+    assert_eq!(
+        owner.committed_tip().unwrap().get(),
+        u64::try_from(committed).unwrap()
+    );
     let mut completions = Vec::new();
     for mut ticket in tickets {
         completions.push(ticket.wait(&native).await.unwrap());
     }
-    for (n, completion) in (2..=4).zip(&completions) {
+    assert_eq!(
+        completions.len(),
+        pages.len(),
+        "return every accepted handle exactly once"
+    );
+    for (index, completion) in completions.iter().enumerate() {
         assert_eq!(completion.transaction.mode(), TransactionMode::Concurrent);
-        assert!(completion.transaction.acknowledgement().is_none());
-        assert_eq!(
-            completion.transaction.pending_commit_pages().unwrap(),
-            vec![page(n)]
-        );
         assert_eq!(
             completion.transaction.published_visible_commit_seq_hint(),
             Some(CommitSeq::ZERO)
         );
+        if index < committed {
+            // A later failure cannot revoke an earlier durable receipt or
+            // turn its exact original handle back into private/uncertain work.
+            completion.result.as_ref().unwrap();
+            assert_eq!(
+                completion.transaction.pager_commit_state(),
+                PagerCommitState::Committed
+            );
+            assert!(!completion.transaction.has_pending_writes());
+            assert!(
+                completion.transaction.pending_commit_pages().unwrap().is_empty()
+            );
+            assert_eq!(
+                completion
+                    .transaction
+                    .acknowledgement()
+                    .unwrap()
+                    .commit_seq
+                    .get(),
+                u64::try_from(index + 1).unwrap()
+            );
+        } else {
+            assert!(completion.transaction.acknowledgement().is_none());
+            assert_eq!(
+                completion.transaction.pending_commit_pages().unwrap(),
+                vec![page(pages[index])]
+            );
+        }
     }
-    for completion in &completions[..2] {
+    for completion in &completions[committed..attempted_end] {
         assert!(matches!(
             completion.result.as_ref().unwrap_err().as_ref(),
             FrankenError::Io(_)
@@ -757,17 +896,32 @@ async fn assert_uncertain_sync_stops(
         );
         assert!(completion.transaction.has_pending_writes());
     }
-    assert_eq!(
-        completions[2].transaction.pager_commit_state(),
-        PagerCommitState::NotCommitted
-    );
-    assert!(matches!(
-        completions[2].result.as_ref().unwrap_err().as_ref(),
-        FrankenError::BusyRecovery
-    ));
+    if in_doubt == 2 {
+        assert!(
+            Arc::ptr_eq(
+                completions[committed].result.as_ref().unwrap_err(),
+                completions[committed + 1].result.as_ref().unwrap_err()
+            ),
+            "both attempted writers retain the original shared I/O error"
+        );
+    }
+    for completion in &completions[attempted_end..] {
+        assert_eq!(
+            completion.transaction.pager_commit_state(),
+            PagerCommitState::NotCommitted
+        );
+        assert!(matches!(
+            completion.result.as_ref().unwrap_err().as_ref(),
+            FrankenError::BusyRecovery
+        ));
+    }
     assert!(matches!(owner.close(&cx), Err(FrankenError::Busy)));
     vfs.power_on();
-    for completion in &mut completions[..2] {
+    assert!(matches!(
+        owner.begin(&cx, TransactionMode::Concurrent),
+        Err(FrankenError::BusyRecovery)
+    ));
+    for completion in &mut completions[committed..attempted_end] {
         let transaction = &mut completion.transaction;
         assert!(matches!(
             transaction.settle_commit(&cx).await,
@@ -786,13 +940,16 @@ async fn assert_uncertain_sync_stops(
             Err(FrankenError::BusyRecovery)
         ));
     }
-    // The queued handle retains its original private savepoint and slot.
-    completions[2]
-        .transaction
-        .rollback_to_savepoint(&cx, "before")
-        .unwrap();
-    assert!(!completions[2].transaction.has_pending_writes());
-    completions[2].transaction.rollback(&cx).await.unwrap();
+    // Both unattempted batch members and mailbox entries keep their private
+    // savepoints/slots. None may be reclassified as part of the failed write.
+    for completion in &mut completions[attempted_end..] {
+        completion
+            .transaction
+            .rollback_to_savepoint(&cx, "before")
+            .unwrap();
+        assert!(!completion.transaction.has_pending_writes());
+        completion.transaction.rollback(&cx).await.unwrap();
+    }
     assert!(matches!(owner.close(&cx), Err(FrankenError::Busy)));
     drop(completions);
     owner.close(&cx).unwrap();
@@ -827,10 +984,12 @@ async fn assert_uncertain_sync_stops(
         u64::try_from(recovered_commits).unwrap()
     );
     let mut view = reopened.begin(&cx).unwrap();
-    for n in 2..=4 {
+    for &n in pages {
         let actual = reopened.read_page(&cx, &mut view, page(n)).unwrap();
-        let expected =
-            (n != 4 && recovered_commits != 0).then(|| vec![u8::try_from(n).unwrap(); 512]);
+        let expected = pages[..recovered_commits]
+            .iter()
+            .position(|&number| number == n)
+            .map(|index| vec![u8::try_from(index + 2).unwrap(); 512]);
         assert_eq!(actual.map(|data| data.to_vec()), expected);
     }
     reopened.rollback(&mut view).unwrap();
