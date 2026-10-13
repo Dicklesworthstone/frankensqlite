@@ -61,6 +61,15 @@ Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releas
 
 Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.4.12...main>
 
+### Fixed
+
+- A WAL-FEC sidecar mutation could report `Busy` although nothing was contending for the sidecar
+  (GH#453). The mutation guard was released only by closing its lock descriptor, and a child
+  process forked by another thread keeps a copy of that descriptor until its exec, so the lock
+  outlived the guard for a moment. The guard now unlocks explicitly when dropped. This is what
+  made the `wal_fec_sidecar` suite fail intermittently (162 of 200 standalone runs on Linux before
+  the fix).
+
 ---
 
 ## [0.4.12] -- 2026-10-13 (GitHub Release)
@@ -226,6 +235,17 @@ reports no vulnerabilities in the lock.
 
 ### Not in this release (known issues)
 
+The first two were found by this release's gate. They are not new: v0.4.10 behaves the same.
+
+- **In a STRICT table, an `ANY` column stores numeric-looking text as an integer
+  ([GH#509](https://github.com/Dicklesworthstone/frankensqlite/issues/509)).** `'000123'` is
+  stored as `123`, where stock SQLite keeps the text. The stored value changes without an error.
+  Until it is fixed, declare such columns `TEXT`.
+- **On a WAL database, a connection that rolls a bulk `INSERT ... SELECT` back to a savepoint and
+  releases it then fails every later INSERT
+  ([GH#510](https://github.com/Dicklesworthstone/frankensqlite/issues/510))** with
+  `database is busy (snapshot conflict on pages: N)`. No data is lost and `integrity_check` stays
+  `ok`. A new connection to the same file inserts normally, so reopen the connection to continue.
 - **Known corruption under concurrency (bd-ujp0h, bd-2ym3z), reduced but not gone.** Several
   connections on one file inserting rows with implicit rowids can still commit the same rowid
   silently; stock `integrity_check` then reports `Rowid N out of order`.
@@ -241,9 +261,17 @@ reports no vulnerabilities in the lock.
 - The statements reported in GH#436, GH#438, GH#439, GH#489, GH#491 and GH#504 take about as long
   as on 0.4.10 and remain several times slower than stock SQLite (re-timed on one host; numbers in
   [GH#507](https://github.com/Dicklesworthstone/frankensqlite/issues/507)).
+- `WITH c AS (...) INSERT INTO attached.t SELECT ... FROM c` fails with `no such table: c`
+  ([GH#511](https://github.com/Dicklesworthstone/frankensqlite/issues/511)); as in v0.4.10.
+- Three small stock-parity differences, as in v0.4.10: the storage class of a tied `max()` through
+  an ordered subquery, the `table_info` pk ordinal of a key column named through a quoted
+  identifier, and the rowids assigned after a rejected `INSERT ... SELECT`
+  ([GH#512](https://github.com/Dicklesworthstone/frankensqlite/issues/512)).
+- The experimental native commit stack fails three of its own harness tests on injected sync
+  failures ([GH#508](https://github.com/Dicklesworthstone/frankensqlite/issues/508)).
 - The qualification-test failures inherited from earlier releases (GH#453 through GH#488) are
-  not addressed here. The GitHub release notes list the ones that reproduced in this release's
-  gate.
+  not addressed here, except GH#453, whose fix landed on `main` right after the tag. The gate
+  results below list the failures that reproduced.
 
 ### Qualification
 
@@ -252,25 +280,52 @@ the pinned toolchain (nightly-2026-08-31), on 2026-10-12/13; the test suite, the
 the benchmarks ran on trj (AMD Threadripper PRO 5995WX, btrfs) from trees exported at the stated
 commits.
 
-- **Release gate.** The tag is cut only when:
+- **Release gate, on the release commit
+  [26aa19afc](https://github.com/Dicklesworthstone/frankensqlite/commit/26aa19afc)** (this section
+  was completed on `main` after the tag, when the results were in):
   - `cargo fmt --all --check`, `cargo check --workspace --all-targets --locked` and
-    `cargo clippy --workspace --all-targets --locked -- -D warnings` (on Linux and on macOS) pass
-    on the release commit;
-  - the workspace test suite, run one crate group at a time on
-    [144103f98](https://github.com/Dicklesworthstone/frankensqlite/commit/144103f98), shows no
-    failure other than inherited or environment-bound qualification failures that are tracked in
-    an issue (GH#453 through GH#488, plus any filed from this gate). The release commit differs
-    from that tree only by lint fixes with no behavior change
-    ([d2491f2be](https://github.com/Dicklesworthstone/frankensqlite/commit/d2491f2be),
-    [3fb9afcad](https://github.com/Dicklesworthstone/frankensqlite/commit/3fb9afcad),
-    [75742f964](https://github.com/Dicklesworthstone/frankensqlite/commit/75742f964): one range
-    spelling in a test helper, three `#[allow]` attributes, and two nested `if`s collapsed in a
-    harness test) and by this changelog;
-  - the tests of everything those lint fixes touch (`fsqlite-types`, `fsqlite-vfs`,
-    `fsqlite-pager`, the `strict_integrity` tests of `fsqlite-core`, and
-    `fsqlite-harness --test native_commit_service`) meet the same bar on the release commit.
+    `cargo clippy --workspace --all-targets --locked -- -D warnings` pass. Clippy ran on Linux
+    x86_64 and on macOS aarch64.
+  - Tests, Linux x86_64 on trj: the unit-test suites, plus every integration target added or
+    changed since v0.4.10.
 
-  Pass and fail counts, and the tracked failures that reproduced, are in the GitHub release notes.
+    | Scope | Passed | Failed | Ignored |
+    |---|---|---|---|
+    | `fsqlite-core`: unit tests (4007 passed, 0 failed) and the 40 changed integration targets | 4154 | 8 | 11 |
+    | `fsqlite`: unit tests and `gh519_stock_truncated_wal_reader` | 734 | 0 | 2 |
+    | `fsqlite-cli`, `fsqlite-c-api`, `fsqlite-wasm`, `beads-doctor`: complete | 171 | 0 | 0 |
+    | `fsqlite-harness`: unit tests and the 3 changed integration targets | 1818 | 4 | 1 |
+    | `fsqlite-e2e`: unit tests and `row_value_oracle_e2e` | 719 | 0 | 1 |
+    | `fsqlite-types`, `fsqlite-vfs`, `fsqlite-pager`: complete | 2123 | 0 | 17 |
+  - Every keeper for the advisory passes: `join_composite_index_lookup_oracle` (GH#502),
+    `gh503_multitrunk_freelist_oracle` (GH#503), `bd_ntt2b_self_referencing_exists_delete_oracle`,
+    and `bd_row_values_oracle_probe` with `row_value_oracle_e2e` (GH#450).
+- **Complete suites, with integration tests and doctests, on
+  [144103f98](https://github.com/Dicklesworthstone/frankensqlite/commit/144103f98)** (Linux x86_64
+  on trj). The release commit differs from that tree only by lint fixes with no behavior change
+  ([d2491f2be](https://github.com/Dicklesworthstone/frankensqlite/commit/d2491f2be),
+  [3fb9afcad](https://github.com/Dicklesworthstone/frankensqlite/commit/3fb9afcad),
+  [75742f964](https://github.com/Dicklesworthstone/frankensqlite/commit/75742f964): one range
+  spelling in a test helper, three `#[allow]` attributes, and two nested `if`s collapsed in a
+  harness test) and by this changelog.
+  - Storage crates (types, error, vfs, pager, wal, mvcc, btree): 5502 passed, 1 failed, 49 ignored.
+  - SQL crates (ast, parser, planner, vdbe, func, the extensions, observability): 4043 passed,
+    0 failed, 20 ignored.
+- **The 13 failures, each tracked:**
+  - 8 in four `fsqlite-core` oracle targets that were added after v0.4.10 without having been run.
+    Replayed on the CLIs against stock SQLite, the published v0.4.10 binary gives the same answer
+    as this release in every case, or a worse one: GH#509, GH#510, GH#511, GH#512, and the
+    hydration bound of GH#493.
+  - 3 in the experimental native commit harness tests (GH#508); identical before and after this
+    release's own commits.
+  - 1 test-fixture defect in `shm_interop`
+    ([GH#513](https://github.com/Dicklesworthstone/frankensqlite/issues/513)): a child process with
+    a 32 KiB file-size limit inherits the test log as its stdout. With output not sent to a large
+    file, the target passed 900 of 900 runs.
+  - 1 intermittent `Busy` in the WAL-FEC sidecar suite (GH#453). Its fix landed on `main` after the
+    tag.
+- **Not run:** the integration targets that are unchanged since v0.4.10 (v0.4.10's gate did not
+  run the full suite either), and the all-features matrix.
 - **Issue reproducers**, on musl release CLIs with stock sqlite3 3.46.1 as the oracle: GH#502,
   GH#503, GH#450 and the bd-ntt2b DELETE each give the wrong answer on v0.4.10 and stock's answer
   on this release.
