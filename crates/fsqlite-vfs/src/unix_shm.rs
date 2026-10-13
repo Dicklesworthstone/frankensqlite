@@ -1,23 +1,47 @@
 //! Storage allocation for writable Unix shared-memory mappings.
 //!
 //! File length is not an allocation receipt. In particular, a failed growth
-//! attempt may leave a full-sized sparse file behind. Every uncached mapping
-//! must establish backing for the complete prefix it makes available to a
-//! stock SQLite peer, before publishing a writable alias.
+//! attempt may leave a full-sized sparse file behind. Where the platform can
+//! allocate natively beside live mappings (Linux and Android), every uncached
+//! mapping establishes backing for the complete prefix it makes available to
+//! a stock SQLite peer before publishing a writable alias, so a full
+//! filesystem is an I/O error instead of a SIGBUS (GH #506).
+//!
+//! That protection is best effort. Releases up to 0.4.10 extended the file
+//! sparsely and mapped it, and that still has to work wherever it worked
+//! before: on a filesystem with no `fallocate` (NFS before 4.2, 9p, many FUSE
+//! mounts), on btrfs extents shared by a snapshot or a reflink copy, through a
+//! descriptor that cannot allocate, and on every Unix without a native
+//! allocator that is safe beside live mappings (macOS included). In all of
+//! those the mapping sites fall back to the sparse extension. Only an error
+//! that says the storage itself failed (see [`is_storage_failure`]) refuses
+//! the mapping.
 
 use std::fs::File;
 use std::io;
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use std::os::fd::AsRawFd as _;
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(test)]
 use std::os::unix::fs::FileExt as _;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// What an allocation attempt established for the requested prefix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShmBacking {
+    /// The platform allocated storage for the whole prefix, or proved that it
+    /// already had it.
+    Allocated,
+    /// The platform, the filesystem or the descriptor cannot preallocate.
+    /// Nothing was allocated; the mapping behaves as it did up to 0.4.10.
+    Sparse,
+}
 
 /// Check allocation without changing file contents, length, or timestamps.
 ///
 /// `false` means that storage is missing or that the filesystem cannot prove
-/// allocation. It is never permission to publish a writable mapping anyway.
-/// Linux may flush already dirty pages when FIEMAP reports delayed allocation;
-/// writeback errors propagate instead of being treated as allocation receipts.
+/// allocation. Linux may flush already dirty pages when FIEMAP reports
+/// delayed allocation; writeback errors propagate instead of being treated as
+/// allocation receipts. Targets without a native allocator never prove it.
 pub fn shm_backing_is_allocated(file: &File, target_len: u64) -> io::Result<bool> {
     if target_len == 0 {
         return Ok(true);
@@ -29,26 +53,94 @@ pub fn shm_backing_is_allocated(file: &File, target_len: u64) -> io::Result<bool
     platform_backing_is_allocated(file, target_len)
 }
 
-/// Materialize backing without truncating or rewriting existing contents.
+/// Allocate backing natively, without truncating or rewriting contents.
 ///
-/// On macOS the caller MUST already exclude other allocation/index writers
-/// with its existing WAL WRITE lock, or with stronger bootstrap exclusion for
-/// a different SHM file. The portable writes do not acquire or release locks.
-/// Readers can continue accessing existing, allocated bytes throughout.
+/// Linux/Android use native allocation, which preserves bytes and is safe
+/// alongside existing mappings. Nothing truncates on error: another alias or
+/// process may depend on an already extended prefix, and a retry rechecks
+/// storage even when the file has the requested size.
 ///
-/// Linux/Android use native allocation, which preserves bytes and
-/// is safe alongside existing mappings. No implementation truncates on error:
-/// another alias or process may depend on an already extended prefix. A retry
-/// must recheck/materialize storage, even when the file has the requested size.
-pub fn ensure_shm_backing(file: &File, target_len: u64) -> io::Result<()> {
+/// `Ok(ShmBacking::Sparse)` means preallocation is not possible here and
+/// nothing was changed; the caller decides whether to extend the file. An
+/// `Err` is always a storage failure the caller must surface.
+pub fn ensure_shm_backing(file: &File, target_len: u64) -> io::Result<ShmBacking> {
     if target_len == 0 {
-        return Ok(());
+        return Ok(ShmBacking::Allocated);
     }
     checked_length(target_len)?;
+    match allocate_shm_backing(file, target_len) {
+        Ok(()) => Ok(ShmBacking::Allocated),
+        Err(error) if is_storage_failure(&error) => Err(error),
+        Err(error) => {
+            note_sparse_fallback(&error);
+            Ok(ShmBacking::Sparse)
+        }
+    }
+}
+
+/// The policy for a site that grows a SHM file before mapping it: prove or
+/// allocate the prefix, and where that is not possible extend the file
+/// sparsely, exactly as releases up to 0.4.10 did at the same site.
+pub fn ensure_shm_backing_or_sparse(file: &File, target_len: u64) -> io::Result<ShmBacking> {
+    let backing = ensure_proven_or_allocated(file, target_len)?;
+    if backing == ShmBacking::Sparse && file.metadata()?.len() < target_len {
+        file.set_len(target_len)?;
+    }
+    Ok(backing)
+}
+
+/// The policy for an existing payload that peers may already be using: prove
+/// or allocate the prefix where the platform can, and otherwise leave the
+/// file exactly as it is. The fallback never changes its length.
+pub fn ensure_existing_shm_backing(file: &File, target_len: u64) -> io::Result<ShmBacking> {
+    ensure_proven_or_allocated(file, target_len)
+}
+
+fn ensure_proven_or_allocated(file: &File, target_len: u64) -> io::Result<ShmBacking> {
+    match shm_backing_is_allocated(file, target_len) {
+        Ok(true) => Ok(ShmBacking::Allocated),
+        Err(error) if is_storage_failure(&error) => Err(error),
+        // Unproven, or a probe that cannot answer: neither refuses a mapping.
+        Ok(false) | Err(_) => ensure_shm_backing(file, target_len),
+    }
+}
+
+/// Errors that say the storage itself failed: no space, quota exhausted, an
+/// I/O error, or a size the file may not reach. These are the failures GH #506
+/// is about, and they refuse the mapping. Every other error from a probe or an
+/// allocation attempt (`EOPNOTSUPP`, `ENOSYS`, `EINVAL`, `EBADF`, `EPERM`, ...)
+/// means that preallocation is unavailable for this file, which is not a
+/// reason to fail an open that worked before preallocation existed.
+fn is_storage_failure(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::ENOSPC | libc::EDQUOT | libc::EIO | libc::EFBIG)
+    )
+}
+
+/// Say once per process that SHM preallocation is unavailable, so an operator
+/// can tell that a full filesystem can still raise SIGBUS on this mount.
+fn note_sparse_fallback(error: &io::Error) {
+    static NOTED: AtomicBool = AtomicBool::new(false);
+    if !NOTED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            %error,
+            "SHM preallocation is unavailable here; mapping sparsely as releases up to 0.4.10 did"
+        );
+    }
+}
+
+fn allocate_shm_backing(file: &File, target_len: u64) -> io::Result<()> {
     #[cfg(test)]
     if let Some(fault) = ALLOCATION_FAULT.with(std::cell::Cell::get) {
         if let Some(prefix) = fault.allocated_prefix {
-            platform_ensure_shm_backing(file, prefix.min(target_len))?;
+            // A target without a native allocator still gets the sparse
+            // remainder below, which is what the fixture is for.
+            if let Err(error) = platform_ensure_shm_backing(file, prefix.min(target_len))
+                && is_storage_failure(&error)
+            {
+                return Err(error);
+            }
             // Deliberately reproduce a legacy/failed allocation's sparse
             // remainder. Production allocation never uses this set_len.
             if file.metadata()?.len() < target_len {
@@ -81,7 +173,9 @@ fn platform_ensure_shm_backing(file: &File, target_len: u64) -> io::Result<()> {
     if linux_fiemap_backing(file, target_len)? == LinuxBacking::Shared {
         // Ordinary fallocate leaves existing reflink extents shared. Reserve
         // their private copy now, or a later mapped write could still SIGBUS
-        // when CoW needs storage. Do not silently fall back if unsupported.
+        // when CoW needs storage. btrfs has no UNSHARE_RANGE: its EOPNOTSUPP
+        // goes back to the caller, which reports the prefix as sparse instead
+        // of refusing a database that a snapshot or `cp --reflink` touched.
         linux_fallocate(file, libc::FALLOC_FL_UNSHARE_RANGE, target_len)?;
     }
     Ok(())
@@ -105,27 +199,23 @@ fn linux_fallocate(file: &File, mode: libc::c_int, target_len: u64) -> io::Resul
     }
 }
 
-#[cfg(target_os = "macos")]
-fn platform_ensure_shm_backing(file: &File, target_len: u64) -> io::Result<()> {
-    materialize_shm_pages(file, target_len)?;
-    // A byte written per 512-byte unit handles sub-4-KiB filesystem blocks.
-    // Nevertheless, require the native allocation receipt before mapping.
-    // This receipt follows writes through every allocation unit under
-    // exclusion. F_LOG2PHYS_EXT itself reports physical backing, not whether
-    // later external clones or snapshots might make a write require CoW.
-    if darwin_physical_backing_is_allocated(file, target_len)? {
-        Ok(())
-    } else {
-        Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP))
-    }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn platform_ensure_shm_backing(_file: &File, _target_len: u64) -> io::Result<()> {
     // There is no safe general emulation alongside mapped readers/writers.
     // Even FreeBSD's native posix_fallocate may use vop_stdallocate's full
-    // buffer read/writeback, which can clobber concurrent mmap stores. Add a
-    // verified allocation backend before admitting another target.
+    // buffer read/writeback, which can clobber concurrent mmap stores.
+    //
+    // macOS is in this group too. Its only route is to write a byte into
+    // every allocation unit of the live index, which needs the WAL WRITE lock
+    // (so a reader would wait behind, or be refused by, an active writer) and
+    // then an F_LOG2PHYS_EXT receipt that APFS does not give until the bytes
+    // reach the disk: a fresh `-shm` reported no physical extent in 20 of 20
+    // probes on macOS 27 until an fsync or about ten seconds of writeback.
+    // Wired in, that refused new WAL databases outright.
+    //
+    // "Unsupported" is not a refusal: the caller maps sparsely, as releases
+    // up to 0.4.10 did. Add a backend proven against live peers before
+    // admitting another target here.
     Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP))
 }
 
@@ -324,67 +414,23 @@ fn linux_fiemap_backing(_file: &File, _target_len: u64) -> io::Result<LinuxBacki
     Ok(LinuxBacking::Unproven)
 }
 
-#[cfg(target_os = "macos")]
-fn platform_backing_is_allocated(file: &File, target_len: u64) -> io::Result<bool> {
-    // This proves physical backing, allowing ordinary cold APFS/HFS readers
-    // to preserve their existing lock and timestamp behavior. Darwin exposes
-    // no equivalent of FIEMAP_EXTENT_SHARED here; externally cloned extents
-    // and later filesystem snapshots remain subject to its CoW semantics.
-    darwin_physical_backing_is_allocated(file, target_len)
-}
-
-#[cfg(target_os = "macos")]
-fn darwin_physical_backing_is_allocated(file: &File, target_len: u64) -> io::Result<bool> {
-    let mut cursor = 0;
-    while cursor < target_len {
-        let mut query = libc::log2phys {
-            l2p_flags: 0,
-            l2p_contigbytes: checked_length(target_len - cursor)?,
-            l2p_devoffset: checked_length(cursor)?,
-        };
-        loop {
-            // SAFETY: the live descriptor and initialized log2phys match the
-            // F_LOG2PHYS_EXT in/out ABI; no file cursor or bytes are modified.
-            if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_LOG2PHYS_EXT, &raw mut query) } != -1
-            {
-                break;
-            }
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
-                return if matches!(
-                    error.raw_os_error(),
-                    Some(libc::ENOTSUP | libc::ENOTTY | libc::EINVAL)
-                ) {
-                    Ok(false)
-                } else {
-                    Err(error)
-                };
-            }
-        }
-        if query.l2p_devoffset < 0 || query.l2p_contigbytes <= 0 {
-            return Ok(false);
-        }
-        cursor = cursor
-            .checked_add(
-                u64::try_from(query.l2p_contigbytes)
-                    .map_err(|_| io::Error::from_raw_os_error(libc::EOVERFLOW))?,
-            )
-            .ok_or_else(|| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
-    }
-    Ok(true)
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn platform_backing_is_allocated(_file: &File, _target_len: u64) -> io::Result<bool> {
+    // No allocator, so no receipt. On macOS an F_LOG2PHYS_EXT query was tried
+    // as the receipt and removed: it reports no physical extent for freshly
+    // written bytes until they are flushed (see platform_ensure_shm_backing).
     Ok(false)
 }
 
-#[cfg(any(test, target_os = "macos"))]
+// The byte-per-allocation-unit materializer is not wired into any target. It
+// stays, with its tests, as the starting point for a macOS backend; see
+// platform_ensure_shm_backing for what such a backend still has to solve.
+#[cfg(test)]
 fn materialize_shm_pages(file: &File, target_len: u64) -> io::Result<()> {
     materialize_shm_pages_with(file, target_len, |byte, offset| file.write_at(byte, offset))
 }
 
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(test)]
 fn materialize_shm_pages_with(
     file: &File,
     target_len: u64,
@@ -614,6 +660,74 @@ mod tests {
         }
     }
 
+    /// A filesystem, descriptor or platform that cannot preallocate must not
+    /// refuse the mapping: the allocator reports the prefix as sparse, a
+    /// mapping site then extends the file as releases up to 0.4.10 did, and an
+    /// existing payload is left exactly as it was.
+    #[test]
+    fn shm_unsupported_allocation_falls_back_to_a_sparse_extension() {
+        for errno in [
+            libc::EOPNOTSUPP,
+            libc::ENOSYS,
+            libc::EINVAL,
+            libc::EBADF,
+            libc::EPERM,
+        ] {
+            let file = tempfile::tempfile().unwrap();
+            file.write_at(b"retained", 0).unwrap();
+            let _fault = fail_allocations(errno, None);
+
+            assert_eq!(
+                ensure_shm_backing(&file, 12_288).unwrap(),
+                ShmBacking::Sparse,
+                "errno {errno} is not a storage failure"
+            );
+            assert_eq!(file.metadata().unwrap().len(), 8);
+
+            assert_eq!(
+                ensure_existing_shm_backing(&file, 12_288).unwrap(),
+                ShmBacking::Sparse
+            );
+            assert_eq!(
+                file.metadata().unwrap().len(),
+                8,
+                "the fallback never resizes an existing payload"
+            );
+
+            assert_eq!(
+                ensure_shm_backing_or_sparse(&file, 12_288).unwrap(),
+                ShmBacking::Sparse
+            );
+            assert_eq!(file.metadata().unwrap().len(), 12_288);
+            // A shorter request never shrinks the file, whatever it proves.
+            ensure_shm_backing_or_sparse(&file, 4096).unwrap();
+            assert_eq!(file.metadata().unwrap().len(), 12_288);
+
+            let mut bytes = [0_u8; 8];
+            file.read_exact_at(&mut bytes, 0).unwrap();
+            assert_eq!(&bytes, b"retained");
+        }
+    }
+
+    /// The fallback is only for "cannot preallocate". A storage failure stays
+    /// an error at every entry point and leaves the file alone.
+    #[test]
+    fn shm_storage_failure_is_never_downgraded_to_the_sparse_fallback() {
+        for errno in [libc::ENOSPC, libc::EDQUOT, libc::EIO, libc::EFBIG] {
+            let file = tempfile::tempfile().unwrap();
+            file.write_at(b"retained", 0).unwrap();
+            let _fault = fail_allocations(errno, None);
+            for attempt in [
+                ensure_shm_backing(&file, 12_288),
+                ensure_shm_backing_or_sparse(&file, 12_288),
+                ensure_existing_shm_backing(&file, 12_288),
+            ] {
+                assert_eq!(attempt.unwrap_err().raw_os_error(), Some(errno));
+                assert_eq!(file.metadata().unwrap().len(), 8);
+            }
+        }
+    }
+
     #[test]
     fn shm_byte_allocation_retries_interruption_and_partial_progress() {
         let file = tempfile::tempfile().unwrap();
@@ -753,15 +867,12 @@ mod tests {
         // SAFETY: the successful syscall returned a new owned descriptor.
         let file = unsafe { File::from_raw_fd(descriptor) };
         file.set_len(HUGE_PAGE).unwrap();
-        let error = match ensure_shm_backing(&file, HUGE_PAGE) {
-            Err(error) => error,
-            Ok(()) => {
-                // A surplus/overcommit policy or a concurrently returned page
-                // can add capacity after the accounting check. This bounded
-                // fixture must not fail a healthy host for having space.
-                eprintln!("SKIP_HUGETLB_ENOSPC: one hugepage became available");
-                return;
-            }
+        let Err(error) = ensure_shm_backing(&file, HUGE_PAGE) else {
+            // A surplus/overcommit policy or a concurrently returned page
+            // can add capacity after the accounting check. This bounded
+            // fixture must not fail a healthy host for having space.
+            eprintln!("SKIP_HUGETLB_ENOSPC: one hugepage became available");
+            return;
         };
         assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
         assert_eq!(file.metadata().unwrap().len(), HUGE_PAGE);

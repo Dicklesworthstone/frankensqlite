@@ -2240,48 +2240,17 @@ impl UnixFile {
     /// Establish physical backing before either publishing a larger WAL-index
     /// extent or exposing a writable mapping (GH #506). Length alone is not an
     /// allocation receipt: an interrupted older initializer may leave holes.
-    fn ensure_wal_shm_backing(&self, info: &mut ShmInfo, target_len: u64) -> Result<()> {
-        if crate::unix_shm::shm_backing_is_allocated(&info.file, target_len)? {
-            return Ok(());
-        }
-
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        {
-            // The native allocator preserves concurrently updated bytes and
-            // extends monotonically. Do not borrow a writer lock from a peer.
-            crate::unix_shm::ensure_shm_backing(&info.file, target_len)?;
-            Ok(())
-        }
-        #[cfg(target_os = "macos")]
-        {
-            // The portable allocator may need to materialize existing holes.
-            // Reuse our own WRITE claim, or acquire a separately accounted
-            // claim only for this allocation. Existing readers stay admitted.
-            let acquired = self.acquire_shm_exclusive_slot(info, WAL_WRITE_LOCK)?;
-            let allocation = crate::unix_shm::ensure_shm_backing(&info.file, target_len)
-                .map_err(FrankenError::Io);
-            if acquired {
-                let release = self.release_shm_exclusive_slot(info, WAL_WRITE_LOCK);
-                if let Err(error) = release {
-                    if allocation.is_ok() {
-                        return Err(error);
-                    }
-                    // Preserve the original allocation errno. The slot table
-                    // still owns this failed release for normal close/retry.
-                    warn!(%error, "SHM allocation failure retained its WRITE cleanup claim");
-                }
-            }
-            allocation
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
-        {
-            // A platform syscall name alone is not a concurrency guarantee:
-            // some native allocation backends rewrite whole existing buffers.
-            // Refuse until a backend that preserves live mapped stores exists.
-            Err(FrankenError::Io(io::Error::from_raw_os_error(
-                libc::EOPNOTSUPP,
-            )))
-        }
+    ///
+    /// Linux and Android allocate natively, which preserves concurrently
+    /// updated bytes and never borrows a writer lock from a peer. Where the
+    /// filesystem or the platform cannot preallocate, the file is extended
+    /// sparsely, exactly as releases up to 0.4.10 did: an unsupported
+    /// preallocation must never fail an open, and a reader never takes the
+    /// WAL WRITE lock or rewrites the live index to get it. Only a storage
+    /// failure (ENOSPC, EDQUOT, EIO, EFBIG) is returned.
+    fn ensure_wal_shm_backing(info: &ShmInfo, target_len: u64) -> Result<()> {
+        crate::unix_shm::ensure_shm_backing_or_sparse(&info.file, target_len)?;
+        Ok(())
     }
 
     fn ensure_shm_info_with_create(
@@ -3224,10 +3193,10 @@ impl UnixFile {
         // grab WAL_WRITE_LOCK just to initialize `*-shm`.
         let shm_info = self.ensure_shm_info(cx)?;
         let shm_file = {
-            let mut info = shm_info
+            let info = shm_info
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            self.ensure_wal_shm_backing(&mut info, SQLITE_WALINDEX_PGSZ)?;
+            Self::ensure_wal_shm_backing(&info, SQLITE_WALINDEX_PGSZ)?;
             Arc::clone(&info.file)
         };
 
@@ -4648,9 +4617,12 @@ impl VfsFile for UnixFile {
             mvcc_shm_lock(file, FileLockMode::Exclusive)?;
             checkpoint_or_abort(cx)?;
             // Publish the immutable transport header only after the complete
-            // payload has backing storage. Failure leaves an invalid, unmapped
-            // companion, never a header advertising a sparse writable payload.
-            crate::unix_shm::ensure_shm_backing(file, total_bytes)?;
+            // payload has backing storage, or, where the platform or the
+            // filesystem cannot preallocate, the sparse extent that releases
+            // up to 0.4.10 created here. A storage failure leaves an invalid,
+            // unmapped companion, never a header for a payload that could not
+            // be allocated.
+            crate::unix_shm::ensure_shm_backing_or_sparse(file, total_bytes)?;
             write_full_at(
                 |buffer, offset| file.write_at(buffer, offset),
                 &mvcc_shm_transport_header(identity, inode_key_from_file(file)?, payload_bytes),
@@ -4665,16 +4637,16 @@ impl VfsFile for UnixFile {
         mvcc_shm_lock(file, FileLockMode::Shared)?;
         validate_mvcc_shm_backing(file, &backing_path)?;
         validate_mvcc_shm_header(file, identity, payload_bytes)?;
-        if !created && !crate::unix_shm::shm_backing_is_allocated(file, total_bytes)? {
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            crate::unix_shm::ensure_shm_backing(file, total_bytes)?;
-            #[cfg(not(any(target_os = "linux", target_os = "android")))]
-            // An existing MVCC payload can have live atomic writers. Unlike
-            // the WAL index, its bytes are not protected by WAL_WRITE_LOCK.
-            // Refuse rather than read/rewrite those bytes to allocate holes.
-            return Err(FrankenError::Io(io::Error::from_raw_os_error(
-                libc::EOPNOTSUPP,
-            )));
+        if !created {
+            // An existing MVCC payload can have live atomic writers, and its
+            // bytes are not protected by WAL_WRITE_LOCK, so they are never
+            // read back and rewritten to fill holes. Linux allocates natively
+            // without touching them. Everywhere else, and on a filesystem
+            // that cannot preallocate, the payload is used as it is, as
+            // releases up to 0.4.10 used it: a companion that a 0.4.10 peer
+            // created sparse must stay joinable. The fallback never resizes
+            // the file.
+            crate::unix_shm::ensure_existing_shm_backing(file, total_bytes)?;
         }
         if inode_key_from_file(main.file_ref())? != identity {
             return Err(FrankenError::CannotOpen {
@@ -4730,7 +4702,7 @@ impl VfsFile for UnixFile {
         })?;
 
         let shm_info = self.ensure_shm_info_with_create(cx, extend)?;
-        let mut info = shm_info
+        let info = shm_info
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
@@ -4775,7 +4747,9 @@ impl VfsFile for UnixFile {
         // may map every preceding region after observing this file length.
         // Never truncate on failure. A peer or an older live alias may already
         // depend on the successful prefix; the next attempt repairs any holes.
-        self.ensure_wal_shm_backing(&mut info, target_len)?;
+        // Where preallocation is unavailable this is the sparse extension
+        // that releases up to 0.4.10 performed here.
+        Self::ensure_wal_shm_backing(&info, target_len)?;
 
         // Map the region via mmap(MAP_SHARED).
         let offset = u64::from(region) * u64::from(size);
@@ -9788,6 +9762,55 @@ mod tests {
             original.write_u32_le(0, 0xCAFE_BABE).unwrap();
             assert_eq!(expanded.read_u32_le(0).unwrap(), 0xCAFE_BABE);
             assert_eq!(next.read_u32_le(segment - 4096).unwrap(), 0x5678_CDEF);
+        }
+    }
+
+    /// GH #506 follow-up: a filesystem that cannot preallocate must not fail a
+    /// WAL open. With every allocation attempt answered "unsupported" (NFS
+    /// before 4.2, 9p, many FUSE mounts, btrfs UNSHARE_RANGE on shared
+    /// extents), creating the index, growing it, and cold-mapping a region
+    /// that a peer extended sparsely all succeed, as they did in 0.4.10.
+    #[test]
+    fn shm_506_unsupported_preallocation_maps_sparsely_instead_of_failing() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let segment = usize::try_from(SHM_SEGMENT_SIZE).unwrap();
+        let segment_len = u64::from(SHM_SEGMENT_SIZE);
+        for errno in [libc::EOPNOTSUPP, libc::ENOSYS, libc::EINVAL] {
+            let (_dir, path) = make_temp_path("shm-allocation-unsupported.db");
+            let _fault = crate::unix_shm::fail_allocations(errno, None);
+
+            let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+            let first = file.shm_map(&cx, 0, SHM_SEGMENT_SIZE, true).unwrap();
+            assert_eq!(first.len(), segment);
+            for offset in (0..segment).step_by(4096) {
+                first.write_u32_le(offset, 0x1234_ABCD).unwrap();
+            }
+            let info = Arc::clone(file.shm_info.as_ref().unwrap());
+            let shm_len = || info.lock().unwrap().file.metadata().unwrap().len();
+            assert_eq!(shm_len(), segment_len);
+
+            // Growth into the next region is a sparse extension too.
+            let second = file.shm_map(&cx, 1, SHM_SEGMENT_SIZE, true).unwrap();
+            second.write_u32_le(0, 0x5678_CDEF).unwrap();
+            assert_eq!(shm_len(), segment_len * 2);
+
+            // A peer on a release up to 0.4.10 extends with a bare set_len.
+            // Mapping that region without extending must not need allocation
+            // and must not resize the file.
+            info.lock().unwrap().file.set_len(segment_len * 3).unwrap();
+            let (mut peer, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+            let third = peer.shm_map(&cx, 2, SHM_SEGMENT_SIZE, false).unwrap();
+            third.write_u32_le(segment - 4096, 0x0BAD_CAFE).unwrap();
+            assert_eq!(shm_len(), segment_len * 3);
+
+            for offset in (0..segment).step_by(4096) {
+                assert_eq!(first.read_u32_le(offset).unwrap(), 0x1234_ABCD);
+            }
+            assert_eq!(second.read_u32_le(0).unwrap(), 0x5678_CDEF);
+            assert_eq!(third.read_u32_le(segment - 4096).unwrap(), 0x0BAD_CAFE);
+            file.close(&cx).unwrap();
+            peer.close(&cx).unwrap();
         }
     }
 
