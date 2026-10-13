@@ -9,7 +9,7 @@ use std::task::{Context, Poll, Waker};
 use asupersync::runtime::RuntimeBuilder;
 use fsqlite_btree::{BtCursor, BtreeCursorOps, SeekResult, TransactionPageIo};
 use fsqlite_error::{FrankenError, Result};
-use fsqlite_harness::fault_vfs::{FaultInjectingVfs, FaultSpec};
+use fsqlite_harness::fault_vfs::{FaultInjectingVfs, FaultKind, FaultSpec};
 use fsqlite_pager::native::NativePager;
 use fsqlite_pager::{PagerCommitState, TransactionHandle, TransactionMode};
 use fsqlite_types::cx::Cx;
@@ -300,30 +300,57 @@ fn real_threads_prepare_disjoint_writes_before_either_is_published() {
 #[test]
 fn failed_syncs_remain_in_doubt_and_recovery_never_invents_an_old_reply() {
     run(async {
-        for (path, ordinal, expected) in [("objects", 1, 0), ("markers", 2, 1)] {
+        for (path, sync_index, expected) in [("objects", 0, 0), ("markers", 1, 1)] {
             let cx = Cx::new();
             let vfs = FaultInjectingVfs::new(MemoryVfs::new());
             let owner = pager(&vfs, &cx);
             let mut txn = owner.begin(&cx, TransactionMode::Concurrent).unwrap();
+            txn.savepoint(&cx, "private").unwrap();
             txn.write_page(&cx, page(2), &[9; 512]).await.unwrap();
-            vfs.inject_fault(FaultSpec::power_cut(path).after_nth_sync(ordinal).build());
-            assert!(txn.commit_at(&cx, 100).await.is_err());
+            // GH#508: select the actual zero-based global barrier index.
+            assert_eq!(vfs.sync_count(), 0);
+            vfs.inject_fault(FaultSpec::power_cut(path).after_nth_sync(sync_index).build());
+            assert!(matches!(
+                txn.commit_at(&cx, 100).await,
+                Err(FrankenError::Io(_))
+            ));
             assert!(vfs.is_powered_off());
+            assert_eq!(vfs.sync_count(), sync_index + 1);
+            let faults = vfs.triggered_faults();
+            assert_eq!(faults.len(), 1, "the intended barrier must actually fail");
+            assert_eq!(faults[0].path, Path::new(path));
+            assert_eq!(faults[0].kind, FaultKind::PowerCut);
+            assert_eq!(faults[0].detail, format!("operation=sync index={sync_index}"));
             assert_eq!(txn.pager_commit_state(), PagerCommitState::InDoubt);
             assert!(txn.acknowledgement().is_none());
+            assert_eq!(txn.pending_commit_pages().unwrap(), vec![page(2)]);
             assert!(matches!(
                 txn.settle_commit(&cx).await,
                 Err(FrankenError::BusyRecovery)
             ));
             vfs.power_on();
-            assert!(txn.rollback(&cx).await.is_err());
-            assert!(txn.commit_at(&cx, 101).await.is_err());
+            assert!(matches!(txn.rollback(&cx).await, Err(FrankenError::BusyRecovery)));
+            assert!(matches!(
+                txn.commit_at(&cx, 101).await,
+                Err(FrankenError::BusyRecovery)
+            ));
+            assert!(matches!(
+                txn.rollback_to_savepoint(&cx, "private"),
+                Err(FrankenError::BusyRecovery)
+            ));
             assert_eq!(txn.pager_commit_state(), PagerCommitState::InDoubt);
+            assert_eq!(txn.pending_commit_pages().unwrap(), vec![page(2)]);
             assert!(owner.needs_recovery().unwrap());
-            assert!(owner.begin(&cx, TransactionMode::Concurrent).is_err());
+            assert!(matches!(
+                owner.begin(&cx, TransactionMode::Concurrent),
+                Err(FrankenError::BusyRecovery)
+            ));
+            assert!(matches!(owner.close(&cx), Err(FrankenError::Busy)));
             drop(txn);
             owner.close(&cx).unwrap();
+            assert_eq!(vfs.sync_count(), sync_index + 1, "no implicit retry");
             let (fresh, count) = recovered(&vfs, &cx).await;
+            assert_eq!(vfs.sync_count(), sync_index + 3, "only recovery resyncs");
             assert_eq!(count, expected);
             let mut view = fresh.begin(&cx, TransactionMode::ReadOnly).unwrap();
             assert!(view.acknowledgement().is_none());
