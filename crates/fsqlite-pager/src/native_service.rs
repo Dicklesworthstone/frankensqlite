@@ -351,9 +351,10 @@ where
     /// An idle worker is woken by either local or attached native cancellation.
     ///
     /// Once physical I/O may have started, no failed group is split or retried.
-    /// A purely rejected group may be tried member-by-member so one stale or
-    /// oversized writer cannot prevent unrelated valid writers from committing.
-    /// Each such attempt revalidates against the newly committed history.
+    /// A purely rejected group isolates its oldest member first, then tries
+    /// remaining ordered ranges together. Only untouched rejected ranges are
+    /// bisected, so valid peers can still share barriers. Every attempt uses
+    /// fresh conflict validation; publication order never changes.
     ///
     /// # Errors
     /// Cancellation or an indeterminate pager stops the worker. Per-transaction
@@ -473,8 +474,16 @@ where
             for request in &mut self.batch { request.outcome = Some(Err(Arc::clone(&error))); }
             return Ok(());
         }
-        for request in &mut self.batch {
-            // Each fallback member is a new publication attempt. The initial
+        // Preserve oldest-first isolation without forcing every valid peer
+        // into its own two-sync publication. A LIFO range stack visits the
+        // left half before the right; disjoint pending ranges need at most
+        // one slot per request. Reserve that bound before any fallback I/O.
+        let mut pending = Vec::new();
+        pending.try_reserve_exact(self.batch.len()).map_err(|_| FrankenError::OutOfMemory)?;
+        pending.push((1, self.batch.len()));
+        pending.push((0, 1));
+        while let Some((start, end)) = pending.pop() {
+            // Each fallback range is a new publication attempt. The initial
             // group can reject after cancelling the worker, and an earlier
             // singleton can finish after cancellation. Check the same native
             // context run resolved, even when cx has no native attachment.
@@ -483,17 +492,49 @@ where
                 self.stopped = Arc::new(FrankenError::Interrupt);
                 break;
             }
-            // Always use THIS service's owner, including in the fallback.
-            // Calling transaction.commit() here would commit a foreign pager.
-            let result = self.pager.commit_batch_at(
-                cx, &mut [&mut request.transaction], request.now_unix_ns,
-            ).await;
-            request.outcome = Some(result.map_err(Arc::new));
-            if request.transaction.pager_commit_state() != PagerCommitState::Committed
-                && request.transaction.pager_commit_state().retains_commit_obligation()
+            let result = {
+                let group = &mut self.batch[start..end];
+                let now = group.iter().map(|request| request.now_unix_ns).max().unwrap_or(0);
+                let mut transactions = Vec::new();
+                transactions.try_reserve_exact(group.len()).map_err(|_| FrankenError::OutOfMemory)?;
+                for request in group {
+                    transactions.push(&mut request.transaction);
+                }
+                // Always use THIS service's owner, including for singleton
+                // leaves. A foreign transaction must never publish elsewhere.
+                self.pager.commit_batch_at(cx, &mut transactions, now).await
+            };
+            let can_split = end - start > 1
+                && matches!(result, Err(FrankenError::BusySnapshot { .. } | FrankenError::TooBig | FrankenError::Abort))
+                && self.batch[start..end].iter().all(|request| request.transaction.pager_commit_state() == PagerCommitState::NotCommitted)
+                && matches!(self.pager.needs_recovery(), Ok(false));
+            if can_split {
+                let middle = start + (end - start) / 2;
+                pending.push((middle, end));
+                pending.push((start, middle));
+                continue;
+            }
+            let outcome = result.map_err(Arc::new);
+            for request in &mut self.batch[start..end] {
+                request.outcome = Some(outcome.clone());
+            }
+            if self.batch[start..end].iter().any(|request| {
+                let state = request.transaction.pager_commit_state();
+                state != PagerCommitState::Committed && state.retains_commit_obligation()
+            }) || matches!(self.pager.needs_recovery(), Ok(true))
             {
                 self.stopped = Arc::new(FrankenError::BusyRecovery);
                 break;
+            }
+            if cx.checkpoint().is_err() || native.checkpoint().is_err() {
+                self.stopped = Arc::new(FrankenError::Interrupt);
+                break;
+            }
+            // Yield only BETWEEN completed attempts, never inside an admitted
+            // write. Every handle/outcome stays in self.batch across the yield,
+            // so cancellation or dropping this future cannot lose a request.
+            if !pending.is_empty() {
+                yield_once().await;
             }
         }
         Ok(())
