@@ -1,0 +1,69 @@
+name: GH510 savepoint WAL correctness
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/gh510-savepoint-wal.yml
+      - crates/fsqlite-core/tests/issue_491_bulk_insert.rs
+      - crates/fsqlite-pager/src/pager.rs
+      - crates/fsqlite-core/src/connection.rs
+      - crates/fsqlite-wal/src/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gh510-savepoint-wal
+  cancel-in-progress: false
+
+jobs:
+  correctness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install repository toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain="$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')"
+          rustup toolchain install "$toolchain" --profile minimal
+          mkdir -p "$RUNNER_TEMP/gh510"
+          git rev-parse HEAD | tee "$RUNNER_TEMP/gh510/commit.txt"
+          rustc --version --verbose | tee "$RUNNER_TEMP/gh510/toolchain.txt"
+      - name: Indexed INSERT SELECT rollback versus stock SQLite
+        id: indexed
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p fsqlite-core --test issue_491_bulk_insert -- --nocapture --test-threads=1 \
+            2>&1 | tee "$RUNNER_TEMP/gh510/indexed-oracle.log"
+      - name: Pager savepoint correctness
+        if: success() || failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p fsqlite-pager savepoint -- --nocapture --test-threads=1 \
+            2>&1 | tee "$RUNNER_TEMP/gh510/pager-savepoints.log"
+      - name: WAL correctness including conflict validation
+        if: success() || failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p fsqlite-wal -- --test-threads=1 \
+            2>&1 | tee "$RUNNER_TEMP/gh510/wal-correctness.log"
+      - name: Preserve test results even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gh510-correctness-${{ github.run_id }}
+          path: ${{ runner.temp }}/gh510/
+          if-no-files-found: error
