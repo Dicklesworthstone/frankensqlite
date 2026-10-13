@@ -1,0 +1,99 @@
+name: GH510 WAL savepoint correctness
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/gh510-wal-savepoint.yml
+      - crates/fsqlite-core/tests/issue_491_bulk_insert.rs
+      - crates/fsqlite-core/src/connection.rs
+      - crates/fsqlite-core/src/wal_adapter.rs
+      - crates/fsqlite-pager/src/pager.rs
+      - crates/fsqlite-mvcc/src/begin_concurrent.rs
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gh510-wal-savepoint-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  correctness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      RUST_BACKTRACE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Capture exact source before building
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/gh510"
+          git rev-parse HEAD | tee "$RUNNER_TEMP/gh510/commit.txt"
+          sha256sum Cargo.lock > "$RUNNER_TEMP/gh510/lockfile.sha256"
+          tar -czf "$RUNNER_TEMP/gh510/source.tar.gz" \
+            Cargo.toml Cargo.lock rust-toolchain.toml .cargo \
+            crates/fsqlite-core crates/fsqlite-pager crates/fsqlite-wal \
+            crates/fsqlite-mvcc crates/fsqlite-btree crates/fsqlite-types \
+            crates/fsqlite-vdbe crates/fsqlite-vfs
+      - name: Preserve source independently of build outcome
+        uses: actions/upload-artifact@v4
+        with:
+          name: gh510-source-${{ github.run_id }}
+          path: ${{ runner.temp }}/gh510/
+          if-no-files-found: error
+      - name: Install repository toolchain
+        id: toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain="$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')"
+          rustup toolchain install "$toolchain" --profile minimal --component rustfmt --component clippy
+          rustc --version --verbose | tee "$RUNNER_TEMP/gh510/rustc.txt"
+          cargo --version | tee "$RUNNER_TEMP/gh510/cargo.txt"
+      - name: WAL, pager and MVCC correctness
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          cargo test --locked -p fsqlite-wal -p fsqlite-pager -p fsqlite-mvcc \
+            --lib -- --nocapture --test-threads=1 \
+            2>&1 | tee "$RUNNER_TEMP/gh510/storage-tests.log"
+          status=${PIPESTATUS[0]}
+          printf '%s\n' "$status" > "$RUNNER_TEMP/gh510/storage-tests.exit"
+          exit "$status"
+      - name: Indexed savepoint rollback versus stock SQLite
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          cargo test --locked -p fsqlite-core --test issue_491_bulk_insert \
+            -- --nocapture --test-threads=1 \
+            2>&1 | tee "$RUNNER_TEMP/gh510/sql-oracle.log"
+          status=${PIPESTATUS[0]}
+          printf '%s\n' "$status" > "$RUNNER_TEMP/gh510/sql-oracle.exit"
+          exit "$status"
+      - name: Check that validation did not rewrite the source
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: git diff --exit-code
+      - name: Preserve actual outcomes, including failures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gh510-results-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/gh510/*.txt
+            ${{ runner.temp }}/gh510/*.log
+            ${{ runner.temp }}/gh510/*.exit
+            ${{ runner.temp }}/gh510/*.sha256
+          if-no-files-found: warn
