@@ -19,6 +19,7 @@ use std::task::Poll;
 
 use asupersync::Cx as NativeCx;
 use asupersync::channel::{mpsc, oneshot};
+use asupersync::sync::Notify;
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
 use fsqlite_vfs::VfsFile;
@@ -103,6 +104,7 @@ impl<T: TransactionHandle> Request<T> {
 pub struct NativeCommitSender<T: TransactionHandle> {
     sender: mpsc::Sender<Request<T>>,
     closing: Arc<AtomicBool>,
+    shutdown: Arc<Notify>,
 }
 
 impl<T: TransactionHandle> Clone for NativeCommitSender<T> {
@@ -110,6 +112,7 @@ impl<T: TransactionHandle> Clone for NativeCommitSender<T> {
         Self {
             sender: self.sender.clone(),
             closing: Arc::clone(&self.closing),
+            shutdown: Arc::clone(&self.shutdown),
         }
     }
 }
@@ -119,6 +122,7 @@ impl<T: TransactionHandle> NativeCommitSender<T> {
     /// Dropping/cancelling this future releases its reservation/waiter only.
     /// Use the caller's existing Asupersync capability context, not a new root.
     /// Native cancellation wakes the wait even while the mailbox stays full.
+    /// Shutdown also wakes it without waiting for the worker's storage I/O.
     ///
     /// # Errors
     /// Returns cancellation, shutdown, or checked runtime-admission failure.
@@ -127,13 +131,26 @@ impl<T: TransactionHandle> NativeCommitSender<T> {
         let permit = {
             let mut reservation = std::pin::pin!(self.sender.reserve_checked(cx));
             let mut cancelled = std::pin::pin!(wait_for_native_cancellation(cx));
-            poll_fn(|task_cx| match reservation.as_mut().poll(task_cx) {
-                Poll::Ready(result) => Poll::Ready(result.map_err(admission_error)),
-                Poll::Pending => {
-                    if cancelled.as_mut().poll(task_cx).is_ready() {
-                        Poll::Ready(Err(FrankenError::Interrupt))
-                    } else {
-                        Poll::Pending
+            // Notify::wait_until arms its generation before checking the flag,
+            // so shutdown between that check and waiter registration is not
+            // lost. Only a backpressured reservation registers this waiter.
+            let mut shutdown = std::pin::pin!(self.shutdown.wait_until(|| {
+                self.closing.load(Ordering::Acquire)
+            }));
+            poll_fn(|task_cx| {
+                if let Err(error) = self.check_open() {
+                    return Poll::Ready(Err(error));
+                }
+                match reservation.as_mut().poll(task_cx) {
+                    Poll::Ready(result) => Poll::Ready(result.map_err(admission_error)),
+                    Poll::Pending => {
+                        if shutdown.as_mut().poll(task_cx).is_ready() {
+                            Poll::Ready(Err(FrankenError::Abort))
+                        } else if cancelled.as_mut().poll(task_cx).is_ready() {
+                            Poll::Ready(Err(FrankenError::Interrupt))
+                        } else {
+                            Poll::Pending
+                        }
                     }
                 }
             }).await?
@@ -172,8 +189,11 @@ impl<T: TransactionHandle> NativeCommitSender<T> {
     /// Already reserved but unsent permits return their transactions on send.
     /// Accepted intents still commit even when their tickets have been dropped.
     /// A send racing this call either returns its handle or joins that drain.
+    /// Backpressured producers wake even if the worker has not started or is
+    /// awaiting a source-owned write. This never cancels that write or its Cx.
     pub fn request_shutdown(&self) {
         self.closing.store(true, Ordering::Release);
+        self.shutdown.notify_waiters();
         self.sender.wake_receiver();
     }
 }
@@ -312,7 +332,11 @@ where
         let (sender, receiver) = mpsc::channel(queue_capacity);
         let closing = Arc::new(AtomicBool::new(false));
         Ok((
-            NativeCommitSender { sender, closing: Arc::clone(&closing) },
+            NativeCommitSender {
+                sender,
+                closing: Arc::clone(&closing),
+                shutdown: Arc::new(Notify::new()),
+            },
             Self {
                 pager: pager.clone(), receiver, closing, batch, max_batch,
                 stopped: Arc::new(FrankenError::Abort),

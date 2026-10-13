@@ -1238,6 +1238,178 @@ fn dropped_native_cancellation_waits_release_wakers_and_reserved_capacity() {
 }
 
 #[test]
+fn shutdown_wakes_all_backpressured_producers_without_polling_the_worker() {
+    run(async {
+        let (cx, native) = contexts();
+        let vfs = FaultInjectingVfs::new(MemoryVfs::new());
+        let owner = pager(&vfs, &cx);
+        let (sender, worker) = NativeCommitService::new(&owner, 1, 1).unwrap();
+        let mut accepted = owner.begin(&cx, TransactionMode::Concurrent).unwrap();
+        accepted.write_page(&cx, page(2), &[2; 512]).await.unwrap();
+        let mut ticket = sender.reserve(&native).await.unwrap().send(accepted, 100).unwrap();
+        let mut private = owner.begin(&cx, TransactionMode::Concurrent).unwrap();
+        private.savepoint(&cx, "before").unwrap();
+        private.write_page(&cx, page(3), &[3; 512]).await.unwrap();
+
+        let peer = sender.clone();
+        let source = NativeCx::for_testing();
+        let old_wakes = Arc::new(WakeCounter::default());
+        let first_wakes = Arc::new(WakeCounter::default());
+        let second_wakes = Arc::new(WakeCounter::default());
+        let dropped_wakes = Arc::new(WakeCounter::default());
+        let old_waker = Waker::from(Arc::clone(&old_wakes));
+        let first_waker = Waker::from(Arc::clone(&first_wakes));
+        let second_waker = Waker::from(Arc::clone(&second_wakes));
+        let dropped_waker = Waker::from(Arc::clone(&dropped_wakes));
+        let mut first = Box::pin(sender.reserve(&source));
+        let mut second = Box::pin(peer.reserve(&source));
+        assert!(first.as_mut().poll(&mut Context::from_waker(&old_waker)).is_pending());
+        assert!(first.as_mut().poll(&mut Context::from_waker(&first_waker)).is_pending());
+        assert!(second.as_mut().poll(&mut Context::from_waker(&second_waker)).is_pending());
+        let mut abandoned = Box::pin(peer.reserve(&source));
+        assert!(abandoned.as_mut().poll(&mut Context::from_waker(&dropped_waker)).is_pending());
+        drop(abandoned);
+        let before = [
+            old_wakes.0.load(Ordering::SeqCst),
+            first_wakes.0.load(Ordering::SeqCst),
+            second_wakes.0.load(Ordering::SeqCst),
+            dropped_wakes.0.load(Ordering::SeqCst),
+        ];
+
+        // The worker has never been polled; the accepted request still owns
+        // the only mailbox slot. Shutdown itself must broadcast the wake.
+        peer.request_shutdown();
+        assert!(first_wakes.0.load(Ordering::SeqCst) > before[1]);
+        assert!(second_wakes.0.load(Ordering::SeqCst) > before[2]);
+        assert_eq!(old_wakes.0.load(Ordering::SeqCst), before[0]);
+        assert_eq!(dropped_wakes.0.load(Ordering::SeqCst), before[3]);
+        assert!(matches!(
+            first.as_mut().poll(&mut Context::from_waker(&first_waker)),
+            Poll::Ready(Err(FrankenError::Abort))
+        ));
+        assert!(matches!(
+            second.as_mut().poll(&mut Context::from_waker(&second_waker)),
+            Poll::Ready(Err(FrankenError::Abort))
+        ));
+        drop(first);
+        drop(second);
+        for wakes in [&old_wakes, &first_wakes, &second_wakes, &dropped_wakes] {
+            assert_eq!(Arc::strong_count(wakes), 2, "waits must release every registration");
+        }
+        let first_after = first_wakes.0.load(Ordering::SeqCst);
+        let second_after = second_wakes.0.load(Ordering::SeqCst);
+        sender.request_shutdown(); // Idempotent and no stale wake after wait cleanup.
+        source.cancel_with(asupersync::types::CancelKind::User, None);
+        assert_eq!(first_wakes.0.load(Ordering::SeqCst), first_after);
+        assert_eq!(second_wakes.0.load(Ordering::SeqCst), second_after);
+        assert!(native.checkpoint().is_ok(), "shutdown must not cancel the caller");
+        assert!(matches!(sender.reserve(&native).await, Err(FrankenError::Abort)));
+        assert_eq!(vfs.sync_count(), 0);
+        assert_eq!(owner.committed_tip().unwrap(), CommitSeq::ZERO);
+        assert_eq!(private.pager_commit_state(), PagerCommitState::NotCommitted);
+        assert_eq!(private.pending_commit_pages().unwrap(), vec![page(3)]);
+        assert_eq!(private.get_page(&cx, page(3)).await.unwrap().as_bytes(), &[3; 512]);
+
+        // Rejection of unsent work is not cancellation of already accepted work.
+        worker.run(&cx).await.unwrap();
+        let completed = ticket.wait(&native).await.unwrap();
+        completed.result.unwrap();
+        assert_eq!(completed.transaction.pager_commit_state(), PagerCommitState::Committed);
+        assert_eq!(completed.transaction.acknowledgement().unwrap().commit_seq, CommitSeq::new(1));
+        assert_eq!(vfs.sync_count(), 2);
+        private.rollback_to_savepoint(&cx, "before").unwrap();
+        assert!(!private.has_pending_writes());
+        private.rollback(&cx).await.unwrap();
+        owner.close(&cx).unwrap();
+    });
+}
+
+#[test]
+fn shutdown_wakes_a_backpressured_producer_without_settling_the_marker_source() {
+    run(async {
+        let (cx, native) = contexts();
+        let vfs = MemoryVfs::new();
+        let source = Arc::new(Mutex::new(None));
+        let log = NativeDurabilityLog::create(
+            &cx,
+            file(&vfs, &cx, "objects"),
+            PausedMarkerFile {
+                inner: file(&vfs, &cx, "markers"),
+                source: Arc::clone(&source),
+            },
+            NativeDurabilityLimits::default(),
+        ).unwrap();
+        let owner = NativePager::new(
+            NativePageStore::new(log, TestCodec, 512, NativePageLimits::default()).unwrap(),
+        ).unwrap();
+        let (sender, worker) = NativeCommitService::new(&owner, 1, 1).unwrap();
+        let mut active = owner.begin(&cx, TransactionMode::Concurrent).unwrap();
+        let mut queued = owner.begin(&cx, TransactionMode::Concurrent).unwrap();
+        let mut private = owner.begin(&cx, TransactionMode::Concurrent).unwrap();
+        active.write_page(&cx, page(2), &[2; 512]).await.unwrap();
+        queued.savepoint(&cx, "before").unwrap();
+        queued.write_page(&cx, page(3), &[3; 512]).await.unwrap();
+        private.write_page(&cx, page(4), &[4; 512]).await.unwrap();
+        let mut active_ticket = sender.reserve(&native).await.unwrap().send(active, 100).unwrap();
+        let mut running = Box::pin(worker.run(&cx));
+        pending_once(running.as_mut()).await; // Coalescing yield.
+        pending_once(running.as_mut()).await; // Marker bytes written; source completion pending.
+        let source_completion = source.lock().unwrap().as_ref().unwrap().clone();
+        assert_eq!(source_completion.state(), VfsWriteCompletionState::Pending);
+        let mut queued_ticket = sender.reserve(&native).await.unwrap().send(queued, 101).unwrap();
+
+        let producer_cx = NativeCx::for_testing();
+        let wakes = Arc::new(WakeCounter::default());
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut task = Context::from_waker(&waker);
+        let mut waiting = Box::pin(sender.reserve(&producer_cx));
+        assert!(waiting.as_mut().poll(&mut task).is_pending());
+        let before = wakes.0.load(Ordering::SeqCst);
+        sender.request_shutdown();
+        // No worker repoll or storage completion is allowed to explain this wake.
+        assert!(wakes.0.load(Ordering::SeqCst) > before);
+        assert!(matches!(waiting.as_mut().poll(&mut task), Poll::Ready(Err(FrankenError::Abort))));
+        drop(waiting);
+        assert_eq!(Arc::strong_count(&wakes), 2);
+        assert!(native.checkpoint().is_ok());
+        assert!(producer_cx.checkpoint().is_ok());
+        assert_eq!(source_completion.state(), VfsWriteCompletionState::Pending);
+        let mut markers = file(&vfs, &cx, "markers");
+        assert_eq!(
+            markers.file_size(&cx).unwrap(),
+            u64::try_from(fsqlite_types::COMMIT_MARKER_RECORD_V1_SIZE).unwrap()
+        );
+        markers.close(&cx).unwrap();
+
+        // Abandonment retains the existing recovery obligation; waking a
+        // producer must not complete, retry, or roll back this physical write.
+        drop(running);
+        let mut active = active_ticket.wait(&native).await.unwrap();
+        let mut queued = queued_ticket.wait(&native).await.unwrap();
+        assert_eq!(active.transaction.pager_commit_state(), PagerCommitState::InDoubt);
+        assert!(matches!(active.result.as_ref().unwrap_err().as_ref(), FrankenError::BusyRecovery));
+        assert!(active.transaction.acknowledgement().is_none());
+        assert_eq!(active.transaction.pending_commit_pages().unwrap(), vec![page(2)]);
+        assert!(matches!(active.transaction.rollback(&cx).await, Err(FrankenError::BusyRecovery)));
+        assert_eq!(queued.transaction.pager_commit_state(), PagerCommitState::NotCommitted);
+        assert!(queued.result.is_err());
+        assert_eq!(queued.transaction.pending_commit_pages().unwrap(), vec![page(3)]);
+        queued.transaction.rollback_to_savepoint(&cx, "before").unwrap();
+        queued.transaction.rollback(&cx).await.unwrap();
+        assert_eq!(private.pager_commit_state(), PagerCommitState::NotCommitted);
+        assert_eq!(private.pending_commit_pages().unwrap(), vec![page(4)]);
+        private.rollback(&cx).await.unwrap();
+        assert!(matches!(owner.close(&cx), Err(FrankenError::Busy)));
+        drop(active);
+        assert!(matches!(owner.close(&cx), Err(FrankenError::BusyRecovery)));
+        assert_eq!(source_completion.state(), VfsWriteCompletionState::Pending);
+        source.lock().unwrap().take().unwrap().complete_success();
+        assert_eq!(source_completion.state(), VfsWriteCompletionState::Success);
+        owner.close(&cx).unwrap();
+    });
+}
+
+#[test]
 fn bounded_producers_and_worker_progress_when_driven_concurrently() {
     run(async {
         let (cx, native) = contexts();
