@@ -864,9 +864,10 @@ fn drop_index_keeps_its_table_and_cookie_exhaustion_restores_partial_removal() {
 
 #[test]
 fn schema_retirement_recovers_atomically_across_both_sync_failure_boundaries() {
-    use fsqlite_harness::fault_vfs::{FaultInjectingVfs, FaultSpec};
+    use fsqlite_harness::fault_vfs::{FaultInjectingVfs, FaultKind, FaultSpec};
+    use fsqlite_wal::native_pages::NativePageTransactionState;
     run(async {
-        for (path, advance, was_committed) in [("objects", 1, false), ("markers", 2, true)] {
+        for (path, barrier_offset, was_committed) in [("objects", 0, false), ("markers", 1, true)] {
             let cx = Cx::new();
             let vfs = FaultInjectingVfs::new(MemoryVfs::new());
             let log = NativeDurabilityLog::create(
@@ -886,20 +887,43 @@ fn schema_retirement_recovers_atomically_across_both_sync_failure_boundaries() {
             drop_native_schema_tree(&cx, &db, &mut txn, "items", NativeSchemaKind::Table)
                 .await
                 .unwrap();
+            // GH#508: the first commit used indices 0/1; retirement uses 2/3.
+            let syncs_before = vfs.sync_count();
+            assert_eq!(syncs_before, 2);
+            let sync_index = syncs_before + barrier_offset;
+            let token = txn.token();
             vfs.inject_fault(
                 FaultSpec::power_cut(path)
-                    .after_nth_sync(vfs.sync_count() + advance)
+                    .after_nth_sync(sync_index)
                     .build(),
             );
-            assert!(db.commit(&cx, &mut txn, 101).await.is_err());
+            assert!(matches!(
+                db.commit(&cx, &mut txn, 101).await,
+                Err(FrankenError::Io(_))
+            ));
+            assert!(vfs.is_powered_off());
+            assert_eq!(vfs.sync_count(), sync_index + 1);
+            let faults = vfs.triggered_faults();
+            assert_eq!(faults.len(), 1, "the intended barrier must actually fail");
+            assert_eq!(faults[0].path, Path::new(path));
+            assert_eq!(faults[0].kind, FaultKind::PowerCut);
+            assert_eq!(faults[0].detail, format!("operation=sync index={sync_index}"));
             assert!(db.needs_recovery());
-            assert!(
-                db.rollback(&mut txn).is_err(),
-                "an uncertain schema commit is not rolled back"
-            );
+            assert_eq!(db.committed_tip().get(), 1);
+            assert_eq!(txn.token(), token);
+            assert_eq!(txn.state(), NativePageTransactionState::Indeterminate);
+            assert!(txn.is_page_dirty(page(1)));
+            assert!(txn.is_page_dirty(object.root()));
+            assert!(matches!(db.rollback(&mut txn), Err(FrankenError::BusyRecovery)));
             vfs.power_on();
+            assert!(matches!(
+                db.commit(&cx, &mut txn, 102).await,
+                Err(FrankenError::BusyRecovery)
+            ));
+            assert!(matches!(db.begin(&cx), Err(FrankenError::BusyRecovery)));
             db.close(&cx).unwrap();
-            let (mut recovered, _) = NativePageStore::recover(
+            assert_eq!(vfs.sync_count(), sync_index + 1, "no implicit retry");
+            let (mut recovered, report) = NativePageStore::recover(
                 &cx,
                 open(&vfs, &cx, "objects"),
                 open(&vfs, &cx, "markers"),
@@ -910,6 +934,13 @@ fn schema_retirement_recovers_atomically_across_both_sync_failure_boundaries() {
             )
             .await
             .unwrap();
+            assert_eq!(vfs.sync_count(), sync_index + 3, "only recovery resyncs");
+            let expected_commits = if was_committed { 2 } else { 1 };
+            assert_eq!(report.markers.len(), expected_commits);
+            assert_eq!(
+                recovered.committed_tip().get(),
+                u64::try_from(expected_commits).unwrap()
+            );
             let mut txn = recovered.begin(&cx).unwrap();
             let schema = read_native_schema(&cx, &recovered, &mut txn).await.unwrap();
             assert_eq!(schema.find("items").is_none(), was_committed);
