@@ -1,0 +1,476 @@
+diff --git a/crates/fsqlite-core/src/connection.rs b/crates/fsqlite-core/src/connection.rs
+--- a/crates/fsqlite-core/src/connection.rs
++++ b/crates/fsqlite-core/src/connection.rs
+@@ -40,4 +40,16 @@
+ mod conformal_retry;
+ mod pragma_maintenance;
+ mod qualified_column_binding;
++
++#[cfg(test)]
++mod incremental_time_travel_tests;
++
++/// The pending physical mutation surface, sampled before explicit COMMIT.
++/// This is capture metadata, not a replacement transaction or commit owner.
++struct TimeTravelCommitPages {
++    before: CommitSeq,
++    before_size: u32,
++    page_size: PageSize,
++    pages: Vec<PageNumber>,
++}
+ 
+@@ -12000,5 +12012,10 @@
+ struct TimeTravelImage {
+-    /// Committed pages `1..=db_size`, in page order.
+-    pages: Vec<PageData>,
++    /// Dense committed page identifiers, with a structurally shared directory.
++    pages: fsqlite_pager::PersistentPageMap<PageData>,
++    /// Physical pager identity; the connection's logical clock is not this key.
++    pager_commit_seq: Option<CommitSeq>,
++    pager_page_size: PageSize,
++    #[cfg(test)]
++    page_capture: fsqlite_pager::PageImageCaptureStats,
+     /// The mirror with every pager-backed table emptied. What remains is the
+     /// mirror-only state the pages cannot reproduce: TEMP tables and their
+@@ -25354,7 +25371,20 @@
+     async fn capture_time_travel_snapshot(&self, commit_seq: u64) {
++        self.capture_time_travel_snapshot_with_pages(commit_seq, None)
++            .await;
++    }
++
++    async fn capture_time_travel_snapshot_with_pages(
++        &self,
++        commit_seq: u64,
++        delta: Option<&TimeTravelCommitPages>,
++    ) {
+         if self.path != ":memory:" {
+             return;
+         }
+-        let image = match self.capture_time_travel_image().await {
++        let capture = match delta {
++            Some(delta) => self.capture_time_travel_image_with_pages(Some(delta)).await,
++            None => self.capture_time_travel_image().await,
++        };
++        let image = match capture {
+             Ok(image) => image,
+             Err(err) => {
+@@ -25423,6 +25453,12 @@
+-    /// Each page is compared with the previous snapshot's copy of it and shares
+-    /// that copy when it is unchanged, by image token first and then by bytes.
++    /// Capture points without a pending-page receipt retain the full-image path.
+     async fn capture_time_travel_image(&self) -> Result<TimeTravelImage> {
++        self.capture_time_travel_image_with_pages(None).await
++    }
++
++    async fn capture_time_travel_image_with_pages(
++        &self,
++        delta: Option<&TimeTravelCommitPages>,
++    ) -> Result<TimeTravelImage> {
+         let cx = self.op_cx()?;
+         let previous = self
+             .time_travel_snapshots
+@@ -25441,5 +25477,14 @@
+-        let pages = Self::read_time_travel_pages(&cx, &txn, db_size, previous.as_deref()).await;
++        let pager_commit_seq = txn.published_visible_commit_seq_hint();
++        let pager_page_size = txn.page_size();
++        let pages = Self::read_time_travel_pages(
++            &cx,
++            &txn,
++            db_size,
++            previous.as_deref(),
++            delta,
++        )
++        .await;
+         let _ = txn.rollback(&cx).await;
+-        let pages = pages?;
++        let (pages, _page_capture) = pages?;
+ 
+         let pager_tables: Vec<TableSchema> = {
+@@ -25504,4 +25549,8 @@
+         Ok(TimeTravelImage {
+             pages,
++            pager_commit_seq,
++            pager_page_size,
++            #[cfg(test)]
++            page_capture: _page_capture,
+             base,
+             pager_tables,
+@@ -25533,26 +25582,145 @@
++    /// The original Connection/pager handle remains the sole commit owner.
++    /// A capture preparation error must not prevent an otherwise valid commit:
++    /// retain the old full capture behavior instead. Never use the conservative
++    /// MVCC conflict surface here; it may omit synthesized freelist pages.
++    fn pending_time_travel_commit_pages(&self) -> Option<TimeTravelCommitPages> {
++        if self.path != ":memory:"
++            || !self.pager.is_memory()
++            || !self.time_travel_capture_enabled.get()
++        {
++            return None;
++        }
++        let guard = self.active_txn.borrow();
++        let txn = guard.as_ref()?;
++        if !txn.has_pending_writes() {
++            return None;
++        }
++        let before = txn.published_visible_commit_seq_hint()?;
++        let pages = match txn.pending_commit_pages() {
++            Ok(pages) => pages,
++            Err(error) => {
++                tracing::warn!(
++                    target: "fsqlite.time_travel",
++                    %error,
++                    "pending page capture unavailable; retaining full history capture"
++                );
++                return None;
++            }
++        };
++        Some(TimeTravelCommitPages {
++            before,
++            before_size: txn.snapshot_db_size(),
++            page_size: txn.page_size(),
++            pages,
++        })
++    }
++
+     async fn read_time_travel_pages(
+         cx: &Cx,
+         txn: &TransactionKind,
+         db_size: u32,
+         previous: Option<&TimeTravelImage>,
+-    ) -> Result<Vec<PageData>> {
+-        let page_count = usize::try_from(db_size).unwrap_or(usize::MAX);
+-        let mut pages = Vec::with_capacity(page_count);
++        delta: Option<&TimeTravelCommitPages>,
++    ) -> Result<(
++        fsqlite_pager::PersistentPageMap<PageData>,
++        fsqlite_pager::PageImageCaptureStats,
++    )> {
++        if let Some(delta) = delta {
++            let sequence = txn.published_visible_commit_seq_hint().ok_or_else(|| {
++                FrankenError::BusySnapshot {
++                    conflicting_pages: "time-travel capture has no physical commit boundary"
++                        .to_owned(),
++                }
++            })?;
++            // Do not attach a peer's newer bytes to this commit's history.
++            // The caller logs a capture failure WITHOUT failing the already
++            // successful database commit or replaying its SQL.
++            if delta.before.get().checked_add(1) != Some(sequence.get())
++                || delta.page_size != txn.page_size()
++            {
++                return Err(FrankenError::BusySnapshot {
++                    conflicting_pages: "time-travel capture lost its exact commit boundary"
++                        .to_owned(),
++                });
++            }
++            if let Some(previous) = previous
++                && previous.pager_commit_seq == Some(delta.before)
++                && previous.pager_page_size == delta.page_size
++                && previous.pages.len() == delta.before_size as usize
++            {
++                let mut pages = previous.pages.clone();
++                pages.truncate(db_size);
++                let mut changed = delta.pages.clone();
++                if db_size > 0 {
++                    changed.push(PageNumber::ONE);
++                }
++                if db_size > delta.before_size {
++                    for number in delta.before_size + 1..=db_size {
++                        changed.push(PageNumber::new(number).ok_or_else(|| {
++                            FrankenError::internal("invalid time-travel allocation")
++                        })?);
++                    }
++                }
++                changed.sort_unstable();
++                changed.dedup();
++                let mut pages_read = 0;
++                for number in changed {
++                    if number.get() > db_size {
++                        continue;
++                    }
++                    let page = txn.get_page(cx, number).await?;
++                    if page.len() != txn.page_size().as_usize() {
++                        return Err(FrankenError::internal(
++                            "time-travel page geometry changed",
++                        ));
++                    }
++                    pages.insert(number.get(), page);
++                    pages_read += 1;
++                }
++                if pages.len() != db_size as usize {
++                    return Err(FrankenError::internal(
++                        "incomplete incremental time-travel image",
++                    ));
++                }
++                return Ok((
++                    pages,
++                    fsqlite_pager::PageImageCaptureStats {
++                        full_capture: false,
++                        pages_read,
++                    },
++                ));
++            }
++        }
++
++        // First capture, a gap while capture was disabled, or another capture
++        // entry point without a receipt: seed from the complete pinned image.
++        // This must not merge a stale predecessor with only the last write set.
++        let mut pages = fsqlite_pager::PersistentPageMap::new();
++        let mut pages_read = 0;
+         for page_no in 1..=db_size {
+             let Some(page_number) = PageNumber::new(page_no) else {
+                 continue;
+             };
+             let page = txn.get_page(cx, page_number).await?;
+-            let index = pages.len();
++            if page.len() != txn.page_size().as_usize() {
++                return Err(FrankenError::internal("time-travel page geometry changed"));
++            }
+             let shared = previous
+-                .and_then(|image| image.pages.get(index))
++                .and_then(|image| image.pages.get(page_no))
+                 .filter(|prior| {
+                     prior.image_token() == page.image_token()
+                         || prior.as_bytes() == page.as_bytes()
+                 })
+                 .cloned();
+-            pages.push(shared.unwrap_or(page));
++            pages.insert(page_no, shared.unwrap_or(page));
++            pages_read += 1;
+         }
+-        Ok(pages)
++        Ok((
++            pages,
++            fsqlite_pager::PageImageCaptureStats {
++                full_capture: true,
++                pages_read,
++            },
++        ))
+     }
+ 
+@@ -25583,3 +25751,3 @@
+-        let Some(page_one) = image.pages.first() else {
++        let Some(page_one) = image.pages.get(1) else {
+             return Ok(db);
+         };
+@@ -25601,5 +25769,5 @@
+             let (mut file, _) = vfs.open(cx, Some(path), flags)?;
+             let mut offset = 0_u64;
+-            for (index, page) in image.pages.iter().enumerate() {
+-                if index == 0 {
++            for (page_number, page) in image.pages.iter() {
++                if page_number == 1 {
+                     // Normalize the private copy's header. It is read as a
+@@ -75120,3 +75288,9 @@
+         // same spin-loop backoff used in begin_pager_txn_with_busy_timeout().
++        // Sample after all deferred writes/FK/vtab synchronization, before the
++        // original physical commit empties its pending surface. This local
++        // receipt cannot survive as stale Connection state after rollback or
++        // an abandoned future. The original MVCC, retry, settlement and
++        // attached-participant finalizers below remain untouched.
++        let time_travel_commit_pages = self.pending_time_travel_commit_pages();
+         let (committed_write, post_durable_commit_error) = {
+             // Issue #115: the concurrent-commit publication must be a single
+@@ -75500,8 +75674,12 @@
+             // Capture time-travel snapshot AFTER cleanup so the write transaction
+             // handle is fully dropped and the pager can serve its read transaction.
+             let last_local_commit_seq = *self.last_local_commit_seq.borrow();
+             if let Some(committed_seq) = last_local_commit_seq {
+                 self.emit_differential_commit_invalidations(committed_seq);
+                 if self.time_travel_capture_enabled.get() {
+-                    self.capture_time_travel_snapshot(committed_seq.get()).await;
++                    self.capture_time_travel_snapshot_with_pages(
++                        committed_seq.get(),
++                        time_travel_commit_pages.as_ref(),
++                    )
++                    .await;
+                 }
+
+diff --git a/crates/fsqlite-core/src/connection/incremental_time_travel_tests.rs b/crates/fsqlite-core/src/connection/incremental_time_travel_tests.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/fsqlite-core/src/connection/incremental_time_travel_tests.rs
+@@ -0,0 +1,184 @@
++//! GH494 guards for Connection's explicit-COMMIT page-image publication.
++//!
++//! These inspect the production capture's own get_page counter, not an
++//! independently reconstructed write set. They do NOT claim to bound mirror
++//! hydration or total transaction latency; gh494_memory_commit_scaling remains
++//! the full transaction-plus-read gate and must not be relaxed for this change.
++
++#[allow(clippy::wildcard_imports)]
++use super::*;
++
++fn latest(conn: &Connection) -> (u64, Rc<TimeTravelImage>) {
++    let snapshots = conn.time_travel_snapshots.borrow();
++    let snapshot = snapshots.last().expect("committed history");
++    (snapshot.commit_seq, Rc::clone(&snapshot.image))
++}
++
++async fn exec(conn: &Connection, statements: &[&str]) {
++    for statement in statements {
++        conn.execute(statement).await.expect(statement);
++    }
++}
++
++async fn integers(conn: &Connection, sql: &str) -> Vec<Vec<i64>> {
++    conn.query(sql)
++        .await
++        .expect(sql)
++        .iter()
++        .map(|row| {
++            row.values()
++                .iter()
++                .map(|value| match value {
++                    SqliteValue::Integer(value) => *value,
++                    other => panic!("expected integer, found {other:?}: {sql}"),
++                })
++                .collect()
++        })
++        .collect()
++}
++
++async fn grow_resident(conn: &Connection, from: usize, to: usize) {
++    if from == to {
++        return;
++    }
++    let payload = format!("X'{}'", "ab".repeat(4096));
++    conn.execute("BEGIN").await.unwrap();
++    for id in from + 1..=to {
++        conn.execute(&format!("INSERT INTO resident VALUES({id},{payload})"))
++            .await
++            .unwrap();
++    }
++    conn.execute("COMMIT").await.unwrap();
++}
++
++async fn exercise_capture_bound(stages: &[usize], repetitions: i64) {
++    let conn = Connection::open(":memory:".to_owned()).await.unwrap();
++    exec(
++        &conn,
++        &[
++            "CREATE TABLE resident(id INTEGER PRIMARY KEY, payload BLOB NOT NULL)",
++            "CREATE TABLE hot(id INTEGER PRIMARY KEY, value INTEGER NOT NULL)",
++            "BEGIN",
++            "INSERT INTO hot VALUES(1,0)",
++            "COMMIT",
++        ],
++    )
++    .await;
++    let mut resident = 0;
++    let mut value = 0;
++    for &stage in stages {
++        grow_resident(&conn, resident, stage).await;
++        resident = stage;
++        for _ in 0..repetitions {
++            value += 1;
++            let (_, previous) = latest(&conn);
++            conn.execute("BEGIN").await.unwrap();
++            conn.execute(&format!("UPDATE hot SET value={value} WHERE id=1"))
++                .await
++                .unwrap();
++            conn.execute("COMMIT").await.unwrap();
++            let (_, image) = latest(&conn);
++            assert!(!image.page_capture.full_capture, "resident rows={resident}");
++            assert!(image.page_capture.pages_read <= 16, "resident rows={resident}, {:?}", image.page_capture);
++            assert_eq!(previous.pages.len(), image.pages.len());
++            assert_eq!(
++                previous.pager_commit_seq.unwrap().get().checked_add(1),
++                image.pager_commit_seq.map(|sequence| sequence.get())
++            );
++            assert_eq!(integers(&conn, "SELECT value FROM hot WHERE id=1").await, vec![vec![value]]);
++        }
++    }
++    assert_eq!(
++        integers(&conn, "SELECT count(*), coalesce(sum(length(payload)),0) FROM resident").await,
++        vec![vec![resident as i64, resident as i64 * 4096]]
++    );
++}
++
++#[test]
++fn explicit_commit_capture_tracks_pages_not_resident_rows() {
++    asupersync::test_utils::run_test(|| async {
++        exercise_capture_bound(&[0, 16, 64, 256], 3).await;
++    });
++}
++
++#[test]
++#[ignore = "32 MiB release-mode production-capture regression"]
++fn explicit_commit_capture_stays_bounded_through_32_mib() {
++    asupersync::test_utils::run_test(|| async {
++        exercise_capture_bound(&[0, 128, 512, 2048, 8192], 101).await;
++    });
++}
++
++#[test]
++fn incremental_history_preserves_trigger_index_savepoint_and_full_rollback() {
++    asupersync::test_utils::run_test(|| async {
++        let conn = Connection::open(":memory:".to_owned()).await.unwrap();
++        exec(&conn, &[
++            "CREATE TABLE hot(id INTEGER PRIMARY KEY, k INTEGER NOT NULL)",
++            "CREATE UNIQUE INDEX hot_k ON hot(k)",
++            "CREATE TABLE audit(id INTEGER PRIMARY KEY, k INTEGER NOT NULL)",
++            "CREATE TRIGGER hot_audit AFTER UPDATE ON hot BEGIN INSERT INTO audit(k) VALUES(NEW.k); END",
++            "BEGIN", "INSERT INTO hot VALUES(1,10),(2,20)", "COMMIT",
++        ]).await;
++        let (before, old_image) = latest(&conn);
++        exec(&conn, &[
++            "BEGIN", "UPDATE hot SET k=30 WHERE id=1", "SAVEPOINT nested",
++            "UPDATE hot SET k=99 WHERE id=1", "DELETE FROM hot WHERE id=2",
++            "ROLLBACK TO nested", "RELEASE nested", "COMMIT",
++        ]).await;
++        let (after, image) = latest(&conn);
++        assert!(!image.page_capture.full_capture);
++        assert_eq!(integers(&conn, "SELECT id,k FROM hot INDEXED BY hot_k ORDER BY k").await,
++                   vec![vec![2,20],vec![1,30]]);
++        assert_eq!(integers(&conn, "SELECT k FROM audit ORDER BY id").await, vec![vec![30]]);
++        assert_eq!(integers(&conn, &format!(
++            "SELECT id,k FROM hot FOR SYSTEM_TIME AS OF COMMITSEQ {before} ORDER BY id"
++        )).await, vec![vec![1,10],vec![2,20]]);
++        assert_eq!(integers(&conn, &format!(
++            "SELECT k FROM audit FOR SYSTEM_TIME AS OF COMMITSEQ {after} ORDER BY id"
++        )).await, vec![vec![30]]);
++
++        exec(&conn, &["BEGIN", "UPDATE hot SET k=50 WHERE id=1", "ROLLBACK"]).await;
++        let (unchanged, _) = latest(&conn);
++        assert_eq!(unchanged, after, "rollback must not publish a new history entry");
++        assert_eq!(integers(&conn, "SELECT id,k FROM hot INDEXED BY hot_k ORDER BY k").await,
++                   vec![vec![2,20],vec![1,30]]);
++        assert_eq!(integers(&conn, "SELECT k FROM audit ORDER BY id").await, vec![vec![30]]);
++        // Read an old snapshot again after both a commit and rollback; the
++        // shared directory must not have been mutated in place.
++        let historical = conn.materialize_time_travel_image(&conn.op_cx().unwrap(), &old_image)
++            .await.expect("historical image still decodes");
++        drop(historical);
++        assert_eq!(integers(&conn, &format!(
++            "SELECT id,k FROM hot FOR SYSTEM_TIME AS OF COMMITSEQ {before} ORDER BY id"
++        )).await, vec![vec![1,10],vec![2,20]]);
++    });
++}
++
++#[test]
++fn disabled_capture_gap_is_reseeded_instead_of_losing_unobserved_writes() {
++    asupersync::test_utils::run_test(|| async {
++        let conn = Connection::open(":memory:".to_owned()).await.unwrap();
++        exec(&conn, &[
++            "CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER)",
++            "BEGIN", "INSERT INTO t VALUES(1,10)", "COMMIT",
++        ]).await;
++        let (old, _) = latest(&conn);
++        exec(&conn, &[
++            "PRAGMA fsqlite_capture_time_travel_snapshots=false",
++            "BEGIN", "INSERT INTO t VALUES(2,20)", "COMMIT",
++        ]).await;
++        assert_eq!(latest(&conn).0, old);
++        exec(&conn, &[
++            "PRAGMA fsqlite_capture_time_travel_snapshots=true",
++            "BEGIN", "UPDATE t SET k=30 WHERE id=1", "COMMIT",
++        ]).await;
++        let (now, image) = latest(&conn);
++        assert!(image.page_capture.full_capture, "the unobserved commit has no delta receipt");
++        assert_eq!(integers(&conn, &format!(
++            "SELECT id,k FROM t FOR SYSTEM_TIME AS OF COMMITSEQ {now} ORDER BY id"
++        )).await, vec![vec![1,30],vec![2,20]]);
++        exec(&conn, &["BEGIN", "UPDATE t SET k=40 WHERE id=1", "COMMIT"]).await;
++        assert!(!latest(&conn).1.page_capture.full_capture);
++    });
++}
