@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use asupersync::runtime::RuntimeBuilder;
 use fsqlite_error::{FrankenError, Result};
-use fsqlite_harness::fault_vfs::{FaultInjectingVfs, FaultSpec};
+use fsqlite_harness::fault_vfs::{FaultInjectingVfs, FaultKind, FaultSpec};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::VfsOpenFlags;
 use fsqlite_types::{
@@ -143,6 +143,16 @@ fn validate(
         }
     }
     Ok(())
+}
+
+fn assert_power_cut<V: Vfs>(vfs: &FaultInjectingVfs<V>, path: &str, sync_index: u32) {
+    assert!(vfs.is_powered_off());
+    assert_eq!(vfs.sync_count(), sync_index + 1);
+    let faults = vfs.triggered_faults();
+    assert_eq!(faults.len(), 1, "the intended barrier must actually fail");
+    assert_eq!(faults[0].path, Path::new(path));
+    assert_eq!(faults[0].kind, FaultKind::PowerCut);
+    assert_eq!(faults[0].detail, format!("operation=sync index={sync_index}"));
 }
 
 #[test]
@@ -383,7 +393,7 @@ fn failed_proof_append_latches_recovery_and_never_completes_the_writer() {
 #[test]
 fn either_sync_failure_blocks_new_commits_but_preserves_earlier_replies() {
     run(async {
-        for (path, advance) in [("objects", 1), ("markers", 2)] {
+        for (path, barrier_offset) in [("objects", 0), ("markers", 1)] {
             let cx = Cx::new();
             let vfs = FaultInjectingVfs::new(MemoryVfs::new());
             let mut coordinator = driver(&vfs, &cx, 8);
@@ -392,25 +402,38 @@ fn either_sync_failure_blocks_new_commits_but_preserves_earlier_replies() {
             coordinator.flush(&cx, validate).await.unwrap();
             stage(&mut coordinator, &cx, 2, 2).await;
             coordinator.queue(&cx, submission(2, 2, 1), 200).unwrap();
-            vfs.inject_fault(
-                FaultSpec::power_cut(path)
-                    .after_nth_sync(vfs.sync_count() + advance)
-                    .build(),
-            );
-            assert!(coordinator.flush(&cx, validate).await.is_err());
-            assert!(vfs.is_powered_off());
+            // GH#508: the earlier publication consumed global indices 0/1.
+            let syncs_before = vfs.sync_count();
+            assert_eq!(syncs_before, 2);
+            let sync_index = syncs_before + barrier_offset;
+            vfs.inject_fault(FaultSpec::power_cut(path).after_nth_sync(sync_index).build());
+            assert!(matches!(
+                coordinator.flush(&cx, validate).await,
+                Err(FrankenError::Io(_))
+            ));
+            assert_power_cut(&vfs, path, sync_index);
+            assert!(coordinator.needs_recovery());
+            assert_eq!(coordinator.pending_count(), 2);
             assert_eq!(coordinator.committed_tip(), CommitSeq::new(1));
             assert!(coordinator.take_committed(CommitSeq::new(2)).is_none());
-            assert_eq!(
-                coordinator
-                    .take_committed(CommitSeq::new(1))
-                    .unwrap()
-                    .txn_token,
-                submission(1, 1, 0).txn_token
-            );
+            let earlier = coordinator.take_committed(CommitSeq::new(1)).unwrap();
+            assert_eq!(earlier.txn_token, submission(1, 1, 0).txn_token);
+            assert_eq!(earlier.commit_seq, CommitSeq::new(1));
+            assert_eq!(earlier.capsule_object_id, submission(1, 1, 0).capsule_object_id);
+            assert_eq!(coordinator.pending_count(), 1);
             vfs.power_on();
-            assert!(coordinator.flush(&cx, validate).await.is_err());
+            assert!(matches!(
+                coordinator.flush(&cx, validate).await,
+                Err(FrankenError::BusyRecovery)
+            ));
+            assert!(matches!(
+                coordinator.queue(&cx, submission(3, 3, 1), 300),
+                Err(DurableCommitError::Failure(FrankenError::BusyRecovery))
+            ));
+            assert!(coordinator.take_committed(CommitSeq::new(1)).is_none());
+            assert!(coordinator.take_committed(CommitSeq::new(2)).is_none());
             coordinator.close(&cx).unwrap();
+            assert_eq!(vfs.sync_count(), sync_index + 1, "no implicit retry");
         }
     });
 }
@@ -499,11 +522,24 @@ fn driver_recovery_reconciles_an_unacknowledged_marker_sync() {
         let mut original = driver(&vfs, &cx, 8);
         stage(&mut original, &cx, 9, 1).await;
         original.queue(&cx, submission(9, 1, 0), 100).unwrap();
-        vfs.inject_fault(FaultSpec::power_cut("markers").after_nth_sync(2).build());
-        assert!(original.flush(&cx, validate).await.is_err());
+        assert_eq!(vfs.sync_count(), 0);
+        vfs.inject_fault(FaultSpec::power_cut("markers").after_nth_sync(1).build());
+        assert!(matches!(
+            original.flush(&cx, validate).await,
+            Err(FrankenError::Io(_))
+        ));
+        assert_power_cut(&vfs, "markers", 1);
+        assert!(original.needs_recovery());
+        assert_eq!(original.committed_tip(), CommitSeq::ZERO);
+        assert_eq!(original.pending_count(), 1);
         assert!(original.take_committed(CommitSeq::new(1)).is_none());
         vfs.power_on();
+        assert!(matches!(
+            original.flush(&cx, validate).await,
+            Err(FrankenError::BusyRecovery)
+        ));
         original.close(&cx).unwrap();
+        assert_eq!(vfs.sync_count(), 2, "close is not recovery");
         let (mut recovered, report) = DurableWriteCoordinator::recover(
             &cx,
             open(&vfs, &cx, "objects"),
@@ -515,9 +551,11 @@ fn driver_recovery_reconciles_an_unacknowledged_marker_sync() {
         )
         .await
         .unwrap();
+        assert_eq!(vfs.sync_count(), 4, "only explicit recovery resynchronizes");
         assert_eq!(report.markers.len(), 1);
         assert_eq!(recovered.committed_tip(), CommitSeq::new(1));
         assert!(!recovered.needs_recovery());
+        assert!(recovered.take_committed(CommitSeq::new(1)).is_none());
         assert!(matches!(
             recovered.queue(&cx, submission(9, 2, 0), 200),
             Err(DurableCommitError::Rejected(
