@@ -374,7 +374,7 @@ mod tests {
         let mut actual = [0xCD_u8; 11];
         // Deliberately pass only the exact space available for this cell's
         // varint; compare the whole buffer to protect both neighboring cells.
-        let written = write_varint(&mut actual[1..1 + len], value);
+        let written = write_varint(&mut actual[1..=len], value);
         assert_eq!(written, len, "encoded length for {value}");
         assert_eq!(actual, expected, "encoded bytes and sentinels for {value}");
     }
