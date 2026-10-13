@@ -2,6 +2,8 @@ name: GH510 WAL savepoint correctness
 
 on:
   workflow_dispatch:
+  issue_comment:
+    types: [created]
   push:
     branches: [main]
     paths:
@@ -21,6 +23,7 @@ concurrency:
 
 jobs:
   correctness:
+    if: ${{ github.event_name != 'issue_comment' }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
@@ -68,9 +71,10 @@ jobs:
           cargo test --locked -p fsqlite-wal -p fsqlite-pager -p fsqlite-mvcc \
             --lib -- --nocapture --test-threads=1 \
             2>&1 | tee "$RUNNER_TEMP/gh510/storage-tests.log"
-          status=${PIPESTATUS[0]}
-          printf '%s\n' "$status" > "$RUNNER_TEMP/gh510/storage-tests.exit"
-          exit "$status"
+          statuses=("${PIPESTATUS[@]}")
+          printf '%s\n' "${statuses[0]}" > "$RUNNER_TEMP/gh510/storage-tests.exit"
+          test "${statuses[1]}" -eq 0 || exit "${statuses[1]}"
+          exit "${statuses[0]}"
       - name: Indexed savepoint rollback versus stock SQLite
         if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         shell: bash
@@ -79,9 +83,10 @@ jobs:
           cargo test --locked -p fsqlite-core --test issue_491_bulk_insert \
             -- --nocapture --test-threads=1 \
             2>&1 | tee "$RUNNER_TEMP/gh510/sql-oracle.log"
-          status=${PIPESTATUS[0]}
-          printf '%s\n' "$status" > "$RUNNER_TEMP/gh510/sql-oracle.exit"
-          exit "$status"
+          statuses=("${PIPESTATUS[@]}")
+          printf '%s\n' "${statuses[0]}" > "$RUNNER_TEMP/gh510/sql-oracle.exit"
+          test "${statuses[1]}" -eq 0 || exit "${statuses[1]}"
+          exit "${statuses[0]}"
       - name: Check that validation did not rewrite the source
         if: ${{ !cancelled() }}
         shell: bash
@@ -96,4 +101,284 @@ jobs:
             ${{ runner.temp }}/gh510/*.log
             ${{ runner.temp }}/gh510/*.exit
             ${{ runner.temp }}/gh510/*.sha256
+          if-no-files-found: warn
+
+  # This is an explicitly invoked, source-pinned repair, not an automatic
+  # modifier for ordinary pushes. Never check out an issue/PR-supplied ref.
+  apply_verified_repair:
+    if: >-
+      github.event_name == 'issue_comment' &&
+      github.repository == 'Dicklesworthstone/frankensqlite' &&
+      github.event.issue.number == 510 &&
+      !github.event.issue.pull_request &&
+      github.event.issue.state == 'open' &&
+      github.event.comment.user.login == github.repository_owner &&
+      github.event.comment.body == '/gh510 apply-quarantine-fix 00acd5aa290da66fb17fd3f08b917f4a91900c53'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      RUST_BACKTRACE: '1'
+      TARGET: crates/fsqlite-pager/src/pager.rs
+      TEST_TARGET: crates/fsqlite-core/tests/issue_491_bulk_insert.rs
+      EXPECTED_PAGER: 00acd5aa290da66fb17fd3f08b917f4a91900c53
+      EXPECTED_TESTS: e2bf81c8f0246b8bb3903cb4c4ad87a9c9be2d33
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: true
+      - name: Pin the complete source and regression controls
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/gh510-repair"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          test "$(git rev-parse "HEAD:$TARGET")" = "$EXPECTED_PAGER"
+          test "$(git rev-parse "HEAD:$TEST_TARGET")" = "$EXPECTED_TESTS"
+          git rev-parse HEAD | tee "$RUNNER_TEMP/gh510-repair/base.txt"
+          git show "HEAD:$TARGET" > "$RUNNER_TEMP/gh510-repair/pager-before.rs"
+          git show "HEAD:$TEST_TARGET" > "$RUNNER_TEMP/gh510-repair/oracle.rs"
+          sha256sum Cargo.lock > "$RUNNER_TEMP/gh510-repair/lockfile.sha256"
+      - name: Install pinned toolchain and logged-command helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain="$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')"
+          rustup toolchain install "$toolchain" --profile minimal --component rustfmt --component clippy
+          rustc --version --verbose | tee "$RUNNER_TEMP/gh510-repair/rustc.txt"
+          cargo --version | tee "$RUNNER_TEMP/gh510-repair/cargo.txt"
+          cat > "$RUNNER_TEMP/gh510-repair/run-command" <<'SH'
+          #!/usr/bin/env bash
+          set -uo pipefail
+          name=$1
+          shift
+          "$@" 2>&1 | tee "$RUNNER_TEMP/gh510-repair/$name.log"
+          statuses=("${PIPESTATUS[@]}")
+          printf '%s\n' "${statuses[0]}" > "$RUNNER_TEMP/gh510-repair/$name.exit"
+          test "${statuses[1]}" -eq 0 || exit "${statuses[1]}"
+          exit "${statuses[0]}"
+          SH
+      - name: Require an executed failing baseline, not a build failure
+        id: baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          runner="$RUNNER_TEMP/gh510-repair/run-command"
+          status=0
+          bash "$runner" baseline-allocator cargo test --locked -p fsqlite-core \
+            --test issue_491_bulk_insert \
+            pager_quarantine::wal_quarantine_clean_commit_returns_committed_free_page \
+            -- --exact --nocapture --test-threads=1 || status=$?
+          test "$status" -eq 101
+          grep -F 'test result: FAILED. 0 passed; 1 failed; 0 ignored;' "$RUNNER_TEMP/gh510-repair/baseline-allocator.log"
+          grep -F 'assertion' "$RUNNER_TEMP/gh510-repair/baseline-allocator.log"
+          status=0
+          bash "$runner" baseline-sql cargo test --locked -p fsqlite-core \
+            --test issue_491_bulk_insert indexed_insert_select_wal_file_matches_stock \
+            -- --exact --nocapture --test-threads=1 || status=$?
+          test "$status" -eq 101
+          grep -F 'test result: FAILED. 0 passed; 1 failed; 0 ignored;' "$RUNNER_TEMP/gh510-repair/baseline-sql.log"
+          grep -F 'database is busy (snapshot conflict on pages:' "$RUNNER_TEMP/gh510-repair/baseline-sql.log"
+          git diff --exit-code
+      - name: Apply the reviewed allocator-only patch
+        id: patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git hash-object "$TARGET")" = "$EXPECTED_PAGER"
+          cat > "$RUNNER_TEMP/gh510-repair/repair.patch" <<'PATCH'
+          diff --git a/crates/fsqlite-pager/src/pager.rs b/crates/fsqlite-pager/src/pager.rs
+          --- a/crates/fsqlite-pager/src/pager.rs
+          +++ b/crates/fsqlite-pager/src/pager.rs
+          @@ -22745,7 +22745,12 @@
+                   inner: &mut PagerInner<V::File>,
+               ) {
+                   return_pages_to_freelist(&mut inner.freelist, self.allocated_from_freelist.drain(..));
+          +        restore_quarantined_durable_freelist_pages(
+          +            &mut inner.freelist,
+          +            &mut self.savepoint_quarantined_allocations,
+          +            &self.allocated_from_durable_freelist,
+          +        );
+                   self.allocated_from_durable_freelist.clear();
+           
+                   if self.mode == TransactionMode::Concurrent {
+                       if self.journal_mode == JournalMode::Wal {
+          @@ -22830,6 +22835,28 @@
+               }
+           }
+           
+          +/// Return committed-free reservations only when their transaction is ending.
+          +/// ROLLBACK TO must keep these pages private while its outer transaction lives.
+          +/// They are not abandoned EOF holes: a durable freelist page can have a WAL
+          +/// frame, so the abandoned-EOF fold would discard it instead of restoring the
+          +/// unchanged freelist. That leaves the next writer's projection incomplete.
+          +fn restore_quarantined_durable_freelist_pages(
+          +    freelist: &mut Vec<PageNumber>,
+          +    quarantined: &mut Vec<PageNumber>,
+          +    durable_origins: &HashSet<u32>,
+          +) {
+          +    return_pages_to_freelist(
+          +        freelist,
+          +        quarantined
+          +            .iter()
+          +            .copied()
+          +            .filter(|page| durable_origins.contains(&page.get())),
+          +    );
+          +    // Preserve never-committed EOF reservations for the existing abandonment
+          +    // path; they still need its peer-claim and generation-boundary checks.
+          +    quarantined.retain(|page| !durable_origins.contains(&page.get()));
+          +}
+          +
+           fn cleanup_child_cx(cx: &Cx) -> Cx {
+               cx.create_child()
+           }
+          @@ -26247,7 +26274,14 @@
+                       // transaction is the only re-grant that cannot alias.
+                       if let Some(page) = self.savepoint_quarantined_allocations.pop() {
+          -                self.allocated_from_eof.push(page);
+          +                // Preserve the original committed-freelist provenance. Both
+          +                // terminal cleanup and the WAL double-consumption guard need
+          +                // it even when the page was re-granted after ROLLBACK TO.
+          +                if self.allocated_from_durable_freelist.contains(&page.get()) {
+          +                    self.allocated_from_freelist.push(page);
+          +                } else {
+          +                    self.allocated_from_eof.push(page);
+          +                }
+                           alloc_ledger(
+                               std::ptr::from_ref(self) as usize,
+                               "alloc_quarantine",
+                               page.get(),
+          @@ -28587,6 +28621,11 @@
+                               &mut inner.freelist,
+                               self.allocated_from_freelist.drain(..),
+                           );
+          +                restore_quarantined_durable_freelist_pages(
+          +                    &mut inner.freelist,
+          +                    &mut self.savepoint_quarantined_allocations,
+          +                    &self.allocated_from_durable_freelist,
+          +                );
+                           self.allocated_from_durable_freelist.clear();
+           
+                           if self.is_writer && self.mode != TransactionMode::Concurrent {
+          @@ -29057,6 +29096,11 @@
+                   } else {
+                       // Ordinary uncommitted drop: restore freelist allocations.
+                       return_pages_to_freelist(&mut inner.freelist, self.allocated_from_freelist.drain(..));
+          +            restore_quarantined_durable_freelist_pages(
+          +                &mut inner.freelist,
+          +                &mut self.savepoint_quarantined_allocations,
+          +                &self.allocated_from_durable_freelist,
+          +            );
+                       self.allocated_from_durable_freelist.clear();
+           
+                       if self.is_writer && self.mode != TransactionMode::Concurrent {
+          PATCH
+          git apply --check "$RUNNER_TEMP/gh510-repair/repair.patch"
+          git apply "$RUNNER_TEMP/gh510-repair/repair.patch"
+          git diff --check
+          test "$(git diff --name-only)" = "$TARGET"
+          test "$(git hash-object "$TEST_TARGET")" = "$EXPECTED_TESTS"
+          git diff -- "$TARGET" > "$RUNNER_TEMP/gh510-repair/applied.diff"
+          cp "$TARGET" "$RUNNER_TEMP/gh510-repair/pager-after.rs"
+      - name: Require all SQL, allocator, index and genuine-conflict controls
+        id: oracle
+        if: ${{ !cancelled() && steps.patch.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash "$RUNNER_TEMP/gh510-repair/run-command" fixed-oracle \
+            cargo test --locked -p fsqlite-core --test issue_491_bulk_insert \
+            -- --nocapture --test-threads=1
+          grep -F 'test result: ok. 10 passed; 0 failed; 0 ignored;' "$RUNNER_TEMP/gh510-repair/fixed-oracle.log"
+      - name: Require WAL, pager and MVCC library suites
+        id: storage
+        if: ${{ !cancelled() && steps.patch.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash "$RUNNER_TEMP/gh510-repair/run-command" fixed-storage \
+            cargo test --locked -p fsqlite-wal -p fsqlite-pager -p fsqlite-mvcc \
+            --lib -- --nocapture --test-threads=1
+      - name: Require workspace compilation
+        id: check
+        if: ${{ !cancelled() && steps.patch.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash "$RUNNER_TEMP/gh510-repair/run-command" fixed-check \
+            cargo check --locked --workspace --all-targets
+      - name: Require Clippy without allowing warnings
+        id: clippy
+        if: ${{ !cancelled() && steps.patch.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash "$RUNNER_TEMP/gh510-repair/run-command" fixed-clippy \
+            cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Require repository formatting checks
+        id: format
+        if: ${{ !cancelled() && steps.patch.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash "$RUNNER_TEMP/gh510-repair/run-command" fixed-format cargo fmt --all -- --check
+      - name: Commit only the verified pager repair directly to main
+        if: >-
+          success() &&
+          steps.baseline.outcome == 'success' &&
+          steps.patch.outcome == 'success' &&
+          steps.oracle.outcome == 'success' &&
+          steps.storage.outcome == 'success' &&
+          steps.check.outcome == 'success' &&
+          steps.clippy.outcome == 'success' &&
+          steps.format.outcome == 'success'
+        shell: bash
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          base="$(cat "$RUNNER_TEMP/gh510-repair/base.txt")"
+          test "$(git rev-parse HEAD)" = "$base"
+          test "$(git ls-remote origin refs/heads/main | cut -f1)" = "$base"
+          test "$(git diff --name-only)" = "$TARGET"
+          test -z "$(git diff --cached --name-only)"
+          test -z "$(git ls-files --others --exclude-standard)"
+          test "$(git hash-object "$TEST_TARGET")" = "$EXPECTED_TESTS"
+          git diff --check
+          cat > "$RUNNER_TEMP/gh510-repair/message.txt" <<EOF
+          fix(pager): preserve durable freelist origin through savepoint rollback
+
+          Return quarantined committed-free pages at clean commit, rollback and
+          Drop before retiring provenance. Keep re-grants on their original
+          committed-freelist consumption path. Leave snapshot validation and
+          fresh-EOF abandonment checks unchanged.
+
+          Verified against base $base: executed red allocator and SQL baselines,
+          then all ten indexed/savepoint/allocator/conflict controls and the WAL,
+          pager and MVCC library suites passed with this patch. Workspace check,
+          Clippy -D warnings and formatting checks also passed.
+          Evidence: $RUN_URL
+          Refs #510.
+          EOF
+          git add -- "$TARGET"
+          git -c user.name='github-actions[bot]' \
+            -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            commit -F "$RUNNER_TEMP/gh510-repair/message.txt"
+          # No force, rebase, merge or PR: concurrent main changes reject this
+          # push. Revalidation on a newly checked-out main requires another run.
+          git push origin HEAD:refs/heads/main
+          git rev-parse HEAD | tee "$RUNNER_TEMP/gh510-repair/published-commit.txt"
+      - name: Preserve repair evidence even when compilation or checks fail
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gh510-repair-${{ github.run_id }}
+          path: ${{ runner.temp }}/gh510-repair/
           if-no-files-found: warn
