@@ -80,13 +80,86 @@ async fn rejected_statement(db: &Connection, stock: &Stock, sql: &str) {
     assert_all(db, stock).await;
 }
 
+// GH#510: use separate autocommit statements, not one multi-row statement.
+// These primary/unique keys were present in the discarded bulk insert, so the
+// writes also detect secondary-index entries left behind by partial rollback.
+async fn post_rollback_writes(db: &Connection, stock: &Stock, first: i64) {
+    for key in first..first + 8 {
+        execute_both(
+            db,
+            stock,
+            &format!("INSERT INTO t VALUES({key},8,{})", key + 30000),
+        )
+        .await;
+        assert_all(db, stock).await;
+    }
+}
+
+async fn nested_rollback_oracle(db: &Connection, stock: &Stock) {
+    let before = stock_rows(stock, CHECKS[0]);
+    for sql in [
+        "BEGIN",
+        "INSERT INTO t VALUES(50000,8,90000)",
+        "SAVEPOINT outer_copy",
+        "INSERT INTO t SELECT value+50000,value%17,value+90000 FROM source WHERE value<=100",
+        "SAVEPOINT inner_copy",
+        "INSERT INTO t VALUES(60000,8,100000)",
+        "ROLLBACK TO outer_copy",
+    ] {
+        execute_both(db, stock, sql).await;
+    }
+    assert_all(db, stock).await;
+    // ROLLBACK TO discards younger markers but retains its own marker.
+    assert!(stock.execute_batch("RELEASE inner_copy").is_err());
+    assert!(db.execute("RELEASE inner_copy").await.is_err());
+    for sql in [
+        "INSERT INTO t VALUES(50001,8,90001)",
+        "ROLLBACK TO outer_copy",
+        "RELEASE outer_copy",
+        "INSERT INTO t VALUES(50002,8,90002)",
+    ] {
+        execute_both(db, stock, sql).await;
+        assert_all(db, stock).await;
+    }
+    // RELEASE inside BEGIN must not commit the outer transaction. The earlier
+    // row and the successful post-RELEASE write must both disappear here.
+    execute_both(db, stock, "ROLLBACK").await;
+    assert_eq!(stock_rows(stock, CHECKS[0]), before);
+    assert_all(db, stock).await;
+
+    // The innermost matching name wins; releasing it must reveal the older
+    // marker rather than committing or discarding both same-named markers.
+    for sql in [
+        "SAVEPOINT repeated",
+        "INSERT INTO t VALUES(50000,8,90000)",
+        "SAVEPOINT repeated",
+        "INSERT INTO t VALUES(50001,8,90001)",
+        "ROLLBACK TO repeated",
+        "RELEASE repeated",
+        "ROLLBACK TO repeated",
+        "RELEASE repeated",
+    ] {
+        execute_both(db, stock, sql).await;
+        assert_all(db, stock).await;
+    }
+    assert_eq!(stock_rows(stock, CHECKS[0]), before);
+}
+
 async fn indexed_insert_oracle(path: Option<&Path>) {
     let name = path.map_or_else(|| ":memory:".to_owned(), |p| p.to_string_lossy().into_owned());
     let db = Connection::open(&name).await.unwrap();
-    let stock = Stock::open_in_memory().unwrap();
+    let stock = match path {
+        Some(path) => Stock::open(path.with_extension("stock.db")).unwrap(),
+        None => Stock::open_in_memory().unwrap(),
+    };
     if path.is_some() {
         // Do not turn off concurrency, fsync, or the WAL to obtain a faster run.
         db.execute("PRAGMA journal_mode=WAL").await.unwrap();
+        stock.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+        assert_eq!(
+            stock.query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0)).unwrap(),
+            "wal",
+        );
     }
     for sql in [
         "CREATE TABLE source(value INTEGER PRIMARY KEY)",
@@ -135,6 +208,11 @@ async fn indexed_insert_oracle(path: Option<&Path>) {
     execute_both(&db, &stock, "ROLLBACK TO bulk").await;
     execute_both(&db, &stock, "RELEASE bulk").await;
     assert_all(&db, &stock).await;
+    post_rollback_writes(&db, &stock, 10001).await;
+    // Reusing rolled-back entries must not disable enforcement for entries
+    // that really committed, in either the primary or unique secondary index.
+    rejected_statement(&db, &stock, "INSERT INTO t VALUES(10001,8,999000)").await;
+    rejected_statement(&db, &stock, "INSERT INTO t VALUES(999000,8,40001)").await;
     execute_both(&db, &stock,
         "INSERT OR IGNORE INTO t SELECT CASE WHEN value<=10 THEN value ELSE value+20000 END,value%17,value+60000 FROM source WHERE value<=20",
     ).await;
@@ -143,9 +221,17 @@ async fn indexed_insert_oracle(path: Option<&Path>) {
     // a=2. REPLACE must remove both old rows and every old secondary entry.
     execute_both(&db, &stock, "INSERT OR REPLACE INTO t VALUES(1,11,9998)").await;
     assert_all(&db, &stock).await;
-    assert_eq!(stock_rows(&stock, "SELECT count(*) FROM t"), vec![vec![Some(4108)]]);
+    assert_eq!(stock_rows(&stock, "SELECT count(*) FROM t"), vec![vec![Some(4116)]]);
+    nested_rollback_oracle(&db, &stock).await;
 
     if let Some(path) = path {
+        // First reopen without an explicit checkpoint: continued writes must
+        // not depend on the old connection's cache or an explicit repair step.
+        // Connection close may itself checkpoint; this is not a crash test.
+        drop(db);
+        let db = Connection::open(&name).await.unwrap();
+        assert_all(&db, &stock).await;
+        post_rollback_writes(&db, &stock, 10009).await;
         let checkpoint = db.query("PRAGMA wal_checkpoint(TRUNCATE)").await.unwrap();
         assert_eq!(checkpoint.len(), 1);
         assert!(matches!(checkpoint[0].values().first(), Some(SqliteValue::Integer(0))));
@@ -202,5 +288,69 @@ fn int_primary_key_is_not_an_integer_primary_key_alias() {
             vec![vec![Some(1), Some(42)], vec![Some(2), None], vec![Some(3), None]]);
         assert_eq!(stock_rows(&stock, "SELECT rowid,a FROM aliased ORDER BY rowid"),
             vec![vec![Some(42), Some(42)], vec![Some(43), Some(43)], vec![Some(44), Some(44)]]);
+    });
+}
+
+// A rollback-local repair must not upgrade an outer transaction's snapshot or
+// turn off first-committer-wins validation. The peer is finished before the
+// stale writer tries to publish, so this is not ordinary lock contention.
+#[test]
+fn wal_savepoint_rollback_keeps_real_same_page_write_conflicts() {
+    asupersync::test_utils::run_test(|| async {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("issue510_conflict.db");
+        let name = path.to_string_lossy().into_owned();
+        let stock_path = directory.path().join("issue510_conflict.stock.db");
+        let db = Connection::open(&name).await.unwrap();
+        let stock = Stock::open(&stock_path).unwrap();
+        for sql in [
+            "PRAGMA journal_mode=WAL",
+            "CREATE TABLE conflict_guard(id INTEGER PRIMARY KEY, value INTEGER)",
+            "INSERT INTO conflict_guard VALUES(1,0),(2,0)",
+        ] {
+            execute_both(&db, &stock, sql).await;
+        }
+        let peer = Connection::open(&name).await.unwrap();
+        let stock_peer = Stock::open(&stock_path).unwrap();
+        execute_both(&db, &stock, "BEGIN").await;
+        execute_both(&db, &stock, "SAVEPOINT observed").await;
+        let read = "SELECT id,value FROM conflict_guard ORDER BY id";
+        assert_rows(&db, &stock, read).await;
+        execute_both(&db, &stock, "ROLLBACK TO observed").await;
+        execute_both(&db, &stock, "RELEASE observed").await;
+        execute_both(
+            &peer,
+            &stock_peer,
+            "UPDATE conflict_guard SET value=1 WHERE id=1",
+        )
+        .await;
+        // RELEASE nested in BEGIN must leave both old snapshots pinned.
+        assert_eq!(stock_rows(&stock, read), vec![vec![Some(1), Some(0)], vec![Some(2), Some(0)]]);
+        assert_rows(&db, &stock, read).await;
+        let update = "UPDATE conflict_guard SET value=2 WHERE id=1";
+        let stock_error = stock.execute_batch(update).expect_err("stale SQLite writer must fail");
+        match stock_error {
+            rusqlite::Error::SqliteFailure(error, _) => {
+                assert_eq!(error.extended_code, rusqlite::ffi::SQLITE_BUSY_SNAPSHOT);
+            }
+            other => panic!("unexpected SQLite conflict error: {other}"),
+        }
+        // FrankenSQLite may validate at statement execution or at COMMIT.
+        let error = match db.execute(update).await {
+            Err(error) => error,
+            Ok(_) => db.execute("COMMIT").await.expect_err("stale writer must not commit"),
+        };
+        assert!(
+            matches!(
+                error,
+                fsqlite_error::FrankenError::BusySnapshot { .. }
+                    | fsqlite_error::FrankenError::SerializationFailure { .. }
+            ),
+            "expected a real snapshot/serialization conflict, got {error}",
+        );
+        execute_both(&db, &stock, "ROLLBACK").await;
+        assert_rows(&db, &stock, read).await;
+        execute_both(&db, &stock, update).await;
+        assert_rows(&db, &stock, read).await;
     });
 }
