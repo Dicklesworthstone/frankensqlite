@@ -35,6 +35,8 @@ struct Audit {
     // One-based attempt ordinal across BOTH streams; never reset on reopen.
     error_after_attempt: Option<usize>,
     failures: Vec<(&'static str, usize)>,
+    cancel_after_attempt: Option<usize>,
+    cancellations: Vec<(&'static str, usize)>,
 }
 
 type Trace = Arc<Mutex<Audit>>;
@@ -107,18 +109,32 @@ impl SyncErrorFile {
         audit.attempts
     }
 
-    fn finish_sync(&self, attempt: usize) -> Result<()> {
-        let fail = {
+    fn finish_sync(&self, cx: &Cx, attempt: usize) -> Result<()> {
+        let (fail, cancel) = {
             let mut audit = self.trace.lock().unwrap();
             audit.inner_successes += 1;
-            if audit.error_after_attempt == Some(attempt) {
+            let fail = if audit.error_after_attempt == Some(attempt) {
                 audit.error_after_attempt = None;
                 audit.failures.push((self.stream, attempt));
                 true
             } else {
                 false
-            }
+            };
+            let cancel = if audit.cancel_after_attempt == Some(attempt) {
+                audit.cancel_after_attempt = None;
+                audit.cancellations.push((self.stream, attempt));
+                true
+            } else {
+                false
+            };
+            (fail, cancel)
         };
+        // Cancellation invokes wakers. Never call it under the audit mutex.
+        // New cancellation cases attach an independent worker context so this
+        // cannot cancel the producer, cleanup, or test runtime's context.
+        if cancel {
+            cx.cancel();
+        }
         if fail {
             Err(FrankenError::Io(std::io::Error::other(REPORTED_ERROR)))
         } else {
@@ -163,12 +179,12 @@ impl VfsFile for SyncErrorFile {
     fn sync(&mut self, cx: &Cx, flags: SyncFlags) -> Result<()> {
         let attempt = self.start_sync("sync");
         self.inner.sync(cx, flags)?;
-        self.finish_sync(attempt)
+        self.finish_sync(cx, attempt)
     }
     fn durable_sync(&mut self, cx: &Cx, kind: SyncKind) -> Result<()> {
         let attempt = self.start_sync("durable_sync");
         self.inner.durable_sync(cx, kind)?;
-        self.finish_sync(attempt)
+        self.finish_sync(cx, attempt)
     }
     fn file_size(&self, cx: &Cx) -> Result<u64> {
         self.record("file_size");
@@ -431,7 +447,162 @@ fn reported_markers_error_preserves_prior_split_member() {
 }
 
 async fn check_service(case: Scenario, marker_barrier: bool) {
+    check_service_stop(case, marker_barrier, false).await;
+}
+
+#[test]
+fn cancellation_after_committed_group_seals_replies_and_preserves_queued_work() {
+    run(check_cancelled_publication(false));
+}
+
+#[test]
+fn cancellation_after_committed_split_member_preserves_all_unattempted_handles() {
+    run(check_cancelled_publication(true));
+}
+
+async fn check_cancelled_publication(split: bool) {
     let (cx, native) = contexts();
+    let worker_native = NativeCx::for_testing();
+    let worker_cx = Cx::new();
+    worker_cx.set_native_cx(worker_native.clone());
+    let vfs = MemoryVfs::new();
+    let trace = Trace::default();
+    let owner = NativePager::new(store(&vfs, &cx, &trace)).unwrap();
+    let (pages, batch, committed): (&[u32], usize, usize) = if split {
+        // Overlap rejects the group before I/O. Cancellation after its first
+        // singleton leaves both worker-owned and mailbox-owned work untouched.
+        (&[2, 2, 3, 4], 3, 1)
+    } else {
+        (&[2, 3, 4], 2, 2)
+    };
+    let (sender, worker) = NativeCommitService::new(&owner, pages.len() + 1, batch).unwrap();
+    let mut tickets = Vec::new();
+    for (index, &number) in pages.iter().enumerate() {
+        let mut txn = owner.begin(&cx, TransactionMode::Concurrent).unwrap();
+        txn.savepoint(&cx, "private").unwrap();
+        txn.write_page(&cx, page(number), &[u8::try_from(index + 2).unwrap(); 512])
+            .await
+            .unwrap();
+        tickets.push(sender.reserve(&native).await.unwrap().send(txn, 100).unwrap());
+    }
+    let admissions = ReplyAdmissions::default();
+    let mut waits: Vec<_> = tickets
+        .iter_mut()
+        .map(|ticket| Box::pin(ticket.wait(&native)))
+        .collect();
+    for (index, waiting) in waits.iter_mut().enumerate() {
+        let waker = reply_admission_waker(&sender, index, &admissions);
+        assert!(waiting.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+    }
+    // Both actual syncs succeed. Only the worker context is cancelled, during
+    // return from the final marker barrier, before any completion callback.
+    trace.lock().unwrap().cancel_after_attempt = Some(2);
+    assert!(matches!(worker.run(&worker_cx).await, Err(FrankenError::Interrupt)));
+    assert!(worker_cx.checkpoint().is_err());
+    assert!(worker_native.checkpoint().is_err());
+    assert!(cx.checkpoint().is_ok());
+    assert!(native.checkpoint().is_ok());
+    assert_eq!(
+        *admissions.lock().unwrap(),
+        (0..pages.len()).map(|index| (index, "closed")).collect::<Vec<_>>(),
+        "cancellation must seal admission before even successful replies"
+    );
+    let stopped = {
+        let audit = trace.lock().unwrap();
+        assert_eq!(audit.attempts, 2);
+        assert_eq!(audit.inner_successes, 2);
+        assert!(audit.failures.is_empty());
+        assert_eq!(audit.cancellations, [("markers", 2)]);
+        assert_eq!(audit.events.last(), Some(&("markers", "durable_sync")));
+        audit.events.clone()
+    };
+    assert!(!owner.needs_recovery().unwrap(), "successful barriers are not uncertain");
+    assert_eq!(owner.committed_tip().unwrap().get(), u64::try_from(committed).unwrap());
+    assert!(matches!(sender.try_reserve(&native), Err(FrankenError::Abort)));
+    assert!(matches!(owner.close(&cx), Err(FrankenError::Busy)));
+    for (index, waiting) in waits.into_iter().enumerate() {
+        let mut completion = waiting.await.unwrap();
+        let txn = &mut completion.transaction;
+        assert_eq!(txn.mode(), TransactionMode::Concurrent);
+        assert_eq!(txn.published_visible_commit_seq_hint(), Some(CommitSeq::ZERO));
+        if index < committed {
+            completion.result.as_ref().unwrap();
+            assert_eq!(txn.pager_commit_state(), PagerCommitState::Committed);
+            assert_eq!(
+                txn.acknowledgement().unwrap().commit_seq.get(),
+                u64::try_from(index + 1).unwrap()
+            );
+            assert!(!txn.has_pending_writes());
+        } else {
+            assert!(matches!(
+                completion.result.as_ref().unwrap_err().as_ref(),
+                FrankenError::Interrupt
+            ));
+            assert_eq!(txn.pager_commit_state(), PagerCommitState::NotCommitted);
+            assert!(txn.acknowledgement().is_none());
+            assert_eq!(txn.pending_commit_pages().unwrap(), [page(pages[index])]);
+            assert_eq!(
+                txn.get_page(&cx, page(pages[index])).await.unwrap().as_bytes(),
+                &[u8::try_from(index + 2).unwrap(); 512]
+            );
+            txn.rollback_to_savepoint(&cx, "private").unwrap();
+            assert!(!txn.has_pending_writes());
+            txn.rollback(&cx).await.unwrap();
+        }
+    }
+    assert_eq!(trace.lock().unwrap().events, stopped, "cleanup must not retry storage");
+
+    // The cancelled service is terminal, not the healthy pager. A new service
+    // can commit on this SAME owner without recovery or replaying any old intent.
+    let mut next = owner.begin(&cx, TransactionMode::Concurrent).unwrap();
+    next.write_page(&cx, page(100), &[91; 512]).await.unwrap();
+    let (fresh, worker) = NativeCommitService::new(&owner, 1, 1).unwrap();
+    let mut ticket = fresh.reserve(&native).await.unwrap().send(next, 1000).unwrap();
+    fresh.request_shutdown();
+    worker.run(&cx).await.unwrap();
+    let completed = ticket.wait(&native).await.unwrap();
+    completed.result.unwrap();
+    assert_eq!(
+        completed.transaction.acknowledgement().unwrap().commit_seq.get(),
+        u64::try_from(committed + 1).unwrap()
+    );
+    assert_eq!(trace.lock().unwrap().attempts, 4);
+    owner.close(&cx).unwrap();
+    let (mut reopened, report) = recover(&vfs, &cx, &trace).await.unwrap();
+    assert_eq!(trace.lock().unwrap().attempts, 6);
+    assert_eq!(report.markers.len(), committed + 1);
+    let mut view = reopened.begin(&cx).unwrap();
+    for &number in pages {
+        let actual = reopened.read_page(&cx, &mut view, page(number)).unwrap();
+        let expected = pages[..committed]
+            .iter()
+            .position(|&p| p == number)
+            .map(|index| vec![u8::try_from(index + 2).unwrap(); 512]);
+        assert_eq!(actual.as_deref(), expected.as_deref());
+    }
+    assert_eq!(
+        reopened.read_page(&cx, &mut view, page(100)).unwrap().as_deref(),
+        Some(&[91_u8; 512][..])
+    );
+    reopened.rollback(&mut view).unwrap();
+    reopened.close(&cx).unwrap();
+}
+
+#[test]
+fn cancellation_with_objects_sync_error_keeps_recovery_priority() {
+    run(check_service_stop(FIRST, false, true));
+}
+
+#[test]
+fn cancellation_with_markers_sync_error_keeps_recovery_priority() {
+    run(check_service_stop(FIRST, true, true));
+}
+
+async fn check_service_stop(case: Scenario, marker_barrier: bool, cancel_at_failure: bool) {
+    let (cx, native) = contexts();
+    let worker_cx = Cx::new();
+    worker_cx.set_native_cx(NativeCx::for_testing());
+    let run_cx = if cancel_at_failure { &worker_cx } else { &cx };
     let vfs = MemoryVfs::new();
     let trace = Trace::default();
     let owner = NativePager::new(store(&vfs, &cx, &trace)).unwrap();
@@ -473,8 +644,11 @@ async fn check_service(case: Scenario, marker_barrier: bool) {
         &trace,
         case.prior_syncs + if marker_barrier { 2 } else { 1 },
     );
+    if cancel_at_failure {
+        trace.lock().unwrap().cancel_after_attempt = Some(target);
+    }
     assert!(matches!(
-        worker.run(&cx).await,
+        worker.run(run_cx).await,
         Err(FrankenError::BusyRecovery)
     ));
     let expected: Vec<_> = (0..case.pages.len())
@@ -503,9 +677,19 @@ async fn check_service(case: Scenario, marker_barrier: bool) {
             "the inner sync really returned success"
         );
         assert_eq!(audit.failures, [(failed_stream, target)]);
+        if cancel_at_failure {
+            assert_eq!(audit.cancellations, [(failed_stream, target)]);
+        } else {
+            assert!(audit.cancellations.is_empty());
+        }
         assert_eq!(audit.events.last(), Some(&(failed_stream, "durable_sync")));
         audit.events.clone()
     };
+    if cancel_at_failure {
+        assert!(worker_cx.checkpoint().is_err());
+    }
+    assert!(cx.checkpoint().is_ok());
+    assert!(native.checkpoint().is_ok());
     assert!(sender.try_reserve(&native).is_err());
     assert!(owner.needs_recovery().unwrap());
     assert_eq!(

@@ -430,6 +430,14 @@ where
                 // service before its closing flag becomes visible.
                 return Err(FrankenError::BusyRecovery);
             }
+            if cx.checkpoint().is_err() || native.checkpoint().is_err() {
+                // Cancellation can arrive during a successful final barrier
+                // or between split members. Seal before invoking any reply
+                // waker, but never replace a committed handle's receipt with
+                // an interrupt. Uncertainty above takes priority over cancel.
+                self.stopped = Arc::new(FrankenError::Interrupt);
+                return Err(FrankenError::Interrupt);
+            }
             self.finish_batch();
             // Preserve the post-delivery health check too: a healthy reply
             // callback can drive another publisher sharing this pager.
