@@ -644,6 +644,7 @@ impl<F: VfsFile> VfsFile for FaultInjectingFile<F> {
     }
 
     fn file_identity(&self) -> Result<Option<FileIdentity>> {
+        self.state.ensure_power_on()?;
         self.inner.file_identity()
     }
 
@@ -762,6 +763,7 @@ impl<F: VfsFile> VfsFile for FaultInjectingFile<F> {
     }
 
     fn file_size(&self, cx: &Cx) -> Result<u64> {
+        self.state.ensure_power_on()?;
         self.inner.file_size(cx)
     }
 
@@ -1719,6 +1721,45 @@ mod tests {
         file.truncate(&cx, 8)
             .expect("truncate becomes available only after explicit restart");
         assert_eq!(file.file_size(&cx).unwrap(), 8);
+        file.close(&cx).unwrap();
+    }
+
+    #[test]
+    fn test_fault_vfs_power_cut_blocks_metadata_probes_until_restart() {
+        let vfs = FaultInjectingVfs::new(MemoryVfs::new());
+        let cx = test_cx();
+        let path = Path::new("metadata.db");
+        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::MAIN_DB;
+        let (mut file, _) = vfs.open(&cx, Some(path), flags).unwrap();
+
+        run_io(file.write(&cx, b"metadata survives", 0)).unwrap();
+        let identity = file
+            .file_identity()
+            .expect("identity before simulated outage")
+            .expect("memory VFS identity");
+        assert_eq!(file.file_size(&cx).unwrap(), 17);
+
+        vfs.inject_fault(FaultSpec::power_cut("metadata.db").after_nth_sync(0).build());
+        assert!(matches!(file.sync(&cx, SyncFlags::FULL), Err(FrankenError::Io(_))));
+        assert!(vfs.is_powered_off());
+
+        assert!(
+            matches!(file.file_size(&cx), Err(FrankenError::Io(_))),
+            "powered-off recovery must not inspect file length"
+        );
+        assert!(
+            matches!(file.file_identity(), Err(FrankenError::Io(_))),
+            "powered-off recovery must not inspect descriptor identity"
+        );
+        assert!(
+            matches!(file.refresh_file_identity(), Err(FrankenError::Io(_))),
+            "default refresh must inherit the same outage gate"
+        );
+
+        vfs.power_on();
+        assert_eq!(file.file_size(&cx).unwrap(), 17);
+        assert_eq!(file.file_identity().unwrap(), Some(identity));
+        assert_eq!(file.refresh_file_identity().unwrap(), Some(identity));
         file.close(&cx).unwrap();
     }
 
