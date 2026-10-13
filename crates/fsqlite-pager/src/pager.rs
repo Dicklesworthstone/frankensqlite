@@ -22747,6 +22747,11 @@ where
         inner: &mut PagerInner<V::File>,
     ) {
         return_pages_to_freelist(&mut inner.freelist, self.allocated_from_freelist.drain(..));
+        restore_quarantined_durable_freelist_pages(
+            &mut inner.freelist,
+            &mut self.savepoint_quarantined_allocations,
+            &self.allocated_from_durable_freelist,
+        );
         self.allocated_from_durable_freelist.clear();
 
         if self.mode == TransactionMode::Concurrent {
@@ -22825,6 +22830,24 @@ where
             self.savepoint_quarantined_allocations.clear();
         }
     }
+}
+
+/// Restore committed-free allocations quarantined by SAVEPOINT rollback only
+/// when the enclosing transaction ends. They have committed WAL frames, so
+/// treating them as abandoned EOF holes silently loses their freelist origin.
+fn restore_quarantined_durable_freelist_pages(
+    freelist: &mut Vec<PageNumber>,
+    quarantined: &mut Vec<PageNumber>,
+    durable_origins: &HashSet<u32>,
+) {
+    return_pages_to_freelist(
+        freelist,
+        quarantined
+            .iter()
+            .copied()
+            .filter(|page| durable_origins.contains(&page.get())),
+    );
+    quarantined.retain(|page| !durable_origins.contains(&page.get()));
 }
 
 fn cleanup_child_cx(cx: &Cx) -> Cx {
@@ -26231,7 +26254,11 @@ where
             // rolled-back allocations; handing them back to the same
             // transaction is the only re-grant that cannot alias.
             if let Some(page) = self.savepoint_quarantined_allocations.pop() {
-                self.allocated_from_eof.push(page);
+                if self.allocated_from_durable_freelist.contains(&page.get()) {
+                    self.allocated_from_freelist.push(page);
+                } else {
+                    self.allocated_from_eof.push(page);
+                }
                 alloc_ledger(
                     std::ptr::from_ref(self) as usize,
                     "alloc_quarantine",
@@ -28588,6 +28615,11 @@ where
                     &mut inner.freelist,
                     self.allocated_from_freelist.drain(..),
                 );
+                restore_quarantined_durable_freelist_pages(
+                    &mut inner.freelist,
+                    &mut self.savepoint_quarantined_allocations,
+                    &self.allocated_from_durable_freelist,
+                );
                 self.allocated_from_durable_freelist.clear();
 
                 if self.is_writer && self.mode != TransactionMode::Concurrent {
@@ -29054,6 +29086,11 @@ where
         } else {
             // Ordinary uncommitted drop: restore freelist allocations.
             return_pages_to_freelist(&mut inner.freelist, self.allocated_from_freelist.drain(..));
+            restore_quarantined_durable_freelist_pages(
+                &mut inner.freelist,
+                &mut self.savepoint_quarantined_allocations,
+                &self.allocated_from_durable_freelist,
+            );
             self.allocated_from_durable_freelist.clear();
 
             if self.is_writer && self.mode != TransactionMode::Concurrent {
