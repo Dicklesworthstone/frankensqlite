@@ -354,3 +354,241 @@ fn wal_savepoint_rollback_keeps_real_same_page_write_conflicts() {
         assert_rows(&db, &stock, read).await;
     });
 }
+
+// GH#510's allocator reduction uses the real pager, WAL serializer and conflict
+// guards over MemoryVfs, not the :memory: SQL/retained-commit shortcut. Pages are
+// opaque pager payloads; the SQL oracle above owns B-tree/index interoperability.
+mod pager_quarantine {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use fsqlite_core::wal_adapter::WalBackendAdapter;
+    use fsqlite_pager::{
+        JournalMode, MvccPager, SimplePager, TransactionHandle, TransactionMode,
+    };
+    use fsqlite_types::cx::Cx;
+    use fsqlite_types::flags::VfsOpenFlags;
+    use fsqlite_types::{PageNumber, PageSize};
+    use fsqlite_vfs::{MemoryVfs, Vfs};
+    use fsqlite_wal::{WalFile, WalSalts};
+
+    const PAGE_BYTES: usize = 512;
+    static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Clone, Copy, Debug)]
+    enum Finish {
+        Commit,
+        Rollback,
+        Drop,
+    }
+
+    async fn seeded_pager() -> (Cx, SimplePager<MemoryVfs>, PageNumber, PageNumber) {
+        let cx = Cx::new();
+        let vfs = MemoryVfs::new();
+        let page_size = PageSize::new(512).unwrap();
+        let fixture = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+        let db_path = PathBuf::from(format!("/issue510-allocator-{fixture}.db"));
+        let wal_path = PathBuf::from(format!("/issue510-allocator-{fixture}.db-wal"));
+        let pager = SimplePager::open_with_cx(&cx, vfs.clone(), &db_path, page_size)
+            .await
+            .unwrap();
+        let (file, _) = vfs
+            .open(
+                &cx,
+                Some(&wal_path),
+                VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL,
+            )
+            .unwrap();
+        let wal = WalFile::create(
+            &cx,
+            file,
+            page_size.get(),
+            0,
+            WalSalts { salt1: 510, salt2: 491 },
+        )
+        .await
+        .unwrap();
+        pager.set_wal_backend(Box::new(WalBackendAdapter::new(wal))).unwrap();
+        pager.set_journal_mode(&cx, JournalMode::Wal).await.unwrap();
+
+        // Immediate allocations avoid an unused EOF lease in the seed. Page 2
+        // becomes the sole durable freelist trunk, below a still-live page 3.
+        let mut seed = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+        let free = seed.allocate_page(&cx).await.unwrap();
+        let live = seed.allocate_page(&cx).await.unwrap();
+        assert!(free < live);
+        seed.write_page(&cx, free, &[0x41; PAGE_BYTES]).await.unwrap();
+        seed.write_page(&cx, live, &[0x42; PAGE_BYTES]).await.unwrap();
+        seed.commit(&cx).await.unwrap();
+        drop(seed);
+        let mut release = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+        release.free_page(&cx, free).await.unwrap();
+        release.commit(&cx).await.unwrap();
+        drop(release);
+
+        // Prove this is a committed-free page WITH a WAL frame, not an unused
+        // EOF address. The abandonment fold must not be its return mechanism.
+        let (file, _) = vfs
+            .open(&cx, Some(&wal_path), VfsOpenFlags::READWRITE | VfsOpenFlags::WAL)
+            .unwrap();
+        let wal = WalFile::open(&cx, file).await.unwrap();
+        let mut free_frame = None;
+        let mut last_commit = None;
+        for index in 0..wal.frame_count() {
+            let (header, _) = wal.read_frame(&cx, index).await.unwrap();
+            if header.page_number == free.get() {
+                free_frame = Some(index);
+            }
+            if header.db_size != 0 {
+                last_commit = Some(index);
+            }
+        }
+        assert!(free_frame.is_some_and(|index| last_commit.is_some_and(|end| index <= end)));
+        wal.close(&cx).unwrap();
+        (cx, pager, free, live)
+    }
+
+    async fn assert_free_header(
+        pager: &SimplePager<MemoryVfs>,
+        cx: &Cx,
+        expected_head: u32,
+        expected_count: u32,
+    ) {
+        let mut reader = pager.begin(cx, TransactionMode::ReadOnly).await.unwrap();
+        let page = reader.get_page(cx, PageNumber::ONE).await.unwrap();
+        let bytes = page.as_bytes();
+        assert_eq!(u32::from_be_bytes(bytes[32..36].try_into().unwrap()), expected_head);
+        assert_eq!(u32::from_be_bytes(bytes[36..40].try_into().unwrap()), expected_count);
+        reader.rollback(cx).await.unwrap();
+    }
+
+    async fn terminal_return(finish: Finish, regrant: bool) {
+        for mixed_eof in [false, true] {
+            let (cx, pager, free, live) = seeded_pager().await;
+            assert_free_header(&pager, &cx, free.get(), 1).await;
+            let mut txn = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+            let snapshot = txn.published_visible_commit_seq_hint();
+            assert_eq!(txn.live_freelist_pages(), vec![free]);
+            txn.savepoint(&cx, "before").unwrap();
+            assert_eq!(txn.allocate_page(&cx).await.unwrap(), free);
+            txn.write_page(&cx, free, &[0x71; PAGE_BYTES]).await.unwrap();
+            let eof = if mixed_eof {
+                let page = txn.allocate_page(&cx).await.unwrap();
+                assert!(page > live);
+                txn.write_page(&cx, page, &[0x72; PAGE_BYTES]).await.unwrap();
+                Some(page)
+            } else {
+                None
+            };
+            // Repeated rollback keeps the target marker and its original
+            // snapshot. Neither kind of reservation may become shared early.
+            for _ in 0..2 {
+                txn.rollback_to_savepoint(&cx, "before").unwrap();
+                assert_eq!(txn.published_visible_commit_seq_hint(), snapshot);
+                assert!(!txn.has_pending_writes());
+                assert!(!txn.live_freelist_pages().contains(&free));
+                let reserved = txn.live_reserved_pages();
+                assert!(reserved.contains(&free));
+                if let Some(eof) = eof {
+                    assert!(reserved.contains(&eof));
+                    assert!(!txn.live_freelist_pages().contains(&eof));
+                }
+                assert_eq!(txn.get_page(&cx, live).await.unwrap().as_bytes(), &[0x42; PAGE_BYTES]);
+            }
+            if regrant {
+                assert_eq!(txn.allocate_page(&cx).await.unwrap(), free);
+                txn.write_page(&cx, free, &[0x73; PAGE_BYTES]).await.unwrap();
+            }
+            match finish {
+                // Outermost SQL RELEASE calls commit with the marker intact.
+                Finish::Commit => txn.commit(&cx).await.unwrap(),
+                Finish::Rollback => txn.rollback(&cx).await.unwrap(),
+                Finish::Drop => {}
+            }
+            drop(txn);
+
+            // Check the local allocator BEFORE reopening a pager, starting a
+            // peer, or checkpointing: those could reload and conceal the loss.
+            let mut next = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+            assert_eq!(
+                next.live_freelist_pages(),
+                vec![free],
+                "{finish:?}, mixed_eof={mixed_eof}, regrant={regrant}",
+            );
+            assert_eq!(next.allocate_page(&cx).await.unwrap(), free);
+            next.write_page(&cx, free, &[0x61; PAGE_BYTES]).await.unwrap();
+            next.commit(&cx).await.unwrap();
+            drop(next);
+            assert_free_header(&pager, &cx, 0, 0).await;
+            let mut expected_live = 0x42;
+            for value in 1_u8..=3 {
+                let mut next = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+                assert_eq!(next.get_page(&cx, free).await.unwrap().as_bytes(), &[0x61; PAGE_BYTES]);
+                assert_eq!(
+                    next.get_page(&cx, live).await.unwrap().as_bytes(),
+                    &[expected_live; PAGE_BYTES],
+                );
+                next.write_page(&cx, live, &[value; PAGE_BYTES]).await.unwrap();
+                next.commit(&cx).await.unwrap();
+                expected_live = value;
+            }
+            let mut reader = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            assert_eq!(reader.get_page(&cx, live).await.unwrap().as_bytes(), &[3; PAGE_BYTES]);
+            reader.rollback(&cx).await.unwrap();
+        }
+    }
+
+    #[test]
+    fn wal_quarantine_clean_commit_returns_committed_free_page() {
+        asupersync::test_utils::run_test(|| async { terminal_return(Finish::Commit, false).await });
+    }
+
+    #[test]
+    fn wal_quarantine_full_rollback_returns_committed_free_page() {
+        asupersync::test_utils::run_test(|| async {
+            terminal_return(Finish::Rollback, false).await;
+        });
+    }
+
+    #[test]
+    fn wal_quarantine_drop_returns_committed_free_page() {
+        asupersync::test_utils::run_test(|| async { terminal_return(Finish::Drop, false).await });
+    }
+
+    #[test]
+    fn wal_quarantine_regrant_keeps_freelist_origin_on_rollback() {
+        asupersync::test_utils::run_test(|| async {
+            terminal_return(Finish::Rollback, true).await;
+        });
+    }
+
+    #[test]
+    fn wal_quarantine_regrant_keeps_freelist_origin_on_drop() {
+        asupersync::test_utils::run_test(|| async { terminal_return(Finish::Drop, true).await });
+    }
+
+    #[test]
+    fn wal_quarantine_regrant_commit_removes_durable_free_entry() {
+        asupersync::test_utils::run_test(|| async {
+            let (cx, pager, free, live) = seeded_pager().await;
+            let mut txn = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+            txn.savepoint(&cx, "before").unwrap();
+            assert_eq!(txn.allocate_page(&cx).await.unwrap(), free);
+            txn.write_page(&cx, free, &[0x71; PAGE_BYTES]).await.unwrap();
+            txn.rollback_to_savepoint(&cx, "before").unwrap();
+            txn.release_savepoint(&cx, "before").unwrap();
+            assert_eq!(txn.allocate_page(&cx).await.unwrap(), free);
+            txn.write_page(&cx, free, &[0x61; PAGE_BYTES]).await.unwrap();
+            txn.commit(&cx).await.unwrap();
+            drop(txn);
+            // A re-granted page is a real consumption of a committed free
+            // entry, not EOF growth. Committing without clearing this header
+            // would leave the new payload simultaneously live and free.
+            assert_free_header(&pager, &cx, 0, 0).await;
+            let mut reader = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            assert_eq!(reader.get_page(&cx, free).await.unwrap().as_bytes(), &[0x61; PAGE_BYTES]);
+            assert_eq!(reader.get_page(&cx, live).await.unwrap().as_bytes(), &[0x42; PAGE_BYTES]);
+            reader.rollback(&cx).await.unwrap();
+        });
+    }
+}
