@@ -1,4 +1,5 @@
 import { withDeferredForeignKeys } from "./changeset-foreign-keys";
+import { FrankenSQLiteError } from "./errors";
 import type {
   ChangesetChange,
   ChangesetLimits,
@@ -23,6 +24,12 @@ export interface ChangesetExecutor {
   ): Promise<{
     rowArrays: readonly (readonly unknown[])[];
   }>;
+  /**
+   * Optional owned child savepoint. Reject with the original callback error
+   * only AFTER successful rollback; cleanup failures must remain distinguishable.
+   * FrankenTransaction supplies this capability without manual boundary SQL.
+   */
+  transaction?<T>(work: (tx: ChangesetExecutor) => Promise<T>): Promise<T>;
 }
 
 /** Implemented by FrankenDB and FrankenTransaction; no WASM session hooks needed. */
@@ -36,7 +43,7 @@ export interface ChangesetTarget {
   ): Promise<T>;
 }
 
-export type ChangesetConflictKind = "data" | "not-found" | "conflict";
+export type ChangesetConflictKind = "data" | "not-found" | "conflict" | "constraint";
 export interface ChangesetConflict<Change extends PatchsetChange = ChangesetChange> {
   readonly kind: ChangesetConflictKind;
   readonly table: string;
@@ -45,6 +52,8 @@ export interface ChangesetConflict<Change extends PatchsetChange = ChangesetChan
   readonly columns: readonly string[];
   /** Owned before/after images; mutating a blob cannot change pending SQL. */
   readonly change: Change;
+  /** Original SQL failure, present only for a rolled-back constraint conflict. */
+  readonly error?: FrankenSQLiteError;
 }
 
 /** Patchset callbacks never receive DATA conflicts: there is no non-key old data. */
@@ -61,13 +70,22 @@ export interface ApplyChangesetOptions<Change extends PatchsetChange = Changeset
   foreignKeys?: "defer";
   /** Opt in: apply writable Session fields and let the trusted target schema recompute generated values. */
   generatedColumns?: "recompute";
+  /**
+   * Opt in to one owned child savepoint per row. A positively identified SQL
+   * constraint failure reaches onConflict only after that child rolls back.
+   * Requires the executor's transaction capability. Only abort/omit are valid;
+   * cleanup, callback, transport and COMMIT failures never become omissions.
+   * The default retains whole-scope abort and has no per-row savepoint cost.
+   */
+  constraintConflicts?: "isolate";
   /** Explicit allowlist of direct target tables in main; NOT a SQL sandbox. */
   tables: readonly string[];
   /** Stable source-qualified delivery identity; atomically recorded with the rows. */
   deliveryId?: string;
   /**
    * Default: abort. replace is valid only for data/primary-key conflicts, never
-   * missing rows. SQL/constraint errors still abort the entire owned scope.
+   * missing rows or constraints. SQL constraints abort unless explicitly
+   * isolated above; all other SQL errors still abort the entire owned scope.
    */
   onConflict?: (
     conflict: ChangesetConflict<Change>,
@@ -162,6 +180,9 @@ function capture<Change extends PatchsetChange>(options: ApplyChangesetOptions<C
   const generatedColumns = options?.generatedColumns;
   if (generatedColumns !== undefined && generatedColumns !== "recompute")
     invalid("generatedColumns must be recompute when supplied");
+  const constraintConflicts = options?.constraintConflicts;
+  if (constraintConflicts !== undefined && constraintConflicts !== "isolate")
+    invalid("constraintConflicts must be isolate when supplied");
   if (!Array.isArray(source) || source.length > 256)
     invalid("tables must be an explicit allowlist of at most 256 names");
   const names = new Set<string>();
@@ -233,7 +254,7 @@ function capture<Change extends PatchsetChange>(options: ApplyChangesetOptions<C
     primaryKey: readonly number[];
     changes: ChangesetRebaseTable["changes"][number][];
   }>();
-  return { names, onConflict, onRebase, rebase, limits, deliveryId, generatedColumns, foreignKeys, transactionOptions, checkpoint };
+  return { names, onConflict, onRebase, rebase, limits, deliveryId, generatedColumns, constraintConflicts, foreignKeys, transactionOptions, checkpoint };
 }
 
 type Settings<Change extends PatchsetChange> = ReturnType<typeof capture<Change>>;
@@ -520,6 +541,89 @@ function copyChange<Change extends PatchsetChange>(change: Change): Change {
   return Object.freeze(copy);
 }
 
+// No message matching, arbitrary cause traversal or "transient" heuristics.
+// These ordinary SQL constraint families may be omitted only when the exact
+// execute failure is returned unchanged by a successfully rolled-back child.
+const ROW_CONSTRAINT_CODES: Readonly<Record<string, number>> = Object.freeze({
+  SQLITE_CONSTRAINT: 19,
+  SQLITE_CONSTRAINT_CHECK: 275,
+  SQLITE_CONSTRAINT_FOREIGNKEY: 787,
+  SQLITE_CONSTRAINT_NOTNULL: 1299,
+  SQLITE_CONSTRAINT_PRIMARYKEY: 1555,
+  SQLITE_CONSTRAINT_TRIGGER: 1811,
+  SQLITE_CONSTRAINT_UNIQUE: 2067,
+  SQLITE_CONSTRAINT_ROWID: 2579,
+  SQLITE_CONSTRAINT_DATATYPE: 3091,
+});
+
+function isRowConstraint(error: unknown): error is FrankenSQLiteError {
+  try {
+    if (!(error instanceof FrankenSQLiteError) || error.cleanupErrors.length !== 0 ||
+        error.userRecoverable === false || error.cause !== undefined ||
+        !Object.hasOwn(ROW_CONSTRAINT_CODES, error.code)) return false;
+    const code = ROW_CONSTRAINT_CODES[error.code]!;
+    if (error.sqliteCode !== undefined && error.sqliteCode !== 19) return false;
+    return error.extendedCode === undefined || (code === 19
+      ? Object.values(ROW_CONSTRAINT_CODES).includes(error.extendedCode)
+      : error.extendedCode === code);
+  } catch { return false; } // Caller-created Error accessors cannot authorize omission.
+}
+
+type RowScope = (work: (tx: ChangesetExecutor) => Promise<boolean>) => Promise<boolean>;
+
+function rowScope(tx: ChangesetExecutor): RowScope {
+  const nested = tx.transaction;
+  if (typeof nested !== "function")
+    invalid("constraintConflicts: isolate requires owned child transactions");
+  return work => nested.call(tx, work) as Promise<boolean>;
+}
+
+async function applyIsolatedRow<Change extends PatchsetChange>(
+  isolate: RowScope,
+  settings: Settings<Change>,
+  plan: TablePlan<Change>,
+  change: Change,
+  changeIndex: number,
+): Promise<boolean> {
+  let sqlFailure: FrankenSQLiteError | undefined;
+  try {
+    return await isolate(child => applyRow({
+      query: (sql, params) => child.query(sql, params),
+      execute: async (sql, params) => {
+        try { return await child.execute(sql, params); }
+        catch (error: unknown) {
+          if (isRowConstraint(error)) sqlFailure = error;
+          throw error;
+        }
+      },
+    }, settings, plan, change, changeIndex));
+  } catch (error: unknown) {
+    // Policy callbacks and child BEGIN/RELEASE errors did not come from our
+    // execute. A cleanup aggregate/wrapper is not the original SQL failure.
+    // Do not suppress it, even if it contains that failure as a cause.
+    if (sqlFailure === undefined || error !== sqlFailure || !isRowConstraint(error)) throw error;
+    settings.checkpoint();
+    const conflict: ChangesetConflict<Change> = Object.freeze({
+      kind: "constraint", table: plan.name, changeIndex, columns: plan.columns,
+      change: copyChange(change), error: sqlFailure,
+    });
+    const action = settings.onConflict === undefined ? "abort" : await settings.onConflict(conflict);
+    settings.checkpoint();
+    if (action === "omit") {
+      // Rebase describes policy decisions, not just surviving SQL. Like native
+      // apply_v2, retain any preceding DATA/PK replacement decision, then OMIT.
+      recordRebase(settings, plan, change, false);
+      return false;
+    }
+    if (action !== "abort") invalid("constraint conflicts allow only abort or omit");
+    throw new ChangesetApplyError(
+      "ERR_FSQLITE_CHANGESET_CONFLICT",
+      `Changeset constraint conflict in ${plan.name} at change ${changeIndex}`,
+      conflict, { cause: sqlFailure },
+    );
+  }
+}
+
 async function applyRow<Change extends PatchsetChange>(
   tx: ChangesetExecutor,
   settings: Settings<Change>,
@@ -696,7 +800,9 @@ async function runRebaseHook(
  * Apply bounded SQLite session wire changes through real owned SQL. Schema and
  * explicit before-image conflicts fail closed by default. This is NOT the full
  * native sqlite3changeset_apply API: triggers/constraints retain ordinary SQL
- * behavior; constraint omission is not synthesized. Explicit foreignKeys: defer
+ * behavior. Opt-in constraint isolation rolls back a complete row operation
+ * before policy can omit it; it never retries or hides uncertain cleanup.
+ * Explicit foreignKeys: defer
  * composes the existing FK-clean scope around rows, hook and receipt. onRebase
  * records actual full-changeset decisions inside the owned transaction.
  * Explicit data/primary-key replacement stays inside the owned
@@ -713,7 +819,7 @@ export function applyChangeset(
 /**
  * Apply a compact SQLite patchset through the same owned SQL/receipt path.
  * UPDATE/DELETE match keys without before-images. Missing rows and duplicate
- * keys still invoke policy; constraints still abort. No DATA conflict can be
+ * keys still invoke policy; constraint isolation is explicitly opt-in. No DATA conflict can be
  * inferred, and a patchset cannot be inverted into an undo changeset.
  */
 export function applyPatchset(
@@ -750,6 +856,9 @@ async function applySession<Change extends PatchsetChange>(
   settings.checkpoint();
   const owner = settings.foreignKeys === "defer" ? withDeferredForeignKeys(target) : target;
   return owner.transaction(async (tx) => {
+    // Resolve capability before inbox/schema/application SQL. Default callers
+    // do not read this optional property or pay for child savepoints.
+    const isolate = settings.constraintConflicts === "isolate" ? rowScope(tx) : undefined;
     if (delivery !== null) {
       await prepareReceipts(tx, settings, true);
       const prior = await readReceipt(tx, settings, delivery);
@@ -763,7 +872,10 @@ async function applySession<Change extends PatchsetChange>(
       index = 0;
     for (const plan of plans) {
       for (const change of plan.wire.changes) {
-        if (await applyRow(tx, settings, plan, change, index++)) applied++;
+        const changed = isolate === undefined
+          ? await applyRow(tx, settings, plan, change, index++)
+          : await applyIsolatedRow(isolate, settings, plan, change, index++);
+        if (changed) applied++;
         else omitted++;
       }
     }
