@@ -7798,12 +7798,10 @@ impl VdbeEngine {
         if !preserve_runtime_setup {
             self.autoincrement_seq_by_root_page.clear();
         }
-        if !retain_cursors {
-            self.concurrent_rowid_allocator = None;
-            self.concurrent_rowid_schema_epoch = SchemaEpoch::ZERO;
-            self.concurrent_rowid_session_id = 0;
-            self.concurrent_rowid_statement = 0;
-        }
+        self.concurrent_rowid_allocator = None;
+        self.concurrent_rowid_schema_epoch = SchemaEpoch::ZERO;
+        self.concurrent_rowid_session_id = 0;
+        self.concurrent_rowid_statement = 0;
         // table_index_meta: kept as-is — execute() overwrites it from the
         // program at the start of each run (line ~4903).
         self.make_record_lookaside.reset();
@@ -8955,6 +8953,10 @@ impl VdbeEngine {
     /// snapshots. Also enables storage cursors automatically.
     pub fn set_transaction(&mut self, txn: impl Into<TransactionKind>) {
         self.attach_transaction_state(txn.into(), None);
+        self.concurrent_rowid_allocator = None;
+        self.concurrent_rowid_schema_epoch = SchemaEpoch::ZERO;
+        self.concurrent_rowid_session_id = 0;
+        self.concurrent_rowid_statement = 0;
     }
 
     /// Lend a pager transaction with MVCC concurrent context (bd-kivg / 5E.2).
@@ -11542,7 +11544,7 @@ impl VdbeEngine {
                     // snapshot and silently overwrite each other.
                     let cursor_id = op.p1;
                     let target = op.p2;
-                    let concurrent_mode = op.p3 != 0;
+                    let concurrent_mode = op.p3 != 0 || self.concurrent_rowid_allocator.is_some();
                     // bd-9ag5r: the max-rowid probe must not see a row an
                     // UPDATE's Delete has only deferred.
                     if let Some((deferred_cursor, deferred_rowid)) =
