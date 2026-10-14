@@ -673,6 +673,10 @@ impl<S: VfsFile, M: VfsFile> NativeReplicationReceiver<'_, S, M> {
         }
         let id = ObjectId::from_bytes(input.array()?);
         let index = self.plan.objects.binary_search(&id).map_err(|_| corrupt("unlisted transported object"))?;
+        // A repeated message is a fresh admission attempt, not a continuation of
+        // an earlier success. Revoke its inventory bit before any fallible parse,
+        // read, or write so errors and dropped futures cannot retain stale proof.
+        self.received[index] = false;
         let count = usize::try_from(u32::from_le_bytes(input.array()?)).map_err(|_| FrankenError::TooBig)?;
         if count == 0 || count > self.destination.limits.max_records
             || count > input.0.len() / (SYMBOL_HEADER_BYTES + SYMBOL_TRAILER_BYTES + 1)
