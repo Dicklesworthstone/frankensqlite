@@ -9,6 +9,7 @@ import type {
   PatchsetTable,
 } from "./changeset-codec";
 import {
+  ChangesetError,
   decodeChangeset,
   decodePatchset,
   encodeRebaseInfo,
@@ -50,6 +51,15 @@ export interface ChangesetConflict<Change extends PatchsetChange = ChangesetChan
   /** Zero-based position in the complete changeset, not just this table. */
   readonly changeIndex: number;
   readonly columns: readonly string[];
+  /**
+   * Receiver values for `columns` in this application's SQL snapshot, captured
+   * before row-conflict policy runs. INTEGERs are bigint, REALs number, BLOBs
+   * owned copies. The array is frozen; changing a BLOB cannot change pending
+   * SQL or rebase evidence. Generated/trailing receiver-only fields are not
+   * included. Null means NOTFOUND or CONSTRAINT: a SQL constraint can involve
+   * several rows, so it has no single authoritative receiver image.
+   */
+  readonly current: readonly ChangesetValue[] | null;
   /** Owned before/after images; mutating a blob cannot change pending SQL. */
   readonly change: Change;
   /** Original SQL failure, present only for a rolled-back constraint conflict. */
@@ -99,6 +109,11 @@ export interface ApplyChangesetOptions<Change extends PatchsetChange = Changeset
    * Throws/cancellation/commit failure roll back journal, rows and receipt.
    */
   onRebase?: ChangesetRebaseHook;
+  /**
+   * Also bounds each conflicting receiver image before fetching it: 8 bytes
+   * per scalar, BLOB length, twice encoded TEXT length. These are returned-data
+   * bounds, not engine scratch/RSS or images retained by application callbacks.
+   */
   limits?: ChangesetLimits;
   signal?: AbortSignal;
   timeoutMs?: number;
@@ -541,6 +556,113 @@ function copyChange<Change extends PatchsetChange>(change: Change): Change {
   return Object.freeze(copy);
 }
 
+function conflictLimit(): never {
+  throw new ChangesetError(
+    "ERR_FSQLITE_CHANGESET_LIMIT",
+    "Conflicting receiver row exceeds the changeset image budget",
+  );
+}
+
+function conflictCost(columns: readonly string[], start = 0, end = columns.length): string {
+  if (end - start === 1) {
+    const column = quote(columns[start]!);
+    // Match capture accounting, including UTF-8 expansion from UTF-16 text.
+    return `(CASE typeof(${column}) WHEN 'text' THEN 2 * length(CAST(${column} AS BLOB)) ` +
+      `WHEN 'blob' THEN length(${column}) ELSE 8 END)`;
+  }
+  const middle = start + Math.floor((end - start) / 2);
+  return `(${conflictCost(columns, start, middle)} + ${conflictCost(columns, middle, end)})`;
+}
+
+/** SQL adapters must not substitute shadowed metadata or racing buffers. */
+function conflictBytes(value: unknown): Uint8Array {
+  if (!(value instanceof Uint8Array)) return badResult();
+  const prototype = Object.getPrototypeOf(Uint8Array.prototype) as object;
+  try {
+    const get = (name: string): unknown =>
+      Object.getOwnPropertyDescriptor(prototype, name)!.get!.call(value);
+    const buffer = get("buffer"), offset = get("byteOffset") as number,
+      size = get("byteLength") as number;
+    if (!(buffer instanceof ArrayBuffer) ||
+        Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "resizable")?.get?.call(buffer))
+      return badResult();
+    return new Uint8Array(buffer, offset, size);
+  } catch { return badResult(); }
+}
+
+/**
+ * Only conflicting rows pay for capture. No external connection/read, new
+ * transaction, or application callback separates the cost and value reads.
+ * The target must retain the same owned SQL snapshot throughout this operation.
+ */
+async function readConflictRow(
+  tx: ChangesetExecutor,
+  settings: Checkpoints & Pick<Settings<PatchsetChange>, "limits">,
+  plan: TablePlan,
+  where: ReturnType<typeof predicates>,
+): Promise<readonly ChangesetValue[]> {
+  if (plan.columns.length === 0) return badResult();
+  if (plan.columns.length > settings.limits.maxCells) return conflictLimit();
+  const suffix = ` FROM ${plan.sqlName} WHERE ${where.key} LIMIT 2`;
+  const costs = await read(tx, settings,
+    `SELECT ${conflictCost(plan.columns)} AS __fsqlite_conflict_cost${suffix}`, where.keyParams);
+  if (costs.length !== 1 || costs[0]!.length !== 1) return badResult();
+  const expectedCost = integer(costs[0]![0]);
+  if (expectedCost > settings.limits.maxBytes) return conflictLimit();
+
+  const encoding = await read(tx, settings, "PRAGMA main.encoding");
+  const label = encoding[0]?.[0];
+  if (encoding.length !== 1 || encoding[0]!.length !== 1 ||
+      (label !== "UTF-8" && label !== "UTF-16le" && label !== "UTF-16be")) return badResult();
+  const text = new TextDecoder(label, { fatal: true, ignoreBOM: true });
+  const current: ChangesetValue[] = [];
+  let cost = 0;
+  // Two result fields per column. Chunking keeps wide tables below SQLite's
+  // result-column limit without dropping fields or weakening their validation.
+  for (let start = 0; start < plan.columns.length; start += 128) {
+    const columns = plan.columns.slice(start, start + 128);
+    const projection = columns.flatMap((name, index) => {
+      const column = quote(name);
+      return [
+        `typeof(${column}) AS t${index}`,
+        `CASE typeof(${column}) WHEN 'integer' THEN CAST(${column} AS TEXT) ` +
+          `WHEN 'text' THEN CAST(${column} AS BLOB) ELSE ${column} END AS x${index}`,
+      ];
+    }).join(", ");
+    const rows = await read(tx, settings, `SELECT ${projection}${suffix}`, where.keyParams);
+    if (rows.length !== 1 || rows[0]!.length !== columns.length * 2) return badResult();
+    const row = rows[0]!;
+    for (let index = 0; index < columns.length; index++) {
+      const tag = row[index * 2], value = row[index * 2 + 1];
+      let captured: ChangesetValue;
+      if (tag === "null" && value === null) { captured = null; cost += 8; }
+      else if (tag === "integer" && typeof value === "string" &&
+          /^(?:0|-?[1-9][0-9]{0,18})$/.test(value)) {
+        const exact = BigInt(value);
+        if (exact < -(1n << 63n) || exact >= (1n << 63n)) return badResult();
+        captured = exact; cost += 8;
+      } else if (tag === "real" && typeof value === "number" && !Number.isNaN(value)) {
+        captured = value; cost += 8;
+      } else if (tag === "text" || tag === "blob") {
+        const bytes = conflictBytes(value);
+        cost += bytes.length * (tag === "text" ? 2 : 1);
+        // Check before cloning/decoding, including broken adapters returning
+        // more bytes than preflight admitted. No partial image escapes.
+        if (cost > expectedCost) return badResult();
+        if (tag === "blob") captured = new Uint8Array(bytes);
+        else {
+          try { captured = text.decode(bytes); }
+          catch { return badResult(); }
+        }
+      } else return badResult();
+      if (cost > expectedCost) return badResult();
+      current.push(captured);
+    }
+  }
+  if (cost !== expectedCost) return badResult();
+  return Object.freeze(current);
+}
+
 // No message matching, arbitrary cause traversal or "transient" heuristics.
 // These ordinary SQL constraint families may be omitted only when the exact
 // execute failure is returned unchanged by a successfully rolled-back child.
@@ -605,7 +727,7 @@ async function applyIsolatedRow<Change extends PatchsetChange>(
     settings.checkpoint();
     const conflict: ChangesetConflict<Change> = Object.freeze({
       kind: "constraint", table: plan.name, changeIndex, columns: plan.columns,
-      change: copyChange(change), error: sqlFailure,
+      change: copyChange(change), current: null, error: sqlFailure,
     });
     const action = settings.onConflict === undefined ? "abort" : await settings.onConflict(conflict);
     settings.checkpoint();
@@ -662,6 +784,7 @@ async function applyRow<Change extends PatchsetChange>(
       table: plan.name,
       changeIndex,
       columns: plan.columns,
+      current: kind === "not-found" ? null : await readConflictRow(tx, settings, plan, where),
       change: copyChange(change),
     });
     const action =
