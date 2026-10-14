@@ -3,9 +3,13 @@
 //! Only the generic native handle is erased, not the transaction protocol.
 //! Conversion moves that exact handle, retaining its private overlay, snapshot
 //! pin, savepoints, commit acknowledgement, and recovery obligations. The
-//! erased trait is private and implemented only by `NativeTransaction`; callers
-//! cannot inject another validator or a mock that reports invented durability.
+//! erased trait is private: only sealed live transactions and immutable native
+//! historical readers implement it. Callers cannot inject another validator
+//! or a mock that reports invented durability.
 //! Compatibility variants remain statically dispatched and pay no boxing cost.
+
+mod snapshot;
+pub use snapshot::{NativeSnapshotPager, NativeSnapshotTransaction};
 
 use std::fmt;
 use std::future::Future;
