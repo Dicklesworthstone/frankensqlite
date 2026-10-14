@@ -282,3 +282,169 @@ fn historical_queries_reopen_real_authenticated_native_files() {
         // touched and no file deletion or physical crash certificate is claimed.
     });
 }
+
+mod replica_query_tests {
+    use fsqlite_harness::fault_vfs::{FaultInjectingVfs, FaultSpec};
+
+    use super::*;
+
+    type History = NativePageRecovery<File, File, Codec>;
+    type Rows = Vec<(i32, Vec<u8>)>;
+
+    async fn history(vfs: &MemoryVfs, cx: &Cx) -> (History, Rows) {
+        let owner = pager(vfs, cx);
+        let mut seed = owner.begin(cx, TransactionMode::Concurrent).unwrap();
+        seed.write_page(cx, page(2), &empty_root()).await.unwrap();
+        seed.commit_at(cx, 100).await.unwrap();
+        drop(seed);
+        let rows: Rows = (1..=80).map(|key| (key, vec![u8::try_from(key).unwrap(); 80]))
+            .chain(std::iter::once((200, vec![0xEF; 4097]))).collect();
+        let writer = owner.begin(cx, TransactionMode::Concurrent).unwrap().into();
+        let (mut writer, _) = execute(cx, writer, &insert_program(&rows)).await;
+        assert_eq!(writer.get_page(cx, page(2)).await.unwrap().as_bytes()[0], 0x05);
+        assert!(writer.pending_commit_pages().unwrap().len() > 10);
+        writer.commit(cx).await.unwrap();
+        drop(writer);
+        let writer = owner.begin(cx, TransactionMode::Concurrent).unwrap().into();
+        let (mut writer, _) = execute(cx, writer, &delete_program(&[42, 200])).await;
+        writer.commit(cx).await.unwrap();
+        drop(writer);
+        (replay(owner, cx).await, rows)
+    }
+
+    fn replica<V: Vfs>(vfs: &V, cx: &Cx) -> NativeDurabilityLog<V::File, V::File> {
+        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
+        NativeDurabilityLog::create(cx,
+            vfs.open(cx, Some(Path::new("replica-objects")), flags).unwrap().0,
+            vfs.open(cx, Some(Path::new("replica-markers")), flags).unwrap().0,
+            NativeDurabilityLimits::default()).unwrap()
+    }
+
+    fn remaining(rows: &Rows) -> Rows {
+        rows.iter().filter(|(key, _)| *key != 42 && *key != 200).cloned().collect()
+    }
+
+    async fn query(cx: &Cx, image: &NativeSnapshotPager) -> Vec<Vec<SqliteValue>> {
+        let reader = image.begin(cx, TransactionMode::ReadOnly).unwrap().into();
+        let (mut reader, rows) = execute(cx, reader, &scan_program()).await;
+        assert!(reader.pending_commit_pages().unwrap().is_empty());
+        reader.commit(cx).await.unwrap();
+        let TransactionKind::Native(reader) = reader else { panic!("replica lost native dispatch") };
+        assert!(reader.acknowledgement().is_none(), "a read is not a replicated commit ACK");
+        rows
+    }
+
+    #[test]
+    fn replicated_images_query_real_bytecode_and_keep_readers_stable_during_catchup() {
+        run(async {
+            let cx = Cx::new();
+            let memory = MemoryVfs::new();
+            let (mut source, rows) = history(&memory, &cx).await;
+            // Move the same namespace into the counter wrapper. Original source
+            // handles stay unwrapped; only destination I/O contributes here.
+            let vfs = FaultInjectingVfs::new(memory);
+            let mut replica = replica(&vfs, &cx);
+            let before = vfs.sync_count();
+            let (receipt, image) = source.replicate_snapshot_to(&cx, &mut replica, 2)
+                .await.unwrap().unwrap();
+            assert_eq!(receipt.commits, 2);
+            assert_eq!(receipt.first_seq, CommitSeq::new(1));
+            assert_eq!(receipt.last_seq, CommitSeq::new(2));
+            assert_eq!(vfs.sync_count() - before, 2, "one real barrier pair for two markers");
+            let old = NativeSnapshotPager::new(image).unwrap();
+            let held: TransactionKind = old.begin(&cx, TransactionMode::ReadOnly).unwrap().into();
+            assert_eq!(held.get_page(&cx, page(2)).await.unwrap().as_bytes()[0], 0x05);
+            let (receipt, image) = source.replicate_snapshot_to(&cx, &mut replica, 128)
+                .await.unwrap().unwrap();
+            assert_eq!(receipt.commits, 1);
+            assert_eq!(receipt.first_seq, CommitSeq::new(3));
+            assert_eq!(image.commit_seq(), receipt.last_seq);
+            assert_eq!(vfs.sync_count() - before, 4);
+            let latest = NativeSnapshotPager::new(image).unwrap();
+            let (mut held, actual) = execute(&cx, held, &scan_program()).await;
+            assert_eq!(actual, expected(&rows), "reader cannot switch to later replicated deletions");
+            held.rollback(&cx).await.unwrap();
+            assert_eq!(query(&cx, &latest).await, expected(&remaining(&rows)));
+            assert!(matches!(latest.begin(&cx, TransactionMode::Concurrent), Err(FrankenError::ReadOnly)));
+            let mut reader = latest.begin(&cx, TransactionMode::ReadOnly).unwrap();
+            assert!(matches!(reader.write_page(&cx, page(2), &empty_root()).await,
+                Err(FrankenError::ReadOnly)));
+            reader.rollback(&cx).await.unwrap();
+            assert!(source.replicate_snapshot_to(&cx, &mut replica, 1).await.unwrap().is_none());
+            assert_eq!(vfs.sync_count() - before, 4, "reads and equal-tip checks do not publish");
+            source.close(&cx).unwrap();
+
+            // Rebuild solely from destination streams, then query the same rows
+            // through the sealed reader with the source already closed.
+            let mut physical = replica.into_recovery();
+            physical.prepare(&cx, |id, records| ready(Codec.decode(&cx, id, &records).map(|_| ())))
+                .await.unwrap();
+            let mut replay = NativePageRecovery::new(physical.finish().unwrap(), Codec,
+                512, NativePageLimits::default());
+            let independently_recovered = NativeSnapshotPager::new(
+                replay.prepare_snapshot(&cx, CommitSeq::new(3)).await.unwrap()).unwrap();
+            replay.close(&cx).unwrap();
+            assert_eq!(query(&cx, &independently_recovered).await, expected(&remaining(&rows)));
+            assert_eq!(query(&cx, &old).await, expected(&rows));
+        });
+    }
+
+    #[test]
+    fn failed_replica_barriers_never_return_images_and_resume_from_recovered_markers() {
+        run(async {
+            for (path, index_delta, recovered_tip) in [
+                ("replica-objects", 0, 1_u64), ("replica-markers", 1, 2_u64),
+            ] {
+                let cx = Cx::new();
+                let memory = MemoryVfs::new();
+                let (mut source, rows) = history(&memory, &cx).await;
+                let vfs = FaultInjectingVfs::new(memory);
+                let mut replica = replica(&vfs, &cx);
+                let (_, old) = source.replicate_snapshot_to(&cx, &mut replica, 1)
+                    .await.unwrap().unwrap();
+                let old = NativeSnapshotPager::new(old).unwrap();
+                assert!(query(&cx, &old).await.is_empty());
+                let before = vfs.sync_count();
+                vfs.inject_fault(FaultSpec::power_cut(path)
+                    .after_nth_sync(before + index_delta).build());
+                assert!(source.replicate_snapshot_to(&cx, &mut replica, 1).await.is_err());
+                assert!(vfs.is_powered_off());
+                assert_eq!(vfs.triggered_faults().len(), 1);
+                assert_eq!(vfs.sync_count(), before + index_delta + 1);
+                assert!(replica.needs_recovery());
+                assert_eq!(replica.published_tip(), CommitSeq::new(1));
+                // Already delivered immutable images have no dependency on
+                // these file handles or the newly indeterminate destination.
+                assert!(query(&cx, &old).await.is_empty());
+                vfs.power_on();
+                assert!(source.replicate_snapshot_to(&cx, &mut replica, 1).await.is_err());
+                assert_eq!(vfs.sync_count(), before + index_delta + 1,
+                    "power restoration alone cannot authorize another append");
+
+                // This fixture retains MemoryVfs writes across a sync error.
+                // It models explicit barrier failures, not physical power loss.
+                let mut physical = replica.into_recovery();
+                physical.prepare(&cx, |id, records| ready(Codec.decode(&cx, id, &records).map(|_| ())))
+                    .await.unwrap();
+                let recovered = physical.finish().unwrap();
+                assert_eq!(recovered.report().markers.len(), usize::try_from(recovered_tip).unwrap());
+                let (mut replica, _) = recovered.into_log();
+                let before = vfs.sync_count();
+                let (receipt, image) = source.replicate_snapshot_to(&cx, &mut replica, 128)
+                    .await.unwrap().unwrap();
+                assert_eq!(receipt.first_seq, CommitSeq::new(recovered_tip + 1));
+                assert_eq!(receipt.last_seq, CommitSeq::new(3));
+                assert_eq!(receipt.commits, usize::try_from(3 - recovered_tip).unwrap());
+                assert_eq!(vfs.sync_count() - before, 2);
+                assert!(!replica.needs_recovery());
+                let latest = NativeSnapshotPager::new(image).unwrap();
+                assert_eq!(query(&cx, &latest).await, expected(&remaining(&rows)));
+                assert!(query(&cx, &old).await.is_empty());
+                assert!(source.replicate_snapshot_to(&cx, &mut replica, 128).await.unwrap().is_none());
+                assert_eq!(vfs.sync_count() - before, 2);
+                replica.close(&cx).unwrap();
+                source.close(&cx).unwrap();
+            }
+        });
+    }
+}
