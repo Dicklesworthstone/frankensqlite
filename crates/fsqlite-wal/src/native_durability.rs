@@ -14,6 +14,9 @@
 //! writes, including writes whose awaiting future was dropped. This module
 //! acquires no database-wide transaction lock and creates/deletes no files.
 
+mod recovery;
+pub use recovery::{NativeRecovery, RecoveredNativeLog};
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use fsqlite_error::{FrankenError, Result};
@@ -196,6 +199,13 @@ impl<S: VfsFile, M: VfsFile> NativeDurabilityLog<S, M> {
         self.last_write.clone()
     }
 
+    /// Transfer this exact log, including any source-owned write completion,
+    /// into an explicitly driven rewrite-before-sync recovery owner.
+    #[must_use]
+    pub fn into_recovery(self) -> NativeRecovery<S, M> {
+        NativeRecovery::from_log(self)
+    }
+
     fn ready(&self) -> Result<()> {
         self.readable()?;
         if self.append_blocked {
@@ -222,6 +232,12 @@ impl<S: VfsFile, M: VfsFile> NativeDurabilityLog<S, M> {
     /// capsule and proof must pass the mandatory async object verifier before
     /// referents and markers are re-synchronized in that order. Readable bytes
     /// after a failed sync are not themselves evidence of durability.
+    /// A successful retry of fsync also need not write clean-but-lost cache
+    /// pages. This non-rewriting entry requires that such writeback uncertainty
+    /// has already been resolved (for example, a fresh system boot or a prior
+    /// [`NativeRecovery::prepare`]). For live recovery after an I/O error use
+    /// [`NativeRecovery`], which retains rewrite buffers and completion tokens
+    /// outside its borrowed future. Reopening handles alone is not sufficient.
     ///
     /// An incomplete tail is reported and retained. The returned log permits
     /// object reads but refuses new appends/publication until the caller has
@@ -235,17 +251,39 @@ impl<S: VfsFile, M: VfsFile> NativeDurabilityLog<S, M> {
         symbols: S,
         markers: M,
         limits: NativeDurabilityLimits,
-        mut verify_object: V,
+        verify_object: V,
     ) -> Result<(Self, NativeDurabilityRecovery)>
     where
         V: FnMut(ObjectId, Vec<SymbolRecord>) -> VF,
         VF: std::future::Future<Output = Result<()>>,
     {
-        limits.validate()?;
+        let mut log = Self::empty(symbols, markers, limits);
+        let report = log.scan_recovery(cx, verify_object).await?;
+        log.symbols.durable_sync(cx, SyncKind::FullDurable)?;
+        log.markers.durable_sync(cx, SyncKind::FullDurable)?;
+        log.poisoned = false;
+        Ok((log, report))
+    }
+
+    // Shared, non-mutating-on-disk admission for both recovery entry points.
+    // A cancelled or failed scan leaves this owner poisoned, even if its
+    // partially rebuilt index happens to contain every requested object.
+    async fn scan_recovery<V, VF>(
+        &mut self,
+        cx: &Cx,
+        mut verify_object: V,
+    ) -> Result<NativeDurabilityRecovery>
+    where
+        V: FnMut(ObjectId, Vec<SymbolRecord>) -> VF,
+        VF: std::future::Future<Output = Result<()>>,
+    {
+        self.poisoned = true;
+        self.limits.validate()?;
         checkpoint(cx)?;
-        ensure_distinct_files(&symbols, &markers)?;
-        let symbol_end = symbols.file_size(cx)?;
-        let marker_end = markers.file_size(cx)?;
+        ensure_distinct_files(&self.symbols, &self.markers)?;
+        let limits = self.limits;
+        let symbol_end = self.symbols.file_size(cx)?;
+        let marker_end = self.markers.file_size(cx)?;
         let marker_width = u64_len(COMMIT_MARKER_RECORD_V1_SIZE)?;
         let marker_count =
             usize::try_from(marker_end / marker_width).map_err(|_| FrankenError::TooBig)?;
@@ -255,18 +293,19 @@ impl<S: VfsFile, M: VfsFile> NativeDurabilityLog<S, M> {
         {
             return Err(FrankenError::TooBig);
         }
-        let mut log = Self::empty(symbols, markers, limits);
-        log.symbol_end = symbol_end;
-        log.marker_end = marker_end;
+        self.index.clear();
+        self.record_count = 0;
+        self.symbol_end = symbol_end;
+        self.marker_end = marker_end;
         let mut offset = 0_u64;
         let mut erased_symbols = 0_usize;
         while symbol_end - offset >= u64_len(SYMBOL_HEADER_BYTES)? {
             checkpoint(cx)?;
-            if log.record_count == limits.max_records {
+            if self.record_count == limits.max_records {
                 return Err(FrankenError::TooBig);
             }
             let mut header = [0_u8; SYMBOL_HEADER_BYTES];
-            read_exact_at(&log.symbols, cx, &mut header, offset).await?;
+            read_exact_at(&self.symbols, cx, &mut header, offset).await?;
             let len = symbol_wire_len(&header, limits)?;
             let end = offset
                 .checked_add(u64_len(len)?)
@@ -275,10 +314,10 @@ impl<S: VfsFile, M: VfsFile> NativeDurabilityLog<S, M> {
                 break;
             }
             let mut bytes = zeroed(len)?;
-            read_exact_at(&log.symbols, cx, &mut bytes, offset).await?;
+            read_exact_at(&self.symbols, cx, &mut bytes, offset).await?;
             match SymbolRecord::from_bytes(&bytes) {
                 Ok(record) => {
-                    log.index
+                    self.index
                         .entry(record.object_id)
                         .or_default()
                         .push(SymbolLocation { offset, len });
@@ -286,7 +325,7 @@ impl<S: VfsFile, M: VfsFile> NativeDurabilityLog<S, M> {
                 Err(SymbolRecordError::IntegrityFailure { .. }) => erased_symbols += 1,
                 Err(error) => return Err(corrupt(&error.to_string())),
             }
-            log.record_count += 1;
+            self.record_count += 1;
             offset = end;
         }
         let mut recovered = Vec::new();
@@ -303,13 +342,13 @@ impl<S: VfsFile, M: VfsFile> NativeDurabilityLog<S, M> {
             let position = u64_len(ordinal)?
                 .checked_mul(marker_width)
                 .ok_or(FrankenError::TooBig)?;
-            read_exact_at(&log.markers, cx, &mut bytes, position).await?;
+            read_exact_at(&self.markers, cx, &mut bytes, position).await?;
             let marker = CommitMarker::from_record_bytes(&bytes)
                 .ok_or_else(|| corrupt("malformed native marker record"))?;
             validate_marker(&marker, tip, previous, time)?;
             for object_id in [marker.capsule_object_id, marker.proof_object_id] {
                 if verified.insert(object_id) {
-                    let records = log.read_object(cx, object_id).await?;
+                    let records = self.read_indexed_object(cx, object_id).await?;
                     verify_object(object_id, records).await?;
                 }
             }
@@ -320,22 +359,18 @@ impl<S: VfsFile, M: VfsFile> NativeDurabilityLog<S, M> {
         }
         let report = NativeDurabilityRecovery {
             markers: recovered,
-            symbol_records: log.record_count,
+            symbol_records: self.record_count,
             erased_symbols,
             symbol_tail_bytes: symbol_end - offset,
             marker_tail_bytes: marker_end % marker_width,
         };
-        log.check_lengths(cx)?;
+        self.check_lengths(cx)?;
         checkpoint(cx)?;
-        log.poisoned = true;
-        log.symbols.durable_sync(cx, SyncKind::FullDurable)?;
-        log.markers.durable_sync(cx, SyncKind::FullDurable)?;
-        log.published_tip = tip;
-        log.previous_marker = previous;
-        log.last_time_ns = time;
-        log.append_blocked = report.append_blocked();
-        log.poisoned = false;
-        Ok((log, report))
+        self.published_tip = tip;
+        self.previous_marker = previous;
+        self.last_time_ns = time;
+        self.append_blocked = report.append_blocked();
+        Ok(report)
     }
 
     fn check_lengths(&mut self, cx: &Cx) -> Result<()> {
@@ -442,6 +477,12 @@ impl<S: VfsFile, M: VfsFile> NativeDurabilityLog<S, M> {
     /// malformed records, exceeded limits, cancellation, or VFS failure.
     pub async fn read_object(&self, cx: &Cx, object_id: ObjectId) -> Result<Vec<SymbolRecord>> {
         self.readable()?;
+        self.read_indexed_object(cx, object_id).await
+    }
+
+    // Only the poisoned recovery owner may use the rebuilt index before the
+    // durability barriers. Public reads still require `readable` above.
+    async fn read_indexed_object(&self, cx: &Cx, object_id: ObjectId) -> Result<Vec<SymbolRecord>> {
         let locations = self
             .index
             .get(&object_id)
