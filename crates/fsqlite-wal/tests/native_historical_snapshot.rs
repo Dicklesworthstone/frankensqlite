@@ -50,11 +50,24 @@ struct Audit {
     writes: AtomicUsize,
     syncs: AtomicUsize,
     closes: AtomicUsize,
+    metadata: AtomicUsize,
+    fail_sync_at: AtomicUsize,
     pause_read: AtomicBool,
 }
 impl Audit {
     fn mutations(&self) -> [usize; 3] {
         [&self.writes, &self.syncs, &self.closes].map(|v| v.load(Ordering::SeqCst))
+    }
+    fn all_io(&self) -> [usize; 5] {
+        [&self.reads, &self.writes, &self.syncs, &self.closes, &self.metadata]
+            .map(|v| v.load(Ordering::SeqCst))
+    }
+    fn barrier(&self) -> Result<()> {
+        let ordinal = self.syncs.fetch_add(1, Ordering::SeqCst) + 1;
+        if self.fail_sync_at.load(Ordering::SeqCst) == ordinal {
+            return Err(std::io::Error::other("injected online snapshot barrier failure").into());
+        }
+        Ok(())
     }
 }
 struct File { inner: <MemoryVfs as Vfs>::File, audit: Arc<Audit> }
@@ -62,8 +75,12 @@ impl VfsFile for File {
     fn close(&mut self, cx: &Cx) -> Result<()> {
         self.audit.closes.fetch_add(1, Ordering::SeqCst); self.inner.close(cx)
     }
-    fn file_identity(&self) -> Result<Option<FileIdentity>> { self.inner.file_identity() }
-    fn refresh_file_identity(&self) -> Result<Option<FileIdentity>> { self.inner.refresh_file_identity() }
+    fn file_identity(&self) -> Result<Option<FileIdentity>> {
+        self.audit.metadata.fetch_add(1, Ordering::SeqCst); self.inner.file_identity()
+    }
+    fn refresh_file_identity(&self) -> Result<Option<FileIdentity>> {
+        self.audit.metadata.fetch_add(1, Ordering::SeqCst); self.inner.refresh_file_identity()
+    }
     async fn read<'a>(&'a self, cx: &'a Cx, bytes: &'a mut [u8], offset: u64) -> Result<usize> {
         self.audit.reads.fetch_add(1, Ordering::SeqCst);
         if self.audit.pause_read.swap(false, Ordering::SeqCst) { return pending().await; }
@@ -76,12 +93,14 @@ impl VfsFile for File {
         self.audit.writes.fetch_add(1, Ordering::SeqCst); self.inner.truncate(cx, size)
     }
     fn sync(&mut self, cx: &Cx, flags: SyncFlags) -> Result<()> {
-        self.audit.syncs.fetch_add(1, Ordering::SeqCst); self.inner.sync(cx, flags)
+        self.audit.barrier()?; self.inner.sync(cx, flags)
     }
     fn durable_sync(&mut self, cx: &Cx, kind: SyncKind) -> Result<()> {
-        self.audit.syncs.fetch_add(1, Ordering::SeqCst); self.inner.durable_sync(cx, kind)
+        self.audit.barrier()?; self.inner.durable_sync(cx, kind)
     }
-    fn file_size(&self, cx: &Cx) -> Result<u64> { self.inner.file_size(cx) }
+    fn file_size(&self, cx: &Cx) -> Result<u64> {
+        self.audit.metadata.fetch_add(1, Ordering::SeqCst); self.inner.file_size(cx)
+    }
     fn lock(&mut self, cx: &Cx, level: LockLevel) -> Result<()> { self.inner.lock(cx, level) }
     fn unlock(&mut self, cx: &Cx, level: LockLevel) -> Result<()> { self.inner.unlock(cx, level) }
     fn lock_external_wal_append(&mut self, cx: &Cx) -> Result<()> { self.inner.lock_external_wal_append(cx) }
@@ -317,6 +336,9 @@ fn historical_read_of_complete_prefix_does_not_authorize_torn_tail_writes() {
         let (mut db, report) = replay.finish().unwrap();
         assert_eq!(report.symbol_tail_bytes, 4); assert!(db.needs_recovery());
         assert!(matches!(db.begin(&cx), Err(FrankenError::BusyRecovery)));
+        let before_capture = audit.all_io();
+        assert!(matches!(db.capture_snapshot(&cx), Err(FrankenError::BusyRecovery)));
+        assert_eq!(audit.all_io(), before_capture, "live capture cannot bypass a torn tail");
         assert_eq!(audit.mutations(), before); db.close(&cx).unwrap();
     });
 }
@@ -330,10 +352,14 @@ fn authenticated_raptorq_snapshots_reject_wrong_keys_and_keep_historical_bytes()
         let vfs = MemoryVfs::new(); let audit = Arc::new(Audit::default());
         let mut db = NativePageStore::new(log(&vfs, &cx, &audit), RaptorQNativeCodec::new(Some([7; 32])),
             512, NativePageLimits::default()).unwrap();
+        let mut live_images = Vec::new();
         for value in 1..=2 {
             let mut tx = db.begin(&cx).unwrap();
             for n in 1..=9 { db.write_page(&cx, &mut tx, page(n), Some(&[value; 512])).unwrap(); }
             db.commit(&cx, &mut tx, u64::from(value) * 100).await.unwrap();
+            let before = audit.all_io();
+            live_images.push(db.capture_snapshot(&cx).unwrap());
+            assert_eq!(audit.all_io(), before, "capture must not run the codec or touch storage");
         }
         let (mut physical, codec) = db.try_into_recovery().ok().unwrap();
         physical.prepare(&cx, |id, records| ready(codec.decode(&cx, id, &records).map(|_| ()))).await.unwrap();
@@ -349,7 +375,202 @@ fn authenticated_raptorq_snapshots_reject_wrong_keys_and_keep_historical_bytes()
         let image = replay.prepare_snapshot(&cx, CommitSeq::new(1)).await.unwrap();
         assert_eq!(image.page_count(), 9);
         for n in 1..=9 { assert_page(&image, n, Some(1)); }
+        assert_eq!(live_images[0].commit_time_unix_ns(), image.commit_time_unix_ns());
+        for n in 1..=9 {
+            assert_eq!(live_images[0].read_page(page(n)), image.read_page(page(n)));
+            assert_page(&live_images[1], n, Some(2));
+        }
         let (mut current, _) = replay.finish().unwrap();
         assert_eq!(current.committed_tip(), CommitSeq::new(2)); current.close(&cx).unwrap();
+    });
+}
+
+fn capture_without_io(db: &Store, cx: &Cx, audit: &Audit) -> NativePageSnapshot {
+    let before = audit.all_io();
+    let image = db.capture_snapshot(cx).unwrap();
+    assert_eq!(audit.all_io(), before, "capture must perform no data or metadata I/O");
+    image
+}
+
+#[test]
+fn online_capture_excludes_private_writes_and_handles_pinned_old_versions() {
+    run(async {
+        let cx = Cx::new(); let vfs = MemoryVfs::new(); let audit = Arc::new(Audit::default());
+        let limits = NativePageLimits { max_active_transactions: 2, ..NativePageLimits::default() };
+        let mut db = Store::new(log(&vfs, &cx, &audit), Codec, 512, limits).unwrap();
+        let genesis = capture_without_io(&db, &cx, &audit);
+        assert_eq!(genesis.commit_seq(), CommitSeq::ZERO);
+        assert_eq!(genesis.commit_time_unix_ns(), None);
+        assert_eq!(genesis.page_count(), 0);
+        assert_eq!(genesis.database_size_bound(), 0);
+        put(&mut db, &cx, &[(2, Some(2)), (900_000, Some(9))], 100).await;
+        let mut pinned = db.begin(&cx).unwrap(); // No read is needed to pin old versions.
+        let mut writer = db.begin(&cx).unwrap();
+        db.write_page(&cx, &mut writer, page(2), Some(&[0xA5; 512])).unwrap();
+        db.write_page(&cx, &mut writer, page(900_001), Some(&[0xEE; 512])).unwrap();
+        assert!(db.begin(&cx).is_err(), "the live transaction limit is actually full");
+        let first = capture_without_io(&db, &cx, &audit);
+        assert_eq!(first.commit_seq(), CommitSeq::new(1));
+        assert_eq!(first.commit_time_unix_ns(), Some(100));
+        assert_eq!(first.database_size_bound(), 900_000);
+        assert_eq!(first.page_count(), 2);
+        assert_page(&first, 2, Some(2)); assert_page(&first, 900_001, None);
+        let receipt = db.commit(&cx, &mut writer, 50).await.unwrap().unwrap();
+        assert_eq!(receipt.commit_time_unix_ns, 101);
+        let second = capture_without_io(&db, &cx, &audit);
+        assert_eq!(second.commit_seq(), receipt.commit_seq);
+        assert_eq!(second.commit_time_unix_ns(), Some(receipt.commit_time_unix_ns));
+        assert_eq!(second.retained_page_bytes(), 1536);
+        assert!(db.retained_page_bytes() > second.retained_page_bytes(), "old pin still retains payloads");
+        assert_page(&second, 2, Some(0xA5)); assert_page(&second, 900_001, Some(0xEE));
+        assert_eq!(db.read_page(&cx, &mut pinned, page(2)).unwrap().unwrap().as_ref(), &[2; 512]);
+        assert!(db.read_page(&cx, &mut pinned, page(900_001)).unwrap().is_none());
+        put(&mut db, &cx, &[(2, Some(3)), (900_000, None)], 0).await;
+        let third = capture_without_io(&db, &cx, &audit);
+        assert_eq!(third.commit_seq(), CommitSeq::new(3));
+        assert_eq!(third.commit_time_unix_ns(), Some(102));
+        assert_eq!(third.database_size_bound(), 900_001);
+        assert_eq!(third.page_numbers().collect::<Vec<_>>(), vec![page(2), page(900_001)]);
+        assert_page(&third, 900_000, None);
+        db.rollback(&mut pinned).unwrap();
+        assert!(db.reclaim_history(&cx, 10).unwrap() > 0);
+        db.close(&cx).unwrap();
+        assert_page(&first, 2, Some(2)); assert_page(&first, 900_000, Some(9));
+        assert_page(&second, 2, Some(0xA5)); assert_page(&second, 900_000, Some(9));
+        assert_page(&third, 2, Some(3)); assert_page(&third, 900_000, None);
+    });
+}
+
+#[test]
+fn online_group_snapshot_matches_cold_replay_and_ignores_read_only_clock_samples() {
+    run(async {
+        let cx = Cx::new(); let vfs = MemoryVfs::new(); let audit = Arc::new(Audit::default());
+        let mut db = store(&vfs, &cx, &audit);
+        put(&mut db, &cx, &[(2, Some(1))], 90).await;
+        let mut a = db.begin(&cx).unwrap();
+        let mut reader = db.begin(&cx).unwrap();
+        let mut b = db.begin(&cx).unwrap();
+        db.write_page(&cx, &mut a, page(2), Some(&[2; 512])).unwrap();
+        db.write_page(&cx, &mut b, page(3), Some(&[3; 512])).unwrap();
+        let receipts = db.commit_batch(&cx, &mut [&mut a, &mut reader, &mut b], 100).await.unwrap();
+        assert_eq!(receipts[0].as_ref().unwrap().commit_seq, CommitSeq::new(2));
+        assert!(receipts[1].is_none());
+        assert_eq!(receipts[2].as_ref().unwrap().commit_seq, CommitSeq::new(3));
+        assert_eq!(receipts[2].as_ref().unwrap().commit_time_unix_ns, 101);
+        let live = capture_without_io(&db, &cx, &audit);
+        assert_eq!(live.commit_seq(), CommitSeq::new(3));
+        assert_eq!(live.commit_time_unix_ns(), Some(101));
+        assert_page(&live, 2, Some(2)); assert_page(&live, 3, Some(3));
+        let mut reader = db.begin(&cx).unwrap();
+        assert!(db.commit(&cx, &mut reader, u64::MAX).await.unwrap().is_none());
+        assert_eq!(capture_without_io(&db, &cx, &audit).commit_time_unix_ns(), Some(101));
+        let mut recovery = recover(db, &cx, NativePageLimits::default()).await;
+        let cold = recovery.prepare_snapshot(&cx, live.commit_seq()).await.unwrap();
+        assert_eq!(cold.commit_time_unix_ns(), live.commit_time_unix_ns());
+        assert_eq!(cold.database_size_bound(), live.database_size_bound());
+        assert_eq!(cold.page_numbers().collect::<Vec<_>>(), live.page_numbers().collect::<Vec<_>>());
+        for page in live.page_numbers() { assert_eq!(cold.read_page(page), live.read_page(page)); }
+        let (mut db, _) = recovery.finish().unwrap();
+        assert_eq!(capture_without_io(&db, &cx, &audit).commit_time_unix_ns(), Some(101));
+        put(&mut db, &cx, &[(2, Some(4))], 0).await;
+        let next = capture_without_io(&db, &cx, &audit);
+        assert_eq!(next.commit_seq(), CommitSeq::new(4));
+        assert_eq!(next.commit_time_unix_ns(), Some(102));
+        assert_page(&live, 2, Some(2)); assert_page(&next, 2, Some(4));
+        db.close(&cx).unwrap();
+    });
+}
+
+#[test]
+fn online_images_do_not_pin_live_history_or_consume_transaction_capacity() {
+    run(async {
+        let cx = Cx::new(); let vfs = MemoryVfs::new(); let audit = Arc::new(Audit::default());
+        let limits = NativePageLimits {
+            max_retained_page_bytes: 1024, max_versions: 2, max_active_transactions: 1,
+        };
+        let mut db = Store::new(log(&vfs, &cx, &audit), Codec, 512, limits).unwrap();
+        let mut images = Vec::new();
+        for value in 1_u8..=64 {
+            put(&mut db, &cx, &[(2, Some(value))], u64::from(value)).await;
+            images.push(capture_without_io(&db, &cx, &audit));
+            db.reclaim_history(&cx, 1).unwrap();
+            assert_eq!(db.retained_page_bytes(), 512);
+            assert_eq!(db.retained_version_count(), 1);
+        }
+        db.close(&cx).unwrap();
+        for (index, image) in images.iter().enumerate() {
+            let value = u8::try_from(index + 1).unwrap();
+            assert_eq!(image.commit_seq(), CommitSeq::new(u64::from(value)));
+            assert_eq!(image.commit_time_unix_ns(), Some(u64::from(value)));
+            assert_page(image, 2, Some(value));
+        }
+    });
+}
+
+#[test]
+fn online_capture_refuses_failed_barriers_and_abandoned_publication_until_recovery() {
+    use fsqlite_wal::native_pages::NativePageTransactionState;
+    run(async {
+        // Zero drops a pending validation read; one/two fail the real barriers.
+        for barrier in 0..=2 {
+            let cx = Cx::new(); let vfs = MemoryVfs::new(); let audit = Arc::new(Audit::default());
+            let mut db = store(&vfs, &cx, &audit);
+            put(&mut db, &cx, &[(2, Some(1))], 100).await;
+            let before_failure = capture_without_io(&db, &cx, &audit);
+            let mut tx = db.begin(&cx).unwrap();
+            db.write_page(&cx, &mut tx, page(2), Some(&[9; 512])).unwrap();
+            if barrier == 0 {
+                audit.pause_read.store(true, Ordering::SeqCst);
+                {
+                    let mut attempt = std::pin::pin!(db.commit(&cx, &mut tx, 200));
+                    assert!(poll_fn(|task| Poll::Ready(attempt.as_mut().poll(task))).await.is_pending());
+                }
+                assert!(!audit.pause_read.load(Ordering::SeqCst), "the publication reached the injected read");
+            } else {
+                let fail_at = audit.syncs.load(Ordering::SeqCst) + barrier;
+                audit.fail_sync_at.store(fail_at, Ordering::SeqCst);
+                assert!(matches!(db.commit(&cx, &mut tx, 200).await, Err(FrankenError::Io(_))));
+                assert_eq!(audit.syncs.load(Ordering::SeqCst), fail_at);
+            }
+            assert_eq!(tx.state(), NativePageTransactionState::Indeterminate);
+            assert!(db.needs_recovery());
+            let before_capture = audit.all_io();
+            assert!(matches!(db.capture_snapshot(&cx), Err(FrankenError::BusyRecovery)));
+            assert_eq!(audit.all_io(), before_capture);
+            assert_eq!(tx.state(), NativePageTransactionState::Indeterminate);
+            assert_page(&before_failure, 2, Some(1));
+            audit.fail_sync_at.store(0, Ordering::SeqCst);
+            drop(tx); // Abandoning the old handle does not declare its commit absent.
+            let mut recovery = recover(db, &cx, NativePageLimits::default()).await;
+            recovery.prepare(&cx).await.unwrap();
+            let (mut db, _) = recovery.finish().unwrap();
+            let image = capture_without_io(&db, &cx, &audit);
+            assert_eq!(image.commit_seq(), CommitSeq::new(if barrier == 2 { 2 } else { 1 }));
+            assert_eq!(image.commit_time_unix_ns(), Some(if barrier == 2 { 200 } else { 100 }));
+            assert_page(&image, 2, Some(if barrier == 2 { 9 } else { 1 }));
+            assert_page(&before_failure, 2, Some(1));
+            db.close(&cx).unwrap();
+        }
+    });
+}
+
+#[test]
+fn online_capture_cancellation_and_close_never_change_a_returned_image() {
+    run(async {
+        let cx = Cx::new(); let vfs = MemoryVfs::new(); let audit = Arc::new(Audit::default());
+        let mut db = store(&vfs, &cx, &audit);
+        put(&mut db, &cx, &[(2, Some(7))], 100).await;
+        let image = capture_without_io(&db, &cx, &audit);
+        let cancelled = Cx::new(); cancelled.cancel();
+        let before = audit.all_io();
+        assert!(matches!(db.capture_snapshot(&cancelled), Err(FrankenError::Interrupt)));
+        assert_eq!(audit.all_io(), before);
+        assert!(!db.needs_recovery());
+        assert_eq!(capture_without_io(&db, &cx, &audit).commit_seq(), image.commit_seq());
+        db.close(&cx).unwrap();
+        let before = audit.all_io();
+        assert!(matches!(db.capture_snapshot(&cx), Err(FrankenError::BusyRecovery)));
+        assert_eq!(audit.all_io(), before);
+        assert_page(&image, 2, Some(7));
     });
 }

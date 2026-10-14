@@ -425,3 +425,37 @@ fn authenticated_attempt_requires_successful_authenticated_semantic_replay() {
         owner.close(&cx).unwrap();
     });
 }
+
+#[test]
+fn snapshot_metadata_never_pairs_a_reserved_clock_with_a_published_prefix() {
+    run(async {
+        let cx = Cx::new(); let vfs = MemoryVfs::new(); let audit = Arc::new(Audit::default());
+        let mut driver = Driver::new(log(&vfs, &cx, &audit), Codec, 8).unwrap();
+        assert_eq!(driver.published_snapshot_metadata().unwrap(), (CommitSeq::ZERO, None));
+        let first = queue(&mut driver, &cx, 1, 100).await;
+        let before = (audit.reads.load(Ordering::SeqCst), audit.mutations());
+        assert!(matches!(driver.published_snapshot_metadata(), Err(FrankenError::Busy)));
+        assert_eq!((audit.reads.load(Ordering::SeqCst), audit.mutations()), before);
+        assert_eq!(driver.pending_count(), 1);
+        flush(&mut driver, &cx).await.unwrap();
+        assert_eq!(driver.published_snapshot_metadata().unwrap(), (CommitSeq::new(1), Some(100)));
+        let second = queue(&mut driver, &cx, 2, 500).await;
+        assert!(driver.flush(&cx, |_, _| Err::<(), _>(FrankenError::Abort)).await.is_err());
+        assert!(!driver.needs_recovery(), "pre-write rejection leaves the queued attempt healthy");
+        let before = (audit.reads.load(Ordering::SeqCst), audit.mutations());
+        assert!(matches!(driver.published_snapshot_metadata(), Err(FrankenError::Busy)));
+        assert_eq!((audit.reads.load(Ordering::SeqCst), audit.mutations()), before);
+        assert_eq!(driver.take_committed(first.commit_seq()).unwrap().commit_time_unix_ns, 100);
+        flush(&mut driver, &cx).await.unwrap();
+        assert_eq!(driver.published_snapshot_metadata().unwrap(), (CommitSeq::new(2), Some(500)));
+        driver.take_committed(second.commit_seq()).unwrap();
+        queue(&mut driver, &cx, 3, 0).await;
+        audit.fail_sync.store(audit.syncs.load(Ordering::SeqCst) + 1, Ordering::SeqCst);
+        assert!(flush(&mut driver, &cx).await.is_err());
+        let before = (audit.reads.load(Ordering::SeqCst), audit.mutations());
+        assert!(matches!(driver.published_snapshot_metadata(), Err(FrankenError::BusyRecovery)));
+        assert_eq!((audit.reads.load(Ordering::SeqCst), audit.mutations()), before);
+        driver.close(&cx).unwrap();
+        assert!(matches!(driver.published_snapshot_metadata(), Err(FrankenError::BusyRecovery)));
+    });
+}

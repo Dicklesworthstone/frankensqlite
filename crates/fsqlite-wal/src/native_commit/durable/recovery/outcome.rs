@@ -64,6 +64,24 @@ pub enum NativeCommitOutcome {
 }
 
 impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> DurableWriteCoordinator<S, M, C> {
+    // The coordinator clock includes unflushed reservations. It describes the
+    // published snapshot only when allocation has caught up with publication.
+    // Page-store capture must never attach a future reservation's timestamp to
+    // an older committed image. This reads owned metadata, not either stream.
+    pub(crate) fn published_snapshot_metadata(&self) -> Result<(CommitSeq, Option<u64>)> {
+        self.ready()?;
+        let sequence = self.coordinator.commit_seq_tip;
+        if self.coordinator.allocated_seq_tip != sequence {
+            return Err(FrankenError::Busy);
+        }
+        if self.log.published_tip() != sequence {
+            return Err(corrupt("native snapshot coordinator/log tip mismatch"));
+        }
+        let time = (sequence != CommitSeq::ZERO)
+            .then_some(self.coordinator.last_commit_time_ns);
+        Ok((sequence, time))
+    }
+
     /// Capture one queued or indeterminate attempt without consuming its reply.
     ///
     /// Query before transfer to recovery, either after `queue` and before

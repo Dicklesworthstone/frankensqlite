@@ -24,6 +24,36 @@ use crate::native_durability::{
 use crate::native_pages::NativePageSnapshot;
 
 impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativePageStore<S, M, C> {
+    /// Capture the latest fully published image without quiescing live readers
+    /// or writers, entering recovery, or touching either physical stream.
+    ///
+    /// The image contains committed heads only: private overlays, allocator
+    /// reservations and staged-but-unacknowledged capsules are excluded. It
+    /// shares immutable payloads and has its own sparse index. Returning an
+    /// image creates no transaction token or pin and does not advance the clock.
+    /// Later commits, reclamation, close and recovery cannot change its bytes.
+    ///
+    /// This is a read of already-admitted in-memory history, not a new on-disk
+    /// integrity check or a durable backup. Capture visits retained versions
+    /// to validate accounting, but retains only their latest heads. Its index
+    /// and caller-retained payloads are separate from the live store's budget;
+    /// keeping images can retain memory after the store reclaims old versions.
+    /// No transaction's read set is extended: an image is an independent reader,
+    /// not permission to derive unchecked writes in another transaction.
+    ///
+    /// # Errors
+    /// Refuses closed/recovery-blocked or inconsistently published storage,
+    /// cancellation, allocation failure and invalid retained history/accounting.
+    /// Failure changes no transaction, publication, pin, or storage obligation.
+    pub fn capture_snapshot(&self, cx: &Cx) -> Result<NativePageSnapshot> {
+        self.ready(cx)?;
+        let (sequence, time) = self.driver.published_snapshot_metadata()?;
+        if sequence != self.history.tip {
+            return Err(corrupt("native snapshot page/coordinator tip mismatch"));
+        }
+        capture_snapshot(cx, &self.history, time)
+    }
+
     /// Capture an admitted attempt before relinquishing this live store.
     ///
     /// Use the original transaction's `token()` after an errored or dropped
@@ -419,8 +449,9 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativePageRecovery<S, M, C> {
     }
 }
 
-// Called only immediately after validated atomic page-capsule application (or
-// at empty genesis). Preserve sparse extent while excluding deleted payloads.
+// Both live capture and replay read complete, already-applied capsule heads.
+// Live readers can still pin older versions. Validate ALL retained accounting,
+// but put only the latest images in the result; tombstones retain their extent.
 fn capture_snapshot(
     cx: &Cx,
     history: &PageHistory,
@@ -430,8 +461,30 @@ fn capture_snapshot(
     pages.try_reserve_exact(history.pages.len()).map_err(|_| FrankenError::OutOfMemory)?;
     let mut extent = 0;
     let mut bytes = 0_usize;
+    let mut retained_bytes = 0_usize;
+    let mut retained_versions = 0_usize;
+    let page_size = usize::try_from(history.page_size).map_err(|_| FrankenError::TooBig)?;
     for (page, versions) in &history.pages {
         cx.checkpoint().map_err(|_| FrankenError::Interrupt)?;
+        let mut previous = CommitSeq::ZERO;
+        for version in versions {
+            cx.checkpoint().map_err(|_| FrankenError::Interrupt)?;
+            if version.seq <= previous || version.seq > history.tip {
+                return Err(corrupt("native snapshot has unordered or unpublished versions"));
+            }
+            previous = version.seq;
+            if let Some(data) = &version.data {
+                if data.len() != page_size {
+                    return Err(corrupt("native snapshot page size mismatch"));
+                }
+                retained_bytes = retained_bytes.checked_add(data.len())
+                    .filter(|bytes| *bytes <= history.limits.max_retained_page_bytes)
+                    .ok_or(FrankenError::TooBig)?;
+            }
+            retained_versions = retained_versions.checked_add(1)
+                .filter(|count| *count <= history.limits.max_versions)
+                .ok_or(FrankenError::TooBig)?;
+        }
         if let Some(version) = versions.last() {
             extent = page.get();
             if let Some(data) = &version.data {
@@ -440,9 +493,10 @@ fn capture_snapshot(
             }
         }
     }
-    if bytes != history.payload_bytes {
+    if retained_bytes != history.payload_bytes || retained_versions != history.version_count {
         return Err(corrupt("native historical snapshot payload accounting mismatch"));
     }
+    cx.checkpoint().map_err(|_| FrankenError::Interrupt)?;
     Ok(NativePageSnapshot::from_validated_pages(
         history.tip, time_unix_ns, history.page_size, extent, pages, bytes,
     ))

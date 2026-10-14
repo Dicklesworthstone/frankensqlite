@@ -1,4 +1,4 @@
-//! Immutable historical images reconstructed from validated native history.
+//! Immutable committed images captured live or replayed from native history.
 //!
 //! These own page bytes, not storage handles, writer authority or snapshot pins
 //! in a live publisher. They cannot be converted into a writable page store.
@@ -19,9 +19,10 @@ struct SnapshotPages {
 
 /// A read-only native page image at one exact committed sequence.
 ///
-/// Constructed only by `NativePageRecovery::prepare_snapshot` or
-/// `prepare_snapshot_at_time` after the complete recovered history passes the
-/// ordinary proof, capsule, read-version, token and resource checks. Clones
+/// Constructed by `NativePageStore::capture_snapshot` from fully published
+/// in-memory heads, or by `NativePageRecovery::prepare_snapshot` and
+/// `prepare_snapshot_at_time` after complete durable-history validation.
+/// Live capture does not reread or reauthenticate the physical log. Clones
 /// share the image; later commits, recovery retries and live history reclamation
 /// cannot change it. A deleted page is absent, but its address remains in the
 /// historical extent. Sparse holes are never expanded into a dense page array.
@@ -29,7 +30,7 @@ struct SnapshotPages {
 /// This is an in-memory historical image of the native log, not a serialized
 /// checkpoint, a SQLite database file, an SSI proof or permission to publish.
 /// It does not pin a live transaction or retain file handles or encryption keys.
-/// The payload fits the recovery owner's page budget; independently retained
+/// The payload fits the source owner's page budget; independently retained
 /// images accumulate caller-owned memory. This is not a process-RSS bound.
 #[derive(Clone)]
 pub struct NativePageSnapshot {
@@ -50,8 +51,8 @@ impl fmt::Debug for NativePageSnapshot {
 
 impl NativePageSnapshot {
     // Only the enclosing native-page implementation can create an image. The
-    // recovery interpreter supplies ordered, validated pages after each atomic
-    // capsule; public callers cannot substitute an arbitrary page map.
+    // live store or recovery interpreter supplies ordered, validated heads
+    // after atomic publication; callers cannot substitute an arbitrary page map.
     pub(super) fn from_validated_pages(
         sequence: CommitSeq,
         commit_time_unix_ns: Option<u64>,
