@@ -21,6 +21,12 @@ pub use prefix_copy::NativePrefixCopyReceipt;
 mod recovery;
 pub use recovery::{NativeRecovery, RecoveredNativeLog};
 
+mod transport;
+pub use transport::{
+    NativeReplicationCursor, NativeReplicationLimits, NativeReplicationPlan,
+    NativeReplicationReceiver,
+};
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use fsqlite_error::{FrankenError, Result};
