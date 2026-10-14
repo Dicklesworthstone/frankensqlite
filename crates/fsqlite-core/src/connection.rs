@@ -23932,6 +23932,23 @@ impl Connection {
         });
     }
 
+    fn record_after_trigger_error_state(&self, changes: usize, last_insert_rowid: Option<i64>) {
+        let mut error_state = self.last_table_program_error_state.borrow_mut();
+        let (rollback_visible_total_changes, force_statement_rollback) =
+            error_state.as_ref().map_or((0, false), |state| {
+                (
+                    state.rollback_visible_total_changes,
+                    state.force_statement_rollback,
+                )
+            });
+        *error_state = Some(TableProgramErrorState {
+            changes,
+            last_insert_rowid,
+            rollback_visible_total_changes,
+            force_statement_rollback,
+        });
+    }
+
     fn record_fk_validation_error_state(
         &self,
         changes: usize,
@@ -24080,13 +24097,15 @@ impl Connection {
             .as_ref()
             .copied()
             .filter(|state| !state.force_statement_rollback);
-        let keeps_rows = !matches!(error, FrankenError::RaiseFail(_))
+        let keeps_rows = !error_state.is_some_and(|state| state.force_statement_rollback)
             && constraint_failure_keeps_rows(
                 error,
                 recorded_action,
                 preserve_prior_changes_on_constraint_violation,
             )
-            && (recorded_action.is_some() || usable_state.is_some());
+            && (matches!(error, FrankenError::RaiseFail(_))
+                || recorded_action.is_some()
+                || usable_state.is_some());
         if keeps_rows && let Some(state) = usable_state {
             self.restore_change_tracking_state(
                 state.changes,
@@ -33478,7 +33497,9 @@ impl Connection {
                 }
             }
         };
-        let commit_autocommit_on_error = was_auto && preserved_constraint_failure_rows;
+        let commit_autocommit_on_error = was_auto
+            && (preserved_constraint_failure_rows
+                || matches!(result.as_ref(), Err(FrankenError::RaiseFail(_))));
         let execution_ok = result.is_ok() || commit_autocommit_on_error;
         let autocommit_resolve_start =
             (direct_insert_autocommit_candidate && was_auto).then(Instant::now);
@@ -41509,7 +41530,7 @@ impl Connection {
                 if has_after_insert && !upsert_conflicted {
                     let after_insert_rowid = self.current_last_insert_rowid();
                     for new_values in &trigger_new_rows {
-                        Box::pin(self.fire_after_triggers(
+                        if let Err(error) = Box::pin(self.fire_after_triggers(
                             table_name,
                             &insert_event,
                             None,
@@ -41517,7 +41538,11 @@ impl Connection {
                             None,
                             Some(after_insert_rowid),
                         ))
-                        .await?;
+                        .await
+                        {
+                            self.record_after_trigger_error_state(affected, last_insert_rowid);
+                            return Err(error);
+                        }
                     }
                 }
                 // bd-y7old: fire AFTER UPDATE for a conflicting DO UPDATE whose WHERE
@@ -41532,7 +41557,7 @@ impl Connection {
                         &self.dml_conflict_clause,
                         Some(fsqlite_ast::ConflictAction::Abort),
                     );
-                    Box::pin(self.fire_after_triggers(
+                    if let Err(error) = Box::pin(self.fire_after_triggers(
                         table_name,
                         &update_event,
                         Some(old_row),
@@ -41540,7 +41565,11 @@ impl Connection {
                         *rowid,
                         *rowid,
                     ))
-                    .await?;
+                    .await
+                    {
+                        self.record_after_trigger_error_state(affected, None);
+                        return Err(error);
+                    }
                 }
 
                 if table_name.eq_ignore_ascii_case("sqlite_sequence") {
