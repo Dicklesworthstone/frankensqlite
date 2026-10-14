@@ -10,7 +10,7 @@ use std::fmt;
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
-use fsqlite_types::{ObjectId, SymbolRecord};
+use fsqlite_types::{CommitSeq, ObjectId, SymbolRecord};
 use fsqlite_vfs::{FileIdentity, SyncKind, VfsFile, VfsWriteCompletion, VfsWriteCompletionState};
 
 use super::{
@@ -63,6 +63,40 @@ struct PendingRewrite {
     binding: StreamBinding,
 }
 
+// Keep this outside the scanner's mutable append state. A valid shorter or
+// substituted on-disk chain is not a recovery of a prefix already acknowledged
+// by this owner. Its terminal marker digest binds the entire preceding chain.
+#[derive(Clone, Copy)]
+struct AcknowledgedPrefix {
+    tip: CommitSeq,
+    marker: Option<ObjectId>,
+}
+
+impl AcknowledgedPrefix {
+    fn capture<S: VfsFile, M: VfsFile>(log: &NativeDurabilityLog<S, M>) -> Self {
+        Self { tip: log.published_tip, marker: log.previous_marker }
+    }
+
+    fn check(self, report: &NativeDurabilityRecovery) -> Result<()> {
+        if self.tip == CommitSeq::ZERO {
+            return if self.marker.is_none() {
+                Ok(())
+            } else {
+                Err(corrupt("invalid acknowledged native genesis prefix"))
+            };
+        }
+        let index = usize::try_from(self.tip.get() - 1).map_err(|_| FrankenError::TooBig)?;
+        let marker = report.markers.get(index)
+            .ok_or_else(|| corrupt("native recovery lost an acknowledged commit prefix"))?;
+        if marker.commit_seq != self.tip
+            || self.marker != Some(ObjectId::derive_from_canonical_bytes(&marker.to_record_bytes()))
+        {
+            return Err(corrupt("native recovery replaced an acknowledged commit prefix"));
+        }
+        Ok(())
+    }
+}
+
 /// Explicit recovery owner for a failed or newly reopened native log.
 ///
 /// Keep this object AND the external append/namespace lease alive until its
@@ -78,6 +112,7 @@ struct PendingRewrite {
 #[must_use]
 pub struct NativeRecovery<S: VfsFile, M: VfsFile> {
     log: NativeDurabilityLog<S, M>,
+    acknowledged: AcknowledgedPrefix,
     pending: Option<PendingRewrite>,
     completed: Option<NativeDurabilityRecovery>,
 }
@@ -85,6 +120,7 @@ pub struct NativeRecovery<S: VfsFile, M: VfsFile> {
 impl<S: VfsFile, M: VfsFile> fmt::Debug for NativeRecovery<S, M> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("NativeRecovery")
+            .field("acknowledged_tip", &self.acknowledged.tip)
             .field("completed", &self.completed.is_some())
             .field("retained_rewrite", &self.pending.is_some())
             .field("write_pending", &self.write_pending())
@@ -106,8 +142,9 @@ impl<S: VfsFile, M: VfsFile> NativeRecovery<S, M> {
     }
 
     pub(super) fn from_log(mut log: NativeDurabilityLog<S, M>) -> Self {
+        let acknowledged = AcknowledgedPrefix::capture(&log);
         log.poisoned = true;
-        Self { log, pending: None, completed: None }
+        Self { log, acknowledged, pending: None, completed: None }
     }
 
     /// The original source-owned completion, including an abandoned overwrite.
@@ -134,6 +171,12 @@ impl<S: VfsFile, M: VfsFile> NativeRecovery<S, M> {
     /// complete prefix again. Subsequent retries re-dirty the entire streams:
     /// a failed sync is never retried by issuing just another sync.
     ///
+    /// An existing log's acknowledged marker prefix must survive unchanged.
+    /// Scanning a valid shorter or substituted chain cannot erase that memory,
+    /// even across failed or abandoned attempts. A valid extension is allowed;
+    /// only successful completion of both barriers advances the retained prefix.
+    /// Freshly opened handles have no prior acknowledgement to compare against.
+    ///
     /// An error or dropped future retains ownership and blocks `finish`.
     /// Pending physical writes must settle before retry, scan, or close. A
     /// settled partial overwrite retains its original buffer until restored;
@@ -159,6 +202,7 @@ impl<S: VfsFile, M: VfsFile> NativeRecovery<S, M> {
         let binding = StreamBinding::capture(&self.log, cx)?;
         let report = self.log.scan_recovery(cx, verify_object).await?;
         binding.check(&self.log, cx)?;
+        self.acknowledged.check(&report)?;
         self.rewrite_stream(cx, Stream::Symbols, binding.symbol_end, binding).await?;
         checkpoint(cx)?;
         binding.check(&self.log, cx)?;
@@ -169,6 +213,7 @@ impl<S: VfsFile, M: VfsFile> NativeRecovery<S, M> {
         binding.check(&self.log, cx)?;
         self.log.markers.durable_sync(cx, SyncKind::FullDurable)?;
         // Do not turn an acknowledged barrier into a retry due to late cancel.
+        self.acknowledged = AcknowledgedPrefix::capture(&self.log);
         self.log.last_write = None;
         self.log.poisoned = false;
         self.completed = Some(report);
@@ -285,3 +330,366 @@ impl<S: VfsFile, M: VfsFile> RecoveredNativeLog<S, M> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod acknowledged_prefix_tests {
+    use std::future::{Future, pending, poll_fn, ready};
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::task::Poll;
+
+    use asupersync::runtime::RuntimeBuilder;
+    use fsqlite_types::flags::{SyncFlags, VfsOpenFlags};
+    use fsqlite_types::{
+        CommitMarker, LockLevel, Oti, SymbolRecordFlags, reconstruct_systematic_happy_path,
+    };
+    use fsqlite_vfs::{MemoryVfs, ShmRegion, Vfs};
+
+    use super::*;
+
+    #[derive(Default)]
+    struct Audit {
+        writes: AtomicUsize,
+        syncs: AtomicUsize,
+        deny: AtomicBool,
+        fail_sync: AtomicUsize,
+    }
+
+    impl Audit {
+        fn reset(&self, deny: bool) {
+            self.writes.store(0, Ordering::SeqCst);
+            self.syncs.store(0, Ordering::SeqCst);
+            self.fail_sync.store(0, Ordering::SeqCst);
+            self.deny.store(deny, Ordering::SeqCst);
+        }
+
+        fn mutation(&self, sync: bool) -> Result<()> {
+            let count = if sync { &self.syncs } else { &self.writes };
+            let ordinal = count.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.deny.load(Ordering::SeqCst)
+                || (sync && self.fail_sync.load(Ordering::SeqCst) == ordinal)
+            {
+                return Err(std::io::Error::other("injected recovery mutation failure").into());
+            }
+            Ok(())
+        }
+
+        fn assert_no_mutations(&self) {
+            assert_eq!(self.writes.load(Ordering::SeqCst), 0);
+            assert_eq!(self.syncs.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    struct File {
+        inner: <MemoryVfs as Vfs>::File,
+        audit: Arc<Audit>,
+    }
+
+    impl VfsFile for File {
+        fn close(&mut self, cx: &Cx) -> Result<()> { self.inner.close(cx) }
+        fn file_identity(&self) -> Result<Option<FileIdentity>> { self.inner.file_identity() }
+        fn refresh_file_identity(&self) -> Result<Option<FileIdentity>> {
+            self.inner.refresh_file_identity()
+        }
+        async fn read<'a>(&'a self, cx: &'a Cx, bytes: &'a mut [u8], offset: u64) -> Result<usize> {
+            self.inner.read(cx, bytes, offset).await
+        }
+        async fn write<'a>(&'a self, cx: &'a Cx, bytes: &'a [u8], offset: u64) -> Result<()> {
+            self.audit.mutation(false)?;
+            self.inner.write(cx, bytes, offset).await
+        }
+        async fn write_tracked<'a>(
+            &'a self, cx: &'a Cx, bytes: &'a [u8], offset: u64, completion: VfsWriteCompletion,
+        ) -> Result<()> {
+            if let Err(error) = self.audit.mutation(false) {
+                completion.complete_error();
+                return Err(error);
+            }
+            self.inner.write_tracked(cx, bytes, offset, completion).await
+        }
+        fn truncate(&mut self, cx: &Cx, size: u64) -> Result<()> {
+            self.audit.mutation(false)?;
+            self.inner.truncate(cx, size)
+        }
+        fn sync(&mut self, cx: &Cx, flags: SyncFlags) -> Result<()> {
+            self.audit.mutation(true)?;
+            self.inner.sync(cx, flags)
+        }
+        fn durable_sync(&mut self, cx: &Cx, kind: SyncKind) -> Result<()> {
+            self.audit.mutation(true)?;
+            self.inner.durable_sync(cx, kind)
+        }
+        fn file_size(&self, cx: &Cx) -> Result<u64> { self.inner.file_size(cx) }
+        fn lock(&mut self, cx: &Cx, level: LockLevel) -> Result<()> { self.inner.lock(cx, level) }
+        fn unlock(&mut self, cx: &Cx, level: LockLevel) -> Result<()> { self.inner.unlock(cx, level) }
+        fn lock_external_wal_append(&mut self, cx: &Cx) -> Result<()> {
+            self.inner.lock_external_wal_append(cx)
+        }
+        fn owns_external_wal_append_write(&self, cx: &Cx) -> Result<bool> {
+            self.inner.owns_external_wal_append_write(cx)
+        }
+        fn restore_external_wal_append_attempt(&mut self, cx: &Cx) -> Result<()> {
+            self.inner.restore_external_wal_append_attempt(cx)
+        }
+        fn lock_external_shared_snapshot(&mut self, cx: &Cx) -> Result<()> {
+            self.inner.lock_external_shared_snapshot(cx)
+        }
+        fn restore_external_shared_snapshot_attempt(&mut self, cx: &Cx) -> Result<()> {
+            self.inner.restore_external_shared_snapshot_attempt(cx)
+        }
+        fn lock_external_maintenance(&mut self, cx: &Cx, wal: bool) -> Result<()> {
+            self.inner.lock_external_maintenance(cx, wal)
+        }
+        fn lock_external_wal_recovery(&mut self, cx: &Cx) -> Result<()> {
+            self.inner.lock_external_wal_recovery(cx)
+        }
+        fn restore_external_maintenance_attempt(&mut self, cx: &Cx) -> Result<()> {
+            self.inner.restore_external_maintenance_attempt(cx)
+        }
+        fn check_reserved_lock(&self, cx: &Cx) -> Result<bool> { self.inner.check_reserved_lock(cx) }
+        fn shm_map(&mut self, cx: &Cx, region: u32, size: u32, extend: bool) -> Result<ShmRegion> {
+            self.inner.shm_map(cx, region, size, extend)
+        }
+        fn shm_lock(&mut self, cx: &Cx, offset: u32, n: u32, flags: u32) -> Result<()> {
+            self.inner.shm_lock(cx, offset, n, flags)
+        }
+        fn shm_barrier(&self) { self.inner.shm_barrier(); }
+        fn shm_unmap(&mut self, cx: &Cx, delete: bool) -> Result<()> {
+            self.inner.shm_unmap(cx, delete)
+        }
+    }
+
+    type Log = NativeDurabilityLog<File, File>;
+    type Recovery = NativeRecovery<File, File>;
+
+    fn run(future: impl Future<Output = ()>) {
+        RuntimeBuilder::current_thread().blocking_threads(1, 2).build().unwrap().block_on(future);
+    }
+
+    fn raw(vfs: &MemoryVfs, cx: &Cx, name: &str) -> <MemoryVfs as Vfs>::File {
+        vfs.open(cx, Some(Path::new(name)),
+            VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL).unwrap().0
+    }
+
+    fn file(vfs: &MemoryVfs, cx: &Cx, name: &str, audit: &Arc<Audit>) -> File {
+        File { inner: raw(vfs, cx, name), audit: Arc::clone(audit) }
+    }
+
+    fn symbol(value: u8) -> SymbolRecord {
+        let bytes = vec![value; 32];
+        SymbolRecord::new(ObjectId::derive_from_canonical_bytes(&bytes),
+            Oti { f: 32, al: 1, t: 32, z: 1, n: 1 },
+            0, bytes, SymbolRecordFlags::SYSTEMATIC_RUN_START)
+    }
+
+    fn verify(id: ObjectId, records: Vec<SymbolRecord>) -> std::future::Ready<Result<()>> {
+        ready(reconstruct_systematic_happy_path(&records)
+            .map_err(|error| corrupt(&error.to_string()))
+            .and_then(|bytes| {
+                if ObjectId::derive_from_canonical_bytes(&bytes) == id {
+                    Ok(())
+                } else {
+                    Err(corrupt("test recovery object mismatch"))
+                }
+            }))
+    }
+
+    fn chain(times: &[u64]) -> Vec<CommitMarker> {
+        let mut previous = None;
+        times.iter().enumerate().map(|(index, time)| {
+            let marker = CommitMarker::new(
+                CommitSeq::new(u64::try_from(index).unwrap() + 1), *time,
+                symbol(1).object_id, symbol(2).object_id, previous,
+            );
+            previous = Some(ObjectId::derive_from_canonical_bytes(&marker.to_record_bytes()));
+            marker
+        }).collect()
+    }
+
+    async fn log(vfs: &MemoryVfs, cx: &Cx, audit: &Arc<Audit>, times: &[u64]) -> Log {
+        let mut log = Log::create(cx, file(vfs, cx, "objects", audit),
+            file(vfs, cx, "markers", audit), NativeDurabilityLimits::default()).unwrap();
+        log.append_symbols(cx, &[symbol(1), symbol(2)]).await.unwrap();
+        log.publish(cx, &chain(times), verify).await.unwrap();
+        log
+    }
+
+    // Corrupt only this test's MemoryVfs bytes, outside the audited recovery
+    // handles. Truncation/replacement must be detected before recovery writes.
+    async fn set_markers(vfs: &MemoryVfs, cx: &Cx, markers: &[CommitMarker]) {
+        let bytes: Vec<_> = markers.iter().flat_map(|marker| marker.to_record_bytes()).collect();
+        let mut file = raw(vfs, cx, "markers");
+        file.truncate(cx, 0).unwrap();
+        file.write(cx, &bytes, 0).await.unwrap();
+        file.close(cx).unwrap();
+    }
+
+    async fn marker_bytes(vfs: &MemoryVfs, cx: &Cx) -> Vec<u8> {
+        let mut file = raw(vfs, cx, "markers");
+        let mut bytes = vec![0; usize::try_from(file.file_size(cx).unwrap()).unwrap()];
+        assert_eq!(file.read(cx, &mut bytes, 0).await.unwrap(), bytes.len());
+        file.close(cx).unwrap();
+        bytes
+    }
+
+    fn refused(owner: Recovery) -> Recovery {
+        owner.finish().expect_err("a refused recovery must not produce a sealed handoff")
+    }
+
+    #[test]
+    fn acknowledged_truncation_is_not_reclassified_as_an_uncommitted_tail() {
+        run(async {
+            for times in [&[][..], &[100][..]] {
+                let cx = Cx::new(); let vfs = MemoryVfs::new(); let audit = Arc::new(Audit::default());
+                let mut owner = log(&vfs, &cx, &audit, &[100, 200]).await.into_recovery();
+                set_markers(&vfs, &cx, &chain(times)).await;
+                let damaged = marker_bytes(&vfs, &cx).await;
+                audit.reset(true);
+                for _ in 0..2 {
+                    let error = owner.prepare(&cx, verify).await.unwrap_err();
+                    assert!(matches!(error, FrankenError::WalCorrupt { .. }));
+                    assert!(error.to_string().contains("lost an acknowledged"));
+                    assert_eq!(owner.acknowledged.tip, CommitSeq::new(2));
+                    owner = refused(owner);
+                    audit.assert_no_mutations();
+                    assert_eq!(marker_bytes(&vfs, &cx).await, damaged);
+                }
+                // Restoring the original retained prefix permits ordinary recovery.
+                set_markers(&vfs, &cx, &chain(&[100, 200])).await;
+                audit.reset(false);
+                owner.prepare(&cx, verify).await.unwrap();
+                let (mut log, report) = owner.finish().unwrap().into_log();
+                assert_eq!(report.markers.len(), 2);
+                assert_eq!(log.published_tip(), CommitSeq::new(2));
+                log.close(&cx).unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn acknowledged_chain_identity_survives_same_length_substitution_and_retries() {
+        run(async {
+            let cx = Cx::new(); let vfs = MemoryVfs::new(); let audit = Arc::new(Audit::default());
+            let mut owner = log(&vfs, &cx, &audit, &[100, 200]).await.into_recovery();
+            let expected = owner.acknowledged.marker;
+            for times in [[101, 200], [100, 201], [101, 201]] {
+                set_markers(&vfs, &cx, &chain(&times)).await;
+                audit.reset(true);
+                let error = owner.prepare(&cx, verify).await.unwrap_err();
+                assert!(matches!(error, FrankenError::WalCorrupt { .. }));
+                assert!(error.to_string().contains("replaced an acknowledged"));
+                assert_eq!(owner.acknowledged.marker, expected);
+                owner = refused(owner);
+                audit.assert_no_mutations();
+            }
+            owner.close(&cx).unwrap();
+        });
+    }
+
+    #[test]
+    fn valid_extension_advances_the_anchor_only_after_both_recovery_barriers() {
+        run(async {
+            let cx = Cx::new(); let vfs = MemoryVfs::new(); let audit = Arc::new(Audit::default());
+            let mut owner = log(&vfs, &cx, &audit, &[100]).await.into_recovery();
+            set_markers(&vfs, &cx, &chain(&[100, 200])).await;
+            audit.reset(false);
+            owner.prepare(&cx, verify).await.unwrap();
+            assert_eq!(audit.syncs.load(Ordering::SeqCst), 2);
+            assert_eq!(owner.acknowledged.tip, CommitSeq::new(2));
+            set_markers(&vfs, &cx, &chain(&[100])).await;
+            audit.reset(true);
+            assert!(matches!(owner.prepare(&cx, verify).await, Err(FrankenError::WalCorrupt { .. })));
+            owner = refused(owner);
+            audit.assert_no_mutations();
+            set_markers(&vfs, &cx, &chain(&[100, 200, 300])).await;
+            audit.reset(false);
+            owner.prepare(&cx, verify).await.unwrap();
+            let (mut log, report) = owner.finish().unwrap().into_log();
+            assert_eq!(report.markers.len(), 3);
+            let extended = chain(&[100, 200, 300, 400]);
+            log.publish(&cx, &extended[3..], verify).await.unwrap();
+            assert_eq!(log.published_tip(), CommitSeq::new(4));
+            log.close(&cx).unwrap();
+        });
+    }
+
+    #[test]
+    fn failed_barriers_do_not_turn_a_tentative_extension_into_an_acknowledgement() {
+        run(async {
+            for barrier in [1, 2] {
+                let cx = Cx::new(); let vfs = MemoryVfs::new(); let audit = Arc::new(Audit::default());
+                let mut owner = log(&vfs, &cx, &audit, &[100]).await.into_recovery();
+                set_markers(&vfs, &cx, &chain(&[100, 200])).await;
+                audit.reset(false);
+                audit.fail_sync.store(barrier, Ordering::SeqCst);
+                assert!(owner.prepare(&cx, verify).await.is_err());
+                assert_eq!(audit.syncs.load(Ordering::SeqCst), barrier);
+                assert_eq!(owner.acknowledged.tip, CommitSeq::new(1));
+                owner = refused(owner);
+                // Model loss of the unacknowledged tail, not of the old prefix.
+                set_markers(&vfs, &cx, &chain(&[100])).await;
+                audit.reset(false);
+                owner.prepare(&cx, verify).await.unwrap();
+                assert_eq!(audit.syncs.load(Ordering::SeqCst), 2);
+                let (mut log, report) = owner.finish().unwrap().into_log();
+                assert_eq!(report.markers.len(), 1);
+                assert!(!log.needs_recovery());
+                log.close(&cx).unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn fresh_recovery_establishes_an_anchor_and_still_preserves_torn_tails() {
+        run(async {
+            let cx = Cx::new(); let vfs = MemoryVfs::new(); let audit = Arc::new(Audit::default());
+            log(&vfs, &cx, &audit, &[100, 200]).await.close(&cx).unwrap();
+            let mut tail = raw(&vfs, &cx, "markers");
+            let end = tail.file_size(&cx).unwrap();
+            tail.write(&cx, b"torn", end).await.unwrap();
+            tail.close(&cx).unwrap();
+            let original = marker_bytes(&vfs, &cx).await;
+            let mut owner = Recovery::new(&cx, file(&vfs, &cx, "objects", &audit),
+                file(&vfs, &cx, "markers", &audit), NativeDurabilityLimits::default()).unwrap();
+            assert_eq!(owner.acknowledged.tip, CommitSeq::ZERO);
+            audit.reset(false);
+            owner.prepare(&cx, verify).await.unwrap();
+            assert_eq!(owner.acknowledged.tip, CommitSeq::new(2));
+            assert_eq!(owner.completed.as_ref().unwrap().marker_tail_bytes, 4);
+            assert_eq!(marker_bytes(&vfs, &cx).await, original);
+            set_markers(&vfs, &cx, &chain(&[100])).await;
+            audit.reset(true);
+            assert!(matches!(owner.prepare(&cx, verify).await, Err(FrankenError::WalCorrupt { .. })));
+            owner = refused(owner);
+            audit.assert_no_mutations();
+            owner.close(&cx).unwrap();
+        });
+    }
+
+    #[test]
+    fn abandoned_and_cancelled_scans_keep_the_original_acknowledged_prefix() {
+        run(async {
+            let cx = Cx::new(); let vfs = MemoryVfs::new(); let audit = Arc::new(Audit::default());
+            let mut owner = log(&vfs, &cx, &audit, &[100, 200]).await.into_recovery();
+            audit.reset(true);
+            {
+                let mut future = Box::pin(owner.prepare(&cx, |_, _| pending::<Result<()>>()));
+                poll_fn(|task_cx| {
+                    assert!(future.as_mut().poll(task_cx).is_pending());
+                    Poll::Ready(())
+                }).await;
+            }
+            owner = refused(owner);
+            let cancelled = Cx::new(); cancelled.cancel();
+            assert!(matches!(owner.prepare(&cancelled, verify).await, Err(FrankenError::Interrupt)));
+            owner = refused(owner);
+            set_markers(&vfs, &cx, &chain(&[100])).await;
+            assert!(matches!(owner.prepare(&cx, verify).await, Err(FrankenError::WalCorrupt { .. })));
+            owner = refused(owner);
+            assert_eq!(owner.acknowledged.tip, CommitSeq::new(2));
+            audit.assert_no_mutations();
+            owner.close(&cx).unwrap();
+        });
+    }
+}
