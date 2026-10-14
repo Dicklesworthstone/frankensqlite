@@ -28,6 +28,7 @@ use fsqlite_types::sync_primitives::{RwLock, RwLockReadGuard};
 use fsqlite_types::{CommitSeq, PageData, PageNumber, PageSize};
 use fsqlite_vfs::{VfsFile, VfsWriteCompletion};
 use fsqlite_wal::native_commit::durable::{DurableCommitAcknowledgement, NativeObjectCodec};
+use fsqlite_wal::native_durability::NativeRecovery;
 use fsqlite_wal::native_pages::{
     NativePageSavepoint, NativePageStore, NativePageTransaction, NativePageTransactionState,
 };
@@ -190,6 +191,48 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativePager<S, M, C> {
     pub fn outstanding_write(&self) -> Result<Option<VfsWriteCompletion>> {
         let store = self.shared.store.try_read().ok_or(FrankenError::Busy)?;
         Ok(store.outstanding_write())
+    }
+
+    /// Move a uniquely owned, quiescent pager into physical recovery.
+    ///
+    /// Drop other pager clones, commit workers and every transaction handle
+    /// first, including terminal handles and handles erased into TransactionKind.
+    /// A drained worker's returned handles still belong to the caller; this
+    /// method never cancels its accepted work or discards a completion receipt.
+    /// Raw page-store transactions created before pager adoption also block the
+    /// transfer until their snapshot pins retire.
+    ///
+    /// The original streams, acknowledged prefix, outstanding source-write
+    /// token and shared codec are retained by the page store's transfer. No
+    /// I/O, locking wait, rollback, hidden runtime or automatic retry occurs.
+    /// Pending writes still require settlement before recovery may start.
+    /// Continuously retain the external namespace/append lease, then drive
+    /// NativeRecovery and NativePageRecovery to reconstruct a new pager.
+    ///
+    /// # Errors
+    /// Returns the pager with its storage obligations intact while shared,
+    /// while closing, or when the underlying page store refuses transfer.
+    #[allow(clippy::result_large_err)] // Preserve ownership on refusal.
+    pub fn try_into_recovery(
+        self,
+    ) -> std::result::Result<(NativeRecovery<S, M>, Arc<C>), Self> {
+        if self.shared.closed.load(Ordering::Acquire) {
+            return Err(self);
+        }
+        // A count-then-take sequence would race another holder. try_unwrap
+        // proves exclusive ownership in one operation, including all worker
+        // and erased-handle references, without taking a publication lock.
+        let shared = match Arc::try_unwrap(self.shared) {
+            Ok(shared) => shared,
+            Err(shared) => return Err(Self { shared }),
+        };
+        let Shared { store, page_size, active, closed } = shared;
+        match store.into_inner().try_into_recovery() {
+            Ok(recovery) => Ok(recovery),
+            Err(store) => Err(Self {
+                shared: Arc::new(Shared { store: RwLock::new(store), page_size, active, closed }),
+            }),
+        }
     }
 
     /// Close only after all active handles finish/drop. Failed physical closes
@@ -378,7 +421,8 @@ where
 
     async fn settle_commit<'a>(&'a mut self, _cx: &'a Cx) -> Result<PagerCommitState> {
         // Reissuing commit here would duplicate an uncertain physical attempt.
-        // Recovery must reopen the retained streams after old writes settle.
+        // The quiescent pager can transfer its original streams into recovery;
+        // source-owned writes must settle before that recovery performs I/O.
         let state = self.pager_commit_state();
         if state == PagerCommitState::InDoubt { return Err(FrankenError::BusyRecovery); }
         Ok(state)
@@ -659,6 +703,141 @@ mod tests {
             owner.close(&cx).unwrap();
             assert!(owner.begin(&cx, TransactionMode::Concurrent).is_err());
             owner.close(&cx).unwrap(); // Underlying independent closes are idempotent.
+        });
+    }
+
+    async fn recover_live_pager(cx: &Cx, owner: Pager) -> Pager {
+        use fsqlite_wal::native_pages::NativePageRecovery;
+        let (mut recovery, codec) = owner.try_into_recovery().ok().expect("quiescent live owner");
+        recovery.prepare(cx, |id, records| {
+            std::future::ready(codec.decode(cx, id, &records).map(|_| ()))
+        }).await.unwrap();
+        let mut replay = NativePageRecovery::with_shared_codec(
+            recovery.finish().unwrap(), codec, 512, NativePageLimits::default(),
+        );
+        replay.prepare(cx).await.unwrap();
+        let (store, _) = replay.finish().unwrap();
+        NativePager::new(store).unwrap()
+    }
+
+    #[test]
+    fn native_recovery_transfer_refuses_clones_and_erased_terminal_handles() {
+        run(async {
+            let cx = Cx::new(); let vfs = MemoryVfs::new(); let owner = pager(&vfs, &cx);
+            let peer = owner.clone();
+            let owner = owner.try_into_recovery().err().expect("live peer still owns admission");
+            assert!(Arc::ptr_eq(&owner.shared, &peer.shared));
+            drop(peer);
+            let mut txn = owner.begin(&cx, TransactionMode::Concurrent).unwrap();
+            txn.write_page(&cx, page(2), &[7; 512]).await.unwrap();
+            let owner = owner.try_into_recovery().err().expect("private transaction retained");
+            assert_eq!(txn.get_page(&cx, page(2)).await.unwrap().as_bytes(), &[7; 512]);
+            txn.commit_at(&cx, 100).await.unwrap();
+            let ack = txn.acknowledgement().unwrap().clone();
+            let erased: crate::traits::TransactionKind = txn.into();
+            let owner = owner.try_into_recovery().err().expect("terminal erased owner retained");
+            assert_eq!(erased.pager_commit_state(), PagerCommitState::Committed);
+            match &erased {
+                crate::traits::TransactionKind::Native(native) => {
+                    assert_eq!(native.acknowledgement(), Some(&ack));
+                }
+                _ => panic!("native transaction changed storage kind"),
+            }
+            drop(erased);
+            let owner = recover_live_pager(&cx, owner).await;
+            assert_eq!(owner.committed_tip().unwrap(), CommitSeq::new(1));
+            let mut next = owner.begin(&cx, TransactionMode::Concurrent).unwrap();
+            assert_eq!(next.get_page(&cx, page(2)).await.unwrap().as_bytes(), &[7; 512]);
+            next.write_page(&cx, page(3), &[8; 512]).await.unwrap();
+            next.commit_at(&cx, 0).await.unwrap();
+            assert_eq!(next.acknowledgement().unwrap().commit_time_unix_ns, 101);
+            owner.close(&cx).unwrap();
+        });
+    }
+
+    #[test]
+    fn native_recovery_transfer_does_not_cancel_queued_service_work_or_lose_receipts() {
+        use crate::native_service::NativeCommitService;
+        run(async {
+            let cx = Cx::new(); let native = asupersync::Cx::current().unwrap();
+            cx.set_native_cx(native.clone());
+            let vfs = MemoryVfs::new(); let owner = pager(&vfs, &cx);
+            let (sender, worker) = NativeCommitService::new(&owner, 2, 2).unwrap();
+            let owner = owner.try_into_recovery().err().expect("idle worker retains its pager");
+            let mut txn = owner.begin(&cx, TransactionMode::Concurrent).unwrap();
+            txn.write_page(&cx, page(2), &[9; 512]).await.unwrap();
+            let mut ticket = sender.reserve(&native).await.unwrap().send(txn, 100).unwrap();
+            let owner = owner.try_into_recovery().err().expect("accepted work cannot be evacuated");
+            sender.request_shutdown();
+            worker.run(&cx).await.unwrap();
+            let completion = ticket.wait(&native).await.unwrap();
+            assert!(completion.result.is_ok());
+            assert_eq!(completion.transaction.pager_commit_state(), PagerCommitState::Committed);
+            assert_eq!(completion.transaction.acknowledgement().unwrap().commit_seq, CommitSeq::new(1));
+            let owner = owner.try_into_recovery().err().expect("receipt handle remains caller owned");
+            drop(completion); drop(ticket); drop(sender);
+            let owner = recover_live_pager(&cx, owner).await;
+            assert_eq!(owner.committed_tip().unwrap(), CommitSeq::new(1));
+            let mut reader = owner.begin(&cx, TransactionMode::ReadOnly).unwrap();
+            assert_eq!(reader.get_page(&cx, page(2)).await.unwrap().as_bytes(), &[9; 512]);
+            reader.rollback(&cx).await.unwrap(); owner.close(&cx).unwrap();
+        });
+    }
+
+    #[test]
+    fn native_recovery_transfer_honors_raw_pins_created_before_pager_adoption() {
+        run(async {
+            let cx = Cx::new(); let vfs = MemoryVfs::new();
+            let log = NativeDurabilityLog::create(
+                &cx, file(&vfs, &cx, "objects"), file(&vfs, &cx, "markers"),
+                NativeDurabilityLimits::default(),
+            ).unwrap();
+            let mut store = NativePageStore::new(log, TestCodec, 512, NativePageLimits::default()).unwrap();
+            let mut pin = store.begin(&cx).unwrap();
+            store.write_page(&cx, &mut pin, page(2), Some(&[3; 512])).unwrap();
+            let owner = NativePager::new(store).unwrap();
+            assert_eq!(Arc::strong_count(&owner.shared), 1);
+            let owner = owner.try_into_recovery().err().expect("raw pin survives unique pager check");
+            assert_eq!(pin.state(), NativePageTransactionState::Active);
+            assert_eq!(owner.committed_tip().unwrap(), CommitSeq::ZERO);
+            drop(pin);
+            let owner = recover_live_pager(&cx, owner).await;
+            let mut reader = owner.begin(&cx, TransactionMode::ReadOnly).unwrap();
+            assert!(reader.get_page(&cx, page(2)).await.is_err(), "uncommitted raw overlay was not published");
+            reader.rollback(&cx).await.unwrap(); owner.close(&cx).unwrap();
+        });
+    }
+
+    #[test]
+    fn native_recovery_transfer_preserves_failed_and_closed_admission_domains() {
+        run(async {
+            let cx = Cx::new(); let vfs = MemoryVfs::new(); let owner = pager(&vfs, &cx);
+            let mut first = owner.begin(&cx, TransactionMode::Concurrent).unwrap();
+            first.write_page(&cx, page(2), &[1; 512]).await.unwrap();
+            first.commit_at(&cx, 100).await.unwrap(); drop(first);
+            let mut symbols = file(&vfs, &cx, "objects");
+            let original_len = symbols.file_size(&cx).unwrap();
+            // An unexpected source length produces a real staging failure;
+            // do not synthesize an InDoubt enum value or fake completion.
+            symbols.write(&cx, b"unexpected", original_len).await.unwrap();
+            let mut failed = owner.begin(&cx, TransactionMode::Concurrent).unwrap();
+            failed.write_page(&cx, page(2), &[2; 512]).await.unwrap();
+            assert!(failed.commit_at(&cx, 200).await.is_err());
+            assert_eq!(failed.pager_commit_state(), PagerCommitState::InDoubt);
+            assert!(matches!(failed.settle_commit(&cx).await, Err(FrankenError::BusyRecovery)));
+            let owner = owner.try_into_recovery().err().expect("uncertain transaction still owned");
+            symbols.truncate(&cx, original_len).unwrap();
+            symbols.close(&cx).unwrap();
+            assert!(owner.needs_recovery().unwrap(), "restoring bytes alone does not reset admission");
+            drop(failed);
+            let owner = recover_live_pager(&cx, owner).await;
+            let mut reader = owner.begin(&cx, TransactionMode::ReadOnly).unwrap();
+            assert_eq!(reader.get_page(&cx, page(2)).await.unwrap().as_bytes(), &[1; 512]);
+            reader.rollback(&cx).await.unwrap(); drop(reader);
+            owner.close(&cx).unwrap();
+            let owner = owner.try_into_recovery().err().expect("close cannot become recovery");
+            assert!(owner.begin(&cx, TransactionMode::Concurrent).is_err());
+            owner.close(&cx).unwrap();
         });
     }
 }
