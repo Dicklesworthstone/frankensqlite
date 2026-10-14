@@ -283,3 +283,91 @@ fn headerless_observation_cannot_authorize_a_later_generation() {
         }
     });
 }
+
+#[test]
+fn reader_horizon_inside_a_transaction_is_refused_before_copying() {
+    run(async {
+        for mode in MODES {
+            let cx = Cx::default();
+            let vfs = MemoryVfs::new();
+            let mut wal = create(&vfs, &cx).await;
+            append(&mut wal, &cx, 1, true).await;
+            append(&mut wal, &cx, 2, false).await;
+            append(&mut wal, &cx, 3, true).await;
+            let mut snapshot = state(3, 0);
+            snapshot.oldest_reader_frame = Some(2);
+            refused(&cx, &mut wal, mode, snapshot).await;
+        }
+    });
+}
+
+#[test]
+fn uncommitted_backfill_receipt_is_refused_even_when_no_work_is_eligible() {
+    run(async {
+        for mode in MODES {
+            for reader in [None, Some(2)] {
+                let cx = Cx::default();
+                let vfs = MemoryVfs::new();
+                let mut wal = create(&vfs, &cx).await;
+                append(&mut wal, &cx, 1, true).await;
+                append(&mut wal, &cx, 2, false).await;
+                append(&mut wal, &cx, 3, true).await;
+                let mut snapshot = state(3, 2);
+                snapshot.oldest_reader_frame = reader;
+                refused(&cx, &mut wal, mode, snapshot).await;
+            }
+        }
+    });
+}
+
+#[test]
+fn committed_partial_checkpoint_can_resume_through_a_multiframe_transaction() {
+    run(async {
+        for mode in MODES {
+            let cx = Cx::default();
+            let vfs = MemoryVfs::new();
+            let mut wal = create(&vfs, &cx).await;
+            append(&mut wal, &cx, 1, true).await;
+            append(&mut wal, &cx, 2, false).await;
+            append(&mut wal, &cx, 3, true).await;
+            let mut snapshot = state(3, 0);
+            snapshot.oldest_reader_frame = Some(1);
+            let mut target = Target::default();
+            let partial = execute_checkpoint(&cx, &mut wal, mode, snapshot, &mut target)
+                .await.expect("committed reader horizon");
+            assert_eq!(partial.frames_backfilled, 1);
+            assert!(!partial.plan.completes_checkpoint());
+            assert!(!partial.wal_was_reset);
+            assert_eq!(target.pages.get(&1).expect("old snapshot"),
+                &vec![1; usize::try_from(PAGE_SIZE).expect("page size")]);
+
+            let complete = execute_checkpoint(&cx, &mut wal, mode, state(3, 1), &mut target)
+                .await.expect("resume from committed backfill receipt");
+            assert_eq!(complete.frames_backfilled, 2);
+            assert!(complete.plan.completes_checkpoint());
+            assert_eq!(complete.wal_was_reset,
+                matches!(mode, CheckpointMode::Restart | CheckpointMode::Truncate));
+            assert_eq!(target.pages.get(&1).expect("new snapshot"),
+                &vec![3; usize::try_from(PAGE_SIZE).expect("page size")]);
+        }
+    });
+}
+
+#[test]
+fn corrupt_backfill_seed_payload_cannot_authorize_a_later_window() {
+    run(async {
+        for mode in MODES {
+            let cx = Cx::default();
+            let vfs = MemoryVfs::new();
+            let mut wal = create(&vfs, &cx).await;
+            append(&mut wal, &cx, 1, true).await;
+            append(&mut wal, &cx, 2, false).await;
+            append(&mut wal, &cx, 3, true).await;
+            let mut file = open_file(&vfs, &cx);
+            // Leave every stored checksum and the entire next transaction
+            // intact. Header-only seed validation would miss this damage.
+            file.write(&cx, &[0xFF], 32 + 24).await.expect("damage first payload");
+            refused(&cx, &mut wal, mode, state(3, 1)).await;
+        }
+    });
+}

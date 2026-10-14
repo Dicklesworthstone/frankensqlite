@@ -39,7 +39,7 @@ pub async fn execute_checkpoint<F: VfsFile>(
     state: CheckpointState,
     target: &mut impl CheckpointTarget,
 ) -> Result<CheckpointExecutionResult> {
-    if admission::validate_source(cx, wal, state).await? {
+    if admission::validate_source(cx, wal, mode, state).await? {
         // There is no physical generation to publish or reset. In particular,
         // TRUNCATE on an already zero-byte WAL must not create a new header.
         let mut plan = plan_checkpoint(mode, state);

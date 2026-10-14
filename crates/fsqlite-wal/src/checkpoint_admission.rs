@@ -11,7 +11,7 @@ use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
 use fsqlite_vfs::VfsFile;
 
-use crate::checkpoint::CheckpointState;
+use crate::checkpoint::{CheckpointMode, CheckpointState, plan_checkpoint};
 use crate::checksum::{
     SqliteWalChecksum, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE, WalFrameHeader, WalHeader,
     compute_wal_frame_checksum, wal_header_checksum,
@@ -32,6 +32,7 @@ fn corrupt(detail: impl Into<String>) -> FrankenError {
 pub(super) async fn validate_source<F: VfsFile>(
     cx: &Cx,
     wal: &WalFile<F>,
+    mode: CheckpointMode,
     state: CheckpointState,
 ) -> Result<bool> {
     let count = wal.frame_count();
@@ -69,6 +70,8 @@ pub(super) async fn validate_source<F: VfsFile>(
     } else {
         validate_terminal_frame(cx, wal, header_seed, &mut frame).await?;
     }
+
+    validate_frontiers(cx, wal, header_seed, mode, state, &mut frame).await?;
 
     let frame_size_u64 = u64::try_from(frame_size).map_err(|_| FrankenError::DatabaseFull)?;
     let extra = usize::try_from((file_size - accepted_end) / frame_size_u64)
@@ -162,6 +165,72 @@ async fn validate_terminal_frame<F: VfsFile>(
         || checksum != wal.running_checksum()
     {
         return Err(corrupt("checkpoint terminal frame differs from the accepted commit"));
+    }
+    Ok(())
+}
+
+/// Backfill receipts and reader horizons must describe committed snapshots,
+/// not arbitrary frame offsets inside a multi-frame transaction. Validate both
+/// the old receipt and the actual planned end before copying even one page.
+async fn validate_frontiers<F: VfsFile>(
+    cx: &Cx,
+    wal: &WalFile<F>,
+    header_seed: SqliteWalChecksum,
+    mode: CheckpointMode,
+    state: CheckpointState,
+    frame: &mut [u8],
+) -> Result<()> {
+    let end = state.backfilled_frames
+        .checked_add(plan_checkpoint(mode, state).frames_to_backfill)
+        .ok_or_else(|| stale("checkpoint backfill endpoint overflow"))?;
+    validate_commit_boundary(cx, wal, header_seed, state.backfilled_frames, frame).await?;
+    if end != state.backfilled_frames {
+        validate_commit_boundary(cx, wal, header_seed, end, frame).await?;
+    }
+    Ok(())
+}
+
+async fn validate_commit_boundary<F: VfsFile>(
+    cx: &Cx,
+    wal: &WalFile<F>,
+    header_seed: SqliteWalChecksum,
+    boundary: u32,
+    frame: &mut [u8],
+) -> Result<()> {
+    let count = usize::try_from(boundary).map_err(|_| FrankenError::DatabaseFull)?;
+    // The empty snapshot is valid; the terminal commit was already checked.
+    if count == 0 || count == wal.frame_count() {
+        return Ok(());
+    }
+    if count > wal.frame_count() {
+        return Err(stale("checkpoint boundary exceeds the accepted WAL"));
+    }
+    cx.checkpoint().map_err(|_| FrankenError::Interrupt)?;
+    let index = count - 1;
+    let previous = if index == 0 {
+        header_seed
+    } else {
+        let predecessor = wal.read_frame_header(cx, index - 1).await?;
+        if predecessor.page_number == 0 || predecessor.salts != wal.header().salts {
+            return Err(corrupt("invalid checkpoint boundary checksum seed"));
+        }
+        predecessor.checksum
+    };
+    let read = wal.file().read(cx, frame, wal.frame_offset(index)).await?;
+    if read != frame.len() {
+        return Err(corrupt("short checkpoint boundary frame"));
+    }
+    let header = WalFrameHeader::from_bytes(&frame[..WAL_FRAME_HEADER_SIZE])?;
+    let checksum = compute_wal_frame_checksum(
+        frame, wal.page_size(), previous, wal.big_endian_checksum(),
+    )?;
+    if header.page_number == 0 || header.salts != wal.header().salts || header.checksum != checksum {
+        return Err(corrupt("invalid checkpoint boundary frame"));
+    }
+    if !header.is_commit() {
+        return Err(stale(format!(
+            "checkpoint boundary {boundary} falls inside a WAL transaction"
+        )));
     }
     Ok(())
 }
