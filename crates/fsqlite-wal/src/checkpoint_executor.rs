@@ -18,7 +18,7 @@ use std::pin::Pin;
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::PageNumber;
 use fsqlite_types::cx::Cx;
-use fsqlite_vfs::{VfsFile, VfsWriteCompletion};
+use fsqlite_vfs::{SyncKind, VfsFile, VfsWriteCompletion};
 use tracing::{debug, info};
 
 use crate::checkpoint::{
@@ -31,6 +31,10 @@ use crate::wal::WalFile;
 
 #[path = "checkpoint_validation.rs"]
 mod validation;
+
+#[cfg(test)]
+#[path = "checkpoint_durability_tests.rs"]
+mod durability_tests;
 
 // ---------------------------------------------------------------------------
 // CheckpointTarget trait
@@ -184,11 +188,12 @@ struct CheckpointPageExpectation {
 /// Execute a WAL checkpoint.
 ///
 /// 1. Computes a [`CheckpointPlan`] from `mode` and `state`.
-/// 2. Reads `frames_to_backfill` frames from `wal` starting at
+/// 2. Reads and validates `frames_to_backfill` frames from `wal` starting at
 ///    `state.backfilled_frames`.
-/// 3. Writes each frame's page data through `target`.
-/// 4. Syncs the database.
-/// 5. Optionally resets / truncates the WAL per the plan's post-action.
+/// 3. Syncs the WAL before any database page can be overwritten.
+/// 4. Writes each selected frame's page data through `target`.
+/// 5. Syncs the database.
+/// 6. Optionally resets / truncates the WAL per the plan's post-action.
 ///
 /// # Errors
 ///
@@ -208,6 +213,14 @@ pub async fn execute_checkpoint<F: VfsFile>(
 
     let plan = plan_checkpoint(mode, state);
     let normalized = state.normalized();
+
+    // A no-copy pass can still publish a backfill receipt or replace the WAL.
+    // Frame validation below checks the physical header only when copying;
+    // do not authorize these side effects from a stale cached generation.
+    // Empty/headerless handles retain their existing owner-binding contract.
+    if plan.frames_to_backfill == 0 && wal.frame_count() > 0 {
+        validation::checkpoint_header_checksum(wal, cx).await?;
+    }
 
     info!(
         mode = ?plan.mode,
@@ -256,6 +269,12 @@ pub async fn execute_checkpoint<F: VfsFile>(
                 last_db_size = Some(header.db_size);
             }
         }
+
+        // Readable/checksummed WAL bytes may still be only in the OS page cache.
+        // Persist the recovery source before the first database overwrite, not
+        // merely before reset. Use WalFile's sync path so failed writeback also
+        // retains its rewrite-before-retry fence (fsyncgate).
+        wal.durable_sync(cx, SyncKind::FullDurable)?;
 
         // Pass 2: Bind each sorted write to the bytes validated in pass 1.
         let mut sorted_pages: Vec<CheckpointPageExpectation> =

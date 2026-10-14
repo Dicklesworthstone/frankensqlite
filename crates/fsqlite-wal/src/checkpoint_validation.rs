@@ -56,7 +56,7 @@ pub(super) fn validate_checkpoint_state<F: VfsFile>(
 
 /// Verify the physical generation against the handle's accepted header.
 /// A checksum-torn header receives one retry, as in the WAL replay path.
-async fn checkpoint_header_checksum<F: VfsFile>(
+pub(super) async fn checkpoint_header_checksum<F: VfsFile>(
     wal: &WalFile<F>,
     cx: &Cx,
 ) -> Result<SqliteWalChecksum> {
