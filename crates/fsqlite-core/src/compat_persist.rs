@@ -3182,6 +3182,11 @@ pub fn parse_columns_from_create_sql(sql: &str) -> Vec<ColumnInfo> {
             } else {
                 None
             };
+            let affinity = if strict_type == Some(StrictColumnType::Any) {
+                'A'
+            } else {
+                affinity
+            };
 
             let default_value = extract_default_value(remainder);
 
@@ -3963,6 +3968,11 @@ pub(crate) fn columns_from_create_table_statement(
                         .and_then(StrictColumnType::from_type_name)
                 } else {
                     None
+                };
+                let affinity = if strict_type == Some(StrictColumnType::Any) {
+                    'A'
+                } else {
+                    affinity
                 };
                 let (generated_expr, generated_stored) = col
                     .constraints

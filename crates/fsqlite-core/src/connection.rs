@@ -65608,6 +65608,11 @@ impl Connection {
                         } else {
                             None
                         };
+                        let affinity = if strict_type == Some(StrictColumnType::Any) {
+                            'A'
+                        } else {
+                            affinity
+                        };
                         // Extract generated column info.
                         let (generated_expr, generated_stored) = col
                             .constraints

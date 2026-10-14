@@ -710,7 +710,15 @@ impl TableSchema {
     pub fn affinity_string(&self) -> String {
         self.columns
             .iter()
-            .map(|c| if c.is_ipk { 'X' } else { c.affinity })
+            .map(|c| {
+                if c.is_ipk {
+                    'X'
+                } else if c.strict_type == Some(StrictColumnType::Any) {
+                    'A'
+                } else {
+                    c.affinity
+                }
+            })
             .collect()
     }
 
