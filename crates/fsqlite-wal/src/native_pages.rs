@@ -10,6 +10,9 @@
 //! resolve a predicate (including absence); this module does not infer SQL
 //! predicates, schema changes, or row-level conflicts from arbitrary bytes.
 
+mod snapshot;
+pub use snapshot::NativePageSnapshot;
+
 mod store;
 pub use store::{
     MAX_NATIVE_SAVEPOINTS, NativePageLimits, NativePageRecovery, NativePageSavepoint,

@@ -10,7 +10,7 @@ use std::sync::atomic::AtomicU64;
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
-use fsqlite_types::TxnToken;
+use fsqlite_types::{CommitSeq, TxnToken};
 use fsqlite_vfs::VfsFile;
 
 use super::{NativePageLimits, NativePageStore, PageHistory, SharedCodec, corrupt};
@@ -18,6 +18,7 @@ use crate::native_commit::durable::{
     NativeCommitAttempt, NativeCommitOutcome, NativeCoordinatorRecovery, NativeObjectCodec,
 };
 use crate::native_durability::{NativeDurabilityRecovery, NativeRecovery, RecoveredNativeLog};
+use crate::native_pages::NativePageSnapshot;
 
 impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativePageStore<S, M, C> {
     /// Capture an admitted attempt before relinquishing this live store.
@@ -193,18 +194,102 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativePageRecovery<S, M, C> {
     /// proof/capsule bindings, duplicate tokens, stale committed observations,
     /// I/O errors, cancellation and ownership whose close has begun.
     pub async fn prepare(&mut self, cx: &Cx) -> Result<()> {
+        self.prepare_inner(cx, None).await.map(|_| ())
+    }
+
+    /// Reconstruct an immutable image at an exact native commit sequence.
+    ///
+    /// Sequence zero selects genesis; future sequences are rejected before
+    /// reading storage. Capture occurs after the entire selected capsule, but
+    /// replay continues through the LATEST commit. A corrupt or unserializable
+    /// suffix therefore rejects even an otherwise readable earlier image.
+    /// `finish` always installs the latest store, never this historical image.
+    ///
+    /// This is a cold full-history replay, not an indexed time-travel query.
+    /// At most one selected image and the current replay heads are retained:
+    /// each payload separately fits `NativePageLimits`. Decode, token/index
+    /// metadata and images retained by callers have their own memory costs.
+    /// Plain `prepare` does not allocate a historical image or its index.
+    ///
+    /// Errors, cancellation and dropped futures invalidate preparation while
+    /// retaining the original handles for retry. Previously returned images
+    /// remain immutable. No writes, syncs, reopens or commit retries occur here.
+    ///
+    /// # Errors
+    /// Returns the ordinary complete-replay errors or an out-of-range target.
+    pub async fn prepare_snapshot(
+        &mut self,
+        cx: &Cx,
+        sequence: CommitSeq,
+    ) -> Result<NativePageSnapshot> {
+        match self.prepare_inner(cx, Some(sequence)).await? {
+            Some(snapshot) => Ok(snapshot),
+            None => {
+                self.prepared = None;
+                Err(corrupt("native historical snapshot was not captured"))
+            }
+        }
+    }
+
+    /// Select the last committed marker at or before this Unix nanosecond time.
+    /// Equal timestamps select the greatest sequence; a time before the first
+    /// marker selects genesis, and a later time selects the current tip. The
+    /// same complete semantic replay as `prepare_snapshot` remains mandatory.
+    ///
+    /// # Errors
+    /// Propagates complete-replay errors, cancellation and retention limits.
+    pub async fn prepare_snapshot_at_time(
+        &mut self,
+        cx: &Cx,
+        time_unix_ns: u64,
+    ) -> Result<NativePageSnapshot> {
+        // The sealed storage scanner already proved nondecreasing timestamps.
+        let markers = &self.replay.report().markers;
+        let count = markers.partition_point(|marker| marker.commit_time_unix_ns <= time_unix_ns);
+        let sequence = count.checked_sub(1)
+            .map_or(CommitSeq::ZERO, |index| markers[index].commit_seq);
+        self.prepare_snapshot(cx, sequence).await
+    }
+
+    async fn prepare_inner(
+        &mut self,
+        cx: &Cx,
+        selected: Option<CommitSeq>,
+    ) -> Result<Option<NativePageSnapshot>> {
         self.prepared = None;
         cx.checkpoint().map_err(|_| FrankenError::Interrupt)?;
         let mut history = PageHistory::new(self.page_size, self.limits)?;
+        let tip = self.replay.report().markers.last()
+            .map_or(CommitSeq::ZERO, |marker| marker.commit_seq);
+        if let Some(sequence) = selected.filter(|sequence| *sequence > tip) {
+            return Err(FrankenError::OutOfRange {
+                what: "native historical commit sequence".to_owned(),
+                value: sequence.get().to_string(),
+            });
+        }
+        let mut snapshot = if selected == Some(CommitSeq::ZERO) {
+            Some(capture_snapshot(cx, &history, None)?)
+        } else {
+            None
+        };
         self.replay
-            .prepare(cx, |candidate, _| history.replay_candidate(candidate))
+            .prepare(cx, |candidate, _| {
+                history.replay_candidate(candidate)?;
+                if selected == Some(candidate.proof.commit_seq) {
+                    snapshot = Some(capture_snapshot(
+                        cx, &history, Some(candidate.proof.commit_time_unix_ns),
+                    )?);
+                }
+                Ok(())
+            })
             .await?;
-        // The coordinator already matched this complete report to its log.
-        let tip = self.replay.report().markers.last().map_or(
-            fsqlite_types::CommitSeq::ZERO, |marker| marker.commit_seq,
-        );
+        // Full replay, including the suffix AFTER a requested historical image,
+        // must succeed before either the image or a current store escapes.
         if history.tip != tip {
             return Err(corrupt("native page replay/driver tip mismatch"));
+        }
+        if selected.is_some() && snapshot.is_none() {
+            return Err(corrupt("native historical snapshot was not captured"));
         }
         let next_txn_id = history.max_txn_id.checked_add(1).ok_or(FrankenError::DatabaseFull)?;
         // Latest tombstones still own their addresses. Never recycle them or
@@ -212,7 +297,7 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativePageRecovery<S, M, C> {
         let page_high_water = history.pages.last_key_value()
             .map_or(1, |(page, _)| u64::from(page.get()).max(1));
         self.prepared = Some(PreparedPages { history, next_txn_id, page_high_water });
-        Ok(())
+        Ok(snapshot)
     }
 
     /// Install complete page and coordinator state together, without new I/O.
@@ -261,6 +346,35 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativePageRecovery<S, M, C> {
         self.prepared = None;
         self.replay.close(cx)
     }
+}
+
+// Called only immediately after validated atomic page-capsule application (or
+// at empty genesis). Preserve sparse extent while excluding deleted payloads.
+fn capture_snapshot(
+    cx: &Cx,
+    history: &PageHistory,
+    time_unix_ns: Option<u64>,
+) -> Result<NativePageSnapshot> {
+    let mut pages = Vec::new();
+    pages.try_reserve_exact(history.pages.len()).map_err(|_| FrankenError::OutOfMemory)?;
+    let mut extent = 0;
+    let mut bytes = 0_usize;
+    for (page, versions) in &history.pages {
+        cx.checkpoint().map_err(|_| FrankenError::Interrupt)?;
+        if let Some(version) = versions.last() {
+            extent = page.get();
+            if let Some(data) = &version.data {
+                bytes = bytes.checked_add(data.len()).ok_or(FrankenError::TooBig)?;
+                pages.push((*page, Arc::clone(data)));
+            }
+        }
+    }
+    if bytes != history.payload_bytes {
+        return Err(corrupt("native historical snapshot payload accounting mismatch"));
+    }
+    Ok(NativePageSnapshot::from_validated_pages(
+        history.tip, time_unix_ns, history.page_size, extent, pages, bytes,
+    ))
 }
 
 #[cfg(test)]
