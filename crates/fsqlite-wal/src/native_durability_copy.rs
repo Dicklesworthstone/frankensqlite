@@ -50,6 +50,9 @@ impl<S: VfsFile, M: VfsFile> NativeDurabilityLog<S, M> {
     /// Checksum-damaged symbols remain erasures, not fabricated repair data.
     /// Each published referent is read from the DESTINATION and passed through
     /// the mandatory verifier before its ordinary two-barrier publication.
+    /// The complete accepted marker chain is checked before any copying, then
+    /// again after object staging and before publishing its first batch. A
+    /// valid checksum on a substituted chain does not authorize its export.
     ///
     /// The destination is appendable on success; its original handles remain
     /// caller-owned on failure. A failed/dropped copy poisons that destination,
@@ -179,6 +182,14 @@ impl<S: VfsFile, M: VfsFile> NativeDurabilityLog<S, M> {
         if marker_count != self.published_tip.get() {
             return Err(corrupt("native prefix copy has an unaccepted marker boundary"));
         }
+        // The entire marker prefix must fit, not just the first publication
+        // batch. Exclude retained source tails; they are never exported.
+        let marker_bytes = marker_count
+            .checked_mul(marker_width)
+            .ok_or(FrankenError::TooBig)?;
+        if marker_bytes > destination.limits.max_stream_bytes {
+            return Err(FrankenError::TooBig);
+        }
         let marker_count = usize::try_from(marker_count).map_err(|_| FrankenError::TooBig)?;
         let capacity = marker_count
             .min(128)
@@ -193,6 +204,11 @@ impl<S: VfsFile, M: VfsFile> NativeDurabilityLog<S, M> {
         batch
             .try_reserve_exact(capacity)
             .map_err(|_| FrankenError::OutOfMemory)?;
+        // Reuse the bounded, full-chain validator rather than discovering a
+        // late malformed or replaced marker after publishing earlier batches.
+        // With limit zero it retains no marker vector. A preflight refusal
+        // leaves the empty destination healthy and reusable.
+        self.replication_batch(cx, CommitSeq::ZERO, None, 0).await?;
         let mut copy = CopyGuard {
             destination,
             complete: false,
@@ -204,6 +220,10 @@ impl<S: VfsFile, M: VfsFile> NativeDurabilityLog<S, M> {
             checkpoint(cx)?;
             copy.destination.append_symbols(cx, &records).await?;
         }
+        // Object reads, codec calls and destination writes can yield. A source
+        // change during staging must not become a published destination prefix.
+        // Once staging starts, the guard still retains recovery obligations.
+        self.replication_batch(cx, CommitSeq::ZERO, None, 0).await?;
         for ordinal in 0..marker_count {
             checkpoint(cx)?;
             let offset = u64_len(ordinal)?
@@ -517,6 +537,8 @@ fn missing_replication_symbols(
 mod replication_tests {
     use std::future::{Future, Ready, pending, ready};
     use std::path::Path;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Waker};
 
     use asupersync::runtime::RuntimeBuilder;
@@ -817,6 +839,227 @@ mod replication_tests {
             assert_eq!(replica.published_tip(), CommitSeq::ZERO);
             source.close(&cx).unwrap();
             replica.close(&cx).unwrap();
+        });
+    }
+
+    // This one-symbol codec isolates copy admission. It is not a substitute
+    // for the authenticated RaptorQ repair tests in native_prefix_copy.
+    #[derive(Default)]
+    struct CopyCodec {
+        calls: AtomicUsize,
+        shorten_markers: Mutex<Option<(File, u64)>>,
+    }
+
+    impl NativeObjectCodec for CopyCodec {
+        fn encode(&self, cx: &Cx, payload: &[u8]) -> Result<Vec<SymbolRecord>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let shorten = self.shorten_markers.lock().unwrap().take();
+            if let Some((mut file, len)) = shorten {
+                // Adversarial external change while the repair codec runs.
+                // Only this sacrificial MemoryVfs fixture mutates the source.
+                file.truncate(cx, len)?;
+                file.close(cx)?;
+            }
+            let size = u32::try_from(payload.len()).map_err(|_| FrankenError::TooBig)?;
+            Ok(vec![SymbolRecord::new(
+                ObjectId::derive_from_canonical_bytes(payload),
+                Oti { f: u64::from(size), al: 1, t: size, z: 1, n: 1 },
+                0,
+                payload.to_vec(),
+                SymbolRecordFlags::SYSTEMATIC_RUN_START,
+            )])
+        }
+
+        fn decode(&self, _: &Cx, id: ObjectId, records: &[SymbolRecord]) -> Result<Vec<u8>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let payload = reconstruct_systematic_happy_path(records)
+                .map_err(|error| corrupt(&error.to_string()))?;
+            if ObjectId::derive_from_canonical_bytes(&payload) != id {
+                return Err(corrupt("copy admission fixture object identity mismatch"));
+            }
+            Ok(payload)
+        }
+    }
+
+    async fn copy_mode(
+        source: &mut Log,
+        cx: &Cx,
+        destination: &mut Log,
+        codec: &CopyCodec,
+        repair: bool,
+    ) -> Result<NativePrefixCopyReceipt> {
+        if repair {
+            source.repair_recovered_prefix_to(cx, destination, codec).await
+        } else {
+            source.copy_recovered_prefix_to(cx, destination, verify).await
+        }
+    }
+
+    async fn shared_object_chain(source: &mut Log, cx: &Cx, count: u64) {
+        let record = symbol(777);
+        let id = record.object_id;
+        source.append_symbols(cx, &[record]).await.unwrap();
+        for seq in 1..=count {
+            let marker = CommitMarker::new(
+                CommitSeq::new(seq), seq, id, id, source.previous_marker,
+            );
+            source.publish(cx, &[marker], verify).await.unwrap();
+        }
+    }
+
+    fn assert_copy_destination_unused(destination: &Log, cx: &Cx) {
+        assert_eq!(destination.symbols.file_size(cx).unwrap(), 0);
+        assert_eq!(destination.markers.file_size(cx).unwrap(), 0);
+        assert_eq!(destination.record_count, 0);
+        assert_eq!(destination.symbol_end, 0);
+        assert_eq!(destination.marker_end, 0);
+        assert!(destination.index.is_empty());
+        assert_eq!(destination.published_tip(), CommitSeq::ZERO);
+        assert!(destination.previous_marker.is_none());
+        assert!(destination.outstanding_write().is_none());
+        assert!(!destination.needs_recovery());
+    }
+
+    #[test]
+    fn fresh_copy_rejects_corrupt_or_substituted_late_markers_before_any_staging() {
+        run(async {
+            for repair in [false, true] {
+                for damage in 0..3 {
+                    let cx = Cx::new();
+                    let vfs = MemoryVfs::new();
+                    let mut source = log(&vfs, &cx, "source");
+                    shared_object_chain(&mut source, &cx, 129).await;
+                    let original = bytes(&source.markers, &cx).await;
+                    let offset = original.len() - COMMIT_MARKER_RECORD_V1_SIZE;
+                    let last = CommitMarker::from_record_bytes(&original[offset..]).unwrap();
+                    let mut changed = match damage {
+                        0 => CommitMarker::new(
+                            last.commit_seq, 999, last.capsule_object_id,
+                            last.proof_object_id, last.prev_marker,
+                        ).to_record_bytes(),
+                        1 => CommitMarker::new(
+                            last.commit_seq, last.commit_time_unix_ns,
+                            last.capsule_object_id, last.proof_object_id, None,
+                        ).to_record_bytes(),
+                        _ => last.to_record_bytes(),
+                    };
+                    if damage == 2 {
+                        changed[0] ^= 0xFF;
+                    }
+                    source.markers.write(&cx, &changed, u64_len(offset).unwrap()).await.unwrap();
+                    let before = (bytes(&source.symbols, &cx).await, bytes(&source.markers, &cx).await);
+                    let mut destination = log(&vfs, &cx, "destination");
+                    let codec = CopyCodec::default();
+                    assert!(matches!(copy_mode(&mut source, &cx, &mut destination, &codec, repair).await,
+                        Err(FrankenError::WalCorrupt { .. })));
+                    assert_copy_destination_unused(&destination, &cx);
+                    assert_eq!(codec.calls.load(Ordering::Relaxed), 0);
+                    assert!(source.needs_recovery());
+                    assert_eq!(bytes(&source.symbols, &cx).await, before.0);
+                    assert_eq!(bytes(&source.markers, &cx).await, before.1);
+                    source.close(&cx).unwrap();
+                    destination.close(&cx).unwrap();
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn fresh_copy_rechecks_source_after_regeneration_before_publishing_any_marker() {
+        run(async {
+            let cx = Cx::new();
+            let vfs = MemoryVfs::new();
+            let mut source = log(&vfs, &cx, "source");
+            shared_object_chain(&mut source, &cx, 129).await;
+            let retained = 128 * u64_len(COMMIT_MARKER_RECORD_V1_SIZE).unwrap();
+            let codec = CopyCodec {
+                calls: AtomicUsize::new(0),
+                shorten_markers: Mutex::new(Some((file(&vfs, &cx, "source-markers"), retained))),
+            };
+            let mut destination = log(&vfs, &cx, "destination");
+            assert!(matches!(source.repair_recovered_prefix_to(&cx, &mut destination, &codec).await,
+                Err(FrankenError::BusyRecovery)));
+            assert!(codec.calls.load(Ordering::Relaxed) >= 3);
+            assert_eq!(source.markers.file_size(&cx).unwrap(), retained);
+            assert!(source.needs_recovery());
+            assert!(destination.symbols.file_size(&cx).unwrap() > 0);
+            assert_eq!(destination.markers.file_size(&cx).unwrap(), 0);
+            assert_eq!(destination.published_tip(), CommitSeq::ZERO);
+            assert!(destination.needs_recovery());
+            assert!(destination.outstanding_write().is_none());
+            // The staged object is an orphan, not a copied 128-commit prefix.
+            destination = recover(destination, &cx).await;
+            assert_eq!(destination.published_tip(), CommitSeq::ZERO);
+            assert_eq!(destination.record_count, 1);
+            destination.close(&cx).unwrap();
+            source.close(&cx).unwrap();
+        });
+    }
+
+    #[test]
+    fn fresh_copy_preflights_total_marker_capacity_and_can_retry_the_same_destination() {
+        run(async {
+            for repair in [false, true] {
+                let cx = Cx::new();
+                let vfs = MemoryVfs::new();
+                let mut source = log(&vfs, &cx, "source");
+                shared_object_chain(&mut source, &cx, 129).await;
+                let original = bytes(&source.markers, &cx).await;
+                let total = u64_len(original.len()).unwrap();
+                let mut destination = log(&vfs, &cx, "destination");
+                destination.limits.max_stream_bytes = total - 1;
+                let codec = CopyCodec::default();
+                assert!(matches!(copy_mode(&mut source, &cx, &mut destination, &codec, repair).await,
+                    Err(FrankenError::TooBig)));
+                assert_copy_destination_unused(&destination, &cx);
+                assert_eq!(codec.calls.load(Ordering::Relaxed), 0);
+                assert!(!source.needs_recovery());
+                destination.limits.max_stream_bytes = total;
+                let receipt = copy_mode(&mut source, &cx, &mut destination, &codec, repair).await.unwrap();
+                assert_eq!(receipt.commits, 129);
+                assert_eq!(receipt.symbol_records, 1);
+                assert_eq!(receipt.marker_stream_bytes, total);
+                assert_eq!(bytes(&destination.markers, &cx).await, original);
+                assert!(!destination.needs_recovery());
+                source.close(&cx).unwrap();
+                destination.close(&cx).unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn fresh_copy_chain_preflight_preserves_tails_and_full_bounded_history() {
+        run(async {
+            for repair in [false, true] {
+                let cx = Cx::new();
+                let vfs = MemoryVfs::new();
+                let mut source = log(&vfs, &cx, "source");
+                shared_object_chain(&mut source, &cx, 129).await;
+                let marker_bytes = source.marker_end;
+                source.symbols.write(&cx, b"torn", source.symbol_end).await.unwrap();
+                source.markers.write(&cx, &[0xAA; 17], source.marker_end).await.unwrap();
+                source = recover(source, &cx).await;
+                let original = (bytes(&source.symbols, &cx).await, bytes(&source.markers, &cx).await);
+                let mut destination = log(&vfs, &cx, "destination");
+                destination.limits.max_stream_bytes = marker_bytes;
+                let receipt = copy_mode(
+                    &mut source, &cx, &mut destination, &CopyCodec::default(), repair,
+                ).await.unwrap();
+                assert_eq!(receipt.commits, 129);
+                assert_eq!(receipt.last_seq, CommitSeq::new(129));
+                assert_eq!(receipt.marker_stream_bytes, marker_bytes);
+                assert_eq!(receipt.symbol_stream_bytes + 4, source.symbol_end);
+                assert_eq!(bytes(&destination.markers, &cx).await.as_slice(),
+                    &original.1[..usize::try_from(marker_bytes).unwrap()]);
+                assert_eq!(bytes(&source.symbols, &cx).await, original.0);
+                assert_eq!(bytes(&source.markers, &cx).await, original.1);
+                assert!(source.needs_recovery());
+                destination = recover(destination, &cx).await;
+                assert!(!destination.needs_recovery());
+                assert_eq!(destination.published_tip(), CommitSeq::new(129));
+                source.close(&cx).unwrap();
+                destination.close(&cx).unwrap();
+            }
         });
     }
 }
