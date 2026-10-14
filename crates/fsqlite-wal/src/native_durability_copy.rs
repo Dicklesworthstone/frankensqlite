@@ -8,6 +8,8 @@ use super::{
 use fsqlite_error::FrankenError;
 use fsqlite_types::cx::Cx;
 
+use crate::native_commit::durable::NativeObjectCodec;
+
 /// A complete copy of one accepted native commit prefix into different streams.
 ///
 /// This is not a namespace-switch receipt or a cross-file atomic replacement.
@@ -75,11 +77,82 @@ impl<S: VfsFile, M: VfsFile> NativeDurabilityLog<S, M> {
         &mut self,
         cx: &Cx,
         destination: &mut NativeDurabilityLog<DS, DM>,
+        verify_object: V,
+    ) -> Result<NativePrefixCopyReceipt>
+    where
+        DS: VfsFile,
+        DM: VfsFile,
+        V: FnMut(ObjectId, Vec<SymbolRecord>) -> VF,
+        VF: std::future::Future<Output = Result<()>>,
+    {
+        self.copy_prefix_to_with(cx, destination, |_, records| Ok(records), verify_object)
+            .await
+    }
+
+    /// Reconstruct and re-encode every indexed object into fresh native streams.
+    ///
+    /// Unlike `copy_recovered_prefix_to`, this restores the source/repair symbol
+    /// set emitted by the caller's codec instead of retaining only survivors.
+    /// With `RaptorQNativeCodec` this runs real RaptorQ decoding and encoding;
+    /// another codec supplies only its own guarantees. The codec must accept
+    /// the original profile and authentication epoch. Re-encoding must preserve
+    /// every `ObjectId`, and its decoded bytes must exactly equal the original
+    /// reconstruction. No checksum-valid symbol alone establishes authenticity.
+    ///
+    /// All indexed objects, including orphans, must reconstruct successfully.
+    /// Objects with no surviving indexed symbols cannot be invented; a missing
+    /// committed referent still fails destination publication. Neither erasure
+    /// repair nor a torn tail changes the complete marker chain. The source
+    /// bytes remain untouched and any failed destination stays recovery-blocked.
+    /// Namespace admission, root switching, external leases, and semantic replay
+    /// remain the caller's responsibility, as for `copy_recovered_prefix_to`.
+    ///
+    /// Work is per object: bounded source symbols, decoded payload, regenerated
+    /// symbols and a roundtrip payload, never all decoded objects at once. The
+    /// codec must enforce its own allocation limits while decoding/encoding;
+    /// destination append limits additionally bound the retained wire records.
+    ///
+    /// # Errors
+    /// In addition to copy admission and I/O errors, refuses insufficient repair
+    /// rank, failed authentication, changed identity/profile, excessive payloads,
+    /// or an encoder whose output does not decode back to the exact source.
+    pub async fn repair_recovered_prefix_to<DS, DM, C>(
+        &mut self,
+        cx: &Cx,
+        destination: &mut NativeDurabilityLog<DS, DM>,
+        codec: &C,
+    ) -> Result<NativePrefixCopyReceipt>
+    where
+        DS: VfsFile,
+        DM: VfsFile,
+        C: NativeObjectCodec,
+    {
+        let payload_limit = self
+            .limits
+            .max_batch_bytes
+            .min(destination.limits.max_batch_bytes);
+        self.copy_prefix_to_with(
+            cx,
+            destination,
+            |id, records| regenerate_object(cx, codec, id, records, payload_limit),
+            |id, records| std::future::ready(codec.decode(cx, id, &records).map(|_| ())),
+        )
+        .await
+    }
+
+    // Both transfer modes share alias admission, publication, and the guard
+    // retaining destination ownership across transforms, I/O and verification.
+    async fn copy_prefix_to_with<DS, DM, T, V, VF>(
+        &mut self,
+        cx: &Cx,
+        destination: &mut NativeDurabilityLog<DS, DM>,
+        mut transform: T,
         mut verify_object: V,
     ) -> Result<NativePrefixCopyReceipt>
     where
         DS: VfsFile,
         DM: VfsFile,
+        T: FnMut(ObjectId, Vec<SymbolRecord>) -> Result<Vec<SymbolRecord>>,
         V: FnMut(ObjectId, Vec<SymbolRecord>) -> VF,
         VF: std::future::Future<Output = Result<()>>,
     {
@@ -127,6 +200,8 @@ impl<S: VfsFile, M: VfsFile> NativeDurabilityLog<S, M> {
         for &object_id in self.index.keys() {
             checkpoint(cx)?;
             let records = self.read_object(cx, object_id).await?;
+            let records = transform(object_id, records)?;
+            checkpoint(cx)?;
             copy.destination.append_symbols(cx, &records).await?;
         }
         for ordinal in 0..marker_count {
@@ -178,4 +253,33 @@ impl<S: VfsFile, M: VfsFile> NativeDurabilityLog<S, M> {
         copy.complete = true;
         Ok(receipt)
     }
+}
+
+fn regenerate_object<C: NativeObjectCodec>(
+    cx: &Cx,
+    codec: &C,
+    id: ObjectId,
+    records: Vec<SymbolRecord>,
+    payload_limit: usize,
+) -> Result<Vec<SymbolRecord>> {
+    if records.iter().any(|record| {
+        usize::try_from(record.oti.f).map_or(true, |len| len > payload_limit)
+    }) {
+        return Err(FrankenError::TooBig);
+    }
+    let payload = codec.decode(cx, id, &records)?;
+    drop(records);
+    if payload.is_empty() || payload.len() > payload_limit {
+        return Err(FrankenError::TooBig);
+    }
+    checkpoint(cx)?;
+    let regenerated = codec.encode(cx, &payload)?;
+    if regenerated.is_empty() || regenerated.iter().any(|record| record.object_id != id) {
+        return Err(corrupt("native repair encoder changed the object identity"));
+    }
+    checkpoint(cx)?;
+    if codec.decode(cx, id, &regenerated)? != payload {
+        return Err(corrupt("native repair encoder changed the decoded object"));
+    }
+    Ok(regenerated)
 }

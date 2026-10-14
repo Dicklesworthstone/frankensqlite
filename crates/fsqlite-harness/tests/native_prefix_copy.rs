@@ -432,3 +432,380 @@ fn either_destination_barrier_failure_stops_without_touching_the_source() {
         }
     });
 }
+
+#[test]
+fn repair_rebuilds_real_raptorq_symbols_and_preserves_authenticated_identity() {
+    use fsqlite_wal::native_commit::durable::NativeObjectCodec;
+    use fsqlite_wal::native_commit::durable::codec::RaptorQNativeCodec;
+
+    run(async {
+        for key in [None, Some([7; 32])] {
+            let cx = Cx::new();
+            cx.set_native_cx(asupersync::Cx::current().unwrap());
+            let vfs = MemoryVfs::new();
+            let codec = RaptorQNativeCodec::new(key);
+            let payload: Vec<_> = (0..4097).map(|n| u8::try_from(n % 251).unwrap()).collect();
+            let proof = vec![0xA5; 1025];
+            let payload_id = RaptorQNativeCodec::object_id(&payload).unwrap();
+            let proof_id = RaptorQNativeCodec::object_id(&proof).unwrap();
+            let payload_records = codec.encode(&cx, &payload).unwrap();
+            let proof_records = codec.encode(&cx, &proof).unwrap();
+            let missing_esi = payload_records[0].esi;
+            assert_eq!(missing_esi & (1 << 31), 0, "erase a source, not a repair");
+            assert!(payload_records.iter().any(|record| record.esi & (1 << 31) != 0));
+            let symbol_count = payload_records.len() + proof_records.len();
+            let mut source = log(&vfs, &cx, "source");
+            source.append_symbols(&cx, &payload_records).await.unwrap();
+            source.append_symbols(&cx, &proof_records).await.unwrap();
+            let first = CommitMarker::new(CommitSeq::new(1), 100, payload_id, proof_id, None);
+            source
+                .publish(&cx, &[first], |id, records| {
+                    ready(codec.decode(&cx, id, &records).map(|_| ()))
+                })
+                .await
+                .unwrap();
+            source.close(&cx).unwrap();
+            let original = bytes(&vfs, &cx, "source-objects").await;
+            let mut objects = file(&vfs, &cx, "source-objects");
+            objects.write(&cx, &[original[51] ^ 0x80], 51).await.unwrap();
+            objects
+                .write(
+                    &cx,
+                    &payload_records[0].to_bytes()[..60],
+                    u64::try_from(original.len()).unwrap(),
+                )
+                .await
+                .unwrap();
+            objects.close(&cx).unwrap();
+            let damaged = bytes(&vfs, &cx, "source-objects").await;
+            let original_markers = bytes(&vfs, &cx, "source-markers").await;
+            let (mut source, report) = NativeDurabilityLog::recover(
+                &cx,
+                file(&vfs, &cx, "source-objects"),
+                file(&vfs, &cx, "source-markers"),
+                NativeDurabilityLimits::default(),
+                |id, records| ready(codec.decode(&cx, id, &records).map(|_| ())),
+            )
+            .await
+            .unwrap();
+            assert_eq!(report.erased_symbols, 1);
+            assert_eq!(report.symbol_tail_bytes, 60);
+            assert!(source.needs_recovery());
+            let survivors = source.read_object(&cx, payload_id).await.unwrap();
+            assert!(!survivors.iter().any(|record| record.esi == missing_esi));
+            assert_eq!(codec.decode(&cx, payload_id, &survivors).unwrap(), payload);
+            let mut repaired = log(&vfs, &cx, "repaired");
+            let receipt = source
+                .repair_recovered_prefix_to(&cx, &mut repaired, &codec)
+                .await
+                .unwrap();
+            assert_eq!(receipt.symbol_records, symbol_count);
+            assert!(!repaired.needs_recovery());
+            let restored = repaired.read_object(&cx, payload_id).await.unwrap();
+            assert!(restored.iter().any(|record| record.esi == missing_esi));
+            assert!(restored.iter().all(SymbolRecord::verify_integrity));
+            if let Some(key) = key {
+                assert!(restored.iter().all(|record| record.verify_auth(&key)));
+            }
+            assert_eq!(codec.decode(&cx, payload_id, &restored).unwrap(), payload);
+            assert_eq!(bytes(&vfs, &cx, "source-objects").await, damaged);
+            assert_eq!(bytes(&vfs, &cx, "source-markers").await, original_markers);
+            assert_eq!(bytes(&vfs, &cx, "repaired-markers").await, original_markers);
+            repaired.close(&cx).unwrap();
+            // A second independent source-symbol erasure must be recoverable
+            // from the regenerated redundancy, not an in-memory page buffer.
+            let copied = bytes(&vfs, &cx, "repaired-objects").await;
+            let mut objects = file(&vfs, &cx, "repaired-objects");
+            objects.write(&cx, &[copied[51] ^ 0x80], 51).await.unwrap();
+            objects.close(&cx).unwrap();
+            let (mut reopened, report) = NativeDurabilityLog::recover(
+                &cx,
+                file(&vfs, &cx, "repaired-objects"),
+                file(&vfs, &cx, "repaired-markers"),
+                NativeDurabilityLimits::default(),
+                |id, records| ready(codec.decode(&cx, id, &records).map(|_| ())),
+            )
+            .await
+            .unwrap();
+            assert_eq!(report.erased_symbols, 1);
+            assert!(!report.append_blocked());
+            let records = reopened.read_object(&cx, payload_id).await.unwrap();
+            assert_eq!(codec.decode(&cx, payload_id, &records).unwrap(), payload);
+            reopened.close(&cx).unwrap();
+            source.close(&cx).unwrap();
+        }
+    });
+}
+
+#[test]
+fn repair_refuses_missing_or_wrong_authentication_keys_before_destination_writes() {
+    use fsqlite_wal::native_commit::durable::NativeObjectCodec;
+    use fsqlite_wal::native_commit::durable::codec::RaptorQNativeCodec;
+
+    run(async {
+        for wrong_key in [None, Some([8; 32])] {
+            let cx = Cx::new();
+            cx.set_native_cx(asupersync::Cx::current().unwrap());
+            let vfs = MemoryVfs::new();
+            let codec = RaptorQNativeCodec::new(Some([7; 32]));
+            let mut source = log(&vfs, &cx, "source");
+            let encoded = codec.encode(&cx, &[0xAB; 4097]).unwrap();
+            source.append_symbols(&cx, &encoded).await.unwrap();
+            let mut destination = log(&vfs, &cx, "copy");
+            let original = bytes(&vfs, &cx, "source-objects").await;
+            assert!(
+                source
+                    .repair_recovered_prefix_to(
+                        &cx,
+                        &mut destination,
+                        &RaptorQNativeCodec::new(wrong_key),
+                    )
+                    .await
+                    .is_err()
+            );
+            assert!(destination.needs_recovery());
+            assert!(bytes(&vfs, &cx, "copy-objects").await.is_empty());
+            assert!(bytes(&vfs, &cx, "copy-markers").await.is_empty());
+            assert_eq!(bytes(&vfs, &cx, "source-objects").await, original);
+            let mut good = log(&vfs, &cx, "good");
+            source.repair_recovered_prefix_to(&cx, &mut good, &codec).await.unwrap();
+            assert!(!good.needs_recovery());
+            good.close(&cx).unwrap();
+            destination.close(&cx).unwrap();
+            source.close(&cx).unwrap();
+        }
+    });
+}
+
+// Intentionally broken codecs test the repair boundary, not an alternative
+// to RaptorQ. Either corrupt the identity or return different decoded bytes
+// while claiming the same identity. Neither may reach destination append.
+struct BrokenRepairCodec {
+    preserve_identity: bool,
+}
+
+impl fsqlite_wal::native_commit::durable::NativeObjectCodec for BrokenRepairCodec {
+    fn encode(&self, _: &Cx, payload: &[u8]) -> Result<Vec<SymbolRecord>> {
+        let mut changed = payload.to_vec();
+        changed[0] ^= 0x80;
+        let id = ObjectId::derive_from_canonical_bytes(if self.preserve_identity {
+            payload
+        } else {
+            &changed
+        });
+        Ok(vec![SymbolRecord::new(
+            id,
+            Oti { f: 4, al: 1, t: 4, z: 1, n: 1 },
+            0,
+            changed,
+            SymbolRecordFlags::SYSTEMATIC_RUN_START,
+        )])
+    }
+
+    fn decode(&self, _: &Cx, _: ObjectId, records: &[SymbolRecord]) -> Result<Vec<u8>> {
+        reconstruct_systematic_happy_path(records).map_err(|error| FrankenError::WalCorrupt {
+            detail: error.to_string(),
+        })
+    }
+}
+
+#[test]
+fn repair_rejects_encoder_identity_and_roundtrip_mismatches_before_append() {
+    run(async {
+        for preserve_identity in [false, true] {
+            let cx = Cx::new();
+            let vfs = MemoryVfs::new();
+            let mut source = log(&vfs, &cx, "source");
+            populate(&cx, &mut source).await;
+            let mut destination = log(&vfs, &cx, "copy");
+            let error = source
+                .repair_recovered_prefix_to(
+                    &cx,
+                    &mut destination,
+                    &BrokenRepairCodec { preserve_identity },
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(error, FrankenError::WalCorrupt { .. }));
+            let expected = if preserve_identity { "decoded object" } else { "object identity" };
+            assert!(error.to_string().contains(expected));
+            assert!(destination.needs_recovery());
+            assert!(bytes(&vfs, &cx, "copy-objects").await.is_empty());
+            assert!(bytes(&vfs, &cx, "copy-markers").await.is_empty());
+            assert!(!source.needs_recovery());
+            destination.close(&cx).unwrap();
+            source.close(&cx).unwrap();
+        }
+    });
+}
+
+#[test]
+fn repaired_native_page_history_reopens_and_resumes_conflict_checked_transactions() {
+    use fsqlite_types::PageNumber;
+    use fsqlite_wal::native_commit::durable::NativeObjectCodec;
+    use fsqlite_wal::native_commit::durable::codec::RaptorQNativeCodec;
+    use fsqlite_wal::native_pages::{NativePageLimits, NativePageStore};
+
+    run(async {
+        let cx = Cx::new();
+        cx.set_native_cx(asupersync::Cx::current().unwrap());
+        let vfs = MemoryVfs::new();
+        let codec = || RaptorQNativeCodec::new(Some([7; 32]));
+        let page = |n| PageNumber::new(n).unwrap();
+        let mut db = NativePageStore::new(
+            log(&vfs, &cx, "source"), codec(), 512, NativePageLimits::default(),
+        )
+        .unwrap();
+        let mut first = db.begin(&cx).unwrap();
+        for (number, fill) in [(1, 0x11), (2, 0x22), (3, 0x33)] {
+            db.write_page(&cx, &mut first, page(number), Some(&[fill; 512])).unwrap();
+        }
+        db.commit(&cx, &mut first, 100).await.unwrap();
+        let mut second = db.begin(&cx).unwrap();
+        db.write_page(&cx, &mut second, page(1), Some(&[0x44; 512])).unwrap();
+        db.write_page(&cx, &mut second, page(2), None).unwrap();
+        db.commit(&cx, &mut second, 200).await.unwrap();
+        db.close(&cx).unwrap();
+        let original = bytes(&vfs, &cx, "source-objects").await;
+        let mut objects = file(&vfs, &cx, "source-objects");
+        objects.write(&cx, &[original[51] ^ 0x80], 51).await.unwrap();
+        objects.write(&cx, b"torn", u64::try_from(original.len()).unwrap()).await.unwrap();
+        objects.close(&cx).unwrap();
+        let damaged = bytes(&vfs, &cx, "source-objects").await;
+        let (mut source, report) = NativeDurabilityLog::recover(
+            &cx,
+            file(&vfs, &cx, "source-objects"),
+            file(&vfs, &cx, "source-markers"),
+            NativeDurabilityLimits::default(),
+            |id, records| ready(codec().decode(&cx, id, &records).map(|_| ())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.erased_symbols, 1);
+        assert_eq!(report.symbol_tail_bytes, 4);
+        let mut repaired = log(&vfs, &cx, "repaired");
+        source.repair_recovered_prefix_to(&cx, &mut repaired, &codec()).await.unwrap();
+        assert_eq!(repaired.published_tip(), CommitSeq::new(2));
+        repaired.close(&cx).unwrap();
+        let (mut db, report) = NativePageStore::recover(
+            &cx,
+            file(&vfs, &cx, "repaired-objects"),
+            file(&vfs, &cx, "repaired-markers"),
+            codec(),
+            512,
+            NativeDurabilityLimits::default(),
+            NativePageLimits::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.erased_symbols, 0);
+        assert!(!report.append_blocked());
+        let mut old = db.begin(&cx).unwrap();
+        assert_eq!(db.read_page(&cx, &mut old, page(1)).unwrap().unwrap().as_ref(), &[0x44; 512]);
+        assert!(db.read_page(&cx, &mut old, page(2)).unwrap().is_none());
+        assert_eq!(db.read_page(&cx, &mut old, page(3)).unwrap().unwrap().as_ref(), &[0x33; 512]);
+        let mut a = db.begin(&cx).unwrap();
+        let mut b = db.begin(&cx).unwrap();
+        db.write_page(&cx, &mut a, page(1), Some(&[0x55; 512])).unwrap();
+        db.write_page(&cx, &mut b, page(1), Some(&[0x66; 512])).unwrap();
+        let committed = db.commit(&cx, &mut a, 300).await.unwrap().unwrap();
+        assert_eq!(committed.commit_seq, CommitSeq::new(3));
+        assert!(matches!(
+            db.commit(&cx, &mut b, 400).await,
+            Err(FrankenError::BusySnapshot { .. })
+        ));
+        db.rollback(&mut b).unwrap();
+        assert_eq!(db.read_page(&cx, &mut old, page(1)).unwrap().unwrap().as_ref(), &[0x44; 512]);
+        db.rollback(&mut old).unwrap();
+        let mut fresh = db.begin(&cx).unwrap();
+        assert_eq!(db.read_page(&cx, &mut fresh, page(1)).unwrap().unwrap().as_ref(), &[0x55; 512]);
+        db.rollback(&mut fresh).unwrap();
+        db.close(&cx).unwrap();
+        assert_eq!(bytes(&vfs, &cx, "source-objects").await, damaged);
+        source.close(&cx).unwrap();
+    });
+}
+
+#[test]
+fn repair_refuses_insufficient_rank_without_fabricating_redundancy() {
+    use fsqlite_wal::native_commit::durable::NativeObjectCodec;
+    use fsqlite_wal::native_commit::durable::codec::RaptorQNativeCodec;
+
+    run(async {
+        let cx = Cx::new();
+        cx.set_native_cx(asupersync::Cx::current().unwrap());
+        let vfs = MemoryVfs::new();
+        let codec = RaptorQNativeCodec::default();
+        let payload = vec![0xAC; 8193];
+        let id = RaptorQNativeCodec::object_id(&payload).unwrap();
+        let encoded = codec.encode(&cx, &payload).unwrap();
+        assert!(encoded.len() > 2);
+        let mut source = log(&vfs, &cx, "source");
+        source.append_symbols(&cx, &encoded).await.unwrap();
+        let mut objects = file(&vfs, &cx, "source-objects");
+        let mut offset = 0;
+        for (index, record) in encoded.iter().enumerate() {
+            let wire = record.to_bytes();
+            if index != 0 {
+                objects.write(&cx, &[wire[51] ^ 0x80], offset + 51).await.unwrap();
+            }
+            offset += u64::try_from(wire.len()).unwrap();
+        }
+        objects.close(&cx).unwrap();
+        let survivors = source.read_object(&cx, id).await.unwrap();
+        assert_eq!(survivors.len(), 1);
+        assert!(codec.decode(&cx, id, &survivors).is_err());
+        let before = bytes(&vfs, &cx, "source-objects").await;
+        let mut destination = log(&vfs, &cx, "copy");
+        assert!(source.repair_recovered_prefix_to(&cx, &mut destination, &codec).await.is_err());
+        assert!(destination.needs_recovery());
+        assert_eq!(destination.published_tip(), CommitSeq::ZERO);
+        assert!(bytes(&vfs, &cx, "copy-objects").await.is_empty());
+        assert!(bytes(&vfs, &cx, "copy-markers").await.is_empty());
+        assert_eq!(bytes(&vfs, &cx, "source-objects").await, before);
+        destination.close(&cx).unwrap();
+        source.close(&cx).unwrap();
+    });
+}
+
+#[test]
+fn repair_enforces_destination_payload_and_symbol_budgets() {
+    use fsqlite_wal::native_commit::durable::NativeObjectCodec;
+    use fsqlite_wal::native_commit::durable::codec::RaptorQNativeCodec;
+
+    run(async {
+        for limit_payload in [false, true] {
+            let cx = Cx::new();
+            cx.set_native_cx(asupersync::Cx::current().unwrap());
+            let vfs = MemoryVfs::new();
+            let codec = RaptorQNativeCodec::default();
+            let encoded = codec.encode(&cx, &[0x5A; 4097]).unwrap();
+            let mut source = log(&vfs, &cx, "source");
+            source.append_symbols(&cx, &encoded).await.unwrap();
+            let limits = if limit_payload {
+                NativeDurabilityLimits {
+                    max_batch_bytes: 2048,
+                    ..NativeDurabilityLimits::default()
+                }
+            } else {
+                NativeDurabilityLimits {
+                    max_symbol_bytes: 512,
+                    ..NativeDurabilityLimits::default()
+                }
+            };
+            let mut destination = NativeDurabilityLog::create(
+                &cx, file(&vfs, &cx, "copy-objects"), file(&vfs, &cx, "copy-markers"), limits,
+            )
+            .unwrap();
+            assert!(matches!(
+                source.repair_recovered_prefix_to(&cx, &mut destination, &codec).await,
+                Err(FrankenError::TooBig)
+            ));
+            assert!(destination.needs_recovery());
+            assert!(bytes(&vfs, &cx, "copy-objects").await.is_empty());
+            assert!(bytes(&vfs, &cx, "copy-markers").await.is_empty());
+            destination.close(&cx).unwrap();
+            source.close(&cx).unwrap();
+        }
+    });
+}
