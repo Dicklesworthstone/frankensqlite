@@ -261,7 +261,7 @@ test("cleanup metadata added to the original SQL error during rollback still pre
   target.beforeRollback=(depth,error)=>{if(depth===1)error.cleanupErrors.push(new FrankenSQLiteError({
     code:"SQLITE_IOERR",message:"cleanup obligation retained",
   }));};
-  await assert.rejects(applyChangeset(target,wire([insert(1n,"taken")]),policy({onConflict:()=>{calls++;return "omit";}})),
+  await assert.rejects(applyChangeset(target,wire([insert(1n,"taken")]),policy({onConflict:()=>{calls++;return "omit";} })),
     e=>e===target.errors[0]);
   assert.equal(calls,0);assert.deepEqual(columns(target.db),[[9n,"taken"]]);
 });
@@ -465,4 +465,59 @@ test("grandchild cleanup uncertainty remains sticky through two caught rejection
     await tx.execute("INSERT INTO t VALUES(4,'parent after caught')");
   }),e=>e.code==="ERR_FSQLITE_FOREIGN_KEY_STATE"&&e.cleanupErrors.length===1);
   assert.deepEqual(columns(target.db),[]);assert.equal(target.depth,0);
+});
+
+test("caught uncertain child cleanup immediately fences parent reads, writes and new savepoints",async t=>{
+  for(const mode of ["rollback","release","metadata"]){
+    const target=new Target(t);let original,checked=0,admitted;
+    if(mode==="rollback")target.rollbackFailure=new Error("cleanup unresolved");
+    if(mode==="release")target.beforeRelease=d=>{if(d===1)throw new Error("release unresolved");};
+    if(mode==="metadata")target.beforeRollback=(d,e)=>{if(d===1)e.cleanupErrors.push(new Error("late cleanup"));};
+    await assert.rejects(withDeferredForeignKeys(target).transaction(async tx=>{
+      try { await tx.transaction(async child=>{
+        await child.execute("INSERT INTO t VALUES(1,'tentative')");
+        if(mode!=="release")throw constraint();
+      });assert.fail("uncertain child must reject"); }
+      catch(error){original=error;}
+      const count=target.log.length;
+      for(const operation of [
+        ()=>tx.execute("INSERT INTO t VALUES(2,'must not be admitted')"),
+        ()=>tx.query("SELECT * FROM t"),
+        ()=>tx.transaction(async()=>assert.fail("new child admitted after uncertain cleanup")),
+      ]) {
+        await assert.rejects(operation(),e=>e.code==="ERR_FSQLITE_FOREIGN_KEY_STATE"&&e.cause===original&&e.cleanupErrors[0]===original);
+        checked++;
+      }
+      admitted=target.log.length-count;
+    }),{code:"ERR_FSQLITE_FOREIGN_KEY_STATE"});
+    // Assertions inside uncertain work can themselves be wrapped by the
+    // expected outer STATE error. Prove all checks completed outside it.
+    assert.equal(checked,3,mode);assert.equal(admitted,0,mode);
+    assert.deepEqual(columns(target.db),[]);assert.equal(target.depth,0);
+  }
+});
+
+test("grandchild cleanup fences each ancestor while confirmed child rollback still permits progress",async t=>{
+  const target=new Target(t);let checkedChild=false,checkedParent=false,childWrites,parentWrites;
+  target.beforeRollback=(d,e)=>{if(d===2)e.cleanupErrors.push(new Error("grandchild unresolved"));};
+  await assert.rejects(withDeferredForeignKeys(target).transaction(async tx=>{
+    await assert.rejects(tx.transaction(async child=>{
+      await assert.rejects(child.transaction(async inner=>{throw constraint();}));
+      const count=target.log.length;
+      await assert.rejects(child.query("SELECT 1"),{code:"ERR_FSQLITE_FOREIGN_KEY_STATE"});
+      checkedChild=true;childWrites=target.log.length-count;
+    }),{code:"ERR_FSQLITE_FOREIGN_KEY_STATE"});
+    const count=target.log.length;
+    await assert.rejects(tx.execute("INSERT INTO t VALUES(1,'must not enter')"),{code:"ERR_FSQLITE_FOREIGN_KEY_STATE"});
+    checkedParent=true;parentWrites=target.log.length-count;
+  }),{code:"ERR_FSQLITE_FOREIGN_KEY_STATE"});
+  assert.equal(checkedChild,true);assert.equal(checkedParent,true);
+  assert.equal(childWrites,0);assert.equal(parentWrites,0);
+  target.beforeRollback=null;
+  await withDeferredForeignKeys(target).transaction(async tx=>{
+    const error=new Error("ordinary child rollback");
+    await assert.rejects(tx.transaction(async()=>{throw error;}),e=>e===error);
+    await tx.execute("INSERT INTO t VALUES(2,'fresh confirmed scope')");
+  });
+  assert.deepEqual(columns(target.db),[[2n,"fresh confirmed scope"]]);
 });

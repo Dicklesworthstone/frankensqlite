@@ -110,6 +110,9 @@ async function runWork<T>(
   const submit = <U>(operation: () => Promise<U>, recovered?: () => boolean): Promise<U> => {
     if (!accepting) return Promise.reject(new ChangesetForeignKeyError(
       "ERR_FSQLITE_FOREIGN_KEY_STATE", "Deferred foreign-key SQL scope has ended"));
+    if (unsettledChildren.length !== 0) return Promise.reject(new ChangesetForeignKeyError(
+      "ERR_FSQLITE_FOREIGN_KEY_STATE", "Child cleanup is uncertain; no further SQL was admitted",
+      { cause: unsettledChildren[0] }, Object.freeze([...unsettledChildren])));
     if (childActive) return Promise.reject(new ChangesetForeignKeyError(
       "ERR_FSQLITE_FOREIGN_KEY_BUSY", "The child transaction owns this SQL scope"));
     const promise = (async () => {
