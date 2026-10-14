@@ -219,7 +219,13 @@ impl NativeReplicationPlan {
         bytes.extend_from_slice(PLAN_MAGIC);
         bytes.extend_from_slice(self.database.as_bytes());
         bytes.extend_from_slice(&self.base.sequence.get().to_le_bytes());
-        bytes.extend_from_slice(self.base.marker.as_ref().map_or(&[0; 16], ObjectId::as_bytes));
+        bytes.extend_from_slice(
+            self.base
+                .marker
+                .as_ref()
+                .map_or(&[0u8; 16], ObjectId::as_bytes)
+                .as_slice(),
+        );
         bytes.extend_from_slice(&count(self.markers.len())?.to_le_bytes());
         bytes.extend_from_slice(&count(self.objects.len())?.to_le_bytes());
         for marker in &self.markers { bytes.extend_from_slice(&marker.to_record_bytes()); }
