@@ -118,7 +118,9 @@ export {
   ChangesetFanoutError,
 } from "./changeset-fanout";
 export type { ChangesetGroupStats } from "./changeset-group";
-export { ChangesetGroup, ChangesetGroupError, concatChangesets } from "./changeset-group";
+export {
+  ChangesetGroup, ChangesetGroupError, PatchsetGroup, concatChangesets, concatPatchsets,
+} from "./changeset-group";
 export type { ChangesetRebaseResolution, ChangesetRebaseStats } from "./changeset-rebase";
 export {
   ChangesetRebaseError,

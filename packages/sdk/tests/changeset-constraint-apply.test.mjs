@@ -521,3 +521,68 @@ test("grandchild cleanup fences each ancestor while confirmed child rollback sti
   });
   assert.deepEqual(columns(target.db),[[2n,"fresh confirmed scope"]]);
 });
+
+for (const compact of [false, true]) {
+  test(`${compact ? "patchset" : "changeset"}: current images compose with deferred isolated replacement`, async t => {
+    const target = new Target(t, `CREATE TABLE t(id INTEGER PRIMARY KEY,v TEXT UNIQUE,revision INTEGER,payload BLOB);
+      CREATE TABLE child(id PRIMARY KEY REFERENCES t(id) ON DELETE CASCADE);
+      CREATE TABLE audit(v);
+      CREATE TRIGGER removed AFTER DELETE ON t BEGIN INSERT INTO audit VALUES(old.v); END`,
+      "INSERT INTO t VALUES(1,'original',12,x'0102'),(2,'taken',2,x'03'); INSERT INTO child VALUES(1)");
+    const bytes = wire([insert(1n,"taken",4n,new Uint8Array([8])), insert(3n,"after",4n,new Uint8Array([9]))],
+      compact, "t", [1,0,0,0]);
+    const seen = [], retained = [];
+    const options = policy({ foreignKeys:"defer", deliveryId:`current/${compact}`, onConflict:c => {
+      seen.push(c.kind);
+      assert.ok(Object.hasOwn(c,"current"));
+      if(c.kind === "conflict") {
+        assert.deepEqual(c.current,[1n,"original",12n,new Uint8Array([1,2])]);
+        assert.ok(Object.isFrozen(c.current));
+        c.current[3].fill(99); retained.push(c.current);
+        return "replace";
+      }
+      assert.equal(c.kind,"constraint");
+      assert.equal(c.current,null,"a UNIQUE failure does not identify one receiver row");
+      assert.equal(c.error,target.errors.at(-1));
+      assert.deepEqual(target.log.at(-1),["rollback",1],"do not read a row after failed replacement");
+      assert.deepEqual(columns(target.db,"SELECT * FROM child"),[[1n]]);
+      assert.deepEqual(columns(target.db,"SELECT * FROM audit"),[]);
+      return "omit";
+    }});
+    assert.deepEqual(await (compact ? applyPatchset : applyChangeset)(target,bytes,options),
+      {applied:1,omitted:1,replayed:false});
+    assert.deepEqual(seen,["conflict","constraint"]);
+    assert.deepEqual(columns(target.db),[
+      [1n,"original",12n,new Uint8Array([1,2])],
+      [2n,"taken",2n,new Uint8Array([3])],
+      [3n,"after",4n,new Uint8Array([9])],
+    ]);
+    assert.deepEqual(retained[0][3],new Uint8Array([99,99]));
+    const before=target.log.length;
+    assert.deepEqual(await (compact ? applyPatchset : applyChangeset)(target,bytes,options),
+      {applied:1,omitted:1,replayed:true});
+    assert.deepEqual(seen,["conflict","constraint"]);
+    assert.equal(target.log.slice(before).some(([kind,,sql])=>kind==="query"&&sql.includes("__fsqlite_conflict_cost")),false);
+  });
+}
+
+test("receiver-image query failures cannot become isolated constraint omissions", async t => {
+  const target = new Target(t, undefined, "INSERT INTO t VALUES(1,'old')");
+  const original = target.transaction.bind(target), readError=constraint();
+  let queries=0, policies=0;
+  const wrap = tx => ({
+    execute: tx.execute,
+    query: (sql,params) => {
+      if(sql.includes("__fsqlite_conflict_cost")) { queries++; return Promise.reject(readError); }
+      return tx.query(sql,params);
+    },
+    transaction: work => tx.transaction(child=>work(wrap(child))),
+  });
+  target.transaction = work => original(tx=>work(wrap(tx)));
+  await assert.rejects(applyChangeset(target,wire([insert(2n,"first"),insert(1n,"new")]),policy({
+    deliveryId:"query-is-not-execute",onConflict:()=>{policies++;return "omit";},
+  })),error=>error===readError);
+  assert.equal(queries,1);assert.equal(policies,0);
+  assert.deepEqual(columns(target.db),[[1n,"old"]]);
+  assert.deepEqual(columns(target.db,"SELECT name FROM sqlite_schema WHERE name='__fsqlite_changeset_receipts'"),[]);
+});
