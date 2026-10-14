@@ -184,3 +184,51 @@ fn strict_update_integer_into_text_gh272() {
         assert_agree_query(&f, &r, "SELECT a, typeof(a) FROM t").await;
     });
 }
+
+#[test]
+fn strict_any_column_preserves_zero_padded_text_and_all_storage_classes_gh509() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let f_path = dir.path().join("f_gh509.db");
+        let r_path = dir.path().join("r_gh509.db");
+
+        let f = Connection::open(f_path.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        let r = rusqlite::Connection::open(&r_path).unwrap();
+
+        let stmts = [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, x ANY, d ANY DEFAULT '000999') STRICT",
+            "INSERT INTO t(id, x) VALUES (1, '000123'), (2, '42'), (3, 42), (4, 3.5), (5, X'CAFE'), (6, NULL)",
+            "ALTER TABLE t ADD COLUMN extra ANY DEFAULT '000777'",
+            "INSERT INTO t(id, x, extra) VALUES (7, '-0042', '00.50')",
+            "UPDATE t SET x = '000888' WHERE id = 3",
+        ];
+        let d = apply_checked(&f, &r, &stmts).await;
+        assert!(
+            d.is_empty(),
+            "GH#509 STRICT ANY divergence:\n{}",
+            d.join("\n")
+        );
+        let check_sql =
+            "SELECT id, x, typeof(x), d, typeof(d), extra, typeof(extra) FROM t ORDER BY id";
+        assert_agree_query(&f, &r, check_sql).await;
+
+        drop(f);
+        let f_reopen = Connection::open(f_path.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        let d2 = apply_checked(
+            &f_reopen,
+            &r,
+            &["INSERT INTO t(id, x) VALUES (8, '000456')"],
+        )
+        .await;
+        assert!(
+            d2.is_empty(),
+            "GH#509 STRICT ANY reopen divergence:\n{}",
+            d2.join("\n")
+        );
+        assert_agree_query(&f_reopen, &r, check_sql).await;
+    });
+}
