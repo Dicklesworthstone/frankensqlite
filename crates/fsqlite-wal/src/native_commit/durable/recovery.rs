@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
-use fsqlite_types::{CommitSeq, ObjectId, OperatingMode};
+use fsqlite_types::{CommitMarker, CommitSeq, ObjectId, OperatingMode};
 use fsqlite_vfs::VfsFile;
 
 use super::{
@@ -181,6 +181,58 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativeCoordinatorRecovery<S, 
     }
 }
 
+impl<S: VfsFile, M: VfsFile> NativeDurabilityLog<S, M> {
+    // Recovery and pre-publication replica validation share this exact proof
+    // interpreter. A transport MAC or a claimed write set cannot stand in for
+    // decoding the bound capsule and every immediate evidence object.
+    pub(crate) async fn read_commit_candidate<C: NativeObjectCodec>(
+        &self,
+        cx: &Cx,
+        codec: &C,
+        marker: &CommitMarker,
+    ) -> Result<(NativeCommitCandidate, BTreeMap<ObjectId, Arc<[u8]>>)> {
+        checkpoint(cx)?;
+        let proof_records = self.read_object(cx, marker.proof_object_id).await?;
+        let proof_bytes = codec.decode(cx, marker.proof_object_id, &proof_records)?;
+        let proof = NativeCommitProof::from_bytes(&proof_bytes)?;
+        if proof.commit_seq != marker.commit_seq
+            || proof.commit_time_unix_ns != marker.commit_time_unix_ns
+            || proof.submission.capsule_object_id != marker.capsule_object_id
+        {
+            return Err(corrupt("native recovery proof is not bound to its marker"));
+        }
+        let mut objects = BTreeMap::<ObjectId, Arc<[u8]>>::new();
+        let mut decoded_bytes = 0_usize;
+        for id in std::iter::once(&proof.submission.capsule_object_id)
+            .chain(&proof.submission.witness_refs)
+            .chain(&proof.submission.edge_ids)
+            .chain(&proof.submission.merge_witness_ids)
+        {
+            if objects.contains_key(id) {
+                continue;
+            }
+            let records = self.read_object(cx, *id).await?;
+            let payload = codec.decode(cx, *id, &records)?;
+            decoded_bytes = decoded_bytes
+                .checked_add(payload.len())
+                .filter(|n| *n <= MAX_NATIVE_VALIDATION_BYTES)
+                .ok_or(FrankenError::TooBig)?;
+            objects.insert(*id, Arc::from(payload));
+        }
+        let capsule = Arc::clone(
+            objects.get(&marker.capsule_object_id)
+                .ok_or_else(|| corrupt("native recovery capsule is missing"))?,
+        );
+        if blake3::hash(&capsule).as_bytes() != &proof.submission.capsule_digest {
+            return Err(corrupt("native recovery capsule digest mismatch"));
+        }
+        let candidate = NativeCommitCandidate {
+            proof, proof_object_id: marker.proof_object_id, capsule,
+        };
+        Ok((candidate, objects))
+    }
+}
+
 // The ordinary fresh-boot entry and the sealed rewrite-recovery handoff share
 // ONE proof interpreter. Neither can substitute report metadata for stored
 // capsule bytes or silently omit the caller's historical semantic validator.
@@ -200,44 +252,7 @@ where
     let mut coordinator =
         WriteCoordinator::new(OperatingMode::Native, CommitSeq::ZERO, max_pending);
     for marker in &report.markers {
-        checkpoint(cx)?;
-        let proof_records = log.read_object(cx, marker.proof_object_id).await?;
-        let proof_bytes = codec.decode(cx, marker.proof_object_id, &proof_records)?;
-        let proof = NativeCommitProof::from_bytes(&proof_bytes)?;
-        if proof.commit_seq != marker.commit_seq
-            || proof.commit_time_unix_ns != marker.commit_time_unix_ns
-            || proof.submission.capsule_object_id != marker.capsule_object_id
-        {
-            return Err(corrupt("native recovery proof is not bound to its marker"));
-        }
-        let mut objects = BTreeMap::<ObjectId, Arc<[u8]>>::new();
-        let mut decoded_bytes = 0_usize;
-        for id in std::iter::once(&proof.submission.capsule_object_id)
-            .chain(&proof.submission.witness_refs)
-            .chain(&proof.submission.edge_ids)
-            .chain(&proof.submission.merge_witness_ids)
-        {
-            if objects.contains_key(id) {
-                continue;
-            }
-            let records = log.read_object(cx, *id).await?;
-            let payload = codec.decode(cx, *id, &records)?;
-            decoded_bytes = decoded_bytes
-                .checked_add(payload.len())
-                .filter(|n| *n <= MAX_NATIVE_VALIDATION_BYTES)
-                .ok_or(FrankenError::TooBig)?;
-            objects.insert(*id, Arc::from(payload));
-        }
-        let capsule = Arc::clone(
-            objects.get(&marker.capsule_object_id)
-                .ok_or_else(|| corrupt("native recovery capsule is missing"))?,
-        );
-        if blake3::hash(&capsule).as_bytes() != &proof.submission.capsule_digest {
-            return Err(corrupt("native recovery capsule digest mismatch"));
-        }
-        let candidate = NativeCommitCandidate {
-            proof, proof_object_id: marker.proof_object_id, capsule,
-        };
+        let (candidate, objects) = log.read_commit_candidate(cx, codec, marker).await?;
         validate(&candidate, &objects)?;
         coordinator.commit_index.record_commit(
             &candidate.proof.submission.write_set_pages, marker.commit_seq,

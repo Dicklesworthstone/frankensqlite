@@ -5,11 +5,15 @@
 //! needs the other side's file handles. The caller supplies transport, routing,
 //! key distribution, namespace admission and the destination append lease.
 
+use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Arc;
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
 use fsqlite_vfs::{VfsFile, VfsWriteCompletion};
+
+use crate::native_commit::durable::{NativeCommitCandidate, NativeObjectCodec};
 
 use super::{
     COMMIT_MARKER_RECORD_V1_SIZE, CommitMarker, CommitSeq, NativeDurabilityLog,
@@ -499,6 +503,82 @@ impl<S: VfsFile, M: VfsFile> NativeReplicationReceiver<'_, S, M> {
         Ok(())
     }
 
+    /// Replay the complete destination history and incoming suffix before
+    /// publishing any new marker. Stored proofs, capsules and immediate
+    /// evidence use the SAME decoder and binding checks as native recovery.
+    /// The mandatory callback must enforce the application's historical
+    /// semantics and bind each write set to its capsule. Its external effects
+    /// are not rolled back. A transport key alone cannot provide that proof.
+    ///
+    /// This is full replay, not incremental validation: retained markers are
+    /// bounded by the destination record limit, decoded evidence is bounded
+    /// per commit, and callback-owned state has its own resource obligations.
+    /// Every callback finishes before the first durability barrier. Failure
+    /// retains staged orphans and the receiver's recovery obligations without
+    /// publishing a partial semantic prefix. Physical publication can still
+    /// tear: recover the original handles before retrying the portable plan.
+    ///
+    /// # Errors
+    /// Rejects incomplete inventories, invalid proofs or application history,
+    /// failed object authentication, cancellation and storage/limit failures.
+    pub async fn finish_validated<C, V>(
+        mut self,
+        cx: &Cx,
+        codec: &C,
+        validate: V,
+    ) -> Result<NativeDurabilityReceipt>
+    where
+        C: NativeObjectCodec,
+        V: FnMut(&NativeCommitCandidate, &BTreeMap<ObjectId, Arc<[u8]>>) -> Result<()>,
+    {
+        self.validate_candidates(cx, codec, validate).await?;
+        self.finish(cx, |id, records| {
+            std::future::ready(codec.decode(cx, id, &records).map(|_| ()))
+        })
+        .await
+    }
+
+    // Also used by the native-page endpoint: it allocates its immutable image
+    // after this replay but before finish can start mutating marker storage.
+    // The pending records stay private; callers cannot substitute a replay list.
+    pub(crate) async fn validate_candidates<C, V>(
+        &mut self,
+        cx: &Cx,
+        codec: &C,
+        mut validate: V,
+    ) -> Result<(CommitSeq, u64)>
+    where
+        C: NativeObjectCodec,
+        V: FnMut(&NativeCommitCandidate, &BTreeMap<ObjectId, Arc<[u8]>>) -> Result<()>,
+    {
+        checkpoint(cx)?;
+        self.destination.ready()?;
+        if self.received.iter().any(|received| !received) {
+            return Err(corrupt("incomplete native object inventory"));
+        }
+        let count = usize::try_from(self.base.sequence.get()).map_err(|_| FrankenError::TooBig)?;
+        if count > self.destination.limits.max_records {
+            return Err(FrankenError::TooBig);
+        }
+        let prefix = self.destination
+            .transport_suffix(cx, NativeReplicationCursor::genesis(), count).await?;
+        if prefix.len() != count || self.destination.published_tip != self.base.sequence {
+            return Err(corrupt("native receiver validation prefix changed"));
+        }
+        for marker in prefix.iter().chain(&self.plan.markers[self.first..]) {
+            let (candidate, objects) = self.destination.read_commit_candidate(cx, codec, marker).await?;
+            validate(&candidate, &objects)?;
+        }
+        // A codec/callback or read can yield to external work. Rebind the
+        // accepted chain, then honor even cancellation by the final callback.
+        // Neither this check nor a successful replay is a durability receipt.
+        self.destination.transport_suffix(cx, self.base, 0).await?;
+        checkpoint(cx)?;
+        let last = self.plan.markers.last()
+            .ok_or_else(|| corrupt("empty native validation plan"))?;
+        Ok((last.commit_seq, last.commit_time_unix_ns))
+    }
+
     /// Verify and publish only after every inventory entry has been received.
     /// Referents are re-read from the destination by the existing two-barrier
     /// publisher. The mandatory verifier must enforce decoding, canonical
@@ -897,6 +977,192 @@ mod tests {
             assert!(source.replication_cursor(&cx).await.is_err());
             replica.close(&cx).unwrap(); source.close(&cx).unwrap();
         });
+    }
+
+    mod semantic_validation {
+        use super::*;
+        use crate::native_commit::CommitSubmission;
+        use crate::native_commit::durable::NativeCommitProof;
+        use fsqlite_types::{PageNumber, TxnEpoch, TxnId, TxnToken};
+
+        struct Codec;
+        impl NativeObjectCodec for Codec {
+            fn encode(&self, _: &Cx, payload: &[u8]) -> Result<Vec<SymbolRecord>> {
+                let size = u32::try_from(payload.len()).map_err(|_| FrankenError::TooBig)?;
+                Ok(vec![SymbolRecord::new(
+                    ObjectId::derive_from_canonical_bytes(payload),
+                    Oti { f: u64::from(size), al: 1, t: size, z: 1, n: 1 },
+                    0, payload.to_vec(), SymbolRecordFlags::SYSTEMATIC_RUN_START,
+                )])
+            }
+            fn decode(&self, _: &Cx, id: ObjectId, records: &[SymbolRecord]) -> Result<Vec<u8>> {
+                let payload = reconstruct_systematic_happy_path(records)
+                    .map_err(|error| corrupt(&error.to_string()))?;
+                if ObjectId::derive_from_canonical_bytes(&payload) != id {
+                    return Err(corrupt("invalid semantic fixture object"));
+                }
+                Ok(payload)
+            }
+        }
+
+        async fn append_proof(log: &mut Log, cx: &Cx, edit: impl FnOnce(&mut NativeCommitProof)) {
+            let seq = log.published_tip.get() + 1;
+            let payload = seq.to_le_bytes();
+            let capsule = Codec.encode(cx, &payload).unwrap();
+            let mut proof = NativeCommitProof {
+                commit_seq: CommitSeq::new(seq),
+                commit_time_unix_ns: seq,
+                submission: CommitSubmission {
+                    capsule_object_id: capsule[0].object_id,
+                    capsule_digest: *blake3::hash(&payload).as_bytes(),
+                    write_set_pages: vec![PageNumber::ONE],
+                    witness_refs: vec![], edge_ids: vec![], merge_witness_ids: vec![],
+                    txn_token: TxnToken::new(TxnId::new(seq).unwrap(), TxnEpoch::new(1)),
+                    begin_seq: CommitSeq::new(seq - 1),
+                },
+            };
+            edit(&mut proof);
+            let proof_records = Codec.encode(cx, &proof.to_bytes().unwrap()).unwrap();
+            let marker = CommitMarker::new(CommitSeq::new(seq), seq,
+                capsule[0].object_id, proof_records[0].object_id, log.previous_marker);
+            log.append_symbols(cx, &capsule).await.unwrap();
+            log.append_symbols(cx, &proof_records).await.unwrap();
+            // Deliberately envelope-only: this fixture can represent an
+            // authenticated but semantically invalid upstream producer.
+            log.publish(cx, &[marker], verify).await.unwrap();
+        }
+
+        async fn receive<'a>(
+            source: &mut Log, destination: &'a mut Log, cx: &Cx, commits: usize,
+        ) -> NativeReplicationReceiver<'a, File, File> {
+            let limits = NativeReplicationLimits::default();
+            let plan = source.export_replication_plan(cx, DB,
+                NativeReplicationCursor::genesis(), commits, limits).await.unwrap().unwrap();
+            let wire = plan.to_bytes(cx, &KEY, limits).unwrap();
+            let messages = messages(source, cx, &plan).await;
+            let mut receiver = destination.receive_replication_plan(cx, decode(cx, &wire), limits)
+                .await.unwrap().unwrap();
+            for message in messages { receiver.stage_object(cx, &message, &KEY).await.unwrap(); }
+            receiver
+        }
+
+        #[test]
+        fn validation_replays_existing_commits_before_the_missing_suffix() {
+            run(async {
+                let cx = Cx::new();
+                let source_vfs = MemoryVfs::new(); let mut source = log(&source_vfs, &cx);
+                for _ in 0..3 { append_proof(&mut source, &cx, |_| {}).await; }
+                let dest_vfs = MemoryVfs::new(); let mut destination = log(&dest_vfs, &cx);
+                let first = receive(&mut source, &mut destination, &cx, 1).await
+                    .finish_validated(&cx, &Codec, |_, _| Ok(())).await.unwrap();
+                assert_eq!(first.commits, 1);
+                let mut visited = Vec::new();
+                let receiver = receive(&mut source, &mut destination, &cx, 3).await;
+                source.close(&cx).unwrap();
+                let receipt = receiver.finish_validated(&cx, &Codec, |candidate, evidence| {
+                    let sequence = candidate.proof.commit_seq.get();
+                    assert_eq!(candidate.capsule.as_ref(), &sequence.to_le_bytes());
+                    assert_eq!(evidence.len(), 1);
+                    assert!(evidence.contains_key(&candidate.proof.submission.capsule_object_id));
+                    visited.push(sequence);
+                    Ok(())
+                }).await.unwrap();
+                assert_eq!(visited, vec![1, 2, 3]);
+                assert_eq!(receipt.first_seq, CommitSeq::new(2));
+                assert_eq!(receipt.last_seq, CommitSeq::new(3));
+                destination = recover(destination, &cx).await;
+                assert_eq!(destination.published_tip(), CommitSeq::new(3));
+                destination.close(&cx).unwrap();
+            });
+        }
+
+        #[test]
+        fn a_late_semantic_rejection_or_cancellation_cannot_publish_an_earlier_marker() {
+            run(async {
+                for cancel in [false, true] {
+                    let cx = Cx::new();
+                    let source_vfs = MemoryVfs::new(); let mut source = log(&source_vfs, &cx);
+                    for _ in 0..3 { append_proof(&mut source, &cx, |_| {}).await; }
+                    let dest_vfs = MemoryVfs::new(); let mut destination = log(&dest_vfs, &cx);
+                    let receiver = receive(&mut source, &mut destination, &cx, 3).await;
+                    let staged = bytes(&receiver.destination.symbols, &cx).await;
+                    let mut visited = 0;
+                    let result = receiver.finish_validated(&cx, &Codec, |_, _| {
+                        visited += 1;
+                        if visited == 3 {
+                            if cancel { cx.cancel(); } else { return Err(FrankenError::Abort); }
+                        }
+                        Ok(())
+                    }).await;
+                    assert_eq!(visited, 3);
+                    if cancel { assert!(matches!(result, Err(FrankenError::Interrupt))); }
+                    else { assert!(matches!(result, Err(FrankenError::Abort))); }
+                    let clean = Cx::new();
+                    assert_eq!(destination.markers.file_size(&clean).unwrap(), 0);
+                    assert_eq!(bytes(&destination.symbols, &clean).await, staged);
+                    assert_eq!(destination.published_tip(), CommitSeq::ZERO);
+                    assert!(destination.needs_recovery());
+                    assert!(destination.outstanding_write().is_none());
+                    destination = recover(destination, &clean).await;
+                    receive(&mut source, &mut destination, &clean, 3).await
+                        .finish_validated(&clean, &Codec, |_, _| Ok(())).await.unwrap();
+                    assert_eq!(bytes(&destination.symbols, &clean).await, staged);
+                    destination.close(&clean).unwrap(); source.close(&clean).unwrap();
+                }
+            });
+        }
+
+        #[test]
+        fn transport_authentication_cannot_replace_bound_proof_and_evidence_checks() {
+            run(async {
+                for invalid in 0..5 {
+                    let cx = Cx::new();
+                    let source_vfs = MemoryVfs::new(); let mut source = log(&source_vfs, &cx);
+                    append_proof(&mut source, &cx, |proof| match invalid {
+                        0 => proof.commit_seq = CommitSeq::new(2),
+                        1 => proof.commit_time_unix_ns = 99,
+                        2 => proof.submission.capsule_object_id = DB,
+                        3 => proof.submission.capsule_digest[0] ^= 1,
+                        4 => proof.submission.witness_refs.push(DB),
+                        _ => unreachable!(),
+                    }).await;
+                    let dest_vfs = MemoryVfs::new(); let mut destination = log(&dest_vfs, &cx);
+                    let receiver = receive(&mut source, &mut destination, &cx, 1).await;
+                    let mut called = false;
+                    let result = receiver.finish_validated(&cx, &Codec, |_, _| {
+                        called = true; Ok(())
+                    }).await;
+                    assert!(matches!(result, Err(FrankenError::WalCorrupt { .. })), "case={invalid}");
+                    assert!(!called, "invalid envelope/binding must not reach semantic code");
+                    assert_eq!(destination.markers.file_size(&cx).unwrap(), 0);
+                    assert_eq!(destination.published_tip(), CommitSeq::ZERO);
+                    assert!(destination.needs_recovery());
+                    destination.close(&cx).unwrap(); source.close(&cx).unwrap();
+                }
+            });
+        }
+
+        #[test]
+        fn previously_stored_invalid_history_is_not_an_authority_for_new_publication() {
+            run(async {
+                let cx = Cx::new();
+                let source_vfs = MemoryVfs::new(); let mut source = log(&source_vfs, &cx);
+                append_proof(&mut source, &cx, |proof| proof.submission.capsule_digest[0] ^= 1).await;
+                append_proof(&mut source, &cx, |_| {}).await;
+                let dest_vfs = MemoryVfs::new(); let mut destination = log(&dest_vfs, &cx);
+                receive(&mut source, &mut destination, &cx, 1).await.finish(&cx, verify).await.unwrap();
+                let original = bytes(&destination.markers, &cx).await;
+                let receiver = receive(&mut source, &mut destination, &cx, 2).await;
+                let mut called = false;
+                assert!(receiver.finish_validated(&cx, &Codec, |_, _| {
+                    called = true; Ok(())
+                }).await.is_err());
+                assert!(!called);
+                assert_eq!(bytes(&destination.markers, &cx).await, original);
+                assert_eq!(destination.published_tip(), CommitSeq::new(1));
+                destination.close(&cx).unwrap(); source.close(&cx).unwrap();
+            });
+        }
     }
 
     #[test]
