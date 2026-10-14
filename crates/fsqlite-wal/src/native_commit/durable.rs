@@ -10,6 +10,9 @@
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
 pub mod codec;
 
+mod recovery;
+pub use recovery::NativeCoordinatorRecovery;
+
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 use std::sync::Arc;
@@ -387,6 +390,8 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> DurableWriteCoordinator<S, M,
     /// starts empty: recovered commits are not new acknowledgements to old
     /// callers. An error or dropped future returns no partially rebuilt owner
     /// and performs no new mutating I/O. Retained tails still block admission.
+    /// For retryable replay that retains these handles even after a failed or
+    /// dropped read, use [`NativeCoordinatorRecovery`] instead.
     ///
     /// # Errors
     /// Rejects invalid capacity, cancellation, malformed or missing objects,
@@ -416,76 +421,13 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> DurableWriteCoordinator<S, M,
         report: NativeDurabilityRecovery,
         codec: C,
         max_pending: usize,
-        mut validate: V,
+        validate: V,
     ) -> Result<(Self, NativeDurabilityRecovery)>
     where
         V: FnMut(&NativeCommitCandidate, &BTreeMap<ObjectId, Arc<[u8]>>) -> Result<()>,
     {
-        checkpoint(cx)?;
-        let mut coordinator =
-            WriteCoordinator::new(OperatingMode::Native, CommitSeq::ZERO, max_pending);
-        for marker in &report.markers {
-            checkpoint(cx)?;
-            let proof_records = log.read_object(cx, marker.proof_object_id).await?;
-            let proof_bytes = codec.decode(cx, marker.proof_object_id, &proof_records)?;
-            let proof = NativeCommitProof::from_bytes(&proof_bytes)?;
-            if proof.commit_seq != marker.commit_seq
-                || proof.commit_time_unix_ns != marker.commit_time_unix_ns
-                || proof.submission.capsule_object_id != marker.capsule_object_id
-            {
-                return Err(corrupt("native recovery proof is not bound to its marker"));
-            }
-            let mut objects = BTreeMap::<ObjectId, Arc<[u8]>>::new();
-            let mut decoded_bytes = 0_usize;
-            for id in std::iter::once(&proof.submission.capsule_object_id)
-                .chain(&proof.submission.witness_refs)
-                .chain(&proof.submission.edge_ids)
-                .chain(&proof.submission.merge_witness_ids)
-            {
-                if objects.contains_key(id) {
-                    continue;
-                }
-                let records = log.read_object(cx, *id).await?;
-                let payload = codec.decode(cx, *id, &records)?;
-                decoded_bytes = decoded_bytes
-                    .checked_add(payload.len())
-                    .filter(|n| *n <= MAX_NATIVE_VALIDATION_BYTES)
-                    .ok_or(FrankenError::TooBig)?;
-                objects.insert(*id, Arc::from(payload));
-            }
-            let capsule = Arc::clone(
-                objects
-                    .get(&marker.capsule_object_id)
-                    .ok_or_else(|| corrupt("native recovery capsule is missing"))?,
-            );
-            if blake3::hash(&capsule).as_bytes() != &proof.submission.capsule_digest {
-                return Err(corrupt("native recovery capsule digest mismatch"));
-            }
-            let candidate = NativeCommitCandidate {
-                proof,
-                proof_object_id: marker.proof_object_id,
-                capsule,
-            };
-            validate(&candidate, &objects)?;
-            // The lower log established a contiguous genesis prefix. Only
-            // bound, semantically validated metadata may restore its FCW map.
-            coordinator.commit_index.record_commit(
-                &candidate.proof.submission.write_set_pages,
-                marker.commit_seq,
-            );
-            coordinator.commit_seq_tip = marker.commit_seq;
-            coordinator.allocated_seq_tip = marker.commit_seq;
-            coordinator.last_commit_time_ns = marker.commit_time_unix_ns;
-            coordinator.prev_marker_id = Some(ObjectId::derive_from_canonical_bytes(
-                &marker.to_record_bytes(),
-            ));
-        }
-        if coordinator.commit_seq_tip != log.published_tip() {
-            return Err(corrupt("native recovery coordinator/log tip mismatch"));
-        }
-        // Replay has no physical publication to acknowledge. A semantic hook
-        // may request cancellation even on the final (or only) commit.
-        checkpoint(cx)?;
+        let coordinator =
+            recovery::replay(cx, &log, &report, &codec, max_pending, validate).await?;
         Ok((Self::from_parts(coordinator, log, codec), report))
     }
 
