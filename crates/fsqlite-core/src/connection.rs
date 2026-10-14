@@ -41325,7 +41325,7 @@ impl Connection {
                             }
                         }
                         for (row, rowid) in live_insert_rows.iter().zip(inserted_rowids.iter()) {
-                            Box::pin(self.fire_after_triggers(
+                            if let Err(error) = Box::pin(self.fire_after_triggers(
                                 table_name,
                                 &insert_event,
                                 None,
@@ -41333,7 +41333,14 @@ impl Connection {
                                 None,
                                 Some(*rowid),
                             ))
-                            .await?;
+                            .await
+                            {
+                                self.record_after_trigger_error_state(
+                                    live_insert_rows.len(),
+                                    inserted_rowids.last().copied(),
+                                );
+                                return Err(error);
+                            }
                         }
                     }
 
@@ -41975,7 +41982,7 @@ impl Connection {
                 // Phase 5G.3: Fire AFTER UPDATE triggers.
                 if has_after_update && !no_row_updated {
                     for (row_rowid, old_values, new_values) in &trigger_rows {
-                        Box::pin(self.fire_after_triggers(
+                        if let Err(error) = Box::pin(self.fire_after_triggers(
                             table_name,
                             &update_event,
                             Some(old_values),
@@ -41983,7 +41990,11 @@ impl Connection {
                             *row_rowid,
                             *row_rowid,
                         ))
-                        .await?;
+                        .await
+                        {
+                            self.record_after_trigger_error_state(affected, None);
+                            return Err(error);
+                        }
                     }
                 }
 
