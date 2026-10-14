@@ -448,3 +448,131 @@ mod replica_query_tests {
         });
     }
 }
+
+mod online_query_tests {
+    use fsqlite_pager::native_service::NativeCommitService;
+
+    use super::*;
+
+    async fn publish(cx: &Cx, transaction: &mut TransactionKind, time: u64) {
+        let TransactionKind::Native(native) = transaction else {
+            panic!("online writer must retain native dispatch")
+        };
+        native.commit_at(cx, time).await.unwrap();
+        assert_eq!(native.acknowledgement().unwrap().commit_time_unix_ns, time);
+    }
+
+    async fn query(cx: &Cx, image: &NativeSnapshotPager) -> Vec<Vec<SqliteValue>> {
+        let reader = image.begin(cx, TransactionMode::ReadOnly).unwrap().into();
+        let (mut reader, rows) = execute(cx, reader, &scan_program()).await;
+        assert_eq!(reader.published_visible_commit_seq_hint(), Some(image.snapshot().commit_seq()));
+        reader.commit(cx).await.unwrap();
+        let TransactionKind::Native(reader) = reader else { panic!("lost snapshot dispatch") };
+        assert!(reader.acknowledgement().is_none());
+        rows
+    }
+
+    #[test]
+    fn online_bytecode_snapshots_coexist_with_private_writers_and_pinned_old_readers() {
+        run(async {
+            let cx = Cx::new(); let vfs = MemoryVfs::new(); let owner = pager(&vfs, &cx);
+            let mut seed = owner.begin(&cx, TransactionMode::Concurrent).unwrap();
+            seed.write_page(&cx, page(2), &empty_root()).await.unwrap();
+            seed.commit_at(&cx, 100).await.unwrap(); drop(seed);
+            let peer = owner.clone();
+            let mut pinned = owner.begin(&cx, TransactionMode::ReadOnly).unwrap();
+            let rows: Vec<_> = (1..=80).map(|key| (key, vec![u8::try_from(key).unwrap(); 80]))
+                .chain(std::iter::once((200, vec![0xEF; 4097]))).collect();
+            let writer = owner.begin(&cx, TransactionMode::Concurrent).unwrap().into();
+            let (mut writer, _) = execute(&cx, writer, &insert_program(&rows)).await;
+            assert_eq!(writer.get_page(&cx, page(2)).await.unwrap().as_bytes()[0], 0x05);
+            assert!(writer.pending_commit_pages().unwrap().len() > 10);
+            let empty = peer.capture_snapshot(&cx).unwrap();
+            assert_eq!(empty.snapshot().commit_seq(), CommitSeq::new(1));
+            assert_eq!(empty.snapshot().page_count(), 1, "private split/overflow pages must not escape");
+            assert!(query(&cx, &empty).await.is_empty());
+            publish(&cx, &mut writer, 200).await; drop(writer);
+            let full = owner.capture_snapshot(&cx).unwrap();
+            assert_eq!(full.snapshot().commit_seq(), CommitSeq::new(2));
+            assert_eq!(full.snapshot().commit_time_unix_ns(), Some(200));
+            assert_eq!(query(&cx, &full).await, expected(&rows));
+            let held: TransactionKind = full.begin(&cx, TransactionMode::ReadOnly).unwrap().into();
+            let writer = owner.begin(&cx, TransactionMode::Concurrent).unwrap().into();
+            let (mut writer, _) = execute(&cx, writer, &delete_program(&[42, 200])).await;
+            let before_delete = peer.capture_snapshot(&cx).unwrap();
+            assert_eq!(query(&cx, &before_delete).await, expected(&rows));
+            publish(&cx, &mut writer, 300).await; drop(writer);
+            let deleted = peer.capture_snapshot(&cx).unwrap();
+            let mut remaining: Vec<_> = rows.iter()
+                .filter(|(key, _)| *key != 42 && *key != 200).cloned().collect();
+            assert_eq!(deleted.snapshot().commit_seq(), CommitSeq::new(3));
+            assert_eq!(query(&cx, &deleted).await, expected(&remaining));
+            assert_eq!(pinned.get_page(&cx, page(2)).await.unwrap().as_bytes(), empty_root().as_slice());
+            pinned.rollback(&cx).await.unwrap(); drop(pinned); drop(peer);
+            let writer = owner.begin(&cx, TransactionMode::Concurrent).unwrap().into();
+            let (mut writer, _) = execute(&cx, writer, &insert_program(&[(300, vec![3; 2049])])).await;
+            publish(&cx, &mut writer, 400).await; drop(writer);
+            remaining.push((300, vec![3; 2049]));
+            let latest = owner.capture_snapshot(&cx).unwrap();
+            assert_eq!(latest.snapshot().commit_seq(), CommitSeq::new(4));
+            assert_eq!(query(&cx, &latest).await, expected(&remaining));
+            // Active snapshot handles retain no live owner, lease or transaction
+            // slot: exact-handle recovery transfer can proceed beneath them.
+            let (mut physical, _codec) = owner.try_into_recovery().ok()
+                .expect("independent images must not prevent source transfer");
+            physical.close(&cx).unwrap();
+            let (mut held, actual) = execute(&cx, held, &scan_program()).await;
+            assert_eq!(actual, expected(&rows), "frozen overflow/deleted rows survive later writes and close");
+            held.rollback(&cx).await.unwrap();
+            assert_eq!(query(&cx, &latest).await, expected(&remaining));
+            assert!(query(&cx, &empty).await.is_empty());
+        });
+    }
+
+    #[test]
+    fn online_capture_coexists_with_accepted_commit_service_work_and_returned_handles() {
+        run(async {
+            let cx = Cx::new(); let native = asupersync::Cx::current().unwrap();
+            cx.set_native_cx(native.clone());
+            let vfs = MemoryVfs::new(); let owner = pager(&vfs, &cx);
+            let mut seed = owner.begin(&cx, TransactionMode::Concurrent).unwrap();
+            seed.write_page(&cx, page(2), &[1; 512]).await.unwrap();
+            seed.commit_at(&cx, 100).await.unwrap(); drop(seed);
+            let (sender, worker) = NativeCommitService::new(&owner, 2, 2).unwrap();
+            let mut a = owner.begin(&cx, TransactionMode::Concurrent).unwrap();
+            let mut b = owner.begin(&cx, TransactionMode::Concurrent).unwrap();
+            a.write_page(&cx, page(2), &[2; 512]).await.unwrap();
+            b.write_page(&cx, page(3), &[3; 512]).await.unwrap();
+            let mut first = sender.reserve(&native).await.unwrap().send(a, 200).unwrap();
+            let mut second = sender.reserve(&native).await.unwrap().send(b, 200).unwrap();
+            let queued = owner.capture_snapshot(&cx).unwrap();
+            assert_eq!(queued.snapshot().commit_seq(), CommitSeq::new(1));
+            assert_eq!(queued.snapshot().commit_time_unix_ns(), Some(100));
+            assert!(queued.snapshot().read_page(page(3)).is_none());
+            let mut held: TransactionKind = queued.begin(&cx, TransactionMode::ReadOnly).unwrap().into();
+            assert_eq!(held.get_page(&cx, page(2)).await.unwrap().as_bytes(), &[1; 512]);
+            sender.request_shutdown();
+            worker.run(&cx).await.unwrap();
+            let a = first.wait(&native).await.unwrap();
+            let b = second.wait(&native).await.unwrap();
+            assert!(a.result.is_ok()); assert!(b.result.is_ok());
+            assert_eq!(a.transaction.acknowledgement().unwrap().commit_seq, CommitSeq::new(2));
+            assert_eq!(b.transaction.acknowledgement().unwrap().commit_seq, CommitSeq::new(3));
+            let published = owner.capture_snapshot(&cx).unwrap();
+            assert_eq!(published.snapshot().commit_seq(), CommitSeq::new(3));
+            assert_eq!(published.snapshot().commit_time_unix_ns(), Some(201));
+            assert_eq!(held.get_page(&cx, page(2)).await.unwrap().as_bytes(), &[1; 512]);
+            let mut newest: TransactionKind = published.begin(&cx, TransactionMode::ReadOnly).unwrap().into();
+            assert_eq!(newest.get_page(&cx, page(2)).await.unwrap().as_bytes(), &[2; 512]);
+            assert_eq!(newest.get_page(&cx, page(3)).await.unwrap().as_bytes(), &[3; 512]);
+            assert!(matches!(newest.write_page(&cx, page(2), &[9; 512]).await, Err(FrankenError::ReadOnly)));
+            drop(a); drop(b); drop(first); drop(second); drop(sender);
+            let (mut physical, _codec) = owner.try_into_recovery().ok()
+                .expect("snapshot readers must not retain completed service ownership");
+            physical.close(&cx).unwrap();
+            assert_eq!(held.get_page(&cx, page(2)).await.unwrap().as_bytes(), &[1; 512]);
+            assert_eq!(newest.get_page(&cx, page(3)).await.unwrap().as_bytes(), &[3; 512]);
+            held.rollback(&cx).await.unwrap(); newest.commit(&cx).await.unwrap();
+        });
+    }
+}

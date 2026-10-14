@@ -7,17 +7,19 @@
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::{CommitSeq, PageData, PageNumber, PageSize, WitnessKey};
-use fsqlite_wal::native_commit::durable::DurableCommitAcknowledgement;
+use fsqlite_vfs::VfsFile;
+use fsqlite_wal::native_commit::durable::{DurableCommitAcknowledgement, NativeObjectCodec};
 use fsqlite_wal::native_pages::{MAX_NATIVE_SAVEPOINTS, NativePageSnapshot};
 
 use super::{ErasedNativeTransaction, NativeFuture, NativeTransactionDispatch};
+use crate::native::NativePager;
 use crate::traits::{PagerCommitState, TransactionHandle, TransactionKind, TransactionMode, sealed};
 
 /// Read-only transaction factory for an already-validated historical image.
 ///
 /// Cloning shares immutable page bytes. Beginning a reader performs no storage
 /// I/O and retains no live publisher or transaction pin. The image may outlive
-/// the source files and be read while a separately reconstructed current pager
+/// the source files and be read while its original or a reconstructed current pager
 /// accepts writes. Only explicit `ReadOnly` admission is accepted; deferred or
 /// concurrent modes must not be silently downgraded to historical read-only.
 /// This is a pager/bytecode entry point, not public Connection SQL selection.
@@ -28,7 +30,7 @@ pub struct NativeSnapshotPager {
 }
 
 impl NativeSnapshotPager {
-    /// Adopt a snapshot from validated native replay, without new I/O.
+    /// Adopt a published live image or validated native replay, without new I/O.
     ///
     /// # Errors
     /// Refuses a page size unsupported by the sealed pager.
@@ -51,6 +53,32 @@ impl NativeSnapshotPager {
             snapshot: self.snapshot.clone(), page_size: self.page_size,
             state: SnapshotState::Active, savepoints: Vec::new(),
         })
+    }
+}
+
+impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativePager<S, M, C> {
+    /// Freeze the current committed database for independent read-only queries.
+    ///
+    /// Existing transactions and commit workers may stay alive. The ordinary
+    /// shared read guard prevents publication only during capture, which visits
+    /// retained versions and clones the latest page Arcs into a sparse index.
+    /// The returned pager has no reference to this live owner, consumes no live
+    /// transaction slot, and works after source close or history reclamation.
+    /// Its readers can enter `TransactionKind` and the existing B-tree/VDBE path.
+    ///
+    /// There is no I/O, hidden task, recovery pass, or transaction-lifetime
+    /// writer lock. This is not lock-free or a constant-time capture. It reads
+    /// admitted in-memory pages, not an independent disk-integrity certificate;
+    /// caller-retained images have their own memory cost. Private writes are
+    /// excluded and no live transaction's conflict/read set is extended.
+    ///
+    /// # Errors
+    /// Returns `Busy` during exclusive publication/close, `BusyRecovery` for a
+    /// closed or indeterminate owner, or cancellation/allocation/history errors.
+    pub fn capture_snapshot(&self, cx: &Cx) -> Result<NativeSnapshotPager> {
+        cx.checkpoint().map_err(|_| FrankenError::Interrupt)?;
+        let store = self.shared.read()?;
+        NativeSnapshotPager::new(store.capture_snapshot(cx)?)
     }
 }
 
@@ -301,4 +329,70 @@ impl ErasedNativeTransaction for NativeSnapshotTransaction {
     fn live_db_size(&self) -> u32 { Self::live_db_size(self) }
     fn visible_db_size_bound(&self) -> u32 { Self::visible_db_size_bound(self) }
     fn live_reserved_pages(&self) -> Vec<PageNumber> { Self::live_reserved_pages(self) }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod online_capture_tests {
+    use std::path::Path;
+
+    use asupersync::runtime::RuntimeBuilder;
+    use fsqlite_types::flags::VfsOpenFlags;
+    use fsqlite_types::{ObjectId, Oti, SymbolRecord, SymbolRecordFlags, reconstruct_systematic_happy_path};
+    use fsqlite_vfs::{MemoryVfs, Vfs};
+    use fsqlite_wal::native_durability::{NativeDurabilityLimits, NativeDurabilityLog};
+    use fsqlite_wal::native_pages::{NativePageLimits, NativePageStore};
+
+    use super::*;
+
+    struct Codec;
+    impl NativeObjectCodec for Codec {
+        fn encode(&self, _: &Cx, bytes: &[u8]) -> Result<Vec<SymbolRecord>> {
+            let size = u32::try_from(bytes.len()).map_err(|_| FrankenError::TooBig)?;
+            Ok(vec![SymbolRecord::new(ObjectId::derive_from_canonical_bytes(bytes),
+                Oti { f: u64::from(size), al: 1, t: size, z: 1, n: 1 },
+                0, bytes.to_vec(), SymbolRecordFlags::SYSTEMATIC_RUN_START)])
+        }
+        fn decode(&self, _: &Cx, id: ObjectId, records: &[SymbolRecord]) -> Result<Vec<u8>> {
+            let bytes = reconstruct_systematic_happy_path(records)
+                .map_err(|error| FrankenError::Internal(error.to_string()))?;
+            if ObjectId::derive_from_canonical_bytes(&bytes) != id { return Err(FrankenError::Abort); }
+            Ok(bytes)
+        }
+    }
+
+    #[test]
+    fn online_capture_refuses_contention_cancellation_and_close_without_invalidating_readers() {
+        RuntimeBuilder::current_thread().blocking_threads(1, 2).build().unwrap().block_on(async {
+            let cx = Cx::new(); let vfs = MemoryVfs::new();
+            let stream = |name: &str| vfs.open(&cx, Some(Path::new(name)),
+                VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL).unwrap().0;
+            let log = NativeDurabilityLog::create(&cx, stream("objects"), stream("markers"),
+                NativeDurabilityLimits::default()).unwrap();
+            let owner = NativePager::new(NativePageStore::new(log, Codec, 512,
+                NativePageLimits::default()).unwrap()).unwrap();
+            let page = PageNumber::new(2).unwrap();
+            let mut seed = owner.begin(&cx, TransactionMode::Concurrent).unwrap();
+            seed.write_page(&cx, page, &[7; 512]).await.unwrap();
+            seed.commit_at(&cx, 10).await.unwrap();
+            let image = owner.capture_snapshot(&cx).unwrap();
+            let mut reader = image.begin(&cx, TransactionMode::ReadOnly).unwrap();
+            {
+                // Exercise the real shared-owner exclusion boundary, not an
+                // injected status flag or a count-then-take ownership check.
+                let _publication = owner.shared.store.try_write().unwrap();
+                assert!(matches!(owner.capture_snapshot(&cx), Err(FrankenError::Busy)));
+            }
+            let cancelled = Cx::new(); cancelled.cancel();
+            assert!(matches!(owner.capture_snapshot(&cancelled), Err(FrankenError::Interrupt)));
+            assert!(!owner.needs_recovery().unwrap());
+            assert_eq!(owner.capture_snapshot(&cx).unwrap().snapshot().commit_seq(), CommitSeq::new(1));
+            assert_eq!(seed.pager_commit_state(), PagerCommitState::Committed);
+            owner.close(&cx).unwrap();
+            assert!(matches!(owner.capture_snapshot(&cx), Err(FrankenError::BusyRecovery)));
+            assert_eq!(reader.get_page(&cx, page).await.unwrap().as_bytes(), &[7; 512]);
+            reader.commit_at(&cx, u64::MAX).await.unwrap();
+            assert!(reader.acknowledgement().is_none());
+            assert_eq!(image.snapshot().commit_time_unix_ns(), Some(10));
+        });
+    }
 }
