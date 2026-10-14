@@ -42308,7 +42308,7 @@ impl Connection {
                     // Phase 5G.3: Fire AFTER DELETE triggers.
                     if has_after_delete {
                         for (old_rowid, old_values) in &trigger_old_rows {
-                            Box::pin(self.fire_after_triggers(
+                            if let Err(error) = Box::pin(self.fire_after_triggers(
                                 table_name,
                                 &delete_event,
                                 Some(old_values),
@@ -42316,7 +42316,11 @@ impl Connection {
                                 *old_rowid,
                                 None,
                             ))
-                            .await?;
+                            .await
+                            {
+                                self.record_after_trigger_error_state(affected, None);
+                                return Err(error);
+                            }
                         }
                     }
 
@@ -42366,7 +42370,7 @@ impl Connection {
                 // and, as in stock, fires no AFTER trigger.
                 if has_after_delete && !(affected == 0 && trigger_old_rows.len() == 1) {
                     for (old_rowid, old_values) in &trigger_old_rows {
-                        Box::pin(self.fire_after_triggers(
+                        if let Err(error) = Box::pin(self.fire_after_triggers(
                             table_name,
                             &delete_event,
                             Some(old_values),
@@ -42374,7 +42378,11 @@ impl Connection {
                             *old_rowid,
                             None,
                         ))
-                        .await?;
+                        .await
+                        {
+                            self.record_after_trigger_error_state(affected, None);
+                            return Err(error);
+                        }
                     }
                 }
 
@@ -43787,6 +43795,14 @@ impl InsertSelectReplayEmitter<'_> {
                 Ok(())
             }
             Err(error) => {
+                if self
+                    .connection
+                    .statement_failure_keeps_rows(self.preserve_constraint_failure_rows, &error)
+                {
+                    self.statement_changes = self
+                        .statement_changes
+                        .saturating_add(self.connection.last_changes.get());
+                }
                 self.record_error_state(&error);
                 Err(error)
             }
