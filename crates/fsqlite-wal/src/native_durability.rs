@@ -14,6 +14,10 @@
 //! writes, including writes whose awaiting future was dropped. This module
 //! acquires no database-wide transaction lock and creates/deletes no files.
 
+#[path = "native_durability_copy.rs"]
+mod prefix_copy;
+pub use prefix_copy::NativePrefixCopyReceipt;
+
 mod recovery;
 pub use recovery::{NativeRecovery, RecoveredNativeLog};
 
