@@ -497,9 +497,14 @@ function encodeSession(
       return;
     }
     if (value instanceof Uint8Array) {
+      // Public length/buffer getters on a typed array can disagree with the
+      // bytes Uint8Array#set copies. Normalize from internal slots before
+      // accounting or copying, or a valid wire record can silently lose data.
+      // Reuse decoder admission to refuse detached/shared/resizable storage.
+      const blob = fixedInput(value, policy.maxBytes - pos);
       put(4);
-      length(value.length);
-      data(value);
+      length(blob.length);
+      data(blob);
       return;
     }
     input("Unsupported changeset value");
