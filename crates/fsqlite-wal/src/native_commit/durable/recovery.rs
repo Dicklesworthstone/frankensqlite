@@ -4,6 +4,9 @@
 //! durability barriers. Dropping a replay future keeps the physical handles in
 //! this owner, and no partial conflict index is ever installed in a live driver.
 
+mod outcome;
+pub use outcome::{NativeCommitAttempt, NativeCommitOutcome};
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
@@ -48,7 +51,7 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> DurableWriteCoordinator<S, M,
         {
             return Err(self);
         }
-        Ok((self.log.into_recovery(), self.codec))
+        Ok((self.log.into_recovery().with_attempt_epoch(Some(self.attempt_epoch)), self.codec))
     }
 }
 
@@ -62,6 +65,7 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> DurableWriteCoordinator<S, M,
 #[must_use]
 pub struct NativeCoordinatorRecovery<S: VfsFile, M: VfsFile, C: NativeObjectCodec> {
     log: NativeDurabilityLog<S, M>,
+    attempt_epoch: Option<Arc<()>>,
     report: NativeDurabilityRecovery,
     codec: C,
     max_pending: usize,
@@ -85,8 +89,8 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativeCoordinatorRecovery<S, 
     /// Retain an unforgeable storage handoff. No I/O or replay occurs here.
     /// Queue bounds are checked by `prepare`, without consuming the owner.
     pub fn new(recovered: RecoveredNativeLog<S, M>, codec: C, max_pending: usize) -> Self {
-        let (log, report) = recovered.into_log();
-        Self { log, report, codec, max_pending, prepared: None, closing: false }
+        let (log, report, attempt_epoch) = recovered.into_reconciliation_parts();
+        Self { log, attempt_epoch, report, codec, max_pending, prepared: None, closing: false }
     }
 
     /// The original storage recovery report, never a caller-supplied replay list.
@@ -141,7 +145,7 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativeCoordinatorRecovery<S, 
     /// This invalidates the old replay and requires both durability barriers again.
     #[must_use]
     pub fn into_recovery(self) -> (NativeRecovery<S, M>, C) {
-        (self.log.into_recovery(), self.codec)
+        (self.log.into_recovery().with_attempt_epoch(self.attempt_epoch), self.codec)
     }
 
     /// Close the exact retained handles; individual close failures remain retryable.

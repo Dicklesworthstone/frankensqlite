@@ -11,7 +11,7 @@
 pub mod codec;
 
 mod recovery;
-pub use recovery::NativeCoordinatorRecovery;
+pub use recovery::{NativeCommitAttempt, NativeCommitOutcome, NativeCoordinatorRecovery};
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
@@ -288,6 +288,9 @@ struct PreparedProof {
 /// settles. Dropping this owner is not a substitute for that lease protocol.
 pub struct DurableWriteCoordinator<S: VfsFile, M: VfsFile, C: NativeObjectCodec> {
     coordinator: WriteCoordinator,
+    // A new live publisher retires all tickets from its predecessor. The
+    // previous epoch remains reachable only through that owner's recovery.
+    attempt_epoch: Arc<()>,
     log: NativeDurabilityLog<S, M>,
     codec: C,
     proofs: BTreeMap<CommitSeq, PreparedProof>,
@@ -318,6 +321,7 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> DurableWriteCoordinator<S, M,
     fn from_parts(coordinator: WriteCoordinator, log: NativeDurabilityLog<S, M>, codec: C) -> Self {
         Self {
             coordinator,
+            attempt_epoch: Arc::new(()),
             log,
             codec,
             proofs: BTreeMap::new(),

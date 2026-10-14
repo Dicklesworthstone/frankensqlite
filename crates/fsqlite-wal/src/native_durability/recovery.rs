@@ -7,6 +7,7 @@
 //! must leave the write completion AND the original rewrite buffer accessible.
 
 use std::fmt;
+use std::sync::Arc;
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
@@ -112,6 +113,9 @@ impl AcknowledgedPrefix {
 #[must_use]
 pub struct NativeRecovery<S: VfsFile, M: VfsFile> {
     log: NativeDurabilityLog<S, M>,
+    // Only a live publisher can attach its private ticket epoch. Fresh opens
+    // and raw log copies cannot resolve another publisher's uncertain attempts.
+    attempt_epoch: Option<Arc<()>>,
     acknowledged: AcknowledgedPrefix,
     pending: Option<PendingRewrite>,
     completed: Option<NativeDurabilityRecovery>,
@@ -144,7 +148,12 @@ impl<S: VfsFile, M: VfsFile> NativeRecovery<S, M> {
     pub(super) fn from_log(mut log: NativeDurabilityLog<S, M>) -> Self {
         let acknowledged = AcknowledgedPrefix::capture(&log);
         log.poisoned = true;
-        Self { log, acknowledged, pending: None, completed: None }
+        Self { log, attempt_epoch: None, acknowledged, pending: None, completed: None }
+    }
+
+    pub(crate) fn with_attempt_epoch(mut self, epoch: Option<Arc<()>>) -> Self {
+        self.attempt_epoch = epoch;
+        self
     }
 
     /// The original source-owned completion, including an abandoned overwrite.
@@ -284,7 +293,7 @@ impl<S: VfsFile, M: VfsFile> NativeRecovery<S, M> {
             return Err(self);
         }
         let Some(report) = self.completed.take() else { return Err(self); };
-        Ok(RecoveredNativeLog { log: self.log, report })
+        Ok(RecoveredNativeLog { log: self.log, report, attempt_epoch: self.attempt_epoch })
     }
 
     /// Close only when no original rewrite bytes or physical write are owed.
@@ -307,6 +316,7 @@ impl<S: VfsFile, M: VfsFile> NativeRecovery<S, M> {
 pub struct RecoveredNativeLog<S: VfsFile, M: VfsFile> {
     log: NativeDurabilityLog<S, M>,
     report: NativeDurabilityRecovery,
+    attempt_epoch: Option<Arc<()>>,
 }
 
 impl<S: VfsFile, M: VfsFile> fmt::Debug for RecoveredNativeLog<S, M> {
@@ -316,6 +326,15 @@ impl<S: VfsFile, M: VfsFile> fmt::Debug for RecoveredNativeLog<S, M> {
 }
 
 impl<S: VfsFile, M: VfsFile> RecoveredNativeLog<S, M> {
+    // Only retained semantic recovery receives the originating ticket epoch.
+    // The public raw-log escape intentionally drops that lineage: installing
+    // any new publisher starts a new epoch, even on the same physical files.
+    pub(crate) fn into_reconciliation_parts(
+        self,
+    ) -> (NativeDurabilityLog<S, M>, NativeDurabilityRecovery, Option<Arc<()>>) {
+        (self.log, self.report, self.attempt_epoch)
+    }
+
     /// Verified committed prefix and preserved tail accounting.
     #[must_use]
     pub const fn report(&self) -> &NativeDurabilityRecovery { &self.report }
@@ -325,6 +344,21 @@ impl<S: VfsFile, M: VfsFile> RecoveredNativeLog<S, M> {
     #[must_use]
     pub fn into_log(self) -> (NativeDurabilityLog<S, M>, NativeDurabilityRecovery) {
         (self.log, self.report)
+    }
+}
+
+impl<S: VfsFile, M: VfsFile> NativeDurabilityLog<S, M> {
+    // Outcome queries must not mistake a stale, shorter in-memory report for
+    // absence after an independently changed stream. The caller still owns
+    // namespace/append exclusion; this check does not replace that authority.
+    pub(crate) fn validate_recovered_lengths(&self, cx: &Cx) -> Result<()> {
+        self.readable()?;
+        if self.symbols.file_size(cx)? != self.symbol_end
+            || self.markers.file_size(cx)? != self.marker_end
+        {
+            return Err(FrankenError::BusyRecovery);
+        }
+        Ok(())
     }
 }
 
