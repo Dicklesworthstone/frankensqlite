@@ -25,6 +25,7 @@ use super::{CommitResult, CommitSubmission, FsyncBarriers, WriteCoordinator};
 use crate::metrics::GLOBAL_GROUP_COMMIT_METRICS;
 use crate::native_durability::{
     NativeDurabilityLimits, NativeDurabilityLog, NativeDurabilityReceipt, NativeDurabilityRecovery,
+    RecoveredNativeLog,
 };
 
 /// Maximum bytes in one canonical admission proof.
@@ -341,6 +342,9 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> DurableWriteCoordinator<S, M,
     /// tails continue to block admission; no file is truncated or replaced.
     /// The caller must settle old writes and hold the log's append-owner and
     /// namespace authority for this entire operation.
+    /// Live writeback uncertainty must already have been resolved. After a
+    /// failed sync, use `NativeRecovery::prepare` and [`Self::from_recovered`]
+    /// instead: reopening handles and repeating fsync does not re-dirty bytes.
     ///
     /// # Errors
     /// Returns storage/codec errors or rejects missing, mismatched or invalid
@@ -354,7 +358,7 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> DurableWriteCoordinator<S, M,
         limits: NativeDurabilityLimits,
         codec: C,
         max_pending: usize,
-        mut validate: V,
+        validate: V,
     ) -> Result<(Self, NativeDurabilityRecovery)>
     where
         V: FnMut(&NativeCommitCandidate, &BTreeMap<ObjectId, Arc<[u8]>>) -> Result<()>,
@@ -365,6 +369,59 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> DurableWriteCoordinator<S, M,
                 std::future::ready(codec.decode(cx, id, &records).map(|_| ()))
             })
             .await?;
+        Self::replay_verified_log(cx, log, report, codec, max_pending, validate).await
+    }
+
+    /// Rebuild admission from a completed caller-owned writeback recovery.
+    ///
+    /// Consume the sealed handoff without reopening, rewriting, or syncing
+    /// either stream. The original handles, object index, accepted marker
+    /// prefix, and torn-tail restrictions move into the returned coordinator.
+    /// Every proof, capsule digest, and immediate evidence reference is still
+    /// decoded and bound to its marker; `validate` remains mandatory and runs
+    /// in commit order. Storage recovery does not substitute for semantic/SSI
+    /// replay. Only one commit's decoded objects are retained at a time.
+    ///
+    /// The caller must continuously retain namespace/append-owner authority
+    /// from recovery through this handoff and subsequent use. The reply queue
+    /// starts empty: recovered commits are not new acknowledgements to old
+    /// callers. An error or dropped future returns no partially rebuilt owner
+    /// and performs no new mutating I/O. Retained tails still block admission.
+    ///
+    /// # Errors
+    /// Rejects invalid capacity, cancellation, malformed or missing objects,
+    /// unbound proofs, invalid semantic history, and exceeded decode bounds.
+    pub async fn from_recovered<V>(
+        cx: &Cx,
+        recovered: RecoveredNativeLog<S, M>,
+        codec: C,
+        max_pending: usize,
+        validate: V,
+    ) -> Result<(Self, NativeDurabilityRecovery)>
+    where
+        V: FnMut(&NativeCommitCandidate, &BTreeMap<ObjectId, Arc<[u8]>>) -> Result<()>,
+    {
+        validate_capacity(max_pending)?;
+        checkpoint(cx)?;
+        let (log, report) = recovered.into_log();
+        Self::replay_verified_log(cx, log, report, codec, max_pending, validate).await
+    }
+
+    // Both entry points supply a log and report produced by the real storage
+    // verifier. Keeping replay shared prevents the sealed handoff from becoming
+    // a weaker, metadata-only route into the sequencer or conflict index.
+    async fn replay_verified_log<V>(
+        cx: &Cx,
+        log: NativeDurabilityLog<S, M>,
+        report: NativeDurabilityRecovery,
+        codec: C,
+        max_pending: usize,
+        mut validate: V,
+    ) -> Result<(Self, NativeDurabilityRecovery)>
+    where
+        V: FnMut(&NativeCommitCandidate, &BTreeMap<ObjectId, Arc<[u8]>>) -> Result<()>,
+    {
+        checkpoint(cx)?;
         let mut coordinator =
             WriteCoordinator::new(OperatingMode::Native, CommitSeq::ZERO, max_pending);
         for marker in &report.markers {
@@ -426,6 +483,9 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> DurableWriteCoordinator<S, M,
         if coordinator.commit_seq_tip != log.published_tip() {
             return Err(corrupt("native recovery coordinator/log tip mismatch"));
         }
+        // Replay has no physical publication to acknowledge. A semantic hook
+        // may request cancellation even on the final (or only) commit.
+        checkpoint(cx)?;
         Ok((Self::from_parts(coordinator, log, codec), report))
     }
 
@@ -876,6 +936,9 @@ fn validate_capacity(max_pending: usize) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod recovery_tests;
 
 #[cfg(test)]
 mod group_admission_tests {
