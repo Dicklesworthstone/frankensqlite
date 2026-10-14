@@ -925,7 +925,7 @@ pub(crate) async fn balance_nonroot<W: PageWriter>(
 
     pending_page_writes.sort_by_key(|(pgno, _, _)| pgno.get());
     for (pgno, page_data, original_page) in pending_page_writes {
-        if let Err(err) = write_page_if_changed(
+        if let Err(err) = write_or_claim_sibling_page(
             cx,
             writer,
             pgno,
@@ -1080,6 +1080,34 @@ async fn write_page_if_changed<W: PageWriter>(
 ) -> Result<()> {
     if let Some(original_page) = original_page
         && original_page == page_data.as_slice()
+    {
+        return Ok(());
+    }
+    writer
+        .write_page_data(cx, page_no, PageData::from_vec(page_data))
+        .await
+}
+
+/// Write a rebalanced sibling page, or claim it in the write-conflict set if
+/// its byte image happens to match `original_page`.
+///
+/// bd-ujp0h: when a large-cell split in `balance_nonroot` or
+/// `balance_table_leaf_local_split` places the new cell on a fresh right
+/// sibling while leaving the existing leaf byte-identical, the parent's new
+/// divider still caps the existing leaf's key range. The transaction must
+/// claim (or restage) that leaf so a concurrent session appending to the old
+/// right edge conflicts on the leaf instead of committing a duplicate implicit
+/// rowid past the new divider.
+async fn write_or_claim_sibling_page<W: PageWriter>(
+    cx: &Cx,
+    writer: &mut W,
+    page_no: PageNumber,
+    page_data: Vec<u8>,
+    original_page: Option<&[u8]>,
+) -> Result<()> {
+    if let Some(original_page) = original_page
+        && original_page == page_data.as_slice()
+        && writer.claim_write_conflict_page(cx, page_no).await?
     {
         return Ok(());
     }
@@ -1423,7 +1451,7 @@ pub(crate) async fn balance_table_leaf_local_split<W: PageWriter>(
     };
 
     for (page_no, page_data, original_page) in prepared.pending_page_writes.iter() {
-        if let Err(err) = write_page_if_changed(
+        if let Err(err) = write_or_claim_sibling_page(
             cx,
             writer,
             *page_no,
@@ -4913,6 +4941,137 @@ mod tests {
                 "new siblings should be cleaned up"
             );
             assert_eq!(store.inner.pages.get(&2), Some(&original_page));
+        });
+    }
+
+    /// bd-ujp0h: when `balance_table_leaf_local_split` splits a large-cell leaf
+    /// and leaves the old leaf byte-identical (putting only the new cell onto
+    /// the new right sibling), it must still claim the old leaf in the
+    /// write-conflict set so concurrent right-edge appenders conflict.
+    #[test]
+    fn test_balance_table_leaf_local_split_claims_unchanged_leaf_it_moves_the_right_edge_off() {
+        run_async(async {
+            let cx = Cx::new();
+            let mut base = MemPageStore::new(20);
+            let existing_cell_bytes = build_leaf_table_cell(10, &vec![b'a'; 2_500]);
+            let existing_leaf = build_page(
+                &[GatheredCell {
+                    size: u16::try_from(existing_cell_bytes.len()).unwrap(),
+                    data: existing_cell_bytes,
+                }],
+                BtreePageType::LeafTable,
+                0,
+                USABLE,
+                USABLE,
+                None,
+            )
+            .unwrap();
+            base.pages
+                .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
+            base.pages.insert(3, build_leaf_table(&[(5, b"five")]));
+            base.pages.insert(4, existing_leaf.clone());
+
+            let mut store = RecordingMemPageStore::tracking_conflicts(base);
+            let overflow_cell = build_leaf_table_cell(20, &vec![b'b'; 2_500]);
+
+            let outcome = balance_table_leaf_local_split(
+                &cx,
+                &mut store,
+                pn(2),
+                1,
+                pn(4),
+                &overflow_cell,
+                1,
+                USABLE,
+                USABLE,
+                true,
+            )
+            .await
+            .expect("local split should succeed")
+            .expect("two 2500-byte cells should take the 1->2 local split path");
+
+            assert!(matches!(outcome, BalanceResult::Done));
+            assert_eq!(
+                store.inner.pages.get(&4),
+                Some(&existing_leaf),
+                "old right-edge leaf stays byte-identical when its single cell remains on page 4"
+            );
+            assert_eq!(
+                store.claimed,
+                vec![pn(4)],
+                "unchanged old right-edge leaf must be claimed in the write-conflict set"
+            );
+            assert_eq!(
+                store.write_count(pn(4)),
+                0,
+                "claimed unchanged leaf should not be rewritten"
+            );
+        });
+    }
+
+    /// bd-ujp0h: when `balance_nonroot` redistributes siblings and leaves an
+    /// existing right-edge leaf byte-identical while adding a new right sibling
+    /// after it, it must claim that leaf in the write-conflict set.
+    #[test]
+    fn test_balance_nonroot_claims_unchanged_leaf_it_moves_the_right_edge_off() {
+        run_async(async {
+            let cx = Cx::new();
+            let mut base = MemPageStore::new(20);
+            let existing_cell_3 = build_leaf_table_cell(5, &vec![b'a'; 2_500]);
+            let leaf_3 = build_page(
+                &[GatheredCell {
+                    size: u16::try_from(existing_cell_3.len()).unwrap(),
+                    data: existing_cell_3,
+                }],
+                BtreePageType::LeafTable,
+                0,
+                USABLE,
+                USABLE,
+                None,
+            )
+            .unwrap();
+            let existing_cell_4 = build_leaf_table_cell(10, &vec![b'b'; 2_500]);
+            let leaf_4 = build_page(
+                &[GatheredCell {
+                    size: u16::try_from(existing_cell_4.len()).unwrap(),
+                    data: existing_cell_4,
+                }],
+                BtreePageType::LeafTable,
+                0,
+                USABLE,
+                USABLE,
+                None,
+            )
+            .unwrap();
+
+            base.pages
+                .insert(2, build_interior_table(&[(pn(3), 5)], pn(4)));
+            base.pages.insert(3, leaf_3.clone());
+            base.pages.insert(4, leaf_4.clone());
+
+            let mut store = RecordingMemPageStore::tracking_conflicts(base);
+            let overflow_cell = build_leaf_table_cell(20, &vec![b'c'; 2_500]);
+
+            let outcome = balance_nonroot(
+                &cx,
+                &mut store,
+                pn(2),
+                1,
+                std::slice::from_ref(&overflow_cell),
+                1,
+                USABLE,
+                USABLE,
+                true,
+            )
+            .await
+            .expect("balance_nonroot should succeed");
+
+            assert!(matches!(outcome, BalanceResult::Done));
+            assert!(
+                store.claimed.contains(&pn(4)),
+                "unchanged old right-edge leaf (page 4) must be claimed in the write-conflict set, got {:?}",
+                store.claimed
+            );
         });
     }
 }

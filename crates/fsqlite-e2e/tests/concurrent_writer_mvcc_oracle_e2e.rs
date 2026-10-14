@@ -1680,3 +1680,181 @@ fn concurrent_scaling_ratio_does_not_degrade() {
         );
     });
 }
+
+// ── Test 8: Concurrent implicit-rowid append across passive autocheckpoint & 3500B splits ─
+
+#[test]
+fn concurrent_implicit_rowid_append_with_autocheckpoint_and_large_rows_bd_ujp0h_bd_2ym3z() {
+    asupersync::test_utils::run_test(|| async {
+        // Case A (bd-2ym3z + GH#507): 4 concurrent writers appending implicit-rowid
+        // rows while frequent PASSIVE autocheckpoints backfill frames into the
+        // main database file within the same WAL generation.
+        {
+            let n_threads = 4usize;
+            let rows_per_thread = 120i64;
+            let expected = n_threads as i64 * rows_per_thread;
+            let f_tmp = tempfile::NamedTempFile::new().unwrap();
+            let f_path = f_tmp.path().to_str().unwrap().to_owned();
+
+            {
+                let conn = fsqlite::Connection::open(&f_path).await.unwrap();
+                conn.execute("PRAGMA journal_mode = WAL;").await.unwrap();
+                conn.execute("PRAGMA wal_autocheckpoint = 16;")
+                    .await
+                    .unwrap();
+                conn.execute(
+                    "CREATE TABLE imp_small (id INTEGER PRIMARY KEY, tid INTEGER, seq INTEGER, pad TEXT);",
+                )
+                .await
+                .unwrap();
+            }
+
+            let barrier = Arc::new(Barrier::new(n_threads));
+            let handles: Vec<_> = (0..n_threads)
+                .map(|tid| {
+                    let p = f_path.clone();
+                    let bar = barrier.clone();
+                    thread::spawn(move || {
+                        asupersync::test_utils::run_test(|| async {
+                            let conn = fsqlite::Connection::open(&p).await.unwrap();
+                            conn.execute("PRAGMA journal_mode = WAL;").await.unwrap();
+                            conn.execute("PRAGMA wal_autocheckpoint = 16;")
+                                .await
+                                .unwrap();
+                            bar.wait();
+
+                            let pad = "x".repeat(120);
+                            for seq in 0..rows_per_thread {
+                                let sql = format!(
+                                    "INSERT INTO imp_small (tid, seq, pad) VALUES ({tid}, {seq}, '{pad}');"
+                                );
+                                let mut attempts = 0u32;
+                                loop {
+                                    match conn.execute(&sql).await {
+                                        Ok(_) => break,
+                                        Err(_) => {
+                                            let _ = conn.execute("ROLLBACK").await;
+                                            attempts += 1;
+                                            assert!(
+                                                attempts < RETRY_LIMIT * 4,
+                                                "exceeded retry limit on small implicit-rowid insert"
+                                            );
+                                            thread::sleep(RETRY_BACKOFF);
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().expect("small-row writer panicked");
+            }
+
+            let verify = fsqlite::Connection::open(&f_path).await.unwrap();
+            let rows = verify
+                .query("SELECT COUNT(*), COUNT(DISTINCT id), MIN(id), MAX(id) FROM imp_small")
+                .await
+                .unwrap();
+            assert_eq!(
+                rows[0].values(),
+                &[
+                    SqliteValue::Integer(expected),
+                    SqliteValue::Integer(expected),
+                    SqliteValue::Integer(1),
+                    SqliteValue::Integer(expected),
+                ],
+                "bd-2ym3z: passive autocheckpoints must never cause duplicate implicit rowids"
+            );
+            let ic = verify.query("PRAGMA integrity_check").await.unwrap();
+            assert_eq!(ic[0].values()[0], SqliteValue::Text("ok".into()));
+        }
+
+        // Case B (bd-ujp0h + GH#507): 8 concurrent writers appending ~3500-byte
+        // rows with implicit rowids, forcing `balance_table_leaf_local_split`
+        // and `balance_nonroot` 1->2 leaf splits where the old right-edge leaf
+        // stays byte-identical.
+        {
+            let n_threads = 8usize;
+            let rows_per_thread = 40i64;
+            let expected = n_threads as i64 * rows_per_thread;
+            let f_tmp = tempfile::NamedTempFile::new().unwrap();
+            let f_path = f_tmp.path().to_str().unwrap().to_owned();
+
+            {
+                let conn = fsqlite::Connection::open(&f_path).await.unwrap();
+                conn.execute("PRAGMA journal_mode = WAL;").await.unwrap();
+                conn.execute("PRAGMA wal_autocheckpoint = 16;")
+                    .await
+                    .unwrap();
+                conn.execute(
+                    "CREATE TABLE imp_big (id INTEGER PRIMARY KEY, tid INTEGER, seq INTEGER, payload TEXT);",
+                )
+                .await
+                .unwrap();
+            }
+
+            let barrier = Arc::new(Barrier::new(n_threads));
+            let handles: Vec<_> = (0..n_threads)
+                .map(|tid| {
+                    let p = f_path.clone();
+                    let bar = barrier.clone();
+                    thread::spawn(move || {
+                        asupersync::test_utils::run_test(|| async {
+                            let conn = fsqlite::Connection::open(&p).await.unwrap();
+                            conn.execute("PRAGMA journal_mode = WAL;").await.unwrap();
+                            conn.execute("PRAGMA wal_autocheckpoint = 16;")
+                                .await
+                                .unwrap();
+                            bar.wait();
+
+                            let payload = "y".repeat(3_500);
+                            for seq in 0..rows_per_thread {
+                                let sql = format!(
+                                    "INSERT INTO imp_big (tid, seq, payload) VALUES ({tid}, {seq}, '{payload}');"
+                                );
+                                let mut attempts = 0u32;
+                                loop {
+                                    match conn.execute(&sql).await {
+                                        Ok(_) => break,
+                                        Err(_) => {
+                                            let _ = conn.execute("ROLLBACK").await;
+                                            attempts += 1;
+                                            assert!(
+                                                attempts < RETRY_LIMIT * 4,
+                                                "exceeded retry limit on 3500B implicit-rowid insert"
+                                            );
+                                            thread::sleep(RETRY_BACKOFF);
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().expect("big-row writer panicked");
+            }
+
+            let verify = fsqlite::Connection::open(&f_path).await.unwrap();
+            let rows = verify
+                .query("SELECT COUNT(*), COUNT(DISTINCT id), MIN(id), MAX(id) FROM imp_big")
+                .await
+                .unwrap();
+            assert_eq!(
+                rows[0].values(),
+                &[
+                    SqliteValue::Integer(expected),
+                    SqliteValue::Integer(expected),
+                    SqliteValue::Integer(1),
+                    SqliteValue::Integer(expected),
+                ],
+                "bd-ujp0h: 3500-byte right-edge leaf splits must claim the unchanged old leaf so no duplicate implicit rowids commit"
+            );
+            let ic = verify.query("PRAGMA integrity_check").await.unwrap();
+            assert_eq!(ic[0].values()[0], SqliteValue::Text("ok".into()));
+        }
+    });
+}

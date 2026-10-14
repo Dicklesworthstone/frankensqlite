@@ -9903,8 +9903,14 @@ impl<F: VfsFile> PagerInner<F> {
             // may have been replaced at the same length by another process
             // (notably WAL-mode VACUUM). File size + WAL generation alone
             // cannot prove that base unchanged.
+            //
+            // While the WAL remains in the same non-empty generation, however,
+            // any main-file growth or header `change_counter` advance is a
+            // non-resetting checkpoint backfilling commits already counted in
+            // `physical_wal_visible_commit_count` (bd-2ym3z). Re-reading the
+            // main header here would double-count those backfilled commits on
+            // top of the full-generation WAL commit count.
             && physical_wal_visible_commit_count != 0
-            && file_size == self.committed_db_file_size_bytes
             && wal_generation.is_some()
             && self.committed_wal_generation == wal_generation;
         let (base_commit_seq, raw_base_change_counter) = if cached_wal_base_is_current {
@@ -9944,19 +9950,28 @@ impl<F: VfsFile> PagerInner<F> {
         // A parallel WAL group may collapse multiple logical commits behind a
         // single physical marker. A current-generation certificate can widen
         // that count only when it was bound above to this exact pinned read
-        // snapshot. The physical count remains the conservative fallback for
-        // backends that cannot prove a logical horizon.
-        let wal_visible_commit_count = logical_visible_commit_seq
-            .map(|logical_visible_commit_seq| {
-                physical_wal_visible_commit_count.max(
-                    logical_visible_commit_seq
-                        .get()
-                        .saturating_sub(base_commit_seq),
-                )
-            })
-            .unwrap_or(physical_wal_visible_commit_count);
-        let visible_commit_seq =
-            CommitSeq::new(base_commit_seq.saturating_add(wal_visible_commit_count));
+        // snapshot. When `logical_visible_commit_seq` is present, it is already
+        // an absolute `CommitSeq` for the pinned WAL generation, so never add
+        // `physical_wal_visible_commit_count` on top of an intermediate
+        // passive-checkpoint `base_commit_seq` (bd-2ym3z).
+        let (wal_visible_commit_count, visible_commit_seq) =
+            if let Some(logical_visible_commit_seq) = logical_visible_commit_seq {
+                let visible_commit_seq =
+                    CommitSeq::new(logical_visible_commit_seq.get().max(base_commit_seq));
+                let wal_visible_commit_count = visible_commit_seq
+                    .get()
+                    .saturating_sub(base_commit_seq)
+                    .max(
+                        physical_wal_visible_commit_count
+                            .min(visible_commit_seq.get().saturating_sub(1)),
+                    );
+                (wal_visible_commit_count, visible_commit_seq)
+            } else {
+                let wal_visible_commit_count = physical_wal_visible_commit_count;
+                let visible_commit_seq =
+                    CommitSeq::new(base_commit_seq.saturating_add(wal_visible_commit_count));
+                (wal_visible_commit_count, visible_commit_seq)
+            };
         let durable_identity_changed = file_size != previous_file_size
             || raw_base_change_counter != previous_db_change_counter
             || wal_generation != previous_wal_generation
@@ -10295,7 +10310,18 @@ impl<F: VfsFile> PagerInner<F> {
         if generation_moved {
             publish_disowned_ledger_generation(self);
         }
-        self.committed_wal_visible_commit_count = probe.wal_visible_commit_count;
+        self.committed_wal_visible_commit_count = if !generation_moved
+            && probe.wal_generation.is_some()
+            && self.commit_seq > probe.visible_commit_seq
+        {
+            probe.wal_visible_commit_count.saturating_add(
+                self.commit_seq
+                    .get()
+                    .saturating_sub(probe.visible_commit_seq.get()),
+            )
+        } else {
+            probe.wal_visible_commit_count
+        };
 
         Ok(CommittedStateRefresh {
             wal_snapshot_initialized: probe.wal_snapshot_initialized,
@@ -66146,5 +66172,204 @@ mod tests {
         );
         drop(fresh);
         remove_group_commit_queue(&path);
+    }
+
+    #[test]
+    fn passive_checkpoint_growing_main_db_does_not_leap_visible_commit_seq_bd_2ym3z() {
+        asupersync::test_utils::run_test(|| async {
+            use crate::traits::{WalBackend, WalLogicalReadSnapshot, WalPublicationSnapshot};
+
+            struct PassiveCheckpointWalBackend {
+                snapshot: WalPublicationSnapshot,
+                logical_snapshot: WalLogicalReadSnapshot,
+            }
+
+            impl WalBackend for PassiveCheckpointWalBackend {
+                fn begin_transaction<'a>(&'a mut self, _cx: &'a Cx) -> WalFuture<'a, ()> {
+                    Box::pin(async { Ok(()) })
+                }
+
+                fn pinned_read_snapshot(&self) -> Option<WalPublicationSnapshot> {
+                    Some(self.snapshot)
+                }
+
+                fn pinned_logical_read_snapshot<'a>(
+                    &'a self,
+                    _cx: &'a Cx,
+                ) -> WalFuture<'a, Option<WalLogicalReadSnapshot>> {
+                    Box::pin(async { Ok(Some(self.logical_snapshot)) })
+                }
+
+                fn append_frame<'a>(
+                    &'a mut self,
+                    _cx: &'a Cx,
+                    _page_number: u32,
+                    _page_data: &'a [u8],
+                    _db_size_if_commit: u32,
+                ) -> WalFuture<'a, ()> {
+                    Box::pin(async { Ok(()) })
+                }
+
+                fn read_page<'a>(
+                    &'a mut self,
+                    _cx: &'a Cx,
+                    _page_number: u32,
+                ) -> WalFuture<'a, Option<Vec<u8>>> {
+                    Box::pin(async { Ok(None) })
+                }
+
+                fn sync(&mut self, _cx: &Cx) -> Result<()> {
+                    Ok(())
+                }
+
+                fn frame_count(&self) -> usize {
+                    8_504
+                }
+
+                fn checkpoint<'a>(
+                    &'a mut self,
+                    _cx: &'a Cx,
+                    mode: crate::traits::CheckpointMode,
+                    _writer: &'a mut dyn crate::traits::CheckpointPageWriter,
+                    _backfilled_frames: u32,
+                    _oldest_reader_frame: Option<u32>,
+                ) -> WalFuture<'a, crate::traits::CheckpointResult> {
+                    Box::pin(async move {
+                        Ok(crate::traits::CheckpointResult {
+                            total_frames: 8_504,
+                            frames_backfilled: 2_302,
+                            completed: false,
+                            wal_was_reset: false,
+                            requested_mode: mode,
+                            effective_mode: mode,
+                        })
+                    })
+                }
+            }
+
+            let cx = Cx::new();
+            let generation = WalGenerationIdentity {
+                checkpoint_seq: 1,
+                salts: fsqlite_wal::WalSalts {
+                    salt1: 0xAAAA_BBBB,
+                    salt2: 0xCCCC_DDDD,
+                },
+            };
+            let physical_snapshot = WalPublicationSnapshot {
+                publication_seq: 8_504,
+                generation,
+                last_commit_frame: Some(8_503),
+                commit_count: 8_504,
+                latest_frame_entries: 10,
+                index_is_partial: false,
+            };
+            let logical_snapshot = WalLogicalReadSnapshot {
+                generation,
+                last_commit_frame: Some(8_503),
+                visible_commit_seq: CommitSeq::new(8_505),
+            };
+
+            let (pager, _) = test_pager().await;
+            pager
+                .set_wal_backend(Box::new(PassiveCheckpointWalBackend {
+                    snapshot: physical_snapshot,
+                    logical_snapshot,
+                }))
+                .expect("install passive-checkpoint WAL backend");
+            pager
+                .set_journal_mode(&cx, JournalMode::Wal)
+                .await
+                .expect("enable WAL mode");
+
+            // Bind initial state in WAL generation `generation`.
+            {
+                let mut inner = pager
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                inner.commit_seq = CommitSeq::new(8_505);
+                inner.committed_wal_generation = Some(generation);
+                inner.committed_wal_visible_commit_count = 8_504;
+                inner.committed_db_change_counter = 1;
+                inner.committed_db_file_size_bytes = 4_096;
+            }
+
+            // Simulate a PASSIVE checkpoint backfilling 2,302 commits into the
+            // main database file (stamping change_counter = 2,303 and growing
+            // db_file to 3 pages) WITHOUT resetting the WAL generation.
+            {
+                let db_file = {
+                    let inner = pager
+                        .inner
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    Arc::clone(&inner.db_file)
+                };
+                let db_file_guard = shared_db_file_read(&db_file, &cx).await.unwrap();
+                let mut page1 = vec![0_u8; 4_096];
+                db_file_guard.read(&cx, &mut page1, 0).await.unwrap();
+                let backfilled_cc = 2_303_u32.to_be_bytes();
+                let backfilled_pages = 3_u32.to_be_bytes();
+                page1[24..28].copy_from_slice(&backfilled_cc);
+                page1[28..32].copy_from_slice(&backfilled_pages);
+                page1[92..96].copy_from_slice(&backfilled_cc);
+                db_file_guard.write(&cx, &page1, 0).await.unwrap();
+                db_file_guard
+                    .write(&cx, &vec![0_u8; 4_096], 8_192)
+                    .await
+                    .unwrap();
+            }
+
+            // 1. Existing connection in the same WAL generation must NOT leap
+            //    to 2,303 + 8,504 = 10,807 when main db_file grows.
+            {
+                let inner = pager
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let probe = inner
+                    .probe_visible_commit_seq(&cx, &pager.wal_backend, false)
+                    .await
+                    .expect("probe after passive checkpoint");
+                assert_eq!(
+                    probe.visible_commit_seq,
+                    CommitSeq::new(8_505),
+                    "passive checkpoint main-file growth in the same WAL generation must not double-count backfilled commits"
+                );
+            }
+
+            // 2. A fresh connection (`committed_wal_generation == None`) that
+            //    opens mid-generation after the passive checkpoint must also
+            //    bind to 8,505, not 2,303 + 8,504 = 10,807.
+            {
+                let mut inner = pager
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                inner.commit_seq = CommitSeq::new(1);
+                inner.committed_wal_generation = None;
+                inner.committed_wal_visible_commit_count = 0;
+                inner.committed_db_change_counter = 1;
+                inner.committed_db_file_size_bytes = 0;
+
+                let probe = inner
+                    .probe_visible_commit_seq(&cx, &pager.wal_backend, false)
+                    .await
+                    .expect("fresh-connection probe after passive checkpoint");
+                assert_eq!(
+                    probe.visible_commit_seq,
+                    CommitSeq::new(8_505),
+                    "fresh connection opening mid-generation after passive checkpoint must not double-count backfilled commits"
+                );
+                assert_eq!(
+                    probe
+                        .visible_commit_seq
+                        .get()
+                        .saturating_sub(probe.wal_visible_commit_count),
+                    1,
+                    "pre-generation base_commit_seq invariant must be preserved"
+                );
+            }
+        });
     }
 }
