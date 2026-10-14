@@ -23,6 +23,69 @@ use crate::native_durability::{
 };
 use crate::native_pages::NativePageSnapshot;
 
+impl<S: VfsFile, M: VfsFile> crate::native_durability::NativeReplicationReceiver<'_, S, M> {
+    /// Validate transported page history, publish it, and return a read-only image.
+    ///
+    /// Call after staging this receiver's authenticated object inventory. All
+    /// accepted destination commits and the entire incoming suffix pass the
+    /// same proof/capsule, read-version, duplicate-token, page-size and resource
+    /// checks as page recovery. No caller-supplied page map or semantic callback
+    /// can replace those checks. The codec must enforce its object identity and
+    /// authentication contract; a transport signature cannot substitute for it.
+    ///
+    /// Snapshot allocation and validation finish BEFORE publishing any marker.
+    /// The image escapes only with the successful two-barrier receipt, with no
+    /// further recovery, rewrite, sync, allocation or cancellation check after
+    /// publication. It owns immutable page bytes, not this receiver, a live
+    /// publisher, file handles or codec keys. Older returned images stay valid
+    /// while the destination receives subsequent batches or closes its files.
+    ///
+    /// This replays from destination genesis on each call; it is not an indexed
+    /// or constant-work incremental apply. Latest heads/tombstones obey the
+    /// page limits, while marker/token metadata, codec scratch and independently
+    /// retained images have additional costs. Only received history through
+    /// this plan's target is validated, not an untransmitted source suffix.
+    /// It does not enable public `Connection` native mode or writable replicas.
+    ///
+    /// Retain the destination namespace/append lease. An error or dropped future
+    /// returns no image and leaves staged objects and source-write obligations
+    /// owned by the recovery-blocked log. A failed marker write can still leave
+    /// a committed prefix: recover original handles before retrying the plan.
+    /// An already-applied plan is handled by `receive_replication_plan` returning
+    /// `None`; it neither manufactures a new image nor another acknowledgement.
+    ///
+    /// # Errors
+    /// Rejects incomplete inventories, invalid page/proof history, authentication
+    /// errors, exceeded limits, cancellation and physical publication failures.
+    pub async fn finish_page_snapshot<C: NativeObjectCodec>(
+        mut self,
+        cx: &Cx,
+        codec: &C,
+        page_size: u32,
+        limits: NativePageLimits,
+    ) -> Result<(NativeDurabilityReceipt, NativePageSnapshot)> {
+        cx.checkpoint().map_err(|_| FrankenError::Interrupt)?;
+        let mut history = PageHistory::new(page_size, limits)?;
+        let (target, time) = self
+            .validate_candidates(cx, codec, |candidate, _| history.replay_candidate(candidate))
+            .await?;
+        if history.tip != target {
+            return Err(corrupt("native received page/marker tip mismatch"));
+        }
+        let snapshot = capture_snapshot(cx, &history, Some(time))?;
+        drop(history);
+        let receipt = self
+            .finish(cx, |id, records| {
+                std::future::ready(codec.decode(cx, id, &records).map(|_| ()))
+            })
+            .await?;
+        // The receiver owns this exact pending suffix until the barrier pair
+        // succeeds. No fallible work remains that could revoke its receipt.
+        debug_assert_eq!(receipt.last_seq, snapshot.commit_seq());
+        Ok((receipt, snapshot))
+    }
+}
+
 impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativePageStore<S, M, C> {
     /// Capture the latest fully published image without quiescing live readers
     /// or writers, entering recovery, or touching either physical stream.
