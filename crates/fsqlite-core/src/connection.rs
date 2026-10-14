@@ -67598,14 +67598,13 @@ impl Connection {
                 // the stored storage class matches a normal INSERT default (the
                 // read path applies the same coercion). bd-v7y8q. apply_affinity
                 // preserves NULL, so the no-default case stays NULL.
-                let default_for_existing_rows = match default_value.as_deref() {
+                let raw_default_for_existing_rows = match default_value.as_deref() {
                     Some(default_sql) => {
                         self.evaluate_column_default_value(Some(default_sql))
                             .await?
                     }
                     None => SqliteValue::Null,
-                }
-                .apply_affinity(affinity_char_to_type(affinity));
+                };
                 let mut schema = self.schema.borrow_mut();
                 let table = schema
                     .iter_mut()
@@ -67635,6 +67634,16 @@ impl Connection {
                 } else {
                     None
                 };
+                // GH#509 (bd-cwf05): STRICT ANY columns must have NONE ('A')
+                // affinity, not NUMERIC ('C'), so numeric-looking text or
+                // backfill defaults are never coerced.
+                let affinity = if strict_type == Some(StrictColumnType::Any) {
+                    'A'
+                } else {
+                    affinity
+                };
+                let default_for_existing_rows =
+                    raw_default_for_existing_rows.apply_affinity(affinity_char_to_type(affinity));
                 let new_column_index = table.columns.len();
                 // ALTER ADD COLUMN cannot add an IPK/UNIQUE; only a column-level
                 // NOT NULL ON CONFLICT clause is meaningful here.
