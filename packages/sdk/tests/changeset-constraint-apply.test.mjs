@@ -6,6 +6,7 @@ import { test } from "node:test";
 import { applyChangeset, applyPatchset } from "../src/changeset-apply.ts";
 import { encodeChangeset, encodePatchset, decodeRebaseInfo } from "../src/changeset-codec.ts";
 import { FrankenSQLiteError } from "../src/errors.ts";
+import { withDeferredForeignKeys } from "../src/changeset-foreign-keys.ts";
 
 const constraint = (extendedCode = 2067, extra = {}) => new FrankenSQLiteError({
   code: "SQLITE_CONSTRAINT", sqliteCode: 19, extendedCode,
@@ -274,4 +275,194 @@ test("nested application omits only rejected rows, retaining the outer caller's 
     await outer.execute("INSERT INTO t VALUES(11,'after')");
   });
   assert.deepEqual(columns(target.db),[[2n,"valid"],[9n,"taken"],[10n,"caller"],[11n,"after"]]);
+});
+
+for (const compact of [false, true]) {
+  test(`deferred ${compact ? "patchset" : "changeset"}: isolated omission and later parents share one commit`, async t => {
+    const target = new Target(t, `CREATE TABLE p(id INTEGER PRIMARY KEY);
+      CREATE TABLE t(id INTEGER PRIMARY KEY,pid REFERENCES p(id),v TEXT UNIQUE);
+      CREATE TABLE decisions(info BLOB)`);
+    const tables = [
+      { name: "t", primaryKey: [1,0,0], changes: [insert(1n,7n,"first"),insert(2n,7n,"first"),insert(3n,7n,"last")] },
+      { name: "p", primaryKey: [1], changes: [insert(7n)] },
+    ];
+    const payload = (compact ? encodePatchset : encodeChangeset)(tables);
+    let calls = 0;
+    const options = policy({ tables:["t","p"], foreignKeys:"defer", deliveryId:`deferred:${compact}`,
+      onConflict: c => {
+        calls++; assert.equal(c.kind,"constraint"); assert.equal(target.depth,1);
+        assert.deepEqual(columns(target.db),[[1n,7n,"first"]]);
+        assert.equal(target.db.prepare("PRAGMA defer_foreign_keys").get().defer_foreign_keys,1);
+        return "omit";
+      },
+      ...(!compact ? { onRebase:async(tx,info)=>tx.execute("INSERT INTO decisions VALUES(?)",[info]) } : {}),
+    });
+    const apply = compact ? applyPatchset : applyChangeset;
+    const result = await apply(target,payload,options);
+    assert.deepEqual(result,{applied:3,omitted:1,replayed:false});
+    assert.equal(calls,1);assert.deepEqual(columns(target.db),[[1n,7n,"first"],[3n,7n,"last"]]);
+    assert.deepEqual(columns(target.db,"SELECT * FROM p"),[[7n]]);
+    assert.deepEqual(columns(target.db,"PRAGMA foreign_key_check"),[]);
+    assert.equal(target.db.prepare("PRAGMA defer_foreign_keys").get().defer_foreign_keys,0);
+    assert.deepEqual(columns(target.db,"SELECT applied,omitted FROM __fsqlite_changeset_receipts"),[[3n,1n]]);
+    if (!compact) assert.equal(decodeRebaseInfo(columns(target.db,"SELECT info FROM decisions")[0][0])[0].changes[0].replace,false);
+    const children=target.log.filter(([op,d])=>op==="begin"&&d===1).length;
+    assert.deepEqual(await apply(target,payload,options),{...result,replayed:true});
+    assert.equal(calls,1);assert.equal(target.log.filter(([op,d])=>op==="begin"&&d===1).length,children);
+  });
+}
+
+test("deferred isolated application still rejects unresolved foreign keys and rolls back receipt plus rows",async t=>{
+  const target=new Target(t,`CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE t(id INTEGER PRIMARY KEY,v REFERENCES p(id))`);let calls=0;
+  await assert.rejects(applyChangeset(target,wire([insert(1n,99n)]),policy({
+    foreignKeys:"defer",deliveryId:"must-not-survive",onConflict:()=>{calls++;return "omit";},
+  })),{code:"ERR_FSQLITE_FOREIGN_KEY_VIOLATION"});
+  assert.equal(calls,0);assert.deepEqual(columns(target.db),[]);
+  assert.deepEqual(columns(target.db,"SELECT name FROM sqlite_schema WHERE name='__fsqlite_changeset_receipts'"),[]);
+  assert.equal(target.db.prepare("PRAGMA defer_foreign_keys").get().defer_foreign_keys,0);
+});
+
+test("a handled child rollback preserves parent work, while a caught direct SQL error still aborts",async t=>{
+  const target=new Target(t);const wrapped=withDeferredForeignKeys(target);
+  const expected=new Error("abort only the child");let parent,child;
+  await wrapped.transaction(async tx=>{
+    parent=tx;await tx.execute("INSERT INTO t VALUES(1,'parent')");
+    await assert.rejects(tx.transaction(async nested=>{
+      child=nested;await nested.execute("INSERT INTO t VALUES(2,'child')");throw expected;
+    }),e=>e===expected);
+    await tx.execute("INSERT INTO t VALUES(3,'after')");
+  });
+  assert.deepEqual(columns(target.db),[[1n,"parent"],[3n,"after"]]);
+  const count=target.log.length;
+  await assert.rejects(parent.query("SELECT 1"),{code:"ERR_FSQLITE_FOREIGN_KEY_STATE"});
+  await assert.rejects(child.query("SELECT 1"),{code:"ERR_FSQLITE_FOREIGN_KEY_STATE"});
+  await assert.rejects(child.transaction(async()=>assert.fail("expired child")),{code:"ERR_FSQLITE_FOREIGN_KEY_STATE"});
+  assert.equal(target.log.length,count);
+  await assert.rejects(wrapped.transaction(async tx=>{
+    await tx.execute("INSERT INTO t VALUES(4,'before')");
+    await assert.rejects(tx.execute("INSERT INTO t VALUES(5,'parent')"),FrankenSQLiteError);
+    await tx.execute("INSERT INTO t VALUES(6,'after')");
+  }),FrankenSQLiteError);
+  assert.deepEqual(columns(target.db),[[1n,"parent"],[3n,"after"]]);
+});
+
+test("uncertain child rollback or RELEASE remains fatal even when its rejection is caught",async t=>{
+  for(const mode of ["rollback","release","metadata"]){
+    const target=new Target(t),wrapped=withDeferredForeignKeys(target);
+    if(mode==="rollback") target.rollbackFailure=new Error("unconfirmed rollback");
+    if(mode==="release") target.beforeRelease=d=>{if(d===1)throw new Error("unconfirmed release");};
+    if(mode==="metadata") target.beforeRollback=(d,e)=>{if(d===1)e.cleanupErrors.push(new Error("retained obligation"));};
+    await assert.rejects(wrapped.transaction(async tx=>{
+      await tx.execute("INSERT INTO t VALUES(1,'outer')");
+      await assert.rejects(tx.transaction(async child=>{
+        await child.execute("INSERT INTO t VALUES(2,'child')");
+        if(mode!=="release")throw constraint();
+      }));
+      await tx.execute("INSERT INTO t VALUES(3,'after-caught')");
+    }));
+    assert.deepEqual(columns(target.db),[],mode);assert.equal(target.depth,0);
+  }
+});
+
+test("deferred work joins an unawaited child through its final release before restoring FK state",async t=>{
+  const target=new Target(t),wrapped=withDeferredForeignKeys(target),entered=deferred(),settle=deferred();
+  target.beforeRelease=async d=>{if(d===1){entered.resolve();await settle.promise;}};
+  let completed=false;
+  const operation=wrapped.transaction(async tx=>{void tx.transaction(async child=>{
+    await child.execute("INSERT INTO t VALUES(1,'child')");
+  });});
+  void operation.then(()=>{completed=true;},()=>{completed=true;});
+  await Promise.race([entered.promise,operation.then(()=>assert.fail("child did not reach release"))]);
+  await new Promise(r=>setImmediate(r));assert.equal(completed,false);assert.equal(target.depth,2);
+  assert.equal(target.db.prepare("PRAGMA defer_foreign_keys").get().defer_foreign_keys,1);
+  settle.resolve();await operation;
+  assert.deepEqual(columns(target.db),[[1n,"child"]]);assert.equal(target.depth,0);
+});
+
+test("cancellation joins child cleanup and cannot commit a deferred prefix",async t=>{
+  const target=new Target(t),wrapped=withDeferredForeignKeys(target),entered=deferred(),settle=deferred();
+  const controller=new AbortController();let completed=false;
+  target.beforeRollback=async d=>{if(d===1){entered.resolve();await settle.promise;}};
+  const operation=wrapped.transaction(async tx=>{
+    await tx.execute("INSERT INTO t VALUES(1,'parent')");
+    try { await tx.transaction(async child=>{await child.execute("INSERT INTO t VALUES(2,'child')");throw new Error("rollback");}); }
+    catch { /* This local failure is handled, but outer cancellation still wins. */ }
+  },{signal:controller.signal});
+  void operation.then(()=>{completed=true;},()=>{completed=true;});
+  await Promise.race([entered.promise,operation.then(()=>assert.fail("child did not reach rollback"))]);
+  controller.abort("stop");await new Promise(r=>setImmediate(r));
+  assert.equal(completed,false);assert.equal(target.depth,2);settle.resolve();
+  await assert.rejects(operation,{code:"ERR_FSQLITE_FOREIGN_KEY_CANCELLED"});
+  assert.deepEqual(columns(target.db),[]);assert.equal(target.depth,0);
+});
+
+test("parent and sibling work cannot interleave inside an active deferred child",async t=>{
+  const target=new Target(t),wrapped=withDeferredForeignKeys(target),entered=deferred(),settle=deferred();
+  await wrapped.transaction(async tx=>{
+    const child=tx.transaction(async inner=>{
+      await inner.execute("INSERT INTO t VALUES(1,'child')");entered.resolve();await settle.promise;
+    });
+    await entered.promise;const count=target.log.length;
+    await assert.rejects(tx.execute("INSERT INTO t VALUES(2,'must not enter child')"),{code:"ERR_FSQLITE_FOREIGN_KEY_BUSY"});
+    await assert.rejects(tx.transaction(async()=>assert.fail("sibling admitted")),{code:"ERR_FSQLITE_FOREIGN_KEY_BUSY"});
+    assert.equal(target.log.length,count);settle.resolve();await child;
+    await tx.execute("INSERT INTO t VALUES(3,'parent')");
+  });
+  assert.deepEqual(columns(target.db),[[1n,"child"],[3n,"parent"]]);
+});
+
+test("pending parent work blocks child admission and unsupported targets get no invented capability",async t=>{
+  const target=new Target(t),wrapped=withDeferredForeignKeys(target),entered=deferred(),settle=deferred();
+  target.beforeExecute=async(sql,params,d)=>{if(d===0&&sql.startsWith("INSERT")){entered.resolve();await settle.promise;}};
+  await wrapped.transaction(async tx=>{
+    const pending=tx.execute("INSERT INTO t VALUES(1,'parent')");await entered.promise;
+    try {
+      await assert.rejects(tx.transaction(async()=>assert.fail("child admitted early")),{code:"ERR_FSQLITE_FOREIGN_KEY_BUSY"});
+    } finally { settle.resolve();await pending; }
+    await assert.rejects(tx.transaction(null),{code:"ERR_FSQLITE_FOREIGN_KEY_INPUT"});
+  });
+  target.capable=false;
+  await wrapped.transaction(async tx=>{assert.equal(tx.transaction,undefined);});
+  assert.deepEqual(columns(target.db),[[1n,"parent"]]);
+});
+
+test("grandchildren preserve deferred dependencies until the outer clean check",async t=>{
+  const target=new Target(t,`CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE t(id INTEGER PRIMARY KEY,v REFERENCES p(id))`);
+  await withDeferredForeignKeys(target).transaction(async tx=>{
+    await tx.transaction(async child=>{
+      await child.transaction(async grandchild=>{await grandchild.execute("INSERT INTO t VALUES(1,7)");});
+      await child.execute("INSERT INTO p VALUES(7)");
+    });
+  });
+  assert.deepEqual(columns(target.db),[[1n,7n]]);
+  assert.deepEqual(columns(target.db,"PRAGMA foreign_key_check"),[]);
+  assert.equal(target.log.filter(([op,d])=>op==="begin"&&d===2).length,1);
+});
+
+test("a thrown parent failure retains separately uncertain child cleanup",async t=>{
+  const target=new Target(t),expected=new Error("parent failure"),childDone=deferred();
+  target.rollbackFailure=new Error("child cleanup");
+  await assert.rejects(withDeferredForeignKeys(target).transaction(async tx=>{
+    const child=tx.transaction(async inner=>{await inner.execute("INSERT INTO t VALUES(1,'child')");throw constraint();});
+    void child.catch(()=>childDone.resolve());await childDone.promise;throw expected;
+  }),e=>e.code==="ERR_FSQLITE_FOREIGN_KEY_STATE"&&e.cause===expected&&e.cleanupErrors.length===1);
+  assert.deepEqual(columns(target.db),[]);
+});
+
+test("grandchild cleanup uncertainty remains sticky through two caught rejections",async t=>{
+  const target=new Target(t);
+  target.beforeRollback=(depth,error)=>{if(depth===2)error.cleanupErrors.push(new Error("grandchild cleanup"));};
+  await assert.rejects(withDeferredForeignKeys(target).transaction(async tx=>{
+    await tx.execute("INSERT INTO t VALUES(1,'parent')");
+    await assert.rejects(tx.transaction(async child=>{
+      await assert.rejects(child.transaction(async grandchild=>{
+        await grandchild.execute("INSERT INTO t VALUES(2,'grandchild')");throw constraint();
+      }));
+      await child.execute("INSERT INTO t VALUES(3,'child after caught')");
+    }),{code:"ERR_FSQLITE_FOREIGN_KEY_STATE"});
+    await tx.execute("INSERT INTO t VALUES(4,'parent after caught')");
+  }),e=>e.code==="ERR_FSQLITE_FOREIGN_KEY_STATE"&&e.cleanupErrors.length===1);
+  assert.deepEqual(columns(target.db),[]);assert.equal(target.depth,0);
 });
