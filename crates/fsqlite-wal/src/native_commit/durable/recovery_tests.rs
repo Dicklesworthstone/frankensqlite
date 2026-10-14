@@ -13,6 +13,10 @@ use fsqlite_vfs::{FileIdentity, MemoryVfs, ShmRegion, SyncKind, Vfs};
 
 use super::*;
 use crate::native_durability::NativeRecovery;
+use crate::native_pages::{
+    NativePageCapsule, NativePageLimits, NativePageStore, NativePageTransactionState,
+    NativePageWrite,
+};
 
 type MemoryFile = <MemoryVfs as Vfs>::File;
 type Log = NativeDurabilityLog<AuditedFile, AuditedFile>;
@@ -434,5 +438,351 @@ fn dropped_handoff_read_cannot_start_mutation_or_damage_the_recoverable_prefix()
         assert_eq!(driver.committed_tip(), CommitSeq::new(2));
         control.assert_frozen(before);
         driver.close(&cx).unwrap();
+    });
+}
+
+type PageStore = NativePageStore<AuditedFile, AuditedFile, Codec>;
+
+fn page(number: u32) -> PageNumber {
+    PageNumber::new(number).unwrap()
+}
+
+async fn prepare_stored_pages(
+    vfs: &MemoryVfs,
+    cx: &Cx,
+    control: &Arc<Control>,
+) -> RecoveredNativeLog<AuditedFile, AuditedFile> {
+    // Fixture admission happens before the handoff mutation gate is armed.
+    // There are no unsettled old source writes in this MemoryVfs fixture.
+    let mut recovery = NativeRecovery::new(
+        cx,
+        file(vfs, cx, "objects", control),
+        file(vfs, cx, "markers", control),
+        NativeDurabilityLimits::default(),
+    )
+    .unwrap();
+    recovery
+        .prepare(cx, |id, records| {
+            ready(Codec.decode(cx, id, &records).map(|_| ()))
+        })
+        .await
+        .unwrap();
+    recovery.finish().unwrap()
+}
+
+#[test]
+fn page_handoff_restores_transactions_tombstones_allocator_and_snapshot_conflicts() {
+    run(async {
+        let cx = Cx::new();
+        let (vfs, control, log) = fixture(&cx);
+        let mut source = PageStore::new(log, Codec, 512, NativePageLimits::default()).unwrap();
+        let mut earlier = source.begin(&cx).unwrap();
+        let mut later = source.begin(&cx).unwrap();
+        source.write_page(&cx, &mut earlier, page(2), Some(&[0x11; 512])).unwrap();
+        source.write_page(&cx, &mut later, page(90), Some(&[0x22; 512])).unwrap();
+        source.commit(&cx, &mut later, 10).await.unwrap();
+        source.commit(&cx, &mut earlier, 11).await.unwrap();
+        let mut deletion = source.begin(&cx).unwrap();
+        source.write_page(&cx, &mut deletion, page(2), Some(&[0x33; 512])).unwrap();
+        source.write_page(&cx, &mut deletion, page(90), None).unwrap();
+        source.commit(&cx, &mut deletion, 12).await.unwrap();
+        let mut foreign = source.begin(&cx).unwrap();
+        source.close(&cx).unwrap();
+        let recovered = prepare_stored_pages(&vfs, &cx, &control).await;
+        let original = (
+            bytes(&vfs, &cx, "objects").await,
+            bytes(&vfs, &cx, "markers").await,
+        );
+        let before = control.freeze();
+        let (mut db, report) = PageStore::from_recovered(
+            &cx, recovered, Codec, 512, NativePageLimits::default(),
+        ).await.unwrap();
+        assert_eq!(report.markers.len(), 3);
+        assert_eq!(db.committed_tip(), CommitSeq::new(3));
+        assert_eq!(db.retained_page_bytes(), 512);
+        assert_eq!(db.retained_version_count(), 2);
+        assert!(db.outstanding_write().is_none());
+        assert!(!db.needs_recovery());
+        assert!(matches!(db.read_page(&cx, &mut foreign, page(2)), Err(FrankenError::Abort)));
+        let mut old = db.begin(&cx).unwrap();
+        assert_eq!(old.token().id.get(), 4, "use the greatest committed ID, not commit order");
+        assert_eq!(old.snapshot_db_size(), 90, "highest tombstone is still an address");
+        assert_eq!(db.read_page(&cx, &mut old, page(2)).unwrap().unwrap().as_ref(), &[0x33; 512]);
+        assert!(db.read_page(&cx, &mut old, page(90)).unwrap().is_none());
+        let mut writer = db.begin(&cx).unwrap();
+        let mut stale = db.begin(&cx).unwrap();
+        db.read_page(&cx, &mut stale, page(2)).unwrap();
+        db.write_page(&cx, &mut stale, page(3), Some(&[0x55; 512])).unwrap();
+        db.write_page(&cx, &mut writer, page(2), Some(&[0x44; 512])).unwrap();
+        let mut allocator = db.begin(&cx).unwrap();
+        assert_eq!(db.allocate_page(&cx, &mut allocator).unwrap(), page(91));
+        db.rollback(&mut allocator).unwrap();
+        control.assert_frozen(before);
+        assert_eq!(bytes(&vfs, &cx, "objects").await, original.0);
+        assert_eq!(bytes(&vfs, &cx, "markers").await, original.1);
+        control.forbid_mutation.store(false, Ordering::SeqCst);
+        let ack = db.commit(&cx, &mut writer, 0).await.unwrap().unwrap();
+        assert_eq!(ack.commit_seq, CommitSeq::new(4));
+        assert_eq!(ack.commit_time_unix_ns, 13);
+        assert_eq!(db.read_page(&cx, &mut old, page(2)).unwrap().unwrap().as_ref(), &[0x33; 512]);
+        assert!(matches!(db.commit(&cx, &mut stale, 14).await, Err(FrankenError::BusySnapshot { .. })));
+        assert_eq!(stale.state(), NativePageTransactionState::Active);
+        db.rollback(&mut stale).unwrap();
+        db.rollback(&mut old).unwrap();
+        db.close(&cx).unwrap();
+        let recovered = prepare_stored_pages(&vfs, &cx, &control).await;
+        let before = control.freeze();
+        let (mut db, report) = PageStore::from_recovered(
+            &cx, recovered, Codec, 512, NativePageLimits::default(),
+        ).await.unwrap();
+        assert_eq!(report.markers.len(), 4);
+        let mut view = db.begin(&cx).unwrap();
+        assert_eq!(db.read_page(&cx, &mut view, page(2)).unwrap().unwrap().as_ref(), &[0x44; 512]);
+        assert!(db.read_page(&cx, &mut view, page(3)).unwrap().is_none());
+        assert!(db.read_page(&cx, &mut view, page(90)).unwrap().is_none());
+        control.assert_frozen(before);
+        db.rollback(&mut view).unwrap();
+        db.close(&cx).unwrap();
+    });
+}
+
+#[test]
+fn page_handoff_replays_many_versions_with_one_head_and_enforces_real_limits() {
+    run(async {
+        let cx = Cx::new();
+        let (vfs, control, log) = fixture(&cx);
+        let mut source = PageStore::new(log, Codec, 512, NativePageLimits::default()).unwrap();
+        for value in 1_u8..=32 {
+            let mut txn = source.begin(&cx).unwrap();
+            source.write_page(&cx, &mut txn, page(7), Some(&[value; 512])).unwrap();
+            source.commit(&cx, &mut txn, u64::from(value)).await.unwrap();
+        }
+        source.close(&cx).unwrap();
+        for (page_size, retained, versions) in [(512, 512, 1), (512, 511, 1), (512, 512, 0), (1024, 1024, 1)] {
+            control.forbid_mutation.store(false, Ordering::SeqCst);
+            let recovered = prepare_stored_pages(&vfs, &cx, &control).await;
+            let before = control.freeze();
+            let limits = NativePageLimits {
+                max_retained_page_bytes: retained,
+                max_versions: versions,
+                ..NativePageLimits::default()
+            };
+            let result = PageStore::from_recovered(&cx, recovered, Codec, page_size, limits).await;
+            control.assert_frozen(before);
+            if page_size == 1024 {
+                assert!(matches!(result, Err(FrankenError::WalCorrupt { .. })));
+            } else if retained < 512 || versions == 0 {
+                assert!(matches!(result, Err(FrankenError::TooBig)));
+            } else {
+                let (mut db, report) = result.unwrap();
+                assert_eq!(report.markers.len(), 32);
+                assert_eq!(db.retained_version_count(), 1);
+                assert_eq!(db.retained_page_bytes(), 512);
+                let mut view = db.begin(&cx).unwrap();
+                assert_eq!(view.token().id.get(), 33);
+                assert_eq!(db.read_page(&cx, &mut view, page(7)).unwrap().unwrap().as_ref(), &[32; 512]);
+                db.rollback(&mut view).unwrap();
+                db.close(&cx).unwrap();
+            }
+        }
+    });
+}
+
+#[test]
+fn page_handoff_rejects_stale_history_duplicate_tokens_and_forged_write_sets() {
+    run(async {
+        for invalid in 0..3 {
+            let cx = Cx::new();
+            let (vfs, control, mut log) = fixture(&cx);
+            let mut previous = None;
+            for seq in 1_u64..=3 {
+                let observed = if seq == 3 && invalid == 0 { 1 } else { seq - 1 };
+                let token_id = if seq == 3 && invalid == 1 { 1 } else { seq };
+                let capsule = NativePageCapsule {
+                    page_size: 512,
+                    snapshot: CommitSeq::new(seq - 1),
+                    reads: vec![(page(2), CommitSeq::new(observed))],
+                    writes: vec![NativePageWrite {
+                        page: page(2),
+                        data: Some(Arc::from(vec![u8::try_from(seq).unwrap(); 512])),
+                    }],
+                };
+                let payload = capsule.to_bytes().unwrap();
+                let capsule_records = Codec.encode(&cx, &payload).unwrap();
+                let proof = NativeCommitProof {
+                    commit_seq: CommitSeq::new(seq),
+                    commit_time_unix_ns: seq,
+                    submission: CommitSubmission {
+                        capsule_object_id: capsule_records[0].object_id,
+                        capsule_digest: *blake3::hash(&payload).as_bytes(),
+                        write_set_pages: vec![page(if seq == 3 && invalid == 2 { 3 } else { 2 })],
+                        witness_refs: vec![], edge_ids: vec![], merge_witness_ids: vec![],
+                        txn_token: TxnToken::new(TxnId::new(token_id).unwrap(), TxnEpoch::new(1)),
+                        begin_seq: capsule.snapshot,
+                    },
+                };
+                let proof_records = Codec.encode(&cx, &proof.to_bytes().unwrap()).unwrap();
+                let marker = CommitMarker::new(
+                    proof.commit_seq, seq, capsule_records[0].object_id,
+                    proof_records[0].object_id, previous,
+                );
+                previous = Some(ObjectId::derive_from_canonical_bytes(&marker.to_record_bytes()));
+                log.append_symbols(&cx, &capsule_records).await.unwrap();
+                log.append_symbols(&cx, &proof_records).await.unwrap();
+                log.publish(&cx, &[marker], |id, records| {
+                    ready(Codec.decode(&cx, id, &records).map(|_| ()))
+                }).await.unwrap();
+            }
+            let recovered = prepared(log, &cx).await;
+            let original = (
+                bytes(&vfs, &cx, "objects").await,
+                bytes(&vfs, &cx, "markers").await,
+            );
+            let before = control.freeze();
+            let result = PageStore::from_recovered(
+                &cx, recovered, Codec, 512,
+                NativePageLimits {
+                    max_retained_page_bytes: 512, max_versions: 1,
+                    ..NativePageLimits::default()
+                },
+            ).await;
+            assert!(matches!(result, Err(FrankenError::WalCorrupt { .. })));
+            control.assert_frozen(before);
+            assert_eq!(bytes(&vfs, &cx, "objects").await, original.0);
+            assert_eq!(bytes(&vfs, &cx, "markers").await, original.1);
+        }
+    });
+}
+
+#[test]
+fn page_handoff_retains_each_torn_tail_and_never_opens_transaction_admission() {
+    run(async {
+        for path in ["objects", "markers"] {
+            let cx = Cx::new();
+            let (vfs, control, log) = fixture(&cx);
+            let mut source = PageStore::new(log, Codec, 512, NativePageLimits::default()).unwrap();
+            let mut txn = source.begin(&cx).unwrap();
+            source.write_page(&cx, &mut txn, page(2), Some(&[7; 512])).unwrap();
+            source.commit(&cx, &mut txn, 100).await.unwrap();
+            source.close(&cx).unwrap();
+            let mut raw = raw_file(&vfs, &cx, path);
+            raw.write(&cx, b"tail", raw.file_size(&cx).unwrap()).await.unwrap();
+            raw.close(&cx).unwrap();
+            let recovered = prepare_stored_pages(&vfs, &cx, &control).await;
+            let original = bytes(&vfs, &cx, path).await;
+            let before = control.freeze();
+            let (mut db, report) = PageStore::from_recovered(
+                &cx, recovered, Codec, 512, NativePageLimits::default(),
+            ).await.unwrap();
+            assert_eq!(report.markers.len(), 1);
+            assert_eq!(report.symbol_tail_bytes, if path == "objects" { 4 } else { 0 });
+            assert_eq!(report.marker_tail_bytes, if path == "markers" { 4 } else { 0 });
+            assert_eq!(db.committed_tip(), CommitSeq::new(1));
+            assert!(db.needs_recovery());
+            assert!(matches!(db.begin(&cx), Err(FrankenError::BusyRecovery)));
+            assert!(matches!(db.commit_batch(&cx, &mut [], 200).await, Err(FrankenError::BusyRecovery)));
+            assert!(matches!(db.reclaim_history(&cx, 1), Err(FrankenError::BusyRecovery)));
+            control.assert_frozen(before);
+            assert_eq!(bytes(&vfs, &cx, path).await, original);
+            db.close(&cx).unwrap();
+        }
+    });
+}
+
+#[test]
+fn page_handoff_cancellation_and_dropped_reads_leave_no_usable_partial_store() {
+    run(async {
+        for cancel_before in [true, false] {
+            let cx = Cx::new();
+            let (vfs, control, log) = fixture(&cx);
+            let mut source = PageStore::new(log, Codec, 512, NativePageLimits::default()).unwrap();
+            let mut txn = source.begin(&cx).unwrap();
+            source.write_page(&cx, &mut txn, page(2), Some(&[0xA5; 512])).unwrap();
+            source.commit(&cx, &mut txn, 10).await.unwrap();
+            source.close(&cx).unwrap();
+            let recovered = prepare_stored_pages(&vfs, &cx, &control).await;
+            let original = bytes(&vfs, &cx, "objects").await;
+            let before = control.freeze();
+            if cancel_before {
+                let cancelled = Cx::new();
+                cancelled.cancel();
+                assert!(matches!(PageStore::from_recovered(
+                    &cancelled, recovered, Codec, 512, NativePageLimits::default(),
+                ).await, Err(FrankenError::Interrupt)));
+            } else {
+                control.hold_reads.store(true, Ordering::SeqCst);
+                let mut handoff = Box::pin(PageStore::from_recovered(
+                    &cx, recovered, Codec, 512, NativePageLimits::default(),
+                ));
+                poll_fn(|task| {
+                    assert!(handoff.as_mut().poll(task).is_pending());
+                    Poll::Ready(())
+                }).await;
+                drop(handoff);
+                control.hold_reads.store(false, Ordering::SeqCst);
+            }
+            control.assert_frozen(before);
+            assert_eq!(bytes(&vfs, &cx, "objects").await, original);
+            control.forbid_mutation.store(false, Ordering::SeqCst);
+            let recovered = prepare_stored_pages(&vfs, &cx, &control).await;
+            let before = control.freeze();
+            let (mut db, _) = PageStore::from_recovered(
+                &cx, recovered, Codec, 512, NativePageLimits::default(),
+            ).await.unwrap();
+            let mut view = db.begin(&cx).unwrap();
+            assert_eq!(db.read_page(&cx, &mut view, page(2)).unwrap().unwrap().as_ref(), &[0xA5; 512]);
+            control.assert_frozen(before);
+            db.rollback(&mut view).unwrap();
+            db.close(&cx).unwrap();
+        }
+    });
+}
+
+#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+#[test]
+fn page_handoff_uses_the_real_authenticated_raptorq_codec_without_new_barriers() {
+    use super::codec::RaptorQNativeCodec;
+
+    run(async {
+        let cx = Cx::new();
+        cx.set_native_cx(asupersync::Cx::current().unwrap());
+        for handoff_key in [[7; 32], [8; 32]] {
+            let (vfs, control, log) = fixture(&cx);
+            let codec = || RaptorQNativeCodec::new(Some([7; 32]));
+            let mut source = NativePageStore::new(
+                log, codec(), 512, NativePageLimits::default(),
+            ).unwrap();
+            let mut txn = source.begin(&cx).unwrap();
+            source.write_page(&cx, &mut txn, page(2), Some(&[0xBC; 512])).unwrap();
+            source.commit(&cx, &mut txn, 100).await.unwrap();
+            source.close(&cx).unwrap();
+            let mut recovery = NativeRecovery::new(
+                &cx, file(&vfs, &cx, "objects", &control),
+                file(&vfs, &cx, "markers", &control), NativeDurabilityLimits::default(),
+            ).unwrap();
+            recovery.prepare(&cx, |id, records| {
+                ready(codec().decode(&cx, id, &records).map(|_| ()))
+            }).await.unwrap();
+            let recovered = recovery.finish().unwrap();
+            let before = control.freeze();
+            let result = NativePageStore::from_recovered(
+                &cx, recovered, RaptorQNativeCodec::new(Some(handoff_key)),
+                512, NativePageLimits::default(),
+            ).await;
+            control.assert_frozen(before);
+            if handoff_key != [7; 32] {
+                assert!(result.is_err(), "the seal does not authorize a wrong authentication epoch");
+                continue;
+            }
+            let (mut db, report) = result.unwrap();
+            assert_eq!(report.markers.len(), 1);
+            let mut next = db.begin(&cx).unwrap();
+            assert_eq!(db.read_page(&cx, &mut next, page(2)).unwrap().unwrap().as_ref(), &[0xBC; 512]);
+            db.write_page(&cx, &mut next, page(3), Some(&[0xDE; 512])).unwrap();
+            control.assert_frozen(before);
+            control.forbid_mutation.store(false, Ordering::SeqCst);
+            assert_eq!(db.commit(&cx, &mut next, 101).await.unwrap().unwrap().commit_seq, CommitSeq::new(2));
+            db.close(&cx).unwrap();
+        }
     });
 }

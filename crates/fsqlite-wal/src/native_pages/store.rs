@@ -22,11 +22,11 @@ use super::{
 };
 use crate::native_commit::durable::{
     DurableCommitAcknowledgement, DurableCommitError, DurableWriteCoordinator,
-    MAX_NATIVE_VALIDATION_BYTES, NativeObjectCodec,
+    MAX_NATIVE_VALIDATION_BYTES, NativeCommitCandidate, NativeObjectCodec,
 };
 use crate::native_commit::{CommitResult, CommitSubmission};
 use crate::native_durability::{
-    NativeDurabilityLimits, NativeDurabilityLog, NativeDurabilityRecovery,
+    NativeDurabilityLimits, NativeDurabilityLog, NativeDurabilityRecovery, RecoveredNativeLog,
 };
 
 /// Retained page payload and metadata bounds, not a process-RSS claim.
@@ -298,6 +298,27 @@ impl PageHistory {
             return Err(corrupt("native page store/capsule page-size mismatch"));
         }
         capsule.validate_snapshot(self.tip, |page| self.latest(page))
+    }
+
+    // Both storage-recovery entry points replay this exact page protocol.
+    // A verified object envelope is not evidence of serializable page history.
+    fn replay_candidate(&mut self, candidate: &NativeCommitCandidate) -> Result<()> {
+        let capsule = NativePageCapsule::from_candidate(candidate)?;
+        let prepared = self
+            .prepare(
+                &capsule,
+                candidate.proof.commit_seq,
+                candidate.proof.submission.txn_token,
+                ApplyMode::Replay,
+            )
+            .map_err(|error| match error {
+                FrankenError::BusySnapshot { .. } => {
+                    corrupt("unserializable committed native page history")
+                }
+                other => other,
+            })?;
+        self.apply(prepared);
+        Ok(())
     }
 
     fn validate_group(&self, cx: &Cx, plans: &[PageCommitPlan]) -> Result<()> {
@@ -634,6 +655,9 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativePageStore<S, M, C> {
     /// can replace the stored page images/read versions. This is bounded page
     /// replay, not streaming of the lower log's marker/index metadata, on-disk
     /// compaction, or a process-RSS bound; decoding uses its own object limits.
+    /// Live writeback uncertainty must already be resolved before using this
+    /// non-rewriting entry point. After a failed sync, drive `NativeRecovery`
+    /// and pass its sealed result to [`Self::from_recovered`] instead.
     ///
     /// # Errors
     /// Propagates storage/codec errors; rejects invalid history, page-size
@@ -658,26 +682,60 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativePageStore<S, M, C> {
             page_limits
                 .max_active_transactions
                 .min(Self::MAX_COMMIT_GROUP),
-            |candidate, _| {
-                let capsule = NativePageCapsule::from_candidate(candidate)?;
-                let prepared = history
-                    .prepare(
-                        &capsule,
-                        candidate.proof.commit_seq,
-                        candidate.proof.submission.txn_token,
-                        ApplyMode::Replay,
-                    )
-                    .map_err(|error| match error {
-                        FrankenError::BusySnapshot { .. } => {
-                            corrupt("unserializable committed native page history")
-                        }
-                        other => other,
-                    })?;
-                history.apply(prepared);
-                Ok(())
-            },
+            |candidate, _| history.replay_candidate(candidate),
         )
         .await?;
+        Ok((Self::from_replayed_parts(driver, codec, history)?, report))
+    }
+
+    /// Restore usable page transactions from a completed writeback recovery.
+    ///
+    /// Consume the sealed log on its original handles without another open,
+    /// rewrite, or durability barrier. Bound proofs and canonical capsules
+    /// still pass the same mandatory page-history replay as [`Self::recover`]:
+    /// stale observations, duplicate tokens, invalid page sizes, and retention
+    /// excess reject the entire reconstruction. Only the current page heads
+    /// and tombstones remain between replay steps; old transaction handles
+    /// never acquire this new owner's authority.
+    ///
+    /// The reconstructed allocator starts beyond the highest committed page,
+    /// including deleted pages, and transaction IDs follow the greatest stored
+    /// ID rather than commit order. A retained torn tail remains readable in
+    /// the report but blocks BEGIN and publication. No old acknowledgement is
+    /// invented, no file is truncated, and public SQL native mode is not enabled.
+    /// The caller retains namespace/append-owner authority continuously through
+    /// recovery, this handoff, and subsequent use.
+    ///
+    /// # Errors
+    /// Propagates cancellation, storage reads, codec and bound-proof failures;
+    /// rejects invalid page history or limits without returning a partial store.
+    pub async fn from_recovered(
+        cx: &Cx,
+        recovered: RecoveredNativeLog<S, M>,
+        codec: C,
+        page_size: u32,
+        page_limits: NativePageLimits,
+    ) -> Result<(Self, NativeDurabilityRecovery)> {
+        let mut history = PageHistory::new(page_size, page_limits)?;
+        let codec = Arc::new(codec);
+        let (driver, report) = DurableWriteCoordinator::from_recovered(
+            cx,
+            recovered,
+            SharedCodec(Arc::clone(&codec)),
+            page_limits
+                .max_active_transactions
+                .min(Self::MAX_COMMIT_GROUP),
+            |candidate, _| history.replay_candidate(candidate),
+        )
+        .await?;
+        Ok((Self::from_replayed_parts(driver, codec, history)?, report))
+    }
+
+    fn from_replayed_parts(
+        driver: DurableWriteCoordinator<S, M, SharedCodec<C>>,
+        codec: Arc<C>,
+        history: PageHistory,
+    ) -> Result<Self> {
         if history.tip != driver.committed_tip() {
             return Err(corrupt("native page replay/driver tip mismatch"));
         }
@@ -691,20 +749,17 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativePageStore<S, M, C> {
             .pages
             .last_key_value()
             .map_or(1, |(page, _)| u64::from(page.get()).max(1));
-        Ok((
-            Self {
-                driver,
-                codec,
-                history,
-                owner: Arc::new(()),
-                active: Vec::new(),
-                next_txn_id,
-                page_high_water: AtomicU64::new(page_high_water),
-                recovery_required: false,
-                closed: false,
-            },
-            report,
-        ))
+        Ok(Self {
+            driver,
+            codec,
+            history,
+            owner: Arc::new(()),
+            active: Vec::new(),
+            next_txn_id,
+            page_high_water: AtomicU64::new(page_high_water),
+            recovery_required: false,
+            closed: false,
+        })
     }
 
     #[must_use]
