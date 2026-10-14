@@ -3,11 +3,14 @@ import type {
   ChangesetField,
   ChangesetLimits,
   ChangesetTable,
+  PatchsetChange,
 } from "./changeset-codec";
 import {
   ChangesetError,
   decodeChangeset,
+  decodePatchset,
   encodeChangeset,
+  encodePatchset,
   resolveChangesetLimits,
 } from "./changeset-codec";
 
@@ -21,10 +24,21 @@ export class ChangesetGroupError extends Error {
   }
 }
 
-interface GroupTable {
+interface GroupTable<Change extends PatchsetChange = ChangesetChange> {
   readonly name: string;
   readonly primaryKey: readonly number[];
-  readonly changes: Map<string, ChangesetChange>;
+  readonly changes: Map<string, Change>;
+}
+
+type SessionTable<Change extends PatchsetChange> = Omit<ChangesetTable, "changes"> & {
+  readonly changes: readonly Change[];
+};
+
+interface GroupFormat<Change extends PatchsetChange> {
+  readonly decode: (bytes: Uint8Array, limits: ChangesetLimits) => readonly SessionTable<Change>[];
+  readonly encode: (tables: readonly SessionTable<Change>[], limits: ChangesetLimits) => Uint8Array;
+  readonly combine: (key: readonly number[], first: Change, second: Change) => Change | null;
+  readonly cost: (change: Change, key: readonly number[]) => { bytes: number; cells: number };
 }
 
 function captureLimits(options?: ChangesetLimits): Readonly<ChangesetLimits> {
@@ -46,7 +60,7 @@ function equal(left: ChangesetField, right: ChangesetField): boolean {
 }
 
 /** Length-delimited typed keys avoid coercion, concatenation ambiguity and blob identity. */
-function rowKey(primaryKey: readonly number[], change: ChangesetChange): string {
+function rowKey(primaryKey: readonly number[], change: PatchsetChange): string {
   const values = change.operation === "insert" ? change.new : change.old;
   const parts: string[] = [];
   for (let i = 0; i < primaryKey.length; i++) {
@@ -139,7 +153,60 @@ function combine(
   );
 }
 
-function addTables(group: Map<string, GroupTable>, tables: readonly ChangesetTable[]): void {
+/** Patchsets carry no non-key before-images: unknown is not NULL or equality. */
+function combinePatchsets(
+  primaryKey: readonly number[],
+  first: PatchsetChange,
+  second: PatchsetChange,
+): PatchsetChange | null {
+  const indirect = first.indirect && second.indirect;
+  if (first.operation === "insert") {
+    if (second.operation === "insert") return first;
+    if (second.operation === "delete") return null;
+    return {
+      operation: "insert",
+      indirect,
+      new: first.new.map((value, i) => second.new[i] === undefined ? value : second.new[i]!),
+    };
+  }
+  if (first.operation === "delete") {
+    if (second.operation !== "insert") return first;
+    // SQLite 3.46.1's changegroup emits a no-op UPDATE for an all-key
+    // DELETE/INSERT pair; SQLite 3.49.1's apply API rejects that output.
+    // Keep the codec's no-empty-UPDATE invariant and the caller's old group,
+    // rather than publish an unusable patch or silently erase the operation.
+    if (!primaryKey.includes(0)) {
+      throw new ChangesetError(
+        "ERR_FSQLITE_CHANGESET_FORMAT",
+        "Cannot compose DELETE/INSERT for a patchset table with only primary-key columns",
+      );
+    }
+    return {
+      operation: "update",
+      indirect,
+      old: first.old,
+      new: second.new.map((value, i) => primaryKey[i] === 0 ? value : undefined),
+    };
+  }
+  if (second.operation === "insert") return first;
+  if (second.operation === "delete") {
+    return { operation: "delete", indirect, old: second.old };
+  }
+  // Even a value that appears to revert an earlier update must remain: there
+  // is no original value with which to prove that the net change is empty.
+  return {
+    operation: "update",
+    indirect,
+    old: first.old,
+    new: first.new.map((value, i) => second.new[i] === undefined ? value : second.new[i]),
+  };
+}
+
+function addTables<Change extends PatchsetChange>(
+  group: Map<string, GroupTable<Change>>,
+  tables: readonly SessionTable<Change>[],
+  merge: GroupFormat<Change>["combine"],
+): void {
   for (const table of tables) {
     const name = table.name.replace(/[A-Z]/g, (c) => c.toLowerCase());
     let target = group.get(name);
@@ -155,15 +222,17 @@ function addTables(group: Map<string, GroupTable>, tables: readonly ChangesetTab
     for (const change of table.changes) {
       const key = rowKey(target.primaryKey, change);
       const previous = target.changes.get(key);
-      const result = previous === undefined ? change : combine(target.primaryKey, previous, change);
+      const result = previous === undefined ? change : merge(target.primaryKey, previous, change);
       if (result === null) target.changes.delete(key);
       else target.changes.set(key, result);
     }
   }
 }
 
-function outputTables(group: ReadonlyMap<string, GroupTable>): ChangesetTable[] {
-  const tables: ChangesetTable[] = [];
+function outputTables<Change extends PatchsetChange>(
+  group: ReadonlyMap<string, GroupTable<Change>>,
+): SessionTable<Change>[] {
+  const tables: SessionTable<Change>[] = [];
   for (const table of group.values()) {
     if (table.changes.size !== 0)
       tables.push({
@@ -187,7 +256,7 @@ export interface ChangesetGroupStats {
   readonly schemaBytes: number;
 }
 
-interface BudgetedTable extends GroupTable {
+interface BudgetedTable<Change extends PatchsetChange> extends GroupTable<Change> {
   readonly headerBytes: number;
 }
 
@@ -212,7 +281,7 @@ function textBytes(value: string): number {
   return bytes;
 }
 
-function rowCost(change: ChangesetChange): { bytes: number; cells: number } {
+function rowCost(change: PatchsetChange): { bytes: number; cells: number } {
   const records =
     change.operation === "insert"
       ? [change.new]
@@ -235,6 +304,21 @@ function rowCost(change: ChangesetChange): { bytes: number; cells: number } {
   return { bytes, cells };
 }
 
+function patchsetRowCost(
+  change: PatchsetChange,
+  primaryKey: readonly number[],
+): { bytes: number; cells: number } {
+  const cost = rowCost(change);
+  // The codec normalizes omitted fields to undefined slots. Count those slots
+  // for maxCells, but not their absent type tags for the compact wire budget.
+  if (change.operation === "delete") {
+    for (const key of primaryKey) if (key === 0) cost.bytes--;
+  } else if (change.operation === "update") {
+    cost.bytes -= primaryKey.length;
+  }
+  return cost;
+}
+
 const emptyStats = (): ChangesetGroupStats =>
   Object.freeze({ tables: 0, changes: 0, cells: 0, byteLength: 0, schemaBytes: 0 });
 
@@ -248,14 +332,16 @@ const emptyStats = (): ChangesetGroupStats =>
  * schema churn. clear() releases the whole history and starts a new batch; it
  * is neither a durability acknowledgement nor an automatic outbox compaction.
  */
-export class ChangesetGroup {
+class SessionGroup<Change extends PatchsetChange> {
   readonly #policy: ReturnType<typeof resolveChangesetLimits>;
-  readonly #tables = new Map<string, BudgetedTable>();
+  readonly #tables = new Map<string, BudgetedTable<Change>>();
+  readonly #format: GroupFormat<Change>;
   #stats = emptyStats();
   #rowBytes = 0;
 
-  constructor(options?: ChangesetLimits) {
+  constructor(options: ChangesetLimits | undefined, format: GroupFormat<Change>) {
     this.#policy = Object.freeze(resolveChangesetLimits(options));
+    this.#format = format;
   }
 
   stats(): ChangesetGroupStats {
@@ -263,7 +349,7 @@ export class ChangesetGroup {
   }
 
   add(bytes: Uint8Array): ChangesetGroupStats {
-    const incoming = decodeChangeset(bytes, this.#policy);
+    const incoming = this.#format.decode(bytes, this.#policy);
     let rows = this.#stats.changes;
     let cells = this.#stats.cells;
     let rowBytes = this.#rowBytes;
@@ -272,8 +358,8 @@ export class ChangesetGroup {
     let tables = this.#tables.size;
     const plans: {
       name: string;
-      table: BudgetedTable;
-      operations: [string, ChangesetChange | null][];
+      table: BudgetedTable<Change>;
+      operations: [string, Change | null][];
     }[] = [];
 
     for (const source of incoming) {
@@ -296,23 +382,25 @@ export class ChangesetGroup {
         throw new ChangesetGroupError(source.name);
       }
 
-      const staged = new Map<string, ChangesetChange | null>();
-      const operations: [string, ChangesetChange | null][] = [];
+      const staged = new Map<string, Change | null>();
+      const operations: [string, Change | null][] = [];
       let count = target.changes.size;
       for (const change of source.changes) {
         const key = rowKey(target.primaryKey, change);
         // has() distinguishes a staged deletion from a key not yet touched.
         const previous = (staged.has(key) ? staged.get(key) : target.changes.get(key)) ?? undefined;
-        const result = previous === undefined ? change : combine(target.primaryKey, previous, change);
+        const result = previous === undefined
+          ? change
+          : this.#format.combine(target.primaryKey, previous, change);
         if (previous !== undefined) {
-          const cost = rowCost(previous);
+          const cost = this.#format.cost(previous, target.primaryKey);
           rowBytes -= cost.bytes;
           cells -= cost.cells;
           rows--;
           count--;
         }
         if (result !== null) {
-          const cost = rowCost(result);
+          const cost = this.#format.cost(result, target.primaryKey);
           rowBytes += cost.bytes;
           cells += cost.cells;
           rows++;
@@ -362,7 +450,7 @@ export class ChangesetGroup {
 
   /** A fresh owned buffer on every call; reading never consumes the group. */
   output(): Uint8Array {
-    return encodeChangeset(outputTables(this.#tables), this.#policy);
+    return this.#format.encode(outputTables(this.#tables), this.#policy);
   }
 
   clear(): void {
@@ -373,13 +461,49 @@ export class ChangesetGroup {
 }
 
 /**
+ * Bounded reversible changeset composition; compact patchsets are refused.
+ * add() parses only the new chunk and stages touched rows. Format, schema and
+ * limit failures leave the previous group unchanged. Retained schema headers
+ * count against maxBytes/maxTables even after their rows cancel; clear() starts
+ * a new group, not a durability acknowledgement or automatic outbox compaction.
+ */
+export class ChangesetGroup extends SessionGroup<ChangesetChange> {
+  constructor(options?: ChangesetLimits) {
+    super(options, {
+      decode: decodeChangeset, encode: encodeChangeset, combine, cost: rowCost,
+    });
+  }
+}
+
+/**
+ * Bounded compact patchset composition using the same atomic staging/index
+ * machinery as ChangesetGroup. Full changesets and mixed formats are refused.
+ * Missing before-images remain missing: output cannot be inverted, detect DATA
+ * conflicts, or prove that an UPDATE returned a column to its original value.
+ *
+ * add() charges each input and retained normalized cells, compact row bytes and
+ * all retained schemas. Failed adds leave output and counters unchanged. Output
+ * is a fresh buffer, not an acknowledgement or a replacement for an identified
+ * outbox payload. All-key DELETE/INSERT pairs are refused before publication:
+ * their UPDATE has no modified non-key column and fails the codec's validator.
+ */
+export class PatchsetGroup extends SessionGroup<PatchsetChange> {
+  constructor(options?: ChangesetLimits) {
+    super(options, {
+      decode: decodePatchset, encode: encodePatchset,
+      combine: combinePatchsets, cost: patchsetRowCost,
+    });
+  }
+}
+
+/**
  * Compose consecutive SQLite session changesets: first, then second. The result
  * retains original conflict before-images and can be applied or inverted using
  * the existing APIs. Insert/delete pairs and fully reverted updates disappear.
  *
  * This does not rebase divergent replicas, preserve intermediate trigger events,
  * or acknowledge durable delivery. Do not replace an already-identified outbox
- * payload with composed bytes. Patchsets remain unsupported. Each input and the
+ * payload with composed bytes. Use concatPatchsets for patchsets. Each input and the
  * final output independently obey ChangesetLimits; scratch memory also includes
  * both decoded inputs and their primary-key index, not a hard process-RSS cap.
  * Table order is first appearance; row order is not SQLite's internal hash order.
@@ -395,7 +519,28 @@ export function concatChangesets(
   const a = decodeChangeset(first, policy);
   const b = decodeChangeset(second, policy);
   const group = new Map<string, GroupTable>();
-  addTables(group, a);
-  addTables(group, b);
+  addTables(group, a, combine);
+  addTables(group, b, combine);
   return encodeChangeset(outputTables(group), policy);
+}
+
+/**
+ * Compose compact patchsets in order without inventing reversible before-images.
+ * Each input and final output independently obey the supplied limits, as for
+ * concatChangesets. Use PatchsetGroup to additionally bound incremental retained
+ * state (including empty schemas). Format/schema errors never mutate inputs.
+ * The all-key DELETE/INSERT restriction is the same as PatchsetGroup's.
+ */
+export function concatPatchsets(
+  first: Uint8Array,
+  second: Uint8Array,
+  options?: ChangesetLimits,
+): Uint8Array {
+  const policy = captureLimits(options);
+  const a = decodePatchset(first, policy);
+  const b = decodePatchset(second, policy);
+  const group = new Map<string, GroupTable<PatchsetChange>>();
+  addTables(group, a, combinePatchsets);
+  addTables(group, b, combinePatchsets);
+  return encodePatchset(outputTables(group), policy);
 }
