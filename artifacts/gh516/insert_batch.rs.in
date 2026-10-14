@@ -1,0 +1,172 @@
+//! GH#516: one compiled row program, one enclosing SQL statement.
+//!
+//! The ordinary INSERT dispatcher below is extracted, not copied: both public
+//! single-row dispatch and batch replay use exactly the same trigger/FK kernel.
+//! A batch changes only entry/compilation ownership, never trigger evaluation.
+use super::*;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct InsertReplayIdentity {
+    schema_cookie: u32,
+    schema_generation: u64,
+    function_generation: u64,
+    concurrent: bool,
+    text_encoding: TextEncoding,
+}
+
+pub(super) struct CompiledInsertReplay {
+    statement: Statement,
+    program: VdbeProgram,
+    identity: InsertReplayIdentity,
+    cx: Cx,
+}
+
+impl Connection {
+    pub(super) fn insert_replay_identity(&self) -> InsertReplayIdentity {
+        InsertReplayIdentity {
+            schema_cookie: self.schema_cookie(),
+            schema_generation: self.schema_generation(),
+            function_generation: self.function_registry_generation(),
+            concurrent: self.is_concurrent_transaction(),
+            text_encoding: self.db_text_encoding.get(),
+        }
+    }
+
+    pub(super) async fn prepare_compiled_insert_replay(
+        &self,
+        original: &fsqlite_ast::InsertStatement,
+        row_sql: &str,
+    ) -> Result<Option<CompiledInsertReplay>> {
+        // Keep SELECT streaming, UPSERT OLD/NEW routing, RETURNING bindings,
+        // virtual tables, and attached/TEMP ownership on their established
+        // paths. FAIL/ROLLBACK also retain their historical replay entry until
+        // their independently nested failure boundaries have a fast-path proof.
+        // This is a positive admission rule, not a global fallback bypass.
+        if !matches!(&original.source, InsertSource::Values(rows) if rows.len() > 1)
+            || original.with.is_some()
+            || !original.returning.is_empty()
+            || !original.upsert.is_empty()
+            || matches!(original.or_conflict,
+                Some(fsqlite_ast::ConflictAction::Fail | fsqlite_ast::ConflictAction::Rollback))
+            || original.table.schema.as_deref().is_some_and(|s| !s.eq_ignore_ascii_case("main"))
+            || is_sqlite_schema_name(&original.table.name)
+            || original.table.name.eq_ignore_ascii_case("sqlite_sequence")
+            || self.has_live_vtab_instance(&original.table.name)
+            || self.view_index_of(&original.table.name).is_some()
+            || self.targets_shadowed_main(&original.table)
+            || !self.temp_storage_roots().is_empty()
+            || !self.active_txn_is_open_or_borrowed()
+            || self.internal_statement_savepoint_depth.get() == 0
+        {
+            return Ok(None);
+        }
+        let event = fsqlite_ast::TriggerEvent::Insert;
+        if !self.has_matching_triggers(&original.table.name, fsqlite_ast::TriggerTiming::Before, &event)
+            && !self.has_matching_triggers(&original.table.name, fsqlite_ast::TriggerTiming::After, &event)
+        {
+            return Ok(None);
+        }
+        // VALUES have already been materialized by the enclosing dispatcher.
+        // Only the parameter-only row template is compiled; source expressions
+        // and WHEN expressions must never be folded against a batch snapshot.
+        let statement = parse_single_statement(row_sql)?;
+        let Statement::Insert(insert) = &statement else {
+            return Err(FrankenError::internal("INSERT row template is not an INSERT"));
+        };
+        let identity = self.insert_replay_identity();
+        let program = self.compile_table_insert(insert, None).await?;
+        if self.insert_replay_identity() != identity {
+            return Ok(None);
+        }
+        Ok(Some(CompiledInsertReplay {
+            statement,
+            program,
+            identity,
+            cx: self.op_cx_after_background_status(),
+        }))
+    }
+
+    pub(super) fn execute_compiled_insert_replay_row<'a>(
+        &'a self,
+        plan: &'a CompiledInsertReplay,
+        values: &'a [SqliteValue],
+    ) -> FallbackStatementFuture<'a, Result<usize>> {
+        // Keep the existing recursion/cancellation admission wrapper. Only
+        // public SQL entry work is elided: no parse, rewrite, schema validation,
+        // cache lookup, autocommit acquisition, or synthetic statement trace.
+        self.with_fallback_statement(Box::pin(async move {
+            if self.insert_replay_identity() != plan.identity {
+                // Reentrant application functions may change schema/functions.
+                // Never run bytecode whose binding proof has expired.
+                self.execute_statement_impl_after_background_status(
+                    &plan.statement, Some(values), None, false,
+                ).await?;
+                return Ok(self.last_changes.get());
+            }
+            let Statement::Insert(insert) = &plan.statement else {
+                return Err(FrankenError::internal("compiled INSERT row lost its statement"));
+            };
+            self.clear_table_program_error_state();
+            self.forget_constraint_failure_action_at_top_level();
+            self.sync_change_tracking_context();
+            let _depth = self.enter_statement_exec();
+            let _conflict = DmlConflictClauseGuard::new(&self.dml_conflict_clause, insert.or_conflict);
+            if self.pragma_state.borrow().query_only || self.pager.is_readonly() {
+                return Err(FrankenError::ReadOnly);
+            }
+            self.guard_mutation_encoding_supported(&plan.statement)?;
+            if Self::statement_may_invalidate_fk_parent_cache(&plan.statement) {
+                self.clear_fk_parent_validation_cache();
+            }
+            // A previous row's trigger may leave direct writes buffered. The
+            // parameter-only template is read-free, exactly the case admitted
+            // by plan_statement_execution's flush (rather than reload) branch.
+            if !self.skip_statement_memdb_refresh.get()
+                && (self.memdb_requires_active_txn_reload.get()
+                    || !self.pending_memdb_direct_upserts.borrow().is_empty())
+            {
+                self.flush_pending_direct_write_runs(&plan.cx).await?;
+            }
+            self.clear_prepared_direct_insert_append_hint();
+            let previous_total = self.total_changes.get();
+            let previous_trigger_steps = self.trigger_step_changes.get();
+            let previous_rowid = self.current_last_insert_rowid();
+            // The stream owns the statement savepoint and final-image FK scope.
+            // The shared kernel keeps BEFORE -> write -> FK -> AFTER ordering,
+            // IGNORE row skips, implicit REPLACE victims, and sequence updates.
+            let result = Box::pin(self.execute_insert_dispatch(
+                &plan.cx, &plan.statement, insert, Some(values),
+                Some(&plan.program), Some(plan.identity),
+            )).await;
+            match result {
+                Ok(_) => Ok(self.last_changes.get()),
+                Err(error) => {
+                    self.restore_failed_statement_tracking(
+                        statement_preserves_prior_changes_on_constraint(&plan.statement),
+                        &error, previous_total, previous_trigger_steps, previous_rowid,
+                    );
+                    // RAISE(ROLLBACK) inside an admitted trigger still rolls
+                    // back the transaction even though OR ROLLBACK uses replay.
+                    self.maybe_rollback_transaction_for_conflict_action(
+                        statement_rolls_back_transaction_on_constraint(&plan.statement),
+                        false, &error,
+                    ).await?;
+                    Err(error)
+                }
+            }
+        }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn execute_insert_dispatch(
+        &self,
+        cx: &Cx,
+        statement: &Statement,
+        insert: &fsqlite_ast::InsertStatement,
+        params: Option<&[SqliteValue]>,
+        precompiled: Option<&VdbeProgram>,
+        replay_identity: Option<InsertReplayIdentity>,
+    ) -> Result<Vec<Row>> {
+/* INSERT_DISPATCH_BODY */
+    }
+}

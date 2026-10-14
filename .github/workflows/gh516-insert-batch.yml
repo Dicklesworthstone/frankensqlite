@@ -1,0 +1,104 @@
+name: GH516 compiled INSERT batch gate
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/gh516-insert-batch.yml
+      - artifacts/gh516/**
+permissions:
+  contents: read
+concurrency:
+  group: gh516-insert-batch
+  cancel-in-progress: false
+jobs:
+  validate-and-stage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      CARGO_BUILD_JOBS: '1'
+      CARGO_PROFILE_RELEASE_DEBUG: '0'
+      CARGO_PROFILE_RELEASE_LTO: 'off'
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
+      GH516_RESULTS: ${{ runner.temp }}/gh516-native
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Install the repository-pinned nightly
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain="$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')"
+          rustup toolchain install "$toolchain" --profile minimal --component rustfmt --component clippy
+      - name: Baseline, shared-kernel candidate, differential gates, and after measurement
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 artifacts/gh516/run_native_validation.py --results "$GH516_RESULTS"
+      - name: Stage only the natively validated source commit (do not move main)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const crypto = require('crypto');
+            const cp = require('child_process');
+            const out = process.env.GH516_RESULTS;
+            const receipt = JSON.parse(fs.readFileSync(path.join(out, 'validated.json'), 'utf8'));
+            const allowed = [
+              'crates/fsqlite-core/src/connection.rs',
+              'crates/fsqlite-core/src/connection/insert_batch.rs',
+              'crates/fsqlite-core/tests/gh516_insert_batch.rs',
+              'crates/fsqlite-core/tests/gh516_cases.json',
+            ];
+            const head = cp.execFileSync('git', ['rev-parse', 'HEAD'], {encoding:'utf8'}).trim();
+            if (receipt.native_gates_passed !== true || receipt.performance.passed !== true ||
+                receipt.base_commit !== head ||
+                JSON.stringify(receipt.files.map(f => f.path).sort()) !== JSON.stringify(allowed.sort())) {
+              throw new Error('invalid native validation receipt');
+            }
+            const repo = context.repo;
+            const tree = [];
+            for (const entry of receipt.files) {
+              const bytes = fs.readFileSync(entry.path);
+              const blob = crypto.createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex');
+              const sha256 = crypto.createHash('sha256').update(bytes).digest('hex');
+              if (blob !== entry.blob || sha256 !== entry.sha256) throw new Error(`changed after validation: ${entry.path}`);
+              const created = await github.rest.git.createBlob({...repo, content:bytes.toString('base64'), encoding:'base64'});
+              if (created.data.sha !== blob) throw new Error(`blob mismatch: ${entry.path}`);
+              tree.push({path:entry.path,mode:'100644',type:'blob',sha:blob});
+            }
+            const parent = await github.rest.git.getCommit({...repo,commit_sha:head});
+            const createdTree = await github.rest.git.createTree({...repo,base_tree:parent.data.tree.sha,tree});
+            const message = [
+              'perf(core): execute triggered VALUES batches with one compiled row program',
+              '',
+              'Share the existing INSERT kernel; preserve per-row BEFORE/write/FK/AFTER ordering.',
+              'Keep one statement savepoint and FK scope; do not redispatch synthetic SQL rows.',
+              'Recheck binding identity after BEFORE triggers; retain conservative complex-shape replay.',
+              `Native validation base: ${head}`,
+              `Passing gates: ${receipt.gates.join(', ')}`,
+              `Measured inactive-trigger geometric-mean speedup: ${receipt.performance.inactive_geomean_speedup}`,
+              `Control-normalized speedup: ${receipt.performance.control_normalized_inactive_speedup}`,
+              `Evidence: ${context.serverUrl}/${repo.owner}/${repo.repo}/actions/runs/${context.runId}`,
+              'Measurements are local fixtures, not a universal throughput claim.',
+              'Staged only; no branch is moved by this workflow.',
+            ].join('\n');
+            const commit = await github.rest.git.createCommit({...repo,message,tree:createdTree.data.sha,parents:[head]});
+            receipt.staged_commit = commit.data.sha;
+            receipt.staged_tree = createdTree.data.sha;
+            receipt.remote_ref_updated = false;
+            fs.writeFileSync(path.join(out,'staged-commit.json'),JSON.stringify(receipt,null,2)+'\n');
+            core.notice(`GH516 validated source commit ${commit.data.sha}; main has NOT been updated.`);
+      - name: Preserve actual evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gh516-native-${{ github.run_id }}
+          path: ${{ runner.temp }}/gh516-native/
+          if-no-files-found: warn
