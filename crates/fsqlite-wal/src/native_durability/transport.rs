@@ -207,10 +207,10 @@ impl NativeReplicationPlan {
         markers.try_reserve_exact(commits).map_err(|_| FrankenError::OutOfMemory)?;
         for _ in 0..commits {
             checkpoint(cx)?;
-            let wire = input.take(COMMIT_MARKER_RECORD_V1_SIZE)?;
-            let marker = CommitMarker::from_record_bytes(wire)
+            let wire = input.array::<COMMIT_MARKER_RECORD_V1_SIZE>()?;
+            let marker = CommitMarker::from_record_bytes(&wire)
                 .ok_or_else(|| corrupt("malformed transported native marker"))?;
-            if marker.to_record_bytes().as_slice() != wire {
+            if marker.to_record_bytes() != wire {
                 return Err(corrupt("noncanonical transported native marker"));
             }
             markers.push(marker);
@@ -684,7 +684,7 @@ mod tests {
             }
             // Authorized-but-malformed sender: recomputing the transport MAC
             // does not excuse bogus counts, duplicate inventories or padding.
-            for case in 0..4 {
+            for case in 0..7 {
                 let mut body = wire[..wire.len() - TAG_BYTES].to_vec();
                 match case {
                     0 => body[48..52].copy_from_slice(&u32::MAX.to_le_bytes()),
@@ -695,6 +695,12 @@ mod tests {
                         body[start + 16..start + 32].copy_from_slice(&id);
                     }
                     3 => body.push(0),
+                    // The shared marker decoder accepts reserved bytes. The
+                    // transport must still reject noncanonical authenticated
+                    // records instead of silently changing their chain digest.
+                    4 => body[PLAN_HEADER + 1] = 1,
+                    5 => body[PLAN_HEADER + 83] = 1,
+                    6 => body[PLAN_HEADER + 50] = 1,
                     _ => unreachable!(),
                 }
                 let signed = seal(&cx, body, &KEY).unwrap();
