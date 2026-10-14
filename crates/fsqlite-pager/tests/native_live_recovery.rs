@@ -12,7 +12,7 @@ use std::task::Poll;
 use asupersync::runtime::RuntimeBuilder;
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_pager::native::NativePager;
-use fsqlite_pager::{PagerCommitState, TransactionHandle, TransactionMode};
+use fsqlite_pager::{PagerCommitState, TransactionHandle, TransactionKind, TransactionMode};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::flags::{SyncFlags, VfsOpenFlags};
 use fsqlite_types::{
@@ -23,7 +23,7 @@ use fsqlite_vfs::{
     FileIdentity, MemoryVfs, ShmRegion, SyncKind, Vfs, VfsFile, VfsWriteCompletion,
     VfsWriteCompletionState,
 };
-use fsqlite_wal::native_commit::durable::NativeObjectCodec;
+use fsqlite_wal::native_commit::durable::{NativeCommitAttempt, NativeCommitOutcome, NativeObjectCodec};
 use fsqlite_wal::native_durability::{NativeDurabilityLimits, NativeDurabilityLog};
 use fsqlite_wal::native_pages::{NativePageLimits, NativePageRecovery, NativePageStore};
 
@@ -206,6 +206,8 @@ fn both_failed_group_barriers_recover_on_original_streams_and_resume_transaction
             let mut b = owner.begin(&cx, TransactionMode::Concurrent).unwrap();
             a.write_page(&cx, page(2), &[0x22; 512]).await.unwrap();
             b.write_page(&cx, page(3), &[0x33; 512]).await.unwrap();
+            let tokens = [a.txn_token(), b.txn_token()];
+            assert!(a.commit_attempt().unwrap().is_none(), "private writes are not an admitted commit");
             let fail_at = audit.syncs.load(Ordering::SeqCst) + barrier;
             audit.fail_sync_at.store(fail_at, Ordering::SeqCst);
             assert!(matches!(owner.commit_batch_at(&cx, &mut [&mut a, &mut b], 101).await,
@@ -215,6 +217,14 @@ fn both_failed_group_barriers_recover_on_original_streams_and_resume_transaction
             assert_eq!(b.pager_commit_state(), PagerCommitState::InDoubt);
             assert!(a.acknowledgement().is_none());
             assert!(b.acknowledgement().is_none());
+            let capture_before = audit.counts();
+            let attempts = [a.commit_attempt().unwrap().unwrap(), b.commit_attempt().unwrap().unwrap()];
+            for (attempt, token) in attempts.iter().zip(tokens) {
+                assert_eq!(attempt.txn_token(), token);
+                assert_eq!(owner.commit_attempt(token).unwrap().unwrap().commit_seq(), attempt.commit_seq());
+            }
+            assert_eq!(audit.counts(), capture_before, "capture cannot probe failed storage");
+            assert_eq!(a.pager_commit_state(), PagerCommitState::InDoubt);
             owner = refused(owner);
             assert!(owner.needs_recovery().unwrap());
             drop(a); drop(b); // Abandonment is not a rollback verdict.
@@ -230,7 +240,20 @@ fn both_failed_group_barriers_recover_on_original_streams_and_resume_transaction
             let syncs = audit.syncs.load(Ordering::SeqCst);
             let mut replay = NativePageRecovery::with_shared_codec(
                 recovered, codec, 512, NativePageLimits::default());
+            assert!(matches!(replay.resolve_commit(&cx, &attempts[0]).await,
+                Err(FrankenError::BusyRecovery)), "storage recovery alone is not page validation");
             replay.prepare(&cx).await.unwrap();
+            let before_resolution = audit.counts();
+            for (index, attempt) in attempts.iter().enumerate() {
+                let outcome = replay.resolve_commit(&cx, attempt).await.unwrap();
+                if barrier == 1 {
+                    assert_eq!(outcome, NativeCommitOutcome::NotCommitted);
+                } else {
+                    assert_recovered_commit(outcome, attempt);
+                    assert_eq!(attempt.commit_seq(), CommitSeq::new(u64::try_from(index).unwrap() + 2));
+                }
+            }
+            assert_eq!(&audit.counts()[1..], &before_resolution[1..], "resolution only reads");
             let (store, _) = replay.finish().unwrap();
             assert_eq!(audit.syncs.load(Ordering::SeqCst), syncs);
             assert_eq!(audit.closes.load(Ordering::SeqCst), 0);
@@ -252,6 +275,8 @@ fn both_failed_group_barriers_recover_on_original_streams_and_resume_transaction
             writer.commit_at(&cx, 1000).await.unwrap();
             assert_eq!(old.get_page(&cx, page(2)).await.unwrap().as_bytes(), &[expected; 512]);
             assert!(matches!(stale.commit_at(&cx, 1001).await, Err(FrankenError::BusySnapshot { .. })));
+            assert!(stale.commit_attempt().unwrap().is_none(), "conflict rejected before admission");
+            assert!(writer.commit_attempt().unwrap().is_none(), "success already delivered its receipt");
             stale.rollback(&cx).await.unwrap();
             old.rollback(&cx).await.unwrap();
             owner.close(&cx).unwrap();
@@ -281,6 +306,9 @@ fn transferred_pending_source_write_blocks_recovery_io_and_preserves_its_torn_ta
         let source = audit.pending_write.lock().unwrap().as_ref().unwrap().clone();
         assert_eq!(source.state(), VfsWriteCompletionState::Pending);
         assert_eq!(txn.pager_commit_state(), PagerCommitState::InDoubt);
+        let capture_before = audit.counts();
+        let attempt = txn.commit_attempt().unwrap().unwrap();
+        assert_eq!(audit.counts(), capture_before, "capture is safe beneath an unsettled source write");
         drop(txn);
         let before = audit.counts();
         let (mut storage, codec) = owner.try_into_recovery()
@@ -303,6 +331,8 @@ fn transferred_pending_source_write_blocks_recovery_io_and_preserves_its_torn_ta
         let mut replay = NativePageRecovery::with_shared_codec(
             recovered, codec, 512, NativePageLimits::default());
         replay.prepare(&cx).await.unwrap();
+        assert!(matches!(replay.resolve_commit(&cx, &attempt).await,
+            Err(FrankenError::BusyRecovery)), "a torn symbol tail does not establish noncommit");
         let (store, _) = replay.finish().unwrap();
         let owner = NativePager::new(store).unwrap();
         assert!(owner.needs_recovery().unwrap());
@@ -336,6 +366,7 @@ fn abandoned_validation_queue_transfers_without_misclassifying_it_as_healthy_wor
         assert_eq!(txn.pager_commit_state(), PagerCommitState::InDoubt);
         assert!(owner.outstanding_write().unwrap().is_none());
         assert!(owner.needs_recovery().unwrap());
+        let attempt = txn.commit_attempt().unwrap().unwrap();
         drop(txn);
         let before = audit.counts();
         let (mut storage, codec) = owner.try_into_recovery()
@@ -346,6 +377,7 @@ fn abandoned_validation_queue_transfers_without_misclassifying_it_as_healthy_wor
         let mut replay = NativePageRecovery::with_shared_codec(
             storage.finish().unwrap(), codec, 512, NativePageLimits::default());
         replay.prepare(&cx).await.unwrap();
+        assert_eq!(replay.resolve_commit(&cx, &attempt).await.unwrap(), NativeCommitOutcome::NotCommitted);
         let (store, report) = replay.finish().unwrap();
         assert_eq!(report.markers.len(), 1);
         assert!(!report.append_blocked());
@@ -399,5 +431,150 @@ fn failed_close_remains_retryable_but_cannot_be_bypassed_by_recovery_transfer() 
         assert!(owner.begin(&cx, TransactionMode::Concurrent).is_err());
         owner.close(&cx).unwrap();
         assert_eq!(audit.closes.load(Ordering::SeqCst), 3);
+    });
+}
+
+fn assert_recovered_commit(outcome: NativeCommitOutcome, attempt: &NativeCommitAttempt) {
+    match outcome {
+        NativeCommitOutcome::Committed(ack) => {
+            assert_eq!(ack.txn_token, attempt.txn_token());
+            assert_eq!(ack.commit_seq, attempt.commit_seq());
+            assert_eq!(ack.capsule_object_id, attempt.capsule_object_id());
+        }
+        other => panic!("expected exact recovered commit, got {other:?}"),
+    }
+}
+
+async fn outcome_recovery(
+    owner: Pager,
+    cx: &Cx,
+) -> NativePageRecovery<AuditedFile, AuditedFile, TestCodec> {
+    let (mut storage, codec) = owner.try_into_recovery()
+        .unwrap_or_else(|_| panic!("ticket must not retain a transaction pin or pager clone"));
+    storage.prepare(cx, |id, records| ready(codec.decode(cx, id, &records).map(|_| ())))
+        .await.unwrap();
+    NativePageRecovery::with_shared_codec(storage.finish().unwrap(), codec, 512, NativePageLimits::default())
+}
+
+#[test]
+fn erased_attempt_requires_the_latest_complete_page_replay_and_survives_dropped_lookup() {
+    run(async {
+        let cx = Cx::new(); let vfs = MemoryVfs::new(); let audit = Arc::new(Audit::default());
+        let owner = pager(&vfs, &cx, &audit);
+        let mut typed = owner.begin(&cx, TransactionMode::Concurrent).unwrap();
+        let token = typed.txn_token();
+        typed.write_page(&cx, page(2), &[0x71; 512]).await.unwrap();
+        let mut erased: TransactionKind = typed.into();
+        audit.fail_sync_at.store(2, Ordering::SeqCst);
+        assert!(erased.commit(&cx).await.is_err());
+        assert_eq!(erased.pager_commit_state(), PagerCommitState::InDoubt);
+        let before = audit.counts();
+        let attempt = owner.commit_attempt(token).unwrap().unwrap();
+        assert_eq!(attempt.txn_token(), token);
+        assert_eq!(audit.counts(), before);
+        assert!(matches!(erased.settle_commit(&cx).await, Err(FrankenError::BusyRecovery)));
+        drop(erased);
+        let mut replay = outcome_recovery(owner, &cx).await;
+        assert!(matches!(replay.resolve_commit(&cx, &attempt).await, Err(FrankenError::BusyRecovery)));
+        replay.prepare(&cx).await.unwrap();
+        let before = audit.counts();
+        assert_recovered_commit(replay.resolve_commit(&cx, &attempt).await.unwrap(), &attempt);
+
+        // This fails in the page layer BEFORE it enters generic replay. The
+        // lower replay's previous success must not authorize a page outcome.
+        let cancelled = Cx::new(); cancelled.cancel();
+        assert!(matches!(replay.prepare(&cancelled).await, Err(FrankenError::Interrupt)));
+        assert!(matches!(replay.resolve_commit(&cx, &attempt).await, Err(FrankenError::BusyRecovery)));
+        audit.hold_read.store(true, Ordering::SeqCst);
+        {
+            let mut future = std::pin::pin!(replay.prepare(&cx));
+            assert!(poll_fn(|task_cx| Poll::Ready(future.as_mut().poll(task_cx))).await.is_pending());
+        }
+        assert!(matches!(replay.resolve_commit(&cx, &attempt).await, Err(FrankenError::BusyRecovery)));
+        replay.prepare(&cx).await.unwrap();
+        audit.hold_read.store(true, Ordering::SeqCst);
+        {
+            let mut future = std::pin::pin!(replay.resolve_commit(&cx, &attempt));
+            assert!(poll_fn(|task_cx| Poll::Ready(future.as_mut().poll(task_cx))).await.is_pending());
+        }
+        assert_recovered_commit(replay.resolve_commit(&cx, &attempt).await.unwrap(), &attempt);
+        assert_eq!(&audit.counts()[1..], &before[1..]);
+        let (mut store, _) = replay.finish().unwrap();
+        assert!(store.commit_attempt(token).unwrap().is_none(), "new publisher has no old reply queue");
+        let mut reader = store.begin(&cx).unwrap();
+        assert_eq!(store.read_page(&cx, &mut reader, page(2)).unwrap().unwrap().as_ref(), &[0x71; 512]);
+        store.rollback(&mut reader).unwrap();
+        drop(reader);
+        let (mut physical, codec) = store.try_into_recovery()
+            .unwrap_or_else(|_| panic!("raw page owner must remain transferable"));
+        physical.prepare(&cx, |id, records| ready(codec.decode(&cx, id, &records).map(|_| ())))
+            .await.unwrap();
+        let mut replay = NativePageRecovery::with_shared_codec(
+            physical.finish().unwrap(), codec, 512, NativePageLimits::default());
+        replay.prepare(&cx).await.unwrap();
+        assert!(matches!(replay.resolve_commit(&cx, &attempt).await, Err(FrankenError::Abort)),
+            "installed publisher retires predecessor tickets even without a new write");
+        replay.close(&cx).unwrap();
+        assert!(matches!(replay.resolve_commit(&cx, &attempt).await, Err(FrankenError::BusyRecovery)));
+    });
+}
+
+#[test]
+fn commit_service_returns_resolvable_attempts_but_does_not_invent_one_for_unattempted_work() {
+    use fsqlite_pager::native_service::NativeCommitService;
+    run(async {
+        let cx = Cx::new(); let native = asupersync::Cx::current().unwrap();
+        cx.set_native_cx(native.clone());
+        let vfs = MemoryVfs::new(); let audit = Arc::new(Audit::default());
+        let owner = pager(&vfs, &cx, &audit);
+        let (sender, worker) = NativeCommitService::new(&owner, 3, 2).unwrap();
+        let mut tickets = Vec::new();
+        let mut tokens = Vec::new();
+        for number in 2_u8..=4 {
+            let mut txn = owner.begin(&cx, TransactionMode::Concurrent).unwrap();
+            txn.write_page(&cx, page(u32::from(number)), &[number; 512]).await.unwrap();
+            tokens.push(txn.txn_token());
+            tickets.push(sender.reserve(&native).await.unwrap().send(txn, 100).unwrap());
+        }
+        audit.fail_sync_at.store(2, Ordering::SeqCst);
+        sender.request_shutdown();
+        assert!(matches!(worker.run(&cx).await, Err(FrankenError::BusyRecovery)));
+        let before = audit.counts();
+        let mut attempts = Vec::new();
+        for (index, ticket) in tickets.iter_mut().enumerate() {
+            let completion = ticket.wait(&native).await.unwrap();
+            assert!(completion.result.is_err());
+            assert_eq!(completion.transaction.txn_token(), tokens[index]);
+            if index < 2 {
+                assert_eq!(completion.transaction.pager_commit_state(), PagerCommitState::InDoubt);
+                let attempt = completion.transaction.commit_attempt().unwrap().unwrap();
+                assert_eq!(attempt.txn_token(), tokens[index]);
+                assert!(owner.commit_attempt(tokens[index]).unwrap().is_some());
+                attempts.push(attempt);
+            } else {
+                assert_eq!(completion.transaction.pager_commit_state(), PagerCommitState::NotCommitted);
+                assert!(completion.transaction.commit_attempt().unwrap().is_none());
+                assert!(owner.commit_attempt(tokens[index]).unwrap().is_none());
+            }
+            assert!(completion.transaction.acknowledgement().is_none());
+        }
+        assert_eq!(audit.counts(), before, "capture did not replay accepted or unattempted work");
+        drop(tickets); drop(sender);
+        let mut replay = outcome_recovery(owner, &cx).await;
+        replay.prepare(&cx).await.unwrap();
+        for attempt in &attempts {
+            assert_recovered_commit(replay.resolve_commit(&cx, attempt).await.unwrap(), attempt);
+        }
+        let (store, report) = replay.finish().unwrap();
+        assert_eq!(report.markers.len(), 2);
+        let owner = NativePager::new(store).unwrap();
+        let mut reader = owner.begin(&cx, TransactionMode::ReadOnly).unwrap();
+        for number in 2_u8..=3 {
+            assert_eq!(reader.get_page(&cx, page(u32::from(number))).await.unwrap().as_bytes(), &[number; 512]);
+        }
+        assert!(reader.get_page(&cx, page(4)).await.is_err(), "unattempted overlay never published");
+        assert!(reader.commit_attempt().unwrap().is_none());
+        reader.rollback(&cx).await.unwrap();
+        owner.close(&cx).unwrap();
     });
 }

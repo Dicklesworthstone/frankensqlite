@@ -10,13 +10,32 @@ use std::sync::atomic::AtomicU64;
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
+use fsqlite_types::TxnToken;
 use fsqlite_vfs::VfsFile;
 
 use super::{NativePageLimits, NativePageStore, PageHistory, SharedCodec, corrupt};
-use crate::native_commit::durable::{NativeCoordinatorRecovery, NativeObjectCodec};
+use crate::native_commit::durable::{
+    NativeCommitAttempt, NativeCommitOutcome, NativeCoordinatorRecovery, NativeObjectCodec,
+};
 use crate::native_durability::{NativeDurabilityRecovery, NativeRecovery, RecoveredNativeLog};
 
 impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativePageStore<S, M, C> {
+    /// Capture an admitted attempt before relinquishing this live store.
+    ///
+    /// Use the original transaction's `token()` after an errored or dropped
+    /// commit returns ownership. This reads retained admission metadata only,
+    /// including while storage is indeterminate. The ticket owns no snapshot
+    /// pin and does not prevent `try_into_recovery` after handles are retired.
+    /// `None` means no retained reservation, not proof of commit or rollback;
+    /// completed page commits already delivered their acknowledgement.
+    ///
+    /// # Errors
+    /// Refuses started closes or inconsistent admission metadata. No I/O occurs.
+    pub fn commit_attempt(&self, token: TxnToken) -> Result<Option<NativeCommitAttempt>> {
+        if self.closed { return Err(FrankenError::BusyRecovery); }
+        self.driver.commit_attempt(token)
+    }
+
     /// Transfer a quiescent live store into caller-owned writeback recovery.
     ///
     /// Finish or drop every transaction first, including unread snapshots and
@@ -135,6 +154,31 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativePageRecovery<S, M, C> {
     #[must_use]
     pub const fn report(&self) -> &NativeDurabilityRecovery {
         self.replay.report()
+    }
+
+    /// Resolve an original page commit after full page-history preparation.
+    ///
+    /// Query before `finish`: installing a new live publisher retires old
+    /// tickets, even when its next transaction reuses the same identity.
+    /// Both physical recovery and the latest page/semantic replay must have
+    /// succeeded. No caller-supplied validator can bypass page observations,
+    /// tombstones, duplicate-token checks, authentication, or retention limits.
+    /// This reads the stored proof but never writes, retries, sends an old
+    /// reply, or changes an abandoned handle's indeterminate state.
+    ///
+    /// # Errors
+    /// Refuses unprepared/closed recovery and foreign/retired tickets. Retains
+    /// uncertainty for missing attempts behind torn tails, changed storage,
+    /// cancellation, and proof/authentication mismatches.
+    pub async fn resolve_commit(
+        &self,
+        cx: &Cx,
+        attempt: &NativeCommitAttempt,
+    ) -> Result<NativeCommitOutcome> {
+        // A failed page preflight may never enter the generic replay, so its
+        // previous prepared state alone cannot authorize a page-level outcome.
+        if self.prepared.is_none() { return Err(FrankenError::BusyRecovery); }
+        self.replay.resolve_commit(cx, attempt).await
     }
 
     /// Rebuild page state with mandatory capsule and read-version validation.

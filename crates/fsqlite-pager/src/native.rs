@@ -25,9 +25,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::sync_primitives::{RwLock, RwLockReadGuard};
-use fsqlite_types::{CommitSeq, PageData, PageNumber, PageSize};
+use fsqlite_types::{CommitSeq, PageData, PageNumber, PageSize, TxnToken};
 use fsqlite_vfs::{VfsFile, VfsWriteCompletion};
-use fsqlite_wal::native_commit::durable::{DurableCommitAcknowledgement, NativeObjectCodec};
+use fsqlite_wal::native_commit::durable::{
+    DurableCommitAcknowledgement, NativeCommitAttempt, NativeObjectCodec,
+};
 use fsqlite_wal::native_durability::NativeRecovery;
 use fsqlite_wal::native_pages::{
     NativePageSavepoint, NativePageStore, NativePageTransaction, NativePageTransactionState,
@@ -193,6 +195,22 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativePager<S, M, C> {
         Ok(store.outstanding_write())
     }
 
+    /// Capture a failed attempt retained by this pager's original publisher.
+    ///
+    /// Record `NativeTransaction::txn_token` before handing a transaction to
+    /// the VDBE dispatcher or commit service. After a failed/dropped commit
+    /// returns its owner, keep this opaque ticket before releasing the handles.
+    /// Tickets do not pin the shared pager or block `try_into_recovery`; resolve
+    /// them through `NativePageRecovery` after preparation and before finish.
+    /// `None` means no retained reservation, not evidence of an abort.
+    ///
+    /// # Errors
+    /// Returns Busy during publication, BusyRecovery after close begins, or
+    /// an admission-metadata error. Performs no storage or metadata I/O.
+    pub fn commit_attempt(&self, token: TxnToken) -> Result<Option<NativeCommitAttempt>> {
+        self.shared.read()?.commit_attempt(token)
+    }
+
     /// Move a uniquely owned, quiescent pager into physical recovery.
     ///
     /// Drop other pager clones, commit workers and every transaction handle
@@ -285,6 +303,25 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativeTransaction<S, M, C> {
     #[must_use]
     pub fn acknowledgement(&self) -> Option<&DurableCommitAcknowledgement> {
         self.acknowledgement.as_ref()
+    }
+
+    /// Original identity retained across dispatch, savepoints and failed commits.
+    /// This is scoped to this pager, not a globally unique commit receipt.
+    #[must_use]
+    pub fn txn_token(&self) -> TxnToken { self.transaction.borrow().token() }
+
+    /// Capture this handle's exact admitted attempt without changing its state.
+    ///
+    /// Call after a failed/dropped commit or on a commit-service completion.
+    /// Keep the ticket before dropping this handle to quiesce recovery. A
+    /// successful handle has its receipt in `acknowledgement`; read-only and
+    /// pre-admission-rejected work do not manufacture attempt tickets.
+    ///
+    /// # Errors
+    /// Returns publication contention, started-close or metadata errors.
+    /// No I/O, retry, rollback, or `InDoubt` state reset is performed.
+    pub fn commit_attempt(&self) -> Result<Option<NativeCommitAttempt>> {
+        self.shared.read()?.commit_attempt(self.txn_token())
     }
 
     fn active(&self) -> Result<()> {
