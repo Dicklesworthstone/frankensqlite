@@ -16,6 +16,55 @@ use super::{NativePageLimits, NativePageStore, PageHistory, SharedCodec, corrupt
 use crate::native_commit::durable::{NativeCoordinatorRecovery, NativeObjectCodec};
 use crate::native_durability::{NativeDurabilityRecovery, NativeRecovery, RecoveredNativeLog};
 
+impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativePageStore<S, M, C> {
+    /// Transfer a quiescent live store into caller-owned writeback recovery.
+    ///
+    /// Finish or drop every transaction first, including unread snapshots and
+    /// indeterminate handles. This consumes the old admission domain, not the
+    /// external namespace/append lease, which the caller must retain throughout.
+    /// No open, close, read, write, sync, rollback or retry occurs here.
+    ///
+    /// Both original streams, their acknowledged prefix and any outstanding
+    /// source-owned write completion move into `NativeRecovery`. A pending
+    /// write may transfer, but still prevents recovery I/O until it settles.
+    /// An indeterminate commit is resolved by actual marker/capsule replay;
+    /// discarding its old handle does not assert that the commit was aborted.
+    /// The returned Arc retains the exact codec, without copying secret keys.
+    /// After `prepare`/`finish`, use `NativePageRecovery::with_shared_codec`
+    /// with this store's page size and limits to rebuild usable transactions.
+    ///
+    /// # Errors
+    /// Returns the store while a transaction pin remains, close has begun, or
+    /// the coordinator still owns an undelivered acknowledgement. No handles
+    /// or queued obligations are discarded on refusal.
+    #[allow(clippy::result_large_err)] // Refusal must retain the live storage owner.
+    pub fn try_into_recovery(
+        self,
+    ) -> std::result::Result<(NativeRecovery<S, M>, Arc<C>), Self> {
+        if self.closed || self.active.iter().any(|lease| lease.strong_count() != 0) {
+            return Err(self);
+        }
+        let Self {
+            mut driver, codec, history, owner, active, next_txn_id,
+            page_high_water, recovery_required, closed,
+        } = self;
+        // Page admission precedes staging. Cancellation after a completed
+        // stage can leave the lower log healthy while this page attempt is
+        // indeterminate. Propagate that existing obligation, exactly as close
+        // does, instead of classifying its reservations as healthy queued work.
+        if recovery_required {
+            driver.abandon_batch();
+        }
+        match driver.try_into_recovery() {
+            Ok((recovery, _shared_codec)) => Ok((recovery, codec)),
+            Err(driver) => Err(Self {
+                driver, codec, history, owner, active, next_txn_id,
+                page_high_water, recovery_required, closed,
+            }),
+        }
+    }
+}
+
 struct PreparedPages {
     history: PageHistory,
     next_txn_id: u64,
@@ -169,3 +218,7 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativePageRecovery<S, M, C> {
         self.replay.close(cx)
     }
 }
+
+#[cfg(test)]
+#[path = "store_recovery_live_tests.rs"]
+mod live_transfer_tests;
