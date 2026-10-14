@@ -232,9 +232,27 @@ impl MemorySnapshotTransaction<'_> {
         self.inner.pager_commit_state()
     }
 
-    /// Commit once, then capture history. An error requires inspecting or
-    /// settling this same handle; it is not permission to repeat the write.
+    /// Commit this transaction, then return its history capture once.
+    ///
+    /// Retrying first settles the retained physical attempt. Only a proven
+    /// `NotCommitted` verdict permits another physical attempt on this same
+    /// transaction; pending durability never replays the write. Mutators stay
+    /// fenced until rejection is settled. Once the capture outcome has been
+    /// returned, use the trait method for an idempotent commit acknowledgement.
     pub async fn commit(&mut self, cx: &Cx) -> Result<MemorySnapshotCommit> {
+        if self.finished {
+            return Err(FrankenError::BusyRecovery);
+        }
+        if self.attempt.is_some() {
+            match self.settle_commit(cx).await? {
+                MemorySnapshotSettlement::Committed(outcome) => return Ok(outcome),
+                MemorySnapshotSettlement::Pending(_) => return Err(FrankenError::BusyRecovery),
+                // Settlement proved that no physical commit was accepted and
+                // restored the original write set. Revalidate its baseline and
+                // recapture the complete pending surface before trying again.
+                MemorySnapshotSettlement::NotCommitted => {}
+            }
+        }
         self.ensure_editable()?;
         if self.owner.pager.journal_mode() != JournalMode::Delete {
             return Err(FrankenError::Unsupported);
@@ -421,6 +439,13 @@ impl TransactionHandle for MemorySnapshotTransaction<'_> {
     }
 
     async fn commit<'a>(&'a mut self, cx: &'a Cx) -> Result<()> {
+        // A lost acknowledgement or a caller's final retry must not turn a
+        // committed transaction into a retryable SQL error. This also covers
+        // a terminal history-capture failure, without recapturing or issuing
+        // I/O. A rolled-back handle does NOT satisfy this predicate.
+        if self.finished && self.inner.pager_commit_state() == PagerCommitState::Committed {
+            return Ok(());
+        }
         report_trait_capture(MemorySnapshotTransaction::commit(self, cx).await?);
         Ok(())
     }
@@ -1185,6 +1210,230 @@ mod tests {
             }
             assert_eq!(owner.current().unwrap().sequence(), before.sequence());
             assert_live(&owner, &before).await;
+        });
+    }
+
+    /// Fill the real MemoryVfs budget with a delete-on-close scratch file.
+    /// Closing this file repairs the resource shortage without changing the
+    /// transaction, its pending pages, or the database's committed bytes.
+    async fn memory_budget_blocker(
+        cx: &Cx,
+    ) -> (MemoryPageSnapshots, fsqlite_vfs::memory::MemoryFile) {
+        use fsqlite_types::flags::VfsOpenFlags;
+        use fsqlite_vfs::{Vfs, VfsFile};
+
+        let bytes = PageSize::DEFAULT.as_usize();
+        let vfs = MemoryVfs::new_with_config(MemoryVfsConfig {
+            initial_reserve_bytes: bytes,
+            growth_chunk_bytes: bytes,
+            max_bytes: Some(8 * bytes),
+        });
+        let pager = SimplePager::open(
+            vfs.clone(), Path::new("/retry.db"), PageSize::DEFAULT,
+        ).await.unwrap();
+        let mut owner = MemoryPageSnapshots::new(pager);
+        {
+            let mut txn = owner.begin(cx, TransactionMode::ReadOnly).await.unwrap();
+            captured(txn.commit(cx).await.unwrap());
+        }
+        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE
+            | VfsOpenFlags::TEMP_DB | VfsOpenFlags::DELETEONCLOSE;
+        let (scratch, _) = vfs.open(cx, None, flags).unwrap();
+        let available = 8 * bytes - vfs.usage_snapshot().unwrap().reserved_bytes();
+        assert!(available >= bytes, "fixture must leave room for a temporary allocation");
+        scratch.write(cx, &vec![0x5a; available], 0).await.unwrap();
+        assert_eq!(vfs.usage_snapshot().unwrap().reserved_bytes(), 8 * bytes);
+        (owner, scratch)
+    }
+
+    #[test]
+    fn rejected_commit_retries_the_same_pages_after_memory_budget_is_released() {
+        use fsqlite_vfs::VfsFile;
+
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let (mut owner, mut scratch) = memory_budget_blocker(&cx).await;
+            let before = owner.current().unwrap().clone();
+            let (page, after) = {
+                let mut txn = owner.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                let page = append(&mut txn, 0xc1).await;
+                let pending = txn.inner.pending_commit_pages().unwrap();
+                for _ in 0..2 {
+                    let error = TransactionHandle::commit(&mut txn, &cx).await.unwrap_err();
+                    assert!(matches!(&error, FrankenError::OutOfMemory), "{error}");
+                    assert_eq!(txn.pager_commit_state(), PagerCommitState::NotCommitted);
+                    assert!(txn.attempt.is_some());
+                    assert!(txn.owner.current.is_none());
+                    assert_eq!(txn.owner.pager.published_snapshot().visible_commit_seq,
+                        before.sequence());
+                    assert_eq!(txn.inner.pending_commit_pages().unwrap(), pending);
+                    assert_frozen(&mut txn, &cx, page).await;
+                }
+                // Even retry futures remain lazy. Constructing and dropping
+                // one must not clear the receipt or reopen mutation admission.
+                drop(TransactionHandle::commit(&mut txn, &cx));
+                drop(TransactionHandle::commit_and_retain(&mut txn, &cx));
+                assert!(txn.attempt.is_some());
+                assert!(txn.owner.current.is_none());
+                assert!(txn.transaction_mut().is_err());
+                scratch.close(&cx).unwrap();
+                drop(scratch);
+                // No new SQL/page mutation and no explicit settlement call.
+                let after = captured(txn.commit(&cx).await.unwrap());
+                assert_eq!(txn.pager_commit_state(), PagerCommitState::Committed);
+                assert_frozen(&mut txn, &cx, page).await;
+                (page, after)
+            };
+            assert_eq!(after.sequence().get(), before.sequence().get() + 1);
+            assert_eq!(after.db_size(), page.get());
+            assert_eq!(after.get_page(page).unwrap().as_bytes()[0], 0xc1);
+            assert!(before.get_page(page).is_none());
+            assert!(!after.capture_stats().full_capture);
+            assert_live(&owner, &after).await;
+        });
+    }
+
+    #[test]
+    fn rejected_commit_retry_can_still_roll_back_without_publishing() {
+        use fsqlite_vfs::VfsFile;
+
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let (mut owner, mut scratch) = memory_budget_blocker(&cx).await;
+            let before = owner.current().unwrap().clone();
+            {
+                let mut txn = owner.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                let page = append(&mut txn, 0xc2).await;
+                for _ in 0..2 {
+                    assert!(matches!(txn.commit(&cx).await, Err(FrankenError::OutOfMemory)));
+                }
+                txn.rollback(&cx).await.unwrap();
+                assert_frozen(&mut txn, &cx, page).await;
+                assert!(TransactionHandle::commit(&mut txn, &cx).await.is_err());
+                assert!(TransactionHandle::commit_and_retain(&mut txn, &cx).await.is_err());
+                assert_eq!(txn.pager_commit_state(), PagerCommitState::NotCommitted);
+            }
+            scratch.close(&cx).unwrap();
+            drop(scratch);
+            assert_eq!(owner.current().unwrap().sequence(), before.sequence());
+            assert_live(&owner, &before).await;
+        });
+    }
+
+    #[test]
+    fn commit_retry_settles_the_actual_post_commit_boundary_without_replay() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let mut owner = owner().await;
+            let (hot, before) = {
+                let mut txn = owner.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                let hot = append(&mut txn, 0xc3).await;
+                (hot, captured(txn.commit(&cx).await.unwrap()))
+            };
+            let after = {
+                let mut txn = owner.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                overwrite(&mut txn, hot, 0xc4).await;
+                // The same protocol seam as the existing settlement keeper:
+                // retain a real page receipt and perform an actual commit,
+                // stopping before the optional history reader is opened.
+                txn.attempt = Some(CommitAttempt {
+                    pages: txn.inner.pending_commit_pages().unwrap(),
+                    has_writes: true,
+                });
+                txn.owner.current = None;
+                txn.inner.commit(&cx).await.unwrap();
+                let visible = txn.owner.pager.published_snapshot().visible_commit_seq;
+                let after = captured(txn.commit(&cx).await.unwrap());
+                assert_eq!(after.sequence(), visible);
+                assert_eq!(after.capture_stats(), PageImageCaptureStats {
+                    full_capture: false, pages_read: 2,
+                });
+                assert_frozen(&mut txn, &cx, hot).await;
+                after
+            };
+            assert_eq!(after.sequence().get(), before.sequence().get() + 1);
+            assert_eq!(before.get_page(hot).unwrap().as_bytes()[0], 0xc3);
+            assert_eq!(after.get_page(hot).unwrap().as_bytes()[0], 0xc4);
+            assert_live(&owner, &after).await;
+        });
+    }
+
+    #[test]
+    fn terminal_generic_commit_acknowledgements_do_not_repeat_capture_or_io() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let mut owner = owner().await;
+            {
+                let mut txn = owner.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                let hot = append(&mut txn, 0xc5).await;
+                generic_commit(txn.transaction_mut().unwrap(), &cx).await;
+                let before = txn.owner.current.as_ref().unwrap().clone();
+                let cancelled = Cx::new();
+                cancelled.cancel();
+                for _ in 0..3 {
+                    TransactionHandle::commit(&mut txn, &cancelled).await.unwrap();
+                    assert!(!TransactionHandle::commit_and_retain(&mut txn, &cancelled).await.unwrap());
+                }
+                assert!(std::ptr::eq(before.get_page(hot).unwrap(),
+                    txn.owner.current.as_ref().unwrap().get_page(hot).unwrap()));
+                assert_eq!(txn.owner.pager.published_snapshot().visible_commit_seq, before.sequence());
+                assert_frozen(&mut txn, &cx, hot).await;
+            }
+            let before = owner.current().unwrap().clone();
+            {
+                let mut reader = owner.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+                TransactionHandle::commit(&mut reader, &cx).await.unwrap();
+                TransactionHandle::commit(&mut reader, &cx).await.unwrap();
+                assert_eq!(reader.owner.current.as_ref().unwrap().sequence(), before.sequence());
+                assert_eq!(reader.owner.current.as_ref().unwrap().capture_stats().pages_read, 0);
+            }
+            assert_live(&owner, &before).await;
+        });
+    }
+
+    #[test]
+    fn commit_retry_after_peer_publication_keeps_capture_failure_nonretryable() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let mut owner = owner().await;
+            let hot = {
+                let mut txn = owner.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                let hot = append(&mut txn, 0xc6).await;
+                captured(txn.commit(&cx).await.unwrap());
+                hot
+            };
+            {
+                let mut txn = owner.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                overwrite(&mut txn, hot, 0xc7).await;
+                txn.attempt = Some(CommitAttempt {
+                    pages: txn.inner.pending_commit_pages().unwrap(),
+                    has_writes: true,
+                });
+                txn.owner.current = None;
+                txn.inner.commit(&cx).await.unwrap();
+                let mut peer = txn.owner.pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                peer.write_page(&cx, hot, &vec![0xc8; PageSize::DEFAULT.as_usize()]).await.unwrap();
+                peer.commit(&cx).await.unwrap();
+                drop(peer);
+                let visible = txn.owner.pager.published_snapshot().visible_commit_seq;
+                TransactionHandle::commit(&mut txn, &cx).await.unwrap();
+                assert!(txn.owner.current.is_none(), "never label the peer's image as our commit");
+                let cancelled = Cx::new();
+                cancelled.cancel();
+                TransactionHandle::commit(&mut txn, &cancelled).await.unwrap();
+                assert!(!TransactionHandle::commit_and_retain(&mut txn, &cancelled).await.unwrap());
+                assert_eq!(txn.owner.pager.published_snapshot().visible_commit_seq, visible);
+                assert!(txn.owner.current.is_none());
+                assert!(txn.rollback(&cx).await.is_err());
+                assert_frozen(&mut txn, &cx, hot).await;
+            }
+            let latest = {
+                let mut reader = owner.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+                assert!(reader.baseline_capture_stats().full_capture);
+                captured(reader.commit(&cx).await.unwrap())
+            };
+            assert_eq!(latest.get_page(hot).unwrap().as_bytes()[0], 0xc8);
+            assert_live(&owner, &latest).await;
         });
     }
 
