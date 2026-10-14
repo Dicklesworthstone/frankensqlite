@@ -24,9 +24,11 @@ use super::{
 
 const PLAN_MAGIC: &[u8; 8] = b"FNPLAN01";
 const OBJECT_MAGIC: &[u8; 8] = b"FNOBJS01";
+const REQUEST_MAGIC: &[u8; 8] = b"FNNEED01";
 const AUTH_DOMAIN: &[u8] = b"frankensqlite/native-replication/transport/v1\0";
 const PLAN_HEADER: usize = 56;
 const OBJECT_HEADER: usize = 60;
+const REQUEST_HEADER: usize = 44;
 const TAG_BYTES: usize = 32;
 const MAX_COMMITS: usize = 128;
 
@@ -105,6 +107,64 @@ pub struct NativeReplicationPlan {
 }
 
 impl NativeReplicationPlan {
+    /// Authenticate a receiver's missing-object request for this exact plan.
+    ///
+    /// Pass the configured replication key, not a key obtained from the request.
+    /// Only strictly ordered, unique members of this plan's inventory can be
+    /// requested. The returned IDs can be passed to `export_replication_object`
+    /// one at a time; no source handle is needed to decode this request itself.
+    /// An empty request says no payloads are requested, NOT that publication
+    /// has succeeded. Replayed requests may resend data; object stages deduplicate.
+    ///
+    /// Authentication, plan binding, counts and exact length are checked before
+    /// allocating the result. The plan's byte/object limits bound the request;
+    /// arbitrary paths, physical offsets and caller-provided inventories are
+    /// never interpreted. Routing, delivery and peer admission remain external.
+    ///
+    /// # Errors
+    /// Rejects wrong keys/plans, nonmembers, duplicates, ordering, malformed or
+    /// excessive lengths, allocation failure and cancellation.
+    pub fn requested_object_ids(
+        &self,
+        cx: &Cx,
+        bytes: &[u8],
+        key: &[u8; 32],
+        limits: NativeReplicationLimits,
+    ) -> Result<Vec<ObjectId>> {
+        self.validate(cx, limits)?;
+        let body = authenticate(cx, bytes, key, limits.max_plan_bytes)?;
+        if let Some(signer) = self.signer {
+            if signer != mac(cx, key, &self.binding)? {
+                return Err(corrupt("native request signing key differs from its plan"));
+            }
+        }
+        let mut input = Reader(body);
+        if input.array::<8>()? != *REQUEST_MAGIC || input.array::<32>()? != self.binding {
+            return Err(corrupt("native missing-object request belongs to another plan"));
+        }
+        let count = usize::try_from(u32::from_le_bytes(input.array()?))
+            .map_err(|_| FrankenError::TooBig)?;
+        if count > self.objects.len() || request_len(count)? != bytes.len() {
+            return Err(corrupt("native missing-object request count or length mismatch"));
+        }
+        let mut requested = Vec::new();
+        requested.try_reserve_exact(count).map_err(|_| FrankenError::OutOfMemory)?;
+        let mut previous = None;
+        for _ in 0..count {
+            checkpoint(cx)?;
+            let id = ObjectId::from_bytes(input.array()?);
+            if previous.is_some_and(|previous| previous >= id)
+                || self.objects.binary_search(&id).is_err()
+            {
+                return Err(corrupt("noncanonical or unlisted native object request"));
+            }
+            requested.push(id);
+            previous = Some(id);
+        }
+        checkpoint(cx)?;
+        Ok(requested)
+    }
+
     #[must_use]
     pub const fn database(&self) -> ObjectId { self.database }
     #[must_use]
@@ -456,6 +516,40 @@ impl<S: VfsFile, M: VfsFile> NativeReplicationReceiver<'_, S, M> {
     #[must_use]
     pub fn outstanding_write(&self) -> Option<VfsWriteCompletion> { self.destination.outstanding_write() }
 
+    /// Encode the unresolved inventory as an authenticated request to the sender.
+    /// Call after optional local reuse; only missing IDs are encoded, using this
+    /// plan's binding and signing key. The sender uses `requested_object_ids` on
+    /// its retained plan, then exports only those objects. No payloads, storage
+    /// writes, synchronization or source handles are needed here.
+    ///
+    /// An empty request is allowed but is not a durability acknowledgement.
+    /// Reusing or receiving more objects after creating a request can make it
+    /// redundant; ordinary stage deduplication still handles retransmission.
+    /// The encoded request fits `max_plan_bytes` and the existing inventory bound.
+    ///
+    /// # Errors
+    /// Rejects wrong signing keys, unavailable storage, cancellation and limits.
+    pub fn missing_object_request(&self, cx: &Cx, key: &[u8; 32]) -> Result<Vec<u8>> {
+        checkpoint(cx)?;
+        self.destination.ready()?;
+        if self.plan.signer != Some(mac(cx, key, &self.plan.binding)?) {
+            return Err(corrupt("native request signing key differs from its plan"));
+        }
+        let count = self.missing_object_ids().count();
+        let len = request_len(count)?;
+        if len > self.limits.max_plan_bytes { return Err(FrankenError::TooBig); }
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(len).map_err(|_| FrankenError::OutOfMemory)?;
+        bytes.extend_from_slice(REQUEST_MAGIC);
+        bytes.extend_from_slice(&self.plan.binding);
+        bytes.extend_from_slice(&u32::try_from(count).map_err(|_| FrankenError::TooBig)?.to_le_bytes());
+        for id in self.missing_object_ids() {
+            checkpoint(cx)?;
+            bytes.extend_from_slice(id.as_bytes());
+        }
+        seal(cx, bytes, key)
+    }
+
     /// Objects still requiring a message or successful local verification.
     ///
     /// This borrowed, ordered inventory allocates nothing. An indexed object
@@ -736,6 +830,11 @@ fn plan_len(commits: usize, objects: usize) -> Result<usize> {
         .and_then(|n| objects.checked_mul(16).and_then(|m| n.checked_add(m)))
         .and_then(|n| n.checked_add(PLAN_HEADER + TAG_BYTES)).ok_or(FrankenError::TooBig)
 }
+fn request_len(objects: usize) -> Result<usize> {
+    objects.checked_mul(ObjectId::LEN)
+        .and_then(|bytes| bytes.checked_add(REQUEST_HEADER + TAG_BYTES))
+        .ok_or(FrankenError::TooBig)
+}
 fn count(value: usize) -> Result<u32> { u32::try_from(value).map_err(|_| FrankenError::TooBig) }
 fn mac(cx: &Cx, key: &[u8; 32], bytes: &[u8]) -> Result<blake3::Hash> {
     let mut hasher = blake3::Hasher::new_keyed(key);
@@ -945,7 +1044,7 @@ mod tests {
             let message = source.export_replication_object(&cx, &plan, id, &KEY, limits).await.unwrap();
             let wrong_plan = source.export_replication_object(&cx, &other, id, &KEY, limits).await.unwrap();
             let other_key = [0x60; 32];
-            let wrong_signer = source.export_replication_object(&cx, &other, id, &other_key, limits).await.unwrap();
+            let wrong_signer = source.export_replication_object(&cx, &plan, id, &other_key, limits).await.unwrap();
             let replica_vfs = MemoryVfs::new(); let mut replica = log(&replica_vfs, &cx);
             let wire = plan.to_bytes(&cx, &KEY, limits).unwrap();
             let mut receiver = replica.receive_replication_plan(&cx, decode(&cx, &wire), limits).await.unwrap().unwrap();
@@ -1459,6 +1558,169 @@ mod tests {
                 assert_eq!(bytes(&destination.symbols, &cx).await, before);
                 assert_eq!(destination.published_tip(), CommitSeq::new(1));
                 destination.close(&cx).unwrap();
+            });
+        }
+
+        #[test]
+        fn missing_requests_select_only_unverified_members_and_empty_is_not_an_ack() {
+            run(async {
+                let cx = Cx::new();
+                let source_vfs = MemoryVfs::new(); let mut source = log(&source_vfs, &cx);
+                for _ in 0..2 { append_proof(&mut source, &cx, |_| {}).await; }
+                let limits = NativeReplicationLimits::default();
+                let plan = source.export_replication_plan(&cx, DB, NativeReplicationCursor::genesis(), 2, limits)
+                    .await.unwrap().unwrap();
+                let dest_vfs = MemoryVfs::new(); let mut destination = log(&dest_vfs, &cx);
+                let local = plan.object_ids().next().unwrap();
+                destination.append_symbols(&cx, &source.read_object(&cx, local).await.unwrap()).await.unwrap();
+                let mut receiver = destination.receive_replication_plan(
+                    &cx, decode(&cx, &plan.to_bytes(&cx, &KEY, limits).unwrap()), limits,
+                ).await.unwrap().unwrap();
+                assert_eq!(receiver.reuse_available_objects(&cx, &Codec).await.unwrap(), 1);
+                let request = receiver.missing_object_request(&cx, &KEY).unwrap();
+                let requested = plan.requested_object_ids(&cx, &request, &KEY, limits).unwrap();
+                assert_eq!(requested, receiver.missing_object_ids().collect::<Vec<_>>());
+                assert_eq!(requested.len(), 3); assert!(!requested.contains(&local));
+                for id in requested {
+                    let message = source.export_replication_object(&cx, &plan, id, &KEY, limits).await.unwrap();
+                    receiver.stage_object(&cx, &message, &KEY).await.unwrap();
+                }
+                let empty = receiver.missing_object_request(&cx, &KEY).unwrap();
+                assert_eq!(empty.len(), REQUEST_HEADER + TAG_BYTES);
+                assert!(plan.requested_object_ids(&cx, &empty, &KEY, limits).unwrap().is_empty());
+                assert_eq!(receiver.destination.published_tip(), CommitSeq::ZERO);
+                assert_eq!(receiver.destination.markers.file_size(&cx).unwrap(), 0);
+                source.close(&cx).unwrap(); drop(source);
+                let receipt = receiver.finish_validated(&cx, &Codec, |_, _| Ok(())).await.unwrap();
+                assert_eq!(receipt.commits, 2); assert_eq!(destination.record_count, 4);
+                destination.close(&cx).unwrap();
+            });
+        }
+
+        #[test]
+        fn missing_requests_reject_wrong_keys_plans_counts_and_noncanonical_inventories() {
+            run(async {
+                let cx = Cx::new();
+                let source_vfs = MemoryVfs::new(); let mut source = log(&source_vfs, &cx);
+                for _ in 0..2 { append_proof(&mut source, &cx, |_| {}).await; }
+                let limits = NativeReplicationLimits::default();
+                let plan = source.export_replication_plan(&cx, DB, NativeReplicationCursor::genesis(), 1, limits)
+                    .await.unwrap().unwrap();
+                let other = source.export_replication_plan(&cx, DB, NativeReplicationCursor::genesis(), 2, limits)
+                    .await.unwrap().unwrap();
+                let dest_vfs = MemoryVfs::new(); let mut destination = log(&dest_vfs, &cx);
+                let receiver = destination.receive_replication_plan(
+                    &cx, decode(&cx, &plan.to_bytes(&cx, &KEY, limits).unwrap()), limits,
+                ).await.unwrap().unwrap();
+                let wire = receiver.missing_object_request(&cx, &KEY).unwrap();
+                assert!(other.requested_object_ids(&cx, &wire, &KEY, limits).is_err());
+                assert!(plan.requested_object_ids(&cx, &wire, &[7; 32], limits).is_err());
+                assert!(receiver.missing_object_request(&cx, &[7; 32]).is_err());
+                for end in 0..wire.len() {
+                    assert!(plan.requested_object_ids(&cx, &wire[..end], &KEY, limits).is_err(), "end={end}");
+                }
+                for case in 0..7 {
+                    let mut body = wire[..wire.len() - TAG_BYTES].to_vec();
+                    match case {
+                        0 => body[0] ^= 1,
+                        1 => body[8] ^= 1,
+                        2 => body[40..44].copy_from_slice(&u32::MAX.to_le_bytes()),
+                        3 => {
+                            let first: [u8; 16] = body[44..60].try_into().unwrap();
+                            body[60..76].copy_from_slice(&first);
+                        }
+                        4 => {
+                            let first: [u8; 16] = body[44..60].try_into().unwrap();
+                            let second: [u8; 16] = body[60..76].try_into().unwrap();
+                            body[44..60].copy_from_slice(&second); body[60..76].copy_from_slice(&first);
+                        }
+                        5 => body[44..60].copy_from_slice(DB.as_bytes()),
+                        6 => body.push(0),
+                        _ => unreachable!(),
+                    }
+                    let malformed = seal(&cx, body, &KEY).unwrap();
+                    assert!(plan.requested_object_ids(&cx, &malformed, &KEY, limits).is_err(), "case={case}");
+                }
+                let cancelled = Cx::new(); cancelled.cancel();
+                assert!(matches!(receiver.missing_object_request(&cancelled, &KEY), Err(FrankenError::Interrupt)));
+                assert!(matches!(plan.requested_object_ids(&cancelled, &wire, &KEY, limits), Err(FrankenError::Interrupt)));
+                let tiny = NativeReplicationLimits { max_plan_bytes: wire.len() - 1, ..limits };
+                assert!(plan.requested_object_ids(&cx, &wire, &KEY, tiny).is_err());
+                assert_eq!(receiver.destination.symbols.file_size(&cx).unwrap(), 0);
+                assert_eq!(receiver.destination.markers.file_size(&cx).unwrap(), 0);
+                assert_eq!(receiver.missing_object_ids().count(), 4);
+                drop(receiver);
+                destination.close(&cx).unwrap(); source.close(&cx).unwrap();
+            });
+        }
+
+        #[cfg(feature = "native")]
+        #[test]
+        fn missing_requests_reuse_authenticated_raptorq_survivors_and_publish_exact_pages() {
+            use crate::native_commit::durable::codec::RaptorQNativeCodec;
+            use crate::native_pages::{NativePageLimits, NativePageRecovery, NativePageStore};
+
+            run(async {
+                let cx = Cx::new(); cx.set_native_cx(asupersync::Cx::current().unwrap());
+                let source_vfs = MemoryVfs::new();
+                let mut store = NativePageStore::new(log(&source_vfs, &cx),
+                    RaptorQNativeCodec::new(Some([0x7B; 32])), 512, NativePageLimits::default()).unwrap();
+                let mut tx = store.begin(&cx).unwrap();
+                for n in 2..=20 {
+                    store.write_page(&cx, &mut tx, PageNumber::new(n).unwrap(),
+                        Some(&[u8::try_from(n).unwrap(); 512])).unwrap();
+                }
+                store.commit(&cx, &mut tx, 100).await.unwrap(); drop(tx);
+                let (mut physical, codec) = store.try_into_recovery().ok().unwrap();
+                physical.prepare(&cx, |id, records| ready(codec.decode(&cx, id, &records).map(|_| ())))
+                    .await.unwrap();
+                let (mut source, _) = physical.finish().unwrap().into_log();
+                let limits = NativeReplicationLimits::default();
+                let plan = source.export_replication_plan(&cx, DB, NativeReplicationCursor::genesis(), 1, limits)
+                    .await.unwrap().unwrap();
+                let dest_vfs = MemoryVfs::new(); let mut destination = log(&dest_vfs, &cx);
+                let mut retained = 0;
+                for id in plan.object_ids() {
+                    let mut records = source.read_object(&cx, id).await.unwrap();
+                    let original = codec.decode(&cx, id, &records).unwrap();
+                    assert!(records.iter().any(|record| record.esi & (1 << 31) != 0));
+                    let systematic = records.iter().position(|record| record.esi & (1 << 31) == 0).unwrap();
+                    records.remove(systematic);
+                    assert_eq!(codec.decode(&cx, id, &records).unwrap(), original);
+                    retained += records.len();
+                    // Existing local cache holds real surviving authenticated envelopes,
+                    // not a replay bit or a fabricated reconstruction result.
+                    destination.append_symbols(&cx, &records).await.unwrap();
+                }
+                let before = bytes(&destination.symbols, &cx).await;
+                let wire = plan.to_bytes(&cx, &KEY, limits).unwrap();
+                source.close(&cx).unwrap(); drop(source);
+                let mut receiver = destination.receive_replication_plan(&cx, decode(&cx, &wire), limits)
+                    .await.unwrap().unwrap();
+                let wrong = RaptorQNativeCodec::new(Some([0x7C; 32]));
+                assert!(receiver.reuse_available_objects(&cx, &wrong).await.is_err());
+                assert_eq!(receiver.missing_object_ids().count(), plan.object_ids().len());
+                assert_eq!(receiver.reuse_available_objects(&cx, codec.as_ref()).await.unwrap(), plan.object_ids().len());
+                let request = receiver.missing_object_request(&cx, &KEY).unwrap();
+                assert!(plan.requested_object_ids(&cx, &request, &KEY, limits).unwrap().is_empty());
+                let (receipt, image) = receiver.finish_page_snapshot(&cx, codec.as_ref(), 512, NativePageLimits::default())
+                    .await.unwrap();
+                assert_eq!(receipt.commits, 1); assert_eq!(image.page_count(), 19);
+                for n in 2..=20 {
+                    assert_eq!(image.read_page(PageNumber::new(n).unwrap()).unwrap().as_ref(),
+                        &[u8::try_from(n).unwrap(); 512]);
+                }
+                assert_eq!(destination.record_count, retained);
+                assert_eq!(bytes(&destination.symbols, &cx).await, before);
+                let mut recovery = destination.into_recovery();
+                recovery.prepare(&cx, |id, records| ready(codec.decode(&cx, id, &records).map(|_| ())))
+                    .await.unwrap();
+                let mut pages = NativePageRecovery::with_shared_codec(recovery.finish().unwrap(),
+                    codec, 512, NativePageLimits::default());
+                let reopened = pages.prepare_snapshot(&cx, CommitSeq::new(1)).await.unwrap();
+                assert_eq!(reopened.page_count(), image.page_count());
+                for page in image.page_numbers() { assert_eq!(reopened.read_page(page), image.read_page(page)); }
+                pages.close(&cx).unwrap();
             });
         }
 
