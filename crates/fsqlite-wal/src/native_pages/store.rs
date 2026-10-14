@@ -6,6 +6,10 @@
 //! The caller retains the native log's namespace/append lease, including while
 //! an abandoned tracked write settles. The store never creates or deletes files.
 
+#[path = "store_recovery.rs"]
+mod recovery;
+pub use recovery::NativePageRecovery;
+
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ops::Bound::{Excluded, Unbounded};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -705,6 +709,8 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativePageStore<S, M, C> {
     /// invented, no file is truncated, and public SQL native mode is not enabled.
     /// The caller retains namespace/append-owner authority continuously through
     /// recovery, this handoff, and subsequent use.
+    /// For retryable semantic replay that retains the original handles after
+    /// cancellation, errors or dropped reads, use [`NativePageRecovery`].
     ///
     /// # Errors
     /// Propagates cancellation, storage reads, codec and bound-proof failures;

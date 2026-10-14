@@ -12,8 +12,8 @@
 
 mod store;
 pub use store::{
-    MAX_NATIVE_SAVEPOINTS, NativePageLimits, NativePageSavepoint, NativePageStore,
-    NativePageTransaction, NativePageTransactionState,
+    MAX_NATIVE_SAVEPOINTS, NativePageLimits, NativePageRecovery, NativePageSavepoint,
+    NativePageStore, NativePageTransaction, NativePageTransactionState,
 };
 
 use std::sync::Arc;
