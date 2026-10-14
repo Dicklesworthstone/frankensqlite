@@ -456,6 +456,104 @@ impl<S: VfsFile, M: VfsFile> NativeReplicationReceiver<'_, S, M> {
     #[must_use]
     pub fn outstanding_write(&self) -> Option<VfsWriteCompletion> { self.destination.outstanding_write() }
 
+    /// Objects still requiring a message or successful local verification.
+    ///
+    /// This borrowed, ordered inventory allocates nothing. An indexed object
+    /// is not automatically available: `reuse_object` must decode its actual
+    /// stored bytes first. The caller routes requests for these IDs under the
+    /// same authenticated plan; this iterator is not a wire message or receipt.
+    pub fn missing_object_ids(&self) -> impl Iterator<Item = ObjectId> + '_ {
+        self.plan.objects.iter().zip(&self.received)
+            .filter_map(|(id, received)| (!*received).then_some(*id))
+    }
+
+    /// Satisfy one plan entry using an independently verified local object.
+    ///
+    /// Use the same identity/authentication codec as final publication. This
+    /// re-reads the existing envelopes and requires complete reconstruction;
+    /// index membership, a checksum, or a previous stage receipt is not enough.
+    /// A recoverable subset of RaptorQ symbols is sufficient, without inventing
+    /// missing redundancy. No object message, source handle, append or sync is
+    /// needed. Storage/codec limits apply; the network-message size bound does
+    /// not apply to data that never crosses the transport.
+    ///
+    /// `false` means the ID has no indexed symbols and needs a message. Errors
+    /// (including insufficient rank, authentication, I/O and cancellation) are
+    /// NOT turned into cache misses. The entry stays missing on every failed
+    /// or dropped polled attempt, including revalidation of a staged entry.
+    /// The receiver can accept a valid message or retry local verification;
+    /// an uncertain physical write still requires original-handle recovery.
+    ///
+    /// This is only inventory admission. Finalizers still re-read referents,
+    /// validate the selected history, and perform the usual durability barriers.
+    /// The caller must continuously retain the destination namespace/append
+    /// lease; successful verification does not freeze external file writers.
+    ///
+    /// # Errors
+    /// Rejects unlisted objects, unavailable storage, changed stream lengths,
+    /// malformed/undecodable objects, wrong keys, limits and cancellation.
+    pub async fn reuse_object<C: NativeObjectCodec>(
+        &mut self,
+        cx: &Cx,
+        id: ObjectId,
+        codec: &C,
+    ) -> Result<bool> {
+        let index = self.plan.objects.binary_search(&id)
+            .map_err(|_| corrupt("unlisted locally reused object"))?;
+        // Revalidation cannot leave an older successful bit authorizing finish
+        // after the current read/decode fails or its borrowed future is dropped.
+        self.received[index] = false;
+        checkpoint(cx)?;
+        self.destination.ready()?;
+        self.destination.check_lengths(cx)?;
+        if !self.destination.index.contains_key(&id) {
+            return Ok(false);
+        }
+        let records = self.destination.read_object(cx, id).await?;
+        let payload = codec.decode(cx, id, &records)?;
+        if payload.is_empty() || payload.len() > self.destination.limits.max_batch_bytes {
+            return Err(FrankenError::TooBig);
+        }
+        // Do not retain decoded payloads across inventory entries. The codec
+        // enforces its identity/profile and scratch bounds, as in publication.
+        drop(payload);
+        self.destination.check_lengths(cx)?;
+        checkpoint(cx)?;
+        self.received[index] = true;
+        Ok(true)
+    }
+
+    /// Verify unresolved local entries one object at a time, returning the
+    /// number newly reused by this call. Request only `missing_object_ids`
+    /// afterward. Completed message stages and previous verified entries are
+    /// skipped; a fresh receiver re-verifies them after recovery or a new plan.
+    ///
+    /// Earlier successes remain recorded on error/cancellation, but the failing
+    /// entry remains missing. No error is suppressed as an absent object. This
+    /// scans the plan inventory and reads locally present objects; it is not
+    /// constant-work catch-up or a reduction in final semantic replay work.
+    ///
+    /// # Errors
+    /// Propagates the first `reuse_object` error without publishing any marker.
+    pub async fn reuse_available_objects<C: NativeObjectCodec>(
+        &mut self,
+        cx: &Cx,
+        codec: &C,
+    ) -> Result<usize> {
+        checkpoint(cx)?;
+        self.destination.ready()?;
+        let mut reused = 0;
+        for index in 0..self.plan.objects.len() {
+            checkpoint(cx)?;
+            if !self.received[index]
+                && self.reuse_object(cx, self.plan.objects[index], codec).await?
+            {
+                reused += 1;
+            }
+        }
+        Ok(reused)
+    }
+
     /// Authenticate and bound an object message before its first storage read
     /// or write. Messages may arrive out of order or repeat. Exact duplicate
     /// envelopes reuse existing locators; conflicting OTI/ESI bytes are refused.
@@ -579,7 +677,7 @@ impl<S: VfsFile, M: VfsFile> NativeReplicationReceiver<'_, S, M> {
         Ok((last.commit_seq, last.commit_time_unix_ns))
     }
 
-    /// Verify and publish only after every inventory entry has been received.
+    /// Verify and publish after every entry is received or locally verified.
     /// Referents are re-read from the destination by the existing two-barrier
     /// publisher. The mandatory verifier must enforce decoding, canonical
     /// identity, object authentication and transitive evidence, as for publish.
@@ -847,7 +945,7 @@ mod tests {
             let message = source.export_replication_object(&cx, &plan, id, &KEY, limits).await.unwrap();
             let wrong_plan = source.export_replication_object(&cx, &other, id, &KEY, limits).await.unwrap();
             let other_key = [0x60; 32];
-            let wrong_signer = source.export_replication_object(&cx, &plan, id, &other_key, limits).await.unwrap();
+            let wrong_signer = source.export_replication_object(&cx, &other, id, &other_key, limits).await.unwrap();
             let replica_vfs = MemoryVfs::new(); let mut replica = log(&replica_vfs, &cx);
             let wire = plan.to_bytes(&cx, &KEY, limits).unwrap();
             let mut receiver = replica.receive_replication_plan(&cx, decode(&cx, &wire), limits).await.unwrap().unwrap();
@@ -1139,6 +1237,228 @@ mod tests {
                     assert!(destination.needs_recovery());
                     destination.close(&cx).unwrap(); source.close(&cx).unwrap();
                 }
+            });
+        }
+
+        #[test]
+        fn local_reuse_requests_only_new_objects_without_skipping_history_validation() {
+            run(async {
+                let cx = Cx::new();
+                let source_vfs = MemoryVfs::new(); let mut source = log(&source_vfs, &cx);
+                let dest_vfs = MemoryVfs::new(); let mut destination = log(&dest_vfs, &cx);
+                append_proof(&mut source, &cx, |_| {}).await;
+                receive(&mut source, &mut destination, &cx, 1).await
+                    .finish_validated(&cx, &Codec, |_, _| Ok(())).await.unwrap();
+                append_proof(&mut source, &cx, |_| {}).await;
+                let limits = NativeReplicationLimits::default();
+                let base = destination.replication_cursor(&cx).await.unwrap();
+                let plan = source.export_replication_plan(&cx, DB, base, 1, limits)
+                    .await.unwrap().unwrap();
+                assert_eq!(plan.object_ids().len(), 4);
+                let before = bytes(&destination.symbols, &cx).await;
+                let mut receiver = destination.receive_replication_plan(
+                    &cx, decode(&cx, &plan.to_bytes(&cx, &KEY, limits).unwrap()), limits,
+                ).await.unwrap().unwrap();
+                assert_eq!(receiver.missing_object_ids().count(), 4);
+                assert_eq!(receiver.reuse_available_objects(&cx, &Codec).await.unwrap(), 2);
+                assert_eq!(bytes(&receiver.destination.symbols, &cx).await, before);
+                let missing: Vec<_> = receiver.missing_object_ids().collect();
+                assert_eq!(missing.len(), 2);
+                assert!(missing.windows(2).all(|pair| pair[0] < pair[1]));
+                for id in missing {
+                    let message = source.export_replication_object(&cx, &plan, id, &KEY, limits)
+                        .await.unwrap();
+                    receiver.stage_object(&cx, &message, &KEY).await.unwrap();
+                }
+                assert_eq!(receiver.missing_object_ids().count(), 0);
+                assert_eq!(receiver.reuse_available_objects(&cx, &Codec).await.unwrap(), 0);
+                let mut visited = Vec::new();
+                let receipt = receiver.finish_validated(&cx, &Codec, |candidate, _| {
+                    visited.push(candidate.proof.commit_seq.get()); Ok(())
+                }).await.unwrap();
+                assert_eq!(visited, vec![1, 2]);
+                assert_eq!(receipt.first_seq, CommitSeq::new(2));
+                assert_eq!(receipt.commits, 1);
+                assert_eq!(destination.record_count, 4);
+                assert_eq!(bytes(&destination.markers, &cx).await, bytes(&source.markers, &cx).await);
+                destination = recover(destination, &cx).await;
+                assert_eq!(destination.replication_cursor(&cx).await.unwrap(), plan.target());
+                destination.close(&cx).unwrap(); source.close(&cx).unwrap();
+            });
+        }
+
+        #[test]
+        fn local_reuse_resumes_interrupted_inventory_without_redownloading_staged_orphans() {
+            run(async {
+                for staged_count in [1, 6] {
+                    let cx = Cx::new();
+                    let source_vfs = MemoryVfs::new(); let mut source = log(&source_vfs, &cx);
+                    for _ in 0..3 { append_proof(&mut source, &cx, |_| {}).await; }
+                    let limits = NativeReplicationLimits::default();
+                    let plan = source.export_replication_plan(
+                        &cx, DB, NativeReplicationCursor::genesis(), 3, limits,
+                    ).await.unwrap().unwrap();
+                    let wire = plan.to_bytes(&cx, &KEY, limits).unwrap();
+                    let dest_vfs = MemoryVfs::new(); let mut destination = log(&dest_vfs, &cx);
+                    let mut receiver = destination.receive_replication_plan(&cx, decode(&cx, &wire), limits)
+                        .await.unwrap().unwrap();
+                    for id in plan.object_ids().take(staged_count) {
+                        let message = source.export_replication_object(&cx, &plan, id, &KEY, limits)
+                            .await.unwrap();
+                        receiver.stage_object(&cx, &message, &KEY).await.unwrap();
+                    }
+                    drop(receiver);
+                    assert!(destination.needs_recovery());
+                    let staged = bytes(&destination.symbols, &cx).await;
+                    destination = recover(destination, &cx).await;
+                    let mut receiver = destination.receive_replication_plan(&cx, decode(&cx, &wire), limits)
+                        .await.unwrap().unwrap();
+                    assert_eq!(receiver.reuse_available_objects(&cx, &Codec).await.unwrap(), staged_count);
+                    let missing: Vec<_> = receiver.missing_object_ids().collect();
+                    assert_eq!(missing.len(), 6 - staged_count);
+                    let mut messages = Vec::new();
+                    for id in missing {
+                        messages.push(source.export_replication_object(&cx, &plan, id, &KEY, limits)
+                            .await.unwrap());
+                    }
+                    source.close(&cx).unwrap(); drop(source);
+                    for message in messages { receiver.stage_object(&cx, &message, &KEY).await.unwrap(); }
+                    let receipt = receiver.finish_validated(&cx, &Codec, |_, _| Ok(())).await.unwrap();
+                    assert_eq!(receipt.commits, 3);
+                    assert_eq!(destination.record_count, 6);
+                    assert!(bytes(&destination.symbols, &cx).await.starts_with(&staged));
+                    destination.close(&cx).unwrap();
+                }
+            });
+        }
+
+        #[test]
+        fn local_reuse_failed_revalidation_revokes_the_entry_without_mutating_storage() {
+            struct Reject;
+            impl NativeObjectCodec for Reject {
+                fn encode(&self, _: &Cx, _: &[u8]) -> Result<Vec<SymbolRecord>> { Err(FrankenError::Abort) }
+                fn decode(&self, _: &Cx, _: ObjectId, _: &[SymbolRecord]) -> Result<Vec<u8>> { Err(FrankenError::Abort) }
+            }
+            struct Cancel;
+            impl NativeObjectCodec for Cancel {
+                fn encode(&self, cx: &Cx, payload: &[u8]) -> Result<Vec<SymbolRecord>> { Codec.encode(cx, payload) }
+                fn decode(&self, cx: &Cx, id: ObjectId, records: &[SymbolRecord]) -> Result<Vec<u8>> {
+                    let bytes = Codec.decode(cx, id, records)?; cx.cancel(); Ok(bytes)
+                }
+            }
+            run(async {
+                let cx = Cx::new();
+                let source_vfs = MemoryVfs::new(); let mut source = log(&source_vfs, &cx);
+                append_proof(&mut source, &cx, |_| {}).await;
+                let dest_vfs = MemoryVfs::new(); let mut destination = log(&dest_vfs, &cx);
+                let mut receiver = receive(&mut source, &mut destination, &cx, 1).await;
+                let id = receiver.plan.objects[0];
+                let before = bytes(&receiver.destination.symbols, &cx).await;
+                assert!(receiver.reuse_object(&cx, id, &Codec).await.unwrap());
+                assert!(matches!(receiver.reuse_object(&cx, id, &Reject).await, Err(FrankenError::Abort)));
+                assert_eq!(receiver.missing_object_ids().collect::<Vec<_>>(), vec![id]);
+                assert!(receiver.reuse_object(&cx, DB, &Codec).await.is_err());
+                assert_eq!(receiver.missing_object_ids().collect::<Vec<_>>(), vec![id]);
+                assert!(receiver.reuse_object(&cx, id, &Codec).await.unwrap());
+                let cancelled = Cx::new();
+                assert!(matches!(receiver.reuse_object(&cancelled, id, &Cancel).await, Err(FrankenError::Interrupt)));
+                assert_eq!(receiver.missing_object_ids().collect::<Vec<_>>(), vec![id]);
+                assert_eq!(bytes(&receiver.destination.symbols, &cx).await, before);
+                assert_eq!(receiver.destination.markers.file_size(&cx).unwrap(), 0);
+                assert!(receiver.outstanding_write().is_none());
+                assert_eq!(receiver.reuse_available_objects(&cx, &Codec).await.unwrap(), 1);
+                receiver.finish_validated(&cx, &Codec, |_, _| Ok(())).await.unwrap();
+                destination.close(&cx).unwrap(); source.close(&cx).unwrap();
+            });
+        }
+
+        #[test]
+        fn local_reuse_requires_complete_reconstruction_not_index_membership() {
+            run(async {
+                let cx = Cx::new();
+                let source_vfs = MemoryVfs::new(); let mut source = log(&source_vfs, &cx);
+                let payload = [0x5A; 8]; let id = ObjectId::derive_from_canonical_bytes(&payload);
+                let oti = Oti { f: 8, al: 1, t: 4, z: 1, n: 1 };
+                let records = [
+                    SymbolRecord::new(id, oti, 0, payload[..4].to_vec(), SymbolRecordFlags::SYSTEMATIC_RUN_START),
+                    SymbolRecord::new(id, oti, 1, payload[4..].to_vec(), SymbolRecordFlags::empty()),
+                ];
+                source.append_symbols(&cx, &records).await.unwrap();
+                source.publish(&cx, &[CommitMarker::new(CommitSeq::new(1), 1, id, id, None)], verify)
+                    .await.unwrap();
+                let limits = NativeReplicationLimits::default();
+                let plan = source.export_replication_plan(&cx, DB, NativeReplicationCursor::genesis(), 1, limits)
+                    .await.unwrap().unwrap();
+                let dest_vfs = MemoryVfs::new(); let mut destination = log(&dest_vfs, &cx);
+                let wire = plan.to_bytes(&cx, &KEY, limits).unwrap();
+                let mut receiver = destination.receive_replication_plan(&cx, decode(&cx, &wire), limits)
+                    .await.unwrap().unwrap();
+                assert!(!receiver.reuse_object(&cx, id, &Codec).await.unwrap());
+                // Actual on-disk, intact but incomplete symbols, not a fake cache bit.
+                receiver.destination.append_symbols(&cx, &records[..1]).await.unwrap();
+                let before = bytes(&receiver.destination.symbols, &cx).await;
+                assert!(receiver.reuse_object(&cx, id, &Codec).await.is_err());
+                assert_eq!(receiver.missing_object_ids().collect::<Vec<_>>(), vec![id]);
+                assert_eq!(bytes(&receiver.destination.symbols, &cx).await, before);
+                let message = source.export_replication_object(&cx, &plan, id, &KEY, limits).await.unwrap();
+                receiver.stage_object(&cx, &message, &KEY).await.unwrap();
+                assert!(receiver.reuse_object(&cx, id, &Codec).await.unwrap());
+                receiver.finish(&cx, verify).await.unwrap();
+                assert_eq!(destination.record_count, 2);
+                assert_eq!(Codec.decode(&cx, id, &destination.read_object(&cx, id).await.unwrap()).unwrap(), payload);
+                destination.close(&cx).unwrap(); source.close(&cx).unwrap();
+            });
+        }
+
+        #[test]
+        fn local_reuse_never_replaces_final_destination_readback() {
+            run(async {
+                let cx = Cx::new();
+                let source_vfs = MemoryVfs::new(); let mut source = log(&source_vfs, &cx);
+                append_proof(&mut source, &cx, |_| {}).await;
+                let dest_vfs = MemoryVfs::new(); let mut destination = log(&dest_vfs, &cx);
+                let mut receiver = receive(&mut source, &mut destination, &cx, 1).await;
+                let id = receiver.plan.objects[0];
+                assert!(receiver.reuse_object(&cx, id, &Codec).await.unwrap());
+                let offset = receiver.destination.index[&id][0].offset + u64_len(SYMBOL_HEADER_BYTES).unwrap();
+                receiver.destination.symbols.write(&cx, &[0xFF], offset).await.unwrap();
+                assert_eq!(receiver.missing_object_ids().count(), 0);
+                assert!(receiver.finish_validated(&cx, &Codec, |_, _| Ok(())).await.is_err());
+                assert_eq!(destination.markers.file_size(&cx).unwrap(), 0);
+                assert!(destination.needs_recovery());
+                destination.close(&cx).unwrap(); source.close(&cx).unwrap();
+            });
+        }
+
+        #[test]
+        fn local_reuse_does_not_require_a_message_large_enough_to_retransmit_the_object() {
+            run(async {
+                let cx = Cx::new();
+                let source_vfs = MemoryVfs::new(); let mut source = log(&source_vfs, &cx);
+                append_proof(&mut source, &cx, |_| {}).await;
+                let limits = NativeReplicationLimits {
+                    max_object_message_bytes: OBJECT_HEADER + TAG_BYTES + SYMBOL_HEADER_BYTES + SYMBOL_TRAILER_BYTES + 1,
+                    ..NativeReplicationLimits::default()
+                };
+                let plan = source.export_replication_plan(&cx, DB, NativeReplicationCursor::genesis(), 1, limits)
+                    .await.unwrap().unwrap();
+                let dest_vfs = MemoryVfs::new(); let mut destination = log(&dest_vfs, &cx);
+                for id in plan.object_ids() {
+                    destination.append_symbols(&cx, &source.read_object(&cx, id).await.unwrap()).await.unwrap();
+                    assert!(matches!(source.export_replication_object(&cx, &plan, id, &KEY, limits).await,
+                        Err(FrankenError::TooBig)));
+                }
+                let wire = plan.to_bytes(&cx, &KEY, limits).unwrap();
+                source.close(&cx).unwrap(); drop(source);
+                let before = bytes(&destination.symbols, &cx).await;
+                let mut receiver = destination.receive_replication_plan(&cx, decode(&cx, &wire), limits)
+                    .await.unwrap().unwrap();
+                assert_eq!(receiver.reuse_available_objects(&cx, &Codec).await.unwrap(), 2);
+                assert_eq!(receiver.missing_object_ids().count(), 0);
+                receiver.finish_validated(&cx, &Codec, |_, _| Ok(())).await.unwrap();
+                assert_eq!(bytes(&destination.symbols, &cx).await, before);
+                assert_eq!(destination.published_tip(), CommitSeq::new(1));
+                destination.close(&cx).unwrap();
             });
         }
 
