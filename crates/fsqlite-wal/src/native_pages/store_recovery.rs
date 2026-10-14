@@ -17,7 +17,10 @@ use super::{NativePageLimits, NativePageStore, PageHistory, SharedCodec, corrupt
 use crate::native_commit::durable::{
     NativeCommitAttempt, NativeCommitOutcome, NativeCoordinatorRecovery, NativeObjectCodec,
 };
-use crate::native_durability::{NativeDurabilityRecovery, NativeRecovery, RecoveredNativeLog};
+use crate::native_durability::{
+    NativeDurabilityLog, NativeDurabilityReceipt, NativeDurabilityRecovery, NativeRecovery,
+    RecoveredNativeLog,
+};
 use crate::native_pages::NativePageSnapshot;
 
 impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativePageStore<S, M, C> {
@@ -251,6 +254,74 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativePageRecovery<S, M, C> {
         self.prepare_snapshot(cx, sequence).await
     }
 
+    /// Advance replica storage and return its exact, intrinsically read-only image.
+    ///
+    /// Each call validates the complete source page history, including commits
+    /// beyond the selected batch, through the ordinary capsule/read-version,
+    /// duplicate-token, codec/authentication and resource checks. No supplied
+    /// callback or page map can bypass those checks. The image is allocated
+    /// before any destination mutation and escapes only with the destination's
+    /// successful two-barrier receipt. Existing images stay immutable while
+    /// subsequent calls catch up. No writable store or publisher is constructed.
+    ///
+    /// The destination must be empty or an accepted prefix of this source;
+    /// the storage transfer checks both complete marker chains and rejects
+    /// aliases, forks and ahead replicas without overwriting them. It reuses
+    /// identical staged symbols and verifies destination referents with this
+    /// source's codec. The destination therefore uses the same codec profile
+    /// and authentication epoch, not a caller-selected weaker verifier.
+    /// An already synchronized replica returns `None`, not another receipt.
+    ///
+    /// `max_commits` is in 1..=128 and bounds marker publication, not total
+    /// work: this is cold full-history replay plus the existing object transfer,
+    /// which may stage objects for later commits and transitive dependencies.
+    /// The selected image and replay heads each obey the page budget; caller-
+    /// retained images, codec allocations and storage metadata are additional.
+    /// This is explicit local catch-up, not a transport, quorum or SQL selector.
+    ///
+    /// Keep both namespace/append leases throughout the operation and any
+    /// abandoned destination writes. Source tails are preserved, destination
+    /// tails refuse admission. A failed or dropped mutating transfer returns no
+    /// image and leaves destination recovery/physical-write obligations intact;
+    /// actual recovery, not an in-place retry, must resolve them. A torn batch
+    /// can contain committed markers even though no complete receipt escaped.
+    ///
+    /// # Errors
+    /// Rejects invalid limits, invalid source history, forks, aliases, capacity
+    /// excess, cancellation and VFS errors. No source bytes are changed.
+    pub async fn replicate_snapshot_to<DS: VfsFile, DM: VfsFile>(
+        &mut self,
+        cx: &Cx,
+        destination: &mut NativeDurabilityLog<DS, DM>,
+        max_commits: usize,
+    ) -> Result<Option<(NativeDurabilityReceipt, NativePageSnapshot)>> {
+        if !(1..=128).contains(&max_commits) {
+            return Err(FrankenError::OutOfRange {
+                what: "native page replication commit batch".to_owned(),
+                value: max_commits.to_string(),
+            });
+        }
+        let tip = self.report().markers.last()
+            .map_or(CommitSeq::ZERO, |marker| marker.commit_seq);
+        let base = destination.published_tip();
+        if base > tip {
+            return Err(corrupt("native page replica is ahead of the source"));
+        }
+        let count = (tip.get() - base.get())
+            .min(u64::try_from(max_commits).map_err(|_| FrankenError::TooBig)?);
+        // count <= tip - base, so this addition cannot overflow.
+        let target = CommitSeq::new(base.get() + count);
+        let snapshot = self.prepare_snapshot(cx, target).await?;
+        let receipt = self.replay
+            .replicate_prepared_prefix_to(cx, destination, max_commits).await?;
+        // The owned source and exclusive destination borrows preserve these
+        // tips across the lower transfer. No fallible allocation, I/O, callback
+        // or late cancellation check follows acknowledged publication.
+        debug_assert_eq!(receipt.is_some(), count != 0);
+        debug_assert!(receipt.as_ref().is_none_or(|receipt| receipt.last_seq == target));
+        Ok(receipt.map(|receipt| (receipt, snapshot)))
+    }
+
     async fn prepare_inner(
         &mut self,
         cx: &Cx,
@@ -380,3 +451,343 @@ fn capture_snapshot(
 #[cfg(test)]
 #[path = "store_recovery_live_tests.rs"]
 mod live_transfer_tests;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod replica_snapshot_tests {
+    use std::future::{Future, ready};
+    use std::path::Path;
+
+    use asupersync::runtime::RuntimeBuilder;
+    use fsqlite_types::flags::VfsOpenFlags;
+    use fsqlite_types::{
+        CommitMarker, ObjectId, Oti, PageNumber, SymbolRecord, SymbolRecordFlags,
+        TxnEpoch, TxnId, reconstruct_systematic_happy_path,
+    };
+    use fsqlite_vfs::{MemoryVfs, Vfs};
+
+    use super::*;
+    use crate::native_commit::CommitSubmission;
+    use crate::native_commit::durable::NativeCommitProof;
+    use crate::native_durability::NativeDurabilityLimits;
+    use crate::native_pages::{NativePageCapsule, NativePageWrite};
+
+    struct Codec;
+    impl NativeObjectCodec for Codec {
+        fn encode(&self, _: &Cx, bytes: &[u8]) -> Result<Vec<SymbolRecord>> {
+            let size = u32::try_from(bytes.len()).map_err(|_| FrankenError::TooBig)?;
+            Ok(vec![SymbolRecord::new(
+                ObjectId::derive_from_canonical_bytes(bytes),
+                Oti { f: u64::from(size), al: 1, t: size, z: 1, n: 1 },
+                0, bytes.to_vec(), SymbolRecordFlags::SYSTEMATIC_RUN_START,
+            )])
+        }
+        fn decode(&self, _: &Cx, id: ObjectId, records: &[SymbolRecord]) -> Result<Vec<u8>> {
+            let bytes = reconstruct_systematic_happy_path(records)
+                .map_err(|error| corrupt(&error.to_string()))?;
+            if ObjectId::derive_from_canonical_bytes(&bytes) != id {
+                return Err(corrupt("replica snapshot test object identity mismatch"));
+            }
+            Ok(bytes)
+        }
+    }
+
+    type File = <MemoryVfs as Vfs>::File;
+    type Log = NativeDurabilityLog<File, File>;
+    type Store = NativePageStore<File, File, Codec>;
+
+    fn run(future: impl Future<Output = ()>) {
+        let _guard = crate::metrics::GLOBAL_GROUP_COMMIT_METRICS_TEST_LOCK.lock().unwrap();
+        RuntimeBuilder::current_thread().blocking_threads(1, 2).build().unwrap().block_on(future);
+    }
+
+    fn page(n: u32) -> PageNumber { PageNumber::new(n).unwrap() }
+
+    fn file(vfs: &MemoryVfs, cx: &Cx, name: &str) -> File {
+        vfs.open(cx, Some(Path::new(name)),
+            VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL).unwrap().0
+    }
+
+    fn log(vfs: &MemoryVfs, cx: &Cx, name: &str) -> Log {
+        Log::create(cx, file(vfs, cx, &format!("{name}-objects")),
+            file(vfs, cx, &format!("{name}-markers")), NativeDurabilityLimits::default()).unwrap()
+    }
+
+    fn store(vfs: &MemoryVfs, cx: &Cx, name: &str) -> Store {
+        Store::new(log(vfs, cx, name), Codec, 512, NativePageLimits::default()).unwrap()
+    }
+
+    async fn put(db: &mut Store, cx: &Cx, value: u8) {
+        let mut txn = db.begin(cx).unwrap();
+        db.write_page(cx, &mut txn, page(2), Some(&[value; 512])).unwrap();
+        db.commit(cx, &mut txn, u64::from(value)).await.unwrap();
+    }
+
+    async fn source<C: NativeObjectCodec>(
+        db: NativePageStore<File, File, C>, cx: &Cx, limits: NativePageLimits,
+    ) -> NativePageRecovery<File, File, C> {
+        let (mut physical, codec) = db.try_into_recovery()
+            .unwrap_or_else(|_| panic!("quiescent source must transfer"));
+        physical.prepare(cx, |id, records| ready(codec.decode(cx, id, &records).map(|_| ())))
+            .await.unwrap();
+        NativePageRecovery::with_shared_codec(physical.finish().unwrap(), codec, 512, limits)
+    }
+
+    async fn disk(vfs: &MemoryVfs, cx: &Cx, name: &str) -> (Vec<u8>, Vec<u8>) {
+        async fn bytes(vfs: &MemoryVfs, cx: &Cx, name: &str) -> Vec<u8> {
+            let mut handle = file(vfs, cx, name);
+            let mut bytes = vec![0; usize::try_from(handle.file_size(cx).unwrap()).unwrap()];
+            assert_eq!(handle.read(cx, &mut bytes, 0).await.unwrap(), bytes.len());
+            handle.close(cx).unwrap();
+            bytes
+        }
+        (bytes(vfs, cx, &format!("{name}-objects")).await,
+         bytes(vfs, cx, &format!("{name}-markers")).await)
+    }
+
+    #[test]
+    fn replica_snapshots_advance_exact_batches_preserve_old_images_and_reopen() {
+        run(async {
+            let cx = Cx::new();
+            let vfs = MemoryVfs::new();
+            let mut db = store(&vfs, &cx, "source");
+            let mut first = db.begin(&cx).unwrap();
+            db.write_page(&cx, &mut first, page(2), Some(&[1; 512])).unwrap();
+            db.write_page(&cx, &mut first, page(9000), Some(&[9; 512])).unwrap();
+            db.commit(&cx, &mut first, 10).await.unwrap();
+            let mut second = db.begin(&cx).unwrap();
+            db.write_page(&cx, &mut second, page(2), Some(&[2; 512])).unwrap();
+            db.write_page(&cx, &mut second, page(9000), None).unwrap();
+            db.commit(&cx, &mut second, 20).await.unwrap();
+            let mut third = db.begin(&cx).unwrap();
+            db.write_page(&cx, &mut third, page(3), Some(&[3; 512])).unwrap();
+            db.commit(&cx, &mut third, 30).await.unwrap();
+            let mut source = source(db, &cx, NativePageLimits::default()).await;
+            let before = disk(&vfs, &cx, "source").await;
+            let mut replica = log(&vfs, &cx, "replica");
+            let (receipt, old) = source.replicate_snapshot_to(&cx, &mut replica, 1)
+                .await.unwrap().unwrap();
+            assert_eq!(receipt.first_seq, CommitSeq::new(1));
+            assert_eq!(receipt.last_seq, old.commit_seq());
+            assert_eq!(receipt.commits, 1);
+            assert_eq!(old.commit_time_unix_ns(), Some(10));
+            assert_eq!(old.read_page(page(2)).unwrap().as_ref(), &[1; 512]);
+            assert_eq!(old.page_count(), 2);
+            let (receipt, middle) = source.replicate_snapshot_to(&cx, &mut replica, 1)
+                .await.unwrap().unwrap();
+            assert_eq!(receipt.first_seq, CommitSeq::new(2));
+            assert_eq!(middle.commit_seq(), receipt.last_seq);
+            assert_eq!(middle.database_size_bound(), 9000);
+            assert!(middle.read_page(page(9000)).is_none());
+            assert!(middle.read_page(page(3)).is_none(), "never expose the staged future commit");
+            let (receipt, latest) = source.replicate_snapshot_to(&cx, &mut replica, 128)
+                .await.unwrap().unwrap();
+            assert_eq!(receipt.commits, 1);
+            assert_eq!(latest.commit_seq(), CommitSeq::new(3));
+            assert_eq!(latest.read_page(page(3)).unwrap().as_ref(), &[3; 512]);
+            assert_eq!(old.read_page(page(9000)).unwrap().as_ref(), &[9; 512]);
+            assert_eq!(old.read_page(page(2)).unwrap().as_ref(), &[1; 512]);
+            let replicated = disk(&vfs, &cx, "replica").await;
+            assert!(source.replicate_snapshot_to(&cx, &mut replica, 1).await.unwrap().is_none());
+            assert_eq!(disk(&vfs, &cx, "replica").await, replicated);
+            assert_eq!(disk(&vfs, &cx, "source").await, before);
+            assert!(!replica.needs_recovery());
+            assert!(replica.outstanding_write().is_none());
+            replica.close(&cx).unwrap();
+            source.close(&cx).unwrap();
+            // Reconstruct from destination bytes alone, not the returned source image.
+            let (mut reopened, report) = Store::recover(&cx,
+                file(&vfs, &cx, "replica-objects"), file(&vfs, &cx, "replica-markers"),
+                Codec, 512, NativeDurabilityLimits::default(), NativePageLimits::default())
+                .await.unwrap();
+            assert_eq!(report.markers.len(), 3);
+            let mut view = reopened.begin(&cx).unwrap();
+            assert_eq!(reopened.read_page(&cx, &mut view, page(2)).unwrap().unwrap().as_ref(), &[2; 512]);
+            assert_eq!(reopened.read_page(&cx, &mut view, page(3)).unwrap().unwrap().as_ref(), &[3; 512]);
+            assert!(reopened.read_page(&cx, &mut view, page(9000)).unwrap().is_none());
+            reopened.rollback(&mut view).unwrap();
+            reopened.close(&cx).unwrap();
+            assert_eq!(middle.read_page(page(2)).unwrap().as_ref(), &[2; 512]);
+        });
+    }
+
+    #[test]
+    fn replica_snapshots_reject_invalid_unselected_source_suffix_before_staging() {
+        run(async {
+            for invalid in 0..4 {
+                let cx = Cx::new();
+                let vfs = MemoryVfs::new();
+                let mut source_log = log(&vfs, &cx, "source");
+                let mut previous = None;
+                for seq in 1_u64..=3 {
+                    let stale = seq == 3 && invalid == 0;
+                    let token = if seq == 3 && invalid == 1 { 1 } else { seq };
+                    let capsule = NativePageCapsule {
+                        page_size: 512, snapshot: CommitSeq::new(seq - 1),
+                        reads: vec![(page(2), CommitSeq::new(if stale { 1 } else { seq - 1 }))],
+                        writes: vec![NativePageWrite {
+                            page: page(2), data: Some(Arc::from(vec![u8::try_from(seq).unwrap(); 512])),
+                        }],
+                    };
+                    let bytes = capsule.to_bytes().unwrap();
+                    let records = Codec.encode(&cx, &bytes).unwrap();
+                    let proof = NativeCommitProof {
+                        commit_seq: CommitSeq::new(seq), commit_time_unix_ns: seq,
+                        submission: CommitSubmission {
+                            capsule_object_id: records[0].object_id,
+                            capsule_digest: *blake3::hash(&bytes).as_bytes(),
+                            write_set_pages: vec![page(if seq == 3 && invalid == 2 { 3 } else { 2 })],
+                            witness_refs: if seq == 3 && invalid == 3 {
+                                vec![ObjectId::from_bytes([0xED; 16])]
+                            } else { vec![] },
+                            edge_ids: vec![], merge_witness_ids: vec![],
+                            txn_token: TxnToken::new(TxnId::new(token).unwrap(), TxnEpoch::new(1)),
+                            begin_seq: capsule.snapshot,
+                        },
+                    };
+                    let proofs = Codec.encode(&cx, &proof.to_bytes().unwrap()).unwrap();
+                    let marker = CommitMarker::new(proof.commit_seq, seq,
+                        records[0].object_id, proofs[0].object_id, previous);
+                    previous = Some(ObjectId::derive_from_canonical_bytes(&marker.to_record_bytes()));
+                    source_log.append_symbols(&cx, &records).await.unwrap();
+                    source_log.append_symbols(&cx, &proofs).await.unwrap();
+                    source_log.publish(&cx, &[marker], |id, records| {
+                        ready(Codec.decode(&cx, id, &records).map(|_| ()))
+                    }).await.unwrap();
+                }
+                // The storage layer can verify envelopes without proving page semantics.
+                let mut physical = source_log.into_recovery();
+                physical.prepare(&cx, |id, records| ready(Codec.decode(&cx, id, &records).map(|_| ())))
+                    .await.unwrap();
+                let mut source = NativePageRecovery::new(physical.finish().unwrap(), Codec,
+                    512, NativePageLimits::default());
+                let mut replica = log(&vfs, &cx, "replica");
+                let before = disk(&vfs, &cx, "replica").await;
+                assert!(source.replicate_snapshot_to(&cx, &mut replica, 1).await.is_err());
+                assert_eq!(disk(&vfs, &cx, "replica").await, before);
+                assert_eq!(replica.published_tip(), CommitSeq::ZERO);
+                assert!(!replica.needs_recovery());
+                assert!(source.prepared.is_none());
+                replica.close(&cx).unwrap();
+                source.close(&cx).unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn replica_snapshots_reject_forks_at_equal_tips_and_ahead_destinations() {
+        run(async {
+            let cx = Cx::new();
+            let vfs = MemoryVfs::new();
+            let mut original = store(&vfs, &cx, "original");
+            put(&mut original, &cx, 1).await;
+            put(&mut original, &cx, 2).await;
+            let mut original = source(original, &cx, NativePageLimits::default()).await;
+            let mut other = store(&vfs, &cx, "other");
+            put(&mut other, &cx, 9).await;
+            let mut other = source(other, &cx, NativePageLimits::default()).await;
+            let mut replica = log(&vfs, &cx, "replica");
+            original.replicate_snapshot_to(&cx, &mut replica, 1).await.unwrap().unwrap();
+            let before = disk(&vfs, &cx, "replica").await;
+            assert!(matches!(other.replicate_snapshot_to(&cx, &mut replica, 1).await,
+                Err(FrankenError::WalCorrupt { .. })));
+            assert_eq!(disk(&vfs, &cx, "replica").await, before);
+            assert!(!replica.needs_recovery());
+            let (_, snapshot) = original.replicate_snapshot_to(&cx, &mut replica, 1)
+                .await.unwrap().unwrap();
+            assert_eq!(snapshot.read_page(page(2)).unwrap().as_ref(), &[2; 512]);
+            let before = disk(&vfs, &cx, "replica").await;
+            assert!(matches!(other.replicate_snapshot_to(&cx, &mut replica, 1).await,
+                Err(FrankenError::WalCorrupt { .. })));
+            assert_eq!(disk(&vfs, &cx, "replica").await, before);
+            assert!(!replica.needs_recovery());
+            replica.close(&cx).unwrap();
+            original.close(&cx).unwrap();
+            other.close(&cx).unwrap();
+        });
+    }
+
+    #[test]
+    fn replica_snapshots_limits_and_cancellation_leave_destination_reusable() {
+        run(async {
+            let cx = Cx::new();
+            let vfs = MemoryVfs::new();
+            let mut db = store(&vfs, &cx, "source");
+            put(&mut db, &cx, 1).await;
+            let mut source = source(db, &cx, NativePageLimits {
+                max_retained_page_bytes: 511, ..NativePageLimits::default()
+            }).await;
+            let mut replica = log(&vfs, &cx, "replica");
+            for count in [0, 129, usize::MAX] {
+                assert!(matches!(source.replicate_snapshot_to(&cx, &mut replica, count).await,
+                    Err(FrankenError::OutOfRange { .. })));
+            }
+            assert!(matches!(source.replicate_snapshot_to(&cx, &mut replica, 1).await,
+                Err(FrankenError::TooBig)));
+            // Correct options through the owned recovery handoff, not mutation of page state.
+            let (mut physical, codec) = source.into_recovery();
+            physical.prepare(&cx, |id, records| ready(codec.decode(&cx, id, &records).map(|_| ())))
+                .await.unwrap();
+            let mut source = NativePageRecovery::with_shared_codec(physical.finish().unwrap(),
+                codec, 512, NativePageLimits::default());
+            let cancelled = Cx::new();
+            cancelled.cancel();
+            assert!(matches!(source.replicate_snapshot_to(&cancelled, &mut replica, 1).await,
+                Err(FrankenError::Interrupt)));
+            assert_eq!(disk(&vfs, &cx, "replica").await, (vec![], vec![]));
+            assert!(!replica.needs_recovery());
+            let (_, image) = source.replicate_snapshot_to(&cx, &mut replica, 1)
+                .await.unwrap().unwrap();
+            assert_eq!(image.read_page(page(2)).unwrap().as_ref(), &[1; 512]);
+            source.close(&cx).unwrap();
+            assert!(source.replicate_snapshot_to(&cx, &mut replica, 1).await.is_err());
+            replica.close(&cx).unwrap();
+        });
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn replica_snapshots_use_authenticated_raptorq_and_preserve_the_codec_epoch() {
+        use crate::native_commit::durable::codec::RaptorQNativeCodec;
+
+        run(async {
+            let cx = Cx::new();
+            cx.set_native_cx(asupersync::Cx::current().unwrap());
+            let vfs = MemoryVfs::new();
+            let mut db = NativePageStore::new(log(&vfs, &cx, "source"),
+                RaptorQNativeCodec::new(Some([0x73; 32])), 512, NativePageLimits::default()).unwrap();
+            let mut txn = db.begin(&cx).unwrap();
+            for n in 2..=12 {
+                db.write_page(&cx, &mut txn, page(n), Some(&[u8::try_from(n).unwrap(); 512])).unwrap();
+            }
+            db.commit(&cx, &mut txn, 100).await.unwrap();
+            let mut source = source(db, &cx, NativePageLimits::default()).await;
+            let mut replica = log(&vfs, &cx, "replica");
+            let (_, image) = source.replicate_snapshot_to(&cx, &mut replica, 128)
+                .await.unwrap().unwrap();
+            assert_eq!(image.page_count(), 11);
+            assert_eq!(image.read_page(page(7)).unwrap().as_ref(), &[7; 512]);
+            let copied = disk(&vfs, &cx, "replica").await;
+            let (mut physical, correct) = source.into_recovery();
+            physical.prepare(&cx, |id, records| ready(correct.decode(&cx, id, &records).map(|_| ())))
+                .await.unwrap();
+            let mut wrong = NativePageRecovery::new(physical.finish().unwrap(),
+                RaptorQNativeCodec::new(Some([0x74; 32])), 512, NativePageLimits::default());
+            // Even the equal-tip/no-new-marker call must not bypass authentication.
+            assert!(wrong.replicate_snapshot_to(&cx, &mut replica, 1).await.is_err());
+            assert_eq!(disk(&vfs, &cx, "replica").await, copied);
+            wrong.close(&cx).unwrap();
+            replica.close(&cx).unwrap();
+            let (mut reopened, _) = NativePageStore::recover(&cx,
+                file(&vfs, &cx, "replica-objects"), file(&vfs, &cx, "replica-markers"),
+                RaptorQNativeCodec::new(Some([0x73; 32])), 512,
+                NativeDurabilityLimits::default(), NativePageLimits::default()).await.unwrap();
+            let mut view = reopened.begin(&cx).unwrap();
+            for n in 2..=12 {
+                assert_eq!(reopened.read_page(&cx, &mut view, page(n)).unwrap().unwrap().as_ref(),
+                    &[u8::try_from(n).unwrap(); 512]);
+            }
+            reopened.rollback(&mut view).unwrap();
+            reopened.close(&cx).unwrap();
+        });
+    }
+}

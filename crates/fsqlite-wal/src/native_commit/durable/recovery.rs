@@ -125,6 +125,28 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativeCoordinatorRecovery<S, 
         Ok(())
     }
 
+    // The native-page layer calls this only after its mandatory full-history
+    // replay and snapshot allocation. Do not expose a public callback-free
+    // generic semantic admission path. Destination publication re-reads and
+    // authenticates its referents with this same codec; the lower transfer
+    // retains its chain/alias checks, two barriers and failed-write ownership.
+    pub(crate) async fn replicate_prepared_prefix_to<DS: VfsFile, DM: VfsFile>(
+        &mut self,
+        cx: &Cx,
+        destination: &mut NativeDurabilityLog<DS, DM>,
+        max_commits: usize,
+    ) -> Result<Option<crate::native_durability::NativeDurabilityReceipt>> {
+        if self.closing || self.prepared.is_none() {
+            return Err(FrankenError::BusyRecovery);
+        }
+        let codec = &self.codec;
+        self.log
+            .replicate_committed_prefix_to(cx, destination, max_commits, |id, records| {
+                std::future::ready(codec.decode(cx, id, &records).map(|_| ()))
+            })
+            .await
+    }
+
     /// Install only a complete replay. Refusal returns the entire owner.
     /// No await or callback separates this handoff from driver construction.
     ///
