@@ -69,6 +69,12 @@ export interface ChangesetReceiverOptions {
   generatedColumns?: ApplyChangesetOptions["generatedColumns"];
   /** One FK-clean scope for rows, journal and receipt; enforcement must be ON. */
   foreignKeys?: ApplyChangesetOptions["foreignKeys"];
+  /**
+   * Trusted local opt-in to per-row constraint isolation, with or without a
+   * rebase journal. Omission policy runs only after confirmed child rollback.
+   * Never taken from the envelope; the source must separately accept omissions.
+   */
+  constraintConflicts?: ApplyChangesetOptions["constraintConflicts"];
   /** Routing identity, NOT authentication. Authenticate callers in the transport. */
   receiverId: string;
   tables: readonly string[];
@@ -260,7 +266,7 @@ export class ChangesetReceiver {
   readonly #confirm: () => Promise<unknown>;
   readonly #onConflict: ApplyChangesetOptions["onConflict"];
   readonly #rebaseJournal: ChangesetRebaseJournal | null;
-  readonly #applicationPolicy: Readonly<Pick<ApplyChangesetOptions, "generatedColumns" | "foreignKeys">>;
+  readonly #applicationPolicy: Readonly<Pick<ApplyChangesetOptions, "generatedColumns" | "foreignKeys" | "constraintConflicts">>;
   readonly #maxBytes: number;
   #active = false;
   constructor(target: ChangesetTarget, options: ChangesetReceiverOptions) {
@@ -271,13 +277,17 @@ export class ChangesetReceiver {
       onConflict = options?.onConflict;
     const rebaseJournal = options?.rebaseJournal;
     const generatedColumns = options?.generatedColumns, foreignKeys = options?.foreignKeys;
+    const constraintConflicts = options?.constraintConflicts;
     if (generatedColumns !== undefined && generatedColumns !== "recompute")
       input("generatedColumns must be recompute when supplied");
     if (foreignKeys !== undefined && foreignKeys !== "defer")
       input("foreignKeys must be defer when supplied");
+    if (constraintConflicts !== undefined && constraintConflicts !== "isolate")
+      input("constraintConflicts must be isolate when supplied");
     this.#applicationPolicy = Object.freeze({
       ...(generatedColumns === undefined ? {} : { generatedColumns }),
       ...(foreignKeys === undefined ? {} : { foreignKeys }),
+      ...(constraintConflicts === undefined ? {} : { constraintConflicts }),
     });
     this.#maxBytes = bound(options?.maxMessageBytes, 8 * 1024 * 1024, HARD_BYTES);
     if (!Array.isArray(source) || source.length > 256)
