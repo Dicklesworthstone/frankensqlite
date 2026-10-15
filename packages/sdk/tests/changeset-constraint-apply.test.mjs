@@ -586,3 +586,164 @@ test("receiver-image query failures cannot become isolated constraint omissions"
   assert.deepEqual(columns(target.db),[[1n,"old"]]);
   assert.deepEqual(columns(target.db,"SELECT name FROM sqlite_schema WHERE name='__fsqlite_changeset_receipts'"),[]);
 });
+
+// Exercise the actual journal, codec, application and owned SQLite target together.
+// No substitute journal or rebaser is used by these integration tests.
+const { ChangesetRebaseJournal } = await import("../src/changeset-rebase-journal.ts");
+const journalOptions = (deliveryId, extra = {}) => policy({ deliveryId, ...extra });
+const journalState = target => columns(target.db,
+  "SELECT name FROM sqlite_schema WHERE name GLOB '__fsqlite_*' ORDER BY name");
+
+test("journal isolation preserves accepted rows, exact decisions and original replay", async t => {
+  const schema = "CREATE TABLE t(id INTEGER PRIMARY KEY,v TEXT NOT NULL UNIQUE CHECK(v!='bad'))";
+  const target = new Target(t, schema, "INSERT INTO t VALUES(9,'taken')");
+  const journal = new ChangesetRebaseJournal(target, { journalId: "receiver/history" });
+  const bytes = wire([insert(1n,"good"),insert(2n,"taken"),insert(3n,null),insert(4n,"bad"),insert(5n,"last")]);
+  const seen = [];
+  const result = await journal.apply(bytes, journalOptions("source/1", { onConflict: c => {
+    assert.equal(c.kind, "constraint"); assert.equal(c.current, null);
+    assert.deepEqual(target.log.at(-1), ["rollback",1]);
+    seen.push([c.changeIndex,c.error.extendedCode]); return "omit";
+  }}));
+  assert.deepEqual(seen, [[1,2067],[2,1299],[3,275]]);
+  assert.deepEqual([result.applied,result.omitted,result.replayed], [2,3,false]);
+  assert.equal(result.entry.position, 1);
+  assert.deepEqual(decodeRebaseInfo(result.entry.rebaseInfo)[0].changes.map(c => [c.values[0],c.replace]),
+    [[2n,false],[3n,false],[4n,false]]);
+  assert.deepEqual(await journal.read("source/1"), result.entry);
+  const bookmark = await journal.bookmark(), before = columns(target.db);
+  const starts = target.log.filter(([op,d]) => op === "begin" && d === 1).length;
+  const replay = await journal.apply(bytes, journalOptions("source/1", { onConflict: () => assert.fail("replayed policy") }));
+  assert.deepEqual(replay, {...result,replayed:true});
+  assert.deepEqual(await journal.bookmark(), bookmark);
+  assert.deepEqual(columns(target.db), before);
+  assert.equal(target.log.filter(([op,d]) => op === "begin" && d === 1).length, starts);
+  const native = new DatabaseSync(":memory:");
+  try {
+    native.exec(schema + ";INSERT INTO t VALUES(9,'taken')");
+    const conflicts = [];
+    assert.equal(native.applyChangeset(bytes,{onConflict: kind => {conflicts.push(kind);return 0;}}),true);
+    assert.deepEqual(conflicts,[4,4,4]); assert.deepEqual(columns(native),before);
+    t.diagnostic(`journal policy/reference SQL: SQLite ${native.prepare("SELECT sqlite_version() v").get().v}`);
+  } finally {native.close();}
+});
+
+test("journal composes generated columns, deferred dependencies and isolated row omissions", async t => {
+  const target = new Target(t, `CREATE TABLE parent(id INTEGER PRIMARY KEY,label);
+    CREATE TABLE t(id INTEGER PRIMARY KEY,v TEXT UNIQUE,pid REFERENCES parent(id),
+      computed INTEGER GENERATED ALWAYS AS (id*2) STORED)`);
+  const journal = new ChangesetRebaseJournal(target,{journalId:"all-policies"});
+  const bytes = encodeChangeset([
+    {name:"t",primaryKey:[1,0,0],changes:[insert(1n,"same",7n),insert(2n,"same",7n),insert(3n,"valid",7n)]},
+    {name:"parent",primaryKey:[1,0],changes:[insert(7n,"arrives-last")]},
+  ]);
+  const seen = [];
+  const result = await journal.apply(bytes, journalOptions("dependency-batch",{
+    tables:["t","parent"],foreignKeys:"defer",generatedColumns:"recompute",
+    onConflict:c => {seen.push(c.kind);return "omit";},
+  }));
+  assert.deepEqual(seen,["constraint"]);
+  assert.deepEqual([result.applied,result.omitted],[3,1]);
+  assert.deepEqual(columns(target.db),[[1n,"same",7n,2n],[3n,"valid",7n,6n]]);
+  assert.deepEqual(columns(target.db,"PRAGMA foreign_key_check"),[]);
+  assert.deepEqual(columns(target.db,"PRAGMA defer_foreign_keys"),[[0n]]);
+  assert.deepEqual(columns(target.db,"SELECT applied,omitted FROM __fsqlite_changeset_receipts"),[[3n,1n]]);
+  assert.deepEqual(decodeRebaseInfo(result.entry.rebaseInfo)[0].changes.map(c=>c.values),[[2n,"same",7n]]);
+});
+
+test("journal captures constraint policy once and rejects invalid values before SQL",async t=>{
+  for (const value of [null,false,0,"omit",{}]) {
+    const target = new Target(t), journal = new ChangesetRebaseJournal(target,{journalId:"invalid"});
+    await assert.rejects(journal.apply(wire([insert(1n,"new")]),journalOptions("invalid",{constraintConflicts:value})),inputError);
+    assert.deepEqual(target.log,[]); assert.deepEqual(journalState(target),[]);
+  }
+  const target = new Target(t,undefined,"INSERT INTO t VALUES(9,'taken')");
+  const journal = new ChangesetRebaseJournal(target,{journalId:"capture"});
+  let reads=0, calls=0;
+  const options = journalOptions("captured",{onConflict:()=>{calls++;return "omit";}});
+  Object.defineProperty(options,"constraintConflicts",{configurable:true,get(){reads++;return "isolate";}});
+  const bytes=wire([insert(1n,"taken"),insert(2n,"accepted")]), original=new Uint8Array(bytes);
+  const pending=journal.apply(bytes,options);
+  Object.defineProperty(options,"constraintConflicts",{value:"invalid"}); bytes.fill(0);
+  const result=await pending;
+  assert.equal(reads,1); assert.equal(calls,1);
+  assert.deepEqual([result.applied,result.omitted],[1,1]);
+  assert.deepEqual(columns(target.db),[[2n,"accepted"],[9n,"taken"]]);
+  assert.equal((await journal.apply(original,journalOptions("captured"))).replayed,true);
+});
+
+test("journal default stays atomic and missing isolation capability never becomes an omission",async t=>{
+  const target=new Target(t,undefined,"INSERT INTO t VALUES(9,'taken')");
+  const journal=new ChangesetRebaseJournal(target,{journalId:"default"}); let calls=0;
+  const bytes=wire([insert(1n,"accepted"),insert(2n,"taken")]);
+  await assert.rejects(journal.apply(bytes,{tables:["t"],deliveryId:"default",onConflict:()=>{calls++;return "omit";}}),
+    e=>e instanceof FrankenSQLiteError);
+  assert.equal(calls,0); assert.deepEqual(columns(target.db),[[9n,"taken"]]);
+  assert.equal(target.log.filter(([op,d])=>op==="begin"&&d>0).length,0);
+  assert.deepEqual(journalState(target),[]);
+  target.capable=false; target.log=[];
+  await assert.rejects(journal.apply(bytes,journalOptions("capability",{onConflict:()=>{calls++;return "omit";}})),inputError);
+  assert.equal(calls,0); assert.deepEqual(journalState(target),[]);
+  assert.equal(target.log.some(([op,,sql])=>op==="execute"&&sql.startsWith('INSERT OR ABORT INTO main."t"')),false);
+  target.capable=true;
+  const result=await journal.apply(bytes,journalOptions("capability",{onConflict:()=>"omit"}));
+  assert.equal(result.replayed,false); assert.deepEqual([result.applied,result.omitted],[1,1]);
+});
+
+test("journal metadata write failures roll back accepted rows and do not consume delivery IDs",async t=>{
+  const target=new Target(t,undefined,"INSERT INTO t VALUES(9,'taken')");
+  const journal=new ChangesetRebaseJournal(target,{journalId:"atomic"});
+  await journal.apply(new Uint8Array(),{tables:["t"],deliveryId:"seed"});
+  const before=await journal.bookmark(), failure=constraint(2067); let calls=0;
+  const bytes=wire([insert(1n,"accepted"),insert(2n,"taken")]);
+  target.beforeExecute=sql=>{if(sql.startsWith('INSERT OR ABORT INTO main."__fsqlite_rebase_journal_entries"'))throw failure;};
+  await assert.rejects(journal.apply(bytes,journalOptions("retry-id",{onConflict:()=>{calls++;return "omit";}})),e=>e===failure);
+  assert.equal(calls,1,"a journal constraint must not invoke row policy");
+  assert.deepEqual(await journal.bookmark(),before); assert.equal(await journal.read("retry-id"),null);
+  assert.deepEqual(columns(target.db),[[9n,"taken"]]);
+  assert.deepEqual(columns(target.db,"SELECT delivery_id FROM __fsqlite_changeset_receipts"),[["seed"]]);
+  target.beforeExecute=null;
+  const result=await journal.apply(bytes,journalOptions("retry-id",{onConflict:()=>"omit"}));
+  assert.equal(result.replayed,false); assert.equal(result.entry.position,2);
+});
+
+test("journal waits for cancelled row rollback and retains its prior committed history",async t=>{
+  const target=new Target(t,undefined,"INSERT INTO t VALUES(9,'taken')");
+  const journal=new ChangesetRebaseJournal(target,{journalId:"cancel"});
+  await journal.apply(new Uint8Array(),{tables:["t"],deliveryId:"seed"});
+  const before=await journal.bookmark(), controller=new AbortController();
+  const entered=deferred(), release=deferred(); let finished=false, calls=0;
+  target.beforeRollback=async d=>{if(d===1){entered.resolve();await release.promise;}};
+  const pending=journal.apply(wire([insert(1n,"taken")]),journalOptions("cancelled",{
+    signal:controller.signal,onConflict:()=>{calls++;return "omit";},
+  }));
+  void pending.then(()=>{finished=true;},()=>{finished=true;});
+  await Promise.race([entered.promise,pending.then(()=>assert.fail("missing child rollback"))]);
+  controller.abort(); await new Promise(r=>setImmediate(r));
+  assert.equal(finished,false); assert.equal(target.depth,2); release.resolve();
+  await assert.rejects(pending,{code:"ERR_FSQLITE_CHANGESET_CANCELLED"});
+  assert.equal(calls,0); assert.equal(target.depth,0);
+  assert.deepEqual(await journal.bookmark(),before); assert.equal(await journal.read("cancelled"),null);
+  assert.deepEqual(columns(target.db),[[9n,"taken"]]);
+});
+
+test("journal failed replacement retains native decision order and restores trigger/FK effects",async t=>{
+  const target=new Target(t,`CREATE TABLE t(id INTEGER PRIMARY KEY,v TEXT UNIQUE);
+    CREATE TABLE child(id PRIMARY KEY REFERENCES t(id) ON DELETE CASCADE);
+    CREATE TABLE audit(v);CREATE TRIGGER removed AFTER DELETE ON t BEGIN INSERT INTO audit VALUES(old.v);END`,
+    "INSERT INTO t VALUES(1,'original'),(9,'taken');INSERT INTO child VALUES(1)");
+  const journal=new ChangesetRebaseJournal(target,{journalId:"replacement"}), seen=[];
+  const result=await journal.apply(wire([insert(1n,"taken"),insert(2n,"good")]),journalOptions("replacement",{
+    foreignKeys:"defer",onConflict:c=>{
+      seen.push([c.kind,c.current]);
+      if(c.kind==="conflict")return "replace";
+      assert.deepEqual(columns(target.db,"SELECT * FROM child"),[[1n]]);
+      assert.deepEqual(columns(target.db,"SELECT * FROM audit"),[]); return "omit";
+    },
+  }));
+  assert.deepEqual(seen,[["conflict",[1n,"original"]],["constraint",null]]);
+  assert.deepEqual([result.applied,result.omitted],[1,1]);
+  assert.deepEqual(columns(target.db),[[1n,"original"],[2n,"good"],[9n,"taken"]]);
+  assert.deepEqual(decodeRebaseInfo(result.entry.rebaseInfo)[0].changes.map(c=>[c.values[0],c.replace]),[[1n,true],[1n,false]]);
+  assert.deepEqual(await journal.read("replacement"),result.entry);
+});
