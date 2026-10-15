@@ -38,6 +38,11 @@ def transform(source: str, template: str) -> tuple[str, str]:
     arm = source[start:end]
     if not arm.endswith("            }\n"):
         raise ValueError("unexpected INSERT arm closing delimiter")
+    arm = replace_once(
+        arm,
+        "                    let outcome = self\n                        .execute_insert_select_materialized_rows_outcome(insert, &source_rows)\n                        .await?;",
+        "                    // Source VALUES have already been materialized against the\n                    // caller's bindings. The replay's ?1..?N are now ROW\n                    // bindings, so trailing UPSERT and RETURNING placeholders\n                    // must first be resolved against the ORIGINAL statement's\n                    // globally numbered/named slots (as INSERT SELECT does).\n                    let resolved_insert;\n                    let replay_insert = match params {\n                        Some(params) if !insert.upsert.is_empty() || !insert.returning.is_empty() => {\n                            let mut cloned = insert.clone();\n                            bind_placeholders_in_insert_statement(\n                                &mut cloned,\n                                &mut BindParamState::default(),\n                                params,\n                            )?;\n                            resolved_insert = cloned;\n                            &resolved_insert\n                        }\n                        _ => insert,\n                    };\n                    let outcome = self\n                        .execute_insert_select_materialized_rows_outcome(replay_insert, &source_rows)\n                        .await?;",
+    )
     body = textwrap.dedent(arm[len(head):-len("            }\n")])
     original_body = body
     body = replace_once(
