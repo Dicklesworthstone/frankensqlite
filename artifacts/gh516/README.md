@@ -29,10 +29,21 @@ after BEFORE triggers**, before bytecode use. A stale identity uses existing
 statement/compilation paths instead of stale bytecode.
 
 Admission is deliberately bounded: ordinary VALUES batches with INSERT triggers
-and an existing statement savepoint. SELECT streams, UPSERT, RETURNING, explicit
-OR FAIL/OR ROLLBACK, virtual tables, and attached/TEMP ownership retain their
+and an existing statement savepoint. Row-local RETURNING projections and `*`
+share the same row program and preserve its projected rows in the outer emitter.
+Function calls, subqueries, table-reading or unknown RETURNING expressions,
+SELECT streams, UPSERT, explicit OR FAIL/OR ROLLBACK, virtual tables, and
+attached/TEMP ownership retain their
 established paths. Triggers within admitted statements may still raise IGNORE,
 ABORT, FAIL, or ROLLBACK; those outcomes are in the differential corpus.
+
+The RETURNING admission walk never evaluates expressions. It traverses nested
+CASE/arithmetic/cast/null-test expressions without recursive native calls and
+refuses unknown forms. Both the original projection and the parameterized row
+template must qualify. Original parameter numbering remains owned by the
+existing replay SQL builder. Returned rows are collected from the write kernel,
+not reconstructed by reading the table after AFTER triggers have run. Stale
+compilation identity falls back with both the rows and affected count intact.
 
 ## Evidence, not assumed performance
 
@@ -42,6 +53,16 @@ memory and WAL mode, comparing ordered values, storage classes, error codes,
 changes, trigger side effects, rollback state, integrity, and reopened data.
 A separate test covers numbered parameter reuse; another rejects the synthetic
 8-row/9-statement replay behavior for inactive BEFORE and AFTER triggers.
+
+`crates/fsqlite-core/tests/gh516_returning_conformance.rs` adds 30 shared JSON
+fixtures for RETURNING, run in memory and WAL mode. They cover row-local
+projections, AFTER-trigger UPDATE/DELETE, IGNORE/REPLACE, RAISE outcomes, caller
+savepoints, final-image foreign keys, generated values and storage classes.
+The target also checks original parameter numbering across prepared executions
+and stock SQLite reads of the closed FrankenSQLite file. Its candidate-only
+redispatch test is explicitly ignored on the unchanged engine and required by
+the native gate after transformation. Parser-level admission tests are required
+then as well. Existing correctness and performance gates are not relaxed.
 
 The ignored release experiment measures 8/64/256-row batches, memory and WAL,
 no-trigger controls, inactive BEFORE/AFTER triggers, and active AFTER triggers.
@@ -66,3 +87,8 @@ application, missing anchors, and unexpected existing output files. It must be
 reviewed/rebased after another edit to that file. Failed gates never emit a
 validated receipt. The workflow verifies SHA-1/SHA-256 of the exact tested
 files before creating a staged commit; it never creates a pull request.
+
+
+The RETURNING extension has not been natively qualified or timed merely by
+being committed here. Its shared fixtures have reference-SQL coverage, but
+compilation, engine conformance and throughput require the native gate above.

@@ -91,6 +91,7 @@ def main() -> None:
     run(['python3',str(ARTIFACTS/'build_scenarios.py'),str(CASES)],results/'stock-corpus.log')
     shutil.copyfile(ARTIFACTS/'gh516_insert_batch.rs', TEST)
     cargo = ['cargo','test','--locked','--release','-p','fsqlite-core','--test','gh516_insert_batch']
+    returning = ['cargo','test','--locked','--release','-p','fsqlite-core','--test','gh516_returning_conformance']
     metadata = {'base_commit':base,'native_gates_passed':False,
                 'environment':{k:os.environ.get(k) for k in (
                     'CARGO_BUILD_JOBS','CARGO_PROFILE_RELEASE_LTO',
@@ -100,13 +101,18 @@ def main() -> None:
         # The baseline MUST include the same test/benchmark source. A known
         # conformance failure is retained, never silently converted to a pass.
         metadata['baseline_conformance_exit'] = run(cargo+['differential','--','--nocapture','--test-threads=1'], results/'baseline-conformance.log',require=False)
+        metadata['baseline_returning_exit'] = run(returning+['--','--nocapture','--test-threads=1'],results/'baseline-returning.log',require=False)
         run(cargo+['release_throughput','--','--ignored','--nocapture','--test-threads=1'],results/'before.log')
         apply(root)
         run(['rustfmt','--edition','2024','--config','skip_children=true',str(CONNECTION),str(MODULE),str(TEST)],results/'format.log')
         # rustfmt is allowed to touch only the three explicitly staged files.
         run(cargo+['--','--nocapture','--test-threads=1'],results/'conformance.log')
+        # Include the candidate-only RETURNING dispatch probe only after the
+        # exact engine transform. Ordinary baseline conformance stays runnable.
+        run(returning+['--','--include-ignored','--nocapture','--test-threads=1'],results/'returning.log')
+        run(['cargo','test','--locked','--release','-p','fsqlite-core','--lib','gh516_returning_admission','--','--test-threads=1'],results/'returning-admission.log')
         run(['cargo','test','--locked','--release','-p','fsqlite-core','--test','gh490_fallback_warn_once','--','--test-threads=1'],results/'gh490.log')
-        run(['cargo','clippy','--locked','--release','-p','fsqlite-core','--lib','--test','gh516_insert_batch','--','-D','warnings'],results/'clippy.log')
+        run(['cargo','clippy','--locked','--release','-p','fsqlite-core','--lib','--test','gh516_insert_batch','--test','gh516_returning_conformance','--','-D','warnings'],results/'clippy.log')
         run(['rustfmt','--edition','2024','--config','skip_children=true','--check',str(CONNECTION),str(MODULE),str(TEST)],results/'format-check.log')
         run(cargo+['release_throughput','--','--ignored','--nocapture','--test-threads=1'],results/'after.log')
         perf = performance(results/'before.log',results/'after.log')
@@ -124,7 +130,8 @@ def main() -> None:
         metadata.update(native_gates_passed=True,files=files,
                         performance=perf,
                         gates=['conformance_memory','conformance_wal','differential_parameters',
-                               'single_statement_dispatch','gh490','clippy','rustfmt','release_before_after'])
+                               'single_statement_dispatch','returning_conformance','returning_parameter_namespace',
+                               'returning_single_statement_dispatch','returning_admission','gh490','clippy','rustfmt','release_before_after'])
         (results/'validated.json').write_text(json.dumps(metadata,indent=2)+'\n')
     finally:
         (results/'attempt.json').write_text(json.dumps(metadata,indent=2)+'\n')

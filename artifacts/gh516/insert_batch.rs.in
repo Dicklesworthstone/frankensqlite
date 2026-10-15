@@ -21,6 +21,79 @@ pub(super) struct CompiledInsertReplay {
     cx: Cx,
 }
 
+/// A row's projected result belongs to the outer INSERT, not a synthetic
+/// nested statement. Keep it beside the affected count so a successful IGNORE
+/// cannot be confused with a returned row, and errors cannot expose a partial
+/// successful batch result.
+pub(super) struct CompiledInsertReplayOutcome {
+    pub(super) changes: usize,
+    pub(super) returning_rows: Vec<Row>,
+}
+
+/// Admission only: expressions are still evaluated by the ordinary INSERT
+/// program for each written row. In particular, do not evaluate RETURNING
+/// against stored rows after AFTER triggers have changed them.
+///
+/// Function calls (including overridable LIKE/JSON operators), table reads,
+/// subqueries, and unknown expression forms retain the existing replay path.
+/// Some of those paths materialize at compilation time, so sharing their
+/// bytecode could freeze the first row's result. Whitelist rather than guess
+/// purity from a function name. Use a worklist rather than recursive Rust
+/// calls: SQL expression depth must not become native-stack depth here.
+fn reusable_insert_returning(columns: &[fsqlite_ast::ResultColumn]) -> bool {
+    use fsqlite_ast::{Expr, Literal, ResultColumn};
+
+    let mut pending = Vec::new();
+    for column in columns {
+        match column {
+            ResultColumn::Star => {}
+            ResultColumn::Expr { expr, .. } => pending.push(expr),
+            ResultColumn::TableStar(_) => return false,
+        }
+    }
+    while let Some(expr) = pending.pop() {
+        match expr {
+            Expr::Literal(
+                Literal::CurrentTime | Literal::CurrentDate | Literal::CurrentTimestamp,
+                _,
+            ) => return false,
+            Expr::Literal(..) | Expr::Column(..) | Expr::Placeholder(..) => {}
+            Expr::BinaryOp { left, right, .. } => {
+                pending.push(left.as_ref());
+                pending.push(right.as_ref());
+            }
+            Expr::UnaryOp { expr, .. }
+            | Expr::Cast { expr, .. }
+            | Expr::Collate { expr, .. }
+            | Expr::IsNull { expr, .. } => pending.push(expr.as_ref()),
+            Expr::Between { expr, low, high, .. } => {
+                pending.push(expr.as_ref());
+                pending.push(low.as_ref());
+                pending.push(high.as_ref());
+            }
+            Expr::Case {
+                operand,
+                whens,
+                else_expr,
+                ..
+            } => {
+                if let Some(operand) = operand {
+                    pending.push(operand.as_ref());
+                }
+                for (condition, value) in whens {
+                    pending.push(condition);
+                    pending.push(value);
+                }
+                if let Some(value) = else_expr {
+                    pending.push(value.as_ref());
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
 impl Connection {
     pub(super) fn insert_replay_identity(&self) -> InsertReplayIdentity {
         InsertReplayIdentity {
@@ -37,14 +110,14 @@ impl Connection {
         original: &fsqlite_ast::InsertStatement,
         row_sql: &str,
     ) -> Result<Option<CompiledInsertReplay>> {
-        // Keep SELECT streaming, UPSERT OLD/NEW routing, RETURNING bindings,
-        // virtual tables, and attached/TEMP ownership on their established
+        // Keep SELECT streaming, UPSERT OLD/NEW routing, non-row-local
+        // RETURNING, virtual tables, and attached/TEMP ownership on their established
         // paths. FAIL/ROLLBACK also retain their historical replay entry until
         // their independently nested failure boundaries have a fast-path proof.
         // This is a positive admission rule, not a global fallback bypass.
         if !matches!(&original.source, InsertSource::Values(rows) if rows.len() > 1)
             || original.with.is_some()
-            || !original.returning.is_empty()
+            || !reusable_insert_returning(&original.returning)
             || !original.upsert.is_empty()
             || matches!(original.or_conflict,
                 Some(fsqlite_ast::ConflictAction::Fail | fsqlite_ast::ConflictAction::Rollback))
@@ -73,6 +146,12 @@ impl Connection {
         let Statement::Insert(insert) = &statement else {
             return Err(FrankenError::internal("INSERT row template is not an INSERT"));
         };
+        // The enclosing replay SQL builder owns original parameter numbering.
+        // Reuse its exact row template and value slice, including RETURNING
+        // bindings; do not allocate a second parameter namespace here.
+        if !reusable_insert_returning(&insert.returning) {
+            return Ok(None);
+        }
         let identity = self.insert_replay_identity();
         let program = self.compile_table_insert(insert, None).await?;
         if self.insert_replay_identity() != identity {
@@ -90,7 +169,7 @@ impl Connection {
         &'a self,
         plan: &'a CompiledInsertReplay,
         values: &'a [SqliteValue],
-    ) -> FallbackStatementFuture<'a, Result<usize>> {
+    ) -> FallbackStatementFuture<'a, Result<CompiledInsertReplayOutcome>> {
         // Keep the existing recursion/cancellation admission wrapper. Only
         // public SQL entry work is elided: no parse, rewrite, schema validation,
         // cache lookup, autocommit acquisition, or synthetic statement trace.
@@ -98,10 +177,13 @@ impl Connection {
             if self.insert_replay_identity() != plan.identity {
                 // Reentrant application functions may change schema/functions.
                 // Never run bytecode whose binding proof has expired.
-                self.execute_statement_impl_after_background_status(
+                let returning_rows = self.execute_statement_impl_after_background_status(
                     &plan.statement, Some(values), None, false,
                 ).await?;
-                return Ok(self.last_changes.get());
+                return Ok(CompiledInsertReplayOutcome {
+                    changes: self.last_changes.get(),
+                    returning_rows,
+                });
             }
             let Statement::Insert(insert) = &plan.statement else {
                 return Err(FrankenError::internal("compiled INSERT row lost its statement"));
@@ -139,7 +221,10 @@ impl Connection {
                 Some(&plan.program), Some(plan.identity),
             )).await;
             match result {
-                Ok(_) => Ok(self.last_changes.get()),
+                Ok(returning_rows) => Ok(CompiledInsertReplayOutcome {
+                    changes: self.last_changes.get(),
+                    returning_rows,
+                }),
                 Err(error) => {
                     self.restore_failed_statement_tracking(
                         statement_preserves_prior_changes_on_constraint(&plan.statement),
@@ -168,5 +253,50 @@ impl Connection {
         replay_identity: Option<InsertReplayIdentity>,
     ) -> Result<Vec<Row>> {
 /* INSERT_DISPATCH_BODY */
+    }
+}
+
+
+#[cfg(test)]
+mod gh516_returning_admission {
+    use super::*;
+
+    fn admits(projection: &str) -> bool {
+        let sql = format!("INSERT INTO t VALUES(?1,?2) RETURNING {projection}");
+        let Statement::Insert(insert) = parse_single_statement(&sql).unwrap() else {
+            panic!("INSERT fixture");
+        };
+        reusable_insert_returning(&insert.returning)
+    }
+
+    #[test]
+    fn row_local_projections_are_reusable_without_evaluation() {
+        for projection in [
+            "*",
+            "id,v,?7",
+            "id + 1, -id, CAST(id AS TEXT), v COLLATE NOCASE",
+            "CASE id WHEN 1 THEN v ELSE NULL END",
+            "CASE WHEN id BETWEEN 1 AND 3 THEN v ELSE 'other' END",
+            "v IS NULL, v IS NOT NULL",
+        ] {
+            assert!(admits(projection), "{projection}");
+        }
+    }
+
+    #[test]
+    fn nested_reads_and_calls_never_enter_the_shared_program() {
+        for projection in [
+            "upper(v)",
+            "(SELECT 1)",
+            "id + (SELECT 1)",
+            "CASE WHEN id=1 THEN upper(v) ELSE v END",
+            "CASE WHEN EXISTS(SELECT 1) THEN id ELSE 0 END",
+            "id BETWEEN 1 AND (SELECT 3)",
+            "v LIKE 'a%'",
+            "id IN (1,2)",
+            "CURRENT_TIMESTAMP",
+        ] {
+            assert!(!admits(projection), "{projection}");
+        }
     }
 }

@@ -68,7 +68,13 @@ def transform(source: str, template: str) -> tuple[str, str]:
     source = replace_once(source,
         "        let row_result = if let Some(returning_statement) = self.returning_statement.as_ref() {",
         "        let row_result = if let Some(plan) = self.compiled_insert.as_ref() {\n"
-        "            self.connection.execute_compiled_insert_replay_row(plan, row_values).await\n"
+        "            match self.connection.execute_compiled_insert_replay_row(plan, row_values).await {\n"
+        "                Ok(outcome) => {\n"
+        "                    self.returning_rows.extend(outcome.returning_rows);\n"
+        "                    Ok(outcome.changes)\n"
+        "                }\n"
+        "                Err(error) => Err(error),\n"
+        "            }\n"
         "        } else if let Some(returning_statement) = self.returning_statement.as_ref() {")
     source = replace_once(source,
         "                let prepared = if collect_returning {\n                    None\n                } else {\n"
@@ -80,6 +86,9 @@ def transform(source: str, template: str) -> tuple[str, str]:
     source = replace_once(source,
         "                    table_column_count,\n                    prepared,\n                    returning_statement,",
         "                    table_column_count,\n                    prepared,\n                    compiled_insert,\n                    returning_statement,")
+    source = replace_once(source,
+        "                let returning_statement = if collect_returning {",
+        "                let returning_statement = if collect_returning && compiled_insert.is_none() {")
     # These assertions prove the extraction didn't silently prune semantics.
     for marker in ["fire_before_triggers(", "fire_after_triggers(",
                    "enforce_fk_on_replace_victims(", "enforce_fk_on_insert(",
