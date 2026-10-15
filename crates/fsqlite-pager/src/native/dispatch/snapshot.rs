@@ -372,7 +372,8 @@ mod online_capture_tests {
                 NativePageLimits::default()).unwrap()).unwrap();
             let page = PageNumber::new(2).unwrap();
             let mut seed = owner.begin(&cx, TransactionMode::Concurrent).unwrap();
-            seed.write_page(&cx, page, &[7; 512]).await.unwrap();
+            // Both TransactionHandle and ErasedNativeTransaction are in scope here.
+            TransactionHandle::write_page(&mut seed, &cx, page, &[7; 512]).await.unwrap();
             seed.commit_at(&cx, 10).await.unwrap();
             let image = owner.capture_snapshot(&cx).unwrap();
             let mut reader = image.begin(&cx, TransactionMode::ReadOnly).unwrap();
@@ -386,10 +387,10 @@ mod online_capture_tests {
             assert!(matches!(owner.capture_snapshot(&cancelled), Err(FrankenError::Interrupt)));
             assert!(!owner.needs_recovery().unwrap());
             assert_eq!(owner.capture_snapshot(&cx).unwrap().snapshot().commit_seq(), CommitSeq::new(1));
-            assert_eq!(seed.pager_commit_state(), PagerCommitState::Committed);
+            assert_eq!(TransactionHandle::pager_commit_state(&seed), PagerCommitState::Committed);
             owner.close(&cx).unwrap();
             assert!(matches!(owner.capture_snapshot(&cx), Err(FrankenError::BusyRecovery)));
-            assert_eq!(reader.get_page(&cx, page).await.unwrap().as_bytes(), &[7; 512]);
+            assert_eq!(TransactionHandle::get_page(&reader, &cx, page).await.unwrap().as_bytes(), &[7; 512]);
             reader.commit_at(&cx, u64::MAX).await.unwrap();
             assert!(reader.acknowledgement().is_none());
             assert_eq!(image.snapshot().commit_time_unix_ns(), Some(10));

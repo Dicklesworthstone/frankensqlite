@@ -363,7 +363,7 @@ fn corrupt_backfill_seed_payload_cannot_authorize_a_later_window() {
             append(&mut wal, &cx, 1, true).await;
             append(&mut wal, &cx, 2, false).await;
             append(&mut wal, &cx, 3, true).await;
-            let mut file = open_file(&vfs, &cx);
+            let file = open_file(&vfs, &cx);
             // Leave every stored checksum and the entire next transaction
             // intact. Header-only seed validation would miss this damage.
             file.write(&cx, &[0xFF], 32 + 24).await.expect("damage first payload");

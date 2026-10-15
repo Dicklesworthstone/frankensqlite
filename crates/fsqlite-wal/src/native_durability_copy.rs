@@ -931,7 +931,9 @@ mod replication_tests {
                     shared_object_chain(&mut source, &cx, 129).await;
                     let original = bytes(&source.markers, &cx).await;
                     let offset = original.len() - COMMIT_MARKER_RECORD_V1_SIZE;
-                    let last = CommitMarker::from_record_bytes(&original[offset..]).unwrap();
+                    let last_bytes: &[u8; COMMIT_MARKER_RECORD_V1_SIZE] =
+                        original[offset..].try_into().unwrap();
+                    let last = CommitMarker::from_record_bytes(last_bytes).unwrap();
                     let mut changed = match damage {
                         0 => CommitMarker::new(
                             last.commit_seq, 999, last.capsule_object_id,

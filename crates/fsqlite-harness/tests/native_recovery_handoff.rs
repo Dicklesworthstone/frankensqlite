@@ -119,6 +119,26 @@ impl VfsFile for File {
     fn file_size(&self, cx: &Cx) -> Result<u64> { self.inner.file_size(cx) }
     fn lock(&mut self, cx: &Cx, level: LockLevel) -> Result<()> { self.inner.lock(cx, level) }
     fn unlock(&mut self, cx: &Cx, level: LockLevel) -> Result<()> { self.inner.unlock(cx, level) }
+    fn lock_external_wal_append(&mut self, cx: &Cx) -> Result<()> { self.inner.lock_external_wal_append(cx) }
+    fn owns_external_wal_append_write(&self, cx: &Cx) -> Result<bool> {
+        self.inner.owns_external_wal_append_write(cx)
+    }
+    fn restore_external_wal_append_attempt(&mut self, cx: &Cx) -> Result<()> {
+        self.inner.restore_external_wal_append_attempt(cx)
+    }
+    fn lock_external_shared_snapshot(&mut self, cx: &Cx) -> Result<()> {
+        self.inner.lock_external_shared_snapshot(cx)
+    }
+    fn restore_external_shared_snapshot_attempt(&mut self, cx: &Cx) -> Result<()> {
+        self.inner.restore_external_shared_snapshot_attempt(cx)
+    }
+    fn lock_external_maintenance(&mut self, cx: &Cx, wal_mode: bool) -> Result<()> {
+        self.inner.lock_external_maintenance(cx, wal_mode)
+    }
+    fn lock_external_wal_recovery(&mut self, cx: &Cx) -> Result<()> { self.inner.lock_external_wal_recovery(cx) }
+    fn restore_external_maintenance_attempt(&mut self, cx: &Cx) -> Result<()> {
+        self.inner.restore_external_maintenance_attempt(cx)
+    }
     fn check_reserved_lock(&self, cx: &Cx) -> Result<bool> { self.inner.check_reserved_lock(cx) }
     fn shm_map(&mut self, cx: &Cx, region: u32, size: u32, extend: bool) -> Result<ShmRegion> {
         self.inner.shm_map(cx, region, size, extend)

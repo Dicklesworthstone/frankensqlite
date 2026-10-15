@@ -249,11 +249,11 @@ fn live_transfer_refuses_unread_snapshots_without_changing_the_healthy_store() {
         let mut writer = db.begin(&cx).unwrap();
         db.write_page(&cx, &mut writer, page(2), Some(&[2; 512])).unwrap();
         let before = audit.lock().unwrap().counts;
-        let mut db = db.try_into_recovery().err().expect("both pins must refuse transfer");
+        let db = db.try_into_recovery().err().expect("both pins must refuse transfer");
         assert_eq!(audit.lock().unwrap().counts, before);
         assert_eq!(db.read_page(&cx, &mut writer, page(2)).unwrap().unwrap().as_ref(), &[2; 512]);
         db.rollback(&mut writer).unwrap();
-        let mut db = db.try_into_recovery().err().expect("unread snapshot still pins its owner");
+        let db = db.try_into_recovery().err().expect("unread snapshot still pins its owner");
         assert_eq!(db.read_page(&cx, &mut unread, page(2)).unwrap().unwrap().as_ref(), &[1; 512]);
         db.rollback(&mut unread).unwrap();
         let before = audit.lock().unwrap().counts;
