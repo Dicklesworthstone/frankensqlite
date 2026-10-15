@@ -40,7 +40,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 artifacts/gh516/run_native_validation.py --results "$GH516_RESULTS"
-      - name: Stage only the natively validated source commit (do not move main)
+      - name: Promote the natively validated source commit directly to main
         uses: actions/github-script@v7
         with:
           script: |
@@ -87,14 +87,19 @@ jobs:
               `Control-normalized speedup: ${receipt.performance.control_normalized_inactive_speedup}`,
               `Evidence: ${context.serverUrl}/${repo.owner}/${repo.repo}/actions/runs/${context.runId}`,
               'Measurements are local fixtures, not a universal throughput claim.',
-              'Staged only; no branch is moved by this workflow.',
+              'Promoted directly to main by the native gate; no pull request.',
             ].join('\n');
             const commit = await github.rest.git.createCommit({...repo,message,tree:createdTree.data.sha,parents:[head]});
+            const mainRef = await github.rest.git.getRef({...repo, ref:'heads/main'});
+            if (mainRef.data.object.sha !== head) {
+              throw new Error(`main advanced during GH516 validation: expected ${head}, found ${mainRef.data.object.sha}`);
+            }
+            await github.rest.git.updateRef({...repo, ref:'heads/main', sha:commit.data.sha, force:false});
             receipt.staged_commit = commit.data.sha;
             receipt.staged_tree = createdTree.data.sha;
-            receipt.remote_ref_updated = false;
-            fs.writeFileSync(path.join(out,'staged-commit.json'),JSON.stringify(receipt,null,2)+'\n');
-            core.notice(`GH516 validated source commit ${commit.data.sha}; main has NOT been updated.`);
+            receipt.remote_ref_updated = true;
+            fs.writeFileSync(path.join(out,'promoted-commit.json'),JSON.stringify(receipt,null,2)+'\n');
+            core.notice(`GH516 validated source commit ${commit.data.sha} promoted directly to main.`);
       - name: Preserve actual evidence even on failure
         if: always()
         uses: actions/upload-artifact@v4
