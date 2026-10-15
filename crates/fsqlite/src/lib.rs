@@ -39,6 +39,27 @@ pub use fsqlite_error::{DatabaseImagePublicationErrorClass, FrankenError};
 pub use fsqlite_types::SqliteValue;
 pub use fsqlite_vfs;
 pub use fsqlite_vfs::FileIdentity;
+
+/// Strict, read-only witnesses for guarded recovery of a frame-free WAL.
+///
+/// This is the public facade for the narrow GH#515 recovery proof. It lets an
+/// embedder that already snapshots and guards database-family bytes distinguish
+/// an unchanged frame-free WAL from the one supported transition: an existing
+/// zero-byte WAL gaining exactly one checksum-valid header whose page size
+/// matches the independently verified main database.
+///
+/// These helpers do **not** acquire a lock, bind a live WAL generation, authorize
+/// an append, modify `-shm`, or bypass `BusyRecovery`. Callers remain responsible
+/// for file identity, writer exclusion, main/journal invariants, and rechecking
+/// the same complete WAL bytes before publishing a guarded recovery.
+#[cfg(feature = "native")]
+pub mod wal_recovery {
+    pub use fsqlite_wal::frame_free::{
+        FrameFreeWalError, FrameFreeWalHeader, FrameFreeWalState, FrameFreeWalTransition,
+        inspect_frame_free_wal, verify_frame_free_wal_transition,
+    };
+}
+
 #[cfg(all(feature = "native", any(unix, windows)))]
 pub use fsqlite_vfs::{
     DatabaseNamespaceGenerationTransition, NamespaceGenerationTransitionOutcome,
