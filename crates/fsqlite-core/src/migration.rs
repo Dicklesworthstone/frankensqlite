@@ -20,15 +20,17 @@
 //!
 //! ## Interrupt safety
 //!
-//! Ordering guarantees "either the pre-migration state or the post-migration
-//! state, never a partial one":
+//! Repairs commit individually; completion is not inferred from an attempted
+//! pass. The completion marker is published only after all required steps and
+//! the final integrity check succeed:
 //! 1. The original files are copied to `<db>.pre-migration-bak*` **before** any
 //!    mutation, each via a temp file + atomic rename.
 //! 2. Each repair is its own atomic (WAL/journal-backed) commit, so an
 //!    interruption leaves the database at a valid inter-commit state.
 //! 3. The marker is written **last**, via a temp file + atomic rename, so its
 //!    presence means "fully migrated to this version". An interruption before
-//!    the marker write simply re-runs the (idempotent) pass on the next open.
+//!    the marker write leaves the pass eligible for retry on the next open.
+//! Earlier successful repairs are not rolled back when a later step fails.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -69,6 +71,25 @@ pub struct MigrationMarker {
     pub repairs_applied: Vec<String>,
 }
 
+/// The operation that prevented a migration from completing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationFailureStage {
+    /// The initial check did not establish a corruption verdict.
+    IntegrityCheck,
+    /// A mandatory pre-repair backup failed.
+    Backup,
+    /// Repairing invalid freelist entries failed.
+    FreelistRepair,
+    /// Reclaiming orphaned pages failed.
+    OrphanRepair,
+    /// Reclaiming legacy contentless FTS5 shadows failed.
+    ContentShadowRepair,
+    /// The post-repair integrity check failed.
+    IntegrityRecheck,
+    /// The completion marker could not be published.
+    MarkerPublication,
+}
+
 /// What the pass did, for callers/tests that want to observe it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MigrationOutcome {
@@ -84,6 +105,42 @@ pub enum MigrationOutcome {
     CleanNoRepair,
     /// Pre-existing database that was repaired; carries the applied-repair names.
     Repaired { repairs: Vec<String> },
+    /// The pass did not complete and did not publish a completion marker.
+    /// Earlier successful repairs remain committed and are listed here. This
+    /// is not a claim that the database is clean or that those repairs rolled
+    /// back. The existing marker, if any, is left unchanged.
+    Incomplete {
+        stage: MigrationFailureStage,
+        repairs: Vec<String>,
+        error: String,
+    },
+}
+
+fn migration_incomplete(
+    db_path: &str,
+    stage: MigrationFailureStage,
+    repairs: Vec<String>,
+    error: FrankenError,
+) -> MigrationOutcome {
+    tracing::warn!(
+        target: "fsqlite.migration",
+        db = %db_path,
+        ?stage,
+        %error,
+        "migration incomplete; completion marker was not published"
+    );
+    MigrationOutcome::Incomplete {
+        stage,
+        repairs,
+        error: error.to_string(),
+    }
+}
+
+/// An inability to inspect the database is not permission to repair it.
+/// In particular, BUSY, cancellation, I/O and internal errors must leave it
+/// untouched instead of entering a mutation path intended for corruption.
+fn permits_migration_repair(error: &FrankenError) -> bool {
+    matches!(error, FrankenError::DatabaseCorrupt { .. })
 }
 
 /// Append `suffix` to a database path (mirrors `wal_path_for_db_path` /
@@ -194,9 +251,10 @@ fn backup_original(db_path: &str) -> Result<PathBuf> {
 
 /// Run the one-time first-open migration/repair pass for `conn`.
 ///
-/// Infallible from the caller's perspective: any internal error is logged and
-/// the database is left no worse than it was found (the backup preserves the
-/// original). `storage_was_empty` is `true` when this open created the file.
+/// Best-effort from the opener's perspective: failures are logged and reported
+/// as `Incomplete`, never as successful repair. Every required operation must
+/// succeed before the completion marker is written. `storage_was_empty` is
+/// `true` when this open created the file.
 pub(crate) async fn run_first_open_migration(
     conn: &Connection,
     storage_was_empty: bool,
@@ -228,7 +286,12 @@ pub(crate) async fn run_first_open_migration(
             repairs_applied: Vec::new(),
         };
         if let Err(err) = write_marker_atomic(&db_path, &marker) {
-            tracing::warn!(target: "fsqlite.migration", %err, db = %db_path, "failed to stamp migration marker at birth");
+            return migration_incomplete(
+                &db_path,
+                MigrationFailureStage::MarkerPublication,
+                Vec::new(),
+                err,
+            );
         }
         return MigrationOutcome::MarkedAtBirth;
     }
@@ -250,8 +313,12 @@ pub(crate) async fn run_first_open_migration(
             let mut repairs_applied = Vec::new();
             if !conn.orphaned_fts5_content_shadow_names().is_empty() {
                 if let Err(err) = backup_original(&db_path) {
-                    tracing::warn!(target: "fsqlite.migration", %err, db = %db_path, "could not back up database before reclaiming orphaned FTS5 content shadows; leaving it untouched");
-                    return MigrationOutcome::CleanNoRepair;
+                    return migration_incomplete(
+                        &db_path,
+                        MigrationFailureStage::Backup,
+                        repairs_applied,
+                        err,
+                    );
                 }
                 match conn.reclaim_orphaned_fts5_content_shadows().await {
                     Ok(dropped) if !dropped.is_empty() => {
@@ -260,8 +327,22 @@ pub(crate) async fn run_first_open_migration(
                     }
                     Ok(_) => {}
                     Err(err) => {
-                        tracing::warn!(target: "fsqlite.migration", %err, db = %db_path, "reclaim_orphaned_fts5_content_shadows failed during migration");
+                        return migration_incomplete(
+                            &db_path,
+                            MigrationFailureStage::ContentShadowRepair,
+                            repairs_applied,
+                            err,
+                        );
                     }
+                }
+                // The initial check predates the shadow-table mutation.
+                if let Err(err) = conn.validate_database_integrity(false).await {
+                    return migration_incomplete(
+                        &db_path,
+                        MigrationFailureStage::IntegrityRecheck,
+                        repairs_applied,
+                        err,
+                    );
                 }
             }
             // Record the marker so the walk runs at most once.
@@ -271,7 +352,12 @@ pub(crate) async fn run_first_open_migration(
                 repairs_applied: repairs_applied.clone(),
             };
             if let Err(err) = write_marker_atomic(&db_path, &marker) {
-                tracing::warn!(target: "fsqlite.migration", %err, db = %db_path, "failed to write migration marker for a clean database");
+                return migration_incomplete(
+                    &db_path,
+                    MigrationFailureStage::MarkerPublication,
+                    repairs_applied,
+                    err,
+                );
             }
             if repairs_applied.is_empty() {
                 MigrationOutcome::CleanNoRepair
@@ -281,13 +367,25 @@ pub(crate) async fn run_first_open_migration(
                 }
             }
         }
-        Err(integrity_err) => {
+        Err(integrity_err) if !permits_migration_repair(&integrity_err) => {
+            migration_incomplete(
+                &db_path,
+                MigrationFailureStage::IntegrityCheck,
+                Vec::new(),
+                integrity_err,
+            )
+        }
+        Err(_) => {
             // Preserve the original before any mutation.
             let backup_path = match backup_original(&db_path) {
                 Ok(path) => path,
                 Err(err) => {
-                    tracing::warn!(target: "fsqlite.migration", %err, db = %db_path, "could not back up database before repair; leaving it untouched");
-                    return MigrationOutcome::CleanNoRepair;
+                    return migration_incomplete(
+                        &db_path,
+                        MigrationFailureStage::Backup,
+                        Vec::new(),
+                        err,
+                    );
                 }
             };
 
@@ -306,7 +404,12 @@ pub(crate) async fn run_first_open_migration(
                 }
                 Ok(_) => {}
                 Err(err) => {
-                    tracing::warn!(target: "fsqlite.migration", %err, db = %db_path, "repair_freelist failed during migration");
+                    return migration_incomplete(
+                        &db_path,
+                        MigrationFailureStage::FreelistRepair,
+                        repairs_applied,
+                        err,
+                    );
                 }
             }
             match conn.repair_orphaned_pages().await {
@@ -315,7 +418,12 @@ pub(crate) async fn run_first_open_migration(
                 }
                 Ok(_) => {}
                 Err(err) => {
-                    tracing::warn!(target: "fsqlite.migration", %err, db = %db_path, "repair_orphaned_pages failed during migration");
+                    return migration_incomplete(
+                        &db_path,
+                        MigrationFailureStage::OrphanRepair,
+                        repairs_applied,
+                        err,
+                    );
                 }
             }
 
@@ -329,18 +437,23 @@ pub(crate) async fn run_first_open_migration(
                 }
                 Ok(_) => {}
                 Err(err) => {
-                    tracing::warn!(target: "fsqlite.migration", %err, db = %db_path, "reclaim_orphaned_fts5_content_shadows failed during migration");
+                    return migration_incomplete(
+                        &db_path,
+                        MigrationFailureStage::ContentShadowRepair,
+                        repairs_applied,
+                        err,
+                    );
                 }
             }
 
-            // Best-effort confirmation (informational only).
-            let integrity_ok_after = conn.validate_database_integrity(false).await.is_ok();
-            if !integrity_ok_after {
-                tracing::warn!(
-                    target: "fsqlite.migration",
-                    db = %db_path,
-                    original = %integrity_err,
-                    "database still fails integrity_check after the migration repair pass; original preserved at the backup"
+            // A failed recheck is not successful migration. Do not suppress
+            // future attempts by marking an unresolved database complete.
+            if let Err(err) = conn.validate_database_integrity(false).await {
+                return migration_incomplete(
+                    &db_path,
+                    MigrationFailureStage::IntegrityRecheck,
+                    repairs_applied,
+                    err,
                 );
             }
 
@@ -351,7 +464,12 @@ pub(crate) async fn run_first_open_migration(
                 repairs_applied: repairs_applied.clone(),
             };
             if let Err(err) = write_marker_atomic(&db_path, &marker) {
-                tracing::warn!(target: "fsqlite.migration", %err, db = %db_path, "failed to write migration marker after repair");
+                return migration_incomplete(
+                    &db_path,
+                    MigrationFailureStage::MarkerPublication,
+                    repairs_applied,
+                    err,
+                );
             }
 
             let elapsed = started.elapsed().as_secs_f64();
@@ -367,6 +485,186 @@ pub(crate) async fn run_first_open_migration(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_explicit_corruption_authorizes_migration_repair() {
+        let errors = [
+            FrankenError::BusyRecovery,
+            FrankenError::Io(std::io::Error::other("inspection failed")),
+            FrankenError::internal("validation implementation failed"),
+            FrankenError::DatabaseNotFound {
+                path: PathBuf::from("missing.db"),
+            },
+            FrankenError::DatabaseFull,
+        ];
+        for error in errors {
+            assert!(!permits_migration_repair(&error), "{error}");
+        }
+        assert!(permits_migration_repair(&FrankenError::DatabaseCorrupt {
+            detail: "Page 3: never used".to_owned(),
+        }));
+    }
+
+    /// A structurally valid index with keys for the wrong declared column is
+    /// corruption that freelist/orphan/content-shadow repairs cannot fix.
+    /// Stock SQLite creates the fixture; no expected query rows are injected
+    /// into the engine or its migration driver.
+    fn migration_sqlite_fixture(inconsistent_index: bool) -> (PathBuf, String) {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let path = directory.join("migration.db");
+        let db_path = path.to_str().unwrap().to_owned();
+        let source = rusqlite::Connection::open(&path).unwrap();
+        source
+            .execute_batch(
+                "CREATE TABLE payload(id INTEGER PRIMARY KEY, v TEXT, w TEXT);
+                 INSERT INTO payload VALUES(1, 'original-v', 'original-w');
+                 CREATE INDEX payload_idx ON payload(v);",
+            )
+            .unwrap();
+        if inconsistent_index {
+            source
+                .execute_batch(
+                    "PRAGMA writable_schema=ON;
+                     UPDATE sqlite_master
+                     SET sql='CREATE INDEX payload_idx ON payload(w)'
+                     WHERE type='index' AND name='payload_idx';
+                     PRAGMA writable_schema=OFF;",
+                )
+                .unwrap();
+        }
+        drop(source);
+        // Reopen to invalidate the stock connection's cached original schema.
+        let oracle = rusqlite::Connection::open(&path).unwrap();
+        let verdict: String = oracle
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(verdict == "ok", !inconsistent_index, "{verdict}");
+        drop(oracle);
+        (directory, db_path)
+    }
+
+    #[test]
+    fn clean_marker_publication_failure_is_incomplete_and_can_retry() {
+        asupersync::test_utils::run_test(|| async {
+            let (directory, db_path) = migration_sqlite_fixture(false);
+            let marker_path = migration_marker_path(&db_path);
+            host_fs::create_dir_all(&marker_path).unwrap();
+            host_fs::write(&marker_path.join("sentinel"), b"retained blocker").unwrap();
+            let conn = Connection::open_schema_only(&db_path).await.unwrap();
+            assert!(matches!(
+                run_first_open_migration(&conn, false).await,
+                MigrationOutcome::Incomplete {
+                    stage: MigrationFailureStage::MarkerPublication,
+                    repairs,
+                    ..
+                } if repairs.is_empty()
+            ));
+            assert!(read_migration_marker(&db_path).is_none());
+            assert!(!pre_migration_backup_path(&db_path).exists());
+
+            // Retain, rather than delete, the blocker and retry the same pass.
+            let retained = directory.join("retained-marker-blocker");
+            host_fs::rename(&marker_path, &retained).unwrap();
+            assert_eq!(
+                run_first_open_migration(&conn, false).await,
+                MigrationOutcome::CleanNoRepair
+            );
+            let marker_bytes = host_fs::read(&marker_path).unwrap();
+            assert_eq!(
+                run_first_open_migration(&conn, false).await,
+                MigrationOutcome::AlreadyMigrated
+            );
+            assert_eq!(host_fs::read(&marker_path).unwrap(), marker_bytes);
+            assert_eq!(
+                host_fs::read(&retained.join("sentinel")).unwrap(),
+                b"retained blocker"
+            );
+            conn.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn failed_birth_marker_is_not_reported_as_marked_at_birth() {
+        asupersync::test_utils::run_test(|| async {
+            let directory = tempfile::tempdir().unwrap().keep();
+            let db_path = directory.join("new.db").to_str().unwrap().to_owned();
+            let marker_path = migration_marker_path(&db_path);
+            host_fs::create_dir_all(&marker_path).unwrap();
+            let conn = Connection::open_schema_only(&db_path).await.unwrap();
+            assert!(matches!(
+                run_first_open_migration(&conn, true).await,
+                MigrationOutcome::Incomplete {
+                    stage: MigrationFailureStage::MarkerPublication,
+                    ..
+                }
+            ));
+            assert!(read_migration_marker(&db_path).is_none());
+            host_fs::rename(&marker_path, &directory.join("retained-blocker")).unwrap();
+            assert_eq!(
+                run_first_open_migration(&conn, true).await,
+                MigrationOutcome::MarkedAtBirth
+            );
+            assert!(read_migration_marker(&db_path).is_some());
+            conn.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn unresolved_index_corruption_does_not_publish_completion() {
+        asupersync::test_utils::run_test(|| async {
+            let (_directory, db_path) = migration_sqlite_fixture(true);
+            let conn = Connection::open_schema_only(&db_path).await.unwrap();
+            let before = conn.validate_database_integrity(false).await.unwrap_err();
+            assert!(permits_migration_repair(&before), "{before}");
+            assert!(matches!(
+                run_first_open_migration(&conn, false).await,
+                MigrationOutcome::Incomplete { .. }
+            ));
+            assert!(read_migration_marker(&db_path).is_none());
+            assert!(pre_migration_backup_path(&db_path).exists());
+            assert!(conn.validate_database_integrity(false).await.is_err());
+            conn.close().await.unwrap();
+
+            let oracle = rusqlite::Connection::open(&db_path).unwrap();
+            let values: (String, String) = oracle
+                .query_row("SELECT v, w FROM payload WHERE id=1", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })
+                .unwrap();
+            assert_eq!(values, ("original-v".to_owned(), "original-w".to_owned()));
+            let verdict: String = oracle
+                .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+                .unwrap();
+            assert_ne!(verdict, "ok");
+        });
+    }
+
+    #[test]
+    fn required_backup_failure_is_incomplete_not_clean() {
+        asupersync::test_utils::run_test(|| async {
+            let (_directory, db_path) = migration_sqlite_fixture(true);
+            let backup = pre_migration_backup_path(&db_path);
+            host_fs::create_dir_all(&backup).unwrap();
+            host_fs::write(&backup.join("sentinel"), b"retain destination").unwrap();
+            let before = host_fs::read(Path::new(&db_path)).unwrap();
+            let conn = Connection::open_schema_only(&db_path).await.unwrap();
+            assert!(matches!(
+                run_first_open_migration(&conn, false).await,
+                MigrationOutcome::Incomplete {
+                    stage: MigrationFailureStage::Backup,
+                    repairs,
+                    ..
+                } if repairs.is_empty()
+            ));
+            assert!(read_migration_marker(&db_path).is_none());
+            conn.close().await.unwrap();
+            assert_eq!(host_fs::read(Path::new(&db_path)).unwrap(), before);
+            assert_eq!(
+                host_fs::read(&backup.join("sentinel")).unwrap(),
+                b"retain destination"
+            );
+        });
+    }
 
     fn backup_fixture() -> (PathBuf, String) {
         let directory = tempfile::tempdir().expect("create backup fixture").keep();
