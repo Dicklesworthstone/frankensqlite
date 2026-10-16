@@ -193,34 +193,19 @@ fn now_unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Serialize `marker` to its sidecar via a temp file + atomic rename, so a
-/// reader never observes a half-written marker.
+/// Serialize `marker` via private, exclusively reserved staging and atomic
+/// rename. Never truncate a stale `.tmp` file or an alias at that pathname.
 fn write_marker_atomic(db_path: &str, marker: &MigrationMarker) -> Result<()> {
     let final_path = migration_marker_path(db_path);
-    let tmp_path = sidecar_path(db_path, &format!("{MIGRATION_MARKER_SUFFIX}.tmp"));
     let json = serde_json::to_vec_pretty(marker)
         .map_err(|e| FrankenError::internal(format!("serialize migration marker: {e}")))?;
-    host_fs::write(&tmp_path, &json)?;
-    host_fs::rename(&tmp_path, &final_path)
+    host_fs::write_private_atomic(&final_path, &json)
 }
 
-/// Copy `from` to `<to>.tmp` then atomically rename to `to`. A missing source
-/// is not an error (the companion simply does not exist). Other inspection
-/// failures must not be mistaken for an absent WAL.
+/// Copy through private staging. Only an absent source is optional; alias,
+/// read, destination, sync and publication failures must stop required backups.
 fn backup_file_atomic(from: &Path, to: &Path) -> Result<bool> {
-    match host_fs::metadata(from) {
-        Ok(_) => {}
-        Err(FrankenError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(false);
-        }
-        Err(err) => return Err(err),
-    }
-    let mut tmp = to.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp_path = PathBuf::from(tmp);
-    host_fs::copy_file(from, &tmp_path)?;
-    host_fs::rename(&tmp_path, to)?;
-    Ok(true)
+    host_fs::copy_private_atomic_if_exists(from, to)
 }
 
 /// Back up the main database file and any `-wal`/`-shm` companions, so the
@@ -675,6 +660,63 @@ mod tests {
     }
 
     #[test]
+    fn migration_marker_publication_preserves_stale_temporary_contents() {
+        let (_directory, db_path) = backup_fixture();
+        let stale = sidecar_path(&db_path, &format!("{MIGRATION_MARKER_SUFFIX}.tmp"));
+        host_fs::write(&stale, b"retained interrupted marker").unwrap();
+        let marker = MigrationMarker {
+            last_upgrade_version: CURRENT_MIGRATION_VERSION,
+            last_run_at: 1_700_000_000,
+            repairs_applied: vec!["repair_orphaned_pages:3".to_owned()],
+        };
+        write_marker_atomic(&db_path, &marker).unwrap();
+        assert_eq!(read_migration_marker(&db_path), Some(marker));
+        assert_eq!(host_fs::read(&stale).unwrap(), b"retained interrupted marker");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let permissions = host_fs::metadata(&migration_marker_path(&db_path))
+                .unwrap()
+                .permissions();
+            assert_eq!(permissions.mode() & 0o077, 0);
+        }
+    }
+
+    #[test]
+    fn migration_marker_failure_preserves_the_existing_destination() {
+        let (_directory, db_path) = backup_fixture();
+        let final_path = migration_marker_path(&db_path);
+        host_fs::create_dir_all(&final_path).unwrap();
+        host_fs::write(&final_path.join("sentinel"), b"preserve destination").unwrap();
+        let marker = MigrationMarker {
+            last_upgrade_version: CURRENT_MIGRATION_VERSION,
+            last_run_at: 0,
+            repairs_applied: Vec::new(),
+        };
+        assert!(write_marker_atomic(&db_path, &marker).is_err());
+        assert_eq!(
+            host_fs::read(&final_path.join("sentinel")).unwrap(),
+            b"preserve destination"
+        );
+        assert!(read_migration_marker(&db_path).is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn migration_backup_family_has_no_group_or_other_access() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (_directory, db_path) = backup_fixture();
+        host_fs::write(&sidecar_path(&db_path, "-wal"), b"private WAL").unwrap();
+        host_fs::write(&sidecar_path(&db_path, "-shm"), b"private SHM").unwrap();
+        backup_original(&db_path).unwrap();
+        for suffix in ["", "-wal", "-shm"] {
+            let path = sidecar_path(&db_path, &format!("{PRE_MIGRATION_BACKUP_SUFFIX}{suffix}"));
+            assert_eq!(host_fs::metadata(&path).unwrap().permissions().mode() & 0o077, 0);
+        }
+    }
+
+    #[test]
     fn backup_requires_the_main_database() {
         let directory = tempfile::tempdir().expect("create fixture").keep();
         let path = directory.join("missing.db");
@@ -696,6 +738,9 @@ mod tests {
         let wal = sidecar_path(&db_path, "-wal");
         let wal_backup = sidecar_path(&db_path, &format!("{PRE_MIGRATION_BACKUP_SUFFIX}-wal"));
         assert!(!wal_backup.exists());
+        host_fs::create_empty_file(&wal).unwrap();
+        backup_original(&db_path).expect("an existing frame-free WAL is still preserved");
+        assert_eq!(host_fs::metadata(&wal_backup).unwrap().len(), 0);
         host_fs::write(&wal, b"committed rows not checkpointed").unwrap();
         backup_original(&db_path).expect("main plus WAL backup");
         assert_eq!(

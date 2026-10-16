@@ -26,6 +26,7 @@ pub mod host_fs {
     use std::fs::{File, OpenOptions};
     use std::io::Write as _;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[cfg(unix)]
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
@@ -222,6 +223,121 @@ pub mod host_fs {
         Ok(std::fs::copy(from, to)?)
     }
 
+    /// Publish bytes through a newly reserved sibling, never a pre-existing
+    /// temporary file. Unix staging and published files are owner-only from
+    /// creation (the umask may narrow that further); Windows inherits the
+    /// parent directory's ACL. Existing destination aliases are replaced by
+    /// rename, not opened for writing, so their referents are not truncated.
+    ///
+    /// The staging descriptor is synced before rename. This is atomic file
+    /// publication, NOT a multi-file snapshot or a directory durability fence.
+    /// The parent directory must already exist and remain in the caller's
+    /// trusted, cooperative namespace. Failed staging files are retained,
+    /// never reused or removed by this helper.
+    pub fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+        publish_private_file(path, |file| {
+            file.write_all(bytes)?;
+            Ok(())
+        })
+    }
+
+    /// Stream an existing regular source into a privately reserved sibling of
+    /// `to`, then publish it atomically. Source permissions are not copied.
+    ///
+    /// `Ok(false)` means opening the SOURCE returned `NotFound`. Destination,
+    /// read, write, sync, and publication failures always propagate, including
+    /// a missing destination directory. Sources use the existing no-follow
+    /// regular-file ingress; Unix additionally rejects multiple hard links.
+    ///
+    /// Like `copy_file`, this opens and closes an independent source descriptor;
+    /// it must not be used to snapshot a live database without the caller's
+    /// recovery/backup exclusion protocol. It neither acquires database locks
+    /// nor makes a changing database/WAL family into a consistent snapshot.
+    /// See `write_private_atomic` for publication and namespace requirements.
+    pub fn copy_private_atomic_if_exists(from: &Path, to: &Path) -> Result<bool> {
+        if from == to {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "private backup source and destination must differ",
+            )
+            .into());
+        }
+        let mut source = match open_existing_regular_file_no_follow(from) {
+            Ok(file) => file,
+            Err(fsqlite_error::FrankenError::Io(err))
+                if err.kind() == std::io::ErrorKind::NotFound =>
+            {
+                return Ok(false);
+            }
+            Err(err) => return Err(err),
+        };
+        publish_private_file(to, |file| {
+            std::io::copy(&mut source, file)?;
+            Ok(true)
+        })
+    }
+
+    fn publish_private_file<T>(
+        path: &Path,
+        write: impl FnOnce(&mut File) -> Result<T>,
+    ) -> Result<T> {
+        let (staging_path, mut file) = reserve_private_sibling(path)?;
+        let value = write(&mut file)?;
+        file.sync_all()?;
+        // Keep the reservation open through publication. reserve_new_file
+        // explicitly permits delete sharing on Windows for this operation.
+        std::fs::rename(&staging_path, path)?;
+        Ok(value)
+    }
+
+    fn reserve_private_sibling(path: &Path) -> Result<(PathBuf, File)> {
+        static NEXT_STAGING_ID: AtomicUsize = AtomicUsize::new(0);
+        // create_new is the authority, not the predictability of the name.
+        // Stale artifacts and concurrent callers never share a descriptor.
+        for _ in 0..64 {
+            let sequence = NEXT_STAGING_ID.fetch_add(1, Ordering::Relaxed);
+            let mut name = path.as_os_str().to_owned();
+            name.push(format!(".tmp.{}.{sequence}", std::process::id()));
+            let staging_path = PathBuf::from(name);
+            match reserve_new_file(&staging_path) {
+                Ok(file) => return Ok((staging_path, file)),
+                Err(fsqlite_error::FrankenError::Io(err))
+                    if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(err) => return Err(err),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("could not reserve a private sibling of {}", path.display()),
+        )
+        .into())
+    }
+
+    #[cfg(test)]
+    mod private_publication_tests {
+        use super::*;
+
+        #[test]
+        fn write_error_preserves_previous_publication_and_partial_staging() {
+            let directory = tempfile::tempdir().unwrap().keep();
+            let path = directory.join("backup");
+            std::fs::write(&path, b"previous complete image").unwrap();
+            let result: Result<()> = publish_private_file(&path, |file| {
+                file.write_all(b"partial new image")?;
+                Err(std::io::Error::other("injected staging write failure").into())
+            });
+            assert!(result.is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), b"previous complete image");
+            let staged: Vec<_> = read_dir_paths(&directory)
+                .unwrap()
+                .into_iter()
+                .filter(|entry| entry != &path)
+                .collect();
+            assert_eq!(staged.len(), 1);
+            assert_eq!(std::fs::read(&staged[0]).unwrap(), b"partial new image");
+        }
+    }
+
     pub fn remove_file(path: &Path) -> Result<()> {
         std::fs::remove_file(path).map_err(|e| {
             std::io::Error::new(e.kind(), format!("remove {}: {e}", path.display()))
@@ -253,12 +369,167 @@ pub mod host_fs {
 #[cfg(all(test, feature = "native", unix))]
 mod host_fs_security_tests {
     use std::io::{Read, Seek, SeekFrom, Write};
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
 
     use super::FileIdentity;
     use super::host_fs::{
-        open_existing_regular_file_no_follow, open_wal_for_guarded_repair, reserve_new_file,
+        copy_private_atomic_if_exists, open_existing_regular_file_no_follow,
+        open_wal_for_guarded_repair, reserve_new_file, write_private_atomic,
     };
+
+    #[test]
+    fn private_publication_replaces_broad_permissions_without_reusing_staging() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let path = directory.join("marker");
+        let stale = directory.join("marker.tmp");
+        std::fs::write(&path, b"old marker").unwrap();
+        std::fs::write(&stale, b"retained interrupted write").unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o666);
+        std::fs::set_permissions(&path, permissions).unwrap();
+
+        write_private_atomic(&path, b"complete new marker").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"complete new marker");
+        assert_eq!(std::fs::read(&stale).unwrap(), b"retained interrupted write");
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o077, 0);
+    }
+
+    #[test]
+    fn private_publication_does_not_truncate_temporary_or_final_alias_targets() {
+        for hard_link in [false, true] {
+            let directory = tempfile::tempdir().unwrap().keep();
+            let victim = directory.join("unrelated-data");
+            let path = directory.join("marker");
+            let stale = directory.join("marker.tmp");
+            std::fs::write(&victim, b"must survive publication").unwrap();
+            if hard_link {
+                std::fs::hard_link(&victim, &path).unwrap();
+                std::fs::hard_link(&victim, &stale).unwrap();
+            } else {
+                symlink(&victim, &path).unwrap();
+                symlink(&victim, &stale).unwrap();
+            }
+            write_private_atomic(&path, b"new marker").unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), b"new marker");
+            assert_eq!(std::fs::read(&victim).unwrap(), b"must survive publication");
+            assert_eq!(std::fs::read(&stale).unwrap(), b"must survive publication");
+            assert!(std::fs::symlink_metadata(&path).unwrap().is_file());
+        }
+    }
+
+    #[test]
+    fn private_copy_preserves_bytes_without_copying_source_permissions() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let source = directory.join("database");
+        let backup = directory.join("backup");
+        let payload: Vec<u8> = (0..=255).cycle().take(1_048_577).collect();
+        std::fs::write(&source, &payload).unwrap();
+        let mut permissions = std::fs::metadata(&source).unwrap().permissions();
+        permissions.set_mode(0o644);
+        std::fs::set_permissions(&source, permissions).unwrap();
+        assert!(copy_private_atomic_if_exists(&source, &backup).unwrap());
+        assert_eq!(std::fs::read(&backup).unwrap(), payload);
+        assert_eq!(std::fs::read(&source).unwrap(), payload);
+        assert_eq!(std::fs::metadata(&backup).unwrap().permissions().mode() & 0o077, 0);
+        assert_eq!(
+            std::fs::metadata(&source).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+    }
+
+    #[test]
+    fn private_copy_only_treats_source_not_found_as_optional() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let source = directory.join("source");
+        let backup = directory.join("existing-backup");
+        std::fs::write(&backup, b"previous backup").unwrap();
+        assert!(!copy_private_atomic_if_exists(&source, &backup).unwrap());
+        assert_eq!(std::fs::read(&backup).unwrap(), b"previous backup");
+
+        std::fs::write(&source, b"new source").unwrap();
+        let missing_destination_parent = directory.join("absent-parent").join("backup");
+        assert!(matches!(
+            copy_private_atomic_if_exists(&source, &missing_destination_parent),
+            Err(fsqlite_error::FrankenError::Io(err))
+                if err.kind() == std::io::ErrorKind::NotFound
+        ));
+        assert!(!directory.join("absent-parent").exists());
+        assert!(copy_private_atomic_if_exists(&source, &source).is_err());
+        assert_eq!(std::fs::read(&source).unwrap(), b"new source");
+    }
+
+    #[test]
+    fn private_copy_rejects_dangling_and_live_source_aliases() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let source = directory.join("source");
+        let link = directory.join("source-link");
+        let backup = directory.join("backup");
+        std::fs::write(&backup, b"preserve previous backup").unwrap();
+        symlink(&source, &link).unwrap();
+        assert!(copy_private_atomic_if_exists(&link, &backup).is_err());
+        std::fs::write(&source, b"source bytes").unwrap();
+        assert!(copy_private_atomic_if_exists(&link, &backup).is_err());
+        let alias = directory.join("source-hard-link");
+        std::fs::hard_link(&source, &alias).unwrap();
+        assert!(copy_private_atomic_if_exists(&source, &backup).is_err());
+        assert!(copy_private_atomic_if_exists(&alias, &backup).is_err());
+        assert!(copy_private_atomic_if_exists(&directory, &backup).is_err());
+        assert_eq!(std::fs::read(&backup).unwrap(), b"preserve previous backup");
+        assert_eq!(std::fs::read(&source).unwrap(), b"source bytes");
+    }
+
+    #[test]
+    fn failed_private_publication_retains_private_staging_and_destination() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let destination = directory.join("blocked");
+        std::fs::create_dir(&destination).unwrap();
+        std::fs::write(destination.join("sentinel"), b"existing destination").unwrap();
+        assert!(write_private_atomic(&destination, b"complete staging bytes").is_err());
+        assert_eq!(
+            std::fs::read(destination.join("sentinel")).unwrap(),
+            b"existing destination"
+        );
+        let staged: Vec<_> = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path != &destination)
+            .collect();
+        assert_eq!(staged.len(), 1);
+        assert_eq!(std::fs::read(&staged[0]).unwrap(), b"complete staging bytes");
+        assert_eq!(
+            std::fs::metadata(&staged[0]).unwrap().permissions().mode() & 0o077,
+            0
+        );
+    }
+
+    #[test]
+    fn concurrent_private_publication_never_shares_a_staging_file() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let path = directory.join("marker");
+        write_private_atomic(&path, &[0; 8192]).unwrap();
+        let barrier = std::sync::Barrier::new(9);
+        std::thread::scope(|scope| {
+            for tag in 1_u8..=8 {
+                let path = &path;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    write_private_atomic(path, &[tag; 8192]).unwrap();
+                });
+            }
+            barrier.wait();
+            for _ in 0..64 {
+                let image = std::fs::read(&path).unwrap();
+                assert_eq!(image.len(), 8192);
+                assert!(image[0] <= 8);
+                assert!(image.iter().all(|&byte| byte == image[0]));
+            }
+        });
+        let image = std::fs::read(&path).unwrap();
+        assert!((1..=8).contains(&image[0]));
+        assert!(image.iter().all(|&byte| byte == image[0]));
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+    }
 
     #[test]
     fn reserved_identity_revalidation_refuses_missing_and_replaced_paths() {
