@@ -851,7 +851,10 @@ mod tests {
         assert_eq!(missing_rows, 0);
 
         let backup = backup_original(db_path).expect("preserve main and WAL");
-        let restored = rusqlite::Connection::open(&backup).unwrap();
+        let retained = read_migration_backup(db_path).unwrap().unwrap();
+        assert_eq!(retained.main_path(), backup);
+        let restore_path = retained.restore_to_new_directory(&directory).unwrap();
+        let restored = rusqlite::Connection::open(&restore_path).unwrap();
         let value: String = restored
             .query_row("SELECT value FROM payload WHERE id=1", [], |row| row.get(0))
             .unwrap();
@@ -864,6 +867,8 @@ mod tests {
             .query_row("SELECT count(*) FROM payload", [], |row| row.get(0))
             .unwrap();
         assert_eq!(source_rows, 1);
+        drop(restored);
+        retained.verify().expect("stock recovery must not change retained evidence");
     }
 
     #[test]

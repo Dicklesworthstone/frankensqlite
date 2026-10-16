@@ -25,6 +25,7 @@ use super::{CURRENT_MIGRATION_VERSION, backup_file_atomic, sidecar_path};
 const RECEIPT_VERSION: u32 = 1;
 const MAX_RECEIPT_BYTES: u64 = 16 * 1024;
 const GENERATION_PREFIX: &str = ".fsqlite-migration-";
+const RESTORE_PREFIX: &str = ".fsqlite-restored-";
 const GENERATION_RECEIPT: &str = "receipt.json";
 const MAIN_FILE: &str = "database.db";
 const WAL_FILE: &str = "database.db-wal";
@@ -126,6 +127,70 @@ impl MigrationBackup {
         previous.verify()?;
         Ok(Some(previous))
     }
+
+    /// Materialize this restore point in a fresh private child of `parent`.
+    /// Returns the new main database path, with exactly the required WAL next
+    /// to it. The caller may open or modify this copy without checkpointing or
+    /// changing the retained generation. Existing paths are never reused.
+    ///
+    /// Main and WAL are verified before any destination is created, and their
+    /// copied bytes must independently match this handle's receipt. SHM,
+    /// journals, migration markers, and unlisted files are not restored.
+    /// Files are synced before return, with directory syncs on Unix. As with
+    /// capture, Windows has no portable directory-fsync guarantee here.
+    ///
+    /// `parent` must already exist in a trusted, cooperative namespace. This
+    /// method neither replaces the live source nor changes its selector.
+    /// Restoring a pre-repair image may restore its original corruption: byte
+    /// verification is not an SQL-integrity verdict or a repair operation.
+    ///
+    /// # Errors
+    /// Refuses invalid source bytes before destination creation. Later copy,
+    /// verification, or sync errors retain partial output for inspection but
+    /// never return its path as a successful restore.
+    pub fn restore_to_new_directory(&self, parent: &Path) -> Result<PathBuf> {
+        self.restore_with(parent, backup_file_atomic)
+    }
+
+    fn restore_with(
+        &self,
+        parent: &Path,
+        mut copy: impl FnMut(&Path, &Path) -> Result<bool>,
+    ) -> Result<PathBuf> {
+        self.verify()?;
+        let directory = tempfile::Builder::new()
+            .prefix(RESTORE_PREFIX)
+            .tempdir_in(parent)?
+            .keep();
+        let main = directory.join(MAIN_FILE);
+        copy_verified(&self.main_path(), &main, &self.receipt.main, &mut copy)?;
+        let wal = directory.join(WAL_FILE);
+        if let Some(expected) = &self.receipt.wal {
+            copy_verified(&self.directory.join(WAL_FILE), &wal, expected, &mut copy)?;
+        } else {
+            require_absent(&wal)?;
+        }
+        // The copy helper syncs each data file before its atomic rename.
+        // Only a complete, independently verified family reaches this point.
+        sync_directory(&directory)?;
+        sync_directory(parent)?;
+        Ok(main)
+    }
+}
+
+fn copy_verified(
+    from: &Path,
+    to: &Path,
+    expected: &FileDigest,
+    copy: &mut impl FnMut(&Path, &Path) -> Result<bool>,
+) -> Result<()> {
+    if !copy(from, to)? {
+        return Err(invalid_backup("required restore file disappeared during copy"));
+    }
+    if &file_digest(to)? != expected {
+        return Err(invalid_backup("restored bytes do not match their receipt"));
+    }
+    Ok(())
 }
 
 /// Load and verify the selected backup. Absence is distinct from an unreadable
@@ -321,6 +386,199 @@ mod tests {
         host_fs::write(&path, b"original main").unwrap();
         let db = path.to_str().unwrap().to_owned();
         (directory, db)
+    }
+
+    #[test]
+    fn restored_sqlite_generations_reopen_without_mutating_retained_evidence() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let path = directory.join("source.db");
+        let db = path.to_str().unwrap();
+        let source = rusqlite::Connection::open(&path).unwrap();
+        source.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE payload(id INTEGER PRIMARY KEY, value TEXT);
+             PRAGMA wal_checkpoint(TRUNCATE);
+             INSERT INTO payload VALUES(1, 'original');",
+        ).unwrap();
+        let first = capture(db).unwrap();
+        assert!(first.wal_path().is_some());
+        let first_receipt = host_fs::read(&first.directory.join(GENERATION_RECEIPT)).unwrap();
+        source.execute_batch("UPDATE payload SET value='after repair' WHERE id=1;").unwrap();
+        drop(source);
+        assert!(!sidecar_path(db, "-wal").exists(), "last stock close checkpoints WAL");
+        let second = capture(db).unwrap();
+        assert!(second.wal_path().is_none());
+        let selected = read_migration_backup(db).unwrap().unwrap();
+        let historical = selected.previous().unwrap().unwrap();
+        assert_eq!(historical.directory(), first.directory());
+        let selector = host_fs::read(&migration_backup_receipt_path(db)).unwrap();
+
+        for (backup, expected) in [(&historical, "original"), (&selected, "after repair")] {
+            let restored_path = backup.restore_to_new_directory(&directory).unwrap();
+            assert_ne!(restored_path, backup.main_path());
+            let restored = rusqlite::Connection::open(&restored_path).unwrap();
+            let value: String = restored.query_row(
+                "SELECT value FROM payload WHERE id=1", [], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(value, expected);
+            let integrity: String = restored.query_row(
+                "PRAGMA integrity_check", [], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(integrity, "ok");
+            restored.execute_batch(
+                "UPDATE payload SET value='modified restore' WHERE id=1;
+                 PRAGMA wal_checkpoint(TRUNCATE);",
+            ).unwrap();
+            drop(restored);
+            backup.verify().unwrap();
+        }
+        first.verify().unwrap();
+        second.verify().unwrap();
+        assert_eq!(host_fs::read(&first.directory.join(GENERATION_RECEIPT)).unwrap(), first_receipt);
+        assert_eq!(host_fs::read(&migration_backup_receipt_path(db)).unwrap(), selector);
+        let untouched = rusqlite::Connection::open(&path).unwrap();
+        let value: String = untouched.query_row(
+            "SELECT value FROM payload WHERE id=1", [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(value, "after repair");
+    }
+
+    #[test]
+    fn restore_uses_fresh_directories_and_excludes_unlisted_sidecars() {
+        let (directory, db) = fixture();
+        host_fs::write(&sidecar_path(&db, "-wal"), b"required WAL").unwrap();
+        host_fs::write(&sidecar_path(&db, "-shm"), b"stale SHM index").unwrap();
+        let backup = capture(&db).unwrap();
+        host_fs::write(&backup.directory.join("database.db-journal"), b"unlisted journal").unwrap();
+        host_fs::write(&backup.directory.join("database.db.fsqlite-migration-state"), b"old marker").unwrap();
+        let parent = directory.join("restores");
+        host_fs::create_dir_all(&parent).unwrap();
+        host_fs::write(&parent.join(MAIN_FILE), b"existing destination").unwrap();
+        let first = backup.restore_to_new_directory(&parent).unwrap();
+        let second = backup.restore_to_new_directory(&parent).unwrap();
+        assert_ne!(first.parent(), second.parent());
+        for main in [&first, &second] {
+            let entries = host_fs::read_dir_paths(main.parent().unwrap()).unwrap();
+            assert_eq!(entries.len(), 2, "only main and WAL belong in a restore");
+            assert!(entries.contains(main));
+            assert!(entries.contains(&main.parent().unwrap().join(WAL_FILE)));
+            assert_eq!(file_digest(main).unwrap(), backup.receipt.main);
+            assert_eq!(file_digest(&main.parent().unwrap().join(WAL_FILE)).unwrap(),
+                *backup.receipt.wal.as_ref().unwrap());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                for entry in std::iter::once(main.parent().unwrap().to_path_buf()).chain(entries) {
+                    assert_eq!(host_fs::metadata(&entry).unwrap().permissions().mode() & 0o077, 0);
+                }
+            }
+        }
+        assert_eq!(host_fs::read(&parent.join(MAIN_FILE)).unwrap(), b"existing destination");
+        assert_eq!(host_fs::read(&backup.directory.join(SHM_FILE)).unwrap(), b"stale SHM index");
+        backup.verify().unwrap();
+    }
+
+    #[test]
+    fn restore_distinguishes_absent_from_empty_wal() {
+        let (directory, db) = fixture();
+        let without_wal = capture(&db).unwrap();
+        host_fs::create_empty_file(&sidecar_path(&db, "-wal")).unwrap();
+        let empty_wal = capture(&db).unwrap();
+        let absent = without_wal.restore_to_new_directory(&directory).unwrap();
+        let empty = empty_wal.restore_to_new_directory(&directory).unwrap();
+        assert!(!absent.parent().unwrap().join(WAL_FILE).exists());
+        assert_eq!(host_fs::metadata(&empty.parent().unwrap().join(WAL_FILE)).unwrap().len(), 0);
+        without_wal.verify().unwrap();
+        empty_wal.verify().unwrap();
+    }
+
+    #[test]
+    fn restore_rejects_tampered_evidence_before_creating_output() {
+        for file in [MAIN_FILE, WAL_FILE] {
+            let (directory, db) = fixture();
+            host_fs::write(&sidecar_path(&db, "-wal"), b"required WAL").unwrap();
+            let backup = capture(&db).unwrap();
+            let path = backup.directory.join(file);
+            let mut bytes = host_fs::read(&path).unwrap();
+            bytes[0] ^= 1;
+            host_fs::write(&path, bytes).unwrap();
+            let mut before = host_fs::read_dir_paths(&directory).unwrap();
+            before.sort();
+            assert!(backup.restore_to_new_directory(&directory).is_err());
+            let mut after = host_fs::read_dir_paths(&directory).unwrap();
+            after.sort();
+            assert_eq!(before, after, "invalid {file} must fail before creating a restore");
+        }
+    }
+
+    #[test]
+    fn restore_required_wal_failure_preserves_partial_output_and_originals() {
+        let (directory, db) = fixture();
+        host_fs::write(&sidecar_path(&db, "-wal"), b"required WAL").unwrap();
+        let backup = capture(&db).unwrap();
+        let selector = host_fs::read(&migration_backup_receipt_path(&db)).unwrap();
+        let mut partial = None;
+        let result = backup.restore_with(&directory, |from, to| {
+            if to.file_name() == Some(std::ffi::OsStr::new(WAL_FILE)) {
+                partial = Some(to.parent().unwrap().to_path_buf());
+                host_fs::create_dir_all(to)?;
+                host_fs::write(&to.join("sentinel"), b"blocked WAL publication")?;
+            }
+            backup_file_atomic(from, to)
+        });
+        assert!(result.is_err());
+        let partial = partial.unwrap();
+        assert_eq!(host_fs::read(&partial.join(MAIN_FILE)).unwrap(), b"original main");
+        assert_eq!(host_fs::read(&partial.join(WAL_FILE).join("sentinel")).unwrap(), b"blocked WAL publication");
+        backup.verify().unwrap();
+        assert_eq!(host_fs::read(&migration_backup_receipt_path(&db)).unwrap(), selector);
+        let retry = backup.restore_to_new_directory(&directory).unwrap();
+        assert_ne!(retry.parent().unwrap(), partial.as_path());
+        backup.verify().unwrap();
+    }
+
+    #[test]
+    fn restore_detects_changes_between_verification_and_copy() {
+        for target in [MAIN_FILE, WAL_FILE] {
+            let (directory, db) = fixture();
+            host_fs::write(&sidecar_path(&db, "-wal"), b"required WAL").unwrap();
+            let backup = capture(&db).unwrap();
+            let mut changed = false;
+            let result = backup.restore_with(&directory, |from, to| {
+                if from.file_name() == Some(std::ffi::OsStr::new(target)) {
+                    // Simulate an external alteration after the initial
+                    // verification using real source bytes of the same size.
+                    let mut bytes = host_fs::read(from)?;
+                    bytes[0] ^= 1;
+                    host_fs::write(from, bytes)?;
+                    changed = true;
+                }
+                backup_file_atomic(from, to)
+            });
+            assert!(changed, "the initial receipt validation must pass");
+            assert!(matches!(result, Err(FrankenError::DatabaseCorrupt { .. })), "{target}");
+        }
+    }
+
+    #[test]
+    fn restore_refuses_disappearing_required_wal_and_missing_parent() {
+        let (directory, db) = fixture();
+        host_fs::write(&sidecar_path(&db, "-wal"), b"required WAL").unwrap();
+        let backup = capture(&db).unwrap();
+        let missing_parent = directory.join("nonexistent-parent");
+        assert!(backup.restore_to_new_directory(&missing_parent).is_err());
+        assert!(!missing_parent.exists(), "restoration must not create parents");
+        backup.verify().unwrap();
+        let retained_wal = directory.join("retained-displaced-wal");
+        let result = backup.restore_with(&directory, |from, to| {
+            if from.file_name() == Some(std::ffi::OsStr::new(WAL_FILE)) {
+                host_fs::rename(from, &retained_wal)?;
+            }
+            backup_file_atomic(from, to)
+        });
+        assert!(matches!(result, Err(FrankenError::DatabaseCorrupt { .. })));
+        assert_eq!(host_fs::read(&retained_wal).unwrap(), b"required WAL");
+        assert_eq!(host_fs::read(&backup.main_path()).unwrap(), b"original main");
     }
 
     #[test]
