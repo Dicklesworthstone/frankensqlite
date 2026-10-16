@@ -23,8 +23,9 @@
 //! Repairs commit individually; completion is not inferred from an attempted
 //! pass. The completion marker is published only after all required steps and
 //! the final integrity check succeed:
-//! 1. The original files are copied to `<db>.pre-migration-bak*` **before** any
-//!    mutation, each via a temp file + atomic rename.
+//! 1. The original main/WAL files are copied to a fresh private generation
+//!    **before** mutation. A checksummed receipt selects the complete set;
+//!    retries retain earlier generations rather than overwriting the original.
 //! 2. Each repair is its own atomic (WAL/journal-backed) commit, so an
 //!    interruption leaves the database at a valid inter-commit state.
 //! 3. The marker is written **last**, via a temp file + atomic rename, so its
@@ -41,6 +42,9 @@ use fsqlite_vfs::host_fs;
 use serde::{Deserialize, Serialize};
 
 use crate::connection::Connection;
+
+pub mod backup;
+pub use backup::{MigrationBackup, migration_backup_receipt_path, read_migration_backup};
 
 /// Sidecar suffix for the migration-state marker.
 pub const MIGRATION_MARKER_SUFFIX: &str = ".fsqlite-migration-state";
@@ -157,10 +161,16 @@ pub fn migration_marker_path(db_path: &str) -> PathBuf {
     sidecar_path(db_path, MIGRATION_MARKER_SUFFIX)
 }
 
-/// Path of the pre-migration backup of the main database file for `db_path`.
+/// Path selected by a well-formed generation receipt, or the legacy backup
+/// pathname when there is no readable receipt. This convenience lookup does
+/// not verify data bytes. Use [`read_migration_backup`] for explicit errors
+/// and checksum verification; do not open retained evidence for writing.
 #[must_use]
 pub fn pre_migration_backup_path(db_path: &str) -> PathBuf {
-    sidecar_path(db_path, PRE_MIGRATION_BACKUP_SUFFIX)
+    backup::selected_path(db_path)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| sidecar_path(db_path, PRE_MIGRATION_BACKUP_SUFFIX))
 }
 
 /// Read and parse the migration marker for `db_path`, if present and valid.
@@ -215,23 +225,7 @@ fn backup_file_atomic(from: &Path, to: &Path) -> Result<bool> {
 /// already stop before mutation and marker publication when this returns an
 /// error. Returns the main backup path on success.
 fn backup_original(db_path: &str) -> Result<PathBuf> {
-    let main_backup = pre_migration_backup_path(db_path);
-    if !backup_file_atomic(Path::new(db_path), &main_backup)? {
-        return Err(FrankenError::DatabaseNotFound {
-            path: PathBuf::from(db_path),
-        });
-    }
-
-    let wal = sidecar_path(db_path, "-wal");
-    let wal_backup = sidecar_path(db_path, &format!("{PRE_MIGRATION_BACKUP_SUFFIX}-wal"));
-    backup_file_atomic(&wal, &wal_backup)?;
-
-    let shm = sidecar_path(db_path, "-shm");
-    let shm_backup = sidecar_path(db_path, &format!("{PRE_MIGRATION_BACKUP_SUFFIX}-shm"));
-    if let Err(err) = backup_file_atomic(&shm, &shm_backup) {
-        tracing::warn!(target: "fsqlite.migration", %err, db = %db_path, "could not back up reconstructible SHM index; main database and WAL were preserved");
-    }
-    Ok(main_backup)
+    Ok(backup::capture(db_path)?.main_path())
 }
 
 /// Run the one-time first-open migration/repair pass for `conn`.
@@ -628,7 +622,7 @@ mod tests {
     fn required_backup_failure_is_incomplete_not_clean() {
         asupersync::test_utils::run_test(|| async {
             let (_directory, db_path) = migration_sqlite_fixture(true);
-            let backup = pre_migration_backup_path(&db_path);
+            let backup = migration_backup_receipt_path(&db_path);
             host_fs::create_dir_all(&backup).unwrap();
             host_fs::write(&backup.join("sentinel"), b"retain destination").unwrap();
             let before = host_fs::read(Path::new(&db_path)).unwrap();
@@ -709,9 +703,9 @@ mod tests {
         let (_directory, db_path) = backup_fixture();
         host_fs::write(&sidecar_path(&db_path, "-wal"), b"private WAL").unwrap();
         host_fs::write(&sidecar_path(&db_path, "-shm"), b"private SHM").unwrap();
-        backup_original(&db_path).unwrap();
+        let main = backup_original(&db_path).unwrap();
         for suffix in ["", "-wal", "-shm"] {
-            let path = sidecar_path(&db_path, &format!("{PRE_MIGRATION_BACKUP_SUFFIX}{suffix}"));
+            let path = sidecar_path(main.to_str().unwrap(), suffix);
             assert_eq!(host_fs::metadata(&path).unwrap().permissions().mode() & 0o077, 0);
         }
     }
@@ -736,32 +730,45 @@ mod tests {
         let main_backup = backup_original(&db_path).expect("main-only backup");
         assert_eq!(host_fs::read(&main_backup).unwrap(), b"original main image");
         let wal = sidecar_path(&db_path, "-wal");
-        let wal_backup = sidecar_path(&db_path, &format!("{PRE_MIGRATION_BACKUP_SUFFIX}-wal"));
+        let wal_backup = sidecar_path(main_backup.to_str().unwrap(), "-wal");
         assert!(!wal_backup.exists());
         host_fs::create_empty_file(&wal).unwrap();
-        backup_original(&db_path).expect("an existing frame-free WAL is still preserved");
-        assert_eq!(host_fs::metadata(&wal_backup).unwrap().len(), 0);
+        let empty = backup_original(&db_path).expect("an existing frame-free WAL is still preserved");
+        let empty_wal = sidecar_path(empty.to_str().unwrap(), "-wal");
+        assert_eq!(host_fs::metadata(&empty_wal).unwrap().len(), 0);
         host_fs::write(&wal, b"committed rows not checkpointed").unwrap();
-        backup_original(&db_path).expect("main plus WAL backup");
+        let full = backup_original(&db_path).expect("main plus WAL backup");
+        let full_wal = sidecar_path(full.to_str().unwrap(), "-wal");
         assert_eq!(
-            host_fs::read(&wal_backup).unwrap(),
+            host_fs::read(&full_wal).unwrap(),
             b"committed rows not checkpointed"
         );
         assert_eq!(
             host_fs::read(&wal).unwrap(),
-            host_fs::read(&wal_backup).unwrap()
+            host_fs::read(&full_wal).unwrap()
         );
+        assert!(!wal_backup.exists(), "retry must not add a WAL to the first generation");
+        assert_eq!(host_fs::metadata(&empty_wal).unwrap().len(), 0);
+        assert_ne!(main_backup, empty);
+        assert_ne!(empty, full);
     }
 
     #[test]
     fn backup_refuses_wal_publication_failure() {
         let (_directory, db_path) = backup_fixture();
         let wal = sidecar_path(&db_path, "-wal");
-        let wal_backup = sidecar_path(&db_path, &format!("{PRE_MIGRATION_BACKUP_SUFFIX}-wal"));
         host_fs::write(&wal, b"only committed copy").unwrap();
-        host_fs::create_dir_all(&wal_backup).unwrap();
-        host_fs::write(&wal_backup.join("sentinel"), b"do not replace").unwrap();
-        assert!(backup_original(&db_path).is_err());
+        let mut blocked = None;
+        let result = backup::capture_with(&db_path, |from, to| {
+            if from == wal.as_path() {
+                host_fs::create_dir_all(to)?;
+                host_fs::write(&to.join("sentinel"), b"do not replace")?;
+                blocked = Some(to.to_path_buf());
+            }
+            backup_file_atomic(from, to)
+        });
+        assert!(result.is_err());
+        let wal_backup = blocked.expect("real WAL publication was attempted");
         assert_eq!(
             host_fs::read(Path::new(&db_path)).unwrap(),
             b"original main image"
@@ -772,6 +779,7 @@ mod tests {
             b"do not replace"
         );
         assert!(!migration_marker_path(&db_path).exists());
+        assert!(!migration_backup_receipt_path(&db_path).exists());
     }
 
     #[test]
@@ -795,13 +803,14 @@ mod tests {
         let shm = sidecar_path(&db_path, "-shm");
         host_fs::write(&wal, b"required WAL").unwrap();
         host_fs::create_dir_all(&shm).unwrap();
-        backup_original(&db_path).expect("reconstructible SHM cannot veto preserved main and WAL");
-        let wal_backup = sidecar_path(&db_path, &format!("{PRE_MIGRATION_BACKUP_SUFFIX}-wal"));
+        let main = backup_original(&db_path)
+            .expect("reconstructible SHM cannot veto preserved main and WAL");
+        let wal_backup = sidecar_path(main.to_str().unwrap(), "-wal");
         assert_eq!(
             host_fs::read(&wal_backup).unwrap(),
             b"required WAL"
         );
-        assert!(!sidecar_path(&db_path, &format!("{PRE_MIGRATION_BACKUP_SUFFIX}-shm")).exists());
+        assert!(!sidecar_path(main.to_str().unwrap(), "-shm").exists());
     }
 
     #[test]
