@@ -43711,6 +43711,7 @@ struct InsertSelectReplayEmitter<'conn> {
     produced_rows: usize,
     error_state_recorded: bool,
     preserve_constraint_failure_rows: bool,
+    previous_changes: usize,
     previous_total_changes: usize,
     previous_last_insert_rowid: i64,
 }
@@ -43765,6 +43766,8 @@ impl InsertSelectReplayEmitter<'_> {
             return Err(FrankenError::FunctionError(message));
         }
 
+        self.connection
+            .set_statement_change_count(self.previous_changes);
         let row_result = if let Some(returning_statement) = self.returning_statement.as_ref() {
             self.connection
                 .execute_statement_impl_after_background_status(
@@ -46002,6 +46005,7 @@ impl Connection {
         let collect_returning = !insert.returning.is_empty();
         let preserve_constraint_failure_rows =
             insert.or_conflict == Some(fsqlite_ast::ConflictAction::Fail);
+        let previous_changes = self.last_changes.get();
         let previous_total_changes = self.total_changes.get();
         let previous_last_insert_rowid = self.current_last_insert_rowid();
         let mut execute_rows = async || -> Result<InsertSelectReplayOutcome> {
@@ -46031,6 +46035,7 @@ impl Connection {
                     produced_rows: 0,
                     error_state_recorded: false,
                     preserve_constraint_failure_rows,
+                    previous_changes,
                     previous_total_changes,
                     previous_last_insert_rowid,
                 };
@@ -54402,6 +54407,8 @@ impl Connection {
                         let preserve_rows = self
                             .statement_failure_keeps_rows(preserve_constraint_failure_rows, &error);
                         if preserve_rows {
+                            statement_changes =
+                                statement_changes.saturating_add(self.last_changes.get());
                             self.set_statement_change_count(statement_changes);
                             self.record_table_program_error_state(
                                 statement_changes,
@@ -72521,15 +72528,20 @@ impl Connection {
             &statement,
             Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
         );
-        self.execute_statement(&statement, (!params.is_empty()).then_some(params))
-            .await?;
+        let previous_total_changes = self.total_changes.get();
+        let previous_trigger_step_changes = self.trigger_step_changes.get();
+        let result = self
+            .execute_statement(&statement, (!params.is_empty()).then_some(params))
+            .await;
         if counts_changes {
-            self.trigger_step_changes.set(
-                self.trigger_step_changes
-                    .get()
-                    .saturating_add(self.last_changes.get()),
-            );
+            let step_total_delta = self
+                .total_changes
+                .get()
+                .saturating_sub(previous_total_changes);
+            self.trigger_step_changes
+                .set(previous_trigger_step_changes.saturating_add(step_total_delta));
         }
+        result?;
         Ok(TriggerStatementOutcome::Continue)
     }
 
