@@ -57,10 +57,6 @@ pub const SKIP_MIGRATION_ENV: &str = "FRANKENSQLITE_SKIP_MIGRATION";
 /// when a new repairable corruption class is added so upgraders re-run the pass.
 pub const CURRENT_MIGRATION_VERSION: u32 = 1;
 
-/// Companion suffixes copied alongside the main file into the pre-migration
-/// backup, so a WAL-mode database can be restored faithfully.
-const BACKUP_COMPANION_SUFFIXES: [&str; 2] = ["-wal", "-shm"];
-
 /// Persisted migration marker (`<db>.fsqlite-migration-state`, JSON).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MigrationMarker {
@@ -152,10 +148,15 @@ fn write_marker_atomic(db_path: &str, marker: &MigrationMarker) -> Result<()> {
 }
 
 /// Copy `from` to `<to>.tmp` then atomically rename to `to`. A missing source
-/// is not an error (the companion simply does not exist).
+/// is not an error (the companion simply does not exist). Other inspection
+/// failures must not be mistaken for an absent WAL.
 fn backup_file_atomic(from: &Path, to: &Path) -> Result<bool> {
-    if host_fs::metadata(from).is_err() {
-        return Ok(false);
+    match host_fs::metadata(from) {
+        Ok(_) => {}
+        Err(FrankenError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(false);
+        }
+        Err(err) => return Err(err),
     }
     let mut tmp = to.as_os_str().to_owned();
     tmp.push(".tmp");
@@ -166,17 +167,27 @@ fn backup_file_atomic(from: &Path, to: &Path) -> Result<bool> {
 }
 
 /// Back up the main database file and any `-wal`/`-shm` companions, so the
-/// original is preserved before any repair mutation. Returns the main backup
-/// path on success.
+/// original is preserved before any repair mutation. The main file and any
+/// existing WAL are mandatory: committed rows may exist only in the WAL. Only
+/// the reconstructible SHM index is best-effort. Both migration repair paths
+/// already stop before mutation and marker publication when this returns an
+/// error. Returns the main backup path on success.
 fn backup_original(db_path: &str) -> Result<PathBuf> {
     let main_backup = pre_migration_backup_path(db_path);
-    backup_file_atomic(Path::new(db_path), &main_backup)?;
-    for suffix in BACKUP_COMPANION_SUFFIXES {
-        let from = sidecar_path(db_path, suffix);
-        let to = sidecar_path(db_path, &format!("{PRE_MIGRATION_BACKUP_SUFFIX}{suffix}"));
-        // Companions are best-effort: a missing/uncopyable -shm must not abort
-        // the migration (it is rebuilt on next open).
-        let _ = backup_file_atomic(&from, &to);
+    if !backup_file_atomic(Path::new(db_path), &main_backup)? {
+        return Err(FrankenError::DatabaseNotFound {
+            path: PathBuf::from(db_path),
+        });
+    }
+
+    let wal = sidecar_path(db_path, "-wal");
+    let wal_backup = sidecar_path(db_path, &format!("{PRE_MIGRATION_BACKUP_SUFFIX}-wal"));
+    backup_file_atomic(&wal, &wal_backup)?;
+
+    let shm = sidecar_path(db_path, "-shm");
+    let shm_backup = sidecar_path(db_path, &format!("{PRE_MIGRATION_BACKUP_SUFFIX}-shm"));
+    if let Err(err) = backup_file_atomic(&shm, &shm_backup) {
+        tracing::warn!(target: "fsqlite.migration", %err, db = %db_path, "could not back up reconstructible SHM index; main database and WAL were preserved");
     }
     Ok(main_backup)
 }
@@ -356,6 +367,152 @@ pub(crate) async fn run_first_open_migration(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn backup_fixture() -> (PathBuf, String) {
+        let directory = tempfile::tempdir().expect("create backup fixture").keep();
+        let path = directory.join("original.db");
+        host_fs::write(&path, b"original main image").expect("write main image");
+        let db_path = path.to_str().expect("UTF-8 fixture path").to_owned();
+        (directory, db_path)
+    }
+
+    #[test]
+    fn backup_requires_the_main_database() {
+        let directory = tempfile::tempdir().expect("create fixture").keep();
+        let path = directory.join("missing.db");
+        let db_path = path.to_str().expect("UTF-8 fixture path");
+        host_fs::write(&sidecar_path(db_path, "-wal"), b"orphaned WAL").unwrap();
+        assert!(matches!(
+            backup_original(db_path),
+            Err(FrankenError::DatabaseNotFound { path: missing }) if missing == path
+        ));
+        assert!(!pre_migration_backup_path(db_path).exists());
+        assert!(!migration_marker_path(db_path).exists());
+    }
+
+    #[test]
+    fn backup_accepts_an_absent_wal_but_preserves_an_existing_one() {
+        let (_directory, db_path) = backup_fixture();
+        let main_backup = backup_original(&db_path).expect("main-only backup");
+        assert_eq!(host_fs::read(&main_backup).unwrap(), b"original main image");
+        let wal = sidecar_path(&db_path, "-wal");
+        let wal_backup = sidecar_path(&db_path, &format!("{PRE_MIGRATION_BACKUP_SUFFIX}-wal"));
+        assert!(!wal_backup.exists());
+        host_fs::write(&wal, b"committed rows not checkpointed").unwrap();
+        backup_original(&db_path).expect("main plus WAL backup");
+        assert_eq!(
+            host_fs::read(&wal_backup).unwrap(),
+            b"committed rows not checkpointed"
+        );
+        assert_eq!(
+            host_fs::read(&wal).unwrap(),
+            host_fs::read(&wal_backup).unwrap()
+        );
+    }
+
+    #[test]
+    fn backup_refuses_wal_publication_failure() {
+        let (_directory, db_path) = backup_fixture();
+        let wal = sidecar_path(&db_path, "-wal");
+        let wal_backup = sidecar_path(&db_path, &format!("{PRE_MIGRATION_BACKUP_SUFFIX}-wal"));
+        host_fs::write(&wal, b"only committed copy").unwrap();
+        host_fs::create_dir_all(&wal_backup).unwrap();
+        host_fs::write(&wal_backup.join("sentinel"), b"do not replace").unwrap();
+        assert!(backup_original(&db_path).is_err());
+        assert_eq!(
+            host_fs::read(Path::new(&db_path)).unwrap(),
+            b"original main image"
+        );
+        assert_eq!(host_fs::read(&wal).unwrap(), b"only committed copy");
+        assert_eq!(
+            host_fs::read(&wal_backup.join("sentinel")).unwrap(),
+            b"do not replace"
+        );
+        assert!(!migration_marker_path(&db_path).exists());
+    }
+
+    #[test]
+    fn backup_refuses_an_unreadable_wal_object() {
+        let (_directory, db_path) = backup_fixture();
+        let wal = sidecar_path(&db_path, "-wal");
+        host_fs::create_dir_all(&wal).unwrap();
+        host_fs::write(&wal.join("sentinel"), b"not a regular WAL").unwrap();
+        assert!(backup_original(&db_path).is_err());
+        assert_eq!(
+            host_fs::read(&wal.join("sentinel")).unwrap(),
+            b"not a regular WAL"
+        );
+        assert!(!migration_marker_path(&db_path).exists());
+    }
+
+    #[test]
+    fn backup_keeps_only_shm_failure_best_effort() {
+        let (_directory, db_path) = backup_fixture();
+        let wal = sidecar_path(&db_path, "-wal");
+        let shm = sidecar_path(&db_path, "-shm");
+        host_fs::write(&wal, b"required WAL").unwrap();
+        host_fs::create_dir_all(&shm).unwrap();
+        backup_original(&db_path).expect("reconstructible SHM cannot veto preserved main and WAL");
+        let wal_backup = sidecar_path(&db_path, &format!("{PRE_MIGRATION_BACKUP_SUFFIX}-wal"));
+        assert_eq!(
+            host_fs::read(&wal_backup).unwrap(),
+            b"required WAL"
+        );
+        assert!(!sidecar_path(&db_path, &format!("{PRE_MIGRATION_BACKUP_SUFFIX}-shm")).exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn backup_does_not_classify_metadata_errors_as_missing() {
+        let (directory, db_path) = backup_fixture();
+        // Traversing through a regular file produces ENOTDIR, not ENOENT.
+        // This remains a real error even when the test runs as root.
+        let from = Path::new(&db_path).join("not-a-child");
+        assert!(backup_file_atomic(&from, &directory.join("backup")).is_err());
+        assert!(!directory.join("backup").exists());
+    }
+
+    #[test]
+    fn backup_restores_rows_present_only_in_the_stock_sqlite_wal() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let path = directory.join("source.db");
+        let db_path = path.to_str().unwrap();
+        let source = rusqlite::Connection::open(&path).unwrap();
+        source
+            .execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; \
+                 CREATE TABLE payload(id INTEGER PRIMARY KEY, value TEXT); \
+                 PRAGMA wal_checkpoint(TRUNCATE); \
+                 INSERT INTO payload VALUES(1, 'committed only in WAL');",
+            )
+            .unwrap();
+        assert!(host_fs::metadata(&sidecar_path(db_path, "-wal")).unwrap().len() > 32);
+
+        // Keep the source connection alive: closing the last stock connection
+        // would checkpoint the row and make a main-only backup appear sound.
+        let main_only = directory.join("main-only.db");
+        host_fs::copy_file(&path, &main_only).unwrap();
+        let incomplete = rusqlite::Connection::open(&main_only).unwrap();
+        let missing_rows: i64 = incomplete
+            .query_row("SELECT count(*) FROM payload", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(missing_rows, 0);
+
+        let backup = backup_original(db_path).expect("preserve main and WAL");
+        let restored = rusqlite::Connection::open(&backup).unwrap();
+        let value: String = restored
+            .query_row("SELECT value FROM payload WHERE id=1", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, "committed only in WAL");
+        let integrity: String = restored
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        let source_rows: i64 = source
+            .query_row("SELECT count(*) FROM payload", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(source_rows, 1);
+    }
 
     #[test]
     fn sidecar_paths_append_suffix_to_raw_db_path() {
