@@ -6,12 +6,10 @@
 //! are retained but never selected. Legacy `.pre-migration-bak*` files are not
 //! rewritten, adopted, or combined with a new generation.
 //!
-//! This is atomic selection of a completed FILE SET, not an online SQLite
-//! snapshot protocol. Capture still uses the existing raw-file copy ingress:
-//! the caller must exclude source mutation/checkpoint for a coherent image.
-//! In particular, this module does not repair the migration opener's remaining
-//! live-source coordination gap or certify SQL integrity of a damaged source.
-//! Independent source descriptors must not be mistaken for database locks.
+//! `capture_migration_backup` captures native main/WAL through VFS handles
+//! under the existing physical-copy fences. Receipt selection and verification
+//! happen after the source handles release those fences. Capture preserves
+//! existing corruption; a coherent file set is not an SQL-integrity verdict.
 
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
@@ -21,6 +19,11 @@ use fsqlite_vfs::host_fs;
 use serde::{Deserialize, Serialize};
 
 use super::{CURRENT_MIGRATION_VERSION, backup_file_atomic, sidecar_path};
+
+#[cfg(any(unix, windows))]
+mod live;
+#[cfg(any(unix, windows))]
+pub use live::capture_migration_backup;
 
 const RECEIPT_VERSION: u32 = 1;
 const MAX_RECEIPT_BYTES: u64 = 16 * 1024;
@@ -259,6 +262,19 @@ pub(super) fn capture_with(
         tracing::warn!(target: "fsqlite.migration", db = %db_path, %error,
             "could not preserve reconstructible SHM; main and WAL are required");
     }
+    publish_generation(db_path, directory, previous, main, wal)
+}
+
+// Both coordinated native capture and offline filesystem fixtures select
+// generations through the same byte-verification and publication protocol.
+fn publish_generation(
+    db_path: &str,
+    directory: PathBuf,
+    previous: Option<MigrationBackup>,
+    main: FileDigest,
+    wal: Option<FileDigest>,
+) -> Result<MigrationBackup> {
+    let parent = source_parent(db_path);
     let generation = directory.file_name().and_then(|name| name.to_str())
         .ok_or_else(|| invalid_backup("invalid reserved generation name"))?.to_owned();
     let receipt = Receipt {
