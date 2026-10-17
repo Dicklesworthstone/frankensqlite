@@ -24,7 +24,8 @@
 //! pass. The completion marker is published only after all required steps and
 //! the final integrity check succeed:
 //! 1. The original main/WAL files are copied to a fresh private generation
-//!    **before** mutation. A checksummed receipt selects the complete set;
+//!    **before** mutation, with native VFS source fences held during copying.
+//!    A checksummed receipt selects the complete set;
 //!    retries retain earlier generations rather than overwriting the original.
 //! 2. Each repair is its own atomic (WAL/journal-backed) commit, so an
 //!    interruption leaves the database at a valid inter-commit state.
@@ -44,6 +45,8 @@ use serde::{Deserialize, Serialize};
 use crate::connection::Connection;
 
 pub mod backup;
+#[cfg(any(unix, windows))]
+pub use backup::capture_migration_backup;
 pub use backup::{MigrationBackup, migration_backup_receipt_path, read_migration_backup};
 
 /// Sidecar suffix for the migration-state marker.
@@ -218,14 +221,26 @@ fn backup_file_atomic(from: &Path, to: &Path) -> Result<bool> {
     host_fs::copy_private_atomic_if_exists(from, to)
 }
 
-/// Back up the main database file and any `-wal`/`-shm` companions, so the
-/// original is preserved before any repair mutation. The main file and any
-/// existing WAL are mandatory: committed rows may exist only in the WAL. Only
-/// the reconstructible SHM index is best-effort. Both migration repair paths
-/// already stop before mutation and marker publication when this returns an
-/// error. Returns the main backup path on success.
+/// Offline file-set fixtures retain the original raw-copy failure seam. This
+/// helper is not available to production migration or live capture.
+#[cfg(test)]
 fn backup_original(db_path: &str) -> Result<PathBuf> {
     Ok(backup::capture(db_path)?.main_path())
+}
+
+/// Both automatic repair paths require the same coherent native capture as
+/// the public backup API. Contention, cancellation, and unsupported platforms
+/// must stop before repair, never fall back to independent raw-file copies.
+async fn backup_before_repair(conn: &Connection) -> Result<PathBuf> {
+    #[cfg(any(unix, windows))]
+    {
+        Ok(backup::capture_migration_backup(conn).await?.main_path())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = conn;
+        Err(FrankenError::Unsupported)
+    }
 }
 
 /// Run the one-time first-open migration/repair pass for `conn`.
@@ -291,7 +306,7 @@ pub(crate) async fn run_first_open_migration(
             // open retries — exactly as the Err branch does on backup failure.
             let mut repairs_applied = Vec::new();
             if !conn.orphaned_fts5_content_shadow_names().is_empty() {
-                if let Err(err) = backup_original(&db_path) {
+                if let Err(err) = backup_before_repair(conn).await {
                     return migration_incomplete(
                         &db_path,
                         MigrationFailureStage::Backup,
@@ -356,7 +371,7 @@ pub(crate) async fn run_first_open_migration(
         }
         Err(_) => {
             // Preserve the original before any mutation.
-            let backup_path = match backup_original(&db_path) {
+            let backup_path = match backup_before_repair(conn).await {
                 Ok(path) => path,
                 Err(err) => {
                     return migration_incomplete(
@@ -464,6 +479,152 @@ pub(crate) async fn run_first_open_migration(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Stock-created, fully checkpointed input with a genuine freelist hole.
+    /// No FrankenSQLite connection or migration marker exists before damage.
+    #[cfg(any(unix, windows))]
+    fn orphaned_upgrade_fixture(wal_mode: bool) -> (PathBuf, String, Vec<u8>, u32) {
+        let directory = tempfile::tempdir().unwrap().keep();
+        let path = directory.join("upgrade.db");
+        let db = path.to_str().unwrap().to_owned();
+        let stock = rusqlite::Connection::open(&path).unwrap();
+        if wal_mode {
+            stock.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+        }
+        stock.execute_batch(
+            "CREATE TABLE payload(id INTEGER PRIMARY KEY, value TEXT, bytes BLOB);
+             INSERT INTO payload VALUES(1, 'retained', zeroblob(180000));
+             CREATE TABLE discarded(bytes BLOB);
+             INSERT INTO discarded VALUES(zeroblob(250000));
+             DROP TABLE discarded;",
+        ).unwrap();
+        drop(stock);
+        let mut before = host_fs::read(&path).unwrap();
+        let freed = u32::from_be_bytes(before[36..40].try_into().unwrap());
+        assert!(freed > 0, "stock DROP must free real pages");
+        before[32..40].fill(0);
+        host_fs::write(&path, &before).unwrap();
+        let oracle = rusqlite::Connection::open(&path).unwrap();
+        let verdict: String = oracle.query_row("PRAGMA integrity_check(1)", [], |row| row.get(0))
+            .unwrap();
+        assert!(verdict.contains("never used"), "{verdict}");
+        drop(oracle);
+        assert_eq!(host_fs::read(&path).unwrap(), before);
+        assert!(!migration_marker_path(&db).exists());
+        (directory, db, before, freed)
+    }
+
+    #[cfg(any(unix, windows))]
+    fn assert_upgrade_rows(path: &Path, expect_clean: bool) {
+        let oracle = rusqlite::Connection::open(path).unwrap();
+        let row: (i64, String, i64) = oracle.query_row(
+            "SELECT id, value, length(bytes) FROM payload", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            },
+        ).unwrap();
+        assert_eq!(row, (1, "retained".to_owned(), 180000));
+        let verdict: String = oracle.query_row("PRAGMA integrity_check(1)", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(verdict == "ok", expect_clean, "{verdict}");
+    }
+
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn ordinary_open_repairs_only_after_preserving_the_original_native_image() {
+        asupersync::test_utils::run_test(|| async {
+            for wal_mode in [false, true] {
+                let (directory, db, before, freed) = orphaned_upgrade_fixture(wal_mode);
+                // Exercise the actual default opener, not only the backup API.
+                let conn = Connection::open(&db).await.unwrap();
+                assert!(conn.is_concurrent_mode_default());
+                conn.validate_database_integrity(false).await.unwrap();
+                conn.close().await.unwrap();
+                let marker = read_migration_marker(&db).expect("completed automatic upgrade");
+                assert!(marker.repairs_applied.contains(&format!("repair_orphaned_pages:{freed}")),
+                    "{marker:?}");
+                let backup = read_migration_backup(&db).unwrap().unwrap();
+                assert_eq!(host_fs::read(&backup.main_path()).unwrap(), before);
+                let restored = backup.restore_to_new_directory(&directory).unwrap();
+                assert_upgrade_rows(&restored, false);
+                assert_upgrade_rows(Path::new(&db), true);
+                backup.verify().unwrap();
+                let selector = host_fs::read(&migration_backup_receipt_path(&db)).unwrap();
+                let reopened = Connection::open(&db).await.unwrap();
+                reopened.close().await.unwrap();
+                assert_eq!(host_fs::read(&migration_backup_receipt_path(&db)).unwrap(), selector);
+                backup.verify().unwrap();
+            }
+        });
+    }
+
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn automatic_upgrade_selection_failure_leaves_damage_retryable_without_repair() {
+        asupersync::test_utils::run_test(|| async {
+            let (directory, db, before, _) = orphaned_upgrade_fixture(false);
+            let selector = migration_backup_receipt_path(&db);
+            host_fs::create_dir_all(&selector).unwrap();
+            host_fs::write(&selector.join("sentinel"), b"preserve blocked selector").unwrap();
+            let conn = Connection::open(&db).await.unwrap();
+            assert!(conn.validate_database_integrity(false).await.is_err());
+            assert!(!migration_marker_path(&db).exists());
+            conn.close().await.unwrap();
+            assert_eq!(host_fs::read(Path::new(&db)).unwrap(), before);
+            let retained = directory.join("retained-selector-blocker");
+            host_fs::rename(&selector, &retained).unwrap();
+            let retry = Connection::open(&db).await.unwrap();
+            retry.validate_database_integrity(false).await.unwrap();
+            retry.close().await.unwrap();
+            let backup = read_migration_backup(&db).unwrap().unwrap();
+            assert_eq!(host_fs::read(&backup.main_path()).unwrap(), before);
+            assert_upgrade_rows(Path::new(&db), true);
+            assert_eq!(host_fs::read(&retained.join("sentinel")).unwrap(), b"preserve blocked selector");
+            backup.verify().unwrap();
+        });
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn migration_refuses_busy_native_capture_without_selecting_a_raw_fallback() {
+        use fsqlite_types::flags::VfsOpenFlags;
+        use fsqlite_vfs::{UnixVfs, Vfs as _, VfsFile as _};
+
+        asupersync::test_utils::run_test(|| async {
+            let (_directory, db, before, _) = orphaned_upgrade_fixture(true);
+            let conn = Connection::open_schema_only(&db).await.unwrap();
+            assert!(conn.is_concurrent_mode_default());
+            let cx = conn.root_cx().create_child();
+            let vfs = UnixVfs::new();
+            let (mut peer, _) = vfs.open(
+                &cx, Some(Path::new(&db)), VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB,
+            ).unwrap();
+            // Another VFS owner holds a real physical checkpoint attempt.
+            // Read-only integrity inspection can still diagnose the hole,
+            // but backup cannot acquire its own WRITE/CKPT ownership.
+            peer.lock_external_wal_checkpoint(&cx).unwrap();
+            let outcome = run_first_open_migration(&conn, false).await;
+            let cleanup = cx.create_child();
+            {
+                let _mask = cleanup.masked();
+                peer.restore_external_maintenance_attempt(&cleanup).unwrap();
+                peer.close(&cleanup).unwrap();
+            }
+            assert!(matches!(outcome, MigrationOutcome::Incomplete {
+                stage: MigrationFailureStage::Backup, ref repairs, ..
+            } if repairs.is_empty()), "{outcome:?}");
+            assert!(!migration_backup_receipt_path(&db).exists());
+            assert!(!migration_marker_path(&db).exists());
+            assert!(conn.validate_database_integrity(false).await.is_err());
+            let retried = run_first_open_migration(&conn, false).await;
+            assert!(matches!(retried, MigrationOutcome::Repaired { .. }), "{retried:?}");
+            conn.validate_database_integrity(false).await.unwrap();
+            conn.close().await.unwrap();
+            let backup = read_migration_backup(&db).unwrap().unwrap();
+            assert_eq!(host_fs::read(&backup.main_path()).unwrap(), before);
+            assert_upgrade_rows(Path::new(&db), true);
+            backup.verify().unwrap();
+        });
+    }
 
     #[test]
     fn only_explicit_corruption_authorizes_migration_repair() {

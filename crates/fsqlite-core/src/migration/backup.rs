@@ -32,6 +32,7 @@ const RESTORE_PREFIX: &str = ".fsqlite-restored-";
 const GENERATION_RECEIPT: &str = "receipt.json";
 const MAIN_FILE: &str = "database.db";
 const WAL_FILE: &str = "database.db-wal";
+#[cfg(test)]
 const SHM_FILE: &str = "database.db-shm";
 
 /// The atomically replaced selector, not the backup data itself.
@@ -229,12 +230,16 @@ fn selected_backup(db_path: &str) -> Result<Option<MigrationBackup>> {
     Ok(Some(MigrationBackup { directory, receipt }))
 }
 
+// Raw copying is deliberately restricted to stable, offline test fixtures.
+// Every production capture uses the native VFS source-fence path.
+#[cfg(test)]
 pub(super) fn capture(db_path: &str) -> Result<MigrationBackup> {
     capture_with(db_path, backup_file_atomic)
 }
 
 // The copy seam allows real filesystem failure injection without changing
 // production storage behavior or manufacturing successful source bytes.
+#[cfg(test)]
 pub(super) fn capture_with(
     db_path: &str,
     mut copy: impl FnMut(&Path, &Path) -> Result<bool>,
