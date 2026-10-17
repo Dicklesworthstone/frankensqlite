@@ -19,7 +19,7 @@
 
 use std::fs::File;
 use std::io;
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
 use std::os::fd::AsRawFd as _;
 #[cfg(test)]
 use std::os::unix::fs::FileExt as _;
@@ -83,8 +83,12 @@ pub fn ensure_shm_backing(file: &File, target_len: u64) -> io::Result<ShmBacking
 /// sparsely, exactly as releases up to 0.4.10 did at the same site.
 pub fn ensure_shm_backing_or_sparse(file: &File, target_len: u64) -> io::Result<ShmBacking> {
     let backing = ensure_proven_or_allocated(file, target_len)?;
-    if backing == ShmBacking::Sparse && file.metadata()?.len() < target_len {
-        file.set_len(target_len)?;
+    if backing == ShmBacking::Sparse {
+        let current_len = file.metadata()?.len();
+        if current_len < target_len {
+            macos_preallocate_before_set_len(file, current_len, target_len)?;
+            file.set_len(target_len)?;
+        }
     }
     Ok(backing)
 }
@@ -217,6 +221,73 @@ fn platform_ensure_shm_backing(_file: &File, _target_len: u64) -> io::Result<()>
     // up to 0.4.10 did. Add a backend proven against live peers before
     // admitting another target here.
     Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn preallocate_from_eof_with(
+    current_len: u64,
+    target_len: u64,
+    mut fcntl_preallocate: impl FnMut(bool, libc::off_t) -> io::Result<()>,
+) -> io::Result<()> {
+    let Some(delta) = target_len.checked_sub(current_len).filter(|&d| d > 0) else {
+        return Ok(());
+    };
+    let length = checked_length(delta)?;
+    if fcntl_preallocate(true, length).is_ok() {
+        return Ok(());
+    }
+    match fcntl_preallocate(false, length) {
+        Ok(()) => Ok(()),
+        Err(error) if is_storage_failure(&error) => Err(error),
+        Err(_) => Ok(()),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_preallocate_before_set_len(
+    file: &File,
+    current_len: u64,
+    target_len: u64,
+) -> io::Result<()> {
+    #[cfg(test)]
+    if ALLOCATION_FAULT.with(std::cell::Cell::get).is_some() {
+        return Ok(());
+    }
+    preallocate_from_eof_with(current_len, target_len, |contiguous, length| {
+        let fst_flags = if contiguous {
+            libc::F_ALLOCATECONTIG | libc::F_ALLOCATEALL
+        } else {
+            libc::F_ALLOCATEALL
+        };
+        let mut store = libc::fstore_t {
+            fst_flags,
+            fst_posmode: libc::F_PEOFPOSMODE,
+            fst_offset: 0,
+            fst_length: length,
+            fst_bytesalloc: 0,
+        };
+        loop {
+            // SAFETY: `file` is a valid open descriptor and `store` is a
+            // properly initialized `fstore_t` passed to `F_PREALLOCATE`.
+            if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PREALLOCATE, &raw mut store) } != -1 {
+                return Ok(());
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+#[allow(clippy::unnecessary_wraps)]
+fn macos_preallocate_before_set_len(
+    _file: &File,
+    _current_len: u64,
+    _target_len: u64,
+) -> io::Result<()> {
+    Ok(())
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -779,6 +850,32 @@ mod tests {
         let error = ensure_shm_backing(&file, u64::MAX).unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::EFBIG));
         assert_eq!(file.metadata().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn preallocate_from_eof_tries_contiguous_then_falls_back_to_all() {
+        let mut attempts = Vec::new();
+        preallocate_from_eof_with(4096, 12_288, |contiguous, length| {
+            attempts.push((contiguous, length));
+            if contiguous {
+                Err(io::Error::from_raw_os_error(libc::ENOSPC))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+        assert_eq!(attempts, vec![(true, 8192), (false, 8192)]);
+
+        let error = preallocate_from_eof_with(0, 4096, |_, _| {
+            Err(io::Error::from_raw_os_error(libc::ENOSPC))
+        })
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
+
+        preallocate_from_eof_with(0, 4096, |_, _| {
+            Err(io::Error::from_raw_os_error(libc::ENOTSUP))
+        })
+        .unwrap();
     }
 
     #[cfg(target_os = "linux")]
