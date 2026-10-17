@@ -26295,8 +26295,9 @@ impl Connection {
         }
 
         let publication = self.bind_pager_publication(cx, scenario_id).await?;
-        if publication.snapshot.visible_commit_seq > *self.memdb_visible_commit_seq.borrow()
-            || (hydrate_rows && !self.memdb_rows_loaded.get())
+        if !self.skip_statement_memdb_refresh.get()
+            && (publication.snapshot.visible_commit_seq > *self.memdb_visible_commit_seq.borrow()
+                || (hydrate_rows && !self.memdb_rows_loaded.get()))
         {
             self.discard_cached_vdbe_engine();
             // bd-db300.5.2.2.1: Count actual memdb refreshes (not skips).
@@ -39337,7 +39338,9 @@ impl Connection {
         &self,
         statement: &Statement,
     ) -> Result<()> {
-        if !Self::statement_validates_select_relations(statement) {
+        if self.skip_statement_memdb_refresh.get()
+            || !Self::statement_validates_select_relations(statement)
+        {
             return Ok(());
         }
 
@@ -43107,6 +43110,7 @@ impl Connection {
         //     computed once here.
         if select_stmt.limit.is_some()
             || insert.with.is_some()
+            || self.skip_statement_memdb_refresh.get()
             || {
                 let target = &insert.table.name;
                 let sources = Self::extract_table_names_from_select(select_stmt);
@@ -43226,6 +43230,11 @@ impl Connection {
         } else {
             select_stmt.clone()
         };
+        if self.skip_statement_memdb_refresh.get() && effective_select.with.is_none() {
+            return self
+                .execute_select_via_memdb_fallback(&effective_select, params)
+                .await;
+        }
         self.execute_statement(&Statement::Select(effective_select), params)
             .await
     }
@@ -46124,6 +46133,9 @@ impl Connection {
         select_stmt: &fsqlite_ast::SelectStatement,
         cx: &Cx,
     ) -> Result<()> {
+        if self.skip_statement_memdb_refresh.get() {
+            return Ok(());
+        }
         let pending_memdb_direct_upserts = !self.pending_memdb_direct_upserts.borrow().is_empty();
         let should_refresh_active_txn_memdb = self.active_txn.borrow().is_some()
             && (self.memdb_requires_active_txn_reload.get()
@@ -60600,6 +60612,11 @@ impl Connection {
                 .rowid_allocator
                 .clear_session(session_id);
         }
+        *self.concurrent_txn_rowid_mark.borrow_mut() = concurrent_session.map(|session_id| {
+            self._shared_mvcc_state
+                .rowid_allocator
+                .mark_savepoint(session_id)
+        });
         self.concurrent_txn.set(is_concurrent);
         self.txn_metrics_mark_started();
         record_hot_path_duration(&FSQLITE_BEGIN_SETUP_TIME_NS, begin_setup_start);
@@ -60616,6 +60633,7 @@ impl Connection {
     /// ends (`concurrent_session_id` returns to `None`) — is what actually frees
     /// the entries. A no-op when there is no active concurrent session.
     fn end_concurrent_rowid_session(&self) {
+        *self.concurrent_txn_rowid_mark.borrow_mut() = None;
         if let Some(session_id) = self.concurrent_session_id.borrow_mut().take() {
             self._shared_mvcc_state
                 .rowid_allocator
@@ -82583,6 +82601,25 @@ impl Connection {
             return positions;
         }
 
+        // Case 1b: Parsed primary_key_constraints on TableSchema (populated from
+        // table-level or non-IPK column-level PRIMARY KEY, including parenthesized
+        // column terms like `PRIMARY KEY(("id"))`).
+        if let Some(pk_cols) = table.primary_key_constraints.first() {
+            for (pk_pos, pk_col_name) in pk_cols.iter().enumerate() {
+                if let Some(col_idx) = table
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(pk_col_name))
+                {
+                    #[allow(clippy::cast_possible_wrap)]
+                    {
+                        positions[col_idx] = (pk_pos as i64) + 1;
+                    }
+                }
+            }
+            return positions;
+        }
+
         // Case 2: Parse original DDL to find PRIMARY KEY constraint
         let ddl_map = self.original_ddl_sql.borrow();
         let ddl = ddl_map.get(&table.name.to_ascii_lowercase());
@@ -82604,11 +82641,11 @@ impl Connection {
                         } = &tc.kind
                         {
                             for (pk_pos, pk_col) in pk_cols.iter().enumerate() {
-                                if let Expr::Column(col_ref, _) = &pk_col.expr
+                                if let Some((col_name, _)) = normalize_indexed_column_term(pk_col)
                                     && let Some(col_idx) = table
                                         .columns
                                         .iter()
-                                        .position(|c| c.name.eq_ignore_ascii_case(&col_ref.column))
+                                        .position(|c| c.name.eq_ignore_ascii_case(&col_name))
                                 {
                                     #[allow(clippy::cast_possible_wrap)]
                                     {
@@ -96675,36 +96712,25 @@ impl Connection {
         let op_cx = self.op_cx_after_background_status();
         if self.memdb_requires_active_txn_reload.get()
             || !self.pending_memdb_direct_upserts.borrow().is_empty()
+            || (self.active_txn.borrow().is_some() && !self.memdb_rows_loaded.get())
         {
             self.refresh_memdb_from_active_txn_if_dirty(&op_cx).await?;
         }
-        if matches!(statement, Statement::Select(_)) {
+        if self.active_txn.borrow().is_none() {
             // T1.6: when an outer connection delegates an attached-schema read
-            // into this attached child via `with_attached_connection`, the
-            // child's prior parent-dispatched writes (INSERT/UPDATE/DELETE)
-            // may still be parked in a retained autocommit transaction. The
-            // normal statement dispatcher would flush that retained txn before
-            // a SELECT whose dirty tables overlap the read set, but we bypass
-            // the dispatcher by calling this helper directly. If we proceed
-            // straight to `reload_memdb_from_pager` with uncommitted writes
-            // still parked, the reload reads the pager's pre-write committed
-            // state and the stripped SELECT observes zero rows. Flush the
-            // retained batch so the subsequent pager reload sees all the
-            // writes the outer connection already dispatched to us.
+            // or CTE-backed DML into this attached child via
+            // `with_attached_connection`, the child's prior parent-dispatched
+            // writes (INSERT/UPDATE/DELETE) may still be parked in a retained
+            // autocommit transaction. Flush the retained batch and hydrate
+            // memdb BEFORE installing the materialized CTE temp tables so a
+            // subsequent read does not need a pager reload that would wipe the
+            // installed CTE tables.
             if self.retained_autocommit_txn.borrow().is_some() {
                 self.flush_retained_autocommit_txn(&op_cx).await?;
             }
             self.refresh_memdb_from_cached_write_txn_if_stale(&op_cx)
                 .await?;
-            if !self.memdb_rows_loaded.get() {
-                self.reload_memdb_from_pager(&op_cx).await?;
-            } else {
-                // T1.5: when a parent connection delegates an attached-schema
-                // read to us via with_attached_connection, our memdb may be
-                // marked as loaded but actually hold stale rows from before
-                // the parent-issued writes committed to our pager. Force a
-                // fresh reload so the stripped query (e.g. `SELECT SUM FROM t`
-                // rewritten from `aux.t`) observes the committed pager state.
+            if !self.memdb_rows_loaded.get() || matches!(statement, Statement::Select(_)) {
                 self.reload_memdb_from_pager(&op_cx).await?;
             }
         }

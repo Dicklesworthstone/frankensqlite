@@ -7897,6 +7897,40 @@ impl VdbeEngine {
         sc.last_alloc_landed = false;
     }
 
+    fn reclaim_unlanded_storage_cursor_rowid_with_allocator(
+        allocator: Option<&ConcurrentRowIdAllocator>,
+        schema_epoch: SchemaEpoch,
+        session_id: u64,
+        sc: &mut StorageCursor,
+    ) {
+        if sc.last_alloc_rowid > 0
+            && !sc.last_alloc_landed
+            && matches!(sc.rowid_mode, RowIdMode::Normal)
+            && sc
+                .last_successful_insert_rowid
+                .is_none_or(|landed| landed < sc.last_alloc_rowid)
+            && let Some(allocator) = allocator
+            && let Ok(key) = Self::concurrent_rowid_key(schema_epoch, sc.root_page)
+        {
+            allocator.rewind_unlanded_one(session_id, key, sc.last_alloc_rowid);
+        }
+        Self::clear_storage_cursor_statement_state(sc);
+    }
+
+    fn reclaim_all_unlanded_storage_cursor_rowids(&mut self) {
+        let allocator = self.concurrent_rowid_allocator.clone();
+        let schema_epoch = self.concurrent_rowid_schema_epoch;
+        let session_id = self.concurrent_rowid_session_id;
+        for sc in self.storage_cursors.values_mut() {
+            Self::reclaim_unlanded_storage_cursor_rowid_with_allocator(
+                allocator.as_deref(),
+                schema_epoch,
+                session_id,
+                sc,
+            );
+        }
+    }
+
     fn clear_retained_storage_cursor_statement_state(&mut self) {
         for sc in self.storage_cursors.values_mut() {
             Self::clear_storage_cursor_statement_state(sc);
@@ -9826,6 +9860,7 @@ impl VdbeEngine {
                             message: msg,
                         };
                     }
+                    self.reclaim_all_unlanded_storage_cursor_rowids();
                     break ExecOutcome::Done;
                 }
 
@@ -10701,8 +10736,16 @@ impl VdbeEngine {
                 Opcode::Close => {
                     self.cursors.remove(&op.p1);
                     if self.retain_storage_cursors_on_close {
+                        let allocator = self.concurrent_rowid_allocator.clone();
+                        let schema_epoch = self.concurrent_rowid_schema_epoch;
+                        let session_id = self.concurrent_rowid_session_id;
                         if let Some(sc) = self.storage_cursors.get_mut(&op.p1) {
-                            Self::clear_storage_cursor_statement_state(sc);
+                            Self::reclaim_unlanded_storage_cursor_rowid_with_allocator(
+                                allocator.as_deref(),
+                                schema_epoch,
+                                session_id,
+                                sc,
+                            );
                         }
                     } else if !self.writable_storage_cursor_opened
                         && let Some(sc) = self.storage_cursors.get_mut(&op.p1)
@@ -10722,8 +10765,13 @@ impl VdbeEngine {
                         if !self.parked_read_cursor_ids.contains(&op.p1) {
                             self.parked_read_cursor_ids.push(op.p1);
                         }
-                    } else {
-                        self.storage_cursors.remove(&op.p1);
+                    } else if let Some(mut sc) = self.storage_cursors.remove(&op.p1) {
+                        Self::reclaim_unlanded_storage_cursor_rowid_with_allocator(
+                            self.concurrent_rowid_allocator.as_deref(),
+                            self.concurrent_rowid_schema_epoch,
+                            self.concurrent_rowid_session_id,
+                            &mut sc,
+                        );
                     }
                     self.sorters.remove(&op.p1);
                     if let Some(cold_state) = self.cold_state_mut() {

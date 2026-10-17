@@ -264,6 +264,13 @@ pub struct ConcurrentRowIdAllocator {
 struct SessionReservations {
     /// Rowids reserved and not yet rolled back.
     count: i64,
+    /// `(next_rowid, autoincrement_high_water)` just before this session's
+    /// first reservation on the table (when `count == 0`). When a savepoint or
+    /// transaction mark had `sp_count == 0`, `ensure_table_floor` may have
+    /// advanced `state.next_rowid` to the committed B-tree tip between the
+    /// mark and that first reservation; rewinding to `first_prior` reclaims
+    /// the session's contiguous tail back to that post-floor tip.
+    first_prior: (i64, i64),
     /// bd-8a8pr: `(statement, next_rowid, autoincrement_high_water, count)`
     /// just before that statement's first reservation on the table, taken
     /// lazily by [`ConcurrentRowIdAllocator::allocate_one_for_statement`]:
@@ -352,8 +359,12 @@ impl ConcurrentRowIdAllocator {
             .entry((session_id, key))
             .or_insert(SessionReservations {
                 count: 0,
+                first_prior: prior,
                 statement: None,
             });
+        if entry.count == 0 {
+            entry.first_prior = prior;
+        }
         if statement != 0
             && entry
                 .statement
@@ -421,11 +432,26 @@ impl ConcurrentRowIdAllocator {
         for &(key, sp_next, sp_high_water, sp_count) in
             mark.entries.iter().chain(absent_entries.iter())
         {
-            let current_count = session_reservations
+            let (current_count, first_prior) = session_reservations
                 .get(&(mark.session_id, key))
-                .map_or(0, |reservations| reservations.count);
+                .map_or((0, (sp_next, sp_high_water)), |reservations| {
+                    (reservations.count, reservations.first_prior)
+                });
+            let (target_next, target_high_water) = if sp_count == 0 && current_count > 0 {
+                (
+                    max_rowid_tip(sp_next, first_prior.0),
+                    sp_high_water.max(first_prior.1),
+                )
+            } else {
+                (sp_next, sp_high_water)
+            };
             if let Some(state) = tables.get_mut(&key) {
-                rewind_reserved_tail(state, sp_next, sp_high_water, current_count - sp_count);
+                rewind_reserved_tail(
+                    state,
+                    target_next,
+                    target_high_water,
+                    current_count - sp_count,
+                );
             }
             // Every reservation since the mark was rolled back — restore the
             // session's tracked count regardless of whether the tip rewound.
@@ -436,6 +462,39 @@ impl ConcurrentRowIdAllocator {
                 reservations.count = sp_count;
                 reservations.statement = None;
             }
+        }
+    }
+
+    /// Reclaim a single un-landed normal-mode rowid `unlanded_rowid` that
+    /// `session_id` allocated at the tail of `key` and then discarded (e.g.
+    /// `INSERT OR IGNORE` / `ON CONFLICT DO NOTHING` / `ON CONFLICT DO UPDATE`
+    /// where the newly-allocated rowid was never stored).
+    pub fn rewind_unlanded_one(&self, session_id: u64, key: AllocatorKey, unlanded_rowid: i64) {
+        if unlanded_rowid <= 0 {
+            return;
+        }
+        let mut session_reservations = self.session_reservations.lock();
+        let mut tables = self.tables.lock();
+        let Some(reservations) = session_reservations.get_mut(&(session_id, key)) else {
+            return;
+        };
+        if reservations.count <= 0 {
+            return;
+        }
+        if let Some(state) = tables.get_mut(&key)
+            && state.mode == RowIdMode::Normal
+            && state.next_rowid == unlanded_rowid.wrapping_add(1)
+        {
+            state.next_rowid = unlanded_rowid;
+        }
+        reservations.count -= 1;
+        if let Some((_, _, _, stmt_mark_count)) = reservations.statement
+            && reservations.count == stmt_mark_count
+        {
+            reservations.statement = None;
+        }
+        if reservations.count == 0 {
+            session_reservations.remove(&(session_id, key));
         }
     }
 
@@ -462,7 +521,7 @@ impl ConcurrentRowIdAllocator {
             };
             if marked != statement {
                 return true;
-            }
+            };
             if let Some(state) = tables.get_mut(&key) {
                 rewind_reserved_tail(
                     state,
@@ -538,13 +597,19 @@ impl ConcurrentRowIdAllocator {
         match tables.get_mut(&key) {
             Some(state) => {
                 state.next_rowid = max_rowid_tip(state.next_rowid, derived.next_rowid);
+                state.durable_next_rowid =
+                    max_rowid_tip(state.durable_next_rowid, derived.durable_next_rowid);
                 state.mode = mode;
                 if mode == RowIdMode::AutoIncrement {
                     state.autoincrement_high_water = state
                         .autoincrement_high_water
                         .max(derived.autoincrement_high_water);
+                    state.durable_high_water = state
+                        .durable_high_water
+                        .max(derived.durable_high_water);
                 } else {
                     state.autoincrement_high_water = 0;
+                    state.durable_high_water = 0;
                 }
             }
             None => {
