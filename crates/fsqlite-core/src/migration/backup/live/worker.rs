@@ -356,4 +356,85 @@ mod tests {
             assert_eq!(host_fs::read(&path).unwrap(), b"complete");
         });
     }
+
+    #[test]
+    fn dropped_publication_worker_preserves_selector_and_fresh_retry_succeeds() {
+        use super::super::super::{
+            GENERATION_PREFIX, GENERATION_RECEIPT, MAIN_FILE, capture, file_digest,
+            migration_backup_receipt_path, publish_generation, read_migration_backup,
+            read_migration_backup_with_check,
+        };
+        use std::cell::Cell;
+
+        execute(async {
+            let parent = tempfile::tempdir().unwrap().keep();
+            let db = parent.join("source.db").to_str().unwrap().to_owned();
+            host_fs::write(Path::new(&db), b"retained original").unwrap();
+            let previous = capture(&db).unwrap();
+            let selector = migration_backup_receipt_path(&db);
+            let before = host_fs::read(&selector).unwrap();
+            let directory = tempfile::Builder::new().prefix(GENERATION_PREFIX)
+                .tempdir_in(&parent).unwrap().keep();
+            host_fs::write_private_atomic(&directory.join(MAIN_FILE), &vec![0x57; 70001]).unwrap();
+            let digest = file_digest(&directory.join(MAIN_FILE)).unwrap();
+            let partial = directory.clone();
+            let receipt = directory.join(GENERATION_RECEIPT);
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let (completed_tx, completed_rx) = mpsc::channel();
+            let cx = context();
+            let caller = std::thread::current().id();
+            let owned_db = db.clone();
+            let owned_previous = previous.clone();
+            let mut future = Box::pin(run(&cx, move |check| {
+                let held = Cell::new(false);
+                let result = publish_generation(
+                    &owned_db, directory, Some(owned_previous), digest, None, &|| {
+                        check()?;
+                        if receipt.exists() && !held.replace(true) {
+                            entered_tx.send(std::thread::current().id()).map_err(io::Error::other)?;
+                            release_rx.recv_timeout(Duration::from_secs(10)).map_err(io::Error::other)?;
+                            check()?;
+                        }
+                        Ok(())
+                    },
+                );
+                // This receipt comes from the actual closure after the real
+                // publisher returned, not from the cancelled wrapper task.
+                completed_tx.send(matches!(&result, Err(FrankenError::Interrupt))).unwrap();
+                result
+            }));
+            assert_ne!(entered(future.as_mut(), &entered_rx).await, caller);
+            assert!(partial.join(GENERATION_RECEIPT).exists());
+            assert_eq!(host_fs::read(&selector).unwrap(), before);
+            drop(future);
+            release_tx.send(()).unwrap();
+            assert!(completed_rx.recv_timeout(Duration::from_secs(10)).unwrap());
+            assert_eq!(host_fs::read(&selector).unwrap(), before);
+            previous.verify().unwrap();
+            assert!(cx.checkpoint().is_ok());
+
+            let retry_dir = tempfile::Builder::new().prefix(GENERATION_PREFIX)
+                .tempdir_in(&parent).unwrap().keep();
+            assert_ne!(retry_dir, partial);
+            host_fs::write_private_atomic(&retry_dir.join(MAIN_FILE), b"new generation").unwrap();
+            let digest = file_digest(&retry_dir.join(MAIN_FILE)).unwrap();
+            let owned_db = db.clone();
+            let owned_previous = previous.clone();
+            let (retry, worker) = run(&cx, move |check| {
+                let backup = publish_generation(&owned_db, retry_dir, Some(owned_previous), digest, None, check)?;
+                Ok((backup, std::thread::current().id()))
+            }).await.unwrap();
+            assert_ne!(worker, caller);
+            let owned_db = db.clone();
+            let selected = run(&cx, move |check| {
+                read_migration_backup_with_check(&owned_db, check)
+            }).await.unwrap().unwrap();
+            assert_eq!(selected.directory(), retry.directory());
+            assert_eq!(retry.previous().unwrap().unwrap().directory(), previous.directory());
+            assert_eq!(read_migration_backup(&db).unwrap().unwrap().directory(), retry.directory());
+            assert_eq!(host_fs::read(&partial.join(MAIN_FILE)).unwrap(), vec![0x57; 70001]);
+            previous.verify().unwrap();
+        });
+    }
 }

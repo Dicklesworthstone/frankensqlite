@@ -97,17 +97,26 @@ impl MigrationBackup {
     /// # Errors
     /// Refuses missing, changed, aliased, or unexpected required files.
     pub fn verify(&self) -> Result<()> {
-        if file_digest(&self.main_path())? != self.receipt.main {
+        self.verify_with_check(&|| Ok(()))
+    }
+
+    // The live worker supplies cancellation/abandonment checks. Synchronous
+    // callers use the identical verifier without requiring a runtime.
+    fn verify_with_check(&self, check: &dyn Fn() -> Result<()>) -> Result<()> {
+        check()?;
+        if file_digest_with_check(&self.main_path(), check)? != self.receipt.main {
             return Err(invalid_backup("main file does not match its receipt"));
         }
+        check()?;
         let wal = self.directory.join(WAL_FILE);
         match &self.receipt.wal {
-            Some(expected) if &file_digest(&wal)? != expected => {
+            Some(expected) if &file_digest_with_check(&wal, check)? != expected => {
                 Err(invalid_backup("WAL does not match its receipt"))
             }
             Some(_) => Ok(()),
             None => require_absent(&wal),
-        }
+        }?;
+        check()
     }
 
     /// Return the previously selected generation observed during capture.
@@ -203,10 +212,19 @@ fn copy_verified(
 /// # Errors
 /// Refuses bad receipts, path traversal, and altered or missing main/WAL bytes.
 pub fn read_migration_backup(db_path: &str) -> Result<Option<MigrationBackup>> {
+    read_migration_backup_with_check(db_path, &|| Ok(()))
+}
+
+fn read_migration_backup_with_check(
+    db_path: &str,
+    check: &dyn Fn() -> Result<()>,
+) -> Result<Option<MigrationBackup>> {
+    check()?;
     let Some(backup) = selected_backup(db_path)? else {
+        check()?;
         return Ok(None);
     };
-    backup.verify()?;
+    backup.verify_with_check(check)?;
     Ok(Some(backup))
 }
 
@@ -267,7 +285,7 @@ pub(super) fn capture_with(
         tracing::warn!(target: "fsqlite.migration", db = %db_path, %error,
             "could not preserve reconstructible SHM; main and WAL are required");
     }
-    publish_generation(db_path, directory, previous, main, wal)
+    publish_generation(db_path, directory, previous, main, wal, &|| Ok(()))
 }
 
 // Both coordinated native capture and offline filesystem fixtures select
@@ -278,7 +296,9 @@ fn publish_generation(
     previous: Option<MigrationBackup>,
     main: FileDigest,
     wal: Option<FileDigest>,
+    check: &dyn Fn() -> Result<()>,
 ) -> Result<MigrationBackup> {
+    check()?;
     let parent = source_parent(db_path);
     let generation = directory.file_name().and_then(|name| name.to_str())
         .ok_or_else(|| invalid_backup("invalid reserved generation name"))?.to_owned();
@@ -297,12 +317,20 @@ fn publish_generation(
     if bytes.len() as u64 > MAX_RECEIPT_BYTES {
         return Err(FrankenError::TooBig);
     }
+    check()?;
     host_fs::write_private_atomic(&directory.join(GENERATION_RECEIPT), &bytes)?;
     let backup = MigrationBackup { directory, receipt };
-    backup.verify()?;
+    backup.verify_with_check(check)?;
     // Persist the complete generation and its parent entry before selection.
+    check()?;
     sync_directory(backup.directory())?;
+    check()?;
     sync_directory(parent)?;
+    // Last cancellation boundary before selection. Once the atomic write
+    // begins, finish its required directory sync even if cancellation arrives.
+    // A dropped awaiter may then observe either complete selection on retry;
+    // cancellation is not proof that the selector remained unchanged.
+    check()?;
     host_fs::write_private_atomic(&migration_backup_receipt_path(db_path), &bytes)?;
     // A failure here may leave a visible selector; it is NOT a rollback claim.
     // No repair is authorized by this function until all required syncs pass.
@@ -346,6 +374,11 @@ fn valid_generation(name: &str) -> bool {
 }
 
 fn file_digest(path: &Path) -> Result<FileDigest> {
+    file_digest_with_check(path, &|| Ok(()))
+}
+
+fn file_digest_with_check(path: &Path, check: &dyn Fn() -> Result<()>) -> Result<FileDigest> {
+    check()?;
     let file = host_fs::open_existing_regular_file_no_follow(path)?;
     let expected = file.metadata()?.len();
     let limit = expected.checked_add(1).ok_or(FrankenError::TooBig)?;
@@ -354,6 +387,7 @@ fn file_digest(path: &Path) -> Result<FileDigest> {
     let mut hasher = blake3::Hasher::new();
     let mut bytes = 0_u64;
     loop {
+        check()?;
         let count = input.read(&mut buffer)?;
         if count == 0 { break; }
         bytes = bytes.checked_add(count as u64).ok_or(FrankenError::TooBig)?;
@@ -362,6 +396,7 @@ fn file_digest(path: &Path) -> Result<FileDigest> {
     if bytes != expected || file.metadata()?.len() != expected {
         return Err(invalid_backup("backup changed length during verification"));
     }
+    check()?;
     Ok(FileDigest { bytes, blake3: *hasher.finalize().as_bytes() })
 }
 
@@ -802,6 +837,120 @@ mod tests {
         for path in [backup.directory.clone(), backup.main_path(), backup.wal_path().unwrap(),
             backup.directory.join(GENERATION_RECEIPT), migration_backup_receipt_path(&db)] {
             assert_eq!(host_fs::metadata(&path).unwrap().permissions().mode() & 0o077, 0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn pending(parent: &Path) -> (PathBuf, FileDigest, Option<FileDigest>) {
+        let directory = tempfile::Builder::new().prefix(GENERATION_PREFIX)
+            .tempdir_in(parent).unwrap().keep();
+        host_fs::write_private_atomic(&directory.join(MAIN_FILE), &vec![0x39; 70001]).unwrap();
+        host_fs::write_private_atomic(&directory.join(WAL_FILE), &vec![0x74; 25003]).unwrap();
+        let main = file_digest(&directory.join(MAIN_FILE)).unwrap();
+        let wal = file_digest(&directory.join(WAL_FILE)).unwrap();
+        (directory, main, Some(wal))
+    }
+
+    #[test]
+    fn large_digest_scan_observes_cancellation_between_reads_without_mutating_bytes() {
+        let parent = tempfile::tempdir().unwrap().keep();
+        let (directory, main, wal) = pending(&parent);
+        for (name, expected) in [(MAIN_FILE, main), (WAL_FILE, wal.unwrap())] {
+            let path = directory.join(name);
+            let before = host_fs::read(&path).unwrap();
+            let calls = Cell::new(0_usize);
+            let result = file_digest_with_check(&path, &|| {
+                calls.set(calls.get() + 1);
+                if calls.get() == 4 { Err(FrankenError::Interrupt) } else { Ok(()) }
+            });
+            assert!(matches!(result, Err(FrankenError::Interrupt)));
+            assert_eq!(calls.get(), 4, "the scan must stop, not hash the remaining file");
+            assert_eq!(host_fs::read(&path).unwrap(), before);
+            assert_eq!(file_digest_with_check(&path, &|| Ok(())).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn cancelled_backup_lookup_is_not_reported_as_missing_or_valid() {
+        let parent = tempfile::tempdir().unwrap().keep();
+        let db = parent.join("source.db").to_str().unwrap().to_owned();
+        assert!(matches!(read_migration_backup_with_check(&db, &|| Err(FrankenError::Interrupt)),
+            Err(FrankenError::Interrupt)));
+        assert!(!migration_backup_receipt_path(&db).exists());
+        let (directory, main, wal) = pending(&parent);
+        let backup = publish_generation(&db, directory, None, main, wal, &|| Ok(())).unwrap();
+        let selector = host_fs::read(&migration_backup_receipt_path(&db)).unwrap();
+        let calls = Cell::new(0_usize);
+        assert!(matches!(read_migration_backup_with_check(&db, &|| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 6 { Err(FrankenError::Interrupt) } else { Ok(()) }
+        }), Err(FrankenError::Interrupt)));
+        assert_eq!(calls.get(), 6);
+        assert_eq!(host_fs::read(&migration_backup_receipt_path(&db)).unwrap(), selector);
+        backup.verify().unwrap();
+        assert_eq!(read_migration_backup(&db).unwrap().unwrap().directory(), backup.directory());
+    }
+
+    #[test]
+    fn every_preselection_cancellation_boundary_preserves_previous_selection() {
+        let parent = tempfile::tempdir().unwrap().keep();
+        let db = parent.join("source.db").to_str().unwrap().to_owned();
+        let (directory, main, wal) = pending(&parent);
+        let calls = Cell::new(0_usize);
+        let previous = publish_generation(&db, directory, None, main, wal, &|| {
+            calls.set(calls.get() + 1);
+            Ok(())
+        }).unwrap();
+        let boundaries = calls.get();
+        assert!(boundaries > 10, "must visit the actual multi-chunk verification loop");
+        let selector_path = migration_backup_receipt_path(&db);
+        let selector = host_fs::read(&selector_path).unwrap();
+        for stop in 1..=boundaries {
+            let (directory, main, wal) = pending(&parent);
+            let retained = directory.clone();
+            let calls = Cell::new(0_usize);
+            let result = publish_generation(&db, directory, Some(previous.clone()), main, wal, &|| {
+                calls.set(calls.get() + 1);
+                if calls.get() == stop { Err(FrankenError::Interrupt) } else { Ok(()) }
+            });
+            assert!(matches!(result, Err(FrankenError::Interrupt)), "boundary {stop}");
+            assert_eq!(calls.get(), stop);
+            assert_eq!(host_fs::read(&selector_path).unwrap(), selector, "boundary {stop}");
+            assert!(retained.join(MAIN_FILE).exists());
+            assert!(retained.join(WAL_FILE).exists());
+            previous.verify().unwrap();
+        }
+        let (directory, main, wal) = pending(&parent);
+        let retry = publish_generation(&db, directory, Some(previous.clone()), main, wal, &|| Ok(())).unwrap();
+        retry.verify().unwrap();
+        assert_eq!(retry.previous().unwrap().unwrap().directory(), previous.directory());
+        assert_eq!(read_migration_backup(&db).unwrap().unwrap().directory(), retry.directory());
+    }
+
+    #[test]
+    fn cooperative_publication_still_refuses_changed_main_and_wal() {
+        for target in [MAIN_FILE, WAL_FILE] {
+            let parent = tempfile::tempdir().unwrap().keep();
+            let db = parent.join("source.db").to_str().unwrap().to_owned();
+            let (directory, main, wal) = pending(&parent);
+            let previous = publish_generation(&db, directory, None, main, wal, &|| Ok(())).unwrap();
+            let before = host_fs::read(&migration_backup_receipt_path(&db)).unwrap();
+            let (directory, main, wal) = pending(&parent);
+            // Same length, different bytes: cancellation support must not
+            // replace real digest checking with metadata or admission checks.
+            let path = directory.join(target);
+            let mut bytes = host_fs::read(&path).unwrap();
+            bytes[0] ^= 1;
+            host_fs::write(&path, &bytes).unwrap();
+            assert!(matches!(publish_generation(&db, directory, Some(previous.clone()), main, wal, &|| Ok(())),
+                Err(FrankenError::DatabaseCorrupt { .. })));
+            assert_eq!(host_fs::read(&migration_backup_receipt_path(&db)).unwrap(), before);
+            previous.verify().unwrap();
         }
     }
 }

@@ -19,7 +19,7 @@ use crate::connection::Connection;
 
 use super::{
     FileDigest, GENERATION_PREFIX, MAIN_FILE, MigrationBackup, WAL_FILE, invalid_backup,
-    publish_generation, read_migration_backup, sidecar_path, source_parent,
+    publish_generation, read_migration_backup_with_check, sidecar_path, source_parent,
 };
 
 #[cfg(unix)]
@@ -48,8 +48,11 @@ const HEADER_BYTES: usize = 100;
 /// Each data file uses a 64 KiB application copy buffer; no full image is loaded.
 /// Destination creation, writes, hashing and syncs use the connection runtime's
 /// blocking pool, with one owned buffer/write in flight. Missing runtime/pool
-/// authority is an error, never inline I/O or a new executor. Receipt verification
-/// is still synchronous. This remains a maintenance capture: source fences are
+/// authority is an error, never inline I/O or a new executor. Previous-generation
+/// verification, directory creation and receipt publication also use that pool;
+/// checksum scans check cancellation between fixed-size reads. Source admission,
+/// metadata probes and lock cleanup still use synchronous VFS operations.
+/// This remains a maintenance capture: source fences are
 /// retained while copying, and a running filesystem syscall cannot be preempted.
 /// Existing receipt, restoration, and Windows durability limitations still apply.
 ///
@@ -253,7 +256,10 @@ async fn capture_with_probe(
     // Refuse missing blocking authority before taking source fences or
     // creating a generation. No filesystem work is dispatched on failure.
     worker::preflight(cx)?;
-    let previous = read_migration_backup(db_path)?;
+    let lookup_path = db_path.to_owned();
+    let previous = worker::run(cx, move |check| {
+        read_migration_backup_with_check(&lookup_path, check)
+    }).await?;
     let vfs = NativeVfs::new();
     let main_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
     require_regular(Path::new(db_path))?;
@@ -273,10 +279,16 @@ async fn capture_with_probe(
     // A rollback journal is never part of the restore receipt. Refuse a
     // non-inert one even with a WAL header instead of guessing at recovery.
     require_inert_journal(&vfs, cx, db_path, main_identity).await?;
-    let directory = tempfile::Builder::new()
-        .prefix(GENERATION_PREFIX)
-        .tempdir_in(source_parent(db_path))?
-        .keep();
+    let parent = source_parent(db_path).to_path_buf();
+    let directory = worker::run(cx, move |check| {
+        check()?;
+        let directory = tempfile::Builder::new()
+            .prefix(GENERATION_PREFIX)
+            .tempdir_in(&parent)?
+            .keep();
+        check()?;
+        Ok(directory)
+    }).await?;
     let main_digest = copy_file(&main.file, cx, &directory.join(MAIN_FILE)).await?;
     after_main(&directory)?;
     checkpoint(cx)?;
@@ -321,7 +333,10 @@ async fn capture_with_probe(
     checkpoint(cx)?;
     // No source descriptor or physical-copy fence is used for the expensive
     // retained-file verification and receipt publication below.
-    publish_generation(db_path, directory, previous, main_digest, wal_digest)
+    let db_path = db_path.to_owned();
+    worker::run(cx, move |check| {
+        publish_generation(&db_path, directory, previous, main_digest, wal_digest, check)
+    }).await
 }
 
 #[cfg(test)]
