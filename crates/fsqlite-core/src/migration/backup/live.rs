@@ -6,8 +6,9 @@
 //! writer serialization or a lock-free online backup algorithm. Source file
 //! ownership and cancellation cleanup follow native WAL recovery's protocol.
 
-use std::io::Write as _;
 use std::path::Path;
+
+mod worker;
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::cx::Cx;
@@ -45,10 +46,12 @@ const HEADER_BYTES: usize = 100;
 ///
 /// The source must be a native database in a trusted, cooperative namespace.
 /// Each data file uses a 64 KiB application copy buffer; no full image is loaded.
-/// Destination writes/syncs and receipt verification are synchronous filesystem
-/// work. This is a maintenance capture, not a nonblocking or deadline-guaranteed
-/// backup API. Unsupported native targets have no implementation. Existing
-/// receipt, restoration, and Windows directory-durability limitations still apply.
+/// Destination creation, writes, hashing and syncs use the connection runtime's
+/// blocking pool, with one owned buffer/write in flight. Missing runtime/pool
+/// authority is an error, never inline I/O or a new executor. Receipt verification
+/// is still synchronous. This remains a maintenance capture: source fences are
+/// retained while copying, and a running filesystem syscall cannot be preempted.
+/// Existing receipt, restoration, and Windows durability limitations still apply.
 ///
 /// # Errors
 /// Refuses unknown database modes, non-inert rollback journals, changed source
@@ -217,26 +220,23 @@ async fn copy_file(file: &NativeFile, cx: &Cx, path: &Path) -> Result<FileDigest
     let length = file.file_size(cx)?;
     // This file is inside an unselected fresh generation. A failed write leaves
     // evidence there; no partially written data pathname is ever selected.
-    let mut destination = host_fs::reserve_new_file(path)?;
+    let mut destination = worker::Destination::create(cx, path).await?;
     let mut buffer = Vec::new();
     buffer.try_reserve_exact(COPY_BYTES).map_err(|_| FrankenError::OutOfMemory)?;
     buffer.resize(COPY_BYTES, 0);
-    let mut hasher = blake3::Hasher::new();
     let mut offset = 0_u64;
     while offset < length {
         let count = usize::try_from((length - offset).min(COPY_BYTES as u64))
             .map_err(|_| FrankenError::TooBig)?;
         read_exact_at(file, cx, &mut buffer[..count], offset).await?;
-        destination.write_all(&buffer[..count])?;
-        hasher.update(&buffer[..count]);
+        (destination, buffer) = destination.append(cx, buffer, count).await?;
         offset += count as u64;
     }
     checkpoint(cx)?;
     if file.file_size(cx)? != length {
         return Err(FrankenError::BusyRecovery);
     }
-    destination.sync_all()?;
-    Ok(FileDigest { bytes: length, blake3: *hasher.finalize().as_bytes() })
+    destination.finish(cx).await
 }
 
 // The probe runs after main is copied but before WAL is read, while the actual
@@ -250,6 +250,9 @@ async fn capture_with_probe(
     if db_path == ":memory:" {
         return Err(FrankenError::Unsupported);
     }
+    // Refuse missing blocking authority before taking source fences or
+    // creating a generation. No filesystem work is dispatched on failure.
+    worker::preflight(cx)?;
     let previous = read_migration_backup(db_path)?;
     let vfs = NativeVfs::new();
     let main_flags = VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB;
