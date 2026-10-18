@@ -9,7 +9,8 @@
 //! # Key types
 //!
 //! - [`PageBuf`]: owned, page-sized, page-aligned buffer (`Send + 'static`).
-//!   When dropped, the backing allocation is returned to the originating pool.
+//!   When dropped, the backing allocation is recycled within the pool's idle
+//!   byte budget or freed. Checked-out buffers are never reclaimed early.
 //! - [`PageBufPool`]: bounded pool keyed by `page_size`.  Avoids repeated heap
 //!   allocation on the hot path by reusing returned buffers.
 
@@ -25,6 +26,9 @@ use fsqlite_types::PageSize;
 
 const PAGE_BUF_POOL_FREE_LIST_INITIAL_CAPACITY: usize = 64;
 const GLOBAL_PAGE_BUF_RECYCLE_CAPACITY: usize = 256;
+/// Bound idle backing allocations independently of the active transaction cap.
+/// Includes alignment headroom and spare `Vec` capacity, not allocator metadata.
+const PAGE_BUF_POOL_MAX_IDLE_BYTES: usize = 8 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // PageBuf
@@ -33,8 +37,8 @@ const GLOBAL_PAGE_BUF_RECYCLE_CAPACITY: usize = 256;
 /// Owned, page-sized, page-aligned buffer handle.
 ///
 /// `Send + 'static` — suitable for cross-task transfer.  When dropped, the
-/// underlying allocation is returned to the originating pool (if any), making
-/// the type cancellation-safe per §4.10.
+/// underlying allocation is recycled or freed by the originating pool (if any),
+/// making the type cancellation-safe per §4.10.
 pub struct PageBuf {
     /// Backing storage.  `None` only transiently during `Drop`.
     backing: Option<Vec<u8>>,
@@ -97,7 +101,8 @@ impl PageBuf {
         self.pool.is_some()
     }
 
-    /// Whether dropping this buffer will return its allocation to `pool`.
+    /// Whether dropping this buffer releases an outstanding slot in `pool`.
+    /// The allocation may be retained for reuse or freed at the idle byte cap.
     #[inline]
     #[must_use]
     pub(crate) fn returns_to_pool(&self, pool: &PageBufPool) -> bool {
@@ -206,11 +211,17 @@ fn allocate_aligned(page_size: usize) -> (Vec<u8>, usize) {
 
 struct PageBufPoolInner {
     page_size: usize,
-    free: Mutex<Vec<(Vec<u8>, usize)>>,
+    free: Mutex<IdlePageBufs>,
     max_buffers: usize,
     total_buffers: AtomicUsize,
     acquire_hits: AtomicUsize,
     acquire_misses: AtomicUsize,
+}
+
+struct IdlePageBufs {
+    buffers: Vec<(Vec<u8>, usize)>,
+    /// Sum of backing `Vec` capacities, protected by the same lock as buffers.
+    retained_bytes: usize,
 }
 
 struct GlobalPageBuf {
@@ -252,18 +263,30 @@ fn recycle_global_page_buf(page_size: usize, backing: Vec<u8>, offset: usize) {
 }
 
 impl PageBufPoolInner {
-    /// Return a backing allocation to the free list (if not at capacity).
+    /// Retain only a bounded idle working set after a large transaction.
     fn return_buf(&self, backing: Vec<u8>, offset: usize) {
         let mut free = self.free.lock();
-        free.push((backing, offset));
+        let bytes = backing.capacity();
+        if bytes <= PAGE_BUF_POOL_MAX_IDLE_BYTES - free.retained_bytes {
+            free.buffers.push((backing, offset));
+            free.retained_bytes += bytes;
+            return;
+        }
         drop(free);
+        // Do not move overflow to the global recycler: that would merely
+        // relocate retained memory. Release the allocation before reopening
+        // its capacity slot so a new acquire cannot exceed the active cap.
+        drop(backing);
+        let previous = self.total_buffers.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "returned buffer must own an allocated slot");
     }
 }
 
 impl Drop for PageBufPoolInner {
     fn drop(&mut self) {
         let mut free = self.free.lock();
-        while let Some((backing, offset)) = free.pop() {
+        while let Some((backing, offset)) = free.buffers.pop() {
+            free.retained_bytes -= backing.capacity();
             recycle_global_page_buf(self.page_size, backing, offset);
         }
     }
@@ -272,8 +295,11 @@ impl Drop for PageBufPoolInner {
 /// Bounded pool of page-aligned buffers keyed by `page_size`.
 ///
 /// Avoids repeated heap allocation on the hot path by reusing returned
-/// buffers.  When the pool is exhausted, [`acquire`](Self::acquire) allocates
-/// a fresh buffer.  When the pool is full, returned buffers are freed normally.
+/// buffers. [`acquire`](Self::acquire) may allocate up to the configured
+/// `max_buffers` active-plus-idle bound; it fails when that bound is exhausted.
+/// Independently, each pool retains at most 8 MiB of idle backing allocations.
+/// Excess returns are freed without reducing the active transaction capacity.
+/// This releases heap ownership, not necessarily RSS held by the allocator.
 ///
 /// Thread-safe and cheaply cloneable (backed by `Arc`).
 #[derive(Clone)]
@@ -321,7 +347,10 @@ impl PageBufPool {
         Self {
             inner: Arc::new(PageBufPoolInner {
                 page_size: page_size.as_usize(),
-                free: Mutex::new(Vec::with_capacity(free_list_capacity)),
+                free: Mutex::new(IdlePageBufs {
+                    buffers: Vec::with_capacity(free_list_capacity),
+                    retained_bytes: 0,
+                }),
                 max_buffers,
                 total_buffers: AtomicUsize::new(0),
                 acquire_hits: AtomicUsize::new(0),
@@ -341,7 +370,11 @@ impl PageBufPool {
 
         let recycled = {
             let mut free = self.inner.free.lock();
-            free.pop()
+            let recycled = free.buffers.pop();
+            if let Some((backing, _)) = &recycled {
+                free.retained_bytes -= backing.capacity();
+            }
+            recycled
         };
 
         if let Some((backing, offset)) = recycled {
@@ -392,7 +425,16 @@ impl PageBufPool {
     /// Number of idle buffers currently available in the pool.
     #[must_use]
     pub fn available(&self) -> usize {
-        self.inner.free.lock().len()
+        self.inner.free.lock().buffers.len()
+    }
+
+    /// Bytes owned by idle backing allocations, including alignment headroom.
+    ///
+    /// Excludes checked-out buffers, free-list metadata, the separately
+    /// bounded cross-pool recycler, and allocator-internal retained memory.
+    #[must_use]
+    pub fn retained_bytes(&self) -> usize {
+        self.inner.free.lock().retained_bytes
     }
 
     /// Maximum number of outstanding buffers the pool will allow.
@@ -484,7 +526,7 @@ mod tests {
             assert_eq!(
                 ptr % 4096,
                 0,
-                "bead_id={BEAD_ID} case=alignment_stress iteration={i}"
+                "bead_id={BEAD_ID} case=alignment_stress iteration={i} ptr={ptr:#x}"
             );
             bufs.push(buf);
         }
@@ -587,7 +629,7 @@ mod tests {
     #[test]
     fn test_page_buf_pool_free_list_capacity_is_lazy() {
         let pool = PageBufPool::new(PageSize::DEFAULT, 262_144);
-        let capacity = pool.inner.free.lock().capacity();
+        let capacity = pool.inner.free.lock().buffers.capacity();
         assert_eq!(
             capacity, PAGE_BUF_POOL_FREE_LIST_INITIAL_CAPACITY,
             "pool construction must not preallocate one idle-list slot per possible buffer"
@@ -837,6 +879,147 @@ mod tests {
         let _b1 = pool.acquire().unwrap();
         let snap1 = pool.metrics_snapshot();
         assert_eq!(snap1.page_buffer_pool_misses, 1);
+    }
+
+    #[test]
+    fn test_page_buf_pool_idle_bytes_bounded_across_page_sizes_and_bursts() {
+        for size in [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536] {
+            let page_size = PageSize::new(size).unwrap();
+            let backing_bytes = 2 * page_size.as_usize() - 1;
+            let capacity = PAGE_BUF_POOL_MAX_IDLE_BYTES / backing_bytes + 3;
+            let pool = PageBufPool::new(page_size, capacity);
+            for _ in 0..2 {
+                let pages: Vec<_> = (0..capacity).map(|_| pool.acquire().unwrap()).collect();
+                assert_eq!(pool.total_buffers(), capacity);
+                assert_eq!(pool.retained_bytes(), 0);
+                assert!(matches!(pool.acquire(), Err(FrankenError::OutOfMemory)));
+                drop(pages);
+
+                let free = pool.inner.free.lock();
+                let owned_bytes: usize = free.buffers.iter().map(|(b, _)| b.capacity()).sum();
+                assert_eq!(free.retained_bytes, owned_bytes);
+                assert!(owned_bytes <= PAGE_BUF_POOL_MAX_IDLE_BYTES);
+                assert!(
+                    free.buffers.len() < capacity,
+                    "the burst must release buffers"
+                );
+                assert_eq!(pool.total_buffers(), free.buffers.len());
+            }
+            assert_eq!(
+                pool.capacity(),
+                capacity,
+                "idle eviction must not shrink admission"
+            );
+        }
+    }
+
+    #[test]
+    fn test_page_buf_pool_retained_bytes_track_reuse_and_alignment_headroom() {
+        let pool = PageBufPool::new(PageSize::DEFAULT, 2);
+        let mut page = pool.acquire().unwrap();
+        page.as_mut_slice().fill(0x6D);
+        let bytes = page.backing.as_ref().unwrap().capacity();
+        assert!(
+            bytes > page.page_size(),
+            "include alignment headroom, not just page bytes"
+        );
+        let ptr = page.as_ptr();
+        assert_eq!(pool.retained_bytes(), 0);
+        drop(page);
+        assert_eq!(pool.retained_bytes(), bytes);
+        let reused = pool.acquire().unwrap();
+        assert_eq!(pool.retained_bytes(), 0);
+        assert_eq!(reused.as_ptr(), ptr);
+        assert!(reused.iter().all(|byte| *byte == 0x6D));
+        drop(reused);
+        assert_eq!(pool.retained_bytes(), bytes);
+        assert_eq!(pool.total_buffers(), 1);
+    }
+
+    #[test]
+    fn test_page_buf_pool_rejects_oversized_spare_capacity_and_reopens_slot() {
+        let pool = PageBufPool::new(PageSize::DEFAULT, 1);
+        let mut page = pool.acquire().unwrap();
+        // Private instrumentation: no slice access after reserve moves the
+        // allocation. This oversized backing must be freed, never recycled
+        // using its old alignment offset. Counting len() would wrongly keep it.
+        page.backing
+            .as_mut()
+            .unwrap()
+            .reserve_exact(PAGE_BUF_POOL_MAX_IDLE_BYTES);
+        drop(page);
+        assert_eq!(pool.available(), 0);
+        assert_eq!(pool.retained_bytes(), 0);
+        assert_eq!(pool.total_buffers(), 0);
+        let replacement = pool.acquire().unwrap();
+        assert_eq!(replacement.as_ptr() as usize % 4096, 0);
+        assert!(replacement.iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn test_page_buf_pool_overflow_does_not_reclaim_checked_out_or_cloned_pages() {
+        let capacity = PAGE_BUF_POOL_MAX_IDLE_BYTES / (2 * 4096 - 1) + 4;
+        let pool = PageBufPool::new(PageSize::DEFAULT, capacity);
+        let mut live = pool.acquire().unwrap();
+        live.as_mut_slice().fill(0xA7);
+        let ptr = live.as_ptr();
+        let cloned = live.clone();
+        let other_pages: Vec<_> = (1..capacity).map(|_| pool.acquire().unwrap()).collect();
+        drop(other_pages);
+        assert_eq!(live.as_ptr(), ptr);
+        assert!(live.iter().all(|byte| *byte == 0xA7));
+        assert!(cloned.iter().all(|byte| *byte == 0xA7));
+        assert_eq!(pool.total_buffers(), pool.available() + 1);
+        let allocated = pool.total_buffers();
+        drop(cloned);
+        assert_eq!(
+            pool.total_buffers(),
+            allocated,
+            "standalone clone owns no pool slot"
+        );
+        drop(live);
+        assert_eq!(pool.total_buffers(), pool.available());
+        assert!(pool.retained_bytes() <= PAGE_BUF_POOL_MAX_IDLE_BYTES);
+    }
+
+    #[test]
+    fn test_page_buf_pool_concurrent_overflow_returns_preserve_capacity_accounting() {
+        let capacity = PAGE_BUF_POOL_MAX_IDLE_BYTES / (2 * 4096 - 1) + 17;
+        let pool = PageBufPool::new(PageSize::DEFAULT, capacity);
+        let mut groups: [Vec<PageBuf>; 4] = std::array::from_fn(|_| Vec::new());
+        for index in 0..capacity {
+            let mut page = pool.acquire().unwrap();
+            page.as_mut_slice().fill(0x3B);
+            groups[index % 4].push(page);
+        }
+        std::thread::scope(|scope| {
+            for pages in groups {
+                scope.spawn(move || {
+                    for page in pages {
+                        assert!(page.iter().all(|byte| *byte == 0x3B));
+                        drop(page);
+                    }
+                });
+            }
+        });
+        assert!(pool.retained_bytes() <= PAGE_BUF_POOL_MAX_IDLE_BYTES);
+        assert!(pool.available() < capacity);
+        assert_eq!(pool.total_buffers(), pool.available());
+        // Every freed slot must be available to a later large transaction.
+        let next: Vec<_> = (0..capacity).map(|_| pool.acquire().unwrap()).collect();
+        assert!(matches!(pool.acquire(), Err(FrankenError::OutOfMemory)));
+        assert_eq!(pool.retained_bytes(), 0);
+        drop(next);
+        assert_eq!(pool.total_buffers(), pool.available());
+    }
+
+    #[test]
+    fn test_page_buf_pool_zero_capacity_retains_nothing() {
+        let pool = PageBufPool::new(PageSize::MAX, 0);
+        assert!(matches!(pool.acquire(), Err(FrankenError::OutOfMemory)));
+        assert_eq!(pool.retained_bytes(), 0);
+        assert_eq!(pool.total_buffers(), 0);
+        assert_eq!(pool.available(), 0);
     }
 
     #[test]
