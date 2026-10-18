@@ -3,6 +3,7 @@ import { FrankenSQLiteError } from "./errors";
 import type {
   ChangesetChange,
   ChangesetLimits,
+  ChangesetReader,
   ChangesetRebaseTable,
   ChangesetValue,
   PatchsetChange,
@@ -10,8 +11,8 @@ import type {
 } from "./changeset-codec";
 import {
   ChangesetError,
-  decodeChangeset,
-  decodePatchset,
+  prepareChangesetReader,
+  preparePatchsetReader,
   encodeRebaseInfo,
   resolveChangesetLimits,
 } from "./changeset-codec";
@@ -274,8 +275,8 @@ function capture<Change extends PatchsetChange>(options: ApplyChangesetOptions<C
 
 type Settings<Change extends PatchsetChange> = ReturnType<typeof capture<Change>>;
 type Checkpoints = Pick<Settings<PatchsetChange>, "checkpoint">;
-interface TablePlan<Change extends PatchsetChange = PatchsetChange> {
-  wire: Omit<PatchsetTable, "changes"> & { readonly changes: readonly Change[] };
+interface TablePlan {
+  wire: Omit<PatchsetTable, "changes">;
   name: string;
   columns: readonly string[];
   sqlName: string;
@@ -468,8 +469,8 @@ async function readReceipt(
 async function planTable<Change extends PatchsetChange>(
   tx: ChangesetExecutor,
   settings: Checkpoints & Pick<Settings<Change>, "generatedColumns">,
-  wire: TablePlan<Change>["wire"],
-): Promise<TablePlan<Change>> {
+  wire: TablePlan["wire"],
+): Promise<TablePlan> {
   const listed = await read(tx, settings, `PRAGMA main.table_list(${literal(wire.name)})`);
   const matches = listed.filter(
     (row) => row[0] === "main" && typeof row[1] === "string" && fold(row[1]) === fold(wire.name),
@@ -703,7 +704,7 @@ function rowScope(tx: ChangesetExecutor): RowScope {
 async function applyIsolatedRow<Change extends PatchsetChange>(
   isolate: RowScope,
   settings: Settings<Change>,
-  plan: TablePlan<Change>,
+  plan: TablePlan,
   change: Change,
   changeIndex: number,
 ): Promise<boolean> {
@@ -749,7 +750,7 @@ async function applyIsolatedRow<Change extends PatchsetChange>(
 async function applyRow<Change extends PatchsetChange>(
   tx: ChangesetExecutor,
   settings: Settings<Change>,
-  plan: TablePlan<Change>,
+  plan: TablePlan,
   change: Change,
   changeIndex: number,
 ): Promise<boolean> {
@@ -858,7 +859,7 @@ async function applyRow<Change extends PatchsetChange>(
 
 function recordRebase<Change extends PatchsetChange>(
   settings: Settings<Change>,
-  plan: TablePlan<Change>,
+  plan: TablePlan,
   change: Change,
   replace: boolean,
 ): void {
@@ -936,7 +937,7 @@ export function applyChangeset(
   bytes: Uint8Array,
   options: ApplyChangesetOptions,
 ): Promise<ApplyChangesetResult> {
-  return applySession(target, bytes, options, decodeChangeset);
+  return applySession(target, bytes, options, prepareChangesetReader);
 }
 
 /**
@@ -950,22 +951,24 @@ export function applyPatchset(
   bytes: Uint8Array,
   options: ApplyPatchsetOptions,
 ): Promise<ApplyChangesetResult> {
-  return applySession(target, bytes, options, decodePatchset);
+  return applySession(target, bytes, options, preparePatchsetReader);
 }
 
 async function applySession<Change extends PatchsetChange>(
   target: ChangesetTarget,
   bytes: Uint8Array,
   options: ApplyChangesetOptions<Change>,
-  decode: (bytes: Uint8Array, limits?: ChangesetLimits) => readonly TablePlan<Change>["wire"][],
+  prepare: (bytes: Uint8Array, limits?: ChangesetLimits) => ChangesetReader<Change>,
 ): Promise<ApplyChangesetResult> {
   const settings = capture(options);
-  if (settings.onRebase !== undefined && decode !== decodeChangeset)
+  if (settings.onRebase !== undefined && prepare !== prepareChangesetReader)
     invalid("Patchsets do not provide changeset rebase evidence");
   settings.checkpoint();
-  // Decode before the first await: caller mutation cannot change admitted work.
-  const tables = decode(bytes, settings.limits);
-  for (const table of tables) {
+  // Validate the complete input before SQL, but do not retain every decoded
+  // row for the transaction's lifetime. The reader owns a private wire copy;
+  // later callbacks cannot change rows that have not been decoded for SQL yet.
+  const reader = prepare(bytes, settings.limits);
+  for (const table of reader.tables) {
     if (!settings.names.has(fold(table.name))) invalid(`Table is not authorized: ${table.name}`);
   }
   const delivery =
@@ -974,7 +977,7 @@ async function applySession<Change extends PatchsetChange>(
       : await fingerprint(
           bytes,
           settings.deliveryId,
-          tables.reduce((count, table) => count + table.changes.length, 0),
+          reader.changeCount,
         );
   settings.checkpoint();
   const owner = settings.foreignKeys === "defer" ? withDeferredForeignKeys(target) : target;
@@ -987,20 +990,21 @@ async function applySession<Change extends PatchsetChange>(
       const prior = await readReceipt(tx, settings, delivery);
       if (prior !== null) return prior;
     }
-    const plans: TablePlan<Change>[] = [];
+    const plans: TablePlan[] = [];
     // Validate ALL table layouts before executing the first application write.
-    for (const table of tables) plans.push(await planTable(tx, settings, table));
+    for (const table of reader.tables) plans.push(await planTable(tx, settings, table));
     let applied = 0,
-      omitted = 0,
-      index = 0;
-    for (const plan of plans) {
-      for (const change of plan.wire.changes) {
-        const changed = isolate === undefined
-          ? await applyRow(tx, settings, plan, change, index++)
-          : await applyIsolatedRow(isolate, settings, plan, change, index++);
-        if (changed) applied++;
-        else omitted++;
-      }
+      omitted = 0;
+    // Replay receipts return above without opening a second decoding cursor.
+    // Abrupt completion closes this cursor while the owned target rolls back.
+    // Requested rebase evidence still retains its selected conflict records.
+    for (const { tableIndex, changeIndex, change } of reader) {
+      const plan = plans[tableIndex]!;
+      const changed = isolate === undefined
+        ? await applyRow(tx, settings, plan, change, changeIndex)
+        : await applyIsolatedRow(isolate, settings, plan, change, changeIndex);
+      if (changed) applied++;
+      else omitted++;
     }
     if (settings.onRebase !== undefined && settings.rebase !== null) {
       settings.checkpoint();

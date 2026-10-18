@@ -1,9 +1,10 @@
 // Execute the production Session parser against native SQLite wire/application.
 // No worker, WASM engine, network stream, or physical durability is simulated.
 import assert from "node:assert/strict";
-import { DatabaseSync } from "node:sqlite";
+import { constants, DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import * as codec from "../src/changeset-codec.ts";
+import { applyChangeset, applyPatchset } from "../src/changeset-apply.ts";
 
 const formats = [
   { name: "changeset", prepare: (...args) => codec.prepareChangesetReader(...args),
@@ -197,3 +198,136 @@ test("prepared and eager validation have identical errors for deterministic corr
     }
   }
 });
+
+// Actual SQL and savepoints: the only injected scheduling boundary is an
+// awaited hook after a completed SQL statement, before its promise settles.
+class SqlTarget {
+  constructor(t, schema = "CREATE TABLE t(id INTEGER PRIMARY KEY,v)") {
+    this.db = new DatabaseSync(":memory:"); this.db.exec(schema);
+    this.log = []; this.scopes = 0; this.afterExecute = null;
+    t.after(() => this.db.close());
+  }
+  async transaction(work, options = {}) {
+    const name = `reader_scope_${++this.scopes}`;
+    this.db.exec(`SAVEPOINT ${name}`);
+    const tx = {
+      query: async (sql, params = []) => {
+        this.log.push(sql);
+        const s = this.db.prepare(sql); s.setReadBigInts(true); s.setReturnArrays(true);
+        return { rowArrays: s.all(...params) };
+      },
+      execute: async (sql, params = []) => {
+        this.log.push(sql);
+        const changes = Number(this.db.prepare(sql).run(...params).changes);
+        await this.afterExecute?.(sql, params);
+        return changes;
+      },
+      transaction: (work, options) => this.transaction(work, options),
+    };
+    try {
+      const value = await work(tx);
+      if (options.signal?.aborted) throw options.signal.reason;
+      this.db.exec(`RELEASE ${name}`);
+      return value;
+    } catch (error) {
+      this.db.exec(`ROLLBACK TO ${name}; RELEASE ${name}`);
+      throw error;
+    }
+  }
+}
+function deferred() {
+  let resolve;
+  const promise = new Promise(r => { resolve = r; });
+  return { promise, resolve };
+}
+
+for (const f of formats) {
+  const apply = f.name === "changeset" ? applyChangeset : applyPatchset;
+  test(`${f.name}: row-at-a-time SQL preserves later rows after policy mutates caller input`, async t => {
+    const schema = `CREATE TABLE t(id INTEGER PRIMARY KEY,v); CREATE TABLE u(id INTEGER PRIMARY KEY,v);
+      CREATE TABLE decisions(info BLOB); INSERT INTO t VALUES(0,'old'); INSERT INTO u VALUES(7,'keep');`;
+    const target = new SqlTarget(t, schema), native = new DatabaseSync(":memory:");
+    t.after(() => native.close()); native.exec(schema);
+    const changes = Array.from({ length: 1001 }, (_, i) => insert(BigInt(i), new Uint8Array([i % 251, 0, 255])));
+    const wire = f.encode([table(changes), table([insert(7n, "ignored")], "u")]);
+    const original = wire.slice(), seen = [];
+    const options = { tables: ["t", "u"], deliveryId: `reader:${f.name}`,
+      onConflict(c) {
+        seen.push([c.table, c.changeIndex]);
+        if (c.table === "u") return "omit";
+        assert.deepEqual(c.current, [0n, "old"]);
+        c.change.new[1].fill(9);
+        wire.fill(0); // Later SQL rows must come from the private validated wire.
+        return "replace";
+      },
+    };
+    if (f.name === "changeset") options.onRebase = (tx, info) => tx.execute("INSERT INTO decisions VALUES(?)", [info]);
+    assert.deepEqual(await apply(target, wire, options), { applied: 1001, omitted: 1, replayed: false });
+    assert.deepEqual(seen, [["t", 0], ["u", 1001]]);
+    let nativeConflicts = 0;
+    assert.equal(native.applyChangeset(original, { onConflict: () => ++nativeConflicts === 1
+      ? constants.SQLITE_CHANGESET_REPLACE : constants.SQLITE_CHANGESET_OMIT }), true);
+    assert.deepEqual(rows(target.db, "t"), rows(native, "t"));
+    assert.deepEqual(rows(target.db, "u"), rows(native, "u"));
+    if (f.name === "changeset") {
+      const info = target.db.prepare("SELECT info FROM decisions").get().info;
+      assert.deepEqual(codec.decodeRebaseInfo(info).map(t => [t.name, t.changes[0].replace]), [["t", true], ["u", false]]);
+    }
+    const offset = target.log.length;
+    options.onConflict = () => assert.fail("receipt replay must not invoke policy");
+    options.onRebase = undefined;
+    assert.deepEqual(await apply(target, original, options), { applied: 1001, omitted: 1, replayed: true });
+    assert.equal(target.log.slice(offset).some(sql => /^(INSERT|UPDATE|DELETE|CREATE)/.test(sql)), false);
+  });
+
+  test(`${f.name}: invalid final wire and unauthorized final tables never enter SQL`, async t => {
+    const target = new SqlTarget(t);
+    const valid = f.encode([table([insert(1n, "valid"), insert(2n, "last payload")])]);
+    await assert.rejects(apply(target, valid.subarray(0, -1), { tables: ["t"], deliveryId: "invalid" }),
+      { code: "ERR_FSQLITE_CHANGESET_FORMAT" });
+    const late = f.encode([table([insert(1n, "valid")]), table([insert(2n, "last")], "unauthorized")]);
+    await assert.rejects(apply(target, late, { tables: ["t"] }), { code: "ERR_FSQLITE_CHANGESET_INPUT" });
+    assert.equal(target.scopes, 0); assert.deepEqual(target.log, []);
+    await assert.rejects(apply(target, late, { tables: ["t", "unauthorized"] }), { code: "ERR_FSQLITE_CHANGESET_SCHEMA" });
+    assert.equal(target.log.some(sql => /^(INSERT|UPDATE|DELETE)/.test(sql)), false);
+    assert.deepEqual(rows(target.db, "t"), []);
+  });
+
+  test(`${f.name}: a late conflict rolls back every preceding row but preserves the caller's outer work`, async t => {
+    const target = new SqlTarget(t, "CREATE TABLE t(id INTEGER PRIMARY KEY,v); INSERT INTO t VALUES(999,'old')");
+    const changes = Array.from({ length: 512 }, (_, i) => insert(BigInt(i), `row ${i}`));
+    changes.push(insert(999n, "conflict"));
+    await target.transaction(async tx => {
+      await tx.execute("INSERT INTO t VALUES(2000,'outer')");
+      await assert.rejects(apply(tx, f.encode([table(changes)]), { tables: ["t"], deliveryId: "abort" }),
+        e => e.code === "ERR_FSQLITE_CHANGESET_CONFLICT" && e.conflict.changeIndex === 512);
+      assert.deepEqual(rows(target.db, "t"), [[999n, "old"], [2000n, "outer"]]);
+      assert.equal(target.db.prepare("SELECT count(*) n FROM sqlite_schema WHERE name='__fsqlite_changeset_receipts'").get().n, 0);
+      await tx.execute("INSERT INTO t VALUES(2001,'after')");
+    });
+    assert.deepEqual(rows(target.db, "t"), [[999n, "old"], [2000n, "outer"], [2001n, "after"]]);
+  });
+
+  test(`${f.name}: cancellation drains admitted SQL before abandoning the cursor and rolling back`, async t => {
+    const target = new SqlTarget(t), entered = deferred(), release = deferred(), controller = new AbortController();
+    let writes = 0, settled = false;
+    target.afterExecute = async sql => {
+      if (sql.startsWith('INSERT OR ABORT INTO main."t"') && ++writes === 5) {
+        entered.resolve(); await release.promise;
+      }
+    };
+    const wire = f.encode([table(Array.from({ length: 100 }, (_, i) => insert(BigInt(i), `row ${i}`)))]);
+    const pending = apply(target, wire, { tables: ["t"], deliveryId: "cancelled", signal: controller.signal });
+    void pending.then(() => { settled = true; }, () => { settled = true; });
+    await Promise.race([entered.promise, pending.then(() => assert.fail("held SQL was not entered"))]);
+    controller.abort(new Error("stop"));
+    await new Promise(r => setImmediate(r));
+    assert.equal(settled, false, "cancellation cannot abandon admitted work");
+    assert.equal(target.db.prepare("SELECT count(*) n FROM t").get().n, 5);
+    release.resolve();
+    await assert.rejects(pending, { code: "ERR_FSQLITE_CHANGESET_CANCELLED" });
+    assert.equal(writes, 5);
+    assert.deepEqual(rows(target.db, "t"), []);
+    assert.equal(target.db.prepare("SELECT count(*) n FROM sqlite_schema WHERE name='__fsqlite_changeset_receipts'").get().n, 0);
+  });
+}
