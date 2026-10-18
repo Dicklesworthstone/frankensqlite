@@ -41,6 +41,31 @@ export interface PatchsetTable {
   readonly primaryKey: readonly number[];
   readonly changes: readonly PatchsetChange[];
 }
+/** Validated table layout and row count, without retaining decoded row images. */
+export interface ChangesetTableInfo {
+  readonly name: string;
+  readonly primaryKey: readonly number[];
+  readonly changeCount: number;
+}
+export interface ChangesetEntry<Change extends PatchsetChange = ChangesetChange> {
+  /** Zero-based index into the reader's tables. */
+  readonly tableIndex: number;
+  /** Zero-based position in the complete message, not just this table. */
+  readonly changeIndex: number;
+  readonly change: Change;
+}
+/**
+ * One fully validated, privately owned Session message with repeatable cursors.
+ * Each cursor decodes one row at a time; returned BLOBs are independent copies.
+ * The reader retains wire bytes and table metadata, not all decoded row images.
+ * This is not network-stream ingestion, authentication, or a database snapshot.
+ */
+export interface ChangesetReader<Change extends PatchsetChange = ChangesetChange>
+  extends Iterable<ChangesetEntry<Change>> {
+  readonly byteLength: number;
+  readonly changeCount: number;
+  readonly tables: readonly ChangesetTableInfo[];
+}
 /** @internal Native apply_v2 rebase records, NOT executable changesets. */
 export interface ChangesetRebaseTable {
   readonly name: string;
@@ -208,6 +233,55 @@ export function decodePatchset(
   return decodeSession(bytes, options, true);
 }
 
+/**
+ * Capture and validate the ENTIRE message synchronously before returning a
+ * cursor. Even an invalid last record is rejected before any row can escape.
+ * Caller mutation/detachment after return cannot affect later iteration.
+ * All ordinary codec limits apply to the complete message, not each row.
+ */
+export function prepareChangesetReader(
+  bytes: Uint8Array,
+  options?: ChangesetLimits,
+): ChangesetReader {
+  return prepareSessionReader(bytes, options, false) as ChangesetReader;
+}
+
+/** Key-only before-images remain absent evidence, never synthesized old data. */
+export function preparePatchsetReader(
+  bytes: Uint8Array,
+  options?: ChangesetLimits,
+): ChangesetReader<PatchsetChange> {
+  return prepareSessionReader(bytes, options, true);
+}
+
+function prepareSessionReader(
+  bytes: Uint8Array,
+  options: ChangesetLimits | undefined,
+  patchset: boolean,
+): ChangesetReader<PatchsetChange> {
+  const policy = resolveChangesetLimits(options);
+  const owned = new Uint8Array(fixedInput(bytes, policy.maxBytes));
+  const tables: { name: string; primaryKey: readonly number[]; changeCount: number }[] = [];
+  let changeCount = 0;
+  for (const entry of walkSession(owned, policy, patchset)) {
+    if (entry.tableIndex === tables.length)
+      tables.push({ ...entry.table, changeCount: 0 });
+    tables[entry.tableIndex]!.changeCount++;
+    changeCount++;
+  }
+  return Object.freeze({
+    byteLength: owned.byteLength,
+    changeCount,
+    tables: Object.freeze(tables.map(table => Object.freeze(table))),
+    *[Symbol.iterator](): IterableIterator<ChangesetEntry<PatchsetChange>> {
+      // Only this closure owns the wire. Neither cursor output nor metadata
+      // exposes its buffer; breaking one cursor cannot invalidate another.
+      for (const { tableIndex, changeIndex, change } of walkSession(owned, policy, patchset))
+        yield Object.freeze({ tableIndex, changeIndex, change: change as PatchsetChange });
+    },
+  });
+}
+
 /** @internal Reuse strict wire/scalar/budget admission for native rebase info. */
 export function decodeRebaseInfo(
   bytes: Uint8Array,
@@ -271,6 +345,30 @@ function decodeSession(
 ): readonly SessionTable[] {
   const policy = resolveChangesetLimits(options);
   bytes = fixedInput(bytes, policy.maxBytes);
+  const result: { name: string; primaryKey: readonly number[]; changes: SessionChange[] }[] = [];
+  for (const entry of walkSession(bytes, policy, patchset, rebasing)) {
+    if (entry.tableIndex === result.length)
+      result.push({ ...entry.table, changes: [] });
+    result[entry.tableIndex]!.changes.push(entry.change);
+  }
+  return Object.freeze(result.map(table =>
+    Object.freeze({ ...table, changes: Object.freeze(table.changes) })));
+}
+
+interface SessionEntry {
+  readonly table: Omit<SessionTable, "changes">;
+  readonly tableIndex: number;
+  readonly changeIndex: number;
+  readonly change: SessionChange;
+}
+
+/** One canonical parser for eager decoding, prepared cursors and validation. */
+function* walkSession(
+  bytes: Uint8Array,
+  policy: Limits,
+  patchset: boolean,
+  rebasing = false,
+): IterableIterator<SessionEntry> {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   let pos = 0,
     rows = 0,
@@ -318,7 +416,6 @@ function decodeSession(
       return format("Invalid changeset UTF-8", pos - size);
     }
   };
-  const result: SessionTable[] = [];
   const names = new Set<string>();
   while (pos < bytes.length) {
     const header = byte();
@@ -328,7 +425,7 @@ function decodeSession(
         patchset ? "Expected patchset table header" : "Expected changeset table header",
         pos - 1,
       );
-    if (result.length >= policy.maxTables) limit("Changeset exceeds maxTables");
+    if (names.size >= policy.maxTables) limit("Changeset exceeds maxTables");
     const count = length(policy.maxColumns);
     if (count === 0) format("Changeset table has no columns", pos);
     need(count);
@@ -348,8 +445,10 @@ function decodeSession(
     if (name.length === 0) format("Empty changeset table name", start);
     const folded = name.replace(/[A-Z]/g, (c) => c.toLowerCase());
     if (names.has(folded)) format("Repeated changeset table header", start);
+    const tableIndex = names.size;
     names.add(folded);
-    const changes: SessionChange[] = [];
+    const table = Object.freeze({ name, primaryKey: Object.freeze(pk) });
+    const firstRow = rows;
     const keyCount = pk.filter((value) => value !== 0).length;
     while (pos < bytes.length && bytes[pos] !== 84 && bytes[pos] !== 80) {
       const op = byte(),
@@ -406,14 +505,10 @@ function decodeSession(
             format("Rebase DELETE requires a complete before-image", pos);
         }
       } else validateChange(pk, change, patchset);
-      changes.push(Object.freeze(change));
+      yield { table, tableIndex, changeIndex: rows - 1, change: Object.freeze(change) };
     }
-    if (changes.length === 0) format("Table header has no changes", pos);
-    result.push(
-      Object.freeze({ name, primaryKey: Object.freeze(pk), changes: Object.freeze(changes) }),
-    );
+    if (rows === firstRow) format("Table header has no changes", pos);
   }
-  return Object.freeze(result);
 }
 
 /** Encode explicit changes, without silently coercing real values to integers. */

@@ -74,9 +74,12 @@ export {
 } from "./changeset-capture";
 export type {
   ChangesetChange,
+  ChangesetEntry,
   ChangesetField,
   ChangesetLimits,
+  ChangesetReader,
   ChangesetTable,
+  ChangesetTableInfo,
   ChangesetValue,
   PatchsetChange,
   PatchsetTable,
@@ -88,6 +91,8 @@ export {
   encodeChangeset,
   encodePatchset,
   invertChangeset,
+  prepareChangesetReader,
+  preparePatchsetReader,
 } from "./changeset-codec";
 export type {
   ChangesetDeliveryOptions,
