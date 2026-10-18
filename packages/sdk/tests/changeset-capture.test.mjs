@@ -247,6 +247,35 @@ test("rolled-back SQL savepoints also undo first-touch records and budget charge
   );
   assert.equal(result.touchedRows, 1);
 });
+
+test("owned nested transactions roll back capture state and preserve released work", async () => {
+  const result = await oracle(
+    async (tx) => {
+      assert.equal(typeof tx.transaction, "function");
+
+      await assert.rejects(
+        tx.transaction(async (child) => {
+          await child.execute("INSERT INTO t VALUES(3,'rolled-back',NULL)");
+          await child.execute("UPDATE t SET value='discarded' WHERE id=1");
+          throw new Error("rollback child");
+        }),
+        /rollback child/,
+      );
+
+      await tx.transaction(async (child) => {
+        await child.execute("UPDATE t SET value='released' WHERE id=1");
+        await child.execute("INSERT INTO t VALUES(4,'kept',NULL)");
+      });
+    },
+    schema,
+    seed,
+    ["t"],
+    { maxRows: 2 },
+  );
+
+  assert.equal(result.touchedRows, 2);
+  assert.equal(result.changes, 2);
+});
 test("callback errors roll back all tables and every TEMP capture object", async () => {
   const target = new SqlTarget(schema, seed),
     error = new Error("callback");
