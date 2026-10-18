@@ -510,9 +510,16 @@ export async function runCaptureWork<T>(
     });
     return task;
   };
+  const nested = tx.transaction;
   const scoped = Object.freeze({
     execute: (sql, params) => submit(() => tx.execute(sql, params)),
     query: (sql, params) => submit(() => tx.query(sql, params)),
+    ...(typeof nested === "function"
+      ? {
+          transaction: <U>(work: (child: ChangesetExecutor) => Promise<U>) =>
+            submit(() => nested.call(tx, (child) => runCaptureWork(child, work, checkpoint))),
+        }
+      : {}),
   } satisfies ChangesetExecutor);
   let value: T;
   try { value = await work(scoped); }
