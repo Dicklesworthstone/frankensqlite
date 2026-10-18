@@ -2396,6 +2396,12 @@ impl UnixFile {
             recovery_mode,
             newly_acquired_wal_slots: 0,
         });
+        // Match BEGIN IMMEDIATE: settle the main-file prefix before taking
+        // any WAL slot. In particular, never hold WRITE while busy-waiting
+        // for RESERVED: its owner may need WRITE to commit (GH #519).
+        // The attempt is already armed, so a failed main acquisition or a
+        // later nonblocking WAL conflict retains exact cleanup ownership.
+        self.lock(cx, main_level)?;
         if wal_mode {
             for slot in [WAL_WRITE_LOCK, WAL_CKPT_LOCK] {
                 if self.acquire_external_wal_slot(cx, slot)?
@@ -2405,7 +2411,7 @@ impl UnixFile {
                 }
             }
         }
-        self.lock(cx, main_level)
+        Ok(())
     }
 
     fn release_shm_owner_state(&mut self, delete: bool) -> Result<()> {
@@ -4228,12 +4234,15 @@ impl VfsFile for UnixFile {
             write_acquired: false,
             acquisition_complete: false,
         });
+        // Concurrent commits use the same main-before-WAL order as
+        // IMMEDIATE transactions and every maintenance/checkpoint path.
+        // Waiting here must leave WRITE available to the RESERVED owner.
+        self.lock(cx, LockLevel::Reserved)?;
         if self.acquire_external_wal_slot(cx, WAL_WRITE_LOCK)?
             && let Some(attempt) = self.external_append_attempt.as_mut()
         {
             attempt.write_acquired = true;
         }
-        self.lock(cx, LockLevel::Reserved)?;
         self.external_append_attempt
             .as_mut()
             .expect("successful append acquisition retains its exact attempt")
@@ -6677,7 +6686,7 @@ mod tests {
             .expect("retain refused attempt");
         assert!(!refused.write_acquired);
         assert_eq!(refused.prior_main_level, LockLevel::Shared);
-        assert_eq!(file.lock_level, LockLevel::Shared);
+        assert_eq!(file.lock_level, LockLevel::Reserved);
         file.restore_external_wal_append_attempt(&cx).unwrap();
         assert!(file.external_append_attempt.is_none());
         assert_eq!(file.lock_level, LockLevel::Shared);
@@ -6704,10 +6713,10 @@ mod tests {
             file.lock_external_wal_append(&cx),
             Err(FrankenError::Busy)
         ));
-        assert!(file.external_append_attempt.unwrap().write_acquired);
+        assert!(!file.external_append_attempt.unwrap().write_acquired);
         assert!(
             !file.owns_external_wal_append_write(&cx).unwrap(),
-            "failed RESERVED leaves cleanup, not append authority"
+            "failed RESERVED must not acquire WRITE or append authority"
         );
         file.restore_external_wal_append_attempt(&cx).unwrap();
         assert_eq!(file.lock_level, LockLevel::Shared);
@@ -7420,6 +7429,107 @@ mod tests {
     }
 
     #[test]
+    fn wal_fence_main_contention_never_retains_write_across_processes() {
+        const TEST: &str =
+            "unix::tests::wal_fence_main_contention_never_retains_write_across_processes";
+        const CHILD_PATH: &str = "FSQLITE_GH519_CHILD_PATH";
+        const CHILD_KIND: &str = "FSQLITE_GH519_CHILD_KIND";
+        const CHILD_TIMEOUT: &str = "FSQLITE_GH519_CHILD_TIMEOUT";
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let acquire = |file: &mut UnixFile, kind: &str| match kind {
+            "append" => file.lock_external_wal_append(&cx),
+            "checkpoint" => file.lock_external_wal_checkpoint(&cx),
+            "recovery" => file.lock_external_wal_recovery(&cx),
+            "maintenance" => file.lock_external_maintenance(&cx, true),
+            _ => panic!("unknown fence kind: {kind}"),
+        };
+        let restore = |file: &mut UnixFile, kind: &str| {
+            if kind == "append" {
+                file.restore_external_wal_append_attempt(&cx)
+            } else {
+                file.restore_external_maintenance_attempt(&cx)
+            }
+        };
+        if let Some(path) = std::env::var_os(CHILD_PATH) {
+            let kind = std::env::var(CHILD_KIND).unwrap();
+            let timeout: u64 = std::env::var(CHILD_TIMEOUT).unwrap().parse().unwrap();
+            let (mut peer, _) = vfs
+                .open(&cx, Some(Path::new(&path)), open_flags_create())
+                .unwrap();
+            peer.set_busy_timeout_ms(timeout);
+            let started = Instant::now();
+            assert!(matches!(acquire(&mut peer, &kind), Err(FrankenError::Busy)));
+            assert!(started.elapsed() >= Duration::from_millis(timeout));
+            assert_eq!(peer.lock_level, LockLevel::None);
+            if kind == "append" {
+                assert!(!peer.external_append_attempt.unwrap().write_acquired);
+            } else {
+                assert_eq!(
+                    peer.external_maintenance_attempt
+                        .unwrap()
+                        .newly_acquired_wal_slots,
+                    0
+                );
+            }
+            // Deliberately retain the failed attempt until the IMMEDIATE
+            // holder demonstrates it can acquire the append fence. The old
+            // order retained WRITE here, so its holder could not progress.
+            println!("gh519-main-busy-without-wal:{kind}");
+            std::io::stdout().flush().unwrap();
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line).unwrap();
+            assert_eq!(line.trim(), "retry");
+            restore(&mut peer, &kind).unwrap();
+            restore(&mut peer, &kind).unwrap();
+            acquire(&mut peer, &kind).expect("waiter progresses after IMMEDIATE exits");
+            restore(&mut peer, &kind).unwrap();
+            assert_eq!(peer.lock_level, LockLevel::None);
+            peer.close(&cx).unwrap();
+            return;
+        }
+
+        for kind in ["append", "checkpoint", "recovery", "maintenance"] {
+            for timeout in [0_u64, 25] {
+                let (_dir, path) = make_temp_path("gh519-main-contention.db");
+                let (mut immediate, _) =
+                    vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+                immediate.lock(&cx, LockLevel::Reserved).unwrap();
+                let mut child = Command::new(std::env::current_exe().unwrap())
+                    .args([TEST, "--exact", "--nocapture"])
+                    .env(CHILD_PATH, &path)
+                    .env(CHILD_KIND, kind)
+                    .env(CHILD_TIMEOUT, timeout.to_string())
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                let mut output = BufReader::new(child.stdout.take().unwrap());
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(
+                        output.read_line(&mut line).unwrap(),
+                        0,
+                        "missing busy witness"
+                    );
+                    if line.trim() == format!("gh519-main-busy-without-wal:{kind}") {
+                        break;
+                    }
+                }
+                immediate
+                    .lock_external_wal_append(&cx)
+                    .expect("IMMEDIATE holder must not lose WRITE to a RESERVED waiter");
+                assert!(immediate.owns_external_wal_append_write(&cx).unwrap());
+                immediate.restore_external_wal_append_attempt(&cx).unwrap();
+                assert_eq!(immediate.lock_level, LockLevel::Reserved);
+                immediate.close(&cx).unwrap();
+                writeln!(child.stdin.as_mut().unwrap(), "retry").unwrap();
+                assert!(child.wait().unwrap().success());
+            }
+        }
+    }
+
+    #[test]
     fn external_maintenance_restores_only_wal_slots_newly_acquired_by_attempt() {
         let cx = Cx::new();
         let vfs = UnixVfs::new();
@@ -7495,7 +7605,7 @@ mod tests {
             )
             .expect("block CKPT");
         assert!(matches!(
-            attempt_file.lock_external_maintenance(&cx, true),
+            attempt_file.lock_external_wal_checkpoint(&cx),
             Err(FrankenError::Busy)
         ));
         let attempt = attempt_file
@@ -7503,7 +7613,7 @@ mod tests {
             .expect("partial attempt marker");
         assert!(attempt.acquired_slot(WAL_WRITE_LOCK));
         assert!(!attempt.acquired_slot(WAL_CKPT_LOCK));
-        assert_eq!(attempt_file.lock_level, LockLevel::None);
+        assert_eq!(attempt_file.lock_level, LockLevel::Reserved);
 
         attempt_file
             .restore_external_maintenance_attempt(&cx)
@@ -11000,3 +11110,4 @@ mod tests {
         assert_eq!(buf, payload);
     }
 }
+
