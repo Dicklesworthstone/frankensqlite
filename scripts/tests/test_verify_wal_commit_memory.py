@@ -12,6 +12,7 @@ import copy
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import sqlite3
 import sys
@@ -155,6 +156,19 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaises(runner.VerificationError):
             runner.verifier_digest(records[1:], 2, 32)
 
+    def test_stock_worker_result_requires_complete_evidence(self):
+        path = Path("/tmp/gh518/records.sqlite")
+        result = dict(rows=64, payload_bytes=2 * runner.MIB, sha256="a" * 64, wal_required=True,
+                      database=str(path.parent / "stock-oracle" / path.name))
+        self.assertEqual(runner.stock_result([result], path, 2, 32), result)
+        for records in ([], [result, result]):
+            with self.subTest(records=records), self.assertRaises(runner.VerificationError):
+                runner.stock_result(records, path, 2, 32)
+        for key, value in (("rows", 63), ("payload_bytes", 1), ("sha256", "bad"),
+                           ("sha256", "G" * 64), ("database", str(path)), ("wal_required", 1)):
+            with self.subTest(key=key), self.assertRaises(runner.VerificationError):
+                runner.stock_result([{**result, key: value}], path, 2, 32)
+
 
 class ComparisonTests(unittest.TestCase):
     def test_complete_repeated_comparison_passes(self):
@@ -236,10 +250,148 @@ class FilesAndProcessTests(unittest.TestCase):
     def test_stock_oracle_reads_uncheckpointed_wal_without_mutation(self):
         path, _ = self.database()
         wal = Path(str(path) + "-wal")
-        before = (path.read_bytes(), wal.read_bytes())
+        shm = Path(str(path) + "-shm")
+        before = (path.read_bytes(), wal.read_bytes(), shm.read_bytes())
         self.assertGreater(len(before[1]), 32)
         self.assertEqual(runner.stock_readback(path, 1, 32)["rows"], 32)
-        self.assertEqual(before, (path.read_bytes(), wal.read_bytes()))
+        self.assertEqual(before, (path.read_bytes(), wal.read_bytes(), shm.read_bytes()))
+
+    def stopped_writer(self, checkpointed=False):
+        binary = self.make_synthetic_reproducer(checkpointed=checkpointed)
+        path = self.fixture("records.sqlite")
+        runner.run_process([str(binary), "write", str(path), "2", "2", "32"],
+                           path.parent, "seed", 10)
+        return path
+
+    def test_stock_oracle_cannot_create_original_missing_shm(self):
+        path = self.stopped_writer()
+        shm = Path(str(path) + "-shm")
+        shm.rename(path.parent / "retained-writer-shm")
+        before = {p.name: p.read_bytes() for p in path.parent.iterdir() if p.is_file()}
+        result = runner.stock_readback(path, 2, 32)
+        self.assertFalse(shm.exists(), "stock recovery must not prime native recovery")
+        self.assertEqual(before, {p.name: p.read_bytes() for p in path.parent.iterdir() if p.is_file()})
+        oracle = Path(result["database"])
+        self.assertTrue(Path(str(oracle) + "-shm").exists())
+        for suffix in ("", "-wal"):
+            source, target = Path(str(path) + suffix), Path(str(oracle) + suffix)
+            self.assertEqual(source.read_bytes(), target.read_bytes())
+            self.assertFalse(source.samefile(target))
+
+    def test_stock_oracle_cannot_repair_original_invalid_shm(self):
+        path = self.stopped_writer()
+        shm = Path(str(path) + "-shm")
+        shm.rename(path.parent / "retained-valid-shm")
+        shm.write_bytes(bytes(32768))
+        before = shm.read_bytes()
+        self.assertEqual(runner.stock_readback(path, 2, 32)["rows"], 64)
+        self.assertEqual(shm.read_bytes(), before)
+
+    def test_checkpointed_writer_cannot_qualify_as_wal_recovery(self):
+        path = self.stopped_writer(checkpointed=True)
+        with self.assertRaises((OSError, runner.VerificationError)):
+            runner.stock_readback(path, 2, 32)
+
+    def test_empty_or_header_only_wal_is_rejected(self):
+        path = self.stopped_writer()
+        wal = Path(str(path) + "-wal")
+        wal.rename(path.parent / "retained-valid-wal")
+        wal.write_bytes(bytes(32))
+        with self.assertRaisesRegex(runner.VerificationError, "no WAL frames"):
+            runner.stock_readback(path, 2, 32)
+
+    def test_nonempty_ignored_wal_cannot_fake_recovery_coverage(self):
+        path = self.stopped_writer(checkpointed=True)
+        wal = Path(str(path) + "-wal")
+        # The previous presence-only guard passed this: SQLite ignores the
+        # invalid WAL and successfully reads every byte from the main file.
+        wal.write_bytes(bytes(4096))
+        with self.assertRaisesRegex(runner.VerificationError, "WAL recovery was not exercised"):
+            runner.stock_readback(path, 2, 32)
+
+    def test_main_only_negative_control_checks_bytes_not_just_row_count(self):
+        path = self.stopped_writer(checkpointed=True)
+        expected = bytes(i % 251 for i in range(32 * runner.KIB))
+        self.assertTrue(runner.main_contains_payload(path, 64, expected))
+        connection = sqlite3.connect(path)
+        try:
+            connection.execute("UPDATE records SET payload=? WHERE id=1", (b"different",))
+            connection.commit()
+        finally:
+            connection.close()
+        self.assertFalse(runner.main_contains_payload(path, 64, expected))
+
+    def test_wal_symlink_is_rejected_without_touching_target(self):
+        path = self.stopped_writer()
+        wal = Path(str(path) + "-wal")
+        target = path.parent / "retained-valid-wal"
+        wal.rename(target)
+        before = target.read_bytes()
+        wal.symlink_to(target)
+        with self.assertRaises(OSError):
+            runner.stock_readback(path, 2, 32)
+        self.assertEqual(target.read_bytes(), before)
+
+    def test_wal_fifo_is_rejected_without_blocking(self):
+        path = self.stopped_writer()
+        wal = Path(str(path) + "-wal")
+        wal.rename(path.parent / "retained-valid-wal")
+        os.mkfifo(wal)
+        with self.assertRaisesRegex(runner.VerificationError, "not a regular"):
+            runner.stock_readback(path, 2, 32)
+
+    def test_existing_oracle_copy_is_never_overwritten(self):
+        path = self.stopped_writer()
+        target = path.parent / "stock-oracle"
+        target.mkdir()
+        evidence = target / path.name
+        evidence.write_bytes(b"keep prior oracle evidence")
+        with self.assertRaises(FileExistsError):
+            runner.stock_readback(path, 2, 32)
+        self.assertEqual(evidence.read_bytes(), b"keep prior oracle evidence")
+
+    def test_stock_worker_error_does_not_look_like_success(self):
+        path = self.fixture("missing.sqlite")
+        with contextlib.redirect_stdout(io.StringIO()) as stdout, contextlib.redirect_stderr(io.StringIO()):
+            code = runner.main(["_stock_readback", str(path), "1", "32"])
+        self.assertEqual(code, 2)
+        self.assertEqual(stdout.getvalue(), "")
+
+    def test_stock_worker_timeout_reaps_child_and_preserves_source(self):
+        path = self.stopped_writer()
+        original = {suffix: Path(str(path) + suffix).read_bytes() for suffix in ("", "-wal", "-shm")}
+        children = []
+        real_popen = runner.subprocess.Popen
+
+        def capture_child(*args, **kwargs):
+            child = real_popen(*args, **kwargs)
+            children.append(child)
+            return child
+
+        # Hang inside the actual worker's SQLite call after the copy. A
+        # same-process oracle would never reach the supervisor's timeout.
+        source = f'''
+import importlib.util, sys, time
+spec = importlib.util.spec_from_file_location("worker", {str(MODULE_PATH)!r})
+worker = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(worker)
+class StalledConnection:
+    def execute(self, sql):
+        print("sqlite-entered", file=sys.stderr, flush=True)
+        time.sleep(60)
+    def close(self):
+        pass
+worker.sqlite3.connect = lambda *a, **k: StalledConnection()
+sys.exit(worker.main(["_stock_readback", {str(path)!r}, "2", "32"]))
+'''
+        with mock.patch.object(runner.subprocess, "Popen", side_effect=capture_child):
+            with self.assertRaisesRegex(runner.VerificationError, "timed out"):
+                runner.run_process([sys.executable, "-c", source], path.parent, "stock-stalled", 2)
+        self.assertEqual(len(children), 1)
+        self.assertIsNotNone(children[0].returncode)
+        self.assertFalse(Path(f"/proc/{children[0].pid}").exists())
+        self.assertIn("sqlite-entered", (path.parent / "stock-stalled.stderr.log").read_text())
+        self.assertEqual(original, {suffix: Path(str(path) + suffix).read_bytes() for suffix in original})
 
     def test_stock_oracle_rejects_incorrect_payload(self):
         path, connection = self.database()
@@ -301,11 +453,11 @@ class FilesAndProcessTests(unittest.TestCase):
             runner.run_process([sys.executable, "-c", "pass"], directory, "existing", 5)
         self.assertEqual(path.read_text(), "preserve me")
 
-    def make_synthetic_reproducer(self, corrupt=False):
+    def make_synthetic_reproducer(self, corrupt=False, checkpointed=False):
         path = self.fixture("synthetic-reproducer")
         source = f'''#!{sys.executable}
 # Test fixture only: these RSS numbers and FNV digests are synthetic.
-import json, sqlite3, sys
+import json, os, sqlite3, sys
 from pathlib import Path
 mode, name, total, transaction, row = sys.argv[1:]
 total, transaction, row = int(total), int(transaction), int(row)
@@ -334,8 +486,13 @@ if mode == "write":
         c.execute("UPDATE records SET payload=? WHERE id=1", (b"corrupt",))
         c.commit()
     checkpoint("all_transactions_committed", rows, rows*row_bytes)
-    c.close()
+    if {checkpointed!r}:
+        c.close()
     checkpoint("closed_without_checkpoint", rows, rows*row_bytes)
+    # Retain real WAL bytes after process exit. This is fixture mechanics,
+    # not a claim about native close_without_checkpoint or crash safety.
+    sys.stdout.flush()
+    os._exit(0)
 else:
     print(json.dumps(dict(phase="all_bytes_verified", rows=rows,
                           payload_bytes=rows*row_bytes, fnv1a64="0000000000000518")))
@@ -358,6 +515,11 @@ else:
         report = json.loads((output / "report.json").read_text())
         self.assertEqual(report["status"], "passed")
         self.assertEqual(len(report["runs"]), 4)
+        self.assertEqual(report["schema_version"], 2)
+        for run in report["runs"]:
+            self.assertIn("_stock_readback", run["stock_process"]["command"])
+            self.assertTrue(Path(run["stock_process"]["stdout"]).is_file())
+            self.assertEqual(run["metrics"]["peak_rss_kib"], 1000000)
         self.assertEqual({item["metrics"]["transactions"] for item in report["runs"]}, {1, 2})
         self.assertEqual(len({item["stock_readback"]["sha256"] for item in report["runs"]}), 1)
         self.assertEqual(report["binaries"]["baseline"]["sha256"], runner.file_sha256(binary))
@@ -374,7 +536,10 @@ else:
         self.assertEqual(code, 2)
         report = json.loads((output / "report.json").read_text())
         self.assertEqual(report["status"], "error")
-        self.assertIn("stock SQLite readback mismatch", report["error"])
+        self.assertIn("stock exited 2", report["error"])
+        logs = list(output.glob("*/stock.stderr.log"))
+        self.assertEqual(len(logs), 1)
+        self.assertIn("stock SQLite readback mismatch", logs[0].read_text())
         self.assertNotIn("verify", report["runs"][0])
 
 

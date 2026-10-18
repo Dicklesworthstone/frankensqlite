@@ -15,9 +15,13 @@ Example (Linux; fresh output directory required):
 
 Each repetition runs the 384 MiB single transaction and 24 x 16 MiB control
 in separate processes and fresh databases for BOTH binaries. Run order is
-seeded and shuffled. Every database gets independent, streaming stock-SQLite
-readback BEFORE the reproducer's own fresh-process verification. Files and logs
-are retained, including on failure; nothing is deleted or overwritten.
+seeded and shuffled. Stock SQLite verifies a private copy of the stopped
+writer's database and WAL, never its original recovery state. The native
+verifier then opens the original database without prior stock-SQLite access.
+Copies and logs are retained, including on failure. A nonempty WAL is required:
+a silently checkpointed workload cannot qualify this WAL recovery experiment.
+Each writer, stock verifier (including copying), and native verifier has its
+own timeout. Stock-verifier memory is not included in writer RSS measurements.
 
 The default gate requires at least 25% lower large-case peak and post-close
 RSS, and permits at most 10% higher small-case peak. These are explicit test
@@ -38,7 +42,9 @@ import os
 from pathlib import Path
 import platform
 import random
+import shutil
 import sqlite3
+import stat
 import statistics
 import subprocess
 import sys
@@ -178,11 +184,51 @@ def verifier_digest(records: list[dict[str, Any]], total_mib: int, row_kib: int)
     return digest
 
 
+def copy_oracle_database(path: Path) -> Path:
+    """Copy a quiescent database/WAL pair, leaving its SHM untouched.
+
+    Call only after the writer process has exited. Read-only SQLite can create
+    or repair SHM, so opening the original before the native verifier can mask
+    recovery bugs. Do not copy SHM: the oracle must rebuild its own index from
+    durable bytes. Copy in bounded blocks into new regular files, not hardlinks.
+    """
+    directory = path.parent / "stock-oracle"
+    directory.mkdir(mode=0o700)
+    target = directory / path.name
+    for suffix in ("", "-wal"):
+        source = Path(str(path) + suffix)
+        destination = Path(str(target) + suffix)
+        # O_NONBLOCK prevents a malformed FIFO from hanging before fstat;
+        # O_NOFOLLOW rejects links without a check/open race (Linux runner).
+        fd = os.open(source, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        with os.fdopen(fd, "rb") as incoming:
+            before = os.fstat(incoming.fileno())
+            if not stat.S_ISREG(before.st_mode):
+                raise VerificationError(f"not a regular database/WAL file: {source}")
+            if suffix == "-wal" and before.st_size <= 32:
+                raise VerificationError("writer left no WAL frames for recovery verification")
+            with destination.open("xb") as outgoing:
+                remaining = before.st_size
+                while remaining:
+                    block = incoming.read(min(MIB, remaining))
+                    if not block:
+                        raise VerificationError(f"database/WAL shrank during copy: {source}")
+                    outgoing.write(block)
+                    remaining -= len(block)
+            after = os.fstat(incoming.fileno())
+            if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+                after.st_size, after.st_mtime_ns, after.st_ctime_ns
+            ):
+                raise VerificationError(f"database/WAL changed during copy: {source}")
+    return target
+
+
 def stock_readback(path: Path, total_mib: int, row_kib: int) -> dict[str, Any]:
-    """Independently check all IDs and payload bytes without loading the table."""
+    """Check every ID and byte on an isolated copy, not native recovery state."""
     total_rows, _, row_bytes = dimensions(total_mib, total_mib, row_kib)
     if path.is_symlink() or not path.is_file():
         raise VerificationError("writer did not create a regular database file")
+    path = copy_oracle_database(path)
     expected = bytes(index % 251 for index in range(row_bytes))
     digest = hashlib.sha256()
     seen = 0
@@ -202,7 +248,71 @@ def stock_readback(path: Path, total_mib: int, row_kib: int) -> dict[str, Any]:
             raise VerificationError(f"stock SQLite read {seen} rows, expected {total_rows}")
     finally:
         connection.close()
-    return {"rows": seen, "payload_bytes": seen * row_bytes, "sha256": digest.hexdigest()}
+    # A leftover nonempty WAL can be stale or invalid and ignored by SQLite.
+    # Prove the successful readback actually needed WAL bytes by checking the
+    # same main image without any sidecars. Never probe the writer's original.
+    main_only = path.parent / "main-only.sqlite"
+    with path.open("rb") as incoming, main_only.open("xb") as outgoing:
+        shutil.copyfileobj(incoming, outgoing, length=MIB)
+    if main_contains_payload(main_only, total_rows, expected):
+        raise VerificationError("all payload bytes are already in the main database; WAL recovery was not exercised")
+    return {"rows": seen, "payload_bytes": seen * row_bytes,
+            "sha256": digest.hexdigest(), "database": str(path), "wal_required": True}
+
+
+def main_contains_payload(path: Path, total_rows: int, expected: bytes) -> bool:
+    """Negative control on a private, immutable main-only copy."""
+    connection = sqlite3.connect(path.resolve().as_uri() + "?mode=ro&immutable=1", uri=True)
+    try:
+        try:
+            cursor = connection.execute("SELECT id,payload FROM records ORDER BY id")
+        except sqlite3.OperationalError as error:
+            if str(error) == "no such table: records":
+                return False  # The schema itself may still be in the WAL.
+            raise
+        seen = 0
+        for identifier, payload in cursor:
+            seen += 1
+            if type(identifier) is not int or identifier != seen or type(payload) is not bytes or payload != expected:
+                return False
+        return seen == total_rows
+    finally:
+        connection.close()
+
+
+def stock_worker_main(argv: list[str]) -> int:
+    """Private subprocess entry point; keeps all oracle work under a deadline."""
+    parser = argparse.ArgumentParser(description="Internal stock-SQLite verification worker")
+    parser.add_argument("database", type=Path)
+    parser.add_argument("total_mib", type=int)
+    parser.add_argument("row_kib", type=int)
+    args = parser.parse_args(argv)
+    try:
+        result = stock_readback(args.database, args.total_mib, args.row_kib)
+        print(json.dumps(result, allow_nan=False), flush=True)
+        return 0
+    except (VerificationError, OSError, sqlite3.Error, ValueError) as error:
+        print(f"stock verification error: {error}", file=sys.stderr, flush=True)
+        return 2
+
+
+def stock_result(records: list[dict[str, Any]], path: Path,
+                 total_mib: int, row_kib: int) -> dict[str, Any]:
+    """Require a complete independent-verifier result, not just exit status 0."""
+    total_rows, _, row_bytes = dimensions(total_mib, total_mib, row_kib)
+    if len(records) != 1:
+        raise VerificationError("missing or duplicated stock verifier result")
+    result = records[0]
+    digest = result.get("sha256")
+    if integer(result, "rows") != total_rows or integer(result, "payload_bytes") != total_rows * row_bytes:
+        raise VerificationError("incorrect stock verifier totals")
+    if not isinstance(digest, str) or len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+        raise VerificationError("invalid stock verifier SHA-256 digest")
+    if result.get("database") != str(path.parent / "stock-oracle" / path.name):
+        raise VerificationError("stock verifier did not report its isolated database")
+    if result.get("wal_required") is not True:
+        raise VerificationError("stock verifier did not prove the WAL was required")
+    return result
 
 
 def rss_kib(pid: int) -> int:
@@ -298,6 +408,9 @@ def compare_runs(runs: list[dict[str, Any]], repetitions: int, peak_ratio: float
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["_stock_readback"]:
+        return stock_worker_main(argv[1:])
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--baseline", type=Path, required=True)
     parser.add_argument("--candidate", type=Path, required=True)
@@ -309,13 +422,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--row-kib", type=int, default=32)
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument("--seed", type=int, default=518)
-    parser.add_argument("--timeout-seconds", type=float, default=900)
+    parser.add_argument("--timeout-seconds", type=float, default=900,
+                        help="deadline for each writer, stock-verifier, or native-verifier process")
     parser.add_argument("--max-large-peak-ratio", type=float, default=0.75)
     parser.add_argument("--max-large-retained-ratio", type=float, default=0.75)
     parser.add_argument("--max-small-peak-ratio", type=float, default=1.10)
     args = parser.parse_args(argv)
     output = args.output.resolve()
-    report: dict[str, Any] = {"schema_version": 1, "status": "error", "runs": []}
+    report: dict[str, Any] = {"schema_version": 2, "status": "error", "runs": []}
     created_output = False
     try:
         dimensions(args.total_mib, args.small_transaction_mib, args.row_kib)
@@ -342,6 +456,7 @@ def main(argv: list[str] | None = None) -> int:
             "declared_source_revisions": {"baseline": args.baseline_revision, "candidate": args.candidate_revision},
             "workload": {"total_mib": args.total_mib, "small_transaction_mib": args.small_transaction_mib,
                          "row_kib": args.row_kib, "repetitions": args.repetitions, "seed": args.seed},
+            "timeout_seconds_per_process": args.timeout_seconds,
             "metric_scope": "peak_rss_kib is whole writer process; COMMIT deltas are endpoint RSS, not peak inside COMMIT",
         })
         rng = random.Random(args.seed)
@@ -359,7 +474,11 @@ def main(argv: list[str] | None = None) -> int:
                 run["write"] = run_process([str(binaries[implementation]), "write", *parameters], directory, "write", args.timeout_seconds)
                 run["metrics"] = writer_metrics(records_from(Path(run["write"]["stdout"])), args.total_mib,
                                                 transaction_mib, args.row_kib, run["write"]["sampled_peak_kib"])
-                run["stock_readback"] = stock_readback(database, args.total_mib, args.row_kib)
+                stock_command = [sys.executable, str(Path(__file__).resolve()), "_stock_readback",
+                                 str(database), str(args.total_mib), str(args.row_kib)]
+                run["stock_process"] = run_process(stock_command, directory, "stock", args.timeout_seconds)
+                run["stock_readback"] = stock_result(records_from(Path(run["stock_process"]["stdout"])),
+                                                       database, args.total_mib, args.row_kib)
                 run["verify"] = run_process([str(binaries[implementation]), "verify", *parameters], directory, "verify", args.timeout_seconds)
                 run["fnv1a64"] = verifier_digest(records_from(Path(run["verify"]["stdout"])), args.total_mib, args.row_kib)
                 print(f"{repetition + 1}/{args.repetitions} {implementation} {case}: verified; peak {run['metrics']['peak_rss_kib']} KiB", flush=True)
