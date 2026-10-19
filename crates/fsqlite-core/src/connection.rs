@@ -23619,9 +23619,19 @@ impl Connection {
     /// path re-indexed the in-memory documents, which are empty after a lazy
     /// delete-all — leaving `count(*)=0`. Returns `None` for non-external tables
     /// (the caller then rebuilds from the in-memory documents, as before).
+    ///
+    /// GH#211: when the `content=` table no longer exists (for example after
+    /// `ALTER TABLE c RENAME TO c2`, which stock deliberately does not
+    /// propagate into the option), this fails with stock's table-local
+    /// `no such table: <schema>.<content>` error. Returning `None` there made
+    /// the caller rebuild from the in-memory documents, which for external
+    /// content do not carry the indexed text, and the rebuild silently erased
+    /// the existing postings. The caller reads these rows before touching the
+    /// index, so the error leaves the index and the source rows unchanged.
     #[cfg(feature = "ext-fts5")]
     async fn fts5_read_external_content_rows_for_rebuild(
         &self,
+        schema_name: Option<&str>,
         table_name: &str,
     ) -> Result<Option<Vec<(i64, Vec<String>)>>> {
         let (content_table, col_count) = {
@@ -23651,7 +23661,9 @@ impl Connection {
                 .find(|table| table.name.eq_ignore_ascii_case(&content_name))
                 .cloned()
             else {
-                return Ok(None);
+                return Err(FrankenError::NoSuchTable {
+                    name: format!("{}.{content_name}", schema_name.unwrap_or("main")),
+                });
             };
             (content_table, col_count)
         };
@@ -56020,7 +56032,10 @@ impl Connection {
                 // Read the source rows up front (needs a txn) before borrowing the
                 // instance. `None` => not external content: rebuild from all_rows().
                 let external_rows = self
-                    .fts5_read_external_content_rows_for_rebuild(insert.table.name.as_str())
+                    .fts5_read_external_content_rows_for_rebuild(
+                        insert.table.schema.as_deref(),
+                        insert.table.name.as_str(),
+                    )
                     .await?;
                 let key = insert.table.name.to_ascii_uppercase();
                 let mut instances = self.vtab_instances.borrow_mut();

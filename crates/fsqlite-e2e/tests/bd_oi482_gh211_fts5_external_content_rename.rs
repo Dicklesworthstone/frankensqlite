@@ -183,3 +183,213 @@ fn gh211_external_content_rename_rebuild_and_lifecycle_match_stock() {
         );
     });
 }
+
+const MATCH_GOODBYE: &str = "SELECT rowid FROM ft WHERE ft MATCH 'goodbye'";
+const SOURCE_ROWS: &str = "SELECT id, body FROM c2 ORDER BY id";
+
+/// Everything a post-rename `'rebuild'` attempt must leave behind: the error,
+/// the postings for both known terms, and the primary rows.
+#[derive(Debug, PartialEq, Eq)]
+struct RebuildOutcome {
+    match_hello_before: Result<Vec<i64>, String>,
+    rebuild_is_no_such_content_table: bool,
+    match_hello_after: Result<Vec<i64>, String>,
+    match_goodbye_after: Result<Vec<i64>, String>,
+}
+
+fn stock_source_rows(conn: &rusqlite::Connection) -> Vec<(i64, String)> {
+    conn.prepare(SOURCE_ROWS)
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<Vec<(i64, String)>>>()
+        })
+        .expect("read c2 rows")
+}
+
+async fn frank_rename_then_rebuild(conn: &Connection) -> RebuildOutcome {
+    conn.execute("ALTER TABLE c RENAME TO c2;")
+        .await
+        .expect("frank rename");
+    let match_hello_before = frank_rowids(conn, MATCH_ROWID).await;
+    let rebuild_err = frank_exec_err(conn, REBUILD).await;
+    RebuildOutcome {
+        match_hello_before,
+        rebuild_is_no_such_content_table: rebuild_err
+            .as_deref()
+            .is_some_and(is_no_such_content_table),
+        match_hello_after: frank_rowids(conn, MATCH_ROWID).await,
+        match_goodbye_after: frank_rowids(conn, MATCH_GOODBYE).await,
+    }
+}
+
+/// GH#211 reopen (release qualification): a `'rebuild'` after the content
+/// table is renamed away used to SUCCEED by rebuilding from frank's in-memory
+/// documents, which do not carry external-content text, and it erased the
+/// existing postings durably: a later stock reopener also found no `hello`.
+/// The rebuild must fail with stock's table-local error before touching the
+/// index, on a hot connection and on a reopened (lazy) one, and a stock first
+/// reopener must still find both terms and both primary rows.
+#[test]
+fn gh211_failed_rebuild_preserves_postings_hot_and_reopened() {
+    asupersync::test_utils::run_test(|| async {
+        let expected = RebuildOutcome {
+            match_hello_before: Ok(vec![1]),
+            rebuild_is_no_such_content_table: true,
+            match_hello_after: Ok(vec![1]),
+            match_goodbye_after: Ok(vec![2]),
+        };
+
+        // Stock control, file-backed like the frank cases.
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let stock_path = dir.path().join("stock.db");
+        {
+            let stock = rusqlite::Connection::open(&stock_path).expect("open stock");
+            stock.execute_batch(SETUP).expect("stock setup");
+            stock
+                .execute_batch("ALTER TABLE c RENAME TO c2;")
+                .expect("stock rename");
+            let rebuild_err = stock_exec_err(&stock, REBUILD);
+            let outcome = RebuildOutcome {
+                match_hello_before: Ok(vec![1]),
+                rebuild_is_no_such_content_table: rebuild_err
+                    .as_deref()
+                    .is_some_and(is_no_such_content_table),
+                match_hello_after: stock_rowids(&stock, MATCH_ROWID),
+                match_goodbye_after: stock_rowids(&stock, MATCH_GOODBYE),
+            };
+            assert_eq!(outcome, expected, "sanity: stock control");
+        }
+
+        for reopen_before_rename in [false, true] {
+            let case = if reopen_before_rename {
+                "reopened"
+            } else {
+                "hot"
+            };
+            let frank_path = dir.path().join(format!("frank-{case}.db"));
+            let frank_str = frank_path.to_string_lossy().into_owned();
+            let mut conn = Connection::open(frank_str.clone())
+                .await
+                .expect("open frank");
+            conn.execute(SETUP).await.expect("frank setup");
+            if reopen_before_rename {
+                conn.close().await.expect("close after setup");
+                conn = Connection::open(frank_str.clone())
+                    .await
+                    .expect("reopen frank");
+            }
+            let outcome = frank_rename_then_rebuild(&conn).await;
+            assert_eq!(outcome, expected, "{case}: frank vs stock");
+            // Not asserted: projecting the body column after the rename is the
+            // separate external-content serving work (bd-c6jre). Stock errors
+            // `no such table: main.c` here; record what frank does.
+            eprintln!(
+                "{case}: MATCH projecting body after rename: {:?}",
+                conn.query("SELECT body FROM ft WHERE ft MATCH 'hello'")
+                    .await
+                    .map(|rows| rows
+                        .iter()
+                        .map(|row| row.values().to_vec())
+                        .collect::<Vec<_>>())
+                    .map_err(|error| error.to_string())
+            );
+            conn.close().await.expect("close frank");
+
+            // Stock is the first reopener, before any rename-back or repair.
+            let stock = rusqlite::Connection::open(&frank_path).expect("stock reopen");
+            assert_eq!(
+                stock_rowids(&stock, MATCH_ROWID),
+                Ok(vec![1]),
+                "{case}: stock reopener must still find `hello`"
+            );
+            assert_eq!(
+                stock_rowids(&stock, MATCH_GOODBYE),
+                Ok(vec![2]),
+                "{case}: stock reopener must still find `goodbye`"
+            );
+            assert_eq!(
+                stock_source_rows(&stock),
+                vec![(1, "hello world".to_owned()), (2, "goodbye moon".to_owned())],
+                "{case}: primary rows intact"
+            );
+            let integrity: String = stock
+                .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+                .expect("stock integrity_check");
+            assert_eq!(integrity, "ok", "{case}: stock integrity_check");
+            let create_sql: String = stock
+                .query_row("SELECT sql FROM sqlite_master WHERE name = 'ft'", [], |row| {
+                    row.get(0)
+                })
+                .expect("persisted ft DDL");
+            assert!(
+                create_sql.contains("content='c'"),
+                "{case}: the persisted content= binding must not be rewritten: {create_sql}"
+            );
+            drop(stock);
+
+            // Rename-back recovers: a valid rebuild then re-indexes the source.
+            let conn = Connection::open(frank_str).await.expect("reopen frank");
+            conn.execute("ALTER TABLE c2 RENAME TO c;")
+                .await
+                .expect("frank rename-back");
+            assert_eq!(
+                frank_exec_err(&conn, REBUILD).await,
+                None,
+                "{case}: rebuild after rename-back"
+            );
+            assert_eq!(
+                frank_rowids(&conn, MATCH_ROWID).await,
+                Ok(vec![1]),
+                "{case}: `hello` after recovery rebuild"
+            );
+            assert_eq!(
+                frank_rowids(&conn, MATCH_GOODBYE).await,
+                Ok(vec![2]),
+                "{case}: `goodbye` after recovery rebuild"
+            );
+        }
+    });
+}
+
+/// External-content maintenance on a reopened connection: indexing one more
+/// source row must keep the postings persisted before the reopen.
+#[test]
+fn gh211_external_content_insert_after_reopen_keeps_existing_postings() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let frank_path = dir.path().join("frank-insert.db");
+        let frank_str = frank_path.to_string_lossy().into_owned();
+        let conn = Connection::open(frank_str.clone())
+            .await
+            .expect("open frank");
+        conn.execute(SETUP).await.expect("frank setup");
+        conn.close().await.expect("close after setup");
+
+        let conn = Connection::open(frank_str).await.expect("reopen frank");
+        conn.execute("INSERT INTO c(id, body) VALUES (3, 'hello again')")
+            .await
+            .expect("insert source row");
+        conn.execute("INSERT INTO ft(rowid, body) VALUES (3, 'hello again')")
+            .await
+            .expect("index source row");
+        assert_eq!(
+            frank_rowids(&conn, MATCH_ROWID).await,
+            Ok(vec![1, 3]),
+            "`hello` after indexing a row on a reopened connection"
+        );
+        assert_eq!(
+            frank_rowids(&conn, MATCH_GOODBYE).await,
+            Ok(vec![2]),
+            "`goodbye` after indexing a row on a reopened connection"
+        );
+        conn.close().await.expect("close frank");
+
+        let stock = rusqlite::Connection::open(&frank_path).expect("stock reopen");
+        assert_eq!(stock_rowids(&stock, MATCH_ROWID), Ok(vec![1, 3]));
+        assert_eq!(stock_rowids(&stock, MATCH_GOODBYE), Ok(vec![2]));
+        let integrity: String = stock
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .expect("stock integrity_check");
+        assert_eq!(integrity, "ok");
+    });
+}
