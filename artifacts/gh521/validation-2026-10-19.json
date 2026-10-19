@@ -1,0 +1,261 @@
+{
+  "schema_version": 1,
+  "issue": "https://github.com/Dicklesworthstone/frankensqlite/issues/521",
+  "recorded_utc": "2026-10-19T19:54:49.521234+00:00",
+  "status": "native_validation_blocked",
+  "scope": "Verified stock SQLite control and benchmark error-path checks. Supplemental Rust patch is retained as an unapplied artifact; no candidate engine result or insertion speedup is asserted.",
+  "baseline_revision": "34e88222688f94701af9fec57b1576289f1942ca",
+  "reviewed_main_revision": "183f44fc1b997c4c749fefc63f3e9ba71ab2bbc5",
+  "upstream_divider_redistribution_commit": "00e907b5214c8fb60906f9ebefa28b361afe9ae5",
+  "platform": "Linux-6.18.55-x86_64-with-glibc2.39",
+  "benchmark": {
+    "path": "scripts/benchmark_issue_521.py",
+    "sha256": "c5f27272198f92356bc78c734d3be3ac271fc63e0ec0593142c877dbe9fe0d38",
+    "checked": [
+      "Python AST parse",
+      "argparse --help",
+      "four exact 12000-key permutations",
+      "counterbalanced engine positions",
+      "stock SQLite control",
+      "CLI-error rejection with postverification",
+      "missing-row rejection despite integrity_check=ok"
+    ],
+    "full_baseline_candidate_stock_invocation_completed": false,
+    "candidate_performance_result": null,
+    "stock_single_run_timing_scope": "Helper validation on tmpfs, including CLI startup, schema, inserts, commit, shutdown. Not a repeated filesystem throughput comparison."
+  },
+  "pending_patch": {
+    "path": "artifacts/gh521/pending-native-validation.patch",
+    "sha256": "9972c45fbc91cac01e21680970c7e9a58aa9c404bd3f58dc2908140bd0503698",
+    "base_revision": "183f44fc1b997c4c749fefc63f3e9ba71ab2bbc5",
+    "applied_to_published_production_source": false,
+    "changes": [
+      "Choose overflowing index/interior root boundaries by physical byte capacity, preserving separator and grandchild pointers.",
+      "Include minimum cell allocation in distribution validation.",
+      "Add six focused B-tree tests and strengthen sibling occupancy assertions.",
+      "Add eight SQL regression scenarios covering autocommit, ascending/descending/alternating/shuffled orders, composite DESC duplicates, variable/overflow keys, deletion/reinsertion, rollback/savepoints, and interrupted WAL transactions."
+    ],
+    "preserved": [
+      "Both upstream compute_leaf_distribution and compute_interior_distribution functions are byte-for-byte unchanged.",
+      "All 49 upstream balancing test names remain; no existing assertions removed.",
+      "Upstream SQL density gate of at most 1.25x SQLite remains unchanged.",
+      "Default concurrent mode remains enabled."
+    ],
+    "candidate_source_sha256": {
+      "crates/fsqlite-btree/src/balance.rs": "c5324038bd293ee977a659993dd2055ebbb03fad5fa24ec99f8c2161bf02061c",
+      "crates/fsqlite-core/tests/btree_page_geometry_stress_oracle.rs": "293dd13196bb7c4e438d03af4555ba353aeee1a0b1a757c44e41bb757ffb186a"
+    },
+    "native_compilation_completed": false,
+    "native_tests_executed": false,
+    "static_review": "Implemented by one reviewer and independently reviewed by two other reviewers; no concrete source-level correctness or API blocker found. This is not compilation evidence."
+  },
+  "stock_control": {
+    "purpose": "benchmark helper validation against actual stock SQLite only",
+    "source": "/workspace/scratch/f65e94bbf96b/frankensqlite/scripts/benchmark_issue_521.py",
+    "python_stock_version": "3.53.1",
+    "binary": {
+      "path": "/dev/shm/frankensqlite-gh521-build/sqlite3-3.53.1",
+      "sha256": "a4cd432f3ca4d5b4654009053d5f6f4d73812cd94ea25e41cc1999f68996269a",
+      "bytes": 1556256,
+      "version": "3.53.1 2026-05-05 10:34:17 c88b22011a54b4f6fbd149e9f8e4de77658ce58143a1af0e3785e4e6475127e9 (64-bit)",
+      "source_revision_supplied": "SQLite 3.53.1 bundled native C CLI"
+    },
+    "settings": {
+      "sqlite_version": "3.53.1",
+      "journal_mode": "delete",
+      "synchronous": "2",
+      "page_size": "4096"
+    },
+    "sample": {
+      "engine": "stock",
+      "directory": "/dev/shm/frankensqlite-gh521-build/benchmark-stock-validation/stock-lze2_mxo/sample",
+      "errors": [],
+      "returncode": 0,
+      "wall_seconds": 0.03189001000009739,
+      "geometry": {
+        "file_bytes": 352256,
+        "wal_bytes": 0,
+        "page_size": 4096,
+        "page_count": 86,
+        "freelist_count": 0,
+        "index_pages": 57,
+        "leaf_pages": 56,
+        "one_cell_leaves": 0,
+        "min_leaf_cells": 204,
+        "max_leaf_cells": 418,
+        "index_unused_bytes": 113048,
+        "logical_bytes": 352256
+      },
+      "stock_queries_ok": true,
+      "density_ok": true,
+      "native_queries_ok": true
+    },
+    "syntax_ok": true,
+    "argparse_help_ok": true
+  },
+  "negative_controls": {
+    "purpose": "stock-only benchmark error-path validation; intentional malformed/missing-row workloads, not performance samples",
+    "source": "/workspace/scratch/f65e94bbf96b/frankensqlite/scripts/benchmark_issue_521.py",
+    "binary": {
+      "path": "/dev/shm/frankensqlite-gh521-build/sqlite3-3.53.1",
+      "sha256": "a4cd432f3ca4d5b4654009053d5f6f4d73812cd94ea25e41cc1999f68996269a",
+      "bytes": 1556256,
+      "version": "3.53.1 2026-05-05 10:34:17 c88b22011a54b4f6fbd149e9f8e4de77658ce58143a1af0e3785e4e6475127e9 (64-bit)",
+      "source_revision_supplied": "SQLite 3.53.1 native CLI"
+    },
+    "results": {
+      "cli-error": {
+        "engine": "stock",
+        "directory": "/dev/shm/frankensqlite-gh521-build/benchmark-stock-validation/negative-controls-p19ko9rd/cli-error",
+        "errors": [
+          "CLI exit: 1",
+          "CLI emitted stderr; see run.stderr"
+        ],
+        "returncode": 1,
+        "wall_seconds": 0.03162911199979135,
+        "geometry": {
+          "file_bytes": 352256,
+          "wal_bytes": 0,
+          "page_size": 4096,
+          "page_count": 86,
+          "freelist_count": 0,
+          "index_pages": 57,
+          "leaf_pages": 56,
+          "one_cell_leaves": 0,
+          "min_leaf_cells": 204,
+          "max_leaf_cells": 418,
+          "index_unused_bytes": 113048,
+          "logical_bytes": 352256
+        },
+        "stock_queries_ok": true,
+        "density_ok": true,
+        "native_queries_ok": true
+      },
+      "missing-row": {
+        "engine": "stock",
+        "directory": "/dev/shm/frankensqlite-gh521-build/benchmark-stock-validation/negative-controls-p19ko9rd/missing-row",
+        "errors": [
+          "stock verification: stock persisted-query mismatch: SELECT rowid,x FROM a NOT INDEXED ORDER BY rowid; expected 12000 rows, got 11999",
+          "native verification: native CLI query verification failed (exit 0); see verify logs"
+        ],
+        "returncode": 0,
+        "wall_seconds": 0.031625689000065904
+      }
+    }
+  },
+  "successful_scoped_checks": [
+    {
+      "command": [
+        "rustfmt",
+        "+nightly-2026-08-31",
+        "--check",
+        "--edition",
+        "2024",
+        "crates/fsqlite-btree/src/balance.rs"
+      ],
+      "exit_code": 0,
+      "output": ""
+    },
+    {
+      "command": [
+        "rustfmt",
+        "+nightly-2026-08-31",
+        "--check",
+        "--edition",
+        "2024",
+        "--config-path",
+        "/dev/null",
+        "crates/fsqlite-core/tests/btree_page_geometry_stress_oracle.rs"
+      ],
+      "exit_code": 0,
+      "output": ""
+    },
+    {
+      "command": [
+        "git",
+        "diff",
+        "--check"
+      ],
+      "exit_code": 0,
+      "output": ""
+    },
+    {
+      "command": [
+        "git",
+        "apply",
+        "--cached",
+        "--check",
+        "/dev/shm/frankensqlite-gh521-build/candidate/artifacts/gh521/pending-native-validation.patch"
+      ],
+      "exit_code": 0,
+      "output": ""
+    },
+    {
+      "command": [
+        "git",
+        "apply",
+        "--reverse",
+        "--check",
+        "/dev/shm/frankensqlite-gh521-build/candidate/artifacts/gh521/pending-native-validation.patch"
+      ],
+      "exit_code": 0,
+      "output": ""
+    }
+  ],
+  "build_blocker": {
+    "dependency": "asupersync 0.5.0, unchanged locked dependency with default features disabled",
+    "attempted_source_base_revision": "34e88222688f94701af9fec57b1576289f1942ca",
+    "attempted_balance_source_sha256": "c28f9bce55178a698bc9d1fa965c69205c61df6babb94821f0a24010db59c747",
+    "rebase_note": "The failed builds preceded the concurrent main commits. The supplemental patch was subsequently rebased onto 183f44fc without changing the locked dependency; it has not been compiled.",
+    "compiler": "rustc 1.100.0-nightly (908501772 2026-08-30), toolchain nightly-2026-08-31",
+    "attempted_target": "cargo +nightly-2026-08-31 test --locked -j 1 -p fsqlite-btree --lib balance:: -- --nocapture",
+    "observed_result": "rustc terminated with signal 9 (SIGKILL) while analyzing asupersync, before compiling the changed FrankenSQLite code.",
+    "diagnostic_rss_before_termination_mb": 3883,
+    "cgroup_memory_limit_bytes": 8589934592,
+    "filesystem_available_bytes": 0,
+    "mitigations_tried": [
+      "single Cargo job",
+      "single rustc frontend thread",
+      "incremental disabled",
+      "debug info disabled",
+      "single codegen backend job",
+      "jemalloc arena/decay tuning",
+      "fewer compiler names and stripped MIR debug information"
+    ],
+    "logs": [
+      {
+        "path": "/dev/shm/frankensqlite-gh521-build/btree-balance-test.log",
+        "sha256": "ba9fc13a5597fc0067c5a982ddaf1790607221af6dd986e208d27656f8fe2edb"
+      },
+      {
+        "path": "/dev/shm/frankensqlite-gh521-build/btree-balance-lowmem-diagnostic.log",
+        "sha256": "67e8d404fe254dab00fff5470e4501a18a3c1c10c819db5548b9dece6abca0a3"
+      },
+      {
+        "path": "/dev/shm/frankensqlite-gh521-build/workspace-format-check.log",
+        "sha256": "389bec3ff90fca1e17642db52cc325b91f9d4675418c1a678bdcd951f861f510"
+      }
+    ],
+    "workspace_format_status": "cargo fmt --check reports pre-existing unrelated formatting differences. Both edited Rust files pass explicit scoped checks.",
+    "workspace_check_status": "blocked by dependency compilation; no successful check claimed",
+    "workspace_clippy_status": "not completed; no successful Clippy result claimed",
+    "resource_cleanup": "No files were deleted. AGENTS.md Rule 1 requires express written user permission for deletion, including generated build outputs."
+  },
+  "remaining_commands": [
+    "git apply --check artifacts/gh521/pending-native-validation.patch",
+    "git apply artifacts/gh521/pending-native-validation.patch",
+    "cargo +nightly-2026-08-31 test --locked -p fsqlite-btree --lib -- --nocapture",
+    "cargo +nightly-2026-08-31 test --locked -p fsqlite-core --test btree_page_geometry_stress_oracle -- --nocapture --test-threads=1",
+    "cargo +nightly-2026-08-31 test --locked -p fsqlite-e2e --test gh521_index_descending_insert_density_e2e -- --nocapture",
+    "cargo +nightly-2026-08-31 check --workspace --all-targets",
+    "cargo +nightly-2026-08-31 clippy --workspace --all-targets -- -D warnings",
+    "cargo +nightly-2026-08-31 fmt --check",
+    "Build baseline and candidate native CLI binaries with identical compiler/profile flags, then run scripts/benchmark_issue_521.py with both binaries and the live SQLite 3.53.1 CLI in one invocation; pass an explicit --max-regression bound.",
+    "Commit the supplemental Rust changes to main only after native validation succeeds; update issue 521 with measured candidate occupancy, bytes, query/integrity and insertion-overhead results."
+  ],
+  "repair_references": [
+    "https://www.sqlite.org/lang_vacuum.html",
+    "https://www.sqlite.org/lang_reindex.html",
+    "https://www.sqlite.org/fileformat.html"
+  ]
+}
