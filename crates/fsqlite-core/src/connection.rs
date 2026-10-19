@@ -13485,6 +13485,10 @@ pub struct Connection {
     /// [`TEMP_MEMDB_ROOT_START`] so it cannot collide with ordinary main pager
     /// roots or advance the ordinary MemDatabase root allocator.
     next_temp_root_page: Cell<i32>,
+    /// Root pages of active materialized ephemeral tables (CTEs, views,
+    /// `sqlite_schema`) that exist only in `self.db` (`MemDatabase`), never in
+    /// the pager (GH#493 / bd-dy2h3).
+    materialized_temp_root_pages: RefCell<HashSet<i32>>,
     /// bd-wjrs0: `main` tables currently shadowed by a same-named `TEMP` table,
     /// keyed by lowercased name. Kept out of `schema` so unqualified references
     /// resolve to the `TEMP` table; restored into `schema` when the `TEMP`
@@ -15605,6 +15609,7 @@ impl Connection {
             schema_by_name: RefCell::new(HashMap::new()),
             temp_table_names: RefCell::new(HashSet::new()),
             next_temp_root_page: Cell::new(TEMP_MEMDB_ROOT_START),
+            materialized_temp_root_pages: RefCell::new(HashSet::new()),
             shadowed_main_tables: RefCell::new(HashMap::new()),
             views: RefCell::new(Vec::new()),
             views_by_name: RefCell::new(HashMap::new()),
@@ -16162,6 +16167,7 @@ impl Connection {
             schema_by_name: RefCell::new(HashMap::new()),
             temp_table_names: RefCell::new(HashSet::new()),
             next_temp_root_page: Cell::new(TEMP_MEMDB_ROOT_START),
+            materialized_temp_root_pages: RefCell::new(HashSet::new()),
             shadowed_main_tables: RefCell::new(HashMap::new()),
             views: RefCell::new(Vec::new()),
             views_by_name: RefCell::new(HashMap::new()),
@@ -25685,7 +25691,8 @@ impl Connection {
 
     fn should_eagerly_hydrate_memdb_rows(&self) -> bool {
         self.path == ":memory:"
-            || (!*self.reject_mem_fallback.borrow()
+            || (!self.defer_memdb_row_hydration()
+                && !*self.reject_mem_fallback.borrow()
                 && self.memdb_row_hydration_suppressed.get() == 0)
     }
 
@@ -26409,10 +26416,9 @@ impl Connection {
         // (self-hydrating on demand), so deferring row hydration here is
         // correctness-neutral and removes the quadratic. Only when the caller
         // explicitly opted into the MemDatabase as the row source of record
-        // (reject_mem_fallback == false) must the mirror stay eagerly hydrated.
-        // (`should_eagerly_hydrate_memdb_rows() && !reject_mem_fallback`
-        // simplifies to `!reject_mem_fallback` by absorption.)
-        let hydrate_rows = !*self.reject_mem_fallback.borrow() && !hydration_suppressed;
+        // (reject_mem_fallback == false && !defer_memdb_row_hydration()) must
+        // the mirror stay eagerly hydrated.
+        let hydrate_rows = self.should_eagerly_hydrate_memdb_rows() && !hydration_suppressed;
         let bound_visible_commit_seq = self
             .active_txn
             .borrow()
@@ -46708,6 +46714,8 @@ impl Connection {
                     return Ok(Some(result?));
                 }
                 let scan_sql = build_join_scan_sql(source);
+                let _tt_guard = (!self.memdb_rows_loaded.get())
+                    .then(|| BoolCellRestoreGuard::new(&self.time_travel_active, false));
                 let rows = self.query(&scan_sql).await?;
                 Ok(Some(rows_into_value_vectors(rows)))
             },
@@ -55151,6 +55159,8 @@ impl Connection {
                         return Ok(Some(result?));
                     }
                     let scan_sql = build_join_scan_sql(source);
+                    let _tt_guard = (!self.memdb_rows_loaded.get())
+                        .then(|| BoolCellRestoreGuard::new(&self.time_travel_active, false));
                     let rows = self.query(&scan_sql).await?;
                     Ok(Some(rows_into_value_vectors(rows)))
                 },
@@ -74007,6 +74017,9 @@ impl Connection {
                     };
 
                     let root_page = self.db.borrow_mut().create_table(col_infos.len());
+                    self.materialized_temp_root_pages
+                        .borrow_mut()
+                        .insert(root_page);
                     self.schema.borrow_mut().push(TableSchema {
                         name: materialized_name.clone(),
                         root_page,
@@ -74136,6 +74149,9 @@ impl Connection {
             for (table_name, is_temp) in referenced {
                 let virtual_rows = if is_temp { &temp_rows } else { &main_rows };
                 let root_page = self.db.borrow_mut().create_table(virtual_columns.len());
+                self.materialized_temp_root_pages
+                    .borrow_mut()
+                    .insert(root_page);
                 self.schema.borrow_mut().push(TableSchema {
                     name: table_name.clone(),
                     root_page,
@@ -76404,6 +76420,7 @@ impl Connection {
         // under. The guards restore the live database and catalog if the
         // query completes, errors, or is cancelled.
         let _database_guard = MemDatabaseRestoreGuard::new(&self.db, snapshot_db);
+        let _rows_loaded_guard = BoolCellRestoreGuard::new(&self.memdb_rows_loaded, true);
         let _catalog_guard = TimeTravelCatalogGuard::install(self, &image.catalog);
         self.ensure_time_travel_from_tables_exist(&stripped)?;
 
@@ -91861,12 +91878,20 @@ impl Connection {
         Ok(Some(result))
     }
 
+    fn is_memdb_only_root_page(&self, root_page: i32) -> bool {
+        root_page >= TEMP_MEMDB_ROOT_START
+            || self
+                .materialized_temp_root_pages
+                .borrow()
+                .contains(&root_page)
+    }
+
     fn join_mem_scan_safe(&self) -> bool {
-        self.time_travel_active.get()
-            || (self.memdb_rows_loaded.get()
-                && self.memdb_storage_count_shortcuts_safe.get()
-                && !self.memdb_requires_active_txn_reload.get()
-                && self.pending_memdb_direct_upserts.borrow().is_empty())
+        self.memdb_rows_loaded.get()
+            && (self.time_travel_active.get()
+                || (self.memdb_storage_count_shortcuts_safe.get()
+                    && !self.memdb_requires_active_txn_reload.get()
+                    && self.pending_memdb_direct_upserts.borrow().is_empty()))
     }
 
     fn join_table_supports_hidden_rowid_for_binding(&self, name: &QualifiedName) -> bool {
@@ -91969,13 +91994,13 @@ impl Connection {
         &self,
         src: &JoinTableSource,
     ) -> Option<Vec<Vec<SqliteValue>>> {
-        if !self.join_mem_scan_safe() {
-            return None;
-        }
         let binding_name = src.local_table_binding()?;
         let (table_schema, rowid_alias_column_index) =
             self.local_join_binding_table(binding_name)?;
         let root_page = table_schema.root_page;
+        if !self.is_memdb_only_root_page(root_page) && !self.join_mem_scan_safe() {
+            return None;
+        }
         // GH#227: VIRTUAL generated columns are stored as a NULL placeholder in
         // the record, so the memdb mirror row carries NULL in their slot. Left
         // uncomputed here, a JOIN/filter predicate on such a column would
@@ -92034,6 +92059,9 @@ impl Connection {
         let (table_schema, rowid_alias_column_index) =
             self.local_join_binding_table(binding_name)?;
         let root_page_num = table_schema.root_page;
+        if self.is_memdb_only_root_page(root_page_num) {
+            return None;
+        }
         let cx = &self.root_cx;
         let result: Result<Vec<Vec<SqliteValue>>> = async {
             let mut txn = self.pager.begin(cx, TransactionMode::ReadOnly).await?;
@@ -92205,6 +92233,8 @@ impl Connection {
                 // plain named table (e.g. while a transaction scope is
                 // active): a single-table SELECT through the normal dispatch.
                 let scan_sql = build_join_scan_sql(inner_src);
+                let _tt_guard = (!self.memdb_rows_loaded.get())
+                    .then(|| BoolCellRestoreGuard::new(&self.time_travel_active, false));
                 let rows = self.query(&scan_sql).await?;
                 rows.iter().map(|row| row.values().to_vec()).collect()
             };
@@ -92287,57 +92317,53 @@ impl Connection {
         // Outer scan, mirroring the generic scan's backend order
         // (memdb, then pager) and per-row materialization exactly.
         let mut memdb_handled = false;
-        if self.join_mem_scan_safe() {
-            let table_schema = {
-                let schema = self.schema.borrow();
-                schema
-                    .iter()
-                    .find(|table| table.name.eq_ignore_ascii_case(&outer_binding.name))
-                    .cloned()
-            };
-            if let Some(table_schema) = table_schema {
-                let has_virtual_generated = table_schema.columns.iter().any(|column| {
-                    column.generated_expr.is_some() && column.generated_stored != Some(true)
-                });
-                let db = self.db.borrow();
-                if let Some(table) = db.get_table(table_schema.root_page) {
-                    memdb_handled = true;
-                    for (rowid, values) in table.iter_rows_from(lower_bound) {
-                        visited_outer += 1;
-                        #[cfg(test)]
-                        {
-                            self.join_materialization_profile.borrow_mut().outer_mem_rows += 1;
-                        }
-                        let mut row = values.to_vec();
-                        if let Some(alias_value) = row.get_mut(ipk_idx) {
-                            *alias_value = SqliteValue::Integer(rowid);
-                        }
-                        if has_virtual_generated
-                            && Self::fill_generated_columns(
-                                &table_schema,
-                                rowid,
-                                Some(ipk_idx),
-                                &mut row,
-                                false,
-                            )
-                            .is_err()
-                        {
-                            // The generic memdb scan declines wholesale on a
-                            // generated-column evaluation error so the pager
-                            // path can surface it; mirror by refusing the
-                            // lane and discarding the partial stream.
-                            refuse("virtual generated column evaluation failed");
-                            return Ok(None);
-                        }
-                        if outer_src.hidden_rowid_projection.is_some() {
-                            row.push(SqliteValue::Integer(rowid));
-                        }
-                        if row.len() != primary_width {
-                            row.resize(primary_width, SqliteValue::Null);
-                        }
-                        if self.with_fallback_function_registry(|| join_outer_row(&row))? {
-                            break;
-                        }
+        let outer_table_schema = self
+            .local_join_binding_table(&outer_binding)
+            .map(|(table, _)| table);
+        if let Some(ref table_schema) = outer_table_schema
+            && (self.is_memdb_only_root_page(table_schema.root_page) || self.join_mem_scan_safe())
+        {
+            let has_virtual_generated = table_schema.columns.iter().any(|column| {
+                column.generated_expr.is_some() && column.generated_stored != Some(true)
+            });
+            let db = self.db.borrow();
+            if let Some(table) = db.get_table(table_schema.root_page) {
+                memdb_handled = true;
+                for (rowid, values) in table.iter_rows_from(lower_bound) {
+                    visited_outer += 1;
+                    #[cfg(test)]
+                    {
+                        self.join_materialization_profile.borrow_mut().outer_mem_rows += 1;
+                    }
+                    let mut row = values.to_vec();
+                    if let Some(alias_value) = row.get_mut(ipk_idx) {
+                        *alias_value = SqliteValue::Integer(rowid);
+                    }
+                    if has_virtual_generated
+                        && Self::fill_generated_columns(
+                            table_schema,
+                            rowid,
+                            Some(ipk_idx),
+                            &mut row,
+                            false,
+                        )
+                        .is_err()
+                    {
+                        // The generic memdb scan declines wholesale on a
+                        // generated-column evaluation error so the pager
+                        // path can surface it; mirror by refusing the
+                        // lane and discarding the partial stream.
+                        refuse("virtual generated column evaluation failed");
+                        return Ok(None);
+                    }
+                    if outer_src.hidden_rowid_projection.is_some() {
+                        row.push(SqliteValue::Integer(rowid));
+                    }
+                    if row.len() != primary_width {
+                        row.resize(primary_width, SqliteValue::Null);
+                    }
+                    if self.with_fallback_function_registry(|| join_outer_row(&row))? {
+                        break;
                     }
                 }
             }
@@ -92347,17 +92373,15 @@ impl Connection {
                 refuse("outer table not streamable (no memdb table, pager not file-backed)");
                 return Ok(None);
             }
-            let outer_table = {
-                let schema = self.schema.borrow();
-                schema
-                    .iter()
-                    .find(|table| table.name.eq_ignore_ascii_case(&outer_binding.name))
-                    .map(|table| (table.root_page, table.clone()))
-            };
-            let Some((root_page_num, table_schema)) = outer_table else {
+            let Some(table_schema) = outer_table_schema else {
                 refuse("outer table missing from schema");
                 return Ok(None);
             };
+            let root_page_num = table_schema.root_page;
+            if self.is_memdb_only_root_page(root_page_num) {
+                refuse("outer table is memdb-only and missing from MemDatabase");
+                return Ok(None);
+            }
             let cx = &self.root_cx;
             let page_no = PageNumber::new(u32::try_from(root_page_num).unwrap_or(1))
                 .unwrap_or(PageNumber::ONE);
@@ -96614,6 +96638,9 @@ impl Connection {
                     .collect();
                 let num_columns = col_infos.len();
                 let root_page = self.db.borrow_mut().create_table(num_columns);
+                self.materialized_temp_root_pages
+                    .borrow_mut()
+                    .insert(root_page);
                 self.schema.borrow_mut().insert(
                     0,
                     TableSchema {
@@ -96703,6 +96730,9 @@ impl Connection {
         let mut installed = Vec::with_capacity(temp_tables.len());
         for temp_table in temp_tables {
             let root_page = self.db.borrow_mut().create_table(temp_table.columns.len());
+            self.materialized_temp_root_pages
+                .borrow_mut()
+                .insert(root_page);
             self.schema.borrow_mut().insert(
                 0,
                 TableSchema {
@@ -96778,6 +96808,9 @@ impl Connection {
     fn cleanup_cte_tables(&self, temp_tables: &[(String, i32)]) {
         let mut any_removed = false;
         for (name, root_page) in temp_tables {
+            self.materialized_temp_root_pages
+                .borrow_mut()
+                .remove(root_page);
             let mut schema = self.schema.borrow_mut();
             if let Some(idx) = schema
                 .iter()
@@ -96915,6 +96948,9 @@ impl Connection {
             .collect();
         let num_columns = col_infos.len();
         let root_page = self.db.borrow_mut().create_table(num_columns);
+        self.materialized_temp_root_pages
+            .borrow_mut()
+            .insert(root_page);
         self.schema.borrow_mut().insert(
             0,
             TableSchema {
@@ -97874,6 +97910,8 @@ impl Connection {
                     result?
                 } else {
                     let scan_sql = build_join_scan_sql(src);
+                    let _tt_guard = (!self.memdb_rows_loaded.get())
+                        .then(|| BoolCellRestoreGuard::new(&self.time_travel_active, false));
                     let rows = self.query(&scan_sql).await?;
                     rows.iter().map(|r| r.values().to_vec()).collect()
                 };
@@ -143077,8 +143115,13 @@ impl<'connection, 'select> SelectRelationResolver<'connection, 'select> {
                 None
             }
             && self.scopes.iter().rev().any(|ctes| {
-                ctes.iter()
-                    .any(|cte| cte.name.eq_ignore_ascii_case(&name.name))
+                ctes.iter().any(|cte| {
+                    cte.name.eq_ignore_ascii_case(&name.name)
+                        && !matches!(
+                            self.visits.get(&std::ptr::from_ref(cte)),
+                            Some(CteCollationVisit::Active)
+                        )
+                })
             })
             && (self.connection.table_exists_for_scope(&name.name, scope)
                 || self
@@ -227298,6 +227341,141 @@ fts5(title, body, content=docs, content_rowid=id)'
                 .unwrap();
             assert_eq!(appended, "appended");
             assert_eq!(integrity, "ok");
+        });
+    }
+
+    #[test]
+    fn test_open_existing_schema_only_with_cte_does_not_hydrate_memdb_gh493() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("schema_only_cte.db");
+            let db_str = db_path.to_string_lossy().into_owned();
+            {
+                let sqlite = rusqlite::Connection::open(&db_path).unwrap();
+                sqlite
+                    .execute_batch(
+                        "CREATE TABLE items(id INTEGER PRIMARY KEY, label TEXT NOT NULL);
+                         INSERT INTO items VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma');
+                         CREATE TABLE unreferenced_bulk(id INTEGER PRIMARY KEY, payload TEXT NOT NULL);",
+                    )
+                    .unwrap();
+                let tx = sqlite.unchecked_transaction().unwrap();
+                for i in 1..=250 {
+                    tx.execute(
+                        "INSERT INTO unreferenced_bulk VALUES (?1, ?2)",
+                        rusqlite::params![i, format!("bulk-payload-{i:04}")],
+                    )
+                    .unwrap();
+                }
+                tx.commit().unwrap();
+            }
+
+            let conn = Connection::open_existing_schema_only(&db_str)
+                .await
+                .unwrap();
+            let total_memdb_rows = || -> usize {
+                let schema = conn.schema.borrow();
+                let db = conn.db.borrow();
+                schema
+                    .iter()
+                    .filter_map(|t| db.get_table(t.root_page))
+                    .map(|table| table.iter_rows().count())
+                    .sum()
+            };
+            assert!(!conn.memdb_rows_loaded.get());
+            assert_eq!(total_memdb_rows(), 0);
+
+            let rows = conn
+                .query(
+                    "WITH picked(id, bonus) AS (
+                         SELECT id, id * 10 FROM items WHERE id IN (1, 3)
+                     )
+                     SELECT items.label, picked.bonus
+                     FROM picked
+                     JOIN items ON items.id = picked.id
+                     ORDER BY picked.id;",
+                )
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(
+                rows[0].values(),
+                &[SqliteValue::Text("alpha".into()), SqliteValue::Integer(10)]
+            );
+            assert_eq!(
+                rows[1].values(),
+                &[SqliteValue::Text("gamma".into()), SqliteValue::Integer(30)]
+            );
+            assert!(
+                !conn.memdb_rows_loaded.get(),
+                "WITH CTE join on open_existing_schema_only must not mark memdb_rows_loaded"
+            );
+            assert_eq!(
+                total_memdb_rows(),
+                0,
+                "WITH CTE join must not retain bulk-hydrated rows in MemDatabase"
+            );
+            assert!(
+                conn.materialized_temp_root_pages.borrow().is_empty(),
+                "materialized CTE root pages must be cleaned up after statement execution"
+            );
+
+            let single_cte_rows = conn
+                .query(
+                    "WITH picked(id, bonus) AS (
+                         SELECT id, id * 10 FROM items WHERE id IN (1, 3)
+                     )
+                     SELECT id, bonus FROM picked ORDER BY id;",
+                )
+                .await
+                .unwrap();
+            assert_eq!(single_cte_rows.len(), 2);
+            assert_eq!(
+                single_cte_rows[0].values(),
+                &[SqliteValue::Integer(1), SqliteValue::Integer(10)]
+            );
+            assert_eq!(
+                single_cte_rows[1].values(),
+                &[SqliteValue::Integer(3), SqliteValue::Integer(30)]
+            );
+            assert!(!conn.memdb_rows_loaded.get());
+            assert_eq!(total_memdb_rows(), 0);
+
+            let master_rows = conn
+                .query("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name;")
+                .await
+                .unwrap();
+            assert_eq!(master_rows.len(), 2);
+            assert!(!conn.memdb_rows_loaded.get());
+            assert_eq!(total_memdb_rows(), 0);
+
+            // Verify inside an explicit write transaction that dirty active_txn does not
+            // bulk-hydrate unreferenced_bulk when materializing a CTE.
+            conn.execute("BEGIN;").await.unwrap();
+            conn.execute("INSERT INTO items VALUES (4, 'delta');")
+                .await
+                .unwrap();
+            let tx_rows = conn
+                .query(
+                    "WITH latest(id) AS (
+                         SELECT id FROM items WHERE id >= 3
+                     )
+                     SELECT items.label
+                     FROM latest
+                     JOIN items ON items.id = latest.id
+                     ORDER BY items.id;",
+                )
+                .await
+                .unwrap();
+            assert_eq!(tx_rows.len(), 2);
+            assert_eq!(tx_rows[0].values(), &[SqliteValue::Text("gamma".into())]);
+            assert_eq!(tx_rows[1].values(), &[SqliteValue::Text("delta".into())]);
+            assert!(
+                !conn.memdb_rows_loaded.get(),
+                "explicit txn WITH CTE on open_existing_schema_only must not bulk-hydrate MemDatabase"
+            );
+            assert_eq!(total_memdb_rows(), 0);
+            conn.execute("COMMIT;").await.unwrap();
         });
     }
 
