@@ -60,6 +60,181 @@ async fn ex(f: &Connection, r: &rusqlite::Connection, sql: &str) {
     let _ = r.execute(sql, []);
 }
 
+async fn assert_materialized_cte_query(
+    f: &Connection,
+    r: &rusqlite::Connection,
+    sql: &str,
+    database: &str,
+    expected_rows: usize,
+    ordered: bool,
+) {
+    let mut statement = r.prepare(sql).expect("stock CTE prepares");
+    let width = statement.column_count();
+    let mut expected = statement
+        .query_map([], |row| {
+            (0..width)
+                .map(|index| {
+                    row.get::<_, rusqlite::types::Value>(index)
+                        .map(|value| tag_r(&value))
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .expect("stock CTE executes")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("stock CTE rows");
+    assert_eq!(expected.len(), expected_rows, "stock fixture: {sql}");
+    if !ordered {
+        expected.sort();
+    }
+    for prepared in [false, true] {
+        let actual = if prepared {
+            f.prepare(sql).await.unwrap().query().await.unwrap()
+        } else {
+            f.query(sql).await.unwrap()
+        };
+        let mut actual = actual
+            .iter()
+            .map(|row| row.values().iter().map(tag_f).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        if !ordered {
+            actual.sort();
+        }
+        assert_eq!(actual, expected, "{database}, prepared={prepared}: {sql}");
+    }
+}
+
+#[test]
+fn materialized_cte_shadow_preserves_values_instead_of_inheriting_table_rowid() {
+    asupersync::test_utils::run_test(|| async {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cte-shadow.db");
+        for database in [":memory:", path.to_str().unwrap()] {
+            let f = Connection::open(database).await.unwrap();
+            let r = rusqlite::Connection::open_in_memory().unwrap();
+            for sql in [
+                "CREATE TABLE nodes(id INTEGER PRIMARY KEY, label TEXT)",
+                "INSERT INTO nodes VALUES(7,'persistent'),(19,'other')",
+                "CREATE TABLE marker(k INTEGER PRIMARY KEY, label TEXT, v INTEGER)",
+                "INSERT INTO marker VALUES(1,'left',9),(2,'right',9)",
+            ] {
+                f.execute(sql).await.unwrap();
+                r.execute_batch(sql).unwrap();
+            }
+            for sql in [
+                "WITH nodes(id,label) AS MATERIALIZED (VALUES(101,'left'),(205,'right')) \
+                 SELECT c.id,c.label,m.v FROM nodes c JOIN marker m ON m.label=c.label ORDER BY c.id",
+                "WITH nodes(label,id) AS MATERIALIZED (VALUES('left',101),('right',205)) \
+                 SELECT c.id,c.label,m.v FROM nodes c JOIN marker m ON m.label=c.label ORDER BY c.id",
+                "WITH nodes(id,label) AS MATERIALIZED (VALUES('00101','left'),('00205','right')) \
+                 SELECT c.id,c.label,m.v FROM nodes c JOIN marker m ON m.label=c.label ORDER BY c.id",
+                "WITH nodes(id,label) AS MATERIALIZED (VALUES(101,'left'),(205,'right')) \
+                 SELECT c.id,c.label,m.v FROM nodes c JOIN marker m ON m.label=c.label \
+                 WHERE c.id>100 ORDER BY c.id LIMIT 2",
+                "WITH nodes(id,v) AS MATERIALIZED (VALUES(101,10),(205,20),(209,30)) \
+                 SELECT id/100,sum(v) FROM nodes GROUP BY id/100 ORDER BY 1",
+                "WITH nodes(id,label) AS MATERIALIZED (VALUES(101,'left'),(205,'right')) \
+                 SELECT m.k,EXISTS(SELECT 1 FROM nodes c \
+                 WHERE (c.id=m.k+100 AND c.label='left') OR c.id=m.k+203) \
+                 FROM marker m ORDER BY m.k",
+            ] {
+                assert_materialized_cte_query(&f, &r, sql, database, 2, true).await;
+                let restored = f
+                    .query("SELECT id,label FROM nodes ORDER BY id")
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    restored
+                        .iter()
+                        .map(|row| row.values().iter().map(tag_f).collect::<Vec<_>>())
+                        .collect::<Vec<_>>(),
+                    vec![
+                        vec!["int:7", "text:persistent"],
+                        vec!["int:19", "text:other"],
+                    ],
+                    "persistent table after {sql}"
+                );
+            }
+            f.close().await.unwrap();
+        }
+    });
+}
+
+#[test]
+fn materialized_cte_shadow_nonleading_primary_key_projects_fewer_columns() {
+    asupersync::test_utils::run_test(|| async {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cte-narrow-shadow.db");
+        for database in [":memory:", path.to_str().unwrap()] {
+            let f = Connection::open(database).await.unwrap();
+            let r = rusqlite::Connection::open_in_memory().unwrap();
+            for sql in [
+                "CREATE TABLE nodes(label TEXT, id INTEGER PRIMARY KEY, payload BLOB)",
+                "INSERT INTO nodes VALUES('persistent',19,x'CAFE')",
+            ] {
+                f.execute(sql).await.unwrap();
+                r.execute_batch(sql).unwrap();
+            }
+            for (sql, rows) in [
+                (
+                    "WITH nodes(v) AS MATERIALIZED (VALUES(101),(205)) \
+                     SELECT sum(v),count(*) FROM nodes GROUP BY v/100 ORDER BY 1",
+                    2,
+                ),
+                (
+                    "WITH nodes(v) AS MATERIALIZED (VALUES(101),(205)) \
+                     SELECT min(v),max(v) FROM nodes",
+                    1,
+                ),
+                (
+                    "SELECT id/10,sum(id) FROM nodes GROUP BY id/10 ORDER BY 1",
+                    1,
+                ),
+                (
+                    "SELECT rowid,sum(id) FROM nodes GROUP BY rowid ORDER BY rowid",
+                    1,
+                ),
+            ] {
+                assert_materialized_cte_query(&f, &r, sql, database, rows, true).await;
+            }
+            f.close().await.unwrap();
+        }
+    });
+}
+
+#[test]
+fn materialized_cte_shadow_does_not_reuse_warmed_group_by_memo() {
+    asupersync::test_utils::run_test(|| async {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cte-memo-shadow.db");
+        for database in [":memory:", path.to_str().unwrap()] {
+            let f = Connection::open(database).await.unwrap();
+            let r = rusqlite::Connection::open_in_memory().unwrap();
+            for sql in [
+                "CREATE TABLE nodes(id INTEGER PRIMARY KEY, v INTEGER)",
+                "INSERT INTO nodes VALUES(7,90),(19,91)",
+            ] {
+                f.execute(sql).await.unwrap();
+                r.execute_batch(sql).unwrap();
+            }
+            let consumer = "SELECT id/100,sum(v) FROM nodes GROUP BY id/100";
+            let prefix =
+                "WITH nodes(id,v) AS MATERIALIZED (VALUES(101,10),(205,20),(209,30)) ";
+            // Preserve expression spans as well as the stripped SELECT shape,
+            // so the ordinary query can warm exactly the CTE consumer's memo.
+            // Omitting ORDER BY admits the rowid-bucket fast lane; compare
+            // unordered rows because SQL does not order these groups.
+            let ordinary = format!("{}{consumer}", " ".repeat(prefix.len()));
+            let shadow = format!("{prefix}{consumer}");
+            for _ in 0..2 {
+                assert_materialized_cte_query(&f, &r, &ordinary, database, 1, false).await;
+                assert_materialized_cte_query(&f, &r, &shadow, database, 2, false).await;
+            }
+            assert_materialized_cte_query(&f, &r, &ordinary, database, 1, false).await;
+            f.close().await.unwrap();
+        }
+    });
+}
+
 #[test]
 fn dysy4_forward_cte_shadows_outer_table() {
     asupersync::test_utils::run_test(|| async {

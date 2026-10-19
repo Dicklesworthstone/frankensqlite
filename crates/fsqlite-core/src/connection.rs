@@ -88458,7 +88458,14 @@ impl Connection {
         {
             return None;
         }
-        let (root_page, col_map, column_collations, column_affinities, declared_blob_columns) = {
+        let (
+            root_page,
+            rowid_alias_column_index,
+            col_map,
+            column_collations,
+            column_affinities,
+            declared_blob_columns,
+        ) = {
             let schema = self.schema.borrow();
             let mut matches = schema
                 .iter()
@@ -88511,13 +88518,13 @@ impl Connection {
             }
             (
                 table.root_page,
+                table.columns.iter().position(|column| column.is_ipk),
                 col_map,
                 collations,
                 affinities,
                 declared_blob_columns,
             )
         };
-        let rowid_alias_column_index = self.rowid_alias_columns.borrow().get(&table_key).copied();
         let context = Arc::new(JoinEvalCollationContext {
             declared_json_keys: declared_blob_columns,
             column_collations,
@@ -90521,11 +90528,13 @@ impl Connection {
 
         // Resolve the INTEGER PRIMARY KEY column name so that rowid/_rowid_/oid
         // aliases in GROUP BY and result columns can be rewritten to the real name.
-        let rowid_real_col: Option<String> = self
-            .rowid_alias_columns
-            .borrow()
-            .get(&table_name.to_ascii_lowercase())
-            .map(|&idx| table_schema.columns[idx].name.clone());
+        let rowid_alias_col_idx = if table_schema.without_rowid {
+            None
+        } else {
+            table_schema.columns.iter().position(|column| column.is_ipk)
+        };
+        let rowid_real_col =
+            rowid_alias_col_idx.map(|idx| table_schema.columns[idx].name.clone());
 
         // Expand Star/TableStar into explicit column references so GROUP BY
         // can process them individually.
@@ -90664,11 +90673,7 @@ impl Connection {
                                 // column or the hidden rowid slot in the raw scan layout.
                                 let idx = table_schema.column_index(col_name).or_else(|| {
                                     if is_rowid_alias(col_name) {
-                                        self.rowid_alias_columns
-                                            .borrow()
-                                            .get(&table_name.to_ascii_lowercase())
-                                            .copied()
-                                            .or(hidden_rowid_column_index)
+                                        rowid_alias_col_idx.or(hidden_rowid_column_index)
                                     } else {
                                         None
                                     }
@@ -90690,11 +90695,7 @@ impl Connection {
                             let idx = if let Some(col_name) = expr_col_name(&exprs[0]) {
                                 table_schema.column_index(col_name).or_else(|| {
                                     if is_rowid_alias(col_name) {
-                                        self.rowid_alias_columns
-                                            .borrow()
-                                            .get(&table_name.to_ascii_lowercase())
-                                            .copied()
-                                            .or(hidden_rowid_column_index)
+                                        rowid_alias_col_idx.or(hidden_rowid_column_index)
                                     } else {
                                         None
                                     }
@@ -91746,18 +91747,22 @@ impl Connection {
         group_by_exprs: &[Expr],
         result_descriptors: &[GroupByColumn],
     ) -> Result<Option<Vec<Row>>> {
-        if self.scalar_function_overridden.get()
+        // The memo may hold a persistent root and schema while a materialized
+        // CTE shadows that relation. Honor the same scope guard as compiled
+        // programs before consulting any cached rowid plan.
+        if self.bypass_compiled_cache.get()
+            || self.scalar_function_overridden.get()
             || self.application_function_replaces_builtin("sum", 1)
             || !self.memdb_rows_loaded.get()
             || !self.memdb_storage_count_shortcuts_safe.get()
         {
             return Ok(None);
         }
-        let rowid_alias_col_idx = self
-            .rowid_alias_columns
-            .borrow()
-            .get(&table_schema.name.to_ascii_lowercase())
-            .copied();
+        let rowid_alias_col_idx = if table_schema.without_rowid {
+            None
+        } else {
+            table_schema.columns.iter().position(|column| column.is_ipk)
+        };
         let Some(plan) = rowid_bucket_sum_group_by_mem_scan_plan(
             table_schema,
             table_label,
@@ -91928,7 +91933,15 @@ impl Connection {
             .iter()
             .find(|table| table.name.eq_ignore_ascii_case(&binding_name.name))
             .cloned()?;
-        let rowid_alias_column_index = self.rowid_alias_columns.borrow().get(&name_lc).copied();
+        // Materialized CTEs can shadow an INTEGER PRIMARY KEY table without
+        // owning its rowid alias. Resolve the alias from the selected schema:
+        // the name-keyed map still describes the persistent table and would
+        // replace the CTE's values with synthetic materialization rowids.
+        let rowid_alias_column_index = if table.without_rowid {
+            None
+        } else {
+            table.columns.iter().position(|column| column.is_ipk)
+        };
         Some((table, rowid_alias_column_index))
     }
 
@@ -92120,16 +92133,13 @@ impl Connection {
             }
         }
         // Resolve the outer table's rowid-alias (INTEGER PRIMARY KEY) column.
-        // `rowid_alias_columns` only holds ordinary rowid tables, so WITHOUT
-        // ROWID outers (and bare-`rowid` ordering on alias-less tables) refuse
-        // here. Both the ORDER BY column and the WHERE bound column must name
-        // exactly that column.
-        let ipk_idx = {
-            let alias_columns = self.rowid_alias_columns.borrow();
-            alias_columns
-                .get(&outer_binding.name.to_ascii_lowercase())
-                .copied()
-        };
+        // Use the resolved schema so a CTE shadow cannot inherit a persistent
+        // table's rowid ordering. WITHOUT ROWID outers and tables without an
+        // INTEGER PRIMARY KEY refuse here. Both the ORDER BY column and the
+        // WHERE bound column must name exactly that column.
+        let ipk_idx = self
+            .local_join_binding_table(&outer_binding)
+            .and_then(|(_, rowid_alias_column_index)| rowid_alias_column_index);
         let Some(ipk_idx) = ipk_idx else {
             refuse("outer table has no rowid-alias IPK");
             return Ok(None);
