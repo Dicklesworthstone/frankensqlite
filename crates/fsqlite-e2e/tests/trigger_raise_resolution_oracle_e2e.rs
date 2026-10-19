@@ -115,7 +115,10 @@ fn raise_abort_rolls_back_statement() {
                  BEGIN SELECT RAISE(ABORT, 'no 3'); END",
                 "INSERT INTO t VALUES (1),(2),(3),(4)", // errors on both
             ],
-            &["SELECT x FROM t ORDER BY x", "SELECT changes(), total_changes()"], // [] (ABORT undid rows 1,2)
+            &[
+                "SELECT x FROM t ORDER BY x",
+                "SELECT changes(), total_changes()",
+            ], // [] (ABORT undid rows 1,2)
             "raise_abort_rolls_back_statement",
         )
         .await;
@@ -133,7 +136,10 @@ fn raise_fail_keeps_prior_rows() {
                  BEGIN SELECT RAISE(FAIL, 'fail 3'); END",
                 "INSERT INTO t VALUES (1),(2),(3),(4)", // errors on both
             ],
-            &["SELECT x FROM t ORDER BY x", "SELECT changes(), total_changes()"], // [1,2] (FAIL kept prior rows)
+            &[
+                "SELECT x FROM t ORDER BY x",
+                "SELECT changes(), total_changes()",
+            ], // [1,2] (FAIL kept prior rows)
             "raise_fail_keeps_prior_rows",
         )
         .await;
@@ -154,7 +160,10 @@ fn raise_rollback_undoes_whole_transaction() {
                 "INSERT INTO t VALUES (10)", // a prior change in the txn
                 "INSERT INTO t VALUES (99)", // triggers ROLLBACK -> errors on both
             ],
-            &["SELECT x FROM t ORDER BY x", "SELECT changes(), total_changes()"], // [] (whole txn rolled back, even the 10)
+            &[
+                "SELECT x FROM t ORDER BY x",
+                "SELECT changes(), total_changes()",
+            ], // [] (whole txn rolled back, even the 10)
             "raise_rollback_undoes_whole_transaction",
         )
         .await;
@@ -172,7 +181,10 @@ fn raise_ignore_skips_row_no_error() {
                  BEGIN SELECT RAISE(IGNORE); END",
                 "INSERT INTO t VALUES (1),(2),(3),(4)", // succeeds on both (no error)
             ],
-            &["SELECT x FROM t ORDER BY x", "SELECT changes(), total_changes()"], // [1,2,4] (3 ignored)
+            &[
+                "SELECT x FROM t ORDER BY x",
+                "SELECT changes(), total_changes()",
+            ], // [1,2,4] (3 ignored)
             "raise_ignore_skips_row_no_error",
         )
         .await;
@@ -296,4 +308,3 @@ fn gh448_raise_fail_updates_changes_and_total_changes() {
         .await;
     });
 }
-
