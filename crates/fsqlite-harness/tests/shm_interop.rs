@@ -225,11 +225,15 @@ struct GrowthChild {
     process: Child,
     role: &'static str,
     control: PathBuf,
+    log_path: PathBuf,
 }
 
 impl GrowthChild {
     fn spawn(role: &'static str, control: &Path, db_path: &Path, limited: bool) -> Self {
         let executable = std::env::current_exe().expect("integration test executable");
+        let log_path = control.join(format!("{role}.log"));
+        let stdout_log = fs::File::create(&log_path).expect("create child stdout log");
+        let stderr_log = stdout_log.try_clone().expect("clone child stderr log");
         let mut command = if limited {
             let mut shell = Command::new("sh");
             // The limit applies only to this disposable process. Shells report
@@ -258,15 +262,20 @@ impl GrowthChild {
             .env("FSQLITE_SHM_INTEROP_CONTROL", control)
             .env("FSQLITE_SHM_INTEROP_DB", db_path)
             .stdin(Stdio::null())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
+            .stdout(Stdio::from(stdout_log))
+            .stderr(Stdio::from(stderr_log))
             .spawn()
             .expect("start isolated SHM interop child");
         Self {
             process,
             role,
             control: control.to_path_buf(),
+            log_path,
         }
+    }
+
+    fn read_log(&self) -> String {
+        fs::read_to_string(&self.log_path).unwrap_or_default()
     }
 
     fn wait_for(&mut self, marker: &str) {
@@ -274,12 +283,17 @@ impl GrowthChild {
         let path = self.control.join(marker);
         while !path.is_file() {
             if let Some(status) = self.process.try_wait().expect("poll interop child") {
-                panic!("{} exited before {marker}: {status}", self.role);
+                panic!(
+                    "{} exited before {marker}: {status}\nchild log:\n{}",
+                    self.role,
+                    self.read_log()
+                );
             }
             assert!(
                 Instant::now() < deadline,
-                "{} timed out at {marker}",
-                self.role
+                "{} timed out at {marker}\nchild log:\n{}",
+                self.role,
+                self.read_log()
             );
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -289,15 +303,26 @@ impl GrowthChild {
         let deadline = Instant::now() + GROWTH_CHILD_TIMEOUT;
         loop {
             if let Some(status) = self.process.try_wait().expect("poll interop child") {
-                assert!(status.success(), "{} failed: {status}", self.role);
+                assert!(
+                    status.success(),
+                    "{} failed: {status}\nchild log:\n{}",
+                    self.role,
+                    self.read_log()
+                );
                 assert!(
                     self.control.join(format!("{}-ok", self.role)).is_file(),
-                    "{} must run its assertions, not merely select zero tests",
-                    self.role
+                    "{} must run its assertions, not merely select zero tests\nchild log:\n{}",
+                    self.role,
+                    self.read_log()
                 );
                 return;
             }
-            assert!(Instant::now() < deadline, "{} timed out", self.role);
+            assert!(
+                Instant::now() < deadline,
+                "{} timed out\nchild log:\n{}",
+                self.role,
+                self.read_log()
+            );
             std::thread::sleep(Duration::from_millis(5));
         }
     }
