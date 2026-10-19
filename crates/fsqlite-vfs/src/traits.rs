@@ -946,6 +946,21 @@ impl VfsWriteCompletion {
         }
     }
 
+    /// Track a prefix write without completing this logical write on success.
+    ///
+    /// Disarm the returned guard after the prefix finishes and the operation
+    /// continues. If it is dropped instead, this token becomes `Error` only
+    /// after the child's actual write source terminates. This keeps a cancelled
+    /// multi-write operation in doubt while an accepted prefix can still write.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn deferred_error_child(&self) -> VfsWriteCompletionErrorRelay {
+        VfsWriteCompletionErrorRelay {
+            source: Self::new(),
+            target: Some(self.clone()),
+        }
+    }
+
     fn complete(&self, terminal: VfsWriteCompletionState) -> bool {
         debug_assert_ne!(terminal, VfsWriteCompletionState::Pending);
         // Walk the relay chain iteratively and publish every mapped terminal
@@ -999,6 +1014,56 @@ impl VfsWriteCompletion {
 impl Default for VfsWriteCompletion {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Defers an abandoned prefix's error until its physical write has terminated.
+///
+/// The source is created with this guard and cannot acquire another outgoing
+/// relay. Linking only that fresh child to its parent prevents relay cycles and
+/// preserves any error mappings installed by lower-level fault wrappers.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct VfsWriteCompletionErrorRelay {
+    source: VfsWriteCompletion,
+    target: Option<VfsWriteCompletion>,
+}
+
+impl VfsWriteCompletionErrorRelay {
+    /// Return the token passed to the prefix's actual write source.
+    #[must_use]
+    pub fn completion(&self) -> VfsWriteCompletion {
+        self.source.clone()
+    }
+
+    /// Keep the parent pending after a successful prefix so later writes can run.
+    pub fn disarm(mut self) {
+        self.target = None;
+    }
+}
+
+impl Drop for VfsWriteCompletionErrorRelay {
+    fn drop(&mut self) {
+        let Some(target) = self.target.take() else {
+            return;
+        };
+        let mut source = self
+            .source
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if source.state == VfsWriteCompletionState::Pending {
+            // No API exposes an arbitrary relay assignment: only this guard
+            // can link its fresh source. Existing mapped children point into
+            // it, never out of it.
+            debug_assert!(source.terminal_relay.is_none());
+            source.terminal_relay = Some((target, VfsWriteCompletionState::Error));
+        } else {
+            // A terminal source can no longer write. Release its lock before
+            // completing the parent, whose wakers may re-enter either token.
+            drop(source);
+            target.complete_error();
+        }
     }
 }
 
@@ -2528,6 +2593,130 @@ mod tests {
             VfsWriteCompletionState::Error,
             "a completed partial-write source must map to outer Error"
         );
+    }
+
+    #[test]
+    fn deferred_error_relay_waits_for_source_and_can_disarm_successful_prefix() {
+        for terminal_first in [false, true] {
+            for succeeded in [false, true] {
+                let outer = VfsWriteCompletion::new();
+                let prefix = outer.deferred_error_child();
+                let source = prefix.completion();
+                if terminal_first {
+                    if succeeded {
+                        source.complete_success();
+                    } else {
+                        source.complete_error();
+                    }
+                    assert_eq!(outer.state(), VfsWriteCompletionState::Pending);
+                }
+                drop(prefix);
+                if !terminal_first {
+                    assert_eq!(
+                        outer.state(),
+                        VfsWriteCompletionState::Pending,
+                        "a dropped caller cannot prove that pending source I/O has stopped"
+                    );
+                    if succeeded {
+                        source.complete_success();
+                    } else {
+                        source.complete_error();
+                    }
+                }
+                assert_eq!(outer.state(), VfsWriteCompletionState::Error);
+                assert!(!outer.complete_success());
+            }
+        }
+
+        let outer = VfsWriteCompletion::new();
+        let prefix = outer.deferred_error_child();
+        let source = prefix.completion();
+        source.complete_success();
+        prefix.disarm();
+        assert_eq!(outer.state(), VfsWriteCompletionState::Pending);
+        assert!(
+            outer.complete_success(),
+            "the final chunk still owns success"
+        );
+
+        let outer = VfsWriteCompletion::new();
+        let prefix = outer.deferred_error_child();
+        let faulted_source = prefix.completion().error_mapped_child();
+        drop(prefix);
+        assert_eq!(outer.state(), VfsWriteCompletionState::Pending);
+        faulted_source.complete_success();
+        assert_eq!(outer.state(), VfsWriteCompletionState::Error);
+    }
+
+    #[test]
+    fn deferred_error_relay_handles_racing_source_completion() {
+        for _ in 0..64 {
+            let outer = VfsWriteCompletion::new();
+            let prefix = outer.deferred_error_child();
+            let source = prefix.completion();
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    source.complete_success();
+                });
+                barrier.wait();
+                drop(prefix);
+            });
+            assert_eq!(source.state(), VfsWriteCompletionState::Success);
+            assert_eq!(outer.state(), VfsWriteCompletionState::Error);
+        }
+    }
+
+    #[test]
+    fn deferred_error_relay_publishes_before_panicking_reentrant_wake() {
+        use std::future::Future as _;
+
+        struct InspectThenPanic {
+            source: VfsWriteCompletion,
+            outer: VfsWriteCompletion,
+            observed: Arc<std::sync::atomic::AtomicBool>,
+        }
+
+        impl std::task::Wake for InspectThenPanic {
+            fn wake(self: Arc<Self>) {
+                assert_eq!(self.source.state(), VfsWriteCompletionState::Success);
+                assert_eq!(self.outer.state(), VfsWriteCompletionState::Error);
+                assert!(!self.outer.complete_success());
+                self.observed.store(true, Ordering::Release);
+                panic!("deferred relay wake panic");
+            }
+        }
+
+        for terminal_first in [false, true] {
+            let outer = VfsWriteCompletion::new();
+            let prefix = outer.deferred_error_child();
+            let source = prefix.completion();
+            if terminal_first {
+                source.complete_success();
+            }
+            let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let waker = Waker::from(Arc::new(InspectThenPanic {
+                source: source.clone(),
+                outer: outer.clone(),
+                observed: Arc::clone(&observed),
+            }));
+            let watched = if terminal_first { &outer } else { &source };
+            let mut waiter = Box::pin(watched.wait());
+            assert!(matches!(
+                waiter.as_mut().poll(&mut Context::from_waker(&waker)),
+                Poll::Pending
+            ));
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                drop(prefix);
+                if !terminal_first {
+                    source.complete_success();
+                }
+            }));
+            assert!(outcome.is_err());
+            assert!(observed.load(Ordering::Acquire));
+            assert_eq!(outer.state(), VfsWriteCompletionState::Error);
+        }
     }
 
     #[test]

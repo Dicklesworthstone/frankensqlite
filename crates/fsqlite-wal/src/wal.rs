@@ -45,6 +45,10 @@ use crate::checksum::{
     write_wal_frame_checksum_fields, write_wal_frame_salts,
 };
 
+/// Maximum serialized append scratch and borrowed buffer handed to the VFS.
+/// Keep whole frames together and reuse this storage across large transactions.
+const WAL_APPEND_BUFFER_BYTES: usize = 1024 * 1024;
+
 #[inline]
 fn log_replay_decision(
     replay_cursor: &'static str,
@@ -123,6 +127,33 @@ impl VfsWritePreflight {
 
     fn hand_off(&mut self) {
         self.completion = None;
+    }
+
+    async fn write_chunk<F: VfsFile>(
+        &mut self,
+        file: &F,
+        cx: &Cx,
+        bytes: &[u8],
+        offset: u64,
+        last_chunk: bool,
+    ) -> Result<()> {
+        let Some(completion) = self.completion.take() else {
+            return file.write(cx, bytes, offset).await;
+        };
+        if last_chunk {
+            return file.write_tracked(cx, bytes, offset, completion).await;
+        }
+
+        // An interrupted prefix must not report either full-write success or
+        // terminal failure while its hidden I/O source can still modify WAL.
+        let prefix = completion.deferred_error_child();
+        file.write_tracked(cx, bytes, offset, prefix.completion())
+            .await?;
+        prefix.disarm();
+        // There is no outstanding source between chunks. A later assembly
+        // failure can therefore terminalize the complete attempt immediately.
+        self.completion = Some(completion);
+        Ok(())
     }
 }
 
@@ -1028,7 +1059,7 @@ impl<F: VfsFile> WalFile<F> {
         let mut frame_scratch = std::mem::take(&mut self.frame_scratch);
         frame_scratch.clear();
         if frame_scratch.capacity() < frame_size {
-            frame_scratch.reserve(frame_size - frame_scratch.capacity());
+            frame_scratch.reserve_exact(frame_size);
         }
         let append_result = async {
             push_wal_frame_bytes(
@@ -1413,14 +1444,39 @@ impl<F: VfsFile> WalFile<F> {
             &format!("start_frame={start_frame_index} frame_count={frame_count}"),
         )?;
 
-        preflight.hand_off();
-        if let Some(completion) = completion {
-            self.file
-                .write_tracked(cx, prepared_frame_bytes, offset, completion.clone())
+        let chunk_bytes = (WAL_APPEND_BUFFER_BYTES / frame_size).max(1) * frame_size;
+        let mut written_bytes = 0usize;
+        for chunk in prepared_frame_bytes.chunks(chunk_bytes) {
+            let chunk_offset = offset
+                .checked_add(u64::try_from(written_bytes).map_err(|_| FrankenError::DatabaseFull)?)
+                .ok_or(FrankenError::DatabaseFull)?;
+            written_bytes += chunk.len();
+            preflight
+                .write_chunk(
+                    &self.file,
+                    cx,
+                    chunk,
+                    chunk_offset,
+                    written_bytes == expected_bytes,
+                )
                 .await?;
-        } else {
-            self.file.write(cx, prepared_frame_bytes, offset).await?;
         }
+
+        self.finish_frame_append(
+            start_frame_index,
+            frame_count,
+            final_running_checksum,
+            last_commit,
+        )
+    }
+
+    fn finish_frame_append(
+        &mut self,
+        start_frame_index: usize,
+        frame_count: usize,
+        final_running_checksum: SqliteWalChecksum,
+        last_commit: Option<(usize, WalFrameHeader)>,
+    ) -> Result<()> {
         self.advance_state_after_write(frame_count, final_running_checksum)?;
         if let Some(last_commit) = last_commit {
             self.last_commit = Some(last_commit);
@@ -1435,8 +1491,10 @@ impl<F: VfsFile> WalFile<F> {
             ),
         )?;
 
-        let bytes_per_frame = u64::try_from(frame_size).unwrap_or(u64::MAX);
-        let bytes_written = u64::try_from(expected_bytes).unwrap_or(u64::MAX);
+        let bytes_per_frame = u64::try_from(self.frame_size()).unwrap_or(u64::MAX);
+        let bytes_written = u64::try_from(frame_count)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(bytes_per_frame);
         let span = tracing::span!(
             tracing::Level::DEBUG,
             "wal_batch_write",
@@ -1550,10 +1608,11 @@ impl<F: VfsFile> WalFile<F> {
         .await
     }
 
-    /// Append a batch of frames to the WAL using a single contiguous write.
+    /// Append frames using bounded, contiguous writes of whole WAL frames.
     ///
-    /// This preserves the checksum chain while avoiding per-frame write
-    /// syscalls on hot commit paths. Durability is still controlled by
+    /// Small batches use one write; large batches reuse at most 1 MiB of
+    /// serialized scratch. This preserves the checksum chain while avoiding
+    /// per-frame writes. Durability is still controlled by
     /// [`Self::sync`] or a higher-level caller.
     pub async fn append_frames(&mut self, cx: &Cx, frames: &[WalAppendFrameRef<'_>]) -> Result<()> {
         self.append_frame_iter(cx, frames.len(), frames.iter().copied())
@@ -1571,8 +1630,10 @@ impl<F: VfsFile> WalFile<F> {
             .await
     }
 
-    /// Append a known-size iterator of frame references without first
-    /// materializing a borrowed descriptor slice.
+    /// Append a known-size iterator of frame references.
+    ///
+    /// Small batches avoid a descriptor allocation. Large batches retain only
+    /// borrowed descriptors so all input can be validated before bounded I/O.
     pub(crate) async fn append_frame_iter<'a, I>(
         &mut self,
         cx: &Cx,
@@ -1632,10 +1693,27 @@ impl<F: VfsFile> WalFile<F> {
         #[cfg(any(test, feature = "fault-injection"))]
         let frame_count_before = self.frame_count;
 
+        if total_bytes > WAL_APPEND_BUFFER_BYTES {
+            preflight.hand_off();
+            let append_result = self
+                .append_large_frame_iter_with_completion(cx, frame_count, frames, completion)
+                .await;
+            #[cfg(any(test, feature = "fault-injection"))]
+            if append_result.is_ok() {
+                crate::fault_hooks::maybe_inject_after_append(frame_count_before, frame_count)?;
+            }
+            return append_result;
+        }
+
         let mut frame_scratch = std::mem::take(&mut self.frame_scratch);
         frame_scratch.clear();
         if frame_scratch.capacity() < total_bytes {
-            frame_scratch.reserve(total_bytes - frame_scratch.capacity());
+            // Keep amortized reuse for gradually growing small transactions
+            // without letting Vec's geometric growth exceed the byte budget.
+            let capacity = total_bytes
+                .max(frame_scratch.capacity().saturating_mul(2))
+                .min(WAL_APPEND_BUFFER_BYTES);
+            frame_scratch.reserve_exact(capacity);
         }
         // bd-db300.3.8.6: Fuse frame assembly + checksum computation into a
         // single pass, eliminating the intermediate Vec<WalChecksumTransform>
@@ -1718,6 +1796,134 @@ impl<F: VfsFile> WalFile<F> {
             crate::fault_hooks::maybe_inject_after_append(frame_count_before, frame_count)?;
         }
 
+        append_result
+    }
+
+    async fn append_large_frame_iter_with_completion<'a, I>(
+        &mut self,
+        cx: &Cx,
+        frame_count: usize,
+        frames: I,
+        completion: Option<&VfsWriteCompletion>,
+    ) -> Result<()>
+    where
+        I: IntoIterator<Item = WalAppendFrameRef<'a>>,
+    {
+        let mut preflight = VfsWritePreflight::new(completion);
+        self.refuse_append_while_headerless()?;
+        let new_count = self
+            .frame_count
+            .checked_add(frame_count)
+            .ok_or(FrankenError::DatabaseFull)?;
+        if new_count > usize::try_from(u32::MAX).unwrap_or(usize::MAX) {
+            return Err(FrankenError::DatabaseFull);
+        }
+
+        // Preserve validation-before-I/O for arbitrary, non-rewindable input.
+        // These descriptors borrow page images; no transaction-sized payload
+        // buffer or owned copy of the page images is retained here.
+        let mut frame_refs = Vec::with_capacity(frame_count);
+        for (idx, frame) in frames.into_iter().enumerate() {
+            if idx >= frame_count {
+                return Err(FrankenError::WalCorrupt {
+                    detail: format!(
+                        "append batch frame count mismatch: expected {frame_count}, got more than declared"
+                    ),
+                });
+            }
+            if frame.page_data.len() != self.page_size {
+                return Err(FrankenError::WalCorrupt {
+                    detail: format!(
+                        "page data size mismatch in batch frame {idx}: expected {}, got {}",
+                        self.page_size,
+                        frame.page_data.len()
+                    ),
+                });
+            }
+            frame_refs.push(frame);
+        }
+        if frame_refs.len() != frame_count {
+            return Err(FrankenError::WalCorrupt {
+                detail: format!(
+                    "append batch frame count mismatch: expected {frame_count}, got {}",
+                    frame_refs.len()
+                ),
+            });
+        }
+
+        let frame_size = self.frame_size();
+        let frames_per_chunk = (WAL_APPEND_BUFFER_BYTES / frame_size).max(1);
+        let chunk_bytes = frames_per_chunk * frame_size;
+        let start_frame_index = self.frame_count;
+        let mut frame_scratch = std::mem::take(&mut self.frame_scratch);
+        frame_scratch.clear();
+        if frame_scratch.capacity() < chunk_bytes {
+            frame_scratch.reserve_exact(chunk_bytes);
+        }
+        let append_result = async {
+            let mut running_checksum = self.running_checksum;
+            let mut last_commit = None;
+            let mut frames_written = 0usize;
+
+            #[cfg(any(test, feature = "fault-injection"))]
+            crate::fault_hooks::maybe_inject_crash_at(
+                crate::fault_hooks::CrashBoundary::BeforeWalFrameAppend,
+                &format!("start_frame={start_frame_index} frame_count={frame_count}"),
+            )?;
+
+            for chunk in frame_refs.chunks(frames_per_chunk) {
+                frame_scratch.clear();
+                let offset = self.frame_offset(start_frame_index + frames_written);
+                for frame in chunk {
+                    let buf_offset = frame_scratch.len();
+                    push_wal_frame_bytes(
+                        &mut frame_scratch,
+                        frame.page_number,
+                        frame.db_size_if_commit,
+                        self.header.salts,
+                        frame.page_data,
+                    );
+                    running_checksum = write_wal_frame_checksum(
+                        &mut frame_scratch[buf_offset..],
+                        self.page_size,
+                        running_checksum,
+                        self.big_endian_checksum,
+                    )?;
+                    if frame.db_size_if_commit != 0 {
+                        last_commit = Some((
+                            start_frame_index + frames_written,
+                            WalFrameHeader {
+                                page_number: frame.page_number,
+                                db_size: frame.db_size_if_commit,
+                                salts: self.header.salts,
+                                checksum: running_checksum,
+                            },
+                        ));
+                    }
+                    frames_written += 1;
+                }
+                preflight
+                    .write_chunk(
+                        &self.file,
+                        cx,
+                        &frame_scratch,
+                        offset,
+                        frames_written == frame_count,
+                    )
+                    .await?;
+            }
+
+            // Publication is batch-wide: an error or dropped future before
+            // this point leaves all in-memory append metadata at its old base.
+            self.finish_frame_append(
+                start_frame_index,
+                frame_count,
+                running_checksum,
+                last_commit,
+            )
+        }
+        .await;
+        self.frame_scratch = frame_scratch;
         append_result
     }
 
@@ -2317,6 +2523,158 @@ mod tests {
             .open(cx, Some(std::path::Path::new("test.db-wal")), flags)
             .expect("open WAL file");
         file
+    }
+
+    #[derive(Clone, Copy, Default)]
+    enum AppendProbeAction {
+        #[default]
+        Complete,
+        Partial {
+            write: usize,
+            bytes: usize,
+        },
+        Pending {
+            write: usize,
+        },
+    }
+
+    /// Captures physical write boundaries and can retain a source after its
+    /// caller is dropped, matching the ownership of a blocking-pool write.
+    struct AppendProbeFile {
+        inner: <MemoryVfs as Vfs>::File,
+        writes: std::sync::Mutex<Vec<(u64, usize)>>,
+        pending: std::sync::Mutex<Option<(u64, Vec<u8>, VfsWriteCompletion)>>,
+        action: AppendProbeAction,
+    }
+
+    impl AppendProbeFile {
+        fn new(vfs: &MemoryVfs, cx: &Cx) -> Self {
+            Self {
+                inner: open_wal_file(vfs, cx),
+                writes: std::sync::Mutex::new(Vec::new()),
+                pending: std::sync::Mutex::new(None),
+                action: AppendProbeAction::Complete,
+            }
+        }
+
+        fn finish_pending(&self, cx: &Cx) {
+            let (offset, bytes, completion) = self
+                .pending
+                .lock()
+                .unwrap()
+                .take()
+                .expect("a source write is pending");
+            self.inner
+                .write_tracked(cx, &bytes, offset, completion)
+                .expect("complete the retained physical source");
+        }
+    }
+
+    impl VfsFile for AppendProbeFile {
+        async fn read(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
+            self.inner.read(cx, buf, offset).await
+        }
+
+        async fn write(&self, cx: &Cx, buf: &[u8], offset: u64) -> Result<()> {
+            self.write_tracked(cx, buf, offset, VfsWriteCompletion::new())
+                .await
+        }
+
+        async fn write_tracked(
+            &self,
+            cx: &Cx,
+            buf: &[u8],
+            offset: u64,
+            completion: VfsWriteCompletion,
+        ) -> Result<()> {
+            let ordinal = if offset == 0 {
+                0
+            } else {
+                let mut writes = self.writes.lock().unwrap();
+                writes.push((offset, buf.len()));
+                writes.len()
+            };
+            match self.action {
+                AppendProbeAction::Partial { write, bytes } if write == ordinal => {
+                    self.inner
+                        .write(cx, &buf[..bytes.min(buf.len())], offset)
+                        .await?;
+                    completion.complete_error();
+                    Err(FrankenError::Io(std::io::Error::other(
+                        "injected partial WAL write",
+                    )))
+                }
+                AppendProbeAction::Pending { write } if write == ordinal => {
+                    *self.pending.lock().unwrap() = Some((offset, buf.to_vec(), completion));
+                    std::future::pending().await
+                }
+                _ => self.inner.write_tracked(cx, buf, offset, completion).await,
+            }
+        }
+
+        fn close(&mut self, cx: &Cx) -> Result<()> {
+            self.inner.close(cx)
+        }
+        fn truncate(&mut self, cx: &Cx, size: u64) -> Result<()> {
+            self.inner.truncate(cx, size)
+        }
+        fn sync(&mut self, cx: &Cx, flags: SyncFlags) -> Result<()> {
+            self.inner.sync(cx, flags)
+        }
+        fn file_size(&self, cx: &Cx) -> Result<u64> {
+            self.inner.file_size(cx)
+        }
+        fn lock(&mut self, cx: &Cx, level: fsqlite_types::LockLevel) -> Result<()> {
+            self.inner.lock(cx, level)
+        }
+        fn unlock(&mut self, cx: &Cx, level: fsqlite_types::LockLevel) -> Result<()> {
+            self.inner.unlock(cx, level)
+        }
+        fn lock_external_shared_snapshot(&mut self, cx: &Cx) -> Result<()> {
+            self.inner.lock_external_shared_snapshot(cx)
+        }
+        fn restore_external_shared_snapshot_attempt(&mut self, cx: &Cx) -> Result<()> {
+            self.inner.restore_external_shared_snapshot_attempt(cx)
+        }
+        fn owns_external_wal_append_write(&self, cx: &Cx) -> Result<bool> {
+            self.inner.owns_external_wal_append_write(cx)
+        }
+        fn lock_external_wal_append(&mut self, cx: &Cx) -> Result<()> {
+            self.inner.lock_external_wal_append(cx)
+        }
+        fn lock_external_wal_recovery(&mut self, cx: &Cx) -> Result<()> {
+            self.inner.lock_external_wal_recovery(cx)
+        }
+        fn restore_external_wal_append_attempt(&mut self, cx: &Cx) -> Result<()> {
+            self.inner.restore_external_wal_append_attempt(cx)
+        }
+        fn lock_external_maintenance(&mut self, cx: &Cx, wal_mode: bool) -> Result<()> {
+            self.inner.lock_external_maintenance(cx, wal_mode)
+        }
+        fn restore_external_maintenance_attempt(&mut self, cx: &Cx) -> Result<()> {
+            self.inner.restore_external_maintenance_attempt(cx)
+        }
+        fn check_reserved_lock(&self, cx: &Cx) -> Result<bool> {
+            self.inner.check_reserved_lock(cx)
+        }
+        fn shm_map(
+            &mut self,
+            cx: &Cx,
+            region: u32,
+            size: u32,
+            extend: bool,
+        ) -> Result<fsqlite_vfs::ShmRegion> {
+            self.inner.shm_map(cx, region, size, extend)
+        }
+        fn shm_lock(&mut self, cx: &Cx, offset: u32, n: u32, flags: u32) -> Result<()> {
+            self.inner.shm_lock(cx, offset, n, flags)
+        }
+        fn shm_barrier(&self) {
+            self.inner.shm_barrier();
+        }
+        fn shm_unmap(&mut self, cx: &Cx, delete: bool) -> Result<()> {
+            self.inner.shm_unmap(cx, delete)
+        }
     }
 
     // bd-mlz2t: a read-only `VfsFile` that serves a scripted sequence of 32-byte
@@ -4983,6 +5341,395 @@ mod tests {
             fsqlite_vfs::VfsWriteCompletionState::Success
         );
         assert_eq!(wal.frame_count(), 1);
+    }
+
+    fn multi_chunk_frames(page: &[u8]) -> Vec<WalAppendFrameRef<'_>> {
+        let frames_per_chunk = WAL_APPEND_BUFFER_BYTES / (WAL_FRAME_HEADER_SIZE + page.len());
+        let count = frames_per_chunk * 2 + 3;
+        (0..count)
+            .map(|idx| {
+                frame_ref(
+                    u32::try_from(idx + 2).unwrap(),
+                    page,
+                    if idx + 1 == count {
+                        u32::try_from(count + 1).unwrap()
+                    } else {
+                        0
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn prepare_test_frame_bytes<F: VfsFile>(
+        wal: &WalFile<F>,
+        frames: &[WalAppendFrameRef<'_>],
+    ) -> (Vec<u8>, Vec<WalChecksumTransform>) {
+        let mut bytes = Vec::new();
+        let mut transforms = Vec::new();
+        wal.prepare_frame_bytes_with_transforms_into(
+            frames.len(),
+            frames.iter().copied(),
+            &mut bytes,
+            &mut transforms,
+        )
+        .unwrap();
+        (bytes, transforms)
+    }
+
+    #[test]
+    fn test_large_batch_append_bounds_buffers_and_matches_single_frames() {
+        use fsqlite_vfs::VfsWriteCompletionState;
+
+        let cx = test_cx();
+        for page_size in [512_u32, PAGE_SIZE, 65_536] {
+            let page = vec![0xA5; usize::try_from(page_size).unwrap()];
+            let mut frames = multi_chunk_frames(&page);
+            let frames_per_chunk = WAL_APPEND_BUFFER_BYTES / (WAL_FRAME_HEADER_SIZE + page.len());
+            // Include commits on both sides of a write boundary and retain an
+            // uncommitted tail, whose checksum must not replace the commit's.
+            frames.last_mut().unwrap().db_size_if_commit = 0;
+            frames[frames_per_chunk - 1].db_size_if_commit = 17;
+            let last_commit_index = frames_per_chunk + 1;
+            frames[last_commit_index].db_size_if_commit = 31;
+
+            let reference_vfs = MemoryVfs::new();
+            let mut reference = WalFile::create(
+                &cx,
+                open_wal_file(&reference_vfs, &cx),
+                page_size,
+                0,
+                test_salts(),
+            )
+            .expect("create reference WAL");
+            for frame in &frames {
+                reference
+                    .append_frame(
+                        &cx,
+                        frame.page_number,
+                        frame.page_data,
+                        frame.db_size_if_commit,
+                    )
+                    .expect("append reference frame");
+            }
+            let mut expected =
+                vec![0; usize::try_from(reference.file().file_size(&cx).unwrap()).unwrap()];
+            reference
+                .file()
+                .read(&cx, &mut expected, 0)
+                .expect("read reference WAL bytes");
+
+            for prepared in [false, true] {
+                for tracked in [false, true] {
+                    let vfs = MemoryVfs::new();
+                    let mut wal = WalFile::create(
+                        &cx,
+                        AppendProbeFile::new(&vfs, &cx),
+                        page_size,
+                        0,
+                        test_salts(),
+                    )
+                    .expect("create multi-chunk WAL");
+                    let completion = VfsWriteCompletion::new();
+                    if prepared {
+                        let (mut bytes, transforms) = prepare_test_frame_bytes(&wal, &frames);
+                        if tracked {
+                            wal.append_prepared_frame_bytes_tracked(
+                                &cx,
+                                &mut bytes,
+                                &transforms,
+                                completion.clone(),
+                            )
+                            .expect("append tracked prepared batch");
+                        } else {
+                            wal.append_prepared_frame_bytes(&cx, &mut bytes, &transforms)
+                                .expect("append prepared batch");
+                        }
+                    } else if tracked {
+                        wal.append_frames_tracked(&cx, &frames, completion.clone())
+                            .expect("append tracked batch");
+                    } else {
+                        wal.append_frames(&cx, &frames).expect("append batch");
+                    }
+                    if tracked {
+                        assert_eq!(completion.state(), VfsWriteCompletionState::Success);
+                    }
+                    let writes = wal.file().writes.lock().unwrap().clone();
+                    assert_eq!(
+                        writes.len(),
+                        3,
+                        "page_size={page_size}, prepared={prepared}, tracked={tracked}"
+                    );
+                    let mut next_offset = u64::try_from(WAL_HEADER_SIZE).unwrap();
+                    for (offset, length) in writes {
+                        assert_eq!(offset, next_offset);
+                        assert!(
+                            length <= WAL_APPEND_BUFFER_BYTES,
+                            "each VFS-owned copy must be bounded"
+                        );
+                        assert_eq!(
+                            length % wal.frame_size(),
+                            0,
+                            "writes contain complete frames"
+                        );
+                        next_offset += u64::try_from(length).unwrap();
+                    }
+                    assert!(wal.frame_scratch_capacity() <= WAL_APPEND_BUFFER_BYTES);
+                    assert_eq!(wal.frame_count(), reference.frame_count());
+                    assert_eq!(wal.running_checksum(), reference.running_checksum());
+                    assert_eq!(
+                        wal.last_commit_frame_header(),
+                        reference.last_commit_frame_header()
+                    );
+                    let mut actual = vec![0; expected.len()];
+                    assert_eq!(
+                        wal.file()
+                            .read(&cx, &mut actual, 0)
+                            .expect("read appended WAL"),
+                        actual.len()
+                    );
+                    assert_eq!(
+                        actual, expected,
+                        "chunking must preserve the exact WAL bytes"
+                    );
+
+                    let reopened = WalFile::open(&cx, open_wal_file(&vfs, &cx))
+                        .expect("recover multi-chunk WAL");
+                    assert_eq!(reopened.frame_count(), last_commit_index + 1);
+                    assert_eq!(
+                        reopened.last_commit_frame_header(),
+                        reference.last_commit_frame_header()
+                    );
+                    assert_eq!(
+                        reopened.running_checksum(),
+                        reference.last_commit_frame_header().unwrap().1.checksum
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_large_batch_preflight_rejects_invalid_suffix_before_write() {
+        use fsqlite_vfs::VfsWriteCompletionState;
+
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let mut wal = WalFile::create(
+            &cx,
+            AppendProbeFile::new(&vfs, &cx),
+            PAGE_SIZE,
+            0,
+            test_salts(),
+        )
+        .expect("create preflight WAL");
+        let page = sample_page(3);
+        let frames = multi_chunk_frames(&page);
+        let bad_page = vec![0; page.len() - 1];
+        for bad_suffix in [false, true] {
+            for delta in [-1_i32, 0, 1] {
+                if !bad_suffix && delta == 0 {
+                    continue;
+                }
+                let mut input = frames.clone();
+                if bad_suffix {
+                    input.last_mut().unwrap().page_data = &bad_page;
+                }
+                let count = usize::try_from(i32::try_from(input.len()).unwrap() + delta).unwrap();
+                let completion = VfsWriteCompletion::new();
+                let result = wal
+                    .append_frame_iter_tracked(&cx, count, input, completion.clone())
+                    .wait();
+                assert!(matches!(result, Err(FrankenError::WalCorrupt { .. })));
+                assert_eq!(completion.state(), VfsWriteCompletionState::Error);
+                assert!(wal.file().writes.lock().unwrap().is_empty());
+                assert_eq!(wal.frame_count(), 0);
+                assert_eq!(
+                    wal.file().file_size(&cx).unwrap(),
+                    u64::try_from(WAL_HEADER_SIZE).unwrap()
+                );
+            }
+        }
+
+        let (mut bytes, transforms) = prepare_test_frame_bytes(&wal, &frames);
+        let checksum = wal
+            .finalize_prepared_frame_bytes(&mut bytes, &transforms)
+            .unwrap();
+        let completion = VfsWriteCompletion::new();
+        let result = wal
+            .append_finalized_prepared_frame_bytes_tracked(
+                &cx,
+                &bytes,
+                frames.len(),
+                checksum,
+                Some(0),
+                completion.clone(),
+            )
+            .wait();
+        assert!(matches!(result, Err(FrankenError::WalCorrupt { .. })));
+        assert_eq!(completion.state(), VfsWriteCompletionState::Error);
+        assert!(wal.file().writes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_large_batch_partial_failure_preserves_state_and_recovery() {
+        use fsqlite_vfs::VfsWriteCompletionState;
+
+        let cx = test_cx();
+        let page = sample_page(9);
+        let frames = multi_chunk_frames(&page);
+        for prepared in [false, true] {
+            for failed_write in [2, 3] {
+                let vfs = MemoryVfs::new();
+                let mut wal = WalFile::create(
+                    &cx,
+                    AppendProbeFile::new(&vfs, &cx),
+                    PAGE_SIZE,
+                    0,
+                    test_salts(),
+                )
+                .expect("create partial-write WAL");
+                wal.append_frame(&cx, 1, &sample_page(1), 1)
+                    .expect("append prior commit");
+                let original_checksum = wal.running_checksum();
+                let original_commit = wal.last_commit_frame_header();
+                wal.file().writes.lock().unwrap().clear();
+                wal.file_mut().action = AppendProbeAction::Partial {
+                    write: failed_write,
+                    bytes: WAL_FRAME_HEADER_SIZE + page.len() + 11,
+                };
+                let completion = VfsWriteCompletion::new();
+                let result = if prepared {
+                    let (mut bytes, transforms) = prepare_test_frame_bytes(&wal, &frames);
+                    wal.append_prepared_frame_bytes_tracked(
+                        &cx,
+                        &mut bytes,
+                        &transforms,
+                        completion.clone(),
+                    )
+                    .wait()
+                } else {
+                    wal.append_frames_tracked(&cx, &frames, completion.clone())
+                        .wait()
+                };
+                assert!(matches!(result, Err(FrankenError::Io(_))));
+                assert_eq!(completion.state(), VfsWriteCompletionState::Error);
+                assert_eq!(wal.frame_count(), 1);
+                assert_eq!(wal.running_checksum(), original_checksum);
+                assert_eq!(wal.last_commit_frame_header(), original_commit);
+                assert!(wal.frame_scratch_capacity() <= WAL_APPEND_BUFFER_BYTES);
+                let reopened =
+                    WalFile::open(&cx, open_wal_file(&vfs, &cx)).expect("recover partial write");
+                assert_eq!(
+                    reopened.frame_count(),
+                    1,
+                    "a partial final marker cannot commit its prefix"
+                );
+                assert_eq!(reopened.last_commit_frame_header(), original_commit);
+
+                wal.refresh(&cx).expect("refresh after partial write");
+                wal.repair_uncommitted_tail(&cx).unwrap();
+                wal.file_mut().action = AppendProbeAction::Complete;
+                let retry = VfsWriteCompletion::new();
+                wal.append_frames_tracked(&cx, &frames, retry.clone())
+                    .expect("retry repaired append");
+                assert_eq!(retry.state(), VfsWriteCompletionState::Success);
+                let reopened =
+                    WalFile::open(&cx, open_wal_file(&vfs, &cx)).expect("recover successful retry");
+                assert_eq!(reopened.frame_count(), frames.len() + 1);
+                assert_eq!(reopened.running_checksum(), wal.running_checksum());
+            }
+        }
+    }
+
+    #[test]
+    fn test_large_batch_cancellation_waits_for_source_and_recovers_exact_commit() {
+        use fsqlite_vfs::VfsWriteCompletionState;
+        use std::future::Future as _;
+        use std::task::{Context, Poll, Waker};
+
+        let cx = test_cx();
+        let page = sample_page(7);
+        let frames = multi_chunk_frames(&page);
+        for prepared in [false, true] {
+            for pending_write in [2, 3] {
+                let vfs = MemoryVfs::new();
+                let mut wal = WalFile::create(
+                    &cx,
+                    AppendProbeFile::new(&vfs, &cx),
+                    PAGE_SIZE,
+                    0,
+                    test_salts(),
+                )
+                .expect("create cancellation WAL");
+                wal.append_frame(&cx, 1, &sample_page(1), 1)
+                    .expect("append prior commit");
+                let original_commit = wal.last_commit_frame_header();
+                let original_checksum = wal.running_checksum();
+                wal.file().writes.lock().unwrap().clear();
+                wal.file_mut().action = AppendProbeAction::Pending {
+                    write: pending_write,
+                };
+                let completion = VfsWriteCompletion::new();
+                let (mut bytes, transforms) = prepare_test_frame_bytes(&wal, &frames);
+                let mut append = Box::pin(async {
+                    if prepared {
+                        wal.append_prepared_frame_bytes_tracked(
+                            &cx,
+                            &mut bytes,
+                            &transforms,
+                            completion.clone(),
+                        )
+                        .await
+                    } else {
+                        wal.append_frames_tracked(&cx, &frames, completion.clone())
+                            .await
+                    }
+                });
+                assert!(matches!(
+                    append
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop())),
+                    Poll::Pending
+                ));
+                assert_eq!(completion.state(), VfsWriteCompletionState::Pending);
+                drop(append);
+                assert_eq!(
+                    completion.state(),
+                    VfsWriteCompletionState::Pending,
+                    "dropping the append cannot terminate live physical I/O"
+                );
+                assert_eq!(wal.frame_count(), 1);
+                assert_eq!(wal.last_commit_frame_header(), original_commit);
+                assert_eq!(wal.running_checksum(), original_checksum);
+                wal.file().finish_pending(&cx);
+                let final_chunk = pending_write == 3;
+                assert_eq!(
+                    completion.state(),
+                    if final_chunk {
+                        VfsWriteCompletionState::Success
+                    } else {
+                        VfsWriteCompletionState::Error
+                    }
+                );
+                assert_eq!(
+                    wal.frame_count(),
+                    1,
+                    "the dropped future never publishes local state"
+                );
+                let reopened =
+                    WalFile::open(&cx, open_wal_file(&vfs, &cx)).expect("recover abandoned append");
+                assert_eq!(
+                    reopened.frame_count(),
+                    if final_chunk { frames.len() + 1 } else { 1 }
+                );
+                let (header, recovered_page) = reopened
+                    .read_frame(&cx, 0)
+                    .expect("read prior committed frame");
+                assert_eq!(header.page_number, 1);
+                assert_eq!(recovered_page, sample_page(1));
+            }
+        }
     }
 
     /// bd-db300.3.8.6: Verify the fused append_frames path produces a
