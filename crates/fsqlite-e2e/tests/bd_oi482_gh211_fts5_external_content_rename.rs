@@ -309,7 +309,10 @@ fn gh211_failed_rebuild_preserves_postings_hot_and_reopened() {
             );
             assert_eq!(
                 stock_source_rows(&stock),
-                vec![(1, "hello world".to_owned()), (2, "goodbye moon".to_owned())],
+                vec![
+                    (1, "hello world".to_owned()),
+                    (2, "goodbye moon".to_owned())
+                ],
                 "{case}: primary rows intact"
             );
             let integrity: String = stock
@@ -317,9 +320,11 @@ fn gh211_failed_rebuild_preserves_postings_hot_and_reopened() {
                 .expect("stock integrity_check");
             assert_eq!(integrity, "ok", "{case}: stock integrity_check");
             let create_sql: String = stock
-                .query_row("SELECT sql FROM sqlite_master WHERE name = 'ft'", [], |row| {
-                    row.get(0)
-                })
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE name = 'ft'",
+                    [],
+                    |row| row.get(0),
+                )
                 .expect("persisted ft DDL");
             assert!(
                 create_sql.contains("content='c'"),
