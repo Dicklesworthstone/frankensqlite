@@ -338,9 +338,7 @@ impl Clone for PageData {
     fn clone(&self) -> Self {
         match &self.repr {
             PageDataRepr::Owned { bytes, shared } => {
-                let shared = Arc::clone(
-                    shared.get_or_init(|| Arc::<[u8]>::from(bytes.clone().into_boxed_slice())),
-                );
+                let shared = Arc::clone(shared.get_or_init(|| Arc::<[u8]>::from(bytes.as_slice())));
                 Self {
                     repr: PageDataRepr::Shared(shared),
                     image_token: self.image_token,
@@ -3511,5 +3509,20 @@ mod tests {
         // 512 = 0x0200
         assert_eq!(buf[5], 0x02, "512 hi byte");
         assert_eq!(buf[6], 0x00, "512 lo byte");
+    }
+
+    #[test]
+    fn test_page_data_clone_shares_single_arc_slice() {
+        let mut raw = vec![0xA5_u8; PageSize::DEFAULT.as_usize()];
+        raw[0] = 0x0D;
+        raw[4095] = 0x5A;
+        let owned = PageData::from_vec(raw);
+        let c1 = owned.clone();
+        let c2 = owned.clone();
+        let c3 = c1.clone();
+        assert_eq!(c1.as_bytes().as_ptr(), c2.as_bytes().as_ptr());
+        assert_eq!(c1.as_bytes().as_ptr(), c3.as_bytes().as_ptr());
+        assert_eq!(c1.image_token(), owned.image_token());
+        assert_eq!(c1.as_bytes(), owned.as_bytes());
     }
 }

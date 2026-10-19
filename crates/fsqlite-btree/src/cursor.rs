@@ -600,6 +600,9 @@ impl<T: TransactionHandle + ?Sized> PageWriter for TransactionPageIo<'_, T> {
 #[derive(Debug, Clone)]
 pub struct MemPageStore {
     pages: std::collections::HashMap<u32, Vec<u8>, foldhash::fast::FixedState>,
+    shared_pages: std::cell::RefCell<
+        std::collections::HashMap<u32, (usize, usize, PageData), foldhash::fast::FixedState>,
+    >,
     page_size: u32,
     page_slots: Vec<u8>,
 }
@@ -610,9 +613,19 @@ impl MemPageStore {
     pub fn new(page_size: u32) -> Self {
         Self {
             pages: std::collections::HashMap::with_hasher(foldhash::fast::FixedState::default()),
+            shared_pages: std::cell::RefCell::new(std::collections::HashMap::with_hasher(
+                foldhash::fast::FixedState::default(),
+            )),
             page_size,
             page_slots: Vec::new(),
         }
+    }
+
+    /// Iterate over all `(page_number, page_bytes)` entries in the store.
+    pub fn pages_iter(&self) -> impl Iterator<Item = (&u32, &[u8])> {
+        self.pages
+            .iter()
+            .map(|(pgno, bytes)| (pgno, bytes.as_slice()))
     }
 
     #[inline]
@@ -645,6 +658,7 @@ impl MemPageStore {
         page[3..5].copy_from_slice(&0u16.to_be_bytes());
         let content_off = self.page_size as u16;
         page[5..7].copy_from_slice(&content_off.to_be_bytes());
+        self.shared_pages.get_mut().remove(&pgno.get());
         self.pages.insert(pgno.get(), page);
         self.set_page_slot_present(pgno, true);
     }
@@ -703,6 +717,37 @@ impl PageReader for MemPageStore {
         }
     }
 
+    fn read_page_data<'a>(
+        &'a self,
+        _cx: &'a Cx,
+        page_no: PageNumber,
+    ) -> impl Future<Output = Result<PageData>> + 'a {
+        async move {
+            let pgno = page_no.get();
+            let page = self
+                .pages
+                .get(&pgno)
+                .ok_or_else(|| FrankenError::internal("page not found"))?;
+            let ptr = page.as_ptr() as usize;
+            let len = page.len();
+            if let Ok(mut shared_map) = self.shared_pages.try_borrow_mut() {
+                if let Some((cached_ptr, cached_len, cached_data)) = shared_map.get(&pgno)
+                    && *cached_ptr == ptr
+                    && *cached_len == len
+                {
+                    return Ok(cached_data.clone());
+                }
+                let shared = PageData::from_shared(std::sync::Arc::<[u8]>::from(page.as_slice()));
+                shared_map.insert(pgno, (ptr, len, shared.clone()));
+                Ok(shared)
+            } else {
+                Ok(PageData::from_shared(std::sync::Arc::<[u8]>::from(
+                    page.as_slice(),
+                )))
+            }
+        }
+    }
+
     fn prefetch_page_hint(&self, _cx: &Cx, page_no: PageNumber) {
         let Some(slot_idx) = Self::page_slot_index(page_no) else {
             return;
@@ -738,10 +783,18 @@ impl PageWriter for MemPageStore {
                     ),
                 });
             }
-            let mut page = vec![0_u8; page_size];
+            let pgno = page_no.get();
+            self.shared_pages.get_mut().remove(&pgno);
             let copy_len = data.len().min(page_size);
-            page[..copy_len].copy_from_slice(&data[..copy_len]);
-            self.pages.insert(page_no.get(), page);
+            if let Some(existing) = self.pages.get_mut(&pgno) {
+                existing.resize(page_size, 0);
+                existing[..copy_len].copy_from_slice(&data[..copy_len]);
+                existing[copy_len..].fill(0);
+            } else {
+                let mut page = vec![0_u8; page_size];
+                page[..copy_len].copy_from_slice(&data[..copy_len]);
+                self.pages.insert(pgno, page);
+            }
             self.set_page_slot_present(page_no, true);
             Ok(())
         }
@@ -764,10 +817,29 @@ impl PageWriter for MemPageStore {
                     ),
                 });
             }
-            let mut page = vec![0_u8; page_size];
-            let copy_len = data.len().min(page_size);
-            page[..copy_len].copy_from_slice(&data.as_bytes()[..copy_len]);
-            self.pages.insert(page_no.get(), page);
+            let pgno = page_no.get();
+            let raw = data.as_bytes();
+            let copy_len = raw.len().min(page_size);
+            let (ptr, len) = if let Some(existing) = self.pages.get_mut(&pgno) {
+                existing.resize(page_size, 0);
+                existing[..copy_len].copy_from_slice(&raw[..copy_len]);
+                existing[copy_len..].fill(0);
+                (existing.as_ptr() as usize, existing.len())
+            } else {
+                let mut page = vec![0_u8; page_size];
+                page[..copy_len].copy_from_slice(&raw[..copy_len]);
+                let ptr = page.as_ptr() as usize;
+                let len = page.len();
+                self.pages.insert(pgno, page);
+                (ptr, len)
+            };
+            if data.len() == page_size {
+                self.shared_pages
+                    .get_mut()
+                    .insert(pgno, (ptr, len, data.clone()));
+            } else {
+                self.shared_pages.get_mut().remove(&pgno);
+            }
             self.set_page_slot_present(page_no, true);
             Ok(())
         }
@@ -787,6 +859,7 @@ impl PageWriter for MemPageStore {
                 .checked_add(1)
                 .ok_or(FrankenError::DatabaseFull)?;
             let pgno = PageNumber::new(next).ok_or(FrankenError::DatabaseFull)?;
+            self.shared_pages.get_mut().remove(&next);
             self.pages.insert(next, vec![0u8; self.page_size as usize]);
             self.set_page_slot_present(pgno, true);
             Ok(pgno)
@@ -799,7 +872,9 @@ impl PageWriter for MemPageStore {
         page_no: PageNumber,
     ) -> impl Future<Output = Result<()>> + 'a {
         async move {
-            self.pages.remove(&page_no.get());
+            let pgno = page_no.get();
+            self.shared_pages.get_mut().remove(&pgno);
+            self.pages.remove(&pgno);
             self.set_page_slot_present(page_no, false);
             Ok(())
         }
@@ -23446,6 +23521,32 @@ mod tests {
              descending order — interior-pop-and-recurse must not re-descend \
              the same subtree (frankensqlite#95)"
             );
+        });
+    }
+
+    #[test]
+    fn test_mem_page_store_read_page_data_shares_arc_snapshot_gh520() {
+        run_async(async {
+            let cx = Cx::new();
+            let root = pn(2);
+            let mut store = MemPageStore::with_empty_table(root, USABLE);
+            let p1 = store.read_page_data(&cx, root).await.unwrap();
+            let p2 = store.read_page_data(&cx, root).await.unwrap();
+            assert_eq!(
+                p1.as_bytes().as_ptr(),
+                p2.as_bytes().as_ptr(),
+                "repeated read_page_data on unchanged MemPageStore page should share Arc<[u8]>"
+            );
+            assert_eq!(p1.image_token(), p2.image_token());
+
+            let mut updated = p1.as_bytes().to_vec();
+            updated[7] = 1;
+            store.write_page(&cx, root, &updated).await.unwrap();
+            let p3 = store.read_page_data(&cx, root).await.unwrap();
+            assert_eq!(p3.as_bytes()[7], 1);
+            assert_ne!(p3.image_token(), p1.image_token());
+            let p4 = store.read_page_data(&cx, root).await.unwrap();
+            assert_eq!(p3.as_bytes().as_ptr(), p4.as_bytes().as_ptr());
         });
     }
 }

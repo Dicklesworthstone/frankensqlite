@@ -1589,28 +1589,29 @@ fn compute_leaf_distribution(
     }
 
     // Rebalance: try to equalize page usage.
-    // Move cells from overfull pages to the right.
+    // Move cells from overfull pages to the right (and symmetrically right-to-left).
     let page_count = distribution.len();
     if page_count > 1 {
-        for _ in 0..3 {
-            // Few iterations suffice.
+        let max_passes = page_count.saturating_mul(2).max(3);
+        for _ in 0..max_passes {
             let mut changed = false;
-            for i in 0..page_count - 1 {
-                let mut left_start: usize = distribution[..i].iter().sum();
-                let mut left_count = distribution[i];
-                let mut right_start = left_start + left_count;
-                let mut right_count = distribution[i + 1];
+            for i in (0..page_count - 1).rev().chain(0..page_count - 1) {
+                let left_start: usize = distribution[..i].iter().sum();
 
-                // Try moving the last cell from left to right.
-                if left_count > 1 {
+                // Move trailing cells from left to right while doing so reduces
+                // the byte-usage difference between page `i` and page `i + 1`.
+                while distribution[i] > 1 {
+                    let right_start = left_start + distribution[i];
                     let last_cell = &cells[right_start - 1];
-                    let cell_cost =
-                        last_cell.data.len().max(MIN_CELL_ALLOCATION) + CELL_POINTER_SIZE as usize;
+                    let Some(cost) = cell_cost(last_cell) else {
+                        break;
+                    };
 
-                    let left_usage = page_sizes[i] - cell_cost;
-                    let right_usage = page_sizes[i + 1] + cell_cost;
+                    let left_usage = page_sizes[i].saturating_sub(cost);
+                    let Some(right_usage) = page_sizes[i + 1].checked_add(cost) else {
+                        break;
+                    };
 
-                    // Move if it makes pages more balanced.
                     let old_diff = page_sizes[i].abs_diff(page_sizes[i + 1]);
                     let new_diff = left_usage.abs_diff(right_usage);
 
@@ -1620,21 +1621,24 @@ fn compute_leaf_distribution(
                         page_sizes[i] = left_usage;
                         page_sizes[i + 1] = right_usage;
                         changed = true;
-                        left_count = distribution[i];
-                        right_count = distribution[i + 1];
-                        left_start = distribution[..i].iter().sum();
-                        right_start = left_start + left_count;
+                    } else {
+                        break;
                     }
                 }
 
-                // Try moving the first cell from right to left.
-                if right_count > 1 {
+                // Move leading cells from right to left while doing so reduces
+                // the byte-usage difference between page `i` and page `i + 1`.
+                while distribution[i + 1] > 1 {
+                    let right_start = left_start + distribution[i];
                     let first_cell = &cells[right_start];
-                    let cell_cost =
-                        first_cell.data.len().max(MIN_CELL_ALLOCATION) + CELL_POINTER_SIZE as usize;
+                    let Some(cost) = cell_cost(first_cell) else {
+                        break;
+                    };
 
-                    let left_usage = page_sizes[i] + cell_cost;
-                    let right_usage = page_sizes[i + 1] - cell_cost;
+                    let Some(left_usage) = page_sizes[i].checked_add(cost) else {
+                        break;
+                    };
+                    let right_usage = page_sizes[i + 1].saturating_sub(cost);
 
                     let old_diff = page_sizes[i].abs_diff(page_sizes[i + 1]);
                     let new_diff = left_usage.abs_diff(right_usage);
@@ -1645,6 +1649,8 @@ fn compute_leaf_distribution(
                         page_sizes[i] = left_usage;
                         page_sizes[i + 1] = right_usage;
                         changed = true;
+                    } else {
+                        break;
                     }
                 }
             }
@@ -1659,6 +1665,7 @@ fn compute_leaf_distribution(
     Ok(distribution)
 }
 
+#[allow(clippy::too_many_lines)]
 fn compute_interior_distribution(
     cells: &[GatheredCell],
     usable_size: u32,
@@ -1670,7 +1677,9 @@ fn compute_interior_distribution(
         return Ok(vec![0]);
     }
 
-    let mut distribution: Vec<usize> = Vec::with_capacity(cells.len().div_ceil(64).max(1));
+    let cap = cells.len().div_ceil(64).max(1);
+    let mut distribution: Vec<usize> = Vec::with_capacity(cap);
+    let mut page_sizes: Vec<usize> = Vec::with_capacity(cap);
     let mut cursor = 0usize;
 
     while cursor < total_cells {
@@ -1716,6 +1725,13 @@ fn compute_interior_distribution(
                 });
             }
             count -= 1;
+            let backtrack_cost = cell_cost(&cells[cursor + count]).ok_or_else(|| {
+                FrankenError::internal(format!(
+                    "balance: interior cell {} size overflow",
+                    cursor + count
+                ))
+            })?;
+            used = used.saturating_sub(backtrack_cost);
         }
 
         if count == 0 {
@@ -1728,6 +1744,7 @@ fn compute_interior_distribution(
         }
 
         distribution.push(count);
+        page_sizes.push(used);
         cursor += count;
 
         if cursor < total_cells {
@@ -1738,6 +1755,85 @@ fn compute_interior_distribution(
                 return Err(FrankenError::DatabaseCorrupt {
                     detail: "balance: interior distribution consumed trailing divider".to_owned(),
                 });
+            }
+        }
+    }
+
+    // GH#521 / bd-mlyph: equalize cell distribution across sibling pages while
+    // accounting for the divider cell promoted between each adjacent pair of
+    // pages (`div_idx = left_start + distribution[i]`). Without this pass,
+    // greedy left-packing leaves a 1-cell trailing sibling whenever N full
+    // index leaves overflow by 1 cell (e.g. descending index inserts).
+    let page_count = distribution.len();
+    if page_count > 1 {
+        let max_passes = page_count.saturating_mul(2).max(3);
+        for _ in 0..max_passes {
+            let mut changed = false;
+            for i in (0..page_count - 1).rev().chain(0..page_count - 1) {
+                let left_start: usize = distribution[..i].iter().sum::<usize>() + i;
+
+                // Shift boundary left: demote `cells[div_idx]` onto page `i + 1`
+                // and promote `cells[div_idx - 1]` from page `i` as the new divider.
+                while distribution[i] > 1 {
+                    let div_idx = left_start + distribution[i];
+                    let Some(promote_cost) = cell_cost(&cells[div_idx - 1]) else {
+                        break;
+                    };
+                    let Some(demote_cost) = cell_cost(&cells[div_idx]) else {
+                        break;
+                    };
+
+                    let left_usage = page_sizes[i].saturating_sub(promote_cost);
+                    let Some(right_usage) = page_sizes[i + 1].checked_add(demote_cost) else {
+                        break;
+                    };
+
+                    let old_diff = page_sizes[i].abs_diff(page_sizes[i + 1]);
+                    let new_diff = left_usage.abs_diff(right_usage);
+
+                    if new_diff < old_diff && right_usage <= usable_space {
+                        distribution[i] -= 1;
+                        distribution[i + 1] += 1;
+                        page_sizes[i] = left_usage;
+                        page_sizes[i + 1] = right_usage;
+                        changed = true;
+                    } else {
+                        break;
+                    }
+                }
+
+                // Shift boundary right: demote `cells[div_idx]` onto page `i`
+                // and promote `cells[div_idx + 1]` from page `i + 1` as the new divider.
+                while distribution[i + 1] > 1 {
+                    let div_idx = left_start + distribution[i];
+                    let Some(demote_cost) = cell_cost(&cells[div_idx]) else {
+                        break;
+                    };
+                    let Some(promote_cost) = cell_cost(&cells[div_idx + 1]) else {
+                        break;
+                    };
+
+                    let Some(left_usage) = page_sizes[i].checked_add(demote_cost) else {
+                        break;
+                    };
+                    let right_usage = page_sizes[i + 1].saturating_sub(promote_cost);
+
+                    let old_diff = page_sizes[i].abs_diff(page_sizes[i + 1]);
+                    let new_diff = left_usage.abs_diff(right_usage);
+
+                    if new_diff < old_diff && left_usage <= usable_space {
+                        distribution[i] += 1;
+                        distribution[i + 1] -= 1;
+                        page_sizes[i] = left_usage;
+                        page_sizes[i + 1] = right_usage;
+                        changed = true;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            if !changed {
+                break;
             }
         }
     }
@@ -5071,6 +5167,57 @@ mod tests {
                 store.claimed.contains(&pn(4)),
                 "unchanged old right-edge leaf (page 4) must be claimed in the write-conflict set, got {:?}",
                 store.claimed
+            );
+        });
+    }
+
+    /// GH#521 / bd-mlyph: descending index inserts must equalize sibling leaf
+    /// pages across divider boundaries instead of left-packing the first three
+    /// siblings and creating a 1-cell trailing leaf on every split.
+    #[test]
+    fn test_descending_index_inserts_equalize_leaf_pages_gh521() {
+        use crate::cursor::{BtCursor, MemPageStore as CursorMemPageStore};
+        use crate::traits::BtreeCursorOps;
+        use fsqlite_types::record::{SqliteValue, serialize_record};
+
+        run_async(async {
+            let cx = Cx::new();
+            let root = pn(2);
+            let store = CursorMemPageStore::with_empty_index(root, USABLE);
+            let mut cursor = BtCursor::new(store, root, USABLE, false);
+
+            let rows = 12_000_i64;
+            for i in 1..=rows {
+                // Monotonically decreasing key with increasing rowid.
+                let k = (rows - i) * 7 + (i % 7);
+                let key = serialize_record(&[SqliteValue::Integer(k), SqliteValue::Integer(i)]);
+                cursor
+                    .index_insert(&cx, &key)
+                    .await
+                    .expect("descending index_insert should succeed");
+            }
+
+            let store = cursor.into_transaction();
+            let mut leaf_pages = 0usize;
+            let mut one_cell_leaves = 0usize;
+            for (&pgno, page_bytes) in store.pages_iter() {
+                let offset = if pgno == 1 { 100 } else { 0 };
+                let header = BtreePageHeader::parse(page_bytes, offset).expect("parse page header");
+                if header.page_type == BtreePageType::LeafIndex {
+                    leaf_pages += 1;
+                    if header.cell_count <= 1 {
+                        one_cell_leaves += 1;
+                    }
+                }
+            }
+
+            assert_eq!(
+                one_cell_leaves, 0,
+                "descending index inserts must not leave 1-cell leaf pages (leaf_pages={leaf_pages})"
+            );
+            assert!(
+                leaf_pages < 100,
+                "12,000 small index keys should pack into <100 4 KiB leaf pages, got {leaf_pages}"
             );
         });
     }
