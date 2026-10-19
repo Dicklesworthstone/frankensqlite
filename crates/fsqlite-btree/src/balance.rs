@@ -1665,7 +1665,23 @@ fn compute_leaf_distribution(
     Ok(distribution)
 }
 
-#[allow(clippy::too_many_lines)]
+/// Distribution for page types whose output pages are separated by real
+/// divider cells: index leaves and every interior page type. Between each pair
+/// of output pages one gathered cell is promoted to the parent instead of
+/// being stored on either page.
+///
+/// Like SQLite's `balance_nonroot`, this first left-packs the cells and then
+/// walks the page boundaries right to left, shifting each boundary leftward
+/// while doing so keeps the right page no larger than its left neighbour. A
+/// shift demotes the current divider onto the right page and promotes the
+/// left page's last cell in its place, so both page sizes are recomputed from
+/// the actual cells that move.
+///
+/// The equalization pass is what keeps index B-trees dense under insert hot
+/// spots that sit left of full siblings. Without it (GH#521), descending keys
+/// into an index left-packed the first three siblings on every balance, so the
+/// next insert overflowed the leftmost leaf again and each balance stranded
+/// one more page holding a single cell.
 fn compute_interior_distribution(
     cells: &[GatheredCell],
     usable_size: u32,
@@ -1676,166 +1692,107 @@ fn compute_interior_distribution(
     if total_cells == 0 {
         return Ok(vec![0]);
     }
-
-    let cap = cells.len().div_ceil(64).max(1);
-    let mut distribution: Vec<usize> = Vec::with_capacity(cap);
-    let mut page_sizes: Vec<usize> = Vec::with_capacity(cap);
-    let mut cursor = 0usize;
-
-    while cursor < total_cells {
-        let mut used = hdr_size;
-        let mut count = 0usize;
-
-        while cursor + count < total_cells {
-            let idx = cursor + count;
-            let cell_cost = cell_cost(&cells[idx]).ok_or_else(|| {
-                FrankenError::internal(format!("balance: interior cell {} size overflow", idx))
+    let content_space =
+        usable_space
+            .checked_sub(hdr_size)
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "balance: page header {hdr_size} exceeds usable space {usable_space}"
+                ),
             })?;
-            let Some(next_used) = used.checked_add(cell_cost) else {
-                return Err(FrankenError::internal(format!(
-                    "balance: interior usage overflow on page {}",
-                    distribution.len()
-                )));
-            };
-            if next_used > usable_space {
-                break;
-            }
-            used = next_used;
-            count += 1;
+    let costs = cells
+        .iter()
+        .enumerate()
+        .map(|(idx, cell)| {
+            cell_cost(cell).ok_or_else(|| {
+                FrankenError::internal(format!("balance: interior cell {idx} size overflow"))
+            })
+        })
+        .collect::<Result<Vec<usize>>>()?;
 
-            let remaining = total_cells - (cursor + count);
-            if remaining == 0 {
-                break;
-            }
-
-            if remaining == 1 {
-                // A non-final page needs at least one divider plus one child cell.
-                // Keep packing this page rather than leaving an orphan divider.
-            }
+    // Pass 1: left-pack. `ends[i]` is the exclusive end of page i's cells; for
+    // every page but the last it is also the index of the divider promoted
+    // between page i and page i + 1. `sizes[i]` is the cell-content plus
+    // cell-pointer bytes used on page i (the page header is excluded).
+    let mut ends: Vec<usize> = Vec::with_capacity(NB + 2);
+    let mut sizes: Vec<usize> = Vec::with_capacity(NB + 2);
+    let mut start = 0usize;
+    loop {
+        let mut end = start;
+        let mut used = 0usize;
+        while end < total_cells && used + costs[end] <= content_space {
+            used += costs[end];
+            end += 1;
         }
-
-        if cursor + count < total_cells && total_cells - (cursor + count) == 1 {
-            // A single trailing interior cell would be consumed as a divider with no
-            // payload cell left for the right page. Backtrack one cell so we leave
-            // two cells: divider + right-page payload.
-            if count <= 1 {
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: "balance: interior distribution cannot leave a solitary divider"
-                        .to_owned(),
-                });
-            }
-            count -= 1;
-            let backtrack_cost = cell_cost(&cells[cursor + count]).ok_or_else(|| {
-                FrankenError::internal(format!(
-                    "balance: interior cell {} size overflow",
-                    cursor + count
-                ))
-            })?;
-            used = used.saturating_sub(backtrack_cost);
-        }
-
-        if count == 0 {
+        if end == start {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(
-                    "balance: interior cell {} cannot fit on page (usable {})",
-                    cursor, usable_space
+                    "balance: interior cell {start} cannot fit on page (usable {usable_space})"
                 ),
             });
         }
-
-        distribution.push(count);
-        page_sizes.push(used);
-        cursor += count;
-
-        if cursor < total_cells {
-            // One gathered interior cell is promoted back to the parent divider
-            // between each pair of output pages.
-            cursor += 1;
-            if cursor >= total_cells {
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: "balance: interior distribution consumed trailing divider".to_owned(),
-                });
-            }
+        ends.push(end);
+        sizes.push(used);
+        if end == total_cells {
+            break;
+        }
+        // cells[end] becomes the divider; the next page starts after it.
+        start = end + 1;
+        if start == total_cells {
+            // The divider was the final gathered cell, so the right-most page
+            // is empty. Pass 2 always moves at least one cell onto it.
+            ends.push(total_cells);
+            sizes.push(0);
+            break;
         }
     }
 
-    // GH#521 / bd-mlyph: equalize cell distribution across sibling pages while
-    // accounting for the divider cell promoted between each adjacent pair of
-    // pages (`div_idx = left_start + distribution[i]`). Without this pass,
-    // greedy left-packing leaves a 1-cell trailing sibling whenever N full
-    // index leaves overflow by 1 cell (e.g. descending index inserts).
-    let page_count = distribution.len();
-    if page_count > 1 {
-        let max_passes = page_count.saturating_mul(2).max(3);
-        for _ in 0..max_passes {
-            let mut changed = false;
-            for i in (0..page_count - 1).rev().chain(0..page_count - 1) {
-                let left_start: usize = distribution[..i].iter().sum::<usize>() + i;
-
-                // Shift boundary left: demote `cells[div_idx]` onto page `i + 1`
-                // and promote `cells[div_idx - 1]` from page `i` as the new divider.
-                while distribution[i] > 1 {
-                    let div_idx = left_start + distribution[i];
-                    let Some(promote_cost) = cell_cost(&cells[div_idx - 1]) else {
-                        break;
-                    };
-                    let Some(demote_cost) = cell_cost(&cells[div_idx]) else {
-                        break;
-                    };
-
-                    let left_usage = page_sizes[i].saturating_sub(promote_cost);
-                    let Some(right_usage) = page_sizes[i + 1].checked_add(demote_cost) else {
-                        break;
-                    };
-
-                    let old_diff = page_sizes[i].abs_diff(page_sizes[i + 1]);
-                    let new_diff = left_usage.abs_diff(right_usage);
-
-                    if new_diff < old_diff && right_usage <= usable_space {
-                        distribution[i] -= 1;
-                        distribution[i + 1] += 1;
-                        page_sizes[i] = left_usage;
-                        page_sizes[i + 1] = right_usage;
-                        changed = true;
-                    } else {
-                        break;
-                    }
-                }
-
-                // Shift boundary right: demote `cells[div_idx]` onto page `i`
-                // and promote `cells[div_idx + 1]` from page `i + 1` as the new divider.
-                while distribution[i + 1] > 1 {
-                    let div_idx = left_start + distribution[i];
-                    let Some(demote_cost) = cell_cost(&cells[div_idx]) else {
-                        break;
-                    };
-                    let Some(promote_cost) = cell_cost(&cells[div_idx + 1]) else {
-                        break;
-                    };
-
-                    let Some(left_usage) = page_sizes[i].checked_add(demote_cost) else {
-                        break;
-                    };
-                    let right_usage = page_sizes[i + 1].saturating_sub(promote_cost);
-
-                    let old_diff = page_sizes[i].abs_diff(page_sizes[i + 1]);
-                    let new_diff = left_usage.abs_diff(right_usage);
-
-                    if new_diff < old_diff && left_usage <= usable_space {
-                        distribution[i] += 1;
-                        distribution[i + 1] -= 1;
-                        page_sizes[i] = left_usage;
-                        page_sizes[i + 1] = right_usage;
-                        changed = true;
-                    } else {
-                        break;
-                    }
-                }
-            }
-            if !changed {
+    // Pass 2: equalize adjacent pages, right-most boundary first, so each
+    // boundary sees the already-adjusted size of the page to its right.
+    let page_count = ends.len();
+    let pointer_size = usize::from(CELL_POINTER_SIZE);
+    for right in (1..page_count).rev() {
+        let left = right - 1;
+        let left_start = if left == 0 { 0 } else { ends[left - 1] + 1 };
+        let mut size_left = sizes[left];
+        let mut size_right = sizes[right];
+        // Matching SQLite, the right-most page may end up one cell pointer
+        // larger than its left neighbour; inner pages may not.
+        let slack = if right == page_count - 1 {
+            pointer_size
+        } else {
+            0
+        };
+        // The left page must keep at least one cell.
+        while ends[left] > left_start + 1 {
+            let promoted = ends[left] - 1;
+            let demoted = ends[left];
+            let right_after = size_right + costs[demoted];
+            let left_after = size_left - costs[promoted];
+            if size_right != 0 && right_after > left_after + slack {
                 break;
             }
+            size_right = right_after;
+            size_left = left_after;
+            ends[left] = promoted;
         }
+        if size_right == 0 {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "balance: interior distribution cannot populate page {right} without \
+                     emptying page {left}"
+                ),
+            });
+        }
+        sizes[left] = size_left;
+        sizes[right] = size_right;
+    }
+
+    let mut distribution: Vec<usize> = Vec::with_capacity(page_count);
+    let mut page_start = 0usize;
+    for &end in &ends {
+        distribution.push(end - page_start);
+        page_start = end + 1;
     }
 
     let logical_cells: usize = distribution.iter().sum();
@@ -4636,6 +4593,83 @@ mod tests {
             dist.iter().sum::<usize>() + dist.len() - 1,
             cells.len(),
             "interior distribution must account for promoted divider cells"
+        );
+    }
+
+    /// GH#521: three packed index leaves plus their two parent dividers and
+    /// one overflow cell. Each cell costs 500 bytes, so a leaf (4088 bytes of
+    /// content space) holds 8. Left-packing alone yields `[8, 8, 7, 1]`, and
+    /// with the insert hot spot on the leftmost leaf every later overflow
+    /// repeats that split, stranding one single-cell leaf per balance. The
+    /// equalization pass must instead spread the cells as SQLite does.
+    #[test]
+    fn test_distribution_leaf_index_equalizes_left_packed_siblings_gh521() {
+        let cells: Vec<GatheredCell> = (0..27)
+            .map(|_| GatheredCell {
+                data: vec![0; 498],
+                size: 498,
+            })
+            .collect();
+
+        let dist = compute_distribution(&cells, USABLE, 8, BtreePageType::LeafIndex).unwrap();
+        assert_eq!(dist, vec![7, 7, 6, 4]);
+        assert_eq!(dist.iter().sum::<usize>() + dist.len() - 1, cells.len());
+    }
+
+    /// Equalization is driven by the bytes that actually move: shifting a
+    /// boundary demotes the (possibly large) divider onto the right page and
+    /// promotes the left page's last cell. A large divider must therefore stop
+    /// the pass before the right page outgrows the left one.
+    #[test]
+    fn test_distribution_leaf_index_equalization_weighs_divider_bytes() {
+        // Left-pack: page 0 takes cells 0..=6 (7 * 500 = 3500 bytes; the
+        // 2,000-byte cell 7 does not fit), cell 7 is the divider and page 1
+        // holds the two remaining cells (1,000 bytes).
+        let mut cells: Vec<GatheredCell> = (0..10)
+            .map(|_| GatheredCell {
+                data: vec![0; 498],
+                size: 498,
+            })
+            .collect();
+        cells[7] = GatheredCell {
+            data: vec![0; 1_998],
+            size: 1_998,
+        };
+
+        let dist = compute_distribution(&cells, USABLE, 8, BtreePageType::LeafIndex).unwrap();
+        // Shifting once moves the 2,000-byte divider right (page 1 = 3,000
+        // bytes) and promotes a 500-byte cell (page 0 = 3,000 bytes); a second
+        // shift would leave page 1 larger than page 0 and is refused.
+        assert_eq!(dist, vec![6, 3]);
+    }
+
+    /// The equalization never empties a left page, and pages that already fit
+    /// on one page are left alone.
+    #[test]
+    fn test_distribution_interior_equalization_single_page_and_minimum_cells() {
+        let small: Vec<GatheredCell> = (0..6)
+            .map(|_| GatheredCell {
+                data: vec![0; 100],
+                size: 100,
+            })
+            .collect();
+        assert_eq!(
+            compute_distribution(&small, USABLE, 12, BtreePageType::InteriorTable).unwrap(),
+            vec![6]
+        );
+
+        // Three cells that cannot share a page pairwise: each output page can
+        // hold exactly one, so the only valid layout is [1, 1] with the middle
+        // cell promoted.
+        let wide: Vec<GatheredCell> = (0..3)
+            .map(|_| GatheredCell {
+                data: vec![0; 2_500],
+                size: 2_500,
+            })
+            .collect();
+        assert_eq!(
+            compute_distribution(&wide, USABLE, 8, BtreePageType::LeafIndex).unwrap(),
+            vec![1, 1]
         );
     }
 

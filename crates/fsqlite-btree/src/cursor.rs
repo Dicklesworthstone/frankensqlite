@@ -16169,6 +16169,80 @@ mod tests {
         });
     }
 
+    /// GH#521: an index B-tree fed keys that sort before everything already in
+    /// it (descending inserts, or any insert hot spot left of full siblings)
+    /// must keep its leaves dense. Before index leaves got the divider-aware
+    /// equalization pass, every balance left-packed the first three siblings,
+    /// the next insert overflowed the leftmost leaf again, and 12,000
+    /// descending keys produced thousands of single-cell leaves.
+    #[test]
+    fn test_cursor_index_descending_inserts_keep_leaves_dense_gh521() {
+        const KEYS: usize = 12_000;
+        // 7-byte keys: 1-byte payload-length varint + 7 payload bytes, plus
+        // a 2-byte cell pointer. A 4096-byte leaf (8-byte header) holds 408.
+        const FULL_LEAF_CELLS: usize = (4096 - 8) / 10;
+
+        async fn insert_and_measure(keys: impl Iterator<Item = usize>) -> (usize, usize, usize) {
+            let root = pn(2);
+            let store = MemPageStore::with_empty_index(root, USABLE);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(store, root, USABLE, false);
+            for idx in keys {
+                let key = format!("k{idx:06}");
+                cursor.index_insert(&cx, key.as_bytes()).await.unwrap();
+            }
+            validate_index_tree_invariants(&mut cursor, root)
+                .await
+                .expect("index tree must satisfy structural invariants");
+            let scanned = scan_all_index_keys(&mut cursor, &cx).await.unwrap();
+            let expected: Vec<Vec<u8>> = (0..KEYS)
+                .map(|idx| format!("k{idx:06}").into_bytes())
+                .collect();
+            assert_eq!(scanned, expected, "every key must be present exactly once");
+
+            let mut pages = BTreeSet::new();
+            collect_reachable_pages(&cursor.pager, root, USABLE, &mut pages);
+            let (mut leaves, mut min_cells, mut leaf_cells) = (0usize, usize::MAX, 0usize);
+            for page_no in pages {
+                let page = cursor.pager.pages.get(&page_no).unwrap();
+                let header = BtreePageHeader::parse(page, 0).unwrap();
+                if header.page_type.is_leaf() {
+                    leaves += 1;
+                    min_cells = min_cells.min(usize::from(header.cell_count));
+                    leaf_cells += usize::from(header.cell_count);
+                }
+            }
+            assert!(leaf_cells <= KEYS);
+            (leaves, min_cells, leaf_cells)
+        }
+
+        run_async(async {
+            let fewest_leaves = KEYS.div_ceil(FULL_LEAF_CELLS);
+
+            let (leaves, min_cells, _) = insert_and_measure((0..KEYS).rev()).await;
+            assert!(
+                min_cells >= FULL_LEAF_CELLS / 4,
+                "descending inserts left a leaf with only {min_cells} cells ({leaves} leaves)"
+            );
+            assert!(
+                leaves <= fewest_leaves * 5 / 2,
+                "descending inserts used {leaves} leaves; {fewest_leaves} would be fully packed"
+            );
+
+            // Ascending appends were already dense; equalization must not
+            // make them sparse.
+            let (leaves, min_cells, _) = insert_and_measure(0..KEYS).await;
+            assert!(
+                min_cells >= FULL_LEAF_CELLS / 4,
+                "ascending inserts left a leaf with only {min_cells} cells ({leaves} leaves)"
+            );
+            assert!(
+                leaves <= fewest_leaves * 3 / 2,
+                "ascending inserts used {leaves} leaves; {fewest_leaves} would be fully packed"
+            );
+        });
+    }
+
     #[test]
     fn test_cursor_index_delete_removes_interior_separator_key() {
         run_async(async {
