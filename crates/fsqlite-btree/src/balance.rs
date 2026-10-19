@@ -1834,11 +1834,14 @@ fn validate_distribution(
             });
         }
 
-        let payload_bytes = cells[cursor..slice_end]
+        let required = cells[cursor..slice_end]
             .iter()
-            .map(|c| c.data.len())
-            .sum::<usize>();
-        let required = hdr_size + count * CELL_POINTER_SIZE as usize + payload_bytes;
+            .try_fold(hdr_size, |used, cell| {
+                cell_cost(cell).and_then(|cost| used.checked_add(cost))
+            })
+            .ok_or_else(|| {
+                FrankenError::internal(format!("balance: distribution page {} size overflow", i))
+            })?;
         if required > usable_space {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(
@@ -2371,95 +2374,41 @@ async fn split_overflowing_root<W: PageWriter>(
     let root_right_child = right_child.ok_or_else(|| FrankenError::DatabaseCorrupt {
         detail: format!("overflowing root {} missing right child", root_page_no),
     })?;
-    let mut chosen_ranges: Option<Vec<(usize, usize)>> = None;
-    let mut chosen_dividers: Option<Vec<Vec<u8>>> = None;
-    let mut chosen_right_children: Option<Vec<PageNumber>> = None;
-
-    for child_count in 2usize..=8usize {
-        if final_cells.len() < child_count.saturating_mul(2).saturating_sub(1) {
-            break;
-        }
-
-        let divider_indices: Vec<usize> = (1..child_count)
-            .map(|k| k.saturating_mul(final_cells.len()) / child_count)
-            .collect();
-
-        let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(child_count);
-        let mut dividers: Vec<Vec<u8>> = Vec::with_capacity(child_count.saturating_sub(1));
-        let mut right_children: Vec<PageNumber> = Vec::with_capacity(child_count);
-
-        let mut start = 0usize;
-        let mut valid = true;
-
-        for &divider_idx in &divider_indices {
-            if divider_idx <= start || divider_idx >= final_cells.len() {
-                valid = false;
-                break;
-            }
-
-            let segment = &final_cells[start..divider_idx];
-            if segment.is_empty() {
-                valid = false;
-                break;
-            }
-
-            let divider = &final_cells[divider_idx].data;
-            if divider.len() < 4 {
-                valid = false;
-                break;
-            }
-
-            let raw = u32::from_be_bytes([divider[0], divider[1], divider[2], divider[3]]);
-            let Some(rc) = PageNumber::new(raw) else {
-                valid = false;
-                break;
-            };
-
-            ranges.push((start, divider_idx));
+    // Newly promoted index keys can be much larger than the separators they
+    // replace. A midpoint by cell count can leave one child overfull even
+    // though the same cells admit a valid byte-balanced split.
+    let distribution = compute_interior_distribution(
+        final_cells,
+        usable_size,
+        usize::from(page_type.header_size()),
+    )?;
+    let mut ranges = Vec::with_capacity(distribution.len());
+    let mut dividers = Vec::with_capacity(distribution.len().saturating_sub(1));
+    let mut right_children = Vec::with_capacity(distribution.len());
+    let mut start = 0usize;
+    for (i, &count) in distribution.iter().enumerate() {
+        let end = start + count;
+        ranges.push((start, end));
+        if i + 1 < distribution.len() {
+            let divider = &final_cells[end].data;
+            let child_bytes: [u8; 4] = divider
+                .get(..4)
+                .and_then(|bytes| bytes.try_into().ok())
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: format!("overflowing root {} has truncated divider", root_page_no),
+                })?;
+            let child = PageNumber::new(u32::from_be_bytes(child_bytes)).ok_or_else(|| {
+                FrankenError::DatabaseCorrupt {
+                    detail: format!("overflowing root {} has zero divider child", root_page_no),
+                }
+            })?;
+            right_children.push(child);
             dividers.push(divider.clone());
-            right_children.push(rc);
-
-            start = divider_idx + 1;
+            start = end + 1;
+        } else {
+            right_children.push(root_right_child);
         }
-
-        if !valid || start >= final_cells.len() {
-            continue;
-        }
-        ranges.push((start, final_cells.len()));
-        if ranges.last().is_some_and(|(s, e)| s == e) {
-            continue;
-        }
-        right_children.push(root_right_child);
-
-        if ranges.len() != child_count
-            || dividers.len() != child_count.saturating_sub(1)
-            || right_children.len() != child_count
-        {
-            continue;
-        }
-
-        chosen_ranges = Some(ranges);
-        chosen_dividers = Some(dividers);
-        chosen_right_children = Some(right_children);
-        break;
     }
-
-    let ranges = chosen_ranges.ok_or_else(|| FrankenError::DatabaseCorrupt {
-        detail: format!(
-            "unable to choose split points for overflowing root {} with {} cells",
-            root_page_no,
-            final_cells.len()
-        ),
-    })?;
-    let mut dividers = chosen_dividers.ok_or_else(|| FrankenError::DatabaseCorrupt {
-        detail: format!("missing divider set for overflowing root {}", root_page_no),
-    })?;
-    let right_children = chosen_right_children.ok_or_else(|| FrankenError::DatabaseCorrupt {
-        detail: format!(
-            "missing right-child set for overflowing root {}",
-            root_page_no
-        ),
-    })?;
 
     let child_count = ranges.len();
     let mut child_pgnos: Vec<PageNumber> = Vec::with_capacity(child_count);
@@ -4673,6 +4622,96 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_distribution_index_exchanges_different_sized_dividers() {
+        let mut cells = fixed_cost_cells(5, 98);
+        cells.extend(fixed_cost_cells(1, 8));
+        cells.extend(fixed_cost_cells(1, 98));
+
+        let dist = compute_distribution(&cells, 512, 8, BtreePageType::LeafIndex).unwrap();
+        assert_eq!(dist, vec![3, 3]);
+        // The 10-byte old separator moves onto the right page. The new parent
+        // separator is a different, 100-byte cell, excluded from both leaves.
+        let left = build_page(&cells[..3], BtreePageType::LeafIndex, 0, 512, 512, None)
+            .expect("left page fits");
+        let right = build_page(&cells[4..], BtreePageType::LeafIndex, 0, 512, 512, None)
+            .expect("right page fits");
+        let left_header = BtreePageHeader::parse(&left, 0).unwrap();
+        let right_header = BtreePageHeader::parse(&right, 0).unwrap();
+        assert_eq!(left_header.cell_content_offset, 218);
+        assert_eq!(right_header.cell_content_offset, 308);
+    }
+
+    #[test]
+    fn test_distribution_index_demotion_cannot_overfill_destination() {
+        let mut cells = fixed_cost_cells(4, 98);
+        cells.extend(fixed_cost_cells(1, 92));
+        cells.extend(fixed_cost_cells(1, 1));
+        cells.extend(fixed_cost_cells(1, 98));
+        cells.extend(fixed_cost_cells(5, 80));
+
+        // The left page uses 508 bytes and the right uses 418. Promoting the
+        // tiny last-left cell removes 6 bytes, but demoting the separator adds
+        // 100 bytes on the right. The byte imbalance would improve, yet the
+        // resulting 518-byte page must be rejected.
+        let dist = compute_distribution(&cells, 512, 8, BtreePageType::LeafIndex).unwrap();
+        assert_eq!(dist, vec![6, 5]);
+    }
+
+    #[test]
+    fn test_distribution_validation_accounts_for_minimum_cell_allocation() {
+        let cells = fixed_cost_cells(85, 1);
+        let err = validate_distribution(&cells, &[85], 8, 512, false)
+            .expect_err("85 minimum-size cells need 518 bytes including the header");
+        assert!(err.to_string().contains("requires 518 bytes"));
+        assert!(build_page(&cells, BtreePageType::LeafIndex, 0, 512, 512, None).is_err());
+
+        let dist = compute_distribution(&cells, 512, 8, BtreePageType::LeafIndex).unwrap();
+        assert_eq!(dist, vec![42, 42]);
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn test_distribution_variable_index_cells_fit_real_page_layouts(
+            sizes in proptest::collection::vec(1usize..=100, 0..250),
+            interior in proptest::bool::ANY,
+        ) {
+            let page_type = if interior {
+                BtreePageType::InteriorIndex
+            } else {
+                BtreePageType::LeafIndex
+            };
+            let hdr_size = usize::from(page_type.header_size());
+            let cells: Vec<GatheredCell> = sizes.iter().map(|&size| GatheredCell {
+                data: vec![0x5A; size],
+                size: u16::try_from(size).unwrap(),
+            }).collect();
+            let dist = compute_distribution(&cells, 512, hdr_size, page_type).unwrap();
+            proptest::prop_assert_eq!(
+                dist.iter().sum::<usize>() + dist.len() - 1,
+                cells.len(),
+            );
+
+            let mut cursor = 0;
+            for (page_idx, &count) in dist.iter().enumerate() {
+                proptest::prop_assert!(count > 0 || cells.is_empty());
+                let page_cells = &cells[cursor..cursor + count];
+                let page = build_page(
+                    page_cells, page_type, 0, 512, 512, interior.then_some(pn(3)),
+                ).expect("every distributed page fits its actual on-page layout");
+                let header = BtreePageHeader::parse(&page, 0).unwrap();
+                let pointers = read_cell_pointers(&page, &header, 0).unwrap();
+                proptest::prop_assert_eq!(pointers.len(), count);
+                for (cell, ptr) in page_cells.iter().zip(pointers) {
+                    let start = usize::from(ptr);
+                    proptest::prop_assert_eq!(&page[start..start + cell.data.len()], &cell.data);
+                }
+                cursor += count + usize::from(page_idx + 1 < dist.len());
+            }
+            proptest::prop_assert_eq!(cursor, cells.len());
+        }
+    }
+
     // -- compute_sibling_range tests --
 
     #[test]
@@ -4868,7 +4907,183 @@ mod tests {
                     actual.windows(2).all(|pair| pair[0] < pair[1]),
                     "balanced index must stay strictly ordered without duplicates"
                 );
+                let mut leaf_count = 0;
+                for (&page_no, page) in &store.pages {
+                    let header = BtreePageHeader::parse(page, 0).expect("parse balanced page");
+                    if header.page_type == BtreePageType::LeafIndex {
+                        leaf_count += 1;
+                        assert!(
+                            header.cell_count >= 4,
+                            "balanced leaf {page_no} must be at least half full, got {} cells",
+                            header.cell_count
+                        );
+                    }
+                }
+                assert_eq!(
+                    leaf_count, 4,
+                    "one overflow splits three full leaves into four"
+                );
             }
+        });
+    }
+
+    #[test]
+    fn test_split_overflowing_index_root_with_clustered_large_keys() {
+        run_async(async {
+            let read_cells = |page: &[u8]| {
+                let header = BtreePageHeader::parse(page, 0).unwrap();
+                assert_eq!(header.page_type, BtreePageType::InteriorIndex);
+                let cells: Vec<Vec<u8>> = read_cell_pointers(page, &header, 0)
+                    .unwrap()
+                    .into_iter()
+                    .map(|ptr| {
+                        let start = usize::from(ptr);
+                        let cell = CellRef::parse(page, start, header.page_type, USABLE).unwrap();
+                        let end = start + cell_on_page_size_from_ref(&cell, start);
+                        page[start..end].to_vec()
+                    })
+                    .collect();
+                (header, cells)
+            };
+            let cx = Cx::new();
+            for large_keys_on_left in [true, false] {
+                let cells: Vec<GatheredCell> = (0_u16..83)
+                    .map(|ordinal| {
+                        let large = if large_keys_on_left {
+                            ordinal < 5
+                        } else {
+                            ordinal >= 78
+                        };
+                        let mut key = vec![0u8; if large { 1_002 } else { 5 }];
+                        key[..2].copy_from_slice(&ordinal.to_be_bytes());
+                        let mut data = pn(1_000 + u32::from(ordinal)).get().to_be_bytes().to_vec();
+                        data.extend(build_leaf_index_cell(&key));
+                        GatheredCell {
+                            size: u16::try_from(data.len()).unwrap(),
+                            data,
+                        }
+                    })
+                    .collect();
+                // Replacing two tiny parent dividers with large keys can turn
+                // a fitting 4,002-byte root into this 5,998-byte overflow.
+                // Splitting the 83 keys at their midpoint overflows one child.
+                assert!(!page_fits(&cells, BtreePageType::InteriorIndex, 0, USABLE));
+                let midpoint = cells.len() / 2;
+                assert!(
+                    !page_fits(&cells[..midpoint], BtreePageType::InteriorIndex, 0, USABLE)
+                        || !page_fits(
+                            &cells[midpoint + 1..],
+                            BtreePageType::InteriorIndex,
+                            0,
+                            USABLE
+                        )
+                );
+
+                let mut store = MemPageStore::new(20);
+                split_overflowing_root(
+                    &cx,
+                    &mut store,
+                    pn(2),
+                    USABLE,
+                    USABLE,
+                    0,
+                    BtreePageType::InteriorIndex,
+                    &[],
+                    &cells,
+                    Some(pn(1_083)),
+                )
+                .await
+                .expect("clustered long keys admit a byte-balanced root split");
+
+                let (root_header, root_cells) = read_cells(store.pages.get(&2).unwrap());
+                assert_eq!(
+                    root_cells.len(),
+                    1,
+                    "two children suffice for this overflow"
+                );
+                let children: Vec<PageNumber> = root_cells
+                    .iter()
+                    .map(|cell| pn(u32::from_be_bytes(cell[..4].try_into().unwrap())))
+                    .chain(std::iter::once(root_header.right_child.unwrap()))
+                    .collect();
+                let mut recovered = Vec::new();
+                for (i, child) in children.iter().enumerate() {
+                    let (header, child_cells) = read_cells(store.pages.get(&child.get()).unwrap());
+                    assert!(!child_cells.is_empty());
+                    recovered.extend(child_cells);
+                    if let Some(divider) = root_cells.get(i) {
+                        let mut restored_divider = divider.clone();
+                        restored_divider[..4]
+                            .copy_from_slice(&header.right_child.unwrap().get().to_be_bytes());
+                        recovered.push(restored_divider);
+                    } else {
+                        assert_eq!(header.right_child, Some(pn(1_083)));
+                    }
+                }
+                let expected: Vec<Vec<u8>> = cells.into_iter().map(|cell| cell.data).collect();
+                assert_eq!(
+                    recovered, expected,
+                    "keys and every grandchild pointer survive"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn test_split_overflowing_page_one_root_preserves_prefix_with_single_child() {
+        run_async(async {
+            let cells: Vec<GatheredCell> = (1_u32..=520)
+                .map(|ordinal| {
+                    let data = build_interior_table_cell(pn(1_000 + ordinal), i64::from(ordinal));
+                    GatheredCell {
+                        size: u16::try_from(data.len()).unwrap(),
+                        data,
+                    }
+                })
+                .collect();
+            assert!(!page_fits(
+                &cells,
+                BtreePageType::InteriorTable,
+                100,
+                USABLE
+            ));
+            assert!(page_fits(&cells, BtreePageType::InteriorTable, 0, USABLE));
+            let prefix = [0xAB; 100];
+            let mut store = MemPageStore::new(20);
+            split_overflowing_root(
+                &Cx::new(),
+                &mut store,
+                pn(1),
+                USABLE,
+                USABLE,
+                100,
+                BtreePageType::InteriorTable,
+                &prefix,
+                &cells,
+                Some(pn(2_000)),
+            )
+            .await
+            .expect("page-one header overflow needs only one full child");
+
+            let root = store.pages.get(&1).unwrap();
+            assert_eq!(&root[..100], &prefix);
+            let header = BtreePageHeader::parse(root, 100).unwrap();
+            assert_eq!(header.cell_count, 0);
+            let child = store.pages.get(&header.right_child.unwrap().get()).unwrap();
+            let expected = build_page(
+                &cells,
+                BtreePageType::InteriorTable,
+                0,
+                USABLE,
+                USABLE,
+                Some(pn(2_000)),
+            )
+            .unwrap();
+            assert_eq!(
+                child, &expected,
+                "all cells and child pointers survive deepening"
+            );
+            assert_eq!(store.pages.len(), 2);
         });
     }
 
