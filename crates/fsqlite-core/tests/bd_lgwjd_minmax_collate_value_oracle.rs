@@ -141,3 +141,32 @@ fn bd_lgwjd_max_collation_tie_break_is_first_wins() {
         .await;
     });
 }
+
+#[test]
+fn gh512_tied_minmax_integer_vs_real_preserves_first_seen_storage_class() {
+    asupersync::test_utils::run_test(|| async {
+        assert_frank_matches_stock(
+            &[
+                "CREATE TABLE int_first(id INTEGER PRIMARY KEY, v ANY);",
+                "CREATE TABLE real_first(id INTEGER PRIMARY KEY, v ANY);",
+            ],
+            &[
+                "INSERT INTO int_first VALUES (1, 1), (2, 1.0);",
+                "INSERT INTO real_first VALUES (1, 1.0), (2, 1);",
+            ],
+            &[
+                "SELECT typeof(max(v)), typeof(min(v)) FROM int_first;",
+                "SELECT typeof(max(v)), typeof(min(v)) FROM real_first;",
+                "SELECT typeof(max(v)), id FROM int_first;",
+                "SELECT typeof(min(v)), id FROM int_first;",
+                "SELECT typeof(max(v)), id FROM real_first;",
+                "SELECT typeof(min(v)), id FROM real_first;",
+                "SELECT typeof(max(v)), typeof(min(v)) FROM int_first GROUP BY 1=1;",
+                "SELECT typeof(max(v)), typeof(min(v)) FROM real_first GROUP BY 1=1;",
+                "SELECT typeof(max(1, 1.0)), typeof(max(1.0, 1)), typeof(min(1, 1.0)), typeof(min(1.0, 1));",
+            ],
+        )
+        .await;
+    });
+}
+

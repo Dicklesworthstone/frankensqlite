@@ -1321,6 +1321,15 @@ impl VfsFile for IoUringFile {
         self.write_data_path(cx, buf, offset)
     }
 
+    fn write_owned<'a>(
+        &'a self,
+        cx: &'a Cx,
+        buf: Vec<u8>,
+        offset: u64,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        self.write_data_path_owned(cx, buf, offset)
+    }
+
     fn write_tracked<'a>(
         &'a self,
         cx: &'a Cx,
@@ -1329,6 +1338,16 @@ impl VfsFile for IoUringFile {
         completion: VfsWriteCompletion,
     ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
         self.write_data_path_tracked(cx, buf, offset, completion)
+    }
+
+    fn write_owned_tracked<'a>(
+        &'a self,
+        cx: &'a Cx,
+        buf: Vec<u8>,
+        offset: u64,
+        completion: VfsWriteCompletion,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        self.write_data_path_owned_tracked(cx, buf, offset, completion)
     }
 
     fn truncate(&mut self, cx: &Cx, size: u64) -> Result<()> {
@@ -1849,6 +1868,166 @@ impl IoUringFile {
                     format!(
                         "tracked async io_uring write completed only {bytes_written} of {} bytes",
                         buf.len()
+                    ),
+                )));
+            }
+            DriverCompletion::Cancelled => return Err(FrankenError::Abort),
+            DriverCompletion::Failed(error) => return Err(FrankenError::Io(error)),
+            DriverCompletion::Read { .. } => {
+                return Err(FrankenError::Io(io::Error::other(
+                    "shared io_uring returned a read completion for a tracked write request",
+                )));
+            }
+        }
+
+        // The CQE driver has already set Success. A cancellation observed here
+        // must not erase proof that the bytes reached the completion source.
+        checkpoint_or_abort(cx)?;
+
+        let elapsed = start.elapsed();
+        if record_io_uring_write_latency(elapsed) {
+            let snapshot = io_uring_latency_snapshot();
+            enforce_conformal_breach_policy(
+                &self.runtime,
+                "write",
+                elapsed,
+                snapshot.write_conformal_upper_bound_us,
+                IO_URING_WRITE_CONFORMAL_BREACH_MSG,
+            );
+        }
+        Ok(())
+    }
+
+    async fn write_data_path_owned(&self, cx: &Cx, buf: Vec<u8>, offset: u64) -> Result<()> {
+        checkpoint_or_abort(cx)?;
+        if buf.is_empty() {
+            return Ok(());
+        }
+        if !self.runtime.is_available() {
+            record_io_uring_write_unix_fallback();
+            return self.inner.write_owned(cx, buf, offset).await;
+        }
+        // See `read_data_path`: do not substitute `NativeCx::current()` here.
+        if cx.attached_native_cx().is_none() {
+            record_io_uring_write_unix_fallback();
+            return self.inner.write_owned(cx, buf, offset).await;
+        }
+        self.write_data_path(cx, &buf, offset).await
+    }
+
+    async fn write_data_path_owned_tracked(
+        &self,
+        cx: &Cx,
+        buf: Vec<u8>,
+        offset: u64,
+        completion: VfsWriteCompletion,
+    ) -> Result<()> {
+        if let Err(error) = checkpoint_or_abort(cx) {
+            completion.complete_error();
+            return Err(error);
+        }
+        if buf.is_empty() {
+            completion.complete_success();
+            return Ok(());
+        }
+        if !self.runtime.is_available() {
+            record_io_uring_write_unix_fallback();
+            return self
+                .inner
+                .write_owned_tracked(cx, buf, offset, completion)
+                .await;
+        }
+        // See `read_data_path`: do not substitute `NativeCx::current()` here.
+        let Some(native_cx) = cx.attached_native_cx() else {
+            record_io_uring_write_unix_fallback();
+            return self
+                .inner
+                .write_owned_tracked(cx, buf, offset, completion)
+                .await;
+        };
+        let expected_len = buf.len();
+        if u32::try_from(expected_len).is_err() {
+            record_io_uring_write_unix_fallback();
+            return self
+                .inner
+                .write_owned_tracked(cx, buf, offset, completion)
+                .await;
+        }
+        let write_range_is_valid = u64::try_from(expected_len)
+            .ok()
+            .and_then(|len| offset.checked_add(len))
+            .is_some();
+        if !write_range_is_valid {
+            completion.complete_error();
+            return Err(FrankenError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "offset overflow during tracked async io_uring write",
+            )));
+        }
+        let file = match self.inner.canonical_file() {
+            Ok(file) => file,
+            Err(error) => {
+                completion.complete_error();
+                return Err(error);
+            }
+        };
+
+        #[cfg(test)]
+        if FORCE_ASUPERSYNC_WRITE_ABORT.load(Ordering::Acquire) {
+            completion.complete_error();
+            return Err(FrankenError::Abort);
+        }
+
+        #[cfg(test)]
+        if FORCE_ASUPERSYNC_WRITE_FAIL.load(Ordering::Acquire) {
+            self.runtime.disable(IO_URING_WRITE_ERROR_FALLBACK_MSG);
+            record_io_uring_write_unix_fallback();
+            return self
+                .inner
+                .write_owned_tracked(cx, buf, offset, completion)
+                .await;
+        }
+
+        let start = Instant::now();
+        let enqueue_result =
+            self.runtime
+                .enqueue_write(cx, &native_cx, file, buf, offset, Some(completion.clone()));
+        let (request_id, mut receiver) = match enqueue_result {
+            Ok(request) => request,
+            Err(error) => {
+                completion.complete_error();
+                return Err(error);
+            }
+        };
+        let mut cancel_guard = RequestCancellationGuard::new(Arc::clone(&self.runtime), request_id);
+        asupersync::runtime::yield_now().await;
+        if let Err(error) = self.runtime.ensure_driver(&native_cx) {
+            drop(cancel_guard);
+            return Err(FrankenError::Io(io::Error::other(format!(
+                "cannot start tracked shared io_uring write: {error}"
+            ))));
+        }
+
+        let driver_completion = receiver
+            .recv(&native_cx)
+            .await
+            .map_err(|error| match error {
+                oneshot::RecvError::Cancelled => FrankenError::Abort,
+                oneshot::RecvError::Closed | oneshot::RecvError::PolledAfterCompletion => {
+                    FrankenError::Io(io::Error::other(format!(
+                        "tracked shared io_uring response channel failed: {error}"
+                    )))
+                }
+            })?;
+        cancel_guard.disarm();
+
+        match driver_completion {
+            DriverCompletion::Write { bytes_written } if bytes_written == expected_len => {}
+            DriverCompletion::Write { bytes_written } => {
+                return Err(FrankenError::Io(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    format!(
+                        "tracked async io_uring write completed only {bytes_written} of {expected_len} bytes"
                     ),
                 )));
             }

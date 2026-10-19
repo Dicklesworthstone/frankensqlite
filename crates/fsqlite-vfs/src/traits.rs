@@ -1284,6 +1284,35 @@ pub trait VfsFile: Send + Sync {
         }
     }
 
+    /// Write an owned `buf` starting at byte offset `offset`.
+    ///
+    /// Backends that dispatch large writes onto a blocking thread pool or async
+    /// submission ring can override this method to move `buf` directly into the
+    /// worker without allocating and copying a second `Vec<u8>`.
+    fn write_owned<'a>(
+        &'a self,
+        cx: &'a Cx,
+        buf: Vec<u8>,
+        offset: u64,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        async move { self.write(cx, &buf, offset).await }
+    }
+
+    /// Write an owned `buf` and report terminal side-effect completion through `completion`.
+    ///
+    /// Backends that dispatch large writes onto a blocking thread pool or async
+    /// submission ring can override this method to move `buf` directly into the
+    /// worker without allocating and copying a second `Vec<u8>`.
+    fn write_owned_tracked<'a>(
+        &'a self,
+        cx: &'a Cx,
+        buf: Vec<u8>,
+        offset: u64,
+        completion: VfsWriteCompletion,
+    ) -> impl std::future::Future<Output = Result<()>> + Send + 'a {
+        async move { self.write_tracked(cx, &buf, offset, completion).await }
+    }
+
     /// Write multiple page-sized buffers in one logical operation.
     ///
     /// The default implementation preserves existing semantics by issuing the

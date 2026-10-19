@@ -1345,6 +1345,54 @@ impl<F: VfsFile> WalFile<F> {
         .await
     }
 
+    /// Append a finalized frame batch by moving the owned byte buffer into the VFS write.
+    ///
+    /// Pre-write validations run before taking `prepared_frame_bytes`, so a preflight
+    /// validation error leaves the caller's buffer intact.
+    pub async fn append_finalized_prepared_frame_bytes_owned(
+        &mut self,
+        cx: &Cx,
+        prepared_frame_bytes: &mut Vec<u8>,
+        frame_count: usize,
+        final_running_checksum: SqliteWalChecksum,
+        last_commit_offset: Option<usize>,
+    ) -> Result<()> {
+        self.append_finalized_prepared_frame_bytes_owned_with_completion(
+            cx,
+            prepared_frame_bytes,
+            frame_count,
+            final_running_checksum,
+            last_commit_offset,
+            None,
+        )
+        .await
+    }
+
+    /// Append a finalized frame batch by moving the owned byte buffer into the VFS write
+    /// while retaining source-level write proof.
+    ///
+    /// Pre-write validations run before taking `prepared_frame_bytes`, so a preflight
+    /// validation error leaves the caller's buffer intact.
+    pub async fn append_finalized_prepared_frame_bytes_owned_tracked(
+        &mut self,
+        cx: &Cx,
+        prepared_frame_bytes: &mut Vec<u8>,
+        frame_count: usize,
+        final_running_checksum: SqliteWalChecksum,
+        last_commit_offset: Option<usize>,
+        completion: VfsWriteCompletion,
+    ) -> Result<()> {
+        self.append_finalized_prepared_frame_bytes_owned_with_completion(
+            cx,
+            prepared_frame_bytes,
+            frame_count,
+            final_running_checksum,
+            last_commit_offset,
+            Some(&completion),
+        )
+        .await
+    }
+
     /// Validate commit metadata after the caller checks frame count and byte length.
     fn validated_prepared_commit_header(
         &self,
@@ -1495,6 +1543,111 @@ impl<F: VfsFile> WalFile<F> {
         let bytes_written = u64::try_from(frame_count)
             .unwrap_or(u64::MAX)
             .saturating_mul(bytes_per_frame);
+        let span = tracing::span!(
+            tracing::Level::DEBUG,
+            "wal_batch_write",
+            start_frame_index = start_frame_index,
+            frames_written = frame_count,
+            bytes_written = bytes_written,
+        );
+        let _guard = span.enter();
+
+        debug!(
+            end_frame_count = self.frame_count,
+            frames_written = frame_count,
+            "WAL frames appended in batch"
+        );
+
+        for _ in 0..frame_count {
+            crate::metrics::GLOBAL_WAL_METRICS.record_frame_write(bytes_per_frame);
+        }
+
+        Ok(())
+    }
+
+    async fn append_finalized_prepared_frame_bytes_owned_with_completion(
+        &mut self,
+        cx: &Cx,
+        prepared_frame_bytes: &mut Vec<u8>,
+        frame_count: usize,
+        final_running_checksum: SqliteWalChecksum,
+        last_commit_offset: Option<usize>,
+        completion: Option<&VfsWriteCompletion>,
+    ) -> Result<()> {
+        let mut preflight = VfsWritePreflight::new(completion);
+        if frame_count == 0 {
+            if !prepared_frame_bytes.is_empty() || last_commit_offset.is_some() {
+                return Err(FrankenError::WalCorrupt {
+                    detail: "empty prepared batch contains frame bytes or commit metadata"
+                        .to_owned(),
+                });
+            }
+            if let Some(completion) = completion {
+                completion.complete_success();
+            }
+            preflight.hand_off();
+            return Ok(());
+        }
+        // Nothing was written; the preflight terminalizes the completion.
+        self.refuse_append_while_headerless()?;
+
+        let new_count = self
+            .frame_count
+            .checked_add(frame_count)
+            .ok_or(FrankenError::DatabaseFull)?;
+        if new_count > usize::try_from(u32::MAX).unwrap_or(usize::MAX) {
+            return Err(FrankenError::DatabaseFull);
+        }
+
+        let frame_size = self.frame_size();
+        let expected_bytes = frame_count
+            .checked_mul(frame_size)
+            .ok_or(FrankenError::DatabaseFull)?;
+        if prepared_frame_bytes.len() != expected_bytes {
+            return Err(FrankenError::WalCorrupt {
+                detail: format!(
+                    "prepared batch byte length mismatch: expected {expected_bytes}, got {}",
+                    prepared_frame_bytes.len()
+                ),
+            });
+        }
+
+        let start_frame_index = self.frame_count;
+        let offset = self.frame_offset(start_frame_index);
+        let last_commit =
+            self.validated_prepared_commit_header(prepared_frame_bytes, last_commit_offset)?;
+
+        #[cfg(any(test, feature = "fault-injection"))]
+        crate::fault_hooks::maybe_inject_crash_at(
+            crate::fault_hooks::CrashBoundary::BeforeWalFrameAppend,
+            &format!("start_frame={start_frame_index} frame_count={frame_count}"),
+        )?;
+
+        preflight.hand_off();
+        let owned_bytes = std::mem::take(prepared_frame_bytes);
+        if let Some(completion) = completion {
+            self.file
+                .write_owned_tracked(cx, owned_bytes, offset, completion.clone())
+                .await?;
+        } else {
+            self.file.write_owned(cx, owned_bytes, offset).await?;
+        }
+        self.advance_state_after_write(frame_count, final_running_checksum)?;
+        if let Some(last_commit) = last_commit {
+            self.last_commit = Some(last_commit);
+        }
+
+        #[cfg(any(test, feature = "fault-injection"))]
+        crate::fault_hooks::maybe_inject_crash_at(
+            crate::fault_hooks::CrashBoundary::AfterWalFrameAppendBeforeFsync,
+            &format!(
+                "end_frame={} frames_written={frame_count}",
+                self.frame_count
+            ),
+        )?;
+
+        let bytes_per_frame = u64::try_from(frame_size).unwrap_or(u64::MAX);
+        let bytes_written = u64::try_from(expected_bytes).unwrap_or(u64::MAX);
         let span = tracing::span!(
             tracing::Level::DEBUG,
             "wal_batch_write",
@@ -1778,18 +1931,34 @@ impl<F: VfsFile> WalFile<F> {
             }
 
             preflight.hand_off();
-            self.append_finalized_prepared_frame_bytes_with_completion(
-                cx,
-                &frame_scratch,
-                frame_count,
-                running_checksum,
-                last_commit_offset,
-                completion,
-            )
-            .await
+            const MAX_RETAINED_FRAME_SCRATCH_BYTES: usize = 4 * 1024 * 1024;
+            if frame_scratch.capacity() > MAX_RETAINED_FRAME_SCRATCH_BYTES {
+                self.append_finalized_prepared_frame_bytes_owned_with_completion(
+                    cx,
+                    &mut frame_scratch,
+                    frame_count,
+                    running_checksum,
+                    last_commit_offset,
+                    completion,
+                )
+                .await
+            } else {
+                self.append_finalized_prepared_frame_bytes_with_completion(
+                    cx,
+                    &frame_scratch,
+                    frame_count,
+                    running_checksum,
+                    last_commit_offset,
+                    completion,
+                )
+                .await
+            }
         }
         .await;
-        self.frame_scratch = frame_scratch;
+        const MAX_RETAINED_FRAME_SCRATCH_BYTES: usize = 4 * 1024 * 1024;
+        if frame_scratch.capacity() <= MAX_RETAINED_FRAME_SCRATCH_BYTES {
+            self.frame_scratch = frame_scratch;
+        }
 
         #[cfg(any(test, feature = "fault-injection"))]
         if append_result.is_ok() {

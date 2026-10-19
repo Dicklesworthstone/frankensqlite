@@ -2501,6 +2501,19 @@ impl VfsFile for WindowsFile {
         checkpoint_or_abort(cx)
     }
 
+    async fn write_owned(&self, cx: &Cx, buf: Vec<u8>, offset: u64) -> Result<()> {
+        checkpoint_or_abort(cx)?;
+        let file = self.file_ref()?.try_clone().map_err(FrankenError::Io)?;
+        if buf.len() <= INLINE_IO_MAX_BYTES {
+            write_owned_at(&file, &buf, offset)?;
+            return checkpoint_or_abort(cx);
+        }
+        spawn_blocking_io(move || write_owned_at(&file, &buf, offset))
+            .await
+            .map_err(FrankenError::Io)?;
+        checkpoint_or_abort(cx)
+    }
+
     async fn write_tracked(
         &self,
         cx: &Cx,
@@ -2525,6 +2538,34 @@ impl VfsFile for WindowsFile {
         }
         let data = buf.to_vec();
         spawn_blocking_io(move || write_owned_at_tracked(&file, &data, offset, source_completion))
+            .await
+            .map_err(FrankenError::Io)?;
+        checkpoint_or_abort(cx)
+    }
+
+    async fn write_owned_tracked(
+        &self,
+        cx: &Cx,
+        buf: Vec<u8>,
+        offset: u64,
+        completion: VfsWriteCompletion,
+    ) -> Result<()> {
+        let file = match (|| {
+            checkpoint_or_abort(cx)?;
+            self.file_ref()?.try_clone().map_err(FrankenError::Io)
+        })() {
+            Ok(file) => file,
+            Err(error) => {
+                completion.complete_error();
+                return Err(error);
+            }
+        };
+        let source_completion = VfsWriteCompletionSource::new(completion.clone());
+        if buf.len() <= INLINE_IO_MAX_BYTES {
+            write_owned_at_tracked(&file, &buf, offset, source_completion)?;
+            return checkpoint_or_abort(cx);
+        }
+        spawn_blocking_io(move || write_owned_at_tracked(&file, &buf, offset, source_completion))
             .await
             .map_err(FrankenError::Io)?;
         checkpoint_or_abort(cx)

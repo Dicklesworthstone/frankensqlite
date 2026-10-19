@@ -322,6 +322,48 @@ impl<F: VfsFile> VfsFile for TracingFile<F> {
         result
     }
 
+    async fn write_owned(&self, cx: &Cx, buf: Vec<u8>, offset: u64) -> Result<()> {
+        GLOBAL_VFS_METRICS.write_ops.fetch_add(1, Ordering::Relaxed);
+        let bytes = buf.len() as u64;
+        let result = vfs_trace_op!(
+            "write_async",
+            &*self.path,
+            bytes,
+            self.inner.write_owned(cx, buf, offset).await
+        );
+        if result.is_ok() {
+            GLOBAL_VFS_METRICS
+                .write_bytes_total
+                .fetch_add(bytes, Ordering::Relaxed);
+        }
+        result
+    }
+
+    async fn write_owned_tracked(
+        &self,
+        cx: &Cx,
+        buf: Vec<u8>,
+        offset: u64,
+        completion: VfsWriteCompletion,
+    ) -> Result<()> {
+        GLOBAL_VFS_METRICS.write_ops.fetch_add(1, Ordering::Relaxed);
+        let bytes = buf.len() as u64;
+        let result = vfs_trace_op!(
+            "write_async",
+            &*self.path,
+            bytes,
+            self.inner
+                .write_owned_tracked(cx, buf, offset, completion)
+                .await
+        );
+        if result.is_ok() {
+            GLOBAL_VFS_METRICS
+                .write_bytes_total
+                .fetch_add(bytes, Ordering::Relaxed);
+        }
+        result
+    }
+
     fn truncate(&mut self, cx: &Cx, size: u64) -> Result<()> {
         GLOBAL_VFS_METRICS
             .truncate_ops

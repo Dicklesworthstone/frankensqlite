@@ -222,3 +222,86 @@ fn a_second_connection_allocates_after_the_rewound_statement_like_stock() {
         .expect("integrity_check");
     assert_eq!(verdict, "ok", "stock integrity_check of the fsqlite file");
 }
+
+#[test]
+fn gh512_post_abort_autocommit_and_conflict_ignored_rowid_matches_stock() {
+    const GH512_STMTS: &[&str] = &[
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, v NOT NULL)",
+        "INSERT INTO t(v) VALUES (10)",
+        // Autocommit single-row constraint abort on empty/existing table
+        "INSERT INTO t(v) VALUES (NULL)",
+        "INSERT INTO t(v) VALUES (20)",
+        // Autocommit multi-row constraint abort (row 1 allocated rowid, row 2 fails NOT NULL)
+        "INSERT INTO t(v) VALUES (30), (NULL)",
+        "INSERT INTO t(v) VALUES (40)",
+        // Implicit rowid table (no INTEGER PRIMARY KEY alias)
+        "CREATE TABLE h(v NOT NULL, u TEXT UNIQUE)",
+        "INSERT INTO h(v, u) VALUES (1, 'a')",
+        "INSERT INTO h(v, u) VALUES (NULL, 'b')",
+        "INSERT INTO h(v, u) VALUES (2, 'b')",
+        // INSERT OR IGNORE / ON CONFLICT DO NOTHING where implicit rowid is allocated then discarded
+        "INSERT OR IGNORE INTO h(v, u) VALUES (3, 'a')",
+        "INSERT INTO h(v, u) VALUES (4, 'c') ON CONFLICT(u) DO NOTHING",
+        "INSERT INTO h(v, u) VALUES (5, 'a') ON CONFLICT(u) DO UPDATE SET v = excluded.v",
+        "INSERT INTO h(v, u) VALUES (6, 'd')",
+    ];
+    const GH512_DUMPS: &[&str] = &[
+        "SELECT id, v FROM t ORDER BY id",
+        "SELECT rowid, v, u FROM h ORDER BY rowid",
+    ];
+
+    let stock_run = || -> Vec<String> {
+        let conn = rusqlite::Connection::open_in_memory().expect("stock open");
+        let mut out = Vec::new();
+        for sql in GH512_STMTS {
+            let status = if conn.execute(sql, []).is_ok() {
+                "ok"
+            } else {
+                "err"
+            };
+            out.push(format!("{sql} => {status}"));
+        }
+        for sql in GH512_DUMPS {
+            let mut stmt = conn.prepare(sql).expect("prepare");
+            let width = stmt.column_count();
+            let mut rows = stmt.query([]).expect("query");
+            let mut rendered = Vec::new();
+            while let Some(r) = rows.next().expect("next") {
+                rendered.push(
+                    (0..width)
+                        .map(|i| render_rusqlite(r.get_ref(i).expect("cell")))
+                        .collect::<Vec<_>>()
+                        .join("|"),
+                );
+            }
+            out.push(format!("{sql} => {rendered:?}"));
+        }
+        out
+    };
+
+    let want = stock_run();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("gh512_rowid.db");
+    let path_str = path.to_str().expect("utf-8").to_owned();
+
+    asupersync::test_utils::run_test(|| async move {
+        for (label, target) in [("in-memory", ":memory:"), ("file-backed", path_str.as_str())] {
+            let conn = Connection::open(target).await.expect("open");
+            let mut got = Vec::new();
+            for sql in GH512_STMTS {
+                let status = if conn.execute(sql).await.is_ok() {
+                    "ok"
+                } else {
+                    "err"
+                };
+                got.push(format!("{sql} => {status}"));
+            }
+            for sql in GH512_DUMPS {
+                let rows = conn.query(sql).await.expect("dump");
+                got.push(format!("{sql} => {:?}", render_rows(&rows)));
+            }
+            assert_matches_stock(label, &got, &want);
+        }
+    });
+}
+

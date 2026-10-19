@@ -313,3 +313,54 @@ fn attach_cross_db_queries_match_rusqlite_oracle() {
         );
     });
 }
+
+#[test]
+fn gh511_with_cte_insert_into_attached_table_matches_rusqlite_oracle() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let f_main = dir.path().join("f_main.db");
+        let f_aux = dir.path().join("f_aux.db");
+        let r_main = dir.path().join("r_main.db");
+        let r_aux = dir.path().join("r_aux.db");
+
+        let f = Connection::open(f_main.to_str().unwrap()).await.unwrap();
+        let r = rusqlite::Connection::open(&r_main).unwrap();
+
+        let attach_f = format!("ATTACH '{}' AS aux", f_aux.display());
+        let attach_r = format!("ATTACH '{}' AS aux", r_aux.display());
+        f.execute(&attach_f).await.unwrap();
+        r.execute(&attach_r, []).unwrap();
+
+        for s in [
+            "CREATE TABLE main.src(id INTEGER PRIMARY KEY, label TEXT)",
+            "INSERT INTO main.src VALUES (1, 'one'), (2, 'two'), (3, 'three')",
+            "CREATE TABLE aux.target(a INTEGER, b TEXT)",
+            "CREATE TABLE aux.existing(k INTEGER PRIMARY KEY, mult INTEGER)",
+            "INSERT INTO aux.existing VALUES (1, 10), (2, 20), (3, 30)",
+            // 1. Basic WITH cte AS (...) INSERT INTO aux.target SELECT ... FROM cte
+            "WITH cte(a, b) AS (SELECT 100, 'hundred' UNION ALL SELECT 200, 'two-hundred') \
+             INSERT INTO aux.target SELECT a, b FROM cte",
+            // 2. Recursive CTE into attached table
+            "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 4) \
+             INSERT INTO aux.target SELECT n, 'rec-' || n FROM seq",
+            // 3. Multi-CTE referencing main.src and aux.existing into aux.target
+            "WITH \
+               base AS (SELECT id, label FROM main.src WHERE id <= 2), \
+               scaled AS (SELECT b.id * e.mult AS val, b.label || ':' || e.mult AS tag \
+                          FROM base b JOIN aux.existing e ON b.id = e.k) \
+             INSERT INTO aux.target SELECT val, tag FROM scaled ORDER BY val",
+        ] {
+            f.execute(s)
+                .await
+                .unwrap_or_else(|e| panic!("frank failed on `{s}`: {e}"));
+            r.execute(s, [])
+                .unwrap_or_else(|e| panic!("stock failed on `{s}`: {e}"));
+        }
+
+        let q = "SELECT a, b FROM aux.target ORDER BY a, b";
+        let fr = fq(&f, q).await;
+        let rr = rq(&r, q);
+        assert_eq!(fr, rr, "GH#511 (bd-fh0r9) mismatch on `{q}`");
+    });
+}
+

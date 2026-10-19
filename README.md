@@ -69,7 +69,7 @@ signature fails closed rather than silently downgrading authenticity.
 | Self-healing storage | No | Native file-backed connections can generate WAL repair symbols asynchronously; automatic FEC recovery is not wired to the compatibility WAL reader |
 | Page-level encryption | No (commercial SEE extension) | Not currently available: the XChaCha20-Poly1305 DEK/KEK implementation exists in `fsqlite-pager`, but no `PRAGMA key`/`rekey` dispatch is wired into `Connection` |
 | SQL dialect | Full | Large and growing subset; parser coverage exceeds full execution parity today |
-| Extensions | FTS3/4/5, R-tree, JSON1, etc. | Extension crates are present; some runtime wiring is still in progress |
+| Extensions | FTS3/4/5, R-tree, JSON1, etc. | FTS5, JSON1, R-tree/geopoly, ICU, and misc (`generate_series`) wired in live engine; session is a library facade; FTS3/4 are helper-level only |
 | Cross-process MVCC | No | Partial (shared-memory coordination, bounded by the measured harness scale) |
 | Embedded, zero-config | Yes | Yes |
 

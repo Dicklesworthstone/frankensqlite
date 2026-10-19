@@ -3766,6 +3766,29 @@ impl VfsFile for UnixFile {
         checkpoint_or_abort(cx)
     }
 
+    async fn write_owned(&self, cx: &Cx, buf: Vec<u8>, offset: u64) -> Result<()> {
+        checkpoint_or_abort(cx)?;
+        checked_io_range(offset, buf.len(), "write")?;
+        let file = Arc::clone(
+            self.file
+                .as_ref()
+                .ok_or_else(|| FrankenError::internal("unix file is closed"))?,
+        );
+        if buf.len() <= INLINE_IO_MAX_BYTES {
+            write_full_at(
+                |chunk, off| file.write_at(chunk, off),
+                &buf,
+                offset,
+                "write",
+            )?;
+            return checkpoint_or_abort(cx);
+        }
+        spawn_blocking_io(move || write_owned_at(file, buf, offset))
+            .await
+            .map_err(FrankenError::Io)?;
+        checkpoint_or_abort(cx)
+    }
+
     async fn write_tracked(
         &self,
         cx: &Cx,
@@ -3806,6 +3829,51 @@ impl VfsFile for UnixFile {
         let data = buf.to_vec();
         let source_completion = VfsWriteCompletionSource::new(completion.clone());
         spawn_blocking_io(move || write_owned_at_tracked(file, data, offset, source_completion))
+            .await
+            .map_err(FrankenError::Io)?;
+        checkpoint_or_abort(cx)
+    }
+
+    async fn write_owned_tracked(
+        &self,
+        cx: &Cx,
+        buf: Vec<u8>,
+        offset: u64,
+        completion: VfsWriteCompletion,
+    ) -> Result<()> {
+        let file = match (|| {
+            checkpoint_or_abort(cx)?;
+            checked_io_range(offset, buf.len(), "write")?;
+            self.file
+                .as_ref()
+                .map(Arc::clone)
+                .ok_or_else(|| FrankenError::internal("unix file is closed"))
+        })() {
+            Ok(file) => file,
+            Err(error) => {
+                completion.complete_error();
+                return Err(error);
+            }
+        };
+        if buf.len() <= INLINE_IO_MAX_BYTES {
+            match write_full_at(
+                |chunk, off| file.write_at(chunk, off),
+                &buf,
+                offset,
+                "write",
+            ) {
+                Ok(()) => {
+                    completion.complete_success();
+                    return checkpoint_or_abort(cx);
+                }
+                Err(error) => {
+                    completion.complete_error();
+                    return Err(error);
+                }
+            }
+        }
+        let source_completion = VfsWriteCompletionSource::new(completion.clone());
+        spawn_blocking_io(move || write_owned_at_tracked(file, buf, offset, source_completion))
             .await
             .map_err(FrankenError::Io)?;
         checkpoint_or_abort(cx)

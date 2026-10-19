@@ -26236,7 +26236,9 @@ impl Connection {
             });
         }
 
-        if bound_visible_commit_seq > memdb_visible_commit_seq {
+        if !self.skip_statement_memdb_refresh.get()
+            && bound_visible_commit_seq > memdb_visible_commit_seq
+        {
             self.discard_cached_vdbe_engine();
             if hot_path_profile_enabled() {
                 FSQLITE_MEMDB_REFRESH_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
@@ -60562,6 +60564,7 @@ impl Connection {
             return Err(error);
         }
         if !is_concurrent
+            && !self.skip_statement_memdb_refresh.get()
             && let Some(bound_visible_commit_seq) = txn.published_visible_commit_seq_hint()
             && bound_visible_commit_seq > *self.memdb_visible_commit_seq.borrow()
             && let Err(error) = self
@@ -82641,11 +82644,13 @@ impl Connection {
                         } = &tc.kind
                         {
                             for (pk_pos, pk_col) in pk_cols.iter().enumerate() {
-                                if let Some((col_name, _)) = normalize_indexed_column_term(pk_col)
+                                if let Some(term) = normalize_indexed_column_term(pk_col)
                                     && let Some(col_idx) = table
                                         .columns
                                         .iter()
-                                        .position(|c| c.name.eq_ignore_ascii_case(&col_name))
+                                        .position(|c| {
+                                            c.name.eq_ignore_ascii_case(&term.column_name)
+                                        })
                                 {
                                     #[allow(clippy::cast_possible_wrap)]
                                     {
@@ -96740,9 +96745,7 @@ impl Connection {
             }
             self.refresh_memdb_from_cached_write_txn_if_stale(&op_cx)
                 .await?;
-            if !self.memdb_rows_loaded.get() || matches!(statement, Statement::Select(_)) {
-                self.reload_memdb_from_pager(&op_cx).await?;
-            }
+            self.reload_memdb_from_pager(&op_cx).await?;
         }
         let installed = self.install_materialized_temp_tables(temp_tables).await?;
         let _installed_guard = MaterializedTablesCleanupGuard::from_tables(self, installed);

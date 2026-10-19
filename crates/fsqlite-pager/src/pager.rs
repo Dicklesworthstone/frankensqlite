@@ -1289,7 +1289,7 @@ trait PendingGroupCommitTxnAttemptOperation: Send + Sync {
     fn complete_authorized_global(
         &self,
         authorization: ParallelWalPublicationAuthorization,
-        complete_group_pages: &HashMap<PageNumber, PageData>,
+        complete_group_pages: &HashMap<PageNumber, &[u8]>,
         group_allocator_delta: &PendingGroupCommitAllocatorDelta,
         apply_allocator_delta: bool,
     ) -> Result<()>;
@@ -2228,8 +2228,8 @@ impl GroupCommitQueue {
         epoch: u64,
         batches: &[TransactionFrameBatch],
         durability_receipt: &ParallelWalDurabilityReceipt,
-        complete_group_pages: &HashMap<PageNumber, PageData>,
-    ) -> Result<()> {
+        complete_group_pages: &HashMap<PageNumber, &[u8]>,
+    ) -> Result<HashSet<*const ()>> {
         let (attempts, registered_for_epoch) = {
             #[cfg(test)]
             record_commit_fast_path_lock(CommitFastPathLockClass::QueueEpochState);
@@ -2311,7 +2311,7 @@ impl GroupCommitQueue {
         for (batch_id, _, _) in attempts {
             registered.remove(&batch_id);
         }
-        Ok(())
+        Ok(normalized_pager_inners)
     }
 
     fn complete_txn_attempts_not_committed(&self, epoch: u64) -> Result<()> {
@@ -3913,7 +3913,7 @@ struct PendingGroupCommitRecovery<F: VfsFile + 'static> {
     wal_backend: WalBackendHandle,
     inner: Arc<Mutex<PagerInner<F>>>,
     published: Option<Arc<PublishedPagerState>>,
-    batches: Vec<TransactionFrameBatch>,
+    batches: Arc<[TransactionFrameBatch]>,
     final_db_size: u32,
     sync: bool,
     sidecar_completion: Arc<Mutex<Option<VfsWriteCompletion>>>,
@@ -3991,7 +3991,7 @@ impl<F: VfsFile + 'static> PendingGroupCommitRecovery<F> {
                 | PendingGroupCommitRecoveryResolution::NotCommittedPendingLogical,
             ) => unreachable!("terminal recovery states returned above"),
         };
-        queue.complete_txn_attempts_authorized(
+        let normalized_pager_inners = queue.complete_txn_attempts_authorized(
             self.epoch,
             &self.batches,
             &receipt,
@@ -4022,11 +4022,14 @@ impl<F: VfsFile + 'static> PendingGroupCommitRecovery<F> {
                 checkpoint_active: inner.checkpoint_active,
             }
         };
-        if let Some(published) = self.published.as_ref() {
+        let self_inner_identity = Arc::as_ptr(&self.inner).cast::<()>();
+        if !normalized_pager_inners.contains(&self_inner_identity)
+            && let Some(published) = self.published.as_ref()
+        {
             published.publish_prepared_parallel_wal_group(
                 cx,
                 publish_update,
-                complete_group_pages,
+                &complete_group_pages,
                 receipt.certificate.commit_seq_lo,
             );
         }
@@ -8899,7 +8902,7 @@ impl<F: VfsFile + 'static> PendingGroupCommitTxnAttemptOperation
     fn complete_authorized_global(
         &self,
         authorization: ParallelWalPublicationAuthorization,
-        complete_group_pages: &HashMap<PageNumber, PageData>,
+        complete_group_pages: &HashMap<PageNumber, &[u8]>,
         group_allocator_delta: &PendingGroupCommitAllocatorDelta,
         apply_allocator_delta: bool,
     ) -> Result<()> {
@@ -8987,7 +8990,7 @@ impl<F: VfsFile + 'static> PendingGroupCommitTxnAttemptOperation
         self.published.publish_prepared_parallel_wal_group(
             &self.cleanup_cx,
             update,
-            complete_group_pages.clone(),
+            complete_group_pages,
             certificate_commit_seq_lo,
         );
         self.published
@@ -12510,6 +12513,42 @@ impl AtomicPublishedPages {
         }
     }
 
+    fn insert_borrowed_batch<'a, I>(&self, pages: I)
+    where
+        I: IntoIterator<Item = (PageNumber, &'a [u8])>,
+    {
+        let mut active_indices = self
+            .active_indices
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut total_added = 0_usize;
+        for (page_no, bytes) in pages {
+            let Some(idx) = self.slot_index(page_no) else {
+                continue;
+            };
+            let page = PageData::from_shared(Arc::<[u8]>::from(bytes));
+            let slot = &self.slots[idx];
+            let mut guard = slot
+                .page
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let inserted = guard.is_none();
+            *guard = Some(page);
+            if inserted {
+                slot.active_pos
+                    .store(active_indices.len(), AtomicOrdering::Relaxed);
+                active_indices.push(idx);
+                total_added = total_added.saturating_add(1);
+            }
+            drop(guard);
+            slot.present.store(true, AtomicOrdering::Release);
+        }
+        if total_added > 0 {
+            self.page_count
+                .fetch_add(total_added, AtomicOrdering::Relaxed);
+        }
+    }
+
     fn len(&self) -> usize {
         self.page_count.load(AtomicOrdering::Acquire)
     }
@@ -12635,6 +12674,28 @@ impl ConcurrentPublishedPages {
         }
     }
 
+    /// Insert multiple borrowed page slices into the overflow plane, allocating
+    /// `PageData` only for entries that are not skipped at capacity.
+    fn insert_borrowed_batch<'a, I>(&self, pages: I)
+    where
+        I: IntoIterator<Item = (PageNumber, &'a [u8])>,
+    {
+        let mut total_added = 0_usize;
+        for (page_no, bytes) in pages {
+            if self.skips_at_capacity(page_no, total_added) {
+                continue;
+            }
+            let page = PageData::from_shared(Arc::<[u8]>::from(bytes));
+            if self.pages.insert(page_no, page).is_none() {
+                total_added = total_added.saturating_add(1);
+            }
+        }
+        if total_added > 0 {
+            self.page_count
+                .fetch_add(total_added, AtomicOrdering::Relaxed);
+        }
+    }
+
     /// Total number of pages in the overflow plane.
     fn len(&self) -> usize {
         self.page_count.load(AtomicOrdering::Acquire)
@@ -12720,6 +12781,27 @@ impl PublishedPages {
         }
         if !overflow_pages.is_empty() {
             self.overflow.insert_batch(overflow_pages);
+        }
+    }
+
+    fn insert_borrowed_batch<'a, I>(&self, pages: I)
+    where
+        I: IntoIterator<Item = (PageNumber, &'a [u8])>,
+    {
+        let mut direct_pages = Vec::new();
+        let mut overflow_pages = Vec::new();
+        for (page_no, bytes) in pages {
+            if self.atomic.accepts(page_no) {
+                direct_pages.push((page_no, bytes));
+            } else {
+                overflow_pages.push((page_no, bytes));
+            }
+        }
+        if !direct_pages.is_empty() {
+            self.atomic.insert_borrowed_batch(direct_pages);
+        }
+        if !overflow_pages.is_empty() {
+            self.overflow.insert_borrowed_batch(overflow_pages);
         }
     }
 
@@ -13385,7 +13467,7 @@ impl PublishedPagerState {
 
     fn prepare_parallel_wal_group_pages(
         batches: &[TransactionFrameBatch],
-    ) -> Result<HashMap<PageNumber, PageData>> {
+    ) -> Result<HashMap<PageNumber, &[u8]>> {
         let mut complete_group_pages = HashMap::with_capacity(
             batches
                 .iter()
@@ -13402,7 +13484,7 @@ impl PublishedPagerState {
                 })?;
                 // Later frames in certificate order replace earlier images of
                 // the same page, matching WAL replay semantics.
-                complete_group_pages.insert(page_no, PageData::from_vec(frame.page_data.clone()));
+                complete_group_pages.insert(page_no, frame.page_data.as_slice());
             }
         }
         Ok(complete_group_pages)
@@ -13418,7 +13500,7 @@ impl PublishedPagerState {
         &self,
         cx: &Cx,
         update: PublishedPagerUpdate,
-        complete_group_pages: HashMap<PageNumber, PageData>,
+        complete_group_pages: &HashMap<PageNumber, &[u8]>,
         certificate_commit_seq_lo: CommitSeq,
     ) {
         #[cfg(test)]
@@ -13452,7 +13534,11 @@ impl PublishedPagerState {
             self.pages.retain(|page_no| page_no.get() <= update.db_size);
         }
 
-        self.pages.insert_batch(complete_group_pages);
+        self.pages.insert_borrowed_batch(
+            complete_group_pages
+                .iter()
+                .map(|(&page_no, &bytes)| (page_no, bytes)),
+        );
         let page_set_size = self.pages.len();
         self.finalize_publish(cx, update, page_set_size, start, true);
     }
@@ -13472,7 +13558,7 @@ impl PublishedPagerState {
         self.publish_prepared_parallel_wal_group(
             cx,
             update,
-            complete_group_pages,
+            &complete_group_pages,
             certificate_commit_seq_lo,
         );
         Ok(())
@@ -22622,15 +22708,49 @@ where
     }
 
     fn drain_committed_cache_pages(&mut self) -> Vec<(PageNumber, PageBuf)> {
+        let max_admit = self.cache.cache_page_budget().min(self.pool.capacity());
+        if self.write_set.len() > max_admit {
+            let mut committed_pages = Vec::with_capacity(max_admit);
+            for &page_no in &self.write_pages_sorted {
+                let Some(staged) = self.write_set.remove(&page_no) else {
+                    continue;
+                };
+                if committed_pages.len() < max_admit {
+                    match staged.into_cache_buf(&self.pool, &self.cache) {
+                        Ok(buffer) => committed_pages.push((page_no, buffer)),
+                        Err(error) => {
+                            self.cache.evict(page_no);
+                            tracing::debug!(
+                                page_no = page_no.get(),
+                                error = %error,
+                                "skipping optional committed-page cache admission at pool capacity"
+                            );
+                        }
+                    }
+                } else {
+                    self.cache.evict(page_no);
+                    drop(staged);
+                }
+            }
+            for (page_no, staged) in self.write_set.drain() {
+                self.cache.evict(page_no);
+                drop(staged);
+            }
+            self.write_pages_sorted.clear();
+            return committed_pages;
+        }
         let mut committed_pages = Vec::with_capacity(self.write_set.len());
         for (page_no, staged) in self.write_set.drain() {
             match staged.into_cache_buf(&self.pool, &self.cache) {
                 Ok(buffer) => committed_pages.push((page_no, buffer)),
-                Err(error) => tracing::debug!(
-                    page_no = page_no.get(),
-                    error = %error,
-                    "skipping optional committed-page cache admission at pool capacity"
-                ),
+                Err(error) => {
+                    self.cache.evict(page_no);
+                    tracing::debug!(
+                        page_no = page_no.get(),
+                        error = %error,
+                        "skipping optional committed-page cache admission at pool capacity"
+                    );
+                }
             }
         }
         self.write_pages_sorted.clear();
@@ -22638,14 +22758,51 @@ where
     }
 
     fn drain_committed_cache_pages_into_cache(&mut self) {
+        let max_admit = self.cache.cache_page_budget().min(self.pool.capacity());
+        if self.write_set.len() > max_admit {
+            let mut admitted = 0usize;
+            for &page_no in &self.write_pages_sorted {
+                let Some(staged) = self.write_set.remove(&page_no) else {
+                    continue;
+                };
+                if admitted < max_admit {
+                    match staged.into_cache_buf(&self.pool, &self.cache) {
+                        Ok(buffer) => {
+                            self.cache.insert_buffer(page_no, buffer);
+                            admitted = admitted.saturating_add(1);
+                        }
+                        Err(error) => {
+                            self.cache.evict(page_no);
+                            tracing::debug!(
+                                page_no = page_no.get(),
+                                error = %error,
+                                "skipping optional committed-page cache admission at pool capacity"
+                            );
+                        }
+                    }
+                } else {
+                    self.cache.evict(page_no);
+                    drop(staged);
+                }
+            }
+            for (page_no, staged) in self.write_set.drain() {
+                self.cache.evict(page_no);
+                drop(staged);
+            }
+            self.write_pages_sorted.clear();
+            return;
+        }
         for (page_no, staged) in self.write_set.drain() {
             match staged.into_cache_buf(&self.pool, &self.cache) {
                 Ok(buffer) => self.cache.insert_buffer(page_no, buffer),
-                Err(error) => tracing::debug!(
-                    page_no = page_no.get(),
-                    error = %error,
-                    "skipping optional committed-page cache admission at pool capacity"
-                ),
+                Err(error) => {
+                    self.cache.evict(page_no);
+                    tracing::debug!(
+                        page_no = page_no.get(),
+                        error = %error,
+                        "skipping optional committed-page cache admission at pool capacity"
+                    );
+                }
             }
         }
         self.write_pages_sorted.clear();
@@ -24096,6 +24253,7 @@ where
                         }
                     }
                 }
+                let batches: Arc<[TransactionFrameBatch]> = Arc::from(batches);
                 let (frame_refs, final_db_size) =
                     flatten_group_commit_batches(flush_base_db_size, &batches);
                 debug_assert_eq!(final_db_size, consolidated_db_size);
@@ -24367,7 +24525,7 @@ where
                                                 .any(|frame| frame.page_number == 1)
                                     });
                                     if std::env::var_os("DW8OE_TRACE").is_some() {
-                                        for batch in &batches {
+                                        for batch in batches.iter() {
                                             for frame in &batch.frames {
                                                 if frame.page_number == 1
                                                     && frame.page_data.len()
@@ -24609,7 +24767,7 @@ where
                                         wal_backend: Arc::clone(&backend),
                                         inner: Arc::clone(inner_arc),
                                         published: published.clone(),
-                                        batches: batches.clone(),
+                                        batches: Arc::clone(&batches),
                                         final_db_size,
                                         sync: sync_policy.should_sync_on_commit(),
                                         sidecar_completion: Arc::clone(&sidecar_completion),
@@ -24687,6 +24845,7 @@ where
                                         frame_completion,
                                     )
                                     .await?;
+                                    prepared_batch = None;
                                 } else {
                                     wal.append_frames_tracked(
                                         &durability_cx,
@@ -31962,7 +32121,7 @@ mod tests {
             attempt
                 .complete_authorized_global(
                     authorization,
-                    &HashMap::from([(committed_page, PageData::from_vec(committed_bytes))]),
+                    &HashMap::from([(committed_page, committed_bytes.as_slice())]),
                     &group_delta,
                     true,
                 )
@@ -32027,7 +32186,7 @@ mod tests {
             attempt
                 .complete_authorized_global(
                     publication_authorization_for_test(false),
-                    &HashMap::from([(PageNumber::ONE, certified_page_one.clone())]),
+                    &HashMap::from([(PageNumber::ONE, certified_page_one.as_bytes())]),
                     &group_delta,
                     true,
                 )
@@ -65923,7 +66082,7 @@ mod tests {
                 freelist_count: 0,
                 checkpoint_active: false,
             },
-            HashMap::from([(current_group_page, current_page.clone())]),
+            &HashMap::from([(current_group_page, current_page.as_bytes())]),
             CommitSeq::new(3),
         );
 
@@ -65933,6 +66092,44 @@ mod tests {
             Some(current_page)
         );
         assert_eq!(published.page_plane_visible_commit_seq(), CommitSeq::new(3));
+    }
+
+    #[test]
+    fn published_page_parallel_wal_group_caps_overflow_pages_from_borrowed_slices() {
+        let cx = Cx::new();
+        let published = PublishedPagerState::new(1, CommitSeq::new(1), JournalMode::Wal, 0);
+        let overflow_total =
+            usize::try_from(ATOMIC_PUBLISHED_PAGE_LIMIT).unwrap() + OVERFLOW_PUBLISHED_PAGE_CAP + 32;
+        let raw_page = sample_page(0x5A);
+        let group_pages: HashMap<PageNumber, &[u8]> = (1..=overflow_total)
+            .map(|idx| {
+                (
+                    PageNumber::new(u32::try_from(idx).unwrap()).unwrap(),
+                    raw_page.as_slice(),
+                )
+            })
+            .collect();
+        assert_eq!(group_pages.len(), overflow_total);
+
+        let total_pages_u32 = u32::try_from(overflow_total).unwrap();
+        published.publish_prepared_parallel_wal_group(
+            &cx,
+            PublishedPagerUpdate {
+                visible_commit_seq: CommitSeq::new(2),
+                db_size: total_pages_u32,
+                journal_mode: JournalMode::Wal,
+                freelist_count: 0,
+                checkpoint_active: false,
+            },
+            &group_pages,
+            CommitSeq::new(1),
+        );
+
+        assert_eq!(
+            published.try_get_page(PageNumber::ONE),
+            Some(PageData::from_vec(raw_page))
+        );
+        assert_eq!(published.page_plane_visible_commit_seq(), CommitSeq::new(2));
     }
 
     #[test]

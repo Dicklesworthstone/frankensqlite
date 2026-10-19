@@ -224,10 +224,12 @@ pub mod host_fs {
     }
 
     /// Publish bytes through a newly reserved sibling, never a pre-existing
-    /// temporary file. Unix staging and published files are owner-only from
-    /// creation (the umask may narrow that further); Windows inherits the
-    /// parent directory's ACL. Existing destination aliases are replaced by
-    /// rename, not opened for writing, so their referents are not truncated.
+    /// temporary file.
+    ///
+    /// Unix staging and published files are owner-only from creation (the
+    /// umask may narrow that further); Windows inherits the parent directory's
+    /// ACL. Existing destination aliases are replaced by rename, not opened
+    /// for writing, so their referents are not truncated.
     ///
     /// The staging descriptor is synced before rename. This is atomic file
     /// publication, NOT a multi-file snapshot or a directory durability fence.
@@ -390,8 +392,14 @@ mod host_fs_security_tests {
 
         write_private_atomic(&path, b"complete new marker").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"complete new marker");
-        assert_eq!(std::fs::read(&stale).unwrap(), b"retained interrupted write");
-        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o077, 0);
+        assert_eq!(
+            std::fs::read(&stale).unwrap(),
+            b"retained interrupted write"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o077,
+            0
+        );
     }
 
     #[test]
@@ -430,7 +438,10 @@ mod host_fs_security_tests {
         assert!(copy_private_atomic_if_exists(&source, &backup).unwrap());
         assert_eq!(std::fs::read(&backup).unwrap(), payload);
         assert_eq!(std::fs::read(&source).unwrap(), payload);
-        assert_eq!(std::fs::metadata(&backup).unwrap().permissions().mode() & 0o077, 0);
+        assert_eq!(
+            std::fs::metadata(&backup).unwrap().permissions().mode() & 0o077,
+            0
+        );
         assert_eq!(
             std::fs::metadata(&source).unwrap().permissions().mode() & 0o777,
             0o644
@@ -495,7 +506,10 @@ mod host_fs_security_tests {
             .filter(|path| path != &destination)
             .collect();
         assert_eq!(staged.len(), 1);
-        assert_eq!(std::fs::read(&staged[0]).unwrap(), b"complete staging bytes");
+        assert_eq!(
+            std::fs::read(&staged[0]).unwrap(),
+            b"complete staging bytes"
+        );
         assert_eq!(
             std::fs::metadata(&staged[0]).unwrap().permissions().mode() & 0o077,
             0

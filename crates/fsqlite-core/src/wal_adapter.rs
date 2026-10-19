@@ -2703,16 +2703,35 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
             ).await?;
             preflight.hand_off();
             drop(preflight);
-            self.wal
-                .append_finalized_prepared_frame_bytes_tracked(
-                    cx,
-                    &prepared.frame_bytes,
-                    prepared.frame_count(),
-                    final_running_checksum,
-                    prepared.last_commit_frame_offset,
-                    completion,
-                )
-                .await?;
+            let frame_count = prepared.frame_count();
+            let last_commit_frame_offset = prepared.last_commit_frame_offset;
+            #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+            let needs_frame_bytes_after_write = self.fec_hook.is_some();
+            #[cfg(not(all(not(target_arch = "wasm32"), feature = "native")))]
+            let needs_frame_bytes_after_write = false;
+            if needs_frame_bytes_after_write {
+                self.wal
+                    .append_finalized_prepared_frame_bytes_tracked(
+                        cx,
+                        &prepared.frame_bytes,
+                        frame_count,
+                        final_running_checksum,
+                        last_commit_frame_offset,
+                        completion,
+                    )
+                    .await?;
+            } else {
+                self.wal
+                    .append_finalized_prepared_frame_bytes_owned_tracked(
+                        cx,
+                        &mut prepared.frame_bytes,
+                        frame_count,
+                        final_running_checksum,
+                        last_commit_frame_offset,
+                        completion,
+                    )
+                    .await?;
+            }
             self.finish_successful_append_attempt()?;
 
             #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
@@ -2786,16 +2805,35 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
             ).await?;
             preflight.hand_off();
             drop(preflight);
-            self.wal
-                .append_finalized_prepared_frame_bytes_tracked(
-                    cx,
-                    &prepared.frame_bytes,
-                    prepared.frame_count(),
-                    final_running_checksum,
-                    prepared.last_commit_frame_offset,
-                    completion,
-                )
-                .await?;
+            let frame_count = prepared.frame_count();
+            let last_commit_frame_offset = prepared.last_commit_frame_offset;
+            #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
+            let needs_frame_bytes_after_write = self.fec_hook.is_some();
+            #[cfg(not(all(not(target_arch = "wasm32"), feature = "native")))]
+            let needs_frame_bytes_after_write = false;
+            if needs_frame_bytes_after_write {
+                self.wal
+                    .append_finalized_prepared_frame_bytes_tracked(
+                        cx,
+                        &prepared.frame_bytes,
+                        frame_count,
+                        final_running_checksum,
+                        last_commit_frame_offset,
+                        completion,
+                    )
+                    .await?;
+            } else {
+                self.wal
+                    .append_finalized_prepared_frame_bytes_owned_tracked(
+                        cx,
+                        &mut prepared.frame_bytes,
+                        frame_count,
+                        final_running_checksum,
+                        last_commit_frame_offset,
+                        completion,
+                    )
+                    .await?;
+            }
             self.finish_successful_append_attempt()?;
 
             #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]

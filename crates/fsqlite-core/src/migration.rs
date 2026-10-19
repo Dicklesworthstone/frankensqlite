@@ -165,9 +165,11 @@ pub fn migration_marker_path(db_path: &str) -> PathBuf {
 }
 
 /// Path selected by a well-formed generation receipt, or the legacy backup
-/// pathname when there is no readable receipt. This convenience lookup does
-/// not verify data bytes. Use [`read_migration_backup`] for explicit errors
-/// and checksum verification; do not open retained evidence for writing.
+/// pathname when there is no readable receipt.
+///
+/// This convenience lookup does not verify data bytes. Use
+/// [`read_migration_backup`] for explicit errors and checksum verification;
+/// do not open retained evidence for writing.
 #[must_use]
 pub fn pre_migration_backup_path(db_path: &str) -> PathBuf {
     backup::selected_path(db_path)

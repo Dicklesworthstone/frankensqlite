@@ -163,3 +163,56 @@ fn pragma_introspection_depth_match_rusqlite_oracle() {
         );
     });
 }
+
+#[test]
+fn gh512_pragma_table_info_quoted_and_parenthesized_pk_ordinals() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let f_path = dir.path().join("f_gh512_pk.db");
+        let r_path = dir.path().join("r_gh512_pk.db");
+
+        let ddls = [
+            "CREATE TABLE t_quoted(\"b\" TEXT, \"a\" INTEGER, \"c\" BLOB, PRIMARY KEY (\"b\", \"A\"))",
+            "CREATE TABLE t_parens(a INTEGER, b TEXT, c REAL, PRIMARY KEY ((\"B\"), (\"a\")))",
+            "CREATE TABLE t_brackets([x] TEXT, [y] INTEGER, PRIMARY KEY ([Y], [x]))",
+        ];
+
+        {
+            let f = Connection::open(f_path.to_str().unwrap()).await.unwrap();
+            let r = rusqlite::Connection::open(&r_path).unwrap();
+            for ddl in ddls {
+                f.execute(ddl).await.unwrap();
+                r.execute(ddl, []).unwrap();
+            }
+            for tbl in ["t_quoted", "t_parens", "t_brackets"] {
+                let q = format!(
+                    "SELECT cid, name, type, \"notnull\", pk FROM pragma_table_info('{tbl}') ORDER BY cid"
+                );
+                assert_eq!(fq(&f, &q).await, rq(&r, &q), "live GH#512 pk ordinal on {tbl}");
+                let p = format!("PRAGMA table_info({tbl})");
+                assert_eq!(fq(&f, &p).await, rq(&r, &p), "live PRAGMA table_info({tbl})");
+            }
+        }
+
+        // Reopen from disk to exercise schema reload from sqlite_master DDL as well.
+        let f = Connection::open(f_path.to_str().unwrap()).await.unwrap();
+        let r = rusqlite::Connection::open(&r_path).unwrap();
+        for tbl in ["t_quoted", "t_parens", "t_brackets"] {
+            let q = format!(
+                "SELECT cid, name, type, \"notnull\", pk FROM pragma_table_info('{tbl}') ORDER BY cid"
+            );
+            assert_eq!(
+                fq(&f, &q).await,
+                rq(&r, &q),
+                "reopened GH#512 pk ordinal on {tbl}"
+            );
+            let p = format!("PRAGMA table_info({tbl})");
+            assert_eq!(
+                fq(&f, &p).await,
+                rq(&r, &p),
+                "reopened PRAGMA table_info({tbl})"
+            );
+        }
+    });
+}
+
