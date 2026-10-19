@@ -715,6 +715,9 @@ fn posix_lock_with_timeout_styled(
         return Ok(first);
     }
 
+    #[cfg(test)]
+    tests::observe_reserved_lock_wait(start);
+
     let started = Instant::now();
     let mut backoff = Duration::from_millis(1);
     let max_backoff = Duration::from_millis(100);
@@ -2173,6 +2176,7 @@ impl UnixFile {
     }
 
     fn acquire_external_wal_slot(&mut self, cx: &Cx, slot: u32) -> Result<bool> {
+        checkpoint_or_abort(cx)?;
         let shm_info = self.ensure_shm_info(cx)?;
         let mut info = shm_info
             .lock()
@@ -2365,6 +2369,34 @@ impl UnixFile {
         Ok(())
     }
 
+    fn lock_main_for_external_fence(&mut self, cx: &Cx, level: LockLevel) -> Result<()> {
+        // Ordinary append and maintenance callers acquire their main-file
+        // fence before any WAL slot. A caller may already own an exclusive
+        // slot, however, and exact restoration must preserve that claim.
+        // Such callers may only try the main fence without waiting: retaining
+        // their slot across a busy wait could block the RESERVED owner's
+        // commit or checkpoint (GH #519).
+        let owns_wal_slot = self.lock_level < level
+            && self.shm_info.as_ref().is_some_and(|shm| {
+                shm.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .slots
+                    .iter()
+                    .any(|slot| slot.exclusive_owner == Some(self.shm_owner_id))
+            });
+        if !owns_wal_slot {
+            return self.lock(cx, level);
+        }
+
+        // lock() is synchronous; restore the configured policy on every
+        // returned outcome. Only this acquisition receives a zero budget.
+        let configured_timeout_ms = self.busy_timeout_ms;
+        self.busy_timeout_ms = 0;
+        let result = self.lock(cx, level);
+        self.busy_timeout_ms = configured_timeout_ms;
+        result
+    }
+
     fn acquire_external_maintenance_fence(
         &mut self,
         cx: &Cx,
@@ -2372,6 +2404,7 @@ impl UnixFile {
         main_level: LockLevel,
         recovery_mode: bool,
     ) -> Result<()> {
+        checkpoint_or_abort(cx)?;
         if self.external_append_attempt.is_some() {
             return Err(FrankenError::internal(
                 "cannot acquire Unix maintenance during a WAL append attempt",
@@ -2401,7 +2434,8 @@ impl UnixFile {
         // for RESERVED: its owner may need WRITE to commit (GH #519).
         // The attempt is already armed, so a failed main acquisition or a
         // later nonblocking WAL conflict retains exact cleanup ownership.
-        self.lock(cx, main_level)?;
+        self.lock_main_for_external_fence(cx, main_level)?;
+        checkpoint_or_abort(cx)?;
         if wal_mode {
             for slot in [WAL_WRITE_LOCK, WAL_CKPT_LOCK] {
                 if self.acquire_external_wal_slot(cx, slot)?
@@ -4237,7 +4271,7 @@ impl VfsFile for UnixFile {
         // Concurrent commits use the same main-before-WAL order as
         // IMMEDIATE transactions and every maintenance/checkpoint path.
         // Waiting here must leave WRITE available to the RESERVED owner.
-        self.lock(cx, LockLevel::Reserved)?;
+        self.lock_main_for_external_fence(cx, LockLevel::Reserved)?;
         if self.acquire_external_wal_slot(cx, WAL_WRITE_LOCK)?
             && let Some(attempt) = self.external_append_attempt.as_mut()
         {
@@ -5233,6 +5267,20 @@ mod tests {
     use std::io::{BufRead, BufReader, Write as _};
     use std::process::{Child, Stdio};
     use std::process::{Command, Output};
+
+    thread_local! {
+        static RESERVED_LOCK_WAIT_OBSERVER: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn observe_reserved_lock_wait(start: u64) {
+        if start == RESERVED_BYTE {
+            let observer = RESERVED_LOCK_WAIT_OBSERVER.with(|slot| slot.borrow_mut().take());
+            if let Some(observer) = observer {
+                observer();
+            }
+        }
+    }
 
     fn admitted_mvcc_fixture(
         name: &str,
@@ -6583,6 +6631,356 @@ mod tests {
         checkpointer.close(&cx).unwrap();
     }
 
+    fn check_wal_fence_waiter_order(operation: &str, test_name: &str, cancel_after_wait: bool) {
+        const CHILD_PATH: &str = "FSQLITE_WAL_FENCE_ORDER_CHILD_PATH";
+        const CHILD_OPERATION: &str = "FSQLITE_WAL_FENCE_ORDER_CHILD_OPERATION";
+        const CHILD_CANCEL: &str = "FSQLITE_WAL_FENCE_ORDER_CHILD_CANCEL";
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        if let Some(path) = std::env::var_os(CHILD_PATH) {
+            let operation = std::env::var(CHILD_OPERATION).expect("child operation");
+            let cancel_after_wait = std::env::var(CHILD_CANCEL).unwrap() == "1";
+            let (mut file, _) = vfs
+                .open(&cx, Some(Path::new(&path)), open_flags_create())
+                .expect("open waiting peer");
+            file.lock(&cx, LockLevel::Shared).unwrap();
+            file.set_busy_timeout_ms(10_000);
+            let waiter_cx = cx.clone();
+            RESERVED_LOCK_WAIT_OBSERVER.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    // This witness follows a real kernel RESERVED refusal.
+                    // Hold the interleaving here without changing that result,
+                    // so the parent probes the actual locks held by this path.
+                    println!("reserved-wait-observed");
+                    std::io::stdout().flush().unwrap();
+                    let mut command = String::new();
+                    assert_ne!(std::io::stdin().read_line(&mut command).unwrap(), 0);
+                    assert_eq!(command.trim(), "resume");
+                    if cancel_after_wait {
+                        waiter_cx.cancel();
+                    }
+                }));
+            });
+            let acquisition = match operation.as_str() {
+                "append" => file.lock_external_wal_append(&cx),
+                "checkpoint" => file.lock_external_wal_checkpoint(&cx),
+                "recovery" => file.lock_external_wal_recovery(&cx),
+                "maintenance" => file.lock_external_maintenance(&cx, true),
+                _ => panic!("unexpected operation {operation}"),
+            };
+            if cancel_after_wait {
+                assert!(matches!(acquisition, Err(FrankenError::Abort)));
+                assert!(
+                    file.shm_info.is_none(),
+                    "cancelled wait never acquires WAL slots"
+                );
+                assert!(
+                    file.external_append_attempt.is_none_or(
+                        |attempt| !attempt.write_acquired && !attempt.acquisition_complete
+                    )
+                );
+                assert!(
+                    file.external_maintenance_attempt
+                        .is_none_or(|attempt| attempt.newly_acquired_wal_slots == 0)
+                );
+            } else {
+                acquisition.expect("waiter acquires after the RESERVED owner finishes");
+            }
+            assert_eq!(
+                file.lock_level,
+                if operation == "maintenance" {
+                    LockLevel::Exclusive
+                } else {
+                    LockLevel::Reserved
+                }
+            );
+            let cleanup_cx = Cx::new();
+            if operation == "append" {
+                assert_eq!(
+                    file.owns_external_wal_append_write(&cleanup_cx).unwrap(),
+                    !cancel_after_wait
+                );
+                file.restore_external_wal_append_attempt(&cleanup_cx)
+                    .unwrap();
+            } else {
+                file.restore_external_maintenance_attempt(&cleanup_cx)
+                    .unwrap();
+            }
+            assert_eq!(file.lock_level, LockLevel::Shared);
+            assert!(file.external_append_attempt.is_none());
+            assert!(file.external_maintenance_attempt.is_none());
+            for slot in [WAL_WRITE_LOCK, WAL_CKPT_LOCK] {
+                file.shm_lock(&cleanup_cx, slot, 1, SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE)
+                    .expect("restored fence has no leaked WAL slot");
+                file.shm_lock(
+                    &cleanup_cx,
+                    slot,
+                    1,
+                    SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE,
+                )
+                .unwrap();
+            }
+            file.close(&cleanup_cx).unwrap();
+            println!("waiter-restored");
+            std::io::stdout().flush().unwrap();
+            return;
+        }
+
+        {
+            let (_dir, path) = make_temp_path("wal-fence-order.db");
+            let (mut writer, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+            writer.lock(&cx, LockLevel::Reserved).unwrap();
+            writer.ensure_shm_info(&cx).unwrap();
+            let mut child = MvccTransportChild(
+                Command::new(std::env::current_exe().unwrap())
+                    .args([test_name, "--exact", "--nocapture"])
+                    .env(CHILD_PATH, &path)
+                    .env(CHILD_OPERATION, operation)
+                    .env(CHILD_CANCEL, if cancel_after_wait { "1" } else { "0" })
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::inherit())
+                    .spawn()
+                    .expect("spawn independent WAL fence waiter"),
+            );
+            let mut input = child.0.stdin.take().unwrap();
+            let output = child.0.stdout.take().unwrap();
+            let (send, receive) = std::sync::mpsc::channel();
+            let reader = std::thread::spawn(move || {
+                for line in BufReader::new(output).lines() {
+                    if send.send(line.expect("child output")).is_err() {
+                        break;
+                    }
+                }
+            });
+            let expect_witness = |expected: &str| {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    let line = receive
+                        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                        .expect("bounded native lock witness");
+                    if line == expected {
+                        break;
+                    }
+                }
+            };
+            expect_witness("reserved-wait-observed");
+            writer
+                .lock_external_wal_append(&cx)
+                .unwrap_or_else(|error| {
+                    panic!("{operation} waiter blocked the RESERVED owner's WAL append: {error}")
+                });
+            assert!(writer.owns_external_wal_append_write(&cx).unwrap());
+            writer
+                .shm_lock(
+                    &cx,
+                    WAL_CKPT_LOCK,
+                    1,
+                    SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE,
+                )
+                .expect("RESERVED wait must not retain CKPT either");
+            writer
+                .shm_lock(
+                    &cx,
+                    WAL_CKPT_LOCK,
+                    1,
+                    SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE,
+                )
+                .unwrap();
+            writer.restore_external_wal_append_attempt(&cx).unwrap();
+            assert_eq!(writer.lock_level, LockLevel::Reserved);
+            writer.close(&cx).unwrap();
+            writeln!(input, "resume").unwrap();
+            input.flush().unwrap();
+            expect_witness("waiter-restored");
+            assert!(
+                child.0.wait().unwrap().success(),
+                "{operation} child failed"
+            );
+            reader.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn wal_fence_append_waiter_preserves_reserved_owner_progress() {
+        check_wal_fence_waiter_order(
+            "append",
+            "unix::tests::wal_fence_append_waiter_preserves_reserved_owner_progress",
+            false,
+        );
+    }
+
+    #[test]
+    fn wal_fence_checkpoint_waiter_preserves_reserved_owner_progress() {
+        check_wal_fence_waiter_order(
+            "checkpoint",
+            "unix::tests::wal_fence_checkpoint_waiter_preserves_reserved_owner_progress",
+            false,
+        );
+    }
+
+    #[test]
+    fn wal_fence_recovery_waiter_preserves_reserved_owner_progress() {
+        check_wal_fence_waiter_order(
+            "recovery",
+            "unix::tests::wal_fence_recovery_waiter_preserves_reserved_owner_progress",
+            false,
+        );
+    }
+
+    #[test]
+    fn wal_fence_maintenance_waiter_preserves_reserved_owner_progress() {
+        check_wal_fence_waiter_order(
+            "maintenance",
+            "unix::tests::wal_fence_maintenance_waiter_preserves_reserved_owner_progress",
+            false,
+        );
+    }
+
+    #[test]
+    fn wal_fence_cancelled_append_waiter_restores_main_only() {
+        check_wal_fence_waiter_order(
+            "append",
+            "unix::tests::wal_fence_cancelled_append_waiter_restores_main_only",
+            true,
+        );
+    }
+
+    #[test]
+    fn wal_fence_cancelled_checkpoint_waiter_restores_main_only() {
+        check_wal_fence_waiter_order(
+            "checkpoint",
+            "unix::tests::wal_fence_cancelled_checkpoint_waiter_restores_main_only",
+            true,
+        );
+    }
+
+    #[test]
+    fn wal_fence_preowned_slots_never_wait_and_preserve_busy_policy() {
+        const CHILD_PATH: &str = "FSQLITE_WAL_FENCE_PREOWNED_CHILD_PATH";
+        const TEST: &str =
+            "unix::tests::wal_fence_preowned_slots_never_wait_and_preserve_busy_policy";
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        if let Some(path) = std::env::var_os(CHILD_PATH) {
+            let (mut file, _) = vfs
+                .open(&cx, Some(Path::new(&path)), open_flags_create())
+                .unwrap();
+            file.lock(&cx, LockLevel::Shared).unwrap();
+            file.set_busy_timeout_ms(10_000);
+            for blocked in [true, false] {
+                for operation in ["append", "checkpoint", "recovery", "maintenance"] {
+                    for preowned in [
+                        WAL_WRITE_LOCK,
+                        WAL_CKPT_LOCK,
+                        WAL_RECOVER_LOCK,
+                        wal_read_lock_slot(3).unwrap(),
+                    ] {
+                        file.shm_lock(&cx, preowned, 1, SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE)
+                            .unwrap();
+                        RESERVED_LOCK_WAIT_OBSERVER.with(|slot| {
+                            *slot.borrow_mut() = Some(Box::new(|| {
+                                panic!(
+                                    "caller-owned WAL slots must never enter a main-lock busy wait"
+                                )
+                            }));
+                        });
+                        let result = match operation {
+                            "append" => file.lock_external_wal_append(&cx),
+                            "checkpoint" => file.lock_external_wal_checkpoint(&cx),
+                            "recovery" => file.lock_external_wal_recovery(&cx),
+                            "maintenance" => file.lock_external_maintenance(&cx, true),
+                            _ => unreachable!(),
+                        };
+                        if blocked {
+                            assert!(matches!(result, Err(FrankenError::Busy)), "{operation}");
+                            assert_eq!(file.lock_level, LockLevel::Shared);
+                        } else {
+                            result.expect("try-once may succeed when the main fence is free");
+                        }
+                        assert_eq!(file.busy_timeout_ms, 10_000, "preserve configured policy");
+                        RESERVED_LOCK_WAIT_OBSERVER.with(|slot| {
+                            assert!(slot.borrow_mut().take().is_some());
+                        });
+                        if operation == "append" {
+                            file.restore_external_wal_append_attempt(&cx).unwrap();
+                        } else {
+                            file.restore_external_maintenance_attempt(&cx).unwrap();
+                        }
+                        assert_eq!(file.lock_level, LockLevel::Shared);
+                        assert!(file.external_append_attempt.is_none());
+                        assert!(file.external_maintenance_attempt.is_none());
+                        {
+                            let info = file.shm_info.as_ref().unwrap().lock().unwrap();
+                            for slot in 0..WAL_TOTAL_LOCKS {
+                                assert_eq!(
+                                    info.slots[usize::try_from(slot).unwrap()].exclusive_owner,
+                                    (slot == preowned).then_some(file.shm_owner_id),
+                                    "{operation} restores only its own claims"
+                                );
+                            }
+                        }
+                        file.shm_lock(&cx, preowned, 1, SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE)
+                            .unwrap();
+                    }
+                }
+                if blocked {
+                    println!("preowned-refusals-complete");
+                    std::io::stdout().flush().unwrap();
+                    let mut command = String::new();
+                    assert_ne!(std::io::stdin().read_line(&mut command).unwrap(), 0);
+                    assert_eq!(command.trim(), "resume");
+                }
+            }
+            file.close(&cx).unwrap();
+            println!("preowned-restores-complete");
+            std::io::stdout().flush().unwrap();
+            return;
+        }
+
+        let (_dir, path) = make_temp_path("wal-fence-preowned.db");
+        let (mut writer, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        writer.lock(&cx, LockLevel::Reserved).unwrap();
+        let mut child = MvccTransportChild(
+            Command::new(std::env::current_exe().unwrap())
+                .args([TEST, "--exact", "--nocapture"])
+                .env(CHILD_PATH, &path)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .expect("spawn independent preowned-fence peer"),
+        );
+        let mut input = child.0.stdin.take().unwrap();
+        let output = child.0.stdout.take().unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            for line in BufReader::new(output).lines() {
+                if send.send(line.expect("child output")).is_err() {
+                    break;
+                }
+            }
+        });
+        let expect_witness = |expected: &str| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let line = receive
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .expect("bounded preowned-fence witness");
+                if line == expected {
+                    break;
+                }
+            }
+        };
+        expect_witness("preowned-refusals-complete");
+        writer.close(&cx).unwrap();
+        writeln!(input, "resume").unwrap();
+        input.flush().unwrap();
+        expect_witness("preowned-restores-complete");
+        assert!(child.0.wait().unwrap().success());
+        reader.join().unwrap();
+    }
+
     #[test]
     fn wal_append_attempt_preserves_snapshot_and_preowned_write() {
         let cx = Cx::new();
@@ -7055,14 +7453,7 @@ mod tests {
                 .expect("partial recovery marker");
             assert!(attempt.recovery_mode);
             assert_eq!(attempt.newly_acquired_wal_slots, (1_u8 << blocked_slot) - 1);
-            assert_eq!(
-                file.lock_level,
-                if blocked_slot >= WAL_RECOVER_LOCK {
-                    LockLevel::Reserved
-                } else {
-                    LockLevel::Shared
-                }
-            );
+            assert_eq!(file.lock_level, LockLevel::Reserved);
             assert!(file.shm_unmap(&cx, false).is_err());
             assert!(file.lock_external_wal_recovery(&cx).is_err());
             assert!(file.lock_external_wal_checkpoint(&cx).is_err());
@@ -7492,8 +7883,7 @@ mod tests {
         for kind in ["append", "checkpoint", "recovery", "maintenance"] {
             for timeout in [0_u64, 25] {
                 let (_dir, path) = make_temp_path("gh519-main-contention.db");
-                let (mut immediate, _) =
-                    vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+                let (mut immediate, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
                 immediate.lock(&cx, LockLevel::Reserved).unwrap();
                 let mut child = Command::new(std::env::current_exe().unwrap())
                     .args([TEST, "--exact", "--nocapture"])
@@ -11110,4 +11500,3 @@ mod tests {
         assert_eq!(buf, payload);
     }
 }
-

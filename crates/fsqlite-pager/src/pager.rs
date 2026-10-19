@@ -6798,8 +6798,8 @@ impl PagerMaintenanceGate {
 impl PagerMaintenanceLease {
     /// Temporarily turn this lease into the sole same-process maintenance
     /// owner. Recovery callers use this only after releasing every VFS lock,
-    /// so the cross-process acquisition can follow the canonical
-    /// WAL-slots-before-main-file order.
+    /// so the backend starts cross-process acquisition from an unambiguous
+    /// baseline without retaining the earlier reader fence.
     fn upgrade_to_exclusive(
         &mut self,
         expected_recovery_owner: Option<RollbackRecoveryOwnerId>,
@@ -14895,9 +14895,9 @@ where
                 return Err(FrankenError::Busy);
             }
 
-            // For write transactions, escalate to RESERVED to signal write intent
-            // to other processes. This is a non-blocking advisory lock that
-            // prevents multiple processes from writing simultaneously.
+            // Explicitly serialized IMMEDIATE/EXCLUSIVE transactions acquire
+            // RESERVED at begin, subject to busy_timeout. Concurrent writers
+            // acquire this fence only around their physical WAL append.
             if eager_writer {
                 if active_transactions_before_begin != 0 {
                     admission.external_lock.arm_lock_level(LockLevel::Shared);
@@ -18411,8 +18411,8 @@ where
     /// Every caller enters with exactly one transaction maintenance lease and
     /// no active transaction in this pager. A hot journal is first discovered
     /// under main-file SHARED, then SHARED is released before the lease is
-    /// upgraded and the canonical WAL-slots -> main-EXCLUSIVE recovery epoch
-    /// begins. Read-only pagers only classify and fail closed.
+    /// upgraded and the backend's exclusive recovery epoch begins. Read-only
+    /// pagers only classify and fail closed.
     async fn refresh_runtime_committed_state(
         &self,
         cx: &Cx,
@@ -18487,9 +18487,9 @@ where
         }
 
         if had_pending || journal_exists {
-            // Never wait for the recovery fence or acquire WAL slots while
-            // retaining main SHARED: maintenance publishers use the opposite,
-            // canonical order.
+            // Drop this read snapshot before waiting for the recovery fence:
+            // an earlier recovery owner may need main EXCLUSIVE. The backend
+            // then establishes the new recovery attempt's complete fence.
             external_lock.restore().await?;
             let _recovery_guard = self.recovery_fence.acquire_for_recovery()?;
             let prior_kind =
