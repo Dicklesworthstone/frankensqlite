@@ -2944,6 +2944,11 @@ impl<P: PageReader> BtCursor<P> {
         &self.read_witnesses
     }
 
+    #[cfg(test)]
+    pub(crate) fn into_pager(self) -> P {
+        self.pager
+    }
+
     /// Clears captured read witness keys.
     pub fn clear_witness_keys(&mut self) {
         self.read_witnesses.clear();

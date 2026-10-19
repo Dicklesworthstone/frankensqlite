@@ -5178,7 +5178,8 @@ mod tests {
     fn test_descending_index_inserts_equalize_leaf_pages_gh521() {
         use crate::cursor::{BtCursor, MemPageStore as CursorMemPageStore};
         use crate::traits::BtreeCursorOps;
-        use fsqlite_types::record::{SqliteValue, serialize_record};
+        use fsqlite_types::record::serialize_record;
+        use fsqlite_types::value::SqliteValue;
 
         run_async(async {
             let cx = Cx::new();
@@ -5197,7 +5198,7 @@ mod tests {
                     .expect("descending index_insert should succeed");
             }
 
-            let store = cursor.into_transaction();
+            let store = cursor.into_pager();
             let mut leaf_pages = 0usize;
             let mut one_cell_leaves = 0usize;
             for (&pgno, page_bytes) in store.pages_iter() {
