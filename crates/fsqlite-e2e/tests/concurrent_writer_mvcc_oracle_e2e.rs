@@ -1754,21 +1754,48 @@ fn concurrent_implicit_rowid_append_with_autocheckpoint_and_large_rows_bd_ujp0h_
 
             let verify = fsqlite::Connection::open(&f_path).await.unwrap();
             let rows = verify
-                .query("SELECT COUNT(*), COUNT(DISTINCT id), MIN(id), MAX(id) FROM imp_small")
+                .query(
+                    "SELECT COUNT(*), COUNT(DISTINCT id), COUNT(DISTINCT (tid * 1000000 + seq)), MIN(id), MAX(id) FROM imp_small",
+                )
                 .await
                 .unwrap();
+            let vals = rows[0].values();
             assert_eq!(
-                rows[0].values(),
+                &vals[..3],
                 &[
                     SqliteValue::Integer(expected),
                     SqliteValue::Integer(expected),
-                    SqliteValue::Integer(1),
                     SqliteValue::Integer(expected),
                 ],
-                "bd-2ym3z: passive autocheckpoints must never cause duplicate implicit rowids"
+                "bd-2ym3z: passive autocheckpoints must preserve all committed rows with zero duplicate implicit rowids"
+            );
+            assert!(
+                matches!(vals[3], SqliteValue::Integer(min_id) if min_id >= 1),
+                "expected MIN(id) >= 1, got {:?}",
+                vals[3]
+            );
+            assert!(
+                matches!(vals[4], SqliteValue::Integer(max_id) if max_id >= expected),
+                "expected MAX(id) >= {expected}, got {:?}",
+                vals[4]
             );
             let ic = verify.query("PRAGMA integrity_check").await.unwrap();
             assert_eq!(ic[0].values()[0], SqliteValue::Text("ok".into()));
+            verify.close().await.unwrap();
+
+            let stock = rusqlite::Connection::open(&f_path).unwrap();
+            let stock_ic: String = stock
+                .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(stock_ic, "ok", "stock SQLite integrity_check on imp_small");
+            let (stock_cnt, stock_distinct): (i64, i64) = stock
+                .query_row(
+                    "SELECT COUNT(*), COUNT(DISTINCT id) FROM imp_small",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!((stock_cnt, stock_distinct), (expected, expected));
         }
 
         // Case B (bd-ujp0h + GH#507): 8 concurrent writers appending ~3500-byte
@@ -1840,21 +1867,48 @@ fn concurrent_implicit_rowid_append_with_autocheckpoint_and_large_rows_bd_ujp0h_
 
             let verify = fsqlite::Connection::open(&f_path).await.unwrap();
             let rows = verify
-                .query("SELECT COUNT(*), COUNT(DISTINCT id), MIN(id), MAX(id) FROM imp_big")
+                .query(
+                    "SELECT COUNT(*), COUNT(DISTINCT id), COUNT(DISTINCT (tid * 1000000 + seq)), MIN(id), MAX(id) FROM imp_big",
+                )
                 .await
                 .unwrap();
+            let vals = rows[0].values();
             assert_eq!(
-                rows[0].values(),
+                &vals[..3],
                 &[
                     SqliteValue::Integer(expected),
                     SqliteValue::Integer(expected),
-                    SqliteValue::Integer(1),
                     SqliteValue::Integer(expected),
                 ],
                 "bd-ujp0h: 3500-byte right-edge leaf splits must claim the unchanged old leaf so no duplicate implicit rowids commit"
             );
+            assert!(
+                matches!(vals[3], SqliteValue::Integer(min_id) if min_id >= 1),
+                "expected MIN(id) >= 1, got {:?}",
+                vals[3]
+            );
+            assert!(
+                matches!(vals[4], SqliteValue::Integer(max_id) if max_id >= expected),
+                "expected MAX(id) >= {expected}, got {:?}",
+                vals[4]
+            );
             let ic = verify.query("PRAGMA integrity_check").await.unwrap();
             assert_eq!(ic[0].values()[0], SqliteValue::Text("ok".into()));
+            verify.close().await.unwrap();
+
+            let stock = rusqlite::Connection::open(&f_path).unwrap();
+            let stock_ic: String = stock
+                .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(stock_ic, "ok", "stock SQLite integrity_check on imp_big");
+            let (stock_cnt, stock_distinct): (i64, i64) = stock
+                .query_row(
+                    "SELECT COUNT(*), COUNT(DISTINCT id) FROM imp_big",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!((stock_cnt, stock_distinct), (expected, expected));
         }
     });
 }
