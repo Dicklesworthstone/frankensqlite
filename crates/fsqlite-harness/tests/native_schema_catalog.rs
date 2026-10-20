@@ -427,6 +427,8 @@ fn invalid_persisted_schema_fields_fail_closed_on_named_access_after_recovery() 
             SqliteValue::Text("CREATE TABLE items(value TEXT)".into()),
         ]);
         with_native_btree(&cx, &db, &mut txn, page(1), true, async |c| {
+            assert!(c.table_move_to(&cx, 1).await?.is_found());
+            c.delete(&cx).await?;
             c.table_insert(&cx, 1, &forged).await
         })
         .await
@@ -907,14 +909,20 @@ fn schema_retirement_recovers_atomically_across_both_sync_failure_boundaries() {
             assert_eq!(faults.len(), 1, "the intended barrier must actually fail");
             assert_eq!(faults[0].path, Path::new(path));
             assert_eq!(faults[0].kind, FaultKind::PowerCut);
-            assert_eq!(faults[0].detail, format!("operation=sync index={sync_index}"));
+            assert_eq!(
+                faults[0].detail,
+                format!("operation=sync index={sync_index}")
+            );
             assert!(db.needs_recovery());
             assert_eq!(db.committed_tip().get(), 1);
             assert_eq!(txn.token(), token);
             assert_eq!(txn.state(), NativePageTransactionState::Indeterminate);
             assert!(txn.is_page_dirty(page(1)));
             assert!(txn.is_page_dirty(object.root()));
-            assert!(matches!(db.rollback(&mut txn), Err(FrankenError::BusyRecovery)));
+            assert!(matches!(
+                db.rollback(&mut txn),
+                Err(FrankenError::BusyRecovery)
+            ));
             vfs.power_on();
             assert!(matches!(
                 db.commit(&cx, &mut txn, 102).await,
