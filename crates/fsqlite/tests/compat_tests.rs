@@ -3393,3 +3393,73 @@ fn temp_sqlite_master_exposes_temp_catalog_and_alias() {
         }
     });
 }
+
+/// cass svhcf: `PRAGMA integrity_check` inside BEGIN on a read-only
+/// connection must account for the durable freelist. A read-only pager never
+/// loads its freelist, and the check used to trust that empty live set for any
+/// active transaction, so every free page of an image stock SQLite verifies
+/// clean read as "page N is never used" (cass's logical-archive restore runs
+/// its verification exactly this way and refused valid restores).
+#[test]
+fn read_only_snapshot_integrity_check_counts_the_durable_freelist() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("read_only_freelist.db");
+        let db = path.to_str().unwrap();
+        {
+            let conn = Connection::open(db).await.unwrap();
+            conn.execute("CREATE TABLE doomed (id INTEGER PRIMARY KEY, body TEXT)")
+                .await
+                .unwrap();
+            for i in 1..=8_i64 {
+                conn.execute_with_params(
+                    "INSERT INTO doomed VALUES (?1, ?2)",
+                    &[
+                        SqliteValue::Integer(i),
+                        SqliteValue::Text("x".repeat(3000).into()),
+                    ],
+                )
+                .await
+                .unwrap();
+            }
+            conn.execute("CREATE TABLE keep (id INTEGER PRIMARY KEY)")
+                .await
+                .unwrap();
+            conn.execute("DROP TABLE doomed").await.unwrap();
+            conn.close().await.unwrap();
+        }
+
+        // Stock SQLite is the authority on the image: valid, with free pages.
+        let stock = RusqliteConnection::open(&path).unwrap();
+        let free: i64 = stock
+            .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+            .unwrap();
+        assert!(free > 0, "the fixture must leave free pages");
+        let stock_verdict: String = stock
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(stock_verdict, "ok");
+        drop(stock);
+
+        let reader = open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .await
+            .unwrap();
+        reader.execute("BEGIN").await.unwrap();
+        let verdict: String = reader
+            .query_row("PRAGMA integrity_check")
+            .await
+            .unwrap()
+            .get_typed(0)
+            .unwrap();
+        assert_eq!(verdict, "ok", "integrity_check inside a read-only snapshot");
+        reader.execute("COMMIT").await.unwrap();
+        let verdict: String = reader
+            .query_row("PRAGMA integrity_check")
+            .await
+            .unwrap()
+            .get_typed(0)
+            .unwrap();
+        assert_eq!(verdict, "ok", "integrity_check outside a transaction");
+        reader.close().await.unwrap();
+    });
+}
