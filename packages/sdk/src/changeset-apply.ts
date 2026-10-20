@@ -1,4 +1,6 @@
 import { withDeferredForeignKeys } from "./changeset-foreign-keys";
+import { runChangesetScope } from "./changeset-scope";
+import type { ChangesetScopeErrors } from "./changeset-scope";
 import { FrankenSQLiteError } from "./errors";
 import type {
   ChangesetChange,
@@ -106,7 +108,10 @@ export interface ApplyChangesetOptions<Change extends PatchsetChange = Changeset
    * these owned bytes with tx, never publish them externally from this hook.
    * Replay skips the hook: recover prior decisions from the journal you saved.
    * Admitted hook SQL drains before the receipt or rollback; saved executors
-   * expire when the hook exits. Any failed admitted SQL aborts even if caught.
+   * expire when the hook exits. Owned child savepoints are preserved when the
+   * target supplies them: a handled, confirmed child rollback permits continued
+   * hook work. Direct SQL failures abort even if caught; uncertain child cleanup
+   * stops further hook SQL and retains its cleanup evidence across descendants.
    * Throws/cancellation/commit failure roll back journal, rows and receipt.
    */
   onRebase?: ChangesetRebaseHook;
@@ -138,6 +143,8 @@ export class ChangesetApplyError extends Error {
   constructor(
     readonly code:
       | "ERR_FSQLITE_CHANGESET_INPUT"
+      | "ERR_FSQLITE_CHANGESET_BUSY"
+      | "ERR_FSQLITE_CHANGESET_STATE"
       | "ERR_FSQLITE_CHANGESET_SCHEMA"
       | "ERR_FSQLITE_CHANGESET_CONFLICT"
       | "ERR_FSQLITE_CHANGESET_RESULT"
@@ -148,6 +155,8 @@ export class ChangesetApplyError extends Error {
     message: string,
     readonly conflict?: ChangesetConflict<PatchsetChange>,
     options?: ErrorOptions,
+    /** Uncertain hook settlement requires reconciliation, not an inferred abort. */
+    readonly cleanupErrors: readonly unknown[] = [],
   ) {
     super(message, options);
     this.name = "ChangesetApplyError";
@@ -881,43 +890,26 @@ function recordRebase<Change extends PatchsetChange>(
   });
 }
 
-/** Drain hook SQL before receipt publication or rollback; saved handles expire. */
+const rebaseScopeErrors: ChangesetScopeErrors = Object.freeze({
+  closed: () => new ChangesetApplyError(
+    "ERR_FSQLITE_CHANGESET_INPUT", "Changeset rebase hook SQL scope has ended"),
+  invalidChild: () => new ChangesetApplyError(
+    "ERR_FSQLITE_CHANGESET_INPUT", "A child transaction callback is required"),
+  busy: () => new ChangesetApplyError(
+    "ERR_FSQLITE_CHANGESET_BUSY", "Settle parent work first; a child transaction owns this SQL scope"),
+  uncertain: (cause: unknown, cleanupErrors: readonly unknown[]) => new ChangesetApplyError(
+    "ERR_FSQLITE_CHANGESET_STATE", "Rebase hook child cleanup is uncertain; reconcile the transaction owner",
+    undefined, { cause }, cleanupErrors),
+});
+
+/** Share capture/FK ownership through the hook, before receipt publication. */
 async function runRebaseHook(
   tx: ChangesetExecutor,
   hook: ChangesetRebaseHook,
   bytes: Uint8Array,
   checkpoint: () => void,
 ): Promise<void> {
-  let accepting = true, failed = false;
-  let firstFailure: unknown;
-  const pending = new Set<Promise<unknown>>();
-  const submit = <T>(operation: () => Promise<T>): Promise<T> => {
-    if (!accepting) return Promise.reject(new ChangesetApplyError(
-      "ERR_FSQLITE_CHANGESET_INPUT", "Changeset rebase hook SQL scope has ended",
-    ));
-    const task = (async () => {
-      checkpoint();
-      const result = await operation();
-      checkpoint();
-      return result;
-    })();
-    pending.add(task);
-    void task.then(() => pending.delete(task), error => {
-      pending.delete(task);
-      if (!failed) { failed = true; firstFailure = error; }
-    });
-    return task;
-  };
-  const scoped = Object.freeze({
-    execute: (sql, params) => submit(() => tx.execute(sql, params)),
-    query: (sql, params) => submit(() => tx.query(sql, params)),
-  } satisfies ChangesetExecutor);
-  // A callback failure takes precedence, but cannot abandon its admitted SQL.
-  // Closing admission first makes a single allSettled snapshot sufficient.
-  try { await hook(scoped, bytes); }
-  finally { accepting = false; await Promise.allSettled(pending); }
-  if (failed) throw firstFailure;
-  checkpoint();
+  await runChangesetScope(tx, scoped => hook(scoped, bytes), checkpoint, rebaseScopeErrors);
 }
 
 /**
