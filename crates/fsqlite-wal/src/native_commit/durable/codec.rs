@@ -80,7 +80,7 @@ impl NativeObjectCodec for RaptorQNativeCodec {
         let object_id = Self::object_id(payload)?;
         let native = native_context(cx)?;
         let mut sender = RaptorQSenderBuilder::new()
-            .config(configuration())
+            .config(configuration(2.0))
             .transport(CollectSymbols::default())
             .build()
             .map_err(|error| corrupt(&format!("native RaptorQ sender: {error}")))?;
@@ -193,7 +193,7 @@ impl NativeObjectCodec for RaptorQNativeCodec {
             u16::try_from(block_symbols).map_err(|_| FrankenError::TooBig)?,
         );
         let mut receiver = RaptorQReceiverBuilder::new()
-            .config(configuration())
+            .config(configuration(1.0))
             .source(StoredSymbols(symbols))
             .build()
             .map_err(|error| corrupt(&format!("native RaptorQ receiver: {error}")))?;
@@ -251,11 +251,11 @@ fn validate_key(key: u32, oti: Oti) -> Result<(SymbolKind, u8, u32)> {
     ))
 }
 
-fn configuration() -> RaptorQConfig {
+fn configuration(repair_overhead: f64) -> RaptorQConfig {
     let mut config = RaptorQConfig::default();
     config.encoding.symbol_size = SYMBOL_BYTES;
     config.encoding.max_block_size = BLOCK_BYTES;
-    config.encoding.repair_overhead = 2.0;
+    config.encoding.repair_overhead = repair_overhead;
     config
 }
 
