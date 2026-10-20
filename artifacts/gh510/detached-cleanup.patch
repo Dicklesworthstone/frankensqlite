@@ -1,0 +1,226 @@
+Subject: [PENDING INTEGRATION] Preserve WAL quarantine provenance through detached cleanup (#510)
+Base-Pager-Blob: fd6daead74625c9742983959a55aa90f6be19d99
+Target: crates/fsqlite-pager/src/pager.rs
+
+This is an unapplied production-and-regression candidate, not an installed fix.
+The previous production commit d9837a6ec3a8116fb51586835fcb52f77a547294
+repairs ordinary cleanup. Dropping a pending group-commit transaction instead
+moves its reservations to DetachedPendingGroupCommitTxnCleanup, which currently
+does not receive the durable-freelist origin set. NotCommitted cleanup sends
+committed-free quarantine entries into EOF abandonment and loses that origin.
+
+Carry the origin set until a terminal outcome is known. On NotCommitted return
+committed-free quarantine entries through the existing restoration helper;
+leave fresh EOF entries on the existing abandonment path. On Authorized retire
+bookkeeping without recycling committed pages. Do not alter Pending outcome
+classification, snapshot horizons, first-committer-wins validation, or defaults.
+
+The regression drives the production transaction Drop/deferred-cleanup boundary
+with the existing mock-WAL fixture and a pre-admission receipt. It checks no
+early return, exact-once restoration, distinct EOF handling, no publication of
+discarded writes, and subsequent allocation/write on the same pager. This is
+NOT a native I/O-cancellation, power-loss, or SQL/index interoperability test.
+
+Status: source-reviewed against the blob above; unified-diff syntax checked.
+No complete-checkout apply check, Rust compilation, rustfmt, Clippy, or runtime
+pass is claimed. Cargo and RCH are unavailable in the preparation environment.
+GitHub Actions remains disabled under the repository's owner policy.
+
+Before integration: verify the target blob, git apply --check this patch, then
+run the focused regression, issue_491_bulk_insert SQL oracle, WAL/pager/MVCC
+library suites, workspace check, Clippy and formatting. Preserve genuine
+concurrent conflicts and require actual failing-before/passing-after evidence.
+
+diff --git a/crates/fsqlite-pager/src/pager.rs b/crates/fsqlite-pager/src/pager.rs
+--- a/crates/fsqlite-pager/src/pager.rs
++++ b/crates/fsqlite-pager/src/pager.rs
+@@ -9044,6 +9044,9 @@
+     attempt: Arc<PendingGroupCommitTxnAttempt<F>>,
+     maintenance_lease: Option<PagerMaintenanceLease>,
+     allocated_from_freelist: Vec<PageNumber>,
++    // The transaction may outlive its caller while publication is unresolved.
++    // Keep quarantine provenance until a terminal verdict permits cleanup.
++    allocated_from_durable_freelist: HashSet<u32>,
+     allocated_from_eof: Vec<PageNumber>,
+     page_lease: Vec<PageNumber>,
+     savepoint_quarantine: Vec<PageNumber>,
+@@ -9147,6 +9150,7 @@
+                 PendingGroupCommitTxnResolution::Authorized(_) => {
+                     if !self.allocation_cleanup_applied {
+                         self.allocated_from_freelist.clear();
++                        self.allocated_from_durable_freelist.clear();
+                         self.allocated_from_eof.clear();
+                         self.page_lease.clear();
+                         self.savepoint_quarantine.clear();
+@@ -9155,7 +9159,7 @@
+                 }
+                 PendingGroupCommitTxnResolution::NotCommitted => {
+                     if !self.allocation_cleanup_applied {
+-                        let not_committed = self.attempt.take_not_committed_state()?;
++                        let mut not_committed = self.attempt.take_not_committed_state()?;
+                         let mut inner = self
+                             .attempt
+                             .inner
+@@ -9174,6 +9178,11 @@
+                             self.allocated_from_eof.drain(..),
+                         );
+                         return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
++                        restore_quarantined_durable_freelist_pages(
++                            &mut inner.freelist,
++                            &mut self.savepoint_quarantine,
++                            &self.allocated_from_durable_freelist,
++                        );
+                         inner
+                             .abandoned_eof_reservations
+                             .append(&mut self.savepoint_quarantine);
+@@ -9190,10 +9199,16 @@
+                                 &mut inner.freelist,
+                                 not_committed.returned_allocations.page_lease,
+                             );
++                            restore_quarantined_durable_freelist_pages(
++                                &mut inner.freelist,
++                                &mut not_committed.returned_allocations.savepoint_quarantine,
++                                &self.allocated_from_durable_freelist,
++                            );
+                             inner.abandoned_eof_reservations.extend(
+                                 not_committed.returned_allocations.savepoint_quarantine,
+                             );
+                         }
++                        self.allocated_from_durable_freelist.clear();
+                         DisownedPageReclaimAttempt::<F>::restore_pages(
+                             &mut inner,
+                             not_committed.reclaimed_abandoned_reservations,
+@@ -29196,6 +29211,9 @@
+                 attempt,
+                 maintenance_lease: self.maintenance_lease.take(),
+                 allocated_from_freelist: std::mem::take(&mut self.allocated_from_freelist),
++                allocated_from_durable_freelist: std::mem::take(
++                    &mut self.allocated_from_durable_freelist,
++                ),
+                 allocated_from_eof: std::mem::take(&mut self.allocated_from_eof),
+                 page_lease: std::mem::take(&mut self.page_lease),
+                 savepoint_quarantine: std::mem::take(&mut self.savepoint_quarantined_allocations),
+@@ -32085,3 +32103,123 @@
++    async fn gh510_seed_detached_cleanup(
++        pager: &SimplePager<MemoryVfs>,
++        cx: &Cx,
++    ) -> (PageNumber, PageNumber) {
++        let mut seed = pager.begin(cx, TransactionMode::Immediate).await.unwrap();
++        let free = seed.allocate_page(cx).await.unwrap();
++        let live = seed.allocate_page(cx).await.unwrap();
++        seed.write_page(cx, free, &sample_page(0x41)).await.unwrap();
++        seed.write_page(cx, live, &sample_page(0x42)).await.unwrap();
++        seed.commit(cx).await.unwrap();
++        drop(seed);
++        let mut release = pager.begin(cx, TransactionMode::Immediate).await.unwrap();
++        release.free_page(cx, free).await.unwrap();
++        release.commit(cx).await.unwrap();
++        drop(release);
++        (free, live)
++    }
++
++    #[test]
++    fn test_gh510_dropped_pending_attempt_restores_durable_quarantine() {
++        asupersync::test_utils::run_test(|| async {
++            // Use the existing mock-WAL pager for the allocator/Drop boundary.
++            // The SQL oracle owns native-file, index and SQLite interoperability.
++            let (pager, frames) = wal_pager().await;
++            let cx = Cx::new();
++            let (free, live) = gh510_seed_detached_cleanup(&pager, &cx).await;
++            let frame_count = frames.lock().unwrap().len();
++
++            let mut txn = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
++            let snapshot = txn.published_visible_commit_seq_hint();
++            // A surviving pre-savepoint write requires the full commit path,
++            // rather than the already-repaired empty-commit cleanup.
++            txn.write_page(&cx, live, &sample_page(0x43)).await.unwrap();
++            txn.savepoint(&cx, "before").unwrap();
++            assert_eq!(txn.allocate_page(&cx).await.unwrap(), free);
++            txn.write_page(&cx, free, &sample_page(0x71)).await.unwrap();
++            let eof = txn.allocate_page(&cx).await.unwrap();
++            assert!(eof > live);
++            txn.write_page(&cx, eof, &sample_page(0x72)).await.unwrap();
++            for _ in 0..2 {
++                txn.rollback_to_savepoint(&cx, "before").unwrap();
++                assert_eq!(txn.published_visible_commit_seq_hint(), snapshot);
++                assert!(txn.has_pending_writes());
++                assert!(txn.savepoint_quarantined_allocations.contains(&free));
++                assert!(txn.savepoint_quarantined_allocations.contains(&eof));
++                assert!(txn.allocated_from_durable_freelist.contains(&free.get()));
++                assert!(!txn.allocated_from_durable_freelist.contains(&eof.get()));
++                assert!(!txn.live_freelist_pages().contains(&free));
++            }
++            txn.release_savepoint(&cx, "before").unwrap();
++            let returned = txn.prepare_unstaged_allocations();
++            assert!(returned.retained_by_transaction);
++            let queue = Arc::clone(&txn.group_commit_queue);
++            let attempt = Arc::new(PendingGroupCommitTxnAttempt::new(
++                &queue,
++                Arc::clone(&txn.inner),
++                Arc::clone(&txn.db_file),
++                Arc::clone(&txn.committed_snapshot),
++                Arc::clone(&txn.published),
++                Arc::clone(&txn.writer_idle),
++                txn.cleanup_cx.clone(),
++                txn.original_db_size,
++                txn.mode,
++                txn.is_writer,
++                txn.staged_page_high_water(txn.snapshot_db_size()),
++                returned,
++                Vec::new(),
++                Vec::new(),
++                Vec::new(),
++            ));
++            // Install the production Phase-A receipt before queue admission.
++            // Reconciliation can prove NotCommitted without timing or I/O faults.
++            txn.pending_group_commit_attempt = Some(attempt);
++            drop(txn);
++            {
++                let inner = pager.inner.lock().unwrap();
++                assert!(!inner.freelist.contains(&free));
++                assert!(!inner.abandoned_eof_reservations.contains(&free));
++            }
++            assert!(queue.has_process_root_finalization_attempt());
++            settle_pending_group_commit_finalization(&queue).await.unwrap();
++            settle_pending_group_commit_finalization(&queue).await.unwrap();
++            assert!(!queue.has_process_root_finalization_attempt());
++            assert_eq!(frames.lock().unwrap().len(), frame_count);
++            {
++                let inner = pager.inner.lock().unwrap();
++                assert_eq!(inner.active_transactions, 0);
++                assert_eq!(
++                    inner.freelist.iter().filter(|&&page| page == free).count(),
++                    1,
++                    "a dropped pending commit must return the committed-free page exactly once",
++                );
++                assert!(!inner.abandoned_eof_reservations.contains(&free));
++                assert!(inner.abandoned_eof_reservations.contains(&eof));
++                assert!(!inner.freelist.contains(&eof));
++            }
++
++            // No reopen/checkpoint/peer refresh may conceal the local loss.
++            let mut next = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
++            assert_eq!(next.allocate_page(&cx).await.unwrap(), free);
++            assert_eq!(
++                next.get_page(&cx, live).await.unwrap().as_bytes(),
++                sample_page(0x42).as_slice(),
++            );
++            next.write_page(&cx, free, &sample_page(0x61)).await.unwrap();
++            next.commit(&cx).await.unwrap();
++            drop(next);
++            let mut reader = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
++            assert_eq!(
++                reader.get_page(&cx, free).await.unwrap().as_bytes(),
++                sample_page(0x61).as_slice(),
++            );
++            assert_eq!(
++                reader.get_page(&cx, live).await.unwrap().as_bytes(),
++                sample_page(0x42).as_slice(),
++            );
++            reader.rollback(&cx).await.unwrap();
++        });
++    }
++
+     #[test]
+     fn rollback_after_authorized_group_commit_reports_commit_and_keeps_page_live() {
+         asupersync::test_utils::run_test(|| async {
