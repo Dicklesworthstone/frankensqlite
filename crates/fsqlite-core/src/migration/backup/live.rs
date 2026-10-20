@@ -346,6 +346,18 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
 
+    fn run_live_backup_test<F, Fut>(f: F)
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(1, 2)
+            .build()
+            .expect("failed to build test runtime");
+        runtime.block_on(f());
+    }
+
     const PEER_PATH: &str = "FSQLITE_MIGRATION_CAPTURE_PEER_PATH";
     const PEER_ACTION: &str = "FSQLITE_MIGRATION_CAPTURE_PEER_ACTION";
     const PEER_DONE: &str = "FSQLITE_CAPTURE_PEER_ASSERTIONS_PASSED";
@@ -446,7 +458,7 @@ mod tests {
 
     #[test]
     fn wal_capture_excludes_peer_writes_and_checkpoints_but_preserves_readers() {
-        asupersync::test_utils::run_test(|| async {
+        run_live_backup_test(|| async {
             let (directory, db, stock) = fixture(true);
             let conn = Connection::open_schema_only(&db).await.unwrap();
             let cx = conn.root_cx().create_child();
@@ -471,7 +483,7 @@ mod tests {
 
     #[test]
     fn rollback_capture_excludes_peer_commits_and_restores_a_standalone_main() {
-        asupersync::test_utils::run_test(|| async {
+        run_live_backup_test(|| async {
             let (directory, db, stock) = fixture(false);
             let conn = Connection::open_schema_only(&db).await.unwrap();
             let cx = conn.root_cx().create_child();
@@ -490,7 +502,7 @@ mod tests {
 
     #[test]
     fn failed_wal_output_retains_selection_and_releases_source_fences() {
-        asupersync::test_utils::run_test(|| async {
+        run_live_backup_test(|| async {
             let (directory, db, stock) = fixture(true);
             let conn = Connection::open_schema_only(&db).await.unwrap();
             let first = capture_migration_backup(&conn).await.unwrap();
@@ -519,7 +531,7 @@ mod tests {
 
     #[test]
     fn cancellation_after_main_retains_selection_and_releases_fences() {
-        asupersync::test_utils::run_test(|| async {
+        run_live_backup_test(|| async {
             let (directory, db, stock) = fixture(true);
             let conn = Connection::open_schema_only(&db).await.unwrap();
             let first = capture_migration_backup(&conn).await.unwrap();
@@ -543,7 +555,7 @@ mod tests {
 
     #[test]
     fn rollback_capture_refuses_noninert_journal_and_accepts_zeroed_header() {
-        asupersync::test_utils::run_test(|| async {
+        run_live_backup_test(|| async {
             let (directory, db, stock) = fixture(false);
             let conn = Connection::open_schema_only(&db).await.unwrap();
             let journal = sidecar_path(&db, "-journal");
@@ -566,7 +578,7 @@ mod tests {
 
     #[test]
     fn frame_free_wal_is_preserved_and_pre_cancelled_capture_creates_no_generation() {
-        asupersync::test_utils::run_test(|| async {
+        run_live_backup_test(|| async {
             let (directory, db, stock) = fixture(true);
             stock.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
             let conn = Connection::open_schema_only(&db).await.unwrap();

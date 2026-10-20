@@ -482,6 +482,18 @@ pub(crate) async fn run_first_open_migration(
 mod tests {
     use super::*;
 
+    fn run_migration_test<F, Fut>(f: F)
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(1, 2)
+            .build()
+            .expect("failed to build test runtime");
+        runtime.block_on(f());
+    }
+
     /// Stock-created, fully checkpointed input with a genuine freelist hole.
     /// No FrankenSQLite connection or migration marker exists before damage.
     #[cfg(any(unix, windows))]
@@ -533,7 +545,7 @@ mod tests {
     #[test]
     #[cfg(any(unix, windows))]
     fn ordinary_open_repairs_only_after_preserving_the_original_native_image() {
-        asupersync::test_utils::run_test(|| async {
+        run_migration_test(|| async {
             for wal_mode in [false, true] {
                 let (directory, db, before, freed) = orphaned_upgrade_fixture(wal_mode);
                 // Exercise the actual default opener, not only the backup API.
@@ -562,7 +574,7 @@ mod tests {
     #[test]
     #[cfg(any(unix, windows))]
     fn automatic_upgrade_selection_failure_leaves_damage_retryable_without_repair() {
-        asupersync::test_utils::run_test(|| async {
+        run_migration_test(|| async {
             let (directory, db, before, _) = orphaned_upgrade_fixture(false);
             let selector = migration_backup_receipt_path(&db);
             host_fs::create_dir_all(&selector).unwrap();
@@ -591,7 +603,7 @@ mod tests {
         use fsqlite_types::flags::VfsOpenFlags;
         use fsqlite_vfs::{UnixVfs, Vfs as _, VfsFile as _};
 
-        asupersync::test_utils::run_test(|| async {
+        run_migration_test(|| async {
             let (_directory, db, before, _) = orphaned_upgrade_fixture(true);
             let conn = Connection::open_schema_only(&db).await.unwrap();
             assert!(conn.is_concurrent_mode_default());
@@ -687,7 +699,7 @@ mod tests {
 
     #[test]
     fn clean_marker_publication_failure_is_incomplete_and_can_retry() {
-        asupersync::test_utils::run_test(|| async {
+        run_migration_test(|| async {
             let (directory, db_path) = migration_sqlite_fixture(false);
             let marker_path = migration_marker_path(&db_path);
             host_fs::create_dir_all(&marker_path).unwrap();
@@ -727,7 +739,7 @@ mod tests {
 
     #[test]
     fn failed_birth_marker_is_not_reported_as_marked_at_birth() {
-        asupersync::test_utils::run_test(|| async {
+        run_migration_test(|| async {
             let directory = tempfile::tempdir().unwrap().keep();
             let db_path = directory.join("new.db").to_str().unwrap().to_owned();
             let marker_path = migration_marker_path(&db_path);
@@ -753,7 +765,7 @@ mod tests {
 
     #[test]
     fn unresolved_index_corruption_does_not_publish_completion() {
-        asupersync::test_utils::run_test(|| async {
+        run_migration_test(|| async {
             let (_directory, db_path) = migration_sqlite_fixture(true);
             let conn = Connection::open_schema_only(&db_path).await.unwrap();
             let before = conn.validate_database_integrity(false).await.unwrap_err();
@@ -783,7 +795,7 @@ mod tests {
 
     #[test]
     fn required_backup_failure_is_incomplete_not_clean() {
-        asupersync::test_utils::run_test(|| async {
+        run_migration_test(|| async {
             let (_directory, db_path) = migration_sqlite_fixture(true);
             let backup = migration_backup_receipt_path(&db_path);
             host_fs::create_dir_all(&backup).unwrap();

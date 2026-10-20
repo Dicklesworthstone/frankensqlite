@@ -84,11 +84,23 @@ fn stock_integrity(db: &str) -> String {
         .expect("stock integrity_check")
 }
 
+fn run_migration_test<F, Fut>(f: F)
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .blocking_threads(1, 2)
+        .build()
+        .expect("failed to build test runtime");
+    runtime.block_on(f());
+}
+
 /// AC precondition: a database created by the current code is stamped at birth
 /// (so reopens short-circuit) and needs no repair or backup.
 #[test]
 fn clean_database_is_stamped_at_birth_without_repair() {
-    asupersync::test_utils::run_test(|| async {
+    run_migration_test(|| async {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = dir.path().join("clean.db").to_string_lossy().into_owned();
 
@@ -120,7 +132,7 @@ fn clean_database_is_stamped_at_birth_without_repair() {
 /// preserved at the backup; stock C SQLite reads the repaired image as `ok`.
 #[test]
 fn prefix_corrupt_database_is_repaired_on_first_open() {
-    asupersync::test_utils::run_test(|| async {
+    run_migration_test(|| async {
         let dir = tempfile::tempdir().expect("tempdir");
         let (db, _freed) = craft_prefix_corrupt_db(dir.path(), "prefix.db").await;
         assert!(
@@ -151,6 +163,21 @@ fn prefix_corrupt_database_is_repaired_on_first_open() {
             backup.exists(),
             "original preserved at the pre-migration backup"
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            for private_path in [migration_marker_path(&db), backup.clone()] {
+                let mode = std::fs::metadata(&private_path)
+                    .expect("metadata")
+                    .permissions()
+                    .mode();
+                assert_eq!(
+                    mode & 0o077,
+                    0,
+                    "GH#517: migration sidecar/backup must not expose group/other bits ({private_path:?} mode={mode:o})"
+                );
+            }
+        }
         assert_ne!(
             std::fs::read(&backup).unwrap(),
             std::fs::read(&db).unwrap(),
@@ -173,7 +200,7 @@ fn prefix_corrupt_database_is_repaired_on_first_open() {
 /// that database and must not skip it on the header stamp.
 #[test]
 fn stock_created_database_written_by_frankensqlite_still_gets_the_pass() {
-    asupersync::test_utils::run_test(|| async {
+    run_migration_test(|| async {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = dir.path().join("stock.db").to_string_lossy().into_owned();
         {
@@ -250,7 +277,7 @@ fn stock_created_database_written_by_frankensqlite_still_gets_the_pass() {
 
 #[test]
 fn migration_runs_once_per_version() {
-    asupersync::test_utils::run_test(|| async {
+    run_migration_test(|| async {
         let dir = tempfile::tempdir().expect("tempdir");
         let (db, _freed) = craft_prefix_corrupt_db(dir.path(), "once.db").await;
 
@@ -277,7 +304,7 @@ fn migration_runs_once_per_version() {
 /// repair is idempotent (re-freeing already-free pages is a no-op).
 #[test]
 fn forced_rerun_is_idempotent() {
-    asupersync::test_utils::run_test(|| async {
+    run_migration_test(|| async {
         let dir = tempfile::tempdir().expect("tempdir");
         let (db, _freed) = craft_prefix_corrupt_db(dir.path(), "idem.db").await;
 
@@ -303,7 +330,7 @@ fn forced_rerun_is_idempotent() {
 /// simulates the interrupt by deleting the marker after a successful pass.
 #[test]
 fn interrupted_before_marker_completes_on_next_open() {
-    asupersync::test_utils::run_test(|| async {
+    run_migration_test(|| async {
         let dir = tempfile::tempdir().expect("tempdir");
         let (db, _freed) = craft_prefix_corrupt_db(dir.path(), "interrupt.db").await;
 
@@ -340,7 +367,7 @@ fn opt_out_leaves_corrupt_database_untouched() {
         );
         return;
     }
-    asupersync::test_utils::run_test(|| async {
+    run_migration_test(|| async {
         let dir = tempfile::tempdir().expect("tempdir");
         let (db, _freed) = craft_prefix_corrupt_db(dir.path(), "optout.db").await;
 
@@ -444,7 +471,7 @@ async fn table_exists(conn: &Connection, name: &str) -> bool {
 #[cfg(feature = "ext-fts5")]
 #[test]
 fn legacy_contentless_fts5_content_shadow_is_reclaimed_on_first_open() {
-    asupersync::test_utils::run_test(|| async {
+    run_migration_test(|| async {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = craft_legacy_contentless_orphan_db(dir.path(), "orphan.db").await;
         // Model a pre-fix upgrader: strip the birth marker.
@@ -538,7 +565,7 @@ fn legacy_contentless_fts5_content_shadow_is_reclaimed_on_first_open() {
 #[cfg(feature = "ext-fts5")]
 #[test]
 fn integrity_check_notes_orphaned_contentless_content_shadow() {
-    asupersync::test_utils::run_test(|| async {
+    run_migration_test(|| async {
         let dir = tempfile::tempdir().expect("tempdir");
         // Keep the birth marker: the migration is AlreadyMigrated and does NOT
         // run, so the orphan survives and the note is observable.
