@@ -1903,12 +1903,26 @@ impl Parser {
             self.expect_token(&TokenKind::LeftParen)?;
             let mut columns = Vec::new();
             let mut constraints = Vec::new();
+            let mut active_constraint_name: Option<String> = None;
             loop {
                 if self.is_table_constraint_start() {
-                    constraints.push(self.parse_table_constraint()?);
-                } else {
-                    columns.push(self.parse_column_def()?);
+                    let mut constraint = self.parse_table_constraint()?;
+                    if constraint.name.is_some() {
+                        active_constraint_name.clone_from(&constraint.name);
+                    } else if active_constraint_name.is_some() {
+                        constraint.name.clone_from(&active_constraint_name);
+                    }
+                    constraints.push(constraint);
+                    if self.eat(&TokenKind::Comma) {
+                        active_constraint_name = None;
+                        continue;
+                    }
+                    if self.is_table_constraint_start() {
+                        continue;
+                    }
+                    break;
                 }
+                columns.push(self.parse_column_def()?);
                 if !self.eat(&TokenKind::Comma) {
                     break;
                 }
@@ -2246,11 +2260,10 @@ impl Parser {
     }
 
     fn parse_table_constraint(&mut self) -> Result<TableConstraint, ParseError> {
-        let name = if self.eat_kw(&TokenKind::KwConstraint) {
-            Some(self.parse_identifier()?)
-        } else {
-            None
-        };
+        let mut name = None;
+        while self.eat_kw(&TokenKind::KwConstraint) {
+            name = Some(self.parse_identifier()?);
+        }
         let kind = if self.eat_kw(&TokenKind::KwPrimary) {
             self.expect_kw(&TokenKind::KwKey)?;
             self.expect_token(&TokenKind::LeftParen)?;
