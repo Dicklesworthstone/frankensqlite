@@ -5398,12 +5398,18 @@ fn codegen_select_without_rowid_unique_seek(
 /// affinity, or a string literal against TEXT affinity with BINARY on the
 /// column and the ASC key term), so a longer probe prefix lands on exactly the
 /// rows the leading-column block would have kept.
+///
+/// A bind parameter pins a term too when [`index_range_bound_is_seek_safe`]
+/// accepts it: the probe then coerces the bound value to the column's
+/// affinity before the seek (the returned affinity), exactly as the equality
+/// filter does, so the longer prefix still lands on the filter's rows.
 fn composite_equality_scan_extra_prefix<'e>(
     idx: &IndexSchema,
     table: &TableSchema,
     table_alias: Option<&str>,
+    schema: &[TableSchema],
     where_clause: Option<&'e Expr>,
-) -> Vec<&'e Expr> {
+) -> Vec<(&'e Expr, Option<char>)> {
     let Some(where_expr) = where_clause else {
         return Vec::new();
     };
@@ -5450,14 +5456,33 @@ fn composite_equality_scan_extra_prefix<'e>(
             } if pins_column(right) => Some(left.as_ref()),
             _ => None,
         });
-        let exact = literal.is_some_and(|literal| match literal {
-            Expr::Literal(Literal::Integer(_), _) => column.affinity == 'D',
-            Expr::Literal(Literal::String(_), _) => column.affinity == 'B',
-            _ => false,
+        let pinned = literal.and_then(|literal| match literal {
+            Expr::Literal(Literal::Integer(_), _) if column.affinity == 'D' => {
+                Some((literal, None))
+            }
+            Expr::Literal(Literal::String(_), _) if column.affinity == 'B' => {
+                Some((literal, None))
+            }
+            bound
+                if is_placeholder_bound(bound)
+                    && index_range_bound_is_seek_safe(
+                        table,
+                        table_alias,
+                        schema,
+                        &column.name,
+                        bound,
+                    ) =>
+            {
+                Some((
+                    bound,
+                    matches!(column.affinity, 'B' | 'C' | 'D' | 'E').then_some(column.affinity),
+                ))
+            }
+            _ => None,
         });
-        match literal {
-            Some(literal) if exact => extra.push(literal),
-            _ => break,
+        match pinned {
+            Some(pinned) => extra.push(pinned),
+            None => break,
         }
     }
     extra
@@ -5628,7 +5653,7 @@ fn codegen_select_index_equality_scan(
     // `(1, 'x')` block instead of walking every `a = 1` entry. The residual
     // filter still checks the whole WHERE on each row.
     let extra_prefix = if composite_prefix_probe && residual_filter && !descending {
-        composite_equality_scan_extra_prefix(idx_schema, table, table_alias, where_clause)
+        composite_equality_scan_extra_prefix(idx_schema, table, table_alias, schema, where_clause)
     } else {
         Vec::new()
     };
@@ -5649,9 +5674,42 @@ fn codegen_select_index_equality_scan(
         0,
     );
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    for (offset, literal) in extra_prefix.iter().enumerate() {
-        emit_expr(b, literal, probe_key_regs + 1 + offset as i32, None);
+    for (offset, (bound, affinity)) in extra_prefix.iter().enumerate() {
+        let key = probe_key_regs + 1 + offset as i32;
+        emit_expr(b, bound, key, None);
+        if is_placeholder_bound(bound) {
+            // `k = NULL` holds for no row, so a NULL bind ends the scan empty.
+            b.emit_jump_to_label(Opcode::IsNull, key, 0, fast_path_done_label, P4::None, 0);
+            // The equality filter compares the bind under the column's
+            // affinity; the probe takes the same coercion so its storage
+            // class matches the stored keys (as the range seek does).
+            if let Some(affinity) = affinity {
+                b.emit_op(
+                    Opcode::Affinity,
+                    key,
+                    1,
+                    0,
+                    P4::Affinity(affinity.to_string()),
+                    0,
+                );
+            }
+        }
     }
+    // bd-gtjlv: the scan ends where the whole pinned prefix ends, not only the
+    // leading term's block; otherwise it walks (and filters) every later entry
+    // of that block. Only when an empty block is authoritative for the leading
+    // term (exact, or checked at run time): otherwise an empty narrowed block
+    // would send the scan to the full-table fallback where it used to finish
+    // the leading block. The one-term probe keeps its leading-key compare.
+    let block_end_fields = if extra_prefix.is_empty()
+        || !(exact_seek || runtime_exact_type_mask.is_some())
+    {
+        1
+    } else {
+        u16::try_from(probe_field_count).map_err(|_| {
+            CodegenError::Unsupported("composite equality prefix too wide".to_owned())
+        })?
+    };
 
     let saw_index_match_reg = b.alloc_reg();
     b.emit_op(Opcode::Integer, 0, saw_index_match_reg, 0, P4::None, 0);
@@ -5730,7 +5788,7 @@ fn codegen_select_index_equality_scan(
             probe_record_reg,
             duplicate_run_done,
             P4::None,
-            1,
+            block_end_fields,
         );
     }
 
