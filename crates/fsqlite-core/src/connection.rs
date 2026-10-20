@@ -35,6 +35,14 @@ mod conformal_retry;
 mod pragma_maintenance;
 mod qualified_column_binding;
 
+/// Required mirror refreshes and optional prepared-read acceleration have
+/// different admission rules. Only the latter may decline row hydration.
+#[derive(Clone, Copy)]
+enum MemdbRowHydrationMode {
+    Explicit(bool),
+    PreparedFastPath,
+}
+
 use conformal_retry::{ConformalRetryBudget, ConformalRetryBudgetCell};
 
 use hashbrown::HashMap as HbHashMap;
@@ -25696,13 +25704,13 @@ impl Connection {
                 && self.memdb_row_hydration_suppressed.get() == 0)
     }
 
-    /// PR#401 invariant (GH#402 companion): connections opened through the
-    /// schema-only family promise bounded-memory, pager-backed row reads, so
-    /// the opportunistic prepared-query MemDB fast path must never bulk-
-    /// hydrate the whole file into `MemDatabase` on their behalf. Derived
-    /// from the open mode: `schema_only_open` is set exclusively by the
-    /// schema-only open family (every variant — read-only, writable
-    /// existing-only, and deferred-FTS5), never by ordinary opens.
+    /// PR#401 / GH#492: schema-only connections never opt into whole-file row
+    /// hydration; ordinary file connections do so only for small images.
+    /// This cheap candidate check uses the last published logical size, not
+    /// filesystem metadata (which misses WAL-resident growth). The refresh
+    /// rechecks the budget against its freshly bound publication before it
+    /// hydrates, so a peer growing a previously small database cannot bypass
+    /// the bound. A stale large estimate can only decline an optimization.
     ///
     /// This used to read `allow_lazy_contentless_fts5`, which happened to
     /// carry the same value until `1e4db3c69` enabled lazy contentless FTS5
@@ -25712,6 +25720,18 @@ impl Connection {
     #[inline]
     fn defer_memdb_row_hydration(&self) -> bool {
         self.schema_only_open
+            || (!self.pager.is_memory()
+                && !self.file_backed_memdb_hydration_within_budget(
+                    self.pager.published_snapshot().db_size,
+                ))
+    }
+
+    /// Bound the image eligible for optional acceleration, not total RSS or
+    /// correctness-required mirror loads. Decoded rows have their own overhead.
+    #[inline]
+    fn file_backed_memdb_hydration_within_budget(&self, db_size: u32) -> bool {
+        const MAX_IMAGE_BYTES: u64 = 8 * 1024 * 1024;
+        u64::from(db_size) * u64::from(self.pager.page_size().get()) <= MAX_IMAGE_BYTES
     }
 
     #[inline]
@@ -26298,7 +26318,7 @@ impl Connection {
         self.refresh_memdb_if_stale_with_publication_and_mode(
             cx,
             scenario_id,
-            self.should_eagerly_hydrate_memdb_rows(),
+            MemdbRowHydrationMode::Explicit(self.should_eagerly_hydrate_memdb_rows()),
         )
         .await
     }
@@ -26307,15 +26327,28 @@ impl Connection {
         &self,
         cx: &Cx,
         scenario_id: &'static str,
-        hydrate_rows: bool,
+        mode: MemdbRowHydrationMode,
     ) -> Result<BoundPagerPublication> {
+        let hydration_requested = |snapshot: &PagerPublishedSnapshot| match mode {
+            MemdbRowHydrationMode::Explicit(hydrate_rows) => hydrate_rows,
+            MemdbRowHydrationMode::PreparedFastPath => {
+                !self.schema_only_open
+                    && (self.pager.is_memory()
+                        || self.file_backed_memdb_hydration_within_budget(snapshot.db_size))
+            }
+        };
         if let Some(publication) = self.cached_autocommit_publication(scenario_id)
-            && (!hydrate_rows || self.memdb_rows_loaded.get())
+            && (!hydration_requested(&publication.snapshot) || self.memdb_rows_loaded.get())
         {
             return Ok(publication);
         }
 
         let publication = self.bind_pager_publication(cx, scenario_id).await?;
+        // Reevaluate after binding: another connection may have grown the
+        // database since the candidate check. The prebound reload below also
+        // rejects a transaction whose visibility sequence differs from this
+        // publication, rather than hydrating a newer, potentially larger image.
+        let hydrate_rows = hydration_requested(&publication.snapshot);
         if !self.skip_statement_memdb_refresh.get()
             && (publication.snapshot.visible_commit_seq > *self.memdb_visible_commit_seq.borrow()
                 || (hydrate_rows && !self.memdb_rows_loaded.get()))
@@ -30661,7 +30694,11 @@ impl Connection {
             && !self.memdb_requires_active_txn_reload.get()
         {
             let _ = self
-                .refresh_memdb_if_stale_with_publication_and_mode(cx, "memdb_staleness_check", true)
+                .refresh_memdb_if_stale_with_publication_and_mode(
+                    cx,
+                    "memdb_staleness_check",
+                    MemdbRowHydrationMode::Explicit(true),
+                )
                 .await?;
         }
         if !self.clean_memory_prepared_memdb_fast_path_candidate(stmt) {
@@ -30709,7 +30746,7 @@ impl Connection {
             .refresh_memdb_if_stale_with_publication_and_mode(
                 cx,
                 "clean_file_backed_memdb_staleness_check",
-                true,
+                MemdbRowHydrationMode::PreparedFastPath,
             )
             .await?;
         stmt.ensure_schema_identity_unchanged_after_local_refresh()?;
@@ -60953,9 +60990,9 @@ impl Connection {
         self.hydrate_memdb_armed_by_capture(cx).await?;
 
         if self.committed_pager_refresh_allowed() {
-            // PR#401 invariant: schema-only opens never bulk-hydrate file rows
-            // into MemDatabase through the prepared fast path; their reads stay
-            // pager-backed (see `defer_memdb_row_hydration`).
+            // PR#401 / GH#492: schema-only and large ordinary file connections
+            // keep prepared reads pager-backed. Only small ordinary images
+            // qualify for optional MemDatabase hydration.
             let hydrate_file_backed_fast_path = !self.defer_memdb_row_hydration()
                 && stmt
                     .prepared_query_fast_path
@@ -60966,7 +61003,7 @@ impl Connection {
                     .refresh_memdb_if_stale_with_publication_and_mode(
                         cx,
                         "memdb_staleness_check",
-                        true,
+                        MemdbRowHydrationMode::PreparedFastPath,
                     )
                     .await?;
             } else if !self.memdb_rows_loaded.get() && self.should_eagerly_hydrate_memdb_rows() {
@@ -74823,7 +74860,7 @@ impl Connection {
                     .refresh_memdb_if_stale_with_publication_and_mode(
                         &cx,
                         "explicit_begin",
-                        hydrate_rows_at_begin,
+                        MemdbRowHydrationMode::Explicit(hydrate_rows_at_begin),
                     )
                     .await
                 {

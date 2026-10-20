@@ -311,7 +311,6 @@ fn run(mode: OpenMode) {
 }
 
 #[test]
-#[ignore = "GH#492 pending production fix; run explicitly with --ignored --nocapture"]
 fn ordinary_post_commit_reads_are_bounded() {
     run(OpenMode::Ordinary);
 }
@@ -332,9 +331,24 @@ fn small_ordinary_database_retains_memdb_acceleration() {
             .expect("open tiny db");
         let row = conn.query_row(LITERAL_POINT).await.expect("tiny point read");
         assert_eq!(row.values(), &[SqliteValue::Integer(0)]);
+        assert_eq!(
+            conn.memdb_row_hydration_count(),
+            0,
+            "ad-hoc unprepared point reads stay pager-backed (bd-xml0z / bd-jdjee)"
+        );
+        let stmt = conn
+            .prepare(POINT)
+            .await
+            .expect("prepare tiny parameterized point read");
+        let rows = stmt
+            .query_with_params(&[SqliteValue::Text("h7".into())])
+            .await
+            .expect("tiny prepared point read");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values(), &[SqliteValue::Integer(0)]);
         assert!(
             conn.memdb_row_hydration_count() > 0,
-            "small databases retain the optional MemDatabase fast path"
+            "small databases retain the optional prepared MemDatabase fast path"
         );
         conn.close().await.expect("close tiny db");
     });
@@ -515,7 +529,6 @@ fn run_wal_growth(mode: OpenMode) {
 }
 
 #[test]
-#[ignore = "GH#492 pending production fix; run explicitly with --ignored --nocapture"]
 fn ordinary_prepared_reads_switch_to_pager_after_wal_only_growth() {
     run_wal_growth(OpenMode::Ordinary);
 }
