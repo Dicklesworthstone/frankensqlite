@@ -173,10 +173,13 @@ impl NativePageTransaction {
         self.reservations.iter().copied().collect()
     }
 
-    /// Whether this active transaction has a private replacement or tombstone.
+    /// Whether this active or indeterminate transaction has a private replacement or tombstone.
     #[must_use]
     pub fn is_page_dirty(&self, page: PageNumber) -> bool {
-        self.state == NativePageTransactionState::Active && self.writes.contains_key(&page)
+        matches!(
+            self.state,
+            NativePageTransactionState::Active | NativePageTransactionState::Indeterminate
+        ) && self.writes.contains_key(&page)
     }
 
     fn finish(&mut self, state: NativePageTransactionState) {
