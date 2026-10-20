@@ -77232,11 +77232,20 @@ impl Connection {
         // with_integrity_txn borrows active_txn). `None` (no active txn) keeps
         // the committed-state walk, which validates the on-disk trunk structure
         // and uses the published size.
-        let active_state: Option<(Vec<PageNumber>, u32)> = self
-            .active_txn
-            .borrow()
-            .as_ref()
-            .map(|txn| (txn.live_integrity_freelist_pages(), txn.live_db_size()));
+        //
+        // A read-only pager never loads its freelist (only allocation needs
+        // it), so its live set is always empty: inside BEGIN on a read-only
+        // connection every free page then read as "page N is never used" on a
+        // valid image. Such a pager cannot hold a write transaction, so the
+        // committed on-disk walk is exact there.
+        let active_state: Option<(Vec<PageNumber>, u32)> = if self.pager.is_readonly() {
+            None
+        } else {
+            self.active_txn
+                .borrow()
+                .as_ref()
+                .map(|txn| (txn.live_integrity_freelist_pages(), txn.live_db_size()))
+        };
         self.with_integrity_txn(async |cx, txn| {
             let page1 = txn.get_page(cx, PageNumber::ONE).await?;
             let page1_bytes = page1.as_ref();
