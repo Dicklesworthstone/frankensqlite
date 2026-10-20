@@ -331,3 +331,178 @@ for (const f of formats) {
     assert.equal(target.db.prepare("SELECT count(*) n FROM sqlite_schema WHERE name='__fsqlite_changeset_receipts'").get().n, 0);
   });
 }
+
+for (const f of formats) {
+  const inspect = (...args) => (f.name === 'changeset' ? codec.inspectChangeset : codec.inspectPatchset)(...args);
+  test(`${f.name}: summary validates native records and retains only frozen metadata`, () => {
+    const db = new DatabaseSync(':memory:');
+    db.exec("CREATE TABLE t(id INTEGER PRIMARY KEY,v); CREATE TABLE u(a,b,v,PRIMARY KEY(b,a)) WITHOUT ROWID; INSERT INTO t VALUES(1,'old'),(2,'removed')");
+    const session = db.createSession();
+    try {
+      db.exec("UPDATE t SET v=x'00ff' WHERE id=1; DELETE FROM t WHERE id=2; INSERT INTO t VALUES(3,1.5); INSERT INTO u VALUES('key',9,9223372036854775807)");
+      const bytes = new Uint8Array(session[f.name]());
+      const eager = f.decode(bytes), reader = f.prepare(bytes), summary = inspect(bytes);
+      assert.deepEqual(summary, { byteLength: bytes.length, changeCount: 4,
+        tables: eager.map(({ name, primaryKey, changes }) => ({ name, primaryKey, changeCount: changes.length })) });
+      assert.deepEqual(summary.tables, reader.tables);
+      assert.ok(Object.isFrozen(summary) && Object.isFrozen(summary.tables));
+      assert.equal(Symbol.iterator in summary, false);
+      for (const t of summary.tables) {
+        assert.ok(Object.isFrozen(t) && Object.isFrozen(t.primaryKey));
+        assert.deepEqual(Object.keys(t).sort(), ['changeCount','name','primaryKey']);
+      }
+      const saved = JSON.stringify(summary);
+      bytes.fill(0); structuredClone(bytes.buffer, { transfer: [bytes.buffer] });
+      assert.equal(JSON.stringify(summary), saved);
+      assert.deepEqual(inspect(new Uint8Array()), { byteLength: 0, changeCount: 0, tables: [] });
+    } finally { session.close(); db.close(); }
+  });
+
+  test(`${f.name}: summary rejects corrupt final records with identical eager error evidence`, () => {
+    const bytes = f.encode([table([insert(1n,'first'), insert(2n,new Uint8Array([0,255,7]))]),
+      table([insert(3n,'last')], 'u')]);
+    const compare = wire => {
+      const expected = errorOf(() => f.decode(wire));
+      assert.deepEqual(errorOf(() => inspect(wire)), expected);
+      if (expected === null) assert.equal(inspect(wire).changeCount,
+        f.decode(wire).reduce((n,t) => n+t.changes.length,0));
+    };
+    for (let n=0; n<bytes.length; n++) compare(bytes.subarray(0,n));
+    for (let n=0; n<bytes.length; n++) {
+      const wire=bytes.slice(); wire[n]^=0xff; compare(wire);
+    }
+    const wrong = (f.name === 'changeset' ? codec.encodePatchset : codec.encodeChangeset)([table([insert(1n,'x')])]);
+    assert.throws(() => inspect(wrong), { code: 'ERR_FSQLITE_CHANGESET_FORMAT' });
+    const repeated = new Uint8Array([...bytes,...bytes]);
+    assert.throws(() => inspect(repeated), { code: 'ERR_FSQLITE_CHANGESET_FORMAT' });
+  });
+
+  test(`${f.name}: summary enforces complete-message budgets and intrinsic fixed-input admission`, () => {
+    const bytes = f.encode([table([insert(1n,'a'),insert(2n,'b')]),table([insert(3n,'c')],'u')]);
+    const exact={maxBytes:bytes.length,maxTables:2,maxColumns:2,maxChanges:3,maxCells:6};
+    assert.equal(inspect(bytes,exact).changeCount,3);
+    for (const key of Object.keys(exact)) {
+      const limits={...exact,[key]:exact[key]-1};
+      assert.deepEqual(errorOf(()=>inspect(bytes,limits)),errorOf(()=>f.decode(bytes,limits)));
+      assert.throws(()=>inspect(bytes,limits),{code:'ERR_FSQLITE_CHANGESET_LIMIT'});
+    }
+    const storage=new Uint8Array(bytes.length+4); storage.set(bytes,2);
+    const view=storage.subarray(2,-2); let calls=0;
+    for (const key of ['buffer','byteOffset','byteLength','length','slice','subarray'])
+      Object.defineProperty(view,key,{get(){calls++;throw new Error(key);}});
+    assert.equal(inspect(view).byteLength,bytes.length); assert.equal(calls,0);
+    structuredClone(storage.buffer,{transfer:[storage.buffer]});
+    for(const bad of [view,new Proxy(bytes,{}),new Uint8Array(new SharedArrayBuffer(32)),
+      new Uint8Array(new ArrayBuffer(32,{maxByteLength:64}))])
+      assert.throws(()=>inspect(bad),{code:'ERR_FSQLITE_CHANGESET_INPUT'});
+  });
+}
+
+// Admission through the production receiver/pump, using actual SQLite for
+// receiver transactions and a small SQL-backed transport-outbox fixture. This
+// does not qualify the separate persistent ChangesetOutbox implementation.
+import { createHash } from 'node:crypto';
+import { CHANGESET_DELIVERY_PROTOCOL, ChangesetReceiver, ChangesetDeliveryPump } from '../src/changeset-delivery.ts';
+const digest = bytes => createHash('sha256').update(bytes).digest('hex');
+const envelope = (bytes, id='summary:one') => ({protocol:CHANGESET_DELIVERY_PROTOCOL,
+  receiverId:'receiver',deliveryId:id,sha256:digest(bytes),changeset:bytes});
+function nativeDelivery(t, count=1024) {
+  const db=new DatabaseSync(':memory:'); let session;
+  try {
+    db.exec('CREATE TABLE t(id INTEGER PRIMARY KEY,v)');
+    session=db.createSession({table:'t'});
+    const insert=db.prepare('INSERT INTO t VALUES(?,?)');
+    for(let n=0;n<count;n++) insert.run(BigInt(n),n%3===0?new Uint8Array([n%256,0,255]):`row-${n}\0界`);
+    return new Uint8Array(session.changeset());
+  } finally { session?.close(); db.close(); }
+}
+for(const journaled of [false,true]) {
+  const journalPolicy=journaled?{rebaseJournal:{journalId:'receiver:history'}}:{};
+  test(`delivery summary ${journaled?'journaled':'ordinary'}: native rows, owned input and exact replay decisions`,async t=>{
+    const wire=nativeDelivery(t), original=wire.slice(), target=new SqlTarget(t);
+    target.db.exec("INSERT INTO t VALUES(0,'receiver conflict')");
+    let policies=0, confirms=0;
+    const receiver=new ChangesetReceiver(target,{receiverId:'receiver',tables:['t'],...journalPolicy,
+      onConflict:()=>{policies++;return 'replace';},confirmCommit:async()=>{confirms++;}});
+    const operation=receiver.receive(envelope(wire));
+    wire.fill(0); structuredClone(wire.buffer,{transfer:[wire.buffer]});
+    const receipt=await operation;
+    assert.equal(receipt.applied,1024); assert.equal(receipt.omitted,0); assert.equal(receipt.sha256,digest(original));
+    assert.equal(receipt.byteLength,original.length); assert.equal(receipt.confirmed,true);
+    assert.equal(target.db.prepare('SELECT count(*) n FROM t').get().n,1024);
+    const reference=new DatabaseSync(':memory:'); t.after(()=>reference.close());
+    reference.exec('CREATE TABLE t(id INTEGER PRIMARY KEY,v)'); reference.applyChangeset(original);
+    assert.deepEqual(rows(target.db,'t'),rows(reference,'t'));
+    const replay=await receiver.receive(envelope(original));
+    assert.equal(replay.replayed,true); assert.equal(policies,1); assert.equal(confirms,2);
+    if(journaled){
+      assert.equal((await receiver.rebaseJournal.head()).position,1);
+      assert.equal((await receiver.rebaseJournal.read('summary:one')).messageSha256,digest(original));
+    }
+  });
+
+  test(`delivery summary ${journaled?'journaled':'ordinary'}: every invalid tail is rejected before SQL or confirmation`,async t=>{
+    const wire=nativeDelivery(t,8), target=new SqlTarget(t); let confirms=0;
+    const receiver=new ChangesetReceiver(target,{receiverId:'receiver',tables:['t'],...journalPolicy,confirmCommit:async()=>{confirms++;}});
+    const invalid=[wire.subarray(0,-1),new Uint8Array([...wire,...wire]),
+      codec.encodePatchset([table([insert(1n,'wrong format')])])];
+    for(const bytes of invalid){
+      const before=target.log.length;
+      await assert.rejects(receiver.receive(envelope(bytes)),e=>e.phase==='validate');
+      assert.equal(target.log.length,before); assert.equal(confirms,0);
+    }
+    const wrong=envelope(wire); wrong.sha256='0'.repeat(64);
+    await assert.rejects(receiver.receive(wrong),e=>e.phase==='validate');
+    assert.equal(target.log.length,0); assert.equal(confirms,0);
+    assert.equal((await receiver.receive(envelope(wire))).applied,8);
+  });
+
+  test(`delivery summary ${journaled?'journaled':'ordinary'}: malformed source counts cannot authorize transmission`,async t=>{
+    const wire=nativeDelivery(t,8), target=new SqlTarget(t), db=new DatabaseSync(':memory:'); t.after(()=>db.close());
+    db.exec('CREATE TABLE outgoing(seq INTEGER PRIMARY KEY,id TEXT,hash TEXT,payload BLOB,n INTEGER,acked INTEGER)');
+    db.prepare('INSERT INTO outgoing VALUES(1,?,?,?,?,0)').run('summary:source',digest(wire),wire,9);
+    let sends=0;
+    const outbox=sqlOutbox(db);
+    const receiver=new ChangesetReceiver(target,{receiverId:'receiver',tables:['t'],...journalPolicy,confirmCommit:async()=>{}});
+    const pump=new ChangesetDeliveryPump(outbox,{receiverId:'receiver',confirmSource:async()=>{},
+      deliver:async message=>{sends++;return receiver.receive(message);}});
+    await assert.rejects(pump.run(),e=>e.phase==='source-read');
+    assert.equal(sends,0); assert.equal(db.prepare('SELECT acked FROM outgoing').get().acked,0);
+    assert.equal(target.log.length,0);
+    db.exec('UPDATE outgoing SET n=8');
+    assert.equal((await pump.run()).applied,8); assert.equal(sends,1);
+    assert.equal(db.prepare('SELECT acked FROM outgoing').get().acked,1);
+    assert.equal(db.prepare('SELECT length(payload) n FROM outgoing').get().n,0);
+  });
+}
+function sqlOutbox(db) {
+  const metadata=r=>({sequence:BigInt(r.seq),deliveryId:r.id,sha256:r.hash,
+    byteLength:r.size,changes:r.n,acknowledged:r.acked===1});
+  const row=()=>db.prepare('SELECT *,length(payload) size FROM outgoing').get();
+  // Retain original byte_length independently when acknowledgement reclaims BLOBs.
+  const size=row().size;
+  return {
+    pending:async()=>{const r=row();return r.acked?[]:[metadata({...r,size})];},
+    read:async id=>{const r=row();return id===r.id?{delivery:metadata({...r,size}),changeset:r.acked?null:r.payload}:null;},
+    acknowledge:async(id,hash)=>Boolean(db.prepare('UPDATE outgoing SET acked=1,payload=zeroblob(0) WHERE id=? AND hash=? AND acked=0').run(id,hash).changes),
+  };
+}
+for(const omission of [false,true]) test(`delivery summary pump: ${omission?'sender omission consent':'lost confirmation'} retains exact payload until confirmed replay`,async t=>{
+  const wire=nativeDelivery(t,4), target=new SqlTarget(t), db=new DatabaseSync(':memory:');t.after(()=>db.close());
+  target.db.exec("INSERT INTO t VALUES(0,'local')");
+  db.exec('CREATE TABLE outgoing(seq INTEGER PRIMARY KEY,id TEXT,hash TEXT,payload BLOB,n INTEGER,acked INTEGER)');
+  db.prepare('INSERT INTO outgoing VALUES(1,?,?,?,?,0)').run('summary:retry',digest(wire),wire,4);
+  let policy=0, confirms=0;
+  const receiver=new ChangesetReceiver(target,{receiverId:'receiver',tables:['t'],rebaseJournal:{journalId:'retry:history'},
+    onConflict:()=>{policy++;return omission?'omit':'replace';},
+    confirmCommit:async()=>{confirms++;if(!omission&&confirms===1)throw new Error('lost confirmation');}});
+  const options={receiverId:'receiver',confirmSource:async()=>{},deliver:message=>receiver.receive(message)};
+  const outbox=sqlOutbox(db);
+  await assert.rejects(new ChangesetDeliveryPump(outbox,options).run());
+  assert.equal(db.prepare('SELECT acked FROM outgoing').get().acked,0);
+  assert.deepEqual(new Uint8Array(db.prepare('SELECT payload FROM outgoing').get().payload),wire);
+  const result=await new ChangesetDeliveryPump(outbox,{...options,allowOmissions:omission}).run();
+  assert.equal(result.replays,1); assert.equal(result.deliveries,1); assert.equal(result.omitted,omission?1:0);
+  assert.equal(policy,1);assert.equal(confirms,2);assert.equal((await receiver.rebaseJournal.head()).position,1);
+  assert.equal(db.prepare('SELECT acked FROM outgoing').get().acked,1);
+});

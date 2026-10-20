@@ -54,6 +54,12 @@ export interface ChangesetEntry<Change extends PatchsetChange = ChangesetChange>
   readonly changeIndex: number;
   readonly change: Change;
 }
+/** Complete-message validation metadata, retaining neither wire nor row images. */
+export interface ChangesetSummary {
+  readonly byteLength: number;
+  readonly changeCount: number;
+  readonly tables: readonly ChangesetTableInfo[];
+}
 /**
  * One fully validated, privately owned Session message with repeatable cursors.
  * Each cursor decodes one row at a time; returned BLOBs are independent copies.
@@ -61,11 +67,7 @@ export interface ChangesetEntry<Change extends PatchsetChange = ChangesetChange>
  * This is not network-stream ingestion, authentication, or a database snapshot.
  */
 export interface ChangesetReader<Change extends PatchsetChange = ChangesetChange>
-  extends Iterable<ChangesetEntry<Change>> {
-  readonly byteLength: number;
-  readonly changeCount: number;
-  readonly tables: readonly ChangesetTableInfo[];
-}
+  extends ChangesetSummary, Iterable<ChangesetEntry<Change>> {}
 /** @internal Native apply_v2 rebase records, NOT executable changesets. */
 export interface ChangesetRebaseTable {
   readonly name: string;
@@ -234,6 +236,49 @@ export function decodePatchset(
 }
 
 /**
+ * Validate every record and return only immutable layouts and counts. Parsing
+ * retains at most the current decoded row, not the complete decoded message.
+ * The fixed input is borrowed synchronously; no input bytes are copied or held
+ * by the result. This is NOT a cursor, authentication, or authority to use later
+ * mutated bytes. Use prepareChangesetReader when an owned replay is required.
+ */
+export function inspectChangeset(
+  bytes: Uint8Array,
+  options?: ChangesetLimits,
+): ChangesetSummary {
+  const policy = resolveChangesetLimits(options);
+  return summarizeSession(fixedInput(bytes, policy.maxBytes), policy, false);
+}
+
+/** Validate the explicit compact format without inventing before-image evidence. */
+export function inspectPatchset(
+  bytes: Uint8Array,
+  options?: ChangesetLimits,
+): ChangesetSummary {
+  const policy = resolveChangesetLimits(options);
+  return summarizeSession(fixedInput(bytes, policy.maxBytes), policy, true);
+}
+
+/** One complete validation pass shared by summaries and privately owned readers. */
+function summarizeSession(
+  bytes: Uint8Array, policy: Limits, patchset: boolean,
+): ChangesetSummary {
+  const tables: { name: string; primaryKey: readonly number[]; changeCount: number }[] = [];
+  let changeCount = 0;
+  for (const entry of walkSession(bytes, policy, patchset)) {
+    if (entry.tableIndex === tables.length)
+      tables.push({ ...entry.table, changeCount: 0 });
+    tables[entry.tableIndex]!.changeCount++;
+    changeCount++;
+  }
+  return Object.freeze({
+    byteLength: bytes.byteLength,
+    changeCount,
+    tables: Object.freeze(tables.map(table => Object.freeze(table))),
+  });
+}
+
+/**
  * Capture and validate the ENTIRE message synchronously before returning a
  * cursor. Even an invalid last record is rejected before any row can escape.
  * Caller mutation/detachment after return cannot affect later iteration.
@@ -261,18 +306,9 @@ function prepareSessionReader(
 ): ChangesetReader<PatchsetChange> {
   const policy = resolveChangesetLimits(options);
   const owned = new Uint8Array(fixedInput(bytes, policy.maxBytes));
-  const tables: { name: string; primaryKey: readonly number[]; changeCount: number }[] = [];
-  let changeCount = 0;
-  for (const entry of walkSession(owned, policy, patchset)) {
-    if (entry.tableIndex === tables.length)
-      tables.push({ ...entry.table, changeCount: 0 });
-    tables[entry.tableIndex]!.changeCount++;
-    changeCount++;
-  }
+  const summary = summarizeSession(owned, policy, patchset);
   return Object.freeze({
-    byteLength: owned.byteLength,
-    changeCount,
-    tables: Object.freeze(tables.map(table => Object.freeze(table))),
+    ...summary,
     *[Symbol.iterator](): IterableIterator<ChangesetEntry<PatchsetChange>> {
       // Only this closure owns the wire. Neither cursor output nor metadata
       // exposes its buffer; breaking one cursor cannot invalidate another.

@@ -4,7 +4,7 @@ import type {
   ChangesetTarget,
 } from "./changeset-apply";
 import { applyChangeset } from "./changeset-apply";
-import { decodeChangeset } from "./changeset-codec";
+import { inspectChangeset } from "./changeset-codec";
 import type { ChangesetOutbox, OutboxDelivery } from "./changeset-outbox";
 import type { ChangesetRebaseJournalOptions } from "./changeset-rebase-journal";
 import { ChangesetRebaseJournal } from "./changeset-rebase-journal";
@@ -351,7 +351,9 @@ export class ChangesetReceiver {
       id = identity(field(message, "deliveryId"), 512);
       const sha256 = digest(field(message, "sha256")),
         bytes = ownBytes(field(message, "changeset"), this.#maxBytes);
-      const changes = decodeChangeset(bytes).reduce((n, t) => n + t.changes.length, 0);
+      // Count only after validating every record, without retaining decoded
+      // rows ahead of applyChangeset's privately owned row-at-a-time reader.
+      const changes = inspectChangeset(bytes).changeCount;
       if ((await hash(bytes)) !== sha256) input("Payload does not match its advertised digest");
       budget.checkpoint();
       phase = "receiver-apply";
@@ -592,7 +594,7 @@ export class ChangesetDeliveryPump {
         if (
           bytes.byteLength !== current.byteLength ||
           (await hash(bytes)) !== current.sha256 ||
-          decodeChangeset(bytes).reduce((n, t) => n + t.changes.length, 0) !== current.changes
+          inspectChangeset(bytes).changeCount !== current.changes
         ) {
           input("Outbox payload disagrees with the selected identity/digest/count");
         }
