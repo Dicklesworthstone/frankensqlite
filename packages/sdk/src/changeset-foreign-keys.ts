@@ -1,4 +1,6 @@
 import type { ChangesetExecutor, ChangesetTarget } from "./changeset-apply";
+import { runChangesetScope } from "./changeset-scope";
+import type { ChangesetScopeErrors } from "./changeset-scope";
 
 export class ChangesetForeignKeyError extends Error {
   constructor(
@@ -98,105 +100,17 @@ async function clean(tx: ChangesetExecutor, names: readonly string[], checkpoint
   }
 }
 
-/** Drain admitted SQL and reject retained executors after the callback ends. */
-async function runWork<T>(
-  tx: ChangesetExecutor, work: (tx: ChangesetExecutor) => Promise<T>, checkpoint: () => void,
-): Promise<T> {
-  let accepting = true;
-  let childActive = false;
-  const nested = tx.transaction;
-  const pending = new Set<Promise<unknown>>(), failures: unknown[] = [];
-  const unsettledChildren: unknown[] = [];
-  const submit = <U>(operation: () => Promise<U>, recovered?: () => boolean): Promise<U> => {
-    if (!accepting) return Promise.reject(new ChangesetForeignKeyError(
-      "ERR_FSQLITE_FOREIGN_KEY_STATE", "Deferred foreign-key SQL scope has ended"));
-    if (unsettledChildren.length !== 0) return Promise.reject(new ChangesetForeignKeyError(
-      "ERR_FSQLITE_FOREIGN_KEY_STATE", "Child cleanup is uncertain; no further SQL was admitted",
-      { cause: unsettledChildren[0] }, Object.freeze([...unsettledChildren])));
-    if (childActive) return Promise.reject(new ChangesetForeignKeyError(
-      "ERR_FSQLITE_FOREIGN_KEY_BUSY", "The child transaction owns this SQL scope"));
-    const promise = (async () => {
-      checkpoint();
-      const result = await operation();
-      checkpoint();
-      return result;
-    })();
-    pending.add(promise);
-    void promise.then(() => pending.delete(promise), error => {
-      pending.delete(promise);
-      if (recovered?.() !== true) failures.push(error);
-    });
-    return promise;
-  };
-  const scoped: ChangesetExecutor = {
-    execute: (sql, params) => submit(() => tx.execute(sql, params)),
-    query: (sql, params) => submit(() => tx.query(sql, params)),
-  };
-  if (typeof nested === "function") {
-    scoped.transaction = <U>(childWork: (child: ChangesetExecutor) => Promise<U>): Promise<U> => {
-      if (typeof childWork !== "function") return Promise.reject(new ChangesetForeignKeyError(
-        "ERR_FSQLITE_FOREIGN_KEY_INPUT", "A child transaction callback is required"));
-      if (pending.size !== 0) return Promise.reject(new ChangesetForeignKeyError(
-        "ERR_FSQLITE_FOREIGN_KEY_BUSY", "Settle parent work before starting a child transaction"));
-      let recovered = false;
-      return submit(async () => {
-        childActive = true;
-        let callbackFailed = false, callbackError: unknown;
-        try {
-          // Do not toggle deferral or require a clean child boundary. A child
-          // may insert a reference whose parent arrives later in this same
-          // application; the unchanged outer clean() still checks all schemas.
-          return await nested.call(tx, async (child: ChangesetExecutor) => {
-            try { return await runWork(child, childWork, checkpoint); }
-            catch (error: unknown) { callbackFailed = true; callbackError = error; throw error; }
-          }) as U;
-        } catch (error: unknown) {
-          // The owned-target contract returns the EXACT callback rejection
-          // only after successful rollback. Boundary/cleanup failures are
-          // sticky even if application code catches the child rejection.
-          recovered = callbackFailed && Object.is(error, callbackError) && childCleanupComplete(error);
-          if (!recovered) unsettledChildren.push(error);
-          throw error;
-        } finally { childActive = false; }
-      }, () => recovered);
-    };
-  }
-  Object.freeze(scoped);
-  let value: T;
-  try { value = await work(scoped); }
-  catch (error: unknown) {
-    // Finally joins any admitted child before this branch completes. Retain
-    // uncertain child cleanup alongside a separately thrown callback error.
-    accepting = false;
-    await Promise.allSettled(pending);
-    if (unsettledChildren.length !== 0) {
-      throw new ChangesetForeignKeyError("ERR_FSQLITE_FOREIGN_KEY_STATE",
-        "A child transaction did not confirm cleanup", { cause: error },
-        Object.freeze([...unsettledChildren]));
-    }
-    throw error;
-  }
-  finally { accepting = false; await Promise.allSettled(pending); }
-  if (unsettledChildren.length !== 0) {
-    throw new ChangesetForeignKeyError("ERR_FSQLITE_FOREIGN_KEY_STATE",
-      "A child transaction did not confirm cleanup", { cause: failures[0] },
-      Object.freeze([...unsettledChildren]));
-  }
-  if (failures.length) throw failures[0];
-  checkpoint();
-  return value;
-}
-
-/** Error metadata may become stricter while the owning child settles. */
-function childCleanupComplete(error: unknown): boolean {
-  if ((typeof error !== "object" && typeof error !== "function") || error === null) return true;
-  try {
-    const state = error as { cleanupErrors?: unknown; userRecoverable?: unknown };
-    const cleanup = state.cleanupErrors, recoverable = state.userRecoverable;
-    return recoverable !== false &&
-      (cleanup === undefined || (Array.isArray(cleanup) && cleanup.length === 0));
-  } catch { return false; }
-}
+const scopeErrors: ChangesetScopeErrors = Object.freeze({
+  closed: () => new ChangesetForeignKeyError(
+    "ERR_FSQLITE_FOREIGN_KEY_STATE", "Deferred foreign-key SQL scope has ended"),
+  invalidChild: () => new ChangesetForeignKeyError(
+    "ERR_FSQLITE_FOREIGN_KEY_INPUT", "A child transaction callback is required"),
+  busy: () => new ChangesetForeignKeyError(
+    "ERR_FSQLITE_FOREIGN_KEY_BUSY", "Settle the owning SQL scope before admitting this operation"),
+  uncertain: (cause: unknown, cleanup: readonly unknown[]) => new ChangesetForeignKeyError(
+    "ERR_FSQLITE_FOREIGN_KEY_STATE", "Child cleanup is uncertain; no further SQL was admitted",
+    { cause }, cleanup),
+});
 
 /**
  * Opt-in FK deferral for one real owned transaction/savepoint. Wrap the target
@@ -246,7 +160,9 @@ export function withDeferredForeignKeys(target: ChangesetTarget): ChangesetTarge
             if (previous === 0) await tx.execute("PRAGMA defer_foreign_keys=ON");
             if (await flag(tx, "defer_foreign_keys") !== 1)
               fail("STATE", "The SQL target did not enable foreign-key deferral");
-            const value = await runWork(tx, work, time.checkpoint);
+            // Children keep deferral enabled and share the outer clean check.
+            // Callback admission/settlement is identical to source capture.
+            const value = await runChangesetScope(tx, work, time.checkpoint, scopeErrors);
             if (await flag(tx, "foreign_keys") !== 1 || await flag(tx, "defer_foreign_keys") !== 1)
               fail("STATE", "Application changed foreign-key enforcement pragmas");
             const after = await schemas(tx);

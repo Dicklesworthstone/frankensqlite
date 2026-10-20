@@ -7,6 +7,7 @@ import type {
   ChangesetValue,
 } from "./changeset-codec";
 import { encodeChangeset } from "./changeset-codec";
+import { runChangesetScope } from "./changeset-scope";
 
 export interface CaptureChangesetOptions {
   /** Opt in to native Session writable-column packing; receivers recompute generated values. */
@@ -490,108 +491,19 @@ export async function runCaptureWork<T>(
   work: (tx: ChangesetExecutor) => T | Promise<T>,
   checkpoint: () => void,
 ): Promise<T> {
-  // One uncertainty fence for this entire callback tree. A caught grandchild
-  // failure cannot disappear when an enclosing child rolls back successfully.
-  // Keep only the first obligation, not an unbounded list of caught failures.
-  let uncertain: { error: unknown } | undefined;
-  const stateError = (cause: unknown): ChangesetCaptureError => new ChangesetCaptureError(
-    "ERR_FSQLITE_CAPTURE_STATE", "Child cleanup is uncertain; no further capture SQL was admitted",
-    { cause }, Object.freeze([uncertain!.error]),
-  );
-  const cleanupComplete = (error: unknown): boolean => {
-    if ((typeof error !== "object" && typeof error !== "function") || error === null) return true;
-    try {
-      const state = error as { cleanupErrors?: unknown; userRecoverable?: unknown };
-      const cleanup = state.cleanupErrors;
-      return state.userRecoverable !== false &&
-        (cleanup === undefined || (Array.isArray(cleanup) && cleanup.length === 0));
-    } catch { return false; }
-  };
-  async function run<U>(
-    owner: ChangesetExecutor, callback: (scoped: ChangesetExecutor) => U | Promise<U>,
-  ): Promise<U> {
-    let accepting = true, childActive = false, failed = false, inFlight = 0;
-    let firstFailure: unknown;
-    const pending = new Set<Promise<unknown>>();
-    const admission = (child: boolean): void => {
-      if (!accepting) throw new ChangesetCaptureError(
-        "ERR_FSQLITE_CAPTURE_INPUT", "Capture callback SQL scope has ended");
-      if (uncertain !== undefined) throw stateError(uncertain.error);
-      if (childActive || (child && inFlight !== 0)) throw new ChangesetCaptureError(
-        "ERR_FSQLITE_CAPTURE_BUSY", "Settle the owning SQL scope before admitting this operation");
-    };
-    const submit = <V>(operation: () => Promise<V>, recovered?: () => boolean): Promise<V> => {
-      try { admission(recovered !== undefined); }
-      catch (error: unknown) { return Promise.reject(error); }
-      // Reserve before invoking the adapter: synchronous reentry must not
-      // start a child inside previously admitted parent SQL. Preserve the
-      // adapter's synchronous input-capture boundary; do not defer invocation.
-      inFlight++;
-      const task = (async () => {
-        checkpoint();
-        const result = await operation();
-        checkpoint();
-        return result;
-      })();
-      pending.add(task);
-      const settle = (): void => { pending.delete(task); inFlight--; };
-      void task.then(settle, error => {
-        settle();
-        // Direct SQL remains sticky even if caught. A confirmed child rollback
-        // undoes its SQL, first-touch records AND budget charges, so its caller
-        // may handle that rejection and continue the parent transaction.
-        if (recovered?.() !== true && !failed) { failed = true; firstFailure = error; }
-      });
-      return task;
-    };
-    const scoped: ChangesetExecutor = {
-      execute: (sql, params) => submit(() => owner.execute(sql, params)),
-      query: (sql, params) => submit(() => owner.query(sql, params)),
-    };
-    const nested = owner.transaction;
-    if (typeof nested === "function") {
-      scoped.transaction = <V>(childWork: (child: ChangesetExecutor) => Promise<V>): Promise<V> => {
-        if (typeof childWork !== "function") return Promise.reject(new ChangesetCaptureError(
-          "ERR_FSQLITE_CAPTURE_INPUT", "A child transaction callback is required"));
-        let recovered = false;
-        return submit(async () => {
-          childActive = true;
-          let callbackFailed = false, callbackError: unknown;
-          try {
-            return await nested.call(owner, async (child: ChangesetExecutor) => {
-              try { return await run(child, childWork); }
-              catch (error: unknown) { callbackFailed = true; callbackError = error; throw error; }
-            }) as V;
-          } catch (error: unknown) {
-            // ChangesetExecutor's owned-child contract returns the EXACT
-            // callback rejection only after rollback. Recheck metadata after
-            // settlement; release/rollback failures must never be omissions.
-            recovered = uncertain === undefined && callbackFailed &&
-              Object.is(error, callbackError) && cleanupComplete(error);
-            if (!recovered && uncertain === undefined) uncertain = { error };
-            throw error;
-          } finally { childActive = false; }
-        }, () => recovered);
-      };
-    }
-    Object.freeze(scoped);
-    let value!: U;
-    let callbackFailed = false, callbackError: unknown;
-    try { value = await callback(scoped); }
-    catch (error: unknown) { callbackFailed = true; callbackError = error; }
-    finally {
-      accepting = false;
-      // Join complete child settlement, not merely its callback. Cancellation
-      // cannot race collection/rollback against admitted SQL or savepoints.
-      await Promise.allSettled(pending);
-    }
-    if (uncertain !== undefined) throw stateError(callbackFailed ? callbackError : uncertain.error);
-    if (callbackFailed) throw callbackError;
-    if (failed) throw firstFailure;
-    checkpoint();
-    return value;
-  }
-  return run(tx, work);
+  // Snapshot/outbox capture and deferred FK application must use the same
+  // ownership rules. Only their public error vocabulary differs.
+  return runChangesetScope(tx, work, checkpoint, {
+    closed: () => new ChangesetCaptureError(
+      "ERR_FSQLITE_CAPTURE_INPUT", "Capture callback SQL scope has ended"),
+    invalidChild: () => new ChangesetCaptureError(
+      "ERR_FSQLITE_CAPTURE_INPUT", "A child transaction callback is required"),
+    busy: () => new ChangesetCaptureError(
+      "ERR_FSQLITE_CAPTURE_BUSY", "Settle the owning SQL scope before admitting this operation"),
+    uncertain: (cause, cleanup) => new ChangesetCaptureError(
+      "ERR_FSQLITE_CAPTURE_STATE", "Child cleanup is uncertain; no further capture SQL was admitted",
+      { cause }, cleanup),
+  });
 }
 
 /**
