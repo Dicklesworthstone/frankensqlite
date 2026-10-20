@@ -692,3 +692,349 @@ test("captured table names and limits are owned before asynchronous transaction 
     target.close();
   }
 });
+
+// The owner executes real SQLite savepoints; hooks delay or fail their actual
+// settlement boundaries. No SQL result or capture journal is synthesized.
+class CaptureOwner extends SqlTarget {
+  constructor(ddl = schema, initial = seed) {
+    super(ddl, initial);
+    this.boundaries = [];
+  }
+  async execute(sql, params = []) {
+    await this.beforeSql?.("execute", sql, this.depth);
+    return super.execute(sql, params);
+  }
+  async query(sql, params = []) {
+    await this.beforeSql?.("query", sql, this.depth);
+    return super.query(sql, params);
+  }
+  async transaction(work) {
+    const depth = this.depth++, key = `owner_${++this.serial}`;
+    let begun = false;
+    try {
+      await this.beforeBegin?.(depth);
+      this.db.exec(depth ? `SAVEPOINT ${key}` : "BEGIN");
+      begun = true;
+      this.boundaries.push(["begin", depth]);
+      const scoped = {
+        execute: (sql, params) => this.execute(sql, params),
+        query: (sql, params) => this.query(sql, params),
+        transaction: (child) => this.transaction(child),
+      };
+      const result = await work(scoped);
+      await this.beforeRelease?.(depth);
+      this.db.exec(depth ? `RELEASE ${key}` : "COMMIT");
+      this.boundaries.push(["release", depth]);
+      return result;
+    } catch (error) {
+      if (begun) {
+        try {
+          await this.beforeRollback?.(depth, error);
+          this.db.exec(depth ? `ROLLBACK TO ${key}; RELEASE ${key}` : "ROLLBACK");
+          this.boundaries.push(["rollback", depth]);
+          await this.afterRollback?.(depth, error);
+        } catch (cleanup) {
+          throw new AggregateError([error, cleanup], "capture owner cleanup failed", { cause: error });
+        }
+      }
+      throw error;
+    } finally {
+      this.depth--;
+    }
+  }
+}
+const captureGate = () => {
+  let resolve;
+  const promise = new Promise((r) => { resolve = r; });
+  return { promise, resolve };
+};
+const nextCaptureTurn = () => new Promise((r) => setImmediate(r));
+const captureBusy = { code: "ERR_FSQLITE_CAPTURE_BUSY" };
+const captureState = { code: "ERR_FSQLITE_CAPTURE_STATE" };
+
+for (const cause of [undefined, null, NaN, "rollback", new Error("child abort")]) {
+  test(`capture preserves exact handled child rejection: ${String(cause)}`, async () => {
+    const target = new CaptureOwner();
+    try {
+      const result = await captureChangeset(target, async (tx) => {
+        await assert.rejects(tx.transaction(async (child) => {
+          await child.execute("DELETE FROM t");
+          throw cause;
+        }), (error) => Object.is(error, cause));
+        return tx.transaction(async (child) => {
+          await child.execute("UPDATE t SET value='kept' WHERE id=1");
+          return { answer: 42 };
+        });
+      }, { tables: ["t"], maxRows: 2 });
+      assert.deepEqual(result.value, { answer: 42 });
+      assert.equal(result.changes, 1);
+      assert.equal(result.touchedRows, 1);
+      assert.deepEqual(rows(target), [[1n, "kept", null], [2n, "delete", new Uint8Array([1, 2])]]);
+      noArtifacts(target);
+    } finally { target.close(); }
+  });
+}
+
+test("released grandchildren disappear with their parent rollback and restore capture budgets", async () => {
+  const result = await oracle(async (tx) => {
+    await assert.rejects(tx.transaction(async (child) => {
+      await child.transaction(async (grandchild) => {
+        await grandchild.execute("DELETE FROM t WHERE id=1");
+        await grandchild.execute("INSERT INTO t VALUES(3,'discard',NULL)");
+      });
+      throw new Error("discard parent");
+    }), /discard parent/);
+    await tx.transaction(async (child) => {
+      await child.execute("UPDATE t SET value='final' WHERE id=1");
+      await child.transaction(async (grandchild) => {
+        await grandchild.execute("INSERT INTO t VALUES(4,'retained',NULL)");
+      });
+    });
+  }, schema, seed, ["t"], { maxRows: 2 });
+  assert.equal(result.touchedRows, 2);
+  assert.equal(result.changes, 2);
+});
+
+test("caught child SQL failures force child rollback, not outer rollback after it is confirmed", async () => {
+  const result = await oracle(async (tx) => {
+    await assert.rejects(tx.transaction(async (child) => {
+      await child.execute("INSERT INTO t VALUES(3,'discard',NULL)");
+      await child.execute("INSERT INTO t VALUES(4,'over budget',NULL)").catch(() => {});
+    }), /CAPTURE_LIMIT/);
+    await tx.execute("UPDATE t SET value='survives' WHERE id=1");
+  }, schema, seed, ["t"], { maxRows: 1 });
+  assert.equal(result.touchedRows, 1);
+  assert.equal(result.changes, 1);
+});
+
+test("capture refuses parent SQL and sibling savepoints while a child owns the scope", async () => {
+  const target = new CaptureOwner(), entered = captureGate(), release = captureGate();
+  try {
+    const result = await captureChangeset(target, async (tx) => {
+      const child = tx.transaction(async (inner) => {
+        await inner.execute("INSERT INTO t VALUES(3,'child',NULL)");
+        entered.resolve(); await release.promise;
+        return "child result";
+      });
+      await entered.promise;
+      const before = [target.statements.length, target.boundaries.length];
+      try {
+        await assert.rejects(tx.execute("DELETE FROM t"), captureBusy);
+        await assert.rejects(tx.query("SELECT * FROM t"), captureBusy);
+        await assert.rejects(tx.transaction(async () => {}), captureBusy);
+        assert.deepEqual([target.statements.length, target.boundaries.length], before);
+      } finally { release.resolve(); await child; }
+      assert.equal(await child, "child result");
+      await tx.execute("UPDATE t SET value='parent' WHERE id=1");
+    }, { tables: ["t"] });
+    assert.equal(result.changes, 2);
+    assert.deepEqual(rows(target).map((r) => r[0]), [1n, 2n, 3n]);
+    noArtifacts(target);
+  } finally { release.resolve(); target.close(); }
+});
+
+test("capture will not enter a child while previously admitted parent SQL is unsettled", async () => {
+  const target = new CaptureOwner(), entered = captureGate(), release = captureGate();
+  target.beforeSql = async (kind, sql) => {
+    if (sql === "UPDATE t SET value='held' WHERE id=1") { entered.resolve(); await release.promise; }
+  };
+  try {
+    const result = await captureChangeset(target, async (tx) => {
+      const write = tx.execute("UPDATE t SET value='held' WHERE id=1");
+      await entered.promise;
+      const count = target.boundaries.length;
+      try {
+        await assert.rejects(tx.transaction(async () => {}), captureBusy);
+        assert.equal(target.boundaries.length, count);
+      } finally { release.resolve(); await write; }
+      return tx.transaction(async () => 19);
+    }, { tables: ["t"] });
+    assert.equal(result.value, 19); assert.equal(result.changes, 1);
+    noArtifacts(target);
+  } finally { release.resolve(); target.close(); }
+});
+
+test("capture joins unawaited child and grandchild SQL before collecting the final source image", async () => {
+  const target = new CaptureOwner(), receiver = new SqlTarget(schema, seed);
+  const entered = captureGate(), release = captureGate();
+  let child, grandchild, sql, finished = false;
+  target.beforeSql = async (_kind, statement) => {
+    if (statement === "INSERT INTO t VALUES(3,'late',NULL)") { entered.resolve(); await release.promise; }
+  };
+  const operation = captureChangeset(target, (tx) => {
+    child = tx.transaction(async (inner) => {
+      grandchild = inner.transaction(async (last) => {
+        sql = last.execute("INSERT INTO t VALUES(3,'late',NULL)");
+      });
+    });
+    return "outer result";
+  }, { tables: ["t"] });
+  void operation.then(() => { finished = true; }, () => { finished = true; });
+  try {
+    await Promise.race([entered.promise, operation.then(() => assert.fail("missed held write"))]);
+    await nextCaptureTurn();
+    assert.equal(finished, false); assert.equal(target.depth, 3);
+    assert.equal(target.boundaries.some(([kind]) => kind === "release"), false);
+    release.resolve();
+    const result = await operation;
+    await Promise.all([child, grandchild, sql]);
+    assert.equal(result.value, "outer result"); assert.equal(result.changes, 1);
+    assert.equal(receiver.db.applyChangeset(result.changeset), true);
+    assert.deepEqual(rows(receiver), rows(target)); noArtifacts(target);
+  } finally {
+    release.resolve(); await Promise.allSettled([operation, child, grandchild, sql]);
+    target.close(); receiver.close();
+  }
+});
+
+test("saved child executors expire before owner RELEASE and cannot enter later capture work", async () => {
+  const target = new CaptureOwner(); let saved, checked = 0;
+  target.beforeRelease = async (depth) => {
+    if (depth !== 1) return;
+    const before = [target.statements.length, target.boundaries.length];
+    await assert.rejects(saved.execute("DELETE FROM t"), /scope has ended/);
+    await assert.rejects(saved.query("SELECT 1"), /scope has ended/);
+    await assert.rejects(saved.transaction(async () => {}), /scope has ended/);
+    assert.deepEqual([target.statements.length, target.boundaries.length], before);
+    checked++;
+  };
+  try {
+    const result = await captureChangeset(target, (tx) => tx.transaction(async (child) => {
+      saved = child;
+      await child.execute("UPDATE t SET value='kept' WHERE id=1");
+    }), { tables: ["t"] });
+    assert.equal(result.changes, 1); assert.equal(checked, 1);
+    target.beforeRelease = null;
+    await captureChangeset(target, async (tx) => {
+      await assert.rejects(saved.transaction(async () => {}), /scope has ended/);
+      await tx.execute("UPDATE t SET value='later' WHERE id=2");
+    }, { tables: ["t"] });
+    assert.equal(rows(target)[1][1], "later"); noArtifacts(target);
+  } finally { target.close(); }
+});
+
+for (const stage of ["begin", "release", "rollback", "metadata", "getter"]) {
+  test(`uncertain child ${stage} blocks more capture SQL even when its rejection is caught`, async () => {
+    const target = new CaptureOwner(), cause = new Error(`uncertain ${stage}`);
+    let refusals = 0, observed;
+    if (stage === "begin") target.beforeBegin = (depth) => { if (depth === 1) throw cause; };
+    if (stage === "release") target.beforeRelease = (depth) => { if (depth === 1) throw cause; };
+    if (stage === "rollback") target.afterRollback = (depth) => { if (depth === 1) throw cause; };
+    if (stage === "metadata") target.afterRollback = (depth, error) => {
+      if (depth === 1) error.cleanupErrors = [cause];
+    };
+    if (stage === "getter") target.afterRollback = (depth, error) => {
+      if (depth === 1) Object.defineProperty(error, "cleanupErrors", { get() { throw cause; } });
+    };
+    try {
+      await assert.rejects(captureChangeset(target, async (tx) => {
+        await tx.execute("UPDATE t SET value='outer' WHERE id=1");
+        await tx.transaction(async (child) => {
+          await child.execute("DELETE FROM t WHERE id=2");
+          if (stage !== "release") throw new Error("child callback");
+        }).catch((error) => { observed = error; });
+        const before = [target.statements.length, target.boundaries.length];
+        for (const attempt of [
+          () => tx.execute("DELETE FROM t"), () => tx.query("SELECT 1"),
+          () => tx.transaction(async () => {}),
+        ]) {
+          await assert.rejects(attempt(), captureState); refusals++;
+        }
+        assert.deepEqual([target.statements.length, target.boundaries.length], before);
+      }, { tables: ["t"] }), (error) => {
+        assert.equal(error.code, captureState.code);
+        assert.equal(error.cleanupErrors.length, 1);
+        assert.equal(error.cleanupErrors[0], observed);
+        return true;
+      });
+      assert.equal(refusals, 3, "all admission refusals must actually execute");
+      assert.deepEqual(rows(target).map((r) => r[1]), ["old", "delete"]);
+      noArtifacts(target);
+    } finally { target.close(); }
+  });
+}
+
+test("caught grandchild uncertainty survives confirmed parent rollback and fences the root", async () => {
+  const target = new CaptureOwner(), failure = new Error("grandchild release failed");
+  let refusals = 0;
+  target.beforeRelease = (depth) => { if (depth === 2) throw failure; };
+  try {
+    await assert.rejects(captureChangeset(target, async (tx) => {
+      await tx.transaction(async (child) => {
+        await child.transaction(async (grandchild) => { await grandchild.execute("DELETE FROM t"); }).catch(() => {});
+        await assert.rejects(child.query("SELECT 1"), captureState); refusals++;
+        throw new Error("parent callback failed too");
+      }).catch(() => {});
+      await assert.rejects(tx.execute("DELETE FROM t"), captureState); refusals++;
+    }, { tables: ["t"] }), (error) => error.code === captureState.code && error.cleanupErrors[0] === failure);
+    assert.equal(refusals, 2);
+    assert.deepEqual(rows(target).map((r) => r[1]), ["old", "delete"]); noArtifacts(target);
+  } finally { target.close(); }
+});
+
+test("cancellation waits for child rollback before rejecting capture without a payload", async () => {
+  const target = new CaptureOwner(), controller = new AbortController();
+  const entered = captureGate(), release = captureGate(); let finished = false;
+  target.beforeRollback = async (depth) => { if (depth === 1) { entered.resolve(); await release.promise; } };
+  const operation = captureChangeset(target, async (tx) => {
+    await tx.transaction(async (child) => {
+      await child.execute("DELETE FROM t"); throw new Error("roll back first");
+    }).catch(() => {});
+  }, { tables: ["t"], signal: controller.signal });
+  void operation.then(() => { finished = true; }, () => { finished = true; });
+  try {
+    await Promise.race([entered.promise, operation.then(() => assert.fail("missing rollback"))]);
+    controller.abort("cancel"); await nextCaptureTurn();
+    assert.equal(finished, false); assert.equal(target.depth, 2);
+    release.resolve();
+    await assert.rejects(operation, { code: "ERR_FSQLITE_CAPTURE_CANCELLED" });
+    assert.equal(target.depth, 0);
+    assert.deepEqual(rows(target).map((r) => r[1]), ["old", "delete"]); noArtifacts(target);
+  } finally { release.resolve(); await Promise.allSettled([operation]); target.close(); }
+});
+
+test("uncertain cleanup from unawaited children retains a separately thrown callback cause", async () => {
+  const target = new CaptureOwner(), entered = captureGate(), release = captureGate();
+  const callback = new Error("outer callback failed"), cleanup = new Error("child cleanup uncertain");
+  let child, finished = false;
+  target.afterRollback = (depth) => { if (depth === 1) throw cleanup; };
+  const operation = captureChangeset(target, async (tx) => {
+    child = tx.transaction(async (inner) => {
+      await inner.execute("DELETE FROM t"); entered.resolve(); await release.promise;
+      throw new Error("child rollback");
+    });
+    await entered.promise;
+    throw callback;
+  }, { tables: ["t"] });
+  void operation.then(() => { finished = true; }, () => { finished = true; });
+  try {
+    await entered.promise; await nextCaptureTurn(); assert.equal(finished, false);
+    release.resolve();
+    await assert.rejects(operation, (error) => error.code === captureState.code &&
+      error.cause === callback && error.cleanupErrors[0].errors.includes(cleanup));
+    assert.deepEqual(rows(target).map((r) => r[1]), ["old", "delete"]); noArtifacts(target);
+  } finally { release.resolve(); await Promise.allSettled([operation, child]); target.close(); }
+});
+
+test("invalid child callbacks are rejected before SQL; executors without children remain valid", async () => {
+  const target = new CaptureOwner();
+  try {
+    const result = await captureChangeset(target, async (tx) => {
+      const before = target.boundaries.length;
+      for (const work of [null, undefined, 42]) {
+        await assert.rejects(tx.transaction(work), { code: "ERR_FSQLITE_CAPTURE_INPUT" });
+      }
+      assert.equal(target.boundaries.length, before);
+      await tx.execute("UPDATE t SET value='valid' WHERE id=1");
+    }, { tables: ["t"] });
+    assert.equal(result.changes, 1);
+    const targetWithoutChildren = {
+      transaction: (work) => target.transaction((tx) => work({ execute: tx.execute, query: tx.query })),
+    };
+    await captureChangeset(targetWithoutChildren, async (tx) => {
+      assert.equal(tx.transaction, undefined);
+      await tx.execute("UPDATE t SET value='also valid' WHERE id=2");
+    }, { tables: ["t"] });
+    noArtifacts(target);
+  } finally { target.close(); }
+});
