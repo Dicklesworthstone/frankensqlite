@@ -41,11 +41,15 @@ impl fmt::Display for FrameFreeWalError {
         f.write_str(match self {
             Self::InvalidDatabasePageSize => "invalid main database page size",
             Self::PartialHeader => "partial WAL header is not recovery authority",
-            Self::FrameBytesPresent => "WAL contains frame bytes; committed, uncheckpointed changes must be preserved",
+            Self::FrameBytesPresent => {
+                "WAL contains frame bytes; committed, uncheckpointed changes must be preserved"
+            }
             Self::InvalidHeader => "invalid WAL header",
             Self::InvalidChecksum => "invalid WAL header checksum",
             Self::PageSizeMismatch => "WAL and main database page sizes differ",
-            Self::NotGenerationBinding => "WAL change is not a zero-byte to valid-header generation binding",
+            Self::NotGenerationBinding => {
+                "WAL change is not a zero-byte to valid-header generation binding"
+            }
         })
     }
 }
@@ -159,7 +163,7 @@ pub fn inspect_frame_free_wal(
     }
     let big_endian = magic & 1 != 0;
     let mut checksum = [0_u32; 2];
-    for pair in header[..24].chunks_exact(8) {
+    for pair in header[..24].as_chunks::<8>().0 {
         let decode = |at: usize| {
             let value = [pair[at], pair[at + 1], pair[at + 2], pair[at + 3]];
             if big_endian {
@@ -168,13 +172,19 @@ pub fn inspect_frame_free_wal(
                 u32::from_le_bytes(value)
             }
         };
-        checksum[0] = checksum[0].wrapping_add(decode(0)).wrapping_add(checksum[1]);
-        checksum[1] = checksum[1].wrapping_add(decode(4)).wrapping_add(checksum[0]);
+        checksum[0] = checksum[0]
+            .wrapping_add(decode(0))
+            .wrapping_add(checksum[1]);
+        checksum[1] = checksum[1]
+            .wrapping_add(decode(4))
+            .wrapping_add(checksum[0]);
     }
     if checksum != [word(&header, 24), word(&header, 28)] {
         return Err(FrameFreeWalError::InvalidChecksum);
     }
-    Ok(FrameFreeWalState::Header(FrameFreeWalHeader { bytes: header }))
+    Ok(FrameFreeWalState::Header(FrameFreeWalHeader {
+        bytes: header,
+    }))
 }
 
 /// Verify only an unchanged WAL or an existing empty WAL gaining one header.
@@ -232,7 +242,11 @@ mod tests {
         for pair in bytes[..24].chunks_exact(8) {
             let decode = |slice: &[u8]| {
                 let array: [u8; 4] = slice.try_into().unwrap();
-                if big_endian { u32::from_be_bytes(array) } else { u32::from_le_bytes(array) }
+                if big_endian {
+                    u32::from_be_bytes(array)
+                } else {
+                    u32::from_le_bytes(array)
+                }
             };
             a = a.wrapping_add(decode(&pair[..4])).wrapping_add(b);
             b = b.wrapping_add(decode(&pair[4..])).wrapping_add(a);
@@ -245,11 +259,19 @@ mod tests {
     #[test]
     fn accepts_only_valid_frame_free_observations_in_both_orders() {
         for size in [512, 1024, 2048, 4096, 8192, 16_384, 32_768, 65_536] {
-            assert_eq!(inspect_frame_free_wal(None, size), Ok(FrameFreeWalState::Absent));
-            assert_eq!(inspect_frame_free_wal(Some(&[]), size), Ok(FrameFreeWalState::Empty));
+            assert_eq!(
+                inspect_frame_free_wal(None, size),
+                Ok(FrameFreeWalState::Absent)
+            );
+            assert_eq!(
+                inspect_frame_free_wal(Some(&[]), size),
+                Ok(FrameFreeWalState::Empty)
+            );
             for big_endian in [false, true] {
                 let bytes = header(size, big_endian, 7);
-                let FrameFreeWalState::Header(proof) = inspect_frame_free_wal(Some(&bytes), size).unwrap() else {
+                let FrameFreeWalState::Header(proof) =
+                    inspect_frame_free_wal(Some(&bytes), size).unwrap()
+                else {
                     panic!("expected a verified header");
                 };
                 assert_eq!(proof.as_bytes(), &bytes);
@@ -264,12 +286,18 @@ mod tests {
     fn rejects_every_partial_header_and_any_trailing_bytes() {
         let bytes = header(4096, false, 0);
         for length in 1..32 {
-            assert_eq!(inspect_frame_free_wal(Some(&bytes[..length]), 4096), Err(FrameFreeWalError::PartialHeader));
+            assert_eq!(
+                inspect_frame_free_wal(Some(&bytes[..length]), 4096),
+                Err(FrameFreeWalError::PartialHeader)
+            );
         }
         for extra in [1, 23, 24, 24 + 4096, 2 * (24 + 4096)] {
             let mut framed = bytes.to_vec();
             framed.resize(32 + extra, 0);
-            assert_eq!(inspect_frame_free_wal(Some(&framed), 4096), Err(FrameFreeWalError::FrameBytesPresent));
+            assert_eq!(
+                inspect_frame_free_wal(Some(&framed), 4096),
+                Err(FrameFreeWalError::FrameBytesPresent)
+            );
             assert!(verify_frame_free_wal_transition(Some(&framed), Some(&framed), 4096).is_err());
             assert!(verify_frame_free_wal_transition(Some(&framed), Some(&bytes), 4096).is_err());
         }
@@ -283,8 +311,14 @@ mod tests {
                 for bit in 0..8 {
                     let mut corrupt = original;
                     corrupt[byte] ^= 1 << bit;
-                    assert!(inspect_frame_free_wal(Some(&corrupt), 4096).is_err(), "byte={byte}, bit={bit}, big_endian={big_endian}");
-                    assert!(verify_frame_free_wal_transition(Some(&corrupt), Some(&corrupt), 4096).is_err());
+                    assert!(
+                        inspect_frame_free_wal(Some(&corrupt), 4096).is_err(),
+                        "byte={byte}, bit={bit}, big_endian={big_endian}"
+                    );
+                    assert!(
+                        verify_frame_free_wal_transition(Some(&corrupt), Some(&corrupt), 4096)
+                            .is_err()
+                    );
                 }
             }
         }
@@ -293,13 +327,25 @@ mod tests {
     #[test]
     fn rejects_invalid_or_mismatched_page_sizes_and_versions() {
         for size in [0, 1, 256, 513, 4095, 65_537, 131_072, u32::MAX] {
-            assert_eq!(inspect_frame_free_wal(None, size), Err(FrameFreeWalError::InvalidDatabasePageSize));
-            assert_eq!(inspect_frame_free_wal(Some(&header(size, false, 0)), 4096), Err(FrameFreeWalError::InvalidHeader));
+            assert_eq!(
+                inspect_frame_free_wal(None, size),
+                Err(FrameFreeWalError::InvalidDatabasePageSize)
+            );
+            assert_eq!(
+                inspect_frame_free_wal(Some(&header(size, false, 0)), 4096),
+                Err(FrameFreeWalError::InvalidHeader)
+            );
         }
-        assert_eq!(inspect_frame_free_wal(Some(&header(8192, false, 0)), 4096), Err(FrameFreeWalError::PageSizeMismatch));
+        assert_eq!(
+            inspect_frame_free_wal(Some(&header(8192, false, 0)), 4096),
+            Err(FrameFreeWalError::PageSizeMismatch)
+        );
         let mut version = header(4096, false, 0);
         version[4..8].copy_from_slice(&3_007_001_u32.to_be_bytes());
-        assert_eq!(inspect_frame_free_wal(Some(&version), 4096), Err(FrameFreeWalError::InvalidHeader));
+        assert_eq!(
+            inspect_frame_free_wal(Some(&version), 4096),
+            Err(FrameFreeWalError::InvalidHeader)
+        );
     }
 
     #[test]

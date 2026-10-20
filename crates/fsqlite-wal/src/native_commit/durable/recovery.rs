@@ -17,8 +17,8 @@ use fsqlite_types::{CommitMarker, CommitSeq, ObjectId, OperatingMode};
 use fsqlite_vfs::VfsFile;
 
 use super::{
-    DurableWriteCoordinator, MAX_NATIVE_VALIDATION_BYTES, NativeCommitCandidate,
-    NativeCommitProof, NativeObjectCodec, WriteCoordinator, checkpoint, corrupt, validate_capacity,
+    DurableWriteCoordinator, MAX_NATIVE_VALIDATION_BYTES, NativeCommitCandidate, NativeCommitProof,
+    NativeObjectCodec, WriteCoordinator, checkpoint, corrupt, validate_capacity,
 };
 use crate::native_durability::{
     NativeDurabilityLog, NativeDurabilityRecovery, NativeRecovery, RecoveredNativeLog,
@@ -47,11 +47,21 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> DurableWriteCoordinator<S, M,
     pub fn try_into_recovery(self) -> std::result::Result<(NativeRecovery<S, M>, C), Self> {
         if self.closing
             || (!self.needs_recovery() && self.pending_count() != 0)
-            || self.coordinator.batch.pending.iter().any(|pending| pending.barriers.all_complete())
+            || self
+                .coordinator
+                .batch
+                .pending
+                .iter()
+                .any(|pending| pending.barriers.all_complete())
         {
             return Err(self);
         }
-        Ok((self.log.into_recovery().with_attempt_epoch(Some(self.attempt_epoch)), self.codec))
+        Ok((
+            self.log
+                .into_recovery()
+                .with_attempt_epoch(Some(self.attempt_epoch)),
+            self.codec,
+        ))
     }
 }
 
@@ -90,7 +100,15 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativeCoordinatorRecovery<S, 
     /// Queue bounds are checked by `prepare`, without consuming the owner.
     pub fn new(recovered: RecoveredNativeLog<S, M>, codec: C, max_pending: usize) -> Self {
         let (log, report, attempt_epoch) = recovered.into_reconciliation_parts();
-        Self { log, attempt_epoch, report, codec, max_pending, prepared: None, closing: false }
+        Self {
+            log,
+            attempt_epoch,
+            report,
+            codec,
+            max_pending,
+            prepared: None,
+            closing: false,
+        }
     }
 
     /// The original storage recovery report, never a caller-supplied replay list.
@@ -119,8 +137,14 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativeCoordinatorRecovery<S, 
             return Err(FrankenError::BusyRecovery);
         }
         let coordinator = replay(
-            cx, &self.log, &self.report, &self.codec, self.max_pending, validate,
-        ).await?;
+            cx,
+            &self.log,
+            &self.report,
+            &self.codec,
+            self.max_pending,
+            validate,
+        )
+        .await?;
         self.prepared = Some(coordinator);
         Ok(())
     }
@@ -153,21 +177,31 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativeCoordinatorRecovery<S, 
     /// # Errors
     /// Returns `self` before successful preparation or after close has started.
     #[allow(clippy::result_large_err)] // Returning ownership preserves the exact storage handles.
-    pub fn finish(mut self) -> std::result::Result<
-        (DurableWriteCoordinator<S, M, C>, NativeDurabilityRecovery), Self,
-    > {
+    pub fn finish(
+        mut self,
+    ) -> std::result::Result<(DurableWriteCoordinator<S, M, C>, NativeDurabilityRecovery), Self>
+    {
         if self.closing {
             return Err(self);
         }
-        let Some(coordinator) = self.prepared.take() else { return Err(self); };
-        Ok((DurableWriteCoordinator::from_parts(coordinator, self.log, self.codec), self.report))
+        let Some(coordinator) = self.prepared.take() else {
+            return Err(self);
+        };
+        Ok((
+            DurableWriteCoordinator::from_parts(coordinator, self.log, self.codec),
+            self.report,
+        ))
     }
 
     /// Return to explicit storage recovery without reopening or losing the codec.
     /// This invalidates the old replay and requires both durability barriers again.
-    #[must_use]
     pub fn into_recovery(self) -> (NativeRecovery<S, M>, C) {
-        (self.log.into_recovery().with_attempt_epoch(self.attempt_epoch), self.codec)
+        (
+            self.log
+                .into_recovery()
+                .with_attempt_epoch(self.attempt_epoch),
+            self.codec,
+        )
     }
 
     /// Close the exact retained handles; individual close failures remain retryable.
@@ -220,14 +254,17 @@ impl<S: VfsFile, M: VfsFile> NativeDurabilityLog<S, M> {
             objects.insert(*id, Arc::from(payload));
         }
         let capsule = Arc::clone(
-            objects.get(&marker.capsule_object_id)
+            objects
+                .get(&marker.capsule_object_id)
                 .ok_or_else(|| corrupt("native recovery capsule is missing"))?,
         );
         if blake3::hash(&capsule).as_bytes() != &proof.submission.capsule_digest {
             return Err(corrupt("native recovery capsule digest mismatch"));
         }
         let candidate = NativeCommitCandidate {
-            proof, proof_object_id: marker.proof_object_id, capsule,
+            proof,
+            proof_object_id: marker.proof_object_id,
+            capsule,
         };
         Ok((candidate, objects))
     }
@@ -255,7 +292,8 @@ where
         let (candidate, objects) = log.read_commit_candidate(cx, codec, marker).await?;
         validate(&candidate, &objects)?;
         coordinator.commit_index.record_commit(
-            &candidate.proof.submission.write_set_pages, marker.commit_seq,
+            &candidate.proof.submission.write_set_pages,
+            marker.commit_seq,
         );
         coordinator.commit_seq_tip = marker.commit_seq;
         coordinator.allocated_seq_tip = marker.commit_seq;
@@ -297,8 +335,16 @@ mod live_transfer_tests {
             let size = u32::try_from(bytes.len()).map_err(|_| FrankenError::TooBig)?;
             Ok(vec![SymbolRecord::new(
                 ObjectId::derive_from_canonical_bytes(bytes),
-                Oti { f: u64::from(size), al: 1, t: size, z: 1, n: 1 },
-                0, bytes.to_vec(), SymbolRecordFlags::SYSTEMATIC_RUN_START,
+                Oti {
+                    f: u64::from(size),
+                    al: 1,
+                    t: size,
+                    z: 1,
+                    n: 1,
+                },
+                0,
+                bytes.to_vec(),
+                SymbolRecordFlags::SYSTEMATIC_RUN_START,
             )])
         }
         fn decode(&self, _: &Cx, id: ObjectId, records: &[SymbolRecord]) -> Result<Vec<u8>> {
@@ -315,30 +361,50 @@ mod live_transfer_tests {
     type Driver = DurableWriteCoordinator<File, File, Codec>;
 
     fn run(future: impl Future<Output = ()>) {
-        let _guard = crate::metrics::GLOBAL_GROUP_COMMIT_METRICS_TEST_LOCK.lock().unwrap();
-        RuntimeBuilder::current_thread().blocking_threads(1, 2).build().unwrap().block_on(future);
+        let _guard = crate::metrics::GLOBAL_GROUP_COMMIT_METRICS_TEST_LOCK
+            .lock()
+            .unwrap();
+        RuntimeBuilder::current_thread()
+            .blocking_threads(1, 2)
+            .build()
+            .unwrap()
+            .block_on(future);
     }
 
     fn file(vfs: &MemoryVfs, cx: &Cx, name: &str) -> File {
-        vfs.open(cx, Some(Path::new(name)),
-            VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL).unwrap().0
+        vfs.open(
+            cx,
+            Some(Path::new(name)),
+            VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL,
+        )
+        .unwrap()
+        .0
     }
 
     fn driver(vfs: &MemoryVfs, cx: &Cx) -> Driver {
-        let log = NativeDurabilityLog::create(cx,
-            file(vfs, cx, "objects"), file(vfs, cx, "markers"),
-            NativeDurabilityLimits::default()).unwrap();
+        let log = NativeDurabilityLog::create(
+            cx,
+            file(vfs, cx, "objects"),
+            file(vfs, cx, "markers"),
+            NativeDurabilityLimits::default(),
+        )
+        .unwrap();
         Driver::new(log, Codec, 8).unwrap()
     }
 
     async fn queue(driver: &mut Driver, cx: &Cx, value: u8, time: u64) -> CommitSeq {
         let bytes = [value; 8];
-        driver.stage_symbols(cx, &Codec.encode(cx, &bytes).unwrap()).await.unwrap();
+        driver
+            .stage_symbols(cx, &Codec.encode(cx, &bytes).unwrap())
+            .await
+            .unwrap();
         let submission = CommitSubmission {
             capsule_object_id: ObjectId::derive_from_canonical_bytes(&bytes),
             capsule_digest: *blake3::hash(&bytes).as_bytes(),
             write_set_pages: vec![PageNumber::new(u32::from(value)).unwrap()],
-            witness_refs: vec![], edge_ids: vec![], merge_witness_ids: vec![],
+            witness_refs: vec![],
+            edge_ids: vec![],
+            merge_witness_ids: vec![],
             txn_token: TxnToken::new(TxnId::new(u64::from(value)).unwrap(), TxnEpoch::new(1)),
             begin_seq: driver.committed_tip(),
         };
@@ -362,15 +428,25 @@ mod live_transfer_tests {
             owner = refused(owner);
             assert_eq!(owner.pending_count(), 1);
             assert_eq!(owner.committed_tip(), CommitSeq::ZERO);
-            assert!(owner.flush(&cx, |_, _| Err::<(), _>(FrankenError::Abort)).await.is_err());
+            assert!(
+                owner
+                    .flush(&cx, |_, _| Err::<(), _>(FrankenError::Abort))
+                    .await
+                    .is_err()
+            );
             owner = refused(owner); // A pre-I/O rejection did not abandon the queue.
             owner.flush(&cx, |_, _| Ok(())).await.unwrap();
             owner = refused(owner);
             assert_eq!(owner.take_committed(seq).unwrap().txn_token.id.get(), 1);
-            let (mut storage, codec) = owner.try_into_recovery()
+            let (mut storage, codec) = owner
+                .try_into_recovery()
                 .unwrap_or_else(|_| panic!("quiescent publisher must transfer"));
-            storage.prepare(&cx, |id, records| ready(codec.decode(&cx, id, &records).map(|_| ())))
-                .await.unwrap();
+            storage
+                .prepare(&cx, |id, records| {
+                    ready(codec.decode(&cx, id, &records).map(|_| ()))
+                })
+                .await
+                .unwrap();
             let mut replay = NativeCoordinatorRecovery::new(storage.finish().unwrap(), codec, 8);
             replay.prepare(&cx, |_, _| Ok(())).await.unwrap();
             let (mut owner, report) = replay.finish().unwrap();
@@ -405,10 +481,15 @@ mod live_transfer_tests {
             assert!(owner.needs_recovery());
             owner = refused(owner);
             assert_eq!(owner.take_committed(first).unwrap().commit_seq, first);
-            let (mut storage, codec) = owner.try_into_recovery()
+            let (mut storage, codec) = owner
+                .try_into_recovery()
                 .unwrap_or_else(|_| panic!("failed reservations may transfer after ACK delivery"));
-            storage.prepare(&cx, |id, records| ready(codec.decode(&cx, id, &records).map(|_| ())))
-                .await.unwrap();
+            storage
+                .prepare(&cx, |id, records| {
+                    ready(codec.decode(&cx, id, &records).map(|_| ()))
+                })
+                .await
+                .unwrap();
             let recovered = storage.finish().unwrap();
             assert_eq!(recovered.report().markers.len(), 1);
             assert_eq!(recovered.report().symbol_tail_bytes, 4);
@@ -429,19 +510,32 @@ mod live_transfer_tests {
             owner.take_committed(seq).unwrap();
             let mut markers = file(&vfs, &cx, "markers");
             let mut original = vec![0; usize::try_from(markers.file_size(&cx).unwrap()).unwrap()];
-            assert_eq!(markers.read(&cx, &mut original, 0).await.unwrap(), original.len());
+            assert_eq!(
+                markers.read(&cx, &mut original, 0).await.unwrap(),
+                original.len()
+            );
             markers.truncate(&cx, 0).unwrap();
-            let (mut storage, codec) = owner.try_into_recovery()
+            let (mut storage, codec) = owner
+                .try_into_recovery()
                 .unwrap_or_else(|_| panic!("quiescent publisher must transfer"));
             for _ in 0..2 {
-                assert!(matches!(storage.prepare(&cx, |id, records| {
-                    ready(codec.decode(&cx, id, &records).map(|_| ()))
-                }).await, Err(FrankenError::WalCorrupt { .. })));
+                assert!(matches!(
+                    storage
+                        .prepare(&cx, |id, records| {
+                            ready(codec.decode(&cx, id, &records).map(|_| ()))
+                        })
+                        .await,
+                    Err(FrankenError::WalCorrupt { .. })
+                ));
             }
             markers.write(&cx, &original, 0).await.unwrap();
             markers.close(&cx).unwrap();
-            storage.prepare(&cx, |id, records| ready(codec.decode(&cx, id, &records).map(|_| ())))
-                .await.unwrap();
+            storage
+                .prepare(&cx, |id, records| {
+                    ready(codec.decode(&cx, id, &records).map(|_| ()))
+                })
+                .await
+                .unwrap();
             let (mut log, report) = storage.finish().unwrap().into_log();
             assert_eq!(report.markers.len(), 1);
             log.close(&cx).unwrap();

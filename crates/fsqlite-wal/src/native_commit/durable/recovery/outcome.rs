@@ -12,8 +12,11 @@ use fsqlite_types::cx::Cx;
 use fsqlite_types::{CommitSeq, ObjectId, TxnToken};
 use fsqlite_vfs::VfsFile;
 
-use super::{DurableWriteCoordinator, NativeCommitProof, NativeCoordinatorRecovery, NativeObjectCodec, checkpoint, corrupt};
 use super::super::DurableCommitAcknowledgement;
+use super::{
+    DurableWriteCoordinator, NativeCommitProof, NativeCoordinatorRecovery, NativeObjectCodec,
+    checkpoint, corrupt,
+};
 
 /// An accepted attempt, NOT a durable acknowledgement or permission to retry.
 ///
@@ -38,15 +41,21 @@ pub struct NativeCommitAttempt {
 impl NativeCommitAttempt {
     /// Original transaction identity; not globally unique across databases.
     #[must_use]
-    pub const fn txn_token(&self) -> TxnToken { self.expected.txn_token }
+    pub const fn txn_token(&self) -> TxnToken {
+        self.expected.txn_token
+    }
 
     /// Reserved sequence, not evidence that its marker reached storage.
     #[must_use]
-    pub const fn commit_seq(&self) -> CommitSeq { self.expected.commit_seq }
+    pub const fn commit_seq(&self) -> CommitSeq {
+        self.expected.commit_seq
+    }
 
     /// Exact submitted capsule identity, not an independently supplied page map.
     #[must_use]
-    pub const fn capsule_object_id(&self) -> ObjectId { self.expected.capsule_object_id }
+    pub const fn capsule_object_id(&self) -> ObjectId {
+        self.expected.capsule_object_id
+    }
 }
 
 /// Outcome at one completed, semantically validated recovery boundary.
@@ -77,8 +86,7 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> DurableWriteCoordinator<S, M,
         if self.log.published_tip() != sequence {
             return Err(corrupt("native snapshot coordinator/log tip mismatch"));
         }
-        let time = (sequence != CommitSeq::ZERO)
-            .then_some(self.coordinator.last_commit_time_ns);
+        let time = (sequence != CommitSeq::ZERO).then_some(self.coordinator.last_commit_time_ns);
         Ok((sequence, time))
     }
 
@@ -94,10 +102,18 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> DurableWriteCoordinator<S, M,
     /// Refuses started closes or malformed retained admission metadata.
     /// No payload/metadata I/O, mutation, or sync occurs, even during an outage.
     pub fn commit_attempt(&self, token: TxnToken) -> Result<Option<NativeCommitAttempt>> {
-        if self.closing { return Err(FrankenError::BusyRecovery); }
-        let Some(pending) = self.coordinator.batch.pending.iter()
+        if self.closing {
+            return Err(FrankenError::BusyRecovery);
+        }
+        let Some(pending) = self
+            .coordinator
+            .batch
+            .pending
+            .iter()
             .find(|pending| pending.submission.txn_token == token)
-        else { return Ok(None); };
+        else {
+            return Ok(None);
+        };
         // Successful flushes release encoded proofs before replies are taken.
         // Reconstruct that same canonical proof from the retained reservation
         // when necessary; never confuse a collected reply with an absent commit.
@@ -152,7 +168,11 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativeCoordinatorRecovery<S, 
             return Err(FrankenError::BusyRecovery);
         }
         checkpoint(cx)?;
-        if !self.attempt_epoch.as_ref().is_some_and(|epoch| Arc::ptr_eq(epoch, &attempt.epoch)) {
+        if !self
+            .attempt_epoch
+            .as_ref()
+            .is_some_and(|epoch| Arc::ptr_eq(epoch, &attempt.epoch))
+        {
             return Err(FrankenError::Abort);
         }
         self.log.validate_recovered_lengths(cx)?;
@@ -163,17 +183,21 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativeCoordinatorRecovery<S, 
         } else {
             let ordinal = usize::try_from(attempt.acknowledged_tip.get() - 1)
                 .map_err(|_| FrankenError::TooBig)?;
-            let marker = self.report.markers.get(ordinal)
+            let marker = self
+                .report
+                .markers
+                .get(ordinal)
                 .ok_or_else(|| corrupt("native attempt lost acknowledged history"))?;
             if marker.commit_seq != attempt.acknowledged_tip
-                || Some(ObjectId::derive_from_canonical_bytes(&marker.to_record_bytes()))
-                    != attempt.acknowledged_marker
+                || Some(ObjectId::derive_from_canonical_bytes(
+                    &marker.to_record_bytes(),
+                )) != attempt.acknowledged_marker
             {
                 return Err(corrupt("native attempt changed acknowledged history"));
             }
         }
-        let ordinal = usize::try_from(attempt.commit_seq().get() - 1)
-            .map_err(|_| FrankenError::TooBig)?;
+        let ordinal =
+            usize::try_from(attempt.commit_seq().get() - 1).map_err(|_| FrankenError::TooBig)?;
         let Some(marker) = self.report.markers.get(ordinal) else {
             if self.report.append_blocked() {
                 return Err(FrankenError::BusyRecovery);

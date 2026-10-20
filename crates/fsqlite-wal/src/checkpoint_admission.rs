@@ -19,11 +19,15 @@ use crate::checksum::{
 use crate::wal::WalFile;
 
 fn stale(detail: impl Into<String>) -> FrankenError {
-    FrankenError::CheckpointFailed { detail: detail.into() }
+    FrankenError::CheckpointFailed {
+        detail: detail.into(),
+    }
 }
 
 fn corrupt(detail: impl Into<String>) -> FrankenError {
-    FrankenError::WalCorrupt { detail: detail.into() }
+    FrankenError::WalCorrupt {
+        detail: detail.into(),
+    }
 }
 
 /// `true` means an accepted, still physically empty headerless WAL. No target
@@ -39,9 +43,15 @@ pub(super) async fn validate_source<F: VfsFile>(
     let total = u32::try_from(count)
         .map_err(|_| stale("WAL frame count exceeds the checkpoint counter domain"))?;
     if state.total_frames != total || state.backfilled_frames > total {
-        return Err(stale("checkpoint counters do not describe the accepted WAL snapshot"));
+        return Err(stale(
+            "checkpoint counters do not describe the accepted WAL snapshot",
+        ));
     }
-    if count > 0 && !wal.last_commit_frame_header().is_some_and(|(index, _)| index == count - 1) {
+    if count > 0
+        && wal
+            .last_commit_frame_header()
+            .is_none_or(|(index, _)| index != count - 1)
+    {
         return Err(stale("checkpoint refused an uncommitted WAL suffix"));
     }
     cx.checkpoint().map_err(|_| FrankenError::Interrupt)?;
@@ -65,7 +75,9 @@ pub(super) async fn validate_source<F: VfsFile>(
     let mut frame = vec![0_u8; frame_size];
     if count == 0 {
         if wal.running_checksum() != header_seed {
-            return Err(corrupt("empty checkpoint WAL has a different checksum seed"));
+            return Err(corrupt(
+                "empty checkpoint WAL has a different checksum seed",
+            ));
         }
     } else {
         validate_terminal_frame(cx, wal, header_seed, &mut frame).await?;
@@ -80,7 +92,10 @@ pub(super) async fn validate_source<F: VfsFile>(
     let mut previous = wal.running_checksum();
     for index in count..end {
         cx.checkpoint().map_err(|_| FrankenError::Interrupt)?;
-        let read = wal.file().read(cx, &mut frame, wal.frame_offset(index)).await?;
+        let read = wal
+            .file()
+            .read(cx, &mut frame, wal.frame_offset(index))
+            .await?;
         if read != frame_size {
             return Err(corrupt("WAL changed during checkpoint suffix validation"));
         }
@@ -89,7 +104,10 @@ pub(super) async fn validate_source<F: VfsFile>(
             break;
         }
         let checksum = compute_wal_frame_checksum(
-            &frame, wal.page_size(), previous, wal.big_endian_checksum(),
+            &frame,
+            wal.page_size(),
+            previous,
+            wal.big_endian_checksum(),
         )?;
         if header.checksum != checksum {
             break;
@@ -121,11 +139,15 @@ async fn validate_header<F: VfsFile>(cx: &Cx, wal: &WalFile<F>) -> Result<Sqlite
             continue;
         }
         if &header != wal.header() {
-            return Err(corrupt("WAL generation changed before checkpoint admission"));
+            return Err(corrupt(
+                "WAL generation changed before checkpoint admission",
+            ));
         }
         return Ok(checksum);
     }
-    Err(corrupt("WAL header checksum mismatch during checkpoint admission"))
+    Err(corrupt(
+        "WAL header checksum mismatch during checkpoint admission",
+    ))
 }
 
 /// Bind zero-backfill checkpoints to the accepted terminal commit too. This
@@ -137,7 +159,8 @@ async fn validate_terminal_frame<F: VfsFile>(
     frame: &mut [u8],
 ) -> Result<()> {
     let index = wal.frame_count() - 1;
-    let (_, expected) = wal.last_commit_frame_header()
+    let (_, expected) = wal
+        .last_commit_frame_header()
         .ok_or_else(|| stale("checkpoint has no accepted terminal commit"))?;
     let previous = if index == 0 {
         header_seed
@@ -153,9 +176,8 @@ async fn validate_terminal_frame<F: VfsFile>(
         return Err(corrupt("short checkpoint terminal frame"));
     }
     let header = WalFrameHeader::from_bytes(&frame[..WAL_FRAME_HEADER_SIZE])?;
-    let checksum = compute_wal_frame_checksum(
-        frame, wal.page_size(), previous, wal.big_endian_checksum(),
-    )?;
+    let checksum =
+        compute_wal_frame_checksum(frame, wal.page_size(), previous, wal.big_endian_checksum())?;
     if header.page_number == 0
         || !header.is_commit()
         || header.page_number != expected.page_number
@@ -164,7 +186,9 @@ async fn validate_terminal_frame<F: VfsFile>(
         || header.checksum != expected.checksum
         || checksum != wal.running_checksum()
     {
-        return Err(corrupt("checkpoint terminal frame differs from the accepted commit"));
+        return Err(corrupt(
+            "checkpoint terminal frame differs from the accepted commit",
+        ));
     }
     Ok(())
 }
@@ -180,7 +204,8 @@ async fn validate_frontiers<F: VfsFile>(
     state: CheckpointState,
     frame: &mut [u8],
 ) -> Result<()> {
-    let end = state.backfilled_frames
+    let end = state
+        .backfilled_frames
         .checked_add(plan_checkpoint(mode, state).frames_to_backfill)
         .ok_or_else(|| stale("checkpoint backfill endpoint overflow"))?;
     validate_commit_boundary(cx, wal, header_seed, state.backfilled_frames, frame).await?;
@@ -221,10 +246,10 @@ async fn validate_commit_boundary<F: VfsFile>(
         return Err(corrupt("short checkpoint boundary frame"));
     }
     let header = WalFrameHeader::from_bytes(&frame[..WAL_FRAME_HEADER_SIZE])?;
-    let checksum = compute_wal_frame_checksum(
-        frame, wal.page_size(), previous, wal.big_endian_checksum(),
-    )?;
-    if header.page_number == 0 || header.salts != wal.header().salts || header.checksum != checksum {
+    let checksum =
+        compute_wal_frame_checksum(frame, wal.page_size(), previous, wal.big_endian_checksum())?;
+    if header.page_number == 0 || header.salts != wal.header().salts || header.checksum != checksum
+    {
         return Err(corrupt("invalid checkpoint boundary frame"));
     }
     if !header.is_commit() {

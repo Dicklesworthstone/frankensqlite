@@ -1,9 +1,9 @@
 //! Non-destructive migration of a recovered native prefix into fresh streams.
 
 use super::{
-    COMMIT_MARKER_RECORD_V1_SIZE, CommitMarker, CommitSeq, NativeDurabilityLog, ObjectId,
-    Result, SymbolRecord, SyncKind, VfsFile, checkpoint, corrupt, ensure_distinct_files,
-    read_exact_at, u64_len,
+    COMMIT_MARKER_RECORD_V1_SIZE, CommitMarker, CommitSeq, NativeDurabilityLog, ObjectId, Result,
+    SymbolRecord, SyncKind, VfsFile, checkpoint, corrupt, ensure_distinct_files, read_exact_at,
+    u64_len,
 };
 use fsqlite_error::FrankenError;
 use fsqlite_types::cx::Cx;
@@ -180,7 +180,9 @@ impl<S: VfsFile, M: VfsFile> NativeDurabilityLog<S, M> {
         let marker_width = u64_len(COMMIT_MARKER_RECORD_V1_SIZE)?;
         let marker_count = self.marker_end / marker_width;
         if marker_count != self.published_tip.get() {
-            return Err(corrupt("native prefix copy has an unaccepted marker boundary"));
+            return Err(corrupt(
+                "native prefix copy has an unaccepted marker boundary",
+            ));
         }
         // The entire marker prefix must fit, not just the first publication
         // batch. Exclude retained source tails; they are never exported.
@@ -261,7 +263,9 @@ impl<S: VfsFile, M: VfsFile> NativeDurabilityLog<S, M> {
             || copy.destination.previous_marker != self.previous_marker
             || copy.destination.last_time_ns != self.last_time_ns
         {
-            return Err(corrupt("native prefix copy changed the accepted marker chain"));
+            return Err(corrupt(
+                "native prefix copy changed the accepted marker chain",
+            ));
         }
         let receipt = NativePrefixCopyReceipt {
             commits: marker_count,
@@ -282,9 +286,10 @@ fn regenerate_object<C: NativeObjectCodec>(
     records: Vec<SymbolRecord>,
     payload_limit: usize,
 ) -> Result<Vec<SymbolRecord>> {
-    if records.iter().any(|record| {
-        usize::try_from(record.oti.f).map_or(true, |len| len > payload_limit)
-    }) {
+    if records
+        .iter()
+        .any(|record| usize::try_from(record.oti.f).map_or(true, |len| len > payload_limit))
+    {
         return Err(FrankenError::TooBig);
     }
     let payload = codec.decode(cx, id, &records)?;
@@ -378,14 +383,18 @@ impl<S: VfsFile, M: VfsFile> NativeDurabilityLog<S, M> {
         let base = destination.published_tip;
         let anchor = destination.previous_marker;
         destination.replication_batch(cx, base, anchor, 0).await?;
-        let batch = self.replication_batch(cx, base, anchor, max_commits).await?;
+        let batch = self
+            .replication_batch(cx, base, anchor, max_commits)
+            .await?;
         if batch.is_empty() {
             return Ok(None);
         }
-        let marker_bytes = batch.len()
+        let marker_bytes = batch
+            .len()
             .checked_mul(COMMIT_MARKER_RECORD_V1_SIZE)
             .ok_or(FrankenError::TooBig)?;
-        let marker_end = destination.marker_end
+        let marker_end = destination
+            .marker_end
             .checked_add(u64_len(marker_bytes)?)
             .ok_or(FrankenError::TooBig)?;
         if marker_bytes > destination.limits.max_batch_bytes
@@ -395,7 +404,10 @@ impl<S: VfsFile, M: VfsFile> NativeDurabilityLog<S, M> {
         {
             return Err(FrankenError::TooBig);
         }
-        let mut copy = CopyGuard { destination, complete: false };
+        let mut copy = CopyGuard {
+            destination,
+            complete: false,
+        };
         for &id in self.index.keys() {
             checkpoint(cx)?;
             let incoming = self.read_object(cx, id).await?;
@@ -408,14 +420,20 @@ impl<S: VfsFile, M: VfsFile> NativeDurabilityLog<S, M> {
             if !records.is_empty() {
                 // append_symbols bounds a batch, but an object's earlier staged
                 // records also consume its eventual read/verification budget.
-                let old_bytes = copy.destination.index.get(&id).map_or(Ok(0_usize), |locations| {
-                    locations.iter().try_fold(0_usize, |sum, location| {
-                        sum.checked_add(location.len).ok_or(FrankenError::TooBig)
-                    })
-                })?;
+                let old_bytes =
+                    copy.destination
+                        .index
+                        .get(&id)
+                        .map_or(Ok(0_usize), |locations| {
+                            locations.iter().try_fold(0_usize, |sum, location| {
+                                sum.checked_add(location.len).ok_or(FrankenError::TooBig)
+                            })
+                        })?;
                 let object_bytes = records.iter().try_fold(old_bytes, |sum, record| {
                     sum.checked_add(record.symbol_data.len())
-                        .and_then(|n| n.checked_add(super::SYMBOL_HEADER_BYTES + super::SYMBOL_TRAILER_BYTES))
+                        .and_then(|n| {
+                            n.checked_add(super::SYMBOL_HEADER_BYTES + super::SYMBOL_TRAILER_BYTES)
+                        })
                         .ok_or(FrankenError::TooBig)
                 })?;
                 if object_bytes > copy.destination.limits.max_batch_bytes {
@@ -427,9 +445,14 @@ impl<S: VfsFile, M: VfsFile> NativeDurabilityLog<S, M> {
         // Reads and object staging can yield. Recheck both histories before
         // publishing, not just after irreversibly appending another marker.
         self.replication_batch(cx, base, anchor, 0).await?;
-        copy.destination.replication_batch(cx, base, anchor, 0).await?;
+        copy.destination
+            .replication_batch(cx, base, anchor, 0)
+            .await?;
         checkpoint(cx)?;
-        let receipt = copy.destination.publish(cx, &batch, &mut verify_object).await?;
+        let receipt = copy
+            .destination
+            .publish(cx, &batch, &mut verify_object)
+            .await?;
         // publish already checked this nonempty batch and completed FSYNC_2.
         // No late cancellation check may revoke its durability acknowledgement.
         copy.complete = true;
@@ -451,10 +474,14 @@ impl<S: VfsFile, M: VfsFile> NativeDurabilityLog<S, M> {
         let count = self.marker_end / width;
         if count != self.published_tip.get() {
             self.poisoned = true;
-            return Err(corrupt("native replication has an unaccepted marker boundary"));
+            return Err(corrupt(
+                "native replication has an unaccepted marker boundary",
+            ));
         }
         if base > self.published_tip {
-            return Err(corrupt("native replica is ahead of the accepted source prefix"));
+            return Err(corrupt(
+                "native replica is ahead of the accepted source prefix",
+            ));
         }
         if base == CommitSeq::ZERO && anchor.is_some() {
             return Err(corrupt("invalid native replication genesis anchor"));
@@ -462,7 +489,9 @@ impl<S: VfsFile, M: VfsFile> NativeDurabilityLog<S, M> {
         let capacity = usize::try_from((count - base.get()).min(u64_len(limit)?))
             .map_err(|_| FrankenError::TooBig)?;
         let mut batch = Vec::new();
-        batch.try_reserve_exact(capacity).map_err(|_| FrankenError::OutOfMemory)?;
+        batch
+            .try_reserve_exact(capacity)
+            .map_err(|_| FrankenError::OutOfMemory)?;
         let mut tip = CommitSeq::ZERO;
         let mut previous = None;
         let mut time = 0;
@@ -492,9 +521,14 @@ impl<S: VfsFile, M: VfsFile> NativeDurabilityLog<S, M> {
                 batch.push(marker);
             }
         }
-        if tip != self.published_tip || previous != self.previous_marker || time != self.last_time_ns {
+        if tip != self.published_tip
+            || previous != self.previous_marker
+            || time != self.last_time_ns
+        {
             self.poisoned = true;
-            return Err(corrupt("native replication changed the accepted marker chain"));
+            return Err(corrupt(
+                "native replication changed the accepted marker chain",
+            ));
         }
         self.check_lengths(cx)?;
         Ok(batch)
@@ -508,23 +542,38 @@ fn missing_replication_symbols(
     mut incoming: Vec<SymbolRecord>,
     mut existing: Vec<SymbolRecord>,
 ) -> Result<Vec<SymbolRecord>> {
-    let oti = incoming.first().ok_or_else(|| corrupt("empty native replication object"))?.oti;
+    let oti = incoming
+        .first()
+        .ok_or_else(|| corrupt("empty native replication object"))?
+        .oti;
     for records in [&mut incoming, &mut existing] {
-        if records.iter().any(|record| record.object_id != id || record.oti != oti) {
-            return Err(corrupt("native replication object identity or OTI mismatch"));
+        if records
+            .iter()
+            .any(|record| record.object_id != id || record.oti != oti)
+        {
+            return Err(corrupt(
+                "native replication object identity or OTI mismatch",
+            ));
         }
         records.sort_unstable_by_key(|record| record.esi);
-        if records.windows(2).any(|pair| pair[0].esi == pair[1].esi && pair[0] != pair[1]) {
+        if records
+            .windows(2)
+            .any(|pair| pair[0].esi == pair[1].esi && pair[0] != pair[1])
+        {
             return Err(corrupt("conflicting duplicate native replication symbol"));
         }
         records.dedup();
     }
     let mut missing = Vec::new();
-    missing.try_reserve_exact(incoming.len()).map_err(|_| FrankenError::OutOfMemory)?;
+    missing
+        .try_reserve_exact(incoming.len())
+        .map_err(|_| FrankenError::OutOfMemory)?;
     for record in incoming {
         match existing.binary_search_by_key(&record.esi, |symbol| symbol.esi) {
             Ok(index) if existing[index] != record => {
-                return Err(corrupt("native replication symbol differs from staged envelope"));
+                return Err(corrupt(
+                    "native replication symbol differs from staged envelope",
+                ));
             }
             Ok(_) => {}
             Err(_) => missing.push(record),
@@ -553,47 +602,74 @@ mod replication_tests {
     type Log = NativeDurabilityLog<File, File>;
 
     fn run(future: impl Future<Output = ()>) {
-        RuntimeBuilder::current_thread().blocking_threads(1, 2)
-            .build().unwrap().block_on(future);
+        RuntimeBuilder::current_thread()
+            .blocking_threads(1, 2)
+            .build()
+            .unwrap()
+            .block_on(future);
     }
 
     fn file(vfs: &MemoryVfs, cx: &Cx, name: &str) -> File {
-        vfs.open(cx, Some(Path::new(name)),
-            VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL)
-            .unwrap().0
+        vfs.open(
+            cx,
+            Some(Path::new(name)),
+            VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL,
+        )
+        .unwrap()
+        .0
     }
 
     fn log(vfs: &MemoryVfs, cx: &Cx, name: &str) -> Log {
-        NativeDurabilityLog::create(cx,
+        NativeDurabilityLog::create(
+            cx,
             file(vfs, cx, &format!("{name}-objects")),
             file(vfs, cx, &format!("{name}-markers")),
-            NativeDurabilityLimits::default()).unwrap()
+            NativeDurabilityLimits::default(),
+        )
+        .unwrap()
     }
 
     fn symbol(value: u64) -> SymbolRecord {
         let bytes = value.to_le_bytes().to_vec();
-        SymbolRecord::new(ObjectId::derive_from_canonical_bytes(&bytes),
-            Oti { f: 8, al: 1, t: 8, z: 1, n: 1 },
-            0, bytes, SymbolRecordFlags::SYSTEMATIC_RUN_START)
+        SymbolRecord::new(
+            ObjectId::derive_from_canonical_bytes(&bytes),
+            Oti {
+                f: 8,
+                al: 1,
+                t: 8,
+                z: 1,
+                n: 1,
+            },
+            0,
+            bytes,
+            SymbolRecordFlags::SYSTEMATIC_RUN_START,
+        )
     }
 
     fn verify(id: ObjectId, records: Vec<SymbolRecord>) -> Ready<Result<()>> {
-        ready(reconstruct_systematic_happy_path(&records)
-            .map_err(|error| corrupt(&error.to_string()))
-            .and_then(|bytes| {
-                if ObjectId::derive_from_canonical_bytes(&bytes) == id {
-                    Ok(())
-                } else {
-                    Err(corrupt("replication test object identity mismatch"))
-                }
-            }))
+        ready(
+            reconstruct_systematic_happy_path(&records)
+                .map_err(|error| corrupt(&error.to_string()))
+                .and_then(|bytes| {
+                    if ObjectId::derive_from_canonical_bytes(&bytes) == id {
+                        Ok(())
+                    } else {
+                        Err(corrupt("replication test object identity mismatch"))
+                    }
+                }),
+        )
     }
 
     async fn append(log: &mut Log, cx: &Cx, time: u64) {
         let seq = log.published_tip.get() + 1;
         let records = [symbol(seq * 2), symbol(seq * 2 + 1)];
-        let marker = CommitMarker::new(CommitSeq::new(seq), time,
-            records[0].object_id, records[1].object_id, log.previous_marker);
+        let marker = CommitMarker::new(
+            CommitSeq::new(seq),
+            time,
+            records[0].object_id,
+            records[1].object_id,
+            log.previous_marker,
+        );
         log.append_symbols(cx, &records).await.unwrap();
         log.publish(cx, &[marker], verify).await.unwrap();
     }
@@ -618,17 +694,26 @@ mod replication_tests {
             let mut source = log(&vfs, &cx, "source");
             let mut replica = log(&vfs, &cx, "replica");
             append(&mut source, &cx, 1).await;
-            source.replicate_committed_prefix_to(&cx, &mut replica, 128, verify)
-                .await.unwrap().unwrap();
+            source
+                .replicate_committed_prefix_to(&cx, &mut replica, 128, verify)
+                .await
+                .unwrap()
+                .unwrap();
             for time in 2..=258 {
                 append(&mut source, &cx, time).await;
             }
             // An intact orphan may be an application's transitive dependency.
             source.append_symbols(&cx, &[symbol(9999)]).await.unwrap();
-            let original = (bytes(&source.symbols, &cx).await, bytes(&source.markers, &cx).await);
+            let original = (
+                bytes(&source.symbols, &cx).await,
+                bytes(&source.markers, &cx).await,
+            );
             for (first, last, count) in [(2, 129, 128), (130, 257, 128), (258, 258, 1)] {
-                let receipt = source.replicate_committed_prefix_to(&cx, &mut replica, 128, verify)
-                    .await.unwrap().unwrap();
+                let receipt = source
+                    .replicate_committed_prefix_to(&cx, &mut replica, 128, verify)
+                    .await
+                    .unwrap()
+                    .unwrap();
                 assert_eq!(receipt.first_seq, CommitSeq::new(first));
                 assert_eq!(receipt.last_seq, CommitSeq::new(last));
                 assert_eq!(receipt.commits, count);
@@ -636,14 +721,26 @@ mod replication_tests {
                 assert_eq!(replica.symbol_end, source.symbol_end);
             }
             let copied = bytes(&replica.symbols, &cx).await;
-            assert!(source.replicate_committed_prefix_to(&cx, &mut replica, 1, verify)
-                .await.unwrap().is_none());
+            assert!(
+                source
+                    .replicate_committed_prefix_to(&cx, &mut replica, 1, verify)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
             assert_eq!(bytes(&replica.symbols, &cx).await, copied);
             assert_eq!(bytes(&replica.markers, &cx).await, original.1);
             assert_eq!(bytes(&source.symbols, &cx).await, original.0);
             assert_eq!(bytes(&source.markers, &cx).await, original.1);
-            verify(symbol(9999).object_id, replica.read_object(&cx, symbol(9999).object_id)
-                .await.unwrap()).await.unwrap();
+            verify(
+                symbol(9999).object_id,
+                replica
+                    .read_object(&cx, symbol(9999).object_id)
+                    .await
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
             source.close(&cx).unwrap();
             replica.close(&cx).unwrap();
         });
@@ -666,14 +763,33 @@ mod replication_tests {
                 }
                 if case == 2 {
                     // Same length and valid checksum, but not the accepted chain.
-                    let replacement = CommitMarker::new(CommitSeq::new(2), 4,
-                        symbol(4).object_id, symbol(5).object_id, replica.previous_marker);
-                    source.markers.write(&cx, &replacement.to_record_bytes(),
-                        u64_len(COMMIT_MARKER_RECORD_V1_SIZE).unwrap()).await.unwrap();
+                    let replacement = CommitMarker::new(
+                        CommitSeq::new(2),
+                        4,
+                        symbol(4).object_id,
+                        symbol(5).object_id,
+                        replica.previous_marker,
+                    );
+                    source
+                        .markers
+                        .write(
+                            &cx,
+                            &replacement.to_record_bytes(),
+                            u64_len(COMMIT_MARKER_RECORD_V1_SIZE).unwrap(),
+                        )
+                        .await
+                        .unwrap();
                 }
-                let before = (bytes(&replica.symbols, &cx).await, bytes(&replica.markers, &cx).await);
-                assert!(matches!(source.replicate_committed_prefix_to(&cx, &mut replica, 128, verify)
-                    .await, Err(FrankenError::WalCorrupt { .. })));
+                let before = (
+                    bytes(&replica.symbols, &cx).await,
+                    bytes(&replica.markers, &cx).await,
+                );
+                assert!(matches!(
+                    source
+                        .replicate_committed_prefix_to(&cx, &mut replica, 128, verify)
+                        .await,
+                    Err(FrankenError::WalCorrupt { .. })
+                ));
                 assert_eq!(bytes(&replica.symbols, &cx).await, before.0);
                 assert_eq!(bytes(&replica.markers, &cx).await, before.1);
                 assert!(!replica.needs_recovery());
@@ -690,24 +806,49 @@ mod replication_tests {
             let vfs = MemoryVfs::new();
             let mut source = log(&vfs, &cx, "source");
             append(&mut source, &cx, 1).await;
-            source.symbols.write(&cx, b"torn", source.symbol_end).await.unwrap();
-            source.markers.write(&cx, &[0xAA; 17], source.marker_end).await.unwrap();
+            source
+                .symbols
+                .write(&cx, b"torn", source.symbol_end)
+                .await
+                .unwrap();
+            source
+                .markers
+                .write(&cx, &[0xAA; 17], source.marker_end)
+                .await
+                .unwrap();
             source = recover(source, &cx).await;
             assert!(source.needs_recovery());
-            let original = (bytes(&source.symbols, &cx).await, bytes(&source.markers, &cx).await);
+            let original = (
+                bytes(&source.symbols, &cx).await,
+                bytes(&source.markers, &cx).await,
+            );
             let mut replica = log(&vfs, &cx, "replica");
-            source.replicate_committed_prefix_to(&cx, &mut replica, 1, verify)
-                .await.unwrap().unwrap();
+            source
+                .replicate_committed_prefix_to(&cx, &mut replica, 1, verify)
+                .await
+                .unwrap()
+                .unwrap();
             assert!(!replica.needs_recovery());
-            assert_eq!(replica.marker_end, u64_len(COMMIT_MARKER_RECORD_V1_SIZE).unwrap());
+            assert_eq!(
+                replica.marker_end,
+                u64_len(COMMIT_MARKER_RECORD_V1_SIZE).unwrap()
+            );
             assert_eq!(replica.symbol_end + 4, source.symbol_end);
             assert_eq!(bytes(&source.symbols, &cx).await, original.0);
             assert_eq!(bytes(&source.markers, &cx).await, original.1);
-            replica.markers.write(&cx, b"tail", replica.marker_end).await.unwrap();
+            replica
+                .markers
+                .write(&cx, b"tail", replica.marker_end)
+                .await
+                .unwrap();
             replica = recover(replica, &cx).await;
             let before = bytes(&replica.markers, &cx).await;
-            assert!(matches!(source.replicate_committed_prefix_to(&cx, &mut replica, 1, verify)
-                .await, Err(FrankenError::BusyRecovery)));
+            assert!(matches!(
+                source
+                    .replicate_committed_prefix_to(&cx, &mut replica, 1, verify)
+                    .await,
+                Err(FrankenError::BusyRecovery)
+            ));
             assert_eq!(bytes(&replica.markers, &cx).await, before);
             source.close(&cx).unwrap();
             replica.close(&cx).unwrap();
@@ -723,21 +864,41 @@ mod replication_tests {
             append(&mut source, &cx, 1).await;
             let mut replica = log(&vfs, &cx, "replica");
             let mut transfer = Box::pin(source.replicate_committed_prefix_to(
-                &cx, &mut replica, 1, |_, _| pending::<Result<()>>()));
-            assert!(transfer.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+                &cx,
+                &mut replica,
+                1,
+                |_, _| pending::<Result<()>>(),
+            ));
+            assert!(
+                transfer
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
             drop(transfer);
             assert!(replica.needs_recovery());
             assert_eq!(replica.published_tip(), CommitSeq::ZERO);
             assert_eq!(replica.markers.file_size(&cx).unwrap(), 0);
             let staged = bytes(&replica.symbols, &cx).await;
             assert!(!staged.is_empty());
-            assert!(source.replicate_committed_prefix_to(&cx, &mut replica, 1, verify).await.is_err());
+            assert!(
+                source
+                    .replicate_committed_prefix_to(&cx, &mut replica, 1, verify)
+                    .await
+                    .is_err()
+            );
             replica = recover(replica, &cx).await;
-            let receipt = source.replicate_committed_prefix_to(&cx, &mut replica, 1, verify)
-                .await.unwrap().unwrap();
+            let receipt = source
+                .replicate_committed_prefix_to(&cx, &mut replica, 1, verify)
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(receipt.commits, 1);
             assert_eq!(bytes(&replica.symbols, &cx).await, staged);
-            assert_eq!(bytes(&replica.markers, &cx).await, bytes(&source.markers, &cx).await);
+            assert_eq!(
+                bytes(&replica.markers, &cx).await,
+                bytes(&source.markers, &cx).await
+            );
             source.close(&cx).unwrap();
             replica.close(&cx).unwrap();
         });
@@ -753,29 +914,60 @@ mod replication_tests {
                 let mut replica = log(&vfs, &cx, "replica");
                 let payload = [0x5A; 16];
                 let id = ObjectId::derive_from_canonical_bytes(&payload);
-                let oti = Oti { f: 16, al: 1, t: 8, z: 1, n: 1 };
+                let oti = Oti {
+                    f: 16,
+                    al: 1,
+                    t: 8,
+                    z: 1,
+                    n: 1,
+                };
                 let records = [
-                    SymbolRecord::new(id, oti, 0, payload[..8].to_vec(),
-                        SymbolRecordFlags::SYSTEMATIC_RUN_START),
-                    SymbolRecord::new(id, oti, 1, payload[8..].to_vec(), SymbolRecordFlags::empty()),
+                    SymbolRecord::new(
+                        id,
+                        oti,
+                        0,
+                        payload[..8].to_vec(),
+                        SymbolRecordFlags::SYSTEMATIC_RUN_START,
+                    ),
+                    SymbolRecord::new(
+                        id,
+                        oti,
+                        1,
+                        payload[8..].to_vec(),
+                        SymbolRecordFlags::empty(),
+                    ),
                 ];
                 source.append_symbols(&cx, &records).await.unwrap();
-                source.publish(&cx, &[CommitMarker::new(CommitSeq::new(1), 1, id, id, None)], verify)
-                    .await.unwrap();
+                source
+                    .publish(
+                        &cx,
+                        &[CommitMarker::new(CommitSeq::new(1), 1, id, id, None)],
+                        verify,
+                    )
+                    .await
+                    .unwrap();
                 replica.append_symbols(&cx, &records[..1]).await.unwrap();
                 replica = recover(replica, &cx).await;
                 let before = bytes(&replica.symbols, &cx).await;
                 replica.limits.max_batch_bytes = budget;
-                let result = source.replicate_committed_prefix_to(&cx, &mut replica, 1, verify).await;
+                let result = source
+                    .replicate_committed_prefix_to(&cx, &mut replica, 1, verify)
+                    .await;
                 if budget == 128 {
                     assert!(matches!(result, Err(FrankenError::TooBig)));
                     assert_eq!(bytes(&replica.symbols, &cx).await, before);
                     assert_eq!(replica.markers.file_size(&cx).unwrap(), 0);
                 } else {
                     assert_eq!(result.unwrap().unwrap().last_seq, CommitSeq::new(1));
-                    assert_eq!(replica.record_count, 2, "do not duplicate the retained first symbol");
+                    assert_eq!(
+                        replica.record_count, 2,
+                        "do not duplicate the retained first symbol"
+                    );
                     let complete = replica.read_object(&cx, id).await.unwrap();
-                    assert_eq!(reconstruct_systematic_happy_path(&complete).unwrap(), payload);
+                    assert_eq!(
+                        reconstruct_systematic_happy_path(&complete).unwrap(),
+                        payload
+                    );
                     assert!(bytes(&replica.symbols, &cx).await.starts_with(&before));
                 }
                 source.close(&cx).unwrap();
@@ -792,15 +984,39 @@ mod replication_tests {
             let mut source = log(&vfs, &cx, "source");
             let mut replica = log(&vfs, &cx, "replica");
             let original = symbol(12);
-            let changed = SymbolRecord::new(original.object_id, original.oti, original.esi,
-                vec![0xFF; 8], SymbolRecordFlags::SYSTEMATIC_RUN_START);
-            source.append_symbols(&cx, std::slice::from_ref(&original)).await.unwrap();
-            source.publish(&cx, &[CommitMarker::new(CommitSeq::new(1), 1,
-                original.object_id, original.object_id, None)], verify).await.unwrap();
+            let changed = SymbolRecord::new(
+                original.object_id,
+                original.oti,
+                original.esi,
+                vec![0xFF; 8],
+                SymbolRecordFlags::SYSTEMATIC_RUN_START,
+            );
+            source
+                .append_symbols(&cx, std::slice::from_ref(&original))
+                .await
+                .unwrap();
+            source
+                .publish(
+                    &cx,
+                    &[CommitMarker::new(
+                        CommitSeq::new(1),
+                        1,
+                        original.object_id,
+                        original.object_id,
+                        None,
+                    )],
+                    verify,
+                )
+                .await
+                .unwrap();
             replica.append_symbols(&cx, &[changed]).await.unwrap();
             let before = bytes(&replica.symbols, &cx).await;
-            assert!(matches!(source.replicate_committed_prefix_to(&cx, &mut replica, 1, verify).await,
-                Err(FrankenError::WalCorrupt { .. })));
+            assert!(matches!(
+                source
+                    .replicate_committed_prefix_to(&cx, &mut replica, 1, verify)
+                    .await,
+                Err(FrankenError::WalCorrupt { .. })
+            ));
             assert_eq!(bytes(&replica.symbols, &cx).await, before);
             assert_eq!(replica.markers.file_size(&cx).unwrap(), 0);
             assert!(replica.needs_recovery());
@@ -818,22 +1034,47 @@ mod replication_tests {
             append(&mut source, &cx, 1).await;
             let mut replica = log(&vfs, &cx, "replica");
             for limit in [0, 129, usize::MAX] {
-                assert!(matches!(source.replicate_committed_prefix_to(&cx, &mut replica, limit, verify)
-                    .await, Err(FrankenError::OutOfRange { .. })));
+                assert!(matches!(
+                    source
+                        .replicate_committed_prefix_to(&cx, &mut replica, limit, verify)
+                        .await,
+                    Err(FrankenError::OutOfRange { .. })
+                ));
             }
             replica.limits.max_stream_bytes = 1;
-            assert!(matches!(source.replicate_committed_prefix_to(&cx, &mut replica, 1, verify)
-                .await, Err(FrankenError::TooBig)));
+            assert!(matches!(
+                source
+                    .replicate_committed_prefix_to(&cx, &mut replica, 1, verify)
+                    .await,
+                Err(FrankenError::TooBig)
+            ));
             assert_eq!(replica.symbols.file_size(&cx).unwrap(), 0);
             replica.limits = NativeDurabilityLimits::default();
             // Independently opened descriptors can still alias physical files.
-            let (mut alias, _) = NativeDurabilityLog::recover(&cx,
-                file(&vfs, &cx, "source-objects"), file(&vfs, &cx, "source-markers"),
-                NativeDurabilityLimits::default(), verify).await.unwrap();
-            assert!(source.replicate_committed_prefix_to(&cx, &mut alias, 1, verify).await.is_err());
+            let (mut alias, _) = NativeDurabilityLog::recover(
+                &cx,
+                file(&vfs, &cx, "source-objects"),
+                file(&vfs, &cx, "source-markers"),
+                NativeDurabilityLimits::default(),
+                verify,
+            )
+            .await
+            .unwrap();
+            assert!(
+                source
+                    .replicate_committed_prefix_to(&cx, &mut alias, 1, verify)
+                    .await
+                    .is_err()
+            );
             alias.close(&cx).unwrap();
-            assert!(matches!(source.replicate_committed_prefix_to(&cx, &mut replica, 1,
-                |_, _| ready(Err(FrankenError::Abort))).await, Err(FrankenError::Abort)));
+            assert!(matches!(
+                source
+                    .replicate_committed_prefix_to(&cx, &mut replica, 1, |_, _| ready(Err(
+                        FrankenError::Abort
+                    )))
+                    .await,
+                Err(FrankenError::Abort)
+            ));
             assert!(replica.needs_recovery());
             assert_eq!(replica.markers.file_size(&cx).unwrap(), 0);
             assert_eq!(replica.published_tip(), CommitSeq::ZERO);
@@ -863,7 +1104,13 @@ mod replication_tests {
             let size = u32::try_from(payload.len()).map_err(|_| FrankenError::TooBig)?;
             Ok(vec![SymbolRecord::new(
                 ObjectId::derive_from_canonical_bytes(payload),
-                Oti { f: u64::from(size), al: 1, t: size, z: 1, n: 1 },
+                Oti {
+                    f: u64::from(size),
+                    al: 1,
+                    t: size,
+                    z: 1,
+                    n: 1,
+                },
                 0,
                 payload.to_vec(),
                 SymbolRecordFlags::SYSTEMATIC_RUN_START,
@@ -889,9 +1136,13 @@ mod replication_tests {
         repair: bool,
     ) -> Result<NativePrefixCopyReceipt> {
         if repair {
-            source.repair_recovered_prefix_to(cx, destination, codec).await
+            source
+                .repair_recovered_prefix_to(cx, destination, codec)
+                .await
         } else {
-            source.copy_recovered_prefix_to(cx, destination, verify).await
+            source
+                .copy_recovered_prefix_to(cx, destination, verify)
+                .await
         }
     }
 
@@ -900,9 +1151,8 @@ mod replication_tests {
         let id = record.object_id;
         source.append_symbols(cx, &[record]).await.unwrap();
         for seq in 1..=count {
-            let marker = CommitMarker::new(
-                CommitSeq::new(seq), seq, id, id, source.previous_marker,
-            );
+            let marker =
+                CommitMarker::new(CommitSeq::new(seq), seq, id, id, source.previous_marker);
             source.publish(cx, &[marker], verify).await.unwrap();
         }
     }
@@ -936,24 +1186,41 @@ mod replication_tests {
                     let last = CommitMarker::from_record_bytes(last_bytes).unwrap();
                     let mut changed = match damage {
                         0 => CommitMarker::new(
-                            last.commit_seq, 999, last.capsule_object_id,
-                            last.proof_object_id, last.prev_marker,
-                        ).to_record_bytes(),
+                            last.commit_seq,
+                            999,
+                            last.capsule_object_id,
+                            last.proof_object_id,
+                            last.prev_marker,
+                        )
+                        .to_record_bytes(),
                         1 => CommitMarker::new(
-                            last.commit_seq, last.commit_time_unix_ns,
-                            last.capsule_object_id, last.proof_object_id, None,
-                        ).to_record_bytes(),
+                            last.commit_seq,
+                            last.commit_time_unix_ns,
+                            last.capsule_object_id,
+                            last.proof_object_id,
+                            None,
+                        )
+                        .to_record_bytes(),
                         _ => last.to_record_bytes(),
                     };
                     if damage == 2 {
                         changed[0] ^= 0xFF;
                     }
-                    source.markers.write(&cx, &changed, u64_len(offset).unwrap()).await.unwrap();
-                    let before = (bytes(&source.symbols, &cx).await, bytes(&source.markers, &cx).await);
+                    source
+                        .markers
+                        .write(&cx, &changed, u64_len(offset).unwrap())
+                        .await
+                        .unwrap();
+                    let before = (
+                        bytes(&source.symbols, &cx).await,
+                        bytes(&source.markers, &cx).await,
+                    );
                     let mut destination = log(&vfs, &cx, "destination");
                     let codec = CopyCodec::default();
-                    assert!(matches!(copy_mode(&mut source, &cx, &mut destination, &codec, repair).await,
-                        Err(FrankenError::WalCorrupt { .. })));
+                    assert!(matches!(
+                        copy_mode(&mut source, &cx, &mut destination, &codec, repair).await,
+                        Err(FrankenError::WalCorrupt { .. })
+                    ));
                     assert_copy_destination_unused(&destination, &cx);
                     assert_eq!(codec.calls.load(Ordering::Relaxed), 0);
                     assert!(source.needs_recovery());
@@ -979,8 +1246,12 @@ mod replication_tests {
                 shorten_markers: Mutex::new(Some((file(&vfs, &cx, "source-markers"), retained))),
             };
             let mut destination = log(&vfs, &cx, "destination");
-            assert!(matches!(source.repair_recovered_prefix_to(&cx, &mut destination, &codec).await,
-                Err(FrankenError::BusyRecovery)));
+            assert!(matches!(
+                source
+                    .repair_recovered_prefix_to(&cx, &mut destination, &codec)
+                    .await,
+                Err(FrankenError::BusyRecovery)
+            ));
             assert!(codec.calls.load(Ordering::Relaxed) >= 3);
             assert_eq!(source.markers.file_size(&cx).unwrap(), retained);
             assert!(source.needs_recovery());
@@ -1011,13 +1282,17 @@ mod replication_tests {
                 let mut destination = log(&vfs, &cx, "destination");
                 destination.limits.max_stream_bytes = total - 1;
                 let codec = CopyCodec::default();
-                assert!(matches!(copy_mode(&mut source, &cx, &mut destination, &codec, repair).await,
-                    Err(FrankenError::TooBig)));
+                assert!(matches!(
+                    copy_mode(&mut source, &cx, &mut destination, &codec, repair).await,
+                    Err(FrankenError::TooBig)
+                ));
                 assert_copy_destination_unused(&destination, &cx);
                 assert_eq!(codec.calls.load(Ordering::Relaxed), 0);
                 assert!(!source.needs_recovery());
                 destination.limits.max_stream_bytes = total;
-                let receipt = copy_mode(&mut source, &cx, &mut destination, &codec, repair).await.unwrap();
+                let receipt = copy_mode(&mut source, &cx, &mut destination, &codec, repair)
+                    .await
+                    .unwrap();
                 assert_eq!(receipt.commits, 129);
                 assert_eq!(receipt.symbol_records, 1);
                 assert_eq!(receipt.marker_stream_bytes, total);
@@ -1038,21 +1313,40 @@ mod replication_tests {
                 let mut source = log(&vfs, &cx, "source");
                 shared_object_chain(&mut source, &cx, 129).await;
                 let marker_bytes = source.marker_end;
-                source.symbols.write(&cx, b"torn", source.symbol_end).await.unwrap();
-                source.markers.write(&cx, &[0xAA; 17], source.marker_end).await.unwrap();
+                source
+                    .symbols
+                    .write(&cx, b"torn", source.symbol_end)
+                    .await
+                    .unwrap();
+                source
+                    .markers
+                    .write(&cx, &[0xAA; 17], source.marker_end)
+                    .await
+                    .unwrap();
                 source = recover(source, &cx).await;
-                let original = (bytes(&source.symbols, &cx).await, bytes(&source.markers, &cx).await);
+                let original = (
+                    bytes(&source.symbols, &cx).await,
+                    bytes(&source.markers, &cx).await,
+                );
                 let mut destination = log(&vfs, &cx, "destination");
                 destination.limits.max_stream_bytes = marker_bytes;
                 let receipt = copy_mode(
-                    &mut source, &cx, &mut destination, &CopyCodec::default(), repair,
-                ).await.unwrap();
+                    &mut source,
+                    &cx,
+                    &mut destination,
+                    &CopyCodec::default(),
+                    repair,
+                )
+                .await
+                .unwrap();
                 assert_eq!(receipt.commits, 129);
                 assert_eq!(receipt.last_seq, CommitSeq::new(129));
                 assert_eq!(receipt.marker_stream_bytes, marker_bytes);
                 assert_eq!(receipt.symbol_stream_bytes + 4, source.symbol_end);
-                assert_eq!(bytes(&destination.markers, &cx).await.as_slice(),
-                    &original.1[..usize::try_from(marker_bytes).unwrap()]);
+                assert_eq!(
+                    bytes(&destination.markers, &cx).await.as_slice(),
+                    &original.1[..usize::try_from(marker_bytes).unwrap()]
+                );
                 assert_eq!(bytes(&source.symbols, &cx).await, original.0);
                 assert_eq!(bytes(&source.markers, &cx).await, original.1);
                 assert!(source.needs_recovery());

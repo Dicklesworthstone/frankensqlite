@@ -213,7 +213,6 @@ impl<S: VfsFile, M: VfsFile> NativeDurabilityLog<S, M> {
 
     /// Transfer this exact log, including any source-owned write completion,
     /// into an explicitly driven rewrite-before-sync recovery owner.
-    #[must_use]
     pub fn into_recovery(self) -> NativeRecovery<S, M> {
         NativeRecovery::from_log(self)
     }
@@ -800,8 +799,8 @@ mod object_admission_tests {
     use std::path::Path;
 
     use asupersync::runtime::RuntimeBuilder;
-    use fsqlite_types::flags::VfsOpenFlags;
     use fsqlite_types::SymbolRecordFlags;
+    use fsqlite_types::flags::VfsOpenFlags;
     use fsqlite_vfs::{MemoryVfs, Vfs};
 
     use super::*;
@@ -1171,7 +1170,9 @@ mod object_admission_tests {
             let cancelled = Cx::new();
             cancelled.cancel();
             assert!(matches!(
-                owner.append_symbols(&cancelled, std::slice::from_ref(&a)).await,
+                owner
+                    .append_symbols(&cancelled, std::slice::from_ref(&a))
+                    .await,
                 Err(FrankenError::Interrupt)
             ));
             assert_eq!(snapshot(&owner, &cx).await, before);
@@ -1199,7 +1200,10 @@ mod object_admission_tests {
             // Real file input that exceeds the object budget, not a fabricated
             // recovery report. With no marker it is an orphan, not a commit.
             let mut objects = file(&vfs, &cx, "objects");
-            objects.write(&cx, &a.to_bytes().repeat(4), 0).await.unwrap();
+            objects
+                .write(&cx, &a.to_bytes().repeat(4), 0)
+                .await
+                .unwrap();
             objects.close(&cx).unwrap();
             let (mut owner, report) = Log::recover(
                 &cx,
