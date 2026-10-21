@@ -506,3 +506,222 @@ for(const omission of [false,true]) test(`delivery summary pump: ${omission?'sen
   assert.equal(policy,1);assert.equal(confirms,2);assert.equal((await receiver.rebaseJournal.head()).position,1);
   assert.equal(db.prepare('SELECT acked FROM outgoing').get().acked,1);
 });
+
+// Persistent outbox storage primitives are exercised directly, without the
+// earlier transport fixture. These are the same read/verify/reclaim functions
+// used by ChangesetOutbox, fanout and local-rebase publication.
+import * as outboxStore from '../src/changeset-outbox-store.ts';
+import { mkdtempSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+
+const captureScope = (tables = ['t'], indirect = false, snapshot = false) =>
+  ({ tables, indirect, ...(snapshot ? { snapshot: true } : {}) });
+const eagerScope = (bytes, scope, limits) => {
+  const decoded = codec.decodeChangeset(bytes, limits);
+  return { changeCount: decoded.reduce((n, t) => n + t.changes.length, 0),
+    matchesScope: decoded.every(t => scope.tables.includes(t.name.replace(/[A-Z]/g, c => c.toLowerCase())) &&
+      t.changes.every(c => c.indirect === scope.indirect && (!scope.snapshot || c.operation === 'insert'))) };
+};
+
+test('retained scope inspection preserves operation, indirect and case-folded table policy', () => {
+  const changes = [insert(1n, 'first'),
+    { operation: 'update', indirect: true, old: [2n, 'before'], new: [undefined, 'after'] },
+    { operation: 'delete', indirect: false, old: [3n, null] }];
+  for (const last of [changes, changes.map(c => ({ ...c, indirect: true }))]) {
+    const wire = codec.encodeChangeset([table(last, 'T'), table([insert(4n, 'last')], 'U')]);
+    for (const names of [['t', 'u'], ['t'], ['u'], []])
+      for (const indirect of [false, true]) for (const snapshot of [false, true]) {
+        const scope = captureScope(names, indirect, snapshot);
+        const result = codec.inspectCapturedChangeset(wire, scope);
+        assert.deepEqual(result, eagerScope(wire, scope));
+        assert.equal(result.changeCount, 4, 'a mismatch must not stop counting the remaining wire');
+        assert.ok(Object.isFrozen(result));
+        assert.deepEqual(Object.keys(result).sort(), ['changeCount', 'matchesScope']);
+      }
+  }
+  assert.deepEqual(codec.inspectCapturedChangeset(new Uint8Array(), captureScope()),
+    { changeCount: 0, matchesScope: true });
+});
+
+test('retained scope mismatch cannot conceal malformed tails or replace wire error precedence', () => {
+  const wire = codec.encodeChangeset([table([insert(1n, 'first')], 'foreign'),
+    table([insert(2n, new Uint8Array([0, 255, 1]))])]);
+  const scope = captureScope(['t'], true, true);
+  const compare = bytes => {
+    const expected = errorOf(() => eagerScope(bytes, scope));
+    assert.deepEqual(errorOf(() => codec.inspectCapturedChangeset(bytes, scope)), expected);
+    if (expected === null) assert.deepEqual(codec.inspectCapturedChangeset(bytes, scope), eagerScope(bytes, scope));
+  };
+  for (let end = 0; end <= wire.length; end++) compare(wire.subarray(0, end));
+  for (let offset = 0; offset < wire.length; offset++) for (const mask of [1, 127, 255]) {
+    const mutated = wire.slice(); mutated[offset] ^= mask; compare(mutated);
+  }
+  compare(codec.encodePatchset([table([insert(1n, 'compact')])]));
+});
+
+test('retained scope inspection keeps cumulative budgets and fixed-buffer admission', () => {
+  const wire = codec.encodeChangeset([table([insert(1n, 'a'), insert(2n, 'b')]), table([insert(3n, 'c')], 'u')]);
+  const scope = captureScope(['t', 'u']);
+  const exact = { maxBytes: wire.length, maxTables: 2, maxColumns: 2, maxChanges: 3, maxCells: 6 };
+  assert.equal(codec.inspectCapturedChangeset(wire, scope, exact).matchesScope, true);
+  for (const key of Object.keys(exact)) {
+    const limits = { ...exact, [key]: exact[key] - 1 };
+    assert.deepEqual(errorOf(() => codec.inspectCapturedChangeset(wire, scope, limits)),
+      errorOf(() => codec.decodeChangeset(wire, limits)));
+    assert.throws(() => codec.inspectCapturedChangeset(wire, scope, limits), { code: 'ERR_FSQLITE_CHANGESET_LIMIT' });
+  }
+  const storage = new Uint8Array(wire.length + 6); storage.set(wire, 3);
+  const view = storage.subarray(3, -3); let getters = 0;
+  for (const key of ['buffer', 'byteOffset', 'byteLength', 'length', 'subarray'])
+    Object.defineProperty(view, key, { get() { getters++; throw new Error(key); } });
+  assert.equal(codec.inspectCapturedChangeset(view, scope).changeCount, 3); assert.equal(getters, 0);
+  structuredClone(storage.buffer, { transfer: [storage.buffer] });
+  for (const invalid of [view, new Proxy(wire, {}), new Uint8Array(new SharedArrayBuffer(8)),
+    new Uint8Array(new ArrayBuffer(8, { maxByteLength: 16 }))])
+    assert.throws(() => codec.inspectCapturedChangeset(invalid, scope), { code: 'ERR_FSQLITE_CHANGESET_INPUT' });
+});
+
+async function persistPayload(target, bytes, id, scope = captureScope(), count) {
+  return target.transaction(async tx => {
+    await outboxStore.ensure(tx, true);
+    return outboxStore.store(tx, id, JSON.stringify(scope),
+      { changeset: bytes, changes: count ?? codec.inspectChangeset(bytes).changeCount }, () => {});
+  });
+}
+function storagePort(target) {
+  return {
+    pending: (options = {}) => target.transaction(tx => outboxStore.pendingDeliveries(tx, options.after ?? 0n, options.limit ?? 100)),
+    read: id => target.transaction(async tx => {
+      if (!await outboxStore.ensure(tx, false)) return null;
+      const record = await outboxStore.find(tx, id);
+      return record === null ? null : { delivery: record.delivery, changeset: await outboxStore.load(tx, record) };
+    }),
+    acknowledge: (id, hash) => target.transaction(tx => outboxStore.acknowledgeDelivery(tx, id, hash)),
+  };
+}
+
+test('persistent storage returns owned native payloads and reclaims only the acknowledged identity', async t => {
+  const source = new SqlTarget(t), port = storagePort(source), wire = nativeDelivery(t, 1024);
+  const first = await persistPayload(source, wire, 'persistent:first');
+  const empty = await persistPayload(source, new Uint8Array(), 'persistent:empty');
+  const loaded = await port.read(first.deliveryId);
+  assert.deepEqual(loaded.delivery, first); assert.deepEqual(loaded.changeset, wire);
+  loaded.changeset.fill(0);
+  assert.deepEqual((await port.read(first.deliveryId)).changeset, wire);
+  await assert.rejects(port.acknowledge(first.deliveryId, '0'.repeat(64)), { code: 'ERR_FSQLITE_OUTBOX_ACK' });
+  assert.deepEqual((await port.read(first.deliveryId)).changeset, wire);
+  assert.equal(await port.acknowledge(first.deliveryId, first.sha256), true);
+  assert.equal(await port.acknowledge(first.deliveryId, first.sha256), false);
+  assert.equal((await port.read(first.deliveryId)).changeset, null);
+  assert.deepEqual((await port.pending()).map(d => d.deliveryId), [empty.deliveryId]);
+  assert.deepEqual((await port.read(empty.deliveryId)).changeset, new Uint8Array());
+});
+
+for (const defect of ['digest', 'count', 'table', 'indirect', 'snapshot', 'tail', 'patchset']) {
+  test(`persistent ${defect} corruption blocks read and acknowledgement without payload loss`, async t => {
+    const source = new SqlTarget(t), port = storagePort(source);
+    const wire = codec.encodeChangeset([table([insert(1n, 'first'),
+      { operation: 'delete', indirect: false, old: [2n, 'old'] }])]);
+    const delivery = await persistPayload(source, wire, `corrupt:${defect}`);
+    const name = outboxStore.TABLE;
+    if (defect === 'digest') source.db.exec(`UPDATE ${name} SET sha256='${'0'.repeat(64)}'`);
+    if (defect === 'count') source.db.exec(`UPDATE ${name} SET change_count=3`);
+    if (['table', 'indirect', 'snapshot'].includes(defect)) {
+      const scope = captureScope(defect === 'table' ? ['other'] : ['t'], defect === 'indirect', defect === 'snapshot');
+      source.db.prepare(`UPDATE ${name} SET scope=?`).run(JSON.stringify(scope));
+    }
+    if (defect === 'tail' || defect === 'patchset') {
+      const bytes = defect === 'tail' ? wire.subarray(0, -1) : codec.encodePatchset([table([insert(1n, 'compact')])]);
+      source.db.prepare(`UPDATE ${name} SET payload=?,byte_length=?,sha256=?`).run(bytes, bytes.length, digest(bytes));
+    }
+    const before = source.db.prepare(`SELECT hex(payload) bytes,sha256 FROM ${name}`).get();
+    const code = ['tail', 'patchset'].includes(defect) ? 'ERR_FSQLITE_CHANGESET_FORMAT' : 'ERR_FSQLITE_OUTBOX_CORRUPT';
+    await assert.rejects(port.read(delivery.deliveryId), { code });
+    await assert.rejects(port.acknowledge(delivery.deliveryId, before.sha256), { code });
+    assert.deepEqual(source.db.prepare(`SELECT hex(payload) bytes,sha256 FROM ${name}`).get(), before);
+    assert.equal(source.db.prepare(`SELECT acknowledged FROM ${name}`).get().acknowledged, 0);
+  });
+}
+
+test('persistent chunk verification preserves complete manifests and ordered acknowledgements', async t => {
+  const source = new SqlTarget(t), port = storagePort(source);
+  const rootId = 'native:seed', wires = [codec.encodeChangeset([table([insert(1n, 'a')])]),
+    codec.encodeChangeset([table([insert(2n, 'b'), insert(3n, 'c')])])];
+  const summary = { chunks: 2, changes: 3, byteLength: wires[0].length + wires[1].length };
+  const deliveries = [];
+  for (let index = 0; index < wires.length; index++) {
+    deliveries.push(await persistPayload(source, wires[index], outboxStore.chunkId(rootId, index),
+      { ...captureScope(['t'], false, true), stream: { id: rootId, index, ...(index === 0 ? { summary } : {}) } }));
+  }
+  await source.transaction(async tx => {
+    const root = await outboxStore.find(tx, rootId);
+    const result = await outboxStore.inspectStream(tx, root, () => {}, true);
+    assert.equal(result.changes, 3); assert.equal(result.complete, false);
+  });
+  await assert.rejects(port.acknowledge(deliveries[1].deliveryId, deliveries[1].sha256), { code: 'ERR_FSQLITE_OUTBOX_ACK' });
+  const original = wires[1];
+  // Retain the original byte length in the manifest so integrity must inspect
+  // a malformed final record rather than merely a changed aggregate total.
+  const invalid = original.slice(); invalid[invalid.length - 1] = 0xff;
+  source.db.prepare(`UPDATE ${outboxStore.TABLE} SET payload=?,sha256=? WHERE delivery_id=?`)
+    .run(invalid, digest(invalid), deliveries[1].deliveryId);
+  await assert.rejects(source.transaction(async tx => outboxStore.inspectStream(tx,
+    await outboxStore.find(tx, rootId), () => {}, true)), { code: 'ERR_FSQLITE_CHANGESET_FORMAT' });
+  source.db.prepare(`UPDATE ${outboxStore.TABLE} SET payload=?,sha256=? WHERE delivery_id=?`)
+    .run(original, deliveries[1].sha256, deliveries[1].deliveryId);
+  assert.equal(await port.acknowledge(rootId, deliveries[0].sha256), true);
+  assert.deepEqual((await port.read(deliveries[1].deliveryId)).changeset, original);
+  assert.equal(await port.acknowledge(deliveries[1].deliveryId, deliveries[1].sha256), true);
+  await source.transaction(async tx => {
+    const status = await outboxStore.inspectStream(tx, await outboxStore.find(tx, rootId), () => {}, true);
+    assert.equal(status.acknowledgedChunks, 2); assert.equal(status.complete, true);
+    assert.equal(await outboxStore.forgetBootstrap(tx, rootId, deliveries[0].sha256), true);
+  });
+  assert.deepEqual(await port.pending(), []);
+  // Reclamation must not recycle committed sequence identities.
+  const next = await persistPayload(source, new Uint8Array(), 'native:after-seed');
+  assert.equal(next.sequence, 3n);
+});
+
+for (const omission of [false, true]) test(`persistent pump ${omission ? 'omission consent' : 'lost confirmation'} preserves verified source until replay`, async t => {
+  const source = new SqlTarget(t), receiverTarget = new SqlTarget(t), bytes = nativeDelivery(t, 64);
+  const saved = await persistPayload(source, bytes, `persistent:delivery:${omission}`), port = storagePort(source);
+  receiverTarget.db.exec("INSERT INTO t VALUES(0,'local')");
+  let conflicts = 0, confirms = 0;
+  const receiver = new ChangesetReceiver(receiverTarget, { receiverId: 'receiver', tables: ['t'],
+    onConflict: () => { conflicts++; return omission ? 'omit' : 'replace'; },
+    confirmCommit: async () => { if (++confirms === 1 && !omission) throw new Error('lost confirmation'); } });
+  const options = { receiverId: 'receiver', deliver: message => receiver.receive(message), confirmSource: async () => {} };
+  await assert.rejects(new ChangesetDeliveryPump(port, options).run());
+  assert.deepEqual((await port.read(saved.deliveryId)).changeset, bytes);
+  const completed = await new ChangesetDeliveryPump(port, { ...options, allowOmissions: omission }).run();
+  assert.equal(completed.deliveries, 1); assert.equal(completed.replays, 1);
+  assert.equal(completed.omitted, omission ? 1 : 0); assert.equal(conflicts, 1); assert.equal(confirms, 2);
+  assert.equal((await port.read(saved.deliveryId)).changeset, null);
+});
+
+test('file-backed outbox verifies original bytes across reopen and resumes acknowledgement', async t => {
+  const path = join(mkdtempSync(join(tmpdir(), 'fsqlite-retained-outbox-')), 'source.db');
+  // Deliberately retain the test file: this is close/reopen persistence, not a
+  // power-loss, checkpoint-durability, or process-crash qualification.
+  let db = new DatabaseSync(path); t.after(() => db.close());
+  db.exec('PRAGMA journal_mode=WAL');
+  const target = { transaction: async work => {
+    db.exec('BEGIN');
+    const tx = {
+      query: async (sql, params = []) => { const s = db.prepare(sql); s.setReadBigInts(true); s.setReturnArrays(true); return { rowArrays: s.all(...params) }; },
+      execute: async (sql, params = []) => Number(db.prepare(sql).run(...params).changes),
+    };
+    try { const value = await work(tx); db.exec('COMMIT'); return value; }
+    catch (error) { db.exec('ROLLBACK'); throw error; }
+  } };
+  const bytes = nativeDelivery(t, 256), saved = await persistPayload(target, bytes, 'reopen:original');
+  db.close(); db = new DatabaseSync(path);
+  const port = storagePort(target);
+  assert.deepEqual((await port.read(saved.deliveryId)).changeset, bytes);
+  await port.acknowledge(saved.deliveryId, saved.sha256);
+  db.close(); db = new DatabaseSync(path);
+  assert.equal((await port.read(saved.deliveryId)).changeset, null);
+  assert.equal(await port.acknowledge(saved.deliveryId, saved.sha256), false);
+});

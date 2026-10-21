@@ -7,7 +7,7 @@ import type {
   SnapshotChangesetStreamOptions,
 } from "./changeset-capture";
 import type { ChangesetValue } from "./changeset-codec";
-import { decodeChangeset } from "./changeset-codec";
+import { inspectCapturedChangeset } from "./changeset-codec";
 
 export const CHANGESET_OUTBOX_TABLE = "__fsqlite_changeset_outbox";
 export interface ChangesetOutboxOptions {
@@ -408,24 +408,17 @@ async function load(tx: ChangesetExecutor, record: Stored): Promise<Uint8Array |
     (await hash(bytes)) !== record.delivery.sha256
   )
     fail("CORRUPT", "Outbox payload does not match its retained digest");
-  const tables = decodeChangeset(bytes);
-  if (tables.reduce((n, t) => n + t.changes.length, 0) !== record.delivery.changes)
-    fail("CORRUPT", "Outbox change count disagrees with payload");
   const scope = JSON.parse(record.scope) as {
     tables: string[];
     indirect: boolean;
     snapshot?: true;
   };
-  if (
-    tables.some(
-      (t) =>
-        !scope.tables.includes(fold(t.name)) ||
-        t.changes.some(
-          (c) =>
-            c.indirect !== scope.indirect || (scope.snapshot === true && c.operation !== "insert"),
-        ),
-    )
-  ) {
+  // Inspect every record in one pass, without retaining the complete decoded
+  // message during source read, replay, bootstrap verification or reclamation.
+  const inspected = inspectCapturedChangeset(bytes, scope);
+  if (inspected.changeCount !== record.delivery.changes)
+    fail("CORRUPT", "Outbox change count disagrees with payload");
+  if (!inspected.matchesScope) {
     fail("CORRUPT", "Outbox payload disagrees with its capture scope");
   }
   return bytes;

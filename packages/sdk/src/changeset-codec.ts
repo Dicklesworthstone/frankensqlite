@@ -259,6 +259,30 @@ export function inspectPatchset(
   return summarizeSession(fixedInput(bytes, policy.maxBytes), policy, true);
 }
 
+/**
+ * @internal Inspect a retained full changeset against its already validated
+ * capture policy without retaining row images or copying the complete wire.
+ * The caller still owns digest verification, metadata admission and SQL scope.
+ * Complete wire validation precedes a scope verdict, even after a mismatch:
+ * a foreign first table cannot conceal a malformed final record.
+ */
+export function inspectCapturedChangeset(
+  bytes: Uint8Array,
+  scope: { readonly tables: readonly string[]; readonly indirect: boolean; readonly snapshot?: true },
+  options?: ChangesetLimits,
+): Readonly<{ changeCount: number; matchesScope: boolean }> {
+  const policy = resolveChangesetLimits(options);
+  const names = new Set(scope.tables), indirect = scope.indirect, snapshot = scope.snapshot === true;
+  let changeCount = 0, matchesScope = true;
+  for (const { table, change } of walkSession(fixedInput(bytes, policy.maxBytes), policy, false)) {
+    changeCount++;
+    if (!names.has(table.name.replace(/[A-Z]/g, c => c.toLowerCase())) ||
+        change.indirect !== indirect || (snapshot && change.operation !== "insert"))
+      matchesScope = false;
+  }
+  return Object.freeze({ changeCount, matchesScope });
+}
+
 /** One complete validation pass shared by summaries and privately owned readers. */
 function summarizeSession(
   bytes: Uint8Array, policy: Limits, patchset: boolean,
@@ -699,8 +723,9 @@ function encodeSession(
   }
   const output = buffer.slice(0, pos);
   // One shared semantic validator, including caller-created row/key combinations.
-  if (rebasing) decodeSession(output, policy, false, true);
-  else decodeSession(output, policy, patchset);
+  // Encoding needs the verdict, not a second retained graph of every row.
+  // Drain the same parser completely, including native rebase validation.
+  for (const entry of walkSession(output, policy, patchset, rebasing)) void entry;
   return output;
 }
 
