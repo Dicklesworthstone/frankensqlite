@@ -102,8 +102,10 @@ export type {
   ChangesetPumpOptions,
   ChangesetPumpResult,
   ChangesetPumpRunOptions,
+  ChangesetPumpBatchRunOptions,
   ChangesetReceiverOptions,
   ChangesetTransport,
+  ChangesetBatchTransport,
 } from "./changeset-delivery";
 export {
   CHANGESET_DELIVERY_PROTOCOL,

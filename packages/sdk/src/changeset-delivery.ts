@@ -401,10 +401,17 @@ export type ChangesetTransport = (
   message: ChangesetEnvelope,
   options: ChangesetDeliveryOptions,
 ) => Promise<unknown>;
+/** A complete window exchange; returning an incomplete receipt list never authorizes ACK. */
+export type ChangesetBatchTransport = (
+  messages: readonly ChangesetEnvelope[],
+  options: ChangesetDeliveryOptions,
+) => Promise<unknown>;
 export interface ChangesetPumpOptions {
   /** One fixed recipient for this outbox. Its acknowledgement state is not multicast. */
   receiverId: string;
   deliver: ChangesetTransport;
+  /** Explicit batch exchange, e.g. createOrderedChangesetBatchTransport; no single-send fallback. */
+  deliverBatch?: ChangesetBatchTransport;
   /** Confirm the SAME source after reads and acknowledgements; recover snapshots here. */
   confirmSource: () => Promise<unknown>;
   maxMessageBytes?: number;
@@ -416,6 +423,12 @@ export interface ChangesetPumpRunOptions extends ChangesetDeliveryOptions {
   maxDeliveries?: number;
   /** Total payload bytes per run. Default 64 MiB, maximum 1 GiB. */
   maxBytes?: number;
+}
+export interface ChangesetPumpBatchRunOptions extends ChangesetPumpRunOptions {
+  /** Maximum messages per contiguous exchange. Default 64, maximum 256. */
+  maxBatchDeliveries?: number;
+  /** Aggregate owned wire per exchange. Default/hard maximum 64 MiB. */
+  maxBatchBytes?: number;
 }
 export interface ChangesetPumpResult {
   readonly deliveries: number;
@@ -488,6 +501,7 @@ export class ChangesetDeliveryPump {
   readonly #outbox: Pick<ChangesetOutbox, "pending" | "read" | "acknowledge">;
   readonly #id: string;
   readonly #deliver: ChangesetTransport;
+  readonly #deliverBatch: ChangesetBatchTransport | undefined;
   readonly #confirm: () => Promise<unknown>;
   readonly #maxBytes: number;
   readonly #allowOmissions: boolean;
@@ -498,16 +512,18 @@ export class ChangesetDeliveryPump {
   ) {
     this.#outbox = outbox;
     this.#id = identity(options?.receiverId, 256);
-    const deliver = options?.deliver,
+    const deliver = options?.deliver, deliverBatch = options?.deliverBatch,
       confirm = options?.confirmSource;
     const allowOmissions = options?.allowOmissions ?? false;
     if (
       typeof deliver !== "function" ||
+      (deliverBatch !== undefined && typeof deliverBatch !== "function") ||
       typeof confirm !== "function" ||
       typeof allowOmissions !== "boolean"
     )
       input("Delivery requires a transport, source confirmation and explicit omission policy");
     this.#deliver = deliver;
+    this.#deliverBatch = deliverBatch;
     this.#confirm = confirm;
     this.#allowOmissions = allowOmissions;
     this.#maxBytes = bound(options?.maxMessageBytes, 8 * 1024 * 1024, HARD_BYTES);
@@ -650,4 +666,152 @@ export class ChangesetDeliveryPump {
       this.#active = false;
     }
   }
+
+  /**
+   * Drain bounded contiguous windows through the explicit batch transport.
+   * Validate ALL receipts and omission policy before acknowledging ANY member.
+   * Source ACKs remain independently committed, in order, with confirmation after
+   * each: a failure can leave a confirmed prefix, never falsely reclaim a suffix.
+   * The next run confirms source recovery then restarts at the oldest pending ID.
+   * No SQL transaction spans transport, no retry/queue or automatic batch protocol.
+   * Window limits are not source transaction boundaries; configure application
+   * dependencies to fit a window, or leave the failed window pending unchanged.
+   */
+  async runBatch(options: ChangesetPumpBatchRunOptions = {}): Promise<ChangesetPumpResult> {
+    if (this.#active)
+      throw new ChangesetDeliveryError("ERR_FSQLITE_DELIVERY_BUSY", "admission", null,
+        new Error("This pump is active; no run was queued"));
+    this.#active = true;
+    let budget: DeliveryBudget | undefined, phase: ChangesetDeliveryPhase = "admission";
+    let id: string | null = null;
+    const counts = { deliveries: 0, bytes: 0, applied: 0, omitted: 0, replays: 0, alreadyAcknowledged: 0 };
+    const result = (stopped: "empty" | "limit"): ChangesetPumpResult => Object.freeze({ ...counts, stopped });
+    try {
+      const deliver = this.#deliverBatch;
+      if (deliver === undefined) input("runBatch requires an explicit batch transport");
+      const maxDeliveries = bound(options.maxDeliveries, 100, 10_000);
+      const maxBytes = bound(options.maxBytes, HARD_BYTES, 1024 * 1024 * 1024);
+      const batchSize = bound(options.maxBatchDeliveries, 64, 256);
+      const batchBytes = bound(options.maxBatchBytes, HARD_BYTES, HARD_BYTES);
+      budget = new DeliveryBudget(options);
+      budget.checkpoint();
+      phase = "source-confirm";
+      await this.#confirm();
+      budget.checkpoint();
+      let selected = 0, lastSequence = 0n;
+      while (selected < maxDeliveries) {
+        id = null;
+        phase = "source-read";
+        const pageSize = Math.min(batchSize, maxDeliveries - selected);
+        budget.checkpoint();
+        const pending = await this.#outbox.pending({ limit: pageSize });
+        budget.checkpoint();
+        if (!Array.isArray(pending) || pending.length > pageSize)
+          input("Outbox exceeded its requested page bound");
+        if (pending.length === 0) return result("empty");
+        // Capture the entire metadata page before an asynchronous read. Sources
+        // may reuse mutable result arrays; no later mutation can change identity.
+        const page: OutboxDelivery[] = [];
+        const ids = new Set<string>();
+        let previous = lastSequence;
+        for (let i = 0, n = pending.length; i < n; i++) {
+          const entry = Object.getOwnPropertyDescriptor(pending, String(i));
+          if (entry === undefined || !Object.hasOwn(entry, "value"))
+            input("Outbox metadata entries must be own data properties");
+          const next = deliveryMetadata(entry.value);
+          if (next.acknowledged || next.sequence <= previous || ids.has(next.deliveryId))
+            input("Outbox did not advance past confirmed acknowledgements");
+          page.push(next); ids.add(next.deliveryId); previous = next.sequence;
+        }
+        const window: { delivery: OutboxDelivery; message: ChangesetEnvelope }[] = [];
+        let bytesInWindow = 0;
+        for (const next of page) {
+          id = next.deliveryId;
+          // An already acknowledged hole is not a missing source payload. End
+          // this contiguous exchange; never renumber messages or skip the head.
+          if (window.length && next.sequence !== window[window.length - 1]!.delivery.sequence + 1n) break;
+          if (next.byteLength > this.#maxBytes || next.byteLength > batchBytes)
+            reject("ERR_FSQLITE_DELIVERY_LIMIT", "Pending message exceeds the batch/message byte budget; it was not skipped");
+          if (next.byteLength > Math.min(batchBytes - bytesInWindow, maxBytes - counts.bytes - bytesInWindow)) {
+            if (window.length) break;
+            if (counts.deliveries === 0)
+              reject("ERR_FSQLITE_DELIVERY_LIMIT", "The oldest message cannot fit this run's byte budget");
+            return result("limit");
+          }
+          selected++;
+          const loaded = await this.#outbox.read(id);
+          budget.checkpoint();
+          if (loaded === null) input("Selected outbox delivery disappeared; reconcile its retention state");
+          const current = deliveryMetadata(field(loaded, "delivery")), data = field(loaded, "changeset");
+          if (!sameDelivery(next, current)) input("Outbox delivery changed between selection and read");
+          if (current.acknowledged) {
+            if (data !== null) input("An acknowledged outbox entry retained unexpected payload bytes");
+            phase = "source-confirm";
+            await this.#confirm();
+            budget.checkpoint();
+            counts.alreadyAcknowledged++;
+            if (!window.length) lastSequence = current.sequence;
+            // Re-read the oldest pending state, after sending any earlier prefix.
+            // Do not accidentally put messages on either side of the race in one
+            // non-contiguous exchange, or mark the pending prefix as consumed.
+            break;
+          }
+          const bytes = ownBytes(data, Math.min(this.#maxBytes, batchBytes - bytesInWindow, maxBytes - counts.bytes - bytesInWindow));
+          if (bytes.byteLength !== current.byteLength || (await hash(bytes)) !== current.sha256 ||
+              inspectChangeset(bytes).changeCount !== current.changes)
+            input("Outbox payload disagrees with the selected identity/digest/count");
+          budget.checkpoint();
+          window.push({ delivery: current, message: Object.freeze({ protocol: CHANGESET_DELIVERY_PROTOCOL,
+            receiverId: this.#id, deliveryId: id, sha256: current.sha256, changeset: bytes }) });
+          bytesInWindow += bytes.byteLength;
+        }
+        if (!window.length) continue;
+        phase = "source-confirm";
+        await this.#confirm();
+        budget.checkpoint();
+        phase = "transport";
+        id = window[0]!.delivery.deliveryId;
+        const controls: ChangesetDeliveryOptions = { signal: budget.signal };
+        const remaining = budget.remainingMs();
+        if (remaining !== undefined) controls.timeoutMs = remaining;
+        const response = await deliver(Object.freeze(window.map(item => item.message)), controls);
+        budget.checkpoint();
+        phase = "receipt";
+        if (!Array.isArray(response) || response.length !== window.length)
+          reject("ERR_FSQLITE_DELIVERY_RECEIPT", "Receiver did not confirm the complete batch");
+        const receipts: ApplyChangesetResult[] = [];
+        for (let i = 0; i < window.length; i++) {
+          id = window[i]!.delivery.deliveryId;
+          const entry = Object.getOwnPropertyDescriptor(response, String(i));
+          if (entry === undefined || !Object.hasOwn(entry, "value"))
+            reject("ERR_FSQLITE_DELIVERY_RECEIPT", "Batch receipts must be own data properties");
+          const receipt = verifyReceipt(entry.value, window[i]!.delivery, this.#id);
+          if (receipt.omitted !== 0 && !this.#allowOmissions)
+            reject("ERR_FSQLITE_DELIVERY_RECEIPT", "Receiver omissions require explicit sender acceptance");
+          receipts.push(receipt);
+        }
+        // Only a complete, accepted response authorizes any source reclamation.
+        // Once each ACK starts, join its confirmation even after cancellation.
+        // Uncertain ACK/confirmation throws with its exact identity; a fresh run
+        // reconciles source state before choosing the remaining pending suffix.
+        for (let i = 0; i < window.length; i++) {
+          budget.checkpoint();
+          const current = window[i]!.delivery, receipt = receipts[i]!;
+          id = current.deliveryId; phase = "source-ack";
+          const acknowledged = await this.#outbox.acknowledge(id, current.sha256);
+          if (typeof acknowledged !== "boolean") input("Invalid outbox acknowledgement result");
+          phase = "source-confirm";
+          await this.#confirm();
+          budget.checkpoint();
+          counts.deliveries++; counts.bytes += current.byteLength;
+          counts.applied += receipt.applied; counts.omitted += receipt.omitted;
+          if (receipt.replayed) counts.replays++;
+          lastSequence = current.sequence;
+        }
+      }
+      return result("limit");
+    } catch (cause: unknown) { throw failure(cause, phase, id); }
+    finally { budget?.finish(); this.#active = false; }
+  }
+
 }
