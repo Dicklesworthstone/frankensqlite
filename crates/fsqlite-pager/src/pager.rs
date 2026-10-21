@@ -9047,6 +9047,8 @@ struct DetachedPendingGroupCommitTxnCleanup<F: VfsFile + 'static> {
     attempt: Arc<PendingGroupCommitTxnAttempt<F>>,
     maintenance_lease: Option<PagerMaintenanceLease>,
     allocated_from_freelist: Vec<PageNumber>,
+    // Preserve committed-freelist origin while a dropped WAL attempt is unresolved.
+    allocated_from_durable_freelist: HashSet<u32>,
     allocated_from_eof: Vec<PageNumber>,
     page_lease: Vec<PageNumber>,
     savepoint_quarantine: Vec<PageNumber>,
@@ -9150,6 +9152,7 @@ impl<F: VfsFile + 'static> PendingGroupCommitLogicalCleanupOperation
                 PendingGroupCommitTxnResolution::Authorized(_) => {
                     if !self.allocation_cleanup_applied {
                         self.allocated_from_freelist.clear();
+                        self.allocated_from_durable_freelist.clear();
                         self.allocated_from_eof.clear();
                         self.page_lease.clear();
                         self.savepoint_quarantine.clear();
@@ -9158,7 +9161,7 @@ impl<F: VfsFile + 'static> PendingGroupCommitLogicalCleanupOperation
                 }
                 PendingGroupCommitTxnResolution::NotCommitted => {
                     if !self.allocation_cleanup_applied {
-                        let not_committed = self.attempt.take_not_committed_state()?;
+                        let mut not_committed = self.attempt.take_not_committed_state()?;
                         let mut inner = self
                             .attempt
                             .inner
@@ -9177,6 +9180,11 @@ impl<F: VfsFile + 'static> PendingGroupCommitLogicalCleanupOperation
                             self.allocated_from_eof.drain(..),
                         );
                         return_pages_to_freelist(&mut inner.freelist, self.page_lease.drain(..));
+                        restore_quarantined_durable_freelist_pages(
+                            &mut inner.freelist,
+                            &mut self.savepoint_quarantine,
+                            &self.allocated_from_durable_freelist,
+                        );
                         inner
                             .abandoned_eof_reservations
                             .append(&mut self.savepoint_quarantine);
@@ -9193,10 +9201,16 @@ impl<F: VfsFile + 'static> PendingGroupCommitLogicalCleanupOperation
                                 &mut inner.freelist,
                                 not_committed.returned_allocations.page_lease,
                             );
+                            restore_quarantined_durable_freelist_pages(
+                                &mut inner.freelist,
+                                &mut not_committed.returned_allocations.savepoint_quarantine,
+                                &self.allocated_from_durable_freelist,
+                            );
                             inner.abandoned_eof_reservations.extend(
                                 not_committed.returned_allocations.savepoint_quarantine,
                             );
                         }
+                        self.allocated_from_durable_freelist.clear();
                         DisownedPageReclaimAttempt::<F>::restore_pages(
                             &mut inner,
                             not_committed.reclaimed_abandoned_reservations,
@@ -29271,6 +29285,9 @@ where
                 attempt,
                 maintenance_lease: self.maintenance_lease.take(),
                 allocated_from_freelist: std::mem::take(&mut self.allocated_from_freelist),
+                allocated_from_durable_freelist: std::mem::take(
+                    &mut self.allocated_from_durable_freelist,
+                ),
                 allocated_from_eof: std::mem::take(&mut self.allocated_from_eof),
                 page_lease: std::mem::take(&mut self.page_lease),
                 savepoint_quarantine: std::mem::take(&mut self.savepoint_quarantined_allocations),
