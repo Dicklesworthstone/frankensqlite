@@ -11,7 +11,7 @@
 //! predicates, schema changes, or row-level conflicts from arbitrary bytes.
 
 mod snapshot;
-pub use snapshot::NativePageSnapshot;
+pub use snapshot::{NativePageSnapshot, NativeSnapshotInstall};
 
 mod store;
 pub use store::{
