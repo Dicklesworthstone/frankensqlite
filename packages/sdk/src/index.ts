@@ -284,8 +284,10 @@ export type {
   OrderedChangesetReceiver,
   OrderedChangesetSource,
   OrderedChangesetTransportOptions,
+  OrderedChangesetBatchTransportOptions,
+  OrderedChangesetBatchTransport,
 } from "./changeset-ordered-delivery";
-export { CHANGESET_ORDER_PROTOCOL, OrderedChangesetDeliveryError, createOrderedChangesetReceiver, createOrderedChangesetTransport } from "./changeset-ordered-delivery";
+export { CHANGESET_ORDER_PROTOCOL, OrderedChangesetDeliveryError, createOrderedChangesetReceiver, createOrderedChangesetTransport, createOrderedChangesetBatchTransport } from "./changeset-ordered-delivery";
 export { ChangesetForeignKeyError, withDeferredForeignKeys } from "./changeset-foreign-keys";
 export { ChangesetBootstrapTransfer, BootstrapTransferError } from "./changeset-bootstrap-transfer";
 export type {

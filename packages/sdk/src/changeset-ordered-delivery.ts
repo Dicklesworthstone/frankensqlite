@@ -34,6 +34,17 @@ export interface OrderedChangesetTransportOptions {
   deliver(message: OrderedChangesetEnvelope, options: ChangesetDeliveryOptions): Promise<unknown>;
   maxMessageBytes?: number;
 }
+export interface OrderedChangesetBatchTransportOptions
+  extends Omit<OrderedChangesetTransportOptions, "deliver"> {
+  /** One authenticated exchange; return ALL receipts in the same source order. */
+  deliver(messages: readonly OrderedChangesetEnvelope[], options: ChangesetDeliveryOptions): Promise<unknown>;
+  /** Aggregate copied input per batch, default/maximum 64 MiB; not total RSS. */
+  maxBatchBytes?: number;
+}
+/** Explicit batching, not a replacement for the single-message pump contract. */
+export type OrderedChangesetBatchTransport = (
+  messages: readonly ChangesetEnvelope[], options?: ChangesetDeliveryOptions,
+) => Promise<readonly OrderedChangesetReceipt[]>;
 /** Apply with the supplied target; never confirm durability inside this callback. */
 export type OrderedDeliveryApply = (
   target: ChangesetTarget,
@@ -120,6 +131,37 @@ function captureMessage(value: unknown, receiverId: string, maximum: number): Ch
   return Object.freeze({ protocol: BASE_PROTOCOL, receiverId,
     deliveryId: identity(own(value, "deliveryId"), 512), sha256: digest(own(value, "sha256")),
     changeset: ownBytes(own(value, "changeset"), maximum) });
+}
+function batchValues(value: unknown): readonly unknown[] {
+  if (!Array.isArray(value)) input("Use 1..256 ordered messages or receipts");
+  const length = bounded(Object.getOwnPropertyDescriptor(value, "length")?.value, 256, 1);
+  const values: unknown[] = [];
+  for (let index = 0; index < length; index++) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    if (descriptor === undefined || !Object.hasOwn(descriptor, "value"))
+      input("Batch entries must be own data properties");
+    values.push(descriptor.value);
+  }
+  return values;
+}
+function captureMessages(
+  values: readonly unknown[], receiverId: string, maximum: number, maximumBatch: number,
+): readonly ChangesetEnvelope[] {
+  const messages: ChangesetEnvelope[] = [], ids = new Set<string>();
+  let remaining = maximumBatch;
+  for (const value of values) {
+    // ownBytes checks the remaining aggregate limit BEFORE allocating a copy.
+    const message = captureMessage(value, receiverId, Math.min(maximum, remaining));
+    if (ids.has(message.deliveryId)) input("A batch repeats a delivery identity");
+    ids.add(message.deliveryId);
+    remaining -= message.changeset.byteLength;
+    messages.push(message);
+  }
+  return Object.freeze(messages);
+}
+function requireNext(previous: ChangesetWireOrder | undefined, next: ChangesetWireOrder): void {
+  if (previous !== undefined && BigInt(next.sequence) !== BigInt(previous.sequence) + 1n)
+    input("Batch messages must be contiguous and in source order");
 }
 async function verifyHash(message: ChangesetEnvelope): Promise<void> {
   if (globalThis.crypto?.subtle === undefined) input("Ordered delivery requires Web Crypto SHA-256");
@@ -337,6 +379,28 @@ function baseReceipt(value: unknown, message: ChangesetEnvelope, byteLength: num
     sha256: message.sha256, byteLength, ...decisions(value), confirmed: true });
 }
 
+function sourceMetadata(record: unknown, message: ChangesetEnvelope, byteLength: number) {
+  if (record === null) mismatch("Ordered delivery has no retained source identity");
+  const entry = own(record, "delivery"), sequence = own(entry, "sequence");
+  if (typeof sequence !== "bigint" || sequence < 1n || sequence >= 1n << 63n ||
+      own(entry, "deliveryId") !== message.deliveryId || own(entry, "sha256") !== message.sha256 ||
+      own(entry, "byteLength") !== byteLength || typeof own(entry, "acknowledged") !== "boolean")
+    mismatch("Source metadata does not identify this ordered delivery");
+  return { sequence, changes: bounded(own(entry, "changes"), 100_000) };
+}
+function orderedReceipt(
+  response: unknown, message: ChangesetEnvelope, order: ChangesetWireOrder,
+  byteLength: number, changes: number,
+): OrderedChangesetReceipt {
+  const proof = captureOrder(own(response, "order"));
+  if (proof.streamId !== order.streamId || proof.sequence !== order.sequence)
+    mismatch("Receiver did not confirm the exact source sequence");
+  const receipt = baseReceipt(response, message, byteLength);
+  if (receipt.applied + receipt.omitted !== changes)
+    mismatch("Ordered receipt decisions disagree with source change count");
+  return Object.freeze({ ...receipt, order });
+}
+
 /**
  * Pump-compatible transport whose successful return proves matching source order.
  * Read authoritative outbox metadata before transport; never renumber retries.
@@ -361,21 +425,68 @@ export function createOrderedChangesetTransport(
       const byteLength = message.changeset.byteLength;
       await verifyHash(message); time.check();
       const record = await read.call(source, message.deliveryId); time.check();
-      if (record === null) mismatch("Ordered delivery has no retained source identity");
-      const entry = own(record, "delivery"), sequence = own(entry, "sequence");
-      if (typeof sequence !== "bigint" || sequence < 1n || sequence >= 1n << 63n ||
-          own(entry, "deliveryId") !== message.deliveryId || own(entry, "sha256") !== message.sha256 ||
-          own(entry, "byteLength") !== byteLength || typeof own(entry, "acknowledged") !== "boolean")
-        mismatch("Source metadata does not identify this ordered delivery");
-      const changes = bounded(own(entry, "changes"), 100_000);
+      const { sequence, changes } = sourceMetadata(record, message, byteLength);
       const order = Object.freeze({ protocol: CHANGESET_ORDER_PROTOCOL, streamId, sequence: sequence.toString() });
       const response = await deliver(Object.freeze({ ...message, order }), time.remaining());
       time.check();
-      const proof = captureOrder(own(response, "order"));
-      if (proof.streamId !== streamId || proof.sequence !== order.sequence) mismatch("Receiver did not confirm the exact source sequence");
-      const receipt = baseReceipt(response, message, byteLength);
-      if (receipt.applied + receipt.omitted !== changes) mismatch("Ordered receipt decisions disagree with source change count");
-      return Object.freeze({ ...receipt, order });
+      return orderedReceipt(response, message, order, byteLength, changes);
+    } finally { active = false; }
+  };
+}
+
+/**
+ * Explicit atomic-window transport. Read each authoritative source sequence,
+ * admit the whole contiguous window before sending, and validate EVERY receipt
+ * before returning any of them. The peer must use atomic batch reception, not a
+ * loop over single-message delivery. This is not an HTTP codec or auto-batching
+ * pump; callers own authentication, omission consent, durable source ACKs and
+ * recovery of lost responses. No source transaction spans network I/O.
+ */
+export function createOrderedChangesetBatchTransport(
+  source: OrderedChangesetSource, options: OrderedChangesetBatchTransportOptions,
+): OrderedChangesetBatchTransport {
+  const receiverId = identity(options?.receiverId, 256), streamId = identity(options?.streamId, 256);
+  const deliver = options?.deliver, read = source?.read, binding = source?.receiverId;
+  const maximum = bounded(options?.maxMessageBytes ?? 8 * 1024 * 1024, HARD_BYTES, 1);
+  const maximumBatch = bounded(options?.maxBatchBytes ?? HARD_BYTES, HARD_BYTES, 1);
+  if (typeof deliver !== "function" || typeof read !== "function" || (binding !== undefined && binding !== receiverId))
+    input("Use a matching receiver-bound source and an ordered batch transport");
+  let active = false;
+  return async (values, options = {}) => {
+    if (active) throw new OrderedChangesetDeliveryError("ERR_FSQLITE_ORDERED_BUSY", "This ordered batch transport is already active");
+    active = true;
+    try {
+      const time = budget(options);
+      const messages = captureMessages(batchValues(values), receiverId, maximum, maximumBatch);
+      const lengths = messages.map(message => message.changeset.byteLength);
+      // Match the receiver's full-changeset contract before source reads or
+      // transport. A corrupt retained count must not be discovered only after
+      // the remote transaction commits; malformed tails cannot escape admission.
+      const expectedCounts = messages.map(message => inspectChangeset(message.changeset).changeCount);
+      for (const message of messages) { await verifyHash(message); time.check(); }
+      const outgoing: OrderedChangesetEnvelope[] = [], counts: number[] = [];
+      for (const message of messages) {
+        const record = await read.call(source, message.deliveryId); time.check();
+        const { sequence, changes } = sourceMetadata(record, message, lengths[outgoing.length]!);
+        if (changes !== expectedCounts[outgoing.length])
+          mismatch("Source change count disagrees with the complete batch payload");
+        counts.push(changes);
+        const order = Object.freeze({ protocol: CHANGESET_ORDER_PROTOCOL, streamId, sequence: sequence.toString() });
+        requireNext(outgoing.at(-1)?.order, order);
+        outgoing.push(Object.freeze({ ...message, order }));
+      }
+      // Authority is retained source metadata, never caller-supplied order.
+      const response = await deliver(Object.freeze(outgoing), time.remaining());
+      time.check();
+      const receipts = batchValues(response);
+      if (receipts.length !== outgoing.length) mismatch("Receiver did not confirm the complete ordered batch");
+      const verified: OrderedChangesetReceipt[] = [];
+      for (let index = 0; index < outgoing.length; index++) {
+        const message = outgoing[index]!;
+        verified.push(orderedReceipt(receipts[index], message, message.order, lengths[index]!, counts[index]!));
+      }
+      time.check();
+      return Object.freeze(verified);
     } finally { active = false; }
   };
 }
