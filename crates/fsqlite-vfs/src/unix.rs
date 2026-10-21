@@ -671,74 +671,37 @@ fn posix_lock_styled(
     }
 }
 
-/// Like [`posix_lock`], but retries with exponential backoff when the lock
-/// would block (`EAGAIN`/`EACCES`) and a non-zero `timeout` is provided.
-///
-/// The backoff starts at 1 ms and doubles each iteration, capped at 100 ms,
-/// matching the strategy used by C SQLite's busy handler. If the cumulative
-/// elapsed time exceeds `timeout`, the function gives up and returns
-/// `Ok(false)`.
-///
-/// When `timeout` is zero the function delegates directly to [`posix_lock`]
-/// with no retry, preserving the original fail-fast behavior.
-fn posix_lock_with_timeout(
+/// One nonblocking main-file attempt. Native contention is recorded separately
+/// from process-local ownership conflicts so only cross-process waits use the
+/// VFS busy handler. The caller drops the inode mutex before any backoff.
+fn try_posix_main_lock(
+    cx: &Cx,
     file: &impl AsFd,
     lock_type: impl Into<i32> + Copy,
     start: u64,
     len: u64,
-    timeout: Duration,
+    native_contention: &mut Option<(u64, u64)>,
 ) -> Result<bool> {
-    posix_lock_with_timeout_styled(file, lock_type, start, len, timeout)
+    try_posix_main_lock_styled(cx, file, lock_type, start, len, native_contention)
         .map(|(acquired, _style)| acquired)
 }
 
-/// Like [`posix_lock_with_timeout`], but also reports which advisory-lock
-/// primitive satisfied the request (see [`posix_lock_styled`]). The reported
-/// style is that of the acquiring attempt; on timeout (`Ok((false, _))`) it is
-/// `ByteRange`. Used by the SHARED-acquisition choke point to record a
-/// whole-file `flock(2)` downgrade on the inode (GH #343 / bd-qll76).
-fn posix_lock_with_timeout_styled(
+/// Preserve the advisory-lock style for the SHARED acquisition's whole-file
+/// `flock(2)` fallback receipt (GH #343 / bd-qll76).
+fn try_posix_main_lock_styled(
+    cx: &Cx,
     file: &impl AsFd,
     lock_type: impl Into<i32> + Copy,
     start: u64,
     len: u64,
-    timeout: Duration,
+    native_contention: &mut Option<(u64, u64)>,
 ) -> Result<(bool, FileLockStyle)> {
-    // Fast path: no timeout configured -- fail immediately on contention.
-    if timeout.is_zero() {
-        return posix_lock_styled(file, lock_type, start, len);
+    checkpoint_or_abort(cx)?;
+    let result = posix_lock_styled(file, lock_type, start, len)?;
+    if !result.0 {
+        *native_contention = Some((start, len));
     }
-
-    // First attempt -- no sleeping.
-    let first = posix_lock_styled(file, lock_type, start, len)?;
-    if first.0 {
-        return Ok(first);
-    }
-
-    #[cfg(test)]
-    tests::observe_reserved_lock_wait(start);
-
-    let started = Instant::now();
-    let mut backoff = Duration::from_millis(1);
-    let max_backoff = Duration::from_millis(100);
-
-    loop {
-        let elapsed = started.elapsed();
-        let Some(remaining) = timeout.checked_sub(elapsed) else {
-            return Ok((false, FileLockStyle::ByteRange));
-        };
-
-        // Sleep for the lesser of `backoff` and the remaining budget.
-        std::thread::sleep(backoff.min(remaining));
-
-        let attempt = posix_lock_styled(file, lock_type, start, len)?;
-        if attempt.0 {
-            return Ok(attempt);
-        }
-
-        // Exponential backoff, capped at 100 ms.
-        backoff = (backoff * 2).min(max_backoff);
-    }
+    Ok(result)
 }
 
 /// Release a POSIX advisory lock.
@@ -1363,6 +1326,16 @@ impl ShmTable {
         Self {
             map: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Observe an existing lock domain without opening SHM or joining it.
+    /// The table guard is gone before the caller inspects per-file ownership.
+    fn lookup(&self, path: &Path) -> Option<Arc<Mutex<ShmInfo>>> {
+        self.map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(path)
+            .cloned()
     }
 
     fn get_or_open_and_register(
@@ -2021,12 +1994,65 @@ pub struct UnixFile {
     /// helper nesting. Retained through failed unmap/close and deferred cleanup.
     shm_dms_lifetime_claim: bool,
     /// Busy timeout for cross-process lock contention (milliseconds).
-    /// When > 0, `posix_lock` retries with exponential backoff instead of
-    /// returning `Ok(false)` immediately on `EAGAIN`/`EACCES`.
+    /// Native main-file refusals retry outside the inode mutex. Process-local
+    /// ownership conflicts remain nonblocking so the owning task can run.
     busy_timeout_ms: u64,
 }
 
 impl UnixFile {
+    /// A never-mapped handle still shares POSIX ownership with sibling SHM
+    /// users. Inspect an existing registration without creating or joining it.
+    /// No SHM/table guard survives this method or overlaps the inode mutex.
+    fn process_holds_wal_fence(&self) -> bool {
+        let shm = self
+            .shm_info
+            .as_ref()
+            .cloned()
+            .or_else(|| global_shm_table().lookup(&self.shm_path));
+        shm.is_some_and(|shm| {
+            let info = shm
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Preserve borrowed RECOVER/reader-exclusive claims too. A
+            // waiting main-lock upgrade must never strand its own WAL owner.
+            info.slots
+                .iter()
+                .any(|slot| slot.exclusive_owner == Some(self.shm_owner_id))
+                || [WAL_WRITE_LOCK, WAL_CKPT_LOCK].iter().any(|&slot| {
+                    let state = &info.slots[usize::try_from(slot).expect("WAL slot fits usize")];
+                    state.exclusive_owner.is_some() || !state.shared_holders.is_empty()
+                })
+        })
+    }
+
+    /// A sibling may acquire a WAL claim after our first native refusal.
+    /// Recheck each wait instead of changing the handle's configured policy.
+    fn main_lock_wait_remaining(&self, started: Instant, timeout: Duration) -> Duration {
+        if self.process_holds_wal_fence() {
+            Duration::ZERO
+        } else {
+            timeout.saturating_sub(started.elapsed())
+        }
+    }
+
+    fn restore_failed_main_lock_wait(
+        &mut self,
+        prior_level: LockLevel,
+        error: FrankenError,
+    ) -> Result<()> {
+        let inode_info = Arc::clone(self.inode_info_ref());
+        let mut info = inode_info
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::return_after_main_lock_failure(
+            &mut info,
+            &mut self.lock_level,
+            &mut self.transient_shared_pending_gate,
+            prior_level,
+            error,
+        )
+    }
+
     fn file_ref(&self) -> &File {
         self.file
             .as_deref()
@@ -2369,34 +2395,6 @@ impl UnixFile {
         Ok(())
     }
 
-    fn lock_main_for_external_fence(&mut self, cx: &Cx, level: LockLevel) -> Result<()> {
-        // Ordinary append and maintenance callers acquire their main-file
-        // fence before any WAL slot. A caller may already own an exclusive
-        // slot, however, and exact restoration must preserve that claim.
-        // Such callers may only try the main fence without waiting: retaining
-        // their slot across a busy wait could block the RESERVED owner's
-        // commit or checkpoint (GH #519).
-        let owns_wal_slot = self.lock_level < level
-            && self.shm_info.as_ref().is_some_and(|shm| {
-                shm.lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .slots
-                    .iter()
-                    .any(|slot| slot.exclusive_owner == Some(self.shm_owner_id))
-            });
-        if !owns_wal_slot {
-            return self.lock(cx, level);
-        }
-
-        // lock() is synchronous; restore the configured policy on every
-        // returned outcome. Only this acquisition receives a zero budget.
-        let configured_timeout_ms = self.busy_timeout_ms;
-        self.busy_timeout_ms = 0;
-        let result = self.lock(cx, level);
-        self.busy_timeout_ms = configured_timeout_ms;
-        result
-    }
-
     fn acquire_external_maintenance_fence(
         &mut self,
         cx: &Cx,
@@ -2429,12 +2427,20 @@ impl UnixFile {
             recovery_mode,
             newly_acquired_wal_slots: 0,
         });
+        tracing::trace!(
+            target: "fsqlite_vfs::unix",
+            event = "unix_maintenance_begin",
+            ?main_level,
+            wal_mode,
+            recovery_mode,
+            "acquiring external maintenance fence"
+        );
         // Match BEGIN IMMEDIATE: settle the main-file prefix before taking
         // any WAL slot. In particular, never hold WRITE while busy-waiting
         // for RESERVED: its owner may need WRITE to commit (GH #519).
         // The attempt is already armed, so a failed main acquisition or a
         // later nonblocking WAL conflict retains exact cleanup ownership.
-        self.lock_main_for_external_fence(cx, main_level)?;
+        self.lock(cx, main_level)?;
         checkpoint_or_abort(cx)?;
         if wal_mode {
             for slot in [WAL_WRITE_LOCK, WAL_CKPT_LOCK] {
@@ -3974,110 +3980,140 @@ impl VfsFile for UnixFile {
         Ok(meta.len())
     }
 
-    fn lock(&mut self, _cx: &Cx, level: LockLevel) -> Result<()> {
+    fn lock(&mut self, cx: &Cx, level: LockLevel) -> Result<()> {
+        checkpoint_or_abort(cx)?;
         let timeout = Duration::from_millis(self.busy_timeout_ms);
         let prior_level = self.lock_level;
-        let inode_info = Arc::clone(self.inode_info_ref());
-        let mut info = inode_info
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        // A prior SHARED attempt may have completed its main prefix but failed
-        // to release the transient PENDING gate. Retire that obligation before
-        // treating an already-reached level as a no-op.
-        if self.transient_shared_pending_gate && self.lock_level >= LockLevel::Shared {
-            Self::release_transient_shared_pending_gate_state(
-                &mut info,
-                &mut self.transient_shared_pending_gate,
-            )?;
-        }
-        if level <= self.lock_level {
-            return Ok(());
-        }
-        if info.n_transient_shared_pending > 0 && !self.transient_shared_pending_gate {
-            // An unresolved transient PENDING byte is process-wide, not
-            // descriptor-local. Do not let another local handle overwrite its
-            // raw lock type while the owning attempt still needs to retry.
-            return Err(FrankenError::Busy);
-        }
-
-        // None -> Shared: acquire F_RDLCK on the shared byte range.
-        if self.lock_level < LockLevel::Shared && level >= LockLevel::Shared {
-            // Classic fcntl locks do not conflict with locks already held by
-            // this process. Enforce SQLite's pending/exclusive exclusion in
-            // the coalesced in-process state before consulting the kernel.
-            if info.n_pending > 0 || info.n_exclusive > 0 {
-                return Err(FrankenError::Busy);
-            }
-            let Some(next_shared) = info.n_shared.checked_add(1) else {
-                return Self::return_after_main_lock_failure(
-                    &mut info,
-                    &mut self.lock_level,
-                    &mut self.transient_shared_pending_gate,
-                    prior_level,
-                    FrankenError::internal("Unix inode SHARED count overflow"),
-                );
-            };
-            // A WAL-lifetime owner already holds the kernel SHARED lock for this
-            // process (release keeps it while `n_wal_lifetime > 0`), and no other
-            // process can reach EXCLUSIVE past it, so the PENDING pass-through
-            // and the SHARED re-lock would only repeat locks already held.
-            if info.n_shared == 0 && info.n_wal_lifetime == 0 {
-                // Readers must pass through the PENDING byte so a waiting
-                // writer can block new SHARED acquisitions while upgrading.
-                if !self.transient_shared_pending_gate {
-                    let next_transient = info
-                        .n_transient_shared_pending
-                        .checked_add(1)
-                        .ok_or_else(|| {
-                            FrankenError::internal(
-                                "Unix inode transient SHARED PENDING count overflow",
-                            )
-                        })?;
-                    match posix_lock_with_timeout(
-                        &*info.file,
-                        libc::F_RDLCK,
-                        PENDING_BYTE,
-                        1,
-                        timeout,
-                    ) {
-                        Ok(true) => {
-                            info.n_transient_shared_pending = next_transient;
-                            self.transient_shared_pending_gate = true;
-                        }
-                        Ok(false) => return Err(FrankenError::Busy),
-                        Err(error) => return Err(error),
-                    }
+        let mut wait_started = None;
+        let mut backoff = Duration::from_millis(1);
+        loop {
+            let mut native_contention = None;
+            // Publish each completed prefix under the inode mutex, but never
+            // retain that mutex across a native wait. Keeping PENDING between
+            // attempts blocks new readers while an EXCLUSIVE writer drains them.
+            let result = (|| -> Result<()> {
+                let inode_info = Arc::clone(self.inode_info_ref());
+                let mut info = inode_info
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Err(error) = checkpoint_or_abort(cx) {
+                    return Self::return_after_main_lock_failure(
+                        &mut info,
+                        &mut self.lock_level,
+                        &mut self.transient_shared_pending_gate,
+                        prior_level,
+                        error,
+                    );
                 }
 
-                let shared_result = posix_lock_with_timeout_styled(
-                    &*info.file,
-                    libc::F_RDLCK,
-                    SHARED_FIRST,
-                    SHARED_SIZE,
-                    timeout,
-                );
-                match shared_result {
-                    Ok((true, style)) => {
-                        // The SHARED lock is the first lock every connection
-                        // takes on the inode; if byte-range/OFD locking was
-                        // rejected here it is rejected for the whole inode.
-                        // Record the coarse whole-file flock(2) downgrade so it
-                        // is observable above the VFS (GH #343 / bd-qll76).
-                        if style == FileLockStyle::WholeFileFlock {
-                            info.flock_fallback_engaged = true;
-                        }
+                // A prior SHARED attempt may have completed its main prefix but failed
+                // to release the transient PENDING gate. Retire that obligation before
+                // treating an already-reached level as a no-op.
+                if self.transient_shared_pending_gate && self.lock_level >= LockLevel::Shared {
+                    Self::release_transient_shared_pending_gate_state(
+                        &mut info,
+                        &mut self.transient_shared_pending_gate,
+                    )?;
+                }
+                if level <= self.lock_level {
+                    return Ok(());
+                }
+                if info.n_transient_shared_pending > 0 && !self.transient_shared_pending_gate {
+                    // An unresolved transient PENDING byte is process-wide, not
+                    // descriptor-local. Do not let another local handle overwrite its
+                    // raw lock type while the owning attempt still needs to retry.
+                    return Err(FrankenError::Busy);
+                }
+
+                // None -> Shared: acquire F_RDLCK on the shared byte range.
+                if self.lock_level < LockLevel::Shared && level >= LockLevel::Shared {
+                    // Classic fcntl locks do not conflict with locks already held by
+                    // this process. Enforce SQLite's pending/exclusive exclusion in
+                    // the coalesced in-process state before consulting the kernel.
+                    if info.n_pending > 0 || info.n_exclusive > 0 {
+                        return Err(FrankenError::Busy);
                     }
-                    Ok((false, _)) => {
+                    let Some(next_shared) = info.n_shared.checked_add(1) else {
                         return Self::return_after_main_lock_failure(
                             &mut info,
                             &mut self.lock_level,
                             &mut self.transient_shared_pending_gate,
                             prior_level,
-                            FrankenError::Busy,
+                            FrankenError::internal("Unix inode SHARED count overflow"),
                         );
+                    };
+                    // A WAL-lifetime owner already holds the kernel SHARED lock for this
+                    // process (release keeps it while `n_wal_lifetime > 0`), and no other
+                    // process can reach EXCLUSIVE past it, so the PENDING pass-through
+                    // and the SHARED re-lock would only repeat locks already held.
+                    if info.n_shared == 0 && info.n_wal_lifetime == 0 {
+                        // Readers must pass through the PENDING byte so a waiting
+                        // writer can block new SHARED acquisitions while upgrading.
+                        if !self.transient_shared_pending_gate {
+                            let next_transient = info
+                                .n_transient_shared_pending
+                                .checked_add(1)
+                                .ok_or_else(|| {
+                                    FrankenError::internal(
+                                        "Unix inode transient SHARED PENDING count overflow",
+                                    )
+                                })?;
+                            match try_posix_main_lock(
+                                cx,
+                                &*info.file,
+                                libc::F_RDLCK,
+                                PENDING_BYTE,
+                                1,
+                                &mut native_contention,
+                            ) {
+                                Ok(true) => {
+                                    info.n_transient_shared_pending = next_transient;
+                                    self.transient_shared_pending_gate = true;
+                                }
+                                Ok(false) => return Err(FrankenError::Busy),
+                                Err(error) => return Err(error),
+                            }
+                        }
+
+                        let shared_result = try_posix_main_lock_styled(
+                            cx,
+                            &*info.file,
+                            libc::F_RDLCK,
+                            SHARED_FIRST,
+                            SHARED_SIZE,
+                            &mut native_contention,
+                        );
+                        match shared_result {
+                            Ok((true, style)) => {
+                                // The SHARED lock is the first lock every connection
+                                // takes on the inode; if byte-range/OFD locking was
+                                // rejected here it is rejected for the whole inode.
+                                // Record the coarse whole-file flock(2) downgrade so it
+                                // is observable above the VFS (GH #343 / bd-qll76).
+                                if style == FileLockStyle::WholeFileFlock {
+                                    info.flock_fallback_engaged = true;
+                                }
+                            }
+                            Ok((false, _)) => {
+                                return Err(FrankenError::Busy);
+                            }
+                            Err(error) => {
+                                return Self::return_after_main_lock_failure(
+                                    &mut info,
+                                    &mut self.lock_level,
+                                    &mut self.transient_shared_pending_gate,
+                                    prior_level,
+                                    error,
+                                );
+                            }
+                        }
                     }
-                    Err(error) => {
+                    info.n_shared = next_shared;
+                    self.lock_level = LockLevel::Shared;
+                    if let Err(error) = Self::release_transient_shared_pending_gate_state(
+                        &mut info,
+                        &mut self.transient_shared_pending_gate,
+                    ) {
                         return Self::return_after_main_lock_failure(
                             &mut info,
                             &mut self.lock_level,
@@ -4087,173 +4123,196 @@ impl VfsFile for UnixFile {
                         );
                     }
                 }
-            }
-            info.n_shared = next_shared;
-            self.lock_level = LockLevel::Shared;
-            if let Err(error) = Self::release_transient_shared_pending_gate_state(
-                &mut info,
-                &mut self.transient_shared_pending_gate,
-            ) {
-                return Self::return_after_main_lock_failure(
-                    &mut info,
-                    &mut self.lock_level,
-                    &mut self.transient_shared_pending_gate,
-                    prior_level,
-                    error,
-                );
-            }
-        }
 
-        // Shared -> Reserved: acquire F_WRLCK on the reserved byte.
-        if self.lock_level < LockLevel::Reserved && level >= LockLevel::Reserved {
-            if info.n_reserved > 0 {
-                // Another handle in this process already holds RESERVED.
-                return Self::return_after_main_lock_failure(
-                    &mut info,
-                    &mut self.lock_level,
-                    &mut self.transient_shared_pending_gate,
-                    prior_level,
-                    FrankenError::Busy,
-                );
-            }
-            let Some(next_reserved) = info.n_reserved.checked_add(1) else {
-                return Self::return_after_main_lock_failure(
-                    &mut info,
-                    &mut self.lock_level,
-                    &mut self.transient_shared_pending_gate,
-                    prior_level,
-                    FrankenError::internal("Unix inode RESERVED count overflow"),
-                );
+                // Shared -> Reserved: acquire F_WRLCK on the reserved byte.
+                if self.lock_level < LockLevel::Reserved && level >= LockLevel::Reserved {
+                    if info.n_reserved > 0 {
+                        // Another handle in this process already holds RESERVED.
+                        return Self::return_after_main_lock_failure(
+                            &mut info,
+                            &mut self.lock_level,
+                            &mut self.transient_shared_pending_gate,
+                            prior_level,
+                            FrankenError::Busy,
+                        );
+                    }
+                    let Some(next_reserved) = info.n_reserved.checked_add(1) else {
+                        return Self::return_after_main_lock_failure(
+                            &mut info,
+                            &mut self.lock_level,
+                            &mut self.transient_shared_pending_gate,
+                            prior_level,
+                            FrankenError::internal("Unix inode RESERVED count overflow"),
+                        );
+                    };
+                    match try_posix_main_lock(
+                        cx,
+                        &*info.file,
+                        libc::F_WRLCK,
+                        RESERVED_BYTE,
+                        1,
+                        &mut native_contention,
+                    ) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            return Err(FrankenError::Busy);
+                        }
+                        Err(error) => {
+                            return Self::return_after_main_lock_failure(
+                                &mut info,
+                                &mut self.lock_level,
+                                &mut self.transient_shared_pending_gate,
+                                prior_level,
+                                error,
+                            );
+                        }
+                    }
+                    info.n_reserved = next_reserved;
+                    self.lock_level = LockLevel::Reserved;
+                }
+
+                // Reserved -> Pending: acquire F_WRLCK on the pending byte.
+                // This blocks new shared-lock acquisitions from other processes.
+                if self.lock_level < LockLevel::Pending && level >= LockLevel::Pending {
+                    if info.n_pending > 0 {
+                        return Self::return_after_main_lock_failure(
+                            &mut info,
+                            &mut self.lock_level,
+                            &mut self.transient_shared_pending_gate,
+                            prior_level,
+                            FrankenError::Busy,
+                        );
+                    }
+                    let Some(next_pending) = info.n_pending.checked_add(1) else {
+                        return Self::return_after_main_lock_failure(
+                            &mut info,
+                            &mut self.lock_level,
+                            &mut self.transient_shared_pending_gate,
+                            prior_level,
+                            FrankenError::internal("Unix inode PENDING count overflow"),
+                        );
+                    };
+                    match try_posix_main_lock(
+                        cx,
+                        &*info.file,
+                        libc::F_WRLCK,
+                        PENDING_BYTE,
+                        1,
+                        &mut native_contention,
+                    ) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            return Err(FrankenError::Busy);
+                        }
+                        Err(error) => {
+                            return Self::return_after_main_lock_failure(
+                                &mut info,
+                                &mut self.lock_level,
+                                &mut self.transient_shared_pending_gate,
+                                prior_level,
+                                error,
+                            );
+                        }
+                    }
+                    info.n_pending = next_pending;
+                    self.lock_level = LockLevel::Pending;
+                }
+
+                // Pending -> Exclusive: acquire F_WRLCK on the entire shared range,
+                // replacing the existing shared read lock. This will only succeed when
+                // all other processes have released their shared locks.
+                if self.lock_level < LockLevel::Exclusive && level >= LockLevel::Exclusive {
+                    // The kernel sees all classic record locks from this process as a
+                    // single owner, so it would happily grant WRLCK even while another
+                    // local handle still has a SHARED claim. Refuse that false upgrade
+                    // and unwind PENDING (plus any levels acquired by this request).
+                    if info.n_shared > 1 || info.n_exclusive > 0 {
+                        return Self::return_after_main_lock_failure(
+                            &mut info,
+                            &mut self.lock_level,
+                            &mut self.transient_shared_pending_gate,
+                            prior_level,
+                            FrankenError::Busy,
+                        );
+                    }
+                    let Some(next_exclusive) = info.n_exclusive.checked_add(1) else {
+                        return Self::return_after_main_lock_failure(
+                            &mut info,
+                            &mut self.lock_level,
+                            &mut self.transient_shared_pending_gate,
+                            prior_level,
+                            FrankenError::internal("Unix inode EXCLUSIVE count overflow"),
+                        );
+                    };
+                    match try_posix_main_lock(
+                        cx,
+                        &*info.file,
+                        libc::F_WRLCK,
+                        SHARED_FIRST,
+                        SHARED_SIZE,
+                        &mut native_contention,
+                    ) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            return Err(FrankenError::Busy);
+                        }
+                        Err(error) => {
+                            return Self::return_after_main_lock_failure(
+                                &mut info,
+                                &mut self.lock_level,
+                                &mut self.transient_shared_pending_gate,
+                                prior_level,
+                                error,
+                            );
+                        }
+                    }
+                    info.n_exclusive = next_exclusive;
+                    self.lock_level = LockLevel::Exclusive;
+                }
+
+                Ok(())
+            })();
+            let Err(error) = result else {
+                return Ok(());
             };
-            match posix_lock_with_timeout(&*info.file, libc::F_WRLCK, RESERVED_BYTE, 1, timeout) {
-                Ok(true) => {}
-                Ok(false) => {
-                    return Self::return_after_main_lock_failure(
-                        &mut info,
-                        &mut self.lock_level,
-                        &mut self.transient_shared_pending_gate,
-                        prior_level,
-                        FrankenError::Busy,
-                    );
-                }
-                Err(error) => {
-                    return Self::return_after_main_lock_failure(
-                        &mut info,
-                        &mut self.lock_level,
-                        &mut self.transient_shared_pending_gate,
-                        prior_level,
-                        error,
-                    );
-                }
-            }
-            info.n_reserved = next_reserved;
-            self.lock_level = LockLevel::Reserved;
-        }
-
-        // Reserved -> Pending: acquire F_WRLCK on the pending byte.
-        // This blocks new shared-lock acquisitions from other processes.
-        if self.lock_level < LockLevel::Pending && level >= LockLevel::Pending {
-            if info.n_pending > 0 {
-                return Self::return_after_main_lock_failure(
-                    &mut info,
-                    &mut self.lock_level,
-                    &mut self.transient_shared_pending_gate,
-                    prior_level,
-                    FrankenError::Busy,
-                );
-            }
-            let Some(next_pending) = info.n_pending.checked_add(1) else {
-                return Self::return_after_main_lock_failure(
-                    &mut info,
-                    &mut self.lock_level,
-                    &mut self.transient_shared_pending_gate,
-                    prior_level,
-                    FrankenError::internal("Unix inode PENDING count overflow"),
-                );
+            let Some((lock_start, lock_len)) = native_contention else {
+                // Local owners must run on their executor to make progress. A
+                // synchronous VFS wait here would prevent that handoff. All
+                // partial acquisition/error cleanup above retains its exact owner.
+                return Err(error);
             };
-            match posix_lock_with_timeout(&*info.file, libc::F_WRLCK, PENDING_BYTE, 1, timeout) {
-                Ok(true) => {}
-                Ok(false) => {
-                    return Self::return_after_main_lock_failure(
-                        &mut info,
-                        &mut self.lock_level,
-                        &mut self.transient_shared_pending_gate,
-                        prior_level,
-                        FrankenError::Busy,
-                    );
-                }
-                Err(error) => {
-                    return Self::return_after_main_lock_failure(
-                        &mut info,
-                        &mut self.lock_level,
-                        &mut self.transient_shared_pending_gate,
-                        prior_level,
-                        error,
-                    );
-                }
+            debug_assert!(matches!(error, FrankenError::Busy));
+            let started = *wait_started.get_or_insert_with(Instant::now);
+            let remaining = self.main_lock_wait_remaining(started, timeout);
+            // Keep the existing deterministic native-wait witness outside the
+            // inode mutex and invoke it only when a busy wait is permitted.
+            #[cfg(test)]
+            if !remaining.is_zero() {
+                tests::observe_reserved_lock_wait(lock_start);
             }
-            info.n_pending = next_pending;
-            self.lock_level = LockLevel::Pending;
+            // Subscribers may coordinate other processes. No inode, SHM, or table
+            // mutex may be held while emitting this boundary or sleeping below.
+            tracing::trace!(
+                target: "fsqlite_vfs::unix",
+                event = "unix_lock_busy",
+                lock_start,
+                lock_len,
+                timeout_ms = u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX),
+                "native main-file lock is contended"
+            );
+            if let Err(error) = checkpoint_or_abort(cx) {
+                return self.restore_failed_main_lock_wait(prior_level, error);
+            }
+            // Recheck after either witness: a sibling can take WRITE/CKPT while
+            // this caller is paused. Borrowed WAL ownership cannot wait for main,
+            // including when this handle has never mapped SHM itself.
+            let remaining = self.main_lock_wait_remaining(started, timeout);
+            if remaining.is_zero() {
+                return self.restore_failed_main_lock_wait(prior_level, FrankenError::Busy);
+            }
+            std::thread::sleep(backoff.min(remaining));
+            backoff = (backoff * 2).min(Duration::from_millis(100));
         }
-
-        // Pending -> Exclusive: acquire F_WRLCK on the entire shared range,
-        // replacing the existing shared read lock. This will only succeed when
-        // all other processes have released their shared locks.
-        if self.lock_level < LockLevel::Exclusive && level >= LockLevel::Exclusive {
-            // The kernel sees all classic record locks from this process as a
-            // single owner, so it would happily grant WRLCK even while another
-            // local handle still has a SHARED claim. Refuse that false upgrade
-            // and unwind PENDING (plus any levels acquired by this request).
-            if info.n_shared > 1 || info.n_exclusive > 0 {
-                return Self::return_after_main_lock_failure(
-                    &mut info,
-                    &mut self.lock_level,
-                    &mut self.transient_shared_pending_gate,
-                    prior_level,
-                    FrankenError::Busy,
-                );
-            }
-            let Some(next_exclusive) = info.n_exclusive.checked_add(1) else {
-                return Self::return_after_main_lock_failure(
-                    &mut info,
-                    &mut self.lock_level,
-                    &mut self.transient_shared_pending_gate,
-                    prior_level,
-                    FrankenError::internal("Unix inode EXCLUSIVE count overflow"),
-                );
-            };
-            match posix_lock_with_timeout(
-                &*info.file,
-                libc::F_WRLCK,
-                SHARED_FIRST,
-                SHARED_SIZE,
-                timeout,
-            ) {
-                Ok(true) => {}
-                Ok(false) => {
-                    return Self::return_after_main_lock_failure(
-                        &mut info,
-                        &mut self.lock_level,
-                        &mut self.transient_shared_pending_gate,
-                        prior_level,
-                        FrankenError::Busy,
-                    );
-                }
-                Err(error) => {
-                    return Self::return_after_main_lock_failure(
-                        &mut info,
-                        &mut self.lock_level,
-                        &mut self.transient_shared_pending_gate,
-                        prior_level,
-                        error,
-                    );
-                }
-            }
-            info.n_exclusive = next_exclusive;
-            self.lock_level = LockLevel::Exclusive;
-        }
-
-        Ok(())
     }
 
     fn unlock(&mut self, _cx: &Cx, level: LockLevel) -> Result<()> {
@@ -4339,7 +4398,7 @@ impl VfsFile for UnixFile {
         // Concurrent commits use the same main-before-WAL order as
         // IMMEDIATE transactions and every maintenance/checkpoint path.
         // Waiting here must leave WRITE available to the RESERVED owner.
-        self.lock_main_for_external_fence(cx, LockLevel::Reserved)?;
+        self.lock(cx, LockLevel::Reserved)?;
         if self.acquire_external_wal_slot(cx, WAL_WRITE_LOCK)?
             && let Some(attempt) = self.external_append_attempt.as_mut()
         {
@@ -4387,6 +4446,18 @@ impl VfsFile for UnixFile {
         attempt.acquisition_complete = false;
         let attempt = *attempt;
         let mut errors = Vec::new();
+        // Reverse the main -> WRITE acquisition. Each outer surface still
+        // gets an independent cleanup attempt if another release fails.
+        if attempt.write_acquired {
+            match self.release_external_wal_slot(WAL_WRITE_LOCK) {
+                Ok(()) => {
+                    if let Some(current) = self.external_append_attempt.as_mut() {
+                        current.write_acquired = false;
+                    }
+                }
+                Err(error) => errors.push(format!("WAL WRITE: {error}")),
+            }
+        }
         if attempt.main_restore_pending {
             let inode_info = Arc::clone(self.inode_info_ref());
             let mut info = inode_info
@@ -4404,16 +4475,6 @@ impl VfsFile for UnixFile {
                     }
                 }
                 Err(error) => errors.push(format!("main lock prefix: {error}")),
-            }
-        }
-        if attempt.write_acquired {
-            match self.release_external_wal_slot(WAL_WRITE_LOCK) {
-                Ok(()) => {
-                    if let Some(current) = self.external_append_attempt.as_mut() {
-                        current.write_acquired = false;
-                    }
-                }
-                Err(error) => errors.push(format!("WAL WRITE: {error}")),
             }
         }
         let restored = self
@@ -4499,10 +4560,28 @@ impl VfsFile for UnixFile {
             }
         }
 
-        // Restore the outer main-file prefix, then CKPT and WRITE. Ordinary
+        // Restore CKPT and WRITE, then the outer main-file prefix. Ordinary
         // maintenance reaches this phase after its reader gates drain. Every
         // pending surface is attempted independently in this pass; successful
         // pieces are removed from the retained marker immediately.
+        if attempt.wal_mode {
+            for slot in [WAL_CKPT_LOCK, WAL_WRITE_LOCK] {
+                let acquired = self
+                    .external_maintenance_attempt
+                    .is_some_and(|current| current.acquired_slot(slot));
+                if !acquired {
+                    continue;
+                }
+                match self.release_external_wal_slot(slot) {
+                    Ok(()) => {
+                        if let Some(current) = self.external_maintenance_attempt.as_mut() {
+                            current.record_released_slot(slot);
+                        }
+                    }
+                    Err(error) => restore_errors.push(format!("WAL slot {slot}: {error}")),
+                }
+            }
+        }
         if attempt.main_restore_pending {
             let inode_info = Arc::clone(self.inode_info_ref());
             let mut info = inode_info
@@ -4520,25 +4599,6 @@ impl VfsFile for UnixFile {
                     }
                 }
                 Err(error) => restore_errors.push(format!("main lock prefix: {error}")),
-            }
-        }
-
-        if attempt.wal_mode {
-            for slot in [WAL_CKPT_LOCK, WAL_WRITE_LOCK] {
-                let acquired = self
-                    .external_maintenance_attempt
-                    .is_some_and(|current| current.acquired_slot(slot));
-                if !acquired {
-                    continue;
-                }
-                match self.release_external_wal_slot(slot) {
-                    Ok(()) => {
-                        if let Some(current) = self.external_maintenance_attempt.as_mut() {
-                            current.record_released_slot(slot);
-                        }
-                    }
-                    Err(error) => restore_errors.push(format!("WAL slot {slot}: {error}")),
-                }
             }
         }
 

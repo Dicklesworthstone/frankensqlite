@@ -1263,6 +1263,7 @@ impl VfsFile for MemoryFile {
     }
 
     fn lock_external_maintenance(&mut self, cx: &Cx, wal_mode: bool) -> Result<()> {
+        checkpoint_or_abort(cx)?;
         if self.external_wal_append_prior_level.is_some() {
             return Err(FrankenError::internal(
                 "cannot acquire MemoryVfs external maintenance during a WAL append attempt",
@@ -1287,11 +1288,14 @@ impl VfsFile for MemoryFile {
             wal_mode,
         ));
 
+        // Match native ordering without introducing a serializing writer
+        // lock: this backend's main-file level remains local bookkeeping.
+        self.lock(cx, LockLevel::Exclusive)?;
         if wal_mode {
             self.acquire_external_maintenance_wal_slot(cx, WAL_WRITE_LOCK)?;
             self.acquire_external_maintenance_wal_slot(cx, WAL_CKPT_LOCK)?;
         }
-        self.lock(cx, LockLevel::Exclusive)
+        Ok(())
     }
 
     fn lock_external_wal_recovery(&mut self, cx: &Cx) -> Result<()> {
@@ -1310,13 +1314,9 @@ impl VfsFile for MemoryFile {
 
         let mut failures = Vec::new();
 
-        // Reverse acquisition order: main file, checkpoint slot, write slot.
+        // Reverse acquisition order: checkpoint slot, write slot, main file.
         // Every surface is attempted even after an earlier error. A successful
         // raw WAL unlock clears only its own bit; failures remain retryable.
-        if let Err(error) = self.restore_external_lock_level(cx, attempt.prior_lock_level) {
-            failures.push(format!("main file: {error}"));
-        }
-
         if attempt.wal_mode {
             for (slot, label) in [
                 (WAL_CKPT_LOCK, "WAL checkpoint slot"),
@@ -1349,6 +1349,10 @@ impl VfsFile for MemoryFile {
                     Err(error) => failures.push(format!("{label}: {error}")),
                 }
             }
+        }
+
+        if let Err(error) = self.restore_external_lock_level(cx, attempt.prior_lock_level) {
+            failures.push(format!("main file: {error}"));
         }
 
         let remaining_wal_lock = self
@@ -3521,10 +3525,11 @@ mod tests {
             .expect("failed acquisition retains its exact attempt marker");
         assert!(marker.acquired_wal_write);
         assert!(!marker.acquired_wal_checkpoint);
-        assert_eq!(attempt.lock_level, LockLevel::None);
+        assert_eq!(attempt.lock_level, LockLevel::Exclusive);
 
         attempt.restore_external_maintenance_attempt(&cx).unwrap();
         assert!(attempt.external_maintenance_attempt.is_none());
+        assert_eq!(attempt.lock_level, LockLevel::None);
         probe
             .shm_lock(
                 &cx,

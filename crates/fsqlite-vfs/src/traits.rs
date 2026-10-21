@@ -1371,6 +1371,13 @@ pub trait VfsFile: Send + Sync {
     /// and retain their existing native appender fence. Memory backends must
     /// preserve their non-serializing lock-state semantics.
     ///
+    /// Acquire the main-file writer level before WRITE. WAL slot acquisition
+    /// must be nonblocking: stock SQLite may acquire CKPT before WRITE.
+    /// Borrowed WAL claims prohibit waiting on a main-file upgrade, including
+    /// claims held by sibling handles that share process-wide POSIX ownership.
+    /// Native backoff must release bookkeeping mutexes so those owners can
+    /// finish or restore their own attempts.
+    ///
     /// Arm the exact prior main-file level and newly acquired WRITE ownership
     /// before the first side effect. An existing shared-snapshot attempt may
     /// enclose this attempt; another append or maintenance attempt may not.
@@ -1394,6 +1401,8 @@ pub trait VfsFile: Send + Sync {
     /// Retain the exact owner of every failed raw unlock for retry, and release
     /// only WRITE ownership newly acquired by this attempt. Close must restore
     /// this inner attempt before its enclosing shared-snapshot attempt.
+    /// Release newly acquired WRITE before restoring the main-file baseline;
+    /// attempt both releases independently and retain every failed obligation.
     fn restore_external_wal_append_attempt(&mut self, cx: &Cx) -> Result<()>;
 
     /// Acquire the cross-process SHARED fence used while capturing a coherent
@@ -1419,6 +1428,10 @@ pub trait VfsFile: Send + Sync {
     /// The backend must record the requested journal mode, exact prior main
     /// lock level, and only the WAL slots newly acquired by this attempt before
     /// returning control to the caller.
+    /// Acquire the main-file level, then WRITE, then CKPT; acquire supplemental
+    /// reader/recovery gates only after that prefix. All WAL probes are
+    /// nonblocking. Restore supplemental gates before the outer fence, and
+    /// restore the outer fence in reverse order without losing failed claims.
     fn lock_external_maintenance(&mut self, cx: &Cx, wal_mode: bool) -> Result<()>;
 
     /// Acquire an appender-excluding fence for a WAL checkpoint.

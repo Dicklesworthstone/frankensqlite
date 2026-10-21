@@ -2715,6 +2715,18 @@ impl VfsFile for WindowsFile {
         self.external_wal_append_attempt =
             Some(WindowsExternalWalAppendAttempt::new(self.lock_level));
 
+        // Match BEGIN IMMEDIATE and native checkpoints: acquire the main-file
+        // prefix before WRITE. Both Windows lock domains remain nonblocking.
+        // The attempt retains any partial prefix for exact restoration.
+        while self.lock_level < LockLevel::Reserved {
+            checkpoint_or_abort(cx)?;
+            let next = next_lock_level(self.lock_level)
+                .ok_or_else(|| FrankenError::internal("invalid WAL append lock escalation"))?;
+            self.os_locks_mut()?.try_lock_level(next)?;
+            self.stock_main_locks_mut()?.try_lock_level(next)?;
+            self.lock_level = next;
+        }
+
         // Arm ownership before the raw call. A single-slot acquisition either
         // succeeds with an exact slot owner or fails without adding an owner;
         // poisoned SHM recovery remains retained by the shared state itself.
@@ -2735,17 +2747,6 @@ impl VfsFile for WindowsFile {
         }
         write_result?;
 
-        // The pager uses this only around physical append/publication. Do not
-        // retain CKPT, PENDING, EXCLUSIVE, or any reader slot. Keep partial
-        // ordinary acquisition in this attempt rather than dropping a handle
-        // that also owns the surrounding snapshot's SHARED lock.
-        while self.lock_level < LockLevel::Reserved {
-            let next = next_lock_level(self.lock_level)
-                .ok_or_else(|| FrankenError::internal("invalid WAL append lock escalation"))?;
-            self.os_locks_mut()?.try_lock_level(next)?;
-            self.stock_main_locks_mut()?.try_lock_level(next)?;
-            self.lock_level = next;
-        }
         Ok(())
     }
 
@@ -2762,16 +2763,6 @@ impl VfsFile for WindowsFile {
             return Ok(());
         };
         let mut failures = Vec::new();
-        if main_pending {
-            match self.restore_wal_append_main_lock_level(cx, prior_level) {
-                Ok(()) => {
-                    if let Some(attempt) = self.external_wal_append_attempt.as_mut() {
-                        attempt.main_restore_pending = false;
-                    }
-                }
-                Err(error) => failures.push(format!("main lock level: {error}")),
-            }
-        }
         if write_acquired {
             match self.shm_lock(
                 cx,
@@ -2785,6 +2776,16 @@ impl VfsFile for WindowsFile {
                     }
                 }
                 Err(error) => failures.push(format!("WAL write slot: {error}")),
+            }
+        }
+        if main_pending {
+            match self.restore_wal_append_main_lock_level(cx, prior_level) {
+                Ok(()) => {
+                    if let Some(attempt) = self.external_wal_append_attempt.as_mut() {
+                        attempt.main_restore_pending = false;
+                    }
+                }
+                Err(error) => failures.push(format!("main lock level: {error}")),
             }
         }
         if failures.is_empty()
@@ -2806,6 +2807,7 @@ impl VfsFile for WindowsFile {
     }
 
     fn lock_external_maintenance(&mut self, cx: &Cx, wal_mode: bool) -> Result<()> {
+        checkpoint_or_abort(cx)?;
         if self.external_wal_append_attempt.is_some() {
             return Err(FrankenError::internal(
                 "cannot acquire Windows external maintenance during a WAL append attempt",
@@ -2829,7 +2831,6 @@ impl VfsFile for WindowsFile {
         // The dedicated stock-main handle is duplicated before any cooperative
         // slot is taken so an OS duplication failure is reported while the
         // attempt still owns nothing at all.
-        let stock_main_locks_preheld = self.stock_main_locks.is_some();
         self.ensure_stock_main_locks()?;
         let (write_preheld, checkpoint_preheld) = if wal_mode {
             (
@@ -2844,36 +2845,18 @@ impl VfsFile for WindowsFile {
             self.lock_level,
         ));
 
-        // Every participant uses the same deadlock-free order: WAL
-        // writer/checkpointer slots first, then main-file EXCLUSIVE. Ordinary
-        // Windows SHM acquisition publishes the process-local slot and its
-        // matching real `-shm` byte together under the shared state mutex.
-        let mut wal_fence = self.acquire_cooperative_wal_maintenance_locks(
+        // Main-file admission precedes WRITE and CKPT on every backend.
+        // Retain the existing EXCLUSIVE maintenance strength; the armed
+        // attempt owns the main prefix even if a later WAL probe fails.
+        self.lock(cx, LockLevel::Exclusive)?;
+        checkpoint_or_abort(cx)?;
+        self.acquire_cooperative_wal_maintenance_locks(
             cx,
             wal_mode,
             write_preheld,
             checkpoint_preheld,
-        );
-        if wal_fence.is_ok() {
-            wal_fence = self.verify_stock_sqlite_maintenance_locks(wal_mode);
-        }
-        if let Err(error) = wal_fence {
-            // Real WAL contention leaves the attempt holding no main-file lock,
-            // so the handle this call duplicated must not outlive the failure:
-            // Windows keeps a file undeletable while any handle stays open, and
-            // the retained attempt is restored through the WAL slots alone. A
-            // handle that predates this call belongs to an earlier lock level
-            // and is left exactly as it was found.
-            if !stock_main_locks_preheld {
-                drop(self.stock_main_locks.take());
-            }
-            return Err(error);
-        }
-        // Past this point the WAL fence is settled, so the main-file EXCLUSIVE
-        // step legitimately owns the handle; a failure there is unwound by
-        // `restore_external_maintenance_attempt` via `main_restore_pending`.
-        self.lock(cx, LockLevel::Exclusive)?;
-        Ok(())
+        )?;
+        self.verify_stock_sqlite_maintenance_locks(wal_mode)
     }
 
     fn lock_external_wal_recovery(&mut self, cx: &Cx) -> Result<()> {
@@ -2898,17 +2881,6 @@ impl VfsFile for WindowsFile {
             return Ok(());
         };
         let mut failures = Vec::new();
-
-        if main_restore_pending {
-            match self.restore_ordinary_lock_level(cx, prior_main_level) {
-                Ok(()) => {
-                    if let Some(attempt) = self.external_maintenance_locks.as_mut() {
-                        attempt.main_restore_pending = false;
-                    }
-                }
-                Err(error) => failures.push(format!("main lock level: {error}")),
-            }
-        }
 
         if actual_wal_mode {
             for (slot, checkpoint_slot) in [(WAL_CKPT_LOCK, true), (WAL_WRITE_LOCK, false)] {
@@ -2937,6 +2909,17 @@ impl VfsFile for WindowsFile {
                     }
                     Err(error) => failures.push(format!("WAL slot {slot}: {error}")),
                 }
+            }
+        }
+
+        if main_restore_pending {
+            match self.restore_ordinary_lock_level(cx, prior_main_level) {
+                Ok(()) => {
+                    if let Some(attempt) = self.external_maintenance_locks.as_mut() {
+                        attempt.main_restore_pending = false;
+                    }
+                }
+                Err(error) => failures.push(format!("main lock level: {error}")),
             }
         }
 
@@ -4465,7 +4448,7 @@ mod tests {
                 .as_ref()
                 .is_some_and(|attempt| !attempt.wal_write_acquired)
         );
-        assert!(file.ordinary_locks_are_exactly_at(LockLevel::Shared));
+        assert!(file.ordinary_locks_are_exactly_at(LockLevel::Reserved));
         file.restore_external_wal_append_attempt(&cx).unwrap();
         file.restore_external_wal_append_attempt(&cx).unwrap();
         assert!(file.ordinary_locks_are_exactly_at(LockLevel::Shared));
@@ -4499,8 +4482,12 @@ mod tests {
         assert!(
             file.external_wal_append_attempt
                 .as_ref()
-                .is_some_and(|attempt| attempt.wal_write_acquired)
+                .is_some_and(|attempt| !attempt.wal_write_acquired)
         );
+        let wal_probe = open_stock_shm_probe(&file.shm_path);
+        try_lock_stock_sqlite_range(&wal_probe, STOCK_SQLITE_WAL_WRITE_BYTE, 1)
+            .expect("a main-file waiter must leave WRITE available before restoration");
+        unlock_stock_sqlite_range_strict(&wal_probe, STOCK_SQLITE_WAL_WRITE_BYTE, 1).unwrap();
         assert!(
             file.os_locks
                 .as_ref()
@@ -5220,7 +5207,7 @@ mod tests {
         // The write byte was acquired before checkpoint contention. The armed
         // attempt must remember exactly that new ownership while preserving
         // the still-unacquired checkpoint slot for a retry-safe restoration.
-        assert_eq!(maintenance.lock_level, LockLevel::None);
+        assert_eq!(maintenance.lock_level, LockLevel::Exclusive);
         let attempt = maintenance
             .external_maintenance_locks
             .as_ref()
@@ -5229,8 +5216,8 @@ mod tests {
         assert!(attempt.wal_write_acquired);
         assert!(!attempt.wal_checkpoint_acquired);
         assert!(
-            maintenance.stock_main_locks.is_none(),
-            "real WAL contention must be resolved before opening the dedicated stock-main lock handle"
+            maintenance.stock_main_locks.is_some(),
+            "WAL contention retains the earlier main-file prefix for exact restoration"
         );
         assert!(matches!(
             try_lock_stock_sqlite_range(&blocker, STOCK_SQLITE_WAL_WRITE_BYTE, 1),
@@ -5285,16 +5272,21 @@ mod tests {
             Err(FrankenError::Busy)
         ));
 
-        // Ordinary main-lock acquisition rolls its own partial prefix back,
-        // while the external-attempt marker retains both newly acquired WAL
-        // slots until the caller performs the required restoration.
+        // Main-file contention must leave both WAL slots available, even
+        // before the caller restores the armed external attempt.
         let attempt = maintenance
             .external_maintenance_locks
             .as_ref()
             .expect("failed main acquisition retains its restoration marker");
         assert!(attempt.main_restore_pending);
-        assert!(attempt.wal_write_acquired);
-        assert!(attempt.wal_checkpoint_acquired);
+        assert!(!attempt.wal_write_acquired);
+        assert!(!attempt.wal_checkpoint_acquired);
+        let wal_probe = open_stock_shm_probe(&shm_path);
+        for offset in [STOCK_SQLITE_WAL_WRITE_BYTE, STOCK_SQLITE_WAL_CKPT_BYTE] {
+            try_lock_stock_sqlite_range(&wal_probe, offset, 1)
+                .expect("main-file refusal must not retain a WAL slot");
+            unlock_stock_sqlite_range_strict(&wal_probe, offset, 1).unwrap();
+        }
         for offset in [STOCK_SQLITE_PENDING_BYTE, STOCK_SQLITE_RESERVED_BYTE] {
             try_lock_stock_sqlite_range(&blocker, offset, 1)
                 .expect("partial main lock must be unwound");
@@ -5307,10 +5299,9 @@ mod tests {
             .open(&shm_path)
             .expect("open -shm lock probe");
         for offset in [STOCK_SQLITE_WAL_WRITE_BYTE, STOCK_SQLITE_WAL_CKPT_BYTE] {
-            assert!(matches!(
-                try_lock_stock_sqlite_range(&shm_probe, offset, 1),
-                Err(FrankenError::Busy)
-            ));
+            try_lock_stock_sqlite_range(&shm_probe, offset, 1)
+                .expect("main admission failure leaves WAL bytes available");
+            unlock_stock_sqlite_range_strict(&shm_probe, offset, 1).unwrap();
         }
 
         maintenance
@@ -5319,7 +5310,7 @@ mod tests {
         assert!(maintenance.external_maintenance_locks.is_none());
         for offset in [STOCK_SQLITE_WAL_WRITE_BYTE, STOCK_SQLITE_WAL_CKPT_BYTE] {
             try_lock_stock_sqlite_range(&shm_probe, offset, 1)
-                .expect("restoration must release the earlier real WAL fence");
+                .expect("restoration must leave WAL bytes available");
             unlock_stock_sqlite_range(&shm_probe, offset, 1).expect("unlock WAL-range probe");
         }
         unlock_stock_sqlite_range(

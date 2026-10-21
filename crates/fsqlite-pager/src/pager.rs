@@ -14734,6 +14734,7 @@ where
                             maintenance_lease,
                             &mut inner,
                             Some(&mut admission.external_lock),
+                            false,
                         )
                         .await?
                     } else {
@@ -14904,6 +14905,7 @@ where
                         maintenance_lease,
                         &mut inner,
                         Some(&mut admission.external_lock),
+                        eager_writer,
                     )
                     .await?
                 } else {
@@ -14981,18 +14983,14 @@ where
                 return Err(FrankenError::Busy);
             }
 
-            // Explicitly serialized IMMEDIATE/EXCLUSIVE transactions acquire
-            // RESERVED at begin, subject to busy_timeout. Concurrent writers
-            // acquire this fence only around their physical WAL append.
+            // The first eager writer acquired RESERVED before refreshing and
+            // binding its snapshot. A later eager begin sharing an existing
+            // local read window upgrades here without disturbing that window's
+            // pin; commit-time conflict validation still protects its lineage.
             if eager_writer {
                 if active_transactions_before_begin != 0 {
                     admission.external_lock.arm_lock_level(LockLevel::Shared);
-                }
-                {
-                    let mut db_file = shared_db_file_write(&inner.db_file, cx).await?;
-                    db_file.lock(cx, LockLevel::Reserved)?;
-                }
-                if active_transactions_before_begin != 0 {
+                    shared_db_lock(&inner.db_file, cx, LockLevel::Reserved).await?;
                     admission.external_lock.mark_lock_level_acquired();
                 }
                 inner.writer_active = true;
@@ -17661,7 +17659,7 @@ where
                 FrankenError::internal("standalone refresh lost its admission lease")
             })?;
             self.refresh_runtime_committed_state(
-                cx, lease, &mut inner, Some(&mut admission.external_lock),
+                cx, lease, &mut inner, Some(&mut admission.external_lock), false,
             ).await.map(Some)
         }.await;
         let restore_result = admission.restore_refresh_admission(&mut open_lease, returning_open).await;
@@ -18434,9 +18432,20 @@ where
         maintenance_lease: &mut PagerMaintenanceLease,
         inner: &mut PagerInner<V::File>,
         external_lock: &mut BeginExternalLockState<V::File>,
+        reserve_writer: bool,
     ) -> Result<()> {
         let mut recovered_once = false;
         loop {
+            // GH#519: writer admission may wait for a peer's committed WAL
+            // publication. Pinning before RESERVED would retain the previous
+            // horizon after that wait succeeds, making an IMMEDIATE transaction
+            // fail its first write at commit with BusySnapshot. The enclosing
+            // snapshot attempt owns this upgrade, including cancellation
+            // cleanup. Recovery below releases the whole attempt, so a retry
+            // must reacquire RESERVED before binding its next snapshot.
+            if reserve_writer {
+                shared_db_lock(&inner.db_file, cx, LockLevel::Reserved).await?;
+            }
             let reason = match self.try_bind_runtime_native_reader(cx, inner, external_lock).await? {
                 traits::WalNativeReadOutcome::Ready => return Ok(()),
                 traits::WalNativeReadOutcome::RecoveryRequired(reason) => reason,
@@ -18497,14 +18506,16 @@ where
     /// Every caller enters with exactly one transaction maintenance lease and
     /// no active transaction in this pager. A hot journal is first discovered
     /// under main-file SHARED, then SHARED is released before the lease is
-    /// upgraded and the backend's exclusive recovery epoch begins. Read-only
-    /// pagers only classify and fail closed.
+    /// upgraded and the backend's exclusive recovery epoch begins. An eager
+    /// writer acquires RESERVED after recovery and before binding its snapshot.
+    /// Read-only pagers only classify and fail closed.
     async fn refresh_runtime_committed_state(
         &self,
         cx: &Cx,
         maintenance_lease: &mut PagerMaintenanceLease,
         inner: &mut PagerInner<V::File>,
         begin_external_lock: Option<&mut BeginExternalLockState<V::File>>,
+        reserve_writer: bool,
     ) -> Result<(CommittedStateRefresh, bool)> {
         let journal_path = Self::journal_path(&self.db_path);
         // File-backed begin admission passes its persistent external-lock
@@ -18550,7 +18561,7 @@ where
                 drop(db_file);
                 match journal_state {
                     Ok(()) => {
-                        self.prepare_runtime_native_reader(cx, maintenance_lease, inner, external_lock).await?;
+                        self.prepare_runtime_native_reader(cx, maintenance_lease, inner, external_lock, false).await?;
                         inner
                             .refresh_committed_state(cx, &self.cache, &self.wal_backend, true)
                             .await
@@ -18637,7 +18648,7 @@ where
             }
 
             let refresh_result = match self.prepare_runtime_native_reader(
-                cx, maintenance_lease, inner, external_lock,
+                cx, maintenance_lease, inner, external_lock, reserve_writer,
             ).await {
                 Ok(()) => inner
                     .refresh_committed_state_after_recovery(cx, &self.cache, &self.wal_backend, true)
@@ -18676,7 +18687,7 @@ where
         // bound header, which can only be this one or newer.
         let pre_refresh_signature = self.current_wal_refresh_signature(cx, inner).await?;
         let refresh_result = match self.prepare_runtime_native_reader(
-            cx, maintenance_lease, inner, external_lock,
+            cx, maintenance_lease, inner, external_lock, reserve_writer,
         ).await {
             Ok(()) => {
                 self.refresh_committed_state_unless_unchanged(cx, inner, pre_refresh_signature)
@@ -30602,6 +30613,8 @@ mod tests {
     const COMMIT_SERVICE_POLICY_BEAD_ID: &str = "bd-1dp9.6.7.9.4";
     type ObservedLockLevel = Arc<Mutex<LockLevel>>;
     type ObservedUnlockTraceIds = Arc<Mutex<Vec<u64>>>;
+    type ReservedAcquisition = Box<dyn FnOnce() -> Result<()> + Send>;
+    type ReservedAcquisitionHook = Arc<Mutex<Option<ReservedAcquisition>>>;
     type ObservedCleanupUnlockHarness = (
         SimplePager<ObservedLockVfs>,
         ObservedLockLevel,
@@ -33301,6 +33314,7 @@ mod tests {
         inner: MemoryVfs,
         observed_lock_level: ObservedLockLevel,
         observed_unlock_trace_ids: ObservedUnlockTraceIds,
+        before_reserved_acquisition: ReservedAcquisitionHook,
         wal_reader_release_failures: Arc<AtomicUsize>,
         wal_reader_release_slots: Arc<Mutex<Vec<u32>>>,
         checkpoint_backfill_held: Arc<AtomicBool>,
@@ -33322,6 +33336,7 @@ mod tests {
                 inner: MemoryVfs::new(),
                 observed_lock_level: Arc::new(Mutex::new(LockLevel::None)),
                 observed_unlock_trace_ids: Arc::new(Mutex::new(Vec::new())),
+                before_reserved_acquisition: Arc::new(Mutex::new(None)),
                 wal_reader_release_failures: Arc::new(AtomicUsize::new(0)),
                 wal_reader_release_slots: Arc::new(Mutex::new(Vec::new())),
                 checkpoint_backfill_held: Arc::new(AtomicBool::new(false)),
@@ -33395,6 +33410,7 @@ mod tests {
         observe_lock_state: bool,
         observed_lock_level: ObservedLockLevel,
         observed_unlock_trace_ids: ObservedUnlockTraceIds,
+        before_reserved_acquisition: ReservedAcquisitionHook,
         wal_reader_release_failures: Arc<AtomicUsize>,
         wal_reader_release_slots: Arc<Mutex<Vec<u32>>>,
         checkpoint_backfill_held: Arc<AtomicBool>,
@@ -33459,6 +33475,7 @@ mod tests {
                     observe_lock_state: actual_flags.contains(VfsOpenFlags::MAIN_DB),
                     observed_lock_level: self.observed_lock_level(),
                     observed_unlock_trace_ids: self.observed_unlock_trace_ids(),
+                    before_reserved_acquisition: Arc::clone(&self.before_reserved_acquisition),
                     wal_reader_release_failures: Arc::clone(&self.wal_reader_release_failures),
                     wal_reader_release_slots: Arc::clone(&self.wal_reader_release_slots),
                     checkpoint_backfill_held: Arc::clone(&self.checkpoint_backfill_held),
@@ -33568,6 +33585,12 @@ mod tests {
         }
 
         fn lock(&mut self, cx: &Cx, level: LockLevel) -> Result<()> {
+            if self.observe_lock_state && level == LockLevel::Reserved {
+                let hook = self.before_reserved_acquisition.lock().unwrap().take();
+                if let Some(hook) = hook {
+                    hook()?;
+                }
+            }
             self.inner.lock(cx, level)?;
             if self.observe_lock_state {
                 *self.observed_lock_level.lock().unwrap() = level;
@@ -53342,11 +53365,7 @@ mod tests {
             }
         }
 
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-            .blocking_threads(1, 1)
-            .build()
-            .expect("cancelled begin test runtime should build");
-        runtime.block_on(async {
+        async fn check_cancelled_begin(has_reader: bool) {
             let cx = Cx::new();
             let vfs = ObservedLockVfs::new();
             let observed_lock_level = vfs.observed_lock_level();
@@ -53355,7 +53374,10 @@ mod tests {
                 .open_file_backed_pager(Path::new("/cancelled-wal-begin.db"))
                 .await
                 .unwrap();
-            let begin_calls = Arc::new(AtomicUsize::new(0));
+            // Without an existing reader, park the first WAL begin. RESERVED
+            // is then owned by the initial refresh before the pager's writer
+            // baton has been published.
+            let begin_calls = Arc::new(AtomicUsize::new(usize::from(!has_reader)));
             let pending_entered = Arc::new(AtomicBool::new(false));
             pager
                 .set_wal_backend(Box::new(PendingBeginWalBackend {
@@ -53365,12 +53387,19 @@ mod tests {
                 .unwrap();
             pager.set_journal_mode(&cx, JournalMode::Wal).await.unwrap();
 
-            let mut reader = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            let mut reader = if has_reader {
+                Some(pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap())
+            } else {
+                None
+            };
             assert_eq!(begin_calls.load(AtomicOrdering::Acquire), 1);
             let reader_lock_level = *observed_lock_level
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            assert_eq!(reader_lock_level, LockLevel::Shared);
+            assert_eq!(
+                reader_lock_level,
+                if has_reader { LockLevel::Shared } else { LockLevel::None }
+            );
 
             let queue = Arc::clone(&pager.group_commit_queue);
             let inner_state = Arc::clone(&pager.inner);
@@ -53443,10 +53472,11 @@ mod tests {
                 let inner = inner_state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                assert_eq!(inner.active_transactions, 1);
-                assert!(
+                assert_eq!(inner.active_transactions, u32::from(has_reader));
+                assert_eq!(
                     inner.writer_active,
-                    "the writer baton must remain owned while RESERVED is stranded"
+                    has_reader,
+                    "cancellation must preserve the exact pre-refresh writer-baton phase"
                 );
             }
 
@@ -53455,7 +53485,7 @@ mod tests {
             let restored_lock_level = *observed_lock_level
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            assert_eq!(restored_lock_level, LockLevel::Shared);
+            assert_eq!(restored_lock_level, reader_lock_level);
             assert_eq!(
                 observed_unlock_trace_ids.lock().unwrap().len(),
                 1,
@@ -53465,7 +53495,7 @@ mod tests {
                 let inner = inner_state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                assert_eq!(inner.active_transactions, 1);
+                assert_eq!(inner.active_transactions, u32::from(has_reader));
                 assert!(!inner.writer_active);
             }
             assert_eq!(
@@ -53482,17 +53512,31 @@ mod tests {
                 assert!(!coordination.logical_exit_in_flight.contains(&handle_key));
             }
 
-            reader.rollback(&cx).await.unwrap();
+            if let Some(reader) = reader.as_mut() {
+                reader.rollback(&cx).await.unwrap();
+            }
             let final_lock_level = *observed_lock_level
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             assert_eq!(final_lock_level, LockLevel::None);
-            assert_eq!(observed_unlock_trace_ids.lock().unwrap().len(), 2);
+            assert_eq!(
+                observed_unlock_trace_ids.lock().unwrap().len(),
+                1 + usize::from(has_reader)
+            );
             let inner = inner_state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             assert_eq!(inner.active_transactions, 0);
             assert!(!inner.writer_active);
+        }
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(1, 1)
+            .build()
+            .expect("cancelled begin test runtime should build");
+        runtime.block_on(async {
+            check_cancelled_begin(false).await;
+            check_cancelled_begin(true).await;
         });
     }
 
@@ -55489,6 +55533,126 @@ mod tests {
                 &sample_page(0xBB)[..],
                 "the disjoint writer's own page must be durable"
             );
+        });
+    }
+
+    #[test]
+    fn test_eager_begin_pins_wal_after_reserved_handoff() {
+        asupersync::test_utils::run_test(|| async {
+            for mode in [TransactionMode::Immediate, TransactionMode::Exclusive] {
+                let cx = Cx::new();
+                let vfs = ObservedLockVfs::new();
+                let pager = vfs
+                    .open_file_backed_pager(Path::new("/eager-reserved-handoff.db"))
+                    .await
+                    .unwrap();
+                let (backend, frames, _, _) = MockWalBackend::new();
+                pager.set_wal_backend(Box::new(backend)).unwrap();
+                pager.set_journal_mode(&cx, JournalMode::Wal).await.unwrap();
+                let page = {
+                    let mut seed = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                    let page = seed.allocate_page(&cx).await.unwrap();
+                    seed.write_page(&cx, page, &sample_page(0x31)).await.unwrap();
+                    seed.commit(&cx).await.unwrap();
+                    page
+                };
+                let prior_commit_seq = pager.published.snapshot().visible_commit_seq;
+                let db_size = pager.published.snapshot().db_size;
+                let peer_frames = Arc::clone(&frames);
+                // Model the exact RESERVED handoff: a peer finishes publishing
+                // before our lock can be granted, after an early reader pin
+                // would already have been captured. No timing or scheduler race
+                // is needed to expose the stale-snapshot failure.
+                *vfs.before_reserved_acquisition.lock().unwrap() = Some(Box::new(move || {
+                    peer_frames
+                        .lock()
+                        .unwrap()
+                        .push((page.get(), sample_page(0x52), db_size));
+                    Ok(())
+                }));
+
+                let mut writer = pager.begin(&cx, mode).await.unwrap();
+                assert!(vfs.before_reserved_acquisition.lock().unwrap().is_none());
+                let expected_snapshot = mock_wal_publication_snapshot(&frames.lock().unwrap());
+                assert_eq!(
+                    writer.wal_conflict_snapshot,
+                    Some(expected_snapshot),
+                    "an eager transaction must include the commit that released RESERVED"
+                );
+                assert_eq!(
+                    writer.published_visible_commit_seq.get(),
+                    prior_commit_seq.next()
+                );
+                assert_eq!(
+                    writer.get_page(&cx, page).await.unwrap().as_ref(),
+                    &sample_page(0x52)[..]
+                );
+                writer.write_page(&cx, page, &sample_page(0x73)).await.unwrap();
+                writer
+                    .commit(&cx)
+                    .await
+                    .expect("a successful eager begin must not inherit the prior writer's conflict");
+                assert_eq!(*vfs.observed_lock_level.lock().unwrap(), LockLevel::None);
+
+                let mut reader = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+                assert_eq!(
+                    reader.get_page(&cx, page).await.unwrap().as_ref(),
+                    &sample_page(0x73)[..],
+                    "the eager writer's update must survive the handoff and commit"
+                );
+                reader.rollback(&cx).await.unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn test_eager_begin_reservation_failure_leaves_readers_and_retry_unblocked() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let vfs = ObservedLockVfs::new();
+            let pager = vfs
+                .open_file_backed_pager(Path::new("/eager-reservation-failure.db"))
+                .await
+                .unwrap();
+            let (backend, _, begin_calls, _) = MockWalBackend::new();
+            pager.set_wal_backend(Box::new(backend)).unwrap();
+            pager.set_journal_mode(&cx, JournalMode::Wal).await.unwrap();
+            *vfs.before_reserved_acquisition.lock().unwrap() =
+                Some(Box::new(|| Err(FrankenError::Busy)));
+
+            for mode in [
+                TransactionMode::ReadOnly,
+                TransactionMode::Concurrent,
+                TransactionMode::Deferred,
+            ] {
+                let mut reader = pager.begin(&cx, mode).await.unwrap();
+                assert!(vfs.before_reserved_acquisition.lock().unwrap().is_some());
+                assert_eq!(*vfs.observed_lock_level.lock().unwrap(), LockLevel::Shared);
+                reader.rollback(&cx).await.unwrap();
+            }
+            let begins_before_failure = *begin_calls.lock().unwrap();
+            let error = pager
+                .begin(&cx, TransactionMode::Immediate)
+                .await
+                .err()
+                .expect("the contended eager begin must return Busy");
+            assert!(matches!(error, FrankenError::Busy));
+            assert_eq!(
+                *begin_calls.lock().unwrap(),
+                begins_before_failure,
+                "a refused writer must not pin a WAL snapshot before admission"
+            );
+            assert_eq!(*vfs.observed_lock_level.lock().unwrap(), LockLevel::None);
+            {
+                let inner = pager.inner.lock().unwrap();
+                assert_eq!(inner.active_transactions, 0);
+                assert!(!inner.writer_active);
+            }
+
+            let mut retry = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            assert_eq!(*vfs.observed_lock_level.lock().unwrap(), LockLevel::Reserved);
+            retry.rollback(&cx).await.unwrap();
+            assert_eq!(*vfs.observed_lock_level.lock().unwrap(), LockLevel::None);
         });
     }
 
