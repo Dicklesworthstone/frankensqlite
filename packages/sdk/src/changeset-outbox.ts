@@ -110,6 +110,24 @@ export class ChangesetOutbox {
     return this.#recordCapture(id, prepareSnapshotCapture(work, options), true);
   }
 
+  /** Check retained state in the owning transaction, not a pre-callback estimate. */
+  async #admitRecord(tx: ChangesetExecutor, payloadBytes = 0): Promise<void> {
+    const size = await query(
+      tx,
+      `SELECT count(*), coalesce(sum(length(payload)),0) FROM ${TABLE}`,
+    );
+    if (size.length !== 1 || size[0]!.length !== 2)
+      fail("CORRUPT", "Invalid outbox capacity result");
+    const entries = integer(size[0]![0]), bytes = integer(size[0]![1]);
+    if (entries >= this.#maxEntries || bytes > this.#maxPayloadBytes)
+      fail(
+        "FULL",
+        "Outbox retention limit reached; acknowledge or explicitly forget old deliveries",
+      );
+    if (payloadBytes > this.#maxPayloadBytes - bytes)
+      fail("FULL", "Outbox pending payload budget exceeded");
+  }
+
   async #recordCapture<T>(
     id: string, capture: RecordCapture<T>, snapshotCapture: boolean,
   ): Promise<OutboxRecordResult<T>> {
@@ -133,23 +151,18 @@ export class ChangesetOutbox {
         capture.checkpoint();
         return { replayed: true, delivery: existing.delivery };
       }
-      const size = await query(
-        tx,
-        `SELECT count(*), coalesce(sum(length(payload)),0) FROM ${TABLE}`,
-      );
-      if (size.length !== 1 || size[0]!.length !== 2)
-        fail("CORRUPT", "Invalid outbox capacity result");
-      const entries = integer(size[0]![0]),
-        bytes = integer(size[0]![1]);
-      if (entries >= this.#maxEntries || bytes > this.#maxPayloadBytes)
-        fail(
-          "FULL",
-          "Outbox retention limit reached; acknowledge or explicitly forget old deliveries",
-        );
+      await this.#admitRecord(tx);
       const result = await capture.run(tx);
       capture.checkpoint();
-      if (result.changeset.byteLength > this.#maxPayloadBytes - bytes)
-        fail("FULL", "Outbox pending payload budget exceeded");
+      // Released child work can publish another delivery (even through a
+      // different outbox instance), or reclaim an acknowledged payload. The
+      // capture owner has joined all admitted descendants by this point. Use
+      // the CURRENT retained population/bytes before adding our own record;
+      // a pre-callback check alone lets nested captures bypass either limit.
+      // On refusal the same outer transaction rolls back both source DML and
+      // provisional child publications. No retry, queue or new lock is needed.
+      await this.#admitRecord(tx, result.changeset.byteLength);
+      capture.checkpoint();
       const delivery = await store(tx, id, scope, result, capture.checkpoint);
       return { replayed: false, value: result.value, delivery };
     }, capture.transactionOptions);

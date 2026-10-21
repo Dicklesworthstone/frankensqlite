@@ -765,3 +765,260 @@ for (const cut of ["before", "after"])
       target.close();
     }
   });
+
+// Persistent source admission through actual owned nested outboxes. Capture,
+// storage and fanout imports below are production modules, not substitutions.
+import { ChangesetFanout } from '../src/changeset-fanout.ts';
+import { encodeChangeset } from '../src/changeset-codec.ts';
+
+const ddl = 'CREATE TABLE t(id INTEGER PRIMARY KEY,value);CREATE TABLE u(id INTEGER PRIMARY KEY,value);CREATE TABLE audit(id INTEGER PRIMARY KEY)';
+const T = `main."${CHANGESET_OUTBOX_TABLE}"`;
+const gate = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
+const tick = () => new Promise(resolve => setImmediate(resolve));
+const full = { code: 'ERR_FSQLITE_OUTBOX_FULL' };
+const settings = (id, table = 't') => ({ deliveryId: id, tables: [table] });
+const inside = tx => ({ transaction: work => tx.transaction(work) });
+function wire(table, id, value) {
+  return encodeChangeset([{ name: table, primaryKey: [1, 0], changes: [
+    { operation: 'insert', indirect: false, new: [id, value] },
+  ] }]);
+}
+const parentSql = "INSERT INTO t VALUES(1,'parent')";
+const childSql = "INSERT INTO u VALUES(1,'child')";
+const parentBytes = wire('t', 1n, 'parent').length;
+const childBytes = wire('u', 1n, 'child').length;
+
+class Owner {
+  constructor(path = ':memory:', initialize = true) {
+    this.db = new DatabaseSync(path);
+    this.db.exec('PRAGMA foreign_keys=ON;PRAGMA recursive_triggers=ON');
+    if (initialize) this.db.exec(ddl);
+    this.depth = 0; this.serial = 0; this.events = [];
+    this.beforeSql = null; this.afterCommit = null;
+  }
+  async transaction(work) {
+    const depth = this.depth++, name = `capacity_${++this.serial}`;
+    this.db.exec(depth ? `SAVEPOINT ${name}` : 'BEGIN');
+    let active = true, committed = false;
+    const check = () => assert.ok(active, 'owner scope expired');
+    const tx = {
+      execute: async (sql, params = []) => {
+        check(); this.events.push(['execute', sql]); await this.beforeSql?.('execute', sql, depth);
+        return Number(this.db.prepare(sql).run(...params).changes);
+      },
+      query: async (sql, params = []) => {
+        check(); this.events.push(['query', sql]); await this.beforeSql?.('query', sql, depth);
+        return { rowArrays: this.rows(sql, params) };
+      },
+      transaction: child => { check(); return this.transaction(child); },
+    };
+    try {
+      const value = await work(tx); active = false;
+      this.db.exec(depth ? `RELEASE ${name}` : 'COMMIT'); committed = true;
+      if (depth === 0) await this.afterCommit?.();
+      return value;
+    } catch (error) {
+      active = false;
+      if (!committed) this.db.exec(depth ? `ROLLBACK TO ${name};RELEASE ${name}` : 'ROLLBACK');
+      throw error;
+    } finally { active = false; this.depth--; }
+  }
+  rows(sql = 'SELECT * FROM t ORDER BY id', params = []) {
+    const stmt = this.db.prepare(sql); stmt.setReadBigInts(true); stmt.setReturnArrays(true);
+    return stmt.all(...params);
+  }
+  close() { this.db.close(); }
+}
+function clean(source) {
+  assert.equal(source.depth, 0);
+  assert.deepEqual(source.rows("SELECT name FROM temp.sqlite_schema WHERE name GLOB '__fsqlite_capture_*'"), []);
+}
+function usage(source) {
+  return source.rows(`SELECT count(*),coalesce(sum(length(payload)),0) FROM ${T}`)[0];
+}
+async function nested(tx) {
+  // An independently configured instance must not bypass its enclosing cap.
+  return new ChangesetOutbox(inside(tx)).recordSnapshot(
+    child => child.execute(childSql), settings('child', 'u'));
+}
+async function recordPair(outbox, method, onChild = () => {}) {
+  return outbox[method](async tx => {
+    const child = await nested(tx); onChild(child);
+    await tx.execute(parentSql);
+    return 42;
+  }, settings('parent'));
+}
+async function verifyPair(source, outbox) {
+  const receiver = new Owner();
+  try {
+    const pending = await outbox.pending();
+    assert.deepEqual(pending.map(d => [d.deliveryId, d.sequence]), [['child', 1n], ['parent', 2n]]);
+    for (const delivery of pending) {
+      const saved = await outbox.read(delivery.deliveryId);
+      assert.equal(receiver.db.applyChangeset(saved.changeset), true);
+    }
+    assert.deepEqual(receiver.rows(), source.rows());
+    assert.deepEqual(receiver.rows('SELECT * FROM u'), source.rows('SELECT * FROM u'));
+  } finally { receiver.close(); }
+}
+
+for (const method of ['record', 'recordSnapshot']) {
+  for (const [label, limits] of [
+    ['identities', { maxEntries: 1 }],
+    ['payload bytes', { maxPayloadBytes: parentBytes + childBytes - 1 }],
+  ]) test(`${method}: released nested publication cannot exceed ${label}`, async () => {
+    const source = new Owner(), outbox = new ChangesetOutbox(source, limits);
+    let child;
+    try {
+      await assert.rejects(recordPair(outbox, method, value => { child = value; }), full);
+      assert.equal(child.delivery.sequence, 1n, 'nested publication genuinely completed before parent admission');
+      assert.deepEqual(source.rows(), []); assert.deepEqual(source.rows('SELECT * FROM u'), []);
+      assert.deepEqual(await outbox.pending(), []); assert.equal(await outbox.read('child'), null);
+      const retry = await outbox[method](tx => tx.execute(parentSql), settings('parent'));
+      assert.equal(retry.delivery.sequence, 1n, 'rollback restores sequence reservation with source and payload');
+      assert.deepEqual(source.rows(), [[1n, 'parent']]); clean(source);
+    } finally { source.close(); }
+  });
+
+  test(`${method}: exact combined capacity commits distinct source records and replays at lower limits`, async () => {
+    const source = new Owner(), outbox = new ChangesetOutbox(source,
+      { maxEntries: 2, maxPayloadBytes: parentBytes + childBytes });
+    try {
+      const result = await recordPair(outbox, method);
+      assert.equal(result.value, 42); assert.deepEqual(usage(source), [2n, BigInt(parentBytes + childBytes)]);
+      await verifyPair(source, outbox);
+      const lower = new ChangesetOutbox(source, { maxEntries: 1, maxPayloadBytes: 1 });
+      const replay = await lower[method](() => assert.fail('replayed business work'), settings('parent'));
+      assert.equal(replay.replayed, true); assert.deepEqual(replay.delivery, result.delivery); clean(source);
+    } finally { source.close(); }
+  });
+
+  test(`${method}: confirmed nested rollback releases provisional capacity`, async () => {
+    const source = new Owner(), outbox = new ChangesetOutbox(source,
+      { maxEntries: 1, maxPayloadBytes: parentBytes });
+    const rejected = new Error('discard optional source operation');
+    try {
+      const result = await outbox[method](async tx => {
+        await assert.rejects(tx.transaction(async child => { await nested(child); throw rejected; }), e => e === rejected);
+        await tx.execute(parentSql);
+      }, settings('parent'));
+      assert.equal(result.delivery.sequence, 1n); assert.deepEqual(usage(source), [1n, BigInt(parentBytes)]);
+      assert.equal(await outbox.read('child'), null); assert.deepEqual(source.rows('SELECT * FROM u'), []); clean(source);
+    } finally { source.close(); }
+  });
+
+  test(`${method}: joined but unawaited nested work is counted before publication`, async () => {
+    const source = new Owner(), outbox = new ChangesetOutbox(source, { maxEntries: 1 });
+    const entered = gate(), release = gate(); let child, done = false;
+    source.beforeSql = async (kind, sql) => { if (kind === 'execute' && sql === childSql) { entered.resolve(); await release.promise; } };
+    const operation = outbox[method](async tx => { await tx.execute(parentSql); child = nested(tx); }, settings('parent'));
+    void operation.then(() => { done = true; }, () => { done = true; });
+    try {
+      await Promise.race([entered.promise, operation.then(() => assert.fail('nested work never started'))]);
+      await tick(); assert.equal(done, false); assert.equal(source.depth, 2);
+      release.resolve(); await assert.rejects(operation, full); await child;
+      assert.deepEqual(source.rows(), []); assert.deepEqual(source.rows('SELECT * FROM u'), []);
+      assert.deepEqual(await outbox.pending(), []); clean(source);
+    } finally { release.resolve(); await Promise.allSettled([operation, child]); source.close(); }
+  });
+
+  test(`${method}: verified acknowledgement inside the callback releases actual payload capacity`, async () => {
+    const source = new Owner();
+    try {
+      const old = await new ChangesetOutbox(source).record(tx => tx.execute("INSERT INTO t VALUES(1,'old')"), settings('old'));
+      const next = 'a longer replacement payload', limit = wire('t', 2n, next).length;
+      const outbox = new ChangesetOutbox(source, { maxEntries: 2, maxPayloadBytes: limit });
+      const result = await outbox[method](async tx => {
+        assert.equal(await new ChangesetOutbox(inside(tx)).acknowledge('old', old.delivery.sha256), true);
+        await tx.execute('INSERT INTO t VALUES(2,?)', [next]);
+      }, settings('parent'));
+      assert.equal(result.delivery.sequence, 2n); assert.deepEqual(usage(source), [2n, BigInt(limit)]);
+      assert.equal((await outbox.read('old')).changeset, null);
+      const receiver = new Owner();
+      try {
+        receiver.db.exec("INSERT INTO t VALUES(1,'old')");
+        assert.equal(receiver.db.applyChangeset((await outbox.read('parent')).changeset), true);
+        assert.deepEqual(receiver.rows(), source.rows());
+      } finally { receiver.close(); }
+      clean(source);
+    } finally { source.close(); }
+  });
+}
+
+test('fanout retains all-recipient acknowledgement and contiguous source order after capacity rollback', async () => {
+  const source = new Owner();
+  try {
+    const fanout = await ChangesetFanout.open(source, ['east', 'west']);
+    const before = await fanout.progress();
+    await assert.rejects(recordPair(new ChangesetOutbox(source, { maxEntries: 1 }), 'recordSnapshot'), full);
+    assert.deepEqual(await fanout.progress(), before);
+    const outbox = new ChangesetOutbox(source, { maxEntries: 2 });
+    await recordPair(outbox, 'recordSnapshot'); await verifyPair(source, outbox);
+    for (const id of ['east', 'west']) {
+      const replica = fanout.forReplica(id);
+      for (const delivery of await replica.pending()) {
+        assert.equal(await replica.acknowledge(delivery.deliveryId, delivery.sha256), true);
+        assert.equal((await outbox.read(delivery.deliveryId)).changeset === null, id === 'west');
+      }
+    }
+    assert.equal((await fanout.progress()).acknowledgedThrough, 2n); assert.deepEqual(usage(source), [2n, 0n]); clean(source);
+  } finally { source.close(); }
+});
+
+test('capacity refusal rolls back only its owned savepoint and preserves enclosing caller work', async () => {
+  const source = new Owner();
+  try {
+    await source.transaction(async tx => {
+      await tx.execute('INSERT INTO audit VALUES(1)');
+      await assert.rejects(recordPair(new ChangesetOutbox(inside(tx), { maxEntries: 1 }), 'record'), full);
+      await tx.execute('INSERT INTO audit VALUES(2)');
+    });
+    assert.deepEqual(source.rows('SELECT * FROM audit ORDER BY id'), [[1n], [2n]]);
+    assert.deepEqual(source.rows(), []); assert.deepEqual(source.rows('SELECT * FROM u'), []); clean(source);
+  } finally { source.close(); }
+});
+
+test('full preflight still refuses before business work and counts acknowledged identities', async () => {
+  const source = new Owner(), outbox = new ChangesetOutbox(source, { maxEntries: 1 });
+  try {
+    const result = await outbox.record(tx => tx.execute(parentSql), settings('first'));
+    await outbox.acknowledge('first', result.delivery.sha256);
+    await assert.rejects(outbox.record(() => assert.fail('callback must not run'), settings('later')), full);
+    assert.deepEqual(usage(source), [1n, 0n]); clean(source);
+  } finally { source.close(); }
+});
+
+test('cancelled publication-time admission completes its SQL before source rollback', async () => {
+  const source = new Owner(), outbox = new ChangesetOutbox(source);
+  const entered = gate(), release = gate(), abort = new AbortController(); let completed = false, checks = 0;
+  source.beforeSql = async (kind, sql) => {
+    if (kind === 'query' && sql.startsWith('SELECT count(*), coalesce(sum(length(payload)),0)')) {
+      if (++checks === 2) { entered.resolve(); await release.promise; }
+    }
+  };
+  const operation = outbox.record(tx => tx.execute(parentSql), { ...settings('parent'), signal: abort.signal });
+  void operation.then(() => { completed = true; }, () => { completed = true; });
+  try {
+    await Promise.race([entered.promise, operation.then(() => assert.fail('publication did not recheck capacity'))]);
+    abort.abort('stop'); await tick(); assert.equal(completed, false); assert.equal(source.depth, 1);
+    release.resolve(); await assert.rejects(operation, { code: 'ERR_FSQLITE_CAPTURE_CANCELLED' });
+    assert.deepEqual(source.rows(), []); assert.deepEqual(await outbox.pending(), []); clean(source);
+  } finally { release.resolve(); await Promise.allSettled([operation]); source.close(); }
+});
+
+test('WAL reopen after lost response retains the exact bounded pair without recapturing', async () => {
+  const file = join(mkdtempSync(join(tmpdir(), 'fsqlite-outbox-capacity-')), 'source.db');
+  let source = new Owner(file), calls = 0;
+  try {
+    source.db.exec('PRAGMA journal_mode=WAL');
+    const outbox = new ChangesetOutbox(source, { maxEntries: 2, maxPayloadBytes: parentBytes + childBytes });
+    source.afterCommit = () => { throw new Error('lost commit response'); };
+    await assert.rejects(outbox.recordSnapshot(async tx => { calls++; await nested(tx); await tx.execute(parentSql); }, settings('parent')), /lost commit response/);
+    source.afterCommit = null; source.close(); source = new Owner(file, false);
+    const reopened = new ChangesetOutbox(source, { maxEntries: 1, maxPayloadBytes: 1 });
+    const replay = await reopened.recordSnapshot(() => { calls++; assert.fail('must not rerun'); }, settings('parent'));
+    assert.equal(replay.replayed, true); assert.equal(calls, 1);
+    assert.deepEqual(usage(source), [2n, BigInt(parentBytes + childBytes)]);
+    await verifyPair(source, reopened); clean(source);
+  } finally { source.afterCommit = null; source.close(); }
+});
