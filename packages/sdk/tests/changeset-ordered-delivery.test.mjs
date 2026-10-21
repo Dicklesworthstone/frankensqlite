@@ -341,3 +341,444 @@ test("recovery allows a fresh call after invalid acknowledgement", async () => {
   await assert.rejects(transport(msg, {})); valid = true;
   assert.equal((await transport(msg, {})).confirmed, true);
 });
+
+
+// Atomic reception executes production application, not the reference adapter
+// used above. SQL, savepoints, receipts and decision BLOBs are real SQLite.
+import { applyChangeset, CHANGESET_RECEIPTS_TABLE } from "../src/changeset-apply.ts";
+import { encodeChangeset, encodePatchset, decodeRebaseInfo } from "../src/changeset-codec.ts";
+import { FrankenSQLiteError } from "../src/errors.ts";
+
+const batchSchema = "CREATE TABLE IF NOT EXISTS notes(id INTEGER PRIMARY KEY,body TEXT UNIQUE);" +
+  "CREATE TABLE IF NOT EXISTS decisions(id TEXT PRIMARY KEY,info BLOB)";
+const sqlArrays = (db, sql = "SELECT * FROM notes ORDER BY id") => {
+  const stmt = db.prepare(sql); stmt.setReadBigInts(true); stmt.setReturnArrays(true);
+  return stmt.all();
+};
+const tick = () => new Promise(r => setImmediate(r));
+class BatchReceiverOwner {
+  constructor(path = ":memory:", ddl = batchSchema) {
+    this.db = new DatabaseSync(path);
+    this.db.exec("PRAGMA foreign_keys=ON;PRAGMA recursive_triggers=ON;" + ddl);
+    this.depth = 0; this.serial = 0; this.events = [];
+    this.beforeSql = null; this.beforeRelease = null; this.afterCommit = null;
+  }
+  async transaction(work) {
+    const depth = this.depth++, name = `receiver_${++this.serial}`;
+    this.db.exec(depth ? `SAVEPOINT ${name}` : "BEGIN");
+    this.events.push(["begin", depth]);
+    let active = true, committed = false;
+    const check = () => assert.ok(active, "SQL owner has expired");
+    const tx = {
+      execute: async (sql, params = []) => {
+        check(); this.events.push(["execute", depth, sql]);
+        await this.beforeSql?.("execute", sql, depth);
+        try { return Number(this.db.prepare(sql).run(...params).changes); }
+        catch (error) {
+          if (error.code === "ERR_SQLITE_ERROR" && (error.errcode & 255) === 19)
+            throw new FrankenSQLiteError({ code: "SQLITE_CONSTRAINT", sqliteCode: 19,
+              extendedCode: error.errcode, message: error.message });
+          throw error;
+        }
+      },
+      query: async (sql, params = []) => {
+        check(); this.events.push(["query", depth, sql]);
+        await this.beforeSql?.("query", sql, depth);
+        const stmt = this.db.prepare(sql); stmt.setReadBigInts(true); stmt.setReturnArrays(true);
+        return { rowArrays: stmt.all(...params) };
+      },
+      transaction: child => { check(); return this.transaction(child); },
+    };
+    try {
+      const value = await work(tx); active = false;
+      await this.beforeRelease?.(depth);
+      this.db.exec(depth ? `RELEASE ${name}` : "COMMIT"); committed = true;
+      this.events.push(["release", depth]);
+      if (depth === 0) await this.afterCommit?.();
+      return value;
+    } catch (error) {
+      active = false;
+      if (!committed) {
+        this.db.exec(depth ? `ROLLBACK TO ${name}; RELEASE ${name}` : "ROLLBACK");
+        this.events.push(["rollback", depth]);
+      }
+      throw error;
+    } finally { active = false; this.depth--; }
+  }
+  close() { this.db.close(); }
+}
+async function batchSetup(t, config = {}) {
+  const owner = new BatchReceiverOwner(config.path, config.ddl); t.after(() => owner.close());
+  if (config.wal) owner.db.exec("PRAGMA journal_mode=WAL");
+  const order = new ChangesetOrder(owner, ID); await order.initialize();
+  const f = { owner, order, calls: [], hooks: [], confirms: 0, applicationOptions: {},
+    confirmHook: null, rows: sql => sqlArrays(owner.db, sql) };
+  const apply = (target, msg, options) => {
+    f.calls.push(msg.deliveryId);
+    return applyChangeset(target, msg.changeset, {
+      tables: config.tables ?? ["notes"], deliveryId: msg.deliveryId, ...options,
+      ...f.applicationOptions,
+    });
+  };
+  const confirmCommit = async () => {
+    assert.equal(owner.depth, 0, "batch confirmation ran before the outer transaction settled");
+    f.confirms++; await f.confirmHook?.();
+  };
+  f.receiver = await createOrderedChangesetReceiver(order, { apply, confirmCommit, ...config.receiver });
+  f.apply = apply; f.confirmCommit = confirmCommit;
+  owner.events.length = 0;
+  return f;
+}
+function noBatchCommit(f) {
+  assert.equal(f.confirms, 0); assert.equal(f.owner.depth, 0);
+  assert.deepEqual(f.rows(`SELECT seq FROM "${CHANGESET_ORDER_TABLE}"`), [[0n]]);
+  if (f.rows(`SELECT name FROM sqlite_schema WHERE name='${CHANGESET_RECEIPTS_TABLE}'`).length)
+    assert.deepEqual(f.rows(`SELECT * FROM "${CHANGESET_RECEIPTS_TABLE}"`), []);
+}
+const batchEnvelope = (sequence, changeset) => ({ ...message(sequence), changeset, sha256: HASH(changeset) });
+function nativeBatchMessage(sequence, ddl, sql) {
+  // Construct independently valid wire fragments; receiver FK enforcement stays ON.
+  const db = new DatabaseSync(":memory:");
+  db.exec("PRAGMA foreign_keys=OFF;" + ddl); const session = db.createSession();
+  try { db.exec(sql); return batchEnvelope(sequence, session.changeset()); }
+  finally { session.close(); db.close(); }
+}
+
+test("batch receiver: production rows, nested decision BLOBs and receipts precede one confirmation", async t => {
+  const f = await batchSetup(t), messages = [message(), message(2n), message(3n)];
+  f.applicationOptions.onRebase = (tx, info) => {
+    const id = f.calls.at(-1); f.hooks.push(id);
+    return tx.transaction(child => info.length
+      ? child.execute("INSERT INTO decisions VALUES(?,?)", [id, info])
+      : child.execute("INSERT INTO decisions VALUES(?,zeroblob(0))", [id]));
+  };
+  f.confirmHook = () => {
+    assert.equal(f.rows().length, 3); assert.equal(f.rows("SELECT * FROM decisions").length, 3);
+    assert.equal(f.rows(`SELECT * FROM "${CHANGESET_RECEIPTS_TABLE}"`).length, 3);
+  };
+  const receipts = await f.receiver.receiveBatch(messages);
+  assert.deepEqual(receipts, messages.map(fakeAck));
+  assert.ok(Object.isFrozen(receipts));
+  for (const receipt of receipts) { assert.ok(Object.isFrozen(receipt)); assert.ok(Object.isFrozen(receipt.order)); }
+  for (const [, bytes] of f.rows("SELECT * FROM decisions")) assert.deepEqual(decodeRebaseInfo(bytes), []);
+  assert.equal(f.confirms, 1);
+  assert.equal(f.owner.events.filter(([kind, depth]) => kind === "begin" && depth === 0).length, 1);
+  const reference = new DatabaseSync(":memory:");
+  try {
+    reference.exec(batchSchema);
+    for (const msg of messages) assert.equal(reference.applyChangeset(msg.changeset), true);
+    assert.deepEqual(f.rows(), sqlArrays(reference));
+  } finally { reference.close(); }
+});
+
+test("batch receiver: replay-only and mixed windows bind the actual message, never callback count", async t => {
+  const f = await batchSetup(t), messages = [message(), message(2n), message(3n)];
+  await f.receiver.receive(messages[0]);
+  const mixed = await f.receiver.receiveBatch(messages);
+  assert.deepEqual(mixed.map(r => r.replayed), [true, false, false]);
+  assert.deepEqual(f.calls, messages.map(m => m.deliveryId)); assert.equal(f.confirms, 2);
+  const replay = await f.receiver.receiveBatch(messages);
+  assert.ok(replay.every(r => r.replayed));
+  assert.deepEqual(replay.map(r => r.deliveryId), messages.map(m => m.deliveryId));
+  assert.equal(f.calls.length, 3); assert.equal(f.confirms, 3);
+  assert.equal((await f.order.head()).sequence, 3n);
+});
+
+test("batch receiver: late SQL failure rejects the whole fresh batch and permits exact retry", async t => {
+  const f = await batchSetup(t), messages = [message(1n, "same"), message(2n, "same")];
+  await assert.rejects(f.receiver.receiveBatch(messages), /UNIQUE/);
+  assert.deepEqual(f.rows(), []); noBatchCommit(f);
+  f.applicationOptions.constraintConflicts = "isolate";
+  f.applicationOptions.onConflict = c => { assert.equal(c.kind, "constraint"); return "omit"; };
+  const receipt = await f.receiver.receiveBatch(messages);
+  assert.deepEqual(receipt.map(r => [r.applied, r.omitted]), [[1, 0], [0, 1]]);
+  assert.equal(f.confirms, 1); assert.deepEqual(f.rows(), [[1n, "same"]]);
+  // The unchanged sender transport can verify each ordinary receipt; no new ACK
+  // format or implicit acceptance of omissions is smuggled into the protocol.
+  for (let i = 0; i < messages.length; i++) {
+    const transport = createOrderedChangesetTransport(sourceFor(messages[i]), transportOptions(async () => receipt[i]));
+    assert.deepEqual(await transport(messages[i], {}), receipt[i]);
+  }
+});
+
+const fkDDL = "CREATE TABLE parents(id INTEGER PRIMARY KEY);" +
+  "CREATE TABLE children(id INTEGER PRIMARY KEY,pid INTEGER REFERENCES parents(id),value TEXT UNIQUE);" +
+  "CREATE TABLE decisions(id TEXT PRIMARY KEY,info BLOB)";
+function fkMessages() {
+  return [
+    nativeBatchMessage(1n, fkDDL, "INSERT INTO children VALUES(1,7,'new'),(2,7,'taken')"),
+    nativeBatchMessage(2n, fkDDL, "INSERT INTO parents VALUES(7)"),
+  ];
+}
+test("batch receiver: local whole-batch FK policy composes isolation and journal savepoints", async t => {
+  const f = await batchSetup(t, { ddl: fkDDL, tables: ["children", "parents"], receiver: { batchForeignKeys: "defer" } });
+  f.owner.db.exec("INSERT INTO parents VALUES(8); INSERT INTO children VALUES(8,8,'taken')");
+  const messages = fkMessages();
+  f.applicationOptions.constraintConflicts = "isolate";
+  f.applicationOptions.onConflict = c => { assert.equal(c.kind, "constraint"); return "omit"; };
+  f.applicationOptions.onRebase = (tx, info) => tx.transaction(child =>
+    child.execute("INSERT INTO decisions VALUES(?,?)", [f.calls.at(-1), info]));
+  const receipts = await f.receiver.receiveBatch(messages);
+  assert.deepEqual(receipts.map(r => [r.applied, r.omitted]), [[1, 1], [1, 0]]);
+  assert.deepEqual(f.rows("PRAGMA foreign_key_check"), []);
+  assert.deepEqual(f.rows("SELECT * FROM children ORDER BY id"), [[1n, 7n, "new"], [8n, 8n, "taken"]]);
+  assert.equal(f.rows("SELECT * FROM decisions").length, 2); assert.equal(f.confirms, 1);
+  assert.deepEqual(f.rows("PRAGMA defer_foreign_keys"), [[0n]]);
+});
+
+test("batch receiver: missing later FK parent rolls back journal, inbox and sequence", async t => {
+  const f = await batchSetup(t, { ddl: fkDDL, tables: ["children", "parents"], receiver: { batchForeignKeys: "defer" } });
+  f.applicationOptions.onRebase = (tx, info) => tx.execute("INSERT INTO decisions VALUES(?,?)", [f.calls.at(-1), info]);
+  const messages = [nativeBatchMessage(1n, fkDDL, "INSERT INTO children VALUES(1,7,'child')"),
+    nativeBatchMessage(2n, fkDDL, "INSERT INTO parents VALUES(99)")];
+  await assert.rejects(f.receiver.receiveBatch(messages), /foreign.key/i);
+  noBatchCommit(f); assert.deepEqual(f.rows("SELECT * FROM children"), []);
+  assert.deepEqual(f.rows("SELECT * FROM parents"), []); assert.deepEqual(f.rows("SELECT * FROM decisions"), []);
+});
+
+test("batch receiver: incoming policy fields cannot enable FK deferral", async t => {
+  const f = await batchSetup(t, { ddl: fkDDL, tables: ["children", "parents"] });
+  const messages = fkMessages();
+  for (const msg of messages) { msg.foreignKeys = "defer"; msg.batchForeignKeys = "defer"; }
+  await assert.rejects(f.receiver.receiveBatch(messages, { batchForeignKeys: "defer", foreignKeys: "defer" }), /FOREIGN KEY/);
+  noBatchCommit(f); assert.deepEqual(f.rows("SELECT * FROM children"), []);
+});
+
+test("batch receiver: all copies and identities are captured before first await", async t => {
+  const f = await batchSetup(t), messages = [message(), message(2n)];
+  const expected = messages.map(fakeAck);
+  const promise = f.receiver.receiveBatch(messages);
+  for (const msg of messages) {
+    msg.changeset.fill(0); structuredClone(msg.changeset.buffer, { transfer: [msg.changeset.buffer] });
+    msg.deliveryId = "mutated"; msg.order.sequence = "99";
+  }
+  messages.reverse(); messages.length = 0;
+  assert.deepEqual(await promise, expected);
+  assert.deepEqual(f.rows(), [[1n, "body-1"], [2n, "body-2"]]);
+});
+
+test("batch receiver: aggregate and per-message byte limits remain exact and unshadowable", async t => {
+  const messages = [message(), message(2n)], size = messages.reduce((n, m) => n + m.changeset.length, 0);
+  const f = await batchSetup(t, { receiver: { maxBatchBytes: size - 1 } });
+  let fakeSizeReads = 0;
+  class HiddenSize extends Uint8Array { get byteLength() { fakeSizeReads++; return 0; } }
+  messages[1].changeset = new HiddenSize(messages[1].changeset);
+  await assert.rejects(f.receiver.receiveBatch(messages), code("INPUT"));
+  assert.equal(fakeSizeReads, 0); assert.equal(f.owner.events.length, 0); noBatchCommit(f);
+  const exact = await createOrderedChangesetReceiver(f.order, { apply: f.apply, confirmCommit: f.confirmCommit,
+    maxBatchBytes: size, maxMessageBytes: Math.max(...messages.map(m => m.changeset.length)) });
+  assert.equal((await exact.receiveBatch(messages)).length, 2);
+  const tooSmall = await createOrderedChangesetReceiver(f.order, { apply: f.apply, confirmCommit: f.confirmCommit,
+    maxBatchBytes: size, maxMessageBytes: messages[0].changeset.length - 1 });
+  await assert.rejects(tooSmall.receiveBatch(messages), code("INPUT"));
+  assert.equal(f.confirms, 1);
+});
+
+test("batch receiver: sparse arrays, element accessors, invalid count and foreign routes reject before SQL", async t => {
+  const f = await batchSetup(t); let reads = 0;
+  const accessor = [message()]; Object.defineProperty(accessor, "0", { get() { reads++; return message(); } });
+  const badRoute = message(2n); badRoute.order.streamId = "untrusted";
+  const duplicate = message(2n); duplicate.deliveryId = message().deliveryId;
+  const iterable = { *[Symbol.iterator]() { reads++; yield message(); } };
+  for (const messages of [[], new Array(1), new Array(257), accessor, iterable,
+    [message(), message(3n)], [message(), badRoute], [message(), duplicate]]) {
+    await assert.rejects(f.receiver.receiveBatch(messages));
+    assert.equal(f.owner.events.length, 0);
+  }
+  assert.equal(reads, 0); assert.equal(f.calls.length, 0); noBatchCommit(f);
+});
+
+test("batch receiver: invalid last digest, malformed tail and compact format reject before any application", async t => {
+  const f = await batchSetup(t), badHash = message(2n); badHash.sha256 = "0".repeat(64);
+  const good = message(2n), truncated = batchEnvelope(2n, good.changeset.slice(0, -1));
+  const compact = batchEnvelope(2n, encodePatchset([{ name: "notes", primaryKey: [1, 0], changes: [
+    { operation: "insert", indirect: false, new: [2n, "compact"] },
+  ] }]));
+  for (const last of [badHash, truncated, compact]) {
+    await assert.rejects(f.receiver.receiveBatch([message(), last]));
+    assert.equal(f.owner.events.length, 0); assert.equal(f.calls.length, 0); assert.equal(f.confirms, 0);
+  }
+});
+
+test("batch receiver: 256 empty full messages are bounded identities, not an empty batch", async t => {
+  const f = await batchSetup(t, { receiver: { maxBatchBytes: 1 } });
+  const messages = Array.from({ length: 256 }, (_, i) => batchEnvelope(BigInt(i + 1), new Uint8Array()));
+  const receipts = await f.receiver.receiveBatch(messages);
+  assert.equal(receipts.length, 256); assert.ok(receipts.every(r => r.applied === 0 && r.omitted === 0));
+  assert.equal(f.confirms, 1); assert.equal((await f.order.head()).sequence, 256n);
+});
+
+test("batch receiver: retained-prefix failure preserves old rows and never invokes later callbacks", async t => {
+  const f = await batchSetup(t);
+  await f.receiver.receive(message()); f.calls.length = 0;
+  const changed = message(1n, "different");
+  await assert.rejects(f.receiver.receiveBatch([changed, message(2n)]), gateCode("REUSE"));
+  assert.equal(f.calls.length, 0); assert.equal(f.confirms, 1);
+  await assert.rejects(f.receiver.receiveBatch([message(), message(2n, "body-1")]), /UNIQUE/);
+  assert.deepEqual(f.rows(), [[1n, "body-1"]]); assert.equal((await f.order.head()).sequence, 1n);
+  assert.equal(f.confirms, 1);
+});
+
+test("batch receiver: failed COMMIT rolls back all provisional members and skips confirmation", async t => {
+  const f = await batchSetup(t);
+  f.owner.beforeRelease = depth => { if (depth === 0) throw new Error("batch commit failed"); };
+  await assert.rejects(f.receiver.receiveBatch([message(), message(2n)]), /batch commit failed/);
+  noBatchCommit(f); assert.deepEqual(f.rows(), []);
+  f.owner.beforeRelease = null;
+  assert.equal((await f.receiver.receiveBatch([message(), message(2n)])).length, 2);
+});
+
+test("batch receiver: lost COMMIT response recovers exact receipts without rerunning callbacks", async t => {
+  const f = await batchSetup(t), messages = [message(), message(2n)];
+  f.owner.afterCommit = () => { throw new Error("lost commit response"); };
+  await assert.rejects(f.receiver.receiveBatch(messages), /lost commit response/);
+  assert.equal(f.rows().length, 2); assert.equal(f.confirms, 0); assert.equal(f.calls.length, 2);
+  f.owner.afterCommit = null;
+  assert.ok((await f.receiver.receiveBatch(messages)).every(r => r.replayed));
+  assert.equal(f.confirms, 1); assert.equal(f.calls.length, 2);
+});
+
+test("batch receiver: WAL reopen after lost confirmation replays every member and confirms once", async t => {
+  const path = join(mkdtempSync(join(tmpdir(), "fsqlite-batch-receiver-")), "receiver.db");
+  // A separate owner is closed here; the test retains files rather than deleting evidence.
+  const first = new BatchReceiverOwner(path);
+  first.db.exec("PRAGMA journal_mode=WAL");
+  const order = new ChangesetOrder(first, ID); await order.initialize();
+  let calls = 0; const messages = [message(), message(2n)];
+  const receiver = await createOrderedChangesetReceiver(order, {
+    apply: (target, msg, options) => { calls++; return applyChangeset(target, msg.changeset, {
+      tables: ["notes"], deliveryId: msg.deliveryId, ...options,
+    }); },
+    confirmCommit: async () => { assert.equal(first.depth, 0); throw new Error("lost storage confirmation"); },
+  });
+  try {
+    await assert.rejects(receiver.receiveBatch(messages), /lost storage confirmation/);
+    assert.equal(sqlArrays(first.db).length, 2); assert.equal(calls, 2);
+  } finally { first.close(); }
+  const reopened = await batchSetup(t, { path, wal: true });
+  const receipts = await reopened.receiver.receiveBatch(messages);
+  assert.ok(receipts.every(r => r.replayed)); assert.equal(reopened.calls.length, 0);
+  assert.equal(reopened.confirms, 1); assert.equal(reopened.rows().length, 2);
+});
+
+for (const ending of ["cancel", "timeout"]) test(`batch receiver: ${ending} waits for confirmation and returns no partial ACK`, async t => {
+  const f = await batchSetup(t), started = pause(), release = pause(), controller = new AbortController();
+  const messages = [message(), message(2n)];
+  f.confirmHook = async () => { started.resolve(); await release.promise; };
+  const operation = f.receiver.receiveBatch(messages,
+    ending === "cancel" ? { signal: controller.signal } : { timeoutMs: 200 });
+  let settled = false; void operation.then(() => { settled = true; }, () => { settled = true; });
+  try {
+    await Promise.race([started.promise, operation.then(() => assert.fail("confirmation was not held"))]);
+    if (ending === "cancel") controller.abort(); else await new Promise(r => setTimeout(r, 230));
+    await tick(); assert.equal(settled, false); assert.equal(f.owner.depth, 0);
+    await assert.rejects(f.receiver.receive(message(3n)), code("BUSY"));
+    await assert.rejects(f.receiver.receiveBatch(messages), code("BUSY"));
+    release.resolve(); await assert.rejects(operation, code(ending === "cancel" ? "CANCELLED" : "TIMEOUT"));
+    assert.equal(f.rows().length, 2); assert.equal((await f.order.head()).sequence, 2n);
+    f.confirmHook = null;
+    assert.ok((await f.receiver.receiveBatch(messages)).every(r => r.replayed)); assert.equal(f.confirms, 2);
+  } finally { release.resolve(); await Promise.allSettled([operation]); }
+});
+
+test("batch receiver: a single receive holds the same admission gate through confirmation", async t => {
+  const f = await batchSetup(t), started = pause(), release = pause();
+  f.confirmHook = async () => { started.resolve(); await release.promise; };
+  const operation = f.receiver.receive(message());
+  try {
+    await Promise.race([started.promise, operation]);
+    await assert.rejects(f.receiver.receiveBatch([message(2n)]), code("BUSY"));
+    release.resolve(); await operation;
+    f.confirmHook = null; await f.receiver.receiveBatch([message(2n)]);
+  } finally { release.resolve(); await Promise.allSettled([operation]); }
+});
+
+test("batch receiver: pre-cancellation and cancellation during held journal work do not advance order", async t => {
+  const f = await batchSetup(t), aborted = new AbortController(); aborted.abort();
+  await assert.rejects(f.receiver.receiveBatch([message()], { signal: aborted.signal }), code("CANCELLED"));
+  assert.equal(f.owner.events.length, 0);
+  const entered = pause(), release = pause(), controller = new AbortController();
+  let child;
+  f.applicationOptions.onRebase = tx => { child = tx.transaction(async inner => {
+    await inner.execute("INSERT INTO decisions VALUES('held',X'01')");
+  }); };
+  f.owner.beforeSql = async (kind, sql) => {
+    if (kind === "execute" && sql.includes("VALUES('held'")) { entered.resolve(); await release.promise; }
+  };
+  const operation = f.receiver.receiveBatch([message(), message(2n)], { signal: controller.signal });
+  let settled = false; void operation.then(() => { settled = true; }, () => { settled = true; });
+  try {
+    await Promise.race([entered.promise, operation.then(() => assert.fail("no held journal"))]);
+    controller.abort(); await tick(); assert.equal(settled, false);
+    await assert.rejects(f.receiver.receive(message()), code("BUSY"));
+    release.resolve(); await assert.rejects(operation, /cancel/i);
+    await Promise.allSettled([child]); noBatchCommit(f);
+    assert.deepEqual(f.rows(), []); assert.deepEqual(f.rows("SELECT * FROM decisions"), []);
+    assert.equal(f.calls.length, 1, "next message must not start while a child is pending");
+  } finally { release.resolve(); await Promise.allSettled([operation, child]); }
+});
+
+test("batch receiver: caught child settlement failure retains uncertainty and prevents confirmation", async t => {
+  const f = await batchSetup(t), boundary = new Error("uncertain child release");
+  f.owner.beforeRelease = depth => { if (depth === 1) throw boundary; };
+  f.applicationOptions.onRebase = async tx => {
+    await tx.transaction(child => child.execute("INSERT INTO decisions VALUES('failed',X'01')")).catch(() => {});
+  };
+  await assert.rejects(f.receiver.receiveBatch([message(), message(2n)]),
+    error => error.cleanupErrors?.length > 0);
+  assert.equal(f.calls.length, 1); noBatchCommit(f); assert.deepEqual(f.rows(), []);
+});
+
+test("batch receiver: malformed application results roll back the complete batch", async t => {
+  const f = await batchSetup(t), messages = [message(), message(2n)];
+  const lying = await createOrderedChangesetReceiver(f.order, {
+    confirmCommit: f.confirmCommit,
+    apply: async (target, msg, options) => {
+      if (msg.deliveryId === messages[0].deliveryId) return f.apply(target, msg, options);
+      // Both the returned SQL result and callback lie identically. The admitted
+      // message count, not agreement between those two objects, must reject it.
+      return target.transaction(async tx => {
+        await tx.execute("INSERT INTO notes VALUES(2,'unreported')");
+        return { applied: 0, omitted: 0, replayed: false };
+      });
+    },
+  });
+  await assert.rejects(lying.receiveBatch(messages), code("RECEIPT"));
+  noBatchCommit(f); assert.deepEqual(f.rows(), []);
+});
+
+test("batch receiver: premature late callback waits for admitted SQL then rolls back earlier messages", async t => {
+  const f = await batchSetup(t), started = pause(), release = pause();
+  let admitted;
+  const receiver = await createOrderedChangesetReceiver(f.order, {
+    confirmCommit: f.confirmCommit,
+    apply: async (target, msg, options) => {
+      if (msg.deliveryId === message().deliveryId) return f.apply(target, msg, options);
+      admitted = target.transaction(async tx => {
+        await tx.execute("INSERT INTO notes VALUES(2,'late')");
+        started.resolve(); await release.promise; return { applied: 1, omitted: 0, replayed: false };
+      });
+      return { applied: 1, omitted: 0, replayed: false };
+    },
+  });
+  const operation = receiver.receiveBatch([message(), message(2n)]);
+  let settled = false; void operation.then(() => { settled = true; }, () => { settled = true; });
+  try {
+    await Promise.race([started.promise, operation.then(() => assert.fail("no late work"))]);
+    await tick(); assert.equal(settled, false);
+    release.resolve(); await assert.rejects(operation, code("RECEIPT"));
+    noBatchCommit(f); assert.deepEqual(f.rows(), []);
+  } finally { release.resolve(); await Promise.allSettled([operation, admitted]); }
+});
+
+test("batch receiver: constructor captures local limits and policy before asynchronous opening", async t => {
+  const f = await batchSetup(t), messages = [message(), message(2n)], size = messages.reduce((n, m) => n + m.changeset.length, 0);
+  for (const bad of [{ maxBatchBytes: 0 }, { maxBatchBytes: 64 * 1024 * 1024 + 1 }, { batchForeignKeys: true }])
+    await assert.rejects(createOrderedChangesetReceiver(f.order, { apply: f.apply, confirmCommit: f.confirmCommit, ...bad }), code("INPUT"));
+  const config = { apply: f.apply, confirmCommit: f.confirmCommit, maxBatchBytes: size };
+  const pending = createOrderedChangesetReceiver(f.order, config);
+  config.maxBatchBytes = 1; config.batchForeignKeys = "invalid";
+  config.apply = config.confirmCommit = () => assert.fail("mutable config was retained");
+  const receiver = await pending;
+  assert.equal((await receiver.receiveBatch(messages)).length, 2);
+});

@@ -4,6 +4,8 @@ import type {
 } from "./changeset-delivery";
 import type { OutboxReadResult } from "./changeset-outbox";
 import { ChangesetOrder } from "./changeset-order";
+import type { ChangesetOrderResult } from "./changeset-order";
+import { inspectChangeset } from "./changeset-codec";
 
 export const CHANGESET_ORDER_PROTOCOL = "fsqlite-ordered-changeset-v1";
 const BASE_PROTOCOL: ChangesetEnvelope["protocol"] = "fsqlite-changeset-v1";
@@ -44,11 +46,27 @@ export interface OrderedChangesetReceiverOptions {
   confirmCommit: () => Promise<unknown>;
   /** Admission before copying; default 8 MiB, maximum 64 MiB. Ledger limits also apply. */
   maxMessageBytes?: number;
+  /** Total owned input per receiveBatch, checked before copying; default/max 64 MiB. */
+  maxBatchBytes?: number;
+  /**
+   * Trusted local policy, never read from incoming envelopes or call options.
+   * Defer across the entire batch so parents may arrive in later messages.
+   * The application callback must not independently defer each fragment.
+   * Does not change the single-message receive policy.
+   */
+  batchForeignKeys?: "defer";
 }
 export interface OrderedChangesetReceiver {
   readonly receiverId: string;
   readonly streamId: string;
   receive(message: unknown, options?: ChangesetDeliveryOptions): Promise<OrderedChangesetReceipt>;
+  /**
+   * Atomically apply 1..256 contiguous existing envelopes, then confirm ONCE.
+   * No receipt escapes until the entire barrier succeeds, including all-replay
+   * batches. A rejection after commit is uncertain delivery, not proof of rollback:
+   * retry the same identities/bytes. This is not a new HTTP or wire protocol.
+   */
+  receiveBatch(messages: readonly unknown[], options?: ChangesetDeliveryOptions): Promise<readonly OrderedChangesetReceipt[]>;
 }
 export class OrderedChangesetDeliveryError extends Error {
   constructor(
@@ -169,6 +187,65 @@ async function applyOnce(
   }
 }
 
+interface ReceivedMessage {
+  readonly message: ChangesetEnvelope;
+  readonly position: Readonly<ChangesetWireOrder>;
+  readonly changes: number;
+}
+
+/** Copy the entire bounded batch before hashing or invoking application code. */
+function captureBatch(
+  values: readonly unknown[], receiverId: string, streamId: string,
+  maximum: number, maximumBatch: number,
+): readonly ReceivedMessage[] {
+  if (!Array.isArray(values)) input("An array of 1..256 ordered envelopes is required");
+  const length = bounded(Object.getOwnPropertyDescriptor(values, "length")?.value, 256, 1);
+  const admitted: ReceivedMessage[] = [];
+  const ids = new Set<string>();
+  let bytes = 0, previous: bigint | undefined;
+  for (let i = 0; i < length; i++) {
+    // Do not invoke an element accessor or a caller-supplied iterator.
+    const element = Object.getOwnPropertyDescriptor(values, String(i));
+    if (element === undefined || !Object.hasOwn(element, "value"))
+      input("Batch envelopes must be own data properties");
+    const position = captureOrder(own(element.value, "order"));
+    const sequence = BigInt(position.sequence);
+    if (position.streamId !== streamId) input("Wrong source stream incarnation");
+    if (previous !== undefined && sequence !== previous + 1n)
+      input("Batch sequences must be contiguous and in source order");
+    const message = captureMessage(element.value, receiverId, Math.min(maximum, maximumBatch - bytes));
+    if (ids.has(message.deliveryId)) input("A batch must contain distinct delivery identities");
+    ids.add(message.deliveryId);
+    bytes += message.changeset.byteLength;
+    // Even a malformed last message must reject before the first application.
+    const changes = inspectChangeset(message.changeset).changeCount;
+    admitted.push(Object.freeze({ message, position, changes }));
+    previous = sequence;
+  }
+  return Object.freeze(admitted);
+}
+
+/** Build private receipts only after every identity and decision is checked. */
+function batchReceipts(
+  results: readonly ChangesetOrderResult[], admitted: readonly ReceivedMessage[],
+): readonly OrderedChangesetReceipt[] {
+  if (!Array.isArray(results) || results.length !== admitted.length)
+    mismatch("Ledger did not return the complete ordered batch");
+  return Object.freeze(admitted.map(({ message, position, changes }, index) => {
+    const result = results[index]!;
+    if (result.receiverId !== message.receiverId || result.sourceId !== position.streamId ||
+        result.sequence.toString() !== position.sequence || result.deliveryId !== message.deliveryId ||
+        result.sha256 !== message.sha256 || result.byteLength !== message.changeset.byteLength)
+      mismatch("Ledger did not confirm this exact batch member");
+    const counts = decisions(result);
+    if (counts.applied + counts.omitted !== changes)
+      mismatch("Ordered receipt decisions disagree with batch message count");
+    return Object.freeze({ protocol: BASE_PROTOCOL, receiverId: message.receiverId,
+      deliveryId: message.deliveryId, sha256: message.sha256, byteLength: result.byteLength,
+      ...counts, confirmed: true as const, order: position });
+  }));
+}
+
 /**
  * Open an already provisioned ledger; never enroll an incoming stream implicitly.
  * Application and ordering commit together. Confirmation happens only afterwards,
@@ -179,6 +256,10 @@ export async function createOrderedChangesetReceiver(
 ): Promise<OrderedChangesetReceiver> {
   const apply = options?.apply, confirm = options?.confirmCommit;
   const maximum = bounded(options?.maxMessageBytes ?? 8 * 1024 * 1024, HARD_BYTES, 1);
+  const maximumBatch = bounded(options?.maxBatchBytes ?? HARD_BYTES, HARD_BYTES, 1);
+  const batchForeignKeys = options?.batchForeignKeys;
+  if (batchForeignKeys !== undefined && batchForeignKeys !== "defer")
+    input("batchForeignKeys must be defer when supplied");
   if (!(order instanceof ChangesetOrder) || typeof apply !== "function" || typeof confirm !== "function") input("An initialized ledger, application callback and commit confirmation are required");
   const head = await order.head();
   const receiverId = identity(head.receiverId, 256), streamId = identity(head.sourceId, 256);
@@ -206,6 +287,42 @@ export async function createOrderedChangesetReceiver(
         time.check();
         return Object.freeze({ protocol: BASE_PROTOCOL, receiverId, deliveryId: message.deliveryId,
           sha256: message.sha256, byteLength, ...counts, confirmed: true, order: position });
+      } finally { active = false; }
+    },
+    receiveBatch: async (values: readonly unknown[], options: ChangesetDeliveryOptions = {}): Promise<readonly OrderedChangesetReceipt[]> => {
+      if (active) throw new OrderedChangesetDeliveryError("ERR_FSQLITE_ORDERED_BUSY", "This ordered receiver is already active");
+      active = true;
+      try {
+        const time = budget(options);
+        const admitted = captureBatch(values, receiverId, streamId, maximum, maximumBatch);
+        for (const { message } of admitted) { time.check(); await verifyHash(message); }
+        time.check();
+        const first = BigInt(admitted[0]!.position.sequence);
+        const results = await order.applyBatch(admitted.map(({ message, position }) => ({
+          sequence: BigInt(position.sequence), deliveryId: message.deliveryId,
+          sha256: message.sha256, changeset: message.changeset,
+        })), async (scoped, bytes, metadata) => {
+          // Replayed members skip application. Never use callback count as identity.
+          const entry = admitted[Number(metadata.sequence - first)];
+          if (entry === undefined || metadata.receiverId !== receiverId || metadata.sourceId !== streamId ||
+              metadata.deliveryId !== entry.message.deliveryId || metadata.sha256 !== entry.message.sha256 ||
+              metadata.byteLength !== entry.message.changeset.byteLength)
+            mismatch("Ledger selected a different batch member");
+          const result = await applyOnce(scoped, apply,
+            Object.freeze({ ...entry.message, changeset: bytes }), time.remaining());
+          if (result.applied + result.omitted !== entry.changes)
+            mismatch("Application decisions disagree with batch message count");
+          return result;
+        }, { ...time.remaining(), maxBatchBytes: maximumBatch,
+          ...(batchForeignKeys === undefined ? {} : { foreignKeys: batchForeignKeys }) });
+        time.check();
+        const receipts = batchReceipts(results, admitted);
+        // All fresh members share one committed transaction. Keep admission closed
+        // while this single barrier settles; do not race it against cancellation.
+        // Historical-only batches also require confirmation, exactly as receive().
+        await confirm();
+        time.check();
+        return receipts;
       } finally { active = false; }
     },
   });
