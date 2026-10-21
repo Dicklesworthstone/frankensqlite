@@ -1,5 +1,3 @@
-#![cfg_attr(target_arch = "x86_64", allow(internal_features))]
-#![cfg_attr(target_arch = "x86_64", feature(core_intrinsics))]
 // bd-h9o9r: this crate's engine futures are deliberately not `Send` — pager
 // state is driven on a current-thread runtime and several futures hold
 // std::sync mutex guards across awaits (each such site carries its own
@@ -12,6 +10,10 @@
 // large bodies. Converting them is pure whitespace churn in files under
 // active Phase-C reconstruction; new code should still prefer `async fn`.
 #![allow(clippy::manual_async_fn)]
+
+// Shared with B-tree without relaxing the engine crates' unsafe-code ban.
+#[doc(hidden)]
+pub use fsqlite_vfs::cache_hint::prefetch_l1_read;
 
 pub mod arc_cache;
 #[cfg(feature = "encryption")]

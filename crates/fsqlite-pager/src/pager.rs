@@ -4,8 +4,6 @@
 //! VFS-backed database file and a zero-copy [`ShardedPageCache`].
 //! Full concurrent MVCC behavior is layered on top in Phase 6.
 
-#[cfg(target_arch = "x86_64")]
-use core::intrinsics::prefetch_read_data;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -44,6 +42,7 @@ use crate::page_buf::{PageBuf, PageBufPool};
 use crate::page_cache::{
     PageCacheEvictionPolicy, PageCacheMetricsSnapshot, PageCachePageSnapshot, ShardedPageCache,
 };
+use crate::prefetch_l1_read;
 use crate::s3_fifo::S3FifoConfig;
 use crate::traits::{
     self, JournalMode, MvccPager, TransactionHandle, TransactionMode, WalBackend, WalFuture,
@@ -110,19 +109,6 @@ use fsqlite_wal::{
     parallel_wal_mode_name, parallel_wal_shadow_verdict_name, parallel_wal_should_shadow_compare,
     resolve_parallel_wal_control_surface_from_env,
 };
-#[cfg(target_arch = "x86_64")]
-#[inline]
-fn prefetch_l1_read<T>(ptr: *const T) {
-    if ptr.is_null() {
-        return;
-    }
-
-    prefetch_read_data::<T, 3>(ptr);
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-#[inline]
-fn prefetch_l1_read<T>(_ptr: *const T) {}
 
 #[inline]
 fn elapsed_profile_us(start: Option<Instant>) -> u64 {

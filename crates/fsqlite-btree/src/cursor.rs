@@ -27,7 +27,7 @@ use crate::overflow;
 use crate::traits::{BtreeCursorOps, SeekResult, sealed};
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_func::collation::CollationRegistry;
-use fsqlite_pager::TransactionHandle;
+use fsqlite_pager::{TransactionHandle, prefetch_l1_read};
 use fsqlite_types::cx::Cx;
 use fsqlite_types::limits::BTREE_MAX_DEPTH;
 use fsqlite_types::record::{
@@ -44,8 +44,6 @@ use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::future::Future;
-#[cfg(target_arch = "x86_64")]
-use std::intrinsics::prefetch_read_data;
 use std::ops::AsyncFnOnce;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -198,22 +196,6 @@ fn observe_cursor_cancellation(cx: &Cx) -> Result<()> {
     }
     Ok(())
 }
-
-#[cfg(target_arch = "x86_64")]
-#[inline]
-fn prefetch_l1_read(ptr: *const u8) {
-    if ptr.is_null() {
-        return;
-    }
-
-    // Locality=3 is the strongest temporal-locality hint, which matches the
-    // `_MM_HINT_T0` intent of pulling the line toward the L1 data cache.
-    prefetch_read_data::<u8, 3>(ptr);
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-#[inline]
-fn prefetch_l1_read(_ptr: *const u8) {}
 
 const TABLE_LEAF_INTERPOLATION_MAX_PROBES: usize = 3;
 

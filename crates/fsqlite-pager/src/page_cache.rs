@@ -25,8 +25,6 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 use std::sync::{Arc, OnceLock};
 
 use asupersync::sync::Notify;
-#[cfg(target_arch = "x86_64")]
-use core::intrinsics::prefetch_read_data;
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_observability::PageCacheEfficiencySnapshot;
@@ -37,22 +35,9 @@ use fsqlite_vfs::VfsFile;
 
 use crate::arc_cache::{ArcEvictionModel, CacheLookup};
 use crate::page_buf::{PageBuf, PageBufPool};
+use crate::prefetch_l1_read;
 use crate::s3_fifo::{QueueKind, S3Fifo, S3FifoConfig, S3FifoEvent};
 use crate::thompson_partitioner::ThompsonPartitioner;
-
-#[cfg(target_arch = "x86_64")]
-#[inline]
-fn prefetch_l1_read<T>(ptr: *const T) {
-    if ptr.is_null() {
-        return;
-    }
-
-    prefetch_read_data::<T, 3>(ptr);
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-#[inline]
-fn prefetch_l1_read<T>(_ptr: *const T) {}
 
 // ---------------------------------------------------------------------------
 // Page buffer pool sizing
@@ -9222,6 +9207,86 @@ mod tests {
             m.evictions, 1,
             "bead_id={BEAD_3WOP3_2} case=basic_evictions"
         );
+    }
+
+    #[test]
+    fn test_sharded_cache_prefetch_preserves_pages_and_metrics() {
+        for (case, fast_path, overflow) in [
+            ("fast_array", true, false),
+            ("flat_slots", false, false),
+            ("overflow_shard", false, true),
+        ] {
+            let mut cache = ShardedPageCache::with_max_buffers_and_shards(PageSize::DEFAULT, 4, 4);
+            if fast_path {
+                cache.enable_fast_path();
+            }
+            let resident = PageNumber::new(2).unwrap();
+            let missing = PageNumber::new(5).unwrap();
+
+            let assert_hint_preserves_state = |page_no| {
+                let metrics = cache.metrics_snapshot();
+                let pages = cache.page_snapshots();
+                let pool_state = (
+                    cache.pool().total_buffers(),
+                    cache.pool().available(),
+                    cache.pool().metrics_snapshot(),
+                );
+
+                cache.prefetch_page_hint(page_no);
+
+                assert_eq!(cache.metrics_snapshot(), metrics, "case={case}");
+                assert_eq!(cache.page_snapshots(), pages, "case={case}");
+                assert_eq!(
+                    (
+                        cache.pool().total_buffers(),
+                        cache.pool().available(),
+                        cache.pool().metrics_snapshot(),
+                    ),
+                    pool_state,
+                    "prefetch must not allocate or acquire a page buffer: case={case}"
+                );
+            };
+
+            // An absent page hint must not create a page or count as a miss.
+            assert_hint_preserves_state(resident);
+            assert!(cache.is_empty(), "case={case}");
+
+            if overflow {
+                // Place the fixture in the overflow tier explicitly so this
+                // test covers its resident-byte hint without depending on a
+                // particular hash-table capacity or collision distribution.
+                let mut buf = cache.pool().acquire().unwrap();
+                buf.as_mut_slice().fill(0x5A);
+                let shard_idx = cache.shard_index(resident);
+                assert!(
+                    cache.shards[shard_idx]
+                        .lock()
+                        .insert_with_dirty_state(resident, buf, true)
+                );
+                cache.shards_dirty.store(true, Ordering::Release);
+                assert!(!cache.flat_slots.contains(resident));
+            } else {
+                cache.insert_fresh(resident, |data| data.fill(0x5A)).unwrap();
+                if !fast_path {
+                    assert!(cache.flat_slots.contains(resident));
+                }
+            }
+
+            // Hints must leave dirtiness, access counts, and eviction state
+            // alone for both resident and missing pages.
+            assert_hint_preserves_state(resident);
+            assert_hint_preserves_state(missing);
+            assert_eq!(
+                cache.get_copy(resident).unwrap(),
+                vec![0x5A; PageSize::DEFAULT.as_usize()],
+                "case={case}"
+            );
+            assert!(!cache.contains(missing), "case={case}");
+
+            assert!(cache.evict(resident), "case={case}");
+            assert_hint_preserves_state(resident);
+            assert!(cache.is_empty(), "case={case}");
+        }
     }
 
     #[test]

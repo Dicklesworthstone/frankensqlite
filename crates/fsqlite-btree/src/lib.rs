@@ -1,6 +1,3 @@
-#![cfg_attr(target_arch = "x86_64", allow(internal_features))]
-#![cfg_attr(target_arch = "x86_64", feature(core_intrinsics))]
-
 use std::cmp::Ordering;
 
 pub mod balance;

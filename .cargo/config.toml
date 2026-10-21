@@ -27,5 +27,5 @@ LIBSQLITE3_FLAGS = "-DSQLITE_ENABLE_MATH_FUNCTIONS"
 # helper stack (see `recursive-trigger-depth-limit` in fsqlite-core).
 RUST_MIN_STACK = "8388608"
 
-[build]
-rustflags = ["-Z", "threads=4"]
+# Keep nightly compiler tuning opt-in so `cargo +stable` works from a checkout.
+# With the pinned nightly, use `RUSTFLAGS="-Z threads=4" cargo check` as needed.
