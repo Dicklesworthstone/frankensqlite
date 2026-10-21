@@ -53,4 +53,15 @@ exclude_patterns = [
     "target/",
     "target_*/",
     "tests/artifacts/",
+    # This list replaces RCH's defaults, so restate the ones that keep local
+    # agent state and credentials (the gitignored .env) off remote workers.
+    ".ntm/",
+    ".beads-recovery/",
+    ".env",
+    ".env.*",
+    "credentials.json",
+    "secrets.json",
+    "secrets.yaml",
+    ".cargo/credentials",
+    ".cargo/credentials.toml",
 ]
