@@ -276,3 +276,364 @@ test("unawaited rejected application work aborts instead of escaping past COMMIT
   assert.deepEqual(target.rows(), []);
   target.close();
 });
+
+// Real owned savepoints through the ordered ledger, application and rebase hook.
+// Fault hooks hold/reenter operations; query results always come from SQLite.
+import { applyChangeset, applyPatchset, CHANGESET_RECEIPTS_TABLE } from "../src/changeset-apply.ts";
+import { encodeChangeset, decodeRebaseInfo } from "../src/changeset-codec.ts";
+import { FrankenSQLiteError } from "../src/errors.ts";
+const ownSchema = "CREATE TABLE IF NOT EXISTS t(id INTEGER PRIMARY KEY,v TEXT UNIQUE);" +
+  "CREATE TABLE IF NOT EXISTS decisions(id INTEGER PRIMARY KEY,info BLOB)";
+const pause = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
+const tick = () => new Promise(resolve => setImmediate(resolve));
+const success = { applied: 1, omitted: 0, replayed: false };
+const sqlRows = (db, sql = "SELECT * FROM t ORDER BY id") => {
+  const stmt = db.prepare(sql); stmt.setReadBigInts(true); stmt.setReturnArrays(true); return stmt.all();
+};
+class OrderedOwner {
+  constructor(ddl = ownSchema, path = ":memory:") {
+    this.db = new DatabaseSync(path);
+    this.db.exec("PRAGMA foreign_keys=ON; PRAGMA recursive_triggers=ON;" + ddl);
+    this.depth = 0; this.serial = 0; this.events = []; this.capable = true;
+    this.beforeSql = null; this.beforeRelease = null; this.beforeRollback = null;
+    this.afterRollback = null; this.afterCommit = null;
+  }
+  async transaction(work) {
+    const depth = this.depth++, name = `order_owned_${++this.serial}`;
+    this.db.exec(depth ? `SAVEPOINT ${name}` : "BEGIN");
+    this.events.push(["begin", depth]);
+    let active = true, released = false;
+    const check = () => assert.ok(active, "expired native owner");
+    const tx = {
+      execute: async (sql, params = []) => {
+        check(); this.events.push(["execute", depth, sql]);
+        await this.beforeSql?.("execute", sql, depth);
+        try { return Number(this.db.prepare(sql).run(...params).changes); }
+        catch (error) {
+          if (error.code === "ERR_SQLITE_ERROR" && (error.errcode & 255) === 19)
+            throw new FrankenSQLiteError({ code: "SQLITE_CONSTRAINT", sqliteCode: 19,
+              extendedCode: error.errcode, message: error.message });
+          throw error;
+        }
+      },
+      query: async (sql, params = []) => {
+        check(); this.events.push(["query", depth, sql]);
+        await this.beforeSql?.("query", sql, depth);
+        const stmt = this.db.prepare(sql); stmt.setReadBigInts(true); stmt.setReturnArrays(true);
+        return { rowArrays: stmt.all(...params) };
+      },
+    };
+    if (this.capable) tx.transaction = child => { check(); return this.transaction(child); };
+    try {
+      const result = await work(tx); active = false;
+      await this.beforeRelease?.(depth);
+      this.db.exec(depth ? `RELEASE ${name}` : "COMMIT"); released = true;
+      this.events.push(["release", depth]);
+      if (!depth) await this.afterCommit?.();
+      return result;
+    } catch (error) {
+      active = false;
+      if (released) throw error; // A lost commit response must not become rollback.
+      try {
+        await this.beforeRollback?.(depth, error);
+        this.db.exec(depth ? `ROLLBACK TO ${name}; RELEASE ${name}` : "ROLLBACK");
+        this.events.push(["rollback", depth]);
+        await this.afterRollback?.(depth, error);
+      } catch (cleanup) {
+        throw new AggregateError([error, cleanup], "unconfirmed ordered cleanup", { cause: error });
+      }
+      throw error;
+    } finally { active = false; this.depth--; }
+  }
+  rows(sql) { return sqlRows(this.db, sql); }
+  close() { this.db.close(); }
+}
+async function ownedSetup(t, ddl = ownSchema) {
+  const owner = new OrderedOwner(ddl); t.after(() => owner.close());
+  const order = new ChangesetOrder(owner, opts); await order.initialize();
+  owner.events.length = 0;
+  return { owner, order };
+}
+function nativeWire(ddl, statements, compact = false) {
+  const db = new DatabaseSync(":memory:"); db.exec(ddl);
+  const session = db.createSession();
+  try { db.exec(statements); return compact ? session.patchset() : session.changeset(); }
+  finally { session.close(); db.close(); }
+}
+const wireMessage = (changeset, sequence = 1n) => ({ sequence,
+  deliveryId: `owned/${sequence}`, sha256: HASH(changeset), changeset });
+const remote = () => encodeChangeset([{ name: "t", primaryKey: [1, 0], changes: [
+  { operation: "insert", indirect: false, new: [1n, "remote"] },
+  { operation: "insert", indirect: false, new: [2n, "new"] },
+] }]);
+function noInbox(owner) {
+  if (owner.rows(`SELECT name FROM sqlite_schema WHERE name='${CHANGESET_RECEIPTS_TABLE}'`).length)
+    assert.deepEqual(owner.rows(`SELECT * FROM "${CHANGESET_RECEIPTS_TABLE}"`), []);
+}
+function atGenesis(owner) {
+  assert.deepEqual(owner.rows(`SELECT seq FROM ${T}`), [[0n]]);
+  noInbox(owner); assert.equal(owner.depth, 0);
+}
+
+for (const compact of [false, true]) test(`ordered ${compact ? "patchset" : "changeset"}: isolate constraints in the same ledger transaction`, async t => {
+  const ddl = "CREATE TABLE t(id INTEGER PRIMARY KEY,v TEXT NOT NULL UNIQUE CHECK(v!='bad'))";
+  const { owner, order } = await ownedSetup(t, ddl);
+  owner.db.exec("INSERT INTO t VALUES(9,'taken')");
+  const bytes = nativeWire(ddl, "INSERT INTO t VALUES(1,'first'),(2,'taken'),(3,'last')", compact);
+  const msg = wireMessage(bytes), apply = compact ? applyPatchset : applyChangeset;
+  let calls = 0;
+  const result = await order.apply(msg, (target, wire) => apply(target, wire, {
+    tables: ["t"], deliveryId: msg.deliveryId, constraintConflicts: "isolate",
+    onConflict: conflict => {
+      calls++; assert.equal(conflict.kind, "constraint");
+      assert.equal(conflict.error.extendedCode, 2067);
+      assert.deepEqual(owner.events.at(-1), ["rollback", 1]); return "omit";
+    },
+  }));
+  assert.equal(result.applied, 2); assert.equal(result.omitted, 1); assert.equal(calls, 1);
+  assert.equal(owner.events.filter(([kind, depth]) => kind === "begin" && depth === 0).length, 1);
+  assert.equal(owner.events.filter(([kind, depth]) => kind === "begin" && depth === 1).length, 3);
+  const oracle = new DatabaseSync(":memory:");
+  try {
+    oracle.exec(ddl + ";INSERT INTO t VALUES(9,'taken')");
+    assert.equal(oracle.applyChangeset(bytes, { onConflict: () => 0 }), true);
+    assert.deepEqual(owner.rows(), sqlRows(oracle));
+  } finally { oracle.close(); }
+  assert.equal((await order.apply(msg, () => assert.fail("ordered replay applied rows"))).replayed, true);
+  assert.equal(calls, 1); assert.equal((await order.head()).sequence, 1n);
+});
+
+for (const defer of [false, true]) test(`ordered rebase hook${defer ? " with deferred FKs" : ""}: nested decisions and exact replay`, async t => {
+  const { owner, order } = await ownedSetup(t);
+  owner.db.exec("INSERT INTO t VALUES(1,'local')");
+  const msg = wireMessage(remote()), rejected = new Error("discard optional journal path");
+  let oldTarget, oldParent, oldChild, info, calls = 0;
+  const result = await order.apply(msg, (target, bytes) => {
+    oldTarget = target;
+    return applyChangeset(target, bytes, { tables: ["t"], deliveryId: msg.deliveryId,
+      ...(defer ? { foreignKeys: "defer" } : {}), onConflict: () => "replace",
+      onRebase: async (tx, decisions) => {
+        calls++; oldParent = tx; info = new Uint8Array(decisions);
+        await assert.rejects(tx.transaction(async child => {
+          await child.execute("INSERT INTO decisions VALUES(99,?)", [decisions]); throw rejected;
+        }), error => error === rejected);
+        assert.equal(await tx.transaction(async child => {
+          oldChild = child;
+          await child.transaction(last => last.execute("INSERT INTO decisions VALUES(1,?)", [decisions]));
+          return 42;
+        }), 42);
+      },
+    });
+  });
+  assert.deepEqual(owner.rows(), [[1n, "remote"], [2n, "new"]]);
+  assert.deepEqual(owner.rows("SELECT id FROM decisions"), [[1n]]);
+  assert.deepEqual(new Uint8Array(owner.rows("SELECT info FROM decisions")[0][0]), info);
+  assert.equal(decodeRebaseInfo(info)[0].changes[0].replace, true);
+  assert.equal(result.applied, 2); assert.equal(result.sequence, 1n);
+  const replay = await order.apply(msg, () => assert.fail("replayed journal"));
+  assert.equal(replay.replayed, true); assert.equal(calls, 1);
+  const before = owner.events.length;
+  await assert.rejects(oldTarget.transaction(async () => 1), code("INPUT"));
+  for (const old of [oldParent, oldChild]) {
+    await assert.rejects(old.query("SELECT 1"), /scope has ended/);
+    await assert.rejects(old.transaction(async () => 1), /scope has ended/);
+  }
+  assert.equal(owner.events.length, before);
+});
+
+test("ordered isolation allows later FK parents but atomically rejects unresolved references", async t => {
+  const ddl = "CREATE TABLE p(id INTEGER PRIMARY KEY);" +
+    "CREATE TABLE t(id INTEGER PRIMARY KEY,pid REFERENCES p(id),v TEXT UNIQUE);" +
+    "CREATE TABLE decisions(id INTEGER PRIMARY KEY,info BLOB)";
+  const { owner, order } = await ownedSetup(t, ddl);
+  owner.db.exec("INSERT INTO p VALUES(9); INSERT INTO t VALUES(9,9,'taken')");
+  const build = includeParent => encodeChangeset([
+    { name: "t", primaryKey: [1,0,0], changes: [
+      { operation: "insert", indirect: false, new: [1n,1n,"kept"] },
+      { operation: "insert", indirect: false, new: [2n,1n,"taken"] },
+    ] },
+    ...(includeParent ? [{ name: "p", primaryKey: [1], changes: [
+      { operation: "insert", indirect: false, new: [1n] },
+    ] }] : []),
+  ]);
+  const settings = { tables: ["t","p"], deliveryId: "ordered-fk-batch",
+    foreignKeys: "defer", constraintConflicts: "isolate",
+    onConflict: c => { assert.equal(c.kind,"constraint"); return "omit"; },
+    onRebase: (tx, info) => tx.transaction(child => child.execute("INSERT INTO decisions VALUES(1,?)", [info])),
+  };
+  await assert.rejects(order.apply(wireMessage(build(false)), (target, bytes) =>
+    applyChangeset(target, bytes, settings)), /foreign|violation/i);
+  atGenesis(owner); assert.deepEqual(owner.rows(), [[9n,9n,"taken"]]);
+  assert.deepEqual(owner.rows("SELECT * FROM decisions"), []);
+  const result = await order.apply(wireMessage(build(true)), (target, bytes) => applyChangeset(target, bytes, settings));
+  assert.equal(result.applied, 2); assert.equal(result.omitted, 1);
+  assert.deepEqual(owner.rows(), [[1n,1n,"kept"],[9n,9n,"taken"]]);
+  assert.deepEqual(owner.rows("PRAGMA foreign_key_check"), []);
+  assert.deepEqual(owner.rows("PRAGMA defer_foreign_keys"), [[0n]]);
+  assert.deepEqual(owner.rows("SELECT id FROM decisions"), [[1n]]);
+  assert.deepEqual(owner.rows(`SELECT applied,omitted FROM "${CHANGESET_RECEIPTS_TABLE}"`), [[2n,1n]]);
+  assert.equal((await order.apply(wireMessage(build(true)), () => assert.fail("replayed composite batch"))).replayed, true);
+});
+
+for (const ending of ["commit", "throw", "cancel"]) test(`ordered ${ending}: drain dropped descendant before ledger publication`, async t => {
+  const { owner, order } = await ownedSetup(t), entered = pause(), release = pause(), abort = new AbortController();
+  let alias, child, write, operation, done = false;
+  const sql = "INSERT INTO t VALUES(1,'held')";
+  owner.beforeSql = async (kind, text) => {
+    if (kind === "execute" && text === sql) { entered.resolve(); await release.promise; }
+  };
+  operation = order.apply(message(), async target => {
+    alias = target.transaction(async tx => {
+      child = tx.transaction(async inner => { write = inner.execute(sql); });
+    });
+    if (ending === "throw") throw new Error("application failed separately");
+    return success;
+  }, { signal: abort.signal });
+  void operation.then(() => { done = true; }, () => { done = true; });
+  try {
+    await Promise.race([entered.promise, operation.then(() => assert.fail("no held descendant"))]);
+    if (ending === "cancel") abort.abort("cancel ordered delivery");
+    await tick(); assert.equal(done, false); assert.equal(owner.depth, 2);
+    assert.deepEqual(owner.rows(`SELECT seq FROM ${T}`), [[0n]]);
+    release.resolve();
+    if (ending === "commit") {
+      await operation; assert.deepEqual(owner.rows(), [[1n,"held"]]);
+      assert.equal((await order.head()).sequence, 1n);
+    } else {
+      await assert.rejects(operation); assert.deepEqual(owner.rows(), []); atGenesis(owner);
+    }
+    await Promise.allSettled([alias, child, write]);
+  } finally { release.resolve(); await Promise.allSettled([operation, alias, child, write]); }
+});
+
+for (const boundary of ["release", "rollback"]) test(`ordered caught ${boundary} uncertainty blocks hooks and sequence advancement`, async t => {
+  const { owner, order } = await ownedSetup(t), failure = new Error(`${boundary} not confirmed`);
+  let blocked = 0;
+  if (boundary === "release") owner.beforeRelease = depth => { if (depth === 2) throw failure; };
+  else owner.afterRollback = depth => { if (depth === 2) throw failure; };
+  await assert.rejects(order.apply(message(), target => target.transaction(async tx => {
+    await tx.transaction(async parent => {
+      await parent.transaction(async child => {
+        await child.execute("INSERT INTO t VALUES(2,'uncertain')");
+        if (boundary === "rollback") throw new Error("rollback request");
+      }).catch(() => {});
+      const before = owner.events.length;
+      for (const attempt of [() => parent.execute("INSERT INTO t VALUES(3,'bad')"),
+        () => parent.query("SELECT 1"), () => parent.transaction(async () => { blocked++; })])
+        await assert.rejects(attempt(), code("STATE"));
+      assert.equal(owner.events.length, before);
+    }).catch(() => {});
+    await assert.rejects(tx.execute("INSERT INTO t VALUES(4,'bad')"), code("STATE"));
+    return success;
+  })), code("STATE"));
+  assert.equal(blocked,0); assert.deepEqual(owner.rows(), []); atGenesis(owner);
+  owner.beforeRelease = null; owner.afterRollback = null;
+  await order.apply(message(), target => target.transaction(async tx => {
+    await tx.execute("INSERT INTO t VALUES(1,'retry')"); return success;
+  }));
+  assert.deepEqual(owner.rows(), [[1n,"retry"]]);
+});
+
+test("ordered callback failure retains independently failed child settlement", async t => {
+  const { owner, order } = await ownedSetup(t);
+  const callback = new Error("outer callback"), cleanup = new Error("child release failed");
+  owner.beforeRelease = depth => { if (depth === 1) throw cleanup; };
+  let alias;
+  await assert.rejects(order.apply(message(), async target => {
+    alias = target.transaction(tx => tx.transaction(async child => {
+      await child.execute("INSERT INTO t VALUES(1,'discarded')");
+    }));
+    throw callback;
+  }), error => {
+    assert.equal(error.code,"ERR_FSQLITE_ORDER_STATE"); assert.equal(error.cause,callback);
+    assert.equal(error.cleanupErrors.length,1);
+    assert.equal(error.cleanupErrors[0].cleanupErrors[0],cleanup); return true;
+  });
+  await Promise.allSettled([alias]); assert.deepEqual(owner.rows(), []); atGenesis(owner);
+});
+
+test("ordered logical application aliases are not independent rollback boundaries", async t => {
+  const { owner, order } = await ownedSetup(t), reason = new Error("logical callback failed");
+  let calls = 0;
+  await assert.rejects(order.apply(message(), async target => {
+    await target.transaction(async tx => {
+      await tx.execute("INSERT INTO t VALUES(1,'provisional')"); throw reason;
+    }).catch(() => {});
+    await assert.rejects(target.transaction(async tx => {
+      calls++; await tx.execute("INSERT INTO t VALUES(2,'must not enter')");
+    }), error => error === reason);
+    return success;
+  }), error => error === reason);
+  assert.equal(calls,0); assert.deepEqual(owner.rows(),[]); atGenesis(owner);
+});
+
+for (const method of ["execute", "query"]) test(`ordered ${method}: synchronous reentry cannot open a second application alias`, async t => {
+  const { owner, order } = await ownedSetup(t);
+  let refused, calls = 0;
+  const sql = "INSERT INTO t VALUES(1,'parent')" + (method === "query" ? " RETURNING id" : "");
+  await order.apply(message(), target => target.transaction(async tx => {
+    owner.beforeSql = (kind,text) => {
+      if (kind !== method || text !== sql) return;
+      owner.beforeSql = null;
+      refused = target.transaction(async () => { calls++; });
+      void refused.catch(() => {});
+    };
+    await tx[method](sql); await assert.rejects(refused,code("BUSY")); return success;
+  }));
+  assert.equal(calls,0); assert.deepEqual(owner.rows(),[[1n,"parent"]]);
+  assert.equal(owner.events.filter(([kind]) => kind === "begin").length,1);
+});
+
+test("ordered savepoint ownership rejects parent and alias writes inside a live child", async t => {
+  const { owner, order } = await ownedSetup(t), entered = pause(), release = pause();
+  let alias, child, operation, calls=0;
+  operation = order.apply(message(), async target => {
+    alias = target.transaction(async tx => {
+      child = tx.transaction(async inner => {
+        entered.resolve(); await release.promise; await inner.execute("INSERT INTO t VALUES(1,'child')");
+      });
+      await entered.promise;
+      await assert.rejects(tx.query("SELECT 1"),code("BUSY"));
+      await assert.rejects(tx.transaction(async () => { calls++; }),code("BUSY"));
+      await child; return success;
+    });
+    await Promise.race([entered.promise, alias.then(() => assert.fail("child did not start"))]);
+    await assert.rejects(target.transaction(async () => { calls++; }),code("BUSY"));
+    release.resolve(); return alias;
+  });
+  try { await operation; assert.equal(calls,0); assert.deepEqual(owner.rows(),[[1n,"child"]]); }
+  finally { release.resolve(); await Promise.allSettled([operation,alias,child]); }
+});
+
+test("ordered lost response and WAL reopen replay rows, decisions and sequence together", async () => {
+  const path = join(mkdtempSync(join(tmpdir(),"fsqlite-order-owned-")),"receiver.db");
+  let owner = new OrderedOwner(ownSchema,path), order = new ChangesetOrder(owner,opts), calls=0;
+  const msg=wireMessage(remote());
+  try {
+    owner.db.exec("PRAGMA journal_mode=WAL"); await order.initialize();
+    owner.afterCommit=()=>{throw new Error("lost committed response");};
+    await assert.rejects(order.apply(msg,(target,bytes)=>applyChangeset(target,bytes,{
+      tables:["t"],deliveryId:msg.deliveryId,onRebase:async(tx,info)=>{
+        calls++; await tx.transaction(child=>child.execute("INSERT INTO decisions VALUES(1,?)",[info]));
+      },
+    })),/lost committed response/);
+    owner.close(); owner = new OrderedOwner(ownSchema,path); order = new ChangesetOrder(owner,opts);
+    const replay=await order.apply(msg,()=>assert.fail("replayed callback"));
+    assert.equal(replay.replayed,true);assert.equal(replay.sequence,1n);assert.equal(calls,1);
+    assert.deepEqual(owner.rows(),[[1n,"remote"],[2n,"new"]]);
+    assert.deepEqual(owner.rows("SELECT id FROM decisions"),[[1n]]);
+    assert.deepEqual(owner.rows(`SELECT applied FROM "${CHANGESET_RECEIPTS_TABLE}"`),[[2n]]);
+  } finally { owner.close(); }
+});
+
+test("ordered targets without child capability retain default application but cannot claim isolation", async t => {
+  const { owner, order }=await ownedSetup(t);owner.capable=false;
+  const msg=wireMessage(remote());
+  await assert.rejects(order.apply(msg,(target,bytes)=>applyChangeset(target,bytes,{
+    tables:["t"],constraintConflicts:"isolate",
+  })),{code:"ERR_FSQLITE_CHANGESET_INPUT"});
+  atGenesis(owner);
+  await order.apply(msg,(target,bytes)=>applyChangeset(target,bytes,{tables:["t"]}));
+  assert.deepEqual(owner.rows(),[[1n,"remote"],[2n,"new"]]);
+  assert.equal(owner.events.some(([kind,depth])=>kind==="begin"&&depth>0),false);
+});

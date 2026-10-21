@@ -1,4 +1,6 @@
 import type { ApplyChangesetResult, ChangesetExecutor, ChangesetTarget } from "./changeset-apply";
+import { runChangesetScope } from "./changeset-scope";
+import type { ChangesetScopeErrors } from "./changeset-scope";
 
 export const CHANGESET_ORDER_TABLE = "__fsqlite_changeset_order";
 export const CHANGESET_ORDER_HEAD_TABLE = "__fsqlite_changeset_order_head";
@@ -61,10 +63,14 @@ export class ChangesetOrderError extends Error {
       "ERR_FSQLITE_ORDER_BINDING" | "ERR_FSQLITE_ORDER_GAP" |
       "ERR_FSQLITE_ORDER_REUSE" | "ERR_FSQLITE_ORDER_FULL" |
       "ERR_FSQLITE_ORDER_BUSY" | "ERR_FSQLITE_ORDER_CANCELLED" |
-      "ERR_FSQLITE_ORDER_TIMEOUT" | "ERR_FSQLITE_ORDER_EXPIRED",
+      "ERR_FSQLITE_ORDER_TIMEOUT" | "ERR_FSQLITE_ORDER_EXPIRED" |
+      "ERR_FSQLITE_ORDER_STATE",
     message: string,
+    options?: ErrorOptions,
+    /** Retained settlement failures; never infer rollback from this rejection. */
+    readonly cleanupErrors: readonly unknown[] = [],
   ) {
-    super(message);
+    super(message, options);
     this.name = "ChangesetOrderError";
   }
 }
@@ -421,64 +427,76 @@ async function requireInstalledBootstrap(tx: ChangesetExecutor, head: Stored): P
   return row[1] as string;
 }
 
-/** Drain admitted child scopes/SQL even when the application forgets to await. */
+const orderScopeErrors: ChangesetScopeErrors = Object.freeze({
+  closed: () => new ChangesetOrderError(
+    "ERR_FSQLITE_ORDER_INPUT", "Ordered SQL scope has ended"),
+  invalidChild: () => new ChangesetOrderError(
+    "ERR_FSQLITE_ORDER_INPUT", "A child transaction callback is required"),
+  busy: () => new ChangesetOrderError(
+    "ERR_FSQLITE_ORDER_BUSY", "Settle parent work first; a child transaction owns this SQL scope"),
+  uncertain: (cause: unknown, cleanupErrors: readonly unknown[]) => new ChangesetOrderError(
+    "ERR_FSQLITE_ORDER_STATE", "Ordered application settlement failed; reconcile the transaction owner",
+    { cause }, cleanupErrors),
+});
+
+/**
+ * Bind application callbacks to the ledger's existing transaction. A target
+ * transaction here is a logical scope, not an independent rollback boundary;
+ * every admitted failure remains fatal to this delivery. Only executor-owned
+ * child savepoints can provide a handled, confirmed rollback.
+ */
 async function applyScoped(
   tx: ChangesetExecutor,
   apply: OrderedChangesetApply,
   bytes: Uint8Array,
   checkpoint: () => void,
 ): Promise<ApplyChangesetResult> {
-  let accepting = true;
-  const children = new Set<Promise<unknown>>(), errors: unknown[] = [];
-  function track<T>(pending: Set<Promise<unknown>>, failures: unknown[], operation: Promise<T>): Promise<T> {
-    pending.add(operation);
-    void operation.then(() => pending.delete(operation), error => {
-      failures.push(error);
-      pending.delete(operation);
-    });
-    return operation;
-  }
-  const scoped: ChangesetTarget = {
+  let accepting = true, active = false, failed = false;
+  let firstFailure: unknown;
+  const pending = new Set<Promise<unknown>>();
+  const scoped: ChangesetTarget = Object.freeze({
     transaction: <T>(work: (executor: ChangesetExecutor) => Promise<T>, options: ChangesetOrderOperationOptions = {}): Promise<T> => {
       if (!accepting) return Promise.reject(new ChangesetOrderError("ERR_FSQLITE_ORDER_INPUT", "Ordered application scope has ended"));
-      return track(children, errors, (async () => {
+      if (failed) return Promise.reject(firstFailure);
+      if (active) return Promise.reject(orderScopeErrors.busy());
+      if (typeof work !== "function") return Promise.reject(orderScopeErrors.invalidChild());
+      // Independent aliases must not share a live child savepoint. Reserve
+      // BEFORE calling budget getters or the owner, including synchronous
+      // adapter reentry. Refused work is not queued and cannot poison its peer.
+      active = true;
+      const task = (async () => {
         const child = budget(options);
-        let open = true;
-        const pending = new Set<Promise<unknown>>(), failures: unknown[] = [];
-        const submit = <U>(operation: () => Promise<U>): Promise<U> => {
-          if (!open) return Promise.reject(new ChangesetOrderError("ERR_FSQLITE_ORDER_INPUT", "Ordered SQL scope has ended"));
-          return track(pending, failures, (async () => {
-            checkpoint(); child.checkpoint();
-            const result = await operation();
-            checkpoint(); child.checkpoint();
-            return result;
-          })());
-        };
-        const executor: ChangesetExecutor = {
-          execute: (sql, params) => submit(() => tx.execute(sql, params)),
-          query: (sql, params) => submit(() => tx.query(sql, params)),
-        };
-        let value: T;
-        try {
-          checkpoint(); child.checkpoint();
-          value = await work(executor);
-        } finally {
-          open = false;
-          await Promise.allSettled(pending);
-        }
-        if (failures.length) throw failures[0];
-        checkpoint(); child.checkpoint();
-        return value;
-      })());
+        const check = (): void => { checkpoint(); child.checkpoint(); };
+        check();
+        // Preserve optional real savepoints without adding an outer boundary.
+        // The shared owner joins descendants and fences uncertain cleanup.
+        return runChangesetScope(tx, work, check, orderScopeErrors);
+      })();
+      pending.add(task);
+      const settle = (): void => { pending.delete(task); active = false; };
+      void task.then(settle, error => {
+        settle();
+        if (!failed) { failed = true; firstFailure = error; }
+      });
+      return task;
     },
-  };
-  let result: ApplyChangesetResult;
+  });
+  let result!: ApplyChangesetResult;
+  let callbackFailed = false, callbackError: unknown;
   try { result = await apply(scoped, bytes); }
+  catch (error: unknown) { callbackFailed = true; callbackError = error; }
   finally {
     accepting = false;
-    await Promise.allSettled(children);
+    // Includes held RELEASE/ROLLBACK and unawaited descendant SQL. The order
+    // receipt must not advance before the underlying owner settles all work.
+    await Promise.allSettled(pending);
   }
-  if (errors.length) throw errors[0];
+  if (callbackFailed) {
+    if (failed && !Object.is(callbackError, firstFailure))
+      throw orderScopeErrors.uncertain(callbackError, Object.freeze([firstFailure]));
+    throw callbackError;
+  }
+  if (failed) throw firstFailure;
   checkpoint();
   return result;
 }
