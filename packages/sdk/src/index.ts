@@ -267,10 +267,12 @@ export type { WorkerLike } from "./worker-client";
 export type {
   ChangesetOrderOptions,
   ChangesetOrderOperationOptions,
+  ChangesetOrderBatchOptions,
   OrderedChangeset,
   ChangesetOrderHead,
   ChangesetOrderResult,
   OrderedChangesetApply,
+  OrderedChangesetBatchApply,
 } from "./changeset-order";
 export { ChangesetOrder, ChangesetOrderError, CHANGESET_ORDER_TABLE, CHANGESET_ORDER_HEAD_TABLE } from "./changeset-order";
 export type {

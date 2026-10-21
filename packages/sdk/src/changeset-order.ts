@@ -1,6 +1,7 @@
 import type { ApplyChangesetResult, ChangesetExecutor, ChangesetTarget } from "./changeset-apply";
 import { runChangesetScope } from "./changeset-scope";
 import type { ChangesetScopeErrors } from "./changeset-scope";
+import { withDeferredForeignKeys } from "./changeset-foreign-keys";
 
 export const CHANGESET_ORDER_TABLE = "__fsqlite_changeset_order";
 export const CHANGESET_ORDER_HEAD_TABLE = "__fsqlite_changeset_order_head";
@@ -35,6 +36,12 @@ export interface ChangesetOrderOperationOptions {
   signal?: AbortSignal;
   timeoutMs?: number;
 }
+export interface ChangesetOrderBatchOptions extends ChangesetOrderOperationOptions {
+  /** Total copied input bytes, checked before copying; default/max 64 MiB. */
+  maxBatchBytes?: number;
+  /** Defer foreign keys across the WHOLE batch, not its individual messages. */
+  foreignKeys?: "defer";
+}
 export interface OrderedChangeset {
   /** Contiguous source-outbox sequence, starting at one; never renumber retries. */
   readonly sequence: bigint;
@@ -56,6 +63,19 @@ export type OrderedChangesetApply = (
   target: ChangesetTarget,
   bytes: Uint8Array,
 ) => Promise<ApplyChangesetResult>;
+/** Called only for fresh messages; use this captured identity for inbox/journal work. */
+export type OrderedChangesetBatchApply = (
+  target: ChangesetTarget,
+  bytes: Uint8Array,
+  message: ChangesetOrderHead,
+) => Promise<ApplyChangesetResult>;
+interface AdmittedMessage {
+  readonly sequence: bigint;
+  readonly deliveryId: string;
+  readonly sha256: string;
+  readonly byteLength: number;
+  readonly bytes: Uint8Array;
+}
 export class ChangesetOrderError extends Error {
   constructor(
     readonly code: "ERR_FSQLITE_ORDER_INPUT" | "ERR_FSQLITE_ORDER_SCHEMA" |
@@ -696,58 +716,161 @@ export class ChangesetOrder {
       const bytes = ownBytes(field(message, "changeset"), this.#bytes), byteLength = bytes.byteLength;
       if ((await digest(bytes)) !== sha256) fail("ERR_FSQLITE_ORDER_INPUT", "Ordered payload does not match its digest");
       b.checkpoint();
-      return await this.#target.transaction(async tx => {
+      return await this.#target.transaction(tx => this.#applyOwned(tx,
+        { sequence, deliveryId, sha256, byteLength, bytes }, apply, b.checkpoint), b.transactionOptions());
+    } finally { this.#active = false; }
+  }
+
+  /**
+   * Atomically apply 1..256 contiguous source messages in ONE outer transaction.
+   * Capture every input before yielding and verify every digest before SQL.
+   * Retained exact replays are allowed as a prefix and never invoke apply.
+   * All fresh rows, hook effects, inbox receipts and sequence markers roll back
+   * together on failure. Results are provisional until the owner commits.
+   *
+   * Use the callback's captured message identity, not an invocation counter:
+   * a replayed prefix changes which callbacks run. foreignKeys: defer checks
+   * the entire batch; do not separately defer/check its incomplete fragments.
+   * Storage confirmation, authentication and transport remain caller-owned.
+   * This does not checkpoint, retry, queue work or create a batch wire protocol.
+   */
+  async applyBatch(
+    messages: readonly OrderedChangeset[],
+    apply: OrderedChangesetBatchApply,
+    options: ChangesetOrderBatchOptions = {},
+  ): Promise<readonly ChangesetOrderResult[]> {
+    if (this.#active) fail("ERR_FSQLITE_ORDER_BUSY", "This ordered receiver is active; nothing was queued");
+    this.#active = true;
+    try {
+      const b = budget(options), maximum = bound(options.maxBatchBytes, 64 * 1024 * 1024, 64 * 1024 * 1024);
+      const foreignKeys = options.foreignKeys;
+      if (foreignKeys !== undefined && foreignKeys !== "defer")
+        fail("ERR_FSQLITE_ORDER_INPUT", "foreignKeys must be defer when supplied");
+      if (!Array.isArray(messages) || messages.length < 1 || messages.length > 256 || typeof apply !== "function")
+        fail("ERR_FSQLITE_ORDER_INPUT", "Use 1..256 ordered messages and an application callback");
+      const captured: AdmittedMessage[] = [], ids = new Set<string>();
+      let remaining = maximum;
+      for (let i = 0, length = messages.length; i < length; i++) {
         b.checkpoint();
+        const descriptor = Object.getOwnPropertyDescriptor(messages, String(i));
+        if (descriptor === undefined || !Object.hasOwn(descriptor, "value"))
+          fail("ERR_FSQLITE_ORDER_INPUT", "Batch entries must be own data properties");
+        const message: unknown = descriptor.value, sequence = field(message, "sequence");
+        const deliveryId = identity(field(message, "deliveryId"), 512), sha256 = hash(field(message, "sha256"));
+        if (typeof sequence !== "bigint" || sequence < 1n || sequence > MAX_SEQUENCE)
+          fail("ERR_FSQLITE_ORDER_INPUT", "Use an int64 positive sequence");
+        if (i > 0 && sequence !== captured[i - 1]!.sequence + 1n)
+          fail("ERR_FSQLITE_ORDER_GAP", "Batch messages must be contiguous and in source order");
+        if (ids.has(deliveryId)) fail("ERR_FSQLITE_ORDER_REUSE", "A batch repeats a delivery identity");
+        ids.add(deliveryId);
+        // The remaining aggregate budget is enforced inside ownBytes BEFORE
+        // allocation. Zero bytes can still fit after the budget is exhausted.
+        const bytes = ownBytes(field(message, "changeset"), Math.min(this.#bytes, remaining));
+        remaining -= bytes.byteLength;
+        captured.push({ sequence, deliveryId, sha256, bytes, byteLength: bytes.byteLength });
+      }
+      for (const message of captured) {
+        b.checkpoint();
+        if (await digest(message.bytes) !== message.sha256)
+          fail("ERR_FSQLITE_ORDER_INPUT", "Ordered payload does not match its digest");
+      }
+      b.checkpoint();
+      const owner = foreignKeys === "defer" ? withDeferredForeignKeys(this.#target) : this.#target;
+      return await owner.transaction(async tx => {
+        // Preflight the ENTIRE window against the same SQL snapshot before
+        // invoking any business callback. A doomed suffix cannot cause partial
+        // callback execution merely because its bytes have a valid digest.
         const view = await this.#view(tx), before = view.head;
-        const bootstrap = await requireInstalledBootstrap(tx, before);
+        await requireInstalledBootstrap(tx, before);
         b.checkpoint();
-        if (sequence > before.sequence + 1n) fail("ERR_FSQLITE_ORDER_GAP", "A source predecessor is missing; no rows were applied");
-        if (view.retention !== null && sequence > view.retention.protectedThrough && sequence < view.retention.anchor.sequence)
-          fail("ERR_FSQLITE_ORDER_EXPIRED", "This sequence was explicitly retired; it cannot be acknowledged or applied again");
-        if (sequence <= before.sequence) {
-          const rows = await query(tx, `SELECT ${META} FROM ${TABLE} WHERE seq=?`, [sequence]);
-          if (rows.length !== 1) fail("ERR_FSQLITE_ORDER_CORRUPT", "Missing ordered replay receipt");
-          const saved = metadata(rows[0]!);
-          if (saved.receiverId !== this.#receiver || saved.sourceId !== this.#source ||
-            saved.deliveryId !== deliveryId || saved.sha256 !== sha256 || saved.byteLength !== byteLength)
-            fail("ERR_FSQLITE_ORDER_REUSE", "A sequence was reused for different content or identity");
+        if (captured[0]!.sequence > before.sequence + 1n)
+          fail("ERR_FSQLITE_ORDER_GAP", "A source predecessor is missing; no rows were applied");
+        const fresh = captured.filter(message => message.sequence > before.sequence);
+        if (fresh.length !== 0 && fresh.length > this.#entries - view.entries)
+          fail("ERR_FSQLITE_ORDER_FULL", "Order-ledger identity retention cannot hold the complete batch");
+        for (const message of captured) {
           b.checkpoint();
-          return Object.freeze({ ...saved, replayed: true });
+          if (message.sequence <= before.sequence) {
+            // This calls no application code and mutates no ledger rows. Reuse
+            // ordinary replay admission, including retirement/source bindings.
+            await this.#applyOwned(tx, message, () => {
+              fail("ERR_FSQLITE_ORDER_CORRUPT", "A retained batch prefix became fresh work");
+            }, b.checkpoint);
+          } else if ((await query(tx, `SELECT 1 FROM ${TABLE} WHERE delivery_id=? LIMIT 1`, [message.deliveryId])).length) {
+            fail("ERR_FSQLITE_ORDER_REUSE", "A delivery identity was reused at a new sequence");
+          }
         }
-        if (view.entries >= this.#entries) fail("ERR_FSQLITE_ORDER_FULL", "Order-ledger identity retention limit reached");
-        if ((await query(tx, `SELECT 1 FROM ${TABLE} WHERE delivery_id=? LIMIT 1`, [deliveryId])).length)
-          fail("ERR_FSQLITE_ORDER_REUSE", "A delivery identity was reused at a new sequence");
+        const results: ChangesetOrderResult[] = [];
+        for (const message of captured) {
+          b.checkpoint();
+          const info: ChangesetOrderHead = Object.freeze({
+            receiverId: this.#receiver, sourceId: this.#source, sequence: message.sequence,
+            deliveryId: message.deliveryId, sha256: message.sha256, byteLength: message.byteLength,
+          });
+          results.push(await this.#applyOwned(tx, message,
+            (target, bytes) => apply(target, bytes, info), b.checkpoint));
+        }
         b.checkpoint();
-        // No nested BEGIN/COMMIT and no second target: applyChangeset and its
-        // rebase journal must use this SAME outer transaction.
-        const result = await applyScoped(tx, apply, bytes, b.checkpoint);
-        b.checkpoint();
-        if ((await digest(bytes)) !== sha256)
-          fail("ERR_FSQLITE_ORDER_CORRUPT", "Application changed the admitted payload bytes");
-        const applied = count(field(result, "applied")), omitted = count(field(result, "omitted"));
-        if (field(result, "replayed") !== false || applied + omitted > 100_000)
-          fail("ERR_FSQLITE_ORDER_REUSE", "Fresh ordered work must not reuse an unordered receipt");
-        const checked = await this.#view(tx);
-        if (fingerprint(checked.head) !== fingerprint(before) ||
-            retentionFingerprint(checked.retention) !== retentionFingerprint(view.retention))
-          fail("ERR_FSQLITE_ORDER_CORRUPT", "Application work changed the order ledger or its retirement policy");
-        if (await requireInstalledBootstrap(tx, before) !== bootstrap)
-          fail("ERR_FSQLITE_ORDER_CORRUPT", "Application work changed its bootstrap authority");
-        b.checkpoint();
-        const changed = await tx.execute(`INSERT OR ABORT INTO ${TABLE} VALUES (?,?,?,?,?,?,?,?)`,
-          [sequence, this.#receiver, this.#source, deliveryId, sha256, BigInt(byteLength), BigInt(applied), BigInt(omitted)]);
-        if (changed !== 1) fail("ERR_FSQLITE_ORDER_CORRUPT", "Sequence marker was not written exactly once");
-        const next = metadata([sequence.toString(), this.#receiver, this.#source, deliveryId, sha256, byteLength, applied, omitted]);
-        if ((await tx.execute(`UPDATE OR ABORT ${HEAD} SET receipt=? WHERE slot=1 AND receipt=? COLLATE BINARY`,
-          [fingerprint(next), fingerprint(before)])) !== 1)
-          fail("ERR_FSQLITE_ORDER_CORRUPT", "Ordered-delivery head did not advance atomically");
-        const after = await this.#head(tx);
-        if (after.sequence !== sequence || after.deliveryId !== deliveryId || after.sha256 !== sha256 ||
-          after.byteLength !== byteLength || after.applied !== applied || after.omitted !== omitted)
-          fail("ERR_FSQLITE_ORDER_CORRUPT", "Sequence publication was not confirmed inside its transaction");
-        b.checkpoint();
-        return Object.freeze({ ...after, replayed: false });
+        return Object.freeze(results);
       }, b.transactionOptions());
     } finally { this.#active = false; }
+  }
+
+  /** Shared single-message publication within an already owned transaction. */
+  async #applyOwned(
+    tx: ChangesetExecutor, message: AdmittedMessage, apply: OrderedChangesetApply,
+    checkpoint: () => void,
+  ): Promise<ChangesetOrderResult> {
+    const { sequence, deliveryId, sha256, byteLength, bytes } = message;
+    checkpoint();
+    const view = await this.#view(tx), before = view.head;
+    const bootstrap = await requireInstalledBootstrap(tx, before);
+    checkpoint();
+    if (sequence > before.sequence + 1n) fail("ERR_FSQLITE_ORDER_GAP", "A source predecessor is missing; no rows were applied");
+    if (view.retention !== null && sequence > view.retention.protectedThrough && sequence < view.retention.anchor.sequence)
+      fail("ERR_FSQLITE_ORDER_EXPIRED", "This sequence was explicitly retired; it cannot be acknowledged or applied again");
+    if (sequence <= before.sequence) {
+      const rows = await query(tx, `SELECT ${META} FROM ${TABLE} WHERE seq=?`, [sequence]);
+      if (rows.length !== 1) fail("ERR_FSQLITE_ORDER_CORRUPT", "Missing ordered replay receipt");
+      const saved = metadata(rows[0]!);
+      if (saved.receiverId !== this.#receiver || saved.sourceId !== this.#source ||
+        saved.deliveryId !== deliveryId || saved.sha256 !== sha256 || saved.byteLength !== byteLength)
+        fail("ERR_FSQLITE_ORDER_REUSE", "A sequence was reused for different content or identity");
+      checkpoint();
+      return Object.freeze({ ...saved, replayed: true });
+    }
+    if (view.entries >= this.#entries) fail("ERR_FSQLITE_ORDER_FULL", "Order-ledger identity retention limit reached");
+    if ((await query(tx, `SELECT 1 FROM ${TABLE} WHERE delivery_id=? LIMIT 1`, [deliveryId])).length)
+      fail("ERR_FSQLITE_ORDER_REUSE", "A delivery identity was reused at a new sequence");
+    checkpoint();
+    // No nested BEGIN/COMMIT and no second target: applyChangeset and its
+    // rebase journal must use this SAME outer transaction.
+    const result = await applyScoped(tx, apply, bytes, checkpoint);
+    checkpoint();
+    if ((await digest(bytes)) !== sha256)
+      fail("ERR_FSQLITE_ORDER_CORRUPT", "Application changed the admitted payload bytes");
+    const applied = count(field(result, "applied")), omitted = count(field(result, "omitted"));
+    if (field(result, "replayed") !== false || applied + omitted > 100_000)
+      fail("ERR_FSQLITE_ORDER_REUSE", "Fresh ordered work must not reuse an unordered receipt");
+    const checked = await this.#view(tx);
+    if (fingerprint(checked.head) !== fingerprint(before) ||
+        retentionFingerprint(checked.retention) !== retentionFingerprint(view.retention))
+      fail("ERR_FSQLITE_ORDER_CORRUPT", "Application work changed the order ledger or its retirement policy");
+    if (await requireInstalledBootstrap(tx, before) !== bootstrap)
+      fail("ERR_FSQLITE_ORDER_CORRUPT", "Application work changed its bootstrap authority");
+    checkpoint();
+    const changed = await tx.execute(`INSERT OR ABORT INTO ${TABLE} VALUES (?,?,?,?,?,?,?,?)`,
+      [sequence, this.#receiver, this.#source, deliveryId, sha256, BigInt(byteLength), BigInt(applied), BigInt(omitted)]);
+    if (changed !== 1) fail("ERR_FSQLITE_ORDER_CORRUPT", "Sequence marker was not written exactly once");
+    const next = metadata([sequence.toString(), this.#receiver, this.#source, deliveryId, sha256, byteLength, applied, omitted]);
+    if ((await tx.execute(`UPDATE OR ABORT ${HEAD} SET receipt=? WHERE slot=1 AND receipt=? COLLATE BINARY`,
+      [fingerprint(next), fingerprint(before)])) !== 1)
+      fail("ERR_FSQLITE_ORDER_CORRUPT", "Ordered-delivery head did not advance atomically");
+    const after = await this.#head(tx);
+    if (after.sequence !== sequence || after.deliveryId !== deliveryId || after.sha256 !== sha256 ||
+      after.byteLength !== byteLength || after.applied !== applied || after.omitted !== omitted)
+      fail("ERR_FSQLITE_ORDER_CORRUPT", "Sequence publication was not confirmed inside its transaction");
+    checkpoint();
+    return Object.freeze({ ...after, replayed: false });
   }
 }
