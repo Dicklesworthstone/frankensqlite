@@ -21,7 +21,7 @@ use asupersync::sync::{Notify, RwLock as AsyncRwLock};
 use dashmap::DashMap;
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_observability::PageCacheEfficiencySnapshot;
-use fsqlite_types::cx::Cx;
+use fsqlite_types::cx::{BusyWaitBudget, Cx};
 use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
 use fsqlite_types::sync_primitives::Instant;
 use fsqlite_types::{
@@ -8037,6 +8037,10 @@ async fn advance_refresh_signature_past_own_commit<F: VfsFile>(
 pub(crate) struct PagerInner<F: VfsFile> {
     /// Handle to the main database file.
     db_file: SharedDbFile<F>,
+    /// This handle's configured admission timeout. Unlike the identity-wide
+    /// settlement budget, a short-timeout connection must not inherit a peer's
+    /// larger timeout when a pager operation retries native acquisition.
+    vfs_busy_timeout_ms: u64,
     /// Stable main-file namespace and identity captured when this pager opened.
     /// An exact recovery receipt snapshots these values before its first
     /// journal side effect so later adopters can validate the origin.
@@ -14616,6 +14620,8 @@ where
         mode: TransactionMode,
     ) -> impl Future<Output = Result<Self::Txn>> + 'a {
         async move {
+            let operation_cx = pager_busy_wait_cx(cx, &self.inner)?;
+            let cx = &operation_cx;
             let begin_handle_key = {
                 let inner = self
                     .inner
@@ -14801,7 +14807,7 @@ where
                     std::cmp::max(published_snapshot.visible_commit_seq, inner.commit_seq);
                 let bound_db_size = published_snapshot.db_size.max(original_db_size);
                 let pool = self.pool.clone();
-                let cleanup_cx = cx.clone();
+                let cleanup_cx = cx.clone().without_busy_wait_budget();
                 let memory_db_bump_alloc =
                     self.vfs.is_memory() && self.db_path == Path::new("/:memory:");
                 let maintenance_lease = admission.complete(&mut inner)?;
@@ -15923,7 +15929,10 @@ where
             .inner
             .lock()
             .ok()
-            .map(|inner| Arc::clone(&inner.db_file));
+            .map(|mut inner| {
+                inner.vfs_busy_timeout_ms = ms;
+                Arc::clone(&inner.db_file)
+            });
         if let Some(db_file) = db_file
             && let Ok(mut db_file) = shared_db_file_write(&db_file, cx).await
         {
@@ -19583,6 +19592,7 @@ where
             maintenance_open_lease: Mutex::new(Some(maintenance_open_lease)),
             inner: Arc::new(Mutex::new(PagerInner {
                 db_file,
+                vfs_busy_timeout_ms: 0,
                 database_path: inner_database_path,
                 database_identity,
                 #[cfg(all(feature = "native", any(unix, windows)))]
@@ -20021,6 +20031,7 @@ where
             maintenance_open_lease: Mutex::new(Some(maintenance_open_lease)),
             inner: Arc::new(Mutex::new(PagerInner {
                 db_file,
+                vfs_busy_timeout_ms: 0,
                 database_path: inner_database_path,
                 database_identity,
                 #[cfg(all(feature = "native", any(unix, windows)))]
@@ -23044,8 +23055,26 @@ fn restore_quarantined_durable_freelist_pages(
     quarantined.retain(|page| !durable_origins.contains(&page.get()));
 }
 
+/// Preserve a caller's operation clock, or supply one for direct pager users.
+/// Merely entering the pager leaves the clock unstarted until contention.
+fn pager_busy_wait_cx<F: VfsFile>(
+    cx: &Cx,
+    inner: &Arc<Mutex<PagerInner<F>>>,
+) -> Result<Cx> {
+    if cx.busy_wait_budget().is_some() {
+        return Ok(cx.clone());
+    }
+    let timeout_ms = inner
+        .lock()
+        .map_err(|_| FrankenError::internal("pager busy-timeout state poisoned"))?
+        .vfs_busy_timeout_ms;
+    Ok(cx.clone().with_busy_wait_budget(BusyWaitBudget::new(
+        Duration::from_millis(timeout_ms),
+    )))
+}
+
 fn cleanup_child_cx(cx: &Cx) -> Cx {
-    cx.create_child()
+    cx.create_child().without_busy_wait_budget()
 }
 
 struct RollbackJournalCommitInput<'a, S> {
@@ -23607,6 +23636,8 @@ where
         publication_authorization: &mut Option<ParallelWalPublicationAuthorization>,
         txn_attempt: Option<&Arc<PendingGroupCommitTxnAttempt<V::File>>>,
     ) -> Result<()> {
+        let operation_cx = pager_busy_wait_cx(cx, inner_arc)?;
+        let cx = &operation_cx;
         // bd-t6sv2.9: count this commit's LOGICAL page bytes (its distinct dirty
         // pages * page size) exactly once, here at the single WAL-commit choke
         // (`commit_wal_group_commit` delegates here) — the write-amplification
@@ -24408,7 +24439,6 @@ where
                     AtomicOrdering::Relaxed,
                 );
 
-                const MAX_FLUSH_RETRIES: u32 = 10;
                 let mut flush_result: Result<()> = Ok(());
                 let mut inner_lock_wait_us: u64 = 0;
                 let mut exclusive_lock_us: u64 = 0;
@@ -24419,7 +24449,22 @@ where
                 let mut frames_written_start: u64 = 0;
                 let mut frames_written_end: u64 = 0;
                 let mut fsync_seq: u64 = 0;
-                for attempt in 0..MAX_FLUSH_RETRIES {
+                let mut retry_attempt = 0_u32;
+                loop {
+                    if cx.checkpoint().is_err() {
+                        flush_result = Err(FrankenError::Abort);
+                        break;
+                    }
+                    // Always permit the initial nonblocking probe, including
+                    // timeout=0. Subsequent probes cannot rearm an exhausted
+                    // caller budget after a native wait or scheduler handoff.
+                    if retry_attempt > 0
+                        && cx.busy_wait_budget().is_some_and(|budget| {
+                            budget.remaining().is_zero()
+                        })
+                    {
+                        break;
+                    }
                     let t_inner_lock_start = phase_timing.then(Instant::now);
                     let db_file = {
                         #[cfg(test)]
@@ -24958,12 +25003,32 @@ where
                         break;
                     }
                     match &flush_result {
-                        Err(
-                            FrankenError::Busy
-                            | FrankenError::BusyRecovery
-                            | FrankenError::BusySnapshot { .. },
-                        ) if attempt + 1 < MAX_FLUSH_RETRIES => {
-                            perform_flush_busy_retry_handoff(flush_busy_retry_wait(attempt + 1));
+                        Err(FrankenError::Busy | FrankenError::BusyRecovery) => {
+                            // Every physical retry spends the same admission
+                            // budget as the first native lock wait. A stale
+                            // snapshot cannot improve without a new logical
+                            // transaction, so BusySnapshot is never retried here.
+                            let remaining = cx
+                                .busy_wait_budget()
+                                .expect("pager admission installs a busy budget")
+                                .remaining();
+                            if remaining.is_zero() {
+                                break;
+                            }
+                            retry_attempt = retry_attempt.saturating_add(1);
+                            if retry_attempt <= FLUSH_BUSY_HANDOFF_YIELD_EVERY {
+                                perform_flush_busy_retry_handoff(flush_busy_retry_wait(retry_attempt));
+                                // A sibling on this executor may own the lock
+                                // or cleanup receipt we need. OS-thread yield
+                                // alone cannot let that task make progress.
+                                asupersync::runtime::yield_now().await;
+                            } else {
+                                asupersync::time::sleep(
+                                    asupersync::time::wall_now(),
+                                    remaining.min(Duration::from_millis(1)),
+                                )
+                                .await;
+                            }
                             // This is a physical flusher retry, not a waiter
                             // wake. Keep it out of the mutually exclusive wake
                             // reason ledger.
@@ -30188,6 +30253,18 @@ where
         cx: &Cx,
         mode: traits::CheckpointMode,
     ) -> Result<traits::CheckpointResult> {
+        let mut operation_cx = pager_busy_wait_cx(cx, &self.inner)?;
+        if mode == traits::CheckpointMode::Passive {
+            // PASSIVE checkpointing must not wait for a writer even when the
+            // connection has a long busy timeout. Keep the shared clock so
+            // nested recovery cannot silently rearm the enclosing operation.
+            let budget = operation_cx
+                .busy_wait_budget()
+                .expect("pager admission installs a busy budget")
+                .with_timeout(Duration::ZERO);
+            operation_cx = operation_cx.with_busy_wait_budget(budget);
+        }
+        let cx = &operation_cx;
         settle_pending_group_commit_finalization(&self.group_commit_queue).await?;
         // A newly enabled WAL can reach checkpoint before the first runtime
         // read initialized its shared index. Reuse that read's existing
@@ -44556,6 +44633,157 @@ mod tests {
                 committed_page.as_slice(),
                 "bead_id={BEAD} case=terminal_recovery_publishes_accepted_wal_batch"
             );
+        });
+    }
+
+    #[test]
+    fn test_group_commit_busy_retries_share_admission_budget() {
+        asupersync::test_utils::run_test(|| async {
+            for (timeout_ms, inherited_zero) in [(0, false), (30_000, false), (30_000, true)] {
+                let vfs = ObservedLockVfs::new();
+                let path = PathBuf::from(format!(
+                    "/group-commit-budget-{timeout_ms}-{inherited_zero}.db"
+                ));
+                let pager = vfs.open_file_backed_pager(&path).await.unwrap();
+                let cx = Cx::new();
+                let (backend, frames, _begin_calls, batch_calls, sync_calls) =
+                    MockWalBackend::new_with_sync_tracking();
+                pager.set_wal_backend(Box::new(backend)).unwrap();
+                pager.set_journal_mode(&cx, JournalMode::Wal).await.unwrap();
+                pager.set_vfs_busy_timeout_ms(&cx, timeout_ms).await;
+                let cx = if inherited_zero {
+                    cx.with_busy_wait_budget(BusyWaitBudget::new(Duration::ZERO))
+                } else {
+                    cx
+                };
+                let baseline = *vfs.observed_lock_level.lock().unwrap();
+                vfs.observed_unlock_trace_ids.lock().unwrap().clear();
+                let failures = if timeout_ms > 0 && !inherited_zero { 15 } else { 2 };
+                vfs.external_append_acquire_failures
+                    .store(failures, AtomicOrdering::Release);
+                let page = PageNumber::new(2).unwrap();
+                let mut write_set = HashMap::new();
+                write_set.insert(
+                    page,
+                    StagedPage::from_bytes(&pager.pool, &vec![0x55; PageSize::DEFAULT.as_usize()])
+                        .unwrap(),
+                );
+                let result = SimpleTransaction::<ObservedLockVfs>::commit_wal_group_commit(
+                    &cx,
+                    &pager.wal_backend,
+                    &pager.inner,
+                    &write_set,
+                    &[page],
+                    &[],
+                    &pager.group_commit_queue,
+                )
+                .await;
+                if timeout_ms == 0 || inherited_zero {
+                    assert!(matches!(result, Err(FrankenError::Busy)));
+                    assert_eq!(
+                        vfs.external_append_acquire_failures.load(AtomicOrdering::Acquire),
+                        1,
+                        "zero budget permits the initial probe, never a physical retry"
+                    );
+                    assert_eq!(vfs.observed_unlock_trace_ids.lock().unwrap().len(), 1);
+                    assert!(frames.lock().unwrap().is_empty());
+                    assert_eq!(*batch_calls.lock().unwrap(), 0);
+                    assert_eq!(*sync_calls.lock().unwrap(), 0);
+                } else {
+                    result.expect("temporary admission conflicts must permit progress");
+                    assert_eq!(
+                        vfs.external_append_acquire_failures.load(AtomicOrdering::Acquire),
+                        0
+                    );
+                    assert_eq!(vfs.observed_unlock_trace_ids.lock().unwrap().len(), failures + 1);
+                    assert_eq!(frames.lock().unwrap().len(), 1);
+                    assert_eq!(*batch_calls.lock().unwrap(), 1);
+                    assert_eq!(*sync_calls.lock().unwrap(), 1);
+                }
+                assert_eq!(*vfs.observed_lock_level.lock().unwrap(), baseline);
+                assert!(pager.group_commit_queue.pending_external_unlocks.lock().unwrap().is_empty());
+                assert_eq!(
+                    pager.group_commit_queue.rooted_finalization_attempts.load(AtomicOrdering::Acquire),
+                    0
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn test_group_commit_stale_snapshot_does_not_repeat_physical_attempt() {
+        asupersync::test_utils::run_test(|| async {
+            let vfs = ObservedLockVfs::new();
+            let pager = vfs
+                .open_file_backed_pager(Path::new("/group-commit-stale-budget.db"))
+                .await
+                .unwrap();
+            let cx = Cx::new();
+            let (backend, frames, _begin_calls, batch_calls, sync_calls) =
+                MockWalBackend::new_with_sync_tracking();
+            pager.set_wal_backend(Box::new(backend)).unwrap();
+            pager.set_journal_mode(&cx, JournalMode::Wal).await.unwrap();
+            pager.set_vfs_busy_timeout_ms(&cx, 30_000).await;
+            let mut reader = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            let page = PageNumber::new(2).unwrap();
+            // The mocked peer publishes after this transaction pinned its
+            // snapshot. Physical lock retries cannot repair that lineage.
+            frames.lock().unwrap().push((
+                page.get(),
+                vec![0x71; PageSize::DEFAULT.as_usize()],
+                2,
+            ));
+            let baseline = *vfs.observed_lock_level.lock().unwrap();
+            vfs.observed_unlock_trace_ids.lock().unwrap().clear();
+            let mut write_set = HashMap::new();
+            write_set.insert(
+                page,
+                StagedPage::from_bytes(&pager.pool, &vec![0x55; PageSize::DEFAULT.as_usize()])
+                    .unwrap(),
+            );
+            let result = SimpleTransaction::<ObservedLockVfs>::commit_wal_group_commit(
+                &cx,
+                &pager.wal_backend,
+                &pager.inner,
+                &write_set,
+                &[page],
+                &[page],
+                &pager.group_commit_queue,
+            )
+            .await;
+            assert!(matches!(result, Err(FrankenError::BusySnapshot { .. })));
+            assert_eq!(vfs.observed_unlock_trace_ids.lock().unwrap().len(), 1);
+            assert_eq!(*vfs.observed_lock_level.lock().unwrap(), baseline);
+            assert_eq!(frames.lock().unwrap().len(), 1);
+            assert_eq!(*batch_calls.lock().unwrap(), 0);
+            assert_eq!(*sync_calls.lock().unwrap(), 0);
+            reader.rollback(&cx).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_begin_does_not_retain_statement_busy_budget_for_cleanup() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new()
+                .with_trace_context(11, 13, 17)
+                .with_busy_wait_budget(BusyWaitBudget::new(Duration::ZERO));
+            for memory_fast_path in [true, false] {
+                let vfs = ObservedLockVfs::new();
+                let pager = SimplePager::open(
+                    vfs.clone(),
+                    Path::new("/cleanup-admission-budget.db"),
+                    PageSize::DEFAULT,
+                )
+                .await
+                .unwrap();
+                vfs.memory_fast_path.store(memory_fast_path, AtomicOrdering::Release);
+                let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                assert!(txn.cleanup_cx.busy_wait_budget().is_none());
+                assert_eq!(txn.cleanup_cx.trace_id(), 11);
+                assert_eq!(txn.cleanup_cx.decision_id(), 13);
+                assert_eq!(txn.cleanup_cx.policy_id(), 17);
+                txn.rollback(&cx).await.unwrap();
+            }
         });
     }
 

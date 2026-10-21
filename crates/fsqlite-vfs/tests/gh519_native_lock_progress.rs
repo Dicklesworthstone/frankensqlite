@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use fsqlite_error::{ErrorCode, Result};
 use fsqlite_types::LockLevel;
-use fsqlite_types::cx::Cx;
+use fsqlite_types::cx::{BusyWaitBudget, Cx};
 use fsqlite_types::flags::VfsOpenFlags;
 use fsqlite_vfs::shm::{
     SHM_SEGMENT_SIZE, SQLITE_SHM_EXCLUSIVE, SQLITE_SHM_LOCK, SQLITE_SHM_UNLOCK, WAL_CKPT_LOCK,
@@ -70,9 +70,6 @@ struct Witness(Arc<Schedule>);
 
 impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Witness {
     fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
-        if event.metadata().target() != "fsqlite_vfs::unix" {
-            return;
-        }
         #[derive(Default)]
         struct Fields {
             event: String,
@@ -92,6 +89,9 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Witness {
                     self.start = Some(value);
                 }
             }
+        }
+        if event.metadata().target() != "fsqlite_vfs::unix" {
+            return;
         }
         let mut fields = Fields::default();
         event.record(&mut fields);
@@ -180,6 +180,17 @@ fn wal_slot(file: &mut impl VfsFile, cx: &Cx, slot: u32, acquire: bool) -> Resul
     file.shm_lock(cx, slot, 1, operation | SQLITE_SHM_EXCLUSIVE)
 }
 
+fn report_busy_fence(file: &mut impl VfsFile, cx: &Cx, fence: Fence) {
+    let started = Instant::now();
+    let error = fence
+        .acquire(file, cx)
+        .expect_err("foreign owner must block admission");
+    assert_eq!(error.error_code(), ErrorCode::Busy);
+    fence.restore(file, cx);
+    fence.restore(file, cx);
+    emit(&format!("busy {}", started.elapsed().as_millis()));
+}
+
 fn run_actor(path: &Path, map_shm: bool) {
     let cx = Cx::new();
     let vfs = UnixVfs::new();
@@ -246,15 +257,16 @@ fn run_actor(path: &Path, map_shm: bool) {
                 fence.restore(&mut file, &cx);
             }
             ["busy-fence", kind] => {
-                let fence = Fence::parse(kind);
-                let started = Instant::now();
-                let error = fence
-                    .acquire(&mut file, &cx)
-                    .expect_err("foreign owner must block admission");
-                assert_eq!(error.error_code(), ErrorCode::Busy);
-                fence.restore(&mut file, &cx);
-                fence.restore(&mut file, &cx);
-                emit(&format!("busy {}", started.elapsed().as_millis()));
+                report_busy_fence(&mut file, &cx, Fence::parse(kind));
+                continue;
+            }
+            ["busy-budget-fence", kind, timeout] => {
+                let scoped =
+                    cx.clone()
+                        .with_busy_wait_budget(BusyWaitBudget::new(Duration::from_millis(
+                            timeout.parse().unwrap(),
+                        )));
+                report_busy_fence(&mut file, &scoped, Fence::parse(kind));
                 continue;
             }
             ["borrowed", kind] => {
@@ -649,10 +661,15 @@ fn cancellation_and_timeouts_restore_every_external_attempt_family() {
         observer.command("probe-checkpoint");
         holder.command("release-main");
         observer.command("probe-main");
-        for timeout in [0_u64, 200] {
+        for (timeout, shared_budget) in [(0_u64, false), (200, false), (0, true), (200, true)] {
             holder.command("reserved");
-            waiter.command(&format!("timeout {timeout}"));
-            waiter.send(&format!("busy-fence {kind}"));
+            if shared_budget {
+                waiter.command("timeout 30000");
+                waiter.send(&format!("busy-budget-fence {kind} {timeout}"));
+            } else {
+                waiter.command(&format!("timeout {timeout}"));
+                waiter.send(&format!("busy-fence {kind}"));
+            }
             let response = waiter.receive();
             let elapsed = response
                 .strip_prefix("busy ")

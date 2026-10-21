@@ -2027,11 +2027,17 @@ impl UnixFile {
 
     /// A sibling may acquire a WAL claim after our first native refusal.
     /// Recheck each wait instead of changing the handle's configured policy.
-    fn main_lock_wait_remaining(&self, started: Instant, timeout: Duration) -> Duration {
+    fn main_lock_wait_remaining(&self, cx: &Cx, started: Instant, timeout: Duration) -> Duration {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        // Native retries and their pager/statement callers spend the same
+        // admission budget. A new lock prefix cannot restart the SQL timeout.
+        let remaining = cx
+            .busy_wait_budget()
+            .map_or(remaining, |budget| remaining.min(budget.remaining()));
         if self.process_holds_wal_fence() {
             Duration::ZERO
         } else {
-            timeout.saturating_sub(started.elapsed())
+            remaining
         }
     }
 
@@ -4283,7 +4289,7 @@ impl VfsFile for UnixFile {
             };
             debug_assert!(matches!(error, FrankenError::Busy));
             let started = *wait_started.get_or_insert_with(Instant::now);
-            let remaining = self.main_lock_wait_remaining(started, timeout);
+            let remaining = self.main_lock_wait_remaining(cx, started, timeout);
             // Keep the existing deterministic native-wait witness outside the
             // inode mutex and invoke it only when a busy wait is permitted.
             #[cfg(test)]
@@ -4306,7 +4312,7 @@ impl VfsFile for UnixFile {
             // Recheck after either witness: a sibling can take WRITE/CKPT while
             // this caller is paused. Borrowed WAL ownership cannot wait for main,
             // including when this handle has never mapped SHM itself.
-            let remaining = self.main_lock_wait_remaining(started, timeout);
+            let remaining = self.main_lock_wait_remaining(cx, started, timeout);
             if remaining.is_zero() {
                 return self.restore_failed_main_lock_wait(prior_level, FrankenError::Busy);
             }
@@ -5104,20 +5110,27 @@ impl VfsFile for UnixFile {
         // a slot mutated between publish and share) is retried with backoff
         // inside the handle's busy budget instead of failing the transaction.
         let budget = Duration::from_millis(self.busy_timeout_ms.max(WAL_READER_SLOT_MIN_BUDGET_MS));
-        let started = Instant::now();
+        let mut wait_started = None;
         let mut backoff = Duration::from_millis(1);
         loop {
             if let Some(slot) = self.try_acquire_wal_reader_slot(cx, &region_0, mx_frame)? {
                 return Ok(Some(slot));
             }
-            let Some(remaining) = budget.checked_sub(started.elapsed()) else {
+            let started = *wait_started.get_or_insert_with(Instant::now);
+            let remaining = budget.saturating_sub(started.elapsed());
+            // Keep the compatibility floor for direct, unscoped VFS callers,
+            // but never extend a SQL operation's shared busy budget with it.
+            let remaining = cx
+                .busy_wait_budget()
+                .map_or(remaining, |shared| remaining.min(shared.remaining()));
+            if remaining.is_zero() {
                 warn!(
                     mx_frame,
                     read_marks = ?self.compat_read_marks(),
                     "no WAL reader slot could be acquired within the busy budget"
                 );
                 return Err(FrankenError::Busy);
-            };
+            }
             std::thread::sleep(backoff.min(remaining));
             backoff = (backoff * 2).min(WAL_READER_SLOT_MAX_BACKOFF);
         }
@@ -9410,6 +9423,58 @@ mod tests {
         let reader_slot = reader.wal_reader_slot_acquire(&cx, 42).unwrap().unwrap();
         assert_eq!(reader_slot, writer_slot);
         reader.wal_reader_slot_release(&cx, reader_slot).unwrap();
+        writer.wal_reader_slot_release(&cx, writer_slot).unwrap();
+    }
+
+    #[test]
+    fn test_wal_reader_admission_obeys_shared_budget_and_allows_ready_retry() {
+        use fsqlite_types::cx::BusyWaitBudget;
+
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("reader_shared_busy_budget.db");
+        let (mut writer, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        let region = writer.shm_map(&cx, 0, SHM_SEGMENT_SIZE, true).unwrap();
+        for index in 1..WAL_NREADER {
+            write_wal_read_mark(&region, index, WAL_READ_MARK_NOT_USED).unwrap();
+        }
+        let (mut reader, _) = vfs
+            .open(
+                &cx,
+                Some(&path),
+                VfsOpenFlags::READONLY | VfsOpenFlags::MAIN_DB,
+            )
+            .unwrap();
+        reader.set_busy_timeout_ms(200);
+        let before = fs::read(sqlite_shm_path(&path)).unwrap();
+        let budget = BusyWaitBudget::new(Duration::ZERO);
+        let scoped = cx.clone().with_busy_wait_budget(budget.clone());
+        assert!(budget.started().is_none());
+        assert!(matches!(
+            reader.wal_reader_slot_acquire(&scoped, 42),
+            Err(FrankenError::Busy)
+        ));
+        assert!(
+            budget.started().is_some(),
+            "native contention spends the shared budget"
+        );
+        assert_eq!(fs::read(sqlite_shm_path(&path)).unwrap(), before);
+        assert!(
+            scoped.checkpoint().is_ok(),
+            "admission expiry is not cancellation"
+        );
+
+        // A zero/expired budget prohibits waiting, not an immediately available
+        // read or exact cleanup. The same handle remains usable after refusal.
+        let writer_slot = writer.wal_reader_slot_acquire(&cx, 42).unwrap().unwrap();
+        let reader_slot = reader
+            .wal_reader_slot_acquire(&scoped, 42)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reader_slot, writer_slot);
+        reader
+            .wal_reader_slot_release(&scoped, reader_slot)
+            .unwrap();
         writer.wal_reader_slot_release(&cx, writer_slot).unwrap();
     }
 

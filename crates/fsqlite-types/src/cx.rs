@@ -32,11 +32,11 @@ use std::pin::Pin;
 #[cfg(feature = "native")]
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::task::{Context as TaskContext, Poll, Waker};
 use std::time::Duration;
 
-use crate::sync_primitives::SystemTime;
+use crate::sync_primitives::{Instant, SystemTime};
 
 #[cfg(feature = "native")]
 use asupersync::types::Time as NativeTime;
@@ -1085,6 +1085,60 @@ impl Drop for LocalCancellation<'_> {
     }
 }
 
+/// One contention clock shared by every admission attempt in an operation.
+///
+/// Constructing or propagating a budget does not start it. The first failed
+/// lock probe starts the clock, so uncontended statement work does not consume
+/// the busy timeout. Nested retries and VFS waits share that same start time.
+/// This is deliberately separate from [`Budget`]: exhausting a busy timeout
+/// must never cancel rollback, exact lock restoration, or durable settlement.
+#[derive(Debug, Clone)]
+pub struct BusyWaitBudget {
+    timeout: Duration,
+    started: Arc<OnceLock<Instant>>,
+}
+
+impl BusyWaitBudget {
+    #[must_use]
+    pub fn new(timeout: Duration) -> Self {
+        Self {
+            timeout,
+            started: Arc::new(OnceLock::new()),
+        }
+    }
+
+    #[must_use]
+    pub const fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    /// Start the clock at first contention, or return its original start.
+    #[must_use]
+    pub fn start(&self) -> Instant {
+        *self.started.get_or_init(Instant::now)
+    }
+
+    /// Inspect the clock without arming it on an uncontended path.
+    #[must_use]
+    pub fn started(&self) -> Option<Instant> {
+        self.started.get().copied()
+    }
+
+    #[must_use]
+    pub fn remaining(&self) -> Duration {
+        self.timeout.saturating_sub(self.start().elapsed())
+    }
+
+    /// Tighten a nested admission's timeout without restarting its clock.
+    #[must_use]
+    pub fn with_timeout(&self, timeout: Duration) -> Self {
+        Self {
+            timeout: self.timeout.min(timeout),
+            started: Arc::clone(&self.started),
+        }
+    }
+}
+
 /// Capability context passed through all effectful operations.
 ///
 /// Carries tracing identifiers (`trace_id`, `decision_id`, `policy_id`) that
@@ -1094,6 +1148,7 @@ impl Drop for LocalCancellation<'_> {
 pub struct Cx<Caps: cap::SubsetOf<cap::All> = FullCaps> {
     inner: Arc<CxInner>,
     budget: Budget,
+    busy_wait_budget: Option<BusyWaitBudget>,
     trace_id: u64,
     decision_id: u64,
     policy_id: u64,
@@ -1106,6 +1161,7 @@ impl<Caps: cap::SubsetOf<cap::All>> Clone for Cx<Caps> {
         Self {
             inner: Arc::clone(&self.inner),
             budget: self.budget,
+            busy_wait_budget: self.busy_wait_budget.clone(),
             trace_id: self.trace_id,
             decision_id: self.decision_id,
             policy_id: self.policy_id,
@@ -1210,6 +1266,7 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
         Self {
             inner: Arc::new(CxInner::new(cancel_dispatch_gate)),
             budget,
+            busy_wait_budget: None,
             trace_id: 0,
             decision_id: 0,
             policy_id: 0,
@@ -1220,6 +1277,26 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
     #[must_use]
     pub fn budget(&self) -> Budget {
         self.budget
+    }
+
+    /// Attach the admission budget for this operation and its derived contexts.
+    #[must_use]
+    pub fn with_busy_wait_budget(mut self, budget: BusyWaitBudget) -> Self {
+        self.busy_wait_budget = Some(budget);
+        self
+    }
+
+    #[must_use]
+    pub fn busy_wait_budget(&self) -> Option<&BusyWaitBudget> {
+        self.busy_wait_budget.as_ref()
+    }
+
+    /// Remove admission timing while preserving cancellation and task lineage.
+    /// Mandatory cleanup and post-durability settlement must use this view.
+    #[must_use]
+    pub fn without_busy_wait_budget(mut self) -> Self {
+        self.busy_wait_budget = None;
+        self
     }
 
     // -----------------------------------------------------------------------
@@ -1281,6 +1358,7 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
         Self {
             inner: Arc::clone(&self.inner),
             budget: self.budget.meet(child),
+            busy_wait_budget: self.busy_wait_budget.clone(),
             trace_id: self.trace_id,
             decision_id: self.decision_id,
             policy_id: self.policy_id,
@@ -1314,6 +1392,7 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
         Cx {
             inner: Arc::clone(&self.inner),
             budget: self.budget,
+            busy_wait_budget: self.busy_wait_budget.clone(),
             trace_id: self.trace_id,
             decision_id: self.decision_id,
             policy_id: self.policy_id,
@@ -1833,6 +1912,7 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
             self.budget,
             Arc::clone(&self.inner.cancel_dispatch_gate),
         );
+        child.busy_wait_budget = self.busy_wait_budget.clone();
         child.trace_id = self.trace_id;
         child.decision_id = self.decision_id;
         child.policy_id = self.policy_id;
@@ -2078,6 +2158,62 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::{Arc, Barrier, Weak};
+
+    #[test]
+    fn busy_wait_budget_is_lazy_and_shared_across_context_derivations() {
+        let budget = BusyWaitBudget::new(Duration::from_secs(30));
+        let cx = Cx::new().with_busy_wait_budget(budget.clone());
+        let clone = cx.clone();
+        let scoped = cx.scope_with_budget(Budget::MINIMAL);
+        let restricted = cx.restrict::<cap::None>();
+        let child = cx.create_child();
+        let spawned = cx.create_child_for_spawn();
+        let (relayed, _relay) = cx.create_child_with_local_cancel_relay();
+        assert!(budget.started().is_none());
+        assert!(restricted.busy_wait_budget().unwrap().started().is_none());
+        let started = child.busy_wait_budget().unwrap().start();
+        for derived in [&cx, &clone, &scoped, &spawned, &relayed] {
+            assert_eq!(derived.busy_wait_budget().unwrap().started(), Some(started));
+        }
+        assert_eq!(restricted.busy_wait_budget().unwrap().start(), started);
+        assert_eq!(budget.start(), started);
+    }
+
+    #[test]
+    fn busy_wait_budget_tightening_keeps_expired_clock() {
+        let budget = BusyWaitBudget::new(Duration::from_secs(30));
+        let started = Instant::now() - Duration::from_secs(60);
+        budget.started.set(started).unwrap();
+        let shorter = budget.with_timeout(Duration::from_millis(200));
+        let longer = shorter.with_timeout(Duration::from_secs(300));
+        assert_eq!(shorter.timeout(), Duration::from_millis(200));
+        assert_eq!(longer.timeout(), shorter.timeout());
+        assert_eq!(longer.started(), Some(started));
+        assert_eq!(budget.remaining(), Duration::ZERO);
+        assert_eq!(shorter.remaining(), Duration::ZERO);
+        assert_eq!(longer.remaining(), Duration::ZERO);
+    }
+
+    #[test]
+    fn removing_busy_wait_budget_preserves_cleanup_lineage() {
+        let cx = Cx::new()
+            .with_trace_context(17, 19, 23)
+            .with_busy_wait_budget(BusyWaitBudget::new(Duration::ZERO));
+        assert_eq!(cx.busy_wait_budget().unwrap().remaining(), Duration::ZERO);
+        // Admission expiry is not a cancellation deadline.
+        assert!(cx.checkpoint().is_ok());
+        let cleanup = cx.create_child().without_busy_wait_budget();
+        assert!(cleanup.busy_wait_budget().is_none());
+        assert!(cx.busy_wait_budget().is_some());
+        assert_eq!(cleanup.budget(), cx.budget());
+        assert_eq!(cleanup.trace_id(), 17);
+        assert_eq!(cleanup.decision_id(), 19);
+        assert_eq!(cleanup.policy_id(), 23);
+        cx.cancel_with_reason(CancelReason::UserInterrupt);
+        assert_eq!(cleanup.cancel_reason(), Some(CancelReason::UserInterrupt));
+        let _mask = cleanup.masked();
+        assert!(cleanup.checkpoint().is_ok());
+    }
 
     #[derive(Debug, Default)]
     struct CountingWake(AtomicUsize);
