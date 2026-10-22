@@ -43,24 +43,189 @@ pub trait PatchObjectStore {
     fn fetch_patch_object(&self, object_id: ObjectId) -> Result<Vec<u8>>;
 }
 
-/// Hot-path cache keyed by `(page, snapshot_high)`.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+/// Immutable source identity and visibility bound for a native index read.
+///
+/// `generation` must identify the complete immutable read source, including
+/// the base/checkpoint image and index manifest (for example its trusted root
+/// object ID). A sequence number alone is not such an identity. This token is
+/// supplied by the caller; it does not authenticate or pin storage by itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeIndexSnapshot {
+    /// Caller-owned immutable root/checkpoint-and-index identity.
+    pub generation: ObjectId,
+    /// Greatest commit sequence visible to this read.
+    pub high: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativeCachedPage {
+    bytes: Box<[u8]>,
+    insertion: u64,
+}
+
+/// Bounded, insertion-ordered cache for materialized native pages.
+///
+/// Defaults to at most 4,096 entries and 16 MiB of boxed page bytes.
+/// Limits bound owned page buffers and entry counts, not allocator overhead or
+/// the caller's returned pages. Oversized pages remain readable but are not
+/// retained. A hit does not refresh insertion order (FIFO, not LRU).
+///
+/// Legacy `insert`/`get` operate in an unscoped namespace; their caller must
+/// keep the source fixed or clear the cache. Prefer
+/// [`lookup_page_version_for_snapshot`] when a cache spans roots/generations.
+/// Switching between scoped and unscoped reads invalidates previous entries.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativePageCache {
-    entries: BTreeMap<(u32, u64), Vec<u8>>,
+    entries: BTreeMap<(u32, u64), NativeCachedPage>,
+    order: BTreeMap<u64, (u32, u64)>,
+    retained_bytes: usize,
+    max_entries: usize,
+    max_bytes: usize,
+    next_insertion: u64,
+    generation: Option<ObjectId>,
+}
+
+impl Default for NativePageCache {
+    fn default() -> Self {
+        Self::with_limits(4096, 16 * 1024 * 1024)
+    }
 }
 
 impl NativePageCache {
-    /// Insert a materialized page for a specific visibility bound.
-    pub fn insert(&mut self, page: PageNumber, snapshot_high: u64, bytes: Vec<u8>) {
-        self.entries.insert((page.get(), snapshot_high), bytes);
+    /// Configure retained entry and page-buffer limits. Either zero
+    /// disables retention, without disabling page reads.
+    #[must_use]
+    pub const fn with_limits(max_entries: usize, max_bytes: usize) -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            order: BTreeMap::new(),
+            retained_bytes: 0,
+            max_entries,
+            max_bytes,
+            next_insertion: 0,
+            generation: None,
+        }
     }
 
-    /// Get cached page bytes for `(page, snapshot_high)`.
+    /// Insert into the legacy unscoped namespace. Replacing an entry always
+    /// discards its old bytes, even when the replacement is too large to cache.
+    pub fn insert(&mut self, page: PageNumber, snapshot_high: u64, bytes: Vec<u8>) {
+        self.select_generation(None);
+        self.insert_current(page, snapshot_high, bytes);
+    }
+
+    /// Get an unscoped entry; scoped entries cannot leak through this method.
     #[must_use]
     pub fn get(&self, page: PageNumber, snapshot_high: u64) -> Option<&[u8]> {
-        self.entries
-            .get(&(page.get(), snapshot_high))
-            .map(Vec::as_slice)
+        if self.generation.is_some() {
+            return None;
+        }
+        self.get_current(page, snapshot_high)
+    }
+
+    /// Get bytes only if both generation and snapshot match the cache entry.
+    #[must_use]
+    pub fn get_for_snapshot(&self, page: PageNumber, snapshot: NativeIndexSnapshot) -> Option<&[u8]> {
+        if self.generation != Some(snapshot.generation) {
+            return None;
+        }
+        self.get_current(page, snapshot.high)
+    }
+
+    /// Release all retained pages and the generation binding.
+    pub fn clear(&mut self) {
+        self.clear_entries();
+        self.generation = None;
+    }
+
+    /// Number of retained page/snapshot entries.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether this cache retains any pages.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Retained boxed page bytes, excluding map/allocator overhead.
+    #[must_use]
+    pub const fn retained_page_bytes(&self) -> usize {
+        self.retained_bytes
+    }
+
+    fn get_current(&self, page: PageNumber, snapshot_high: u64) -> Option<&[u8]> {
+        self.entries.get(&(page.get(), snapshot_high)).map(|entry| entry.bytes.as_ref())
+    }
+
+    fn clear_entries(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+        self.retained_bytes = 0;
+        self.next_insertion = 0;
+    }
+
+    fn select_generation(&mut self, generation: Option<ObjectId>) {
+        if self.generation != generation {
+            self.clear_entries();
+            self.generation = generation;
+        }
+    }
+
+    fn remove_key(&mut self, key: (u32, u64)) {
+        if let Some(previous) = self.entries.remove(&key) {
+            self.retained_bytes -= previous.bytes.len();
+            self.order.remove(&previous.insertion);
+        }
+    }
+
+    fn insert_current(&mut self, page: PageNumber, snapshot_high: u64, bytes: Vec<u8>) {
+        let key = (page.get(), snapshot_high);
+        self.remove_key(key);
+        let charge = bytes.len();
+        if self.max_entries == 0 || self.max_bytes == 0 || charge > self.max_bytes {
+            return;
+        }
+        // Cache age exhaustion is not database exhaustion. Drop this derived
+        // state rather than wrap an age and collide with a live eviction key.
+        if self.next_insertion == u64::MAX {
+            self.clear_entries();
+        }
+        while self.entries.len() >= self.max_entries
+            || self.retained_bytes > self.max_bytes - charge
+        {
+            let Some((_, oldest)) = self.order.first_key_value() else {
+                return;
+            };
+            let oldest = *oldest;
+            self.remove_key(oldest);
+        }
+        let insertion = self.next_insertion;
+        self.next_insertion += 1;
+        self.order.insert(insertion, key);
+        self.entries.insert(key, NativeCachedPage {
+            bytes: bytes.into_boxed_slice(),
+            insertion,
+        });
+        self.retained_bytes += charge;
+    }
+
+    fn retain_materialized(&mut self, page: PageNumber, snapshot_high: u64, bytes: &[u8]) {
+        // Do not clone a large result merely to discover that it exceeds the
+        // cache budget. Failed optional retention must not fail a valid read.
+        if self.max_entries == 0 || self.max_bytes == 0 || bytes.len() > self.max_bytes {
+            self.remove_key((page.get(), snapshot_high));
+            return;
+        }
+        let mut owned = Vec::new();
+        if owned.try_reserve_exact(bytes.len()).is_err() {
+            self.remove_key((page.get(), snapshot_high));
+            return;
+        }
+        owned.extend_from_slice(bytes);
+        self.insert_current(page, snapshot_high, owned);
     }
 }
 
@@ -386,6 +551,47 @@ pub fn lookup_page_version(
     patch_store: &impl PatchObjectStore,
     symbol_loss_rate_estimate: f64,
 ) -> Result<LookupResult> {
+    cache.select_generation(None);
+    lookup_page_version_cached(
+        page, snapshot_high, segments, cache, base_provider, patch_store, symbol_loss_rate_estimate,
+    )
+}
+
+/// Read through a cache bound to one immutable root/checkpoint-and-index view.
+///
+/// A different generation clears all prior cached pages before lookup; a
+/// failed lookup cannot leave entries from the old generation accessible.
+/// Calls with the same generation may reuse entries at different visibility
+/// bounds. Segment and base providers must belong to that immutable generation
+/// and remain pinned by the caller. A label alone does not establish trust,
+/// completeness, or durable storage lifetime.
+///
+/// # Errors
+/// Propagates the same index, patch and I/O failures as [`lookup_page_version`].
+pub fn lookup_page_version_for_snapshot(
+    page: PageNumber,
+    snapshot: NativeIndexSnapshot,
+    segments: &[PageVersionIndexSegment],
+    cache: &mut NativePageCache,
+    base_provider: &impl BasePageProvider,
+    patch_store: &impl PatchObjectStore,
+    symbol_loss_rate_estimate: f64,
+) -> Result<LookupResult> {
+    cache.select_generation(Some(snapshot.generation));
+    lookup_page_version_cached(
+        page, snapshot.high, segments, cache, base_provider, patch_store, symbol_loss_rate_estimate,
+    )
+}
+
+fn lookup_page_version_cached(
+    page: PageNumber,
+    snapshot_high: u64,
+    segments: &[PageVersionIndexSegment],
+    cache: &mut NativePageCache,
+    base_provider: &impl BasePageProvider,
+    patch_store: &impl PatchObjectStore,
+    symbol_loss_rate_estimate: f64,
+) -> Result<LookupResult> {
     debug!(
         bead_id = NATIVE_INDEX_BEAD_ID,
         logging_standard = NATIVE_INDEX_LOGGING_STANDARD,
@@ -400,7 +606,7 @@ pub fn lookup_page_version(
         symbol_loss_rate_estimate,
     };
 
-    if let Some(cached) = deps.cache.get(page, snapshot_high) {
+    if let Some(cached) = deps.cache.get_current(page, snapshot_high) {
         log_lookup_path(true, false, 0, None);
         return Ok(LookupResult {
             page_bytes: cached.to_vec(),
@@ -458,7 +664,7 @@ fn base_fallback_result(
     segment_scans: u64,
 ) -> Result<LookupResult> {
     let base = base_provider.load_base_page(page)?;
-    cache.insert(page, snapshot_high, base.clone());
+    cache.retain_materialized(page, snapshot_high, &base);
     log_lookup_path(false, filter_hit, segment_scans, None);
     Ok(LookupResult {
         page_bytes: base,
@@ -499,7 +705,7 @@ fn materialized_result(
         );
     }
 
-    deps.cache.insert(page, snapshot_high, page_bytes.clone());
+    deps.cache.retain_materialized(page, snapshot_high, &page_bytes);
     log_lookup_path(false, true, segment_scans, Some(pointer.commit_seq));
     info!(
         bead_id = NATIVE_INDEX_BEAD_ID,
@@ -2783,6 +2989,160 @@ mod tests {
         assert!(defaults.permits_repair(0.0));
         assert!(defaults.permits_repair(0.25));
         assert!(!defaults.permits_repair(0.26));
+    }
+
+
+    fn assert_cache_accounting(cache: &NativePageCache) {
+        assert_eq!(cache.entries.len(), cache.order.len());
+        assert!(cache.entries.len() <= cache.max_entries);
+        assert!(cache.retained_bytes <= cache.max_bytes);
+        assert_eq!(cache.retained_bytes,
+            cache.entries.values().map(|entry| entry.bytes.len()).sum::<usize>());
+        for (key, entry) in &cache.entries {
+            assert_eq!(cache.order.get(&entry.insertion), Some(key));
+        }
+    }
+
+    #[test]
+    fn native_cache_evicts_by_insertion_and_both_limits() {
+        let mut cache = NativePageCache::with_limits(2, 6);
+        cache.insert(page(9), 10, vec![1, 2]);
+        cache.insert(page(2), 10, vec![3, 4]);
+        assert!(cache.get(page(9), 10).is_some()); // FIFO: a hit does not refresh age.
+        cache.insert(page(7), 10, vec![5, 6]);
+        assert!(cache.get(page(9), 10).is_none());
+        assert_eq!(cache.get(page(2), 10), Some([3, 4].as_slice()));
+        cache.insert(page(8), 10, vec![7, 8, 9, 10, 11]);
+        assert_eq!(cache.len(), 1, "byte budget may evict multiple entries");
+        assert_eq!(cache.get(page(8), 10), Some([7, 8, 9, 10, 11].as_slice()));
+        assert_cache_accounting(&cache);
+    }
+
+    #[test]
+    fn native_cache_replacements_do_not_accumulate_eviction_metadata() {
+        let mut cache = NativePageCache::with_limits(3, 20);
+        for n in 0..1000 {
+            cache.insert(page(2), 10, vec![0xAA; 1 + n % 10]);
+            assert_eq!(cache.len(), 1);
+            assert_eq!(cache.order.len(), 1);
+            assert_cache_accounting(&cache);
+        }
+        let mut spare_capacity = Vec::with_capacity(40);
+        spare_capacity.push(1);
+        cache.insert(page(2), 10, spare_capacity);
+        assert_eq!(cache.retained_page_bytes(), 1, "boxing discards spare Vec capacity");
+        assert_cache_accounting(&cache.clone());
+        cache.insert(page(2), 10, vec![1; 40]);
+        assert!(cache.get(page(2), 10).is_none(), "do not retain stale replaced bytes");
+        assert!(cache.is_empty());
+        assert_cache_accounting(&cache);
+    }
+
+    #[test]
+    fn native_cache_zero_limits_and_oversized_results_preserve_reads() {
+        for (entries, bytes) in [(0, 100), (100, 0), (1, 3)] {
+            let mut cache = NativePageCache::with_limits(entries, bytes);
+            let base = TestBasePages::new([(page(2), b"uncached result".to_vec())]);
+            let store = TestPatchStore::new([]);
+            for _ in 0..2 {
+                let result = lookup_page_version(page(2), 10, &[], &mut cache, &base, &store, 0.0)
+                    .expect("retention is optional");
+                assert_eq!(result.page_bytes, b"uncached result".to_vec());
+                assert!(!result.trace.cache_hit);
+                assert!(cache.is_empty());
+                assert_cache_accounting(&cache);
+            }
+            assert_eq!(base.loads(), 2);
+        }
+    }
+
+    #[test]
+    fn native_cache_scopes_reused_page_and_sequence_numbers_to_generation() {
+        let p = page(2);
+        let first = NativeIndexSnapshot { generation: oid(1), high: 10 };
+        let second = NativeIndexSnapshot { generation: oid(2), high: 10 };
+        let a = TestBasePages::new([(p, b"root-a".to_vec())]);
+        let b = TestBasePages::new([(p, b"root-b".to_vec())]);
+        let store = TestPatchStore::new([]);
+        let mut cache = NativePageCache::with_limits(8, 100);
+        let first_read = lookup_page_version_for_snapshot(p, first, &[], &mut cache, &a, &store, 0.0).unwrap();
+        let hit = lookup_page_version_for_snapshot(p, first, &[], &mut cache, &a, &store, 0.0).unwrap();
+        assert_eq!(first_read.page_bytes, b"root-a".to_vec());
+        assert!(hit.trace.cache_hit);
+        assert_eq!(a.loads(), 1);
+        assert!(cache.get(p, 10).is_none(), "scoped entries are not unscoped entries");
+        assert!(cache.get_for_snapshot(p, second).is_none());
+        let changed = lookup_page_version_for_snapshot(p, second, &[], &mut cache, &b, &store, 0.0).unwrap();
+        assert!(!changed.trace.cache_hit);
+        assert_eq!(changed.page_bytes, b"root-b".to_vec());
+        assert!(cache.get_for_snapshot(p, first).is_none());
+        assert_eq!(cache.get_for_snapshot(p, second), Some(b"root-b".as_slice()));
+        // Mixing APIs must not smuggle the unscoped cache back into root B.
+        let legacy = lookup_page_version(p, 10, &[], &mut cache, &a, &store, 0.0).unwrap();
+        assert_eq!(legacy.page_bytes, b"root-a".to_vec());
+        assert!(!legacy.trace.cache_hit);
+        assert!(cache.get_for_snapshot(p, second).is_none());
+        let scoped = lookup_page_version_for_snapshot(p, second, &[], &mut cache, &b, &store, 0.0).unwrap();
+        assert_eq!(scoped.page_bytes, b"root-b".to_vec());
+        assert!(!scoped.trace.cache_hit);
+        cache.insert(p, 10, b"manual".to_vec());
+        assert!(cache.get_for_snapshot(p, second).is_none());
+        assert_eq!(cache.get(p, 10), Some(b"manual".as_slice()));
+        assert_cache_accounting(&cache);
+    }
+
+    #[test]
+    fn native_cache_keeps_visibility_bounds_separate_within_one_generation() {
+        let p = page(2);
+        let low = pointer(10, 0x10, PatchKind::FullImage, None);
+        let high = pointer(20, 0x20, PatchKind::FullImage, None);
+        let segments = [PageVersionIndexSegment::new(10, 20, vec![(p, low), (p, high)])];
+        let base = TestBasePages::new([]);
+        let store = TestPatchStore::new([(oid(0x10), b"low".to_vec()), (oid(0x20), b"high".to_vec())]);
+        let mut cache = NativePageCache::with_limits(8, 100);
+        for (seq, expected, cached) in [(10, b"low".as_slice(), false), (20, b"high".as_slice(), false), (10, b"low".as_slice(), true)] {
+            let snapshot = NativeIndexSnapshot { generation: oid(1), high: seq };
+            let result = lookup_page_version_for_snapshot(p, snapshot, &segments, &mut cache, &base, &store, 0.0).unwrap();
+            assert_eq!(result.page_bytes.as_slice(), expected);
+            assert_eq!(result.trace.cache_hit, cached);
+        }
+        assert_eq!(store.fetches(), 2);
+        assert_eq!(cache.len(), 2);
+        assert_cache_accounting(&cache);
+    }
+
+    #[test]
+    fn native_cache_failed_generation_change_cannot_reuse_old_bytes() {
+        let p = page(2);
+        let a = NativeIndexSnapshot { generation: oid(1), high: 10 };
+        let b = NativeIndexSnapshot { generation: oid(2), high: 10 };
+        let source = TestBasePages::new([(p, b"old".to_vec())]);
+        let missing = TestBasePages::new([]);
+        let store = TestPatchStore::new([]);
+        let mut cache = NativePageCache::default();
+        lookup_page_version_for_snapshot(p, a, &[], &mut cache, &source, &store, 0.0).unwrap();
+        assert!(lookup_page_version_for_snapshot(p, b, &[], &mut cache, &missing, &store, 0.0).is_err());
+        assert!(cache.get_for_snapshot(p, a).is_none());
+        assert!(cache.get_for_snapshot(p, b).is_none());
+        assert!(cache.is_empty());
+        assert_cache_accounting(&cache);
+    }
+
+    #[test]
+    fn native_cache_clear_clone_and_age_exhaustion_preserve_accounting() {
+        let mut cache = NativePageCache::with_limits(3, 100);
+        cache.insert(page(2), 10, vec![1, 2, 3]);
+        let mut cloned = cache.clone();
+        cache.clear();
+        assert!(cache.is_empty());
+        assert_eq!(cache.retained_page_bytes(), 0);
+        assert_eq!(cloned.get(page(2), 10), Some([1, 2, 3].as_slice()));
+        cloned.next_insertion = u64::MAX;
+        cloned.insert(page(3), 10, vec![4, 5]);
+        assert!(cloned.get(page(2), 10).is_none());
+        assert_eq!(cloned.get(page(3), 10), Some([4, 5].as_slice()));
+        assert_cache_accounting(&cloned);
+        assert_cache_accounting(&cache);
     }
 
 }
