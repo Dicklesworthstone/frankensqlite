@@ -1051,6 +1051,9 @@ mod bp {
     pub const UNARY: u8 = 23;
     // JSON access (-> ->>): Same as CONCAT
     pub const JSON: (u8, u8) = (19, 20);
+    // Unparenthesized column DEFAULT operand: stock's grammar takes one
+    // `[PLUS|MINUS] term`, so stop before every postfix and infix operator.
+    pub const DEFAULT_TERM: u8 = COLLATE + 1;
 }
 
 struct ParseMachine<'a> {
@@ -1061,8 +1064,12 @@ struct ParseMachine<'a> {
 
 impl<'a> ParseMachine<'a> {
     fn for_expr(parser: &'a mut Parser) -> Self {
+        Self::for_expr_with_min_bp(parser, 0)
+    }
+
+    fn for_expr_with_min_bp(parser: &'a mut Parser, min_bp: u8) -> Self {
         let mut controls = InlineStack::new();
-        controls.push(ParseControl::ExprStart { min_bp: 0 });
+        controls.push(ParseControl::ExprStart { min_bp });
         Self {
             parser,
             controls,
@@ -3563,6 +3570,17 @@ impl Parser {
 
     pub(crate) fn parse_expr_tracked(&mut self) -> Result<ParsedExpr, ParseError> {
         ParseMachine::for_expr(self).run_expr()
+    }
+
+    /// Parse the operand of an unparenthesized column `DEFAULT`.
+    ///
+    /// Stock accepts only `DEFAULT [PLUS|MINUS] term` here, so in
+    /// `DEFAULT 0 NOT NULL` or `DEFAULT 'x' COLLATE NOCASE` the trailing words
+    /// are the next column constraints, not postfix operators on the default.
+    pub(crate) fn parse_default_term(&mut self) -> Result<Expr, ParseError> {
+        ParseMachine::for_expr_with_min_bp(self, bp::DEFAULT_TERM)
+            .run_expr()
+            .map(|parsed| parsed.expr)
     }
 
     pub(crate) fn parse_select_tracked_machine(

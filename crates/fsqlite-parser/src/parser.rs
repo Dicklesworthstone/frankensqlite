@@ -2134,8 +2134,8 @@ impl Parser {
                 // ``DEFAULT `abc` `` all yield the string 'abc'; `DEFAULT (abc)`
                 // stays an expression and is later rejected as non-constant.
                 // Keyword constants (TRUE/FALSE/NULL/CURRENT_*) lex as keywords
-                // (not Id), so they fall through to the normal expression parse
-                // below and keep their literal meaning.
+                // (not Id), so they fall through to the term parse below and
+                // keep their literal meaning.
                 let span = self.current_span();
                 self.advance();
                 ColumnConstraintKind::Default(DefaultValue::Expr(Expr::Literal(
@@ -2143,7 +2143,9 @@ impl Parser {
                     span,
                 )))
             } else {
-                let expr = self.parse_expr()?;
+                // A full expression parse would read `DEFAULT 0 NOT NULL` as
+                // the default `0 IS NOT NULL` (= 1) and drop the constraint.
+                let expr = self.parse_default_term()?;
                 ColumnConstraintKind::Default(DefaultValue::Expr(expr))
             }
         } else if self.eat_kw(&TokenKind::KwCollate) {
@@ -8085,6 +8087,110 @@ mod tests {
         } else {
             unreachable!("expected CreateTable");
         }
+    }
+
+    #[test]
+    fn test_column_default_term_stops_before_next_constraint() {
+        // Stock: `ccons ::= DEFAULT [PLUS|MINUS] term`. The words after the
+        // term are further column constraints, never postfix operators.
+        let stmt = parse_one(
+            "CREATE TABLE t (a INTEGER DEFAULT 42 NOT NULL, \
+             b TEXT DEFAULT 'x' COLLATE NOCASE, c INTEGER DEFAULT -1 UNIQUE, \
+             d TEXT DEFAULT CURRENT_TIMESTAMP NOT NULL, e REAL DEFAULT +2.5 CHECK (e > 0))",
+        );
+        let Statement::CreateTable(ct) = stmt else {
+            unreachable!("expected CreateTable");
+        };
+        let CreateTableBody::Columns { columns, .. } = &ct.body else {
+            unreachable!("expected Columns body");
+        };
+        let kinds = |i: usize| {
+            columns[i]
+                .constraints
+                .iter()
+                .map(|c| &c.kind)
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            matches!(
+                kinds(0).as_slice(),
+                [
+                    ColumnConstraintKind::Default(DefaultValue::Expr(Expr::Literal(
+                        Literal::Integer(42),
+                        _
+                    ))),
+                    ColumnConstraintKind::NotNull { .. }
+                ]
+            ),
+            "DEFAULT 42 NOT NULL: {:?}",
+            kinds(0)
+        );
+        assert!(
+            matches!(
+                kinds(1).as_slice(),
+                [
+                    ColumnConstraintKind::Default(DefaultValue::Expr(Expr::Literal(
+                        Literal::String(s),
+                        _
+                    ))),
+                    ColumnConstraintKind::Collate(c)
+                ] if s == "x" && c.eq_ignore_ascii_case("NOCASE")
+            ),
+            "DEFAULT 'x' COLLATE NOCASE: {:?}",
+            kinds(1)
+        );
+        assert!(
+            matches!(
+                kinds(2).as_slice(),
+                [
+                    ColumnConstraintKind::Default(DefaultValue::Expr(Expr::UnaryOp {
+                        op: UnaryOp::Negate,
+                        ..
+                    })),
+                    ColumnConstraintKind::Unique { .. }
+                ]
+            ),
+            "DEFAULT -1 UNIQUE: {:?}",
+            kinds(2)
+        );
+        assert!(
+            matches!(
+                kinds(3).as_slice(),
+                [
+                    ColumnConstraintKind::Default(DefaultValue::Expr(_)),
+                    ColumnConstraintKind::NotNull { .. }
+                ]
+            ),
+            "DEFAULT CURRENT_TIMESTAMP NOT NULL: {:?}",
+            kinds(3)
+        );
+        assert!(
+            matches!(
+                kinds(4).as_slice(),
+                [
+                    ColumnConstraintKind::Default(DefaultValue::Expr(_)),
+                    ColumnConstraintKind::Check(_)
+                ]
+            ),
+            "DEFAULT +2.5 CHECK: {:?}",
+            kinds(4)
+        );
+    }
+
+    #[test]
+    fn test_column_default_unparenthesized_operator_is_syntax_error() {
+        // Stock rejects these with "near ...: syntax error"; only
+        // `DEFAULT (expr)` takes a full expression.
+        for sql in [
+            "CREATE TABLE t (a INTEGER DEFAULT 1 + 2)",
+            "CREATE TABLE t (a TEXT DEFAULT 'a' || 'b')",
+            "CREATE TABLE t (a INTEGER DEFAULT 0 IS NOT NULL)",
+        ] {
+            let mut p = Parser::from_sql(sql);
+            let (_, errs) = p.parse_all();
+            assert!(!errs.is_empty(), "expected a syntax error for `{sql}`");
+        }
+        parse_one("CREATE TABLE t (a INTEGER DEFAULT (1 + 2) NOT NULL)");
     }
 
     #[test]

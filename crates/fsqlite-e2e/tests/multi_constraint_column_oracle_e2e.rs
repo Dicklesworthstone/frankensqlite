@@ -169,3 +169,96 @@ fn check_and_default_expression() {
         .await;
     });
 }
+
+// An unparenthesized DEFAULT takes one signed term, so the constraints that
+// follow it keep their meaning. Parsing `DEFAULT 0 NOT NULL` as the default
+// `0 IS NOT NULL` used to store 1 and drop the NOT NULL constraint.
+#[test]
+fn default_term_before_not_null_and_collate() {
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, \
+             deleted INTEGER DEFAULT 0 NOT NULL, \
+             score INTEGER DEFAULT -7 CHECK (score < 100), \
+             kind TEXT DEFAULT 'a' COLLATE NOCASE)",
+                "INSERT INTO t(id) VALUES (1)", // all defaults
+                "INSERT INTO t(id, deleted) VALUES (2, NULL)", // NOT NULL -> error
+                "INSERT INTO t(id, kind) VALUES (3, 'A')",
+                "ALTER TABLE t ADD COLUMN flag INTEGER DEFAULT 42 NOT NULL",
+                "INSERT INTO t(id) VALUES (5)",
+                "CREATE TABLE bad (a INTEGER DEFAULT 1 + 2)", // syntax error in both
+            ],
+            &[
+                "SELECT id, deleted, score, kind, flag FROM t ORDER BY id",
+                "SELECT count(*) FROM t WHERE kind = 'A'", // NOCASE -> 3
+                "SELECT name, \"notnull\", dflt_value FROM pragma_table_info('t') ORDER BY cid",
+            ],
+            "default_term_before_not_null_and_collate",
+        )
+        .await;
+    });
+}
+
+// Same shape on a database file created by stock SQLite: FrankenSQLite
+// re-parses the stored schema text, and stock must still find the rows valid.
+#[test]
+fn default_term_on_stock_created_file() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir_in(std::env::temp_dir())
+            .or_else(|_| tempfile::tempdir_in("."))
+            .expect("tempdir");
+        let path = dir.path().join("stock_default_term.db");
+        {
+            let c = rusqlite::Connection::open(&path).expect("stock create");
+            c.execute_batch(
+                "CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT NOT NULL, \
+                 deleted INTEGER DEFAULT 0 NOT NULL, kind TEXT DEFAULT 'a' COLLATE NOCASE)",
+            )
+            .expect("stock schema");
+        }
+        let f = Connection::open(path.to_str().expect("utf8 path"))
+            .await
+            .expect("frank open");
+        f.execute("INSERT INTO items(name) VALUES ('x')")
+            .await
+            .expect("default insert");
+        assert!(
+            f.execute("INSERT INTO items(name, deleted) VALUES ('y', NULL)")
+                .await
+                .is_err(),
+            "NOT NULL after DEFAULT must still be enforced on a stock schema"
+        );
+        f.execute("INSERT INTO items(name, kind) VALUES ('z', 'A')")
+            .await
+            .expect("collated insert");
+        assert_eq!(
+            frank_rows(&f, "SELECT name, deleted, kind FROM items ORDER BY name")
+                .await
+                .expect("frank rows"),
+            vec![
+                vec!["'x'".to_owned(), "0".to_owned(), "'a'".to_owned()],
+                vec!["'z'".to_owned(), "0".to_owned(), "'A'".to_owned()],
+            ]
+        );
+        f.close().await.expect("frank close");
+
+        let c = rusqlite::Connection::open(&path).expect("stock reopen");
+        assert_eq!(
+            sqlite_rows(&c, "SELECT name, deleted, kind FROM items ORDER BY name")
+                .expect("stock rows"),
+            vec![
+                vec!["'x'".to_owned(), "0".to_owned(), "'a'".to_owned()],
+                vec!["'z'".to_owned(), "0".to_owned(), "'A'".to_owned()],
+            ]
+        );
+        assert_eq!(
+            sqlite_rows(&c, "SELECT count(*) FROM items WHERE kind = 'A'").expect("nocase"),
+            vec![vec!["2".to_owned()]]
+        );
+        assert_eq!(
+            sqlite_rows(&c, "PRAGMA integrity_check").expect("integrity"),
+            vec![vec!["'ok'".to_owned()]]
+        );
+    });
+}
