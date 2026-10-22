@@ -45,6 +45,9 @@ const ANSI_DIM: &str = "\x1b[2m";
 struct CliOptions {
     db_path: String,
     command: Option<String>,
+    /// Stock `sqlite3 FILENAME [SQL...]`: arguments after the database path,
+    /// each run as its own command.
+    sql_args: Vec<String>,
     init_path: Option<String>,
     verify_proof_path: Option<String>,
     verify_policy_id: u32,
@@ -345,16 +348,23 @@ where
             }
         }
 
-        if let Some(command) = options.command {
-            return run_command(
-                &mut connection,
-                &mut current_db_path,
-                &mut output_options,
-                &command,
-                out,
-                err,
-            )
-            .await;
+        if options.command.is_some() || !options.sql_args.is_empty() {
+            // Like stock, the first command that fails ends the run.
+            for command in options.command.iter().chain(&options.sql_args) {
+                let code = run_command(
+                    &mut connection,
+                    &mut current_db_path,
+                    &mut output_options,
+                    command,
+                    out,
+                    err,
+                )
+                .await;
+                if code != 0 {
+                    return code;
+                }
+            }
+            return 0;
         }
 
         run_repl(
@@ -388,6 +398,7 @@ where
     let mut db_path = String::from(DEFAULT_DB_PATH);
     let mut has_path = false;
     let mut command: Option<String> = None;
+    let mut sql_args = Vec::new();
     let mut init_path: Option<String> = None;
     let mut verify_proof_path: Option<String> = None;
     let mut verify_policy_id = DEFAULT_VERIFY_POLICY_ID;
@@ -570,9 +581,8 @@ where
                     ));
                 }
                 if has_path {
-                    return Err(String::from(
-                        "too many positional arguments; expected at most one DB path",
-                    ));
+                    sql_args.push(arg_str.to_owned());
+                    continue;
                 }
 
                 arg_str.clone_into(&mut db_path);
@@ -590,6 +600,7 @@ where
     Ok(CliOptions {
         db_path,
         command,
+        sql_args,
         init_path,
         verify_proof_path,
         verify_policy_id,
@@ -2624,8 +2635,9 @@ where
 {
     writeln!(
         out,
-        "Usage: fsqlite [DB_PATH] [-c|--command SQL] [-batch|--batch] [-init FILE]\n\
+        "Usage: fsqlite [DB_PATH [SQL...]] [-c|--command SQL] [-batch|--batch] [-init FILE]\n\
          \n\
+         Each SQL argument after DB_PATH runs as its own command, as in stock sqlite3.\n\
          Piped input runs in batch mode automatically (no prompts).\n\
          `-batch` forces batch mode even on a TTY.\n\
          `-init FILE` executes a startup script before command mode or the REPL.\n\
@@ -2641,6 +2653,7 @@ where
          fsqlite app.db\n\
          fsqlite --batch --init boot.sql app.db\n\
          fsqlite -c \"SELECT 1 + 2;\"\n\
+         fsqlite app.db \"SELECT count(*) FROM users\" \".tables\"\n\
          fsqlite app.db --command \"SELECT * FROM users;\"\n\
          fsqlite --verify-proof decode_proof.json\n",
     )
@@ -2871,10 +2884,13 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_multiple_paths_fails() {
-        let error = parse_from(&["fsqlite", "a.db", "b.db"])
-            .expect_err("multiple positional args should fail");
-        assert!(error.contains("too many positional arguments"));
+    fn test_parse_positional_sql_after_db_path() {
+        let options = parse_from(&["fsqlite", "a.db", "SELECT 1", "-batch", ".tables"])
+            .expect("stock-style SQL arguments should parse");
+        assert_eq!(options.db_path, "a.db");
+        assert_eq!(options.sql_args, ["SELECT 1", ".tables"]);
+        assert!(options.force_batch);
+        assert!(options.command.is_none());
     }
 
     #[test]
@@ -2989,6 +3005,54 @@ SELECT 'log', v FROM log;\n\
                 stdout.contains("triggers|1") && stdout.contains("log|pos"),
                 "the trigger must be created whole and fire once, got: {stdout}"
             );
+        });
+    }
+
+    #[test]
+    fn test_positional_sql_arguments_run_in_order_like_stock() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let db = dir.path().join("positional.db");
+            let db_arg = db.to_string_lossy().into_owned();
+            let argv = |sql: &[&str]| {
+                let mut args = vec![OsString::from("fsqlite"), OsString::from(&db_arg)];
+                args.extend(sql.iter().map(OsString::from));
+                args
+            };
+
+            // `sqlite3 DB SQL...`: each argument is one command, run in order,
+            // with no trailing semicolon needed.
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let args = argv(&[
+                "CREATE TABLE t(x)",
+                "INSERT INTO t VALUES (1), (2)",
+                "SELECT count(*), sum(x) FROM t",
+                ".tables",
+            ]);
+            let exit_code = run(args, &mut Cursor::new(Vec::new()), &mut out, &mut err).await;
+            let stderr = String::from_utf8_lossy(&err);
+            assert_eq!(exit_code, 0, "stderr: {stderr}");
+            let stdout = String::from_utf8(out).expect("output should be utf-8");
+            let mut lines = stdout.lines();
+            assert_eq!(lines.next(), Some("2|3"), "got: {stdout}");
+            assert_eq!(lines.next().map(str::trim), Some("t"), "got: {stdout}");
+
+            // Like stock, the first failing argument exits 1 and the rest do not run.
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let args = argv(&["INSERT INTO missing VALUES (1)", "INSERT INTO t VALUES (3)"]);
+            let exit_code = run(args, &mut Cursor::new(Vec::new()), &mut out, &mut err).await;
+            assert_eq!(exit_code, 1);
+            assert!(
+                String::from_utf8_lossy(&err).contains("missing"),
+                "the failing statement is reported"
+            );
+            let stock = rusqlite::Connection::open(&db).expect("stock open");
+            let rows: i64 = stock
+                .query_row("SELECT count(*) FROM t", [], |row| row.get(0))
+                .expect("stock count");
+            assert_eq!(rows, 2, "the argument after the failure did not run");
         });
     }
 
