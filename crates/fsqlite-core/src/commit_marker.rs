@@ -78,6 +78,14 @@ pub enum MarkerError {
     SequenceOverflow,
     /// Recovery could not reserve space for another accepted marker.
     OutOfMemory,
+    /// Caller-supplied bound on recovered records would be exceeded.
+    RecoveryLimitExceeded { max_records: usize },
+    /// Segment identities must increase in replay order.
+    SegmentOrder { previous: u64, actual: u64 },
+    /// An empty segment cannot be followed by another segment.
+    EmptyInteriorSegment { segment_id: u64 },
+    /// The recovered stream does not end at the caller's trusted tip.
+    ExpectedTipMismatch { commit_seq: u64 },
 }
 
 impl std::fmt::Display for MarkerError {
@@ -139,6 +147,18 @@ impl std::fmt::Display for MarkerError {
             ),
             Self::SequenceOverflow => f.write_str("marker commit sequence overflow"),
             Self::OutOfMemory => f.write_str("unable to reserve marker recovery memory"),
+            Self::RecoveryLimitExceeded { max_records } => {
+                write!(f, "marker recovery exceeds record limit {max_records}")
+            }
+            Self::SegmentOrder { previous, actual } => {
+                write!(f, "marker segment order violation: {actual} follows {previous}")
+            }
+            Self::EmptyInteriorSegment { segment_id } => {
+                write!(f, "empty marker segment {segment_id} precedes another segment")
+            }
+            Self::ExpectedTipMismatch { commit_seq } => {
+                write!(f, "recovered marker stream does not end at expected tip {commit_seq}")
+            }
         }
     }
 }
@@ -533,6 +553,13 @@ pub fn check_segment_integrity(segment_data: &[u8]) -> Result<u64, MarkerError> 
 /// of being treated as an incomplete append. The first record's predecessor
 /// remains unanchored; callers combining segments must validate that boundary.
 pub fn recover_valid_prefix(segment_data: &[u8]) -> Result<Vec<CommitMarkerRecord>, MarkerError> {
+    recover_valid_prefix_with_limit(segment_data, usize::MAX)
+}
+
+fn recover_valid_prefix_with_limit(
+    segment_data: &[u8],
+    max_records: usize,
+) -> Result<Vec<CommitMarkerRecord>, MarkerError> {
     if segment_data.len() < MARKER_SEGMENT_HEADER_BYTES {
         return Err(MarkerError::HeaderTooShort);
     }
@@ -572,6 +599,9 @@ pub fn recover_valid_prefix(segment_data: &[u8]) -> Result<Vec<CommitMarkerRecor
         if let Some(previous) = records.last() {
             validate_successor(previous, &record)?;
         }
+        if records.len() == max_records {
+            return Err(MarkerError::RecoveryLimitExceeded { max_records });
+        }
         records
             .try_reserve(1)
             .map_err(|_| MarkerError::OutOfMemory)?;
@@ -579,6 +609,111 @@ pub fn recover_valid_prefix(segment_data: &[u8]) -> Result<Vec<CommitMarkerRecor
     }
 
     Ok(records)
+}
+
+/// Recover a bounded, contiguous marker stream across ordered segment buffers.
+///
+/// Checks sequence, predecessor hash, and nondecreasing time across segment
+/// boundaries as well as within each segment. Segment IDs must strictly
+/// increase; inputs are not sorted, merged, or deduplicated by this routine.
+/// Every nonfinal segment must be nonempty and completely valid. Only the
+/// final segment may have a torn/checksum-invalid suffix, which is not replayed.
+/// An empty final segment is allowed if its start sequence extends the tip.
+///
+/// `predecessor`, when supplied, is the caller's trusted checkpoint marker
+/// immediately before the first segment. Its content hash is verified, and
+/// the first segment must extend its sequence, identity, and time. Without a
+/// predecessor, the first segment is unanchored; this is not authentication.
+/// `expected_tip`, when supplied, requires the recovered tip (or predecessor
+/// for an empty stream) to match that trusted record exactly. This prevents
+/// a torn tail from silently discarding a commit known to be durable. Without
+/// an expected tip, a valid prefix does not establish historical completeness.
+/// Both anchors must come from trusted caller state, not the input stream.
+/// This routine performs no file mutation or capsule application.
+///
+/// `max_records` bounds the number of decoded records retained, not the input
+/// buffers or total allocator overhead. The bound is enforced during decoding
+/// rather than after allocating a whole segment. Errors return no partial
+/// stream, so a caller cannot accidentally publish a prefix after a bad seam.
+pub fn recover_marker_stream(
+    segments: &[&[u8]],
+    predecessor: Option<&CommitMarkerRecord>,
+    expected_tip: Option<&CommitMarkerRecord>,
+    max_records: usize,
+) -> Result<Vec<CommitMarkerRecord>, MarkerError> {
+    for anchor in [predecessor, expected_tip].into_iter().flatten() {
+        if !anchor.verify_marker_id() {
+            return Err(MarkerError::MarkerIdMismatch {
+                commit_seq: anchor.commit_seq,
+            });
+        }
+    }
+    let mut combined: Vec<CommitMarkerRecord> = Vec::new();
+    let mut previous_segment_id = None;
+    for (index, bytes) in segments.iter().enumerate() {
+        let header = MarkerSegmentHeader::decode(bytes)?;
+        if let Some(previous) = previous_segment_id
+            && header.segment_id <= previous
+        {
+            return Err(MarkerError::SegmentOrder {
+                previous,
+                actual: header.segment_id,
+            });
+        }
+        if let Some(previous) = combined.last().or(predecessor) {
+            let expected = previous
+                .commit_seq
+                .checked_add(1)
+                .ok_or(MarkerError::SequenceOverflow)?;
+            if header.start_commit_seq != expected {
+                return Err(MarkerError::CommitSeqMismatch {
+                    expected,
+                    actual: header.start_commit_seq,
+                });
+            }
+        }
+        let remaining = max_records - combined.len();
+        let mut records =
+            recover_valid_prefix_with_limit(bytes, remaining).map_err(|error| match error {
+                MarkerError::RecoveryLimitExceeded { .. } => {
+                    MarkerError::RecoveryLimitExceeded { max_records }
+                }
+                other => other,
+            })?;
+        if index + 1 < segments.len() {
+            let trailing_bytes = bytes.len()
+                - MARKER_SEGMENT_HEADER_BYTES
+                - records.len() * COMMIT_MARKER_RECORD_BYTES;
+            if trailing_bytes != 0 {
+                return Err(MarkerError::TornTail {
+                    complete_records: u64::try_from(records.len())
+                        .map_err(|_| MarkerError::SequenceOverflow)?,
+                    trailing_bytes,
+                });
+            }
+            if records.is_empty() {
+                return Err(MarkerError::EmptyInteriorSegment {
+                    segment_id: header.segment_id,
+                });
+            }
+        }
+        if let (Some(previous), Some(first)) = (combined.last().or(predecessor), records.first()) {
+            validate_successor(previous, first)?;
+        }
+        combined
+            .try_reserve(records.len())
+            .map_err(|_| MarkerError::OutOfMemory)?;
+        combined.append(&mut records);
+        previous_segment_id = Some(header.segment_id);
+    }
+    if let Some(expected) = expected_tip
+        && combined.last().or(predecessor) != Some(expected)
+    {
+        return Err(MarkerError::ExpectedTipMismatch {
+            commit_seq: expected.commit_seq,
+        });
+    }
+    Ok(combined)
 }
 
 /// Validate adjacency after both records' individual hashes were checked.
@@ -685,6 +820,233 @@ mod tests {
             bytes.extend_from_slice(&record.encode());
         }
         bytes
+    }
+
+    fn stream_segment(id: u64, start: u64, records: &[CommitMarkerRecord]) -> Vec<u8> {
+        let mut bytes = Vec::from(MarkerSegmentHeader::new(id, start).encode());
+        for record in records {
+            bytes.extend_from_slice(&record.encode());
+        }
+        bytes
+    }
+
+    fn stream_fixture() -> (CommitMarkerRecord, Vec<CommitMarkerRecord>, Vec<Vec<u8>>) {
+        let predecessor = make_test_record(9, [9; ID_SIZE]);
+        let mut previous = predecessor.marker_id;
+        let records: Vec<_> = (10..14)
+            .map(|seq| {
+                let record = make_test_record(seq, previous);
+                previous = record.marker_id;
+                record
+            })
+            .collect();
+        let segments = vec![
+            stream_segment(4, 10, &records[..2]),
+            stream_segment(5, 12, &records[2..]),
+        ];
+        (predecessor, records, segments)
+    }
+
+    #[test]
+    fn stream_recovery_checks_checkpoint_and_expected_tip() {
+        let (previous, records, segments) = stream_fixture();
+        let inputs: Vec<_> = segments.iter().map(Vec::as_slice).collect();
+        assert_eq!(
+            recover_marker_stream(&inputs, Some(&previous), records.last(), 4).unwrap(),
+            records
+        );
+        let wrong_anchor = make_test_record(9, [8; ID_SIZE]);
+        assert_eq!(
+            recover_marker_stream(&inputs, Some(&wrong_anchor), None, 4),
+            Err(MarkerError::HashChainMismatch { commit_seq: 10 })
+        );
+    }
+
+    #[test]
+    fn stream_recovery_rejects_internally_valid_spliced_segment() {
+        let (previous, records, mut segments) = stream_fixture();
+        let third = make_test_record(12, [0xAB; ID_SIZE]);
+        let fourth = make_test_record(13, third.marker_id);
+        segments[1] = stream_segment(5, 12, &[third, fourth]);
+        assert_eq!(recover_valid_prefix(&segments[0]).unwrap(), records[..2]);
+        assert!(recover_valid_prefix(&segments[1]).is_ok());
+        let inputs: Vec<_> = segments.iter().map(Vec::as_slice).collect();
+        assert_eq!(
+            recover_marker_stream(&inputs, Some(&previous), None, 4),
+            Err(MarkerError::HashChainMismatch { commit_seq: 12 })
+        );
+    }
+
+    #[test]
+    fn stream_recovery_checks_timestamp_at_segment_boundary() {
+        let (previous, records, mut segments) = stream_fixture();
+        let time = records[1].commit_time_unix_ns - 1;
+        let third =
+            CommitMarkerRecord::new(12, time, [1; ID_SIZE], [2; ID_SIZE], records[1].marker_id);
+        let fourth =
+            CommitMarkerRecord::new(13, time + 1, [3; ID_SIZE], [4; ID_SIZE], third.marker_id);
+        segments[1] = stream_segment(5, 12, &[third, fourth]);
+        assert!(recover_valid_prefix(&segments[1]).is_ok());
+        let inputs: Vec<_> = segments.iter().map(Vec::as_slice).collect();
+        assert_eq!(
+            recover_marker_stream(&inputs, Some(&previous), None, 4),
+            Err(MarkerError::TimestampRegression {
+                commit_seq: 12,
+                previous: time + 1,
+                actual: time,
+            })
+        );
+    }
+
+    #[test]
+    fn stream_recovery_rejects_gaps_overlaps_and_segment_reordering() {
+        let (previous, records, segments) = stream_fixture();
+        for start in [11, 13] {
+            let second = stream_segment(5, start, &records[2..]);
+            assert_eq!(
+                recover_marker_stream(&[&segments[0], &second], Some(&previous), None, 4),
+                Err(MarkerError::CommitSeqMismatch {
+                    expected: 12,
+                    actual: start,
+                })
+            );
+        }
+        for id in [3, 4] {
+            let second = stream_segment(id, 12, &records[2..]);
+            assert_eq!(
+                recover_marker_stream(&[&segments[0], &second], Some(&previous), None, 4),
+                Err(MarkerError::SegmentOrder {
+                    previous: 4,
+                    actual: id,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn stream_recovery_never_skips_a_torn_interior_suffix() {
+        let (previous, records, segments) = stream_fixture();
+        let mut bad_record = records[2].encode();
+        bad_record[COMMIT_MARKER_RECORD_BYTES - 1] ^= 1;
+        for suffix in [&bad_record[..1], &bad_record[..]] {
+            let mut first = segments[0].clone();
+            first.extend_from_slice(suffix);
+            assert_eq!(recover_valid_prefix(&first).unwrap(), records[..2]);
+            assert_eq!(
+                recover_marker_stream(&[&first, &segments[1]], Some(&previous), None, 4),
+                Err(MarkerError::TornTail {
+                    complete_records: 2,
+                    trailing_bytes: suffix.len(),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn stream_recovery_torn_final_record_cannot_hide_expected_commit() {
+        let (previous, records, mut segments) = stream_fixture();
+        let end = segments[1].len() - 21;
+        segments[1].truncate(end);
+        let inputs: Vec<_> = segments.iter().map(Vec::as_slice).collect();
+        assert_eq!(
+            recover_marker_stream(&inputs, Some(&previous), None, 3).unwrap(),
+            records[..3]
+        );
+        assert_eq!(
+            recover_marker_stream(&inputs, Some(&previous), Some(&records[2]), 3).unwrap(),
+            records[..3]
+        );
+        assert_eq!(
+            recover_marker_stream(&inputs, Some(&previous), records.last(), 4),
+            Err(MarkerError::ExpectedTipMismatch { commit_seq: 13 })
+        );
+    }
+
+    #[test]
+    fn stream_recovery_enforces_one_record_budget_across_segments() {
+        let (previous, records, segments) = stream_fixture();
+        let inputs: Vec<_> = segments.iter().map(Vec::as_slice).collect();
+        for limit in 0..4 {
+            assert_eq!(
+                recover_marker_stream(&inputs, Some(&previous), None, limit),
+                Err(MarkerError::RecoveryLimitExceeded { max_records: limit })
+            );
+        }
+        assert_eq!(
+            recover_marker_stream(&inputs, Some(&previous), records.last(), 4).unwrap(),
+            records
+        );
+    }
+
+    #[test]
+    fn stream_recovery_handles_empty_final_but_not_interior_segment() {
+        let (previous, records, segments) = stream_fixture();
+        let empty_tail = stream_segment(6, 14, &[]);
+        assert_eq!(
+            recover_marker_stream(
+                &[&segments[0], &segments[1], &empty_tail],
+                Some(&previous),
+                records.last(),
+                4,
+            )
+            .unwrap(),
+            records
+        );
+        let empty_head = stream_segment(3, 10, &[]);
+        assert_eq!(
+            recover_marker_stream(&[&empty_head, &segments[0]], Some(&previous), None, 4),
+            Err(MarkerError::EmptyInteriorSegment { segment_id: 3 })
+        );
+        assert!(
+            recover_marker_stream(&[], Some(&previous), Some(&previous), 0)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            recover_marker_stream(&[], None, records.last(), 0),
+            Err(MarkerError::ExpectedTipMismatch { commit_seq: 13 })
+        );
+    }
+
+    #[test]
+    fn stream_recovery_rejects_invalid_anchor_and_wrong_tip_identity() {
+        let (previous, records, segments) = stream_fixture();
+        let inputs: Vec<_> = segments.iter().map(Vec::as_slice).collect();
+        let mut corrupt = previous.clone();
+        corrupt.capsule_object_id[0] ^= 1;
+        assert_eq!(
+            recover_marker_stream(&inputs, Some(&corrupt), None, 4),
+            Err(MarkerError::MarkerIdMismatch { commit_seq: 9 })
+        );
+        let wrong_tip = make_test_record(13, [1; ID_SIZE]);
+        assert_eq!(
+            recover_marker_stream(&inputs, Some(&previous), Some(&wrong_tip), 4),
+            Err(MarkerError::ExpectedTipMismatch { commit_seq: 13 })
+        );
+        let mut corrupt_tip = records[3].clone();
+        corrupt_tip.proof_object_id[0] ^= 1;
+        assert_eq!(
+            recover_marker_stream(&inputs, Some(&previous), Some(&corrupt_tip), 4),
+            Err(MarkerError::MarkerIdMismatch { commit_seq: 13 })
+        );
+    }
+
+    #[test]
+    fn stream_recovery_handles_terminal_u64_sequence_without_wrapping() {
+        let previous =
+            CommitMarkerRecord::new(u64::MAX - 1, 1, [1; ID_SIZE], [2; ID_SIZE], [0; ID_SIZE]);
+        let last =
+            CommitMarkerRecord::new(u64::MAX, 2, [3; ID_SIZE], [4; ID_SIZE], previous.marker_id);
+        let segment = stream_segment(10, u64::MAX, std::slice::from_ref(&last));
+        assert_eq!(
+            recover_marker_stream(&[&segment], Some(&previous), Some(&last), 1).unwrap(),
+            vec![last]
+        );
+        let wrapped = stream_segment(11, 0, &[]);
+        assert_eq!(
+            recover_marker_stream(&[&segment, &wrapped], Some(&previous), None, 1),
+            Err(MarkerError::SequenceOverflow)
+        );
     }
 
     #[test]
