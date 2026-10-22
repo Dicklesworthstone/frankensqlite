@@ -136,6 +136,7 @@ export class WorkerConnectionHost {
   readonly #bulkCancellations = new Map<number, BulkCancellation>();
   #snapshotStore: IndexedDbSnapshotStore | OpfsSnapshotStore | null = null;
   #snapshotLease: SnapshotSessionLease | null = null;
+  #stopObservingLease: (() => void) | null = null;
   #snapshotRevision: string | null = null;
   readonly #budget: RequestBudget;
   #closePromise: Promise<WorkerResponse> | null = null;
@@ -168,6 +169,26 @@ export class WorkerConnectionHost {
     // This internal response is not a client acknowledgement. A later client
     // close joins the same fence and receives its own correlated response.
     return this.handle({ kind: "close", requestId: 0 });
+  }
+
+  #assertSession(): void {
+    if (this.#terminalError !== null) throw this.#terminalError;
+    this.#snapshotLease?.assertHeld();
+  }
+
+  #observeLease(): void {
+    const lease = this.#snapshotLease;
+    if (lease === null) return;
+    const lost = (): void => {
+      if (this.#snapshotLease !== lease) return;
+      // Fence synchronously, but queue destruction behind every admitted
+      // operation. A stolen Web Lock does not cancel its former callback or
+      // authorize freeing a WASM handle that is still running.
+      void this.failTransport(lease.lossSignal.reason).catch(() => {});
+    };
+    lease.lossSignal.addEventListener("abort", lost, { once: true });
+    this.#stopObservingLease = () => lease.lossSignal.removeEventListener("abort", lost);
+    if (lease.lossSignal.aborted) lost();
   }
 
   handle(request: WorkerRequest): Promise<WorkerResponse> {
@@ -217,6 +238,12 @@ export class WorkerConnectionHost {
       );
       return response;
     }
+    // Preserve the non-retryable loss diagnosis, rather than disguising it as
+    // an ordinary close. Nothing new is reserved after the session is fenced.
+    if (this.#terminalError instanceof SnapshotOwnershipError &&
+        this.#terminalError.code === "ERR_FSQLITE_SNAPSHOT_OWNERSHIP_LOST") {
+      throw this.#terminalError;
+    }
     if (this.#closePromise !== null) {
       return Promise.resolve({
         kind: "error",
@@ -254,11 +281,10 @@ export class WorkerConnectionHost {
     if (request.kind === "execute-many" || request.kind === "statement-execute-many") {
       const transactionId = request.transactionId;
       if (request.cancellable || transactionId !== undefined) {
-        cancellation = new BulkCancellation(
-          transactionId === undefined
-            ? undefined
-            : () => this.#transactions.assertOwner(transactionId),
-        );
+        cancellation = new BulkCancellation(() => {
+          this.#snapshotLease?.assertHeld();
+          if (transactionId !== undefined) this.#transactions.assertOwner(transactionId);
+        });
         if (request.cancellable) this.#bulkCancellations.set(request.requestId, cancellation);
       }
     }
@@ -288,6 +314,32 @@ export class WorkerConnectionHost {
   }
 
   async #handle(
+    request: Exclude<WorkerRequest, { kind: "cancel-bulk" | "cancel-transaction" }>,
+    cancellation?: BulkCancellation,
+  ): Promise<WorkerResponse> {
+    if (request.kind === "close") return this.#dispatch(request, cancellation);
+    try {
+      this.#assertSession();
+      const response = await this.#dispatch(request, cancellation);
+      if (response.kind === "error") {
+        // Preserve a real operation/cleanup error, but never advertise it as
+        // retryable on a session whose ownership was lost during that work.
+        if (this.#snapshotLease?.lossSignal.aborted) {
+          response.error.transient = false;
+          response.error.userRecoverable = false;
+        }
+        return response;
+      }
+      // Join the actual result before diagnosing loss. This error is NOT
+      // evidence of rollback: SQL or publication may already have completed.
+      this.#snapshotLease?.assertHeld();
+      return response;
+    } catch (error: unknown) {
+      return { kind: "error", requestId: request.requestId, error: serializeFrankenError(error) };
+    }
+  }
+
+  async #dispatch(
     request: Exclude<WorkerRequest, { kind: "cancel-bulk" | "cancel-transaction" }>,
     cancellation?: BulkCancellation,
   ): Promise<WorkerResponse> {
@@ -462,11 +514,14 @@ export class WorkerConnectionHost {
             requestedOwnership,
           );
         }
+        stagedLease?.assertHeld();
         stagedStore =
           ready.persistence === "opfs-snapshot"
             ? await OpfsSnapshotStore.open(config.dbName!)
             : await IndexedDbSnapshotStore.open(config.dbName!);
+        stagedLease?.assertHeld();
         const loaded = await stagedStore.load();
+        stagedLease?.assertHeld();
         if (loaded !== null) {
           if (image !== undefined) {
             throw new SnapshotStoreError(
@@ -487,6 +542,8 @@ export class WorkerConnectionHost {
       // session. A rejected import must not erase unsaved data, prepared handles,
       // a manual transaction, or the previous snapshot publication lineage.
       const core = await this.#loader.load(config.wasmUrl);
+      this.#assertSession();
+      stagedLease?.assertHeld();
       stagedDb =
         image !== undefined
           ? await core.FrankenDB.import(image)
@@ -501,7 +558,8 @@ export class WorkerConnectionHost {
         ? ready.path
         : stagedDb.path || ready.path;
       if (typeof path !== "string") throw new Error("Invalid initialized database path");
-      if (this.#terminalError !== null) throw this.#terminalError;
+      this.#assertSession();
+      stagedLease?.assertHeld();
 
       // No await or user callback follows the ownership transfer. If retiring
       // the old session fails, the candidate is NOT published and all later SQL
@@ -510,6 +568,7 @@ export class WorkerConnectionHost {
       await this.#disposeDatabase(stagedLease);
       previousRetired = true;
       if (this.#terminalError !== null) throw this.#terminalError;
+      stagedLease?.assertHeld();
       this.#db = stagedDb;
       stagedDb = null;
       this.#snapshotStore = stagedStore;
@@ -519,6 +578,7 @@ export class WorkerConnectionHost {
       this.#snapshotRevision = saved?.revision ?? null;
       this.#resultEncoding = resultEncoding;
       this.#statementBudget = stagedStatementBudget;
+      this.#observeLease();
       return {
         kind: "ready",
         requestId,
@@ -599,7 +659,7 @@ export class WorkerConnectionHost {
       await db.executeBatch(sql);
     } else {
       await executeManagedBatch(db, sql, () => {
-        if (this.#terminalError !== null) throw this.#terminalError;
+        this.#assertSession();
         this.#transactions.assertOwner(transactionId);
       });
     }
@@ -628,6 +688,11 @@ export class WorkerConnectionHost {
     prepared?: CorePreparedStatementHandle,
     cancellation?: BulkCancellation,
   ): Promise<ExecuteManyResponse> {
+    // Raw callers need the same lifetime fence, even without opting into
+    // cancellation. Resolve this at execution time: init may precede this
+    // request in the FIFO while no snapshot lease existed at admission.
+    const guard = cancellation ?? (this.#snapshotLease === null
+      ? undefined : new BulkCancellation(() => this.#snapshotLease?.assertHeld()));
     return {
       kind: "execute-many-result",
       requestId,
@@ -637,7 +702,7 @@ export class WorkerConnectionHost {
         parameterSets,
         `fsqlite_bulk_${this.#nextBulkSavepoint++}`,
         prepared,
-        cancellation,
+        guard,
       ),
     };
   }
@@ -837,7 +902,13 @@ export class WorkerConnectionHost {
     // Remain in the same host FIFO slot through export, hash, CAS and commit.
     // Quota/conflict/export failures leave both the prior durable checkpoint
     // and this session's expected revision unchanged; memory remains usable.
-    const saved = await store.save(await db.export(), this.#snapshotRevision, publicationId);
+    this.#assertSession();
+    const bytes = await db.export();
+    this.#assertSession();
+    const saved = await store.save(bytes, this.#snapshotRevision, publicationId);
+    // A started save is always joined. Loss after its commit means uncertain
+    // acknowledgement, not permission to replay the originating transaction.
+    this.#assertSession();
     this.#snapshotRevision = saved.revision;
     return { kind: "checkpoint-result", requestId, data: saved };
   }
@@ -891,6 +962,8 @@ export class WorkerConnectionHost {
     this.#snapshotRevision = null;
     const snapshotLease = this.#snapshotLease;
     this.#snapshotLease = null;
+    this.#stopObservingLease?.();
+    this.#stopObservingLease = null;
 
     const errors: unknown[] = [];
     try {
@@ -1039,7 +1112,8 @@ export function serializeFrankenError(error: unknown, depth = 0): SerializedFran
     serialized.stack = error.stack;
   }
 
-  if (error instanceof SnapshotStoreError && depth < 4 && error.cause !== undefined) {
+  if ((error instanceof SnapshotStoreError || error instanceof SnapshotOwnershipError) &&
+      depth < 4 && error.cause !== undefined) {
     serialized.cause = serializeFrankenError(error.cause, depth + 1);
   }
   if (error instanceof CheckpointRollbackError) {
