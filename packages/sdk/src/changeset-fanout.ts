@@ -1,3 +1,5 @@
+import { captureAcknowledgements } from "./changeset-outbox-ack";
+import type { OutboxAcknowledgement } from "./changeset-outbox-ack";
 import type { ChangesetExecutor, ChangesetTarget } from "./changeset-apply";
 import type { OutboxDelivery, OutboxPageOptions, OutboxReadResult, Stored } from "./changeset-outbox-store";
 import {
@@ -77,6 +79,8 @@ export interface ChangesetReplicaOutbox {
   pending(options?: OutboxPageOptions): Promise<readonly OutboxDelivery[]>;
   read(deliveryId: string): Promise<OutboxReadResult | null>;
   acknowledge(deliveryId: string, sha256: string): Promise<boolean>;
+  /** One SQL transaction; remote receipts/omissions must already be verified. */
+  acknowledgeBatch(acknowledgements: readonly OutboxAcknowledgement[]): Promise<readonly boolean[]>;
 }
 interface State {
   manifest: string;
@@ -338,6 +342,7 @@ export class ChangesetFanout {
       pending: (options?: OutboxPageOptions) => this.#pending(id, options),
       read: (deliveryId: string) => this.#read(id, deliveryId),
       acknowledge: (deliveryId: string, sha256: string) => this.#acknowledge(id, deliveryId, sha256),
+      acknowledgeBatch: (acknowledgements: readonly OutboxAcknowledgement[]) => this.#acknowledgeBatch(id, acknowledgements),
     });
   }
 
@@ -365,33 +370,46 @@ export class ChangesetFanout {
 
   async #acknowledge(replica: string, deliveryId: string, sha256: string): Promise<boolean> {
     const id = identity(deliveryId), expected = digest(sha256);
-    return this.#target.transaction(async (tx) => {
-      const current = await this.#state(tx), cursor = current.replicas.find((r) => r.receiverId === replica)!;
-      const record = await find(tx, id);
-      if (record === null || record.delivery.sha256 !== expected)
-        fail("ACK", "Acknowledgement does not match a retained source identity and digest");
-      if (record.delivery.sequence <= cursor.sequence) return false;
-      if (record.delivery.sequence !== cursor.sequence + 1n)
-        fail("ACK", "A replica must acknowledge its next source operation without skipping");
-      await load(tx, record);
-      if (await tx.execute(
-        `UPDATE OR ABORT ${PROGRESS} SET sequence=?,delivery_id=?,sha256=? WHERE replica_id=? AND sequence=? AND delivery_id=? AND sha256=?`,
-        [record.delivery.sequence, id, expected, replica, cursor.sequence, cursor.deliveryId ?? "", cursor.sha256 ?? ""],
-      ) !== 1) fail("CORRUPT", "Replica acknowledgement was not stored exactly once");
-      const replicas = current.replicas.map((r) => r.receiverId === replica
-        ? { receiverId: replica, sequence: record.delivery.sequence, deliveryId: id, sha256: expected } : r);
-      const minimum = replicas.reduce((n, r) => r.sequence < n ? r.sequence : n, current.high);
-      if (minimum > current.minimum) {
-        // Advancing one ordered cursor can cross at most this one operation.
-        if (minimum !== record.delivery.sequence || minimum !== current.minimum + 1n)
-          fail("CORRUPT", "Invalid fanout reclamation frontier");
-        if (!(await acknowledgeDelivery(tx, id, expected))) fail("CORRUPT", "Payload was already reclaimed");
-      }
-      const next = await this.#state(tx);
-      if (fingerprint(next) !== fingerprint({ ...current, replicas, minimum }) || next.high !== current.high)
-        fail("CORRUPT", "Acknowledgement changed unrelated fanout state");
-      return true;
+    return this.#target.transaction(tx => this.#acknowledgeIn(tx, replica, id, expected));
+  }
+
+  /** Each step retains the original ordered cursor and ALL-recipient checks. */
+  async #acknowledgeBatch(replica: string, acknowledgements: readonly OutboxAcknowledgement[]): Promise<readonly boolean[]> {
+    const admitted = captureAcknowledgements(acknowledgements);
+    return this.#target.transaction(async tx => {
+      const results: boolean[] = [];
+      for (const { deliveryId, sha256 } of admitted)
+        results.push(await this.#acknowledgeIn(tx, replica, deliveryId, sha256));
+      return Object.freeze(results);
     });
+  }
+
+  async #acknowledgeIn(tx: ChangesetExecutor, replica: string, id: string, expected: string): Promise<boolean> {
+    const current = await this.#state(tx), cursor = current.replicas.find((r) => r.receiverId === replica)!;
+    const record = await find(tx, id);
+    if (record === null || record.delivery.sha256 !== expected)
+      fail("ACK", "Acknowledgement does not match a retained source identity and digest");
+    if (record.delivery.sequence <= cursor.sequence) return false;
+    if (record.delivery.sequence !== cursor.sequence + 1n)
+      fail("ACK", "A replica must acknowledge its next source operation without skipping");
+    await load(tx, record);
+    if (await tx.execute(
+      `UPDATE OR ABORT ${PROGRESS} SET sequence=?,delivery_id=?,sha256=? WHERE replica_id=? AND sequence=? AND delivery_id=? AND sha256=?`,
+      [record.delivery.sequence, id, expected, replica, cursor.sequence, cursor.deliveryId ?? "", cursor.sha256 ?? ""],
+    ) !== 1) fail("CORRUPT", "Replica acknowledgement was not stored exactly once");
+    const replicas = current.replicas.map((r) => r.receiverId === replica
+      ? { receiverId: replica, sequence: record.delivery.sequence, deliveryId: id, sha256: expected } : r);
+    const minimum = replicas.reduce((n, r) => r.sequence < n ? r.sequence : n, current.high);
+    if (minimum > current.minimum) {
+      // Advancing one ordered cursor can cross at most this one operation.
+      if (minimum !== record.delivery.sequence || minimum !== current.minimum + 1n)
+        fail("CORRUPT", "Invalid fanout reclamation frontier");
+      if (!(await acknowledgeDelivery(tx, id, expected))) fail("CORRUPT", "Payload was already reclaimed");
+    }
+    const next = await this.#state(tx);
+    if (fingerprint(next) !== fingerprint({ ...current, replicas, minimum }) || next.high !== current.high)
+      fail("CORRUPT", "Acknowledgement changed unrelated fanout state");
+    return true;
   }
 
   /** Explicitly ends ID deduplication. Current replica receipts stay retained. */

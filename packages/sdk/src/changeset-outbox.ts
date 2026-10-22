@@ -1,3 +1,6 @@
+import { captureAcknowledgements } from "./changeset-outbox-ack";
+import type { OutboxAcknowledgement } from "./changeset-outbox-ack";
+export type { OutboxAcknowledgement } from "./changeset-outbox-ack";
 import type { ChangesetExecutor, ChangesetTarget } from "./changeset-apply";
 import {
   prepareChangesetCapture,
@@ -359,6 +362,26 @@ export class ChangesetOutbox {
     return this.#target.transaction(async (tx) => {
       await assertSingleRecipient(tx);
       return acknowledgeDelivery(tx, id, expected);
+    });
+  }
+
+  /**
+   * Acknowledge 1..256 distinct identities in ONE owned source transaction.
+   * Verify all remote receipts and omission consent before calling. Results
+   * match input order: false means that exact retained identity was already ACKed.
+   * Bootstrap predecessor rules and the single-recipient guard still apply.
+   * Payloads are verified one at a time, never retained as a whole batch here.
+   * SQL success still requires source-storage confirmation. A lost commit
+   * response is uncertain; retry the same identities, never regenerate them.
+   */
+  async acknowledgeBatch(acknowledgements: readonly OutboxAcknowledgement[]): Promise<readonly boolean[]> {
+    const admitted = captureAcknowledgements(acknowledgements);
+    return this.#target.transaction(async (tx) => {
+      await assertSingleRecipient(tx);
+      const results: boolean[] = [];
+      for (const { deliveryId, sha256 } of admitted)
+        results.push(await acknowledgeDelivery(tx, deliveryId, sha256));
+      return Object.freeze(results);
     });
   }
 
