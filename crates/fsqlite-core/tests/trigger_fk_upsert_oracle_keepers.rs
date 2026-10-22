@@ -51,6 +51,291 @@ fn render_frank(v: &SqliteValue) -> String {
     }
 }
 
+fn fk_cascade_trigger_schema(deferred: bool) -> String {
+    let deferral = if deferred {
+        "DEFERRABLE INITIALLY DEFERRED"
+    } else {
+        ""
+    };
+    format!(
+        "PRAGMA foreign_keys = ON;
+         CREATE TABLE parent (id INTEGER PRIMARY KEY);
+         CREATE TABLE child (
+             id INTEGER PRIMARY KEY,
+             parent_id INTEGER REFERENCES parent(id)
+                 ON DELETE CASCADE ON UPDATE CASCADE
+         );
+         CREATE TABLE ref_parent (id INTEGER PRIMARY KEY);
+         CREATE TABLE guarded (
+             id INTEGER PRIMARY KEY,
+             parent_id INTEGER REFERENCES ref_parent(id) {deferral}
+         );
+         CREATE TABLE audit (id INTEGER PRIMARY KEY);
+         INSERT INTO parent VALUES (1);
+         INSERT INTO child VALUES (10, 1);
+         INSERT INTO ref_parent VALUES (1);
+         INSERT INTO guarded VALUES (10, 1);"
+    )
+}
+
+fn assert_oracle_fk_error(error: &rusqlite::Error) {
+    assert!(
+        matches!(
+            error,
+            rusqlite::Error::SqliteFailure(code, _)
+                if code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY
+        ),
+        "expected the stock foreign-key constraint error, got {error}"
+    );
+}
+
+async fn assert_fk_cascade_rows_match(
+    conn: &Connection,
+    oracle: &rusqlite::Connection,
+    context: &str,
+) {
+    for sql in [
+        "SELECT id FROM parent ORDER BY id",
+        "SELECT id, parent_id FROM child ORDER BY id",
+        "SELECT id FROM ref_parent ORDER BY id",
+        "SELECT id, parent_id FROM guarded ORDER BY id",
+        "SELECT id FROM audit ORDER BY id",
+    ] {
+        let mut statement = oracle.prepare(sql).unwrap();
+        let columns = statement.column_count();
+        let expected = statement
+            .query_map([], |row| {
+                (0..columns)
+                    .map(|column| row.get::<_, i64>(column).map(SqliteValue::Integer))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let actual = conn
+            .query(sql)
+            .await
+            .unwrap()
+            .iter()
+            .map(row_values)
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected, "{context}: {sql}");
+    }
+}
+
+/// bd-vcvn0: a generated FK action may suppress its own child-side checks,
+/// but user trigger statements inside that action still own FK obligations.
+#[test]
+fn fk_cascade_trigger_immediate_checks_match_stock() {
+    asupersync::test_utils::run_test(|| async {
+        for (event, mutation) in [
+            ("DELETE", "DELETE FROM parent WHERE id = 1"),
+            ("UPDATE", "UPDATE parent SET id = 2 WHERE id = 1"),
+        ] {
+            for body in [
+                "INSERT INTO guarded VALUES (20, 999)",
+                "UPDATE guarded SET parent_id = 999 WHERE id = 10",
+            ] {
+                for explicit in [false, true] {
+                    let context = format!("{event} cascade / {body} / explicit={explicit}");
+                    let schema = format!(
+                        "{} CREATE TRIGGER child_action AFTER {event} ON child BEGIN
+                             INSERT INTO audit VALUES (20);
+                             {body};
+                         END;",
+                        fk_cascade_trigger_schema(false)
+                    );
+                    let oracle = rusqlite::Connection::open(":memory:").unwrap();
+                    oracle.execute_batch(&schema).unwrap();
+                    let conn = Connection::open(":memory:").await.unwrap();
+                    conn.execute(&schema).await.unwrap();
+                    if explicit {
+                        let prior = "BEGIN; INSERT INTO audit VALUES (99);";
+                        oracle.execute_batch(prior).unwrap();
+                        conn.execute(prior).await.unwrap();
+                    }
+
+                    let oracle_error = oracle.execute(mutation, []).unwrap_err();
+                    assert_oracle_fk_error(&oracle_error);
+                    let error = conn
+                        .execute(mutation)
+                        .await
+                        .expect_err("cascade-fired trigger must reject a missing parent");
+                    assert!(
+                        matches!(error, FrankenError::ForeignKeyViolation),
+                        "{context}: {error}"
+                    );
+                    assert_eq!(conn.in_transaction(), explicit, "{context}");
+                    assert_eq!(oracle.is_autocommit(), !explicit, "{context}");
+                    assert_fk_cascade_rows_match(&conn, &oracle, &context).await;
+                    assert_oracle_fk_integrity(&oracle);
+                    assert!(
+                        conn.query("PRAGMA foreign_key_check")
+                            .await
+                            .unwrap()
+                            .is_empty()
+                    );
+
+                    // Error unwinding must restore ordinary enforcement too.
+                    let invalid = "INSERT INTO guarded VALUES (30, 12345)";
+                    assert_oracle_fk_error(&oracle.execute(invalid, []).unwrap_err());
+                    assert!(matches!(
+                        conn.execute(invalid).await,
+                        Err(FrankenError::ForeignKeyViolation)
+                    ));
+
+                    // The same trigger must succeed once its parent exists.
+                    oracle
+                        .execute("INSERT INTO ref_parent VALUES (999)", [])
+                        .unwrap();
+                    conn.execute("INSERT INTO ref_parent VALUES (999)")
+                        .await
+                        .unwrap();
+                    let expected_changes = oracle.execute(mutation, []).unwrap();
+                    assert_eq!(conn.execute(mutation).await.unwrap(), expected_changes);
+                    if explicit {
+                        oracle.execute_batch("COMMIT").unwrap();
+                        conn.execute("COMMIT").await.unwrap();
+                    }
+                    assert_fk_cascade_rows_match(&conn, &oracle, &context).await;
+                    assert_oracle_fk_integrity(&oracle);
+                    assert!(
+                        conn.query("PRAGMA foreign_key_check")
+                            .await
+                            .unwrap()
+                            .is_empty()
+                    );
+                    conn.close().await.unwrap();
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn fk_cascade_trigger_deferred_checks_survive_failed_commit() {
+    asupersync::test_utils::run_test(|| async {
+        let schema = format!(
+            "{} CREATE TRIGGER child_action AFTER DELETE ON child BEGIN
+                 INSERT INTO audit VALUES (20);
+                 INSERT INTO guarded VALUES (20, 999);
+             END;",
+            fk_cascade_trigger_schema(true)
+        );
+        let oracle = rusqlite::Connection::open(":memory:").unwrap();
+        oracle.execute_batch(&schema).unwrap();
+        let conn = Connection::open(":memory:").await.unwrap();
+        conn.execute(&schema).await.unwrap();
+        let transaction = "BEGIN; INSERT INTO audit VALUES (99); DELETE FROM parent WHERE id = 1;";
+        oracle.execute_batch(transaction).unwrap();
+        conn.execute(transaction).await.unwrap();
+        assert_fk_cascade_rows_match(&conn, &oracle, "deferred statement effects").await;
+
+        assert_oracle_fk_error(&oracle.execute_batch("COMMIT").unwrap_err());
+        assert!(matches!(
+            conn.execute("COMMIT").await,
+            Err(FrankenError::ForeignKeyViolation)
+        ));
+        assert!(!oracle.is_autocommit());
+        assert!(conn.in_transaction());
+        assert_fk_cascade_rows_match(&conn, &oracle, "failed COMMIT retains transaction").await;
+
+        let repair = "INSERT INTO ref_parent VALUES (999); COMMIT;";
+        oracle.execute_batch(repair).unwrap();
+        conn.execute(repair).await.unwrap();
+        assert_fk_cascade_rows_match(&conn, &oracle, "repaired deferred obligation").await;
+        assert_oracle_fk_integrity(&oracle);
+        assert!(
+            conn.query("PRAGMA foreign_key_check")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!conn.in_transaction());
+        conn.close().await.unwrap();
+    });
+}
+
+#[test]
+fn fk_cascade_trigger_nested_program_checks_match_stock() {
+    asupersync::test_utils::run_test(|| async {
+        let schema = format!(
+            "{} CREATE VIEW guarded_view AS SELECT id, parent_id FROM guarded;
+             CREATE TRIGGER guarded_view_insert INSTEAD OF INSERT ON guarded_view BEGIN
+                 INSERT INTO guarded VALUES (NEW.id, NEW.parent_id);
+             END;
+             CREATE TRIGGER audit_action AFTER INSERT ON audit BEGIN
+                 DELETE FROM parent WHERE id = 1;
+             END;
+             CREATE TRIGGER child_action AFTER DELETE ON child BEGIN
+                 INSERT INTO guarded_view VALUES (20, 999);
+             END;",
+            fk_cascade_trigger_schema(false)
+        );
+        let oracle = rusqlite::Connection::open(":memory:").unwrap();
+        oracle.execute_batch(&schema).unwrap();
+        let conn = Connection::open(":memory:").await.unwrap();
+        conn.execute(&schema).await.unwrap();
+        let mutation = "INSERT INTO audit VALUES (20)";
+        assert_oracle_fk_error(&oracle.execute(mutation, []).unwrap_err());
+        assert!(matches!(
+            conn.execute(mutation).await,
+            Err(FrankenError::ForeignKeyViolation)
+        ));
+        assert_fk_cascade_rows_match(&conn, &oracle, "trigger/cascade/trigger rollback").await;
+
+        oracle
+            .execute("INSERT INTO ref_parent VALUES (999)", [])
+            .unwrap();
+        conn.execute("INSERT INTO ref_parent VALUES (999)")
+            .await
+            .unwrap();
+        assert_eq!(
+            conn.execute(mutation).await.unwrap(),
+            oracle.execute(mutation, []).unwrap()
+        );
+        assert_fk_cascade_rows_match(&conn, &oracle, "trigger/cascade/trigger success").await;
+        assert_oracle_fk_integrity(&oracle);
+        assert!(
+            conn.query("PRAGMA foreign_key_check")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        conn.close().await.unwrap();
+    });
+}
+
+#[test]
+fn fk_cascade_trigger_can_reference_new_parent_key() {
+    asupersync::test_utils::run_test(|| async {
+        let schema = format!(
+            "{} CREATE TRIGGER child_action AFTER UPDATE ON child BEGIN
+                 INSERT INTO child VALUES (20, NEW.parent_id);
+             END;",
+            fk_cascade_trigger_schema(false)
+        );
+        let oracle = rusqlite::Connection::open(":memory:").unwrap();
+        oracle.execute_batch(&schema).unwrap();
+        let conn = Connection::open(":memory:").await.unwrap();
+        conn.execute(&schema).await.unwrap();
+        let mutation = "UPDATE parent SET id = 2 WHERE id = 1";
+        assert_eq!(
+            conn.execute(mutation).await.unwrap(),
+            oracle.execute(mutation, []).unwrap()
+        );
+        assert_fk_cascade_rows_match(&conn, &oracle, "trigger sees new parent key").await;
+        assert_oracle_fk_integrity(&oracle);
+        assert!(
+            conn.query("PRAGMA foreign_key_check")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        conn.close().await.unwrap();
+    });
+}
+
 #[test]
 fn test_insert_or_fail_foreign_key_error_aborts_entire_insert_select() {
     asupersync::test_utils::run_test(|| async {

@@ -10473,6 +10473,7 @@ impl TriggerFrame {
 
 struct TriggerFrameGuard<'a> {
     stack: &'a RefCell<Vec<TriggerFrame>>,
+    _fk_check_suppression: BoolCellRestoreGuard<'a>,
 }
 
 impl Drop for TriggerFrameGuard<'_> {
@@ -13792,11 +13793,13 @@ pub struct Connection {
     /// File change counter (offset 24 in the database header).  Incremented
     /// on every transaction that modifies the database (DML or DDL).
     change_counter: RefCell<u32>,
-    /// Depth counter for FK cascade operations.  When > 0, FK enforcement
-    /// is suppressed to prevent recursive checking during CASCADE/SET NULL
-    /// actions (matches C SQLite behavior where FK actions do not re-trigger
-    /// FK checking).
+    /// Depth counter for FK cascade operations, charged against the shared
+    /// trigger/FK recursive-program budget independently of FK enforcement.
     fk_cascade_depth: Cell<usize>,
+    /// Ordinary FK checks are suppressed only for generated FK actions.
+    /// User trigger programs temporarily restore enforcement while the
+    /// enclosing action remains charged against the recursion budget.
+    fk_action_checks_suppressed: Cell<bool>,
     /// Recursive-program depth inherited from a delegating parent connection
     /// (bd-wymdl.3). Attached-schema statements execute on a separately opened
     /// child `Connection`; seeding this baseline at every delegation makes
@@ -14710,32 +14713,39 @@ impl Drop for MemFallbackRejectionOverrideGuard<'_> {
     }
 }
 
-/// RAII depth guard for the foreign-key cascade counter.
+/// RAII guard for foreign-key cascade depth and generated-action check policy.
 ///
-/// The cascade sites `await` a nested statement between incrementing and
-/// decrementing `fk_cascade_depth`. Doing that by hand is not cancel-safe:
-/// dropping the future at the await point skips the decrement, the counter
-/// stays elevated, and because `fk_enforcement_enabled()` is
-/// `foreign_keys && fk_cascade_depth.get() == 0`, foreign-key enforcement is
-/// then silently disabled for the remaining life of the connection.
+/// The cascade sites `await` a nested statement while charging one recursive
+/// program and suppressing the generated action's ordinary FK checks. User
+/// triggers temporarily restore those checks without releasing the depth
+/// charge, so their nested statements retain normal FK obligations.
 ///
-/// Holding the increment in a guard makes the decrement run on the drop path
-/// too, so cancellation restores the counter instead of corrupting it.
+/// Both guards restore the caller's state on every return and cancellation
+/// path. Saving the previous check policy also preserves nested trigger/FK
+/// scopes instead of unconditionally enabling checks when an inner action ends.
 struct FkCascadeDepthGuard<'a> {
     depth: &'a Cell<usize>,
+    _fk_check_suppression: BoolCellRestoreGuard<'a>,
 }
 
 impl<'a> FkCascadeDepthGuard<'a> {
     /// `other_active_programs` is every non-FK charge against the shared
     /// aggregate budget: active trigger frames plus any recursive-program
     /// depth inherited across attached-schema delegation (bd-wymdl.3).
-    fn try_enter(depth: &'a Cell<usize>, other_active_programs: usize) -> Result<Self> {
+    fn try_enter(
+        depth: &'a Cell<usize>,
+        checks_suppressed: &'a Cell<bool>,
+        other_active_programs: usize,
+    ) -> Result<Self> {
         let current = depth.get();
         if current.saturating_add(other_active_programs) >= trigger_program_depth_limit() {
             return Err(FrankenError::TriggerRecursionDepthExceeded);
         }
         depth.set(current + 1);
-        Ok(Self { depth })
+        Ok(Self {
+            depth,
+            _fk_check_suppression: BoolCellRestoreGuard::new(checks_suppressed, true),
+        })
     }
 }
 
@@ -15684,6 +15694,7 @@ impl Connection {
             pending_adopted_header_encoding: Cell::new(None),
             change_counter: RefCell::new(0),
             fk_cascade_depth: Cell::new(0),
+            fk_action_checks_suppressed: Cell::new(false),
             inherited_recursive_program_depth: Cell::new(0),
             deferred_fk_checks: RefCell::new(Vec::new()),
             fk_force_immediate_check: Cell::new(false),
@@ -16242,6 +16253,7 @@ impl Connection {
             pending_adopted_header_encoding: Cell::new(None),
             change_counter: RefCell::new(0),
             fk_cascade_depth: Cell::new(0),
+            fk_action_checks_suppressed: Cell::new(false),
             inherited_recursive_program_depth: Cell::new(0),
             deferred_fk_checks: RefCell::new(Vec::new()),
             fk_force_immediate_check: Cell::new(false),
@@ -70720,17 +70732,20 @@ impl Connection {
         self.trigger_frame_stack.borrow_mut().push(frame);
         TriggerFrameGuard {
             stack: &self.trigger_frame_stack,
+            _fk_check_suppression: BoolCellRestoreGuard::new(
+                &self.fk_action_checks_suppressed,
+                false,
+            ),
         }
     }
 
     // ── Foreign Key enforcement helpers (bd-thqgm) ─────────────────────
 
-    /// Returns `true` when `PRAGMA foreign_keys` is currently ON and we are
-    /// NOT inside a CASCADE action.  Used for INSERT parent-existence checks
-    /// and UPDATE parent-side/child-side FK checks, which should NOT fire
-    /// during a CASCADE operation.
+    /// Returns `true` when `PRAGMA foreign_keys` is ON and the current program
+    /// is not a generated FK action. User trigger programs restore ordinary
+    /// INSERT/UPDATE checks even while an enclosing cascade remains active.
     fn fk_enforcement_enabled(&self) -> bool {
-        self.pragma_state.borrow().foreign_keys && self.fk_cascade_depth.get() == 0
+        self.pragma_state.borrow().foreign_keys && !self.fk_action_checks_suppressed.get()
     }
 
     /// Returns `true` when `PRAGMA foreign_keys` is ON, regardless of cascade
@@ -70806,6 +70821,7 @@ impl Connection {
         ensure_native_stack_headroom(self.active_recursive_program_depth())?;
         FkCascadeDepthGuard::try_enter(
             &self.fk_cascade_depth,
+            &self.fk_action_checks_suppressed,
             self.trigger_frame_stack
                 .borrow()
                 .len()
@@ -71063,7 +71079,7 @@ impl Connection {
     }
 
     /// Queue final-image validation after SET DEFAULT writes values while
-    /// ordinary child-side enforcement is suppressed by `fk_cascade_depth`.
+    /// ordinary child-side enforcement is suppressed for the generated action.
     fn queue_set_default_fk_validation(&self, table_name: &str, changed_rows: usize) -> Result<()> {
         if self.statement_fk_validation_depth.get() == 0
             || self.statement_fk_validation_rechecking.get()
@@ -71336,10 +71352,10 @@ impl Connection {
     /// cache so repeated parent ids across successive prepared/direct INSERTs
     /// skip both the FK existence SELECT and its O(rows-so-far) memdb reload.
     ///
-    /// Only created when FK enforcement is active (so cascades, which run at
-    /// `fk_cascade_depth > 0`, never seed it) and an explicit transaction is
-    /// open (autocommit each-statement-its-own-txn workloads would clear it at
-    /// every boundary, so there is nothing to amortize). A statement-scoped
+    /// Only created when ordinary FK enforcement is active (so generated FK
+    /// actions themselves never seed it) and an explicit transaction is open
+    /// (autocommit each-statement-its-own-txn workloads would clear it at every
+    /// boundary, so there is nothing to amortize). A statement-scoped
     /// cache already present (the `INSERT … SELECT` replay scope) is left
     /// untouched — it takes precedence and is restored by its RAII guard.
     ///
@@ -188651,6 +188667,10 @@ mod tests {
             "trigger frame stack must unwind completely"
         );
         assert_eq!(conn.fk_cascade_depth.get(), 0, "FK depth must be restored");
+        assert!(
+            !conn.fk_action_checks_suppressed.get(),
+            "generated-action FK check suppression must unwind"
+        );
         assert_eq!(
             conn.inherited_recursive_program_depth.get(),
             0,
@@ -188909,7 +188929,7 @@ mod tests {
     fn trigger_frame_and_fk_guards_restore_state_on_drop() {
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
-            let frame_guard = conn.push_trigger_frame(TriggerFrame {
+            let frame = || TriggerFrame {
                 table_name: "t".to_owned(),
                 trigger_name: "trg".to_owned(),
                 column_names: Vec::new(),
@@ -188918,18 +188938,82 @@ mod tests {
                 new_row: None,
                 old_rowid: None,
                 new_rowid: None,
-            });
-            assert_eq!(conn.trigger_frame_stack.borrow().len(), 1);
-            let fk_guard = conn.enter_fk_cascade().unwrap();
-            assert_eq!(conn.fk_cascade_depth.get(), 1);
-            assert_eq!(conn.active_recursive_program_depth(), 2);
-            // Dropping mid-program — which is what dropping an execute()
-            // future at any await point does — must restore both counters.
-            drop(fk_guard);
-            assert_eq!(conn.fk_cascade_depth.get(), 0);
-            drop(frame_guard);
-            assert_trigger_program_state_clean(&conn);
+            };
+            for foreign_keys in [true, false] {
+                conn.execute(if foreign_keys {
+                    "PRAGMA foreign_keys = ON"
+                } else {
+                    "PRAGMA foreign_keys = OFF"
+                })
+                .await
+                .unwrap();
+                assert_eq!(conn.fk_enforcement_enabled(), foreign_keys);
+                let frame_guard = conn.push_trigger_frame(frame());
+                assert_eq!(conn.trigger_frame_stack.borrow().len(), 1);
+                assert_eq!(conn.fk_enforcement_enabled(), foreign_keys);
+
+                let fk_guard = conn.enter_fk_cascade().unwrap();
+                assert_eq!(conn.fk_cascade_depth.get(), 1);
+                assert_eq!(conn.active_recursive_program_depth(), 2);
+                assert!(conn.fk_action_checks_suppressed.get());
+                assert!(!conn.fk_enforcement_enabled());
+
+                // Trigger checks resume without releasing the enclosing FK
+                // action's recursion charge, and never override PRAGMA OFF.
+                let nested_frame_guard = conn.push_trigger_frame(frame());
+                assert_eq!(conn.fk_cascade_depth.get(), 1);
+                assert_eq!(conn.active_recursive_program_depth(), 3);
+                assert!(!conn.fk_action_checks_suppressed.get());
+                assert_eq!(conn.fk_enforcement_enabled(), foreign_keys);
+                let nested_fk_guard = conn.enter_fk_cascade().unwrap();
+                assert_eq!(conn.fk_cascade_depth.get(), 2);
+                assert_eq!(conn.active_recursive_program_depth(), 4);
+                assert!(conn.fk_action_checks_suppressed.get());
+                assert!(!conn.fk_enforcement_enabled());
+
+                // These are the same drops that cancellation runs while
+                // unwinding a trigger -> FK action -> trigger -> FK action.
+                drop(nested_fk_guard);
+                assert_eq!(conn.fk_cascade_depth.get(), 1);
+                assert_eq!(conn.active_recursive_program_depth(), 3);
+                assert!(!conn.fk_action_checks_suppressed.get());
+                assert_eq!(conn.fk_enforcement_enabled(), foreign_keys);
+                drop(nested_frame_guard);
+                assert_eq!(conn.active_recursive_program_depth(), 2);
+                assert!(conn.fk_action_checks_suppressed.get());
+                assert!(!conn.fk_enforcement_enabled());
+                drop(fk_guard);
+                assert_eq!(conn.fk_cascade_depth.get(), 0);
+                assert_eq!(conn.active_recursive_program_depth(), 1);
+                assert!(!conn.fk_action_checks_suppressed.get());
+                assert_eq!(conn.fk_enforcement_enabled(), foreign_keys);
+                drop(frame_guard);
+                assert_eq!(conn.fk_enforcement_enabled(), foreign_keys);
+                assert_trigger_program_state_clean(&conn);
+            }
         });
+    }
+
+    #[test]
+    fn fk_cascade_failed_admission_preserves_check_policy() {
+        let limit = trigger_program_depth_limit();
+        for (active_fk, other_programs) in [(limit, 0), (0, limit)] {
+            for suppressed in [false, true] {
+                let depth = std::cell::Cell::new(active_fk);
+                let checks_suppressed = std::cell::Cell::new(suppressed);
+                let result = super::FkCascadeDepthGuard::try_enter(
+                    &depth,
+                    &checks_suppressed,
+                    other_programs,
+                );
+                assert!(matches!(
+                    result,
+                    Err(FrankenError::TriggerRecursionDepthExceeded)
+                ));
+                assert_eq!(depth.get(), active_fk);
+                assert_eq!(checks_suppressed.get(), suppressed);
+            }
+        }
     }
 
     /// bd-wymdl.1 criterion 4: drop the execution future mid-flight if a
