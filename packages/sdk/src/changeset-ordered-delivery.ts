@@ -314,16 +314,28 @@ export async function createOrderedChangesetReceiver(
         const time = budget(options), position = captureOrder(own(value, "order"));
         if (position.streamId !== streamId) input("Wrong source stream incarnation");
         const message = captureMessage(value, receiverId, maximum), byteLength = message.changeset.byteLength;
+        const changes = inspectChangeset(message.changeset).changeCount;
         await verifyHash(message); time.check();
         const result = await order.apply({ sequence: BigInt(position.sequence), deliveryId: message.deliveryId,
           sha256: message.sha256, changeset: message.changeset },
-          (scoped, bytes) => applyOnce(scoped, apply, Object.freeze({ ...message, changeset: bytes }), time.remaining()),
-          time.remaining());
+          async (scoped, bytes) => {
+            const applied = await applyOnce(scoped, apply,
+              Object.freeze({ ...message, changeset: bytes }), time.remaining());
+            // Reject inside the ledger transaction: once committed, a false
+            // count becomes a retained replay that the sender can never accept.
+            if (applied.applied + applied.omitted !== changes)
+              mismatch("Application decisions disagree with message count");
+            return applied;
+          }, time.remaining());
         time.check();
         if (result.receiverId !== receiverId || result.sourceId !== streamId || result.sequence.toString() !== position.sequence ||
             result.deliveryId !== message.deliveryId || result.sha256 !== message.sha256 || result.byteLength !== byteLength)
           mismatch("Ledger did not confirm this ordered application");
         const counts = decisions(result);
+        // Retained receipts may predate count admission. Do not confirm or
+        // silently repair an inconsistent historical decision on replay.
+        if (counts.applied + counts.omitted !== changes)
+          mismatch("Ordered receipt decisions disagree with message count");
         // This barrier must never run from within order.apply's SQL transaction.
         await confirm();
         time.check();
@@ -423,9 +435,13 @@ export function createOrderedChangesetTransport(
     try {
       const time = budget(options), message = captureMessage(value, receiverId, maximum);
       const byteLength = message.changeset.byteLength;
+      const expectedChanges = inspectChangeset(message.changeset).changeCount;
       await verifyHash(message); time.check();
       const record = await read.call(source, message.deliveryId); time.check();
       const { sequence, changes } = sourceMetadata(record, message, byteLength);
+      // Refuse stale/corrupt source counters before the receiver can commit.
+      if (changes !== expectedChanges)
+        mismatch("Source change count disagrees with the complete message payload");
       const order = Object.freeze({ protocol: CHANGESET_ORDER_PROTOCOL, streamId, sequence: sequence.toString() });
       const response = await deliver(Object.freeze({ ...message, order }), time.remaining());
       time.check();
