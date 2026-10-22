@@ -4,17 +4,20 @@ type SnapshotBackend = "indexeddb-snapshot" | "opfs-snapshot";
 
 export class SnapshotOwnershipError extends Error {
   readonly transient: boolean;
-  readonly userRecoverable = true;
+  readonly userRecoverable: boolean;
   constructor(
     readonly code:
       | "ERR_FSQLITE_SNAPSHOT_OWNERSHIP_INPUT"
       | "ERR_FSQLITE_SNAPSHOT_OWNERSHIP_UNAVAILABLE"
+      | "ERR_FSQLITE_SNAPSHOT_OWNERSHIP_LOST"
       | "ERR_FSQLITE_SNAPSHOT_OWNED",
     message: string,
+    options?: ErrorOptions,
   ) {
-    super(message);
+    super(message, options);
     this.name = "SnapshotOwnershipError";
     this.transient = code === "ERR_FSQLITE_SNAPSHOT_OWNED";
+    this.userRecoverable = code !== "ERR_FSQLITE_SNAPSHOT_OWNERSHIP_LOST";
   }
 }
 
@@ -36,10 +39,15 @@ export function resolveSnapshotOwnership(value: unknown): SnapshotOwnership | un
  *
  * Acquire BEFORE loading stored bytes and release AFTER database cleanup.
  * Web Locks release abandoned ownership when the worker realm is terminated.
+ * Observe lossSignal and check assertHeld() at operation boundaries: a stolen
+ * lock rejects the released promise WITHOUT stopping its former owner's work.
+ * These checks cannot preempt already-running SQL or prove it rolled back.
  */
 export class SnapshotSessionLease {
   readonly #release: () => void;
   readonly #finished: Promise<void>;
+  readonly #loss = new AbortController();
+  #failure: SnapshotOwnershipError | undefined;
   #closing = false;
 
   private constructor(
@@ -110,6 +118,11 @@ export class SnapshotSessionLease {
     });
     let entered = false;
     const lease = new SnapshotSessionLease(persistence, name, mode, release, finished);
+    const rejected = (cause: unknown): void => {
+      const error = entered ? lease.#lose(cause) : cause;
+      refuse(error);
+      failFinish(error);
+    };
     try {
       const request = locks.request(key, { mode, ifAvailable: true }, (lock) => {
         if (lock === null) {
@@ -134,24 +147,60 @@ export class SnapshotSessionLease {
                 "The lock manager did not grant snapshot ownership",
               ),
             );
-          finish();
+          if (entered && !lease.#closing) {
+            rejected(new Error("The lock manager released an active snapshot session"));
+          } else {
+            finish();
+          }
         },
-        (cause) => {
-          refuse(cause);
-          failFinish(cause);
-        },
+        rejected,
       );
     } catch (cause: unknown) {
-      refuse(cause);
-      failFinish(cause);
+      rejected(cause);
     }
-    return admitted;
+    const granted = await admitted;
+    // A manager may settle immediately after invoking the grant callback.
+    // Never publish an already-lost lease just because admission won the race.
+    granted.assertHeld();
+    return granted;
+  }
+
+  /** Aborts only on unexpected ownership loss, not on an ordinary close. */
+  get lossSignal(): AbortSignal {
+    return this.#loss.signal;
+  }
+
+  /** Refuse new work after observed loss or intentional retirement. */
+  assertHeld(): void {
+    if (this.#failure !== undefined) throw this.#failure;
+    if (this.#closing) {
+      throw new SnapshotOwnershipError(
+        "ERR_FSQLITE_SNAPSHOT_OWNERSHIP_UNAVAILABLE",
+        "The snapshot session lease is closing or closed",
+      );
+    }
+  }
+
+  #lose(cause: unknown): SnapshotOwnershipError {
+    if (this.#failure === undefined) {
+      this.#failure = new SnapshotOwnershipError(
+        "ERR_FSQLITE_SNAPSHOT_OWNERSHIP_LOST",
+        "Snapshot ownership was lost; stop work and reconcile before reopening. In-flight work may have completed.",
+        { cause },
+      );
+      this.#loss.abort(this.#failure);
+      // A stolen request's released promise has already settled, but its
+      // callback may still be waiting. Do not retain that orphaned wait.
+      this.#release();
+    }
+    return this.#failure;
   }
 
   /** Reinitializing the same owned namespace may transfer, not reacquire, it. */
   matches(persistence: string, name: string, mode: SnapshotOwnership | undefined): boolean {
     return (
       !this.#closing &&
+      this.#failure === undefined &&
       this.persistence === persistence &&
       this.name === name &&
       this.mode === (mode ?? "shared")

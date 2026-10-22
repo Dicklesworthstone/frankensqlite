@@ -157,3 +157,108 @@ test("lock-manager refusal and thrown errors never become a granted lease", asyn
     code: "ERR_FSQLITE_SNAPSHOT_OWNERSHIP_UNAVAILABLE",
   });
 });
+
+function breakable(t) {
+  let reject, finish, callbackDone;
+  install(t, {
+    request(name, options, callback) {
+      const released = new Promise((resolve, fail) => { finish = resolve; reject = fail; });
+      callbackDone = Promise.resolve(callback({ name, mode: options.mode }));
+      void callbackDone.then(finish, reject);
+      return released;
+    },
+  });
+  return { reject: reason => reject(reason), finish: () => finish(), joined: () => callbackDone };
+}
+
+test("a granted but subsequently lost lease is never transferable", async (t) => {
+  const manager = breakable(t);
+  const lease = await Lease.acquire("opfs-snapshot", "db", "exclusive");
+  const failure = new DOMException("Lock stolen", "AbortError");
+  manager.reject(failure);
+  await Promise.resolve();
+  assert.equal(lease.matches("opfs-snapshot", "db", "exclusive"), false);
+  await assert.rejects(lease.close());
+  await manager.joined();
+});
+
+test("loss signals one non-retryable failure and releases the orphaned callback", async (t) => {
+  for (const mode of ["shared", "exclusive"]) {
+    const manager = breakable(t);
+    const lease = await Lease.acquire("indexeddb-snapshot", "db", mode);
+    let notices = 0;
+    lease.lossSignal.addEventListener("abort", () => { notices++; });
+    lease.assertHeld();
+    const cause = new DOMException("stolen", "AbortError");
+    manager.reject(cause);
+    await Promise.resolve();
+    const failure = lease.lossSignal.reason;
+    assert.equal(lease.lossSignal.aborted, true);
+    assert.equal(failure.code, "ERR_FSQLITE_SNAPSHOT_OWNERSHIP_LOST");
+    assert.equal(failure.cause, cause);
+    assert.equal(failure.transient, false);
+    assert.equal(failure.userRecoverable, false);
+    assert.throws(() => lease.assertHeld(), error => error === failure);
+    // This joins WITHOUT close(): the unexpected loss releases its own wait.
+    await manager.joined();
+    assert.equal(notices, 1);
+    const closing = lease.close();
+    assert.equal(closing, lease.close());
+    await assert.rejects(closing, error => error === failure);
+    assert.equal(notices, 1);
+  }
+});
+
+test("premature successful manager settlement is also loss, not a clean close", async (t) => {
+  const manager = breakable(t);
+  const lease = await Lease.acquire("opfs-snapshot", "db", "exclusive");
+  manager.finish();
+  await Promise.resolve();
+  assert.equal(lease.lossSignal.aborted, true);
+  assert.throws(() => lease.assertHeld(), { code: "ERR_FSQLITE_SNAPSHOT_OWNERSHIP_LOST" });
+  await assert.rejects(lease.close(), { code: "ERR_FSQLITE_SNAPSHOT_OWNERSHIP_LOST" });
+  await manager.joined();
+});
+
+test("ordinary joined close never reports an unexpected loss", async (t) => {
+  model(t);
+  const lease = await Lease.acquire("opfs-snapshot", "db", "exclusive");
+  let notices = 0;
+  lease.lossSignal.addEventListener("abort", () => { notices++; });
+  const closing = lease.close();
+  assert.throws(() => lease.assertHeld(), { code: "ERR_FSQLITE_SNAPSHOT_OWNERSHIP_UNAVAILABLE" });
+  await closing;
+  assert.equal(lease.lossSignal.aborted, false);
+  assert.equal(notices, 0);
+});
+
+test("an already-lost grant cannot escape acquire", async (t) => {
+  let done;
+  install(t, {
+    request(name, options, callback) {
+      done = callback({ name, mode: options.mode });
+      return Promise.reject(new DOMException("immediate theft", "AbortError"));
+    },
+  });
+  await assert.rejects(Lease.acquire("opfs-snapshot", "db", "exclusive"), {
+    code: "ERR_FSQLITE_SNAPSHOT_OWNERSHIP_LOST",
+  });
+  await done;
+});
+
+test("loss while close is settling remains a failure", async (t) => {
+  let reject, done;
+  install(t, {
+    request(name, options, callback) {
+      done = callback({ name, mode: options.mode });
+      return new Promise((_resolve, fail) => { reject = fail; });
+    },
+  });
+  const lease = await Lease.acquire("opfs-snapshot", "db", "exclusive");
+  const closing = lease.close();
+  const cause = new Error("release could not be acknowledged");
+  reject(cause);
+  await assert.rejects(closing, error => error === lease.lossSignal.reason && error.cause === cause);
+  await done;
+  assert.equal(lease.matches("opfs-snapshot", "db", "exclusive"), false);
+});

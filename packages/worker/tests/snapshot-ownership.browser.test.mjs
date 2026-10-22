@@ -240,3 +240,28 @@ test("invalid policies and names never create a held or pending lock", async () 
     same: true,
   });
 });
+
+test("stolen ownership cannot be reused even before close", async () => {
+  const result = await run(async () => {
+    const { SnapshotSessionLease: L } = await import("/ownership.js");
+    const name = crypto.randomUUID();
+    const lease = await L.acquire("opfs-snapshot", name, "exclusive");
+    const key = `frankensqlite:snapshot-session:v1:${JSON.stringify(["opfs-snapshot", name])}`;
+    let release;
+    let grant;
+    const granted = new Promise(resolve => { grant = resolve; });
+    const stolen = navigator.locks.request(key, { steal: true }, () => {
+      grant();
+      return new Promise(resolve => { release = resolve; });
+    });
+    await granted;
+    // Wait for the original released-promise rejection to reach its realm.
+    await new Promise(resolve => setTimeout(resolve, 0));
+    const reusable = lease.matches("opfs-snapshot", name, "exclusive");
+    const closeFailed = await lease.close().then(() => false, () => true);
+    release();
+    await stolen;
+    return { reusable, closeFailed };
+  });
+  assert.deepEqual(result, { reusable: false, closeFailed: true });
+});
