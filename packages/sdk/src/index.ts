@@ -309,3 +309,14 @@ export type { BootstrapHttpAuthorization, BootstrapHttpHandlerOptions, Bootstrap
 export { captureSnapshotChangeset } from "./changeset-snapshot-capture";
 export type { SnapshotCaptureOptions, SnapshotCapturedChangeset } from "./changeset-snapshot-capture";
 export type { OutboxSnapshotRecordOptions } from "./changeset-outbox";
+
+export type {
+  OrderedChangesetBatchHttpTransportOptions,
+  OrderedChangesetBatchHttpHandlerOptions,
+} from "./changeset-http";
+export {
+  createOrderedChangesetBatchHttpTransport,
+  createOrderedChangesetBatchHttpHandler,
+  CHANGESET_ORDERED_BATCH_HTTP_CONTENT_TYPE,
+  CHANGESET_ORDERED_BATCH_HTTP_RECEIPT_TYPE,
+} from "./changeset-http";

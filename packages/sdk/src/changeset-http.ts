@@ -20,6 +20,10 @@ export const CHANGESET_HTTP_RECEIPT_TYPE = "application/vnd.fsqlite.changeset-re
 export const CHANGESET_ORDERED_HTTP_CONTENT_TYPE = "application/vnd.fsqlite.ordered-changeset.v1";
 export const CHANGESET_ORDERED_HTTP_RECEIPT_TYPE =
   "application/vnd.fsqlite.ordered-changeset-receipt.v1+json";
+export const CHANGESET_ORDERED_BATCH_HTTP_CONTENT_TYPE =
+  "application/vnd.fsqlite.ordered-changeset-batch.v1";
+export const CHANGESET_ORDERED_BATCH_HTTP_RECEIPT_TYPE =
+  "application/vnd.fsqlite.ordered-changeset-batch-receipt.v1+json";
 const ORDER_PROTOCOL: ChangesetWireOrder["protocol"] = "fsqlite-ordered-changeset-v1";
 interface WireFormat {
   readonly ordered: boolean;
@@ -35,11 +39,20 @@ const ORDERED_WIRE: WireFormat = Object.freeze({
   ordered: true, tag: 79,
   contentType: CHANGESET_ORDERED_HTTP_CONTENT_TYPE, receiptType: CHANGESET_ORDERED_HTTP_RECEIPT_TYPE,
 });
+const ORDERED_BATCH_WIRE: WireFormat = Object.freeze({
+  ordered: true, tag: 66,
+  contentType: CHANGESET_ORDERED_BATCH_HTTP_CONTENT_TYPE,
+  receiptType: CHANGESET_ORDERED_BATCH_HTTP_RECEIPT_TYPE,
+});
 type WireEnvelope = ChangesetEnvelope & { readonly order?: Readonly<ChangesetWireOrder> };
 type WireReceipt = ChangesetDeliveryReceipt & { readonly order?: Readonly<ChangesetWireOrder> };
 const MAX_PAYLOAD = 64 * 1024 * 1024;
 const MAX_METADATA = 8192;
 const MAX_RECEIPT = 8192;
+const MAX_BATCH_MESSAGES = 256;
+// One bounded metadata/receipt object per message, plus JSON array separators.
+const MAX_BATCH_METADATA = MAX_METADATA * MAX_BATCH_MESSAGES + MAX_BATCH_MESSAGES + 1;
+const MAX_BATCH_RECEIPT = MAX_RECEIPT * MAX_BATCH_MESSAGES + MAX_BATCH_MESSAGES + 1;
 const utf8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 const encoder = new TextEncoder();
 
@@ -421,6 +434,24 @@ function createHttpTransport(
   format: WireFormat,
 ): (message: WireEnvelope, controls?: ChangesetDeliveryOptions) => Promise<WireReceipt> {
   const maximum = bound(options.maxMessageBytes, 8 * 1024 * 1024, MAX_PAYLOAD);
+  return createHttpExchange(url, options, format,
+    (message: WireEnvelope) => encode(message, maximum, format),
+    (value, meta) => receipt(value, meta, format), MAX_RECEIPT);
+}
+
+type ExchangeOptions<M> = Omit<ChangesetHttpTransportOptions, "headers"> & {
+  headers?: (metadata: M, signal: AbortSignal) => HeadersInit | Promise<HeadersInit>;
+};
+
+/** The same request, credential, stream-budget and uncertain-outcome rules for all frames. */
+function createHttpExchange<I, M, R>(
+  url: string | URL,
+  options: ExchangeOptions<M>,
+  format: WireFormat,
+  encodeInput: (input: I) => { readonly wire: Uint8Array; readonly meta: M },
+  validateReceipt: (value: unknown, meta: M) => R,
+  maximumReceipt: number,
+): (input: I, controls?: ChangesetDeliveryOptions) => Promise<R> {
   const timeout = bound(options.timeoutMs, 30_000, 2_147_483_647),
     insecure = options.allowInsecureLoopback ?? false;
   if (typeof insecure !== "boolean") fail("INPUT", "allowInsecureLoopback must be boolean");
@@ -445,7 +476,7 @@ function createHttpTransport(
       budget = new Budget({ ...controls, timeoutMs });
       budget.checkpoint();
       // Capture before invoking application code or awaiting credentials/fetch.
-      const { wire, meta } = encode(message, maximum, format);
+      const { wire, meta } = encodeInput(message);
       budget.checkpoint();
       const headers = new Headers(
         credentials === undefined ? undefined : await credentials(meta, budget.signal),
@@ -506,9 +537,9 @@ function createHttpTransport(
         );
       if (!contentType(response.headers, format.receiptType))
         fail("PROTOCOL", "Unexpected changeset receipt content type");
-      const bytes = await readBody(response.body, response.headers, MAX_RECEIPT, budget);
+      const bytes = await readBody(response.body, response.headers, maximumReceipt, budget);
       budget.checkpoint();
-      return receipt(parseJson(bytes), meta, format);
+      return validateReceipt(parseJson(bytes), meta);
     } catch (cause: unknown) {
       // Never return remote messages, URLs, headers or SQL errors as diagnostics.
       if (cause instanceof ChangesetHttpError) {
@@ -675,6 +706,41 @@ function createHttpHandler(
   format: WireFormat,
   streamId?: string,
 ): ChangesetHttpHandler {
+  const maximum = bound(options?.maxMessageBytes, 8 * 1024 * 1024, MAX_PAYLOAD);
+  return createHttpEndpoint(receiver, options, format, {
+    maximumBody: 8 + MAX_METADATA + maximum,
+    decode: wire => {
+      const envelope = decode(wire, maximum, format);
+      return { envelope, metadata: Object.freeze([envelopeMetadata(envelope)]) };
+    },
+    receipt: (value, meta) => receipt(value, meta[0]!, format),
+  }, streamId);
+}
+
+interface HandlerCodec<I> {
+  readonly maximumBody: number;
+  decode(wire: Uint8Array): { readonly envelope: I; readonly metadata: readonly Metadata[] };
+  receipt(value: unknown, meta: readonly Metadata[]): unknown;
+}
+
+function envelopeMetadata(envelope: WireEnvelope): Metadata {
+  return Object.freeze({
+    protocol: envelope.protocol, receiverId: envelope.receiverId,
+    deliveryId: envelope.deliveryId, sha256: envelope.sha256,
+    byteLength: envelope.changeset.byteLength,
+    ...(envelope.order === undefined ? {} : { order: envelope.order }),
+  });
+}
+
+/** Authentication and complete per-member authorization precede any receiver call. */
+function createHttpEndpoint<I>(
+  receiver: { readonly receiverId: string;
+    receive(message: I, controls: ChangesetDeliveryOptions): Promise<unknown> },
+  options: ChangesetHttpHandlerOptions,
+  format: WireFormat,
+  codec: HandlerCodec<I>,
+  streamId?: string,
+): ChangesetHttpHandler {
   const id = identity(receiver?.receiverId, 256),
     method = receiver?.receive;
   const authorize = options?.authorize,
@@ -686,7 +752,6 @@ function createHttpHandler(
   )
     fail("INPUT", "A receiver and explicit authorization callback are required");
   const receive = method.bind(receiver);
-  const maximum = bound(options.maxMessageBytes, 8 * 1024 * 1024, MAX_PAYLOAD);
   const timeout = bound(options.timeoutMs, 30_000, 2_147_483_647);
   const capacity = bound(options.maxInFlight, 1, 64);
   const allowed = origins(options.allowedOrigins),
@@ -756,32 +821,22 @@ function createHttpHandler(
       }
       budget.checkpoint();
       if (!permitted) return errorResponse(403, origin);
-      const wire = await readBody(
-        request.body,
-        request.headers,
-        8 + MAX_METADATA + maximum,
-        budget,
-      );
-      const envelope = decode(wire, maximum, format);
+      const wire = await readBody(request.body, request.headers, codec.maximumBody, budget);
+      const { envelope, metadata: meta } = codec.decode(wire);
       budget.checkpoint();
-      if (envelope.receiverId !== id) return errorResponse(400, origin);
-      if (format.ordered && envelope.order?.streamId !== streamId) return errorResponse(400, origin);
-      const meta = Object.freeze({
-        protocol: envelope.protocol,
-        receiverId: id,
-        deliveryId: envelope.deliveryId,
-        sha256: envelope.sha256,
-        byteLength: envelope.changeset.byteLength,
-        ...(envelope.order === undefined ? {} : { order: envelope.order }),
-      });
+      // Validate ALL routes before application-specific authorization. A denied
+      // final member cannot leave an applied prefix or partially confirmed batch.
+      for (const entry of meta) {
+        if (entry.receiverId !== id) return errorResponse(400, origin);
+        if (format.ordered && entry.order?.streamId !== streamId) return errorResponse(400, origin);
+      }
       if (authorizeDelivery !== undefined) {
-        try {
-          permitted = (await authorizeDelivery(context, meta)) === true;
-        } catch {
-          permitted = false;
+        for (const entry of meta) {
+          try { permitted = (await authorizeDelivery(context, entry)) === true; }
+          catch { permitted = false; }
+          budget.checkpoint();
+          if (!permitted) return errorResponse(403, origin);
         }
-        budget.checkpoint();
-        if (!permitted) return errorResponse(403, origin);
       }
       budget.checkpoint();
       receiving = true;
@@ -793,7 +848,7 @@ function createHttpHandler(
         timeoutMs: budget.remaining(),
       });
       budget.checkpoint();
-      return httpResponse(200, receipt(result, meta, format), origin, undefined, format);
+      return httpResponse(200, codec.receipt(result, meta), origin, undefined, format);
     } catch (cause: unknown) {
       if (cause instanceof ChangesetHttpError) {
         if (cause.code.endsWith("TIMEOUT") || cause.code.endsWith("CANCELLED"))
@@ -820,4 +875,155 @@ function createHttpHandler(
       }
     }
   };
+}
+
+
+/** No payload bytes are exposed to the batch credential provider. */
+export interface OrderedChangesetBatchHttpTransportOptions
+  extends Omit<ChangesetHttpTransportOptions, "headers"> {
+  /** Aggregate payload bytes, excluding bounded framing; default/max 64 MiB. */
+  maxBatchBytes?: number;
+  headers?: (
+    deliveries: readonly Readonly<Omit<OrderedChangesetEnvelope, "changeset">>[],
+    signal: AbortSignal,
+  ) => HeadersInit | Promise<HeadersInit>;
+}
+export interface OrderedChangesetBatchHttpHandlerOptions extends ChangesetHttpHandlerOptions {
+  /** Aggregate payload bytes; receiver and ledger limits independently apply. */
+  maxBatchBytes?: number;
+}
+
+type OrderedMetadata = Metadata & { readonly order: Readonly<ChangesetWireOrder> };
+
+/** Snapshot array entries without invoking element accessors or custom iterators. */
+function batchItems(value: unknown): readonly unknown[] {
+  if (!Array.isArray(value)) fail("PROTOCOL", "An ordered batch array is required");
+  const n = bound(Object.getOwnPropertyDescriptor(value, "length")?.value, 0, MAX_BATCH_MESSAGES);
+  const items: unknown[] = [];
+  for (let i = 0; i < n; i++) {
+    const entry = Object.getOwnPropertyDescriptor(value, String(i));
+    if (entry === undefined || !Object.hasOwn(entry, "value"))
+      fail("PROTOCOL", "Batch entries must be own data properties");
+    items.push(entry.value);
+  }
+  return items;
+}
+
+function orderedMetadata(value: unknown, maximum: number): OrderedMetadata {
+  const meta = metadata(value, maximum, ORDERED_BATCH_WIRE);
+  if (meta.order === undefined) fail("PROTOCOL", "Missing batch order");
+  return Object.freeze({ ...meta, order: meta.order });
+}
+
+function validateBatchWindow(meta: readonly OrderedMetadata[]): void {
+  const first = meta[0]!;
+  const ids = new Set<string>();
+  let previous: bigint | undefined;
+  for (const item of meta) {
+    const sequence = BigInt(item.order.sequence);
+    if (item.receiverId !== first.receiverId || item.order.streamId !== first.order.streamId ||
+        (previous !== undefined && sequence !== previous + 1n) || ids.has(item.deliveryId))
+      fail("PROTOCOL", "Batch requires one route, distinct identities and contiguous source order");
+    ids.add(item.deliveryId); previous = sequence;
+  }
+}
+
+/** FCB1 + uint32-BE metadata-array length + UTF-8 array + concatenated raw payloads. */
+function encodeBatch(values: readonly OrderedChangesetEnvelope[], maximum: number, batchMaximum: number) {
+  const metas: OrderedMetadata[] = [], payloads: Uint8Array[] = [];
+  let total = 0;
+  for (const value of batchItems(values)) {
+    const bytes = ownedBytes(field(value, "changeset"), Math.min(maximum, batchMaximum - total));
+    const order = captureOrder(value, ORDERED_BATCH_WIRE);
+    const meta = orderedMetadata({
+      protocol: field(value, "protocol"), receiverId: field(value, "receiverId"),
+      deliveryId: field(value, "deliveryId"), sha256: field(value, "sha256"),
+      byteLength: bytes.length, order,
+    }, maximum);
+    if (encoder.encode(JSON.stringify(meta)).length > MAX_METADATA)
+      fail("LIMIT", "HTTP delivery metadata is too large");
+    metas.push(meta); payloads.push(bytes); total += bytes.length;
+  }
+  validateBatchWindow(metas);
+  const meta = Object.freeze(metas), json = encoder.encode(JSON.stringify(meta));
+  if (json.length > MAX_BATCH_METADATA) fail("LIMIT", "HTTP batch metadata is too large");
+  const wire = new Uint8Array(8 + json.length + total);
+  wire.set([70, 67, ORDERED_BATCH_WIRE.tag, 49]);
+  new DataView(wire.buffer).setUint32(4, json.length);
+  wire.set(json, 8);
+  let pos = 8 + json.length;
+  for (const bytes of payloads) { wire.set(bytes, pos); pos += bytes.length; }
+  return { wire, meta };
+}
+
+function decodeBatch(wire: Uint8Array, maximum: number, batchMaximum: number) {
+  if (wire.length < 8 || wire[0] !== 70 || wire[1] !== 67 || wire[2] !== ORDERED_BATCH_WIRE.tag || wire[3] !== 49)
+    fail("PROTOCOL", "Invalid ordered-batch HTTP frame");
+  const length = new DataView(wire.buffer, wire.byteOffset, wire.byteLength).getUint32(4);
+  if (length === 0 || length > MAX_BATCH_METADATA || length > wire.length - 8)
+    fail("PROTOCOL", "Invalid HTTP batch metadata length");
+  const meta = batchItems(parseJson(wire.subarray(8, 8 + length)))
+    .map(value => orderedMetadata(value, maximum));
+  validateBatchWindow(meta);
+  let total = 0;
+  for (const item of meta) {
+    if (item.byteLength > batchMaximum - total) fail("LIMIT", "HTTP batch exceeds its payload budget");
+    total += item.byteLength;
+  }
+  if (total !== wire.length - 8 - length) fail("PROTOCOL", "HTTP batch payload lengths disagree");
+  let pos = 8 + length;
+  const envelope = Object.freeze(meta.map(item => {
+    const changeset = wire.subarray(pos, pos + item.byteLength); pos += item.byteLength;
+    return Object.freeze({ protocol: PROTOCOL, receiverId: item.receiverId,
+      deliveryId: item.deliveryId, sha256: item.sha256, order: item.order, changeset });
+  }));
+  return { envelope, metadata: Object.freeze(meta) };
+}
+
+function batchReceipt(value: unknown, meta: readonly Metadata[]): readonly OrderedChangesetReceipt[] {
+  const entries = batchItems(value);
+  if (entries.length !== meta.length) fail("PROTOCOL", "HTTP receipt must cover the complete batch");
+  return Object.freeze(entries.map((entry, i) => {
+    const saved = receipt(entry, meta[i]!, ORDERED_BATCH_WIRE);
+    if (saved.order === undefined) fail("PROTOCOL", "Missing ordered HTTP batch receipt");
+    return Object.freeze({ ...saved, order: saved.order });
+  }));
+}
+
+/**
+ * One bounded binary POST to the explicit batch endpoint, never N single sends.
+ * Supply as createOrderedChangesetBatchTransport's deliver callback. That outer
+ * sender owns source identity/count checks; this layer verifies framing/receipts,
+ * not authentication or SQL semantics. No source ACK or automatic retry occurs.
+ */
+export function createOrderedChangesetBatchHttpTransport(
+  url: string | URL,
+  options: OrderedChangesetBatchHttpTransportOptions = {},
+): (messages: readonly OrderedChangesetEnvelope[], controls?: ChangesetDeliveryOptions) => Promise<readonly OrderedChangesetReceipt[]> {
+  const maximum = bound(options.maxMessageBytes, 8 * 1024 * 1024, MAX_PAYLOAD);
+  const batchMaximum = bound(options.maxBatchBytes, MAX_PAYLOAD, MAX_PAYLOAD);
+  return createHttpExchange(url, options, ORDERED_BATCH_WIRE,
+    (messages: readonly OrderedChangesetEnvelope[]) => encodeBatch(messages, maximum, batchMaximum),
+    batchReceipt, MAX_BATCH_RECEIPT);
+}
+
+/**
+ * Authenticate before upload; authorize EVERY member before invoking receiveBatch
+ * ONCE. Keep the shared HTTP admission slot until receiver/confirmation settles.
+ * No fallback to receive(), wire-controlled FK policy or implicit enrollment.
+ */
+export function createOrderedChangesetBatchHttpHandler(
+  receiver: Pick<OrderedChangesetReceiver, "receiverId" | "streamId" | "receiveBatch">,
+  options: OrderedChangesetBatchHttpHandlerOptions,
+): ChangesetHttpHandler {
+  const receiverId = identity(receiver?.receiverId, 256), streamId = identity(receiver?.streamId, 256);
+  const method = receiver?.receiveBatch;
+  if (typeof method !== "function") fail("INPUT", "An atomic batch receiver is required");
+  const maximum = bound(options?.maxMessageBytes, 8 * 1024 * 1024, MAX_PAYLOAD);
+  const batchMaximum = bound(options?.maxBatchBytes, MAX_PAYLOAD, MAX_PAYLOAD);
+  return createHttpEndpoint({ receiverId, receive: method.bind(receiver) }, options, ORDERED_BATCH_WIRE, {
+    maximumBody: 8 + MAX_BATCH_METADATA + batchMaximum,
+    decode: wire => decodeBatch(wire, maximum, batchMaximum),
+    receipt: batchReceipt,
+  }, streamId);
 }
