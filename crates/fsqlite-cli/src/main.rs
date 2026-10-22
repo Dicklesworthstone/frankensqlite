@@ -2465,8 +2465,11 @@ fn statement_complete(buffer: &str) -> bool {
     // `head_words` tracks the first tokens of the CURRENT statement (reset at
     // each top-level `;`), mirroring sqlite3_complete()'s per-statement state.
     let mut head_words: Vec<String> = Vec::with_capacity(3);
-    let mut last_word = String::new();
     let mut in_trigger = false;
+    // sqlite3_complete()'s `;END;` rule: inside a trigger only an END that
+    // directly follows a `;` (whitespace and comments aside) can close the
+    // body, so the END of a `CASE ... END;` body statement does not.
+    let mut end_follows_semi = false;
 
     let mut i = 0usize;
     while i < bytes.len() {
@@ -2496,6 +2499,7 @@ fn statement_complete(buffer: &str) -> bool {
                     {
                         i += 1;
                     }
+                    let previous_significant = last_significant;
                     last_significant = Some(bytes[i - 1]);
                     let word = buffer[start..i].to_ascii_uppercase();
                     if !in_trigger && head_words.len() < 3 {
@@ -2507,7 +2511,8 @@ fn statement_complete(buffer: &str) -> bool {
                                     .is_some_and(|w| w == "TEMP" || w == "TEMPORARY")
                                     && head_words.get(2).is_some_and(|w| w == "TRIGGER")));
                     }
-                    last_word = word;
+                    end_follows_semi =
+                        in_trigger && word == "END" && previous_significant == Some(b';');
                     continue;
                 }
 
@@ -2515,9 +2520,9 @@ fn statement_complete(buffer: &str) -> bool {
 
                 if b == b';' {
                     if in_trigger {
-                        // Only `END ;` closes the trigger body; inner
+                        // Only `; END ;` closes the trigger body; inner
                         // `;`-terminated body statements do not.
-                        if last_word == "END" {
+                        if end_follows_semi {
                             in_trigger = false;
                             head_words.clear();
                         }
@@ -2528,8 +2533,8 @@ fn statement_complete(buffer: &str) -> bool {
                         // machine at each semicolon the same way).
                         head_words.clear();
                     }
-                    last_word.clear();
                 }
+                end_follows_semi = false;
 
                 match b {
                     b'\'' => state = StatementScanState::SingleQuote,
@@ -2931,6 +2936,60 @@ mod tests {
         assert!(statement_complete(
             "INSERT INTO t VALUES(1); CREATE TRIGGER tr AFTER INSERT ON x BEGIN SELECT 1; END;"
         ));
+        // The END of a CASE expression is not the trigger's `; END ;` even
+        // when a `;` follows it (sqlite3_complete() only accepts END right
+        // after a `;`, whitespace and comments aside).
+        assert!(!statement_complete(
+            "CREATE TRIGGER tr AFTER INSERT ON t BEGIN\n  SELECT CASE WHEN new.a > 0 THEN 1 ELSE 0 END;\n"
+        ));
+        assert!(!statement_complete(
+            "CREATE TRIGGER tr AFTER INSERT ON t BEGIN\n  SELECT CASE WHEN new.a > 0 THEN 1 ELSE 0 END;\n  \
+             INSERT INTO log VALUES(new.a);\n"
+        ));
+        assert!(statement_complete(
+            "CREATE TRIGGER tr AFTER INSERT ON t BEGIN\n  SELECT CASE WHEN new.a > 0 THEN 1 ELSE 0 END;\n  \
+             INSERT INTO log VALUES(new.a);\nEND;"
+        ));
+        assert!(statement_complete(
+            "CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; /* note */ END -- done\n;"
+        ));
+        // An END that does not follow a `;` leaves the trigger open, as in stock.
+        assert!(!statement_complete(
+            "CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1 END;"
+        ));
+    }
+
+    #[test]
+    fn test_repl_trigger_body_with_case_end() {
+        asupersync::test_utils::run_test(|| async {
+            let mut input = Cursor::new(
+                b"CREATE TABLE t(a);\n\
+CREATE TABLE log(v);\n\
+CREATE TRIGGER tr AFTER INSERT ON t BEGIN\n\
+  SELECT CASE WHEN new.a > 0 THEN 1 ELSE 0 END;\n\
+  INSERT INTO log VALUES(CASE WHEN new.a > 0 THEN 'pos' ELSE 'neg' END);\n\
+END;\n\
+INSERT INTO t VALUES(5);\n\
+SELECT 'triggers', count(*) FROM sqlite_master WHERE type = 'trigger';\n\
+SELECT 'log', v FROM log;\n\
+.quit\n"
+                    .to_vec(),
+            );
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let args = vec![OsString::from("fsqlite")];
+
+            let exit_code = run(args, &mut input, &mut out, &mut err).await;
+
+            let stderr = String::from_utf8_lossy(&err);
+            assert_eq!(exit_code, 0, "stderr: {stderr}");
+            assert!(err.is_empty(), "unexpected stderr: {stderr}");
+            let stdout = String::from_utf8(out).expect("output should be utf-8");
+            assert!(
+                stdout.contains("triggers|1") && stdout.contains("log|pos"),
+                "the trigger must be created whole and fire once, got: {stdout}"
+            );
+        });
     }
 
     #[test]
