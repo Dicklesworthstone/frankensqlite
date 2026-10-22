@@ -237,9 +237,8 @@ fn preallocate_from_eof_with(
         return Ok(());
     }
     match fcntl_preallocate(false, length) {
-        Ok(()) => Ok(()),
         Err(error) if is_storage_failure(&error) => Err(error),
-        Err(_) => Ok(()),
+        Ok(()) | Err(_) => Ok(()),
     }
 }
 

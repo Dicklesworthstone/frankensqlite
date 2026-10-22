@@ -416,13 +416,14 @@ mod gh521 {
         let stock =
             rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
                 .expect("stock opens persisted image read-only");
-        let root: usize = stock
+        let root: i64 = stock
             .query_row(
                 "SELECT rootpage FROM sqlite_schema WHERE name=?1 AND type='index'",
                 [index_name],
                 |row| row.get(0),
             )
             .expect("index root");
+        let root = usize::try_from(root).expect("index root page is positive");
         let integrity = stock
             .prepare("PRAGMA integrity_check")
             .expect("stock integrity prepare")

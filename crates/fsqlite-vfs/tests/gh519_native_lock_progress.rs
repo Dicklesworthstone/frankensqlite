@@ -80,7 +80,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Witness {
 
             fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
                 if field.name() == "event" {
-                    self.event = value.to_owned();
+                    value.clone_into(&mut self.event);
                 }
             }
 
@@ -346,7 +346,7 @@ fn run_siblings(path: &Path) {
     let waiter_region = waiter.shm_map(&cx, 0, SHM_SEGMENT_SIZE, true).unwrap();
     let (mut sibling, _) = vfs.open(&cx, Some(path), flags).unwrap();
     let sibling_region = sibling.shm_map(&cx, 0, SHM_SEGMENT_SIZE, true).unwrap();
-    let (sender, commands) = mpsc::channel();
+    let (sender, commands) = mpsc::channel::<bool>();
     let sibling_cx = cx.create_child();
     let worker = std::thread::spawn(move || {
         assert!(!commands.recv_timeout(WATCHDOG).unwrap());

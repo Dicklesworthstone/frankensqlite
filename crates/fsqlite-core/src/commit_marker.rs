@@ -486,7 +486,7 @@ pub const fn next_commit_seq_from_file_len(start_commit_seq: u64, file_len: u64)
 pub fn valid_record_prefix_count(data: &[u8]) -> u64 {
     let mut count = 0u64;
     let mut previous: Option<CommitMarkerRecord> = None;
-    for record_bytes in data.chunks_exact(COMMIT_MARKER_RECORD_BYTES) {
+    for record_bytes in data.as_chunks::<COMMIT_MARKER_RECORD_BYTES>().0 {
         let Ok(record) = CommitMarkerRecord::decode(record_bytes) else {
             break;
         };
@@ -569,7 +569,7 @@ fn recover_valid_prefix_with_limit(
 
     let mut records: Vec<CommitMarkerRecord> = Vec::new();
 
-    for record_bytes in record_region.chunks_exact(COMMIT_MARKER_RECORD_BYTES) {
+    for record_bytes in record_region.as_chunks::<COMMIT_MARKER_RECORD_BYTES>().0 {
         let Ok(record) = CommitMarkerRecord::decode(record_bytes) else {
             break;
         };

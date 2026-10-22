@@ -234,12 +234,12 @@ mod tests {
             0x9abc_def0,
         ];
         let mut bytes = [0; 32];
-        for (field, slot) in fields.iter().zip(bytes.chunks_exact_mut(4)) {
+        for (field, slot) in fields.iter().zip(bytes.as_chunks_mut::<4>().0) {
             slot.copy_from_slice(&field.to_be_bytes());
         }
         let mut a = 0_u32;
         let mut b = 0_u32;
-        for pair in bytes[..24].chunks_exact(8) {
+        for pair in bytes[..24].as_chunks::<8>().0 {
             let decode = |slice: &[u8]| {
                 let array: [u8; 4] = slice.try_into().unwrap();
                 if big_endian {

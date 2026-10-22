@@ -314,31 +314,6 @@ pub mod host_fs {
         .into())
     }
 
-    #[cfg(test)]
-    mod private_publication_tests {
-        use super::*;
-
-        #[test]
-        fn write_error_preserves_previous_publication_and_partial_staging() {
-            let directory = tempfile::tempdir().unwrap().keep();
-            let path = directory.join("backup");
-            std::fs::write(&path, b"previous complete image").unwrap();
-            let result: Result<()> = publish_private_file(&path, |file| {
-                file.write_all(b"partial new image")?;
-                Err(std::io::Error::other("injected staging write failure").into())
-            });
-            assert!(result.is_err());
-            assert_eq!(std::fs::read(&path).unwrap(), b"previous complete image");
-            let staged: Vec<_> = read_dir_paths(&directory)
-                .unwrap()
-                .into_iter()
-                .filter(|entry| entry != &path)
-                .collect();
-            assert_eq!(staged.len(), 1);
-            assert_eq!(std::fs::read(&staged[0]).unwrap(), b"partial new image");
-        }
-    }
-
     pub fn remove_file(path: &Path) -> Result<()> {
         std::fs::remove_file(path).map_err(|e| {
             std::io::Error::new(e.kind(), format!("remove {}: {e}", path.display()))
@@ -364,6 +339,31 @@ pub mod host_fs {
         writeln!(file, "{line}")?;
         file.flush()?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod private_publication_tests {
+        use super::*;
+
+        #[test]
+        fn write_error_preserves_previous_publication_and_partial_staging() {
+            let directory = tempfile::tempdir().unwrap().keep();
+            let path = directory.join("backup");
+            std::fs::write(&path, b"previous complete image").unwrap();
+            let result: Result<()> = publish_private_file(&path, |file| {
+                file.write_all(b"partial new image")?;
+                Err(std::io::Error::other("injected staging write failure").into())
+            });
+            assert!(result.is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), b"previous complete image");
+            let staged: Vec<_> = read_dir_paths(&directory)
+                .unwrap()
+                .into_iter()
+                .filter(|entry| entry != &path)
+                .collect();
+            assert_eq!(staged.len(), 1);
+            assert_eq!(std::fs::read(&staged[0]).unwrap(), b"partial new image");
+        }
     }
 }
 

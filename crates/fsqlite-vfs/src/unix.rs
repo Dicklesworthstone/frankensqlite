@@ -2006,8 +2006,7 @@ impl UnixFile {
     fn process_holds_wal_fence(&self) -> bool {
         let shm = self
             .shm_info
-            .as_ref()
-            .cloned()
+            .clone()
             .or_else(|| global_shm_table().lookup(&self.shm_path));
         shm.is_some_and(|shm| {
             let info = shm

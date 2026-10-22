@@ -606,7 +606,9 @@ mod tests {
             // Simulate a changed physical append window before the first staged
             // write. This deliberately violates the normal exclusive append
             // lease and exercises the existing post-admission failure path.
-            file(&vfs, &cx, "fork.objects").write(&cx, &[0x7F], 0).unwrap();
+            file(&vfs, &cx, "fork.objects")
+                .write(&cx, &[0x7F], 0)
+                .expect("move the physical append window");
             assert!(install.commit(&cx, 10).wait().is_err());
             assert_eq!(install.state(), NativePageTransactionState::Indeterminate);
             assert!(install.acknowledgement().is_none());
