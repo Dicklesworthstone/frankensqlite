@@ -10,7 +10,7 @@ pub mod btree;
 use std::collections::BTreeMap;
 
 use crate::commit_marker::{
-    CommitMarkerRecord, MARKER_SEGMENT_HEADER_BYTES, MarkerSegmentHeader, recover_valid_prefix,
+    CommitMarkerRecord, MarkerError, MarkerSegmentHeader, recover_marker_stream,
 };
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::ecs::{PageVersionIndexSegment, PatchKind, VersionPointer};
@@ -190,6 +190,32 @@ pub struct IndexRebuildReport {
     pub markers: Vec<CommitMarkerRecord>,
     /// Built index segments.
     pub segments: Vec<BuiltIndexSegment>,
+}
+
+/// Trust anchors and decoded-marker budget for native index reconstruction.
+///
+/// Anchors must come from trusted caller state, not from the supplied segments.
+/// Without them, a structurally valid prefix does not prove that no committed
+/// history is missing. Rebuilding an index does not publish a database root.
+#[derive(Debug, Clone, Copy)]
+pub struct NativeIndexRecoveryOptions<'a> {
+    /// Checkpoint marker immediately preceding the supplied history, if known.
+    pub predecessor: Option<&'a CommitMarkerRecord>,
+    /// Exact durable tip that reconstruction must reach, if known.
+    pub expected_tip: Option<&'a CommitMarkerRecord>,
+    /// Maximum decoded markers retained across all segments. This does not
+    /// bound input buffers, capsule payloads, or the rebuilt index itself.
+    pub max_records: usize,
+}
+
+impl Default for NativeIndexRecoveryOptions<'_> {
+    fn default() -> Self {
+        Self {
+            predecessor: None,
+            expected_tip: None,
+            max_records: usize::MAX,
+        }
+    }
 }
 
 /// In-memory deterministic builder for `PageVersionIndexSegment`.
@@ -869,6 +895,10 @@ pub fn repair_index_segments_from_ecs(
 
 /// Rebuild native index segments by replaying the commit marker stream.
 ///
+/// Uses unanchored prefix recovery with no explicit marker-count limit. Use
+/// [`rebuild_index_from_marker_stream_with_options`] when the caller knows a
+/// checkpoint/durable tip or needs a decoded-marker budget.
+///
 /// # Errors
 ///
 /// Returns [`FrankenError::DatabaseCorrupt`] with
@@ -879,7 +909,38 @@ pub fn rebuild_index_from_marker_stream(
     capsule_source: &impl CommitCapsuleIndexSource,
     max_entries: usize,
 ) -> Result<IndexRebuildReport> {
-    let markers = scan_commit_markers(marker_segment_blobs)?;
+    rebuild_index_from_marker_stream_with_options(
+        marker_segment_blobs,
+        capsule_source,
+        max_entries,
+        NativeIndexRecoveryOptions::default(),
+    )
+}
+
+/// Rebuild only after the entire supplied marker history satisfies its trust
+/// anchors, cross-segment chain invariants, and decoded-marker budget.
+///
+/// Inputs may arrive in any order; only segment references are sorted, not
+/// copied payloads. An incomplete final append is permitted only when it does
+/// not hide `expected_tip`. An incomplete or empty interior segment is always
+/// rejected. No capsule callback runs until all marker validation succeeds.
+/// Checkpoint-covered pages remain the caller's responsibility: only updates
+/// in the supplied suffix are included in the rebuilt index.
+///
+/// # Errors
+///
+/// Returns [`FrankenError::TooBig`] for an exceeded marker budget,
+/// [`FrankenError::OutOfMemory`] for failed marker-buffer reservations,
+/// [`FrankenError::OutOfRange`] for a zero segment-entry threshold, and
+/// corruption errors for invalid history or unrecoverable capsule updates.
+pub fn rebuild_index_from_marker_stream_with_options(
+    marker_segment_blobs: &[Vec<u8>],
+    capsule_source: &impl CommitCapsuleIndexSource,
+    max_entries: usize,
+    options: NativeIndexRecoveryOptions<'_>,
+) -> Result<IndexRebuildReport> {
+    let mut builder = SegmentBuilder::new(max_entries)?;
+    let markers = scan_commit_markers_with_options(marker_segment_blobs, options)?;
     if markers.is_empty() {
         return Ok(IndexRebuildReport {
             markers,
@@ -898,7 +959,6 @@ pub fn rebuild_index_from_marker_stream(
         "native index rebuild start"
     );
 
-    let mut builder = SegmentBuilder::new(max_entries)?;
     let mut built_segments = Vec::new();
 
     for marker in &markers {
@@ -1007,49 +1067,49 @@ pub fn emergency_linear_scan_lookup(
 }
 
 fn scan_commit_markers(marker_segment_blobs: &[Vec<u8>]) -> Result<Vec<CommitMarkerRecord>> {
-    let mut ordered_segments: Vec<(u64, Vec<CommitMarkerRecord>)> =
-        Vec::with_capacity(marker_segment_blobs.len());
+    scan_commit_markers_with_options(marker_segment_blobs, NativeIndexRecoveryOptions::default())
+}
+
+fn scan_commit_markers_with_options(
+    marker_segment_blobs: &[Vec<u8>],
+    options: NativeIndexRecoveryOptions<'_>,
+) -> Result<Vec<CommitMarkerRecord>> {
+    let mut ordered_segments = Vec::new();
+    ordered_segments
+        .try_reserve_exact(marker_segment_blobs.len())
+        .map_err(|_| FrankenError::OutOfMemory)?;
     for bytes in marker_segment_blobs {
-        if bytes.len() < MARKER_SEGMENT_HEADER_BYTES {
-            return Err(FrankenError::DatabaseCorrupt {
-                detail: format!(
-                    "marker segment shorter than header: bytes={} header_bytes={MARKER_SEGMENT_HEADER_BYTES}",
-                    bytes.len()
-                ),
-            });
-        }
-        let header =
-            MarkerSegmentHeader::decode(&bytes[..MARKER_SEGMENT_HEADER_BYTES]).map_err(|err| {
-                FrankenError::DatabaseCorrupt {
-                    detail: format!("invalid marker segment header: {err}"),
-                }
-            })?;
-        let records = recover_valid_prefix(bytes).map_err(|err| FrankenError::DatabaseCorrupt {
-            detail: format!("marker segment prefix recovery failed: {err}"),
-        })?;
-        ordered_segments.push((header.start_commit_seq, records));
+        let header = MarkerSegmentHeader::decode(bytes).map_err(marker_recovery_error)?;
+        ordered_segments.push((header.start_commit_seq, header.segment_id, bytes.as_slice()));
     }
 
-    ordered_segments.sort_by_key(|(start_seq, _)| *start_seq);
-    let mut combined = Vec::new();
-    let mut expected_next_seq: Option<u64> = None;
-    for (_, records) in ordered_segments {
-        for record in records {
-            if let Some(expected) = expected_next_seq
-                && record.commit_seq != expected
-            {
-                return Err(FrankenError::DatabaseCorrupt {
-                    detail: format!(
-                        "marker stream commit gap: expected {expected}, found {}",
-                        record.commit_seq
-                    ),
-                });
-            }
-            expected_next_seq = Some(record.commit_seq.saturating_add(1));
-            combined.push(record);
-        }
+    // Directory enumeration order is not commit order. Sort borrowed segment
+    // references first, then validate ONE stream, including every segment seam.
+    // Recovering independent prefixes would discard evidence of an interior
+    // torn append and would not bind a later segment to its predecessor hash.
+    ordered_segments.sort_unstable_by_key(|(start, id, _)| (*start, *id));
+    let mut segments = Vec::new();
+    segments
+        .try_reserve_exact(ordered_segments.len())
+        .map_err(|_| FrankenError::OutOfMemory)?;
+    segments.extend(ordered_segments.iter().map(|(_, _, bytes)| *bytes));
+    recover_marker_stream(
+        &segments,
+        options.predecessor,
+        options.expected_tip,
+        options.max_records,
+    )
+    .map_err(marker_recovery_error)
+}
+
+fn marker_recovery_error(error: MarkerError) -> FrankenError {
+    match error {
+        MarkerError::OutOfMemory => FrankenError::OutOfMemory,
+        MarkerError::RecoveryLimitExceeded { .. } => FrankenError::TooBig,
+        other => FrankenError::DatabaseCorrupt {
+            detail: format!("native index marker stream validation failed: {other}"),
+        },
     }
-    Ok(combined)
 }
 
 fn try_fetch_valid_segment(
@@ -1287,6 +1347,252 @@ mod tests {
         let expected_len = MARKER_SEGMENT_HEADER_BYTES + COMMIT_MARKER_RECORD_BYTES * records.len();
         assert_eq!(out.len(), expected_len);
         out
+    }
+
+    #[derive(Default)]
+    struct CountingCapsuleSource {
+        calls: Cell<usize>,
+    }
+
+    impl CommitCapsuleIndexSource for CountingCapsuleSource {
+        fn updates_for_commit(
+            &self,
+            commit_seq: u64,
+            capsule_object_id: ObjectId,
+        ) -> Result<Vec<(PageNumber, VersionPointer)>> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(vec![(
+                page(7),
+                VersionPointer {
+                    commit_seq,
+                    patch_object: capsule_object_id,
+                    patch_kind: PatchKind::FullImage,
+                    base_hint: None,
+                },
+            )])
+        }
+    }
+
+    #[test]
+    fn native_rebuild_checks_seams_before_capsules() {
+        let first = marker_record(999_999, 0x10, [0; 16]);
+        let last = marker_record(1_000_000, 0x11, first.marker_id);
+        let first_blob = marker_segment_blob(first.commit_seq, std::slice::from_ref(&first));
+        let last_blob = marker_segment_blob(last.commit_seq, std::slice::from_ref(&last));
+        let foreign = marker_record(last.commit_seq, 0x11, [0xFF; 16]);
+        let backwards = CommitMarkerRecord::new(
+            last.commit_seq,
+            first.commit_time_unix_ns - 1,
+            last.capsule_object_id,
+            last.proof_object_id,
+            first.marker_id,
+        );
+        let skipped = marker_record(last.commit_seq + 1, 0x12, first.marker_id);
+        let mut torn_first = first_blob.clone();
+        torn_first.push(0xAA);
+        let mut duplicate_id = last_blob.clone();
+        duplicate_id[..MARKER_SEGMENT_HEADER_BYTES]
+            .copy_from_slice(&MarkerSegmentHeader::new(0, last.commit_seq).encode());
+        let cases = [
+            vec![
+                first_blob.clone(),
+                marker_segment_blob(last.commit_seq, &[foreign]),
+            ],
+            vec![
+                first_blob.clone(),
+                marker_segment_blob(last.commit_seq, &[backwards]),
+            ],
+            vec![
+                first_blob.clone(),
+                marker_segment_blob(skipped.commit_seq, &[skipped]),
+            ],
+            vec![torn_first, last_blob.clone()],
+            vec![marker_segment_blob(first.commit_seq, &[]), last_blob],
+            vec![first_blob, duplicate_id],
+        ];
+        for blobs in cases {
+            let source = CountingCapsuleSource::default();
+            assert!(matches!(
+                rebuild_index_from_marker_stream(&blobs, &source, 1),
+                Err(FrankenError::DatabaseCorrupt { .. })
+            ));
+            assert!(preflight_native_index_integrity(&blobs, true, true).is_err());
+            assert!(
+                emergency_linear_scan_lookup(
+                    page(7),
+                    last.commit_seq,
+                    &blobs,
+                    &source,
+                    BoldnessConstraint::emergency(),
+                    "invalid_history",
+                )
+                .is_err()
+            );
+            assert_eq!(
+                source.calls.get(),
+                0,
+                "all consumers must reject before fetch"
+            );
+        }
+    }
+
+    #[test]
+    fn native_rebuild_orders_segments_and_accepts_final_uncommitted_tail() {
+        let first = marker_record(999_999, 0x10, [0; 16]);
+        let last = marker_record(1_000_000, 0x11, first.marker_id);
+        let first_blob = marker_segment_blob(first.commit_seq, std::slice::from_ref(&first));
+        let mut last_blob = marker_segment_blob(last.commit_seq, std::slice::from_ref(&last));
+        last_blob.extend_from_slice(b"incomplete append");
+        let source = CountingCapsuleSource::default();
+        let forward = vec![first_blob.clone(), last_blob.clone()];
+        let reverse = vec![last_blob, first_blob];
+        let expected = rebuild_index_from_marker_stream(&forward, &source, 1).expect("forward");
+        let actual = rebuild_index_from_marker_stream(&reverse, &source, 1).expect("reverse");
+        assert_eq!(actual, expected);
+        assert_eq!(actual.markers, vec![first, last]);
+        assert_eq!(actual.segments.len(), 2);
+        assert_eq!(source.calls.get(), 4);
+        preflight_native_index_integrity(&reverse, true, true).expect("valid prefix");
+    }
+
+    #[test]
+    fn native_rebuild_enforces_checkpoint_tip_and_global_budget() {
+        let checkpoint = marker_record(999_998, 0x09, [0; 16]);
+        let first = marker_record(999_999, 0x10, checkpoint.marker_id);
+        let last = marker_record(1_000_000, 0x11, first.marker_id);
+        let blobs = vec![
+            marker_segment_blob(last.commit_seq, std::slice::from_ref(&last)),
+            marker_segment_blob(first.commit_seq, std::slice::from_ref(&first)),
+        ];
+        let source = CountingCapsuleSource::default();
+        let options = NativeIndexRecoveryOptions {
+            predecessor: Some(&checkpoint),
+            expected_tip: Some(&last),
+            max_records: 2,
+        };
+        for max_records in [0, 1] {
+            assert!(matches!(
+                rebuild_index_from_marker_stream_with_options(
+                    &blobs,
+                    &source,
+                    1,
+                    NativeIndexRecoveryOptions {
+                        max_records,
+                        ..options
+                    },
+                ),
+                Err(FrankenError::TooBig)
+            ));
+            assert_eq!(source.calls.get(), 0);
+        }
+        let foreign_checkpoint = marker_record(checkpoint.commit_seq, 0xF0, [0; 16]);
+        let foreign_tip = marker_record(last.commit_seq, 0xF1, first.marker_id);
+        for invalid in [
+            NativeIndexRecoveryOptions {
+                predecessor: Some(&foreign_checkpoint),
+                ..options
+            },
+            NativeIndexRecoveryOptions {
+                expected_tip: Some(&foreign_tip),
+                ..options
+            },
+        ] {
+            assert!(matches!(
+                rebuild_index_from_marker_stream_with_options(&blobs, &source, 1, invalid),
+                Err(FrankenError::DatabaseCorrupt { .. })
+            ));
+            assert_eq!(source.calls.get(), 0);
+        }
+        let report = rebuild_index_from_marker_stream_with_options(&blobs, &source, 1, options)
+            .expect("anchored suffix");
+        assert_eq!(report.markers, vec![first, last]);
+        assert_eq!(report.segments.len(), 2);
+        assert_eq!(source.calls.get(), 2);
+    }
+
+    #[test]
+    fn native_rebuild_checkpoint_only_still_validates_options() {
+        let checkpoint = marker_record(42, 0x10, [0; 16]);
+        let future_tip = marker_record(43, 0x11, checkpoint.marker_id);
+        let source = CountingCapsuleSource::default();
+        let options = NativeIndexRecoveryOptions {
+            predecessor: Some(&checkpoint),
+            expected_tip: Some(&checkpoint),
+            max_records: 0,
+        };
+        let report = rebuild_index_from_marker_stream_with_options(&[], &source, 1, options)
+            .expect("checkpoint already reaches the tip");
+        assert!(report.markers.is_empty());
+        assert!(report.segments.is_empty());
+        assert!(matches!(
+            rebuild_index_from_marker_stream_with_options(&[], &source, 0, options),
+            Err(FrankenError::OutOfRange { .. })
+        ));
+        assert!(matches!(
+            rebuild_index_from_marker_stream_with_options(
+                &[],
+                &source,
+                1,
+                NativeIndexRecoveryOptions {
+                    expected_tip: Some(&future_tip),
+                    ..options
+                },
+            ),
+            Err(FrankenError::DatabaseCorrupt { .. })
+        ));
+        assert_eq!(source.calls.get(), 0);
+    }
+
+    #[test]
+    fn native_rebuild_never_hides_a_known_durable_tail() {
+        let first = marker_record(999_999, 0x10, [0; 16]);
+        let last = marker_record(1_000_000, 0x11, first.marker_id);
+        for retained_bytes in 0..COMMIT_MARKER_RECORD_BYTES {
+            let first_blob = marker_segment_blob(first.commit_seq, std::slice::from_ref(&first));
+            let mut last_blob = marker_segment_blob(last.commit_seq, &[]);
+            last_blob.extend_from_slice(&last.encode()[..retained_bytes]);
+            let source = CountingCapsuleSource::default();
+            assert!(matches!(
+                rebuild_index_from_marker_stream_with_options(
+                    &[last_blob, first_blob],
+                    &source,
+                    1,
+                    NativeIndexRecoveryOptions {
+                        expected_tip: Some(&last),
+                        ..NativeIndexRecoveryOptions::default()
+                    },
+                ),
+                Err(FrankenError::DatabaseCorrupt { .. })
+            ));
+            assert_eq!(source.calls.get(), 0, "cut at byte {retained_bytes}");
+        }
+    }
+
+    #[test]
+    fn native_marker_scan_rejects_duplicate_maximum_sequence() {
+        let last = marker_record(u64::MAX, 0x10, [0; 16]);
+        let blob = marker_segment_blob(last.commit_seq, std::slice::from_ref(&last));
+        assert_eq!(
+            scan_commit_markers(std::slice::from_ref(&blob)).expect("last"),
+            vec![last]
+        );
+        assert!(scan_commit_markers(&[blob.clone(), blob]).is_err());
+    }
+
+    #[test]
+    fn native_marker_resource_failures_remain_distinct_from_corruption() {
+        assert!(matches!(
+            marker_recovery_error(MarkerError::OutOfMemory),
+            FrankenError::OutOfMemory
+        ));
+        assert!(matches!(
+            marker_recovery_error(MarkerError::RecoveryLimitExceeded { max_records: 0 }),
+            FrankenError::TooBig
+        ));
+        assert!(matches!(
+            marker_recovery_error(MarkerError::SequenceOverflow),
+            FrankenError::DatabaseCorrupt { .. }
+        ));
     }
 
     #[test]
