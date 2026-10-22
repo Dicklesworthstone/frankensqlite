@@ -23,6 +23,8 @@ import type {
   WorkerResponse,
 } from "./protocol";
 import { isSnapshotPersistenceMode } from "./protocol";
+import type { ResultLimits } from "./result-budget";
+import { enforceResultLimits, resolveResultLimits } from "./result-budget";
 import type { ResultEncoding } from "./result-codec";
 import { encodeQueryResponse, resolveResultEncoding } from "./result-codec";
 import {
@@ -141,12 +143,15 @@ export class WorkerConnectionHost {
   readonly #budget: RequestBudget;
   #closePromise: Promise<WorkerResponse> | null = null;
   #resultEncoding: ResultEncoding = "structured-clone";
+  readonly #resultLimits: Readonly<ResultLimits> | null;
 
   constructor(
     loader: CoreModuleLoader = defaultCoreModuleLoader,
     limits: Partial<RequestLimits> = {},
     statementLimits: Partial<PreparedStatementLimits> = {},
+    resultLimits?: Partial<ResultLimits>,
   ) {
+    this.#resultLimits = resultLimits === undefined ? null : resolveResultLimits(resultLimits);
     this.#loader = loader;
     this.#budget = new RequestBudget(limits);
     this.#statementBudget = new PreparedStatementBudget(statementLimits);
@@ -678,6 +683,7 @@ export class WorkerConnectionHost {
     const params = this.#parameters(sql, bindings);
     const data =
       params.length === 0 ? await db.query(sql) : await db.queryWithParams(sql, [...params]);
+    if (this.#resultLimits !== null) enforceResultLimits(data, this.#resultLimits);
     return encodeQueryResponse(requestId, data, this.#resultEncoding);
   }
 
@@ -829,6 +835,7 @@ export class WorkerConnectionHost {
     const stmt = this.#requireStatement(statementId);
     const params = this.#parameters(stmt.sql, bindings, this.#parameterLayouts.get(statementId));
     const data = params.length === 0 ? await stmt.query() : await stmt.queryWithParams([...params]);
+    if (this.#resultLimits !== null) enforceResultLimits(data, this.#resultLimits);
     return encodeQueryResponse(requestId, data, this.#resultEncoding);
   }
 

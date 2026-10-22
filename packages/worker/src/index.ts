@@ -15,6 +15,8 @@ export {
 } from "./connection";
 export { OpfsSnapshotStore } from "./opfs-snapshot-store";
 export * from "./protocol";
+export type { ResultLimits } from "./result-budget";
+export { DEFAULT_RESULT_LIMITS, ResultBudgetError, resolveResultLimits } from "./result-budget";
 export type { ResultEncoding } from "./result-codec";
 export {
   BINARY_RESULT_THRESHOLD,
