@@ -122,19 +122,21 @@ fn local_jdn_to_utc_jdn(local_jdn: f64) -> f64 {
 // Algorithms from Meeus, "Astronomical Algorithms" (1991).
 
 /// Gregorian (y, m, d, h, min, sec, frac_sec) → Julian Day Number.
+///
+/// SQLite's computeJD (date.c) exactly: its century term `(Y+4800)/100` stays
+/// positive for every supported year, where Meeus's `Y/100` with truncating
+/// division put BCE dates a day late.
 fn ymd_to_jdn(y: i64, m: i64, d: i64) -> f64 {
     let (y, m) = if m <= 2 {
         (y.saturating_sub(1), m.saturating_add(12))
     } else {
         (y, m)
     };
-    let a = y / 100;
-    let b = 2_i64.saturating_sub(a).saturating_add(a / 4);
-    (365.25 * y.saturating_add(4716) as f64).floor()
-        + (30.6001 * m.saturating_add(1) as f64).floor()
-        + d as f64
-        + b as f64
-        - 1524.5
+    let a = y.saturating_add(4800) / 100;
+    let b = 38_i64.saturating_sub(a).saturating_add(a / 4);
+    let x1 = 36525_i64.saturating_mul(y.saturating_add(4716)) / 100;
+    let x2 = 306_001_i64.saturating_mul(m.saturating_add(1)) / 10000;
+    x1.saturating_add(x2).saturating_add(d).saturating_add(b) as f64 - 1524.5
 }
 
 /// Julian Day Number → Gregorian (year, month, day).
@@ -337,15 +339,22 @@ fn parse_iso8601(s: &str) -> Option<f64> {
     // HH:MM:SS.SSS[Z|±HH:MM]  (bare time → 2000-01-01)
     // HH:MM:SS[Z|±HH:MM]
     // HH:MM[Z|±HH:MM]
+    // A leading '-' makes the date's year negative (BCE, date.c parseYyyyMmDd):
+    // -YYYY-MM-DD[...]
 
-    let bytes = s.as_bytes();
+    let (negative_year, date) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s),
+    };
+    let bytes = date.as_bytes();
     let len = bytes.len();
 
     // Try date-only or date+time.
     if len >= 10 && bytes[4] == b'-' && bytes[7] == b'-' {
-        let y = s[0..4].parse::<i64>().ok()?;
-        let m = s[5..7].parse::<i64>().ok()?;
-        let d = s[8..10].parse::<i64>().ok()?;
+        let y = date[0..4].parse::<i64>().ok()?;
+        let y = if negative_year { -y } else { y };
+        let m = date[5..7].parse::<i64>().ok()?;
+        let d = date[8..10].parse::<i64>().ok()?;
 
         if m < 1 || m > 12 || d < 1 || d > 31 {
             return None;
@@ -357,13 +366,16 @@ fn parse_iso8601(s: &str) -> Option<f64> {
 
         // Separator: space or 'T'.
         if len > 10 && (bytes[10] == b' ' || bytes[10] == b'T') {
-            let time_part = &s[11..];
+            let time_part = &date[11..];
             let (h, mi, sec, frac, tz_offset_min) = parse_time_part_with_tz(time_part)?;
             let jdn = ymdhms_to_jdn(y, m, d, h, mi, sec, frac);
             // Apply TZ offset: subtract the offset to convert local → UTC.
             // For "+01:00", local = UTC + 1h, so UTC = local - 1h.
             return Some(jdn - (tz_offset_min as f64) / 1440.0);
         }
+        return None;
+    }
+    if negative_year {
         return None;
     }
 
@@ -705,6 +717,18 @@ fn apply_modifiers(jdn: f64, modifiers: &[String], mut raw_numeric: bool) -> Opt
             n_floor = 0;
             continue;
         }
+        // (+|-)YYYY-MM-DD[ HH:MM...] and [+|-]HH:MM[:SS[.FFF]] offsets.
+        match apply_signed_offset_modifier(j, &m_lower) {
+            Ok(Some((new_jdn, floor))) => {
+                j = new_jdn;
+                if let Some(floor) = floor {
+                    n_floor = floor;
+                }
+                continue;
+            }
+            Ok(None) => return None,
+            Err(()) => {}
+        }
         // Month/year modifiers need special handling for exact date math.
         // If exact arithmetic overflows (returns None), the modifier is
         // out of representable range — return NULL rather than falling
@@ -824,6 +848,124 @@ fn apply_month_year_exact(jdn: f64, m: &str) -> std::result::Result<Option<(f64,
         ymdhms_to_jdn(new_y, new_mo, d, h, mi, s, frac) + frac_days,
         n_floor,
     )))
+}
+
+/// Exactly `count` ASCII digits at the start of `s`, as a number.
+fn leading_digits(s: &str, count: usize) -> Option<i64> {
+    let digits = s.get(..count)?;
+    digits
+        .bytes()
+        .all(|b| b.is_ascii_digit())
+        .then(|| digits.parse().ok())
+        .flatten()
+}
+
+/// SQLite's signed date/time offset modifiers (date.c `parseModifier`):
+///
+/// * `(+|-)YYYY-MM-DD` (4 or 5 year digits) shifts by years, months (0..11) and
+///   days (0..30): years and months by calendar recomposition, days flat. It
+///   may be followed by ` HH:MM[:SS[.FFF]]`, applied as below with the same
+///   sign. The day-of-month overflow is reported for a later `'floor'`.
+/// * `[+|-]HH:MM[:SS[.FFF]]` shifts the time by that much, taken modulo one
+///   day as stock's computation does (`+24:00` is a no-op).
+///
+/// Returns `Err(())` when `m` has neither form, so the caller tries the
+/// `NNN units` grammar; `Ok(None)` when it has one but a field is invalid
+/// (stock's NULL). `Ok(Some((jdn, floor)))` carries the new pending floor
+/// for the date form and `None` (unchanged) for the time-only form.
+fn apply_signed_offset_modifier(
+    jdn: f64,
+    m: &str,
+) -> std::result::Result<Option<(f64, Option<i64>)>, ()> {
+    let sign = match m.as_bytes().first() {
+        Some(b'+') => Some(1_i64),
+        Some(b'-') => Some(-1_i64),
+        Some(b) if b.is_ascii_digit() => None,
+        _ => return Err(()),
+    };
+    let body = if sign.is_some() { &m[1..] } else { m };
+
+    // (+|-)YYYY-MM-DD[ HH:MM[:SS[.FFF]]]
+    let year_digits = [4_usize, 5]
+        .into_iter()
+        .find(|&n| body.as_bytes().get(n) == Some(&b'-') && leading_digits(body, n).is_some());
+    if let (Some(sign), Some(year_digits)) = (sign, year_digits) {
+        let years = leading_digits(body, year_digits).ok_or(())?;
+        let rest = &body[year_digits + 1..];
+        let (Some(months), Some(b'-'), Some(days)) = (
+            leading_digits(rest, 2),
+            rest.as_bytes().get(2),
+            rest.get(3..).and_then(|tail| leading_digits(tail, 2)),
+        ) else {
+            return Ok(None);
+        };
+        if months >= 12 || days >= 31 {
+            return Ok(None);
+        }
+        let (y, mo, d) = jdn_to_ymd(jdn);
+        let (h, mi, s, frac) = jdn_to_hms(jdn);
+        let shifted_months = (y * 12 + (mo - 1)) + sign * (years * 12 + months);
+        let new_y = shifted_months.div_euclid(12);
+        let new_mo = shifted_months.rem_euclid(12) + 1;
+        let n_floor = compute_floor(new_y, new_mo, d);
+        let shifted = ymdhms_to_jdn(new_y, new_mo, d, h, mi, s, frac) + (sign * days) as f64;
+        let time = &rest[5..];
+        if time.is_empty() {
+            return Ok(Some((shifted, Some(n_floor))));
+        }
+        let Some(time) = time.strip_prefix(' ') else {
+            return Ok(None);
+        };
+        return Ok(
+            time_of_day_offset(time).map(|delta| (shifted + sign as f64 * delta, Some(n_floor)))
+        );
+    }
+
+    // [+|-]HH:MM[:SS[.FFF]]: a numeric prefix ending at ':'.
+    let Some(colon) = body.find(':') else {
+        return Err(());
+    };
+    if colon == 0 || !body[..colon].bytes().all(|b| b.is_ascii_digit()) {
+        return Err(());
+    }
+    Ok(time_of_day_offset(body).map(|delta| (jdn + sign.unwrap_or(1) as f64 * delta, None)))
+}
+
+/// `HH:MM[:SS[.FFF]]` as a fraction of a day for the offset modifiers,
+/// following date.c: hours 0..24, minutes and seconds 0..59, fractional
+/// seconds truncated at .999, rounded to the millisecond, modulo one day.
+fn time_of_day_offset(time: &str) -> Option<f64> {
+    let hours = leading_digits(time, 2).filter(|&h| h <= 24)?;
+    if time.as_bytes().get(2) != Some(&b':') {
+        return None;
+    }
+    let minutes = leading_digits(&time[3..], 2).filter(|&m| m <= 59)?;
+    let mut rest = &time[5..];
+    let seconds = if let Some(after_colon) = rest.strip_prefix(':') {
+        let whole = leading_digits(after_colon, 2).filter(|&s| s <= 59)?;
+        rest = &after_colon[2..];
+        let mut fraction = 0.0_f64;
+        if let Some(digits) = rest.strip_prefix('.')
+            && digits.as_bytes().first().is_some_and(u8::is_ascii_digit)
+        {
+            let count = digits.bytes().take_while(u8::is_ascii_digit).count();
+            let mut scale = 1.0_f64;
+            for b in digits[..count].bytes() {
+                fraction = fraction * 10.0 + f64::from(b - b'0');
+                scale *= 10.0;
+            }
+            fraction = (fraction / scale).min(0.999);
+            rest = &digits[count..];
+        }
+        whole as f64 + fraction
+    } else {
+        0.0
+    };
+    if !rest.is_empty() {
+        return None;
+    }
+    let millis = hours * 3_600_000 + minutes * 60_000 + (seconds * 1000.0 + 0.5) as i64;
+    Some((millis % 86_400_000) as f64 / 86_400_000.0)
 }
 
 // ── Output Formatters ─────────────────────────────────────────────────────
@@ -2070,6 +2212,85 @@ mod tests {
 
         assert_eq!(StrftimeFunc.invoke(&[]).unwrap(), SqliteValue::Null);
         assert_eq!(StrftimeFunc.invoke(&[null()]).unwrap(), SqliteValue::Null);
+    }
+
+    #[test]
+    fn test_datetime_signed_offset_modifiers_and_bce_dates() {
+        // Oracle: sqlite3 3.54.0 and the 3.52.0 date.c parseModifier /
+        // parseYyyyMmDd. Some(text) for TEXT, None for NULL.
+        let date = |args: &[SqliteValue]| -> Option<String> {
+            match DateFunc.invoke(args).unwrap() {
+                SqliteValue::Text(t) => Some(t.as_str().to_owned()),
+                SqliteValue::Null => None,
+                other => panic!("date -> {other:?}"),
+            }
+        };
+        let dtime = |args: &[SqliteValue]| -> Option<String> {
+            match DateTimeFunc.invoke(args).unwrap() {
+                SqliteValue::Text(t) => Some(t.as_str().to_owned()),
+                SqliteValue::Null => None,
+                other => panic!("datetime -> {other:?}"),
+            }
+        };
+        let s = |x: &str| Some(x.to_owned());
+        let base = text("2024-01-01 10:00");
+
+        // [+|-]HH:MM[:SS[.FFF]] time shifts, modulo one day.
+        assert_eq!(
+            dtime(&[base.clone(), text("+01:30")]),
+            s("2024-01-01 11:30:00")
+        );
+        assert_eq!(
+            dtime(&[base.clone(), text("01:30")]),
+            s("2024-01-01 11:30:00")
+        );
+        assert_eq!(
+            dtime(&[base.clone(), text("-01:30:15")]),
+            s("2024-01-01 08:29:45")
+        );
+        assert_eq!(
+            dtime(&[base.clone(), text("+24:00")]),
+            s("2024-01-01 10:00:00")
+        );
+        assert_eq!(
+            dtime(&[text("2024-01-01"), text("+01:30:15.5")]),
+            s("2024-01-01 01:30:15")
+        );
+        assert_eq!(dtime(&[base.clone(), text("+1:30")]), None);
+        assert_eq!(dtime(&[base.clone(), text("+01:60")]), None);
+        assert_eq!(dtime(&[base.clone(), text("+01:30 junk")]), None);
+
+        // (+|-)YYYY-MM-DD[ HH:MM] calendar shifts, with floor support.
+        assert_eq!(
+            dtime(&[text("2024-01-01 12:00"), text("+0001-02-03 04:05:06")]),
+            s("2025-03-04 16:05:06")
+        );
+        assert_eq!(
+            dtime(&[text("2024-03-31"), text("+0000-01-00")]),
+            s("2024-05-01 00:00:00")
+        );
+        assert_eq!(
+            dtime(&[text("2024-03-31"), text("+0000-01-00"), text("floor")]),
+            s("2024-04-30 00:00:00")
+        );
+        assert_eq!(
+            dtime(&[text("2024-01-01"), text("-0000-00-01")]),
+            s("2023-12-31 00:00:00")
+        );
+        assert_eq!(
+            dtime(&[text("2024-01-01"), text("+00000-01-00")]),
+            s("2024-02-01 00:00:00")
+        );
+        assert_eq!(dtime(&[text("2024-01-01"), text("+0000-12-00")]), None);
+        assert_eq!(dtime(&[text("2024-01-01"), text("+0000-00-31")]), None);
+        assert_eq!(dtime(&[text("2024-01-01"), text("0000-01-00")]), None);
+
+        // A leading '-' is a BCE year.
+        assert_eq!(date(&[text("-0001-01-01")]), s("-0001-01-01"));
+        assert_eq!(
+            date(&[text("-0001-03-01"), text("-1 day")]),
+            s("-0001-02-28")
+        );
     }
 
     #[test]

@@ -177,3 +177,39 @@ fn datetime_iso_week_specifiers() {
         .await;
     });
 }
+
+/// bd-reality-check-1022-llk6g.17: the signed `[+|-]HH:MM[:SS[.FFF]]` and
+/// `(+|-)YYYY-MM-DD[ HH:MM[:SS]]` modifiers, plus BCE (`-YYYY-MM-DD`) dates.
+#[test]
+fn datetime_signed_offset_modifiers_and_bce_dates() {
+    asupersync::test_utils::run_test(|| async {
+        assert_scalar(
+            &[
+                "SELECT datetime('2024-01-01 10:00', '+01:30')",
+                "SELECT datetime('2024-01-01 10:00', '01:30')",
+                "SELECT datetime('2024-01-01 10:00', '-01:30:15')",
+                "SELECT datetime('2024-01-01 10:00', '+24:00')",
+                "SELECT datetime('2024-01-01', '+01:30:15.5')",
+                "SELECT strftime('%H:%M:%f', '2024-01-01', '+01:30:15.123')",
+                "SELECT datetime('2024-01-01 10:00', '+1:30')",
+                "SELECT datetime('2024-01-01 10:00', '+01:60')",
+                "SELECT datetime('2024-01-01 12:00', '+0001-02-03 04:05:06')",
+                "SELECT datetime('2024-03-31', '+0000-01-00')",
+                "SELECT datetime('2024-03-31', '+0000-01-00', 'floor')",
+                "SELECT datetime('2024-01-31 08:00', '+0001-01-00 01:00')",
+                "SELECT datetime('2024-01-01', '-0000-00-01')",
+                "SELECT datetime('2024-01-01', '-0001-11-30 23:59:59')",
+                "SELECT datetime('2024-01-01', '+00000-01-00')",
+                "SELECT datetime('2024-01-01', '+0000-12-00')",
+                "SELECT datetime('2024-01-01', '+0000-00-31')",
+                "SELECT datetime('2024-01-01', '0000-01-00')",
+                "SELECT date('-0001-01-01')",
+                "SELECT date('-0001-03-01', '-1 day')",
+                "SELECT datetime('-0100-06-15 12:30')",
+                "SELECT julianday('-4712-01-01 12:00')",
+            ],
+            "datetime_signed_offset_modifiers_and_bce_dates",
+        )
+        .await;
+    });
+}
