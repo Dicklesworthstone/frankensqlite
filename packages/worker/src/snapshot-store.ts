@@ -154,10 +154,9 @@ export class IndexedDbSnapshotStore {
         "Invalid checkpoint publication identity",
       );
     }
-    validateSnapshotBytes(bytes);
     // Own an exact-size copy before yielding. Do not detach the caller's data,
     // persist a view's unrelated backing bytes, or race caller buffer mutation.
-    const owned = new Uint8Array(bytes);
+    const owned = captureSnapshotBytes(bytes);
     const record: SnapshotRecord = {
       format: FORMAT,
       name: this.#name,
@@ -271,16 +270,59 @@ export function validateSnapshotName(name: string): void {
   }
 }
 
-export function validateSnapshotBytes(bytes: Uint8Array): void {
-  if (!(bytes instanceof Uint8Array)) {
-    throw new SnapshotStoreError("ERR_FSQLITE_SNAPSHOT_INPUT", "Snapshot must be a Uint8Array");
-  }
-  if (bytes.byteLength > MAX_SNAPSHOT_BYTES) {
+// Capture native accessors, not properties/methods supplied by a caller's
+// Uint8Array subclass. Validation and copying must describe the SAME bytes.
+const typedArray = Object.getPrototypeOf(Uint8Array.prototype) as object;
+const arrayKind = Object.getOwnPropertyDescriptor(typedArray, Symbol.toStringTag)!.get!;
+const arrayBuffer = Object.getOwnPropertyDescriptor(typedArray, "buffer")!.get!;
+const arrayOffset = Object.getOwnPropertyDescriptor(typedArray, "byteOffset")!.get!;
+const arrayLength = Object.getOwnPropertyDescriptor(typedArray, "byteLength")!.get!;
+const bufferLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength")!.get!;
+const bufferResizable = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "resizable")?.get;
+
+/** A plain zero-copy view, without application getters or shared/resizing storage. */
+function fixedSnapshotView(bytes: Uint8Array): Uint8Array {
+  try {
+    if (arrayKind.call(bytes) !== "Uint8Array") throw new TypeError("Expected Uint8Array");
+    const buffer = arrayBuffer.call(bytes) as ArrayBuffer;
+    const offset = arrayOffset.call(bytes) as number;
+    const length = arrayLength.call(bytes) as number;
+    // This getter is also an ArrayBuffer brand check: SharedArrayBuffer must
+    // not race either the synchronous validator or its subsequent owned copy.
+    bufferLength.call(buffer);
+    if (bufferResizable?.call(buffer)) throw new TypeError("Resizable snapshot storage");
+    if (length > MAX_SNAPSHOT_BYTES) {
+      throw new SnapshotStoreError(
+        "ERR_FSQLITE_SNAPSHOT_TOO_LARGE",
+        `Snapshot exceeds ${MAX_SNAPSHOT_BYTES} bytes`,
+      );
+    }
+    // Construction rejects detached buffers, including a zero-length view.
+    // Cross-realm ArrayBuffers and Node Buffers still use their real slots.
+    return new Uint8Array(buffer, offset, length);
+  } catch (cause: unknown) {
+    if (cause instanceof SnapshotStoreError) throw cause;
     throw new SnapshotStoreError(
-      "ERR_FSQLITE_SNAPSHOT_TOO_LARGE",
-      `Snapshot exceeds ${MAX_SNAPSHOT_BYTES} bytes`,
+      "ERR_FSQLITE_SNAPSHOT_INPUT",
+      "Snapshot requires an attached Uint8Array over fixed, non-shared storage",
+      { cause },
     );
   }
+}
+
+/** Validate real view bounds and bytes; never invoke caller-defined accessors. */
+export function validateSnapshotBytes(bytes: Uint8Array): void {
+  validateFixedSnapshotBytes(fixedSnapshotView(bytes));
+}
+
+/** @internal Bound and validate BEFORE copying; retain no caller-owned storage. */
+export function captureSnapshotBytes(bytes: Uint8Array): Uint8Array<ArrayBuffer> {
+  const view = fixedSnapshotView(bytes);
+  validateFixedSnapshotBytes(view);
+  return new Uint8Array(view);
+}
+
+function validateFixedSnapshotBytes(bytes: Uint8Array): void {
   const magic = "SQLite format 3\0";
   if (
     bytes.byteLength < 512 ||

@@ -2,6 +2,7 @@ import type { SnapshotMetadata, StoredSnapshot } from "./snapshot-store";
 import {
   MAX_SNAPSHOT_BYTES,
   SnapshotStoreError,
+  captureSnapshotBytes,
   validateSnapshotBytes,
   validateSnapshotName,
 } from "./snapshot-store";
@@ -109,11 +110,9 @@ export class OpfsSnapshotStore {
   ): Promise<SnapshotMetadata> {
     this.#assertOpen();
     validateIdentity(expectedRevision, publicationId);
-    validateSnapshotBytes(bytes);
     // Capture before the first await, including exact view bounds. Caller
     // mutation during hashing or lock acquisition cannot change publication.
-    const owned = new Uint8Array(bytes);
-    validateSnapshotBytes(owned);
+    const owned = captureSnapshotBytes(bytes);
     const envelope: Envelope = {
       format: 1,
       name: this.#name,
