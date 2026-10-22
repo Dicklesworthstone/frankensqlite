@@ -355,7 +355,7 @@ impl SegmentBuilder {
 /// Implements:
 /// 1) cache lookup
 /// 2) presence filter check (fast negative path)
-/// 3) backward segment scan
+/// 3) newest visible version across all eligible index segments
 /// 4) patch fetch + materialization.
 ///
 /// # Errors
@@ -411,7 +411,7 @@ pub fn lookup_page_version(
     }
 
     let (resolved_pointer, segment_scans) =
-        lookup_pointer_in_segments(page, snapshot_high, segments);
+        lookup_pointer_in_segments(page, snapshot_high, segments)?;
     let Some(pointer) = resolved_pointer else {
         return base_fallback_result(
             page,
@@ -464,7 +464,14 @@ fn materialized_result(
     deps: &mut LookupDeps<'_>,
 ) -> Result<LookupResult> {
     let patch_bytes = deps.patch_store.fetch_patch_object(pointer.patch_object)?;
-    let base_bytes = deps.base_provider.load_base_page(page)?;
+    // Full images are self-contained; hinted patches obtain their base from
+    // the object store. Neither path may depend on a possibly absent, newer,
+    // or corrupt compatibility/base page that it will never use.
+    let base_bytes = if pointer.patch_kind != PatchKind::FullImage && pointer.base_hint.is_none() {
+        deps.base_provider.load_base_page(page)?
+    } else {
+        Vec::new()
+    };
     let page_bytes = materialize_patch(pointer, &patch_bytes, &base_bytes, deps.patch_store, 0)?;
     if pointer.patch_kind != PatchKind::FullImage {
         warn!(
@@ -526,27 +533,45 @@ fn version_maybe_present(
         .any(|segment| segment.start_seq <= snapshot_high && segment.bloom.maybe_contains(page))
 }
 
-#[must_use]
 fn lookup_pointer_in_segments(
     page: PageNumber,
     snapshot_high: u64,
     segments: &[PageVersionIndexSegment],
-) -> (Option<VersionPointer>, u64) {
-    let mut ordered: Vec<&PageVersionIndexSegment> = segments.iter().collect();
-    ordered.sort_by_key(|segment| segment.end_seq);
-    ordered.reverse();
-
+) -> Result<(Option<VersionPointer>, u64)> {
+    // Segment end_seq describes all pages, not this page's newest version.
+    // Overlapping/rebuilt segments cannot be searched by returning the first
+    // hit from the segment with the highest end_seq. Compare actual visible
+    // commit sequences, without allocating and sorting a temporary directory.
+    let mut resolved: Option<VersionPointer> = None;
+    let mut conflicting_latest = false;
     let mut scans = 0_u64;
-    for segment in ordered {
+    for segment in segments {
         if segment.start_seq > snapshot_high {
             continue;
         }
         scans = scans.saturating_add(1);
         if let Some(pointer) = segment.lookup(page, snapshot_high) {
-            return (Some(*pointer), scans);
+            match resolved {
+                Some(current) if pointer.commit_seq < current.commit_seq => {}
+                Some(current) if pointer.commit_seq == current.commit_seq => {
+                    conflicting_latest |= *pointer != current;
+                }
+                _ => {
+                    resolved = Some(*pointer);
+                    conflicting_latest = false;
+                }
+            }
         }
     }
-    (None, scans)
+    if conflicting_latest {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: format!(
+                "conflicting native index pointers for page {} at snapshot {snapshot_high}",
+                page.get(),
+            ),
+        });
+    }
+    Ok((resolved, scans))
 }
 
 fn materialize_patch(
@@ -1048,10 +1073,32 @@ pub fn emergency_linear_scan_lookup(
         }
         let capsule_id = ObjectId::from_bytes(marker.capsule_object_id);
         let updates = capsule_source.updates_for_commit(marker.commit_seq, capsule_id)?;
-        if let Some((_, pointer)) = updates
-            .into_iter()
-            .find(|(candidate, pointer)| *candidate == page && pointer.commit_seq <= snapshot_high)
-        {
+        let mut resolved = None;
+        // Validate the whole capsule before returning even its first match.
+        // A pointer at some other visible sequence is not an update belonging
+        // to this marker, and competing target-page updates are ambiguous.
+        for (candidate, pointer) in updates {
+            if pointer.commit_seq != marker.commit_seq {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "capsule update sequence {} does not match marker {}",
+                        pointer.commit_seq, marker.commit_seq,
+                    ),
+                });
+            }
+            if candidate == page {
+                if resolved.is_some_and(|current| current != pointer) {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "conflicting capsule updates for page {} at commit {}",
+                            page.get(), marker.commit_seq,
+                        ),
+                    });
+                }
+                resolved = Some(pointer);
+            }
+        }
+        if let Some(pointer) = resolved {
             info!(
                 bead_id = NATIVE_INDEX_REPAIR_BEAD_ID,
                 logging_standard = NATIVE_INDEX_LOGGING_STANDARD,
@@ -1629,6 +1676,231 @@ mod tests {
     }
 
     #[test]
+    fn native_lookup_selects_latest_page_not_latest_segment_end() {
+        let p = page(7);
+        let old = pointer(70, 0x70, PatchKind::FullImage, None);
+        let new = pointer(80, 0x80, PatchKind::FullImage, None);
+        let wide = PageVersionIndexSegment::new(
+            1,
+            100,
+            vec![
+                (p, old),
+                (page(9), pointer(100, 0x90, PatchKind::FullImage, None)),
+            ],
+        );
+        let narrow = PageVersionIndexSegment::new(2, 90, vec![(p, new)]);
+        for segments in [vec![wide.clone(), narrow.clone()], vec![narrow, wide]] {
+            for (snapshot, expected) in [
+                (0, None),
+                (69, None),
+                (70, Some(old)),
+                (79, Some(old)),
+                (80, Some(new)),
+                (100, Some(new)),
+            ] {
+                assert_eq!(
+                    lookup_pointer_in_segments(p, snapshot, &segments)
+                        .expect("lookup")
+                        .0,
+                    expected,
+                    "snapshot {snapshot}"
+                );
+            }
+            let base = TestBasePages::new([]);
+            let store = TestPatchStore::new([
+                (oid(0x70), b"old".to_vec()),
+                (oid(0x80), b"new".to_vec()),
+            ]);
+            let mut cache = NativePageCache::default();
+            let actual = lookup_page_version(p, 85, &segments, &mut cache, &base, &store, 0.0)
+                .expect("latest standalone image");
+            assert_eq!(actual.page_bytes, b"new".to_vec());
+            assert_eq!(actual.resolved_pointer, Some(new));
+            assert_eq!(base.loads(), 0);
+            assert_eq!(store.fetches(), 1);
+        }
+    }
+
+    #[test]
+    fn native_lookup_rejects_ambiguous_latest_versions_in_every_order() {
+        let p = page(7);
+        let first = pointer(20, 0x10, PatchKind::FullImage, None);
+        let conflicting = pointer(20, 0x11, PatchKind::FullImage, None);
+        let latest = pointer(30, 0x12, PatchKind::FullImage, None);
+        let segments = [
+            PageVersionIndexSegment::new(20, 20, vec![(p, first)]),
+            PageVersionIndexSegment::new(20, 20, vec![(p, conflicting)]),
+            PageVersionIndexSegment::new(30, 30, vec![(p, latest)]),
+        ];
+        for order in [
+            [0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0],
+        ] {
+            let ordered = order.map(|index| segments[index].clone());
+            let base = TestBasePages::new([]);
+            let store = TestPatchStore::new([]);
+            let mut cache = NativePageCache::default();
+            assert!(matches!(
+                lookup_page_version(p, 20, &ordered, &mut cache, &base, &store, 0.0),
+                Err(FrankenError::DatabaseCorrupt { .. })
+            ));
+            assert!(cache.get(p, 20).is_none());
+            assert_eq!(
+                store.fetches(),
+                0,
+                "reject before materializing either candidate"
+            );
+            assert_eq!(base.loads(), 0);
+            assert_eq!(
+                lookup_pointer_in_segments(p, 30, &ordered)
+                    .expect("unambiguous newer version")
+                    .0,
+                Some(latest)
+            );
+        }
+        let repeated = [segments[0].clone(), segments[0].clone()];
+        assert_eq!(
+            lookup_pointer_in_segments(p, 20, &repeated)
+                .expect("identical copies")
+                .0,
+            Some(first)
+        );
+    }
+
+    #[test]
+    fn native_full_image_does_not_require_a_base_page_or_hint_object() {
+        for hint in [None, Some(0xEE)] {
+            let p = page(7);
+            let vp = pointer(40, 0x40, PatchKind::FullImage, hint);
+            let segments = [PageVersionIndexSegment::new(40, 40, vec![(p, vp)])];
+            let base = TestBasePages::new([]);
+            let store = TestPatchStore::new([(oid(0x40), b"complete image".to_vec())]);
+            let mut cache = NativePageCache::default();
+            let actual = lookup_page_version(p, 40, &segments, &mut cache, &base, &store, 0.0)
+                .expect("full image must be self-contained");
+            assert_eq!(actual.page_bytes, b"complete image".to_vec());
+            assert_eq!(base.loads(), 0);
+            assert_eq!(store.fetches(), 1);
+            let cached = lookup_page_version(p, 40, &segments, &mut cache, &base, &store, 0.0)
+                .expect("cached image");
+            assert!(cached.trace.cache_hit);
+            assert_eq!(cached.page_bytes, actual.page_bytes);
+            assert_eq!(store.fetches(), 1);
+        }
+    }
+
+    #[test]
+    fn native_hinted_patches_use_only_their_explicit_base() {
+        let cases = [
+            (
+                PatchKind::IntentLog,
+                encode_intent_patch(&[(1, b"BC")]),
+                b"aBCa".to_vec(),
+            ),
+            (
+                PatchKind::SparseXor,
+                encode_sparse_xor_patch(&[(0, &[1, 2, 3, 4])]),
+                vec![96, 99, 98, 101],
+            ),
+        ];
+        for (kind, patch, expected) in cases {
+            let p = page(7);
+            let vp = pointer(50, 0x50, kind, Some(0x51));
+            let segments = [PageVersionIndexSegment::new(50, 50, vec![(p, vp)])];
+            let base = TestBasePages::new([]);
+            let store = TestPatchStore::new([(oid(0x50), patch), (oid(0x51), b"aaaa".to_vec())]);
+            let mut cache = NativePageCache::default();
+            let actual = lookup_page_version(p, 50, &segments, &mut cache, &base, &store, 0.0)
+                .expect("explicit base materialization");
+            assert_eq!(actual.page_bytes, expected);
+            assert_eq!(base.loads(), 0);
+            assert_eq!(store.fetches(), 2);
+        }
+    }
+
+    #[test]
+    fn native_missing_hint_does_not_fall_back_to_unrelated_base() {
+        let p = page(7);
+        let vp = pointer(50, 0x50, PatchKind::IntentLog, Some(0x51));
+        let segments = [PageVersionIndexSegment::new(50, 50, vec![(p, vp)])];
+        let base = TestBasePages::new([(p, b"newer unrelated page".to_vec())]);
+        let store = TestPatchStore::new([(oid(0x50), encode_intent_patch(&[(0, b"X")]))]);
+        let mut cache = NativePageCache::default();
+        assert!(lookup_page_version(p, 50, &segments, &mut cache, &base, &store, 0.0).is_err());
+        assert_eq!(base.loads(), 0);
+        assert!(cache.get(p, 50).is_none());
+    }
+
+    #[test]
+    fn native_failed_materialization_never_caches_a_partial_page() {
+        let p = page(7);
+        let vp = pointer(50, 0x50, PatchKind::IntentLog, Some(0x51));
+        let segments = [PageVersionIndexSegment::new(50, 50, vec![(p, vp)])];
+        let base = TestBasePages::new([]);
+        let mut store = TestPatchStore::new([
+            (oid(0x50), encode_intent_patch(&[(0, b"X"), (7, b"Y")])),
+            (oid(0x51), b"aaaa".to_vec()),
+        ]);
+        let mut cache = NativePageCache::default();
+        assert!(lookup_page_version(p, 50, &segments, &mut cache, &base, &store, 0.0).is_err());
+        assert!(cache.get(p, 50).is_none());
+        store
+            .objects
+            .insert(*oid(0x50).as_bytes(), encode_intent_patch(&[(1, b"BC")]));
+        let retried = lookup_page_version(p, 50, &segments, &mut cache, &base, &store, 0.0)
+            .expect("retry repaired patch");
+        assert!(!retried.trace.cache_hit);
+        assert_eq!(retried.page_bytes, b"aBCa".to_vec());
+        assert_eq!(base.loads(), 0);
+    }
+
+    #[test]
+    fn native_emergency_lookup_validates_all_updates_before_returning() {
+        let marker = marker_record(100, 0x10, [0; 16]);
+        let blob = marker_segment_blob(100, &[marker]);
+        let good = pointer(100, 0x20, PatchKind::FullImage, None);
+        let cases = [
+            vec![(page(7), pointer(99, 0x21, PatchKind::FullImage, None))],
+            vec![(page(7), pointer(101, 0x21, PatchKind::FullImage, None))],
+            vec![
+                (page(7), good),
+                (page(8), pointer(99, 0x21, PatchKind::FullImage, None)),
+            ],
+            vec![
+                (page(7), good),
+                (page(7), pointer(100, 0x21, PatchKind::FullImage, None)),
+            ],
+        ];
+        for updates in cases {
+            let source = TestCapsuleSource::default().with_update(100, 0x10, updates);
+            assert!(matches!(
+                emergency_linear_scan_lookup(
+                    page(7),
+                    100,
+                    std::slice::from_ref(&blob),
+                    &source,
+                    BoldnessConstraint::emergency(),
+                    "invalid_capsule",
+                ),
+                Err(FrankenError::DatabaseCorrupt { .. })
+            ));
+        }
+        let source = TestCapsuleSource::default()
+            .with_update(100, 0x10, vec![(page(7), good), (page(7), good)]);
+        assert_eq!(
+            emergency_linear_scan_lookup(
+                page(7),
+                100,
+                &[blob],
+                &source,
+                BoldnessConstraint::emergency(),
+                "valid_capsule",
+            )
+            .expect("identical updates"),
+            Some(good)
+        );
+    }
+
+    #[test]
     fn test_filter_negative_path_has_no_false_negatives() {
         let target = page(5);
         let other = page(9);
@@ -1800,7 +2072,11 @@ mod tests {
         assert!(second.trace.cache_hit);
         assert_eq!(second.page_bytes, first.page_bytes);
         assert_eq!(store.fetches(), 2);
-        assert_eq!(base.loads(), 1);
+        assert_eq!(
+            base.loads(),
+            0,
+            "hinted materialization must not read the base page"
+        );
     }
 
     #[test]
@@ -1892,7 +2168,7 @@ mod tests {
             .iter()
             .map(|segment| segment.segment.clone())
             .collect();
-        let (resolved, scans) = lookup_pointer_in_segments(page(3), 101, &segments);
+        let (resolved, scans) = lookup_pointer_in_segments(page(3), 101, &segments).expect("lookup");
         assert_eq!(
             resolved,
             Some(pointer(101, 0x81, PatchKind::IntentLog, Some(0x82)))
@@ -1944,7 +2220,7 @@ mod tests {
         assert_eq!(report.repaired_from_local, 1);
         assert_eq!(report.repaired_from_remote, 1);
         assert_eq!(report.segments.len(), 2);
-        let (resolved, _) = lookup_pointer_in_segments(p2, 201, &report.segments);
+        let (resolved, _) = lookup_pointer_in_segments(p2, 201, &report.segments).expect("lookup");
         assert_eq!(
             resolved,
             Some(pointer(201, 0x91, PatchKind::SparseXor, Some(0x92)))
