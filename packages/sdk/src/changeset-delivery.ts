@@ -498,6 +498,36 @@ function verifyReceipt(
   return resultCounts(value, delivery.changes);
 }
 
+/** Own the complete source response before hashing yields to adapter code. */
+function captureBatchPayloads(
+  value: unknown, expected: readonly OutboxDelivery[], maximum: number,
+): readonly { delivery: OutboxDelivery; changeset: Uint8Array | null }[] {
+  if (!Array.isArray(value) || value.length !== expected.length)
+    input("Source did not return the complete batch read");
+  const captured: { delivery: OutboxDelivery; changeset: Uint8Array | null }[] = [];
+  let remaining = maximum;
+  for (let i = 0; i < expected.length; i++) {
+    const entry = Object.getOwnPropertyDescriptor(value, String(i));
+    if (entry === undefined || !Object.hasOwn(entry, "value"))
+      input("Batch source records must be own data properties");
+    const delivery = deliveryMetadata(field(entry.value, "delivery"));
+    if (!sameDelivery(expected[i]!, delivery))
+      input("Outbox delivery changed between selection and batch read");
+    const data = field(entry.value, "changeset");
+    let changeset: Uint8Array | null = null;
+    if (delivery.acknowledged) {
+      if (data !== null) input("An acknowledged outbox entry retained unexpected payload bytes");
+    } else {
+      changeset = ownBytes(data, Math.min(delivery.byteLength, remaining));
+      if (changeset.byteLength !== delivery.byteLength)
+        input("Batch source payload length disagrees with its selected identity");
+      remaining -= changeset.byteLength;
+    }
+    captured.push(Object.freeze({ delivery, changeset }));
+  }
+  return Object.freeze(captured);
+}
+
 /**
  * One bounded, awaited outbox drain. No transaction is held across transport.
  * Every new run starts at the oldest pending entry; no cursor can skip a failure.
@@ -506,6 +536,7 @@ function verifyReceipt(
 export class ChangesetDeliveryPump {
   readonly #outbox: Pick<ChangesetOutbox, "pending" | "read" | "acknowledge">;
   readonly #acknowledgeBatch: ChangesetOutbox["acknowledgeBatch"] | undefined;
+  readonly #readBatch: ChangesetOutbox["readBatch"] | undefined;
   readonly #id: string;
   readonly #deliver: ChangesetTransport;
   readonly #deliverBatch: ChangesetBatchTransport | undefined;
@@ -514,7 +545,7 @@ export class ChangesetDeliveryPump {
   readonly #allowOmissions: boolean;
   #active = false;
   constructor(
-    outbox: Pick<ChangesetOutbox, "pending" | "read" | "acknowledge"> & Partial<Pick<ChangesetOutbox, "acknowledgeBatch">> & {
+    outbox: Pick<ChangesetOutbox, "pending" | "read" | "acknowledge"> & Partial<Pick<ChangesetOutbox, "acknowledgeBatch" | "readBatch">> & {
       /** A replica port's acknowledgement cursor belongs to this exact receiver. */
       readonly receiverId?: string;
     },
@@ -535,6 +566,10 @@ export class ChangesetDeliveryPump {
     if (acknowledgeBatch !== undefined && typeof acknowledgeBatch !== "function")
       input("acknowledgeBatch must be an atomic source method when supplied");
     this.#acknowledgeBatch = acknowledgeBatch?.bind(outbox);
+    const readBatch = outbox?.readBatch;
+    if (readBatch !== undefined && typeof readBatch !== "function")
+      input("readBatch must be a source snapshot method when supplied");
+    this.#readBatch = readBatch?.bind(outbox);
     this.#outbox = Object.freeze({
       pending: pending.bind(outbox),
       read: read.bind(outbox),
@@ -705,6 +740,8 @@ export class ChangesetDeliveryPump {
    * No SQL transaction spans transport, no retry/queue or automatic batch protocol.
    * Window limits do not describe source application transactions: configure
    * dependencies to fit a window, or leave the failed window pending unchanged.
+   * Sources with readBatch load each admitted window from one snapshot. Pending
+   * selection still precedes that snapshot; acknowledged races remain explicit.
    */
   async runBatch(options: ChangesetPumpBatchRunOptions = {}): Promise<ChangesetPumpResult> {
     if (this.#active)
@@ -757,23 +794,46 @@ export class ChangesetDeliveryPump {
             input("Outbox did not advance past confirmed acknowledgements");
           page.push(next); ids.add(next.deliveryId); previous = next.sequence;
         }
-        const window: { delivery: OutboxDelivery; message: ChangesetEnvelope }[] = [];
-        let bytesInWindow = 0;
+        // Admit a contiguous metadata prefix BEFORE loading any payload. Do not
+        // ask readBatch to allocate the whole page when only a prefix fits.
+        const admitted: OutboxDelivery[] = [];
+        let admittedBytes = 0;
         for (const next of page) {
           id = next.deliveryId;
           // An already acknowledged hole is not a missing source payload. End
           // this contiguous exchange; never renumber messages or skip the head.
-          if (window.length && next.sequence !== window[window.length - 1]!.delivery.sequence + 1n) break;
+          if (admitted.length && next.sequence !== admitted[admitted.length - 1]!.sequence + 1n) break;
           if (next.byteLength > this.#maxBytes || next.byteLength > batchBytes)
             reject("ERR_FSQLITE_DELIVERY_LIMIT", "Pending message exceeds the batch/message byte budget; it was not skipped");
-          if (next.byteLength > Math.min(batchBytes - bytesInWindow, maxBytes - counts.bytes - bytesInWindow)) {
-            if (window.length) break;
+          if (next.byteLength > Math.min(batchBytes - admittedBytes, maxBytes - counts.bytes - admittedBytes)) {
+            if (admitted.length) break;
             if (counts.deliveries === 0)
               reject("ERR_FSQLITE_DELIVERY_LIMIT", "The oldest message cannot fit this run's byte budget");
             return result("limit");
           }
+          admitted.push(next);
+          admittedBytes += next.byteLength;
+        }
+        let captured: ReturnType<typeof captureBatchPayloads> | undefined;
+        if (this.#readBatch !== undefined) {
+          budget.checkpoint();
+          id = admitted[0]!.deliveryId;
+          const loaded = await this.#readBatch(
+            Object.freeze(admitted.map(entry => entry.deliveryId)),
+            // readBatch requires a positive limit; empty messages still undergo
+            // exact zero-byte validation in captureBatchPayloads below.
+            Object.freeze({ maxBytes: Math.max(1, admittedBytes) }),
+          );
+          budget.checkpoint();
+          captured = captureBatchPayloads(loaded, admitted, admittedBytes);
+        }
+        const window: { delivery: OutboxDelivery; message: ChangesetEnvelope }[] = [];
+        let bytesInWindow = 0;
+        for (let index = 0; index < admitted.length; index++) {
+          const next = admitted[index]!;
+          id = next.deliveryId;
           selected++;
-          const loaded = await this.#outbox.read(id);
+          const loaded = captured === undefined ? await this.#outbox.read(id) : captured[index]!;
           budget.checkpoint();
           if (loaded === null) input("Selected outbox delivery disappeared; reconcile its retention state");
           const current = deliveryMetadata(field(loaded, "delivery")), data = field(loaded, "changeset");
@@ -790,7 +850,11 @@ export class ChangesetDeliveryPump {
             // non-contiguous exchange, or mark the pending prefix as consumed.
             break;
           }
-          const bytes = ownBytes(data, Math.min(this.#maxBytes, batchBytes - bytesInWindow, maxBytes - counts.bytes - bytesInWindow));
+          // The snapshot branch already owns every response buffer, including
+          // later records, before the first asynchronous digest calculation.
+          const bytes = captured === undefined
+            ? ownBytes(data, Math.min(this.#maxBytes, batchBytes - bytesInWindow, maxBytes - counts.bytes - bytesInWindow))
+            : captured[index]!.changeset!;
           if (bytes.byteLength !== current.byteLength || (await hash(bytes)) !== current.sha256 ||
               inspectChangeset(bytes).changeCount !== current.changes)
             input("Outbox payload disagrees with the selected identity/digest/count");
