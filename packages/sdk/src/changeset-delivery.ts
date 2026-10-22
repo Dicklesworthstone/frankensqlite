@@ -507,11 +507,28 @@ export class ChangesetDeliveryPump {
   readonly #allowOmissions: boolean;
   #active = false;
   constructor(
-    outbox: Pick<ChangesetOutbox, "pending" | "read" | "acknowledge">,
+    outbox: Pick<ChangesetOutbox, "pending" | "read" | "acknowledge"> & {
+      /** A replica port's acknowledgement cursor belongs to this exact receiver. */
+      readonly receiverId?: string;
+    },
     options: ChangesetPumpOptions,
   ) {
-    this.#outbox = outbox;
     this.#id = identity(options?.receiverId, 256);
+    const binding = outbox?.receiverId;
+    if (binding !== undefined && identity(binding, 256) !== this.#id)
+      input("The source acknowledgement cursor belongs to another receiver");
+    // Capture the complete source port just like transport and confirmation
+    // configuration. Replacing methods during a read/exchange must not redirect
+    // a verified receipt to another replica's acknowledgement state. Preserve
+    // the original receiver for adapters that use private fields or this.
+    const pending = outbox?.pending, read = outbox?.read, acknowledge = outbox?.acknowledge;
+    if (typeof pending !== "function" || typeof read !== "function" || typeof acknowledge !== "function")
+      input("Delivery requires a source with pending, read and acknowledge methods");
+    this.#outbox = Object.freeze({
+      pending: pending.bind(outbox),
+      read: read.bind(outbox),
+      acknowledge: acknowledge.bind(outbox),
+    });
     const deliver = options?.deliver, deliverBatch = options?.deliverBatch,
       confirm = options?.confirmSource;
     const allowOmissions = options?.allowOmissions ?? false;
