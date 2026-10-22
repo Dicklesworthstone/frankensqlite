@@ -66,6 +66,18 @@ pub enum MarkerError {
     },
     /// marker_id does not match recomputed value (forged or corrupt record).
     MarkerIdMismatch { commit_seq: u64 },
+    /// The record does not link to the preceding accepted marker.
+    HashChainMismatch { commit_seq: u64 },
+    /// Commit time moved backwards, invalidating ordered time lookup.
+    TimestampRegression {
+        commit_seq: u64,
+        previous: u64,
+        actual: u64,
+    },
+    /// A sequence or range endpoint cannot be represented without wrapping.
+    SequenceOverflow,
+    /// Recovery could not reserve space for another accepted marker.
+    OutOfMemory,
 }
 
 impl std::fmt::Display for MarkerError {
@@ -114,6 +126,19 @@ impl std::fmt::Display for MarkerError {
                     "marker_id verification failed for commit_seq {commit_seq} (forged or corrupt)"
                 )
             }
+            Self::HashChainMismatch { commit_seq } => {
+                write!(f, "marker hash chain mismatch at commit_seq {commit_seq}")
+            }
+            Self::TimestampRegression {
+                commit_seq,
+                previous,
+                actual,
+            } => write!(
+                f,
+                "marker timestamp regression at commit_seq {commit_seq}: {actual} < {previous}"
+            ),
+            Self::SequenceOverflow => f.write_str("marker commit sequence overflow"),
+            Self::OutOfMemory => f.write_str("unable to reserve marker recovery memory"),
         }
     }
 }
@@ -431,25 +456,29 @@ pub const fn next_commit_seq_from_file_len(start_commit_seq: u64, file_len: u64)
 // ---------------------------------------------------------------------------
 
 /// Scan a segment's record region and return the count of valid records
-/// from the start.  Stops at the first record that fails xxh3 verification
-/// or marker_id verification (tamper detection).
+/// from the start. Stops at the first checksum, content-hash, sequence,
+/// hash-chain, or timestamp violation.
 ///
 /// `data` must be the record region only (header already stripped).
+/// The first record is unanchored: this does not establish its provenance,
+/// expected sequence, or continuity with a preceding segment.
 #[must_use]
 pub fn valid_record_prefix_count(data: &[u8]) -> u64 {
     let mut count = 0u64;
-    let mut offset = 0;
-    while offset + COMMIT_MARKER_RECORD_BYTES <= data.len() {
-        let record_bytes = &data[offset..offset + COMMIT_MARKER_RECORD_BYTES];
+    let mut previous: Option<CommitMarkerRecord> = None;
+    for record_bytes in data.chunks_exact(COMMIT_MARKER_RECORD_BYTES) {
         let Ok(record) = CommitMarkerRecord::decode(record_bytes) else {
             break;
         };
-        // Security: also verify marker_id to reject forged records.
-        if !record.verify_marker_id() {
+        if !record.verify_marker_id()
+            || previous
+                .as_ref()
+                .is_some_and(|prev| validate_successor(prev, &record).is_err())
+        {
             break;
         }
         count += 1;
-        offset += COMMIT_MARKER_RECORD_BYTES;
+        previous = Some(record);
     }
     count
 }
@@ -496,11 +525,13 @@ pub fn check_segment_integrity(segment_data: &[u8]) -> Result<u64, MarkerError> 
     Ok(valid)
 }
 
-/// Recover the valid, density-checked prefix of commit markers from a segment.
+/// Recover the valid, density- and chain-checked prefix of one segment.
 ///
 /// This helper is intentionally tolerant of torn tails: it stops at the first
-/// undecodable record and returns the valid prefix. Density violations are
-/// fail-closed and returned as [`MarkerError::CommitSeqMismatch`].
+/// undecodable record and returns the valid prefix. Complete records with
+/// invalid identity, sequence, linkage, or time ordering fail closed instead
+/// of being treated as an incomplete append. The first record's predecessor
+/// remains unanchored; callers combining segments must validate that boundary.
 pub fn recover_valid_prefix(segment_data: &[u8]) -> Result<Vec<CommitMarkerRecord>, MarkerError> {
     if segment_data.len() < MARKER_SEGMENT_HEADER_BYTES {
         return Err(MarkerError::HeaderTooShort);
@@ -509,17 +540,18 @@ pub fn recover_valid_prefix(segment_data: &[u8]) -> Result<Vec<CommitMarkerRecor
     let header = MarkerSegmentHeader::decode(&segment_data[..MARKER_SEGMENT_HEADER_BYTES])?;
     let record_region = &segment_data[MARKER_SEGMENT_HEADER_BYTES..];
 
-    let mut records = Vec::new();
-    let mut offset = 0usize;
+    let mut records: Vec<CommitMarkerRecord> = Vec::new();
 
-    while offset + COMMIT_MARKER_RECORD_BYTES <= record_region.len() {
-        let record_bytes = &record_region[offset..offset + COMMIT_MARKER_RECORD_BYTES];
+    for record_bytes in record_region.chunks_exact(COMMIT_MARKER_RECORD_BYTES) {
         let Ok(record) = CommitMarkerRecord::decode(record_bytes) else {
             break;
         };
 
-        let expected = header.start_commit_seq
-            + u64::try_from(records.len()).expect("record vector length always fits in u64");
+        let slot = u64::try_from(records.len()).map_err(|_| MarkerError::SequenceOverflow)?;
+        let expected = header
+            .start_commit_seq
+            .checked_add(slot)
+            .ok_or(MarkerError::SequenceOverflow)?;
         if record.commit_seq != expected {
             return Err(MarkerError::CommitSeqMismatch {
                 expected,
@@ -527,20 +559,56 @@ pub fn recover_valid_prefix(segment_data: &[u8]) -> Result<Vec<CommitMarkerRecor
             });
         }
 
-        // Security: reject records with forged marker_id even if xxh3 is consistent.
-        // An attacker can recompute record_xxh3 to match altered fields, but cannot
-        // forge the BLAKE3-based marker_id without knowing the correct inputs.
+        // These unkeyed hashes establish internal consistency, not sender
+        // authentication. A substituted, rehashed record must also extend the
+        // accepted chain; a trusted external anchor is still needed to detect
+        // replacement of an entire internally consistent history.
         if !record.verify_marker_id() {
             return Err(MarkerError::MarkerIdMismatch {
                 commit_seq: record.commit_seq,
             });
         }
 
+        if let Some(previous) = records.last() {
+            validate_successor(previous, &record)?;
+        }
+        records
+            .try_reserve(1)
+            .map_err(|_| MarkerError::OutOfMemory)?;
         records.push(record);
-        offset += COMMIT_MARKER_RECORD_BYTES;
     }
 
     Ok(records)
+}
+
+/// Validate adjacency after both records' individual hashes were checked.
+fn validate_successor(
+    previous: &CommitMarkerRecord,
+    record: &CommitMarkerRecord,
+) -> Result<(), MarkerError> {
+    let expected = previous
+        .commit_seq
+        .checked_add(1)
+        .ok_or(MarkerError::SequenceOverflow)?;
+    if record.commit_seq != expected {
+        return Err(MarkerError::CommitSeqMismatch {
+            expected,
+            actual: record.commit_seq,
+        });
+    }
+    if record.prev_marker_id != previous.marker_id {
+        return Err(MarkerError::HashChainMismatch {
+            commit_seq: record.commit_seq,
+        });
+    }
+    if record.commit_time_unix_ns < previous.commit_time_unix_ns {
+        return Err(MarkerError::TimestampRegression {
+            commit_seq: record.commit_seq,
+            previous: previous.commit_time_unix_ns,
+            actual: record.commit_time_unix_ns,
+        });
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -551,6 +619,9 @@ pub fn recover_valid_prefix(segment_data: &[u8]) -> Result<Vec<CommitMarkerRecor
 /// value <= `target_ns`.  Returns `None` if all records are after `target_ns`.
 ///
 /// `read_record` is called with a commit_seq and must return the decoded record.
+/// The caller must provide an already validated, monotonic marker stream.
+/// A missing, mismatched, or invalid record encountered during the search,
+/// or an overflowing sequence range, returns `None`, never a partial best hit.
 pub fn binary_search_by_time<F>(
     start_commit_seq: u64,
     record_count: u64,
@@ -563,6 +634,7 @@ where
     if record_count == 0 {
         return None;
     }
+    start_commit_seq.checked_add(record_count - 1)?;
 
     let mut lo = 0u64;
     let mut hi = record_count;
@@ -571,9 +643,10 @@ where
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
         let seq = start_commit_seq + mid;
-        let Some(record) = read_record(seq) else {
-            break;
-        };
+        let record = read_record(seq)?;
+        if record.commit_seq != seq || !record.verify_marker_id() {
+            return None;
+        }
 
         if record.commit_time_unix_ns <= target_ns {
             best = Some(seq);
@@ -604,6 +677,176 @@ mod tests {
         let proof = [((seq >> 8) & 0xFF) as u8; ID_SIZE];
         let time_ns = 1_700_000_000_000_000_000u64 + seq * 1_000_000;
         CommitMarkerRecord::new(seq, time_ns, capsule, proof, prev)
+    }
+
+    fn encode_test_segment(start: u64, records: &[CommitMarkerRecord]) -> Vec<u8> {
+        let mut bytes = Vec::from(MarkerSegmentHeader::new(0, start).encode());
+        for record in records {
+            bytes.extend_from_slice(&record.encode());
+        }
+        bytes
+    }
+
+    #[test]
+    fn recovery_rejects_rehashed_broken_link() {
+        let first = make_test_record(10, [0; ID_SIZE]);
+        let second = make_test_record(11, [0xAB; ID_SIZE]);
+        assert!(second.verify_marker_id());
+        assert!(CommitMarkerRecord::decode(&second.encode()).is_ok());
+        let bytes = encode_test_segment(10, &[first, second]);
+        assert_eq!(
+            recover_valid_prefix(&bytes),
+            Err(MarkerError::HashChainMismatch { commit_seq: 11 })
+        );
+        assert_eq!(
+            check_segment_integrity(&bytes),
+            Err(MarkerError::HashChainMismatch { commit_seq: 11 })
+        );
+        assert_eq!(
+            valid_record_prefix_count(&bytes[MARKER_SEGMENT_HEADER_BYTES..]),
+            1
+        );
+    }
+
+    #[test]
+    fn recovery_rejects_rehashed_timestamp_regression() {
+        let first = CommitMarkerRecord::new(10, 100, [1; ID_SIZE], [2; ID_SIZE], [0; ID_SIZE]);
+        let second = CommitMarkerRecord::new(11, 99, [3; ID_SIZE], [4; ID_SIZE], first.marker_id);
+        let bytes = encode_test_segment(10, &[first, second]);
+        assert_eq!(
+            recover_valid_prefix(&bytes),
+            Err(MarkerError::TimestampRegression {
+                commit_seq: 11,
+                previous: 100,
+                actual: 99,
+            })
+        );
+        assert_eq!(
+            valid_record_prefix_count(&bytes[MARKER_SEGMENT_HEADER_BYTES..]),
+            1
+        );
+    }
+
+    #[test]
+    fn recovery_accepts_equal_times_and_nonzero_unanchored_start() {
+        let first = CommitMarkerRecord::new(10, 100, [1; ID_SIZE], [2; ID_SIZE], [9; ID_SIZE]);
+        let second = CommitMarkerRecord::new(11, 100, [3; ID_SIZE], [4; ID_SIZE], first.marker_id);
+        let records = vec![first, second];
+        let bytes = encode_test_segment(10, &records);
+        assert_eq!(recover_valid_prefix(&bytes).unwrap(), records);
+        assert_eq!(check_segment_integrity(&bytes), Ok(2));
+        assert_eq!(
+            valid_record_prefix_count(&bytes[MARKER_SEGMENT_HEADER_BYTES..]),
+            2
+        );
+    }
+
+    #[test]
+    fn recovery_refuses_sequence_wraparound() {
+        let first =
+            CommitMarkerRecord::new(u64::MAX, 100, [1; ID_SIZE], [2; ID_SIZE], [0; ID_SIZE]);
+        let mut bytes = encode_test_segment(u64::MAX, std::slice::from_ref(&first));
+        assert_eq!(recover_valid_prefix(&bytes).unwrap(), vec![first.clone()]);
+        let wrapped = CommitMarkerRecord::new(0, 101, [3; ID_SIZE], [4; ID_SIZE], first.marker_id);
+        bytes.extend_from_slice(&wrapped.encode());
+        assert_eq!(
+            recover_valid_prefix(&bytes),
+            Err(MarkerError::SequenceOverflow)
+        );
+        assert_eq!(
+            valid_record_prefix_count(&bytes[MARKER_SEGMENT_HEADER_BYTES..]),
+            1
+        );
+    }
+
+    #[test]
+    fn prefix_counter_rejects_gap_duplicate_and_reordering() {
+        let first = make_test_record(10, [0; ID_SIZE]);
+        for next_seq in [9, 10, 12] {
+            let second = make_test_record(next_seq, first.marker_id);
+            let bytes = encode_test_segment(10, &[first.clone(), second]);
+            assert_eq!(
+                valid_record_prefix_count(&bytes[MARKER_SEGMENT_HEADER_BYTES..]),
+                1
+            );
+            assert!(matches!(
+                recover_valid_prefix(&bytes),
+                Err(MarkerError::CommitSeqMismatch { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn recovery_preserves_every_torn_tail_prefix() {
+        let mut records = Vec::new();
+        let mut prev = [0; ID_SIZE];
+        for seq in 10..14 {
+            let record = make_test_record(seq, prev);
+            prev = record.marker_id;
+            records.push(record);
+        }
+        let bytes = encode_test_segment(10, &records);
+        for end in MARKER_SEGMENT_HEADER_BYTES..=bytes.len() {
+            let complete = (end - MARKER_SEGMENT_HEADER_BYTES) / COMMIT_MARKER_RECORD_BYTES;
+            assert_eq!(
+                recover_valid_prefix(&bytes[..end]).unwrap(),
+                records[..complete]
+            );
+            assert_eq!(
+                valid_record_prefix_count(&bytes[MARKER_SEGMENT_HEADER_BYTES..end]),
+                u64::try_from(complete).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn time_search_does_not_return_best_hit_after_read_failure() {
+        let mut visited = Vec::new();
+        let hit = binary_search_by_time(0, 8, u64::MAX, |seq| {
+            visited.push(seq);
+            (seq != 6).then(|| make_test_record(seq, [0; ID_SIZE]))
+        });
+        assert_eq!(visited, vec![4, 6]);
+        assert_eq!(
+            hit, None,
+            "commit 4 is not a proven answer after read 6 failed"
+        );
+    }
+
+    #[test]
+    fn time_search_rejects_wrong_slot_and_bad_content_hash() {
+        for wrong_slot in [false, true] {
+            let hit = binary_search_by_time(0, 8, u64::MAX, |seq| {
+                let mut record = make_test_record(seq, [0; ID_SIZE]);
+                if seq == 6 {
+                    if wrong_slot {
+                        record = make_test_record(5, [0; ID_SIZE]);
+                    } else {
+                        record.capsule_object_id[0] ^= 1;
+                    }
+                }
+                Some(record)
+            });
+            assert_eq!(hit, None);
+        }
+    }
+
+    #[test]
+    fn time_search_checks_range_before_reading() {
+        assert_eq!(
+            binary_search_by_time(u64::MAX, 2, 0, |_| panic!("invalid range read")),
+            None
+        );
+        assert_eq!(
+            binary_search_by_time(u64::MAX, 0, 0, |_| panic!("empty range read")),
+            None
+        );
+        let record =
+            CommitMarkerRecord::new(u64::MAX, 100, [1; ID_SIZE], [2; ID_SIZE], [0; ID_SIZE]);
+        assert_eq!(
+            binary_search_by_time(u64::MAX, 1, 100, |_| Some(record.clone())),
+            Some(u64::MAX)
+        );
     }
 
     #[test]
