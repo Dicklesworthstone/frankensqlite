@@ -320,3 +320,5 @@ export {
   CHANGESET_ORDERED_BATCH_HTTP_CONTENT_TYPE,
   CHANGESET_ORDERED_BATCH_HTTP_RECEIPT_TYPE,
 } from "./changeset-http";
+
+export type { OutboxAcknowledgement } from "./changeset-outbox-ack";

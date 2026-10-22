@@ -429,6 +429,12 @@ export interface ChangesetPumpBatchRunOptions extends ChangesetPumpRunOptions {
   maxBatchDeliveries?: number;
   /** Aggregate owned wire per exchange. Default/hard maximum 64 MiB. */
   maxBatchBytes?: number;
+  /**
+   * Default false. Require acknowledgeBatch and commit each accepted source
+   * window atomically, followed by one source confirmation. Never falls back
+   * to per-message ACKs. Source and receiver remain separate transactions.
+   */
+  atomicAcknowledgements?: boolean;
 }
 export interface ChangesetPumpResult {
   readonly deliveries: number;
@@ -499,6 +505,7 @@ function verifyReceipt(
  */
 export class ChangesetDeliveryPump {
   readonly #outbox: Pick<ChangesetOutbox, "pending" | "read" | "acknowledge">;
+  readonly #acknowledgeBatch: ChangesetOutbox["acknowledgeBatch"] | undefined;
   readonly #id: string;
   readonly #deliver: ChangesetTransport;
   readonly #deliverBatch: ChangesetBatchTransport | undefined;
@@ -507,7 +514,7 @@ export class ChangesetDeliveryPump {
   readonly #allowOmissions: boolean;
   #active = false;
   constructor(
-    outbox: Pick<ChangesetOutbox, "pending" | "read" | "acknowledge"> & {
+    outbox: Pick<ChangesetOutbox, "pending" | "read" | "acknowledge"> & Partial<Pick<ChangesetOutbox, "acknowledgeBatch">> & {
       /** A replica port's acknowledgement cursor belongs to this exact receiver. */
       readonly receiverId?: string;
     },
@@ -524,6 +531,10 @@ export class ChangesetDeliveryPump {
     const pending = outbox?.pending, read = outbox?.read, acknowledge = outbox?.acknowledge;
     if (typeof pending !== "function" || typeof read !== "function" || typeof acknowledge !== "function")
       input("Delivery requires a source with pending, read and acknowledge methods");
+    const acknowledgeBatch = outbox?.acknowledgeBatch;
+    if (acknowledgeBatch !== undefined && typeof acknowledgeBatch !== "function")
+      input("acknowledgeBatch must be an atomic source method when supplied");
+    this.#acknowledgeBatch = acknowledgeBatch?.bind(outbox);
     this.#outbox = Object.freeze({
       pending: pending.bind(outbox),
       read: read.bind(outbox),
@@ -687,11 +698,12 @@ export class ChangesetDeliveryPump {
   /**
    * Drain bounded contiguous windows through the explicit batch transport.
    * Validate ALL receipts and omission policy before acknowledging ANY member.
-   * Source ACKs remain independently committed, in order, with confirmation after
-   * each: a failure can leave a confirmed prefix, never falsely reclaim a suffix.
+   * By default source ACKs commit individually and may leave a confirmed prefix.
+   * atomicAcknowledgements opts into one source transaction/confirmation per
+   * accepted window. A missing capability rejects before source I/O or delivery.
    * The next run confirms source recovery then restarts at the oldest pending ID.
    * No SQL transaction spans transport, no retry/queue or automatic batch protocol.
-   * Window limits are not source transaction boundaries; configure application
+   * Window limits do not describe source application transactions: configure
    * dependencies to fit a window, or leave the failed window pending unchanged.
    */
   async runBatch(options: ChangesetPumpBatchRunOptions = {}): Promise<ChangesetPumpResult> {
@@ -710,6 +722,11 @@ export class ChangesetDeliveryPump {
       const maxBytes = bound(options.maxBytes, HARD_BYTES, 1024 * 1024 * 1024);
       const batchSize = bound(options.maxBatchDeliveries, 64, 256);
       const batchBytes = bound(options.maxBatchBytes, HARD_BYTES, HARD_BYTES);
+      const atomic = options.atomicAcknowledgements ?? false;
+      if (typeof atomic !== "boolean") input("atomicAcknowledgements must be boolean");
+      const acknowledgeBatch = atomic ? this.#acknowledgeBatch : undefined;
+      if (atomic && acknowledgeBatch === undefined)
+        input("Atomic acknowledgement requires the source acknowledgeBatch capability");
       budget = new DeliveryBudget(options);
       budget.checkpoint();
       phase = "source-confirm";
@@ -806,6 +823,37 @@ export class ChangesetDeliveryPump {
           if (receipt.omitted !== 0 && !this.#allowOmissions)
             reject("ERR_FSQLITE_DELIVERY_RECEIPT", "Receiver omissions require explicit sender acceptance");
           receipts.push(receipt);
+        }
+        // No source transaction spans the exchange. Only the fully verified
+        // response and omission consent above authorize this atomic source ACK.
+        if (acknowledgeBatch !== undefined) {
+          budget.checkpoint();
+          id = window[0]!.delivery.deliveryId; phase = "source-ack";
+          const acknowledgements = Object.freeze(window.map(({ delivery }) => Object.freeze({
+            deliveryId: delivery.deliveryId, sha256: delivery.sha256,
+          })));
+          const acknowledged = await acknowledgeBatch(acknowledgements);
+          // A fulfilled source operation may already have committed. Always
+          // settle its confirmation, even on cancellation or a malformed result.
+          phase = "source-confirm";
+          await this.#confirm();
+          budget.checkpoint();
+          phase = "source-ack";
+          if (!Array.isArray(acknowledged) || acknowledged.length !== window.length)
+            input("Invalid atomic acknowledgement result count");
+          for (let i = 0; i < window.length; i++) {
+            const entry = Object.getOwnPropertyDescriptor(acknowledged, String(i));
+            if (entry === undefined || !Object.hasOwn(entry, "value") || typeof entry.value !== "boolean")
+              input("Atomic acknowledgement results must be own boolean values");
+          }
+          for (let i = 0; i < window.length; i++) {
+            const current = window[i]!.delivery, receipt = receipts[i]!;
+            counts.deliveries++; counts.bytes += current.byteLength;
+            counts.applied += receipt.applied; counts.omitted += receipt.omitted;
+            if (receipt.replayed) counts.replays++;
+            lastSequence = current.sequence;
+          }
+          continue;
         }
         // Only a complete, accepted response authorizes any source reclamation.
         // Once each ACK starts, join its confirmation even after cancellation.
