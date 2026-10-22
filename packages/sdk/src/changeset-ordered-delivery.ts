@@ -2,7 +2,7 @@ import type { ApplyChangesetResult, ChangesetTarget } from "./changeset-apply";
 import type {
   ChangesetDeliveryOptions, ChangesetDeliveryReceipt, ChangesetEnvelope, ChangesetTransport,
 } from "./changeset-delivery";
-import type { OutboxReadResult } from "./changeset-outbox";
+import type { OutboxReadResult, OutboxBatchReadOptions } from "./changeset-outbox";
 import { ChangesetOrder } from "./changeset-order";
 import type { ChangesetOrderResult } from "./changeset-order";
 import { inspectChangeset } from "./changeset-codec";
@@ -26,6 +26,8 @@ export interface OrderedChangesetReceipt extends ChangesetDeliveryReceipt {
 export interface OrderedChangesetSource {
   readonly receiverId?: string;
   read(deliveryId: string): Promise<OutboxReadResult | null>;
+  /** Optional consistent source snapshot. Legacy sources retain per-message reads. */
+  readBatch?(ids: readonly string[], options?: OutboxBatchReadOptions): Promise<readonly OutboxReadResult[]>;
 }
 export interface OrderedChangesetTransportOptions {
   receiverId: string;
@@ -467,6 +469,9 @@ export function createOrderedChangesetBatchTransport(
   const maximumBatch = bounded(options?.maxBatchBytes ?? HARD_BYTES, HARD_BYTES, 1);
   if (typeof deliver !== "function" || typeof read !== "function" || (binding !== undefined && binding !== receiverId))
     input("Use a matching receiver-bound source and an ordered batch transport");
+  const readBatch = source?.readBatch;
+  if (readBatch !== undefined && typeof readBatch !== "function")
+    input("Source readBatch must provide one consistent bounded snapshot");
   let active = false;
   return async (values, options = {}) => {
     if (active) throw new OrderedChangesetDeliveryError("ERR_FSQLITE_ORDERED_BUSY", "This ordered batch transport is already active");
@@ -480,9 +485,26 @@ export function createOrderedChangesetBatchTransport(
       // the remote transaction commits; malformed tails cannot escape admission.
       const expectedCounts = messages.map(message => inspectChangeset(message.changeset).changeCount);
       for (const message of messages) { await verifyHash(message); time.check(); }
+      // New persistent sources validate the whole window in one SQL snapshot.
+      // No snapshot is held across delivery, and an uncertain/malformed batch
+      // read must never fall back to individually observed source generations.
+      const records = readBatch === undefined ? undefined : await readBatch.call(source,
+        Object.freeze(messages.map(message => message.deliveryId)), { maxBytes: maximumBatch });
+      time.check();
+      if (readBatch !== undefined && (!Array.isArray(records) || records.length !== messages.length))
+        mismatch("Source did not return the complete batch snapshot");
       const outgoing: OrderedChangesetEnvelope[] = [], counts: number[] = [];
       for (const message of messages) {
-        const record = await read.call(source, message.deliveryId); time.check();
+        let record: unknown;
+        if (records === undefined) {
+          record = await read.call(source, message.deliveryId);
+        } else {
+          const entry = Object.getOwnPropertyDescriptor(records, String(outgoing.length));
+          if (entry === undefined || !Object.hasOwn(entry, "value"))
+            mismatch("Source batch records must be own data properties");
+          record = entry.value;
+        }
+        time.check();
         const { sequence, changes } = sourceMetadata(record, message, lengths[outgoing.length]!);
         if (changes !== expectedCounts[outgoing.length])
           mismatch("Source change count disagrees with the complete batch payload");

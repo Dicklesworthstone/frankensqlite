@@ -1,3 +1,5 @@
+import { captureBatchRead, loadReadBatch } from "./changeset-outbox-read";
+import type { OutboxBatchReadOptions } from "./changeset-outbox-read";
 import { captureAcknowledgements } from "./changeset-outbox-ack";
 import type { OutboxAcknowledgement } from "./changeset-outbox-ack";
 import type { ChangesetExecutor, ChangesetTarget } from "./changeset-apply";
@@ -78,6 +80,8 @@ export interface ChangesetReplicaOutbox {
   readonly receiverId: string;
   pending(options?: OutboxPageOptions): Promise<readonly OutboxDelivery[]>;
   read(deliveryId: string): Promise<OutboxReadResult | null>;
+  /** One source snapshot and one validated recipient cursor; no ACK or reclamation. */
+  readBatch(ids: readonly string[], options?: OutboxBatchReadOptions): Promise<readonly OutboxReadResult[]>;
   acknowledge(deliveryId: string, sha256: string): Promise<boolean>;
   /** One SQL transaction; remote receipts/omissions must already be verified. */
   acknowledgeBatch(acknowledgements: readonly OutboxAcknowledgement[]): Promise<readonly boolean[]>;
@@ -341,6 +345,7 @@ export class ChangesetFanout {
       receiverId: id,
       pending: (options?: OutboxPageOptions) => this.#pending(id, options),
       read: (deliveryId: string) => this.#read(id, deliveryId),
+      readBatch: (ids: readonly string[], options?: OutboxBatchReadOptions) => this.#readBatch(id, ids, options),
       acknowledge: (deliveryId: string, sha256: string) => this.#acknowledge(id, deliveryId, sha256),
       acknowledgeBatch: (acknowledgements: readonly OutboxAcknowledgement[]) => this.#acknowledgeBatch(id, acknowledgements),
     });
@@ -365,6 +370,15 @@ export class ChangesetFanout {
       if (record.delivery.sequence <= cursor.sequence)
         return { delivery: Object.freeze({ ...record.delivery, acknowledged: true }), changeset: null };
       return { delivery: record.delivery, changeset: await load(tx, record) };
+    });
+  }
+
+  async #readBatch(replica: string, ids: readonly string[], options: OutboxBatchReadOptions = {}): Promise<readonly OutboxReadResult[]> {
+    const request = captureBatchRead(ids, options);
+    return this.#target.transaction(async tx => {
+      const current = await this.#state(tx);
+      const cursor = current.replicas.find(r => r.receiverId === replica)!;
+      return loadReadBatch(tx, request, cursor.sequence);
     });
   }
 

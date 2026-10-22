@@ -322,3 +322,4 @@ export {
 } from "./changeset-http";
 
 export type { OutboxAcknowledgement } from "./changeset-outbox-ack";
+export type { OutboxBatchReadOptions } from "./changeset-outbox-read";

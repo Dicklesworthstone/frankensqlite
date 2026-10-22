@@ -1,3 +1,6 @@
+import { captureBatchRead, loadReadBatch } from "./changeset-outbox-read";
+import type { OutboxBatchReadOptions } from "./changeset-outbox-read";
+export type { OutboxBatchReadOptions } from "./changeset-outbox-read";
 import { captureAcknowledgements } from "./changeset-outbox-ack";
 import type { OutboxAcknowledgement } from "./changeset-outbox-ack";
 export type { OutboxAcknowledgement } from "./changeset-outbox-ack";
@@ -353,6 +356,18 @@ export class ChangesetOutbox {
         ? null
         : { delivery: record.delivery, changeset: await load(tx, record) };
     });
+  }
+
+  /**
+   * Read 1..256 distinct retained identities from one consistent SQL snapshot.
+   * Admit the total pending bytes before loading any payload. Input order is
+   * preserved, acknowledged records have null bytes, and no partial array is
+   * returned if a member is missing/corrupt. Results own their payload bytes.
+   * This is a read, not a source confirmation or acknowledgement.
+   */
+  async readBatch(ids: readonly string[], options: OutboxBatchReadOptions = {}): Promise<readonly OutboxReadResult[]> {
+    const request = captureBatchRead(ids, options);
+    return this.#target.transaction(tx => loadReadBatch(tx, request));
   }
 
   /** Call only after the receiver durably acknowledges this exact ID and digest. */
