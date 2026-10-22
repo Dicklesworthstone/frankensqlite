@@ -4,14 +4,14 @@
 //! with the probe side to produce output batches.  Supports inner, left outer,
 //! semi, and anti join variants.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::DefaultHasher};
+use std::hash::{Hash, Hasher};
 
 use crate::vectorized::{
     AlignedValues, Batch, BatchFormatError, Column, ColumnData, ColumnSpec, ColumnVectorType,
     DEFAULT_SIMD_ALIGNMENT_BYTES, NullBitmap, SelectionVector, record_vectorized_rows,
     set_vectorized_simd_utilization, simd_path_label,
 };
-use crate::vectorized_ops::hash_batch_columns;
 
 // ── Join Type ──────────────────────────────────────────────────────────────
 
@@ -39,13 +39,15 @@ struct BuildRow {
     row_index: usize,
 }
 
-/// Comparable key value extracted from a column.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Canonical binary-equality key, shared by hashing and collision checks.
+/// INTEGER and exactly integral REAL values share one representation; no
+/// integer is rounded to REAL. NaNs are NULL and never participate in a join.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum KeyValue {
     Null,
     Integer(i64),
     FloatBits(u64),
-    Text(String),
+    Text(Vec<u8>),
     Blob(Vec<u8>),
 }
 
@@ -67,6 +69,8 @@ pub struct HashJoinTable {
 /// Build a hash table from a build-side batch.
 ///
 /// `build_key_columns` identifies which columns form the join key.
+/// Keys use SQLite numeric equality and byte-exact text/blob equality. The
+/// caller must apply comparison affinities or nonbinary collations beforehand.
 ///
 /// # Errors
 ///
@@ -79,14 +83,14 @@ pub fn hash_join_build(
         return Err("hash join build requires at least one key column".to_owned());
     }
 
+    validate_key_columns(&build_batch, build_key_columns)?;
     let sel = build_batch.selection();
-    let hashes = hash_batch_columns(&build_batch, build_key_columns)?;
 
     let mut rows = Vec::with_capacity(sel.len());
     let mut head: HashMap<u64, usize> = HashMap::new();
     let mut next: Vec<Option<usize>> = Vec::with_capacity(sel.len());
 
-    for (sel_idx, &row_idx) in sel.as_slice().iter().enumerate() {
+    for &row_idx in sel.as_slice() {
         let row = usize::from(row_idx);
         let key = extract_key(&build_batch, build_key_columns, row)?;
 
@@ -95,7 +99,7 @@ pub fn hash_join_build(
             continue;
         }
 
-        let hash = hashes[sel_idx];
+        let hash = hash_key(&key);
         let current_idx = rows.len();
 
         rows.push(BuildRow {
@@ -153,14 +157,14 @@ pub fn hash_join_probe(
     let simd_path = simd_path_label();
     let input_rows = sel.len() as u64;
 
-    let probe_hashes = hash_batch_columns(probe_batch, probe_key_columns)?;
+    validate_key_columns(probe_batch, probe_key_columns)?;
 
     // Collect (probe_row, build_row) match pairs.
     let mut probe_indices: Vec<usize> = Vec::new();
     let mut build_indices: Vec<Option<usize>> = Vec::new();
     let mut probe_matched = vec![false; probe_batch.row_count()];
 
-    for (sel_idx, &row_idx) in sel.as_slice().iter().enumerate() {
+    for &row_idx in sel.as_slice() {
         let probe_row = usize::from(row_idx);
         let probe_key = extract_key(probe_batch, probe_key_columns, probe_row)?;
 
@@ -176,7 +180,7 @@ pub fn hash_join_probe(
             continue;
         }
 
-        let hash = probe_hashes[sel_idx];
+        let hash = hash_key(&probe_key);
         let matches = find_build_matches(table, hash, &probe_key);
 
         if matches.is_empty() {
@@ -270,6 +274,40 @@ pub fn hash_join_probe(
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
+fn validate_key_columns(batch: &Batch, columns: &[usize]) -> Result<(), String> {
+    for &column in columns {
+        if column >= batch.columns().len() {
+            return Err(format!("join key column index {column} out of bounds"));
+        }
+    }
+    Ok(())
+}
+
+fn hash_key(key: &[KeyValue]) -> u64 {
+    // Hash the same canonical representation that equality compares. Hashing
+    // physical column bytes separately would separate INTEGER 1 from REAL 1.0
+    // (and different integer widths) before collision checks can see them.
+    let mut hasher = DefaultHasher::new();
+    key.hash(&mut hasher);
+    hasher.finish()
+}
+
+#[allow(clippy::cast_possible_truncation)] // integral, in-range REAL only
+fn float_key(value: f64) -> KeyValue {
+    if value.is_nan() {
+        return KeyValue::Null;
+    }
+    // The upper bound is exclusive: i64::MAX rounds UP to 2^63 as f64.
+    // Casting all integers to f64 instead would alias neighbors above 2^53.
+    if (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&value)
+        && value.fract() == 0.0
+    {
+        KeyValue::Integer(value as i64)
+    } else {
+        KeyValue::FloatBits(value.to_bits())
+    }
+}
+
 fn extract_key(batch: &Batch, key_columns: &[usize], row: usize) -> Result<Vec<KeyValue>, String> {
     let mut key = Vec::with_capacity(key_columns.len());
     for &col_idx in key_columns {
@@ -286,37 +324,21 @@ fn extract_key(batch: &Batch, key_columns: &[usize], row: usize) -> Result<Vec<K
             ColumnData::Int16(v) => KeyValue::Integer(i64::from(v.as_slice()[row])),
             ColumnData::Int32(v) => KeyValue::Integer(i64::from(v.as_slice()[row])),
             ColumnData::Int64(v) => KeyValue::Integer(v.as_slice()[row]),
-            ColumnData::Float32(v) => {
-                let f = f64::from(v.as_slice()[row]);
-                let f_norm = if f.is_nan() {
-                    f64::NAN.to_bits()
-                } else if f == 0.0 {
-                    0.0f64.to_bits()
-                } else {
-                    f.to_bits()
-                };
-                KeyValue::FloatBits(f_norm)
-            }
-            ColumnData::Float64(v) => {
-                let f = v.as_slice()[row];
-                let f_norm = if f.is_nan() {
-                    f64::NAN.to_bits()
-                } else if f == 0.0 {
-                    0.0f64.to_bits()
-                } else {
-                    f.to_bits()
-                };
-                KeyValue::FloatBits(f_norm)
-            }
+            ColumnData::Float32(v) => float_key(f64::from(v.as_slice()[row])),
+            ColumnData::Float64(v) => float_key(v.as_slice()[row]),
             ColumnData::Text { offsets, data } => {
                 let start = offsets[row] as usize;
                 let end = offsets[row + 1] as usize;
-                KeyValue::Text(String::from_utf8_lossy(&data[start..end]).into_owned())
+                let bytes = data.get(start..end)
+                    .ok_or_else(|| "invalid text join key offsets".to_owned())?;
+                KeyValue::Text(bytes.to_vec())
             }
             ColumnData::Binary { offsets, data } => {
                 let start = offsets[row] as usize;
                 let end = offsets[row + 1] as usize;
-                KeyValue::Blob(data[start..end].to_vec())
+                let bytes = data.get(start..end)
+                    .ok_or_else(|| "invalid binary join key offsets".to_owned())?;
+                KeyValue::Blob(bytes.to_vec())
             }
         };
         key.push(val);
@@ -1013,5 +1035,165 @@ mod tests {
         assert_eq!(result.columns()[0].spec.name, "id");
         assert_eq!(result.columns()[1].spec.name, "probe_val");
         assert_eq!(result.columns()[2].spec.name, "build_val");
+    }
+
+    fn numeric_batch(values: &[SqliteValue], kind: ColumnVectorType) -> Batch {
+        let specs = [
+            ColumnSpec::new("key", kind),
+            ColumnSpec::new("ordinal", ColumnVectorType::Int64),
+        ];
+        let rows: Vec<_> = values.iter().enumerate().map(|(i, value)| {
+            vec![value.clone(), SqliteValue::Integer(i64::try_from(i).unwrap())]
+        }).collect();
+        Batch::from_rows(&rows, &specs, rows.len().max(1)).unwrap()
+    }
+
+    fn joined_ordinals(batch: &Batch) -> Vec<(i64, Option<i64>)> {
+        let ColumnData::Int64(probe) = &batch.columns()[1].data else {
+            panic!("probe ordinal must be integer");
+        };
+        let build_column = &batch.columns()[2];
+        let ColumnData::Int64(build) = &build_column.data else {
+            panic!("build ordinal must be integer");
+        };
+        batch.selection().as_slice().iter().map(|&row| {
+            let row = usize::from(row);
+            (probe.as_slice()[row], build_column.validity.is_valid(row)
+                .then(|| build.as_slice()[row]))
+        }).collect()
+    }
+
+    #[test]
+    fn numeric_keys_match_across_every_physical_width() {
+        let kinds = [ColumnVectorType::Int8, ColumnVectorType::Int16,
+            ColumnVectorType::Int32, ColumnVectorType::Int64,
+            ColumnVectorType::Float32, ColumnVectorType::Float64];
+        let values: Vec<_> = [-7, 0, 1, 42].into_iter().map(SqliteValue::Integer).collect();
+        for build_kind in kinds {
+            for probe_kind in kinds {
+                let table = hash_join_build(numeric_batch(&values, build_kind), &[0]).unwrap();
+                let probe = numeric_batch(&values, probe_kind);
+                let result = hash_join_probe(&table, &probe, &[0], JoinType::Inner).unwrap();
+                assert_eq!(joined_ordinals(&result),
+                    vec![(0, Some(0)), (1, Some(1)), (2, Some(2)), (3, Some(3))],
+                    "{build_kind:?} -> {probe_kind:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn numeric_join_does_not_round_large_integer_keys() {
+        let integers = [i64::MIN, -1, 0, 1, 9_007_199_254_740_992,
+            9_007_199_254_740_993, i64::MAX];
+        let reals = [-9_223_372_036_854_775_808.0, -1.0, -0.0, 1.0,
+            9_007_199_254_740_992.0, 9_223_372_036_854_775_808.0, 1.5,
+            f64::INFINITY, f64::NEG_INFINITY];
+        let build = numeric_batch(&integers.map(SqliteValue::Integer), ColumnVectorType::Int64);
+        let probe = numeric_batch(&reals.map(SqliteValue::Float), ColumnVectorType::Float64);
+        let table = hash_join_build(build.clone(), &[0]).unwrap();
+        let result = hash_join_probe(&table, &probe, &[0], JoinType::Inner).unwrap();
+        assert_eq!(joined_ordinals(&result),
+            vec![(0, Some(0)), (1, Some(1)), (2, Some(2)), (3, Some(3)), (4, Some(4))]);
+        let reversed = hash_join_build(probe, &[0]).unwrap();
+        let result = hash_join_probe(&reversed, &build, &[0], JoinType::Inner).unwrap();
+        assert_eq!(joined_ordinals(&result),
+            vec![(0, Some(0)), (1, Some(1)), (2, Some(2)), (3, Some(3)), (4, Some(4))]);
+    }
+
+    #[test]
+    fn nan_keys_are_nonmatching_even_with_validity_bits_set() {
+        // Bypass row conversion so the operator itself must normalize NaN.
+        let mut columns = numeric_batch(
+            &[SqliteValue::Integer(0), SqliteValue::Integer(1)],
+            ColumnVectorType::Float64,
+        ).columns().to_vec();
+        columns[0].data = ColumnData::Float64(AlignedValues::from_vec(
+            vec![f64::NAN, 1.0], DEFAULT_SIMD_ALIGNMENT_BYTES,
+        ).unwrap());
+        let batch = Batch::from_columns(columns, 2, 2, SelectionVector::identity(2).unwrap()).unwrap();
+        assert!(batch.columns()[0].validity.is_valid(0));
+        let table = hash_join_build(batch.clone(), &[0]).unwrap();
+        for (kind, expected) in [
+            (JoinType::Inner, vec![(1, Some(1))]),
+            (JoinType::Semi, vec![(1, Some(1))]),
+            (JoinType::Left, vec![(0, None), (1, Some(1))]),
+            (JoinType::Anti, vec![(0, None)]),
+        ] {
+            let result = hash_join_probe(&table, &batch, &[0], kind).unwrap();
+            assert_eq!(joined_ordinals(&result), expected, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn canonical_float_hashes_preserve_zero_infinities_and_fractional_values() {
+        for real in [0.0, -0.0] {
+            assert_eq!(float_key(real), KeyValue::Integer(0));
+            assert_eq!(hash_key(&[float_key(real)]), hash_key(&[KeyValue::Integer(0)]));
+        }
+        for real in [0.5, -0.5, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(float_key(real), KeyValue::FloatBits(real.to_bits()));
+        }
+        assert_eq!(float_key(f64::from_bits(0x7FF0_0000_0000_0001)), KeyValue::Null);
+        assert_eq!(float_key(f64::from_bits(0xFFF8_0000_0000_0001)), KeyValue::Null);
+        let reals = [SqliteValue::Float(f64::INFINITY), SqliteValue::Float(-0.0),
+            SqliteValue::Float(0.5), SqliteValue::Float(f64::NEG_INFINITY)];
+        let batch = numeric_batch(&reals, ColumnVectorType::Float64);
+        let table = hash_join_build(batch.clone(), &[0]).unwrap();
+        assert_eq!(joined_ordinals(&hash_join_probe(&table, &batch, &[0], JoinType::Inner).unwrap()),
+            vec![(0, Some(0)), (1, Some(1)), (2, Some(2)), (3, Some(3))]);
+    }
+
+    #[test]
+    fn composite_numeric_keys_respect_selection_order_and_column_mapping() {
+        let build = Batch::from_rows(&[
+            vec![SqliteValue::Integer(1), SqliteValue::Integer(2), SqliteValue::Integer(10)],
+            vec![SqliteValue::Integer(1), SqliteValue::Integer(3), SqliteValue::Integer(11)],
+        ], &[
+            ColumnSpec::new("a", ColumnVectorType::Int16),
+            ColumnSpec::new("b", ColumnVectorType::Float32),
+            ColumnSpec::new("payload", ColumnVectorType::Int64),
+        ], 2).unwrap();
+        let mut probe = Batch::from_rows(&[
+            vec![SqliteValue::Integer(3), SqliteValue::Float(1.0)],
+            vec![SqliteValue::Integer(2), SqliteValue::Float(1.0)],
+        ], &[
+            ColumnSpec::new("b", ColumnVectorType::Int64),
+            ColumnSpec::new("a", ColumnVectorType::Float64),
+        ], 2).unwrap();
+        probe.apply_selection(SelectionVector::from_indices(vec![1, 0, 1])).unwrap();
+        let table = hash_join_build(build, &[0, 1]).unwrap();
+        let result = hash_join_probe(&table, &probe, &[1, 0], JoinType::Inner).unwrap();
+        let ColumnData::Int64(payload) = &result.columns()[2].data else { panic!("payload"); };
+        assert_eq!(payload.as_slice(), &[10, 11, 10]);
+    }
+
+    #[test]
+    fn binary_keys_preserve_raw_bytes_and_storage_class() {
+        assert_ne!(KeyValue::Text(vec![0x80]), KeyValue::Text(vec![0x81]));
+        assert_ne!(KeyValue::Text(b"1".to_vec()), KeyValue::Integer(1));
+        assert_ne!(KeyValue::Text(b"1".to_vec()), KeyValue::Blob(b"1".to_vec()));
+        let batch = |bytes: Vec<u8>| {
+            Batch::from_columns(vec![Column {
+                spec: ColumnSpec::new("key", ColumnVectorType::Text),
+                data: ColumnData::Text {
+                    offsets: std::sync::Arc::from(vec![0, u32::try_from(bytes.len()).unwrap()]),
+                    data: std::sync::Arc::from(bytes),
+                },
+                validity: NullBitmap::from_bytes(std::sync::Arc::from(vec![1_u8]), 1).unwrap(),
+            }], 1, 1, SelectionVector::identity(1).unwrap()).unwrap()
+        };
+        for bytes in [vec![0x80], b"a\0b".to_vec()] {
+            let table = hash_join_build(batch(bytes.clone()), &[0]).unwrap();
+            assert_eq!(hash_join_probe(&table, &batch(bytes), &[0], JoinType::Inner).unwrap().row_count(), 1);
+            assert_eq!(hash_join_probe(&table, &batch(vec![0x81]), &[0], JoinType::Inner).unwrap().row_count(), 0);
+        }
+    }
+
+    #[test]
+    fn invalid_key_indices_are_rejected_on_empty_batches() {
+        assert!(hash_join_build(build_batch(&[]), &[2]).unwrap_err().contains("out of bounds"));
+        let table = hash_join_build(build_batch(&[]), &[0]).unwrap();
+        assert!(hash_join_probe(&table, &probe_batch(&[]), &[2], JoinType::Inner)
+            .unwrap_err().contains("out of bounds"));
     }
 }
