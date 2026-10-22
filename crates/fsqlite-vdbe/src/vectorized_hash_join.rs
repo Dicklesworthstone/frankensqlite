@@ -115,6 +115,20 @@ pub fn hash_join_build(
         head.insert(hash, current_idx);
     }
 
+    // Convert prepend chains to build-selection order once. Streaming probes
+    // can now resume directly inside a bucket without collecting and reversing
+    // every matching row (or allocating a Cartesian product).
+    for first in head.values_mut() {
+        let mut previous = *first;
+        let mut current = next[previous].take();
+        while let Some(index) = current {
+            current = next[index];
+            next[index] = Some(previous);
+            previous = index;
+        }
+        *first = previous;
+    }
+
     Ok(HashJoinTable {
         rows,
         head,
@@ -134,85 +148,189 @@ pub fn hash_join_build(
 ///
 /// # Errors
 ///
-/// Returns an error if column indices are out of bounds.
-#[allow(clippy::too_many_lines)]
+/// Returns an error for invalid keys or more than 65,536 output rows. Use
+/// [`HashJoinProbe`] to consume larger joins incrementally. The size check
+/// happens before gathering output payloads, not after constructing them.
 pub fn hash_join_probe(
     table: &HashJoinTable,
     probe_batch: &Batch,
     probe_key_columns: &[usize],
     join_type: JoinType,
 ) -> Result<Batch, String> {
-    if probe_key_columns.is_empty() {
-        return Err("hash join probe requires at least one key column".to_owned());
+    let probe = HashJoinProbe::new(
+        table, probe_batch, probe_key_columns, join_type, MAX_JOIN_BATCH_ROWS,
+    )?;
+    let mut position = ProbePosition::default();
+    let pairs = probe.collect_pairs(&mut position)?;
+    if probe.next_pair(&mut position)?.is_some() {
+        return Err("hash join result exceeds one batch; use HashJoinProbe".to_owned());
     }
-    if table.build_key_columns.len() != probe_key_columns.len() {
-        return Err(format!(
-            "hash join key arity mismatch: build has {} key columns, probe has {}",
-            table.build_key_columns.len(),
-            probe_key_columns.len()
-        ));
-    }
+    let result = materialize_join_pairs(table, probe_batch, &pairs)?;
+    record_probe_batch(position.selection_offset, result.row_count(), join_type);
+    Ok(result)
+}
 
-    let sel = probe_batch.selection();
-    let simd_path = simd_path_label();
-    let input_rows = sel.len() as u64;
+const MAX_JOIN_BATCH_ROWS: usize = u16::MAX as usize + 1;
 
-    validate_key_columns(probe_batch, probe_key_columns)?;
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveProbe {
+    row: usize,
+    key: Vec<KeyValue>,
+    next_build: Option<usize>,
+    matched: bool,
+}
 
-    // Collect (probe_row, build_row) match pairs.
-    let mut probe_indices: Vec<usize> = Vec::new();
-    let mut build_indices: Vec<Option<usize>> = Vec::new();
-    let mut probe_matched = vec![false; probe_batch.row_count()];
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ProbePosition {
+    selection_offset: usize,
+    active: Option<ActiveProbe>,
+}
 
-    for &row_idx in sel.as_slice() {
-        let probe_row = usize::from(row_idx);
-        let probe_key = extract_key(probe_batch, probe_key_columns, probe_row)?;
+#[derive(Default)]
+struct JoinPairs {
+    probe: Vec<usize>,
+    build: Vec<Option<usize>>,
+}
 
-        // NULL keys never match.
-        if probe_key.iter().any(|k| matches!(k, KeyValue::Null)) {
-            match join_type {
-                JoinType::Left | JoinType::Anti => {
-                    probe_indices.push(probe_row);
-                    build_indices.push(None);
-                }
-                JoinType::Inner | JoinType::Semi => {}
-            }
-            continue;
+/// Resumable hash-join output, including joins larger than a selection vector.
+///
+/// Each call emits at most the configured row limit and resumes inside the
+/// current collision chain. Probe selection order (including repeated entries)
+/// and build selection order are preserved. Semi/anti joins stop searching at
+/// the first match. Output schema matches [`hash_join_probe`] for every variant.
+///
+/// This bounds result-pair staging and output row counts, not input tables,
+/// key sizes, variable-width payload bytes or total process memory. Consume
+/// and release batches rather than collecting them all to retain that benefit.
+/// No input or table is mutated. Dropping the probe abandons only its progress.
+#[derive(Debug)]
+pub struct HashJoinProbe<'a> {
+    table: &'a HashJoinTable,
+    probe_batch: &'a Batch,
+    key_columns: Vec<usize>,
+    join_type: JoinType,
+    max_output_rows: usize,
+    position: ProbePosition,
+}
+
+impl<'a> HashJoinProbe<'a> {
+    /// Start a probe with an output row limit in `1..=65_536`.
+    ///
+    /// # Errors
+    /// Rejects invalid key indices, differing key arities, or an invalid limit,
+    /// including for empty inputs. No output payload is gathered at admission.
+    pub fn new(
+        table: &'a HashJoinTable,
+        probe_batch: &'a Batch,
+        key_columns: &[usize],
+        join_type: JoinType,
+        max_output_rows: usize,
+    ) -> Result<Self, String> {
+        if key_columns.is_empty() {
+            return Err("hash join probe requires at least one key column".to_owned());
         }
+        if table.build_key_columns.len() != key_columns.len() {
+            return Err(format!(
+                "hash join key arity mismatch: build has {} key columns, probe has {}",
+                table.build_key_columns.len(), key_columns.len(),
+            ));
+        }
+        validate_key_columns(probe_batch, key_columns)?;
+        if !(1..=MAX_JOIN_BATCH_ROWS).contains(&max_output_rows) {
+            return Err("hash join output row limit must be in 1..=65536".to_owned());
+        }
+        Ok(Self {
+            table,
+            probe_batch,
+            key_columns: key_columns.to_vec(),
+            join_type,
+            max_output_rows,
+            position: ProbePosition::default(),
+        })
+    }
 
-        let hash = hash_key(&probe_key);
-        let matches = find_build_matches(table, hash, &probe_key);
-
-        if matches.is_empty() {
-            match join_type {
-                JoinType::Left | JoinType::Anti => {
-                    probe_indices.push(probe_row);
-                    build_indices.push(None);
-                }
-                JoinType::Inner | JoinType::Semi => {}
-            }
+    /// Produce the next nonempty batch, or `None` once exhausted.
+    ///
+    /// # Errors
+    /// A key, allocation or output-materialization error leaves progress
+    /// unchanged: the failed batch has not been consumed. Already returned
+    /// batches remain consumed. The caller may retry or abandon the probe.
+    pub fn next_batch(&mut self) -> Result<Option<Batch>, String> {
+        let mut position = self.position.clone();
+        let pairs = self.collect_pairs(&mut position)?;
+        let result = if pairs.probe.is_empty() {
+            None
         } else {
-            probe_matched[probe_row] = true;
-            match join_type {
-                JoinType::Inner | JoinType::Left => {
-                    for &build_row in &matches {
-                        probe_indices.push(probe_row);
-                        build_indices.push(Some(build_row));
+            Some(materialize_join_pairs(self.table, self.probe_batch, &pairs)?)
+        };
+        let consumed = position.selection_offset - self.position.selection_offset;
+        self.position = position;
+        record_probe_batch(consumed, pairs.probe.len(), self.join_type);
+        Ok(result)
+    }
+
+    fn collect_pairs(&self, position: &mut ProbePosition) -> Result<JoinPairs, String> {
+        let mut pairs = JoinPairs::default();
+        while pairs.probe.len() < self.max_output_rows {
+            let Some((probe, build)) = self.next_pair(position)? else {
+                break;
+            };
+            pairs.probe.try_reserve(1).map_err(|error| error.to_string())?;
+            pairs.build.try_reserve(1).map_err(|error| error.to_string())?;
+            pairs.probe.push(probe);
+            pairs.build.push(build);
+        }
+        Ok(pairs)
+    }
+
+    fn next_pair(&self, position: &mut ProbePosition) -> Result<Option<(usize, Option<usize>)>, String> {
+        loop {
+            let mut active = if let Some(active) = position.active.take() {
+                active
+            } else {
+                let Some(&row) = self.probe_batch.selection().as_slice().get(position.selection_offset) else {
+                    return Ok(None);
+                };
+                let row = usize::from(row);
+                let key = extract_key(self.probe_batch, &self.key_columns, row)?;
+                let next_build = if key.iter().any(|value| matches!(value, KeyValue::Null)) {
+                    None
+                } else {
+                    self.table.head.get(&hash_key(&key)).copied()
+                };
+                position.selection_offset += 1;
+                ActiveProbe { row, key, next_build, matched: false }
+            };
+            while let Some(index) = active.next_build {
+                active.next_build = self.table.next[index];
+                let build = &self.table.rows[index];
+                if build.key != active.key {
+                    continue; // A hash collision is not equality.
+                }
+                active.matched = true;
+                match self.join_type {
+                    JoinType::Inner | JoinType::Left => {
+                        let pair = (active.row, Some(build.row_index));
+                        position.active = Some(active);
+                        return Ok(Some(pair));
                     }
+                    JoinType::Semi => return Ok(Some((active.row, Some(build.row_index)))),
+                    JoinType::Anti => break,
                 }
-                JoinType::Semi => {
-                    // Only emit once per probe row.
-                    probe_indices.push(probe_row);
-                    build_indices.push(Some(matches[0]));
-                }
-                JoinType::Anti => {
-                    // Has match → skip for anti join.
-                }
+            }
+            if !active.matched && matches!(self.join_type, JoinType::Left | JoinType::Anti) {
+                return Ok(Some((active.row, None)));
             }
         }
     }
+}
 
-    let output_rows = probe_indices.len();
+fn materialize_join_pairs(
+    table: &HashJoinTable,
+    probe_batch: &Batch,
+    pairs: &JoinPairs,
+) -> Result<Batch, String> {
+    let output_rows = pairs.probe.len();
 
     // Build output columns: probe columns + non-key build columns.
     let mut output_columns: Vec<Column> = Vec::new();
@@ -223,7 +341,7 @@ pub fn hash_join_probe(
             &probe_col.spec,
             &probe_col.data,
             &probe_col.validity,
-            &probe_indices,
+            &pairs.probe,
             output_rows,
         )?;
         output_columns.push(col);
@@ -240,24 +358,11 @@ pub fn hash_join_probe(
             &build_col.spec,
             &build_col.data,
             &build_col.validity,
-            &build_indices,
+            &pairs.build,
             output_rows,
         )?;
         output_columns.push(col);
     }
-
-    record_vectorized_rows(input_rows);
-    update_join_simd_utilization(simd_path);
-
-    let _span = tracing::debug_span!(
-        "vectorized_batch",
-        batch_size = input_rows,
-        output_rows = output_rows,
-        simd_path = simd_path,
-        join_type = ?join_type,
-        op = "hash_join_probe",
-    )
-    .entered();
 
     if output_rows == 0 {
         // Return empty batch with correct schema.
@@ -344,22 +449,6 @@ fn extract_key(batch: &Batch, key_columns: &[usize], row: usize) -> Result<Vec<K
         key.push(val);
     }
     Ok(key)
-}
-
-fn find_build_matches(table: &HashJoinTable, hash: u64, probe_key: &[KeyValue]) -> Vec<usize> {
-    let mut matches = Vec::new();
-    let mut current = table.head.get(&hash).copied();
-    while let Some(idx) = current {
-        let build_row = &table.rows[idx];
-        if build_row.key == *probe_key {
-            matches.push(build_row.row_index);
-        }
-        current = table.next[idx];
-    }
-    // We inserted items by pushing onto the head, meaning we traverse from newest to oldest.
-    // We reverse to maintain the stable insertion order of the original build side, matching the old HashMap bucket ordering.
-    matches.reverse();
-    matches
 }
 
 /// Gather values from a column at specified row indices.
@@ -503,14 +592,10 @@ fn gather_column_inner(
             new_offsets.push(0);
             for (out_idx, &row) in indices.iter().enumerate() {
                 if !extra_nulls[out_idx] && validity.is_valid(row) {
-                    let start = offsets.get(row).copied().unwrap_or_default() as usize;
-                    let end = offsets.get(row + 1).copied().unwrap_or_default() as usize;
-                    if start <= end && end <= src.len() {
-                        new_data.extend_from_slice(&src[start..end]);
-                    }
+                    append_variable_value(&mut new_data, offsets, src, row)?;
                 }
-                #[allow(clippy::cast_possible_truncation)]
-                new_offsets.push(new_data.len() as u32);
+                new_offsets.push(u32::try_from(new_data.len())
+                    .map_err(|_| "join text output exceeds 4 GiB".to_owned())?);
                 set_valid(&mut validity_bytes, out_idx, row, extra_nulls, validity);
             }
             ColumnData::Text {
@@ -524,14 +609,10 @@ fn gather_column_inner(
             new_offsets.push(0);
             for (out_idx, &row) in indices.iter().enumerate() {
                 if !extra_nulls[out_idx] && validity.is_valid(row) {
-                    let start = offsets.get(row).copied().unwrap_or_default() as usize;
-                    let end = offsets.get(row + 1).copied().unwrap_or_default() as usize;
-                    if start <= end && end <= src.len() {
-                        new_data.extend_from_slice(&src[start..end]);
-                    }
+                    append_variable_value(&mut new_data, offsets, src, row)?;
                 }
-                #[allow(clippy::cast_possible_truncation)]
-                new_offsets.push(new_data.len() as u32);
+                new_offsets.push(u32::try_from(new_data.len())
+                    .map_err(|_| "join binary output exceeds 4 GiB".to_owned())?);
                 set_valid(&mut validity_bytes, out_idx, row, extra_nulls, validity);
             }
             ColumnData::Binary {
@@ -549,6 +630,23 @@ fn gather_column_inner(
         data: out_data,
         validity: out_validity,
     })
+}
+
+fn append_variable_value(
+    output: &mut Vec<u8>,
+    offsets: &[u32],
+    source: &[u8],
+    row: usize,
+) -> Result<(), String> {
+    let start = offsets.get(row).ok_or_else(|| "missing join payload offset".to_owned())?;
+    let end = offsets.get(row + 1).ok_or_else(|| "missing join payload end".to_owned())?;
+    let bytes = source.get(*start as usize..*end as usize)
+        .ok_or_else(|| "invalid join payload offsets".to_owned())?;
+    output.len().checked_add(bytes.len()).and_then(|length| u32::try_from(length).ok())
+        .ok_or_else(|| "join variable-width output exceeds 4 GiB".to_owned())?;
+    output.try_reserve(bytes.len()).map_err(|error| error.to_string())?;
+    output.extend_from_slice(bytes);
+    Ok(())
 }
 
 fn empty_batch_with_schema(specs: &[ColumnSpec]) -> Result<Batch, String> {
@@ -598,6 +696,21 @@ fn empty_batch_with_schema(specs: &[ColumnSpec]) -> Result<Batch, String> {
     }
     let selection = SelectionVector::identity(0).map_err(|e: BatchFormatError| e.to_string())?;
     Batch::from_columns(columns, 0, 1, selection).map_err(|e: BatchFormatError| e.to_string())
+}
+
+fn record_probe_batch(input_rows: usize, output_rows: usize, join_type: JoinType) {
+    let simd_path = simd_path_label();
+    record_vectorized_rows(u64::try_from(input_rows).unwrap_or(u64::MAX));
+    update_join_simd_utilization(simd_path);
+    let _span = tracing::debug_span!(
+        "vectorized_batch",
+        batch_size = input_rows,
+        output_rows = output_rows,
+        simd_path = simd_path,
+        join_type = ?join_type,
+        op = "hash_join_probe",
+    )
+    .entered();
 }
 
 /// Update SIMD utilization gauge.
@@ -1195,5 +1308,149 @@ mod tests {
         let table = hash_join_build(build_batch(&[]), &[0]).unwrap();
         assert!(hash_join_probe(&table, &probe_batch(&[]), &[2], JoinType::Inner)
             .unwrap_err().contains("out of bounds"));
+    }
+
+    #[test]
+    fn streaming_join_crosses_selection_vector_limit_without_losing_pairs() {
+        let build_rows: Vec<_> = (0..300).map(|row| (1, row)).collect();
+        let probe_rows: Vec<_> = (0..300).map(|row| (1, row)).collect();
+        let table = hash_join_build(build_batch(&build_rows), &[0]).unwrap();
+        let probe = probe_batch(&probe_rows);
+        let mut stream = HashJoinProbe::new(&table, &probe, &[0], JoinType::Inner, 257).unwrap();
+        let mut count = 0_i64;
+        while let Some(batch) = stream.next_batch().unwrap() {
+            assert!((1..=257).contains(&batch.row_count()));
+            for (probe_row, build_row) in joined_ordinals(&batch) {
+                assert_eq!((probe_row, build_row), (count / 300, Some(count % 300)));
+                count += 1;
+            }
+        }
+        assert_eq!(count, 90_000);
+        assert!(stream.next_batch().unwrap().is_none());
+        assert!(hash_join_probe(&table, &probe, &[0], JoinType::Inner)
+            .unwrap_err().contains("use HashJoinProbe"));
+    }
+
+    #[test]
+    fn single_batch_join_accepts_exactly_all_u16_indices() {
+        let rows: Vec<_> = (0..256).map(|row| (1, row)).collect();
+        let table = hash_join_build(build_batch(&rows), &[0]).unwrap();
+        let result = hash_join_probe(&table, &probe_batch(&rows), &[0], JoinType::Inner).unwrap();
+        assert_eq!(result.row_count(), 65_536);
+        assert_eq!(result.selection().as_slice().last(), Some(&u16::MAX));
+        let pairs = joined_ordinals(&result);
+        assert_eq!(pairs.first(), Some(&(0, Some(0))));
+        assert_eq!(pairs.last(), Some(&(255, Some(255))));
+    }
+
+    #[test]
+    fn streaming_variants_preserve_selected_duplicates_order_and_null_padding() {
+        let mut build = build_batch_nullable(&[
+            (Some(1), 100), (None, 200), (Some(1), 101), (Some(2), 102),
+        ]);
+        build.apply_selection(SelectionVector::from_indices(vec![2, 0, 2, 1, 3])).unwrap();
+        let mut probe = probe_batch_nullable(&[
+            (Some(1), 10), (None, 20), (Some(3), 30), (Some(2), 40),
+        ]);
+        probe.apply_selection(SelectionVector::from_indices(vec![3, 0, 1, 0, 2])).unwrap();
+        let table = hash_join_build(build, &[0]).unwrap();
+        for (kind, expected) in [
+            (JoinType::Inner, vec![(40, Some(102)), (10, Some(101)), (10, Some(100)),
+                (10, Some(101)), (10, Some(101)), (10, Some(100)), (10, Some(101))]),
+            (JoinType::Left, vec![(40, Some(102)), (10, Some(101)), (10, Some(100)),
+                (10, Some(101)), (20, None), (10, Some(101)), (10, Some(100)),
+                (10, Some(101)), (30, None)]),
+            (JoinType::Semi, vec![(40, Some(102)), (10, Some(101)), (10, Some(101))]),
+            (JoinType::Anti, vec![(20, None), (30, None)]),
+        ] {
+            for limit in [1, 2, 3, 7, 100] {
+                let mut stream = HashJoinProbe::new(&table, &probe, &[0], kind, limit).unwrap();
+                let mut actual = Vec::new();
+                while let Some(batch) = stream.next_batch().unwrap() {
+                    assert!(batch.row_count() <= limit);
+                    assert_eq!(batch.columns().len(), 3);
+                    actual.extend(joined_ordinals(&batch));
+                }
+                assert_eq!(actual, expected, "{kind:?} limit={limit}");
+                assert!(stream.next_batch().unwrap().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_probe_checks_equality_after_forced_hash_collisions() {
+        let mut table = hash_join_build(build_batch(&[(2, 200), (1, 100), (3, 300), (1, 101)]), &[0]).unwrap();
+        // Deliberately place every key in one chain without needing a hash
+        // preimage. Matches at both ends of a batch still require exact keys.
+        table.next = vec![Some(1), Some(2), Some(3), None];
+        for key in [1, 2, 3, 4] {
+            table.head.insert(hash_key(&[KeyValue::Integer(key)]), 0);
+        }
+        let probe = probe_batch(&[(1, 10), (4, 40), (2, 20)]);
+        let mut stream = HashJoinProbe::new(&table, &probe, &[0], JoinType::Left, 1).unwrap();
+        let mut actual = Vec::new();
+        while let Some(batch) = stream.next_batch().unwrap() {
+            actual.extend(joined_ordinals(&batch));
+        }
+        assert_eq!(actual, vec![(10, Some(100)), (10, Some(101)), (40, None), (20, Some(200))]);
+    }
+
+    #[test]
+    fn streaming_materialization_error_does_not_consume_the_failed_chunk() {
+        let mut columns = build_batch(&[(1, 100), (2, 200)]).columns().to_vec();
+        columns[1].spec = ColumnSpec::new("payload", ColumnVectorType::Text);
+        columns[1].data = ColumnData::Text {
+            offsets: std::sync::Arc::from(vec![0, 1, 3]),
+            data: std::sync::Arc::from(vec![b'x']), // Second value is truncated.
+        };
+        let build = Batch::from_columns(columns, 2, 2, SelectionVector::identity(2).unwrap()).unwrap();
+        let table = hash_join_build(build, &[0]).unwrap();
+        let probe = probe_batch(&[(1, 10), (2, 20)]);
+        let mut stream = HashJoinProbe::new(&table, &probe, &[0], JoinType::Inner, 1).unwrap();
+        assert_eq!(stream.next_batch().unwrap().unwrap().row_count(), 1);
+        let before = stream.position.clone();
+        for _ in 0..2 {
+            assert!(stream.next_batch().unwrap_err().contains("invalid join payload offsets"));
+            assert_eq!(stream.position, before, "a rejected chunk must remain retryable");
+        }
+        // A larger initial chunk must also reject atomically, even though its
+        // first row could have been emitted successfully on its own.
+        let mut stream = HashJoinProbe::new(&table, &probe, &[0], JoinType::Inner, 2).unwrap();
+        assert!(stream.next_batch().is_err());
+        assert_eq!(stream.position, ProbePosition::default());
+    }
+
+    #[test]
+    fn streaming_limits_and_empty_inputs_are_well_defined() {
+        let table = hash_join_build(build_batch(&[]), &[0]).unwrap();
+        let empty = probe_batch(&[]);
+        for limit in [0, 65_537, usize::MAX] {
+            assert!(HashJoinProbe::new(&table, &empty, &[0], JoinType::Inner, limit).is_err());
+        }
+        let mut stream = HashJoinProbe::new(&table, &empty, &[0], JoinType::Inner, 1).unwrap();
+        assert!(stream.next_batch().unwrap().is_none());
+        assert!(stream.next_batch().unwrap().is_none());
+        let empty_result = hash_join_probe(&table, &empty, &[0], JoinType::Inner).unwrap();
+        assert_eq!(empty_result.row_count(), 0);
+        assert_eq!(empty_result.columns().len(), 3);
+        let probe = probe_batch(&[(1, 10), (2, 20)]);
+        for kind in [JoinType::Left, JoinType::Anti] {
+            let mut stream = HashJoinProbe::new(&table, &probe, &[0], kind, 1).unwrap();
+            assert_eq!(joined_ordinals(&stream.next_batch().unwrap().unwrap()), vec![(10, None)]);
+            assert_eq!(joined_ordinals(&stream.next_batch().unwrap().unwrap()), vec![(20, None)]);
+            assert!(stream.next_batch().unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn abandoned_probe_does_not_mutate_reusable_build_table() {
+        let table = hash_join_build(build_batch(&[(1, 100), (1, 101)]), &[0]).unwrap();
+        let probe = probe_batch(&[(1, 10)]);
+        {
+            let mut stream = HashJoinProbe::new(&table, &probe, &[0], JoinType::Inner, 1).unwrap();
+            assert_eq!(joined_ordinals(&stream.next_batch().unwrap().unwrap()), vec![(10, Some(100))]);
+        }
+        let result = hash_join_probe(&table, &probe, &[0], JoinType::Inner).unwrap();
+        assert_eq!(joined_ordinals(&result), vec![(10, Some(100)), (10, Some(101))]);
     }
 }
