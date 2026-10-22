@@ -13,7 +13,7 @@ use crate::commit_marker::{
     CommitMarkerRecord, MarkerError, MarkerSegmentHeader, recover_marker_stream,
 };
 use fsqlite_error::{FrankenError, Result};
-use fsqlite_types::ecs::{PageVersionIndexSegment, PatchKind, VersionPointer};
+use fsqlite_types::ecs::{BloomFilter, PageVersionIndexSegment, PatchKind, VersionPointer};
 use fsqlite_types::{ObjectId, PageNumber};
 use tracing::{debug, error, info, warn};
 
@@ -93,7 +93,7 @@ pub struct LookupResult {
 pub struct BuiltIndexSegment {
     /// Built segment payload.
     pub segment: PageVersionIndexSegment,
-    /// Content-addressed deterministic object id for the segment.
+    /// Content-addressed deterministic object id of the segment.
     pub object_id: ObjectId,
 }
 
@@ -127,7 +127,9 @@ impl BoldnessConstraint {
 
     #[must_use]
     fn permits_repair(self, symbol_loss_rate_estimate: f64) -> bool {
-        symbol_loss_rate_estimate <= self.max_repair_symbol_loss_rate
+        (0.0..=1.0).contains(&symbol_loss_rate_estimate)
+            && (0.0..=1.0).contains(&self.max_repair_symbol_loss_rate)
+            && symbol_loss_rate_estimate <= self.max_repair_symbol_loss_rate
     }
 }
 
@@ -255,7 +257,9 @@ impl SegmentBuilder {
     /// # Errors
     ///
     /// Returns [`FrankenError::TypeMismatch`] if a pointer commit sequence does
-    /// not match `commit_seq`. Invalid updates leave the builder unchanged.
+    /// not match `commit_seq`. Conflicting pointers for one `(page, commit_seq)`
+    /// are corruption, including re-admission against pending entries. Identical
+    /// duplicates are idempotent. Invalid updates leave the builder unchanged.
     pub fn ingest_commit(
         &mut self,
         commit_seq: u64,
@@ -268,10 +272,10 @@ impl SegmentBuilder {
             "segment builder ingesting commit updates"
         );
 
-        // Validate the entire commit before changing pending entries or their
-        // sequence bounds. In particular, a valid prefix may replace keys
-        // already buffered by an earlier admission of the same commit.
-        let mut admitted = Vec::new();
+        // Admission must be independent of iterator order. A last-wins insert
+        // would turn two different versions of one page/commit into a plausible
+        // content-addressed segment, hiding corruption from later readers.
+        let mut admitted = BTreeMap::new();
         for (page, pointer) in updates {
             if pointer.commit_seq != commit_seq {
                 return Err(FrankenError::TypeMismatch {
@@ -279,11 +283,23 @@ impl SegmentBuilder {
                     actual: pointer.commit_seq.to_string(),
                 });
             }
-            admitted.push((page, pointer));
+            let key = (page.get(), commit_seq);
+            for existing in [admitted.get(&key), self.pending.get(&key)]
+                .into_iter()
+                .flatten()
+            {
+                if *existing != pointer {
+                    return Err(FrankenError::DatabaseCorrupt {
+                        detail: format!(
+                            "conflicting native index updates for page {} at commit {commit_seq}",
+                            page.get(),
+                        ),
+                    });
+                }
+            }
+            admitted.insert(key, pointer);
         }
-        for (page, pointer) in admitted {
-            self.pending.insert((page.get(), commit_seq), pointer);
-        }
+        self.pending.extend(admitted);
 
         self.start_seq = Some(match self.start_seq {
             Some(start) => start.min(commit_seq),
@@ -801,7 +817,12 @@ pub fn preflight_native_index_integrity(
 
 /// Repair index segments from surviving symbols without a full rebuild.
 ///
-/// The loader first tries local symbols, then remote symbols.
+/// The loader first tries local symbols, then remote symbols. Each accepted
+/// segment is checked against its manifest identity, bounds and entry ordering.
+/// Bloom filters are derived accelerators, not part of the canonical identity;
+/// they are rebuilt from verified entries before any lookup can use them.
+/// Resource exhaustion and cancellation are propagated, not disguised as a
+/// missing/corrupt object or retried against a second provider.
 ///
 /// # Errors
 ///
@@ -854,6 +875,9 @@ pub fn repair_index_segments_from_ecs(
                 segments.push(segment);
                 continue;
             }
+            Err(error @ (FrankenError::OutOfMemory | FrankenError::TooBig | FrankenError::Abort)) => {
+                return Err(error);
+            }
             Err(local_error) => {
                 warn!(
                     bead_id = NATIVE_INDEX_REPAIR_BEAD_ID,
@@ -871,6 +895,9 @@ pub fn repair_index_segments_from_ecs(
             Ok(segment) => {
                 repaired_from_remote = repaired_from_remote.saturating_add(1);
                 segments.push(segment);
+            }
+            Err(error @ (FrankenError::OutOfMemory | FrankenError::TooBig | FrankenError::Abort)) => {
+                return Err(error);
             }
             Err(remote_error) => {
                 error!(
@@ -1159,11 +1186,51 @@ fn marker_recovery_error(error: MarkerError) -> FrankenError {
     }
 }
 
+/// Check canonical entry semantics without consulting the derived Bloom filter.
+/// A matching content hash establishes byte identity, not valid index semantics.
+fn validate_segment_entries(segment: &PageVersionIndexSegment) -> Result<()> {
+    if segment.start_seq > segment.end_seq {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: "native index segment has reversed sequence bounds".to_owned(),
+        });
+    }
+    let mut previous: Option<(PageNumber, VersionPointer)> = None;
+    for &(page, pointer) in &segment.entries {
+        if !(segment.start_seq..=segment.end_seq).contains(&pointer.commit_seq) {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "native index page {} commit {} is outside segment [{}..={}]",
+                    page.get(), pointer.commit_seq, segment.start_seq, segment.end_seq,
+                ),
+            });
+        }
+        if let Some((previous_page, previous_pointer)) = previous {
+            let previous_key = (previous_page.get(), previous_pointer.commit_seq);
+            let key = (page.get(), pointer.commit_seq);
+            if key < previous_key || (key == previous_key && pointer != previous_pointer) {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "native index entries are unordered or conflicting at page {} commit {}",
+                        page.get(), pointer.commit_seq,
+                    ),
+                });
+            }
+        }
+        previous = Some((page, pointer));
+    }
+    Ok(())
+}
+
 fn try_fetch_valid_segment(
     entry: NativeIndexSegmentRef,
     store: &impl NativeIndexSegmentStore,
 ) -> Result<PageVersionIndexSegment> {
-    let segment = store.fetch_index_segment(entry.object_id)?;
+    if entry.start_seq > entry.end_seq {
+        return Err(FrankenError::DatabaseCorrupt {
+            detail: "native index manifest has reversed sequence bounds".to_owned(),
+        });
+    }
+    let mut segment = store.fetch_index_segment(entry.object_id)?;
     if segment.start_seq != entry.start_seq || segment.end_seq != entry.end_seq {
         return Err(FrankenError::DatabaseCorrupt {
             detail: format!(
@@ -1172,6 +1239,7 @@ fn try_fetch_valid_segment(
             ),
         });
     }
+    validate_segment_entries(&segment)?;
     let recomputed = derive_segment_object_id(&segment);
     if recomputed != entry.object_id {
         return Err(FrankenError::DatabaseCorrupt {
@@ -1181,6 +1249,15 @@ fn try_fetch_valid_segment(
             ),
         });
     }
+    // The object ID deliberately excludes the accelerator. Even a valid
+    // canonical payload can arrive with a stale/empty Bloom filter; trusting
+    // it would turn a present page version into an older base-page fallback.
+    let count = u32::try_from(segment.entries.len()).map_err(|_| FrankenError::TooBig)?;
+    let mut bloom = BloomFilter::new(count.max(1), 0.01);
+    for &(page, _) in &segment.entries {
+        bloom.insert(page);
+    }
+    segment.bloom = bloom;
     Ok(segment)
 }
 
@@ -2015,11 +2092,12 @@ mod tests {
                     .expect("seed");
             }
             let mut control = builder.clone();
-            // The valid prefix overwrites an existing key in the seeded case;
-            // a new key then reaches the auto-flush threshold before a bad
-            // final pointer rejects the entire commit.
+            // The prefix re-admits an existing key in the seeded case; a new
+            // key then reaches the auto-flush threshold before a bad final
+            // sequence rejects the entire commit. Conflicting replacements are
+            // covered separately below.
             let rejected = [
-                (page(1), pointer(10, 0x20, PatchKind::FullImage, None)),
+                (page(1), pointer(10, 0x10, PatchKind::FullImage, None)),
                 (page(2), pointer(10, 0x21, PatchKind::FullImage, None)),
                 (page(3), pointer(11, 0x22, PatchKind::FullImage, None)),
             ];
@@ -2536,4 +2614,175 @@ mod tests {
         assert_repaired_index_lookups(&fixture, &repaired.segments);
         assert_emergency_scan_behavior(&fixture);
     }
+
+
+    fn ref_for_segment(segment: &PageVersionIndexSegment) -> NativeIndexSegmentRef {
+        NativeIndexSegmentRef {
+            start_seq: segment.start_seq,
+            end_seq: segment.end_seq,
+            object_id: derive_segment_object_id(segment),
+        }
+    }
+
+    #[test]
+    fn repaired_bloom_is_reconstructed_before_page_lookup() {
+        let p = page(7);
+        let vp = pointer(12, 0xA1, PatchKind::FullImage, None);
+        let mut segment = PageVersionIndexSegment::new(10, 20, vec![(p, vp)]);
+        let reference = ref_for_segment(&segment);
+        segment.bloom = BloomFilter::new(1, 0.01);
+        assert!(segment.lookup(p, 20).is_none(), "fixture hides a real version");
+        assert_eq!(derive_segment_object_id(&segment), reference.object_id);
+        let store = TestSegmentStore::new([(reference.object_id, segment)]);
+        let report = repair_index_segments_from_ecs(
+            &[reference], &store, &TestSegmentStore::default(), 0.0,
+            BoldnessConstraint::strict(),
+        ).expect("rebuild the derived filter from canonical entries");
+        assert_eq!(report.repaired_from_local, 1);
+        assert_eq!(report.repaired_from_remote, 0);
+        assert_eq!(report.segments[0].lookup(p, 20), Some(&vp));
+        assert_eq!(derive_segment_object_id(&report.segments[0]), reference.object_id);
+        let result = lookup_page_version(
+            p, 20, &report.segments, &mut NativePageCache::default(),
+            &TestBasePages::new([(p, b"obsolete-base".to_vec())]),
+            &TestPatchStore::new([(vp.patch_object, b"recovered-version".to_vec())]), 0.0,
+        ).expect("repaired version must win over the stale base");
+        assert_eq!(result.page_bytes, b"recovered-version".to_vec());
+    }
+
+    #[test]
+    fn matching_content_id_does_not_admit_invalid_index_semantics() {
+        let first = pointer(10, 0x10, PatchKind::FullImage, None);
+        let second = pointer(20, 0x20, PatchKind::FullImage, None);
+        let valid = PageVersionIndexSegment::new(10, 20, vec![(page(1), first), (page(2), second)]);
+        let mut cases = Vec::new();
+        let mut unordered = valid.clone();
+        unordered.entries.swap(0, 1);
+        cases.push(unordered);
+        let mut reversed = valid.clone();
+        reversed.start_seq = 21;
+        cases.push(reversed);
+        let mut outside = valid.clone();
+        outside.end_seq = 19;
+        cases.push(outside);
+        cases.push(PageVersionIndexSegment::new(10, 20, vec![
+            (page(1), first),
+            (page(1), pointer(10, 0x11, PatchKind::FullImage, None)),
+        ]));
+        for segment in cases {
+            // These references genuinely match the bad canonical payloads.
+            // Checking only the hash would wrongly accept every fixture.
+            let reference = ref_for_segment(&segment);
+            let store = TestSegmentStore::new([(reference.object_id, segment)]);
+            assert!(matches!(try_fetch_valid_segment(reference, &store),
+                Err(FrankenError::DatabaseCorrupt { .. })));
+        }
+    }
+
+    #[test]
+    fn index_repair_uses_verified_remote_when_local_payload_is_wrong() {
+        let good = PageVersionIndexSegment::new(1, 2, vec![
+            (page(2), pointer(2, 0x22, PatchKind::FullImage, None)),
+        ]);
+        let reference = ref_for_segment(&good);
+        let bad = PageVersionIndexSegment::new(1, 2, vec![
+            (page(2), pointer(2, 0x23, PatchKind::FullImage, None)),
+        ]);
+        let local = TestSegmentStore::new([(reference.object_id, bad)]);
+        let mut remote_good = good.clone();
+        remote_good.bloom = BloomFilter::new(1, 0.01);
+        let remote = TestSegmentStore::new([(reference.object_id, remote_good)]);
+        let report = repair_index_segments_from_ecs(
+            &[reference], &local, &remote, 0.0, BoldnessConstraint::strict(),
+        ).expect("valid remote payload repairs the local object");
+        assert_eq!(report.repaired_from_local, 0);
+        assert_eq!(report.repaired_from_remote, 1);
+        assert_eq!(report.segments, vec![good]);
+    }
+
+    #[test]
+    fn index_repair_preserves_resource_and_cancellation_errors() {
+        struct FailingStore { failure: u8, calls: Cell<usize> }
+        impl NativeIndexSegmentStore for FailingStore {
+            fn fetch_index_segment(&self, _id: ObjectId) -> Result<PageVersionIndexSegment> {
+                self.calls.set(self.calls.get() + 1);
+                Err(match self.failure {
+                    0 => FrankenError::OutOfMemory,
+                    1 => FrankenError::TooBig,
+                    2 => FrankenError::Abort,
+                    _ => FrankenError::DatabaseCorrupt { detail: "unavailable".to_owned() },
+                })
+            }
+        }
+        let reference = NativeIndexSegmentRef { start_seq: 1, end_seq: 1, object_id: oid(1) };
+        for failure in 0..3 {
+            for fail_locally in [false, true] {
+                let local = FailingStore { failure: if fail_locally { failure } else { 3 }, calls: Cell::new(0) };
+                let remote = FailingStore { failure, calls: Cell::new(0) };
+                let error = repair_index_segments_from_ecs(
+                    &[reference], &local, &remote, 0.0, BoldnessConstraint::strict(),
+                ).expect_err("operational failure is not repairable corruption");
+                assert!(matches!((failure, error),
+                    (0, FrankenError::OutOfMemory) | (1, FrankenError::TooBig) | (2, FrankenError::Abort)));
+                assert_eq!(local.calls.get(), 1);
+                assert_eq!(remote.calls.get(), usize::from(!fail_locally));
+            }
+        }
+    }
+
+    #[test]
+    fn identical_segment_keys_are_valid_but_conflicting_keys_are_not() {
+        let vp = pointer(10, 0x10, PatchKind::FullImage, None);
+        let good = PageVersionIndexSegment::new(10, 10, vec![(page(3), vp), (page(3), vp)]);
+        let reference = ref_for_segment(&good);
+        let store = TestSegmentStore::new([(reference.object_id, good.clone())]);
+        assert_eq!(try_fetch_valid_segment(reference, &store).unwrap(), good);
+        assert_eq!(good.lookup(page(3), 10), Some(&vp));
+    }
+
+    #[test]
+    fn builder_conflicting_admission_is_atomic_and_order_independent() {
+        let original = pointer(10, 0x10, PatchKind::FullImage, None);
+        let replacement = pointer(10, 0x20, PatchKind::FullImage, None);
+        for seeded in [false, true] {
+            for reverse in [false, true] {
+                let mut builder = SegmentBuilder::new(2).unwrap();
+                if seeded { builder.ingest_commit(10, [(page(1), original)]).unwrap(); }
+                let control = builder.clone();
+                let mut updates = vec![(page(1), original), (page(2), original), (page(1), replacement)];
+                if reverse { updates.reverse(); }
+                assert!(matches!(builder.ingest_commit(10, updates),
+                    Err(FrankenError::DatabaseCorrupt { .. })));
+                assert_eq!(builder, control, "no overwrite, range change, or auto-flush on failure");
+                let result = builder.ingest_commit(10, [(page(1), original), (page(2), original)])
+                    .unwrap().expect("a valid retry can still flush");
+                assert_eq!(result.segment.entries, vec![(page(1), original), (page(2), original)]);
+            }
+        }
+    }
+
+    #[test]
+    fn builder_duplicate_admission_does_not_change_canonical_identity() {
+        let vp = pointer(10, 0x10, PatchKind::FullImage, None);
+        let mut one = SegmentBuilder::new(8).unwrap();
+        let mut duplicates = SegmentBuilder::new(8).unwrap();
+        one.ingest_commit(10, [(page(1), vp)]).unwrap();
+        duplicates.ingest_commit(10, [(page(1), vp), (page(1), vp)]).unwrap();
+        duplicates.ingest_commit(10, [(page(1), vp)]).unwrap();
+        assert_eq!(one.flush().unwrap(), duplicates.flush().unwrap());
+    }
+
+    #[test]
+    fn repair_policy_rejects_invalid_probability_inputs() {
+        let defaults = BoldnessConstraint::strict();
+        for invalid in [-1.0, f64::NEG_INFINITY, f64::INFINITY, f64::NAN, 1.01] {
+            assert!(!defaults.permits_repair(invalid));
+            let policy = BoldnessConstraint { max_repair_symbol_loss_rate: invalid, ..defaults };
+            assert!(!policy.permits_repair(0.0));
+        }
+        assert!(defaults.permits_repair(0.0));
+        assert!(defaults.permits_repair(0.25));
+        assert!(!defaults.permits_repair(0.26));
+    }
+
 }
