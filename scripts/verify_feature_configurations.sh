@@ -1,21 +1,25 @@
 #!/usr/bin/env bash
 # bd-oemkn: keep isolated consumer builds out of workspace feature unification.
 # Actions is disabled; this is an executable local/RCH gate, not a CI claim.
-# Usage: bash scripts/verify_feature_configurations.sh [all|core-no-default|cli-default|stable-x86_64]
+# Usage: bash scripts/verify_feature_configurations.sh [all|core-no-default|cli-default|stable-x86_64|stable-windows]
 # Set RCH_WORKER to coordinate worker selection; existing modes are strict remote.
 # stable-x86_64 also works locally when rch is absent. Install stable and its
 # x86_64-unknown-linux-gnu standard library first; the local host or chosen remote
 # worker must be able to execute that target. This gate never installs toolchains.
+# stable-windows cross-checks VFS libraries and test compilation. It defaults
+# to x86_64-pc-windows-gnu; CARGO_BUILD_TARGET can select x86_64-pc-windows-msvc.
+# Install the selected Rust target and its C toolchain before running this mode.
+# Windows-specific tests still need execution on a Windows host.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIGURATION="${1:-all}"
 if [[ $# -gt 1 ]]; then
-    echo "Usage: $0 [all|core-no-default|cli-default|stable-x86_64]" >&2
+    echo "Usage: $0 [all|core-no-default|cli-default|stable-x86_64|stable-windows]" >&2
     exit 2
 fi
 case "$CONFIGURATION" in
-    all|core-no-default|cli-default|stable-x86_64) ;;
+    all|core-no-default|cli-default|stable-x86_64|stable-windows) ;;
     *) echo "Unknown feature configuration: $CONFIGURATION" >&2; exit 2 ;;
 esac
 cd "$REPO_ROOT"
@@ -78,6 +82,25 @@ if [[ "$CONFIGURATION" == all || "$CONFIGURATION" == stable-x86_64 ]]; then
         --target "$stable_target" -p fsqlite-pager --lib prefetch
     run_stable btree-prefetch test --locked -j 2 \
         --target "$stable_target" -p fsqlite-btree --lib prefetch
+fi
+
+if [[ "$CONFIGURATION" == stable-windows ]]; then
+    # Keep this explicit: Linux-only hosts running `all` need not install a
+    # Windows cross toolchain. Do not let a non-Windows target bypass the gate.
+    stable_windows_target="${CARGO_BUILD_TARGET:-x86_64-pc-windows-gnu}"
+    case "$stable_windows_target" in
+        x86_64-pc-windows-gnu|x86_64-pc-windows-msvc) ;;
+        *) echo "Expected an x86_64 Windows target, found: $stable_windows_target" >&2; exit 2 ;;
+    esac
+    run_stable_build env RUSTC_BOOTSTRAP=-1 rustc +stable -vV
+    run_stable vfs-windows-default check --locked -j 2 \
+        --target "$stable_windows_target" -p fsqlite-vfs --lib
+    run_stable vfs-windows-no-default check --locked -j 2 \
+        --target "$stable_windows_target" -p fsqlite-vfs --lib --no-default-features
+    # Type-check the actual Windows hard-link, retained-handle, and cleanup
+    # regressions without pretending a cross host can execute Windows binaries.
+    run_stable vfs-windows-tests check --locked -j 2 \
+        --target "$stable_windows_target" -p fsqlite-vfs --tests
 fi
 
 if [[ "$CONFIGURATION" == all || "$CONFIGURATION" == core-no-default ]]; then

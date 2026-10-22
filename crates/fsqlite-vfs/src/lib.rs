@@ -1,5 +1,3 @@
-#![cfg_attr(windows, feature(windows_by_handle))]
-
 pub mod cache_hint;
 pub mod memory;
 pub mod metrics;

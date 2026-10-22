@@ -391,23 +391,42 @@ fn query_windows_file_id(
 fn query_windows_legacy_file_index(
     handle: std::os::windows::io::RawHandle,
 ) -> std::io::Result<(u32, u32, u32)> {
+    let information = query_windows_file_information(handle)?;
+    Ok((
+        information.dwVolumeSerialNumber,
+        information.nFileIndexHigh,
+        information.nFileIndexLow,
+    ))
+}
+
+/// Read the link count from the same open object used for identity checks.
+///
+/// This keeps Windows namespace admission on stable Rust without reopening a
+/// pathname or assuming an unavailable link count means a single-link file.
+#[cfg(all(windows, feature = "native"))]
+pub(crate) fn windows_file_link_count(file: &std::fs::File) -> std::io::Result<u32> {
+    use std::os::windows::io::AsRawHandle as _;
+
+    Ok(query_windows_file_information(file.as_raw_handle())?.nNumberOfLinks)
+}
+
+#[cfg(windows)]
+fn query_windows_file_information(
+    handle: std::os::windows::io::RawHandle,
+) -> std::io::Result<windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION> {
     use windows_sys::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
     };
 
-    let mut identity = BY_HANDLE_FILE_INFORMATION::default();
-    // SAFETY: the caller supplies a live Windows file handle and `identity`
-    // is a correctly sized writable buffer that remains valid for the
-    // duration of this synchronous system call.
-    let succeeded = unsafe { GetFileInformationByHandle(handle, &raw mut identity) };
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `information` is a correctly sized writable output buffer that
+    // remains valid for this synchronous call. Windows validates the input
+    // handle; a rejected query is returned as an error, never default data.
+    let succeeded = unsafe { GetFileInformationByHandle(handle, &raw mut information) };
     if succeeded == 0 {
         return Err(std::io::Error::last_os_error());
     }
-    Ok((
-        identity.dwVolumeSerialNumber,
-        identity.nFileIndexHigh,
-        identity.nFileIndexLow,
-    ))
+    Ok(information)
 }
 
 #[cfg(windows)]
@@ -469,6 +488,39 @@ mod file_identity_tests {
         ERROR_CALL_NOT_IMPLEMENTED, ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER,
         ERROR_NOT_SUPPORTED,
     };
+
+    #[test]
+    fn windows_file_information_rejects_invalid_handle() {
+        use windows_sys::Win32::Foundation::{ERROR_INVALID_HANDLE, INVALID_HANDLE_VALUE};
+
+        let error = super::query_windows_file_information(INVALID_HANDLE_VALUE)
+            .err()
+            .expect("a failed query must not return default single-link metadata");
+        assert_eq!(error.raw_os_error(), Some(ERROR_INVALID_HANDLE as i32));
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn windows_link_count_tracks_the_retained_file_after_path_replacement() {
+        use std::fs::{self, File};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("original.db");
+        let alias = dir.path().join("alias.db");
+        let displaced = dir.path().join("displaced.db");
+        fs::write(&path, b"original").expect("create original");
+        let retained = File::open(&path).expect("retain original handle");
+        assert_eq!(super::windows_file_link_count(&retained).unwrap(), 1);
+
+        fs::hard_link(&path, &alias).expect("create alias");
+        assert_eq!(super::windows_file_link_count(&retained).unwrap(), 2);
+
+        fs::rename(&path, &displaced).expect("displace original pathname");
+        fs::write(&path, b"replacement").expect("replace pathname");
+        let replacement = File::open(&path).expect("open replacement");
+        assert_eq!(super::windows_file_link_count(&retained).unwrap(), 2);
+        assert_eq!(super::windows_file_link_count(&replacement).unwrap(), 1);
+    }
 
     #[test]
     fn windows_identity_compares_all_file_id_bits() {

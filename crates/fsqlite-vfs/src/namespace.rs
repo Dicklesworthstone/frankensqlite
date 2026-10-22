@@ -1752,9 +1752,7 @@ fn cleanup_metadata_is_safe(metadata: &std::fs::Metadata) -> bool {
     {
         use std::os::windows::fs::MetadataExt as _;
         use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-            || metadata.number_of_links() != Some(1)
-        {
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             return false;
         }
     }
@@ -1782,6 +1780,15 @@ fn observe_cleanup_entry(path: &Path) -> CleanupEntryObservation {
     };
     if !cleanup_metadata_is_safe(&guard_metadata) {
         return CleanupEntryObservation::Unsafe;
+    }
+    #[cfg(windows)]
+    // Stable Rust exposes Windows link counts through the open-handle Win32
+    // query, not pathname metadata. Require proof from the no-follow guard
+    // that also supplies the identity retained throughout cleanup.
+    match crate::traits::windows_file_link_count(&guard) {
+        Ok(1) => {}
+        Ok(_) => return CleanupEntryObservation::Unsafe,
+        Err(_) => return CleanupEntryObservation::Unknown,
     }
     let Ok(Some(identity)) = FileIdentity::from_file(&guard) else {
         return CleanupEntryObservation::Unknown;
@@ -2322,7 +2329,7 @@ fn validate_secure_lock_file(
         use std::os::windows::fs::MetadataExt as _;
         use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
         if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-            || metadata.number_of_links() != Some(1)
+            || crate::traits::windows_file_link_count(file).map_err(|_| cannot_open(path))? != 1
         {
             return Err(cannot_open(path));
         }
@@ -2592,10 +2599,8 @@ fn validate_generation_path_identity(
 
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt as _;
-
         let file = open_identity_probe(database_path)?;
-        if file.metadata()?.number_of_links() != Some(1)
+        if crate::traits::windows_file_link_count(&file)? != 1
             || FileIdentity::from_file(&file)? != Some(expected_identity)
         {
             return Err(cannot_open(database_path));
@@ -3154,6 +3159,62 @@ mod tests {
         FileIdentity::from_file(&file)
             .expect("query test database identity")
             .expect("native filesystem identity")
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_single_link_checks_cover_cleanup_sidecars_and_generation() {
+        let dir = tempdir().expect("tempdir");
+        let database = dir.path().join("single-link.db");
+        let alias = dir.path().join("alias.db");
+        let identity = create_database(&database, b"owned");
+        let file = File::open(&database).expect("retain handle");
+
+        assert!(matches!(
+            observe_cleanup_entry(&database),
+            CleanupEntryObservation::Present { identity: observed, .. } if observed == identity
+        ));
+        validate_secure_lock_file(&database, &file, SidecarProvenance::CreatedNow)
+            .expect("single-link sidecar is admissible");
+        validate_generation_path_identity(&database, identity)
+            .expect("single-link generation is admissible");
+
+        fs::hard_link(&database, &alias).expect("create hard-link alias");
+        assert!(matches!(
+            observe_cleanup_entry(&database),
+            CleanupEntryObservation::Unsafe
+        ));
+        assert!(matches!(
+            validate_secure_lock_file(&database, &file, SidecarProvenance::CreatedNow),
+            Err(FrankenError::CannotOpen { .. })
+        ));
+        assert!(matches!(
+            validate_generation_path_identity(&database, identity),
+            Err(FrankenError::CannotOpen { .. })
+        ));
+        assert_eq!(fs::read(&database).unwrap(), b"owned");
+        assert_eq!(fs::read(&alias).unwrap(), b"owned");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_cleanup_refuses_an_unavailable_identity_probe() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        let dir = tempdir().expect("tempdir");
+        let database = dir.path().join("unavailable.db");
+        create_database(&database, b"owned");
+        let _exclusive_handle = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&database)
+            .expect("deny other handle opens");
+
+        assert!(matches!(
+            observe_cleanup_entry(&database),
+            CleanupEntryObservation::Unknown
+        ));
+        assert!(preflight_cleanup_entry(&database, database.clone()).is_err());
     }
 
     /// Subprocess endpoint: environment and kernel credentials are isolated
@@ -6142,6 +6203,27 @@ mod tests {
                 .iter()
                 .all(|path| path.exists()),
             "retry must preserve the namespace records without a fresh main proof"
+        );
+    }
+
+    #[test]
+    fn cleanup_rejects_hard_linked_companion_before_any_removal() {
+        let dir = tempdir().expect("tempdir");
+        let database = dir.path().join("hard-linked-companion.db");
+        let linked_ordinal = 0;
+        let (identity, paths) = seed_cleanup_fixture(&database, Some(linked_ordinal));
+        let target = dir.path().join("unrelated-target");
+        fs::write(&target, b"unrelated").expect("seed hard-link target");
+        fs::hard_link(&target, &paths[linked_ordinal]).expect("create companion hard link");
+
+        assert!(
+            cleanup_abandoned_private_database(&database, identity).is_err(),
+            "hard-linked companion preflight must fail closed"
+        );
+        assert_eq!(fs::read(&target).expect("read target"), b"unrelated");
+        assert!(
+            paths.iter().all(|path| path.exists()),
+            "preflight rejection must preserve every planned entry"
         );
     }
 
