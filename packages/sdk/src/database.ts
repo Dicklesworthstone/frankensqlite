@@ -4,6 +4,7 @@ import {
   resolvePreparedStatementLimits,
   resolveRequestLimits,
   resolveResultEncoding,
+  resolveResultLimits,
   resolveSnapshotOwnership,
   SnapshotOwnershipError,
 } from "@frankensqlite/worker";
@@ -220,8 +221,12 @@ export class FrankenDB {
       requestedStatementLimits === undefined
         ? undefined
         : resolvePreparedStatementLimits(requestedStatementLimits);
+    const requestedResultLimits = normalized.resultLimits;
+    const resultLimits = requestedResultLimits === undefined
+      ? undefined : resolveResultLimits(requestedResultLimits);
     const client = new FrankenWorkerClient(resolveWorker(normalized.worker), limits);
     const config: FrankenDbOpenOptions = {};
+    if (resultLimits !== undefined) config.resultLimits = resultLimits;
     if (ownership !== undefined) config.snapshotOwnership = ownership;
     if (statementLimits !== undefined) config.preparedStatementLimits = statementLimits;
     if (normalized.resultEncoding !== undefined) config.resultEncoding = resultEncoding;
@@ -332,6 +337,11 @@ export class FrankenDB {
   /** Acknowledged worker limits; null means an older worker supplied no policy. */
   get preparedStatementLimits(): Readonly<PreparedStatementLimits> | null {
     return this.#preparedStatementLimits;
+  }
+
+  /** Effective completed-result delivery limits; null means unbudgeted. */
+  get resultLimits() {
+    return this.#client.resultLimits;
   }
 
   /** Effective worker policy; individual noncanonical results may still fall back. */

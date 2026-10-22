@@ -1,6 +1,7 @@
 import { BindingError, isNamedBindings } from "./bindings";
 import type { InitConfig, SqlBindings, SqlScalar, WorkerRequest } from "./protocol";
 import { MAX_EXECUTE_MANY_ROWS } from "./protocol";
+import { resolveResultLimits } from "./result-budget";
 import { resolveResultEncoding } from "./result-codec";
 import { resolveSnapshotOwnership } from "./snapshot-ownership";
 import { resolvePreparedStatementLimits } from "./statement-budget";
@@ -227,6 +228,11 @@ function captureRequest(
       if (resultEncoding !== undefined) {
         config.resultEncoding = resolveResultEncoding(resultEncoding);
         text(config.resultEncoding);
+      }
+      const resultLimits = source.resultLimits;
+      if (resultLimits !== undefined) {
+        charge(64);
+        config.resultLimits = resolveResultLimits(resultLimits);
       }
       const statementLimits = source.preparedStatementLimits;
       if (statementLimits !== undefined) {

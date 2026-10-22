@@ -1,3 +1,4 @@
+import type { ResultLimits } from "./result-budget";
 import type { ResultEncoding } from "./result-codec";
 import type { SnapshotOwnership } from "./snapshot-ownership";
 import type { SnapshotMetadata } from "./snapshot-store";
@@ -51,6 +52,8 @@ export interface InitConfig {
   snapshot?: Uint8Array;
   /** Opt in to FQR1 transfer; unsupported result shapes still use structured clone. */
   resultEncoding?: ResultEncoding;
+  /** Opt-in completed-result budgets, independently of transport encoding. */
+  resultLimits?: Partial<ResultLimits>;
   /** Request retained-handle limits. The worker may enforce tighter ceilings. */
   preparedStatementLimits?: Partial<PreparedStatementLimits>;
 }
@@ -66,6 +69,8 @@ export interface InitResult {
   snapshot?: SnapshotMetadata | null;
   /** Absent on older workers, which only return structured-clone query results. */
   resultEncoding?: ResultEncoding;
+  /** Present only when the host enforces these completed-result limits. */
+  resultLimits?: Readonly<ResultLimits>;
   /** Absent on older workers: no prepared-resource policy was acknowledged. */
   preparedStatementLimits?: Readonly<PreparedStatementLimits>;
 }

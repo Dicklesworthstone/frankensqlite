@@ -19,7 +19,7 @@ export const DEFAULT_RESULT_LIMITS: Readonly<ResultLimits> = Object.freeze({
 export class ResultBudgetError extends Error {
   readonly transient = false;
   constructor(
-    readonly code: "ERR_FSQLITE_RESULT_LIMIT" | "ERR_FSQLITE_RESULT_INPUT" | "ERR_FSQLITE_RESULT_SHAPE",
+    readonly code: "ERR_FSQLITE_RESULT_LIMIT" | "ERR_FSQLITE_RESULT_INPUT" | "ERR_FSQLITE_RESULT_SHAPE" | "ERR_FSQLITE_RESULT_POLICY",
     message: string,
   ) {
     super(message);
@@ -165,4 +165,27 @@ export function enforceResultLimits(value: unknown, limits: Readonly<ResultLimit
     if (stack.length >= 64) invalid();
     stack.push(properties(item));
   }
+}
+
+/** An explicit request requires a complete acknowledgement, not local defaults. */
+export function captureResultLimitsAcknowledgement(
+  value: unknown,
+  requested?: Readonly<ResultLimits>,
+): Readonly<ResultLimits> | null {
+  if (value === undefined && requested === undefined) return null;
+  const reject = (): never => {
+    throw new ResultBudgetError("ERR_FSQLITE_RESULT_POLICY",
+      "The worker did not acknowledge resultLimits within the requested policy; use a matching worker before submitting SQL");
+  };
+  if (!object(value)) return reject();
+  const captured: Partial<ResultLimits> = {};
+  for (const key of ["maxRows", "maxCells", "maxBytes"] as const) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor === undefined || !Object.hasOwn(descriptor, "value") ||
+        typeof descriptor.value !== "number" || !Number.isSafeInteger(descriptor.value) ||
+        descriptor.value < 1 || descriptor.value > DEFAULT_RESULT_LIMITS[key] ||
+        (requested !== undefined && descriptor.value > requested[key])) return reject();
+    captured[key] = descriptor.value;
+  }
+  return resolveResultLimits(captured);
 }

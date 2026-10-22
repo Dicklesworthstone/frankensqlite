@@ -143,7 +143,8 @@ export class WorkerConnectionHost {
   readonly #budget: RequestBudget;
   #closePromise: Promise<WorkerResponse> | null = null;
   #resultEncoding: ResultEncoding = "structured-clone";
-  readonly #resultLimits: Readonly<ResultLimits> | null;
+  readonly #resultCeiling: Readonly<ResultLimits> | null;
+  #resultLimits: Readonly<ResultLimits> | null;
 
   constructor(
     loader: CoreModuleLoader = defaultCoreModuleLoader,
@@ -151,7 +152,8 @@ export class WorkerConnectionHost {
     statementLimits: Partial<PreparedStatementLimits> = {},
     resultLimits?: Partial<ResultLimits>,
   ) {
-    this.#resultLimits = resultLimits === undefined ? null : resolveResultLimits(resultLimits);
+    this.#resultCeiling = resultLimits === undefined ? null : resolveResultLimits(resultLimits);
+    this.#resultLimits = this.#resultCeiling;
     this.#loader = loader;
     this.#budget = new RequestBudget(limits);
     this.#statementBudget = new PreparedStatementBudget(statementLimits);
@@ -482,6 +484,16 @@ export class WorkerConnectionHost {
       );
     }
     const resultEncoding = resolveResultEncoding(config.resultEncoding);
+    const requestedResults = config.resultLimits === undefined
+      ? this.#resultCeiling : resolveResultLimits(config.resultLimits);
+    // A caller may tighten a host ceiling, never raise or disable it. Stage
+    // the policy with the candidate: failed replacement leaves the old session
+    // and its limits intact, just like its statement budget and encoding.
+    const stagedResultLimits = requestedResults === null ? null : Object.freeze({
+      maxRows: Math.min(requestedResults.maxRows, this.#resultCeiling?.maxRows ?? requestedResults.maxRows),
+      maxCells: Math.min(requestedResults.maxCells, this.#resultCeiling?.maxCells ?? requestedResults.maxCells),
+      maxBytes: Math.min(requestedResults.maxBytes, this.#resultCeiling?.maxBytes ?? requestedResults.maxBytes),
+    });
     const requestedStatements =
       config.preparedStatementLimits === undefined
         ? this.#statementCeiling
@@ -582,6 +594,7 @@ export class WorkerConnectionHost {
       stagedLease = null;
       this.#snapshotRevision = saved?.revision ?? null;
       this.#resultEncoding = resultEncoding;
+      this.#resultLimits = stagedResultLimits;
       this.#statementBudget = stagedStatementBudget;
       this.#observeLease();
       return {
@@ -592,6 +605,7 @@ export class WorkerConnectionHost {
           persistence: resolvePersistenceMode(config.persistence),
           resultEncoding,
           preparedStatementLimits: stagedStatementBudget.limits,
+          ...(stagedResultLimits === null ? {} : { resultLimits: stagedResultLimits }),
           ...(this.#snapshotLease === null ? {} : { snapshotOwnership: this.#snapshotLease.mode }),
           ...(isSnapshotPersistenceMode(ready.persistence)
             ? { snapshot: saved, checkpointRecovery: 1 as const }

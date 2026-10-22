@@ -11,6 +11,7 @@ import type {
   RequestLimits,
   RequestQueueStats,
   ResultEncoding,
+  ResultLimits,
   SnapshotMetadata,
   SnapshotOwnership,
   SqlBindings,
@@ -21,6 +22,7 @@ import type {
 } from "@frankensqlite/worker";
 import {
   BindingError,
+  captureResultLimitsAcknowledgement,
   decodeQueryResult,
   isSnapshotPersistenceMode,
   RequestAdmissionError,
@@ -28,6 +30,7 @@ import {
   ResultCodecError,
   resolveBindings,
   resolveResultEncoding,
+  resolveResultLimits,
   resolveSnapshotOwnership,
   SnapshotOwnershipError,
 } from "@frankensqlite/worker";
@@ -76,6 +79,7 @@ export class FrankenWorkerClient {
   #closePromise: Promise<void> | null = null;
   #resultEncoding: ResultEncoding = "structured-clone";
   #snapshotOwnership: SnapshotOwnership | null = null;
+  #resultLimits: Readonly<ResultLimits> | null = null;
 
   readonly #onMessage = (event: WorkerMessageEvent): void => {
     if (this.#disposed) return;
@@ -187,6 +191,11 @@ export class FrankenWorkerClient {
     return this.#resultEncoding;
   }
 
+  /** Acknowledged completed-result policy, not an engine-memory limit. */
+  get resultLimits(): Readonly<ResultLimits> | null {
+    return this.#resultLimits;
+  }
+
   get snapshotOwnership(): SnapshotOwnership | null {
     return this.#snapshotOwnership;
   }
@@ -290,6 +299,9 @@ export class FrankenWorkerClient {
     // Capture caller-owned getters before transport dispatch. A later mutation
     // cannot change which database/persistence acknowledgement is acceptable.
     const captured = { ...config };
+    const requestedResults = captured.resultLimits === undefined
+      ? undefined : resolveResultLimits(captured.resultLimits);
+    if (requestedResults !== undefined) captured.resultLimits = requestedResults;
     const requested = resolveResultEncoding(captured.resultEncoding);
     const persistence = captured.persistence ?? "memory";
     const ownership = resolveSnapshotOwnership(captured.snapshotOwnership);
@@ -348,6 +360,15 @@ export class FrankenWorkerClient {
         message: "Worker enabled a result encoding that was not requested",
       });
     }
+    let effectiveResults: Readonly<ResultLimits> | null;
+    try {
+      effectiveResults = captureResultLimitsAcknowledgement(ready.resultLimits, requestedResults);
+    } catch (cause: unknown) {
+      const error = cause instanceof Error ? cause : new Error("Invalid result policy", { cause });
+      this.#failTransport(error, true);
+      throw error;
+    }
+    this.#resultLimits = effectiveResults;
     // An older worker may omit the acknowledgement and keep structured clone.
     this.#resultEncoding = accepted;
     this.#snapshotOwnership = held ?? null;
@@ -893,6 +914,7 @@ function captureResponse(
         "checkpointRecovery",
         "preparedStatementLimits",
         "resultEncoding",
+        "resultLimits",
         "snapshotOwnership",
       ]) {
         const value = field(key);
