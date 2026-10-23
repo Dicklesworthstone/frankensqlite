@@ -10709,6 +10709,9 @@ const AGGREGATE_FUNCTIONS: &[&str] = &[
     // arity is rejected downstream by `find_aggregate`.
     "json_group_array",
     "json_group_object",
+    // Geopoly's bounding-box aggregate (fsqlite-ext-rtree); also without a
+    // scalar overload, and unresolvable when the extension is not built.
+    "geopoly_group_bbox",
     "max",
     "min",
     "sum",
@@ -10937,7 +10940,7 @@ fn custom_aggregate_overrides_builtin(name: &str, arity: i32) -> bool {
     let builtin_has_exact_arity = (name.eq_ignore_ascii_case("count") && matches!(arity, 0 | 1))
         || (name.eq_ignore_ascii_case("string_agg") && arity == 2)
         || (arity == 1
-            && ["avg", "max", "median", "min", "sum", "total"]
+            && ["avg", "geopoly_group_bbox", "max", "median", "min", "sum", "total"]
                 .iter()
                 .any(|builtin| name.eq_ignore_ascii_case(builtin)))
         || (arity == 2

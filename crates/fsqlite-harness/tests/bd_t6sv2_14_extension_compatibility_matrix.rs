@@ -597,20 +597,21 @@ fn connection_runtime_wired_extension_surfaces_dispatch_through_connection_path(
         let geopoly_rows = conn
             .query(
                 "SELECT \
-                geopoly_json(geopoly_blob('[[0,0],[2,0],[2,2],[0,2]]')), \
-                geopoly_svg('[[0,0],[2,0],[2,2],[0,2]]'), \
-                geopoly_area('[[0,0],[2,0],[2,2],[0,2]]'), \
-                geopoly_overlap('[[0,0],[2,0],[2,2],[0,2]]', '[[1,1],[3,1],[3,3],[1,3]]'), \
-                geopoly_within('[[0.5,0.5],[1.5,0.5],[1.5,1.5],[0.5,1.5]]', '[[0,0],[2,0],[2,2],[0,2]]');",
+                geopoly_json(geopoly_blob('[[0,0],[2,0],[2,2],[0,2],[0,0]]')), \
+                geopoly_svg('[[0,0],[2,0],[2,2],[0,2],[0,0]]'), \
+                geopoly_area('[[0,0],[2,0],[2,2],[0,2],[0,0]]'), \
+                geopoly_overlap('[[0,0],[2,0],[2,2],[0,2],[0,0]]', '[[1,1],[3,1],[3,3],[1,3],[1,1]]'), \
+                geopoly_within('[[0.5,0.5],[1.5,0.5],[1.5,1.5],[0.5,1.5],[0.5,0.5]]', '[[0,0],[2,0],[2,2],[0,2],[0,0]]');",
             )
             .await
             .expect("Geopoly scalar functions should dispatch through the connection path");
         assert_eq!(geopoly_rows.len(), 1);
+        // Stock 3.53.2 with SQLITE_ENABLE_GEOPOLY gives exactly these.
         assert_eq!(
             geopoly_rows[0].values(),
             &[
-                SqliteValue::Text("[[0,0],[2,0],[2,2],[0,2],[0,0]]".into()),
-                SqliteValue::Text("M 0 0 L 2 0 L 2 2 L 0 2 Z".into()),
+                SqliteValue::Text("[[0.0,0.0],[2.0,0.0],[2.0,2.0],[0.0,2.0],[0.0,0.0]]".into()),
+                SqliteValue::Text("<polyline points='0,0 2,0 2,2 0,2 0,0'></polyline>".into()),
                 SqliteValue::Float(4.0),
                 SqliteValue::Integer(1),
                 SqliteValue::Integer(1),

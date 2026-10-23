@@ -1,0 +1,393 @@
+> SELECT geopoly_json('[[0,0],[1,0],[1,1],[0,0]]');
+[[0.0,0.0],[1.0,0.0],[1.0,1.0],[0.0,0.0]]
+> SELECT geopoly_json('[[0,0],[2,0],[2,2],[0,2]]');
+N
+> SELECT geopoly_json('[[0,0],[1,0],[0,0]]');
+N
+> SELECT geopoly_json(' [ [0 , 0] , [1,0],[1,1],[0,0] ] ');
+[[0.0,0.0],[1.0,0.0],[1.0,1.0],[0.0,0.0]]
+> SELECT geopoly_json('[[0,0],[1,0],[1,1],[0,0]] x');
+N
+> SELECT geopoly_json('[[0.5,1e2],[-1.25,0],[3E-1,2],[0.5,1e2]]');
+[[0.5,100.0],[-1.25,0.0],[0.3,2.0],[0.5,100.0]]
+> SELECT geopoly_json('[[01,0],[1,0],[1,1],[01,0]]');
+N
+> SELECT geopoly_json('[[.5,0],[1,0],[1,1],[.5,0]]');
+[[0.5,0.0],[1.0,0.0],[1.0,1.0],[0.5,0.0]]
+> SELECT geopoly_json('[[-.5,0],[1,0],[1,1],[-.5,0]]');
+N
+> SELECT geopoly_json('[[5.,0],[1,0],[1,1],[5.,0]]');
+N
+> SELECT geopoly_json('[[+1,0],[1,0],[1,1],[+1,0]]');
+N
+> SELECT geopoly_json('[[1e,0],[1,0],[1,1],[1e,0]]');
+N
+> SELECT geopoly_json('[[1e+2,0],[1,0],[1,1],[1e+2,0]]');
+[[100.0,0.0],[1.0,0.0],[1.0,1.0],[100.0,0.0]]
+> SELECT geopoly_json('[[0,0,9],[1,0,9],[1,1],[0,0]]');
+[[0.0,0.0],[1.0,0.0],[1.0,1.0],[0.0,0.0]]
+> SELECT geopoly_json('[[0],[1,0],[1,1],[0]]');
+N
+> SELECT geopoly_json('[[0.1,0.2],[1,0],[1,1],[0.1,0.2]]');
+[[0.1,0.2],[1.0,0.0],[1.0,1.0],[0.1,0.2]]
+> SELECT geopoly_json('[[1e20,1e-7],[123456789,0.000123456],[1,1],[1e20,1e-7]]');
+[[1.0e+20,1.0e-07],[1.23457e+08,0.000123456],[1.0,1.0],[1.0e+20,1.0e-07]]
+> SELECT geopoly_json('[[-0,0],[1,0],[1,1],[-0,0]]');
+[[0.0,0.0],[1.0,0.0],[1.0,1.0],[0.0,0.0]]
+> SELECT geopoly_json('[[1234565,0.1234565],[1,0],[1,1],[1234565,0.1234565]]');
+[[1.23457e+06,0.123457],[1.0,0.0],[1.0,1.0],[1.23457e+06,0.123457]]
+> SELECT geopoly_json('[[0.1,0],[1,0],[1,1],[0.10000000001,0]]');
+[[0.1,0.0],[1.0,0.0],[1.0,1.0],[0.1,0.0]]
+> SELECT geopoly_json('[]');
+N
+> SELECT geopoly_json('[[0,0],[1,0],[1,1],[0,0],]');
+[[0.0,0.0],[1.0,0.0],[1.0,1.0],[0.0,0.0]]
+> SELECT geopoly_json('[[0,0],[1,0],[1,1],[0,0]');
+N
+> SELECT geopoly_json('junk');
+N
+> SELECT geopoly_json(5);
+N
+> SELECT geopoly_json(5.5);
+N
+> SELECT geopoly_json(NULL);
+N
+> SELECT geopoly_json(X'00');
+N
+> SELECT geopoly_svg('[[0,0],[1,0],[1,1],[0,0]]');
+<polyline points='0,0 1,0 1,1 0,0'></polyline>
+> SELECT geopoly_svg('[[0,0],[1,0],[1,1],[0,0]]', 'style="fill:red"', NULL, '', 5, 1.5, 'id="x"');
+<polyline points='0,0 1,0 1,1 0,0' style="fill:red" 5 1.5 id="x"></polyline>
+> SELECT geopoly_svg('[[1e20,1e-7],[123456789,0.000123456],[1,1],[1e20,1e-7]]');
+<polyline points='1e+20,1e-07 1.23457e+08,0.000123456 1,1 1e+20,1e-07'></polyline>
+> SELECT geopoly_svg('[[0.1,-2.5],[1,0],[1,1],[0.1,-2.5]]');
+<polyline points='0.1,-2.5 1,0 1,1 0.1,-2.5'></polyline>
+> SELECT geopoly_svg('junk');
+N
+> SELECT geopoly_svg(NULL, 'a');
+N
+> SELECT typeof(geopoly_svg('[[0,0],[1,0],[1,1],[0,0]]'));
+text
+> SELECT geopoly_area('[[0,0],[1,0],[1,1],[0,1],[0,0]]');
+1.0
+> SELECT geopoly_area('[[0,0],[0,1],[1,1],[1,0],[0,0]]');
+-1.0
+> SELECT geopoly_area('[[0.1,0.1],[0.7,0.2],[0.3,0.9],[0.1,0.1]]');
+0.23000001162290573
+> SELECT geopoly_area('[[1e7,1e7],[1.0000001e7,1e7],[1e7,1.0000003e7],[1e7,1e7]]');
+2.0
+> SELECT geopoly_area('junk'), geopoly_area(NULL), geopoly_area(1);
+N|N|N
+> SELECT typeof(geopoly_area('[[0,0],[1,0],[1,1],[0,0]]'));
+real
+> SELECT hex(geopoly_blob('[[0,0],[1,0],[1,1],[0,0]]'));
+0100000300000000000000000000803F000000000000803F0000803F
+> SELECT hex(geopoly_blob('[[0.1,-2.5],[1,0],[1,1],[0.1,-2.5]]'));
+01000003CDCCCC3D000020C00000803F000000000000803F0000803F
+> SELECT typeof(geopoly_blob('[[0,0],[1,0],[1,1],[0,0]]'));
+blob
+> SELECT geopoly_json(X'0100000300000000000000000000803F000000000000803F0000803F');
+[[0.0,0.0],[1.0,0.0],[1.0,1.0],[0.0,0.0]]
+> SELECT geopoly_json(X'000000033F80000000000000000000003F8000003F80000000000000');
+[[1.0,0.0],[0.0,1.0],[1.0,0.0],[1.0,0.0]]
+> SELECT geopoly_json(X'470300000000000000000000000000803F000000000000803F0000803F');
+N
+> SELECT geopoly_json(X'010000030000000000000000000000803F000000000000803F0000803F');
+N
+> SELECT geopoly_json(X'010000040000000000000000000000803F000000000000803F0000803F');
+N
+> SELECT geopoly_json(X'0100000200000000000000000000803F00000000');
+N
+> SELECT geopoly_json(X'020000030000000000000000000000803F000000000000803F0000803F');
+N
+> SELECT hex(geopoly_blob(X'000000033F80000000000000000000003F8000003F80000000000000'));
+010000030000803F00000000000000000000803F0000803F00000000
+> SELECT geopoly_json(geopoly_bbox('[[0,0],[2,0],[1,3],[0,0]]'));
+[[0.0,0.0],[2.0,0.0],[2.0,3.0],[0.0,3.0],[0.0,0.0]]
+> SELECT geopoly_json(geopoly_bbox('[[5,-1],[2,7],[-3,0.5],[5,-1]]'));
+[[-3.0,-1.0],[5.0,-1.0],[5.0,7.0],[-3.0,7.0],[-3.0,-1.0]]
+> SELECT geopoly_bbox(NULL), geopoly_bbox('junk'), geopoly_bbox(3);
+N|N|N
+> SELECT hex(geopoly_bbox('[[0,0],[2,0],[1,3],[0,0]]'));
+010000040000000000000000000000400000000000000040000040400000000000004040
+> SELECT geopoly_contains_point('[[0,0],[2,0],[2,2],[0,2],[0,0]]', 1, 1);
+2
+> SELECT geopoly_contains_point('[[0,0],[2,0],[2,2],[0,2],[0,0]]', 2, 1);
+1
+> SELECT geopoly_contains_point('[[0,0],[2,0],[2,2],[0,2],[0,0]]', 0, 0);
+1
+> SELECT geopoly_contains_point('[[0,0],[2,0],[2,2],[0,2],[0,0]]', 1, 0);
+1
+> SELECT geopoly_contains_point('[[0,0],[2,0],[2,2],[0,2],[0,0]]', 0, 1);
+1
+> SELECT geopoly_contains_point('[[0,0],[2,0],[2,2],[0,2],[0,0]]', 3, 1);
+0
+> SELECT geopoly_contains_point('[[0,0],[2,0],[2,2],[0,2],[0,0]]', 1, 3);
+0
+> SELECT geopoly_contains_point('[[0,0],[2,0],[2,2],[0,2],[0,0]]', '1.5', '0.5');
+2
+> SELECT geopoly_contains_point('[[0,0],[2,0],[2,2],[0,2],[0,0]]', NULL, NULL);
+1
+> SELECT geopoly_contains_point('[[0,0],[2,0],[2,2],[0,2],[0,0]]', 'abc', 1);
+1
+> SELECT geopoly_contains_point('[[0,0],[4,0],[4,4],[2,1],[0,4],[0,0]]', 2, 3);
+0
+> SELECT geopoly_contains_point('[[0,0],[4,0],[4,4],[2,1],[0,4],[0,0]]', 2, 0.5);
+2
+> SELECT geopoly_contains_point('[[0,0],[4,0],[4,4],[2,1],[0,4],[0,0]]', 2, 1);
+1
+> SELECT geopoly_contains_point('[[0,0],[4,0],[4,4],[2,1],[0,4],[0,0]]', 3, 2.5);
+1
+> SELECT geopoly_contains_point('junk', 1, 1), geopoly_contains_point(NULL, 1, 1);
+N|N
+> SELECT geopoly_overlap('[[0,0],[1,0],[1,1],[0,1],[0,0]]', '[[2,2],[3,2],[3,3],[2,3],[2,2]]');
+0
+> SELECT geopoly_overlap('[[0,0],[2,0],[2,2],[0,2],[0,0]]', '[[1,1],[3,1],[3,3],[1,3],[1,1]]');
+1
+> SELECT geopoly_overlap('[[1,1],[2,1],[2,2],[1,2],[1,1]]', '[[0,0],[3,0],[3,3],[0,3],[0,0]]');
+2
+> SELECT geopoly_overlap('[[0,0],[3,0],[3,3],[0,3],[0,0]]', '[[1,1],[2,1],[2,2],[1,2],[1,1]]');
+3
+> SELECT geopoly_overlap('[[0,0],[3,0],[3,3],[0,3],[0,0]]', '[[0,0],[3,0],[3,3],[0,3],[0,0]]');
+4
+> SELECT geopoly_overlap('[[0,0],[1,0],[1,1],[0,1],[0,0]]', '[[1,0],[2,0],[2,1],[1,1],[1,0]]');
+0
+> SELECT geopoly_overlap('[[0,0],[1,0],[1,1],[0,1],[0,0]]', '[[1,1],[2,1],[2,2],[1,2],[1,1]]');
+0
+> SELECT geopoly_overlap('[[0,0],[4,0],[0,4],[0,0]]', '[[1,1],[2,1],[1,2],[1,1]]');
+3
+> SELECT geopoly_overlap('[[0,0],[4,0],[4,4],[2,1],[0,4],[0,0]]', '[[1.5,2],[2.5,2],[2.5,3],[1.5,3],[1.5,2]]');
+0
+> SELECT geopoly_overlap('junk', '[[0,0],[1,0],[1,1],[0,0]]'), geopoly_overlap(NULL, NULL);
+N|N
+> SELECT geopoly_within('[[1,1],[2,1],[2,2],[1,2],[1,1]]', '[[0,0],[3,0],[3,3],[0,3],[0,0]]');
+1
+> SELECT geopoly_within('[[0,0],[3,0],[3,3],[0,3],[0,0]]', '[[1,1],[2,1],[2,2],[1,2],[1,1]]');
+0
+> SELECT geopoly_within('[[0,0],[3,0],[3,3],[0,3],[0,0]]', '[[0,0],[3,0],[3,3],[0,3],[0,0]]');
+2
+> SELECT geopoly_within('[[0,0],[2,0],[2,2],[0,2],[0,0]]', '[[1,1],[3,1],[3,3],[1,3],[1,1]]');
+0
+> SELECT geopoly_within('[[0,0],[1,0],[1,1],[0,1],[0,0]]', '[[2,2],[3,2],[3,3],[2,3],[2,2]]');
+0
+> SELECT geopoly_within('[[0.5,0.5],[1.5,0.5],[1.5,1.5],[0.5,1.5],[0.5,0.5]]', '[[0,0],[2,0],[2,2],[0,2],[0,0]]');
+1
+> SELECT geopoly_within(NULL, '[[0,0],[1,0],[1,1],[0,0]]');
+N
+> SELECT geopoly_json(geopoly_ccw('[[0,0],[0,1],[1,1],[1,0],[0,0]]'));
+[[0.0,0.0],[1.0,0.0],[1.0,1.0],[0.0,1.0],[0.0,0.0]]
+> SELECT geopoly_json(geopoly_ccw('[[0,0],[1,0],[1,1],[0,1],[0,0]]'));
+[[0.0,0.0],[1.0,0.0],[1.0,1.0],[0.0,1.0],[0.0,0.0]]
+> SELECT geopoly_json(geopoly_ccw('[[5,5],[5,6],[6,6],[6,5],[7,4],[5,5]]'));
+[[5.0,5.0],[7.0,4.0],[6.0,5.0],[6.0,6.0],[5.0,6.0],[5.0,5.0]]
+> SELECT geopoly_ccw('junk');
+N
+> SELECT geopoly_json(geopoly_regular(0,0,1,4));
+[[1.00007,0.0],[0.0,1.00007],[-1.00007,0.0],[0.0,-1.00007],[1.00007,0.0]]
+> SELECT geopoly_json(geopoly_regular(1,2,3,5));
+[[4.0002,2.0],[1.92685,4.85313],[-1.42725,3.7633],[-1.42725,0.236696],[1.92685,-0.853126],[4.0002,2.0]]
+> SELECT geopoly_json(geopoly_regular(0,0,1,3));
+[[1.00007,0.0],[-0.499953,0.866088],[-0.499953,-0.866088],[1.00007,0.0]]
+> SELECT geopoly_svg(geopoly_regular(10,10,5,6));
+<polyline points='15.0003,10 12.4998,14.3304 7.50023,14.3304 4.99966,10 7.50023,5.66956 12.4998,5.66956 15.0003,10'></polyline>
+> SELECT geopoly_regular(0,0,1,2), geopoly_regular(0,0,0,4), geopoly_regular(0,0,-1,4);
+N|N|N
+> SELECT length(geopoly_regular(0,0,1,2000)), length(geopoly_regular(0,0,1,1000));
+8004|8004
+> SELECT geopoly_json(geopoly_regular('1','2','3','4.9'));
+[[4.0002,2.0],[1.0,5.0002],[-2.0002,2.0],[1.0,-1.0002],[4.0002,2.0]]
+> SELECT geopoly_json(geopoly_regular(0,0,1,4.9));
+[[1.00007,0.0],[0.0,1.00007],[-1.00007,0.0],[0.0,-1.00007],[1.00007,0.0]]
+> SELECT hex(geopoly_regular(0,0,1,4));
+010000043502803F00000000000000003502803F350280BF0000000000000000350280BF
+> SELECT geopoly_json(geopoly_xform('[[0,0],[1,0],[1,1],[0,0]]', 1, 0, 0, 1, 5, -3));
+[[5.0,-3.0],[6.0,-3.0],[6.0,-2.0],[5.0,-3.0]]
+> SELECT geopoly_json(geopoly_xform('[[0,0],[1,0],[1,1],[0,0]]', 0, 1, -1, 0, 0, 0));
+[[0.0,0.0],[0.0,-1.0],[1.0,-1.0],[0.0,0.0]]
+> SELECT geopoly_json(geopoly_xform('[[0.1,0.2],[1,0],[1,1],[0.1,0.2]]', 3, 0.5, 0.25, 7, 0.1, 0.3));
+[[0.5,1.725],[3.1,0.55],[3.6,7.55],[0.5,1.725]]
+> SELECT geopoly_json(geopoly_xform('[[0,0],[1,0],[1,1],[0,0]]', NULL, 'x', 2, 2, 0, 0));
+[[0.0,0.0],[0.0,2.0],[0.0,4.0],[0.0,0.0]]
+> SELECT geopoly_xform('junk', 1, 0, 0, 1, 0, 0);
+N
+> SELECT geopoly_debug(1);
+N
+> SELECT geopoly_json();
+ERROR: wrong number of arguments to function geopoly_json()
+> SELECT geopoly_contains_point('[[0,0],[1,0],[1,1],[0,0]]', 1);
+ERROR: wrong number of arguments to function geopoly_contains_point()
+> SELECT geopoly_svg();
+N
+> SELECT geopoly_json(geopoly_blob('[[0,0],[2,0],[2,2],[0,2],[0,0]]')), geopoly_svg('[[0,0],[2,0],[2,2],[0,2],[0,0]]'), geopoly_area('[[0,0],[2,0],[2,2],[0,2],[0,0]]'), geopoly_overlap('[[0,0],[2,0],[2,2],[0,2],[0,0]]', '[[1,1],[3,1],[3,3],[1,3],[1,1]]'), geopoly_within('[[0.5,0.5],[1.5,0.5],[1.5,1.5],[0.5,1.5],[0.5,0.5]]', '[[0,0],[2,0],[2,2],[0,2],[0,0]]');
+[[0.0,0.0],[2.0,0.0],[2.0,2.0],[0.0,2.0],[0.0,0.0]]|<polyline points='0,0 2,0 2,2 0,2 0,0'></polyline>|4.0|1|1
+> SELECT geopoly_json(geopoly_group_bbox(column1)) FROM (VALUES ('[[0,0],[1,0],[1,1],[0,0]]'),('[[2,2],[3,2],[3,5],[2,2]]'));
+[[0.0,0.0],[3.0,0.0],[3.0,5.0],[0.0,5.0],[0.0,0.0]]
+> SELECT geopoly_json(geopoly_group_bbox(column1)) FROM (VALUES ('[[5,5],[6,5],[6,6],[5,5]]'),('junk'));
+[[0.0,0.0],[6.0,0.0],[6.0,6.0],[0.0,6.0],[0.0,0.0]]
+> SELECT geopoly_json(geopoly_group_bbox(column1)) FROM (VALUES ('[[5,5],[6,5],[6,6],[5,5]]'),(NULL),('[[0,0],[1,0]]'),(7));
+[[5.0,5.0],[6.0,5.0],[6.0,6.0],[5.0,6.0],[5.0,5.0]]
+> SELECT geopoly_json(geopoly_group_bbox(column1)) FROM (VALUES ('[[5,5],[6,5],[6,6],[5,5]]'),(X'470300000000000000000000000000803F000000000000803F0000803F'));
+[[0.0,0.0],[6.0,0.0],[6.0,6.0],[0.0,6.0],[0.0,0.0]]
+> SELECT geopoly_json(geopoly_group_bbox(column1)) FROM (VALUES ('[[5,5],[6,5],[6,6],[5,5]]'),(X'0011'));
+[[5.0,5.0],[6.0,5.0],[6.0,6.0],[5.0,6.0],[5.0,5.0]]
+> SELECT geopoly_json(geopoly_group_bbox(column1)) FROM (VALUES ('[[5,5],[6,5],[6,6],[5,5]]'),('[[9,9],[8,8]'));
+[[5.0,5.0],[6.0,5.0],[6.0,6.0],[5.0,6.0],[5.0,5.0]]
+> SELECT geopoly_group_bbox(column1) FROM (VALUES (NULL),(7));
+N
+> SELECT geopoly_group_bbox(column1) FROM (VALUES ('[[0,0],[1,0],[1,1],[0,0]]')) WHERE 0;
+N
+> SELECT typeof(geopoly_group_bbox(column1)) FROM (VALUES ('[[0,0],[1,0],[1,1],[0,0]]'));
+blob
+> SELECT hex(geopoly_group_bbox(column1)) FROM (VALUES ('[[0,0],[1,0],[1,1],[0,0]]'),('[[-1,0.5],[0,0],[0,0.25],[-1,0.5]]'));
+01000004000080BF000000000000803F000000000000803F0000803F000080BF0000803F
+> SELECT g, geopoly_json(geopoly_group_bbox(p)) FROM (SELECT 1 AS g, '[[0,0],[1,0],[1,1],[0,0]]' AS p UNION ALL SELECT 1, '[[4,4],[5,4],[5,5],[4,4]]' UNION ALL SELECT 2, '[[7,7],[8,7],[8,8],[7,7]]') GROUP BY g ORDER BY g;
+1|[[0.0,0.0],[5.0,0.0],[5.0,5.0],[0.0,5.0],[0.0,0.0]]
+2|[[7.0,7.0],[8.0,7.0],[8.0,8.0],[7.0,8.0],[7.0,7.0]]
+> SELECT geopoly_svg('[[0,0],[1,0],[1,1],[0,0]]', X'616263');
+<polyline points='0,0 1,0 1,1 0,0' abc></polyline>
+> SELECT geopoly_svg(geopoly_blob('[[0,0],[1,0],[1,1],[0,0]]'), 'class=a');
+<polyline points='0,0 1,0 1,1 0,0' class=a></polyline>
+> SELECT geopoly_json('[[1e40,0],[1,0],[1,1],[1e40,0]]');
+[[Inf,0.0],[1.0,0.0],[1.0,1.0],[Inf,0.0]]
+> SELECT geopoly_json('[[1e-50,0],[1,0],[1,1],[1e-50,0]]');
+[[0.0,0.0],[1.0,0.0],[1.0,1.0],[0.0,0.0]]
+> SELECT geopoly_json('[[3.4e38,-3.4e38],[1,0],[1,1],[3.4e38,-3.4e38]]');
+[[3.4e+38,-3.4e+38],[1.0,0.0],[1.0,1.0],[3.4e+38,-3.4e+38]]
+> SELECT geopoly_svg('[[1e40,0],[1,0],[1,1],[1e40,0]]');
+<polyline points='Inf,0 1,0 1,1 Inf,0'></polyline>
+> SELECT geopoly_json('[[0.000012345,99999.95],[1,0],[1,1],[0.000012345,99999.95]]');
+[[1.2345e-05,100000.0],[1.0,0.0],[1.0,1.0],[1.2345e-05,100000.0]]
+> SELECT geopoly_svg('[[0.000012345,99999.95],[1,0],[1,1],[0.000012345,99999.95]]');
+<polyline points='1.2345e-05,100000 1,0 1,1 1.2345e-05,100000'></polyline>
+> SELECT geopoly_json('[[1,2],[3,4],[5,6]	,[1,2]]');
+[[1.0,2.0],[3.0,4.0],[5.0,6.0],[1.0,2.0]]
+> SELECT geopoly_json('[[1,2],[3,4],[5,6],[1,2]]  ');
+[[1.0,2.0],[3.0,4.0],[5.0,6.0],[1.0,2.0]]
+> SELECT geopoly_json('[[1,2] [3,4],[5,6],[1,2]]');
+N
+> SELECT geopoly_json('[[1,2],,[3,4],[5,6],[1,2]]');
+N
+> SELECT geopoly_json('[[1,2,],[3,4],[5,6],[1,2]]');
+N
+> SELECT geopoly_json('[[1,2,3,4],[3,4],[5,6],[1,2]]');
+[[1.0,2.0],[3.0,4.0],[5.0,6.0],[1.0,2.0]]
+> SELECT geopoly_json('[[1,2],[3,4],[5,6],[1,2],[7,8],[1,2]]');
+[[1.0,2.0],[3.0,4.0],[5.0,6.0],[1.0,2.0],[7.0,8.0],[1.0,2.0]]
+> SELECT geopoly_json('[[-0.0,1],[3,4],[5,6],[0,1]]');
+[[0.0,1.0],[3.0,4.0],[5.0,6.0],[0.0,1.0]]
+> SELECT geopoly_json('[[1.5e+00,1],[3,4],[5,6],[1.5,1]]');
+[[1.5,1.0],[3.0,4.0],[5.0,6.0],[1.5,1.0]]
+> SELECT geopoly_json('[[1.5e1.2,1],[3,4],[5,6],[1.5,1]]');
+N
+> SELECT geopoly_json('[[1ee2,1],[3,4],[5,6],[1ee2,1]]');
+N
+> SELECT geopoly_json('[[1.2.3,1],[3,4],[5,6],[1.2.3,1]]');
+N
+> SELECT geopoly_json('[[-,1],[3,4],[5,6],[-,1]]');
+N
+> SELECT geopoly_json('[[0x10,1],[3,4],[5,6],[0x10,1]]');
+N
+> SELECT geopoly_json('[[00,1],[3,4],[5,6],[00,1]]');
+N
+> SELECT geopoly_json('[[-01,1],[3,4],[5,6],[-01,1]]');
+N
+> SELECT geopoly_json('[[0.,1],[3,4],[5,6],[0.,1]]');
+N
+> SELECT geopoly_json('[[1E5,1],[3,4],[5,6],[1E5,1]]');
+[[100000.0,1.0],[3.0,4.0],[5.0,6.0],[100000.0,1.0]]
+> SELECT geopoly_area('[[0,0],[1,0],[0,0],[0,0]]');
+0.0
+> SELECT geopoly_area(geopoly_regular(0,0,1,1000));
+3.1415552175596133
+> SELECT geopoly_area(geopoly_regular(3,4,2.5,7));
+17.102835416793823
+> SELECT geopoly_contains_point(geopoly_regular(0,0,1,8), 0.5, 0.5), geopoly_contains_point(geopoly_regular(0,0,1,8), 1.00007, 0);
+2|0
+> SELECT geopoly_overlap(geopoly_regular(0,0,1,8), geopoly_regular(0.5,0.5,1,5)), geopoly_overlap(geopoly_regular(0,0,1,8), geopoly_regular(0,0,0.5,5));
+1|3
+> SELECT geopoly_within(geopoly_regular(0,0,0.5,5), geopoly_regular(0,0,1,8)), geopoly_within(geopoly_regular(0,0,1,8), geopoly_regular(0,0,1,8));
+1|2
+> SELECT geopoly_json(geopoly_ccw(geopoly_xform(geopoly_regular(0,0,1,5), 1, 0, 0, -1, 0, 0)));
+[[1.00007,0.0],[0.30895,0.951042],[-0.809084,0.587768],[-0.809084,-0.587768],[0.30895,-0.951042],[1.00007,0.0]]
+> SELECT geopoly_area(geopoly_xform(geopoly_regular(0,0,1,5), 1, 0, 0, -1, 0, 0));
+-2.377722978591919
+> SELECT geopoly_json(geopoly_xform('[[0.3,0.7],[1,0],[1,1],[0.3,0.7]]', 0.1, 0.2, 0.3, 0.4, 0.5, 0.6));
+[[0.67,0.97],[0.6,0.9],[0.8,1.3],[0.67,0.97]]
+> SELECT geopoly_json(geopoly_xform('[[0,0],[1,0],[1,1],[0,0]]', 1, 0, 0, 1, 0, 0, 0));
+ERROR: wrong number of arguments to function geopoly_xform()
+> SELECT geopoly_json(geopoly_regular(0,0,1,4,5));
+ERROR: wrong number of arguments to function geopoly_regular()
+> SELECT geopoly_overlap('[[0,0],[1,0],[1,1],[0,0]]');
+ERROR: wrong number of arguments to function geopoly_overlap()
+> SELECT geopoly_debug();
+ERROR: wrong number of arguments to function geopoly_debug()
+> SELECT geopoly_json(geopoly_blob(geopoly_blob('[[0,0],[1,0],[1,1],[0,0]]')));
+[[0.0,0.0],[1.0,0.0],[1.0,1.0],[0.0,0.0]]
+> SELECT geopoly_json(CAST('[[0,0],[1,0],[1,1],[0,0]]' AS BLOB));
+N
+> SELECT geopoly_json(geopoly_bbox(geopoly_regular(0,0,1,8)));
+[[-1.00007,-1.00007],[1.00007,-1.00007],[1.00007,1.00007],[-1.00007,1.00007],[-1.00007,-1.00007]]
+> SELECT geopoly_json(geopoly_regular(0,0,1e-3,3)), geopoly_json(geopoly_regular(100,100,1e6,3));
+[[0.00100007,0.0],[-0.000499953,0.000866088],[-0.000499953,-0.000866088],[0.00100007,0.0]]|[[1.00017e+06,100.0],[-499853.0,866188.0],[-499853.0,-865988.0],[1.00017e+06,100.0]]
+> SELECT geopoly_json('[[e5,0],[1,0],[1,1],[e5,0]]');
+[[0.0,0.0],[1.0,0.0],[1.0,1.0],[0.0,0.0]]
+> SELECT geopoly_json('[[,5],[1,0],[1,1],[,5]]');
+[[0.0,5.0],[1.0,0.0],[1.0,1.0],[0.0,5.0]]
+> SELECT geopoly_json('[[0,0],[1,0],[1,1],[0,0,]');
+[[0.0,0.0],[1.0,0.0],[1.0,1.0],[0.0,0.0]]
+> SELECT geopoly_json('[[0,0],[1,0],[1,1],[0,0]');
+N
+> SELECT geopoly_json('[[1e5e3,0],[1,0],[1,1],[1e5e3,0]]');
+N
+> SELECT geopoly_json('[[ e5,0],[1,0],[1,1],[ e5,0]]');
+N
+> SELECT geopoly_json('[[0,e5],[1,0],[1,1],[0,e5]]');
+N
+> SELECT geopoly_json('[[0,0] , [1,0] , [1,1] , [0,0] ]');
+[[0.0,0.0],[1.0,0.0],[1.0,1.0],[0.0,0.0]]
+> SELECT geopoly_json(char(10) || '[[0,0],[1,0],[1,1],[0,0]]' || char(13));
+[[0.0,0.0],[1.0,0.0],[1.0,1.0],[0.0,0.0]]
+> SELECT geopoly_json(char(11) || '[[0,0],[1,0],[1,1],[0,0]]');
+N
+> SELECT geopoly_json(char(12) || '[[0,0],[1,0],[1,1],[0,0]]');
+N
+> SELECT geopoly_json('[[0,0],[1,0],[1,1],[0,0]]' || char(0) || 'junk');
+[[0.0,0.0],[1.0,0.0],[1.0,1.0],[0.0,0.0]]
+> SELECT geopoly_svg('[[0,0],[1,0],[1,1],[0,0]]', 'a' || char(0) || 'b', char(0) || 'c');
+<polyline points='0,0 1,0 1,1 0,0' a></polyline>
+> SELECT geopoly_json('[[1.0000001,2],[3,4],[5,6],[1,2]]');
+N
+> SELECT geopoly_json('[[16777217,2],[3,4],[5,6],[16777216,2]]');
+[[1.67772e+07,2.0],[3.0,4.0],[5.0,6.0],[1.67772e+07,2.0]]
+> SELECT geopoly_json('[[-1e-3,2],[3,4],[5,6],[-1e-3,2]]');
+[[-0.001,2.0],[3.0,4.0],[5.0,6.0],[-0.001,2.0]]
+> SELECT geopoly_json('[[-12,-0.000001],[3,4],[5,6],[-12,-0.000001]]');
+[[-12.0,-1.0e-06],[3.0,4.0],[5.0,6.0],[-12.0,-1.0e-06]]
+> SELECT geopoly_json('[[1,2],[3,4],[5,6],[1,2]][');
+N
+> SELECT geopoly_json('[[1,2],[3,4],[5,6],[1,2]]]');
+N
+> SELECT geopoly_json('[[1,2],[3,4],[5,6],[1,2],');
+N
+> SELECT geopoly_json('[[1,2],[3,4],[5,6],[1,2],]');
+[[1.0,2.0],[3.0,4.0],[5.0,6.0],[1.0,2.0]]
+> SELECT geopoly_json('[[1,2],[3,4],[5,6],[1,2]],');
+N
+> SELECT geopoly_json('[[1, 2 ],[3 ,4],[ 5,6],[1,2 ]]');
+[[1.0,2.0],[3.0,4.0],[5.0,6.0],[1.0,2.0]]
+> SELECT geopoly_json('[[-0,0],[1,0],[1,1],[0,-0]]');
+[[0.0,0.0],[1.0,0.0],[1.0,1.0],[0.0,0.0]]
+> SELECT hex(geopoly_blob('[[-0,0],[1,0],[1,1],[-0,0]]'));
+0100000300000080000000000000803F000000000000803F0000803F
+> SELECT geopoly_svg('[[-0,-1e-50],[1,0],[1,1],[-0,-1e-50]]');
+<polyline points='0,0 1,0 1,1 0,0'></polyline>
+> SELECT geopoly_json('[[1.5,2.5],[3.5,4.5],[5.5,6.5],[1.5,2.5]]'), geopoly_svg('[[1.5,2.5],[3.5,4.5],[5.5,6.5],[1.5,2.5]]');
+[[1.5,2.5],[3.5,4.5],[5.5,6.5],[1.5,2.5]]|<polyline points='1.5,2.5 3.5,4.5 5.5,6.5 1.5,2.5'></polyline>
+> SELECT geopoly_json('[[123456.7,1234567.8],[1,0],[1,1],[123456.7,1234567.8]]'), geopoly_svg('[[123456.7,1234567.8],[1,0],[1,1],[123456.7,1234567.8]]');
+[[123457.0,1.23457e+06],[1.0,0.0],[1.0,1.0],[123457.0,1.23457e+06]]|<polyline points='123457,1.23457e+06 1,0 1,1 123457,1.23457e+06'></polyline>
+> SELECT geopoly_json('[[999999.5,0.0001],[1,0],[1,1],[999999.5,0.0001]]'), geopoly_svg('[[999999.5,0.0001],[1,0],[1,1],[999999.5,0.0001]]');
+[[1.0e+06,0.0001],[1.0,0.0],[1.0,1.0],[1.0e+06,0.0001]]|<polyline points='1e+06,0.0001 1,0 1,1 1e+06,0.0001'></polyline>
+> SELECT geopoly_area(X'0100000300000000000000000000803F000000000000803F0000803F');
+0.5
+> SELECT geopoly_contains_point(X'0100000300000000000000000000803F000000000000803F0000803F', 0.75, 0.25);
+2

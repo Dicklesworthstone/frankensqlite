@@ -124976,6 +124976,7 @@ const AGG_NAMES: &[&str] = &[
     "count",
     "group_concat",
     "string_agg",
+    "geopoly_group_bbox",
     "max",
     "median",
     "min",
@@ -124993,9 +124994,15 @@ fn is_agg_fn(name: &str) -> bool {
 }
 
 fn is_registry_backed_builtin_aggregate(name: &str) -> bool {
-    ["median", "percentile", "percentile_cont", "percentile_disc"]
-        .iter()
-        .any(|builtin| name.eq_ignore_ascii_case(builtin))
+    [
+        "geopoly_group_bbox",
+        "median",
+        "percentile",
+        "percentile_cont",
+        "percentile_disc",
+    ]
+    .iter()
+    .any(|builtin| name.eq_ignore_ascii_case(builtin))
 }
 
 fn builtin_aggregate_has_exact_arity(name: &str, arity: i32) -> bool {
@@ -125005,7 +125012,7 @@ fn builtin_aggregate_has_exact_arity(name: &str, arity: i32) -> bool {
     (name.eq_ignore_ascii_case("count") && matches!(arity, 0 | 1))
         || (name.eq_ignore_ascii_case("string_agg") && arity == 2)
         || (arity == 1
-            && ["avg", "max", "median", "min", "sum", "total"]
+            && ["avg", "geopoly_group_bbox", "max", "median", "min", "sum", "total"]
                 .iter()
                 .any(|builtin| name.eq_ignore_ascii_case(builtin)))
         || (arity == 2
