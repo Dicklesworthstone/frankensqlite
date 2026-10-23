@@ -58150,7 +58150,11 @@ impl Connection {
             }
             Ok(())
         })
-        .await
+        .await?;
+        // The MemDatabase mirror still holds the rows with the dropped slot,
+        // and the prepared lane (query_with_params) read them from there.
+        self.abandon_exact_memdb_row_mirror();
+        Ok(())
     }
 
     #[cfg(feature = "ext-fts5")]
