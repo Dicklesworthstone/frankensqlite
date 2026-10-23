@@ -198,7 +198,7 @@ use fsqlite_planner::{
     best_access_path_with_hints, classify_where_term, decompose_where,
 };
 use fsqlite_types::DATABASE_HEADER_SIZE;
-use fsqlite_types::cx::{CancelReason, Cx};
+use fsqlite_types::cx::{BusyWaitBudget, CancelReason, Cx};
 use fsqlite_types::flags::{AccessFlags, VfsOpenFlags};
 use fsqlite_types::limits::MAX_VARIABLE_NUMBER;
 use fsqlite_types::opcode::{Opcode, P4};
@@ -60067,10 +60067,13 @@ impl Connection {
             // maintenance gate admits this mode while peer connections are
             // idle and returns Busy if a transaction becomes active.
             CheckpointMode::Truncate
-        } else if snapshot.wal_frames_estimate
-            >= snapshot.urgent_wal_frames_threshold.saturating_mul(2)
-            && snapshot.active_txn_count <= snapshot.low_activity_txn_threshold
-        {
+        } else if snapshot.active_txn_count <= snapshot.low_activity_txn_threshold {
+            // Reset the WAL as soon as a checkpoint has backfilled all of it,
+            // the effect of stock's restart of a fully backfilled WAL at the
+            // next write. A PASSIVE-only schedule never resets, so the WAL grew
+            // without bound and every later checkpoint re-copied all of it.
+            // Autocheckpoints never wait, so a pinned reader just leaves a
+            // partial checkpoint and a later commit retries.
             CheckpointMode::Restart
         } else if snapshot.wal_frames_estimate >= snapshot.urgent_wal_frames_threshold {
             CheckpointMode::Full
@@ -60196,8 +60199,22 @@ impl Connection {
         // was the super-linear per-statement cost cliff (each pass re-walked
         // the whole WAL). Raw WAL length still escalates past the urgent
         // threshold so Full/Restart/Truncate can bound the file itself.
-        if snapshot.wal_unbackfilled_frames_estimate < adaptive_target
-            && snapshot.wal_frames_estimate < snapshot.urgent_wal_frames_threshold.max(1)
+        let backfill_below_target = snapshot.wal_unbackfilled_frames_estimate < adaptive_target;
+        // An urgent pass over an already-backfilled WAL only helps if it can
+        // reset the WAL, and every pager checkpoint re-walks the WAL from frame
+        // 0. If the last attempt left the WAL unreset (it has only grown since),
+        // retry after another `adaptive_target` frames rather than re-copying
+        // the whole WAL on every commit: that per-commit pass was the cliff past
+        // the urgent threshold (~10 ms per autocommit at 4,000 frames).
+        let urgent_retry_pending = snapshot.wal_frames_estimate
+            >= snapshot.last_checkpoint_total_frames
+            && snapshot.wal_frames_estimate
+                < snapshot
+                    .last_checkpoint_total_frames
+                    .saturating_add(adaptive_target);
+        if backfill_below_target
+            && (snapshot.wal_frames_estimate < snapshot.urgent_wal_frames_threshold.max(1)
+                || urgent_retry_pending)
         {
             #[cfg(feature = "bench-internals")]
             if let Some(record) = autocheckpoint_record {
@@ -60246,7 +60263,10 @@ impl Connection {
             }
         }
         let cx = match self.op_cx() {
-            Ok(cx) => cx,
+            // Like stock's PASSIVE autocheckpoint, this pass runs on the commit
+            // path and must never wait on readers or writers: a busy or pinned
+            // WAL is simply retried by a later commit.
+            Ok(cx) => cx.with_busy_wait_budget(BusyWaitBudget::new(Duration::ZERO)),
             Err(_) => {
                 #[cfg(feature = "bench-internals")]
                 if let Some(record) = autocheckpoint_record {
