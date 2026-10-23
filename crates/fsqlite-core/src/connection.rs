@@ -98558,6 +98558,9 @@ impl Connection {
         // Storing the intrinsic collation keeps a COLLATE local to the term
         // that spells it.
         let mut extra_order_exprs: Vec<Expr> = Vec::new();
+        // `ORDER BY bm25(ft)` names the FTS5 table as the auxiliary function's
+        // first argument, which validation must accept as the projection does.
+        let match_table_names = join_match_table_names(&all_sources);
         for term in &select.order_by {
             if matches!(&term.expr, Expr::Literal(Literal::Integer(_), _)) {
                 continue;
@@ -98580,7 +98583,7 @@ impl Connection {
                         &term.expr,
                         &col_map,
                         using_skip,
-                        &[],
+                        &match_table_names,
                         &fts5_rank_table_names,
                     )
             {
@@ -98592,7 +98595,7 @@ impl Connection {
                     &term.expr,
                     &col_map,
                     using_skip,
-                    &[],
+                    &match_table_names,
                     &fts5_rank_table_names,
                 )?;
                 let hidden_expr = strip_collate_wrappers(&term.expr).clone();
@@ -160241,13 +160244,7 @@ fn validate_join_select_column_references(
     using_skip: Option<&HashSet<usize>>,
     fts5_rank_table_names: &[&str],
 ) -> Result<()> {
-    let match_table_names: Vec<&str> = sources
-        .iter()
-        .filter_map(|source| match source {
-            TableOrSubquery::Table { name, .. } => Some(name.name.as_str()),
-            _ => None,
-        })
-        .collect();
+    let match_table_names = join_match_table_names(sources);
     for join in joins {
         if let Some(JoinConstraint::On(expr)) = join.constraint.as_ref() {
             validate_join_column_references(
@@ -160654,6 +160651,19 @@ fn validate_join_frame_bound_column_references(
         | FrameBound::CurrentRow
         | FrameBound::UnboundedFollowing => Ok(()),
     }
+}
+
+/// The table names a MATCH operand or an FTS5 auxiliary function's first
+/// argument may name: each FROM table's own name, as stock's hidden column is
+/// named after the table (an alias does not rename it).
+fn join_match_table_names<'a>(sources: &[&'a TableOrSubquery]) -> Vec<&'a str> {
+    sources
+        .iter()
+        .filter_map(|source| match source {
+            TableOrSubquery::Table { name, .. } => Some(name.name.as_str()),
+            _ => None,
+        })
+        .collect()
 }
 
 fn is_join_match_table_operand(expr: &Expr, table_names: &[&str]) -> bool {
