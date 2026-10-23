@@ -5729,7 +5729,7 @@ where
         Err(err) => return Err(err),
     };
     if file.file_size(cx)? < u64::try_from(fsqlite_wal::WAL_HEADER_SIZE).unwrap_or(32) {
-        if allow_readonly {
+        if allow_readonly && !headerless_wal_lacks_wal_index(&vfs, cx, wal_path)? {
             // bd-yxqs9: a stock writer's `wal_checkpoint(TRUNCATE)` leaves its
             // WAL at zero bytes until its next commit writes a header. Bind it
             // header-less, so this reader sees the database file now and the
@@ -5770,6 +5770,23 @@ where
         install_opened_wal_backend(pager, cx, vfs, wal_path, wal, false)?;
     }
     Ok(true)
+}
+
+/// GH#515: whether a read-only open of a header-less WAL finds no `-shm` to
+/// read it through. No WAL-mode connection is then live (a live connection
+/// keeps its `-shm`, and an exclusive-mode one holds the main file), and the
+/// WAL has no frames, so the main file is the whole database, as for a missing
+/// WAL. Binding the WAL would only answer BusyRecovery: a read-only pager may
+/// not build the index its native reader requires.
+fn headerless_wal_lacks_wal_index<V: Vfs>(vfs: &V, cx: &Cx, wal_path: &Path) -> Result<bool> {
+    if !cfg!(all(feature = "native", unix)) || vfs.is_memory() {
+        return Ok(false);
+    }
+    let Some(db_path) = wal_path.to_str().and_then(|wal| wal.strip_suffix("-wal")) else {
+        return Ok(false);
+    };
+    let shm_path = PathBuf::from(format!("{db_path}-shm"));
+    Ok(!vfs.access(cx, &shm_path, AccessFlags::EXISTS)?)
 }
 
 fn wal_file_present_with_vfs<V>(vfs: &V, cx: &Cx, wal_path: &Path) -> bool
