@@ -24326,9 +24326,12 @@ impl Connection {
         let rollback_visible_total_changes = error_state
             .as_ref()
             .map_or(0, |state| state.rollback_visible_total_changes);
+        // A failed statement never restores last_insert_rowid(): as in stock
+        // it keeps the rowid of the last row the statement inserted, even one
+        // an ABORT rolled back.
         let failed_last_insert_rowid = error_state
             .and_then(|state| state.last_insert_rowid)
-            .unwrap_or(previous_last_insert_rowid);
+            .unwrap_or_else(|| self.current_last_insert_rowid());
         self.restore_change_tracking_state(
             0,
             previous_total_changes.saturating_add(rollback_visible_total_changes),
@@ -44113,7 +44116,6 @@ struct InsertSelectReplayEmitter<'conn> {
     preserve_constraint_failure_rows: bool,
     previous_changes: usize,
     previous_total_changes: usize,
-    previous_last_insert_rowid: i64,
 }
 
 impl InsertSelectReplayEmitter<'_> {
@@ -44133,7 +44135,7 @@ impl InsertSelectReplayEmitter<'_> {
             self.connection.restore_change_tracking_state(
                 0,
                 self.previous_total_changes,
-                self.previous_last_insert_rowid,
+                self.connection.current_last_insert_rowid(),
             );
         } else {
             self.connection
@@ -46407,7 +46409,6 @@ impl Connection {
             insert.or_conflict == Some(fsqlite_ast::ConflictAction::Fail);
         let previous_changes = self.last_changes.get();
         let previous_total_changes = self.total_changes.get();
-        let previous_last_insert_rowid = self.current_last_insert_rowid();
         let mut execute_rows = async || -> Result<InsertSelectReplayOutcome> {
             self.with_statement_fk_validation_scope(preserve_constraint_failure_rows, async || {
                 let _fk_parent_validation_cache =
@@ -46437,7 +46438,6 @@ impl Connection {
                     preserve_constraint_failure_rows,
                     previous_changes,
                     previous_total_changes,
-                    previous_last_insert_rowid,
                 };
 
                 if let Err(error) = producer(&mut emitter).await {
@@ -73159,16 +73159,18 @@ impl Connection {
                 Err(FrankenError::RaiseFail(message))
             }
             fsqlite_ast::RaiseAction::Rollback => {
-                let reason = directive
+                // ROLLBACK: end the explicit transaction, if there is one. In
+                // autocommit it is ABORT: the statement's own transaction rolls
+                // back as the error unwinds. Either way stock reports only the
+                // message.
+                let message = directive
                     .message
                     .unwrap_or_else(|| "trigger requested rollback".to_owned());
-                let has_active_txn =
-                    self.in_transaction.get() || self.active_txn_is_open_or_borrowed();
-                if has_active_txn {
+                if self.in_transaction.get() {
                     let rollback_stmt = fsqlite_ast::RollbackStatement { to_savepoint: None };
                     self.execute_rollback(&rollback_stmt).await?;
                 }
-                Err(FrankenError::TransactionRolledBack { reason })
+                Err(FrankenError::FunctionError(message))
             }
         }
     }
@@ -188739,15 +188741,16 @@ mod tests {
                 .execute("INSERT INTO t VALUES (1);")
                 .await
                 .expect_err("INSERT should fail via RAISE(ROLLBACK)");
-            assert!(matches!(
-                err,
-                FrankenError::TransactionRolledBack { ref reason } if reason == "rollback insert"
-            ));
+            assert_eq!(err.to_string(), "rollback insert", "stock reports the message");
 
             let rows = conn.query("SELECT id FROM t;").await.unwrap();
             assert!(
                 rows.is_empty(),
                 "transaction should be rolled back by RAISE(ROLLBACK)"
+            );
+            assert_eq!(
+                conn.execute("COMMIT;").await.unwrap_err().to_string(),
+                "cannot commit - no transaction is active"
             );
         });
     }
