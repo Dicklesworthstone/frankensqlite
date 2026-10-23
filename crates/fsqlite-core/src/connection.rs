@@ -39489,9 +39489,20 @@ impl Connection {
             //   schema mutation  bd-orwh0, CREATE TABLE 8_164 refusals at 0 ms;
             //                    CREATE INDEX 7_497 refusals, 0 completions
             //
+            //   Insert, Update,  bd-reality-check-1022-llk6g.5: `execute` sends a
+            //   Delete           single DML statement through the prepared retry
+            //                    (GH #333), but `query` -- and so the CLI, one
+            //                    process per statement -- reached this loop with
+            //                    DML unarmed: 4 processes x 100 autocommit
+            //                    INSERTs with busy_timeout=5000 committed 276 of
+            //                    400, each loser refused in ~90 ms with
+            //                    "snapshot conflict on pages". A failed
+            //                    autocommit DML statement has rolled back like
+            //                    the prepared retry's, so re-running it is the
+            //                    same retry on the other path.
+            //
             // Vacuum, Attach, Detach, Reindex and Explain stay out: no measured
-            // exposure, and in VACUUM's case a measured reason not to. DML keeps
-            // its own prepared-retry path and is untouched.
+            // exposure, and in VACUUM's case a measured reason not to.
             let autocommit_retry_entry = matches!(
                 statement,
                 Statement::Pragma(_)
@@ -39506,6 +39517,9 @@ impl Connection {
                     | Statement::CreateVirtualTable(_)
                     | Statement::Drop(_)
                     | Statement::AlterTable(_)
+                    | Statement::Insert(_)
+                    | Statement::Update(_)
+                    | Statement::Delete(_)
             ) && self.autocommit_conflict_retry_boundary();
             // GH#423: BEGIN admission inside this statement and the retry
             // below draw on one busy_timeout budget.
