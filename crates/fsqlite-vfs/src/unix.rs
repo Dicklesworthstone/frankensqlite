@@ -1386,19 +1386,33 @@ impl ShmTable {
             }
             Arc::clone(existing)
         } else {
-            let file = OpenOptions::new()
+            use std::os::unix::fs::OpenOptionsExt as _;
+
+            // Stock `unixOpenSharedMemory`: `-shm` takes the database's mode.
+            let create_mode = if create {
+                sidecar_create_mode(&path)
+            } else {
+                None
+            };
+            let mut options = OpenOptions::new();
+            options
                 .read(true)
                 .write(true)
                 .create(create)
-                .truncate(false)
-                .open(&path)
-                .map_err(|error| {
-                    if !create && error.kind() == std::io::ErrorKind::NotFound {
-                        FrankenError::CannotOpen { path: path.clone() }
-                    } else {
-                        FrankenError::Io(error)
-                    }
-                })?;
+                .truncate(false);
+            if let Some(create_mode) = create_mode {
+                options.mode(create_mode.mode);
+            }
+            let file = options.open(&path).map_err(|error| {
+                if !create && error.kind() == std::io::ErrorKind::NotFound {
+                    FrankenError::CannotOpen { path: path.clone() }
+                } else {
+                    FrankenError::Io(error)
+                }
+            })?;
+            if let Some(create_mode) = create_mode {
+                apply_create_file_mode(&file, create_mode);
+            }
 
             let info = Arc::new(Mutex::new(ShmInfo::new(Arc::new(file))));
             map.insert(path, Arc::clone(&info));
@@ -1463,6 +1477,65 @@ fn sqlite_shm_path(path: &Path) -> PathBuf {
     let mut shm = path.as_os_str().to_owned();
     shm.push("-shm");
     PathBuf::from(shm)
+}
+
+/// Permission bits (and owner) a newly created file must carry regardless of
+/// the umask, mirroring stock `findCreateFileMode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CreateFileMode {
+    mode: u32,
+    owner: Option<(u32, u32)>,
+}
+
+/// Stock `findCreateFileMode` for a sidecar: a WAL, rollback journal or `-shm`
+/// file takes the mode and owner of the file it belongs to, found by dropping
+/// the trailing `-suffix` of the name (a `.` reached first means there is no
+/// owning file). fsqlite's nested sidecars (`-wal-cert`, `-wal-cert-head`)
+/// keep dropping suffixes until an existing file is found. `None` leaves the
+/// umask default in place.
+fn sidecar_create_mode(path: &Path) -> Option<CreateFileMode> {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::MetadataExt as _;
+
+    let parent = path.parent()?;
+    let mut name = path.file_name()?.as_bytes();
+    loop {
+        let separator = name
+            .iter()
+            .rposition(|&byte| byte == b'-' || byte == b'.')?;
+        if separator == 0 || name[separator] == b'.' {
+            return None;
+        }
+        name = &name[..separator];
+        if let Ok(metadata) = fs::metadata(parent.join(OsStr::from_bytes(name))) {
+            return Some(CreateFileMode {
+                mode: metadata.mode() & 0o777,
+                owner: Some((metadata.uid(), metadata.gid())),
+            });
+        }
+    }
+}
+
+/// Stock `robust_open` + `robustFchown`: the umask may have narrowed the
+/// requested bits, so a still-empty file gets the exact mode, and a root
+/// process hands the file to the owning database's user so that user can
+/// reopen it. Both are best effort, as in stock.
+fn apply_create_file_mode(file: &File, create_mode: CreateFileMode) {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    if let Ok(metadata) = file.metadata()
+        && metadata.len() == 0
+        && metadata.mode() & 0o777 != create_mode.mode
+    {
+        let _ = file.set_permissions(fs::Permissions::from_mode(create_mode.mode));
+    }
+    // SAFETY: geteuid has no arguments or memory preconditions.
+    if let Some((uid, gid)) = create_mode.owner
+        && unsafe { libc::geteuid() } == 0
+    {
+        let _ = std::os::unix::fs::fchown(file, Some(uid), Some(gid));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1739,8 +1812,24 @@ impl Vfs for UnixVfs {
                 .access(cx, &resolved, AccessFlags::READWRITE)
                 .unwrap_or(false);
 
+        // Stock `findCreateFileMode`: a WAL or rollback journal takes its
+        // database's mode and owner; delete-on-close files are owner-only.
+        let create_mode =
+            if is_create && flags.intersects(VfsOpenFlags::WAL | VfsOpenFlags::MAIN_JOURNAL) {
+                path.and_then(sidecar_create_mode)
+            } else if is_create && delete_on_close {
+                Some(CreateFileMode {
+                    mode: 0o600,
+                    owner: None,
+                })
+            } else {
+                None
+            };
         let open_file = |write| {
-            OpenOptions::new()
+            use std::os::unix::fs::OpenOptionsExt as _;
+
+            let mut options = OpenOptions::new();
+            options
                 .read(true)
                 // Prefer a canonical read-write fd whenever the underlying file is
                 // writable, even for read-only callers. Otherwise a later writable
@@ -1748,8 +1837,11 @@ impl Vfs for UnixVfs {
                 // fail on writes or lock-related syscalls.
                 .write(write)
                 .create(is_create)
-                .create_new(create_new)
-                .open(&resolved)
+                .create_new(create_new);
+            if let Some(create_mode) = create_mode {
+                options.mode(create_mode.mode);
+            }
+            options.open(&resolved)
         };
         let reused = if !create_new && !delete_on_close && flags.contains(VfsOpenFlags::MAIN_DB) {
             global_inode_table().reuse_retained_file(&resolved, requested_rw)
@@ -1773,6 +1865,9 @@ impl Vfs for UnixVfs {
                     FrankenError::Io(e)
                 }
             })?;
+            if let Some(create_mode) = create_mode {
+                apply_create_file_mode(&file, create_mode);
+            }
 
             // Derive identity from the descriptor actually opened, never from
             // a path stat that could race a rename to a different inode.
@@ -5950,6 +6045,95 @@ mod tests {
             PendingNamespaceOpen::begin(&path, NamespaceOpenIntent::ReservedExclusive)
                 .expect("pending owner releases its gate only after main cleanup"),
         );
+    }
+
+    #[test]
+    fn sidecar_create_mode_follows_find_create_file_mode() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("my-data.db");
+        fs::write(&db, b"db").expect("create database");
+        fs::set_permissions(&db, fs::Permissions::from_mode(0o640)).expect("chmod database");
+        let mode_of = |name: &str| sidecar_create_mode(&dir.path().join(name)).map(|m| m.mode);
+
+        assert_eq!(mode_of("my-data.db-wal"), Some(0o640));
+        assert_eq!(mode_of("my-data.db-journal"), Some(0o640));
+        assert_eq!(mode_of("my-data.db-shm"), Some(0o640));
+        // Nested sidecars resolve through the first existing owner.
+        assert_eq!(mode_of("my-data.db-wal-cert-head"), Some(0o640));
+        let wal = dir.path().join("my-data.db-wal");
+        fs::write(&wal, b"").expect("create WAL");
+        fs::set_permissions(&wal, fs::Permissions::from_mode(0o600)).expect("chmod WAL");
+        assert_eq!(mode_of("my-data.db-wal-cert"), Some(0o600));
+        // A `.` before any `-` (scanning from the end) means no owning file,
+        // and the search never leaves the file name for a dashed directory.
+        assert_eq!(mode_of("my-data.db"), None);
+        assert_eq!(mode_of("orphan-wal"), None);
+        let dashed = dir.path().join("dir-x");
+        fs::create_dir(&dashed).expect("dashed directory");
+        assert_eq!(sidecar_create_mode(&dashed.join("wal")), None);
+
+        let metadata = fs::metadata(&db).expect("database metadata");
+        assert_eq!(
+            sidecar_create_mode(&wal).and_then(|m| m.owner),
+            Some((metadata.uid(), metadata.gid()))
+        );
+    }
+
+    #[test]
+    fn created_wal_journal_shm_and_temp_files_take_stock_modes() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let mode_of =
+            |path: &Path| fs::metadata(path).expect("metadata").permissions().mode() & 0o777;
+        for db_mode in [0o600, 0o640, 0o660, 0o604] {
+            let db = dir.path().join(format!("m{db_mode:o}.db"));
+            fs::write(&db, b"").expect("create database");
+            fs::set_permissions(&db, fs::Permissions::from_mode(db_mode)).expect("chmod database");
+            for (suffix, kind) in [
+                ("-wal", VfsOpenFlags::WAL),
+                ("-journal", VfsOpenFlags::MAIN_JOURNAL),
+            ] {
+                let sidecar = PathBuf::from(format!("{}{suffix}", db.display()));
+                let (mut file, _) = vfs
+                    .open(
+                        &cx,
+                        Some(&sidecar),
+                        VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | kind,
+                    )
+                    .expect("create sidecar");
+                assert_eq!(
+                    mode_of(&sidecar),
+                    db_mode,
+                    "{suffix} for a {db_mode:o} database"
+                );
+                file.close(&cx).expect("close sidecar");
+            }
+            let shm = sqlite_shm_path(&db);
+            let table = ShmTable::new();
+            let info = table
+                .get_or_open_and_register(shm.clone(), 1, true)
+                .expect("create SHM");
+            assert_eq!(mode_of(&shm), db_mode, "-shm for a {db_mode:o} database");
+            info.lock().expect("SHM state").owner_refs.remove(&1);
+            table.finish_owner_release(&shm, info);
+        }
+
+        // Stock opens delete-on-close files 0600 whatever the umask.
+        let temp_path = dir.path().join("scratch.tmp");
+        let (mut temp, _) = vfs
+            .open(
+                &cx,
+                Some(&temp_path),
+                VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::DELETEONCLOSE,
+            )
+            .expect("create delete-on-close file");
+        assert_eq!(mode_of(&temp_path), 0o600);
+        temp.close(&cx).expect("close delete-on-close file");
     }
 
     #[test]
