@@ -1461,8 +1461,8 @@ fn sqlite_shm_path(path: &Path) -> PathBuf {
 // bd-sz9j5: foreign WAL-participation probe
 // ---------------------------------------------------------------------------
 
-/// Outcome of one lock-neutral `F_GETLK` probe through a temporary descriptor.
-enum TempDescriptorProbe {
+/// Outcome of one lock-neutral `F_GETLK` probe through a retained descriptor.
+enum PeerLockProbe {
     /// Another process holds a lock conflicting with a write lock on the range.
     Locked,
     /// No other process holds a lock on the range.
@@ -1513,86 +1513,115 @@ fn byte_range_locks_are_reportable(_file: &File) -> bool {
     false
 }
 
+/// GH#455: the descriptors the WAL peer probe opened, one per probed inode,
+/// kept open for the process lifetime and reused by later probes of it.
+///
+/// Closing any descriptor of an inode drops every classic POSIX lock this
+/// process holds on it, including those of a stock SQLite connection in the
+/// same process, which no table of this VFS can see. So the probe never closes
+/// one. The cost is one read-only descriptor per distinct database and `-shm`
+/// inode probed.
+fn retained_probe_descriptors() -> &'static Mutex<HashMap<FileIdentity, File>> {
+    static DESCRIPTORS: OnceLock<Mutex<HashMap<FileIdentity, File>>> = OnceLock::new();
+    DESCRIPTORS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Run `probe` through the retained probe descriptor for the inode `key`,
+/// which `path` named when it was stat'ed, opening and retaining one read-only
+/// on first use. `None` when `path` cannot be opened or no longer names `key`.
+fn with_retained_probe_descriptor<T>(
+    path: &Path,
+    key: FileIdentity,
+    probe: impl FnOnce(&File) -> T,
+) -> Option<T> {
+    let mut descriptors = retained_probe_descriptors()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(file) = descriptors.get(&key) {
+        return Some(probe(file));
+    }
+    let file = OpenOptions::new().read(true).open(path).ok()?;
+    let identity = inode_key_from_file(&file).ok();
+    // A path replaced after the stat still yields a descriptor that must not
+    // be closed; keep it under the inode it names.
+    match identity {
+        Some(identity) if !descriptors.contains_key(&identity) => {
+            descriptors.insert(identity, file);
+        }
+        _ => std::mem::forget(file),
+    }
+    if identity != Some(key) {
+        return None;
+    }
+    descriptors.get(&key).map(probe)
+}
+
 impl InodeTable {
-    /// Probe the main file at `path` through a temporary read-only descriptor
+    /// Probe the main file at `path` through a retained read-only descriptor
     /// only while no descriptor for its inode is registered in this process.
-    ///
-    /// Closing any descriptor of an inode drops every classic POSIX lock this
-    /// process holds on it, so the shard mutex is held from the registration
-    /// check through the close: no thread of this process can register (and
-    /// lock) the inode in between. A registered inode means this process
-    /// already participates, and its own locks are invisible to `F_GETLK`.
-    fn probe_unregistered_main_file(&self, path: &Path) -> TempDescriptorProbe {
+    /// A registered inode means this process already participates, and its
+    /// own locks are invisible to `F_GETLK`.
+    fn probe_unregistered_main_file(&self, path: &Path) -> PeerLockProbe {
         use std::os::unix::fs::MetadataExt;
         let Ok(meta) = fs::metadata(path) else {
-            return TempDescriptorProbe::Unknown;
+            return PeerLockProbe::Unknown;
         };
         let key = FileIdentity::from_unix_parts(meta.dev(), meta.ino());
         let map = self.shards[self.shard_idx(key)]
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if map.contains_key(&key) {
-            return TempDescriptorProbe::Unknown;
+            return PeerLockProbe::Unknown;
         }
-        let Ok(file) = OpenOptions::new().read(true).open(path) else {
-            return TempDescriptorProbe::Unknown;
-        };
-        if inode_key_from_file(&file).ok() != Some(key) {
-            // The path was replaced after the stat. This descriptor names an
-            // inode whose registration was never checked; closing it could
-            // drop another connection's locks, so retain it for the process
-            // lifetime instead (a vanishingly rare race).
-            std::mem::forget(file);
-            return TempDescriptorProbe::Unknown;
-        }
-        // Only a WAL-mode database (header bytes 18/19 == 2) has WAL peers.
-        let mut header = [0_u8; 20];
-        let is_wal = std::os::unix::fs::FileExt::read_exact_at(&file, &mut header, 0).is_ok()
-            && header[18] == 2
-            && header[19] == 2;
-        let verdict = if is_wal && byte_range_locks_are_reportable(&file) {
-            match foreign_lock_on_range(&file, SHARED_FIRST, SHARED_SIZE) {
-                Some(true) => TempDescriptorProbe::Locked,
-                Some(false) => TempDescriptorProbe::Unlocked,
-                None => TempDescriptorProbe::Unknown,
+        let verdict = with_retained_probe_descriptor(path, key, |file| {
+            // Only a WAL-mode database (header bytes 18/19 == 2) has WAL peers.
+            let mut header = [0_u8; 20];
+            let is_wal = std::os::unix::fs::FileExt::read_exact_at(file, &mut header, 0).is_ok()
+                && header[18] == 2
+                && header[19] == 2;
+            if !is_wal || !byte_range_locks_are_reportable(file) {
+                return PeerLockProbe::Unknown;
             }
-        } else {
-            TempDescriptorProbe::Unknown
-        };
-        drop(file);
+            match foreign_lock_on_range(file, SHARED_FIRST, SHARED_SIZE) {
+                Some(true) => PeerLockProbe::Locked,
+                Some(false) => PeerLockProbe::Unlocked,
+                None => PeerLockProbe::Unknown,
+            }
+        });
         drop(map);
-        verdict
+        verdict.unwrap_or(PeerLockProbe::Unknown)
     }
 }
 
 impl ShmTable {
-    /// Probe the stock `-shm` DMS byte through a temporary descriptor only
-    /// while this process has no canonical `-shm` entry (see
-    /// [`InodeTable::probe_unregistered_main_file`] for why the table lock
-    /// spans the close). A missing `-shm` has no DMS holder.
-    fn probe_unregistered_dms(&self, shm_path: &Path) -> TempDescriptorProbe {
+    /// Probe the stock `-shm` DMS byte through a retained descriptor only
+    /// while this process has no canonical `-shm` entry. A missing `-shm` has
+    /// no DMS holder.
+    fn probe_unregistered_dms(&self, shm_path: &Path) -> PeerLockProbe {
+        use std::os::unix::fs::MetadataExt;
         let map = self
             .map
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if map.contains_key(shm_path) {
-            return TempDescriptorProbe::Unknown;
+            return PeerLockProbe::Unknown;
         }
-        let file = match OpenOptions::new().read(true).open(shm_path) {
-            Ok(file) => file,
+        let key = match fs::metadata(shm_path) {
+            Ok(meta) => FileIdentity::from_unix_parts(meta.dev(), meta.ino()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return TempDescriptorProbe::Unlocked;
+                return PeerLockProbe::Unlocked;
             }
-            Err(_) => return TempDescriptorProbe::Unknown,
+            Err(_) => return PeerLockProbe::Unknown,
         };
-        let verdict = match foreign_lock_on_range(&file, sqlite_shm_dms_lock_byte(), 1) {
-            Some(true) => TempDescriptorProbe::Locked,
-            Some(false) => TempDescriptorProbe::Unlocked,
-            None => TempDescriptorProbe::Unknown,
-        };
-        drop(file);
+        let verdict = with_retained_probe_descriptor(shm_path, key, |file| {
+            match foreign_lock_on_range(file, sqlite_shm_dms_lock_byte(), 1) {
+                Some(true) => PeerLockProbe::Locked,
+                Some(false) => PeerLockProbe::Unlocked,
+                None => PeerLockProbe::Unknown,
+            }
+        });
         drop(map);
-        verdict
+        verdict.unwrap_or(PeerLockProbe::Unknown)
     }
 }
 
@@ -1606,14 +1635,14 @@ impl ShmTable {
 /// Takes no lock and never waits.
 pub(crate) fn probe_foreign_wal_participation(path: &Path) -> ForeignWalParticipation {
     match global_inode_table().probe_unregistered_main_file(path) {
-        TempDescriptorProbe::Locked => return ForeignWalParticipation::Participant,
-        TempDescriptorProbe::Unknown => return ForeignWalParticipation::Unknown,
-        TempDescriptorProbe::Unlocked => {}
+        PeerLockProbe::Locked => return ForeignWalParticipation::Participant,
+        PeerLockProbe::Unknown => return ForeignWalParticipation::Unknown,
+        PeerLockProbe::Unlocked => {}
     }
     match global_shm_table().probe_unregistered_dms(&sqlite_shm_path(path)) {
-        TempDescriptorProbe::Locked => ForeignWalParticipation::Participant,
-        TempDescriptorProbe::Unlocked => ForeignWalParticipation::NoParticipant,
-        TempDescriptorProbe::Unknown => ForeignWalParticipation::Unknown,
+        PeerLockProbe::Locked => ForeignWalParticipation::Participant,
+        PeerLockProbe::Unlocked => ForeignWalParticipation::NoParticipant,
+        PeerLockProbe::Unknown => ForeignWalParticipation::Unknown,
     }
 }
 
@@ -10229,9 +10258,7 @@ mod tests {
         );
 
         // Once this process registers the inode, its own locks are invisible
-        // to F_GETLK, so the probe must not claim a verdict (and returns
-        // before opening the temporary descriptor whose close would drop
-        // this process's locks).
+        // to F_GETLK, so the probe must not claim a verdict.
         let cx = Cx::new();
         let vfs = UnixVfs::new();
         let (mut file, _) = vfs
@@ -10247,6 +10274,91 @@ mod tests {
             ForeignWalParticipation::Unknown
         );
         file.unlock(&cx, LockLevel::None).unwrap();
+    }
+
+    /// A classic per-process `F_SETLK`/`F_GETLK` request, as stock SQLite
+    /// issues on Linux and macOS (this VFS uses OFD locks on macOS).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    fn classic_flock(lock_type: impl Into<i32>, start: u64, len: u64) -> libc::flock {
+        let lock_type: i32 = lock_type.into();
+        libc::flock {
+            l_type: lock_type as libc::c_short,
+            l_whence: libc::SEEK_SET as libc::c_short,
+            l_start: start as libc::off_t,
+            l_len: len as libc::off_t,
+            l_pid: 0,
+        }
+    }
+
+    /// GH#455: the WAL peer probe must keep the classic POSIX locks that a
+    /// lock manager this VFS cannot see (stock SQLite linked into the same
+    /// process) holds on the database file and its `-shm`. Closing a probe
+    /// descriptor dropped both.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn probe_foreign_wal_participation_keeps_unregistered_same_process_locks() {
+        const PROBE_PATH: &str = "FSQLITE_GH455_LOCK_PROBE";
+        const TEST: &str =
+            "unix::tests::probe_foreign_wal_participation_keeps_unregistered_same_process_locks";
+        let range_locked = |file: &File, start: u64, len: u64| {
+            let mut flock = classic_flock(libc::F_WRLCK, start, len);
+            nix::fcntl::fcntl(file.as_fd(), nix::fcntl::FcntlArg::F_GETLK(&mut flock)).unwrap();
+            flock.l_type != classic_flock(libc::F_UNLCK, 0, 0).l_type
+        };
+        if let Some(path) = std::env::var_os(PROBE_PATH) {
+            let path = PathBuf::from(path);
+            let main = File::open(&path).unwrap();
+            let shm = File::open(sqlite_shm_path(&path)).unwrap();
+            println!(
+                "main-shared={} shm-dms={}",
+                range_locked(&main, SHARED_FIRST, SHARED_SIZE),
+                range_locked(&shm, sqlite_shm_dms_lock_byte(), 1)
+            );
+            return;
+        }
+
+        let (_dir, path) = make_temp_path("gh455-same-process-locks.db");
+        let mut header = vec![0_u8; 100];
+        header[18] = 2;
+        header[19] = 2;
+        std::fs::write(&path, &header).unwrap();
+        std::fs::write(sqlite_shm_path(&path), vec![0_u8; 32_768]).unwrap();
+        // The locks a stock WAL connection holds while attached: a read lock
+        // on the main file's shared range and on the `-shm` DMS byte, taken
+        // through descriptors this VFS never registered.
+        let main = File::open(&path).unwrap();
+        let shm = File::open(sqlite_shm_path(&path)).unwrap();
+        for (file, start, len) in [
+            (&main, SHARED_FIRST, SHARED_SIZE),
+            (&shm, sqlite_shm_dms_lock_byte(), 1),
+        ] {
+            let flock = classic_flock(libc::F_RDLCK, start, len);
+            nix::fcntl::fcntl(file.as_fd(), nix::fcntl::FcntlArg::F_SETLK(&flock)).unwrap();
+        }
+        let held_per_other_process = || {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([TEST, "--exact", "--nocapture"])
+                .env(PROBE_PATH, &path)
+                .output()
+                .expect("execute independent kernel-lock probe");
+            assert!(output.status.success(), "lock probe failed: {output:?}");
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            assert!(stdout.contains("main-shared="), "{stdout}");
+            stdout.contains("main-shared=true shm-dms=true")
+        };
+        assert!(held_per_other_process(), "the stand-in locks are visible");
+
+        for round in 0..3 {
+            // The verdict depends on the platform's lock space (OFD locks see
+            // this process's classic locks); the locks must survive either way.
+            let _ = probe_foreign_wal_participation(&path);
+            assert!(
+                held_per_other_process(),
+                "probe {round} dropped this process's classic locks"
+            );
+        }
+        drop((main, shm));
     }
 
     #[test]
