@@ -149,6 +149,51 @@ struct FunctionBuild {
     end: Span,
 }
 
+/// Stock compiles `iif()`/`if()` as an inline CASE (expr.c `INLINEFUNC_iif`):
+/// `iif(c1, v1 [, c2, v2 ...] [, else])` is `CASE WHEN c1 THEN v1 ... ELSE
+/// else END`, so it takes any number of arguments from two up (3.48+) and
+/// evaluates only the branch it selects. Rewriting it here gives every
+/// execution path that behavior. Fewer than two arguments, or DISTINCT,
+/// ORDER BY, FILTER or OVER, stay a function call for the resolver to reject.
+/// The span is the call's, so the result column keeps the call's source text.
+fn function_call_or_inline_iif(build: FunctionBuild, span: Span) -> Expr {
+    let inline = (build.name.eq_ignore_ascii_case("iif") || build.name.eq_ignore_ascii_case("if"))
+        && !build.distinct
+        && build.order_by.is_empty()
+        && build.filter.is_none()
+        && build.over.is_none()
+        && matches!(&build.args, FunctionArgs::List(args) if args.len() >= 2);
+    if !inline {
+        return Expr::FunctionCall {
+            name: build.name,
+            args: build.args,
+            distinct: build.distinct,
+            order_by: build.order_by,
+            filter: build.filter,
+            over: build.over,
+            span,
+        };
+    }
+    let FunctionArgs::List(args) = build.args else {
+        unreachable!("checked above");
+    };
+    let mut args = args.into_iter();
+    let mut whens = Vec::with_capacity(args.len() / 2);
+    let mut else_expr = None;
+    while let Some(condition) = args.next() {
+        match args.next() {
+            Some(value) => whens.push((condition, value)),
+            None => else_expr = Some(Box::new(condition)),
+        }
+    }
+    Expr::Case {
+        operand: None,
+        whens,
+        else_expr,
+        span,
+    }
+}
+
 struct CaseBuild {
     start: Span,
     operand: Option<ParsedExpr>,
@@ -1222,20 +1267,9 @@ impl<'a> ParseMachine<'a> {
         build: FunctionBuild,
     ) -> Result<(), ParseError> {
         let span = build.start.merge(build.end);
-        let parsed = self.parser.checked_expr(
-            Expr::FunctionCall {
-                name: build.name,
-                args: build.args,
-                distinct: build.distinct,
-                order_by: build.order_by,
-                filter: build.filter,
-                over: build.over,
-                span,
-            },
-            build.height,
-            false,
-            true,
-        )?;
+        let height = build.height;
+        let expr = function_call_or_inline_iif(build, span);
+        let parsed = self.parser.checked_expr(expr, height, false, true)?;
         self.push_expr_tail(parsed, outer_min_bp);
         Ok(())
     }
@@ -6270,6 +6304,35 @@ mod tests {
     }
 
     // ── CASE ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_iif_and_if_rewrite_to_searched_case() {
+        // iif(c1, v1, c2, v2, else) == CASE WHEN c1 THEN v1 WHEN c2 THEN v2 ELSE else END
+        for sql in ["iif(a, 1, b, 2, 3)", "IF(a, 1, b, 2, 3)"] {
+            match parse(sql) {
+                Expr::Case {
+                    operand: None,
+                    whens,
+                    else_expr: Some(else_expr),
+                    span,
+                } => {
+                    assert_eq!(whens.len(), 2, "{sql}");
+                    assert!(matches!(*else_expr, Expr::Literal(Literal::Integer(3), _)));
+                    assert_eq!(span.start, 0, "{sql}: CASE keeps the call's span");
+                    assert_eq!(span.end, u32::try_from(sql.len()).unwrap(), "{sql}");
+                }
+                other => unreachable!("expected CASE for {sql}, got {other:?}"),
+            }
+        }
+        // An even argument count has no ELSE.
+        assert!(matches!(
+            parse("iif(a, 1, b, 2)"),
+            Expr::Case { else_expr: None, ref whens, .. } if whens.len() == 2
+        ));
+        // Fewer than two arguments stay a call so the resolver reports arity.
+        assert!(matches!(parse("iif(a)"), Expr::FunctionCall { .. }));
+        assert!(matches!(parse("iif()"), Expr::FunctionCall { .. }));
+    }
 
     #[test]
     fn test_case_when_simple() {

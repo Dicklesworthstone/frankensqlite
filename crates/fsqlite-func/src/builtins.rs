@@ -485,33 +485,35 @@ impl ScalarFunction for IfnullFunc {
 
 pub struct IifFunc;
 
+/// C SQLite tests a CASE/IIF condition with sqlite3VdbeRealValue != 0.0, so
+/// 0.5 is truthy (non-zero real).
+fn iif_condition_is_true(cond: &SqliteValue) -> bool {
+    match cond {
+        SqliteValue::Null => false,
+        SqliteValue::Integer(n) => *n != 0,
+        SqliteValue::Float(f) => *f != 0.0,
+        SqliteValue::Text(_) | SqliteValue::Blob(_) => {
+            cond.to_integer() != 0 || cond.to_float() != 0.0
+        }
+    }
+}
+
 impl ScalarFunction for IifFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
-        let cond = &args[0];
-        // C SQLite evaluates IIF condition with sqlite3VdbeRealValue != 0.0,
-        // so 0.5 is truthy (non-zero real).
-        let is_true = match cond {
-            SqliteValue::Null => false,
-            SqliteValue::Integer(n) => *n != 0,
-            SqliteValue::Float(f) => *f != 0.0,
-            SqliteValue::Text(_) | SqliteValue::Blob(_) => {
-                let i = cond.to_integer();
-                if i != 0 { true } else { cond.to_float() != 0.0 }
+        // iif(c1, v1 [, c2, v2 ...] [, else]) is CASE WHEN c1 THEN v1 ... ELSE
+        // else END (SQLite 3.48+); a missing else is NULL. Parsed SQL is
+        // rewritten to that CASE (lazy branches); this covers direct calls.
+        let (pairs, rest) = args.as_chunks::<2>();
+        for [condition, value] in pairs {
+            if iif_condition_is_true(condition) {
+                return Ok(value.clone());
             }
-        };
-        if is_true {
-            Ok(args[1].clone())
-        } else if args.len() >= 3 {
-            Ok(args[2].clone())
-        } else {
-            // Two-argument form iif(X,Y) is shorthand for iif(X,Y,NULL),
-            // i.e. CASE WHEN X THEN Y END (SQLite 3.48+).
-            Ok(SqliteValue::Null)
         }
+        Ok(rest.first().cloned().unwrap_or(SqliteValue::Null))
     }
 
     fn num_args(&self) -> i32 {
-        -1 // 2 or 3 args
+        -1 // two or more args
     }
 
     fn min_args(&self) -> i32 {
@@ -519,7 +521,7 @@ impl ScalarFunction for IifFunc {
     }
 
     fn max_args(&self) -> Option<i32> {
-        Some(3)
+        None
     }
 
     fn name(&self) -> &str {
@@ -2385,7 +2387,7 @@ pub fn register_builtins(registry: &mut FunctionRegistry) {
         }
 
         fn num_args(&self) -> i32 {
-            -1 // 2 or 3 args, mirroring iif
+            -1 // two or more args, mirroring iif
         }
 
         fn min_args(&self) -> i32 {
@@ -2393,7 +2395,7 @@ pub fn register_builtins(registry: &mut FunctionRegistry) {
         }
 
         fn max_args(&self) -> Option<i32> {
-            Some(3)
+            None
         }
 
         fn name(&self) -> &str {
@@ -4370,6 +4372,31 @@ mod tests {
             ])
             .unwrap();
         assert_eq!(result, SqliteValue::Text(SmallText::from_string("yes")));
+    }
+
+    #[test]
+    fn test_iif_variadic_pairs_and_else() {
+        // SQLite 3.48+: iif(c1, v1, c2, v2, ..., else); no else means NULL.
+        let int = SqliteValue::Integer;
+        let txt = |s: &str| SqliteValue::Text(SmallText::from_string(s));
+        let f = IifFunc;
+        assert_eq!(
+            f.invoke(&[int(0), txt("a"), int(1), txt("b"), txt("c")])
+                .unwrap(),
+            txt("b")
+        );
+        assert_eq!(
+            f.invoke(&[int(0), txt("a"), int(0), txt("b"), txt("c")])
+                .unwrap(),
+            txt("c")
+        );
+        assert_eq!(
+            f.invoke(&[int(0), txt("a"), SqliteValue::Null, txt("b")])
+                .unwrap(),
+            SqliteValue::Null
+        );
+        assert_eq!(f.invoke(&[int(1), txt("x")]).unwrap(), txt("x"));
+        assert_eq!(f.max_args(), None);
     }
 
     // ── ifnull ───────────────────────────────────────────────────────────

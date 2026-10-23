@@ -1632,10 +1632,10 @@ fn known_function_arity(name: &str) -> Option<FunctionArity> {
         "replace" => Some(FunctionArity::Exact(3)),
         "count" => Some(FunctionArity::Range(0, 1)),
         "group_concat" | "trim" | "ltrim" | "rtrim" | "round" => Some(FunctionArity::Range(1, 2)),
-        // iif/if accept the 2-argument shorthand iif(X,Y) as of SQLite 3.48;
-        // `if` is iif's registered alias.
-        "substr" | "substring" | "like" | "iif" | "if" => Some(FunctionArity::Range(2, 3)),
-        "coalesce" | "json_extract" => Some(FunctionArity::VariadicMin(2)),
+        "substr" | "substring" | "like" => Some(FunctionArity::Range(2, 3)),
+        // iif/if take any number of arguments from two up as of SQLite 3.48
+        // (the parser rewrites those calls to CASE); `if` is iif's alias.
+        "coalesce" | "json_extract" | "iif" | "if" => Some(FunctionArity::VariadicMin(2)),
         "json_remove" => Some(FunctionArity::VariadicMin(1)),
         "json_insert" | "json_replace" | "json_set" => Some(FunctionArity::VariadicMin(3)),
         // Variadic: aggregates, scalars, date/time, and JSON functions

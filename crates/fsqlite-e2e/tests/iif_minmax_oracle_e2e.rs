@@ -103,6 +103,65 @@ fn iif_basic_and_null_condition() {
     });
 }
 
+// SQLite 3.48+: iif()/if() take any number of arguments from two up and are
+// compiled as CASE, so only the selected branch is evaluated.
+#[test]
+fn iif_variadic_lazy_and_if_alias() {
+    asupersync::test_utils::run_test(|| async {
+        assert_scalar(
+            &[
+                "SELECT iif(0, 'a', 1, 'b', 'c')",
+                "SELECT iif(0, 'a', 0, 'b', 'c')",
+                "SELECT iif(0, 'a', 0, 'b')",
+                "SELECT iif(NULL, 1, 0.5, 2, 3)",
+                "SELECT iif(0, 1, 0, 2, 0, 3, 4)",
+                "SELECT if(0, 'a', 1, 'b', 'c')",
+                "SELECT if(1, 'x')",
+                // The unselected branches would raise "integer overflow".
+                "SELECT iif(1, 'ok', abs(-9223372036854775808))",
+                "SELECT iif(0, abs(-9223372036854775808), 'else-ok')",
+                "SELECT iif(0, abs(-9223372036854775808), 1, 'second', abs(-9223372036854775808))",
+                // Arity errors stay errors in both engines.
+                "SELECT iif(1)",
+                "SELECT iif()",
+            ],
+            "iif_variadic_lazy_and_if_alias",
+        )
+        .await;
+    });
+}
+
+#[test]
+fn iif_variadic_over_table_rows() {
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.expect("open frank");
+        let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
+        let setup = "CREATE TABLE t(a INTEGER, b TEXT); \
+                     INSERT INTO t VALUES (0, 'z'), (1, 'o'), (2, 't'), (NULL, 'n'), (5, 'f');";
+        f.execute_batch(setup).await.expect("frank setup");
+        r.execute_batch(setup).expect("rusqlite setup");
+        let mut mismatches = Vec::new();
+        for q in [
+            "SELECT a, iif(a > 1, 'big', a = 1, 'one', a = 0, 'zero', 'null') FROM t ORDER BY a",
+            "SELECT b FROM t WHERE iif(a IS NULL, 0, a > 1, 1, b = 'z') ORDER BY b",
+            "SELECT iif(count(*) > 3, 'many', count(*) > 1, 'some', 'few') FROM t",
+            "SELECT iif(a = 5, b, a = 2, upper(b)) FROM t ORDER BY a",
+            "SELECT sum(iif(a > 0, a, a IS NULL, 100, -1)) FROM t",
+        ] {
+            match (frank_rows(&f, q).await, sqlite_rows(&r, q)) {
+                (Ok(a), Ok(b)) if a == b => {}
+                (a, b) => mismatches.push(format!("{q}\n  frank: {a:?}\n  csql:  {b:?}")),
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "iif_variadic_over_table_rows: {} mismatch(es)\n{}",
+            mismatches.len(),
+            mismatches.join("\n")
+        );
+    });
+}
+
 #[test]
 fn scalar_min_max_multi_arg() {
     asupersync::test_utils::run_test(|| async {
