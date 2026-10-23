@@ -345,6 +345,80 @@ impl FanoutDelivery {
         settle(transaction, cx, result).await
     }
 
+    /// Read one receiver's next bounded contiguous batch from ONE source snapshot.
+    ///
+    /// Each envelope is chained from that receiver's current committed cursor,
+    /// while payload reclamation still waits for the all-recipient fanout floor.
+    /// The source transaction ends before this method returns, so no SQL snapshot
+    /// spans transport. This prepares messages only; acknowledgement remains a
+    /// separate authenticated, receiver-specific operation.
+    pub async fn next_pending_batch(
+        &self,
+        conn: &mut Connection,
+        cx: &Cx,
+        receiver: ReceiverId,
+        max_messages: usize,
+        max_batch_bytes: usize,
+        max_message_bytes: usize,
+    ) -> DeliveryResult<Vec<OrderedMessage>> {
+        let slot = self.receiver_slot(receiver)?;
+        if max_messages == 0 || max_messages > 256 {
+            return Err(CaptureError::Input(
+                "delivery batch count must be in 1..=256",
+            )
+            .into());
+        }
+        if max_batch_bytes == 0 || max_batch_bytes > super::super::MAX_PAYLOAD {
+            return Err(CaptureError::Input(
+                "delivery batch byte bound must be in 1..64 MiB",
+            )
+            .into());
+        }
+        if max_message_bytes == 0 || max_message_bytes > super::super::MAX_PAYLOAD {
+            return Err(CaptureError::Input(
+                "delivery message bound must be in 1..64 MiB",
+            )
+            .into());
+        }
+        checkpoint(cx)?;
+        let transaction = conn.transaction().await?;
+        let result = async {
+            let progress = self.load(&transaction, cx).await?;
+            let mut previous = progress.replicas[slot].acknowledged;
+            let available = progress
+                .source
+                .produced_sequence
+                .checked_sub(previous.sequence)
+                .ok_or_else(|| invalid("fanout receiver cursor exceeds produced source"))?;
+            let count = max_messages.min(usize::try_from(available).unwrap_or(usize::MAX));
+            let mut messages = Vec::new();
+            messages
+                .try_reserve_exact(count)
+                .map_err(|_| FrankenError::OutOfMemory)?;
+            let mut batch_bytes = 0_usize;
+            for _ in 0..count {
+                checkpoint(cx)?;
+                let message = self
+                    .route
+                    .message_after(&transaction, cx, previous, max_message_bytes)
+                    .await?;
+                let body_bytes = message.body().len();
+                if body_bytes > max_batch_bytes.saturating_sub(batch_bytes) {
+                    if messages.is_empty() {
+                        return Err(CaptureError::Limit("delivery first batch bytes").into());
+                    }
+                    break;
+                }
+                batch_bytes += body_bytes;
+                previous = message.expected_checkpoint();
+                messages.push(message);
+            }
+            Ok(messages)
+        }
+        .await;
+        settle(transaction, cx, result).await
+    }
+
     /// Accept ONLY the named receiver's authenticated committed checkpoint.
     /// Exact current ACK replay is idempotent, including after payload release;
     /// older ACKs are Stale. A loss/error after COMMIT remains uncertain: inspect
@@ -545,6 +619,79 @@ mod tests {
             .await
             .unwrap()
             .unwrap()
+    }
+
+    #[test]
+    fn fanout_pending_batch_tracks_each_receiver_without_reclaiming_slow_payloads() {
+        asupersync::test_utils::run_test(|| async {
+            let group = group();
+            let cx = Cx::new();
+            let mut source = database().await;
+            let mut fast = database().await;
+            group.initialize(&mut source, &cx).await.unwrap();
+            ordered::initialize(&mut fast, &cx, group.baseline())
+                .await
+                .unwrap();
+            for id in 1..=3 {
+                insert(&mut source, &cx, &group.route, id).await;
+            }
+
+            let initial = group
+                .next_pending_batch(&mut source, &cx, FAST, 3, 64 * 1024, 64 * 1024)
+                .await
+                .unwrap();
+            assert_eq!(initial.len(), 3);
+            for (index, message) in initial.iter().enumerate() {
+                assert_eq!(
+                    message.envelope().sequence(),
+                    u64::try_from(index + 1).unwrap()
+                );
+                if index == 0 {
+                    assert_eq!(message.envelope().previous(), group.baseline().tip);
+                } else {
+                    assert_eq!(
+                        message.envelope().previous(),
+                        initial[index - 1].envelope().id()
+                    );
+                }
+            }
+
+            let receipt = receive(&mut fast, &cx, &initial[0]).await;
+            let progress = group
+                .acknowledge(&mut source, &cx, FAST, &initial[0], receipt.checkpoint)
+                .await
+                .unwrap();
+            assert_eq!(progress.replicas[0].acknowledged.sequence, 1);
+            assert_eq!(progress.replicas[1].acknowledged.sequence, 0);
+            assert_eq!(
+                progress.source.acknowledged.sequence, 0,
+                "slow receiver must retain the shared source payload"
+            );
+
+            let fast_remaining = group
+                .next_pending_batch(&mut source, &cx, FAST, 3, 64 * 1024, 64 * 1024)
+                .await
+                .unwrap();
+            assert_eq!(fast_remaining.len(), 2);
+            assert_eq!(fast_remaining[0].envelope().sequence(), 2);
+            assert_eq!(
+                fast_remaining[0].envelope().previous(),
+                initial[0].envelope().id()
+            );
+
+            let slow_full = group
+                .next_pending_batch(&mut source, &cx, SLOW, 3, 64 * 1024, 64 * 1024)
+                .await
+                .unwrap();
+            assert_eq!(slow_full.len(), 3);
+            for (slow, original) in slow_full.iter().zip(&initial) {
+                assert_eq!(slow.envelope(), original.envelope());
+                assert_eq!(slow.body(), original.body());
+            }
+
+            source.close().await.unwrap();
+            fast.close().await.unwrap();
+        });
     }
 
     #[test]
