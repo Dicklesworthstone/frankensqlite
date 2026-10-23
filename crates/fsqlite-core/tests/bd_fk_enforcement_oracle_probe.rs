@@ -157,3 +157,100 @@ fn fk_enforcement_matches_rusqlite_oracle() {
         );
     });
 }
+
+/// GH#451 / bd-reality-check-1022-llk6g.4: an UPDATE checks only the child-side
+/// foreign keys whose child columns it assigns (stock `fkChildIsModified`), so
+/// rows that already violate an unrelated key stay updatable. Each statement's
+/// success or failure must match stock, and so must the final rows.
+#[test]
+fn fk_update_checks_only_assigned_child_keys() {
+    asupersync::test_utils::run_test(|| async {
+        for path_kind in ["memory", "file"] {
+            let dir = tempfile::tempdir().unwrap();
+            let (f, r) = if path_kind == "memory" {
+                (
+                    Connection::open(":memory:").await.unwrap(),
+                    rusqlite::Connection::open_in_memory().unwrap(),
+                )
+            } else {
+                (
+                    Connection::open(dir.path().join("f.db").to_str().unwrap())
+                        .await
+                        .unwrap(),
+                    rusqlite::Connection::open(dir.path().join("r.db")).unwrap(),
+                )
+            };
+            let mut diffs = Vec::new();
+            for s in [
+                // Bundled rusqlite defaults foreign_keys to ON; seed with it OFF.
+                "PRAGMA foreign_keys=OFF",
+                "CREATE TABLE p(id INTEGER PRIMARY KEY, x INT, y INT, UNIQUE(x, y))",
+                "CREATE TABLE q(id INTEGER PRIMARY KEY)",
+                "CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id), \
+                 qid INTEGER REFERENCES q(id), a INT, b INT, note TEXT, \
+                 FOREIGN KEY(a, b) REFERENCES p(x, y))",
+                "CREATE TABLE r(id INTEGER PRIMARY KEY REFERENCES p(id), note TEXT)",
+                "CREATE TABLE d(id INTEGER PRIMARY KEY, \
+                 pid INTEGER REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED, note TEXT)",
+                "INSERT INTO p VALUES (1, 10, 20), (2, 30, 40)",
+                "INSERT INTO q VALUES (7)",
+                // Orphans written while foreign_keys is OFF.
+                "INSERT INTO c VALUES (1, 1, 7, 10, 20, 'ok'), (2, 99, 7, 10, 20, 'orphan pid'), \
+                 (3, 1, 77, 10, 20, 'orphan qid'), (4, 1, 7, 10, 99, 'orphan pair')",
+                "INSERT INTO r VALUES (98, 'orphan rowid key')",
+                "INSERT INTO d VALUES (1, 99, 'deferred orphan')",
+                "PRAGMA foreign_keys=ON",
+                "UPDATE c SET note = 'touched' WHERE id = 2",
+                "UPDATE c SET note = 'touched all'",
+                "UPDATE c SET qid = 7 WHERE id = 2",
+                "UPDATE c SET pid = 55 WHERE id = 1",
+                "UPDATE c SET pid = 2 WHERE id = 2",
+                "UPDATE c SET b = 40 WHERE id = 4",
+                "UPDATE c SET a = 30 WHERE id = 4",
+                "UPDATE c SET (a, b) = (30, 40) WHERE id = 4",
+                "UPDATE c SET a = 11 WHERE id = 3",
+                "UPDATE r SET note = 'touched' WHERE id = 98",
+                "UPDATE r SET rowid = 97 WHERE id = 98",
+                "UPDATE r SET id = 1 WHERE id = 98",
+                "BEGIN",
+                "UPDATE d SET note = 'touched in txn' WHERE id = 1",
+                "COMMIT",
+                "BEGIN",
+                "UPDATE d SET pid = 88 WHERE id = 1",
+                "COMMIT",
+                "ROLLBACK",
+            ] {
+                let fe = f.execute(s).await.is_ok();
+                let re = r.execute_batch(s).is_ok();
+                if fe != re {
+                    diffs.push(format!(
+                        "  [{path_kind}] `{s}`: frank ok={fe}, stock ok={re}"
+                    ));
+                }
+            }
+            for q in [
+                "SELECT id, pid, qid, a, b, note FROM c ORDER BY id",
+                "SELECT id, note FROM r ORDER BY id",
+                "SELECT id, pid, note FROM d ORDER BY id",
+            ] {
+                let fr = fq(&f, q).await;
+                let rr = rq(&r, q);
+                if fr != rr {
+                    diffs.push(format!(
+                        "  [{path_kind}] {q}\n     frank= {fr:?}\n     stock= {rr:?}"
+                    ));
+                }
+            }
+            eprintln!(
+                "event=fk_update_assigned_child_keys path={path_kind} divergences={}",
+                diffs.len()
+            );
+            assert!(
+                diffs.is_empty(),
+                "{} UPDATE child-key divergence(s) vs rusqlite:\n{}",
+                diffs.len(),
+                diffs.join("\n")
+            );
+        }
+    });
+}

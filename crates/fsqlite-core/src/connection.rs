@@ -13889,7 +13889,7 @@ pub struct Connection {
     /// bd-dk9ra (#111): rows queued for statement-suffix FK revalidation.
     /// Row-scoped so a single-row INSERT revalidates one row, not the whole
     /// child table (the former `SELECT *` rescan was O(rows) per statement).
-    statement_fk_validation_rows: RefCell<Vec<(String, Vec<SqliteValue>)>>,
+    statement_fk_validation_rows: RefCell<Vec<StatementFkRow>>,
     /// Prevent final-image FK rechecks from recursively queueing themselves.
     statement_fk_validation_rechecking: Cell<bool>,
     /// SET DEFAULT child rows changed by the active logical statement.
@@ -14868,11 +14868,16 @@ impl Drop for StatementFkValidationDepthGuard<'_> {
     }
 }
 
+/// A child row queued for statement-suffix FK revalidation: table, row image,
+/// and the child-side foreign keys to check (`None` = all of them; an UPDATE
+/// names only the keys whose child columns it assigns).
+type StatementFkRow = (String, Vec<SqliteValue>, Option<Vec<usize>>);
+
 /// Owns only the table/deferred-obligation suffixes appended by one outer
 /// logical-statement FK validation scope.
 struct StatementFkValidationSuffixGuard<'a> {
     tables: &'a RefCell<Vec<String>>,
-    rows: &'a RefCell<Vec<(String, Vec<SqliteValue>)>>,
+    rows: &'a RefCell<Vec<StatementFkRow>>,
     deferred: &'a RefCell<Vec<(String, Vec<SqliteValue>)>>,
     set_default_changes: &'a Cell<usize>,
     table_start: usize,
@@ -14885,7 +14890,7 @@ struct StatementFkValidationSuffixGuard<'a> {
 impl<'a> StatementFkValidationSuffixGuard<'a> {
     fn new(
         tables: &'a RefCell<Vec<String>>,
-        rows: &'a RefCell<Vec<(String, Vec<SqliteValue>)>>,
+        rows: &'a RefCell<Vec<StatementFkRow>>,
         deferred: &'a RefCell<Vec<(String, Vec<SqliteValue>)>>,
         set_default_changes: &'a Cell<usize>,
     ) -> Self {
@@ -42036,6 +42041,8 @@ impl Connection {
                         self.collect_update_trigger_rows(&effective_update, params)
                             .await?
                     };
+                    let modified_child_keys =
+                        self.fk_keys_modified_by_update(table_name, &effective_update.assignments);
                     for (old_values, new_values) in &rows_to_check {
                         // Parent-side: if this table is referenced by children,
                         // check that changing FK-referenced values doesn't orphan them.
@@ -42044,11 +42051,17 @@ impl Connection {
                             Box::pin(self.check_fk_on_update(table_name, old_values, new_values))
                                 .await?;
                         pending_fk_actions.extend(fk_actions);
-                        // Child-side: validate new FK values against parent tables.
+                        // Child-side: validate new FK values against parent tables,
+                        // for the keys whose child columns this UPDATE assigns.
                         // Only check when NOT inside a cascade action, because
                         // the cascade itself is modifying parent data.
-                        if self.fk_enforcement_enabled() {
-                            Box::pin(self.check_fk_parent_exists(table_name, new_values)).await?;
+                        if self.fk_enforcement_enabled() && !modified_child_keys.is_empty() {
+                            Box::pin(self.check_fk_parent_exists_for_keys(
+                                table_name,
+                                new_values,
+                                Some(&modified_child_keys),
+                            ))
+                            .await?;
                         }
                     }
                 }
@@ -71119,14 +71132,15 @@ impl Connection {
                 }
             }
             // Row-scoped pass: exactly the rows this statement touched.
-            for (child_table, row_values) in &queued_rows {
+            for (child_table, row_values, keys) in &queued_rows {
                 if child_tables
                     .iter()
                     .any(|table| table.eq_ignore_ascii_case(child_table))
                 {
                     continue; // already revalidated by the table-scoped pass
                 }
-                self.check_fk_parent_exists(child_table, row_values).await?;
+                self.check_fk_parent_exists_for_keys(child_table, row_values, keys.as_deref())
+                    .await?;
             }
             Ok(())
         }
@@ -71209,13 +71223,73 @@ impl Connection {
         table_name: &str,
         row_values: &[SqliteValue],
     ) -> Result<()> {
+        self.check_fk_parent_exists_for_keys(table_name, row_values, None)
+            .await
+    }
+
+    /// Indices of `table_name`'s child-side foreign keys whose child columns
+    /// an UPDATE assigns. Stock (fkey.c `fkChildIsModified`) checks only these
+    /// on UPDATE, so a row that already violates an unrelated key (written
+    /// while `foreign_keys` was OFF, say) stays updatable. A rowid alias
+    /// assignment counts as assigning the INTEGER PRIMARY KEY column.
+    fn fk_keys_modified_by_update(
+        &self,
+        table_name: &str,
+        assignments: &[fsqlite_ast::Assignment],
+    ) -> Vec<usize> {
+        let schema = self.schema.borrow();
+        let Some(table) = schema
+            .iter()
+            .find(|t| t.name.eq_ignore_ascii_case(table_name))
+        else {
+            return Vec::new();
+        };
+        let assigned: Vec<usize> = assignments
+            .iter()
+            .flat_map(|assignment| match &assignment.target {
+                fsqlite_ast::AssignmentTarget::Column(column) => std::slice::from_ref(column),
+                fsqlite_ast::AssignmentTarget::ColumnList(columns) => columns.as_slice(),
+            })
+            .filter_map(|name| {
+                table
+                    .columns
+                    .iter()
+                    .position(|column| column.name.eq_ignore_ascii_case(name))
+                    .or_else(|| {
+                        is_hidden_rowid_alias_name(name)
+                            .then(|| table.columns.iter().position(|column| column.is_ipk))
+                            .flatten()
+                    })
+            })
+            .collect();
+        table
+            .foreign_keys
+            .iter()
+            .enumerate()
+            .filter(|(_, fk)| {
+                fk.child_columns
+                    .iter()
+                    .any(|column| assigned.contains(column))
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// Check the child-side foreign keys of `row_values`, or only the keys at
+    /// `keys` (indices into the table's foreign keys) when given.
+    async fn check_fk_parent_exists_for_keys(
+        &self,
+        table_name: &str,
+        row_values: &[SqliteValue],
+        keys: Option<&[usize]>,
+    ) -> Result<()> {
         // bd-dk9ra attribution: per-call latency receipt, visible in
         // --nocapture keeper runs (no tracing subscriber needed). Average is
         // printed every 1024 calls; a flat average across N proves the #111
         // super-linear term lives OUTSIDE this function.
         let attribution_start = hot_path_profile_enabled().then(Instant::now);
         let result = self
-            .check_fk_parent_exists_inner(table_name, row_values)
+            .check_fk_parent_exists_inner(table_name, row_values, keys)
             .await;
         if let Some(start) = attribution_start {
             let ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -71238,6 +71312,7 @@ impl Connection {
         &self,
         table_name: &str,
         row_values: &[SqliteValue],
+        keys: Option<&[usize]>,
     ) -> Result<()> {
         let schema = self.schema.borrow();
         let table = schema
@@ -71263,9 +71338,11 @@ impl Connection {
             // check itself is flat ~2us/call while 22.5k checks served 15k
             // inserts). Table-scoped queueing remains for SET DEFAULT
             // cascades, which cannot name their affected rows here.
-            self.statement_fk_validation_rows
-                .borrow_mut()
-                .push((table_name.to_owned(), row_values.to_vec()));
+            self.statement_fk_validation_rows.borrow_mut().push((
+                table_name.to_owned(),
+                row_values.to_vec(),
+                keys.map(<[usize]>::to_vec),
+            ));
             return Ok(());
         }
 
@@ -71280,7 +71357,10 @@ impl Connection {
         // FKs are violated.
         let mut deferred_recorded = false;
 
-        for fk in &fk_defs {
+        for (key_index, fk) in fk_defs.iter().enumerate() {
+            if keys.is_some_and(|keys| !keys.contains(&key_index)) {
+                continue;
+            }
             // Collect child column values for this FK.
             let fk_values = fk
                 .child_columns
