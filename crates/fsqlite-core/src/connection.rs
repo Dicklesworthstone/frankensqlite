@@ -82513,11 +82513,23 @@ impl Connection {
                             .view_index_for_scope(&table_name, pragma_schema_scope(pragma))
                             .and_then(|idx| self.views.borrow().get(idx).cloned());
                         match view {
-                            Some(view) => Ok(self.build_view_table_info_rows(
-                                &view,
-                                &tables,
-                                full_name == "table_xinfo",
-                            )),
+                            Some(view) => {
+                                // bd-mw9m3: stock resolves the view's columns
+                                // first (sqlite3ViewGetColumnNames), so a view
+                                // that is circular or reads a missing relation
+                                // fails here as it does when selected from.
+                                SelectRelationResolver::new(self).validate_local_catalog_relation(
+                                    &table_name,
+                                    pragma_schema_scope(pragma),
+                                    "main",
+                                    || table_name.clone(),
+                                )?;
+                                Ok(self.build_view_table_info_rows(
+                                    &view,
+                                    &tables,
+                                    full_name == "table_xinfo",
+                                ))
+                            }
                             None => Ok(Vec::new()),
                         }
                     }
