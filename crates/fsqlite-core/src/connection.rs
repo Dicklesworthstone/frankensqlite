@@ -55582,8 +55582,9 @@ impl Connection {
                 .map(|table| table.root_page)
                 .ok_or_else(|| FrankenError::Internal(format!("table not found: {table_name}")))?
         };
-        #[cfg(feature = "ext-fts5")]
-        if root_page == 0 && self.is_live_fts5_instance(table_name) {
+        // A rootpage=0 table (FTS5, R-tree) keeps its rows in shadow tables,
+        // which the ordinary path persists; there is no b-tree to stream into.
+        if root_page == 0 {
             return Ok(None);
         }
         let root = page_number_from_schema_root(root_page, table_name, "table")?;
@@ -55885,6 +55886,12 @@ impl Connection {
                 Ok((inserted_rowids, patch_first_column_with_rowid))
             })?;
 
+        // Before the FTS5 path, which takes every rootpage=0 table for FTS5.
+        #[cfg(feature = "ext-rtree")]
+        if self.is_live_shadow_rtree_instance(table_name) {
+            self.persist_rtree_shadow_writes(table_name).await?;
+            return Ok(inserted_rowids);
+        }
         #[cfg(feature = "ext-fts5")]
         if self
             .persist_rootpage_zero_fts5_insert_rows(table_name, rows, &inserted_rowids, replace)
@@ -56131,6 +56138,11 @@ impl Connection {
                 instance.update(&cx, &args)
             })?;
         }
+        #[cfg(feature = "ext-rtree")]
+        if self.is_live_shadow_rtree_instance(&table_name) {
+            self.persist_rtree_shadow_writes(&table_name).await?;
+            return Ok(old_rowids.len());
+        }
         self.persist_materialized_live_vtab_rows(&table_name, &new_rows, &old_rowids, false)
             .await?;
         Ok(old_rowids.len())
@@ -56213,6 +56225,26 @@ impl Connection {
             )?;
             self.persist_rootpage_zero_fts5_deleted_rowids(table_name)
                 .await?;
+            return Ok(deleted);
+        }
+        #[cfg(feature = "ext-rtree")]
+        if root_page == 0 && self.is_live_shadow_rtree_instance(table_name) {
+            let cx = self.op_cx()?;
+            let deleted = self.with_active_live_vtab_instance(
+                &cx,
+                table_name,
+                "xBegin/xUpdate",
+                |instance| {
+                    self.begin_live_vtab_transaction_if_needed(table_name, instance, &cx)?;
+                    for rowid in rowids {
+                        cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+                        // `xUpdate(argc==1)`: a single old-rowid argument is a delete.
+                        instance.update(&cx, &[SqliteValue::Integer(*rowid)])?;
+                    }
+                    Ok(rowids.len())
+                },
+            )?;
+            self.persist_rtree_shadow_writes(table_name).await?;
             return Ok(deleted);
         }
         let root = page_number_from_schema_root(root_page, table_name, "table")?;
@@ -58230,6 +58262,168 @@ impl Connection {
         // this is what makes `%_idx` and `%_config` real WITHOUT ROWID b-trees
         // with owned roots and primary-key metadata, exactly like stock SQLite.
         self.execute_create_table(&create).await
+    }
+
+    /// `CREATE VIRTUAL TABLE ... USING rtree`: stock's rootpage=0 layout
+    /// (bd-reality-check-1022-llk6g.3). The tree lives in the `_rowid`,
+    /// `_node` and `_parent` shadow tables, created in stock's order with
+    /// stock's exact text, and xCreate's empty root node is stored in `_node`.
+    #[cfg(feature = "ext-rtree")]
+    async fn create_rootpage_zero_rtree_virtual_table(
+        &self,
+        table_name: &str,
+        col_infos: Vec<ColumnInfo>,
+        create_sql: &str,
+        mut pending_instance: PendingLiveVtabGuard<'_>,
+    ) -> Result<()> {
+        let page_size = usize::try_from(self.pager.page_size().get()).unwrap_or(usize::MAX);
+        let shadow_tables = self.invoke_live_vtab_callback("xCreate", || {
+            let rtree = pending_instance
+                .instance_mut()
+                .as_any_mut()
+                .downcast_mut::<RtreeVirtualTable>()
+                .ok_or_else(|| {
+                    FrankenError::Internal(format!(
+                        "virtual table {table_name} is not an R-tree instance"
+                    ))
+                })?;
+            rtree.init_shadow_storage(page_size);
+            Ok(rtree.shadow_table_definitions())
+        })?;
+        {
+            // Stock's xCreate fails on the first shadow name already taken.
+            let schema = self.schema.borrow();
+            if let Some((existing, _)) = shadow_tables.iter().find(|(name, _)| {
+                schema
+                    .iter()
+                    .any(|table| table.name.eq_ignore_ascii_case(name))
+            }) {
+                return Err(FrankenError::FunctionError(format!(
+                    "table \"{existing}\" already exists"
+                )));
+            }
+        }
+        let table_key = table_name.to_ascii_uppercase();
+        if self.vtab_instances.borrow().contains_key(&table_key) {
+            return Err(FrankenError::Internal(format!(
+                "live virtual table registry already contains {table_name}"
+            )));
+        }
+        self.schema.borrow_mut().push(TableSchema {
+            name: table_name.to_owned(),
+            root_page: 0,
+            columns: col_infos,
+            indexes: Vec::new(),
+            strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+        });
+        self.rebuild_schema_indices();
+        {
+            let mut registry = self.vtab_instances.borrow_mut();
+            if registry.contains_key(&table_key) {
+                return Err(FrankenError::Internal(format!(
+                    "live virtual table registry already contains {table_name}"
+                )));
+            }
+            registry.insert(table_key, pending_instance.take_instance());
+        }
+        self.note_live_vtab_created(table_name);
+        self.insert_sqlite_master_row("table", table_name, table_name, 0, create_sql)
+            .await?;
+        for (name, sql) in shadow_tables {
+            let Statement::CreateTable(create) = parse_single_statement(&sql)? else {
+                return Err(FrankenError::Internal(format!(
+                    "R-tree shadow definition for {name} did not parse as CREATE TABLE"
+                )));
+            };
+            // The ordinary CREATE TABLE stores the pending source verbatim, so
+            // sqlite_schema carries stock's exact shadow-table text.
+            *self.pending_ddl_source.borrow_mut() = Some(sql);
+            self.execute_create_table(&create).await?;
+        }
+        self.persist_rtree_shadow_writes(table_name).await?;
+        self.increment_schema_cookie().await?;
+        Ok(())
+    }
+
+    /// Whether `table_name` is a live R-tree kept in stock's shadow tables.
+    #[cfg(feature = "ext-rtree")]
+    fn is_live_shadow_rtree_instance(&self, table_name: &str) -> bool {
+        self.vtab_instances
+            .borrow()
+            .get(&table_name.to_ascii_uppercase())
+            .and_then(|instance| instance.as_any().downcast_ref::<RtreeVirtualTable>())
+            .is_some_and(RtreeVirtualTable::uses_shadow_storage)
+    }
+
+    /// Stores the `_node`, `_rowid` and `_parent` rows the live R-tree changed
+    /// since the last drain, so storage matches the instance at the end of
+    /// every statement.
+    #[cfg(feature = "ext-rtree")]
+    async fn persist_rtree_shadow_writes(&self, table_name: &str) -> Result<()> {
+        let cx = self.op_cx()?;
+        let writes =
+            self.with_active_live_vtab_instance(&cx, table_name, "xShadowWrites", |instance| {
+                instance
+                    .as_any_mut()
+                    .downcast_mut::<RtreeVirtualTable>()
+                    .map(RtreeVirtualTable::take_shadow_writes)
+                    .ok_or_else(|| {
+                        FrankenError::Internal(format!(
+                            "virtual table {table_name} is not an R-tree instance"
+                        ))
+                    })
+            })?;
+        for (suffix, changes) in [
+            ("_node", writes.node),
+            ("_rowid", writes.rowid),
+            ("_parent", writes.parent),
+        ] {
+            self.apply_storage_table_row_changes(&format!("{table_name}{suffix}"), changes)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Applies `(rowid, Some(record))` stores and `(rowid, None)` deletes to a
+    /// rowid table through the pager.
+    #[cfg(feature = "ext-rtree")]
+    async fn apply_storage_table_row_changes(
+        &self,
+        table_name: &str,
+        changes: Vec<(i64, Option<Vec<SqliteValue>>)>,
+    ) -> Result<()> {
+        if changes.is_empty() {
+            return Ok(());
+        }
+        let root_page = {
+            let schema = self.schema.borrow();
+            schema
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case(table_name))
+                .map(|table| table.root_page)
+                .ok_or_else(|| FrankenError::Internal(format!("table not found: {table_name}")))?
+        };
+        let root = page_number_from_schema_root(root_page, table_name, "table")?;
+        let text_encoding = self.db_text_encoding.get();
+
+        self.with_pager_write_txn(async |cx, txn| {
+            let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true).await?;
+            for (rowid, record) in changes {
+                if cursor.table_move_to(cx, rowid).await?.is_found() {
+                    cursor.delete(cx).await?;
+                }
+                if let Some(values) = record {
+                    let record = serialize_record_with_encoding(&values, text_encoding);
+                    cursor.table_insert(cx, rowid, &record).await?;
+                }
+            }
+            Ok(())
+        })
+        .await
     }
 
     #[allow(clippy::unused_self)]
@@ -66667,6 +66861,19 @@ impl Connection {
                         &create.to_string(),
                         pending_instance,
                         &create.args,
+                    )
+                    .await;
+            }
+            #[cfg(feature = "ext-rtree")]
+            if self.invoke_live_vtab_callback("asAny", || {
+                Ok(is_rtree_instance(pending_instance.instance()))
+            })? {
+                return self
+                    .create_rootpage_zero_rtree_virtual_table(
+                        &table_name,
+                        col_infos,
+                        &create.to_string(),
+                        pending_instance,
                     )
                     .await;
             }
@@ -102747,6 +102954,23 @@ impl Connection {
                 reloaded.insert_pending(table_key, &mut pending_instance)?;
                 continue;
             }
+            #[cfg(feature = "ext-rtree")]
+            if self
+                .hydrate_rootpage_zero_rtree_for_reload(
+                    cx,
+                    txn,
+                    page_size,
+                    reserved_per_page,
+                    schema,
+                    rowid_alias_columns,
+                    table_name,
+                    &mut pending_instance,
+                )
+                .await?
+            {
+                reloaded.insert_pending(table_key, &mut pending_instance)?;
+                continue;
+            }
 
             tracing::debug!(
                 table = %table_name,
@@ -102758,7 +102982,127 @@ impl Connection {
         Ok(reloaded)
     }
 
-    #[cfg(not(feature = "ext-fts5"))]
+    /// Loads a connected rootpage=0 R-tree from its stock shadow tables, as
+    /// stock or FrankenSQLite last wrote them. Returns false when the
+    /// instance is not an R-tree.
+    #[cfg(feature = "ext-rtree")]
+    #[allow(clippy::too_many_arguments)]
+    async fn hydrate_rootpage_zero_rtree_for_reload(
+        &self,
+        cx: &Cx,
+        txn: &mut TransactionKind,
+        page_size: PageSize,
+        reserved_per_page: u8,
+        schema: &[TableSchema],
+        rowid_alias_columns: &HashMap<String, usize>,
+        table_name: &str,
+        pending_instance: &mut PendingLiveVtabGuard<'_>,
+    ) -> Result<bool> {
+        if !is_rtree_instance(pending_instance.instance()) {
+            return Ok(false);
+        }
+        let mut shadow: [Vec<(i64, Vec<SqliteValue>)>; 3] = Default::default();
+        for (rows, suffix) in shadow.iter_mut().zip(["_node", "_rowid", "_parent"]) {
+            let name = format!("{table_name}{suffix}");
+            let table = schema
+                .iter()
+                .find(|candidate| candidate.name.eq_ignore_ascii_case(&name))
+                .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                    detail: format!("R-tree `{table_name}` is missing its shadow table `{name}`"),
+                })?;
+            *rows = self
+                .read_storage_table_rows_for_reload(
+                    cx,
+                    txn,
+                    page_size,
+                    reserved_per_page,
+                    table,
+                    rowid_alias_columns,
+                )
+                .await?;
+        }
+        let [nodes, rowids, parents] = shadow;
+        self.invoke_live_vtab_callback("xConnect", || {
+            pending_instance
+                .instance_mut()
+                .as_any_mut()
+                .downcast_mut::<RtreeVirtualTable>()
+                .ok_or_else(|| {
+                    FrankenError::Internal(format!(
+                        "virtual table {table_name} changed type during schema reload"
+                    ))
+                })?
+                .load_shadow_storage(&nodes, &rowids, &parents)
+        })?;
+        Ok(true)
+    }
+
+    /// Without FTS5, R-tree is the only module with shadow-backed hydration.
+    #[cfg(all(not(feature = "ext-fts5"), feature = "ext-rtree"))]
+    #[allow(clippy::too_many_arguments)]
+    async fn rebuild_rootpage_zero_live_vtab_instances_from_reload<'a>(
+        &'a self,
+        cx: &Cx,
+        txn: &mut TransactionKind,
+        page_size: PageSize,
+        reserved_per_page: u8,
+        schema: &[TableSchema],
+        rowid_alias_columns: &HashMap<String, usize>,
+        specs: &[(String, String, Vec<ColumnInfo>)],
+        preserved_live_vtab_keys: &HashSet<String>,
+    ) -> Result<PendingConnectedLiveVtabRegistryGuard<'a>> {
+        let mut reloaded = PendingConnectedLiveVtabRegistryGuard::new(self, cx);
+        for (table_name, create_sql, _) in specs {
+            let table_key = table_name.to_ascii_uppercase();
+            if preserved_live_vtab_keys.contains(&table_key) {
+                continue;
+            }
+            let Ok(Statement::CreateVirtualTable(create_stmt)) = parse_single_statement(create_sql)
+            else {
+                return Err(FrankenError::DatabaseCorrupt {
+                    detail: format!(
+                        "validated virtual table `{table_name}` could not be reparsed during schema reload"
+                    ),
+                });
+            };
+            let factory = {
+                let modules = self.vtab_modules.borrow();
+                modules.get(&create_stmt.module.to_ascii_uppercase()).cloned()
+            };
+            let Some(factory) = factory else {
+                continue;
+            };
+            let mut full_args = vec![
+                create_stmt.module.clone(),
+                "main".to_owned(),
+                table_name.clone(),
+            ];
+            full_args.extend(create_stmt.args.iter().cloned());
+            let full_arg_refs: Vec<&str> = full_args.iter().map(String::as_str).collect();
+            let instance =
+                self.invoke_live_vtab_callback("xConnect", || factory.connect(cx, &full_arg_refs))?;
+            let mut pending_instance =
+                PendingLiveVtabGuard::connected(self, cx, table_name, instance);
+            if self
+                .hydrate_rootpage_zero_rtree_for_reload(
+                    cx,
+                    txn,
+                    page_size,
+                    reserved_per_page,
+                    schema,
+                    rowid_alias_columns,
+                    table_name,
+                    &mut pending_instance,
+                )
+                .await?
+            {
+                reloaded.insert_pending(table_key, &mut pending_instance)?;
+            }
+        }
+        Ok(reloaded)
+    }
+
+    #[cfg(all(not(feature = "ext-fts5"), not(feature = "ext-rtree")))]
     async fn rebuild_rootpage_zero_live_vtab_instances_from_reload<'a>(
         &'a self,
         cx: &Cx,
@@ -104208,7 +104552,7 @@ impl Connection {
                             && existing_live_vtabs.contains_key(key)
                     })
                     .collect();
-                #[cfg(feature = "ext-fts5")]
+                #[cfg(any(feature = "ext-fts5", feature = "ext-rtree"))]
                 preserved_live_vtab_keys.extend(
                     pending_rootpage_zero_virtual_tables
                         .iter()

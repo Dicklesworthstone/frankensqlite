@@ -11,5 +11,8 @@ fsqlite-func = { workspace = true }
 fsqlite-types = { workspace = true }
 fsqlite-error = { workspace = true }
 
+[dev-dependencies]
+rusqlite = { workspace = true }
+
 [lints]
 workspace = true

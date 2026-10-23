@@ -1282,6 +1282,7 @@ dependencies = [
  "fsqlite-error",
  "fsqlite-func",
  "fsqlite-types",
+ "rusqlite",
 ]
 
 [[package]]

@@ -293,10 +293,12 @@ pub(crate) struct HeightTracked<T> {
 
 pub struct Parser {
     pub(crate) tokens: Vec<Token>,
-    // Cache PRAGMAs interpret numeric token spelling, not the decoded number.
-    // Only from_sql can retain that spelling; caller-built token streams have
-    // already lost e.g. the distinction between 1e3 and 1000.0.
-    pragma_source_sql: Option<String>,
+    // The source text, kept only where token spelling matters: cache PRAGMAs
+    // interpret a number's spelling, not the decoded value, and a virtual
+    // table's module arguments are their source text, as in stock. Only
+    // from_sql can retain it; caller-built token streams have already lost
+    // e.g. the distinction between 1e3 and 1000.0.
+    source_sql: Option<String>,
     pub(crate) pos: usize,
     pub(crate) errors: Vec<ParseError>,
     pub(crate) depth: u32,
@@ -333,7 +335,7 @@ impl Parser {
         }
         Self {
             tokens,
-            pragma_source_sql: None,
+            source_sql: None,
             pos: 0,
             errors: Vec::new(),
             depth: 0,
@@ -380,18 +382,18 @@ impl Parser {
     #[must_use]
     pub fn from_sql(sql: &str) -> Self {
         let mut parser = Self::new(Lexer::tokenize(sql));
-        parser.preserve_pragma_source(sql);
+        parser.preserve_source_where_needed(sql);
         parser
     }
 
-    fn preserve_pragma_source(&mut self, sql: &str) {
+    fn preserve_source_where_needed(&mut self, sql: &str) {
         // Ordinary SQL does not need a second copy of its source text.
         if self
             .tokens
             .iter()
-            .any(|token| token.kind == TokenKind::KwPragma)
+            .any(|token| matches!(token.kind, TokenKind::KwPragma | TokenKind::KwVirtual))
         {
-            self.pragma_source_sql = Some(sql.to_owned());
+            self.source_sql = Some(sql.to_owned());
         }
     }
 
@@ -2502,25 +2504,38 @@ impl Parser {
                 let mut args = Vec::new();
                 let mut depth = 0i32;
                 let mut current_arg = String::new();
+                // Source bytes from the current argument's first token to its last.
+                let mut arg_span: Option<(usize, usize)> = None;
                 loop {
+                    let token_span = self
+                        .current()
+                        .map(|token| (token.span.start as usize, token.span.end as usize));
+                    let extend_arg = |arg_span: &mut Option<(usize, usize)>| {
+                        if let Some((start, end)) = token_span {
+                            *arg_span =
+                                Some(arg_span.map_or((start, end), |(first, _)| (first, end)));
+                        }
+                    };
                     match self.peek() {
                         TokenKind::RightParen if depth == 0 => {
                             self.advance();
-                            args.push(current_arg.trim().to_owned());
+                            args.push(self.module_arg_text(&current_arg, arg_span));
                             break;
                         }
                         TokenKind::LeftParen => {
                             depth += 1;
                             current_arg.push('(');
+                            extend_arg(&mut arg_span);
                             self.advance();
                         }
                         TokenKind::RightParen => {
                             depth -= 1;
                             current_arg.push(')');
+                            extend_arg(&mut arg_span);
                             self.advance();
                         }
                         TokenKind::Comma if depth == 0 => {
-                            args.push(current_arg.trim().to_owned());
+                            args.push(self.module_arg_text(&current_arg, arg_span.take()));
                             current_arg = String::new();
                             self.advance();
                         }
@@ -2528,6 +2543,7 @@ impl Parser {
                             return Err(self.err_expected("closing parenthesis"));
                         }
                         _ => {
+                            extend_arg(&mut arg_span);
                             // Reconstruct token text from token kind.
                             let t = self
                                 .current()
@@ -2555,6 +2571,18 @@ impl Parser {
             module,
             args,
         }))
+    }
+
+    /// A module argument as stock passes it to xCreate: the source text from
+    /// its first token to its last. Without the source (a caller-built token
+    /// stream) the tokens' SQL spelling stands in, which can differ: `+tag`
+    /// would read `+ tag`, which stock's rtree turns into a bad declaration.
+    fn module_arg_text(&self, spelled: &str, span: Option<(usize, usize)>) -> String {
+        self.source_sql
+            .as_deref()
+            .zip(span)
+            .and_then(|(sql, (start, end))| sql.get(start..end))
+            .map_or_else(|| spelled.trim().to_owned(), str::to_owned)
     }
 
     // -----------------------------------------------------------------------
@@ -2671,7 +2699,7 @@ impl Parser {
         &mut self,
         preserve_numeric_spelling: bool,
     ) -> Result<Expr, ParseError> {
-        if preserve_numeric_spelling && let Some(sql) = &self.pragma_source_sql {
+        if preserve_numeric_spelling && let Some(sql) = &self.source_sql {
             let signed = matches!(self.peek(), TokenKind::Plus | TokenKind::Minus);
             let offset = usize::from(signed);
             if matches!(
@@ -2924,13 +2952,13 @@ fn parse_statements_with_scratch_inner(
     Lexer::tokenize_into_with_interner(sql, &mut scratch.tokens, &mut scratch.identifier_interner);
     let mut parser = Parser {
         tokens: std::mem::take(&mut scratch.tokens),
-        pragma_source_sql: None,
+        source_sql: None,
         pos: 0,
         errors: std::mem::take(&mut scratch.errors),
         depth: 0,
         has_with: false,
     };
-    parser.preserve_pragma_source(sql);
+    parser.preserve_source_where_needed(sql);
     let (statements, errors) = parser.parse_all();
     scratch.tokens = parser.tokens;
     scratch.tokens.clear();
@@ -5323,7 +5351,7 @@ mod tests {
         for sql in ["PRAGMA cache_size=1_0", "PRAGMA default_cache_size=0x1_0"] {
             assert!(parse_first_statement_with_tail(sql).is_err(), "{sql}");
         }
-        assert!(Parser::from_sql("SELECT 1e3").pragma_source_sql.is_none());
+        assert!(Parser::from_sql("SELECT 1e3").source_sql.is_none());
     }
 
     #[test]
@@ -9839,6 +9867,32 @@ mod tests {
     // -----------------------------------------------------------------------
     // bd-2kvo Phase 3 acceptance: all statement types (Section 12 coverage)
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn create_virtual_table_args_are_their_source_text() {
+        // Stock hands xCreate each argument's source text. Spelled from its
+        // tokens, `+tag0` read `+ tag0`, which stock's rtree declares as an
+        // empty column: `CREATE TABLE x(..., )` fails with a syntax error.
+        let sql = "CREATE VIRTUAL TABLE rt USING rtree(id,c0 , c1, +tag0, \"x y\"  REAL, f(a,b))";
+        let mut scratch = StatementParseScratch::default();
+        let mut scratch_statements = parse_statements_with_scratch(sql, &mut scratch).expect(sql);
+        for statement in [parse_one(sql), scratch_statements.remove(0)] {
+            let Statement::CreateVirtualTable(create) = statement else {
+                panic!("expected CREATE VIRTUAL TABLE");
+            };
+            assert_eq!(
+                create.args,
+                ["id", "c0", "c1", "+tag0", "\"x y\"  REAL", "f(a,b)"]
+            );
+        }
+
+        let Statement::CreateVirtualTable(create) =
+            parse_one("CREATE VIRTUAL TABLE docs USING fts5(body, tokenize='porter ascii')")
+        else {
+            panic!("expected CREATE VIRTUAL TABLE");
+        };
+        assert_eq!(create.args, ["body", "tokenize='porter ascii'"]);
+    }
 
     #[test]
     fn test_parser_all_statement_types() {

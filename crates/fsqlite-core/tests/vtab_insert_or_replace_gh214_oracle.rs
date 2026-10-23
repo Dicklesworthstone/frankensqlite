@@ -104,10 +104,8 @@ fn plain_insert_of_duplicate_id_still_errors_gh214() {
             .execute("INSERT INTO rt VALUES(1, 5.0, 6.0)")
             .await
             .expect_err("plain INSERT of a duplicate rowid must still fail");
-        assert!(
-            err.to_string().contains("PRIMARY KEY"),
-            "expected a PRIMARY KEY violation, got: {err}"
-        );
+        // Stock's rtreeConstraintError message.
+        assert_eq!(err.to_string(), "UNIQUE constraint failed: rt.id");
 
         // The original row is untouched by the failed insert.
         assert_eq!(contents(&conn).await, vec![row(1, 0.0, 1.0)]);
