@@ -56501,13 +56501,19 @@ impl Connection {
                     && let Some(fts5) = instance.as_any_mut().downcast_mut::<Fts5Table>()
                 {
                     fts5.ensure_rebuild_supported()?;
-                    fts5.ensure_shadow_rows_materializable_for_mutation()?;
-                    let rows = external_rows.unwrap_or_else(|| fts5.all_rows());
-                    for (rowid, _) in &rows {
-                        fts5.delete_document(*rowid);
-                    }
-                    for (rowid, columns) in &rows {
-                        fts5.insert_document(*rowid, columns);
+                    if let Some(rows) = external_rows {
+                        // Stock re-indexes the source from scratch: postings of
+                        // rows no longer in it must not survive (GH#211).
+                        fts5.rebuild_documents(rows);
+                    } else {
+                        fts5.ensure_shadow_rows_materializable_for_mutation()?;
+                        let rows = fts5.all_rows();
+                        for (rowid, _) in &rows {
+                            fts5.delete_document(*rowid);
+                        }
+                        for (rowid, columns) in &rows {
+                            fts5.insert_document(*rowid, columns);
+                        }
                     }
                 }
                 drop(instances);

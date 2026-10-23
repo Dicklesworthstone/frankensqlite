@@ -9248,6 +9248,9 @@ pub struct Fts5Table {
     documents: HashMap<i64, Vec<String>>,
     /// Shadow-table rows bound from an existing on-disk FTS5 table.
     shadow_rows: Option<Fts5ShadowRows>,
+    /// `content='tbl'`: the documents live in a host table, not in `%_content`,
+    /// so a reopened table's postings exist only in its persisted segments.
+    external_content: bool,
     /// Lazy on-disk mode: the table was reopened over persisted `_data`
     /// posting segments and is answered by point-reading those segments via a
     /// host-supplied [`Fts5OnDiskReader`] instead of loading the whole index.
@@ -9454,6 +9457,7 @@ impl Fts5Table {
             index: InvertedIndex::with_options(true, &[], DetailMode::Full),
             documents: HashMap::new(),
             shadow_rows: None,
+            external_content: false,
             lazy_on_disk: false,
             lazy_doc_count: 0,
             row_locales: HashMap::new(),
@@ -9737,17 +9741,19 @@ impl Fts5Table {
     }
 
     /// Hydrate the in-memory inverted index from the persisted on-disk segments
-    /// of a reopened CONTENTLESS table, so an incremental mutation appends to the
-    /// existing postings instead of dropping them.
+    /// of a reopened CONTENTLESS or EXTERNAL-content table, so an incremental
+    /// mutation appends to the existing postings instead of dropping them.
     ///
-    /// A no-op for content-backed tables (their index is rebuilt by
+    /// A no-op for tables with their own `_content` (their index is rebuilt by
     /// re-tokenizing the bound `_content` rows in
     /// [`Self::materialize_shadow_rows_for_mutation`]) and for tables with no
     /// persisted segments. On success the lazy shadow binding is consumed, so the
     /// subsequent `materialize_shadow_rows_for_mutation` becomes a no-op and the
     /// new row is appended to the fully-hydrated index.
-    fn hydrate_contentless_index_from_segments(&mut self) -> Result<()> {
-        if self.config.content_mode != ContentMode::Contentless {
+    fn hydrate_index_from_segments(&mut self) -> Result<()> {
+        // GH#211: an external-content table binds no `_content` rows either, so
+        // re-tokenizing them would leave only the new row's postings in memory.
+        if self.config.content_mode != ContentMode::Contentless && !self.external_content {
             return Ok(());
         }
         if self.shadow_rows.is_some() {
@@ -9813,13 +9819,13 @@ impl Fts5Table {
 
     /// Prepare a (possibly lazily reopened) table for an in-place mutation.
     ///
-    /// For a CONTENTLESS table reopened with persisted segments this hydrates the
-    /// in-memory index from those segments (the postings are otherwise
-    /// unrecoverable — contentless keeps no `_content` rows); for every other
-    /// table it is a cheap no-op and the standard content materialization runs at
-    /// mutation time.
+    /// For a CONTENTLESS or EXTERNAL-content table reopened with persisted
+    /// segments this hydrates the in-memory index from those segments (the
+    /// postings are otherwise unrecoverable — neither keeps `_content` rows); for
+    /// every other table it is a cheap no-op and the standard content
+    /// materialization runs at mutation time.
     pub fn ensure_shadow_rows_materializable_for_mutation(&mut self) -> Result<()> {
-        self.hydrate_contentless_index_from_segments()
+        self.hydrate_index_from_segments()
     }
 
     pub fn ensure_rebuild_supported(&self) -> Result<()> {
@@ -10043,6 +10049,12 @@ impl Fts5Table {
     #[must_use]
     pub const fn is_lazy_on_disk(&self) -> bool {
         self.lazy_on_disk
+    }
+
+    /// Whether the documents live in a host table (`content='tbl'`).
+    #[must_use]
+    pub const fn is_external_content(&self) -> bool {
+        self.external_content
     }
 
     /// Collect the full vocabulary of this table as `(term, entries)` groups for
@@ -10515,11 +10527,15 @@ impl Fts5Table {
         };
 
         let mut rows = vec![Fts5DataRow::new(FTS5_AVERAGES_ROWID, averages.encode())];
-        let pending = if self.config.content_mode == ContentMode::Contentless {
-            self.index.build_pending_hash(&self.prefix_lengths)?
-        } else {
-            self.build_pending_hash()?
-        };
+        // Neither a contentless nor an external-content table holds its
+        // documents' text once its index is hydrated from the segments, so the
+        // index itself is the source (GH#211).
+        let pending =
+            if self.config.content_mode == ContentMode::Contentless || self.external_content {
+                self.index.build_pending_hash(&self.prefix_lengths)?
+            } else {
+                self.build_pending_hash()?
+            };
         if !pending.is_empty() {
             let flush = pending.flush_to_segment(
                 1,
@@ -11030,6 +11046,7 @@ impl VirtualTable for Fts5Table {
         let mut columns: Vec<String> = Vec::new();
         let mut indexed_columns: Vec<bool> = Vec::new();
         let mut config = Fts5Config::default();
+        let mut external_content = false;
         let mut tokenizer_name = "unicode61".to_owned();
         let mut prefix_lengths = Vec::new();
 
@@ -11056,8 +11073,10 @@ impl VirtualTable for Fts5Table {
                         "content" => {
                             if value_unquoted.is_empty() {
                                 config.content_mode = ContentMode::Contentless;
+                                external_content = false;
                             } else {
                                 config.content_mode = ContentMode::Stored;
+                                external_content = true;
                             }
                         }
                         "content_rowid" => {
@@ -11191,6 +11210,7 @@ impl VirtualTable for Fts5Table {
         let mut table = Self::with_columns(columns);
         table.indexed_columns = indexed_columns;
         table.config = config;
+        table.external_content = external_content;
         table.tokenizer_name = tokenizer_name;
         table.prefix_lengths = prefix_lengths;
         table.index = InvertedIndex::with_options_and_tokendata(
@@ -11579,7 +11599,7 @@ pub fn fts5vocab_column_info(vocab_type: Fts5VocabType) -> Vec<(String, char)> {
 /// Strip the leading [`FTS5_MAIN_PREFIX_BYTE`] main-index marker from a stored
 /// term, returning the raw token bytes. A term with no marker is returned
 /// unchanged (some segments store raw tokens; see
-/// [`hydrate_contentless_index_from_segments`]).
+/// [`Fts5Table::hydrate_index_from_segments`]).
 fn strip_main_marker(stored_term: &[u8]) -> &[u8] {
     match stored_term.split_first() {
         Some((&FTS5_MAIN_PREFIX_BYTE, rest)) => rest,
