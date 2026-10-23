@@ -191,3 +191,145 @@ fn recursive_aggregate_in_recursive_term_errors() {
         .await;
     });
 }
+
+/// bd-reality-check-1022-llk6g.15: an ORDER BY on the recursive compound makes
+/// the queue a priority queue. Stock takes one row at a time, the first in
+/// that order (ties first-in first-out), and queues what the recursive arms
+/// produce from it. frank used to run whole generations: breadth-first.
+#[test]
+fn recursive_order_by_sets_queue_priority() {
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(&[
+            "CREATE TABLE org (name TEXT PRIMARY KEY, boss TEXT)",
+            "INSERT INTO org VALUES ('A',NULL),('Ax','A'),('Ay','A'),('Axx','Ax'),('Axy','Ax'),('Ayx','Ay')",
+            "CREATE TABLE fam (name TEXT, parent TEXT, born INT)",
+            "INSERT INTO fam VALUES ('Root',NULL,1900),('B','Root',1930),('A','Root',1925),\
+             ('Ba','B',1960),('Aa','A',1950),('Ab','A',1955)",
+        ])
+        .await;
+        check(
+            &f,
+            &r,
+            &[
+                // Depth-first (the SQLite docs' org chart): A,Ax,Axx,Axy,Ay,Ayx.
+                "WITH RECURSIVE u(name, lvl) AS (SELECT 'A', 0 UNION ALL \
+                 SELECT org.name, u.lvl + 1 FROM org JOIN u ON org.boss = u.name ORDER BY 2 DESC) \
+                 SELECT group_concat(name, ',') FROM u",
+                "WITH RECURSIVE u(name, lvl) AS (SELECT 'A', 0 UNION ALL \
+                 SELECT org.name, u.lvl + 1 FROM org JOIN u ON org.boss = u.name ORDER BY 2) \
+                 SELECT group_concat(name, ',') FROM u",
+                // The ORDER BY term binds to an alias of the first SELECT.
+                "WITH RECURSIVE u(name, lvl) AS (SELECT 'A' AS name, 0 AS lvl UNION ALL \
+                 SELECT org.name, u.lvl + 1 FROM org JOIN u ON org.boss = u.name ORDER BY lvl DESC) \
+                 SELECT group_concat(name, ',') FROM u",
+                "WITH RECURSIVE u(name, lvl) AS (SELECT 'A', 0 UNION ALL \
+                 SELECT org.name, u.lvl + 1 FROM org JOIN u ON org.boss = u.name ORDER BY 2 DESC, 1 DESC) \
+                 SELECT group_concat(name, ',') FROM u",
+                "WITH RECURSIVE t(name, depth, born) AS (SELECT 'Root', 0, 1900 UNION ALL \
+                 SELECT fam.name, t.depth + 1, fam.born FROM fam JOIN t ON fam.parent = t.name \
+                 ORDER BY 2 DESC, 3) SELECT group_concat(name) FROM t",
+                "WITH RECURSIVE t(name, depth, born) AS (SELECT 'Root', 0, 1900 UNION ALL \
+                 SELECT fam.name, t.depth + 1, fam.born FROM fam JOIN t ON fam.parent = t.name \
+                 ORDER BY 3 DESC) SELECT group_concat(name) FROM t",
+                // Several seed rows: 1,0,3,2,1,0,5,4,3,2,1,0 (not 1,3,5,0,2,4,...).
+                "WITH RECURSIVE c(x) AS (VALUES (5),(1),(3) UNION ALL \
+                 SELECT x - 1 FROM c WHERE x > 0 ORDER BY 1) SELECT group_concat(x) FROM c",
+                "WITH RECURSIVE c(x) AS (VALUES (5),(1),(3) UNION \
+                 SELECT x - 1 FROM c WHERE x > 0 ORDER BY 1 DESC) SELECT group_concat(x) FROM c",
+                "WITH RECURSIVE c(x) AS (VALUES (3),(1),(2) UNION ALL \
+                 SELECT x + 10 FROM c WHERE x < 10 ORDER BY 1 NULLS LAST) SELECT group_concat(x) FROM c",
+                // Collation ties leave first-in first-out: A,a,A.,a.,b,b.
+                "WITH RECURSIVE c(x) AS (VALUES ('b'),('A'),('a') UNION ALL \
+                 SELECT x || '.' FROM c WHERE length(x) < 2 ORDER BY 1 COLLATE NOCASE) \
+                 SELECT group_concat(x) FROM c",
+                // NULL sorts low, so DESC takes it last.
+                "WITH RECURSIVE c(x) AS (VALUES (NULL),(1) UNION ALL \
+                 SELECT x + 1 FROM c WHERE x < 2 ORDER BY 1 DESC) \
+                 SELECT group_concat(coalesce(x, 'N')) FROM c",
+                "WITH RECURSIVE c(x, y) AS (SELECT 1, 'z' AS y UNION ALL \
+                 SELECT x + 1, char(120 - x) FROM c WHERE x < 4 ORDER BY y) \
+                 SELECT group_concat(x || y) FROM c",
+                // Two recursive arms feed one queue, with and without UNION dedup.
+                "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x * 2 FROM c WHERE x < 20 \
+                 UNION ALL SELECT x * 3 FROM c WHERE x < 20 ORDER BY 1) SELECT group_concat(x) FROM c",
+                "WITH RECURSIVE c(x) AS (SELECT 1 UNION SELECT x * 2 FROM c WHERE x < 20 \
+                 UNION SELECT x * 3 FROM c WHERE x < 20 ORDER BY 1 DESC) SELECT group_concat(x) FROM c",
+                // LIMIT / OFFSET count rows in queue order: A,Ax,Axx and Ax,Axx,Axy.
+                "WITH RECURSIVE u(name, lvl) AS (SELECT 'A', 0 UNION ALL \
+                 SELECT org.name, u.lvl + 1 FROM org JOIN u ON org.boss = u.name ORDER BY 2 DESC LIMIT 3) \
+                 SELECT group_concat(name, ',') FROM u",
+                "WITH RECURSIVE u(name, lvl) AS (SELECT 'A', 0 UNION ALL \
+                 SELECT org.name, u.lvl + 1 FROM org JOIN u ON org.boss = u.name \
+                 ORDER BY 2 DESC LIMIT 3 OFFSET 1) SELECT group_concat(name, ',') FROM u",
+                "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 9 \
+                 ORDER BY 1 DESC LIMIT 4 OFFSET 2) SELECT group_concat(x) FROM c",
+                // A term that names no result column is an error on both.
+                "WITH RECURSIVE u(name, lvl) AS (SELECT 'A', 0 UNION ALL \
+                 SELECT org.name, u.lvl + 1 FROM org JOIN u ON org.boss = u.name ORDER BY lvl DESC) \
+                 SELECT group_concat(name, ',') FROM u",
+            ],
+            "recursive_order_by_sets_queue_priority",
+        )
+        .await;
+    });
+}
+
+/// bd-reality-check-1022-llk6g.15: the CTE's own LIMIT and OFFSET, in any
+/// form, apply to its output. frank used to honor only a bare literal LIMIT
+/// and returned every row for `LIMIT 5 OFFSET 2`.
+#[test]
+fn recursive_limit_offset_apply_to_cte_output() {
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(&[]).await;
+        check(
+            &f,
+            &r,
+            &[
+                "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 10 \
+                 LIMIT 5 OFFSET 2) SELECT group_concat(x) FROM c", // 3,4,5,6,7
+                "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 5 \
+                 LIMIT 3, 2) SELECT group_concat(x) FROM c", // 4,5
+                "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 5 \
+                 LIMIT -1 OFFSET -3) SELECT group_concat(x) FROM c", // 1..5
+                "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 5 \
+                 LIMIT 0) SELECT count(*) FROM c",
+                "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 5 \
+                 LIMIT 2 OFFSET 10) SELECT count(*) FROM c",
+                "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 5 \
+                 LIMIT 1 + 1 OFFSET (SELECT 1)) SELECT group_concat(x) FROM c", // 2,3
+                // Not an integer: datatype mismatch on both.
+                "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 5 \
+                 LIMIT 'a') SELECT count(*) FROM c",
+            ],
+            "recursive_limit_offset_apply_to_cte_output",
+        )
+        .await;
+    });
+}
+
+/// bd-reality-check-1022-llk6g.15: LIMIT with OFFSET, or a LIMIT that is not
+/// a bare literal, must still end an otherwise infinite recursion (frank used
+/// to run forever), with and without an ORDER BY.
+#[test]
+fn recursive_limit_offset_cuts_infinite() {
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(&[]).await;
+        check(
+            &f,
+            &r,
+            &[
+                "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c LIMIT 4 OFFSET 3) \
+                 SELECT group_concat(x) FROM c", // 4,5,6,7
+                "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c \
+                 LIMIT 2 + 2 OFFSET (SELECT 3)) SELECT group_concat(x) FROM c",
+                "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c ORDER BY 1 DESC LIMIT 5) \
+                 SELECT group_concat(x) FROM c",
+                // The consumer's LIMIT bounds an ordered recursion too.
+                "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c ORDER BY 1 DESC) \
+                 SELECT x FROM c LIMIT 3",
+            ],
+            "recursive_limit_offset_cuts_infinite",
+        )
+        .await;
+    });
+}

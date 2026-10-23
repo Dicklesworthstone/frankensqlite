@@ -49,7 +49,7 @@ use hashbrown::HashMap as HbHashMap;
 use lru::LruCache;
 use std::borrow::Cow;
 use std::cell::{Cell, OnceCell, RefCell};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::hash::Hash;
 use std::num::NonZeroUsize;
@@ -7042,6 +7042,49 @@ enum RecursiveCteArmExecutionPlan {
     Direct(RecursiveCteDirectEvalPlan),
     Statement(SelectStatement),
 }
+
+/// The ORDER BY of a recursive CTE, resolved to output columns. It makes the
+/// recursion queue a priority queue (stock `generateWithRecursiveQuery`).
+struct RecursiveCteQueueOrder {
+    terms: Vec<(usize, bool, NullsOrder, Option<String>)>,
+    registry: CollationRegistry,
+}
+
+/// One queued recursive-CTE row. `seq` is the queue insertion order, so rows
+/// that tie on the ORDER BY leave first-in first-out, as in stock.
+struct RecursiveCteQueueEntry<'a> {
+    row: Vec<SqliteValue>,
+    seq: u64,
+    order: &'a RecursiveCteQueueOrder,
+}
+
+impl Ord for RecursiveCteQueueEntry<'_> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // `BinaryHeap` pops its greatest entry: reverse the queue order.
+        compare_rows_by_resolved_order_terms(
+            &self.row,
+            &other.row,
+            &self.order.terms,
+            &self.order.registry,
+        )
+        .then(self.seq.cmp(&other.seq))
+        .reverse()
+    }
+}
+
+impl PartialOrd for RecursiveCteQueueEntry<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for RecursiveCteQueueEntry<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.seq == other.seq
+    }
+}
+
+impl Eq for RecursiveCteQueueEntry<'_> {}
 
 fn flat_combining_abort_total(snapshot: FlatCombiningMetrics) -> u64 {
     snapshot
@@ -97064,23 +97107,12 @@ impl Connection {
             .await?;
         let mut all_rows: Vec<Vec<SqliteValue>> =
             base_rows.iter().map(|r| r.values().to_vec()).collect();
-        // GH #152: a literal LIMIT inside the recursive CTE caps the total rows
-        // it produces (stock sqlite3 stops the recursion once the LIMIT is
-        // reached). A LIMIT with OFFSET or a non-literal expression is not capped
-        // here — the sum fast paths bail on any CTE limit, and other shapes run
-        // to the fixpoint (GH#419: there is no round cap any more).
-        let recursive_cte_row_cap: Option<usize> =
-            cte.query
-                .limit
-                .as_ref()
-                .and_then(|lc| match (&lc.limit, &lc.offset) {
-                    (fsqlite_ast::Expr::Literal(fsqlite_ast::Literal::Integer(n), _), None)
-                        if *n >= 0 =>
-                    {
-                        usize::try_from(*n).ok()
-                    }
-                    _ => None,
-                });
+        // GH #152: the CTE's own LIMIT caps the rows it produces (stock sqlite3
+        // stops the recursion once the LIMIT is reached); OFFSET drops the first
+        // rows from the output while they still feed the recursion. Stock
+        // evaluates both once, up front; the sum fast paths bail on any CTE
+        // limit (GH#419: there is no round cap any more).
+        let (cte_limit, cte_offset) = self.recursive_cte_limit_offset(cte, params).await?;
         let mut recursive_arms: Vec<(CompoundOp, RecursiveCteArmExecutionPlan)> = Vec::new();
         for (op, core) in &cte.query.body.compounds {
             if matches!(op, CompoundOp::Intersect | CompoundOp::Except) {
@@ -97162,10 +97194,30 @@ impl Connection {
         // (see `recursive_cte_consumer_row_budget`), so rows past that point
         // need not be produced. Combined with the CTE's own LIMIT this is the
         // earliest safe stopping point.
-        let stop_row_cap = match (recursive_cte_row_cap, consumer_row_budget) {
+        let output_row_cap = match (cte_limit, consumer_row_budget) {
             (Some(cap), Some(budget)) => Some(cap.min(budget)),
             (cap, budget) => cap.or(budget),
         };
+        if !cte.query.order_by.is_empty() {
+            // Rare shape: box it so its state does not widen every recursive
+            // CTE's future.
+            let rows = Box::pin(self.materialize_recursive_cte_ordered(
+                cte,
+                root_page,
+                all_rows,
+                &recursive_arms,
+                &mut seen_rows,
+                cte_offset,
+                output_row_cap,
+                params,
+            ))
+            .await?;
+            self.store_recursive_cte_rows(root_page, rows);
+            return Ok(());
+        }
+        // Without an ORDER BY the queue is first-in first-out, so whole
+        // generations can run at once: the output is `all_rows` in order.
+        let stop_row_cap = output_row_cap.map(|cap| cap.saturating_add(cte_offset));
         let cx = self.op_cx_after_background_status();
         // Iterate: feed working set to recursive arm, collect new rows, until
         // the fixpoint, a row cap, or cancellation. No round cap (GH#419).
@@ -97252,20 +97304,174 @@ impl Connection {
         if let Some(cap) = stop_row_cap {
             all_rows.truncate(cap);
         }
+        all_rows.drain(..cte_offset.min(all_rows.len()));
+        self.store_recursive_cte_rows(root_page, all_rows);
+        Ok(())
+    }
 
-        // Final: populate temp table with ALL accumulated rows. `all_rows` is not
-        // read after this, so move each row into the temp table instead of cloning
-        // (bd-gpi5i: drops one O(total-rows) clone pass from the materialization).
-        {
-            let mut db = self.db.borrow_mut();
-            if let Some(table) = db.get_table_mut(root_page) {
-                table.clear();
-                for (i, vals) in all_rows.into_iter().enumerate() {
-                    table.insert_row(i as i64 + 1, vals);
-                }
+    /// Final step of a recursive CTE: populate its temp table with every output
+    /// row. The rows are moved, not cloned (bd-gpi5i: drops one O(total-rows)
+    /// clone pass from the materialization).
+    fn store_recursive_cte_rows(&self, root_page: i32, rows: Vec<Vec<SqliteValue>>) {
+        let mut db = self.db.borrow_mut();
+        if let Some(table) = db.get_table_mut(root_page) {
+            table.clear();
+            for (i, vals) in rows.into_iter().enumerate() {
+                table.insert_row(i as i64 + 1, vals);
             }
         }
-        Ok(())
+    }
+
+    /// Evaluate a recursive CTE's own LIMIT and OFFSET once, up front, as stock
+    /// does: a negative LIMIT means no limit and a negative OFFSET counts as 0.
+    async fn recursive_cte_limit_offset(
+        &self,
+        cte: &fsqlite_ast::Cte,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<(Option<usize>, usize)> {
+        let Some(clause) = cte.query.limit.as_ref() else {
+            return Ok((None, 0));
+        };
+        // Boxed: the evaluator can run subqueries, and its future would
+        // otherwise widen every recursive CTE's future.
+        let limit =
+            Box::pin(self.eval_expression_only_limit_offset_expr(&clause.limit, params)).await?;
+        let offset = match &clause.offset {
+            Some(expr) => {
+                Box::pin(self.eval_expression_only_limit_offset_expr(expr, params)).await?
+            }
+            None => 0,
+        };
+        Ok((
+            usize::try_from(limit).ok(),
+            usize::try_from(offset.max(0)).unwrap_or(usize::MAX),
+        ))
+    }
+
+    /// Run a recursive CTE whose compound has an ORDER BY. Stock
+    /// (`generateWithRecursiveQuery`) keeps a priority queue ordered by it and
+    /// takes ONE row at a time: the row is emitted (unless OFFSET skips it),
+    /// then the recursive arms run with that row alone as the CTE table and
+    /// queue what they produce. The LIMIT-th emitted row ends the recursion.
+    /// Processing a whole generation at once would give a different order,
+    /// e.g. breadth-first instead of the depth-first `ORDER BY level DESC`.
+    async fn materialize_recursive_cte_ordered(
+        &self,
+        cte: &fsqlite_ast::Cte,
+        root_page: i32,
+        initial_rows: Vec<Vec<SqliteValue>>,
+        recursive_arms: &[(CompoundOp, RecursiveCteArmExecutionPlan)],
+        seen_rows: &mut BTreeSet<Vec<SqliteValue>>,
+        offset: usize,
+        output_cap: Option<usize>,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Vec<Vec<SqliteValue>>> {
+        let indices = resolve_compound_order_output_indices(self, &cte.query, &[])?;
+        let mut cores = Vec::with_capacity(cte.query.body.compounds.len() + 1);
+        cores.push(&cte.query.body.select);
+        cores.extend(cte.query.body.compounds.iter().map(|(_, core)| core));
+        let candidate_rows = {
+            let schemas = self.schema.borrow();
+            cores
+                .iter()
+                .map(|core| select_core_result_collation_candidates(core, &schemas))
+                .collect::<Vec<_>>()
+        };
+        let registry = lock_unpoisoned(self.collation_registry.as_ref()).clone();
+        let terms = cte
+            .query
+            .order_by
+            .iter()
+            .zip(indices)
+            .map(|(term, index)| {
+                let collation = match &term.expr {
+                    Expr::Collate { collation, .. } => Some(collation.clone()),
+                    _ => resolve_compound_column_collation_candidate(
+                        &candidate_rows,
+                        index,
+                        &registry,
+                    )?,
+                };
+                Ok((
+                    index,
+                    matches!(term.direction, Some(SortDirection::Desc)),
+                    term.nulls
+                        .unwrap_or_else(|| default_nulls_order(term.direction)),
+                    collation,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let order = RecursiveCteQueueOrder { terms, registry };
+
+        let mut output: Vec<Vec<SqliteValue>> = Vec::new();
+        if output_cap == Some(0) {
+            return Ok(output);
+        }
+        let mut queue = BinaryHeap::with_capacity(initial_rows.len());
+        let mut seq: u64 = 0;
+        for row in initial_rows {
+            queue.push(RecursiveCteQueueEntry {
+                row,
+                seq,
+                order: &order,
+            });
+            seq += 1;
+        }
+        let requires_temp_table = recursive_arms
+            .iter()
+            .any(|(_, plan)| !matches!(plan, RecursiveCteArmExecutionPlan::Direct(_)));
+        let cx = self.op_cx_after_background_status();
+        let mut skipped: usize = 0;
+        while let Some(entry) = queue.pop() {
+            cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+            let row = entry.row;
+            let emit = skipped >= offset;
+            if !emit {
+                skipped += 1;
+            } else if output_cap.is_some_and(|cap| output.len() + 1 >= cap) {
+                output.push(row);
+                break;
+            }
+            if requires_temp_table {
+                let mut db = self.db.borrow_mut();
+                if let Some(table) = db.get_table_mut(root_page) {
+                    table.clear();
+                    table.insert_row(1, row.clone());
+                }
+            }
+            let working_set = std::slice::from_ref(&row);
+            for (op, execution_plan) in recursive_arms {
+                let arm_rows = match execution_plan {
+                    RecursiveCteArmExecutionPlan::Direct(plan) if plan.sync_evaluable => {
+                        Self::execute_recursive_cte_direct_eval_plan_sync(
+                            plan,
+                            working_set,
+                            params,
+                        )?
+                    }
+                    _ => {
+                        self.execute_recursive_cte_arm_select(execution_plan, working_set, params)
+                            .await?
+                    }
+                };
+                for arm_row in &arm_rows {
+                    let vals = arm_row.values().to_vec();
+                    if matches!(op, CompoundOp::Union) && !seen_rows.insert(vals.clone()) {
+                        continue;
+                    }
+                    queue.push(RecursiveCteQueueEntry {
+                        row: vals,
+                        seq,
+                        order: &order,
+                    });
+                    seq += 1;
+                }
+            }
+            if emit {
+                output.push(row);
+            }
+        }
+        Ok(output)
     }
 
     async fn execute_recursive_cte_arm_select(
@@ -136715,35 +136921,44 @@ fn sort_rows_by_order_terms(
     let coll_snapshot = lock_unpoisoned(collation_registry).clone();
 
     rows.sort_by(|a, b| {
-        for (idx, desc, nulls, coll) in &resolved {
-            let av = &a.values()[*idx];
-            let bv = &b.values()[*idx];
-            let a_null = av.is_null();
-            let b_null = bv.is_null();
-            if a_null || b_null {
-                if a_null && b_null {
-                    continue;
-                }
-                let ord = match (a_null, *nulls) {
-                    (true, NullsOrder::First) | (false, NullsOrder::Last) => {
-                        std::cmp::Ordering::Less
-                    }
-                    (true, NullsOrder::Last) | (false, NullsOrder::First) => {
-                        std::cmp::Ordering::Greater
-                    }
-                };
-                return ord;
-            }
-            let ord = cmp_sqlite_values_collated_snapshot(av, bv, coll.as_deref(), &coll_snapshot);
-            let ord = if *desc { ord.reverse() } else { ord };
-            if ord != std::cmp::Ordering::Equal {
-                return ord;
-            }
-        }
-        std::cmp::Ordering::Equal
+        compare_rows_by_resolved_order_terms(a.values(), b.values(), &resolved, &coll_snapshot)
     });
 
     Ok(())
+}
+
+/// Compare two rows by ORDER BY terms already resolved to
+/// `(column index, descending, nulls order, collation)`.
+fn compare_rows_by_resolved_order_terms(
+    a: &[SqliteValue],
+    b: &[SqliteValue],
+    resolved: &[(usize, bool, NullsOrder, Option<String>)],
+    registry: &CollationRegistry,
+) -> std::cmp::Ordering {
+    for (idx, desc, nulls, coll) in resolved {
+        let av = &a[*idx];
+        let bv = &b[*idx];
+        let a_null = av.is_null();
+        let b_null = bv.is_null();
+        if a_null || b_null {
+            if a_null && b_null {
+                continue;
+            }
+            let ord = match (a_null, *nulls) {
+                (true, NullsOrder::First) | (false, NullsOrder::Last) => std::cmp::Ordering::Less,
+                (true, NullsOrder::Last) | (false, NullsOrder::First) => {
+                    std::cmp::Ordering::Greater
+                }
+            };
+            return ord;
+        }
+        let ord = cmp_sqlite_values_collated_snapshot(av, bv, coll.as_deref(), registry);
+        let ord = if *desc { ord.reverse() } else { ord };
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    std::cmp::Ordering::Equal
 }
 
 /// Convert an AST `ForeignKeyClause` to a codegen `FkDef`.
