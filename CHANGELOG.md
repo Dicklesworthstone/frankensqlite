@@ -23,7 +23,7 @@ Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releas
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| [Unreleased](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.4.12...main) | HEAD | 2026-10-13 | Development on `main` after v0.4.12. |
+| [Unreleased](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.4.12...main) | HEAD | 2026-10-22 | Development on `main` after v0.4.12, with **data-integrity fixes**: an unparenthesized column `DEFAULT` swallowed a following NOT NULL or COLLATE, also on stock-created schemas; an FTS5 external-content `rebuild` after a content-table rename erased the index (GH#211); concurrent writers could commit duplicate implicit rowids (bd-ujp0h, bd-2ym3z); triggers fired by a cascade skipped FK checks (bd-vcvn0). Plus GH#509, GH#511, GH#512, GH#448 and GH#521 fixes, candidate fixes for GH#510, GH#519 and GH#506 (macOS) that were not run when committed, large-commit memory bounds (GH#518), stable-Rust build work (GH#522; releases through v0.4.12 still need nightly), the source-incompatible `MigrationOutcome::Incomplete`, and ordered batch replication in the TypeScript SDK. Many commits record no compile or test run |
 | [v0.4.12](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.4.12) | Release | 2026-10-13 | Uniform release of all 26 public crates, with an **upgrade advisory for 0.4.10**: a join whose outer table was read through an index with a `DESC` column returned no rows (GH#502); `:memory:` with `autocommit_retain = OFF` could lose every row of a table (GH#503); `DELETE ... WHERE EXISTS` over the same table deleted the wrong rows (bd-ntt2b). Plus FROM-less row-value comparisons (GH#450), attached-database DML and name resolution, conflict-clause and constraint parity, a full filesystem during WAL-index growth reported as an I/O error instead of a SIGBUS on Linux (GH#506), WAL-FEC attach/close fixes, and index seeks for `IN` lists and `WHERE k = ? ORDER BY id` |
 | [0.4.11](https://crates.io/crates/fsqlite-vfs/0.4.11) | crates.io only | 2026-10-09 | `fsqlite-vfs` alone: on macOS and other non-Linux Unix, a redundant main-DB descriptor opened while WAL lifetime locks were held is reused instead of parked forever, so long-running processes stop leaking about 2 fds per fresh connection (bd-l0rbc). Tag `fsqlite-vfs-v0.4.11`; no GitHub Release. The next uniform release must be >= 0.4.12 |
 | [v0.4.10](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.4.10) | Release | 2026-10-07 | Uniform release of all 26 public crates, with a **data-integrity advisory**: inserts inside a transaction could silently corrupt a table b-tree (bd-obwsy); UPDATE ... FROM lost or repeated updates (bd-b5j26); non-integer rowid / INTEGER PRIMARY KEY values left malformed index entries (REINDEX); a REPLACE constraint could delete a row an IGNORE constraint then kept out; a retried fsync after a failed WAL sync could vouch for unwritten frames (bd-alyrn). Plus checkpoint source validation, max-rowid and rowid-reuse parity, `:memory:` freelist reuse, stock empty-schema opens, and DML/join/trigger performance work |
@@ -61,7 +61,116 @@ Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releas
 
 Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.4.12...main>
 
+**Verification status.** GitHub Actions is off, and many commits in this range state in their own
+messages that Cargo was unavailable or that their Rust tests were not run; the entries below repeat
+those caveats. Where the tracker (`.beads/issues.jsonl`) later records a run of a named test, the
+entry says so; that run is not part of the commit.
+[1cab6896d](https://github.com/Dicklesworthstone/frankensqlite/commit/1cab6896d) made the
+`fsqlite-vfs`, `fsqlite-wal` and `fsqlite-core` targets compile and pass `clippy -D warnings` again
+on 2026-10-22, and the tracker records no full-workspace test run of `main` since 2026-10-03
+(bd-reality-check-1022-llk6g.12).
+
+### Data integrity
+
+- **An unparenthesized column `DEFAULT` swallowed the constraints that followed it, on new and
+  stock-created schemas alike
+  ([770fe3048](https://github.com/Dicklesworthstone/frankensqlite/commit/770fe3048),
+  bd-reality-check-1022-llk6g.1).** `x INTEGER DEFAULT 0 NOT NULL` became the default
+  `0 IS NOT NULL` (that is, 1) with no NOT NULL check, and `DEFAULT 'a' COLLATE NOCASE` lost its
+  collation, so files written by earlier versions may hold wrong defaults or NULLs in NOT NULL
+  columns, which stock `PRAGMA integrity_check` reports; the default is now one signed term as in
+  stock, which makes `DEFAULT 1 + 2` a syntax error.
+- **An FTS5 `'rebuild'` on an external-content table whose content table had been renamed erased the
+  index ([#211](https://github.com/Dicklesworthstone/frankensqlite/issues/211),
+  [183f44fc1](https://github.com/Dicklesworthstone/frankensqlite/commit/183f44fc1)).** Stock fails
+  that rebuild with `no such table`, but FrankenSQLite rebuilt from its in-memory documents, which
+  hold no external content, and dropped every posting; it now returns the same error and leaves the
+  index and source rows unchanged.
+- **Several connections inserting implicit rowids into one WAL database could commit the same rowid
+  (bd-ujp0h, bd-2ym3z;
+  [76e57eeac](https://github.com/Dicklesworthstone/frankensqlite/commit/76e57eeac),
+  [ce314ef4e](https://github.com/Dicklesworthstone/frankensqlite/commit/ce314ef4e)), the known issue
+  listed for v0.4.12.** A right-edge split now takes a write-conflict claim on the old leaf even
+  when its bytes are unchanged, a passive checkpoint no longer double-counts backfilled commits in
+  the visible commit sequence, and a reused VDBE engine drops its cached concurrent rowid allocator;
+  neither commit was built or run when committed, and the tracker records the 4- and 8-writer
+  `concurrent_implicit_rowid_append_with_autocheckpoint_and_large_rows_bd_ujp0h_bd_2ym3z` keeper
+  passing with stock `integrity_check` afterwards
+  ([34e882226](https://github.com/Dicklesworthstone/frankensqlite/commit/34e882226)).
+- **Statements run by a user trigger that an `ON DELETE` or `ON UPDATE CASCADE` fired skipped
+  foreign-key checks, so they could insert orphan rows and let deferred violations pass COMMIT
+  ([0bede8f87](https://github.com/Dicklesworthstone/frankensqlite/commit/0bede8f87), bd-vcvn0).**
+  Enforcement is now restored on entry to every trigger frame; the fix was verified with stable
+  rustc 1.99.1 by an external program running the new oracle cases, because builds of the
+  repository's own test target ran out of memory.
+
 ### Fixed
+
+SQL results and schema:
+
+- STRICT `ANY` columns keep numeric-looking text such as `'000123'` as text, including defaults that
+  `ALTER TABLE ADD COLUMN` backfills
+  ([#509](https://github.com/Dicklesworthstone/frankensqlite/issues/509),
+  [e55d78c96](https://github.com/Dicklesworthstone/frankensqlite/commit/e55d78c96),
+  [78dc5e39a](https://github.com/Dicklesworthstone/frankensqlite/commit/78dc5e39a)). Neither commit
+  was built or run when committed; the tracker records
+  `strict_any_column_preserves_zero_padded_text_and_all_storage_classes_gh509`
+  ([97618e7da](https://github.com/Dicklesworthstone/frankensqlite/commit/97618e7da)) passing against
+  rusqlite afterwards.
+- `WITH c AS (...) INSERT INTO attached.t SELECT ... FROM c` no longer fails with `no such table: c`
+  ([#511](https://github.com/Dicklesworthstone/frankensqlite/issues/511),
+  [4b6919f14](https://github.com/Dicklesworthstone/frankensqlite/commit/4b6919f14)).
+- [#512](https://github.com/Dicklesworthstone/frankensqlite/issues/512): `PRAGMA table_info` reports
+  the right `pk` ordinal for a quoted or parenthesized composite-key column, and the next implicit
+  rowid after a rejected or ignored insert matches stock
+  ([77b6544f9](https://github.com/Dicklesworthstone/frankensqlite/commit/77b6544f9),
+  [4b6919f14](https://github.com/Dicklesworthstone/frankensqlite/commit/4b6919f14)). For the tied
+  `min()`/`max()` storage class this range adds only a regression test; 77b6544f9 was not built or
+  run, and the tracker records the three GH#512 keepers passing afterwards.
+- `changes()` and `total_changes()` after a trigger `RAISE(FAIL)` follow stock: a statement whose
+  first row fails in a BEFORE trigger reports 0 instead of the previous statement's count, prepared
+  statements keep the rows written before the failure, and DML in a failing trigger step still
+  counts ([#448](https://github.com/Dicklesworthstone/frankensqlite/issues/448);
+  [79b4cb85a](https://github.com/Dicklesworthstone/frankensqlite/commit/79b4cb85a),
+  [93770efe1](https://github.com/Dicklesworthstone/frankensqlite/commit/93770efe1),
+  [8b99ba764](https://github.com/Dicklesworthstone/frankensqlite/commit/8b99ba764),
+  [02a76463d](https://github.com/Dicklesworthstone/frankensqlite/commit/02a76463d)). None of these
+  commits was compiled when committed; the tracker closed GH#448 citing
+  `gh448_raise_fail_updates_changes_and_total_changes`
+  ([87a919c1c](https://github.com/Dicklesworthstone/frankensqlite/commit/87a919c1c)) passing against
+  rusqlite, while a later tracker note (2026-10-22) still lists them as unverified.
+- `PRAGMA integrity_check` inside `BEGIN` on a read-only connection reported every free page of a
+  valid file as `page N is never used`; it now walks the committed freelist
+  ([58ddae0de](https://github.com/Dicklesworthstone/frankensqlite/commit/58ddae0de), bd-vgw6e).
+- A materialized CTE named like a table with an INTEGER PRIMARY KEY no longer returns that table's
+  values through the rowid fast paths (joins, keyset limits, correlated scans, GROUP BY)
+  ([292b08c34](https://github.com/Dicklesworthstone/frankensqlite/commit/292b08c34)), and
+  materialized CTE tables stay installed while the statement that reads them runs
+  ([77b6544f9](https://github.com/Dicklesworthstone/frankensqlite/commit/77b6544f9)). The oracle
+  tests of 292b08c34 could not run when committed; the tracker records
+  `bd_cte_composition_edges_oracle_probe` passing later (bd-dy2h3).
+- `[+|-]HH:MM[:SS[.FFF]]` and `(+|-)YYYY-MM-DD` date/time modifiers and BCE dates such as
+  `date('-0001-01-01')` returned NULL; they now follow stock, and BCE dates are no longer one day
+  late ([0701d799a](https://github.com/Dicklesworthstone/frankensqlite/commit/0701d799a)).
+- `CREATE TABLE` accepts adjacent table constraints without a separating comma, as stock's grammar
+  does ([0c709404d](https://github.com/Dicklesworthstone/frankensqlite/commit/0c709404d)). The
+  commit adds no test and was not compiled.
+
+B-tree:
+
+- Descending inserts into an index, including a `DESC` column of a composite index, stranded
+  one-cell leaves: 12,000 descending integers produced 5,384 index leaves and a 22 MB file where
+  stock needs 56 leaves and 344 KB
+  ([#521](https://github.com/Dicklesworthstone/frankensqlite/issues/521);
+  [00e907b52](https://github.com/Dicklesworthstone/frankensqlite/commit/00e907b52),
+  [6fb125a3d](https://github.com/Dicklesworthstone/frankensqlite/commit/6fb125a3d),
+  [cdad39841](https://github.com/Dicklesworthstone/frankensqlite/commit/cdad39841)). Index and
+  interior pages are now equalized after left-packing and an overflowing root is split by bytes,
+  which also removes a `split child does not fit` error when large keys cluster on one side;
+  6fb125a3d was not run when committed, and cdad39841 reports native validation of the result
+  against stock page geometry.
+
+Files, WAL and durability:
 
 - A WAL-FEC sidecar mutation could report `Busy` although nothing was contending for the sidecar
   (GH#453). The mutation guard was released only by closing its lock descriptor, and a child
@@ -69,6 +178,324 @@ Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.4.12...m
   outlived the guard for a moment. The guard now unlocks explicitly when dropped. This is what
   made the `wal_fec_sidecar` suite fail intermittently (162 of 200 standalone runs on Linux before
   the fix).
+- On macOS, `-shm` growth tries `F_PREALLOCATE` before extending the file and reports a real storage
+  failure such as `ENOSPC` instead of mapping sparse space
+  ([#506](https://github.com/Dicklesworthstone/frankensqlite/issues/506),
+  [43bc4f21e](https://github.com/Dicklesworthstone/frankensqlite/commit/43bc4f21e)). The commit was
+  not compiled and nothing ran on macOS; the tracker records only its injected-call policy test
+  passing, on Linux.
+- Cross-process lock ordering
+  ([#519](https://github.com/Dicklesworthstone/frankensqlite/issues/519);
+  [3dc78166e](https://github.com/Dicklesworthstone/frankensqlite/commit/3dc78166e),
+  [96bc40e36](https://github.com/Dicklesworthstone/frankensqlite/commit/96bc40e36),
+  [ff5f170dc](https://github.com/Dicklesworthstone/frankensqlite/commit/ff5f170dc),
+  [48b26924c](https://github.com/Dicklesworthstone/frankensqlite/commit/48b26924c)): WAL append,
+  checkpoint and recovery take the main-file lock before the WAL WRITE/CKPT slots on Unix, Windows
+  and the in-memory VFS, a `BEGIN IMMEDIATE` that waited for a peer takes RESERVED before binding
+  its WAL snapshot instead of starting from the peer's old one, and one busy-wait budget spans
+  BEGIN, checkpoint, group-commit and reader-slot waits (PASSIVE checkpoints never wait). None of
+  these commits ran native tests;
+  [1cab6896d](https://github.com/Dicklesworthstone/frankensqlite/commit/1cab6896d) later ran
+  `gh519_native_lock_progress` (6 passed) and the `fsqlite-vfs` library (508 passed, 2 failed in
+  `wal_fence_cancelled_*`, which fail the same way on its base).
+- [#510](https://github.com/Dicklesworthstone/frankensqlite/issues/510) (on a WAL database, after a
+  bulk `INSERT ... SELECT` was rolled back to a savepoint and released, every later INSERT failed
+  with `database is busy`):
+  [d9837a6ec](https://github.com/Dicklesworthstone/frankensqlite/commit/d9837a6ec) and
+  [1642d9b05](https://github.com/Dicklesworthstone/frankensqlite/commit/1642d9b05) keep the freelist
+  origin of committed-free pages through savepoint rollback and through a dropped transaction's
+  deferred cleanup. Neither was compiled or run, the savepoint regressions added for it
+  ([497db384a](https://github.com/Dicklesworthstone/frankensqlite/commit/497db384a),
+  [5c83039c5](https://github.com/Dicklesworthstone/frankensqlite/commit/5c83039c5),
+  [472084581](https://github.com/Dicklesworthstone/frankensqlite/commit/472084581)) have no recorded
+  run, and the tracker closed GH#510 citing the multi-connection INSERT keeper instead.
+- The `shm_interop` failure listed for v0.4.12
+  ([#513](https://github.com/Dicklesworthstone/frankensqlite/issues/513)) is fixed in the test only:
+  its child process gets its own `TMPDIR` and a `SIGXFSZ` exit under `ulimit -f 64` is accepted
+  ([4b6919f14](https://github.com/Dicklesworthstone/frankensqlite/commit/4b6919f14)). No library
+  code changed for it.
+- Checkpoints sync the WAL at full durability before their first database write, validate the WAL
+  header even when there is nothing to copy, leave a zero-byte WAL alone in every mode, refuse a WAL
+  that gained a commit after the plan was made, and refuse a backfill endpoint inside a multi-frame
+  transaction ([ddbddc667](https://github.com/Dicklesworthstone/frankensqlite/commit/ddbddc667),
+  [5f7da1542](https://github.com/Dicklesworthstone/frankensqlite/commit/5f7da1542),
+  [421c4dd6a](https://github.com/Dicklesworthstone/frankensqlite/commit/421c4dd6a)). These commits
+  were checked only against Python models; their Rust tests were not run.
+- The first-open migration marker and its backups are created owner-only through exclusive staging
+  and an atomic rename
+  ([98f90882f](https://github.com/Dicklesworthstone/frankensqlite/commit/98f90882f)), which the
+  tracker records as the fix for
+  [#517](https://github.com/Dicklesworthstone/frankensqlite/issues/517). The commit was not
+  compiled, and the `-wal`, `-shm` and WAL-certificate sidecars still use the ambient umask
+  (bd-reality-check-1022-llk6g.29).
+- First-open migration repair requires its main and WAL backups and stops before any repair if they
+  fail, repairs only on an explicit corruption verdict, reports a new `Incomplete` outcome instead
+  of success when a stage fails, keeps checksummed (BLAKE3) backup generations across retries, and
+  copies the source under the native write and checkpoint fences, pausing physical commits and
+  checkpoints while it copies
+  ([0a949c188](https://github.com/Dicklesworthstone/frankensqlite/commit/0a949c188),
+  [75d334d75](https://github.com/Dicklesworthstone/frankensqlite/commit/75d334d75),
+  [bad47e5a3](https://github.com/Dicklesworthstone/frankensqlite/commit/bad47e5a3),
+  [719aa32a7](https://github.com/Dicklesworthstone/frankensqlite/commit/719aa32a7),
+  [c9be23175](https://github.com/Dicklesworthstone/frankensqlite/commit/c9be23175),
+  [8fab351ea](https://github.com/Dicklesworthstone/frankensqlite/commit/8fab351ea)). None of these
+  commits was compiled when committed; their evidence is SQLite 3.46.1/POSIX reference probes.
+
+CLI:
+
+- A `CASE ... END;` inside a trigger body ended `CREATE TRIGGER` early, so the trigger was not
+  created and the leftover `END;` ran as a `COMMIT`; only an `END` that follows a `;` closes the
+  body now, as in `sqlite3_complete()`
+  ([53a4ed3ef](https://github.com/Dicklesworthstone/frankensqlite/commit/53a4ed3ef)).
+- `fsqlite app.db "SELECT ..."` runs each SQL argument after the database path in order and stops
+  with exit status 1 at the first failure, as `sqlite3 FILENAME SQL...` does; it used to fail with
+  `too many positional arguments`
+  ([5bd1fdc23](https://github.com/Dicklesworthstone/frankensqlite/commit/5bd1fdc23)).
+
+Build and platforms:
+
+- [#522](https://github.com/Dicklesworthstone/frankensqlite/issues/522): `main` aims to build on
+  stable Rust; releases through v0.4.12 still need nightly, and `rust-toolchain.toml` still pins
+  `nightly-2026-08-31`. The nightly `prefetch_read_data` calls are replaced by a stable
+  `_mm_prefetch` wrapper in `fsqlite-vfs`, the Windows `windows_by_handle` feature by
+  `GetFileInformationByHandle`, and the `-Z threads=4` flag is opt-in
+  ([4c0a98dea](https://github.com/Dicklesworthstone/frankensqlite/commit/4c0a98dea),
+  [00261bb5d](https://github.com/Dicklesworthstone/frankensqlite/commit/00261bb5d)); on rustc 1.99.1
+  the `fsqlite-pager`, `fsqlite-btree` and `fsqlite` library checks and the prefetch and cleanup
+  tests passed and the Windows GNU target cross-compiled, but Windows tests were not executed and
+  the full test matrix was not built.
+
+### Performance
+
+- Composite index equality scans with bound parameters, such as `a = ?1 AND k = ?2 AND v > 0` on
+  `(a, k)`, seek the whole pinned prefix and stop at its end
+  ([72b0806c3](https://github.com/Dicklesworthstone/frankensqlite/commit/72b0806c3), bd-gtjlv
+  follow-up). Measured by the commit through FLDT's `fldt-fsqlite-compat` wrapper (dev build, 60k
+  rows, against 0.4.10), a 4-column bound prefix went from 4,098 ms to 1.6 ms and a 3-column one
+  from 3,745 ms to 87 ms; full scans and point lookups were unchanged.
+- Large single-transaction WAL commits keep fewer copies: VFS writes take ownership of frame
+  buffers, large appends are written in 1 MiB chunks, retained WAL scratch is capped at 4 MiB,
+  post-commit cache admission stays within the cache budget, and an idle page-buffer pool keeps at
+  most 8 MiB ([#518](https://github.com/Dicklesworthstone/frankensqlite/issues/518);
+  [4b6919f14](https://github.com/Dicklesworthstone/frankensqlite/commit/4b6919f14),
+  [b1263081c](https://github.com/Dicklesworthstone/frankensqlite/commit/b1263081c),
+  [9f0b1429e](https://github.com/Dicklesworthstone/frankensqlite/commit/9f0b1429e)). No RSS change
+  is recorded; b1263081c and 9f0b1429e were not compiled when committed, and the tracker records the
+  `fsqlite-wal` `wal::tests` (200 passed) and the borrowed-page test passing for 4b6919f14.
+- A `WITH` statement on a schema-only open no longer loads every row into the MemDatabase mirror
+  ([#493](https://github.com/Dicklesworthstone/frankensqlite/issues/493),
+  [b729ccf1d](https://github.com/Dicklesworthstone/frankensqlite/commit/b729ccf1d)), and prepared
+  point reads on file databases hydrate the mirror only for logical images of at most 8 MiB
+  ([#492](https://github.com/Dicklesworthstone/frankensqlite/issues/492),
+  [91df8b6b9](https://github.com/Dicklesworthstone/frankensqlite/commit/91df8b6b9)). 91df8b6b9 was
+  not compiled when committed; the tracker records the GH#492 keeper (5 passed) and the GH#493
+  targets passing afterwards (bd-w7qsf, bd-dy2h3).
+- `PageData::clone` no longer copies through an intermediate `Vec`, and the in-memory page store
+  shares cached page snapshots
+  ([#520](https://github.com/Dicklesworthstone/frankensqlite/issues/520),
+  [6fb125a3d](https://github.com/Dicklesworthstone/frankensqlite/commit/6fb125a3d)). The commit was
+  not run; the tracker records its two tests passing.
+
+### TypeScript SDK and worker
+
+These commits were executed with Node 22.16.0 against native SQLite 3.49.1, not against the
+FrankenSQLite engine; they state that no full SDK, worker, browser or WASM build was run.
+
+Fixed:
+
+- **A synchronous adapter hook could start an owned child savepoint before an admitted parent write
+  was registered, so a handled child rollback erased the parent's row while the outer transaction
+  committed ([af5503f5c](https://github.com/Dicklesworthstone/frankensqlite/commit/af5503f5c)).**
+  Changeset capture and `withDeferredForeignKeys` now reserve ownership before calling the adapter
+  and reject the overlapping child with `BUSY`.
+- A `Uint8Array` BLOB with a shadowed `length` property was encoded from that property, so a 4-byte
+  BLOB could become an empty one that SQLite then applied; the session encoders read the internal
+  slots and reject detached, shared, resizable and proxied buffers
+  ([e027b9544](https://github.com/Dicklesworthstone/frankensqlite/commit/e027b9544)).
+- `ChangesetOutbox` `record` and `recordSnapshot` could exceed `maxEntries` and `maxPayloadBytes`
+  when their callback published through another outbox; capacity is rechecked before publication
+  ([c5231f1ef](https://github.com/Dicklesworthstone/frankensqlite/commit/c5231f1ef)).
+- `ChangesetDeliveryPump` ignored a source port's `receiverId`, so a source bound to one replica
+  could accept another replica's receipt and reclaim payloads the first replica never applied
+  ([fe8a7c40c](https://github.com/Dicklesworthstone/frankensqlite/commit/fe8a7c40c)).
+- The single-message ordered receiver committed an order receipt whose counts did not match what was
+  applied; counts are now checked before the sequence is published
+  ([a4f8a7557](https://github.com/Dicklesworthstone/frankensqlite/commit/a4f8a7557)).
+- Nested capture savepoints: a callback rejection after a confirmed child rollback lets the parent
+  continue, and an uncertain child cleanup fences the whole scope
+  ([d05352025](https://github.com/Dicklesworthstone/frankensqlite/commit/d05352025),
+  [d1f71461d](https://github.com/Dicklesworthstone/frankensqlite/commit/d1f71461d)).
+- Worker: a stolen or released OPFS publication lock let a detached writer overwrite a newer
+  checkpoint ([84362e955](https://github.com/Dicklesworthstone/frankensqlite/commit/84362e955));
+  snapshot stores trusted shadowable `byteLength`/`buffer` properties and could persist an oversized
+  image ([d8ea80ffe](https://github.com/Dicklesworthstone/frankensqlite/commit/d8ea80ffe)); and a
+  lost Web Locks lease is now reported and fences new and queued work
+  ([8d0ad32dc](https://github.com/Dicklesworthstone/frankensqlite/commit/8d0ad32dc),
+  [4567e4c6c](https://github.com/Dicklesworthstone/frankensqlite/commit/4567e4c6c)). The browser
+  tests could not run; these were executed on Node with lock and storage models.
+
+Added:
+
+- `constraintConflicts: "isolate"` applies each changeset or patchset row in its own child
+  transaction so a constraint failure can be omitted instead of aborting the scope; it composes with
+  `foreignKeys: "defer"` and is available through `ChangesetRebaseJournal.apply`, delivery receivers
+  and `ChangesetOrder`
+  ([4a35a41cb](https://github.com/Dicklesworthstone/frankensqlite/commit/4a35a41cb),
+  [cda35504a](https://github.com/Dicklesworthstone/frankensqlite/commit/cda35504a),
+  [ba77d8f20](https://github.com/Dicklesworthstone/frankensqlite/commit/ba77d8f20),
+  [9adb235d4](https://github.com/Dicklesworthstone/frankensqlite/commit/9adb235d4),
+  [d737512d5](https://github.com/Dicklesworthstone/frankensqlite/commit/d737512d5)). Default
+  application stays atomic with no per-row savepoints.
+- Conflict policies receive the receiver's current row as `ChangesetConflict.current`
+  ([60a16c7b1](https://github.com/Dicklesworthstone/frankensqlite/commit/60a16c7b1));
+  `PatchsetGroup` and `concatPatchsets` combine patchsets
+  ([afe4d875c](https://github.com/Dicklesworthstone/frankensqlite/commit/afe4d875c)); capture
+  executors expose nested `transaction`, and `onRebase` hooks can write through owned savepoints in
+  the same transaction
+  ([f27e107bb](https://github.com/Dicklesworthstone/frankensqlite/commit/f27e107bb),
+  [b03595a8f](https://github.com/Dicklesworthstone/frankensqlite/commit/b03595a8f)).
+- `prepareChangesetReader` and `preparePatchsetReader` validate a whole message and then decode one
+  record at a time, and application, receivers, the pump, the outbox and the encoder use them
+  instead of a full decoded copy
+  ([842eebcc7](https://github.com/Dicklesworthstone/frankensqlite/commit/842eebcc7),
+  [dcca36d6c](https://github.com/Dicklesworthstone/frankensqlite/commit/dcca36d6c),
+  [78e32d085](https://github.com/Dicklesworthstone/frankensqlite/commit/78e32d085),
+  [d79f0e98b](https://github.com/Dicklesworthstone/frankensqlite/commit/d79f0e98b)). For a
+  6,000-row, 32-column payload of 8.6 MB, the extra JS heap at application admission went from 14.3
+  MB to 73 KB plus the retained wire bytes, and at outbox load from 14.3 MB to 86 KB.
+- Ordered replication can move 1 to 256 contiguous messages as one unit: `ChangesetOrder.applyBatch`
+  and `receiveBatch` apply them in one SQL transaction, `createOrderedChangesetBatchTransport` and
+  `createOrderedChangesetBatchHttpTransport`/`createOrderedChangesetBatchHttpHandler` carry them
+  (one binary POST, documented in `packages/sdk/docs/ordered-batch-http.md`), and
+  `ChangesetDeliveryPump.runBatch` drives them
+  ([936052eb2](https://github.com/Dicklesworthstone/frankensqlite/commit/936052eb2),
+  [eba352d09](https://github.com/Dicklesworthstone/frankensqlite/commit/eba352d09),
+  [7f503f701](https://github.com/Dicklesworthstone/frankensqlite/commit/7f503f701),
+  [c9346deb1](https://github.com/Dicklesworthstone/frankensqlite/commit/c9346deb1),
+  [23084f9ee](https://github.com/Dicklesworthstone/frankensqlite/commit/23084f9ee)). Sources can
+  read a window from one snapshot with `readBatch` and, with `atomicAcknowledgements: true`,
+  acknowledge it in one transaction with `acknowledgeBatch`
+  ([859041c33](https://github.com/Dicklesworthstone/frankensqlite/commit/859041c33),
+  [829b4906a](https://github.com/Dicklesworthstone/frankensqlite/commit/829b4906a),
+  [725830d5c](https://github.com/Dicklesworthstone/frankensqlite/commit/725830d5c),
+  [965b6c463](https://github.com/Dicklesworthstone/frankensqlite/commit/965b6c463)); source and
+  receiver remain separate transactions.
+- `WorkerConnectionHost` accepts optional row, cell and byte limits for query results, and
+  `FrankenDB.open({ resultLimits })` negotiates them with the worker before exposing the database
+  ([0aa03a7e9](https://github.com/Dicklesworthstone/frankensqlite/commit/0aa03a7e9),
+  [d1b9dec8a](https://github.com/Dicklesworthstone/frankensqlite/commit/d1b9dec8a)). The limits are
+  checked after the SQL ran, so a refused result can follow committed writes.
+
+### API changes
+
+- **Source-incompatible:** `fsqlite_core::migration::MigrationOutcome` gains an
+  `Incomplete { stage, repairs, error }` variant, with the new `MigrationFailureStage` enum
+  ([75d334d75](https://github.com/Dicklesworthstone/frankensqlite/commit/75d334d75)). The enum is
+  not `#[non_exhaustive]`, so an exhaustive `match` on it needs a new arm.
+- SQL: an unparenthesized `DEFAULT` expression with an operator, such as `DEFAULT 1 + 2`, is now a
+  syntax error, as in stock
+  ([770fe3048](https://github.com/Dicklesworthstone/frankensqlite/commit/770fe3048)).
+- New Rust items: `fsqlite::wal_recovery` (feature `native`) re-exports the read-only frame-free WAL
+  witnesses `inspect_frame_free_wal` and `verify_frame_free_wal_transition` for
+  [#515](https://github.com/Dicklesworthstone/frankensqlite/issues/515)
+  ([57bd4079d](https://github.com/Dicklesworthstone/frankensqlite/commit/57bd4079d),
+  [0af6f244a](https://github.com/Dicklesworthstone/frankensqlite/commit/0af6f244a));
+  `capture_migration_backup`, `MigrationBackup`, `read_migration_backup` and
+  `migration_backup_receipt_path` in `fsqlite_core::migration`, with
+  `MigrationBackup::restore_to_new_directory` and async variants
+  ([bad47e5a3](https://github.com/Dicklesworthstone/frankensqlite/commit/bad47e5a3),
+  [d05fbd145](https://github.com/Dicklesworthstone/frankensqlite/commit/d05fbd145),
+  [cf3f43ec7](https://github.com/Dicklesworthstone/frankensqlite/commit/cf3f43ec7),
+  [121b28e26](https://github.com/Dicklesworthstone/frankensqlite/commit/121b28e26));
+  `fsqlite_types::cx::BusyWaitBudget` with `Cx::with_busy_wait_budget`
+  ([48b26924c](https://github.com/Dicklesworthstone/frankensqlite/commit/48b26924c));
+  `VfsFile::write_owned` and `write_owned_tracked`, both with default implementations
+  ([4b6919f14](https://github.com/Dicklesworthstone/frankensqlite/commit/4b6919f14));
+  `fsqlite_vfs::cache_hint`
+  ([4c0a98dea](https://github.com/Dicklesworthstone/frankensqlite/commit/4c0a98dea)); and
+  `fsqlite_vfs::host_fs::write_private_atomic` and `copy_private_atomic_if_exists`
+  ([98f90882f](https://github.com/Dicklesworthstone/frankensqlite/commit/98f90882f)). The witness
+  commits were not run when committed;
+  [1cab6896d](https://github.com/Dicklesworthstone/frankensqlite/commit/1cab6896d) later ran the
+  `frame_free` tests (6 passed).
+- `next_pending_batch` on the `fsqlite` compat changeset `OrderedDelivery` and `FanoutDelivery`
+  types reads a bounded contiguous batch from one source snapshot
+  ([bdb4db9db](https://github.com/Dicklesworthstone/frankensqlite/commit/bdb4db9db),
+  [67d7d93f1](https://github.com/Dicklesworthstone/frankensqlite/commit/67d7d93f1)). These commits
+  have no message body and record no test run.
+- TypeScript: the SDK root exports `prepareChangesetReader`, `preparePatchsetReader`,
+  `PatchsetGroup`, `concatPatchsets`, `createOrderedChangesetBatchTransport`,
+  `createOrderedChangesetBatchHttpTransport`, `createOrderedChangesetBatchHttpHandler` and their
+  option types; `ChangesetApplyError` gains the `ERR_FSQLITE_CHANGESET_BUSY` and
+  `ERR_FSQLITE_CHANGESET_STATE` codes and `ChangesetOrderError` gains `ERR_FSQLITE_ORDER_STATE`,
+  both with a `cleanupErrors` field
+  ([b03595a8f](https://github.com/Dicklesworthstone/frankensqlite/commit/b03595a8f),
+  [d737512d5](https://github.com/Dicklesworthstone/frankensqlite/commit/d737512d5)). The worker
+  package exports `ResultLimits`, `resolveResultLimits`, `DEFAULT_RESULT_LIMITS`,
+  `ResultBudgetError` and `captureResultLimitsAcknowledgement`, and `WorkerConnectionHost` takes an
+  optional fourth constructor argument
+  ([0aa03a7e9](https://github.com/Dicklesworthstone/frankensqlite/commit/0aa03a7e9)).
+
+### Experimental (not reachable from `Connection`)
+
+The `fsqlite-wal`/`fsqlite-pager` native stack gained caller-owned recovery that rewrites before it
+syncs, recovered-prefix copy with RaptorQ redundancy regeneration, coordinator and page-store
+rebuild from a sealed recovery handoff, live transfer of a failed publisher into recovery,
+commit-outcome resolution, historical and online page snapshots that the B-tree/VDBE dispatcher can
+read, snapshot forks, and local and transport-independent replica catch-up with authenticated
+selective object requests (for example
+[fe4093876](https://github.com/Dicklesworthstone/frankensqlite/commit/fe4093876),
+[43191f697](https://github.com/Dicklesworthstone/frankensqlite/commit/43191f697),
+[3e434118d](https://github.com/Dicklesworthstone/frankensqlite/commit/3e434118d),
+[31511e61a](https://github.com/Dicklesworthstone/frankensqlite/commit/31511e61a),
+[333b4a57b](https://github.com/Dicklesworthstone/frankensqlite/commit/333b4a57b),
+[6bdbd8418](https://github.com/Dicklesworthstone/frankensqlite/commit/6bdbd8418),
+[e1aab9726](https://github.com/Dicklesworthstone/frankensqlite/commit/e1aab9726),
+[9f5681c99](https://github.com/Dicklesworthstone/frankensqlite/commit/9f5681c99),
+[08d00338f](https://github.com/Dicklesworthstone/frankensqlite/commit/08d00338f),
+[1e6aa4f9f](https://github.com/Dicklesworthstone/frankensqlite/commit/1e6aa4f9f)). Its commit
+service wakes idle workers and blocked producers on cancellation and shutdown and keeps group commit
+while isolating rejected writers
+([f356ee822](https://github.com/Dicklesworthstone/frankensqlite/commit/f356ee822),
+[37d5cf509](https://github.com/Dicklesworthstone/frankensqlite/commit/37d5cf509),
+[3eb53bc46](https://github.com/Dicklesworthstone/frankensqlite/commit/3eb53bc46)), and the pager's
+[#494](https://github.com/Dicklesworthstone/frankensqlite/issues/494) memory-snapshot owner retries
+a refused commit without replaying writes
+([db5f7ba19](https://github.com/Dicklesworthstone/frankensqlite/commit/db5f7ba19)). `fsqlite-core`
+gained checkpoint-anchored commit-marker validation and bounded native-index caches
+([d9210956b](https://github.com/Dicklesworthstone/frankensqlite/commit/d9210956b),
+[f4386c7c2](https://github.com/Dicklesworthstone/frankensqlite/commit/f4386c7c2),
+[4991f5d92](https://github.com/Dicklesworthstone/frankensqlite/commit/4991f5d92),
+[64a666993](https://github.com/Dicklesworthstone/frankensqlite/commit/64a666993)), and the
+`fsqlite-vdbe` vectorized hash-join operator, which the SQL planner does not use, gained a streaming
+probe and stock numeric key equality
+([cd0844456](https://github.com/Dicklesworthstone/frankensqlite/commit/cd0844456),
+[1570f3389](https://github.com/Dicklesworthstone/frankensqlite/commit/1570f3389)). Almost all of
+these commits say Cargo was unavailable and their Rust tests were not run;
+[1cab6896d](https://github.com/Dicklesworthstone/frankensqlite/commit/1cab6896d) later made the
+affected targets compile and ran `commit_marker` (47 passed) and `native_pages::snapshot` (9
+passed). The [#508](https://github.com/Dicklesworthstone/frankensqlite/issues/508) native harness
+tests were corrected to target the real sync barriers, also without being run.
+
+### Documentation
+
+- The README drops the CI badge, says page-lock writers wait within the busy budget with deadlock
+  detection instead of never waiting, names rusqlite's bundled SQLite 3.53.2 as the conformance
+  oracle, stops claiming the SQLite test corpus is run, lists the companion files a database uses,
+  and says `main` aims to build on stable while releases through v0.4.12 need nightly
+  ([652c76cff](https://github.com/Dicklesworthstone/frankensqlite/commit/652c76cff)).
+
+### Committed as unapplied candidates
+
+- The [#494](https://github.com/Dicklesworthstone/frankensqlite/issues/494) explicit-COMMIT
+  `Connection` integration
+  ([61b0b81b3](https://github.com/Dicklesworthstone/frankensqlite/commit/61b0b81b3)) and the
+  [#516](https://github.com/Dicklesworthstone/frankensqlite/issues/516) compiled INSERT row executor
+  ([757179e79](https://github.com/Dicklesworthstone/frankensqlite/commit/757179e79),
+  [4c099d558](https://github.com/Dicklesworthstone/frankensqlite/commit/4c099d558),
+  [f7fe9f331](https://github.com/Dicklesworthstone/frankensqlite/commit/f7fe9f331)) are stored under
+  `artifacts/` with their validation scripts and are not built into the engine; neither issue is
+  fixed.
 
 ---
 
