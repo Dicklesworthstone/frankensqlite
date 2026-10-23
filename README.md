@@ -276,15 +276,96 @@ cargo test -p fsqlite-vfs trusted_group_cross_uid_reopen_and_safety -- --ignored
 
 ### Companion Files
 
-A file-backed database `app.db` opened read-write can gain these siblings:
+A file-backed database `app.db` opened read-write can gain these siblings.
+None of them is deleted when the last connection closes.
 
-| File | Purpose |
-|------|---------|
-| `app.db-wal`, `app.db-shm` | Standard SQLite WAL and WAL-index, readable by stock SQLite. The `-wal` is checkpointed but currently kept, not deleted, when the last connection closes, and rollback-journal databases still get an empty `-wal` and a `-shm` (bead bd-reality-check-1022-llk6g.21). |
-| `app.db-fsqlite-ns-gate`, `app.db-fsqlite-ns-use` | Namespace admission sidecars described above. Never delete them while any process has the database open. |
-| `app.db-wal-cert`, `app.db-wal-cert-head` | The durable commit certificate of the parallel WAL path, bound to the database file's identity so a certificate never applies to a replaced or copied file. |
-| `app.db.fsqlite-migration-state` | Marker for the one-time first-open pass (`fsqlite-core/src/migration.rs`). The first read-write open of a database without the marker, including one created by stock SQLite, runs `integrity_check`. A clean database only gets the marker. A database with a known repairable damage class (for example orphaned pages from older FrankenSQLite versions) has its main and WAL files copied to a private backup generation first, then is repaired. This first open costs time proportional to the database size (bd-6jf9o). `FRANKENSQLITE_SKIP_MIGRATION=1` skips the pass. |
-| `app.db-wal-fec`, `app.db-wal-fec.lock` | RaptorQ repair symbols for durable WAL ranges, written only on native runtimes with a blocking pool at WAL fsync boundaries (see Crash Recovery). |
+| File | Created by | Purpose |
+|------|------------|---------|
+| `app.db-wal` | Read-write opens of a WAL-mode database. New FrankenSQLite databases start in WAL mode. | Standard SQLite WAL, readable by stock SQLite. |
+| `app.db-shm` | The first WAL-index access. | Standard SQLite WAL-index and WAL lock bytes. |
+| `app.db-journal` | Write transactions in a rollback journal mode. | Standard rollback journal; removed at commit in `DELETE` mode, as in stock SQLite. |
+| `app.db-fsqlite-ns-gate`, `app.db-fsqlite-ns-use` | Every native read-write open, including one that only reads. | The namespace admission sidecars described above. `-ns-gate` is an empty lock file; `-ns-use` is a 40-byte record of the main file's device and inode, optionally followed by a transition ledger. |
+| `app.db-wal-cert` | WAL commits. | Append-only commit certificates of the parallel WAL path: WAL salts, frame range, database identity and a BLAKE3 digest of the frames per commit. The database identity means a certificate never applies to a replaced or copied file. |
+| `app.db-wal-cert-head` | Checkpoints, including the one at close. | The latest certificate record, kept as the anchor when `-wal-cert` has nothing for the current WAL generation. |
+| `app.db.fsqlite-migration-state` | The end of every native read-write open. | JSON marker of the first-open migration pass (below). |
+| `app.db-wal-fec`, `app.db-wal-fec.lock` | WAL fsync on native runtimes with a blocking pool (the `fsqlite` shell has one), and assigning `PRAGMA raptorq_repair_symbols`. | RaptorQ repair symbols for durable WAL ranges (see Crash Recovery), and an empty lock file that serializes changes to them. |
+
+A stock-created database in a rollback journal mode gets only the namespace
+pair and the migration marker. A database switched from WAL to a rollback
+journal mode keeps a 0-byte `-wal`, its `-shm` and the certificate files.
+
+**Lifetime.** Closing runs a passive checkpoint, which normally copies every
+WAL frame into the main file, but the `-wal` stays at its full size: it is
+reused, not truncated, so it grows with the work done since its last restart
+(bd-reality-check-1022-llk6g.7). `PRAGMA wal_checkpoint(TRUNCATE)` leaves a
+32-byte WAL header where stock SQLite leaves a 0-byte file. `-wal-cert` gains
+one record (about 156 bytes) per commit, and the first commit after a WAL
+restart drops the records of earlier WAL generations. The full-size `-wal`
+and the 32-byte header are known gaps (bd-reality-check-1022-llk6g.21).
+
+**Deleting companion files.** Never delete any of them while a process has
+the database open: deleting the namespace pair splits the lock domain, and
+deleting the `-wal` loses committed transactions, as with stock SQLite. With
+every process closed:
+
+- Keep the `-wal`. Like stock SQLite's, it can hold committed transactions
+  that a checkpoint has not yet copied into the main file, for example after a
+  crash or when a reader blocked the close-time checkpoint.
+- `-shm`, `-wal-cert`, `-wal-cert-head`, `-wal-fec`, `-wal-fec.lock`, the
+  namespace pair and the migration marker are recreated when missing. Without
+  `-wal-cert` and `-wal-cert-head`, recovery of a `-wal` that still holds
+  uncheckpointed frames falls back to the conservative WAL scan, which can
+  drop the newest committed batch. Without `-wal-fec`, the repair symbols are
+  regenerated and the configured symbol count reverts to the default. Without
+  the migration marker, the next open runs the migration pass again.
+- A damaged certificate file is not treated as missing. Bytes after the last
+  whole record of `-wal-cert` make every statement fail with
+  `WAL file is corrupt: parallel WAL certificate suffix does not start at a
+  record boundary`. An empty `-wal-cert-head` with no `-wal-cert` makes writes
+  fail with `WAL file is corrupt`. Report these as bugs rather than deleting
+  the files, for the recovery reason above.
+
+**Permissions.** The namespace pair, the migration marker and `-wal-fec` are
+created owner-only (`0600`). `-wal`, `-shm`, `-journal` and the certificate
+pair take the main database file's permission bits and owner, as stock
+SQLite's `-wal`, `-shm` and `-journal` do. `-wal-fec.lock` and the main file
+itself use `0666` less the umask.
+
+#### First-open migration pass
+
+`fsqlite-core/src/migration.rs` runs at the end of every native read-write
+open of a file-backed database, including one that only reads, unless one of
+these applies:
+
+- `app.db.fsqlite-migration-state` records the current migration version.
+- The open just created the database. It is clean by construction, so it
+  gets the marker without a check.
+- `FRANKENSQLITE_SKIP_MIGRATION=1` is set. Only the exact value `1` counts.
+  This also skips writing the birth marker, so a later open without the
+  variable runs the full pass.
+
+The pass runs the full integrity check. That check reads every b-tree page,
+so the first open of a large stock-created database costs time proportional
+to its size (bd-6jf9o). It then does one of three things:
+
+- **Clean database.** It writes the marker. If the check finds orphaned
+  contentless FTS5 `%_content` shadow rows, it first backs up the database,
+  reclaims them and re-checks.
+- **The check reports corruption.** It backs up the database, then runs the
+  freelist repair, the orphaned-page repair and the FTS5 reclaim, and
+  re-checks. This happens for any corruption verdict, not only for the damage
+  classes known from older FrankenSQLite versions. On success it prints
+  `fsqlite: applied migration repairs (took Ns). Original DB preserved at ...`
+  to stderr.
+- **Busy or I/O error.** It changes nothing and writes no marker.
+
+A failed migration never fails the open. When a repair does not end in a
+clean re-check, no marker is written, so the pass, including a new backup,
+runs again on every later read-write open. Each backup is a private
+directory `.fsqlite-migration-<random>/` next to the database. It holds
+`database.db`, `database.db-wal` (WAL mode only) and `receipt.json`, and
+`app.db.pre-migration-bak.receipt` points to it. Backups are never removed
+automatically. Read-only opens never run the pass.
 
 ---
 
