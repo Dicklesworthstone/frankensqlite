@@ -4641,6 +4641,16 @@ impl CursorBackend {
         }
     }
 
+    /// Whether the last `index_insert` put its key after every stored key.
+    #[must_use]
+    fn last_index_insert_was_past_rightmost(&self) -> bool {
+        match self {
+            Self::Mem(c) => c.last_index_insert_was_past_rightmost(),
+            Self::Txn(c) => c.last_index_insert_was_past_rightmost(),
+            Self::TimeTravel(_) => false,
+        }
+    }
+
     /// Force the cursor into EOF state so subsequent reads return NULL.
     ///
     /// Used by `OP_NullRow` to satisfy the SQLite contract that Column/Rowid
@@ -4722,6 +4732,8 @@ struct StorageCursor {
     ///
     /// For monotonic composite UNIQUE streams, this lets `IdxInsert` skip the
     /// duplicate-probe seek and append from the current right-edge position.
+    /// A non-UNIQUE index keeps its whole last record here instead, for the
+    /// same append (sorted CREATE INDEX, monotonic ingest).
     last_rightmost_unique_index_prefix: Option<Vec<SqliteValue>>,
     /// Cursor position that produced `last_rightmost_unique_index_prefix`.
     last_rightmost_unique_index_position: Option<CursorPositionStamp>,
@@ -12697,14 +12709,73 @@ impl VdbeEngine {
                                     }
                                 }
                             } else {
-                                sc.last_rightmost_unique_index_prefix = None;
-                                sc.last_rightmost_unique_index_position = None;
-                                if let Err(error) = sc.cursor.index_insert(&sc.cx, key_bytes).await
-                                {
-                                    if sideband_active {
-                                        self.make_record_lookaside.replace_cleared_buf(key_blob);
+                                // bd-reality-check-1022-llk6g.8: the whole record is the
+                                // key (it ends in the rowid), so one that sorts after the
+                                // last right-edge key appends from the cursor's position
+                                // instead of seeking from the root. Same physical-order
+                                // guard as the UNIQUE path.
+                                let binary_key_order = index_collations.iter().all(|collation| {
+                                    collation
+                                        .as_deref()
+                                        .is_none_or(|name| name.eq_ignore_ascii_case("BINARY"))
+                                });
+                                let fast_append_key = match (
+                                    sc.last_rightmost_unique_index_prefix.take(),
+                                    sc.last_rightmost_unique_index_position.take(),
+                                ) {
+                                    (Some(last_key), Some(last_position))
+                                        if binary_key_order
+                                            && sc.cursor.position_stamp()
+                                                == Some(last_position) =>
+                                    {
+                                        index_record_sorting_after(
+                                            &last_key,
+                                            key_bytes,
+                                            &index_desc_flags,
+                                            &index_collations,
+                                        )
                                     }
-                                    return Err(error);
+                                    _ => None,
+                                };
+                                let appended = if fast_append_key.is_some() {
+                                    sc.cursor
+                                        .index_append_after_current_rightmost_position(
+                                            &sc.cx, key_bytes,
+                                        )
+                                        .await
+                                } else {
+                                    Ok(false)
+                                };
+                                let rightmost_key = match appended {
+                                    Ok(true) => Ok(fast_append_key),
+                                    Ok(false) => {
+                                        sc.cursor.index_insert(&sc.cx, key_bytes).await.map(|()| {
+                                            if binary_key_order
+                                                && sc.cursor.last_index_insert_was_past_rightmost()
+                                            {
+                                                parse_non_null_index_record(key_bytes)
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                    }
+                                    Err(error) => Err(error),
+                                };
+                                let rightmost_key = match rightmost_key {
+                                    Ok(rightmost_key) => rightmost_key,
+                                    Err(error) => {
+                                        if sideband_active {
+                                            self.make_record_lookaside
+                                                .replace_cleared_buf(key_blob);
+                                        }
+                                        return Err(error);
+                                    }
+                                };
+                                if let (Some(key), Some(position)) =
+                                    (rightmost_key, sc.cursor.position_stamp())
+                                {
+                                    sc.last_rightmost_unique_index_prefix = Some(key);
+                                    sc.last_rightmost_unique_index_position = Some(position);
                                 }
                                 invalidate_storage_cursor_row_cache_with_reason(
                                     sc,
@@ -20700,6 +20771,36 @@ fn parse_non_null_index_prefix(key_bytes: &[u8], key_columns: usize) -> Option<V
         return None;
     }
     Some(fields.into_iter().take(key_columns).collect())
+}
+
+/// Every field of an index record, when none is NULL.
+// Feeds the non-UNIQUE blind-append guard, which compares physical order.
+#[allow(clippy::disallowed_methods)]
+fn parse_non_null_index_record(key_bytes: &[u8]) -> Option<Vec<SqliteValue>> {
+    parse_record(key_bytes).filter(|fields| !fields.iter().any(SqliteValue::is_null))
+}
+
+/// The fields of `key_bytes`, when none is NULL and the record sorts after
+/// `last_key` in physical (stored-byte) order: the BINARY-only right-edge
+/// append guard for a non-UNIQUE index. Byte-wise (`Utf8`) for the reason the
+/// UNIQUE guard gives (bd-nmd19).
+fn index_record_sorting_after(
+    last_key: &[SqliteValue],
+    key_bytes: &[u8],
+    desc_flags: &[bool],
+    collations: &[Option<String>],
+) -> Option<Vec<SqliteValue>> {
+    parse_non_null_index_record(key_bytes).filter(|key| {
+        compare_index_prefix_keys(
+            last_key,
+            key,
+            key.len().max(last_key.len()),
+            desc_flags,
+            collations,
+            &BUILTIN_COLLATION_REGISTRY,
+            TextEncoding::Utf8,
+        ) == Ordering::Less
+    })
 }
 
 fn compare_index_prefix_keys(

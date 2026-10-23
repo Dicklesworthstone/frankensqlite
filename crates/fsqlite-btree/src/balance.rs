@@ -5424,6 +5424,7 @@ mod tests {
     /// pages across divider boundaries instead of left-packing the first three
     /// siblings and creating a 1-cell trailing leaf on every split.
     #[test]
+    #[allow(clippy::disallowed_methods)]
     fn test_descending_index_inserts_equalize_leaf_pages_gh521() {
         use crate::cursor::{BtCursor, MemPageStore as CursorMemPageStore};
         use crate::traits::BtreeCursorOps;

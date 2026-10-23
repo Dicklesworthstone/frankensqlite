@@ -2210,6 +2210,8 @@ enum ReadWitnessRetention {
 /// A B-tree cursor that navigates through B-tree pages using a page stack.
 ///
 /// Generic over the page I/O backend for testability.
+// Its flags are cursor state (EOF, the last insert's position), not options.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug)]
 pub struct BtCursor<P> {
     /// Page I/O backend.
@@ -2334,6 +2336,9 @@ pub struct BtCursor<P> {
     /// Best-known depth for this tree, even when a hot append helper leaves
     /// the cursor stack empty on purpose.
     last_known_depth: Option<usize>,
+    /// Whether the last `index_insert` seek ran past the last cell of the
+    /// rightmost leaf, i.e. the key sorts after every key already stored.
+    last_index_insert_past_rightmost: bool,
     /// Four-entry LRU of table-seek leaf anchors.
     ///
     /// Each slot remembers the rowid probe plus the leaf page/cell position
@@ -2476,6 +2481,30 @@ impl<P> BtCursor<P> {
             && ancestors
                 .iter()
                 .all(|entry| entry.cell_idx == entry.header.cell_count)
+    }
+
+    /// After an insert seek that found no equal key: whether it ran past the
+    /// last cell of the rightmost leaf, so the key sorts after every key in
+    /// the tree.
+    fn insert_seek_is_past_rightmost_key(&self) -> bool {
+        let Some((leaf, ancestors)) = self.stack.split_last() else {
+            return false;
+        };
+        self.at_eof
+            && leaf.header.page_type.is_leaf()
+            && (leaf.page_no == self.root_page || !ancestors.is_empty())
+            && ancestors
+                .iter()
+                .all(|entry| entry.cell_idx == entry.header.cell_count)
+    }
+
+    /// Whether the last successful index insert put its key after every key
+    /// already in the tree. The VDBE uses it to arm its right-edge append
+    /// path for the next, larger key.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn last_index_insert_was_past_rightmost(&self) -> bool {
+        self.last_index_insert_past_rightmost
     }
 
     fn remember_table_seek(&mut self, rowid: i64, page_no: PageNumber, cell_idx: u16) {
@@ -2884,6 +2913,7 @@ impl<P: PageReader> BtCursor<P> {
             last_insert_rowid: None,
             rightmost_leaf_cache: None,
             last_known_depth: None,
+            last_index_insert_past_rightmost: false,
             seek_cache: [None; TABLE_SEEK_CACHE_SLOTS],
             row_image_epoch: 0,
         }
@@ -11546,9 +11576,12 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
     }
 
     async fn index_insert(&mut self, cx: &Cx, key: &[u8]) -> Result<()> {
+        self.last_index_insert_past_rightmost = false;
         let result = self
             .with_btree_op(cx, BtreeOpType::Insert, async |cursor| {
                 let seek = cursor.index_seek_for_insert(cx, key).await?;
+                cursor.last_index_insert_past_rightmost =
+                    !seek.is_found() && cursor.insert_seek_is_past_rightmost_key();
                 let (is_leaf, cell_idx) = {
                     let top = cursor
                         .stack
@@ -15326,6 +15359,82 @@ mod tests {
             assert_eq!(
                 scan_all_index_keys(&mut cursor, &cx).await.unwrap(),
                 vec![first, second, third]
+            );
+        });
+    }
+
+    #[test]
+    fn test_index_insert_reports_keys_past_the_rightmost_key() {
+        run_async(async {
+            let root = pn(2);
+            let store = MemPageStore::with_empty_index(root, USABLE);
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(store, root, USABLE, false);
+            let key = |value: i64, rowid: i64| {
+                serialize_record(&[
+                    SqliteValue::Text(format!("k{value:060}").into()),
+                    SqliteValue::Integer(rowid),
+                ])
+            };
+
+            // Rising keys over a three-level tree: each insert lands past the
+            // rightmost key, and the append helper takes the next key whenever
+            // the insert left the cursor on the right edge.
+            let mut expected = Vec::new();
+            let mut appended = 0;
+            for rowid in 0..20_000 {
+                let entry = key(rowid * 2, rowid);
+                if rowid % 2 == 1
+                    && cursor
+                        .index_append_after_current_rightmost_position(&cx, &entry)
+                        .await
+                        .unwrap()
+                {
+                    appended += 1;
+                } else {
+                    cursor.index_insert(&cx, &entry).await.unwrap();
+                    assert!(
+                        cursor.last_index_insert_was_past_rightmost(),
+                        "rising key {rowid} lands past the rightmost key"
+                    );
+                }
+                expected.push((rowid * 2, rowid));
+            }
+            assert!(cursor.measure_tree_depth(&cx).await.unwrap() >= 3);
+            // The helper declines whenever the cursor is off the right edge,
+            // where a balance can leave it; 8,479 of the 10,000 odd keys
+            // appended when this bound was set.
+            assert!(
+                appended >= 8_000,
+                "only {appended} appends took the right edge"
+            );
+
+            // Keys that land before the rightmost key, including an equal
+            // value whose smaller rowid sorts it first, report false; a larger
+            // rowid under the largest value reports true.
+            for (value, rowid, past) in [
+                (1, 20_001, false),
+                (-1, 20_002, false),
+                (39_998, 0, false),
+                (39_998, 30_000, true),
+            ] {
+                cursor.index_insert(&cx, &key(value, rowid)).await.unwrap();
+                assert_eq!(
+                    cursor.last_index_insert_was_past_rightmost(),
+                    past,
+                    "key ({value}, {rowid})"
+                );
+                expected.push((value, rowid));
+            }
+
+            expected.sort_unstable();
+            let expected: Vec<Vec<u8>> = expected
+                .into_iter()
+                .map(|(value, rowid)| key(value, rowid))
+                .collect();
+            assert_eq!(
+                scan_all_index_keys(&mut cursor, &cx).await.unwrap(),
+                expected
             );
         });
     }
