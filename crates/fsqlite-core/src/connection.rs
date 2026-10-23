@@ -22741,6 +22741,11 @@ impl Connection {
                     .map(Fts5Table::is_lazy_on_disk)
             };
             if let Some(is_lazy) = lazy_fts5 {
+                if let Some(content) = self.fts5_external_content(&src.table_name) {
+                    return self
+                        .scan_external_content_fts5_rows(src, plan, is_lazy, &content)
+                        .await;
+                }
                 if is_lazy {
                     if plan.idx_num == 1 {
                         return self.scan_lazy_fts5_match(src, plan).await;
@@ -22952,6 +22957,12 @@ impl Connection {
             Cursor(LiveVtabCursorGuard<'a>),
         }
 
+        // An external-content table has its content table's rows, which the
+        // normal scan reads there (GH#211).
+        #[cfg(feature = "ext-fts5")]
+        if self.fts5_external_content(&name.name).is_some() {
+            return Ok(None);
+        }
         #[cfg(feature = "ext-fts5")]
         let known_count = {
             let instances = self.vtab_instances.borrow();
@@ -23234,23 +23245,7 @@ impl Connection {
     ) -> Result<Vec<Vec<SqliteValue>>> {
         let rows = match plan.idx_num {
             0 => fts5.all_rows().into_iter().collect::<Vec<_>>(),
-            1 => {
-                if plan.args.is_empty() {
-                    return Err(FrankenError::Internal(
-                        "fts5 MATCH scan missing query argument".to_owned(),
-                    ));
-                }
-                let queries: Vec<String> = plan.args.iter().map(SqliteValue::to_text).collect();
-                let query_refs: Vec<&str> = queries.iter().map(String::as_str).collect();
-                let weights: Vec<f64> = fts5.columns().iter().map(|_| 1.0).collect();
-                fts5.search_rows_for_queries_with_weights(&query_refs, &weights)
-                    .map_err(|error| {
-                        FrankenError::function_error(format!("fts5 query failed: {error}"))
-                    })?
-                    .into_iter()
-                    .map(|(rowid, _score, columns)| (rowid, columns))
-                    .collect::<Vec<_>>()
-            }
+            1 => Self::live_fts5_match_rows(fts5, plan)?,
             idx_num => {
                 return Err(FrankenError::Internal(format!(
                     "unsupported FTS5 live scan strategy: {idx_num}",
@@ -23274,6 +23269,28 @@ impl Connection {
                 }
                 row
             })
+            .collect())
+    }
+
+    /// The rows an in-memory or shadow-bound FTS5 table's MATCH selects.
+    #[cfg(feature = "ext-fts5")]
+    fn live_fts5_match_rows(
+        fts5: &Fts5Table,
+        plan: &LiveVtabScanPlan,
+    ) -> Result<Vec<(i64, Vec<String>)>> {
+        if plan.args.is_empty() {
+            return Err(FrankenError::Internal(
+                "fts5 MATCH scan missing query argument".to_owned(),
+            ));
+        }
+        let queries: Vec<String> = plan.args.iter().map(SqliteValue::to_text).collect();
+        let query_refs: Vec<&str> = queries.iter().map(String::as_str).collect();
+        let weights: Vec<f64> = fts5.columns().iter().map(|_| 1.0).collect();
+        Ok(fts5
+            .search_rows_for_queries_with_weights(&query_refs, &weights)
+            .map_err(|error| FrankenError::function_error(format!("fts5 query failed: {error}")))?
+            .into_iter()
+            .map(|(rowid, _score, columns)| (rowid, columns))
             .collect())
     }
 
@@ -23625,39 +23642,7 @@ impl Connection {
         src: &JoinTableSource,
         plan: &LiveVtabScanPlan,
     ) -> Result<Vec<Vec<SqliteValue>>> {
-        if plan.args.is_empty() {
-            return Err(FrankenError::Internal(
-                "fts5 MATCH scan missing query argument".to_owned(),
-            ));
-        }
-        let key = src.table_name.to_ascii_uppercase();
-        let queries: Vec<String> = plan.args.iter().map(SqliteValue::to_text).collect();
-        let query_refs: Vec<&str> = queries.iter().map(String::as_str).collect();
-
-        let fts5 = {
-            let instances = self.vtab_instances.borrow();
-            instances
-                .get(&key)
-                .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
-                .cloned()
-                .ok_or_else(|| {
-                    FrankenError::Internal(format!("virtual table not found: {}", src.table_name))
-                })?
-        };
-        // This is the plain-MATCH (idx_num == 1) scan: it yields matching
-        // rowids, and any `ORDER BY rank` / bm25()/snippet() scoring is applied
-        // separately through the aux context. Resolve rowids WITHOUT ranking so
-        // a plain MATCH does not pay (and discard) the O(hits^2) BM25 rank.
-        let matched = self
-            .with_lazy_fts5_reader(&src.table_name, async |reader| {
-                fts5.matched_rows_lazy(reader, &query_refs)
-                    .await
-                    .map_err(|error| {
-                        FrankenError::function_error(format!("fts5 query failed: {error}"))
-                    })
-            })
-            .await?;
-
+        let matched = self.lazy_fts5_match_rows(&src.table_name, plan).await?;
         Ok(matched
             .into_iter()
             .map(|(rowid, columns)| {
@@ -23675,6 +23660,47 @@ impl Connection {
                 row
             })
             .collect())
+    }
+
+    /// The rows a lazy FTS5 table's MATCH selects, with their `_content`
+    /// columns.
+    #[cfg(feature = "ext-fts5")]
+    async fn lazy_fts5_match_rows(
+        &self,
+        table_name: &str,
+        plan: &LiveVtabScanPlan,
+    ) -> Result<Vec<(i64, Vec<String>)>> {
+        if plan.args.is_empty() {
+            return Err(FrankenError::Internal(
+                "fts5 MATCH scan missing query argument".to_owned(),
+            ));
+        }
+        let key = table_name.to_ascii_uppercase();
+        let queries: Vec<String> = plan.args.iter().map(SqliteValue::to_text).collect();
+        let query_refs: Vec<&str> = queries.iter().map(String::as_str).collect();
+
+        let fts5 = {
+            let instances = self.vtab_instances.borrow();
+            instances
+                .get(&key)
+                .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+                .cloned()
+                .ok_or_else(|| {
+                    FrankenError::Internal(format!("virtual table not found: {table_name}"))
+                })?
+        };
+        // This is the plain-MATCH (idx_num == 1) scan: it yields matching
+        // rowids, and any `ORDER BY rank` / bm25()/snippet() scoring is applied
+        // separately through the aux context. Resolve rowids WITHOUT ranking so
+        // a plain MATCH does not pay (and discard) the O(hits^2) BM25 rank.
+        self.with_lazy_fts5_reader(table_name, async |reader| {
+            fts5.matched_rows_lazy(reader, &query_refs)
+                .await
+                .map_err(|error| {
+                    FrankenError::function_error(format!("fts5 query failed: {error}"))
+                })
+        })
+        .await
     }
 
     /// Enumerate a lazy contentless FTS5 table without hydrating its posting
@@ -23699,70 +23725,17 @@ impl Connection {
                 ),
             })?;
         let root = page_number_from_schema_root(root_page, &docsize_name, "fts5 docsize shadow")?;
-
-        // bd-plxob: an EXTERNAL-content table (`content='<table>'`) keeps its bodies
-        // in the content SOURCE, which frank does not persist internally. After
-        // `'delete-all'` the in-memory documents are empty, so a NULL-projected scan
-        // diverges from stock (which reads the source). Read the source table by
-        // rowid here and project the real column values. A true contentless table
-        // (`content=''`) has no source and correctly keeps the NULL projection.
-        let content_source = self.fts5_external_content_source_schema(src);
-        let rowid_alias_columns = self.rowid_alias_columns.borrow().clone();
+        // An external-content table never gets here: its scan reads the
+        // content table (scan_external_content_fts5_rows).
         let col_count = src.col_names.len();
 
         self.with_integrity_txn(async |cx, txn| {
-            let content_by_rowid = if let Some(content_table) = &content_source {
-                let (page_size, reserved_per_page) = {
-                    let page1 = txn.get_page(cx, PageNumber::ONE).await?;
-                    let header = parse_database_header_checked(page1.as_ref())?;
-                    (header.page_size, header.reserved_per_page)
-                };
-                let source_rows = self
-                    .read_storage_table_rows_for_reload(
-                        cx,
-                        txn,
-                        page_size,
-                        reserved_per_page,
-                        content_table,
-                        &rowid_alias_columns,
-                    )
-                    .await?;
-                let mut map: HashMap<i64, Vec<SqliteValue>> =
-                    HashMap::with_capacity(source_rows.len());
-                for (source_rowid, values) in source_rows {
-                    // Mirror the reload projection
-                    // (read_fts5_rootpage_zero_content_rows_for_reload): the content
-                    // table carries the rowid-alias column first, then one column per
-                    // FTS5 column in declaration order.
-                    let content_values = if values.len() == col_count.saturating_add(1) {
-                        &values[1..]
-                    } else {
-                        values.as_slice()
-                    };
-                    let mut projected: Vec<SqliteValue> =
-                        content_values.iter().take(col_count).cloned().collect();
-                    while projected.len() < col_count {
-                        projected.push(SqliteValue::Null);
-                    }
-                    map.insert(source_rowid, projected);
-                }
-                Some(map)
-            } else {
-                None
-            };
-
             let mut cursor = Self::new_pager_btree_cursor(cx, txn, root, true).await?;
             let mut rows = Vec::new();
             if cursor.first(cx).await? {
                 loop {
                     let rowid = cursor.rowid(cx).await?;
-                    let mut row = match &content_by_rowid {
-                        Some(map) => map
-                            .get(&rowid)
-                            .cloned()
-                            .unwrap_or_else(|| vec![SqliteValue::Null; col_count]),
-                        None => vec![SqliteValue::Null; col_count],
-                    };
+                    let mut row = vec![SqliteValue::Null; col_count];
                     if src.hidden_rowid_projection.is_some() {
                         row.push(SqliteValue::Integer(rowid));
                     }
@@ -23777,33 +23750,188 @@ impl Connection {
         .await
     }
 
-    /// bd-plxob: resolve the external content SOURCE table for a `content='<table>'`
-    /// FTS5 vtab so lazy scans can project real column bodies from it. Returns
-    /// `None` for internal-content (`_content`-backed) or true contentless
-    /// (`content=''`) tables — neither has an external source to read.
+    /// Where an external-content FTS5 table (`content='<table>'`) reads its
+    /// columns. `None` for an internal-content (`_content`-backed) or
+    /// contentless (`content=''`) table, which has no content table to read.
     #[cfg(feature = "ext-fts5")]
-    fn fts5_external_content_source_schema(&self, src: &JoinTableSource) -> Option<TableSchema> {
-        let content_name = {
-            let ddl = self.original_ddl_sql.borrow();
-            let create_sql = ddl.get(&src.table_name.to_ascii_lowercase())?;
-            let Ok(Statement::CreateVirtualTable(create_stmt)) = parse_single_statement(create_sql)
-            else {
-                return None;
-            };
-            if !create_stmt.module.eq_ignore_ascii_case("fts5") {
-                return None;
-            }
-            let name = virtual_table_option_value(&create_stmt.args, "content")?;
-            if name.is_empty() {
-                return None; // contentless: no source
-            }
-            name
+    fn fts5_external_content(&self, table_name: &str) -> Option<Fts5ExternalContent> {
+        let columns = {
+            let instances = self.vtab_instances.borrow();
+            let fts5 = instances
+                .get(&table_name.to_ascii_uppercase())
+                .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+                .filter(|fts5| fts5.is_external_content())?;
+            fts5.columns().to_vec()
         };
-        self.schema
-            .borrow()
-            .iter()
-            .find(|table| table.name.eq_ignore_ascii_case(&content_name))
-            .cloned()
+        let ddl = self.original_ddl_sql.borrow();
+        let create_sql = ddl.get(&table_name.to_ascii_lowercase())?;
+        let Ok(Statement::CreateVirtualTable(create_stmt)) = parse_single_statement(create_sql)
+        else {
+            return None;
+        };
+        // A table that names itself as its content has no rows to read.
+        let content = virtual_table_option_value(&create_stmt.args, "content")
+            .filter(|name| !name.is_empty() && !name.eq_ignore_ascii_case(table_name))?;
+        let content_rowid = virtual_table_option_value(&create_stmt.args, "content_rowid")
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "rowid".to_owned());
+        Some(Fts5ExternalContent::new(&content, &content_rowid, &columns))
+    }
+
+    /// Whether the table or view an external-content FTS5 table names as its
+    /// content still exists (a RENAME of it does not follow into the option).
+    #[cfg(feature = "ext-fts5")]
+    fn fts5_content_source_exists(&self, content: &Fts5ExternalContent) -> bool {
+        self.schema_table_exists(&content.name)
+            || self
+                .views
+                .borrow()
+                .iter()
+                .any(|view| view.name.eq_ignore_ascii_case(&content.name))
+    }
+
+    /// Run an [`Fts5ExternalContent`] statement: each row is a content rowid
+    /// and the FTS5 columns' values.
+    #[cfg(feature = "ext-fts5")]
+    async fn query_fts5_external_content(
+        &self,
+        statement: &Statement,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Vec<(i64, Vec<SqliteValue>)>> {
+        // The scan runs inside another statement: read the content table the
+        // way that statement's subqueries do.
+        let rows = match statement {
+            Statement::Select(select) if self.skip_statement_memdb_refresh.get() => {
+                Box::pin(self.execute_select_via_memdb_fallback(select, params)).await?
+            }
+            _ => self.execute_statement(statement, params).await?,
+        };
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let mut values = row.values;
+                let rowid = if values.is_empty() {
+                    0
+                } else {
+                    values.remove(0).to_integer()
+                };
+                (rowid, values)
+            })
+            .collect())
+    }
+
+    /// The content rows of `rowids`, by rowid: a few hits are looked up one by
+    /// one, more read the content table once.
+    #[cfg(feature = "ext-fts5")]
+    async fn fts5_external_content_rows(
+        &self,
+        content: &Fts5ExternalContent,
+        rowids: &[i64],
+    ) -> Result<HashMap<i64, Vec<SqliteValue>>> {
+        const POINT_LOOKUPS: usize = 64;
+        if rowids.len() > POINT_LOOKUPS {
+            let wanted: HashSet<i64> = rowids.iter().copied().collect();
+            let scan = parse_single_statement(&content.scan_sql())?;
+            return Ok(self
+                .query_fts5_external_content(&scan, None)
+                .await?
+                .into_iter()
+                .filter(|(rowid, _)| wanted.contains(rowid))
+                .collect());
+        }
+        let lookup = parse_single_statement(&content.lookup_sql())?;
+        let mut rows = HashMap::with_capacity(rowids.len());
+        for &rowid in rowids {
+            let param = [SqliteValue::Integer(rowid)];
+            if let Some((_, values)) = self
+                .query_fts5_external_content(&lookup, Some(&param))
+                .await?
+                .into_iter()
+                .next()
+            {
+                rows.insert(rowid, values);
+            }
+        }
+        Ok(rows)
+    }
+
+    /// GH#211 (bd-c6jre): scan an external-content FTS5 table. Its index
+    /// holds only postings, so like stock a full scan reads the content table
+    /// and a MATCH looks each hit up there by `content_rowid`: the values,
+    /// and their types, are the content table's, read by column name.
+    #[cfg(feature = "ext-fts5")]
+    async fn scan_external_content_fts5_rows(
+        &self,
+        src: &JoinTableSource,
+        plan: &LiveVtabScanPlan,
+        is_lazy: bool,
+        content: &Fts5ExternalContent,
+    ) -> Result<Vec<Vec<SqliteValue>>> {
+        let rows = match plan.idx_num {
+            0 => {
+                if !self.fts5_content_source_exists(content) {
+                    return Err(FrankenError::NoSuchTable {
+                        name: format!("main.{}", content.name),
+                    });
+                }
+                let scan = parse_single_statement(&content.scan_sql())?;
+                self.query_fts5_external_content(&scan, None).await?
+            }
+            1 => {
+                let rowids: Vec<i64> = if is_lazy {
+                    self.lazy_fts5_match_rows(&src.table_name, plan)
+                        .await?
+                        .into_iter()
+                        .map(|(rowid, _)| rowid)
+                        .collect()
+                } else {
+                    let instances = self.vtab_instances.borrow();
+                    let fts5 = instances
+                        .get(&src.table_name.to_ascii_uppercase())
+                        .and_then(|instance| instance.as_any().downcast_ref::<Fts5Table>())
+                        .ok_or_else(|| {
+                            FrankenError::Internal(format!(
+                                "virtual table not found: {}",
+                                src.table_name
+                            ))
+                        })?;
+                    Self::live_fts5_match_rows(fts5, plan)?
+                        .into_iter()
+                        .map(|(rowid, _)| rowid)
+                        .collect()
+                };
+                // Stock reads a hit's content row only when a column of it is
+                // read, so a MATCH that projects only rowids still works once
+                // the content table is renamed or dropped (GH#211).
+                let mut found = if self.fts5_content_source_exists(content) {
+                    self.fts5_external_content_rows(content, &rowids).await?
+                } else {
+                    HashMap::new()
+                };
+                // Stock fails a hit whose content row is gone ("fts5: missing
+                // row N from content table") when a column of it is read; the
+                // scan cannot tell which columns are, so that hit projects NULL.
+                rowids
+                    .into_iter()
+                    .map(|rowid| (rowid, found.remove(&rowid).unwrap_or_default()))
+                    .collect()
+            }
+            idx_num => {
+                return Err(FrankenError::Internal(format!(
+                    "unsupported FTS5 external-content scan strategy: {idx_num}",
+                )));
+            }
+        };
+        Ok(rows
+            .into_iter()
+            .map(|(rowid, mut row)| {
+                row.resize(src.col_names.len(), SqliteValue::Null);
+                if src.hidden_rowid_projection.is_some() {
+                    row.push(SqliteValue::Integer(rowid));
+                }
+                row
+            })
+            .collect())
     }
 
     /// bd-plxob(b): read the EXTERNAL content SOURCE rows for a `'rebuild'`,
@@ -23827,78 +23955,24 @@ impl Connection {
         schema_name: Option<&str>,
         table_name: &str,
     ) -> Result<Option<Vec<(i64, Vec<String>)>>> {
-        let (content_table, col_count) = {
-            let ddl = self.original_ddl_sql.borrow();
-            let Some(create_sql) = ddl.get(&table_name.to_ascii_lowercase()) else {
-                return Ok(None);
-            };
-            let Ok(Statement::CreateVirtualTable(create_stmt)) = parse_single_statement(create_sql)
-            else {
-                return Ok(None);
-            };
-            if !create_stmt.module.eq_ignore_ascii_case("fts5") {
-                return Ok(None);
-            }
-            let Some(content_name) = virtual_table_option_value(&create_stmt.args, "content")
-            else {
-                return Ok(None);
-            };
-            if content_name.is_empty() {
-                return Ok(None); // contentless: no source
-            }
-            let col_count = parse_virtual_table_column_infos(&create_stmt.args).len();
-            let Some(content_table) = self
-                .schema
-                .borrow()
-                .iter()
-                .find(|table| table.name.eq_ignore_ascii_case(&content_name))
-                .cloned()
-            else {
-                return Err(FrankenError::NoSuchTable {
-                    name: format!("{}.{content_name}", schema_name.unwrap_or("main")),
-                });
-            };
-            (content_table, col_count)
+        let Some(content) = self.fts5_external_content(table_name) else {
+            return Ok(None);
         };
-        let rowid_alias_columns = self.rowid_alias_columns.borrow().clone();
-        let rows = self
-            .with_integrity_txn(async |cx, txn| {
-                let (page_size, reserved_per_page) = {
-                    let page1 = txn.get_page(cx, PageNumber::ONE).await?;
-                    let header = parse_database_header_checked(page1.as_ref())?;
-                    (header.page_size, header.reserved_per_page)
-                };
-                let source_rows = self
-                    .read_storage_table_rows_for_reload(
-                        cx,
-                        txn,
-                        page_size,
-                        reserved_per_page,
-                        &content_table,
-                        &rowid_alias_columns,
-                    )
-                    .await?;
-                Ok(source_rows
-                    .into_iter()
-                    .map(|(rowid, values)| {
-                        let content_values = if values.len() == col_count.saturating_add(1) {
-                            &values[1..]
-                        } else {
-                            values.as_slice()
-                        };
-                        (
-                            rowid,
-                            content_values
-                                .iter()
-                                .take(col_count)
-                                .map(SqliteValue::to_text)
-                                .collect::<Vec<String>>(),
-                        )
-                    })
-                    .collect::<Vec<_>>())
-            })
-            .await?;
-        Ok(Some(rows))
+        if !self.fts5_content_source_exists(&content) {
+            return Err(FrankenError::NoSuchTable {
+                name: format!("{}.{}", schema_name.unwrap_or("main"), content.name),
+            });
+        }
+        // As stock's rebuild reads them: the columns by name (GH#211), with
+        // the transaction's uncommitted source rows.
+        let scan = parse_single_statement(&content.scan_sql())?;
+        Ok(Some(
+            self.query_fts5_external_content(&scan, None)
+                .await?
+                .into_iter()
+                .map(|(rowid, values)| (rowid, values.iter().map(SqliteValue::to_text).collect()))
+                .collect(),
+        ))
     }
 
     /// Promote a lazy on-disk FTS5 table into the in-memory representation for
@@ -151139,6 +151213,57 @@ fn fts4_shadow_drop_names(table_name: &str, args: &[String]) -> Vec<String> {
     }
     names.push(format!("{table_name}_stat"));
     names
+}
+
+/// How an external-content FTS5 table (`content='<table>'`) reads its column
+/// values from its content table or view: by name, with stock's full-scan and
+/// lookup statements (`fts5_storage.c`).
+#[cfg(feature = "ext-fts5")]
+struct Fts5ExternalContent {
+    /// The content table or view, as the `content=` option names it.
+    name: String,
+    /// `SELECT T.<content_rowid>, T.<column>... FROM <content> AS T`.
+    select: String,
+    /// `T.<content_rowid>`.
+    rowid: String,
+}
+
+#[cfg(feature = "ext-fts5")]
+impl Fts5ExternalContent {
+    fn new(content: &str, content_rowid: &str, columns: &[String]) -> Self {
+        // A rowid name stays bare so it names the rowid of any table.
+        let rowid = if ["rowid", "oid", "_rowid_"]
+            .iter()
+            .any(|alias| content_rowid.eq_ignore_ascii_case(alias))
+        {
+            format!("T.{content_rowid}")
+        } else {
+            format!("T.{}", quote_identifier(content_rowid))
+        };
+        let mut select = format!("SELECT {rowid}");
+        for column in columns {
+            select.push_str(", T.");
+            select.push_str(&quote_identifier(column));
+        }
+        select.push_str(" FROM ");
+        select.push_str(&quote_identifier(content));
+        select.push_str(" AS T");
+        Self {
+            name: content.to_owned(),
+            select,
+            rowid,
+        }
+    }
+
+    /// Every content row, in rowid order.
+    fn scan_sql(&self) -> String {
+        format!("{} ORDER BY {}", self.select, self.rowid)
+    }
+
+    /// The content row with the rowid bound to `?`.
+    fn lookup_sql(&self) -> String {
+        format!("{} WHERE {} = ?", self.select, self.rowid)
+    }
 }
 
 fn virtual_table_option_value(args: &[String], option: &str) -> Option<String> {
