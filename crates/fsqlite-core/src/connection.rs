@@ -5284,11 +5284,6 @@ impl PagerBackend {
         }
     }
 
-    async fn install_existing_wal_backend(&self, cx: &Cx, db_path: &str) -> Result<bool> {
-        self.install_existing_wal_backend_with_mode(cx, db_path, false)
-            .await
-    }
-
     async fn install_existing_wal_backend_allow_readonly(
         &self,
         cx: &Cx,
@@ -83675,23 +83670,15 @@ impl Connection {
             return Ok(());
         }
 
-        let installed_existing_wal = self
-            .pager
+        self.pager
             .install_existing_wal_backend_allow_readonly(&cx, &self.path)
             .await?;
         match self.pager.set_journal_mode(&cx, JournalMode::Wal).await {
-            Ok(_) => Ok(()),
-            Err(FrankenError::Unsupported) => {
-                if !installed_existing_wal
-                    && self
-                        .pager
-                        .install_existing_wal_backend(&cx, &self.path)
-                        .await?
-                {
-                    self.pager.set_journal_mode(&cx, JournalMode::Wal).await?;
-                }
-                Ok(())
-            }
+            // Unsupported: no WAL was bound, so the main file is the whole
+            // database. (A writable install reaches the same decision for the
+            // same file, and its read-write open of the WAL failed on a
+            // read-only file: bd-reality-check-1022-llk6g.20.)
+            Ok(_) | Err(FrankenError::Unsupported) => Ok(()),
             Err(err) => Err(err),
         }
     }

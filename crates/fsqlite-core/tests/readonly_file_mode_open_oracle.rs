@@ -53,6 +53,24 @@ fn build_image(dir: &Path, shape: &str) -> PathBuf {
             std::fs::copy(dir.join("source.db-wal"), dir.join("image.db-wal")).expect("copy WAL");
             drop(stock);
         }
+        "wal_zero_byte" | "wal_shorter_than_header" => {
+            // GH#515's shape: a WAL shorter than its header and no -shm, so
+            // the main file is the whole database. The read-only WAL install
+            // binds no WAL here, and the open then retried a writable install
+            // whose read-write WAL open failed with "Permission denied".
+            {
+                let stock = rusqlite::Connection::open(&path).expect("stock create");
+                stock
+                    .execute_batch(&format!("PRAGMA journal_mode=WAL; {seed}"))
+                    .expect("seed");
+            }
+            let wal: &[u8] = if shape == "wal_zero_byte" {
+                &[]
+            } else {
+                &[0x37; 16]
+            };
+            std::fs::write(dir.join("image.db-wal"), wal).expect("write WAL");
+        }
         other => panic!("unknown shape {other}"),
     }
     path
@@ -110,7 +128,13 @@ fn unwritable_database_file_opens_read_only_like_stock() {
             tempfile::tempdir()
         }
         .expect("tempdir");
-        for shape in ["rollback", "wal_checkpointed", "wal_live_frames"] {
+        for shape in [
+            "rollback",
+            "wal_checkpointed",
+            "wal_live_frames",
+            "wal_zero_byte",
+            "wal_shorter_than_header",
+        ] {
             let image_dir = root.path().join(format!("{shape}-image"));
             std::fs::create_dir_all(&image_dir).expect("image dir");
             let image = build_image(&image_dir, shape);
