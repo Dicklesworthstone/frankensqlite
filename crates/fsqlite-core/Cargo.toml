@@ -109,6 +109,9 @@ proptest = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde_json = { workspace = true }
 
+[target.'cfg(unix)'.dev-dependencies]
+nix = { workspace = true }
+
 [lints]
 workspace = true
 

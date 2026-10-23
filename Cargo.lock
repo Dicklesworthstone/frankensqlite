@@ -1163,6 +1163,7 @@ dependencies = [
  "itoa",
  "lazy_static",
  "lru",
+ "nix",
  "proptest",
  "rusqlite",
  "serde",

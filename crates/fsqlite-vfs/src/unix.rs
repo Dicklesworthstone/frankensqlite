@@ -612,6 +612,14 @@ fn flock_whole_file_fallback(file: &impl AsFd, l_type: libc::c_short) -> nix::Re
     }
 }
 
+/// Whether `file` was opened read-only, so a POSIX write lock on it fails
+/// with EBADF.
+fn descriptor_is_read_only(file: &impl AsFd) -> bool {
+    use nix::fcntl::{FcntlArg, OFlag, fcntl};
+    fcntl(file, FcntlArg::F_GETFL)
+        .is_ok_and(|flags| OFlag::from_bits_truncate(flags) & OFlag::O_ACCMODE == OFlag::O_RDONLY)
+}
+
 /// Attempt a non-blocking POSIX advisory lock via [`fcntl_setlk`].
 ///
 /// On Linux this is a safe `nix` `F_SETLK` wrapper; on Darwin/other Unix it
@@ -4539,9 +4547,20 @@ impl VfsFile for UnixFile {
 
     fn lock_external_wal_recovery(&mut self, cx: &Cx) -> Result<()> {
         checkpoint_or_abort(cx)?;
+        // A database this process cannot write has only a read-only canonical
+        // descriptor, and a POSIX write lock on one fails with EBADF, so its
+        // reader recovers under SHARED, as stock's walIndexRecover always
+        // does. Every appender takes WRITE after RESERVED, so the WRITE, CKPT,
+        // and RECOVER..READ(n) slots still exclude appenders, checkpointers,
+        // and pinned readers.
+        let main_level = if descriptor_is_read_only(self.file_ref()) {
+            LockLevel::Shared
+        } else {
+            LockLevel::Reserved
+        };
         // Arm the recovery kind before even the checkpoint prefix can fail.
         // The shared maintenance owner forbids nested append/snapshot owners.
-        self.acquire_external_maintenance_fence(cx, true, LockLevel::Reserved, true)?;
+        self.acquire_external_maintenance_fence(cx, true, main_level, true)?;
         for slot in WAL_RECOVER_LOCK..WAL_TOTAL_LOCKS {
             checkpoint_or_abort(cx)?;
             if self.acquire_external_wal_slot(cx, slot)?
@@ -10224,6 +10243,27 @@ mod tests {
         let byte = sqlite_shm_dms_lock_byte();
         // WAL_WRITE_LOCK is slot 0, lock byte 120, plus WAL_TOTAL_LOCKS (8) = 128.
         assert_eq!(byte, 128);
+    }
+
+    #[test]
+    fn read_only_descriptor_is_detected_for_the_wal_recovery_fence() {
+        let (_dir, path) = make_temp_path("access_mode.db");
+        fs::write(&path, b"x").unwrap();
+        let read_only = OpenOptions::new().read(true).open(&path).unwrap();
+        let read_write = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        assert!(descriptor_is_read_only(&read_only));
+        assert!(!descriptor_is_read_only(&read_write));
+        // The reason recovery must not ask a read-only descriptor for RESERVED
+        // (Linux never falls back to flock(2), which ignores the access mode).
+        #[cfg(target_os = "linux")]
+        {
+            assert!(posix_lock(&read_only, libc::F_WRLCK, 0, 1).is_err());
+            assert!(posix_lock(&read_only, libc::F_RDLCK, 0, 1).unwrap());
+        }
     }
 
     #[test]

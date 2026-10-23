@@ -4237,6 +4237,29 @@ impl PagerBackend {
         }
     }
 
+    /// Whether an existing database file cannot be opened for writing: a
+    /// read-only mode, another owner's file, or a read-only mount. Stock's
+    /// `unixOpen` retries such a read-write open read-only, so the database
+    /// opens as a read-only connection instead of failing with EACCES.
+    ///
+    /// Uses `access(2)`, never a probe descriptor: closing any descriptor for
+    /// the inode would release this process's fcntl locks on it.
+    fn database_file_is_read_only(path: &str, cx: &Cx) -> bool {
+        #[cfg(all(feature = "native", unix))]
+        {
+            let vfs = UnixVfs::new();
+            let path = Path::new(path);
+            vfs.access(cx, path, AccessFlags::EXISTS).unwrap_or(false)
+                && !vfs.access(cx, path, AccessFlags::READWRITE).unwrap_or(true)
+        }
+
+        #[cfg(not(all(feature = "native", unix)))]
+        {
+            let _ = (path, cx);
+            false
+        }
+    }
+
     /// Returns `true` if this backend uses the in-memory VFS (`:memory:`).
     #[must_use]
     pub fn is_memory(&self) -> bool {
@@ -16038,6 +16061,15 @@ impl Connection {
 
         let bootstrap_cx = env.bootstrap_cx();
         let path = PagerBackend::resolve_stable_database_path(&path, &bootstrap_cx)?;
+        if expected_identity.is_none()
+            && PagerBackend::database_file_is_read_only(&path, &bootstrap_cx)
+        {
+            // Stock's SQLITE_OPEN_READWRITE falls back to read-only too.
+            return Box::pin(Self::open_schema_only_with_wal_index_recovery_and_env(
+                path, env,
+            ))
+            .await;
+        }
         let pager = retry_busy_connection_bootstrap(|| {
             PagerBackend::open_existing_with_page_buffer_max(
                 &path,
@@ -16084,6 +16116,14 @@ impl Connection {
                 Err(_) => false,
             }
         };
+        if !storage_was_empty && PagerBackend::database_file_is_read_only(&path, &bootstrap_cx) {
+            // Like stock, an unwritable existing database opens read-only
+            // (writes fail with SQLITE_READONLY) instead of failing the open.
+            return Box::pin(Self::open_schema_only_with_wal_index_recovery_and_env(
+                path, env,
+            ))
+            .await;
+        }
         retry_busy_connection_bootstrap(|| async {
             let pager = PagerBackend::open_with_requested_page_size_and_page_buffer_max(
                 &path,
