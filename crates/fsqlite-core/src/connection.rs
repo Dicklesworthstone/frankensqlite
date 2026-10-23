@@ -89528,15 +89528,18 @@ impl Connection {
                             )));
                         }
                     }
+                    let mut arg_subtypes = SmallVec::<[u32; 4]>::new();
                     let arg_vals: Vec<SqliteValue> = match args {
                         FunctionArgs::Star => vec![],
                         FunctionArgs::List(exprs) => {
                             let mut vals = Vec::with_capacity(exprs.len());
                             for e in exprs {
+                                LAST_VARYING_RESULT_SUBTYPE.with(|cell| cell.set(0));
                                 vals.push(
                                     self.eval_expr_with_subqueries(e, row, col_map, params)
                                         .await?,
                                 );
+                                arg_subtypes.push(evaluated_arg_json_subtype(e));
                             }
                             vals
                         }
@@ -89570,7 +89573,13 @@ impl Connection {
                         } else {
                             None
                         };
-                        invoke_resolved_scalar(name, &resolved, &arg_vals, collation.as_deref())
+                        invoke_resolved_scalar(
+                            name,
+                            &resolved,
+                            &arg_vals,
+                            &arg_subtypes,
+                            collation.as_deref(),
+                        )
                     } else {
                         Ok(eval_scalar_fn(name, &arg_vals))
                     }
@@ -90339,6 +90348,7 @@ impl Connection {
                         function_name,
                         &resolved,
                         &[input, json_path],
+                        &[],
                         collation.as_deref(),
                     )
                 }
@@ -126271,13 +126281,8 @@ fn eval_group_agg_join_expr(
                     "unable to use function {name} in the requested context",
                 )));
             }
-            let arg_vals: Vec<SqliteValue> = match args {
-                FunctionArgs::List(exprs) => exprs
-                    .iter()
-                    .map(|e| eval_group_agg_join_expr(e, group_rows, col_map))
-                    .collect::<Result<Vec<_>>>()?,
-                FunctionArgs::Star => vec![],
-            };
+            let (arg_vals, arg_subtypes) =
+                eval_scalar_call_args(args, |e| eval_group_agg_join_expr(e, group_rows, col_map))?;
             #[cfg(feature = "ext-fts5")]
             if application_kind.is_none()
                 && let Some(value) = eval_fts5_scalar_fallback(name, &arg_vals)?
@@ -126285,9 +126290,12 @@ fn eval_group_agg_join_expr(
                 return Ok(value);
             }
             let collation = function_argument_collation(args, col_map);
-            if let Some(result) =
-                invoke_current_registered_scalar(name, &arg_vals, collation.as_deref())
-            {
+            if let Some(result) = invoke_current_registered_scalar(
+                name,
+                &arg_vals,
+                &arg_subtypes,
+                collation.as_deref(),
+            ) {
                 return result;
             }
             Ok(eval_scalar_fn(name, &arg_vals))
@@ -135035,13 +135043,9 @@ fn evaluate_having_value(
 
         // Non-aggregate scalar function call — evaluate arguments and delegate.
         Expr::FunctionCall { name, args, .. } => {
-            let arg_values: Vec<SqliteValue> = match args {
-                FunctionArgs::Star => vec![],
-                FunctionArgs::List(exprs) => exprs
-                    .iter()
-                    .map(|e| evaluate_having_value(e, values, columns, group_rows, col_map))
-                    .collect::<Result<Vec<_>>>()?,
-            };
+            let (arg_values, arg_subtypes) = eval_scalar_call_args(args, |e| {
+                evaluate_having_value(e, values, columns, group_rows, col_map)
+            })?;
             #[cfg(feature = "ext-fts5")]
             if current_application_function_kind(name, aggregate_args_len_for_lookup(args))
                 .is_none()
@@ -135050,9 +135054,12 @@ fn evaluate_having_value(
                 return Ok(value);
             }
             let collation = function_argument_collation(args, col_map);
-            if let Some(result) =
-                invoke_current_registered_scalar(name, &arg_values, collation.as_deref())
-            {
+            if let Some(result) = invoke_current_registered_scalar(
+                name,
+                &arg_values,
+                &arg_subtypes,
+                collation.as_deref(),
+            ) {
                 return result;
             }
             // GH #270: a HAVING call to a function that does not exist must raise
@@ -154237,21 +154244,93 @@ fn invoke_resolved_scalar(
     name: &str,
     resolved: &ResolvedScalarFunction,
     args: &[SqliteValue],
+    arg_subtypes: &[u32],
     collation: Option<&dyn CollationFunction>,
 ) -> Result<SqliteValue> {
     validate_scalar_for_sync_evaluation(name, resolved.schema_safety(), args)?;
     let function = resolved.function();
     if resolved.consumes_argument_collation() {
         function.invoke_with_collation(args, collation)
+    } else if function.result_subtype_varies() {
+        let (value, subtype) = function.invoke_with_result_subtype(args, arg_subtypes)?;
+        LAST_VARYING_RESULT_SUBTYPE.with(|cell| cell.set(subtype.unwrap_or(0)));
+        Ok(value)
+    } else if arg_subtypes.iter().any(|&subtype| subtype != 0) {
+        function.invoke_with_arg_subtypes(args, arg_subtypes)
     } else {
         function.invoke(args)
     }
+}
+
+thread_local! {
+    /// The subtype the latest compatibility-evaluator call to a scalar with a
+    /// value-dependent result subtype (json_extract) reported; read back by
+    /// `evaluated_arg_json_subtype` for the argument that made that call.
+    static LAST_VARYING_RESULT_SUBTYPE: Cell<u32> = const { Cell::new(0) };
+}
+
+/// The subtype an argument carries into a scalar call made by the
+/// compatibility evaluators, as the VDBE would pass it: a call to a function
+/// returning JSON (`json(...)`, `json_object(...)`, `json_group_array(...)`,
+/// ...) yields JSON text, so a JSON constructor embeds it instead of quoting
+/// it; for json_extract it is what that very call reported. Call right after
+/// evaluating `expr`, with `LAST_VARYING_RESULT_SUBTYPE` reset before it.
+fn evaluated_arg_json_subtype(expr: &Expr) -> u32 {
+    let (name, arity) = match expr {
+        Expr::FunctionCall { name, args, .. } => {
+            let arity = match args {
+                FunctionArgs::List(list) => i32::try_from(list.len()).unwrap_or(-1),
+                FunctionArgs::Star => -1,
+            };
+            if is_builtin_json_aggregate(name)
+                && current_application_function_kind(name, arity).is_none()
+            {
+                return fsqlite_func::JSON_SUBTYPE;
+            }
+            (name.as_str(), arity)
+        }
+        // `x -> path` calls the `->` scalar, whose result is JSON.
+        Expr::JsonAccess { arrow, .. } => (json_access_function_name(*arrow), 2),
+        _ => return 0,
+    };
+    let PreparedJoinScalar::Resolved(resolved) = resolve_current_registered_scalar(name, arity)
+    else {
+        return 0;
+    };
+    let function = resolved.function();
+    if function.result_subtype_varies() {
+        LAST_VARYING_RESULT_SUBTYPE.with(Cell::get)
+    } else if function.result_subtype() == Some(fsqlite_func::JSON_SUBTYPE) {
+        fsqlite_func::JSON_SUBTYPE
+    } else {
+        0
+    }
+}
+
+/// Evaluate a scalar call's arguments with `eval`, together with the subtype
+/// each one carries (see `evaluated_arg_json_subtype`).
+fn eval_scalar_call_args(
+    args: &FunctionArgs,
+    mut eval: impl FnMut(&Expr) -> Result<SqliteValue>,
+) -> Result<(Vec<SqliteValue>, SmallVec<[u32; 4]>)> {
+    let FunctionArgs::List(exprs) = args else {
+        return Ok((Vec::new(), SmallVec::new()));
+    };
+    let mut values = Vec::with_capacity(exprs.len());
+    let mut subtypes = SmallVec::with_capacity(exprs.len());
+    for expr in exprs {
+        LAST_VARYING_RESULT_SUBTYPE.with(|cell| cell.set(0));
+        values.push(eval(expr)?);
+        subtypes.push(evaluated_arg_json_subtype(expr));
+    }
+    Ok((values, subtypes))
 }
 
 fn invoke_scalar_for_sync_evaluation(
     name: &str,
     resolved: &ResolvedScalarFunction,
     args: &[SqliteValue],
+    arg_subtypes: &[u32],
     collation_name: Option<&str>,
 ) -> Result<SqliteValue> {
     let collation = if resolved.consumes_argument_collation() {
@@ -154277,7 +154356,7 @@ fn invoke_scalar_for_sync_evaluation(
     } else {
         None
     };
-    invoke_resolved_scalar(name, resolved, args, collation.as_deref())
+    invoke_resolved_scalar(name, resolved, args, arg_subtypes, collation.as_deref())
 }
 
 fn validate_scalar_for_sync_evaluation(
@@ -157639,10 +157718,11 @@ fn apply_pattern_operator_not(value: SqliteValue, not: bool) -> SqliteValue {
 fn invoke_current_registered_scalar(
     name: &str,
     args: &[SqliteValue],
+    arg_subtypes: &[u32],
     collation_name: Option<&str>,
 ) -> Option<Result<SqliteValue>> {
     let prepared = resolve_current_registered_scalar(name, args.len() as i32);
-    invoke_prepared_scalar(name, &prepared, args, collation_name)
+    invoke_prepared_scalar(name, &prepared, args, arg_subtypes, collation_name)
 }
 
 /// The registered scalar `name/arity` resolves to under the current sync
@@ -157686,6 +157766,7 @@ fn invoke_prepared_scalar(
     name: &str,
     prepared: &PreparedJoinScalar,
     args: &[SqliteValue],
+    arg_subtypes: &[u32],
     collation_name: Option<&str>,
 ) -> Option<Result<SqliteValue>> {
     match prepared {
@@ -157693,6 +157774,7 @@ fn invoke_prepared_scalar(
             name,
             resolved,
             args,
+            arg_subtypes,
             collation_name,
         )),
         PreparedJoinScalar::Misuse(message) => {
@@ -157805,8 +157887,14 @@ fn invoke_resolved_pattern_operator(
     if let Some(escape) = escape {
         args.push(escape.clone());
     }
-    invoke_resolved_scalar(resolved.function_name, &resolved.scalar, &args, collation)
-        .map(|value| apply_pattern_operator_not(value, not))
+    invoke_resolved_scalar(
+        resolved.function_name,
+        &resolved.scalar,
+        &args,
+        &[],
+        collation,
+    )
+    .map(|value| apply_pattern_operator_not(value, not))
 }
 
 fn pattern_operator_argument_collation(
@@ -158191,13 +158279,8 @@ pub(crate) fn eval_join_expr(
                     )));
                 }
             }
-            let arg_vals: Vec<SqliteValue> = match args {
-                FunctionArgs::List(exprs) => exprs
-                    .iter()
-                    .map(|e| eval_join_expr(e, row, col_map))
-                    .collect::<Result<Vec<_>>>()?,
-                FunctionArgs::Star => vec![],
-            };
+            let (arg_vals, arg_subtypes) =
+                eval_scalar_call_args(args, |e| eval_join_expr(e, row, col_map))?;
             #[cfg(feature = "ext-fts5")]
             if application_kind_is_none
                 && fts5_candidate
@@ -158210,6 +158293,7 @@ pub(crate) fn eval_join_expr(
                     name,
                     &prepared.scalar,
                     &arg_vals,
+                    &arg_subtypes,
                     prepared.collation.as_deref(),
                 ) {
                     return result;
@@ -158217,9 +158301,12 @@ pub(crate) fn eval_join_expr(
                 return Ok(eval_scalar_fn(name, &arg_vals));
             }
             let collation = function_argument_collation(args, col_map);
-            if let Some(result) =
-                invoke_current_registered_scalar(name, &arg_vals, collation.as_deref())
-            {
+            if let Some(result) = invoke_current_registered_scalar(
+                name,
+                &arg_vals,
+                &arg_subtypes,
+                collation.as_deref(),
+            ) {
                 return result;
             }
             Ok(eval_scalar_fn(name, &arg_vals))
@@ -158289,7 +158376,7 @@ pub(crate) fn eval_join_expr(
             };
             let collation = join_expr_defining_collation(inner, col_map)
                 .or_else(|| join_expr_defining_collation(path, col_map));
-            invoke_current_registered_scalar(name, &[source, path_value], collation.as_deref())
+            invoke_current_registered_scalar(name, &[source, path_value], &[], collation.as_deref())
                 .unwrap_or_else(|| {
                     Err(FrankenError::Internal(format!(
                         "no such function: {}",

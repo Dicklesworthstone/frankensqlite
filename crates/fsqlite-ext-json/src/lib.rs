@@ -939,7 +939,9 @@ pub fn json_quote(value: &SqliteValue) -> Result<String> {
         SqliteValue::Text(text) => {
             Ok(serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_owned()))
         }
-        SqliteValue::Blob(_) => Err(FrankenError::function_error("JSON cannot hold BLOB values")),
+        // Stock `jsonAppendSqlValue`: a JSONB blob is rendered as JSON text.
+        SqliteValue::Blob(bytes) => json_from_jsonb(bytes)
+            .map_err(|_| FrankenError::function_error("JSON cannot hold BLOB values")),
     }
 }
 
@@ -955,6 +957,9 @@ fn sqlite_to_json_with_subtype(value: &SqliteValue, subtype: u32) -> Result<Valu
         match value {
             SqliteValue::Text(text) => return parse_json_text(text),
             SqliteValue::Blob(bytes) => {
+                if let Ok(value) = decode_jsonb_root(bytes) {
+                    return Ok(value);
+                }
                 if let Ok(text) = std::str::from_utf8(bytes) {
                     return parse_json_text(text);
                 }
@@ -2634,7 +2639,10 @@ fn sqlite_to_json(value: &SqliteValue) -> Result<Value> {
         SqliteValue::Integer(i) => Ok(Value::Number(Number::from(*i))),
         SqliteValue::Float(f) => float_to_json(*f),
         SqliteValue::Text(text) => Ok(Value::String(text.to_string())),
-        SqliteValue::Blob(_) => Err(FrankenError::function_error("JSON cannot hold BLOB values")),
+        // Stock `jsonAppendSqlValue`: a JSONB blob is embedded as the JSON
+        // value it encodes; any other blob is an error.
+        SqliteValue::Blob(bytes) => decode_jsonb_root(bytes)
+            .map_err(|_| FrankenError::function_error("JSON cannot hold BLOB values")),
     }
 }
 
@@ -3288,8 +3296,11 @@ impl ScalarFunction for JsonTypeFunc {
 
 pub struct JsonExtractFunc;
 
-impl ScalarFunction for JsonExtractFunc {
-    fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+impl JsonExtractFunc {
+    /// `json_extract` plus the subtype stock gives its result: an extracted
+    /// array or object, and the array built for several paths, are JSON; a
+    /// scalar (even a string that looks like JSON) is not.
+    fn extract(&self, args: &[SqliteValue]) -> Result<(SqliteValue, Option<u32>)> {
         if args.is_empty() {
             return Err(invalid_arity(
                 self.name(),
@@ -3298,22 +3309,46 @@ impl ScalarFunction for JsonExtractFunc {
             ));
         }
         if args.len() == 1 {
-            return Ok(SqliteValue::Null);
+            return Ok((SqliteValue::Null, None));
         }
         if matches!(args[0], SqliteValue::Null) {
-            return Ok(SqliteValue::Null);
+            return Ok((SqliteValue::Null, None));
         }
         // SQLite returns NULL when any path argument is NULL.
         if args[1..].iter().any(|a| matches!(a, SqliteValue::Null)) {
-            return Ok(SqliteValue::Null);
+            return Ok((SqliteValue::Null, None));
         }
         let input = json_arg_value(self.name(), args, 0)?;
         if args.len() == 2 {
             let path = text_arg(self.name(), args, 1)?;
-            return json_extract_single_path(&input, path);
+            let selected = resolve_path(&input, path)?;
+            let subtype = matches!(selected, Some(Value::Array(_) | Value::Object(_)))
+                .then_some(JSON_SUBTYPE);
+            return Ok((
+                selected.map_or(SqliteValue::Null, json_to_sqlite_scalar),
+                subtype,
+            ));
         }
         let paths = collect_path_args(self.name(), args, 1)?;
-        json_extract_value(&input, &paths)
+        Ok((json_extract_value(&input, &paths)?, Some(JSON_SUBTYPE)))
+    }
+}
+
+impl ScalarFunction for JsonExtractFunc {
+    fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        Ok(self.extract(args)?.0)
+    }
+
+    fn result_subtype_varies(&self) -> bool {
+        true
+    }
+
+    fn invoke_with_result_subtype(
+        &self,
+        args: &[SqliteValue],
+        _arg_subtypes: &[u32],
+    ) -> Result<(SqliteValue, Option<u32>)> {
+        self.extract(args)
     }
 
     fn num_args(&self) -> i32 {
@@ -3564,10 +3599,25 @@ pub struct JsonQuoteFunc;
 
 impl ScalarFunction for JsonQuoteFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        self.invoke_with_arg_subtypes(args, &[])
+    }
+
+    fn invoke_with_arg_subtypes(
+        &self,
+        args: &[SqliteValue],
+        arg_subtypes: &[u32],
+    ) -> Result<SqliteValue> {
         if args.len() != 1 {
             return Err(invalid_arity(self.name(), "exactly 1 argument", args.len()));
         }
-        let s = json_quote(&args[0])?;
+        // A value returned by another JSON function is already JSON: stock
+        // copies it verbatim (`json_quote(json('[1]'))` is `[1]`, not a string).
+        let s = match &args[0] {
+            SqliteValue::Text(text) if arg_subtypes.first() == Some(&JSON_SUBTYPE) => {
+                text.to_string()
+            }
+            value => json_quote(value)?,
+        };
         Ok(SqliteValue::Text(SmallText::from_string(s)))
     }
 
@@ -3577,6 +3627,10 @@ impl ScalarFunction for JsonQuoteFunc {
 
     fn name(&self) -> &'static str {
         "json_quote"
+    }
+
+    fn result_subtype(&self) -> Option<u32> {
+        Some(JSON_SUBTYPE)
     }
 }
 
@@ -4090,6 +4144,10 @@ impl ScalarFunction for JsonRemoveFunc {
     fn name(&self) -> &'static str {
         "json_remove"
     }
+
+    fn result_subtype(&self) -> Option<u32> {
+        Some(JSON_SUBTYPE)
+    }
 }
 
 pub struct JsonbRemoveFunc;
@@ -4158,6 +4216,10 @@ impl ScalarFunction for JsonPatchFunc {
 
     fn name(&self) -> &'static str {
         "json_patch"
+    }
+
+    fn result_subtype(&self) -> Option<u32> {
+        Some(JSON_SUBTYPE)
     }
 }
 
@@ -4333,6 +4395,9 @@ impl AggregateFunction for JsonGroupArrayFunc {
             json_array_with_subtypes(&values, &subtypes)?,
         )))
     }
+    fn result_subtype(&self) -> Option<u32> {
+        Some(JSON_SUBTYPE)
+    }
     fn num_args(&self) -> i32 {
         1
     }
@@ -4375,6 +4440,9 @@ impl AggregateFunction for JsonGroupObjectFunc {
         Ok(SqliteValue::Text(SmallText::from_string(
             json_object_with_subtypes(&values, &subtypes)?,
         )))
+    }
+    fn result_subtype(&self) -> Option<u32> {
+        Some(JSON_SUBTYPE)
     }
     fn num_args(&self) -> i32 {
         2
@@ -7093,6 +7161,53 @@ mod tests {
                 .to_string()
                 .contains("JSON cannot hold BLOB values")
         );
+    }
+
+    /// bd-reality-check-1022-llk6g.14: stock `json_quote` copies a JSON-subtyped
+    /// argument verbatim, renders a JSONB blob as JSON text, and tags its
+    /// result as JSON.
+    #[test]
+    fn test_json_quote_passes_json_values_through() {
+        let text = |s: &str| SqliteValue::Text(SmallText::from_string(s));
+        let json_arg = JsonQuoteFunc
+            .invoke_with_arg_subtypes(&[text(r#"{"a":1}"#)], &[JSON_SUBTYPE])
+            .unwrap();
+        assert_eq!(json_arg, text(r#"{"a":1}"#));
+        // The same text without the subtype is an ordinary string.
+        assert_eq!(
+            JsonQuoteFunc.invoke(&[text(r#"{"a":1}"#)]).unwrap(),
+            text(r#""{\"a\":1}""#)
+        );
+        let blob = SqliteValue::Blob(Arc::from(jsonb("[1, 2]").unwrap().as_slice()));
+        assert_eq!(JsonQuoteFunc.invoke(&[blob]).unwrap(), text("[1,2]"));
+        // x'01' is the one-byte JSONB `true`.
+        let one = SqliteValue::Blob(Arc::from(vec![0x01_u8]));
+        assert_eq!(JsonQuoteFunc.invoke(&[one]).unwrap(), text("true"));
+        assert_eq!(JsonQuoteFunc.result_subtype(), Some(JSON_SUBTYPE));
+        assert_eq!(JsonPatchFunc.result_subtype(), Some(JSON_SUBTYPE));
+        assert_eq!(JsonRemoveFunc.result_subtype(), Some(JSON_SUBTYPE));
+    }
+
+    /// bd-reality-check-1022-llk6g.14: json_extract tags an extracted array or
+    /// object (and the multi-path array) as JSON, but not a scalar, even a
+    /// string that looks like JSON.
+    #[test]
+    fn test_json_extract_result_subtype_depends_on_value() {
+        let text = |s: &str| SqliteValue::Text(SmallText::from_string(s));
+        assert!(JsonExtractFunc.result_subtype_varies());
+        let doc = text(r#"{"a":[1],"s":"[1]","n":2}"#);
+        let call = |path: &[&str]| {
+            let mut args = vec![doc.clone()];
+            args.extend(path.iter().map(|p| text(p)));
+            JsonExtractFunc
+                .invoke_with_result_subtype(&args, &[])
+                .unwrap()
+        };
+        assert_eq!(call(&["$.a"]), (text("[1]"), Some(JSON_SUBTYPE)));
+        assert_eq!(call(&["$.s"]), (text("[1]"), None));
+        assert_eq!(call(&["$.n"]), (SqliteValue::Integer(2), None));
+        assert_eq!(call(&["$.missing"]), (SqliteValue::Null, None));
+        assert_eq!(call(&["$.a", "$.n"]), (text("[[1],2]"), Some(JSON_SUBTYPE)));
     }
 
     #[test]

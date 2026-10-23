@@ -92,6 +92,25 @@ pub trait ScalarFunction: Send + Sync {
         None
     }
 
+    /// Whether the result's subtype depends on the value each call produces,
+    /// so the engine must ask [`Self::invoke_with_result_subtype`] instead of
+    /// [`Self::result_subtype`]. Stock `json_extract` tags an extracted array
+    /// or object as JSON but not a string, even one that looks like JSON.
+    fn result_subtype_varies(&self) -> bool {
+        false
+    }
+
+    /// Execute this function and report the subtype of this particular
+    /// result. Only consulted when [`Self::result_subtype_varies`] is `true`.
+    fn invoke_with_result_subtype(
+        &self,
+        args: &[SqliteValue],
+        arg_subtypes: &[u32],
+    ) -> Result<(SqliteValue, Option<u32>)> {
+        let value = self.invoke_with_arg_subtypes(args, arg_subtypes)?;
+        Ok((value, self.result_subtype()))
+    }
+
     /// Whether this function is deterministic (same inputs → same output).
     ///
     /// Deterministic functions enable constant folding and other query

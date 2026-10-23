@@ -61,6 +61,13 @@ pub trait AggregateFunction: Send + Sync {
     /// Consume the accumulator and produce the final result.
     fn finalize(&self, state: Self::State) -> Result<SqliteValue>;
 
+    /// The subtype this aggregate tags onto its result, if any
+    /// (`json_group_array` / `json_group_object` return JSON), so an outer
+    /// JSON constructor embeds the result instead of quoting it.
+    fn result_subtype(&self) -> Option<u32> {
+        None
+    }
+
     /// The number of arguments this function accepts (`-1` = variadic).
     fn num_args(&self) -> i32;
 
@@ -146,6 +153,10 @@ where
             .downcast::<F::State>()
             .expect("aggregate state type mismatch");
         self.inner.finalize(concrete)
+    }
+
+    fn result_subtype(&self) -> Option<u32> {
+        self.inner.result_subtype()
     }
 
     fn num_args(&self) -> i32 {

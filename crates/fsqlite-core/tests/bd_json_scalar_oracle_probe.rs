@@ -102,3 +102,99 @@ fn json_scalar_functions_match_rusqlite_oracle() {
         );
     });
 }
+
+/// bd-reality-check-1022-llk6g.14: the JSON subtype must flow from one JSON
+/// function into the next, as in stock. `json_quote` of a JSON value is a
+/// no-op and its own result is JSON; json_extract of an array or object, and
+/// json_patch / json_remove results, are JSON; a JSONB blob argument is the
+/// JSON it encodes. The join and GROUP BY evaluators must pass the subtype
+/// too (they used to quote `json('[1]')` inside `json_array`).
+#[test]
+fn json_subtype_flows_between_json_functions() {
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        for s in [
+            "CREATE TABLE t(x INTEGER, doc TEXT)",
+            r#"INSERT INTO t VALUES (1, '{"a":[1,2],"s":"[1]"}')"#,
+        ] {
+            f.execute(s).await.unwrap();
+            r.execute_batch(s).unwrap();
+        }
+        let shapes = [
+            r#"json_quote(json('{"a":1}'))"#,
+            r#"json_quote(json(' {"a" : 1} '))"#,
+            r#"json_quote(json('"s"'))"#,
+            r#"json_quote(json_set('{"a":1}','$.b',2))"#,
+            "json_quote(json_object('a', 1))",
+            "json_quote(json_array(1, 'b'))",
+            r#"json_quote('{"a":1}')"#,
+            "json_quote(json_pretty('[1]'))",
+            "json_quote(json_quote('x'))",
+            "json_array(json_quote('x'))",
+            "json_object('k', json_quote('x'))",
+            "json_quote(jsonb('[1, 2]'))",
+            "json_quote(x'01')",
+            "typeof(json_quote(jsonb('{}')))",
+            "json_quote(jsonb_array(1))",
+            r#"json_quote('{"a":1}' -> '$')"#,
+            r#"json_quote('{"a":"x"}' ->> '$.a')"#,
+            r#"json_array(json_extract('{"a":[1]}','$.a'))"#,
+            r#"json_array(json_extract('{"a":"x"}','$.a'))"#,
+            r#"json_array(json_extract('{"a":"[1]"}','$.a'))"#,
+            r#"json_array(json_extract('{"a":[1],"b":2}','$.a','$.b'))"#,
+            r#"json_object('k', json_extract('{"a":{"b":1}}','$.a'))"#,
+            r#"json_array(json_patch('{}','{"a":1}'))"#,
+            "json_array(json_remove('[1,2]','$[0]'))",
+            "json_array(jsonb('[1]'))",
+            "json_set('{}', '$.a', jsonb('[1]'))",
+            r#"json_object('k', jsonb('{"x":1}'))"#,
+            r#"json_array('{"a":1}' ->> '$')"#,
+            "json_array(json('[1]'))",
+            "json_object('k', json_object('a', json_array(1)))",
+        ];
+        let mut diffs = Vec::new();
+        for shape in shapes {
+            for sql in [
+                format!("SELECT {shape}"),
+                format!("SELECT {shape} FROM t"),
+                format!("SELECT {shape} FROM t a JOIN t b ON a.x = b.x"),
+                format!("SELECT {shape} FROM t a LEFT JOIN t b ON a.x = b.x"),
+                format!("SELECT {shape} FROM t GROUP BY x"),
+            ] {
+                let fv = fval(&f, &sql).await;
+                let rv = rval(&r, &sql);
+                if fv != rv {
+                    diffs.push(format!("  `{sql}`\n     frank= {fv}\n     stock= {rv}"));
+                }
+            }
+        }
+        // Column-sourced JSON inside a join (the common application shape).
+        for sql in [
+            "SELECT json_object('id', a.x, 'doc', json(b.doc)) FROM t a JOIN t b ON a.x = b.x",
+            "SELECT json_array(json_extract(b.doc, '$.a')) FROM t a JOIN t b ON a.x = b.x",
+            "SELECT json_object('n', count(*), 'docs', json_group_array(json(doc))) FROM t",
+            "SELECT json_array(json_group_array(x)) FROM t GROUP BY x",
+        ] {
+            let fv = fval(&f, sql).await;
+            let rv = rval(&r, sql);
+            if fv != rv {
+                diffs.push(format!("  `{sql}`\n     frank= {fv}\n     stock= {rv}"));
+            }
+        }
+        // Blobs that are not JSONB still fail on both.
+        for sql in ["SELECT json_quote(x'dead')", "SELECT json_array(x'cafe')"] {
+            let fe = f.query(sql).await.is_err();
+            let re = r.query_row(sql, [], |_| Ok(())).is_err();
+            if fe != re {
+                diffs.push(format!("  `{sql}`: frank err={fe}, stock err={re}"));
+            }
+        }
+        assert!(
+            diffs.is_empty(),
+            "{} JSON subtype divergence(s) vs rusqlite:\n{}",
+            diffs.len(),
+            diffs.join("\n")
+        );
+    });
+}

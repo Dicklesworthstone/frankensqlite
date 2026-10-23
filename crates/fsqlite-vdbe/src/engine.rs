@@ -7597,6 +7597,7 @@ impl VdbeEngine {
     #[inline]
     fn register_subtype(&self, r: i32) -> Option<u32> {
         self.cold_state()
+            .filter(|cold_state| cold_state.has_subtypes)
             .and_then(|cold_state| cold_state.register_subtypes.get(&r).copied())
     }
 
@@ -13980,6 +13981,9 @@ impl VdbeEngine {
 
                     observe_execution_cancellation(&self.execution_cx)?;
                     self.set_reg(accum_reg, result);
+                    if let Some(subtype) = func.result_subtype() {
+                        self.set_register_subtype(accum_reg, subtype);
+                    }
                     pc += 1;
                 }
 
@@ -14188,6 +14192,8 @@ impl VdbeEngine {
                     // allocating a SmallVec via collect_reg_range.  Same pattern as
                     // AggStep.  Falls back to collect_reg_range only when the
                     // register range is out of bounds or negative.
+                    let subtype_varies = func.result_subtype_varies();
+                    let mut call_subtype = None;
                     let result = if first_arg_reg >= 0
                         && (first_arg_reg as usize).saturating_add(arg_count)
                             <= self.registers.len()
@@ -14206,6 +14212,11 @@ impl VdbeEngine {
                         observe_requested_execution_cancellation(&self.execution_cx)?;
                         if function_consumes_argument_collation {
                             func.invoke_with_collation(args, function_collation.as_deref())?
+                        } else if subtype_varies {
+                            let (value, subtype) =
+                                func.invoke_with_result_subtype(args, &arg_subtypes)?;
+                            call_subtype = subtype;
+                            value
                         } else if any_arg_subtype {
                             func.invoke_with_arg_subtypes(args, &arg_subtypes)?
                         } else {
@@ -14224,6 +14235,11 @@ impl VdbeEngine {
                         observe_requested_execution_cancellation(&self.execution_cx)?;
                         if function_consumes_argument_collation {
                             func.invoke_with_collation(&args, function_collation.as_deref())?
+                        } else if subtype_varies {
+                            let (value, subtype) =
+                                func.invoke_with_result_subtype(&args, &arg_subtypes)?;
+                            call_subtype = subtype;
+                            value
                         } else if any_arg_subtype {
                             func.invoke_with_arg_subtypes(&args, &arg_subtypes)?
                         } else {
@@ -14234,7 +14250,11 @@ impl VdbeEngine {
 
                     // Propagate this function's result subtype (e.g. JSON) to the
                     // destination register so a nested `json(...)` keeps its tag.
-                    let result_subtype = func.result_subtype();
+                    let result_subtype = if subtype_varies {
+                        call_subtype
+                    } else {
+                        func.result_subtype()
+                    };
 
                     if self.trace_opcodes {
                         let result_type = match &result {
@@ -15331,8 +15351,11 @@ impl VdbeEngine {
             // main-match arm.
             Opcode::Move => {
                 if op.p3 == 1 {
-                    let value = self.take_reg(op.p1);
+                    let (value, subtype) = self.take_reg_with_subtype(op.p1);
                     self.set_reg_fast(op.p2, value);
+                    if let Some(subtype) = subtype {
+                        self.set_register_subtype(op.p2, subtype);
+                    }
                 } else {
                     let count = usize::try_from(op.p3).unwrap_or(0);
                     self.move_reg_range(op.p1, op.p2, count);
@@ -16858,28 +16881,46 @@ impl VdbeEngine {
 
         if can_stream_directly {
             for offset in 0..count {
-                let value = Self::reg_with_offset(src_start, offset)
-                    .map_or_else(|| SqliteValue::Null, |reg| self.take_reg(reg));
+                let (value, subtype) = Self::reg_with_offset(src_start, offset)
+                    .map_or((SqliteValue::Null, None), |reg| {
+                        self.take_reg_with_subtype(reg)
+                    });
                 if let Some(dst) = Self::reg_with_offset(dst_start, offset) {
                     self.set_reg_fast(dst, value);
+                    if let Some(subtype) = subtype {
+                        self.set_register_subtype(dst, subtype);
+                    }
                 }
             }
             return;
         }
 
-        let mut temp: smallvec::SmallVec<[SqliteValue; 16]> =
+        let mut temp: smallvec::SmallVec<[(SqliteValue, Option<u32>); 16]> =
             smallvec::SmallVec::with_capacity(count);
         for offset in 0..count {
-            let value = Self::reg_with_offset(src_start, offset)
-                .map_or_else(|| SqliteValue::Null, |reg| self.take_reg(reg));
-            temp.push(value);
+            let entry = Self::reg_with_offset(src_start, offset)
+                .map_or((SqliteValue::Null, None), |reg| {
+                    self.take_reg_with_subtype(reg)
+                });
+            temp.push(entry);
         }
 
-        for (offset, value) in temp.into_iter().enumerate() {
+        for (offset, (value, subtype)) in temp.into_iter().enumerate() {
             if let Some(dst) = Self::reg_with_offset(dst_start, offset) {
                 self.set_reg_fast(dst, value);
+                if let Some(subtype) = subtype {
+                    self.set_register_subtype(dst, subtype);
+                }
             }
         }
+    }
+
+    /// `take_reg` plus the subtype the value carried: a move keeps it, as
+    /// stock `OP_Move` does.
+    #[inline]
+    fn take_reg_with_subtype(&mut self, r: i32) -> (SqliteValue, Option<u32>) {
+        let subtype = self.register_subtype(r);
+        (self.take_reg(r), subtype)
     }
 
     /// Copy one register while avoiding an intermediate enum for the common
@@ -16898,7 +16939,13 @@ impl VdbeEngine {
         }
 
         let value = self.get_reg(src).clone();
+        let subtype = self.register_subtype(src);
         self.set_reg_fast(dst, value);
+        // A copy keeps the value's subtype, as stock `OP_Copy`/`OP_SCopy` do:
+        // a JSON aggregate result copied into `json_array`'s argument stays JSON.
+        if let Some(subtype) = subtype {
+            self.set_register_subtype(dst, subtype);
+        }
     }
 
     #[inline]
@@ -16916,9 +16963,17 @@ impl VdbeEngine {
         }
 
         let values = self.collect_reg_range(src_start, count);
-        for (offset, value) in values.into_iter().enumerate() {
+        let subtypes: smallvec::SmallVec<[Option<u32>; 8]> = (0..count)
+            .map(|offset| {
+                Self::reg_with_offset(src_start, offset).and_then(|reg| self.register_subtype(reg))
+            })
+            .collect();
+        for (offset, (value, subtype)) in values.into_iter().zip(subtypes).enumerate() {
             if let Some(dst) = Self::reg_with_offset(dst_start, offset) {
                 self.set_reg_fast(dst, value);
+                if let Some(subtype) = subtype {
+                    self.set_register_subtype(dst, subtype);
+                }
             }
         }
     }
