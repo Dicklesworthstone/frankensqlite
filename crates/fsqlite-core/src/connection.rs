@@ -26491,8 +26491,11 @@ impl Connection {
                 // a whole read transaction to read page 1. Only while nothing
                 // was published past the mirror: a commit (a concurrent-mode
                 // local one leaves the sequence behind too) still needs the
-                // reload to refresh sequence-scoped state and advance it.
+                // reload to refresh sequence-scoped state and advance it. A
+                // forced full reload (a late `register_module` for a table the
+                // open could not bind, GH#483) must still run.
                 if !self.memdb_rows_loaded.get()
+                    && !self.force_full_schema_reload_once.get()
                     && !self.should_eagerly_hydrate_memdb_rows()
                     && self.pending_memdb_direct_upserts.borrow().is_empty()
                     && self.pending_local_live_vtab_preservation.borrow().is_none()
