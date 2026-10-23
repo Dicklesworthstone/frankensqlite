@@ -53691,6 +53691,19 @@ impl Connection {
         col_map: &[(String, String, bool)],
         qualifier: &QualifiedName,
     ) -> Vec<ResultColumn> {
+        self.expand_join_table_star_result_columns(sources, col_map, qualifier, &HashSet::new())
+    }
+
+    /// `tbl.*` over a join: qualified column references, except that a column
+    /// in `coalesced` (see `collect_join_coalesced_star_indices`) expands to
+    /// its bare name, which reads the join's coalesced USING value.
+    fn expand_join_table_star_result_columns(
+        &self,
+        sources: &[&TableOrSubquery],
+        col_map: &[(String, String, bool)],
+        qualifier: &QualifiedName,
+        coalesced: &HashSet<usize>,
+    ) -> Vec<ResultColumn> {
         let matching_labels: Vec<String> = sources
             .iter()
             .filter(|source| source_matches_name(source, qualifier))
@@ -53702,18 +53715,23 @@ impl Connection {
 
         col_map
             .iter()
-            .filter(|(table, _, hidden)| {
+            .enumerate()
+            .filter(|(_, (table, _, hidden))| {
                 !*hidden
                     && matching_labels
                         .iter()
                         .any(|label| label.eq_ignore_ascii_case(table))
             })
-            .map(|(table, column, _)| ResultColumn::Expr {
-                expr: Expr::Column(
-                    ColumnRef::qualified(table.clone(), column.clone()),
-                    Span::new(0, 0),
-                ),
-                alias: None,
+            .map(|(index, (table, column, _))| {
+                let column_ref = if coalesced.contains(&index) {
+                    ColumnRef::bare(column.clone())
+                } else {
+                    ColumnRef::qualified(table.clone(), column.clone())
+                };
+                ResultColumn::Expr {
+                    expr: Expr::Column(column_ref, Span::new(0, 0)),
+                    alias: None,
+                }
             })
             .collect()
     }
@@ -86334,6 +86352,19 @@ impl Connection {
         };
         let mut left_visible_names =
             self.source_column_names_for_join_layout(&from.source, &visible_ctes);
+        // Stock `sqlite3ProcessJoin`: with a RIGHT or FULL JOIN in the FROM, a
+        // USING term coalesces every left source that has the column, so each
+        // of them after the first must itself be joined USING that column.
+        // Each entry is a source's column names and the columns its own join
+        // matched by USING or NATURAL.
+        let coalesces = from
+            .joins
+            .iter()
+            .any(|join| matches!(join.join_type.kind, JoinKind::Right | JoinKind::Full));
+        let mut left_sources: Vec<(Vec<String>, Vec<String>)> = Vec::new();
+        if coalesces {
+            left_sources.push((left_visible_names.clone(), Vec::new()));
+        }
         for join in &from.joins {
             let right_names = self.source_column_names_for_join_layout(&join.table, &visible_ctes);
             if !join.join_type.natural
@@ -86350,6 +86381,38 @@ impl Connection {
                         )));
                     }
                 }
+            }
+            if coalesces {
+                let using_cols: Vec<String> = if join.join_type.natural {
+                    right_names
+                        .iter()
+                        .filter(|name| {
+                            left_visible_names
+                                .iter()
+                                .any(|left| left.eq_ignore_ascii_case(name))
+                        })
+                        .cloned()
+                        .collect()
+                } else if let Some(JoinConstraint::Using(cols)) = join.constraint.as_ref() {
+                    cols.clone()
+                } else {
+                    Vec::new()
+                };
+                for col in &using_cols {
+                    let ambiguous = left_sources
+                        .iter()
+                        .filter(|(names, _)| names.iter().any(|n| n.eq_ignore_ascii_case(col)))
+                        .skip(1)
+                        .any(|(_, joined_using)| {
+                            !joined_using.iter().any(|n| n.eq_ignore_ascii_case(col))
+                        });
+                    if ambiguous {
+                        return Err(FrankenError::FunctionError(format!(
+                            "ambiguous reference to {col} in USING()"
+                        )));
+                    }
+                }
+                left_sources.push((right_names.clone(), using_cols));
             }
             left_visible_names.extend(right_names);
         }
@@ -98110,6 +98173,8 @@ impl Connection {
                 registry: lock_unpoisoned(self.collation_registry.as_ref()).clone(),
             });
         let using_skip_indices = collect_join_using_skip_indices(&table_sources, &from.joins);
+        let coalesced_star_indices =
+            collect_join_coalesced_star_indices(&table_sources, &from.joins);
         let using_skip: Option<&HashSet<usize>> = if using_skip_indices.is_empty() {
             None
         } else {
@@ -98515,6 +98580,14 @@ impl Connection {
                 }
                 (constraint, _) => constraint,
             };
+            // With a RIGHT/FULL join anywhere in the FROM, a USING term's left
+            // operand coalesces every left source that has the column.
+            let using_left_slots = match effective_constraint {
+                Some(JoinConstraint::Using(cols)) if primary_null_extendable => {
+                    join_using_left_coalesce_slots(&table_sources, join_idx, cols)
+                }
+                _ => None,
+            };
 
             // bd-tfwym: a lateral table-valued function (its argument reads a
             // sibling column) produces a distinct relation per left row. Bind
@@ -98542,6 +98615,7 @@ impl Connection {
                         join.join_type.kind,
                         effective_constraint,
                         &col_map,
+                        using_left_slots.as_deref(),
                     )
                     .await?;
                 continue;
@@ -98582,6 +98656,7 @@ impl Connection {
                         join.join_type.kind,
                         effective_constraint,
                         &col_map,
+                        using_left_slots.as_deref(),
                     )
                 })?;
             }
@@ -98655,30 +98730,53 @@ impl Connection {
         // Expand Star / TableStar into explicit column references so that
         // sort_rows_by_order_terms can resolve integer positions and column
         // name lookups against the actual projected columns.
-        let mut expanded_columns: Vec<ResultColumn> = columns
-            .iter()
-            .flat_map(|col| match col {
+        //
+        // A column in `coalesced_star_indices` expands to its bare name, so it
+        // reads the coalesced USING value (see `join_star_column_value`), and,
+        // as in stock, that name must not be ambiguous among the sources.
+        let mut expanded_columns: Vec<ResultColumn> = Vec::with_capacity(columns.len());
+        for col in columns {
+            let expanded = match col {
                 ResultColumn::Star => col_map
                     .iter()
                     .enumerate()
                     .filter(|(idx, (_, _, hidden))| !hidden && !using_skip_indices.contains(idx))
-                    .map(|(_, (tbl, c, _))| ResultColumn::Expr {
-                        expr: Expr::Column(
-                            ColumnRef::qualified(tbl.clone(), c.clone()),
-                            Span::new(0, 0),
-                        ),
-                        alias: None,
+                    .map(|(idx, (tbl, c, _))| {
+                        let column = if coalesced_star_indices.contains(&idx) {
+                            ColumnRef::bare(c.clone())
+                        } else {
+                            ColumnRef::qualified(tbl.clone(), c.clone())
+                        };
+                        ResultColumn::Expr {
+                            expr: Expr::Column(column, Span::new(0, 0)),
+                            alias: None,
+                        }
                     })
                     .collect::<Vec<_>>(),
                 ResultColumn::TableStar(tbl_name) => self
-                    .expand_table_star_result_columns_from_col_map(
+                    .expand_join_table_star_result_columns(
                         &all_sources,
                         &col_map,
                         tbl_name,
+                        &coalesced_star_indices,
                     ),
-                other @ ResultColumn::Expr { .. } => vec![other.clone()],
-            })
-            .collect();
+                other @ ResultColumn::Expr { .. } => {
+                    expanded_columns.push(other.clone());
+                    continue;
+                }
+            };
+            for column in &expanded {
+                if let ResultColumn::Expr {
+                    expr: Expr::Column(col_ref, _),
+                    ..
+                } = column
+                    && col_ref.table.is_none()
+                {
+                    find_col_in_map(&col_map, None, &col_ref.column, using_skip)?;
+                }
+            }
+            expanded_columns.extend(expanded);
+        }
         let projected_width = expanded_columns.len();
 
         // Identify ORDER BY terms referencing columns not in the SELECT list.
@@ -98783,7 +98881,13 @@ impl Connection {
                             if !using_skip_indices.contains(&i)
                                 && !col_map.get(i).is_some_and(|(_, _, hidden)| *hidden)
                             {
-                                values.push(v.clone());
+                                values.push(join_star_column_value(
+                                    row,
+                                    i,
+                                    v,
+                                    &col_map,
+                                    &coalesced_star_indices,
+                                ));
                             }
                         }
                     }
@@ -98791,8 +98895,16 @@ impl Connection {
                         let mut offset = 0;
                         for (source, src) in all_sources.iter().zip(&table_sources) {
                             if source_matches_name(source, table_name) {
-                                let visible_width = src.col_names.len();
-                                values.extend(row[offset..offset + visible_width].iter().cloned());
+                                let visible = offset..offset + src.col_names.len();
+                                for (v, i) in row[visible.clone()].iter().zip(visible) {
+                                    values.push(join_star_column_value(
+                                        row,
+                                        i,
+                                        v,
+                                        &col_map,
+                                        &coalesced_star_indices,
+                                    ));
+                                }
                             }
                             offset += src.scan_width();
                         }
@@ -98988,6 +99100,7 @@ impl Connection {
         kind: fsqlite_ast::JoinKind,
         constraint: Option<&JoinConstraint>,
         col_map: &[(String, String, bool)],
+        using_left_slots: Option<&[SmallVec<[usize; 4]>]>,
     ) -> Result<Vec<Vec<SqliteValue>>> {
         use fsqlite_ast::JoinKind;
 
@@ -99026,9 +99139,13 @@ impl Connection {
                 let passes = match constraint {
                     None => true,
                     Some(JoinConstraint::On(expr)) => eval_join_predicate(expr, &scratch, col_map)?,
-                    Some(JoinConstraint::Using(cols)) => {
-                        eval_using_constraint(cols, &scratch, col_map, left_width)
-                    }
+                    Some(JoinConstraint::Using(cols)) => eval_using_constraint(
+                        cols,
+                        &scratch,
+                        col_map,
+                        left_width,
+                        using_left_slots,
+                    ),
                 };
                 if passes {
                     matched = true;
@@ -154060,54 +154177,136 @@ impl JoinTableSource {
     }
 }
 
+/// The column names each FROM source's own join matches by USING, indexed like
+/// `table_sources`: the USING list as written, or for NATURAL the source's
+/// columns that a source to its left also has. The primary source and ON or
+/// cross joins match none.
+fn join_source_using_columns<'a>(
+    table_sources: &'a [JoinTableSource],
+    joins: &'a [JoinClause],
+) -> Vec<Vec<&'a str>> {
+    let mut using_columns = Vec::with_capacity(table_sources.len());
+    if table_sources.is_empty() {
+        return using_columns;
+    }
+    using_columns.push(Vec::new());
+    for (join_idx, join) in joins.iter().enumerate() {
+        let Some(right_src) = table_sources.get(join_idx + 1) else {
+            break;
+        };
+        let cols = if join.join_type.natural {
+            right_src
+                .col_names
+                .iter()
+                .filter(|right_col| {
+                    table_sources[..=join_idx].iter().any(|source| {
+                        source
+                            .col_names
+                            .iter()
+                            .any(|left_col| left_col.eq_ignore_ascii_case(right_col))
+                    })
+                })
+                .map(String::as_str)
+                .collect()
+        } else if let Some(JoinConstraint::Using(cols)) = &join.constraint {
+            cols.iter().map(String::as_str).collect()
+        } else {
+            Vec::new()
+        };
+        using_columns.push(cols);
+    }
+    using_columns
+}
+
 fn collect_join_using_skip_indices(
     table_sources: &[JoinTableSource],
     joins: &[JoinClause],
 ) -> HashSet<usize> {
     let mut using_skip_indices = HashSet::new();
-    let Some(primary_source) = table_sources.first() else {
-        return using_skip_indices;
-    };
-    let mut offset = primary_source.scan_width();
-    for (join_idx, join) in joins.iter().enumerate() {
-        let Some(right_src) = table_sources.get(join_idx + 1) else {
-            break;
-        };
-        let using_cols: Option<Vec<&str>> = if join.join_type.natural {
-            let left_cols: Vec<&str> = table_sources[..=join_idx]
+    let using_columns = join_source_using_columns(table_sources, joins);
+    let mut offset = 0;
+    for (source, cols) in table_sources.iter().zip(&using_columns) {
+        for (i, col_name) in source.col_names.iter().enumerate() {
+            if cols
                 .iter()
-                .flat_map(|source| source.col_names.iter().map(String::as_str))
-                .collect();
-            Some(
-                right_src
-                    .col_names
-                    .iter()
-                    .filter(|right_col| {
-                        left_cols
-                            .iter()
-                            .any(|left_col| left_col.eq_ignore_ascii_case(right_col))
-                    })
-                    .map(String::as_str)
-                    .collect(),
-            )
-        } else if let Some(JoinConstraint::Using(cols)) = &join.constraint {
-            Some(cols.iter().map(String::as_str).collect())
-        } else {
-            None
-        };
-        if let Some(cols) = using_cols {
-            for (i, col_name) in right_src.col_names.iter().enumerate() {
-                if cols
-                    .iter()
-                    .any(|using_col| using_col.eq_ignore_ascii_case(col_name))
-                {
-                    using_skip_indices.insert(offset + i);
-                }
+                .any(|using_col| using_col.eq_ignore_ascii_case(col_name))
+            {
+                using_skip_indices.insert(offset + i);
             }
         }
-        offset += right_src.scan_width();
+        offset += source.scan_width();
     }
     using_skip_indices
+}
+
+/// Stock `selectExpander`: in `*` and `tbl.*`, a column of a source to the
+/// left of the last RIGHT or FULL JOIN whose name a later join matches by
+/// USING or NATURAL expands to the bare name, i.e. the join's coalesced value,
+/// instead of the source's own column. Returns those combined-row indices.
+fn collect_join_coalesced_star_indices(
+    table_sources: &[JoinTableSource],
+    joins: &[JoinClause],
+) -> HashSet<usize> {
+    let mut coalesced = HashSet::new();
+    // `joins[k]` brings in `table_sources[k + 1]`, so the sources left of the
+    // last RIGHT/FULL join (stock's JT_LTORJ) are `table_sources[..=k]`.
+    let Some(last_right_join) = joins
+        .iter()
+        .rposition(|join| matches!(join.join_type.kind, JoinKind::Right | JoinKind::Full))
+    else {
+        return coalesced;
+    };
+    let using_columns = join_source_using_columns(table_sources, joins);
+    let mut offset = 0;
+    for (source_idx, source) in table_sources.iter().enumerate().take(last_right_join + 1) {
+        let later_using = using_columns.get(source_idx + 1..).unwrap_or(&[]);
+        for (i, col_name) in source.col_names.iter().enumerate() {
+            if later_using
+                .iter()
+                .flatten()
+                .any(|using_col| using_col.eq_ignore_ascii_case(col_name))
+            {
+                coalesced.insert(offset + i);
+            }
+        }
+        offset += source.scan_width();
+    }
+    coalesced
+}
+
+/// Stock `sqlite3ProcessJoin`: when the FROM has a RIGHT or FULL JOIN, the
+/// left operand of a USING/NATURAL term is coalesce() over every source left
+/// of the join that has the column, in FROM order; the first one donates the
+/// comparison affinity and collation. Returns each term's combined-row slots
+/// in `cols` order, or `None` when every term has a single left source and
+/// the plain comparison applies.
+fn join_using_left_coalesce_slots(
+    table_sources: &[JoinTableSource],
+    join_idx: usize,
+    cols: &[String],
+) -> Option<Vec<SmallVec<[usize; 4]>>> {
+    let left_sources = table_sources.get(..=join_idx)?;
+    let mut coalesced = false;
+    let slots = cols
+        .iter()
+        .map(|col_name| {
+            let mut group = SmallVec::new();
+            let mut offset = 0;
+            for source in left_sources {
+                if let Some(position) = source
+                    .col_names
+                    .iter()
+                    .position(|name| name.eq_ignore_ascii_case(col_name))
+                {
+                    group.push(offset + position);
+                }
+                offset += source.scan_width();
+            }
+            coalesced |= group.len() > 1;
+            group
+        })
+        .collect::<Vec<_>>();
+    coalesced.then_some(slots)
 }
 
 fn join_table_supports_hidden_rowid(
@@ -154289,6 +154488,26 @@ impl JoinUsingProjection {
             .cloned()
             .unwrap_or(SqliteValue::Null)
     }
+}
+
+/// The value a join's `*` or `tbl.*` emits for the column at `index`: for a
+/// column in `coalesced` (see `collect_join_coalesced_star_indices`), the
+/// join's coalesced USING value (the right row's for RIGHT JOIN,
+/// coalesce(left, right) for FULL JOIN); otherwise the raw value.
+fn join_star_column_value(
+    row: &[SqliteValue],
+    index: usize,
+    raw: &SqliteValue,
+    col_map: &[(String, String, bool)],
+    coalesced: &HashSet<usize>,
+) -> SqliteValue {
+    if coalesced.contains(&index)
+        && let Some((_, name, _)) = col_map.get(index)
+        && let Some(projection) = current_join_using_column_projection(name)
+    {
+        return projection.value(row);
+    }
+    raw.clone()
 }
 
 #[derive(Clone)]
@@ -155392,15 +155611,26 @@ fn build_canonical_hash_join_key(
     pairs: &[HashJoinPair],
     right_side: bool,
 ) -> Option<CanonicalHashJoinKey> {
+    build_canonical_hash_join_key_with(pairs, |_, pair| {
+        row.get(if right_side {
+            pair.right_idx
+        } else {
+            pair.left_idx
+        })
+    })
+}
+
+/// `value_of(i, pair)` supplies pair `i`'s key value; a missing, NULL or NaN
+/// value means the row cannot match.
+fn build_canonical_hash_join_key_with<'a>(
+    pairs: &[HashJoinPair],
+    mut value_of: impl FnMut(usize, &HashJoinPair) -> Option<&'a SqliteValue>,
+) -> Option<CanonicalHashJoinKey> {
     pairs
         .iter()
-        .map(|pair| {
-            let index = if right_side {
-                pair.right_idx
-            } else {
-                pair.left_idx
-            };
-            let value = row.get(index)?;
+        .enumerate()
+        .map(|(term, pair)| {
+            let value = value_of(term, pair)?;
             if value.is_null() {
                 return None;
             }
@@ -155509,7 +155739,9 @@ fn try_extract_equi_join_indices(
 }
 
 /// Hash-join: build a multi-map on the right table, probe for each left row.
-/// O(n+m) instead of O(n*m).
+/// O(n+m) instead of O(n*m). With `left_coalesce`, pair `i`'s left key is the
+/// first non-NULL value among `left_coalesce[i]`'s slots (a chained USING
+/// after a RIGHT/FULL join).
 #[allow(clippy::too_many_arguments)]
 fn execute_hash_join(
     left: &[Vec<SqliteValue>],
@@ -155521,6 +155753,7 @@ fn execute_hash_join(
     track_right: bool,
     residual: Option<&Expr>,
     using_recheck: Option<&[(usize, usize)]>,
+    left_coalesce: Option<&[SmallVec<[usize; 4]>]>,
     col_map: &[(String, String, bool)],
 ) -> Result<Vec<Vec<SqliteValue>>> {
     let combined_width = left_width + right_width;
@@ -155540,7 +155773,15 @@ fn execute_hash_join(
     let mut result = Vec::with_capacity(left.len());
     for left_row in left {
         let mut matched = false;
-        if let Some(probe_key) = build_canonical_hash_join_key(left_row, hash_pairs, false)
+        let probe_key = match left_coalesce {
+            Some(slots) => build_canonical_hash_join_key_with(hash_pairs, |term, _| {
+                slots
+                    .get(term)
+                    .and_then(|group| coalesced_join_value(left_row, group))
+            }),
+            None => build_canonical_hash_join_key(left_row, hash_pairs, false),
+        };
+        if let Some(probe_key) = probe_key
             && let Some(matching_indices) = right_index.get(&probe_key)
         {
             for &ri in matching_indices {
@@ -155557,9 +155798,9 @@ fn execute_hash_join(
                         continue;
                     }
                 }
-                if using_recheck
-                    .is_some_and(|indices| !eval_using_constraint_indices(indices, &combined))
-                {
+                if using_recheck.is_some_and(|indices| {
+                    !eval_using_constraint_terms(indices, left_coalesce, &combined)
+                }) {
                     continue;
                 }
 
@@ -156056,6 +156297,10 @@ fn join_keyset_limit_pushdown_shape(
     })
 }
 
+/// `using_left_slots`, from `join_using_left_coalesce_slots`, holds the
+/// coalesce() slots of each USING term's left operand when some term has more
+/// than one left source.
+#[allow(clippy::too_many_arguments)]
 fn execute_single_join(
     left: &[Vec<SqliteValue>],
     right: &[Vec<SqliteValue>],
@@ -156064,6 +156309,7 @@ fn execute_single_join(
     kind: JoinKind,
     constraint: Option<&JoinConstraint>,
     col_map: &[(String, String, bool)],
+    using_left_slots: Option<&[SmallVec<[usize; 4]>]>,
 ) -> Result<Vec<Vec<SqliteValue>>> {
     let combined_width = left_width + right_width;
 
@@ -156102,6 +156348,7 @@ fn execute_single_join(
             track_right,
             plan.residual.as_ref(),
             None,
+            None,
             col_map,
         );
     }
@@ -156118,37 +156365,27 @@ fn execute_single_join(
     {
         return joined;
     }
-    if let Some(JoinConstraint::Using(cols)) = constraint {
-        let mut equi_pairs = Vec::with_capacity(cols.len());
-        let mut all_found = true;
-        for col_name in cols {
-            let l_idx = col_map[..left_width]
-                .iter()
-                .position(|(_, name, _)| name.eq_ignore_ascii_case(col_name));
-            let r_idx = col_map[left_width..]
-                .iter()
-                .position(|(_, name, _)| name.eq_ignore_ascii_case(col_name));
-            if let (Some(l), Some(r)) = (l_idx, r_idx) {
-                equi_pairs.push((l, r));
-            } else {
-                all_found = false;
-                break;
-            }
-        }
-        if all_found
-            && !equi_pairs.is_empty()
+    // Combined-row (left, right) indices of each USING term; the left index is
+    // the first coalesce() slot when `using_left_slots` is given.
+    let using_indices = if let Some(JoinConstraint::Using(cols)) = constraint {
+        using_term_indices(cols, col_map, left_width, using_left_slots)
+    } else {
+        None
+    };
+    if let Some(indices) = using_indices.as_deref() {
+        // Hash-key pairs keep the right index relative to the right input,
+        // while the authoritative USING recheck reads the combined row, so a
+        // non-leading right USING column cannot be mistaken for a left-side
+        // column at the same relative offset.
+        let equi_pairs = indices
+            .iter()
+            .map(|&(left_idx, right_idx)| (left_idx, right_idx - left_width))
+            .collect::<Vec<_>>();
+        if !equi_pairs.is_empty()
             && join_hash_pairs_are_binary(&equi_pairs, left_width)
             && let Some(hash_pairs) = hash_join_pairs_with_modes(&equi_pairs, left_width)
         {
             let track_right = matches!(kind, JoinKind::Right | JoinKind::Full);
-            // Hash-key pairs keep the right index relative to the right input,
-            // while the authoritative USING recheck reads the combined row.
-            // Convert once here so a non-leading right USING column cannot be
-            // mistaken for a left-side column at the same relative offset.
-            let using_recheck_indices = equi_pairs
-                .iter()
-                .map(|&(left_idx, right_rel_idx)| (left_idx, left_width + right_rel_idx))
-                .collect::<Vec<_>>();
             return execute_hash_join(
                 left,
                 right,
@@ -156158,7 +156395,8 @@ fn execute_single_join(
                 &hash_pairs,
                 track_right,
                 None,
-                Some(&using_recheck_indices),
+                Some(indices),
+                using_left_slots,
                 col_map,
             );
         }
@@ -156175,31 +156413,6 @@ fn execute_single_join(
 
     let mut scratch = Vec::with_capacity(combined_width);
 
-    let using_indices = if let Some(JoinConstraint::Using(cols)) = constraint {
-        let mut indices = Vec::with_capacity(cols.len());
-        let mut complete = true;
-        for col_name in cols {
-            let Some(l_idx) = col_map[..left_width]
-                .iter()
-                .position(|(_, name, _)| name.eq_ignore_ascii_case(col_name))
-            else {
-                complete = false;
-                break;
-            };
-            let Some(r_idx) = col_map[left_width..]
-                .iter()
-                .position(|(_, name, _)| name.eq_ignore_ascii_case(col_name))
-            else {
-                complete = false;
-                break;
-            };
-            indices.push((l_idx, left_width + r_idx));
-        }
-        complete.then_some(indices)
-    } else {
-        None
-    };
-
     for left_row in left {
         let mut matched = false;
 
@@ -156213,8 +156426,10 @@ fn execute_single_join(
                 None => true,
                 Some(JoinConstraint::On(expr)) => eval_join_predicate(expr, &scratch, col_map)?,
                 Some(JoinConstraint::Using(cols)) => using_indices.as_deref().map_or_else(
-                    || eval_using_constraint(cols, &scratch, col_map, left_width),
-                    |indices| eval_using_constraint_indices(indices, &scratch),
+                    || {
+                        eval_using_constraint(cols, &scratch, col_map, left_width, using_left_slots)
+                    },
+                    |indices| eval_using_constraint_terms(indices, using_left_slots, &scratch),
                 ),
             };
 
@@ -156918,77 +157133,72 @@ fn expr_references_only_col_map(expr: &Expr, col_map: &[(String, String, bool)])
     }
 }
 
+/// The combined-row (left, right) index of each USING term: the first left
+/// column of that name (or the first coalesce() slot from `left_slots`) and
+/// the right one. `None` when a term has no column on one side.
+fn using_term_indices(
+    cols: &[String],
+    col_map: &[(String, String, bool)],
+    left_width: usize,
+    left_slots: Option<&[SmallVec<[usize; 4]>]>,
+) -> Option<Vec<(usize, usize)>> {
+    cols.iter()
+        .enumerate()
+        .map(|(term, col_name)| {
+            let left_idx = match left_slots {
+                Some(slots) => slots.get(term)?.first().copied()?,
+                None => col_map[..left_width]
+                    .iter()
+                    .position(|(_, name, _)| name.eq_ignore_ascii_case(col_name))?,
+            };
+            let right_idx = col_map[left_width..]
+                .iter()
+                .position(|(_, name, _)| name.eq_ignore_ascii_case(col_name))?;
+            Some((left_idx, left_width + right_idx))
+        })
+        .collect()
+}
+
+/// The first non-NULL value among `slots` (stock's coalesce()), or NULL.
+fn coalesced_join_value<'a>(row: &'a [SqliteValue], slots: &[usize]) -> Option<&'a SqliteValue> {
+    let mut last = None;
+    for &slot in slots {
+        let value = row.get(slot)?;
+        if !value.is_null() {
+            return Some(value);
+        }
+        last = Some(value);
+    }
+    last
+}
+
 /// Evaluate a USING constraint: check that named columns match in both sides.
 fn eval_using_constraint(
     cols: &[String],
     combined_row: &[SqliteValue],
     col_map: &[(String, String, bool)],
     left_width: usize,
+    left_slots: Option<&[SmallVec<[usize; 4]>]>,
 ) -> bool {
-    for col_name in cols {
-        // Find the column in the left side.
-        let left_match = col_map[..left_width]
-            .iter()
-            .enumerate()
-            .find(|(_, (_, name, _))| name.eq_ignore_ascii_case(col_name))
-            .and_then(|(i, _)| combined_row.get(i).map(|value| (i, value)));
-        // Find the column in the right side.
-        let right_match = col_map[left_width..]
-            .iter()
-            .enumerate()
-            .find(|(_, (_, name, _))| name.eq_ignore_ascii_case(col_name))
-            .and_then(|(i, _)| {
-                combined_row
-                    .get(left_width + i)
-                    .map(|value| (left_width + i, value))
-            });
-
-        match (left_match, right_match) {
-            (Some((left_idx, l)), Some((right_idx, r))) => {
-                // SQL join semantics: USING expands to equality checks,
-                // and `NULL = NULL` is not true.
-                if matches!(l, SqliteValue::Null) || matches!(r, SqliteValue::Null) {
-                    return false;
-                }
-                let collation = join_using_collation(left_idx, right_idx);
-                let ordering = with_current_join_eval_collation_context(|context| {
-                    context.map_or_else(
-                        || cmp_values(l, r),
-                        |context| {
-                            let left_affinity = context
-                                .column_affinities
-                                .get(left_idx)
-                                .copied()
-                                .unwrap_or(TypeAffinity::Blob);
-                            let right_affinity = context
-                                .column_affinities
-                                .get(right_idx)
-                                .copied()
-                                .unwrap_or(TypeAffinity::Blob);
-                            cmp_values_with_comparison_affinity(
-                                l,
-                                r,
-                                left_affinity,
-                                right_affinity,
-                                collation.as_deref(),
-                                &context.registry,
-                            )
-                        },
-                    )
-                });
-                if ordering != std::cmp::Ordering::Equal {
-                    return false;
-                }
-            }
-            _ => return false,
-        }
-    }
-    true
+    using_term_indices(cols, col_map, left_width, left_slots)
+        .is_some_and(|indices| eval_using_constraint_terms(&indices, left_slots, combined_row))
 }
 
-fn eval_using_constraint_indices(indices: &[(usize, usize)], combined_row: &[SqliteValue]) -> bool {
-    for &(left_idx, right_idx) in indices {
-        let left_val = combined_row.get(left_idx);
+/// `left_slots[i]`, when given, lists the slots whose coalesce() is term `i`'s
+/// left operand. `indices[i].0` is its first slot and donates the comparison
+/// affinity and collation, as stock's AFF_DEFER coalesce() does.
+fn eval_using_constraint_terms(
+    indices: &[(usize, usize)],
+    left_slots: Option<&[SmallVec<[usize; 4]>]>,
+    combined_row: &[SqliteValue],
+) -> bool {
+    for (term, &(left_idx, right_idx)) in indices.iter().enumerate() {
+        let left_val = match left_slots {
+            Some(slots) => slots
+                .get(term)
+                .and_then(|group| coalesced_join_value(combined_row, group)),
+            None => combined_row.get(left_idx),
+        };
         let right_val = combined_row.get(right_idx);
         match (left_val, right_val) {
             (Some(l), Some(r)) => {

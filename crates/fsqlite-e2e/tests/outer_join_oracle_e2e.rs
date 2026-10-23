@@ -198,6 +198,190 @@ fn full_outer_join_using_coalesces_column() {
     });
 }
 
+// `SELECT *` must emit the coalesced USING/NATURAL value too: the right row's
+// key for right-only rows (it used to come out NULL and sort first).
+#[test]
+fn outer_join_star_emits_coalesced_using_column() {
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE a (id INTEGER, x TEXT)",
+                "CREATE TABLE b (id INTEGER, y TEXT)",
+                "CREATE TABLE c (id INTEGER, z TEXT)",
+                "INSERT INTO a VALUES (1,'a1'),(2,'a2'),(NULL,'anull')",
+                "INSERT INTO b VALUES (2,'b2'),(3,'b3'),(NULL,'bnull')",
+                "INSERT INTO c VALUES (3,'c3'),(4,'c4')",
+                "CREATE TABLE d (k INTEGER, w TEXT)",
+                "INSERT INTO d VALUES (3,'d3')",
+            ],
+            &[
+                "SELECT * FROM a FULL JOIN b USING(id) ORDER BY 1, 2, 3",
+                "SELECT * FROM a RIGHT JOIN b USING(id) ORDER BY 1, 2, 3",
+                "SELECT * FROM a LEFT JOIN b USING(id) ORDER BY 1, 2, 3",
+                "SELECT * FROM a NATURAL FULL JOIN b ORDER BY 1, 2, 3",
+                "SELECT * FROM a NATURAL RIGHT JOIN b ORDER BY 1, 2, 3",
+                "SELECT *, id FROM a FULL JOIN b USING(id) ORDER BY 1, 2, 3",
+                // Columns outside the USING group stay raw. (Stock reports a
+                // later same-named `c.id` as ambiguous, so use a distinct name;
+                // see `outer_join_using_errors_match_stock`.)
+                "SELECT * FROM a FULL JOIN b USING(id) LEFT JOIN d ON d.w = 'd3' ORDER BY 1, 2, 3",
+            ],
+            "outer_join_star_emits_coalesced_using_column",
+        )
+        .await;
+    });
+}
+
+// a, b, c share `id` and each has a NULL-keyed or unmatched row, so every
+// outer-join side NULL-extends somewhere.
+const ABC: [&str; 6] = [
+    "CREATE TABLE a (id INTEGER, x TEXT)",
+    "CREATE TABLE b (id INTEGER, y TEXT)",
+    "CREATE TABLE c (id INTEGER, z TEXT)",
+    "INSERT INTO a VALUES (1,'a1'),(2,'a2'),(NULL,'anull')",
+    "INSERT INTO b VALUES (2,'b2'),(3,'b3'),(NULL,'bnull')",
+    "INSERT INTO c VALUES (3,'c3'),(4,'c4')",
+];
+
+// bd-reality-check-1022-llk6g.31: with a RIGHT/FULL JOIN in the FROM, stock
+// matches a later USING column against coalesce() over every left table that
+// has it, so b's right-only id 3 meets c's 3 in one row. fsqlite compared the
+// first left table's (NULL) column and split it into two rows.
+#[test]
+fn chained_using_after_outer_join_matches_coalesced_key() {
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &ABC,
+            &[
+                "SELECT * FROM a FULL JOIN b USING(id) FULL JOIN c USING(id) ORDER BY 1, 2, 3, 4",
+                "SELECT * FROM a FULL JOIN b USING(id) LEFT JOIN c USING(id) ORDER BY 1, 2, 3, 4",
+                "SELECT * FROM a FULL JOIN b USING(id) JOIN c USING(id) ORDER BY 1, 2, 3, 4",
+                "SELECT * FROM a RIGHT JOIN b USING(id) JOIN c USING(id) ORDER BY 1, 2, 3, 4",
+                "SELECT * FROM a LEFT JOIN b USING(id) RIGHT JOIN c USING(id) ORDER BY 1, 2, 3, 4",
+                "SELECT * FROM a NATURAL FULL JOIN b NATURAL JOIN c ORDER BY 1, 2, 3, 4",
+                "SELECT a.id, b.id, c.id, id FROM a FULL JOIN b USING(id) FULL JOIN c USING(id) \
+                 ORDER BY 1, 2, 3, 4",
+                "SELECT count(*) FROM a FULL JOIN b USING(id) JOIN c USING(id)",
+                "SELECT id, count(*) FROM a FULL JOIN b USING(id) FULL JOIN c USING(id) \
+                 GROUP BY id ORDER BY 1",
+            ],
+            "chained_using_after_outer_join_matches_coalesced_key",
+        )
+        .await;
+    });
+}
+
+// The coalesce() takes its first argument's collation and affinity (stock's
+// AFF_DEFER), even for the value that came from a later table. NOCASE keys
+// also take the nested-loop path instead of the hash join.
+#[test]
+fn chained_using_coalesce_takes_first_table_collation_and_affinity() {
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "CREATE TABLE n1 (id TEXT, x TEXT)",
+                "CREATE TABLE n2 (id TEXT COLLATE NOCASE, y TEXT)",
+                "CREATE TABLE n3 (id TEXT, z TEXT)",
+                "INSERT INTO n1 VALUES ('A','a1')",
+                "INSERT INTO n2 VALUES ('B','b1')",
+                "INSERT INTO n3 VALUES ('a','c1'),('b','c2'),('B','c3')",
+                "CREATE TABLE d (id INTEGER, w TEXT)",
+                "CREATE TABLE e (id TEXT, v TEXT)",
+                "CREATE TABLE f (id TEXT, u TEXT)",
+                "INSERT INTO d VALUES (1,'d1')",
+                "INSERT INTO e VALUES ('2','e2')",
+                "INSERT INTO f VALUES ('1','f1'),('2','f2'),('01','f01')",
+            ],
+            &[
+                // BINARY first: only the exact 'B' matches.
+                "SELECT * FROM n1 FULL JOIN n2 USING(id) JOIN n3 USING(id) ORDER BY 1, 2, 3, 4",
+                // NOCASE first: 'B' matches 'b' and 'B', and n1's 'A' matches 'a'.
+                "SELECT * FROM n2 FULL JOIN n1 USING(id) JOIN n3 USING(id) ORDER BY 1, 2, 3, 4",
+                // INTEGER first: numeric comparison, so '01' matches 1.
+                "SELECT * FROM d FULL JOIN e USING(id) JOIN f USING(id) ORDER BY 1, 2, 3, 4",
+                // TEXT first: d's integer 1 never equals text '1'.
+                "SELECT * FROM e FULL JOIN d USING(id) JOIN f USING(id) ORDER BY 1, 2, 3, 4",
+            ],
+            "chained_using_coalesce_takes_first_table_collation_and_affinity",
+        )
+        .await;
+    });
+}
+
+// Stock `selectExpander`: in `tbl.*` (and `*`), a column of a table left of the
+// last RIGHT/FULL JOIN whose name a later join uses in USING expands to the
+// coalesced value; `tbl.col` written out stays raw. Without a RIGHT/FULL join
+// every column stays raw, even when two left tables share the USING name.
+#[test]
+fn table_star_coalesces_using_columns_left_of_outer_join() {
+    asupersync::test_utils::run_test(|| async {
+        let mut stmts = ABC.to_vec();
+        stmts.extend([
+            "CREATE TABLE p (id INTEGER, x TEXT)",
+            "CREATE TABLE q (id INTEGER, y TEXT)",
+            "CREATE TABLE s (id INTEGER, z TEXT)",
+            "INSERT INTO p VALUES (3,'p3')",
+            "INSERT INTO q VALUES (7,'q7'),(8,'q8')",
+            "INSERT INTO s VALUES (3,'s3')",
+        ]);
+        scenario(
+            &stmts,
+            &[
+                "SELECT a.*, b.* FROM a FULL JOIN b USING(id) ORDER BY 1, 2, 3, 4",
+                "SELECT a.id, a.* FROM a FULL JOIN b USING(id) ORDER BY 1, 2, 3",
+                "SELECT a.*, b.*, c.* FROM a FULL JOIN b USING(id) FULL JOIN c USING(id) \
+                 ORDER BY 1, 2, 3, 4, 5, 6",
+                "SELECT a.*, b.* FROM a LEFT JOIN b USING(id) RIGHT JOIN c USING(id) \
+                 ORDER BY 1, 2, 3, 4",
+                "SELECT a.* FROM a NATURAL FULL JOIN b ORDER BY 1, 2",
+                "SELECT c.* FROM a JOIN b USING(id) FULL JOIN c ON a.id = c.id ORDER BY 1, 2",
+                "SELECT * FROM p CROSS JOIN q JOIN s USING(id) ORDER BY 1, 2, 3, 4, 5",
+                "SELECT q.* FROM p CROSS JOIN q JOIN s USING(id) ORDER BY 1, 2",
+            ],
+            "table_star_coalesces_using_columns_left_of_outer_join",
+        )
+        .await;
+    });
+}
+
+fn stock_error_message(error: rusqlite::Error) -> String {
+    match error {
+        // rusqlite's Display appends "in <sql> at offset N" to a message
+        // stock reports with an error offset.
+        rusqlite::Error::SqliteFailure(_, Some(msg))
+        | rusqlite::Error::SqlInputError { msg, .. } => msg,
+        other => other.to_string(),
+    }
+}
+
+// Stock rejects a chained USING whose coalesce() would take a column from a
+// table not itself joined USING it, and a coalesced `*` column whose bare name
+// is ambiguous. Both must fail with the same message, and their valid
+// neighbors must not.
+#[test]
+fn outer_join_using_errors_match_stock() {
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.expect("open frank");
+        let r = rusqlite::Connection::open_in_memory().expect("open rusqlite");
+        for s in ABC {
+            f.execute(s).await.expect("frank setup");
+            r.execute_batch(s).expect("rusqlite setup");
+        }
+        for q in [
+            "SELECT * FROM a FULL JOIN b ON a.id = b.id JOIN c USING(id)",
+            "SELECT * FROM a LEFT JOIN b ON 1 NATURAL RIGHT JOIN c",
+            "SELECT * FROM a JOIN b USING(id) FULL JOIN c ON a.id = c.id",
+            "SELECT a.* FROM a JOIN b USING(id) FULL JOIN c ON a.id = c.id",
+            "SELECT c.* FROM a JOIN b USING(id) FULL JOIN c ON a.id = c.id",
+            "SELECT * FROM a CROSS JOIN b JOIN c USING(id)",
+        ] {
+            let frank = f.query(q).await.err().map(|error| error.to_string());
+            let stock = r.prepare(q).err().map(stock_error_message);
+            assert_eq!(frank, stock, "{q}");
+        }
+    });
+}
+
 #[test]
 fn aggregate_over_right_join() {
     asupersync::test_utils::run_test(|| async {
