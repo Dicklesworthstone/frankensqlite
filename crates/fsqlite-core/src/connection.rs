@@ -523,6 +523,24 @@ const fn autocommit_statement_conflict_is_retryable(error: &FrankenError) -> boo
     error.is_transient()
 }
 
+/// The reload refuses a transaction whose snapshot is newer than the
+/// publication it was bound against (a peer committed in between).
+const PUBLICATION_STRADDLE_DETAIL: &str =
+    "pager publication advanced between metadata bind and reload transaction";
+
+/// GH#457: how many times a refresh rebinds after a peer commit straddled its
+/// bind and reload before surfacing the BUSY. Each straddle needs a commit to
+/// land inside one bind-to-begin window, so a few retries suffice.
+const PUBLICATION_STRADDLE_REBINDS: u32 = 16;
+
+fn is_publication_straddle(error: &FrankenError) -> bool {
+    matches!(
+        error,
+        FrankenError::BusySnapshot { conflicting_pages }
+            if conflicting_pages == PUBLICATION_STRADDLE_DETAIL
+    )
+}
+
 /// bd-xv5cm L4: the `SQLITE_BUSY`-family error to surface when a read/txn-begin
 /// retry budget is exhausted, preserving whether the last admission attempt
 /// observed `BusyRecovery` (extended code 261) rather than collapsing every
@@ -26460,32 +26478,50 @@ impl Connection {
             return Ok(publication);
         }
 
-        let publication = self.bind_pager_publication(cx, scenario_id).await?;
-        // Reevaluate after binding: another connection may have grown the
-        // database since the candidate check. The prebound reload below also
-        // rejects a transaction whose visibility sequence differs from this
-        // publication, rather than hydrating a newer, potentially larger image.
-        let hydrate_rows = hydration_requested(&publication.snapshot);
-        if !self.skip_statement_memdb_refresh.get()
-            && (publication.snapshot.visible_commit_seq > *self.memdb_visible_commit_seq.borrow()
-                || (hydrate_rows && !self.memdb_rows_loaded.get()))
-        {
-            self.discard_cached_vdbe_engine();
-            // bd-db300.5.2.2.1: Count actual memdb refreshes (not skips).
-            if hot_path_profile_enabled() {
-                FSQLITE_MEMDB_REFRESH_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+        let mut rebinds = 0;
+        loop {
+            let publication = self.bind_pager_publication(cx, scenario_id).await?;
+            // Reevaluate after binding: another connection may have grown the
+            // database since the candidate check. The prebound reload below also
+            // rejects a transaction whose visibility sequence differs from this
+            // publication, rather than hydrating a newer, potentially larger image.
+            let hydrate_rows = hydration_requested(&publication.snapshot);
+            if !self.skip_statement_memdb_refresh.get()
+                && (publication.snapshot.visible_commit_seq
+                    > *self.memdb_visible_commit_seq.borrow()
+                    || (hydrate_rows && !self.memdb_rows_loaded.get()))
+            {
+                self.discard_cached_vdbe_engine();
+                // bd-db300.5.2.2.1: Count actual memdb refreshes (not skips).
+                if hot_path_profile_enabled() {
+                    FSQLITE_MEMDB_REFRESH_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+                }
+                // bd-db300.4.5.2: Reuse the already-bound publication instead of
+                // calling bind_pager_publication again inside reload_memdb_from_pager.
+                match self
+                    .reload_memdb_from_pager_with_prebound_publication_and_mode(
+                        cx,
+                        &publication,
+                        hydrate_rows,
+                    )
+                    .await
+                {
+                    // GH#457: a peer published between the bind and the
+                    // reload. Nothing was read, so bind the newer publication
+                    // instead of answering BUSY (stock WAL readers do not).
+                    Err(error)
+                        if is_publication_straddle(&error)
+                            && rebinds < PUBLICATION_STRADDLE_REBINDS =>
+                    {
+                        rebinds += 1;
+                        continue;
+                    }
+                    result => result?,
+                }
             }
-            // bd-db300.4.5.2: Reuse the already-bound publication instead of
-            // calling bind_pager_publication again inside reload_memdb_from_pager.
-            self.reload_memdb_from_pager_with_prebound_publication_and_mode(
-                cx,
-                &publication,
-                hydrate_rows,
-            )
-            .await?;
+            self.remember_autocommit_publication(scenario_id, publication);
+            return Ok(publication);
         }
-        self.remember_autocommit_publication(scenario_id, publication);
-        Ok(publication)
     }
 
     async fn refresh_memdb_if_stale(&self, cx: &Cx) -> Result<()> {
@@ -26808,41 +26844,60 @@ impl Connection {
             // same connection are caught by the schema_generation comparison
             // in ensure_schema_unchanged, not by memdb staleness.
             if self.committed_pager_refresh_allowed() {
-                match self
-                    .try_refresh_prepared_metadata_if_stale(cx, allow_lightweight_refresh)
-                    .await?
-                {
-                    PreparedSchemaRefreshResult {
-                        outcome: PreparedSchemaRefreshOutcome::Noop,
-                        publication,
-                    } => return Ok(Some(publication)),
-                    PreparedSchemaRefreshResult {
-                        outcome: PreparedSchemaRefreshOutcome::Lightweight,
-                        publication,
-                    } => {
-                        if profile_enabled {
-                            FSQLITE_PREPARED_SCHEMA_LIGHTWEIGHT_REFRESHES
-                                .fetch_add(1, AtomicOrdering::Relaxed);
+                let mut rebinds = 0;
+                loop {
+                    match self
+                        .try_refresh_prepared_metadata_if_stale(cx, allow_lightweight_refresh)
+                        .await?
+                    {
+                        PreparedSchemaRefreshResult {
+                            outcome: PreparedSchemaRefreshOutcome::Noop,
+                            publication,
+                        } => return Ok(Some(publication)),
+                        PreparedSchemaRefreshResult {
+                            outcome: PreparedSchemaRefreshOutcome::Lightweight,
+                            publication,
+                        } => {
+                            if profile_enabled {
+                                FSQLITE_PREPARED_SCHEMA_LIGHTWEIGHT_REFRESHES
+                                    .fetch_add(1, AtomicOrdering::Relaxed);
+                            }
+                            return Ok(Some(publication));
                         }
-                        return Ok(Some(publication));
-                    }
-                    PreparedSchemaRefreshResult {
-                        outcome: PreparedSchemaRefreshOutcome::FullReloadRequired,
-                        publication,
-                    } => {
-                        // bd-db300.4.5.2: Reuse the publication that
-                        // try_refresh_prepared_metadata_if_stale already bound,
-                        // avoiding a redundant bind_pager_publication call.
-                        self.reload_memdb_from_pager_with_prebound_publication(cx, &publication)
-                            .await?;
-                        if profile_enabled {
-                            FSQLITE_PREPARED_SCHEMA_FULL_RELOADS
-                                .fetch_add(1, AtomicOrdering::Relaxed);
+                        PreparedSchemaRefreshResult {
+                            outcome: PreparedSchemaRefreshOutcome::FullReloadRequired,
+                            publication,
+                        } => {
+                            // bd-db300.4.5.2: Reuse the publication that
+                            // try_refresh_prepared_metadata_if_stale already bound,
+                            // avoiding a redundant bind_pager_publication call.
+                            match self
+                                .reload_memdb_from_pager_with_prebound_publication(
+                                    cx,
+                                    &publication,
+                                )
+                                .await
+                            {
+                                // GH#457: rebind past a peer commit that landed
+                                // between the bind and the reload, as above.
+                                Err(error)
+                                    if is_publication_straddle(&error)
+                                        && rebinds < PUBLICATION_STRADDLE_REBINDS =>
+                                {
+                                    rebinds += 1;
+                                    continue;
+                                }
+                                result => result?,
+                            }
+                            if profile_enabled {
+                                FSQLITE_PREPARED_SCHEMA_FULL_RELOADS
+                                    .fetch_add(1, AtomicOrdering::Relaxed);
+                            }
+                            // bd-db300.4.5.2: Pass the publication to the caller so
+                            // the autocommit begin path can reuse it instead of
+                            // calling bind_pager_publication a second time.
+                            return Ok(Some(publication));
                         }
-                        // bd-db300.4.5.2: Pass the publication to the caller so
-                        // the autocommit begin path can reuse it instead of
-                        // calling bind_pager_publication a second time.
-                        return Ok(Some(publication));
                     }
                 }
             }
@@ -101898,9 +101953,7 @@ impl Connection {
             // so the caller can restart from a fresh bind.
             let _ = txn.rollback(cx).await;
             return Err(FrankenError::BusySnapshot {
-                conflicting_pages:
-                    "pager publication advanced between metadata bind and reload transaction"
-                        .to_owned(),
+                conflicting_pages: PUBLICATION_STRADDLE_DETAIL.to_owned(),
             });
         }
         self.reload_memdb_from_txn_with_mode(

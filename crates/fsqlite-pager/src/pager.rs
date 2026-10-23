@@ -5470,18 +5470,67 @@ impl<F: VfsFile + 'static> WalIndexShmSource<F> {
     }
 
     /// Acquire into the caller's owner, including every intermediate failure.
+    ///
+    /// GH#457: stock `walTryBeginRead` answers `WAL_RETRY` when a live
+    /// publisher has torn the header pair, no reader slot could be locked, or
+    /// the publication moved between the slot claim and its revalidation, and
+    /// `sqlite3WalBeginReadTransaction` retries without consulting the busy
+    /// handler. Those races are retried here at stock's pace, so a reader with
+    /// `busy_timeout = 0` does not fail just because a writer committed.
     async fn acquire_reader_into(
         &self,
         cx: &Cx,
         owner: &mut BeginExternalLockState<F>,
         require_wal: bool,
     ) -> Result<traits::WalNativeReadOutcome> {
+        let mut attempt = 1_u32;
+        let mut torn_header_retries = 0_u32;
+        loop {
+            let exhausted = match self.try_acquire_reader_into(cx, owner, require_wal).await? {
+                NativeReaderAdmission::Admitted(outcome) => return Ok(outcome),
+                NativeReaderAdmission::Retry { exhausted, torn_header } => {
+                    torn_header_retries += u32::from(torn_header);
+                    if torn_header_retries > WAL_TORN_HEADER_RETRIES {
+                        return exhausted;
+                    }
+                    exhausted
+                }
+            };
+            attempt += 1;
+            if attempt > WAL_READER_ATTEMPTS {
+                return exhausted;
+            }
+            self.release_reader_attempt(owner).await?;
+            wal_reader_retry_pause(attempt).await;
+        }
+    }
+
+    /// Release a retried attempt's slot claim so the next attempt starts clean.
+    async fn release_reader_attempt(&self, owner: &mut BeginExternalLockState<F>) -> Result<()> {
+        let cleanup_cx = owner.cleanup_cx.clone();
+        if let Some(reader) = owner.native_reader.as_mut().filter(|reader| reader.claim.is_some()) {
+            let _cleanup_mask = cleanup_cx.masked();
+            let mut file = shared_db_file_write(&self.db_file, &cleanup_cx).await?;
+            reader.restore_claim(&mut *file, &cleanup_cx)?;
+        }
+        owner.native_reader = None;
+        Ok(())
+    }
+
+    /// One admission attempt of [`Self::acquire_reader_into`].
+    async fn try_acquire_reader_into(
+        &self,
+        cx: &Cx,
+        owner: &mut BeginExternalLockState<F>,
+        require_wal: bool,
+    ) -> Result<NativeReaderAdmission> {
         use traits::{WalNativeReadBinding, WalNativeReadOutcome, WalNativeRecoveryReason};
         use fsqlite_vfs::shm::{SQLITE_SHM_LOCK, SQLITE_SHM_SHARED, WAL_READ_LOCK_BASE};
         use fsqlite_wal::wal_index::{
             WAL_INDEX_HDR_BYTES, read_shared_wal_index_header,
-            revalidate_shared_wal_index_reader,
+            revalidate_shared_wal_index_reader, shared_wal_index_header_is_torn,
         };
+        use NativeReaderAdmission::{Admitted, Retry};
 
         let queue = self.cleanup_queue.upgrade().ok_or(FrankenError::BusyRecovery)?;
         if !Arc::ptr_eq(&self.db_file, &owner.db_file) || owner.native_reader.is_some() {
@@ -5501,21 +5550,32 @@ impl<F: VfsFile + 'static> WalIndexShmSource<F> {
         let region = match file.shm_map(cx, 0, fsqlite_vfs::shm::SHM_SEGMENT_SIZE, false) {
             Ok(region) => region,
             Err(FrankenError::CannotOpen { .. }) => {
-                return Ok(WalNativeReadOutcome::RecoveryRequired(
+                return Ok(Admitted(WalNativeReadOutcome::RecoveryRequired(
                     WalNativeRecoveryReason::SharedIndexUnavailable,
-                ));
+                )));
             }
             Err(FrankenError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(WalNativeReadOutcome::RecoveryRequired(
+                return Ok(Admitted(WalNativeReadOutcome::RecoveryRequired(
                     WalNativeRecoveryReason::SharedIndexUnavailable,
-                ));
+                )));
             }
             Err(error) => return Err(error),
         };
         let Some(header) = read_shared_wal_index_header(&region)? else {
-            return Ok(WalNativeReadOutcome::RecoveryRequired(
+            let invalid = Ok(WalNativeReadOutcome::RecoveryRequired(
                 WalNativeRecoveryReason::SharedHeaderInvalid,
             ));
+            // A publisher between its two header stores leaves the pair torn,
+            // or whole again by now. Retry that, as stock does while the
+            // writer holds its lock, rather than start a recovery that would
+            // only find the writer busy.
+            let live_publisher = shared_wal_index_header_is_torn(&region)?
+                || read_shared_wal_index_header(&region)?.is_some();
+            return Ok(if live_publisher {
+                Retry { exhausted: invalid, torn_header: true }
+            } else {
+                Admitted(invalid?)
+            });
         };
         let backfilled = region.atomic_load_u32_ne(2 * WAL_INDEX_HDR_BYTES, AtomicOrdering::Acquire)?;
         // A read-only opener cannot publish a new nonzero read mark after
@@ -5554,13 +5614,27 @@ impl<F: VfsFile + 'static> WalIndexShmSource<F> {
                                 header.mx_frame,
                             )? =>
                     {
-                        return Ok(WalNativeReadOutcome::RecoveryRequired(
+                        return Ok(Admitted(WalNativeReadOutcome::RecoveryRequired(
                             WalNativeRecoveryReason::StaleReaderMarks,
-                        ));
+                        )));
+                    }
+                    // Every slot was busy: stock's WAL_RETRY.
+                    Err(FrankenError::BusyRecovery) if self.can_publish_reader_marks => {
+                        return Ok(Retry {
+                            exhausted: Err(FrankenError::BusyRecovery),
+                            torn_header: false,
+                        });
                     }
                     Err(error) => return Err(error),
                 };
-                file.shm_lock(cx, WAL_READ_LOCK_BASE + slot, 1, SQLITE_SHM_LOCK | SQLITE_SHM_SHARED)?;
+                match file.shm_lock(cx, WAL_READ_LOCK_BASE + slot, 1, SQLITE_SHM_LOCK | SQLITE_SHM_SHARED) {
+                    Ok(()) => {}
+                    // A peer holds the slot to move its mark: WAL_RETRY.
+                    Err(FrankenError::Busy) => {
+                        return Ok(Retry { exhausted: Err(FrankenError::Busy), torn_header: false });
+                    }
+                    Err(error) => return Err(error),
+                }
                 (slot, mark)
             }
         };
@@ -5570,8 +5644,10 @@ impl<F: VfsFile + 'static> WalIndexShmSource<F> {
                 exclusive: false,
             });
         drop(file);
-        let boundary = revalidate_shared_wal_index_reader(&region, &header, slot, read_mark)?
-            .ok_or(FrankenError::BusyRecovery)?;
+        // The publication or mark moved after the claim: WAL_RETRY.
+        let Some(boundary) = revalidate_shared_wal_index_reader(&region, &header, slot, read_mark)? else {
+            return Ok(Retry { exhausted: Err(FrankenError::BusyRecovery), torn_header: false });
+        };
         owner.native_reader.as_mut().expect("shared reader owner").validated =
             Some(WalNativeReadBinding {
                 token: traits::WalNativeReadToken::new(),
@@ -5579,8 +5655,42 @@ impl<F: VfsFile + 'static> WalIndexShmSource<F> {
                 header,
                 boundary,
             });
-        Ok(WalNativeReadOutcome::Ready)
+        Ok(Admitted(WalNativeReadOutcome::Ready))
     }
+}
+
+/// One native reader admission attempt.
+enum NativeReaderAdmission {
+    Admitted(traits::WalNativeReadOutcome),
+    /// Stock's `WAL_RETRY`. `exhausted` is the answer once retries run out.
+    /// A torn header pair can also be left by a publisher that stopped between
+    /// its two stores, so those retries have a shorter budget.
+    Retry {
+        exhausted: Result<traits::WalNativeReadOutcome>,
+        torn_header: bool,
+    },
+}
+
+/// Stock `walTryBeginRead` gives up (`SQLITE_PROTOCOL`) after 100 tries.
+const WAL_READER_ATTEMPTS: u32 = 100;
+
+/// Torn-header retries before recovering instead: about 0.13 s at stock's
+/// pace, far longer than a live publisher takes to store both copies.
+const WAL_TORN_HEADER_RETRIES: u32 = 30;
+
+/// Stock's retry pacing for `attempt` (the try about to run): immediate for the
+/// first five tries, then 1 us, then `(attempt - 9)^2 * 39` us from the tenth.
+async fn wal_reader_retry_pause(attempt: u32) {
+    if attempt <= 5 {
+        asupersync::runtime::yield_now().await;
+        return;
+    }
+    let micros = if attempt < 10 {
+        1
+    } else {
+        u64::from((attempt - 9) * (attempt - 9)) * 39
+    };
+    asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_micros(micros)).await;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

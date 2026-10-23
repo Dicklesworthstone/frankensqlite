@@ -381,6 +381,20 @@ pub fn read_shared_wal_index_header(region: &ShmRegion) -> Result<Option<WalInde
     Ok(header.validate().is_ok().then_some(header))
 }
 
+/// Whether the two live header copies differ.
+///
+/// A publisher stores copy 2, a barrier, then copy 1, so a reader can sample
+/// the pair mid-publication. Stock readers retry that state (`walIndexTryHdr`
+/// answering `WAL_RETRY`) instead of recovering. Two equal copies that fail
+/// validation, such as an invalidated index, are not torn.
+pub fn shared_wal_index_header_is_torn(region: &ShmRegion) -> Result<bool> {
+    validate_shared_segment(region)?;
+    let first = read_shared_header_copy(region, 0)?;
+    fence(Ordering::SeqCst);
+    let second = read_shared_header_copy(region, WAL_INDEX_HDR_BYTES)?;
+    Ok(first != second)
+}
+
 /// Read the durable backfill watermark for one exact accepted publication.
 ///
 /// The caller retains its checkpoint/reader owner. A changed header or an
@@ -2055,14 +2069,21 @@ mod tests {
             assert!(publish_shared_wal_index_header(&region, &invalid).is_err());
             assert_eq!(region.lock().to_vec(), captured);
 
+            assert!(!shared_wal_index_header_is_torn(&region).unwrap());
             region
                 .atomic_store_u32_ne(56, 8, Ordering::Release)
                 .unwrap();
             assert!(read_shared_wal_index_header(&region).unwrap().is_none());
+            assert!(shared_wal_index_header_is_torn(&region).unwrap());
             region.atomic_store_u32_ne(8, 8, Ordering::Release).unwrap();
             assert!(read_shared_wal_index_header(&region).unwrap().is_none());
+            assert!(!shared_wal_index_header_is_torn(&region).unwrap());
             publish_shared_wal_index_header(&region, &header).unwrap();
             assert_eq!(read_shared_wal_index_header(&region).unwrap(), Some(header));
+            invalidate_shared_wal_index_header(&region).unwrap();
+            assert!(read_shared_wal_index_header(&region).unwrap().is_none());
+            assert!(!shared_wal_index_header_is_torn(&region).unwrap());
+            publish_shared_wal_index_header(&region, &header).unwrap();
         }
         for size in [0, 96, WAL_SHM_SEGMENT_BYTES - 1, WAL_SHM_SEGMENT_BYTES + 1] {
             let region = ShmRegion::new(size);
