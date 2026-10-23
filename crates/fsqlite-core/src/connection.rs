@@ -72785,7 +72785,13 @@ impl Connection {
                     self.execute_with_params(&sql, parent_values).await
                 };
                 result?;
-                Ok(())
+                self.queue_fk_action_survivors(
+                    child_table,
+                    child_columns,
+                    parent_values,
+                    &fsqlite_ast::TriggerEvent::Delete,
+                )
+                .await
             }
             FkDeleteAction::SetNull {
                 child_table,
@@ -72812,7 +72818,13 @@ impl Connection {
                     self.execute_with_params(&sql, parent_values).await
                 };
                 result?;
-                Ok(())
+                self.queue_fk_action_survivors(
+                    child_table,
+                    child_columns,
+                    parent_values,
+                    &fsqlite_ast::TriggerEvent::Update(child_columns.clone()),
+                )
+                .await
             }
             FkDeleteAction::SetDefault {
                 child_table,
@@ -72845,6 +72857,66 @@ impl Connection {
                 Ok(())
             }
         }
+    }
+
+    /// bd-vcvn0: queue each `child_table` row an FK action left pointing at
+    /// the parent key it acted on, for the statement-end parent check. Only a
+    /// BEFORE trigger's RAISE(IGNORE) can skip the action's DELETE or UPDATE
+    /// of a child row; stock then fails the statement with "FOREIGN KEY
+    /// constraint failed" unless the key has a parent again by its end.
+    async fn queue_fk_action_survivors(
+        &self,
+        child_table: &str,
+        child_columns: &[String],
+        parent_values: &[SqliteValue],
+        event: &fsqlite_ast::TriggerEvent,
+    ) -> Result<()> {
+        if !self.has_matching_triggers(child_table, fsqlite_ast::TriggerTiming::Before, event) {
+            return Ok(());
+        }
+        // The child-side keys over exactly these columns.
+        let keys: Vec<usize> = {
+            let schema = self.schema.borrow();
+            let Some(table) = schema
+                .iter()
+                .find(|t| t.name.eq_ignore_ascii_case(child_table))
+            else {
+                return Ok(());
+            };
+            table
+                .foreign_keys
+                .iter()
+                .enumerate()
+                .filter(|(_, fk)| {
+                    fk.child_columns.len() == child_columns.len()
+                        && fk.child_columns.iter().zip(child_columns).all(|(&index, name)| {
+                            table
+                                .columns
+                                .get(index)
+                                .is_some_and(|column| column.name.eq_ignore_ascii_case(name))
+                        })
+                })
+                .map(|(index, _)| index)
+                .collect()
+        };
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let where_parts: Vec<String> = child_columns
+            .iter()
+            .enumerate()
+            .map(|(i, col)| format!("{} = ?{}", quote_identifier(col), i + 1))
+            .collect();
+        let sql = format!(
+            "SELECT * FROM {} WHERE {}",
+            quote_identifier(child_table),
+            where_parts.join(" AND ")
+        );
+        for row in self.fk_validation_query(&sql, parent_values).await? {
+            self.check_fk_parent_exists_for_keys(child_table, row.values(), Some(&keys))
+                .await?;
+        }
+        Ok(())
     }
 
     /// Verify that no child table references a row being updated in `table_name`.
@@ -73061,7 +73133,13 @@ impl Connection {
                     self.execute_with_params(&sql, &params).await
                 };
                 result?;
-                Ok(())
+                self.queue_fk_action_survivors(
+                    child_table,
+                    child_columns,
+                    old_parent_values,
+                    &fsqlite_ast::TriggerEvent::Update(child_columns.clone()),
+                )
+                .await
             }
             FkUpdateAction::SetNull {
                 child_table,
@@ -73088,7 +73166,13 @@ impl Connection {
                     self.execute_with_params(&sql, old_parent_values).await
                 };
                 result?;
-                Ok(())
+                self.queue_fk_action_survivors(
+                    child_table,
+                    child_columns,
+                    old_parent_values,
+                    &fsqlite_ast::TriggerEvent::Update(child_columns.clone()),
+                )
+                .await
             }
             FkUpdateAction::SetDefault {
                 child_table,
