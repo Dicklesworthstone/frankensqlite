@@ -17,6 +17,9 @@ use std::time::Instant;
 use fsqlite_core::connection::{Connection, hot_path_profile_snapshot, reset_hot_path_profile};
 use fsqlite_types::SqliteValue;
 
+/// Timed runs per size; the scaling check uses the fastest.
+const REPEATS: usize = 3;
+
 /// Run N explicit-rowid FK-on inserts in a single txn with one prepared stmt.
 /// Returns (microseconds-per-insert, memdb_refresh_count observed during the
 /// hot loop).
@@ -113,13 +116,22 @@ fn fk_explicit_rowid_insert_scales_flat() {
         let mut fk = Vec::new();
         let mut nofk = Vec::new();
         for &n in &sizes {
-            let (us, refreshes) = run_fk_insert(n).await;
-            // Distinct from #110: this shape must not trigger memdb reloads.
-            assert_eq!(
-                refreshes, 0,
-                "FK explicit-rowid insert at N={n} triggered {refreshes} memdb refreshes (expected 0; this would be the #110 bug, not #111)"
-            );
-            let control = run_no_fk_insert(n).await;
+            // Best of REPEATS paired runs per size: a loaded host inflates
+            // single runs (GH#485 saw 28.5 -> 71.7 us where a same-host rerun
+            // measured 15.4 -> 14.6 us), while a super-linear regression slows
+            // every run, so the minimum still exposes it.
+            let mut us = f64::INFINITY;
+            let mut control = f64::INFINITY;
+            for _ in 0..REPEATS {
+                let (run_us, refreshes) = run_fk_insert(n).await;
+                // Distinct from #110: this shape must not trigger memdb reloads.
+                assert_eq!(
+                    refreshes, 0,
+                    "FK explicit-rowid insert at N={n} triggered {refreshes} memdb refreshes (expected 0; this would be the #110 bug, not #111)"
+                );
+                us = us.min(run_us);
+                control = control.min(run_no_fk_insert(n).await);
+            }
             eprintln!(
                 "N={n:>5}  FK-on={us:8.3} us/insert   no-FK={control:8.3} us/insert   ratio={:.2}x",
                 us / control

@@ -135,9 +135,42 @@ fn gh327_ddl_against_open_peer_write_txn_is_bounded_and_recovers() {
         };
         eprintln!("gh327 receipt: contended DDL outcome = {contended_outcome} in {elapsed:?}");
 
+        // A's COMMIT. After a refused DDL nothing stands in its way. After a
+        // DDL that published concurrently, A's write transaction was opened
+        // on the old schema, and the schema-snapshot commit guard may refuse
+        // it (GH#476); that refusal must be transient, and A's write must
+        // then succeed promptly when retried on the new schema.
+        let a_commit = conn_a.execute("COMMIT").await;
+        match (&contended, a_commit) {
+            (_, Ok(_)) => {}
+            (Err(_), Err(error)) => {
+                panic!("A's COMMIT must succeed after the DDL was refused, got: {error}")
+            }
+            (Ok(_), Err(error)) => {
+                assert!(
+                    error.is_transient(),
+                    "an old-schema COMMIT refused after a concurrent DDL must \
+                     surface a transient busy-class error, got: {error}"
+                );
+                eprintln!("gh327 receipt: A's old-schema COMMIT refused: {error}");
+                conn_a.execute("ROLLBACK").await.ok();
+                let started_retry = Instant::now();
+                conn_a.execute("BEGIN").await.expect("A retry begin");
+                conn_a
+                    .execute("UPDATE skills SET name = 'beta-renamed' WHERE id = 2")
+                    .await
+                    .expect("A retry write");
+                conn_a.execute("COMMIT").await.expect("A retry commit");
+                let retry_elapsed = started_retry.elapsed();
+                assert!(
+                    retry_elapsed < PROMPT_BUDGET,
+                    "A's write retry after the schema change took {retry_elapsed:?}"
+                );
+            }
+        }
+
         // Field report parity: once the conflicting transaction resolves,
         // the same operation must succeed.
-        conn_a.execute("COMMIT").await.expect("A commit");
         if contended.is_err() {
             let started_retry = Instant::now();
             conn_b

@@ -36,27 +36,6 @@ if [[ ! -f "${FSQLITE_MANIFEST}" || ! -f "${WORKSPACE_MANIFEST}" ]]; then
     exit 1
 fi
 
-required_feature_lines=(
-    '[features]'
-    'default = ["native", "linux-asupersync-uring", "json", "fts5", "rtree"]'
-    'json = ["dep:fsqlite-ext-json"]'
-    'fts5 = ["dep:fsqlite-ext-fts5"]'
-    'fts3 = ["dep:fsqlite-ext-fts3"]'
-    'rtree = ["dep:fsqlite-ext-rtree"]'
-    'session = ["dep:fsqlite-ext-session"]'
-    'icu = ["dep:fsqlite-ext-icu"]'
-    'misc = ["dep:fsqlite-ext-misc"]'
-    'raptorq = []'
-    'mvcc = []'
-)
-
-for line in "${required_feature_lines[@]}"; do
-    if ! rg -Fq "${line}" "${FSQLITE_MANIFEST}"; then
-        printf 'bead_id=%s level=ERROR case=missing_feature_marker marker=%q\n' "${BEAD_ID}" "${line}"
-        exit 1
-    fi
-done
-
 required_profile_lines=(
     '[profile.release]'
     'opt-level = 3'
@@ -90,9 +69,38 @@ trap cleanup EXIT
 
 (cd "${WORKSPACE_ROOT}" && cargo metadata --format-version=1 >"${metadata_json}")
 
+# Facade feature contract, read from the resolved metadata rather than from
+# the manifest's formatting (GH#481): each extension feature enables its
+# crate, the default build is native plus json/fts5/rtree/icu/misc, and
+# raptorq/mvcc are empty markers.
+fsqlite_features="$(jq -c '.packages[] | select(.name == "fsqlite") | .features' "${metadata_json}")"
+for extension in json fts5 fts3 rtree session icu misc; do
+    if ! jq -e --arg f "${extension}" --arg d "dep:fsqlite-ext-${extension}" \
+        '(.[$f] // []) | index($d)' <<<"${fsqlite_features}" >/dev/null; then
+        printf 'bead_id=%s level=ERROR case=feature_missing_dependency feature=%s\n' \
+            "${BEAD_ID}" "${extension}"
+        exit 1
+    fi
+done
+for required in native linux-asupersync-uring json fts5 rtree icu misc; do
+    if ! jq -e --arg r "${required}" '(.default // []) | index($r)' \
+        <<<"${fsqlite_features}" >/dev/null; then
+        printf 'bead_id=%s level=ERROR case=default_feature_missing feature=%s\n' \
+            "${BEAD_ID}" "${required}"
+        exit 1
+    fi
+done
+for marker in raptorq mvcc; do
+    if ! jq -e --arg m "${marker}" '.[$m] == []' <<<"${fsqlite_features}" >/dev/null; then
+        printf 'bead_id=%s level=ERROR case=marker_feature_not_empty feature=%s\n' \
+            "${BEAD_ID}" "${marker}"
+        exit 1
+    fi
+done
+
 member_count="$(jq '.workspace_members | length' "${metadata_json}")"
-if [[ "${member_count}" -ne 27 ]]; then
-    printf 'bead_id=%s level=ERROR case=workspace_member_count expected=27 actual=%s\n' \
+if [[ "${member_count}" -ne 28 ]]; then
+    printf 'bead_id=%s level=ERROR case=workspace_member_count expected=28 actual=%s\n' \
         "${BEAD_ID}" "${member_count}"
     exit 1
 fi

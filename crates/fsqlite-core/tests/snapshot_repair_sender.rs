@@ -108,36 +108,29 @@ fn cancellation_refuses_without_consuming_a_packet() {
 #[test]
 #[cfg(not(target_arch = "wasm32"))]
 fn unsupported_repair_parameters_never_emit_a_placeholder() {
-    // A real one-page snapshot with one-byte transport symbols exceeds the
-    // codec's supported K. Systematic extraction is cheap; codec admission
-    // must refuse before allocating its matrix or returning a fake repair.
-    let mut pages = vec![PageEntry::new(1, vec![7; 65_536])];
-    let mut sender = SnapshotSender::prepare(
-        65_536,
-        &mut pages,
-        SenderConfig {
-            symbol_size: 1,
-            max_isi_multiplier: 2,
-        },
-    )
-    .expect("systematic snapshot");
-    let k = sender.total_source_symbols();
-    assert!((56_404..70_000).contains(&k));
-    let cx = Cx::new();
-    for esi in 0..k {
-        let packet = sender
-            .next_packet(&cx)
-            .expect("systematic encoding")
-            .expect("source");
-        assert_eq!(u64::from(packet.esi), esi);
-        assert!(packet.is_source_symbol());
-    }
-    let first = sender
-        .next_packet(&cx)
-        .expect_err("unsupported repair must refuse");
-    let second = sender
-        .next_packet(&cx)
-        .expect_err("failed repair must remain unconsumed");
+    // A real one-page snapshot with one-byte transport symbols needs about
+    // 65.5k source symbols, beyond the codec's supported K and the dense
+    // repair budget. Admission sizes every block so its repair symbols can
+    // be encoded, so this snapshot is refused at prepare (GH#484), before
+    // any matrix is allocated: no sender exists, no systematic symbol is
+    // streamed, and no repair, real or placeholder, can be emitted for it.
+    let fixture = vec![PageEntry::new(1, vec![7; 65_536])];
+    let oversized = SenderConfig {
+        symbol_size: 1,
+        max_isi_multiplier: 2,
+    };
+    let mut pages = fixture.clone();
+    let first = SnapshotSender::prepare(65_536, &mut pages, oversized.clone())
+        .expect_err("unsupported repair parameters must be refused at admission");
+    assert!(matches!(first, FrankenError::TooBig), "got {first:?}");
+    // The refusal consumes nothing: the pages are intact and a retry is
+    // refused identically.
+    assert_eq!(pages, fixture);
+    let second = SnapshotSender::prepare(65_536, &mut pages, oversized)
+        .expect_err("a retried refusal must not change");
     assert_eq!(first.to_string(), second.to_string());
-    assert!(matches!(first, FrankenError::OutOfRange { .. }));
+    // The refusal is about the symbol parameters, not the page: the same
+    // page is admitted with the default transport symbols.
+    SnapshotSender::prepare(65_536, &mut pages, SenderConfig::default())
+        .expect("default symbols admit the same page");
 }

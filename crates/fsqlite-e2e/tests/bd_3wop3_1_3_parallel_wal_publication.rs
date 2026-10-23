@@ -417,8 +417,9 @@ fn summarize_publication_logs(
     }
 }
 
+/// The caller must have installed the JSON logger with [`init_logging`]
+/// before entering the test runtime (see the child entrypoint).
 async fn run_child_workload(run_dir: &Path, mode: &str) -> PublicationRunSummary {
-    let _logging_guard = init_logging(run_dir, true).expect("initialize child logging");
     let db_path = run_dir.join("parallel_wal_publication.db");
     let log_path = run_dir.join("test.log.jsonl");
 
@@ -570,7 +571,7 @@ async fn run_performance_workload(
 ) -> PerformanceRunSummary {
     const TRANSACTIONS_PER_THREAD: usize = 16;
 
-    let _logging_guard = init_logging(run_dir, true).expect("initialize performance logging");
+    // The JSON logger is installed by the entrypoint, before the runtime.
     let db_path = run_dir.join("parallel_wal_publication_performance.db");
     let log_path = run_dir.join("test.log.jsonl");
     let setup = open_connection(&db_path).await;
@@ -1140,12 +1141,16 @@ fn bd_3wop3_1_3_parallel_wal_publication_modes_are_semantically_equivalent() {
 #[test]
 #[ignore = "helper entrypoint for the parent test harness; not meant to run directly"]
 fn bd_3wop3_1_3_parallel_wal_publication_child_entrypoint() {
+    let run_dir = PathBuf::from(
+        env::var(CHILD_RUN_DIR_ENV)
+            .expect("child run dir env must be present for child entrypoint"),
+    );
+    // Install the process-global JSON logger before `run_test`: with no
+    // global subscriber yet, `run_test` scopes a console dispatcher to this
+    // thread, and the main thread's publication events then never reach
+    // the JSON log the parent counts (GH#471).
+    let _logging_guard = init_logging(&run_dir, true).expect("initialize child logging");
     asupersync::test_utils::run_test(|| async {
-        let run_dir = PathBuf::from(
-            env::var(CHILD_RUN_DIR_ENV)
-                .expect("child run dir env must be present for child entrypoint"),
-        );
-        fs::create_dir_all(&run_dir).expect("create child run dir");
         let mode = env::var(CHILD_MODE_ENV).expect("child mode env must be present");
         let summary = run_child_workload(&run_dir, &mode).await;
         fs::write(
@@ -1159,11 +1164,12 @@ fn bd_3wop3_1_3_parallel_wal_publication_child_entrypoint() {
 #[test]
 #[ignore = "helper entrypoint for the production performance matrix"]
 fn bd_3wop3_1_3_parallel_wal_publication_performance_child_entrypoint() {
+    let run_dir = PathBuf::from(
+        env::var(CHILD_RUN_DIR_ENV).expect("performance child run dir env must be present"),
+    );
+    // As in the publication child: the global logger must precede `run_test`.
+    let _logging_guard = init_logging(&run_dir, true).expect("initialize performance logging");
     asupersync::test_utils::run_test(|| async {
-        let run_dir = PathBuf::from(
-            env::var(CHILD_RUN_DIR_ENV).expect("performance child run dir env must be present"),
-        );
-        fs::create_dir_all(&run_dir).expect("create performance child run dir");
         let mode = env::var(CHILD_MODE_ENV).expect("performance child mode env must be present");
         let thread_count = env::var(PERFORMANCE_THREADS_ENV)
             .expect("performance thread-count env must be present")

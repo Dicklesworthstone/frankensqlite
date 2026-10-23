@@ -18,7 +18,7 @@ use fsqlite_harness::parity_evidence_matrix::{
     ParityEvidenceRow, required_evidence_classes,
 };
 use fsqlite_harness::parity_invariant_catalog::build_canonical_catalog;
-use fsqlite_harness::parity_taxonomy::build_canonical_universe;
+use fsqlite_harness::parity_taxonomy::{ParityStatus, build_canonical_universe};
 use fsqlite_harness::score_engine::{ScoreEngineConfig, compute_bayesian_scorecard_with_contract};
 use fsqlite_harness::verification_contract_enforcement::{
     ContractBeadStatus, EnforcementDisposition, classify_parity_evidence_report,
@@ -139,11 +139,16 @@ fn e2e_scorecard_release_blocked_when_contract_missing() {
     )
     .expect("write issues.jsonl");
 
-    let universe = build_canonical_universe();
-    let config = ScoreEngineConfig {
-        release_threshold: 0.0,
-        ..Default::default()
-    };
+    // The base gate must pass on its own merits so the missing contract is
+    // the only thing blocking release (GH#458): every feature passing at the
+    // default threshold. A threshold below STATISTICAL_RELEASE_FLOOR makes
+    // the config invalid, which fails the base gate before the contract runs.
+    let mut universe = build_canonical_universe();
+    for feature in universe.features.values_mut() {
+        feature.status = ParityStatus::Passing;
+        feature.exclusion = None;
+    }
+    let config = ScoreEngineConfig::default();
     let scorecard = compute_bayesian_scorecard_with_contract(temp_dir.path(), &universe, &config)
         .expect("compute scorecard with contract");
 

@@ -35,6 +35,7 @@
 #![recursion_limit = "512"]
 
 use fsqlite::Connection;
+use fsqlite_types::SqliteValue;
 
 /// Helper: open an in-memory connection with deterministic state.
 async fn open_conn() -> Connection {
@@ -708,38 +709,64 @@ fn t15_prepared_stmt_reuse_after_ddl() {
         .await
         .expect("create trigger");
 
-        // Prepare a statement
-        let stmt = conn
+        // Prepare both statements before the DDL, so both carry a stale
+        // schema_cookie into execute.
+        let positional = conn
             .prepare("INSERT INTO msgs VALUES (1, 'prepared')")
             .await
-            .expect("prepare");
+            .expect("prepare positional");
+        let explicit = conn
+            .prepare("INSERT INTO msgs (id, body) VALUES (2, 'prepared')")
+            .await
+            .expect("prepare explicit");
 
         // DDL changes schema_cookie
         conn.execute("ALTER TABLE msgs ADD COLUMN ts TEXT")
             .await
             .expect("alter table");
 
-        // Execute the prepared statement — its cached schema_cookie is stale.
-        // The execute path must handle revalidation + trigger firing safely.
-        let result = stmt.execute().await;
-        // Might return SQLITE_SCHEMA error or succeed; either is acceptable.
-        // A panic (BorrowMutError) is the bug we're looking for.
-        match result {
-            Ok(_) => {
-                let rows = conn
-                    .query("SELECT COUNT(*) FROM msg_audit")
-                    .await
-                    .expect("q");
-                assert_eq!(rows.len(), 1);
-            }
-            Err(e) => {
-                let msg = format!("{e}");
-                assert!(
-                    msg.contains("schema") || msg.contains("Schema"),
-                    "expected schema error, got: {msg}"
-                );
-            }
-        }
+        // The execute path must handle revalidation + trigger firing safely;
+        // a panic (BorrowMutError) is the bug we're looking for. Revalidated
+        // against three columns, the positional INSERT's two values no longer
+        // fit, and it is refused as stock SQLite refuses it (GH#478).
+        let error = positional
+            .execute()
+            .await
+            .expect_err("two values into three columns must be refused");
+        assert!(
+            error
+                .to_string()
+                .contains("table msgs has 3 columns but 2 values were supplied"),
+            "expected the stock arity error, got: {error}"
+        );
+
+        // The column list keeps the other statement valid across the DDL: it
+        // stores its row and fires the audit trigger, and the refused
+        // statement left nothing behind.
+        explicit
+            .execute()
+            .await
+            .expect("explicit-column INSERT after ADD COLUMN");
+        let values = |rows: Vec<fsqlite::Row>| -> Vec<Vec<SqliteValue>> {
+            rows.iter().map(|row| row.values().to_vec()).collect()
+        };
+        let stored = conn
+            .query("SELECT id, body, ts FROM msgs ORDER BY id")
+            .await
+            .expect("msgs");
+        assert_eq!(
+            values(stored),
+            vec![vec![
+                SqliteValue::Integer(2),
+                SqliteValue::Text("prepared".to_owned().into()),
+                SqliteValue::Null,
+            ]]
+        );
+        let audited = conn
+            .query("SELECT msg_id FROM msg_audit ORDER BY msg_id")
+            .await
+            .expect("msg_audit");
+        assert_eq!(values(audited), vec![vec![SqliteValue::Integer(2)]]);
     });
 }
 

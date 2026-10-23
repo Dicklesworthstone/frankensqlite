@@ -35,12 +35,15 @@
 #![recursion_limit = "512"]
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use fsqlite::Connection;
+use fsqlite_types::SqliteValue;
 
 const STRESS_DURATION: Duration = Duration::from_secs(2);
+/// Upper bound for W4's workers to open their connections.
+const OPEN_DEADLINE: Duration = Duration::from_secs(120);
 
 fn test_tmpdir() -> tempfile::TempDir {
     tempfile::tempdir_in(std::env::temp_dir())
@@ -333,32 +336,49 @@ fn w4_cross_table_concurrent_updates() {
 
         let stop = Arc::new(AtomicBool::new(false));
         let total_ops = Arc::new(AtomicU64::new(0));
+        // Workers count themselves ready once their connection is open, and
+        // the stress window starts only when all of them are (GH#472: opening
+        // six connections could outlast STRESS_DURATION, closing the window
+        // before any worker issued an UPDATE).
+        let ready = Arc::new(AtomicUsize::new(0));
+        // Failed BEGIN / UPDATE / COMMIT attempts, reported with the result.
+        let failures = Arc::new([AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)]);
 
         // Each thread writes to a different table but they share the same WAL/pager
         let tables = ["t1", "t2", "t3"];
+        let spawned_at = Instant::now();
         let threads: Vec<_> = (0..6)
             .map(|i| {
                 let path = path_str.to_string();
                 let s = Arc::clone(&stop);
                 let ops = Arc::clone(&total_ops);
+                let ready = Arc::clone(&ready);
+                let failures = Arc::clone(&failures);
                 let table = tables[i % 3].to_string();
                 std::thread::spawn(move || {
                     asupersync::test_utils::run_test(|| async {
                         let conn = Connection::open(&path).await.expect("open");
+                        ready.fetch_add(1, Ordering::SeqCst);
                         let mut local_ops = 0u64;
                         while !s.load(Ordering::Relaxed) {
                             let row_id = (local_ops % 10) + 1;
-                            if conn.execute("BEGIN").await.is_ok() {
-                                if conn
-                                    .execute(&format!(
-                                        "UPDATE {table} SET val = val + 1 WHERE id = {row_id}"
-                                    ))
-                                    .await
-                                    .is_ok()
-                                    && conn.execute("COMMIT").await.is_ok()
-                                {
-                                    local_ops += 1;
-                                } else {
+                            if conn.execute("BEGIN").await.is_err() {
+                                failures[0].fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
+                            let update =
+                                format!("UPDATE {table} SET val = val + 1 WHERE id = {row_id}");
+                            let failed_stage = if conn.execute(&update).await.is_err() {
+                                Some(1)
+                            } else if conn.execute("COMMIT").await.is_err() {
+                                Some(2)
+                            } else {
+                                None
+                            };
+                            match failed_stage {
+                                None => local_ops += 1,
+                                Some(stage) => {
+                                    failures[stage].fetch_add(1, Ordering::Relaxed);
                                     conn.execute("ROLLBACK").await.ok();
                                 }
                             }
@@ -369,6 +389,21 @@ fn w4_cross_table_concurrent_updates() {
             })
             .collect();
 
+        // Independent deadline for connection startup, so a worker that never
+        // opens fails the test instead of hanging it.
+        while ready.load(Ordering::SeqCst) < threads.len() {
+            if spawned_at.elapsed() > OPEN_DEADLINE {
+                stop.store(true, Ordering::Relaxed);
+                panic!(
+                    "only {} of {} workers opened a connection within {OPEN_DEADLINE:?}",
+                    ready.load(Ordering::SeqCst),
+                    threads.len()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let all_ready_after = spawned_at.elapsed();
+
         std::thread::sleep(STRESS_DURATION);
         stop.store(true, Ordering::Relaxed);
 
@@ -378,7 +413,43 @@ fn w4_cross_table_concurrent_updates() {
         }
 
         let ops = total_ops.load(Ordering::Relaxed);
+        let [begin_failures, update_failures, commit_failures] = failures
+            .each_ref()
+            .map(|count| count.load(Ordering::Relaxed));
+        eprintln!(
+            "W4: {ops} cross-table concurrent updates, 6 threads, all ready after \
+             {all_ready_after:?}; failed begin={begin_failures} update={update_failures} \
+             commit={commit_failures}"
+        );
         assert!(ops > 0, "no operations completed — possible lost wakeup");
-        eprintln!("W4: {ops} cross-table concurrent updates, 6 threads");
+
+        // Every acknowledged COMMIT added exactly 1 to one row, and nothing
+        // else did, so the persisted sum must equal the acknowledged count.
+        let verify = Connection::open(path_str).await.expect("verify");
+        let mut persisted = 0_i64;
+        for table in tables {
+            let rows = verify
+                .query(&format!("SELECT COALESCE(SUM(val), 0) FROM {table}"))
+                .await
+                .expect("sum");
+            match rows[0].get(0) {
+                Some(SqliteValue::Integer(sum)) => persisted += *sum,
+                other => panic!("expected integer sum for {table}, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            persisted,
+            i64::try_from(ops).expect("op count fits i64"),
+            "persisted increments must equal acknowledged commits"
+        );
+        let integrity = verify
+            .query("PRAGMA integrity_check")
+            .await
+            .expect("integrity_check");
+        assert!(
+            matches!(integrity[0].get(0), Some(SqliteValue::Text(text)) if text.as_str() == "ok"),
+            "integrity_check after contention: {:?}",
+            integrity[0].get(0)
+        );
     });
 }

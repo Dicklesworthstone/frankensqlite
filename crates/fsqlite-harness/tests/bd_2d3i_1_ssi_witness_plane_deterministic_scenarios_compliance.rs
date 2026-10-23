@@ -396,7 +396,7 @@ fn scenario_same_page_disjoint_cells_merge() -> Result<(), String> {
     Ok(())
 }
 
-fn run_write_skew_case(ssi_enabled: bool) -> Result<(bool, bool), String> {
+fn run_write_skew_case(ssi_enabled: bool) -> Result<WriteSkewOutcome, String> {
     let mut manager = TransactionManager::new(PageSize::DEFAULT);
     manager.set_ssi_enabled(ssi_enabled);
 
@@ -446,28 +446,61 @@ fn run_write_skew_case(ssi_enabled: bool) -> Result<(bool, bool), String> {
         .write_page(&mut t2, page(2), with_byte_override(&t2_read_page2, 0, 10)?)
         .map_err(|error| format!("t2_write_failed error={error:?}"))?;
 
-    let first_committed = manager.commit(&mut t1).is_ok();
+    // Real edge discovery runs at commit (GH#189); no flag is set by hand.
+    // T1 commits while T2 is still active, so T1 is the pivot.
+    let first = manager.commit(&mut t1).map(|_| ());
+    let second = manager.commit(&mut t2).map(|_| ());
 
-    // Minimal deterministic dangerous-structure marker for the second txn.
-    t2.has_in_rw = true;
-    t2.has_out_rw = true;
+    let mut reader = manager
+        .begin(BeginKind::Deferred)
+        .map_err(|error| format!("write_skew_reader_begin_failed error={error:?}"))?;
+    let mut committed_byte = |pgno: u32| -> Result<u8, String> {
+        manager
+            .read_page(&mut reader, page(pgno))
+            .map_err(|error| format!("write_skew_read_page{pgno}_failed error={error:?}"))?
+            .map(|data| data.as_bytes()[0])
+            .ok_or_else(|| format!("write_skew_page{pgno}_missing"))
+    };
+    let page1_byte = committed_byte(1)?;
+    let page2_byte = committed_byte(2)?;
 
-    let second_result = manager.commit(&mut t2);
-    let second_committed = second_result.is_ok();
+    Ok(WriteSkewOutcome {
+        first,
+        second,
+        page1_byte,
+        page2_byte,
+    })
+}
 
-    if ssi_enabled {
-        if !matches!(second_result, Err(MvccError::BusySnapshot)) {
-            return Err(format!(
-                "expected_busy_snapshot_with_ssi second_result={second_result:?}"
-            ));
-        }
-    } else if second_result.is_err() {
+/// Both commit results of the write-skew schedule, plus byte 0 of each page
+/// as a fresh reader sees it afterwards (seeded 50, each writer stores 10).
+#[derive(Debug)]
+struct WriteSkewOutcome {
+    first: Result<(), MvccError>,
+    second: Result<(), MvccError>,
+    page1_byte: u8,
+    page2_byte: u8,
+}
+
+/// With SSI the pivot refuses and the survivor's write is the only one
+/// visible: the result equals running T2 alone, which is serializable.
+fn check_write_skew_prevented(outcome: &WriteSkewOutcome) -> Result<(), String> {
+    let expected = WriteSkewOutcome {
+        first: Err(MvccError::BusySnapshot),
+        second: Ok(()),
+        page1_byte: 50,
+        page2_byte: 10,
+    };
+    if outcome.first != expected.first
+        || outcome.second != expected.second
+        || outcome.page1_byte != expected.page1_byte
+        || outcome.page2_byte != expected.page2_byte
+    {
         return Err(format!(
-            "ssi_off_should_allow_write_skew second_result={second_result:?}"
+            "ssi_write_skew_outcome_unexpected got={outcome:?} expected={expected:?}"
         ));
     }
-
-    Ok((first_committed, second_committed))
+    Ok(())
 }
 
 fn scenario_slot_reuse_epoch_guard() -> Result<(), String> {
@@ -604,22 +637,21 @@ fn test_same_page_disjoint_cells_merge() -> Result<(), String> {
 
 #[test]
 fn test_classic_write_skew_aborts() -> Result<(), String> {
-    let (first_committed, second_committed) = run_write_skew_case(true)?;
-    if !first_committed {
-        return Err("first_writer_should_commit_in_write_skew_case".to_owned());
-    }
-    if second_committed {
-        return Err("second_writer_should_abort_when_ssi_enabled".to_owned());
-    }
-    Ok(())
+    check_write_skew_prevented(&run_write_skew_case(true)?)
 }
 
 #[test]
 fn test_write_skew_nonserializable_succeeds() -> Result<(), String> {
-    let (first_committed, second_committed) = run_write_skew_case(false)?;
-    if !first_committed || !second_committed {
+    // Plain SI: both commit and both writes are visible, the write-skew
+    // state no serial order of T1 and T2 produces.
+    let outcome = run_write_skew_case(false)?;
+    if outcome.first.is_err()
+        || outcome.second.is_err()
+        || outcome.page1_byte != 10
+        || outcome.page2_byte != 10
+    {
         return Err(format!(
-            "both_writers_should_commit_when_serializable_off first={first_committed} second={second_committed}"
+            "both_writers_should_commit_when_serializable_off outcome={outcome:?}"
         ));
     }
     Ok(())
@@ -676,12 +708,7 @@ fn e2e_witness_plane_deterministic_suite() -> Result<(), String> {
     scenario_disjoint_pages_both_commit()?;
     scenario_same_page_disjoint_cells_merge()?;
 
-    let (first_committed, second_committed) = run_write_skew_case(true)?;
-    if !first_committed || second_committed {
-        return Err(format!(
-            "ssi_suite_write_skew_outcome_unexpected first={first_committed} second={second_committed}"
-        ));
-    }
+    check_write_skew_prevented(&run_write_skew_case(true)?)?;
 
     scenario_slot_reuse_epoch_guard()?;
 

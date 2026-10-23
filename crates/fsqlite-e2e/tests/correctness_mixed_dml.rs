@@ -28,6 +28,9 @@ use tempfile::tempdir;
 const TRACK_U_BEAD_ID: &str = "bd-c9pxw";
 const TRACK_U_CRASH_HELPER_DB_PATH_ENV: &str = "FSQLITE_TRACK_U_CRASH_DB_PATH";
 const TRACK_U_CRASH_HELPER_TEST: &str = "bd_c9pxw_crash_helper_entrypoint";
+/// How the crash helper runs its UPDATE/DELETE tail: "acknowledged"
+/// autocommits, or "uncommitted" inside an explicit transaction.
+const TRACK_U_CRASH_HELPER_TAIL_ENV: &str = "FSQLITE_TRACK_U_CRASH_TAIL";
 
 /// Default mixed-DML workload size used in regular test runs.
 ///
@@ -225,13 +228,14 @@ async fn fsqlite_query_values(conn: &fsqlite::Connection, sql: &str) -> Vec<Vec<
         .collect()
 }
 
-fn spawn_track_u_crash_helper(db_path: &Path) {
+fn spawn_track_u_crash_helper(db_path: &Path, tail: &str) {
     let helper_status = Command::new(env::current_exe().expect("current_exe"))
         .arg("--exact")
         .arg(TRACK_U_CRASH_HELPER_TEST)
         .arg("--ignored")
         .arg("--nocapture")
         .env(TRACK_U_CRASH_HELPER_DB_PATH_ENV, db_path.as_os_str())
+        .env(TRACK_U_CRASH_HELPER_TAIL_ENV, tail)
         .status()
         .expect("spawn track u crash helper");
 
@@ -723,68 +727,107 @@ fn bd_c9pxw_delete_5k_rows_matches_oracle() {
     );
 }
 
+/// Crash the helper after its UPDATE/DELETE `tail`, then reopen with stock
+/// SQLite first and fsqlite second: both must see exactly `expected_rows`.
+async fn check_track_u_crash_reopen(
+    tail: &str,
+    expected_rows: &[Vec<SqlValue>],
+    expected_summary: &[Vec<SqlValue>],
+) {
+    const ORDERED_ROWS_SQL: &str = "SELECT id, val FROM dml_test ORDER BY id";
+    const SUMMARY_SQL: &str = "SELECT COUNT(*), MIN(id), MAX(id), MIN(val), MAX(val) FROM dml_test";
+
+    let tmp = tempdir().expect("tempdir");
+    let db_path = tmp.path().join("track_u_dirty_bitmap_crash.db");
+    let db_path_string = db_path.to_string_lossy().into_owned();
+
+    spawn_track_u_crash_helper(&db_path, tail);
+
+    let reopened_c = rusqlite::Connection::open(&db_path).expect("reopen csqlite db");
+    let integrity: String = reopened_c
+        .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+        .expect("csqlite integrity_check");
+    assert_eq!(
+        integrity, "ok",
+        "bead_id={TRACK_U_BEAD_ID} case=crash_recovery_integrity_check tail={tail}"
+    );
+    let actual_c = csqlite_query_values(&reopened_c, ORDERED_ROWS_SQL);
+
+    let reopened_f = fsqlite::Connection::open(&db_path_string)
+        .await
+        .expect("reopen fsqlite db");
+    assert!(
+        reopened_f.is_concurrent_mode_default(),
+        "bead_id={TRACK_U_BEAD_ID} case=crash_recovery_reopen_keeps_default_concurrent_mode"
+    );
+    let actual_f = fsqlite_query_values(&reopened_f, ORDERED_ROWS_SQL).await;
+    let summary_f = fsqlite_query_values(&reopened_f, SUMMARY_SQL).await;
+
+    assert_eq!(
+        actual_c, expected_rows,
+        "bead_id={TRACK_U_BEAD_ID} case=crash_recovery_csqlite_rows tail={tail}"
+    );
+    assert_eq!(
+        actual_f, expected_rows,
+        "bead_id={TRACK_U_BEAD_ID} case=crash_recovery_fsqlite_rows tail={tail}"
+    );
+    assert_eq!(
+        actual_f, actual_c,
+        "bead_id={TRACK_U_BEAD_ID} case=crash_recovery_reopen_matches_oracle tail={tail}"
+    );
+    assert_eq!(
+        summary_f, expected_summary,
+        "bead_id={TRACK_U_BEAD_ID} case=crash_recovery_summary tail={tail}"
+    );
+
+    eprintln!(
+        "INFO bead_id={TRACK_U_BEAD_ID} case=crash_recovery_update_delete_tail tail={tail} rows={}",
+        expected_rows.len()
+    );
+}
+
 #[test]
 fn bd_c9pxw_crash_recovery_discards_unflushed_update_delete_batch() {
+    // The tail runs inside an explicit transaction that never commits, so
+    // recovery must restore exactly the committed seed.
     asupersync::test_utils::run_test(|| async {
         const ROW_COUNT: i64 = 10_000;
-        const ORDERED_ROWS_SQL: &str = "SELECT id, val FROM dml_test ORDER BY id";
-        const SUMMARY_SQL: &str =
-            "SELECT COUNT(*), MIN(id), MAX(id), MIN(val), MAX(val) FROM dml_test";
-
-        let tmp = tempdir().expect("tempdir");
-        let db_path = tmp.path().join("track_u_dirty_bitmap_crash.db");
-        let db_path_string = db_path.to_string_lossy().into_owned();
-
-        spawn_track_u_crash_helper(&db_path);
-
-        let reopened_c = rusqlite::Connection::open(&db_path).expect("reopen csqlite db");
-        let integrity: String = reopened_c
-            .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
-            .expect("csqlite integrity_check");
-        assert_eq!(
-            integrity, "ok",
-            "bead_id={TRACK_U_BEAD_ID} case=crash_recovery_integrity_check"
-        );
-        let actual_c = csqlite_query_values(&reopened_c, ORDERED_ROWS_SQL);
-
-        let reopened_f = fsqlite::Connection::open(&db_path_string)
-            .await
-            .expect("reopen fsqlite db");
-        assert!(
-            reopened_f.is_concurrent_mode_default(),
-            "bead_id={TRACK_U_BEAD_ID} case=crash_recovery_reopen_keeps_default_concurrent_mode"
-        );
-        let actual_f = fsqlite_query_values(&reopened_f, ORDERED_ROWS_SQL).await;
-        let summary_f = fsqlite_query_values(&reopened_f, SUMMARY_SQL).await;
-
-        let expected_rows = expected_track_u_rows(ROW_COUNT);
-        assert_eq!(
-            actual_c, expected_rows,
-            "bead_id={TRACK_U_BEAD_ID} case=crash_recovery_csqlite_restores_committed_prefix_only"
-        );
-        assert_eq!(
-            actual_f, expected_rows,
-            "bead_id={TRACK_U_BEAD_ID} case=crash_recovery_fsqlite_restores_committed_prefix_only"
-        );
-        assert_eq!(
-            actual_f, actual_c,
-            "bead_id={TRACK_U_BEAD_ID} case=crash_recovery_reopen_matches_oracle"
-        );
-        assert_eq!(
-            summary_f,
-            vec![vec![
+        check_track_u_crash_reopen(
+            "uncommitted",
+            &expected_track_u_rows(ROW_COUNT),
+            &[vec![
                 SqlValue::Integer(ROW_COUNT),
                 SqlValue::Integer(1),
                 SqlValue::Integer(ROW_COUNT),
                 SqlValue::Integer(1),
                 SqlValue::Integer(ROW_COUNT),
             ]],
-            "bead_id={TRACK_U_BEAD_ID} case=crash_recovery_summary_matches_seeded_state"
-        );
+        )
+        .await;
+    });
+}
 
-        eprintln!(
-            "INFO bead_id={TRACK_U_BEAD_ID} case=crash_recovery_unflushed_update_delete_batch rows={ROW_COUNT}"
-        );
+#[test]
+fn bd_c9pxw_crash_recovery_keeps_acknowledged_autocommit_update_delete() {
+    // GH#486: an autocommit acknowledged under synchronous=FULL is a durable
+    // commit, so the crash must keep both statements: ids 5,001..10,000 with
+    // val = id + 100,000, as stock SQLite's first reopen reports.
+    asupersync::test_utils::run_test(|| async {
+        let expected_rows: Vec<_> = (5_001..=10_000_i64)
+            .map(|id| vec![SqlValue::Integer(id), SqlValue::Integer(id + 100_000)])
+            .collect();
+        check_track_u_crash_reopen(
+            "acknowledged",
+            &expected_rows,
+            &[vec![
+                SqlValue::Integer(5_000),
+                SqlValue::Integer(5_001),
+                SqlValue::Integer(10_000),
+                SqlValue::Integer(105_001),
+                SqlValue::Integer(110_000),
+            ]],
+        )
+        .await;
     });
 }
 
@@ -840,6 +883,16 @@ fn bd_c9pxw_crash_helper_entrypoint() {
             .await
             .expect("commit seed transaction");
 
+        // GH#486: only an explicit transaction leaves the tail uncommitted;
+        // as autocommits, each statement is acknowledged and durable.
+        if matches!(
+            env::var(TRACK_U_CRASH_HELPER_TAIL_ENV).as_deref(),
+            Ok("uncommitted")
+        ) {
+            conn.execute("BEGIN;")
+                .await
+                .expect("begin uncommitted tail transaction");
+        }
         conn.execute(UPDATE_SQL)
             .await
             .expect("queue retained 10k update batch");

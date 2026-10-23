@@ -47,7 +47,12 @@ const SPEC_EXPECTED_CRATES: [&str; 24] = [
 ];
 
 /// Workspace crates present in Cargo metadata but not yet listed in spec §8.1.
-const WORKSPACE_ONLY_CRATES: [&str; 3] = ["fsqlite-observability", "fsqlite-c-api", "fsqlite-wasm"];
+const WORKSPACE_ONLY_CRATES: [&str; 4] = [
+    "fsqlite-observability",
+    "fsqlite-c-api",
+    "fsqlite-wasm",
+    "beads-doctor",
+];
 
 const EXPECTED_WORKSPACE_CRATE_COUNT: usize =
     SPEC_EXPECTED_CRATES.len() + WORKSPACE_ONLY_CRATES.len();
@@ -116,6 +121,8 @@ fn layer_assignments() -> HashMap<&'static str, u8> {
     m.insert("fsqlite-harness", 9);
     m.insert("fsqlite-c-api", 9);
     m.insert("fsqlite-wasm", 9);
+    // A standalone tool with no workspace dependencies.
+    m.insert("beads-doctor", 9);
     m
 }
 
@@ -325,6 +332,119 @@ fn fsqlite_cargo_toml() -> Result<String, String> {
     })
 }
 
+fn parse_manifest(text: &str, label: &str) -> Result<toml::Table, String> {
+    text.parse()
+        .map_err(|error| format!("bead_id={DEP_BUILD_BEAD_ID} case=parse_{label} error={error}"))
+}
+
+/// The members of one `[features]` entry, or `None` if it is missing or not
+/// an array of strings.
+fn feature_members<'a>(features: &'a toml::Table, name: &str) -> Option<Vec<&'a str>> {
+    features
+        .get(name)?
+        .as_array()?
+        .iter()
+        .map(toml::Value::as_str)
+        .collect()
+}
+
+/// Facade feature contract (GH#481: check what the manifest means, not how it
+/// is formatted). Each extension feature links its crate, the default build is
+/// native plus the extensions a default engine has always registered
+/// (fsqlite#356 added `icu` and `misc` there), `raptorq` and `mvcc` are empty
+/// markers, and no feature lists a member twice.
+fn facade_feature_violations(manifest: &toml::Table) -> Vec<String> {
+    let Some(features) = manifest.get("features").and_then(toml::Value::as_table) else {
+        return vec!["no [features] table".to_owned()];
+    };
+    let mut violations = Vec::new();
+    for extension in ["json", "fts5", "fts3", "rtree", "session", "icu", "misc"] {
+        let dependency = format!("dep:fsqlite-ext-{extension}");
+        let members = feature_members(features, extension);
+        if !members
+            .as_ref()
+            .is_some_and(|members| members.contains(&dependency.as_str()))
+        {
+            violations.push(format!("{extension} must enable {dependency}: {members:?}"));
+        }
+    }
+    let default = feature_members(features, "default").unwrap_or_default();
+    for required in [
+        "native",
+        "linux-asupersync-uring",
+        "json",
+        "fts5",
+        "rtree",
+        "icu",
+        "misc",
+    ] {
+        if !default.contains(&required) {
+            violations.push(format!("default must include {required}: {default:?}"));
+        }
+    }
+    for marker in ["raptorq", "mvcc"] {
+        let members = feature_members(features, marker);
+        if members.as_deref() != Some(&[][..]) {
+            violations.push(format!("{marker} must be an empty marker: {members:?}"));
+        }
+    }
+    for name in features.keys() {
+        let members = feature_members(features, name).unwrap_or_default();
+        let distinct: BTreeSet<_> = members.iter().collect();
+        if distinct.len() != members.len() {
+            violations.push(format!("{name} lists a member twice: {members:?}"));
+        }
+    }
+    violations
+}
+
+/// The browser package script's default for the release opt-level.
+#[allow(clippy::literal_string_with_formatting_args)] // shell `${VAR:-z}`, not a format string
+const WASM_RELEASE_OPT_LEVEL_DEFAULT: &str =
+    r#"CARGO_PROFILE_RELEASE_OPT_LEVEL="${CARGO_PROFILE_RELEASE_OPT_LEVEL:-z}""#;
+
+/// Release policy: native release builds optimize for speed (86945ae73), the
+/// browser package script keeps its size override, and `release-perf` stays
+/// a speed profile inheriting `release`.
+fn release_profile_violations(workspace: &toml::Table) -> Result<Vec<String>, String> {
+    let profile = |name: &str| {
+        workspace
+            .get("profile")
+            .and_then(|profiles| profiles.get(name))
+            .and_then(toml::Value::as_table)
+    };
+    let mut violations = Vec::new();
+    let mut expect = |profile_name: &str, key: &str, expected: toml::Value| {
+        let actual = profile(profile_name).and_then(|table| table.get(key));
+        if actual != Some(&expected) {
+            violations.push(format!(
+                "[profile.{profile_name}] {key} must be {expected}: {actual:?}"
+            ));
+        }
+    };
+    expect("release", "opt-level", toml::Value::Integer(3));
+    expect("release", "lto", toml::Value::Boolean(true));
+    expect("release", "codegen-units", toml::Value::Integer(1));
+    expect("release", "panic", toml::Value::String("abort".to_owned()));
+    expect("release", "strip", toml::Value::Boolean(true));
+    expect(
+        "release-perf",
+        "inherits",
+        toml::Value::String("release".to_owned()),
+    );
+    expect("release-perf", "opt-level", toml::Value::Integer(3));
+    let script_path = workspace_root().join("scripts/build_fsqlite_wasm_package.sh");
+    let script = fs::read_to_string(&script_path)
+        .map_err(|error| format!("read {}: {error}", script_path.display()))?;
+    if !script.contains(WASM_RELEASE_OPT_LEVEL_DEFAULT) {
+        violations.push(format!(
+            "{} must default the wasm release opt-level to z",
+            script_path.display()
+        ));
+    }
+    Ok(violations)
+}
+
 fn spec_section_8_3() -> Result<String, String> {
     let path = workspace_root().join("docs/planning/COMPREHENSIVE_SPEC_FOR_FRANKENSQLITE_V1.md");
     let spec = fs::read_to_string(&path).map_err(|error| {
@@ -417,7 +537,7 @@ fn concise_description_allowed(crate_name: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_workspace_crate_count_is_27() {
+fn test_workspace_crate_count_matches_inventory() {
     let metadata = cargo_metadata_cached();
     let members = workspace_member_names(metadata);
 
@@ -620,15 +740,6 @@ fn test_build_configuration_matches_spec() -> Result<(), String> {
         "[workspace.lints.clippy]",
         "pedantic = { level = \"deny\", priority = -1 }",
         "nursery = { level = \"deny\", priority = -1 }",
-        "[profile.release]",
-        "opt-level = \"z\"",
-        "lto = true",
-        "codegen-units = 1",
-        "panic = \"abort\"",
-        "strip = true",
-        "[profile.release-perf]",
-        "inherits = \"release\"",
-        "opt-level = 3",
     ];
 
     let missing = required_markers
@@ -640,6 +751,13 @@ fn test_build_configuration_matches_spec() -> Result<(), String> {
     assert!(
         missing.is_empty(),
         "bead_id={ARCH_BEAD_ID} case=build_configuration_matches_spec missing={missing:?}"
+    );
+    let profile_violations =
+        release_profile_violations(&parse_manifest(&cargo_toml, "workspace_cargo_toml")?)?;
+    assert!(
+        profile_violations.is_empty(),
+        "bead_id={ARCH_BEAD_ID} case=build_configuration_release_profiles \
+         violations={profile_violations:?}"
     );
 
     Ok(())
@@ -684,30 +802,12 @@ fn test_forbidden_dependency_edges() {
 
 #[test]
 fn test_feature_flags_declared_on_fsqlite_manifest() -> Result<(), String> {
-    let manifest = fsqlite_cargo_toml()?;
-    let required_markers = [
-        "[features]",
-        "default = [\"native\", \"linux-asupersync-uring\", \"json\", \"fts5\", \"rtree\"]",
-        "json = [\"dep:fsqlite-ext-json\"]",
-        "fts5 = [\"dep:fsqlite-ext-fts5\"]",
-        "fts3 = [\"dep:fsqlite-ext-fts3\"]",
-        "rtree = [\"dep:fsqlite-ext-rtree\"]",
-        "session = [\"dep:fsqlite-ext-session\"]",
-        "icu = [\"dep:fsqlite-ext-icu\"]",
-        "misc = [\"dep:fsqlite-ext-misc\"]",
-        "raptorq = []",
-        "mvcc = []",
-    ];
-
-    let missing = required_markers
-        .iter()
-        .copied()
-        .filter(|marker| !manifest.contains(marker))
-        .collect::<Vec<_>>();
+    let manifest = parse_manifest(&fsqlite_cargo_toml()?, "fsqlite_cargo_toml")?;
+    let violations = facade_feature_violations(&manifest);
 
     assert!(
-        missing.is_empty(),
-        "bead_id={DEP_BUILD_BEAD_ID} case=feature_flags_declared missing={missing:?}"
+        violations.is_empty(),
+        "bead_id={DEP_BUILD_BEAD_ID} case=feature_flags_declared violations={violations:?}"
     );
 
     Ok(())
@@ -715,28 +815,12 @@ fn test_feature_flags_declared_on_fsqlite_manifest() -> Result<(), String> {
 
 #[test]
 fn test_release_profiles_exist() -> Result<(), String> {
-    let workspace_manifest = workspace_cargo_toml()?;
-    let required_markers = [
-        "[profile.release]",
-        "opt-level = \"z\"",
-        "lto = true",
-        "codegen-units = 1",
-        "panic = \"abort\"",
-        "strip = true",
-        "[profile.release-perf]",
-        "inherits = \"release\"",
-        "opt-level = 3",
-    ];
-
-    let missing = required_markers
-        .iter()
-        .copied()
-        .filter(|marker| !workspace_manifest.contains(marker))
-        .collect::<Vec<_>>();
+    let workspace_manifest = parse_manifest(&workspace_cargo_toml()?, "workspace_cargo_toml")?;
+    let violations = release_profile_violations(&workspace_manifest)?;
 
     assert!(
-        missing.is_empty(),
-        "bead_id={DEP_BUILD_BEAD_ID} case=release_profiles_exist missing={missing:?}"
+        violations.is_empty(),
+        "bead_id={DEP_BUILD_BEAD_ID} case=release_profiles_exist violations={violations:?}"
     );
 
     Ok(())
@@ -754,29 +838,34 @@ fn test_bd_2v8x_unit_compliance_gate() -> Result<(), String> {
 
 #[test]
 fn prop_bd_2v8x_structure_compliance() -> Result<(), String> {
-    let manifest = fsqlite_cargo_toml()?;
-    let expected_features = [
-        "default = [\"native\", \"linux-asupersync-uring\", \"json\", \"fts5\", \"rtree\"]",
-        "json = [\"dep:fsqlite-ext-json\"]",
-        "fts5 = [\"dep:fsqlite-ext-fts5\"]",
-        "fts3 = [\"dep:fsqlite-ext-fts3\"]",
-        "rtree = [\"dep:fsqlite-ext-rtree\"]",
-        "session = [\"dep:fsqlite-ext-session\"]",
-        "icu = [\"dep:fsqlite-ext-icu\"]",
-        "misc = [\"dep:fsqlite-ext-misc\"]",
-        "raptorq = []",
-        "mvcc = []",
-    ];
-
-    let duplicates = expected_features
-        .iter()
-        .copied()
-        .filter(|feature_line| manifest.match_indices(feature_line).count() != 1)
-        .collect::<Vec<_>>();
+    // TOML itself rejects a feature defined twice. Beyond that, every
+    // `dep:NAME` a feature enables must be an optional dependency, or the
+    // feature cannot gate it.
+    let manifest = parse_manifest(&fsqlite_cargo_toml()?, "fsqlite_cargo_toml")?;
+    let features = manifest
+        .get("features")
+        .and_then(toml::Value::as_table)
+        .ok_or("fsqlite Cargo.toml has no [features]")?;
+    let dependencies = manifest.get("dependencies").and_then(toml::Value::as_table);
+    let mut ungated = Vec::new();
+    for name in features.keys() {
+        for member in feature_members(features, name).unwrap_or_default() {
+            let Some(dependency) = member.strip_prefix("dep:") else {
+                continue;
+            };
+            let optional = dependencies
+                .and_then(|dependencies| dependencies.get(dependency))
+                .and_then(|spec| spec.get("optional"))
+                .and_then(toml::Value::as_bool);
+            if optional != Some(true) {
+                ungated.push(format!("{name} -> {member}"));
+            }
+        }
+    }
 
     assert!(
-        duplicates.is_empty(),
-        "bead_id={DEP_BUILD_BEAD_ID} case=structure_compliance duplicate_or_missing={duplicates:?}"
+        ungated.is_empty(),
+        "bead_id={DEP_BUILD_BEAD_ID} case=structure_compliance non_optional_dep_features={ungated:?}"
     );
 
     Ok(())

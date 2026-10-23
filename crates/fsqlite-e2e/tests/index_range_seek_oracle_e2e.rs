@@ -120,6 +120,19 @@ async fn opcodes(conn: &Connection, sql: &str) -> Vec<String> {
         .collect()
 }
 
+/// `EXPLAIN QUERY PLAN` detail column for `sql`.
+async fn eqp(conn: &Connection, sql: &str) -> Vec<String> {
+    conn.query(&format!("EXPLAIN QUERY PLAN {sql}"))
+        .await
+        .unwrap_or_else(|e| panic!("EQP `{sql}`: {e}"))
+        .iter()
+        .map(|row| match row.values().get(3) {
+            Some(SqliteValue::Text(detail)) => detail.to_string(),
+            other => panic!("EQP `{sql}`: unexpected detail column {other:?}"),
+        })
+        .collect()
+}
+
 /// The index-range scan (`codegen_select_index_range_scan`) always dereferences the
 /// index entry's rowid via `IdxRowid` on a rowid table (for covering reads and table
 /// lookups alike), while a full table scan (`codegen_select_full_scan`) never emits it.
@@ -252,12 +265,10 @@ fn index_range_seek_emits_seek_for_numeric_literals() {
             );
         }
 
-        // Declined shapes keep the correct full scan (no unhinted index walk): NOT INDEXED,
-        // a forced unrelated index, and a text literal on a numeric column. In particular,
-        // INDEXED BY idx_t_w must not be silently replaced by the idx_t_k range heuristic.
+        // Declined shapes keep the correct full scan (no unhinted index walk): NOT INDEXED
+        // and a text literal on a numeric column.
         for sql in [
             "SELECT id FROM t NOT INDEXED WHERE k BETWEEN 2 AND 5",
-            "SELECT id FROM t INDEXED BY idx_t_w WHERE k BETWEEN 2 AND 5",
             "SELECT id FROM t WHERE k > '3'",
         ] {
             let ops = opcodes(&f, sql).await;
@@ -266,6 +277,25 @@ fn index_range_seek_emits_seek_for_numeric_literals() {
                 "declined range must NOT seek (keeps the full scan) for `{sql}`; ops = {ops:?}"
             );
         }
+
+        // INDEXED BY idx_t_w must not be silently replaced by the idx_t_k range heuristic.
+        // Honoring it walks idx_t_w end to end (Rewind/Next, with IdxRowid table lookups, so
+        // `uses_index` is true by design) and filters `k` as a residual: no range bound is
+        // set, and idx_t_w stays the selected index (GH#473). Its rows are compared with
+        // SQLite in `index_range_seek_matches_sqlite`.
+        let sql = "SELECT id FROM t INDEXED BY idx_t_w WHERE k BETWEEN 2 AND 5";
+        let ops = opcodes(&f, sql).await;
+        assert!(
+            !ops.iter()
+                .any(|o| matches!(o.as_str(), "SeekGE" | "SeekGT" | "SeekLE" | "SeekLT")),
+            "a forced unrelated index must not take a range seek for `{sql}`; ops = {ops:?}"
+        );
+        let plan = eqp(&f, sql).await;
+        assert!(
+            plan.iter().any(|detail| detail.contains("INDEX idx_t_w"))
+                && !plan.iter().any(|detail| detail.contains("idx_t_k")),
+            "INDEXED BY idx_t_w must stay the selected index for `{sql}`; plan = {plan:?}"
+        );
     });
 }
 
