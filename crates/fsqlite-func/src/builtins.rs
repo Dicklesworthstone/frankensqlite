@@ -2625,6 +2625,16 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<Option<String>> {
             }
         }
 
+        // Length modifier: stock accepts `l` or `ll` before the conversion
+        // (printf.c `case 'l'`). It only selects the C varargs width there; SQL
+        // arguments are already 64-bit, so `%lld` formats exactly like `%d`.
+        if i < chars.len() && chars[i] == 'l' {
+            i += 1;
+            if i < chars.len() && chars[i] == 'l' {
+                i += 1;
+            }
+        }
+
         if i >= chars.len() {
             // A `%` that consumed flags/width/precision but then hit EOF with no
             // conversion char (printf('%5'), printf('%-'), printf('%.3'), ...) is
@@ -3060,11 +3070,16 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<Option<String>> {
             _ => {
                 // Unsupported/unknown conversion specifier (e.g. `%a` hex-float,
                 // or a positional `%2$s` whose `$` lands here after `2` is parsed
-                // as the field width): stock SQLite NULLs the ENTIRE printf()/
-                // format() result rather than emitting the raw `%<spec>`. The
-                // supported set above is exactly SQLite's documented conversions
+                // as the field width): stock's sqlite3_str_vappendf stops at it
+                // and keeps the text accumulated so far (printf('x%a', 1) == 'x'),
+                // never emitting the raw `%<spec>`. Like an incomplete conversion,
+                // an empty accumulation finishes as SQL NULL. The supported set
+                // above is exactly SQLite's documented conversions
                 // (% n d i u f e E g G s z q Q w x X o c). bd-printf-unsupported-spec-null.
-                return Ok(None);
+                if result.is_empty() {
+                    return Ok(None);
+                }
+                break;
             }
         }
         // Suppress unused warnings
@@ -6853,6 +6868,56 @@ mod tests {
             run(&[txt("%*.*f"), int(10), int(2), flt(3.14159)]),
             some("      3.14")
         );
+    }
+
+    #[test]
+    fn test_printf_length_modifiers_and_unknown_spec_prefix() {
+        // Oracle: sqlite3 3.52.0 printf.c and 3.54.0. `l`/`ll` are accepted
+        // length modifiers and change nothing for SQL arguments; an unknown
+        // conversion stops formatting but keeps the text accumulated so far.
+        let f = FormatFunc;
+        let run = |args: &[SqliteValue]| -> Option<String> {
+            match f.invoke(args).unwrap() {
+                SqliteValue::Text(s) => Some(s.as_str().to_owned()),
+                SqliteValue::Null => None,
+                other => panic!("expected text or null, got {other:?}"),
+            }
+        };
+        let txt = |s: &str| SqliteValue::Text(SmallText::from_string(s));
+        let int = SqliteValue::Integer;
+        let flt = SqliteValue::Float;
+        let some = |s: &str| Some(s.to_owned());
+
+        assert_eq!(
+            run(&[txt("%lld"), int(i64::MAX)]),
+            some("9223372036854775807")
+        );
+        assert_eq!(run(&[txt("%ld|%li"), int(5), int(-5)]), some("5|-5"));
+        assert_eq!(run(&[txt("%lu"), int(-1)]), some("18446744073709551615"));
+        assert_eq!(
+            run(&[txt("%llx|%lX|%llo"), int(255), int(255), int(8)]),
+            some("ff|FF|10")
+        );
+        assert_eq!(
+            run(&[
+                txt("%5ld|%-5lld|%05ld|%.3ld|%,lld"),
+                int(42),
+                int(42),
+                int(42),
+                int(7),
+                int(1_234_567)
+            ]),
+            some("   42|42   |00042|007|1,234,567")
+        );
+        assert_eq!(run(&[txt("%lld rows"), int(3)]), some("3 rows"));
+        assert_eq!(run(&[txt("%lf"), flt(1.5)]), some("1.500000"));
+        // Unknown conversion after accumulated text: stock returns the prefix.
+        assert_eq!(run(&[txt("x%a"), int(1)]), some("x"));
+        assert_eq!(run(&[txt("ab%d|%y|tail"), int(5)]), some("ab5|"));
+        assert_eq!(run(&[txt("a%2$s"), int(1), int(2)]), some("a"));
+        // Nothing accumulated: NULL, as before (3.52/3.53 finish an empty
+        // accumulator as NULL).
+        assert_eq!(run(&[txt("%a"), int(1)]), None);
     }
 
     #[test]

@@ -5,15 +5,17 @@
 //! (bundled SQLite 3.53, the authoritative oracle — the sqlite3 CLI 3.46.1 is a
 //! known float-text outlier, but the specifier partition is stable across both).
 //!
-//! Three contracts:
+//! Four contracts:
 //!   1. Supported specifiers (% n d i u f e E g G s z q Q w x X o c p r) format
 //!      identically to stock — INCLUDING the two frank previously emitted as raw
 //!      literals: `%p` (== `%X`, uppercase hex) and `%r` (ordinal, 255->'255th').
-//!   2. Unsupported/unknown specifiers (a, b, h, j, k, l, m, t, v, y and the
-//!      unsupported uppercase set) NULL the whole call — frank previously emitted
-//!      a raw `%<spec>` literal.
-//!   3. Positional args (`%2$s`) NULL the whole call (the `$` reaches the
+//!   2. Unsupported/unknown specifiers (a, b, h, j, k, m, t, v, y and the
+//!      unsupported uppercase set) stop formatting: stock keeps the text
+//!      accumulated before them, and an empty accumulation is NULL — frank
+//!      previously emitted a raw `%<spec>` literal, then NULLed even a prefix.
+//!   3. Positional args (`%2$s`) behave the same way (the `$` reaches the
 //!      conversion slot after the digits parse as field width).
+//!   4. `l` and `ll` are length modifiers (`%lld` == `%d`), not conversions.
 //!
 //! Compared via `SELECT quote(printf(...))` so NULL vs a value is unambiguous
 //! (quote(NULL) yields the text 'NULL').
@@ -126,6 +128,77 @@ fn printf_supported_controls_unregressed() {
             "%E", "%g", "%G", "%n", "%%", "%!d", "%,d", "%+d", "%05d", "%-8d|", "%5.2f", "%.0f",
         ] {
             sqls.push(format!("SELECT quote(printf('{f}', 1234))"));
+        }
+        assert_all_agree(&sqls).await;
+    });
+}
+
+#[test]
+fn printf_length_modifier_is_a_no_op_like_stock() {
+    asupersync::test_utils::run_test(|| async {
+        // (4): for every supported conversion, flag/width/precision prefix and
+        // argument type, `%<spec>l<conv>` and `%<spec>ll<conv>` must render
+        // exactly like `%<spec><conv>` — on stock (sanity check of the premise)
+        // and on frank. Frank-vs-stock parity of the unmodified forms is the job
+        // of the tests above, so a pre-existing divergence there cannot make
+        // this property test fail for an unrelated reason.
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        let mut failures = Vec::new();
+        let mut checked = 0;
+        for conv in ["d", "i", "u", "x", "X", "o", "c", "s", "q", "f", "e", "g"] {
+            for spec in ["", "5", "-5", "05", ".3", ",", "+"] {
+                for arg in ["9223372036854775807", "-1", "42", "3.5", "'txt'"] {
+                    let plain = format!("SELECT quote(printf('<%{spec}{conv}>', {arg}))");
+                    let frank_plain = frank(&f, &plain).await;
+                    let stock_plain = oracle(&r, &plain);
+                    for modifier in ["l", "ll"] {
+                        let sql =
+                            format!("SELECT quote(printf('<%{spec}{modifier}{conv}>', {arg}))");
+                        checked += 1;
+                        let stock = oracle(&r, &sql);
+                        if stock != stock_plain {
+                            failures.push(format!(
+                                "  premise: {sql}\n    stock={stock} vs {stock_plain}"
+                            ));
+                        }
+                        let fv = frank(&f, &sql).await;
+                        if fv != frank_plain {
+                            failures.push(format!(
+                                "  {sql}\n    frank={fv} but without the modifier {frank_plain}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        f.close().await.unwrap();
+        eprintln!(
+            "event=printf_length_modifier_property checked={checked} failures={}",
+            failures.len()
+        );
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    });
+}
+
+#[test]
+fn printf_length_modifiers_and_text_before_unknown_spec_match_stock() {
+    asupersync::test_utils::run_test(|| async {
+        let mut sqls: Vec<String> = [
+            "SELECT quote(printf('%lld', 9223372036854775807))",
+            "SELECT quote(printf('%ld|%li|%lu|%llu', 5, -5, -1, 42))",
+            "SELECT quote(printf('%llx|%lX|%llo', 255, 255, 8))",
+            "SELECT quote(printf('%5ld|%-5lld|%05ld|%.3ld|%,lld', 42, 42, 42, 7, 1234567))",
+            "SELECT quote(printf('%lf|%lle|%lg|%ls|%lq', 1.5, 2.5, 3.5, 'x', 'it''s'))",
+            "SELECT quote(format('%lld rows', 3))",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+        // (2)+(3): text accumulated before an unknown or positional conversion
+        // is kept; only an empty accumulation is NULL.
+        for p in ["x%a", "ab%d|%y|tail", "a%2$s", "%d%k%d", "pre %lly", "%a"] {
+            sqls.push(format!("SELECT quote(printf('{p}', 5, 6))"));
         }
         assert_all_agree(&sqls).await;
     });
