@@ -382,6 +382,73 @@ impl OrderedDelivery {
         settle(transaction, cx, result).await
     }
 
+    /// Prepare a bounded contiguous source batch from ONE committed SQL snapshot.
+    ///
+    /// Messages are chained in source order: every envelope after the first uses
+    /// the preceding envelope ID as its predecessor. The source transaction ends
+    /// before this method returns, so no SQL lock or snapshot spans transport.
+    /// This only prepares messages; receiver application and source ACK policy
+    /// remain caller-owned and no distributed transaction is implied.
+    pub async fn next_pending_batch(
+        &self,
+        conn: &mut Connection,
+        cx: &Cx,
+        max_messages: usize,
+        max_batch_bytes: usize,
+        max_message_bytes: usize,
+    ) -> DeliveryResult<Vec<OrderedMessage>> {
+        if max_messages == 0 || max_messages > 256 {
+            return Err(CaptureError::Input(
+                "delivery batch count must be in 1..=256",
+            )
+            .into());
+        }
+        if max_batch_bytes == 0 || max_batch_bytes > super::MAX_PAYLOAD {
+            return Err(CaptureError::Input(
+                "delivery batch byte bound must be in 1..64 MiB",
+            )
+            .into());
+        }
+        if max_message_bytes == 0 || max_message_bytes > super::MAX_PAYLOAD {
+            return Err(CaptureError::Input(
+                "delivery message bound must be in 1..64 MiB",
+            )
+            .into());
+        }
+        checkpoint(cx)?;
+        let transaction = conn.transaction().await?;
+        let result = async {
+            Self::validate_route(&transaction, cx).await?;
+            let progress = self.load_progress(&transaction).await?;
+            let count = max_messages.min(progress.pending_messages);
+            let mut messages = Vec::new();
+            messages
+                .try_reserve_exact(count)
+                .map_err(|_| FrankenError::OutOfMemory)?;
+            let mut previous = progress.acknowledged;
+            let mut batch_bytes = 0_usize;
+            for _ in 0..count {
+                checkpoint(cx)?;
+                let message = self
+                    .message_after(&transaction, cx, previous, max_message_bytes)
+                    .await?;
+                let body_bytes = message.body().len();
+                if body_bytes > max_batch_bytes.saturating_sub(batch_bytes) {
+                    if messages.is_empty() {
+                        return Err(CaptureError::Limit("delivery first batch bytes").into());
+                    }
+                    break;
+                }
+                batch_bytes += body_bytes;
+                previous = message.expected_checkpoint();
+                messages.push(message);
+            }
+            Ok(messages)
+        }
+        .await;
+        settle(transaction, cx, result).await
+    }
+
     // Both routes use the same codec and retained queue. The caller validates
     // the predecessor and establishes a pending successor in this transaction.
     async fn message_after(
@@ -762,6 +829,79 @@ mod tests {
                 .unwrap(),
                 "captured"
             );
+        });
+    }
+
+    #[test]
+    fn pending_batch_uses_one_contiguous_source_snapshot_and_exact_bounds() {
+        asupersync::test_utils::run_test(|| async {
+            let route = route();
+            let cx = Cx::new();
+            let mut source = database().await;
+            route.initialize(&mut source, &cx).await.unwrap();
+            for id in 1..=3 {
+                insert(&mut source, &cx, &route, id).await;
+            }
+
+            let all = route
+                .next_pending_batch(&mut source, &cx, 3, 64 * 1024, 64 * 1024)
+                .await
+                .unwrap();
+            assert_eq!(all.len(), 3);
+            for (index, message) in all.iter().enumerate() {
+                assert_eq!(
+                    message.envelope().sequence(),
+                    u64::try_from(index + 1).unwrap()
+                );
+                if index == 0 {
+                    assert_eq!(message.envelope().previous(), route.baseline().tip);
+                } else {
+                    assert_eq!(
+                        message.envelope().previous(),
+                        all[index - 1].envelope().id()
+                    );
+                }
+            }
+
+            let first_bytes = all[0].body().len();
+            let bounded = route
+                .next_pending_batch(&mut source, &cx, 3, first_bytes.max(1), 64 * 1024)
+                .await
+                .unwrap();
+            assert_eq!(bounded.len(), 1);
+            assert_eq!(bounded[0].envelope(), all[0].envelope());
+            assert_eq!(bounded[0].body(), all[0].body());
+
+            let by_count = route
+                .next_pending_batch(&mut source, &cx, 2, 64 * 1024, 64 * 1024)
+                .await
+                .unwrap();
+            assert_eq!(by_count.len(), 2);
+            assert_eq!(
+                by_count[1].envelope().previous(),
+                by_count[0].envelope().id()
+            );
+
+            assert!(
+                route
+                    .next_pending_batch(&mut source, &cx, 0, 64 * 1024, 64 * 1024)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                route
+                    .next_pending_batch(&mut source, &cx, 257, 64 * 1024, 64 * 1024)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                route
+                    .next_pending_batch(&mut source, &cx, 1, 0, 64 * 1024)
+                    .await
+                    .is_err()
+            );
+
+            source.close().await.unwrap();
         });
     }
 
