@@ -508,24 +508,29 @@ fn immediate_transaction_commit_survives_a_cross_process_autocommit_writer() {
     // Stock: A commits after its 2 s hold, B's insert waits behind it.
     // fsqlite 0.4.12: A's COMMIT failed `database is busy` at ~7 s and its row
     // was rolled back while B took ~6.6 s (GH#519 lock-order inversion).
-    for backend in ["stock", "fsqlite"] {
-        let [a, b] = run_immediate(backend);
-        assert!(
-            a.0,
-            "{backend}: the IMMEDIATE transaction must commit: {}",
-            a.2
-        );
-        assert!(b.0, "{backend}: the autocommit writer must commit: {}", b.2);
-        assert!(
-            a.1 < IMMEDIATE_HOLD + Duration::from_millis(1500),
-            "{backend}: A's COMMIT must not wait on B: {}",
-            a.2
-        );
-        assert!(
-            b.1 < IMMEDIATE_HOLD + Duration::from_millis(2500),
-            "{backend}: B waits only for A: {}",
-            b.2
-        );
+    let shape_failure = |[a, b]: &[(bool, Duration, String); 2]| {
+        if !a.0 {
+            Some(format!("the IMMEDIATE transaction must commit: {}", a.2))
+        } else if !b.0 {
+            Some(format!("the autocommit writer must commit: {}", b.2))
+        } else if a.1 >= IMMEDIATE_HOLD + Duration::from_millis(1500) {
+            Some(format!("A's COMMIT must not wait on B: {}", a.2))
+        } else if b.1 >= IMMEDIATE_HOLD + Duration::from_millis(2500) {
+            Some(format!("B waits only for A: {}", b.2))
+        } else {
+            None
+        }
+    };
+    // The bounds assume the host commits within B's 5 s busy_timeout. On an
+    // overloaded build worker stock itself once took ~57 s to commit A
+    // (probably a stalled WAL fsync), so its B gave up after 5 s; such a run
+    // cannot judge fsqlite.
+    if let Some(failure) = shape_failure(&run_immediate("stock")) {
+        eprintln!("event=mp_immediate_inconclusive stock missed the shape on this host: {failure}");
+        return;
+    }
+    if let Some(failure) = shape_failure(&run_immediate("fsqlite")) {
+        panic!("fsqlite: {failure}");
     }
 }
 
