@@ -3687,9 +3687,15 @@ impl RuntimeContext {
     }
 
     fn derived_root_cx(parent: &Cx) -> Cx {
-        parent
+        let root = parent
             .create_child()
-            .with_trace_context(next_trace_id(), 0, 0)
+            .with_trace_context(next_trace_id(), 0, 0);
+        // The caller owns its native context. Its cancellation still reaches
+        // every connection, but closing a database must not cancel it.
+        if let Some(native) = root.attached_native_cx() {
+            root.set_shared_native_cx(native);
+        }
+        root
     }
 
     #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
@@ -3817,8 +3823,12 @@ impl RuntimeContext {
         if cx.attached_native_cx().is_some() {
             return;
         }
+        // Every connection on this context carries the same io Cx, so none
+        // of them may cancel it: closing one connection used to cancel it and
+        // with it every sibling, and an ATTACHed child's close (DETACH) killed
+        // its parent connection.
         if let Some(io_cx) = self.io_native_cx() {
-            cx.set_native_cx(io_cx);
+            cx.set_shared_native_cx(io_cx);
         }
     }
 
@@ -43050,10 +43060,26 @@ impl Connection {
             Statement::Detach(schema_name) => {
                 // bd-wymdl.3: see the ATTACH arm above.
                 self.reject_registry_mutation_during_recursive_program("DETACH")?;
+                let key = attached_schema_key(schema_name);
+                // Stock refuses to detach a database enrolled in the open
+                // transaction and leaves it attached.
+                if self
+                    .attached_connections
+                    .borrow()
+                    .get(&key)
+                    .is_some_and(|child| child.in_transaction.get())
+                {
+                    return Err(FrankenError::function_error(format!(
+                        "database {schema_name} is locked"
+                    )));
+                }
                 self.attached_schemas.borrow_mut().detach(schema_name)?;
-                self.attached_connections
-                    .borrow_mut()
-                    .remove(&attached_schema_key(schema_name));
+                let detached = self.attached_connections.borrow_mut().remove(&key);
+                // Close the child instead of dropping it: an unawaited drop
+                // skips its checkpoint and leaves its regions undrained.
+                if let Some(mut detached) = detached {
+                    detached.close_in_place().await?;
+                }
                 Ok(Vec::new())
             }
             #[allow(unreachable_patterns)]

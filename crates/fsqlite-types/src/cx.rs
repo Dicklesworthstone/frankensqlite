@@ -488,6 +488,12 @@ struct CxInner {
     eprocess_oracle: std::sync::OnceLock<Arc<EProcessOracle>>,
     #[cfg(feature = "native")]
     attached_native_cx: Mutex<Option<NativeCx>>,
+    // Set when `attached_native_cx` is borrowed (`Cx::set_shared_native_cx`):
+    // checkpoints observe its cancellation, but cancelling this context or
+    // its descendants never writes into it. Written while the attachment
+    // lock is held.
+    #[cfg(feature = "native")]
+    attached_native_cx_is_shared: AtomicBool,
     #[cfg(feature = "native")]
     fallback_native_cx: std::sync::OnceLock<NativeCx>,
     // bd-bjm5d: set only on the root Cx of a dedicated engine OS thread
@@ -525,6 +531,8 @@ impl CxInner {
             eprocess_oracle: std::sync::OnceLock::new(),
             #[cfg(feature = "native")]
             attached_native_cx: Mutex::new(None),
+            #[cfg(feature = "native")]
+            attached_native_cx_is_shared: AtomicBool::new(false),
             #[cfg(feature = "native")]
             fallback_native_cx: std::sync::OnceLock::new(),
             blocking_io_inline_safe: AtomicBool::new(false),
@@ -779,12 +787,19 @@ fn append_native_cancel_targets(
     descendant_index: Option<usize>,
     targets: &mut Vec<NativeCancelTarget>,
 ) {
-    let attached_native = inner
-        .attached_native_cx
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .as_ref()
-        .cloned();
+    let attached_native = {
+        let attached = inner
+            .attached_native_cx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A shared context belongs to its owner; FrankenSQLite cancellation
+        // only reads it.
+        if inner.attached_native_cx_is_shared.load(Ordering::Acquire) {
+            None
+        } else {
+            attached.as_ref().cloned()
+        }
+    };
     if let Some(native_cx) = attached_native {
         targets.push(NativeCancelTarget {
             descendant_index,
@@ -1209,7 +1224,7 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
     #[must_use]
     #[allow(dead_code)]
     fn effective_native_cx(&self) -> NativeCx {
-        let native = {
+        let (native, shared) = {
             let _dispatch = self
                 .inner
                 .cancel_dispatch_gate
@@ -1222,22 +1237,33 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .as_ref()
                 .cloned();
-            attached_native.unwrap_or_else(|| {
-                self.inner
-                    .fallback_native_cx
-                    .get_or_init(|| {
-                        NativeCx::for_request_with_budget(native_budget_from_local_at(
-                            self.budget,
-                            asupersync::time::wall_now(),
-                        ))
-                    })
-                    .clone()
-            })
+            match attached_native {
+                Some(native) => (
+                    native,
+                    self.inner
+                        .attached_native_cx_is_shared
+                        .load(Ordering::Acquire),
+                ),
+                None => (
+                    self.inner
+                        .fallback_native_cx
+                        .get_or_init(|| {
+                            NativeCx::for_request_with_budget(native_budget_from_local_at(
+                                self.budget,
+                                asupersync::time::wall_now(),
+                            ))
+                        })
+                        .clone(),
+                    false,
+                ),
+            }
         };
         // Recheck after releasing the family publication gate: NativeCx
         // dispatches arbitrary wakers synchronously, so no FrankenSQLite lock
         // may be held while mirroring the reason.
-        sync_one_native_cx_cancel(&self.inner, &native);
+        if !shared {
+            sync_one_native_cx_cancel(&self.inner, &native);
+        }
         native
     }
 
@@ -1522,6 +1548,22 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
     /// Attach a native asupersync context used by [`Self::checkpoint`].
     #[cfg(feature = "native")]
     pub fn set_native_cx(&self, native_cx: NativeCx) {
+        self.attach_native_cx(native_cx, false);
+    }
+
+    /// Attach a native context this `Cx` borrows rather than owns, such as a
+    /// runtime-wide I/O context that other connections also carry.
+    ///
+    /// Checkpoints observe its cancellation, children inherit it, and I/O
+    /// uses it as with [`Self::set_native_cx`], but cancelling this context
+    /// or any descendant never cancels the shared native context.
+    #[cfg(feature = "native")]
+    pub fn set_shared_native_cx(&self, native_cx: NativeCx) {
+        self.attach_native_cx(native_cx, true);
+    }
+
+    #[cfg(feature = "native")]
+    fn attach_native_cx(&self, native_cx: NativeCx, shared: bool) {
         let retired = {
             let _dispatch = self
                 .inner
@@ -1533,12 +1575,17 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
                 .attached_native_cx
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.inner
+                .attached_native_cx_is_shared
+                .store(shared, Ordering::Release);
             attached.replace(native_cx.clone())
         };
         // Synchronize the exact handle supplied by this call. Re-reading the
         // attachment here would let a racing replacement return with this
         // handle still uncancelled.
-        sync_one_native_cx_cancel(&self.inner, &native_cx);
+        if !shared {
+            sync_one_native_cx_cancel(&self.inner, &native_cx);
+        }
         // Releasing the final old NativeCx reference may retire cancellation
         // Wakers. Do that only after both FrankenSQLite locks are gone and the
         // replacement's synchronization postcondition has been established.
@@ -1548,6 +1595,10 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
     /// Attach a native context shim in non-native builds.
     #[cfg(not(feature = "native"))]
     pub fn set_native_cx<T>(&self, _native_cx: T) {}
+
+    /// Attach a shared native context shim in non-native builds.
+    #[cfg(not(feature = "native"))]
+    pub fn set_shared_native_cx<T>(&self, _native_cx: T) {}
 
     /// Return the attached native asupersync context, if one exists.
     #[cfg(feature = "native")]
@@ -1590,11 +1641,15 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
                 .cancel_dispatch_gate
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            self.inner
+            let mut attached = self
+                .inner
                 .attached_native_cx
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.inner
+                .attached_native_cx_is_shared
+                .store(false, Ordering::Release);
+            attached.take()
         };
         // NativeCx destruction may invoke executor-owned cleanup.
         drop(retired);
@@ -1912,7 +1967,7 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
             self.budget,
             Arc::clone(&self.inner.cancel_dispatch_gate),
         );
-        child.busy_wait_budget = self.busy_wait_budget.clone();
+        child.busy_wait_budget.clone_from(&self.busy_wait_budget);
         child.trace_id = self.trace_id;
         child.decision_id = self.decision_id;
         child.policy_id = self.policy_id;
@@ -1946,19 +2001,31 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let attached_native = inherit_runtime_affinity
                 .then(|| {
-                    self.inner
+                    let attached = self
+                        .inner
                         .attached_native_cx
                         .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .clone()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    attached.clone().map(|native| {
+                        let shared = self
+                            .inner
+                            .attached_native_cx_is_shared
+                            .load(Ordering::Acquire);
+                        (native, shared)
+                    })
                 })
                 .flatten();
-            if let Some(native) = attached_native.as_ref() {
-                *child
+            if let Some((native, shared)) = attached_native.as_ref() {
+                let mut child_attached = child
                     .inner
                     .attached_native_cx
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(native.clone());
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                child
+                    .inner
+                    .attached_native_cx_is_shared
+                    .store(*shared, Ordering::Release);
+                *child_attached = Some(native.clone());
             }
 
             let local_reason = self.cancel_reason();
@@ -1979,7 +2046,9 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
             }
             children.push(Arc::downgrade(&child.inner));
 
-            attached_native.filter(|_| native_reason.is_some())
+            attached_native
+                .filter(|(_, shared)| !shared && native_reason.is_some())
+                .map(|(native, _)| native)
         };
 
         #[cfg(not(feature = "native"))]
@@ -2182,7 +2251,9 @@ mod tests {
     #[test]
     fn busy_wait_budget_tightening_keeps_expired_clock() {
         let budget = BusyWaitBudget::new(Duration::from_secs(30));
-        let started = Instant::now() - Duration::from_secs(60);
+        let started = Instant::now()
+            .checked_sub(Duration::from_secs(60))
+            .expect("the monotonic clock is past one minute");
         budget.started.set(started).unwrap();
         let shorter = budget.with_timeout(Duration::from_millis(200));
         let longer = shorter.with_timeout(Duration::from_secs(300));
@@ -3645,6 +3716,49 @@ mod tests {
             .expect_err("child should observe inherited native cancel");
         assert_eq!(err.kind(), ErrorKind::Cancelled);
         assert_eq!(child.cancel_reason(), Some(CancelReason::Timeout));
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn shared_native_cx_is_observed_but_never_cancelled_by_its_borrowers() {
+        let shared = NativeCx::for_testing();
+        let parent = Cx::<FullCaps>::new();
+        parent.set_shared_native_cx(shared.clone());
+        let child = parent.create_child();
+        assert!(child.attached_native_cx().is_some());
+
+        child.cancel_with_reason(CancelReason::RegionClose);
+        parent.cancel_with_reason(CancelReason::Abort);
+        let late_child = parent.create_child();
+        assert!(late_child.checkpoint().is_err());
+        assert!(
+            !shared.is_cancel_requested(),
+            "cancelling a borrower must not cancel the shared native context"
+        );
+
+        let sibling = Cx::<FullCaps>::new();
+        sibling.set_shared_native_cx(shared.clone());
+        assert!(sibling.checkpoint().is_ok());
+        shared.set_cancel_reason(NativeCancelReason::timeout());
+        let err = sibling
+            .checkpoint()
+            .expect_err("the owner's cancellation still reaches every borrower");
+        assert_eq!(err.kind(), ErrorKind::Cancelled);
+        assert_eq!(sibling.cancel_reason(), Some(CancelReason::Timeout));
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn owned_native_cx_replacing_a_shared_one_is_cancelled_with_its_cx() {
+        let shared = NativeCx::for_testing();
+        let cx = Cx::<FullCaps>::new();
+        cx.set_shared_native_cx(shared.clone());
+        let owned = NativeCx::for_testing();
+        cx.set_native_cx(owned.clone());
+
+        cx.cancel_with_reason(CancelReason::RegionClose);
+        assert!(owned.is_cancel_requested());
+        assert!(!shared.is_cancel_requested());
     }
 
     #[cfg(feature = "native")]

@@ -194,13 +194,90 @@ fn attach_detach() {
                 "CREATE TABLE aux.t (x INTEGER)",
                 "INSERT INTO aux.t VALUES (1),(2)",
                 "DETACH DATABASE aux",
+                // The connection must stay fully usable after DETACH (it used to
+                // fail every later statement with "callback requested query abort").
+                "CREATE TABLE main.after (x INTEGER)",
+                "INSERT INTO main.after VALUES (3)",
+                "ATTACH DATABASE ':memory:' AS aux",
+                "CREATE TABLE aux.t2 (y INTEGER)",
+                "INSERT INTO aux.t2 VALUES (4)",
+                "DETACH DATABASE aux",
+                "DETACH DATABASE aux", // no longer attached -> error on both
             ],
             &[
                 // After DETACH, aux.t is gone -> error on both.
                 "SELECT * FROM aux.t",
+                "SELECT 'after-detach'",
+                "SELECT x FROM main.after",
             ],
             "attach_detach",
         )
         .await;
+    });
+}
+
+#[test]
+fn detach_refused_inside_a_transaction_that_uses_it() {
+    asupersync::test_utils::run_test(|| async {
+        scenario(
+            &[
+                "ATTACH DATABASE ':memory:' AS aux",
+                "CREATE TABLE aux.t (x INTEGER)",
+                "BEGIN",
+                "INSERT INTO aux.t VALUES (1)",
+                "DETACH DATABASE aux", // "database aux is locked" on both
+                "COMMIT",
+                "DETACH DATABASE aux",
+            ],
+            &["SELECT 'detached-after-commit'", "SELECT * FROM aux.t"],
+            "detach_refused_inside_a_transaction_that_uses_it",
+        )
+        .await;
+    });
+}
+
+// File-backed main and attached databases: DETACH closes the attached file
+// cleanly, its rows stay readable by stock, and the main connection keeps
+// working and closes without error.
+#[test]
+fn detach_file_backed_keeps_connection_and_data() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let main_path = dir.path().join("main.db");
+        let aux_path = dir.path().join("aux.db");
+        let f = Connection::open(main_path.to_str().expect("utf8"))
+            .await
+            .expect("open frank");
+        f.execute(&format!(
+            "ATTACH DATABASE '{}' AS aux",
+            aux_path.to_str().expect("utf8")
+        ))
+        .await
+        .expect("attach");
+        f.execute("CREATE TABLE aux.t (x INTEGER)")
+            .await
+            .expect("create");
+        f.execute("INSERT INTO aux.t VALUES (1), (2), (3)")
+            .await
+            .expect("insert");
+        f.execute("DETACH DATABASE aux").await.expect("detach");
+        f.execute("CREATE TABLE main.m (y INTEGER)")
+            .await
+            .expect("main still usable after DETACH");
+        assert_eq!(
+            frank_rows(&f, "SELECT count(*) FROM main.m").await,
+            Ok(vec![vec!["0".to_owned()]])
+        );
+        f.close().await.expect("close after DETACH");
+
+        let stock = rusqlite::Connection::open(&aux_path).expect("stock open aux");
+        assert_eq!(
+            sqlite_rows(&stock, "SELECT sum(x) FROM t"),
+            Ok(vec![vec!["6".to_owned()]])
+        );
+        assert_eq!(
+            sqlite_rows(&stock, "PRAGMA integrity_check"),
+            Ok(vec![vec!["'ok'".to_owned()]])
+        );
     });
 }
