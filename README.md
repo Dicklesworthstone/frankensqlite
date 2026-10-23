@@ -9,7 +9,6 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Dicklesworthstone/frankensqlite/actions/workflows/verification-gates.yml"><img src="https://img.shields.io/github/actions/workflow/status/Dicklesworthstone/frankensqlite/verification-gates.yml?branch=main&label=CI" alt="CI"></a>
   <a href="https://github.com/Dicklesworthstone/frankensqlite/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg" alt="License: MIT+Rider"></a>
   <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/rust-nightly%20%7C%20edition%202024-orange.svg" alt="Rust"></a>
   <a href="https://github.com/Dicklesworthstone/frankensqlite"><img src="https://img.shields.io/badge/unsafe-only%20in%20VFS%20%2B%20C%20ABI-blue.svg" alt="unsafe only in VFS + C ABI"></a>
@@ -99,7 +98,7 @@ Compatibility with existing SQLite databases is a core goal of the current runti
 
 ### 5. Serializable Snapshot Isolation (SSI) by Default
 
-`BEGIN CONCURRENT` targets SERIALIZABLE isolation rather than merely Snapshot Isolation. The conservative Cahill/Fekete rule applied at page granularity ("Page-SSI") rejects a transaction that would become a dangerous rw-antidependency pivot. PostgreSQL's SSI results are useful prior art, but they do not establish FrankenSQLite's overhead; that cost remains part of this project's release benchmark matrix. `PRAGMA fsqlite.serializable = OFF` explicitly downgrades to plain SI for benchmarking or applications that tolerate write skew: the setting is snapped at `BEGIN CONCURRENT` and routes that transaction's commit through first-committer-wins validation only, skipping SSI edge validation (GH#390). When two writers touch the same page, FCW detects base drift and the current live path makes the loser retry with `SQLITE_BUSY_SNAPSHOT`; the safe merge ladder remains dormant. Page-lock acquisition does not wait, so it cannot form a page-lock wait-for cycle.
+`BEGIN CONCURRENT` targets SERIALIZABLE isolation rather than merely Snapshot Isolation. The conservative Cahill/Fekete rule applied at page granularity ("Page-SSI") rejects a transaction that would become a dangerous rw-antidependency pivot. PostgreSQL's SSI results are useful prior art, but they do not establish FrankenSQLite's overhead; that cost remains part of this project's release benchmark matrix. `PRAGMA fsqlite.serializable = OFF` explicitly downgrades to plain SI for benchmarking or applications that tolerate write skew: the setting is snapped at `BEGIN CONCURRENT` and routes that transaction's commit through first-committer-wins validation only, skipping SSI edge validation (GH#390). When two writers touch the same page, FCW detects base drift and the current live path makes the loser retry with `SQLITE_BUSY_SNAPSHOT`; the safe merge ladder remains dormant. Page-lock acquisition waits up to the connection's busy budget for the holder to finish; waiters publish wait-for edges, and a detected cycle fails its youngest member with `SQLITE_BUSY` (see Deadlock Handling below).
 
 This guarantee belongs to the connection pipeline, which records the read/write
 dependencies consumed by Page-SSI. The lower-level
@@ -179,6 +178,12 @@ FrankenSQLite is organized as a 28-member Cargo workspace with layered dependenc
 | | `beads-doctor` | Beads database health tool |
 
 The `crates/fsqlite-wasm/` crate provides experimental WebAssembly support and is included as a workspace member.
+Two TypeScript packages sit on top of it: `packages/worker` (`@frankensqlite/worker`, the dedicated
+module worker that owns one WASM `FrankenDB` and its message protocol) and `packages/sdk`
+(`@frankensqlite/sdk`, the Promise-based browser client: `FrankenDB.open()`, `execute`, `query`,
+`prepare`, `transaction`, `export`). Only `memory` persistence is implemented; `opfs` and
+`indexeddb` raise explicit errors, and the opt-in `indexeddb-snapshot` mode saves explicit
+whole-database checkpoints rather than per-commit pages.
 
 ---
 
@@ -268,6 +273,18 @@ Linux cross-UID namespace regression (root and `setpriv` required):
 ```bash
 cargo test -p fsqlite-vfs trusted_group_cross_uid_reopen_and_safety -- --ignored
 ```
+
+### Companion Files
+
+A file-backed database `app.db` opened read-write can gain these siblings:
+
+| File | Purpose |
+|------|---------|
+| `app.db-wal`, `app.db-shm` | Standard SQLite WAL and WAL-index, readable by stock SQLite. The `-wal` is checkpointed but currently kept, not deleted, when the last connection closes, and rollback-journal databases still get an empty `-wal` and a `-shm` (bead bd-reality-check-1022-llk6g.21). |
+| `app.db-fsqlite-ns-gate`, `app.db-fsqlite-ns-use` | Namespace admission sidecars described above. Never delete them while any process has the database open. |
+| `app.db-wal-cert`, `app.db-wal-cert-head` | The durable commit certificate of the parallel WAL path, bound to the database file's identity so a certificate never applies to a replaced or copied file. |
+| `app.db.fsqlite-migration-state` | Marker for the one-time first-open pass (`fsqlite-core/src/migration.rs`). The first read-write open of a database without the marker, including one created by stock SQLite, runs `integrity_check`. A clean database only gets the marker. A database with a known repairable damage class (for example orphaned pages from older FrankenSQLite versions) has its main and WAL files copied to a private backup generation first, then is repaired. This first open costs time proportional to the database size (bd-6jf9o). `FRANKENSQLITE_SKIP_MIGRATION=1` skips the pass. |
+| `app.db-wal-fec`, `app.db-wal-fec.lock` | RaptorQ repair symbols for durable WAL ranges, written only on native runtimes with a blocking pool at WAL fsync boundaries (see Crash Recovery). |
 
 ---
 
@@ -368,7 +385,7 @@ Transaction C and D both reach COMMIT:
      │   ├── Yes → First to lock page 47 wins. Loser hits base drift at commit
      │   │         and aborts/retries. The intent-replay/structured-patch merge
      │   │         ladder is not wired into the live commit path.
-     │   │         Deadlock impossible (eager locking, no wait-for cycles).
+     │   │         A page-lock wait-for cycle fails one member with BUSY.
      │
      └── No (different leaf pages) → page work can overlap, and both commit
          when the full tracked conflict sets stay clean — freed-page and
@@ -494,18 +511,18 @@ Old page versions are reclaimed when no active transaction can see them:
 - During WAL checkpointing, reclaimable frames are copied back to the main database file
 - When the optional ARC eviction policy is selected, its ghost entries (B1/B2) for pruned versions are cleaned as the GC horizon advances
 
-### Deadlock Freedom (By Construction)
+### Deadlock Handling
 
-The proof is simple:
-
-1. Page locks are acquired eagerly: when a transaction first writes to a page, it tries to lock immediately.
-2. If the lock is held by another transaction, the caller gets `SQLITE_BUSY` immediately. There is no waiting.
-3. A transaction that does not wait cannot participate in a wait-for cycle.
-4. No wait-for cycle means no deadlock. QED.
-
-This trades potential throughput (a waiter could eventually succeed) for a
-smaller page-lock state machine. Conflict frequency is workload- and page-layout
-dependent and must be measured; it is not assumed to be rare.
+Page locks are acquired eagerly: a transaction locks a page when it first
+writes it. If another transaction holds the lock, the live VDBE write path
+waits for the holder to finish, bounded by the connection's busy budget
+(`fsqlite-vdbe/src/engine.rs`, `wait_for_page_lock_holder_change`). Each
+waiter publishes its wait-for edge and polls for cycles; when one forms, the
+youngest member of the cycle fails with `SQLITE_BUSY` and retries, so a cycle
+cannot park every writer for the full timeout (bd-zeg99). Setting
+`FSQLITE_PAGE_LOCK_DEADLOCK_DETECT=0` disables the cycle check and leaves only
+the busy budget. Conflict frequency is workload- and page-layout dependent and
+must be measured; it is not assumed to be rare.
 
 ---
 
@@ -834,6 +851,13 @@ the connection only cancels it. Generation and shutdown regression coverage is
 in `crates/fsqlite-core/tests/wal_fec_commit_pipeline.rs` and the CLI's
 `test_shell_runtime_generates_wal_fec_before_exit`. This is not a claim of
 automatic corruption repair or a measured end-to-end performance guarantee.
+
+For offline recovery, `crates/fsqlite-wal` builds a separate `fsqlite-recover`
+binary (`cargo build -p fsqlite-wal --bin fsqlite-recover`). By default it
+exports a coherent main/WAL/FEC snapshot into a new database file;
+`--repair-wal` (Unix only) repairs the existing WAL in place after writing a
+mandatory, verified backup of it. It never overwrites a destination or deletes
+files (`fsqlite-recover --help`).
 
 ---
 
@@ -1260,8 +1284,8 @@ The `fsqlite-cli` binary currently provides a small interactive SQL shell plus o
 
 - Multi-line statement detection with TTY-aware continuation prompts
 - Syntax-highlighted SQL previews in interactive continuation prompts
-- Output modes: `list`, `column`, `csv`, `tabs`, `line`, with optional headers
-- REPL and command-mode dot commands: `.help`, `.quit`, `.exit`, `.read FILE`, `.open FILE`, `.tables`, `.schema`, `.dump`, `.mode`, `.headers` / `.header`
+- Output modes: `list`, `column`, `csv`, `tabs`, `line`, `quote`, with optional headers
+- REPL and command-mode dot commands: `.help`, `.quit`, `.exit`, `.read FILE`, `.open FILE`, `.tables`, `.schema`, `.dump`, `.mode`, `.headers` / `.header`, `.timer`
 - Single-command mode: `-c` / `--command`
 - Batch mode for piped stdin plus explicit `-batch` / `--batch`
 - Startup script support via `-init` / `--init`
@@ -1365,7 +1389,7 @@ bounded backoff appropriate to their runtime between transient retries.
 
 1. **Unit tests** in each crate test components in isolation using mock implementations of trait dependencies.
 2. **Integration tests** in `fsqlite-core` test the full query pipeline from SQL text to result rows using an in-memory VFS.
-3. **Compatibility tests** in `fsqlite-harness` run the SQLite test corpus against both FrankenSQLite and C SQLite, comparing results row-by-row.
+3. **Compatibility tests**, mostly in `fsqlite-core`, `fsqlite-e2e` and `fsqlite` integration tests, run the same SQL against FrankenSQLite and the C SQLite bundled with `rusqlite`, comparing statement outcomes and result rows; `fsqlite-harness` holds the surrounding conformance and orchestration tooling.
 4. **Fuzz tests** using `cargo-fuzz` target the parser, record decoder, and B-tree page decoder with arbitrary byte inputs.
 5. **Concurrency tests** exercise MVCC behavior: concurrent readers and writers, snapshot isolation verification, write-write conflict detection, and garbage collection under load.
 
@@ -1386,8 +1410,16 @@ bounded backoff appropriate to their runtime between transient retries.
 
 **100% behavioral parity target** with C SQLite 3.52.0 for the supported
 surface. Any intentional divergence MUST be explicitly documented and
-annotated in the harness with rationale. The conformance suite runs SQL Logic
-Tests (SLT format) covering:
+annotated in the harness with rationale. In practice the differential oracle
+used throughout the test suite is the SQLite bundled with `rusqlite`
+(`libsqlite3-sys` 0.38.2, SQLite 3.53.2), and where 3.52 and 3.53 behave
+differently the engine follows 3.53 (for example 5e1d39431, subquery `ORDER BY`
+resolving outer columns). Most parity evidence lives in the integration tests
+under `crates/fsqlite-core/tests/`, `crates/fsqlite-e2e/tests/` and
+`crates/fsqlite/tests/` that compare against that oracle; the SQL Logic Test
+corpus under `conformance/slt/` is still a single smoke file. Not every one of
+those targets is run for every release (GitHub Actions is off; see AGENTS.md).
+The conformance target covers:
 
 The runtime file-format surface covers encoding=1/UTF-8 plus encodings 2/3
 (UTF-16le/UTF-16be) for reads and writes; the SLT parity claim is deepest on
@@ -2249,18 +2281,21 @@ The following six safety and liveness arguments state obligations and
 assumptions for the MVCC implementation. They are not machine-checked proofs
 of the complete engine.
 
-**Theorem 1: No Page-Ownership Wait Cycles**
+**Theorem 1: Page-Ownership Waits Cannot Deadlock**
 
 ```
-Claim: Nonblocking page ownership does not create page-lock wait cycles.
+Claim: Page-lock waits on the live write path cannot form a permanent cycle.
 
-Proof:
+Argument:
     1. A deadlock requires a cycle in the wait-for graph.
-    2. try_acquire() never blocks — it returns Err(SQLITE_BUSY) immediately
-       if the lock is held by another transaction.
-    3. This failed page-ownership acquisition adds no wait edge.
-    4. With no page-ownership wait edges, there is no cycle in that graph.
-    5. Therefore this mechanism cannot cause a page-lock deadlock. QED ∎
+    2. A writer that finds a page locked waits only for that holder, and
+       only within its busy budget; it publishes the wait-for edge while
+       waiting.
+    3. Each waiter polls for a cycle among published edges. When one forms,
+       its youngest member fails with SQLITE_BUSY and removes its edge.
+    4. A cycle is therefore broken as soon as it is observed, and every
+       wait is bounded by its busy budget even if detection is disabled
+       (FSQLITE_PAGE_LOCK_DEADLOCK_DETECT=0).
 
 Registry/shard mutexes, I/O and lifecycle waits have separate liveness
 obligations. This argument does not prove global deadlock freedom or remove
@@ -2306,8 +2341,10 @@ a state equivalent to some serial ordering.
 
 Proof (two cases):
     Case A — Concurrent lock contention:
-        T1 acquires lock on P first. T2 calls try_acquire(P) → Err(SQLITE_BUSY).
-        T2 cannot write P at all. At most T1 commits with P.
+        T1 acquires lock on P first. T2 waits for T1 within its busy budget
+        (or fails with SQLITE_BUSY). T2 cannot write P while T1 holds it; if
+        T1 commits, T2 later locks P from a snapshot that excludes T1, which
+        is Case B's validation failure.
 
     Case B — Sequential (T1 commits and releases before T2 acquires):
         T2 acquires lock on P and writes it.
@@ -2754,6 +2791,10 @@ FrankenSQLite follows a 9-phase implementation plan. Each phase has specific **v
 5. cargo doc --workspace --no-deps                           all public items documented
 ```
 
+These are the intended gates, not a record of what main passes. GitHub Actions
+has been off since 2026-07-16 (AGENTS.md), so they run only when someone runs
+them, and a given commit on main can have failing test targets.
+
 ### Phase-Specific Gates (Selected)
 
 These are target acceptance criteria, not a list of achieved results. Each
@@ -2883,14 +2924,15 @@ cargo fmt --check
 ### Benchmarks
 
 ```bash
-# Run all benchmarks
-cargo bench
-
-# Specific benchmark suite
-cargo bench --bench btree_perf
-cargo bench --bench mvcc_scaling
-cargo bench --bench parser_throughput
+# Criterion benchmarks live in the owning crates' benches/ directories
+cargo bench -p fsqlite-btree --bench cell_parse_hot_paths
+cargo bench -p fsqlite-mvcc --bench mvcc_bench
+cargo bench -p fsqlite-e2e --bench concurrent_write_bench
+cargo bench -p fsqlite-e2e --bench write_throughput_bench
 ```
+
+These are development tools, not release evidence; see Performance
+Characteristics for what a citable measurement requires.
 
 ---
 
@@ -2989,7 +3031,13 @@ still serves as an authoritative reference.
   fixed — the connection stays usable and renaming back recovers — but
   external-content column projection can still return NULL even with the
   content table present (tracked as bd-c6jre).
-- **Nightly Rust required.** Uses edition 2024 features that aren't stabilized yet.
+- **The workspace is developed on a pinned nightly.** `rust-toolchain.toml`
+  names the dated nightly the whole workspace (tests, benches, optional
+  features such as `nightly-simd`) is built with. The published library crates
+  are meant to build on stable as well: main removed the last default-on
+  `#![feature]` gates from `fsqlite-pager`, `fsqlite-btree` and `fsqlite-vfs`
+  (GH#522), but releases up to and including v0.4.12 still need nightly on
+  x86_64 and Windows.
 - **Rust is still the primary supported surface.** An optional `fsqlite-c-api` crate exists for C/C++ embedding, but the main documented API and most verification effort are still centered on the Rust crates.
 - **No loadable extensions.** Extension support is configured at compile time via Cargo features; dynamic `dlopen`-based loading is not planned.
 - **WASM support is experimental.** The `fsqlite-wasm` crate now builds a
@@ -3070,8 +3118,9 @@ file and WAL layouts, subject to the extension-specific limitations above.
 A: In the current compatibility runtime, WAL is the durability mechanism while MVCC conflict tracking lives above the pager in shared session state (`ConcurrentRegistry`, commit index, page locks, version store). The more ambitious WAL/native-mode extensions described elsewhere in this README are design/partial-implementation work rather than the entire hot path today.
 
 **Q: What happens when two writers conflict on the same page?**
-A: If the page lock is held, the second writer gets `SQLITE_BUSY` immediately
-(no waiting, no deadlocks). If both reach commit on the same page, FCW detects
+A: If the page lock is held, the second writer waits for the holder within its
+busy budget; a lock-wait cycle fails one member with `SQLITE_BUSY` (see
+Deadlock Handling). If both reach commit on the same page, FCW detects
 base drift and the loser aborts/retries with `SQLITE_BUSY_SNAPSHOT`. The safe
 write-merge ladder exists as dormant implementation and is not wired into the
 live commit path.
@@ -3084,8 +3133,9 @@ A: SQLite's C codebase is well-engineered but carries 24 years of accumulated co
 
 **Q: What's the conformance target?**
 A: **100% behavioral parity target** with C SQLite 3.52.0 for the supported
-surface, measured by running the SQLite test corpus against both implementations
-and comparing results. Any intentional divergence is documented and annotated
+surface, measured by differential integration tests that run the same SQL
+against FrankenSQLite and the SQLite 3.53.2 bundled with `rusqlite` (see
+Conformance Target). Any intentional divergence is documented and annotated
 with rationale. The canonical contract file is `docs/contracts/sqlite_version_contract.toml`,
 and the corresponding scope document is `docs/canonical_parity_contract.md`.
 
@@ -3156,8 +3206,8 @@ frankensqlite/
 │   ├── contracts/            # Normative surface + parity matrices
 │   └── concurrency-contract.md  # Caller-facing concurrency contract
 ├── crates/
-│   ├── fsqlite-types/        # Core types (2,800+ LOC, 64 tests)
-│   ├── fsqlite-error/        # Error handling (578 LOC, 13 tests)
+│   ├── fsqlite-types/        # Core types
+│   ├── fsqlite-error/        # Error handling
 │   ├── fsqlite-vfs/          # Virtual filesystem
 │   ├── fsqlite-pager/        # Page cache
 │   ├── fsqlite-wal/          # Write-ahead log
@@ -3178,6 +3228,9 @@ frankensqlite/
 │   ├── fsqlite-c-api/        # Optional C ABI adapter
 │   ├── fsqlite-wasm/         # Experimental WebAssembly API
 │   └── beads-doctor/         # Beads database health tool
+├── packages/
+│   ├── worker/               # @frankensqlite/worker (TypeScript, WASM worker transport)
+│   └── sdk/                  # @frankensqlite/sdk (TypeScript, browser client)
 ├── legacy_sqlite_code/
 │   └── sqlite/               # C SQLite reference (git submodule)
 ├── benches/                  # Criterion benchmarks
