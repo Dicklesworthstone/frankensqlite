@@ -3458,6 +3458,10 @@ const DURABLE_CERTIFICATE_RECORD_HEADER_SIZE: usize = 14;
 const MIN_LEGACY_DURABLE_CERTIFICATE_RECORD_SIZE: usize = DURABLE_CERTIFICATE_RECORD_HEADER_SIZE
     + ParallelWalDurableCertificateRecord::LENGTH_FOOTER_SIZE;
 const MAX_ORPHAN_CERTIFICATE_LOOKBACK: usize = 64;
+/// Re-reads allowed when the `-wal-cert` sidecar changed size under a failed
+/// read: a peer's append-boundary repair or generation compaction truncates
+/// it in place while this read-only descriptor is mid-walk.
+const CERTIFICATE_READ_RESIZE_RETRIES: u32 = 3;
 
 fn durable_certificate_declared_len(bytes: &[u8]) -> Option<usize> {
     let length_bytes = bytes.get(10..DURABLE_CERTIFICATE_RECORD_HEADER_SIZE)?;
@@ -3698,13 +3702,16 @@ where
     /// re-opened/closed the `-wal-cert` sidecar every call — part of the
     /// per-commit file-open storm that serializes writers under disk contention.
     /// Holding the descriptor is safe: the read is `READONLY` (no lock), the
-    /// certificate is only ever appended/truncated *in place* within a WAL
-    /// generation (never unlinked+recreated), so re-reading `file_size` each
-    /// call observes peer appends live; and the sidecar is reset only at a
-    /// generation change, where [`Self::replace_inner`] (and `checkpoint`)
-    /// invalidate this cache. A stale cross-generation read is additionally
-    /// caught by the callers' `record.wal_generation` check (fail-closed). Any
-    /// read anomaly drops the descriptor, forcing a fresh open. Interior-mutable
+    /// certificate is only ever appended/truncated *in place* (never
+    /// unlinked+recreated), so re-reading `file_size` each call observes peer
+    /// appends live — including the truncate-to-empty that the first append
+    /// of a new WAL generation performs to drop the prior generation's
+    /// records. [`Self::replace_inner`] (and `checkpoint`) still invalidate
+    /// this cache at a generation change. A stale cross-generation read is
+    /// additionally caught by the callers' `record.wal_generation` check
+    /// (fail-closed). Any read anomaly drops the descriptor, forcing a fresh
+    /// open; a read that a peer's in-place truncate cut short re-reads
+    /// (`CERTIFICATE_READ_RESIZE_RETRIES`). Interior-mutable
     /// because the read path is `&self` (a `WalBackend` read-snapshot method);
     /// the lock is held only for the sync take/put-back, never across `.await`.
     cached_certificate_read: std::sync::Mutex<Option<V::File>>,
@@ -3929,9 +3936,9 @@ where
         replacement.wal_index_shm_source.clone_from(&self.inner.wal_index_shm_source);
         replacement.native_recovery_requested = self.inner.native_recovery_requested;
         let old = std::mem::replace(&mut self.inner, replacement);
-        // bd-smxhz: the WAL generation changed, so the -wal-cert sidecar is
-        // reset for the new generation and the cached certificate descriptor is
-        // stale — drop it so the next read re-opens.
+        // bd-smxhz: the WAL generation changed, so drop the cached certificate
+        // descriptor and let the next read re-open. The sidecar keeps the old
+        // generation's records until the new generation's first append.
         if let Some(mut stale) = self
             .cached_certificate_read
             .get_mut()
@@ -4767,13 +4774,41 @@ where
         Ok(0)
     }
 
-    /// Return a safe append boundary, repairing exactly one validated torn
-    /// suffix in place.
+    /// The newest record — and so, in generation-ordered appends, every
+    /// record — belongs to a WAL generation a checkpoint has since reset.
+    /// Readers already treat that tail as absent, so drop it before the
+    /// first append of `generation`: the sidecar then holds at most one
+    /// generation instead of every commit since the database was created
+    /// (bd-reality-check-1022-llk6g.32). Unsynced like every append; the
+    /// crash ordering is the one `discard_legacy_certificate_sidecar` gives.
+    fn discard_prior_generation_certificate_sidecar(
+        file: &mut V::File,
+        cx: &Cx,
+        file_size: u64,
+        generation: WalGenerationIdentity,
+    ) -> Result<u64> {
+        tracing::debug!(
+            target: "fsqlite::wal::durability_combiner",
+            file_size,
+            checkpoint_seq = generation.checkpoint_seq,
+            "compacting durable certificate sidecar left by a reset WAL generation"
+        );
+        file.truncate(cx, 0)?;
+        Ok(0)
+    }
+
+    /// Return a safe append boundary for a record of `generation`, repairing
+    /// exactly one validated torn suffix in place and dropping a sidecar whose
+    /// tail belongs to a prior generation.
     ///
     /// The caller must hold the database's external writer or maintenance
     /// gate for the whole scan/truncate/append sequence. Keeping this helper
     /// private prevents a scan/reopen race from becoming part of the API.
-    async fn prepare_certificate_sidecar_for_append(file: &mut V::File, cx: &Cx) -> Result<u64> {
+    async fn prepare_certificate_sidecar_for_append(
+        file: &mut V::File,
+        cx: &Cx,
+        generation: WalGenerationIdentity,
+    ) -> Result<u64> {
         let file_size = file.file_size(cx)?;
         if file_size == 0 {
             return Ok(0);
@@ -4818,7 +4853,13 @@ where
                     && (bytes.starts_with(&PARALLEL_WAL_DURABLE_CERTIFICATE_MAGIC)
                         || durable_certificate_declares_len(&bytes, record_len))
                 {
-                    decode_durable_certificate_record(&bytes, "append-boundary record")?;
+                    let record =
+                        decode_durable_certificate_record(&bytes, "append-boundary record")?;
+                    if record.wal_generation != generation {
+                        return Self::discard_prior_generation_certificate_sidecar(
+                            file, cx, file_size, generation,
+                        );
+                    }
                     return Ok(file_size);
                 }
             }
@@ -4879,9 +4920,9 @@ where
                 break;
             }
             if record_len >= MIN_DURABLE_CERTIFICATE_RECORD_SIZE
-                && ParallelWalDurableCertificateRecord::from_bytes(record_bytes).is_ok()
+                && let Ok(record) = ParallelWalDurableCertificateRecord::from_bytes(record_bytes)
             {
-                anchor_end = Some(candidate_end);
+                anchor_end = Some((candidate_end, record.wal_generation));
                 break;
             }
         }
@@ -4894,8 +4935,13 @@ where
             );
         }
 
-        let safe_end = if let Some(anchor_end) = anchor_end {
+        let safe_end = if let Some((anchor_end, anchor_generation)) = anchor_end {
             validate_incomplete_certificate_suffix(&tail[anchor_end..], true)?;
+            if anchor_generation != generation {
+                return Self::discard_prior_generation_certificate_sidecar(
+                    file, cx, file_size, generation,
+                );
+            }
             tail_offset
                 .checked_add(u64::try_from(anchor_end).unwrap_or(u64::MAX))
                 .ok_or_else(|| FrankenError::WalCorrupt {
@@ -4999,7 +5045,9 @@ where
         let certificate_path = self.certificate_sidecar_path();
         let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
         let (mut file, _) = self.vfs.open(cx, Some(&certificate_path), flags)?;
-        let append_offset = Self::prepare_certificate_sidecar_for_append(&mut file, cx).await?;
+        let append_offset =
+            Self::prepare_certificate_sidecar_for_append(&mut file, cx, record.wal_generation)
+                .await?;
         preflight.hand_off();
         drop(preflight);
         let write_result = if let Some(completion) = completion {
@@ -5090,7 +5138,12 @@ where
         let (mut file, _) = self.vfs.open(cx, Some(&certificate_path), flags)?;
         let reconciliation_result = async {
             let original_size = file.file_size(cx)?;
-            let safe_end = Self::prepare_certificate_sidecar_for_append(&mut file, cx).await?;
+            let safe_end = Self::prepare_certificate_sidecar_for_append(
+                &mut file,
+                cx,
+                expected.wal_generation,
+            )
+            .await?;
             let latest = if safe_end == 0 {
                 None
             } else {
@@ -5381,331 +5434,28 @@ where
                 file
             }
         };
-        let read_result = async {
-            let file_size = file.file_size(cx)?;
-            if file_size == 0 {
-                return Ok(None);
+        // The read holds no lock, so a peer appender can truncate the sidecar
+        // in place mid-walk (torn-suffix repair, prior-generation compaction).
+        // A failed read whose size moved meanwhile re-reads; a stable size
+        // keeps the error, so real corruption still fails closed.
+        let mut resize_retries = 0_u32;
+        let read_result = loop {
+            let file_size = match file.file_size(cx) {
+                Ok(file_size) => file_size,
+                Err(error) => break Err(error),
+            };
+            let attempt = self
+                .read_latest_authorized_certificate(&file, cx, read_horizon, file_size)
+                .await;
+            if matches!(attempt, Err(FrankenError::WalCorrupt { .. }))
+                && resize_retries < CERTIFICATE_READ_RESIZE_RETRIES
+                && file.file_size(cx).is_ok_and(|current| current != file_size)
+            {
+                resize_retries += 1;
+                continue;
             }
-
-            // Healthy operation is O(1): the final four bytes identify the
-            // exact newest record, so only its footer and bytes are read.
-            let footer_size =
-                u64::try_from(ParallelWalDurableCertificateRecord::LENGTH_FOOTER_SIZE)
-                    .unwrap_or(4);
-            let mut newest = None;
-            if file_size >= footer_size {
-                let footer_offset = file_size - footer_size;
-                let footer = Self::read_certificate_sidecar_exact(
-                    &file,
-                    cx,
-                    footer_offset,
-                    ParallelWalDurableCertificateRecord::LENGTH_FOOTER_SIZE,
-                    "newest length footer",
-                )
-                .await?;
-                let record_len = usize::try_from(u32::from_le_bytes([
-                    footer[0], footer[1], footer[2], footer[3],
-                ]))
-                .map_err(|_| FrankenError::WalCorrupt {
-                    detail: "parallel WAL certificate newest footer length exceeds usize"
-                        .to_owned(),
-                })?;
-                let record_len_u64 = u64::try_from(record_len).unwrap_or(u64::MAX);
-                // GH#372: admit legacy-length footers too — an older release's
-                // records are shorter than this build's minimum — so the bytes
-                // are classified before the length alone rules them out.
-                if (MIN_LEGACY_DURABLE_CERTIFICATE_RECORD_SIZE
-                    ..=PARALLEL_WAL_MAX_DURABLE_CERTIFICATE_RECORD_SIZE)
-                    .contains(&record_len)
-                    && record_len_u64 <= file_size
-                {
-                    let record_start = file_size - record_len_u64;
-                    let bytes = Self::read_certificate_sidecar_exact(
-                        &file,
-                        cx,
-                        record_start,
-                        record_len,
-                        "newest record",
-                    )
-                    .await?;
-                    // bd-85x9y / GH#364 + GH#372: a well-formed record from a
-                    // legacy build (the pre-identity v3 envelope, or the
-                    // original v2 one) is an absent certificate, not corruption.
-                    // Return None so recovery does not fail closed on a sidecar
-                    // left behind by a prior release. Any other bad version
-                    // decodes strictly below and is caught as corruption.
-                    if durable_certificate_is_complete_legacy_envelope(&bytes, record_len) {
-                        tracing::debug!(
-                            target: "fsqlite::wal::durability_combiner",
-                            legacy_record_version = durable_certificate_declared_version(&bytes),
-                            "ignored durable certificate sidecar from a legacy record version"
-                        );
-                        return Ok(None);
-                    }
-                    // A matching magic or self-declared length makes this a
-                    // fully-present envelope candidate. Strict decoding is
-                    // mandatory even when its magic/version/CRC/footer is
-                    // corrupt; complete corruption is never a torn suffix.
-                    if record_len >= MIN_DURABLE_CERTIFICATE_RECORD_SIZE
-                        && (bytes.starts_with(&PARALLEL_WAL_DURABLE_CERTIFICATE_MAGIC)
-                            || durable_certificate_declares_len(&bytes, record_len))
-                    {
-                        let record =
-                            decode_durable_certificate_record(&bytes, "newest record")?;
-                        newest = Some((record_start, record));
-                    }
-                }
-            }
-
-            if newest.is_none() {
-                // Invalid EOF footer means the last append may have torn.
-                // Search only footer-derived candidates within one maximum
-                // suffix, retaining enough preceding bytes for one maximum
-                // anchor record. Magic is only a cheap validation after a
-                // candidate footer establishes an exact boundary; it is never
-                // used as a free-form scan key.
-                let recovery_window_size =
-                    PARALLEL_WAL_MAX_DURABLE_CERTIFICATE_RECORD_SIZE.saturating_mul(2);
-                let recovery_window_size_u64 =
-                    u64::try_from(recovery_window_size).unwrap_or(u64::MAX);
-                let tail_offset = file_size.saturating_sub(recovery_window_size_u64);
-                let tail_len =
-                    usize::try_from(file_size - tail_offset).map_err(|_| {
-                        FrankenError::WalCorrupt {
-                            detail: "parallel WAL certificate recovery window exceeds usize"
-                                .to_owned(),
-                        }
-                    })?;
-                let tail = Self::read_certificate_sidecar_exact(
-                    &file,
-                    cx,
-                    tail_offset,
-                    tail_len,
-                    "recovery window",
-                )
-                .await?;
-                let minimum_candidate_end = tail
-                    .len()
-                    .saturating_sub(PARALLEL_WAL_MAX_DURABLE_CERTIFICATE_RECORD_SIZE)
-                    .max(ParallelWalDurableCertificateRecord::LENGTH_FOOTER_SIZE);
-                let mut anchor = None;
-                for candidate_end in (minimum_candidate_end..tail.len()).rev() {
-                    let footer_start = candidate_end
-                        - ParallelWalDurableCertificateRecord::LENGTH_FOOTER_SIZE;
-                    let footer = &tail[footer_start..candidate_end];
-                    let record_len = usize::try_from(u32::from_le_bytes([
-                        footer[0], footer[1], footer[2], footer[3],
-                    ]))
-                    .unwrap_or(usize::MAX);
-                    if !(MIN_LEGACY_DURABLE_CERTIFICATE_RECORD_SIZE
-                        ..=PARALLEL_WAL_MAX_DURABLE_CERTIFICATE_RECORD_SIZE)
-                        .contains(&record_len)
-                        || record_len > candidate_end
-                    {
-                        continue;
-                    }
-                    let record_start = candidate_end - record_len;
-                    let record_bytes = &tail[record_start..candidate_end];
-                    if !record_bytes.starts_with(&PARALLEL_WAL_DURABLE_CERTIFICATE_MAGIC)
-                        || !durable_certificate_declares_len(record_bytes, record_len)
-                    {
-                        continue;
-                    }
-                    // GH#372: a legacy envelope at an exact footer boundary
-                    // means the whole sidecar predates this build — absent.
-                    if durable_certificate_is_legacy_envelope(record_bytes) {
-                        tracing::debug!(
-                            target: "fsqlite::wal::durability_combiner",
-                            legacy_record_version =
-                                durable_certificate_declared_version(record_bytes),
-                            "ignored durable certificate sidecar from a legacy record version"
-                        );
-                        return Ok(None);
-                    }
-                    if record_len >= MIN_DURABLE_CERTIFICATE_RECORD_SIZE
-                        && let Ok(record) =
-                            ParallelWalDurableCertificateRecord::from_bytes(record_bytes)
-                    {
-                        anchor = Some((record_start, candidate_end, record));
-                        break;
-                    }
-                }
-
-                if let Some((record_start, record_end, record)) = anchor {
-                    validate_incomplete_certificate_suffix(&tail[record_end..], true)?;
-                    let absolute_start = tail_offset
-                        .checked_add(u64::try_from(record_start).unwrap_or(u64::MAX))
-                        .ok_or_else(|| FrankenError::WalCorrupt {
-                            detail:
-                                "parallel WAL certificate recovery anchor offset overflow"
-                                    .to_owned(),
-                        })?;
-                    newest = Some((absolute_start, record));
-                } else {
-                    if file_size
-                        > u64::try_from(PARALLEL_WAL_MAX_DURABLE_CERTIFICATE_RECORD_SIZE)
-                            .unwrap_or(u64::MAX)
-                    {
-                        return Err(FrankenError::WalCorrupt {
-                            detail: format!(
-                                "parallel WAL certificate sidecar has no valid record within its bounded {}-byte recovery suffix",
-                                PARALLEL_WAL_MAX_DURABLE_CERTIFICATE_RECORD_SIZE
-                            ),
-                        });
-                    }
-                    validate_incomplete_certificate_suffix(&tail, false)?;
-                    return Ok(None);
-                }
-            }
-
-            let physical_frame_count = u64::try_from(self.inner.frame_count()).unwrap_or(u64::MAX);
-            let wal_generation = self.inner.inner().generation_identity();
-            if read_horizon.is_some_and(|horizon| horizon.generation != wal_generation) {
-                return Ok(None);
-            }
-            let valid_frame_count = read_horizon.map_or(physical_frame_count, |horizon| {
-                horizon.last_commit_frame.map_or(0, |end| {
-                    u64::try_from(end).unwrap_or(u64::MAX).saturating_add(1)
-                }).min(physical_frame_count)
-            });
-            let (mut record_start, mut record) = newest.ok_or_else(|| {
-                FrankenError::WalCorrupt {
-                    detail: "parallel WAL certificate recovery produced no record".to_owned(),
-                }
-            })?;
-            let mut unauthorized_records = 0_usize;
-            loop {
-                // Append order is generation order. Once the newest tail
-                // belongs to a prior reset generation, no earlier sidecar
-                // record can authorize the current WAL; checkpoint clock
-                // continuation comes from the fixed handoff anchor instead.
-                if record.wal_generation != wal_generation {
-                    return Ok(None);
-                }
-                // bd-85x9y / GH#364 defense-in-depth: a record bound to a
-                // DIFFERENT database identity means the whole -wal-cert sidecar
-                // belongs to a replaced file. No record in it can authorize this
-                // database, so treat the certificate as absent. Fires only on a
-                // positive cross-identity conflict (never on unknown/legacy
-                // identity), preserving a valid same-file certificate.
-                if self.db_file_identity_rejects_record(&record) {
-                    tracing::debug!(
-                        target: "fsqlite::wal::durability_combiner",
-                        "ignored durable certificate sidecar bound to a foreign database identity"
-                    );
-                    return Ok(None);
-                }
-                if record.wal_frame_end <= valid_frame_count
-                    && self
-                        .authorized_certificate_record
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .as_ref()
-                        == Some(&record)
-                {
-                    return Ok(Some(record));
-                }
-                let frame_index =
-                    usize::try_from(record.wal_frame_end.saturating_sub(1)).map_err(|_| {
-                        FrankenError::WalCorrupt {
-                            detail: "parallel WAL certificate commit-marker index exceeds usize"
-                                .to_owned(),
-                        }
-                    })?;
-                let commit_marker_frame = if record.wal_frame_end <= valid_frame_count
-                    && frame_index < self.inner.frame_count()
-                    && self
-                        .inner
-                        .inner()
-                        .read_frame_header(cx, frame_index)
-                        .await?
-                        .is_commit()
-                {
-                    record.wal_frame_end
-                } else {
-                    0
-                };
-                let actual_wal_frame_payload_digest =
-                    if commit_marker_frame == record.wal_frame_end {
-                        Some(
-                            self.wal_frame_payload_digest(
-                                cx,
-                                record.wal_frame_start,
-                                record.wal_frame_end,
-                            )
-                            .await?,
-                        )
-                    } else {
-                        None
-                    };
-                if actual_wal_frame_payload_digest.is_some_and(|actual_digest| {
-                    record.authorizes_wal_boundary(
-                        wal_generation,
-                        valid_frame_count,
-                        commit_marker_frame,
-                        actual_digest,
-                    )
-                }) {
-                    *self
-                        .authorized_certificate_record
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(record.clone());
-                    return Ok(Some(record));
-                }
-
-                // A current-generation record whose committed boundary lies
-                // beyond this reader's frame snapshot is not an orphan:
-                // concurrent committers keep appending certificates while the
-                // walk runs, so records newer than the snapshot are expected
-                // under write load and must not consume the bounded orphan
-                // budget (bd-e0ghc: three writers racing a concurrent BEGIN
-                // exhausted the 64-record lookback on a healthy database).
-                // Genuine orphans — records inside the snapshot that fail the
-                // commit-marker or digest checks — still count, so real
-                // sidecar corruption trips the bound exactly as before. The
-                // walk itself stays terminating either way: record_start is
-                // strictly decreasing and stops at zero.
-                if record.wal_frame_end > valid_frame_count {
-                    tracing::debug!(
-                        target: "fsqlite::wal::durability_combiner",
-                        future_certificate_epoch = record.certificate.certificate_epoch,
-                        future_commit_seq_hi = record.certificate.commit_seq_hi.get(),
-                        future_wal_frame_end = record.wal_frame_end,
-                        valid_frame_count,
-                        "skipped parallel WAL certificate newer than reader frame snapshot"
-                    );
-                } else {
-                    unauthorized_records = unauthorized_records.saturating_add(1);
-                    if unauthorized_records > MAX_ORPHAN_CERTIFICATE_LOOKBACK {
-                        return Err(FrankenError::WalCorrupt {
-                            detail: format!(
-                                "parallel WAL certificate sidecar exceeded bounded orphan lookback {MAX_ORPHAN_CERTIFICATE_LOOKBACK}"
-                            ),
-                        });
-                    }
-                    tracing::debug!(
-                        target: "fsqlite::wal::durability_combiner",
-                        orphan_certificate_epoch = record.certificate.certificate_epoch,
-                        orphan_commit_seq_hi = record.certificate.commit_seq_hi.get(),
-                        orphan_wal_frame_end = record.wal_frame_end,
-                        lookback = unauthorized_records,
-                        "ignored unauthorized parallel WAL certificate tail"
-                    );
-                }
-                if record_start == 0 {
-                    return Ok(None);
-                }
-                // GH#372: `None` means the record below is a legacy envelope
-                // from an older release; nothing older can authorize this WAL.
-                let Some(previous) =
-                    Self::read_certificate_record_ending_at(&file, cx, record_start).await?
-                else {
-                    return Ok(None);
-                };
-                (record_start, record) = previous;
-            }
-        }
-        .await;
+            break attempt;
+        };
         match read_result {
             // Success: retain the descriptor for the next call rather than
             // closing it. The read is read-only, so deferring the close (to
@@ -5726,6 +5476,326 @@ where
                 let _ = file.close(&cleanup_cx);
                 Err(error)
             }
+        }
+    }
+
+    /// One pass of [`Self::latest_authorized_durable_certificate_record`]
+    /// over the sidecar as it was `file_size` bytes long.
+    async fn read_latest_authorized_certificate(
+        &self,
+        file: &V::File,
+        cx: &Cx,
+        read_horizon: Option<WalPublicationSnapshot>,
+        file_size: u64,
+    ) -> Result<Option<ParallelWalDurableCertificateRecord>> {
+        if file_size == 0 {
+            return Ok(None);
+        }
+
+        // Healthy operation is O(1): the final four bytes identify the
+        // exact newest record, so only its footer and bytes are read.
+        let footer_size =
+            u64::try_from(ParallelWalDurableCertificateRecord::LENGTH_FOOTER_SIZE).unwrap_or(4);
+        let mut newest = None;
+        if file_size >= footer_size {
+            let footer_offset = file_size - footer_size;
+            let footer = Self::read_certificate_sidecar_exact(
+                file,
+                cx,
+                footer_offset,
+                ParallelWalDurableCertificateRecord::LENGTH_FOOTER_SIZE,
+                "newest length footer",
+            )
+            .await?;
+            let record_len = usize::try_from(u32::from_le_bytes([
+                footer[0], footer[1], footer[2], footer[3],
+            ]))
+            .map_err(|_| FrankenError::WalCorrupt {
+                detail: "parallel WAL certificate newest footer length exceeds usize".to_owned(),
+            })?;
+            let record_len_u64 = u64::try_from(record_len).unwrap_or(u64::MAX);
+            // GH#372: admit legacy-length footers too — an older release's
+            // records are shorter than this build's minimum — so the bytes
+            // are classified before the length alone rules them out.
+            if (MIN_LEGACY_DURABLE_CERTIFICATE_RECORD_SIZE
+                ..=PARALLEL_WAL_MAX_DURABLE_CERTIFICATE_RECORD_SIZE)
+                .contains(&record_len)
+                && record_len_u64 <= file_size
+            {
+                let record_start = file_size - record_len_u64;
+                let bytes = Self::read_certificate_sidecar_exact(
+                    file,
+                    cx,
+                    record_start,
+                    record_len,
+                    "newest record",
+                )
+                .await?;
+                // bd-85x9y / GH#364 + GH#372: a well-formed record from a
+                // legacy build (the pre-identity v3 envelope, or the
+                // original v2 one) is an absent certificate, not corruption.
+                // Return None so recovery does not fail closed on a sidecar
+                // left behind by a prior release. Any other bad version
+                // decodes strictly below and is caught as corruption.
+                if durable_certificate_is_complete_legacy_envelope(&bytes, record_len) {
+                    tracing::debug!(
+                        target: "fsqlite::wal::durability_combiner",
+                        legacy_record_version = durable_certificate_declared_version(&bytes),
+                        "ignored durable certificate sidecar from a legacy record version"
+                    );
+                    return Ok(None);
+                }
+                // A matching magic or self-declared length makes this a
+                // fully-present envelope candidate. Strict decoding is
+                // mandatory even when its magic/version/CRC/footer is
+                // corrupt; complete corruption is never a torn suffix.
+                if record_len >= MIN_DURABLE_CERTIFICATE_RECORD_SIZE
+                    && (bytes.starts_with(&PARALLEL_WAL_DURABLE_CERTIFICATE_MAGIC)
+                        || durable_certificate_declares_len(&bytes, record_len))
+                {
+                    let record = decode_durable_certificate_record(&bytes, "newest record")?;
+                    newest = Some((record_start, record));
+                }
+            }
+        }
+
+        if newest.is_none() {
+            // Invalid EOF footer means the last append may have torn.
+            // Search only footer-derived candidates within one maximum
+            // suffix, retaining enough preceding bytes for one maximum
+            // anchor record. Magic is only a cheap validation after a
+            // candidate footer establishes an exact boundary; it is never
+            // used as a free-form scan key.
+            let recovery_window_size =
+                PARALLEL_WAL_MAX_DURABLE_CERTIFICATE_RECORD_SIZE.saturating_mul(2);
+            let recovery_window_size_u64 = u64::try_from(recovery_window_size).unwrap_or(u64::MAX);
+            let tail_offset = file_size.saturating_sub(recovery_window_size_u64);
+            let tail_len =
+                usize::try_from(file_size - tail_offset).map_err(|_| FrankenError::WalCorrupt {
+                    detail: "parallel WAL certificate recovery window exceeds usize".to_owned(),
+                })?;
+            let tail = Self::read_certificate_sidecar_exact(
+                file,
+                cx,
+                tail_offset,
+                tail_len,
+                "recovery window",
+            )
+            .await?;
+            let minimum_candidate_end = tail
+                .len()
+                .saturating_sub(PARALLEL_WAL_MAX_DURABLE_CERTIFICATE_RECORD_SIZE)
+                .max(ParallelWalDurableCertificateRecord::LENGTH_FOOTER_SIZE);
+            let mut anchor = None;
+            for candidate_end in (minimum_candidate_end..tail.len()).rev() {
+                let footer_start =
+                    candidate_end - ParallelWalDurableCertificateRecord::LENGTH_FOOTER_SIZE;
+                let footer = &tail[footer_start..candidate_end];
+                let record_len = usize::try_from(u32::from_le_bytes([
+                    footer[0], footer[1], footer[2], footer[3],
+                ]))
+                .unwrap_or(usize::MAX);
+                if !(MIN_LEGACY_DURABLE_CERTIFICATE_RECORD_SIZE
+                    ..=PARALLEL_WAL_MAX_DURABLE_CERTIFICATE_RECORD_SIZE)
+                    .contains(&record_len)
+                    || record_len > candidate_end
+                {
+                    continue;
+                }
+                let record_start = candidate_end - record_len;
+                let record_bytes = &tail[record_start..candidate_end];
+                if !record_bytes.starts_with(&PARALLEL_WAL_DURABLE_CERTIFICATE_MAGIC)
+                    || !durable_certificate_declares_len(record_bytes, record_len)
+                {
+                    continue;
+                }
+                // GH#372: a legacy envelope at an exact footer boundary
+                // means the whole sidecar predates this build — absent.
+                if durable_certificate_is_legacy_envelope(record_bytes) {
+                    tracing::debug!(
+                        target: "fsqlite::wal::durability_combiner",
+                        legacy_record_version =
+                            durable_certificate_declared_version(record_bytes),
+                        "ignored durable certificate sidecar from a legacy record version"
+                    );
+                    return Ok(None);
+                }
+                if record_len >= MIN_DURABLE_CERTIFICATE_RECORD_SIZE
+                    && let Ok(record) =
+                        ParallelWalDurableCertificateRecord::from_bytes(record_bytes)
+                {
+                    anchor = Some((record_start, candidate_end, record));
+                    break;
+                }
+            }
+
+            if let Some((record_start, record_end, record)) = anchor {
+                validate_incomplete_certificate_suffix(&tail[record_end..], true)?;
+                let absolute_start = tail_offset
+                    .checked_add(u64::try_from(record_start).unwrap_or(u64::MAX))
+                    .ok_or_else(|| FrankenError::WalCorrupt {
+                        detail: "parallel WAL certificate recovery anchor offset overflow"
+                            .to_owned(),
+                    })?;
+                newest = Some((absolute_start, record));
+            } else {
+                if file_size
+                    > u64::try_from(PARALLEL_WAL_MAX_DURABLE_CERTIFICATE_RECORD_SIZE)
+                        .unwrap_or(u64::MAX)
+                {
+                    return Err(FrankenError::WalCorrupt {
+                        detail: format!(
+                            "parallel WAL certificate sidecar has no valid record within its bounded {}-byte recovery suffix",
+                            PARALLEL_WAL_MAX_DURABLE_CERTIFICATE_RECORD_SIZE
+                        ),
+                    });
+                }
+                validate_incomplete_certificate_suffix(&tail, false)?;
+                return Ok(None);
+            }
+        }
+
+        let physical_frame_count = u64::try_from(self.inner.frame_count()).unwrap_or(u64::MAX);
+        let wal_generation = self.inner.inner().generation_identity();
+        if read_horizon.is_some_and(|horizon| horizon.generation != wal_generation) {
+            return Ok(None);
+        }
+        let valid_frame_count = read_horizon.map_or(physical_frame_count, |horizon| {
+            horizon
+                .last_commit_frame
+                .map_or(0, |end| {
+                    u64::try_from(end).unwrap_or(u64::MAX).saturating_add(1)
+                })
+                .min(physical_frame_count)
+        });
+        let (mut record_start, mut record) = newest.ok_or_else(|| FrankenError::WalCorrupt {
+            detail: "parallel WAL certificate recovery produced no record".to_owned(),
+        })?;
+        let mut unauthorized_records = 0_usize;
+        loop {
+            // Append order is generation order. Once the newest tail
+            // belongs to a prior reset generation, no earlier sidecar
+            // record can authorize the current WAL; checkpoint clock
+            // continuation comes from the fixed handoff anchor instead.
+            if record.wal_generation != wal_generation {
+                return Ok(None);
+            }
+            // bd-85x9y / GH#364 defense-in-depth: a record bound to a
+            // DIFFERENT database identity means the whole -wal-cert sidecar
+            // belongs to a replaced file. No record in it can authorize this
+            // database, so treat the certificate as absent. Fires only on a
+            // positive cross-identity conflict (never on unknown/legacy
+            // identity), preserving a valid same-file certificate.
+            if self.db_file_identity_rejects_record(&record) {
+                tracing::debug!(
+                    target: "fsqlite::wal::durability_combiner",
+                    "ignored durable certificate sidecar bound to a foreign database identity"
+                );
+                return Ok(None);
+            }
+            if record.wal_frame_end <= valid_frame_count
+                && self
+                    .authorized_certificate_record
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_ref()
+                    == Some(&record)
+            {
+                return Ok(Some(record));
+            }
+            let frame_index =
+                usize::try_from(record.wal_frame_end.saturating_sub(1)).map_err(|_| {
+                    FrankenError::WalCorrupt {
+                        detail: "parallel WAL certificate commit-marker index exceeds usize"
+                            .to_owned(),
+                    }
+                })?;
+            let commit_marker_frame = if record.wal_frame_end <= valid_frame_count
+                && frame_index < self.inner.frame_count()
+                && self
+                    .inner
+                    .inner()
+                    .read_frame_header(cx, frame_index)
+                    .await?
+                    .is_commit()
+            {
+                record.wal_frame_end
+            } else {
+                0
+            };
+            let actual_wal_frame_payload_digest = if commit_marker_frame == record.wal_frame_end {
+                Some(
+                    self.wal_frame_payload_digest(cx, record.wal_frame_start, record.wal_frame_end)
+                        .await?,
+                )
+            } else {
+                None
+            };
+            if actual_wal_frame_payload_digest.is_some_and(|actual_digest| {
+                record.authorizes_wal_boundary(
+                    wal_generation,
+                    valid_frame_count,
+                    commit_marker_frame,
+                    actual_digest,
+                )
+            }) {
+                *self
+                    .authorized_certificate_record
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(record.clone());
+                return Ok(Some(record));
+            }
+
+            // A current-generation record whose committed boundary lies
+            // beyond this reader's frame snapshot is not an orphan:
+            // concurrent committers keep appending certificates while the
+            // walk runs, so records newer than the snapshot are expected
+            // under write load and must not consume the bounded orphan
+            // budget (bd-e0ghc: three writers racing a concurrent BEGIN
+            // exhausted the 64-record lookback on a healthy database).
+            // Genuine orphans — records inside the snapshot that fail the
+            // commit-marker or digest checks — still count, so real
+            // sidecar corruption trips the bound exactly as before. The
+            // walk itself stays terminating either way: record_start is
+            // strictly decreasing and stops at zero.
+            if record.wal_frame_end > valid_frame_count {
+                tracing::debug!(
+                    target: "fsqlite::wal::durability_combiner",
+                    future_certificate_epoch = record.certificate.certificate_epoch,
+                    future_commit_seq_hi = record.certificate.commit_seq_hi.get(),
+                    future_wal_frame_end = record.wal_frame_end,
+                    valid_frame_count,
+                    "skipped parallel WAL certificate newer than reader frame snapshot"
+                );
+            } else {
+                unauthorized_records = unauthorized_records.saturating_add(1);
+                if unauthorized_records > MAX_ORPHAN_CERTIFICATE_LOOKBACK {
+                    return Err(FrankenError::WalCorrupt {
+                        detail: format!(
+                            "parallel WAL certificate sidecar exceeded bounded orphan lookback {MAX_ORPHAN_CERTIFICATE_LOOKBACK}"
+                        ),
+                    });
+                }
+                tracing::debug!(
+                    target: "fsqlite::wal::durability_combiner",
+                    orphan_certificate_epoch = record.certificate.certificate_epoch,
+                    orphan_commit_seq_hi = record.certificate.commit_seq_hi.get(),
+                    orphan_wal_frame_end = record.wal_frame_end,
+                    lookback = unauthorized_records,
+                    "ignored unauthorized parallel WAL certificate tail"
+                );
+            }
+            if record_start == 0 {
+                return Ok(None);
+            }
+            // GH#372: `None` means the record below is a legacy envelope
+            // from an older release; nothing older can authorize this WAL.
+            let Some(previous) =
+                Self::read_certificate_record_ending_at(file, cx, record_start).await?
+            else {
+                return Ok(None);
+            };
+            (record_start, record) = previous;
         }
     }
 }
@@ -6535,9 +6605,9 @@ where
                     }
                 });
             }
-            // bd-smxhz: the checkpoint reset the WAL generation and its
-            // -wal-cert sidecar, so the cached certificate descriptor is stale;
-            // drop it so the next read re-opens against the fresh generation.
+            // bd-smxhz: the checkpoint may have reset the WAL generation, so
+            // drop the cached certificate descriptor and let the next read
+            // re-open against the fresh generation.
             if let Some(mut stale) = self
                 .cached_certificate_read
                 .get_mut()
@@ -6742,6 +6812,9 @@ mod tests {
         fail_index_maps: bool,
         wal_header_reads_before_failure: Option<usize>,
         wal_header_reads_completed: usize,
+        /// A peer's in-place sidecar rewrite, run just before the next
+        /// `-wal-cert` read (after the reader sampled the size).
+        certificate_rewrite_before_read: Option<(MemoryVfs, Vec<u8>)>,
         sync_observations: Vec<CertificateSyncObservation>,
         /// Modelled stable storage of `test.db-wal` once tracking starts
         /// (bd-alyrn): writes stay volatile until a successful WAL sync.
@@ -6829,6 +6902,13 @@ mod tests {
             if result.is_ok() { self.faults.lock().unwrap().reset_header_written = true; }
             let close = file.close(cx);
             result.and(close)
+        }
+
+        fn rewrite_certificate_sidecar_before_next_read(&self, bytes: Vec<u8>) {
+            self.faults
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .certificate_rewrite_before_read = Some((self.inner.clone(), bytes));
         }
 
         fn take_sync_observations(&self) -> Vec<CertificateSyncObservation> {
@@ -6986,6 +7066,21 @@ mod tests {
             } else {
                 false
             };
+            if self.path.as_deref() == Some(Path::new(CERTIFICATE_PATH)) {
+                let rewrite = self
+                    .faults
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .certificate_rewrite_before_read
+                    .take();
+                if let Some((vfs, bytes)) = rewrite {
+                    let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::WAL;
+                    let (mut peer, _) = vfs.open(cx, Some(Path::new(CERTIFICATE_PATH)), flags)?;
+                    peer.truncate(cx, 0)?;
+                    peer.write(cx, &bytes, 0).await?;
+                    peer.close(cx)?;
+                }
+            }
             let bytes_read = self.inner.read(cx, buf, offset).await?;
             if observe_header && bytes_read == WAL_FRAME_HEADER_SIZE {
                 self.faults
@@ -9073,6 +9168,145 @@ mod tests {
         assert_eq!(
             logical.visible_commit_seq,
             post_checkpoint_receipt.certificate.commit_seq_hi
+        );
+    }
+
+    /// Certify one single-frame commit of page 1 at the WAL's next frame.
+    fn publish_certified_commit(
+        backend: &mut PathRefreshingWalBackend<MemoryVfs>,
+        cx: &Cx,
+        combiner: &fsqlite_wal::ParallelWalDurabilityCombiner,
+        batch_id: u64,
+    ) -> ParallelWalCommitCertificate {
+        let frame = u64::try_from(backend.inner.frame_count()).expect("frame count fits u64") + 1;
+        let page = sample_page(u8::try_from(batch_id % 256).expect("seed fits u8"));
+        let request = fsqlite_wal::ParallelWalDurabilityRequest {
+            trace_id: batch_id,
+            scenario_id: "certificate-sidecar-compaction".to_owned(),
+            certificate_epoch: 0,
+            durable_segment_epoch: 0,
+            batch_size: 1,
+            batch_ids: vec![batch_id],
+            lane_record_counts: vec![1],
+            db_size_pages: 1,
+            page_set_size: 1,
+            control_mode: fsqlite_wal::ParallelWalOperatingMode::Auto,
+            fallback_reason: None,
+            checkpoint_active: false,
+            wal_frame_payload_digest: test_frame_payload_digest(1, &page, 1),
+        };
+        combiner
+            .certify_and_publish(request, |certificate| {
+                backend
+                    .persist_parallel_wal_commit_certificate(cx, certificate, frame, frame)
+                    .wait()
+                    .and_then(|()| backend.append_frame(cx, 1, &page, 1).wait())
+                    .and_then(|()| backend.sync(cx))
+                    .map_err(|error| error.to_string())
+            })
+            .expect("publish certified commit")
+            .certificate
+    }
+
+    /// bd-reality-check-1022-llk6g.32: `-wal-cert` kept every certificate
+    /// since the database was created, because nothing removed the records a
+    /// WAL reset had made unreadable. The first append of a reset generation
+    /// now drops them, so the sidecar holds one generation at most.
+    #[test]
+    fn first_append_after_wal_reset_compacts_prior_generation_certificates() {
+        const COMMITS_PER_GENERATION: usize = 4;
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let mut backend = make_path_refreshing_backend(&vfs, &cx);
+        let combiner = fsqlite_wal::ParallelWalDurabilityCombiner::default();
+        let mut batch_id = 0;
+        for cycle in 0..3 {
+            let mut record_len = 0;
+            let mut latest = None;
+            for commit in 0..COMMITS_PER_GENERATION {
+                batch_id += 1;
+                let certificate =
+                    publish_certified_commit(&mut backend, &cx, &combiner, batch_id);
+                if commit == 0 {
+                    let sidecar = read_certificate_sidecar(&vfs, &cx);
+                    let record = ParallelWalDurableCertificateRecord::from_bytes(&sidecar)
+                        .expect("a generation's first append leaves exactly one record");
+                    assert_eq!(
+                        record.wal_generation,
+                        backend.inner.inner().generation_identity()
+                    );
+                    assert_eq!(record.certificate, certificate);
+                    record_len = sidecar.len();
+                }
+                latest = Some(certificate);
+            }
+            let sidecar_len = read_certificate_sidecar(&vfs, &cx).len();
+            assert_eq!(
+                sidecar_len,
+                COMMITS_PER_GENERATION * record_len,
+                "cycle {cycle}: only the current generation's records remain"
+            );
+            assert_eq!(
+                backend
+                    .latest_authorized_parallel_wal_commit_certificate(&cx)
+                    .expect("read the newest certificate"),
+                latest
+            );
+
+            let mut checkpoint_writer = MockCheckpointPageWriter;
+            let checkpoint = backend
+                .checkpoint(
+                    &cx,
+                    CheckpointMode::Truncate,
+                    &mut checkpoint_writer,
+                    0,
+                    None,
+                )
+                .expect("truncate checkpoint resets the WAL generation");
+            assert!(checkpoint.wal_was_reset);
+            // Readers already treat the old records as absent; they stay on
+            // disk until the new generation's first append replaces them.
+            assert_eq!(read_certificate_sidecar(&vfs, &cx).len(), sidecar_len);
+        }
+    }
+
+    /// The certificate read holds no lock, so a peer can truncate the sidecar
+    /// in place between this reader's size sample and its reads (orphan
+    /// reconciliation, torn-suffix repair, generation compaction). The read
+    /// must re-sample rather than report the short read as corruption.
+    #[test]
+    fn certificate_read_rereads_when_a_peer_shrinks_the_sidecar_mid_read() {
+        let cx = test_cx();
+        let vfs = CheckpointHandoffFaultVfs::new();
+        let (mut backend, first, _) = make_checkpoint_handoff_fault_backend(&vfs, &cx);
+        let first_only = read_certificate_sidecar(&vfs.inner, &cx);
+
+        let second_page = sample_page(0x48);
+        let mut second = sample_certificate(2, 2, vec![1]);
+        second.wal_frame_payload_digest = test_frame_payload_digest(1, &second_page, 1);
+        second.certificate_crc32c = second.computed_crc32c();
+        backend
+            .persist_parallel_wal_commit_certificate(&cx, &second, 2, 2)
+            .expect("persist second certificate");
+        backend
+            .append_frame(&cx, 1, &second_page, 1)
+            .expect("append second commit marker");
+        backend.sync(&cx).expect("sync second commit marker");
+        assert_eq!(
+            backend
+                .latest_authorized_parallel_wal_commit_certificate(&cx)
+                .expect("read the second certificate"),
+            Some(second)
+        );
+
+        // A peer drops the newest record after this reader sampled the
+        // two-record size, so the footer read lands past the new EOF.
+        vfs.rewrite_certificate_sidecar_before_next_read(first_only);
+        assert_eq!(
+            backend
+                .latest_authorized_parallel_wal_commit_certificate(&cx)
+                .expect("a read cut short by a peer's in-place truncate re-reads"),
+            Some(first)
         );
     }
 

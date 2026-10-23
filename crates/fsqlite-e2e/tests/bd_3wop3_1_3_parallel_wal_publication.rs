@@ -25,6 +25,8 @@ const ORACLE: &str = "rusqlite";
 const ALLOWED_DIFFERENCE_POLICY: &str = "none";
 const BASELINE_COMPARATOR: &str = "sqlite3_c1_baseline";
 const POLICY_ID: &str = "parallel_wal_control.v1";
+/// Commits the publication workload makes after its TRUNCATE checkpoint.
+const POST_RESET_PUBLICATIONS: usize = 1;
 const REPLAY_COMMAND: &str = "cargo test -p fsqlite-e2e --test bd_3wop3_1_3_parallel_wal_publication -- --nocapture --test-threads=1";
 const CHILD_TEST_NAME: &str = "bd_3wop3_1_3_parallel_wal_publication_child_entrypoint";
 const PERFORMANCE_CHILD_TEST_NAME: &str =
@@ -74,6 +76,7 @@ struct PublicationRunSummary {
     integrity_check: String,
     publication_events: usize,
     durable_certificate_records: usize,
+    durable_certificate_commit_seq_ranges: Vec<(u64, u64)>,
     commit_certificates: Vec<u64>,
     commit_seq_ranges: Vec<(u64, u64)>,
     durability_sequences: Vec<u64>,
@@ -288,7 +291,7 @@ fn summarize_publication_logs(
     mode: &str,
     final_rows: Vec<FinalRow>,
     integrity_check: String,
-    durable_certificate_records: usize,
+    durable_certificate_commit_seq_ranges: Vec<(u64, u64)>,
 ) -> PublicationRunSummary {
     const REQUIRED_FIELDS: [&str; 15] = [
         "trace_id",
@@ -402,7 +405,8 @@ fn summarize_publication_logs(
         final_rows,
         integrity_check,
         publication_events: commit_certificates.len(),
-        durable_certificate_records,
+        durable_certificate_records: durable_certificate_commit_seq_ranges.len(),
+        durable_certificate_commit_seq_ranges,
         commit_certificates,
         commit_seq_ranges,
         durability_sequences,
@@ -515,7 +519,15 @@ async fn run_child_workload(run_dir: &Path, mode: &str) -> PublicationRunSummary
         mode,
         final_rows,
         integrity_check,
-        durable_records.len(),
+        durable_records
+            .iter()
+            .map(|record| {
+                (
+                    record.certificate.commit_seq_lo.get(),
+                    record.certificate.commit_seq_hi.get(),
+                )
+            })
+            .collect(),
     )
 }
 
@@ -869,9 +881,21 @@ fn assert_monotonic_publication(summary: &PublicationRunSummary) {
         summary.mode,
         summary.publication_events
     );
+    // The workload's TRUNCATE checkpoint resets the WAL before its last
+    // commit, and the first append of the new generation drops the older
+    // generation's records (bd-reality-check-1022-llk6g.32). The sidecar
+    // holds exactly the post-reset publications, which are the newest.
+    let mut published = summary.commit_seq_ranges.clone();
+    published.sort_unstable();
     assert_eq!(
-        summary.publication_events, summary.durable_certificate_records,
-        "bead_id={BEAD_ID} case={}_every_publication_has_one_reconstructible_durable_certificate",
+        summary.durable_certificate_records, POST_RESET_PUBLICATIONS,
+        "bead_id={BEAD_ID} case={}_sidecar_holds_only_the_current_generation",
+        summary.mode
+    );
+    assert_eq!(
+        summary.durable_certificate_commit_seq_ranges,
+        published[published.len().saturating_sub(POST_RESET_PUBLICATIONS)..],
+        "bead_id={BEAD_ID} case={}_every_current_generation_publication_has_one_reconstructible_durable_certificate",
         summary.mode
     );
     assert!(
