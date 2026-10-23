@@ -3070,6 +3070,23 @@ still serves as an authoritative reference.
   and 16-byte tag (40 bytes total) consume reserved space in each page, and
   encrypted databases will not be readable without the key, even by C SQLite.
 - **Native mode databases are not directly readable by C SQLite.** The ECS commit stream format is FrankenSQLite-specific. Compatibility export (`compat/foo.db`) materializes a standard SQLite file on demand.
+- **Some schema text and diagnostics differ from stock SQLite.** The schemas
+  are equivalent, but tools that compare text will see these differences:
+  - `ALTER TABLE ... RENAME TO` and `RENAME COLUMN` rebuild the affected
+    `CREATE` statements in `sqlite_schema` from the parsed statement. Stock
+    SQLite edits the original text in place, so it keeps comments and spacing
+    and writes a renamed table's name quoted (`"t5"`). FrankenSQLite's
+    rewritten text drops comments, normalizes spacing, and leaves the name
+    unquoted.
+  - When `ALTER TABLE ... DROP COLUMN` is refused because a trigger uses the
+    column, stock SQLite repeats the reference as written
+    (`no such column: new.c`). FrankenSQLite reports only the column name
+    (`no such column: c`).
+  - The `fsqlite` shell draws `EXPLAIN QUERY PLAN` output as the same tree the
+    stock shell draws. The lines in that tree describe FrankenSQLite's own
+    planner, so they can differ from stock: for example, there is no
+    `LIST SUBQUERY` node for `IN (SELECT ...)`, and index choices can differ.
+  - The `rtreecheck()` SQL function is not provided.
 
 Limitations documented in earlier revisions of this README that are now fixed
 and regression-kept include: R-tree `UPDATE`/`INSERT OR REPLACE` (#208, #214),

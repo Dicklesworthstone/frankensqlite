@@ -6773,6 +6773,10 @@ fn pragma_table_function_columns(name: &str) -> Option<&'static [&'static str]> 
         // No-argument pragma TVF: `SELECT * FROM pragma_collation_list()` reuses
         // the `PRAGMA collation_list` row generator (bd-5m52m).
         Some(&PRAGMA_COLLATION_LIST_COLUMNS)
+    } else if pragma.eq_ignore_ascii_case("table_list") {
+        // `pragma_table_list` and `pragma_table_list('t')` reuse the
+        // `PRAGMA table_list[(t)]` row generator (bd-reality-check-1022-llk6g.28).
+        Some(&PRAGMA_TABLE_LIST_COLUMNS)
     } else {
         None
     }
@@ -6799,6 +6803,7 @@ fn pragma_table_function_is_no_arg(name: &str) -> bool {
         || pragma.eq_ignore_ascii_case("compile_options")
         || pragma.eq_ignore_ascii_case("function_list")
         || pragma.eq_ignore_ascii_case("collation_list")
+        || pragma.eq_ignore_ascii_case("table_list")
 }
 
 struct HtmMetricsVtab;
@@ -21668,6 +21673,18 @@ impl Connection {
             0
         };
         table.columns.len().saturating_add(hidden_columns)
+    }
+
+    /// A view's `ncol` in `PRAGMA table_list`: stock prepares the view to
+    /// count its columns, so a view without a column list reports the width
+    /// of its SELECT rather than 0.
+    fn pragma_table_list_view_column_count(&self, view: &ViewDef) -> usize {
+        if view.columns.is_empty() {
+            self.select_result_column_names(&view.query, &[], &mut Vec::new())
+                .len()
+        } else {
+            view.columns.len()
+        }
     }
 
     #[cfg(feature = "ext-fts5")]
@@ -82750,7 +82767,7 @@ impl Connection {
                                         attached_schema,
                                         view.name.clone(),
                                         "view",
-                                        view.columns.len(),
+                                        conn.pragma_table_list_view_column_count(view),
                                         false,
                                         false,
                                     )
@@ -82812,7 +82829,7 @@ impl Connection {
                                 if view.temporary { "temp" } else { "main" },
                                 view.name.clone(),
                                 "view",
-                                view.columns.len(),
+                                self.pragma_table_list_view_column_count(view),
                                 false,
                                 false,
                             )
@@ -82866,7 +82883,7 @@ impl Connection {
                                         attached_schema,
                                         view.name.clone(),
                                         "view",
-                                        view.columns.len(),
+                                        conn.pragma_table_list_view_column_count(view),
                                         false,
                                         false,
                                     )

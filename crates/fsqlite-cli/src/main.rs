@@ -978,9 +978,21 @@ where
             None
         };
         let timer = output_options.timer.then(StatementTimer::start);
+        let is_query_plan = matches!(
+            statement,
+            fsqlite_ast::Statement::Explain {
+                query_plan: true,
+                ..
+            }
+        );
         match connection.query(statement_sql).await {
             Ok(rows) => {
-                if write_rows(&rows, column_names.as_deref(), output_options, out).is_err() {
+                let written = if is_query_plan {
+                    write_query_plan_tree(&rows, out)
+                } else {
+                    write_rows(&rows, column_names.as_deref(), output_options, out)
+                };
+                if written.is_err() {
                     let _ = writeln!(err, "error: failed writing query results");
                     return false;
                 }
@@ -1102,6 +1114,73 @@ where
             out,
         ),
     }
+}
+
+/// Deepest indentation the stock shell renders; it stops descending once
+/// the prefix would overflow its 100-byte buffer (shell.c `eqp_render_level`).
+const QUERY_PLAN_MAX_PREFIX: usize = 100 - 7;
+
+/// Writes `EXPLAIN QUERY PLAN` rows (`id|parent|notused|detail`) as the
+/// stock shell's tree, which it prints in every output mode:
+///
+/// ```text
+/// QUERY PLAN
+/// |--SEARCH a USING INTEGER PRIMARY KEY (rowid=?)
+/// `--LIST SUBQUERY 1
+///    `--SCAN b
+/// ```
+///
+/// Each row is printed under the row whose id is its parent, in row order.
+fn write_query_plan_tree<W>(rows: &[Row], out: &mut W) -> io::Result<()>
+where
+    W: Write,
+{
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let nodes: Vec<(i64, i64, Cow<'_, [u8]>)> = rows
+        .iter()
+        .map(|row| {
+            let values = row.values();
+            let integer_at = |index: usize| values.get(index).map_or(0, SqliteValue::to_integer);
+            let detail = values
+                .get(3)
+                .map_or(Cow::Borrowed(&b""[..]), render_display_value);
+            (integer_at(0), integer_at(1), detail)
+        })
+        .collect();
+    out.write_all(b"QUERY PLAN\n")?;
+    let mut prefix = Vec::new();
+    write_query_plan_level(&nodes, 0, &mut prefix, out)
+}
+
+fn write_query_plan_level<W>(
+    nodes: &[(i64, i64, Cow<'_, [u8]>)],
+    parent: i64,
+    prefix: &mut Vec<u8>,
+    out: &mut W,
+) -> io::Result<()>
+where
+    W: Write,
+{
+    let mut children = nodes
+        .iter()
+        .filter(|(_, node_parent, _)| *node_parent == parent);
+    let mut next = children.next();
+    while let Some((id, _, detail)) = next {
+        next = children.next();
+        out.write_all(prefix)?;
+        out.write_all(if next.is_some() { b"|--" } else { b"`--" })?;
+        out.write_all(detail)?;
+        out.write_all(b"\n")?;
+        if prefix.len() < QUERY_PLAN_MAX_PREFIX {
+            let depth = prefix.len();
+            prefix.extend_from_slice(if next.is_some() { b"|  " } else { b"   " });
+            write_query_plan_level(nodes, *id, prefix, out)?;
+            prefix.truncate(depth);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2699,9 +2778,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ANSI_BOLD_BLUE, ANSI_DIM, ANSI_GREEN, ANSI_MAGENTA, ANSI_RESET, OutputMode, OutputOptions,
-        ShellOptions, format_row, highlight_sql, parse_args, render_display_value, render_prompt,
-        run, run_with_shell_options, statement_complete, write_delimited_rows,
+        ANSI_BOLD_BLUE, ANSI_DIM, ANSI_GREEN, ANSI_MAGENTA, ANSI_RESET, Connection, OutputMode,
+        OutputOptions, ShellOptions, format_row, highlight_sql, parse_args, render_display_value,
+        render_prompt, run, run_with_shell_options, statement_complete, write_delimited_rows,
+        write_query_plan_tree,
     };
 
     fn parse_from(args: &[&str]) -> Result<super::CliOptions, String> {
@@ -3827,6 +3907,58 @@ SELECT 1 AS one, 'two,three' AS two;\n\
             assert_eq!(system_sqlite3_stdout(script.as_bytes()), expected);
             eprintln!("event=display_bytes_stock_verified sqlite={version}");
         }
+    }
+
+    #[test]
+    fn test_explain_query_plan_renders_stock_tree_in_every_mode() {
+        asupersync::test_utils::run_test(|| async {
+            let plan = "EXPLAIN QUERY PLAN SELECT x FROM a ORDER BY x;\n";
+            let script = format!(
+                "CREATE TABLE a(id INTEGER PRIMARY KEY, x);\n{plan}\
+                 .mode csv\n.headers on\n{plan}.mode line\n{plan}.mode column\n{plan}"
+            );
+            let tree = b"QUERY PLAN\n|--SCAN a\n`--USE TEMP B-TREE FOR ORDER BY\n";
+            assert_display_script_matches_stock(&script, &tree.repeat(4)).await;
+        });
+    }
+
+    #[test]
+    fn test_query_plan_tree_nests_rows_under_their_parent() {
+        asupersync::test_utils::run_test(|| async {
+            let connection = Connection::open(":memory:").await.expect("open");
+            // Stock 3.54's plan for
+            // `SELECT * FROM a, b WHERE a.id=b.id UNION SELECT * FROM a, b`.
+            let rows = connection
+                .query(
+                    "VALUES (1, 0, 0, 'MERGE (UNION)'), (2, 1, 0, 'LEFT'), \
+                     (3, 2, 0, 'SCAN b USING INDEX b_id'), \
+                     (4, 2, 0, 'SEARCH a USING INTEGER PRIMARY KEY (rowid=?)'), \
+                     (5, 2, 0, 'USE TEMP B-TREE FOR ORDER BY'), (6, 1, 0, 'RIGHT'), \
+                     (7, 6, 0, 'SCAN a'), (8, 6, 0, 'SCAN b USING INDEX b_id'), \
+                     (9, 6, 0, 'USE TEMP B-TREE FOR LAST TERM OF ORDER BY')",
+                )
+                .await
+                .expect("plan rows");
+            let mut out = Vec::new();
+            write_query_plan_tree(&rows, &mut out).expect("render");
+            assert_eq!(
+                String::from_utf8(out).expect("utf-8"),
+                "QUERY PLAN\n\
+                 `--MERGE (UNION)\n   \
+                 |--LEFT\n   \
+                 |  |--SCAN b USING INDEX b_id\n   \
+                 |  |--SEARCH a USING INTEGER PRIMARY KEY (rowid=?)\n   \
+                 |  `--USE TEMP B-TREE FOR ORDER BY\n   \
+                 `--RIGHT\n      \
+                 |--SCAN a\n      \
+                 |--SCAN b USING INDEX b_id\n      \
+                 `--USE TEMP B-TREE FOR LAST TERM OF ORDER BY\n"
+            );
+
+            let mut out = Vec::new();
+            write_query_plan_tree(&[], &mut out).expect("render");
+            assert!(out.is_empty(), "stock prints nothing for an empty plan");
+        });
     }
 
     #[test]
