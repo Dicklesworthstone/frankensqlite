@@ -184,6 +184,7 @@ pub struct CompactionReport {
     /// Bytes reclaimed by compaction (`source_byte_len - compacted_byte_len`, saturating).
     pub reclaimed_bytes: u64,
 }
+use fsqlite_pager::persistent_page_map::PersistentPageMap;
 use fsqlite_pager::{
     CheckpointMode, JournalMode, PageCacheMetricsSnapshot, PageCachePageSnapshot,
     PagerCommitProfileSnapshot, PagerCommitState, PagerPublishedSnapshot, RollbackCleanup,
@@ -12686,9 +12687,11 @@ struct TableExecutionRuntimeInputs {
 //
 // bd-jdjee: a snapshot holds the committed page image, not a decoded
 // MemDatabase. Pages a commit did not change are shared with the previous
-// snapshot, so capture costs one pass over the page table plus the changed
-// pages, and memory grows with what changed, not with the database size. The
-// MemDatabase a historical SELECT reads is decoded from the image on demand.
+// snapshot, so memory grows with what changed, not with the database size.
+// After an explicit COMMIT, capture also reads only the commit's pages (GH#494,
+// see TimeTravelCommitDelta); other capture points read the whole page table.
+// The MemDatabase a historical SELECT reads is decoded from the image on
+// demand.
 
 /// A snapshot of the in-memory database captured at COMMIT time.
 #[derive(Debug, Clone)]
@@ -12705,8 +12708,19 @@ struct TimeTravelSnapshotEntry {
 /// commit.
 #[derive(Debug)]
 struct TimeTravelImage {
-    /// Committed pages `1..=db_size`, in page order.
-    pages: Vec<PageData>,
+    /// Committed pages `1..=db_size`. The directory is structurally shared
+    /// with the previous snapshot, so a commit's capture replaces only the
+    /// pages it changed instead of rebuilding a directory of every page
+    /// (GH#494).
+    pages: PersistentPageMap<PageData>,
+    /// Size of the database in pages at capture.
+    db_size: u32,
+    page_size: PageSize,
+    /// The pager commit sequence the image was read at, which a later
+    /// capture checks before reusing it (see [`TimeTravelCommitDelta`]).
+    pager_sequence: Option<CommitSeq>,
+    /// Pages the capture read from the pager; the rest it shared.
+    pages_read: usize,
     /// The mirror with every pager-backed table emptied. What remains is the
     /// mirror-only state the pages cannot reproduce: TEMP tables and their
     /// rows, plus schema-shaped placeholders.
@@ -12769,6 +12783,19 @@ impl Drop for TimeTravelCatalogGuard<'_> {
             let _historical = self.conn.swap_time_travel_catalog(live);
         }
     }
+}
+
+/// The pages one `:memory:` pager commit changed, recorded only when that
+/// commit advanced the pager's sequence from `from` to exactly `to`
+/// (GH#494). A capture at `to` whose previous image was read at `from` then
+/// re-reads just these pages, page 1 and any newly allocated page, and shares
+/// every other page with the previous image. Any other state falls back to
+/// reading every page.
+#[derive(Debug)]
+struct TimeTravelCommitDelta {
+    from: CommitSeq,
+    to: CommitSeq,
+    pages: Vec<PageNumber>,
 }
 
 impl TimeTravelImage {
@@ -14401,6 +14428,9 @@ pub struct Connection {
     /// `PRAGMA fsqlite_capture_time_travel_snapshots = false` for the SQL
     /// surface.
     time_travel_capture_enabled: Cell<bool>,
+    /// The page set of the last explicit COMMIT on a `:memory:` connection,
+    /// consumed by the time-travel capture that follows it (GH#494).
+    time_travel_commit_delta: RefCell<Option<TimeTravelCommitDelta>>,
     /// Conformal-prediction SQLITE_BUSY retry budget.
     ///
     /// Per-connection ring buffer of recent successful commit latencies plus
@@ -15942,6 +15972,7 @@ impl Connection {
             memdb_hydrate_at_next_read: Cell::new(false),
             time_travel_active: Cell::new(false),
             time_travel_capture_enabled: Cell::new(true),
+            time_travel_commit_delta: RefCell::new(None),
             conformal_retry_budget: RefCell::new(ConformalRetryBudget::default()),
             busy_budget_scope: Cell::new(BusyBudgetScope::Inactive),
             // AAC-P6: renewal-amortization micro-batcher — default SAFE on,
@@ -16538,6 +16569,7 @@ impl Connection {
             memdb_hydrate_at_next_read: Cell::new(false),
             time_travel_active: Cell::new(false),
             time_travel_capture_enabled: Cell::new(true),
+            time_travel_commit_delta: RefCell::new(None),
             conformal_retry_budget: RefCell::new(ConformalRetryBudget::default()),
             busy_budget_scope: Cell::new(BusyBudgetScope::Inactive),
             // AAC-P6: renewal-amortization micro-batcher — default SAFE on,
@@ -25934,7 +25966,16 @@ impl Connection {
             return;
         }
         let image = match self.capture_time_travel_image().await {
-            Ok(image) => image,
+            Ok(image) => {
+                tracing::trace!(
+                    target: "fsqlite.time_travel",
+                    commit_seq,
+                    db_size = image.db_size,
+                    pages_read = image.pages_read,
+                    "captured time-travel snapshot"
+                );
+                image
+            }
             Err(err) => {
                 tracing::warn!(
                     target: "fsqlite.time_travel",
@@ -25970,6 +26011,34 @@ impl Connection {
         }
     }
 
+    /// The base sequence and full page set of the active transaction's
+    /// pending commit, when a `:memory:` time-travel capture follows that
+    /// commit (GH#494). Read before the commit consumes the write set. `None`
+    /// leaves the capture to read every page.
+    fn time_travel_commit_surface(&self) -> Option<(CommitSeq, Vec<PageNumber>)> {
+        if self.path != ":memory:" || !self.time_travel_capture_enabled.get() {
+            return None;
+        }
+        let txn = self.active_txn.borrow();
+        let txn = txn.as_ref()?;
+        let base = txn.published_visible_commit_seq_hint()?;
+        // NOT write_set_page_numbers(): that omits synthesized freelist trunks.
+        let pages = txn.pending_commit_pages().ok()?;
+        Some((base, pages))
+    }
+
+    /// Keep a successful commit's surface for the capture that follows it,
+    /// only if the commit advanced the pager exactly one sequence past the
+    /// surface's base: its pages are then everything that changed between the
+    /// two sequences.
+    fn record_time_travel_commit_delta(&self, surface: Option<(CommitSeq, Vec<PageNumber>)>) {
+        let delta = surface.and_then(|(from, pages)| {
+            let to = self.pager.published_snapshot().visible_commit_seq;
+            (from.next() == to).then_some(TimeTravelCommitDelta { from, to, pages })
+        });
+        *self.time_travel_commit_delta.borrow_mut() = delta;
+    }
+
     /// Rebuild the `:memory:` row mirror once if a time-travel capture point
     /// left it stale (bd-jdjee). Called at read statements only; inside a
     /// transaction the request stays armed for the first read after it.
@@ -25999,8 +26068,8 @@ impl Connection {
 
     /// Read the committed page image and the mirror-only state for a snapshot.
     ///
-    /// Each page is compared with the previous snapshot's copy of it and shares
-    /// that copy when it is unchanged, by image token first and then by bytes.
+    /// Pages the commit did not change are shared with the previous snapshot
+    /// (see [`Self::read_time_travel_pages`]).
     async fn capture_time_travel_image(&self) -> Result<TimeTravelImage> {
         let cx = self.op_cx()?;
         let previous = self
@@ -26008,6 +26077,9 @@ impl Connection {
             .borrow()
             .last()
             .map(|entry| Rc::clone(&entry.image));
+        // Taken first, so a recorded delta serves at most the one capture
+        // that follows its commit.
+        let delta = self.time_travel_commit_delta.borrow_mut().take();
         let mut txn = self.begin_reload_txn_repairing_empty_page_one(&cx).await?;
         // The transaction's own fixed size bound: every page below it is
         // readable in this snapshot, and nothing above it exists in it.
@@ -26015,9 +26087,24 @@ impl Connection {
             0 => self.pager.published_snapshot().db_size,
             size => size,
         };
-        let pages = Self::read_time_travel_pages(&cx, &txn, db_size, previous.as_deref()).await;
+        let page_size = txn.page_size();
+        let pager_sequence = txn.published_visible_commit_seq_hint();
+        // The commit's page set is everything that changed since the previous
+        // image only if that image was read at the commit's base sequence and
+        // this read sees the sequence the commit produced.
+        let changed = delta
+            .as_ref()
+            .filter(|delta| {
+                pager_sequence == Some(delta.to)
+                    && previous.as_ref().is_some_and(|image| {
+                        image.pager_sequence == Some(delta.from) && image.page_size == page_size
+                    })
+            })
+            .map(|delta| delta.pages.as_slice());
+        let pages =
+            Self::read_time_travel_pages(&cx, &txn, db_size, previous.as_deref(), changed).await;
         let _ = txn.rollback(&cx).await;
-        let pages = pages?;
+        let (pages, pages_read) = pages?;
 
         let pager_tables: Vec<TableSchema> = {
             let temp_table_names = self.temp_table_names.borrow();
@@ -26078,6 +26165,10 @@ impl Connection {
         };
         Ok(TimeTravelImage {
             pages,
+            db_size,
+            page_size,
+            pager_sequence,
+            pages_read,
             base,
             pager_tables,
             rowid_alias_columns,
@@ -26105,30 +26196,65 @@ impl Connection {
         previous
     }
 
+    /// Read the committed pages `1..=db_size`, returning them with the number
+    /// of pages read from the pager.
+    ///
+    /// Given the commit's page set (`changed`, see [`TimeTravelCommitDelta`]),
+    /// start from the previous image and re-read only those pages, page 1 and
+    /// any page past the previous size, so the capture costs the commit's
+    /// write set rather than the database size (GH#494). Otherwise read every
+    /// page, sharing the previous image's copy of each unchanged page, by
+    /// image token first and then by bytes.
     async fn read_time_travel_pages(
         cx: &Cx,
         txn: &TransactionKind,
         db_size: u32,
         previous: Option<&TimeTravelImage>,
-    ) -> Result<Vec<PageData>> {
+        changed: Option<&[PageNumber]>,
+    ) -> Result<(PersistentPageMap<PageData>, usize)> {
         let page_count = usize::try_from(db_size).unwrap_or(usize::MAX);
-        let mut pages = Vec::with_capacity(page_count);
+        if let (Some(previous), Some(changed)) = (previous, changed) {
+            let mut pages = previous.pages.clone();
+            pages.truncate(db_size);
+            let mut reread: Vec<u32> = changed
+                .iter()
+                .map(|page| page.get())
+                .chain(std::iter::once(1))
+                .chain(previous.db_size.saturating_add(1)..=db_size)
+                .filter(|&page_no| page_no <= db_size)
+                .collect();
+            reread.sort_unstable();
+            reread.dedup();
+            for &page_no in &reread {
+                let Some(page_number) = PageNumber::new(page_no) else {
+                    continue;
+                };
+                pages.insert(page_no, txn.get_page(cx, page_number).await?);
+            }
+            // The previous image covered every page it shares, so the result
+            // is complete; if it somehow is not, read everything instead.
+            if pages.len() == page_count {
+                return Ok((pages, reread.len()));
+            }
+        }
+        let mut pages = PersistentPageMap::new();
         for page_no in 1..=db_size {
             let Some(page_number) = PageNumber::new(page_no) else {
                 continue;
             };
             let page = txn.get_page(cx, page_number).await?;
-            let index = pages.len();
             let shared = previous
-                .and_then(|image| image.pages.get(index))
+                .and_then(|image| image.pages.get_shared(page_no))
                 .filter(|prior| {
                     prior.image_token() == page.image_token()
                         || prior.as_bytes() == page.as_bytes()
-                })
-                .cloned();
-            pages.push(shared.unwrap_or(page));
+                });
+            match shared {
+                Some(prior) => pages.insert_shared(page_no, Arc::clone(prior)),
+                None => pages.insert(page_no, page),
+            };
         }
-        Ok(pages)
+        Ok((pages, page_count))
     }
 
     /// Decode a snapshot into the MemDatabase a historical SELECT reads.
@@ -26153,7 +26279,7 @@ impl Connection {
                 );
             }
         }
-        let Some(page_one) = image.pages.first() else {
+        let Some(page_one) = image.pages.get(1) else {
             return Ok(db);
         };
         let page_one_bytes = page_one.as_bytes();
@@ -26170,9 +26296,9 @@ impl Connection {
         {
             let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::MAIN_DB;
             let (mut file, _) = vfs.open(cx, Some(path), flags)?;
-            let mut offset = 0_u64;
-            for (index, page) in image.pages.iter().enumerate() {
-                if index == 0 {
+            for (page_no, page) in image.pages.iter() {
+                let offset = u64::from(page_no - 1) * u64::try_from(page.len()).unwrap_or(0);
+                if page_no == 1 {
                     // Normalize the private copy's header. It is read as a
                     // rollback-journal database, so clear the WAL version
                     // bytes (the image already absorbed any WAL). The in-header
@@ -26190,7 +26316,6 @@ impl Connection {
                 } else {
                     file.write(cx, page.as_bytes(), offset).await?;
                 }
-                offset += u64::try_from(page.len()).unwrap_or(0);
             }
             file.close(cx)?;
         }
@@ -76311,6 +76436,8 @@ impl Connection {
             };
             record_hot_path_duration(&FSQLITE_COMMIT_PRE_TXN_TIME_NS, commit_pre_txn_start);
 
+            let time_travel_surface = self.time_travel_commit_surface();
+
             // First attempt — fast path, no timing overhead.
             let commit_txn_roundtrip_start = hot_path_profile_enabled().then(Instant::now);
             // Always record the commit start for conformal calibration so
@@ -76468,6 +76595,9 @@ impl Connection {
                 && let Some(guard) = commit_registry_guard.as_mut()
             {
                 guard.mark_io_done();
+            }
+            if commit_res.is_ok() {
+                self.record_time_travel_commit_delta(time_travel_surface);
             }
 
             // Feed the conformal calibration ring on the successful-commit
@@ -80605,12 +80735,12 @@ impl Connection {
                 }
             }
             // ── Time-travel snapshot capture toggle ───────────────────────
-            // `:memory:` connections otherwise pay an O(existing_rows) pager
-            // walk + MemDatabase clone at every COMMIT so that
-            // `FOR SYSTEM_TIME AS OF` queries can resolve historical reads.
-            // Workloads that never issue time-travel queries (e.g. batched-
-            // commit INSERT benchmarks) can disable this capture to reclaim
-            // linear per-transaction scaling.
+            // `:memory:` connections otherwise capture a page image at every
+            // DDL and explicit COMMIT so that `FOR SYSTEM_TIME AS OF` queries
+            // can resolve historical reads. An explicit COMMIT's capture
+            // reads only the pages it changed (GH#494); a DDL capture reads
+            // every page. Workloads that never issue time-travel queries can
+            // disable capture to skip that work entirely.
             "fsqlite.capture_time_travel_snapshots"
             | "fsqlite_capture_time_travel_snapshots"
             | "capture_time_travel_snapshots" => {
@@ -260105,6 +260235,83 @@ mod pager_routing_tests {
                 captured.timestamp_ns,
                 previous.timestamp_ns.saturating_add(1),
                 "snapshot capture should force timestamps to remain monotonic even if the wall clock moves backward"
+            );
+        });
+    }
+
+    /// GH#494: the capture after an explicit COMMIT reads the commit's pages,
+    /// not the whole database, and still yields exactly the image a full read
+    /// would: growth, in-place updates, index changes, freed pages, freelist
+    /// reuse and a savepoint rollback inside the committed transaction.
+    #[test]
+    fn time_travel_commit_capture_reads_only_the_commits_pages_gh494() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            for sql in [
+                "CREATE TABLE resident (id INTEGER PRIMARY KEY, payload BLOB NOT NULL);",
+                "CREATE TABLE hot (id INTEGER PRIMARY KEY, v INTEGER, note TEXT);",
+                "CREATE INDEX hot_v ON hot(v);",
+                "BEGIN;",
+            ] {
+                conn.execute(sql).await.unwrap();
+            }
+            for id in 1..=400 {
+                conn.execute(&format!("INSERT INTO resident VALUES ({id}, zeroblob(2000));"))
+                    .await
+                    .unwrap();
+            }
+            conn.execute("COMMIT;").await.unwrap();
+
+            let steps: &[&[&str]] = &[
+                &["INSERT INTO hot VALUES (1, 10, 'a');"],
+                &["UPDATE hot SET v = 11 WHERE id = 1;"],
+                &["INSERT INTO hot SELECT id + 1, id, 'x' FROM resident WHERE id <= 200;"],
+                &["DELETE FROM resident WHERE id > 300;"],
+                &["INSERT INTO resident VALUES (1000, zeroblob(2000));"],
+                &[
+                    "SAVEPOINT s;",
+                    "UPDATE hot SET note = 'rolled back';",
+                    "ROLLBACK TO s;",
+                    "UPDATE hot SET v = 12 WHERE id = 1;",
+                ],
+            ];
+            let image_bytes = |image: &TimeTravelImage| -> Vec<(u32, Vec<u8>)> {
+                image
+                    .pages
+                    .iter()
+                    .map(|(page_no, page)| (page_no, page.as_bytes().to_vec()))
+                    .collect()
+            };
+            for statements in steps {
+                conn.execute("BEGIN;").await.unwrap();
+                for sql in *statements {
+                    conn.execute(sql).await.unwrap();
+                }
+                conn.execute("COMMIT;").await.unwrap();
+                let captured =
+                    Rc::clone(&conn.time_travel_snapshots.borrow().last().unwrap().image);
+                // No delta is pending now, so this reads every page.
+                let full = conn.capture_time_travel_image().await.unwrap();
+                assert_eq!(full.pages_read, full.db_size as usize, "{statements:?}");
+                assert!(
+                    captured.pages_read < full.pages_read,
+                    "{statements:?}: the commit capture read {} of {} pages",
+                    captured.pages_read,
+                    full.db_size
+                );
+                assert_eq!(captured.db_size, full.db_size, "{statements:?}");
+                assert_eq!(
+                    image_bytes(&*captured),
+                    image_bytes(&full),
+                    "{statements:?}: commit capture differs from a full read"
+                );
+            }
+            let snapshots = conn.time_travel_snapshots.borrow();
+            let single_row = &snapshots[snapshots.len() - 5].image;
+            assert!(
+                single_row.pages_read <= 8,
+                "a one-row UPDATE read {} pages",
+                single_row.pages_read
             );
         });
     }
