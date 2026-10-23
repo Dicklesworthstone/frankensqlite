@@ -63,15 +63,6 @@ struct TableAllocatorState {
     mode: RowIdMode,
     /// High-water mark for AUTOINCREMENT `sqlite_sequence` persistence.
     autoincrement_high_water: i64,
-    /// bd-elcjy: the durable init tip (`next_rowid` at creation, before any
-    /// allocation) and its high-water. A table that first enters the allocator
-    /// AFTER a `SAVEPOINT` is absent from that savepoint's mark, so
-    /// [`ConcurrentRowIdAllocator::rewind_to_mark`] treats it as
-    /// `(durable_next_rowid, durable_high_water, count 0)` and rewinds it back
-    /// to fresh on `ROLLBACK TO` (the CAS still guards against a peer that also
-    /// allocated on the table in the interval).
-    durable_next_rowid: i64,
-    durable_high_water: i64,
 }
 
 impl TableAllocatorState {
@@ -105,8 +96,6 @@ impl TableAllocatorState {
             next_rowid: next,
             mode,
             autoincrement_high_water: high_water,
-            durable_next_rowid: next,
-            durable_high_water: high_water,
         }
     }
 }
@@ -271,6 +260,12 @@ struct SessionReservations {
     /// mark and that first reservation; rewinding to `first_prior` reclaims
     /// the session's contiguous tail back to that post-floor tip.
     first_prior: (i64, i64),
+    /// `(next_rowid, autoincrement_high_water)` just before this session's
+    /// latest reservation on the table: what
+    /// [`ConcurrentRowIdAllocator::rewind_unlanded_one`] restores an
+    /// AUTOINCREMENT table's high-water to when that reservation is the one it
+    /// gives back.
+    last_prior: (i64, i64),
     /// bd-8a8pr: `(statement, next_rowid, autoincrement_high_water, count)`
     /// just before that statement's first reservation on the table, taken
     /// lazily by [`ConcurrentRowIdAllocator::allocate_one_for_statement`]:
@@ -360,11 +355,13 @@ impl ConcurrentRowIdAllocator {
             .or_insert(SessionReservations {
                 count: 0,
                 first_prior: prior,
+                last_prior: prior,
                 statement: None,
             });
         if entry.count == 0 {
             entry.first_prior = prior;
         }
+        entry.last_prior = prior;
         if statement != 0
             && entry
                 .statement
@@ -417,16 +414,20 @@ impl ConcurrentRowIdAllocator {
         // is absent from `mark.entries`, so the original loop never rewound it
         // (the GH#147 fresh-table subcase: a post-rollback INSERT reused the
         // advanced tip). Treat every such table this session has reserved as if
-        // the mark had captured its durable init tip with a zero reservation
-        // count, then run it through the identical CAS-guarded rewind.
+        // the mark had captured it just before the session's first reservation
+        // there (`first_prior`) with a zero reservation count, then run it
+        // through the identical CAS-guarded rewind. Not a tip derived from the
+        // table's visible rows: those include the session's own uncommitted
+        // rows, and a floor raised past them pinned the rewind above the
+        // aborted rowids (bead .33).
         let marked: HashSet<AllocatorKey> = mark.entries.iter().map(|&(key, ..)| key).collect();
         let absent_entries: Vec<(AllocatorKey, i64, i64, i64)> = session_reservations
             .iter()
             .filter(|((session, key), _)| *session == mark.session_id && !marked.contains(key))
-            .filter_map(|((_, key), _)| {
-                tables
-                    .get(key)
-                    .map(|state| (*key, state.durable_next_rowid, state.durable_high_water, 0))
+            .filter(|((_, key), _)| tables.contains_key(key))
+            .map(|((_, key), reservations)| {
+                let (prior_next, prior_high_water) = reservations.first_prior;
+                (*key, prior_next, prior_high_water, 0)
             })
             .collect();
         for &(key, sp_next, sp_high_water, sp_count) in
@@ -465,10 +466,14 @@ impl ConcurrentRowIdAllocator {
         }
     }
 
-    /// Reclaim a single un-landed normal-mode rowid `unlanded_rowid` that
-    /// `session_id` allocated at the tail of `key` and then discarded (e.g.
-    /// `INSERT OR IGNORE` / `ON CONFLICT DO NOTHING` / `ON CONFLICT DO UPDATE`
-    /// where the newly-allocated rowid was never stored).
+    /// Reclaim a single un-landed rowid `unlanded_rowid` that `session_id`
+    /// allocated at the tail of `key` and then discarded (e.g. `INSERT OR
+    /// IGNORE` / `ON CONFLICT DO NOTHING` / `ON CONFLICT DO UPDATE` where the
+    /// newly-allocated rowid was never stored, or the failing row of an `OR
+    /// FAIL` statement). An AUTOINCREMENT table gets it back only when it is
+    /// the session's latest reservation there, whose prior high-water is
+    /// known; callers pass one only for a failed statement, whose
+    /// `sqlite_sequence` update stock never runs.
     pub fn rewind_unlanded_one(&self, session_id: u64, key: AllocatorKey, unlanded_rowid: i64) {
         if unlanded_rowid <= 0 {
             return;
@@ -482,10 +487,16 @@ impl ConcurrentRowIdAllocator {
             return;
         }
         if let Some(state) = tables.get_mut(&key)
-            && state.mode == RowIdMode::Normal
             && state.next_rowid == unlanded_rowid.wrapping_add(1)
         {
-            state.next_rowid = unlanded_rowid;
+            match state.mode {
+                RowIdMode::Normal => state.next_rowid = unlanded_rowid,
+                RowIdMode::AutoIncrement if reservations.last_prior.0 == unlanded_rowid => {
+                    state.next_rowid = unlanded_rowid;
+                    state.autoincrement_high_water = reservations.last_prior.1;
+                }
+                RowIdMode::AutoIncrement => {}
+            }
         }
         reservations.count -= 1;
         if let Some((_, _, _, stmt_mark_count)) = reservations.statement
@@ -521,7 +532,7 @@ impl ConcurrentRowIdAllocator {
             };
             if marked != statement {
                 return true;
-            };
+            }
             if let Some(state) = tables.get_mut(&key) {
                 rewind_reserved_tail(
                     state,
@@ -597,19 +608,13 @@ impl ConcurrentRowIdAllocator {
         match tables.get_mut(&key) {
             Some(state) => {
                 state.next_rowid = max_rowid_tip(state.next_rowid, derived.next_rowid);
-                state.durable_next_rowid =
-                    max_rowid_tip(state.durable_next_rowid, derived.durable_next_rowid);
                 state.mode = mode;
                 if mode == RowIdMode::AutoIncrement {
                     state.autoincrement_high_water = state
                         .autoincrement_high_water
                         .max(derived.autoincrement_high_water);
-                    state.durable_high_water = state
-                        .durable_high_water
-                        .max(derived.durable_high_water);
                 } else {
                     state.autoincrement_high_water = 0;
-                    state.durable_high_water = 0;
                 }
             }
             None => {
@@ -1313,7 +1318,8 @@ mod tests {
 
     /// bd-elcjy (GH#147 fresh-table subcase): a table whose first allocation
     /// happens AFTER the SAVEPOINT is absent from the mark; `ROLLBACK TO` must
-    /// still rewind it to its durable init tip so the next insert reuses id 1.
+    /// still rewind it to its tip before that allocation so the next insert
+    /// reuses id 1.
     #[test]
     fn rewind_rewinds_a_table_first_allocated_after_the_savepoint() {
         let alloc = ConcurrentRowIdAllocator::new(epoch(1));
@@ -1325,11 +1331,12 @@ mod tests {
         assert_eq!(alloc.allocate_one_for_session(k, session).unwrap().get(), 1);
         alloc.rewind_to_mark(&mark);
         // The rewind restores both the tip and the AUTOINCREMENT high-water to
-        // the durable init (checked before the reclaiming insert re-bumps them).
+        // their values before the allocation (checked before the reclaiming
+        // insert re-bumps them).
         assert_eq!(
             alloc.autoincrement_high_water(&k),
             Some(0),
-            "fresh-table rewind must restore the high-water to its durable init"
+            "fresh-table rewind must restore the high-water to its initial value"
         );
         // Previously the tip stayed at 2 (absent tables were never rewound);
         // now the rolled-back id 1 is reclaimed.
@@ -1360,13 +1367,56 @@ mod tests {
             2
         );
         alloc.rewind_to_mark(&mark);
-        // The tip (3) is not A's contiguous tail (durable 1 + 1), so the CAS
-        // declines: B's id 2 is preserved and never reissued.
+        // The tip (3) is not A's contiguous tail (first reservation at 1, + 1),
+        // so the CAS declines: B's id 2 is preserved and never reissued.
         assert_eq!(
             alloc.allocate_one_for_session(k, session_a).unwrap().get(),
             3,
             "fresh-table CAS must not reissue peer id 2"
         );
+    }
+
+    /// Bead .33: a floor refresh that sees the session's own uncommitted row
+    /// (the Insert arm raises the floor past every row it lands) must not move
+    /// the rewind target of a table first allocated after the mark. An
+    /// autocommit INSERT whose row landed and whose index entry then hit a
+    /// UNIQUE conflict used to keep its rowid: the next INSERT got max + 2.
+    #[test]
+    fn fresh_table_rewind_ignores_a_floor_raised_by_the_sessions_own_row() {
+        let alloc = ConcurrentRowIdAllocator::new(epoch(1));
+        let k = key(1, 1);
+        let session = 10u64;
+        let mark = alloc.mark_savepoint(session); // k absent from the mark
+        alloc.ensure_table_floor(k, Some(RowId::new(1)), 0, RowIdMode::Normal);
+        assert_eq!(alloc.allocate_one_for_session(k, session).unwrap().get(), 2);
+        alloc.ensure_table_floor(k, Some(RowId::new(2)), 0, RowIdMode::Normal);
+        alloc.rewind_to_mark(&mark);
+        assert_eq!(
+            alloc.next_rowid(&k),
+            Some(2),
+            "the aborted statement's rowid 2 is given back"
+        );
+        assert_eq!(alloc.session_reservation_len(), 0);
+    }
+
+    /// Bead .33: the failing row of an `OR FAIL` statement gives back an
+    /// AUTOINCREMENT rowid together with the high-water it had before that
+    /// reservation. An older reservation's prior high-water is unknown, so it
+    /// is not given back.
+    #[test]
+    fn rewind_unlanded_one_restores_the_autoincrement_high_water() {
+        let alloc = ConcurrentRowIdAllocator::new(epoch(1));
+        let k = key(1, 1);
+        let session = 10u64;
+        alloc.ensure_table_floor(k, Some(RowId::new(1)), 1, RowIdMode::AutoIncrement);
+        assert_eq!(alloc.allocate_one_for_session(k, session).unwrap().get(), 2);
+        assert_eq!(alloc.allocate_one_for_session(k, session).unwrap().get(), 3);
+        alloc.rewind_unlanded_one(session, k, 3);
+        assert_eq!(alloc.next_rowid(&k), Some(3));
+        assert_eq!(alloc.autoincrement_high_water(&k), Some(2));
+        alloc.rewind_unlanded_one(session, k, 2);
+        assert_eq!(alloc.next_rowid(&k), Some(3));
+        assert_eq!(alloc.autoincrement_high_water(&k), Some(2));
     }
 
     /// bd-elcjy: `clear_session` must drop a finished session's reservation

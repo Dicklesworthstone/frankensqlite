@@ -7910,15 +7910,20 @@ impl VdbeEngine {
         sc.last_alloc_landed = false;
     }
 
+    /// Give the shared allocator back a rowid `sc` allocated and never landed.
+    /// An AUTOINCREMENT table keeps it (stock's `sqlite_sequence` records a
+    /// burned value) unless `statement_failed`: a failed statement never runs
+    /// stock's `sqlite_sequence` update, so its rowids are not burned.
     fn reclaim_unlanded_storage_cursor_rowid_with_allocator(
         allocator: Option<&ConcurrentRowIdAllocator>,
         schema_epoch: SchemaEpoch,
         session_id: u64,
         sc: &mut StorageCursor,
+        statement_failed: bool,
     ) {
         if sc.last_alloc_rowid > 0
             && !sc.last_alloc_landed
-            && matches!(sc.rowid_mode, RowIdMode::Normal)
+            && (statement_failed || matches!(sc.rowid_mode, RowIdMode::Normal))
             && sc
                 .last_successful_insert_rowid
                 .is_none_or(|landed| landed < sc.last_alloc_rowid)
@@ -7930,7 +7935,7 @@ impl VdbeEngine {
         Self::clear_storage_cursor_statement_state(sc);
     }
 
-    fn reclaim_all_unlanded_storage_cursor_rowids(&mut self) {
+    fn reclaim_all_unlanded_storage_cursor_rowids(&mut self, statement_failed: bool) {
         let allocator = self.concurrent_rowid_allocator.clone();
         let schema_epoch = self.concurrent_rowid_schema_epoch;
         let session_id = self.concurrent_rowid_session_id;
@@ -7940,6 +7945,7 @@ impl VdbeEngine {
                 schema_epoch,
                 session_id,
                 sc,
+                statement_failed,
             );
         }
     }
@@ -9518,6 +9524,27 @@ impl VdbeEngine {
         &mut self,
         program: &VdbeProgram,
         borrowed_bindings: Option<&[SqliteValue]>,
+        row_handler: Option<&mut ResultRowCallback<'_>>,
+    ) -> Result<ExecOutcome> {
+        let outcome = self
+            .execute_program_body(program, borrowed_bindings, row_handler)
+            .await;
+        // Bead .33: stock's next `OP_NewRowid` is `max(rowid) + 1`, so a
+        // failed statement leaves no gap at a rowid it allocated and never
+        // kept (a NOT NULL or CHECK failure after `NewRowid`, or a UNIQUE
+        // conflict whose provisional row was removed again). An ABORT
+        // statement's rewind would give it back too, but an `OR FAIL`
+        // statement keeps its earlier rows and runs no rewind.
+        if !matches!(outcome, Ok(ExecOutcome::Done)) {
+            self.reclaim_all_unlanded_storage_cursor_rowids(true);
+        }
+        outcome
+    }
+
+    async fn execute_program_body(
+        &mut self,
+        program: &VdbeProgram,
+        borrowed_bindings: Option<&[SqliteValue]>,
         mut row_handler: Option<&mut ResultRowCallback<'_>>,
     ) -> Result<ExecOutcome> {
         let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::VdbeEngine);
@@ -9873,7 +9900,7 @@ impl VdbeEngine {
                             message: msg,
                         };
                     }
-                    self.reclaim_all_unlanded_storage_cursor_rowids();
+                    self.reclaim_all_unlanded_storage_cursor_rowids(false);
                     break ExecOutcome::Done;
                 }
 
@@ -10758,6 +10785,7 @@ impl VdbeEngine {
                                 schema_epoch,
                                 session_id,
                                 sc,
+                                false,
                             );
                         }
                     } else if !self.writable_storage_cursor_opened
@@ -10784,6 +10812,7 @@ impl VdbeEngine {
                             self.concurrent_rowid_schema_epoch,
                             self.concurrent_rowid_session_id,
                             &mut sc,
+                            false,
                         );
                     }
                     self.sorters.remove(&op.p1);
