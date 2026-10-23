@@ -55245,6 +55245,32 @@ impl Connection {
                 // Canonicalize the VALUES placeholders once across all rows with a
                 // shared bind_state (statement-level positions matching the bound
                 // params); idempotent for already-Numbered placeholders.
+                // Stock's errors, in its order: a ragged VALUES list first (a
+                // parse error there), then a width that does not fit the target.
+                if let Some(first) = rows.first() {
+                    if rows.iter().any(|row| row.len() != first.len()) {
+                        return Err(FrankenError::FunctionError(
+                            "all VALUES must have the same number of terms".to_owned(),
+                        ));
+                    }
+                    if first.len() != layout.targets.len() {
+                        return Err(FrankenError::FunctionError(if insert.columns.is_empty() {
+                            let name = insert.alias.clone().unwrap_or_else(|| {
+                                insert.table.schema.as_ref().map_or_else(
+                                    || insert.table.name.clone(),
+                                    |schema| format!("{schema}.{}", insert.table.name),
+                                )
+                            });
+                            format!(
+                                "table {name} has {} columns but {} values were supplied",
+                                layout.targets.len(),
+                                first.len()
+                            )
+                        } else {
+                            format!("{} values for {} columns", first.len(), layout.targets.len())
+                        }));
+                    }
+                }
                 let mut bind_state = BindParamState::default();
                 let mut mapped = Vec::with_capacity(rows.len());
                 for (row_idx, row_exprs) in rows.iter().enumerate() {
@@ -69201,6 +69227,11 @@ impl Connection {
                 }
             }
             for statement in &mut trigger_probe.body {
+                // Stock re-resolves only a trigger's expressions after DROP
+                // COLUMN (renameResolveTrigger), so a step that merely assigns
+                // the column (UPDATE ... SET c, INSERT INTO t(c), upsert SET c)
+                // does not depend on it.
+                clear_assignment_names_for_drop_column(statement, column_name);
                 dependency_found |= rename_column_refs_in_statement_for_table(
                     statement,
                     table_name,
@@ -130678,6 +130709,33 @@ fn rename_column_refs_in_insert_for_table(
         );
     }
     changed
+}
+
+/// Blank every name-only mention of `column` in a trigger step probe: UPDATE
+/// and upsert SET targets and INSERT column lists, which stock does not
+/// resolve when it re-checks a trigger after DROP COLUMN.
+fn clear_assignment_names_for_drop_column(statement: &mut Statement, column: &str) {
+    let clear_targets = |assignments: &mut [fsqlite_ast::Assignment]| {
+        for assignment in assignments {
+            rename_assignment_target_columns(&mut assignment.target, column, "");
+        }
+    };
+    match statement {
+        Statement::Update(update) => clear_targets(&mut update.assignments),
+        Statement::Insert(insert) => {
+            for name in &mut insert.columns {
+                if name.eq_ignore_ascii_case(column) {
+                    name.clear();
+                }
+            }
+            for upsert in &mut insert.upsert {
+                if let UpsertAction::Update { assignments, .. } = &mut upsert.action {
+                    clear_targets(assignments);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn rename_assignment_target_columns(
