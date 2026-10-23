@@ -137,6 +137,27 @@ fn supervise_campaign(mode: &str, timeout: Duration) -> Result<(), String> {
     Ok(())
 }
 
+/// A WAL file longer than its header holds at least one frame.
+const WAL_HEADER_BYTES: u64 = 32;
+
+// Checkpointer outcome counters, reported with the campaign result.
+const OUTCOME_TRUNCATED: usize = 0;
+const OUTCOME_EMPTY: usize = 1;
+const OUTCOME_DOWNGRADED: usize = 2;
+const OUTCOME_BUSY: usize = 3;
+const OUTCOME_TRANSIENT_ERROR: usize = 4;
+type CheckpointOutcomes = [AtomicU64; 5];
+
+fn describe_outcomes(outcomes: &CheckpointOutcomes) -> String {
+    let [truncated, empty, downgraded, busy, transient] = outcomes
+        .each_ref()
+        .map(|count| count.load(Ordering::Relaxed));
+    format!(
+        "TRUNCATE outcomes: nonempty={truncated} empty={empty} downgraded={downgraded} \
+         busy={busy} transient_error={transient}"
+    )
+}
+
 fn require_progress(before: (u64, u64), after: (u64, u64)) -> Result<(), String> {
     if after.0 <= before.0 || after.1 <= before.1 {
         return Err(format!(
@@ -265,6 +286,7 @@ fn run_campaign(directory: &Path, suppress_writer: bool, suppress_checkpoint: bo
     let ready = Arc::new(Barrier::new(3));
     let writes = Arc::new(AtomicU64::new(0));
     let truncates = Arc::new(AtomicU64::new(0));
+    let outcomes: Arc<CheckpointOutcomes> = Arc::new(std::array::from_fn(|_| AtomicU64::new(0)));
 
     // ── Connection A: live writer (paced autocommit INSERT loop). ────────
     let writer = {
@@ -307,10 +329,12 @@ fn run_campaign(directory: &Path, suppress_writer: bool, suppress_checkpoint: bo
         let stop = Arc::clone(&stop);
         let ready = Arc::clone(&ready);
         let truncates = Arc::clone(&truncates);
+        let outcomes = Arc::clone(&outcomes);
         std::thread::spawn(move || {
             let rt = RuntimeBuilder::current_thread()
                 .build()
                 .expect("checkpointer runtime");
+            let wal_path = format!("{path}-wal");
             let conn = rt
                 .block_on(fsqlite::Connection::open(path))
                 .expect("checkpointer open");
@@ -320,7 +344,15 @@ fn run_campaign(directory: &Path, suppress_writer: bool, suppress_checkpoint: bo
                     std::thread::sleep(CHECKPOINT_PACE);
                     continue;
                 }
-                match rt.block_on(conn.query("PRAGMA wal_checkpoint(TRUNCATE);")) {
+                // A completed TRUNCATE reports SQLite's post-reset counts,
+                // (0, 0, 0), whether or not the WAL held frames (0449e2487).
+                // Only this connection truncates the WAL file, so its length
+                // before the checkpoint says whether the reset was nonempty
+                // (GH#477: counting only (0, N, N) as a nonempty TRUNCATE
+                // matched just the downgraded case, so no campaign could pass).
+                let wal_had_frames = std::fs::metadata(&wal_path)
+                    .is_ok_and(|metadata| metadata.len() > WAL_HEADER_BYTES);
+                let outcome = match rt.block_on(conn.query("PRAGMA wal_checkpoint(TRUNCATE);")) {
                     Ok(rows) => {
                         use fsqlite_types::SqliteValue;
 
@@ -329,31 +361,39 @@ fn run_campaign(directory: &Path, suppress_writer: bool, suppress_checkpoint: bo
                         match values {
                             [
                                 SqliteValue::Integer(0),
-                                SqliteValue::Integer(total),
-                                SqliteValue::Integer(backfilled),
-                            ] if *total > 0 && *backfilled == *total => {
-                                // The PRAGMA reports busy=1 for incomplete reset.
-                                // Its backfill count is cumulative (wal_adapter),
-                                // so complete progress also requires total equality.
-                                // Empty-WAL success cannot prove the race scenario.
+                                SqliteValue::Integer(0),
+                                SqliteValue::Integer(0),
+                            ] if wal_had_frames => {
                                 truncates.fetch_add(1, Ordering::Release);
+                                OUTCOME_TRUNCATED
                             }
+                            // Empty-WAL success cannot prove the race scenario.
                             [
                                 SqliteValue::Integer(0),
                                 SqliteValue::Integer(0),
                                 SqliteValue::Integer(0),
-                            ] => {}
+                            ] => OUTCOME_EMPTY,
+                            // Completed without the reset (a safety downgrade):
+                            // a full checkpoint, but not a TRUNCATE.
+                            [
+                                SqliteValue::Integer(0),
+                                SqliteValue::Integer(total),
+                                SqliteValue::Integer(backfilled),
+                            ] if *total > 0 && *backfilled == *total => OUTCOME_DOWNGRADED,
                             [
                                 SqliteValue::Integer(1),
                                 SqliteValue::Integer(total),
                                 SqliteValue::Integer(backfilled),
-                            ] if *total >= 0 && *backfilled >= 0 && *backfilled <= *total => {}
+                            ] if *total >= 0 && *backfilled >= 0 && *backfilled <= *total => {
+                                OUTCOME_BUSY
+                            }
                             other => panic!("unexpected TRUNCATE result: {other:?}"),
                         }
                     }
-                    Err(error) if error.is_transient() => {}
+                    Err(error) if error.is_transient() => OUTCOME_TRANSIENT_ERROR,
                     Err(error) => panic!("unexpected checkpoint failure: {error}"),
-                }
+                };
+                outcomes[outcome].fetch_add(1, Ordering::Relaxed);
                 std::thread::sleep(CHECKPOINT_PACE);
             }
             rt.block_on(conn.close()).expect("checkpointer close");
@@ -372,6 +412,7 @@ fn run_campaign(directory: &Path, suppress_writer: bool, suppress_checkpoint: bo
         let ready = Arc::clone(&ready);
         let writes = Arc::clone(&writes);
         let truncates = Arc::clone(&truncates);
+        let outcomes = Arc::clone(&outcomes);
         std::thread::spawn(move || {
             let rt = RuntimeBuilder::current_thread()
                 .build()
@@ -399,7 +440,7 @@ fn run_campaign(directory: &Path, suppress_writer: bool, suppress_checkpoint: bo
                                 break;
                             }
                             Err(error) if deadline.elapsed() >= progress_timeout => {
-                                panic!("{error}");
+                                panic!("{error}; {}", describe_outcomes(&outcomes));
                             }
                             Err(_) => std::thread::sleep(Duration::from_millis(1)),
                         }
@@ -486,6 +527,11 @@ fn run_campaign(directory: &Path, suppress_writer: bool, suppress_checkpoint: bo
             .expect("checkpointer thread must not panic");
     }
 
+    eprintln!(
+        "GH335 campaign: writes={} {}",
+        writes.load(Ordering::Acquire),
+        describe_outcomes(&outcomes)
+    );
     assert!(
         failures.is_empty(),
         "GH #335 keeper: {}/{ITERATIONS} fresh-reader first-SELECT failure(s) \
