@@ -462,7 +462,10 @@ fn begin_busy_retry_sleep(attempt: u32) -> Duration {
     Duration::from_micros(begin_busy_retry_sleep_micros(attempt))
 }
 
-async fn perform_begin_busy_retry_handoff(wait: BeginBusyRetryWait) {
+// Settlement of an in-doubt or durable commit must reach its terminal state
+// even after cancellation. Admission and ordinary retries use the wrapper
+// below, while those mandatory settlement paths retain this raw delay.
+async fn perform_busy_retry_wait(wait: BeginBusyRetryWait) {
     for _ in 0..wait.spin_loops {
         std::hint::spin_loop();
     }
@@ -474,11 +477,32 @@ async fn perform_begin_busy_retry_handoff(wait: BeginBusyRetryWait) {
     }
 }
 
-async fn retry_busy_connection_bootstrap<T, F, Fut>(mut operation: F) -> Result<T>
+async fn perform_begin_busy_retry_handoff(cx: &Cx, wait: BeginBusyRetryWait) -> Result<()> {
+    cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+    let mut cancellation = std::pin::pin!(cx.wait_for_local_cancellation());
+    let mut handoff = std::pin::pin!(perform_busy_retry_wait(wait));
+    std::future::poll_fn(|task_cx| {
+        // Register before rechecking so a local relay cannot be lost between
+        // the checkpoint and suspension. The explicit operation context need
+        // not be the executor's ambient task context.
+        let _ = cancellation.as_mut().poll(task_cx);
+        if cx.checkpoint().is_err() {
+            return std::task::Poll::Ready(Err(FrankenError::Abort));
+        }
+        handoff
+            .as_mut()
+            .poll(task_cx)
+            .map(|()| cx.checkpoint().map_err(|_| FrankenError::Abort))
+    })
+    .await
+}
+
+async fn retry_busy_connection_bootstrap<T, F, Fut>(cx: &Cx, mut operation: F) -> Result<T>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T>>,
 {
+    cx.checkpoint().map_err(|_| FrankenError::Abort)?;
     let mut err = match operation().await {
         Ok(value) => return Ok(value),
         Err(err @ (FrankenError::Busy | FrankenError::BusyRecovery)) => err,
@@ -494,7 +518,7 @@ where
     let mut handoff = BeginBusyRetryHandoff::default();
 
     while let Some(wait) = handoff.next_wait(started, deadline) {
-        perform_begin_busy_retry_handoff(wait).await;
+        perform_begin_busy_retry_handoff(cx, wait).await?;
         match operation().await {
             Ok(value) => return Ok(value),
             Err(next_err @ (FrankenError::Busy | FrankenError::BusyRecovery)) => {
@@ -504,6 +528,7 @@ where
         }
     }
 
+    cx.checkpoint().map_err(|_| FrankenError::Abort)?;
     Err(err)
 }
 
@@ -658,6 +683,13 @@ fn arm_settle_rollback_error_once(error: FrankenError) {
 #[cfg(test)]
 fn take_settle_rollback_error_once() -> Option<FrankenError> {
     FSQLITE_SETTLE_ROLLBACK_ERROR_ONCE.with_borrow_mut(Option::take)
+}
+
+// Exercise cancellation while pager rollback still owns a live transaction.
+// Scoped to the executing test thread and consumed before returning Busy.
+#[cfg(test)]
+thread_local! {
+    static FSQLITE_ROLLBACK_BUSY_ONCE: Cell<bool> = const { Cell::new(false) };
 }
 
 // Test-only one-shot fault injection for the retained-autocommit flush commit
@@ -1838,7 +1870,7 @@ async fn settle_failed_commit_obligation<T: TransactionHandle + ?Sized>(
             }
             PagerCommitState::InDoubt | PagerCommitState::DurableNeedsPublication => {
                 attempt = attempt.saturating_add(1);
-                perform_begin_busy_retry_handoff(BeginBusyRetryWait {
+                perform_busy_retry_wait(BeginBusyRetryWait {
                     attempt,
                     spin_loops: begin_busy_retry_spin_loops(attempt),
                     sleep_for: begin_busy_retry_sleep(attempt),
@@ -15601,7 +15633,8 @@ impl Connection {
         // delays the refusal its caller retries on its own budget (cass GH#477
         // strict probes: 0.4.7 took ~30 s per open instead of failing fast).
         if writable {
-            retry_busy_connection_bootstrap(open).await
+            let bootstrap_cx = env.bootstrap_cx();
+            retry_busy_connection_bootstrap(&bootstrap_cx, open).await
         } else {
             open().await
         }
@@ -15649,7 +15682,7 @@ impl Connection {
         let path = PagerBackend::resolve_stable_database_path(&path, &bootstrap_cx)?;
         let pager = match disposition {
             SchemaOnlyPagerDisposition::Ordinary if writable => {
-                retry_busy_connection_bootstrap(|| {
+                retry_busy_connection_bootstrap(&bootstrap_cx, || {
                     PagerBackend::open_existing_with_page_buffer_max(
                         &path,
                         &bootstrap_cx,
@@ -15660,7 +15693,7 @@ impl Connection {
                 .await?
             }
             SchemaOnlyPagerDisposition::Ordinary | SchemaOnlyPagerDisposition::RecoverWalIndex => {
-                retry_busy_connection_bootstrap(|| {
+                retry_busy_connection_bootstrap(&bootstrap_cx, || {
                     PagerBackend::open_readonly_with_page_buffer_max(
                         &path,
                         &bootstrap_cx,
@@ -15674,7 +15707,7 @@ impl Connection {
             }
             #[cfg(not(target_arch = "wasm32"))]
             SchemaOnlyPagerDisposition::ReservedEmptyRollback(expected_identity) => {
-                retry_busy_connection_bootstrap(|| {
+                retry_busy_connection_bootstrap(&bootstrap_cx, || {
                     PagerBackend::open_reserved_with_page_buffer_max(
                         &path,
                         &bootstrap_cx,
@@ -16093,7 +16126,7 @@ impl Connection {
 
         let bootstrap_cx = env.bootstrap_cx();
         let path = PagerBackend::resolve_stable_database_path(&path, &bootstrap_cx)?;
-        let pager = retry_busy_connection_bootstrap(|| {
+        let pager = retry_busy_connection_bootstrap(&bootstrap_cx, || {
             PagerBackend::open_reserved_with_page_buffer_max(
                 &path,
                 &bootstrap_cx,
@@ -16129,7 +16162,7 @@ impl Connection {
             ))
             .await;
         }
-        let pager = retry_busy_connection_bootstrap(|| {
+        let pager = retry_busy_connection_bootstrap(&bootstrap_cx, || {
             PagerBackend::open_existing_with_page_buffer_max(
                 &path,
                 &bootstrap_cx,
@@ -16183,7 +16216,7 @@ impl Connection {
             ))
             .await;
         }
-        retry_busy_connection_bootstrap(|| async {
+        retry_busy_connection_bootstrap(&bootstrap_cx, || async {
             let pager = PagerBackend::open_with_requested_page_size_and_page_buffer_max(
                 &path,
                 &bootstrap_cx,
@@ -26951,6 +26984,7 @@ impl Connection {
         mode: TransactionMode,
         refresh_memdb_during_busy_wait: bool,
     ) -> Result<TransactionKind> {
+        cx.checkpoint().map_err(|_| FrankenError::Abort)?;
         // `Busy` AND `BusyRecovery` are both transient, retryable members of
         // the SQLITE_BUSY family (`FrankenError::is_transient`), so the read /
         // transaction-begin admission budget must honor `busy_timeout` for
@@ -26981,6 +27015,7 @@ impl Connection {
         let mut handoff = BeginBusyRetryHandoff::default();
 
         while let Some(wait) = handoff.next_wait(started, deadline) {
+            cx.checkpoint().map_err(|_| FrankenError::Abort)?;
             // Conformal SLO cap: if the predicted total commit latency at
             // miscoverage α already exceeds the configured SLO, stop
             // retrying and surface BUSY immediately rather than wasting
@@ -26993,10 +27028,11 @@ impl Connection {
             {
                 return Err(busy_family_error(last_was_recovery));
             }
-            perform_begin_busy_retry_handoff(wait).await;
+            perform_begin_busy_retry_handoff(cx, wait).await?;
             if refresh_memdb_during_busy_wait {
                 self.refresh_memdb_if_stale(cx).await?;
             }
+            cx.checkpoint().map_err(|_| FrankenError::Abort)?;
             match pager.begin(cx, mode).await {
                 Ok(txn) => return Ok(txn),
                 Err(FrankenError::BusyRecovery) => last_was_recovery = true,
@@ -27004,6 +27040,7 @@ impl Connection {
                 Err(err) => return Err(err),
             }
         }
+        cx.checkpoint().map_err(|_| FrankenError::Abort)?;
         Err(self.strict_multi_process_busy_refusal(
             "transaction lock admission remained busy through busy_timeout",
             last_was_recovery,
@@ -28514,6 +28551,7 @@ impl Connection {
         let refresh_started = Instant::now();
         let mut refresh_handoff = BeginBusyRetryHandoff::default();
         loop {
+            op_cx.checkpoint().map_err(|_| FrankenError::Abort)?;
             let attempt: Result<()> = async {
                 self.refresh_memdb_from_cached_write_txn_if_stale(&op_cx)
                     .await?;
@@ -28541,8 +28579,9 @@ impl Connection {
             match attempt {
                 Ok(()) => break,
                 Err(error) if error.is_transient() => {
+                    op_cx.checkpoint().map_err(|_| FrankenError::Abort)?;
                     match refresh_handoff.next_wait(refresh_started, refresh_deadline) {
-                        Some(wait) => perform_begin_busy_retry_handoff(wait).await,
+                        Some(wait) => perform_begin_busy_retry_handoff(&op_cx, wait).await?,
                         None => return Err(error),
                     }
                 }
@@ -29962,11 +30001,14 @@ impl Connection {
         {
             return result;
         }
+        let retry_cx = self.op_cx_after_background_status();
+        retry_cx.checkpoint().map_err(|_| FrankenError::Abort)?;
         let busy_timeout_ms = self.pragma_state.borrow().busy_timeout_ms.max(0) as u64;
         let deadline = Duration::from_millis(busy_timeout_ms);
         let started = Instant::now();
         let mut handoff = BeginBusyRetryHandoff::default();
         while let Some(wait) = handoff.next_wait(started, deadline) {
+            retry_cx.checkpoint().map_err(|_| FrankenError::Abort)?;
             // Conformal SLO cap, matching the commit-path busy loop: stop
             // retrying once the latency SLO disqualifies further attempts.
             if !self
@@ -29976,7 +30018,7 @@ impl Connection {
             {
                 break;
             }
-            perform_begin_busy_retry_handoff(wait).await;
+            perform_begin_busy_retry_handoff(&retry_cx, wait).await?;
             // The failed attempt must have fully unwound; if any transaction
             // state survived, re-executing would not be an autocommit retry.
             if !self.autocommit_conflict_retry_boundary() {
@@ -29988,6 +30030,9 @@ impl Connection {
             if !matches!(&result, Err(error) if autocommit_statement_conflict_is_retryable(error)) {
                 break;
             }
+        }
+        if matches!(&result, Err(error) if autocommit_statement_conflict_is_retryable(error)) {
+            retry_cx.checkpoint().map_err(|_| FrankenError::Abort)?;
         }
         result
     }
@@ -39638,11 +39683,14 @@ impl Connection {
             // busy-timeout handoff used by GH #333. Explicit transactions remain
             // outside this boundary, and a non-transient error returns above
             // without a second attempt.
+            let retry_cx = self.op_cx_after_background_status();
+            retry_cx.checkpoint().map_err(|_| FrankenError::Abort)?;
             let busy_timeout_ms = self.pragma_state.borrow().busy_timeout_ms.max(0) as u64;
             let deadline = Duration::from_millis(busy_timeout_ms);
             let started = self.busy_budget_start();
             let mut handoff = BeginBusyRetryHandoff::default();
             while let Some(wait) = handoff.next_wait(started, deadline) {
+                retry_cx.checkpoint().map_err(|_| FrankenError::Abort)?;
                 if !self
                     .conformal_retry_budget
                     .borrow()
@@ -39650,7 +39698,7 @@ impl Connection {
                 {
                     break;
                 }
-                perform_begin_busy_retry_handoff(wait).await;
+                perform_begin_busy_retry_handoff(&retry_cx, wait).await?;
                 if !self.autocommit_conflict_retry_boundary() {
                     break;
                 }
@@ -39672,6 +39720,9 @@ impl Connection {
                     // attempt 1 defers the drop into this loop.
                     break;
                 }
+            }
+            if matches!(&result, Err(error) if autocommit_statement_conflict_is_retryable(error)) {
+                retry_cx.checkpoint().map_err(|_| FrankenError::Abort)?;
             }
             result
         }))
@@ -76905,6 +76956,14 @@ impl Connection {
                     let mut handoff = BeginBusyRetryHandoff::default();
 
                     while let Some(wait) = handoff.next_wait(started, deadline) {
+                        // A Busy result is not sufficient to abandon an exact
+                        // commit obligation. Keep the publication guard and
+                        // prepared plan together for mandatory settlement below.
+                        if self.active_txn.borrow().as_ref().is_some_and(|txn| {
+                            txn.pager_commit_state() != PagerCommitState::NotCommitted
+                        }) {
+                            break;
+                        }
                         // Conformal SLO cap: if continuing to retry would
                         // violate the user-configured latency SLO with
                         // probability > α, stop now.  This is a policy
@@ -76936,7 +76995,13 @@ impl Connection {
                         // (which the caller treats as a transient retry).
                         let reacquire_registry = commit_registry_guard.is_some();
                         drop(commit_registry_guard.take());
-                        perform_begin_busy_retry_handoff(wait).await;
+                        if let Err(error) = perform_begin_busy_retry_handoff(cx, wait).await {
+                            // Preserve the normal physical-outcome decision;
+                            // the active transaction remains available for
+                            // the caller's rollback after a rejected commit.
+                            commit_res = Err(error);
+                            break;
+                        }
                         if reacquire_registry {
                             let mut registry = lock_registry_for_commit(&self.concurrent_registry);
                             if is_concurrent_txn {
@@ -76970,6 +77035,14 @@ impl Connection {
                             break;
                         }
                     }
+                }
+                if matches!(commit_res, Err(FrankenError::Busy))
+                    && self.active_txn.borrow().as_ref().is_some_and(|txn| {
+                        txn.pager_commit_state() == PagerCommitState::NotCommitted
+                    })
+                    && cx.checkpoint().is_err()
+                {
+                    commit_res = Err(FrankenError::Abort);
                 }
             }
 
@@ -77010,7 +77083,7 @@ impl Connection {
                             spin_loops: begin_busy_retry_spin_loops(obligation_retry_attempt),
                             sleep_for: begin_busy_retry_sleep(obligation_retry_attempt),
                         };
-                        perform_begin_busy_retry_handoff(wait).await;
+                        perform_busy_retry_wait(wait).await;
                         let cleanup_cx = cx.create_child();
                         let _cleanup_mask = cleanup_cx.masked();
                         commit_res = {
@@ -77671,8 +77744,15 @@ impl Connection {
             // immediately, and budget exhaustion restores the transaction
             // exactly as before — FCW semantics are untouched (this retries
             // only the rollback of an already-doomed transaction).
+            let mut rollback_cancelled = false;
             let rollback_result = {
-                let mut result = if let Some(txn) = active_txn.as_mut() {
+                #[cfg(test)]
+                let injected_busy = FSQLITE_ROLLBACK_BUSY_ONCE.with(|armed| armed.replace(false));
+                #[cfg(not(test))]
+                let injected_busy = false;
+                let mut result = if injected_busy {
+                    Err(FrankenError::BusyRecovery)
+                } else if let Some(txn) = active_txn.as_mut() {
                     txn.rollback(cx).await
                 } else {
                     Ok(())
@@ -77692,7 +77772,14 @@ impl Connection {
                         let Some(wait) = handoff.next_wait(started, deadline) else {
                             break;
                         };
-                        perform_begin_busy_retry_handoff(wait).await;
+                        if perform_begin_busy_retry_handoff(cx, wait).await.is_err() {
+                            // Keep the last pager refusal until its live handle
+                            // has been restored below. Cancellation is not proof
+                            // that a BusyRecovery transaction reached a terminal
+                            // state, so it must not release the MVCC session.
+                            rollback_cancelled = true;
+                            break;
+                        }
                         result = if let Some(txn) = active_txn.as_mut() {
                             txn.rollback(cx).await
                         } else {
@@ -77702,10 +77789,21 @@ impl Connection {
                 }
                 result
             };
+            if matches!(
+                &rollback_result,
+                Err(FrankenError::Busy | FrankenError::BusyRecovery)
+            ) && cx.checkpoint().is_err()
+            {
+                rollback_cancelled = true;
+            }
             if let Err(error) = &rollback_result
                 && self.restore_retryable_rollback_transaction(&mut active_txn, error)
             {
-                return rollback_result;
+                return if rollback_cancelled {
+                    Err(FrankenError::Abort)
+                } else {
+                    rollback_result
+                };
             }
             drop(active_txn);
 
@@ -209930,6 +210028,59 @@ mod tests {
     }
 
     #[test]
+    fn test_gh524_cancelled_rollback_wait_preserves_live_transaction_for_cleanup() {
+        struct ResetRollbackBusy;
+        impl Drop for ResetRollbackBusy {
+            fn drop(&mut self) {
+                super::FSQLITE_ROLLBACK_BUSY_ONCE.with(|armed| armed.set(false));
+            }
+        }
+
+        asupersync::test_utils::run_test(|| async {
+            let _reset = ResetRollbackBusy;
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+                .await
+                .unwrap();
+            conn.execute("BEGIN CONCURRENT").await.unwrap();
+            conn.execute("INSERT INTO t VALUES (1)").await.unwrap();
+            let (operation, relay) = conn.root_cx().create_child_with_local_cancel_relay();
+            assert!(relay.cancel_local(CancelReason::UserInterrupt));
+            super::FSQLITE_ROLLBACK_BUSY_ONCE.with(|armed| armed.set(true));
+            let result = conn
+                .execute_rollback_with_cx(
+                    &operation,
+                    &fsqlite_ast::RollbackStatement { to_savepoint: None },
+                )
+                .await;
+            assert!(matches!(result, Err(FrankenError::Abort)), "{result:?}");
+            assert!(
+                !super::FSQLITE_ROLLBACK_BUSY_ONCE.with(|armed| armed.get()),
+                "rollback must consume its injected pager refusal"
+            );
+            assert!(conn.in_transaction() && conn.is_concurrent_transaction());
+            assert!(
+                conn.active_txn.borrow().is_some() && conn.has_concurrent_session(),
+                "cancellation must retain pager ownership and the matching MVCC session"
+            );
+
+            // A fresh operation owns the mandatory retry after the cancelled
+            // caller has returned; its rollback must discard the staged row.
+            conn.root_cx().checkpoint().unwrap();
+            conn.execute("ROLLBACK").await.unwrap();
+            assert!(!conn.in_transaction() && !conn.is_concurrent_transaction());
+            assert!(conn.active_txn.borrow().is_none() && !conn.has_concurrent_session());
+            assert!(conn.query("SELECT id FROM t").await.unwrap().is_empty());
+            conn.execute("INSERT INTO t VALUES (2)").await.unwrap();
+            assert_eq!(
+                conn.query_row("SELECT id FROM t").await.unwrap().get(0),
+                Some(&SqliteValue::Integer(2))
+            );
+            conn.close().await.unwrap();
+        });
+    }
+
+    #[test]
     fn test_rollback_clears_concurrent_flag() {
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
@@ -210227,6 +210378,97 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(row.get(0), Some(&SqliteValue::Text("durable".into())));
+        });
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn test_gh524_cancellation_after_durable_commit_still_publishes() {
+        use fsqlite_types::cx::CancelReason;
+
+        asupersync::test_utils::run_test(|| async {
+            let _serial = super::fsqlite_core_test_serializer();
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("cancel_after_durable_commit.db");
+            let conn = Connection::open(path.to_str().unwrap()).await.unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);")
+                .await
+                .unwrap();
+            let root_page = conn
+                .schema
+                .borrow()
+                .iter()
+                .find(|table| table.name.eq_ignore_ascii_case("t"))
+                .map(|table| {
+                    PageNumber::new(u32::try_from(table.root_page).expect("root page fits u32"))
+                        .expect("table root page must be nonzero")
+                })
+                .expect("created table must have a root page");
+            let before = conn.concurrent_commit_index.latest(root_page);
+            conn.execute("BEGIN CONCURRENT;").await.unwrap();
+            conn.execute("INSERT INTO t VALUES (1, 'durable');")
+                .await
+                .unwrap();
+
+            let (operation, relay) = conn.root_cx().create_child_with_local_cancel_relay();
+            let hook_calls = Arc::new(AtomicUsize::new(0));
+            let calls = Arc::clone(&hook_calls);
+            let owner_thread = std::thread::current().id();
+            struct CommitWindowHookGuard;
+            impl Drop for CommitWindowHookGuard {
+                fn drop(&mut self) {
+                    super::set_concurrent_commit_window_hook(None);
+                }
+            }
+            let hook_guard = CommitWindowHookGuard;
+            // This existing hook fires after the physical outcome has been
+            // classified as durable, but before logical CommitIndex publication.
+            // Restrict the global hook to our connection's owning test thread.
+            super::set_concurrent_commit_window_hook(Some(Arc::new(move || {
+                if std::thread::current().id() == owner_thread {
+                    calls.fetch_add(1, AtomicOrdering::SeqCst);
+                    assert!(relay.cancel_local(CancelReason::UserInterrupt));
+                }
+            })));
+            {
+                let _binding = conn.bind_operation_cx(&operation);
+                conn.execute("COMMIT;")
+                    .await
+                    .expect("cancellation after durability must still acknowledge the commit");
+            }
+            drop(hook_guard);
+
+            assert_eq!(hook_calls.load(AtomicOrdering::SeqCst), 1);
+            assert!(operation.checkpoint().is_err());
+            conn.root_cx()
+                .checkpoint()
+                .expect("operation cancellation must leave the connection root live");
+            assert!(!conn.in_transaction() && !conn.is_concurrent_transaction());
+            assert!(conn.active_txn.borrow().is_none() && !conn.has_concurrent_session());
+            let published = conn
+                .concurrent_commit_index
+                .latest(root_page)
+                .expect("the durable write must publish its table root to CommitIndex");
+            assert!(before.is_none_or(|previous| published > previous));
+            assert_eq!(published, conn.pager.published_snapshot().visible_commit_seq);
+            assert_eq!(
+                conn.query_row("SELECT v FROM t WHERE id = 1;")
+                    .await
+                    .unwrap()
+                    .get(0),
+                Some(&SqliteValue::Text("durable".into()))
+            );
+            conn.execute("INSERT INTO t VALUES (2, 'after cancellation');")
+                .await
+                .expect("a fresh operation must still be able to write");
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM t;")
+                    .await
+                    .unwrap()
+                    .get(0),
+                Some(&SqliteValue::Integer(2))
+            );
+            conn.close().await.unwrap();
         });
     }
 
@@ -210908,7 +211150,8 @@ mod tests {
                 handles.push(std::thread::spawn(move || -> (Vec<i64>, u64) {
                 let mut worker_out: (Vec<i64>, u64) = (Vec::new(), 0);
                 asupersync::test_utils::run_test(|| async {
-                let mut conn = retry_busy_connection_bootstrap(|| Connection::open(&db))
+                let bootstrap_cx = Cx::new();
+                let mut conn = retry_busy_connection_bootstrap(&bootstrap_cx, || Connection::open(&db))
                     .await
                     .unwrap();
                 conn.execute("PRAGMA busy_timeout=5000;").await.unwrap();
@@ -231715,7 +231958,8 @@ fts5(title, body, content=docs, content_rowid=id)'
     fn test_connection_bootstrap_retries_transient_busy() {
         asupersync::test_utils::run_test(|| async {
             let mut attempts = 0;
-            let result = retry_busy_connection_bootstrap(|| {
+            let cx = Cx::new();
+            let result = retry_busy_connection_bootstrap(&cx, || {
                 attempts += 1;
                 std::future::ready(if attempts < 3 {
                     Err(FrankenError::BusyRecovery)
@@ -231734,10 +231978,128 @@ fts5(title, body, content=docs, content_rowid=id)'
     }
 
     #[test]
+    fn test_gh524_busy_handoff_wakes_on_local_cancellation() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Wake, Waker};
+
+        struct WakeCount(AtomicUsize);
+        impl Wake for WakeCount {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+        }
+
+        let root = Cx::new();
+        let (operation, relay) = root.create_child_with_local_cancel_relay();
+        let wake_count = Arc::new(WakeCount(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&wake_count));
+        let mut task_cx = Context::from_waker(&waker);
+        // A long test delay separates a cancellation wake from a timer wake.
+        // No real-time sleep is needed: poll, cancel, and poll deterministically.
+        let mut handoff = std::pin::pin!(super::perform_begin_busy_retry_handoff(
+            &operation,
+            super::BeginBusyRetryWait {
+                attempt: 1,
+                spin_loops: 0,
+                sleep_for: std::time::Duration::from_secs(60),
+            },
+        ));
+        assert!(handoff.as_mut().poll(&mut task_cx).is_pending());
+        let before = wake_count.0.load(AtomicOrdering::Relaxed);
+        assert!(relay.cancel_local(CancelReason::UserInterrupt));
+        assert!(
+            wake_count.0.load(AtomicOrdering::Relaxed) > before,
+            "the explicit operation relay must wake the sleeping retry"
+        );
+        assert!(matches!(
+            handoff.as_mut().poll(&mut task_cx),
+            Poll::Ready(Err(FrankenError::Abort))
+        ));
+        root.checkpoint().expect("cancellation must remain local");
+    }
+
+    #[test]
+    fn test_gh524_busy_handoff_respects_cleanup_mask() {
+        asupersync::test_utils::run_test(|| async {
+            let root = Cx::new();
+            let (operation, relay) = root.create_child_with_local_cancel_relay();
+            let mask = operation.masked();
+            assert!(relay.cancel_local(CancelReason::UserInterrupt));
+            super::perform_begin_busy_retry_handoff(
+                &operation,
+                super::BeginBusyRetryWait {
+                    attempt: 1,
+                    spin_loops: 0,
+                    sleep_for: std::time::Duration::ZERO,
+                },
+            )
+            .await
+            .expect("a masked cleanup handoff must complete");
+            drop(mask);
+            assert!(
+                operation.checkpoint().is_err(),
+                "masking must defer, not discard, cancellation"
+            );
+        });
+    }
+
+    #[test]
+    fn test_gh524_bootstrap_rejects_precancelled_context_without_attempt() {
+        asupersync::test_utils::run_test(|| async {
+            let root = Cx::new();
+            let (operation, relay) = root.create_child_with_local_cancel_relay();
+            assert!(relay.cancel_local(CancelReason::UserInterrupt));
+            let mut attempts = 0;
+            let result = retry_busy_connection_bootstrap(&operation, || {
+                attempts += 1;
+                std::future::ready(Ok(()))
+            })
+            .await;
+            assert!(matches!(result, Err(FrankenError::Abort)));
+            assert_eq!(
+                attempts, 0,
+                "pre-cancellation must prevent bootstrap side effects"
+            );
+        });
+    }
+
+    #[test]
+    fn test_gh524_bootstrap_stops_after_cancelled_busy_attempt() {
+        asupersync::test_utils::run_test(|| async {
+            for recovery in [false, true] {
+                let root = Cx::new();
+                let (operation, relay) = root.create_child_with_local_cancel_relay();
+                let mut attempts = 0;
+                let result = retry_busy_connection_bootstrap(&operation, || {
+                    attempts += 1;
+                    std::future::ready(if attempts == 1 {
+                        assert!(relay.cancel_local(CancelReason::UserInterrupt));
+                        Err(super::busy_family_error(recovery))
+                    } else {
+                        // A broken retry finishes promptly but incorrectly:
+                        // this guard need not spend the 30-second open budget.
+                        Ok(())
+                    })
+                })
+                .await;
+                assert!(
+                    matches!(result, Err(FrankenError::Abort)),
+                    "recovery={recovery}: {result:?}"
+                );
+                assert_eq!(
+                    attempts, 1,
+                    "cancelled Busy must not start another open attempt"
+                );
+            }
+        });
+    }
+
+    #[test]
     fn test_connection_bootstrap_does_not_retry_permanent_open_error() {
         asupersync::test_utils::run_test(|| async {
             let mut attempts = 0;
-            let err: Result<()> = retry_busy_connection_bootstrap(|| {
+            let cx = Cx::new();
+            let err: Result<()> = retry_busy_connection_bootstrap(&cx, || {
                 attempts += 1;
                 std::future::ready(Err(FrankenError::CannotOpen {
                     path: std::path::PathBuf::from("permanent-open-error.db"),

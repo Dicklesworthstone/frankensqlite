@@ -452,3 +452,264 @@ fn migration_result_fields_all_correct() {
         assert_eq!(r.current, 20);
     });
 }
+
+#[cfg(all(unix, feature = "native"))]
+mod gh524_migration_cancellation {
+    use std::future::{Future, poll_fn};
+    use std::io::Read;
+    use std::path::Path;
+    use std::process::{Child, Command, Stdio};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use fsqlite::FrankenError;
+    use fsqlite_types::cx::CancelReason;
+
+    use super::{Connection, MigrationRunner, SqliteValue};
+
+    const WRITER_DB_ENV: &str = "FSQLITE_GH524_MIGRATION_WRITER_DB";
+    const WRITER_READY_ENV: &str = "FSQLITE_GH524_MIGRATION_WRITER_READY";
+
+    // Re-executed in another process so that cancellation cannot be helped by
+    // FrankenSQLite's in-process lock notifications. Match the reported cass
+    // writer's serialized main-file admission fence; stock SQLite's WAL writer
+    // instead contends at WAL publication and does not block this BEGIN path.
+    #[test]
+    fn writer_child() {
+        let Some(db) = std::env::var_os(WRITER_DB_ENV) else {
+            return;
+        };
+        let ready = std::env::var_os(WRITER_READY_ENV).expect("writer readiness path");
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(db.to_str().expect("UTF-8 database path"))
+                .await
+                .expect("open writer connection");
+            conn.execute("PRAGMA fsqlite.concurrent_mode = OFF;")
+                .await
+                .unwrap();
+            conn.execute("BEGIN IMMEDIATE;").await.unwrap();
+            conn.execute("INSERT INTO writer_rows VALUES (99);")
+                .await
+                .expect("hold the writer with an uncommitted row");
+            std::fs::write(ready, b"writer locked\n").expect("report acquired writer lock");
+
+            let error = std::io::stdin()
+                .read_exact(&mut [0_u8; 1])
+                .expect_err("parent closes stdin to release the writer");
+            assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+            conn.execute("ROLLBACK;").await.expect("writer rollback");
+            conn.close().await.expect("close writer connection");
+        });
+    }
+
+    struct Writer(Child);
+
+    impl Writer {
+        fn start(db: &Path) -> Self {
+            let ready = db.with_extension("ready");
+            assert!(!ready.exists(), "each writer needs a fresh readiness path");
+            let child = Command::new(std::env::current_exe().expect("migration test binary"))
+                .args([
+                    "--exact",
+                    "gh524_migration_cancellation::writer_child",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(WRITER_DB_ENV, db)
+                .env(WRITER_READY_ENV, &ready)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .expect("spawn writer process");
+            let mut writer = Self(child);
+            let started = Instant::now();
+            while !ready.exists() {
+                if let Some(status) = writer.0.try_wait().expect("poll writer startup") {
+                    panic!("writer exited before acquiring its lock: {status}");
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(20),
+                    "writer did not acquire its lock"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                writer.0.try_wait().expect("check live writer").is_none(),
+                "writer must retain its lock after reporting readiness"
+            );
+            writer
+        }
+
+        fn release(mut self) {
+            drop(self.0.stdin.take());
+            let started = Instant::now();
+            loop {
+                if let Some(status) = self.0.try_wait().expect("poll writer exit") {
+                    assert!(status.success(), "writer failed: {status}");
+                    return;
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(10),
+                    "writer did not exit after release"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    impl Drop for Writer {
+        fn drop(&mut self) {
+            drop(self.0.stdin.take());
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn migration() -> MigrationRunner {
+        MigrationRunner::new().add(
+            1,
+            "create_migrated",
+            "CREATE TABLE migrated(id INTEGER PRIMARY KEY);",
+        )
+    }
+
+    #[test]
+    fn cancelled_migration_releases_admission_and_leaves_connection_reusable() {
+        let dir = tempfile::tempdir().expect("migration database directory");
+        let db = dir.path().join("gh524_migration.db");
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(db.to_str().expect("UTF-8 database path"))
+                .await
+                .expect("open migration connection");
+            assert!(conn.is_concurrent_mode_default());
+            conn.query("PRAGMA journal_mode = WAL;").await.unwrap();
+            conn.execute("PRAGMA wal_autocheckpoint = 0;")
+                .await
+                .unwrap();
+            conn.execute("PRAGMA busy_timeout = 10000;").await.unwrap();
+            conn.execute("CREATE TABLE writer_rows(id INTEGER PRIMARY KEY);")
+                .await
+                .unwrap();
+            // Initialize metadata before contention so the test has a pending
+            // migration against an existing tracking table.
+            let empty = MigrationRunner::new().run(&conn).await.unwrap();
+            assert_eq!(empty.current, 0);
+            let writer = Writer::start(&db);
+
+            let (operation, relay) = conn.root_cx().create_child_with_local_cancel_relay();
+            let (started_tx, started_rx) = mpsc::channel();
+            let canceller = thread::spawn(move || {
+                started_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("migration began polling");
+                thread::sleep(Duration::from_millis(300));
+                let cancelled_at = Instant::now();
+                assert!(relay.cancel_local(CancelReason::UserInterrupt));
+                cancelled_at
+            });
+            let result = {
+                let _binding = conn.bind_operation_cx(&operation);
+                let runner = migration();
+                let mut future = std::pin::pin!(runner.run(&conn));
+                let mut first_poll = Some(started_tx);
+                poll_fn(|cx| {
+                    // Signal before the first poll: the original defect can
+                    // block inside that poll for the entire busy timeout.
+                    if let Some(started) = first_poll.take() {
+                        started.send(()).expect("notify cancellation thread");
+                    }
+                    future.as_mut().poll(cx)
+                })
+                .await
+            };
+            let finished_at = Instant::now();
+            let cancelled_at = canceller.join().expect("cancellation thread");
+            let cancel_latency = finished_at
+                .checked_duration_since(cancelled_at)
+                .expect("migration must still be waiting when cancellation is requested");
+            assert!(
+                matches!(result, Err(FrankenError::Abort)),
+                "cancelled migration returned {result:?} after {cancel_latency:?}"
+            );
+            assert!(!conn.in_transaction());
+            assert!(operation.is_cancel_requested());
+            assert!(conn.root_cx().checkpoint().is_ok());
+
+            // The same connection must still honor a normal busy timeout while
+            // the peer holds its writer; local cancellation cannot poison it.
+            conn.execute("PRAGMA busy_timeout = 250;").await.unwrap();
+            let busy_started = Instant::now();
+            let busy = conn.execute("BEGIN IMMEDIATE;").await;
+            let busy_elapsed = busy_started.elapsed();
+            writer.release();
+            assert!(
+                matches!(busy, Err(FrankenError::Busy | FrankenError::BusyRecovery)),
+                "uncancelled BEGIN returned {busy:?} after {busy_elapsed:?}"
+            );
+            assert!(!conn.in_transaction());
+            assert!(
+                conn.query("SELECT id FROM writer_rows;")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                conn.query("SELECT version FROM main._schema_migrations;")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                conn.query("SELECT name FROM sqlite_master WHERE name = 'migrated';")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+
+            let runner = migration();
+            let applied = runner.run(&conn).await.expect("retry cancelled migration");
+            assert_eq!(applied.applied, vec![1]);
+            assert_eq!(applied.current, 1);
+            assert!(runner.run(&conn).await.unwrap().applied.is_empty());
+            conn.execute("INSERT INTO migrated VALUES (1);")
+                .await
+                .unwrap();
+            assert_eq!(
+                conn.query_row("SELECT id FROM migrated;")
+                    .await
+                    .unwrap()
+                    .get(0),
+                Some(&SqliteValue::Integer(1))
+            );
+            conn.close().await.expect("close reusable connection");
+
+            let oracle = rusqlite::Connection::open(&db).expect("open stock SQLite oracle");
+            let rows: i64 = oracle
+                .query_row("SELECT COUNT(*) FROM migrated;", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(rows, 1);
+            let integrity: String = oracle
+                .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(integrity, "ok");
+
+            eprintln!(
+                "GH#524 migration cancellation: {cancel_latency:?}; uncancelled busy timeout: {busy_elapsed:?}"
+            );
+            assert!(
+                cancel_latency < Duration::from_secs(1),
+                "{cancel_latency:?}"
+            );
+            assert!(
+                busy_elapsed >= Duration::from_millis(200),
+                "{busy_elapsed:?}"
+            );
+            assert!(
+                busy_elapsed < Duration::from_millis(900),
+                "{busy_elapsed:?}"
+            );
+        });
+    }
+}

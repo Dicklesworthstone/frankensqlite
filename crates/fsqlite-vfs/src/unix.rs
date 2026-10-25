@@ -5255,6 +5255,7 @@ impl VfsFile for UnixFile {
         let mut wait_started = None;
         let mut backoff = Duration::from_millis(1);
         loop {
+            checkpoint_or_abort(cx)?;
             if let Some(slot) = self.try_acquire_wal_reader_slot(cx, &region_0, mx_frame)? {
                 return Ok(Some(slot));
             }
@@ -9650,6 +9651,67 @@ mod tests {
 
         // Once a writable peer publishes a safe mark, the same read-only
         // handle can acquire it. The failed attempt left no stale lock.
+        let writer_slot = writer.wal_reader_slot_acquire(&cx, 42).unwrap().unwrap();
+        let reader_slot = reader.wal_reader_slot_acquire(&cx, 42).unwrap().unwrap();
+        assert_eq!(reader_slot, writer_slot);
+        reader.wal_reader_slot_release(&cx, reader_slot).unwrap();
+        writer.wal_reader_slot_release(&cx, writer_slot).unwrap();
+    }
+
+    #[test]
+    fn test_gh524_readonly_wal_reader_cancels_without_safe_mark() {
+        use fsqlite_types::cx::BusyWaitBudget;
+
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("readonly_reader_cancel_no_safe_mark.db");
+        let (mut writer, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        let region = writer.shm_map(&cx, 0, SHM_SEGMENT_SIZE, true).unwrap();
+        for index in 1..WAL_NREADER {
+            write_wal_read_mark(&region, index, WAL_READ_MARK_NOT_USED).unwrap();
+        }
+        let before = fs::read(sqlite_shm_path(&path)).unwrap();
+        let (mut reader, _) = vfs
+            .open(
+                &cx,
+                Some(&path),
+                VfsOpenFlags::READONLY | VfsOpenFlags::MAIN_DB,
+            )
+            .unwrap();
+        reader.set_busy_timeout_ms(10_000);
+
+        let budget = BusyWaitBudget::new(Duration::from_secs(10));
+        let operation = Cx::new().with_busy_wait_budget(budget.clone());
+        let cancel = operation.clone();
+        let canceller = std::thread::spawn(move || {
+            let started = Instant::now();
+            // Start only after genuine contention, rather than racing the
+            // initial cancellation checkpoint that already works.
+            while budget.started().is_none() {
+                assert!(
+                    started.elapsed() < Duration::from_secs(3),
+                    "reader did not reach its first contended admission"
+                );
+                std::thread::yield_now();
+            }
+            let cancelled_at = Instant::now();
+            cancel.cancel();
+            cancelled_at
+        });
+        let result = reader.wal_reader_slot_acquire(&operation, 42);
+        let returned_at = Instant::now();
+        let cancelled_at = canceller.join().unwrap();
+        assert!(
+            matches!(result, Err(FrankenError::Abort)),
+            "cancelled read-only admission must return Abort, got {result:?}"
+        );
+        assert!(
+            returned_at.duration_since(cancelled_at) < Duration::from_secs(1),
+            "cancellation must not wait out the 10-second busy timeout"
+        );
+        assert_eq!(fs::read(sqlite_shm_path(&path)).unwrap(), before);
+
+        // Cancellation must leave the handle reusable and publish no mark.
         let writer_slot = writer.wal_reader_slot_acquire(&cx, 42).unwrap().unwrap();
         let reader_slot = reader.wal_reader_slot_acquire(&cx, 42).unwrap().unwrap();
         assert_eq!(reader_slot, writer_slot);
