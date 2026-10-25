@@ -2049,6 +2049,8 @@ pub struct CreateTriggerStatement {
     pub timing: TriggerTiming,
     /// What event triggers it.
     pub event: TriggerEvent,
+    /// Optional schema qualifier on the target table (`ON schema.table`, bd-3j81a).
+    pub table_schema: Option<String>,
     /// Table the trigger is on.
     pub table: String,
     /// `FOR EACH ROW` (SQLite only supports row-level triggers).
@@ -2582,6 +2584,7 @@ mod tests {
             name: QualifiedName::bare("tr"),
             timing: TriggerTiming::Before,
             event: TriggerEvent::Insert,
+            table_schema: None,
             table: "t".to_owned(),
             for_each_row: true,
             when: None,

@@ -53,8 +53,8 @@ use crate::connection::{
 };
 #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
 use crate::connection::{
-    eval_join_expr, is_sqlite_truthy, qualified_unique_constraint_label,
-    unshadowed_hidden_rowid_alias,
+    JoinEvalCollationContext, JoinEvalCollationContextGuard, eval_join_expr, is_sqlite_truthy,
+    qualified_unique_constraint_label, unshadowed_hidden_rowid_alias,
 };
 use fsqlite_types::{
     DATABASE_HEADER_SIZE, DatabaseHeader, PageNumber, PageSize, without_rowid_storage_order,
@@ -1594,7 +1594,7 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
                 // `VacuumTargetReservation`, which is identity-bound; returning
                 // early simply leaves the reservation to clean up as it already
                 // does for every other failure in this function.
-                {
+                let eval_collation_registry = {
                     let registry = collation_registry.lock().map_err(|_| {
                         FrankenError::internal(
                             "collation registry lock poisoned while rebuilding an index".to_owned(),
@@ -1611,7 +1611,8 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
                             )));
                         }
                     }
-                }
+                    registry.clone()
+                };
                 // GH#347: resolve the key collations for the bulk-load sort
                 // before `index_collations` is moved into the cursor.
                 let sort_collations =
@@ -1634,6 +1635,37 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
                     // entries first; mirror that with the cursor's own comparator.
                     let mut index_keys: Vec<Vec<SqliteValue>> = Vec::new();
                     let evaluates_row = partial_predicate.is_some() || is_expression_index;
+                    // bd-h09hh: push the table's declared column collations and
+                    // affinities before evaluating partial-index predicates or
+                    // expression-index terms so declared collations (e.g. NOCASE)
+                    // match runtime and integrity_check evaluation.
+                    let _eval_collation_guard = if evaluates_row {
+                        let mut column_collations: Vec<Option<String>> = table
+                            .columns
+                            .iter()
+                            .map(|col| col.collation.clone())
+                            .collect();
+                        let mut column_affinities: Vec<fsqlite_types::TypeAffinity> = table
+                            .columns
+                            .iter()
+                            .map(|col| affinity_char_to_type(col.affinity))
+                            .collect();
+                        if hidden_rowid_slot {
+                            column_collations.push(None);
+                            column_affinities.push(fsqlite_types::TypeAffinity::Integer);
+                        }
+                        Some(JoinEvalCollationContextGuard::push(
+                            JoinEvalCollationContext {
+                                declared_json_keys: HashSet::new(),
+                                column_collations,
+                                column_affinities,
+                                using_column_projections: HashMap::new(),
+                                registry: eval_collation_registry,
+                            },
+                        ))
+                    } else {
+                        None
+                    };
                     let mut row_image: Vec<SqliteValue> = Vec::new();
                     for (rowid, values) in mem_table.iter_rows() {
                         // The row as predicates and key expressions see it:
@@ -3501,21 +3533,88 @@ pub(crate) fn check_constraints_from_create_table_statement(
     checks
 }
 
-/// `expr`'s verbatim source in `create_sql`, trimmed, when that slice parses
-/// back to the same expression; otherwise the AST rendering. This is the rule
-/// CREATE TABLE applies (`Connection::format_check_expr_source`): a span that
-/// omits grouping parentheses, as in `CHECK((a) AND (b))`, is not a valid
-/// expression on its own and must not replace the constraint.
-fn stored_check_expr_source(expr: &Expr, create_sql: &str) -> String {
+/// `expr`'s verbatim source in `create_sql`, trimmed, when that slice (or its
+/// balanced grouping-parenthesis expansion inside `CHECK(...)`) parses back to
+/// the same expression; otherwise the AST rendering.
+pub(crate) fn stored_check_expr_source(expr: &Expr, create_sql: &str) -> String {
     let span = expr.span();
+    let (mut start, mut end) = (span.start as usize, span.end as usize);
+    if let Some(raw) = create_sql.get(start..end) {
+        let mut depth = 0_isize;
+        let mut min_depth = 0_isize;
+        let mut chars = raw.char_indices().peekable();
+        while let Some((_, ch)) = chars.next() {
+            match ch {
+                '\'' | '"' | '`' => skip_quoted_sql(&mut chars, ch),
+                '[' => skip_bracket_identifier(&mut chars),
+                '-' if chars.peek().is_some_and(|(_, next_ch)| *next_ch == '-') => {
+                    let _ = chars.next();
+                    skip_line_comment(&mut chars);
+                }
+                '/' if chars.peek().is_some_and(|(_, next_ch)| *next_ch == '*') => {
+                    let _ = chars.next();
+                    skip_block_comment(&mut chars);
+                }
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    min_depth = min_depth.min(depth);
+                }
+                _ => {}
+            }
+        }
+        let need_left = (-min_depth).max(0) as usize;
+        let need_right = (depth + (-min_depth).max(0)).max(0) as usize;
+        for _ in 0..need_left {
+            if let Some((idx, '(')) = prev_non_ws_char_index(create_sql, start) {
+                start = idx;
+            } else {
+                break;
+            }
+        }
+        for _ in 0..need_right {
+            if let Some((idx, ')')) = next_non_ws_char_index(create_sql, end) {
+                end = idx + 1;
+            } else {
+                break;
+            }
+        }
+        while let (Some((l_idx, '(')), Some((r_idx, ')'))) = (
+            prev_non_ws_char_index(create_sql, start),
+            next_non_ws_char_index(create_sql, end),
+        ) {
+            if prev_non_ws_char_index(create_sql, l_idx).is_some_and(|(_, ch)| ch == '(')
+                && next_non_ws_char_index(create_sql, r_idx + 1).is_some_and(|(_, ch)| ch == ')')
+            {
+                start = l_idx;
+                end = r_idx + 1;
+            } else {
+                break;
+            }
+        }
+    }
     create_sql
-        .get(span.start as usize..span.end as usize)
+        .get(start..end)
         .map(str::trim)
         .filter(|source| {
             !source.is_empty()
                 && fsqlite_parser::expr::parse_expr(source).is_ok_and(|parsed| parsed.eq(expr))
         })
         .map_or_else(|| expr.to_string(), str::to_owned)
+}
+
+fn prev_non_ws_char_index(sql: &str, before: usize) -> Option<(usize, char)> {
+    sql.get(..before)?
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| !ch.is_whitespace())
+}
+
+fn next_non_ws_char_index(sql: &str, after: usize) -> Option<(usize, char)> {
+    sql.get(after..)?
+        .char_indices()
+        .find(|(_, ch)| !ch.is_whitespace())
+        .map(|(rel, ch)| (after + rel, ch))
 }
 
 fn parse_column_name_and_remainder(def: &str) -> Option<(String, &str)> {

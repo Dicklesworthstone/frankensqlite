@@ -1332,6 +1332,7 @@ fn emit_upsert_assignments(
     assignments: &[fsqlite_ast::Assignment],
     table: &TableSchema,
     target_regs: i32,
+    hidden_rowid_target_reg: Option<i32>,
     existing_ctx: &ScanCtx<'_>,
     excluded_ctx: &ScanCtx<'_>,
     existing_hidden_rowid_reg: Option<i32>,
@@ -1340,14 +1341,8 @@ fn emit_upsert_assignments(
     for assign in assignments {
         match &assign.target {
             AssignmentTarget::Column(name) => {
-                let col_idx =
-                    table
-                        .column_index(name)
-                        .ok_or_else(|| CodegenError::ColumnNotFound {
-                            table: table.name.clone(),
-                            column: name.to_owned(),
-                        })?;
-                let dest_reg = target_regs + col_idx as i32;
+                let dest_reg =
+                    update_target_reg(table, name, target_regs, hidden_rowid_target_reg)?;
                 emit_upsert_expr(
                     b,
                     &assign.value,
@@ -1373,13 +1368,8 @@ fn emit_upsert_assignments(
                     )));
                 }
                 for (col_name, value_expr) in columns.iter().zip(values) {
-                    let col_idx = table.column_index(col_name).ok_or_else(|| {
-                        CodegenError::ColumnNotFound {
-                            table: table.name.clone(),
-                            column: col_name.to_owned(),
-                        }
-                    })?;
-                    let dest_reg = target_regs + col_idx as i32;
+                    let dest_reg =
+                        update_target_reg(table, col_name, target_regs, hidden_rowid_target_reg)?;
                     emit_upsert_expr(
                         b,
                         value_expr,
@@ -15078,12 +15068,19 @@ fn resolve_join_column_ref(
                 }
             }
         }
-        if table.resolves_to_hidden_rowid(name) {
-            let resolution = JoinColumnResolution::HiddenRowid(cursor_idx as i32);
-            if found.replace(resolution).is_some() {
-                return Err(ambiguous_join_column(&join_qualified_column_name(
-                    qualifier, name,
-                )));
+    }
+    if found.is_none() {
+        for (cursor_idx, (table, alias)) in tables.iter().enumerate() {
+            if !join_qualifier_matches(qualifier, table, *alias) {
+                continue;
+            }
+            if table.resolves_to_hidden_rowid(name) {
+                let resolution = JoinColumnResolution::HiddenRowid(cursor_idx as i32);
+                if found.replace(resolution).is_some() {
+                    return Err(ambiguous_join_column(&join_qualified_column_name(
+                        qualifier, name,
+                    )));
+                }
             }
         }
     }
@@ -23613,7 +23610,22 @@ fn build_insert_target_mapping(
     table: &TableSchema,
 ) -> Result<Option<InsertTargetMapping>, CodegenError> {
     if insert_columns.is_empty() {
-        return Ok(None);
+        if !table.columns.iter().any(|col| col.generated_expr.is_some()) {
+            return Ok(None);
+        }
+        let mut next_source_pos = 0usize;
+        let mut col_mapping = vec![None; table.columns.len()];
+        for (tbl_pos, col) in table.columns.iter().enumerate() {
+            if col.generated_expr.is_none() {
+                col_mapping[tbl_pos] = Some(next_source_pos);
+                next_source_pos += 1;
+            }
+        }
+        return Ok(Some(InsertTargetMapping {
+            expected_source_cols: next_source_pos,
+            explicit_rowid_source_pos: None,
+            col_mapping,
+        }));
     }
 
     enum RowidTarget {
@@ -23949,16 +23961,24 @@ fn emit_upsert_do_update_apply(
         None
     };
 
+    let assignment_targets = collect_update_assignment_columns(table, assignments)?;
+    let hidden_rowid_target_reg = assignment_targets
+        .assigns_hidden_rowid
+        .then(|| b.alloc_reg());
     emit_upsert_assignments(
         b,
         assignments,
         table,
         existing_regs,
+        hidden_rowid_target_reg,
         &existing_ctx,
         &excluded_ctx,
         existing_hidden_rowid_reg,
         excluded_hidden_rowid_reg,
     )?;
+    if let Some(reg) = hidden_rowid_target_reg {
+        b.emit_op(Opcode::MustBeInt, reg, 0, 0, P4::None, 0);
+    }
     // The rewritten image's STORED generated columns follow its new base
     // columns, as in a plain UPDATE and the WITHOUT ROWID apply; without this
     // the record kept the conflict victim's stale values (bd-u7sv8 review).
@@ -23974,10 +23994,10 @@ fn emit_upsert_do_update_apply(
     if let Some(ipk_reg) = ipk_reg {
         emit_rowid_must_be_int(b, ipk_reg);
     }
-    // bd-8cs1s: the rewritten row's rowid, as its CHECK constraints see it: the
-    // (now integer) INTEGER PRIMARY KEY when the table has one, else the
-    // conflict row's own rowid, which a DO UPDATE without an IPK keeps.
-    let checked_rowid_reg = ipk_reg.unwrap_or(update_rowid_reg);
+    // bd-8cs1s / bd-xrzce: the rewritten row's rowid, as its CHECK constraints
+    // see it: the assigned hidden rowid, else the (now integer) INTEGER PRIMARY
+    // KEY when the table has one, else the conflict row's own rowid.
+    let checked_rowid_reg = hidden_rowid_target_reg.or(ipk_reg).unwrap_or(update_rowid_reg);
     // Validate the rewritten image before removing the old row.
     emit_strict_type_check(b, table, existing_regs);
     // GH #169: coerce to column affinity before CHECK/NOT NULL so the
@@ -24004,9 +24024,9 @@ fn emit_upsert_do_update_apply(
     emit_index_deletes_for_update(b, table, cursor, None);
     b.emit_op(Opcode::Delete, cursor, 0, 0, P4::None, OPFLAG_ISUPDATE);
 
-    // An UPSERT assignment may rewrite the INTEGER PRIMARY KEY. Reinsert at the
-    // new rowid, not the conflict victim's old id.
-    let mut final_rowid_reg = update_rowid_reg;
+    // An UPSERT assignment may rewrite the hidden rowid or INTEGER PRIMARY KEY.
+    // Reinsert at the new rowid, not the conflict victim's old id.
+    let mut final_rowid_reg = hidden_rowid_target_reg.unwrap_or(update_rowid_reg);
     if let Some(ipk_idx) = ctx
         .rowid_alias_col_idx
         .or_else(|| table.columns.iter().position(|column| column.is_ipk))
@@ -24118,14 +24138,24 @@ fn codegen_insert_values(
         .ok_or_else(|| CodegenError::Unsupported("empty VALUES".to_owned()))?
         .len();
 
-    let expected_source_cols = expected_source_cols.unwrap_or(table.columns.len());
+    let default_source_cols = table
+        .columns
+        .iter()
+        .filter(|col| col.generated_expr.is_none())
+        .count();
+    let expected_source_cols = expected_source_cols.unwrap_or(default_source_cols);
     if n_source_cols != expected_source_cols {
-        let message = if expected_source_cols == table.columns.len() && col_mapping.is_none() {
+        let is_implicit_column_list = col_mapping.is_none_or(|mapping| {
+            expected_source_cols == default_source_cols
+                && mapping
+                    .iter()
+                    .zip(&table.columns)
+                    .all(|(src, col)| src.is_some() == col.generated_expr.is_none())
+        });
+        let message = if is_implicit_column_list {
             format!(
                 "table {} has {} columns but {} values were supplied",
-                table.name,
-                table.columns.len(),
-                n_source_cols
+                table.name, expected_source_cols, n_source_cols
             )
         } else {
             // An explicit target column list uses stock's shorter form.
@@ -25236,7 +25266,7 @@ pub fn codegen_update(
     validate_single_table_result_columns(
         &stmt.returning,
         table,
-        stmt.table.alias.as_deref(),
+        None,
         stmt.table.name.schema.as_deref(),
     )?;
 
@@ -26463,7 +26493,7 @@ fn codegen_update_from(
     validate_single_table_result_columns(
         &stmt.returning,
         target,
-        stmt.table.alias.as_deref(),
+        None,
         stmt.table.name.schema.as_deref(),
     )?;
 
@@ -27416,7 +27446,7 @@ pub fn codegen_delete(
     validate_single_table_result_columns(
         &stmt.returning,
         table,
-        stmt.table.alias.as_deref(),
+        None,
         stmt.table.name.schema.as_deref(),
     )?;
 
@@ -27788,7 +27818,7 @@ pub fn codegen_delete(
             table_cursor,
             &stmt.returning,
             table,
-            stmt.table.alias.as_deref(),
+            None,
             schema,
             ret_regs,
         )?;
@@ -29292,6 +29322,7 @@ fn emit_without_rowid_upsert_do_update_apply(
         assignments,
         table,
         existing_regs,
+        None,
         &existing_ctx,
         &excluded_ctx,
         None,
@@ -30432,7 +30463,7 @@ fn codegen_update_from_without_rowid(
     validate_single_table_result_columns(
         &stmt.returning,
         table,
-        stmt.table.alias.as_deref(),
+        None,
         stmt.table.name.schema.as_deref(),
     )?;
 
@@ -31948,7 +31979,7 @@ fn emit_returning(
     cursor: i32,
     table: &TableSchema,
     returning: &[ResultColumn],
-    table_alias: Option<&str>,
+    _table_alias: Option<&str>,
     schema: &[TableSchema],
     rowid_reg: i32,
 ) -> Result<(), CodegenError> {
@@ -31956,7 +31987,11 @@ fn emit_returning(
     // codegen paths is always a main (or implicit) binding: attached-schema DML
     // is delegated or rejected upstream, so a `None` (implicit `main`) FROM
     // schema is the correct reconciliation base here.
-    validate_single_table_result_columns(returning, table, table_alias, None)?;
+    // bd-xrzce: stock SQLite lowers RETURNING as a synthetic trigger on the
+    // unaliased target table name, so the DML target's `AS alias` is not in
+    // scope inside RETURNING (`INSERT INTO q AS x ... RETURNING x.rowid` ->
+    // "no such column: x.rowid").
+    validate_single_table_result_columns(returning, table, None, None)?;
 
     let skip_returning = b.emit_label();
     b.emit_jump_to_label(
@@ -31969,7 +32004,7 @@ fn emit_returning(
     );
     let ret_count = result_column_count(returning, table);
     let ret_regs = b.alloc_regs(ret_count);
-    emit_column_reads(b, cursor, returning, table, table_alias, schema, ret_regs)?;
+    emit_column_reads(b, cursor, returning, table, None, schema, ret_regs)?;
     b.emit_op(Opcode::ResultRow, ret_regs, ret_count, 0, P4::None, 0);
     b.resolve_label(skip_returning);
     Ok(())
@@ -31986,7 +32021,7 @@ fn emit_returning_from_regs(
     b: &mut ProgramBuilder,
     table: &TableSchema,
     returning: &[ResultColumn],
-    table_alias: Option<&str>,
+    _table_alias: Option<&str>,
     schema: &[TableSchema],
     col_regs: i32,
 ) -> Result<(), CodegenError> {
@@ -31994,7 +32029,7 @@ fn emit_returning_from_regs(
     // codegen paths is always a main (or implicit) binding: attached-schema DML
     // is delegated or rejected upstream, so a `None` (implicit `main`) FROM
     // schema is the correct reconciliation base here.
-    validate_single_table_result_columns(returning, table, table_alias, None)?;
+    validate_single_table_result_columns(returning, table, None, None)?;
     let ret_count = result_column_count(returning, table);
     let ret_regs = b.alloc_regs(ret_count);
     let mut reg = ret_regs;
@@ -32007,7 +32042,7 @@ fn emit_returning_from_regs(
                 }
             }
             ResultColumn::TableStar(qualifier) => {
-                if !matches_table_or_alias(&qualifier.name, table, table_alias) {
+                if !matches_table_or_alias(&qualifier.name, table, None) {
                     return Err(CodegenError::TableNotFound(qualifier.to_string()));
                 }
                 for i in 0..table.columns.len() {
@@ -32019,7 +32054,7 @@ fn emit_returning_from_regs(
                 let scan = ScanCtx {
                     cursor: 0,
                     table,
-                    table_alias,
+                    table_alias: None,
                     schema: Some(schema),
                     register_base: Some(RegisterRow::columns(col_regs)),
                     secondaries: &[],
@@ -33156,14 +33191,8 @@ fn validate_assignment_target(
 ) -> Result<(), CodegenError> {
     match target {
         AssignmentTarget::Column(name) => {
-            if table.column_index(name).is_some() {
-                Ok(())
-            } else {
-                Err(CodegenError::ColumnNotFound {
-                    table: table.name.clone(),
-                    column: name.clone(),
-                })
-            }
+            resolve_update_target(table, name)?;
+            Ok(())
         }
         AssignmentTarget::ColumnList(columns) => {
             if columns.is_empty() {
@@ -33172,12 +33201,7 @@ fn validate_assignment_target(
                 ));
             }
             for name in columns {
-                if table.column_index(name).is_none() {
-                    return Err(CodegenError::ColumnNotFound {
-                        table: table.name.clone(),
-                        column: name.clone(),
-                    });
-                }
+                resolve_update_target(table, name)?;
             }
             Ok(())
         }
@@ -33374,12 +33398,22 @@ fn validate_scan_column_ref(col_ref: &ColumnRef, scan: &ScanCtx<'_>) -> Result<(
         return Err(qualified_column_not_found(qualifier, &col_ref.column));
     }
 
-    let mut match_count = usize::from(table_has_column_or_rowid(scan.table, &col_ref.column));
-    match_count += scan
-        .secondaries
-        .iter()
-        .filter(|secondary| table_has_column_or_rowid(secondary.table, &col_ref.column))
-        .count();
+    let declared_matches = usize::from(scan.table.column_index(&col_ref.column).is_some())
+        + scan
+            .secondaries
+            .iter()
+            .filter(|secondary| secondary.table.column_index(&col_ref.column).is_some())
+            .count();
+    let match_count = if declared_matches > 0 {
+        declared_matches
+    } else {
+        usize::from(scan.table.resolves_to_hidden_rowid(&col_ref.column))
+            + scan
+                .secondaries
+                .iter()
+                .filter(|secondary| secondary.table.resolves_to_hidden_rowid(&col_ref.column))
+                .count()
+    };
 
     match match_count {
         0 => Err(CodegenError::ColumnNotFound {
@@ -38812,15 +38846,21 @@ fn emit_expr(b: &mut ProgramBuilder, expr: &Expr, reg: i32, ctx: Option<&ScanCtx
                 } else {
                     b.emit_op(Opcode::Column, sc.cursor, col_idx as i32, reg, P4::None, 0);
                 }
+            } else if let Some(sec) = sc
+                .secondaries
+                .iter()
+                .find(|sec| sec.table.column_index(&col_ref.column).is_some())
+            {
+                // Unqualified declared column in a secondary FROM source takes
+                // precedence over the primary table's hidden rowid (bd-257yl).
+                emit_secondary_column(b, &col_ref.column, sec, reg);
             } else if sc.table.resolves_to_hidden_rowid(&col_ref.column) {
                 b.emit_op(Opcode::Rowid, sc.cursor, reg, 0, P4::None, 0);
             } else if let Some(sec) = sc
                 .secondaries
                 .iter()
-                .find(|sec| table_has_column_or_rowid(sec.table, &col_ref.column))
+                .find(|sec| sec.table.resolves_to_hidden_rowid(&col_ref.column))
             {
-                // Unqualified column not found in primary — resolve against the
-                // first secondary FROM source that has it.
                 emit_secondary_column(b, &col_ref.column, sec, reg);
             } else {
                 // Unknown column — emit Null.
@@ -41602,19 +41642,26 @@ fn join_declared_collation<'a>(
     let Expr::Column(col_ref, _) = source else {
         return None;
     };
-    tables.iter().find_map(|(table, alias)| {
+    if let Some(collation) = tables.iter().find_map(|(table, alias)| {
         if let Some(qualifier) = col_ref.table.as_deref()
             && !matches_table_or_alias(qualifier, table, *alias)
         {
             return None;
         }
-        if let Some(index) = table.column_index(&col_ref.column) {
-            return Some(
-                table.columns[index]
-                    .collation
-                    .as_deref()
-                    .unwrap_or("BINARY"),
-            );
+        table.column_index(&col_ref.column).map(|index| {
+            table.columns[index]
+                .collation
+                .as_deref()
+                .unwrap_or("BINARY")
+        })
+    }) {
+        return Some(collation);
+    }
+    tables.iter().find_map(|(table, alias)| {
+        if let Some(qualifier) = col_ref.table.as_deref()
+            && !matches_table_or_alias(qualifier, table, *alias)
+        {
+            return None;
         }
         table
             .resolves_to_hidden_rowid(&col_ref.column)
@@ -41645,12 +41692,21 @@ fn join_expr_affinity(expr: &Expr, tables: &[(&TableSchema, Option<&str>)]) -> u
                 {
                     return None;
                 }
-                if let Some(index) = table.column_index(&col_ref.column) {
-                    return Some(schema_column_expr_affinity(&table.columns[index]));
-                }
                 table
-                    .resolves_to_hidden_rowid(&col_ref.column)
-                    .then_some(b'D')
+                    .column_index(&col_ref.column)
+                    .map(|index| schema_column_expr_affinity(&table.columns[index]))
+            })
+            .or_else(|| {
+                tables.iter().find_map(|(table, alias)| {
+                    if let Some(qualifier) = col_ref.table.as_deref()
+                        && !matches_table_or_alias(qualifier, table, *alias)
+                    {
+                        return None;
+                    }
+                    table
+                        .resolves_to_hidden_rowid(&col_ref.column)
+                        .then_some(b'D')
+                })
             })
             .unwrap_or(b'A'),
         Expr::Cast { type_name, .. } => type_name_to_affinity(type_name),
@@ -41770,6 +41826,27 @@ fn declared_collation_ctx<'a>(expr: &'a Expr, ctx: Option<&'a ScanCtx<'_>>) -> O
                 .iter()
                 .find_map(|secondary| in_table(secondary.table, secondary.table_alias))
         });
+    }
+
+    let declared_in_table = |table: &'a TableSchema| -> Option<&'a str> {
+        table.column_index(&col_ref.column).map(|index| {
+            table.columns[index]
+                .collation
+                .as_deref()
+                .unwrap_or("BINARY")
+        })
+    };
+    let mut winner = declared_in_table(ctx.table);
+    for secondary in ctx.secondaries {
+        if let Some(collation) = declared_in_table(secondary.table) {
+            if winner.is_some() {
+                return None;
+            }
+            winner = Some(collation);
+        }
+    }
+    if winner.is_some() {
+        return winner;
     }
 
     let mut winner = in_table(ctx.table, ctx.table_alias);
@@ -42682,6 +42759,16 @@ fn expr_affinity(expr: &Expr, ctx: Option<&ScanCtx<'_>>) -> u8 {
                         .resolves_to_hidden_rowid(&col_ref.column)
                         .then_some(b'D')
                 };
+                if col_ref.table.is_none() {
+                    if let Some(idx) = ctx.table.column_index(&col_ref.column) {
+                        return schema_column_expr_affinity(&ctx.table.columns[idx]);
+                    }
+                    for sec in ctx.secondaries {
+                        if let Some(idx) = sec.table.column_index(&col_ref.column) {
+                            return schema_column_expr_affinity(&sec.table.columns[idx]);
+                        }
+                    }
+                }
                 if let Some(aff) = check_table(ctx.table, ctx.table_alias) {
                     return aff;
                 }
