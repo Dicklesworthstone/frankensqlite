@@ -5700,6 +5700,38 @@ fn shared_db_file_key<F>(file: &SharedDbFile<F>) -> SharedDbFileKey {
     SharedDbFileKey(Arc::as_ptr(file).cast::<()>() as usize)
 }
 
+/// Race a reversible admission wait against the explicit operation's local
+/// cancellation. Dropping a pending native lock future retires its waiter;
+/// mandatory settlement and physical writes must not use this helper.
+#[cfg(feature = "native")]
+async fn await_pager_admission<F: Future>(cx: &Cx, wait: F) -> Result<F::Output> {
+    let mut cancellation = std::pin::pin!(cx.wait_for_local_cancellation());
+    let mut wait = std::pin::pin!(wait);
+    std::future::poll_fn(|task_cx| {
+        if cx.checkpoint().is_err() {
+            return std::task::Poll::Ready(Err(FrankenError::Abort));
+        }
+        if let std::task::Poll::Ready(output) = wait.as_mut().poll(task_cx) {
+            return std::task::Poll::Ready(
+                cx.checkpoint()
+                    .map(|()| output)
+                    .map_err(|_| FrankenError::Abort),
+            );
+        }
+        // Uncontended locks need no local waiter registration. Once the
+        // native future suspends, register the operation's local relay and
+        // recheck: cancellation between its poll and registration cannot be
+        // lost, and cancellation after the recheck wakes this task.
+        let _ = cancellation.as_mut().poll(task_cx);
+        if cx.checkpoint().is_err() {
+            std::task::Poll::Ready(Err(FrankenError::Abort))
+        } else {
+            std::task::Poll::Pending
+        }
+    })
+    .await
+}
+
 async fn async_rwlock_read<'a, T>(
     lock: &'a AsyncRwLock<T>,
     cx: &Cx,
@@ -5716,10 +5748,12 @@ async fn async_rwlock_read<'a, T>(
     if cx.mask_depth() == 0
         && let Some(native_cx) = cx.attached_native_cx()
     {
-        return lock.read(&native_cx).await.map_err(|error| match error {
-            asupersync::sync::RwLockError::Cancelled => FrankenError::Abort,
-            error => FrankenError::internal(format!("{label} read lock failed: {error}")),
-        });
+        return await_pager_admission(cx, lock.read(&native_cx))
+            .await?
+            .map_err(|error| match error {
+                asupersync::sync::RwLockError::Cancelled => FrankenError::Abort,
+                error => FrankenError::internal(format!("{label} read lock failed: {error}")),
+            });
     }
 
     loop {
@@ -5750,10 +5784,12 @@ async fn async_rwlock_write<'a, T>(
     if cx.mask_depth() == 0
         && let Some(native_cx) = cx.attached_native_cx()
     {
-        return lock.write(&native_cx).await.map_err(|error| match error {
-            asupersync::sync::RwLockError::Cancelled => FrankenError::Abort,
-            error => FrankenError::internal(format!("{label} write lock failed: {error}")),
-        });
+        return await_pager_admission(cx, lock.write(&native_cx))
+            .await?
+            .map_err(|error| match error {
+                asupersync::sync::RwLockError::Cancelled => FrankenError::Abort,
+                error => FrankenError::internal(format!("{label} write lock failed: {error}")),
+            });
     }
 
     loop {
@@ -7160,11 +7196,13 @@ fn maintenance_gate_for_backend<V: Vfs>(vfs: &V, db_path: &Path) -> Arc<PagerMai
 /// across the wait.
 #[cfg(all(feature = "native", any(unix, windows)))]
 async fn begin_namespace_admission(
+    cx: &Cx,
     stable_path: &Path,
     intent: NamespaceOpenIntent,
 ) -> Result<PendingNamespaceOpen> {
     let mut delays = PendingNamespaceOpen::LEGACY_PEER_RETRY_DELAYS.iter();
     loop {
+        cx.checkpoint().map_err(|_| FrankenError::Abort)?;
         if let Some(admission) = PendingNamespaceOpen::begin_attempt(stable_path, intent)? {
             return Ok(admission);
         }
@@ -7173,7 +7211,19 @@ async fn begin_namespace_admission(
                 path: stable_path.to_owned(),
             });
         };
-        asupersync::time::sleep(asupersync::time::wall_now(), delay).await;
+        // Local cancellation wakes the wait immediately. Native-only signals
+        // are also checked at least every 50 ms, including the longer legacy
+        // peer backoffs, without changing the total retry schedule.
+        let mut remaining = delay;
+        while !remaining.is_zero() {
+            let slice = remaining.min(Duration::from_millis(50));
+            await_pager_admission(
+                cx,
+                asupersync::time::sleep(asupersync::time::wall_now(), slice),
+            )
+            .await?;
+            remaining = remaining.saturating_sub(slice);
+        }
     }
 }
 
@@ -19060,7 +19110,7 @@ where
             } else {
                 NamespaceOpenIntent::Shared
             };
-            let pending = begin_namespace_admission(&db_path, intent).await?;
+            let pending = begin_namespace_admission(cx, &db_path, intent).await?;
             // A Shared admission without an expected identity owns both
             // namespace locks exclusively. Its bind may therefore repair a
             // plain copied/corrupt base record after validating the opened
@@ -19910,7 +19960,7 @@ where
                 Ok(pending) => (Some(pending), false),
                 Err(FrankenError::CannotOpen { .. }) => {
                     let pending =
-                        begin_namespace_admission(&db_path, NamespaceOpenIntent::Shared).await?;
+                        begin_namespace_admission(cx, &db_path, NamespaceOpenIntent::Shared).await?;
                     let replace_record = pending.has_quiescent_record_bytes()?;
                     (Some(pending), replace_record)
                 }
@@ -19958,7 +20008,7 @@ where
                     // instead and the exact-identity open remains fail-closed.
                     drop(pending_namespace.take());
                     let replacement_pending =
-                        begin_namespace_admission(&db_path, NamespaceOpenIntent::Shared).await?;
+                        begin_namespace_admission(cx, &db_path, NamespaceOpenIntent::Shared).await?;
                     let replacement_expected = replacement_pending.expected_identity();
                     replace_quiescent_namespace_record =
                         replacement_pending.has_quiescent_record_bytes()?;
@@ -30874,6 +30924,115 @@ mod tests {
 
     #[cfg(feature = "native")]
     #[test]
+    fn gh524_native_rwlock_wait_observes_local_operation_cancellation() {
+        use fsqlite_types::cx::CancelReason;
+
+        #[derive(Default)]
+        struct LockWake(AtomicUsize);
+        impl std::task::Wake for LockWake {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, AtomicOrdering::Release);
+            }
+        }
+
+        for write in [false, true] {
+            for cancelled_before_wait in [false, true] {
+                let lock = AsyncRwLock::new(0_u8);
+                let native = asupersync::Cx::for_testing();
+                let root = Cx::new();
+                root.set_shared_native_cx(native.clone());
+                let (operation, relay) = root.create_child_with_local_cancel_relay();
+                // Exercise a queued reader behind a writer, and a queued
+                // writer behind a reader, including writer-preference cleanup.
+                let read_blocker = write.then(|| lock.try_read().unwrap());
+                let write_blocker = (!write).then(|| lock.try_write().unwrap());
+                let wake = Arc::new(LockWake::default());
+                let waker = std::task::Waker::from(Arc::clone(&wake));
+                let mut task_cx = std::task::Context::from_waker(&waker);
+                if cancelled_before_wait {
+                    assert!(relay.cancel_local(CancelReason::UserInterrupt));
+                }
+                let mut acquire = Box::pin(async {
+                    if write {
+                        async_rwlock_write(&lock, &operation, "local cancellation")
+                            .await
+                            .map(drop)
+                    } else {
+                        async_rwlock_read(&lock, &operation, "local cancellation")
+                            .await
+                            .map(drop)
+                    }
+                });
+                if !cancelled_before_wait {
+                    assert!(acquire.as_mut().poll(&mut task_cx).is_pending());
+                    let before = wake.0.load(AtomicOrdering::Acquire);
+                    assert!(relay.cancel_local(CancelReason::UserInterrupt));
+                    assert!(
+                        wake.0.load(AtomicOrdering::Acquire) > before,
+                        "local cancellation must wake the queued native lock waiter: write={write}"
+                    );
+                }
+                assert!(matches!(
+                    acquire.as_mut().poll(&mut task_cx),
+                    std::task::Poll::Ready(Err(FrankenError::Abort))
+                ));
+                drop(acquire);
+                drop(read_blocker);
+                drop(write_blocker);
+                native.checkpoint().expect("the shared native task stays live");
+                root.checkpoint().expect("cancellation stays operation-local");
+                assert!(lock.try_write().is_ok(), "the cancelled waiter must retire");
+
+                let fresh = root.create_child();
+                let mut retry = Box::pin(async {
+                    if write {
+                        async_rwlock_write(&lock, &fresh, "after local cancellation")
+                            .await
+                            .map(drop)
+                    } else {
+                        async_rwlock_read(&lock, &fresh, "after local cancellation")
+                            .await
+                            .map(drop)
+                    }
+                });
+                assert!(matches!(
+                    retry.as_mut().poll(&mut task_cx),
+                    std::task::Poll::Ready(Ok(()))
+                ));
+            }
+        }
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn gh524_pager_admission_drops_guard_when_completion_races_cancellation() {
+        use fsqlite_types::cx::CancelReason;
+
+        let lock = AsyncRwLock::new(0_u8);
+        let root = Cx::new();
+        let (operation, relay) = root.create_child_with_local_cancel_relay();
+        let lock_ref = &lock;
+        let wait = std::future::poll_fn(move |_| {
+            let guard = lock_ref.try_write().unwrap();
+            assert!(relay.cancel_local(CancelReason::UserInterrupt));
+            std::task::Poll::Ready(guard)
+        });
+        let mut admission = Box::pin(await_pager_admission(&operation, wait));
+        let mut task_cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(
+            admission.as_mut().poll(&mut task_cx),
+            std::task::Poll::Ready(Err(FrankenError::Abort))
+        ));
+        assert!(
+            lock.try_write().is_ok(),
+            "cancelled successful admission must drop its acquired guard"
+        );
+        assert!(operation.checkpoint().is_err());
+        root.checkpoint().expect("cancellation stays operation-local");
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
     fn native_rwlock_cancellation_preserves_abort_and_masking() {
         asupersync::test_utils::run_test(|| async {
             let lock = AsyncRwLock::new(0_u8);
@@ -32475,6 +32634,70 @@ mod tests {
         assert!(
             local_registry.entries.len() <= 2,
             "amortized sweeps must bound expired identity keys"
+        );
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn gh524_namespace_admission_observes_operation_cancellation() {
+        #[derive(Default)]
+        struct AdmissionWake(AtomicUsize);
+        impl std::task::Wake for AdmissionWake {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, AtomicOrdering::Release);
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cancelled-namespace-admission.db");
+        // A legacy peer owns the namespace without registering the main file
+        // or WAL shared memory. Keep the fixture outside UnixVfs so the peer
+        // probe does not mistake this for an already-registered local inode.
+        let mut database = vec![0_u8; DATABASE_HEADER_SIZE];
+        database[18] = 2;
+        database[19] = 2;
+        std::fs::write(&path, &database).unwrap();
+        let identity = FileIdentity::from_file(&std::fs::File::open(&path).unwrap())
+            .unwrap()
+            .expect("Unix descriptor identity");
+        let peer = PendingNamespaceOpen::begin(&path, NamespaceOpenIntent::Shared)
+            .unwrap()
+            .bind(identity)
+            .unwrap();
+        peer.finish_bootstrap().unwrap();
+        assert!(
+            PendingNamespaceOpen::begin_attempt(&path, NamespaceOpenIntent::Shared)
+                .unwrap()
+                .is_none(),
+            "the fixture must force legacy-peer admission backoff"
+        );
+
+        let cx = Cx::new();
+        let wake = Arc::new(AdmissionWake::default());
+        let waker = std::task::Waker::from(Arc::clone(&wake));
+        let mut task_cx = std::task::Context::from_waker(&waker);
+        let mut open = Box::pin(SimplePager::open_with_cx(
+            &cx,
+            UnixVfs::new(),
+            &path,
+            PageSize::DEFAULT,
+        ));
+        assert!(open.as_mut().poll(&mut task_cx).is_pending());
+        let prior_wakes = wake.0.load(AtomicOrdering::Acquire);
+        cx.cancel();
+        assert!(
+            wake.0.load(AtomicOrdering::Acquire) > prior_wakes,
+            "operation cancellation must wake a pending namespace admission"
+        );
+        assert!(matches!(
+            open.as_mut().poll(&mut task_cx),
+            std::task::Poll::Ready(Err(FrankenError::Abort))
+        ));
+        drop(open);
+        assert_eq!(std::fs::read(&path).unwrap(), database);
+        assert!(
+            PendingNamespaceOpen::begin(&path, NamespaceOpenIntent::ReadOnlyExisting).is_ok(),
+            "cancelled admission must release its namespace gate"
         );
     }
 
