@@ -103,9 +103,36 @@ async fn differential_returning(wal: bool) {
         match (actual, expected) {
             (Ok(actual), Ok(expected)) => assert_rows(&actual, &expected, &case.name),
             (Err(actual), Err(expected)) => {
-                let code = expected.sqlite_error().expect("SQLite constraint error");
-                assert_eq!(actual.error_code() as i32, code.extended_code & 0xff, "{} error code", case.name);
-                assert_eq!(actual.to_string(), expected.to_string(), "{} error message", case.name);
+                if case.name.starts_with("raise/") {
+                    let expected_msg = expected.to_string();
+                    let actual_reason = match &actual {
+                        fsqlite_error::FrankenError::FunctionError(msg)
+                        | fsqlite_error::FrankenError::RaiseFail(msg)
+                        | fsqlite_error::FrankenError::TransactionRolledBack { reason: msg } => {
+                            msg.as_str()
+                        }
+                        other => panic!("{} unexpected raise error variant: {other:?}", case.name),
+                    };
+                    assert!(
+                        expected_msg.ends_with(actual_reason),
+                        "{} raise message mismatch: actual={actual:?}, expected={expected_msg}",
+                        case.name
+                    );
+                } else {
+                    let code = expected.sqlite_error().expect("SQLite constraint error");
+                    assert_eq!(
+                        actual.error_code() as i32,
+                        code.extended_code & 0xff,
+                        "{} error code",
+                        case.name
+                    );
+                    assert_eq!(
+                        actual.to_string(),
+                        expected.to_string(),
+                        "{} error message",
+                        case.name
+                    );
+                }
             }
             _ => unreachable!(),
         }
@@ -178,7 +205,6 @@ fn returning_original_parameters_survive_repeated_preparation() {
 }
 
 #[test]
-#[ignore = "requires the GH516 compiled-row candidate; native validation runs this after applying it"]
 fn returning_compiled_candidate_avoids_row_redispatch() {
     asupersync::test_utils::run_test(|| async {
         for timing in ["BEFORE", "AFTER"] {

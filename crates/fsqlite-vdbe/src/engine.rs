@@ -514,12 +514,24 @@ impl BtreeCursorPageLayout {
     }
 }
 
+fn is_synthetic_absent_page_one_error(error: &FrankenError) -> bool {
+    matches!(
+        error,
+        FrankenError::DatabaseCorrupt { detail }
+            if detail == "native page 1 is absent"
+                || detail.starts_with("page 1 is absent at native historical commit ")
+    )
+}
+
 /// Page-1 read failures that describe the real database, as opposed to a
 /// synthetic page store that simply has no page 1. Answering any of these
 /// with the no-reserved-bytes UTF-8 default would let a write cursor place
 /// cells in the reserved trailer, or encode TEXT as UTF-8 in a UTF-16
 /// database, so they must fail the cursor open instead.
 fn page_one_read_error_must_propagate(error: &FrankenError) -> bool {
+    if is_synthetic_absent_page_one_error(error) {
+        return false;
+    }
     error.is_transient()
         || matches!(
             error,
