@@ -46741,7 +46741,7 @@ impl Connection {
                 if let Some(row_data) = self.try_scan_join_source_from_memdb(source) {
                     return Ok(Some(row_data));
                 }
-                if let Some(result) = self.try_scan_join_source_from_pager(source).await {
+                if let Some(result) = self.try_scan_join_source_from_pager(source, None).await {
                     return Ok(Some(result?));
                 }
                 let scan_sql = build_join_scan_sql(source);
@@ -55285,7 +55285,8 @@ impl Connection {
                     if let Some(row_data) = self.try_scan_join_source_from_memdb(source) {
                         return Ok(Some(row_data));
                     }
-                    if let Some(result) = self.try_scan_join_source_from_pager(source).await {
+                    if let Some(result) = self.try_scan_join_source_from_pager(source, None).await
+                    {
                         return Ok(Some(result?));
                     }
                     let scan_sql = build_join_scan_sql(source);
@@ -85736,16 +85737,7 @@ impl Connection {
             *distinct = Distinctness::All;
             *group_by = Vec::new();
             *having = None;
-            *columns = col_map
-                .iter()
-                .map(|(table, column, _)| ResultColumn::Expr {
-                    expr: Expr::Column(
-                        ColumnRef::qualified(table.clone(), column.clone()),
-                        Span::new(0, 0),
-                    ),
-                    alias: None,
-                })
-                .collect();
+            *columns = join_raw_projection(select, &col_map);
         }
         join_select.limit = None;
         join_select.order_by = Vec::new();
@@ -93069,9 +93061,26 @@ impl Connection {
         Some(rows)
     }
 
+    /// Whether a join source is a local table without generated columns, so a
+    /// [`join_source_keep_masks`] mask may drop its columns. A generated
+    /// column is computed from stored ones; anything else is left whole.
+    fn join_source_columns_are_stored(&self, src: &JoinTableSource) -> bool {
+        src.local_table_binding()
+            .and_then(|binding| self.local_join_binding_table(binding))
+            .is_some_and(|(table, _)| {
+                table
+                    .columns
+                    .iter()
+                    .all(|column| column.generated_expr.is_none())
+            })
+    }
+
+    /// `keep` is a [`join_source_keep_masks`] mask, applied as each row is
+    /// read so a dropped wide column never accumulates.
     async fn try_scan_join_source_from_pager(
         &self,
         src: &JoinTableSource,
+        keep: Option<&[bool]>,
     ) -> Option<Result<Vec<Vec<SqliteValue>>>> {
         if !self.pager.is_file_backed() || self.local_transaction_scope_is_active() {
             return None;
@@ -93079,6 +93088,13 @@ impl Connection {
         let binding_name = src.local_table_binding()?;
         let (table_schema, rowid_alias_column_index) =
             self.local_join_binding_table(binding_name)?;
+        // A generated column is computed from the stored ones; keep them all.
+        let keep = keep.filter(|_| {
+            table_schema
+                .columns
+                .iter()
+                .all(|column| column.generated_expr.is_none())
+        });
         let root_page_num = table_schema.root_page;
         if self.is_memdb_only_root_page(root_page_num) {
             return None;
@@ -93111,6 +93127,9 @@ impl Connection {
                         &payload_values,
                         rowid_alias_column_index,
                     )?;
+                    if let Some(keep) = keep {
+                        prune_join_source_row(&mut values, keep);
+                    }
                     if src.hidden_rowid_projection.is_some() {
                         values.push(SqliteValue::Integer(rowid));
                     }
@@ -93247,7 +93266,8 @@ impl Connection {
         let mut inner_rows: Vec<Vec<SqliteValue>> =
             if let Some(rows) = self.try_scan_join_source_from_memdb(inner_src) {
                 rows
-            } else if let Some(result) = self.try_scan_join_source_from_pager(inner_src).await {
+            } else if let Some(result) = self.try_scan_join_source_from_pager(inner_src, None).await
+            {
                 result?
             } else {
                 // Same last-resort scan the generic step-3 loop uses for a
@@ -94813,16 +94833,20 @@ impl Connection {
         // rows from all joined tables; otherwise use single-table path.
         let mut raw_select = build_raw_scan_select(select);
         if let SelectCore::Select { columns, .. } = &mut raw_select.body.select {
-            *columns = col_map
-                .iter()
-                .map(|(table, column, _)| ResultColumn::Expr {
-                    expr: Expr::Column(
-                        ColumnRef::qualified(table.clone(), column.clone()),
-                        Span::new(0, 0),
-                    ),
-                    alias: None,
-                })
-                .collect();
+            *columns = if has_join {
+                join_raw_projection(select, &col_map)
+            } else {
+                col_map
+                    .iter()
+                    .map(|(table, column, _)| ResultColumn::Expr {
+                        expr: Expr::Column(
+                            ColumnRef::qualified(table.clone(), column.clone()),
+                            Span::new(0, 0),
+                        ),
+                        alias: None,
+                    })
+                    .collect()
+            };
         }
         let raw_rows = if has_join {
             self.execute_join_select(&raw_select, params).await?
@@ -99050,6 +99074,16 @@ impl Connection {
         // `main.t` and `aux.t` alias each other.
         let mut scanned_cache: HashMap<String, Vec<Vec<SqliteValue>>> = HashMap::new();
         let mut table_rows: Vec<Vec<Vec<SqliteValue>>> = Vec::with_capacity(table_sources.len());
+        // GH#527: keep only the columns the statement can name.
+        let rowid_aliases: Vec<Option<usize>> = table_sources
+            .iter()
+            .map(|src| {
+                src.local_table_binding()
+                    .and_then(|binding| self.local_join_binding_table(binding))
+                    .and_then(|(_, rowid_alias)| rowid_alias)
+            })
+            .collect();
+        let keep_masks = join_source_keep_masks(select, &table_sources, &rowid_aliases);
         for (i, src) in table_sources.iter().enumerate() {
             if keyset_stream_active {
                 // GH#386: the streaming keyset lane already produced the
@@ -99057,8 +99091,13 @@ impl Connection {
                 table_rows.push(Vec::new());
                 continue;
             }
-            if let Some(rows) = preloaded[i].take() {
+            if let Some(mut rows) = preloaded[i].take() {
                 // Subquery: use preloaded rows.
+                if let Some(keep) = keep_masks[i].as_deref() {
+                    for row in &mut rows {
+                        prune_join_source_row(row, keep);
+                    }
+                }
                 table_rows.push(maybe_filter_primary_join_rows(
                     rows,
                     i,
@@ -99091,7 +99130,10 @@ impl Connection {
                 let mut row_data = if let Some(row_data) = self.try_scan_join_source_from_memdb(src)
                 {
                     row_data
-                } else if let Some(result) = self.try_scan_join_source_from_pager(src).await {
+                } else if let Some(result) = self
+                    .try_scan_join_source_from_pager(src, keep_masks[i].as_deref())
+                    .await
+                {
                     result?
                 } else {
                     let scan_sql = build_join_scan_sql(src);
@@ -99115,6 +99157,15 @@ impl Connection {
                 for row in &mut row_data {
                     if row.len() != scan_width {
                         row.resize(scan_width, SqliteValue::Null);
+                    }
+                }
+                // The pager scan already applied the mask row by row; the
+                // memdb and SQL scans apply it here.
+                if let Some(keep) = keep_masks[i].as_deref()
+                    && self.join_source_columns_are_stored(src)
+                {
+                    for row in &mut row_data {
+                        prune_join_source_row(row, keep);
                     }
                 }
                 #[cfg(test)]
@@ -155452,6 +155503,132 @@ fn join_hidden_rowid_projection(columns: &[String], supports_hidden_rowid: bool)
 fn join_scan_cache_key(name: &QualifiedName) -> String {
     let schema = normalized_attached_schema_name(name.schema.as_deref()).unwrap_or("main");
     format!("table:{schema}:{}", name.name.to_ascii_lowercase())
+}
+
+/// The lowercased SQL a join statement's column references can be matched
+/// against (GH#527), or `None` when any column may be read implicitly: a
+/// `*` / `tbl.*` result column or a NATURAL join. Matching on the SQL text is
+/// deliberately coarse: a name that appears anywhere (an alias, a string
+/// literal, another table's column, a subquery) counts as named.
+fn join_statement_column_text(select: &SelectStatement) -> Option<String> {
+    let SelectCore::Select {
+        columns,
+        from: Some(from),
+        ..
+    } = &select.body.select
+    else {
+        return None;
+    };
+    if columns
+        .iter()
+        .any(|column| matches!(column, ResultColumn::Star | ResultColumn::TableStar(_)))
+        || from.joins.iter().any(|join| join.join_type.natural)
+    {
+        return None;
+    }
+    Some(select.to_string().to_ascii_lowercase())
+}
+
+/// Whether `sql` (from [`join_statement_column_text`]) can name `column`.
+/// A name that is not a plain identifier always counts as named.
+fn join_column_is_named(sql: &str, column: &str) -> bool {
+    let column = column.to_ascii_lowercase();
+    !is_plain_sql_identifier(&column) || sql_mentions_word(sql, &column)
+}
+
+/// Per-source column keep-masks for the generic join fallback (GH#527).
+///
+/// The fallback holds every row of every source, and a joined row clones its
+/// sources' values, so one unreferenced wide column (a message body) costs
+/// its full size per row, several times over: `COUNT(*)` over a three-table
+/// join of a 2.1 GB archive held 6 GB. A column is dropped, and read as NULL
+/// by the join, only when the statement cannot name it
+/// ([`join_column_is_named`]). A table's rowid alias (`rowid_aliases`, its
+/// INTEGER PRIMARY KEY column index) is always kept, so a `rowid` reference
+/// stays answerable. Masks depend only on a source's column names, so two
+/// references to one table get the same mask and may share scanned rows.
+/// `None` keeps every column.
+fn join_source_keep_masks(
+    select: &SelectStatement,
+    table_sources: &[JoinTableSource],
+    rowid_aliases: &[Option<usize>],
+) -> Vec<Option<Vec<bool>>> {
+    let Some(sql) = join_statement_column_text(select) else {
+        return vec![None; table_sources.len()];
+    };
+    table_sources
+        .iter()
+        .zip(rowid_aliases)
+        .map(|(source, rowid_alias)| {
+            let mask: Vec<bool> = source
+                .col_names
+                .iter()
+                .enumerate()
+                .map(|(index, name)| {
+                    *rowid_alias == Some(index) || join_column_is_named(&sql, name)
+                })
+                .collect();
+            mask.contains(&false).then_some(mask)
+        })
+        .collect()
+}
+
+/// GH#527: the raw projection an aggregate or window join reads, one entry
+/// per `col_map` column of the original statement. A visible column the
+/// statement never names is projected as NULL, so neither the compiled join
+/// nor the generic fallback decodes or holds it; hidden rowids, which order
+/// grouped rows, are always read.
+fn join_raw_projection(
+    original: &SelectStatement,
+    col_map: &[(String, String, bool)],
+) -> Vec<ResultColumn> {
+    let sql = join_statement_column_text(original);
+    col_map
+        .iter()
+        .map(|(table, column, hidden)| {
+            let named =
+                *hidden || sql.as_deref().is_none_or(|sql| join_column_is_named(sql, column));
+            ResultColumn::Expr {
+                expr: if named {
+                    Expr::Column(
+                        ColumnRef::qualified(table.clone(), column.clone()),
+                        Span::new(0, 0),
+                    )
+                } else {
+                    Expr::Literal(Literal::Null, Span::ZERO)
+                },
+                alias: None,
+            }
+        })
+        .collect()
+}
+
+/// Whether `word` occurs in `sql` delimited by non-identifier characters.
+fn sql_mentions_word(sql: &str, word: &str) -> bool {
+    let bytes = sql.as_bytes();
+    let is_identifier_byte = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    sql.match_indices(word).any(|(at, _)| {
+        let before = at.checked_sub(1).map(|index| bytes[index]);
+        let after = bytes.get(at + word.len()).copied();
+        !before.is_some_and(is_identifier_byte) && !after.is_some_and(is_identifier_byte)
+    })
+}
+
+fn is_plain_sql_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Applies a [`join_source_keep_masks`] mask: dropped columns become NULL.
+fn prune_join_source_row(row: &mut [SqliteValue], keep: &[bool]) {
+    for (value, keep) in row.iter_mut().zip(keep) {
+        if !keep {
+            *value = SqliteValue::Null;
+        }
+    }
 }
 
 fn build_join_scan_sql(source: &JoinTableSource) -> String {
@@ -305868,11 +306045,11 @@ mod join_keyset_stream_tests {
     fn runtime_refusals() -> u64 {
         FSQLITE_JOIN_KEYSET_STREAM_RUNTIME_REFUSALS.load(AtomicOrdering::Relaxed)
     }
-    fn values_of(rows: &[Row]) -> Vec<Vec<SqliteValue>> {
+    pub(super) fn values_of(rows: &[Row]) -> Vec<Vec<SqliteValue>> {
         rows.iter().map(|row| row.values().to_vec()).collect()
     }
 
-    fn stock_rows(
+    pub(super) fn stock_rows(
         stock: &rusqlite::Connection,
         sql: &str,
         params: impl rusqlite::Params,
@@ -306661,6 +306838,141 @@ mod join_keyset_stream_tests {
                     rusqlite::params![Option::<i64>::None, 9]
                 )
             );
+        });
+    }
+}
+
+/// GH#527 keepers: the generic join fallback keeps only the columns a
+/// statement can name. See `join_source_keep_masks`.
+#[cfg(test)]
+mod join_projection_prune_tests {
+    use super::join_keyset_stream_tests::{stock_rows, values_of};
+    use super::{Connection, fsqlite_core_test_serializer};
+
+    const BIG_ROWS: i64 = 600;
+    const BODY_BYTES: usize = 2_000;
+
+    const SCHEMA: &str = "CREATE TABLE tiny (id INTEGER PRIMARY KEY, name TEXT);
+         CREATE TABLE small (id INTEGER PRIMARY KEY, tid INTEGER);
+         CREATE TABLE big (id INTEGER PRIMARY KEY, sid INTEGER NOT NULL, body TEXT);";
+
+    /// Rows for tiny (8), small (50) and big (`BIG_ROWS`, ~`BODY_BYTES` bodies).
+    fn inserts() -> Vec<String> {
+        let tiny = (1..=8)
+            .map(|id| format!("({id}, 'agent{id}')"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let small = (1..=50)
+            .map(|id| format!("({id}, {})", 1 + id % 8))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let big = (1..=BIG_ROWS)
+            .map(|id| {
+                let body = format!("body {id} ").repeat(BODY_BYTES / 8);
+                format!("({id}, {}, '{body}')", 1 + id % 50)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        vec![
+            format!("INSERT INTO tiny (id, name) VALUES {tiny};"),
+            format!("INSERT INTO small (id, tid) VALUES {small};"),
+            format!("INSERT INTO big (id, sid, body) VALUES {big};"),
+        ]
+    }
+
+    /// Statements the generic fallback runs (three sources or a subquery
+    /// source), and whether `big.body` must survive: it is named, or `*`
+    /// expands it. `rowid` alone does not keep it (the rowid alias is kept).
+    const CASES: [(&str, bool); 8] = [
+        (
+            "SELECT COUNT(*) FROM big b JOIN small s ON s.id = b.sid JOIN tiny t ON t.id = s.tid",
+            false,
+        ),
+        (
+            "SELECT COUNT(*) FROM big b JOIN small s ON s.id = b.sid \
+             LEFT JOIN tiny t ON t.id = s.tid WHERE t.name = 'agent3'",
+            false,
+        ),
+        (
+            "SELECT t.name, COUNT(*), SUM(CASE WHEN b.id % 2 = 0 THEN 1 ELSE 0 END) \
+             FROM big b JOIN small s ON s.id = b.sid JOIN tiny t ON t.id = s.tid \
+             GROUP BY t.name ORDER BY t.name",
+            false,
+        ),
+        (
+            "SELECT COUNT(*) FROM big b \
+             LEFT JOIN (SELECT id, MAX(name) AS name FROM tiny GROUP BY id) g ON g.id = b.sid % 8 + 1 \
+             JOIN small s ON s.id = b.sid",
+            false,
+        ),
+        (
+            "SELECT t.name, SUM(length(b.body)) FROM big b JOIN small s ON s.id = b.sid \
+             JOIN tiny t ON t.id = s.tid GROUP BY t.name ORDER BY t.name",
+            true,
+        ),
+        (
+            "SELECT b.id, substr(b.body, 1, 12), t.name FROM big b JOIN small s ON s.id = b.sid \
+             JOIN tiny t ON t.id = s.tid WHERE b.id <= 3 ORDER BY b.id",
+            true,
+        ),
+        (
+            "SELECT * FROM big b JOIN small s ON s.id = b.sid JOIN tiny t ON t.id = s.tid \
+             WHERE b.id = 7",
+            true,
+        ),
+        (
+            "SELECT MAX(b.rowid) FROM big b JOIN small s ON s.id = b.sid JOIN tiny t ON t.id = s.tid",
+            false,
+        ),
+    ];
+
+    /// Positive observable: a statement that never names `big.body` holds
+    /// none of it (payload far below one body per row), including aggregates
+    /// and `rowid` reads. Planted negatives: naming it and `*` each keep it
+    /// (payload above one body per row), and every result equals stock
+    /// SQLite's, so pruning never changes an answer. Before GH#527 every case
+    /// held every body.
+    #[test]
+    fn generic_join_fallback_holds_only_named_columns_and_matches_stock() {
+        let _serialize = fsqlite_core_test_serializer();
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("gh527_prune.db");
+            let conn = Connection::open(path.to_str().unwrap()).await.unwrap();
+            conn.execute_batch(SCHEMA).await.unwrap();
+            for insert in inserts() {
+                conn.execute(&insert).await.unwrap();
+            }
+            conn.close().await.unwrap();
+            let conn = Connection::open(path.to_str().unwrap()).await.unwrap();
+            let stock = rusqlite::Connection::open_in_memory().unwrap();
+            stock.execute_batch(SCHEMA).unwrap();
+            for insert in inserts() {
+                stock.execute_batch(&insert).unwrap();
+            }
+
+            let all_bodies = usize::try_from(BIG_ROWS).unwrap() * BODY_BYTES;
+            for (sql, body_survives) in CASES {
+                conn.join_materialization_profile.replace(Default::default());
+                let rows = conn.query(&format!("{sql};")).await.unwrap();
+                let profile = *conn.join_materialization_profile.borrow();
+                assert_eq!(values_of(&rows), stock_rows(&stock, sql, []), "{sql}");
+                assert!(
+                    profile.generic_source_rows >= usize::try_from(BIG_ROWS).unwrap(),
+                    "{sql} must take the generic fallback: {profile:?}"
+                );
+                if body_survives {
+                    assert!(
+                        profile.generic_source_payload_bytes > all_bodies,
+                        "{sql} names big.body, which must be kept: {profile:?}"
+                    );
+                } else {
+                    assert!(
+                        profile.generic_source_payload_bytes < all_bodies / 20,
+                        "{sql} never names big.body, which must not be held: {profile:?}"
+                    );
+                }
+            }
         });
     }
 }
