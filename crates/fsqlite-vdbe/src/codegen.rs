@@ -4192,8 +4192,10 @@ pub fn codegen_select(
     }
 
     // hfdt-gbou9l: trigger EXISTS probes project a constant and stop after one
-    // match. Prefer the longest safe literal prefix instead of repeatedly
-    // scanning every row sharing the first key. Retain the complete predicate.
+    // match. Prefer the longest safe equality prefix instead of repeatedly
+    // scanning every row sharing the first key. GH#526: WHEN guards bind
+    // OLD/NEW as parameters, so they need the same prefix selection as the
+    // literal-bound trigger-body form. Retain the complete predicate.
     if ctx.index_ordered_scan_reliable
         && ctx.collation_semantics == CollationSemantics::Builtin
         && !table.without_rowid
@@ -4218,7 +4220,7 @@ pub fn codegen_select(
         && where_clause.as_deref().is_some_and(|expr| {
             where_is_plain_scan_safe(expr) && !expr_contains_non_numbered_placeholder(expr)
         })
-        && let Some((index, targets)) = literal_exists_index_prefix(
+        && let Some((index, targets)) = exists_index_prefix(
             table,
             table_alias,
             schema,
@@ -33633,11 +33635,15 @@ fn normalize_table_local_expression(
     }
 }
 
-/// Non-NULL literal `IS` has equality semantics; Boolean `IS` does not. Only
-/// native-class literals are admitted because this emitter performs no affinity
-/// conversion on its seek key. Stop at an unsafe/DESC term, preserving a useful
-/// earlier prefix (e.g. an ASC taxonomy/tag prefix before a DESC period).
-fn literal_exists_index_prefix<'a, 's>(
+/// Find the longest exact equality prefix for a single-row existence probe.
+/// Non-NULL literal `IS` has equality semantics; Boolean `IS` does not.
+/// Numbered parameters qualify for `=`: the ordered-scan emitter applies the
+/// comparison affinity to each key at execution time and rejects NULL keys.
+/// Parameterized `IS` cannot extend this prefix because `NULL IS NULL` is
+/// true, while that emitter's NULL-key exit implements `=` semantics.
+/// Stop at an unsafe/DESC term, preserving a useful earlier prefix (e.g. an
+/// ASC taxonomy/tag prefix before a DESC period).
+fn exists_index_prefix<'a, 's>(
     table: &'s TableSchema,
     table_alias: Option<&str>,
     schema: &[TableSchema],
@@ -33645,45 +33651,69 @@ fn literal_exists_index_prefix<'a, 's>(
 ) -> Option<(&'s IndexSchema, Vec<&'a Expr>)> {
     let mut terms = Vec::new();
     collect_conjunctive_terms(where_clause?, &mut terms);
-    table.indexes.iter().filter_map(|index| {
-        if !index.supports_direct_column_lookup() {
-            return None;
-        }
-        let mut targets = Vec::new();
-        for (pos, column) in index.columns.iter().enumerate() {
-            if index.key_term_descending(pos)
-                || index.key_term_collation(pos)
-                    .is_some_and(|name| !name.eq_ignore_ascii_case("BINARY"))
-            {
-                break;
+    table
+        .indexes
+        .iter()
+        .filter_map(|index| {
+            if !index.supports_direct_column_lookup() {
+                return None;
             }
-            let target = terms.iter().find_map(|term| {
-                let Expr::BinaryOp {
-                    left,
-                    op: BinaryOp::Eq | BinaryOp::Is,
-                    right,
-                    ..
-                } = term else {
-                    return None;
-                };
-                let target = if expr_matches_index_column(left, table, table_alias, column) {
-                    right.as_ref()
-                } else if expr_matches_index_column(right, table, table_alias, column) {
-                    left.as_ref()
-                } else {
-                    return None;
-                };
-                (matches!(target, Expr::Literal(
-                    Literal::Integer(_) | Literal::Float(_)
-                        | Literal::String(_) | Literal::Blob(_), _))
-                    && index_range_bound_is_seek_safe(table, table_alias, schema, column, target))
+            let mut targets = Vec::new();
+            for (pos, column) in index.columns.iter().enumerate() {
+                if index.key_term_descending(pos)
+                    || index
+                        .key_term_collation(pos)
+                        .is_some_and(|name| !name.eq_ignore_ascii_case("BINARY"))
+                {
+                    break;
+                }
+                let target = terms.iter().find_map(|term| {
+                    let Expr::BinaryOp {
+                        left,
+                        op: op @ (BinaryOp::Eq | BinaryOp::Is),
+                        right,
+                        ..
+                    } = term
+                    else {
+                        return None;
+                    };
+                    let target = if expr_matches_index_column(left, table, table_alias, column) {
+                        right.as_ref()
+                    } else if expr_matches_index_column(right, table, table_alias, column) {
+                        left.as_ref()
+                    } else {
+                        return None;
+                    };
+                    let supported_target = matches!(
+                        target,
+                        Expr::Literal(
+                            Literal::Integer(_)
+                                | Literal::Float(_)
+                                | Literal::String(_)
+                                | Literal::Blob(_),
+                            _
+                        )
+                    ) || (*op == BinaryOp::Eq
+                        && matches!(
+                            target,
+                            Expr::Placeholder(fsqlite_ast::PlaceholderType::Numbered(_), _)
+                        ));
+                    (supported_target
+                        && index_range_bound_is_seek_safe(
+                            table,
+                            table_alias,
+                            schema,
+                            column,
+                            target,
+                        ))
                     .then_some(target)
-            });
-            let Some(target) = target else { break };
-            targets.push(target);
-        }
-        (targets.len() >= 2).then_some((index, targets))
-    }).max_by_key(|(_, targets)| targets.len())
+                });
+                let Some(target) = target else { break };
+                targets.push(target);
+            }
+            (targets.len() >= 2).then_some((index, targets))
+        })
+        .max_by_key(|(_, targets)| targets.len())
 }
 
 /// Only plain literal comparisons joined by AND qualify. In particular, an
@@ -49267,6 +49297,167 @@ mod tests {
             foreign_keys: Vec::new(),
             check_constraints: Vec::new(),
         }]
+    }
+
+    fn gh526_exists_schema() -> Vec<TableSchema> {
+        let mut schema = test_schema_with_composite_prefix_index();
+        schema[0].columns[1].affinity = 'B';
+        let composite = &mut schema[0].indexes[0];
+        composite.name = "idx_messages_probe".to_owned();
+        composite.is_unique = false;
+        composite.columns.push("content".to_owned());
+        composite.key_expressions.push("content".to_owned());
+        composite.key_sort_directions =
+            vec![SortDirection::Asc, SortDirection::Asc, SortDirection::Desc];
+        let mut weak = composite.clone();
+        weak.name = "idx_messages_conversation".to_owned();
+        weak.root_page = 4;
+        weak.columns.truncate(1);
+        weak.key_expressions.truncate(1);
+        weak.key_sort_directions.clear();
+        // The first index admits many more candidates than the composite key.
+        schema[0].indexes.insert(0, weak);
+        schema
+    }
+
+    fn gh526_weak_exists_directive() -> SelectPlannerDirective {
+        SelectPlannerDirective {
+            plan_id: "gh526-weak-equality".to_owned(),
+            plan_generation: 1,
+            planner_surface: "single_table_access_path_v1".to_owned(),
+            table_name: "messages".to_owned(),
+            index_name: Some("idx_messages_conversation".to_owned()),
+            index_key_label: Some("conversation_id".to_owned()),
+            index_key_is_expression: false,
+            index_equality_target: None,
+            index_range_target: None,
+            covering: false,
+            access_kind: PlannerSelectAccessKind::IndexEquality,
+        }
+    }
+
+    #[test]
+    fn gh526_parameterized_exists_uses_composite_prefix_before_weak_directive() {
+        let schema = gh526_exists_schema();
+        for equality in ["v.conversation_id = ?4", "?4 = v.conversation_id"] {
+            let stmt = select_sql(&format!(
+                "SELECT 1 FROM messages AS v WHERE v.id IS NOT ?9 \
+                 AND {equality} AND v.idx = ?2 AND v.content = ?11 LIMIT 1"
+            ));
+            for directive in [None, Some(gh526_weak_exists_directive())] {
+                let ctx = CodegenContext {
+                    index_ordered_scan_reliable: true,
+                    planner_select_directive: directive,
+                    ..CodegenContext::default()
+                };
+                let mut builder = ProgramBuilder::new();
+                codegen_select(&mut builder, &stmt, &schema, &ctx).expect("EXISTS probe codegen");
+                let program = builder.finish().expect("EXISTS probe program");
+                let ops = program.ops();
+                let opened_indexes: Vec<_> = ops
+                    .iter()
+                    .filter_map(|op| match (&op.opcode, &op.p4) {
+                        (Opcode::OpenRead, P4::Index(name)) => Some(name.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(opened_indexes, ["idx_messages_probe"]);
+                let seek_pos = ops
+                    .iter()
+                    .position(|op| op.opcode == Opcode::SeekGE)
+                    .expect("probe must seek its composite index");
+                let seek = &ops[seek_pos];
+                let record = ops[..seek_pos]
+                    .iter()
+                    .find(|op| op.opcode == Opcode::MakeRecord && op.p3 == seek.p3)
+                    .expect("seek must consume its own probe record");
+                assert_eq!(
+                    record.p2, 2,
+                    "bind both ASC keys, stopping before the DESC term"
+                );
+                for (offset, parameter, affinity) in [(0, 4, "B"), (1, 2, "C")] {
+                    let key = record.p1 + offset;
+                    assert!(
+                        ops[..seek_pos].iter().any(|op| {
+                            op.opcode == Opcode::Variable && op.p1 == parameter && op.p2 == key
+                        }),
+                        "sparse parameter numbers must survive prefix extraction"
+                    );
+                    assert!(
+                        ops[..seek_pos].iter().any(|op| {
+                            op.opcode == Opcode::Affinity
+                                && op.p1 == key
+                                && op.p4 == P4::Affinity(affinity.to_owned())
+                        }),
+                        "the bound key must take its comparison affinity"
+                    );
+                }
+                let boundary_pos = ops
+                    .iter()
+                    .position(|op| op.opcode == Opcode::IdxGT)
+                    .expect("each candidate must remain inside the composite prefix");
+                let boundary = &ops[boundary_pos];
+                assert_eq!(
+                    (boundary.p1, boundary.p3, boundary.p5),
+                    (seek.p1, record.p3, 2)
+                );
+                assert!(
+                    ops.iter().any(|op| {
+                        op.opcode == Opcode::Next
+                            && op.p1 == seek.p1
+                            && usize::try_from(op.p2).ok() == Some(boundary_pos)
+                    }),
+                    "every index step must recheck both prefix fields"
+                );
+                assert!(
+                    !ops.iter()
+                        .any(|op| matches!(op.opcode, Opcode::Rewind | Opcode::Last)),
+                    "a missing composite prefix must not fall back to a table scan"
+                );
+                for parameter in [9, 11] {
+                    assert!(
+                        ops[seek_pos + 1..]
+                            .iter()
+                            .any(|op| { op.opcode == Opcode::Variable && op.p1 == parameter }),
+                        "the OLD-row exclusion and DESC-key residual must remain in the filter"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gh526_nullable_is_parameter_is_not_a_non_null_equality_prefix() {
+        let schema = gh526_exists_schema();
+        for nullable in ["v.idx IS ?2", "?2 IS v.idx"] {
+            let stmt = select_sql(&format!(
+                "SELECT 1 FROM messages AS v WHERE v.id IS NOT ?9 \
+                 AND v.conversation_id = ?4 AND {nullable} AND v.content IS ?11 LIMIT 1"
+            ));
+            let ctx = CodegenContext {
+                index_ordered_scan_reliable: true,
+                planner_select_directive: Some(gh526_weak_exists_directive()),
+                ..CodegenContext::default()
+            };
+            let mut builder = ProgramBuilder::new();
+            codegen_select(&mut builder, &stmt, &schema, &ctx).expect("nullable EXISTS codegen");
+            let program = builder.finish().expect("nullable EXISTS program");
+            let ops = program.ops();
+            assert!(
+                ops.iter().any(|op| {
+                    op.opcode == Opcode::OpenRead
+                        && matches!(&op.p4, P4::Index(name) if name == "idx_messages_conversation")
+                }),
+                "IS ?2 must remain a residual that can match NULL"
+            );
+            assert!(
+                !ops.iter().any(|op| {
+                    op.opcode == Opcode::OpenRead
+                        && matches!(&op.p4, P4::Index(name) if name == "idx_messages_probe")
+                }),
+                "the non-NULL prefix emitter cannot safely bind an IS parameter"
+            );
+        }
     }
 
     #[test]
