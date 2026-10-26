@@ -336,6 +336,21 @@ fn fk_cascade_trigger_can_reference_new_parent_key() {
     });
 }
 
+fn render_rusqlite(v: rusqlite::types::ValueRef<'_>) -> String {
+    match v {
+        rusqlite::types::ValueRef::Null => "NULL".to_owned(),
+        rusqlite::types::ValueRef::Integer(n) => n.to_string(),
+        rusqlite::types::ValueRef::Real(f) => format!("{f}"),
+        rusqlite::types::ValueRef::Text(s) => {
+            format!("'{}'", String::from_utf8_lossy(s))
+        }
+        rusqlite::types::ValueRef::Blob(b) => format!(
+            "X'{}'",
+            b.iter().map(|x| format!("{x:02X}")).collect::<String>()
+        ),
+    }
+}
+
 #[test]
 fn test_insert_or_fail_foreign_key_error_aborts_entire_insert_select() {
     asupersync::test_utils::run_test(|| async {
@@ -1619,3 +1634,711 @@ fn test_aggregate_order_by_and_filter_placeholders_match_sqlite() {
         assert_eq!(frank_values, vec![oracle_values]);
     });
 }
+
+#[test]
+fn test_bd_dojku_comma_less_table_constraints_match_sqlite() {
+    asupersync::test_utils::run_test(|| async {
+        let frank = Connection::open(":memory:").await.unwrap();
+        let oracle = rusqlite::Connection::open(":memory:").unwrap();
+
+        let ddl = "CREATE TABLE t(a INT, b INT, PRIMARY KEY(a) CHECK(b > 0) UNIQUE(b));";
+        frank.execute(ddl).await.unwrap();
+        oracle.execute_batch(ddl).unwrap();
+
+        frank.execute("INSERT INTO t VALUES (1, 10);").await.unwrap();
+        oracle.execute("INSERT INTO t VALUES (1, 10);", []).unwrap();
+
+        for bad_sql in [
+            "INSERT INTO t VALUES (1, 20);",
+            "INSERT INTO t VALUES (2, 10);",
+            "INSERT INTO t VALUES (2, -1);",
+        ] {
+            assert!(
+                frank.execute(bad_sql).await.is_err(),
+                "expected constraint failure for {bad_sql}"
+            );
+            assert!(
+                oracle.execute(bad_sql, []).is_err(),
+                "expected stock failure for {bad_sql}"
+            );
+        }
+
+        // Named constraint propagation across comma-less table constraints until next comma
+        let named_ddl = "CREATE TABLE t_named(a INT, b INT, c INT, CONSTRAINT c1 CHECK(a > 0) CHECK(b > 0), CHECK(c > 0));";
+        frank.execute(named_ddl).await.unwrap();
+        oracle.execute_batch(named_ddl).unwrap();
+
+        let frank_err = frank
+            .execute("INSERT INTO t_named VALUES (1, -1, 1);")
+            .await
+            .unwrap_err()
+            .to_string();
+        let oracle_err = oracle
+            .execute("INSERT INTO t_named VALUES (1, -1, 1);", [])
+            .unwrap_err()
+            .to_string();
+        assert_eq!(frank_err, oracle_err);
+
+        let frank_err_un = frank
+            .execute("INSERT INTO t_named VALUES (1, 1, -1);")
+            .await
+            .unwrap_err()
+            .to_string();
+        let oracle_err_un = oracle
+            .execute("INSERT INTO t_named VALUES (1, 1, -1);", [])
+            .unwrap_err()
+            .to_string();
+        assert_eq!(frank_err_un, oracle_err_un);
+    });
+}
+
+#[test]
+fn test_bd_vcvn0_fk_cascade_and_trigger_enforce_child_fk() {
+    asupersync::test_utils::run_test(|| async {
+        let setup = [
+            "PRAGMA foreign_keys = ON;",
+            "CREATE TABLE p1(id INTEGER PRIMARY KEY);",
+            "CREATE TABLE p2(id INTEGER PRIMARY KEY);",
+            "CREATE TABLE c(id INTEGER PRIMARY KEY, a INTEGER REFERENCES p1(id) ON DELETE SET DEFAULT, b INTEGER REFERENCES p2(id));",
+            "INSERT INTO p1 VALUES (1);",
+            "INSERT INTO p2 VALUES (10);",
+            "INSERT INTO c VALUES (100, 1, 10);",
+            "CREATE TRIGGER c_au AFTER UPDATE ON c BEGIN UPDATE c SET b = 999 WHERE id = NEW.id; END;",
+        ];
+        let frank = Connection::open(":memory:").await.unwrap();
+        let oracle = rusqlite::Connection::open(":memory:").unwrap();
+        for stmt in setup {
+            frank.execute(stmt).await.unwrap();
+            oracle.execute_batch(stmt).unwrap();
+        }
+
+        let frank_err = frank.execute("DELETE FROM p1 WHERE id = 1;").await;
+        let oracle_err = oracle.execute("DELETE FROM p1 WHERE id = 1;", []);
+        assert!(
+            frank_err.is_err() && oracle_err.is_err(),
+            "trigger inside FK cascade setting invalid FK must fail: frank={frank_err:?} oracle={oracle_err:?}"
+        );
+    });
+}
+
+#[test]
+fn test_bd_01rla_self_referential_fk_delete_and_update_match_sqlite() {
+    asupersync::test_utils::run_test(|| async {
+        for action in ["RESTRICT", "NO ACTION", "CASCADE", "SET NULL"] {
+            let frank = Connection::open(":memory:").await.unwrap();
+            let oracle = rusqlite::Connection::open(":memory:").unwrap();
+            let setup = [
+                "PRAGMA foreign_keys = ON;",
+                &format!(
+                    "CREATE TABLE t(id INTEGER PRIMARY KEY, p INTEGER REFERENCES t(id) ON DELETE {action} ON UPDATE {action});"
+                ),
+                "INSERT INTO t VALUES (1, 1);",
+            ];
+            for stmt in &setup {
+                frank.execute(stmt).await.unwrap();
+                oracle.execute_batch(stmt).unwrap();
+            }
+
+            let update_sql = "UPDATE t SET id = 2, p = 2 WHERE id = 1;";
+            let frank_upd = frank.execute(update_sql).await.map(|_| ());
+            let oracle_upd = oracle.execute(update_sql, []).map(|_| ());
+            assert_eq!(
+                frank_upd.is_ok(),
+                oracle_upd.is_ok(),
+                "self-ref UPDATE mismatch for {action}: frank={frank_upd:?} oracle={oracle_upd:?}"
+            );
+
+            let frank_rows: Vec<Vec<String>> = frank
+                .query("SELECT id, p FROM t ORDER BY id;")
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.values().iter().map(render_frank).collect())
+                .collect();
+            let mut stmt = oracle.prepare("SELECT id, p FROM t ORDER BY id;").unwrap();
+            let oracle_rows: Vec<Vec<String>> = stmt
+                .query_map([], |row| {
+                    Ok(vec![
+                        render_rusqlite(row.get_ref(0)?),
+                        render_rusqlite(row.get_ref(1)?),
+                    ])
+                })
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert_eq!(
+                frank_rows, oracle_rows,
+                "post-UPDATE rows mismatch for {action}"
+            );
+
+            let delete_sql = "DELETE FROM t;";
+            let frank_del = frank.execute(delete_sql).await.map(|_| ());
+            let oracle_del = oracle.execute(delete_sql, []).map(|_| ());
+            assert_eq!(
+                frank_del.is_ok(),
+                oracle_del.is_ok(),
+                "self-ref DELETE mismatch for {action}: frank={frank_del:?} oracle={oracle_del:?}"
+            );
+        }
+    });
+}
+
+fn rusqlite_err_msg(err: &rusqlite::Error) -> String {
+    match err {
+        rusqlite::Error::SqliteFailure(_, Some(msg))
+        | rusqlite::Error::SqlInputError { msg, .. } => msg.clone(),
+        other => other.to_string(),
+    }
+}
+
+#[test]
+fn test_bd_kn6ah_bd_vtbcf_bd_wt3mn_ddl_column_resolution_matches_sqlite() {
+    asupersync::test_utils::run_test(|| async {
+        let frank = Connection::open(":memory:").await.unwrap();
+        let oracle = rusqlite::Connection::open(":memory:").unwrap();
+
+        frank.execute("CREATE TABLE base(a INT);").await.unwrap();
+        oracle.execute("CREATE TABLE base(a INT);", []).unwrap();
+
+        let error_cases = [
+            // bd-kn6ah: generated columns naming rowid/_rowid_/oid
+            "CREATE TABLE gv(a, b AS (rowid * 2));",
+            "CREATE TABLE gs(a, b AS (rowid * 2) STORED);",
+            "CREATE TABLE gc(a, b AS (oid * 2), CHECK(b > 2));",
+            // bd-vtbcf: qualified column reference in generated columns
+            "CREATE TABLE g(a, b AS (main.g.a * 2));",
+            "CREATE TABLE g2(a, b AS (temp.g2.a * 2));",
+            "CREATE TABLE g3(a, b AS (g3.a * 2));",
+            // bd-wt3mn: CHECK referencing unknown column or WITHOUT ROWID rowid alias
+            "CREATE TABLE w(a PRIMARY KEY, b, CHECK(rowid > 1)) WITHOUT ROWID;",
+            "CREATE TABLE w2(a PRIMARY KEY, b, CHECK(_rowid_ > 1)) WITHOUT ROWID;",
+            "CREATE TABLE w3(a PRIMARY KEY, b, CHECK(oid > 1)) WITHOUT ROWID;",
+            "CREATE TABLE ns(a, CHECK(nosuch > 1));",
+            // ALTER TABLE ADD COLUMN equivalents
+            "ALTER TABLE base ADD COLUMN b AS (base.a);",
+            "ALTER TABLE base ADD COLUMN b AS (rowid);",
+            "ALTER TABLE base ADD COLUMN b CHECK (nosuch > 0);",
+        ];
+
+        for sql in error_cases {
+            let frank_err = frank
+                .execute(sql)
+                .await
+                .expect_err(&format!("expected error for {sql}"))
+                .to_string();
+            let oracle_err = rusqlite_err_msg(
+                &oracle
+                    .execute(sql, [])
+                    .expect_err(&format!("expected stock error for {sql}")),
+            );
+            assert_eq!(frank_err, oracle_err, "error message mismatch for {sql}");
+        }
+
+        // WITHOUT ROWID table that explicitly declares a `rowid` column allows `CHECK(rowid > 1)`
+        let valid_without_rowid =
+            "CREATE TABLE w_ok(a PRIMARY KEY, rowid INT, CHECK(rowid > 1)) WITHOUT ROWID;";
+        frank.execute(valid_without_rowid).await.unwrap();
+        oracle.execute(valid_without_rowid, []).unwrap();
+    });
+}
+
+#[test]
+fn test_bd_whs71_alter_table_add_column_check_validates_existing_rows() {
+    asupersync::test_utils::run_test(|| async {
+        let frank = Connection::open(":memory:").await.unwrap();
+        let oracle = rusqlite::Connection::open(":memory:").unwrap();
+
+        for stmt in [
+            "CREATE TABLE a(x);",
+            "INSERT INTO a(rowid, x) VALUES (1, 1), (5, 5);",
+        ] {
+            frank.execute(stmt).await.unwrap();
+            oracle.execute(stmt, []).unwrap();
+        }
+
+        for bad_alter in [
+            "ALTER TABLE a ADD COLUMN y CHECK(x > 3);",
+            "ALTER TABLE a ADD COLUMN z DEFAULT 0 CHECK(z = 1);",
+            "ALTER TABLE a ADD COLUMN y CHECK(rowid > 3);",
+        ] {
+            let frank_err = frank
+                .execute(bad_alter)
+                .await
+                .expect_err(&format!("expected failure for {bad_alter}"))
+                .to_string();
+            let oracle_err = oracle
+                .execute(bad_alter, [])
+                .expect_err(&format!("expected stock failure for {bad_alter}"))
+                .to_string();
+            assert_eq!(frank_err, oracle_err, "mismatch on {bad_alter}");
+        }
+
+        // Schema must remain unchanged (only column `x`), and a valid ADD COLUMN CHECK must succeed.
+        frank
+            .execute("ALTER TABLE a ADD COLUMN y DEFAULT 10 CHECK(y > 5 AND x > 0);")
+            .await
+            .unwrap();
+        oracle
+            .execute(
+                "ALTER TABLE a ADD COLUMN y DEFAULT 10 CHECK(y > 5 AND x > 0);",
+                [],
+            )
+            .unwrap();
+
+        let frank_rows: Vec<Vec<String>> = frank
+            .query("SELECT rowid, x, y FROM a ORDER BY rowid;")
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.values().iter().map(render_frank).collect())
+            .collect();
+        let mut stmt = oracle
+            .prepare("SELECT rowid, x, y FROM a ORDER BY rowid;")
+            .unwrap();
+        let oracle_rows: Vec<Vec<String>> = stmt
+            .query_map([], |row| {
+                Ok(vec![
+                    render_rusqlite(row.get_ref(0)?),
+                    render_rusqlite(row.get_ref(1)?),
+                    render_rusqlite(row.get_ref(2)?),
+                ])
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(frank_rows, oracle_rows);
+    });
+}
+
+#[test]
+fn test_bd_kld68_create_index_on_virtual_table_or_view_errors_match_stock() {
+    asupersync::test_utils::run_test(|| async {
+        let frank = Connection::open(":memory:").await.unwrap();
+        let oracle = rusqlite::Connection::open(":memory:").unwrap();
+
+        for stmt in [
+            "CREATE VIRTUAL TABLE f USING fts5(x);",
+            "CREATE TABLE base(x);",
+            "CREATE VIEW v AS SELECT x FROM base;",
+        ] {
+            frank.execute(stmt).await.unwrap();
+            oracle.execute(stmt, []).unwrap();
+        }
+
+        for bad_index in ["CREATE INDEX i_f ON f(x);", "CREATE INDEX i_v ON v(x);"] {
+            let frank_err = frank.execute(bad_index).await.unwrap_err().to_string();
+            let oracle_err = oracle.execute(bad_index, []).unwrap_err().to_string();
+            assert_eq!(frank_err, oracle_err, "mismatch on {bad_index}");
+        }
+    });
+}
+
+#[test]
+fn test_bd_29sgd_pragma_index_xinfo_on_without_rowid_table_name() {
+    asupersync::test_utils::run_test(|| async {
+        let frank = Connection::open(":memory:").await.unwrap();
+        let oracle = rusqlite::Connection::open(":memory:").unwrap();
+
+        let ddl = "CREATE TABLE w(a, b, PRIMARY KEY(a)) WITHOUT ROWID;";
+        frank.execute(ddl).await.unwrap();
+        oracle.execute(ddl, []).unwrap();
+
+        for sql in [
+            "PRAGMA index_xinfo('w');",
+            "PRAGMA index_info('w');",
+            "SELECT * FROM pragma_index_xinfo('w');",
+        ] {
+            let frank_rows: Vec<Vec<String>> = frank
+                .query(sql)
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.values().iter().map(render_frank).collect())
+                .collect();
+            let mut stmt = oracle.prepare(sql).unwrap();
+            let col_count = stmt.column_count();
+            let oracle_rows: Vec<Vec<String>> = stmt
+                .query_map([], |row| {
+                    let mut vals = Vec::with_capacity(col_count);
+                    for i in 0..col_count {
+                        vals.push(render_rusqlite(row.get_ref(i)?));
+                    }
+                    Ok(vals)
+                })
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert_eq!(frank_rows, oracle_rows, "mismatch on {sql}");
+        }
+    });
+}
+
+#[test]
+fn test_bd_mw9m3_pragma_table_info_on_circular_view_errors_match_stock() {
+    asupersync::test_utils::run_test(|| async {
+        let frank = Connection::open(":memory:").await.unwrap();
+        let oracle = rusqlite::Connection::open(":memory:").unwrap();
+
+        for ddl in [
+            "CREATE VIEW c AS SELECT * FROM c;",
+            "CREATE VIEW ma AS SELECT * FROM mb;",
+            "CREATE VIEW mb AS SELECT * FROM ma;",
+        ] {
+            frank.execute(ddl).await.unwrap();
+            oracle.execute(ddl, []).unwrap();
+        }
+
+        for sql in [
+            "PRAGMA table_info(c);",
+            "PRAGMA table_info(ma);",
+            "SELECT * FROM pragma_table_info('c');",
+        ] {
+            let frank_err = frank.query(sql).await.unwrap_err().to_string();
+            let oracle_err = oracle
+                .prepare(sql)
+                .and_then(|mut s| {
+                    let rows: rusqlite::Result<Vec<i64>> = s.query_map([], |r| r.get(0))?.collect();
+                    rows
+                })
+                .unwrap_err()
+                .to_string();
+            assert_eq!(frank_err, oracle_err, "mismatch on {sql}");
+        }
+    });
+}
+
+#[test]
+fn test_bd_073qp_and_bd_84b60_duplicate_relation_column_names_renamed() {
+    asupersync::test_utils::run_test(|| async {
+        let frank = Connection::open(":memory:").await.unwrap();
+        let oracle = rusqlite::Connection::open(":memory:").unwrap();
+
+        for ddl in [
+            "CREATE TABLE t(x INT);",
+            "INSERT INTO t VALUES (10);",
+            "CREATE VIEW vd AS SELECT x, x FROM t;",
+            "CREATE TABLE users(name TEXT);",
+            "CREATE TEMP TABLE users(name TEXT);",
+            "CREATE TEMP VIEW vv2 AS SELECT main.users.name, temp.users.name FROM main.users JOIN temp.users;",
+        ] {
+            frank.execute(ddl).await.unwrap();
+            oracle.execute(ddl, []).unwrap();
+        }
+
+        for sql in [
+            "SELECT * FROM (SELECT 1 AS x, 2 AS x);",
+            "SELECT * FROM vd;",
+            "WITH c AS (SELECT 1 AS x, 2 AS x) SELECT * FROM c;",
+        ] {
+            let frank_stmt = frank.prepare(sql).await.unwrap();
+            let oracle_stmt = oracle.prepare(sql).unwrap();
+            let oracle_cols: Vec<String> = oracle_stmt
+                .column_names()
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            assert_eq!(frank_stmt.column_names(), oracle_cols.as_slice(), "column names mismatch on {sql}");
+        }
+
+        let info_sql = "SELECT name FROM pragma_table_info('vv2');";
+        let frank_names: Vec<String> = frank
+            .query(info_sql)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| render_frank(&r.values()[0]))
+            .collect();
+        let mut stmt = oracle.prepare(info_sql).unwrap();
+        let oracle_names: Vec<String> = stmt
+            .query_map([], |r| Ok(render_rusqlite(r.get_ref(0)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(frank_names, oracle_names);
+    });
+}
+
+#[test]
+fn test_bd_3j81a_create_trigger_on_schema_qualified_table_matches_stock() {
+    asupersync::test_utils::run_test(|| async {
+        let frank = Connection::open(":memory:").await.unwrap();
+        let oracle = rusqlite::Connection::open(":memory:").unwrap();
+
+        for ddl in [
+            "CREATE TABLE t(x INT);",
+            "CREATE TABLE logm(a INT);",
+            "CREATE TRIGGER mtr3 AFTER INSERT ON main.t BEGIN INSERT INTO logm VALUES (NEW.x * 10); END;",
+            "INSERT INTO t VALUES (3);",
+        ] {
+            frank.execute(ddl).await.unwrap();
+            oracle.execute(ddl, []).unwrap();
+        }
+
+        let frank_val = frank
+            .query_row("SELECT a FROM logm;")
+            .await
+            .unwrap()
+            .values()[0]
+            .as_integer()
+            .unwrap();
+        let oracle_val: i64 = oracle
+            .query_row("SELECT a FROM logm;", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(frank_val, 30);
+        assert_eq!(frank_val, oracle_val);
+
+        for bad_sql in [
+            "CREATE TRIGGER mtr_bad AFTER INSERT ON temp.t BEGIN SELECT 1; END;",
+            "CREATE TEMP TRIGGER main.tr_bad AFTER INSERT ON t BEGIN SELECT 1; END;",
+        ] {
+            let frank_err = frank.execute(bad_sql).await.unwrap_err().to_string();
+            let oracle_err = rusqlite_err_msg(&oracle.execute(bad_sql, []).unwrap_err());
+            assert_eq!(frank_err, oracle_err, "mismatch on {bad_sql}");
+        }
+    });
+}
+
+#[test]
+fn test_bd_xrzce_rowid_aliases_in_upsert_set_and_returning_match_stock() {
+    asupersync::test_utils::run_test(|| async {
+        let frank = Connection::open(":memory:").await.unwrap();
+        let oracle = rusqlite::Connection::open(":memory:").unwrap();
+
+        for ddl in [
+            "CREATE TABLE q(k TEXT UNIQUE, v INT);",
+            "INSERT INTO q(rowid, k, v) VALUES (10, 'a', 1);",
+            "INSERT INTO q VALUES ('a', 2) ON CONFLICT(k) DO UPDATE SET rowid = -5, v = excluded.v;",
+        ] {
+            frank.execute(ddl).await.unwrap();
+            oracle.execute(ddl, []).unwrap();
+        }
+
+        let sql = "SELECT rowid, k, v FROM q;";
+        let frank_row: Vec<String> = frank
+            .query_row(sql)
+            .await
+            .unwrap()
+            .values()
+            .iter()
+            .map(render_frank)
+            .collect();
+        let oracle_row: Vec<String> = oracle
+            .query_row(sql, [], |r| {
+                Ok(vec![
+                    render_rusqlite(r.get_ref(0)?),
+                    render_rusqlite(r.get_ref(1)?),
+                    render_rusqlite(r.get_ref(2)?),
+                ])
+            })
+            .unwrap();
+        assert_eq!(frank_row, oracle_row);
+
+        let bad_returning = "INSERT INTO q AS x VALUES ('b', 3) RETURNING x.rowid;";
+        let frank_err = frank.query(bad_returning).await.unwrap_err().to_string();
+        let oracle_err = rusqlite_err_msg(
+            &oracle
+                .prepare(bad_returning)
+                .and_then(|mut s| {
+                    let rows: rusqlite::Result<Vec<i64>> = s.query_map([], |r| r.get(0))?.collect();
+                    rows
+                })
+                .unwrap_err(),
+        );
+        assert_eq!(frank_err, oracle_err);
+    });
+}
+
+#[test]
+fn test_bd_257yl_unqualified_declared_rowid_in_multi_table_from_matches_stock() {
+    asupersync::test_utils::run_test(|| async {
+        let frank = Connection::open(":memory:").await.unwrap();
+        let oracle = rusqlite::Connection::open(":memory:").unwrap();
+
+        for ddl in [
+            "CREATE TABLE r(rowid INTEGER, v INT);",
+            "CREATE TABLE s(x INT, y INT);",
+            "CREATE TABLE o(oid INT, _rowid_ INT, v INT);",
+            "INSERT INTO r(_rowid_, rowid, v) VALUES (10, 100, 1), (20, 200, 2);",
+            "INSERT INTO s(rowid, x, y) VALUES (30, 1, 11), (40, 2, 22);",
+            "INSERT INTO o(rowid, oid, _rowid_, v) VALUES (50, 500, 5000, 1), (60, 600, 6000, 2);",
+        ] {
+            frank.execute(ddl).await.unwrap();
+            oracle.execute(ddl, []).unwrap();
+        }
+
+        for sql in [
+            "SELECT rowid, v FROM r JOIN s ON r.v = s.x ORDER BY v;",
+            "SELECT rowid, x FROM r, s WHERE r.v = s.x ORDER BY x;",
+            "SELECT count(*) FROM r JOIN s ON rowid > 0;",
+            "SELECT rowid FROM r JOIN o ON r.v = o.v ORDER BY r.v;",
+        ] {
+            let frank_rows: Vec<Vec<String>> = frank
+                .query(sql)
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.values().iter().map(render_frank).collect())
+                .collect();
+            let mut stmt = oracle.prepare(sql).unwrap();
+            let col_count = stmt.column_count();
+            let oracle_rows: Vec<Vec<String>> = stmt
+                .query_map([], |row| {
+                    let mut vals = Vec::with_capacity(col_count);
+                    for i in 0..col_count {
+                        vals.push(render_rusqlite(row.get_ref(i)?));
+                    }
+                    Ok(vals)
+                })
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert_eq!(frank_rows, oracle_rows, "mismatch on {sql}");
+        }
+    });
+}
+
+#[test]
+fn test_bd_h09hh_vacuum_partial_index_with_declared_column_collation() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("vac_partial_collation.db");
+        let conn = Connection::open(db_path.to_str().unwrap()).await.unwrap();
+        for sql in [
+            "CREATE TABLE c(v TEXT COLLATE NOCASE);",
+            "CREATE INDEX c_col ON c(v) WHERE v = 'abc';",
+            "INSERT INTO c VALUES ('ABC'), ('abc'), ('x');",
+            "VACUUM;",
+        ] {
+            conn.execute(sql).await.unwrap();
+        }
+        let rows: Vec<String> = conn
+            .query("SELECT v FROM c INDEXED BY c_col WHERE v = 'abc' ORDER BY rowid;")
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| render_frank(&r.values()[0]))
+            .collect();
+        assert_eq!(rows, vec!["'ABC'".to_owned(), "'abc'".to_owned()]);
+
+        let oracle = rusqlite::Connection::open(&db_path).unwrap();
+        let integrity: String = oracle
+            .query_row("PRAGMA integrity_check;", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+    });
+}
+
+#[test]
+fn test_bd_d4lv6_minmax_distinct_bare_column_duplicate_after_loading_row() {
+    asupersync::test_utils::run_test(|| async {
+        let frank = Connection::open(":memory:").await.unwrap();
+        let oracle = rusqlite::Connection::open(":memory:").unwrap();
+
+        for ddl in [
+            "CREATE TABLE t(a INT, b TEXT, c INT);",
+            "INSERT INTO t VALUES (9, 'b6', 2), (5, 'b1', 1), (9, 'b7', 2), (NULL, 'bn', 3), (5, 'b5', 3);",
+            "CREATE TABLE t2(a INT, b TEXT, f INT);",
+            "INSERT INTO t2 VALUES (3, 'b3a', 1), (9, 'b9', 1), (3, 'b3b', 1);",
+        ] {
+            frank.execute(ddl).await.unwrap();
+            oracle.execute(ddl, []).unwrap();
+        }
+
+        for sql in [
+            "SELECT max(DISTINCT a), b FROM t WHERE c >= 2;",
+            "SELECT max(DISTINCT a), b FROM t;",
+            "SELECT max(DISTINCT a), b FROM t2;",
+            "SELECT max(DISTINCT a) FILTER (WHERE f), b FROM t2;",
+        ] {
+            let frank_row: Vec<String> = frank
+                .query_row(sql)
+                .await
+                .unwrap()
+                .values()
+                .iter()
+                .map(render_frank)
+                .collect();
+            let stmt_frank = frank.prepare(sql).await.unwrap();
+            let prep_row: Vec<String> = stmt_frank
+                .query_row()
+                .await
+                .unwrap()
+                .values()
+                .iter()
+                .map(render_frank)
+                .collect();
+            let oracle_row: Vec<String> = oracle
+                .query_row(sql, [], |r| {
+                    Ok(vec![
+                        render_rusqlite(r.get_ref(0)?),
+                        render_rusqlite(r.get_ref(1)?),
+                    ])
+                })
+                .unwrap();
+            assert_eq!(frank_row, oracle_row, "ad-hoc mismatch on {sql}");
+            assert_eq!(prep_row, oracle_row, "prepared mismatch on {sql}");
+        }
+    });
+}
+
+#[test]
+fn test_bd_3syf5_check_error_text_grouped_exprs_and_constraint_name_carryover() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let frank_path = dir.path().join("frank_3syf5.db");
+        let oracle_path = dir.path().join("oracle_3syf5.db");
+
+        let frank = Connection::open(frank_path.to_str().unwrap())
+            .await
+            .unwrap();
+        let oracle = rusqlite::Connection::open(&oracle_path).unwrap();
+
+        for ddl in [
+            "CREATE TABLE g(a, b, CHECK((a) AND (b)));",
+            "CREATE TABLE g2(a CHECK((a > 0)));",
+            "CREATE TABLE c1_tbl(a CONSTRAINT c1 CHECK(a > 0) CHECK(a < 10));",
+            "CREATE TABLE nn_tbl(a CONSTRAINT nn NOT NULL CHECK(a > 0));",
+            "CREATE TABLE c2_tbl(a, b, CONSTRAINT c2 CHECK(a > 0) CHECK(b < 10));",
+        ] {
+            frank.execute(ddl).await.unwrap();
+            oracle.execute(ddl, []).unwrap();
+        }
+
+        let probes = [
+            "INSERT INTO g VALUES (0, 1);",
+            "INSERT INTO g2 VALUES (0);",
+            "INSERT INTO c1_tbl VALUES (20);",
+            "INSERT INTO nn_tbl VALUES (0);",
+            "INSERT INTO c2_tbl VALUES (1, 20);",
+        ];
+
+        for sql in probes {
+            let f_err = frank.execute(sql).await.unwrap_err().to_string();
+            let o_err = rusqlite_err_msg(&oracle.execute(sql, []).unwrap_err());
+            assert_eq!(f_err, o_err, "live DDL CHECK error mismatch for {sql}");
+        }
+        drop(frank);
+        drop(oracle);
+
+        // Verify reopened databases and stock-created databases produce the exact same text.
+        let frank_reopen = Connection::open(frank_path.to_str().unwrap())
+            .await
+            .unwrap();
+        let frank_from_stock = Connection::open(oracle_path.to_str().unwrap())
+            .await
+            .unwrap();
+        let oracle_reopen = rusqlite::Connection::open(&oracle_path).unwrap();
+
+        for sql in probes {
+            let o_err = rusqlite_err_msg(&oracle_reopen.execute(sql, []).unwrap_err());
+            let fr_err = frank_reopen.execute(sql).await.unwrap_err().to_string();
+            let fs_err = frank_from_stock.execute(sql).await.unwrap_err().to_string();
+            assert_eq!(fr_err, o_err, "reopened CHECK error mismatch for {sql}");
+            assert_eq!(
+                fs_err, o_err,
+                "stock-created CHECK error mismatch for {sql}"
+            );
+        }
+    });
+}
+

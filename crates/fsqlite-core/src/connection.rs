@@ -32,6 +32,7 @@
 )]
 
 mod conformal_retry;
+mod insert_batch;
 mod pragma_maintenance;
 mod qualified_column_binding;
 
@@ -21279,6 +21280,53 @@ impl Connection {
                     .await
                     .map(Some)
                 }
+                Statement::CreateTrigger(create_trigger) => {
+                    let Some(target_schema) = self.attached_target_schema(&create_trigger.name)?
+                    else {
+                        return Ok(None);
+                    };
+                    if create_trigger.temporary {
+                        return Err(FrankenError::FunctionError(
+                            "temporary trigger may not have qualified name".to_owned(),
+                        ));
+                    }
+                    if let Some(table_schema) = create_trigger.table_schema.as_deref()
+                        && !table_schema.eq_ignore_ascii_case(&target_schema)
+                    {
+                        return Err(FrankenError::FunctionError(format!(
+                            "trigger {} cannot reference objects in database {table_schema}",
+                            create_trigger.name.name
+                        )));
+                    }
+                    self.prepare_attached_target_write_in_explicit_transaction(
+                        "CREATE TRIGGER",
+                        create_trigger
+                            .name
+                            .schema
+                            .as_deref()
+                            .unwrap_or(&target_schema),
+                    )
+                    .await?;
+                    let mut rewritten = create_trigger.clone();
+                    rewritten.name.schema = None;
+                    rewritten.table_schema = None;
+                    let schema_for_err = target_schema.clone();
+                    self.with_attached_connection_and_source(&target_schema, async |conn| {
+                        conn.execute_statement(&Statement::CreateTrigger(rewritten), params)
+                            .await
+                            .map_err(|err| match err {
+                                FrankenError::NoSuchTable { name } => {
+                                    let bare = name.strip_prefix("main.").unwrap_or(&name);
+                                    FrankenError::NoSuchTable {
+                                        name: format!("{schema_for_err}.{bare}"),
+                                    }
+                                }
+                                other => other,
+                            })
+                    })
+                    .await
+                    .map(Some)
+                }
                 Statement::Insert(insert) => {
                     let Some(target_schema) = self.attached_target_schema(&insert.table)? else {
                         return Ok(None);
@@ -28157,7 +28205,7 @@ impl Connection {
     fn select_uses_builtin_minmax_bare_tracking(
         &self,
         select: &SelectStatement,
-    ) -> Option<(bool, Expr, Option<Expr>)> {
+    ) -> Option<(bool, Expr, Option<Expr>, bool)> {
         let walk = select_minmax_bare_tracking_walk(
             select,
             &self.having_alias_shadowing_column_names(select),
@@ -28165,7 +28213,10 @@ impl Connection {
         let builtin = walk.seen_minmax.iter().all(|(is_max, _, _)| {
             !self.application_function_replaces_builtin(if *is_max { "max" } else { "min" }, 1)
         });
-        walk.minmax.filter(|_| builtin)
+        let is_distinct = walk.minmax_distinct;
+        walk.minmax
+            .filter(|_| builtin)
+            .map(|(is_max, arg, filter)| (is_max, arg, filter, is_distinct))
     }
 
     /// GH#174 / bd-6lijo: the result aliases a HAVING name does NOT resolve
@@ -28465,37 +28516,14 @@ impl Connection {
         }
     }
 
-    /// The VERBATIM source text of `expr` — sliced from `pending_ddl_source`
-    /// (the exact issued CREATE/ALTER SQL the statement was parsed from) by the
-    /// expression's byte span, whitespace-trimmed. Returns `None` when the
-    /// source is unavailable (batched statements) or the span does not resolve,
-    /// so callers can fall back to an AST render. Used for `dflt_value`
-    /// (bd-...-rqvvf) and for a `CHECK` constraint's reported expression
-    /// (bd-...-s9irk); SQLite reports both verbatim, not re-rendered.
-    fn expr_verbatim_source(&self, expr: &Expr) -> Option<String> {
-        let span = expr.span();
-        let source = self.pending_ddl_source.borrow();
-        let text = source
-            .as_deref()?
-            .get(span.start as usize..span.end as usize)?;
-        let trimmed = text.trim();
-        (!trimmed.is_empty()).then(|| trimmed.to_owned())
-    }
-
-    /// Return CHECK SQL that is guaranteed to round-trip to the parsed AST.
-    ///
-    /// Grouping parentheses are intentionally omitted from expression spans,
-    /// because DEFAULT reporting strips its outer grouping. A compound CHECK
-    /// such as `CHECK((a) AND (b))` can therefore have a span whose verbatim
-    /// slice is the invalid fragment `a) AND (b`. Preserve verbatim spelling
-    /// only when it reparses to the same expression; otherwise use the AST's
-    /// canonical rendering so CHECK bytecode cannot silently disappear.
+    /// Return CHECK SQL that is guaranteed to round-trip to the parsed AST,
+    /// preserving grouping parentheses inside `CHECK(...)` when `pending_ddl_source`
+    /// is available.
     fn format_check_expr_source(&self, expr: &Expr) -> String {
-        self.expr_verbatim_source(expr)
-            .filter(|source| {
-                fsqlite_parser::expr::parse_expr(source).is_ok_and(|parsed| parsed.eq(expr))
-            })
-            .unwrap_or_else(|| expr.to_string())
+        match self.pending_ddl_source.borrow().as_deref() {
+            Some(sql) => crate::compat_persist::stored_check_expr_source(expr, sql),
+            None => expr.to_string(),
+        }
     }
 
     /// Consume the raw CREATE source after expression-span users have finished
@@ -30345,6 +30373,39 @@ impl Connection {
                 ));
             }
             if stmt.dml_dispatch.is_some() {
+                if let Some(dml) = stmt.deferred_dml_statement()
+                    && match dml {
+                        Statement::Insert(ins) => !ins.returning.is_empty(),
+                        Statement::Update(upd) => !upd.returning.is_empty(),
+                        Statement::Delete(del) => !del.returning.is_empty(),
+                        _ => false,
+                    }
+                {
+                    if stmt.may_observe_change_tracking {
+                        self.sync_change_tracking_context();
+                    }
+                    let op_cx = self.op_cx_after_background_status();
+                    stmt.ensure_schema_unchanged(&op_cx).await?;
+                    let dml = stmt
+                        .deferred_dml_statement()
+                        .expect("checked RETURNING DML statement above");
+                    let rows_result = self
+                        .execute_statement_impl_after_background_status(
+                            dml,
+                            if params.is_empty() {
+                                None
+                            } else {
+                                Some(params)
+                            },
+                            stmt.dispatch_precompiled_program(),
+                            false,
+                        )
+                        .await;
+                    if rows_result.is_ok() {
+                        self.note_connection_statement_execution_count(1);
+                    }
+                    return rows_result;
+                }
                 return Err(FrankenError::Internal(
                     "DML prepared statements must be executed through \
                  Connection::execute_prepared() or Connection::execute_prepared_with_params()"
@@ -30642,6 +30703,22 @@ impl Connection {
                 ));
             }
             if stmt.dml_dispatch.is_some() {
+                if let Some(dml) = stmt.deferred_dml_statement()
+                    && match dml {
+                        Statement::Insert(ins) => !ins.returning.is_empty(),
+                        Statement::Update(upd) => !upd.returning.is_empty(),
+                        Statement::Delete(del) => !del.returning.is_empty(),
+                        _ => false,
+                    }
+                {
+                    let rows = self
+                        .query_prepared_with_params_after_background_status(stmt, params)
+                        .await?;
+                    for row in rows {
+                        f(&row)?;
+                    }
+                    return Ok(());
+                }
                 return Err(FrankenError::Internal(
                     "DML prepared statements must be executed through \
                  Connection::execute_prepared() or Connection::execute_prepared_with_params()"
@@ -30766,6 +30843,22 @@ impl Connection {
                 ));
             }
             if stmt.dml_dispatch.is_some() {
+                if let Some(dml) = stmt.deferred_dml_statement()
+                    && match dml {
+                        Statement::Insert(ins) => !ins.returning.is_empty(),
+                        Statement::Update(upd) => !upd.returning.is_empty(),
+                        Statement::Delete(del) => !del.returning.is_empty(),
+                        _ => false,
+                    }
+                {
+                    let rows = self
+                        .query_prepared_with_params_after_background_status(
+                            stmt,
+                            params.unwrap_or(&[]),
+                        )
+                        .await?;
+                    return exactly_one_row_or_error(rows);
+                }
                 return Err(FrankenError::Internal(
                     "DML prepared statements must be executed through \
                  Connection::execute_prepared() or Connection::execute_prepared_with_params()"
@@ -41508,619 +41601,15 @@ impl Connection {
                 }
             }
             Statement::Insert(insert) => {
-                if self.pragma_state.borrow().writable_schema
-                    && is_sqlite_schema_name(&insert.table.name)
-                {
-                    let affected =
-                        Box::pin(self.execute_writable_schema_insert(insert, params)).await?;
-                    self.record_statement_changes(affected);
-                    return Ok(Vec::new());
-                }
-                // Reached only with writable_schema OFF: direct DML on the schema
-                // table is rejected with SQLITE_ERROR, not the generic
-                // "no such table" the interpreted path would otherwise raise.
-                // (GH #284)
-                if is_sqlite_schema_name(&insert.table.name) {
-                    return Err(FrankenError::FunctionError(format!(
-                        "table {} may not be modified",
-                        insert.table.name
-                    )));
-                }
-                if Box::pin(self.execute_fts5_maintenance_insert(insert)).await? {
-                    return Ok(Vec::new());
-                }
-                #[cfg(feature = "ext-fts5")]
-                if let Some(affected) =
-                    Box::pin(self.execute_fts5_magic_delete_insert(insert, params)).await?
-                {
-                    self.record_statement_changes(affected);
-                    return Ok(Vec::new());
-                }
-                if insert.with.is_some() {
-                    self.log_mem_execution_fallback("insert", "with_clause_materialization")?;
-                    return Box::pin(self.execute_insert_with_ctes(insert, params)).await;
-                }
-
-                let table_name = &insert.table.name;
-                let insert_event = fsqlite_ast::TriggerEvent::Insert;
-                let is_live_vtab = self.has_live_vtab_instance(table_name);
-                let has_before_insert = self.has_matching_triggers(
-                    table_name,
-                    fsqlite_ast::TriggerTiming::Before,
-                    &insert_event,
-                );
-                let has_after_insert = self.has_matching_triggers(
-                    table_name,
-                    fsqlite_ast::TriggerTiming::After,
-                    &insert_event,
-                );
-                // bd-y7old: a conflicting ON CONFLICT DO UPDATE resolves to the
-                // UPDATE path, so it must fire BEFORE/AFTER UPDATE triggers (and
-                // NOT AFTER INSERT). Compute their presence for the DO-UPDATE case.
-                let is_do_update_upsert = insert.upsert.iter().any(|clause| {
-                    matches!(clause.action, fsqlite_ast::UpsertAction::Update { .. })
-                });
-                // `UPDATE OF <cols>` triggers match on the SET-assigned columns.
-                // The exact event depends on WHICH ON CONFLICT clause is taken,
-                // which is only known after conflict routing (bd-bwm0x): with
-                // multiple DO-UPDATE clauses a LATER clause with different SET
-                // columns can be the one applied. Here we only need a COARSE gate —
-                // whether ANY DO-UPDATE clause could fire a BEFORE/AFTER UPDATE
-                // trigger — to decide whether the (potentially expensive) conflict
-                // routing runs at all. Use the union of every DO-UPDATE clause's
-                // SET columns; the precise taken-clause event is derived below.
-                let upsert_all_update_cols: Vec<String> = insert
-                    .upsert
-                    .iter()
-                    .filter_map(|clause| match &clause.action {
-                        fsqlite_ast::UpsertAction::Update { assignments, .. } => {
-                            Some(Self::assignment_target_column_names(assignments))
-                        }
-                        fsqlite_ast::UpsertAction::Nothing => None,
-                    })
-                    .flatten()
-                    .collect();
-                let coarse_update_event =
-                    fsqlite_ast::TriggerEvent::Update(upsert_all_update_cols);
-                let table_has_upsert_update_trigger = is_do_update_upsert
-                    && (self.has_matching_triggers(
-                        table_name,
-                        fsqlite_ast::TriggerTiming::Before,
-                        &coarse_update_event,
-                    ) || self.has_matching_triggers(
-                        table_name,
-                        fsqlite_ast::TriggerTiming::After,
-                        &coarse_update_event,
-                    ));
-                // The conflict/OLD-NEW plan is needed whenever a conflicting row
-                // would change which triggers fire: BEFORE/AFTER UPDATE must fire
-                // for the update, and AFTER INSERT must be SUPPRESSED because no
-                // insert happened — the latter matters even with no UPDATE triggers
-                // (stock fires only BEFORE INSERT on a conflict/update path).
-                let upsert_needs_conflict_plan =
-                    is_do_update_upsert && (has_after_insert || table_has_upsert_update_trigger);
-                if is_live_vtab {
-                    if !insert.returning.is_empty() {
-                        return Err(FrankenError::NotImplemented(
-                            "RETURNING is not supported for live virtual-table INSERT".to_owned(),
-                        ));
-                    }
-                    // INSERT OR REPLACE is supported for live virtual tables
-                    // (delete any row conflicting on the rowid, then insert —
-                    // matching SQLite's REPLACE). UPSERT (`ON CONFLICT ... DO
-                    // ...`) and every other conflict action (ROLLBACK / ABORT /
-                    // FAIL / IGNORE) remain unimplemented. (GH #214)
-                    let is_replace = matches!(
-                        insert.or_conflict,
-                        Some(fsqlite_ast::ConflictAction::Replace)
-                    );
-                    if !insert.upsert.is_empty() || (insert.or_conflict.is_some() && !is_replace) {
-                        return Err(FrankenError::NotImplemented(
-                            "UPSERT and conflict clauses are not supported for live virtual-table INSERT"
-                                .to_owned(),
-                        ));
-                    }
-                }
-                if !is_live_vtab
-                    && let fsqlite_ast::InsertSource::Select(select_stmt) = &insert.source
-                {
-                    // Detect simple VALUES clause (no compounds).
-                    // We must use the VDBE path for simple VALUES to avoid infinite recursion
-                    // in the fallback (which implements inserts by generating simple VALUES inserts).
-                    let is_simple_values = matches!(select_stmt.body.select, SelectCore::Values(_))
-                        && select_stmt.body.compounds.is_empty();
-
-                    // A real INSERT ... SELECT bypasses the VDBE VALUES-path
-                    // column-count check (codegen.rs), so a SELECT (with `*`
-                    // expanded) whose width does not match the INSERT target would
-                    // silently mis-insert. Validate it here, matching the VDBE
-                    // path's counts and messages exactly: no target list -> "table
-                    // T has N columns but M values were supplied"; an explicit list
-                    // -> "M values for N columns". (Simple VALUES keep flowing to the
-                    // VDBE path, which checks them.) bd-errmsg-parity-batch3-3brmm.
-                    if !is_simple_values {
-                        let source_cols =
-                            self.select_result_column_count(select_stmt, &[], &mut Vec::new());
-                        let target_cols = {
-                            let schemas = self.schema.borrow();
-                            schemas
-                                .iter()
-                                .find(|t| t.name.eq_ignore_ascii_case(table_name))
-                                .map(|t| {
-                                    if insert.columns.is_empty() {
-                                        t.columns.len()
-                                    } else {
-                                        insert.columns.len()
-                                    }
-                                })
-                        };
-                        if let Some(target_cols) = target_cols
-                            && source_cols != target_cols
-                        {
-                            return Err(FrankenError::FunctionError(
-                                if insert.columns.is_empty() {
-                                    format!(
-                                        "table {table_name} has {target_cols} columns but {source_cols} values were supplied"
-                                    )
-                                } else {
-                                    format!("{source_cols} values for {target_cols} columns")
-                                },
-                            ));
-                        }
-                    }
-
-                    // Complex INSERT ... SELECT statements are replayed as
-                    // per-row INSERT ... VALUES operations. Those inner
-                    // statements already handle trigger firing and change
-                    // tracking, so route around the outer trigger path here.
-                    let needs_row_by_row_replay = has_before_insert
-                        || has_after_insert
-                        || upsert_needs_conflict_plan
-                        || self.fk_enforcement_enabled();
-                    if !is_simple_values || needs_row_by_row_replay {
-                        self.log_mem_execution_fallback(
-                            "insert_select",
-                            "insert_select_row_by_row_fallback",
-                        )?;
-                        if insert.returning.is_empty() {
-                            let _ = Box::pin(self.execute_insert_select_fallback(
-                                insert,
-                                select_stmt,
-                                params,
-                            ))
-                            .await?;
-                            return Ok(Vec::new());
-                        }
-                        return Box::pin(self.execute_insert_select_fallback_returning(
-                            insert,
-                            select_stmt,
-                            params,
-                        ))
-                        .await;
-                    }
-                }
-                if !is_live_vtab
-                    && (has_before_insert
-                        || has_after_insert
-                        || upsert_needs_conflict_plan
-                        || self.fk_enforcement_enabled())
-                    && let fsqlite_ast::InsertSource::Values(rows) = &insert.source
-                    && rows.len() > 1
-                {
-                    self.log_mem_execution_fallback(
-                        "insert_values",
-                        "insert_values_row_by_row_trigger_or_fk_fallback",
-                    )?;
-                    let source_rows = self
-                        .materialize_insert_values_source_rows(rows, params)
-                        .await?;
-                    let outcome = self
-                        .execute_insert_select_materialized_rows_outcome(insert, &source_rows)
-                        .await?;
-                    return Ok(outcome.returning_rows);
-                }
-                // bd-xb07w: morsel-driven INSERT for large multi-row VALUES
-                // without triggers, FK, RETURNING, or UPSERT. The morsel
-                // scheduler splits the row stream into batches for future
-                // parallel execution; this wiring executes them sequentially.
-                if !is_live_vtab
-                    && insert.returning.is_empty()
-                    && !has_before_insert
-                    && !has_after_insert
-                    && !self.fk_enforcement_enabled()
-                    && insert.upsert.is_empty()
-                    && let fsqlite_ast::InsertSource::Values(rows) = &insert.source
-                    && rows.len() >= MORSEL_INSERT_THRESHOLD
-                {
-                    self.log_mem_execution_fallback("insert_values", "morsel_insert_dispatch")?;
-                    let source_rows = self
-                        .materialize_insert_values_source_rows(rows, params)
-                        .await?;
-                    let _ = self.execute_morsel_insert(insert, source_rows).await?;
-                    return Ok(Vec::new());
-                }
-                let mut live_insert_rows = if is_live_vtab
-                    && !has_before_insert
-                    && !has_after_insert
-                    && matches!(insert.source, InsertSource::Select(_))
-                {
-                    if let Some(affected) = Box::pin(
-                        self.try_execute_streaming_live_vtab_insert_select(insert, params),
-                    )
-                    .await?
-                    {
-                        self.record_statement_changes(affected);
-                        return Ok(Vec::new());
-                    }
-                    Some(self.collect_live_vtab_insert_rows(insert, params).await?)
-                } else if is_live_vtab {
-                    Some(self.collect_live_vtab_insert_rows(insert, params).await?)
-                } else {
-                    None
-                };
-                // NEW row images plus the explicit rowid each row supplies (None
-                // when the rowid is auto-assigned). The explicit rowid resolves
-                // `NEW.rowid` in BEFORE INSERT triggers on tables without an
-                // INTEGER PRIMARY KEY column (GH #205).
-                let (mut trigger_new_rows, trigger_new_explicit_rowids): (
-                    Vec<Vec<SqliteValue>>,
-                    Vec<Option<i64>>,
-                ) = if has_before_insert || has_after_insert || upsert_needs_conflict_plan {
-                    if let Some(rows) = live_insert_rows.as_ref() {
-                        // Live virtual-table rows are inserted through the module's
-                        // xUpdate; the rowid is chosen there, not known pre-insert.
-                        let values = rows.iter().map(|row| row.values.clone()).collect();
-                        let rowids = vec![None; rows.len()];
-                        (values, rowids)
-                    } else {
-                        self.collect_insert_trigger_rows(insert, params)
-                            .await?
-                            .into_iter()
-                            .unzip()
-                    }
-                } else {
-                    (Vec::new(), Vec::new())
-                };
-
-                // Phase 5G.2 (bd-iqam): Fire BEFORE INSERT triggers.
-                let skip_dml = if has_before_insert {
-                    let mut skip = false;
-                    for (new_values, &explicit_rowid) in
-                        trigger_new_rows.iter().zip(&trigger_new_explicit_rowids)
-                    {
-                        // SQLite exposes `NEW.rowid` in BEFORE INSERT triggers as
-                        // the explicit rowid when the statement supplies one, and
-                        // as -1 when the rowid will be auto-assigned (it is not yet
-                        // known). Match that. (GH #205)
-                        if Box::pin(self.fire_before_triggers(
-                            table_name,
-                            &insert_event,
-                            None,
-                            Some(new_values),
-                            None,
-                            Some(explicit_rowid.unwrap_or(-1)),
-                        ))
-                        .await?
-                        {
-                            skip = true;
-                            break;
-                        }
-                    }
-                    skip
-                } else {
-                    false
-                };
-                if skip_dml {
-                    // RAISE(IGNORE) was called - skip the INSERT.
-                    self.reset_statement_change_count();
-                    return Ok(Vec::new());
-                }
-
-                if is_live_vtab {
-                    let mut live_insert_rows = live_insert_rows.take().unwrap_or_else(Vec::new);
-                    let patch_first_column_with_rowid = {
-                        let key = table_name.to_ascii_uppercase();
-                        self.vtab_instances
-                            .borrow()
-                            .get(&key)
-                            .is_some_and(|instance| is_rtree_instance(instance.as_ref()))
-                    };
-                    // INSERT OR REPLACE resolves a rowid conflict by deleting the
-                    // existing row before inserting the new one (GH #214).
-                    let replace = matches!(
-                        insert.or_conflict,
-                        Some(fsqlite_ast::ConflictAction::Replace)
-                    );
-                    let inserted_rowids = Box::pin(self.execute_live_vtab_insert_rows(
-                        table_name,
-                        &live_insert_rows,
-                        replace,
-                    ))
-                    .await?;
-
-                    if has_after_insert {
-                        if patch_first_column_with_rowid {
-                            for (row, rowid) in
-                                live_insert_rows.iter_mut().zip(inserted_rowids.iter())
-                            {
-                                if row.values.first().is_some_and(|value| value.is_null()) {
-                                    row.values[0] = SqliteValue::Integer(*rowid);
-                                }
-                            }
-                        }
-                        for (row, rowid) in live_insert_rows.iter().zip(inserted_rowids.iter()) {
-                            if let Err(error) = Box::pin(self.fire_after_triggers(
-                                table_name,
-                                &insert_event,
-                                None,
-                                Some(&row.values),
-                                None,
-                                Some(*rowid),
-                            ))
-                            .await
-                            {
-                                self.record_after_trigger_error_state(
-                                    live_insert_rows.len(),
-                                    inserted_rowids.last().copied(),
-                                );
-                                return Err(error);
-                            }
-                        }
-                    }
-
-                    self.record_statement_changes(live_insert_rows.len());
-                    return Ok(Vec::new());
-                }
-
-                // bd-y7old / bd-bwm0x: a DO UPDATE upsert whose single attempted row
-                // conflicts resolves to the UPDATE path. Determine the conflict +
-                // OLD/NEW BEFORE running the VDBE program (which itself does the
-                // insert-or-update), fire the BEFORE UPDATE trigger here, and
-                // remember to fire AFTER UPDATE / suppress AFTER INSERT below. A
-                // non-conflicting row keeps the ordinary insert path unchanged.
-                //
-                // Routing mirrors the VDBE (bd-aap9u/xa2qv): the FIRST ON CONFLICT
-                // clause whose conflict target is violated is the one applied, so
-                // `route_upsert_conflict` walks the clauses in order and returns the
-                // TAKEN clause's SET columns (for `UPDATE OF <col>` matching) plus
-                // its OLD/NEW plan — not always the first DO-UPDATE clause. Returns
-                // None (fall back to VDBE-only triggers) when no clause conflicts, a
-                // DO NOTHING conflict is taken (AFTER INSERT is then suppressed by
-                // the affected==0 path), an indeterminate conflict target is reached
-                // (expression/partial index, or an omitted target on a table without
-                // an INTEGER PRIMARY KEY), or the taken clause's OLD/NEW cannot be
-                // evaluated.
-                let (update_event, has_before_update, has_after_update, upsert_update_plan) =
-                    if upsert_needs_conflict_plan && trigger_new_rows.len() == 1 {
-                        match self
-                            .route_upsert_conflict(insert, &trigger_new_rows[0], params)
-                            .await?
-                        {
-                            Some((event_cols, plan)) => {
-                                let event = fsqlite_ast::TriggerEvent::Update(event_cols);
-                                let hbu = self.has_matching_triggers(
-                                    table_name,
-                                    fsqlite_ast::TriggerTiming::Before,
-                                    &event,
-                                );
-                                let hau = self.has_matching_triggers(
-                                    table_name,
-                                    fsqlite_ast::TriggerTiming::After,
-                                    &event,
-                                );
-                                (event, hbu, hau, Some(plan))
-                            }
-                            None => (
-                                fsqlite_ast::TriggerEvent::Update(Vec::new()),
-                                false,
-                                false,
-                                None,
-                            ),
-                        }
-                    } else {
-                        (
-                            fsqlite_ast::TriggerEvent::Update(Vec::new()),
-                            false,
-                            false,
-                            None,
-                        )
-                    };
-                // A conflict (plan present) always suppresses AFTER INSERT — whether
-                // the DO UPDATE ... WHERE applies (an update) or not (a no-op that
-                // still fired only BEFORE INSERT in stock).
-                let upsert_conflicted = upsert_update_plan.is_some();
-                let upsert_before_update_ignored = if let Some((
-                    rowid,
-                    old_row,
-                    new_row,
-                    where_true,
-                )) = &upsert_update_plan
-                    && *where_true
-                    && has_before_update
-                {
-                    // bd-nn29x: stock runs the DO UPDATE, and so the triggers
-                    // it fires, under ABORT whatever this INSERT's clause is.
-                    let _do_update_clause = DmlConflictClauseGuard::new(
-                        &self.dml_conflict_clause,
-                        Some(fsqlite_ast::ConflictAction::Abort),
-                    );
-                    Box::pin(self.fire_before_triggers(
-                        table_name,
-                        &update_event,
-                        Some(old_row),
-                        Some(new_row),
-                        *rowid,
-                        *rowid,
-                    ))
-                    .await?
-                } else {
-                    false
-                };
-                if upsert_before_update_ignored {
-                    // BEFORE UPDATE raised RAISE(IGNORE): skip this row's update
-                    // entirely (no mutation, no AFTER UPDATE, no AFTER INSERT).
-                    // BEFORE INSERT already fired above.
-                    self.reset_statement_change_count();
-                    return Ok(Vec::new());
-                }
-
-                // Phase 5B.2 (bd-1yi8): INSERT OR REPLACE / INSERT OR IGNORE
-                // routes through VDBE which has UPSERT semantics in the
-                // Insert opcode (table_move_to + delete + insert). The
-                // previous execute_insert_or_conflict fast path read from
-                // MemDatabase directly, which doesn't work now that
-                // write-through stopped syncing inserts to MemDatabase.
-                //
-                // Performance note (bead bd-bldc5.4.3): re-enabling the fast
-                // path requires updating execute_insert_or_conflict to read
-                // from the pager via StorageCursor instead of MemDatabase.
-                // The VDBE path is correct; this is an optimization only.
-
-                let arc_prog;
-                let program: &VdbeProgram = if let Some(p) = precompiled {
-                    p
-                } else {
-                    let plan_span = tracing::span!(
-                        target: "fsqlite.plan",
-                        tracing::Level::TRACE,
-                        "plan",
-                        stage = "compile_table_insert"
-                    );
-                    record_trace_span_created();
-                    let _plan_guard = plan_span.enter();
-                    let sql_text = statement.to_string();
-                    let sql_key = Self::sql_hash(&sql_text);
-                    // A program built from resolved VALUES subqueries holds
-                    // their results for this execution: never reuse it.
-                    let _values_subquery_cache_bypass = insert_values_have_subquery(insert)
-                        .then(|| BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true));
-                    arc_prog = self
-                        .compile_with_cache(sql_key, &sql_text, async |conn| {
-                            conn.compile_table_insert(insert, params).await
-                        })
-                        .await?;
-                    &arc_prog
-                };
-                let runtime_requirements = self.insert_runtime_requirements(insert)?;
-                let (rows, affected, last_insert_rowid) = self
-                    .execute_table_program_with_cx(
-                        program,
-                        params,
-                        true,
-                        runtime_requirements,
-                        cx,
-                        true,
-                    )
-                    .await?;
-
-                // Implicit REPLACE deletes are parent-row deletions for inbound
-                // FK purposes. Enforce their exact OLD rows before child-side
-                // validation and AFTER INSERT processing.
-                Box::pin(self.enforce_fk_on_replace_victims(table_name)).await?;
-
-                // bd-thqgm: FK constraint checking on INSERT.
-                // Skip FK enforcement when no row was written (e.g. an OR IGNORE
-                // PK conflict, affected == 0): SQLite does not FK-check a row it
-                // never inserted (#111).
-                if affected > 0 && self.fk_enforcement_enabled() {
-                    Box::pin(self.enforce_fk_on_insert(insert, table_name, params)).await?;
-                }
-
-                // Patch trigger NEW rows: fill in auto-assigned INTEGER
-                // PRIMARY KEY rowids that were NULL at pre-computation time.
-                if has_after_insert && !trigger_new_rows.is_empty() {
-                    if affected == 0 {
-                        trigger_new_rows.clear();
-                    } else {
-                        let tbl_key = table_name.to_ascii_lowercase();
-                        if let Some(&ipk_idx) = self.rowid_alias_columns.borrow().get(&tbl_key) {
-                            let last_rowid = self.current_last_insert_rowid();
-                            let count = trigger_new_rows.len();
-                            for (i, new_row) in trigger_new_rows.iter_mut().enumerate() {
-                                if ipk_idx < new_row.len() && new_row[ipk_idx] == SqliteValue::Null
-                                {
-                                    #[allow(clippy::cast_possible_wrap)]
-                                    let rowid = last_rowid - (count as i64 - 1) + i as i64;
-                                    new_row[ipk_idx] = SqliteValue::Integer(rowid);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Phase 5G.3: Fire AFTER INSERT triggers.
-                // The direct VDBE INSERT path only reaches here single-row when
-                // triggers are present (multi-row VALUES and INSERT...SELECT are
-                // replayed row-by-row above), so the just-assigned
-                // `last_insert_rowid` is the NEW.rowid for this row. Tables with an
-                // INTEGER PRIMARY KEY carry the rowid in a snapshotted column and
-                // resolve the alias there; passing it additionally is harmless and
-                // makes `NEW.rowid` resolve on tables without an IPK column. (GH #205)
-                // bd-y7old: a conflicting DO UPDATE upsert resolves to the UPDATE
-                // path, so it fires AFTER UPDATE (below) rather than AFTER INSERT.
-                if has_after_insert && !upsert_conflicted {
-                    let after_insert_rowid = self.current_last_insert_rowid();
-                    for new_values in &trigger_new_rows {
-                        if let Err(error) = Box::pin(self.fire_after_triggers(
-                            table_name,
-                            &insert_event,
-                            None,
-                            Some(new_values),
-                            None,
-                            Some(after_insert_rowid),
-                        ))
-                        .await
-                        {
-                            self.record_after_trigger_error_state(affected, last_insert_rowid);
-                            return Err(error);
-                        }
-                    }
-                }
-                // bd-y7old: fire AFTER UPDATE for a conflicting DO UPDATE whose WHERE
-                // applied (the VDBE program performed the update above); a WHERE-false
-                // conflict is a no-op that fires neither AFTER INSERT nor AFTER UPDATE.
-                if let Some((rowid, old_row, new_row, where_true)) = &upsert_update_plan
-                    && *where_true
-                    && has_after_update
-                {
-                    // bd-nn29x: the DO UPDATE's triggers run under ABORT.
-                    let _do_update_clause = DmlConflictClauseGuard::new(
-                        &self.dml_conflict_clause,
-                        Some(fsqlite_ast::ConflictAction::Abort),
-                    );
-                    if let Err(error) = Box::pin(self.fire_after_triggers(
-                        table_name,
-                        &update_event,
-                        Some(old_row),
-                        Some(new_row),
-                        *rowid,
-                        *rowid,
-                    ))
-                    .await
-                    {
-                        self.record_after_trigger_error_state(affected, None);
-                        return Err(error);
-                    }
-                }
-
-                if table_name.eq_ignore_ascii_case("sqlite_sequence") {
-                    Box::pin(self.refresh_sqlite_sequence_cache()).await?;
-                } else {
-                    Box::pin(self.refresh_autoincrement_sequence_after_insert(
-                        table_name,
-                        affected,
-                        last_insert_rowid,
-                    ))
-                    .await?;
-                }
-
-                // 5D.4: Persistence now handled by pager WAL, not compat_persist.
-                self.record_statement_changes(affected);
-                if insert.returning.is_empty() {
-                    Ok(Vec::new())
-                } else {
-                    Ok(rows)
-                }
+                Box::pin(self.execute_insert_dispatch(
+                    cx,
+                    statement,
+                    insert,
+                    params,
+                    precompiled,
+                    None,
+                ))
+                .await
             }
             Statement::Update(update) => {
                 if self.pragma_state.borrow().writable_schema
@@ -44180,7 +43669,7 @@ impl Connection {
         layout: &InsertTargetLayout,
     ) -> String {
         let qualified_table = quote_qualified_name(&insert.table);
-        let placeholders = (1..=layout.table_columns.len()).map(|idx| format!("?{idx}"));
+        let placeholders = (1..=layout.targets.len()).map(|idx| format!("?{idx}"));
         let conflict_clause = match &insert.or_conflict {
             Some(fsqlite_ast::ConflictAction::Replace) => "OR REPLACE ",
             Some(fsqlite_ast::ConflictAction::Ignore) => "OR IGNORE ",
@@ -44259,6 +43748,7 @@ struct InsertSelectReplayEmitter<'conn> {
     has_explicit_columns: bool,
     table_column_count: usize,
     prepared: Option<PreparedStatement<'conn>>,
+    compiled_insert: Option<insert_batch::CompiledInsertReplay>,
     returning_statement: Option<Statement>,
     statement_changes: usize,
     returning_rows: Vec<Row>,
@@ -44272,6 +43762,7 @@ struct InsertSelectReplayEmitter<'conn> {
 impl InsertSelectReplayEmitter<'_> {
     fn record_error_state(&mut self, error: &FrankenError) {
         self.error_state_recorded = true;
+        let current_last_insert_rowid = self.connection.current_last_insert_rowid();
         let preserve_rows = self
             .connection
             .statement_failure_keeps_rows(self.preserve_constraint_failure_rows, error);
@@ -44280,7 +43771,7 @@ impl InsertSelectReplayEmitter<'_> {
                 .set_statement_change_count(self.statement_changes);
             self.connection.record_table_program_error_state(
                 self.statement_changes,
-                (self.statement_changes > 0).then(|| self.connection.current_last_insert_rowid()),
+                Some(current_last_insert_rowid),
             );
         } else if self.connection.internal_statement_savepoint_depth.get() > 0 {
             self.connection.restore_change_tracking_state(
@@ -44288,12 +43779,14 @@ impl InsertSelectReplayEmitter<'_> {
                 self.previous_total_changes,
                 self.connection.current_last_insert_rowid(),
             );
+            self.connection
+                .record_table_program_error_state(0, Some(current_last_insert_rowid));
         } else {
             self.connection
                 .set_statement_change_count(self.statement_changes);
             self.connection.record_table_program_error_state(
                 self.statement_changes,
-                (self.statement_changes > 0).then(|| self.connection.current_last_insert_rowid()),
+                Some(current_last_insert_rowid),
             );
         }
     }
@@ -44321,7 +43814,19 @@ impl InsertSelectReplayEmitter<'_> {
 
         self.connection
             .set_statement_change_count(self.previous_changes);
-        let row_result = if let Some(returning_statement) = self.returning_statement.as_ref() {
+        let row_result = if let Some(plan) = self.compiled_insert.as_ref() {
+            match self
+                .connection
+                .execute_compiled_insert_replay_row(plan, row_values)
+                .await
+            {
+                Ok(outcome) => {
+                    self.returning_rows.extend(outcome.returning_rows);
+                    Ok(outcome.changes)
+                }
+                Err(error) => Err(error),
+            }
+        } else if let Some(returning_statement) = self.returning_statement.as_ref() {
             self.connection
                 .execute_statement_impl_after_background_status(
                     returning_statement,
@@ -46564,12 +46069,15 @@ impl Connection {
             self.with_statement_fk_validation_scope(preserve_constraint_failure_rows, async || {
                 let _fk_parent_validation_cache =
                     self.enter_fk_parent_validation_cache_scope(&insert.table.name);
-                let prepared = if collect_returning {
+                let compiled_insert = self
+                    .prepare_compiled_insert_replay(insert, &insert_sql)
+                    .await?;
+                let prepared = if collect_returning || compiled_insert.is_some() {
                     None
                 } else {
                     Some(self.prepare_after_background_status(&insert_sql).await?)
                 };
-                let returning_statement = if collect_returning {
+                let returning_statement = if collect_returning && compiled_insert.is_none() {
                     Some(parse_single_statement(&insert_sql)?)
                 } else {
                     None
@@ -46581,6 +46089,7 @@ impl Connection {
                     has_explicit_columns,
                     table_column_count,
                     prepared,
+                    compiled_insert,
                     returning_statement,
                     statement_changes: 0,
                     returning_rows: Vec::new(),
@@ -47676,13 +47185,26 @@ impl Connection {
         let rowid_alias_col_idx = table.columns.iter().position(|column| column.is_ipk);
 
         if insert.columns.is_empty() {
-            let targets = (0..table_columns.len()).map(InsertTarget::Column).collect();
+            let targets: Vec<InsertTarget> = table
+                .columns
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, col)| {
+                    col.generated_expr
+                        .is_none()
+                        .then_some(InsertTarget::Column(idx))
+                })
+                .collect();
+            let explicit_rowid_source = targets.iter().rposition(|target| match target {
+                InsertTarget::HiddenRowid => true,
+                InsertTarget::Column(idx) => Some(*idx) == rowid_alias_col_idx,
+            });
             return Ok(InsertTargetLayout {
                 table_columns,
                 default_sqls,
                 targets,
                 rowid_alias_col_idx,
-                explicit_rowid_source: rowid_alias_col_idx,
+                explicit_rowid_source,
             });
         }
 
@@ -52712,7 +52234,11 @@ impl Connection {
         is_xinfo: bool,
     ) -> Vec<Row> {
         let names: Vec<String> = if view.columns.is_empty() {
-            self.select_result_column_names(&view.query, &[], &mut Vec::new())
+            Self::deduplicate_relation_column_names(self.select_result_column_names(
+                &view.query,
+                &[],
+                &mut Vec::new(),
+            ))
         } else {
             view.columns.clone()
         };
@@ -54030,9 +53556,9 @@ impl Connection {
                     })
                     .unwrap_or_else(|_| vec![name.name.clone()]),
             },
-            TableOrSubquery::Subquery { query, .. } => {
-                self.select_result_column_names(query, visible_ctes, active_ctes)
-            }
+            TableOrSubquery::Subquery { query, .. } => Self::deduplicate_relation_column_names(
+                self.select_result_column_names(query, visible_ctes, active_ctes),
+            ),
             TableOrSubquery::TableFunction { name, .. } => self
                 .table_function_result_column_names(name)
                 .unwrap_or_else(|| vec![name.clone()]),
@@ -54159,11 +53685,13 @@ impl Connection {
                 // body's syntactic names, as the CTE branch does, instead of
                 // recursing without end.
                 let Some(_inference) = ViewColumnNameInference::enter(self, i) else {
-                    return infer_select_column_names(&query);
+                    return Self::deduplicate_relation_column_names(infer_select_column_names(
+                        &query,
+                    ));
                 };
-                return with_view_expansion_stack(|| {
+                return Self::deduplicate_relation_column_names(with_view_expansion_stack(|| {
                     self.select_result_column_names(&query, &[], active_ctes)
-                });
+                }));
             }
         }
 
@@ -54183,7 +53711,9 @@ impl Connection {
             .iter()
             .any(|active_name| active_name.eq_ignore_ascii_case(&cte.name))
         {
-            let inferred = infer_select_column_names(&cte.query);
+            let inferred = Self::deduplicate_relation_column_names(infer_select_column_names(
+                &cte.query,
+            ));
             if inferred.is_empty() {
                 return vec!["_c0".to_owned()];
             }
@@ -54191,13 +53721,47 @@ impl Connection {
         }
 
         active_ctes.push(cte.name.clone());
-        let column_names = self.select_result_column_names(&cte.query, visible_ctes, active_ctes);
+        let column_names = Self::deduplicate_relation_column_names(
+            self.select_result_column_names(&cte.query, visible_ctes, active_ctes),
+        );
         active_ctes.pop();
         if column_names.is_empty() {
             vec!["_c0".to_owned()]
         } else {
             column_names
         }
+    }
+
+    /// Rename duplicate column names in a derived relation (view, subquery in
+    /// FROM, CTE without explicit column list) to `name:1`, `name:2`, ... matching
+    /// C SQLite's `sqlite3ColumnsFromExprList` (`bd-073qp`, `bd-84b60`).
+    fn deduplicate_relation_column_names(col_names: Vec<String>) -> Vec<String> {
+        let mut used_names: HashSet<String> = HashSet::with_capacity(col_names.len());
+        col_names
+            .into_iter()
+            .map(|name| {
+                if used_names.insert(name.to_ascii_lowercase()) {
+                    return name;
+                }
+                let base = match name.rfind(':') {
+                    Some(colon)
+                        if colon > 0
+                            && name[colon + 1..].bytes().all(|byte| byte.is_ascii_digit()) =>
+                    {
+                        &name[..colon]
+                    }
+                    _ => name.as_str(),
+                };
+                let mut suffix = 0u32;
+                loop {
+                    suffix += 1;
+                    let candidate = format!("{base}:{suffix}");
+                    if used_names.insert(candidate.to_ascii_lowercase()) {
+                        return candidate;
+                    }
+                }
+            })
+            .collect()
     }
 
     /// Count the number of rows in `table_name` matching an optional WHERE
@@ -66693,28 +66257,59 @@ impl Connection {
                     }
                 }
 
-                // CHECK constraints may not contain a subquery — SQLite rejects
-                // them at CREATE time ("subqueries prohibited in CHECK
-                // constraints"). Validate before allocating any pages so a
-                // rejection leaves no side effects (bd-bkbe6).
+                // CHECK constraints and GENERATED column expressions may not
+                // contain a subquery or reference unknown/prohibited columns
+                // (bd-bkbe6, bd-kn6ah, bd-vtbcf, bd-wt3mn). Validate before
+                // allocating any pages so a rejection leaves no side effects.
+                let declared_col_names: Vec<&str> =
+                    columns.iter().map(|c| c.name.as_str()).collect();
+                let create_table_db = if target_is_temp { "temp" } else { "main" };
                 for col in columns {
                     for c in &col.constraints {
-                        if let ColumnConstraintKind::Check(ref expr) = c.kind
-                            && expr_contains_subquery_match(expr, &mut |_| true)
-                        {
-                            return Err(FrankenError::FunctionError(
-                                "subqueries prohibited in CHECK constraints".to_owned(),
-                            ));
+                        match &c.kind {
+                            ColumnConstraintKind::Check(expr) => {
+                                if expr_contains_subquery_match(expr, &mut |_| true) {
+                                    return Err(FrankenError::FunctionError(
+                                        "subqueries prohibited in CHECK constraints".to_owned(),
+                                    ));
+                                }
+                                validate_check_constraint_expr_columns(
+                                    expr,
+                                    &table_name,
+                                    create.without_rowid,
+                                    &declared_col_names,
+                                )?;
+                            }
+                            ColumnConstraintKind::Generated { expr, .. } => {
+                                if expr_contains_subquery_match(expr, &mut |_| true) {
+                                    return Err(FrankenError::FunctionError(
+                                        "subqueries prohibited in generated columns".to_owned(),
+                                    ));
+                                }
+                                validate_generated_column_expr_columns(
+                                    expr,
+                                    create_table_db,
+                                    &table_name,
+                                    &declared_col_names,
+                                )?;
+                            }
+                            _ => {}
                         }
                     }
                 }
                 for tc in constraints {
-                    if let TableConstraintKind::Check(ref expr) = tc.kind
-                        && expr_contains_subquery_match(expr, &mut |_| true)
-                    {
-                        return Err(FrankenError::FunctionError(
-                            "subqueries prohibited in CHECK constraints".to_owned(),
-                        ));
+                    if let TableConstraintKind::Check(ref expr) = tc.kind {
+                        if expr_contains_subquery_match(expr, &mut |_| true) {
+                            return Err(FrankenError::FunctionError(
+                                "subqueries prohibited in CHECK constraints".to_owned(),
+                            ));
+                        }
+                        validate_check_constraint_expr_columns(
+                            expr,
+                            &table_name,
+                            create.without_rowid,
+                            &declared_col_names,
+                        )?;
                     }
                 }
                 // Derive SQLite's canonical declaration-slot layout once, then
@@ -68358,20 +67953,72 @@ impl Connection {
                         "Cannot add a UNIQUE column".to_owned(),
                     ));
                 }
-                // CHECK constraints may not contain a subquery. CREATE TABLE
-                // already rejects these (bd-bkbe6); ALTER TABLE ADD COLUMN
-                // must too, with C SQLite's alter-scoped message. Persisting
-                // such a CHECK poisons the on-disk schema: stock SQLite
-                // refuses to parse it and the whole file becomes unreadable
-                // ("malformed database schema").
-                for constraint in &col_def.constraints {
-                    if let ColumnConstraintKind::Check(ref expr) = constraint.kind
-                        && expr_contains_subquery_match(expr, &mut |_| true)
+                // CHECK constraints and GENERATED column expressions may not
+                // contain a subquery or reference unknown/prohibited columns.
+                // CREATE TABLE already rejects these (bd-bkbe6, bd-kn6ah,
+                // bd-vtbcf, bd-wt3mn); ALTER TABLE ADD COLUMN must too, with
+                // C SQLite's alter-scoped message. Persisting such a column
+                // poisons the on-disk schema: stock SQLite refuses to parse it
+                // and the whole file becomes unreadable ("malformed database
+                // schema").
+                {
+                    let schema = self.schema.borrow();
+                    if let Some(existing_table) = schema
+                        .iter()
+                        .find(|t| t.name.eq_ignore_ascii_case(table_name))
                     {
-                        return Err(FrankenError::FunctionError(format!(
-                            "error in table {table_name} after add column: \
-                             subqueries prohibited in CHECK constraints"
-                        )));
+                        let mut declared_col_names: Vec<&str> = existing_table
+                            .columns
+                            .iter()
+                            .map(|c| c.name.as_str())
+                            .collect();
+                        declared_col_names.push(col_def.name.as_str());
+                        let alter_table_db = if alters_temp_table { "temp" } else { "main" };
+                        for constraint in &col_def.constraints {
+                            match &constraint.kind {
+                                ColumnConstraintKind::Check(expr) => {
+                                    if expr_contains_subquery_match(expr, &mut |_| true) {
+                                        return Err(FrankenError::FunctionError(format!(
+                                            "error in table {table_name} after add column: \
+                                             subqueries prohibited in CHECK constraints"
+                                        )));
+                                    }
+                                    if let Err(FrankenError::FunctionError(msg)) =
+                                        validate_check_constraint_expr_columns(
+                                            expr,
+                                            &existing_table.name,
+                                            existing_table.without_rowid,
+                                            &declared_col_names,
+                                        )
+                                    {
+                                        return Err(FrankenError::FunctionError(format!(
+                                            "error in table {table_name} after add column: {msg}"
+                                        )));
+                                    }
+                                }
+                                ColumnConstraintKind::Generated { expr, .. } => {
+                                    if expr_contains_subquery_match(expr, &mut |_| true) {
+                                        return Err(FrankenError::FunctionError(format!(
+                                            "error in table {table_name} after add column: \
+                                             subqueries prohibited in generated columns"
+                                        )));
+                                    }
+                                    if let Err(FrankenError::FunctionError(msg)) =
+                                        validate_generated_column_expr_columns(
+                                            expr,
+                                            alter_table_db,
+                                            &existing_table.name,
+                                            &declared_col_names,
+                                        )
+                                    {
+                                        return Err(FrankenError::FunctionError(format!(
+                                            "error in table {table_name} after add column: {msg}"
+                                        )));
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
                     }
                 }
                 let affinity = col_def
@@ -68517,6 +68164,24 @@ impl Connection {
                     }
                     None => SqliteValue::Null,
                 };
+                let added_check_exprs: Vec<String> = column_check_constraints
+                    .iter()
+                    .map(|c| c.expr.clone())
+                    .collect();
+                if !added_check_exprs.is_empty() {
+                    // Settle any pending active-transaction or pager refresh
+                    // BEFORE mutating `self.schema` so the nested validation
+                    // query below does not reload the pre-ALTER `sqlite_master`
+                    // schema over our in-memory column addition (bd-whs71).
+                    let op_cx = self.op_cx_after_background_status();
+                    self.refresh_memdb_from_cached_write_txn_if_stale(&op_cx)
+                        .await?;
+                    if self.committed_pager_refresh_allowed() {
+                        self.refresh_memdb_from_active_txn_if_dirty(&op_cx).await?;
+                        self.refresh_memdb_if_stale(&op_cx).await?;
+                    }
+                    let _ = self.refresh_prepared_schema_state(&op_cx, true).await?;
+                }
                 let mut schema = self.schema.borrow_mut();
                 let table = schema
                     .iter_mut()
@@ -68556,6 +68221,8 @@ impl Connection {
                 };
                 let default_for_existing_rows =
                     raw_default_for_existing_rows.apply_affinity(affinity_char_to_type(affinity));
+                let previous_table_schema =
+                    (!added_check_exprs.is_empty()).then(|| table.clone());
                 let new_column_index = table.columns.len();
                 // ALTER ADD COLUMN cannot add an IPK/UNIQUE; only a column-level
                 // NOT NULL ON CONFLICT clause is meaningful here.
@@ -68615,13 +68282,65 @@ impl Connection {
                 let root_page = table.root_page;
                 let table_clone = table.clone();
                 drop(schema);
-                {
+                let previous_mem_table = {
                     let mut db = self.db.borrow_mut();
+                    let prev = if !added_check_exprs.is_empty() {
+                        db.get_table(root_page).cloned()
+                    } else {
+                        None
+                    };
                     if let Some(mem_table) = db.get_table_mut(root_page) {
                         mem_table.pad_rows_to_column_count(
                             table_clone.columns.len(),
                             &default_for_existing_rows,
                         );
+                    }
+                    prev
+                };
+                // bd-whs71: stock SQLite runs a nested check after adding a
+                // column with a CHECK constraint (`sqlite3AlterFinishAddColumn`)
+                // and aborts with "CHECK constraint failed" if any existing row
+                // violates the new constraint, leaving the schema unchanged.
+                if let Some(prev_schema) = previous_table_schema {
+                    self.rebuild_schema_indices();
+                    self.clear_compilation_reuse_caches();
+                    self.table_execution_metadata_cache.borrow_mut().take();
+                    let schema_prefix = if alters_temp_table { "temp" } else { "main" };
+                    let violation_predicates = added_check_exprs
+                        .iter()
+                        .map(|expr_sql| format!("NOT ({expr_sql})"))
+                        .collect::<Vec<_>>()
+                        .join(" OR ");
+                    let check_sql = format!(
+                        "SELECT 1 FROM {}.{} WHERE {} LIMIT 1",
+                        schema_prefix,
+                        quote_identifier(&table_clone.name),
+                        violation_predicates
+                    );
+                    let check_failed = match self.fk_validation_query(&check_sql, &[]).await {
+                        Ok(rows) => !rows.is_empty(),
+                        Err(_) => true,
+                    };
+                    if check_failed {
+                        if let Some(slot) = self
+                            .schema
+                            .borrow_mut()
+                            .iter_mut()
+                            .find(|t| t.name.eq_ignore_ascii_case(&table_clone.name))
+                        {
+                            *slot = prev_schema;
+                        }
+                        if let Some(prev_mem) = previous_mem_table
+                            && let Some(mem_slot) = self.db.borrow_mut().get_table_mut(root_page)
+                        {
+                            *mem_slot = prev_mem;
+                        }
+                        self.rebuild_schema_indices();
+                        self.clear_compilation_reuse_caches();
+                        self.table_execution_metadata_cache.borrow_mut().take();
+                        return Err(FrankenError::FunctionError(
+                            "CHECK constraint failed".to_owned(),
+                        ));
                     }
                 }
                 table_clone
@@ -70738,6 +70457,24 @@ impl Connection {
             }
         }
 
+        // bd-kld68: virtual tables and views cannot be indexed; report stock SQLite's
+        // exact error messages before checking the ordinary table catalog.
+        if self.table_name_is_virtual(table_name) {
+            return Err(FrankenError::FunctionError(
+                "virtual tables may not be indexed".to_owned(),
+            ));
+        }
+        if self
+            .views
+            .borrow()
+            .iter()
+            .any(|v| v.name.eq_ignore_ascii_case(table_name))
+        {
+            return Err(FrankenError::FunctionError(
+                "views may not be indexed".to_owned(),
+            ));
+        }
+
         // Phase 1: Validate schema (with borrow)
         {
             let schema = self.schema.borrow();
@@ -71197,6 +70934,11 @@ impl Connection {
         stmt: &fsqlite_ast::CreateTriggerStatement,
     ) -> Result<()> {
         let trigger_name = &stmt.name.name;
+        if stmt.temporary && stmt.name.schema.is_some() {
+            return Err(FrankenError::FunctionError(
+                "temporary trigger may not have qualified name".to_owned(),
+            ));
+        }
         // Stock reserves "sqlite_"-prefixed object names for internal use.
         // bd-errmsg-parity-batch2-g8v6e.
         if trigger_name.len() >= 7 && trigger_name.as_bytes()[..7].eq_ignore_ascii_case(b"sqlite_")
@@ -71206,9 +70948,96 @@ impl Connection {
             )));
         }
         let table_name = &stmt.table;
+        let temp_target_exists = self.table_exists_for_scope(table_name, PragmaSchemaScope::Temp)
+            || self
+                .view_index_for_scope(table_name, PragmaSchemaScope::Temp)
+                .is_some();
+        let is_temp_trigger = stmt.temporary
+            || stmt
+                .name
+                .schema
+                .as_deref()
+                .is_some_and(|s| s.eq_ignore_ascii_case("temp"))
+            || (stmt.name.schema.is_none()
+                && temp_target_exists
+                && stmt
+                    .table_schema
+                    .as_deref()
+                    .is_none_or(|s| s.eq_ignore_ascii_case("temp")));
 
-        let table_exists = self.schema_index_of(table_name).is_some();
-        let view_exists = self.view_index_of(table_name).is_some();
+        let (table_exists, view_exists, missing_table_label) = if is_temp_trigger {
+            match stmt.table_schema.as_deref() {
+                None => {
+                    let mut tbl = self.schema_index_of(table_name).is_some();
+                    let mut vw = self.view_index_of(table_name).is_some();
+                    if !tbl && !vw {
+                        let attached_names: Vec<String> = self
+                            .attached_schemas
+                            .borrow()
+                            .all_schemas()
+                            .into_iter()
+                            .filter(|schema| !is_builtin_schema(schema))
+                            .map(str::to_owned)
+                            .collect();
+                        for schema in attached_names {
+                            let (at, av) = self.with_attached_connection(&schema, |conn| {
+                                Ok((
+                                    conn.schema_index_of(table_name).is_some(),
+                                    conn.view_index_of(table_name).is_some(),
+                                ))
+                            })?;
+                            if at || av {
+                                tbl = at;
+                                vw = av;
+                                break;
+                            }
+                        }
+                    }
+                    (tbl, vw, table_name.clone())
+                }
+                Some(ts) if ts.eq_ignore_ascii_case("temp") => (
+                    self.table_exists_for_scope(table_name, PragmaSchemaScope::Temp),
+                    self.view_index_for_scope(table_name, PragmaSchemaScope::Temp)
+                        .is_some(),
+                    format!("{ts}.{table_name}"),
+                ),
+                Some(ts) if ts.eq_ignore_ascii_case("main") => (
+                    self.table_exists_for_scope(table_name, PragmaSchemaScope::Main),
+                    self.view_index_for_scope(table_name, PragmaSchemaScope::Main)
+                        .is_some(),
+                    format!("{ts}.{table_name}"),
+                ),
+                Some(ts) => {
+                    let has_attached = self.attached_schemas.borrow().find(ts).is_some();
+                    let (tbl, vw) = if has_attached {
+                        self.with_attached_connection(ts, |conn| {
+                            Ok((
+                                conn.schema_index_of(table_name).is_some(),
+                                conn.view_index_of(table_name).is_some(),
+                            ))
+                        })?
+                    } else {
+                        (false, false)
+                    };
+                    (tbl, vw, format!("{ts}.{table_name}"))
+                }
+            }
+        } else {
+            let trigger_db = stmt.name.schema.as_deref().unwrap_or("main");
+            if let Some(table_schema) = stmt.table_schema.as_deref()
+                && !table_schema.eq_ignore_ascii_case(trigger_db)
+            {
+                return Err(FrankenError::FunctionError(format!(
+                    "trigger {trigger_name} cannot reference objects in database {table_schema}"
+                )));
+            }
+            (
+                self.table_exists_for_scope(table_name, PragmaSchemaScope::Main),
+                self.view_index_for_scope(table_name, PragmaSchemaScope::Main)
+                    .is_some(),
+                format!("{trigger_db}.{table_name}"),
+            )
+        };
         // INSTEAD OF triggers attach to a VIEW (making it writable); BEFORE/AFTER
         // triggers attach to a base table. bd-ffkpv.
         if stmt.timing == fsqlite_ast::TriggerTiming::InsteadOf {
@@ -71219,11 +71048,7 @@ impl Connection {
             }
             if !view_exists {
                 return Err(FrankenError::NoSuchTable {
-                    name: format!(
-                        "{}.{}",
-                        stmt.name.schema.as_deref().unwrap_or("main"),
-                        table_name
-                    ),
+                    name: missing_table_label,
                 });
             }
         } else {
@@ -71240,11 +71065,7 @@ impl Connection {
             }
             if !table_exists {
                 return Err(FrankenError::NoSuchTable {
-                    name: format!(
-                        "{}.{}",
-                        stmt.name.schema.as_deref().unwrap_or("main"),
-                        table_name
-                    ),
+                    name: missing_table_label,
                 });
             }
         }
@@ -71280,13 +71101,13 @@ impl Connection {
                 stored_stmt.temporary = false;
                 stored_stmt.to_string()
             });
-        self.triggers
-            .borrow_mut()
-            .push(TriggerDef::from_create_statement(stmt, create_sql.clone()));
+        let mut trigger_def = TriggerDef::from_create_statement(stmt, create_sql.clone());
+        trigger_def.temporary = is_temp_trigger;
+        self.triggers.borrow_mut().push(trigger_def);
         self.rebuild_schema_indices();
 
         // TEMP triggers are connection-local and not persisted to sqlite_master.
-        if !stmt.temporary {
+        if !is_temp_trigger {
             self.insert_sqlite_master_row("trigger", trigger_name, table_name, 0, &create_sql)
                 .await?;
         }
@@ -72162,7 +71983,7 @@ impl Connection {
         &self,
         target_table: &str,
     ) -> Option<FkParentValidationCacheScope<'_>> {
-        if !self.fk_enforcement_enabled() {
+        if !self.fk_enforcement_enabled() || self.fk_cascade_depth.get() > 0 {
             return None;
         }
         let previous = self
@@ -72189,7 +72010,10 @@ impl Connection {
     /// every transaction boundary and on every statement that could remove or
     /// alter a parent row (see `clear_fk_parent_validation_cache` call sites).
     fn ensure_fk_parent_validation_cache(&self) {
-        if !self.fk_enforcement_enabled() || !self.in_transaction.get() {
+        if !self.fk_enforcement_enabled()
+            || self.fk_cascade_depth.get() > 0
+            || !self.in_transaction.get()
+        {
             return;
         }
         if self.fk_parent_validation_cache.borrow().is_some() {
@@ -72586,19 +72410,32 @@ impl Connection {
             }
 
             // Check if any child rows reference this parent row.
+            // bd-01rla: when `plan_fk_on_delete` runs BEFORE the parent row is
+            // physically removed, a self-referencing row (`child_table ==
+            // table_name` whose own FK child columns match its parent key) will
+            // still appear in the table scan. Deleting a row that only
+            // references itself does not leave any surviving child orphaned, so
+            // require at least 2 matching rows in that case.
+            let self_references_deleted_row = child_table.eq_ignore_ascii_case(table_name)
+                && fk
+                    .child_columns
+                    .iter()
+                    .zip(&parent_values)
+                    .all(|(&idx, pv)| row_values.get(idx) == Some(pv));
+            let min_matching_rows = if self_references_deleted_row { 2 } else { 1 };
             let where_parts: Vec<String> = child_col_names
                 .iter()
                 .enumerate()
                 .map(|(i, col)| format!("{} = ?{}", quote_identifier(col), i + 1))
                 .collect();
             let sql = format!(
-                "SELECT 1 FROM {} WHERE {} LIMIT 1",
+                "SELECT 1 FROM {} WHERE {} LIMIT {min_matching_rows}",
                 quote_identifier(child_table),
                 where_parts.join(" AND ")
             );
             // bd-issue59: Use fk_validation_query for consistent FK checking.
             let rows = self.fk_validation_query(&sql, &parent_values).await?;
-            if !rows.is_empty() {
+            if rows.len() >= min_matching_rows {
                 // Children exist — action depends on ON DELETE clause.
                 match fk.on_delete {
                     FkActionType::Cascade => {
@@ -73065,19 +72902,44 @@ impl Connection {
                 continue;
             }
 
+            // bd-01rla: `check_fk_on_update` runs BEFORE the parent row is
+            // updated in storage. For a self-referential FK (`child_table ==
+            // table_name`), if the old row referenced its own parent key and the
+            // updated row no longer references `old_parent_vals`, the old copy
+            // of the row still sitting in storage is not a surviving dependent
+            // child — require at least 2 matching rows before triggering
+            // RESTRICT / NO ACTION / CASCADE / SET NULL / SET DEFAULT.
+            let old_row_matched_self = child_table.eq_ignore_ascii_case(table_name)
+                && fk
+                    .child_columns
+                    .iter()
+                    .zip(&old_parent_vals)
+                    .all(|(&idx, pv)| old_values.get(idx) == Some(pv));
+            let new_row_still_matches_old_parent = child_table.eq_ignore_ascii_case(table_name)
+                && fk
+                    .child_columns
+                    .iter()
+                    .zip(&old_parent_vals)
+                    .all(|(&idx, pv)| new_values.get(idx) == Some(pv));
+            let min_matching_rows =
+                if old_row_matched_self && !new_row_still_matches_old_parent {
+                    2
+                } else {
+                    1
+                };
             let where_parts: Vec<String> = child_col_names
                 .iter()
                 .enumerate()
                 .map(|(i, col)| format!("{} = ?{}", quote_identifier(col), i + 1))
                 .collect();
             let sql = format!(
-                "SELECT 1 FROM {} WHERE {} LIMIT 1",
+                "SELECT 1 FROM {} WHERE {} LIMIT {min_matching_rows}",
                 quote_identifier(child_table),
                 where_parts.join(" AND ")
             );
             // bd-issue59: Use fk_validation_query for consistent FK checking.
             let rows = self.fk_validation_query(&sql, &old_parent_vals).await?;
-            if !rows.is_empty() {
+            if rows.len() >= min_matching_rows {
                 match fk.on_update {
                     fsqlite_vdbe::codegen::FkActionType::Cascade => {
                         result_actions.push(FkUpdateAction::Cascade {
@@ -74939,11 +74801,11 @@ impl Connection {
                     // while expanding `*`, yielding column metadata that does
                     // not match the rows produced below.
                     let inferred_col_names = view.columns.is_empty().then(|| {
-                        self.select_result_column_names(
+                        Self::deduplicate_relation_column_names(self.select_result_column_names(
                             &executable_view_query,
                             &[],
                             &mut Vec::new(),
-                        )
+                        ))
                     });
                     let view_rows = ViewBodyExecution {
                         statement: self
@@ -76864,6 +76726,11 @@ impl Connection {
         // Stock SQLite applies the busy handler during COMMIT lock escalation,
         // not just at BEGIN time. We mirror that by retrying on Busy with the
         // same spin-loop backoff used in begin_pager_txn_with_busy_timeout().
+        // Sample after all deferred writes/FK/vtab synchronization, before the
+        // original physical commit empties its pending surface. This local
+        // receipt cannot survive as stale Connection state after rollback or
+        // an abandoned future. The original MVCC, retry, settlement and
+        // attached-participant finalizers below remain untouched.
         let (committed_write, post_durable_commit_error) = {
             // Issue #115: the concurrent-commit publication must be a single
             // critical section spanning FCW/SSI validate → physical pager write
@@ -83000,7 +82867,9 @@ impl Connection {
                         continue;
                     };
                     let pk_name = format!("sqlite_autoindex_{}_{pk_ordinal}", table.name);
-                    if !pk_name.eq_ignore_ascii_case(&index_name) {
+                    if !pk_name.eq_ignore_ascii_case(&index_name)
+                        && !table.name.eq_ignore_ascii_case(&index_name)
+                    {
                         continue;
                     }
                     // PK columns (in declaration order) resolved to storage cids.
@@ -86771,52 +86640,86 @@ impl Connection {
     /// the FILTER rejects every row (stock keeps the group's first row).
     async fn join_minmax_bare_extremum_index(
         &self,
-        tracking: &(bool, Expr, Option<Expr>),
+        tracking: &(bool, Expr, Option<Expr>, bool),
         group_rows: &[Vec<SqliteValue>],
         col_map: &[(String, String, bool)],
         using_skip: Option<&HashSet<usize>>,
         coll_snap: &CollationRegistry,
     ) -> Result<Option<usize>> {
-        let (is_max, arg, filter) = tracking;
+        let (is_max, arg, filter, is_distinct) = tracking;
         let collation = join_expr_effective_collation(arg, col_map);
-        let mut best: Option<(usize, SqliteValue)> = None;
-        let mut null_row = None;
+        let mut best: Option<SqliteValue> = None;
+        let mut seen_distinct: Vec<SqliteValue> = Vec::new();
+        let mut reg_hit = false;
+        let mut bare_row = None;
         for (index, row) in group_rows.iter().enumerate() {
+            if filter.is_some() {
+                reg_hit = index > 0;
+            }
             if let Some(filter) = filter {
                 let keep = self
                     .eval_row_expr_allowing_subqueries_with_using(filter, row, col_map, using_skip)
                     .await?;
                 if !is_sqlite_truthy(&keep) {
+                    if !reg_hit {
+                        bare_row = Some(index);
+                    }
                     continue;
                 }
             }
             let value = self
                 .eval_row_expr_allowing_subqueries_with_using(arg, row, col_map, using_skip)
                 .await?;
-            if value.is_null() {
-                if best.is_none() {
-                    null_row = Some(index);
-                }
-                continue;
-            }
-            let replace = best.as_ref().is_none_or(|(_, best_value)| {
-                let ordering = cmp_sqlite_values_collated_snapshot(
-                    &value,
-                    best_value,
-                    collation.as_deref(),
-                    coll_snap,
-                );
-                if *is_max {
-                    ordering == std::cmp::Ordering::Greater
+            if *is_distinct {
+                let is_dup = if value.is_null() {
+                    seen_distinct.iter().any(SqliteValue::is_null)
                 } else {
-                    ordering == std::cmp::Ordering::Less
+                    seen_distinct.iter().any(|prev| {
+                        !prev.is_null()
+                            && cmp_sqlite_values_collated_snapshot(
+                                prev,
+                                &value,
+                                collation.as_deref(),
+                                coll_snap,
+                            ) == std::cmp::Ordering::Equal
+                    })
+                };
+                if is_dup {
+                    if !reg_hit {
+                        bare_row = Some(index);
+                    }
+                    continue;
                 }
-            });
-            if replace {
-                best = Some((index, value));
+                seen_distinct.push(value.clone());
+            }
+            if value.is_null() {
+                reg_hit = best.is_some();
+            } else {
+                let replace = best.as_ref().is_none_or(|best_value| {
+                    let ordering = cmp_sqlite_values_collated_snapshot(
+                        &value,
+                        best_value,
+                        collation.as_deref(),
+                        coll_snap,
+                    );
+                    if *is_max {
+                        ordering == std::cmp::Ordering::Greater
+                    } else {
+                        ordering == std::cmp::Ordering::Less
+                    }
+                });
+                if replace {
+                    best = Some(value);
+                    reg_hit = false;
+                } else {
+                    reg_hit = true;
+                }
+            }
+            if !reg_hit {
+                bare_row = Some(index);
             }
         }
-        Ok(best.map(|(index, _)| index).or(null_row))
+        Ok(bare_row)
     }
 
     /// Stable-reorder the materialized rows of a GROUP BY + JOIN so that, within
@@ -92205,8 +92108,12 @@ impl Connection {
             // argument or FILTER again while computing the aggregate would
             // duplicate UDF side effects and could choose a bare row that does
             // not correspond to the reported value.
-            let minmax_cache = if let Some((is_max, tracked_arg, tracked_filter)) =
-                &minmax_bare_tracking
+            let minmax_cache = if let Some((
+                is_max,
+                tracked_arg,
+                tracked_filter,
+                tracked_distinct,
+            )) = &minmax_bare_tracking
             {
                 let expected_name = if *is_max { "max" } else { "min" };
                 // bd-89z48: the tracked argument's EFFECTIVE collation — an
@@ -92259,18 +92166,23 @@ impl Connection {
                         )
                     });
 
-                let mut best: Option<(&Vec<SqliteValue>, usize)> = None;
-                // Stock's minmaxStep loads the bare columns from a NULL row
-                // until the first non-NULL value appears, so an all-NULL group
-                // reports its last (FILTER-passing) row.
-                let mut null_row: Option<&Vec<SqliteValue>> = None;
+                let mut best_index: Option<usize> = None;
+                let mut seen_distinct: Vec<SqliteValue> = Vec::new();
+                let mut reg_hit = false;
+                let mut bare_row: Option<&Vec<SqliteValue>> = None;
                 let mut aggregate_values = Vec::with_capacity(group_rows.len());
-                for row in group_rows {
+                for (row_idx, row) in group_rows.iter().enumerate() {
+                    if filter.is_some() {
+                        reg_hit = row_idx > 0;
+                    }
                     if let Some(filter_expr) = filter {
                         let filter_value = self
                             .eval_row_expr_allowing_subqueries(filter_expr, row, &col_map)
                             .await?;
                         if !is_sqlite_truthy(&filter_value) {
+                            if !reg_hit {
+                                bare_row = Some(row);
+                            }
                             continue;
                         }
                     }
@@ -92282,35 +92194,59 @@ impl Connection {
                     } else {
                         SqliteValue::Null
                     };
-                    if value.is_null() {
-                        if best.is_none() {
-                            null_row = Some(row);
-                        }
-                        continue;
-                    }
-                    let replace = best.as_ref().is_none_or(|(_, best_index)| {
-                        let ordering = cmp_sqlite_values_collated_snapshot(
-                            &value,
-                            &aggregate_values[*best_index],
-                            collation,
-                            &coll_snap,
-                        );
-                        if *is_max {
-                            ordering == std::cmp::Ordering::Greater
+                    if *tracked_distinct {
+                        let is_dup = if value.is_null() {
+                            seen_distinct.iter().any(SqliteValue::is_null)
                         } else {
-                            ordering == std::cmp::Ordering::Less
+                            seen_distinct.iter().any(|prev| {
+                                !prev.is_null()
+                                    && cmp_sqlite_values_collated_snapshot(
+                                        prev,
+                                        &value,
+                                        collation,
+                                        &coll_snap,
+                                    ) == std::cmp::Ordering::Equal
+                            })
+                        };
+                        if is_dup {
+                            if !reg_hit {
+                                bare_row = Some(row);
+                            }
+                            continue;
                         }
-                    });
-                    aggregate_values.push(value);
-                    if replace {
-                        best = Some((row, aggregate_values.len() - 1));
+                        seen_distinct.push(value.clone());
+                    }
+                    if value.is_null() {
+                        reg_hit = best_index.is_some();
+                    } else {
+                        let replace = best_index.is_none_or(|best_idx| {
+                            let ordering = cmp_sqlite_values_collated_snapshot(
+                                &value,
+                                &aggregate_values[best_idx],
+                                collation,
+                                &coll_snap,
+                            );
+                            if *is_max {
+                                ordering == std::cmp::Ordering::Greater
+                            } else {
+                                ordering == std::cmp::Ordering::Less
+                            }
+                        });
+                        aggregate_values.push(value);
+                        if replace {
+                            best_index = Some(aggregate_values.len() - 1);
+                            reg_hit = false;
+                        } else {
+                            reg_hit = true;
+                        }
+                    }
+                    if !reg_hit {
+                        bare_row = Some(row);
                     }
                 }
                 Some((
                     descriptor_index,
-                    best.map(|(row, _)| row)
-                        .or(null_row)
-                        .or_else(|| group_rows.first()),
+                    bare_row.or_else(|| group_rows.first()),
                     aggregate_values,
                 ))
             } else {
@@ -98749,10 +98685,8 @@ impl Connection {
                         ))
                     }
                     TableOrSubquery::Subquery { query, alias } => {
-                        let col_names = self.select_result_column_names(
-                            query,
-                            &visible_ctes,
-                            &mut Vec::new(),
+                        let col_names = Self::deduplicate_relation_column_names(
+                            self.select_result_column_names(query, &visible_ctes, &mut Vec::new()),
                         );
                         let label = alias.clone().unwrap_or_else(|| "subquery".to_owned());
                         Ok((
@@ -98840,8 +98774,9 @@ impl Connection {
                             .await?;
                         let row_data: Vec<Vec<SqliteValue>> =
                             rows.iter().map(|r| r.values().to_vec()).collect();
-                        let resolved =
-                            self.select_result_column_names(query, &visible_ctes, &mut Vec::new());
+                        let resolved = Self::deduplicate_relation_column_names(
+                            self.select_result_column_names(query, &visible_ctes, &mut Vec::new()),
+                        );
                         if !resolved.is_empty() {
                             table_sources[i].col_names = resolved;
                         } else {
@@ -106328,6 +106263,8 @@ impl<'a> CteResultMetadataResolver<'a> {
         self.active.remove(&key);
         if !cte.columns.is_empty() {
             metadata.names.clone_from(&cte.columns);
+        } else {
+            metadata.names = Connection::deduplicate_relation_column_names(metadata.names);
         }
         metadata.columns.resize(
             metadata.names.len(),
@@ -106350,7 +106287,9 @@ impl<'a> CteResultMetadataResolver<'a> {
         };
         if !self.active_views.borrow_mut().insert(view_index) {
             let names = if view.columns.is_empty() {
-                infer_select_column_names(&view.query)
+                Connection::deduplicate_relation_column_names(infer_select_column_names(
+                    &view.query,
+                ))
             } else {
                 view.columns
             };
@@ -106379,6 +106318,8 @@ impl<'a> CteResultMetadataResolver<'a> {
         });
         if !view.columns.is_empty() {
             metadata.names = view.columns;
+        } else {
+            metadata.names = Connection::deduplicate_relation_column_names(metadata.names);
         }
         metadata.columns.resize(
             metadata.names.len(),
@@ -118966,6 +118907,214 @@ fn expr_contains_subquery_match(
     }
 }
 
+fn visit_expr_column_refs(
+    expr: &Expr,
+    visitor: &mut impl FnMut(&fsqlite_ast::ColumnRef) -> Result<()>,
+) -> Result<()> {
+    match expr {
+        Expr::Column(col_ref, _) => visitor(col_ref),
+        Expr::BoundOuterValue { .. }
+        | Expr::Literal(_, _)
+        | Expr::Raise { .. }
+        | Expr::Placeholder(_, _)
+        | Expr::Subquery(_, _)
+        | Expr::Exists { .. } => Ok(()),
+        Expr::BinaryOp { left, right, .. }
+        | Expr::JsonAccess {
+            expr: left,
+            path: right,
+            ..
+        } => {
+            visit_expr_column_refs(left, visitor)?;
+            visit_expr_column_refs(right, visitor)
+        }
+        Expr::UnaryOp { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::Collate { expr, .. } => visit_expr_column_refs(expr, visitor),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            visit_expr_column_refs(expr, visitor)?;
+            visit_expr_column_refs(low, visitor)?;
+            visit_expr_column_refs(high, visitor)
+        }
+        Expr::In { expr, set, .. } => {
+            visit_expr_column_refs(expr, visitor)?;
+            match set {
+                InSet::List(exprs) => {
+                    for item in exprs {
+                        visit_expr_column_refs(item, visitor)?;
+                    }
+                    Ok(())
+                }
+                InSet::Subquery(_) | InSet::Table(_) => Ok(()),
+            }
+        }
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
+            visit_expr_column_refs(expr, visitor)?;
+            visit_expr_column_refs(pattern, visitor)?;
+            if let Some(inner) = escape {
+                visit_expr_column_refs(inner, visitor)?;
+            }
+            Ok(())
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_expr,
+            ..
+        } => {
+            if let Some(inner) = operand {
+                visit_expr_column_refs(inner, visitor)?;
+            }
+            for (when_expr, then_expr) in whens {
+                visit_expr_column_refs(when_expr, visitor)?;
+                visit_expr_column_refs(then_expr, visitor)?;
+            }
+            if let Some(inner) = else_expr {
+                visit_expr_column_refs(inner, visitor)?;
+            }
+            Ok(())
+        }
+        Expr::FunctionCall {
+            args,
+            order_by,
+            filter,
+            over,
+            ..
+        } => {
+            if let FunctionArgs::List(exprs) = args {
+                for inner in exprs {
+                    visit_expr_column_refs(inner, visitor)?;
+                }
+            }
+            for term in order_by {
+                visit_expr_column_refs(&term.expr, visitor)?;
+            }
+            if let Some(inner) = filter {
+                visit_expr_column_refs(inner, visitor)?;
+            }
+            if let Some(window) = over {
+                for part in &window.partition_by {
+                    visit_expr_column_refs(part, visitor)?;
+                }
+                for term in &window.order_by {
+                    visit_expr_column_refs(&term.expr, visitor)?;
+                }
+                if let Some(frame) = &window.frame {
+                    if let FrameBound::Preceding(inner) | FrameBound::Following(inner) =
+                        &frame.start
+                    {
+                        visit_expr_column_refs(inner, visitor)?;
+                    }
+                    if let Some(FrameBound::Preceding(inner) | FrameBound::Following(inner)) =
+                        frame.end.as_ref()
+                    {
+                        visit_expr_column_refs(inner, visitor)?;
+                    }
+                }
+            }
+            Ok(())
+        }
+        Expr::RowValue(values, _) => {
+            for value in values {
+                visit_expr_column_refs(value, visitor)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Validate column references in a GENERATED ALWAYS AS expression (`NC_GenCol`
+/// in SQLite's `resolve.c`, bd-kn6ah + bd-vtbcf):
+/// - Rowid aliases (`rowid`, `_rowid_`, `oid`) are never bound unless the table
+///   explicitly declares a column with that name.
+/// - If a reference resolves to a declared column of `(table_db, table_name)`
+///   but used a table/schema qualifier (`t.col` or `main.t.col`), reject with
+///   `"the \".\" operator prohibited in generated columns"`.
+/// - Otherwise reject with `"no such column: <qualified-name>"`.
+fn validate_generated_column_expr_columns(
+    expr: &Expr,
+    table_db: &str,
+    table_name: &str,
+    column_names: &[&str],
+) -> Result<()> {
+    visit_expr_column_refs(expr, &mut |col_ref| {
+        let col_exists = column_names
+            .iter()
+            .any(|col| col.eq_ignore_ascii_case(&col_ref.column));
+        let db_matches = col_ref
+            .schema
+            .as_deref()
+            .is_none_or(|schema| schema.eq_ignore_ascii_case(table_db));
+        let table_matches = col_ref
+            .table
+            .as_deref()
+            .is_none_or(|table| table.eq_ignore_ascii_case(table_name));
+        if col_exists && db_matches && table_matches {
+            if col_ref.table.is_some() {
+                return Err(FrankenError::FunctionError(
+                    "the \".\" operator prohibited in generated columns".to_owned(),
+                ));
+            }
+            Ok(())
+        } else {
+            let missing = match (&col_ref.schema, &col_ref.table) {
+                (Some(schema), Some(table)) => format!("{schema}.{table}.{}", col_ref.column),
+                (None, Some(table)) => format!("{table}.{}", col_ref.column),
+                _ => col_ref.column.to_string(),
+            };
+            Err(FrankenError::FunctionError(format!(
+                "no such column: {missing}"
+            )))
+        }
+    })
+}
+
+/// Validate column references in a CHECK constraint expression (`NC_IsCheck`
+/// in SQLite's `resolve.c`, bd-wt3mn):
+/// - Only declared columns of `table_name` (plus `rowid`, `_rowid_`, `oid` when
+///   `!without_rowid`) are valid.
+/// - Any table qualifier must match `table_name` (case-insensitively).
+fn validate_check_constraint_expr_columns(
+    expr: &Expr,
+    table_name: &str,
+    without_rowid: bool,
+    column_names: &[&str],
+) -> Result<()> {
+    visit_expr_column_refs(expr, &mut |col_ref| {
+        let table_matches = col_ref
+            .table
+            .as_deref()
+            .is_none_or(|table| table.eq_ignore_ascii_case(table_name));
+        let is_rowid_alias = !without_rowid
+            && ["rowid", "_rowid_", "oid"]
+                .iter()
+                .any(|alias| alias.eq_ignore_ascii_case(&col_ref.column));
+        let col_exists = column_names
+            .iter()
+            .any(|col| col.eq_ignore_ascii_case(&col_ref.column))
+            || is_rowid_alias;
+        if table_matches && col_exists {
+            Ok(())
+        } else {
+            let missing = match &col_ref.table {
+                Some(table) => format!("{table}.{}", col_ref.column),
+                None => col_ref.column.to_string(),
+            };
+            Err(FrankenError::FunctionError(format!(
+                "no such column: {missing}"
+            )))
+        }
+    })
+}
+
 /// Mirror the native IN-probe expression boundary in `fsqlite-vdbe`.
 ///
 /// These nodes need connection-level semantic evaluation: native probing
@@ -128964,6 +129113,7 @@ fn render_create_trigger_sql(trigger: &TriggerDef) -> String {
         name: QualifiedName::bare(trigger.name.clone()),
         timing: trigger.timing,
         event: trigger.event.clone(),
+        table_schema: None,
         table: trigger.table_name.clone(),
         for_each_row: trigger.for_each_row,
         when: trigger.when_clause.clone(),
@@ -155431,7 +155581,7 @@ fn with_current_fts5_aux_context<T>(f: impl FnOnce(Option<&Fts5AuxContext>) -> T
 }
 
 #[derive(Clone)]
-struct JoinUsingProjection {
+pub(crate) struct JoinUsingProjection {
     /// Source slots in left-to-right COALESCE order. INNER/LEFT retain the
     /// prior projection, RIGHT replaces it, and FULL appends the right slot.
     value_indices: SmallVec<[usize; 4]>,
@@ -155471,28 +155621,28 @@ fn join_star_column_value(
 }
 
 #[derive(Clone)]
-struct JoinEvalCollationContext {
+pub(crate) struct JoinEvalCollationContext {
     /// Columns with declared BLOB affinity, unlike computed columns (which the
     /// affinity vector also reports as BLOB): built-in JSON keys and, on the
     /// main join path, typeless base-table columns.
-    declared_json_keys: HashSet<usize>,
-    column_collations: Vec<Option<String>>,
-    column_affinities: Vec<TypeAffinity>,
+    pub(crate) declared_json_keys: HashSet<usize>,
+    pub(crate) column_collations: Vec<Option<String>>,
+    pub(crate) column_affinities: Vec<TypeAffinity>,
     /// Compact, non-overridable runtime projections for unqualified columns
     /// coalesced by USING/NATURAL. This avoids both user-function hijacking and
     /// exponential AST cloning in chains of FULL joins.
-    using_column_projections: HashMap<String, JoinUsingProjection>,
-    registry: CollationRegistry,
+    pub(crate) using_column_projections: HashMap<String, JoinUsingProjection>,
+    pub(crate) registry: CollationRegistry,
 }
 
 thread_local! {
     static CURRENT_JOIN_EVAL_COLLATION_CONTEXT: RefCell<Vec<Arc<JoinEvalCollationContext>>> = const { RefCell::new(Vec::new()) };
 }
 
-struct JoinEvalCollationContextGuard;
+pub(crate) struct JoinEvalCollationContextGuard;
 
 impl JoinEvalCollationContextGuard {
-    fn push(context: JoinEvalCollationContext) -> Self {
+    pub(crate) fn push(context: JoinEvalCollationContext) -> Self {
         Self::push_shared(Arc::new(context))
     }
 
@@ -159763,9 +159913,9 @@ fn find_col_in_map(
     using_skip_indices: Option<&HashSet<usize>>,
 ) -> Result<usize> {
     if let Some(prefix) = table_prefix {
-        // Qualified: match table label + column name.
-        if let Some(idx) = col_map.iter().position(|(tbl, col, _)| {
-            tbl.eq_ignore_ascii_case(prefix) && col.eq_ignore_ascii_case(col_name)
+        // Qualified: match table label + declared column name first.
+        if let Some(idx) = col_map.iter().position(|(tbl, col, hidden)| {
+            !*hidden && tbl.eq_ignore_ascii_case(prefix) && col.eq_ignore_ascii_case(col_name)
         }) {
             return Ok(idx);
         }
@@ -159780,11 +159930,13 @@ fn find_col_in_map(
             "column not found: {prefix}.{col_name}"
         )))
     } else {
-        // Unqualified: find all matches, ignoring skipped USING columns.
+        // Unqualified: find all declared column matches first, ignoring skipped
+        // USING columns and hidden rowid pseudo-columns (bd-257yl: declared
+        // `rowid` columns take precedence over other FROM items' hidden rowids).
         let mut first = None;
         let mut ambiguous = false;
-        for (i, (_, col, _)) in col_map.iter().enumerate() {
-            if using_skip_indices.is_some_and(|s| s.contains(&i)) {
+        for (i, (_, col, hidden)) in col_map.iter().enumerate() {
+            if *hidden || using_skip_indices.is_some_and(|s| s.contains(&i)) {
                 continue;
             }
             if col.eq_ignore_ascii_case(col_name) {

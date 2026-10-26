@@ -1979,7 +1979,13 @@ impl Parser {
         let name = self.parse_identifier()?;
         let type_name = self.try_type_name()?;
         let mut constraints = Vec::new();
-        while let Some(c) = self.try_column_constraint()? {
+        let mut active_constraint_name: Option<String> = None;
+        while let Some(mut c) = self.try_column_constraint()? {
+            if c.name.is_some() {
+                active_constraint_name.clone_from(&c.name);
+            } else if active_constraint_name.is_some() {
+                c.name.clone_from(&active_constraint_name);
+            }
             constraints.push(c);
         }
         Ok(ColumnDef {
@@ -2086,11 +2092,10 @@ impl Parser {
     }
 
     fn try_column_constraint(&mut self) -> Result<Option<ColumnConstraint>, ParseError> {
-        let name = if self.eat_kw(&TokenKind::KwConstraint) {
-            Some(self.parse_identifier()?)
-        } else {
-            None
-        };
+        let mut name = None;
+        while self.eat_kw(&TokenKind::KwConstraint) {
+            name = Some(self.parse_identifier()?);
+        }
         let kind = if self.eat_kw(&TokenKind::KwPrimary) {
             self.expect_kw(&TokenKind::KwKey)?;
             let direction = if self.eat_kw(&TokenKind::KwAsc) {
@@ -2434,7 +2439,9 @@ impl Parser {
             TriggerEvent::Update(cols)
         };
         self.expect_kw(&TokenKind::KwOn)?;
-        let table = self.parse_identifier()?;
+        let target = self.parse_qualified_name()?;
+        let table_schema = target.schema;
+        let table = target.name;
         let for_each_row = if self.eat_kw(&TokenKind::KwFor) {
             self.expect_kw(&TokenKind::KwEach)?;
             self.expect_kw(&TokenKind::KwRow)?;
@@ -2483,6 +2490,7 @@ impl Parser {
             name,
             timing,
             event,
+            table_schema,
             table,
             for_each_row,
             when,

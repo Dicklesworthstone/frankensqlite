@@ -949,6 +949,10 @@ fn write_expr_tasks(f: &mut fmt::Formatter<'_>, root: ExprWriteTask<'_>) -> fmt:
                     "{} {} {} ON ",
                     trigger.name, trigger.timing, trigger.event
                 )?;
+                if let Some(schema) = &trigger.table_schema {
+                    write_ident(f, schema)?;
+                    f.write_str(".")?;
+                }
                 write_ident(f, &trigger.table)?;
                 if trigger.for_each_row {
                     f.write_str(" FOR EACH ROW")?;
@@ -2919,6 +2923,7 @@ mod expr_display_tests {
                     name: QualifiedName::bare(format!("trigger_{level}")),
                     timing: TriggerTiming::After,
                     event: TriggerEvent::Insert,
+                    table_schema: None,
                     table: "target".to_owned(),
                     for_each_row: false,
                     when: None,
@@ -3038,6 +3043,7 @@ mod expr_display_tests {
             name: QualifiedName::bare("tr"),
             timing: TriggerTiming::After,
             event: TriggerEvent::Insert,
+            table_schema: None,
             table: "target".to_owned(),
             for_each_row: false,
             when: None,
