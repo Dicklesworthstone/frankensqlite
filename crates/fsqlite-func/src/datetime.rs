@@ -554,23 +554,25 @@ fn skip_sqlite_spaces(s: &[u8]) -> &[u8] {
 // ── Modifier Pipeline ─────────────────────────────────────────────────────
 
 /// Apply a single modifier string to a JDN.  Returns None if invalid.
-fn apply_modifier(jdn: f64, modifier: &str) -> Option<f64> {
+fn apply_modifier(jdn: f64, modifier: &str, written_ymd: Option<(i64, i64, i64)>) -> Option<f64> {
     if has_outer_ascii_whitespace(modifier) {
         return None;
     }
     let m = modifier.to_ascii_lowercase();
 
     // 'start of month' / 'start of year' / 'start of day'
+    // Like date.c's computeYMD when validYMD is still set, take Y-M-D from the
+    // written fields when no prior modifier has recomputed them (bd-a20bp).
     if m == "start of month" {
-        let (y, mo, _d) = jdn_to_ymd(jdn);
+        let (y, mo, _d) = written_ymd.unwrap_or_else(|| jdn_to_ymd(jdn));
         return Some(ymd_to_jdn(y, mo, 1));
     }
     if m == "start of year" {
-        let (y, _mo, _d) = jdn_to_ymd(jdn);
+        let (y, _mo, _d) = written_ymd.unwrap_or_else(|| jdn_to_ymd(jdn));
         return Some(ymd_to_jdn(y, 1, 1));
     }
     if m == "start of day" {
-        let (y, mo, d) = jdn_to_ymd(jdn);
+        let (y, mo, d) = written_ymd.unwrap_or_else(|| jdn_to_ymd(jdn));
         return Some(ymd_to_jdn(y, mo, d));
     }
 
@@ -753,6 +755,7 @@ fn apply_modifiers(start: &ParsedTimeValue, modifiers: &[String]) -> Option<Modi
         if m_lower == "utc" && is_utc {
             continue;
         }
+        let written_ymd = fields_kept.then_some(start.unmodified_ymd).flatten();
         fields_kept = false;
         // 'ceiling' is the default day-of-month-overflow behavior (roll forward
         // into the next month); it merely clears any pending floor adjustment.
@@ -820,7 +823,7 @@ fn apply_modifiers(start: &ParsedTimeValue, modifiers: &[String]) -> Option<Modi
         if m_lower.starts_with(|c: char| c == '+' || c == '-' || c.is_ascii_digit()) {
             n_floor = 0;
         }
-        j = apply_modifier(j, m)?;
+        j = apply_modifier(j, m, written_ymd)?;
     }
     Some(ModifiedTime {
         jdn: j,
@@ -2009,7 +2012,7 @@ mod tests {
         }
         let utc_of = |y, mo, d, h, mi, s| -> (i64, i64, i64, i64, i64, i64) {
             let jdn = ymdhms_to_jdn(y, mo, d, h, mi, s, 0.0);
-            let out = apply_modifier(jdn, "utc").expect("utc modifier");
+            let out = apply_modifier(jdn, "utc", None).expect("utc modifier");
             let (yy, mm, dd) = jdn_to_ymd(out);
             let (hh, nn, ss, _f) = jdn_to_hms(out);
             (yy, mm, dd, hh, nn, ss)
@@ -3856,5 +3859,55 @@ mod tests {
 
         let jdn2 = unix_to_jdn(0.0);
         assert!((jdn2 - UNIX_EPOCH_JDN).abs() < 1e-10, "roundtrip failed");
+    }
+
+    #[test]
+    fn test_hour_24_start_of_uses_written_ymd_until_recomputed_bd_a20bp() {
+        let cases = [
+            (&["2024-01-31 24:00", "start of day"][..], "2024-01-31"),
+            (&["2024-01-31 24:00", "start of month"][..], "2024-01-01"),
+            (&["2024-01-31 24:00", "start of year"][..], "2024-01-01"),
+            (&["2024-12-31 24:00", "start of day"][..], "2024-12-31"),
+            (&["2024-12-31 24:00", "start of month"][..], "2024-12-01"),
+            (&["2024-12-31 24:00", "start of year"][..], "2024-01-01"),
+            (
+                &["2024-01-31 24:00", "subsec", "start of month"][..],
+                "2024-01-01",
+            ),
+            (
+                &["2024-01-31 24:00Z", "utc", "start of month"][..],
+                "2024-01-01",
+            ),
+            (
+                &["2024-01-31 24:00", "+0 days", "start of day"][..],
+                "2024-02-01",
+            ),
+            (
+                &["2024-01-31 24:00", "+0 days", "start of month"][..],
+                "2024-02-01",
+            ),
+            (
+                &["2024-01-31 24:00", "+1 days", "start of day"][..],
+                "2024-02-02",
+            ),
+            (
+                &["2024-01-31 24:00", "+1 days", "start of month"][..],
+                "2024-02-01",
+            ),
+            (
+                &["2024-12-31 24:00", "+0 days", "start of year"][..],
+                "2025-01-01",
+            ),
+            (
+                &["2024-12-31 24:00", "+1 days", "start of year"][..],
+                "2025-01-01",
+            ),
+        ];
+
+        for (raw_args, expected) in cases {
+            let args: Vec<SqliteValue> = raw_args.iter().copied().map(text).collect();
+            let got = DateFunc.invoke(&args).expect("date() should succeed");
+            assert_eq!(got, text(expected), "failed for args={raw_args:?}");
+        }
     }
 }
