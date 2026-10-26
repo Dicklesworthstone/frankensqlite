@@ -37,6 +37,7 @@ use fsqlite_vfs::{
 };
 use smallvec::SmallVec;
 
+use crate::cancellation::await_pager_admission;
 use crate::journal::{JOURNAL_MAGIC, JournalHeader, JournalPageRecord};
 use crate::page_buf::{PageBuf, PageBufPool};
 use crate::page_cache::{
@@ -5501,7 +5502,10 @@ impl<F: VfsFile + 'static> WalIndexShmSource<F> {
                 return exhausted;
             }
             self.release_reader_attempt(owner).await?;
-            wal_reader_retry_pause(attempt).await;
+            // The attempted slot is restored before this reversible wait.
+            // Keep stock retry pacing, but let the explicit operation's local
+            // relay interrupt even the longer late-attempt backoffs.
+            await_pager_admission(cx, wal_reader_retry_pause(attempt)).await?;
         }
     }
 
@@ -5698,38 +5702,6 @@ struct SharedDbFileKey(usize);
 
 fn shared_db_file_key<F>(file: &SharedDbFile<F>) -> SharedDbFileKey {
     SharedDbFileKey(Arc::as_ptr(file).cast::<()>() as usize)
-}
-
-/// Race a reversible admission wait against the explicit operation's local
-/// cancellation. Dropping a pending native lock future retires its waiter;
-/// mandatory settlement and physical writes must not use this helper.
-#[cfg(feature = "native")]
-async fn await_pager_admission<F: Future>(cx: &Cx, wait: F) -> Result<F::Output> {
-    let mut cancellation = std::pin::pin!(cx.wait_for_local_cancellation());
-    let mut wait = std::pin::pin!(wait);
-    std::future::poll_fn(|task_cx| {
-        if cx.checkpoint().is_err() {
-            return std::task::Poll::Ready(Err(FrankenError::Abort));
-        }
-        if let std::task::Poll::Ready(output) = wait.as_mut().poll(task_cx) {
-            return std::task::Poll::Ready(
-                cx.checkpoint()
-                    .map(|()| output)
-                    .map_err(|_| FrankenError::Abort),
-            );
-        }
-        // Uncontended locks need no local waiter registration. Once the
-        // native future suspends, register the operation's local relay and
-        // recheck: cancellation between its poll and registration cannot be
-        // lost, and cancellation after the recheck wakes this task.
-        let _ = cancellation.as_mut().poll(task_cx);
-        if cx.checkpoint().is_err() {
-            std::task::Poll::Ready(Err(FrankenError::Abort))
-        } else {
-            std::task::Poll::Pending
-        }
-    })
-    .await
 }
 
 async fn async_rwlock_read<'a, T>(
