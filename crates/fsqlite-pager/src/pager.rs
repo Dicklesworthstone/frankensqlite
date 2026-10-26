@@ -15026,6 +15026,8 @@ where
                     memory_db_bump_alloc,
                     rolled_back_pages: HashSet::new(),
                     txn_read_cache: RefCell::new(PagePageMap::default()),
+                    txn_read_cache_page_budget: self.transaction_read_cache_page_budget(mode),
+                    txn_read_cache_incomplete: Cell::new(false),
                     retained_memory_overlay_dirty_pages: BTreeSet::new(),
                     scratch_arena: bumpalo::Bump::new(),
                 });
@@ -15264,6 +15266,8 @@ where
                 memory_db_bump_alloc,
                 rolled_back_pages: HashSet::new(),
                 txn_read_cache: RefCell::new(PagePageMap::default()),
+                txn_read_cache_page_budget: self.transaction_read_cache_page_budget(mode),
+                txn_read_cache_incomplete: Cell::new(false),
                 retained_memory_overlay_dirty_pages: BTreeSet::new(),
                 scratch_arena: bumpalo::Bump::new(),
             })
@@ -17964,6 +17968,25 @@ where
     /// Bind a same-path connection counter owned by the SQL connection layer.
     pub fn bind_shared_connection_count(&self, counter: Arc<AtomicUsize>) {
         let _ = self.shared_connection_count.set(counter);
+    }
+
+    /// Optional snapshot copies follow the connection cache budget, not the
+    /// much larger allocation-pool ceiling (GH #525). Capture the bound at
+    /// BEGIN: a later connection attachment or cache-size increase must not
+    /// make previously unretained snapshot pages appear safe to reread.
+    fn transaction_read_cache_page_budget(&self, mode: TransactionMode) -> usize {
+        if mode == TransactionMode::ReadOnly
+            && self
+                .shared_connection_count
+                .get()
+                .is_some_and(|counter| counter.load(AtomicOrdering::Acquire) == 1)
+        {
+            // Keep the WAL read pin and all normal snapshot validation. A
+            // process-local connection count does not exclude external writers.
+            0
+        } else {
+            self.cache.cache_page_budget().min(self.pool.capacity())
+        }
     }
 
     /// Number of page reads satisfied directly from the publication plane.
@@ -21344,13 +21367,18 @@ where
     /// Pages that were allocated after a savepoint but then rolled back.
     /// These pages should return zeros when read, not BusySnapshot error.
     rolled_back_pages: HashSet<PageNumber>,
-    /// Per-transaction read cache: pages read via inner.lock() are cached
-    /// here so subsequent reads of the same page (e.g., B-tree root during
-    /// repeated INSERTs) skip inner.lock entirely. This eliminates the
-    /// ~80,000 inner.lock acquisitions at 16 threads (reduces to ~80).
-    /// Only used in WAL mode where the published snapshot fast path is
-    /// defeated by constant commit_seq advancement.
+    /// Exact images already observed by this snapshot, consulted before all
+    /// shared latest-image sources (GH #129). Also avoids repeated inner.lock()
+    /// acquisition for hot pages. Optional read admission is bounded separately
+    /// from authoritative retained commits; see the overlay contract below.
     txn_read_cache: RefCell<PagePageMap<PageData>>,
+    /// Optional read-image bound captured at each logical transaction boundary.
+    /// PRAGMA cache_size changes apply to the next snapshot, so resizing cannot
+    /// silently evict an existing snapshot's retained images or reopen its guard.
+    txn_read_cache_page_budget: usize,
+    /// Sticky for this snapshot once an observed image is not retained. Map
+    /// length alone is insufficient after forget_cached_page removes an entry.
+    txn_read_cache_incomplete: Cell<bool>,
     /// Committed page images whose backing-store flush was intentionally
     /// deferred for the private `:memory:` retained-autocommit fast path.
     /// These pages stay authoritative in `txn_read_cache` until a real
@@ -21958,18 +21986,34 @@ where
         Ok(StagedPage::from_buf(buffer))
     }
 
-    /// Admit a snapshot page to the per-transaction read cache without
-    /// letting a large scan bypass the configured page-buffer ceiling.
+    /// Admit a snapshot page without letting a scan retain the entire database.
     ///
-    /// Once the cache reaches the pool capacity, first reads continue through
-    /// the normal pager/WAL snapshot path but are not pinned for the remaining
-    /// transaction lifetime. Existing entries may still be refreshed without
-    /// increasing retained memory.
+    /// Once the captured cache budget is exhausted, reads use the normal
+    /// pager/WAL path without pinning a copy until transaction end. Existing
+    /// entries stay stable. Authoritative retained-commit images are inserted
+    /// separately and must never be discarded to enforce this optional budget.
     fn cache_transaction_read_page(&self, page_no: PageNumber, page: &PageData) {
         let mut txn_read_cache = self.txn_read_cache.borrow_mut();
-        if txn_read_cache.contains_key(&page_no) || txn_read_cache.len() < self.pool.capacity() {
+        if txn_read_cache.contains_key(&page_no)
+            || txn_read_cache.len() < self.txn_read_cache_page_budget
+        {
             txn_read_cache.insert(page_no, page.clone());
+        } else {
+            self.txn_read_cache_incomplete.set(true);
         }
+    }
+
+    /// A successful retained commit begins a new logical snapshot. Failed
+    /// commits, savepoint rollback and cache invalidation must not call this.
+    fn reset_transaction_read_cache_budget(&mut self) {
+        self.txn_read_cache_page_budget = if self.mode == TransactionMode::ReadOnly
+            && self.single_connection_fast_path_enabled()
+        {
+            0
+        } else {
+            self.cache.cache_page_budget().min(self.pool.capacity())
+        };
+        self.txn_read_cache_incomplete.set(false);
     }
 
     /// Fail closed instead of serving a potentially newer image after this
@@ -21979,17 +22023,18 @@ where
         page_no: PageNumber,
         observed_commit_seq: CommitSeq,
     ) -> Result<()> {
-        if self.txn_read_cache.borrow().len() < self.pool.capacity()
+        if (!self.txn_read_cache_incomplete.get()
+            && self.txn_read_cache.borrow().len() < self.txn_read_cache_page_budget)
             || observed_commit_seq == self.published_visible_commit_seq.get()
         {
             return Ok(());
         }
         Err(FrankenError::BusySnapshot {
             conflicting_pages: format!(
-                "page {} is not retained after the transaction read cache reached {} pages; \
+                "page {} is not retained by the transaction read cache (budget {} pages); \
                  snapshot commit_seq {} != observed {}",
                 page_no.get(),
-                self.pool.capacity(),
+                self.txn_read_cache_page_budget,
                 self.published_visible_commit_seq.get().get(),
                 observed_commit_seq.get()
             ),
@@ -26015,6 +26060,7 @@ where
             // transaction instead of caching a stale local Page 1.
             self.discard_committed_pages();
             self.txn_read_cache.borrow_mut().clear();
+            self.reset_transaction_read_cache_budget();
         }
         self.reset_current_write_set_accounting();
         self.retained_memory_overlay_dirty_pages.clear();
@@ -26389,6 +26435,30 @@ where
                 // bd-perf (V1.2): Use get_shared to get PageData directly,
                 // avoiding the 4KB memcpy + separate Arc allocation of get_copy.
                 if let Some(page_data) = self.cache.get_shared(page_no) {
+                    // A peer may attach and commit between the equality check
+                    // above and the cache lookup. Validate after reading too,
+                    // even before the optional snapshot cache is full.
+                    // The immutable committed snapshot advances under inner
+                    // before visible publication. A slow peer can refill the
+                    // shared cache in that interval, so check that watermark
+                    // too. It may lag after a refresh, hence max rather than an
+                    // equality requirement on the immutable snapshot alone.
+                    let observed_commit_seq = self.published.snapshot().visible_commit_seq.max(
+                        self.committed_snapshot
+                            .read()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .commit_seq,
+                    );
+                    if observed_commit_seq != self.published_visible_commit_seq.get() {
+                        return Err(FrankenError::BusySnapshot {
+                            conflicting_pages: format!(
+                                "page {} shared-cache read crossed snapshot commit_seq {} -> {}",
+                                page_no.get(),
+                                self.published_visible_commit_seq.get().get(),
+                                observed_commit_seq.get()
+                            ),
+                        });
+                    }
                     self.cache_transaction_read_page(page_no, &page_data);
                     return Ok(page_data);
                 }
@@ -26450,8 +26520,10 @@ where
         // authoritative committed version, including when the current
         // transaction frees the page and may subsequently roll back.
         self.cache.evict(page_no);
-        if !self.retained_memory_overlay_dirty_pages.contains(&page_no) {
-            self.txn_read_cache.borrow_mut().remove(&page_no);
+        if !self.retained_memory_overlay_dirty_pages.contains(&page_no)
+            && self.txn_read_cache.borrow_mut().remove(&page_no).is_some()
+        {
+            self.txn_read_cache_incomplete.set(true);
         }
     }
 
@@ -28728,6 +28800,7 @@ where
                 self.published_visible_commit_seq
                     .set(publish_update.visible_commit_seq);
                 self.published_db_size.set(publish_update.db_size);
+                self.reset_transaction_read_cache_budget();
                 if self.journal_mode != JournalMode::Wal {
                     let mut inner = self
                         .inner
@@ -33121,6 +33194,307 @@ mod tests {
                 "expected BusySnapshot for uncached page {uncached_page:?} (old marker \
                  {uncached_marker}), got {error:?}"
             );
+            reader.commit(&cx).await.unwrap();
+        });
+    }
+
+    async fn gh525_seed_snapshot_pages(
+        pager: &SimplePager<MemoryVfs>,
+        cx: &Cx,
+    ) -> Vec<(PageNumber, u8)> {
+        let mut seed = pager.begin(cx, TransactionMode::Immediate).await.unwrap();
+        let mut pages = Vec::new();
+        for marker in 1_u8..=8 {
+            let page_no = seed.allocate_page(cx).await.unwrap();
+            seed.write_page(cx, page_no, &sample_page(marker))
+                .await
+                .unwrap();
+            pages.push((page_no, marker));
+        }
+        seed.commit(cx).await.unwrap();
+        pages
+    }
+
+    #[test]
+    fn gh_525_transaction_read_cache_follows_cache_budget() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            for budget in [0, 1, 4] {
+                for mode in [TransactionMode::ReadOnly, TransactionMode::Concurrent] {
+                    let (pager, _) = test_pager().await;
+                    let pages = gh525_seed_snapshot_pages(&pager, &cx).await;
+                    assert!(pager.pool.capacity() > pages.len());
+                    pager.set_cache_page_budget(budget).unwrap();
+                    let mut reader = pager.begin(&cx, mode).await.unwrap();
+                    assert_eq!(reader.txn_read_cache_page_budget, budget);
+
+                    // Two complete passes exercise both retained and uncached
+                    // rereads without materializing the scanned working set.
+                    for _ in 0..2 {
+                        for &(page_no, marker) in &pages {
+                            assert_eq!(
+                                reader.get_page(&cx, page_no).await.unwrap().as_ref()[0],
+                                marker
+                            );
+                            assert!(reader.txn_read_cache.borrow().len() <= budget);
+                        }
+                    }
+                    assert_eq!(reader.txn_read_cache.borrow().len(), budget);
+                    assert!(reader.txn_read_cache_incomplete.get());
+
+                    let mut writer = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                    for &(page_no, _) in &[pages[0], pages[7]] {
+                        writer
+                            .write_page(&cx, page_no, &sample_page(0xEE))
+                            .await
+                            .unwrap();
+                    }
+                    writer.commit(&cx).await.unwrap();
+                    if budget != 0 {
+                        assert_eq!(
+                            reader.get_page(&cx, pages[0].0).await.unwrap().as_ref()[0],
+                            pages[0].1,
+                            "retained images must survive a peer commit"
+                        );
+                    }
+                    assert!(matches!(
+                        reader.get_page(&cx, pages[7].0).await,
+                        Err(FrankenError::BusySnapshot { .. })
+                    ));
+                    reader.commit(&cx).await.unwrap();
+
+                    let mut fresh = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+                    assert_eq!(
+                        fresh.get_page(&cx, pages[7].0).await.unwrap().as_ref()[0],
+                        0xEE
+                    );
+                    fresh.commit(&cx).await.unwrap();
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn gh_525_single_reader_bypasses_copies_and_fails_closed_after_peer_attaches() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let (pager, _) = test_pager().await;
+            let connection_count = Arc::new(AtomicUsize::new(1));
+            pager.bind_shared_connection_count(Arc::clone(&connection_count));
+            let pages = gh525_seed_snapshot_pages(&pager, &cx).await;
+            pager.set_cache_page_budget(4).unwrap();
+            let mut reader = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            assert_eq!(reader.txn_read_cache_page_budget, 0);
+            for _ in 0..2 {
+                for &(page_no, marker) in &pages {
+                    assert_eq!(
+                        reader.get_page(&cx, page_no).await.unwrap().as_ref()[0],
+                        marker
+                    );
+                }
+            }
+            assert!(reader.txn_read_cache.borrow().is_empty());
+            assert!(reader.txn_read_cache_incomplete.get());
+
+            connection_count.store(2, AtomicOrdering::Release);
+            pager.set_cache_page_budget(64).unwrap();
+            let mut writer = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            writer
+                .write_page(&cx, pages[0].0, &sample_page(0xEE))
+                .await
+                .unwrap();
+            writer.commit(&cx).await.unwrap();
+            assert_eq!(reader.txn_read_cache_page_budget, 0);
+            assert!(matches!(
+                reader.get_page(&cx, pages[0].0).await,
+                Err(FrankenError::BusySnapshot { .. })
+            ));
+            reader.commit(&cx).await.unwrap();
+
+            // The next transaction can adopt the new shared-reader policy.
+            let mut fresh = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            assert_eq!(fresh.txn_read_cache_page_budget, 64);
+            assert_eq!(
+                fresh.get_page(&cx, pages[0].0).await.unwrap().as_ref()[0],
+                0xEE
+            );
+            fresh.commit(&cx).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn gh_525_forget_resize_and_savepoint_cannot_reopen_snapshot_guard() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            for saturate in [false, true] {
+                let (pager, _) = test_pager().await;
+                let pages = gh525_seed_snapshot_pages(&pager, &cx).await;
+                pager.set_cache_page_budget(2).unwrap();
+                let mut reader = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+                reader.savepoint(&cx, "before_reads").unwrap();
+                reader.get_page(&cx, pages[0].0).await.unwrap();
+                if saturate {
+                    reader.get_page(&cx, pages[1].0).await.unwrap();
+                    reader.get_page(&cx, pages[2].0).await.unwrap();
+                }
+                reader.forget_cached_page(pages[0].0);
+                assert!(reader.txn_read_cache.borrow().len() < 2);
+                assert!(reader.txn_read_cache_incomplete.get());
+                reader.rollback_to_savepoint(&cx, "before_reads").unwrap();
+                assert!(reader.txn_read_cache_incomplete.get());
+
+                pager.set_cache_page_budget(64).unwrap();
+                assert_eq!(reader.txn_read_cache_page_budget, 2);
+                let mut writer = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                writer
+                    .write_page(&cx, pages[0].0, &sample_page(0xEE))
+                    .await
+                    .unwrap();
+                writer.commit(&cx).await.unwrap();
+                assert!(matches!(
+                    reader.get_page(&cx, pages[0].0).await,
+                    Err(FrankenError::BusySnapshot { .. })
+                ));
+                if saturate {
+                    assert_eq!(
+                        reader.get_page(&cx, pages[1].0).await.unwrap().as_ref()[0],
+                        pages[1].1
+                    );
+                }
+                pager.set_cache_page_budget(0).unwrap();
+                assert_eq!(reader.txn_read_cache_page_budget, 2);
+                reader.rollback(&cx).await.unwrap();
+                let mut fresh = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+                assert_eq!(fresh.txn_read_cache_page_budget, 0);
+                assert_eq!(
+                    fresh.get_page(&cx, pages[0].0).await.unwrap().as_ref()[0],
+                    0xEE
+                );
+                fresh.commit(&cx).await.unwrap();
+            }
+        });
+    }
+
+    #[test]
+    #[allow(clippy::await_holding_lock)]
+    fn gh_525_uncached_reader_rejects_shared_cache_refill_before_publication() {
+        asupersync::test_utils::run_test(|| async {
+            let (pager, _) = test_pager().await;
+            let cx = Cx::new();
+            let connections = Arc::new(AtomicUsize::new(1));
+            pager.bind_shared_connection_count(Arc::clone(&connections));
+            pager.set_cache_page_budget(2).unwrap();
+            let page_no = {
+                let mut seed = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                let page_no = seed.allocate_page(&cx).await.unwrap();
+                seed.write_page(&cx, page_no, &sample_page(0x11))
+                    .await
+                    .unwrap();
+                seed.commit(&cx).await.unwrap();
+                page_no
+            };
+            let mut reader = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            assert_eq!(
+                reader.get_page(&cx, page_no).await.unwrap().as_ref()[0],
+                0x11
+            );
+            assert!(reader.txn_read_cache.borrow().is_empty());
+            let bound = reader.published_visible_commit_seq.get();
+            connections.store(2, AtomicOrdering::Release);
+            let mut writer = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            writer
+                .write_page(&cx, page_no, &sample_page(0xEE))
+                .await
+                .unwrap();
+
+            // Pause at the real retained-memory commit boundary: backing bytes
+            // and immutable committed metadata advance before publication.
+            {
+                let mut inner = pager.inner.lock().unwrap();
+                SimpleTransaction::<MemoryVfs>::flush_write_set_to_db_file_batch(
+                    &cx,
+                    &inner,
+                    &writer.write_set,
+                    &writer.write_pages_sorted,
+                )
+                .await
+                .unwrap();
+                inner.record_local_commit();
+                pager.cache.evict(page_no);
+                pager.publish_committed_snapshot_from_inner(&inner);
+            }
+            assert_eq!(pager.published.snapshot().visible_commit_seq, bound);
+
+            // An already-started peer can refill through ordinary pager I/O
+            // under inner in this interval, before visible metadata advances.
+            {
+                let inner = pager.inner.lock().unwrap();
+                let bytes = inner
+                    .read_page_copy(&cx, &pager.cache, &pager.wal_backend, page_no)
+                    .await
+                    .unwrap();
+                assert_eq!(bytes[0], 0xEE);
+            }
+            assert_eq!(pager.cache.get_shared(page_no).unwrap().as_ref()[0], 0xEE);
+            assert_eq!(pager.published.snapshot().visible_commit_seq, bound);
+            assert!(matches!(
+                reader.get_page(&cx, page_no).await,
+                Err(FrankenError::BusySnapshot { .. })
+            ));
+            assert_eq!(reader.published_visible_commit_seq.get(), bound);
+            reader.rollback(&cx).await.unwrap();
+            writer.commit(&cx).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn gh_525_retained_commit_preserves_authoritative_images_above_read_budget() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let pager = private_memory_pager().await;
+            pager.bind_shared_connection_count(Arc::new(AtomicUsize::new(1)));
+            let pages = gh525_seed_snapshot_pages(&pager, &cx).await;
+            pager.set_cache_page_budget(0).unwrap();
+            let mut writer = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            writer.get_page(&cx, pages[0].0).await.unwrap();
+            assert!(writer.txn_read_cache_incomplete.get());
+            writer
+                .write_page(&cx, pages[0].0, &sample_page(0xA1))
+                .await
+                .unwrap();
+            assert!(writer.commit_and_retain(&cx).await.unwrap());
+            assert_eq!(writer.txn_read_cache_page_budget, 0);
+            assert!(!writer.txn_read_cache_incomplete.get());
+            assert!(!writer.txn_read_cache.borrow().is_empty());
+            assert!(writer.retained_memory_overlay_dirty_pages.contains(&pages[0].0));
+            writer.forget_cached_page(pages[0].0);
+            assert_eq!(
+                writer.get_page(&cx, pages[0].0).await.unwrap().as_ref()[0],
+                0xA1,
+                "a zero optional read budget cannot discard committed overlay data"
+            );
+
+            pager.set_cache_page_budget(2).unwrap();
+            writer
+                .write_page(&cx, pages[1].0, &sample_page(0xA2))
+                .await
+                .unwrap();
+            assert!(writer.commit_and_retain(&cx).await.unwrap());
+            assert_eq!(writer.txn_read_cache_page_budget, 2);
+            writer
+                .write_page(&cx, pages[0].0, &sample_page(0xEE))
+                .await
+                .unwrap();
+            writer.rollback(&cx).await.unwrap();
+
+            let mut reader = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            for (page_no, marker) in [(pages[0].0, 0xA1), (pages[1].0, 0xA2)] {
+                assert_eq!(
+                    reader.get_page(&cx, page_no).await.unwrap().as_ref()[0],
+                    marker,
+                    "rollback must preserve both retained commits"
+                );
+            }
             reader.commit(&cx).await.unwrap();
         });
     }
