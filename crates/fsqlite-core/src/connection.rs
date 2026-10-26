@@ -3989,6 +3989,9 @@ async fn capture_ambient_io_native_cx(root_cx: &Cx) -> Option<asupersync::runtim
 #[derive(Debug, Clone)]
 pub struct ConnectionEnv {
     runtime: Arc<RuntimeContext>,
+    /// Operation context for opening only. Never retained as a connection's
+    /// lifetime root or inherited by a later ATTACH.
+    bootstrap_cx_override: Option<Cx>,
     /// Whether contexts derived while opening this connection are running on
     /// a dedicated engine OS thread where bounded positional I/O may safely
     /// execute inline. Raw connection opens leave this disabled; the
@@ -4022,6 +4025,7 @@ impl ConnectionEnv {
     pub fn new(runtime: Arc<RuntimeContext>) -> Self {
         Self {
             runtime,
+            bootstrap_cx_override: None,
             blocking_io_inline_safe: false,
             page_buffer_max: None,
             memory_vfs_config: None,
@@ -4104,6 +4108,25 @@ impl ConnectionEnv {
         &self.runtime
     }
 
+    /// Use `cx` for cancellation and budgets throughout connection opening.
+    ///
+    /// Derive this context from [`Self::bootstrap_cx`] so it carries the
+    /// environment's capabilities. A local cancellation relay can then abort
+    /// an admitted open without cancelling the shared runtime. The returned
+    /// connection still derives its lifetime root from [`Self::runtime`];
+    /// cancelling this opening context after success does not cancel later
+    /// SQL, ATTACH, or close operations.
+    /// An active cancellation mask is retained for the bounded opening
+    /// operation; it is not installed on the returned connection.
+    ///
+    /// Drive the open future to completion after requesting cancellation so
+    /// the engine can release acquired locks and finish required cleanup.
+    #[must_use]
+    pub fn with_bootstrap_cx(mut self, cx: Cx) -> Self {
+        self.bootstrap_cx_override = Some(cx);
+        self
+    }
+
     /// Mark this environment as owned by a dedicated engine OS thread.
     ///
     /// Contexts derived during connection bootstrap and for the resulting
@@ -4127,11 +4150,23 @@ impl ConnectionEnv {
         }
     }
 
-    fn bootstrap_cx(&self) -> Cx {
+    /// Derive a context for one connection-opening operation.
+    ///
+    /// This inherits the configured bootstrap context, including a snapshot
+    /// of its cancellation mask, or derives an ordinary child of the runtime
+    /// root when no override is configured. Retain this parent while using a
+    /// further child with a local cancellation relay, and pass that child to
+    /// [`Self::with_bootstrap_cx`]. For work moved to another OS thread, derive
+    /// a spawn-safe child before attaching that thread's I/O context.
+    #[must_use]
+    pub fn bootstrap_cx(&self) -> Cx {
         let cx = self
-            .runtime
-            .root_cx
-            .create_child()
+            .bootstrap_cx_override
+            .as_ref()
+            .map_or_else(
+                || self.runtime.root_cx.create_child(),
+                Cx::create_child_preserving_mask,
+            )
             .with_trace_context(next_trace_id(), 0, 0);
         self.apply_blocking_io_inline_safety(&cx);
         cx
@@ -4174,6 +4209,7 @@ impl Default for ConnectionEnv {
     fn default() -> Self {
         Self {
             runtime: RuntimeContext::global(),
+            bootstrap_cx_override: None,
             blocking_io_inline_safe: false,
             page_buffer_max: None,
             memory_vfs_config: None,
@@ -4268,6 +4304,7 @@ impl PagerBackend {
     /// bootstrap work. All namespace keys and companion-file paths are derived
     /// from this stable absolute spelling for the connection lifetime.
     fn resolve_stable_database_path(path: &str, cx: &Cx) -> Result<String> {
+        cx.checkpoint().map_err(|_| FrankenError::Abort)?;
         if path == ":memory:" {
             return Ok(path.to_owned());
         }
@@ -15677,7 +15714,8 @@ impl Connection {
                 path: std::path::PathBuf::from(path),
             });
         }
-        let attach_env = env.clone();
+        let mut attach_env = env.clone();
+        attach_env.bootstrap_cx_override = None;
 
         let bootstrap_cx = env.bootstrap_cx();
         let path = PagerBackend::resolve_stable_database_path(&path, &bootstrap_cx)?;
@@ -16030,7 +16068,9 @@ impl Connection {
             fast_path_gate: AtomicU32::new(0),
         };
         let bootstrap_result: Result<()> = async {
+            let _binding = conn.bind_bootstrap_cx(&env, &bootstrap_cx);
             let op_cx = conn.op_cx()?;
+            op_cx.checkpoint().map_err(|_| FrankenError::Abort)?;
             {
                 let ms = conn.pragma_state.borrow().busy_timeout_ms.max(0) as u64;
                 conn.pager.set_vfs_busy_timeout_ms(&op_cx, ms).await;
@@ -16061,6 +16101,7 @@ impl Connection {
             // The native namespace gate remains exclusive throughout every
             // journal/WAL/schema/MemDB bootstrap step above. Publish the completed
             // connection generation only at the final success boundary.
+            op_cx.checkpoint().map_err(|_| FrankenError::Abort)?;
             conn.pager.finish_namespace_bootstrap()?;
             Ok(())
         }
@@ -16255,6 +16296,7 @@ impl Connection {
 
         let path = ":memory:".to_owned();
         let bootstrap_cx = env.bootstrap_cx();
+        bootstrap_cx.checkpoint().map_err(|_| FrankenError::Abort)?;
         let vfs = env
             .memory_vfs_config()
             .map_or_else(MemoryVfs::new, MemoryVfs::new_with_config);
@@ -16286,14 +16328,15 @@ impl Connection {
         pager: PagerBackend,
         storage_was_empty: bool,
     ) -> Result<Self> {
-        let attach_env = env.clone();
+        let mut attach_env = env.clone();
+        attach_env.bootstrap_cx_override = None;
+        let bootstrap_cx = env.bootstrap_cx();
+        bootstrap_cx.checkpoint().map_err(|_| FrankenError::Abort)?;
         let pager_is_memory = pager.is_memory();
         let file_identity = if pager_is_memory {
             None
         } else {
-            let identity_cx = env.runtime().root_cx.create_child();
-            env.apply_blocking_io_inline_safety(&identity_cx);
-            pager.file_identity(&identity_cx).await?
+            pager.file_identity(&bootstrap_cx).await?
         };
         let shared_mvcc_state =
             shared_mvcc_state_for_path(&path, file_identity, Arc::clone(env.runtime()))?;
@@ -16627,7 +16670,9 @@ impl Connection {
             fast_path_gate: AtomicU32::new(0),
         };
         let bootstrap_result: Result<()> = async {
+            let _binding = conn.bind_bootstrap_cx(&env, &bootstrap_cx);
             let op_cx = conn.op_cx()?;
+            op_cx.checkpoint().map_err(|_| FrankenError::Abort)?;
             {
                 let ms = conn.pragma_state.borrow().busy_timeout_ms.max(0) as u64;
                 conn.pager.set_vfs_busy_timeout_ms(&op_cx, ms).await;
@@ -16658,6 +16703,7 @@ impl Connection {
             // Retain the native namespace bootstrap lease through journal/WAL,
             // schema, and MemDB initialization. Publish the generation only at
             // this final successful Connection boundary.
+            op_cx.checkpoint().map_err(|_| FrankenError::Abort)?;
             conn.pager.finish_namespace_bootstrap()?;
             // bd-zywqc.5: one-time idempotent repair pass on the first open of a
             // database created by a version predating the issue-#70 recovery
@@ -16669,6 +16715,7 @@ impl Connection {
             if !pager_is_memory {
                 crate::migration::run_first_open_migration(&conn, storage_was_empty).await;
             }
+            op_cx.checkpoint().map_err(|_| FrankenError::Abort)?;
             Ok(())
         }
         .await;
@@ -16923,11 +16970,7 @@ impl Connection {
                     path: requested.to_owned(),
                 });
             }
-            let cx = env
-                .runtime()
-                .root_cx
-                .create_child()
-                .with_trace_context(next_trace_id(), 0, 0);
+            let cx = env.bootstrap_cx();
             let stable = PagerBackend::resolve_stable_database_path(requested_text, &cx)?;
             let stable_path = std::path::PathBuf::from(stable);
             let reservation = fsqlite_vfs::host_fs::reserve_new_file(&stable_path).map_err(
@@ -17014,6 +17057,9 @@ impl Connection {
         reservation: &DatabaseBuilderReservation,
         env: ConnectionEnv,
     ) -> Result<Self> {
+        env.bootstrap_cx()
+            .checkpoint()
+            .map_err(|_| FrankenError::Abort)?;
         let Some(mut bootstrap_claim) = reservation.try_claim_initialization_bootstrap()? else {
             return Self::reopen_reserved_schema_only_bounded_writer(reservation, env).await;
         };
@@ -25665,6 +25711,28 @@ impl Connection {
             slot: &self.operation_cx_override,
             previous,
         }
+    }
+
+    /// Keep opening cancellation scoped to initialization, including helpers
+    /// that derive their own operation contexts after the pager has opened.
+    /// This context follows the selected environment's capability lineage;
+    /// the separately registered connection root owns its later lifetime.
+    fn bind_bootstrap_cx(
+        &self,
+        env: &ConnectionEnv,
+        bootstrap_cx: &Cx,
+    ) -> Option<OperationCxGuard<'_>> {
+        env.bootstrap_cx_override.as_ref()?;
+        // Opening may have captured a connection-owned native I/O context.
+        // Borrow it for bootstrap without giving that operation authority to
+        // cancel the connection's native context.
+        #[cfg(feature = "native")]
+        if bootstrap_cx.attached_native_cx().is_none()
+            && let Some(native_cx) = self.root_cx.attached_native_cx()
+        {
+            bootstrap_cx.set_shared_native_cx(native_cx);
+        }
+        Some(self.bind_operation_cx(bootstrap_cx))
     }
 
     /// Run one actor-dispatched operation under a worker-root-derived context.
@@ -42527,18 +42595,18 @@ impl Connection {
                 // surface as `ReadOnly` rather than mutating a file the parent
                 // was never granted write access to. A writable main opens the
                 // attached database read-write as usual.
+                let attach_env = self.attach_env.clone().with_bootstrap_cx(self.op_cx()?);
                 let attached_connection = if self.pager.is_readonly() {
                     Box::new(
                         Box::pin(Self::open_schema_only_with_env(
                             path.clone(),
-                            self.attach_env.clone(),
+                            attach_env,
                         ))
                         .await?,
                     )
                 } else {
                     Box::new(
-                        Box::pin(Self::open_with_env(path.clone(), self.attach_env.clone()))
-                            .await?,
+                        Box::pin(Self::open_with_env(path.clone(), attach_env)).await?,
                     )
                 };
                 // bd-6n5cy stock-fidelity: SQLite refuses to attach a database
