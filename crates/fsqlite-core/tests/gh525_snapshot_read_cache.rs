@@ -49,12 +49,15 @@ fn fixture(path: &Path, rows: i64) {
     assert!(!path.exists(), "fixture creation must not overwrite a database");
     assert!(rows > 0);
     let mut db = rusqlite::Connection::open(path).expect("create SQLite fixture");
+    // Keep big unindexed: a secondary index also contains its integer rowid,
+    // so COUNT(id) could scan that small covering index instead of the payload
+    // table. The exact issue query must visit the large table in both engines.
+    // The join workload still probes the INTEGER PRIMARY KEYs of small/tiny.
     db.execute_batch(
         "PRAGMA page_size=4096; PRAGMA journal_mode=WAL; PRAGMA synchronous=OFF; \
          CREATE TABLE tiny(id INTEGER PRIMARY KEY, name TEXT); \
          CREATE TABLE small(id INTEGER PRIMARY KEY, tid INTEGER); \
-         CREATE TABLE big(id INTEGER PRIMARY KEY, sid INTEGER NOT NULL, body TEXT); \
-         CREATE INDEX big_sid ON big(sid);",
+         CREATE TABLE big(id INTEGER PRIMARY KEY, sid INTEGER NOT NULL, body TEXT);",
     )
     .expect("fixture schema");
     let tx = db.transaction().expect("fixture transaction");
