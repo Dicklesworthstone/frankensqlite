@@ -1,0 +1,21 @@
+[build]
+jobs = 1
+rustflags = ["-Znext-solver=coherence", "-Zunstable-options", "--jobs-frontend=1", "--jobs-backend=1", "--jobs-linker=1"]
+
+[profile.dev]
+opt-level = 0
+debug = 0
+incremental = false
+
+[profile.test]
+opt-level = 0
+debug = 0
+incremental = false
+
+[profile.dev.package.asupersync]
+opt-level = 0
+debug = false
+hint-mostly-unused = true
+
+[unstable]
+profile-hint-mostly-unused = true

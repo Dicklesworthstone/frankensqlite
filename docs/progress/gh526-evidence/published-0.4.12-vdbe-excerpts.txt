@@ -1,0 +1,53 @@
+GH#526: selected raw VDBE rows from the same diagnostic
+Rows are unchanged; gaps between retained addresses are intentional.
+See the manifest for exact statements and the investigation note for interpretation.
+
+[literal_ordered] FrankenSQLite 0.4.12
+4|OpenRead|0|2|0|t|0|
+5|OpenRead|1|4|0|x1|0|
+18|MakeRecord|3|4|7||0|
+19|SeekGE|1|115|7||0|
+20|IdxGT|1|115|7||4|
+21|IdxRowid|1|8|0||0|
+22|SeekRowid|0|114|8||0|
+114|Next|1|20|0||0|
+
+[numbered_ordered] FrankenSQLite 0.4.12
+4|OpenRead|0|2|0|t|0|
+5|OpenRead|1|4|0|x1|0|
+18|MakeRecord|3|4|7||0|
+19|SeekGE|1|116|7||0|
+20|IdxGT|1|116|7||4|
+21|IdxRowid|1|8|0||0|
+22|SeekRowid|0|115|8||0|
+115|Next|1|20|0||0|
+
+[literal_nested_normalized] FrankenSQLite 0.4.12
+4|OpenRead|0|2|0|t|0|
+5|OpenRead|1|4|0|x1|0|
+12|MakeRecord|3|2|5||0|
+13|SeekGE|1|109|5||0|
+14|IdxGT|1|109|5||2|
+15|IdxRowid|1|6|0||0|
+16|SeekRowid|0|108|6||0|
+108|Next|1|14|0||0|
+
+[numbered_nested_normalized] FrankenSQLite 0.4.12
+4|Variable|4|3|0||0|
+5|IsNull|3|206|0||0|
+6|Integer|0|4|0||0|
+7|MakeRecord|3|1|5||0|
+8|OpenRead|0|2|0|t|0|
+9|OpenRead|1|4|0|x1|0|
+10|SeekGE|1|111|5||0|
+11|IdxGT|1|109|5||1|
+12|Integer|1|4|0||0|
+13|IdxRowid|1|6|0||0|
+14|SeekRowid|0|107|6||0|
+107|Next|1|11|0||0|
+108|Goto|0|206|0||0|
+109|If|4|206|0||0|
+110|Goto|0|111|0||0|
+111|IsType|-1|206|3||4|
+112|Rewind|0|206|0||0|
+205|Next|0|113|0||0|

@@ -1,0 +1,23 @@
+GH#526: fresh direct EXPLAIN QUERY PLAN diagnostic on official 0.4.12
+Exact issue schema, 128 generated rows. Stock is SQLite 3.53.1.
+This does not execute or time a trigger. See the companion manifest for SQL and provenance.
+
+[literal_ordered] FrankenSQLite 0.4.12
+2|0|0|SEARCH v USING INDEX x1 (c3=? AND c4=? AND c8=? AND c1=?)
+[literal_ordered] Stock SQLite 3.53.1
+5|0|57|SEARCH v USING INDEX x10 (c1=? AND c2=? AND c3=? AND c4=? AND c5=?)
+
+[numbered_ordered] FrankenSQLite 0.4.12
+2|0|0|SEARCH v USING INDEX x1 (c3=? AND c4=? AND c8=? AND c1=?)
+[numbered_ordered] Stock SQLite 3.53.1
+5|0|57|SEARCH v USING INDEX x10 (c1=? AND c2=? AND c3=? AND c4=? AND c5=?)
+
+[literal_nested_normalized] FrankenSQLite 0.4.12
+2|0|0|SEARCH t USING INDEX x1 (c3=? AND c4=?)
+[literal_nested_normalized] Stock SQLite 3.53.1
+4|0|57|SEARCH v USING INDEX x10 (c1=? AND c2=? AND c3=? AND c4=? AND c5=?)
+
+[numbered_nested_normalized] FrankenSQLite 0.4.12
+2|0|0|SEARCH t USING INDEX x1 (c3=?)
+[numbered_nested_normalized] Stock SQLite 3.53.1
+4|0|57|SEARCH v USING INDEX x10 (c1=? AND c2=? AND c3=? AND c4=? AND c5=?)
