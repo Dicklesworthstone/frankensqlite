@@ -234,8 +234,7 @@ pub fn json(input: &str) -> Result<String> {
     // value-tree round-trip would drop duplicate object keys and normalize
     // exponent literals (`{a:1,a:2}` and `{a:1e2,}` must stay `{"a":1,"a":2}`
     // and `{"a":1e2}`), exactly the fidelity rule the strict path above
-    // follows. On total failure surface the strict error so malformed input
-    // keeps its "invalid JSON input" message.
+    // follows. On total failure surface the strict error ("malformed JSON").
     if parse_json5_text(input).is_err() {
         return Err(strict_error);
     }
@@ -666,9 +665,9 @@ fn write_canonical_json_text(value: &Value, out: &mut String) -> Result<()> {
 fn parse_json_input_blob(input: &[u8]) -> Result<Value> {
     match decode_jsonb_root(input) {
         Ok(value) => Ok(value),
-        Err(jsonb_error) => match std::str::from_utf8(input) {
+        Err(_) => match std::str::from_utf8(input) {
             Ok(text) => parse_json_text(text),
-            Err(_) => Err(jsonb_error),
+            Err(_) => Err(malformed_json()),
         },
     }
 }
@@ -806,8 +805,12 @@ fn edit_json_paths_value_with_subtypes(
     let mut edited = input.clone();
     let mut idx = start;
     while idx + 1 < args.len() {
-        let path = text_arg(name, args, idx)?.to_owned();
-        let segments = parse_path(&path)?;
+        // Stock skips a pair whose PATH is NULL.
+        if args[idx].is_null() {
+            idx += 2;
+            continue;
+        }
+        let segments = parse_path(path_arg(name, args, idx)?)?;
         let subtype = arg_subtypes.get(idx + 1).copied().unwrap_or(0);
         let replacement = sqlite_to_json_with_subtype(&args[idx + 1], subtype)?;
         apply_edit(&mut edited, &segments, replacement, mode);
@@ -1026,7 +1029,7 @@ fn encode_json_object_members(members: &[(String, Value)]) -> Result<String> {
 pub fn json_object_with_subtypes(args: &[SqliteValue], subtypes: &[u32]) -> Result<String> {
     if !args.len().is_multiple_of(2) {
         return Err(FrankenError::function_error(
-            "json_object requires an even number of arguments",
+            "json_object() requires an even number of arguments",
         ));
     }
 
@@ -1037,7 +1040,7 @@ pub fn json_object_with_subtypes(args: &[SqliteValue], subtypes: &[u32]) -> Resu
             SqliteValue::Text(text) => text.to_string(),
             _ => {
                 return Err(FrankenError::function_error(
-                    "json_object keys must be text",
+                    "json_object() labels must be TEXT",
                 ));
             }
         };
@@ -1056,7 +1059,7 @@ pub fn json_object_with_subtypes(args: &[SqliteValue], subtypes: &[u32]) -> Resu
 pub fn json_object(args: &[SqliteValue]) -> Result<String> {
     if !args.len().is_multiple_of(2) {
         return Err(FrankenError::function_error(
-            "json_object requires an even number of arguments",
+            "json_object() requires an even number of arguments",
         ));
     }
 
@@ -1067,7 +1070,7 @@ pub fn json_object(args: &[SqliteValue]) -> Result<String> {
             SqliteValue::Text(text) => text.to_string(),
             _ => {
                 return Err(FrankenError::function_error(
-                    "json_object keys must be text",
+                    "json_object() labels must be TEXT",
                 ));
             }
         };
@@ -1108,15 +1111,12 @@ pub fn jsonb_group_array(values: &[SqliteValue]) -> Result<Vec<u8>> {
 pub fn json_group_object(entries: &[(SqliteValue, SqliteValue)]) -> Result<String> {
     let mut members = Vec::with_capacity(entries.len());
     for (key_value, value) in entries {
-        let key = match key_value {
-            SqliteValue::Text(text) => text.to_string(),
-            _ => {
-                return Err(FrankenError::function_error(
-                    "json_group_object keys must be text",
-                ));
-            }
-        };
-        members.push((key, sqlite_to_json(value)?));
+        // Stock reads the label as text (`sqlite3_value_text`), so a number
+        // becomes its text, and a NULL label drops the row.
+        if key_value.is_null() {
+            continue;
+        }
+        members.push((key_value.to_text(), sqlite_to_json(value)?));
     }
     encode_json_object_members(&members)
 }
@@ -1507,15 +1507,10 @@ fn parse_json_text(input: &str) -> Result<Value> {
         Ok(value) => Ok(value),
         // serde (with `arbitrary_precision` off) hard-errors on a JSON number
         // literal that overflows f64 to ±Inf. Retry after wrapping every such
-        // overflow token in a tagged string carrier (GH#212, bd-yalqc); on total
-        // failure keep the original strict-parse error message.
-        Err(error) => match rewrite_overflow_numbers(input) {
-            Some(rewritten) => serde_json::from_str::<Value>(&rewritten)
-                .map_err(|_| FrankenError::function_error(format!("invalid JSON input: {error}"))),
-            None => Err(FrankenError::function_error(format!(
-                "invalid JSON input: {error}"
-            ))),
-        },
+        // overflow token in a tagged string carrier (GH#212, bd-yalqc).
+        Err(_) => rewrite_overflow_numbers(input)
+            .and_then(|rewritten| serde_json::from_str::<Value>(&rewritten).ok())
+            .ok_or_else(malformed_json),
     }
 }
 
@@ -1640,20 +1635,17 @@ fn parse_json5_text(input: &str) -> Result<Value> {
 fn parse_json_value_lenient(input: &str) -> Result<Value> {
     match serde_json::from_str::<Value>(input) {
         Ok(value) => Ok(value),
-        Err(strict_error) => {
+        Err(_) => {
             // First retry with overflow numbers wrapped as tagged carriers so a
             // non-finite literal (`9e999`) parses instead of hard-erroring
             // (GH#212, bd-yalqc). If that does not yield a valid parse, fall back
-            // to JSON5; on total failure surface the STRICT-parse error so
-            // genuinely-malformed input keeps its "invalid JSON input" message.
+            // to JSON5; on total failure report stock's "malformed JSON".
             if let Some(rewritten) = rewrite_overflow_numbers(input)
                 && let Ok(value) = serde_json::from_str::<Value>(&rewritten)
             {
                 return Ok(value);
             }
-            parse_json5_text(input).map_err(|_| {
-                FrankenError::function_error(format!("invalid JSON input: {strict_error}"))
-            })
+            parse_json5_text(input).map_err(|_| malformed_json())
         }
     }
 }
@@ -2107,9 +2099,7 @@ fn is_superficially_valid_jsonb(input: &[u8]) -> bool {
 fn parse_path(path: &str) -> Result<Vec<PathSegment>> {
     let bytes = path.as_bytes();
     if bytes.first().copied() != Some(b'$') {
-        return Err(FrankenError::function_error(format!(
-            "invalid json path `{path}`: must start with `$`"
-        )));
+        return Err(bad_json_path(path));
     }
 
     let mut idx = 1;
@@ -2119,9 +2109,7 @@ fn parse_path(path: &str) -> Result<Vec<PathSegment>> {
             b'.' => {
                 idx += 1;
                 if idx >= bytes.len() {
-                    return Err(FrankenError::function_error(format!(
-                        "invalid json path `{path}`: empty key segment"
-                    )));
+                    return Err(bad_json_path(path));
                 }
                 // ... rest of the dot case remains same ...
 
@@ -2147,16 +2135,11 @@ fn parse_path(path: &str) -> Result<Vec<PathSegment>> {
                         idx += 1;
                     }
                     if idx >= bytes.len() {
-                        return Err(FrankenError::function_error(format!(
-                            "invalid json path `{path}`: missing closing quote in key segment"
-                        )));
+                        return Err(bad_json_path(path));
                     }
                     let quoted_key = &path[quoted_start..=idx];
-                    let key = serde_json::from_str::<String>(quoted_key).map_err(|error| {
-                        FrankenError::function_error(format!(
-                            "invalid json path `{path}` quoted key `{quoted_key}`: {error}"
-                        ))
-                    })?;
+                    let key = serde_json::from_str::<String>(quoted_key)
+                        .map_err(|_| bad_json_path(path))?;
                     idx += 1; // closing quote
                     segments.push(PathSegment::Key(SmallText::from_string(key)));
                 } else {
@@ -2165,9 +2148,7 @@ fn parse_path(path: &str) -> Result<Vec<PathSegment>> {
                         idx += 1;
                     }
                     if start == idx {
-                        return Err(FrankenError::function_error(format!(
-                            "invalid json path `{path}`: empty key segment"
-                        )));
+                        return Err(bad_json_path(path));
                     }
                     segments.push(PathSegment::Key(SmallText::new(&path[start..idx])));
                 }
@@ -2194,9 +2175,7 @@ fn parse_path(path: &str) -> Result<Vec<PathSegment>> {
                     idx += 1;
                 }
                 if idx >= bytes.len() {
-                    return Err(FrankenError::function_error(format!(
-                        "invalid json path `{path}`: missing closing `]`"
-                    )));
+                    return Err(bad_json_path(path));
                 }
                 let segment_text = &path[start..idx];
                 idx += 1;
@@ -2204,30 +2183,21 @@ fn parse_path(path: &str) -> Result<Vec<PathSegment>> {
                 if segment_text == "#" {
                     segments.push(PathSegment::Append);
                 } else if let Some(rest) = segment_text.strip_prefix("#-") {
-                    let from_end = rest.parse::<usize>().map_err(|error| {
-                        FrankenError::function_error(format!(
-                            "invalid json path `{path}` from-end index `{segment_text}`: {error}"
-                        ))
-                    })?;
-                    if from_end == 0 {
-                        return Err(FrankenError::function_error(format!(
-                            "invalid json path `{path}`: from-end index must be >= 1"
-                        )));
-                    }
-                    segments.push(PathSegment::FromEnd(from_end));
+                    let from_end = parse_path_index(rest).ok_or_else(|| bad_json_path(path))?;
+                    // `#-0` is one past the last element, the same slot as `#`.
+                    segments.push(if from_end == 0 {
+                        PathSegment::Append
+                    } else {
+                        PathSegment::FromEnd(from_end)
+                    });
                 } else {
-                    let index = segment_text.parse::<usize>().map_err(|error| {
-                        FrankenError::function_error(format!(
-                            "invalid json path `{path}` array index `{segment_text}`: {error}"
-                        ))
-                    })?;
+                    let index =
+                        parse_path_index(segment_text).ok_or_else(|| bad_json_path(path))?;
                     segments.push(PathSegment::Index(index));
                 }
             }
             _ => {
-                return Err(FrankenError::function_error(format!(
-                    "invalid json path `{path}` at byte offset {idx}"
-                )));
+                return Err(bad_json_path(path));
             }
         }
     }
@@ -2258,11 +2228,9 @@ fn parse_quoted_path_key<'a>(path: &'a str, bytes: &[u8], idx: &mut usize) -> Re
             let raw = &path[(quoted_start + 1)..*idx];
             let key = if saw_escape {
                 let quoted_key = &path[quoted_start..=*idx];
-                Cow::Owned(serde_json::from_str::<String>(quoted_key).map_err(|error| {
-                    FrankenError::function_error(format!(
-                        "invalid json path `{path}` quoted key `{quoted_key}`: {error}"
-                    ))
-                })?)
+                Cow::Owned(
+                    serde_json::from_str::<String>(quoted_key).map_err(|_| bad_json_path(path))?,
+                )
             } else {
                 Cow::Borrowed(raw)
             };
@@ -2272,17 +2240,27 @@ fn parse_quoted_path_key<'a>(path: &'a str, bytes: &[u8], idx: &mut usize) -> Re
         *idx += 1;
     }
 
-    Err(FrankenError::function_error(format!(
-        "invalid json path `{path}`: missing closing quote in key segment"
-    )))
+    Err(bad_json_path(path))
+}
+
+/// An array subscript read the way stock reads one: ASCII digits only, and a
+/// number too large for any array saturates, so it finds nothing instead of
+/// being a bad path.
+fn parse_path_index(text: &str) -> Option<usize> {
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some(text.bytes().fold(0usize, |index, byte| {
+        index
+            .saturating_mul(10)
+            .saturating_add(usize::from(byte - b'0'))
+    }))
 }
 
 fn resolve_path<'a>(root: &'a Value, path: &str) -> Result<Option<&'a Value>> {
     let bytes = path.as_bytes();
     if bytes.first().copied() != Some(b'$') {
-        return Err(FrankenError::function_error(format!(
-            "invalid json path `{path}`: must start with `$`"
-        )));
+        return Err(bad_json_path(path));
     }
 
     let mut idx = 1;
@@ -2293,9 +2271,7 @@ fn resolve_path<'a>(root: &'a Value, path: &str) -> Result<Option<&'a Value>> {
             b'.' => {
                 idx += 1;
                 if idx >= bytes.len() {
-                    return Err(FrankenError::function_error(format!(
-                        "invalid json path `{path}`: empty key segment"
-                    )));
+                    return Err(bad_json_path(path));
                 }
 
                 let next = if bytes[idx] == b'"' {
@@ -2307,9 +2283,7 @@ fn resolve_path<'a>(root: &'a Value, path: &str) -> Result<Option<&'a Value>> {
                         idx += 1;
                     }
                     if start == idx {
-                        return Err(FrankenError::function_error(format!(
-                            "invalid json path `{path}`: empty key segment"
-                        )));
+                        return Err(bad_json_path(path));
                     }
                     cursor.get(&path[start..idx])
                 };
@@ -2341,9 +2315,7 @@ fn resolve_path<'a>(root: &'a Value, path: &str) -> Result<Option<&'a Value>> {
                     idx += 1;
                 }
                 if idx >= bytes.len() {
-                    return Err(FrankenError::function_error(format!(
-                        "invalid json path `{path}`: missing closing `]`"
-                    )));
+                    return Err(bad_json_path(path));
                 }
                 let segment_text = &path[start..idx];
                 idx += 1;
@@ -2352,15 +2324,10 @@ fn resolve_path<'a>(root: &'a Value, path: &str) -> Result<Option<&'a Value>> {
                     return Ok(None);
                 }
                 if let Some(rest) = segment_text.strip_prefix("#-") {
-                    let from_end = rest.parse::<usize>().map_err(|error| {
-                        FrankenError::function_error(format!(
-                            "invalid json path `{path}` from-end index `{segment_text}`: {error}"
-                        ))
-                    })?;
+                    let from_end = parse_path_index(rest).ok_or_else(|| bad_json_path(path))?;
+                    // `#-0` is one past the last element, like `#`: nothing there.
                     if from_end == 0 {
-                        return Err(FrankenError::function_error(format!(
-                            "invalid json path `{path}`: from-end index must be >= 1"
-                        )));
+                        return Ok(None);
                     }
                     let Some(array) = cursor.as_array() else {
                         return Ok(None);
@@ -2372,11 +2339,7 @@ fn resolve_path<'a>(root: &'a Value, path: &str) -> Result<Option<&'a Value>> {
                     continue;
                 }
 
-                let index = segment_text.parse::<usize>().map_err(|error| {
-                    FrankenError::function_error(format!(
-                        "invalid json path `{path}` array index `{segment_text}`: {error}"
-                    ))
-                })?;
+                let index = parse_path_index(segment_text).ok_or_else(|| bad_json_path(path))?;
                 let Some(array) = cursor.as_array() else {
                     return Ok(None);
                 };
@@ -2386,9 +2349,7 @@ fn resolve_path<'a>(root: &'a Value, path: &str) -> Result<Option<&'a Value>> {
                 cursor = next;
             }
             _ => {
-                return Err(FrankenError::function_error(format!(
-                    "invalid json path `{path}` at byte offset {idx}"
-                )));
+                return Err(bad_json_path(path));
             }
         }
     }
@@ -2517,12 +2478,7 @@ fn parse_json_table_filter_args(args: &[SqliteValue]) -> Result<Option<(Value, O
     let path = match args.get(1) {
         None => None,
         Some(SqliteValue::Null) => return Ok(None),
-        Some(SqliteValue::Text(path)) => Some(&**path),
-        Some(_) => {
-            return Err(FrankenError::function_error(
-                "json table-valued PATH argument must be TEXT or NULL",
-            ));
-        }
+        Some(_) => Some(path_arg("json_each", args, 1)?),
     };
 
     Ok(Some((input_value, path)))
@@ -3024,6 +2980,47 @@ fn invalid_arity(name: &str, expected: &str, got: usize) -> FrankenError {
     FrankenError::function_error(format!("{name} expects {expected}; got {got} argument(s)"))
 }
 
+/// Stock's error for input that does not parse as JSON (text or JSONB).
+fn malformed_json() -> FrankenError {
+    FrankenError::function_error("malformed JSON")
+}
+
+/// Stock's error for a PATH it cannot parse: `bad JSON path: %Q`.
+fn bad_json_path(path: &str) -> FrankenError {
+    FrankenError::function_error(format!("bad JSON path: '{}'", path.replace('\'', "''")))
+}
+
+/// Stock's arity rule for json_set/json_insert/json_replace and their jsonb_
+/// forms: any odd count (a lone argument returns the input), else an error
+/// that names the json_ form.
+fn check_edit_arity(name: &str, args: &[SqliteValue]) -> Result<()> {
+    if args.len().is_multiple_of(2) {
+        let base = name
+            .trim_start_matches("jsonb_")
+            .trim_start_matches("json_");
+        return Err(FrankenError::function_error(format!(
+            "json_{base}() needs an odd number of arguments"
+        )));
+    }
+    Ok(())
+}
+
+/// A PATH argument read the way stock reads one (`sqlite3_value_text`): a
+/// BLOB is its UTF-8 bytes, and a number is its text, which never starts with
+/// `$` and so is a bad path.
+fn path_arg<'a>(name: &str, args: &'a [SqliteValue], index: usize) -> Result<&'a str> {
+    match args.get(index) {
+        Some(SqliteValue::Text(text)) => Ok(&**text),
+        Some(SqliteValue::Blob(bytes)) => {
+            std::str::from_utf8(bytes).map_err(|_| bad_json_path(&String::from_utf8_lossy(bytes)))
+        }
+        Some(other @ (SqliteValue::Integer(_) | SqliteValue::Float(_))) => {
+            Err(bad_json_path(&other.to_text()))
+        }
+        _ => text_arg(name, args, index),
+    }
+}
+
 fn text_arg<'a>(name: &str, args: &'a [SqliteValue], index: usize) -> Result<&'a str> {
     match args.get(index) {
         Some(SqliteValue::Text(text)) => Ok(&**text),
@@ -3070,16 +3067,12 @@ fn optional_flags_arg(name: &str, args: &[SqliteValue], index: usize) -> Result<
     let Some(value) = args.get(index) else {
         return Ok(None);
     };
-    let raw = value.to_integer();
-    let flags = u8::try_from(raw).map_err(|_| {
-        FrankenError::function_error(format!("{name} flags out of range for u8: {raw}"))
-    })?;
-    if !(1..=15).contains(&flags) {
-        return Err(FrankenError::function_error(format!(
-            "{name} FLAGS parameter must be between 1 and 15"
-        )));
+    match u8::try_from(value.to_integer()) {
+        Ok(flags @ 1..=15) => Ok(Some(flags)),
+        _ => Err(FrankenError::function_error(format!(
+            "FLAGS parameter to {name}() must be between 1 and 15"
+        ))),
     }
-    Ok(Some(flags))
 }
 
 fn usize_to_i64(name: &str, value: usize) -> Result<i64> {
@@ -3095,7 +3088,7 @@ fn collect_path_args<'a>(
 ) -> Result<Vec<&'a str>> {
     let mut out = Vec::with_capacity(args.len().saturating_sub(start));
     for idx in start..args.len() {
-        out.push(text_arg(name, args, idx)?);
+        out.push(path_arg(name, args, idx)?);
     }
     Ok(out)
 }
@@ -3105,33 +3098,32 @@ fn normalize_arrow_path_arg<'a>(
     value: &'a SqliteValue,
     index: usize,
 ) -> Result<Cow<'a, str>> {
-    match value {
-        SqliteValue::Text(path) => {
-            if path.starts_with('$') || path.is_empty() {
-                Ok(Cow::Borrowed(&**path))
-            } else {
-                let quoted = serde_json::to_string(path).map_err(|error| {
-                    FrankenError::function_error(format!(
-                        "{name} argument {} key encoding failed: {error}",
-                        index + 1
-                    ))
-                })?;
-                Ok(Cow::Owned(format!("$.{quoted}")))
-            }
+    // Stock's abbreviated paths: an INTEGER N is `$[N]` (`$[#-N]` when
+    // negative); any other value is read as text, where `$...` is a full path,
+    // `[N]` means `$[N]`, and anything else is an object label.
+    let path = match value {
+        SqliteValue::Integer(index_value) if *index_value >= 0 => {
+            return Ok(Cow::Owned(format!("$[{index_value}]")));
         }
         SqliteValue::Integer(index_value) => {
-            if *index_value >= 0 {
-                Ok(Cow::Owned(format!("$[{index_value}]")))
-            } else {
-                Ok(Cow::Owned(format!("$[#-{}]", index_value.unsigned_abs())))
-            }
+            return Ok(Cow::Owned(format!("$[#-{}]", index_value.unsigned_abs())));
         }
-        other => Err(FrankenError::function_error(format!(
-            "{name} argument {} must be TEXT or INTEGER, got {}",
-            index + 1,
-            other.typeof_str()
-        ))),
+        SqliteValue::Text(path) => Cow::Borrowed(&**path),
+        other => Cow::Owned(other.to_text()),
+    };
+    if path.starts_with('$') || path.is_empty() {
+        return Ok(path);
     }
+    if path.len() >= 3 && path.starts_with('[') && path.ends_with(']') {
+        return Ok(Cow::Owned(format!("${path}")));
+    }
+    let quoted = serde_json::to_string(path.as_ref()).map_err(|error| {
+        FrankenError::function_error(format!(
+            "{name} argument {} key encoding failed: {error}",
+            index + 1
+        ))
+    })?;
+    Ok(Cow::Owned(format!("$.{quoted}")))
 }
 
 fn invoke_json_arrow(name: &str, args: &[SqliteValue], double_arrow: bool) -> Result<SqliteValue> {
@@ -3162,9 +3154,11 @@ fn collect_path_value_pairs(
         if idx + 1 >= args.len() {
             break;
         }
-        let path = text_arg(name, args, idx)?.to_owned();
-        let value = args[idx + 1].clone();
-        pairs.push((path, value));
+        // Stock skips a pair whose PATH is NULL.
+        if !args[idx].is_null() {
+            let path = path_arg(name, args, idx)?.to_owned();
+            pairs.push((path, args[idx + 1].clone()));
+        }
         idx += 2;
     }
     Ok(pairs)
@@ -3279,7 +3273,7 @@ impl ScalarFunction for JsonTypeFunc {
             if matches!(args[1], SqliteValue::Null) {
                 return Ok(SqliteValue::Null);
             }
-            Some(text_arg(self.name(), args, 1)?)
+            Some(path_arg(self.name(), args, 1)?)
         } else {
             None
         };
@@ -3305,14 +3299,7 @@ impl JsonExtractFunc {
     /// array or object, and the array built for several paths, are JSON; a
     /// scalar (even a string that looks like JSON) is not.
     fn extract(&self, args: &[SqliteValue]) -> Result<(SqliteValue, Option<u32>)> {
-        if args.is_empty() {
-            return Err(invalid_arity(
-                self.name(),
-                "at least 1 argument (json, path...)",
-                args.len(),
-            ));
-        }
-        if args.len() == 1 {
+        if args.len() < 2 {
             return Ok((SqliteValue::Null, None));
         }
         if matches!(args[0], SqliteValue::Null) {
@@ -3324,7 +3311,7 @@ impl JsonExtractFunc {
         }
         let input = json_arg_value(self.name(), args, 0)?;
         if args.len() == 2 {
-            let path = text_arg(self.name(), args, 1)?;
+            let path = path_arg(self.name(), args, 1)?;
             let selected = resolve_path(&input, path)?;
             let subtype = matches!(selected, Some(Value::Array(_) | Value::Object(_)))
                 .then_some(JSON_SUBTYPE);
@@ -3368,14 +3355,7 @@ pub struct JsonbExtractFunc;
 
 impl ScalarFunction for JsonbExtractFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
-        if args.is_empty() {
-            return Err(invalid_arity(
-                self.name(),
-                "at least 1 argument (json, path...)",
-                args.len(),
-            ));
-        }
-        if args.len() == 1 {
+        if args.len() < 2 {
             return Ok(SqliteValue::Null);
         }
         if matches!(args[0], SqliteValue::Null) {
@@ -3386,7 +3366,7 @@ impl ScalarFunction for JsonbExtractFunc {
         }
         let input = json_arg_value(self.name(), args, 0)?;
         if args.len() == 2 {
-            let path = text_arg(self.name(), args, 1)?;
+            let path = path_arg(self.name(), args, 1)?;
             let node = jsonb_extract_single_path_value(&input, path)?;
             // Stock jsonb_extract returns JSONB only where json_extract would
             // return a JSON array/object; a single path resolving to a JSON
@@ -3642,22 +3622,11 @@ pub struct JsonSetFunc;
 
 impl ScalarFunction for JsonSetFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
-        if args.len() < 3 || args.len().is_multiple_of(2) {
-            return Err(invalid_arity(
-                self.name(),
-                "an odd argument count >= 3 (json, path, value, ...)",
-                args.len(),
-            ));
-        }
-        if matches!(args[0], SqliteValue::Null) {
+        if args.is_empty() {
             return Ok(SqliteValue::Null);
         }
-        // SQLite returns NULL when any path argument is NULL.
-        if args[1..]
-            .iter()
-            .step_by(2)
-            .any(|a| matches!(a, SqliteValue::Null))
-        {
+        check_edit_arity(self.name(), args)?;
+        if matches!(args[0], SqliteValue::Null) {
             return Ok(SqliteValue::Null);
         }
         let input = json_arg_value(self.name(), args, 0)?;
@@ -3676,21 +3645,11 @@ impl ScalarFunction for JsonSetFunc {
         args: &[SqliteValue],
         arg_subtypes: &[u32],
     ) -> Result<SqliteValue> {
-        if args.len() < 3 || args.len().is_multiple_of(2) {
-            return Err(invalid_arity(
-                self.name(),
-                "an odd argument count >= 3 (json, path, value, ...)",
-                args.len(),
-            ));
-        }
-        if matches!(args[0], SqliteValue::Null) {
+        if args.is_empty() {
             return Ok(SqliteValue::Null);
         }
-        if args[1..]
-            .iter()
-            .step_by(2)
-            .any(|a| matches!(a, SqliteValue::Null))
-        {
+        check_edit_arity(self.name(), args)?;
+        if matches!(args[0], SqliteValue::Null) {
             return Ok(SqliteValue::Null);
         }
         let input = json_arg_value(self.name(), args, 0)?;
@@ -3723,21 +3682,11 @@ pub struct JsonbSetFunc;
 
 impl ScalarFunction for JsonbSetFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
-        if args.len() < 3 || args.len().is_multiple_of(2) {
-            return Err(invalid_arity(
-                self.name(),
-                "an odd argument count >= 3 (json, path, value, ...)",
-                args.len(),
-            ));
-        }
-        if matches!(args[0], SqliteValue::Null) {
+        if args.is_empty() {
             return Ok(SqliteValue::Null);
         }
-        if args[1..]
-            .iter()
-            .step_by(2)
-            .any(|a| matches!(a, SqliteValue::Null))
-        {
+        check_edit_arity(self.name(), args)?;
+        if matches!(args[0], SqliteValue::Null) {
             return Ok(SqliteValue::Null);
         }
         let input = json_arg_value(self.name(), args, 0)?;
@@ -3756,21 +3705,11 @@ impl ScalarFunction for JsonbSetFunc {
         args: &[SqliteValue],
         arg_subtypes: &[u32],
     ) -> Result<SqliteValue> {
-        if args.len() < 3 || args.len().is_multiple_of(2) {
-            return Err(invalid_arity(
-                self.name(),
-                "an odd argument count >= 3 (json, path, value, ...)",
-                args.len(),
-            ));
-        }
-        if matches!(args[0], SqliteValue::Null) {
+        if args.is_empty() {
             return Ok(SqliteValue::Null);
         }
-        if args[1..]
-            .iter()
-            .step_by(2)
-            .any(|a| matches!(a, SqliteValue::Null))
-        {
+        check_edit_arity(self.name(), args)?;
+        if matches!(args[0], SqliteValue::Null) {
             return Ok(SqliteValue::Null);
         }
         let input = json_arg_value(self.name(), args, 0)?;
@@ -3799,22 +3738,11 @@ pub struct JsonInsertFunc;
 
 impl ScalarFunction for JsonInsertFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
-        if args.len() < 3 || args.len().is_multiple_of(2) {
-            return Err(invalid_arity(
-                self.name(),
-                "an odd argument count >= 3 (json, path, value, ...)",
-                args.len(),
-            ));
-        }
-        if matches!(args[0], SqliteValue::Null) {
+        if args.is_empty() {
             return Ok(SqliteValue::Null);
         }
-        // SQLite returns NULL when any path argument is NULL.
-        if args[1..]
-            .iter()
-            .step_by(2)
-            .any(|a| matches!(a, SqliteValue::Null))
-        {
+        check_edit_arity(self.name(), args)?;
+        if matches!(args[0], SqliteValue::Null) {
             return Ok(SqliteValue::Null);
         }
         let input = json_arg_value(self.name(), args, 0)?;
@@ -3833,21 +3761,11 @@ impl ScalarFunction for JsonInsertFunc {
         args: &[SqliteValue],
         arg_subtypes: &[u32],
     ) -> Result<SqliteValue> {
-        if args.len() < 3 || args.len().is_multiple_of(2) {
-            return Err(invalid_arity(
-                self.name(),
-                "an odd argument count >= 3 (json, path, value, ...)",
-                args.len(),
-            ));
-        }
-        if matches!(args[0], SqliteValue::Null) {
+        if args.is_empty() {
             return Ok(SqliteValue::Null);
         }
-        if args[1..]
-            .iter()
-            .step_by(2)
-            .any(|a| matches!(a, SqliteValue::Null))
-        {
+        check_edit_arity(self.name(), args)?;
+        if matches!(args[0], SqliteValue::Null) {
             return Ok(SqliteValue::Null);
         }
         let input = json_arg_value(self.name(), args, 0)?;
@@ -3880,21 +3798,11 @@ pub struct JsonbInsertFunc;
 
 impl ScalarFunction for JsonbInsertFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
-        if args.len() < 3 || args.len().is_multiple_of(2) {
-            return Err(invalid_arity(
-                self.name(),
-                "an odd argument count >= 3 (json, path, value, ...)",
-                args.len(),
-            ));
-        }
-        if matches!(args[0], SqliteValue::Null) {
+        if args.is_empty() {
             return Ok(SqliteValue::Null);
         }
-        if args[1..]
-            .iter()
-            .step_by(2)
-            .any(|a| matches!(a, SqliteValue::Null))
-        {
+        check_edit_arity(self.name(), args)?;
+        if matches!(args[0], SqliteValue::Null) {
             return Ok(SqliteValue::Null);
         }
         let input = json_arg_value(self.name(), args, 0)?;
@@ -3913,21 +3821,11 @@ impl ScalarFunction for JsonbInsertFunc {
         args: &[SqliteValue],
         arg_subtypes: &[u32],
     ) -> Result<SqliteValue> {
-        if args.len() < 3 || args.len().is_multiple_of(2) {
-            return Err(invalid_arity(
-                self.name(),
-                "an odd argument count >= 3 (json, path, value, ...)",
-                args.len(),
-            ));
-        }
-        if matches!(args[0], SqliteValue::Null) {
+        if args.is_empty() {
             return Ok(SqliteValue::Null);
         }
-        if args[1..]
-            .iter()
-            .step_by(2)
-            .any(|a| matches!(a, SqliteValue::Null))
-        {
+        check_edit_arity(self.name(), args)?;
+        if matches!(args[0], SqliteValue::Null) {
             return Ok(SqliteValue::Null);
         }
         let input = json_arg_value(self.name(), args, 0)?;
@@ -3956,22 +3854,11 @@ pub struct JsonReplaceFunc;
 
 impl ScalarFunction for JsonReplaceFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
-        if args.len() < 3 || args.len().is_multiple_of(2) {
-            return Err(invalid_arity(
-                self.name(),
-                "an odd argument count >= 3 (json, path, value, ...)",
-                args.len(),
-            ));
-        }
-        if matches!(args[0], SqliteValue::Null) {
+        if args.is_empty() {
             return Ok(SqliteValue::Null);
         }
-        // SQLite returns NULL when any path argument is NULL.
-        if args[1..]
-            .iter()
-            .step_by(2)
-            .any(|a| matches!(a, SqliteValue::Null))
-        {
+        check_edit_arity(self.name(), args)?;
+        if matches!(args[0], SqliteValue::Null) {
             return Ok(SqliteValue::Null);
         }
         let input = json_arg_value(self.name(), args, 0)?;
@@ -3990,21 +3877,11 @@ impl ScalarFunction for JsonReplaceFunc {
         args: &[SqliteValue],
         arg_subtypes: &[u32],
     ) -> Result<SqliteValue> {
-        if args.len() < 3 || args.len().is_multiple_of(2) {
-            return Err(invalid_arity(
-                self.name(),
-                "an odd argument count >= 3 (json, path, value, ...)",
-                args.len(),
-            ));
-        }
-        if matches!(args[0], SqliteValue::Null) {
+        if args.is_empty() {
             return Ok(SqliteValue::Null);
         }
-        if args[1..]
-            .iter()
-            .step_by(2)
-            .any(|a| matches!(a, SqliteValue::Null))
-        {
+        check_edit_arity(self.name(), args)?;
+        if matches!(args[0], SqliteValue::Null) {
             return Ok(SqliteValue::Null);
         }
         let input = json_arg_value(self.name(), args, 0)?;
@@ -4037,21 +3914,11 @@ pub struct JsonbReplaceFunc;
 
 impl ScalarFunction for JsonbReplaceFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
-        if args.len() < 3 || args.len().is_multiple_of(2) {
-            return Err(invalid_arity(
-                self.name(),
-                "an odd argument count >= 3 (json, path, value, ...)",
-                args.len(),
-            ));
-        }
-        if matches!(args[0], SqliteValue::Null) {
+        if args.is_empty() {
             return Ok(SqliteValue::Null);
         }
-        if args[1..]
-            .iter()
-            .step_by(2)
-            .any(|a| matches!(a, SqliteValue::Null))
-        {
+        check_edit_arity(self.name(), args)?;
+        if matches!(args[0], SqliteValue::Null) {
             return Ok(SqliteValue::Null);
         }
         let input = json_arg_value(self.name(), args, 0)?;
@@ -4070,21 +3937,11 @@ impl ScalarFunction for JsonbReplaceFunc {
         args: &[SqliteValue],
         arg_subtypes: &[u32],
     ) -> Result<SqliteValue> {
-        if args.len() < 3 || args.len().is_multiple_of(2) {
-            return Err(invalid_arity(
-                self.name(),
-                "an odd argument count >= 3 (json, path, value, ...)",
-                args.len(),
-            ));
-        }
-        if matches!(args[0], SqliteValue::Null) {
+        if args.is_empty() {
             return Ok(SqliteValue::Null);
         }
-        if args[1..]
-            .iter()
-            .step_by(2)
-            .any(|a| matches!(a, SqliteValue::Null))
-        {
+        check_edit_arity(self.name(), args)?;
+        if matches!(args[0], SqliteValue::Null) {
             return Ok(SqliteValue::Null);
         }
         let input = json_arg_value(self.name(), args, 0)?;
@@ -4114,11 +3971,7 @@ pub struct JsonRemoveFunc;
 impl ScalarFunction for JsonRemoveFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
         if args.is_empty() {
-            return Err(invalid_arity(
-                self.name(),
-                "at least 1 argument (json [, path...])",
-                args.len(),
-            ));
+            return Ok(SqliteValue::Null);
         }
         if matches!(args[0], SqliteValue::Null) {
             return Ok(SqliteValue::Null);
@@ -4159,11 +4012,7 @@ pub struct JsonbRemoveFunc;
 impl ScalarFunction for JsonbRemoveFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
         if args.is_empty() {
-            return Err(invalid_arity(
-                self.name(),
-                "at least 1 argument (json [, path...])",
-                args.len(),
-            ));
+            return Ok(SqliteValue::Null);
         }
         if matches!(args[0], SqliteValue::Null) {
             return Ok(SqliteValue::Null);
@@ -4272,7 +4121,7 @@ impl ScalarFunction for JsonArrayLengthFunc {
             if matches!(args[1], SqliteValue::Null) {
                 return Ok(SqliteValue::Null);
             }
-            Some(text_arg(self.name(), args, 1)?)
+            Some(path_arg(self.name(), args, 1)?)
         } else {
             None
         };
@@ -4425,9 +4274,7 @@ impl AggregateFunction for JsonGroupObjectFunc {
         Vec::new()
     }
     fn step(&self, state: &mut Self::State, args: &[SqliteValue]) -> Result<()> {
-        state.push((args[0].clone(), 0));
-        state.push((args[1].clone(), 0));
-        Ok(())
+        self.step_with_arg_subtypes(state, args, &[])
     }
     fn step_with_arg_subtypes(
         &self,
@@ -4435,7 +4282,14 @@ impl AggregateFunction for JsonGroupObjectFunc {
         args: &[SqliteValue],
         arg_subtypes: &[u32],
     ) -> Result<()> {
-        state.push((args[0].clone(), arg_subtypes.first().copied().unwrap_or(0)));
+        // Stock reads the label as text (`sqlite3_value_text`), so a number
+        // becomes its text, and a NULL label drops the row.
+        let label = match &args[0] {
+            SqliteValue::Null => return Ok(()),
+            label @ SqliteValue::Text(_) => label.clone(),
+            other => SqliteValue::Text(SmallText::from_string(other.to_text())),
+        };
+        state.push((label, 0));
         state.push((args[1].clone(), arg_subtypes.get(1).copied().unwrap_or(0)));
         Ok(())
     }
@@ -7553,8 +7407,17 @@ mod tests {
     }
 
     #[test]
-    fn test_path_from_end_zero_error() {
-        assert!(json_extract("[1,2,3]", &["$[#-0]"]).is_err());
+    fn test_path_from_end_zero_is_one_past_the_end() {
+        // Stock: `$[#-0]` is the slot `$[#]` names, so nothing is there to
+        // extract, and json_set appends there.
+        assert_eq!(
+            json_extract("[1,2,3]", &["$[#-0]"]).unwrap(),
+            SqliteValue::Null
+        );
+        assert_eq!(
+            json_set("[1]", &[("$[#-0]", SqliteValue::Integer(2))]).unwrap(),
+            "[1,2]"
+        );
     }
 
     #[test]
@@ -7568,9 +7431,14 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_json_group_object_non_text_key_error() {
-        let err = json_group_object(&[(SqliteValue::Integer(1), SqliteValue::Integer(2))]);
-        assert!(err.is_err());
+    fn test_json_group_object_non_text_key_is_its_text() {
+        // Stock: json_group_object(1, 2) -> {"1":2}; a NULL label drops the row.
+        let out = json_group_object(&[
+            (SqliteValue::Integer(1), SqliteValue::Integer(2)),
+            (SqliteValue::Null, SqliteValue::Integer(3)),
+        ])
+        .unwrap();
+        assert_eq!(out, r#"{"1":2}"#);
     }
 
     #[test]

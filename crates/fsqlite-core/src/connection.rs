@@ -190125,7 +190125,7 @@ mod tests {
         // Trigger WHEN is a truthiness context: stock compiles it through
         // ExprIfTrue, so AND/OR short-circuit left-to-right and an operand
         // past the determining one is never evaluated. `json_each('bare')`
-        // errors with "invalid JSON input" if it ever runs. NULL determines
+        // errors with "malformed JSON" if it ever runs. NULL determines
         // nothing (NULL AND FALSE is false), so the walk continues past NULL
         // to a later determining operand.
         // NOTE: VALUE context (a result column) is eager in stock and stays
@@ -190207,7 +190207,7 @@ mod tests {
                     None => {
                         let error = update.expect_err(name);
                         assert!(
-                            error.to_string().contains("invalid JSON input"),
+                            error.to_string().contains("malformed JSON"),
                             "{name}: expected the json error to propagate, got {error}"
                         );
                     }
@@ -190406,8 +190406,8 @@ mod tests {
         // Downstream shape (hfdt migration 0113): a WHEN guard whose EXISTS
         // arm is FALSE for the row must prevent a later arm from running
         // json_each over an element that is a bare string. Before the
-        // short-circuit fix this UPDATE failed with "invalid JSON input:
-        // expected value at line 1 column 1".
+        // short-circuit fix this UPDATE failed with a JSON parse error
+        // ("malformed JSON" in stock's wording).
         asupersync::test_utils::run_test(|| async {
             let conn = Connection::open(":memory:").await.unwrap();
             conn.execute(
@@ -190457,7 +190457,7 @@ mod tests {
                 .unwrap_err();
             let message = error.to_string();
             assert!(
-                message.contains("guarded shape invalid") || message.contains("invalid JSON input"),
+                message.contains("guarded shape invalid") || message.contains("malformed JSON"),
                 "positive control must abort, got: {message}"
             );
         });
