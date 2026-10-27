@@ -49870,11 +49870,11 @@ impl Connection {
         resolve_qualified_column(sum_arg_col).is_some()
     }
 
-    /// bd-41o3t: an implicit aggregate over one INNER or LEFT join of two
-    /// base tables (`SELECT count(*) FROM u JOIN t ON t.a = u.a`). VDBE
-    /// codegen compiles the single-lookup form into a loop that feeds each
-    /// match to AggStep; `try_execute_join_aggregate_program` falls back to
-    /// the general join-aggregate path for any shape codegen declines.
+    /// An implicit aggregate over INNER or LEFT joins of base tables
+    /// (`SELECT count(*) FROM u JOIN t ON t.a = u.a`). VDBE codegen compiles
+    /// supported lookup chains into a loop that feeds each match to AggStep;
+    /// `try_execute_join_aggregate_program` falls back to the general
+    /// join-aggregate path for any shape codegen declines.
     fn select_join_aggregate_is_vdbe_candidate(&self, select: &SelectStatement) -> bool {
         use fsqlite_ast::{FunctionArgs, JoinConstraint, JoinKind};
 
@@ -49892,7 +49892,7 @@ impl Connection {
         };
         if !self.pager.is_file_backed()
             || self.time_travel_active.get()
-            || from.joins.len() != 1
+            || from.joins.is_empty()
             || !group_by.is_empty()
             || having.is_some()
             || *distinct != Distinctness::All
@@ -49911,17 +49911,19 @@ impl Connection {
         {
             return false;
         }
-        let join = &from.joins[0];
         let vdbe_expr = |expr: &Expr| !expr_has_any_subquery(expr) && join_expr_is_vdbe_eligible(expr);
         let base_table = |source: &TableOrSubquery| {
-            matches!(source, TableOrSubquery::Table { .. })
+            matches!(source, TableOrSubquery::Table { name, .. }
+                if !self.table_name_is_virtual(&name.name))
                 && !table_or_subquery_in_attached_schema(source)
         };
         if !base_table(&from.source)
-            || !base_table(&join.table)
-            || !matches!(join.join_type.kind, JoinKind::Inner | JoinKind::Left)
-            || join.join_type.natural
-            || !matches!(&join.constraint, Some(JoinConstraint::On(on)) if vdbe_expr(on))
+            || from.joins.iter().any(|join| {
+                !base_table(&join.table)
+                    || !matches!(join.join_type.kind, JoinKind::Inner | JoinKind::Left)
+                    || join.join_type.natural
+                    || !matches!(&join.constraint, Some(JoinConstraint::On(on)) if vdbe_expr(on))
+            })
             || where_clause.as_ref().is_some_and(|expr| !vdbe_expr(expr))
         {
             return false;
@@ -49945,7 +49947,7 @@ impl Connection {
     }
 
     /// Run an implicit aggregate over a join through VDBE codegen. `None`
-    /// when codegen declines the shape (only single-lookup joins compile).
+    /// when codegen declines the shape (only supported lookup joins compile).
     async fn try_execute_join_aggregate_program(
         &self,
         cx: &Cx,
@@ -307232,11 +307234,35 @@ mod join_projection_prune_tests {
             }
 
             let all_bodies = usize::try_from(BIG_ROWS).unwrap() * BODY_BYTES;
-            for (sql, body_survives) in CASES {
+            for (case_index, (sql, body_survives)) in CASES.into_iter().enumerate() {
                 conn.join_materialization_profile.replace(Default::default());
                 let rows = conn.query(&format!("{sql};")).await.unwrap();
-                let profile = *conn.join_materialization_profile.borrow();
+                let mut profile = *conn.join_materialization_profile.borrow();
                 assert_eq!(values_of(&rows), stock_rows(&stock, sql, []), "{sql}");
+                if case_index < 2 {
+                    // GH#527: these lookup aggregates now execute directly in
+                    // the VDBE, with no generic source/join materialization.
+                    assert_eq!(profile.generic_route_hits, 0, "{sql}: {profile:?}");
+                    assert_eq!(profile.generic_source_rows, 0, "{sql}: {profile:?}");
+                    assert_eq!(profile.generic_source_payload_bytes, 0, "{sql}: {profile:?}");
+
+                    // Keep the original pruning proof for the same statements:
+                    // invoke the general aggregate evaluator explicitly, then
+                    // apply every original payload assertion below.
+                    let super::Statement::Select(select) =
+                        super::parse_single_statement(sql).unwrap()
+                    else {
+                        panic!("expected SELECT");
+                    };
+                    conn.join_materialization_profile.replace(Default::default());
+                    let cx = conn.op_cx().unwrap();
+                    let fallback = conn
+                        .execute_group_by_join_select(&cx, &select, None)
+                        .await
+                        .unwrap();
+                    assert_eq!(values_of(&fallback), stock_rows(&stock, sql, []), "{sql}");
+                    profile = *conn.join_materialization_profile.borrow();
+                }
                 assert!(
                     profile.generic_source_rows >= usize::try_from(BIG_ROWS).unwrap(),
                     "{sql} must take the generic fallback: {profile:?}"

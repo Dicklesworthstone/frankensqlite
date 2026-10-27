@@ -1,6 +1,6 @@
 #![recursion_limit = "512"]
 
-//! Implicit aggregates over a single-lookup join (bd-41o3t):
+//! Implicit aggregates over lookup joins (bd-41o3t, GH#527):
 //! `SELECT count(*), sum(t.c) FROM u JOIN t ON t.a = u.a` on a file-backed
 //! database compiles into a rowid or index lookup loop that feeds each match
 //! to AggStep, instead of materializing every joined row first. count(*)
@@ -12,6 +12,8 @@
 //! collated columns, an empty table, and a bound parameter. Shapes the lookup
 //! loop does not handle (OR in ON, DISTINCT aggregates) must still answer
 //! correctly through the general path.
+//! Multi-table chains additionally cover unique lookups, terminal LEFT JOIN
+//! null extension, empty inputs, prepared execution, and snapshot visibility.
 
 use fsqlite_core::connection::Connection;
 use fsqlite_types::value::SqliteValue;
@@ -187,6 +189,200 @@ fn join_aggregates_over_lookups_match_sqlite() {
                 );
                 let ops = opcodes(&f, "SELECT sum(t.c) FROM u JOIN t ON t.a = u.a").await;
                 assert!(ops.iter().any(|op| op == "SeekRowid"), "{ops:?}");
+            }
+        });
+    }
+}
+
+const MULTI_SETUP: &str = "
+    CREATE TABLE driver(id INTEGER PRIMARY KEY, sid INTEGER, sk INTEGER, amount REAL);
+    CREATE TABLE middle(id INTEGER PRIMARY KEY, k INTEGER UNIQUE, lid INTEGER, lk INTEGER);
+    CREATE TABLE leaf(id INTEGER PRIMARY KEY, k INTEGER UNIQUE, amount REAL, name TEXT);
+    CREATE TABLE tail(id INTEGER PRIMARY KEY, amount REAL);
+    CREATE TABLE empty_driver(id INTEGER PRIMARY KEY, sid INTEGER, amount REAL);
+    INSERT INTO driver VALUES
+        (1,1,10,1.0),(2,2,20,2.5),(3,3,30,NULL),(4,2,20,-3.0),
+        (5,4,40,5.5),(6,NULL,NULL,10.0),(7,999,999,1.0),(8,1,10,-2.0);
+    INSERT INTO middle VALUES (1,10,1,10),(2,20,99,999),(3,30,NULL,NULL),(4,40,2,20);
+    INSERT INTO leaf VALUES (1,10,12.5,'A'),(2,20,-2.0,'z'),(3,30,NULL,'b');
+    INSERT INTO tail VALUES (1,2.0),(2,-4.0);
+";
+
+#[test]
+fn multi_join_aggregates_stream_and_match_sqlite() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multi_join_aggregate.db");
+        let f = Connection::open(path.to_str().unwrap()).await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        f.execute_batch(MULTI_SETUP).await.unwrap();
+        r.execute_batch(MULTI_SETUP).unwrap();
+
+        // Alternate real matches, missing and NULL keys, and repeated driver
+        // keys. In particular, a LEFT miss must not poison the next match.
+        let chains = [
+            "driver d JOIN middle m ON m.id=d.sid JOIN leaf l ON l.id=m.lid",
+            "driver d JOIN middle m ON m.id=d.sid LEFT JOIN leaf l ON l.id=m.lid",
+            "driver d JOIN middle m ON m.k=d.sk JOIN leaf l ON l.k=m.lk",
+            "driver d JOIN middle m ON m.k=d.sk LEFT JOIN leaf l ON l.k=m.lk",
+            "driver d JOIN middle m ON m.id=d.sid JOIN leaf l ON l.id=m.lid \
+             LEFT JOIN tail t ON t.id=l.id",
+        ];
+        for chain in chains {
+            for aggregates in [
+                "count(*), count(l.id), count(d.amount), sum(l.amount), total(l.amount), \
+                 avg(d.amount), min(l.amount), max(l.amount)",
+                "sum(d.amount*l.amount), min(l.name), max(l.name), count(1)",
+            ] {
+                for predicate in [
+                    "",
+                    " WHERE d.id > 1",
+                    " WHERE l.id IS NULL",
+                    " WHERE d.id < 0",
+                ] {
+                    let sql = format!("SELECT {aggregates} FROM {chain}{predicate}");
+                    assert_agree(&f, &r, &sql, &[], &[]).await;
+                    let ops = opcodes(&f, &sql).await;
+                    assert_eq!(
+                        ops.iter().filter(|op| *op == "Rewind").count(),
+                        1,
+                        "{sql}: {ops:?}"
+                    );
+                    assert_eq!(
+                        ops.iter().filter(|op| *op == "ResultRow").count(),
+                        1,
+                        "{sql}: {ops:?}"
+                    );
+                    assert!(ops.iter().any(|op| op == "AggStep"), "{sql}: {ops:?}");
+                    assert!(ops.iter().any(|op| op == "AggFinal"), "{sql}: {ops:?}");
+                    assert!(!ops.iter().any(|op| op == "SorterInsert"), "{sql}: {ops:?}");
+                }
+            }
+        }
+        for chain in [
+            "empty_driver d JOIN middle m ON m.id=d.sid JOIN leaf l ON l.id=m.lid",
+            "empty_driver d JOIN middle m ON m.id=d.sid LEFT JOIN leaf l ON l.id=m.lid",
+        ] {
+            let sql = format!(
+                "SELECT count(*), count(l.id), sum(l.amount), total(l.amount), \
+                 avg(l.amount), min(l.amount), max(l.amount) FROM {chain}"
+            );
+            assert_agree(&f, &r, &sql, &[], &[]).await;
+        }
+
+        let parameterized = "SELECT count(*), sum(d.amount), sum(l.amount), max(l.id) FROM driver d \
+            JOIN middle m ON m.id=d.sid LEFT JOIN leaf l ON l.id=m.lid WHERE d.id > ?1";
+        let prepared = f.prepare(parameterized).await.unwrap();
+        for bound in [0_i64, 3, 100, 0] {
+            let params = [SqliteValue::Integer(bound)];
+            assert_agree(&f, &r, parameterized, &params, &[&bound]).await;
+            let prepared_rows = prepared.query_with_params(&params).await.unwrap();
+            let direct_rows = f.query_with_params(parameterized, &params).await.unwrap();
+            assert_eq!(
+                prepared_rows
+                    .iter()
+                    .map(|row| row.values())
+                    .collect::<Vec<_>>(),
+                direct_rows
+                    .iter()
+                    .map(|row| row.values())
+                    .collect::<Vec<_>>()
+            );
+        }
+        drop(prepared);
+
+        // A generated probe needs expression scratch registers. Those must
+        // not separate the index key from its rowid-floor register.
+        let generated = "ALTER TABLE middle ADD COLUMN generated_key INTEGER \
+            GENERATED ALWAYS AS (id * 10) VIRTUAL";
+        f.execute(generated).await.unwrap();
+        r.execute(generated, []).unwrap();
+        for sql in [
+            "SELECT count(*), sum(l.amount) FROM driver d JOIN middle m ON m.id=d.sid \
+             LEFT JOIN leaf l ON l.k=m.generated_key",
+            "SELECT d.id, l.id FROM driver d JOIN middle m ON m.id=d.sid \
+             LEFT JOIN leaf l ON l.k=m.generated_key ORDER BY d.id",
+        ] {
+            assert_agree(&f, &r, sql, &[], &[]).await;
+            let ops = opcodes(&f, sql).await;
+            assert_eq!(
+                ops.iter().filter(|op| *op == "Rewind").count(),
+                1,
+                "{sql}: {ops:?}"
+            );
+        }
+
+        // Read the explicit transaction's uncommitted pages, then the original
+        // values after rollback, through the same compiled join.
+        f.execute("BEGIN").await.unwrap();
+        r.execute("BEGIN", []).unwrap();
+        f.execute("UPDATE leaf SET amount=40.0 WHERE id=1")
+            .await
+            .unwrap();
+        r.execute("UPDATE leaf SET amount=40.0 WHERE id=1", [])
+            .unwrap();
+        assert_agree(&f, &r, parameterized, &[SqliteValue::Integer(0)], &[&0_i64]).await;
+        f.execute("ROLLBACK").await.unwrap();
+        r.execute("ROLLBACK", []).unwrap();
+        assert_agree(&f, &r, parameterized, &[SqliteValue::Integer(0)], &[&0_i64]).await;
+
+        // Accumulator state belongs to one execution, including after an error.
+        f.execute("UPDATE driver SET sid=1, amount=1.0")
+            .await
+            .unwrap();
+        r.execute("UPDATE driver SET sid=1, amount=1.0", [])
+            .unwrap();
+        let overflow = "SELECT sum(9223372036854775807) FROM driver d \
+            JOIN middle m ON m.id=d.sid JOIN leaf l ON l.id=m.lid";
+        assert!(
+            f.query(overflow)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("overflow")
+        );
+        assert!(
+            r.query_row(overflow, [], |row| row.get::<_, i64>(0))
+                .unwrap_err()
+                .to_string()
+                .contains("overflow")
+        );
+        assert_agree(&f, &r, parameterized, &[SqliteValue::Integer(0)], &[&0_i64]).await;
+    });
+}
+
+#[test]
+fn unsupported_multi_join_aggregates_keep_sqlite_semantics() {
+    for memory in [false, true] {
+        asupersync::test_utils::run_test(|| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("multi_join_fallback.db");
+            let target = if memory {
+                ":memory:"
+            } else {
+                path.to_str().unwrap()
+            };
+            let f = Connection::open(target).await.unwrap();
+            let r = rusqlite::Connection::open_in_memory().unwrap();
+            f.execute_batch(MULTI_SETUP).await.unwrap();
+            r.execute_batch(MULTI_SETUP).unwrap();
+            for sql in [
+                "SELECT count(*), sum(l.amount) FROM driver d LEFT JOIN middle m ON m.id=d.sid \
+                 JOIN leaf l ON l.id=m.lid",
+                "SELECT count(*), count(l.id) FROM driver d LEFT JOIN middle m ON m.id=d.sid \
+                 LEFT JOIN leaf l ON l.id=m.lid",
+                "SELECT count(*), sum(l.amount) FROM driver d JOIN middle m ON m.id=d.sid AND d.id>1 \
+                 LEFT JOIN leaf l ON l.id=m.lid",
+                "SELECT count(*), sum(l.amount) FROM driver d JOIN middle m ON m.id=d.sid \
+                 LEFT JOIN leaf l ON l.id=m.lid+0",
+                "SELECT count(DISTINCT d.sid), min(l.name COLLATE NOCASE) FROM driver d \
+                 JOIN middle m ON m.id=d.sid LEFT JOIN leaf l ON l.id=m.lid",
+                "SELECT count(*) FILTER (WHERE l.id IS NULL), sum(d.amount) FROM driver d \
+                 JOIN middle m ON m.id=d.sid LEFT JOIN leaf l ON l.id=m.lid",
+                "SELECT count(*), sum(d.amount) FROM driver d \
+                 JOIN middle m ON m.id=d.sid JOIN driver l ON l.sid=m.id",
+            ] {
+                assert_agree(&f, &r, sql, &[], &[]).await;
             }
         });
     }

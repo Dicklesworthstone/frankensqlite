@@ -11755,7 +11755,7 @@ struct SingleJoinLookupPlan<'a> {
     prefix_probe: bool,
 }
 
-/// One result column of an implicit aggregate over a single-lookup join
+/// One result column of an implicit aggregate over a lookup join
 /// (`SELECT count(*), sum(t.c) FROM u JOIN t ON t.a = u.a`).
 struct JoinAggregateTerm<'a> {
     /// Lowercase builtin name: count, sum, total, avg, min or max.
@@ -11814,7 +11814,7 @@ fn join_aggregate_terms(columns: &[ResultColumn]) -> Option<Vec<JoinAggregateTer
 }
 
 /// Whether an aggregate argument is a value the join loop can compute:
-/// columns of the two tables and literals under arithmetic or concatenation.
+/// columns of the joined tables and literals under arithmetic or concatenation.
 /// For min/max, a column with a non-BINARY collation is refused, since the
 /// comparison would have to honor it.
 fn join_aggregate_arg_supported(
@@ -11858,10 +11858,11 @@ fn join_aggregate_arg_supported(
     }
 }
 
-/// Compile an implicit aggregate over one INNER or LEFT join whose ON is a
-/// single rowid or index lookup. Each match feeds AggStep directly instead of
-/// materializing joined rows. Any other shape is `Unsupported`, so the
-/// connection runs its general join-aggregate path.
+/// Compile an implicit aggregate over a lookup join or a chain of unique
+/// lookups. Each match feeds AggStep directly instead of materializing joined
+/// rows. Multi-table chains preserve the existing lookup plan's restrictions,
+/// including at most one terminal LEFT join. Any other shape is `Unsupported`,
+/// so the connection runs its general join-aggregate path.
 #[allow(clippy::too_many_arguments)]
 fn codegen_join_aggregate_select(
     b: &mut ProgramBuilder,
@@ -11877,8 +11878,78 @@ fn codegen_join_aggregate_select(
 
     let unsupported =
         || CodegenError::Unsupported("aggregate over this JOIN shape in VDBE codegen".to_owned());
-    let ([join], TableOrSubquery::Table { name, alias, .. }) = (from.joins.as_slice(), &from.source)
-    else {
+    let TableOrSubquery::Table { name, alias, .. } = &from.source else {
+        return Err(unsupported());
+    };
+    let left_table = find_table(schema, &name.name)?;
+    let left_alias = alias.as_deref();
+    if from.joins.len() > 1 {
+        // The aggregate emitter uses the built-in BINARY comparator for
+        // MIN/MAX. A connection may override BINARY, so its name alone is
+        // insufficient proof that this lane preserves comparison semantics.
+        if ctx.collation_semantics != CollationSemantics::Builtin
+            && aggregates
+                .iter()
+                .any(|term| matches!(term.name.as_str(), "min" | "max"))
+        {
+            return Err(unsupported());
+        }
+        let mut join_tables = Vec::with_capacity(from.joins.len());
+        for join in &from.joins {
+            let TableOrSubquery::Table { name, alias, .. } = &join.table else {
+                return Err(unsupported());
+            };
+            let (Some(JoinConstraint::On(on_expr)), false, JoinKind::Inner | JoinKind::Left) = (
+                join.constraint.as_ref(),
+                join.join_type.natural,
+                join.join_type.kind,
+            ) else {
+                return Err(unsupported());
+            };
+            join_tables.push((
+                find_table(schema, &name.name)?,
+                alias.clone(),
+                join.join_type.kind,
+                Some(on_expr),
+            ));
+        }
+        let tables: Vec<_> = std::iter::once((left_table, left_alias))
+            .chain(
+                join_tables
+                    .iter()
+                    .map(|(table, alias, _, _)| (*table, alias.as_deref())),
+            )
+            .collect();
+        if !aggregates.iter().all(|term| {
+            term.arg.is_none_or(|arg| {
+                join_aggregate_arg_supported(
+                    arg,
+                    &tables,
+                    matches!(term.name.as_str(), "min" | "max"),
+                )
+            })
+        }) {
+            return Err(unsupported());
+        }
+        let Some(plan) = resolve_multi_join_lookup_plan(left_table, left_alias, &join_tables)
+        else {
+            return Err(unsupported());
+        };
+        return codegen_multi_join_lookup_select(
+            b,
+            stmt,
+            columns,
+            where_clause,
+            left_table,
+            left_alias,
+            &join_tables,
+            &plan,
+            ctx,
+            aggregates,
+        );
+    }
+
+    let [join] = from.joins.as_slice() else {
         return Err(unsupported());
     };
     let TableOrSubquery::Table {
@@ -11896,9 +11967,8 @@ fn codegen_join_aggregate_select(
     ) else {
         return Err(unsupported());
     };
-    let left_table = find_table(schema, &name.name)?;
     let right_table = find_table(schema, &right_name.name)?;
-    let (left_alias, right_alias) = (alias.as_deref(), right_alias.as_deref());
+    let right_alias = right_alias.as_deref();
     let tables = [(left_table, left_alias), (right_table, right_alias)];
     if !aggregates.iter().all(|term| {
         term.arg.is_none_or(|arg| {
@@ -13925,6 +13995,8 @@ fn resolve_multi_join_lookup_plan<'a>(
 /// (rowid lookup) or `SeekGE` on an index cursor — no nested Rewind/Next
 /// loops.  This is the O(N) fast path that avoids the Cartesian blowup
 /// in the general `codegen_join_select` scan path.
+/// With `aggregates`, fold each matched or null-extended row into the
+/// accumulators and emit only the final aggregate row.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn codegen_multi_join_lookup_select(
     b: &mut ProgramBuilder,
@@ -13941,6 +14013,7 @@ fn codegen_multi_join_lookup_select(
     )],
     plan: &MultiJoinLookupPlan<'_>,
     ctx: &CodegenContext,
+    aggregates: &[JoinAggregateTerm<'_>],
 ) -> Result<(), CodegenError> {
     use fsqlite_ast::JoinKind;
 
@@ -13959,6 +14032,13 @@ fn codegen_multi_join_lookup_select(
 
     let out_col_count = resolve_join_output_count(columns, &all_tables);
     let out_regs = b.alloc_regs(out_col_count as i32);
+    let accum_base = (!aggregates.is_empty()).then(|| {
+        let base = b.alloc_regs(aggregates.len() as i32);
+        for i in 0..aggregates.len() as i32 {
+            b.emit_op(Opcode::Null, 0, base + i, 0, P4::None, 0);
+        }
+        base
+    });
 
     // Open data cursors for every table.  Cursor id = table index in
     // all_tables (the convention emit_join_expr already relies on).
@@ -14054,22 +14134,19 @@ fn codegen_multi_join_lookup_select(
         None
     };
 
-    // The "emit one result row" tail is duplicated inline below — once
-    // on the all-lookups-landed path and once inside the trailing
-    // null-row block for the terminal LEFT JOIN miss.  They MUST stay
-    // in lock-step when someone edits the sort-vs-direct branching.
-    // Extracting a helper is awkward because both call sites bind the
-    // `sorter` tuple fields, the `out_regs`/`out_col_count` locals,
-    // and emit bytecode through the same `ProgramBuilder` — leaving
-    // them inline keeps the control-flow structure visible next to
-    // the label resolution above and below.
+    // Both the all-lookups-landed path and the trailing LEFT JOIN null
+    // block use the same output helper, including aggregate accumulation.
     for (i, step) in plan.steps.iter().enumerate() {
         let right_cursor = (i + 1) as i32;
         // Tables that have been bound by the time we emit step i.
         // probe_table_index is always < i + 1 by construction.
         let probe_tables = &all_tables[..=step.probe_table_index];
 
-        let probe_base = b.alloc_regs(1);
+        // Reserve the complete index probe before reading the source. A
+        // VIRTUAL generated column can allocate temporary registers while
+        // computing its value, but MakeRecord still needs adjacent key and
+        // rowid-floor registers.
+        let probe_base = b.alloc_regs(if index_cursors[i].is_some() { 2 } else { 1 });
         let probe_cursor = step.probe_table_index as i32;
         let probe_scan = ScanCtx {
             cursor: probe_cursor,
@@ -14116,17 +14193,9 @@ fn codegen_multi_join_lookup_select(
                 // have been rejected, so the first matching key row
                 // is the only one.
                 //
-                // `probe_base` was the last alloc_regs call and
-                // `min_rowid_reg` is the very next alloc_reg, so they
-                // are guaranteed adjacent — MakeRecord can read the
-                // 2-register run [probe_base, probe_base+1] directly
-                // without copying into a separate block.
-                let min_rowid_reg = b.alloc_reg();
-                debug_assert_eq!(
-                    min_rowid_reg,
-                    probe_base + 1,
-                    "probe_base and min_rowid_reg must be adjacent for MakeRecord"
-                );
+                // Both source registers were reserved before evaluating the
+                // probe, including any generated-column expression.
+                let min_rowid_reg = probe_base + 1;
                 b.emit_op(Opcode::Int64, 0, min_rowid_reg, 0, P4::Int64(i64::MIN), 0);
                 let probe_record_reg = b.alloc_reg();
                 b.emit_op(
@@ -14177,53 +14246,17 @@ fn codegen_multi_join_lookup_select(
         b.emit_jump_to_label(Opcode::IfNot, cond_reg, 1, row_done_label, P4::None, 0);
     }
 
-    // Emit the result tuple (either direct ResultRow or SorterInsert).
-    emit_join_result_columns(b, columns, out_regs, &all_tables, ctx)?;
-    if let Some((sort_cursor, sort_regs, sort_key_count, sort_record_reg)) = sorter {
-        for (i, term) in stmt.order_by.iter().enumerate() {
-            let sort_reg = sort_regs + i as i32;
-            emit_join_order_key(
-                b,
-                &term.expr,
-                sort_reg,
-                out_regs,
-                columns,
-                out_col_count,
-                &all_tables,
-                ctx,
-            )?;
-        }
-        for i in 0..out_col_count {
-            let src = out_regs + i as i32;
-            let dst = sort_regs + (sort_key_count + i) as i32;
-            b.emit_op(Opcode::SCopy, src, dst, 0, P4::None, 0);
-        }
-        b.emit_op(
-            Opcode::MakeRecord,
-            sort_regs,
-            (sort_key_count + out_col_count) as i32,
-            sort_record_reg,
-            P4::None,
-            0,
-        );
-        b.emit_op(
-            Opcode::SorterInsert,
-            sort_cursor,
-            sort_record_reg,
-            0,
-            P4::None,
-            0,
-        );
-    } else {
-        b.emit_op(
-            Opcode::ResultRow,
-            out_regs,
-            out_col_count as i32,
-            0,
-            P4::None,
-            0,
-        );
-    }
+    emit_join_lookup_match(
+        b,
+        columns,
+        out_regs,
+        &all_tables,
+        ctx,
+        sorter,
+        &stmt.order_by,
+        aggregates,
+        accum_base,
+    )?;
 
     // Jump past the trailing LEFT-JOIN null-row block (if any) to the
     // outer Next.  When there is no LEFT JOIN this is a harmless extra
@@ -14246,58 +14279,44 @@ fn codegen_multi_join_lookup_select(
             emit_join_expr(b, where_expr, cond_reg, &all_tables, ctx)?;
             b.emit_jump_to_label(Opcode::IfNot, cond_reg, 1, row_done_label, P4::None, 0);
         }
-        emit_join_result_columns(b, columns, out_regs, &all_tables, ctx)?;
-        if let Some((sort_cursor, sort_regs, sort_key_count, sort_record_reg)) = sorter {
-            for (i, term) in stmt.order_by.iter().enumerate() {
-                let sort_reg = sort_regs + i as i32;
-                emit_join_order_key(
-                b,
-                &term.expr,
-                sort_reg,
-                out_regs,
-                columns,
-                out_col_count,
-                &all_tables,
-                ctx,
-            )?;
-            }
-            for i in 0..out_col_count {
-                let src = out_regs + i as i32;
-                let dst = sort_regs + (sort_key_count + i) as i32;
-                b.emit_op(Opcode::SCopy, src, dst, 0, P4::None, 0);
-            }
-            b.emit_op(
-                Opcode::MakeRecord,
-                sort_regs,
-                (sort_key_count + out_col_count) as i32,
-                sort_record_reg,
-                P4::None,
-                0,
-            );
-            b.emit_op(
-                Opcode::SorterInsert,
-                sort_cursor,
-                sort_record_reg,
-                0,
-                P4::None,
-                0,
-            );
-        } else {
-            b.emit_op(
-                Opcode::ResultRow,
-                out_regs,
-                out_col_count as i32,
-                0,
-                P4::None,
-                0,
-            );
-        }
+        emit_join_lookup_match(
+            b,
+            columns,
+            out_regs,
+            &all_tables,
+            ctx,
+            sorter,
+            &stmt.order_by,
+            aggregates,
+            accum_base,
+        )?;
     }
 
     b.resolve_label(row_done_label);
     b.emit_jump_to_label(Opcode::Next, left_cursor, 0, next_left_label, P4::None, 0);
 
     b.resolve_label(done_label);
+
+    if let Some(base) = accum_base {
+        for (i, term) in aggregates.iter().enumerate() {
+            b.emit_op(
+                Opcode::AggFinal,
+                base + i as i32,
+                i32::from(term.arg.is_some()),
+                0,
+                P4::FuncName(term.name.clone()),
+                0,
+            );
+        }
+        b.emit_op(
+            Opcode::ResultRow,
+            base,
+            aggregates.len() as i32,
+            0,
+            P4::None,
+            0,
+        );
+    }
 
     if let Some((sort_cursor, sort_regs, sort_key_count, _sort_record_reg)) = sorter {
         let sort_loop = b.emit_label();
@@ -14469,6 +14488,7 @@ fn codegen_join_select(
             &join_tables,
             &plan,
             ctx,
+            &[],
         );
     }
 
@@ -55605,6 +55625,215 @@ mod tests {
              NullRow stub for probe-misses so the outer row is \
              preserved with a NULL workspace"
         );
+    }
+
+    #[test]
+    fn test_codegen_multi_join_aggregate_streams_without_result_materialization() {
+        let stmt = select_sql(
+            "SELECT count(*), count(w.id), sum(m.id), total(a.id), avg(c.id), \
+                    min(w.path), max(c.title) \
+             FROM messages m JOIN conversations c ON c.id = m.conversation_id \
+             JOIN agents a ON a.id = c.agent_id \
+             LEFT JOIN workspaces w ON w.id = c.workspace_id WHERE m.id > ?1",
+        );
+        let schema = test_schema_issue_62_fts_rebuild();
+        let mut b = ProgramBuilder::new();
+        let ctx = CodegenContext {
+            collation_semantics: CollationSemantics::Builtin,
+            ..CodegenContext::default()
+        };
+        codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+        let prog = b.finish().unwrap();
+        let ops = prog.ops();
+        let count = |opcode| ops.iter().filter(|op| op.opcode == opcode).count();
+
+        assert_eq!(count(Opcode::Rewind), 1, "only the driver is scanned");
+        assert_eq!(count(Opcode::SeekRowid), 3);
+        assert_eq!(
+            count(Opcode::AggStep),
+            14,
+            "both LEFT JOIN paths accumulate"
+        );
+        assert_eq!(count(Opcode::AggFinal), 7);
+        assert_eq!(
+            count(Opcode::ResultRow),
+            1,
+            "emit only the final aggregate row"
+        );
+        assert_eq!(count(Opcode::SorterOpen), 0);
+        assert!(
+            !ops.iter()
+                .any(|op| op.opcode == Opcode::Column && op.p1 == 0 && op.p2 == 2),
+            "the unreferenced messages.content column must never be decoded"
+        );
+        let rewind = ops.iter().find(|op| op.opcode == Opcode::Rewind).unwrap();
+        assert_eq!(
+            ops[usize::try_from(rewind.p2).unwrap()].opcode,
+            Opcode::AggFinal,
+            "an empty driver must still finalize COUNT=0 and nullable aggregates"
+        );
+        let result_index = ops
+            .iter()
+            .position(|op| op.opcode == Opcode::ResultRow)
+            .unwrap();
+        let advance_index = ops.iter().position(|op| op.opcode == Opcode::Next).unwrap();
+        assert!(
+            result_index > advance_index,
+            "the scan must not retain joined rows"
+        );
+    }
+
+    #[test]
+    fn test_codegen_multi_join_aggregate_uses_unique_index_lookup() {
+        let stmt = select_sql(
+            "SELECT count(*), sum(a.id) FROM messages m \
+             JOIN conversations c ON c.id = m.conversation_id \
+             JOIN agents a ON a.tenant_id = c.tenant_id",
+        );
+        let schema = test_schema_multi_join_prefers_unique_single_column_lookup();
+        let mut b = ProgramBuilder::new();
+        codegen_select(&mut b, &stmt, &schema, &CodegenContext::default()).unwrap();
+        let prog = b.finish().unwrap();
+        assert_eq!(
+            prog.ops()
+                .iter()
+                .filter(|op| op.opcode == Opcode::Rewind)
+                .count(),
+            1,
+        );
+        assert!(
+            prog.ops()
+                .iter()
+                .any(|op| { matches!(&op.p4, P4::Index(name) if name == "agents_tenant_unique") })
+        );
+        assert!(prog.ops().iter().any(|op| op.opcode == Opcode::SeekGE));
+        assert_eq!(
+            prog.ops()
+                .iter()
+                .filter(|op| op.opcode == Opcode::ResultRow)
+                .count(),
+            1,
+        );
+    }
+
+    #[test]
+    fn test_codegen_multi_join_aggregate_requires_verified_minmax_collation() {
+        let schema = test_schema_issue_62_fts_rebuild();
+        for aggregate in ["min(a.slug)", "max(a.slug)"] {
+            let stmt = select_sql(&format!(
+                "SELECT {aggregate} FROM messages m \
+                 JOIN conversations c ON c.id = m.conversation_id \
+                 JOIN agents a ON a.id = c.agent_id"
+            ));
+            let mut b = ProgramBuilder::new();
+            assert!(matches!(
+                codegen_select(&mut b, &stmt, &schema, &CodegenContext::default()),
+                Err(CodegenError::Unsupported(_))
+            ));
+            let ctx = CodegenContext {
+                collation_semantics: CollationSemantics::Builtin,
+                ..CodegenContext::default()
+            };
+            let mut b = ProgramBuilder::new();
+            codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
+            assert!(
+                b.finish()
+                    .unwrap()
+                    .ops()
+                    .iter()
+                    .any(|op| op.opcode == Opcode::AggStep)
+            );
+        }
+    }
+
+    #[test]
+    fn test_codegen_multi_join_generated_index_probe_keeps_record_registers_adjacent() {
+        let mut schema = test_schema_multi_join_prefers_unique_single_column_lookup();
+        schema[1].columns[1].generated_expr = Some("id + 1".to_owned());
+        schema[1].columns[1].generated_stored = Some(false);
+        // Exercise both users of the shared lookup emitter. Computing the
+        // VIRTUAL probe must not put its temporary registers in the index key.
+        for projection in ["count(*), sum(a.id)", "a.id"] {
+            let stmt = select_sql(&format!(
+                "SELECT {projection} FROM messages m \
+                 JOIN conversations c ON c.id = m.conversation_id \
+                 JOIN agents a ON a.tenant_id = c.tenant_id"
+            ));
+            let mut b = ProgramBuilder::new();
+            codegen_select(&mut b, &stmt, &schema, &CodegenContext::default()).unwrap();
+            let prog = b.finish().unwrap();
+            let ops = prog.ops();
+            let record = ops
+                .iter()
+                .find(|op| op.opcode == Opcode::MakeRecord)
+                .unwrap();
+            assert_eq!(record.p2, 2);
+            assert!(
+                ops.iter()
+                    .any(|op| { op.opcode == Opcode::Add && op.p3 == record.p1 })
+            );
+            assert!(ops.iter().any(|op| {
+                op.opcode == Opcode::Int64
+                    && op.p2 == record.p1 + 1
+                    && matches!(op.p4, P4::Int64(i64::MIN))
+            }));
+        }
+    }
+
+    #[test]
+    fn test_codegen_multi_join_aggregate_preserves_unsupported_shape_fallbacks() {
+        let schema = test_schema_issue_62_fts_rebuild();
+        for sql in [
+            "SELECT count(*) FROM messages m \
+             LEFT JOIN conversations c ON c.id = m.conversation_id \
+             JOIN agents a ON a.id = c.agent_id",
+            "SELECT count(*) FROM messages m \
+             LEFT JOIN conversations c ON c.id = m.conversation_id \
+             LEFT JOIN agents a ON a.id = c.agent_id",
+            "SELECT count(*) FROM messages m \
+             JOIN conversations c ON c.id = m.conversation_id AND c.agent_id > 0 \
+             JOIN agents a ON a.id = c.agent_id",
+            "SELECT count(*) FROM messages m \
+             JOIN conversations c ON c.id = m.conversation_id \
+             JOIN agents a ON a.id = c.agent_id + 1",
+            "SELECT count(DISTINCT m.id) FROM messages m \
+             JOIN conversations c ON c.id = m.conversation_id \
+             JOIN agents a ON a.id = c.agent_id",
+            "SELECT min(a.slug COLLATE NOCASE) FROM messages m \
+             JOIN conversations c ON c.id = m.conversation_id \
+             JOIN agents a ON a.id = c.agent_id",
+        ] {
+            let stmt = select_sql(sql);
+            let mut b = ProgramBuilder::new();
+            assert!(
+                matches!(
+                    codegen_select(&mut b, &stmt, &schema, &CodegenContext::default()),
+                    Err(CodegenError::Unsupported(_))
+                ),
+                "unsupported aggregate shape must use the general evaluator: {sql}",
+            );
+        }
+
+        let stmt = select_sql(
+            "SELECT count(*) FROM messages m \
+             JOIN conversations c ON c.id = m.conversation_id \
+             JOIN agents a ON a.tenant_id = c.tenant_id",
+        );
+        // A UNIQUE(a,b) index still has multiple matches for a alone.
+        let schema = test_schema_multi_join_composite_unique_prefix_lookup();
+        let mut b = ProgramBuilder::new();
+        assert!(matches!(
+            codegen_select(&mut b, &stmt, &schema, &CodegenContext::default()),
+            Err(CodegenError::Unsupported(_))
+        ));
+
+        let mut schema = test_schema_multi_join_prefers_unique_single_column_lookup();
+        schema[2].without_rowid = true;
+        let mut b = ProgramBuilder::new();
+        assert!(matches!(
+            codegen_select(&mut b, &stmt, &schema, &CodegenContext::default()),
+            Err(CodegenError::Unsupported(_))
+        ));
     }
 
     /// Sanity check: a 3-table INNER-JOIN chain whose middle step
