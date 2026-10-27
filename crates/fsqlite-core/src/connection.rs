@@ -90364,30 +90364,56 @@ impl Connection {
                     else_expr,
                     ..
                 } => {
-                    let base = if let Some(op) = operand {
-                        Some(
-                            self.eval_expr_with_subqueries(op, row, col_map, params)
-                                .await?,
-                        )
+                    let base = if let Some(operand) = operand.as_deref() {
+                        // A scalar subquery donates its result affinity to
+                        // simple CASE, including through COLLATE. Materialize
+                        // only that operand shape: structurally inlining other
+                        // expressions would eagerly visit nested CASE arms.
+                        let operand =
+                            if matches!(strip_collate_wrappers(operand), Expr::Subquery(..)) {
+                                Cow::Owned(
+                                    self.inline_in_comparison_operand(
+                                        operand, row, col_map, None, false, params,
+                                    )
+                                    .await?,
+                                )
+                            } else {
+                                Cow::Borrowed(operand)
+                            };
+                        let value = self
+                            .eval_expr_with_subqueries(&operand, row, col_map, params)
+                            .await?;
+                        Some((operand, value))
                     } else {
                         None
                     };
                     for (when_expr, then_expr) in whens {
-                        let matched = if let (Some(operand_expr), Some(b)) =
-                            (operand.as_deref(), base.as_ref())
-                        {
+                        let matched = if let Some((operand_expr, b)) = base.as_ref() {
                             // Simple `CASE operand WHEN value`: the WHEN is a value
                             // compared against the operand (NOT a truth context), so
                             // evaluate it eagerly.
+                            let when_expr = if matches!(
+                                strip_collate_wrappers(when_expr),
+                                Expr::Subquery(..)
+                            ) {
+                                Cow::Owned(
+                                    self.inline_in_comparison_operand(
+                                        when_expr, row, col_map, None, false, params,
+                                    )
+                                    .await?,
+                                )
+                            } else {
+                                Cow::Borrowed(when_expr)
+                            };
                             let when_val = self
-                                .eval_expr_with_subqueries(when_expr, row, col_map, params)
+                                .eval_expr_with_subqueries(&when_expr, row, col_map, params)
                                 .await?;
                             !b.is_null()
                                 && !when_val.is_null()
                                 && compare_join_expr_values(
                                     operand_expr,
                                     b,
-                                    when_expr,
+                                    &when_expr,
                                     &when_val,
                                     col_map,
                                 ) == std::cmp::Ordering::Equal
@@ -92990,10 +93016,13 @@ impl Connection {
         using_skip: Option<&HashSet<usize>>,
     ) -> Result<SqliteValue> {
         if expr_has_any_subquery(expr) {
-            let inlined = self
-                .inline_subqueries_in_expr_with_using(expr, row, col_map, using_skip)
-                .await?;
-            self.eval_join_expr_with_using_registry(&inlined, row, col_map, using_skip)
+            // bd-k5isc: evaluate at the row boundary so CASE can skip unused
+            // subqueries. The active JoinEvalCollationContext carries USING
+            // projections for both ordinary and correlated column references.
+            // Keep structural inlining separate: it also runs without a row
+            // for attached DML and before aggregate conditions are evaluated.
+            self.eval_expr_with_subqueries(expr, row, col_map, None)
+                .await
         } else {
             self.eval_join_expr_with_using_registry(expr, row, col_map, using_skip)
         }
@@ -100745,6 +100774,29 @@ impl Connection {
                         .await?;
                     self.materialize_scalar_subquery_in_operand(&donor_subquery, rows, *span)
                 }
+                Expr::Collate {
+                    expr: inner,
+                    collation,
+                    span,
+                } => Ok(Expr::Collate {
+                    // COLLATE preserves comparison affinity. In particular,
+                    // a simple CASE base that wraps a scalar subquery must
+                    // keep that subquery's affinity as well as this explicit
+                    // collation instead of inlining it to a bare literal.
+                    expr: Box::new(
+                        self.inline_in_comparison_operand(
+                            inner,
+                            row,
+                            outer_col_map,
+                            using_skip,
+                            false,
+                            params,
+                        )
+                        .await?,
+                    ),
+                    collation: collation.clone(),
+                    span: *span,
+                }),
                 Expr::RowValue(fields, span) => {
                     let mut inlined_fields = Vec::with_capacity(fields.len());
                     for field in fields {
