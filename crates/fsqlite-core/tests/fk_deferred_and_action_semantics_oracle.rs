@@ -364,7 +364,7 @@ fn deferred_parent_action_obligation_rolls_back_with_named_and_statement_savepoi
             .await
             .expect_err("the trigger must roll the statement back after recording its obligation");
         assert!(
-            matches!(error, FrankenError::FunctionError(_)),
+            matches!(error, FrankenError::TriggerRaise(_)),
             "unexpected RAISE(ABORT) error: {error:?}"
         );
         conn.execute("COMMIT;")
@@ -771,7 +771,7 @@ fn insert_or_fail_runtime_trigger_error_rolls_back_in_autocommit_and_explicit_tx
             .await
             .expect_err("runtime failures cannot inherit OR FAIL partial-write semantics");
         assert!(
-            matches!(error, FrankenError::FunctionError(_)),
+            matches!(error, FrankenError::TriggerRaise(_)),
             "unexpected error {error:?}"
         );
         assert!(
@@ -789,7 +789,7 @@ fn insert_or_fail_runtime_trigger_error_rolls_back_in_autocommit_and_explicit_tx
             .execute("INSERT OR FAIL INTO protected VALUES (3), (4);")
             .await
             .expect_err("runtime failure must roll back only the current statement");
-        assert!(matches!(error, FrankenError::FunctionError(_)));
+        assert!(matches!(error, FrankenError::TriggerRaise(_)));
         assert!(conn.in_transaction());
         assert!(
             conn.query("SELECT * FROM protected;")

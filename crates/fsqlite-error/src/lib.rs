@@ -378,12 +378,21 @@ pub enum FrankenError {
     /// `RAISE(FAIL, msg)` (and, semantically, `INSERT/UPDATE OR FAIL`): the
     /// current statement fails, but rows already changed earlier in the same
     /// statement are KEPT — no statement-level rollback. This differs from
-    /// `RAISE(ABORT)` (which surfaces as [`FrankenError::FunctionError`] and undoes the
+    /// `RAISE(ABORT)` (which surfaces as [`FrankenError::TriggerRaise`] and undoes the
     /// statement's prior rows) only in that the statement savepoint is released
     /// rather than rolled back, and an autocommit boundary commits rather than
-    /// rolls back. The wire-visible message and error code match `FunctionError`.
+    /// rolls back. Maps to `SQLITE_CONSTRAINT` (primary 19) and
+    /// `SQLITE_CONSTRAINT_TRIGGER` (extended `19 | (7 << 8) = 1811`).
     #[error("{0}")]
     RaiseFail(String),
+
+    /// Trigger `RAISE(ABORT, msg)` or `RAISE(ROLLBACK, msg)`: fails the
+    /// statement (and, for `ROLLBACK`, rolls back the enclosing transaction)
+    /// with primary error code `SQLITE_CONSTRAINT` (19) and extended code
+    /// `SQLITE_CONSTRAINT_TRIGGER` (`19 | (7 << 8) = 1811`), matching stock
+    /// SQLite's `OP_Halt P2=OE_Abort/OE_Rollback P3=SQLITE_CONSTRAINT_TRIGGER`.
+    #[error("{0}")]
+    TriggerRaise(String),
 
     /// A background runtime worker failed and poisoned the shared database state.
     #[error("background worker failed: {0}")]
@@ -538,7 +547,6 @@ impl FrankenError {
             | Self::TooManyArguments { .. }
             | Self::NotImplemented(_)
             | Self::FunctionError(_)
-            | Self::RaiseFail(_)
             | Self::BackgroundWorkerFailed(_)
             | Self::ConcurrentUnavailable => ErrorCode::Error,
             Self::UniqueViolation { .. }
@@ -547,7 +555,9 @@ impl FrankenError {
             | Self::ForeignKeyViolation
             | Self::PrimaryKeyViolation
             | Self::DatatypeViolation { .. }
-            | Self::RtreeConstraint { .. } => ErrorCode::Constraint,
+            | Self::RtreeConstraint { .. }
+            | Self::TriggerRaise(_)
+            | Self::RaiseFail(_) => ErrorCode::Constraint,
             Self::WriteConflict { .. }
             | Self::SerializationFailure { .. }
             | Self::Busy
@@ -697,10 +707,11 @@ impl FrankenError {
     /// - `BusySnapshot` → 517 (SQLITE_BUSY_SNAPSHOT = 5 | (2 << 8))
     pub const fn extended_error_code(&self) -> i32 {
         match self {
-            Self::Busy => 5,                                      // SQLITE_BUSY
-            Self::BusyRecovery => 5 | (1 << 8),                   // SQLITE_BUSY_RECOVERY = 261
-            Self::BusySnapshot { .. } => 5 | (2 << 8),            // SQLITE_BUSY_SNAPSHOT = 517
-            Self::DatatypeViolation { .. } => 3091,               // SQLITE_CONSTRAINT_DATATYPE
+            Self::Busy => 5,                                             // SQLITE_BUSY
+            Self::BusyRecovery => 5 | (1 << 8), // SQLITE_BUSY_RECOVERY = 261
+            Self::BusySnapshot { .. } => 5 | (2 << 8), // SQLITE_BUSY_SNAPSHOT = 517
+            Self::TriggerRaise(_) | Self::RaiseFail(_) => 19 | (7 << 8), // SQLITE_CONSTRAINT_TRIGGER = 1811
+            Self::DatatypeViolation { .. } => 3091, // SQLITE_CONSTRAINT_DATATYPE
             Self::NewerFormat { .. } => SQLITE_OPEN_NEWER_FORMAT, // 14 | (0x7F << 8) = 32526
             // 14 | (0x7E << 8) = 32270
             Self::IncompatiblePeerEngine { .. } => SQLITE_OPEN_INCOMPATIBLE_PEER,

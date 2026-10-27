@@ -261,27 +261,6 @@ fn assert_matches_stock(label: &str, cases: &[Case]) {
     assert_no_divergences(label, &divergences(cases, |_| {}));
 }
 
-/// The message every `RAISE()` in these cases carries.
-const RAISE_MESSAGE: &str = "boom";
-
-/// Compare everything except the primary result code of a `RAISE()` error:
-/// stock reports SQLITE_CONSTRAINT (19) for it and FrankenSQLite reports
-/// SQLITE_ERROR (1). That code is a separate divergence from the rows,
-/// transaction state and message this bead is about, so a `RAISE()` step
-/// still has to fail with exactly the stock message.
-fn assert_matches_stock_except_raise_result_code(label: &str, cases: &[Case]) {
-    fn forget_raise_result_code(observation: &mut Observation) {
-        for (_, outcome) in &mut observation.steps {
-            if let Outcome::Err { code, message } = outcome
-                && message == RAISE_MESSAGE
-            {
-                *code = 0;
-            }
-        }
-    }
-    assert_no_divergences(label, &divergences(cases, forget_raise_result_code));
-}
-
 /// Every statement-level conflict clause, plus none at all.
 const MODES: [&str; 6] = [
     "OR FAIL",
@@ -670,7 +649,7 @@ fn bd_nn29x_trigger_raise_action_overrides_statement_clause() {
             }
         }
     }
-    assert_matches_stock_except_raise_result_code("trigger RAISE", &cases);
+    assert_matches_stock("trigger RAISE", &cases);
 }
 
 /// Bead case 5: a trigger statement's own `OR` clause applies only when the

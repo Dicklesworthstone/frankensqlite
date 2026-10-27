@@ -106,7 +106,8 @@ async fn differential_returning(wal: bool) {
                 if case.name.starts_with("raise/") {
                     let expected_msg = expected.to_string();
                     let actual_reason = match &actual {
-                        fsqlite_error::FrankenError::FunctionError(msg)
+                        fsqlite_error::FrankenError::TriggerRaise(msg)
+                        | fsqlite_error::FrankenError::FunctionError(msg)
                         | fsqlite_error::FrankenError::RaiseFail(msg)
                         | fsqlite_error::FrankenError::TransactionRolledBack { reason: msg } => {
                             msg.as_str()

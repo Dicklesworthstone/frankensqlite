@@ -301,24 +301,6 @@ fn assert_matches_stock(
 
 fn no_normalize(_: &mut Observation) {}
 
-/// The message every `RAISE()` in these cases carries.
-const RAISE_MESSAGE: &str = "boom";
-
-/// RAISE() reports SQLITE_ERROR in FrankenSQLite and SQLITE_CONSTRAINT in
-/// stock, and RAISE(ROLLBACK) prefixes its message; both are pre-existing and
-/// tracked separately, so a step that fails with the RAISE message compares
-/// only as "failed with the RAISE message".
-fn normalize_raise(observation: &mut Observation) {
-    for (_, outcome) in &mut observation.steps {
-        if let Outcome::Err { code, message } = outcome
-            && message.contains(RAISE_MESSAGE)
-        {
-            *code = 0;
-            RAISE_MESSAGE.clone_into(message);
-        }
-    }
-}
-
 /// Every statement-level conflict clause, plus none at all.
 const MODES: [&str; 6] = [
     "OR FAIL",
@@ -615,6 +597,7 @@ fn review_nested_trigger_clause_inheritance() {
 /// INSERT, directly and one trigger level down, under every outer clause.
 #[test]
 fn review_trigger_raise_matrix() {
+    const RAISE_MESSAGE: &str = "review-raise";
     let mut cases = Vec::new();
     for raise in ["IGNORE", "FAIL", "ABORT", "ROLLBACK"] {
         let raise_expr = if raise == "IGNORE" {
@@ -625,12 +608,6 @@ fn review_trigger_raise_matrix() {
         for timing in ["BEFORE", "AFTER"] {
             for mode in MODES {
                 for txn in TXNS {
-                    // RAISE(ROLLBACK) in autocommit reports "cannot rollback -
-                    // no transaction is active" instead of its message: a
-                    // separate, pre-existing divergence.
-                    if raise == "ROLLBACK" && matches!(txn, Txn::Autocommit) {
-                        continue;
-                    }
                     cases.push(Case {
                         name: format!(
                             "{timing} INSERT {raise_expr} after INSERT OR FAIL, outer `{mode}`, {txn:?}"
@@ -683,7 +660,7 @@ fn review_trigger_raise_matrix() {
         "trigger RAISE matrix",
         &cases,
         &BASIC_LANES,
-        normalize_raise,
+        no_normalize,
     );
 }
 

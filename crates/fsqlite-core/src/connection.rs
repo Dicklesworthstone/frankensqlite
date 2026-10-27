@@ -73249,7 +73249,7 @@ impl Connection {
                 let message = directive
                     .message
                     .unwrap_or_else(|| "trigger RAISE()".to_owned());
-                Err(FrankenError::FunctionError(message))
+                Err(FrankenError::TriggerRaise(message))
             }
             fsqlite_ast::RaiseAction::Fail => {
                 // FAIL: fail the statement but KEEP its already-applied rows.
@@ -73273,7 +73273,7 @@ impl Connection {
                     let rollback_stmt = fsqlite_ast::RollbackStatement { to_savepoint: None };
                     self.execute_rollback(&rollback_stmt).await?;
                 }
-                Err(FrankenError::FunctionError(message))
+                Err(FrankenError::TriggerRaise(message))
             }
         }
     }
@@ -157909,7 +157909,10 @@ fn apply_trigger_conflict_override(
 fn error_is_conflict_resolvable(error: &FrankenError) -> bool {
     !matches!(
         error,
-        FrankenError::ForeignKeyViolation | FrankenError::DatatypeViolation { .. }
+        FrankenError::ForeignKeyViolation
+            | FrankenError::DatatypeViolation { .. }
+            | FrankenError::TriggerRaise(_)
+            | FrankenError::RaiseFail(_)
     ) && error_is_constraint_violation(error)
 }
 
@@ -189163,7 +189166,7 @@ mod tests {
             assert!(
                 matches!(
                     err,
-                    FrankenError::FunctionError(ref msg) if msg == "write intent has duplicate journals"
+                    FrankenError::TriggerRaise(ref msg) if msg == "write intent has duplicate journals"
                 ),
                 "unexpected error: {err:?}"
             );
@@ -189186,7 +189189,7 @@ mod tests {
                 .expect_err("INSERT should fail via RAISE(ABORT)");
             assert!(matches!(
                 err,
-                FrankenError::FunctionError(ref msg) if msg == "stop insert"
+                FrankenError::TriggerRaise(ref msg) if msg == "stop insert"
             ));
         });
     }
@@ -190032,7 +190035,7 @@ mod tests {
                 .expect_err("nested trigger should propagate inner RAISE(ABORT)");
             assert!(matches!(
                 err,
-                FrankenError::FunctionError(ref msg) if msg == "inner trigger abort"
+                FrankenError::TriggerRaise(ref msg) if msg == "inner trigger abort"
             ));
             assert!(conn.trigger_frame_stack.borrow().is_empty());
         });
