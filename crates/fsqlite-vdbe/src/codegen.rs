@@ -4801,10 +4801,21 @@ pub fn codegen_select(
         // read only the matching rows and sort them, rather than walking a whole index (or the
         // table) in ORDER BY order and testing every row. An ORDER BY index that the equality
         // itself seeks (an equality prefix) still wins: it reads the same rows and needs no sort.
-        let ordered_eq_seek = if from_index_hint.is_none() && time_travel.is_none() {
-            resolve_outer_equality_seek(where_clause.as_deref(), table, table_alias, None)
-        } else {
-            None
+        // GH#523: an `INDEXED BY` index whose order the ORDER BY cannot use still seeks the
+        // equality, as stock does, instead of the hint being dropped for a table scan.
+        let ordered_eq_seek = match from_index_hint {
+            _ if time_travel.is_some() => None,
+            None => {
+                resolve_outer_equality_seek(where_clause.as_deref(), table, table_alias, None, None)
+            }
+            Some(fsqlite_ast::IndexHint::IndexedBy(hinted)) => resolve_outer_equality_seek(
+                where_clause.as_deref(),
+                table,
+                table_alias,
+                None,
+                Some(hinted.as_str()),
+            ),
+            Some(fsqlite_ast::IndexHint::NotIndexed) => None,
         };
         if let Some(index_plan) = ctx
             .index_ordered_scan_reliable
@@ -12874,6 +12885,7 @@ pub fn join_select_seeks_outer_table(stmt: &SelectStatement, schema: &[TableSche
             right_table,
             right_alias,
             Some((left_table, left_alias)),
+            None,
         )
         .is_some();
     }
@@ -12882,6 +12894,7 @@ pub fn join_select_seeks_outer_table(stmt: &SelectStatement, schema: &[TableSche
         left_table,
         left_alias,
         Some((right_table, right_alias)),
+        None,
     )
     .is_some()
 }
@@ -12889,12 +12902,14 @@ pub fn join_select_seeks_outer_table(stmt: &SelectStatement, schema: &[TableSche
 /// The [`OuterEqualitySeek`] that reaches every row of `left_table` the WHERE
 /// can accept. `other_table` is the joined table, if any: an unqualified
 /// column it also resolves is ambiguous and not used. The single-table
-/// ORDER BY sorter (GH#498) passes `None`.
+/// ORDER BY sorter (GH#498) passes `None`. `required_index` is an
+/// `INDEXED BY` name: only that index may seek, and never the rowid.
 fn resolve_outer_equality_seek<'a>(
     where_clause: Option<&'a Expr>,
     left_table: &'a TableSchema,
     left_alias: Option<&str>,
     other_table: Option<(&TableSchema, Option<&str>)>,
+    required_index: Option<&str>,
 ) -> Option<OuterEqualitySeek<'a>> {
     if left_table.without_rowid {
         return None;
@@ -12928,9 +12943,12 @@ fn resolve_outer_equality_seek<'a>(
                 continue;
             }
             match resolve_column_ref(column, left_table, left_alias) {
-                Some(SortKeySource::Rowid) => return Some(OuterEqualitySeek::Rowid { probe }),
+                Some(SortKeySource::Rowid) if required_index.is_none() => {
+                    return Some(OuterEqualitySeek::Rowid { probe });
+                }
                 Some(SortKeySource::Column(col_idx)) if index_seek.is_none() => {
-                    index_seek = outer_index_equality_seek(left_table, col_idx, probe);
+                    index_seek =
+                        outer_index_equality_seek(left_table, col_idx, probe, required_index);
                 }
                 _ => {}
             }
@@ -12943,6 +12961,7 @@ fn outer_index_equality_seek<'a>(
     table: &'a TableSchema,
     col_idx: usize,
     probe: &'a Expr,
+    required_index: Option<&str>,
 ) -> Option<OuterEqualitySeek<'a>> {
     let column = table.columns.get(col_idx)?;
     let column_binary = column
@@ -12950,10 +12969,11 @@ fn outer_index_equality_seek<'a>(
         .as_deref()
         .is_none_or(|collation| collation.eq_ignore_ascii_case("BINARY"));
     table.indexes.iter().find_map(|index| {
-        let usable = index
-            .columns
-            .first()
-            .is_some_and(|name| name.eq_ignore_ascii_case(&column.name))
+        let usable = required_index.is_none_or(|name| index.name.eq_ignore_ascii_case(name))
+            && index
+                .columns
+                .first()
+                .is_some_and(|name| name.eq_ignore_ascii_case(&column.name))
             && index.columns.len() == index.key_term_count()
             && index.where_clause.is_none()
             && !index.key_term_descending(0);
@@ -13329,6 +13349,7 @@ fn codegen_single_join_lookup_select(
         left_table,
         left_alias,
         Some((right_table, right_alias)),
+        None,
     );
     let outer_loop = emit_outer_loop_start(
         b,
@@ -34124,10 +34145,13 @@ fn resolve_order_by_index_plan(
         {
             return None;
         }
-        let is_rowid = table.resolves_to_hidden_rowid(&col_ref.column);
-        if is_rowid && table.without_rowid {
-            return None;
-        }
+        // GH#523: the rowid by a hidden name or by its INTEGER PRIMARY KEY
+        // alias (`ORDER BY i, id`); a WITHOUT ROWID table has none.
+        let is_rowid = !table.without_rowid
+            && matches!(
+                resolve_column_ref(resolved_expr, table, table_alias),
+                Some(SortKeySource::Rowid)
+            );
         order_columns.push((
             col_ref.column.to_string(),
             term_direction,
@@ -34215,15 +34239,14 @@ fn resolve_order_by_index_plan(
         let matches_order_columns = variable_order.iter().enumerate().all(
             |(offset, (order_col, term_direction, order_collation, is_rowid))| {
                 let key_pos = equality_prefix_len + offset;
-                let forward_direction = if *is_rowid {
+                let forward_direction = if *is_rowid && key_pos == index.key_term_count() {
                     // GH#523: every secondary index on a rowid table terminates
                     // its key with the table rowid in ascending order. Once all
                     // declared index key columns are covered by the equality
                     // prefix + variable ORDER BY terms, a trailing rowid/IPK
                     // ORDER BY term is satisfied by the index's stored order.
-                    if table.without_rowid || key_pos != index.key_term_count() {
-                        return false;
-                    }
+                    // Before that, an IPK alias matches only an index key
+                    // column that names it.
                     SortDirection::Asc
                 } else {
                     if key_pos >= index.key_term_count()
