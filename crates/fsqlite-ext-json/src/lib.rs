@@ -4643,7 +4643,6 @@ impl AggregateFunction for JsonGroupObjectFunc {
     }
 }
 
-
 /// `jsonb_group_array(X)` — JSONB aggregate variant of `json_group_array`.
 ///
 /// The state retains argument subtypes so nested JSON values are embedded
@@ -5107,10 +5106,7 @@ mod tests {
         let SqliteValue::Blob(object_blob) = object.finalize(object_state).unwrap() else {
             panic!("jsonb_group_object must return a BLOB");
         };
-        assert_eq!(
-            json_from_jsonb(&object_blob).unwrap(),
-            r#"{"k":7}"#
-        );
+        assert_eq!(json_from_jsonb(&object_blob).unwrap(), r#"{"k":7}"#);
     }
 
     #[test]
@@ -5742,11 +5738,7 @@ mod tests {
             t("[1,2]")
         );
         assert_eq!(
-            invoke(vec![
-                t("[1,2]"),
-                SqliteValue::Null,
-                SqliteValue::Integer(9)
-            ]),
+            invoke(vec![t("[1,2]"), SqliteValue::Null, SqliteValue::Integer(9)]),
             t("[1,2]")
         );
         assert_eq!(
@@ -5754,11 +5746,7 @@ mod tests {
             t(r#"{"a":[9]}"#)
         );
         assert_eq!(
-            invoke(vec![
-                t(r#"{"a":1}"#),
-                t("$.a.b"),
-                SqliteValue::Integer(9)
-            ]),
+            invoke(vec![t(r#"{"a":1}"#), t("$.a.b"), SqliteValue::Integer(9)]),
             t(r#"{"a":1}"#)
         );
 
@@ -5771,10 +5759,7 @@ mod tests {
         );
 
         let embedded = func
-            .invoke_with_arg_subtypes(
-                &[t("[]"), t("$[0]"), t("[2,3]")],
-                &[0, 0, JSON_SUBTYPE],
-            )
+            .invoke_with_arg_subtypes(&[t("[]"), t("$[0]"), t("[2,3]")], &[0, 0, JSON_SUBTYPE])
             .unwrap();
         assert_eq!(embedded, t("[[2,3]]"));
     }
@@ -7813,8 +7798,14 @@ mod tests {
         let SqliteValue::Blob(blob) = blob else {
             panic!("jsonb_object must return a BLOB");
         };
-        // Two TEXT("k") members must remain physically present.
-        assert_eq!(blob.iter().filter(|&&byte| byte == b'k').count(), 2);
+        // Both "k" members remain, the first holding the embedded array: stock
+        // 3.54.0's hex(jsonb_object('k', json('[1,2]'), 'k', 3)).
+        assert_eq!(
+            blob.as_ref(),
+            [
+                0xbc, 0x17, b'k', 0x4b, 0x13, b'1', 0x13, b'2', 0x17, b'k', 0x13, b'3'
+            ]
+        );
     }
 
     // -----------------------------------------------------------------------
