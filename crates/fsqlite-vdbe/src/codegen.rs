@@ -33204,7 +33204,6 @@ fn validate_assignment_target(
     match target {
         AssignmentTarget::Column(name) => {
             resolve_update_target(table, name)?;
-            Ok(())
         }
         AssignmentTarget::ColumnList(columns) => {
             if columns.is_empty() {
@@ -33215,9 +33214,9 @@ fn validate_assignment_target(
             for name in columns {
                 resolve_update_target(table, name)?;
             }
-            Ok(())
         }
     }
+    Ok(())
 }
 
 fn validate_expr_columns_with<F>(expr: &Expr, validate_column: &F) -> Result<(), CodegenError>
