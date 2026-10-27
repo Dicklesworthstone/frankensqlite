@@ -8,7 +8,7 @@ use fsqlite_types::cx::Cx;
 /// Race a reversible admission wait against the explicit operation's local
 /// cancellation. Dropping a pending native lock future retires its waiter;
 /// mandatory settlement and physical writes must not use this helper.
-pub(crate) async fn await_pager_admission<F: Future>(cx: &Cx, wait: F) -> Result<F::Output> {
+pub async fn await_pager_admission<F: Future>(cx: &Cx, wait: F) -> Result<F::Output> {
     let mut cancellation = std::pin::pin!(cx.wait_for_local_cancellation());
     let mut wait = std::pin::pin!(wait);
     std::future::poll_fn(|task_cx| {
