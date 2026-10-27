@@ -23325,3 +23325,34 @@ bead) — likely the interior descent must propagate the UpperBound bias, or the
 - Retry condition: only with a signal that proves no FrankenSQLite build ever
   wrote the file (offset 96 cannot), or by making the pass itself cheaper (a
   page-reference walk instead of a full record-decoding integrity_check).
+
+## 2026-10-27 — Shared (Arc) sorter row blobs for GROUP BY / DISTINCT sorts (GH#504)
+
+- Workload: GH#504's `count(DISTINCT i_color) ... GROUP BY i_category` and
+  three neighbours (plain `count(i_color)` GROUP BY, a nested GROUP BY, an
+  `ORDER BY ... LIMIT 1 OFFSET 999999`) over a 1M-row `item` table that
+  sqlite3 built; release CLIs, best of 7, `/usr/bin/sqlite3` 3.54.0 in the
+  same invocation, macOS arm64 (`r504/ab.sh` in the session scratchpad).
+- Candidate: `crates/fsqlite-vdbe/src/engine.rs` only. `SorterRow.blob`
+  became `Arc<[u8]>`: SorterInsert copied the MakeRecord buffer once and
+  handed the buffer back, and SorterData cloned the Arc instead of the
+  record bytes.
+- Result: no measurable change; not committed. Same-window runs with both
+  build orders (load average about 20 from other work): Q1 base
+  0.518 / 0.495 s, candidate 0.535 / 0.544 s; Q2 base 0.504 / 0.473 s,
+  candidate 0.474 / 0.514 s; stock 0.156 / 0.147 s and 0.136 / 0.130 s.
+  Identical output in every run. An earlier run on a quieter machine gave
+  the same picture (Q1 0.510 / 0.518 vs 0.505 / 0.529 s).
+- Why the gap is elsewhere: it is per-row VDBE work, not the DISTINCT or
+  sorter path. A plain `SELECT sum(i_color) FROM item` takes 0.130 s against
+  stock's 0.023 s, and sorting 1M rows under `count(*)` 0.573 s against
+  0.184 s (same session, best of 5). A sample of the fsqlite CLI spends the
+  time in opcode dispatch, `ensure_storage_cursor_row_layout`,
+  `column_to_reg_direct`, argument SmallVec collection and per-opcode future
+  drops. `temp_store = MEMORY` leaves fsqlite's Q1 at 0.528 -> 0.537 s but
+  slows stock's from 0.146 to 0.202 s, which narrows the ratio and may be
+  where the issue's 1.7x figure came from.
+- Retry condition: only together with a change that removes per-row
+  dispatch or column-decode cost, when the sorter copy becomes a visible
+  share of the profile. See also the 2026-05-06 SorterRow entry (narrow
+  patches only).

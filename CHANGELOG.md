@@ -23,7 +23,7 @@ Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releas
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| [Unreleased](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.4.12...main) | HEAD | 2026-10-27 | Development on `main` after v0.4.12, with **data-integrity fixes**: an unparenthesized column `DEFAULT` swallowed a following NOT NULL or COLLATE, also on stock-created schemas; an FTS5 external-content `rebuild` after a content-table rename erased the index, and such a table lost its postings on its first write after a reopen (GH#211); concurrent writers could commit duplicate implicit rowids (bd-ujp0h, bd-2ym3z); triggers fired by a cascade skipped FK checks, and an FK action skipped by `RAISE(IGNORE)` left orphan rows (bd-vcvn0); R-tree tables were not written in stock's file format. Plus GH#509, GH#511, GH#512, GH#448, GH#521, GH#523, GH#528 and GH#529 fixes, read-only opens of a header-less WAL without `-shm` (GH#515) and of unwritable files, WAL resets by the autocheckpoint (GH#385), join memory bounds (GH#527), candidate fixes for GH#510, GH#519 and GH#506 (macOS) that were not run when committed and for GH#524, GH#525 and GH#526 that were not fully built or run, large-commit memory bounds (GH#518), stable-Rust build work (GH#522; releases through v0.4.12 still need nightly), the source-incompatible `MigrationOutcome::Incomplete` and geopoly return types, and ordered batch replication in the TypeScript SDK. Many commits record no compile or test run |
+| [Unreleased](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.4.12...main) | HEAD | 2026-10-27 | Development on `main` after v0.4.12, with **data-integrity fixes**: an unparenthesized column `DEFAULT` swallowed a following NOT NULL or COLLATE, also on stock-created schemas; an FTS5 external-content `rebuild` after a content-table rename erased the index, and such a table lost its postings on its first write after a reopen (GH#211); concurrent writers could commit duplicate implicit rowids (bd-ujp0h, bd-2ym3z); triggers fired by a cascade skipped FK checks, and an FK action skipped by `RAISE(IGNORE)` left orphan rows (bd-vcvn0); R-tree tables were not written in stock's file format. Plus GH#509, GH#511, GH#512, GH#448, GH#521, GH#523, GH#526 (measured), GH#528 and GH#529 fixes, `json_each` over NULL input and table-valued functions listed before the table they read, contended checkpoints that failed with BusyRecovery, read-only opens of a header-less WAL without `-shm` (GH#515) and of unwritable files, WAL resets by the autocheckpoint (GH#385), join memory bounds (GH#527), candidate fixes for GH#510, GH#519 and GH#506 (macOS) that were not run when committed and for GH#524 and GH#525 that were not fully built or run, large-commit memory bounds (GH#518), stable-Rust build work (GH#522; releases through v0.4.12 still need nightly), the source-incompatible `MigrationOutcome::Incomplete` and geopoly return types, and ordered batch replication in the TypeScript SDK. Many commits record no compile or test run |
 | [v0.4.12](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.4.12) | Release | 2026-10-13 | Uniform release of all 26 public crates, with an **upgrade advisory for 0.4.10**: a join whose outer table was read through an index with a `DESC` column returned no rows (GH#502); `:memory:` with `autocommit_retain = OFF` could lose every row of a table (GH#503); `DELETE ... WHERE EXISTS` over the same table deleted the wrong rows (bd-ntt2b). Plus FROM-less row-value comparisons (GH#450), attached-database DML and name resolution, conflict-clause and constraint parity, a full filesystem during WAL-index growth reported as an I/O error instead of a SIGBUS on Linux (GH#506), WAL-FEC attach/close fixes, and index seeks for `IN` lists and `WHERE k = ? ORDER BY id` |
 | [0.4.11](https://crates.io/crates/fsqlite-vfs/0.4.11) | crates.io only | 2026-10-09 | `fsqlite-vfs` alone: on macOS and other non-Linux Unix, a redundant main-DB descriptor opened while WAL lifetime locks were held is reused instead of parked forever, so long-running processes stop leaking about 2 fds per fresh connection (bd-l0rbc). Tag `fsqlite-vfs-v0.4.11`; no GitHub Release. The next uniform release must be >= 0.4.12 |
 | [v0.4.10](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.4.10) | Release | 2026-10-07 | Uniform release of all 26 public crates, with a **data-integrity advisory**: inserts inside a transaction could silently corrupt a table b-tree (bd-obwsy); UPDATE ... FROM lost or repeated updates (bd-b5j26); non-integer rowid / INTEGER PRIMARY KEY values left malformed index entries (REINDEX); a REPLACE constraint could delete a row an IGNORE constraint then kept out; a retried fsync after a failed WAL sync could vouch for unwritten frames (bd-alyrn). Plus checkpoint source validation, max-rowid and rowid-reuse parity, `:memory:` freelist reuse, stock empty-schema opens, and DML/join/trigger performance work |
@@ -347,6 +347,24 @@ Extensions and virtual tables:
   `geopoly_regular`, `geopoly_ccw`, `geopoly_debug` and the `geopoly_group_bbox` aggregate are
   registered. Blobs that earlier versions' `geopoly_blob()` wrote carry the old header and now
   read as not a polygon. The geopoly virtual table is not provided.
+- `json_each` and `json_tree` over a NULL input return no rows, as in stock, instead of failing
+  with `json table-valued input must be TEXT or BLOB JSON`
+  ([d21ba7baa](https://github.com/Dicklesworthstone/frankensqlite/commit/d21ba7baa), bd-oui0e).
+  So `FROM t, json_each(t.tags)` failed on any table with a NULL in `tags`; it now skips those
+  rows, and `t LEFT JOIN json_each(t.tags)` keeps them with NULL columns. A NULL PATH also
+  returns no rows (it scanned from `$`), and `json_each()` with no argument returns no rows
+  instead of an error. The new keeper compares 16 queries with rusqlite's bundled SQLite: 15
+  differed at 46192f4be, none after.
+- A table-valued function listed before the FROM source its arguments read, as in
+  `FROM json_each(t.tags) AS j, t`, failed with `internal error: column not found: tags`. Like
+  stock, FrankenSQLite now runs the function after that source
+  ([4f584689a](https://github.com/Dicklesworthstone/frankensqlite/commit/4f584689a), bd-4t938),
+  for comma joins and inner joins with `ON`, including chains of functions. When a LEFT JOIN pins
+  the source after the function, the function returns no rows, as `json_each` does in stock. The
+  new keeper compares 19 queries with rusqlite's bundled SQLite: all 19 differed at 46192f4be,
+  none after. Still different from stock: `CROSS JOIN` is reordered too, where stock keeps its
+  order and `json_each` returns no rows; `USING`, `NATURAL`, and a FROM with an outer join
+  elsewhere still fail.
 
 B-tree:
 
@@ -518,6 +536,15 @@ Connections, busy handling and cancellation:
   publication, up to 16 times, and WAL-index reader admission retries a torn header, busy slots
   and moved marks at stock's pace, up to 100 times. The keeper saw no BUSY result in two runs
   afterwards.
+- A `PRAGMA wal_checkpoint(TRUNCATE)` (or PASSIVE/RESTART) that raced another process's WAL reset
+  failed with `BusyRecovery`, so processes that checkpoint at close, as `br` does, exited with
+  `truncate checkpoint: BusyRecovery`. It now returns the `busy = 1` row the PRAGMA already
+  returns for a plain busy checkpoint (GH#399), since stock's checkpoint never returns
+  SQLITE_BUSY_RECOVERY
+  ([3716efbb2](https://github.com/Dicklesworthstone/frankensqlite/commit/3716efbb2), bd-s4lco).
+  The cross-process churn keeper failed 4 and 3 of 10 runs at 46192f4be on macOS arm64; with the
+  change it passed 20 of 20 there and 7 of 7 completed runs on Linux x86_64. No deterministic test
+  drives the busy row.
 - `Connection::query`, which the CLI uses, did not retry an autocommit INSERT, UPDATE or DELETE
   that conflicted with a writer in another process, so with `busy_timeout=5000` it failed in about
   90 ms with `database is busy (snapshot conflict on pages: 2)` (265 of 400 inserts from four
@@ -694,14 +721,20 @@ Build and platforms:
   [82dcce30f](https://github.com/Dicklesworthstone/frankensqlite/commit/82dcce30f) and
   [29e1c3090](https://github.com/Dicklesworthstone/frankensqlite/commit/29e1c3090) is recorded,
   so there is no measured RSS change, and GH#525 stays open.
-- A BEFORE UPDATE trigger whose `WHEN` holds a correlated multi-column `EXISTS` sought only the
-  first column of the composite index and walked its duplicates, because `WHEN` binds OLD and NEW
-  as numbered parameters and the composite-prefix seek accepted only literals; numbered-parameter
-  equalities now use the whole prefix
-  ([#526](https://github.com/Dicklesworthstone/frankensqlite/issues/526),
-  [14c7f7a19](https://github.com/Dicklesworthstone/frankensqlite/commit/14c7f7a19)). Not compiled
-  or run when committed (memory and disk limits on the build host): no Rust test or benchmark ran,
-  no speedup is claimed, and GH#526 stays open.
+- A BEFORE UPDATE trigger whose `WHEN` holds a correlated multi-column `EXISTS` no longer walks
+  the duplicates of the composite index's first column on every UPDATE
+  ([#526](https://github.com/Dicklesworthstone/frankensqlite/issues/526)). The fix is the
+  bound-parameter prefix seek above
+  ([72b0806c3](https://github.com/Dicklesworthstone/frankensqlite/commit/72b0806c3)), which
+  `WHEN`'s numbered OLD/NEW parameters already reach. The `gh526_trigger_when_composite_exists`
+  keeper counts 9,309 opcodes per UPDATE at 2,048 rows at 72b0806c3's parent and 260 at
+  72b0806c3. [14c7f7a19](https://github.com/Dicklesworthstone/frankensqlite/commit/14c7f7a19),
+  committed for #526 without a build, is not needed for the issue's shape: its keepers pass at
+  its parent too. Measured 2026-10-27 on macOS arm64 (release, stock 3.53.2 in the same run;
+  median of 3), the `WHEN` arm's milliseconds per UPDATE at 2k / 8k / 32k rows were 2.31 / 11.20
+  / 45.50 on v0.4.12 and 0.114 / 0.147 / 0.305 on `main` (46192f4be), against stock's
+  0.006 / 0.006 / 0.012. FrankenSQLite is still 19-26x slower than stock per UPDATE here, and
+  7-16x without the trigger.
 
 ### TypeScript SDK and worker
 
