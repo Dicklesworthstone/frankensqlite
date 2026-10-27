@@ -86407,19 +86407,12 @@ impl Connection {
                                 entries.push((val, sep, keys));
                             }
                             if *distinct {
-                                let coll = collation.as_deref();
-                                let mut seen = Vec::new();
-                                entries.retain(|e| {
-                                    let dup = seen.iter().any(|s: &SqliteValue| {
-                                        cmp_sqlite_values_collated_snapshot(
-                                            s, &e.0, coll, &coll_snap,
-                                        ) == std::cmp::Ordering::Equal
-                                    });
-                                    if !dup {
-                                        seen.push(e.0.clone());
-                                    }
-                                    !dup
-                                });
+                                retain_first_distinct(
+                                    &mut entries,
+                                    |entry| &entry.0,
+                                    collation.as_deref(),
+                                    &coll_snap,
+                                );
                             }
                             let order_collations = order_by
                                 .iter()
@@ -86476,22 +86469,12 @@ impl Connection {
                                 entries.push((value, keys));
                             }
                             if *distinct {
-                                let mut seen = Vec::new();
-                                entries.retain(|(value, _)| {
-                                    if seen.iter().any(|previous| {
-                                        cmp_sqlite_values_collated_snapshot(
-                                            previous,
-                                            value,
-                                            collation.as_deref(),
-                                            &coll_snap,
-                                        ) == std::cmp::Ordering::Equal
-                                    }) {
-                                        false
-                                    } else {
-                                        seen.push(value.clone());
-                                        true
-                                    }
-                                });
+                                retain_first_distinct(
+                                    &mut entries,
+                                    |(value, _)| value,
+                                    collation.as_deref(),
+                                    &coll_snap,
+                                );
                             }
                             if !order_by.is_empty() {
                                 let order_collations = order_by
@@ -92573,19 +92556,12 @@ impl Connection {
                                 entries.push((val, sep, keys));
                             }
                             if *distinct {
-                                let coll = collation.as_deref();
-                                let mut seen = Vec::new();
-                                entries.retain(|e| {
-                                    let dup = seen.iter().any(|s: &SqliteValue| {
-                                        cmp_sqlite_values_collated_snapshot(
-                                            s, &e.0, coll, &coll_snap,
-                                        ) == std::cmp::Ordering::Equal
-                                    });
-                                    if !dup {
-                                        seen.push(e.0.clone());
-                                    }
-                                    !dup
-                                });
+                                retain_first_distinct(
+                                    &mut entries,
+                                    |entry| &entry.0,
+                                    collation.as_deref(),
+                                    &coll_snap,
+                                );
                             }
                             let order_collations = order_by
                                 .iter()
@@ -92639,22 +92615,12 @@ impl Connection {
                                 entries.push((value, keys));
                             }
                             if *distinct {
-                                let mut seen = Vec::new();
-                                entries.retain(|(value, _)| {
-                                    if seen.iter().any(|previous| {
-                                        cmp_sqlite_values_collated_snapshot(
-                                            previous,
-                                            value,
-                                            collation.as_deref(),
-                                            &coll_snap,
-                                        ) == std::cmp::Ordering::Equal
-                                    }) {
-                                        false
-                                    } else {
-                                        seen.push(value.clone());
-                                        true
-                                    }
-                                });
+                                retain_first_distinct(
+                                    &mut entries,
+                                    |(value, _)| value,
+                                    collation.as_deref(),
+                                    &coll_snap,
+                                );
                             }
                             if !order_by.is_empty() {
                                 let order_collations = order_by
@@ -127328,24 +127294,14 @@ fn prepare_application_aggregate_rows(
     collation_registry: &CollationRegistry,
 ) -> Vec<Vec<SqliteValue>> {
     if distinct {
-        let mut seen = Vec::new();
-        let mut saw_zero_arg_row = false;
-        entries.retain(|(args, _)| {
-            let Some(value) = args.first() else {
-                let keep = !saw_zero_arg_row;
-                saw_zero_arg_row = true;
-                return keep;
-            };
-            if seen.iter().any(|previous| {
-                cmp_sqlite_values_collated_snapshot(previous, value, collation, collation_registry)
-                    == std::cmp::Ordering::Equal
-            }) {
-                false
-            } else {
-                seen.push(value.clone());
-                true
-            }
-        });
+        // Every row of one call has the same arity, so a zero-argument call's
+        // empty tuples form one class, which the NULL key stands for.
+        retain_first_distinct(
+            &mut entries,
+            |(args, _)| args.first().unwrap_or(&SqliteValue::Null),
+            collation,
+            collation_registry,
+        );
     }
     if !order_by.is_empty() {
         let order_collations = order_by
@@ -127448,23 +127404,13 @@ fn eval_group_agg_join_expr(
                 }
                 // DISTINCT removes duplicate values (first occurrence wins). (GH #268)
                 if *distinct {
-                    let mut seen: Vec<SqliteValue> = Vec::new();
                     let distinct_collation = join_expr_effective_collation(arg, col_map);
-                    items.retain(|(v, _)| {
-                        if seen.iter().any(|s| {
-                            cmp_sqlite_values_collated_snapshot(
-                                s,
-                                v,
-                                distinct_collation.as_deref(),
-                                &collation_registry,
-                            ) == std::cmp::Ordering::Equal
-                        }) {
-                            false
-                        } else {
-                            seen.push(v.clone());
-                            true
-                        }
-                    });
+                    retain_first_distinct(
+                        &mut items,
+                        |(value, _)| value,
+                        distinct_collation.as_deref(),
+                        &collation_registry,
+                    );
                 }
                 // In-aggregate ORDER BY sorts the collected values. (GH #266)
                 if !order_by.is_empty() {
@@ -137798,44 +137744,57 @@ fn compute_aggregate_ext(
     }
 }
 
-/// Remove duplicate values in-place, preserving first-occurrence order.
-fn dedup_values(values: &mut Vec<&SqliteValue>) {
-    let mut seen = Vec::new();
-    values.retain(|v| {
-        if seen.contains(v) {
-            false
-        } else {
-            seen.push(*v);
-            true
+/// Keep the first item of each DISTINCT class of `key(item)`, in input order.
+/// Items whose keys compare equal under `collation` share a class (`1` and
+/// `1.0`, NOCASE-equal text, every NULL), as in stock's DISTINCT aggregates.
+/// Sorting the positions keeps this O(n log n); checking each item against
+/// every earlier distinct one was quadratic (GH#529).
+fn retain_first_distinct<T>(
+    items: &mut Vec<T>,
+    key: impl Fn(&T) -> &SqliteValue,
+    collation: Option<&str>,
+    registry: &CollationRegistry,
+) {
+    let compare = |left: usize, right: usize| {
+        cmp_sqlite_values_collated_snapshot(
+            key(&items[left]),
+            key(&items[right]),
+            collation,
+            registry,
+        )
+    };
+    let mut positions: Vec<usize> = (0..items.len()).collect();
+    positions.sort_unstable_by(|&left, &right| compare(left, right).then(left.cmp(&right)));
+    let mut keep = vec![false; items.len()];
+    let mut class_first: Option<usize> = None;
+    for position in positions {
+        if class_first.is_none_or(|first| compare(first, position) != std::cmp::Ordering::Equal) {
+            keep[position] = true;
+            class_first = Some(position);
         }
-    });
+    }
+    let mut keep = keep.into_iter();
+    items.retain(|_| keep.next().unwrap_or(false));
 }
 
-/// Collation-aware duplicate removal. When a collation is specified (e.g.
-/// `NOCASE`), text values are compared through the collation registry so
-/// that `'Alice'` and `'alice'` are treated as equal.
+/// Collation-aware duplicate removal, preserving first-occurrence order.
+/// When a collation is specified (e.g. `NOCASE`), text values are compared
+/// through the collation registry so that `'Alice'` and `'alice'` are treated
+/// as equal.
 fn dedup_values_collated(
     values: &mut Vec<&SqliteValue>,
     collation: Option<&str>,
     collation_registry: &Mutex<CollationRegistry>,
 ) {
     if collation.is_none() {
-        dedup_values(values);
+        // BINARY comparison never calls into the registry, so holding its
+        // lock cannot reenter application code.
+        let registry = lock_unpoisoned(collation_registry);
+        retain_first_distinct(values, |value| *value, None, &registry);
         return;
     }
     let snap = lock_unpoisoned(collation_registry).clone();
-    let mut seen: Vec<&SqliteValue> = Vec::new();
-    values.retain(|v| {
-        let already = seen.iter().any(|s| {
-            cmp_sqlite_values_collated_snapshot(v, s, collation, &snap) == std::cmp::Ordering::Equal
-        });
-        if already {
-            false
-        } else {
-            seen.push(*v);
-            true
-        }
-    });
+    retain_first_distinct(values, |value| *value, collation, &snap);
 }
 
 /// Extended aggregate computation with optional collation for MIN/MAX.
