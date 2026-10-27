@@ -3989,6 +3989,9 @@ async fn capture_ambient_io_native_cx(root_cx: &Cx) -> Option<asupersync::runtim
 #[derive(Debug, Clone)]
 pub struct ConnectionEnv {
     runtime: Arc<RuntimeContext>,
+    /// Operation context for opening only. Never retained as a connection's
+    /// lifetime root or inherited by a later ATTACH.
+    bootstrap_cx_override: Option<Cx>,
     /// Whether contexts derived while opening this connection are running on
     /// a dedicated engine OS thread where bounded positional I/O may safely
     /// execute inline. Raw connection opens leave this disabled; the
@@ -4022,6 +4025,7 @@ impl ConnectionEnv {
     pub fn new(runtime: Arc<RuntimeContext>) -> Self {
         Self {
             runtime,
+            bootstrap_cx_override: None,
             blocking_io_inline_safe: false,
             page_buffer_max: None,
             memory_vfs_config: None,
@@ -4104,6 +4108,25 @@ impl ConnectionEnv {
         &self.runtime
     }
 
+    /// Use `cx` for cancellation and budgets throughout connection opening.
+    ///
+    /// Derive this context from [`Self::bootstrap_cx`] so it carries the
+    /// environment's capabilities. A local cancellation relay can then abort
+    /// an admitted open without cancelling the shared runtime. The returned
+    /// connection still derives its lifetime root from [`Self::runtime`];
+    /// cancelling this opening context after success does not cancel later
+    /// SQL, ATTACH, or close operations.
+    /// An active cancellation mask is retained for the bounded opening
+    /// operation; it is not installed on the returned connection.
+    ///
+    /// Drive the open future to completion after requesting cancellation so
+    /// the engine can release acquired locks and finish required cleanup.
+    #[must_use]
+    pub fn with_bootstrap_cx(mut self, cx: Cx) -> Self {
+        self.bootstrap_cx_override = Some(cx);
+        self
+    }
+
     /// Mark this environment as owned by a dedicated engine OS thread.
     ///
     /// Contexts derived during connection bootstrap and for the resulting
@@ -4127,11 +4150,23 @@ impl ConnectionEnv {
         }
     }
 
-    fn bootstrap_cx(&self) -> Cx {
+    /// Derive a context for one connection-opening operation.
+    ///
+    /// This inherits the configured bootstrap context, including a snapshot
+    /// of its cancellation mask, or derives an ordinary child of the runtime
+    /// root when no override is configured. Retain this parent while using a
+    /// further child with a local cancellation relay, and pass that child to
+    /// [`Self::with_bootstrap_cx`]. For work moved to another OS thread, derive
+    /// a spawn-safe child before attaching that thread's I/O context.
+    #[must_use]
+    pub fn bootstrap_cx(&self) -> Cx {
         let cx = self
-            .runtime
-            .root_cx
-            .create_child()
+            .bootstrap_cx_override
+            .as_ref()
+            .map_or_else(
+                || self.runtime.root_cx.create_child(),
+                Cx::create_child_preserving_mask,
+            )
             .with_trace_context(next_trace_id(), 0, 0);
         self.apply_blocking_io_inline_safety(&cx);
         cx
@@ -4174,6 +4209,7 @@ impl Default for ConnectionEnv {
     fn default() -> Self {
         Self {
             runtime: RuntimeContext::global(),
+            bootstrap_cx_override: None,
             blocking_io_inline_safe: false,
             page_buffer_max: None,
             memory_vfs_config: None,
@@ -4268,6 +4304,7 @@ impl PagerBackend {
     /// bootstrap work. All namespace keys and companion-file paths are derived
     /// from this stable absolute spelling for the connection lifetime.
     fn resolve_stable_database_path(path: &str, cx: &Cx) -> Result<String> {
+        cx.checkpoint().map_err(|_| FrankenError::Abort)?;
         if path == ":memory:" {
             return Ok(path.to_owned());
         }
@@ -15446,7 +15483,8 @@ impl Connection {
     /// Open an existing database read-only, explicitly allowing reconstruction
     /// of its derived WAL index under the native recovery locks.
     ///
-    /// Unlike [`Self::open_schema_only`], this may modify the SHM sidecar when
+    /// [`Self::open_schema_only`] rebuilds only an existing SHM index that was
+    /// never initialized (GH#528). This may also modify the SHM sidecar when
     /// its publication is missing, invalid, or belongs to an older WAL
     /// generation. It does not authorize database/WAL writes, checkpoints,
     /// rollback-journal recovery, or SQL writes. A live conflicting owner
@@ -15677,7 +15715,8 @@ impl Connection {
                 path: std::path::PathBuf::from(path),
             });
         }
-        let attach_env = env.clone();
+        let mut attach_env = env.clone();
+        attach_env.bootstrap_cx_override = None;
 
         let bootstrap_cx = env.bootstrap_cx();
         let path = PagerBackend::resolve_stable_database_path(&path, &bootstrap_cx)?;
@@ -16030,7 +16069,9 @@ impl Connection {
             fast_path_gate: AtomicU32::new(0),
         };
         let bootstrap_result: Result<()> = async {
+            let _binding = conn.bind_bootstrap_cx(&env, &bootstrap_cx);
             let op_cx = conn.op_cx()?;
+            op_cx.checkpoint().map_err(|_| FrankenError::Abort)?;
             {
                 let ms = conn.pragma_state.borrow().busy_timeout_ms.max(0) as u64;
                 conn.pager.set_vfs_busy_timeout_ms(&op_cx, ms).await;
@@ -16061,6 +16102,7 @@ impl Connection {
             // The native namespace gate remains exclusive throughout every
             // journal/WAL/schema/MemDB bootstrap step above. Publish the completed
             // connection generation only at the final success boundary.
+            op_cx.checkpoint().map_err(|_| FrankenError::Abort)?;
             conn.pager.finish_namespace_bootstrap()?;
             Ok(())
         }
@@ -16255,6 +16297,7 @@ impl Connection {
 
         let path = ":memory:".to_owned();
         let bootstrap_cx = env.bootstrap_cx();
+        bootstrap_cx.checkpoint().map_err(|_| FrankenError::Abort)?;
         let vfs = env
             .memory_vfs_config()
             .map_or_else(MemoryVfs::new, MemoryVfs::new_with_config);
@@ -16286,14 +16329,15 @@ impl Connection {
         pager: PagerBackend,
         storage_was_empty: bool,
     ) -> Result<Self> {
-        let attach_env = env.clone();
+        let mut attach_env = env.clone();
+        attach_env.bootstrap_cx_override = None;
+        let bootstrap_cx = env.bootstrap_cx();
+        bootstrap_cx.checkpoint().map_err(|_| FrankenError::Abort)?;
         let pager_is_memory = pager.is_memory();
         let file_identity = if pager_is_memory {
             None
         } else {
-            let identity_cx = env.runtime().root_cx.create_child();
-            env.apply_blocking_io_inline_safety(&identity_cx);
-            pager.file_identity(&identity_cx).await?
+            pager.file_identity(&bootstrap_cx).await?
         };
         let shared_mvcc_state =
             shared_mvcc_state_for_path(&path, file_identity, Arc::clone(env.runtime()))?;
@@ -16627,7 +16671,9 @@ impl Connection {
             fast_path_gate: AtomicU32::new(0),
         };
         let bootstrap_result: Result<()> = async {
+            let _binding = conn.bind_bootstrap_cx(&env, &bootstrap_cx);
             let op_cx = conn.op_cx()?;
+            op_cx.checkpoint().map_err(|_| FrankenError::Abort)?;
             {
                 let ms = conn.pragma_state.borrow().busy_timeout_ms.max(0) as u64;
                 conn.pager.set_vfs_busy_timeout_ms(&op_cx, ms).await;
@@ -16658,6 +16704,7 @@ impl Connection {
             // Retain the native namespace bootstrap lease through journal/WAL,
             // schema, and MemDB initialization. Publish the generation only at
             // this final successful Connection boundary.
+            op_cx.checkpoint().map_err(|_| FrankenError::Abort)?;
             conn.pager.finish_namespace_bootstrap()?;
             // bd-zywqc.5: one-time idempotent repair pass on the first open of a
             // database created by a version predating the issue-#70 recovery
@@ -16669,6 +16716,7 @@ impl Connection {
             if !pager_is_memory {
                 crate::migration::run_first_open_migration(&conn, storage_was_empty).await;
             }
+            op_cx.checkpoint().map_err(|_| FrankenError::Abort)?;
             Ok(())
         }
         .await;
@@ -16923,11 +16971,7 @@ impl Connection {
                     path: requested.to_owned(),
                 });
             }
-            let cx = env
-                .runtime()
-                .root_cx
-                .create_child()
-                .with_trace_context(next_trace_id(), 0, 0);
+            let cx = env.bootstrap_cx();
             let stable = PagerBackend::resolve_stable_database_path(requested_text, &cx)?;
             let stable_path = std::path::PathBuf::from(stable);
             let reservation = fsqlite_vfs::host_fs::reserve_new_file(&stable_path).map_err(
@@ -17014,6 +17058,9 @@ impl Connection {
         reservation: &DatabaseBuilderReservation,
         env: ConnectionEnv,
     ) -> Result<Self> {
+        env.bootstrap_cx()
+            .checkpoint()
+            .map_err(|_| FrankenError::Abort)?;
         let Some(mut bootstrap_claim) = reservation.try_claim_initialization_bootstrap()? else {
             return Self::reopen_reserved_schema_only_bounded_writer(reservation, env).await;
         };
@@ -25665,6 +25712,28 @@ impl Connection {
             slot: &self.operation_cx_override,
             previous,
         }
+    }
+
+    /// Keep opening cancellation scoped to initialization, including helpers
+    /// that derive their own operation contexts after the pager has opened.
+    /// This context follows the selected environment's capability lineage;
+    /// the separately registered connection root owns its later lifetime.
+    fn bind_bootstrap_cx(
+        &self,
+        env: &ConnectionEnv,
+        bootstrap_cx: &Cx,
+    ) -> Option<OperationCxGuard<'_>> {
+        env.bootstrap_cx_override.as_ref()?;
+        // Opening may have captured a connection-owned native I/O context.
+        // Borrow it for bootstrap without giving that operation authority to
+        // cancel the connection's native context.
+        #[cfg(feature = "native")]
+        if bootstrap_cx.attached_native_cx().is_none()
+            && let Some(native_cx) = self.root_cx.attached_native_cx()
+        {
+            bootstrap_cx.set_shared_native_cx(native_cx);
+        }
+        Some(self.bind_operation_cx(bootstrap_cx))
     }
 
     /// Run one actor-dispatched operation under a worker-root-derived context.
@@ -42527,18 +42596,18 @@ impl Connection {
                 // surface as `ReadOnly` rather than mutating a file the parent
                 // was never granted write access to. A writable main opens the
                 // attached database read-write as usual.
+                let attach_env = self.attach_env.clone().with_bootstrap_cx(self.op_cx()?);
                 let attached_connection = if self.pager.is_readonly() {
                     Box::new(
                         Box::pin(Self::open_schema_only_with_env(
                             path.clone(),
-                            self.attach_env.clone(),
+                            attach_env,
                         ))
                         .await?,
                     )
                 } else {
                     Box::new(
-                        Box::pin(Self::open_with_env(path.clone(), self.attach_env.clone()))
-                            .await?,
+                        Box::pin(Self::open_with_env(path.clone(), attach_env)).await?,
                     )
                 };
                 // bd-6n5cy stock-fidelity: SQLite refuses to attach a database
@@ -46741,7 +46810,7 @@ impl Connection {
                 if let Some(row_data) = self.try_scan_join_source_from_memdb(source) {
                     return Ok(Some(row_data));
                 }
-                if let Some(result) = self.try_scan_join_source_from_pager(source).await {
+                if let Some(result) = self.try_scan_join_source_from_pager(source, None).await {
                     return Ok(Some(result?));
                 }
                 let scan_sql = build_join_scan_sql(source);
@@ -55288,7 +55357,8 @@ impl Connection {
                     if let Some(row_data) = self.try_scan_join_source_from_memdb(source) {
                         return Ok(Some(row_data));
                     }
-                    if let Some(result) = self.try_scan_join_source_from_pager(source).await {
+                    if let Some(result) = self.try_scan_join_source_from_pager(source, None).await
+                    {
                         return Ok(Some(result?));
                     }
                     let scan_sql = build_join_scan_sql(source);
@@ -85739,16 +85809,7 @@ impl Connection {
             *distinct = Distinctness::All;
             *group_by = Vec::new();
             *having = None;
-            *columns = col_map
-                .iter()
-                .map(|(table, column, _)| ResultColumn::Expr {
-                    expr: Expr::Column(
-                        ColumnRef::qualified(table.clone(), column.clone()),
-                        Span::new(0, 0),
-                    ),
-                    alias: None,
-                })
-                .collect();
+            *columns = join_raw_projection(select, &col_map);
         }
         join_select.limit = None;
         join_select.order_by = Vec::new();
@@ -86349,19 +86410,12 @@ impl Connection {
                                 entries.push((val, sep, keys));
                             }
                             if *distinct {
-                                let coll = collation.as_deref();
-                                let mut seen = Vec::new();
-                                entries.retain(|e| {
-                                    let dup = seen.iter().any(|s: &SqliteValue| {
-                                        cmp_sqlite_values_collated_snapshot(
-                                            s, &e.0, coll, &coll_snap,
-                                        ) == std::cmp::Ordering::Equal
-                                    });
-                                    if !dup {
-                                        seen.push(e.0.clone());
-                                    }
-                                    !dup
-                                });
+                                retain_first_distinct(
+                                    &mut entries,
+                                    |entry| &entry.0,
+                                    collation.as_deref(),
+                                    &coll_snap,
+                                );
                             }
                             let order_collations = order_by
                                 .iter()
@@ -86418,22 +86472,12 @@ impl Connection {
                                 entries.push((value, keys));
                             }
                             if *distinct {
-                                let mut seen = Vec::new();
-                                entries.retain(|(value, _)| {
-                                    if seen.iter().any(|previous| {
-                                        cmp_sqlite_values_collated_snapshot(
-                                            previous,
-                                            value,
-                                            collation.as_deref(),
-                                            &coll_snap,
-                                        ) == std::cmp::Ordering::Equal
-                                    }) {
-                                        false
-                                    } else {
-                                        seen.push(value.clone());
-                                        true
-                                    }
-                                });
+                                retain_first_distinct(
+                                    &mut entries,
+                                    |(value, _)| value,
+                                    collation.as_deref(),
+                                    &coll_snap,
+                                );
                             }
                             if !order_by.is_empty() {
                                 let order_collations = order_by
@@ -92515,19 +92559,12 @@ impl Connection {
                                 entries.push((val, sep, keys));
                             }
                             if *distinct {
-                                let coll = collation.as_deref();
-                                let mut seen = Vec::new();
-                                entries.retain(|e| {
-                                    let dup = seen.iter().any(|s: &SqliteValue| {
-                                        cmp_sqlite_values_collated_snapshot(
-                                            s, &e.0, coll, &coll_snap,
-                                        ) == std::cmp::Ordering::Equal
-                                    });
-                                    if !dup {
-                                        seen.push(e.0.clone());
-                                    }
-                                    !dup
-                                });
+                                retain_first_distinct(
+                                    &mut entries,
+                                    |entry| &entry.0,
+                                    collation.as_deref(),
+                                    &coll_snap,
+                                );
                             }
                             let order_collations = order_by
                                 .iter()
@@ -92581,22 +92618,12 @@ impl Connection {
                                 entries.push((value, keys));
                             }
                             if *distinct {
-                                let mut seen = Vec::new();
-                                entries.retain(|(value, _)| {
-                                    if seen.iter().any(|previous| {
-                                        cmp_sqlite_values_collated_snapshot(
-                                            previous,
-                                            value,
-                                            collation.as_deref(),
-                                            &coll_snap,
-                                        ) == std::cmp::Ordering::Equal
-                                    }) {
-                                        false
-                                    } else {
-                                        seen.push(value.clone());
-                                        true
-                                    }
-                                });
+                                retain_first_distinct(
+                                    &mut entries,
+                                    |(value, _)| value,
+                                    collation.as_deref(),
+                                    &coll_snap,
+                                );
                             }
                             if !order_by.is_empty() {
                                 let order_collations = order_by
@@ -93072,9 +93099,26 @@ impl Connection {
         Some(rows)
     }
 
+    /// Whether a join source is a local table without generated columns, so a
+    /// [`join_source_keep_masks`] mask may drop its columns. A generated
+    /// column is computed from stored ones; anything else is left whole.
+    fn join_source_columns_are_stored(&self, src: &JoinTableSource) -> bool {
+        src.local_table_binding()
+            .and_then(|binding| self.local_join_binding_table(binding))
+            .is_some_and(|(table, _)| {
+                table
+                    .columns
+                    .iter()
+                    .all(|column| column.generated_expr.is_none())
+            })
+    }
+
+    /// `keep` is a [`join_source_keep_masks`] mask, applied as each row is
+    /// read so a dropped wide column never accumulates.
     async fn try_scan_join_source_from_pager(
         &self,
         src: &JoinTableSource,
+        keep: Option<&[bool]>,
     ) -> Option<Result<Vec<Vec<SqliteValue>>>> {
         if !self.pager.is_file_backed() || self.local_transaction_scope_is_active() {
             return None;
@@ -93082,6 +93126,13 @@ impl Connection {
         let binding_name = src.local_table_binding()?;
         let (table_schema, rowid_alias_column_index) =
             self.local_join_binding_table(binding_name)?;
+        // A generated column is computed from the stored ones; keep them all.
+        let keep = keep.filter(|_| {
+            table_schema
+                .columns
+                .iter()
+                .all(|column| column.generated_expr.is_none())
+        });
         let root_page_num = table_schema.root_page;
         if self.is_memdb_only_root_page(root_page_num) {
             return None;
@@ -93114,6 +93165,9 @@ impl Connection {
                         &payload_values,
                         rowid_alias_column_index,
                     )?;
+                    if let Some(keep) = keep {
+                        prune_join_source_row(&mut values, keep);
+                    }
                     if src.hidden_rowid_projection.is_some() {
                         values.push(SqliteValue::Integer(rowid));
                     }
@@ -93250,7 +93304,8 @@ impl Connection {
         let mut inner_rows: Vec<Vec<SqliteValue>> =
             if let Some(rows) = self.try_scan_join_source_from_memdb(inner_src) {
                 rows
-            } else if let Some(result) = self.try_scan_join_source_from_pager(inner_src).await {
+            } else if let Some(result) = self.try_scan_join_source_from_pager(inner_src, None).await
+            {
                 result?
             } else {
                 // Same last-resort scan the generic step-3 loop uses for a
@@ -94816,16 +94871,20 @@ impl Connection {
         // rows from all joined tables; otherwise use single-table path.
         let mut raw_select = build_raw_scan_select(select);
         if let SelectCore::Select { columns, .. } = &mut raw_select.body.select {
-            *columns = col_map
-                .iter()
-                .map(|(table, column, _)| ResultColumn::Expr {
-                    expr: Expr::Column(
-                        ColumnRef::qualified(table.clone(), column.clone()),
-                        Span::new(0, 0),
-                    ),
-                    alias: None,
-                })
-                .collect();
+            *columns = if has_join {
+                join_raw_projection(select, &col_map)
+            } else {
+                col_map
+                    .iter()
+                    .map(|(table, column, _)| ResultColumn::Expr {
+                        expr: Expr::Column(
+                            ColumnRef::qualified(table.clone(), column.clone()),
+                            Span::new(0, 0),
+                        ),
+                        alias: None,
+                    })
+                    .collect()
+            };
         }
         let raw_rows = if has_join {
             self.execute_join_select(&raw_select, params).await?
@@ -98760,12 +98819,17 @@ impl Connection {
         // substituted to literals upstream (bd-l3tce `substitute_outer_refs`),
         // so any surviving `Expr::Column` in a TVF argument is a same-level
         // lateral reference. Such sources skip pre-materialization here and are
-        // evaluated per-row inside the join loop instead.
+        // evaluated per-row inside the join loop instead. The join loop only
+        // binds joined sources, and the first source has no left sibling to
+        // read, so it always materializes here: skipping it for a subquery
+        // argument (`FROM json_each((SELECT tags FROM t))`) returned no rows.
         let lateral_tvf: Vec<bool> = all_sources
             .iter()
-            .map(|src| {
-                matches!(src, TableOrSubquery::TableFunction { args, .. }
-                    if args.iter().any(expr_references_any_column))
+            .enumerate()
+            .map(|(index, src)| {
+                index > 0
+                    && matches!(src, TableOrSubquery::TableFunction { args, .. }
+                        if args.iter().any(expr_references_any_column))
             })
             .collect();
         for (i, pre) in preloaded.iter_mut().enumerate() {
@@ -99053,6 +99117,16 @@ impl Connection {
         // `main.t` and `aux.t` alias each other.
         let mut scanned_cache: HashMap<String, Vec<Vec<SqliteValue>>> = HashMap::new();
         let mut table_rows: Vec<Vec<Vec<SqliteValue>>> = Vec::with_capacity(table_sources.len());
+        // GH#527: keep only the columns the statement can name.
+        let rowid_aliases: Vec<Option<usize>> = table_sources
+            .iter()
+            .map(|src| {
+                src.local_table_binding()
+                    .and_then(|binding| self.local_join_binding_table(binding))
+                    .and_then(|(_, rowid_alias)| rowid_alias)
+            })
+            .collect();
+        let keep_masks = join_source_keep_masks(select, &table_sources, &rowid_aliases);
         for (i, src) in table_sources.iter().enumerate() {
             if keyset_stream_active {
                 // GH#386: the streaming keyset lane already produced the
@@ -99060,8 +99134,13 @@ impl Connection {
                 table_rows.push(Vec::new());
                 continue;
             }
-            if let Some(rows) = preloaded[i].take() {
+            if let Some(mut rows) = preloaded[i].take() {
                 // Subquery: use preloaded rows.
+                if let Some(keep) = keep_masks[i].as_deref() {
+                    for row in &mut rows {
+                        prune_join_source_row(row, keep);
+                    }
+                }
                 table_rows.push(maybe_filter_primary_join_rows(
                     rows,
                     i,
@@ -99094,7 +99173,10 @@ impl Connection {
                 let mut row_data = if let Some(row_data) = self.try_scan_join_source_from_memdb(src)
                 {
                     row_data
-                } else if let Some(result) = self.try_scan_join_source_from_pager(src).await {
+                } else if let Some(result) = self
+                    .try_scan_join_source_from_pager(src, keep_masks[i].as_deref())
+                    .await
+                {
                     result?
                 } else {
                     let scan_sql = build_join_scan_sql(src);
@@ -99118,6 +99200,15 @@ impl Connection {
                 for row in &mut row_data {
                     if row.len() != scan_width {
                         row.resize(scan_width, SqliteValue::Null);
+                    }
+                }
+                // The pager scan already applied the mask row by row; the
+                // memdb and SQL scans apply it here.
+                if let Some(keep) = keep_masks[i].as_deref()
+                    && self.join_source_columns_are_stored(src)
+                {
+                    for row in &mut row_data {
+                        prune_join_source_row(row, keep);
                     }
                 }
                 #[cfg(test)]
@@ -127206,24 +127297,14 @@ fn prepare_application_aggregate_rows(
     collation_registry: &CollationRegistry,
 ) -> Vec<Vec<SqliteValue>> {
     if distinct {
-        let mut seen = Vec::new();
-        let mut saw_zero_arg_row = false;
-        entries.retain(|(args, _)| {
-            let Some(value) = args.first() else {
-                let keep = !saw_zero_arg_row;
-                saw_zero_arg_row = true;
-                return keep;
-            };
-            if seen.iter().any(|previous| {
-                cmp_sqlite_values_collated_snapshot(previous, value, collation, collation_registry)
-                    == std::cmp::Ordering::Equal
-            }) {
-                false
-            } else {
-                seen.push(value.clone());
-                true
-            }
-        });
+        // Every row of one call has the same arity, so a zero-argument call's
+        // empty tuples form one class, which the NULL key stands for.
+        retain_first_distinct(
+            &mut entries,
+            |(args, _)| args.first().unwrap_or(&SqliteValue::Null),
+            collation,
+            collation_registry,
+        );
     }
     if !order_by.is_empty() {
         let order_collations = order_by
@@ -127326,23 +127407,13 @@ fn eval_group_agg_join_expr(
                 }
                 // DISTINCT removes duplicate values (first occurrence wins). (GH #268)
                 if *distinct {
-                    let mut seen: Vec<SqliteValue> = Vec::new();
                     let distinct_collation = join_expr_effective_collation(arg, col_map);
-                    items.retain(|(v, _)| {
-                        if seen.iter().any(|s| {
-                            cmp_sqlite_values_collated_snapshot(
-                                s,
-                                v,
-                                distinct_collation.as_deref(),
-                                &collation_registry,
-                            ) == std::cmp::Ordering::Equal
-                        }) {
-                            false
-                        } else {
-                            seen.push(v.clone());
-                            true
-                        }
-                    });
+                    retain_first_distinct(
+                        &mut items,
+                        |(value, _)| value,
+                        distinct_collation.as_deref(),
+                        &collation_registry,
+                    );
                 }
                 // In-aggregate ORDER BY sorts the collected values. (GH #266)
                 if !order_by.is_empty() {
@@ -137676,44 +137747,57 @@ fn compute_aggregate_ext(
     }
 }
 
-/// Remove duplicate values in-place, preserving first-occurrence order.
-fn dedup_values(values: &mut Vec<&SqliteValue>) {
-    let mut seen = Vec::new();
-    values.retain(|v| {
-        if seen.contains(v) {
-            false
-        } else {
-            seen.push(*v);
-            true
+/// Keep the first item of each DISTINCT class of `key(item)`, in input order.
+/// Items whose keys compare equal under `collation` share a class (`1` and
+/// `1.0`, NOCASE-equal text, every NULL), as in stock's DISTINCT aggregates.
+/// Sorting the positions keeps this O(n log n); checking each item against
+/// every earlier distinct one was quadratic (GH#529).
+fn retain_first_distinct<T>(
+    items: &mut Vec<T>,
+    key: impl Fn(&T) -> &SqliteValue,
+    collation: Option<&str>,
+    registry: &CollationRegistry,
+) {
+    let compare = |left: usize, right: usize| {
+        cmp_sqlite_values_collated_snapshot(
+            key(&items[left]),
+            key(&items[right]),
+            collation,
+            registry,
+        )
+    };
+    let mut positions: Vec<usize> = (0..items.len()).collect();
+    positions.sort_unstable_by(|&left, &right| compare(left, right).then(left.cmp(&right)));
+    let mut keep = vec![false; items.len()];
+    let mut class_first: Option<usize> = None;
+    for position in positions {
+        if class_first.is_none_or(|first| compare(first, position) != std::cmp::Ordering::Equal) {
+            keep[position] = true;
+            class_first = Some(position);
         }
-    });
+    }
+    let mut keep = keep.into_iter();
+    items.retain(|_| keep.next().unwrap_or(false));
 }
 
-/// Collation-aware duplicate removal. When a collation is specified (e.g.
-/// `NOCASE`), text values are compared through the collation registry so
-/// that `'Alice'` and `'alice'` are treated as equal.
+/// Collation-aware duplicate removal, preserving first-occurrence order.
+/// When a collation is specified (e.g. `NOCASE`), text values are compared
+/// through the collation registry so that `'Alice'` and `'alice'` are treated
+/// as equal.
 fn dedup_values_collated(
     values: &mut Vec<&SqliteValue>,
     collation: Option<&str>,
     collation_registry: &Mutex<CollationRegistry>,
 ) {
     if collation.is_none() {
-        dedup_values(values);
+        // BINARY comparison never calls into the registry, so holding its
+        // lock cannot reenter application code.
+        let registry = lock_unpoisoned(collation_registry);
+        retain_first_distinct(values, |value| *value, None, &registry);
         return;
     }
     let snap = lock_unpoisoned(collation_registry).clone();
-    let mut seen: Vec<&SqliteValue> = Vec::new();
-    values.retain(|v| {
-        let already = seen.iter().any(|s| {
-            cmp_sqlite_values_collated_snapshot(v, s, collation, &snap) == std::cmp::Ordering::Equal
-        });
-        if already {
-            false
-        } else {
-            seen.push(*v);
-            true
-        }
-    });
+    retain_first_distinct(values, |value| *value, collation, &snap);
 }
 
 /// Extended aggregate computation with optional collation for MIN/MAX.
@@ -155455,6 +155539,132 @@ fn join_hidden_rowid_projection(columns: &[String], supports_hidden_rowid: bool)
 fn join_scan_cache_key(name: &QualifiedName) -> String {
     let schema = normalized_attached_schema_name(name.schema.as_deref()).unwrap_or("main");
     format!("table:{schema}:{}", name.name.to_ascii_lowercase())
+}
+
+/// The lowercased SQL a join statement's column references can be matched
+/// against (GH#527), or `None` when any column may be read implicitly: a
+/// `*` / `tbl.*` result column or a NATURAL join. Matching on the SQL text is
+/// deliberately coarse: a name that appears anywhere (an alias, a string
+/// literal, another table's column, a subquery) counts as named.
+fn join_statement_column_text(select: &SelectStatement) -> Option<String> {
+    let SelectCore::Select {
+        columns,
+        from: Some(from),
+        ..
+    } = &select.body.select
+    else {
+        return None;
+    };
+    if columns
+        .iter()
+        .any(|column| matches!(column, ResultColumn::Star | ResultColumn::TableStar(_)))
+        || from.joins.iter().any(|join| join.join_type.natural)
+    {
+        return None;
+    }
+    Some(select.to_string().to_ascii_lowercase())
+}
+
+/// Whether `sql` (from [`join_statement_column_text`]) can name `column`.
+/// A name that is not a plain identifier always counts as named.
+fn join_column_is_named(sql: &str, column: &str) -> bool {
+    let column = column.to_ascii_lowercase();
+    !is_plain_sql_identifier(&column) || sql_mentions_word(sql, &column)
+}
+
+/// Per-source column keep-masks for the generic join fallback (GH#527).
+///
+/// The fallback holds every row of every source, and a joined row clones its
+/// sources' values, so one unreferenced wide column (a message body) costs
+/// its full size per row, several times over: `COUNT(*)` over a three-table
+/// join of a 2.1 GB archive held 6 GB. A column is dropped, and read as NULL
+/// by the join, only when the statement cannot name it
+/// ([`join_column_is_named`]). A table's rowid alias (`rowid_aliases`, its
+/// INTEGER PRIMARY KEY column index) is always kept, so a `rowid` reference
+/// stays answerable. Masks depend only on a source's column names, so two
+/// references to one table get the same mask and may share scanned rows.
+/// `None` keeps every column.
+fn join_source_keep_masks(
+    select: &SelectStatement,
+    table_sources: &[JoinTableSource],
+    rowid_aliases: &[Option<usize>],
+) -> Vec<Option<Vec<bool>>> {
+    let Some(sql) = join_statement_column_text(select) else {
+        return vec![None; table_sources.len()];
+    };
+    table_sources
+        .iter()
+        .zip(rowid_aliases)
+        .map(|(source, rowid_alias)| {
+            let mask: Vec<bool> = source
+                .col_names
+                .iter()
+                .enumerate()
+                .map(|(index, name)| {
+                    *rowid_alias == Some(index) || join_column_is_named(&sql, name)
+                })
+                .collect();
+            mask.contains(&false).then_some(mask)
+        })
+        .collect()
+}
+
+/// GH#527: the raw projection an aggregate or window join reads, one entry
+/// per `col_map` column of the original statement. A visible column the
+/// statement never names is projected as NULL, so neither the compiled join
+/// nor the generic fallback decodes or holds it; hidden rowids, which order
+/// grouped rows, are always read.
+fn join_raw_projection(
+    original: &SelectStatement,
+    col_map: &[(String, String, bool)],
+) -> Vec<ResultColumn> {
+    let sql = join_statement_column_text(original);
+    col_map
+        .iter()
+        .map(|(table, column, hidden)| {
+            let named =
+                *hidden || sql.as_deref().is_none_or(|sql| join_column_is_named(sql, column));
+            ResultColumn::Expr {
+                expr: if named {
+                    Expr::Column(
+                        ColumnRef::qualified(table.clone(), column.clone()),
+                        Span::new(0, 0),
+                    )
+                } else {
+                    Expr::Literal(Literal::Null, Span::ZERO)
+                },
+                alias: None,
+            }
+        })
+        .collect()
+}
+
+/// Whether `word` occurs in `sql` delimited by non-identifier characters.
+fn sql_mentions_word(sql: &str, word: &str) -> bool {
+    let bytes = sql.as_bytes();
+    let is_identifier_byte = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    sql.match_indices(word).any(|(at, _)| {
+        let before = at.checked_sub(1).map(|index| bytes[index]);
+        let after = bytes.get(at + word.len()).copied();
+        !before.is_some_and(is_identifier_byte) && !after.is_some_and(is_identifier_byte)
+    })
+}
+
+fn is_plain_sql_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Applies a [`join_source_keep_masks`] mask: dropped columns become NULL.
+fn prune_join_source_row(row: &mut [SqliteValue], keep: &[bool]) {
+    for (value, keep) in row.iter_mut().zip(keep) {
+        if !keep {
+            *value = SqliteValue::Null;
+        }
+    }
 }
 
 fn build_join_scan_sql(source: &JoinTableSource) -> String {
@@ -305874,11 +306084,11 @@ mod join_keyset_stream_tests {
     fn runtime_refusals() -> u64 {
         FSQLITE_JOIN_KEYSET_STREAM_RUNTIME_REFUSALS.load(AtomicOrdering::Relaxed)
     }
-    fn values_of(rows: &[Row]) -> Vec<Vec<SqliteValue>> {
+    pub(super) fn values_of(rows: &[Row]) -> Vec<Vec<SqliteValue>> {
         rows.iter().map(|row| row.values().to_vec()).collect()
     }
 
-    fn stock_rows(
+    pub(super) fn stock_rows(
         stock: &rusqlite::Connection,
         sql: &str,
         params: impl rusqlite::Params,
@@ -306667,6 +306877,141 @@ mod join_keyset_stream_tests {
                     rusqlite::params![Option::<i64>::None, 9]
                 )
             );
+        });
+    }
+}
+
+/// GH#527 keepers: the generic join fallback keeps only the columns a
+/// statement can name. See `join_source_keep_masks`.
+#[cfg(test)]
+mod join_projection_prune_tests {
+    use super::join_keyset_stream_tests::{stock_rows, values_of};
+    use super::{Connection, fsqlite_core_test_serializer};
+
+    const BIG_ROWS: i64 = 600;
+    const BODY_BYTES: usize = 2_000;
+
+    const SCHEMA: &str = "CREATE TABLE tiny (id INTEGER PRIMARY KEY, name TEXT);
+         CREATE TABLE small (id INTEGER PRIMARY KEY, tid INTEGER);
+         CREATE TABLE big (id INTEGER PRIMARY KEY, sid INTEGER NOT NULL, body TEXT);";
+
+    /// Rows for tiny (8), small (50) and big (`BIG_ROWS`, ~`BODY_BYTES` bodies).
+    fn inserts() -> Vec<String> {
+        let tiny = (1..=8)
+            .map(|id| format!("({id}, 'agent{id}')"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let small = (1..=50)
+            .map(|id| format!("({id}, {})", 1 + id % 8))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let big = (1..=BIG_ROWS)
+            .map(|id| {
+                let body = format!("body {id} ").repeat(BODY_BYTES / 8);
+                format!("({id}, {}, '{body}')", 1 + id % 50)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        vec![
+            format!("INSERT INTO tiny (id, name) VALUES {tiny};"),
+            format!("INSERT INTO small (id, tid) VALUES {small};"),
+            format!("INSERT INTO big (id, sid, body) VALUES {big};"),
+        ]
+    }
+
+    /// Statements the generic fallback runs (three sources or a subquery
+    /// source), and whether `big.body` must survive: it is named, or `*`
+    /// expands it. `rowid` alone does not keep it (the rowid alias is kept).
+    const CASES: [(&str, bool); 8] = [
+        (
+            "SELECT COUNT(*) FROM big b JOIN small s ON s.id = b.sid JOIN tiny t ON t.id = s.tid",
+            false,
+        ),
+        (
+            "SELECT COUNT(*) FROM big b JOIN small s ON s.id = b.sid \
+             LEFT JOIN tiny t ON t.id = s.tid WHERE t.name = 'agent3'",
+            false,
+        ),
+        (
+            "SELECT t.name, COUNT(*), SUM(CASE WHEN b.id % 2 = 0 THEN 1 ELSE 0 END) \
+             FROM big b JOIN small s ON s.id = b.sid JOIN tiny t ON t.id = s.tid \
+             GROUP BY t.name ORDER BY t.name",
+            false,
+        ),
+        (
+            "SELECT COUNT(*) FROM big b \
+             LEFT JOIN (SELECT id, MAX(name) AS name FROM tiny GROUP BY id) g ON g.id = b.sid % 8 + 1 \
+             JOIN small s ON s.id = b.sid",
+            false,
+        ),
+        (
+            "SELECT t.name, SUM(length(b.body)) FROM big b JOIN small s ON s.id = b.sid \
+             JOIN tiny t ON t.id = s.tid GROUP BY t.name ORDER BY t.name",
+            true,
+        ),
+        (
+            "SELECT b.id, substr(b.body, 1, 12), t.name FROM big b JOIN small s ON s.id = b.sid \
+             JOIN tiny t ON t.id = s.tid WHERE b.id <= 3 ORDER BY b.id",
+            true,
+        ),
+        (
+            "SELECT * FROM big b JOIN small s ON s.id = b.sid JOIN tiny t ON t.id = s.tid \
+             WHERE b.id = 7",
+            true,
+        ),
+        (
+            "SELECT MAX(b.rowid) FROM big b JOIN small s ON s.id = b.sid JOIN tiny t ON t.id = s.tid",
+            false,
+        ),
+    ];
+
+    /// Positive observable: a statement that never names `big.body` holds
+    /// none of it (payload far below one body per row), including aggregates
+    /// and `rowid` reads. Planted negatives: naming it and `*` each keep it
+    /// (payload above one body per row), and every result equals stock
+    /// SQLite's, so pruning never changes an answer. Before GH#527 every case
+    /// held every body.
+    #[test]
+    fn generic_join_fallback_holds_only_named_columns_and_matches_stock() {
+        let _serialize = fsqlite_core_test_serializer();
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("gh527_prune.db");
+            let conn = Connection::open(path.to_str().unwrap()).await.unwrap();
+            conn.execute_batch(SCHEMA).await.unwrap();
+            for insert in inserts() {
+                conn.execute(&insert).await.unwrap();
+            }
+            conn.close().await.unwrap();
+            let conn = Connection::open(path.to_str().unwrap()).await.unwrap();
+            let stock = rusqlite::Connection::open_in_memory().unwrap();
+            stock.execute_batch(SCHEMA).unwrap();
+            for insert in inserts() {
+                stock.execute_batch(&insert).unwrap();
+            }
+
+            let all_bodies = usize::try_from(BIG_ROWS).unwrap() * BODY_BYTES;
+            for (sql, body_survives) in CASES {
+                conn.join_materialization_profile.replace(Default::default());
+                let rows = conn.query(&format!("{sql};")).await.unwrap();
+                let profile = *conn.join_materialization_profile.borrow();
+                assert_eq!(values_of(&rows), stock_rows(&stock, sql, []), "{sql}");
+                assert!(
+                    profile.generic_source_rows >= usize::try_from(BIG_ROWS).unwrap(),
+                    "{sql} must take the generic fallback: {profile:?}"
+                );
+                if body_survives {
+                    assert!(
+                        profile.generic_source_payload_bytes > all_bodies,
+                        "{sql} names big.body, which must be kept: {profile:?}"
+                    );
+                } else {
+                    assert!(
+                        profile.generic_source_payload_bytes < all_bodies / 20,
+                        "{sql} never names big.body, which must not be held: {profile:?}"
+                    );
+                }
+            }
         });
     }
 }

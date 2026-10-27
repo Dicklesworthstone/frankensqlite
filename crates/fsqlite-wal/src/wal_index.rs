@@ -395,6 +395,20 @@ pub fn shared_wal_index_header_is_torn(region: &ShmRegion) -> Result<bool> {
     Ok(first != second)
 }
 
+/// Whether the primary header copy was never initialized (GH#528).
+///
+/// Stock's first attacher truncates `-shm` to 3 bytes and only then rebuilds
+/// it, so extending that file, an invalidated recovery, and a recovery that
+/// stopped before its final store all leave copy 1's `isInit` zero. Every
+/// publisher stores copy 1 last, so a caller holding every recovery fence
+/// sees such a pair abandoned. An initialized copy 1 that fails validation is
+/// not reported here.
+pub fn shared_wal_index_header_is_uninitialized(region: &ShmRegion) -> Result<bool> {
+    validate_shared_segment(region)?;
+    let first = read_shared_header_copy(region, 0)?;
+    Ok(first[12] == 0)
+}
+
 /// Read the durable backfill watermark for one exact accepted publication.
 ///
 /// The caller retains its checkpoint/reader owner. A changed header or an
@@ -2093,6 +2107,41 @@ mod tests {
             );
             assert!(region.lock().iter().all(|byte| *byte == 0));
         }
+    }
+
+    #[test]
+    fn test_shared_header_uninitialized_names_only_an_unset_primary_copy() {
+        // GH#528: stock's 3-byte first-attacher truncation, extended by zeros.
+        let region = ShmRegion::new(WAL_SHM_SEGMENT_BYTES);
+        assert!(shared_wal_index_header_is_uninitialized(&region).unwrap());
+        region
+            .atomic_store_u32_ne(0, WAL_INDEX_VERSION, Ordering::Release)
+            .unwrap();
+        assert!(shared_wal_index_header_is_torn(&region).unwrap());
+        assert!(shared_wal_index_header_is_uninitialized(&region).unwrap());
+
+        let header = shared_header_fixture(4096, 7);
+        publish_shared_wal_index_header(&region, &header).unwrap();
+        assert!(!shared_wal_index_header_is_uninitialized(&region).unwrap());
+        invalidate_shared_wal_index_header(&region).unwrap();
+        assert!(shared_wal_index_header_is_uninitialized(&region).unwrap());
+        // A recovery that stored copy 2 and stopped before copy 1.
+        write_shared_header_copy(&region, WAL_INDEX_HDR_BYTES, &header.to_bytes()).unwrap();
+        assert!(shared_wal_index_header_is_torn(&region).unwrap());
+        assert!(shared_wal_index_header_is_uninitialized(&region).unwrap());
+
+        // Initialized but corrupt: both copies agree on a bad checksum.
+        publish_shared_wal_index_header(&region, &header).unwrap();
+        for offset in [16, WAL_INDEX_HDR_BYTES + 16] {
+            region
+                .atomic_store_u32_ne(offset, 99, Ordering::Release)
+                .unwrap();
+        }
+        assert!(read_shared_wal_index_header(&region).unwrap().is_none());
+        assert!(!shared_wal_index_header_is_torn(&region).unwrap());
+        assert!(!shared_wal_index_header_is_uninitialized(&region).unwrap());
+
+        assert!(shared_wal_index_header_is_uninitialized(&ShmRegion::new(136)).is_err());
     }
 
     #[test]

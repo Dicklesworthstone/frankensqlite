@@ -1,0 +1,56 @@
+{
+  "date_utc": "2026-10-26",
+  "current_base_commit": "226bf9f0392e0ef42fffed5b5b2f3c236b8ec839",
+  "earlier_frozen_baseline_commit": "4a60d9f7168cd1a3fc6943e5e2c7ad52dc6f89d0",
+  "earlier_equivalent_main_commit": "ac0c616166c6f40360ac2406a970f8540b9cc8fc",
+  "pinned_toolchain": "nightly-2026-08-31-x86_64-unknown-linux-gnu",
+  "rustc_commit": "90850177249efe0321573c569aec5d12b257f8d6",
+  "rustc_version_verified_after_recovery": "1.100.0-nightly (908501772 2026-08-30)",
+  "recovered_config": "/tmp/gh526-recovery/build-hints.toml",
+  "recovered_config_status": "Prepared only; not used for a compilation or test run",
+  "recovered_wrapper": "/tmp/gh526-recovery/run-cargo.sh",
+  "private_cache_status": "Preparation script saved but not executed; no cache copied or modified",
+  "baseline_test_executable": null,
+  "candidate_test_executable": null,
+  "new_benchmark_results": null,
+  "earlier_attempts_from_session_records": [
+    {
+      "operation": "cargo check -p fsqlite-core --lib",
+      "result": "asupersync rustc received SIGKILL; cgroup OOM observed"
+    },
+    {
+      "operation": "Frozen baseline release-perf test compilation",
+      "settings": "one Cargo job; engine opt-level=3; LTO=false; codegen-units=32",
+      "result": "asupersync rustc received SIGKILL before changed engine compilation"
+    },
+    {
+      "operation": "Repeated dependency-only compile diagnostics",
+      "settings": "asupersync opt-level=1 then 0; codegen-units=256; final explicit one-job frontend and backend",
+      "result": "SIGKILL in compiler frontend; final peak RSS 2403404 KiB, elapsed 37.50 seconds; no executable"
+    },
+    {
+      "operation": "cargo check --workspace --all-targets --locked --offline",
+      "result": "exit 101; asupersync rustc received SIGKILL"
+    },
+    {
+      "operation": "cargo clippy --workspace --all-targets --locked --offline -- -D warnings",
+      "result": "exit 101; asupersync rustc received SIGKILL"
+    },
+    {
+      "operation": "cargo fmt --check",
+      "result": "exit 1; formatting differences in 20 unchanged baseline files"
+    },
+    {
+      "operation": "Earlier new integration-test standalone rustfmt and git diff --check",
+      "result": "passed before temporary workspace expired; restored files require their own checks"
+    }
+  ],
+  "latest_resource_observation": {
+    "cgroup_memory_limit_bytes": 8589934592,
+    "cgroup_memory_current_bytes": 7793803264,
+    "filesystem_free_bytes_including_reserved": 26292224,
+    "filesystem_unreserved_available_bytes": 0,
+    "normal_exec_error": "ENOSPC registering synthetic /tmp/.aws sandbox mount target"
+  },
+  "scope": "No dependency source, manifest, lockfile, sibling checkout or sibling cache was modified. No unrelated job or file was removed. Issue and bead must remain open pending executable validation."
+}

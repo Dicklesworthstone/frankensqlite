@@ -1,0 +1,50 @@
+{
+  "recorded_at_utc": "2026-10-26T17:33:45.218003+00:00",
+  "issue": "https://github.com/Dicklesworthstone/frankensqlite/issues/526",
+  "archive_url": "https://github.com/Dicklesworthstone/frankensqlite/releases/download/v0.4.12/fsqlite-0.4.12-linux_amd64.tar.gz",
+  "binary_version": "fsqlite 0.4.12",
+  "archive_sha256": "12dcedd3d8c15bbac7d67ea83a25926b96000cad82e04a224112202f4224242b",
+  "executable_sha256": "71259ce7c788fbf227f58dab7f6696c0c58d62b1637e1e789c86e696653c4543",
+  "stock_version": "3.53.1",
+  "rows": 128,
+  "schema": "CREATE TABLE t (id TEXT PRIMARY KEY NOT NULL, c1 TEXT NOT NULL, c2 TEXT NOT NULL,\n c3 TEXT NOT NULL, c4 TEXT NOT NULL, c5 TEXT, c6 TEXT, c7 TEXT, c8 TEXT NOT NULL,\n c9 TEXT, c10 TEXT, c11 INTEGER, c12 TEXT, c13 TEXT, c14 TEXT, c15 INTEGER NOT NULL);\nCREATE INDEX x1 ON t (c3, c4, c8 DESC, c1);\nCREATE INDEX x2 ON t (c1, c8 DESC);\nCREATE INDEX x3 ON t (c2, c8 DESC);\nCREATE INDEX x4 ON t (c5);\nCREATE UNIQUE INDEX x5 ON t (c14) WHERE c14 IS NOT NULL;\nCREATE INDEX x6 ON t (c9, c8 DESC);\nCREATE INDEX x7 ON t (c10);\nCREATE INDEX x8 ON t (c15);\nCREATE INDEX x9 ON t (c6);\nCREATE UNIQUE INDEX x10 ON t (c1, c2, c3, c4, c5, COALESCE(c6, ''), c8, c7,\n c9, c10, COALESCE(c11, -1), COALESCE(c12, ''), COALESCE(c13, ''))\n WHERE c1 IS NOT NULL AND c2 IS NOT NULL;",
+  "parameter_numbers": {
+    "OLD.id": 1,
+    "NEW.c1": 2,
+    "NEW.c2": 3,
+    "NEW.c3": 4,
+    "NEW.c4": 5,
+    "NEW.c5": 6,
+    "NEW.c6": 7,
+    "NEW.c7": 8,
+    "NEW.c8": 9,
+    "NEW.c9": 10,
+    "NEW.c10": 11,
+    "NEW.c11": 12,
+    "NEW.c12": 13,
+    "NEW.c13": 14
+  },
+  "example_parameter_values": [
+    "id00000000",
+    "s1",
+    "p1",
+    "ns-a",
+    "tag0",
+    "u-a",
+    "2010-01-01",
+    "x",
+    "2010-01-01",
+    "form-a",
+    "2010-12-31",
+    null,
+    "fp",
+    "fr"
+  ],
+  "cells": {
+    "literal_ordered": "SELECT 1 FROM t AS v WHERE v.id IS NOT 'id00000000' AND v.c14 IS NOT NULL\n AND v.c1 = 's1' AND v.c2 = 'p1' AND v.c3 = 'ns-a' AND v.c4 = 'tag0'\n AND v.c5 IS 'u-a' AND v.c6 IS '2010-01-01' AND v.c7 IS 'x' AND v.c8 = '2010-01-01'\n AND v.c9 IS 'form-a' AND v.c10 IS '2010-12-31' AND v.c11 IS NULL\n AND v.c12 IS 'fp' AND v.c13 IS 'fr'\n ORDER BY v.c3, v.c4, v.c8 DESC LIMIT 1",
+    "literal_nested_normalized": "SELECT 1 FROM t AS v WHERE v.id IS NOT 'id00000000' AND v.c14 IS NOT NULL\n AND v.c1 = 's1' AND v.c2 = 'p1' AND v.c3 = 'ns-a' AND v.c4 = 'tag0'\n AND v.c5 IS 'u-a' AND v.c6 IS '2010-01-01' AND v.c7 IS 'x' AND v.c8 = '2010-01-01'\n AND v.c9 IS 'form-a' AND v.c10 IS '2010-12-31' AND v.c11 IS NULL\n AND v.c12 IS 'fp' AND v.c13 IS 'fr' LIMIT 1",
+    "numbered_ordered": "SELECT 1 FROM t AS v WHERE v.id IS NOT ?1 AND v.c14 IS NOT NULL\n AND v.c1 = ?2 AND v.c2 = ?3 AND v.c3 = ?4 AND v.c4 = ?5\n AND v.c5 IS ?6 AND v.c6 IS ?7 AND v.c7 IS ?8 AND v.c8 = ?9\n AND v.c9 IS ?10 AND v.c10 IS ?11 AND v.c11 IS ?12\n AND v.c12 IS ?13 AND v.c13 IS ?14\n ORDER BY v.c3, v.c4, v.c8 DESC LIMIT 1",
+    "numbered_nested_normalized": "SELECT 1 FROM t AS v WHERE v.id IS NOT ?1 AND v.c14 IS NOT NULL\n AND v.c1 = ?2 AND v.c2 = ?3 AND v.c3 = ?4 AND v.c4 = ?5\n AND v.c5 IS ?6 AND v.c6 IS ?7 AND v.c7 IS ?8 AND v.c8 = ?9\n AND v.c9 IS ?10 AND v.c10 IS ?11 AND v.c11 IS ?12\n AND v.c12 IS ?13 AND v.c13 IS ?14 LIMIT 1"
+  },
+  "scope": "Direct EXPLAIN of original and normalized SELECT shapes; no runtime trigger trace or timing. FrankenSQLite EXPLAIN is compiled without binding values; stock EXPLAIN receives the example bindings required by its API."
+}

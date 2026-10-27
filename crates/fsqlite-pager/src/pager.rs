@@ -37,6 +37,7 @@ use fsqlite_vfs::{
 };
 use smallvec::SmallVec;
 
+use crate::cancellation::await_pager_admission;
 use crate::journal::{JOURNAL_MAGIC, JournalHeader, JournalPageRecord};
 use crate::page_buf::{PageBuf, PageBufPool};
 use crate::page_cache::{
@@ -5501,7 +5502,10 @@ impl<F: VfsFile + 'static> WalIndexShmSource<F> {
                 return exhausted;
             }
             self.release_reader_attempt(owner).await?;
-            wal_reader_retry_pause(attempt).await;
+            // The attempted slot is restored before this reversible wait.
+            // Keep stock retry pacing, but let the explicit operation's local
+            // relay interrupt even the longer late-attempt backoffs.
+            await_pager_admission(cx, wal_reader_retry_pause(attempt)).await?;
         }
     }
 
@@ -5698,38 +5702,6 @@ struct SharedDbFileKey(usize);
 
 fn shared_db_file_key<F>(file: &SharedDbFile<F>) -> SharedDbFileKey {
     SharedDbFileKey(Arc::as_ptr(file).cast::<()>() as usize)
-}
-
-/// Race a reversible admission wait against the explicit operation's local
-/// cancellation. Dropping a pending native lock future retires its waiter;
-/// mandatory settlement and physical writes must not use this helper.
-#[cfg(feature = "native")]
-async fn await_pager_admission<F: Future>(cx: &Cx, wait: F) -> Result<F::Output> {
-    let mut cancellation = std::pin::pin!(cx.wait_for_local_cancellation());
-    let mut wait = std::pin::pin!(wait);
-    std::future::poll_fn(|task_cx| {
-        if cx.checkpoint().is_err() {
-            return std::task::Poll::Ready(Err(FrankenError::Abort));
-        }
-        if let std::task::Poll::Ready(output) = wait.as_mut().poll(task_cx) {
-            return std::task::Poll::Ready(
-                cx.checkpoint()
-                    .map(|()| output)
-                    .map_err(|_| FrankenError::Abort),
-            );
-        }
-        // Uncontended locks need no local waiter registration. Once the
-        // native future suspends, register the operation's local relay and
-        // recheck: cancellation between its poll and registration cannot be
-        // lost, and cancellation after the recheck wakes this task.
-        let _ = cancellation.as_mut().poll(task_cx);
-        if cx.checkpoint().is_err() {
-            std::task::Poll::Ready(Err(FrankenError::Abort))
-        } else {
-            std::task::Poll::Pending
-        }
-    })
-    .await
 }
 
 async fn async_rwlock_read<'a, T>(
@@ -6608,6 +6580,46 @@ struct PagerMaintenanceState {
     /// remains armed; once every pre-existing transaction/opener drains, one
     /// surviving pager may adopt this receipt and run canonical recovery.
     orphaned_rollback_recovery: Option<OrphanedRollbackRecovery>,
+    /// GH#528: a read-only pager holds a [`WalIndexRebuildDrain`] and waits
+    /// to become the sole owner; new same-process admissions answer `Busy`.
+    wal_index_rebuild_draining: bool,
+}
+
+impl PagerMaintenanceState {
+    /// Whether a lease of `kind` is the only same-process maintenance holder.
+    const fn is_sole_owner(&self, kind: PagerMaintenanceLeaseKind) -> bool {
+        !self.maintenance_active
+            && match kind {
+                PagerMaintenanceLeaseKind::Open => {
+                    self.active_openers == 1 && self.active_transactions == 0
+                }
+                PagerMaintenanceLeaseKind::Transaction => {
+                    self.active_transactions == 1 && self.active_openers == 0
+                }
+                PagerMaintenanceLeaseKind::Exclusive => false,
+            }
+    }
+}
+
+/// Bound on how long a read-only pager drains same-process admissions before
+/// it rebuilds an uninitialized WAL index (GH#528). Counted openers fail fast
+/// once the drain is armed, so they leave within one admission attempt.
+const WAL_INDEX_REBUILD_DRAIN_BUDGET: Duration = Duration::from_secs(2);
+
+/// Clears [`PagerMaintenanceState::wal_index_rebuild_draining`] on every exit,
+/// including cancellation of the waiting rebuild.
+struct WalIndexRebuildDrain {
+    gate: Arc<PagerMaintenanceGate>,
+}
+
+impl Drop for WalIndexRebuildDrain {
+    fn drop(&mut self) {
+        self.gate
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .wal_index_rebuild_draining = false;
+    }
 }
 
 #[derive(Debug, Default)]
@@ -6790,7 +6802,7 @@ impl PagerMaintenanceGate {
         if self.rollback_recovery_pending() {
             return Err(FrankenError::BusyRecovery);
         }
-        if state.maintenance_active {
+        if state.maintenance_active || state.wal_index_rebuild_draining {
             return Err(FrankenError::Busy);
         }
         state.active_openers = state.active_openers.saturating_add(1);
@@ -6800,6 +6812,23 @@ impl PagerMaintenanceGate {
             kind: PagerMaintenanceLeaseKind::Open,
             counted_snapshot: false,
             exclusive_upgrade_prior: None,
+        })
+    }
+
+    /// GH#528: arm the drain for one read-only rebuild of an uninitialized
+    /// WAL index. A drain or exclusive maintenance already in progress may
+    /// publish that index itself, so a second claimant answers at once.
+    fn begin_wal_index_rebuild_drain(self: &Arc<Self>) -> Result<WalIndexRebuildDrain> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| FrankenError::internal("pager maintenance gate poisoned"))?;
+        if state.wal_index_rebuild_draining || state.maintenance_active {
+            return Err(FrankenError::BusyRecovery);
+        }
+        state.wal_index_rebuild_draining = true;
+        Ok(WalIndexRebuildDrain {
+            gate: Arc::clone(self),
         })
     }
 
@@ -6813,7 +6842,7 @@ impl PagerMaintenanceGate {
             .state
             .lock()
             .map_err(|_| FrankenError::internal("pager maintenance gate poisoned"))?;
-        if state.maintenance_active {
+        if state.maintenance_active || state.wal_index_rebuild_draining {
             return Err(FrankenError::Busy);
         }
 
@@ -6895,7 +6924,7 @@ impl PagerMaintenanceGate {
             );
             return Err(FrankenError::BusyRecovery);
         }
-        if state.maintenance_active {
+        if state.maintenance_active || state.wal_index_rebuild_draining {
             return Err(FrankenError::Busy);
         }
         state.active_transactions = state.active_transactions.saturating_add(1);
@@ -6977,13 +7006,8 @@ impl PagerMaintenanceLease {
         }
         let prior = self.kind;
         let sole_owner = match prior {
-            PagerMaintenanceLeaseKind::Open => {
-                state.active_openers == 1 && state.active_transactions == 0
-            }
-            PagerMaintenanceLeaseKind::Transaction => {
-                state.active_transactions == 1 && state.active_openers == 0
-            }
             PagerMaintenanceLeaseKind::Exclusive => return Ok(prior),
+            kind => state.is_sole_owner(kind),
         };
         if !sole_owner {
             // bd-b4mwn round 5: name the silent refusal — recovery-requiring
@@ -7060,6 +7084,37 @@ impl PagerMaintenanceLease {
         self.kind = prior;
         self.exclusive_upgrade_prior = None;
         Ok(())
+    }
+
+    /// GH#528: under the caller's [`WalIndexRebuildDrain`], wait until
+    /// [`Self::upgrade_to_exclusive`] would find this lease the sole owner.
+    /// The drain only lets counts fall, so the wait ends once the counted
+    /// peers fail their own attempts; a peer that outlives the budget leaves
+    /// the rebuild to a later attempt.
+    async fn wait_until_sole_owner(&self, cx: &Cx) -> Result<()> {
+        let deadline = Instant::now() + WAL_INDEX_REBUILD_DRAIN_BUDGET;
+        let mut pause = Duration::from_micros(50);
+        loop {
+            {
+                let state = self
+                    .gate
+                    .state
+                    .lock()
+                    .map_err(|_| FrankenError::internal("pager maintenance gate poisoned"))?;
+                if state.is_sole_owner(self.kind) {
+                    return Ok(());
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(FrankenError::BusyRecovery);
+            }
+            await_pager_admission(
+                cx,
+                asupersync::time::sleep(asupersync::time::wall_now(), pause),
+            )
+            .await?;
+            pause = pause.saturating_mul(2).min(Duration::from_millis(5));
+        }
     }
 }
 
@@ -15026,6 +15081,8 @@ where
                     memory_db_bump_alloc,
                     rolled_back_pages: HashSet::new(),
                     txn_read_cache: RefCell::new(PagePageMap::default()),
+                    txn_read_cache_page_budget: self.transaction_read_cache_page_budget(mode),
+                    txn_read_cache_incomplete: Cell::new(false),
                     retained_memory_overlay_dirty_pages: BTreeSet::new(),
                     scratch_arena: bumpalo::Bump::new(),
                 });
@@ -15264,6 +15321,8 @@ where
                 memory_db_bump_alloc,
                 rolled_back_pages: HashSet::new(),
                 txn_read_cache: RefCell::new(PagePageMap::default()),
+                txn_read_cache_page_budget: self.transaction_read_cache_page_budget(mode),
+                txn_read_cache_incomplete: Cell::new(false),
                 retained_memory_overlay_dirty_pages: BTreeSet::new(),
                 scratch_arena: bumpalo::Bump::new(),
             })
@@ -17966,6 +18025,25 @@ where
         let _ = self.shared_connection_count.set(counter);
     }
 
+    /// Optional snapshot copies follow the connection cache budget, not the
+    /// much larger allocation-pool ceiling (GH #525). Capture the bound at
+    /// BEGIN: a later connection attachment or cache-size increase must not
+    /// make previously unretained snapshot pages appear safe to reread.
+    fn transaction_read_cache_page_budget(&self, mode: TransactionMode) -> usize {
+        if mode == TransactionMode::ReadOnly
+            && self
+                .shared_connection_count
+                .get()
+                .is_some_and(|counter| counter.load(AtomicOrdering::Acquire) == 1)
+        {
+            // Keep the WAL read pin and all normal snapshot validation. A
+            // process-local connection count does not exclude external writers.
+            0
+        } else {
+            self.cache.cache_page_budget().min(self.pool.capacity())
+        }
+    }
+
     /// Number of page reads satisfied directly from the publication plane.
     #[must_use]
     pub fn published_page_hits(&self) -> u64 {
@@ -18594,6 +18672,48 @@ where
         Ok(outcome)
     }
 
+    /// Whether this pager's `-shm` exists; read-only opens never create it.
+    fn wal_index_shm_exists(&self, cx: &Cx) -> Result<bool> {
+        let mut shm_path = self.db_path.as_os_str().to_owned();
+        shm_path.push("-shm");
+        self.vfs.access(cx, Path::new(&shm_path), AccessFlags::EXISTS)
+    }
+
+    /// GH#528: classify the shared index for a pager that may rebuild only an
+    /// uninitialized one. The answer is authoritative only while the caller
+    /// holds every recovery fence, so no peer can publish, truncate, or read
+    /// through the index meanwhile. `false` means a peer published a valid
+    /// header first. An initialized header that fails validation stays
+    /// fail-closed.
+    async fn wal_index_is_uninitialized(
+        &self,
+        cx: &Cx,
+        inner: &PagerInner<V::File>,
+    ) -> Result<bool> {
+        use fsqlite_wal::wal_index::{
+            read_shared_wal_index_header, shared_wal_index_header_is_uninitialized,
+        };
+        let source = WalIndexShmSource {
+            db_file: Arc::clone(&inner.db_file),
+            cleanup_queue: Arc::downgrade(&self.group_commit_queue),
+            can_publish_reader_marks: false,
+        };
+        let region = match source.map_region(cx, 0, false).await {
+            Ok(region) => region,
+            // Shorter than one region, like stock's 3-byte first-attacher
+            // marker: nothing was ever published there.
+            Err(FrankenError::CannotOpen { .. }) => return Ok(true),
+            Err(error) => return Err(error),
+        };
+        if read_shared_wal_index_header(&region)?.is_some() {
+            return Ok(false);
+        }
+        if shared_wal_index_header_is_uninitialized(&region)? {
+            return Ok(true);
+        }
+        Err(FrankenError::BusyRecovery)
+    }
+
     /// Retire the whole reader attempt before a separately classified recovery.
     async fn prepare_runtime_native_reader(
         &self,
@@ -18619,25 +18739,64 @@ where
                 traits::WalNativeReadOutcome::Ready => return Ok(()),
                 traits::WalNativeReadOutcome::RecoveryRequired(reason) => reason,
             };
-            if inner.access_mode == PagerAccessMode::ReadOnly || recovered_once {
-                // A stale-marks index never clears for a pager that may not
-                // rebuild it; answer like SQLITE_READONLY_RECOVERY instead of a
-                // retryable busy that callers spin on forever (GH#430).
-                if inner.access_mode == PagerAccessMode::ReadOnly
-                    && reason == traits::WalNativeRecoveryReason::StaleReaderMarks
-                {
-                    return Err(FrankenError::ReadOnly);
-                }
+            let read_only = inner.access_mode == PagerAccessMode::ReadOnly;
+            // A stale-marks index never clears for a pager that may not
+            // rebuild it; answer like SQLITE_READONLY_RECOVERY instead of a
+            // retryable busy that callers spin on forever (GH#430).
+            if read_only && reason == traits::WalNativeRecoveryReason::StaleReaderMarks {
+                return Err(FrankenError::ReadOnly);
+            }
+            // GH#528: a stock first attacher truncates `-shm` to 3 bytes and
+            // rebuilds it later, so one that dies in between leaves an index
+            // nobody initialized, which a pager that may not rebuild it can
+            // never read. A plain read-only pager therefore rebuilds an
+            // existing index found uninitialized under every recovery fence,
+            // as stock does from any connection that can write `-shm`. It
+            // never creates a missing `-shm` or rewrites an initialized index.
+            let uninitialized_only = read_only
+                && matches!(
+                    reason,
+                    traits::WalNativeRecoveryReason::SharedIndexUnavailable
+                        | traits::WalNativeRecoveryReason::SharedHeaderInvalid
+                );
+            if recovered_once || (read_only && !uninitialized_only) {
                 return Err(FrankenError::BusyRecovery);
             }
+            if uninitialized_only {
+                if !self.wal_index_shm_exists(cx)? {
+                    return Err(FrankenError::BusyRecovery);
+                }
+                // Unlocked, this only turns an initialized index that fails
+                // validation away before peers are drained; the fenced check
+                // below settles the classification.
+                self.wal_index_is_uninitialized(cx, inner).await?;
+            }
             external_lock.restore().await?;
+            // Recovery needs sole same-process ownership, which openers that
+            // each wait for it while counted never reach. A read-only rebuild
+            // drains instead: new admissions answer `Busy`, counted peers fail
+            // their own attempts, and the drain ends after the downgrade.
+            let rebuild_drain = if uninitialized_only {
+                let drain = maintenance_lease.gate.begin_wal_index_rebuild_drain()?;
+                maintenance_lease.wait_until_sole_owner(cx).await?;
+                Some(drain)
+            } else {
+                None
+            };
             let recovery_guard = self.recovery_fence.acquire_for_recovery()?;
             let prior_kind = maintenance_lease.upgrade_to_exclusive(inner.rollback_journal_recovery_owner)?;
             let acquisition = external_lock.acquire_wal_recovery(cx).await;
-            let recovery_result = match acquisition {
-                Ok(()) => with_wal_backend(&self.wal_backend, cx, |wal, cx| {
+            let rebuild = match acquisition {
+                Ok(()) if uninitialized_only => self.wal_index_is_uninitialized(cx, inner).await,
+                Ok(()) => Ok(true),
+                Err(error) => Err(error),
+            };
+            let recovery_result = match rebuild {
+                Ok(true) => with_wal_backend(&self.wal_backend, cx, |wal, cx| {
                     Box::pin(async move { wal.recover_native_read_state(cx, reason).await })
                 }).await,
+                // A peer published a valid index first; rebind to it.
+                Ok(false) => Ok(()),
                 Err(error) => Err(error),
             };
             if let Err(restore_error) = external_lock.restore().await {
@@ -18662,6 +18821,7 @@ where
             }
             drop(cleanup_mask);
             drop(recovery_guard);
+            drop(rebuild_drain);
             external_lock.acquire_snapshot(cx).await?;
             self.validate_namespace_binding_locked(inner)?;
             let journal_path = Self::journal_path(&self.db_path);
@@ -21344,13 +21504,18 @@ where
     /// Pages that were allocated after a savepoint but then rolled back.
     /// These pages should return zeros when read, not BusySnapshot error.
     rolled_back_pages: HashSet<PageNumber>,
-    /// Per-transaction read cache: pages read via inner.lock() are cached
-    /// here so subsequent reads of the same page (e.g., B-tree root during
-    /// repeated INSERTs) skip inner.lock entirely. This eliminates the
-    /// ~80,000 inner.lock acquisitions at 16 threads (reduces to ~80).
-    /// Only used in WAL mode where the published snapshot fast path is
-    /// defeated by constant commit_seq advancement.
+    /// Exact images already observed by this snapshot, consulted before all
+    /// shared latest-image sources (GH #129). Also avoids repeated inner.lock()
+    /// acquisition for hot pages. Optional read admission is bounded separately
+    /// from authoritative retained commits; see the overlay contract below.
     txn_read_cache: RefCell<PagePageMap<PageData>>,
+    /// Optional read-image bound captured at each logical transaction boundary.
+    /// PRAGMA cache_size changes apply to the next snapshot, so resizing cannot
+    /// silently evict an existing snapshot's retained images or reopen its guard.
+    txn_read_cache_page_budget: usize,
+    /// Sticky for this snapshot once an observed image is not retained. Map
+    /// length alone is insufficient after forget_cached_page removes an entry.
+    txn_read_cache_incomplete: Cell<bool>,
     /// Committed page images whose backing-store flush was intentionally
     /// deferred for the private `:memory:` retained-autocommit fast path.
     /// These pages stay authoritative in `txn_read_cache` until a real
@@ -21958,18 +22123,34 @@ where
         Ok(StagedPage::from_buf(buffer))
     }
 
-    /// Admit a snapshot page to the per-transaction read cache without
-    /// letting a large scan bypass the configured page-buffer ceiling.
+    /// Admit a snapshot page without letting a scan retain the entire database.
     ///
-    /// Once the cache reaches the pool capacity, first reads continue through
-    /// the normal pager/WAL snapshot path but are not pinned for the remaining
-    /// transaction lifetime. Existing entries may still be refreshed without
-    /// increasing retained memory.
+    /// Once the captured cache budget is exhausted, reads use the normal
+    /// pager/WAL path without pinning a copy until transaction end. Existing
+    /// entries stay stable. Authoritative retained-commit images are inserted
+    /// separately and must never be discarded to enforce this optional budget.
     fn cache_transaction_read_page(&self, page_no: PageNumber, page: &PageData) {
         let mut txn_read_cache = self.txn_read_cache.borrow_mut();
-        if txn_read_cache.contains_key(&page_no) || txn_read_cache.len() < self.pool.capacity() {
+        if txn_read_cache.contains_key(&page_no)
+            || txn_read_cache.len() < self.txn_read_cache_page_budget
+        {
             txn_read_cache.insert(page_no, page.clone());
+        } else {
+            self.txn_read_cache_incomplete.set(true);
         }
+    }
+
+    /// A successful retained commit begins a new logical snapshot. Failed
+    /// commits, savepoint rollback and cache invalidation must not call this.
+    fn reset_transaction_read_cache_budget(&mut self) {
+        self.txn_read_cache_page_budget = if self.mode == TransactionMode::ReadOnly
+            && self.single_connection_fast_path_enabled()
+        {
+            0
+        } else {
+            self.cache.cache_page_budget().min(self.pool.capacity())
+        };
+        self.txn_read_cache_incomplete.set(false);
     }
 
     /// Fail closed instead of serving a potentially newer image after this
@@ -21979,17 +22160,18 @@ where
         page_no: PageNumber,
         observed_commit_seq: CommitSeq,
     ) -> Result<()> {
-        if self.txn_read_cache.borrow().len() < self.pool.capacity()
+        if (!self.txn_read_cache_incomplete.get()
+            && self.txn_read_cache.borrow().len() < self.txn_read_cache_page_budget)
             || observed_commit_seq == self.published_visible_commit_seq.get()
         {
             return Ok(());
         }
         Err(FrankenError::BusySnapshot {
             conflicting_pages: format!(
-                "page {} is not retained after the transaction read cache reached {} pages; \
+                "page {} is not retained by the transaction read cache (budget {} pages); \
                  snapshot commit_seq {} != observed {}",
                 page_no.get(),
-                self.pool.capacity(),
+                self.txn_read_cache_page_budget,
                 self.published_visible_commit_seq.get().get(),
                 observed_commit_seq.get()
             ),
@@ -26015,6 +26197,7 @@ where
             // transaction instead of caching a stale local Page 1.
             self.discard_committed_pages();
             self.txn_read_cache.borrow_mut().clear();
+            self.reset_transaction_read_cache_budget();
         }
         self.reset_current_write_set_accounting();
         self.retained_memory_overlay_dirty_pages.clear();
@@ -26389,6 +26572,30 @@ where
                 // bd-perf (V1.2): Use get_shared to get PageData directly,
                 // avoiding the 4KB memcpy + separate Arc allocation of get_copy.
                 if let Some(page_data) = self.cache.get_shared(page_no) {
+                    // A peer may attach and commit between the equality check
+                    // above and the cache lookup. Validate after reading too,
+                    // even before the optional snapshot cache is full.
+                    // The immutable committed snapshot advances under inner
+                    // before visible publication. A slow peer can refill the
+                    // shared cache in that interval, so check that watermark
+                    // too. It may lag after a refresh, hence max rather than an
+                    // equality requirement on the immutable snapshot alone.
+                    let observed_commit_seq = self.published.snapshot().visible_commit_seq.max(
+                        self.committed_snapshot
+                            .read()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .commit_seq,
+                    );
+                    if observed_commit_seq != self.published_visible_commit_seq.get() {
+                        return Err(FrankenError::BusySnapshot {
+                            conflicting_pages: format!(
+                                "page {} shared-cache read crossed snapshot commit_seq {} -> {}",
+                                page_no.get(),
+                                self.published_visible_commit_seq.get().get(),
+                                observed_commit_seq.get()
+                            ),
+                        });
+                    }
                     self.cache_transaction_read_page(page_no, &page_data);
                     return Ok(page_data);
                 }
@@ -26450,8 +26657,10 @@ where
         // authoritative committed version, including when the current
         // transaction frees the page and may subsequently roll back.
         self.cache.evict(page_no);
-        if !self.retained_memory_overlay_dirty_pages.contains(&page_no) {
-            self.txn_read_cache.borrow_mut().remove(&page_no);
+        if !self.retained_memory_overlay_dirty_pages.contains(&page_no)
+            && self.txn_read_cache.borrow_mut().remove(&page_no).is_some()
+        {
+            self.txn_read_cache_incomplete.set(true);
         }
     }
 
@@ -28728,6 +28937,7 @@ where
                 self.published_visible_commit_seq
                     .set(publish_update.visible_commit_seq);
                 self.published_db_size.set(publish_update.db_size);
+                self.reset_transaction_read_cache_budget();
                 if self.journal_mode != JournalMode::Wal {
                     let mut inner = self
                         .inner
@@ -33125,6 +33335,307 @@ mod tests {
         });
     }
 
+    async fn gh525_seed_snapshot_pages(
+        pager: &SimplePager<MemoryVfs>,
+        cx: &Cx,
+    ) -> Vec<(PageNumber, u8)> {
+        let mut seed = pager.begin(cx, TransactionMode::Immediate).await.unwrap();
+        let mut pages = Vec::new();
+        for marker in 1_u8..=8 {
+            let page_no = seed.allocate_page(cx).await.unwrap();
+            seed.write_page(cx, page_no, &sample_page(marker))
+                .await
+                .unwrap();
+            pages.push((page_no, marker));
+        }
+        seed.commit(cx).await.unwrap();
+        pages
+    }
+
+    #[test]
+    fn gh_525_transaction_read_cache_follows_cache_budget() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            for budget in [0, 1, 4] {
+                for mode in [TransactionMode::ReadOnly, TransactionMode::Concurrent] {
+                    let (pager, _) = test_pager().await;
+                    let pages = gh525_seed_snapshot_pages(&pager, &cx).await;
+                    assert!(pager.pool.capacity() > pages.len());
+                    pager.set_cache_page_budget(budget).unwrap();
+                    let mut reader = pager.begin(&cx, mode).await.unwrap();
+                    assert_eq!(reader.txn_read_cache_page_budget, budget);
+
+                    // Two complete passes exercise both retained and uncached
+                    // rereads without materializing the scanned working set.
+                    for _ in 0..2 {
+                        for &(page_no, marker) in &pages {
+                            assert_eq!(
+                                reader.get_page(&cx, page_no).await.unwrap().as_ref()[0],
+                                marker
+                            );
+                            assert!(reader.txn_read_cache.borrow().len() <= budget);
+                        }
+                    }
+                    assert_eq!(reader.txn_read_cache.borrow().len(), budget);
+                    assert!(reader.txn_read_cache_incomplete.get());
+
+                    let mut writer = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                    for &(page_no, _) in &[pages[0], pages[7]] {
+                        writer
+                            .write_page(&cx, page_no, &sample_page(0xEE))
+                            .await
+                            .unwrap();
+                    }
+                    writer.commit(&cx).await.unwrap();
+                    if budget != 0 {
+                        assert_eq!(
+                            reader.get_page(&cx, pages[0].0).await.unwrap().as_ref()[0],
+                            pages[0].1,
+                            "retained images must survive a peer commit"
+                        );
+                    }
+                    assert!(matches!(
+                        reader.get_page(&cx, pages[7].0).await,
+                        Err(FrankenError::BusySnapshot { .. })
+                    ));
+                    reader.commit(&cx).await.unwrap();
+
+                    let mut fresh = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+                    assert_eq!(
+                        fresh.get_page(&cx, pages[7].0).await.unwrap().as_ref()[0],
+                        0xEE
+                    );
+                    fresh.commit(&cx).await.unwrap();
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn gh_525_single_reader_bypasses_copies_and_fails_closed_after_peer_attaches() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let (pager, _) = test_pager().await;
+            let connection_count = Arc::new(AtomicUsize::new(1));
+            pager.bind_shared_connection_count(Arc::clone(&connection_count));
+            let pages = gh525_seed_snapshot_pages(&pager, &cx).await;
+            pager.set_cache_page_budget(4).unwrap();
+            let mut reader = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            assert_eq!(reader.txn_read_cache_page_budget, 0);
+            for _ in 0..2 {
+                for &(page_no, marker) in &pages {
+                    assert_eq!(
+                        reader.get_page(&cx, page_no).await.unwrap().as_ref()[0],
+                        marker
+                    );
+                }
+            }
+            assert!(reader.txn_read_cache.borrow().is_empty());
+            assert!(reader.txn_read_cache_incomplete.get());
+
+            connection_count.store(2, AtomicOrdering::Release);
+            pager.set_cache_page_budget(64).unwrap();
+            let mut writer = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            writer
+                .write_page(&cx, pages[0].0, &sample_page(0xEE))
+                .await
+                .unwrap();
+            writer.commit(&cx).await.unwrap();
+            assert_eq!(reader.txn_read_cache_page_budget, 0);
+            assert!(matches!(
+                reader.get_page(&cx, pages[0].0).await,
+                Err(FrankenError::BusySnapshot { .. })
+            ));
+            reader.commit(&cx).await.unwrap();
+
+            // The next transaction can adopt the new shared-reader policy.
+            let mut fresh = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            assert_eq!(fresh.txn_read_cache_page_budget, 64);
+            assert_eq!(
+                fresh.get_page(&cx, pages[0].0).await.unwrap().as_ref()[0],
+                0xEE
+            );
+            fresh.commit(&cx).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn gh_525_forget_resize_and_savepoint_cannot_reopen_snapshot_guard() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            for saturate in [false, true] {
+                let (pager, _) = test_pager().await;
+                let pages = gh525_seed_snapshot_pages(&pager, &cx).await;
+                pager.set_cache_page_budget(2).unwrap();
+                let mut reader = pager.begin(&cx, TransactionMode::Concurrent).await.unwrap();
+                reader.savepoint(&cx, "before_reads").unwrap();
+                reader.get_page(&cx, pages[0].0).await.unwrap();
+                if saturate {
+                    reader.get_page(&cx, pages[1].0).await.unwrap();
+                    reader.get_page(&cx, pages[2].0).await.unwrap();
+                }
+                reader.forget_cached_page(pages[0].0);
+                assert!(reader.txn_read_cache.borrow().len() < 2);
+                assert!(reader.txn_read_cache_incomplete.get());
+                reader.rollback_to_savepoint(&cx, "before_reads").unwrap();
+                assert!(reader.txn_read_cache_incomplete.get());
+
+                pager.set_cache_page_budget(64).unwrap();
+                assert_eq!(reader.txn_read_cache_page_budget, 2);
+                let mut writer = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                writer
+                    .write_page(&cx, pages[0].0, &sample_page(0xEE))
+                    .await
+                    .unwrap();
+                writer.commit(&cx).await.unwrap();
+                assert!(matches!(
+                    reader.get_page(&cx, pages[0].0).await,
+                    Err(FrankenError::BusySnapshot { .. })
+                ));
+                if saturate {
+                    assert_eq!(
+                        reader.get_page(&cx, pages[1].0).await.unwrap().as_ref()[0],
+                        pages[1].1
+                    );
+                }
+                pager.set_cache_page_budget(0).unwrap();
+                assert_eq!(reader.txn_read_cache_page_budget, 2);
+                reader.rollback(&cx).await.unwrap();
+                let mut fresh = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+                assert_eq!(fresh.txn_read_cache_page_budget, 0);
+                assert_eq!(
+                    fresh.get_page(&cx, pages[0].0).await.unwrap().as_ref()[0],
+                    0xEE
+                );
+                fresh.commit(&cx).await.unwrap();
+            }
+        });
+    }
+
+    #[test]
+    #[allow(clippy::await_holding_lock)]
+    fn gh_525_uncached_reader_rejects_shared_cache_refill_before_publication() {
+        asupersync::test_utils::run_test(|| async {
+            let (pager, _) = test_pager().await;
+            let cx = Cx::new();
+            let connections = Arc::new(AtomicUsize::new(1));
+            pager.bind_shared_connection_count(Arc::clone(&connections));
+            pager.set_cache_page_budget(2).unwrap();
+            let page_no = {
+                let mut seed = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                let page_no = seed.allocate_page(&cx).await.unwrap();
+                seed.write_page(&cx, page_no, &sample_page(0x11))
+                    .await
+                    .unwrap();
+                seed.commit(&cx).await.unwrap();
+                page_no
+            };
+            let mut reader = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            assert_eq!(
+                reader.get_page(&cx, page_no).await.unwrap().as_ref()[0],
+                0x11
+            );
+            assert!(reader.txn_read_cache.borrow().is_empty());
+            let bound = reader.published_visible_commit_seq.get();
+            connections.store(2, AtomicOrdering::Release);
+            let mut writer = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            writer
+                .write_page(&cx, page_no, &sample_page(0xEE))
+                .await
+                .unwrap();
+
+            // Pause at the real retained-memory commit boundary: backing bytes
+            // and immutable committed metadata advance before publication.
+            {
+                let mut inner = pager.inner.lock().unwrap();
+                SimpleTransaction::<MemoryVfs>::flush_write_set_to_db_file_batch(
+                    &cx,
+                    &inner,
+                    &writer.write_set,
+                    &writer.write_pages_sorted,
+                )
+                .await
+                .unwrap();
+                inner.record_local_commit();
+                pager.cache.evict(page_no);
+                pager.publish_committed_snapshot_from_inner(&inner);
+            }
+            assert_eq!(pager.published.snapshot().visible_commit_seq, bound);
+
+            // An already-started peer can refill through ordinary pager I/O
+            // under inner in this interval, before visible metadata advances.
+            {
+                let inner = pager.inner.lock().unwrap();
+                let bytes = inner
+                    .read_page_copy(&cx, &pager.cache, &pager.wal_backend, page_no)
+                    .await
+                    .unwrap();
+                assert_eq!(bytes[0], 0xEE);
+            }
+            assert_eq!(pager.cache.get_shared(page_no).unwrap().as_ref()[0], 0xEE);
+            assert_eq!(pager.published.snapshot().visible_commit_seq, bound);
+            assert!(matches!(
+                reader.get_page(&cx, page_no).await,
+                Err(FrankenError::BusySnapshot { .. })
+            ));
+            assert_eq!(reader.published_visible_commit_seq.get(), bound);
+            reader.rollback(&cx).await.unwrap();
+            writer.commit(&cx).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn gh_525_retained_commit_preserves_authoritative_images_above_read_budget() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let pager = private_memory_pager().await;
+            pager.bind_shared_connection_count(Arc::new(AtomicUsize::new(1)));
+            let pages = gh525_seed_snapshot_pages(&pager, &cx).await;
+            pager.set_cache_page_budget(0).unwrap();
+            let mut writer = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            writer.get_page(&cx, pages[0].0).await.unwrap();
+            assert!(writer.txn_read_cache_incomplete.get());
+            writer
+                .write_page(&cx, pages[0].0, &sample_page(0xA1))
+                .await
+                .unwrap();
+            assert!(writer.commit_and_retain(&cx).await.unwrap());
+            assert_eq!(writer.txn_read_cache_page_budget, 0);
+            assert!(!writer.txn_read_cache_incomplete.get());
+            assert!(!writer.txn_read_cache.borrow().is_empty());
+            assert!(writer.retained_memory_overlay_dirty_pages.contains(&pages[0].0));
+            writer.forget_cached_page(pages[0].0);
+            assert_eq!(
+                writer.get_page(&cx, pages[0].0).await.unwrap().as_ref()[0],
+                0xA1,
+                "a zero optional read budget cannot discard committed overlay data"
+            );
+
+            pager.set_cache_page_budget(2).unwrap();
+            writer
+                .write_page(&cx, pages[1].0, &sample_page(0xA2))
+                .await
+                .unwrap();
+            assert!(writer.commit_and_retain(&cx).await.unwrap());
+            assert_eq!(writer.txn_read_cache_page_budget, 2);
+            writer
+                .write_page(&cx, pages[0].0, &sample_page(0xEE))
+                .await
+                .unwrap();
+            writer.rollback(&cx).await.unwrap();
+
+            let mut reader = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            for (page_no, marker) in [(pages[0].0, 0xA1), (pages[1].0, 0xA2)] {
+                assert_eq!(
+                    reader.get_page(&cx, page_no).await.unwrap().as_ref()[0],
+                    marker,
+                    "rollback must preserve both retained commits"
+                );
+            }
+            reader.commit(&cx).await.unwrap();
+        });
+    }
+
     #[test]
     fn gh_131_read_copy_capacity_fallback_preserves_dirty_cache_page() {
         asupersync::test_utils::run_test(|| async {
@@ -36833,6 +37344,79 @@ mod tests {
             retained.recovery_state,
             RollbackJournalRecoveryState::ReplayPending
         ));
+    }
+
+    /// GH#528: same-process openers that each need sole ownership to rebuild
+    /// an uninitialized WAL index never get it while all stay counted. The
+    /// read-only rebuilder's drain admits no new lease, refuses a second
+    /// claimant, and waits exactly until the counted peers leave; a cancelled
+    /// rebuild readmits peers.
+    #[test]
+    fn gh528_wal_index_rebuild_drain_waits_out_counted_peers() {
+        use fsqlite_types::cx::CancelReason;
+
+        asupersync::test_utils::run_test(|| async {
+            let gate = Arc::new(PagerMaintenanceGate::default());
+            let mut rebuilder = gate.enter_open().unwrap();
+            let peer_open = gate.enter_open().unwrap();
+            let peer_txn = gate.enter_transaction().unwrap();
+            assert!(matches!(
+                rebuilder.upgrade_to_exclusive(None),
+                Err(FrankenError::BusyRecovery)
+            ));
+
+            let drain = gate.begin_wal_index_rebuild_drain().unwrap();
+            assert!(matches!(gate.enter_open(), Err(FrankenError::Busy)));
+            assert!(matches!(gate.enter_transaction(), Err(FrankenError::Busy)));
+            assert!(matches!(
+                gate.enter_readwrite_open_for_orphan_recovery(),
+                Err(FrankenError::Busy)
+            ));
+            assert!(matches!(
+                gate.begin_wal_index_rebuild_drain(),
+                Err(FrankenError::BusyRecovery)
+            ));
+
+            let left = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let leaving = Arc::clone(&left);
+            let peers = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(20));
+                leaving.store(true, AtomicOrdering::Release);
+                drop(peer_open);
+                drop(peer_txn);
+            });
+            rebuilder.wait_until_sole_owner(&Cx::new()).await.unwrap();
+            assert!(
+                left.load(AtomicOrdering::Acquire),
+                "the wait must outlast every counted peer"
+            );
+            peers.join().unwrap();
+            let prior = rebuilder.upgrade_to_exclusive(None).unwrap();
+            assert!(matches!(prior, PagerMaintenanceLeaseKind::Open));
+            rebuilder.downgrade_from_exclusive(prior).unwrap();
+            drop(drain);
+            drop(gate.enter_open().unwrap());
+
+            let peer = gate.enter_open().unwrap();
+            let root = Cx::new();
+            let (operation, relay) = root.create_child_with_local_cancel_relay();
+            assert!(relay.cancel_local(CancelReason::UserInterrupt));
+            let cancelled = async {
+                let _drain = gate.begin_wal_index_rebuild_drain()?;
+                rebuilder.wait_until_sole_owner(&operation).await
+            }
+            .await;
+            assert!(matches!(cancelled, Err(FrankenError::Abort)));
+            assert!(
+                !gate
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .wal_index_rebuild_draining
+            );
+            drop(gate.enter_open().unwrap());
+            drop(peer);
+        });
     }
 
     /// bd-6xjma (persistent ownership survives Drop): a recovery-open

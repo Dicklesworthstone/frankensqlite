@@ -1927,6 +1927,20 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
         self.create_child_with_runtime_affinity(true)
     }
 
+    /// Like [`Self::create_child`], but also snapshots the parent's current
+    /// cancellation-mask depth for bounded work within the caller's masked
+    /// operation. The child retains the parent's native context and OS-thread
+    /// I/O affinity.
+    ///
+    /// The snapshot lasts for the child's entire lifetime: unmasking the parent
+    /// does not unmask this child. Use only where the child must finish for the
+    /// caller's masked operation to complete, and do not retain it for unrelated
+    /// later operations. An unmasked parent produces an ordinary unmasked child.
+    #[must_use]
+    pub fn create_child_preserving_mask(&self) -> Self {
+        self.create_child_with_mask_snapshot(true)
+    }
+
     /// Create a child context that may be moved into a newly spawned task.
     ///
     /// Cancellation lineage, budget, tracing metadata, e-process policy, and
@@ -1954,7 +1968,11 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
     /// under a post-VACUUM masked read.
     #[must_use]
     pub fn create_child_for_spawn_preserving_mask(&self) -> Self {
-        let child = self.create_child_for_spawn();
+        self.create_child_with_mask_snapshot(false)
+    }
+
+    fn create_child_with_mask_snapshot(&self, inherit_runtime_affinity: bool) -> Self {
+        let child = self.create_child_with_runtime_affinity(inherit_runtime_affinity);
         let depth = self.inner.mask_depth.load(Ordering::Acquire);
         if depth > 0 {
             child.inner.mask_depth.store(depth, Ordering::Release);
@@ -2080,6 +2098,17 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
         child
     }
 
+    /// Return weak authority to request local cancellation of this context and
+    /// its descendants, without creating another child or changing its masks.
+    ///
+    /// The relay cannot access the context's effects or cancel its inherited
+    /// native context, and does not keep this context alive.
+    pub fn local_cancel_relay(&self) -> LocalCancelRelay {
+        LocalCancelRelay {
+            inner: Arc::downgrade(&self.inner),
+        }
+    }
+
     /// Create a child context plus narrowly scoped local cancellation authority.
     ///
     /// The child inherits the same budget, tracing metadata, effect
@@ -2089,9 +2118,7 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
     /// context.
     pub fn create_child_with_local_cancel_relay(&self) -> (Self, LocalCancelRelay) {
         let child = self.create_child();
-        let relay = LocalCancelRelay {
-            inner: Arc::downgrade(&child.inner),
-        };
+        let relay = child.local_cancel_relay();
         (child, relay)
     }
 
@@ -2896,6 +2923,65 @@ mod tests {
     }
 
     #[test]
+    fn child_preserving_mask_defers_local_cancellation_and_retains_thread_affinity() {
+        let root = Cx::<FullCaps>::new();
+        let (parent, relay) = root.create_child_with_local_cancel_relay();
+        parent.mark_blocking_io_inline_safe();
+        #[cfg(feature = "native")]
+        let native = NativeCx::for_testing();
+        #[cfg(feature = "native")]
+        parent.set_native_cx(native.clone());
+
+        let outer_mask = parent.masked();
+        let inner_mask = parent.masked();
+        let child = parent.create_child_preserving_mask();
+        let ordinary = parent.create_child();
+        let spawned = parent.create_child_for_spawn_preserving_mask();
+        assert_eq!(child.mask_depth(), 2);
+        assert_eq!(spawned.mask_depth(), 2);
+        assert!(child.blocking_io_inline_safe());
+        assert!(ordinary.blocking_io_inline_safe());
+        assert!(!spawned.blocking_io_inline_safe());
+        #[cfg(feature = "native")]
+        {
+            assert!(child.attached_native_cx().is_some());
+            assert!(spawned.attached_native_cx().is_none());
+        }
+
+        assert!(relay.cancel_local(CancelReason::UserInterrupt));
+        assert_eq!(child.cancel_reason(), Some(CancelReason::UserInterrupt));
+        assert!(parent.checkpoint().is_ok());
+        assert!(child.checkpoint().is_ok());
+        assert!(spawned.checkpoint().is_ok());
+        assert_eq!(
+            ordinary.checkpoint().unwrap_err().kind(),
+            ErrorKind::Cancelled
+        );
+
+        drop(inner_mask);
+        assert_eq!(parent.mask_depth(), 1);
+        assert!(parent.checkpoint().is_ok());
+        drop(outer_mask);
+        assert_eq!(
+            parent.checkpoint().unwrap_err().kind(),
+            ErrorKind::Cancelled
+        );
+        assert_eq!(child.mask_depth(), 2);
+        assert!(child.checkpoint().is_ok());
+        assert!(spawned.checkpoint().is_ok());
+
+        let unmasked_child = parent.create_child_preserving_mask();
+        assert_eq!(unmasked_child.mask_depth(), 0);
+        assert_eq!(
+            unmasked_child.checkpoint().unwrap_err().kind(),
+            ErrorKind::Cancelled
+        );
+        assert!(root.checkpoint().is_ok());
+        #[cfg(feature = "native")]
+        assert!(!native.is_cancel_requested());
+    }
+
+    #[test]
     fn test_create_child_inherits_preexisting_parent_cancellation() {
         let parent = Cx::<FullCaps>::new();
         parent.cancel_with_reason(CancelReason::RegionClose);
@@ -2906,6 +2992,44 @@ mod tests {
 
         let err = child.checkpoint().unwrap_err();
         assert_eq!(err.kind(), ErrorKind::Cancelled);
+    }
+
+    #[test]
+    fn local_cancel_relay_targets_existing_context_without_retaining_it() {
+        let root = Cx::<FullCaps>::new();
+        #[cfg(feature = "native")]
+        let native = NativeCx::for_testing();
+        #[cfg(feature = "native")]
+        root.set_native_cx(native.clone());
+        let sibling = root.create_child();
+        let operation = root.create_child();
+        let descendant = operation.create_child();
+        let relay = operation.local_cancel_relay();
+
+        assert!(relay.cancel_local(CancelReason::UserInterrupt));
+        assert_eq!(operation.cancel_reason(), Some(CancelReason::UserInterrupt));
+        assert_eq!(
+            descendant.cancel_reason(),
+            Some(CancelReason::UserInterrupt)
+        );
+        assert!(operation.checkpoint().is_err());
+        assert!(descendant.checkpoint().is_err());
+        assert!(root.checkpoint().is_ok());
+        assert!(sibling.checkpoint().is_ok());
+        #[cfg(feature = "native")]
+        assert!(!native.is_cancel_requested());
+
+        drop(operation);
+        assert!(
+            !relay.cancel_local(CancelReason::Abort),
+            "a relay and a surviving descendant must not retain their target"
+        );
+        assert_eq!(
+            descendant.cancel_reason(),
+            Some(CancelReason::UserInterrupt)
+        );
+        assert!(root.checkpoint().is_ok());
+        assert!(sibling.checkpoint().is_ok());
     }
 
     #[test]

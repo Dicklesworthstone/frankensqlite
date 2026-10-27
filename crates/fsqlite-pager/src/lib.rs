@@ -16,6 +16,7 @@
 pub use fsqlite_vfs::cache_hint::prefetch_l1_read;
 
 pub mod arc_cache;
+mod cancellation;
 #[cfg(feature = "encryption")]
 pub mod encrypt;
 #[cfg(feature = "evalue-eviction")]

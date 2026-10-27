@@ -270,6 +270,8 @@ struct WorkerState {
     unobserved_errors: Mutex<Vec<String>>,
     #[cfg(test)]
     forced_open_error: Mutex<Option<FrankenError>>,
+    #[cfg(test)]
+    open_started: AtomicBool,
 }
 
 impl WorkerState {
@@ -296,6 +298,8 @@ impl WorkerState {
             unobserved_errors: Mutex::new(Vec::new()),
             #[cfg(test)]
             forced_open_error: Mutex::new(None),
+            #[cfg(test)]
+            open_started: AtomicBool::new(false),
         }
     }
 
@@ -485,6 +489,10 @@ enum Command {
     },
     #[cfg(test)]
     PanicForTest,
+    #[cfg(test)]
+    InspectRootCancellationForTest {
+        tx: mpsc::SyncSender<(u32, bool)>,
+    },
 }
 
 #[derive(Default)]
@@ -1373,6 +1381,11 @@ fn worker_loop(conn: &Connection, rx: &mut CommandReceiver, state: &WorkerState)
             Command::PanicForTest => {
                 test_panic("async worker command panic sentinel");
             }
+            #[cfg(test)]
+            Command::InspectRootCancellationForTest { tx } => {
+                let root = conn.root_cx();
+                let _ = tx.send((root.mask_depth(), root.is_cancel_requested()));
+            }
         }
     }
 }
@@ -1653,6 +1666,7 @@ enum WorkerLifecycle {
 struct PendingOpen {
     tx: Option<CommandSender>,
     worker: Option<WorkerHandle>,
+    cancellation: Option<Arc<OpenCancellation>>,
 }
 
 impl PendingOpen {
@@ -1660,6 +1674,19 @@ impl PendingOpen {
         Self {
             tx: Some(tx),
             worker: Some(worker),
+            cancellation: None,
+        }
+    }
+
+    fn with_cancellation(mut self, cancellation: Arc<OpenCancellation>) -> Self {
+        self.cancellation = Some(cancellation);
+        self
+    }
+
+    fn cancel_bootstrap(&self, reason: CancelReason) {
+        if let Some(cancellation) = &self.cancellation {
+            cancellation.requested.store(true, Ordering::Release);
+            let _ = cancellation.relay.cancel_local(reason);
         }
     }
 
@@ -1689,9 +1716,56 @@ impl Drop for PendingOpen {
         // Dropping a JoinHandle detaches without stopping the worker. Sender
         // disconnection is the shutdown fence; the worker still owns and
         // closes any successfully opened Connection exactly once.
+        // LocalCancelRelay dispatches arbitrary wakers synchronously, so it
+        // belongs only to the explicit cancellation path, never this Drop.
         drop(self.tx.take());
         drop(self.worker.take());
     }
+}
+
+/// Only local cancellation authority crosses back to the opening caller.
+/// The worker's native I/O context and eventual connection root stay private.
+struct OpenCancellation {
+    relay: LocalCancelRelay,
+    requested: AtomicBool,
+}
+
+/// [`Cx`] children register weakly with their parent. Keep the original
+/// environment and the immediate bootstrap parent alive until opening
+/// returns: they may be the only strong owners of the cancellation lineage.
+struct OpenBootstrapLineage {
+    _environment: ConnectionEnv,
+    _bootstrap_parent: Cx,
+}
+
+struct OpenBootstrapScope {
+    _lineage: OpenBootstrapLineage,
+    cancellation: Arc<OpenCancellation>,
+}
+
+fn prepare_worker_bootstrap(env: &ConnectionEnv) -> (Cx, OpenBootstrapLineage) {
+    // Keep cancellation, capabilities, budgets and the bounded opening mask,
+    // while letting the worker establish its own native I/O affinity.
+    let bootstrap_parent = env.bootstrap_cx();
+    let bootstrap = bootstrap_parent.create_child_for_spawn_preserving_mask();
+    #[cfg(test)]
+    {
+        assert!(
+            bootstrap.attached_native_cx().is_none(),
+            "opening must not carry a caller's native context into the worker"
+        );
+        assert!(
+            !bootstrap.blocking_io_inline_safe(),
+            "the worker must establish its own inline-I/O authority after spawning"
+        );
+    }
+    (
+        bootstrap,
+        OpenBootstrapLineage {
+            _environment: env.clone(),
+            _bootstrap_parent: bootstrap_parent,
+        },
+    )
 }
 
 /// How the dedicated worker thread opens its raw [`Connection`].
@@ -1706,6 +1780,11 @@ enum WorkerOpenRequest {
     WithEnv {
         path: String,
         env: ConnectionEnv,
+    },
+    CancellableWithEnv {
+        path: String,
+        env: ConnectionEnv,
+        scope: Box<OpenBootstrapScope>,
     },
     WithPageSize {
         path: String,
@@ -1745,11 +1824,39 @@ enum WorkerOpenRequest {
 }
 
 impl WorkerOpenRequest {
+    fn prepare_for_spawn(mut self) -> (Self, Option<Box<OpenBootstrapLineage>>) {
+        let env = match &mut self {
+            Self::WithEnv { env, .. }
+            | Self::SchemaOnlyWithEnv { env, .. }
+            | Self::ExistingSchemaOnlyWithEnv { env, .. }
+            | Self::ReservedWithExpectedIdentityAndEnv { env, .. }
+            | Self::ExistingWithExpectedIdentityAndEnv { env, .. } => env,
+            // CancellableWithEnv already owns a prepared scope. The other
+            // constructors create their default environment on the worker.
+            _ => return (self, None),
+        };
+        let (bootstrap, lineage) = prepare_worker_bootstrap(env);
+        *env = env.clone().with_bootstrap_cx(bootstrap);
+        (self, Some(Box::new(lineage)))
+    }
+
+    fn bootstrap_cancellation(&self) -> Option<Arc<OpenCancellation>> {
+        match self {
+            Self::CancellableWithEnv { scope, .. } => Some(Arc::clone(&scope.cancellation)),
+            _ => None,
+        }
+    }
+
     async fn open(self) -> Result<Connection, FrankenError> {
         match self {
             Self::WithEnv { path, env } => {
                 Connection::open_with_env(path, dedicated_worker_env(env)).await
             }
+            Self::CancellableWithEnv {
+                path,
+                env,
+                scope: _scope,
+            } => Connection::open_with_env(path, dedicated_worker_env(env)).await,
             Self::WithPageSize {
                 path,
                 page_size_bytes,
@@ -1836,7 +1943,9 @@ fn spawn_worker_thread(
     open_tx: Responder<OpenHandshake>,
     state: Arc<WorkerState>,
 ) -> Result<WorkerHandle, FrankenError> {
+    let (request, bootstrap_lineage) = request.prepare_for_spawn();
     let handle_state = Arc::clone(&state);
+    let bootstrap_cancellation = request.bootstrap_cancellation();
     thread::Builder::new()
         .name("fsqlite-worker".to_owned())
         .stack_size(WORKER_STACK_BYTES)
@@ -1844,12 +1953,17 @@ fn spawn_worker_thread(
             let outcome_state = Arc::clone(&state);
             let outcome = catch_unwind(AssertUnwindSafe(|| {
                 #[cfg(test)]
+                state.open_started.store(true, Ordering::Release);
+                #[cfg(test)]
                 let open_result = match state.take_forced_open_error() {
                     Some(error) => Err(error),
                     None => future::block_on(request.open()),
                 };
                 #[cfg(not(test))]
                 let open_result = future::block_on(request.open());
+                // The returned connection has an independent lifetime root;
+                // release the caller's opening authority before commands run.
+                drop(bootstrap_lineage);
 
                 match open_result {
                     Ok(conn) => {
@@ -1872,6 +1986,17 @@ fn spawn_worker_thread(
                         state.publish_phase(WorkerPhase::Terminal);
                         let diagnostic =
                             Arc::new(OpenErrorDiagnostic::new(&error, Arc::clone(&state)));
+                        // The caller already observed its Interrupt. A
+                        // cooperatively aborted bootstrap is the expected
+                        // worker completion, not an unobserved terminal fault.
+                        // Keep unrelated open failures visible.
+                        if matches!(&error, FrankenError::Abort)
+                            && bootstrap_cancellation
+                                .as_ref()
+                                .is_some_and(|cancel| cancel.requested.load(Ordering::Acquire))
+                        {
+                            diagnostic.acknowledge();
+                        }
                         #[cfg(test)]
                         state.pause_before_open_response();
                         open_tx.respond(Ok(OpenHandshake::Failed {
@@ -1902,6 +2027,45 @@ fn spawn_worker_thread(
             state: handle_state,
         })
         .map_err(worker_thread_spawn_err)
+}
+
+fn spawn_cancellable_pending_open(
+    path: String,
+    env: ConnectionEnv,
+    state: Arc<WorkerState>,
+) -> Result<
+    (
+        PendingOpen,
+        oneshot::Receiver<Result<OpenHandshake, FrankenError>>,
+    ),
+    FrankenError,
+> {
+    // Derive engine authority from the environment, not the caller's
+    // task-affine preflight context.
+    let (bootstrap, lineage) = prepare_worker_bootstrap(&env);
+    let relay = bootstrap.local_cancel_relay();
+    let cancellation = Arc::new(OpenCancellation {
+        relay,
+        requested: AtomicBool::new(false),
+    });
+    let scope = Box::new(OpenBootstrapScope {
+        _lineage: lineage,
+        cancellation: Arc::clone(&cancellation),
+    });
+    let (open_tx, open_rx) = async_response_channel();
+    let (cmd_tx, cmd_rx) = command_channel(COMMAND_MAILBOX_CAPACITY);
+    let worker = spawn_worker_thread(
+        WorkerOpenRequest::CancellableWithEnv {
+            path,
+            env: env.with_bootstrap_cx(bootstrap),
+            scope,
+        },
+        cmd_rx,
+        open_tx,
+        state,
+    )?;
+    let pending = PendingOpen::new(cmd_tx, worker).with_cancellation(cancellation);
+    Ok((pending, open_rx))
 }
 
 fn wait_for_worker_open(
@@ -2020,8 +2184,9 @@ impl std::fmt::Debug for AsyncConnection {
 impl AsyncConnection {
     /// Open a database connection asynchronously with `Cx` integration.
     ///
-    /// The `Cx` is checkpointed before the blocking open. On success, a
-    /// dedicated large-stack worker thread is spawned to own the `Connection`.
+    /// The dedicated large-stack worker owns the connection from bootstrap
+    /// onward. Cancellation is relayed to its opening operation without
+    /// cancelling the successful connection's lifetime context.
     pub async fn open<Caps>(cx: &Cx<Caps>, path: impl Into<String>) -> Result<Self, FrankenError>
     where
         Caps: fsqlite_types::cx::cap::SubsetOf<fsqlite_types::cx::cap::All>,
@@ -2244,6 +2409,12 @@ impl AsyncConnection {
                 Err(error)
             }
             Err(FrankenError::Interrupt) => {
+                pending.cancel_bootstrap(
+                    preflight
+                        .control_cx
+                        .cancel_reason()
+                        .unwrap_or(CancelReason::UserInterrupt),
+                );
                 drop(pending);
                 Err(FrankenError::Interrupt)
             }
@@ -2273,22 +2444,14 @@ impl AsyncConnection {
         // connection is !Send, so it must be born on and stay on that thread.
         // Open admission and its response use native async channels and do not
         // require a blocking pool.
-        let (open_tx, open_rx) = async_response_channel();
-        let (cmd_tx, cmd_rx) = command_channel(COMMAND_MAILBOX_CAPACITY);
         let state = Arc::new(WorkerState::new());
         preflight.check_cancellation()?;
-        let worker = spawn_worker_thread(
-            WorkerOpenRequest::WithEnv { path, env },
-            cmd_rx,
-            open_tx,
-            Arc::clone(&state),
-        )?;
-        let pending = PendingOpen::new(cmd_tx, worker);
+        let (pending, open_rx) = spawn_cancellable_pending_open(path, env, Arc::clone(&state))?;
 
         // PendingOpen is the cancellation and arbitrary-Future-drop fence.
-        // It disconnects the command channel before detaching the join handle,
-        // leaving the worker itself responsible for exactly-once Connection
-        // cleanup without delaying cancellation on an OS-thread join.
+        // Explicit cancellation first signals the worker's bootstrap context.
+        // Disconnection then leaves exactly-once cleanup with the worker;
+        // arbitrary Future Drop also stays nonblocking and never joins it.
         Self::finish_pending_open(preflight, pending, open_rx, state).await
     }
 
@@ -3118,6 +3281,426 @@ mod tests {
             "same-connection stream reentrancy must fail with SQLITE_MISUSE"
         );
         assert_eq!(error.error_code(), fsqlite_error::ErrorCode::Misuse);
+    }
+
+    #[cfg(unix)]
+    const GH524_OPEN_PEER_ENV: &str = "FSQLITE_GH524_OPEN_PEER_DB";
+    #[cfg(unix)]
+    const GH524_OPEN_PEER_READY: &str = "GH524_OPEN_PEER_EXCLUSIVE";
+
+    #[cfg(unix)]
+    #[test]
+    fn gh524_open_peer_holds_exclusive_lock() {
+        use std::io::{Read as _, Write as _};
+
+        let Some(path) = std::env::var_os(GH524_OPEN_PEER_ENV) else {
+            return;
+        };
+        let conn = rusqlite::Connection::open(path).expect("peer opens seeded database");
+        conn.execute_batch("BEGIN EXCLUSIVE; INSERT INTO t VALUES (100);")
+            .expect("peer takes the rollback-journal exclusive lock");
+        println!("{GH524_OPEN_PEER_READY}");
+        std::io::stdout().flush().expect("publish peer readiness");
+        let mut input = Vec::new();
+        std::io::stdin()
+            .read_to_end(&mut input)
+            .expect("peer release channel");
+        conn.execute_batch("ROLLBACK;").expect("peer rollback");
+    }
+
+    #[cfg(unix)]
+    struct OpenLockPeer {
+        child: std::process::Child,
+        input: Option<std::process::ChildStdin>,
+        output: Option<std::thread::JoinHandle<()>>,
+    }
+
+    #[cfg(unix)]
+    impl OpenLockPeer {
+        fn start(path: &str) -> Self {
+            use std::io::BufRead as _;
+            use std::process::{Command, Stdio};
+
+            let child = Command::new(std::env::current_exe().expect("test executable"))
+                .args([
+                    "async_api::tests::gh524_open_peer_holds_exclusive_lock",
+                    "--exact",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(GH524_OPEN_PEER_ENV, path)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .expect("spawn separate-process lock holder");
+            let mut peer = Self {
+                child,
+                input: None,
+                output: None,
+            };
+            peer.input = peer.child.stdin.take();
+            let stdout = peer.child.stdout.take().expect("peer stdout");
+            let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+            peer.output = Some(thread::spawn(move || {
+                let mut output = std::io::BufReader::new(stdout);
+                let mut line = String::new();
+                while output.read_line(&mut line).is_ok_and(|size| size > 0) {
+                    if line.contains(GH524_OPEN_PEER_READY) {
+                        let _ = ready_tx.send(());
+                        let _ = std::io::copy(&mut output, &mut std::io::sink());
+                        return;
+                    }
+                    line.clear();
+                }
+            }));
+            ready_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("peer must confirm lock ownership before opening the waiter");
+            peer
+        }
+
+        fn release(mut self) {
+            drop(self.input.take());
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(status) = self.child.try_wait().expect("peer status") {
+                    assert!(status.success(), "lock holder failed: {status}");
+                    return;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "lock holder did not exit"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for OpenLockPeer {
+        fn drop(&mut self) {
+            drop(self.input.take());
+            if !matches!(self.child.try_wait(), Ok(Some(_))) {
+                let _ = self.child.kill();
+            }
+            let _ = self.child.wait();
+            if let Some(output) = self.output.take() {
+                let _ = output.join();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn gh524_open_database(dir: &tempfile::TempDir) -> String {
+        let path = dir.path().join("open-cancellation.db");
+        let conn = rusqlite::Connection::open(&path).expect("seed open");
+        conn.execute_batch(
+            "PRAGMA journal_mode=DELETE; CREATE TABLE t(x); INSERT INTO t VALUES (1);",
+        )
+        .expect("seed rollback-journal database");
+        path.to_str().expect("UTF-8 test path").to_owned()
+    }
+
+    #[cfg(unix)]
+    fn wait_for_gh524_open_contention(state: &WorkerState) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !state.open_started.load(Ordering::Acquire) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker did not start opening"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        thread::sleep(Duration::from_millis(300));
+        assert!(
+            !state.open_response_committed.load(Ordering::Acquire),
+            "the exclusive peer must keep bootstrap pending until cancellation"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh524_async_open_cancels_worker_waiting_for_another_process() {
+        let dir = tempfile::tempdir().expect("test directory");
+        let path = gh524_open_database(&dir);
+        let mut peer = OpenLockPeer::start(&path);
+        let runtime = test_runtime();
+        let caller = Cx::new();
+        let state = Arc::new(WorkerState::new());
+        let (preflight, mut pending, open_rx) = runtime.block_on(async {
+            let preflight = preflight_async_call(&caller).expect("open preflight");
+            let (pending, open_rx) = spawn_cancellable_pending_open(
+                path.clone(),
+                ConnectionEnv::default(),
+                Arc::clone(&state),
+            )
+            .expect("start pending open");
+            (preflight, pending, open_rx)
+        });
+        wait_for_gh524_open_contention(&state);
+        // Retain join ownership only in this test. The Interrupt branch must
+        // return without joining, and a detached outcome's diagnostic must
+        // still be dropped before we inspect the unobserved-error sink.
+        let worker = pending.worker.take().expect("pending worker handle");
+        let cancelled_at = std::time::Instant::now();
+        caller.cancel();
+        let result = runtime.block_on(AsyncConnection::finish_pending_open(
+            preflight,
+            pending,
+            open_rx,
+            Arc::clone(&state),
+        ));
+        assert!(matches!(result, Err(FrankenError::Interrupt)));
+        while !worker.thread.is_finished() {
+            assert!(
+                cancelled_at.elapsed() < Duration::from_secs(1),
+                "caller returned but the worker kept waiting for the peer's lock"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        drop(worker.join());
+        assert!(
+            cancelled_at.elapsed() < Duration::from_secs(1),
+            "cancellation and worker cleanup exceeded the prompt completion bound"
+        );
+        assert!(peer.child.try_wait().expect("peer status").is_none());
+        assert!(unobserved_worker_errors(&state).is_empty());
+        peer.release();
+
+        let mut recovered = AsyncConnection::open_sync(path).expect("open after cancellation");
+        assert_eq!(
+            recovered
+                .query_sync("SELECT COUNT(*) FROM t;")
+                .expect("read after cancellation")[0]
+                .values()[0],
+            SqliteValue::Integer(1),
+        );
+        recovered
+            .execute_sync("INSERT INTO t VALUES (2);")
+            .expect("write after cancellation");
+        recovered.close_sync().expect("close recovered connection");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh524_async_open_preserves_environment_cancellation_lineage() {
+        let dir = tempfile::tempdir().expect("test directory");
+        let path = gh524_open_database(&dir);
+        let peer = OpenLockPeer::start(&path);
+        let runtime = test_runtime();
+        let caller = Cx::new();
+        let env = ConnectionEnv::default();
+        let (bootstrap, relay) = env
+            .runtime()
+            .root_cx()
+            .create_child_with_local_cancel_relay();
+        // Only the environment owns this cancellation node. The relay is weak.
+        let env = env.with_bootstrap_cx(bootstrap);
+        let state = Arc::new(WorkerState::new());
+        let (preflight, pending, open_rx) = runtime.block_on(async {
+            let preflight = preflight_async_call(&caller).expect("open preflight");
+            let (pending, open_rx) =
+                spawn_cancellable_pending_open(path, env, Arc::clone(&state)).expect("start open");
+            (preflight, pending, open_rx)
+        });
+        wait_for_gh524_open_contention(&state);
+        let cancelled_at = std::time::Instant::now();
+        assert!(relay.cancel_local(CancelReason::UserInterrupt));
+        let result = runtime.block_on(AsyncConnection::finish_pending_open(
+            preflight,
+            pending,
+            open_rx,
+            Arc::clone(&state),
+        ));
+        assert!(matches!(result, Err(FrankenError::Abort)));
+        assert!(cancelled_at.elapsed() < Duration::from_secs(1));
+        assert!(
+            caller.checkpoint().is_ok(),
+            "environment cancellation reached caller"
+        );
+        // Unlike caller-side Interrupt, this path observes the authoritative
+        // failed-open response. finish_pending_open acknowledges its shared
+        // diagnostic synchronously before returning Abort, so later outcome
+        // destruction cannot turn that observed error into an unobserved one.
+        assert!(unobserved_worker_errors(&state).is_empty());
+        peer.release();
+    }
+
+    #[test]
+    fn gh524_async_open_success_outlives_opening_cancellation_scope() {
+        let runtime = test_runtime();
+        let caller = Cx::new();
+        let env = ConnectionEnv::default();
+        let lifetime = Arc::clone(env.runtime());
+        let (bootstrap, relay) = env
+            .runtime()
+            .root_cx()
+            .create_child_with_local_cancel_relay();
+        let bootstrap_alias = bootstrap.clone();
+        let mut conn = runtime
+            .block_on(AsyncConnection::open_with_env(
+                &caller,
+                ":memory:",
+                env.with_bootstrap_cx(bootstrap),
+            ))
+            .expect("open succeeds");
+        caller.cancel();
+        assert!(relay.cancel_local(CancelReason::UserInterrupt));
+        assert!(bootstrap_alias.checkpoint().is_err());
+        assert!(lifetime.root_cx().checkpoint().is_ok());
+        conn.execute_sync("CREATE TABLE t(x);")
+            .expect("late open cancellation permits DDL");
+        conn.execute_sync("INSERT INTO t VALUES (1);")
+            .expect("late open cancellation permits writes");
+        conn.execute_sync("ATTACH DATABASE ':memory:' AS aux;")
+            .expect("later opens do not reuse the cancelled bootstrap scope");
+        conn.execute_sync("CREATE TABLE aux.u(x);")
+            .expect("attached connection is usable");
+        assert_eq!(
+            conn.query_sync("SELECT x FROM t;")
+                .expect("late open cancellation permits reads")[0]
+                .values()[0],
+            SqliteValue::Integer(1),
+        );
+        conn.close_sync()
+            .expect("late open cancellation permits cleanup");
+    }
+
+    #[test]
+    fn gh524_async_open_preserves_bootstrap_mask_without_masking_connection() {
+        let runtime = test_runtime();
+        let caller = Cx::new();
+        let env = ConnectionEnv::default();
+        let bootstrap = env.bootstrap_cx();
+        bootstrap.set_native_cx(NativeCx::for_testing());
+        bootstrap.mark_blocking_io_inline_safe();
+        assert!(bootstrap.attached_native_cx().is_some());
+        assert!(bootstrap.blocking_io_inline_safe());
+        let mask = bootstrap.masked();
+        assert!(
+            bootstrap
+                .local_cancel_relay()
+                .cancel_local(CancelReason::UserInterrupt)
+        );
+        assert!(
+            bootstrap.checkpoint().is_ok(),
+            "bootstrap cancellation is masked"
+        );
+        let mut conn = runtime
+            .block_on(AsyncConnection::open_with_env(
+                &caller,
+                ":memory:",
+                env.with_bootstrap_cx(bootstrap.clone()),
+            ))
+            .expect("masked bootstrap completes despite local cancellation");
+
+        drop(mask);
+        assert!(
+            bootstrap.checkpoint().is_err(),
+            "parent observes cancellation after unmask"
+        );
+        let (tx, rx) = mpsc::sync_channel(1);
+        conn.sender()
+            .expect("live worker")
+            .send(Command::InspectRootCancellationForTest { tx })
+            .expect("inspect connection lifetime context");
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .expect("worker context inspection"),
+            (0, false),
+            "the returned connection must be unmasked and uncancelled",
+        );
+        conn.execute_sync("CREATE TABLE t(x);")
+            .expect("unmasked connection permits DDL");
+        conn.execute_sync("INSERT INTO t VALUES (7);")
+            .expect("unmasked connection permits writes");
+        assert_eq!(
+            conn.query_sync("SELECT x FROM t;")
+                .expect("unmasked connection permits reads")[0]
+                .values()[0],
+            SqliteValue::Integer(7),
+        );
+        conn.close_sync()
+            .expect("unmasked connection permits cleanup");
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn gh524_sync_open_requests_preserve_cancellation_without_caller_affinity() {
+        let identity_file = tempfile::tempfile().expect("identity file");
+        let expected_identity = FileIdentity::from_file(&identity_file)
+            .expect("file identity lookup")
+            .expect("platform file identity");
+        for variant in 0..5 {
+            let env = ConnectionEnv::default();
+            let bootstrap = env.bootstrap_cx();
+            bootstrap.set_native_cx(NativeCx::for_testing());
+            bootstrap.mark_blocking_io_inline_safe();
+            let relay = bootstrap.local_cancel_relay();
+            let mask = bootstrap.masked();
+            let env = env.with_bootstrap_cx(bootstrap.clone());
+            let path = ":memory:".to_owned();
+            let request = match variant {
+                0 => WorkerOpenRequest::WithEnv { path, env },
+                1 => WorkerOpenRequest::SchemaOnlyWithEnv { path, env },
+                2 => WorkerOpenRequest::ExistingSchemaOnlyWithEnv { path, env },
+                3 => WorkerOpenRequest::ReservedWithExpectedIdentityAndEnv {
+                    path,
+                    expected_identity,
+                    env,
+                },
+                4 => WorkerOpenRequest::ExistingWithExpectedIdentityAndEnv {
+                    path,
+                    expected_identity,
+                    env,
+                },
+                _ => test_panic("unexpected worker opening variant"),
+            };
+            let (request, lineage) = request.prepare_for_spawn();
+            assert!(
+                lineage.is_some(),
+                "variant {variant} must retain its parent"
+            );
+            let target = match &request {
+                WorkerOpenRequest::WithEnv { env, .. }
+                | WorkerOpenRequest::SchemaOnlyWithEnv { env, .. }
+                | WorkerOpenRequest::ExistingSchemaOnlyWithEnv { env, .. }
+                | WorkerOpenRequest::ReservedWithExpectedIdentityAndEnv { env, .. }
+                | WorkerOpenRequest::ExistingWithExpectedIdentityAndEnv { env, .. } => {
+                    env.bootstrap_cx()
+                }
+                _ => test_panic("preparation changed the worker opening variant"),
+            };
+            assert_eq!(target.mask_depth(), 1, "variant {variant} lost its mask");
+            assert!(
+                target.attached_native_cx().is_none(),
+                "variant {variant} carried the caller's native context"
+            );
+            assert!(
+                !target.blocking_io_inline_safe(),
+                "variant {variant} carried the caller's inline-I/O authority"
+            );
+            drop(mask);
+            drop(bootstrap);
+            assert!(
+                relay.cancel_local(CancelReason::UserInterrupt),
+                "variant {variant} dropped its cancellation parent before opening"
+            );
+            assert!(
+                target.is_cancel_requested(),
+                "variant {variant} broke cancellation propagation"
+            );
+            assert!(
+                target.checkpoint().is_ok(),
+                "variant {variant} lost the bounded opening mask"
+            );
+            drop(lineage);
+            assert!(
+                !relay.cancel_local(CancelReason::UserInterrupt),
+                "variant {variant} retained the caller after opening completed"
+            );
+        }
     }
 
     #[test]
