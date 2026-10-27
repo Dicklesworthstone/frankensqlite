@@ -1400,8 +1400,10 @@ impl VirtualTableCursor for JsonEachCursor {
         _idx_str: Option<&str>,
         args: &[SqliteValue],
     ) -> Result<()> {
-        let (input, path) = parse_json_table_filter_args(args)?;
-        self.rows = json_each_value(&input, path)?;
+        self.rows = match parse_json_table_filter_args(args)? {
+            Some((input, path)) => json_each_value(&input, path)?,
+            None => Vec::new(),
+        };
         self.pos = 0;
         Ok(())
     }
@@ -1467,8 +1469,10 @@ impl VirtualTableCursor for JsonTreeCursor {
         _idx_str: Option<&str>,
         args: &[SqliteValue],
     ) -> Result<()> {
-        let (input, path) = parse_json_table_filter_args(args)?;
-        self.rows = json_tree_value(&input, path)?;
+        self.rows = match parse_json_table_filter_args(args)? {
+            Some((input, path)) => json_tree_value(&input, path)?,
+            None => Vec::new(),
+        };
         self.pos = 0;
         Ok(())
     }
@@ -2486,13 +2490,17 @@ fn append_tree_rows(
     Ok(())
 }
 
-fn parse_json_table_filter_args(args: &[SqliteValue]) -> Result<(Value, Option<&str>)> {
+/// The JSON input and PATH of a json_each/json_tree scan, or `None` when the
+/// scan has no rows. As in stock's `jsonEachFilter`, that is a missing or NULL
+/// input (checked before the PATH, so `json_each(NULL, 'x')` is empty) or a
+/// NULL PATH (checked after the input parses, so malformed input still
+/// errors). `FROM t, json_each(t.tags)` thus skips rows whose `tags` is NULL.
+fn parse_json_table_filter_args(args: &[SqliteValue]) -> Result<Option<(Value, Option<&str>)>> {
     let Some(input_arg) = args.first() else {
-        return Err(FrankenError::function_error(
-            "json table-valued functions require JSON input argument",
-        ));
+        return Ok(None);
     };
     let input_value = match input_arg {
+        SqliteValue::Null => return Ok(None),
         // JSON5 input accepted (bd-qear2) — json_each/json_tree canonicalize
         // via the parsed tree; strict JSON is unaffected (tried first).
         SqliteValue::Text(input_text) => parse_json_value_lenient(input_text)?,
@@ -2504,15 +2512,11 @@ fn parse_json_table_filter_args(args: &[SqliteValue]) -> Result<(Value, Option<&
         // (NaN -> null), so json_each(9e999) yields a single row (GH#212).
         SqliteValue::Integer(i) => Value::Number((*i).into()),
         SqliteValue::Float(f) => float_to_json(*f)?,
-        _ => {
-            return Err(FrankenError::function_error(
-                "json table-valued input must be TEXT or BLOB JSON",
-            ));
-        }
     };
 
     let path = match args.get(1) {
-        None | Some(SqliteValue::Null) => None,
+        None => None,
+        Some(SqliteValue::Null) => return Ok(None),
         Some(SqliteValue::Text(path)) => Some(&**path),
         Some(_) => {
             return Err(FrankenError::function_error(
@@ -2521,7 +2525,7 @@ fn parse_json_table_filter_args(args: &[SqliteValue]) -> Result<(Value, Option<&
         }
     };
 
-    Ok((input_value, path))
+    Ok(Some((input_value, path)))
 }
 fn write_json_table_column(row: &JsonTableRow, ctx: &mut ColumnContext, col: i32) {
     let value = match col {
@@ -6686,18 +6690,22 @@ mod tests {
         // "must be TEXT or BLOB JSON". C SQLite: json_each(1.5) -> type='real'
         // atom=1.5; json_tree(7) -> type='integer'.
         use serde_json::Value;
-        let (v_float, path) =
-            super::parse_json_table_filter_args(&[SqliteValue::Float(1.5)]).unwrap();
+        let (v_float, path) = super::parse_json_table_filter_args(&[SqliteValue::Float(1.5)])
+            .unwrap()
+            .unwrap();
         assert_eq!(v_float, Value::from(1.5));
         assert!(path.is_none());
-        let (v_int, _) = super::parse_json_table_filter_args(&[SqliteValue::Integer(7)]).unwrap();
+        let (v_int, _) = super::parse_json_table_filter_args(&[SqliteValue::Integer(7)])
+            .unwrap()
+            .unwrap();
         assert_eq!(v_int, Value::from(7_i64));
         // GH#212 (verified against sqlite3 3.46.1): json_each(9e999) yields a
         // single row (type='real', atom=Inf), so a bare +Inf renders as the
         // numeric literal 9.0e+999 rather than erroring. The non-finite REAL is
         // carried as a tagged string (bd-yalqc).
-        let (v_inf, _) =
-            super::parse_json_table_filter_args(&[SqliteValue::Float(f64::INFINITY)]).unwrap();
+        let (v_inf, _) = super::parse_json_table_filter_args(&[SqliteValue::Float(f64::INFINITY)])
+            .unwrap()
+            .unwrap();
         assert_eq!(v_inf, super::nonfinite_value("9.0e+999"));
     }
 
