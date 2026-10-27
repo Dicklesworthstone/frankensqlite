@@ -98676,6 +98676,163 @@ impl Connection {
         Ok(Cow::Owned(result))
     }
 
+    /// bd-4t938: stock's planner runs a table-valued function after the FROM
+    /// sources its arguments read, so `FROM json_each(t.tags) AS j, t` scans
+    /// `t` and feeds each row's `tags` to `json_each`. The join fallback runs
+    /// sources in FROM order and binds a function's arguments only from
+    /// sources to its left. When a function reads a later source of an
+    /// all-inner FROM, rebuild the statement with the sources in dependency
+    /// order (stable, so the others keep their relative order): the joins
+    /// become cross joins with their ON terms moved into WHERE, which inner
+    /// joins allow, and `*` expands to qualified columns in the original order
+    /// so the result columns do not change (`tbl.*` names one source and keeps
+    /// its order). `None` when no function reads a later source, or the FROM
+    /// has an outer, NATURAL or USING join, a source without a distinct name,
+    /// or a dependency cycle.
+    ///
+    /// The AST does not tell a comma from CROSS JOIN, so a CROSS JOIN is
+    /// reordered too, where stock keeps its order and runs the function
+    /// without the argument (no rows from json_each).
+    fn reorder_forward_table_function_sources(
+        &self,
+        select: &SelectStatement,
+        visible_ctes: &[fsqlite_ast::Cte],
+    ) -> Option<SelectStatement> {
+        let SelectCore::Select {
+            columns,
+            from: Some(from),
+            where_clause,
+            ..
+        } = &select.body.select
+        else {
+            return None;
+        };
+        if from.joins.is_empty()
+            || from.joins.iter().any(|join| {
+                join.join_type.natural
+                    || !matches!(join.join_type.kind, JoinKind::Inner | JoinKind::Cross)
+                    || matches!(join.constraint, Some(JoinConstraint::Using(_)))
+            })
+        {
+            return None;
+        }
+        let sources: Vec<&TableOrSubquery> = std::iter::once(&from.source)
+            .chain(from.joins.iter().map(|join| &join.table))
+            .collect();
+        if !sources.iter().any(|source| {
+            matches!(source, TableOrSubquery::TableFunction { args, .. }
+                if args.iter().any(expr_references_any_column))
+        }) {
+            return None;
+        }
+        let labels: Vec<Option<String>> = sources
+            .iter()
+            .map(|source| source_projection_label(source))
+            .collect();
+        let distinct_labels = labels.iter().enumerate().all(|(index, label)| {
+            label.as_ref().is_some_and(|label| {
+                !labels[..index]
+                    .iter()
+                    .flatten()
+                    .any(|other| other.eq_ignore_ascii_case(label))
+            })
+        });
+        if !distinct_labels {
+            return None;
+        }
+        let column_names: Vec<Vec<String>> = sources
+            .iter()
+            .map(|source| {
+                self.table_or_subquery_result_column_names(source, visible_ctes, &mut Vec::new())
+            })
+            .collect();
+        if column_names.iter().any(Vec::is_empty) {
+            return None;
+        }
+        let dependencies = table_function_source_dependencies(&sources, &labels, &column_names);
+        if dependencies
+            .iter()
+            .enumerate()
+            .all(|(index, reads)| reads.iter().all(|&read| read < index))
+        {
+            return None;
+        }
+        // The earliest source whose dependencies are placed goes next.
+        let mut order = Vec::with_capacity(sources.len());
+        let mut placed = vec![false; sources.len()];
+        while order.len() < sources.len() {
+            let next = (0..sources.len()).find(|&index| {
+                !placed[index] && dependencies[index].iter().all(|&read| placed[read])
+            })?;
+            placed[next] = true;
+            order.push(next);
+        }
+
+        let mut conjuncts: Vec<Expr> = from
+            .joins
+            .iter()
+            .filter_map(|join| match &join.constraint {
+                Some(JoinConstraint::On(expr)) => Some(expr.clone()),
+                _ => None,
+            })
+            .collect();
+        conjuncts.extend(where_clause.as_deref().cloned());
+        let reordered_where = conjuncts.into_iter().reduce(|left, right| Expr::BinaryOp {
+            left: Box::new(left),
+            op: BinaryOp::And,
+            right: Box::new(right),
+            span: Span::ZERO,
+        });
+        let reordered_columns: Vec<ResultColumn> = columns
+            .iter()
+            .flat_map(|column| match column {
+                ResultColumn::Star => labels
+                    .iter()
+                    .flatten()
+                    .zip(&column_names)
+                    .flat_map(|(label, names)| {
+                        names.iter().map(|name| ResultColumn::Expr {
+                            expr: Expr::Column(
+                                ColumnRef::qualified(label.as_str(), name.as_str()),
+                                Span::ZERO,
+                            ),
+                            alias: None,
+                        })
+                    })
+                    .collect(),
+                other => vec![other.clone()],
+            })
+            .collect();
+        let reordered_from = FromClause {
+            source: sources[order[0]].clone(),
+            joins: order[1..]
+                .iter()
+                .map(|&index| JoinClause {
+                    join_type: fsqlite_ast::JoinType {
+                        natural: false,
+                        kind: JoinKind::Cross,
+                    },
+                    table: sources[index].clone(),
+                    constraint: None,
+                })
+                .collect(),
+        };
+
+        let mut reordered = select.clone();
+        if let SelectCore::Select {
+            columns,
+            from,
+            where_clause,
+            ..
+        } = &mut reordered.body.select
+        {
+            *columns = reordered_columns;
+            *from = Some(reordered_from);
+            *where_clause = reordered_where.map(Box::new);
+        }
+        Some(reordered)
+    }
+
     /// Execute a SELECT with JOINs using in-memory nested-loop evaluation.
     ///
     /// Loads each table's rows independently, then combines them according to
@@ -98706,6 +98863,10 @@ impl Connection {
             .with
             .as_ref()
             .map_or_else(Vec::new, |with| with.ctes.clone());
+        if let Some(reordered) = self.reorder_forward_table_function_sources(select, &visible_ctes)
+        {
+            return Box::pin(self.execute_join_select(&reordered, None)).await;
+        }
 
         // ── 1. Resolve all table sources (primary + joined tables) ──
         let mut table_sources: Vec<JoinTableSource> = Vec::with_capacity(1 + from.joins.len());
@@ -98823,11 +98984,42 @@ impl Connection {
         // binds joined sources, and the first source has no left sibling to
         // read, so it always materializes here: skipping it for a subquery
         // argument (`FROM json_each((SELECT tags FROM t))`) returned no rows.
+        //
+        // bd-4t938: a function that reads a source an outer join pins after it
+        // (`FROM json_each(t.tags) AS j LEFT JOIN t`) cannot run after that
+        // source, even in stock, which then runs it without the argument:
+        // json_each and json_tree return no rows. Here any such function keeps
+        // its empty placeholder instead of failing on the unbound column.
+        let is_outer =
+            |kind: JoinKind| matches!(kind, JoinKind::Left | JoinKind::Right | JoinKind::Full);
+        let has_outer_join = from.joins.iter().any(|join| is_outer(join.join_type.kind));
+        let pinned_tvf: Vec<bool> = if has_outer_join {
+            let labels: Vec<Option<String>> = all_sources
+                .iter()
+                .map(|source| source_projection_label(source))
+                .collect();
+            let column_names: Vec<&[String]> = table_sources
+                .iter()
+                .map(|src| src.col_names.as_slice())
+                .collect();
+            table_function_source_dependencies(&all_sources, &labels, &column_names)
+                .iter()
+                .enumerate()
+                .map(|(index, reads)| {
+                    reads
+                        .iter()
+                        .any(|&read| read > index && is_outer(from.joins[read - 1].join_type.kind))
+                })
+                .collect()
+        } else {
+            vec![false; all_sources.len()]
+        };
         let lateral_tvf: Vec<bool> = all_sources
             .iter()
             .enumerate()
             .map(|(index, src)| {
                 index > 0
+                    && !pinned_tvf[index]
                     && matches!(src, TableOrSubquery::TableFunction { args, .. }
                         if args.iter().any(expr_references_any_column))
             })
@@ -98859,7 +99051,7 @@ impl Connection {
                         // join loop, not pre-materialized here. Leave the empty
                         // placeholder in `preloaded[i]`; `table_rows[i]` is unused
                         // for such sources (the join loop overrides it).
-                        if lateral_tvf[i] {
+                        if lateral_tvf[i] || pinned_tvf[i] {
                             continue;
                         }
                         let include_hidden_rowid =
@@ -116282,6 +116474,55 @@ fn source_matches_name(source: &TableOrSubquery, target: &QualifiedName) -> bool
         }
         TableOrSubquery::ParenJoin(_) => false,
     }
+}
+
+/// bd-4t938: for each FROM source, the other sources its table-valued
+/// function arguments read (empty for a source that is not a function). A
+/// qualified reference names a source by its label; a bare one reads the only
+/// other source with that column. A reference that matches no source, or
+/// several, is left to ordinary resolution and its errors.
+fn table_function_source_dependencies<C: AsRef<[String]>>(
+    sources: &[&TableOrSubquery],
+    labels: &[Option<String>],
+    column_names: &[C],
+) -> Vec<Vec<usize>> {
+    sources
+        .iter()
+        .enumerate()
+        .map(|(index, source)| {
+            let TableOrSubquery::TableFunction { args, .. } = source else {
+                return Vec::new();
+            };
+            let mut reads = Vec::new();
+            for arg in args {
+                let _ = visit_expr_column_refs(arg, &mut |col_ref| {
+                    let mut matches = (0..sources.len()).filter(|&other| {
+                        other != index
+                            && col_ref.table.as_deref().map_or_else(
+                                || {
+                                    column_names[other]
+                                        .as_ref()
+                                        .iter()
+                                        .any(|name| name.eq_ignore_ascii_case(&col_ref.column))
+                                },
+                                |table| {
+                                    labels[other]
+                                        .as_deref()
+                                        .is_some_and(|label| label.eq_ignore_ascii_case(table))
+                                },
+                            )
+                    });
+                    if let (Some(read), None) = (matches.next(), matches.next())
+                        && !reads.contains(&read)
+                    {
+                        reads.push(read);
+                    }
+                    Ok(())
+                });
+            }
+            reads
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
