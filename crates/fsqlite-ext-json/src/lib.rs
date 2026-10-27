@@ -4310,6 +4310,109 @@ impl AggregateFunction for JsonGroupObjectFunc {
     }
 }
 
+
+/// `jsonb_group_array(X)` — JSONB aggregate variant of `json_group_array`.
+///
+/// The state retains argument subtypes so nested JSON values are embedded
+/// rather than quoted, matching the text aggregate's subtype semantics.
+pub struct JsonbGroupArrayFunc;
+
+impl AggregateFunction for JsonbGroupArrayFunc {
+    type State = Vec<(SqliteValue, u32)>;
+
+    fn initial_state(&self) -> Self::State {
+        Vec::new()
+    }
+
+    fn step(&self, state: &mut Self::State, args: &[SqliteValue]) -> Result<()> {
+        state.push((args[0].clone(), 0));
+        Ok(())
+    }
+
+    fn step_with_arg_subtypes(
+        &self,
+        state: &mut Self::State,
+        args: &[SqliteValue],
+        arg_subtypes: &[u32],
+    ) -> Result<()> {
+        state.push((args[0].clone(), arg_subtypes.first().copied().unwrap_or(0)));
+        Ok(())
+    }
+
+    fn finalize(&self, state: Self::State) -> Result<SqliteValue> {
+        let mut values = Vec::with_capacity(state.len());
+        for (value, subtype) in state {
+            values.push(sqlite_to_json_with_subtype(&value, subtype)?);
+        }
+        let blob = encode_jsonb_root(&Value::Array(values))?;
+        Ok(SqliteValue::Blob(Arc::from(blob.as_slice())))
+    }
+
+    fn num_args(&self) -> i32 {
+        1
+    }
+
+    fn name(&self) -> &str {
+        "jsonb_group_array"
+    }
+}
+
+/// `jsonb_group_object(NAME, VALUE)` — JSONB aggregate variant of
+/// `json_group_object`.
+///
+/// Object members are encoded directly into the JSONB payload so duplicate
+/// labels remain in row order instead of being collapsed by a map round-trip.
+pub struct JsonbGroupObjectFunc;
+
+impl AggregateFunction for JsonbGroupObjectFunc {
+    type State = Vec<(String, SqliteValue, u32)>;
+
+    fn initial_state(&self) -> Self::State {
+        Vec::new()
+    }
+
+    fn step(&self, state: &mut Self::State, args: &[SqliteValue]) -> Result<()> {
+        self.step_with_arg_subtypes(state, args, &[])
+    }
+
+    fn step_with_arg_subtypes(
+        &self,
+        state: &mut Self::State,
+        args: &[SqliteValue],
+        arg_subtypes: &[u32],
+    ) -> Result<()> {
+        if args[0].is_null() {
+            return Ok(());
+        }
+        state.push((
+            args[0].to_text(),
+            args[1].clone(),
+            arg_subtypes.get(1).copied().unwrap_or(0),
+        ));
+        Ok(())
+    }
+
+    fn finalize(&self, state: Self::State) -> Result<SqliteValue> {
+        let mut payload = Vec::new();
+        for (key, value, subtype) in state {
+            append_jsonb_string(&key, &mut payload)?;
+            let json_value = sqlite_to_json_with_subtype(&value, subtype)?;
+            encode_jsonb_value(&json_value, &mut payload)?;
+        }
+        let mut blob = Vec::new();
+        append_jsonb_node(JSONB_OBJECT_TYPE, &payload, &mut blob)?;
+        Ok(SqliteValue::Blob(Arc::from(blob.as_slice())))
+    }
+
+    fn num_args(&self) -> i32 {
+        2
+    }
+
+    fn name(&self) -> &str {
+        "jsonb_group_object"
+    }
+}
+
 /// Register JSON1 scalar functions into a `FunctionRegistry`.
 pub fn register_json_scalars(registry: &mut FunctionRegistry) {
     registry.register_scalar(JsonFunc);
@@ -4342,6 +4445,8 @@ pub fn register_json_scalars(registry: &mut FunctionRegistry) {
     registry.register_scalar(JsonPrettyFunc);
     registry.register_aggregate(JsonGroupArrayFunc);
     registry.register_aggregate(JsonGroupObjectFunc);
+    registry.register_aggregate(JsonbGroupArrayFunc);
+    registry.register_aggregate(JsonbGroupObjectFunc);
 }
 
 #[cfg(test)]
@@ -4618,6 +4723,59 @@ mod tests {
             fullkey: row.fullkey.clone(),
             path: row.path.clone(),
         }
+    }
+
+    #[test]
+    fn test_register_json_scalars_registers_jsonb_aggregates_bd_5ul61() {
+        let mut registry = FunctionRegistry::new();
+        register_json_scalars(&mut registry);
+
+        for name in [
+            "json_group_array",
+            "json_group_object",
+            "jsonb_group_array",
+            "jsonb_group_object",
+        ] {
+            assert!(
+                registry.contains_aggregate(name),
+                "missing aggregate registration for {name}"
+            );
+        }
+
+        let array = JsonbGroupArrayFunc;
+        let mut array_state = array.initial_state();
+        array
+            .step(&mut array_state, &[SqliteValue::Integer(1)])
+            .unwrap();
+        array
+            .step(&mut array_state, &[SqliteValue::Integer(2)])
+            .unwrap();
+        let SqliteValue::Blob(array_blob) = array.finalize(array_state).unwrap() else {
+            panic!("jsonb_group_array must return a BLOB");
+        };
+        assert_eq!(
+            decode_jsonb_root(&array_blob).unwrap(),
+            Value::Array(vec![Value::Number(1.into()), Value::Number(2.into())])
+        );
+
+        let object = JsonbGroupObjectFunc;
+        let mut object_state = object.initial_state();
+        object
+            .step(
+                &mut object_state,
+                &[
+                    SqliteValue::Text(SmallText::from_string("k")),
+                    SqliteValue::Integer(7),
+                ],
+            )
+            .unwrap();
+        let SqliteValue::Blob(object_blob) = object.finalize(object_state).unwrap() else {
+            panic!("jsonb_group_object must return a BLOB");
+        };
+        assert_eq!(
+            json_from_jsonb(&object_blob).unwrap(),
+            r#"{"k":7}"#
+        );
     }
 
     #[test]
