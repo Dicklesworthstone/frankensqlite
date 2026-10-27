@@ -301,7 +301,13 @@ impl Connection {
             // `busy = 1` with nothing checkpointed rather than as an error, so
             // peers closing at the same moment do not fail each other's
             // close-time checkpoints.
-            Err(FrankenError::Busy) => {
+            //
+            // bd-s4lco: the same holds when a peer's WAL reset or index
+            // recovery lands between this checkpoint's index binds, which the
+            // pager answers with BusyRecovery. Stock's checkpoint never
+            // returns SQLITE_BUSY_RECOVERY: an index it cannot read under the
+            // checkpoint lock is plain SQLITE_BUSY, so the row is `busy = 1`.
+            Err(FrankenError::Busy | FrankenError::BusyRecovery) => {
                 let log_frames =
                     i64::try_from(self.pager.wal_frame_count(&cx).await).unwrap_or(i64::MAX);
                 return Ok([1, log_frames, 0]);
