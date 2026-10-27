@@ -1052,6 +1052,41 @@ pub fn json_object_with_subtypes(args: &[SqliteValue], subtypes: &[u32]) -> Resu
     encode_json_object_members(&members)
 }
 
+/// Build a JSONB object from alternating key/value SQL arguments while
+/// preserving duplicate labels and argument order.
+///
+/// Encoding through `serde_json::Value::Object` would collapse duplicate keys,
+/// which is observable because SQLite's JSONB object format permits duplicates.
+fn jsonb_object_with_subtypes(args: &[SqliteValue], subtypes: &[u32]) -> Result<Vec<u8>> {
+    if !args.len().is_multiple_of(2) {
+        return Err(FrankenError::function_error(
+            "json_object() requires an even number of arguments",
+        ));
+    }
+
+    let mut payload = Vec::new();
+    let mut idx = 0;
+    while idx < args.len() {
+        let key = match &args[idx] {
+            SqliteValue::Text(text) => text.as_ref(),
+            _ => {
+                return Err(FrankenError::function_error(
+                    "json_object() labels must be TEXT",
+                ));
+            }
+        };
+        append_jsonb_string(key, &mut payload)?;
+        let subtype = subtypes.get(idx + 1).copied().unwrap_or(0);
+        let value = sqlite_to_json_with_subtype(&args[idx + 1], subtype)?;
+        encode_jsonb_value(&value, &mut payload)?;
+        idx += 2;
+    }
+
+    let mut out = Vec::new();
+    append_jsonb_node(JSONB_OBJECT_TYPE, &payload, &mut out)?;
+    Ok(out)
+}
+
 /// Build a JSON object from alternating key/value SQL arguments.
 ///
 /// Duplicate labels are preserved verbatim in argument order, matching stock
@@ -1089,8 +1124,7 @@ pub fn jsonb_array(values: &[SqliteValue]) -> Result<Vec<u8>> {
 
 /// Build JSONB object from alternating key/value SQL arguments.
 pub fn jsonb_object(args: &[SqliteValue]) -> Result<Vec<u8>> {
-    let json_text = json_object(args)?;
-    jsonb(&json_text)
+    jsonb_object_with_subtypes(args, &[])
 }
 
 /// Aggregate rows into a JSON array, preserving SQL NULL as JSON null.
@@ -1123,8 +1157,17 @@ pub fn json_group_object(entries: &[(SqliteValue, SqliteValue)]) -> Result<Strin
 
 /// JSONB variant of `json_group_object`.
 pub fn jsonb_group_object(entries: &[(SqliteValue, SqliteValue)]) -> Result<Vec<u8>> {
-    let json_text = json_group_object(entries)?;
-    jsonb(&json_text)
+    let mut payload = Vec::new();
+    for (key_value, value) in entries {
+        if key_value.is_null() {
+            continue;
+        }
+        append_jsonb_string(&key_value.to_text(), &mut payload)?;
+        encode_jsonb_value(&sqlite_to_json(value)?, &mut payload)?;
+    }
+    let mut out = Vec::new();
+    append_jsonb_node(JSONB_OBJECT_TYPE, &payload, &mut out)?;
+    Ok(out)
 }
 
 /// Set JSON values at path(s), creating object keys when missing.
@@ -3760,8 +3803,7 @@ impl ScalarFunction for JsonbObjectFunc {
         args: &[SqliteValue],
         arg_subtypes: &[u32],
     ) -> Result<SqliteValue> {
-        let s = json_object_with_subtypes(args, arg_subtypes)?;
-        let blob = jsonb(&s)?;
+        let blob = jsonb_object_with_subtypes(args, arg_subtypes)?;
         Ok(SqliteValue::Blob(Arc::from(blob.as_slice())))
     }
 
@@ -7716,6 +7758,63 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(out, r#"{"a":1,"b":2,"a":3}"#);
+    }
+
+    #[test]
+    fn test_jsonb_object_preserves_duplicate_labels_bd_55eq3() {
+        let blob = jsonb_object(&[
+            SqliteValue::Text(SmallText::from_string("k")),
+            SqliteValue::Integer(1),
+            SqliteValue::Text(SmallText::from_string("k")),
+            SqliteValue::Integer(2),
+        ])
+        .unwrap();
+
+        // Stock JSONB for {"k":1,"k":2}: object payload length 8, followed by
+        // TEXT("k"), INT("1"), TEXT("k"), INT("2").
+        assert_eq!(
+            blob,
+            vec![0x8c, 0x17, b'k', 0x13, b'1', 0x17, b'k', 0x13, b'2']
+        );
+    }
+
+    #[test]
+    fn test_jsonb_group_object_preserves_duplicate_labels_bd_55eq3() {
+        let blob = jsonb_group_object(&[
+            (
+                SqliteValue::Text(SmallText::from_string("k")),
+                SqliteValue::Integer(1),
+            ),
+            (
+                SqliteValue::Text(SmallText::from_string("k")),
+                SqliteValue::Integer(2),
+            ),
+        ])
+        .unwrap();
+        assert_eq!(
+            blob,
+            vec![0x8c, 0x17, b'k', 0x13, b'1', 0x17, b'k', 0x13, b'2']
+        );
+    }
+
+    #[test]
+    fn test_jsonb_object_subtype_embeds_nested_value_without_collapsing_labels() {
+        let blob = JsonbObjectFunc
+            .invoke_with_arg_subtypes(
+                &[
+                    SqliteValue::Text(SmallText::from_string("k")),
+                    SqliteValue::Text(SmallText::from_string("[1,2]")),
+                    SqliteValue::Text(SmallText::from_string("k")),
+                    SqliteValue::Integer(3),
+                ],
+                &[0, JSON_SUBTYPE, 0, 0],
+            )
+            .unwrap();
+        let SqliteValue::Blob(blob) = blob else {
+            panic!("jsonb_object must return a BLOB");
+        };
+        // Two TEXT("k") members must remain physically present.
+        assert_eq!(blob.iter().filter(|&&byte| byte == b'k').count(), 2);
     }
 
     // -----------------------------------------------------------------------
