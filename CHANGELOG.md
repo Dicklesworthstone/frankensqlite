@@ -23,7 +23,7 @@ Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releas
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| [Unreleased](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.4.12...main) | HEAD | 2026-10-22 | Development on `main` after v0.4.12, with **data-integrity fixes**: an unparenthesized column `DEFAULT` swallowed a following NOT NULL or COLLATE, also on stock-created schemas; an FTS5 external-content `rebuild` after a content-table rename erased the index (GH#211); concurrent writers could commit duplicate implicit rowids (bd-ujp0h, bd-2ym3z); triggers fired by a cascade skipped FK checks (bd-vcvn0). Plus GH#509, GH#511, GH#512, GH#448 and GH#521 fixes, candidate fixes for GH#510, GH#519 and GH#506 (macOS) that were not run when committed, large-commit memory bounds (GH#518), stable-Rust build work (GH#522; releases through v0.4.12 still need nightly), the source-incompatible `MigrationOutcome::Incomplete`, and ordered batch replication in the TypeScript SDK. Many commits record no compile or test run |
+| [Unreleased](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.4.12...main) | HEAD | 2026-10-27 | Development on `main` after v0.4.12, with **data-integrity fixes**: an unparenthesized column `DEFAULT` swallowed a following NOT NULL or COLLATE, also on stock-created schemas; an FTS5 external-content `rebuild` after a content-table rename erased the index, and such a table lost its postings on its first write after a reopen (GH#211); concurrent writers could commit duplicate implicit rowids (bd-ujp0h, bd-2ym3z); triggers fired by a cascade skipped FK checks, and an FK action skipped by `RAISE(IGNORE)` left orphan rows (bd-vcvn0); R-tree tables were not written in stock's file format. Plus GH#509, GH#511, GH#512, GH#448, GH#521, GH#523, GH#528 and GH#529 fixes, read-only opens of a header-less WAL without `-shm` (GH#515) and of unwritable files, WAL resets by the autocheckpoint (GH#385), join memory bounds (GH#527), candidate fixes for GH#510, GH#519 and GH#506 (macOS) that were not run when committed and for GH#524, GH#525 and GH#526 that were not fully built or run, large-commit memory bounds (GH#518), stable-Rust build work (GH#522; releases through v0.4.12 still need nightly), the source-incompatible `MigrationOutcome::Incomplete` and geopoly return types, and ordered batch replication in the TypeScript SDK. Many commits record no compile or test run |
 | [v0.4.12](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.4.12) | Release | 2026-10-13 | Uniform release of all 26 public crates, with an **upgrade advisory for 0.4.10**: a join whose outer table was read through an index with a `DESC` column returned no rows (GH#502); `:memory:` with `autocommit_retain = OFF` could lose every row of a table (GH#503); `DELETE ... WHERE EXISTS` over the same table deleted the wrong rows (bd-ntt2b). Plus FROM-less row-value comparisons (GH#450), attached-database DML and name resolution, conflict-clause and constraint parity, a full filesystem during WAL-index growth reported as an I/O error instead of a SIGBUS on Linux (GH#506), WAL-FEC attach/close fixes, and index seeks for `IN` lists and `WHERE k = ? ORDER BY id` |
 | [0.4.11](https://crates.io/crates/fsqlite-vfs/0.4.11) | crates.io only | 2026-10-09 | `fsqlite-vfs` alone: on macOS and other non-Linux Unix, a redundant main-DB descriptor opened while WAL lifetime locks were held is reused instead of parked forever, so long-running processes stop leaking about 2 fds per fresh connection (bd-l0rbc). Tag `fsqlite-vfs-v0.4.11`; no GitHub Release. The next uniform release must be >= 0.4.12 |
 | [v0.4.10](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.4.10) | Release | 2026-10-07 | Uniform release of all 26 public crates, with a **data-integrity advisory**: inserts inside a transaction could silently corrupt a table b-tree (bd-obwsy); UPDATE ... FROM lost or repeated updates (bd-b5j26); non-integer rowid / INTEGER PRIMARY KEY values left malformed index entries (REINDEX); a REPLACE constraint could delete a row an IGNORE constraint then kept out; a retried fsync after a failed WAL sync could vouch for unwritten frames (bd-alyrn). Plus checkpoint source validation, max-rowid and rowid-reuse parity, `:memory:` freelist reuse, stock empty-schema opens, and DML/join/trigger performance work |
@@ -68,7 +68,10 @@ entry says so; that run is not part of the commit.
 [1cab6896d](https://github.com/Dicklesworthstone/frankensqlite/commit/1cab6896d) made the
 `fsqlite-vfs`, `fsqlite-wal` and `fsqlite-core` targets compile and pass `clippy -D warnings` again
 on 2026-10-22, and the tracker records no full-workspace test run of `main` since 2026-10-03
-(bd-reality-check-1022-llk6g.12).
+(bd-reality-check-1022-llk6g.12). From 2026-10-23 most commits record their own runs: unless an
+entry says otherwise, each commit from that date that it cites records a keeper that failed before
+the change and passes with it on Linux x86_64 build hosts (trj, mostly through rch). Entries name
+the runs made on macOS arm64 and the commits that record no run or only part of one.
 
 ### Data integrity
 
@@ -86,6 +89,20 @@ on 2026-10-22, and the tracker records no full-workspace test run of `main` sinc
   that rebuild with `no such table`, but FrankenSQLite rebuilt from its in-memory documents, which
   hold no external content, and dropped every posting; it now returns the same error and leaves the
   index and source rows unchanged.
+- **An external-content FTS5 table lost its postings on its first write after a reopen
+  ([#211](https://github.com/Dicklesworthstone/frankensqlite/issues/211),
+  [ca48dd641](https://github.com/Dicklesworthstone/frankensqlite/commit/ca48dd641)).** When a
+  connection bound an index it had not built itself (a reopened file, a stock-created file, or the
+  segments a `'rebuild'` had just written), the first INSERT or `'delete'` rebuilt the in-memory
+  index from the table's `%_content` rows, which an external-content table does not have, and wrote
+  that index back, so `MATCH` then found only the rows written since. The index is now loaded from
+  its persisted segments before the first change. `'rebuild'` on an external-content table now
+  rebuilds from the source rows alone, where a row deleted from the content table without a
+  matching FTS5 `'delete'` kept its postings, and
+  [6f0818e63](https://github.com/Dicklesworthstone/frankensqlite/commit/6f0818e63) makes it read
+  the source columns by name, where it paired them by position and could index the wrong columns.
+  An index damaged this way can be regenerated with `INSERT INTO ft(ft) VALUES('rebuild')`. The
+  GH#211 e2e keeper that was red on `main` passes with ca48dd641.
 - **Several connections inserting implicit rowids into one WAL database could commit the same rowid
   (bd-ujp0h, bd-2ym3z;
   [76e57eeac](https://github.com/Dicklesworthstone/frankensqlite/commit/76e57eeac),
@@ -103,6 +120,27 @@ on 2026-10-22, and the tracker records no full-workspace test run of `main` sinc
   Enforcement is now restored on entry to every trigger frame; the fix was verified with stable
   rustc 1.99.1 by an external program running the new oracle cases, because builds of the
   repository's own test target ran out of memory.
+- **With `foreign_keys` on, a CASCADE or SET NULL action that a child table's BEFORE trigger
+  skipped with `RAISE(IGNORE)` left an orphan row, and the statement succeeded
+  ([ad5d47395](https://github.com/Dicklesworthstone/frankensqlite/commit/ad5d47395), bd-vcvn0).**
+  Stock fails such a statement with `FOREIGN KEY constraint failed` unless the parent key exists
+  again by the statement's end (by COMMIT for a deferred key), and FrankenSQLite now does the same.
+  One difference remains on purpose: inside an explicit transaction stock keeps the failed
+  statement's changes, orphan included, while FrankenSQLite rolls the statement back. Orphans left
+  by earlier versions show up in `PRAGMA foreign_key_check`.
+- **R-tree tables were not stored in stock's file format
+  ([80ac75664](https://github.com/Dicklesworthstone/frankensqlite/commit/80ac75664),
+  bd-reality-check-1022-llk6g.3).** FrankenSQLite kept one row per entry in the table's own b-tree
+  and wrote no `%_node`, `%_rowid` or `%_parent` shadow tables, so stock could not read the file
+  (`no such table: main.rt_node`, also from `PRAGMA integrity_check`), and FrankenSQLite failed on
+  stock-written R-trees with `OpenRead failed: could not open storage cursor on root page 0`.
+  `rtree` and `rtree_i32` tables created now use stock's shadow tables and node layout and get the
+  same shadow rows as stock for the same writes, and stock-written R-trees can be read and
+  extended. Tables created by earlier versions keep the old layout, which FrankenSQLite still reads
+  and updates and stock still cannot read (conversion is bd-reality-check-1022-llk6g.34). A
+  duplicate id now fails with stock's `UNIQUE constraint failed: rt.id`, and `CREATE VIRTUAL TABLE`
+  passes module arguments as their source text, so an auxiliary column `+tag0` no longer reaches
+  the module as `+ tag0`, which stock read back as a syntax error.
 
 ### Fixed
 
@@ -139,6 +177,14 @@ SQL results and schema:
   `gh448_raise_fail_updates_changes_and_total_changes`
   ([87a919c1c](https://github.com/Dicklesworthstone/frankensqlite/commit/87a919c1c)) passing against
   rusqlite, while a later tracker note (2026-10-22) still lists them as unverified.
+- `RAISE(ROLLBACK, 'msg')` fails with just `msg`, as in stock, instead of
+  `transaction rolled back: msg`, and in autocommit it acts as ABORT instead of rolling back
+  whatever transaction handle was open. A failed statement leaves `last_insert_rowid()` at the last
+  row it inserted, even one that ABORT rolled back, as stock does, instead of restoring the value
+  from before the statement
+  ([#448](https://github.com/Dicklesworthstone/frankensqlite/issues/448),
+  [7d09e6417](https://github.com/Dicklesworthstone/frankensqlite/commit/7d09e6417)). Of the
+  commit's 256 trigger cases and 72 conflict cases compared with stock, 88 and 18 differed before.
 - `PRAGMA integrity_check` inside `BEGIN` on a read-only connection reported every free page of a
   valid file as `page N is never used`; it now walks the committed freelist
   ([58ddae0de](https://github.com/Dicklesworthstone/frankensqlite/commit/58ddae0de), bd-vgw6e).
@@ -155,6 +201,152 @@ SQL results and schema:
 - `CREATE TABLE` accepts adjacent table constraints without a separating comma, as stock's grammar
   does ([0c709404d](https://github.com/Dicklesworthstone/frankensqlite/commit/0c709404d)). The
   commit adds no test and was not compiled.
+- Date and time functions follow stock's `date.c`
+  ([d5524d3fa](https://github.com/Dicklesworthstone/frankensqlite/commit/d5524d3fa),
+  bd-reality-check-1022-llk6g.17): `'localtime'` outside 1970-01-01..2038-01-18 uses the same
+  wall-clock time in year 2000 + Y%4 instead of the zone's historical offsets (1800 in New York
+  came out at -4:56:02); `'utc'`, and a second `'localtime'`, leave a value already in that zone
+  alone, including text ending in `Z` or `+HH:MM`; a time zone is only `+HH:MM` or `-HH:MM` with
+  hours 0-14, or `Z`, with optional spaces around it; any run of spaces and `T` (or none) may
+  separate date and time; hour 24 is accepted; fractions are truncated at .999, so `59.9995` with
+  `'subsec'` is 59.999, not 60.000; `'floor'` follows stock's state; date and time fields print as
+  written while no modifier recomputes them (`datetime('2024-01-01 24:00')` is
+  `2024-01-01 24:00:00`); and `9999-12-31 23:59:59.999` is in range.
+  [4ba02c822](https://github.com/Dicklesworthstone/frankensqlite/commit/4ba02c822) makes
+  `'start of day'`, `'start of month'` and `'start of year'` on an hour-24 input start from the
+  date as written, as stock does (bd-a20bp); it was not compiled or run when committed, and no
+  later run of its unit cases is recorded.
+- `printf()` and `format()` accept the `l` and `ll` length modifiers and ignore them, as stock
+  does: `printf('%lld', x)`, `%ld`, `%lu`, `%llx` and `format('%lld rows', 3)` returned NULL. An
+  unknown conversion such as `%a` now keeps the text formatted before it (`printf('x%a', 1)` is
+  `'x'`) and still returns NULL when there is none
+  ([c86030ce7](https://github.com/Dicklesworthstone/frankensqlite/commit/c86030ce7),
+  bd-reality-check-1022-llk6g.16).
+- `iif()` and its alias `if()` take any number of arguments, as stock 3.48 and later do:
+  `iif(c1, v1, c2, v2, ..., else)` is a searched `CASE`, a missing else is NULL, and only the
+  selected branch is evaluated, so an unselected `abs(-9223372036854775808)` no longer fails with
+  `integer overflow`
+  ([e0a15abb8](https://github.com/Dicklesworthstone/frankensqlite/commit/e0a15abb8),
+  bd-reality-check-1022-llk6g.28).
+- A recursive CTE's `ORDER BY` orders its recursion queue as in stock, so `ORDER BY lvl DESC`
+  walks a tree depth-first where FrankenSQLite always went breadth-first, and the CTE's own
+  `LIMIT` and `OFFSET` apply in every form: `LIMIT 5 OFFSET 2` returned every row, and with an
+  `OFFSET` or a non-literal `LIMIT` an otherwise infinite recursion never ended
+  ([db5e15482](https://github.com/Dicklesworthstone/frankensqlite/commit/db5e15482),
+  bd-reality-check-1022-llk6g.15).
+- JSON values keep stock's JSON subtype from one JSON function to the next
+  ([a75995f59](https://github.com/Dicklesworthstone/frankensqlite/commit/a75995f59),
+  bd-reality-check-1022-llk6g.14): `json_quote(json('{"a":1}'))` returns `{"a":1}` instead of a
+  quoted string; results of `json_extract` (an array or object), `json_patch`, `json_remove`,
+  `json_group_array` and `json_group_object` are embedded by an outer `json_array` or
+  `json_object` instead of quoted; a JSONB blob passed to `json_quote`, `json_array`,
+  `json_object` or `json_set` is read as the value it encodes instead of failing with
+  `JSON cannot hold BLOB values`; and joins, `GROUP BY` and `HAVING` pass subtypes as a FROM-less
+  SELECT does (`json_array(json('[1]'))` over a join gave `["[1]"]`). Duplicate object keys still
+  differ from stock: `json_extract` returns the last one.
+- `pragma_table_list` works as a table-valued function (bare, `()` and `('t')`) instead of failing
+  with `no such table: pragma_table_list`, and `PRAGMA table_list` reports a view's column count
+  in `ncol` when the view has no column list, where it reported 0
+  ([3ef73bc95](https://github.com/Dicklesworthstone/frankensqlite/commit/3ef73bc95)).
+- `PRAGMA table_info`, `table_xinfo` and `pragma_table_info()` resolve a view first, as stock
+  does: a circular view fails with `view c is circularly defined` instead of returning one column
+  named `*`, and a view whose table was dropped fails with `no such table: main.t` instead of
+  returning its old columns
+  ([44ca9d261](https://github.com/Dicklesworthstone/frankensqlite/commit/44ca9d261), bd-mw9m3).
+- `RIGHT` and `FULL JOIN` with `USING` or `NATURAL` match stock on rows that exist only on the
+  right ([e0ca46a17](https://github.com/Dicklesworthstone/frankensqlite/commit/e0ca46a17),
+  bd-reality-check-1022-llk6g.13, bd-reality-check-1022-llk6g.31): `SELECT *` and `tbl.*` return
+  the coalesced join key where they returned NULL, and a `USING` after such a join compares the
+  coalesced key of every left table that has the column, so
+  `a FULL JOIN b USING(id) FULL JOIN c USING(id)` returns one row for an id that only b and c
+  hold, not two. Stock's errors `ambiguous reference to X in USING()` and
+  `ambiguous column name: X` are raised for the shapes stock rejects.
+- A table-valued function listed first in FROM with a subquery among its arguments returned no
+  rows and no error: `SELECT value FROM json_each((SELECT '[1,2,2]'))` was empty and
+  `SELECT sum(DISTINCT value) FROM generate_series(1, (SELECT 3))` was NULL instead of 6
+  ([653391c3c](https://github.com/Dicklesworthstone/frankensqlite/commit/653391c3c), bd-oamvm).
+  Plain `count`, `sum`, `avg`, `min` and `max` and `GROUP BY` projections were not affected, and
+  v0.4.9 behaves the same. A function listed before the table its argument reads
+  (`FROM json_each(t.tags) AS j, t`) still returns no rows (bd-4t938). The commit's keeper failed
+  on 0f338e1d8 and passes with the change on macOS arm64.
+- After `ALTER TABLE ... DROP COLUMN`, statements that read the in-memory row mirror, such as those
+  run through `query_with_params`, still returned the dropped column (`1|2|3` where stock returns
+  `1|3`); the mirror is now reloaded from storage after the drop
+  ([10ca0776a](https://github.com/Dicklesworthstone/frankensqlite/commit/10ca0776a)).
+- `ALTER TABLE ... DROP COLUMN` is allowed when a trigger only assigns the column
+  (`UPDATE t SET c = ...`, `INSERT INTO t(a, c) ...`, an upsert's `SET c`), as in stock; the
+  trigger then fails when it fires. A trigger that reads the column still blocks the drop. An
+  INSERT into a table with an INSERT trigger reports a VALUES width mismatch in stock's words
+  (`table t has 2 columns but 1 values were supplied`) instead of an internal error
+  ([4f37506fc](https://github.com/Dicklesworthstone/frankensqlite/commit/4f37506fc),
+  bd-reality-check-1022-llk6g.28).
+
+Constraints, foreign keys and triggers:
+
+- With `foreign_keys` on, an UPDATE checks only the foreign keys whose child columns it assigns,
+  as stock does. A row that already violated a key, for example one written while `foreign_keys`
+  was off, failed any UPDATE with `FOREIGN KEY constraint failed`, even of an unrelated column
+  ([#451](https://github.com/Dicklesworthstone/frankensqlite/issues/451),
+  [7efb85c25](https://github.com/Dicklesworthstone/frankensqlite/commit/7efb85c25),
+  bd-reality-check-1022-llk6g.4).
+- After a failed INSERT the next automatic rowid is `max(rowid) + 1`, as in stock. A UNIQUE or
+  PRIMARY KEY failure on a table first written in the failing transaction, and any failure of an
+  `OR FAIL` statement, left a one-rowid gap. An AUTOINCREMENT table gets the rowid back only from a
+  failed statement, and a successful `OR IGNORE` still uses one up, as in stock
+  ([c3f68438d](https://github.com/Dicklesworthstone/frankensqlite/commit/c3f68438d),
+  bd-reality-check-1022-llk6g.33).
+- Schema and constraint parity
+  ([4a60d9f71](https://github.com/Dicklesworthstone/frankensqlite/commit/4a60d9f71)):
+  `ALTER TABLE ADD COLUMN` with a CHECK checks the existing rows (bd-whs71); VACUUM rebuilds a
+  partial index with the columns' declared collations (bd-h09hh); CHECK error text keeps grouped
+  expressions as written, and later column constraints take the preceding `CONSTRAINT` name, as in
+  stock (bd-3syf5); `CREATE TRIGGER ... ON schema.table` parses (bd-3j81a); rowid aliases in an
+  UPSERT `SET` and in `RETURNING` resolve as in stock (bd-xrzce); generated columns that name
+  `rowid` or a qualified column, and CHECK constraints on unknown columns or on a WITHOUT ROWID
+  table's `rowid`, are refused at `CREATE TABLE` and `ADD COLUMN`, where they were accepted into a
+  schema stock cannot read (bd-kn6ah, bd-vtbcf, bd-wt3mn); RESTRICT and NO ACTION keys on
+  self-referencing rows no longer reject valid DELETEs and UPDATEs (bd-01rla); `CREATE INDEX` on
+  an FTS5 table reports `virtual tables may not be indexed` (bd-kld68); repeated result column
+  names of a derived table or view are renamed `x:1`, as in stock (bd-073qp, bd-84b60); an
+  unqualified `rowid` in a multi-table FROM resolves to a table's declared `rowid` column instead
+  of being ambiguous (bd-257yl); and the bare columns that come with `min(DISTINCT ...)` and
+  `max(DISTINCT ...)` are taken from the row stock picks (bd-d4lv6). The commit records
+  `trigger_fk_upsert_oracle_keepers` (37 tests) passing against rusqlite on host hz3, and no run
+  before the change.
+
+Extensions and virtual tables:
+
+- `ORDER BY bm25(docs)` and other FTS5 auxiliary calls in `ORDER BY` failed with
+  `internal error: column not found: docs` unless the same call was also a result column; they
+  now order the matches
+  ([52e2dc66c](https://github.com/Dicklesworthstone/frankensqlite/commit/52e2dc66c),
+  bd-reality-check-1022-llk6g.18). Still different from stock: `WHERE ft = 'q'` as a MATCH, the
+  table-valued form `FROM ft('q')`, and the `rank` configuration command.
+- An external-content FTS5 table returned NULL or empty text for its columns, both in a scan and
+  for `MATCH` hits, so `highlight()` and `snippet()` returned nothing
+  ([#211](https://github.com/Dicklesworthstone/frankensqlite/issues/211),
+  [6f0818e63](https://github.com/Dicklesworthstone/frankensqlite/commit/6f0818e63), bd-c6jre).
+  Columns are now read from the content table by name, as stock does: a full scan is a scan of the
+  content table, so `count(*)` counts its rows, and a missing content column fails with
+  `no such column: T.body`. After the content table is renamed or dropped, a full scan fails with
+  stock's `no such table`, but a `MATCH` that reads a column returns NULL for it where stock
+  fails, and a hit whose content row is gone also reads as NULL.
+- A virtual table whose module was registered again after reopening the file failed with
+  `no such table`; the schema reload that `register_module` arms now runs
+  ([#483](https://github.com/Dicklesworthstone/frankensqlite/issues/483),
+  [ef2b6bc96](https://github.com/Dicklesworthstone/frankensqlite/commit/ef2b6bc96),
+  bd-reality-check-1022-llk6g.10).
+- The geopoly functions are ported from `geopoly.c`
+  ([4d3a3fc02](https://github.com/Dicklesworthstone/frankensqlite/commit/4d3a3fc02),
+  bd-reality-check-1022-llk6g.28); 179 of the 196 statements in the commit's recorded stock run
+  differed before, and all match now. `geopoly_blob()` writes stock's blob header, so stock and
+  FrankenSQLite read each other's polygons; JSON input needs the closing vertex, and input that
+  is not a polygon gives NULL instead of an error; `geopoly_json()` and `geopoly_svg()` produce
+  stock's text; `geopoly_area()` is signed; `geopoly_overlap()` and `geopoly_within()` return
+  stock's codes instead of 0 or 1; and `geopoly_bbox`, `geopoly_contains_point`, `geopoly_xform`,
+  `geopoly_regular`, `geopoly_ccw`, `geopoly_debug` and the `geopoly_group_bbox` aggregate are
+  registered. Blobs that earlier versions' `geopoly_blob()` wrote carry the old header and now
+  read as not a polygon. The geopoly virtual table is not provided.
 
 B-tree:
 
@@ -172,6 +364,42 @@ B-tree:
 
 Files, WAL and durability:
 
+- **A read-only open of a WAL database whose `-wal` has no header and that has no `-shm` reads the
+  main file again ([#515](https://github.com/Dicklesworthstone/frankensqlite/issues/515);
+  [5083bd687](https://github.com/Dicklesworthstone/frankensqlite/commit/5083bd687),
+  [8f3f91644](https://github.com/Dicklesworthstone/frankensqlite/commit/8f3f91644),
+  bd-reality-check-1022-llk6g.30, bd-reality-check-1022-llk6g.20).** The contract for embedders,
+  unchanged since 0.4.12 (bd-yxqs9,
+  [8cc4796da](https://github.com/Dicklesworthstone/frankensqlite/commit/8cc4796da)): a `-wal`
+  shorter than its 32-byte header (zero bytes, as stock's `wal_checkpoint(TRUNCATE)` leaves it, or
+  a torn short file) is header-less and has no frames. Nothing can be appended to it until a
+  writable connection binds a new WAL generation, which writes the header and so changes the
+  `-wal` file; until then an append through a handle on it answers `BusyRecovery`
+  (`refuse_append_while_headerless`). A read-only open with a `-shm` present still binds such a
+  WAL header-less, for example under a live stock writer after `wal_checkpoint(TRUNCATE)`, and
+  sees that writer's later commits. What changed is only the read-only open
+  (`SQLITE_OPEN_READ_ONLY`) with no `-shm`, on native Unix with a file-backed VFS: it answered
+  `BusyRecovery` on every read, and it now reads the main file, as 0.4.10 and stock do, refuses
+  writes as read-only, creates no `-shm`, and leaves the main file and `-wal` unchanged
+  (5083bd687; its keeper failed on a018602fb with `database is busy (recovery in progress)`).
+  8f3f91644 opens the same shape when its files are mode 0444, where every open failed with
+  `Permission denied`. An embedder that refuses any change to the `-wal` during recovery, as
+  beads_rust does, still has no way to admit the header bind deliberately (the issue's third ask),
+  and GH#515 stays open.
+- A `-shm` that stock left uninitialized, either truncated to 3 bytes by a first attacher that
+  died before rebuilding it or extended but zero, made every plain read-only open answer
+  `BusyRecovery` forever; beads_rust read-only commands hit this
+  ([#528](https://github.com/Dicklesworthstone/frankensqlite/issues/528),
+  [0f338e1d8](https://github.com/Dicklesworthstone/frankensqlite/commit/0f338e1d8)). A read-only
+  open now rebuilds the WAL index in that `-shm` from the WAL, only while the index is
+  uninitialized and only under every recovery lock; it never creates a missing `-shm` and never
+  writes the WAL or the main file. If a peer publishes a valid index first it uses that one, and
+  while a live peer holds the WAL locks the open fails with the usual retryable busy error and
+  leaves the `-shm` alone. An initialized index that fails validation still answers
+  `BusyRecovery`. While a rebuild waits for the other connections of its process to finish (at
+  most 2 s), their new opens and transactions answer `Busy`. The commit's suites failed before the
+  change (6 of 8 core tests, on macOS arm64) and pass with it in three runs on macOS arm64 and on
+  Linux (trj).
 - A WAL-FEC sidecar mutation could report `Busy` although nothing was contending for the sidecar
   (GH#453). The mutation guard was released only by closing its lock descriptor, and a child
   process forked by another thread keeps a copy of that descriptor until its exec, so the lock
@@ -226,8 +454,9 @@ Files, WAL and durability:
   ([98f90882f](https://github.com/Dicklesworthstone/frankensqlite/commit/98f90882f)), which the
   tracker records as the fix for
   [#517](https://github.com/Dicklesworthstone/frankensqlite/issues/517). The commit was not
-  compiled, and the `-wal`, `-shm` and WAL-certificate sidecars still use the ambient umask
-  (bd-reality-check-1022-llk6g.29).
+  compiled, and the `-wal`, `-shm` and WAL-certificate sidecars used the ambient umask until
+  [97f4ae1b5](https://github.com/Dicklesworthstone/frankensqlite/commit/97f4ae1b5) (below;
+  bd-reality-check-1022-llk6g.29).
 - First-open migration repair requires its main and WAL backups and stops before any repair if they
   fail, repairs only on an explicit corruption verdict, reports a new `Incomplete` outcome instead
   of success when a stage fails, keeps checksummed (BLAKE3) backup generations across retries, and
@@ -240,6 +469,97 @@ Files, WAL and durability:
   [c9be23175](https://github.com/Dicklesworthstone/frankensqlite/commit/c9be23175),
   [8fab351ea](https://github.com/Dicklesworthstone/frankensqlite/commit/8fab351ea)). None of these
   commits was compiled when committed; their evidence is SQLite 3.46.1/POSIX reference probes.
+- A database file the process cannot write (mode 0444, another user's file, a read-only mount)
+  opens read-only, as with stock's `unixOpen`, instead of failing with
+  `I/O error: Permission denied`; reads work and writes fail with `SQLITE_READONLY`
+  ([5e188deea](https://github.com/Dicklesworthstone/frankensqlite/commit/5e188deea),
+  bd-reality-check-1022-llk6g.20). A WAL database with frames and no `-shm` opens this way too,
+  because rebuilding its WAL index no longer takes a write lock on the main file. Native Unix only.
+  A read-only WAL database with frames and a 0444 `-shm` still fails to open
+  (bd-reality-check-1022-llk6g.35).
+- `-wal`, `-journal` and `-shm` files, and the `-wal-cert` pair, are created with the database
+  file's mode and, for a root process, its owner, as stock's unix VFS does; they took the process
+  umask, so a 0600 database could get a 0644 WAL holding copies of its pages
+  ([97f4ae1b5](https://github.com/Dicklesworthstone/frankensqlite/commit/97f4ae1b5),
+  bd-reality-check-1022-llk6g.29). Delete-on-close files are created 0600.
+- On Linux and macOS the WAL peer probe opened and closed a temporary descriptor on the database
+  or its `-shm`, and closing it dropped every POSIX lock the process held on that file, including
+  the locks of a stock SQLite connection in the same process
+  ([#455](https://github.com/Dicklesworthstone/frankensqlite/issues/455),
+  [3eed2882f](https://github.com/Dicklesworthstone/frankensqlite/commit/3eed2882f),
+  bd-reality-check-1022-llk6g.9). The probe runs whenever another process holds the namespace
+  lease. It now keeps one descriptor per probed file open for the life of the process.
+- The `-wal-cert` sidecar gained one 156-byte record per WAL commit and never shrank (31.4 KB
+  after 200 commits, kept since the database was created), and past 4,096 records WAL-FEC replay
+  dropped every certificate. The first append after a WAL reset now truncates it, so it holds only
+  the current WAL generation's records
+  ([d2a752116](https://github.com/Dicklesworthstone/frankensqlite/commit/d2a752116),
+  bd-reality-check-1022-llk6g.32). A database switched to `journal_mode=DELETE` keeps one
+  generation's records until WAL mode is used again.
+- With default settings a file-backed autocommit loop never reset the WAL: the autocheckpoint was
+  PASSIVE, and past the 4,000-frame urgent threshold every commit ran a FULL checkpoint over the
+  whole WAL without resetting it, at about 10 ms per commit (353x stock at 10,000 inserts), while
+  the WAL kept growing (12.4 MB after 3,000 inserts)
+  ([#385](https://github.com/Dicklesworthstone/frankensqlite/issues/385),
+  [ea44754a4](https://github.com/Dicklesworthstone/frankensqlite/commit/ea44754a4),
+  bd-reality-check-1022-llk6g.7). The autocheckpoint now picks RESTART whenever few transactions
+  are active, waits for more frames after an attempt that left the WAL unreset, and never waits on
+  readers or writers. The commit's 9,000-insert keeper failed after 2,134 s with a 32.2 MB WAL
+  high-water mark before and passes in 7.3 s with 3 WAL resets.
+
+Connections, busy handling and cancellation:
+
+- With the default `busy_timeout` of 0, an autocommit SELECT on a WAL database could fail with
+  `database is busy` while another connection committed (139 of 33,091 reads with one writer and
+  four readers); stock's readers retry these races without the busy handler
+  ([#457](https://github.com/Dicklesworthstone/frankensqlite/issues/457),
+  [93dd2b5fe](https://github.com/Dicklesworthstone/frankensqlite/commit/93dd2b5fe),
+  bd-reality-check-1022-llk6g.23). The schema and row-mirror refreshes now rebind a newer
+  publication, up to 16 times, and WAL-index reader admission retries a torn header, busy slots
+  and moved marks at stock's pace, up to 100 times. The keeper saw no BUSY result in two runs
+  afterwards.
+- `Connection::query`, which the CLI uses, did not retry an autocommit INSERT, UPDATE or DELETE
+  that conflicted with a writer in another process, so with `busy_timeout=5000` it failed in about
+  90 ms with `database is busy (snapshot conflict on pages: 2)` (265 of 400 inserts from four
+  processes committed); it now retries within `busy_timeout`, as `execute()` already did
+  ([2433e21f6](https://github.com/Dicklesworthstone/frankensqlite/commit/2433e21f6),
+  bd-reality-check-1022-llk6g.5). Cross-process stalls remain: later runs of the same test file on
+  loaded Linux build hosts failed once after 211 s and once after 1,245 s
+  ([c15d0734a](https://github.com/Dicklesworthstone/frankensqlite/commit/c15d0734a)), and the
+  tracker records the fresh-connection shape committing 372 of 400 on `main` at 80ac75664
+  (bd-reality-check-1022-llk6g.5, open).
+- On a connection opened the way the `fsqlite` CLI opens it (a `RuntimeContext` built inside a
+  runtime), `ATTACH` and then `DETACH` made every later statement, and close, fail with
+  `callback requested query abort`
+  ([081606a58](https://github.com/Dicklesworthstone/frankensqlite/commit/081606a58),
+  bd-reality-check-1022-llk6g.2). Closing any connection cancelled the I/O context it shared with
+  the other connections on that context, and with `RuntimeContext::new_with_root_cx` it cancelled
+  the caller's own native context; neither happens now. DETACH closes the detached connection
+  properly, and a DETACH of a database that the open transaction uses fails with
+  `database aux is locked` and leaves it attached, as in stock.
+- Cancelling a busy wait
+  ([#524](https://github.com/Dicklesworthstone/frankensqlite/issues/524)): a test added in
+  [24499460e](https://github.com/Dicklesworthstone/frankensqlite/commit/24499460e) shows that on
+  v0.4.12 a cancelled `BEGIN IMMEDIATE`, autocommit INSERT or COMMIT waiting for a writer in
+  another process waited out its whole `busy_timeout` (10 s), and that `main` at ad5d47395
+  already ends all three promptly (not bisected). Later commits close further gaps: native and
+  namespace lock admission and every Unix WAL reader-slot retry observe the operation's
+  cancellation ([77e42b879](https://github.com/Dicklesworthstone/frankensqlite/commit/77e42b879));
+  bootstrap, transaction, prepare-refresh and autocommit retries do too, without giving up commit
+  settlement or rollback cleanup
+  ([d4e814928](https://github.com/Dicklesworthstone/frankensqlite/commit/d4e814928)); a cancelled
+  open, including an async open, stops in pager admission, schema initialization, first-open
+  migration or a nested ATTACH
+  ([d6492cbdf](https://github.com/Dicklesworthstone/frankensqlite/commit/d6492cbdf),
+  [b657719db](https://github.com/Dicklesworthstone/frankensqlite/commit/b657719db)); and the WAL
+  reader retry backoff is cancellable
+  ([6e8916b16](https://github.com/Dicklesworthstone/frankensqlite/commit/6e8916b16)).
+  Verification is partial: 77e42b879 and d4e814928 record local Linux runs (the WAL reader
+  regression returned `Busy` after 10 s before the fix; afterwards `migration_tests` passed 14
+  tests and the GH#524 test 6), but d4e814928's six new core unit tests did not run, b657719db was
+  not compiled natively, and d6492cbdf and 6e8916b16 ran only a few tests in isolated or non-native
+  builds. [0f338e1d8](https://github.com/Dicklesworthstone/frankensqlite/commit/0f338e1d8) later
+  built this tree on macOS arm64 and Linux for its own tests. GH#524 stays open.
 
 CLI:
 
@@ -251,6 +571,11 @@ CLI:
   with exit status 1 at the first failure, as `sqlite3 FILENAME SQL...` does; it used to fail with
   `too many positional arguments`
   ([5bd1fdc23](https://github.com/Dicklesworthstone/frankensqlite/commit/5bd1fdc23)).
+- The `fsqlite` shell draws `EXPLAIN QUERY PLAN` output as the stock shell does, as a tree under
+  `QUERY PLAN` in every output mode, where it printed the rows in the current mode (csv, line,
+  column, ...) ([3ef73bc95](https://github.com/Dicklesworthstone/frankensqlite/commit/3ef73bc95)).
+  The plan's content still comes from FrankenSQLite's own planner. The new shell tests compare
+  the output with the system `sqlite3` and pass; no run before the change is recorded.
 
 Build and platforms:
 
@@ -295,6 +620,88 @@ Build and platforms:
   ([#520](https://github.com/Dicklesworthstone/frankensqlite/issues/520),
   [6fb125a3d](https://github.com/Dicklesworthstone/frankensqlite/commit/6fb125a3d)). The commit was
   not run; the tracker records its two tests passing.
+- A join that leaves the streaming paths (a third source, a subquery source, a WHERE or ON
+  predicate, a computed aggregate) held every column of every source row; columns the statement
+  cannot name are now read as NULL, so an unreferenced wide column is no longer copied per row
+  ([#527](https://github.com/Dicklesworthstone/frankensqlite/issues/527),
+  [226bf9f03](https://github.com/Dicklesworthstone/frankensqlite/commit/226bf9f03)). Measured by
+  the commit with a release CLI on a 2.26 GB cass archive, peak RSS went from 6,832 to 4,491 MiB
+  for `total_messages` and from 4,082 to 1,184 MiB for `message_metrics JOIN messages` with
+  `SUM(CASE ...)`. Two-table joins with a WHERE or ON predicate are unchanged (3.9-4.5 GB on that
+  archive), because the rest is the in-memory row mirror, and GH#527 stays open. The commit
+  records its new test and 23 join, subquery, view and CTE suites passing through rch (host hz4),
+  and no run before the change.
+- DISTINCT aggregates over a table-valued source compared each value with every earlier distinct
+  value, so `select sum(distinct round(value/1.5)) from generate_series(1,50000)` took 2.8 s on
+  0.4.12 and four times as long for twice the rows; they now sort, keeping the same equality
+  classes and the first value of each in scan order
+  ([#529](https://github.com/Dicklesworthstone/frankensqlite/issues/529),
+  [07bc8b79e](https://github.com/Dicklesworthstone/frankensqlite/commit/07bc8b79e), bd-r0jkl). In
+  the commit's growth test on macOS arm64 debug builds, 5,000 and 40,000 rows took 0.93 s and
+  58.5 s before and 10.9 ms and 90.1 ms after;
+  [ccb0b05d5](https://github.com/Dicklesworthstone/frankensqlite/commit/ccb0b05d5) adds the
+  reported query itself to that test (growth ratio 51.9 on 6e8916b16, 8.0 after).
+  `min`/`max(DISTINCT)` bare-column tracking is still linear per row (bd-ma0e1).
+- `ORDER BY <index columns>, <rowid>` reads the index in order instead of scanning the table and
+  sorting it: `SELECT id FROM m INDEXED BY sqlite_autoindex_m_1 WHERE c = ?1 ORDER BY i, id
+  LIMIT ?2` with `UNIQUE(c, i)` and `id INTEGER PRIMARY KEY` read the whole table for every page
+  (cass measured 80.7 ms per 25-row page against 1.34 ms for `ORDER BY i`)
+  ([#523](https://github.com/Dicklesworthstone/frankensqlite/issues/523),
+  [fd1ef9c70](https://github.com/Dicklesworthstone/frankensqlite/commit/fd1ef9c70),
+  [bf64160f8](https://github.com/Dicklesworthstone/frankensqlite/commit/bf64160f8), bd-lolg7).
+  Every index entry of a rowid table ends with the rowid, ascending, so a last ORDER BY term naming
+  the rowid or its INTEGER PRIMARY KEY alias right after the index's key terms needs no sort, in
+  either walk direction, hinted or not. fd1ef9c70 recognised only a hidden rowid name and its
+  keeper failed on `main`; bf64160f8 adds the alias. bf64160f8 also makes an `INDEXED BY` index
+  that cannot give the ORDER BY still seek the WHERE equality and sort the matches, as stock does,
+  where the hint was dropped for a table scan. Its keeper failed its plan checks on f87ca8ff2 and
+  passes with the change on macOS arm64. The missing-index half of #523 already failed as stock
+  does.
+- An explicit COMMIT on a `:memory:` connection got slower as the database grew, even when it
+  changed one row, because the time-travel capture after it read every page; the capture now
+  reuses the previous image and re-reads only the commit's pages
+  ([#494](https://github.com/Dicklesworthstone/frankensqlite/issues/494),
+  [bf490d0f3](https://github.com/Dicklesworthstone/frankensqlite/commit/bf490d0f3)). In the
+  commit's release timing probe the mean commit stays at 28-63 µs through 1,400 rows, where it
+  reached 5.2 ms before, and with 8,192 unrelated rows the commit's p50 went from 34 ms to 0.1 ms.
+  A ROLLBACK (about 41 ms) and the first read after a COMMIT (about 42 ms) with 8,192 resident
+  rows are unchanged (bd-reality-check-1022-llk6g.24).
+- A multi-row `INSERT ... VALUES` into a table with a BEFORE or AFTER INSERT trigger replays its
+  rows through one compiled row program instead of dispatching each row as a separate single-row
+  statement ([#516](https://github.com/Dicklesworthstone/frankensqlite/issues/516),
+  [4a60d9f71](https://github.com/Dicklesworthstone/frankensqlite/commit/4a60d9f71)). No timing is
+  recorded. The commit records `gh516_returning_conformance` (4 tests, including the previously
+  ignored `returning_compiled_candidate_avoids_row_redispatch`) passing on host vmi1152480, and no
+  run before the change.
+- A non-UNIQUE index insert whose key sorts after the index's last key appends at the right edge
+  instead of seeking from the root, as UNIQUE inserts already did (BINARY collations and keys
+  without NULL only)
+  ([b226c8633](https://github.com/Dicklesworthstone/frankensqlite/commit/b226c8633),
+  bd-reality-check-1022-llk6g.8). Measured by the commit with a release CLI on a 1M-row table,
+  `CREATE INDEX` on a column in rowid order went from 4.57 s to 2.73 s and `INSERT ... SELECT` into
+  a table indexed on a rising column from 8.89 s to 7.45 s (stock: 0.26 s and 0.45 s); random,
+  duplicate-heavy and text keys are unchanged at 5.6-6.3 s. Its oracle keeper passes before and
+  after the change: it guards the append rather than reproducing a bug.
+- Read transactions kept copies of the pages they read up to the default 262,144-page allocation
+  pool rather than the cache budget, so read-only connections held page buffers far above
+  `cache_size` (GH#525 reports 676 MiB for four 64 MiB readers); retention is now capped at the
+  smaller of the cache budget and the page-buffer capacity, and a read-only transaction on a lone
+  connection retains none
+  ([#525](https://github.com/Dicklesworthstone/frankensqlite/issues/525),
+  [d39a460b6](https://github.com/Dicklesworthstone/frankensqlite/commit/d39a460b6)). Not compiled
+  when committed; no run of its five pager regressions or of the GH#525 oracles and memory
+  profiles added in
+  [82dcce30f](https://github.com/Dicklesworthstone/frankensqlite/commit/82dcce30f) and
+  [29e1c3090](https://github.com/Dicklesworthstone/frankensqlite/commit/29e1c3090) is recorded,
+  so there is no measured RSS change, and GH#525 stays open.
+- A BEFORE UPDATE trigger whose `WHEN` holds a correlated multi-column `EXISTS` sought only the
+  first column of the composite index and walked its duplicates, because `WHEN` binds OLD and NEW
+  as numbered parameters and the composite-prefix seek accepted only literals; numbered-parameter
+  equalities now use the whole prefix
+  ([#526](https://github.com/Dicklesworthstone/frankensqlite/issues/526),
+  [14c7f7a19](https://github.com/Dicklesworthstone/frankensqlite/commit/14c7f7a19)). Not compiled
+  or run when committed (memory and disk limits on the build host): no Rust test or benchmark ran,
+  no speedup is claimed, and GH#526 stays open.
 
 ### TypeScript SDK and worker
 
@@ -395,6 +802,16 @@ Added:
 - SQL: an unparenthesized `DEFAULT` expression with an operator, such as `DEFAULT 1 + 2`, is now a
   syntax error, as in stock
   ([770fe3048](https://github.com/Dicklesworthstone/frankensqlite/commit/770fe3048)).
+- **Source-incompatible:** in `fsqlite-ext-rtree`, `geopoly_contains_point`, `geopoly_overlap` and
+  `geopoly_within` return stock's `i64` codes instead of `bool`, and `geopoly_area` returns a
+  signed area ([4d3a3fc02](https://github.com/Dicklesworthstone/frankensqlite/commit/4d3a3fc02)).
+- **Source-incompatible:** `fsqlite_ast::CreateTriggerStatement` gains a public
+  `table_schema: Option<String>` field for `ON schema.table`; the struct is not
+  `#[non_exhaustive]`, so a struct literal needs the new field
+  ([4a60d9f71](https://github.com/Dicklesworthstone/frankensqlite/commit/4a60d9f71)).
+- The parser turns an `iif()` or `if()` call with two or more plain arguments into a searched
+  `CASE` expression, so an AST consumer sees `CASE` there instead of a function call
+  ([e0a15abb8](https://github.com/Dicklesworthstone/frankensqlite/commit/e0a15abb8)).
 - New Rust items: `fsqlite::wal_recovery` (feature `native`) re-exports the read-only frame-free WAL
   witnesses `inspect_frame_free_wal` and `verify_frame_free_wal_transition` for
   [#515](https://github.com/Dicklesworthstone/frankensqlite/issues/515)
@@ -418,6 +835,28 @@ Added:
   commits were not run when committed;
   [1cab6896d](https://github.com/Dicklesworthstone/frankensqlite/commit/1cab6896d) later ran the
   `frame_free` tests (6 passed).
+- More new Rust items: `Cx::set_shared_native_cx`
+  ([081606a58](https://github.com/Dicklesworthstone/frankensqlite/commit/081606a58)) and
+  `Cx::create_child_preserving_mask`, `Cx::local_cancel_relay` and `LocalCancelRelay`
+  ([d6492cbdf](https://github.com/Dicklesworthstone/frankensqlite/commit/d6492cbdf)) in
+  `fsqlite_types::cx`; `ConnectionEnv::with_bootstrap_cx` and `ConnectionEnv::bootstrap_cx` in
+  `fsqlite-core` ([b657719db](https://github.com/Dicklesworthstone/frankensqlite/commit/b657719db));
+  `ScalarFunction::result_subtype_varies`, `ScalarFunction::invoke_with_result_subtype` and
+  `AggregateFunction::result_subtype` in `fsqlite-func`, all with default implementations
+  ([a75995f59](https://github.com/Dicklesworthstone/frankensqlite/commit/a75995f59));
+  `Fts5Table::is_external_content`
+  ([ca48dd641](https://github.com/Dicklesworthstone/frankensqlite/commit/ca48dd641)); in
+  `fsqlite-ext-rtree`, seven new `Geopoly*Func` types, `geopoly_bbox_polygon` and
+  `geopoly_svg_with_attributes`
+  ([4d3a3fc02](https://github.com/Dicklesworthstone/frankensqlite/commit/4d3a3fc02)) and the
+  R-tree shadow-storage API (`RtreeShadowWrites`, `RtreeShadowRowChanges` and new
+  `RtreeVirtualTable` methods such as `take_shadow_writes`)
+  ([80ac75664](https://github.com/Dicklesworthstone/frankensqlite/commit/80ac75664));
+  `shared_wal_index_header_is_torn` and `shared_wal_index_header_is_uninitialized` in
+  `fsqlite-wal` ([93dd2b5fe](https://github.com/Dicklesworthstone/frankensqlite/commit/93dd2b5fe),
+  [0f338e1d8](https://github.com/Dicklesworthstone/frankensqlite/commit/0f338e1d8)); and
+  `BtCursor::last_index_insert_was_past_rightmost` in `fsqlite-btree`
+  ([b226c8633](https://github.com/Dicklesworthstone/frankensqlite/commit/b226c8633)).
 - `next_pending_batch` on the `fsqlite` compat changeset `OrderedDelivery` and `FanoutDelivery`
   types reads a bounded contiguous batch from one source snapshot
   ([bdb4db9db](https://github.com/Dicklesworthstone/frankensqlite/commit/bdb4db9db),
@@ -494,8 +933,12 @@ tests were corrected to target the real sync barriers, also without being run.
   ([757179e79](https://github.com/Dicklesworthstone/frankensqlite/commit/757179e79),
   [4c099d558](https://github.com/Dicklesworthstone/frankensqlite/commit/4c099d558),
   [f7fe9f331](https://github.com/Dicklesworthstone/frankensqlite/commit/f7fe9f331)) are stored under
-  `artifacts/` with their validation scripts and are not built into the engine; neither issue is
-  fixed.
+  `artifacts/` with their validation scripts and are not built into the engine; neither fixes its
+  issue. [4a60d9f71](https://github.com/Dicklesworthstone/frankensqlite/commit/4a60d9f71) later
+  built a compiled INSERT row executor for #516 into the engine (see Performance); the #494 patch
+  under `artifacts/gh494` stays unapplied, and
+  [bf490d0f3](https://github.com/Dicklesworthstone/frankensqlite/commit/bf490d0f3) addressed the
+  `:memory:` COMMIT cost instead.
 
 ---
 
@@ -610,7 +1053,12 @@ Files, WAL and durability:
   shipped alone as `fsqlite-vfs` 0.4.11.
 - A WAL that a stock writer truncated to zero bytes reads as a WAL with no frames, not as corrupt or
   as a recovery in progress (bd-yxqs9,
-  [8cc4796da](https://github.com/Dicklesworthstone/frankensqlite/commit/8cc4796da)).
+  [8cc4796da](https://github.com/Dicklesworthstone/frankensqlite/commit/8cc4796da)). Such a
+  header-less WAL needs a writable connection to bind a new header before anything can be appended
+  to it, and appends answer `BusyRecovery` until then; a read-only open of it with no `-shm`
+  answered `BusyRecovery` on every read in this release
+  ([#515](https://github.com/Dicklesworthstone/frankensqlite/issues/515); fixed on `main`, see the
+  Unreleased section).
 - Attaching WAL-FEC to a fully backfilled WAL creates no repair artifacts, so a read-only session
   no longer writes `-wal-fec` files (bd-xsxdz, GH#294,
   [0a87aedd2](https://github.com/Dicklesworthstone/frankensqlite/commit/0a87aedd2)). Close succeeds
