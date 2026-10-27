@@ -98850,12 +98850,17 @@ impl Connection {
         // substituted to literals upstream (bd-l3tce `substitute_outer_refs`),
         // so any surviving `Expr::Column` in a TVF argument is a same-level
         // lateral reference. Such sources skip pre-materialization here and are
-        // evaluated per-row inside the join loop instead.
+        // evaluated per-row inside the join loop instead. The join loop only
+        // binds joined sources, and the first source has no left sibling to
+        // read, so it always materializes here: skipping it for a subquery
+        // argument (`FROM json_each((SELECT tags FROM t))`) returned no rows.
         let lateral_tvf: Vec<bool> = all_sources
             .iter()
-            .map(|src| {
-                matches!(src, TableOrSubquery::TableFunction { args, .. }
-                    if args.iter().any(expr_references_any_column))
+            .enumerate()
+            .map(|(index, src)| {
+                index > 0
+                    && matches!(src, TableOrSubquery::TableFunction { args, .. }
+                        if args.iter().any(expr_references_any_column))
             })
             .collect();
         for (i, pre) in preloaded.iter_mut().enumerate() {
