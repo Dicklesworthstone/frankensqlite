@@ -3079,7 +3079,13 @@ still serves as an authoritative reference.
   ([#140](https://github.com/Dicklesworthstone/frankensqlite/issues/140),
   [#294](https://github.com/Dicklesworthstone/frankensqlite/issues/294), both
   fixed), and Windows no longer creates its `-lock-*` sidecars for read-only
-  access. Default read-write opens still create the namespace sidecars and
+  access. One exception keeps such a database readable: an existing `-shm`
+  whose WAL index was never initialized, such as the 3-byte file a stock
+  connection leaves when it dies between truncating and rebuilding it, is
+  rebuilt in place under every WAL recovery lock, as stock SQLite does
+  ([#528](https://github.com/Dicklesworthstone/frankensqlite/issues/528)).
+  An initialized index is never rewritten and a missing `-shm` is never
+  created. Default read-write opens still create the namespace sidecars and
   need a writable parent directory on first contact, and the close-time
   passive checkpoint writes only when it has real work. Opening from
   genuinely immutable/read-only media and rebinding a database copied to

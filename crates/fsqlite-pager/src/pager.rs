@@ -6580,6 +6580,46 @@ struct PagerMaintenanceState {
     /// remains armed; once every pre-existing transaction/opener drains, one
     /// surviving pager may adopt this receipt and run canonical recovery.
     orphaned_rollback_recovery: Option<OrphanedRollbackRecovery>,
+    /// GH#528: a read-only pager holds a [`WalIndexRebuildDrain`] and waits
+    /// to become the sole owner; new same-process admissions answer `Busy`.
+    wal_index_rebuild_draining: bool,
+}
+
+impl PagerMaintenanceState {
+    /// Whether a lease of `kind` is the only same-process maintenance holder.
+    const fn is_sole_owner(&self, kind: PagerMaintenanceLeaseKind) -> bool {
+        !self.maintenance_active
+            && match kind {
+                PagerMaintenanceLeaseKind::Open => {
+                    self.active_openers == 1 && self.active_transactions == 0
+                }
+                PagerMaintenanceLeaseKind::Transaction => {
+                    self.active_transactions == 1 && self.active_openers == 0
+                }
+                PagerMaintenanceLeaseKind::Exclusive => false,
+            }
+    }
+}
+
+/// Bound on how long a read-only pager drains same-process admissions before
+/// it rebuilds an uninitialized WAL index (GH#528). Counted openers fail fast
+/// once the drain is armed, so they leave within one admission attempt.
+const WAL_INDEX_REBUILD_DRAIN_BUDGET: Duration = Duration::from_secs(2);
+
+/// Clears [`PagerMaintenanceState::wal_index_rebuild_draining`] on every exit,
+/// including cancellation of the waiting rebuild.
+struct WalIndexRebuildDrain {
+    gate: Arc<PagerMaintenanceGate>,
+}
+
+impl Drop for WalIndexRebuildDrain {
+    fn drop(&mut self) {
+        self.gate
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .wal_index_rebuild_draining = false;
+    }
 }
 
 #[derive(Debug, Default)]
@@ -6762,7 +6802,7 @@ impl PagerMaintenanceGate {
         if self.rollback_recovery_pending() {
             return Err(FrankenError::BusyRecovery);
         }
-        if state.maintenance_active {
+        if state.maintenance_active || state.wal_index_rebuild_draining {
             return Err(FrankenError::Busy);
         }
         state.active_openers = state.active_openers.saturating_add(1);
@@ -6772,6 +6812,23 @@ impl PagerMaintenanceGate {
             kind: PagerMaintenanceLeaseKind::Open,
             counted_snapshot: false,
             exclusive_upgrade_prior: None,
+        })
+    }
+
+    /// GH#528: arm the drain for one read-only rebuild of an uninitialized
+    /// WAL index. A drain or exclusive maintenance already in progress may
+    /// publish that index itself, so a second claimant answers at once.
+    fn begin_wal_index_rebuild_drain(self: &Arc<Self>) -> Result<WalIndexRebuildDrain> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| FrankenError::internal("pager maintenance gate poisoned"))?;
+        if state.wal_index_rebuild_draining || state.maintenance_active {
+            return Err(FrankenError::BusyRecovery);
+        }
+        state.wal_index_rebuild_draining = true;
+        Ok(WalIndexRebuildDrain {
+            gate: Arc::clone(self),
         })
     }
 
@@ -6785,7 +6842,7 @@ impl PagerMaintenanceGate {
             .state
             .lock()
             .map_err(|_| FrankenError::internal("pager maintenance gate poisoned"))?;
-        if state.maintenance_active {
+        if state.maintenance_active || state.wal_index_rebuild_draining {
             return Err(FrankenError::Busy);
         }
 
@@ -6867,7 +6924,7 @@ impl PagerMaintenanceGate {
             );
             return Err(FrankenError::BusyRecovery);
         }
-        if state.maintenance_active {
+        if state.maintenance_active || state.wal_index_rebuild_draining {
             return Err(FrankenError::Busy);
         }
         state.active_transactions = state.active_transactions.saturating_add(1);
@@ -6949,13 +7006,8 @@ impl PagerMaintenanceLease {
         }
         let prior = self.kind;
         let sole_owner = match prior {
-            PagerMaintenanceLeaseKind::Open => {
-                state.active_openers == 1 && state.active_transactions == 0
-            }
-            PagerMaintenanceLeaseKind::Transaction => {
-                state.active_transactions == 1 && state.active_openers == 0
-            }
             PagerMaintenanceLeaseKind::Exclusive => return Ok(prior),
+            kind => state.is_sole_owner(kind),
         };
         if !sole_owner {
             // bd-b4mwn round 5: name the silent refusal — recovery-requiring
@@ -7032,6 +7084,37 @@ impl PagerMaintenanceLease {
         self.kind = prior;
         self.exclusive_upgrade_prior = None;
         Ok(())
+    }
+
+    /// GH#528: under the caller's [`WalIndexRebuildDrain`], wait until
+    /// [`Self::upgrade_to_exclusive`] would find this lease the sole owner.
+    /// The drain only lets counts fall, so the wait ends once the counted
+    /// peers fail their own attempts; a peer that outlives the budget leaves
+    /// the rebuild to a later attempt.
+    async fn wait_until_sole_owner(&self, cx: &Cx) -> Result<()> {
+        let deadline = Instant::now() + WAL_INDEX_REBUILD_DRAIN_BUDGET;
+        let mut pause = Duration::from_micros(50);
+        loop {
+            {
+                let state = self
+                    .gate
+                    .state
+                    .lock()
+                    .map_err(|_| FrankenError::internal("pager maintenance gate poisoned"))?;
+                if state.is_sole_owner(self.kind) {
+                    return Ok(());
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(FrankenError::BusyRecovery);
+            }
+            await_pager_admission(
+                cx,
+                asupersync::time::sleep(asupersync::time::wall_now(), pause),
+            )
+            .await?;
+            pause = pause.saturating_mul(2).min(Duration::from_millis(5));
+        }
     }
 }
 
@@ -18589,6 +18672,48 @@ where
         Ok(outcome)
     }
 
+    /// Whether this pager's `-shm` exists; read-only opens never create it.
+    fn wal_index_shm_exists(&self, cx: &Cx) -> Result<bool> {
+        let mut shm_path = self.db_path.as_os_str().to_owned();
+        shm_path.push("-shm");
+        self.vfs.access(cx, Path::new(&shm_path), AccessFlags::EXISTS)
+    }
+
+    /// GH#528: classify the shared index for a pager that may rebuild only an
+    /// uninitialized one. The answer is authoritative only while the caller
+    /// holds every recovery fence, so no peer can publish, truncate, or read
+    /// through the index meanwhile. `false` means a peer published a valid
+    /// header first. An initialized header that fails validation stays
+    /// fail-closed.
+    async fn wal_index_is_uninitialized(
+        &self,
+        cx: &Cx,
+        inner: &PagerInner<V::File>,
+    ) -> Result<bool> {
+        use fsqlite_wal::wal_index::{
+            read_shared_wal_index_header, shared_wal_index_header_is_uninitialized,
+        };
+        let source = WalIndexShmSource {
+            db_file: Arc::clone(&inner.db_file),
+            cleanup_queue: Arc::downgrade(&self.group_commit_queue),
+            can_publish_reader_marks: false,
+        };
+        let region = match source.map_region(cx, 0, false).await {
+            Ok(region) => region,
+            // Shorter than one region, like stock's 3-byte first-attacher
+            // marker: nothing was ever published there.
+            Err(FrankenError::CannotOpen { .. }) => return Ok(true),
+            Err(error) => return Err(error),
+        };
+        if read_shared_wal_index_header(&region)?.is_some() {
+            return Ok(false);
+        }
+        if shared_wal_index_header_is_uninitialized(&region)? {
+            return Ok(true);
+        }
+        Err(FrankenError::BusyRecovery)
+    }
+
     /// Retire the whole reader attempt before a separately classified recovery.
     async fn prepare_runtime_native_reader(
         &self,
@@ -18614,25 +18739,64 @@ where
                 traits::WalNativeReadOutcome::Ready => return Ok(()),
                 traits::WalNativeReadOutcome::RecoveryRequired(reason) => reason,
             };
-            if inner.access_mode == PagerAccessMode::ReadOnly || recovered_once {
-                // A stale-marks index never clears for a pager that may not
-                // rebuild it; answer like SQLITE_READONLY_RECOVERY instead of a
-                // retryable busy that callers spin on forever (GH#430).
-                if inner.access_mode == PagerAccessMode::ReadOnly
-                    && reason == traits::WalNativeRecoveryReason::StaleReaderMarks
-                {
-                    return Err(FrankenError::ReadOnly);
-                }
+            let read_only = inner.access_mode == PagerAccessMode::ReadOnly;
+            // A stale-marks index never clears for a pager that may not
+            // rebuild it; answer like SQLITE_READONLY_RECOVERY instead of a
+            // retryable busy that callers spin on forever (GH#430).
+            if read_only && reason == traits::WalNativeRecoveryReason::StaleReaderMarks {
+                return Err(FrankenError::ReadOnly);
+            }
+            // GH#528: a stock first attacher truncates `-shm` to 3 bytes and
+            // rebuilds it later, so one that dies in between leaves an index
+            // nobody initialized, which a pager that may not rebuild it can
+            // never read. A plain read-only pager therefore rebuilds an
+            // existing index found uninitialized under every recovery fence,
+            // as stock does from any connection that can write `-shm`. It
+            // never creates a missing `-shm` or rewrites an initialized index.
+            let uninitialized_only = read_only
+                && matches!(
+                    reason,
+                    traits::WalNativeRecoveryReason::SharedIndexUnavailable
+                        | traits::WalNativeRecoveryReason::SharedHeaderInvalid
+                );
+            if recovered_once || (read_only && !uninitialized_only) {
                 return Err(FrankenError::BusyRecovery);
             }
+            if uninitialized_only {
+                if !self.wal_index_shm_exists(cx)? {
+                    return Err(FrankenError::BusyRecovery);
+                }
+                // Unlocked, this only turns an initialized index that fails
+                // validation away before peers are drained; the fenced check
+                // below settles the classification.
+                self.wal_index_is_uninitialized(cx, inner).await?;
+            }
             external_lock.restore().await?;
+            // Recovery needs sole same-process ownership, which openers that
+            // each wait for it while counted never reach. A read-only rebuild
+            // drains instead: new admissions answer `Busy`, counted peers fail
+            // their own attempts, and the drain ends after the downgrade.
+            let rebuild_drain = if uninitialized_only {
+                let drain = maintenance_lease.gate.begin_wal_index_rebuild_drain()?;
+                maintenance_lease.wait_until_sole_owner(cx).await?;
+                Some(drain)
+            } else {
+                None
+            };
             let recovery_guard = self.recovery_fence.acquire_for_recovery()?;
             let prior_kind = maintenance_lease.upgrade_to_exclusive(inner.rollback_journal_recovery_owner)?;
             let acquisition = external_lock.acquire_wal_recovery(cx).await;
-            let recovery_result = match acquisition {
-                Ok(()) => with_wal_backend(&self.wal_backend, cx, |wal, cx| {
+            let rebuild = match acquisition {
+                Ok(()) if uninitialized_only => self.wal_index_is_uninitialized(cx, inner).await,
+                Ok(()) => Ok(true),
+                Err(error) => Err(error),
+            };
+            let recovery_result = match rebuild {
+                Ok(true) => with_wal_backend(&self.wal_backend, cx, |wal, cx| {
                     Box::pin(async move { wal.recover_native_read_state(cx, reason).await })
                 }).await,
+                // A peer published a valid index first; rebind to it.
+                Ok(false) => Ok(()),
                 Err(error) => Err(error),
             };
             if let Err(restore_error) = external_lock.restore().await {
@@ -18657,6 +18821,7 @@ where
             }
             drop(cleanup_mask);
             drop(recovery_guard);
+            drop(rebuild_drain);
             external_lock.acquire_snapshot(cx).await?;
             self.validate_namespace_binding_locked(inner)?;
             let journal_path = Self::journal_path(&self.db_path);
@@ -37179,6 +37344,79 @@ mod tests {
             retained.recovery_state,
             RollbackJournalRecoveryState::ReplayPending
         ));
+    }
+
+    /// GH#528: same-process openers that each need sole ownership to rebuild
+    /// an uninitialized WAL index never get it while all stay counted. The
+    /// read-only rebuilder's drain admits no new lease, refuses a second
+    /// claimant, and waits exactly until the counted peers leave; a cancelled
+    /// rebuild readmits peers.
+    #[test]
+    fn gh528_wal_index_rebuild_drain_waits_out_counted_peers() {
+        use fsqlite_types::cx::CancelReason;
+
+        asupersync::test_utils::run_test(|| async {
+            let gate = Arc::new(PagerMaintenanceGate::default());
+            let mut rebuilder = gate.enter_open().unwrap();
+            let peer_open = gate.enter_open().unwrap();
+            let peer_txn = gate.enter_transaction().unwrap();
+            assert!(matches!(
+                rebuilder.upgrade_to_exclusive(None),
+                Err(FrankenError::BusyRecovery)
+            ));
+
+            let drain = gate.begin_wal_index_rebuild_drain().unwrap();
+            assert!(matches!(gate.enter_open(), Err(FrankenError::Busy)));
+            assert!(matches!(gate.enter_transaction(), Err(FrankenError::Busy)));
+            assert!(matches!(
+                gate.enter_readwrite_open_for_orphan_recovery(),
+                Err(FrankenError::Busy)
+            ));
+            assert!(matches!(
+                gate.begin_wal_index_rebuild_drain(),
+                Err(FrankenError::BusyRecovery)
+            ));
+
+            let left = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let leaving = Arc::clone(&left);
+            let peers = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(20));
+                leaving.store(true, AtomicOrdering::Release);
+                drop(peer_open);
+                drop(peer_txn);
+            });
+            rebuilder.wait_until_sole_owner(&Cx::new()).await.unwrap();
+            assert!(
+                left.load(AtomicOrdering::Acquire),
+                "the wait must outlast every counted peer"
+            );
+            peers.join().unwrap();
+            let prior = rebuilder.upgrade_to_exclusive(None).unwrap();
+            assert!(matches!(prior, PagerMaintenanceLeaseKind::Open));
+            rebuilder.downgrade_from_exclusive(prior).unwrap();
+            drop(drain);
+            drop(gate.enter_open().unwrap());
+
+            let peer = gate.enter_open().unwrap();
+            let root = Cx::new();
+            let (operation, relay) = root.create_child_with_local_cancel_relay();
+            assert!(relay.cancel_local(CancelReason::UserInterrupt));
+            let cancelled = async {
+                let _drain = gate.begin_wal_index_rebuild_drain()?;
+                rebuilder.wait_until_sole_owner(&operation).await
+            }
+            .await;
+            assert!(matches!(cancelled, Err(FrankenError::Abort)));
+            assert!(
+                !gate
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .wal_index_rebuild_draining
+            );
+            drop(gate.enter_open().unwrap());
+            drop(peer);
+        });
     }
 
     /// bd-6xjma (persistent ownership survives Drop): a recovery-open

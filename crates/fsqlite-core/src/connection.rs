@@ -15483,7 +15483,8 @@ impl Connection {
     /// Open an existing database read-only, explicitly allowing reconstruction
     /// of its derived WAL index under the native recovery locks.
     ///
-    /// Unlike [`Self::open_schema_only`], this may modify the SHM sidecar when
+    /// [`Self::open_schema_only`] rebuilds only an existing SHM index that was
+    /// never initialized (GH#528). This may also modify the SHM sidecar when
     /// its publication is missing, invalid, or belongs to an older WAL
     /// generation. It does not authorize database/WAL writes, checkpoints,
     /// rollback-journal recovery, or SQL writes. A live conflicting owner
