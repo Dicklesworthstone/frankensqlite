@@ -7,7 +7,7 @@
 //! - JSON path extraction with SQLite-like single vs multi-path semantics (`json_extract`)
 //! - JSON value constructors and aggregates (`json_quote`, `json_array`, `json_object`,
 //!   `json_group_array`, `json_group_object`)
-//! - mutators (`json_set`, `json_insert`, `json_replace`, `json_remove`, `json_patch`)
+//! - mutators (`json_set`, `json_insert`, `json_array_insert`, `json_replace`, `json_remove`, `json_patch`)
 //! - formatting and diagnostics (`json_pretty`, `json_error_position`, `json_array_length`)
 //!
 //! Path support in this slice:
@@ -1152,6 +1152,33 @@ pub fn json_insert(input: &str, pairs: &[(&str, SqliteValue)]) -> Result<String>
 pub fn jsonb_insert(input: &str, pairs: &[(&str, SqliteValue)]) -> Result<Vec<u8>> {
     let root = parse_json_text(input)?;
     let edited = edit_json_paths_value(&root, pairs, EditMode::Insert)?;
+    encode_jsonb_root(&edited)
+}
+
+/// Insert values before array elements named by PATH.
+///
+/// Unlike `json_insert`, the final path component must identify an array
+/// position. An index equal to the array length appends; an index beyond the
+/// end is a no-op. Missing object parents may be created when the eventual
+/// target is an array position.
+pub fn json_array_insert(input: &str, pairs: &[(&str, SqliteValue)]) -> Result<String> {
+    let root = parse_json_text(input)?;
+    let mut edited = root;
+    for (path, value) in pairs {
+        let segments = parse_path(path)?;
+        apply_array_insert(&mut edited, &segments, sqlite_to_json(value)?, path)?;
+    }
+    encode_json_text("json_array_insert encode failed", &edited)
+}
+
+/// JSONB variant of `json_array_insert`.
+pub fn jsonb_array_insert(input: &str, pairs: &[(&str, SqliteValue)]) -> Result<Vec<u8>> {
+    let root = parse_json_text(input)?;
+    let mut edited = root;
+    for (path, value) in pairs {
+        let segments = parse_path(path)?;
+        apply_array_insert(&mut edited, &segments, sqlite_to_json(value)?, path)?;
+    }
     encode_jsonb_root(&edited)
 }
 
@@ -2664,6 +2691,190 @@ fn write_pretty_value(value: &Value, indent: &str, depth: usize, out: &mut Strin
     }
 }
 
+fn not_an_array_element(path: &str) -> FrankenError {
+    FrankenError::function_error(format!(
+        "not an array element: '{}'",
+        path.replace('\'', "''")
+    ))
+}
+
+fn array_insert_scaffold(next: Option<&PathSegment>) -> Value {
+    match next {
+        Some(PathSegment::Index(_) | PathSegment::Append | PathSegment::FromEnd(_)) => {
+            Value::Array(Vec::new())
+        }
+        _ => Value::Object(Map::new()),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArrayInsertOutcome {
+    Applied,
+    Noop,
+}
+
+fn apply_array_insert(
+    root: &mut Value,
+    segments: &[PathSegment],
+    new_value: Value,
+    path: &str,
+) -> Result<()> {
+    if segments.is_empty() || !matches!(root, Value::Object(_) | Value::Array(_)) {
+        return Ok(());
+    }
+
+    let original = root.clone();
+    match apply_array_insert_inner(root, segments, new_value, path)? {
+        ArrayInsertOutcome::Applied => Ok(()),
+        ArrayInsertOutcome::Noop => {
+            // Parent scaffolding is speculative. Stock leaves the document
+            // unchanged when a later segment cannot be reached.
+            *root = original;
+            Ok(())
+        }
+    }
+}
+
+fn apply_array_insert_inner(
+    cursor: &mut Value,
+    segments: &[PathSegment],
+    new_value: Value,
+    path: &str,
+) -> Result<ArrayInsertOutcome> {
+    let Some((segment, rest)) = segments.split_first() else {
+        return Ok(ArrayInsertOutcome::Noop);
+    };
+
+    if rest.is_empty() {
+        return match segment {
+            PathSegment::Key(_) => {
+                if matches!(cursor, Value::Object(_)) {
+                    Err(not_an_array_element(path))
+                } else {
+                    Ok(ArrayInsertOutcome::Noop)
+                }
+            }
+            PathSegment::Index(index) => {
+                let Value::Array(array) = cursor else {
+                    return Ok(ArrayInsertOutcome::Noop);
+                };
+                if *index > array.len() {
+                    return Ok(ArrayInsertOutcome::Noop);
+                }
+                array.insert(*index, new_value);
+                Ok(ArrayInsertOutcome::Applied)
+            }
+            PathSegment::Append => {
+                let Value::Array(array) = cursor else {
+                    return Ok(ArrayInsertOutcome::Noop);
+                };
+                array.push(new_value);
+                Ok(ArrayInsertOutcome::Applied)
+            }
+            PathSegment::FromEnd(from_end) => {
+                let Value::Array(array) = cursor else {
+                    return Ok(ArrayInsertOutcome::Noop);
+                };
+                if *from_end == 0 {
+                    array.push(new_value);
+                    return Ok(ArrayInsertOutcome::Applied);
+                }
+                if *from_end > array.len() {
+                    return Ok(ArrayInsertOutcome::Noop);
+                }
+                let index = array.len() - *from_end;
+                array.insert(index, new_value);
+                Ok(ArrayInsertOutcome::Applied)
+            }
+        };
+    }
+
+    let next = rest.first();
+    match segment {
+        PathSegment::Key(key) => {
+            let Value::Object(object) = cursor else {
+                return Ok(ArrayInsertOutcome::Noop);
+            };
+            if !object.contains_key(key.as_ref()) {
+                object.insert(key.to_string(), array_insert_scaffold(next));
+            }
+            let child = object
+                .get_mut(key.as_ref())
+                .expect("array-insert parent was present or just created");
+            // Existing NULL/scalar parents are not rewritten. This is a
+            // deliberate difference from json_insert/json_set.
+            if !matches!(child, Value::Object(_) | Value::Array(_)) {
+                return Ok(ArrayInsertOutcome::Noop);
+            }
+            apply_array_insert_inner(child, rest, new_value, path)
+        }
+        PathSegment::Index(index) => {
+            let Value::Array(array) = cursor else {
+                return Ok(ArrayInsertOutcome::Noop);
+            };
+            if *index > array.len() {
+                return Ok(ArrayInsertOutcome::Noop);
+            }
+            if *index == array.len() {
+                array.push(array_insert_scaffold(next));
+            }
+            let child = array
+                .get_mut(*index)
+                .expect("array-insert index was present or just appended");
+            if !matches!(child, Value::Object(_) | Value::Array(_)) {
+                return Ok(ArrayInsertOutcome::Noop);
+            }
+            apply_array_insert_inner(child, rest, new_value, path)
+        }
+        PathSegment::Append => {
+            let Value::Array(array) = cursor else {
+                return Ok(ArrayInsertOutcome::Noop);
+            };
+            array.push(array_insert_scaffold(next));
+            let child = array.last_mut().expect("array-insert scaffold appended");
+            apply_array_insert_inner(child, rest, new_value, path)
+        }
+        PathSegment::FromEnd(from_end) => {
+            let Value::Array(array) = cursor else {
+                return Ok(ArrayInsertOutcome::Noop);
+            };
+            if *from_end == 0 || *from_end > array.len() {
+                return Ok(ArrayInsertOutcome::Noop);
+            }
+            let index = array.len() - *from_end;
+            let child = array.get_mut(index).expect("array-insert index checked");
+            if !matches!(child, Value::Object(_) | Value::Array(_)) {
+                return Ok(ArrayInsertOutcome::Noop);
+            }
+            apply_array_insert_inner(child, rest, new_value, path)
+        }
+    }
+}
+
+fn edit_json_array_insert_with_subtypes(
+    name: &str,
+    input: &Value,
+    args: &[SqliteValue],
+    arg_subtypes: &[u32],
+    start: usize,
+) -> Result<Value> {
+    let mut edited = input.clone();
+    let mut idx = start;
+    while idx + 1 < args.len() {
+        if args[idx].is_null() {
+            idx += 2;
+            continue;
+        }
+        let path = path_arg(name, args, idx)?;
+        let segments = parse_path(path)?;
+        let subtype = arg_subtypes.get(idx + 1).copied().unwrap_or(0);
+        let replacement = sqlite_to_json_with_subtype(&args[idx + 1], subtype)?;
+        apply_array_insert(&mut edited, &segments, replacement, path)?;
+        idx += 2;
+    }
+    Ok(edited)
+}
+
 fn apply_edit(root: &mut Value, segments: &[PathSegment], new_value: Value, mode: EditMode) {
     if segments.is_empty() {
         match mode {
@@ -3850,6 +4061,102 @@ impl ScalarFunction for JsonbInsertFunc {
     }
 }
 
+pub struct JsonArrayInsertFunc;
+
+impl ScalarFunction for JsonArrayInsertFunc {
+    fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        if args.is_empty() {
+            return Ok(SqliteValue::Null);
+        }
+        check_edit_arity(self.name(), args)?;
+        if matches!(args[0], SqliteValue::Null) {
+            return Ok(SqliteValue::Null);
+        }
+        let input = json_arg_value(self.name(), args, 0)?;
+        let edited = edit_json_array_insert_with_subtypes(self.name(), &input, args, &[], 1)?;
+        Ok(SqliteValue::Text(
+            encode_json_text("json_array_insert encode failed", &edited)?.into(),
+        ))
+    }
+
+    fn invoke_with_arg_subtypes(
+        &self,
+        args: &[SqliteValue],
+        arg_subtypes: &[u32],
+    ) -> Result<SqliteValue> {
+        if args.is_empty() {
+            return Ok(SqliteValue::Null);
+        }
+        check_edit_arity(self.name(), args)?;
+        if matches!(args[0], SqliteValue::Null) {
+            return Ok(SqliteValue::Null);
+        }
+        let input = json_arg_value(self.name(), args, 0)?;
+        let edited =
+            edit_json_array_insert_with_subtypes(self.name(), &input, args, arg_subtypes, 1)?;
+        Ok(SqliteValue::Text(
+            encode_json_text("json_array_insert encode failed", &edited)?.into(),
+        ))
+    }
+
+    fn num_args(&self) -> i32 {
+        -1
+    }
+
+    fn name(&self) -> &'static str {
+        "json_array_insert"
+    }
+
+    fn result_subtype(&self) -> Option<u32> {
+        Some(JSON_SUBTYPE)
+    }
+}
+
+pub struct JsonbArrayInsertFunc;
+
+impl ScalarFunction for JsonbArrayInsertFunc {
+    fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        if args.is_empty() {
+            return Ok(SqliteValue::Null);
+        }
+        check_edit_arity(self.name(), args)?;
+        if matches!(args[0], SqliteValue::Null) {
+            return Ok(SqliteValue::Null);
+        }
+        let input = json_arg_value(self.name(), args, 0)?;
+        let edited = edit_json_array_insert_with_subtypes(self.name(), &input, args, &[], 1)?;
+        let blob = encode_jsonb_root(&edited)?;
+        Ok(SqliteValue::Blob(Arc::from(blob.as_slice())))
+    }
+
+    fn invoke_with_arg_subtypes(
+        &self,
+        args: &[SqliteValue],
+        arg_subtypes: &[u32],
+    ) -> Result<SqliteValue> {
+        if args.is_empty() {
+            return Ok(SqliteValue::Null);
+        }
+        check_edit_arity(self.name(), args)?;
+        if matches!(args[0], SqliteValue::Null) {
+            return Ok(SqliteValue::Null);
+        }
+        let input = json_arg_value(self.name(), args, 0)?;
+        let edited =
+            edit_json_array_insert_with_subtypes(self.name(), &input, args, arg_subtypes, 1)?;
+        let blob = encode_jsonb_root(&edited)?;
+        Ok(SqliteValue::Blob(Arc::from(blob.as_slice())))
+    }
+
+    fn num_args(&self) -> i32 {
+        -1
+    }
+
+    fn name(&self) -> &'static str {
+        "jsonb_array_insert"
+    }
+}
+
 pub struct JsonReplaceFunc;
 
 impl ScalarFunction for JsonReplaceFunc {
@@ -4434,6 +4741,8 @@ pub fn register_json_scalars(registry: &mut FunctionRegistry) {
     registry.register_scalar(JsonbSetFunc);
     registry.register_scalar(JsonInsertFunc);
     registry.register_scalar(JsonbInsertFunc);
+    registry.register_scalar(JsonArrayInsertFunc);
+    registry.register_scalar(JsonbArrayInsertFunc);
     registry.register_scalar(JsonReplaceFunc);
     registry.register_scalar(JsonbReplaceFunc);
     registry.register_scalar(JsonRemoveFunc);
@@ -4796,6 +5105,8 @@ mod tests {
             "->>",
             "json_set",
             "jsonb_set",
+            "json_array_insert",
+            "jsonb_array_insert",
             "json_remove",
             "jsonb_remove",
             "json_array",
@@ -5377,6 +5688,82 @@ mod tests {
             ])
             .expect("json_double_arrow should normalize integer indexes");
         assert_eq!(out, SqliteValue::Integer(20));
+    }
+
+    #[test]
+    fn test_json_array_insert_stock_semantics_bd_5ul61() {
+        let t = |s: &str| SqliteValue::Text(SmallText::from_string(s.to_owned()));
+        let func = JsonArrayInsertFunc;
+
+        let invoke = |args: Vec<SqliteValue>| -> SqliteValue {
+            func.invoke(&args).expect("json_array_insert succeeds")
+        };
+
+        assert_eq!(
+            invoke(vec![t("[1,2]"), t("$[1]"), SqliteValue::Integer(9)]),
+            t("[1,9,2]")
+        );
+        assert_eq!(
+            invoke(vec![t("[1,2]"), t("$[2]"), SqliteValue::Integer(9)]),
+            t("[1,2,9]")
+        );
+        assert_eq!(
+            invoke(vec![t("[1,2]"), t("$[3]"), SqliteValue::Integer(9)]),
+            t("[1,2]")
+        );
+        assert_eq!(
+            invoke(vec![t("[1,2]"), t("$"), SqliteValue::Integer(9)]),
+            t("[1,2]")
+        );
+        assert_eq!(
+            invoke(vec![
+                t("[1,2]"),
+                SqliteValue::Null,
+                SqliteValue::Integer(9)
+            ]),
+            t("[1,2]")
+        );
+        assert_eq!(
+            invoke(vec![t("{}"), t("$.a[0]"), SqliteValue::Integer(9)]),
+            t(r#"{"a":[9]}"#)
+        );
+        assert_eq!(
+            invoke(vec![
+                t(r#"{"a":1}"#),
+                t("$.a.b"),
+                SqliteValue::Integer(9)
+            ]),
+            t(r#"{"a":1}"#)
+        );
+
+        let error = func
+            .invoke(&[t("{}"), t("$.a"), SqliteValue::Integer(9)])
+            .expect_err("terminal object label must be rejected");
+        assert!(
+            error.to_string().contains("not an array element: '$.a'"),
+            "unexpected error: {error}"
+        );
+
+        let embedded = func
+            .invoke_with_arg_subtypes(
+                &[t("[]"), t("$[0]"), t("[2,3]")],
+                &[0, 0, JSON_SUBTYPE],
+            )
+            .unwrap();
+        assert_eq!(embedded, t("[[2,3]]"));
+    }
+
+    #[test]
+    fn test_jsonb_array_insert_returns_jsonb_bd_5ul61() {
+        let t = |s: &str| SqliteValue::Text(SmallText::from_string(s.to_owned()));
+        let func = JsonbArrayInsertFunc;
+        let SqliteValue::Blob(blob) = func
+            .invoke(&[t("[1,2]"), t("$[1]"), SqliteValue::Integer(9)])
+            .unwrap()
+        else {
+            panic!("jsonb_array_insert must return a BLOB");
+        };
+        assert_eq!(json_from_jsonb(&blob).unwrap(), "[1,9,2]");
     }
 
     #[test]
