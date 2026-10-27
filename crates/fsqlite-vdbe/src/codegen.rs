@@ -4280,12 +4280,16 @@ pub fn codegen_select(
                             index: forced_idx.clone(),
                             descending: false,
                             equality_prefix_len: 0,
-                            covering_output: resolve_covering_output_sources(
-                                columns,
-                                table,
-                                table_alias,
-                                forced_idx,
-                            ),
+                            covering_output: if where_clause.is_none() {
+                                resolve_covering_output_sources(
+                                    columns,
+                                    table,
+                                    table_alias,
+                                    forced_idx,
+                                )
+                            } else {
+                                None
+                            },
                         };
                         return codegen_select_index_ordered_scan(
                             b,
@@ -4954,12 +4958,16 @@ pub fn codegen_select(
             index: forced_idx.clone(),
             descending: false,
             equality_prefix_len: 0,
-            covering_output: resolve_covering_output_sources(
-                columns,
-                table,
-                table_alias,
-                forced_idx,
-            ),
+            covering_output: if where_clause.is_none() {
+                resolve_covering_output_sources(
+                    columns,
+                    table,
+                    table_alias,
+                    forced_idx,
+                )
+            } else {
+                None
+            },
         };
         codegen_select_index_ordered_scan(
             b,
@@ -9695,7 +9703,7 @@ fn codegen_select_index_ordered_scan(
     explicit_prefix: Option<&[&Expr]>,
 ) -> Result<(), CodegenError> {
     let index_cursor = cursor + 1;
-    let needs_table_lookup = index_plan.covering_output.is_none() || where_clause.is_some();
+    let needs_table_lookup = index_plan.covering_output.is_none();
     let where_placeholder_base = b.current_anon_placeholder();
     let equality_prefix_exprs = if let Some(targets) = explicit_prefix {
         targets.to_vec()
@@ -9842,7 +9850,9 @@ fn codegen_select_index_ordered_scan(
         }
     }
 
-    if let Some(where_expr) = where_clause {
+    if needs_table_lookup
+        && let Some(where_expr) = where_clause
+    {
         b.set_next_anon_placeholder(where_placeholder_base);
         emit_where_filter(b, where_expr, cursor, table, table_alias, schema, skip_row);
     }
@@ -33660,7 +33670,7 @@ fn literal_exists_index_prefix<'a, 's>(
             let target = terms.iter().find_map(|term| {
                 let Expr::BinaryOp {
                     left,
-                    op: BinaryOp::Eq | BinaryOp::Is,
+                    op: op @ (BinaryOp::Eq | BinaryOp::Is),
                     right,
                     ..
                 } = term else {
@@ -33673,9 +33683,24 @@ fn literal_exists_index_prefix<'a, 's>(
                 } else {
                     return None;
                 };
-                (matches!(target, Expr::Literal(
-                    Literal::Integer(_) | Literal::Float(_)
-                        | Literal::String(_) | Literal::Blob(_), _))
+                // bd-ry6x7 / GH#526: a numbered parameter under `=` qualifies too;
+                // `codegen_select_index_ordered_scan` exits on NULL and coerces the
+                // parameter to the comparison affinity before seeking.
+                let target_admitted = matches!(
+                    target,
+                    Expr::Literal(
+                        Literal::Integer(_)
+                            | Literal::Float(_)
+                            | Literal::String(_)
+                            | Literal::Blob(_),
+                        _
+                    )
+                ) || (*op == BinaryOp::Eq
+                    && matches!(
+                        target,
+                        Expr::Placeholder(fsqlite_ast::PlaceholderType::Numbered(_), _)
+                    ));
+                (target_admitted
                     && index_range_bound_is_seek_safe(table, table_alias, schema, column, target))
                     .then_some(target)
             });
@@ -34081,13 +34106,15 @@ fn resolve_order_by_index_plan(
         {
             return None;
         }
-        if table.resolves_to_hidden_rowid(&col_ref.column) {
+        let is_rowid = table.resolves_to_hidden_rowid(&col_ref.column);
+        if is_rowid && table.without_rowid {
             return None;
         }
         order_columns.push((
             col_ref.column.to_string(),
             term_direction,
             column_collation(resolved_expr, table, table_alias),
+            is_rowid,
         ));
     }
 
@@ -34107,24 +34134,25 @@ fn resolve_order_by_index_plan(
         // `codegen_select_index_ordered_scan` applies), so it pins a key term only when the
         // comparison's own collation, explicit COLLATE included, is the index term's:
         // `k = 'v' COLLATE NOCASE` cannot seek a BINARY index. Later terms stay residual.
-        let equality_prefix_len =
-            extract_index_equality_prefix_exprs(index, table, table_alias, where_clause)
-                .iter()
-                .zip(&index.columns)
-                .enumerate()
-                .take_while(|(key_pos, (expr, column))| {
-                    let comparison =
-                        resolved_index_range_comparison(table, table_alias, schema, column, expr);
-                    let comparison_collation = match &comparison.collation_p4 {
-                        P4::Collation(name) => Some(name.as_str()),
-                        _ => None,
-                    };
-                    collation_names_equivalent(
-                        comparison_collation,
-                        index.key_term_collation(*key_pos),
-                    )
-                })
-                .count();
+        let prefix_exprs =
+            extract_index_equality_prefix_exprs(index, table, table_alias, where_clause);
+        let equality_prefix_len = prefix_exprs
+            .iter()
+            .zip(&index.columns)
+            .enumerate()
+            .take_while(|(key_pos, (expr, column))| {
+                let comparison =
+                    resolved_index_range_comparison(table, table_alias, schema, column, expr);
+                let comparison_collation = match &comparison.collation_p4 {
+                    P4::Collation(name) => Some(name.as_str()),
+                    _ => None,
+                };
+                collation_names_equivalent(
+                    comparison_collation,
+                    index.key_term_collation(*key_pos),
+                )
+            })
+            .count();
 
         // Equality probes and ORDER BY must agree with the index's collation.
         // In particular, a NOCASE index cannot prove that a BINARY equality
@@ -34149,8 +34177,9 @@ fn resolve_order_by_index_plan(
             .iter()
             .zip(index.columns.iter().take(equality_prefix_len))
             .enumerate()
-            .take_while(|(key_pos, ((order_col, _, order_collation), index_col))| {
-                order_col.eq_ignore_ascii_case(index_col)
+            .take_while(|(key_pos, ((order_col, _, order_collation, is_rowid), index_col))| {
+                !*is_rowid
+                    && order_col.eq_ignore_ascii_case(index_col)
                     && collation_names_equivalent(
                         *order_collation,
                         index.key_term_collation(*key_pos),
@@ -34159,31 +34188,45 @@ fn resolve_order_by_index_plan(
             .count();
         let variable_order = &order_columns[fixed_order_prefix_len..];
 
-        if equality_prefix_len + variable_order.len() > index.key_term_count() {
+        let max_order_terms = index.key_term_count() + usize::from(!table.without_rowid);
+        if equality_prefix_len + variable_order.len() > max_order_terms {
             continue;
         }
 
         let mut traversal_descending = None;
         let matches_order_columns = variable_order.iter().enumerate().all(
-            |(offset, (order_col, term_direction, order_collation))| {
+            |(offset, (order_col, term_direction, order_collation, is_rowid))| {
                 let key_pos = equality_prefix_len + offset;
-                if !index.columns[key_pos].eq_ignore_ascii_case(order_col)
-                    || !collation_names_equivalent(
-                        *order_collation,
-                        index.key_term_collation(key_pos),
-                    )
-                {
-                    return false;
-                }
+                let forward_direction = if *is_rowid {
+                    // GH#523: every secondary index on a rowid table terminates
+                    // its key with the table rowid in ascending order. Once all
+                    // declared index key columns are covered by the equality
+                    // prefix + variable ORDER BY terms, a trailing rowid/IPK
+                    // ORDER BY term is satisfied by the index's stored order.
+                    if table.without_rowid || key_pos != index.key_term_count() {
+                        return false;
+                    }
+                    SortDirection::Asc
+                } else {
+                    if key_pos >= index.key_term_count()
+                        || !index.columns[key_pos].eq_ignore_ascii_case(order_col)
+                        || !collation_names_equivalent(
+                            *order_collation,
+                            index.key_term_collation(key_pos),
+                        )
+                    {
+                        return false;
+                    }
+                    if index.key_term_descending(key_pos) {
+                        SortDirection::Desc
+                    } else {
+                        SortDirection::Asc
+                    }
+                };
 
                 // A forward index walk follows each key term's declared
                 // direction; a reverse walk flips every term. All variable
                 // ORDER BY terms must therefore agree on one traversal.
-                let forward_direction = if index.key_term_descending(key_pos) {
-                    SortDirection::Desc
-                } else {
-                    SortDirection::Asc
-                };
                 let reverse = *term_direction != forward_direction;
                 if traversal_descending.is_some_and(|existing| existing != reverse) {
                     return false;
@@ -34197,7 +34240,42 @@ fn resolve_order_by_index_plan(
         }
         let descending = traversal_descending.unwrap_or(false);
 
-        let covering_output = if where_clause.is_none() {
+        let where_covered_by_prefix = !table.without_rowid
+            && equality_prefix_len > 0
+            && where_clause.is_some_and(|where_expr| {
+                let mut conjuncts = Vec::new();
+                collect_conjunctive_terms(where_expr, &mut conjuncts);
+                conjuncts.len() == equality_prefix_len
+                    && (0..equality_prefix_len).all(|key_pos| {
+                        let col_name = &index.columns[key_pos];
+                        let expr = prefix_exprs[key_pos];
+                        !index.key_term_descending(key_pos)
+                            && index
+                                .key_term_collation(key_pos)
+                                .is_none_or(|c| c.eq_ignore_ascii_case("BINARY"))
+                            && table
+                                .column_index(col_name)
+                                .and_then(|idx| table.columns.get(idx))
+                                .is_some_and(|col| {
+                                    matches!(col.affinity, 'D' | 'B' | 'A')
+                                        && col
+                                            .collation
+                                            .as_deref()
+                                            .is_none_or(|c| c.eq_ignore_ascii_case("BINARY"))
+                                })
+                            && index_range_bound_is_seek_safe(
+                                table,
+                                table_alias,
+                                schema,
+                                col_name,
+                                expr,
+                            )
+                            && ((key_pos + 1)..equality_prefix_len).all(|other_pos| {
+                                !col_name.eq_ignore_ascii_case(&index.columns[other_pos])
+                            })
+                    })
+            });
+        let covering_output = if where_clause.is_none() || where_covered_by_prefix {
             resolve_covering_output_sources(columns, table, table_alias, index)
         } else {
             None

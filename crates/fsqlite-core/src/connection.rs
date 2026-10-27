@@ -51821,7 +51821,8 @@ impl Connection {
                     select,
                     SubqueryCollationUse::Scalar,
                     &collation_registry,
-                )
+                )?;
+                self.validate_select_index_hints(select)
             }
             Statement::Insert(insert) => {
                 if let InsertSource::Select(select) = &insert.source {
@@ -51844,6 +51845,7 @@ impl Connection {
                         SubqueryCollationUse::Scalar,
                         &collation_registry,
                     )?;
+                    self.validate_select_index_hints(select)?;
                 }
                 Ok(())
             }
@@ -51866,6 +51868,7 @@ impl Connection {
                         SubqueryCollationUse::Scalar,
                         &collation_registry,
                     )?;
+                    self.validate_select_index_hints(select)?;
                 }
                 Ok(())
             }

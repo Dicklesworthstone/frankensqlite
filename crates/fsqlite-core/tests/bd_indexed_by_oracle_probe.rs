@@ -212,3 +212,175 @@ fn gh381_composite_equality_prefix_serves_order_by_without_sorter() {
         f.close().await.expect("close FrankenSQLite GH#381 oracle");
     });
 }
+
+#[test]
+fn gh523_indexed_by_order_by_trailing_rowid_and_missing_hint() {
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        for sql in [
+            "CREATE TABLE m(id INTEGER PRIMARY KEY, c INTEGER, i INTEGER, t TEXT, UNIQUE(c, i))",
+            "INSERT INTO m VALUES (1, 10, 3, 'a'), (2, 10, 1, 'b'), (3, 10, 2, 'c'), (4, 20, 1, 'd')",
+        ] {
+            ex(&f, &r, sql).await;
+        }
+
+        let query = "SELECT id FROM m INDEXED BY sqlite_autoindex_m_1 WHERE c = ?1 ORDER BY i, id LIMIT ?2";
+        let eqp = fq(&f, &format!("EXPLAIN QUERY PLAN {query}")).await;
+        let eqp_text = eqp
+            .iter()
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            eqp_text.contains("SEARCH m USING COVERING INDEX sqlite_autoindex_m_1 (c=?)"),
+            "GH#523: expected covering index search without sorter, got {eqp:?}"
+        );
+        assert!(
+            !eqp_text.contains("TEMP B-TREE"),
+            "GH#523: trailing rowid ORDER BY term must not add a sorter, got {eqp:?}"
+        );
+
+        let stmt = f.prepare(query).await.unwrap();
+        let rows = stmt
+            .query_with_params(&[
+                fsqlite_types::value::SqliteValue::Integer(10),
+                fsqlite_types::value::SqliteValue::Integer(2),
+            ])
+            .await
+            .unwrap();
+        let ids: Vec<i64> = rows
+            .iter()
+            .map(|row| match row.values()[0] {
+                fsqlite_types::value::SqliteValue::Integer(v) => v,
+                ref other => panic!("expected integer id, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(ids, vec![2, 3]);
+
+        // Part 2: missing hinted index must fail at prepare/query_with_params/query
+        // in both ORDER BY i and ORDER BY i, id shapes.
+        f.execute("CREATE TABLE u(id INTEGER PRIMARY KEY, c INTEGER, i INTEGER, t TEXT)")
+            .await
+            .unwrap();
+        for bad_sql in [
+            "SELECT id FROM u INDEXED BY sqlite_autoindex_u_1 WHERE c = ?1 ORDER BY i LIMIT ?2",
+            "SELECT id FROM u INDEXED BY sqlite_autoindex_u_1 WHERE c = ?1 ORDER BY i, id LIMIT ?2",
+        ] {
+            let prep_err = match f.prepare(bad_sql).await {
+                Ok(_) => panic!("prepare must reject missing INDEXED BY for {bad_sql}"),
+                Err(err) => err,
+            };
+            assert!(
+                prep_err.to_string().contains("no such index: sqlite_autoindex_u_1"),
+                "expected no such index error on prepare for {bad_sql}, got {prep_err:?}"
+            );
+            let qwp_err = f
+                .query_with_params(
+                    bad_sql,
+                    &[
+                        fsqlite_types::value::SqliteValue::Integer(10),
+                        fsqlite_types::value::SqliteValue::Integer(2),
+                    ],
+                )
+                .await
+                .expect_err("query_with_params must reject missing INDEXED BY");
+            assert!(
+                qwp_err.to_string().contains("no such index: sqlite_autoindex_u_1"),
+                "expected no such index error on query_with_params for {bad_sql}, got {qwp_err:?}"
+            );
+        }
+
+        f.close().await.expect("close FrankenSQLite GH#523 oracle");
+    });
+}
+
+#[test]
+fn gh526_before_update_trigger_when_correlated_exists_prefix_seek() {
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        for sql in [
+            "CREATE TABLE t (
+                id TEXT PRIMARY KEY,
+                c1 TEXT NOT NULL, c2 TEXT NOT NULL, c3 TEXT NOT NULL, c4 TEXT NOT NULL,
+                c5 TEXT, c6 TEXT, c7 TEXT, c8 TEXT NOT NULL,
+                c9 TEXT, c10 TEXT, c11 INTEGER, c12 TEXT, c13 TEXT, c14 TEXT, c15 TEXT
+            )",
+            "CREATE INDEX x1 ON t (c3, c4, c8 DESC, c1)",
+            "CREATE INDEX x2 ON t (c1, c8 DESC)",
+            "CREATE TRIGGER trg_when BEFORE UPDATE ON t
+             WHEN EXISTS (
+                 SELECT 1 FROM t AS v
+                 WHERE v.id IS NOT OLD.id AND v.c14 IS NOT NULL
+                   AND v.c1 = NEW.c1 AND v.c2 = NEW.c2 AND v.c3 = NEW.c3 AND v.c4 = NEW.c4
+                   AND v.c5 IS NEW.c5 AND v.c6 IS NEW.c6 AND v.c7 IS NEW.c7
+                   AND v.c8 = NEW.c8
+                   AND v.c9 IS NEW.c9 AND v.c10 IS NEW.c10 AND v.c11 IS NEW.c11
+                   AND v.c12 IS NEW.c12 AND v.c13 IS NEW.c13
+                 ORDER BY v.c3, v.c4, v.c8 DESC LIMIT 1
+             )
+             BEGIN
+                 SELECT RAISE(ABORT, 'dup');
+             END",
+        ] {
+            f.execute(sql).await.unwrap();
+        }
+
+        f.execute("BEGIN").await.unwrap();
+        let insert = f
+            .prepare(
+                "INSERT INTO t VALUES (?1,'s1','p1','us-gaap',?2,'U','FY','10-K',?3,'f1','2025-02-01',0,'main',NULL,?4,'r1')",
+            )
+            .await
+            .unwrap();
+        for i in 0..2_000_i64 {
+            insert
+                .execute_with_params(&[
+                    fsqlite_types::value::SqliteValue::Text(format!("id{i}").into()),
+                    fsqlite_types::value::SqliteValue::Text(format!("tag{}", i % 200).into()),
+                    fsqlite_types::value::SqliteValue::Text(format!("2024-12-{:02}", (i % 28) + 1).into()),
+                    fsqlite_types::value::SqliteValue::Text(format!("h{i}").into()),
+                ])
+                .await
+                .unwrap();
+        }
+        f.execute("COMMIT").await.unwrap();
+
+        let started = std::time::Instant::now();
+        f.execute("BEGIN").await.unwrap();
+        let update = f
+            .prepare("UPDATE t SET c14 = ?1 WHERE id = ?2")
+            .await
+            .unwrap();
+        for i in 0..64_i64 {
+            update
+                .execute_with_params(&[
+                    fsqlite_types::value::SqliteValue::Text(format!("nh{i}").into()),
+                    fsqlite_types::value::SqliteValue::Text(format!("id{i}").into()),
+                ])
+                .await
+                .unwrap();
+        }
+        f.execute("COMMIT").await.unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "GH#526: BEFORE UPDATE WHEN EXISTS took {elapsed:?} for 64 updates over 2,000 rows"
+        );
+
+        // Also verify duplicate detection still triggers RAISE(ABORT, 'dup') with SQLITE_CONSTRAINT_TRIGGER.
+        f.execute("INSERT INTO t VALUES ('dup1','s1','p1','us-gaap','tag0','U','FY','10-K','2024-12-01','f1','2025-02-01',0,'main',NULL,NULL,'r1')")
+            .await
+            .unwrap();
+        let err = f
+            .execute("UPDATE t SET c14 = 'h_dup' WHERE id = 'dup1'")
+            .await
+            .expect_err("duplicate update must fire BEFORE UPDATE WHEN EXISTS trigger");
+        assert_eq!(err.to_string(), "dup");
+        assert_eq!(err.error_code(), fsqlite_error::ErrorCode::Constraint);
+        assert_eq!(err.extended_error_code(), 19 | (7 << 8));
+
+        f.close().await.expect("close FrankenSQLite GH#526 oracle");
+    });
+}
