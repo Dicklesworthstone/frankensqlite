@@ -3072,14 +3072,9 @@ fn resolve_parent_for_edit<'a>(
         });
         match segment {
             PathSegment::Key(key) => {
-                if cursor.is_null() {
-                    if matches!(mode, EditMode::Set | EditMode::Insert) {
-                        *cursor = Value::Object(Map::new());
-                    } else {
-                        return None;
-                    }
-                }
-
+                // An existing JSON null is a real value, not a missing path
+                // component. Stock json_set/json_insert never replace it with
+                // a container merely to continue descending (bd-8ouj3).
                 let object = match cursor {
                     Value::Object(o) => o,
                     _ => return None,
@@ -3096,13 +3091,8 @@ fn resolve_parent_for_edit<'a>(
                     .expect("just inserted or checked");
             }
             PathSegment::Index(index) => {
-                if cursor.is_null() {
-                    if matches!(mode, EditMode::Set | EditMode::Insert) {
-                        *cursor = Value::Array(Vec::new());
-                    } else {
-                        return None;
-                    }
-                }
+                // Preserve an existing JSON null instead of treating it as an
+                // absent array that may be scaffolded (bd-8ouj3).
                 let array = match cursor {
                     Value::Array(a) => a,
                     _ => return None,
@@ -3119,13 +3109,7 @@ fn resolve_parent_for_edit<'a>(
                 cursor = array.get_mut(*index).expect("just pushed or checked");
             }
             PathSegment::Append => {
-                if cursor.is_null() {
-                    if matches!(mode, EditMode::Set | EditMode::Insert) {
-                        *cursor = Value::Array(Vec::new());
-                    } else {
-                        return None;
-                    }
-                }
+                // Existing JSON null is not an implicit empty array.
                 let array = match cursor {
                     Value::Array(a) => a,
                     _ => return None,
@@ -6342,6 +6326,60 @@ mod tests {
     fn test_json_set_existing_null_value_with_array_path_is_noop() {
         let out = json_set(r#"{"a":null}"#, &[("$.a[1]", SqliteValue::Integer(1))]).unwrap();
         assert_eq!(out, r#"{"a":null}"#);
+    }
+
+    #[test]
+    fn test_json_edits_do_not_descend_through_existing_null_bd_8ouj3() {
+        let cases = [
+            (r#"{"a":null}"#, "$.a.b.c", r#"{"a":null}"#),
+            ("[null]", "$[0][0][0]", "[null]"),
+            (r#"{"a":null}"#, "$.a[0].c", r#"{"a":null}"#),
+            (r#"{"a":{"b":null}}"#, "$.a.b[0]", r#"{"a":{"b":null}}"#),
+        ];
+
+        for (input, path, expected) in cases {
+            assert_eq!(
+                json_set(input, &[(path, SqliteValue::Integer(1))]).unwrap(),
+                expected,
+                "json_set path {path}"
+            );
+            assert_eq!(
+                json_insert(input, &[(path, SqliteValue::Integer(1))]).unwrap(),
+                expected,
+                "json_insert path {path}"
+            );
+            assert_eq!(
+                json_replace(input, &[(path, SqliteValue::Integer(1))]).unwrap(),
+                expected,
+                "json_replace path {path}"
+            );
+
+            for output in [
+                jsonb_set(input, &[(path, SqliteValue::Integer(1))]).unwrap(),
+                jsonb_insert(input, &[(path, SqliteValue::Integer(1))]).unwrap(),
+                jsonb_replace(input, &[(path, SqliteValue::Integer(1))]).unwrap(),
+            ] {
+                assert_eq!(
+                    json_from_jsonb(&output).unwrap(),
+                    expected,
+                    "JSONB edit path {path}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_json_edits_still_scaffold_missing_path_bd_8ouj3() {
+        // Negative control: only an *existing* JSON null blocks traversal.
+        // Truly missing parents still scaffold exactly as before.
+        assert_eq!(
+            json_set("{}", &[("$.a.b", SqliteValue::Integer(1))]).unwrap(),
+            r#"{"a":{"b":1}}"#
+        );
+        assert_eq!(
+            json_insert("{}", &[("$.a[0]", SqliteValue::Integer(1))]).unwrap(),
+            r#"{"a":[1]}"#
+        );
     }
 
     #[test]
