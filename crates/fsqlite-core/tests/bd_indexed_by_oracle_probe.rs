@@ -334,11 +334,14 @@ fn gh526_before_update_trigger_when_correlated_exists_prefix_seek() {
             )
             .await
             .unwrap();
+        // bd-kwar3: one tag per row. With `i % 200` tags, rows i and i + 1400
+        // agreed on every compared column, so the first UPDATE raised 'dup'
+        // (stock does too) before the timing bound was ever reached.
         for i in 0..2_000_i64 {
             insert
                 .execute_with_params(&[
                     fsqlite_types::value::SqliteValue::Text(format!("id{i}").into()),
-                    fsqlite_types::value::SqliteValue::Text(format!("tag{}", i % 200).into()),
+                    fsqlite_types::value::SqliteValue::Text(format!("tag{i}").into()),
                     fsqlite_types::value::SqliteValue::Text(format!("2024-12-{:02}", (i % 28) + 1).into()),
                     fsqlite_types::value::SqliteValue::Text(format!("h{i}").into()),
                 ])
