@@ -233,6 +233,20 @@ async fn timed_distinct_aggregates(conn: &Connection, n: u64) -> Duration {
     elapsed
 }
 
+/// The issue's own query, a lone `sum(DISTINCT round(value/1.5))`.
+async fn timed_issue_query(conn: &Connection, n: u64) -> Duration {
+    let sql = format!("SELECT sum(DISTINCT round(value/1.5)) FROM generate_series(1, {n})");
+    // round(k/1.5) is (2k + 1) / 3 in integer division and rises by at most
+    // one per row, so the distinct values are 1..=m.
+    let m = (2 * n + 1) / 3;
+    let expected = format!("{}.0", m * (m + 1) / 2);
+    let started = Instant::now();
+    let rows = conn.query(&sql).await.unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(rows[0].values()[0].to_text(), expected, "n = {n}");
+    elapsed
+}
+
 #[test]
 fn distinct_aggregate_cost_grows_with_input_not_its_square() {
     asupersync::test_utils::run_test(|| async {
@@ -240,23 +254,30 @@ fn distinct_aggregate_cost_grows_with_input_not_its_square() {
         // 8x the rows: about 8x the time when deduplication sorts, 64x when it
         // scans every earlier value. Best of three absorbs scheduler noise.
         let (small, large) = (5_000, 40_000);
-        let mut best = [Duration::MAX; 2];
+        let mut best = [[Duration::MAX; 2]; 2];
         for _ in 0..3 {
             for (slot, n) in [small, large].into_iter().enumerate() {
-                best[slot] = best[slot].min(timed_distinct_aggregates(&conn, n).await);
+                best[0][slot] = best[0][slot].min(timed_distinct_aggregates(&conn, n).await);
+                best[1][slot] = best[1][slot].min(timed_issue_query(&conn, n).await);
             }
         }
-        let ratio = best[1].as_secs_f64() / best[0].as_secs_f64().max(1e-6);
-        eprintln!(
-            "GH529 best n={small}: {:?}, n={large}: {:?}, ratio {ratio:.1}",
-            best[0], best[1]
-        );
+        let superlinear: Vec<String> = ["six aggregates", "issue query"]
+            .iter()
+            .zip(best)
+            .filter_map(|(shape, [small_best, large_best])| {
+                let ratio = large_best.as_secs_f64() / small_best.as_secs_f64().max(1e-6);
+                eprintln!(
+                    "GH529 {shape} best n={small}: {small_best:?}, n={large}: {large_best:?}, \
+                     ratio {ratio:.1}"
+                );
+                (ratio >= 24.0).then(|| {
+                    format!("{shape}: 8x the rows cost {ratio:.1}x the time")
+                })
+            })
+            .collect();
         assert!(
-            ratio < 24.0,
-            "8x the rows cost {ratio:.1}x the time ({:?} -> {:?}): DISTINCT deduplication is \
-             superlinear",
-            best[0],
-            best[1]
+            superlinear.is_empty(),
+            "DISTINCT deduplication is superlinear: {superlinear:?}"
         );
     });
 }
