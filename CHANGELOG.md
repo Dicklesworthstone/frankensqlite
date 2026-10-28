@@ -23,7 +23,7 @@ Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releas
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| [Unreleased](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.4.12...main) | HEAD | 2026-10-27 | Development on `main` after v0.4.12, with **data-integrity fixes**: an unparenthesized column `DEFAULT` swallowed a following NOT NULL or COLLATE, also on stock-created schemas; an FTS5 external-content `rebuild` after a content-table rename erased the index, and such a table lost its postings on its first write after a reopen (GH#211); concurrent writers could commit duplicate implicit rowids (bd-ujp0h, bd-2ym3z); triggers fired by a cascade skipped FK checks, and an FK action skipped by `RAISE(IGNORE)` left orphan rows (bd-vcvn0); R-tree tables were not written in stock's file format. Plus GH#509, GH#511, GH#512, GH#448, GH#521, GH#523, GH#526 (measured), GH#528 and GH#529 fixes, `json_each` over NULL input and table-valued functions listed before the table they read, contended checkpoints that failed with BusyRecovery, read-only opens of a header-less WAL without `-shm` (GH#515) and of unwritable files, WAL resets by the autocheckpoint (GH#385), join memory bounds (GH#527), candidate fixes for GH#510, GH#519 and GH#506 (macOS) that were not run when committed and for GH#524 and GH#525 that were not fully built or run, large-commit memory bounds (GH#518), stable-Rust build work (GH#522; releases through v0.4.12 still need nightly), the source-incompatible `MigrationOutcome::Incomplete` and geopoly return types, and ordered batch replication in the TypeScript SDK. Many commits record no compile or test run |
+| [Unreleased](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.4.12...main) | HEAD | 2026-10-27 | Development on `main` after v0.4.12, with **data-integrity fixes**: an unparenthesized column `DEFAULT` swallowed a following NOT NULL or COLLATE, also on stock-created schemas; an FTS5 external-content `rebuild` after a content-table rename erased the index, and such a table lost its postings on its first write after a reopen (GH#211); concurrent writers could commit duplicate implicit rowids (bd-ujp0h, bd-2ym3z); triggers fired by a cascade skipped FK checks, and an FK action skipped by `RAISE(IGNORE)` left orphan rows (bd-vcvn0); R-tree tables were not written in stock's file format. Plus GH#509, GH#511, GH#512, GH#448, GH#521, GH#523, GH#526 (measured), GH#528 and GH#529 fixes, `json_each` over NULL input and table-valued functions listed before the table they read, stock's JSON error texts, `json_array_insert` and the jsonb_ aggregates, the JSON aggregates as window functions and with `->` arguments, contended checkpoints that failed with BusyRecovery, read-only opens of a header-less WAL without `-shm` (GH#515) and of unwritable files, WAL resets by the autocheckpoint (GH#385), join memory bounds (GH#527), candidate fixes for GH#510, GH#519 and GH#506 (macOS) that were not run when committed and for GH#524 and GH#525 that were not fully built or run, large-commit memory bounds (GH#518), stable-Rust build work (GH#522; releases through v0.4.12 still need nightly), the source-incompatible `MigrationOutcome::Incomplete` and geopoly return types, and ordered batch replication in the TypeScript SDK. Many commits record no compile or test run |
 | [v0.4.12](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.4.12) | Release | 2026-10-13 | Uniform release of all 26 public crates, with an **upgrade advisory for 0.4.10**: a join whose outer table was read through an index with a `DESC` column returned no rows (GH#502); `:memory:` with `autocommit_retain = OFF` could lose every row of a table (GH#503); `DELETE ... WHERE EXISTS` over the same table deleted the wrong rows (bd-ntt2b). Plus FROM-less row-value comparisons (GH#450), attached-database DML and name resolution, conflict-clause and constraint parity, a full filesystem during WAL-index growth reported as an I/O error instead of a SIGBUS on Linux (GH#506), WAL-FEC attach/close fixes, and index seeks for `IN` lists and `WHERE k = ? ORDER BY id` |
 | [0.4.11](https://crates.io/crates/fsqlite-vfs/0.4.11) | crates.io only | 2026-10-09 | `fsqlite-vfs` alone: on macOS and other non-Linux Unix, a redundant main-DB descriptor opened while WAL lifetime locks were held is reused instead of parked forever, so long-running processes stop leaking about 2 fds per fresh connection (bd-l0rbc). Tag `fsqlite-vfs-v0.4.11`; no GitHub Release. The next uniform release must be >= 0.4.12 |
 | [v0.4.10](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.4.10) | Release | 2026-10-07 | Uniform release of all 26 public crates, with a **data-integrity advisory**: inserts inside a transaction could silently corrupt a table b-tree (bd-obwsy); UPDATE ... FROM lost or repeated updates (bd-b5j26); non-integer rowid / INTEGER PRIMARY KEY values left malformed index entries (REINDEX); a REPLACE constraint could delete a row an IGNORE constraint then kept out; a retried fsync after a failed WAL sync could vouch for unwritten frames (bd-alyrn). Plus checkpoint source validation, max-rowid and rowid-reuse parity, `:memory:` freelist reuse, stock empty-schema opens, and DML/join/trigger performance work |
@@ -365,6 +365,49 @@ Extensions and virtual tables:
   none after. Still different from stock: `CROSS JOIN` is reordered too, where stock keeps its
   order and `json_each` returns no rows; `USING`, `NATURAL`, and a FROM with an outer join
   elsewhere still fail.
+- The JSON functions' error messages and argument rules follow stock
+  ([5cf0a9af1](https://github.com/Dicklesworthstone/frankensqlite/commit/5cf0a9af1), bd-1v0p9).
+  Only 2 of 24 error texts matched before. Input that does not parse is `malformed JSON`, a PATH
+  that does not parse is `bad JSON path: '...'`, and the arity and label errors use stock's
+  wording. Calls that failed where stock returns a value now return it:
+  `json_set(X)` returns X, a PATH/VALUE pair whose PATH is NULL is skipped instead of making the
+  result NULL, `json_group_object(1, 2)` is `{"1":2}`, and an array subscript too large for any
+  array finds nothing. Three unit tests that asserted the old behavior now assert stock's. The
+  keeper compares 91 statements with rusqlite's bundled SQLite: 83 differed before, none after,
+  on macOS arm64; the Linux run is pending.
+- `json_set`, `json_insert` and their jsonb_ forms no longer build the rest of a PATH through a
+  JSON null in its middle: `json_set('{"a":null}', '$.a.b.c', 1)` leaves the document unchanged,
+  as in stock, where it gave `{"a":{"b":{"c":1}}}`
+  ([f005c4010](https://github.com/Dicklesworthstone/frankensqlite/commit/f005c4010), bd-8ouj3).
+  The keeper ([be8a8e8c6](https://github.com/Dicklesworthstone/frankensqlite/commit/be8a8e8c6))
+  puts a null or scalar at each depth of a PATH for all six functions: 15 of 55 statements
+  differed at 5cf0a9af1, none after (macOS arm64). f005c4010 records no run of its own.
+- New stock JSON functions: `json_array_insert` and `jsonb_array_insert`
+  ([18e8414e8](https://github.com/Dicklesworthstone/frankensqlite/commit/18e8414e8)), and the
+  `jsonb_group_array` and `jsonb_group_object` aggregates
+  ([80067ab71](https://github.com/Dicklesworthstone/frankensqlite/commit/80067ab71),
+  [be8a8e8c6](https://github.com/Dicklesworthstone/frankensqlite/commit/be8a8e8c6), bd-5ul61).
+  80067ab71 registered the aggregates, but SQL could not reach them until be8a8e8c6.
+  `jsonb_object` and `jsonb_group_object` keep duplicate labels, as stock does
+  ([e097a8955](https://github.com/Dicklesworthstone/frankensqlite/commit/e097a8955)). The keeper
+  compares 105 statements with rusqlite's bundled SQLite: 101 differed at 5cf0a9af1, none after
+  (macOS arm64). 18e8414e8, 80067ab71 and e097a8955 record no run of their own. Still different:
+  the jsonb_ edit functions store a SQL text value as TEXT where stock uses TEXTRAW (bd-b0i0o).
+- `json_group_array`, `json_group_object` and their jsonb_ forms work as window functions
+  ([9424b31c0](https://github.com/Dicklesworthstone/frankensqlite/commit/9424b31c0), bd-ffwsd);
+  every use with `OVER` failed with `no such function`. They cover ROWS, RANGE and GROUPS
+  frames, EXCLUDE, PARTITION BY and FILTER, and a JSON argument such as `json(x)` is embedded
+  rather than quoted. The keeper compares 82 statements with rusqlite's bundled SQLite: all 82
+  differed before, none after (macOS arm64). Still different: a window result passed to
+  `json_array()` or `json_object()` is quoted (bd-0pj4x).
+- The JSON aggregates embed the JSON that `x -> path` returns, and a `json_extract()` result
+  that is an array or object, as stock does; `json_group_array(doc -> '$.tags')` gave an array
+  of quoted strings, and `doc -> '$.n'` gave `["2"]` for 2 (bd-ikehc). This holds for plain and
+  GROUP BY aggregates and in windows. The keeper compares 65 statements with rusqlite's bundled
+  SQLite: 41 differed before, none after (macOS arm64). A GROUP BY whose JSON aggregate takes a
+  json_extract() argument now runs on the slower grouped evaluator, as one with a `json()`
+  argument already did; other aggregates over json_extract(), such as `sum()`, are not
+  rerouted. No timing was measured.
 
 B-tree:
 
