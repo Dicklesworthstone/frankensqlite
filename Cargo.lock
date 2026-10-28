@@ -1300,6 +1300,7 @@ dependencies = [
  "chrono",
  "fsqlite-error",
  "fsqlite-types",
+ "rand 0.10.3",
  "tracing",
 ]
 

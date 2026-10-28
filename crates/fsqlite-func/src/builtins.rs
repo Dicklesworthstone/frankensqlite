@@ -1116,22 +1116,39 @@ impl ScalarFunction for RandomFunc {
     }
 }
 
-/// Simple deterministic-enough PRNG for SQLite's random().
+/// Simple PRNG for SQLite's random() and randomblob().
+///
+/// Not cryptographic, matching SQLite's semantics, but seeded once per process
+/// the way C SQLite seeds its PRNG from the VFS: with a fixed seed every
+/// process produced the same sequence, so `hex(randomblob(16))` keys repeated
+/// across processes.
 fn simple_random_i64() -> i64 {
-    // Deterministic per-process PRNG (no ambient authority).
-    // Not cryptographic, matching SQLite's random()/randomblob() semantics.
-    //
     // splitmix64: fast, decent statistical properties, and requires only a u64 state.
+    use std::sync::OnceLock;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    static STATE: AtomicU64 = AtomicU64::new(0xD1B5_4A32_D192_ED03);
-    let mut x = STATE.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed);
+    static SEED: OnceLock<u64> = OnceLock::new();
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let seed = *SEED.get_or_init(random_seed);
+    let mut x = seed.wrapping_add(COUNTER.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed));
     x ^= x >> 30;
     x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
     x ^= x >> 27;
     x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
     x ^= x >> 31;
     x as i64
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn random_seed() -> u64 {
+    rand::random::<u64>()
+}
+
+/// Wasm fallback: no entropy source is wired up on this target, so it keeps
+/// the fixed seed.
+#[cfg(target_arch = "wasm32")]
+fn random_seed() -> u64 {
+    0xD1B5_4A32_D192_ED03
 }
 
 // ── randomblob(N) ────────────────────────────────────────────────────────
