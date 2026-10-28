@@ -10722,6 +10722,8 @@ const AGGREGATE_FUNCTIONS: &[&str] = &[
     // arity is rejected downstream by `find_aggregate`.
     "json_group_array",
     "json_group_object",
+    "jsonb_group_array",
+    "jsonb_group_object",
     // Geopoly's bounding-box aggregate (fsqlite-ext-rtree); also without a
     // scalar overload, and unresolvable when the extension is not built.
     "geopoly_group_bbox",

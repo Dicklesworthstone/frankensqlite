@@ -109517,10 +109517,12 @@ fn validate_function_call_resolution(
         // active FTS table, including the zero-argument form.
         Some(true)
     } else if is_builtin_json_aggregate(name) {
-        Some(
-            (name.eq_ignore_ascii_case("json_group_array") && num_args == 1)
-                || (name.eq_ignore_ascii_case("json_group_object") && num_args == 2),
-        )
+        let wanted = if name.to_ascii_lowercase().ends_with("_group_array") {
+            1
+        } else {
+            2
+        };
+        Some(num_args == wanted)
     } else if is_aggregate {
         with_current_sync_function_registry(|registry| {
             registry
@@ -126707,15 +126709,20 @@ fn custom_aggregate_overrides_builtin(
 }
 
 /// bd-cnwdm: the JSON1 aggregate functions `json_group_array(v)` and
-/// `json_group_object(k, v)`. They are intentionally NOT in [`AGG_NAMES`] — that
-/// would route them to the registry-unaware GROUP BY storage substrate. Instead
+/// `json_group_object(k, v)`, and their `jsonb_` forms (bd-5ul61), which build
+/// the same value and return it as JSONB. They are intentionally NOT in
+/// [`AGG_NAMES`] — that would route them to the registry-unaware GROUP BY
+/// storage substrate. Instead
 /// they are recognized here so the connection-level grouped-aggregate
 /// interpreter (`eval_group_agg_join_expr`) computes them directly, preserving
 /// the NULL-keeping / two-argument semantics the generic aggregate path lacks.
 #[cfg(feature = "ext-json")]
 fn is_builtin_json_aggregate(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    matches!(lower.as_str(), "json_group_array" | "json_group_object")
+    matches!(
+        lower.as_str(),
+        "json_group_array" | "json_group_object" | "jsonb_group_array" | "jsonb_group_object"
+    )
 }
 
 #[cfg(not(feature = "ext-json"))]
@@ -127680,7 +127687,10 @@ fn eval_group_agg_join_expr(
                 .iter()
                 .map(|term| join_expr_effective_collation(&term.expr, col_map))
                 .collect::<Vec<_>>();
-            if name.eq_ignore_ascii_case("json_group_array") {
+            let lower_name = name.to_ascii_lowercase();
+            // The jsonb_ forms build the same value and return it as JSONB.
+            let is_jsonb = lower_name.starts_with("jsonb_");
+            let encoded = if lower_name.ends_with("_group_array") {
                 let arg = exprs.first().ok_or_else(|| {
                     FrankenError::function_error("json_group_array() requires 1 argument")
                 })?;
@@ -127729,13 +127739,18 @@ fn eval_group_agg_join_expr(
                 // property of the argument expression, constant across the
                 // group's rows, so one registry lookup suffices.
                 let arg_subtype = expr_result_json_subtype_via_registry(arg);
-                let encoded = if arg_subtype != 0 {
+                if is_jsonb {
+                    let subtypes = vec![arg_subtype; vals.len()];
+                    return Ok(SqliteValue::Blob(
+                        fsqlite_ext_json::jsonb_array_with_subtypes(&vals, &subtypes)?.into(),
+                    ));
+                }
+                if arg_subtype != 0 {
                     let subtypes = vec![arg_subtype; vals.len()];
                     fsqlite_ext_json::json_array_with_subtypes(&vals, &subtypes)?
                 } else {
                     fsqlite_ext_json::json_group_array(&vals)?
-                };
-                Ok(SqliteValue::Text(encoded.into()))
+                }
             } else {
                 // json_group_object(key, value)
                 if exprs.len() != 2 {
@@ -127776,21 +127791,33 @@ fn eval_group_agg_join_expr(
                 // as nested JSON rather than quoting it. Keys stay text; only
                 // the value slot can carry a JSON subtype here.
                 let value_subtype = expr_result_json_subtype_via_registry(&exprs[1]);
-                let encoded = if value_subtype != 0 {
+                if value_subtype != 0 || is_jsonb {
                     let mut flat = Vec::with_capacity(pairs.len() * 2);
                     let mut subtypes = Vec::with_capacity(pairs.len() * 2);
                     for (key, value) in pairs {
+                        // As json_group_object reads its label: as text, and a
+                        // NULL label drops the row.
+                        let key = match key {
+                            SqliteValue::Null => continue,
+                            key @ SqliteValue::Text(_) => key,
+                            other => SqliteValue::Text(other.to_text().into()),
+                        };
                         flat.push(key);
                         flat.push(value);
                         subtypes.push(0);
                         subtypes.push(value_subtype);
                     }
+                    if is_jsonb {
+                        return Ok(SqliteValue::Blob(
+                            fsqlite_ext_json::jsonb_object_with_subtypes(&flat, &subtypes)?.into(),
+                        ));
+                    }
                     fsqlite_ext_json::json_object_with_subtypes(&flat, &subtypes)?
                 } else {
                     fsqlite_ext_json::json_group_object(&pairs)?
-                };
-                Ok(SqliteValue::Text(encoded.into()))
-            }
+                }
+            };
+            Ok(SqliteValue::Text(encoded.into()))
         }
         Expr::FunctionCall {
             name,
@@ -156269,7 +156296,9 @@ fn evaluated_arg_json_subtype(expr: &Expr) -> u32 {
                 FunctionArgs::List(list) => i32::try_from(list.len()).unwrap_or(-1),
                 FunctionArgs::Star => -1,
             };
+            // The jsonb_ aggregates return a JSONB blob, which carries no subtype.
             if is_builtin_json_aggregate(name)
+                && !name.to_ascii_lowercase().starts_with("jsonb_")
                 && current_application_function_kind(name, arity).is_none()
             {
                 return fsqlite_func::JSON_SUBTYPE;

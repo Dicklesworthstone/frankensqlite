@@ -1057,7 +1057,7 @@ pub fn json_object_with_subtypes(args: &[SqliteValue], subtypes: &[u32]) -> Resu
 ///
 /// Encoding through `serde_json::Value::Object` would collapse duplicate keys,
 /// which is observable because SQLite's JSONB object format permits duplicates.
-fn jsonb_object_with_subtypes(args: &[SqliteValue], subtypes: &[u32]) -> Result<Vec<u8>> {
+pub fn jsonb_object_with_subtypes(args: &[SqliteValue], subtypes: &[u32]) -> Result<Vec<u8>> {
     if !args.len().is_multiple_of(2) {
         return Err(FrankenError::function_error(
             "json_object() requires an even number of arguments",
@@ -1125,6 +1125,16 @@ pub fn jsonb_array(values: &[SqliteValue]) -> Result<Vec<u8>> {
 /// Build JSONB object from alternating key/value SQL arguments.
 pub fn jsonb_object(args: &[SqliteValue]) -> Result<Vec<u8>> {
     jsonb_object_with_subtypes(args, &[])
+}
+
+/// JSONB variant of [`json_array_with_subtypes`].
+pub fn jsonb_array_with_subtypes(values: &[SqliteValue], subtypes: &[u32]) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(values.len());
+    for (i, value) in values.iter().enumerate() {
+        let subtype = subtypes.get(i).copied().unwrap_or(0);
+        out.push(sqlite_to_json_with_subtype(value, subtype)?);
+    }
+    encode_jsonb_root(&Value::Array(out))
 }
 
 /// Aggregate rows into a JSON array, preserving SQL NULL as JSON null.
