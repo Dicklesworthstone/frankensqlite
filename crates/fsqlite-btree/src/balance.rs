@@ -24,6 +24,7 @@ use fsqlite_types::cx::Cx;
 use fsqlite_types::limits::{BTREE_LEAF_HEADER_SIZE, CELL_POINTER_SIZE};
 use fsqlite_types::serial_type::write_varint;
 use fsqlite_types::{PageData, PageNumber};
+use std::borrow::Cow;
 use tracing::trace;
 
 /// Maximum number of sibling pages involved in a single balance_nonroot.
@@ -80,9 +81,11 @@ pub(crate) struct QuickBalanceResult {
 /// Cells are collected from all sibling pages and divider cells from the
 /// parent into a flat array, then redistributed across new pages.
 #[derive(Debug, Clone)]
-struct GatheredCell {
-    /// The raw cell bytes (complete cell as stored on page).
-    data: Vec<u8>,
+struct GatheredCell<'a> {
+    /// The raw cell bytes (complete cell as stored on page). A cell copied
+    /// unchanged borrows them from the page it was read from; only cells
+    /// that are rewritten own their bytes.
+    data: Cow<'a, [u8]>,
     /// Size of this cell including left-child pointer, varints, local
     /// payload, and overflow pointer.
     #[allow(dead_code)]
@@ -263,7 +266,7 @@ pub async fn balance_deeper<W: PageWriter>(
 
     // Extract cells from the root page safely to avoid offset shifting bugs.
     let cell_ptrs = read_cell_pointers(root_data.as_bytes(), &root_header, root_offset)?;
-    let mut root_cells: Vec<GatheredCell> = Vec::with_capacity(cell_ptrs.len());
+    let mut root_cells: Vec<GatheredCell<'_>> = Vec::with_capacity(cell_ptrs.len());
     for &ptr in &cell_ptrs {
         let cell_offset = usize::from(ptr);
         let cell_ref = CellRef::parse(
@@ -273,11 +276,14 @@ pub async fn balance_deeper<W: PageWriter>(
             usable_size,
         )?;
         let cell_end = cell_offset + cell_on_page_size_from_ref(&cell_ref, cell_offset);
-        let data = root_data.as_bytes()[cell_offset..cell_end].to_vec();
+        let data = &root_data.as_bytes()[cell_offset..cell_end];
         let size = u16::try_from(data.len()).map_err(|_| FrankenError::DatabaseCorrupt {
             detail: "cell too large during balance_deeper".to_owned(),
         })?;
-        root_cells.push(GatheredCell { data, size });
+        root_cells.push(GatheredCell {
+            data: Cow::Borrowed(data),
+            size,
+        });
     }
 
     // Allocate a new child page.
@@ -658,17 +664,31 @@ pub(crate) async fn balance_nonroot<W: PageWriter>(
         }
     }
 
-    // Read all sibling pages and gather cells.
-    let mut all_cells: Vec<GatheredCell> = Vec::with_capacity(sibling_count * 32);
+    // Read all sibling pages, then gather their cells. The gathered cells
+    // borrow from these page images, which also serve as the rollback copy.
+    let mut original_sibling_pages: Vec<(PageNumber, PageData)> = Vec::with_capacity(sibling_count);
+    for &pgno in &sibling_pgnos {
+        original_sibling_pages.push((pgno, writer.read_page_data(cx, pgno).await?));
+    }
+    let mut sibling_headers: Vec<BtreePageHeader> = Vec::with_capacity(sibling_count);
+    let mut gathered_capacity = overflow_cells.len() + divider_cells.len();
+    for (pgno, page_data) in &original_sibling_pages {
+        let page_header = parse_page_header(page_data.as_bytes(), *pgno)?;
+        gathered_capacity += usize::from(page_header.cell_count);
+        sibling_headers.push(page_header);
+    }
+    let mut all_cells: Vec<GatheredCell<'_>> = Vec::with_capacity(gathered_capacity);
     let mut sibling_types: Vec<BtreePageType> = Vec::with_capacity(sibling_count);
     let mut old_right_children: Vec<Option<PageNumber>> = Vec::with_capacity(sibling_count);
-    let mut original_sibling_pages: Vec<(PageNumber, PageData)> = Vec::with_capacity(sibling_count);
 
-    for (sib_idx, &pgno) in sibling_pgnos.iter().enumerate() {
-        let page_data = writer.read_page_data(cx, pgno).await?;
-        original_sibling_pages.push((pgno, page_data.clone()));
+    for (sib_idx, ((pgno, page_data), page_header)) in original_sibling_pages
+        .iter()
+        .zip(&sibling_headers)
+        .enumerate()
+    {
+        let pgno = *pgno;
+        let page_header = *page_header;
         let page_offset = header_offset_for_page(pgno);
-        let page_header = parse_page_header(page_data.as_bytes(), pgno)?;
         let ptrs = read_cell_pointers(page_data.as_bytes(), &page_header, page_offset)?;
 
         sibling_types.push(page_header.page_type);
@@ -684,21 +704,21 @@ pub(crate) async fn balance_nonroot<W: PageWriter>(
                 usable_size,
             )?;
             let cell_end = ptr as usize + cell_on_page_size_from_ref(&cell_ref, ptr as usize);
-            let raw = page_data.as_bytes()[ptr as usize..cell_end].to_vec();
+            let raw = &page_data.as_bytes()[ptr as usize..cell_end];
 
             // Insert overflow cells at the correct position.
             if sib_idx == relative_sib && cell_idx == overflow_insert_idx {
                 for ov in overflow_cells {
                     all_cells.push(GatheredCell {
                         size: u16::try_from(ov.len()).unwrap_or(u16::MAX),
-                        data: ov.clone(),
+                        data: Cow::Borrowed(ov),
                     });
                 }
             }
 
             all_cells.push(GatheredCell {
                 size: u16::try_from(raw.len()).unwrap_or(u16::MAX),
-                data: raw,
+                data: Cow::Borrowed(raw),
             });
         }
 
@@ -707,7 +727,7 @@ pub(crate) async fn balance_nonroot<W: PageWriter>(
             for ov in overflow_cells {
                 all_cells.push(GatheredCell {
                     size: u16::try_from(ov.len()).unwrap_or(u16::MAX),
-                    data: ov.clone(),
+                    data: Cow::Borrowed(ov),
                 });
             }
         }
@@ -733,7 +753,7 @@ pub(crate) async fn balance_nonroot<W: PageWriter>(
                 }
                 all_cells.push(GatheredCell {
                     size: u16::try_from(div.len()).unwrap_or(u16::MAX),
-                    data: div,
+                    data: Cow::Owned(div),
                 });
             } else if page_type == BtreePageType::LeafIndex {
                 // For index leaf pages, the parent divider is an InteriorIndex cell.
@@ -741,10 +761,10 @@ pub(crate) async fn balance_nonroot<W: PageWriter>(
                 // left-child pointer to turn it into a LeafIndex cell.
                 let div = &divider_cells[sib_idx];
                 if div.len() >= 4 {
-                    let leaf_cell_data = div[4..].to_vec();
+                    let leaf_cell_data = &div[4..];
                     all_cells.push(GatheredCell {
                         size: u16::try_from(leaf_cell_data.len()).unwrap_or(u16::MAX),
-                        data: leaf_cell_data,
+                        data: Cow::Borrowed(leaf_cell_data),
                     });
                 } else {
                     return Err(FrankenError::DatabaseCorrupt {
@@ -905,7 +925,7 @@ pub(crate) async fn balance_nonroot<W: PageWriter>(
                 // Interior page: the divider cell is consumed from the
                 // gathered cells. Skip it and use it as the parent divider.
                 let div_cell = &all_cells[cell_cursor + cell_count];
-                let mut div = div_cell.data.clone();
+                let mut div = div_cell.data.to_vec();
                 // Replace the left-child pointer with this page's pgno.
                 if div.len() >= 4 {
                     div[0..4].copy_from_slice(&pgno.get().to_be_bytes());
@@ -1225,7 +1245,7 @@ fn choose_leaf_table_split_index(
 
 fn table_leaf_divider_bytes(
     left_page_no: PageNumber,
-    rightmost_left_cell: &GatheredCell,
+    rightmost_left_cell: &GatheredCell<'_>,
     usable_size: u32,
 ) -> Result<Vec<u8>> {
     let cell_ref = CellRef::parse(
@@ -1285,7 +1305,7 @@ async fn prepare_leaf_table_local_split<W: PageWriter>(
         if cell_idx == insert_idx {
             all_cells.push(GatheredCell {
                 size: u16::try_from(overflow_cell.len()).unwrap_or(u16::MAX),
-                data: overflow_cell.to_vec(),
+                data: Cow::Borrowed(overflow_cell),
             });
             overflow_inserted = true;
         }
@@ -1298,17 +1318,17 @@ async fn prepare_leaf_table_local_split<W: PageWriter>(
             usable_size,
         )?;
         let cell_end = ptr + cell_on_page_size_from_ref(&cell_ref, ptr);
-        let raw = leaf_page.as_bytes()[ptr..cell_end].to_vec();
+        let raw = &leaf_page.as_bytes()[ptr..cell_end];
         all_cells.push(GatheredCell {
             size: u16::try_from(raw.len()).unwrap_or(u16::MAX),
-            data: raw,
+            data: Cow::Borrowed(raw),
         });
     }
 
     if !overflow_inserted {
         all_cells.push(GatheredCell {
             size: u16::try_from(overflow_cell.len()).unwrap_or(u16::MAX),
-            data: overflow_cell.to_vec(),
+            data: Cow::Borrowed(overflow_cell),
         });
     }
 
@@ -2064,7 +2084,7 @@ pub(crate) async fn apply_child_replacement<W: PageWriter>(
     let old_divider_count = old_sibling_count.saturating_sub(1);
 
     // Collect cells to keep: everything except the old dividers.
-    let mut kept_cells: Vec<GatheredCell> =
+    let mut kept_cells: Vec<GatheredCell<'_>> =
         Vec::with_capacity(ptrs.len().saturating_sub(old_divider_count));
 
     for (i, &ptr) in ptrs.iter().enumerate() {
@@ -2078,32 +2098,28 @@ pub(crate) async fn apply_child_replacement<W: PageWriter>(
             usable_size,
         )?;
         let cell_end = ptr as usize + cell_on_page_size_from_ref(&cell_ref, ptr as usize);
-        let raw = page_data.as_bytes()[ptr as usize..cell_end].to_vec();
+        let raw = &page_data.as_bytes()[ptr as usize..cell_end];
         kept_cells.push(GatheredCell {
             size: u16::try_from(raw.len()).unwrap_or(u16::MAX),
-            data: raw,
+            data: Cow::Borrowed(raw),
         });
     }
 
     // Insert new divider cells at the correct position.
     let insert_pos = first_child;
-    let mut final_cells: Vec<GatheredCell> =
+    let mut final_cells: Vec<GatheredCell<'_>> =
         Vec::with_capacity(kept_cells.len() + new_dividers.len());
 
-    for cell in &kept_cells[..insert_pos] {
-        final_cells.push(cell.clone());
-    }
+    final_cells.extend(kept_cells.drain(..insert_pos));
 
     for (_, div_data) in new_dividers {
         final_cells.push(GatheredCell {
             size: u16::try_from(div_data.len()).unwrap_or(u16::MAX),
-            data: div_data.clone(),
+            data: Cow::Borrowed(div_data),
         });
     }
 
-    for cell in &kept_cells[insert_pos..] {
-        final_cells.push(cell.clone());
-    }
+    final_cells.append(&mut kept_cells);
 
     // Update right_child to point to the last new sibling.
     let right_child = if touches_rightmost {
@@ -2144,7 +2160,7 @@ pub(crate) async fn apply_child_replacement<W: PageWriter>(
                 ),
             });
         }
-        final_cells[patch_idx].data[0..4].copy_from_slice(&last_pgno.get().to_be_bytes());
+        final_cells[patch_idx].data.to_mut()[0..4].copy_from_slice(&last_pgno.get().to_be_bytes());
     }
 
     if !page_fits(&final_cells, header.page_type, offset, usable_size) {
@@ -2264,7 +2280,7 @@ async fn balance_shallower<W: PageWriter>(
     // Rebuild child cells using the root's header offset. This handles page-1
     // (100-byte header) safely and avoids raw offset shifting pitfalls.
     let child_ptrs = read_cell_pointers(child_data.as_bytes(), &child_header, child_offset)?;
-    let mut child_cells: Vec<GatheredCell> = Vec::with_capacity(child_ptrs.len());
+    let mut child_cells: Vec<GatheredCell<'_>> = Vec::with_capacity(child_ptrs.len());
     for &ptr in &child_ptrs {
         let cell_offset = usize::from(ptr);
         let cell_ref = CellRef::parse(
@@ -2274,11 +2290,14 @@ async fn balance_shallower<W: PageWriter>(
             usable_size,
         )?;
         let cell_end = cell_offset + cell_on_page_size_from_ref(&cell_ref, cell_offset);
-        let data = child_data.as_bytes()[cell_offset..cell_end].to_vec();
+        let data = &child_data.as_bytes()[cell_offset..cell_end];
         let size = u16::try_from(data.len()).map_err(|_| FrankenError::DatabaseCorrupt {
             detail: "cell too large during balance_shallower".to_owned(),
         })?;
-        child_cells.push(GatheredCell { data, size });
+        child_cells.push(GatheredCell {
+            data: Cow::Borrowed(data),
+            size,
+        });
     }
 
     // If the child cannot fit on the root due to header-offset reduction
@@ -2352,7 +2371,7 @@ async fn split_overflowing_root<W: PageWriter>(
     root_offset: usize,
     page_type: BtreePageType,
     root_prefix: &[u8],
-    final_cells: &[GatheredCell],
+    final_cells: &[GatheredCell<'_>],
     right_child: Option<PageNumber>,
 ) -> Result<()> {
     if !page_type.is_interior() {
@@ -2403,7 +2422,7 @@ async fn split_overflowing_root<W: PageWriter>(
                 }
             })?;
             right_children.push(child);
-            dividers.push(divider.clone());
+            dividers.push(divider.to_vec());
             start = end + 1;
         } else {
             right_children.push(root_right_child);
@@ -2439,11 +2458,11 @@ async fn split_overflowing_root<W: PageWriter>(
     for (i, divider) in dividers.iter_mut().enumerate() {
         divider[0..4].copy_from_slice(&child_pgnos[i].get().to_be_bytes());
     }
-    let root_cells: Vec<GatheredCell> = dividers
+    let root_cells: Vec<GatheredCell<'_>> = dividers
         .into_iter()
         .map(|data| GatheredCell {
             size: u16::try_from(data.len()).unwrap_or(u16::MAX),
-            data,
+            data: Cow::Owned(data),
         })
         .collect();
     if !page_fits(&root_cells, page_type, root_offset, usable_size) {
@@ -2525,7 +2544,7 @@ async fn split_overflowing_nonroot_interior_page<W: PageWriter>(
     page_offset: usize,
     page_type: BtreePageType,
     original_page: &[u8],
-    final_cells: &[GatheredCell],
+    final_cells: &[GatheredCell<'_>],
     right_child: Option<PageNumber>,
 ) -> Result<SplitPagesAndDividers> {
     if !page_type.is_interior() {
@@ -2597,7 +2616,7 @@ async fn split_overflowing_nonroot_interior_page<W: PageWriter>(
             };
 
             ranges.push((start, divider_idx));
-            dividers.push(divider.clone());
+            dividers.push(divider.to_vec());
             right_children.push(rc);
             start = divider_idx + 1;
         }
@@ -3039,10 +3058,10 @@ mod tests {
         cell_buf
     }
 
-    fn fixed_cost_cells(count: usize, payload_len: usize) -> Vec<GatheredCell> {
+    fn fixed_cost_cells(count: usize, payload_len: usize) -> Vec<GatheredCell<'static>> {
         (0..count)
             .map(|_| GatheredCell {
-                data: vec![0x5A; payload_len],
+                data: Cow::Owned(vec![0x5A; payload_len]),
                 size: u16::try_from(payload_len).unwrap_or(u16::MAX),
             })
             .collect()
@@ -3098,7 +3117,7 @@ mod tests {
                 let data = build_leaf_index_cell(key);
                 GatheredCell {
                     size: u16::try_from(data.len()).expect("test index cell fits in u16"),
-                    data,
+                    data: Cow::Owned(data),
                 }
             })
             .collect();
@@ -3119,7 +3138,7 @@ mod tests {
                 data.extend_from_slice(&leaf_cell);
                 GatheredCell {
                     size: u16::try_from(data.len()).expect("test divider cell fits in u16"),
-                    data,
+                    data: Cow::Owned(data),
                 }
             })
             .collect();
@@ -4381,7 +4400,7 @@ mod tests {
         // arithmetic, the leaf-vs-interior header difference, and the boundary.
         let cells: Vec<GatheredCell> = (0..3)
             .map(|_| GatheredCell {
-                data: vec![0u8; 10],
+                data: Cow::Owned(vec![0u8; 10]),
                 size: 10,
             })
             .collect();
@@ -4432,7 +4451,7 @@ mod tests {
             let data = build_leaf_table_cell(rowid, b"payload");
             let cell = GatheredCell {
                 size: u16::try_from(data.len()).unwrap(),
-                data,
+                data: Cow::Owned(data),
             };
             table_leaf_divider_bytes(left, &cell, USABLE).unwrap()
         };
@@ -4463,7 +4482,7 @@ mod tests {
     fn test_distribution_single_page() {
         let cells: Vec<GatheredCell> = (0..5)
             .map(|_| GatheredCell {
-                data: vec![0; 20],
+                data: Cow::Owned(vec![0; 20]),
                 size: 20,
             })
             .collect();
@@ -4479,7 +4498,7 @@ mod tests {
         // So 2 cells per page.
         let cells: Vec<GatheredCell> = (0..6)
             .map(|_| GatheredCell {
-                data: vec![0; 2000],
+                data: Cow::Owned(vec![0; 2000]),
                 size: 2000,
             })
             .collect();
@@ -4501,7 +4520,7 @@ mod tests {
     fn test_distribution_interior_accounts_for_parent_dividers() {
         let cells: Vec<GatheredCell> = (0..15)
             .map(|_| GatheredCell {
-                data: vec![0; 300],
+                data: Cow::Owned(vec![0; 300]),
                 size: 300,
             })
             .collect();
@@ -4523,15 +4542,15 @@ mod tests {
     fn test_distribution_interior_avoids_trailing_orphan_divider() {
         let cells = vec![
             GatheredCell {
-                data: vec![0; 1_500],
+                data: Cow::Owned(vec![0; 1_500]),
                 size: 1_500,
             },
             GatheredCell {
-                data: vec![0; 1_500],
+                data: Cow::Owned(vec![0; 1_500]),
                 size: 1_500,
             },
             GatheredCell {
-                data: vec![0; 3_000],
+                data: Cow::Owned(vec![0; 3_000]),
                 size: 3_000,
             },
         ];
@@ -4555,7 +4574,7 @@ mod tests {
     fn test_distribution_leaf_index_equalizes_left_packed_siblings_gh521() {
         let cells: Vec<GatheredCell> = (0..27)
             .map(|_| GatheredCell {
-                data: vec![0; 498],
+                data: Cow::Owned(vec![0; 498]),
                 size: 498,
             })
             .collect();
@@ -4576,12 +4595,12 @@ mod tests {
         // holds the two remaining cells (1,000 bytes).
         let mut cells: Vec<GatheredCell> = (0..10)
             .map(|_| GatheredCell {
-                data: vec![0; 498],
+                data: Cow::Owned(vec![0; 498]),
                 size: 498,
             })
             .collect();
         cells[7] = GatheredCell {
-            data: vec![0; 1_998],
+            data: Cow::Owned(vec![0; 1_998]),
             size: 1_998,
         };
 
@@ -4598,7 +4617,7 @@ mod tests {
     fn test_distribution_interior_equalization_single_page_and_minimum_cells() {
         let small: Vec<GatheredCell> = (0..6)
             .map(|_| GatheredCell {
-                data: vec![0; 100],
+                data: Cow::Owned(vec![0; 100]),
                 size: 100,
             })
             .collect();
@@ -4612,7 +4631,7 @@ mod tests {
         // cell promoted.
         let wide: Vec<GatheredCell> = (0..3)
             .map(|_| GatheredCell {
-                data: vec![0; 2_500],
+                data: Cow::Owned(vec![0; 2_500]),
                 size: 2_500,
             })
             .collect();
@@ -4683,7 +4702,7 @@ mod tests {
             };
             let hdr_size = usize::from(page_type.header_size());
             let cells: Vec<GatheredCell> = sizes.iter().map(|&size| GatheredCell {
-                data: vec![0x5A; size],
+                data: Cow::Owned(vec![0x5A; size]),
                 size: u16::try_from(size).unwrap(),
             }).collect();
             let dist = compute_distribution(&cells, 512, hdr_size, page_type).unwrap();
@@ -4704,7 +4723,7 @@ mod tests {
                 proptest::prop_assert_eq!(pointers.len(), count);
                 for (cell, ptr) in page_cells.iter().zip(pointers) {
                     let start = usize::from(ptr);
-                    proptest::prop_assert_eq!(&page[start..start + cell.data.len()], &cell.data);
+                    proptest::prop_assert_eq!(&page[start..start + cell.data.len()], &*cell.data);
                 }
                 cursor += count + usize::from(page_idx + 1 < dist.len());
             }
@@ -4741,11 +4760,11 @@ mod tests {
     fn test_build_page_roundtrip() {
         let cells: Vec<GatheredCell> = vec![
             GatheredCell {
-                data: vec![5, 1, b'a', b'b', b'c', b'd', b'e'],
+                data: Cow::Owned(vec![5, 1, b'a', b'b', b'c', b'd', b'e']),
                 size: 7,
             },
             GatheredCell {
-                data: vec![3, 2, b'x', b'y', b'z'],
+                data: Cow::Owned(vec![3, 2, b'x', b'y', b'z']),
                 size: 5,
             },
         ];
@@ -4764,7 +4783,7 @@ mod tests {
         for (i, ptr) in ptrs.iter().enumerate() {
             let offset = *ptr as usize;
             let expected = &cells[i].data;
-            assert_eq!(&page[offset..offset + expected.len()], expected.as_slice());
+            assert_eq!(&page[offset..offset + expected.len()], &**expected);
         }
     }
 
@@ -4772,11 +4791,11 @@ mod tests {
     fn test_build_page_rejects_header_overlap() {
         let cells: Vec<GatheredCell> = vec![
             GatheredCell {
-                data: vec![0xAA; 2_000],
+                data: Cow::Owned(vec![0xAA; 2_000]),
                 size: 2_000,
             },
             GatheredCell {
-                data: vec![0xBB; 2_000],
+                data: Cow::Owned(vec![0xBB; 2_000]),
                 size: 2_000,
             },
         ];
@@ -4960,7 +4979,7 @@ mod tests {
                         data.extend(build_leaf_index_cell(&key));
                         GatheredCell {
                             size: u16::try_from(data.len()).unwrap(),
-                            data,
+                            data: Cow::Owned(data),
                         }
                     })
                     .collect();
@@ -5020,7 +5039,10 @@ mod tests {
                         assert_eq!(header.right_child, Some(pn(1_083)));
                     }
                 }
-                let expected: Vec<Vec<u8>> = cells.into_iter().map(|cell| cell.data).collect();
+                let expected: Vec<Vec<u8>> = cells
+                    .into_iter()
+                    .map(|cell| cell.data.into_owned())
+                    .collect();
                 assert_eq!(
                     recovered, expected,
                     "keys and every grandchild pointer survive"
@@ -5037,7 +5059,7 @@ mod tests {
                     let data = build_interior_table_cell(pn(1_000 + ordinal), i64::from(ordinal));
                     GatheredCell {
                         size: u16::try_from(data.len()).unwrap(),
-                        data,
+                        data: Cow::Owned(data),
                     }
                 })
                 .collect();
@@ -5120,7 +5142,10 @@ mod tests {
                                 cell_offset + cell_on_page_size_from_ref(&cell_ref, cell_offset);
                             let data = candidate[cell_offset..cell_end].to_vec();
                             let size = u16::try_from(data.len()).expect("cell size");
-                            cells.push(GatheredCell { data, size });
+                            cells.push(GatheredCell {
+                                data: Cow::Owned(data),
+                                size,
+                            });
                         }
                         if page_fits(&cells, header.page_type, 0, USABLE)
                             && !page_fits(&cells, header.page_type, 100, USABLE)
@@ -5260,7 +5285,7 @@ mod tests {
                     let data = build_interior_table_cell(left_child, rowid);
                     GatheredCell {
                         size: u16::try_from(data.len()).unwrap_or(u16::MAX),
-                        data,
+                        data: Cow::Owned(data),
                     }
                 })
                 .collect();
@@ -5302,7 +5327,7 @@ mod tests {
             let existing_leaf = build_page(
                 &[GatheredCell {
                     size: u16::try_from(existing_cell_bytes.len()).unwrap(),
-                    data: existing_cell_bytes,
+                    data: Cow::Owned(existing_cell_bytes),
                 }],
                 BtreePageType::LeafTable,
                 0,
@@ -5366,7 +5391,7 @@ mod tests {
             let leaf_3 = build_page(
                 &[GatheredCell {
                     size: u16::try_from(existing_cell_3.len()).unwrap(),
-                    data: existing_cell_3,
+                    data: Cow::Owned(existing_cell_3),
                 }],
                 BtreePageType::LeafTable,
                 0,
@@ -5379,7 +5404,7 @@ mod tests {
             let leaf_4 = build_page(
                 &[GatheredCell {
                     size: u16::try_from(existing_cell_4.len()).unwrap(),
-                    data: existing_cell_4,
+                    data: Cow::Owned(existing_cell_4),
                 }],
                 BtreePageType::LeafTable,
                 0,
