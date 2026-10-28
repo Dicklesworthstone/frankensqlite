@@ -239,8 +239,8 @@ use fsqlite_vdbe::codegen::{
     PlannerIndexRangeBound, PlannerIndexRangeTarget, PlannerSelectAccessKind,
     SelectPlannerDirective, TableSchema, bind_explicit_index, codegen_delete, codegen_insert,
     codegen_select, codegen_update, emit_backfill_column_read, emit_backfill_key_expr,
-    emit_scan_filter, join_select_seeks_outer_table, without_rowid_index_appended_pk,
-    without_rowid_pk_indices,
+    emit_scan_filter, join_select_seeks_outer_table, join_select_uses_lookup,
+    without_rowid_index_appended_pk, without_rowid_pk_indices,
 };
 #[cfg(not(test))]
 use fsqlite_vdbe::engine::set_vdbe_metrics_enabled;
@@ -25488,6 +25488,16 @@ impl Connection {
             // that seeks its outer table to the rows the WHERE pins reads a
             // handful (a trigger guard's join probe runs once per row).
             && !join_select_seeks_outer_table(select, &self.schema.borrow())
+            // bd-9gl3w: a LIMIT join the VDBE runs stops after its last row.
+            && select.limit.is_none()
+    }
+
+    /// Whether the VDBE join codegen can run `select`, including a lookup
+    /// join's LIMIT (bd-9gl3w).
+    #[must_use]
+    fn select_join_runs_in_vdbe(&self, select: &SelectStatement) -> bool {
+        select_join_is_vdbe_eligible(select)
+            || select_limited_join_is_vdbe_eligible(select, &self.schema.borrow())
     }
 
     #[must_use]
@@ -41386,7 +41396,7 @@ impl Connection {
                     }
                     Ok(rows)
                 } else if (has_joins(select) || has_subquery_source(select))
-                    && (!select_join_is_vdbe_eligible(select)
+                    && (!self.select_join_runs_in_vdbe(select)
                         || self.prefer_memdb_hash_join_dispatch(select))
                     && !self.select_grouped_inner_join_count_sum_is_vdbe_eligible(select)
                 {
@@ -41565,7 +41575,7 @@ impl Connection {
                         &arc_prog
                     };
 
-                    let vdbe_storage_log_select = if select_join_is_vdbe_eligible(select) {
+                    let vdbe_storage_log_select = if self.select_join_runs_in_vdbe(select) {
                         Some((select, "join_vdbe_storage_cursors"))
                     } else {
                         derived_storage_log_select
@@ -50774,7 +50784,7 @@ impl Connection {
         let has_implicit_aggregate = self.has_implicit_aggregation_with_registry(select);
         let has_grouping = has_group_by(select) || has_implicit_aggregate || has_ordered_aggregate;
         let has_join_like_source = has_joins(select) || has_fallback_from_source(select);
-        let has_vdbe_eligible_join = has_joins(select) && select_join_is_vdbe_eligible(select);
+        let has_vdbe_eligible_join = has_joins(select) && self.select_join_runs_in_vdbe(select);
         let has_vdbe_eligible_grouped_join =
             self.select_grouped_inner_join_count_sum_is_vdbe_eligible(select);
         let has_vdbe_eligible_group_by =
@@ -90626,15 +90636,20 @@ impl Connection {
                     // instead of the full scan a bound-outer target otherwise forces —
                     // the quadratic bulk-ingest half of the trigger-WHEN EXISTS guard.
                     self.relax_correlated_exists_equalities_for_seek(&mut sub_clone);
-                    // bd-8c68u: a join the VDBE compiles (with its index and
-                    // rowid seeks) refuses a LIMIT, which would route the probe
-                    // to the materializing join executor and scan both tables
-                    // per probe. EXISTS needs no LIMIT for its answer.
-                    if sub_clone.limit.is_none() && !select_join_is_vdbe_eligible(&sub_clone) {
+                    // bd-8c68u: a nested-loop join the VDBE compiles refuses a
+                    // LIMIT, which would route the probe to the materializing
+                    // join executor and scan both tables per probe. EXISTS
+                    // needs no LIMIT for its answer. A lookup join compiles
+                    // the LIMIT 1 and stops at its first row (bd-9gl3w).
+                    if sub_clone.limit.is_none() {
+                        let unlimited_runs_in_vdbe = select_join_is_vdbe_eligible(&sub_clone);
                         sub_clone.limit = Some(fsqlite_ast::LimitClause {
                             limit: Expr::Literal(Literal::Integer(1), fsqlite_ast::Span::new(0, 0)),
                             offset: None,
                         });
+                        if unlimited_runs_in_vdbe && !self.select_join_runs_in_vdbe(&sub_clone) {
+                            sub_clone.limit = None;
+                        }
                     }
                     // bd-ry6x7: a parameterized probe (a trigger WHEN guard)
                     // is identified by its text and reuses its program.
@@ -111797,6 +111812,30 @@ fn table_or_subquery_in_attached_schema(tos: &TableOrSubquery) -> bool {
 }
 
 fn select_join_is_vdbe_eligible(select: &SelectStatement) -> bool {
+    select.limit.is_none() && select_join_shape_is_vdbe_eligible(select)
+}
+
+/// bd-9gl3w: a join with a LIMIT and no ORDER BY that the VDBE can stop early.
+///
+/// The join codegen compiles LIMIT/OFFSET where it emits each row, so a
+/// lookup join (a rowid or index seek per outer row) ends after its last row.
+/// A nested-loop join would rescan the inner table per outer row until then,
+/// so it keeps the materializing executor, which hashes the inner table once.
+/// ORDER BY + LIMIT keeps that executor and its GH#386 keyset lane too.
+fn select_limited_join_is_vdbe_eligible(select: &SelectStatement, schema: &[TableSchema]) -> bool {
+    select.order_by.is_empty()
+        && select.limit.as_ref().is_some_and(|clause| {
+            !expr_has_any_subquery(&clause.limit)
+                && clause
+                    .offset
+                    .as_ref()
+                    .is_none_or(|offset| !expr_has_any_subquery(offset))
+        })
+        && select_join_shape_is_vdbe_eligible(select)
+        && join_select_uses_lookup(select, schema)
+}
+
+fn select_join_shape_is_vdbe_eligible(select: &SelectStatement) -> bool {
     let SelectCore::Select {
         columns,
         from: Some(from),
@@ -111814,7 +111853,6 @@ fn select_join_is_vdbe_eligible(select: &SelectStatement) -> bool {
         || has_ordered_aggregate(select)
         || has_window_functions(select)
         || is_distinct_select(select)
-        || select.limit.is_some()
         || has_fallback_from_source(select)
         || has_table_function_source(select)
         || select_contains_match_operator(select)

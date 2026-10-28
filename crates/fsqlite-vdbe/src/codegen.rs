@@ -12771,6 +12771,94 @@ fn emit_join_order_key(
     emit_join_expr(b, order_expr, target, tables, ctx)
 }
 
+/// A join's LIMIT and OFFSET registers (bd-9gl3w). Without ORDER BY they apply
+/// where the join emits each row, as SQLite's `selectInnerLoop` does: OFFSET
+/// skips the row before its columns are computed, and LIMIT jumps to `done`,
+/// the loop exit, after the last row. Under ORDER BY they apply to the
+/// sorter's output instead (see [`emit_join_sorter_output`]).
+#[derive(Clone, Copy)]
+struct JoinOutputLimit {
+    limit_reg: i32,
+    offset_reg: Option<i32>,
+    done: Label,
+}
+
+/// Evaluate a join's LIMIT and OFFSET ahead of its loops; a zero LIMIT jumps
+/// straight to `done_label`.
+fn emit_join_output_limit(
+    b: &mut ProgramBuilder,
+    stmt: &SelectStatement,
+    done_label: Label,
+) -> Option<JoinOutputLimit> {
+    let limit_clause = stmt.limit.as_ref()?;
+    // LIMIT is last in the SQL text but evaluated before the loops: give its
+    // anonymous placeholders their textual indices, then restore the counter.
+    let body_anon_placeholder_base = b.current_anon_placeholder();
+    let limit_placeholder_count = count_anon_placeholders(&limit_clause.limit)
+        + limit_clause
+            .offset
+            .as_ref()
+            .map_or(0, count_anon_placeholders);
+    b.set_next_anon_placeholder(
+        body_anon_placeholder_base
+            + count_anon_placeholders_in_select(stmt).saturating_sub(limit_placeholder_count),
+    );
+    let (limit_reg, offset_reg) = emit_limit_offset_registers(b, Some(limit_clause), done_label);
+    b.set_next_anon_placeholder(body_anon_placeholder_base);
+    limit_reg.map(|limit_reg| JoinOutputLimit {
+        limit_reg,
+        offset_reg,
+        done: done_label,
+    })
+}
+
+/// Emit the rows of a join's ORDER BY sorter, past its OFFSET and up to its
+/// LIMIT.
+fn emit_join_sorter_output(
+    b: &mut ProgramBuilder,
+    (sort_cursor, sort_regs, sort_key_count): (i32, i32, usize),
+    out_regs: i32,
+    out_col_count: usize,
+    limit: Option<JoinOutputLimit>,
+) {
+    let sort_loop = b.emit_label();
+    let sort_next = b.emit_label();
+    let sort_done = b.emit_label();
+    b.emit_jump_to_label(Opcode::SorterSort, sort_cursor, 0, sort_done, P4::None, 0);
+    b.resolve_label(sort_loop);
+    if let Some(offset_reg) = limit.and_then(|limit| limit.offset_reg) {
+        b.emit_jump_to_label(Opcode::IfPos, offset_reg, 1, sort_next, P4::None, 0);
+    }
+    b.emit_op(Opcode::SorterData, sort_cursor, sort_regs, 0, P4::None, 0);
+    // Extract output columns from sorter data.
+    for i in 0..out_col_count {
+        let dst = out_regs + i as i32;
+        b.emit_op(
+            Opcode::Column,
+            sort_cursor,
+            (sort_key_count + i) as i32,
+            dst,
+            P4::None,
+            0,
+        );
+    }
+    b.emit_op(
+        Opcode::ResultRow,
+        out_regs,
+        out_col_count as i32,
+        0,
+        P4::None,
+        0,
+    );
+    if let Some(limit) = limit {
+        b.emit_jump_to_label(Opcode::DecrJumpZero, limit.limit_reg, 0, sort_done, P4::None, 0);
+    }
+    b.resolve_label(sort_next);
+    b.emit_jump_to_label(Opcode::SorterNext, sort_cursor, 0, sort_loop, P4::None, 0);
+    b.resolve_label(sort_done);
+}
+
+#[allow(clippy::too_many_arguments)]
 fn emit_join_output_or_sort(
     b: &mut ProgramBuilder,
     columns: &[ResultColumn],
@@ -12779,8 +12867,15 @@ fn emit_join_output_or_sort(
     ctx: &CodegenContext,
     sorter: Option<(i32, i32, usize, i32)>,
     order_by: &[OrderingTerm],
+    limit: Option<JoinOutputLimit>,
 ) -> Result<(), CodegenError> {
     let out_col_count = resolve_join_output_count(columns, tables);
+    let offset_skip = b.emit_label();
+    if sorter.is_none()
+        && let Some(offset_reg) = limit.and_then(|limit| limit.offset_reg)
+    {
+        b.emit_jump_to_label(Opcode::IfPos, offset_reg, 1, offset_skip, P4::None, 0);
+    }
     emit_join_result_columns(b, columns, out_regs, tables, ctx)?;
     if let Some((sort_cursor, sort_regs, sort_key_count, sort_record_reg)) = sorter {
         for (i, term) in order_by.iter().enumerate() {
@@ -12826,7 +12921,11 @@ fn emit_join_output_or_sort(
             P4::None,
             0,
         );
+        if let Some(limit) = limit {
+            b.emit_jump_to_label(Opcode::DecrJumpZero, limit.limit_reg, 0, limit.done, P4::None, 0);
+        }
     }
+    b.resolve_label(offset_skip);
     Ok(())
 }
 
@@ -12866,10 +12965,13 @@ fn emit_join_lookup_match(
     order_by: &[OrderingTerm],
     aggregates: &[JoinAggregateTerm<'_>],
     accum_base: Option<i32>,
+    limit: Option<JoinOutputLimit>,
 ) -> Result<(), CodegenError> {
     match accum_base {
         Some(base) => emit_join_aggregate_steps(b, aggregates, base, tables, ctx),
-        None => emit_join_output_or_sort(b, columns, out_regs, tables, ctx, sorter, order_by),
+        None => {
+            emit_join_output_or_sort(b, columns, out_regs, tables, ctx, sorter, order_by, limit)
+        }
     }
 }
 
@@ -12897,25 +12999,29 @@ enum OuterEqualitySeek<'a> {
     },
 }
 
-/// bd-8c68u: whether `codegen_join_select` seeks the outer table of `stmt`.
-///
-/// True when the two-table join compiles to the single-join lookup whose
-/// outer loop seeks ([`OuterEqualitySeek`]). That plan reads only the outer
-/// rows the WHERE pins, so a caller choosing between it and a strategy that
-/// reads both tables in full (the in-memory hash join) should take it.
-#[must_use]
-pub fn join_select_seeks_outer_table(stmt: &SelectStatement, schema: &[TableSchema]) -> bool {
+/// The two tables of `stmt`'s two-table `ON` join and the single-join lookup
+/// `codegen_join_select` compiles it to.
+struct SingleJoinLookupSelect<'a> {
+    left_table: &'a TableSchema,
+    left_alias: Option<&'a str>,
+    right_table: &'a TableSchema,
+    right_alias: Option<&'a str>,
+    on_expr: &'a Expr,
+    plan: SingleJoinLookupPlan<'a>,
+}
+
+fn single_join_lookup_select<'a>(
+    stmt: &'a SelectStatement,
+    schema: &'a [TableSchema],
+) -> Option<SingleJoinLookupSelect<'a>> {
     let SelectCore::Select {
-        columns,
-        from: Some(from),
-        where_clause,
-        ..
+        from: Some(from), ..
     } = &stmt.body.select
     else {
-        return false;
+        return None;
     };
     let [join] = from.joins.as_slice() else {
-        return false;
+        return None;
     };
     let (
         TableOrSubquery::Table {
@@ -12930,26 +13036,73 @@ pub fn join_select_seeks_outer_table(stmt: &SelectStatement, schema: &[TableSche
         },
     ) = (&from.source, &join.table)
     else {
-        return false;
+        return None;
     };
     let (Ok(left_table), Ok(right_table)) = (
         find_table(schema, &left_name.name),
         find_table(schema, &right_name.name),
     ) else {
-        return false;
+        return None;
     };
     let Some(fsqlite_ast::JoinConstraint::On(on_expr)) = &join.constraint else {
-        return false;
+        return None;
     };
     let (left_alias, right_alias) = (left_alias.as_deref(), right_alias.as_deref());
-    let Some(plan) = resolve_single_join_lookup_plan(
+    let plan = resolve_single_join_lookup_plan(
         left_table,
         left_alias,
         right_table,
         right_alias,
         join.join_type.kind,
         Some(on_expr),
-    ) else {
+    )?;
+    Some(SingleJoinLookupSelect {
+        left_table,
+        left_alias,
+        right_table,
+        right_alias,
+        on_expr,
+        plan,
+    })
+}
+
+/// bd-9gl3w: whether `codegen_join_select` seeks the inner rows of a two-table join.
+///
+/// The single-join lookup reaches the inner table with a rowid or index seek
+/// per outer row instead of rescanning it in a nested loop. A LIMIT stops the
+/// lookup plan after its last row; a nested loop would rescan the inner table
+/// for every outer row until then, where the materializing join executor
+/// hashes it once.
+#[must_use]
+pub fn join_select_uses_lookup(stmt: &SelectStatement, schema: &[TableSchema]) -> bool {
+    single_join_lookup_select(stmt, schema).is_some()
+}
+
+/// bd-8c68u: whether `codegen_join_select` seeks the outer table of `stmt`.
+///
+/// True when the two-table join compiles to the single-join lookup whose
+/// outer loop seeks ([`OuterEqualitySeek`]). That plan reads only the outer
+/// rows the WHERE pins, so a caller choosing between it and a strategy that
+/// reads both tables in full (the in-memory hash join) should take it.
+#[must_use]
+pub fn join_select_seeks_outer_table(stmt: &SelectStatement, schema: &[TableSchema]) -> bool {
+    let SelectCore::Select {
+        columns,
+        where_clause,
+        ..
+    } = &stmt.body.select
+    else {
+        return false;
+    };
+    let Some(SingleJoinLookupSelect {
+        left_table,
+        left_alias,
+        right_table,
+        right_alias,
+        on_expr,
+        plan,
+    }) = single_join_lookup_select(stmt, schema)
+    else {
         return false;
     };
     let where_clause = where_clause.as_deref();
@@ -13263,6 +13416,13 @@ fn codegen_single_join_lookup_select(
     // result row at the end, instead of one row per match.
     aggregates: &[JoinAggregateTerm<'_>],
 ) -> Result<(), CodegenError> {
+    // The aggregate form emits its one row after the loop; nothing routes a
+    // LIMIT to it.
+    if !aggregates.is_empty() && stmt.limit.is_some() {
+        return Err(CodegenError::Unsupported(
+            "LIMIT on a join lookup aggregate".to_owned(),
+        ));
+    }
     let end_label = b.emit_label();
     let done_label = b.emit_label();
     b.emit_jump_to_label(Opcode::Init, 0, 0, end_label, P4::None, 0);
@@ -13345,6 +13505,7 @@ fn codegen_single_join_lookup_select(
     } else {
         None
     };
+    let limit = emit_join_output_limit(b, stmt, done_label);
 
     // bd-673gw / bd-k8ebx: a numeric probe into a typeless index also matches
     // the TEXT keys NUMERIC affinity makes equal to it. Walking the TEXT keys
@@ -13505,6 +13666,7 @@ fn codegen_single_join_lookup_select(
                 &stmt.order_by,
                 aggregates,
                 accum_base,
+                limit,
             )?;
             b.resolve_label(matched_skip);
             b.resolve_label(no_match);
@@ -13622,6 +13784,7 @@ fn codegen_single_join_lookup_select(
                     &stmt.order_by,
                     aggregates,
                     accum_base,
+                    limit,
                 )
             };
             let idx_loop_top = b.current_addr();
@@ -13748,6 +13911,7 @@ fn codegen_single_join_lookup_select(
             &stmt.order_by,
             aggregates,
             accum_base,
+            limit,
         )?;
         b.resolve_label(skip_left_join_null_row);
     }
@@ -13782,32 +13946,13 @@ fn codegen_single_join_lookup_select(
     }
 
     if let Some((sort_cursor, sort_regs, sort_key_count, _sort_record_reg)) = sorter {
-        let sort_loop = b.emit_label();
-        let sort_done = b.emit_label();
-        b.emit_jump_to_label(Opcode::SorterSort, sort_cursor, 0, sort_done, P4::None, 0);
-        b.resolve_label(sort_loop);
-        b.emit_op(Opcode::SorterData, sort_cursor, sort_regs, 0, P4::None, 0);
-        for i in 0..out_col_count {
-            let dst = out_regs + i as i32;
-            b.emit_op(
-                Opcode::Column,
-                sort_cursor,
-                (sort_key_count + i) as i32,
-                dst,
-                P4::None,
-                0,
-            );
-        }
-        b.emit_op(
-            Opcode::ResultRow,
+        emit_join_sorter_output(
+            b,
+            (sort_cursor, sort_regs, sort_key_count),
             out_regs,
-            out_col_count as i32,
-            0,
-            P4::None,
-            0,
+            out_col_count,
+            limit,
         );
-        b.emit_jump_to_label(Opcode::SorterNext, sort_cursor, 0, sort_loop, P4::None, 0);
-        b.resolve_label(sort_done);
         b.emit_op(Opcode::Close, sort_cursor, 0, 0, P4::None, 0);
     }
 
@@ -14035,6 +14180,13 @@ fn codegen_multi_join_lookup_select(
     use fsqlite_ast::JoinKind;
 
     debug_assert_eq!(plan.steps.len(), join_tables.len());
+    // The aggregate form emits its one row after the loop; nothing routes a
+    // LIMIT to it.
+    if !aggregates.is_empty() && stmt.limit.is_some() {
+        return Err(CodegenError::Unsupported(
+            "LIMIT on a multi-join lookup aggregate".to_owned(),
+        ));
+    }
 
     let end_label = b.emit_label();
     let done_label = b.emit_label();
@@ -14126,6 +14278,7 @@ fn codegen_multi_join_lookup_select(
     } else {
         None
     };
+    let limit = emit_join_output_limit(b, stmt, done_label);
     // Single outer rewind over the driver.
     let next_left_label = b.emit_label();
     let row_done_label = b.emit_label();
@@ -14273,6 +14426,7 @@ fn codegen_multi_join_lookup_select(
         &stmt.order_by,
         aggregates,
         accum_base,
+        limit,
     )?;
 
     // Jump past the trailing LEFT-JOIN null-row block (if any) to the
@@ -14306,6 +14460,7 @@ fn codegen_multi_join_lookup_select(
             &stmt.order_by,
             aggregates,
             accum_base,
+            limit,
         )?;
     }
 
@@ -14336,32 +14491,13 @@ fn codegen_multi_join_lookup_select(
     }
 
     if let Some((sort_cursor, sort_regs, sort_key_count, _sort_record_reg)) = sorter {
-        let sort_loop = b.emit_label();
-        let sort_done = b.emit_label();
-        b.emit_jump_to_label(Opcode::SorterSort, sort_cursor, 0, sort_done, P4::None, 0);
-        b.resolve_label(sort_loop);
-        b.emit_op(Opcode::SorterData, sort_cursor, sort_regs, 0, P4::None, 0);
-        for i in 0..out_col_count {
-            let dst = out_regs + i as i32;
-            b.emit_op(
-                Opcode::Column,
-                sort_cursor,
-                (sort_key_count + i) as i32,
-                dst,
-                P4::None,
-                0,
-            );
-        }
-        b.emit_op(
-            Opcode::ResultRow,
+        emit_join_sorter_output(
+            b,
+            (sort_cursor, sort_regs, sort_key_count),
             out_regs,
-            out_col_count as i32,
-            0,
-            P4::None,
-            0,
+            out_col_count,
+            limit,
         );
-        b.emit_jump_to_label(Opcode::SorterNext, sort_cursor, 0, sort_loop, P4::None, 0);
-        b.resolve_label(sort_done);
         b.emit_op(Opcode::Close, sort_cursor, 0, 0, P4::None, 0);
     }
 
@@ -14582,6 +14718,7 @@ fn codegen_join_select(
     } else {
         None
     };
+    let limit = emit_join_output_limit(b, stmt, done_label);
 
     // Nested loop: Rewind left, for each row rewind right, check ON + WHERE, emit.
     let next_left_label = b.emit_label();
@@ -14627,55 +14764,17 @@ fn codegen_join_select(
         b.emit_jump_to_label(Opcode::IfNot, cond_reg, 1, skip_label, P4::None, 0);
     }
 
-    // Emit output columns.
-    emit_join_result_columns(b, columns, out_regs, &all_tables, ctx)?;
-
-    if let Some((sort_cursor, sort_regs, sort_key_count, sort_record_reg)) = sorter {
-        // Copy sort keys then output columns into sorter registers.
-        for (i, term) in stmt.order_by.iter().enumerate() {
-            let sort_reg = sort_regs + i as i32;
-            emit_join_order_key(
-                b,
-                &term.expr,
-                sort_reg,
-                out_regs,
-                columns,
-                out_col_count,
-                &all_tables,
-                ctx,
-            )?;
-        }
-        for i in 0..out_col_count {
-            let src = out_regs + i as i32;
-            let dst = sort_regs + (sort_key_count + i) as i32;
-            b.emit_op(Opcode::SCopy, src, dst, 0, P4::None, 0);
-        }
-        b.emit_op(
-            Opcode::MakeRecord,
-            sort_regs,
-            (sort_key_count + out_col_count) as i32,
-            sort_record_reg,
-            P4::None,
-            0,
-        );
-        b.emit_op(
-            Opcode::SorterInsert,
-            sort_cursor,
-            sort_record_reg,
-            0,
-            P4::None,
-            0,
-        );
-    } else {
-        b.emit_op(
-            Opcode::ResultRow,
-            out_regs,
-            out_col_count as i32,
-            0,
-            P4::None,
-            0,
-        );
-    }
+    // Emit output columns (or feed the sorter).
+    emit_join_output_or_sort(
+        b,
+        columns,
+        out_regs,
+        &all_tables,
+        ctx,
+        sorter,
+        &stmt.order_by,
+        limit,
+    )?;
 
     // Close nested loops (inner to outer).
     // Resolve skip_label here so failed ON/WHERE conditions jump to the
@@ -14708,52 +14807,16 @@ fn codegen_join_select(
                 0,
             );
         }
-        emit_join_result_columns(b, columns, out_regs, &all_tables, ctx)?;
-        if let Some((sort_cursor, sort_regs, sort_key_count, sort_record_reg)) = sorter {
-            for (i, term) in stmt.order_by.iter().enumerate() {
-                let sort_reg = sort_regs + i as i32;
-                emit_join_order_key(
-                b,
-                &term.expr,
-                sort_reg,
-                out_regs,
-                columns,
-                out_col_count,
-                &all_tables,
-                ctx,
-            )?;
-            }
-            for i in 0..out_col_count {
-                let src = out_regs + i as i32;
-                let dst = sort_regs + (sort_key_count + i) as i32;
-                b.emit_op(Opcode::SCopy, src, dst, 0, P4::None, 0);
-            }
-            b.emit_op(
-                Opcode::MakeRecord,
-                sort_regs,
-                (sort_key_count + out_col_count) as i32,
-                sort_record_reg,
-                P4::None,
-                0,
-            );
-            b.emit_op(
-                Opcode::SorterInsert,
-                sort_cursor,
-                sort_record_reg,
-                0,
-                P4::None,
-                0,
-            );
-        } else {
-            b.emit_op(
-                Opcode::ResultRow,
-                out_regs,
-                out_col_count as i32,
-                0,
-                P4::None,
-                0,
-            );
-        }
+        emit_join_output_or_sort(
+            b,
+            columns,
+            out_regs,
+            &all_tables,
+            ctx,
+            sorter,
+            &stmt.order_by,
+            limit,
+        )?;
         b.resolve_label(skip_left_join_null_row);
     }
     b.emit_jump_to_label(Opcode::Next, left_cursor, 0, next_left_label, P4::None, 0);
@@ -14762,37 +14825,14 @@ fn codegen_join_select(
 
     // If sorting, emit sorter output.
     if let Some((sort_cursor, sort_regs, sort_key_count, _sort_record_reg)) = sorter {
-        let sort_loop = b.emit_label();
-        let sort_done = b.emit_label();
-        b.emit_jump_to_label(Opcode::SorterSort, sort_cursor, 0, sort_done, P4::None, 0);
-        b.resolve_label(sort_loop);
-        b.emit_op(Opcode::SorterData, sort_cursor, sort_regs, 0, P4::None, 0);
-        // Extract output columns from sorter data.
-        for i in 0..out_col_count {
-            let dst = out_regs + i as i32;
-            b.emit_op(
-                Opcode::Column,
-                sort_cursor,
-                (sort_key_count + i) as i32,
-                dst,
-                P4::None,
-                0,
-            );
-        }
-        b.emit_op(
-            Opcode::ResultRow,
+        emit_join_sorter_output(
+            b,
+            (sort_cursor, sort_regs, sort_key_count),
             out_regs,
-            out_col_count as i32,
-            0,
-            P4::None,
-            0,
+            out_col_count,
+            limit,
         );
-        b.emit_jump_to_label(Opcode::SorterNext, sort_cursor, 0, sort_loop, P4::None, 0);
-        b.resolve_label(sort_done);
     }
-
-    // LIMIT/OFFSET (simple version).
-    // (Full LIMIT support is handled by the caller's post-processing.)
 
     // Close cursors.
     for &rc in &right_cursors {
