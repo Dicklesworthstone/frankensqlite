@@ -40972,6 +40972,12 @@ impl Connection {
                 }
                 // View expansion: materialize referenced views as temp tables.
                 if self.has_view_references(select) {
+                    if let Some(flattened) = self.flatten_simple_view_select(select) {
+                        return Box::pin(
+                            self.execute_statement(&Statement::Select(flattened), params),
+                        )
+                        .await;
+                    }
                     self.log_mem_execution_fallback("select", "view_materialization")?;
                     return Box::pin(self.execute_with_materialized_views(select, params)).await;
                 }
@@ -75492,6 +75498,117 @@ impl Connection {
             })
     }
 
+    /// bd-kef4m: `select` with its one FROM source, a simple view (one table,
+    /// columns or plain expressions, an optional WHERE), flattened into the
+    /// query as stock flattens it, through views of views. A filter then
+    /// seeks the base table instead of first copying the whole view, which a
+    /// correlated subquery over a view paid once per outer row. `None` keeps
+    /// the materializing path.
+    ///
+    /// Flattening composes each level's expressions into the next, so a chain
+    /// of `SELECT n + 1 AS n FROM <previous view>` views becomes one
+    /// expression as deep as the chain, and evaluating a 1000-level one
+    /// overflows a 2 MiB stack. Materializing evaluates each level on its own
+    /// (bd-5haia), so a chain deeper than `MAX_FLATTENED_VIEW_LEVELS` takes
+    /// that path.
+    fn flatten_simple_view_select(&self, select: &SelectStatement) -> Option<SelectStatement> {
+        const MAX_FLATTENED_VIEW_LEVELS: usize = 16;
+        let mut flattened: Option<SelectStatement> = None;
+        for level in 0.. {
+            let current = flattened.as_ref().unwrap_or(select);
+            let SelectCore::Select {
+                from: Some(from), ..
+            } = &current.body.select
+            else {
+                break;
+            };
+            let TableOrSubquery::Table {
+                name,
+                alias,
+                index_hint: None,
+                time_travel: None,
+            } = &from.source
+            else {
+                break;
+            };
+            if !from.joins.is_empty() {
+                break;
+            }
+            let Some(view_index) = self.local_view_index_for_relation(name) else {
+                break;
+            };
+            let Some(body) = self.inlinable_view_body(view_index) else {
+                break;
+            };
+            if level == MAX_FLATTENED_VIEW_LEVELS {
+                return None;
+            }
+            let mut derived = current.clone();
+            if let SelectCore::Select {
+                from: Some(from), ..
+            } = &mut derived.body.select
+            {
+                from.source = TableOrSubquery::Subquery {
+                    query: Box::new(body),
+                    alias: Some(alias.clone().unwrap_or_else(|| name.name.clone())),
+                };
+            }
+            let Some(next) = flatten_from_subquery_select(&derived, true) else {
+                break;
+            };
+            flattened = Some(next);
+        }
+        flattened
+    }
+
+    /// bd-kef4m: flatten the simple view or derived-table source of a
+    /// correlated subquery whose outer references are bound, as executing it
+    /// would, but before its `col = <bound>` equalities are relaxed, so the
+    /// statement run once per outer row can seek the underlying table.
+    fn flatten_correlated_probe_source(&self, probe: &mut SelectStatement) {
+        if let Some(flattened) = self.flatten_simple_view_select(probe) {
+            *probe = flattened;
+        }
+        while let Some(flattened) = flatten_simple_from_subquery_select(probe) {
+            *probe = flattened;
+        }
+    }
+
+    /// bd-kef4m: a view's body bound as `execute_with_materialized_views`
+    /// binds it, its declared column names as aliases, or `None` when the
+    /// body is not one SELECT core or its columns cannot carry those names.
+    fn inlinable_view_body(&self, view_index: usize) -> Option<SelectStatement> {
+        let view = self.views.borrow().get(view_index)?.clone();
+        let mut body = view.query;
+        if body.with.is_some() || !body.body.compounds.is_empty() {
+            return None;
+        }
+        if !view.temporary {
+            qualify_persistent_view_relations(&mut body);
+        }
+        if let Some(Statement::Select(bound)) = self
+            .bind_schema_qualified_columns(&Statement::Select(body.clone()))
+            .ok()?
+        {
+            body = bound;
+        }
+        if !view.columns.is_empty() {
+            let SelectCore::Select { columns, .. } = &mut body.body.select else {
+                return None;
+            };
+            if columns.len() != view.columns.len() {
+                return None;
+            }
+            for (column, name) in columns.iter_mut().zip(&view.columns) {
+                let ResultColumn::Expr { alias, .. } = column else {
+                    return None;
+                };
+                *alias = Some(name.clone());
+            }
+        }
+        Some(body)
+    }
+
     /// Materialize views referenced by a SELECT as temporary tables, execute
     /// the query, then clean up the temp tables.
     ///
@@ -90488,7 +90605,8 @@ impl Connection {
     /// Scope is a single unshadowed MAIN FROM table (no joins/CTE/compound),
     /// including explicit `main` qualification used by foreign-key checks,
     /// with an AND-conjunction WHERE; each qualifying `col = bound` / `bound =
-    /// col` conjunct is relaxed in place.
+    /// col` conjunct is relaxed in place. bd-kef4m: in a join, a column
+    /// qualified by the name of exactly one such table relaxes too.
     fn relax_correlated_exists_equalities_for_seek(&self, select: &mut SelectStatement) {
         if select.with.is_some() || !select.body.compounds.is_empty() {
             return;
@@ -90504,6 +90622,17 @@ impl Connection {
                 return;
             };
             if !from.joins.is_empty() {
+                let tables: Vec<(TableSchema, String)> = std::iter::once(&from.source)
+                    .chain(from.joins.iter().map(|join| &join.table))
+                    .filter_map(|source| self.relaxable_join_table(source))
+                    .collect();
+                if let SelectCore::Select {
+                    where_clause: Some(where_expr),
+                    ..
+                } = &mut select.body.select
+                {
+                    relax_eq_conjunct_bound_outer_in_join(where_expr, &tables);
+                }
                 return;
             }
             match &from.source {
@@ -90543,6 +90672,35 @@ impl Connection {
             return;
         };
         relax_eq_conjunct_bound_outer(where_expr, &table, alias.as_deref());
+    }
+
+    /// bd-kef4m: a join source whose correlated equalities may be relaxed,
+    /// under the single-table rule (an unshadowed MAIN table), with the name
+    /// its columns are qualified by: its alias, else its table name.
+    fn relaxable_join_table(&self, source: &TableOrSubquery) -> Option<(TableSchema, String)> {
+        let TableOrSubquery::Table { name, alias, .. } = source else {
+            return None;
+        };
+        if name
+            .schema
+            .as_deref()
+            .is_some_and(|schema| !schema.eq_ignore_ascii_case("main"))
+        {
+            return None;
+        }
+        let table_key = name.name.to_ascii_lowercase();
+        if self.temp_table_names.borrow().contains(&table_key)
+            || self.shadowed_main_tables.borrow().contains_key(&table_key)
+        {
+            return None;
+        }
+        let table = self
+            .schema
+            .borrow()
+            .iter()
+            .find(|t| t.name.eq_ignore_ascii_case(&name.name))
+            .cloned()?;
+        Some((table, alias.clone().unwrap_or_else(|| name.name.clone())))
     }
 
     /// Substitute outer-row values with the connection's shadow-aware
@@ -90741,6 +90899,11 @@ impl Connection {
                     );
                     self.validate_select_column_references(&sub_clone)?;
                     self.validate_scalar_subquery_column_count(&sub_clone)?;
+                    // bd-kef4m: relax the correlated equalities as an EXISTS
+                    // probe's are, past a view or derived table, so the nested
+                    // statement seeks instead of scanning once per outer row.
+                    self.flatten_correlated_probe_source(&mut sub_clone);
+                    self.relax_correlated_exists_equalities_for_seek(&mut sub_clone);
                     // BoundOuterValue display intentionally omits affinity and
                     // collation metadata, so its SQL text cannot identify a
                     // reusable program or planner directive. Recompile this
@@ -90797,6 +90960,9 @@ impl Connection {
                     // so the nested statement compiles to an index / PRIMARY KEY seek
                     // instead of the full scan a bound-outer target otherwise forces —
                     // the quadratic bulk-ingest half of the trigger-WHEN EXISTS guard.
+                    // bd-kef4m: past a view or derived table, flattened only here so
+                    // the linear scan probe above never takes the flattened table.
+                    self.flatten_correlated_probe_source(&mut sub_clone);
                     self.relax_correlated_exists_equalities_for_seek(&mut sub_clone);
                     // bd-8c68u: a nested-loop join the VDBE compiles refuses a
                     // LIMIT, which would route the probe to the materializing
@@ -93845,6 +94011,67 @@ impl Connection {
             FSQLITE_JOIN_MEM_SCAN_FAST_PATH_HITS.fetch_add(1, AtomicOrdering::Relaxed);
         }
         Some(rows)
+    }
+
+    /// bd-kef4m: the row of local rowid table `src` whose rowid is `rowid`
+    /// (if any), in the shape a full scan of it yields: from the in-memory
+    /// mirror where [`Self::try_scan_join_source_from_memdb`] would read it,
+    /// otherwise by a rowid seek. `None` when `src` is not such a table.
+    async fn try_scan_join_source_rowid_point(
+        &self,
+        src: &JoinTableSource,
+        rowid: i64,
+    ) -> Option<Result<Vec<Vec<SqliteValue>>>> {
+        let binding_name = src.local_table_binding()?;
+        let (table_schema, rowid_alias_column_index) =
+            self.local_join_binding_table(binding_name)?;
+        if table_schema.without_rowid || self.table_name_is_virtual(&table_schema.name) {
+            return None;
+        }
+        let root_page = table_schema.root_page;
+        let has_virtual_generated = table_schema
+            .columns
+            .iter()
+            .any(|column| column.generated_expr.is_some() && column.generated_stored != Some(true));
+        if !has_virtual_generated
+            && (self.is_memdb_only_root_page(root_page) || self.join_mem_scan_safe())
+        {
+            let db = self.db.borrow();
+            if let Some(table) = db.get_table(root_page) {
+                let rows = table
+                    .row_values_by_rowid(rowid)
+                    .map(|values| {
+                        let mut row = values.to_vec();
+                        if let Some(alias_idx) = rowid_alias_column_index
+                            && let Some(alias_value) = row.get_mut(alias_idx)
+                        {
+                            *alias_value = SqliteValue::Integer(rowid);
+                        }
+                        if src.hidden_rowid_projection.is_some() {
+                            row.push(SqliteValue::Integer(rowid));
+                        }
+                        row
+                    })
+                    .into_iter()
+                    .collect();
+                return Some(Ok(rows));
+            }
+        }
+        // The scan's own SQL, restricted to the rowid by a name the table's
+        // columns do not shadow.
+        let rowid_column = join_hidden_rowid_projection(&src.col_names, true).or_else(|| {
+            rowid_alias_column_index
+                .and_then(|index| table_schema.columns.get(index))
+                .map(|column| quote_identifier(&column.name))
+        })?;
+        let scan_sql = format!("{} WHERE {rowid_column} = ?1", build_join_scan_sql(src));
+        let _tt_guard = (!self.memdb_rows_loaded.get())
+            .then(|| BoolCellRestoreGuard::new(&self.time_travel_active, false));
+        Some(
+            self.query_with_params(&scan_sql, &[SqliteValue::Integer(rowid)])
+                .await
+                .map(|rows| rows.iter().map(|row| row.values().to_vec()).collect()),
+        )
     }
 
     /// Whether a join source is a local table without generated columns, so a
@@ -100217,8 +100444,22 @@ impl Connection {
                     )?);
                     continue;
                 }
-                let mut row_data = if let Some(row_data) = self.try_scan_join_source_from_memdb(src)
-                {
+                // bd-kef4m: a WHERE pinning the primary table's rowid reads
+                // that row alone, so a per-row probe (`SELECT ... FROM t
+                // WHERE t.rowid = ?`) is a seek, not a scan. The filter below
+                // still applies the whole pushed-down WHERE.
+                let rowid_point = primary_where_pushdown
+                    .filter(|_| i == 0)
+                    .and_then(|expr| {
+                        join_primary_rowid_point(expr, &col_map[..primary_width], rowid_aliases[0])
+                    });
+                let point_rows = match rowid_point {
+                    Some(rowid) => self.try_scan_join_source_rowid_point(src, rowid).await,
+                    None => None,
+                };
+                let mut row_data = if let Some(result) = point_rows {
+                    result?
+                } else if let Some(row_data) = self.try_scan_join_source_from_memdb(src) {
                     row_data
                 } else if let Some(result) = self
                     .try_scan_join_source_from_pager(src, keep_masks[i].as_deref())
@@ -101586,6 +101827,10 @@ impl Connection {
                     if !allow_vector_subquery {
                         self.validate_scalar_subquery_column_count(&donor_subquery)?;
                     }
+                    // bd-kef4m: seek, as in eval_expr_with_subqueries. The
+                    // donor keeps the subquery's own result metadata.
+                    self.flatten_correlated_probe_source(&mut bound_subquery);
+                    self.relax_correlated_exists_equalities_for_seek(&mut bound_subquery);
                     // As for a scalar subquery in eval_expr_with_subqueries: a
                     // parameterized one without BoundOuterValue leaves is
                     // identified by its text and reuses its program.
@@ -101665,6 +101910,9 @@ impl Connection {
                     );
                     self.validate_select_column_references(&sub_clone)?;
                     self.validate_scalar_subquery_column_count(&sub_clone)?;
+                    // bd-kef4m: seek, as in eval_expr_with_subqueries.
+                    self.flatten_correlated_probe_source(&mut sub_clone);
+                    self.relax_correlated_exists_equalities_for_seek(&mut sub_clone);
                     let _cache_guard = BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true);
                     let rows = self
                         .execute_statement(&Statement::Select(sub_clone), None)
@@ -101689,6 +101937,9 @@ impl Connection {
                         using_skip,
                     );
                     strip_exists_subquery_projection(&mut sub_clone);
+                    // bd-kef4m: seek, as in eval_expr_with_subqueries.
+                    self.flatten_correlated_probe_source(&mut sub_clone);
+                    self.relax_correlated_exists_equalities_for_seek(&mut sub_clone);
                     let _cache_guard = BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true);
                     let rows = self
                         .execute_statement(&Statement::Select(sub_clone), None)
@@ -118362,6 +118613,16 @@ fn flatten_leading_paren_joins(select: &mut SelectStatement) {
 }
 
 fn flatten_simple_from_subquery_select(select: &SelectStatement) -> Option<SelectStatement> {
+    flatten_from_subquery_select(select, false)
+}
+
+/// `flatten_simple_from_subquery_select`. With `always_strict`, every name
+/// resolves strictly (bd-5ap77), as an inlined view's must (bd-kef4m): a
+/// column its body does not expose is "no such column", not a base column.
+fn flatten_from_subquery_select(
+    select: &SelectStatement,
+    always_strict: bool,
+) -> Option<SelectStatement> {
     if select.with.is_some() || !select.body.compounds.is_empty() {
         return None;
     }
@@ -118440,7 +118701,8 @@ fn flatten_simple_from_subquery_select(select: &SelectStatement) -> Option<Selec
     let inner_has_expressions = inner_columns
         .iter()
         .any(|column| matches!(column, ResultColumn::Expr { expr, .. } if !matches!(expr, Expr::Column(..))));
-    let strict = outer_has_expressions || inner_has_expressions || inner_is_table_function;
+    let strict =
+        always_strict || outer_has_expressions || inner_has_expressions || inner_is_table_function;
     if strict
         && (outer_where.as_deref().is_some_and(expr_has_any_subquery)
             || select
@@ -127373,6 +127635,67 @@ fn relax_eq_conjunct_bound_outer(expr: &mut Expr, table: &TableSchema, alias: Op
         }
         _ => {}
     }
+}
+
+/// bd-kef4m: [`relax_eq_conjunct_bound_outer`] for a join's WHERE. `tables`
+/// are its relaxable sources with the name each one's columns are qualified
+/// by. Only a column qualified by exactly one of those names is relaxed: an
+/// unqualified one could belong to any source.
+fn relax_eq_conjunct_bound_outer_in_join(expr: &mut Expr, tables: &[(TableSchema, String)]) {
+    match expr {
+        Expr::BinaryOp {
+            op: BinaryOp::And,
+            left,
+            right,
+            ..
+        } => {
+            relax_eq_conjunct_bound_outer_in_join(left, tables);
+            relax_eq_conjunct_bound_outer_in_join(right, tables);
+        }
+        Expr::BinaryOp {
+            op: BinaryOp::Eq,
+            left,
+            right,
+            ..
+        } => {
+            if let Some(col) = join_eq_seek_column(left, tables)
+                && let Some(literal) = bound_outer_relaxable_to_literal(right, col, true)
+            {
+                **right = literal;
+            } else if let Some(col) = join_eq_seek_column(right, tables)
+                && let Some(literal) = bound_outer_relaxable_to_literal(left, col, false)
+            {
+                **left = literal;
+            }
+        }
+        _ => {}
+    }
+}
+
+/// bd-kef4m: the [`ColumnInfo`] of a column reference qualified by the name
+/// of exactly one of `tables`.
+fn join_eq_seek_column<'a>(
+    expr: &Expr,
+    tables: &'a [(TableSchema, String)],
+) -> Option<&'a ColumnInfo> {
+    let Expr::Column(column, _) = expr else {
+        return None;
+    };
+    let qualifier = column.table.as_deref()?;
+    if column.schema.is_some() {
+        return None;
+    }
+    let mut named = tables
+        .iter()
+        .filter(|(_, name)| name.eq_ignore_ascii_case(qualifier));
+    let (table, _) = named.next()?;
+    if named.next().is_some() {
+        return None;
+    }
+    table
+        .columns
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case(column.column.as_ref()))
 }
 
 /// If `expr` is a bare column reference of `table` (unqualified, or qualified by
@@ -159745,6 +160068,50 @@ fn maybe_filter_primary_join_rows(
         }
     }
     Ok(filtered)
+}
+
+/// bd-kef4m: the integer a top-level AND term of the primary join source's
+/// pushed-down WHERE pins its rowid to (`<rowid or its alias> = <integer>`,
+/// either way round), the column resolved as `maybe_filter_primary_join_rows`
+/// resolves it. Only that row can pass the filter.
+fn join_primary_rowid_point(
+    where_clause: &Expr,
+    primary_col_map: &[(String, String, bool)],
+    rowid_alias: Option<usize>,
+) -> Option<i64> {
+    let rowid_equal_to = |column: &Expr, value: &Expr| {
+        let Expr::Column(col_ref, _) = column else {
+            return None;
+        };
+        if col_ref.table.is_none() && current_join_using_column_projection(&col_ref.column).is_some()
+        {
+            return None;
+        }
+        let index = resolve_join_expr_column_index(col_ref, primary_col_map).ok()?;
+        let (_, name, hidden) = primary_col_map.get(index)?;
+        if Some(index) != rowid_alias && !(*hidden && is_rowid_alias(name)) {
+            return None;
+        }
+        match value {
+            Expr::Literal(Literal::Integer(rowid), _)
+            | Expr::BoundOuterValue {
+                value: SqliteValue::Integer(rowid),
+                ..
+            } => Some(*rowid),
+            _ => None,
+        }
+    };
+    let mut terms = Vec::new();
+    flatten_and_terms(where_clause, &mut terms);
+    terms.into_iter().find_map(|term| match term {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOp::Eq,
+            right,
+            ..
+        } => rowid_equal_to(left, right).or_else(|| rowid_equal_to(right, left)),
+        _ => None,
+    })
 }
 
 fn expr_references_only_col_map(expr: &Expr, col_map: &[(String, String, bool)]) -> bool {
@@ -308292,10 +308659,7 @@ mod join_projection_prune_tests {
             .collect::<Vec<_>>()
             .join(", ");
         let big = (1..=BIG_ROWS)
-            .map(|id| {
-                let body = format!("body {id} ").repeat(BODY_BYTES / 8);
-                format!("({id}, {}, '{body}')", 1 + id % 50)
-            })
+            .map(|id| format!("({id}, {}, '{}')", 1 + id % 50, body(id)))
             .collect::<Vec<_>>()
             .join(", ");
         vec![
@@ -308305,49 +308669,63 @@ mod join_projection_prune_tests {
         ]
     }
 
+    fn body(id: i64) -> String {
+        format!("body {id} ").repeat(BODY_BYTES / 8)
+    }
+
     /// Statements the generic fallback runs (three sources or a subquery
-    /// source), and whether `big.body` must survive: it is named, or `*`
-    /// expands it. `rowid` alone does not keep it (the rowid alias is kept).
-    const CASES: [(&str, bool); 8] = [
+    /// source), whether `big.body` must survive: it is named, or `*` expands
+    /// it. `rowid` alone does not keep it (the rowid alias is kept). And the
+    /// `big` rowid the WHERE pins, if any: the fallback then reads that row of
+    /// `big` alone (bd-kef4m).
+    const CASES: [(&str, bool, Option<i64>); 8] = [
         (
             "SELECT COUNT(*) FROM big b JOIN small s ON s.id = b.sid JOIN tiny t ON t.id = s.tid",
             false,
+            None,
         ),
         (
             "SELECT COUNT(*) FROM big b JOIN small s ON s.id = b.sid \
              LEFT JOIN tiny t ON t.id = s.tid WHERE t.name = 'agent3'",
             false,
+            None,
         ),
         (
             "SELECT t.name, COUNT(*), SUM(CASE WHEN b.id % 2 = 0 THEN 1 ELSE 0 END) \
              FROM big b JOIN small s ON s.id = b.sid JOIN tiny t ON t.id = s.tid \
              GROUP BY t.name ORDER BY t.name",
             false,
+            None,
         ),
         (
             "SELECT COUNT(*) FROM big b \
              LEFT JOIN (SELECT id, MAX(name) AS name FROM tiny GROUP BY id) g ON g.id = b.sid % 8 + 1 \
              JOIN small s ON s.id = b.sid",
             false,
+            None,
         ),
         (
             "SELECT t.name, SUM(length(b.body)) FROM big b JOIN small s ON s.id = b.sid \
              JOIN tiny t ON t.id = s.tid GROUP BY t.name ORDER BY t.name",
             true,
+            None,
         ),
         (
             "SELECT b.id, substr(b.body, 1, 12), t.name FROM big b JOIN small s ON s.id = b.sid \
              JOIN tiny t ON t.id = s.tid WHERE b.id <= 3 ORDER BY b.id",
             true,
+            None,
         ),
         (
             "SELECT * FROM big b JOIN small s ON s.id = b.sid JOIN tiny t ON t.id = s.tid \
              WHERE b.id = 7",
             true,
+            Some(7),
         ),
         (
             "SELECT MAX(b.rowid) FROM big b JOIN small s ON s.id = b.sid JOIN tiny t ON t.id = s.tid",
             false,
+            None,
         ),
     ];
 
@@ -308377,7 +308755,9 @@ mod join_projection_prune_tests {
             }
 
             let all_bodies = usize::try_from(BIG_ROWS).unwrap() * BODY_BYTES;
-            for (case_index, (sql, body_survives)) in CASES.into_iter().enumerate() {
+            for (case_index, (sql, body_survives, pinned_big_rowid)) in
+                CASES.into_iter().enumerate()
+            {
                 conn.join_materialization_profile.replace(Default::default());
                 let rows = conn.query(&format!("{sql};")).await.unwrap();
                 let mut profile = *conn.join_materialization_profile.borrow();
@@ -308406,13 +308786,25 @@ mod join_projection_prune_tests {
                     assert_eq!(values_of(&fallback), stock_rows(&stock, sql, []), "{sql}");
                     profile = *conn.join_materialization_profile.borrow();
                 }
-                assert!(
-                    profile.generic_source_rows >= usize::try_from(BIG_ROWS).unwrap(),
-                    "{sql} must take the generic fallback: {profile:?}"
-                );
+                // The bodies of the `big` rows the fallback reads.
+                let read_bodies = if let Some(rowid) = pinned_big_rowid {
+                    assert!(
+                        profile.generic_route_hits > 0
+                            && profile.generic_source_rows < usize::try_from(BIG_ROWS).unwrap(),
+                        "{sql} pins big's rowid, so the generic fallback reads that row \
+                         alone: {profile:?}"
+                    );
+                    body(rowid).len()
+                } else {
+                    assert!(
+                        profile.generic_source_rows >= usize::try_from(BIG_ROWS).unwrap(),
+                        "{sql} must take the generic fallback: {profile:?}"
+                    );
+                    all_bodies
+                };
                 if body_survives {
                     assert!(
-                        profile.generic_source_payload_bytes > all_bodies,
+                        profile.generic_source_payload_bytes > read_bodies,
                         "{sql} names big.body, which must be kept: {profile:?}"
                     );
                 } else {

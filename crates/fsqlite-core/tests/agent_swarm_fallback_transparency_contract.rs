@@ -153,7 +153,10 @@ const STRICT_SQL_REPLAY_SCENARIOS: &[StrictSqlReplayScenario] = &[
         setup_sql: &[
             "CREATE TABLE g9_jobs(id INTEGER PRIMARY KEY, status TEXT);",
             "INSERT INTO g9_jobs(status) VALUES ('ready');",
-            "CREATE VIEW g9_ready_jobs AS SELECT status FROM g9_jobs WHERE status = 'ready';",
+            // A GROUP BY view: a simple view flattens without materializing
+            // (bd-kef4m), so it never reaches this boundary.
+            "CREATE VIEW g9_ready_jobs AS SELECT status, count(*) AS jobs FROM g9_jobs \
+             WHERE status = 'ready' GROUP BY status;",
         ],
         operation: ReplayOperation::Query,
         sql: "SELECT status FROM g9_ready_jobs;",

@@ -3402,9 +3402,26 @@ pub fn codegen_select(
     // but codegen's bare `rowid_target` extraction declines the conjunction, so the directive bypasses
     // (`rowid_lookup_target_missing`) and the shape falls through to a full scan. Route it here, before
     // the directive. The bare `rowid = <const>` (single conjunct) is declined by the detector and keeps
-    // its existing directive path. Same narrow gate as the IN seeks. `codegen_select_rowid_lookup`
-    // always opens the table, so the residual reads any column and all outputs work.
-    let rowid_eq_residual = if in_list_seek_allowed && rowid_in.is_none() && rowid_in_const.is_none()
+    // its existing directive path. Same narrow gate as the IN seeks, except that a LIMIT is admitted
+    // (bd-kef4m): the lookup visits at most one row and applies LIMIT/OFFSET itself, and `WHERE id = ?
+    // AND x = ? LIMIT 1` (a per-row EXISTS probe's shape) otherwise scanned the whole table. An anon
+    // `?` in LIMIT/OFFSET is declined: the lookup emits LIMIT before the WHERE. The lookup always
+    // opens the table, so the residual reads any column and all outputs work.
+    let rowid_eq_seek_allowed = !is_aggregate
+        && from_index_hint.is_none()
+        && stmt.order_by.is_empty()
+        && stmt.limit.as_ref().is_none_or(|clause| {
+            !expr_contains_non_numbered_placeholder(&clause.limit)
+                && !clause
+                    .offset
+                    .as_ref()
+                    .is_some_and(expr_contains_non_numbered_placeholder)
+        })
+        && distinct == Distinctness::All
+        && group_by.is_empty()
+        && having.is_none()
+        && !table.without_rowid;
+    let rowid_eq_residual = if rowid_eq_seek_allowed && rowid_in.is_none() && rowid_in_const.is_none()
     {
         extract_rowid_eq_residual_target(where_clause.as_deref(), table, table_alias)
     } else {
