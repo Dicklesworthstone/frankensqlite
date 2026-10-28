@@ -11148,12 +11148,22 @@ impl VdbeEngine {
                     let cursor_id = op.p1;
                     // Seek repositions the cursor, so clear any pending delete state.
                     self.pending_next_after_delete.remove(&cursor_id);
-                    let key = self.get_reg(op.p3);
-                    if key.is_null() {
-                        pc = op.p2 as usize;
-                        continue;
-                    }
-                    let rowid_val = key.to_integer();
+                    // Like stock's OP_SeekRowid, a key that is not an integer
+                    // takes NUMERIC affinity ('5', '5.0' and 5.0 become 5).
+                    // One still not an integer (5.5, 1e300, a blob, NULL)
+                    // equals no rowid; truncating it found the wrong row.
+                    let rowid_val = match self.get_reg(op.p3) {
+                        SqliteValue::Integer(rowid) => *rowid,
+                        key => {
+                            let numeric =
+                                key.clone().apply_affinity(fsqlite_types::TypeAffinity::Numeric);
+                            let SqliteValue::Integer(rowid) = numeric else {
+                                pc = op.p2 as usize;
+                                continue;
+                            };
+                            rowid
+                        }
+                    };
                     let use_rowset_advance = pc > 0
                         && ops.get(pc - 1).is_some_and(|prev| {
                             prev.opcode == Opcode::RowSetRead && prev.p3 == op.p3

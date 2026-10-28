@@ -40713,141 +40713,33 @@ fn emit_scalar_subquery(
             );
         }
     } else {
-        if let Some(where_expr) = where_clause
-            && let Some((probe_expr, residual_terms)) =
-                extract_exists_rowid_probe(where_expr, table, sub_alias)
-        {
-            let probe_reg = b.alloc_temp();
-            emit_expr_with_fallback(b, probe_expr, probe_reg, &sub_ctx, Some(outer_ctx));
-            b.emit_jump_to_label(Opcode::IsNull, probe_reg, 0, done_label, P4::None, 0);
-            b.emit_jump_to_label(
-                Opcode::SeekRowid,
-                sub_cursor,
-                probe_reg,
-                done_label,
-                P4::None,
-                0,
-            );
-            b.free_temp(probe_reg);
-
-            for residual_term in residual_terms {
-                let residual_reg = b.alloc_temp();
-                emit_expr_with_fallback(b, residual_term, residual_reg, &sub_ctx, Some(outer_ctx));
-                b.emit_jump_to_label(Opcode::IfNot, residual_reg, 1, done_label, P4::None, 0);
-                b.free_temp(residual_reg);
-            }
-
-            emit_scalar_subquery_result_value(b, columns, reg, &sub_ctx, outer_ctx);
-
-            b.resolve_label(done_label);
-            return;
-        }
-
-        // GH#432: seek an index on the probed column instead of scanning the
-        // table once per outer row. The index walks equal keys in rowid order,
-        // so its first match is the row a table scan would find first.
-        if subquery.order_by.is_empty()
-            && let Some(where_expr) = where_clause
-            && let Some(index_probe) =
-                extract_exists_index_probe(where_expr, table, sub_alias, outer_ctx)
-        {
-            let idx_cursor = b.alloc_aux_cursor_range(1);
-            let idx_open_done = b.emit_label();
-            b.emit_jump_to_label(Opcode::Once, 0, 0, idx_open_done, P4::None, 0);
-            b.emit_op(
-                Opcode::OpenRead,
-                idx_cursor,
-                index_probe.index.root_page,
-                0,
-                P4::Index(index_probe.index.name.clone()),
-                0,
-            );
-            b.resolve_label(idx_open_done);
-
-            let probe_regs = b.alloc_regs(2);
-            emit_expr_with_fallback(b, index_probe.probe, probe_regs, &sub_ctx, Some(outer_ctx));
-            b.emit_jump_to_label(Opcode::IsNull, probe_regs, 0, done_label, P4::None, 0);
-            if let Some(affinity) = index_probe.affinity {
-                emit_single_column_affinity(b, probe_regs, affinity);
-            }
-            b.emit_op(Opcode::Int64, 0, probe_regs + 1, 0, P4::Int64(i64::MIN), 0);
-            let probe_record = b.alloc_reg();
-            b.emit_op(Opcode::MakeRecord, probe_regs, 2, probe_record, P4::None, 0);
-            b.emit_jump_to_label(
-                Opcode::SeekGE,
-                idx_cursor,
-                probe_record,
-                done_label,
-                P4::None,
-                0,
-            );
-            let loop_top = b.current_addr();
-            let next_label = b.emit_label();
-            let key_reg = b.alloc_reg();
-            b.emit_op(Opcode::Column, idx_cursor, 0, key_reg, P4::None, 0);
-            b.emit_jump_to_label(
-                Opcode::Ne,
-                probe_regs,
-                key_reg,
-                done_label,
-                direct_lookup_index_comparison_p4(index_probe.index),
-                0x10,
-            );
-            let rowid_reg = b.alloc_temp();
-            b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
-            b.emit_jump_to_label(
-                Opcode::SeekRowid,
-                sub_cursor,
-                rowid_reg,
-                next_label,
-                P4::None,
-                0,
-            );
-            b.free_temp(rowid_reg);
-            for residual_term in index_probe.residual_terms {
-                let residual_reg = b.alloc_temp();
-                emit_expr_with_fallback(b, residual_term, residual_reg, &sub_ctx, Some(outer_ctx));
-                b.emit_jump_to_label(Opcode::IfNot, residual_reg, 1, next_label, P4::None, 0);
-                b.free_temp(residual_reg);
-            }
-            emit_scalar_subquery_result_value(b, columns, reg, &sub_ctx, outer_ctx);
-            b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
-            b.resolve_label(next_label);
-            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-            b.emit_op(Opcode::Next, idx_cursor, loop_top as i32, 0, P4::None, 0);
-            b.resolve_label(done_label);
-            return;
-        }
-
         // GH #172: an ORDER BY (with optional LIMIT/OFFSET) selects a specific
         // ordered row, not the first row in scan order. Route to a sorter-based
         // path that materializes the matching rows, sorts by the ORDER BY terms,
         // and reads the (OFFSET+1)-th result value. (An OFFSET without ORDER BY
         // has an unspecified order in SQLite, so that keeps the first-row scan.)
-        if subquery.order_by.is_empty() {
-            // Non-aggregate scalar subquery: grab first row's first column value.
-            let rewind_addr = b.current_addr();
-            b.emit_jump_to_label(Opcode::Rewind, sub_cursor, 0, done_label, P4::None, 0);
-            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-            let loop_body = (rewind_addr + 1) as i32;
-
-            // Apply WHERE filter.
-            let next_label = b.emit_label();
-            if let Some(where_expr) = where_clause {
-                let r_cond = b.alloc_temp();
-                emit_expr_with_fallback(b, where_expr, r_cond, &sub_ctx, Some(outer_ctx));
-                b.emit_jump_to_label(Opcode::IfNot, r_cond, 1, next_label, P4::None, 0);
-                b.free_temp(r_cond);
-            }
-
-            // Evaluate the first result column expression.
-            emit_scalar_subquery_result_value(b, columns, reg, &sub_ctx, outer_ctx);
-
-            // Got our value — jump to done (only need one row).
-            b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
-
-            b.resolve_label(next_label);
-            b.emit_op(Opcode::Next, sub_cursor, loop_body, 0, P4::None, 0);
+        // A rowid equality matches at most one row, so its order is moot.
+        if subquery.order_by.is_empty()
+            || where_clause.as_deref().is_some_and(|where_expr| {
+                extract_exists_rowid_probe(where_expr, table, sub_alias).is_some()
+            })
+        {
+            // Non-aggregate scalar subquery: the first matching row's first
+            // column value. The walk visits rows in rowid order, as a scan
+            // would, so a seek finds the row the scan would find first.
+            emit_scalar_subquery_rows(
+                b,
+                &sub_ctx,
+                outer_ctx,
+                where_clause.as_deref(),
+                false,
+                done_label,
+                &mut |b, _next| {
+                    emit_scalar_subquery_result_value(b, columns, reg, &sub_ctx, outer_ctx);
+                    // Got our value — jump to done (only need one row).
+                    b.emit_jump_to_label(Opcode::Goto, 0, 0, done_label, P4::None, 0);
+                },
+            );
         } else {
             emit_scalar_subquery_ordered(
                 b,
@@ -41013,6 +40905,202 @@ fn emit_scalar_subquery_ordered(
     b.emit_op(Opcode::Close, sorter_cursor, 0, 0, P4::None, 0);
 }
 
+/// Integer-literal rowid bounds among the WHERE's AND terms, for
+/// `emit_scalar_subquery_rows` to seek (bd-rl7ak).
+///
+/// Only integer literals: a seek compares rowids as integers, which agrees
+/// with SQL `<`/`>` for them. The walk re-applies the whole WHERE, so the
+/// other terms (and any other bound on the same side) still filter.
+fn scalar_subquery_rowid_range<'a>(
+    where_clause: Option<&'a Expr>,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+) -> Option<RowidRangeTarget<'a>> {
+    if table.without_rowid {
+        return None;
+    }
+    let (range, _) = extract_rowid_range_residual_target(where_clause, table, table_alias)?;
+    [range.lower, range.upper]
+        .into_iter()
+        .flatten()
+        .all(|bound| matches!(bound.expr, Expr::Literal(Literal::Integer(_), _)))
+        .then_some(range)
+}
+
+/// Walk the rows of a compiled scalar subquery's table that its WHERE
+/// matches, in rowid order, running `body` on each (bd-rl7ak).
+///
+/// The subquery runs once per outer row, so scanning its table each time is
+/// quadratic. Where the WHERE allows, the walk seeks instead:
+/// - a rowid equality seeks its one row;
+/// - an equality on a single-column index walks the equal keys, which the
+///   index keeps in rowid order (GH#432);
+/// - integer-literal rowid bounds seek the low end and stop past the high end.
+///
+/// Each visits the rows the scan would accept, in the scan's order, so
+/// order-sensitive aggregates (`group_concat`, a float `sum`) do not change.
+/// `body` gets the label that moves to the next row. A miss jumps to
+/// `done_label`, and the end of the walk falls through; the caller resolves
+/// `done_label` right after. `count_only` skips loading the table row when
+/// the index answers the whole WHERE.
+fn emit_scalar_subquery_rows(
+    b: &mut ProgramBuilder,
+    sub_ctx: &ScanCtx<'_>,
+    outer_ctx: &ScanCtx<'_>,
+    where_clause: Option<&Expr>,
+    count_only: bool,
+    done_label: crate::Label,
+    body: &mut dyn FnMut(&mut ProgramBuilder, crate::Label),
+) {
+    let (table, sub_alias, sub_cursor) = (sub_ctx.table, sub_ctx.table_alias, sub_ctx.cursor);
+    let emit_residuals = |b: &mut ProgramBuilder, terms: Vec<&Expr>, miss: crate::Label| {
+        for term in terms {
+            let residual_reg = b.alloc_temp();
+            emit_expr_with_fallback(b, term, residual_reg, sub_ctx, Some(outer_ctx));
+            b.emit_jump_to_label(Opcode::IfNot, residual_reg, 1, miss, P4::None, 0);
+            b.free_temp(residual_reg);
+        }
+    };
+
+    if let Some(where_expr) = where_clause
+        && let Some((probe_expr, residual_terms)) =
+            extract_exists_rowid_probe(where_expr, table, sub_alias)
+    {
+        let probe_reg = b.alloc_temp();
+        emit_expr_with_fallback(b, probe_expr, probe_reg, sub_ctx, Some(outer_ctx));
+        b.emit_jump_to_label(Opcode::IsNull, probe_reg, 0, done_label, P4::None, 0);
+        b.emit_jump_to_label(
+            Opcode::SeekRowid,
+            sub_cursor,
+            probe_reg,
+            done_label,
+            P4::None,
+            0,
+        );
+        b.free_temp(probe_reg);
+        emit_residuals(b, residual_terms, done_label);
+        body(b, done_label);
+        return;
+    }
+
+    let next_label = b.emit_label();
+    let (walk_cursor, loop_top) = if let Some(where_expr) = where_clause
+        && let Some(index_probe) =
+            extract_exists_index_probe(where_expr, table, sub_alias, outer_ctx)
+    {
+        // The probe key is `(value, i64::MIN)`, so the seek lands on the first
+        // entry equal to the value; the walk stops at the first that differs.
+        let idx_cursor = b.alloc_aux_cursor_range(1);
+        let idx_open_done = b.emit_label();
+        b.emit_jump_to_label(Opcode::Once, 0, 0, idx_open_done, P4::None, 0);
+        b.emit_op(
+            Opcode::OpenRead,
+            idx_cursor,
+            index_probe.index.root_page,
+            0,
+            P4::Index(index_probe.index.name.clone()),
+            0,
+        );
+        b.resolve_label(idx_open_done);
+        let probe_regs = b.alloc_regs(2);
+        emit_expr_with_fallback(b, index_probe.probe, probe_regs, sub_ctx, Some(outer_ctx));
+        b.emit_jump_to_label(Opcode::IsNull, probe_regs, 0, done_label, P4::None, 0);
+        if let Some(affinity) = index_probe.affinity {
+            emit_single_column_affinity(b, probe_regs, affinity);
+        }
+        b.emit_op(Opcode::Int64, 0, probe_regs + 1, 0, P4::Int64(i64::MIN), 0);
+        let probe_record = b.alloc_reg();
+        b.emit_op(Opcode::MakeRecord, probe_regs, 2, probe_record, P4::None, 0);
+        b.emit_jump_to_label(
+            Opcode::SeekGE,
+            idx_cursor,
+            probe_record,
+            done_label,
+            P4::None,
+            0,
+        );
+        let loop_top = b.current_addr();
+        let key_reg = b.alloc_reg();
+        b.emit_op(Opcode::Column, idx_cursor, 0, key_reg, P4::None, 0);
+        b.emit_jump_to_label(
+            Opcode::Ne,
+            probe_regs,
+            key_reg,
+            done_label,
+            direct_lookup_index_comparison_p4(index_probe.index),
+            0x10,
+        );
+        if !count_only || !index_probe.residual_terms.is_empty() {
+            let rowid_reg = b.alloc_temp();
+            b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
+            b.emit_jump_to_label(
+                Opcode::SeekRowid,
+                sub_cursor,
+                rowid_reg,
+                next_label,
+                P4::None,
+                0,
+            );
+            b.free_temp(rowid_reg);
+            emit_residuals(b, index_probe.residual_terms, next_label);
+        }
+        (idx_cursor, loop_top)
+    } else if let Some(range) = scalar_subquery_rowid_range(where_clause, table, sub_alias) {
+        let [lower, upper] = [range.lower, range.upper].map(|bound| {
+            bound.map(|bound| {
+                let reg = b.alloc_reg();
+                emit_expr(b, bound.expr, reg, None);
+                (bound, reg)
+            })
+        });
+        if let Some((bound, reg)) = lower {
+            let seek = if bound.inclusive {
+                Opcode::SeekGE
+            } else {
+                Opcode::SeekGT
+            };
+            b.emit_jump_to_label(seek, sub_cursor, reg, done_label, P4::None, 0);
+        } else {
+            b.emit_jump_to_label(Opcode::Rewind, sub_cursor, 0, done_label, P4::None, 0);
+        }
+        let loop_top = b.current_addr();
+        if let Some((bound, reg)) = upper {
+            let comparison = sub_ctx.schema.map(|schema| {
+                resolved_rowid_range_comparison(table, sub_alias, schema, bound)
+            });
+            let rowid_reg = b.alloc_reg();
+            b.emit_op(Opcode::Rowid, sub_cursor, rowid_reg, 0, P4::None, 0);
+            b.emit_jump_to_label(
+                if bound.inclusive {
+                    Opcode::Gt
+                } else {
+                    Opcode::Ge
+                },
+                reg,
+                rowid_reg,
+                done_label,
+                comparison
+                    .as_ref()
+                    .map_or(P4::None, |comparison| comparison.collation_p4.clone()),
+                comparison
+                    .as_ref()
+                    .map_or(0, |comparison| comparison.cmp_p5),
+            );
+        }
+        emit_residuals(b, where_clause.into_iter().collect(), next_label);
+        (sub_cursor, loop_top)
+    } else {
+        b.emit_jump_to_label(Opcode::Rewind, sub_cursor, 0, done_label, P4::None, 0);
+        let loop_top = b.current_addr();
+        emit_residuals(b, where_clause.into_iter().collect(), next_label);
+        (sub_cursor, loop_top)
+    };
+    body(b, next_label);
+    b.resolve_label(next_label);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    b.emit_op(Opcode::Next, walk_cursor, loop_top as i32, 0, P4::None, 0);
+}
+
 fn emit_scalar_count_star_subquery(
     b: &mut ProgramBuilder,
     sub_ctx: &ScanCtx<'_>,
@@ -41028,29 +41116,17 @@ fn emit_scalar_count_star_subquery(
     b.emit_op(Opcode::Integer, 0, reg, 0, P4::None, 0);
 
     let finalize_label = b.emit_label();
-    let rewind_addr = b.current_addr();
-    b.emit_jump_to_label(
-        Opcode::Rewind,
-        sub_ctx.cursor,
-        0,
+    emit_scalar_subquery_rows(
+        b,
+        sub_ctx,
+        outer_ctx,
+        where_clause,
+        true,
         finalize_label,
-        P4::None,
-        0,
+        &mut |b, _next| {
+            b.emit_op(Opcode::AddImm, reg, 1, 0, P4::None, 0);
+        },
     );
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    let loop_body = (rewind_addr + 1) as i32;
-
-    let skip_label = b.emit_label();
-    if let Some(where_expr) = where_clause {
-        let r_cond = b.alloc_temp();
-        emit_expr_with_fallback(b, where_expr, r_cond, sub_ctx, Some(outer_ctx));
-        b.emit_jump_to_label(Opcode::IfNot, r_cond, 1, skip_label, P4::None, 0);
-        b.free_temp(r_cond);
-    }
-
-    b.emit_op(Opcode::AddImm, reg, 1, 0, P4::None, 0);
-    b.resolve_label(skip_label);
-    b.emit_op(Opcode::Next, sub_ctx.cursor, loop_body, 0, P4::None, 0);
     b.resolve_label(finalize_label);
 }
 
@@ -41078,28 +41154,6 @@ fn emit_scalar_aggregate_subquery(
     let accum_reg = b.alloc_temp();
     b.emit_op(Opcode::Null, 0, accum_reg, 0, P4::None, 0);
 
-    let finalize_label = b.emit_label();
-    let rewind_addr = b.current_addr();
-    b.emit_jump_to_label(
-        Opcode::Rewind,
-        sub_ctx.cursor,
-        0,
-        finalize_label,
-        P4::None,
-        0,
-    );
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    let loop_body = (rewind_addr + 1) as i32;
-
-    // Apply WHERE filter.
-    let skip_label = b.emit_label();
-    if let Some(where_expr) = where_clause {
-        let r_cond = b.alloc_temp();
-        emit_expr_with_fallback(b, where_expr, r_cond, sub_ctx, Some(outer_ctx));
-        b.emit_jump_to_label(Opcode::IfNot, r_cond, 1, skip_label, P4::None, 0);
-        b.free_temp(r_cond);
-    }
-
     // Separate real (hidden) aggregates from the output entry (which may
     // have a wrapper_expr for complex expressions like COUNT(*) - 1).
     let real_aggs: Vec<&AggColumn> = agg_cols.iter().filter(|a| !a.name.is_empty()).collect();
@@ -41113,56 +41167,64 @@ fn emit_scalar_aggregate_subquery(
         accum_reg
     };
 
-    // Initialize all accumulators to NULL.
-    for i in 0..real_aggs.len() {
-        #[allow(clippy::cast_possible_wrap)]
-        b.emit_op(Opcode::Null, 0, accum_base + i as i32, 0, P4::None, 0);
-    }
-
-    // AggStep for each real aggregate in the loop body.
-    for (i, agg) in real_aggs.iter().enumerate() {
-        let total_args = agg.num_args.max(1);
-        let arg_base = b.alloc_regs(total_args);
-        if agg.num_args > 0 {
-            if agg.arg_is_rowid {
-                b.emit_op(Opcode::Rowid, sub_ctx.cursor, arg_base, 0, P4::None, 0);
-            } else if let Some(expr) = &agg.arg_expr {
-                emit_expr_with_fallback(b, expr, arg_base, sub_ctx, Some(outer_ctx));
-            } else if let Some(col_idx) = agg.arg_col_index {
-                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-                b.emit_op(
-                    Opcode::Column,
-                    sub_ctx.cursor,
-                    col_idx as i32,
-                    arg_base,
-                    P4::None,
-                    0,
-                );
+    let finalize_label = b.emit_label();
+    emit_scalar_subquery_rows(
+        b,
+        sub_ctx,
+        outer_ctx,
+        where_clause,
+        false,
+        finalize_label,
+        &mut |b, _next| {
+            // Initialize all accumulators to NULL.
+            for i in 0..real_aggs.len() {
+                #[allow(clippy::cast_possible_wrap)]
+                b.emit_op(Opcode::Null, 0, accum_base + i as i32, 0, P4::None, 0);
             }
-            for (j, extra_expr) in agg.extra_args.iter().enumerate() {
+
+            // AggStep for each real aggregate in the loop body.
+            for (i, agg) in real_aggs.iter().enumerate() {
+                let total_args = agg.num_args.max(1);
+                let arg_base = b.alloc_regs(total_args);
+                if agg.num_args > 0 {
+                    if agg.arg_is_rowid {
+                        b.emit_op(Opcode::Rowid, sub_ctx.cursor, arg_base, 0, P4::None, 0);
+                    } else if let Some(expr) = &agg.arg_expr {
+                        emit_expr_with_fallback(b, expr, arg_base, sub_ctx, Some(outer_ctx));
+                    } else if let Some(col_idx) = agg.arg_col_index {
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                        b.emit_op(
+                            Opcode::Column,
+                            sub_ctx.cursor,
+                            col_idx as i32,
+                            arg_base,
+                            P4::None,
+                            0,
+                        );
+                    }
+                    for (j, extra_expr) in agg.extra_args.iter().enumerate() {
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                        let extra_reg = arg_base + 1 + j as i32;
+                        emit_expr_with_fallback(b, extra_expr, extra_reg, sub_ctx, Some(outer_ctx));
+                    }
+                }
+
                 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-                let extra_reg = arg_base + 1 + j as i32;
-                emit_expr_with_fallback(b, extra_expr, extra_reg, sub_ctx, Some(outer_ctx));
+                {
+                    let num_args = agg.num_args as u16;
+                    let distinct_flag = i32::from(agg.distinct);
+                    b.emit_op(
+                        Opcode::AggStep,
+                        distinct_flag,
+                        arg_base,
+                        accum_base + i as i32,
+                        P4::FuncName(agg.name.clone()),
+                        num_args,
+                    );
+                }
             }
-        }
-
-        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        {
-            let num_args = agg.num_args as u16;
-            let distinct_flag = i32::from(agg.distinct);
-            b.emit_op(
-                Opcode::AggStep,
-                distinct_flag,
-                arg_base,
-                accum_base + i as i32,
-                P4::FuncName(agg.name.clone()),
-                num_args,
-            );
-        }
-    }
-
-    b.resolve_label(skip_label);
-    b.emit_op(Opcode::Next, sub_ctx.cursor, loop_body, 0, P4::None, 0);
+        },
+    );
 
     // Finalize all accumulators.
     b.resolve_label(finalize_label);
