@@ -40124,55 +40124,14 @@ fn extract_exists_index_probe<'a>(
         [(left, right, true), (right, left, false)]
             .into_iter()
             .find_map(|(inner, other, inner_on_left)| {
-                let Some(SortKeySource::Column(column_index)) =
-                    resolve_column_ref(inner, table, table_alias)
-                else {
-                    return None;
-                };
-                if !matches!(inner.as_ref(), Expr::Column(..))
-                    || extract_collation(other).is_some()
-                    || expr_references_scan(other, table, table_alias)
-                    || expr_contains_bound_outer_value(other)
-                    || expr_contains_nested_subquery(other)
-                {
-                    return None;
-                }
-                let column = table.columns.get(column_index)?;
-                let index = table.indexes.iter().find(|index| {
-                    index.supports_direct_column_lookup()
-                        && index.key_term_count() == 1
-                        && !index.key_term_descending(0)
-                        && index
-                            .columns
-                            .first()
-                            .is_some_and(|name| name.eq_ignore_ascii_case(&column.name))
-                })?;
-                // The left operand's declared collation wins; a probe without
-                // one (an expression) leaves the column's.
-                let column_collation = column.collation.as_deref().unwrap_or("BINARY");
-                let collation = if inner_on_left {
-                    column_collation
-                } else {
-                    declared_collation_ctx(other, Some(outer_ctx)).unwrap_or(column_collation)
-                };
-                if !collation_names_equivalent(Some(collation), index.key_term_collation(0)) {
-                    return None;
-                }
-                let column_affinity = schema_column_expr_affinity(column);
-                let comparison = combine_declared_comparison_affinity(
-                    column_affinity,
-                    true,
-                    expr_affinity(other, Some(outer_ctx)),
-                    expr_has_declared_affinity(other, Some(outer_ctx)),
-                );
-                let affinity = match u8::try_from(comparison).ok()? {
-                    0 => None,
-                    b'B' if column_affinity == b'B' => Some('B'),
-                    b'C' if matches!(column_affinity, b'C' | b'D' | b'E') => {
-                        Some(char::from(column_affinity))
-                    }
-                    _ => return None,
-                };
+                let (index, affinity) = single_column_index_for_comparison(
+                    inner,
+                    other,
+                    inner_on_left,
+                    table,
+                    table_alias,
+                    outer_ctx,
+                )?;
                 Some((position, index, other.as_ref(), affinity))
             })
     });
@@ -40188,6 +40147,361 @@ fn extract_exists_index_probe<'a>(
         affinity,
         residual_terms,
     })
+}
+
+/// The single-column index on `inner`'s column whose order agrees with SQL
+/// comparing `inner` and the outer-only `other`, and the affinity `other`
+/// takes before it is sought. See `extract_exists_index_probe` for the rules.
+fn single_column_index_for_comparison<'a>(
+    inner: &Expr,
+    other: &Expr,
+    inner_on_left: bool,
+    table: &'a TableSchema,
+    table_alias: Option<&str>,
+    outer_ctx: &ScanCtx<'_>,
+) -> Option<(&'a IndexSchema, Option<char>)> {
+    let column = outer_compared_column(inner, other, table, table_alias)?;
+    let index = table.indexes.iter().find(|index| {
+        index.supports_direct_column_lookup()
+            && index.key_term_count() == 1
+            && !index.key_term_descending(0)
+            && index
+                .columns
+                .first()
+                .is_some_and(|name| name.eq_ignore_ascii_case(&column.name))
+    })?;
+    let affinity = index_term_probe_affinity(index, 0, column, other, inner_on_left, outer_ctx)?;
+    Some((index, affinity))
+}
+
+/// The column of `table` that `inner` names, when the other side of the
+/// comparison is outer-only and so can be computed before a seek.
+fn outer_compared_column<'a>(
+    inner: &Expr,
+    other: &Expr,
+    table: &'a TableSchema,
+    table_alias: Option<&str>,
+) -> Option<&'a ColumnInfo> {
+    let Some(SortKeySource::Column(column_index)) = resolve_column_ref(inner, table, table_alias)
+    else {
+        return None;
+    };
+    if !matches!(inner, Expr::Column(..))
+        || extract_collation(other).is_some()
+        || expr_references_scan(other, table, table_alias)
+        || expr_contains_bound_outer_value(other)
+        || expr_contains_nested_subquery(other)
+    {
+        return None;
+    }
+    table.columns.get(column_index)
+}
+
+/// Whether key term `term` of `index`, on `column`, orders values the way
+/// SQL compares `column` with `other`, under the rules of
+/// `extract_exists_index_probe`. If so, returns the affinity `other` takes
+/// before it is sought, `None` when it takes none.
+#[allow(clippy::option_option)]
+fn index_term_probe_affinity(
+    index: &IndexSchema,
+    term: usize,
+    column: &ColumnInfo,
+    other: &Expr,
+    inner_on_left: bool,
+    outer_ctx: &ScanCtx<'_>,
+) -> Option<Option<char>> {
+    // The left operand's declared collation wins; a probe without one (an
+    // expression) leaves the column's.
+    let column_collation = column.collation.as_deref().unwrap_or("BINARY");
+    let collation = if inner_on_left {
+        column_collation
+    } else {
+        declared_collation_ctx(other, Some(outer_ctx)).unwrap_or(column_collation)
+    };
+    if !collation_names_equivalent(Some(collation), index.key_term_collation(term)) {
+        return None;
+    }
+    let column_affinity = schema_column_expr_affinity(column);
+    let comparison = combine_declared_comparison_affinity(
+        column_affinity,
+        true,
+        expr_affinity(other, Some(outer_ctx)),
+        expr_has_declared_affinity(other, Some(outer_ctx)),
+    );
+    match u8::try_from(comparison).ok()? {
+        0 => Some(None),
+        b'B' if column_affinity == b'B' => Some(Some('B')),
+        b'C' if matches!(column_affinity, b'C' | b'D' | b'E') => {
+            Some(Some(char::from(column_affinity)))
+        }
+        _ => None,
+    }
+}
+
+/// One end of an `IndexRangeProbe`.
+#[derive(Clone, Copy)]
+struct IndexRangeProbeBound<'a> {
+    expr: &'a Expr,
+    inclusive: bool,
+    affinity: Option<char>,
+}
+
+/// Bounds on the column of a single-column index among a correlated
+/// subquery's AND terms, each outer-only (bd-rl7ak).
+struct IndexRangeProbe<'a> {
+    index: &'a IndexSchema,
+    lower: Option<IndexRangeProbeBound<'a>>,
+    upper: Option<IndexRangeProbeBound<'a>>,
+}
+
+/// Find `<`, `<=`, `>`, `>=` or `BETWEEN` terms that bound the column of a
+/// single-column index, under the rules of `extract_exists_index_probe`.
+/// Every bound comes from the same index; the first per side wins, and the
+/// caller re-applies the whole WHERE.
+fn extract_index_range_probe<'a>(
+    where_expr: &'a Expr,
+    table: &'a TableSchema,
+    table_alias: Option<&str>,
+    outer_ctx: &ScanCtx<'_>,
+) -> Option<IndexRangeProbe<'a>> {
+    use fsqlite_ast::BinaryOp;
+    if table.without_rowid {
+        return None;
+    }
+    let mut terms = Vec::new();
+    flatten_and_terms(where_expr, &mut terms);
+    // (column side, bound side, column on the left, bounds from below, inclusive)
+    let mut comparisons: Vec<(&Expr, &'a Expr, bool, bool, bool)> = Vec::new();
+    for term in terms {
+        match term {
+            Expr::BinaryOp {
+                left, op, right, ..
+            } => {
+                let (left_is_lower, inclusive) = match op {
+                    BinaryOp::Gt => (true, false),
+                    BinaryOp::Ge => (true, true),
+                    BinaryOp::Lt => (false, false),
+                    BinaryOp::Le => (false, true),
+                    _ => continue,
+                };
+                let (left, right) = (left.as_ref(), right.as_ref());
+                comparisons.push((left, right, true, left_is_lower, inclusive));
+                comparisons.push((right, left, false, !left_is_lower, inclusive));
+            }
+            Expr::Between {
+                expr,
+                low,
+                high,
+                not: false,
+                ..
+            } => {
+                comparisons.push((expr.as_ref(), low.as_ref(), true, true, true));
+                comparisons.push((expr.as_ref(), high.as_ref(), true, false, true));
+            }
+            _ => {}
+        }
+    }
+    let mut probe: Option<IndexRangeProbe<'a>> = None;
+    for (inner, other, inner_on_left, is_lower, inclusive) in comparisons {
+        let Some((index, affinity)) = single_column_index_for_comparison(
+            inner,
+            other,
+            inner_on_left,
+            table,
+            table_alias,
+            outer_ctx,
+        ) else {
+            continue;
+        };
+        let probe = probe.get_or_insert(IndexRangeProbe {
+            index,
+            lower: None,
+            upper: None,
+        });
+        if !probe.index.name.eq_ignore_ascii_case(&index.name) {
+            continue;
+        }
+        let slot = if is_lower {
+            &mut probe.lower
+        } else {
+            &mut probe.upper
+        };
+        if slot.is_none() {
+            *slot = Some(IndexRangeProbeBound {
+                expr: other,
+                inclusive,
+                affinity,
+            });
+        }
+    }
+    probe
+}
+
+/// A walk of a multi-column index for a correlated subquery (bd-rl7ak):
+/// equalities on its leading key terms, then bounds on the next term, each
+/// against an outer-only value.
+struct CompositeIndexProbe<'a> {
+    index: &'a IndexSchema,
+    /// The value and affinity for each leading key term, in key order.
+    keys: Vec<(&'a Expr, Option<char>)>,
+    lower: Option<IndexRangeProbeBound<'a>>,
+    upper: Option<IndexRangeProbeBound<'a>>,
+    /// The AND terms the equalities do not answer, the bounds included.
+    residual_terms: Vec<&'a Expr>,
+}
+
+impl CompositeIndexProbe<'_> {
+    /// How much of the index the probe pins: two per equality, and one for
+    /// bounds on the term after them.
+    fn rank(&self) -> usize {
+        2 * self.keys.len() + usize::from(self.lower.is_some() || self.upper.is_some())
+    }
+}
+
+/// Find the multi-column index whose leading key terms the WHERE's
+/// equalities pin the most, plus the bounds on the term after them. Each
+/// term follows the rules of `extract_exists_index_probe`; only ascending
+/// terms are used. The first index wins a tie, and the first bound per side
+/// wins.
+fn extract_composite_index_probe<'a>(
+    where_expr: &'a Expr,
+    table: &'a TableSchema,
+    table_alias: Option<&str>,
+    outer_ctx: &ScanCtx<'_>,
+) -> Option<CompositeIndexProbe<'a>> {
+    use fsqlite_ast::BinaryOp;
+    if table.without_rowid {
+        return None;
+    }
+    let mut terms = Vec::new();
+    flatten_and_terms(where_expr, &mut terms);
+    // (term position, column, other side, column on the left)
+    let mut equalities = Vec::new();
+    // (column, bound side, column on the left, bounds from below, inclusive)
+    let mut bounds = Vec::new();
+    for (position, term) in terms.iter().copied().enumerate() {
+        match term {
+            Expr::BinaryOp {
+                left, op, right, ..
+            } => {
+                let range = match op {
+                    BinaryOp::Eq => None,
+                    BinaryOp::Gt => Some((true, false)),
+                    BinaryOp::Ge => Some((true, true)),
+                    BinaryOp::Lt => Some((false, false)),
+                    BinaryOp::Le => Some((false, true)),
+                    _ => continue,
+                };
+                for (inner, other, inner_on_left) in [(left, right, true), (right, left, false)] {
+                    let Some(column) = outer_compared_column(inner, other, table, table_alias)
+                    else {
+                        continue;
+                    };
+                    match range {
+                        None => equalities.push((position, column, other.as_ref(), inner_on_left)),
+                        Some((left_is_lower, inclusive)) => bounds.push((
+                            column,
+                            other.as_ref(),
+                            inner_on_left,
+                            left_is_lower == inner_on_left,
+                            inclusive,
+                        )),
+                    }
+                }
+            }
+            Expr::Between {
+                expr,
+                low,
+                high,
+                not: false,
+                ..
+            } => {
+                for (other, is_lower) in [(low, true), (high, false)] {
+                    if let Some(column) = outer_compared_column(expr, other, table, table_alias) {
+                        bounds.push((column, other.as_ref(), true, is_lower, true));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut best: Option<CompositeIndexProbe<'a>> = None;
+    for index in &table.indexes {
+        if !index.supports_direct_column_lookup() || index.key_term_count() < 2 {
+            continue;
+        }
+        let term_column = |term: usize| {
+            index
+                .columns
+                .get(term)
+                .filter(|_| !index.key_term_descending(term))
+        };
+        let mut used = Vec::new();
+        let mut keys = Vec::new();
+        while let Some(name) = term_column(keys.len()) {
+            let term = keys.len();
+            let found = equalities.iter().find_map(|&(position, column, other, inner_on_left)| {
+                if used.contains(&position) || !column.name.eq_ignore_ascii_case(name) {
+                    return None;
+                }
+                let affinity = index_term_probe_affinity(
+                    index,
+                    term,
+                    column,
+                    other,
+                    inner_on_left,
+                    outer_ctx,
+                )?;
+                Some((position, other, affinity))
+            });
+            let Some((position, other, affinity)) = found else {
+                break;
+            };
+            used.push(position);
+            keys.push((other, affinity));
+        }
+        let (mut lower, mut upper) = (None, None);
+        if let Some(name) = term_column(keys.len()) {
+            for &(column, other, inner_on_left, is_lower, inclusive) in &bounds {
+                if !column.name.eq_ignore_ascii_case(name) {
+                    continue;
+                }
+                let Some(affinity) = index_term_probe_affinity(
+                    index,
+                    keys.len(),
+                    column,
+                    other,
+                    inner_on_left,
+                    outer_ctx,
+                ) else {
+                    continue;
+                };
+                let slot = if is_lower { &mut lower } else { &mut upper };
+                if slot.is_none() {
+                    *slot = Some(IndexRangeProbeBound {
+                        expr: other,
+                        inclusive,
+                        affinity,
+                    });
+                }
+            }
+        }
+        let probe = CompositeIndexProbe {
+            index,
+            keys,
+            lower,
+            upper,
+            residual_terms: terms
+                .iter()
+                .enumerate()
+                .filter_map(|(position, term)| (!used.contains(&position)).then_some(*term))
+                .collect(),
+        };
+        if probe.rank() > best.as_ref().map_or(0, CompositeIndexProbe::rank) {
+            best = Some(probe);
+        }
+    }
+    best
 }
 
 /// Whether the compiled EXISTS and scalar-subquery emitters seek instead of
@@ -40928,17 +41242,24 @@ fn scalar_subquery_rowid_range<'a>(
 }
 
 /// Walk the rows of a compiled scalar subquery's table that its WHERE
-/// matches, in rowid order, running `body` on each (bd-rl7ak).
+/// matches, running `body` on each (bd-rl7ak).
 ///
 /// The subquery runs once per outer row, so scanning its table each time is
 /// quadratic. Where the WHERE allows, the walk seeks instead:
 /// - a rowid equality seeks its one row;
 /// - an equality on a single-column index walks the equal keys, which the
 ///   index keeps in rowid order (GH#432);
-/// - integer-literal rowid bounds seek the low end and stop past the high end.
+/// - integer-literal rowid bounds seek the low end and stop past the high end;
+/// - bounds on the column of a single-column index walk that slice of it;
+/// - equalities on the leading columns of a multi-column index, then bounds
+///   on its next column, walk that slice of it. It goes ahead of the
+///   single-column equality when it pins more than one column.
 ///
-/// Each visits the rows the scan would accept, in the scan's order, so
+/// The rowid equality, the single-column equality and the rowid bounds
+/// visit the rows the scan would accept in the scan's rowid order, so
 /// order-sensitive aggregates (`group_concat`, a float `sum`) do not change.
+/// An index slice visits them in index order, as stock does when it walks
+/// the same index.
 /// `body` gets the label that moves to the next row. A miss jumps to
 /// `done_label`, and the end of the walk falls through; the caller resolves
 /// `done_label` right after. `count_only` skips loading the table row when
@@ -40984,7 +41305,110 @@ fn emit_scalar_subquery_rows(
     }
 
     let next_label = b.emit_label();
-    let (walk_cursor, loop_top) = if let Some(where_expr) = where_clause
+    let composite = where_clause.and_then(|where_expr| {
+        extract_composite_index_probe(where_expr, table, sub_alias, outer_ctx)
+    });
+    let composite_rank = composite.as_ref().map_or(0, CompositeIndexProbe::rank);
+    let composite_walk = |b: &mut ProgramBuilder, probe: CompositeIndexProbe<'_>| {
+        // The walk follows the index's order, as stock's walk of the same
+        // index does. A probe record shorter than the index key compares as
+        // its prefix: SeekGE lands on the first entry that starts with it,
+        // and SeekGT on the first entry after those. The walk stops at the
+        // first entry whose leading keys differ or that passes the upper
+        // bound.
+        let idx_cursor = b.alloc_aux_cursor_range(1);
+        let idx_open_done = b.emit_label();
+        b.emit_jump_to_label(Opcode::Once, 0, 0, idx_open_done, P4::None, 0);
+        b.emit_op(
+            Opcode::OpenRead,
+            idx_cursor,
+            probe.index.root_page,
+            0,
+            P4::Index(probe.index.name.clone()),
+            0,
+        );
+        b.resolve_label(idx_open_done);
+        // A NULL value matches nothing.
+        let load = |b: &mut ProgramBuilder, expr: &Expr, reg: i32, affinity: Option<char>| {
+            emit_expr_with_fallback(b, expr, reg, sub_ctx, Some(outer_ctx));
+            b.emit_jump_to_label(Opcode::IsNull, reg, 0, done_label, P4::None, 0);
+            if let Some(affinity) = affinity {
+                emit_single_column_affinity(b, reg, affinity);
+            }
+        };
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let prefix = probe.keys.len() as i32;
+        // The equal keys, then the lower bound.
+        let key_regs = b.alloc_regs(prefix + 1);
+        for ((expr, affinity), offset) in probe.keys.iter().copied().zip(0_i32..) {
+            load(b, expr, key_regs + offset, affinity);
+        }
+        let upper = probe.upper.map(|bound| {
+            let reg = b.alloc_reg();
+            load(b, bound.expr, reg, bound.affinity);
+            (bound.inclusive, reg)
+        });
+        let seek = match probe.lower {
+            Some(bound) => {
+                load(b, bound.expr, key_regs + prefix, bound.affinity);
+                let seek = if bound.inclusive {
+                    Opcode::SeekGE
+                } else {
+                    Opcode::SeekGT
+                };
+                Some((prefix + 1, seek))
+            }
+            None => (prefix > 0).then_some((prefix, Opcode::SeekGE)),
+        };
+        if let Some((fields, seek)) = seek {
+            let probe_record = b.alloc_reg();
+            b.emit_op(Opcode::MakeRecord, key_regs, fields, probe_record, P4::None, 0);
+            b.emit_jump_to_label(seek, idx_cursor, probe_record, done_label, P4::None, 0);
+        } else {
+            b.emit_jump_to_label(Opcode::Rewind, idx_cursor, 0, done_label, P4::None, 0);
+        }
+        let loop_top = b.current_addr();
+        let key_reg = b.alloc_reg();
+        for (term, column) in (0_i32..).enumerate().take(probe.keys.len()) {
+            b.emit_op(Opcode::Column, idx_cursor, column, key_reg, P4::None, 0);
+            b.emit_jump_to_label(
+                Opcode::Ne,
+                key_regs + column,
+                key_reg,
+                done_label,
+                index_term_comparison_p4(probe.index, term),
+                0x10,
+            );
+        }
+        if let Some((inclusive, reg)) = upper {
+            b.emit_op(Opcode::Column, idx_cursor, prefix, key_reg, P4::None, 0);
+            b.emit_jump_to_label(
+                if inclusive { Opcode::Gt } else { Opcode::Ge },
+                reg,
+                key_reg,
+                done_label,
+                index_term_comparison_p4(probe.index, probe.keys.len()),
+                0,
+            );
+        }
+        if !count_only || !probe.residual_terms.is_empty() {
+            let rowid_reg = b.alloc_temp();
+            b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
+            b.emit_jump_to_label(
+                Opcode::SeekRowid,
+                sub_cursor,
+                rowid_reg,
+                next_label,
+                P4::None,
+                0,
+            );
+            b.free_temp(rowid_reg);
+            emit_residuals(b, probe.residual_terms, next_label);
+        }
+        (idx_cursor, loop_top)
+    };
+    let (walk_cursor, loop_top) = if composite_rank <= 2
+        && let Some(where_expr) = where_clause
         && let Some(index_probe) =
             extract_exists_index_probe(where_expr, table, sub_alias, outer_ctx)
     {
@@ -41045,6 +41469,10 @@ fn emit_scalar_subquery_rows(
             emit_residuals(b, index_probe.residual_terms, next_label);
         }
         (idx_cursor, loop_top)
+    } else if composite_rank >= 2
+        && let Some(probe) = composite
+    {
+        composite_walk(b, probe)
     } else if let Some(range) = scalar_subquery_rowid_range(where_clause, table, sub_alias) {
         let [lower, upper] = [range.lower, range.upper].map(|bound| {
             bound.map(|bound| {
@@ -41089,6 +41517,83 @@ fn emit_scalar_subquery_rows(
         }
         emit_residuals(b, where_clause.into_iter().collect(), next_label);
         (sub_cursor, loop_top)
+    } else if let Some(where_expr) = where_clause
+        && let Some(range) = extract_index_range_probe(where_expr, table, sub_alias, outer_ctx)
+    {
+        // The walk follows the index's order, as stock's walk of the same
+        // index does. A NULL bound matches nothing; with no lower bound the
+        // walk starts at the NULL keys, which the WHERE rejects.
+        let idx_cursor = b.alloc_aux_cursor_range(1);
+        let idx_open_done = b.emit_label();
+        b.emit_jump_to_label(Opcode::Once, 0, 0, idx_open_done, P4::None, 0);
+        b.emit_op(
+            Opcode::OpenRead,
+            idx_cursor,
+            range.index.root_page,
+            0,
+            P4::Index(range.index.name.clone()),
+            0,
+        );
+        b.resolve_label(idx_open_done);
+        let [lower, upper] = [range.lower, range.upper].map(|bound| {
+            bound.map(|bound| {
+                let regs = b.alloc_regs(2);
+                emit_expr_with_fallback(b, bound.expr, regs, sub_ctx, Some(outer_ctx));
+                b.emit_jump_to_label(Opcode::IsNull, regs, 0, done_label, P4::None, 0);
+                if let Some(affinity) = bound.affinity {
+                    emit_single_column_affinity(b, regs, affinity);
+                }
+                (bound, regs)
+            })
+        });
+        if let Some((bound, regs)) = lower {
+            // `(value, i64::MIN)` sorts before every entry equal to the value
+            // and `(value, i64::MAX)` after them.
+            let (rowid, seek) = if bound.inclusive {
+                (i64::MIN, Opcode::SeekGE)
+            } else {
+                (i64::MAX, Opcode::SeekGT)
+            };
+            b.emit_op(Opcode::Int64, 0, regs + 1, 0, P4::Int64(rowid), 0);
+            let probe_record = b.alloc_reg();
+            b.emit_op(Opcode::MakeRecord, regs, 2, probe_record, P4::None, 0);
+            b.emit_jump_to_label(seek, idx_cursor, probe_record, done_label, P4::None, 0);
+        } else {
+            b.emit_jump_to_label(Opcode::Rewind, idx_cursor, 0, done_label, P4::None, 0);
+        }
+        let loop_top = b.current_addr();
+        if let Some((bound, regs)) = upper {
+            // Stop at the first key past the bound in index order.
+            let key_reg = b.alloc_reg();
+            b.emit_op(Opcode::Column, idx_cursor, 0, key_reg, P4::None, 0);
+            b.emit_jump_to_label(
+                if bound.inclusive {
+                    Opcode::Gt
+                } else {
+                    Opcode::Ge
+                },
+                regs,
+                key_reg,
+                done_label,
+                index_term_comparison_p4(range.index, 0),
+                0,
+            );
+        }
+        let rowid_reg = b.alloc_temp();
+        b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
+        b.emit_jump_to_label(
+            Opcode::SeekRowid,
+            sub_cursor,
+            rowid_reg,
+            next_label,
+            P4::None,
+            0,
+        );
+        b.free_temp(rowid_reg);
+        emit_residuals(b, where_clause.into_iter().collect(), next_label);
+        (idx_cursor, loop_top)
+    } else if let Some(probe) = composite {
+        composite_walk(b, probe)
     } else {
         b.emit_jump_to_label(Opcode::Rewind, sub_cursor, 0, done_label, P4::None, 0);
         let loop_top = b.current_addr();

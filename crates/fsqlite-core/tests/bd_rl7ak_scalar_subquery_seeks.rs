@@ -9,9 +9,11 @@
 //! table once per outer row whenever it was an aggregate, and whenever its
 //! WHERE bounded only the rowid. At 20,000 rows `UPDATE u SET n = (SELECT
 //! count(*) FROM t WHERE t.g = u.g AND t.id < 10)` took 111 s; stock takes
-//! 0.04 s. The subquery now seeks a rowid equality, an equality on a
-//! single-column index, or integer-literal rowid bounds, and visits the rows
-//! a scan would accept in the scan's order.
+//! 0.04 s. The subquery now seeks a rowid equality, integer-literal rowid
+//! bounds, equalities on an index's leading columns, or bounds on the index
+//! column after them. Rowid seeks and a single-column equality visit the rows
+//! a scan would accept in the scan's order; other index slices visit them in
+//! index order, as stock's walk of the same index does.
 //!
 //! A rowid equality seeks with `SeekRowid`, which truncated a key that is not
 //! an integer: `t.id = 5.5` and `t.id = x'35'` found row 5, and `t.id = 1e300`
@@ -101,7 +103,9 @@ async fn fq(
 
 /// `t` has a NULL `g` every 11th row, a float `r`, so a float `sum` depends
 /// on the order it adds in, and the largest rowid. `w` and `h` hold the same
-/// keys without a rowid and with a hidden one.
+/// keys without a rowid and with a hidden one. `m` has a three-column index
+/// whose last column is not in rowid order, NULL keys, and indexes whose
+/// leading term is descending or NOCASE; `q` has a UNIQUE constraint's index.
 const SCHEMA: &str = "\
 CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT, g INTEGER, n INTEGER, r REAL);\
 CREATE INDEX t_g ON t(g);\
@@ -110,10 +114,27 @@ INSERT INTO t WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHE
   SELECT i, 'v' || (i % 7), CASE WHEN i % 11 = 0 THEN NULL ELSE i % 9 END, i % 5, i * 0.1 \
   FROM s;\
 INSERT INTO t VALUES (9223372036854775807, 'vmax', 4, 4, 0.5);\
+CREATE INDEX t_r ON t(r);\
+CREATE TABLE c(id INTEGER PRIMARY KEY, s TEXT COLLATE NOCASE);\
+CREATE INDEX c_s ON c(s);\
+INSERT INTO c VALUES (1, 'a'), (2, 'B'), (3, 'b'), (4, 'C'), (5, 'A'), (6, 'd'), (7, 'c'), \
+  (8, NULL), (9, 'bb'), (10, 'Ab');\
 CREATE TABLE w(k INTEGER PRIMARY KEY, g INTEGER) WITHOUT ROWID;\
 INSERT INTO w SELECT id, g FROM t;\
 CREATE TABLE h(a INTEGER, g INTEGER);\
-INSERT INTO h SELECT id, g FROM t ORDER BY id;";
+INSERT INTO h SELECT id, g FROM t ORDER BY id;\
+CREATE TABLE m(id INTEGER PRIMARY KEY, a INTEGER, b TEXT, c REAL, d INTEGER, \
+  e TEXT COLLATE NOCASE);\
+INSERT INTO m WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 90) \
+  SELECT i, CASE WHEN i % 13 = 0 THEN NULL ELSE i % 4 END, \
+  CASE WHEN i % 17 = 0 THEN NULL ELSE 'b' || (i % 3) END, ((i * 37) % 91) * 0.25, i % 6, \
+  CASE WHEN i % 5 = 0 THEN 'x' ELSE 'X' END || (i % 3) FROM s;\
+CREATE INDEX m_abc ON m(a, b, c);\
+CREATE INDEX m_da ON m(d DESC, a);\
+CREATE INDEX m_bd ON m(b COLLATE NOCASE, d);\
+CREATE INDEX m_ea ON m(e, a);\
+CREATE TABLE q(a INTEGER, b INTEGER, n INTEGER, UNIQUE(a, b));\
+INSERT INTO q SELECT n, g, max(id) FROM t GROUP BY n, g;";
 
 // rusqlite's bundled SQLite enforces foreign keys by default; fsqlite does not.
 const RESET: &str = "PRAGMA foreign_keys = OFF; DROP TABLE IF EXISTS u; DROP TABLE IF EXISTS p;\
@@ -221,6 +242,65 @@ const STATEMENTS: &[(&str, &[i64])] = &[
          AND x.id < 60)",
         &[],
     ),
+    // Bounds on the column of a single-column index.
+    (
+        "UPDATE u SET n = (SELECT count(*) FROM t AS x WHERE x.g BETWEEN u.n AND u.n + 2)",
+        &[],
+    ),
+    (
+        "UPDATE u SET v = (SELECT group_concat(x.id) FROM t AS x \
+         WHERE x.g > u.g AND x.g <= u.g + 1)",
+        &[],
+    ),
+    (
+        "UPDATE u SET r = (SELECT sum(x.r) FROM t AS x WHERE x.g < u.n)",
+        &[],
+    ),
+    (
+        "UPDATE u SET n = (SELECT x.id FROM t AS x WHERE x.g >= u.g + 3)",
+        &[],
+    ),
+    (
+        "UPDATE u SET n = (SELECT x.id FROM t AS x WHERE u.n > x.g AND x.n <> u.n)",
+        &[],
+    ),
+    (
+        "UPDATE u SET v = (SELECT max(x.v) || group_concat(x.id) FROM t AS x \
+         WHERE x.v > 'v' || u.n AND x.v < 'v6')",
+        &[],
+    ),
+    (
+        "UPDATE u SET n = (SELECT count(*) FROM t AS x WHERE x.r BETWEEN u.r - 1 AND u.r + 1)",
+        &[],
+    ),
+    (
+        "UPDATE u SET r = (SELECT total(x.r) FROM t AS x WHERE x.r > u.n * 1.5 \
+         AND x.r <= u.n * 1.5 + 0.35)",
+        &[],
+    ),
+    (
+        "UPDATE u SET n = (SELECT count(*) FROM t AS x WHERE x.g > '3' AND x.g < 7.5)",
+        &[],
+    ),
+    (
+        "UPDATE u SET n = (SELECT count(*) FROM t AS x WHERE x.v > u.g)",
+        &[],
+    ),
+    (
+        "UPDATE u SET n = (SELECT count(*) FROM t AS x WHERE x.g >= u.g AND x.g < u.g)",
+        &[],
+    ),
+    (
+        "UPDATE u SET v = (SELECT group_concat(c.id) FROM c WHERE c.s >= 'b' \
+         AND c.s < substr('ABCD', u.n + 1, 1))",
+        &[],
+    ),
+    (
+        "UPDATE u SET v = (SELECT group_concat(c.id) FROM c WHERE c.s > 'a' COLLATE BINARY \
+         AND u.n > 1)",
+        &[],
+    ),
+    ("UPDATE u SET v = (SELECT c.s FROM c WHERE c.s <= u.v)", &[]),
     // A rowid equality.
     (
         "UPDATE u SET n = (SELECT count(*) FROM t AS x WHERE x.id = u.id + 3 AND x.n > 1)",
@@ -282,6 +362,85 @@ const STATEMENTS: &[(&str, &[i64])] = &[
          b = (SELECT count(*) FROM t WHERE t.id < 20 AND t.g = p.val)",
         &[],
     ),
+    (
+        "UPDATE p SET a = (SELECT count(*) FROM t WHERE t.g >= p.val AND t.g < p.val + 2), \
+         b = (SELECT group_concat(t.id) FROM t WHERE t.v <= p.val)",
+        &[],
+    ),
+    (
+        "UPDATE p SET a = (SELECT group_concat(c.id) FROM c WHERE c.s > p.val), \
+         b = (SELECT count(*) FROM t WHERE t.r < p.val)",
+        &[],
+    ),
+    // Equalities on the leading columns of a multi-column index, then bounds
+    // on the next column. The walk follows the index.
+    (
+        "UPDATE u SET v = (SELECT group_concat(m.id) FROM m WHERE m.a = u.n \
+         AND m.b = 'b' || (u.id % 3))",
+        &[],
+    ),
+    (
+        "UPDATE u SET v = (SELECT group_concat(m.id) FROM m WHERE m.a = u.g % 4)",
+        &[],
+    ),
+    (
+        "UPDATE u SET r = (SELECT total(m.c) FROM m WHERE m.b = 'b1' AND m.a = u.n \
+         AND m.c > u.r * 10 AND m.c <= u.r * 10 + 6)",
+        &[],
+    ),
+    (
+        "UPDATE u SET n = (SELECT count(*) FROM m WHERE m.a = u.n AND m.b = 'b2' \
+         AND m.c = ((u.id * 37) % 91) * 0.25)",
+        &[],
+    ),
+    (
+        "UPDATE u SET v = (SELECT group_concat(m.id) FROM m WHERE m.a >= u.n \
+         AND m.a < u.n + 2)",
+        &[],
+    ),
+    (
+        "UPDATE u SET v = (SELECT group_concat(m.id) FROM m WHERE m.a = u.n \
+         AND m.b BETWEEN 'b0' AND 'b1')",
+        &[],
+    ),
+    (
+        "UPDATE u SET v = (SELECT m.id || ',' || m.b FROM m WHERE u.n = m.a AND m.b > 'b0')",
+        &[],
+    ),
+    // Terms the index cannot order: a TEXT column under numeric affinity, an
+    // explicit collation, a NOCASE or a descending leading key term.
+    (
+        "UPDATE u SET n = (SELECT count(*) FROM m WHERE m.a = u.n AND m.b = u.g)",
+        &[],
+    ),
+    (
+        "UPDATE u SET v = (SELECT group_concat(m.id) FROM m WHERE m.a = u.n \
+         AND m.b = 'B1' COLLATE NOCASE)",
+        &[],
+    ),
+    (
+        "UPDATE u SET n = (SELECT max(m.id) FROM m WHERE m.e = 'X' || (u.id % 3) \
+         AND m.a = u.n)",
+        &[],
+    ),
+    (
+        "UPDATE u SET n = (SELECT max(m.id) FROM m WHERE m.d = u.n AND m.a = 1)",
+        &[],
+    ),
+    (
+        "UPDATE u SET n = (SELECT q.n FROM q WHERE q.a = u.n AND q.b = u.g)",
+        &[],
+    ),
+    (
+        "UPDATE p SET a = (SELECT group_concat(m.id) FROM m WHERE m.a = p.val \
+         AND m.b = 'b1'), b = (SELECT count(*) FROM m WHERE m.a = 1 AND m.b = p.val)",
+        &[],
+    ),
+    (
+        "UPDATE u SET n = (SELECT count(*) FROM m WHERE m.a = ?1 AND m.b = 'b0' \
+         AND m.c < ?2) WHERE u.id > ?3",
+        &[2, 15, 40],
+    ),
     // DELETE decides by such a subquery.
     (
         "DELETE FROM u WHERE (SELECT count(*) FROM t AS x WHERE x.g = u.g AND x.id < 30) > 2",
@@ -293,6 +452,10 @@ const STATEMENTS: &[(&str, &[i64])] = &[
     ),
     (
         "DELETE FROM u WHERE (SELECT x.id FROM t AS x WHERE x.id > 75 AND x.n = u.n) IS NULL",
+        &[],
+    ),
+    (
+        "DELETE FROM u WHERE (SELECT count(*) FROM m WHERE m.a = u.n AND m.b = 'b1') > 6",
         &[],
     ),
     // Bound parameters, numbered and anonymous.
@@ -335,6 +498,24 @@ const STATEMENTS: &[(&str, &[i64])] = &[
     (
         "SELECT p.id FROM p WHERE EXISTS (SELECT 1 FROM t WHERE t.id = p.val) ORDER BY p.id",
         &[],
+    ),
+    (
+        "SELECT u.id, (SELECT count(*) FROM m WHERE m.a = u.n AND m.b = 'b0'), \
+         (SELECT max(m.c) FROM m WHERE m.a = u.n AND m.c > u.r) FROM u ORDER BY u.id",
+        &[],
+    ),
+    // `max`, not `group_concat`: a SELECT list visits an index range in rowid
+    // order, unlike stock (bd-c6b16).
+    (
+        "SELECT u.id, (SELECT count(*) FROM t AS x WHERE x.g BETWEEN u.n AND u.n + 1), \
+         (SELECT max(x.id) FROM t AS x WHERE x.r > u.r AND x.r < u.r + 0.25) \
+         FROM u ORDER BY u.id",
+        &[],
+    ),
+    (
+        "UPDATE u SET n = (SELECT count(*) FROM t AS x WHERE x.g > ?1 AND x.g <= u.g) \
+         WHERE u.id > ?2",
+        &[2, 10],
     ),
 ];
 
@@ -446,6 +627,14 @@ fn seeking_subqueries_visit_few_rows() {
         "UPDATE u SET n = (SELECT max(x.id) FROM t AS x WHERE x.g = u.g)",
         "UPDATE u SET n = (SELECT count(*) FROM t AS x WHERE x.id = u.id + 3 AND x.n > 1)",
         "UPDATE u SET n = (SELECT x.id FROM t AS x WHERE x.id > 990 AND x.n = u.n + 7)",
+        "UPDATE u SET n = (SELECT count(*) FROM t AS x WHERE x.g BETWEEN u.g AND u.g + 1)",
+        "UPDATE u SET n = (SELECT max(x.n) FROM t AS x WHERE x.g > u.g AND x.g < u.g + 3 \
+         AND x.n < u.n)",
+        "UPDATE u SET n = (SELECT count(*) FROM k WHERE k.a = u.id % 100 AND k.b = u.id % 7)",
+        "UPDATE u SET n = (SELECT max(k.id) FROM k WHERE k.a = u.id % 100)",
+        "UPDATE u SET n = (SELECT count(*) FROM k WHERE k.a = u.id % 100 AND k.b > u.n)",
+        "UPDATE u SET n = (SELECT count(*) FROM k WHERE k.a BETWEEN u.id % 100 AND u.id % 100)",
+        "UPDATE u SET n = (SELECT q.n FROM q WHERE q.a = u.g AND q.b = u.n)",
     ];
     const SCAN_CONTROL: &str =
         "UPDATE u SET n = (SELECT count(*) FROM t AS x WHERE x.n = u.n AND x.id < u.id)";
@@ -461,7 +650,12 @@ fn seeking_subqueries_visit_few_rows() {
              INSERT INTO t WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s \
                WHERE i < {COST_ROWS}) SELECT i, i % 250, i % 5 FROM s;\
              CREATE TABLE u(id INTEGER PRIMARY KEY, g INTEGER, n INTEGER);\
-             INSERT INTO u SELECT * FROM t;"
+             INSERT INTO u SELECT * FROM t;\
+             CREATE TABLE k(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER);\
+             CREATE INDEX k_ab ON k(a, b);\
+             INSERT INTO k SELECT id, id % 100, id % 7 FROM t;\
+             CREATE TABLE q(a INTEGER, b INTEGER, n INTEGER, UNIQUE(a, b));\
+             INSERT INTO q SELECT g, n, max(id) FROM t GROUP BY g, n;"
         ))
         .await
         .unwrap();
