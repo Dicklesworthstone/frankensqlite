@@ -88082,6 +88082,8 @@ impl Connection {
     ) -> Result<SqliteValue> {
         let window = resolve_used_window_spec(window, named_windows)?;
         validate_window_frame_shape(&window)?;
+        let quoted_args = self.window_args_quoting_varying_json(name, args);
+        let args = quoted_args.as_ref().unwrap_or(args);
         let arg_exprs = match args {
             FunctionArgs::List(values) => values.as_slice(),
             FunctionArgs::Star => &[],
@@ -93723,6 +93725,8 @@ impl Connection {
                     ..
                 } => {
                     let spec = resolve_used_window_spec(raw_spec, &named_windows)?;
+                    let quoted_args = self.window_args_quoting_varying_json(name, args);
+                    let args = quoted_args.as_ref().unwrap_or(args);
                     let args_are_star = matches!(args, FunctionArgs::Star);
                     let arg_exprs = match args {
                         FunctionArgs::List(exprs) => exprs
@@ -93813,6 +93817,9 @@ impl Connection {
                     } in extracted_windows
                     {
                         let inner_spec = resolve_used_window_spec(&raw_inner_spec, &named_windows)?;
+                        let inner_args = self
+                            .window_args_quoting_varying_json(&inner_name, &inner_args)
+                            .unwrap_or(inner_args);
                         let args_are_star = matches!(&inner_args, FunctionArgs::Star);
                         let arg_exprs = match &inner_args {
                             FunctionArgs::List(exprs) => exprs
@@ -94769,6 +94776,8 @@ impl Connection {
                     ..
                 } => {
                     let spec = resolve_used_window_spec(raw_spec, &named_windows)?;
+                    let quoted_args = self.window_args_quoting_varying_json(name, args);
+                    let args = quoted_args.as_ref().unwrap_or(args);
                     let args_are_star = matches!(args, FunctionArgs::Star);
                     let arg_exprs = match args {
                         FunctionArgs::List(exprs) => exprs.clone(),
@@ -94832,6 +94841,9 @@ impl Connection {
                     } in extracted_windows
                     {
                         let inner_spec = resolve_used_window_spec(&raw_inner_spec, &named_windows)?;
+                        let inner_args = self
+                            .window_args_quoting_varying_json(&inner_name, &inner_args)
+                            .unwrap_or(inner_args);
                         let args_are_star = matches!(&inner_args, FunctionArgs::Star);
                         let arg_exprs = match &inner_args {
                             FunctionArgs::List(exprs) => exprs.clone(),
@@ -97242,13 +97254,66 @@ impl Connection {
         Arc::new(fsqlite_func::WindowWithArgSubtypes::new(func, arg_subtypes))
     }
 
-    fn expr_result_json_subtype(&self, expr: &Expr) -> u32 {
-        let Expr::FunctionCall { name, args, .. } = expr else {
-            return 0;
+    /// The arguments to evaluate for a builtin JSON aggregate window call
+    /// whose VALUE argument has a per-row subtype (json_extract), which the
+    /// static binding above cannot express. That argument is passed through
+    /// json_quote(), which keeps a JSON-subtyped value as it is and renders any
+    /// other value as the aggregate would, and whose result is always JSON, so
+    /// the static binding then embeds it. `None` leaves `args` as they are.
+    /// bd-ikehc.
+    fn window_args_quoting_varying_json(
+        &self,
+        name: &str,
+        args: &FunctionArgs,
+    ) -> Option<FunctionArgs> {
+        let FunctionArgs::List(exprs) = args else {
+            return None;
         };
-        let num_args = match args {
-            FunctionArgs::List(list) => i32::try_from(list.len()).unwrap_or(-1),
-            FunctionArgs::Star => -1,
+        let lower = name.to_ascii_lowercase();
+        let value_index = if lower.ends_with("_group_array") {
+            0
+        } else if lower.ends_with("_group_object") {
+            1
+        } else {
+            return None;
+        };
+        if !is_builtin_json_aggregate(name)
+            || self
+                .application_function_kind(name, aggregate_args_len_for_lookup(args))
+                .is_some()
+            || self.application_function_kind("json_quote", 1).is_some()
+        {
+            return None;
+        }
+        let value = exprs.get(value_index)?;
+        if !self.expr_result_json_subtype_varies(value) {
+            return None;
+        }
+        let mut exprs = exprs.clone();
+        exprs[value_index] = Expr::FunctionCall {
+            name: "json_quote".to_owned(),
+            args: FunctionArgs::List(vec![value.clone()]),
+            distinct: false,
+            order_by: Vec::new(),
+            filter: None,
+            over: None,
+            span: value.span(),
+        };
+        Some(FunctionArgs::List(exprs))
+    }
+
+    fn expr_result_json_subtype(&self, expr: &Expr) -> u32 {
+        let (name, num_args) = match expr {
+            Expr::FunctionCall { name, args, .. } => {
+                let num_args = match args {
+                    FunctionArgs::List(list) => i32::try_from(list.len()).unwrap_or(-1),
+                    FunctionArgs::Star => -1,
+                };
+                (name.as_str(), num_args)
+            }
+            // `x -> path` calls the `->` scalar, whose result is JSON (bd-ikehc).
+            Expr::JsonAccess { arrow, .. } => (json_access_function_name(*arrow), 2),
+            _ => return 0,
         };
         let registry = self.func_registry.borrow();
         if registry
@@ -97259,6 +97324,22 @@ impl Connection {
         } else {
             0
         }
+    }
+
+    /// Whether `expr` calls a scalar whose JSON subtype depends on the value it
+    /// returns (json_extract), so only a per-row evaluation knows it. bd-ikehc.
+    fn expr_result_json_subtype_varies(&self, expr: &Expr) -> bool {
+        let Expr::FunctionCall { name, args, .. } = expr else {
+            return false;
+        };
+        let num_args = match args {
+            FunctionArgs::List(list) => i32::try_from(list.len()).unwrap_or(-1),
+            FunctionArgs::Star => -1,
+        };
+        self.func_registry
+            .borrow()
+            .find_scalar(name, num_args)
+            .is_some_and(|func| func.result_subtype_varies())
     }
 
     /// bd-76x57: does any result-column aggregate take a JSON-subtyped argument?
@@ -97284,9 +97365,14 @@ impl Connection {
                     && is_current_aggregate_fn(name, args)
                     && !is_scalar_max_min(name, args)
                     && let FunctionArgs::List(exprs) = args
-                    && exprs
-                        .iter()
-                        .any(|arg| self.expr_result_json_subtype(arg) != 0)
+                    && exprs.iter().any(|arg| {
+                        self.expr_result_json_subtype(arg) != 0
+                            // A per-row subtype (json_extract) matters only to the
+                            // JSON aggregates; `sum(json_extract(..))` keeps the
+                            // substrate. bd-ikehc.
+                            || (is_builtin_json_aggregate(name)
+                                && self.expr_result_json_subtype_varies(arg))
+                    })
                 {
                     return true;
                 }
@@ -127650,33 +127736,48 @@ fn prepare_application_aggregate_rows(
     entries.into_iter().map(|(args, _)| args).collect()
 }
 
-/// bd-76x57: the JSON subtype a scalar-call argument expression yields,
-/// resolved through the thread-local function registry (the free-function
-/// mirror of `Connection::expr_result_json_subtype`, used by the grouped
-/// aggregate evaluator below). Only a top-level scalar call whose
-/// `result_subtype()` is JSON qualifies; the property is constant across the
-/// group's rows, so a single static lookup suffices.
+/// One json_group_object row in the grouped aggregate evaluator below: the
+/// label, the value with its JSON subtype, and the in-aggregate ORDER BY keys.
 #[cfg(feature = "ext-json")]
-fn expr_result_json_subtype_via_registry(expr: &Expr) -> u32 {
-    let Expr::FunctionCall { name, args, .. } = expr else {
-        return 0;
-    };
-    let num_args = match args {
-        FunctionArgs::List(list) => i32::try_from(list.len()).unwrap_or(-1),
-        FunctionArgs::Star => -1,
-    };
-    let is_json = with_current_sync_function_registry(|registry| {
-        registry.is_some_and(|registry| {
-            registry
-                .find_scalar(name, num_args)
-                .is_some_and(|func| func.result_subtype() == Some(fsqlite_func::JSON_SUBTYPE))
-        })
-    });
-    if is_json {
-        fsqlite_func::JSON_SUBTYPE
-    } else {
-        0
+type JsonObjectAggregateItem = ((SqliteValue, (SqliteValue, u32)), Vec<SqliteValue>);
+
+/// The JSON subtype a JSON aggregate's argument expression gives every row of
+/// the grouped aggregate evaluator below (see `evaluated_arg_json_subtype`),
+/// or `None` when it depends on the row, as json_extract()'s depends on what
+/// it returns. bd-76x57 derived one subtype per group; bd-ikehc.
+#[cfg(feature = "ext-json")]
+fn fixed_json_aggregate_arg_subtype(expr: &Expr) -> Option<u32> {
+    if let Expr::FunctionCall { name, args, .. } = expr {
+        let arity = match args {
+            FunctionArgs::List(list) => i32::try_from(list.len()).unwrap_or(-1),
+            FunctionArgs::Star => -1,
+        };
+        if let PreparedJoinScalar::Resolved(resolved) =
+            resolve_current_registered_scalar(name, arity)
+            && resolved.function().result_subtype_varies()
+        {
+            return None;
+        }
     }
+    Some(evaluated_arg_json_subtype(expr))
+}
+
+/// Evaluate a JSON aggregate's argument for one row of the grouped aggregate
+/// evaluator below, with the JSON subtype its value carries: `fixed`, from
+/// `fixed_json_aggregate_arg_subtype`, or else what the call reported.
+#[cfg(feature = "ext-json")]
+fn eval_json_aggregate_arg(
+    expr: &Expr,
+    fixed: Option<u32>,
+    row: &[SqliteValue],
+    col_map: &[(String, String, bool)],
+) -> Result<(SqliteValue, u32)> {
+    if let Some(subtype) = fixed {
+        return Ok((eval_join_expr(expr, row, col_map)?, subtype));
+    }
+    LAST_VARYING_RESULT_SUBTYPE.with(|cell| cell.set(0));
+    let value = eval_join_expr(expr, row, col_map)?;
+    Ok((value, LAST_VARYING_RESULT_SUBTYPE.with(Cell::get)))
 }
 
 /// Evaluate an expression that may contain aggregate function calls against
@@ -127718,8 +127819,10 @@ fn eval_group_agg_join_expr(
                 let arg = exprs.first().ok_or_else(|| {
                     FrankenError::function_error("json_group_array() requires 1 argument")
                 })?;
-                // Collect (value, ORDER BY keys) for each row that passes FILTER.
-                let mut items: Vec<(SqliteValue, Vec<SqliteValue>)> = Vec::new();
+                // Collect ((value, subtype), ORDER BY keys) for each row that
+                // passes FILTER.
+                let fixed_subtype = fixed_json_aggregate_arg_subtype(arg);
+                let mut items: Vec<((SqliteValue, u32), Vec<SqliteValue>)> = Vec::new();
                 for row in group_rows {
                     if let Some(filter_expr) = filter
                         && !is_sqlite_truthy(&eval_join_expr(filter_expr, row, col_map)?)
@@ -127727,7 +127830,7 @@ fn eval_group_agg_join_expr(
                         continue;
                     }
                     // NULLs are preserved (rendered as JSON null).
-                    let value = eval_join_expr(arg, row, col_map)?;
+                    let value = eval_json_aggregate_arg(arg, fixed_subtype, row, col_map)?;
                     let mut keys = Vec::with_capacity(order_by.len());
                     for term in order_by {
                         keys.push(eval_join_expr(&term.expr, row, col_map)?);
@@ -127739,7 +127842,7 @@ fn eval_group_agg_join_expr(
                     let distinct_collation = join_expr_effective_collation(arg, col_map);
                     retain_first_distinct(
                         &mut items,
-                        |(value, _)| value,
+                        |((value, _), _)| value,
                         distinct_collation.as_deref(),
                         &collation_registry,
                     );
@@ -127756,21 +127859,17 @@ fn eval_group_agg_join_expr(
                         )
                     });
                 }
-                let vals: Vec<SqliteValue> = items.into_iter().map(|(v, _)| v).collect();
                 // bd-76x57: embed a JSON-subtyped element (e.g. the result of
-                // json_object(...)/json_array(...)/json(...)) as nested JSON
-                // rather than quoting it as a string. The subtype is a static
-                // property of the argument expression, constant across the
-                // group's rows, so one registry lookup suffices.
-                let arg_subtype = expr_result_json_subtype_via_registry(arg);
+                // json_object(...)/json(...)/`x -> p`, or a json_extract()
+                // container) as nested JSON rather than quoting it as a string.
+                let (vals, subtypes): (Vec<SqliteValue>, Vec<u32>) =
+                    items.into_iter().map(|(value, _)| value).unzip();
                 if is_jsonb {
-                    let subtypes = vec![arg_subtype; vals.len()];
                     return Ok(SqliteValue::Blob(
                         fsqlite_ext_json::jsonb_array_with_subtypes(&vals, &subtypes)?.into(),
                     ));
                 }
-                if arg_subtype != 0 {
-                    let subtypes = vec![arg_subtype; vals.len()];
+                if subtypes.iter().any(|&subtype| subtype != 0) {
                     fsqlite_ext_json::json_array_with_subtypes(&vals, &subtypes)?
                 } else {
                     fsqlite_ext_json::json_group_array(&vals)?
@@ -127782,7 +127881,8 @@ fn eval_group_agg_join_expr(
                         "json_group_object() requires 2 arguments",
                     ));
                 }
-                let mut items: Vec<((SqliteValue, SqliteValue), Vec<SqliteValue>)> = Vec::new();
+                let fixed_subtype = fixed_json_aggregate_arg_subtype(&exprs[1]);
+                let mut items: Vec<JsonObjectAggregateItem> = Vec::new();
                 for row in group_rows {
                     if let Some(filter_expr) = filter
                         && !is_sqlite_truthy(&eval_join_expr(filter_expr, row, col_map)?)
@@ -127790,7 +127890,7 @@ fn eval_group_agg_join_expr(
                         continue;
                     }
                     let key = eval_join_expr(&exprs[0], row, col_map)?;
-                    let value = eval_join_expr(&exprs[1], row, col_map)?;
+                    let value = eval_json_aggregate_arg(&exprs[1], fixed_subtype, row, col_map)?;
                     let mut keys = Vec::with_capacity(order_by.len());
                     for term in order_by {
                         keys.push(eval_join_expr(&term.expr, row, col_map)?);
@@ -127809,16 +127909,15 @@ fn eval_group_agg_join_expr(
                         )
                     });
                 }
-                let pairs: Vec<(SqliteValue, SqliteValue)> =
+                let pairs: Vec<(SqliteValue, (SqliteValue, u32))> =
                     items.into_iter().map(|(kv, _)| kv).collect();
                 // bd-76x57: embed a JSON-subtyped VALUE (e.g. json_object(...))
                 // as nested JSON rather than quoting it. Keys stay text; only
                 // the value slot can carry a JSON subtype here.
-                let value_subtype = expr_result_json_subtype_via_registry(&exprs[1]);
-                if value_subtype != 0 || is_jsonb {
+                if is_jsonb || pairs.iter().any(|(_, (_, subtype))| *subtype != 0) {
                     let mut flat = Vec::with_capacity(pairs.len() * 2);
                     let mut subtypes = Vec::with_capacity(pairs.len() * 2);
-                    for (key, value) in pairs {
+                    for (key, (value, value_subtype)) in pairs {
                         // As json_group_object reads its label: as text, and a
                         // NULL label drops the row.
                         let key = match key {
@@ -127838,6 +127937,8 @@ fn eval_group_agg_join_expr(
                     }
                     fsqlite_ext_json::json_object_with_subtypes(&flat, &subtypes)?
                 } else {
+                    let pairs: Vec<(SqliteValue, SqliteValue)> =
+                        pairs.into_iter().map(|(key, (value, _))| (key, value)).collect();
                     fsqlite_ext_json::json_group_object(&pairs)?
                 }
             };
