@@ -199314,11 +199314,14 @@ mod tests {
                 .expect_err("duplicate value should abort INSERT ... SELECT");
             assert!(matches!(err, FrankenError::UniqueViolation { .. }));
 
+            // Stock (3.54.0) prints 11|0|3: changes() and total_changes() drop
+            // the rolled-back row, but last_insert_rowid() keeps the rowid of
+            // the last row inserted before the failure.
             let tracking = conn
                 .query("SELECT last_insert_rowid(), changes(), total_changes();")
                 .await
                 .unwrap();
-            assert_eq!(tracking[0].values()[0], SqliteValue::Integer(1));
+            assert_eq!(tracking[0].values()[0], SqliteValue::Integer(11));
             assert_eq!(tracking[0].values()[1], SqliteValue::Integer(0));
             assert_eq!(tracking[0].values()[2], SqliteValue::Integer(3));
 

@@ -49458,8 +49458,11 @@ mod tests {
                  AND {equality} AND v.idx = ?2 AND v.content = ?11 LIMIT 1"
             ));
             for directive in [None, Some(gh526_weak_exists_directive())] {
+                // The prefix lane needs proven built-in collations, as the
+                // connection reports unless a built-in collation is overridden.
                 let ctx = CodegenContext {
                     index_ordered_scan_reliable: true,
+                    collation_semantics: CollationSemantics::Builtin,
                     planner_select_directive: directive,
                     ..CodegenContext::default()
                 };
@@ -49547,8 +49550,10 @@ mod tests {
                 "SELECT 1 FROM messages AS v WHERE v.id IS NOT ?9 \
                  AND v.conversation_id = ?4 AND {nullable} AND v.content IS ?11 LIMIT 1"
             ));
+            // Builtin collations, so the prefix lane is live and must refuse IS.
             let ctx = CodegenContext {
                 index_ordered_scan_reliable: true,
+                collation_semantics: CollationSemantics::Builtin,
                 planner_select_directive: Some(gh526_weak_exists_directive()),
                 ..CodegenContext::default()
             };
@@ -51828,8 +51833,10 @@ mod tests {
     }
 
     #[test]
-    fn test_codegen_insert_returning_respects_target_alias() {
-        let stmt = InsertStatement {
+    fn test_codegen_insert_returning_names_table_not_alias() {
+        // Stock: `INSERT INTO t AS u ... RETURNING t.a` works, `RETURNING u.a`
+        // is "no such column: u.a".
+        let insert_returning = |qualifier: &str| InsertStatement {
             with: None,
             or_conflict: None,
             table: QualifiedName::bare("t"),
@@ -51838,16 +51845,21 @@ mod tests {
             source: InsertSource::Values(vec![vec![placeholder(1), placeholder(2)]]),
             upsert: vec![],
             returning: vec![ResultColumn::Expr {
-                expr: Expr::Column(ColumnRef::qualified("u", "a"), Span::ZERO),
+                expr: Expr::Column(ColumnRef::qualified(qualifier, "a"), Span::ZERO),
                 alias: None,
             }],
         };
         let schema = test_schema();
         let ctx = CodegenContext::default();
-        let mut b = ProgramBuilder::new();
 
-        codegen_insert(&mut b, &stmt, &schema, &ctx)
-            .expect("INSERT RETURNING should resolve the target alias");
+        codegen_insert(&mut ProgramBuilder::new(), &insert_returning("t"), &schema, &ctx)
+            .expect("INSERT RETURNING resolves the table name under an alias");
+        let err = codegen_insert(&mut ProgramBuilder::new(), &insert_returning("u"), &schema, &ctx)
+            .expect_err("INSERT RETURNING does not see the target alias");
+        assert!(
+            matches!(err, CodegenError::ColumnNotFound { ref column, .. } if column == "u.a"),
+            "unexpected error: {err:?}"
+        );
     }
 
     // === Test 11: SELECT with LIMIT ===
@@ -59362,7 +59374,9 @@ mod tests {
 
     #[test]
     fn test_codegen_update_returning_qualified_alias() {
-        let stmt = UpdateStatement {
+        // Stock: the alias qualifies WHERE, but RETURNING names the table
+        // (`RETURNING u.a` is "no such column: u.a").
+        let update_returning = |qualifier: &str| UpdateStatement {
             with: None,
             or_conflict: None,
             table: QualifiedTableRef {
@@ -59383,7 +59397,7 @@ mod tests {
                 span: Span::ZERO,
             }),
             returning: vec![ResultColumn::Expr {
-                expr: Expr::Column(ColumnRef::qualified("u", "a"), Span::ZERO),
+                expr: Expr::Column(ColumnRef::qualified(qualifier, "a"), Span::ZERO),
                 alias: None,
             }],
             order_by: vec![],
@@ -59391,8 +59405,14 @@ mod tests {
         };
         let schema = test_schema();
         let ctx = CodegenContext::default();
-        let mut b = ProgramBuilder::new();
-        codegen_update(&mut b, &stmt, &schema, &ctx).unwrap();
+        codegen_update(&mut ProgramBuilder::new(), &update_returning("t"), &schema, &ctx)
+            .expect("UPDATE RETURNING resolves the table name under an alias");
+        let err = codegen_update(&mut ProgramBuilder::new(), &update_returning("u"), &schema, &ctx)
+            .expect_err("UPDATE RETURNING does not see the target alias");
+        assert!(
+            matches!(err, CodegenError::ColumnNotFound { ref column, .. } if column == "u.a"),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]
@@ -62208,18 +62228,15 @@ mod tests {
 
     #[test]
     fn test_codegen_insert_stored_generated_column_emits_copy_and_add() {
-        // INSERT INTO t VALUES (?, ?, DEFAULT) — 3 columns, c is STORED generated
+        // INSERT INTO t VALUES (?, ?) — c is STORED generated, so the implicit
+        // column list is (a, b); stock rejects a third value.
         let stmt = InsertStatement {
             with: None,
             or_conflict: None,
             table: QualifiedName::bare("t"),
             alias: None,
             columns: vec![],
-            source: InsertSource::Values(vec![vec![
-                placeholder(1),
-                placeholder(2),
-                Expr::Literal(Literal::Null, Span::ZERO), // placeholder for generated col
-            ]]),
+            source: InsertSource::Values(vec![vec![placeholder(1), placeholder(2)]]),
             upsert: vec![],
             returning: vec![],
         };
@@ -62244,18 +62261,15 @@ mod tests {
 
     #[test]
     fn test_codegen_insert_virtual_generated_column_emits_null() {
-        // INSERT INTO t VALUES (?, ?, DEFAULT) — c is VIRTUAL generated (not stored)
+        // INSERT INTO t VALUES (?, ?) — c is VIRTUAL generated (not stored) and
+        // not part of the implicit column list.
         let stmt = InsertStatement {
             with: None,
             or_conflict: None,
             table: QualifiedName::bare("t"),
             alias: None,
             columns: vec![],
-            source: InsertSource::Values(vec![vec![
-                placeholder(1),
-                placeholder(2),
-                Expr::Literal(Literal::Null, Span::ZERO),
-            ]]),
+            source: InsertSource::Values(vec![vec![placeholder(1), placeholder(2)]]),
             upsert: vec![],
             returning: vec![],
         };
