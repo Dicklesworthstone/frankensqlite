@@ -36753,22 +36753,14 @@ impl Connection {
             if !is_rowid_alias {
                 continue;
             }
-            let raw_value = Self::eval_prepared_direct_simple_insert_expr(
+            let value = Self::eval_prepared_direct_simple_insert_expr(
                 expr,
                 params,
                 Some(&mut concat_text_scratch),
             )?;
-            let value = if let Some(strict_type) = column.strict_type {
-                raw_value.validate_strict(strict_type).map_err(|error| {
-                    FrankenError::DatatypeViolation {
-                        column: column.name.clone(),
-                        column_type: format!("{strict_type:?}").to_ascii_uppercase(),
-                        actual: error.actual.to_string(),
-                    }
-                })?
-            } else {
-                raw_value
-            };
+            // Stock checks a rowid alias only as a rowid (MustBeInt), even in a
+            // STRICT table: a value that is not an integer is "datatype
+            // mismatch".
             return Self::coerce_insert_rowid_value(&value);
         }
         Ok(None)
@@ -36802,23 +36794,27 @@ impl Connection {
         mem_row_values: &mut PreparedDirectInsertRowScratch,
     ) -> Result<()> {
         let is_rowid_alias = column.is_ipk || direct.rowid_alias_col_idx == Some(col_idx);
+        if is_rowid_alias {
+            // As stock: a rowid alias gets the rowid check alone, no STRICT
+            // type check.
+            *explicit_rowid = Self::coerce_insert_rowid_value(&raw_value)?;
+            mem_row_values.push(SqliteValue::Null);
+            return Ok(());
+        }
+
         let value = if let Some(strict_type) = column.strict_type {
             raw_value.validate_strict(strict_type).map_err(|error| {
                 FrankenError::DatatypeViolation {
                     column: format!("{table_name}.{}", column.name),
-                    column_type: format!("{strict_type:?}").to_ascii_uppercase(),
-                    actual: error.actual.to_string(),
+                    column_type: strict_type
+                        .declared_name(column.type_name.as_deref())
+                        .to_owned(),
+                    actual: error.actual_name().to_owned(),
                 }
             })?
         } else {
             raw_value
         };
-
-        if is_rowid_alias {
-            *explicit_rowid = Self::coerce_insert_rowid_value(&value)?;
-            mem_row_values.push(SqliteValue::Null);
-            return Ok(());
-        }
 
         if column.notnull && value.is_null() {
             return Err(FrankenError::NotNullViolation {

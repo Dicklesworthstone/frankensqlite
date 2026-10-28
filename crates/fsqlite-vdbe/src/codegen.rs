@@ -797,7 +797,7 @@ impl TableSchema {
         })
     }
 
-    /// STRICT type-check pattern for `Opcode::TypeCheck` (`I`,`R`,`T`,`L`,`A`).
+    /// STRICT type-check pattern for `Opcode::TypeCheck` (`I`,`N`,`R`,`T`,`L`,`A`).
     #[must_use]
     pub fn strict_type_pattern(&self) -> Option<String> {
         if !self.strict {
@@ -806,7 +806,7 @@ impl TableSchema {
         Some(
             self.columns
                 .iter()
-                .map(|col| strict_type_code(col.strict_type))
+                .map(|col| strict_type_code(col.strict_type, col.type_name.as_deref()))
                 .collect(),
         )
     }
@@ -1126,8 +1126,15 @@ fn validate_explicit_index_expr_shape(expr: &Expr, context: &str) -> Result<(), 
     }
 }
 
-fn strict_type_code(strict_type: Option<StrictColumnType>) -> char {
+/// `N` marks a column declared `INT`: it checks like `I`, but stock's error
+/// text names it "INT".
+fn strict_type_code(strict_type: Option<StrictColumnType>, type_name: Option<&str>) -> char {
     match strict_type.unwrap_or(StrictColumnType::Any) {
+        StrictColumnType::Integer
+            if type_name.is_some_and(|name| name.eq_ignore_ascii_case("INT")) =>
+        {
+            'N'
+        }
         StrictColumnType::Integer => 'I',
         StrictColumnType::Real => 'R',
         StrictColumnType::Text => 'T',

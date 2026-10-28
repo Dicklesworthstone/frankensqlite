@@ -13476,9 +13476,10 @@ impl VdbeEngine {
                         #[allow(clippy::cast_possible_wrap)]
                         let reg = op.p1 + offset as i32;
                         let value = self.get_reg(reg);
-                        let strict_type = match pattern.get(offset).copied().unwrap_or(b'A') {
+                        let code = pattern.get(offset).copied().unwrap_or(b'A');
+                        let strict_type = match code {
                             b'A' | b'a' => None,
-                            b'I' | b'i' => Some(StrictColumnType::Integer),
+                            b'I' | b'i' | b'N' | b'n' => Some(StrictColumnType::Integer),
                             b'R' | b'r' => Some(StrictColumnType::Real),
                             b'T' | b't' => Some(StrictColumnType::Text),
                             b'L' | b'l' => Some(StrictColumnType::Blob),
@@ -13506,8 +13507,9 @@ impl VdbeEngine {
                                                 }
                                             },
                                         );
-                                    let col_type = format!("{expected:?}").to_ascii_uppercase();
-                                    let actual_str = err.actual.to_string();
+                                    let declared = matches!(code, b'N' | b'n').then_some("INT");
+                                    let col_type = expected.declared_name(declared).to_owned();
+                                    let actual_str = err.actual_name().to_owned();
                                     tracing::warn!(
                                         register = reg,
                                         expected = ?expected,

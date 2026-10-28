@@ -764,6 +764,21 @@ impl StrictColumnType {
             _ => None,
         }
     }
+
+    /// The type name stock prints in a STRICT violation ("cannot store TEXT
+    /// value in INT column t.a"): the standard type the column declared, so
+    /// `INT` stays apart from `INTEGER`.
+    #[must_use]
+    pub fn declared_name(self, declared: Option<&str>) -> &'static str {
+        match self {
+            Self::Integer if declared.is_some_and(|name| name.eq_ignore_ascii_case("INT")) => "INT",
+            Self::Integer => "INTEGER",
+            Self::Real => "REAL",
+            Self::Text => "TEXT",
+            Self::Blob => "BLOB",
+            Self::Any => "ANY",
+        }
+    }
 }
 
 /// Error returned when a value violates a STRICT table column type constraint.
@@ -773,6 +788,21 @@ pub struct StrictTypeError {
     pub expected: StrictColumnType,
     /// The actual storage class of the value.
     pub actual: StorageClass,
+}
+
+impl StrictTypeError {
+    /// The value's type as stock names it in a STRICT violation
+    /// (`vdbeMemTypeName`): an integer is "INT".
+    #[must_use]
+    pub const fn actual_name(&self) -> &'static str {
+        match self.actual {
+            StorageClass::Null => "NULL",
+            StorageClass::Integer => "INT",
+            StorageClass::Real => "REAL",
+            StorageClass::Text => "TEXT",
+            StorageClass::Blob => "BLOB",
+        }
+    }
 }
 
 impl fmt::Display for StrictTypeError {
