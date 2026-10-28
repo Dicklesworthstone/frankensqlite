@@ -43732,13 +43732,26 @@ impl Connection {
         Ok(outcome.changes)
     }
 
+    /// The replay statement for `row_count` source rows: one VALUES row of
+    /// placeholders per source row, numbered in row order.
     fn build_insert_select_replay_sql(
         &self,
         insert: &fsqlite_ast::InsertStatement,
         layout: &InsertTargetLayout,
+        row_count: usize,
     ) -> String {
         let qualified_table = quote_qualified_name(&insert.table);
-        let placeholders = (1..=layout.targets.len()).map(|idx| format!("?{idx}"));
+        let width = layout.targets.len();
+        let values_rows = (0..row_count)
+            .map(|row| {
+                let placeholders = (1..=width)
+                    .map(|col| format!("?{}", row * width + col))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("({placeholders})")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
         let conflict_clause = match &insert.or_conflict {
             Some(fsqlite_ast::ConflictAction::Replace) => "OR REPLACE ",
             Some(fsqlite_ast::ConflictAction::Ignore) => "OR IGNORE ",
@@ -43761,7 +43774,6 @@ impl Connection {
             )
         };
         let insert_sql = if insert.columns.is_empty() {
-            let placeholders = placeholders.collect::<Vec<_>>().join(", ");
             let upsert_sql = insert
                 .upsert
                 .iter()
@@ -43770,11 +43782,11 @@ impl Connection {
                 .join(" ");
             if upsert_sql.is_empty() {
                 format!(
-                    "INSERT {conflict_clause}INTO {qualified_table} VALUES ({placeholders}){returning_clause};"
+                    "INSERT {conflict_clause}INTO {qualified_table} VALUES {values_rows}{returning_clause};"
                 )
             } else {
                 format!(
-                    "INSERT {conflict_clause}INTO {qualified_table} VALUES ({placeholders}) {upsert_sql}{returning_clause};"
+                    "INSERT {conflict_clause}INTO {qualified_table} VALUES {values_rows} {upsert_sql}{returning_clause};"
                 )
             }
         } else {
@@ -43784,10 +43796,6 @@ impl Connection {
                 .map(|column| quote_identifier(column))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let placeholders = (1..=layout.targets.len())
-                .map(|idx| format!("?{idx}"))
-                .collect::<Vec<_>>()
-                .join(", ");
             let upsert_sql = insert
                 .upsert
                 .iter()
@@ -43796,11 +43804,11 @@ impl Connection {
                 .join(" ");
             if upsert_sql.is_empty() {
                 format!(
-                    "INSERT {conflict_clause}INTO {qualified_table} ({quoted_targets}) VALUES ({placeholders}){returning_clause};"
+                    "INSERT {conflict_clause}INTO {qualified_table} ({quoted_targets}) VALUES {values_rows}{returning_clause};"
                 )
             } else {
                 format!(
-                    "INSERT {conflict_clause}INTO {qualified_table} ({quoted_targets}) VALUES ({placeholders}) {upsert_sql}{returning_clause};"
+                    "INSERT {conflict_clause}INTO {qualified_table} ({quoted_targets}) VALUES {values_rows} {upsert_sql}{returning_clause};"
                 )
             }
         };
@@ -43819,6 +43827,7 @@ struct InsertSelectReplayEmitter<'conn> {
     prepared: Option<PreparedStatement<'conn>>,
     compiled_insert: Option<insert_batch::CompiledInsertReplay>,
     returning_statement: Option<Statement>,
+    batch: Option<InsertSelectReplayBatch<'conn>>,
     statement_changes: usize,
     returning_rows: Vec<Row>,
     produced_rows: usize,
@@ -43826,6 +43835,18 @@ struct InsertSelectReplayEmitter<'conn> {
     preserve_constraint_failure_rows: bool,
     previous_changes: usize,
     previous_total_changes: usize,
+}
+
+/// bd-i3csr (GH#491): source rows replayed `rows` at a time through one
+/// prepared multi-row INSERT ... VALUES. A chunk pays the statement setup
+/// once instead of per row, and its cursors stay on the right edge from one
+/// row to the next. Admitted only where a multi-row VALUES statement has the
+/// per-row replay's semantics (see `insert_select_replay_batch_rows`).
+struct InsertSelectReplayBatch<'conn> {
+    prepared: PreparedStatement<'conn>,
+    rows: usize,
+    /// The buffered rows' values, row after row.
+    values: Vec<SqliteValue>,
 }
 
 impl InsertSelectReplayEmitter<'_> {
@@ -43881,9 +43902,48 @@ impl InsertSelectReplayEmitter<'_> {
             return Err(FrankenError::FunctionError(message));
         }
 
+        let Some(mut batch) = self.batch.take() else {
+            return self.replay(None, row_values).await;
+        };
+        batch.values.extend_from_slice(row_values);
+        let result = if batch.values.len() == batch.rows * self.source_column_count {
+            let result = self.replay(Some(&batch.prepared), &batch.values).await;
+            batch.values.clear();
+            result
+        } else {
+            Ok(())
+        };
+        self.batch = Some(batch);
+        result
+    }
+
+    /// Replays the rows a batch still holds, one at a time. Runs after the
+    /// last source row, and before a source error is reported: per-row replay
+    /// would already have inserted these rows, so their own errors come first.
+    async fn flush_batch_rows(&mut self) -> Result<()> {
+        let Some(batch) = self.batch.take() else {
+            return Ok(());
+        };
+        for row_values in batch.values.chunks(self.source_column_count) {
+            self.replay(None, row_values).await?;
+        }
+        Ok(())
+    }
+
+    /// Inserts `row_values`: one row through the replay statement, or a whole
+    /// batch of rows through `batch_prepared`.
+    async fn replay(
+        &mut self,
+        batch_prepared: Option<&PreparedStatement<'_>>,
+        row_values: &[SqliteValue],
+    ) -> Result<()> {
         self.connection
             .set_statement_change_count(self.previous_changes);
-        let row_result = if let Some(plan) = self.compiled_insert.as_ref() {
+        let row_result = if let Some(prepared) = batch_prepared {
+            self.connection
+                .execute_prepared_with_params_after_background_status(prepared, row_values, false)
+                .await
+        } else if let Some(plan) = self.compiled_insert.as_ref() {
             match self
                 .connection
                 .execute_compiled_insert_replay_row(plan, row_values)
@@ -46128,7 +46188,7 @@ impl Connection {
         let source_column_count = layout.targets.len();
         let has_explicit_columns = !insert.columns.is_empty();
         let table_column_count = layout.table_columns.len();
-        let insert_sql = self.build_insert_select_replay_sql(insert, &layout);
+        let insert_sql = self.build_insert_select_replay_sql(insert, &layout, 1);
         let collect_returning = !insert.returning.is_empty();
         let preserve_constraint_failure_rows =
             insert.or_conflict == Some(fsqlite_ast::ConflictAction::Fail);
@@ -46151,6 +46211,22 @@ impl Connection {
                 } else {
                     None
                 };
+                let batch_rows = if prepared.is_some() {
+                    self.insert_select_replay_batch_rows(insert, source_column_count)
+                } else {
+                    0
+                };
+                let batch = if batch_rows > 1 {
+                    let batch_sql =
+                        self.build_insert_select_replay_sql(insert, &layout, batch_rows);
+                    Some(InsertSelectReplayBatch {
+                        prepared: self.prepare_after_background_status(&batch_sql).await?,
+                        rows: batch_rows,
+                        values: Vec::with_capacity(batch_rows * source_column_count),
+                    })
+                } else {
+                    None
+                };
                 let mut emitter = InsertSelectReplayEmitter {
                     connection: self,
                     source_column_count,
@@ -46160,6 +46236,7 @@ impl Connection {
                     prepared,
                     compiled_insert,
                     returning_statement,
+                    batch,
                     statement_changes: 0,
                     returning_rows: Vec::new(),
                     produced_rows: 0,
@@ -46171,10 +46248,13 @@ impl Connection {
 
                 if let Err(error) = producer(&mut emitter).await {
                     if !emitter.error_state_recorded {
+                        // A source error: the rows read before it go in first.
+                        emitter.flush_batch_rows().await?;
                         emitter.record_error_state(&error);
                     }
                     return Err(error);
                 }
+                emitter.flush_batch_rows().await?;
                 Ok(emitter.into_outcome())
             })
             .await
@@ -46189,6 +46269,58 @@ impl Connection {
         } else {
             execute_rows().await
         }
+    }
+
+    /// Source rows per batched replay statement (bd-i3csr). Below
+    /// `MORSEL_INSERT_THRESHOLD`, so a batch statement is never itself split
+    /// back into per-row replay.
+    const INSERT_SELECT_REPLAY_BATCH_ROWS: usize = 32;
+    /// Placeholders per batched replay statement: wide rows batch fewer rows.
+    const INSERT_SELECT_REPLAY_BATCH_VALUES: usize = 1024;
+
+    /// How many source rows one batched replay statement inserts, or 0 when
+    /// rows replay one at a time. A multi-row VALUES statement inserts its rows
+    /// in order with the same per-row conflict handling as per-row replay. It
+    /// differs where a row's effects or failure scope are visible per
+    /// statement, so these keep per-row replay: RETURNING, UPSERT, OR FAIL,
+    /// OR ROLLBACK, foreign keys, and INSERT triggers. So does any target that
+    /// is not a plain table of the main schema.
+    fn insert_select_replay_batch_rows(
+        &self,
+        insert: &fsqlite_ast::InsertStatement,
+        source_column_count: usize,
+    ) -> usize {
+        let table = &insert.table;
+        let event = fsqlite_ast::TriggerEvent::Insert;
+        if source_column_count == 0
+            || !insert.returning.is_empty()
+            || !insert.upsert.is_empty()
+            || matches!(
+                insert.or_conflict,
+                Some(fsqlite_ast::ConflictAction::Fail | fsqlite_ast::ConflictAction::Rollback)
+            )
+            || self.fk_enforcement_enabled()
+            || table
+                .schema
+                .as_deref()
+                .is_some_and(|schema| !schema.eq_ignore_ascii_case("main"))
+            || is_sqlite_schema_name(&table.name)
+            || table.name.eq_ignore_ascii_case("sqlite_sequence")
+            || self.schema_index_of(&table.name).is_none()
+            || self.has_live_vtab_instance(&table.name)
+            || self.view_index_of(&table.name).is_some()
+            || self.targets_shadowed_main(table)
+            || self
+                .temp_table_names
+                .borrow()
+                .contains(&table.name.to_ascii_lowercase())
+            || self.has_matching_triggers(&table.name, fsqlite_ast::TriggerTiming::Before, &event)
+            || self.has_matching_triggers(&table.name, fsqlite_ast::TriggerTiming::After, &event)
+        {
+            return 0;
+        }
+        (Self::INSERT_SELECT_REPLAY_BATCH_VALUES / source_column_count)
+            .min(Self::INSERT_SELECT_REPLAY_BATCH_ROWS)
     }
 
     async fn try_execute_streaming_insert_select_fallback_outcome(
