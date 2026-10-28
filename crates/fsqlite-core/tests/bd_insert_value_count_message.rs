@@ -40,3 +40,48 @@ fn insert_value_count_mismatch_reports_stock_text() {
         );
     });
 }
+
+fn stock_insert_err(setup: &str, insert: &str) -> String {
+    let c = rusqlite::Connection::open_in_memory().unwrap();
+    c.execute_batch(setup).unwrap();
+    let err = c.execute_batch(insert).expect_err("stock rejects it");
+    match err {
+        rusqlite::Error::SqlInputError { msg, .. }
+        | rusqlite::Error::SqliteFailure(_, Some(msg)) => msg,
+        other => other.to_string(),
+    }
+}
+
+// A target list that names every column, in or out of table order, still takes the
+// short form; so do WITHOUT ROWID and generated-column tables and multi-row VALUES.
+// Live oracle: bundled rusqlite.
+#[test]
+fn insert_value_count_mismatch_matches_stock_across_table_shapes() {
+    const T: &str = "CREATE TABLE t(a, b)";
+    const W: &str = "CREATE TABLE w(a PRIMARY KEY, b) WITHOUT ROWID";
+    const G: &str = "CREATE TABLE g(a, b, c AS (a + b))";
+    const CASES: &[(&str, &str)] = &[
+        (T, "INSERT INTO t(b, a) VALUES(1)"),
+        (T, "INSERT INTO t(a, b) VALUES(1), (2)"),
+        (T, "INSERT INTO t VALUES(1), (2)"),
+        (W, "INSERT INTO w(a) VALUES(1, 2)"),
+        (W, "INSERT INTO w(a, b) VALUES(1)"),
+        (W, "INSERT INTO w VALUES(1)"),
+        (G, "INSERT INTO g VALUES(1)"),
+        (G, "INSERT INTO g VALUES(1, 2, 3)"),
+        (G, "INSERT INTO g(a, b) VALUES(1)"),
+        (T, "INSERT INTO t(a, b) SELECT 1"),
+        (T, "INSERT INTO t SELECT 1"),
+    ];
+    asupersync::test_utils::run_test(|| async {
+        let mut mismatches = Vec::new();
+        for (setup, insert) in CASES {
+            let ours = insert_err(setup, insert).await;
+            let stock = stock_insert_err(setup, insert);
+            if ours != stock {
+                mismatches.push(format!("{insert}\n  stock:   {stock}\n  fsqlite: {ours}"));
+            }
+        }
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    });
+}

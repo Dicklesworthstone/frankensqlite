@@ -23453,6 +23453,7 @@ pub fn codegen_insert(
                     Some(mapping.expected_source_cols),
                     mapping.explicit_rowid_source_pos,
                     Some(&mapping.col_mapping),
+                    !stmt.columns.is_empty(),
                     table_cursor,
                     table,
                     schema,
@@ -23470,6 +23471,7 @@ pub fn codegen_insert(
                     None,
                     None,
                     None,
+                    false,
                     table_cursor,
                     table,
                     schema,
@@ -24169,6 +24171,7 @@ fn codegen_insert_values(
     expected_source_cols: Option<usize>,
     explicit_rowid_source_pos: Option<usize>,
     col_mapping: Option<&[Option<usize>]>,
+    has_column_list: bool,
     cursor: i32,
     table: &TableSchema,
     schema: &[TableSchema],
@@ -24200,21 +24203,15 @@ fn codegen_insert_values(
         .count();
     let expected_source_cols = expected_source_cols.unwrap_or(default_source_cols);
     if n_source_cols != expected_source_cols {
-        let is_implicit_column_list = col_mapping.is_none_or(|mapping| {
-            expected_source_cols == default_source_cols
-                && mapping
-                    .iter()
-                    .zip(&table.columns)
-                    .all(|(src, col)| src.is_some() == col.generated_expr.is_none())
-        });
-        let message = if is_implicit_column_list {
+        // An explicit target column list uses stock's shorter form, even one
+        // that names every column in table order.
+        let message = if has_column_list {
+            format!("{n_source_cols} values for {expected_source_cols} columns")
+        } else {
             format!(
                 "table {} has {} columns but {} values were supplied",
                 table.name, expected_source_cols, n_source_cols
             )
-        } else {
-            // An explicit target column list uses stock's shorter form.
-            format!("{n_source_cols} values for {expected_source_cols} columns")
         };
         return Err(CodegenError::SqlError(message));
     }
@@ -29564,10 +29561,15 @@ fn codegen_insert_without_rowid(
                 .as_ref()
                 .map_or(n_cols, |m| m.expected_source_cols);
             if n_source_cols != expected {
-                return Err(CodegenError::Unsupported(format!(
-                    "table {} has {} columns but {} values were supplied",
-                    table.name, expected, n_source_cols
-                )));
+                // Stock's SQL error, in the same two forms as a rowid table.
+                return Err(CodegenError::SqlError(if stmt.columns.is_empty() {
+                    format!(
+                        "table {} has {} columns but {} values were supplied",
+                        table.name, expected, n_source_cols
+                    )
+                } else {
+                    format!("{n_source_cols} values for {expected} columns")
+                }));
             }
             let source_regs = b.alloc_regs(n_source_cols as i32);
             let mapped_regs = target_mapping.as_ref().map(|_| b.alloc_regs(n_cols as i32));
