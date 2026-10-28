@@ -43206,17 +43206,24 @@ impl Connection {
         //     That is quadratic in the row count:
         //     `generate_series(1, 1000000)` took about five minutes. The
         //     rows are generated, not read from a large table, so they are
-        //     computed once here.
-        if select_stmt.limit.is_some()
+        //     computed once here, unless the series can be generated in
+        //     sub-ranges instead (bd-qdve2).
+        let reads_whole_source_first = select_stmt.limit.is_some()
             || insert.with.is_some()
             || self.skip_statement_memdb_refresh.get()
             || {
                 let target = &insert.table.name;
                 let sources = Self::extract_table_names_from_select(select_stmt);
                 sources.iter().any(|s| s.eq_ignore_ascii_case(target))
-            }
-            || select_reads_only_table_functions(select_stmt)
+            };
+        if !reads_whole_source_first
+            && let Some(outcome) = self
+                .try_execute_series_chunked_insert_select(insert, select_stmt, params)
+                .await?
         {
+            return Ok(outcome);
+        }
+        if reads_whole_source_first || select_reads_only_table_functions(select_stmt) {
             let source_rows = self
                 .materialize_insert_select_source_rows(insert, select_stmt, params)
                 .await?;
@@ -43375,6 +43382,149 @@ impl Connection {
             },
             fsqlite_ast::Span::ZERO,
         ))
+    }
+
+    /// bd-qdve2: `(start, stop, step)` when the SELECT reads nothing but
+    /// `generate_series(start, stop[, step])` with integer arguments, a step of
+    /// at least 1 and `start <= stop`. Consecutive sub-ranges of that series
+    /// then give the source's rows in order, so the chunked INSERT ... SELECT
+    /// needs neither the whole series in memory nor an OFFSET (GH#438). Only
+    /// `value` may be named: a sub-range changes the hidden start, stop and
+    /// step columns. Anything that sees the rows or the inserts as a whole
+    /// declines: grouping, ordering, a LIMIT, DISTINCT, window functions, a
+    /// subquery, or a read of the change counters.
+    fn insert_select_series_chunks(
+        &self,
+        select_stmt: &SelectStatement,
+    ) -> Option<(i64, i64, i64)> {
+        if select_stmt.with.is_some()
+            || !select_stmt.body.compounds.is_empty()
+            || !select_stmt.order_by.is_empty()
+            || select_stmt.limit.is_some()
+            || has_window_functions(select_stmt)
+            || self.has_implicit_aggregation_with_registry(select_stmt)
+            || select_may_observe_change_tracking(select_stmt)
+            || select_contains_subquery_matching(select_stmt, self, &|_, _| true)
+        {
+            return None;
+        }
+        let SelectCore::Select {
+            distinct,
+            columns,
+            from: Some(from),
+            where_clause,
+            group_by,
+            having,
+            windows,
+        } = &select_stmt.body.select
+        else {
+            return None;
+        };
+        if *distinct != Distinctness::All
+            || !from.joins.is_empty()
+            || !group_by.is_empty()
+            || having.is_some()
+            || !windows.is_empty()
+            || columns.is_empty()
+        {
+            return None;
+        }
+        let TableOrSubquery::TableFunction { name, args, .. } = &from.source else {
+            return None;
+        };
+        if !name.eq_ignore_ascii_case("generate_series") || !(2..=3).contains(&args.len()) {
+            return None;
+        }
+        let integer = |expr: &Expr| match expr {
+            Expr::Literal(Literal::Integer(value), _) => Some(*value),
+            Expr::UnaryOp {
+                op: UnaryOp::Negate,
+                expr,
+                ..
+            } => match expr.as_ref() {
+                Expr::Literal(Literal::Integer(value), _) => value.checked_neg(),
+                _ => None,
+            },
+            _ => None,
+        };
+        let start = integer(&args[0])?;
+        let stop = integer(&args[1])?;
+        let step = args.get(2).map_or(Some(1), integer)?;
+        if step < 1 || start > stop {
+            return None;
+        }
+        let mut names_other_column = false;
+        let mut visit = |column_ref: &ColumnRef| {
+            names_other_column |= !column_ref.column.eq_ignore_ascii_case("value");
+        };
+        for column in columns {
+            if let ResultColumn::Expr { expr, .. } = column {
+                for_each_column_ref_in_expr(expr, &mut visit);
+            }
+        }
+        if let Some(where_clause) = where_clause {
+            for_each_column_ref_in_expr(where_clause, &mut visit);
+        }
+        (!names_other_column).then_some((start, stop, step))
+    }
+
+    /// bd-qdve2: run a `generate_series` INSERT ... SELECT (see
+    /// `insert_select_series_chunks`) in sub-ranges of
+    /// `INSERT_SELECT_CHUNK_SIZE` values, each inserted before the next is
+    /// generated. `Ok(None)` declines before generating anything.
+    async fn try_execute_series_chunked_insert_select(
+        &self,
+        insert: &fsqlite_ast::InsertStatement,
+        select_stmt: &SelectStatement,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Option<InsertSelectReplayOutcome>> {
+        // The INSERT has no WITH clause here, so the SELECT's placeholders
+        // number from 1. Bound to literals, `generate_series(1, ?)` is admitted
+        // too; a binding error is left to the materializing path to report.
+        let bound_select;
+        let select_stmt = match params {
+            Some(params) => {
+                let mut cloned = select_stmt.clone();
+                if bind_placeholders_in_select_statement(
+                    &mut cloned,
+                    &mut BindParamState::default(),
+                    params,
+                )
+                .is_err()
+                {
+                    return Ok(None);
+                }
+                bound_select = cloned;
+                &bound_select
+            }
+            None => select_stmt,
+        };
+        let Some((start, stop, step)) = self.insert_select_series_chunks(select_stmt) else {
+            return Ok(None);
+        };
+        let chunk_span = step.saturating_mul(Self::INSERT_SELECT_CHUNK_SIZE - 1);
+        let mut total_outcome = InsertSelectReplayOutcome::default();
+        let mut next_low = Some(start);
+        while let Some(low) = next_low {
+            // `high` is the chunk's last value unless `stop` cuts it short, in
+            // which case the series ends with this chunk.
+            let high = low.saturating_add(chunk_span).min(stop);
+            next_low = high.checked_add(step).filter(|next| *next <= stop);
+            let mut chunk_select = select_stmt.clone();
+            series_chunk_select(&mut chunk_select, low, high, step);
+            let source_rows = self
+                .materialize_insert_select_source_rows(insert, &chunk_select, None)
+                .await?;
+            let chunk_outcome = self
+                .execute_insert_select_materialized_rows_outcome(insert, &source_rows)
+                .await?;
+            total_outcome.changes = total_outcome.changes.saturating_add(chunk_outcome.changes);
+            total_outcome
+                .returning_rows
+                .extend(chunk_outcome.returning_rows);
+        }
+        self.set_statement_change_count(total_outcome.changes);
+        Ok(Some(total_outcome))
     }
 
     async fn execute_materialized_insert_select_statement(
@@ -156536,6 +156686,21 @@ fn keyset_chunk_select(select: &mut SelectStatement, rowid: &Expr, after_rowid: 
         direction: None,
         nulls: None,
     }];
+}
+
+/// bd-qdve2: point `select`'s `generate_series` source (admitted by
+/// `Connection::insert_select_series_chunks`) at the values from `low` to
+/// `high` by `step`.
+fn series_chunk_select(select: &mut SelectStatement, low: i64, high: i64, step: i64) {
+    if let SelectCore::Select {
+        from: Some(from), ..
+    } = &mut select.body.select
+        && let TableOrSubquery::TableFunction { args, .. } = &mut from.source
+    {
+        *args = [low, high, step]
+            .map(|value| Expr::Literal(Literal::Integer(value), Span::ZERO))
+            .into();
+    }
 }
 
 fn build_join_scan_sql(source: &JoinTableSource) -> String {

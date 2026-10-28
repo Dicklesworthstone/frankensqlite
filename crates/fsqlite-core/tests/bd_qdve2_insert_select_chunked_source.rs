@@ -15,7 +15,9 @@
 //! sources, which run in chunks of 10,000 rows: by rowid where the scan is in
 //! rowid order, else by LIMIT/OFFSET (a compound SELECT, or a filter an
 //! index can serve). Either way `changes()` is the whole statement's count,
-//! not the last chunk's.
+//! not the last chunk's. A `generate_series` source runs in sub-ranges of its
+//! series, unless the SELECT names the hidden start/stop/step columns or must
+//! see the series whole (ORDER BY, LIMIT, DISTINCT, a subquery on the target).
 
 use fsqlite_core::connection::Connection;
 use fsqlite_types::value::SqliteValue;
@@ -75,21 +77,25 @@ fn rq(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<Vec<String>>, String
 }
 
 /// rusqlite's bundled SQLite has no generate_series, so stock reads the same
-/// rows from a recursive CTE: `generate_series(a, b)` becomes a subquery
-/// yielding `value` = a..=b in order.
+/// rows from a recursive CTE: `generate_series(a, b[, s])` (s >= 1) becomes a
+/// subquery yielding `value` = a, a + s, ... up to b in order, beside the
+/// hidden `start`, `stop` and `step` columns. (`SELECT *` would show those, so
+/// no step selects `*` from a series.)
 fn stock_sql(sql: &str) -> String {
     const CALL: &str = "generate_series(";
     let Some(start) = sql.find(CALL) else {
         return sql.to_owned();
     };
     let args_start = start + CALL.len();
-    let comma = args_start + sql[args_start..].find(',').expect("two arguments");
-    let close = comma + sql[comma..].find(')').expect("closing paren");
-    let lo = sql[args_start..comma].trim();
-    let hi = sql[comma + 1..close].trim();
+    let close = args_start + sql[args_start..].find(')').expect("closing paren");
+    let args: Vec<&str> = sql[args_start..close].split(',').map(str::trim).collect();
+    let (lo, hi) = (args[0], args[1]);
+    let step = args.get(2).copied().unwrap_or("1");
     format!(
-        "{}(WITH RECURSIVE gs(value) AS (SELECT {lo} WHERE {lo} <= {hi} \
-         UNION ALL SELECT value + 1 FROM gs WHERE value < {hi}) SELECT value FROM gs){}",
+        "{}(WITH RECURSIVE gs(value, start, stop, step) AS \
+         (SELECT {lo}, {lo}, {hi}, {step} WHERE {lo} <= {hi} \
+         UNION ALL SELECT value + {step}, start, stop, step FROM gs \
+         WHERE value + {step} <= {hi}) SELECT value, start, stop, step FROM gs){}",
         &sql[..start],
         stock_sql(&sql[close + 1..])
     )
@@ -271,6 +277,54 @@ const SCENARIOS: &[Scenario] = &[
         ],
         checks: &["SELECT count(*), sum(rowid * a), sum(length(b)) FROM t"],
     },
+    Scenario {
+        name: "generate_series sources in sub-ranges: steps, filters, ragged and exact ends",
+        steps: &[
+            "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT)",
+            "INSERT INTO t SELECT value, 'n' || value FROM generate_series(1, 25000)",
+            "CREATE TABLE t2(x, y)",
+            "INSERT INTO t2 SELECT value * 2, value % 7 FROM generate_series(-30000, 30001, 2)",
+            "INSERT INTO t2 SELECT value, NULL FROM generate_series(1, 30000) WHERE value % 3 = 0",
+            "INSERT INTO t2 SELECT g.value, upper('x' || g.value) \
+             FROM generate_series(5, 20004) AS g",
+            "INSERT INTO t2(x) SELECT value FROM generate_series(1, 10000)",
+            "INSERT INTO t2(x) SELECT value FROM generate_series(1, 10001)",
+            "INSERT INTO t2(x) SELECT value FROM generate_series(100, 100)",
+            "INSERT INTO t2(x) SELECT value FROM generate_series(5, 1)",
+            "INSERT INTO t2(x) SELECT value FROM generate_series(1, 123456, 7)",
+            "INSERT INTO t2 SELECT value, value FROM generate_series(1, 20000) WHERE value > 25000",
+            "BEGIN",
+            "INSERT INTO t2(y) SELECT 'txn' || value FROM generate_series(1, 12000)",
+            "COMMIT",
+        ],
+        checks: &[
+            "SELECT count(*), sum(a), sum(length(b)) FROM t",
+            "SELECT count(*), sum(rowid * coalesce(x, 1)), sum(rowid * length(y)), \
+             sum(y IS NULL) FROM t2",
+        ],
+    },
+    Scenario {
+        name: "generate_series: errors across sub-ranges, and shapes that read the series whole",
+        steps: &[
+            "CREATE TABLE u(a INT UNIQUE, b TEXT)",
+            "INSERT INTO u VALUES (22222, 'pre')",
+            "INSERT INTO u SELECT value, 'b' || value FROM generate_series(1, 25000)",
+            "INSERT OR IGNORE INTO u SELECT value, 'i' || value FROM generate_series(1, 25000, 3)",
+            "CREATE TABLE h(v, s, e, st)",
+            "INSERT INTO h SELECT value, start, stop, step FROM generate_series(1, 25000, 2)",
+            "INSERT INTO h SELECT value, NULL, NULL, NULL FROM generate_series(1, 25000) \
+             WHERE stop = 25000 AND value > 24990",
+            "INSERT INTO h(v) SELECT value FROM generate_series(1, 21000) ORDER BY value DESC",
+            "INSERT INTO h(v) SELECT value FROM generate_series(1, 21000) LIMIT 15000 OFFSET 3",
+            "INSERT INTO h(v) SELECT DISTINCT value % 5 FROM generate_series(1, 21000)",
+            "INSERT INTO h(v, s) SELECT value, (SELECT count(*) FROM h) \
+             FROM generate_series(1, 12000)",
+        ],
+        checks: &[
+            "SELECT count(*), sum(a), sum(b LIKE 'i%'), sum(b = 'pre') FROM u",
+            "SELECT count(*), sum(rowid * v), sum(rowid * coalesce(s, 0)), sum(e), sum(st) FROM h",
+        ],
+    },
 ];
 
 const COUNTERS: &str = "SELECT changes(), total_changes(), last_insert_rowid()";
@@ -334,6 +388,75 @@ fn insert_select_chunked_source_matches_stock() {
         assert!(
             diffs.is_empty(),
             "{} of {statements} statement(s) diverge from rusqlite:\n{}",
+            diffs.len(),
+            diffs.join("\n")
+        );
+    });
+}
+
+/// A generate_series source whose arguments are parameters is split into
+/// sub-ranges once they are bound, anonymous `?` numbered in text order across
+/// the result columns, the series arguments and the WHERE clause. Stock's text
+/// is spelled out with numbered parameters, since its CTE repeats each bound.
+#[test]
+fn insert_select_series_with_parameters_matches_stock() {
+    const SERIES: &str = "(WITH RECURSIVE gs(value) AS (SELECT ?2 WHERE ?2 <= ?3 \
+                          UNION ALL SELECT value + ?4 FROM gs WHERE value + ?4 <= ?3) \
+                          SELECT value FROM gs)";
+    let cases: [(&str, String, &[i64]); 3] = [
+        (
+            "INSERT INTO t SELECT value + ?1, 'p' || value FROM generate_series(?2, ?3, ?4)",
+            format!("INSERT INTO t SELECT value + ?1, 'p' || value FROM {SERIES}"),
+            &[0, -5, 24990, 1],
+        ),
+        (
+            "INSERT INTO t(a) SELECT value + ? FROM generate_series(?, ?, ?) WHERE value % ? = 0",
+            format!("INSERT INTO t(a) SELECT value + ?1 FROM {SERIES} WHERE value % ?5 = 0"),
+            &[1_000_000, 1, 60000, 3, 2],
+        ),
+        (
+            "INSERT INTO t(b) SELECT ?1 || value FROM generate_series(?2, ?3, ?4)",
+            format!("INSERT INTO t(b) SELECT ?1 || value FROM {SERIES}"),
+            &[7, 40001, 40000, 1],
+        ),
+    ];
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        r.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+        f.execute("CREATE TABLE t(a INT, b TEXT)").await.unwrap();
+        r.execute_batch("CREATE TABLE t(a INT, b TEXT)").unwrap();
+        let mut diffs = Vec::new();
+        for (sql, stock, params) in &cases {
+            let values: Vec<SqliteValue> =
+                params.iter().copied().map(SqliteValue::Integer).collect();
+            let fr = f
+                .execute_with_params(sql, &values)
+                .await
+                .map_err(|e| e.to_string());
+            let rr = r
+                .execute(stock, rusqlite::params_from_iter(params.iter()))
+                .map_err(stock_err);
+            if fr != rr {
+                diffs.push(format!("  `{sql}`\n     frank= {fr:?}\n     stock= {rr:?}"));
+            }
+            for check in [
+                COUNTERS,
+                "SELECT count(*), sum(rowid * coalesce(a, 1)), sum(rowid * length(b)) FROM t",
+            ] {
+                let fr = fq(&f, check).await;
+                let rr = rq(&r, check);
+                if fr != rr {
+                    diffs.push(format!(
+                        "  after `{sql}`: `{check}`\n     frank= {fr:?}\n     stock= {rr:?}"
+                    ));
+                }
+            }
+        }
+        f.close().await.unwrap();
+        assert!(
+            diffs.is_empty(),
+            "{} divergence(s) from rusqlite:\n{}",
             diffs.len(),
             diffs.join("\n")
         );
