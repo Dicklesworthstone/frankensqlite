@@ -24019,9 +24019,26 @@ fn emit_upsert_do_update_apply(
         }
     }
 
+    // bd-bymr0: the DO UPDATE terms read this copy of the conflicting row. The
+    // assignments rewrite `existing_regs` term by term, so reading it let
+    // `SET a = b, b = a` see the new `a`.
+    let old_regs = b.alloc_regs(n_cols_i32);
+    for col_idx in 0..n_cols {
+        #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+        let col_i = col_idx as i32;
+        b.emit_op(
+            Opcode::Copy,
+            existing_regs + col_i,
+            old_regs + col_i,
+            0,
+            P4::None,
+            0,
+        );
+    }
+
     // Build ScanCtx for evaluating DO UPDATE expressions. "excluded" maps to
     // val_regs (the attempted insert values); unqualified column refs resolve
-    // from existing_regs (the current row). bd-xjfrt: both ctxs carry the real
+    // from old_regs (the current row). bd-xjfrt: both ctxs carry the real
     // `schema` (so subqueries resolve, not the "no schema → NULL" arm) and
     // existing_ctx exposes `excluded.*` as a register-backed secondary so
     // `... WHERE s.k = excluded.k` correlates against val_regs.
@@ -24044,12 +24061,12 @@ fn emit_upsert_do_update_apply(
         table,
         table_alias,
         schema: Some(schema),
-        register_base: Some(RegisterRow::columns(existing_regs)),
+        register_base: Some(RegisterRow::columns(old_regs)),
         secondaries: &excluded_secondary,
     };
     let existing_hidden_rowid_reg = ctx
         .rowid_alias_col_idx
-        .map(|ipk_idx| existing_regs + ipk_idx as i32);
+        .map(|ipk_idx| old_regs + ipk_idx as i32);
     let excluded_hidden_rowid_reg = rowid_reg;
 
     // Optional WHERE clause on the DO UPDATE action.
@@ -29365,8 +29382,22 @@ fn emit_without_rowid_upsert_do_update_apply(
         );
     }
 
+    // bd-bymr0: the DO UPDATE terms read this copy of the existing row; the
+    // assignments rewrite `existing_regs` term by term.
+    let old_regs = b.alloc_regs(n_cols as i32);
+    for i in 0..n_cols {
+        b.emit_op(
+            Opcode::Copy,
+            existing_regs + i as i32,
+            old_regs + i as i32,
+            0,
+            P4::None,
+            0,
+        );
+    }
+
     // `excluded.*` resolves to the attempted-insert values (val_regs); unqualified
-    // column refs resolve to the existing row (existing_regs).
+    // column refs resolve to the existing row (old_regs).
     //
     // bd-xjfrt: as in the rowid path, `existing_ctx` carries the real `schema` and
     // a register-backed `excluded.*` secondary so correlated subqueries/EXISTS in
@@ -29391,7 +29422,7 @@ fn emit_without_rowid_upsert_do_update_apply(
         table,
         table_alias: target_alias,
         schema: Some(schema),
-        register_base: Some(RegisterRow::columns(existing_regs)),
+        register_base: Some(RegisterRow::columns(old_regs)),
         secondaries: &excluded_secondary,
     };
     // WITHOUT ROWID tables have no hidden rowid, so no column ever resolves to a
@@ -30332,12 +30363,16 @@ fn codegen_update_without_rowid(
     // Compute the NEW image in place, then validate constraints. Nothing below
     // this point has mutated the table yet, so OR IGNORE can bail cleanly and
     // the ABORT family can raise with the OLD row still intact.
+    //
+    // bd-bymr0: the SET terms read the OLD image. `col_regs` is rewritten term
+    // by term, so reading it let `SET a = b, b = a` see the new `a`, and
+    // `SET a = 'z' || a` see its own partial result.
     let update_ctx = ScanCtx {
         cursor: table_cursor,
         table,
         table_alias: stmt.table.alias.as_deref(),
         schema: Some(schema),
-        register_base: Some(RegisterRow::columns(col_regs)),
+        register_base: Some(RegisterRow::columns(old_regs)),
         secondaries: &[],
     };
     // Reset the placeholder counter to 1 for the SET expressions (Pass 2): they
