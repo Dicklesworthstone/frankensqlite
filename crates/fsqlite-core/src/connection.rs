@@ -41854,7 +41854,18 @@ impl Connection {
                                     && expr_has_correlated_subquery_deep(value, self))
                         })
                     });
+                // bd-hga35: a RETURNING subquery the codegen cannot answer is
+                // compiled to a wrong value too, so such an UPDATE also runs row
+                // by row, reading each row's RETURNING with a SELECT once the row
+                // has changed. Stock evaluates RETURNING before the row's AFTER
+                // triggers, which a statement per row cannot, and a SET of the
+                // row key loses the row: both keep the old lane.
+                let returning_needs_select_path = !has_after_update
+                    && self
+                        .returning_has_uncompiled_correlated_subquery(&effective_update.returning)
+                    && !self.update_assigns_row_key(&effective_update)?;
                 let needs_row_by_row_replay = set_needs_select_path
+                    || returning_needs_select_path
                     || (computes_new_images
                         && (effective_update.from.is_some()
                             || !self.dml_where_pins_one_row(
@@ -41877,12 +41888,16 @@ impl Connection {
                     .map(|(columns, rows)| (columns, None, rows))
                 };
                 if let Some((locator_columns, set_columns, locator_rows)) = replay_locators
-                    && (locator_rows.len() > 1 || set_needs_select_path)
+                    && (locator_rows.len() > 1
+                        || set_needs_select_path
+                        || returning_needs_select_path)
                 {
                     self.log_mem_execution_fallback(
                         "update",
                         if set_needs_select_path {
                             "update_row_by_row_correlated_set_fallback"
+                        } else if returning_needs_select_path {
+                            "update_row_by_row_correlated_returning_fallback"
                         } else {
                             "update_row_by_row_trigger_or_fk_fallback"
                         },
@@ -41910,6 +41925,7 @@ impl Connection {
                         params,
                         &locator_columns,
                         &locator_rows,
+                        returning_needs_select_path,
                     ))
                     .await;
                 }
@@ -42274,6 +42290,37 @@ impl Connection {
                     fsqlite_ast::TriggerTiming::After,
                     &delete_event,
                 );
+                // bd-hga35: a RETURNING subquery the codegen cannot answer is
+                // compiled to a wrong value, so such a DELETE runs row by row,
+                // reading each row's RETURNING with a SELECT just before the row
+                // goes. Stock reads it just after, before the row's AFTER
+                // triggers; with DELETE triggers the old lane stays.
+                if !has_before_delete
+                    && !has_after_delete
+                    && !self.has_live_vtab_instance(table_name)
+                    && self
+                        .returning_has_uncompiled_correlated_subquery(&effective_delete.returning)
+                    && let Some((locator_columns, locator_rows)) = self
+                        .materialize_dml_replay_locators(
+                            &effective_delete.table,
+                            effective_delete.where_clause.as_ref(),
+                            params,
+                        )
+                        .await?
+                {
+                    self.log_mem_execution_fallback(
+                        "delete",
+                        "delete_row_by_row_correlated_returning_fallback",
+                    )?;
+                    return Box::pin(self.execute_dml_row_by_row(
+                        DmlRowReplay::Delete(&effective_delete),
+                        params,
+                        &locator_columns,
+                        &locator_rows,
+                        true,
+                    ))
+                    .await;
+                }
                 // bd-5pt42: stock SQLite deletes a multi-row target one row at a
                 // time — row N's BEFORE triggers, delete, FK actions and AFTER
                 // triggers all run before row N+1's BEFORE triggers, so each
@@ -42308,6 +42355,7 @@ impl Connection {
                         params,
                         &locator_columns,
                         &locator_rows,
+                        false,
                     ))
                     .await;
                 }
@@ -54917,6 +54965,41 @@ impl Connection {
         Ok(Some((locator_columns, set_columns, rows)))
     }
 
+    /// bd-hga35: whether a RETURNING list holds a correlated subquery the
+    /// codegen cannot answer (see `dml_expr_has_uncompiled_correlated_subquery`).
+    fn returning_has_uncompiled_correlated_subquery(&self, returning: &[ResultColumn]) -> bool {
+        returning.iter().any(|column| {
+            matches!(column, ResultColumn::Expr { expr, .. }
+                if dml_expr_has_uncompiled_correlated_subquery(expr, self))
+        })
+    }
+
+    /// bd-hga35: whether an UPDATE assigns the key a row replay finds its rows
+    /// by: the rowid under any of its names, an INTEGER PRIMARY KEY, or a
+    /// WITHOUT ROWID primary key column. A SET list that does not flatten
+    /// counts as assigning it.
+    fn update_assigns_row_key(&self, update: &fsqlite_ast::UpdateStatement) -> Result<bool> {
+        let Some(locator_columns) = self.dml_replay_locator_columns(&update.table)? else {
+            return Ok(false);
+        };
+        let Ok(set_pairs) = Self::update_set_pairs(update) else {
+            return Ok(true);
+        };
+        self.with_dml_target_table(&update.table, |table| {
+            let declared = |name: &str| {
+                table
+                    .columns
+                    .iter()
+                    .find(|column| column.name.eq_ignore_ascii_case(name))
+            };
+            Ok(set_pairs.iter().any(|(column, _)| {
+                locator_columns.iter().any(|key| key.eq_ignore_ascii_case(column))
+                    || declared(column)
+                        .map_or_else(|| is_rowid_alias(column), |declared| declared.is_ipk)
+            }))
+        })?
+    }
+
     /// An UPDATE's SET list flattened to (target column, value) pairs in order;
     /// `(a, b) = (x, y)` becomes `a = x, b = y`.
     fn update_set_pairs(update: &fsqlite_ast::UpdateStatement) -> Result<Vec<(&str, &Expr)>> {
@@ -55161,6 +55244,61 @@ impl Connection {
         Ok(rows.into_iter().next().map(|row| row.values().to_vec()))
     }
 
+    /// bd-hga35: `SELECT <RETURNING> FROM <target> WHERE <locator>`, which
+    /// reads one row's RETURNING values for a replay whose RETURNING the
+    /// codegen cannot compute. The target is named without its alias, which
+    /// RETURNING cannot name (bd-xrzce), and without an index hint.
+    fn build_returning_row_select(
+        table_ref: &fsqlite_ast::QualifiedTableRef,
+        returning: &[ResultColumn],
+        locator_columns: &[String],
+        locator_values: Vec<Expr>,
+    ) -> Result<Statement> {
+        let mut target = table_ref.clone();
+        target.alias = None;
+        target.index_hint = None;
+        let locator =
+            Self::build_update_replay_locator_filter(&target, locator_columns, locator_values)?;
+        Ok(Statement::Select(Self::build_single_table_select(
+            &target,
+            returning.to_vec(),
+            Some(&locator),
+            &[],
+            None,
+        )))
+    }
+
+    /// bd-hga35: one row's RETURNING rows (none once the row is gone), read
+    /// by `returning_select` with the row statement's parameter layout, or
+    /// past the variable limit by a SELECT naming the locator as literals.
+    #[allow(clippy::too_many_arguments)]
+    async fn read_returning_row(
+        &self,
+        table_ref: &fsqlite_ast::QualifiedTableRef,
+        returning: &[ResultColumn],
+        returning_select: Option<&Statement>,
+        locator_columns: &[String],
+        locator_values: &[SqliteValue],
+        params: Option<&[SqliteValue]>,
+        parameter_base: usize,
+    ) -> Result<Vec<Row>> {
+        if let Some(returning_select) = returning_select {
+            let mut select_params = params.unwrap_or(&[]).to_vec();
+            select_params.resize(parameter_base, SqliteValue::Null);
+            select_params.extend_from_slice(locator_values);
+            return self
+                .execute_statement(returning_select, Some(&select_params))
+                .await;
+        }
+        let literal_select = Self::build_returning_row_select(
+            table_ref,
+            returning,
+            locator_columns,
+            locator_values.iter().cloned().map(value_to_literal_expr).collect(),
+        )?;
+        self.execute_statement(&literal_select, params).await
+    }
+
     /// The highest bind-parameter slot `statement` itself can read: every
     /// `?NNN` it names and every slot its anonymous and named placeholders
     /// claim. A replay's own per-row parameters are numbered after it.
@@ -55191,12 +55329,19 @@ impl Connection {
     /// of compiling a statement with literal values per row. A literal and a
     /// bound value both compare and assign without affinity, so the per-row
     /// statement means the same thing either way.
+    ///
+    /// bd-hga35: with `returning_via_select`, the per-row statements carry no
+    /// RETURNING; a SELECT of the row reads it instead, after an UPDATE changes
+    /// the row (where stock evaluates RETURNING) or just before a DELETE
+    /// removes it. The caller keeps AFTER triggers and changed row keys off
+    /// this lane.
     async fn execute_dml_row_by_row(
         &self,
         statement: DmlRowReplay<'_>,
         params: Option<&[SqliteValue]>,
         locator_columns: &[String],
         locator_rows: &[Vec<SqliteValue>],
+        returning_via_select: bool,
     ) -> Result<Vec<Row>> {
         let (table_ref, preserve_constraint_failure_rows, kind) = match statement {
             DmlRowReplay::Update(update)
@@ -55228,7 +55373,18 @@ impl Connection {
                 None
             }
         };
+        // The RETURNING list read per row, and whether after the row changes.
+        let returning_read = match statement {
+            _ if !returning_via_select => None,
+            DmlRowReplay::Update(update)
+            | DmlRowReplay::UpdateFrom { update, .. }
+            | DmlRowReplay::UpdateEvaluated { update, .. } => {
+                Some((update.returning.as_slice(), true))
+            }
+            DmlRowReplay::Delete(delete) => Some((delete.returning.as_slice(), false)),
+        };
         let mut parameterized_set_select = None;
+        let mut parameterized_returning_select = None;
         let row_value_count = locator_columns.len() + set_count;
         let caller_params = params.unwrap_or(&[]);
         let parameter_base = Self::dml_replay_statement_parameter_slots(statement)?
@@ -55253,12 +55409,24 @@ impl Connection {
                     locator_slots.clone(),
                 )?);
             }
-            Some(Self::build_dml_replay_row_statement(
+            if let Some((returning, _)) = returning_read {
+                parameterized_returning_select = Some(Self::build_returning_row_select(
+                    table_ref,
+                    returning,
+                    locator_columns,
+                    locator_slots.clone(),
+                )?);
+            }
+            let mut row_statement = Self::build_dml_replay_row_statement(
                 statement,
                 locator_columns,
                 locator_slots,
                 set_slots,
-            )?)
+            )?;
+            if returning_read.is_some() {
+                strip_dml_returning(&mut row_statement);
+            }
+            Some(row_statement)
         } else {
             None
         };
@@ -55302,17 +55470,44 @@ impl Connection {
                     row_params.extend_from_slice(locator_row);
                     (parameterized, Some(row_params.as_slice()))
                 } else {
-                    literal_statement = Self::build_dml_replay_row_statement(
+                    let mut built = Self::build_dml_replay_row_statement(
                         statement,
                         locator_columns,
                         locator_values.iter().cloned().map(value_to_literal_expr).collect(),
                         set_values.iter().cloned().map(value_to_literal_expr).collect(),
                     )?;
+                    if returning_read.is_some() {
+                        strip_dml_returning(&mut built);
+                    }
+                    literal_statement = built;
                     (&literal_statement, params)
                 };
 
+                // bd-hga35: a DELETE reads the row's RETURNING before removing it.
+                let mut returning_error = None;
+                let returning_before = match returning_read {
+                    Some((returning, false)) if evaluation_error.is_none() => match self
+                        .read_returning_row(
+                            table_ref,
+                            returning,
+                            parameterized_returning_select.as_ref(),
+                            locator_columns,
+                            locator_values,
+                            params,
+                            parameter_base,
+                        )
+                        .await
+                    {
+                        Ok(rows) => rows,
+                        Err(error) => {
+                            returning_error = Some(error);
+                            Vec::new()
+                        }
+                    },
+                    _ => Vec::new(),
+                };
                 self.set_statement_change_count(previous_changes);
-                let row_result = match evaluation_error {
+                let row_result = match evaluation_error.or(returning_error) {
                     Some(error) => Err(error),
                     None => {
                         self.execute_statement_impl_after_background_status(
@@ -55323,6 +55518,32 @@ impl Connection {
                         )
                         .await
                     }
+                };
+                // bd-hga35: an UPDATE reads it once the row has changed. A row
+                // the statement did not change returns nothing.
+                let row_result = match (row_result, returning_read) {
+                    (Ok(_), Some((returning, read_after))) => {
+                        let row_changes = self.last_changes.get();
+                        let returned = if row_changes == 0 {
+                            Ok(Vec::new())
+                        } else if read_after {
+                            self.read_returning_row(
+                                table_ref,
+                                returning,
+                                parameterized_returning_select.as_ref(),
+                                locator_columns,
+                                locator_values,
+                                params,
+                                parameter_base,
+                            )
+                            .await
+                        } else {
+                            Ok(returning_before)
+                        };
+                        self.set_statement_change_count(row_changes);
+                        returned
+                    }
+                    (result, _) => result,
                 };
                 match row_result {
                     Ok(rows) => {
@@ -158419,6 +158640,15 @@ enum DmlRowReplay<'a> {
         set_columns: &'a [String],
     },
     Delete(&'a fsqlite_ast::DeleteStatement),
+}
+
+/// bd-hga35: drop a row-replay statement's RETURNING; the replay reads it.
+fn strip_dml_returning(statement: &mut Statement) {
+    match statement {
+        Statement::Update(update) => update.returning.clear(),
+        Statement::Delete(delete) => delete.returning.clear(),
+        _ => {}
+    }
 }
 
 #[derive(Default)]
