@@ -43227,16 +43227,24 @@ impl Connection {
         // Chunked materialization: wrap the source SELECT with LIMIT/OFFSET
         // and process in bounded batches to avoid OOM on large result sets.
         // Safe here because the source and destination tables are disjoint.
+        // Where the source is read in rowid order, each chunk instead seeks
+        // past the previous chunk's last rowid (bd-qdve2): an OFFSET re-reads
+        // every row before it, so the chunks cost quadratic time in total.
+        let keyset_rowid = self.insert_select_keyset_rowid(select_stmt);
+        let mut after_rowid = None;
         let mut total_outcome = InsertSelectReplayOutcome::default();
         let mut offset: i64 = 0;
         loop {
             let mut chunked_select = select_stmt.clone();
+            if let Some(rowid) = &keyset_rowid {
+                keyset_chunk_select(&mut chunked_select, rowid, after_rowid);
+            }
             chunked_select.limit = Some(fsqlite_ast::LimitClause {
                 limit: fsqlite_ast::Expr::Literal(
                     fsqlite_ast::Literal::Integer(Self::INSERT_SELECT_CHUNK_SIZE),
                     fsqlite_ast::Span::ZERO,
                 ),
-                offset: if offset > 0 {
+                offset: if offset > 0 && keyset_rowid.is_none() {
                     Some(fsqlite_ast::Expr::Literal(
                         fsqlite_ast::Literal::Integer(offset),
                         fsqlite_ast::Span::ZERO,
@@ -43245,9 +43253,21 @@ impl Connection {
                     None
                 },
             });
-            let source_rows = self
+            let mut source_rows = self
                 .materialize_insert_select_source_rows(insert, &chunked_select, params)
                 .await?;
+            if keyset_rowid.is_some() {
+                // The appended last column is the rowid the next chunk seeks past.
+                for row in &mut source_rows {
+                    let Some(SqliteValue::Integer(rowid)) = row.values.pop() else {
+                        return Err(FrankenError::Internal(
+                            "INSERT ... SELECT keyset chunk returned a row without its rowid"
+                                .to_owned(),
+                        ));
+                    };
+                    after_rowid = Some(rowid);
+                }
+            }
             let chunk_len = source_rows.len();
             let chunk_outcome = self
                 .execute_insert_select_materialized_rows_outcome(insert, &source_rows)
@@ -43262,7 +43282,99 @@ impl Connection {
             }
             offset += Self::INSERT_SELECT_CHUNK_SIZE;
         }
+        // Each chunk set changes() to its own count; the statement's is the
+        // sum (bd-qdve2).
+        self.set_statement_change_count(total_outcome.changes);
         Ok(total_outcome)
+    }
+
+    /// bd-qdve2: the source's rowid, as a column reference, when the chunked
+    /// INSERT ... SELECT fallback can page its source by rowid rather than by
+    /// OFFSET with the same rows in the same order. That holds when the SELECT
+    /// reads one local rowid table with no join, compound, DISTINCT, grouping,
+    /// aggregate, window function, ORDER BY or WITH, and its WHERE clause names
+    /// no column an index on the table leads with (nor is there an expression
+    /// or partial index): the scan then goes in rowid order, which the chunks
+    /// keep.
+    fn insert_select_keyset_rowid(&self, select_stmt: &SelectStatement) -> Option<Expr> {
+        if select_stmt.with.is_some()
+            || !select_stmt.body.compounds.is_empty()
+            || !select_stmt.order_by.is_empty()
+            || select_stmt.limit.is_some()
+            || has_window_functions(select_stmt)
+            || self.has_implicit_aggregation_with_registry(select_stmt)
+        {
+            return None;
+        }
+        let SelectCore::Select {
+            distinct,
+            columns,
+            from: Some(from),
+            where_clause,
+            group_by,
+            having,
+            windows,
+        } = &select_stmt.body.select
+        else {
+            return None;
+        };
+        if *distinct != Distinctness::All
+            || !from.joins.is_empty()
+            || !group_by.is_empty()
+            || having.is_some()
+            || !windows.is_empty()
+            || columns.is_empty()
+        {
+            return None;
+        }
+        let TableOrSubquery::Table { name, alias, .. } = &from.source else {
+            return None;
+        };
+        if name.schema.as_deref().is_some_and(|schema| !is_builtin_schema(schema))
+            || self.has_live_vtab_instance(&name.name)
+            || self.view_index_of(&name.name).is_some()
+        {
+            return None;
+        }
+        let (table, _) = self.local_join_binding_table(name)?;
+        if table.without_rowid {
+            return None;
+        }
+        if let Some(where_clause) = where_clause {
+            if table
+                .indexes
+                .iter()
+                .any(|index| index.columns.is_empty() || index.where_clause.is_some())
+            {
+                return None;
+            }
+            let mut names_index_column = false;
+            for_each_column_ref_in_expr(where_clause, &mut |column_ref| {
+                names_index_column |= table.indexes.iter().any(|index| {
+                    index.columns.first().is_some_and(|leading| {
+                        leading.eq_ignore_ascii_case(&column_ref.column)
+                    })
+                });
+            });
+            if names_index_column {
+                return None;
+            }
+        }
+        let rowid_name = ["rowid", "_rowid_", "oid"].into_iter().find(|candidate| {
+            !table
+                .columns
+                .iter()
+                .any(|column| column.name.eq_ignore_ascii_case(candidate))
+        })?;
+        let qualifier = alias.as_deref().unwrap_or(&name.name);
+        Some(Expr::Column(
+            fsqlite_ast::ColumnRef {
+                schema: None,
+                table: Some(Arc::from(qualifier)),
+                column: Arc::from(rowid_name),
+            },
+            fsqlite_ast::Span::ZERO,
+        ))
     }
 
     async fn execute_materialized_insert_select_statement(
@@ -46328,14 +46440,28 @@ impl Connection {
         if insert.with.is_some() {
             return Ok(None);
         }
+        let source_is_unwritten = self.insert_select_source_is_unwritten(insert, select_stmt);
         let mut streamed = false;
         let outcome = self
             .execute_insert_select_row_stream(insert, async |emitter| {
-                streamed = self
-                    .try_stream_simple_join_select_rows(select_stmt, params, async |source_row| {
-                        emitter.emit_row(source_row).await
-                    })
-                    .await?;
+                if source_is_unwritten {
+                    streamed = self
+                        .try_stream_single_table_select_rows_in_chunks(
+                            select_stmt,
+                            params,
+                            async |source_row| emitter.emit_row(source_row).await,
+                        )
+                        .await?;
+                }
+                if !streamed {
+                    streamed = self
+                        .try_stream_simple_join_select_rows(
+                            select_stmt,
+                            params,
+                            async |source_row| emitter.emit_row(source_row).await,
+                        )
+                        .await?;
+                }
                 Ok(())
             })
             .await?;
@@ -46950,6 +47076,135 @@ impl Connection {
             async |row| emit_row(row).await,
         )
         .await
+    }
+
+    /// bd-qdve2: whether nothing an INSERT ... SELECT does can write a table
+    /// its SELECT reads, so the source may be read while rows are inserted:
+    /// the target is not a source, no trigger is defined on the target, and no
+    /// foreign-key action can run.
+    fn insert_select_source_is_unwritten(
+        &self,
+        insert: &fsqlite_ast::InsertStatement,
+        select_stmt: &fsqlite_ast::SelectStatement,
+    ) -> bool {
+        let target = &insert.table.name;
+        !self.skip_statement_memdb_refresh.get()
+            && !self.fk_enforcement_enabled()
+            && !self
+                .triggers
+                .borrow()
+                .iter()
+                .any(|trigger| trigger.table_name.eq_ignore_ascii_case(target))
+            && !Self::extract_table_names_from_select(select_stmt)
+                .iter()
+                .any(|source| source.eq_ignore_ascii_case(target))
+    }
+
+    /// bd-qdve2: the streaming INSERT ... SELECT source when it is a single
+    /// rowid table read whole (`SELECT cols FROM s`, optionally ORDER BY its
+    /// rowid). `try_stream_simple_join_select_rows` loads such a table in one
+    /// scan; this reads it in rowid order, `INSERT_SELECT_CHUNK_SIZE` rows at
+    /// a time, and inserts each chunk before reading the next, so the
+    /// statement holds one chunk of the source instead of all of it. The rows
+    /// and their order are the ones the whole-table scan gives.
+    ///
+    /// The caller checks `insert_select_source_is_unwritten`. Every chunk is
+    /// read in the statement's open transaction, so all of them see the same
+    /// snapshot. `Ok(false)` declines before emitting anything: a join, a
+    /// source that is not a local rowid table, or no open transaction.
+    async fn try_stream_single_table_select_rows_in_chunks<F>(
+        &self,
+        select_stmt: &fsqlite_ast::SelectStatement,
+        params: Option<&[SqliteValue]>,
+        mut emit_row: F,
+    ) -> Result<bool>
+    where
+        F: std::ops::AsyncFnMut(&[SqliteValue]) -> Result<()>,
+    {
+        let SelectCore::Select {
+            from: Some(from), ..
+        } = &select_stmt.body.select
+        else {
+            return Ok(false);
+        };
+        if !from.joins.is_empty() || self.active_txn.borrow().is_none() {
+            return Ok(false);
+        }
+        let prep_cx = self.op_cx_after_background_status();
+        self.prepare_streaming_join_select_read_boundary(select_stmt, &prep_cx)
+            .await?;
+        let mut chunk_source = None;
+        let Some(mut prepared) = self
+            .prepare_simple_join_select_rows_with_scanner(
+                select_stmt,
+                params,
+                async |source| {
+                    chunk_source = Some(source.clone());
+                    Ok(Some(Vec::new()))
+                },
+                |table_name| self.has_live_vtab_instance(table_name),
+            )
+            .await?
+        else {
+            return Ok(false);
+        };
+        let Some(source) = chunk_source else {
+            return Ok(false);
+        };
+        let Some(rowid_name) = source.hidden_rowid_projection.as_deref() else {
+            return Ok(false);
+        };
+        if source
+            .local_table_binding()
+            .and_then(|binding| self.local_join_binding_table(binding))
+            .is_none_or(|(table, _)| table.without_rowid)
+        {
+            return Ok(false);
+        }
+
+        let chunk_rows = usize::try_from(Self::INSERT_SELECT_CHUNK_SIZE).unwrap_or(usize::MAX);
+        let scan_sql = build_join_scan_sql(&source);
+        let first_sql = format!(
+            "{scan_sql} ORDER BY {rowid_name} LIMIT {}",
+            Self::INSERT_SELECT_CHUNK_SIZE
+        );
+        let next_sql = format!(
+            "{scan_sql} WHERE {rowid_name} > ?1 ORDER BY {rowid_name} LIMIT {}",
+            Self::INSERT_SELECT_CHUNK_SIZE
+        );
+        let rowid_index = source.scan_width().saturating_sub(1);
+        let mut after_rowid = None;
+        loop {
+            let rows = {
+                let _tt_guard = (!self.memdb_rows_loaded.get())
+                    .then(|| BoolCellRestoreGuard::new(&self.time_travel_active, false));
+                match after_rowid {
+                    None => self.query(&first_sql).await?,
+                    Some(rowid) => {
+                        self.query_with_params(&next_sql, &[SqliteValue::Integer(rowid)])
+                            .await?
+                    }
+                }
+            };
+            let chunk_len = rows.len();
+            prepared.table_rows = vec![rows_into_value_vectors(rows)];
+            let Some(last_row) = prepared.table_rows[0].last() else {
+                break;
+            };
+            let Some(SqliteValue::Integer(last_rowid)) = last_row.get(rowid_index) else {
+                return Err(FrankenError::Internal(format!(
+                    "INSERT ... SELECT chunked scan of `{}` returned a row without its rowid",
+                    source.table_name
+                )));
+            };
+            after_rowid = Some(*last_rowid);
+            self.emit_prepared_simple_join_rows(&prepared, async |row| emit_row(row).await)
+                .await?;
+            if chunk_len < chunk_rows {
+                break;
+            }
+        }
+        Ok(true)
     }
 
     fn validate_insert_target_columns(
@@ -156240,6 +156495,47 @@ fn prune_join_source_row(row: &mut [SqliteValue], keep: &[bool]) {
             *value = SqliteValue::Null;
         }
     }
+}
+
+/// bd-qdve2: turn `select` into one keyset chunk of its rows: `rowid` (from
+/// `Connection::insert_select_keyset_rowid`) is appended as the last result
+/// column and ordered by, and rows at or before `after_rowid` are skipped.
+/// The caller adds the LIMIT.
+fn keyset_chunk_select(select: &mut SelectStatement, rowid: &Expr, after_rowid: Option<i64>) {
+    let SelectCore::Select {
+        columns,
+        where_clause,
+        ..
+    } = &mut select.body.select
+    else {
+        return;
+    };
+    columns.push(ResultColumn::Expr {
+        expr: rowid.clone(),
+        alias: None,
+    });
+    if let Some(after_rowid) = after_rowid {
+        let bound = Expr::BinaryOp {
+            left: Box::new(rowid.clone()),
+            op: BinaryOp::Gt,
+            right: Box::new(Expr::Literal(Literal::Integer(after_rowid), Span::ZERO)),
+            span: Span::ZERO,
+        };
+        *where_clause = Some(Box::new(match where_clause.take() {
+            Some(filter) => Expr::BinaryOp {
+                left: Box::new(bound),
+                op: BinaryOp::And,
+                right: filter,
+                span: Span::ZERO,
+            },
+            None => bound,
+        }));
+    }
+    select.order_by = vec![OrderingTerm {
+        expr: rowid.clone(),
+        direction: None,
+        nulls: None,
+    }];
 }
 
 fn build_join_scan_sql(source: &JoinTableSource) -> String {
