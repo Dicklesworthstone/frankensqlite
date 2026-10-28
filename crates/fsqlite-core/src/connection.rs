@@ -41204,6 +41204,23 @@ impl Connection {
                     )?;
                     Box::pin(self.execute_correlated_subquery_where_fallback(cx, select, params))
                         .await
+                } else if select_has_unsupported_correlated_exists_subquery(select, self)
+                    && self
+                        .select_uses_builtin_minmax_bare_tracking(select)
+                        .is_none()
+                {
+                    // bd-jf4s4: likewise `emit_exists_subquery`, which scans
+                    // one base table for a matching row. A correlated EXISTS
+                    // it cannot answer (a join, a view, a CTE, a compound,
+                    // HAVING, an OFFSET) answers per outer row here. One in
+                    // the WHERE clause was routed earlier
+                    // (select_correlated_exists_where_requires_fallback).
+                    self.log_mem_execution_fallback(
+                        "select",
+                        "correlated_exists_subquery_fallback",
+                    )?;
+                    Box::pin(self.execute_correlated_subquery_where_fallback(cx, select, params))
+                        .await
                 } else if select_has_in_subquery_operand_requiring_semantic_fallback(select, self) {
                     // Keep connection dispatch aligned with the native
                     // IN-probe admission boundary. A scalar subquery on the
@@ -119426,6 +119443,59 @@ fn select_has_unsupported_correlated_scalar_subquery(
                     && !scalar_subquery_supported_by_vdbe(inner, conn, outer)
         )
     })
+}
+
+/// bd-jf4s4: whether a correlated EXISTS in `select` is a shape
+/// `emit_exists_subquery` would compile wrong.
+fn select_has_unsupported_correlated_exists_subquery(
+    select: &SelectStatement,
+    conn: &Connection,
+) -> bool {
+    select_contains_subquery_matching(select, conn, &|subquery, conn| {
+        matches!(
+            subquery,
+            SubqueryExprRef::Exists(inner)
+                if !exists_subquery_answered_by_table_scan(inner, conn)
+                    && is_correlated_subquery_with_schema(inner, &conn.schema.borrow())
+        )
+    })
+}
+
+/// Whether `emit_exists_subquery`'s scan answers `sub`. It looks for one row
+/// of one main-schema base table that passes the WHERE: it ignores joins,
+/// compounds, CTEs and HAVING, reads a view, derived table or table function
+/// as empty, and of LIMIT/OFFSET honours only a literal `LIMIT 0`. A literal
+/// LIMIT with no positive literal OFFSET cannot hide the first matching row.
+fn exists_subquery_answered_by_table_scan(sub: &SelectStatement, conn: &Connection) -> bool {
+    let SelectCore::Select {
+        from,
+        having: None,
+        ..
+    } = &sub.body.select
+    else {
+        return false;
+    };
+    let source_is_base_table = from.as_ref().is_none_or(|from| {
+        from.joins.is_empty()
+            && matches!(
+                &from.source,
+                TableOrSubquery::Table { name, .. }
+                    if name.schema.is_none()
+                        && !conn.table_name_is_virtual(&name.name)
+                        && conn
+                            .schema
+                            .borrow()
+                            .iter()
+                            .any(|table| table.name.eq_ignore_ascii_case(&name.name))
+            )
+    });
+    let limit_is_literal = sub.limit.as_ref().is_none_or(|clause| {
+        matches!(clause.limit, Expr::Literal(Literal::Integer(_), _))
+            && clause.offset.as_ref().is_none_or(
+                |offset| matches!(offset, Expr::Literal(Literal::Integer(value), _) if *value <= 0),
+            )
+    });
+    sub.with.is_none() && sub.body.compounds.is_empty() && source_is_base_table && limit_is_literal
 }
 
 /// The table a SELECT scans when its FROM is exactly one base table, with its
