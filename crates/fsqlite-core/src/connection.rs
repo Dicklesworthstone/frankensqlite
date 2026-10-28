@@ -26980,8 +26980,12 @@ impl Connection {
         // correctness-neutral and removes the quadratic. Only when the caller
         // explicitly opted into the MemDatabase as the row source of record
         // (reject_mem_fallback == false && !defer_memdb_row_hydration()) must
-        // the mirror stay eagerly hydrated.
-        let hydrate_rows = self.should_eagerly_hydrate_memdb_rows() && !hydration_suppressed;
+        // the mirror stay eagerly hydrated. Not `should_eagerly_hydrate_memdb_rows()`:
+        // its `:memory:` arm would hydrate every in-memory database here again
+        // (bd-gjrct, b729ccf1d).
+        let hydrate_rows = !*self.reject_mem_fallback.borrow()
+            && !self.defer_memdb_row_hydration()
+            && !hydration_suppressed;
         let bound_visible_commit_seq = self
             .active_txn
             .borrow()
@@ -260098,10 +260102,11 @@ mod pager_routing_tests {
                 .execute("INSERT INTO udf_trigger_target VALUES ('x');")
                 .await
                 .expect_err("trigger RAISE predicates must retain the connection registry");
+            // RAISE(ABORT) is SQLITE_CONSTRAINT_TRIGGER, as in stock (f62448b87).
             assert!(
                 matches!(
                     trigger_error,
-                    FrankenError::FunctionError(ref message)
+                    FrankenError::TriggerRaise(ref message)
                         if message == "blocked by custom scalar"
                 ),
                 "the custom scalar must make the trigger predicate fire: {trigger_error:?}"
