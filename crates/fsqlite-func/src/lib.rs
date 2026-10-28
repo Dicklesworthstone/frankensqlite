@@ -116,7 +116,7 @@ pub use vtab::{
     ColumnContext, ConstraintOp, IndexConstraint, IndexConstraintUsage, IndexInfo, IndexOrderBy,
     VirtualTable, VirtualTableCursor,
 };
-pub use window::{WindowAdapter, WindowFunction};
+pub use window::{WindowAdapter, WindowFunction, WindowWithArgSubtypes};
 pub use window_builtins::register_window_builtins;
 
 /// Top-level function family exposed by the runtime registry.

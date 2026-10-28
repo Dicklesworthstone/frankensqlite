@@ -88093,6 +88093,7 @@ impl Connection {
         let registry = self.func_registry.borrow().clone();
         let function = find_window_function_checked(&registry, name, num_args)?;
         let is_builtin = !self.is_custom_window_function(&function);
+        let function = self.window_function_with_arg_subtypes(function, args);
 
         for expr in &window.partition_by {
             self.eval_fromless_group_stage_expr(expr, group_has_input)
@@ -93734,6 +93735,7 @@ impl Connection {
                     let num_args = arg_exprs.len() as i32;
                     let func = find_window_function_checked(&registry, name, num_args)?;
                     let is_builtin = !self.is_custom_window_function(&func);
+                    let func = self.window_function_with_arg_subtypes(func, args);
                     let order_by_source: Vec<Expr> =
                         spec.order_by.iter().map(|term| term.expr.clone()).collect();
                     let ob: Vec<OrderingTerm> = spec
@@ -93823,6 +93825,7 @@ impl Connection {
                         let num_args = arg_exprs.len() as i32;
                         let func = find_window_function_checked(&registry, &inner_name, num_args)?;
                         let is_builtin = !self.is_custom_window_function(&func);
+                        let func = self.window_function_with_arg_subtypes(func, &inner_args);
                         let order_by_source: Vec<Expr> = inner_spec
                             .order_by
                             .iter()
@@ -94775,6 +94778,7 @@ impl Connection {
                     let num_args = arg_exprs.len() as i32;
                     let func = find_window_function_checked(&registry, name, num_args)?;
                     let is_builtin = !self.is_custom_window_function(&func);
+                    let func = self.window_function_with_arg_subtypes(func, args);
                     let ob = spec.order_by.clone();
                     let pb = spec.partition_by.clone();
                     let upper = name.to_ascii_uppercase();
@@ -94837,6 +94841,7 @@ impl Connection {
                         let num_args = arg_exprs.len() as i32;
                         let func = find_window_function_checked(&registry, &inner_name, num_args)?;
                         let is_builtin = !self.is_custom_window_function(&func);
+                        let func = self.window_function_with_arg_subtypes(func, &inner_args);
                         let ob = inner_spec.order_by.clone();
                         let pb = inner_spec.partition_by.clone();
                         let upper = inner_name.to_ascii_uppercase();
@@ -97216,6 +97221,25 @@ impl Connection {
             .iter()
             .map(|expr| self.expr_result_json_subtype(expr))
             .collect()
+    }
+
+    /// The window-call counterpart of [`Self::aggregate_arg_json_subtypes`]:
+    /// bind the argument expressions' static JSON subtypes to `func`, so
+    /// `json_group_array(json(x)) OVER (...)` embeds the JSON instead of
+    /// quoting it. The window engines materialize arguments as plain column
+    /// values, which carry no subtype. Returns `func` unchanged when no
+    /// argument carries one. Call after `is_custom_window_function`, which
+    /// compares the registered `Arc` by pointer. bd-ffwsd.
+    fn window_function_with_arg_subtypes(
+        &self,
+        func: Arc<ErasedWindowFunction>,
+        args: &FunctionArgs,
+    ) -> Arc<ErasedWindowFunction> {
+        let arg_subtypes = self.aggregate_arg_json_subtypes(args);
+        if arg_subtypes.iter().all(|&subtype| subtype == 0) {
+            return func;
+        }
+        Arc::new(fsqlite_func::WindowWithArgSubtypes::new(func, arg_subtypes))
     }
 
     fn expr_result_json_subtype(&self, expr: &Expr) -> u32 {

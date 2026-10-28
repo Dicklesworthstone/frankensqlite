@@ -7,11 +7,12 @@
 #![allow(clippy::unnecessary_literal_bound)]
 
 use std::any::Any;
+use std::sync::Arc;
 
 use fsqlite_error::Result;
 use fsqlite_types::SqliteValue;
 
-use crate::FunctionArity;
+use crate::{ErasedWindowFunction, FunctionArity};
 
 /// A window SQL function (e.g. `SUM() OVER (...)`, custom moving averages).
 ///
@@ -36,6 +37,19 @@ pub trait WindowFunction: Send + Sync {
 
     /// Add a row to the window frame.
     fn step(&self, state: &mut Self::State, args: &[SqliteValue]) -> Result<()>;
+
+    /// Add a row with per-argument subtype tags available, as
+    /// [`AggregateFunction::step_with_arg_subtypes`](crate::AggregateFunction::step_with_arg_subtypes)
+    /// does for aggregates. The default ignores the tags and forwards to
+    /// [`Self::step`].
+    fn step_with_arg_subtypes(
+        &self,
+        state: &mut Self::State,
+        args: &[SqliteValue],
+        _arg_subtypes: &[u32],
+    ) -> Result<()> {
+        self.step(state, args)
+    }
 
     /// Remove a row from the window frame (sliding window support).
     ///
@@ -119,6 +133,19 @@ where
         self.inner.step(concrete, args)
     }
 
+    fn step_with_arg_subtypes(
+        &self,
+        state: &mut Self::State,
+        args: &[SqliteValue],
+        arg_subtypes: &[u32],
+    ) -> Result<()> {
+        let concrete = state
+            .downcast_mut::<F::State>()
+            .expect("window state type mismatch");
+        self.inner
+            .step_with_arg_subtypes(concrete, args, arg_subtypes)
+    }
+
     fn inverse(&self, state: &mut Self::State, args: &[SqliteValue]) -> Result<()> {
         let concrete = state
             .downcast_mut::<F::State>()
@@ -138,6 +165,82 @@ where
             .downcast::<F::State>()
             .expect("window state type mismatch");
         self.inner.finalize(concrete)
+    }
+
+    fn num_args(&self) -> i32 {
+        self.inner.num_args()
+    }
+
+    fn min_args(&self) -> i32 {
+        self.inner.min_args()
+    }
+
+    fn max_args(&self) -> Option<i32> {
+        self.inner.max_args()
+    }
+
+    fn arity(&self) -> FunctionArity {
+        self.inner.arity()
+    }
+
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+}
+
+/// A type-erased window function whose arguments carry fixed subtypes.
+///
+/// Every [`step`](WindowFunction::step) becomes
+/// [`step_with_arg_subtypes`](WindowFunction::step_with_arg_subtypes) with
+/// `arg_subtypes`. This serves evaluators where an argument's subtype is a
+/// static property of its expression, so that
+/// `json_group_array(json(x)) OVER (...)` embeds the JSON instead of quoting it.
+pub struct WindowWithArgSubtypes {
+    inner: Arc<ErasedWindowFunction>,
+    arg_subtypes: Vec<u32>,
+}
+
+impl WindowWithArgSubtypes {
+    /// Bind `arg_subtypes` (parallel to the call's arguments) to `inner`.
+    pub fn new(inner: Arc<ErasedWindowFunction>, arg_subtypes: Vec<u32>) -> Self {
+        Self {
+            inner,
+            arg_subtypes,
+        }
+    }
+}
+
+impl WindowFunction for WindowWithArgSubtypes {
+    type State = Box<dyn Any + Send>;
+
+    fn initial_state(&self) -> Self::State {
+        self.inner.initial_state()
+    }
+
+    fn step(&self, state: &mut Self::State, args: &[SqliteValue]) -> Result<()> {
+        self.inner
+            .step_with_arg_subtypes(state, args, &self.arg_subtypes)
+    }
+
+    fn step_with_arg_subtypes(
+        &self,
+        state: &mut Self::State,
+        args: &[SqliteValue],
+        arg_subtypes: &[u32],
+    ) -> Result<()> {
+        self.inner.step_with_arg_subtypes(state, args, arg_subtypes)
+    }
+
+    fn inverse(&self, state: &mut Self::State, args: &[SqliteValue]) -> Result<()> {
+        self.inner.inverse(state, args)
+    }
+
+    fn value(&self, state: &Self::State) -> Result<SqliteValue> {
+        self.inner.value(state)
+    }
+
+    fn finalize(&self, state: Self::State) -> Result<SqliteValue> {
+        self.inner.finalize(state)
     }
 
     fn num_args(&self) -> i32 {

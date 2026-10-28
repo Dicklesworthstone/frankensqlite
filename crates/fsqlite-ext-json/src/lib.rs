@@ -19,12 +19,13 @@
 //! - `$[#-N]` reverse array index
 
 use std::borrow::Cow;
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_func::{
     AggregateFunction, ColumnContext, FunctionRegistry, IndexInfo, JSON_SUBTYPE, ScalarFunction,
-    VirtualTable, VirtualTableCursor,
+    VirtualTable, VirtualTableCursor, WindowFunction,
 };
 use fsqlite_types::{SmallText, SqliteValue, cx::Cx};
 use serde_json::{Map, Number, Value};
@@ -4755,6 +4756,135 @@ impl AggregateFunction for JsonbGroupObjectFunc {
     }
 }
 
+/// One row of a JSON aggregate's window frame: the object label (`None` for a
+/// row whose label is NULL), the value, and the value's subtype.
+type JsonWindowRow = (Option<SqliteValue>, SqliteValue, u32);
+
+/// `json_group_array`, `json_group_object` and their `jsonb_` forms as window
+/// functions (bd-ffwsd).
+///
+/// The frame is a queue of rows and the inverse removes the oldest, as
+/// stock's jsonGroupInverse removes the first element. A row
+/// whose label is NULL keeps its place in the queue but adds no member, as
+/// stock's jsonObjectStep keeps a placeholder for it.
+pub struct JsonGroupWindowFunc {
+    name: &'static str,
+    object: bool,
+    jsonb: bool,
+}
+
+impl JsonGroupWindowFunc {
+    const ALL: [Self; 4] = [
+        Self {
+            name: "json_group_array",
+            object: false,
+            jsonb: false,
+        },
+        Self {
+            name: "json_group_object",
+            object: true,
+            jsonb: false,
+        },
+        Self {
+            name: "jsonb_group_array",
+            object: false,
+            jsonb: true,
+        },
+        Self {
+            name: "jsonb_group_object",
+            object: true,
+            jsonb: true,
+        },
+    ];
+}
+
+impl WindowFunction for JsonGroupWindowFunc {
+    type State = VecDeque<JsonWindowRow>;
+
+    fn initial_state(&self) -> Self::State {
+        VecDeque::new()
+    }
+
+    fn step(&self, state: &mut Self::State, args: &[SqliteValue]) -> Result<()> {
+        self.step_with_arg_subtypes(state, args, &[])
+    }
+
+    fn step_with_arg_subtypes(
+        &self,
+        state: &mut Self::State,
+        args: &[SqliteValue],
+        arg_subtypes: &[u32],
+    ) -> Result<()> {
+        if !self.object {
+            state.push_back((
+                None,
+                args[0].clone(),
+                arg_subtypes.first().copied().unwrap_or(0),
+            ));
+            return Ok(());
+        }
+        // The label is read as text, as for the aggregate.
+        let label = match &args[0] {
+            SqliteValue::Null => None,
+            label @ SqliteValue::Text(_) => Some(label.clone()),
+            other => Some(SqliteValue::Text(SmallText::from_string(other.to_text()))),
+        };
+        state.push_back((
+            label,
+            args[1].clone(),
+            arg_subtypes.get(1).copied().unwrap_or(0),
+        ));
+        Ok(())
+    }
+
+    fn inverse(&self, state: &mut Self::State, _args: &[SqliteValue]) -> Result<()> {
+        state.pop_front();
+        Ok(())
+    }
+
+    fn value(&self, state: &Self::State) -> Result<SqliteValue> {
+        let mut values = Vec::with_capacity(state.len() * 2);
+        let mut subtypes = Vec::with_capacity(state.len() * 2);
+        for (label, value, subtype) in state {
+            if self.object {
+                let Some(label) = label else {
+                    continue;
+                };
+                values.push(label.clone());
+                subtypes.push(0);
+            }
+            values.push(value.clone());
+            subtypes.push(*subtype);
+        }
+        Ok(match (self.object, self.jsonb) {
+            (false, false) => SqliteValue::Text(SmallText::from_string(json_array_with_subtypes(
+                &values, &subtypes,
+            )?)),
+            (true, false) => SqliteValue::Text(SmallText::from_string(json_object_with_subtypes(
+                &values, &subtypes,
+            )?)),
+            (false, true) => {
+                SqliteValue::Blob(Arc::from(jsonb_array_with_subtypes(&values, &subtypes)?))
+            }
+            (true, true) => {
+                SqliteValue::Blob(Arc::from(jsonb_object_with_subtypes(&values, &subtypes)?))
+            }
+        })
+    }
+
+    fn finalize(&self, state: Self::State) -> Result<SqliteValue> {
+        self.value(&state)
+    }
+
+    fn num_args(&self) -> i32 {
+        if self.object { 2 } else { 1 }
+    }
+
+    fn name(&self) -> &str {
+        self.name
+    }
+}
+
 /// Register JSON1 scalar functions into a `FunctionRegistry`.
 pub fn register_json_scalars(registry: &mut FunctionRegistry) {
     registry.register_scalar(JsonFunc);
@@ -4791,6 +4921,9 @@ pub fn register_json_scalars(registry: &mut FunctionRegistry) {
     registry.register_aggregate(JsonGroupObjectFunc);
     registry.register_aggregate(JsonbGroupArrayFunc);
     registry.register_aggregate(JsonbGroupObjectFunc);
+    for window in JsonGroupWindowFunc::ALL {
+        registry.register_window(window);
+    }
 }
 
 #[cfg(test)]
@@ -7815,6 +7948,56 @@ mod tests {
             [
                 0xbc, 0x17, b'k', 0x4b, 0x13, b'1', 0x13, b'2', 0x17, b'k', 0x13, b'3'
             ]
+        );
+    }
+
+    #[test]
+    fn test_json_group_window_inverse_removes_oldest_row() {
+        let [array, object, jsonb_array, jsonb_object] = JsonGroupWindowFunc::ALL;
+        let text = |s: &str| SqliteValue::Text(SmallText::from_string(s));
+
+        // A frame sliding over 1, json('[2]'), 3: the inverse drops the oldest
+        // row, and a JSON-subtyped value stays embedded.
+        let mut state = array.initial_state();
+        array.step(&mut state, &[SqliteValue::Integer(1)]).unwrap();
+        array
+            .step_with_arg_subtypes(&mut state, &[text("[2]")], &[JSON_SUBTYPE])
+            .unwrap();
+        assert_eq!(array.value(&state).unwrap(), text("[1,[2]]"));
+        array
+            .inverse(&mut state, &[SqliteValue::Integer(1)])
+            .unwrap();
+        array.step(&mut state, &[SqliteValue::Integer(3)]).unwrap();
+        assert_eq!(array.value(&state).unwrap(), text("[[2],3]"));
+
+        // A NULL label adds no member but keeps its row's place, so the next
+        // inverse removes that row, not the member after it.
+        let mut state = object.initial_state();
+        object
+            .step(&mut state, &[SqliteValue::Null, SqliteValue::Integer(1)])
+            .unwrap();
+        object
+            .step(&mut state, &[text("a"), SqliteValue::Integer(2)])
+            .unwrap();
+        assert_eq!(object.value(&state).unwrap(), text("{\"a\":2}"));
+        object
+            .inverse(&mut state, &[SqliteValue::Null, SqliteValue::Integer(1)])
+            .unwrap();
+        assert_eq!(object.value(&state).unwrap(), text("{\"a\":2}"));
+        object
+            .inverse(&mut state, &[text("a"), SqliteValue::Integer(2)])
+            .unwrap();
+        assert_eq!(object.value(&state).unwrap(), text("{}"));
+
+        // An empty frame is an empty JSONB array or object.
+        let empty = |f: &JsonGroupWindowFunc| f.value(&f.initial_state()).unwrap();
+        assert_eq!(
+            empty(&jsonb_array),
+            SqliteValue::Blob(Arc::from(vec![0x0b]))
+        );
+        assert_eq!(
+            empty(&jsonb_object),
+            SqliteValue::Blob(Arc::from(vec![0x0c]))
         );
     }
 
