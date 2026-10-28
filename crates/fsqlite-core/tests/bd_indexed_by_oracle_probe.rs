@@ -382,7 +382,8 @@ fn gh526_before_update_trigger_when_correlated_exists_prefix_seek() {
             .expect_err("duplicate update must fire BEFORE UPDATE WHEN EXISTS trigger");
         assert_eq!(err.to_string(), "dup");
         assert_eq!(err.error_code(), fsqlite_error::ErrorCode::Constraint);
-        assert_eq!(err.extended_error_code(), 19 | (7 << 8));
+        // SQLITE_CONSTRAINT_TRIGGER: SQLITE_CONSTRAINT (19) | (7 << 8).
+        assert_eq!(err.extended_error_code(), 0x13 | (0x7 << 8));
 
         f.close().await.expect("close FrankenSQLite GH#526 oracle");
     });

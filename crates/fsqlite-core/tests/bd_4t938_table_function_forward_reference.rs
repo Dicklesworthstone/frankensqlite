@@ -143,7 +143,7 @@ fn table_function_before_the_source_it_reads_matches_stock() {
         assert_eq!(fq(&f, comma).await.unwrap().len(), 3, "{comma}");
 
         let star = "SELECT * FROM json_each(t.tags) AS j, t";
-        let frank_names = f.prepare(star).await.unwrap().column_names().to_vec();
+        let frank_names = f.prepare(star).await.unwrap().column_names().clone();
         let stock_names: Vec<String> = r
             .prepare(star)
             .unwrap()

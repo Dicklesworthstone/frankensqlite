@@ -78,13 +78,13 @@ INSERT INTO k WITH RECURSIVE s(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM s WHE
   SELECT i, 'k' || i FROM s;\
 CREATE VIEW vt AS SELECT id, g FROM t WHERE n > 1;";
 
-/// `{e}` is replaced by each EXISTS subquery below; the outer rows are fixed.
+/// `@E@` is replaced by each EXISTS subquery below; the outer rows are fixed.
 const OUTER: &[&str] = &[
-    "SELECT o.id, {e} FROM t AS o WHERE o.id IN (6, 7, 14, 45)",
-    "SELECT o.id, NOT {e} FROM t AS o WHERE o.id IN (6, 7, 14, 45)",
-    "SELECT o.id, CASE WHEN {e} THEN 'y' ELSE 'n' END FROM t AS o WHERE o.id IN (6, 7, 14, 45)",
-    "SELECT o.id FROM t AS o WHERE o.id IN (6, 7, 14, 45) ORDER BY {e}, o.id DESC",
-    "SELECT o.id FROM t AS o WHERE o.id IN (6, 7, 14, 45) AND {e}",
+    "SELECT o.id, @E@ FROM t AS o WHERE o.id IN (6, 7, 14, 45)",
+    "SELECT o.id, NOT @E@ FROM t AS o WHERE o.id IN (6, 7, 14, 45)",
+    "SELECT o.id, CASE WHEN @E@ THEN 'y' ELSE 'n' END FROM t AS o WHERE o.id IN (6, 7, 14, 45)",
+    "SELECT o.id FROM t AS o WHERE o.id IN (6, 7, 14, 45) ORDER BY @E@, o.id DESC",
+    "SELECT o.id FROM t AS o WHERE o.id IN (6, 7, 14, 45) AND @E@",
 ];
 
 const EXISTS: &[&str] = &[
@@ -174,7 +174,7 @@ async fn compare(file_backed: bool) -> (Vec<String>, usize) {
     for (exists, params) in cases {
         let values: Vec<SqliteValue> = params.iter().copied().map(SqliteValue::Integer).collect();
         for outer in OUTER {
-            let sql = outer.replace("{e}", exists);
+            let sql = outer.replace("@E@", exists);
             statements += 1;
             let rr = rq(&r, &sql, params);
             let adhoc = if values.is_empty() {
