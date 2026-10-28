@@ -1,0 +1,2 @@
+[ perf record: Woken up 40 times to write data ]
+[ perf record: Captured and wrote 9.897 MB /tmp/fsqlite-530-release-results/profiles/stock-cartesian-count.perf.data (1229 samples) ]

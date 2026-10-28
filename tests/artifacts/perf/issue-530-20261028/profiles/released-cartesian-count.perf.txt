@@ -1,0 +1,108 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 1K of event 'cpu-clock:u'
+# Event count (approx.): 2791583144
+#
+# Overhead  Command  Shared Object     Symbol                
+# ........  .......  ................  ......................
+#
+    13.71%  fsqlite  fsqlite           [.] 0x00000000007dc4ee
+            |
+            ---0x17dd4ee
+               |          
+               |--7.97%--0x1828236
+               |          0x20b6b23
+               |          0xffffffffffffffff
+               |          
+                --5.74%--0x18cf306
+                          0x1dd9cc3
+                          0x20ae09a
+                          0xffffffffffffffff
+
+     5.38%  fsqlite  fsqlite           [.] 0x00000000008c6e9e
+            |
+            ---0x18c7e9e
+               0x20c27a4
+               0x1ddb15e
+               0xffffffffffffffff
+
+     3.45%  fsqlite  fsqlite           [.] 0x0000000000dda18f
+            |
+            ---0x1ddb18f
+               0x20ae09a
+               0xffffffffffffffff
+
+     2.94%  fsqlite  fsqlite           [.] 0x0000000000682f9d
+            |
+            ---0x1683f9d
+               0x18c7e7a
+               0x20c27a4
+               0x1ddb15e
+               0xffffffffffffffff
+
+     2.80%  fsqlite  fsqlite           [.] 0x0000000001795490
+            |
+            ---0x2796490
+
+     2.51%  fsqlite  fsqlite           [.] 0x0000000000682fbc
+            |
+            ---0x1683fbc
+               0x18c7e7a
+               0x20c27a4
+               0x1ddb15e
+               0xffffffffffffffff
+
+     2.30%  fsqlite  fsqlite           [.] 0x0000000001796027
+            |
+            ---0x2797027
+
+     1.94%  fsqlite  fsqlite           [.] 0x0000000000902620
+            |
+            ---0x1903620
+               0x1ddb15e
+               0x20ae09a
+               0xffffffffffffffff
+
+     1.94%  fsqlite  fsqlite           [.] 0x0000000000dda1e4
+            |
+            ---0x1ddb1e4
+               0x20ae09a
+               0xffffffffffffffff
+
+     1.79%  fsqlite  fsqlite           [.] 0x0000000001796022
+            |
+            ---0x2797022
+
+     1.58%  fsqlite  fsqlite           [.] 0x00000000008ca0d5
+            |
+            ---0x18cb0d5
+               0x18c74fe
+               0x20c27a4
+               0x1ddb15e
+               0xffffffffffffffff
+
+     1.29%  fsqlite  fsqlite           [.] 0x00000000008c9f8c
+            |
+            ---0x18caf8c
+               0x18c74fe
+               0x20c27a4
+               0x1ddb15e
+               0xffffffffffffffff
+
+     1.15%  fsqlite  fsqlite           [.] 0x00000000007c60a8
+            |
+            ---0x17c70a8
+               0x18cb007
+               0x18c74fe
+               0x20c27a4
+               0x1ddb15e
+               0xffffffffffffffff
+
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

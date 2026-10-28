@@ -12,6 +12,46 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-10-28 - Unvalidated: Cartesian aggregate streaming; broad admission rejected (GH#530)
+
+- Target: issue #530's four million-row COUNT/SUM queries and independent
+  table-function products. A local, unmerged candidate in
+  `crates/fsqlite-core/src/connection.rs` scans each input once and folds its
+  Cartesian product through a reusable row instead of storing every pair.
+- Admission was narrowed during source review. The general join WHERE
+  evaluator short-circuits truth contexts; the reused streaming value evaluator
+  is eager. With singleton sources, `a.value=b.value OR json_extract('bad','$')`
+  must yield COUNT 1 without evaluating the erroring arm. Multi-source WHERE
+  remains on the existing path, preserving searched CASE and internal
+  `IN table` handling as well.
+- Internal INSERT/CTE callers can leave LIMIT attached. An early aggregate
+  return could skip their LIMIT/OFFSET pass; `WITH unused AS (VALUES(1)) INSERT
+  INTO out SELECT count(*) FROM ... LIMIT 0` must insert no rows. Attached
+  limits retain the existing executor.
+- Equal GROUP BY keys can differ in storage class. For JSON `[1,1.0]`, a
+  projected key paired with MAX over a real-type discriminator must use REAL
+  1.0 from the extremum row. The simple streaming state retains the first row,
+  so projected grouping values together with MIN/MAX retain the executor that
+  tracks the representative row.
+- Custom table-function metadata callbacks can replace aggregate registrations;
+  replacement BINARY collations and connection-local scalar functions can
+  change comparison state. The proposed path requires unchanged shared
+  factory/scalar identities and builtin BINARY, with fallback elsewhere.
+- Evidence: [the investigation report](issue-530-cartesian-aggregate-investigation.md)
+  records measured published v0.4.12 versus stock SQLite results, memory usage,
+  plans, source routing, and profiling limitations. The reproducible harness is
+  `scripts/benchmark_issue_530.py`. Those release measurements are not a
+  baseline/candidate comparison.
+- The candidate and proposed Rust regression tests were kept out of production:
+  native builds, the workspace check, and a narrowed core-library check all hit
+  the worker's dependency compiler memory guard before reaching changed code.
+  No candidate SQL tests, compiler acceptance, or speedup are established.
+  This is a validation blocker, not a measured performance rejection. Retry on
+  a sufficiently provisioned worker with baseline/candidate built identically,
+  the correctness battery executed, and live stock SQLite in the same timing
+  invocation; retain the semantic exclusions above until their counterexamples
+  are handled explicitly.
+
 ## 2026-09-19 - Insufficient for HFDT persistence: index-extrema EXISTS exclusion (hfdt-gbou9l)
 
 - Target: the original populated schema-116 HFDT store, the complete retained

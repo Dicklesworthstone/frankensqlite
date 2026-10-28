@@ -1,0 +1,5 @@
+.mode list
+.headers off
+SELECT count(*) FROM generate_series(1,1000)a,generate_series(1,1000)b;
+SELECT count(*) FROM generate_series(1,1000)a,generate_series(1,1000)b;
+SELECT count(*) FROM generate_series(1,1000)a,generate_series(1,1000)b;

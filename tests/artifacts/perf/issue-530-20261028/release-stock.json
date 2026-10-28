@@ -1,0 +1,656 @@
+{
+  "schema": 1,
+  "issue": 530,
+  "status": "ok",
+  "comparison_scope": "published release versus stock; no candidate/before-after measurements",
+  "started_utc": "2026-10-28T20:27:23.613771+00:00",
+  "platform": "Linux-6.18.55-x86_64-with-glibc2.39",
+  "machine": "x86_64",
+  "cpu_affinity": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8
+  ],
+  "build_note": "Published official portable fsqlite v0.4.12 Linux amd64 release, not locally rebuilt. Stock SQLite 3.53.2 official amalgamation3530200, GCC 13.3.0 -O3, ENABLE_COLUMN_METADATA FTS5 RTREE DBSTAT_VTAB MATH_FUNCTIONS, native upstream shell generate_series. No concurrent builds or profiles; release/stock only, no candidate speedup claim.",
+  "work_directory": "/tmp/fsqlite-530-release-results/harness-work/issue530-qd4i_man",
+  "timing_scope": "native CLI SELECT timer, scalar output; startup/setup/warmup excluded",
+  "timing_resolution_note": "FrankenSQLite real timers round to 1 ms (up to 0.5 ms error per sample); user+sys CPU fields print microseconds. Do not interpret small differences below this precision.",
+  "warmups_per_sample": 1,
+  "repeats": 6,
+  "settings": "engine defaults; empty explicit init file; in-memory databases",
+  "engine_order": [
+    [
+      "released",
+      "stock"
+    ],
+    [
+      "stock",
+      "released"
+    ]
+  ],
+  "results": {
+    "single_count": {
+      "sql": "SELECT count(*) FROM generate_series(1,1000000);",
+      "setup": [],
+      "expected": 1000000,
+      "samples": [
+        {
+          "engine": "released",
+          "repetition": 0,
+          "seconds": 0.086,
+          "cpu_seconds": 0.08595,
+          "timer_line": "Run Time: real 0.086 user 0.085950 sys 0.000000"
+        },
+        {
+          "engine": "stock",
+          "repetition": 0,
+          "seconds": 0.012672,
+          "cpu_seconds": 0.012541,
+          "timer_line": "Run Time: real 0.012672 user 0.012098 sys 0.000443"
+        },
+        {
+          "engine": "stock",
+          "repetition": 1,
+          "seconds": 0.012144,
+          "cpu_seconds": 0.012149,
+          "timer_line": "Run Time: real 0.012144 user 0.012149 sys 0.000000"
+        },
+        {
+          "engine": "released",
+          "repetition": 1,
+          "seconds": 0.091,
+          "cpu_seconds": 0.091175,
+          "timer_line": "Run Time: real 0.091 user 0.091175 sys 0.000000"
+        },
+        {
+          "engine": "released",
+          "repetition": 2,
+          "seconds": 0.1,
+          "cpu_seconds": 0.100422,
+          "timer_line": "Run Time: real 0.100 user 0.100422 sys 0.000000"
+        },
+        {
+          "engine": "stock",
+          "repetition": 2,
+          "seconds": 0.011961,
+          "cpu_seconds": 0.012046,
+          "timer_line": "Run Time: real 0.011961 user 0.012046 sys 0.000000"
+        },
+        {
+          "engine": "stock",
+          "repetition": 3,
+          "seconds": 0.013423,
+          "cpu_seconds": 0.013429,
+          "timer_line": "Run Time: real 0.013423 user 0.013429 sys 0.000000"
+        },
+        {
+          "engine": "released",
+          "repetition": 3,
+          "seconds": 0.099,
+          "cpu_seconds": 0.09883900000000001,
+          "timer_line": "Run Time: real 0.099 user 0.098780 sys 0.000059"
+        },
+        {
+          "engine": "released",
+          "repetition": 4,
+          "seconds": 0.099,
+          "cpu_seconds": 0.099002,
+          "timer_line": "Run Time: real 0.099 user 0.099002 sys 0.000000"
+        },
+        {
+          "engine": "stock",
+          "repetition": 4,
+          "seconds": 0.015953,
+          "cpu_seconds": 0.015958,
+          "timer_line": "Run Time: real 0.015953 user 0.015958 sys 0.000000"
+        },
+        {
+          "engine": "stock",
+          "repetition": 5,
+          "seconds": 0.013149,
+          "cpu_seconds": 0.013154,
+          "timer_line": "Run Time: real 0.013149 user 0.013154 sys 0.000000"
+        },
+        {
+          "engine": "released",
+          "repetition": 5,
+          "seconds": 0.093,
+          "cpu_seconds": 0.092855,
+          "timer_line": "Run Time: real 0.093 user 0.092855 sys 0.000000"
+        }
+      ],
+      "plans": {
+        "released": {
+          "returncode": 1,
+          "stdout": "2|0|0|SCAN generate_series VIRTUAL TABLE INDEX 1:\n",
+          "stderr": "error: not implemented: non-table FROM source\n"
+        },
+        "stock": {
+          "returncode": 0,
+          "stdout": "QUERY PLAN\n`--SCAN generate_series VIRTUAL TABLE INDEX 0x3:\naddr  opcode         p1    p2    p3    p4             p5  comment      \n----  -------------  ----  ----  ----  -------------  --  -------------\n0     Init           0     14    0                    0   \n1     Null           0     1     1                    0   \n2     VOpen          0     0     0     vtab:55BF963FC778 0   \n3     Integer        1     4     0                    0   \n4     Integer        1000000 5     0                    0   \n5     Integer        3     2     0                    0   \n6     Integer        2     3     0                    0   \n7     VFilter        0     10    2                    0   \n8       AggStep        0     0     1     count(0)       0   \n9     VNext          0     8     0                    0   \n10    AggFinal       1     0     0     count(0)       0   \n11    Copy           1     6     0                    0   \n12    ResultRow      6     1     0                    0   \n13    Halt           0     0     0                    0   \n14    Transaction    0     0     0     0              1   \n15    Goto           0     1     0                    0   \n",
+          "stderr": ""
+        }
+      },
+      "summary": {
+        "released": {
+          "runs": 6,
+          "median_seconds": 0.096,
+          "min_seconds": 0.086,
+          "max_seconds": 0.1,
+          "median_cpu_seconds": 0.095847
+        },
+        "stock": {
+          "runs": 6,
+          "median_seconds": 0.012910499999999998,
+          "min_seconds": 0.011961,
+          "max_seconds": 0.015953,
+          "median_cpu_seconds": 0.012847500000000001
+        },
+        "released_over_stock": 7.4358080632043695
+      }
+    },
+    "cartesian_count": {
+      "sql": "SELECT count(*) FROM generate_series(1,1000)a,generate_series(1,1000)b;",
+      "setup": [],
+      "expected": 1000000,
+      "samples": [
+        {
+          "engine": "released",
+          "repetition": 0,
+          "seconds": 1.613,
+          "cpu_seconds": 1.6095100000000002,
+          "timer_line": "Run Time: real 1.613 user 1.009222 sys 0.600288"
+        },
+        {
+          "engine": "stock",
+          "repetition": 0,
+          "seconds": 0.01278,
+          "cpu_seconds": 0.012786,
+          "timer_line": "Run Time: real 0.012780 user 0.012786 sys 0.000000"
+        },
+        {
+          "engine": "stock",
+          "repetition": 1,
+          "seconds": 0.013315,
+          "cpu_seconds": 0.013321,
+          "timer_line": "Run Time: real 0.013315 user 0.013321 sys 0.000000"
+        },
+        {
+          "engine": "released",
+          "repetition": 1,
+          "seconds": 1.807,
+          "cpu_seconds": 1.7956789999999998,
+          "timer_line": "Run Time: real 1.807 user 1.008228 sys 0.787451"
+        },
+        {
+          "engine": "released",
+          "repetition": 2,
+          "seconds": 1.8,
+          "cpu_seconds": 1.7913009999999998,
+          "timer_line": "Run Time: real 1.800 user 0.948379 sys 0.842922"
+        },
+        {
+          "engine": "stock",
+          "repetition": 2,
+          "seconds": 0.020909,
+          "cpu_seconds": 0.020915,
+          "timer_line": "Run Time: real 0.020909 user 0.020915 sys 0.000000"
+        },
+        {
+          "engine": "stock",
+          "repetition": 3,
+          "seconds": 0.023292,
+          "cpu_seconds": 0.023059000000000003,
+          "timer_line": "Run Time: real 0.023292 user 0.022523 sys 0.000536"
+        },
+        {
+          "engine": "released",
+          "repetition": 3,
+          "seconds": 1.747,
+          "cpu_seconds": 1.743124,
+          "timer_line": "Run Time: real 1.747 user 1.114881 sys 0.628243"
+        },
+        {
+          "engine": "released",
+          "repetition": 4,
+          "seconds": 1.666,
+          "cpu_seconds": 1.6570230000000001,
+          "timer_line": "Run Time: real 1.666 user 0.948598 sys 0.708425"
+        },
+        {
+          "engine": "stock",
+          "repetition": 4,
+          "seconds": 0.010875,
+          "cpu_seconds": 0.010882,
+          "timer_line": "Run Time: real 0.010875 user 0.010882 sys 0.000000"
+        },
+        {
+          "engine": "stock",
+          "repetition": 5,
+          "seconds": 0.015841,
+          "cpu_seconds": 0.015835,
+          "timer_line": "Run Time: real 0.015841 user 0.015566 sys 0.000269"
+        },
+        {
+          "engine": "released",
+          "repetition": 5,
+          "seconds": 1.643,
+          "cpu_seconds": 1.635423,
+          "timer_line": "Run Time: real 1.643 user 0.974365 sys 0.661058"
+        }
+      ],
+      "plans": {
+        "released": {
+          "returncode": 1,
+          "stdout": "2|0|0|SCAN a VIRTUAL TABLE INDEX 1:\n",
+          "stderr": "error: not implemented: non-table FROM source\n"
+        },
+        "stock": {
+          "returncode": 0,
+          "stdout": "QUERY PLAN\n|--SCAN a VIRTUAL TABLE INDEX 0x3:\n`--SCAN b VIRTUAL TABLE INDEX 0x3:\naddr  opcode         p1    p2    p3    p4             p5  comment      \n----  -------------  ----  ----  ----  -------------  --  -------------\n0     Init           0     21    0                    0   \n1     Null           0     1     1                    0   \n2     VOpen          0     0     0     vtab:55AE23DF0798 0   \n3     VOpen          1     0     0     vtab:55AE23DF0798 0   \n4     Integer        1     4     0                    0   \n5     Integer        1000  5     0                    0   \n6     Integer        3     2     0                    0   \n7     Integer        2     3     0                    0   \n8     VFilter        0     17    2                    0   \n9       Integer        1     8     0                    0   \n10      Integer        1000  9     0                    0   \n11      Integer        3     6     0                    0   \n12      Integer        2     7     0                    0   \n13      VFilter        1     16    6                    0   \n14        AggStep        0     0     1     count(0)       0   \n15      VNext          1     14    0                    0   \n16    VNext          0     9     0                    0   \n17    AggFinal       1     0     0     count(0)       0   \n18    Copy           1     10    0                    0   \n19    ResultRow      10    1     0                    0   \n20    Halt           0     0     0                    0   \n21    Transaction    0     0     0     0              1   \n22    Goto           0     1     0                    0   \n",
+          "stderr": ""
+        }
+      },
+      "summary": {
+        "released": {
+          "runs": 6,
+          "median_seconds": 1.7065000000000001,
+          "min_seconds": 1.613,
+          "max_seconds": 1.807,
+          "median_cpu_seconds": 1.7000735
+        },
+        "stock": {
+          "runs": 6,
+          "median_seconds": 0.014578,
+          "min_seconds": 0.010875,
+          "max_seconds": 0.023292,
+          "median_cpu_seconds": 0.014577999999999999
+        },
+        "released_over_stock": 117.0599533543696
+      }
+    },
+    "single_sum": {
+      "sql": "SELECT sum(value) FROM generate_series(1,1000000);",
+      "setup": [],
+      "expected": 500000500000,
+      "samples": [
+        {
+          "engine": "released",
+          "repetition": 0,
+          "seconds": 0.099,
+          "cpu_seconds": 0.099219,
+          "timer_line": "Run Time: real 0.099 user 0.099219 sys 0.000000"
+        },
+        {
+          "engine": "stock",
+          "repetition": 0,
+          "seconds": 0.024871,
+          "cpu_seconds": 0.02488,
+          "timer_line": "Run Time: real 0.024871 user 0.024730 sys 0.000150"
+        },
+        {
+          "engine": "stock",
+          "repetition": 1,
+          "seconds": 0.028218,
+          "cpu_seconds": 0.028209,
+          "timer_line": "Run Time: real 0.028218 user 0.027643 sys 0.000566"
+        },
+        {
+          "engine": "released",
+          "repetition": 1,
+          "seconds": 0.139,
+          "cpu_seconds": 0.138569,
+          "timer_line": "Run Time: real 0.139 user 0.135712 sys 0.002857"
+        },
+        {
+          "engine": "released",
+          "repetition": 2,
+          "seconds": 0.108,
+          "cpu_seconds": 0.108131,
+          "timer_line": "Run Time: real 0.108 user 0.108131 sys 0.000000"
+        },
+        {
+          "engine": "stock",
+          "repetition": 2,
+          "seconds": 0.040613,
+          "cpu_seconds": 0.040615,
+          "timer_line": "Run Time: real 0.040613 user 0.040615 sys 0.000000"
+        },
+        {
+          "engine": "stock",
+          "repetition": 3,
+          "seconds": 0.026662,
+          "cpu_seconds": 0.026673,
+          "timer_line": "Run Time: real 0.026662 user 0.026673 sys 0.000000"
+        },
+        {
+          "engine": "released",
+          "repetition": 3,
+          "seconds": 0.114,
+          "cpu_seconds": 0.114034,
+          "timer_line": "Run Time: real 0.114 user 0.114034 sys 0.000000"
+        },
+        {
+          "engine": "released",
+          "repetition": 4,
+          "seconds": 0.11,
+          "cpu_seconds": 0.109584,
+          "timer_line": "Run Time: real 0.110 user 0.109584 sys 0.000000"
+        },
+        {
+          "engine": "stock",
+          "repetition": 4,
+          "seconds": 0.026299,
+          "cpu_seconds": 0.026307,
+          "timer_line": "Run Time: real 0.026299 user 0.026307 sys 0.000000"
+        },
+        {
+          "engine": "stock",
+          "repetition": 5,
+          "seconds": 0.022351,
+          "cpu_seconds": 0.022276,
+          "timer_line": "Run Time: real 0.022351 user 0.022276 sys 0.000000"
+        },
+        {
+          "engine": "released",
+          "repetition": 5,
+          "seconds": 0.119,
+          "cpu_seconds": 0.118965,
+          "timer_line": "Run Time: real 0.119 user 0.118965 sys 0.000000"
+        }
+      ],
+      "plans": {
+        "released": {
+          "returncode": 1,
+          "stdout": "2|0|0|SCAN generate_series VIRTUAL TABLE INDEX 1:\n",
+          "stderr": "error: not implemented: non-table FROM source\n"
+        },
+        "stock": {
+          "returncode": 0,
+          "stdout": "QUERY PLAN\n`--SCAN generate_series VIRTUAL TABLE INDEX 0x3:\naddr  opcode         p1    p2    p3    p4             p5  comment      \n----  -------------  ----  ----  ----  -------------  --  -------------\n0     Init           0     15    0                    0   \n1     Null           0     1     2                    0   \n2     VOpen          0     0     0     vtab:563F5AC6B788 0   \n3     Integer        1     5     0                    0   \n4     Integer        1000000 6     0                    0   \n5     Integer        3     3     0                    0   \n6     Integer        2     4     0                    0   \n7     VFilter        0     11    3                    0   \n8       VColumn        0     0     7                    0   \n9       AggStep        0     7     2     sum(1)         1   \n10    VNext          0     8     0                    0   \n11    AggFinal       2     1     0     sum(1)         0   \n12    Copy           2     8     0                    0   \n13    ResultRow      8     1     0                    0   \n14    Halt           0     0     0                    0   \n15    Transaction    0     0     0     0              1   \n16    Goto           0     1     0                    0   \n",
+          "stderr": ""
+        }
+      },
+      "summary": {
+        "released": {
+          "runs": 6,
+          "median_seconds": 0.112,
+          "min_seconds": 0.099,
+          "max_seconds": 0.139,
+          "median_cpu_seconds": 0.11180899999999999
+        },
+        "stock": {
+          "runs": 6,
+          "median_seconds": 0.0264805,
+          "min_seconds": 0.022351,
+          "max_seconds": 0.040613,
+          "median_cpu_seconds": 0.02649
+        },
+        "released_over_stock": 4.2295273880780195
+      }
+    },
+    "cartesian_sum": {
+      "sql": "SELECT sum((a.value-1)*1000+b.value) FROM generate_series(1,1000)a,generate_series(1,1000)b;",
+      "setup": [],
+      "expected": 500000500000,
+      "samples": [
+        {
+          "engine": "released",
+          "repetition": 0,
+          "seconds": 1.905,
+          "cpu_seconds": 1.901917,
+          "timer_line": "Run Time: real 1.905 user 1.299712 sys 0.602205"
+        },
+        {
+          "engine": "stock",
+          "repetition": 0,
+          "seconds": 0.051509,
+          "cpu_seconds": 0.051519,
+          "timer_line": "Run Time: real 0.051509 user 0.051519 sys 0.000000"
+        },
+        {
+          "engine": "stock",
+          "repetition": 1,
+          "seconds": 0.044304,
+          "cpu_seconds": 0.044432,
+          "timer_line": "Run Time: real 0.044304 user 0.044432 sys 0.000000"
+        },
+        {
+          "engine": "released",
+          "repetition": 1,
+          "seconds": 1.907,
+          "cpu_seconds": 1.903801,
+          "timer_line": "Run Time: real 1.907 user 1.221428 sys 0.682373"
+        },
+        {
+          "engine": "released",
+          "repetition": 2,
+          "seconds": 2.081,
+          "cpu_seconds": 2.076425,
+          "timer_line": "Run Time: real 2.081 user 1.384492 sys 0.691933"
+        },
+        {
+          "engine": "stock",
+          "repetition": 2,
+          "seconds": 0.04693,
+          "cpu_seconds": 0.046935,
+          "timer_line": "Run Time: real 0.046930 user 0.046935 sys 0.000000"
+        },
+        {
+          "engine": "stock",
+          "repetition": 3,
+          "seconds": 0.041059,
+          "cpu_seconds": 0.041066,
+          "timer_line": "Run Time: real 0.041059 user 0.041066 sys 0.000000"
+        },
+        {
+          "engine": "released",
+          "repetition": 3,
+          "seconds": 2.022,
+          "cpu_seconds": 2.016632,
+          "timer_line": "Run Time: real 2.022 user 1.405861 sys 0.610771"
+        },
+        {
+          "engine": "released",
+          "repetition": 4,
+          "seconds": 2.163,
+          "cpu_seconds": 2.149975,
+          "timer_line": "Run Time: real 2.163 user 1.368307 sys 0.781668"
+        },
+        {
+          "engine": "stock",
+          "repetition": 4,
+          "seconds": 0.064687,
+          "cpu_seconds": 0.064699,
+          "timer_line": "Run Time: real 0.064687 user 0.064699 sys 0.000000"
+        },
+        {
+          "engine": "stock",
+          "repetition": 5,
+          "seconds": 0.046717,
+          "cpu_seconds": 0.046724,
+          "timer_line": "Run Time: real 0.046717 user 0.046724 sys 0.000000"
+        },
+        {
+          "engine": "released",
+          "repetition": 5,
+          "seconds": 1.935,
+          "cpu_seconds": 1.930146,
+          "timer_line": "Run Time: real 1.935 user 1.285167 sys 0.644979"
+        }
+      ],
+      "plans": {
+        "released": {
+          "returncode": 1,
+          "stdout": "2|0|0|SCAN a VIRTUAL TABLE INDEX 1:\n",
+          "stderr": "error: not implemented: non-table FROM source\n"
+        },
+        "stock": {
+          "returncode": 0,
+          "stdout": "QUERY PLAN\n|--SCAN a VIRTUAL TABLE INDEX 0x3:\n`--SCAN b VIRTUAL TABLE INDEX 0x3:\naddr  opcode         p1    p2    p3    p4             p5  comment      \n----  -------------  ----  ----  ----  -------------  --  -------------\n0     Init           0     26    0                    0   \n1     Null           0     1     3                    0   \n2     VOpen          0     0     0     vtab:56099BF1BF18 0   \n3     VOpen          1     0     0     vtab:56099BF1BF18 0   \n4     Integer        1     6     0                    0   \n5     Integer        1000  7     0                    0   \n6     Integer        3     4     0                    0   \n7     Integer        2     5     0                    0   \n8     VFilter        0     22    4                    0   \n9       Integer        1     10    0                    0   \n10      Integer        1000  11    0                    0   \n11      Integer        3     8     0                    0   \n12      Integer        2     9     0                    0   \n13      VFilter        1     21    8                    0   \n14        VColumn        0     0     15                   0   \n15        Subtract       16    15    14                   0   \n16        Multiply       17    14    13                   0   \n17        VColumn        1     0     14                   0   \n18        Add            14    13    12                   0   \n19        AggStep        0     12    3     sum(1)         1   \n20      VNext          1     14    0                    0   \n21    VNext          0     9     0                    0   \n22    AggFinal       3     1     0     sum(1)         0   \n23    Copy           3     18    0                    0   \n24    ResultRow      18    1     0                    0   \n25    Halt           0     0     0                    0   \n26    Transaction    0     0     0     0              1   \n27    Integer        1     16    0                    0   \n28    Integer        1000  17    0                    0   \n29    Goto           0     1     0                    0   \n",
+          "stderr": ""
+        }
+      },
+      "summary": {
+        "released": {
+          "runs": 6,
+          "median_seconds": 1.9785,
+          "min_seconds": 1.905,
+          "max_seconds": 2.163,
+          "median_cpu_seconds": 1.973389
+        },
+        "stock": {
+          "runs": 6,
+          "median_seconds": 0.046823500000000004,
+          "min_seconds": 0.041059,
+          "max_seconds": 0.064687,
+          "median_cpu_seconds": 0.046829499999999996
+        },
+        "released_over_stock": 42.25442352664794
+      }
+    },
+    "single_count_having_fallback": {
+      "sql": "SELECT count(*) FROM generate_series(1,1000000) HAVING count(*)>=0;",
+      "setup": [],
+      "expected": 1000000,
+      "samples": [
+        {
+          "engine": "released",
+          "repetition": 0,
+          "seconds": 1.236,
+          "cpu_seconds": 1.226759,
+          "timer_line": "Run Time: real 1.236 user 0.759010 sys 0.467749"
+        },
+        {
+          "engine": "stock",
+          "repetition": 0,
+          "seconds": 0.011466,
+          "cpu_seconds": 0.011446,
+          "timer_line": "Run Time: real 0.011466 user 0.011446 sys 0.000000"
+        },
+        {
+          "engine": "stock",
+          "repetition": 1,
+          "seconds": 0.011426,
+          "cpu_seconds": 0.011432,
+          "timer_line": "Run Time: real 0.011426 user 0.011432 sys 0.000000"
+        },
+        {
+          "engine": "released",
+          "repetition": 1,
+          "seconds": 1.149,
+          "cpu_seconds": 1.141024,
+          "timer_line": "Run Time: real 1.149 user 0.652102 sys 0.488922"
+        },
+        {
+          "engine": "released",
+          "repetition": 2,
+          "seconds": 1.077,
+          "cpu_seconds": 1.069694,
+          "timer_line": "Run Time: real 1.077 user 0.622686 sys 0.447008"
+        },
+        {
+          "engine": "stock",
+          "repetition": 2,
+          "seconds": 0.012189,
+          "cpu_seconds": 0.012195,
+          "timer_line": "Run Time: real 0.012189 user 0.012195 sys 0.000000"
+        },
+        {
+          "engine": "stock",
+          "repetition": 3,
+          "seconds": 0.016121,
+          "cpu_seconds": 0.016126,
+          "timer_line": "Run Time: real 0.016121 user 0.016126 sys 0.000000"
+        },
+        {
+          "engine": "released",
+          "repetition": 3,
+          "seconds": 1.092,
+          "cpu_seconds": 1.087046,
+          "timer_line": "Run Time: real 1.092 user 0.651830 sys 0.435216"
+        },
+        {
+          "engine": "released",
+          "repetition": 4,
+          "seconds": 1.211,
+          "cpu_seconds": 1.203887,
+          "timer_line": "Run Time: real 1.211 user 0.664985 sys 0.538902"
+        },
+        {
+          "engine": "stock",
+          "repetition": 4,
+          "seconds": 0.012406,
+          "cpu_seconds": 0.012416,
+          "timer_line": "Run Time: real 0.012406 user 0.012416 sys 0.000000"
+        },
+        {
+          "engine": "stock",
+          "repetition": 5,
+          "seconds": 0.01159,
+          "cpu_seconds": 0.011595999999999999,
+          "timer_line": "Run Time: real 0.011590 user 0.011352 sys 0.000244"
+        },
+        {
+          "engine": "released",
+          "repetition": 5,
+          "seconds": 1.064,
+          "cpu_seconds": 1.053641,
+          "timer_line": "Run Time: real 1.064 user 0.669614 sys 0.384027"
+        }
+      ],
+      "plans": {
+        "released": {
+          "returncode": 1,
+          "stdout": "2|0|0|SCAN generate_series VIRTUAL TABLE INDEX 1:\n",
+          "stderr": "error: not implemented: non-table FROM source\n"
+        },
+        "stock": {
+          "returncode": 0,
+          "stdout": "QUERY PLAN\n`--SCAN generate_series VIRTUAL TABLE INDEX 0x3:\naddr  opcode         p1    p2    p3    p4             p5  comment      \n----  -------------  ----  ----  ----  -------------  --  -------------\n0     Init           0     15    0                    0   \n1     Null           0     1     1                    0   \n2     VOpen          0     0     0     vtab:56295D32D798 0   \n3     Integer        1     4     0                    0   \n4     Integer        1000000 5     0                    0   \n5     Integer        3     2     0                    0   \n6     Integer        2     3     0                    0   \n7     VFilter        0     10    2                    0   \n8       AggStep        0     0     1     count(0)       0   \n9     VNext          0     8     0                    0   \n10    AggFinal       1     0     0     count(0)       0   \n11    Lt             7     14    1                    80  \n12    Copy           1     8     0                    0   \n13    ResultRow      8     1     0                    0   \n14    Halt           0     0     0                    0   \n15    Transaction    0     0     0     0              1   \n16    Integer        0     7     0                    0   \n17    Goto           0     1     0                    0   \n",
+          "stderr": ""
+        }
+      },
+      "summary": {
+        "released": {
+          "runs": 6,
+          "median_seconds": 1.1205,
+          "min_seconds": 1.064,
+          "max_seconds": 1.236,
+          "median_cpu_seconds": 1.1140349999999999
+        },
+        "stock": {
+          "runs": 6,
+          "median_seconds": 0.0118895,
+          "min_seconds": 0.011426,
+          "max_seconds": 0.016121,
+          "median_cpu_seconds": 0.0118955
+        },
+        "released_over_stock": 94.24281929433533
+      }
+    }
+  },
+  "binaries": {
+    "released": {
+      "path": "/tmp/fsqlite-530-release/fsqlite",
+      "sha256": "71259ce7c788fbf227f58dab7f6696c0c58d62b1637e1e789c86e696653c4543",
+      "bytes": 25038488,
+      "version": "fsqlite 0.4.12",
+      "source_revision_supplied": "26aa19afcbd5afdb01658a10bb33417ad0b513be"
+    },
+    "stock": {
+      "path": "/tmp/fsqlite-530-tools/sqlite3",
+      "sha256": "1977c14d2e533fbde01a69ea8ec79ac03eb5bd233f5d3bc148f0bcb89ab3c5d9",
+      "bytes": 2226416,
+      "version": "3.53.2 2026-06-03 19:12:13 d6e03d8c777cfa2d35e3b60d8ec3e0187f3e9f99d8e2ee9cac695fd6fcdf1a24 (64-bit)",
+      "source_revision_supplied": "d6e03d8c777cfa2d35e3b60d8ec3e0187f3e9f99d8e2ee9cac695fd6fcdf1a24"
+    }
+  },
+  "finished_utc": "2026-10-28T20:28:26.520256+00:00"
+}

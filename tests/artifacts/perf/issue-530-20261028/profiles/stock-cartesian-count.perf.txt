@@ -1,0 +1,21 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 1K of event 'cpu-clock:u'
+# Event count (approx.): 2462925832
+#
+# Overhead  Command  Shared Object  Symbol                     
+# ........  .......  .............  ...........................
+#
+    54.84%  sqlite3  sqlite3        [.] sqlite3VdbeExec
+    21.97%  sqlite3  sqlite3        [.] seriesNext
+    10.41%  sqlite3  sqlite3        [.] countStep
+     6.83%  sqlite3  sqlite3        [.] sqlite3VtabImportErrmsg
+     5.21%  sqlite3  sqlite3        [.] seriesEof
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

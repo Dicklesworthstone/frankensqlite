@@ -1,0 +1,2 @@
+[ perf record: Woken up 46 times to write data ]
+[ perf record: Captured and wrote 11.412 MB /tmp/fsqlite-530-release-results/profiles/released-single-count.perf.data (1413 samples) ]

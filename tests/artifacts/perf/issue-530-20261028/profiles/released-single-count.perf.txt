@@ -1,0 +1,33 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 1K of event 'cpu-clock:u'
+# Event count (approx.): 2831663304
+#
+# Overhead  Command  Shared Object     Symbol                  
+# ........  .......  ................  ........................
+#
+     7.36%  fsqlite  fsqlite           [.] 0x00000000010d8f0f
+     5.94%  fsqlite  fsqlite           [.] 0x00000000017a31ad
+     5.66%  fsqlite  fsqlite           [.] 0x00000000010d8f87
+     4.03%  fsqlite  fsqlite           [.] 0x00000000010d8e65
+     3.33%  fsqlite  fsqlite           [.] 0x00000000010d8f17
+     2.69%  fsqlite  fsqlite           [.] 0x00000000010d99d2
+     2.48%  fsqlite  fsqlite           [.] 0x000000000090262b
+     1.70%  fsqlite  fsqlite           [.] 0x0000000001795490
+     1.56%  fsqlite  fsqlite           [.] 0x00000000010d8f7b
+     1.56%  fsqlite  fsqlite           [.] 0x00000000017a3246
+     1.49%  fsqlite  fsqlite           [.] 0x000000000179551f
+     1.49%  fsqlite  fsqlite           [.] 0x0000000001795633
+     1.42%  fsqlite  fsqlite           [.] 0x00000000017955df
+     1.27%  fsqlite  fsqlite           [.] 0x00000000010d9a3b
+     1.20%  fsqlite  fsqlite           [.] 0x00000000017954b6
+     1.13%  fsqlite  fsqlite           [.] 0x0000000000f63430
+     1.13%  fsqlite  fsqlite           [.] 0x00000000010da0ca
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#
