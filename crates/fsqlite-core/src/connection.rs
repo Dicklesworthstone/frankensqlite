@@ -41831,14 +41831,30 @@ impl Connection {
                         "UPDATE of the implicit rowid ({alias}) on a table with UPDATE triggers"
                     )));
                 }
-                let needs_row_by_row_replay = (has_before_update
-                    || has_after_update
-                    || self.fk_cascade_propagation_enabled())
-                    && (effective_update.from.is_some()
-                        || !self.dml_where_pins_one_row(
-                            &effective_update.table,
-                            effective_update.where_clause.as_ref(),
-                        ));
+                // bd-h7hox: the codegen compiles a SET subquery it cannot
+                // answer to a wrong value, so such an UPDATE runs row by row,
+                // each row's SET values read through the SELECT path. With
+                // triggers or FKs, every correlated SET subquery does: those
+                // lanes compute each row's NEW image with an evaluator that
+                // cannot run one. A SET list that does not flatten to columns
+                // keeps the old lane.
+                let computes_new_images =
+                    has_before_update || has_after_update || self.fk_cascade_propagation_enabled();
+                let set_needs_select_path = Self::update_set_pairs(&effective_update)
+                    .is_ok_and(|set_pairs| {
+                        set_pairs.iter().any(|(_, value)| {
+                            dml_expr_has_uncompiled_correlated_subquery(value, self)
+                                || (computes_new_images
+                                    && expr_has_correlated_subquery_deep(value, self))
+                        })
+                    });
+                let needs_row_by_row_replay = set_needs_select_path
+                    || (computes_new_images
+                        && (effective_update.from.is_some()
+                            || !self.dml_where_pins_one_row(
+                                &effective_update.table,
+                                effective_update.where_clause.as_ref(),
+                            )));
                 let replay_locators = if !needs_row_by_row_replay {
                     None
                 } else if effective_update.from.is_some() {
@@ -41855,17 +41871,32 @@ impl Connection {
                     .map(|(columns, rows)| (columns, None, rows))
                 };
                 if let Some((locator_columns, set_columns, locator_rows)) = replay_locators
-                    && locator_rows.len() > 1
+                    && (locator_rows.len() > 1 || set_needs_select_path)
                 {
                     self.log_mem_execution_fallback(
                         "update",
-                        "update_row_by_row_trigger_or_fk_fallback",
+                        if set_needs_select_path {
+                            "update_row_by_row_correlated_set_fallback"
+                        } else {
+                            "update_row_by_row_trigger_or_fk_fallback"
+                        },
                     )?;
+                    let evaluated_set_columns;
                     let replay = match &set_columns {
                         Some(set_columns) => DmlRowReplay::UpdateFrom {
                             update: &effective_update,
                             set_columns,
                         },
+                        None if set_needs_select_path => {
+                            evaluated_set_columns = Self::update_set_pairs(&effective_update)?
+                                .into_iter()
+                                .map(|(column, _)| column.to_owned())
+                                .collect::<Vec<_>>();
+                            DmlRowReplay::UpdateEvaluated {
+                                update: &effective_update,
+                                set_columns: &evaluated_set_columns,
+                            }
+                        }
                         None => DmlRowReplay::Update(&effective_update),
                     };
                     return Box::pin(self.execute_dml_row_by_row(
@@ -54506,6 +54537,10 @@ impl Connection {
     /// bd-1jnfu: a WITHOUT ROWID target has no rowid to list, so its matching
     /// rows are frozen by their full primary key instead, as bd-ntt2b does for
     /// a self-referencing EXISTS. With ORDER BY or LIMIT it keeps the WHERE.
+    ///
+    /// bd-h7hox: a correlated EXISTS or scalar subquery the codegen's one-table
+    /// scan cannot answer (a join, a view, HAVING, an OFFSET, ...) is resolved
+    /// the same way.
     async fn rewrite_correlated_in_where_to_rowids(
         &self,
         table_ref: &fsqlite_ast::QualifiedTableRef,
@@ -54514,9 +54549,11 @@ impl Connection {
         limit: Option<&fsqlite_ast::LimitClause>,
         params: Option<&[SqliteValue]>,
     ) -> Result<Option<Expr>> {
-        let has_correlated_in = where_clause
-            .is_some_and(|wh| expr_has_correlated_in_subquery(wh, &self.schema.borrow()));
-        if !has_correlated_in {
+        let where_needs_select_path = where_clause.is_some_and(|wh| {
+            expr_has_correlated_in_subquery(wh, &self.schema.borrow())
+                || dml_expr_has_uncompiled_correlated_subquery(wh, self)
+        });
+        if !where_needs_select_path {
             return Ok(None);
         }
         if !self.table_is_rowid_table(&table_ref.name.name) {
@@ -55008,6 +55045,10 @@ impl Connection {
             DmlRowReplay::UpdateFrom {
                 update,
                 set_columns,
+            }
+            | DmlRowReplay::UpdateEvaluated {
+                update,
+                set_columns,
             } => {
                 // bd-2jbl5: as in stock, the join was evaluated once up front;
                 // each row is a plain UPDATE of the target that assigns the SET
@@ -55057,13 +55098,72 @@ impl Connection {
         })
     }
 
+    /// bd-h7hox: `SELECT <SET values> FROM <target> WHERE <locator>`, which
+    /// reads one row's SET values for an `UpdateEvaluated` replay.
+    fn build_update_row_set_select(
+        update: &fsqlite_ast::UpdateStatement,
+        locator_columns: &[String],
+        locator_values: Vec<Expr>,
+    ) -> Result<Statement> {
+        let projections = Self::update_set_pairs(update)?
+            .into_iter()
+            .map(|(_, value)| ResultColumn::Expr {
+                expr: value.clone(),
+                alias: None,
+            })
+            .collect();
+        let locator = Self::build_update_replay_locator_filter(
+            &update.table,
+            locator_columns,
+            locator_values,
+        )?;
+        Ok(Statement::Select(Self::build_single_table_select(
+            &update.table,
+            projections,
+            Some(&locator),
+            &[],
+            None,
+        )))
+    }
+
+    /// bd-h7hox: one `UpdateEvaluated` row's SET values, read by `set_select`
+    /// with the row statement's parameter layout, or past the variable limit
+    /// by a SELECT naming the locator as literals. `None` once the row is gone.
+    async fn read_update_row_set_values(
+        &self,
+        update: &fsqlite_ast::UpdateStatement,
+        set_select: Option<&Statement>,
+        locator_columns: &[String],
+        locator_row: &[SqliteValue],
+        params: Option<&[SqliteValue]>,
+        parameter_base: usize,
+    ) -> Result<Option<Vec<SqliteValue>>> {
+        let rows = if let Some(set_select) = set_select {
+            let mut select_params = params.unwrap_or(&[]).to_vec();
+            select_params.resize(parameter_base, SqliteValue::Null);
+            select_params.extend_from_slice(locator_row);
+            self.execute_statement(set_select, Some(&select_params))
+                .await?
+        } else {
+            let literal_select = Self::build_update_row_set_select(
+                update,
+                locator_columns,
+                locator_row.iter().cloned().map(value_to_literal_expr).collect(),
+            )?;
+            self.execute_statement(&literal_select, params).await?
+        };
+        Ok(rows.into_iter().next().map(|row| row.values().to_vec()))
+    }
+
     /// The highest bind-parameter slot `statement` itself can read: every
     /// `?NNN` it names and every slot its anonymous and named placeholders
     /// claim. A replay's own per-row parameters are numbered after it.
     fn dml_replay_statement_parameter_slots(statement: DmlRowReplay<'_>) -> Result<usize> {
         let mut bind_state = BindParamState::default();
         match statement {
-            DmlRowReplay::Update(update) | DmlRowReplay::UpdateFrom { update, .. } => {
+            DmlRowReplay::Update(update)
+            | DmlRowReplay::UpdateFrom { update, .. }
+            | DmlRowReplay::UpdateEvaluated { update, .. } => {
                 canonicalize_update_placeholders_with_state(update, &mut bind_state)?;
             }
             DmlRowReplay::Delete(delete) => {
@@ -55093,7 +55193,9 @@ impl Connection {
         locator_rows: &[Vec<SqliteValue>],
     ) -> Result<Vec<Row>> {
         let (table_ref, preserve_constraint_failure_rows, kind) = match statement {
-            DmlRowReplay::Update(update) | DmlRowReplay::UpdateFrom { update, .. } => (
+            DmlRowReplay::Update(update)
+            | DmlRowReplay::UpdateFrom { update, .. }
+            | DmlRowReplay::UpdateEvaluated { update, .. } => (
                 &update.table,
                 update.or_conflict == Some(fsqlite_ast::ConflictAction::Fail),
                 "UPDATE",
@@ -55109,9 +55211,18 @@ impl Connection {
         let previous_changes = self.last_changes.get();
 
         let set_count = match statement {
-            DmlRowReplay::UpdateFrom { set_columns, .. } => set_columns.len(),
+            DmlRowReplay::UpdateFrom { set_columns, .. }
+            | DmlRowReplay::UpdateEvaluated { set_columns, .. } => set_columns.len(),
             DmlRowReplay::Update(_) | DmlRowReplay::Delete(_) => 0,
         };
+        // bd-h7hox: an evaluated UPDATE reads each row's SET values first.
+        let set_source = match statement {
+            DmlRowReplay::UpdateEvaluated { update, .. } => Some(update),
+            DmlRowReplay::Update(_) | DmlRowReplay::UpdateFrom { .. } | DmlRowReplay::Delete(_) => {
+                None
+            }
+        };
+        let mut parameterized_set_select = None;
         let row_value_count = locator_columns.len() + set_count;
         let caller_params = params.unwrap_or(&[]);
         let parameter_base = Self::dml_replay_statement_parameter_slots(statement)?
@@ -55127,8 +55238,15 @@ impl Connection {
                     Span::ZERO,
                 )
             });
-            let locator_slots = slots.by_ref().take(locator_columns.len()).collect();
+            let locator_slots: Vec<Expr> = slots.by_ref().take(locator_columns.len()).collect();
             let set_slots = slots.take(set_count).collect();
+            if let Some(update) = set_source {
+                parameterized_set_select = Some(Self::build_update_row_set_select(
+                    update,
+                    locator_columns,
+                    locator_slots.clone(),
+                )?);
+            }
             Some(Self::build_dml_replay_row_statement(
                 statement,
                 locator_columns,
@@ -55143,7 +55261,30 @@ impl Connection {
             let mut row_params = Vec::with_capacity(parameter_base + row_value_count);
             let mut statement_changes = 0usize;
             let mut returning_rows = Vec::new();
-            for (row_index, locator_row) in locator_rows.iter().enumerate() {
+            for (row_index, frozen_row) in locator_rows.iter().enumerate() {
+                let (evaluated_row, evaluation_error) = match set_source {
+                    None => (None, None),
+                    Some(update) => match self
+                        .read_update_row_set_values(
+                            update,
+                            parameterized_set_select.as_ref(),
+                            locator_columns,
+                            frozen_row,
+                            params,
+                            parameter_base,
+                        )
+                        .await
+                    {
+                        Ok(Some(set_values)) => (
+                            Some([frozen_row.as_slice(), set_values.as_slice()].concat()),
+                            None,
+                        ),
+                        // A previous row's trigger removed this row.
+                        Ok(None) => continue,
+                        Err(error) => (None, Some(error)),
+                    },
+                };
+                let locator_row = evaluated_row.as_ref().unwrap_or(frozen_row);
                 let (locator_values, set_values) = locator_row.split_at(locator_columns.len());
                 let literal_statement;
                 let (row_statement, row_statement_params) = if let Some(parameterized) =
@@ -55165,15 +55306,19 @@ impl Connection {
                 };
 
                 self.set_statement_change_count(previous_changes);
-                match self
-                    .execute_statement_impl_after_background_status(
-                        row_statement,
-                        row_statement_params,
-                        None,
-                        false,
-                    )
-                    .await
-                {
+                let row_result = match evaluation_error {
+                    Some(error) => Err(error),
+                    None => {
+                        self.execute_statement_impl_after_background_status(
+                            row_statement,
+                            row_statement_params,
+                            None,
+                            false,
+                        )
+                        .await
+                    }
+                };
+                match row_result {
                     Ok(rows) => {
                         statement_changes =
                             statement_changes.saturating_add(self.last_changes.get());
@@ -119466,36 +119611,115 @@ fn select_has_unsupported_correlated_exists_subquery(
 /// compounds, CTEs and HAVING, reads a view, derived table or table function
 /// as empty, and of LIMIT/OFFSET honours only a literal `LIMIT 0`. A literal
 /// LIMIT with no positive literal OFFSET cannot hide the first matching row.
+/// With no FROM it answers true without testing the WHERE (bd-h7hox).
 fn exists_subquery_answered_by_table_scan(sub: &SelectStatement, conn: &Connection) -> bool {
     let SelectCore::Select {
         from,
+        where_clause,
         having: None,
         ..
     } = &sub.body.select
     else {
         return false;
     };
-    let source_is_base_table = from.as_ref().is_none_or(|from| {
-        from.joins.is_empty()
-            && matches!(
-                &from.source,
-                TableOrSubquery::Table { name, .. }
-                    if name.schema.is_none()
-                        && !conn.table_name_is_virtual(&name.name)
-                        && conn
-                            .schema
-                            .borrow()
-                            .iter()
-                            .any(|table| table.name.eq_ignore_ascii_case(&name.name))
-            )
-    });
+    let source_is_scanned = match from {
+        Some(from) => from_is_one_base_table(from, conn),
+        None => where_clause.is_none(),
+    };
     let limit_is_literal = sub.limit.as_ref().is_none_or(|clause| {
         matches!(clause.limit, Expr::Literal(Literal::Integer(_), _))
             && clause.offset.as_ref().is_none_or(
                 |offset| matches!(offset, Expr::Literal(Literal::Integer(value), _) if *value <= 0),
             )
     });
-    sub.with.is_none() && sub.body.compounds.is_empty() && source_is_base_table && limit_is_literal
+    sub.with.is_none() && sub.body.compounds.is_empty() && source_is_scanned && limit_is_literal
+}
+
+/// bd-h7hox: whether `emit_scalar_subquery`'s scan answers `sub`. Over one
+/// main-schema base table it reads the first row passing the WHERE, folds
+/// an aggregate into one row, or (non-aggregate, with ORDER BY) sorts and
+/// applies LIMIT/OFFSET. It ignores joins, compounds, CTEs, GROUP BY and
+/// HAVING, reads any other source as NULL, and without that sort ignores
+/// LIMIT/OFFSET. With no FROM it returns the expression and ignores a WHERE.
+fn scalar_subquery_answered_by_table_scan(sub: &SelectStatement, conn: &Connection) -> bool {
+    let SelectCore::Select {
+        columns,
+        from,
+        where_clause,
+        group_by,
+        having: None,
+        ..
+    } = &sub.body.select
+    else {
+        return false;
+    };
+    let aggregate = columns.iter().any(|column| {
+        matches!(column, ResultColumn::Expr { expr, .. }
+            if conn.expr_contains_aggregate_with_registry(expr))
+    });
+    let source_is_scanned = match from {
+        Some(from) => from_is_one_base_table(from, conn),
+        None => where_clause.is_none() && !aggregate && sub.limit.is_none(),
+    };
+    let limit_is_applied = sub.limit.as_ref().is_none_or(|clause| {
+        (!aggregate && !sub.order_by.is_empty())
+            || (matches!(clause.limit, Expr::Literal(Literal::Integer(value), _) if value != 0)
+                && clause.offset.as_ref().is_none_or(|offset| {
+                    matches!(offset, Expr::Literal(Literal::Integer(value), _) if *value <= 0)
+                }))
+    });
+    sub.with.is_none()
+        && sub.body.compounds.is_empty()
+        && group_by.is_empty()
+        && source_is_scanned
+        && limit_is_applied
+}
+
+/// Whether `from` is one main-schema base table with no join, the only
+/// source the compiled EXISTS and scalar subquery scans read.
+fn from_is_one_base_table(from: &FromClause, conn: &Connection) -> bool {
+    from.joins.is_empty()
+        && matches!(
+            &from.source,
+            TableOrSubquery::Table { name, .. }
+                if name.schema.is_none()
+                    && !conn.table_name_is_virtual(&name.name)
+                    && conn
+                        .schema
+                        .borrow()
+                        .iter()
+                        .any(|table| table.name.eq_ignore_ascii_case(&name.name))
+        )
+}
+
+/// bd-h7hox: whether `expr`, part of an UPDATE or DELETE, holds a correlated
+/// subquery the DML codegen compiles wrong: an EXISTS or scalar subquery its
+/// one-table scan does not answer, or an IN subquery (its probe cannot read
+/// the row being changed). Nested subqueries count.
+fn dml_expr_has_uncompiled_correlated_subquery(expr: &Expr, conn: &Connection) -> bool {
+    expr_contains_subquery_matching_deep(expr, conn, &|subquery, conn| {
+        let (inner, answered) = match subquery {
+            SubqueryExprRef::Exists(inner) => {
+                (inner, exists_subquery_answered_by_table_scan(inner, conn))
+            }
+            SubqueryExprRef::Scalar(inner) => {
+                (inner, scalar_subquery_answered_by_table_scan(inner, conn))
+            }
+            SubqueryExprRef::In(inner) => (inner, false),
+        };
+        !answered && is_correlated_subquery_with_schema(inner, &conn.schema.borrow())
+    })
+}
+
+/// Whether `expr` holds a correlated subquery of any kind, nested ones
+/// included.
+fn expr_has_correlated_subquery_deep(expr: &Expr, conn: &Connection) -> bool {
+    expr_contains_subquery_matching_deep(expr, conn, &|subquery, conn| {
+        let (SubqueryExprRef::Scalar(inner)
+        | SubqueryExprRef::Exists(inner)
+        | SubqueryExprRef::In(inner)) = subquery;
+        is_correlated_subquery_with_schema(inner, &conn.schema.borrow())
+    })
 }
 
 /// The table a SELECT scans when its FROM is exactly one base table, with its
@@ -157860,6 +158084,14 @@ enum DmlRowReplay<'a> {
     /// An `UPDATE ... FROM` whose join ran once: each locator row carries the
     /// SET values for `set_columns` after the locator values.
     UpdateFrom {
+        update: &'a fsqlite_ast::UpdateStatement,
+        set_columns: &'a [String],
+    },
+    /// bd-h7hox: an UPDATE whose SET values the codegen cannot compute. Each
+    /// row assigns `set_columns` the values a SELECT of that row reads just
+    /// before it changes, so a subquery sees the rows changed before it, as
+    /// in stock.
+    UpdateEvaluated {
         update: &'a fsqlite_ast::UpdateStatement,
         set_columns: &'a [String],
     },
