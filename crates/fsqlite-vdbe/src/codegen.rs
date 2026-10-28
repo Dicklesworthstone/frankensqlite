@@ -3167,10 +3167,19 @@ pub fn codegen_select(
     // bd-nonagg-rowid-range-residual: `rowid <range> AND <residual>` — walk only the [lower, upper] slice
     // (rowid order = full-scan order) and re-apply the whole WHERE per row, instead of full-scanning. The
     // bare range (no residual) is owned by `rowid_range` above; this handles ONLY the conjunction case
-    // (`has_residual`). Gated to no-LIMIT so nothing before the residual filter emits a placeholder (the
-    // detector already requires integer-literal bounds), keeping the residual `?` numbering trivial.
+    // (`has_residual`). Gated so nothing before the residual filter emits a placeholder (the
+    // detector already requires integer-literal bounds), keeping the residual `?` numbering
+    // trivial: no LIMIT, or an integer-literal LIMIT and OFFSET (bd-qdve2: the keyset page
+    // `rowid > N AND <filter> LIMIT n`).
+    let limit_is_literal = stmt.limit.as_ref().is_none_or(|clause| {
+        matches!(clause.limit, Expr::Literal(Literal::Integer(_), _))
+            && clause
+                .offset
+                .as_ref()
+                .is_none_or(|offset| matches!(offset, Expr::Literal(Literal::Integer(_), _)))
+    });
     let rowid_range_residual =
-        if rowid_range_allowed && rowid_range.is_none() && stmt.limit.is_none() {
+        if rowid_range_allowed && rowid_range.is_none() && limit_is_literal {
             extract_rowid_range_residual_target(where_clause.as_deref(), table, table_alias)
                 .filter(|(_, has_residual)| *has_residual)
                 .map(|(range, _)| range)
@@ -6873,8 +6882,8 @@ fn codegen_select_rowid_range_scan(
     // `rowid <range> AND <residual>`. The walk visits the `[lower, upper]` slice (a superset of the
     // matches) in rowid order; the residual narrows it. Byte-identical to the full scan (same rows, same
     // order, fewer visited). `false` for the plain-range callers → byte-identical. The residual hoist
-    // requires integer-literal bounds and no LIMIT, so nothing before the filter emits a placeholder.
-    // bd-nonagg-rowid-range-residual.
+    // requires integer-literal bounds and LIMIT/OFFSET, so nothing before the filter emits a
+    // placeholder. bd-nonagg-rowid-range-residual.
     residual_filter: bool,
 ) -> Result<(), CodegenError> {
     // Captured before any placeholder-emitting op so the re-applied WHERE re-numbers a residual `?` from
@@ -6996,8 +7005,7 @@ fn codegen_select_rowid_range_scan(
 
     // bd-nonagg-rowid-range-residual: narrow the [lower, upper] slice with the full WHERE. A residual
     // miss jumps to `skip_label` (the Next), so the walk continues to the next row. Applied before the
-    // OFFSET count so OFFSET skips only matching rows (the residual hoist gates on no-LIMIT, so
-    // offset_reg is None here anyway).
+    // OFFSET count so OFFSET skips only matching rows, and LIMIT counts only rows emitted.
     if residual_filter && let Some(where_expr) = where_clause {
         b.set_next_anon_placeholder(where_placeholder_base);
         emit_where_filter(
@@ -34966,7 +34974,8 @@ fn extract_rowid_range_target<'a>(
 /// (placeholder-free) predicates the seek cannot enforce: the rowid range visits a SUPERSET of the
 /// matching rows and the caller re-applies the whole WHERE as a residual filter per row. Aggregates are
 /// order-independent, so visiting a superset and filtering is byte-exact. Both cases require the range
-/// to pass `rowid_range_fast_path_is_safe`.
+/// to pass `rowid_range_fast_path_is_safe`. In the residual case several bounds on one side are
+/// allowed: the seek uses one (`merge_residual_rowid_range_bound`), the filter enforces all.
 fn extract_rowid_range_residual_target<'a>(
     where_clause: Option<&'a Expr>,
     table: &TableSchema,
@@ -34986,9 +34995,8 @@ fn extract_rowid_range_residual_target<'a>(
             } => {
                 if let Some((slot, bound)) =
                     extract_rowid_range_bound(left, *op, right, Some(table), table_alias)
-                    && !assign_rowid_range_bound(&mut target, slot, bound)
                 {
-                    return None; // conflicting duplicate bound
+                    merge_residual_rowid_range_bound(&mut target, slot, bound);
                 }
             }
             Expr::Between {
@@ -35001,7 +35009,7 @@ fn extract_rowid_range_residual_target<'a>(
                 && is_rowid_range_constant(low)
                 && is_rowid_range_constant(high) =>
             {
-                let bounds_assigned = assign_rowid_range_bound(
+                merge_residual_rowid_range_bound(
                     &mut target,
                     RowidRangeSlot::Lower,
                     RowidRangeBound {
@@ -35009,7 +35017,8 @@ fn extract_rowid_range_residual_target<'a>(
                         expr: low,
                         inclusive: true,
                     },
-                ) && assign_rowid_range_bound(
+                );
+                merge_residual_rowid_range_bound(
                     &mut target,
                     RowidRangeSlot::Upper,
                     RowidRangeBound {
@@ -35018,9 +35027,6 @@ fn extract_rowid_range_residual_target<'a>(
                         inclusive: true,
                     },
                 );
-                if !bounds_assigned {
-                    return None;
-                }
             }
             _ => {} // non-rowid conjunct: a residual the filter enforces
         }
@@ -35183,6 +35189,51 @@ fn extract_rowid_range_bound<'a>(
     }
 
     None
+}
+
+/// `assign_rowid_range_bound` for the residual walk, which re-applies the whole WHERE to every
+/// row it visits: a second bound for a slot (`rowid > 100 AND id > 0`) is enforced by that
+/// filter, so it does not decline the walk. The seek takes an integer-literal bound over any
+/// other, since the walk requires literal bounds, and of two literals the one admitting fewer
+/// rows (bd-qdve2).
+fn merge_residual_rowid_range_bound<'a>(
+    target: &mut RowidRangeTarget<'a>,
+    slot: RowidRangeSlot,
+    bound: RowidRangeBound<'a>,
+) {
+    let lower = matches!(slot, RowidRangeSlot::Lower);
+    let target_slot = if lower {
+        &mut target.lower
+    } else {
+        &mut target.upper
+    };
+    let Some(current) = *target_slot else {
+        *target_slot = Some(bound);
+        return;
+    };
+    // The first rowid the bound admits, walking from its side of the range.
+    let first_admitted = |bound: RowidRangeBound<'_>| match bound.expr {
+        Expr::Literal(Literal::Integer(value), _) => Some(match (lower, bound.inclusive) {
+            (_, true) => *value,
+            (true, false) => value.saturating_add(1),
+            (false, false) => value.saturating_sub(1),
+        }),
+        _ => None,
+    };
+    let tighter = match (first_admitted(current), first_admitted(bound)) {
+        (_, None) => false,
+        (None, Some(_)) => true,
+        (Some(current), Some(new)) => {
+            if lower {
+                new > current
+            } else {
+                new < current
+            }
+        }
+    };
+    if tighter {
+        *target_slot = Some(bound);
+    }
 }
 
 fn assign_rowid_range_bound<'a>(
