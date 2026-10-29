@@ -19430,14 +19430,14 @@ fn codegen_select_aggregate(
     //
     // Additional aggregate-specific guards:
     //   * HAVING is not supported on this path.
-    //   * A bare (non-aggregate) output column would expose *which* row the scan
-    //     happened to end on, so the row source must not change.
     //   * Direct-lookup, ASC-leading indexes only; the partial probe record and
     //     per-term `Ne` guards handle composite equality prefixes.
-    let index_eq_seek = if allow_index_seek
-        && having.is_none()
-        && agg_columns.iter().all(|agg| agg.bare_expr.is_none())
-    {
+    //
+    // bd-d4rbi: a bare (non-aggregate) output column does not gate this or any
+    // seek below. It takes the first visited row (GH #226) or the min()/max()
+    // row, and stock visits the rows in the same ascending key order a seek
+    // does; the rowid-order scan this gate used to force returned another row.
+    let index_eq_seek = if allow_index_seek && having.is_none() {
         aggregate_index_eq_seek_target(where_clause, table, table_alias)
     } else {
         None
@@ -19458,11 +19458,7 @@ fn codegen_select_aggregate(
     //     COUNT=0 / SUM=NULL the empty scan would produce.
     // Mutually exclusive with `index_eq_seek`: the INTEGER PRIMARY KEY is the table
     // b-tree key, not a secondary index, so `extract_column_eq_target` never matches it.
-    let rowid_eq_seek = if allow_index_seek
-        && having.is_none()
-        && index_eq_seek.is_none()
-        && agg_columns.iter().all(|agg| agg.bare_expr.is_none())
-    {
+    let rowid_eq_seek = if allow_index_seek && having.is_none() && index_eq_seek.is_none() {
         // bd-agg-rowid-eq-coerced: accept any simple constant (placeholder / real /
         // text as well as an integer literal), not just an integer literal.
         // `extract_rowid_target_expr` already requires `is_simple_constant`; the
@@ -19489,7 +19485,6 @@ fn codegen_select_aggregate(
         && having.is_none()
         && index_eq_seek.is_none()
         && rowid_eq_seek.is_none()
-        && agg_columns.iter().all(|agg| agg.bare_expr.is_none())
     {
         extract_rowid_range_residual_target(where_clause, table, table_alias)
     } else {
@@ -19504,7 +19499,6 @@ fn codegen_select_aggregate(
         && index_eq_seek.is_none()
         && rowid_eq_seek.is_none()
         && rowid_range_seek.is_none()
-        && agg_columns.iter().all(|agg| agg.bare_expr.is_none())
     {
         index_integer_in_list_residual_target(where_clause, table, table_alias)
     } else {
@@ -19521,7 +19515,6 @@ fn codegen_select_aggregate(
         && rowid_eq_seek.is_none()
         && rowid_range_seek.is_none()
         && index_in_seek.is_none()
-        && agg_columns.iter().all(|agg| agg.bare_expr.is_none())
     {
         aggregate_index_range_seek_target(where_clause, table, table_alias, schema)
     } else {
@@ -19540,7 +19533,6 @@ fn codegen_select_aggregate(
         && rowid_range_seek.is_none()
         && index_in_seek.is_none()
         && index_range_seek.is_none()
-        && agg_columns.iter().all(|agg| agg.bare_expr.is_none())
     {
         composite_index_prefix_range_target(where_clause, table, table_alias, schema, None)
     } else {
@@ -19559,7 +19551,6 @@ fn codegen_select_aggregate(
         && index_in_seek.is_none()
         && index_range_seek.is_none()
         && composite_prefix_range_seek.is_none()
-        && agg_columns.iter().all(|agg| agg.bare_expr.is_none())
     {
         aggregate_index_prefix_literal_residual_target(where_clause, table, table_alias, None)
     } else {
@@ -19582,7 +19573,6 @@ fn codegen_select_aggregate(
         && composite_prefix_range_seek.is_none()
         && index_prefix_residual_seek.is_none()
         && !table.without_rowid
-        && agg_columns.iter().all(|agg| agg.bare_expr.is_none())
     {
         extract_rowid_in_list_residual_target(where_clause, table, table_alias)
     } else {
@@ -19604,7 +19594,6 @@ fn codegen_select_aggregate(
         && index_prefix_residual_seek.is_none()
         && rowid_in_seek.is_none()
         && !table.without_rowid
-        && agg_columns.iter().all(|agg| agg.bare_expr.is_none())
     {
         extract_rowid_eq_residual_target(where_clause, table, table_alias)
             .filter(|rhs| matches!(rhs, Expr::Literal(Literal::Integer(_), _)))
