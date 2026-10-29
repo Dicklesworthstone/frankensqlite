@@ -18,7 +18,7 @@ use fsqlite_ast::{
     UpsertClause, UpsertTarget,
 };
 use fsqlite_error::ErrorCode;
-use fsqlite_func::{FunctionArity, FunctionRegistry};
+use fsqlite_func::{FunctionArity, FunctionRegistry, ScalarQueryConstancy};
 use fsqlite_parser::expr::parse_expr as parse_sql_expr;
 use fsqlite_types::opcode::{
     COLUMN_SUBSTR_PREFIX_LEN_FROM_REGISTER, IndexCursorMeta, Opcode, P4,
@@ -139,6 +139,20 @@ fn scalar_is_query_constant_for_codegen(name: &str, num_args: i32) -> bool {
             .as_ref()
             .and_then(|registry| registry.resolve_scalar(name, num_args))
             .is_some_and(|resolved| resolved.query_constancy().is_query_constant())
+    })
+}
+
+/// Whether the scalar returns the same result for the same arguments in
+/// every statement. A seek evaluates its key once where a scan evaluates the
+/// term per row, so a `'now'`-style call, stable only within one query, is
+/// left to the scan.
+fn scalar_is_deterministic_for_codegen(name: &str, num_args: i32) -> bool {
+    FUNCTION_REGISTRY.with(|registry| {
+        registry
+            .borrow()
+            .as_ref()
+            .and_then(|registry| registry.resolve_scalar(name, num_args))
+            .is_some_and(|resolved| resolved.query_constancy() == ScalarQueryConstancy::Constant)
     })
 }
 
@@ -5657,7 +5671,7 @@ fn codegen_select_index_equality_scan(
     // probes miss on every insert; without this each miss scanned the whole table.
     let runtime_exact_type_mask = if leading_key_block_is_exact
         && !exact_seek
-        && matches!(target_expr, Expr::Placeholder(..))
+        && (matches!(target_expr, Expr::Placeholder(..)) || is_constant_seek_key_expr(target_expr))
     {
         probe_column.and_then(|column| match column.affinity {
             'D' => Some(0x01_u16),
@@ -8002,10 +8016,11 @@ fn is_numeric_literal_bound(expr: &Expr) -> bool {
     }
 }
 
-/// Whether `expr` is a bind parameter (`?`, `?N`, `:name`, `@name`, `$name`). A placeholder's
-/// runtime value is unknown at compile time, so the range seek coerces it to the indexed
-/// column's affinity at execution ([`codegen_select_index_range_scan`]) rather than relying on
-/// a compile-time-numeric bound.
+/// Whether `expr` is a bind parameter (`?N`, `:name`, `@name`, `$name`) or a constant
+/// expression over parameters and literals ([`is_constant_seek_key_expr`]). Its runtime value
+/// is unknown at compile time, so the range seek coerces it to the indexed column's affinity at
+/// execution ([`codegen_select_index_range_scan`]) rather than relying on a compile-time-numeric
+/// bound.
 fn is_placeholder_bound(expr: &Expr) -> bool {
     matches!(
         expr,
@@ -8016,7 +8031,7 @@ fn is_placeholder_bound(expr: &Expr) -> bool {
                 | fsqlite_ast::PlaceholderType::DollarNamed(_),
             _
         )
-    )
+    ) || is_constant_seek_key_expr(expr)
 }
 
 /// Whether `expr` is a text string literal. A text literal compared against a BINARY-collated
@@ -8122,6 +8137,10 @@ fn rowid_range_fast_path_is_safe(range: RowidRangeTarget<'_>) -> bool {
 }
 
 fn rowid_range_bound_is_seek_safe(expr: &Expr) -> bool {
+    // bd-aavtp: like a parameter, a constant expression's value is compared at run time.
+    if is_constant_seek_key_expr(expr) {
+        return true;
+    }
     match expr {
         Expr::Literal(Literal::Integer(_), _)
         | Expr::Placeholder(
@@ -19738,30 +19757,46 @@ fn codegen_select_aggregate(
         // GH#444: a string literal against a TEXT column is exact on the same terms as the single-column
         // seek (GH#409) — no affinity conversion is implied, and BINARY on both the index term and the
         // column makes the index order the comparison order — so it qualifies per term too.
-        let exact_seek = prefix_exprs.iter().enumerate().all(|(i, e)| {
-            let Some(column) = idx_schema
-                .columns
-                .get(i)
-                .and_then(|name| table.column_index(name))
-                .and_then(|ci| table.columns.get(ci))
-            else {
-                return false;
-            };
-            let binary = |collation: Option<&str>| {
-                collation.is_none_or(|c| c.eq_ignore_ascii_case("BINARY"))
-            };
-            match e {
-                Expr::Literal(Literal::Integer(_), _) => column.affinity == 'D',
-                Expr::Literal(Literal::String(_), _) => {
-                    column.affinity == 'B'
-                        && binary(idx_schema.key_term_collation(i))
-                        && binary(column.collation.as_deref())
+        // bd-aavtp: a key known only at run time (a parameter or a constant expression) is exact on
+        // the same terms once its value holds the storage class the column's affinity leaves
+        // unconverted, as for the single-column seek (bd-ry6x7). `Some(None)` is a term exact at
+        // compile time, `Some(Some(mask))` one `IsType` checks at run time, `None` neither.
+        let term_exactness: Vec<Option<Option<u16>>> = prefix_exprs
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                let column = idx_schema
+                    .columns
+                    .get(i)
+                    .and_then(|name| table.column_index(name))
+                    .and_then(|ci| table.columns.get(ci))?;
+                let binary = |collation: Option<&str>| {
+                    collation.is_none_or(|c| c.eq_ignore_ascii_case("BINARY"))
+                };
+                let text_exact = column.affinity == 'B'
+                    && binary(idx_schema.key_term_collation(i))
+                    && binary(column.collation.as_deref());
+                match e {
+                    Expr::Literal(Literal::Integer(_), _) => {
+                        (column.affinity == 'D').then_some(None)
+                    }
+                    Expr::Literal(Literal::String(_), _) => text_exact.then_some(None),
+                    bound if is_placeholder_bound(bound) => match column.affinity {
+                        'D' => Some(Some(0x01_u16)),
+                        'B' if text_exact => Some(Some(0x04_u16)),
+                        _ => None,
+                    },
+                    _ => None,
                 }
-                _ => false,
-            }
-        });
+            })
+            .collect();
+        let exact_seek = term_exactness.iter().all(|term| matches!(term, Some(None)));
+        let runtime_exact_check = (!exact_seek && term_exactness.iter().all(Option::is_some))
+            .then(|| b.emit_label());
         let seek_miss_label = if exact_seek {
             finalize_label
+        } else if let Some(check) = runtime_exact_check {
+            check
         } else {
             scan_fallback
         };
@@ -19902,6 +19937,22 @@ fn codegen_select_aggregate(
                 P4::None,
                 0,
             );
+        }
+        if let Some(check) = runtime_exact_check {
+            // bd-aavtp: the miss is authoritative when every run-time key holds the storage class
+            // its column's affinity leaves unconverted; any other key falls through to the scan.
+            b.resolve_label(check);
+            for (offset, term) in term_exactness.iter().enumerate() {
+                if let Some(Some(mask)) = term {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                    let reg = probe_key_regs + offset as i32;
+                    let next_term = b.emit_label();
+                    b.emit_jump_to_label(Opcode::IsType, -1, reg, next_term, P4::None, *mask);
+                    b.emit_jump_to_label(Opcode::Goto, 0, 0, scan_fallback, P4::None, 0);
+                    b.resolve_label(next_term);
+                }
+            }
+            b.emit_jump_to_label(Opcode::Goto, 0, 0, finalize_label, P4::None, 0);
         }
 
         // No index match: fall through to the full scan. No AggStep ran, so the
@@ -27352,8 +27403,9 @@ fn index_eq_residual_seek_target<'a, 't>(
 type IndexEqSeekTarget<'a, 't> = (&'t IndexSchema, Vec<(&'a Expr, char)>, bool);
 
 /// [`index_eq_residual_seek_target`], extended (GH#434) to an index whose
-/// every key column is pinned by an equality with a literal or a numbered or
-/// named parameter, such as the autoindex of a composite PRIMARY KEY.
+/// every key column is pinned by an equality with a literal, a numbered or
+/// named parameter, or a constant expression over those (bd-aavtp), such as
+/// the autoindex of a composite PRIMARY KEY.
 ///
 /// Only the full key qualifies: the probe `(v1, ..., vn, i64::MIN)` then
 /// compares its trailing field with the rowid. After a partial prefix it
@@ -34534,10 +34586,62 @@ fn is_simple_constant(expr: &Expr) -> bool {
     // subset or a superset of the SQL equality result.  Keep literals and bind
     // parameters on the fast path, and make correlated values use the
     // comparator-correct scan path.
-    matches!(expr, Expr::Placeholder(..) | Expr::Literal(..))
+    matches!(expr, Expr::Placeholder(..) | Expr::Literal(..)) || is_constant_seek_key_expr(expr)
+}
+
+/// Whether `expr` is a constant expression a b-tree probe can take as its
+/// key: `col = -5`, `rowid = ?1 + 1`, `name = lower('X')` (bd-aavtp).
+///
+/// It is built from literals, numbered or named parameters and deterministic
+/// scalar calls, so it has one value for the whole statement. It has no
+/// affinity of its own (no CAST at the root) and no collation (no COLLATE
+/// anywhere), so `col = expr` applies the column's affinity and collation to
+/// it exactly as to a bind parameter. The seek paths treat it as one: a value
+/// whose storage class is known only at run time, coerced or checked there.
+/// Anonymous parameters stay out: their slots follow emission order, and a
+/// seek emits its key before the rest of the WHERE.
+fn is_constant_seek_key_expr(expr: &Expr) -> bool {
+    !matches!(
+        expr,
+        Expr::Literal(..) | Expr::Placeholder(..) | Expr::Cast { .. }
+    ) && constant_seek_key_operand(expr)
+}
+
+fn constant_seek_key_operand(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(..) => true,
+        Expr::Placeholder(placeholder, _) => {
+            !matches!(placeholder, fsqlite_ast::PlaceholderType::Anonymous)
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            constant_seek_key_operand(left) && constant_seek_key_operand(right)
+        }
+        Expr::UnaryOp { expr, .. } | Expr::Cast { expr, .. } => constant_seek_key_operand(expr),
+        Expr::FunctionCall {
+            name,
+            args: FunctionArgs::List(args),
+            distinct: false,
+            order_by,
+            filter: None,
+            over: None,
+            ..
+        } => {
+            // `likely(x)` and its kin are skipped when SQLite computes an
+            // operand's affinity, so `likely(CAST(...))` would carry one.
+            order_by.is_empty()
+                && !["likely", "unlikely", "likelihood"]
+                    .iter()
+                    .any(|wrapper| name.eq_ignore_ascii_case(wrapper))
+                && args.iter().all(constant_seek_key_operand)
+                && i32::try_from(args.len())
+                    .is_ok_and(|arity| scalar_is_deterministic_for_codegen(name, arity))
+        }
+        _ => false,
+    }
 }
 
 fn is_rowid_range_constant(expr: &Expr) -> bool {
+    // bd-aavtp: a constant expression bounds a range as a parameter does.
     matches!(expr, Expr::Literal(..))
         || matches!(
             expr,
@@ -34549,6 +34653,7 @@ fn is_rowid_range_constant(expr: &Expr) -> bool {
                 _
             )
         )
+        || is_constant_seek_key_expr(expr)
 }
 
 fn is_index_range_constant(expr: &Expr) -> bool {
@@ -45843,19 +45948,25 @@ mod tests {
             "rowid equality plus residual must not scan the table"
         );
 
-        // Shapes the direct rowid seek still MUST decline. `id = -5` parses as
-        // unary-negate over an integer literal (not a simple constant), while
+        // bd-aavtp: `id = -5` (unary negate over an integer literal) is a
+        // constant expression, so it takes the exact-or-reject rowid probe.
+        let ops = bd_2dgf5_program("SELECT SUM(v) FROM t WHERE id = -5");
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::SeekRowid),
+            "`id = -5` must seek the row by rowid"
+        );
+        assert!(
+            !ops.iter().any(|op| op.opcode == Opcode::Rewind),
+            "`id = -5` is a unique rowid point lookup: it must not scan (no Rewind)"
+        );
+
         // NOT INDEXED explicitly retains the scan contract.
-        for sql in [
-            "SELECT SUM(v) FROM t WHERE id = -5",
-            "SELECT SUM(v) FROM t NOT INDEXED WHERE id = 2",
-        ] {
-            let ops = bd_2dgf5_program(sql);
-            assert!(
-                ops.iter().any(|op| op.opcode == Opcode::Rewind),
-                "`{sql}` must decline the rowid seek and scan (Rewind present)"
-            );
-        }
+        let sql = "SELECT SUM(v) FROM t NOT INDEXED WHERE id = 2";
+        let ops = bd_2dgf5_program(sql);
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::Rewind),
+            "`{sql}` must decline the rowid seek and scan (Rewind present)"
+        );
     }
 
     /// bd-2dgf5: an aggregate over a rowid *range* must position with `SeekGE`/`SeekGT`
