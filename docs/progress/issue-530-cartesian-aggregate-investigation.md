@@ -339,3 +339,144 @@ python3 scripts/benchmark_issue_530.py \
 Use a symbolized candidate for CPU attribution and repeat the memory experiment.
 Until those checks and measurements succeed, the candidate is unverified and
 the performance issue remains unresolved.
+
+## Implementation follow-up: preserved candidate, native validation blocked
+
+The streaming engine optimization is **still not active on main**. A complete
+implementation and ten new SQL regression tests are now retained as
+[candidate.patch](../../tests/artifacts/perf/issue-530-streaming-candidate/candidate.patch),
+so the next sufficiently provisioned worker does not have to reconstruct the
+uncommitted work. The patch is based on `b4155a06947e936877b2edb699b8e9c448a03283`;
+the four affected Rust files are identical in its parent baseline
+`eb7e6964bce773e99913f54c28232fcd432303b4`. `git apply --check` against that immutable
+baseline passed. Patch SHA-256:
+`600c2bc1096b39da2d5611843f588c2b08453eb7a6a3d428ee5f7edbf856e43c`.
+
+The candidate scans each admitted independent table function once in FROM order,
+retains those input rows, and enumerates their product through one reusable row
+buffer into borrowed-row aggregate accumulators. Retained intermediate storage
+is proportional to the sum of source rows and the number of aggregate groups,
+rather than the product cardinality. This is an algorithmic property of the
+candidate, **not an executed memory or speedup result**. There is no series
+formula or multiplication of source cardinalities in place of tuple evaluation.
+
+Admission requires unchanged built-in module factories and verified source
+layouts, including hidden columns and rowids. Unsupported predicates, HAVING,
+outer/constrained/lateral/custom sources, application functions, non-BINARY
+comparison, DISTINCT, attached LIMIT/OFFSET, and projected grouping keys with
+MIN/MAX retain the general executor. A structural expression check excludes
+evaluation forms whose semantics the streaming lane cannot prove. Every input
+is scanned before an empty product is finalized, preserving later scan errors.
+
+The candidate also replaces the older duplicated streaming SUM/AVG states with
+the canonical `SumFunc`/`AvgFunc` implementations. The new SQL regressions cover
+exact integer prefixes beyond 2^53, mixed REAL/integer overflow, NULLs and
+infinities, in addition to the original million-row SQL, product shapes,
+parameters, grouping representatives, custom registrations, predicate fallbacks
+and internal LIMIT/OFFSET. A custom table-function callback regression detects
+incorrect column pruning that would suppress a registry-changing callback.
+These new SQL regressions have **not executed**.
+
+### Executed validation and concrete blockers
+
+| Check | Observed outcome |
+|---|---|
+| Python benchmark protocol suite | 14 passed, including actual child processes, PTY flushing, strict result checks, missing counters, bounded IO, and failed-run evidence |
+| Canonical aggregate unit tests | [69 passed, zero failed, one existing performance test ignored](../../tests/artifacts/perf/issue-530-streaming-candidate/candidate-agg-builtins-tests.log); this does not compile or exercise the connection-level change |
+| Immutable baseline native CLI build | [SIGKILL while compiling `asupersync`](../../tests/artifacts/perf/issue-530-streaming-candidate/baseline-build-low-memory.log), before engine compilation |
+| Candidate `cargo check -p fsqlite-core --lib` | [SIGKILL while checking `asupersync`](../../tests/artifacts/perf/issue-530-streaming-candidate/candidate-core-check.log), before checking the changed connection code |
+| Focused function-crate Clippy | [Blocked by an existing `fsqlite-error` lint and an older-toolchain unknown lint](../../tests/artifacts/perf/issue-530-streaming-candidate/candidate-func-clippy.log); no lint allowance was changed |
+| Configured workspace formatting | [Existing differences elsewhere](../../tests/artifacts/perf/issue-530-streaming-candidate/workspace-fmt-check.log); the repository configuration excludes the large core/pager/VDBE files |
+| Source whitespace and patch application | `git diff --check` and baseline `git apply --check` passed |
+| New SQL integration tests, full workspace check/Clippy, baseline/candidate benchmark | **Not completed**; no baseline or candidate native executable was produced |
+
+The worker again has an 8 GiB cgroup limit. Other concurrent work occupies
+compiler memory and several GiB of RAM-backed files; the disk also repeatedly
+ran out of unreserved space. Only this task's files were moved, reversibly, to
+manage space. Other tasks' jobs and files were left untouched. No usable remote
+compilation configuration or runner was found. The repository documents Actions
+as disabled; inspected historical verification runs remain queued. Actions was
+not enabled or reconfigured.
+
+The available toolchain was `nightly-2026-07-06`, rustc
+`1.99.0-nightly (3659db0d3 2026-07-05)`, rather than the repository's pinned
+`nightly-2026-08-31`. The native attempts preserved default features and locked
+dependencies, using the development profile with `CARGO_BUILD_JOBS=1`,
+`CARGO_INCREMENTAL=0`, `CARGO_PROFILE_DEV_DEBUG=0`,
+`CARGO_PROFILE_DEV_CODEGEN_UNITS=256`, `CARGO_PROFILE_DEV_LTO=false`, and
+`RUSTFLAGS='-Zthreads=1 -Cembed-bitcode=no'`. The final attempts additionally used
+Cargo's `-Zprofile-rustflags` with package-specific asupersync flags
+`-Zno-parallel-backend -Zmir-opt-level=0`. Neither those settings nor the narrower
+check completed the dependency build. No dependency source, feature set, SQL
+assertion, concurrency default, or acceptance gate was weakened.
+
+### Reusable process-memory retention measurement
+
+Commit `b4155a06947e936877b2edb699b8e9c448a03283` adds `--memory` to the existing
+benchmark. This is a separate mode: native wall/CPU timing samples remain
+uninstrumented. Each fresh child pauses after setup and after each checked
+workload result. Linux `/proc/<pid>/status` supplies VmRSS and VmHWM while that
+same child waits for more input. Reports distinguish first-query high-water
+from RSS retained across subsequent queries, retain raw checkpoints and failures,
+and never substitute zero for an unavailable counter. Values include process
+state, allocator arenas and engine caches; they are not isolated query heap or
+proof of a leak. The first-query VmHWM includes startup/setup but has no
+pre-exec Python-parent RSS floor.
+
+The collector passed an actual native SQLite 3.53.2 smoke run over Cartesian
+COUNT/SUM, the HAVING diagnostic, ordinary-table COUNT and JSON SUM, checking
+three executions of each query. This validates the collector protocol, not a
+candidate engine. This worker's sandbox PID namespace does not match its `/proc`
+mount, so the initial sandbox memory test correctly failed on missing process
+status; the passing protocol and native collector runs used matching namespaces.
+
+A subsequent release/stock retention experiment completed seven cases, three
+fresh processes per engine/case and three checked executions per process:
+**126 validated workload results**. The [raw report](../../tests/artifacts/perf/issue-530-streaming-candidate/release-stock-memory.json)
+contains every checkpoint and both binary hashes; the
+[command record](../../tests/artifacts/perf/issue-530-streaming-candidate/release-stock-memory-command.json)
+records the collector hash, exact options and resource guard, and the
+[log archive](../../tests/artifacts/perf/issue-530-streaming-candidate/release-stock-memory-logs.tar.gz)
+retains scripts, outputs and per-process checkpoint files. The guard never fired.
+The run used the verified official v0.4.12 binary and native SQLite 3.53.2 built
+with GCC 13.3.0 and the investigation's flags. Medians below are **MiB**:
+
+| Case | v0.4.12 first-query HWM | v0.4.12 RSS after query 3 | Stock first-query HWM |
+|---|---:|---:|---:|
+| Single COUNT | 12.61 | 12.61 | 2.67 |
+| Cartesian COUNT | 1331.76 | 16.24 | 2.60 |
+| Single SUM | 12.61 | 12.61 | 2.65 |
+| Cartesian SUM | 1331.75 | 16.24 | 2.65 |
+| Single COUNT with HAVING | 731.44 | 16.33 | 2.65 |
+| JSON Cartesian COUNT | 2601.48 | 16.32 | 2.71 |
+| JSON Cartesian SUM | 2601.62 | 16.34 | 2.70 |
+
+For every release case, median RSS growth from query 1's completed checkpoint to
+query 3's completed checkpoint was zero. The large product peaks are therefore
+transient in these repetitions, rather than retained GiB growth. This does not
+rule out retention over other workloads or longer runs. The different measurement
+scope explains why these figures should not be pooled with the earlier wait4
+measurements. JSON's roughly 2.54 GiB peaks also demonstrate that the materializing
+path affects table functions beyond generate_series. These are **released versus
+stock observations only**, not measurements of main or the preserved candidate.
+Fresh wall/CPU comparisons were not rerun while another task was consuming the
+shared worker's CPU; the earlier timing evidence remains separate.
+
+On a worker where the locked native build succeeds, apply the retained patch,
+run the two integration targets above and the GH#436 streaming-function guard,
+then complete the required workspace gates. Build baseline and candidate with
+identical settings and retain their source/binary identities. Run the existing
+three-engine timing command, followed separately by the retention experiment:
+
+```bash
+python3 scripts/benchmark_issue_530.py \
+  --baseline-fsqlite /path/to/baseline/fsqlite --baseline-revision BASELINE_SHA \
+  --fsqlite /path/to/candidate/fsqlite --candidate-revision CANDIDATE_SHA \
+  --sqlite /path/to/native/sqlite3 --stock-revision STOCK_SOURCE_ID \
+  --build-note 'Exact matching build settings and toolchains' \
+  --memory --memory-queries 5 --repeats 3 \
+  --work-dir /path/to/new/memory-logs --output /path/to/new/memory-result.json
+```
+
+The retained candidate must not be described as landed, validated, or faster
+until the native compile, SQL regressions and paired measurements succeed.

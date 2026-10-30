@@ -1,0 +1,98 @@
+   Compiling libc v0.2.190
+   Compiling serde_core v1.0.229
+   Compiling num-traits v0.2.19
+   Compiling syn v2.0.119
+   Compiling serde v1.0.229
+   Compiling smallvec v1.16.3
+   Compiling parking_lot_core v0.9.12
+   Compiling tracing-attributes v0.1.31
+   Compiling tracing v0.1.44
+   Compiling fsqlite-error v0.4.12 (/workspace/scratch/0dfadb1ccd39/frankensqlite/crates/fsqlite-error)
+   Compiling parking_lot v0.12.5
+   Compiling getrandom v0.4.3
+   Compiling chacha20 v0.10.2
+   Compiling bitflags v2.13.2
+   Compiling xxhash-rust v0.8.19
+   Compiling iana-time-zone v0.1.65
+   Compiling simdutf8 v0.1.5
+   Compiling fsqlite-types v0.4.12 (/workspace/scratch/0dfadb1ccd39/frankensqlite/crates/fsqlite-types)
+   Compiling chrono v0.4.45
+   Compiling rand v0.10.3
+   Compiling fsqlite-func v0.4.12 (/workspace/scratch/0dfadb1ccd39/frankensqlite/crates/fsqlite-func)
+    Finished `test` profile [optimized] target(s) in 45.84s
+     Running unittests src/lib.rs (/tmp/issue530-target/debug/deps/fsqlite_func-b6725fb94500e4e5)
+
+running 70 tests
+test agg_builtins::tests::perf_group_concat_text_rows ... ignored, perf-only benchmark
+test agg_builtins::tests::test_all_integer_overflow_remains_an_error_after_cancellation ... ok
+test agg_builtins::tests::test_aggregate_oracle_edges_2026_08 ... ok
+test agg_builtins::tests::test_avg_empty ... ok
+test agg_builtins::tests::test_avg_basic ... ok
+test agg_builtins::tests::test_avg_with_nulls ... ok
+test agg_builtins::tests::test_avg_returns_real ... ok
+test agg_builtins::tests::test_count_column ... ok
+test agg_builtins::tests::test_count_empty ... ok
+test agg_builtins::tests::test_finite_numeric_overflow_preserves_infinity ... ok
+test agg_builtins::tests::test_count_star ... ok
+test agg_builtins::tests::test_group_concat_basic ... ok
+test agg_builtins::tests::test_e2e_registry_invoke_aggregates ... ok
+test agg_builtins::tests::test_group_concat_custom_sep ... ok
+test agg_builtins::tests::test_group_concat_empty ... ok
+test agg_builtins::tests::test_group_concat_null_skipped ... ok
+test agg_builtins::tests::test_group_concat_integer_values_coerced_to_text ... ok
+test agg_builtins::tests::test_group_concat_varying_separator ... ok
+test agg_builtins::tests::test_indeterminate_numeric_aggregates_return_null_not_nan ... ok
+test agg_builtins::tests::test_group_concat_single_value ... ok
+test agg_builtins::tests::test_max_aggregate ... ok
+test agg_builtins::tests::test_max_aggregate_empty ... ok
+test agg_builtins::tests::test_max_aggregate_null_skipped ... ok
+test agg_builtins::tests::test_median_empty ... ok
+test agg_builtins::tests::test_median_and_percentiles_reject_non_numeric_and_infinite_data ... ok
+test agg_builtins::tests::test_median_even ... ok
+test agg_builtins::tests::test_median_null_skipped ... ok
+test agg_builtins::tests::test_min_aggregate ... ok
+test agg_builtins::tests::test_min_aggregate_null_skipped ... ok
+test agg_builtins::tests::test_min_aggregate_empty ... ok
+test agg_builtins::tests::test_median_basic ... ok
+test agg_builtins::tests::test_numeric_aggregate_text_and_blob_coercion_counts_non_numeric_values ... ok
+test agg_builtins::tests::test_median_finite_extreme_values_do_not_overflow_interpolation ... ok
+test agg_builtins::tests::test_nan_inputs_have_null_numeric_aggregate_semantics ... ok
+test agg_builtins::tests::test_numeric_aggregate_registry_states_are_independent ... ok
+test agg_builtins::tests::test_numeric_aggregates_recover_low_bits_after_integer_overflow ... ok
+test agg_builtins::tests::test_numeric_aggregates_preserve_signed_infinities ... ok
+test agg_builtins::tests::test_numeric_aggregates_preserve_large_integer_cancellation ... ok
+test agg_builtins::tests::test_numeric_aggregates_retain_compensated_fractional_residue ... ok
+test agg_builtins::tests::test_percentile_0 ... ok
+test agg_builtins::tests::test_percentile_100 ... ok
+test agg_builtins::tests::test_percentile_disc_basic ... ok
+test agg_builtins::tests::test_percentile_disc_no_interpolation ... ok
+test agg_builtins::tests::test_percentile_disc_uses_lower_continuous_rank ... ok
+test agg_builtins::tests::test_percentile_fraction_is_checked_on_null_rows ... ok
+test agg_builtins::tests::test_percentile_50 ... ok
+test agg_builtins::tests::test_percentile_cont_basic ... ok
+test agg_builtins::tests::test_percentile_cont_interpolation_and_percent_scale_agree ... ok
+test agg_builtins::tests::test_percentile_fraction_tolerance_is_normalized_and_does_not_drift ... ok
+test agg_builtins::tests::test_percentile_invalid_fractions_error_even_for_null_data ... ok
+test agg_builtins::tests::test_percentile_numeric_text_fraction_is_not_numeric_text_data ... ok
+test agg_builtins::tests::test_percentile_rejected_row_does_not_change_state ... ok
+test agg_builtins::tests::test_percentile_empty_singleton_and_nan_data ... ok
+test agg_builtins::tests::test_percentile_typed_affinity_keeps_group_fractions_independent ... ok
+test agg_builtins::tests::test_sum_empty_null ... ok
+test agg_builtins::tests::test_sum_integer_text_later_real_clears_overflow_error ... ok
+test agg_builtins::tests::test_string_agg_alias ... ok
+test agg_builtins::tests::test_register_aggregate_builtins_all_present ... ok
+test agg_builtins::tests::test_sum_integer_text_preserves_overflow_error ... ok
+test agg_builtins::tests::test_sum_later_real_value_clears_integer_overflow_error ... ok
+test agg_builtins::tests::test_sum_integers ... ok
+test agg_builtins::tests::test_sum_null_skipped ... ok
+test agg_builtins::tests::test_sum_reals ... ok
+test agg_builtins::tests::test_sum_prefix_text_uses_real_accumulator ... ok
+test agg_builtins::tests::test_total_and_avg_keep_exact_integer_prefix ... ok
+test agg_builtins::tests::test_sum_unicode_whitespace_text_uses_sqlite_ascii_space_rules ... ok
+test agg_builtins::tests::test_sum_overflow_error ... ok
+test agg_builtins::tests::test_total_basic ... ok
+test agg_builtins::tests::test_total_no_overflow ... ok
+test agg_builtins::tests::test_total_empty_zero ... ok
+
+test result: ok. 69 passed; 0 failed; 1 ignored; 0 measured; 464 filtered out; finished in 0.01s
+

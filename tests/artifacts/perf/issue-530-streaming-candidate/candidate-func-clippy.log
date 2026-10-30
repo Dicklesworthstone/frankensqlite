@@ -1,0 +1,29 @@
+    Checking libc v0.2.190
+    Checking serde_core v1.0.229
+    Checking smallvec v1.16.3
+    Checking parking_lot_core v0.9.12
+    Checking tracing v0.1.44
+    Checking serde v1.0.229
+    Checking num-traits v0.2.19
+    Checking fsqlite-error v0.4.12 (/workspace/scratch/0dfadb1ccd39/frankensqlite/crates/fsqlite-error)
+warning[E0602]: unknown lint: `clippy::assert_is_empty`
+  |
+  = help: did you mean: `clippy::const_is_empty`
+  = note: requested on the command line with `-A clippy::assert_is_empty`
+  = note: `#[warn(unknown_lints)]` on by default
+  = note: the `unknown_lints` lint ignores `-D warnings`
+
+error: using decimal literal for bitwise operation
+   --> crates/fsqlite-error/src/lib.rs:713:59
+    |
+713 |             Self::TriggerRaise(_) | Self::RaiseFail(_) => 19 | (7 << 8), // SQLITE_CONSTRAINT_TRIGGER = 1811
+    |                                                           ^^
+    |
+    = help: use binary (0b1_0011), hex (0x0013), or octal (0o23) notation for better readability
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#decimal_bitwise_operands
+    = note: `-D clippy::decimal-bitwise-operands` implied by `-D clippy::pedantic`
+    = help: to override `-D clippy::pedantic` add `#[allow(clippy::decimal_bitwise_operands)]`
+
+For more information about this error, try `rustc --explain E0602`.
+warning: `fsqlite-error` (lib) generated 1 warning
+error: could not compile `fsqlite-error` (lib) due to 1 previous error; 1 warning emitted

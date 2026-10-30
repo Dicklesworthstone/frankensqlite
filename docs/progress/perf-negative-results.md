@@ -51,6 +51,14 @@ Each entry should include:
   the correctness battery executed, and live stock SQLite in the same timing
   invocation; retain the semantic exclusions above until their counterexamples
   are handled explicitly.
+- Follow-up: the complete implementation and ten SQL regressions are preserved
+  in [candidate.patch](../../tests/artifacts/perf/issue-530-streaming-candidate/candidate.patch),
+  with [executed checks and native-build blockers](issue-530-cartesian-aggregate-investigation.md#implementation-follow-up-preserved-candidate-native-validation-blocked).
+  Canonical aggregate unit tests pass, but the baseline build and candidate
+  core check were again killed inside `asupersync` before reaching the engine.
+  The patch remains unapplied on main. The new benchmark `--memory` mode measures
+  retained process RSS separately from peak RSS; neither its passing protocol
+  tests nor release/stock observations validate the candidate.
 
 ## 2026-09-19 - Insufficient for HFDT persistence: index-extrema EXISTS exclusion (hfdt-gbou9l)
 

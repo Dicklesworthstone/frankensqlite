@@ -1,0 +1,1168 @@
+diff --git a/crates/fsqlite-core/src/connection.rs b/crates/fsqlite-core/src/connection.rs
+index f0fe325..834c97f 100644
+--- a/crates/fsqlite-core/src/connection.rs
++++ b/crates/fsqlite-core/src/connection.rs
+@@ -112,6 +112,7 @@ use fsqlite_ext_json::{JSON_TABLE_COLUMN_NAMES, JsonEachVtab, JsonTreeVtab};
+ use fsqlite_ext_misc::GenerateSeriesTable;
+ #[cfg(feature = "ext-rtree")]
+ use fsqlite_ext_rtree::{RtreeGeometry, RtreeVirtualTable};
++use fsqlite_func::agg_builtins::{AvgFunc, AvgState, SumFunc, SumState};
+ use fsqlite_func::builtins::{
+     ChangeTrackingState, case_sensitive_like_active, get_change_tracking_state,
+     reset_statement_now, set_case_sensitive_like, set_change_tracking_state,
+@@ -123,8 +124,8 @@ use fsqlite_func::vtab::{
+     VirtualTable, VirtualTableCursor, VtabModuleFactory, module_factory_from,
+ };
+ use fsqlite_func::{
+-    ApplicationFunctionKind, BuiltinFunctionFamily, ErasedWindowFunction, FunctionArity,
+-    FunctionRegistry, ResolvedScalarFunction, ScalarSchemaSafety,
++    AggregateFunction, ApplicationFunctionKind, BuiltinFunctionFamily, ErasedWindowFunction,
++    FunctionArity, FunctionRegistry, ResolvedScalarFunction, ScalarSchemaSafety,
+     builtin_function_surface_inventory, get_last_changes, get_last_insert_rowid, get_total_changes,
+     sqlite_compile_options,
+ };
+@@ -86600,7 +86601,7 @@ impl Connection {
+         without_rowid
+     }
+ 
+-    /// GH#420: stream a lone table-valued function into simple aggregates.
++    /// GH#420 / GH#530: stream table-valued functions into simple aggregates.
+     ///
+     /// `SELECT sum(value) FROM generate_series(1, 1000000)` and its grouped and
+     /// filtered forms fold each cursor row straight into the streaming
+@@ -86610,7 +86611,11 @@ impl Connection {
+     /// WHERE, the GROUP BY and any argument that is not a bare column must be
+     /// plain expressions (no subquery, aggregate, window function or
+     /// collation). When the query reads only bare columns, the scan fetches
+-    /// just those.
++    /// just those. Independent, unconstrained products of builtin table
++    /// functions retain each input once and fold their Cartesian tuples through
++    /// one reusable row. They never materialize the product. Their admission is
++    /// deliberately narrower than the lone-source lane: predicates, lateral
++    /// arguments and user callbacks retain the general executor.
+     #[allow(clippy::too_many_lines)]
+     async fn try_execute_streaming_table_function_aggregate(
+         &self,
+@@ -86619,6 +86624,7 @@ impl Connection {
+         col_map: &[(String, String, bool)],
+     ) -> Result<Option<Vec<Row>>> {
+         let SelectCore::Select {
++            distinct,
+             columns,
+             from: Some(from),
+             where_clause,
+@@ -86633,25 +86639,99 @@ impl Connection {
+         let TableOrSubquery::TableFunction { name, args, .. } = &from.source else {
+             return Ok(None);
+         };
++        let is_product = !from.joins.is_empty();
+         let plain_clause = |expr: &Expr| {
+             !expr_has_any_subquery(expr)
+                 && !expr_contains_agg(expr)
+                 && !expr_has_window_function(expr)
+                 && join_expr_effective_collation(expr, col_map).is_none()
++                && (!is_product || self.streaming_table_function_expr_supported(expr))
+         };
+         if select.with.is_some()
+             || !select.body.compounds.is_empty()
+             || !select.order_by.is_empty()
+-            || !from.joins.is_empty()
++            // Internal INSERT/CTE callers can leave these attached; an early
++            // return must not bypass their final DISTINCT or LIMIT/OFFSET.
++            || *distinct != Distinctness::All
++            || select.limit.is_some()
++            || from.joins.iter().any(|join| {
++                !matches!(join.join_type.kind, JoinKind::Inner | JoinKind::Cross)
++                    || join.join_type.natural
++                    || join.constraint.is_some()
++            })
+             || !windows.is_empty()
+             || self.scalar_function_overridden.get()
+             || self.custom_aggregate_registered.get()
++            || !lock_unpoisoned(self.collation_registry.as_ref())
++                .uses_builtin_implementation("BINARY")
++            // The general join WHERE evaluator short-circuits truth contexts;
++            // eval_join_predicate below is a value evaluator. Do not change
++            // which predicate arms, subqueries or errors are observed.
++            || (is_product && where_clause.is_some())
+             || where_clause
+                 .as_deref()
+                 .is_some_and(|predicate| !plain_clause(predicate))
+         {
+             return Ok(None);
+         }
++
++        // Prove every source and its layout before evaluating any arguments.
++        // A name alone is insufficient: an application may replace a builtin
++        // module, and its metadata/scan callbacks may replace functions or
++        // collations. Only unchanged factories with known layouts can skip
++        // unneeded column callbacks and safely reuse the aggregate plan.
++        let mut product_sources = Vec::new();
++        if is_product {
++            let modules = self.vtab_modules.borrow();
++            let defaults = shared_default_vtab_module_registry();
++            let mut offset = 0;
++            for source in std::iter::once(&from.source)
++                .chain(from.joins.iter().map(|join| &join.table))
++            {
++                let TableOrSubquery::TableFunction { name, args, alias } = source else {
++                    return Ok(None);
++                };
++                let key = name.to_ascii_uppercase();
++                let (Some(factory), Some(builtin), Some(column_names)) = (
++                    modules.get(&key),
++                    defaults.get(&key),
++                    table_function_column_names(name),
++                ) else {
++                    return Ok(None);
++                };
++                if !Arc::ptr_eq(factory, builtin)
++                    || args.iter().any(|arg| {
++                        expr_references_any_column(arg)
++                            || !self.streaming_table_function_expr_supported(arg)
++                    })
++                {
++                    return Ok(None);
++                }
++                let label = alias.as_deref().unwrap_or(name);
++                let declared_end = offset + column_names.len();
++                let Some(declared_columns) = col_map.get(offset..declared_end) else {
++                    return Ok(None);
++                };
++                if !declared_columns.iter().zip(column_names).all(
++                    |((table, column, hidden), expected)| {
++                        table.eq_ignore_ascii_case(label)
++                            && column.eq_ignore_ascii_case(expected)
++                            && !hidden
++                    },
++                ) {
++                    return Ok(None);
++                }
++                let include_hidden_rowid = col_map.get(declared_end).is_some_and(
++                    |(table, _, hidden)| table.eq_ignore_ascii_case(label) && *hidden,
++                );
++                let end = declared_end + usize::from(include_hidden_rowid);
++                product_sources.push((name, args, offset..end, include_hidden_rowid));
++                offset = end;
++            }
++            if offset != col_map.len() {
++                return Ok(None);
++            }
++        }
+         let mut group_by_exprs = group_by.clone();
+         resolve_group_by_aliases(&mut group_by_exprs, columns, col_map);
+         if !group_by_exprs.iter().all(plain_clause) {
+@@ -86729,6 +86809,23 @@ impl Connection {
+             outputs.push(output);
+         }
+ 
++        // Equal grouping keys need not have the same storage class (1 and
++        // 1.0 compare equal). MIN/MAX can choose a different representative
++        // row for a projected key; this accumulator keeps the first one.
++        if outputs
++            .iter()
++            .any(|output| matches!(output, SimpleStreamingGroupByOutput::Plain(_)))
++            && outputs.iter().any(|output| {
++                matches!(
++                    output,
++                    SimpleStreamingGroupByOutput::MinValue { .. }
++                        | SimpleStreamingGroupByOutput::MaxValue { .. }
++                )
++            })
++        {
++            return Ok(None);
++        }
++
+         // Evaluate the WHERE and GROUP BY terms in the same collation and
+         // affinity context the materializing path uses.
+         let column_collations = self.build_join_col_collations(select);
+@@ -86780,6 +86877,60 @@ impl Connection {
+             JoinExprBindingsGuard::push(bindings)
+         });
+         let mut grouping = SimpleStreamingGroupBy::new(&group_by_exprs, &outputs, col_map);
++        if is_product {
++            let mut inputs = Vec::with_capacity(product_sources.len());
++            for (name, args, columns, include_hidden_rowid) in &product_sources {
++                let mut rows = Vec::new();
++                self.scan_table_function_rows(
++                    name,
++                    args,
++                    params,
++                    *include_hidden_rowid,
++                    Some(&needed_columns[columns.clone()]),
++                    &mut |row| {
++                        rows.push(row);
++                        Ok(())
++                    },
++                )
++                .await?;
++                inputs.push(rows);
++            }
++            // Scan every source first, including those after an empty source:
++            // the established executor observes their argument and scan errors.
++            if inputs.iter().all(|rows| !rows.is_empty()) {
++                let mut row = vec![SqliteValue::Null; col_map.len()];
++                let mut positions = vec![0; inputs.len()];
++                for (rows, (_, _, columns, _)) in inputs.iter().zip(&product_sources) {
++                    row[columns.clone()].clone_from_slice(&rows[0]);
++                }
++                self.with_fallback_function_registry(|| -> Result<()> {
++                    loop {
++                        grouping.push(&row)?;
++                        // Odometer order is the same left-to-right nested-loop
++                        // order as execute_single_join. Copy only sources whose
++                        // position changed, without cloning an entire tuple.
++                        let mut source = inputs.len();
++                        loop {
++                            if source == 0 {
++                                return Ok(());
++                            }
++                            source -= 1;
++                            positions[source] += 1;
++                            let carry = positions[source] == inputs[source].len();
++                            if carry {
++                                positions[source] = 0;
++                            }
++                            row[product_sources[source].2.clone()]
++                                .clone_from_slice(&inputs[source][positions[source]]);
++                            if !carry {
++                                break;
++                            }
++                        }
++                    }
++                })?;
++            }
++            return self.with_fallback_function_registry(|| grouping.finish().map(Some));
++        }
+         self.scan_table_function_rows(
+             name,
+             args,
+@@ -86793,7 +86944,7 @@ impl Connection {
+                     {
+                         return Ok(());
+                     }
+-                    grouping.push(row)
++                    grouping.push(&row)
+                 })
+             },
+         )
+@@ -86801,6 +86952,46 @@ impl Connection {
+         grouping.finish().map(Some)
+     }
+ 
++    /// Expressions whose evaluation can be interleaved across streaming
++    /// accumulators without invoking application state or a different truth/
++    /// subquery evaluator. Keep this proof structural and fail closed for new
++    /// expression forms; the general aggregate executor remains authoritative.
++    fn streaming_table_function_expr_supported(&self, expr: &Expr) -> bool {
++        match expr {
++            Expr::Literal(..) | Expr::Column(..) => true,
++            Expr::BinaryOp { left, op, right, .. } => {
++                !matches!(op, BinaryOp::And | BinaryOp::Or)
++                    && self.streaming_table_function_expr_supported(left)
++                    && self.streaming_table_function_expr_supported(right)
++            }
++            Expr::UnaryOp { expr, .. }
++            | Expr::Cast { expr, .. }
++            | Expr::IsNull { expr, .. } => self.streaming_table_function_expr_supported(expr),
++            Expr::FunctionCall {
++                name,
++                args: args @ FunctionArgs::List(values),
++                distinct: false,
++                order_by,
++                filter: None,
++                over: None,
++                ..
++            } => {
++                order_by.is_empty()
++                    && !self.function_call_is_current_aggregate(name, args)
++                    && selected_function_is_builtin(self, name, args, None)
++                    && self
++                        .func_registry
++                        .borrow()
++                        .scalar_is_deterministic(name, aggregate_args_len_for_lookup(args))
++                        == Some(true)
++                    && values
++                        .iter()
++                        .all(|value| self.streaming_table_function_expr_supported(value))
++            }
++            _ => false,
++        }
++    }
++
+     /// Handle GROUP BY + JOIN by materializing the join first, then applying
+     /// GROUP BY aggregation directly on the joined rows.
+     async fn execute_group_by_join_select(
+@@ -130063,20 +130254,10 @@ enum SimpleStreamingGroupByOutput {
+ enum SimpleStreamingGroupByAccumulator {
+     Plain,
+     Count(i64),
+-    Sum {
+-        sum: f64,
+-        err: f64,
+-        int_sum: i64,
+-        has_int: bool,
+-        all_int: bool,
+-        int_overflowed: bool,
+-        saw_value: bool,
+-    },
+-    Avg {
+-        sum: f64,
+-        err: f64,
+-        count: u64,
+-    },
++    // Share exact integer prefixes, compensated real summation, NULL handling
++    // and overflow behavior with the registered built-in aggregates.
++    Sum(SumState),
++    Avg(AvgState),
+     Min(Option<SqliteValue>),
+     Max(Option<SqliteValue>),
+ }
+@@ -130182,20 +130363,12 @@ impl SimpleStreamingGroupByOutput {
+             Self::CountStar | Self::CountValue { .. } => {
+                 SimpleStreamingGroupByAccumulator::Count(0)
+             }
+-            Self::SumValue { .. } => SimpleStreamingGroupByAccumulator::Sum {
+-                sum: 0.0,
+-                err: 0.0,
+-                int_sum: 0,
+-                has_int: false,
+-                all_int: true,
+-                int_overflowed: false,
+-                saw_value: false,
+-            },
+-            Self::AvgValue { .. } => SimpleStreamingGroupByAccumulator::Avg {
+-                sum: 0.0,
+-                err: 0.0,
+-                count: 0,
+-            },
++            Self::SumValue { .. } => {
++                SimpleStreamingGroupByAccumulator::Sum(SumFunc.initial_state())
++            }
++            Self::AvgValue { .. } => {
++                SimpleStreamingGroupByAccumulator::Avg(AvgFunc.initial_state())
++            }
+             Self::MinValue { .. } => SimpleStreamingGroupByAccumulator::Min(None),
+             Self::MaxValue { .. } => SimpleStreamingGroupByAccumulator::Max(None),
+         }
+@@ -130256,55 +130429,19 @@ fn update_simple_streaming_group_by_state(
+             }
+             (
+                 SimpleStreamingGroupByOutput::SumValue { arg_col, arg_expr },
+-                SimpleStreamingGroupByAccumulator::Sum {
+-                    sum,
+-                    err,
+-                    int_sum,
+-                    has_int,
+-                    all_int,
+-                    int_overflowed,
+-                    saw_value,
+-                },
++                SimpleStreamingGroupByAccumulator::Sum(sum),
+             ) => {
+                 let value =
+                     simple_streaming_group_by_value(*arg_col, arg_expr.as_deref(), row, col_map)?;
+-                if matches!(value, SqliteValue::Null) {
+-                    continue;
+-                }
+-                *saw_value = true;
+-                match value.to_sum_numeric_value() {
+-                    SqliteValue::Integer(n) => {
+-                        *has_int = true;
+-                        if *all_int && !*int_overflowed {
+-                            match int_sum.checked_add(n) {
+-                                Some(next) => *int_sum = next,
+-                                None => *int_overflowed = true,
+-                            }
+-                        }
+-                        kbn_step(sum, err, n as f64);
+-                    }
+-                    SqliteValue::Float(f) => {
+-                        *all_int = false;
+-                        kbn_step(sum, err, f);
+-                    }
+-                    SqliteValue::Null | SqliteValue::Text(_) | SqliteValue::Blob(_) => {}
+-                }
++                SumFunc.step(sum, std::slice::from_ref(&value))?;
+             }
+             (
+                 SimpleStreamingGroupByOutput::AvgValue { arg_col, arg_expr },
+-                SimpleStreamingGroupByAccumulator::Avg { sum, err, count },
++                SimpleStreamingGroupByAccumulator::Avg(avg),
+             ) => {
+                 let value =
+                     simple_streaming_group_by_value(*arg_col, arg_expr.as_deref(), row, col_map)?;
+-                if matches!(value, SqliteValue::Null) {
+-                    continue;
+-                }
+-                match value {
+-                    SqliteValue::Integer(n) => kbn_step(sum, err, n as f64),
+-                    SqliteValue::Float(f) => kbn_step(sum, err, f),
+-                    other => kbn_step(sum, err, other.to_float()),
+-                }
+-                *count += 1;
++                AvgFunc.step(avg, std::slice::from_ref(&value))?;
+             }
+             (
+                 SimpleStreamingGroupByOutput::MinValue { arg_col, arg_expr },
+@@ -130363,36 +130500,12 @@ fn finalize_simple_streaming_group_by_row(
+             }
+             (
+                 SimpleStreamingGroupByOutput::SumValue { .. },
+-                SimpleStreamingGroupByAccumulator::Sum {
+-                    sum,
+-                    err,
+-                    int_sum,
+-                    has_int,
+-                    all_int,
+-                    int_overflowed,
+-                    saw_value,
+-                },
+-            ) => {
+-                if !*saw_value {
+-                    Ok(SqliteValue::Null)
+-                } else if *all_int && *int_overflowed {
+-                    Err(FrankenError::IntegerOverflow)
+-                } else if *has_int && *all_int {
+-                    Ok(SqliteValue::Integer(*int_sum))
+-                } else {
+-                    Ok(SqliteValue::Float(*sum + *err))
+-                }
+-            }
++                SimpleStreamingGroupByAccumulator::Sum(sum),
++            ) => SumFunc.finalize(sum.clone()),
+             (
+                 SimpleStreamingGroupByOutput::AvgValue { .. },
+-                SimpleStreamingGroupByAccumulator::Avg { sum, err, count },
+-            ) => {
+-                if *count == 0 {
+-                    Ok(SqliteValue::Null)
+-                } else {
+-                    Ok(SqliteValue::Float((*sum + *err) / *count as f64))
+-                }
+-            }
++                SimpleStreamingGroupByAccumulator::Avg(avg),
++            ) => AvgFunc.finalize(avg.clone()),
+             (
+                 _,
+                 SimpleStreamingGroupByAccumulator::Min(value)
+@@ -130426,27 +130539,27 @@ impl<'a> SimpleStreamingGroupBy<'a> {
+         }
+     }
+ 
+-    fn push(&mut self, row_values: Vec<SqliteValue>) -> Result<()> {
++    fn push(&mut self, row_values: &[SqliteValue]) -> Result<()> {
+         let key: Vec<SqliteValue> = self
+             .group_by_exprs
+             .iter()
+-            .map(|expr| eval_join_expr(expr, &row_values, self.col_map))
++            .map(|expr| eval_join_expr(expr, row_values, self.col_map))
+             .collect::<Result<_>>()?;
+         match self.groups.entry(key) {
+             std::collections::btree_map::Entry::Occupied(mut entry) => {
+                 update_simple_streaming_group_by_state(
+                     entry.get_mut(),
+                     self.outputs,
+-                    &row_values,
++                    row_values,
+                     self.col_map,
+                 )?;
+             }
+             std::collections::btree_map::Entry::Vacant(entry) => {
+-                let mut state = SimpleStreamingGroupByState::new(row_values.clone(), self.outputs);
++                let mut state = SimpleStreamingGroupByState::new(row_values.to_vec(), self.outputs);
+                 update_simple_streaming_group_by_state(
+                     &mut state,
+                     self.outputs,
+-                    &row_values,
++                    row_values,
+                     self.col_map,
+                 )?;
+                 entry.insert(state);
+@@ -130506,7 +130619,7 @@ where
+ {
+     let mut grouping = SimpleStreamingGroupBy::new(group_by_exprs, outputs, col_map);
+     for row in raw_rows {
+-        grouping.push(row)?;
++        grouping.push(&row)?;
+     }
+     grouping.finish()
+ }
+diff --git a/crates/fsqlite-core/tests/generate_series_constraints.rs b/crates/fsqlite-core/tests/generate_series_constraints.rs
+index 046d520..9c18382 100644
+--- a/crates/fsqlite-core/tests/generate_series_constraints.rs
++++ b/crates/fsqlite-core/tests/generate_series_constraints.rs
+@@ -7,6 +7,10 @@
+ 
+ use fsqlite_core::connection::Connection;
+ use fsqlite_types::SqliteValue;
++use std::sync::{
++    Arc,
++    atomic::{AtomicUsize, Ordering},
++};
+ 
+ async fn values(conn: &Connection, sql: &str) -> Vec<i64> {
+     conn.query(sql).await.unwrap().iter().map(|row| match row.get(0) {
+@@ -88,3 +92,224 @@ fn series_join_and_aggregate_keep_sql_semantics() {
+         ).await, [1045]);
+     });
+ }
++
++async fn aggregate_rows(conn: &Connection, sql: &str) -> Vec<Vec<SqliteValue>> {
++    conn.query(sql)
++        .await
++        .unwrap_or_else(|error| panic!("{sql}: {error}"))
++        .iter()
++        .map(|row| row.values().to_vec())
++        .collect()
++}
++
++/// GH#530's original reproductions must consume every Cartesian tuple. The
++/// separately run benchmark checks memory/time; these assert exact SQL results.
++#[test]
++fn cartesian_series_aggregates_cover_the_issue_and_product_shapes() {
++    asupersync::test_utils::run_test(|| async {
++        let conn = Connection::open(":memory:").await.unwrap();
++        for (sql, expected) in [
++            (
++                "SELECT count(*) FROM generate_series(1,1000)a,generate_series(1,1000)b",
++                1_000_000,
++            ),
++            (
++                "SELECT sum((a.value-1)*1000+b.value) \
++                 FROM generate_series(1,1000)a,generate_series(1,1000)b",
++                500_000_500_000,
++            ),
++            (
++                "SELECT sum(a.value*b.value) FROM generate_series(1,7)a \
++                 CROSS JOIN generate_series(2,10,2)b",
++                840,
++            ),
++            (
++                "SELECT sum(100*a.value+10*b.value+c.value) FROM generate_series(1,2)a \
++                 JOIN generate_series(1,3)b CROSS JOIN generate_series(1,4)c",
++                4140,
++            ),
++        ] {
++            assert_eq!(values(&conn, sql).await, [expected], "{sql}");
++        }
++    });
++}
++
++#[test]
++fn cartesian_series_aggregates_preserve_hidden_slots_and_parameters() {
++    asupersync::test_utils::run_test(|| async {
++        let conn = Connection::open(":memory:").await.unwrap();
++        assert_eq!(
++            aggregate_rows(
++                &conn,
++                "SELECT sum(a.value),sum(a.start),sum(a.stop),sum(a.step),sum(a.rowid), \
++                 sum(b.value),sum(b.start),sum(b.stop),sum(b.step),sum(b.rowid) \
++                 FROM generate_series(2,8,3)a,generate_series(11,13,2)b",
++            )
++            .await,
++            vec![
++                vec![30, 12, 48, 18, 30, 72, 66, 78, 12, 72]
++                    .into_iter()
++                    .map(SqliteValue::Integer)
++                    .collect::<Vec<_>>()
++            ]
++        );
++        let sql = "SELECT count(*),sum(a.value*b.value) FROM generate_series(1,?1)a, \
++                   generate_series(1,?2)b";
++        let prepared = conn.prepare(sql).await.unwrap();
++        for bound in [7_i64, 0, 1, 9, 0] {
++            let params = [SqliteValue::Integer(bound), SqliteValue::Integer(3)];
++            let expected = vec![
++                SqliteValue::Integer(bound * 3),
++                if bound == 0 {
++                    SqliteValue::Null
++                } else {
++                    SqliteValue::Integer(bound * (bound + 1) * 3)
++                },
++            ];
++            let direct = conn.query_with_params(sql, &params).await.unwrap();
++            let reused = prepared.query_with_params(&params).await.unwrap();
++            assert_eq!(direct.len(), 1);
++            assert_eq!(reused.len(), 1);
++            assert_eq!(direct[0].values(), expected.as_slice(), "bound={bound}");
++            assert_eq!(reused[0].values(), expected.as_slice(), "bound={bound}");
++        }
++    });
++}
++
++#[test]
++fn cartesian_series_empty_inputs_nulls_and_overflow_keep_aggregate_semantics() {
++    asupersync::test_utils::run_test(|| async {
++        let conn = Connection::open(":memory:").await.unwrap();
++        for sources in [
++            "generate_series(1,0)a,generate_series(1,3)b",
++            "generate_series(1,3)a,generate_series(1,0)b",
++            "generate_series(1,3)a,generate_series(NULL,3)b",
++            "generate_series(1,3)a,generate_series(1,0)b,generate_series(1,2)c",
++        ] {
++            let sql = format!(
++                "SELECT count(*),count(a.value),sum(a.value),avg(a.value),min(a.value),max(a.value) \
++                 FROM {sources}"
++            );
++            assert_eq!(
++                aggregate_rows(&conn, &sql).await,
++                vec![vec![
++                    SqliteValue::Integer(0),
++                    SqliteValue::Integer(0),
++                    SqliteValue::Null,
++                    SqliteValue::Null,
++                    SqliteValue::Null,
++                    SqliteValue::Null,
++                ]],
++                "{sql}"
++            );
++            assert!(
++                aggregate_rows(&conn, &format!("{sql} GROUP BY a.value"))
++                    .await
++                    .is_empty()
++            );
++        }
++        assert_eq!(
++            aggregate_rows(
++                &conn,
++                "SELECT count(*),count(NULL),sum(NULL),avg(NULL),min(NULL),max(NULL) \
++                 FROM generate_series(1,2)a,generate_series(1,3)b",
++            )
++            .await,
++            vec![vec![
++                SqliteValue::Integer(6),
++                SqliteValue::Integer(0),
++                SqliteValue::Null,
++                SqliteValue::Null,
++                SqliteValue::Null,
++                SqliteValue::Null,
++            ]]
++        );
++        let overflow = "SELECT sum(9223372036854775807) FROM generate_series(1,1)a, \
++                        generate_series(1,2)b";
++        let error = conn.query(overflow).await.unwrap_err().to_string();
++        assert!(error.contains("overflow"), "{error}");
++        // Failed accumulation must not leak state into a subsequent execution.
++        assert_eq!(
++            values(
++                &conn,
++                "SELECT sum(a.value*b.value) FROM generate_series(1,2)a,generate_series(1,3)b"
++            )
++            .await,
++            [18]
++        );
++    });
++}
++
++#[test]
++fn cartesian_series_limits_apply_to_final_aggregate_rows_in_internal_callers() {
++    asupersync::test_utils::run_test(|| async {
++        let conn = Connection::open(":memory:").await.unwrap();
++        let from = "FROM generate_series(1,2)a,generate_series(1,3)b";
++        for suffix in ["LIMIT 0", "LIMIT 1 OFFSET 1", "LIMIT -1 OFFSET 1"] {
++            let sql = format!("SELECT count(*) {from} {suffix}");
++            assert!(aggregate_rows(&conn, &sql).await.is_empty(), "{sql}");
++        }
++        conn.execute("CREATE TABLE aggregate_out(n INTEGER)")
++            .await
++            .unwrap();
++        for suffix in ["LIMIT 0", "LIMIT 1 OFFSET 1"] {
++            conn.execute(&format!(
++                "WITH unused AS (VALUES(1)) INSERT INTO aggregate_out \
++                 SELECT count(*) {from} {suffix}"
++            ))
++            .await
++            .unwrap();
++        }
++        assert_eq!(
++            values(&conn, "SELECT count(*) FROM aggregate_out").await,
++            [0]
++        );
++        conn.execute(&format!(
++            "WITH unused AS (VALUES(1)) INSERT INTO aggregate_out SELECT count(*) {from} LIMIT 1"
++        ))
++        .await
++        .unwrap();
++        assert_eq!(values(&conn, "SELECT n FROM aggregate_out").await, [6]);
++    });
++}
++
++struct CountSeriesArgument(Arc<AtomicUsize>);
++
++impl fsqlite_func::ScalarFunction for CountSeriesArgument {
++    fn name(&self) -> &str {
++        "count_series_argument"
++    }
++
++    fn num_args(&self) -> i32 {
++        1
++    }
++
++    fn invoke(&self, args: &[SqliteValue]) -> fsqlite_error::Result<SqliteValue> {
++        self.0.fetch_add(1, Ordering::Relaxed);
++        Ok(args[0].clone())
++    }
++}
++
++#[test]
++fn cartesian_series_arguments_are_evaluated_once_per_independent_source() {
++    asupersync::test_utils::run_test(|| async {
++        let conn = Connection::open(":memory:").await.unwrap();
++        let calls = Arc::new(AtomicUsize::new(0));
++        conn.register_nondeterministic_scalar_function(CountSeriesArgument(Arc::clone(&calls)));
++        let sql = "SELECT count(*) FROM generate_series(1,count_series_argument(2))a, \
++                   generate_series(1,count_series_argument(3))b";
++        assert_eq!(values(&conn, sql).await, [6]);
++        assert_eq!(calls.load(Ordering::Relaxed), 2);
++        calls.store(0, Ordering::Relaxed);
++        assert_eq!(
++            values(
++                &conn,
++                "SELECT sum(count_series_argument(a.value+b.value)) FROM generate_series(1,2)a, \
++             generate_series(1,3)b",
++            )
++            .await,
++            [21]
++        );
++        assert_eq!(calls.load(Ordering::Relaxed), 6);
++    });
++}
+diff --git a/crates/fsqlite-core/tests/join_aggregate_lookup_oracle.rs b/crates/fsqlite-core/tests/join_aggregate_lookup_oracle.rs
+index 94f5179..23b43cb 100644
+--- a/crates/fsqlite-core/tests/join_aggregate_lookup_oracle.rs
++++ b/crates/fsqlite-core/tests/join_aggregate_lookup_oracle.rs
+@@ -387,3 +387,413 @@ fn unsupported_multi_join_aggregates_keep_sqlite_semantics() {
+         });
+     }
+ }
++
++/// Unlike the older lookup oracle's display tags, retain storage classes and
++/// complete blobs: equal INTEGER/REAL group keys can select different bare-row
++/// representatives when MIN/MAX is present.
++#[cfg(feature = "ext-json")]
++async fn assert_table_function_agree(
++    f: &Connection,
++    r: &rusqlite::Connection,
++    sql: &str,
++    unordered: bool,
++) {
++    let mut actual = f
++        .query(sql)
++        .await
++        .unwrap_or_else(|error| panic!("franken `{sql}`: {error}"))
++        .iter()
++        .map(|row| row.values().to_vec())
++        .collect::<Vec<_>>();
++    let mut statement = r
++        .prepare(sql)
++        .unwrap_or_else(|error| panic!("stock `{sql}`: {error}"));
++    let width = statement.column_count();
++    let mut expected = statement
++        .query_map([], |row| {
++            (0..width)
++                .map(|column| {
++                    row.get::<_, rusqlite::types::Value>(column)
++                        .map(|value| match value {
++                            rusqlite::types::Value::Null => SqliteValue::Null,
++                            rusqlite::types::Value::Integer(value) => SqliteValue::Integer(value),
++                            rusqlite::types::Value::Real(value) => SqliteValue::Float(value),
++                            rusqlite::types::Value::Text(value) => SqliteValue::Text(value.into()),
++                            rusqlite::types::Value::Blob(value) => SqliteValue::Blob(value.into()),
++                        })
++                })
++                .collect::<rusqlite::Result<Vec<_>>>()
++        })
++        .unwrap()
++        .collect::<rusqlite::Result<Vec<_>>>()
++        .unwrap();
++    if unordered {
++        actual.sort_by_cached_key(|row| format!("{row:?}"));
++        expected.sort_by_cached_key(|row| format!("{row:?}"));
++    }
++    // SqliteValue equality deliberately equates INTEGER 1 and REAL 1.0.
++    // Check discriminants separately so the oracle catches changed storage
++    // classes in grouped representatives and aggregate result values.
++    for (actual_row, expected_row) in actual.iter().zip(&expected) {
++        for (actual_value, expected_value) in actual_row.iter().zip(expected_row) {
++            assert_eq!(
++                std::mem::discriminant(actual_value),
++                std::mem::discriminant(expected_value),
++                "storage class on `{sql}`: actual {actual_value:?}, expected {expected_value:?}"
++            );
++        }
++    }
++    assert_eq!(
++        actual, expected,
++        "typed table-function aggregate mismatch on `{sql}`"
++    );
++}
++
++#[test]
++#[cfg(feature = "ext-json")]
++fn cartesian_table_function_aggregates_match_typed_stock_results() {
++    asupersync::test_utils::run_test(|| async {
++        let f = Connection::open(":memory:").await.unwrap();
++        let r = rusqlite::Connection::open_in_memory().unwrap();
++        for sql in [
++            "SELECT count(*),count(a.value),count(b.value),sum(a.value),avg(a.value), \
++             min(a.value),max(a.value) FROM json_each('[1,null,3,4.5]')a, \
++             json_each('[2,null]')b",
++            "SELECT sum(a.value*b.value),sum(a.value+b.value),count(a.value/b.value) \
++             FROM json_each('[1,null,3]')a CROSS JOIN json_each('[0,2,4]')b",
++            "SELECT count(*),sum(a.value+b.value+c.value) FROM json_each('[1,2]')a \
++             JOIN json_each('[3,4,5]')b CROSS JOIN json_each('[6,7]')c",
++            "SELECT count(*),sum(a.value),avg(a.value),min(a.value),max(a.value) \
++             FROM json_each('[1,2]')a,json_each('[]')b",
++            "SELECT count(*),sum(b.value) FROM json_each('[]')a,json_each('[1,2]')b",
++            "SELECT count(*),sum(a.atom),count(a.parent),sum(b.key) \
++             FROM json_tree('[1,[2,null]]')a,json_each('[3,4]')b",
++            "SELECT count(a.json),count(b.json),min(a.root),max(b.root),sum(a.key),sum(b.key) \
++             FROM json_each('[1,2]')a,json_each('[3,4,5]')b",
++            "SELECT min(a.value),max(a.value),count(a.value) \
++             FROM json_each('[1,1.0,\"a\",null]')a,json_each('[0,1]')b",
++            "SELECT min(CAST(a.value AS BLOB)),max(CAST(a.value AS BLOB)) \
++             FROM json_each('[\"ab\",\"ac\",null]')a,json_each('[0,1]')b",
++            "SELECT sum(a.value),avg(a.value) FROM json_each('[\"2\",3.5,null,\"not numeric\"]')a, \
++             json_each('[0,1]')b",
++            "SELECT count(*),sum(a.value) FROM json_each('[1,2]')a,json_each('[3,4]')b \
++             HAVING count(*)=4 AND sum(a.value)=6",
++            "SELECT count(*) FROM json_each('[1,2]')a,json_each('[3,4]')b HAVING count(*)<0",
++            "SELECT count(*) FROM json_each('[1,2,3]') HAVING count(*)=3",
++            "SELECT count(*) FROM json_each('[]')a,json_each('[1]')b HAVING count(*)=0",
++            "SELECT count(*) FROM json_each('[1,2]')a,json_each('[3,4]')b LIMIT 0",
++            "SELECT count(*) FROM json_each('[1,2]')a,json_each('[3,4]')b LIMIT 1 OFFSET 1",
++        ] {
++            assert_table_function_agree(&f, &r, sql, false).await;
++        }
++        for sql in [
++            "SELECT a.value%2 AS bucket,count(*),sum(a.value*b.value) \
++             FROM json_each('[1,2,3,4]')a,json_each('[2,3]')b GROUP BY bucket",
++            "SELECT a.value,count(*),sum(b.value) FROM json_each('[1,1.0,null,2]')a, \
++             json_each('[3,4]')b GROUP BY a.value",
++            "SELECT a.value,max(a.type='real') FROM json_each('[1,1.0]')a, \
++             json_each('[0]')b GROUP BY a.value",
++            "SELECT a.value,min(a.type='real') FROM json_each('[1.0,1]')a, \
++             json_each('[0]')b GROUP BY a.value",
++            "SELECT a.value,count(*) FROM json_each('[]')a,json_each('[1,2]')b GROUP BY a.value",
++        ] {
++            assert_table_function_agree(&f, &r, sql, true).await;
++        }
++        for sql in [
++            "SELECT a.value%2 AS bucket,count(*),sum(b.value) FROM json_each('[1,2,3,4]')a, \
++             json_each('[3,4]')b GROUP BY bucket HAVING sum(b.value)>10 ORDER BY bucket DESC LIMIT 1",
++            "SELECT a.value,count(*) FROM json_each('[3,1,2]')a,json_each('[0,1]')b \
++             GROUP BY a.value ORDER BY a.value DESC LIMIT 1 OFFSET 1",
++        ] {
++            assert_table_function_agree(&f, &r, sql, false).await;
++        }
++    });
++}
++
++#[test]
++#[cfg(feature = "ext-json")]
++fn cartesian_aggregate_numeric_accumulators_match_stock() {
++    asupersync::test_utils::run_test(|| async {
++        let f = Connection::open(":memory:").await.unwrap();
++        let r = rusqlite::Connection::open_in_memory().unwrap();
++        for json in [
++            "[9007199254740993,1.0,-9007199254740992]",
++            "[-9007199254740992,9007199254740993,1.0]",
++            "[9223372036854775807,1.0,9223372036854775807]",
++            "[9223372036854775807,1,1.0]",
++            "[-9223372036854775808,-1,1.0]",
++            "[1e999,2]",
++            "[1e999,-1e999]",
++            "[\"1x\",\"2.5x\",null,\"not numeric\"]",
++        ] {
++            let single = format!("SELECT sum(value),avg(value) FROM json_each('{json}')");
++            assert_table_function_agree(&f, &r, &single, false).await;
++            for copies in ["[0]", "[0,1]"] {
++                let sql = format!(
++                    "SELECT sum(a.value),avg(a.value) FROM json_each('{json}')a,json_each('{copies}')b"
++                );
++                assert_table_function_agree(&f, &r, &sql, false).await;
++            }
++        }
++        for json in ["[9223372036854775807,1]", "[-9223372036854775808,-1]"] {
++            let from = format!("FROM json_each('{json}')a,json_each('[0]')b");
++            let sum = format!("SELECT sum(a.value) {from}");
++            let error = f.query(&sum).await.unwrap_err().to_string();
++            assert!(error.contains("overflow"), "{error}");
++            let error = r
++                .query_row(&sum, [], |row| row.get::<_, f64>(0))
++                .unwrap_err()
++                .to_string();
++            assert!(error.contains("overflow"), "{error}");
++            assert_table_function_agree(&f, &r, &format!("SELECT avg(a.value) {from}"), false)
++                .await;
++        }
++    });
++}
++
++#[test]
++#[cfg(feature = "ext-json")]
++fn unsupported_cartesian_aggregate_forms_preserve_predicates_and_collations() {
++    asupersync::test_utils::run_test(|| async {
++        let f = Connection::open(":memory:").await.unwrap();
++        let r = rusqlite::Connection::open_in_memory().unwrap();
++        for sql in [
++            "SELECT count(*) FROM json_each('[1]')a,json_each('[1]')b \
++             WHERE a.value=b.value OR json_extract('bad','$')",
++            "SELECT count(*) FROM json_each('[1]')a,json_each('[1]')b \
++             WHERE CASE WHEN a.value=b.value THEN 1 ELSE json_extract('bad','$') END",
++            "SELECT count(*),sum(a.value) FROM json_each('[1,2,3]')a,json_each('[2,3]')b \
++             WHERE a.value IN (SELECT value FROM json_each('[1,3]')) AND b.value>2",
++            "SELECT count(*),sum(b.value) FROM json_each('[1,2]')a \
++             JOIN json_each('[2,3]')b ON a.value=b.value",
++            "SELECT count(*),count(b.value),sum(a.value) FROM json_each('[1,2]')a \
++             LEFT JOIN json_each('[2,3]')b ON a.value=b.value",
++            "SELECT count(*),sum(value) FROM json_each('[1,2]')a JOIN json_each('[2,3]')b USING(value)",
++            "SELECT count(*),sum(b.value) FROM json_each('[[1,2],[3]]')a,json_each(a.value)b",
++            "SELECT count(DISTINCT a.value),sum(DISTINCT a.value) FROM json_each('[1,1,2]')a, \
++             json_each('[3,4]')b",
++            "SELECT count(*) FILTER (WHERE a.value>1),sum(b.value) FILTER (WHERE a.value<2) \
++             FROM json_each('[1,2]')a,json_each('[3,4]')b",
++            "SELECT group_concat(a.value||b.value ORDER BY a.value DESC,b.value) \
++             FROM json_each('[1,2]')a,json_each('[3,4]')b",
++            "SELECT min(a.value COLLATE NOCASE),max(a.value COLLATE NOCASE) \
++             FROM json_each('[\"a\",\"B\",\"A\"]')a,json_each('[0,1]')b",
++            "SELECT a.value COLLATE NOCASE,count(*) FROM json_each('[\"a\",\"B\",\"A\"]')a, \
++             json_each('[0,1]')b GROUP BY a.value COLLATE NOCASE ORDER BY a.value COLLATE NOCASE",
++        ] {
++            assert_table_function_agree(&f, &r, sql, false).await;
++        }
++        for sql in [
++            "SELECT sum(9223372036854775807) FROM json_each('[1,2]')a,json_each('[0]')b",
++            "SELECT count(*) FROM json_each('[1]')a,json_each('[1]')b \
++             WHERE a.value!=b.value OR json_extract('bad','$')",
++        ] {
++            assert!(f.query(sql).await.is_err(), "{sql}");
++            let error = r.query_row(sql, [], |row| row.get::<_, i64>(0));
++            assert!(error.is_err(), "{sql}");
++        }
++        // The existing executor scans independent sources in FROM order, even
++        // after an empty source. Do not silently suppress its later scan error.
++        let malformed = "SELECT count(*) FROM json_each('[]')a,json_each('bad')b";
++        let error = f.query(malformed).await.unwrap_err().to_string();
++        assert!(error.contains("malformed JSON"), "{error}");
++    });
++}
++
++#[cfg(feature = "ext-json")]
++struct ReverseBinary;
++
++#[cfg(feature = "ext-json")]
++impl fsqlite_func::collation::CollationFunction for ReverseBinary {
++    fn name(&self) -> &str {
++        "BINARY"
++    }
++
++    fn compare(&self, left: &[u8], right: &[u8]) -> std::cmp::Ordering {
++        right.cmp(left)
++    }
++}
++
++#[cfg(feature = "ext-json")]
++struct ReplacementSum;
++
++#[cfg(feature = "ext-json")]
++impl fsqlite_func::AggregateFunction for ReplacementSum {
++    type State = i64;
++
++    fn initial_state(&self) -> Self::State {
++        1000
++    }
++
++    fn step(&self, state: &mut Self::State, _args: &[SqliteValue]) -> fsqlite_error::Result<()> {
++        *state += 1;
++        Ok(())
++    }
++
++    fn finalize(&self, state: Self::State) -> fsqlite_error::Result<SqliteValue> {
++        Ok(SqliteValue::Integer(state))
++    }
++
++    fn num_args(&self) -> i32 {
++        1
++    }
++
++    fn name(&self) -> &str {
++        "sum"
++    }
++}
++
++#[test]
++#[cfg(feature = "ext-json")]
++fn cartesian_table_functions_honor_module_aggregate_and_collation_replacements() {
++    asupersync::test_utils::run_test(|| async {
++        let f = Connection::open(":memory:").await.unwrap();
++        f.register_module(
++            "custom_tree",
++            Box::new(fsqlite_func::vtab::module_factory_from::<
++                fsqlite_ext_json::JsonTreeVtab,
++            >()),
++        );
++        f.register_module(
++            "JSON_EACH",
++            Box::new(fsqlite_func::vtab::module_factory_from::<
++                fsqlite_ext_json::JsonTreeVtab,
++            >()),
++        );
++        for name in ["custom_tree", "json_each"] {
++            let sql = format!("SELECT count(*) FROM {name}('[1,2]')a,{name}('[3,4]')b");
++            let rows = f.query(&sql).await.unwrap();
++            assert_eq!(rows[0].values(), &[SqliteValue::Integer(9)], "{sql}");
++        }
++
++        let f = Connection::open(":memory:").await.unwrap();
++        f.register_collation_function(ReverseBinary);
++        let rows = f.query(
++            "SELECT min(a.value),max(a.value) FROM json_each('[\"a\",\"b\"]')a,json_each('[0,1]')b",
++        ).await.unwrap();
++        assert_eq!(
++            rows[0].values(),
++            &[SqliteValue::Text("b".into()), SqliteValue::Text("a".into())]
++        );
++
++        let f = Connection::open(":memory:").await.unwrap();
++        f.register_aggregate_function(ReplacementSum);
++        let rows = f
++            .query("SELECT sum(a.value),count(*) FROM json_each('[1,2]')a,json_each('[3,4,5]')b")
++            .await
++            .unwrap();
++        assert_eq!(
++            rows[0].values(),
++            &[SqliteValue::Integer(1006), SqliteValue::Integer(6)]
++        );
++    });
++}
++
++#[cfg(feature = "ext-json")]
++mod cartesian_callback_regression {
++    use super::{Connection, ReplacementSum, SqliteValue};
++    use asupersync::Cx;
++    use fsqlite_error::{FrankenError, Result};
++    use fsqlite_func::vtab::{
++        ColumnContext, IndexInfo, VirtualTable, VirtualTableCursor, module_factory_from,
++    };
++    use std::cell::RefCell;
++    use std::rc::{Rc, Weak};
++
++    thread_local! {
++        static CALLBACK_CONNECTION: RefCell<Option<Weak<Connection>>> = const { RefCell::new(None) };
++    }
++
++    struct CallbackConnectionGuard;
++
++    impl Drop for CallbackConnectionGuard {
++        fn drop(&mut self) {
++            CALLBACK_CONNECTION.with(|slot| *slot.borrow_mut() = None);
++        }
++    }
++
++    struct RegisterSumOnColumn(bool);
++
++    impl VirtualTable for RegisterSumOnColumn {
++        type Cursor = Self;
++
++        fn connect(_cx: &Cx, _args: &[&str]) -> Result<Self> {
++            Ok(Self(false))
++        }
++
++        fn best_index(&self, _info: &mut IndexInfo) -> Result<()> {
++            Ok(())
++        }
++
++        fn open(&self) -> Result<Self::Cursor> {
++            Ok(Self(false))
++        }
++    }
++
++    impl VirtualTableCursor for RegisterSumOnColumn {
++        fn filter(
++            &mut self,
++            _cx: &Cx,
++            _idx_num: i32,
++            _idx_str: Option<&str>,
++            _args: &[SqliteValue],
++        ) -> Result<()> {
++            self.0 = false;
++            Ok(())
++        }
++
++        fn next(&mut self, _cx: &Cx) -> Result<()> {
++            self.0 = true;
++            Ok(())
++        }
++
++        fn eof(&self) -> bool {
++            self.0
++        }
++
++        fn column(&self, _ctx: &mut ColumnContext, _col: i32) -> Result<()> {
++            let connection = CALLBACK_CONNECTION.with(|slot| {
++                slot.borrow()
++                    .as_ref()
++                    .and_then(Weak::upgrade)
++                    .expect("callback connection must remain live")
++            });
++            connection.register_aggregate_function(ReplacementSum);
++            Ok(())
++        }
++
++        fn rowid(&self) -> Result<i64> {
++            Ok(1)
++        }
++    }
++
++    #[test]
++    fn cartesian_count_does_not_elide_custom_module_registry_callbacks() {
++        asupersync::test_utils::run_test(|| async {
++            let connection = Rc::new(Connection::open(":memory:").await.unwrap());
++            CALLBACK_CONNECTION.with(|slot| {
++                assert!(slot.borrow_mut().replace(Rc::downgrade(&connection)).is_none());
++            });
++            let _guard = CallbackConnectionGuard;
++            connection.register_module(
++                "JSON_EACH",
++                Box::new(module_factory_from::<RegisterSumOnColumn>()),
++            );
++
++            // The general executor observes xColumn even for COUNT(*). A
++            // registry replacement during that callback invalidates the scan.
++            // Admitting this factory by name would mask every column, skip the
++            // callback entirely, and incorrectly return a successful count.
++            let result = connection
++                .query("SELECT count(*) FROM json_each('[1]')a,json_tree('2')b")
++                .await;
++            assert!(matches!(result, Err(FrankenError::SchemaChanged)), "{result:?}");
++
++            let rows = connection
++                .query("SELECT sum(value) FROM json_tree('2')")
++                .await
++                .unwrap();
++            assert_eq!(rows[0].values(), &[SqliteValue::Integer(1001)]);
++        });
++    }
++}
+diff --git a/crates/fsqlite-func/src/agg_builtins.rs b/crates/fsqlite-func/src/agg_builtins.rs
+index e30dc07..3b8339f 100644
+--- a/crates/fsqlite-func/src/agg_builtins.rs
++++ b/crates/fsqlite-func/src/agg_builtins.rs
+@@ -89,6 +89,7 @@ fn aggregate_float(value: f64) -> SqliteValue {
+ // avg(X)
+ // ═══════════════════════════════════════════════════════════════════════════
+ 
++#[derive(Debug, Clone)]
+ pub struct AvgState {
+     sum: SumState,
+     count: i64,
+@@ -360,6 +361,7 @@ impl AggregateFunction for AggMinFunc {
+ /// State for `sum()`: tracks whether all values are integers, the running
+ /// integer sum, and the float sum as fallback.  Uses Kahan compensated
+ /// summation for the float path to match C SQLite's precision.
++#[derive(Debug, Clone)]
+ pub struct SumState {
+     int_sum: i64,
+     float_sum: f64,
