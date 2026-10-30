@@ -1,5 +1,14 @@
 # GH#530: Cartesian aggregate investigation, 2026-10-28
 
+> **2026-10-30 implementation update:** The preserved candidate has been
+> incorporated into production source with compatibility fixes. See the
+> [implementation and partial qualification report](issue-530-streaming-qualification.md)
+> for the committed revision, passing compiler checks and unit suites, and exact
+> remaining native SQL/performance evidence gap. The record below is historical;
+> its descriptions of an unapplied candidate and blocked core compilation refer
+> to the earlier investigation, not the updated source. Its release/stock timings
+> remain separate from any baseline/candidate comparison.
+
 The published FrankenSQLite v0.4.12 binary reproduces the large Cartesian
 aggregate penalty. On this worker, Cartesian COUNT and SUM took about 17.8 times
 their single-series counterparts. Stock SQLite executed the same SQL in the same

@@ -1,0 +1,9 @@
+{
+  "crates/fsqlite-core/src/connection.rs": "f38fd3e80971746f25b01b20096f669bc92943cbb82d0e009a2b3fcd5372acb2",
+  "crates/fsqlite-core/tests/generate_series_constraints.rs": "84f8187dc12c264f1e38b3bb5d2115bc3b24109558051612fb4d1baafc756926",
+  "crates/fsqlite-core/tests/join_aggregate_lookup_oracle.rs": "772285be217797a40271449cbf7aebc0999df850465553675933fd6a4f6e39f1",
+  "crates/fsqlite-ext-json/src/lib.rs": "73a067b273db89cbd0a2449b588d38573d71a7140c949732cc7ac3901a617150",
+  "crates/fsqlite-ext-misc/src/lib.rs": "92f81624c889492a3864f24e54169d141233251a12a7bf5f05936cd517b87020",
+  "crates/fsqlite-func/src/agg_builtins.rs": "2f4bff09ff7c3412e8c1bf8964fcca188beb38ce4a5e9c36e675319c17592507",
+  "crates/fsqlite-func/src/vtab.rs": "1d667b6fe412df31e5383476bf2fd924ee5bc87884f69106b273d81bd43b94b0"
+}

@@ -1,0 +1,8 @@
+{
+  "normalization": "Replace the absolute baseline and candidate repository paths with <repo>; no other text edits.",
+  "identical": true,
+  "baseline_diff_hunks": 446,
+  "candidate_diff_hunks": 446,
+  "baseline_normalized_sha256": "23d9bed053ccf2c9266a2bd3403212b42b544dbfc126b1c1fb9a239bfe8df816",
+  "candidate_normalized_sha256": "23d9bed053ccf2c9266a2bd3403212b42b544dbfc126b1c1fb9a239bfe8df816"
+}

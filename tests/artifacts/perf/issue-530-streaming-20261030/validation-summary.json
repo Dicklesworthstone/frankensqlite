@@ -1,0 +1,130 @@
+{
+  "recorded_utc": "2026-10-30T20:40:54.776758+00:00",
+  "baseline_revision": "f5cf83b283f0655e9b98dac7170a7f3d6b404fbd",
+  "candidate_revision": "b56e7bc7c93d6a04cfefb30cae82ec0a2fe7fcad",
+  "source_sha256": {
+    "crates/fsqlite-core/src/connection.rs": "f38fd3e80971746f25b01b20096f669bc92943cbb82d0e009a2b3fcd5372acb2",
+    "crates/fsqlite-core/tests/generate_series_constraints.rs": "84f8187dc12c264f1e38b3bb5d2115bc3b24109558051612fb4d1baafc756926",
+    "crates/fsqlite-core/tests/join_aggregate_lookup_oracle.rs": "772285be217797a40271449cbf7aebc0999df850465553675933fd6a4f6e39f1",
+    "crates/fsqlite-ext-json/src/lib.rs": "73a067b273db89cbd0a2449b588d38573d71a7140c949732cc7ac3901a617150",
+    "crates/fsqlite-ext-misc/src/lib.rs": "92f81624c889492a3864f24e54169d141233251a12a7bf5f05936cd517b87020",
+    "crates/fsqlite-func/src/agg_builtins.rs": "2f4bff09ff7c3412e8c1bf8964fcca188beb38ce4a5e9c36e675319c17592507",
+    "crates/fsqlite-func/src/vtab.rs": "1d667b6fe412df31e5383476bf2fd924ee5bc87884f69106b273d81bd43b94b0"
+  },
+  "toolchain": "nightly-2026-08-31",
+  "rustc": "1.100.0-nightly (908501772 2026-08-30)",
+  "qualification": {
+    "core_cli_and_six_integration_targets_typecheck": "passed",
+    "connection_level_integration_tests_executed": false,
+    "changed_core_integration_test_functions": 28,
+    "added_core_integration_test_functions": 20,
+    "json_units": {
+      "passed": 228,
+      "ignored": 1
+    },
+    "canonical_aggregate_units": {
+      "passed": 69,
+      "ignored": 1
+    },
+    "vtab_units": {
+      "passed": 18,
+      "ignored": 0
+    },
+    "generate_series_units": {
+      "passed": 20,
+      "ignored": 0
+    },
+    "native_unit_total": {
+      "passed": 335,
+      "ignored": 2
+    },
+    "python_benchmark_protocol": {
+      "passed": 14
+    },
+    "small_changed_rust_files_format": "passed",
+    "source_whitespace": "passed",
+    "workspace_format": "failed; normalized output identical to pristine baseline",
+    "focused_clippy": "failed on existing fsqlite-error decimal_bitwise_operands lint",
+    "workspace_clippy": "stopped by memory resource guard inside asupersync",
+    "workspace_check_all_targets": "interrupted; incomplete",
+    "baseline_cli_produced": false,
+    "candidate_cli_produced": false,
+    "baseline_candidate_timing_measured": false,
+    "baseline_candidate_query_memory_measured": false
+  },
+  "authoritative_final_check": {
+    "command": [
+      "cargo",
+      "check",
+      "--locked",
+      "--offline",
+      "-p",
+      "fsqlite-cli",
+      "-p",
+      "fsqlite-core",
+      "--bin",
+      "fsqlite",
+      "--test",
+      "generate_series_constraints",
+      "--test",
+      "join_aggregate_lookup_oracle",
+      "--test",
+      "gh436_streaming_function_calls",
+      "--test",
+      "json_tvf_oracle",
+      "--test",
+      "table_function_subquery_argument_oracle",
+      "--test",
+      "gh438_insert_select_table_function"
+    ],
+    "cwd": "/workspace/scratch/1e2355381366/frankensqlite",
+    "environment": {
+      "CARGO_HOME": "/workspace/scratch/1e2355381366/issue530-build/cargo",
+      "RUSTUP_HOME": "/workspace/scratch/1e2355381366/issue530-build/rustup",
+      "CARGO_TARGET_DIR": "/workspace/scratch/1e2355381366/issue530-build/target",
+      "CARGO_BUILD_JOBS": "1",
+      "CARGO_INCREMENTAL": "0",
+      "CARGO_PROFILE_DEV_DEBUG": "0",
+      "CARGO_PROFILE_DEV_CODEGEN_UNITS": "256",
+      "CARGO_PROFILE_DEV_LTO": "false",
+      "RUSTFLAGS": "-Zthreads=1 -Cembed-bitcode=no",
+      "RUSTC_WRAPPER": "/workspace/scratch/1e2355381366/issue530-build/rustc_admit.py",
+      "MALLOC_ARENA_MAX": "1"
+    },
+    "started_utc": "2026-10-30T20:34:43.296955+00:00",
+    "max_rss_mib": 4096.0,
+    "timeout_seconds": 300.0,
+    "min_disk_free_mib": 0.0,
+    "elapsed_seconds": 2.00155734999953,
+    "exit_code": 0,
+    "guard_reason": null,
+    "peak_observed_process_group_rss_bytes": 671744,
+    "ended_utc": "2026-10-30T20:34:45.298535+00:00"
+  },
+  "resource_state": {
+    "recorded_utc": "2026-10-30T20:33:15.394108+00:00",
+    "root_filesystem_free_bytes": 16777216,
+    "root_unreserved_free_bytes": 0,
+    "cgroup_memory_limit_bytes": 8589934592,
+    "cgroup_anon_bytes": 255311872,
+    "cgroup_shmem_bytes": 2408181760,
+    "build_target_path": "/dev/shm/issue530-qualification/target",
+    "rustup_path": "/dev/shm/issue530-qualification/rustup",
+    "candidate_cli_exists": false,
+    "baseline_cli_exists": false
+  },
+  "stock_oracle": {
+    "version": "3.53.2",
+    "source_id": "d6e03d8c777cfa2d35e3b60d8ec3e0187f3e9f99d8e2ee9cac695fd6fcdf1a24",
+    "binary_sha256": "9a87551ccdcc3b620cbece12078691532939ab85e6c5d58c357334cb7b193849",
+    "amalgamation_zip_sha256": "8a310d0a16c7a90cacd4c884e70faa51c902afed2a89f63aaa0126ab83558a32"
+  },
+  "notes": [
+    "cargo check establishes compiler/typechecking acceptance, not native linking or execution.",
+    "The source snapshot includes the final formatting corrections.",
+    "No source dependencies, feature sets, SQL assertions or lint gates were weakened.",
+    "Compilation-resource RSS is not query-memory evidence.",
+    "Historical release-versus-stock results are not baseline-versus-candidate evidence.",
+    "The final resource snapshot reports 16 MiB statvfs free including reserved blocks; subsequent repository mkdir failed ENOSPC. Evidence was staged separately for GitHub upload."
+  ]
+}

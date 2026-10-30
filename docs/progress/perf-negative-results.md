@@ -59,6 +59,18 @@ Each entry should include:
   The patch remains unapplied on main. The new benchmark `--memory` mode measures
   retained process RSS separately from peak RSS; neither its passing protocol
   tests nor release/stock observations validate the candidate.
+- 2026-10-30 implementation follow-up: the retained patch was incorporated into
+  production code in
+  [`b56e7bc7c93d6a04cfefb30cae82ec0a2fe7fcad`](https://github.com/Dicklesworthstone/frankensqlite/commit/b56e7bc7c93d6a04cfefb30cae82ec0a2fe7fcad),
+  with additional compatibility corrections and 20 added core integration test
+  functions in total. The final engine, CLI, and six integration targets pass
+  compiler typechecking; 335 prerequisite native unit tests and 14 benchmark
+  protocol tests passed. Native linking remains blocked by the worker's combined
+  memory and storage limits. The core SQL assertions did not execute, neither
+  benchmark executable exists, and no candidate speedup or query-RSS reduction
+  is established. The [dated qualification report](issue-530-streaming-qualification.md)
+  and its raw-log archive supersede the earlier unapplied/compiler-blocked status
+  while preserving the runtime/performance gap and conservative admission limits.
 
 ## 2026-09-19 - Insufficient for HFDT persistence: index-extrema EXISTS exclusion (hfdt-gbou9l)
 
