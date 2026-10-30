@@ -112,6 +112,7 @@ use fsqlite_ext_json::{JSON_TABLE_COLUMN_NAMES, JsonEachVtab, JsonTreeVtab};
 use fsqlite_ext_misc::GenerateSeriesTable;
 #[cfg(feature = "ext-rtree")]
 use fsqlite_ext_rtree::{RtreeGeometry, RtreeVirtualTable};
+use fsqlite_func::agg_builtins::{AvgFunc, AvgState, SumFunc, SumState};
 use fsqlite_func::builtins::{
     ChangeTrackingState, case_sensitive_like_active, get_change_tracking_state,
     reset_statement_now, set_case_sensitive_like, set_change_tracking_state,
@@ -123,8 +124,8 @@ use fsqlite_func::vtab::{
     VirtualTable, VirtualTableCursor, VtabModuleFactory, module_factory_from,
 };
 use fsqlite_func::{
-    ApplicationFunctionKind, BuiltinFunctionFamily, ErasedWindowFunction, FunctionArity,
-    FunctionRegistry, ResolvedScalarFunction, ScalarSchemaSafety,
+    AggregateFunction, ApplicationFunctionKind, BuiltinFunctionFamily, ErasedWindowFunction,
+    FunctionArity, FunctionRegistry, ResolvedScalarFunction, ScalarSchemaSafety,
     builtin_function_surface_inventory, get_last_changes, get_last_insert_rowid, get_total_changes,
     sqlite_compile_options,
 };
@@ -39931,7 +39932,34 @@ impl Connection {
             let rewritten_statement = self.rewrite_statement_bare_pragma_table_functions(statement);
             let statement: &Statement = rewritten_statement.as_ref();
             // bd-cpa8b: `*` leaves out a table-valued function's HIDDEN columns.
-            let star_expanded_statement = expand_statement_hidden_table_function_stars(statement);
+            // Expanding a later source can replace an earlier source's module.
+            // Per-factory validation cannot establish that the entire rewritten
+            // projection still belongs to one registry generation. Retry from
+            // the original stars, never from a partially expanded projection.
+            let mut star_expanded_statement = None;
+            for attempt in 0..FUNCTION_REGISTRY_STABILITY_ATTEMPTS {
+                let star_registry_generation = self.function_registry_generation();
+                // A Weak snapshot compares registry identity without delaying
+                // an application's function destructor across the callback.
+                let star_functions = Arc::downgrade(&self.func_registry.borrow());
+                let expanded = expand_statement_hidden_table_function_stars(self, statement);
+                if self.function_registry_generation() == star_registry_generation {
+                    star_expanded_statement = expanded;
+                    break;
+                }
+                if attempt + 1 == FUNCTION_REGISTRY_STABILITY_ATTEMPTS {
+                    return Err(FrankenError::SchemaChanged);
+                }
+                if !star_functions.ptr_eq(&Arc::downgrade(&self.func_registry.borrow()))
+                    && !statement_contains_deferred_values(statement)
+                {
+                    // As in the validation loop below, a borrowed input may
+                    // contain a VALUES donor frozen by an enclosing statement.
+                    // Module-only changes can retry its projection, but a new
+                    // scalar registry cannot safely reuse that frozen donor.
+                    return Err(FrankenError::SchemaChanged);
+                }
+            }
             let statement: &Statement = star_expanded_statement.as_ref().unwrap_or(statement);
             // bd-l6-view-insert-subquery-numbering-2qtn7: globally number a DML
             // statement's `?` placeholders (recursing into subqueries) BEFORE the
@@ -41663,6 +41691,8 @@ impl Connection {
                         } else {
                             Vec::new()
                         };
+                        let hidden_columns =
+                            self.hidden_table_function_column_indices(&join_sources, &col_map);
                         let mut output_index = 0;
                         for col in columns {
                             let output_width = match col {
@@ -41671,7 +41701,9 @@ impl Connection {
                                     .iter()
                                     .enumerate()
                                     .filter(|(index, (_, _, hidden))| {
-                                        !hidden && !using_skip_indices.contains(index)
+                                        !hidden
+                                            && !hidden_columns.contains(index)
+                                            && !using_skip_indices.contains(index)
                                     })
                                     .count(),
                                 ResultColumn::TableStar(qualifier) => self
@@ -46873,6 +46905,7 @@ impl Connection {
                 scan_cache_key: join_scan_cache_key(name),
                 table_name: name.name.clone(),
                 alias: alias.clone(),
+                hidden_columns: HashSet::new(),
                 hidden_rowid_projection: join_hidden_rowid_projection(
                     &col_names,
                     self.join_table_supports_hidden_rowid_for_binding(name),
@@ -54132,6 +54165,10 @@ impl Connection {
     ) -> Vec<String> {
         let mut names =
             self.table_or_subquery_result_column_names(&from.source, visible_ctes, active_ctes);
+        // NATURAL matches declared visible source columns, including a right
+        // column previously coalesced into a hidden left USING column. That
+        // column remains a matching candidate even though `*` omits it.
+        let mut natural_names = names.clone();
         for join in &from.joins {
             let right_names =
                 self.table_or_subquery_result_column_names(&join.table, visible_ctes, active_ctes);
@@ -54139,7 +54176,7 @@ impl Connection {
                 right_names
                     .iter()
                     .filter(|right_name| {
-                        names
+                        natural_names
                             .iter()
                             .any(|left_name| left_name.eq_ignore_ascii_case(right_name))
                     })
@@ -54150,6 +54187,7 @@ impl Connection {
             } else {
                 Vec::new()
             };
+            natural_names.extend(right_names.iter().cloned());
             names.extend(right_names.into_iter().filter(|right_name| {
                 !using_cols
                     .iter()
@@ -54186,8 +54224,22 @@ impl Connection {
     }
 
     fn table_function_result_column_names(&self, name: &str) -> Option<Vec<String>> {
+        self.table_function_column_metadata(name)
+            .map(|(columns, _)| columns)
+    }
+
+    /// Resolve declared columns and their visibility from one live factory
+    /// snapshot. Hidden declarations keep their xColumn indices; unlike the
+    /// synthetic rowid slot, they remain ordinary bindable column names.
+    fn table_function_column_metadata(
+        &self,
+        name: &str,
+    ) -> Option<(Vec<String>, HashSet<String>)> {
         if let Some(columns) = pragma_table_function_columns(name) {
-            return Some(columns.iter().map(|column| (*column).to_owned()).collect());
+            return Some((
+                columns.iter().map(|column| (*column).to_owned()).collect(),
+                HashSet::new(),
+            ));
         }
         let module_key = name.to_ascii_uppercase();
         let factory_args = [name.to_owned(), "main".to_owned(), name.to_owned()];
@@ -54201,14 +54253,22 @@ impl Connection {
                 modules.get(&module_key).cloned()
             };
             let Some(factory) = factory else {
-                return table_function_column_names(name)
-                    .map(|columns| columns.iter().map(|column| (*column).to_owned()).collect());
+                return table_function_column_names(name).map(|columns| {
+                    (
+                        columns.iter().map(|column| (*column).to_owned()).collect(),
+                        HashSet::new(),
+                    )
+                });
             };
-            let columns = self
+            let (columns, hidden) = self
                 .invoke_live_vtab_callback("xColumnInfo", || {
-                    Ok(factory.column_info(&factory_arg_refs))
+                    Ok((
+                        factory.column_info(&factory_arg_refs),
+                        factory.hidden_column_names(&factory_arg_refs),
+                    ))
                 })
-                .ok()?
+                .ok()?;
+            let columns = columns
                 .into_iter()
                 .map(|(column_name, _)| column_name)
                 .collect::<Vec<_>>();
@@ -54221,13 +54281,66 @@ impl Connection {
             if !factory_is_still_current {
                 continue;
             }
-            if !columns.is_empty() {
-                return Some(columns);
-            }
-            return table_function_column_names(name)
-                .map(|columns| columns.iter().map(|column| (*column).to_owned()).collect());
+            let columns = if columns.is_empty() {
+                table_function_column_names(name)?
+                    .iter()
+                    .map(|column| (*column).to_owned())
+                    .collect()
+            } else {
+                columns
+            };
+            let hidden = hidden
+                .into_iter()
+                .filter(|name| columns.iter().any(|column| column.eq_ignore_ascii_case(name)))
+                .map(|name| name.to_ascii_lowercase())
+                .collect();
+            return Some((columns, hidden));
         }
         None
+    }
+
+    fn source_hidden_column_names(&self, source: &TableOrSubquery) -> HashSet<String> {
+        match source {
+            TableOrSubquery::TableFunction { name, .. } => self
+                .table_function_column_metadata(name)
+                .map_or_else(HashSet::new, |(_, hidden)| hidden),
+            _ => HashSet::new(),
+        }
+    }
+
+    fn hidden_table_function_column_indices(
+        &self,
+        sources: &[&TableOrSubquery],
+        col_map: &[(String, String, bool)],
+    ) -> HashSet<usize> {
+        let mut hidden_indices = HashSet::new();
+        let mut offset = 0;
+        for source in sources {
+            if let TableOrSubquery::TableFunction { name, .. } = source
+                && let Some((columns, hidden)) = self.table_function_column_metadata(name)
+            {
+                for (index, column) in columns.iter().enumerate() {
+                    if hidden.contains(&column.to_ascii_lowercase()) {
+                        hidden_indices.insert(offset + index);
+                    }
+                }
+                offset += columns.len();
+                if col_map.get(offset).is_some_and(|(_, _, rowid)| *rowid) {
+                    offset += 1;
+                }
+            } else if let Some(label) = source_projection_label(source).or_else(|| {
+                matches!(source, TableOrSubquery::Subquery { alias: None, .. })
+                    .then(|| "subquery".to_owned())
+            }) {
+                while col_map
+                    .get(offset)
+                    .is_some_and(|(table, _, _)| table.eq_ignore_ascii_case(&label))
+                {
+                    offset += 1;
+                }
+            }
+        }
+        hidden_indices
     }
 
     fn table_or_subquery_result_column_names(
@@ -54283,7 +54396,13 @@ impl Connection {
                 self.select_result_column_names(query, visible_ctes, active_ctes),
             ),
             TableOrSubquery::TableFunction { name, .. } => self
-                .table_function_result_column_names(name)
+                .table_function_column_metadata(name)
+                .map(|(columns, hidden)| {
+                    columns
+                        .into_iter()
+                        .filter(|column| !hidden.contains(&column.to_ascii_lowercase()))
+                        .collect()
+                })
                 .unwrap_or_else(|| vec![name.clone()]),
             TableOrSubquery::ParenJoin(from) => {
                 self.from_clause_result_column_names(from, visible_ctes, active_ctes)
@@ -54318,12 +54437,14 @@ impl Connection {
         if matching_labels.is_empty() {
             return Vec::new();
         }
+        let hidden_columns = self.hidden_table_function_column_indices(sources, col_map);
 
         col_map
             .iter()
             .enumerate()
-            .filter(|(_, (table, _, hidden))| {
+            .filter(|(index, (table, _, hidden))| {
                 !*hidden
+                    && !hidden_columns.contains(index)
                     && matching_labels
                         .iter()
                         .any(|label| label.eq_ignore_ascii_case(table))
@@ -86600,7 +86721,7 @@ impl Connection {
         without_rowid
     }
 
-    /// GH#420: stream a lone table-valued function into simple aggregates.
+    /// GH#420 / GH#530: stream table-valued functions into simple aggregates.
     ///
     /// `SELECT sum(value) FROM generate_series(1, 1000000)` and its grouped and
     /// filtered forms fold each cursor row straight into the streaming
@@ -86610,7 +86731,11 @@ impl Connection {
     /// WHERE, the GROUP BY and any argument that is not a bare column must be
     /// plain expressions (no subquery, aggregate, window function or
     /// collation). When the query reads only bare columns, the scan fetches
-    /// just those.
+    /// just those. Independent, unconstrained products of builtin table
+    /// functions retain each input once and fold their Cartesian tuples through
+    /// one reusable row. They never materialize the product. Their admission is
+    /// deliberately narrower than the lone-source lane: predicates, lateral
+    /// arguments and user callbacks retain the general executor.
     #[allow(clippy::too_many_lines)]
     async fn try_execute_streaming_table_function_aggregate(
         &self,
@@ -86619,6 +86744,7 @@ impl Connection {
         col_map: &[(String, String, bool)],
     ) -> Result<Option<Vec<Row>>> {
         let SelectCore::Select {
+            distinct,
             columns,
             from: Some(from),
             where_clause,
@@ -86633,24 +86759,120 @@ impl Connection {
         let TableOrSubquery::TableFunction { name, args, .. } = &from.source else {
             return Ok(None);
         };
+        let is_product = !from.joins.is_empty();
         let plain_clause = |expr: &Expr| {
             !expr_has_any_subquery(expr)
                 && !expr_contains_agg(expr)
                 && !expr_has_window_function(expr)
                 && join_expr_effective_collation(expr, col_map).is_none()
+                && (!is_product || self.streaming_table_function_expr_supported(expr))
         };
         if select.with.is_some()
             || !select.body.compounds.is_empty()
             || !select.order_by.is_empty()
-            || !from.joins.is_empty()
+            // Internal INSERT/CTE callers can leave these attached; an early
+            // return must not bypass their final DISTINCT or LIMIT/OFFSET.
+            || *distinct != Distinctness::All
+            || select.limit.is_some()
+            || from.joins.iter().any(|join| {
+                !matches!(join.join_type.kind, JoinKind::Inner | JoinKind::Cross)
+                    || join.join_type.natural
+                    || join.constraint.is_some()
+            })
             || !windows.is_empty()
             || self.scalar_function_overridden.get()
             || self.custom_aggregate_registered.get()
+            || !lock_unpoisoned(self.collation_registry.as_ref())
+                .uses_builtin_implementation("BINARY")
+            // The general join WHERE evaluator short-circuits truth contexts;
+            // eval_join_predicate below is a value evaluator. Do not change
+            // which predicate arms, subqueries or errors are observed.
+            || (is_product && where_clause.is_some())
             || where_clause
                 .as_deref()
                 .is_some_and(|predicate| !plain_clause(predicate))
         {
             return Ok(None);
+        }
+
+        // Prove every source and its layout before evaluating any arguments.
+        // A name alone is insufficient: an application may replace a builtin
+        // module, and its metadata/scan callbacks may replace functions or
+        // collations. Only unchanged factories with known layouts can skip
+        // unneeded column callbacks and safely reuse the aggregate plan.
+        let mut product_sources = Vec::new();
+        if is_product {
+            let modules = self.vtab_modules.borrow();
+            let defaults = shared_default_vtab_module_registry();
+            let mut offset = 0;
+            for source in std::iter::once(&from.source)
+                .chain(from.joins.iter().map(|join| &join.table))
+            {
+                let TableOrSubquery::TableFunction { name, args, alias } = source else {
+                    return Ok(None);
+                };
+                let key = name.to_ascii_uppercase();
+                let (Some(factory), Some(builtin), Some(column_names)) = (
+                    modules.get(&key),
+                    defaults.get(&key),
+                    table_function_column_names(name),
+                ) else {
+                    return Ok(None);
+                };
+                if !Arc::ptr_eq(factory, builtin)
+                    || args.iter().any(|arg| {
+                        expr_references_any_column(arg)
+                            || !self.streaming_table_function_expr_supported(arg)
+                    })
+                {
+                    return Ok(None);
+                }
+                // Arity is a prepare-time error even when an earlier source
+                // is empty. Check it without evaluating the argument values,
+                // whose errors belong to the nested-loop execution order.
+                let max_args = match key.as_str() {
+                    "GENERATE_SERIES" => {
+                        if args.is_empty() {
+                            return Err(FrankenError::FunctionError(
+                                "generate_series: start argument is required".to_owned(),
+                            ));
+                        }
+                        3
+                    }
+                    "JSON_EACH" | "JSON_TREE" => 2,
+                    // Diagnostic and future builtin modules have not proved
+                    // the same argument and empty-scan contract.
+                    _ => return Ok(None),
+                };
+                if args.len() > max_args {
+                    return Err(FrankenError::FunctionError(format!(
+                        "too many arguments on {name}() - max {max_args}",
+                    )));
+                }
+                let label = alias.as_deref().unwrap_or(name);
+                let declared_end = offset + column_names.len();
+                let Some(declared_columns) = col_map.get(offset..declared_end) else {
+                    return Ok(None);
+                };
+                if !declared_columns.iter().zip(column_names).all(
+                    |((table, column, hidden), expected)| {
+                        table.eq_ignore_ascii_case(label)
+                            && column.eq_ignore_ascii_case(expected)
+                            && !hidden
+                    },
+                ) {
+                    return Ok(None);
+                }
+                let include_hidden_rowid = col_map.get(declared_end).is_some_and(
+                    |(table, _, hidden)| table.eq_ignore_ascii_case(label) && *hidden,
+                );
+                let end = declared_end + usize::from(include_hidden_rowid);
+                product_sources.push((name, args, offset..end, include_hidden_rowid));
+                offset = end;
+            }
+            if offset != col_map.len() {
+                return Ok(None);
+            }
         }
         let mut group_by_exprs = group_by.clone();
         resolve_group_by_aliases(&mut group_by_exprs, columns, col_map);
@@ -86708,6 +86930,16 @@ impl Connection {
                     }
                     // An expression argument may read any column.
                     argument if plain_clause(argument) => {
+                        // The general executor evaluates groups in key order.
+                        // Scalar calls can fail, so interleaving them across
+                        // groups could change which error is observed first.
+                        // Keep potentially throwing grouped arguments there.
+                        if is_product
+                            && !group_by_exprs.is_empty()
+                            && expr_contains_function_call(argument)
+                        {
+                            return Ok(None);
+                        }
                         needed_columns.fill(true);
                         (None, Some(Box::new(argument.clone())))
                     }
@@ -86727,6 +86959,32 @@ impl Connection {
                 _ => return Ok(None),
             };
             outputs.push(output);
+        }
+
+        // Equal grouping keys need not have the same storage class (1 and
+        // 1.0 compare equal). MIN/MAX can choose a different representative
+        // row for a projected key; this accumulator keeps the first one.
+        if outputs
+            .iter()
+            .any(|output| matches!(output, SimpleStreamingGroupByOutput::Plain(_)))
+            && outputs.iter().any(|output| {
+                matches!(
+                    output,
+                    SimpleStreamingGroupByOutput::MinValue { .. }
+                        | SimpleStreamingGroupByOutput::MaxValue { .. }
+                )
+            })
+        {
+            return Ok(None);
+        }
+
+        if is_product {
+            // Resolve nested column references even if no tuple will reach
+            // the evaluator. An empty product must not conceal a missing or
+            // ambiguous column in an aggregate or grouping expression. Do
+            // this after admission and after dropping the module-map borrow:
+            // unsupported subqueries can invoke application metadata callbacks.
+            self.validate_select_column_references(select)?;
         }
 
         // Evaluate the WHERE and GROUP BY terms in the same collation and
@@ -86780,6 +87038,72 @@ impl Connection {
             JoinExprBindingsGuard::push(bindings)
         });
         let mut grouping = SimpleStreamingGroupBy::new(&group_by_exprs, &outputs, col_map);
+        if is_product {
+            let mut inputs = Vec::with_capacity(product_sources.len());
+            for (name, args, columns, include_hidden_rowid) in &product_sources {
+                let mut rows = Vec::new();
+                self.scan_table_function_rows(
+                    name,
+                    args,
+                    params,
+                    *include_hidden_rowid,
+                    Some(&needed_columns[columns.clone()]),
+                    &mut |row| {
+                        rows.push(row);
+                        Ok(())
+                    },
+                )
+                .await?;
+                // SQLite never opens a later independent cursor when a
+                // preceding source is empty. In particular, its argument and
+                // JSON parse errors must stay unevaluated. Source arity and
+                // column names have already been checked above.
+                if rows.is_empty() {
+                    return self.with_fallback_function_registry(|| grouping.finish().map(Some));
+                }
+                inputs.push(rows);
+            }
+            let mut row = vec![SqliteValue::Null; col_map.len()];
+            let mut positions = vec![0; inputs.len()];
+            for (rows, (_, _, columns, _)) in inputs.iter().zip(&product_sources) {
+                row[columns.clone()].clone_from_slice(&rows[0]);
+            }
+            let cx = self.op_cx()?;
+            let mut rows_until_checkpoint = 0_u16;
+            self.with_fallback_function_registry(|| -> Result<()> {
+                loop {
+                    // Once the source cursors have closed, tuple enumeration
+                    // must still observe cancellation and operation budgets.
+                    if rows_until_checkpoint == 0 {
+                        cx.checkpoint().map_err(|_| FrankenError::Interrupt)?;
+                        rows_until_checkpoint = 256;
+                    }
+                    rows_until_checkpoint -= 1;
+                    grouping.push(&row)?;
+                    // Odometer order is the same left-to-right nested-loop
+                    // order as execute_single_join. Copy only sources whose
+                    // position changed, without cloning an entire tuple.
+                    let mut source = inputs.len();
+                    loop {
+                        if source == 0 {
+                            return Ok(());
+                        }
+                        source -= 1;
+                        positions[source] += 1;
+                        let carry = positions[source] == inputs[source].len();
+                        if carry {
+                            positions[source] = 0;
+                        }
+                        row[product_sources[source].2.clone()]
+                            .clone_from_slice(&inputs[source][positions[source]]);
+                        if !carry {
+                            break;
+                        }
+                    }
+                }
+            })?;
+            return self.with_fallback_function_registry(|| grouping.finish().map(Some));
+        }
         self.scan_table_function_rows(
             name,
             args,
@@ -86793,12 +87117,52 @@ impl Connection {
                     {
                         return Ok(());
                     }
-                    grouping.push(row)
+                    grouping.push(&row)
                 })
             },
         )
         .await?;
         grouping.finish().map(Some)
+    }
+
+    /// Expressions whose evaluation can be interleaved across streaming
+    /// accumulators without invoking application state or a different truth/
+    /// subquery evaluator. Keep this proof structural and fail closed for new
+    /// expression forms; the general aggregate executor remains authoritative.
+    fn streaming_table_function_expr_supported(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Literal(..) | Expr::Column(..) => true,
+            Expr::BinaryOp { left, op, right, .. } => {
+                !matches!(op, BinaryOp::And | BinaryOp::Or)
+                    && self.streaming_table_function_expr_supported(left)
+                    && self.streaming_table_function_expr_supported(right)
+            }
+            Expr::UnaryOp { expr, .. }
+            | Expr::Cast { expr, .. }
+            | Expr::IsNull { expr, .. } => self.streaming_table_function_expr_supported(expr),
+            Expr::FunctionCall {
+                name,
+                args: args @ FunctionArgs::List(values),
+                distinct: false,
+                order_by,
+                filter: None,
+                over: None,
+                ..
+            } => {
+                order_by.is_empty()
+                    && !self.function_call_is_current_aggregate(name, args)
+                    && selected_function_is_builtin(self, name, args, None)
+                    && self
+                        .func_registry
+                        .borrow()
+                        .scalar_is_deterministic(name, aggregate_args_len_for_lookup(args))
+                        == Some(true)
+                    && values
+                        .iter()
+                        .all(|value| self.streaming_table_function_expr_supported(value))
+            }
+            _ => false,
+        }
     }
 
     /// Handle GROUP BY + JOIN by materializing the join first, then applying
@@ -86942,13 +87306,19 @@ impl Connection {
 
         // Step 4a: Expand Star / TableStar into explicit column references
         // using the col_map so GROUP BY can process them individually.
+        let hidden_columns = self.hidden_table_function_column_indices(&join_sources, &col_map);
         let expanded_columns: Vec<ResultColumn> = columns
             .iter()
             .flat_map(|col| match col {
                 ResultColumn::Star => col_map
                     .iter()
-                    .filter(|(_, _, hidden)| !*hidden)
-                    .map(|(tbl, c, _)| ResultColumn::Expr {
+                    .enumerate()
+                    .filter(|(index, (_, _, hidden))| {
+                        !*hidden
+                            && !hidden_columns.contains(index)
+                            && !using_skip_indices.contains(index)
+                    })
+                    .map(|(_, (tbl, c, _))| ResultColumn::Expr {
                         expr: Expr::Column(
                             ColumnRef::qualified(tbl.clone(), c.clone()),
                             Span::new(0, 0),
@@ -87914,10 +88284,15 @@ impl Connection {
         offset += primary_width;
         order_keys.push(JoinRowOrderKey::ScanOrder { end: offset });
 
-        let mut left_visible_names: Vec<String> = primary_names;
+        let primary_hidden = self.source_hidden_column_names(&from.source);
+        let mut left_visible_names = primary_names
+            .into_iter()
+            .filter(|name| !primary_hidden.contains(&name.to_ascii_lowercase()))
+            .collect::<Vec<_>>();
 
         for join in &from.joins {
             let right_names = self.source_column_names_for_join_layout(&join.table, &visible_ctes);
+            let right_hidden = self.source_hidden_column_names(&join.table);
             let right_hidden_rowid = self
                 .hidden_rowid_projection_for_source(&join.table, &right_names)
                 .is_some();
@@ -87933,9 +88308,10 @@ impl Connection {
                 right_names
                     .iter()
                     .filter(|right_name| {
-                        left_visible_names
-                            .iter()
-                            .any(|left_name| left_name.eq_ignore_ascii_case(right_name))
+                        !right_hidden.contains(&right_name.to_ascii_lowercase())
+                            && left_visible_names
+                                .iter()
+                                .any(|left_name| left_name.eq_ignore_ascii_case(right_name))
                     })
                     .cloned()
                     .collect()
@@ -87976,7 +88352,11 @@ impl Connection {
             }
 
             // Right columns become visible to subsequent joins.
-            left_visible_names.extend(right_names);
+            left_visible_names.extend(
+                right_names
+                    .into_iter()
+                    .filter(|name| !right_hidden.contains(&name.to_ascii_lowercase())),
+            );
         }
 
         if !order_keys
@@ -88098,6 +88478,11 @@ impl Connection {
         };
         let mut left_visible_names =
             self.source_column_names_for_join_layout(&from.source, &visible_ctes);
+        let mut left_natural_names = self.table_or_subquery_result_column_names(
+            &from.source,
+            &visible_ctes,
+            &mut Vec::new(),
+        );
         // Stock `sqlite3ProcessJoin`: with a RIGHT or FULL JOIN in the FROM, a
         // USING term coalesces every left source that has the column, so each
         // of them after the first must itself be joined USING that column.
@@ -88107,12 +88492,21 @@ impl Connection {
             .joins
             .iter()
             .any(|join| matches!(join.join_type.kind, JoinKind::Right | JoinKind::Full));
-        let mut left_sources: Vec<(Vec<String>, Vec<String>)> = Vec::new();
+        let mut left_sources: Vec<(Vec<String>, Vec<String>, HashSet<String>)> = Vec::new();
         if coalesces {
-            left_sources.push((left_visible_names.clone(), Vec::new()));
+            left_sources.push((
+                left_visible_names.clone(),
+                Vec::new(),
+                self.source_hidden_column_names(&from.source),
+            ));
         }
         for join in &from.joins {
             let right_names = self.source_column_names_for_join_layout(&join.table, &visible_ctes);
+            let right_natural_names = self.table_or_subquery_result_column_names(
+                &join.table,
+                &visible_ctes,
+                &mut Vec::new(),
+            );
             if !join.join_type.natural
                 && let Some(JoinConstraint::Using(cols)) = join.constraint.as_ref()
             {
@@ -88130,10 +88524,10 @@ impl Connection {
             }
             if coalesces {
                 let using_cols: Vec<String> = if join.join_type.natural {
-                    right_names
+                    right_natural_names
                         .iter()
                         .filter(|name| {
-                            left_visible_names
+                            left_natural_names
                                 .iter()
                                 .any(|left| left.eq_ignore_ascii_case(name))
                         })
@@ -88147,9 +88541,12 @@ impl Connection {
                 for col in &using_cols {
                     let ambiguous = left_sources
                         .iter()
-                        .filter(|(names, _)| names.iter().any(|n| n.eq_ignore_ascii_case(col)))
+                        .filter(|(names, _, hidden)| {
+                            (!join.join_type.natural || !hidden.contains(&col.to_ascii_lowercase()))
+                                && names.iter().any(|n| n.eq_ignore_ascii_case(col))
+                        })
                         .skip(1)
-                        .any(|(_, joined_using)| {
+                        .any(|(_, joined_using, _)| {
                             !joined_using.iter().any(|n| n.eq_ignore_ascii_case(col))
                         });
                     if ambiguous {
@@ -88158,9 +88555,14 @@ impl Connection {
                         )));
                     }
                 }
-                left_sources.push((right_names.clone(), using_cols));
+                left_sources.push((
+                    right_names.clone(),
+                    using_cols,
+                    self.source_hidden_column_names(&join.table),
+                ));
             }
             left_visible_names.extend(right_names);
+            left_natural_names.extend(right_natural_names);
         }
         Ok(())
     }
@@ -88207,17 +88609,24 @@ impl Connection {
             };
 
         let (_, primary_names) = record_source(&from.source, &mut offset);
-        left_visible_names.extend(primary_names);
+        let primary_hidden = self.source_hidden_column_names(&from.source);
+        left_visible_names.extend(
+            primary_names
+                .into_iter()
+                .filter(|name| !primary_hidden.contains(&name.to_ascii_lowercase())),
+        );
 
         for join in &from.joins {
             let (right_start, right_names) = record_source(&join.table, &mut offset);
+            let right_hidden = self.source_hidden_column_names(&join.table);
             let using_cols: Vec<String> = if join.join_type.natural {
                 right_names
                     .iter()
                     .filter(|right_name| {
-                        left_visible_names
-                            .iter()
-                            .any(|left_name| left_name.eq_ignore_ascii_case(right_name))
+                        !right_hidden.contains(&right_name.to_ascii_lowercase())
+                            && left_visible_names
+                                .iter()
+                                .any(|left_name| left_name.eq_ignore_ascii_case(right_name))
                     })
                     .cloned()
                     .collect()
@@ -88232,7 +88641,8 @@ impl Connection {
                     .any(|using_col| using_col.eq_ignore_ascii_case(right_name))
                 {
                     skip.insert(right_start + i);
-                } else {
+                }
+                if !right_hidden.contains(&right_name.to_ascii_lowercase()) {
                     left_visible_names.push(right_name.clone());
                 }
             }
@@ -88295,24 +88705,35 @@ impl Connection {
         };
 
         let (primary_start, primary_names) = record_source(&from.source, &mut offset);
+        let primary_hidden = self.source_hidden_column_names(&from.source);
+        let mut natural_names = primary_names
+            .iter()
+            .filter(|name| !primary_hidden.contains(&name.to_ascii_lowercase()))
+            .cloned()
+            .collect::<Vec<_>>();
         let mut visible = primary_names
             .into_iter()
             .enumerate()
             .filter_map(|(index, name)| {
-                column_projection(primary_start + index).map(|projection| (name, projection))
+                column_projection(primary_start + index).map(|projection| {
+                    let hidden = primary_hidden.contains(&name.to_ascii_lowercase());
+                    (name, projection, hidden)
+                })
             })
             .collect::<Vec<_>>();
         let mut projections = HashMap::new();
 
         for join in &from.joins {
             let (right_start, right_names) = record_source(&join.table, &mut offset);
+            let right_hidden = self.source_hidden_column_names(&join.table);
             let using_columns = if join.join_type.natural {
                 right_names
                     .iter()
                     .filter(|right_name| {
-                        visible
-                            .iter()
-                            .any(|(left_name, _)| left_name.eq_ignore_ascii_case(right_name))
+                        !right_hidden.contains(&right_name.to_ascii_lowercase())
+                            && natural_names
+                                .iter()
+                                .any(|left_name| left_name.eq_ignore_ascii_case(right_name))
                     })
                     .cloned()
                     .collect::<Vec<_>>()
@@ -88321,6 +88742,12 @@ impl Connection {
             } else {
                 Vec::new()
             };
+            natural_names.extend(
+                right_names
+                    .iter()
+                    .filter(|name| !right_hidden.contains(&name.to_ascii_lowercase()))
+                    .cloned(),
+            );
 
             for (right_index, right_name) in right_names.into_iter().enumerate() {
                 let Some(right_projection) = column_projection(right_start + right_index) else {
@@ -88330,12 +88757,16 @@ impl Connection {
                     .iter()
                     .any(|using_name| using_name.eq_ignore_ascii_case(&right_name))
                 {
-                    visible.push((right_name, right_projection));
+                    let hidden = right_hidden.contains(&right_name.to_ascii_lowercase());
+                    visible.push((right_name, right_projection, hidden));
                     continue;
                 }
                 let Some(left_position) = visible
                     .iter()
-                    .position(|(left_name, _)| left_name.eq_ignore_ascii_case(&right_name))
+                    .position(|(left_name, _, hidden)| {
+                        (!join.join_type.natural || !*hidden)
+                            && left_name.eq_ignore_ascii_case(&right_name)
+                    })
                 else {
                     continue;
                 };
@@ -88354,6 +88785,10 @@ impl Connection {
                     JoinKind::Cross | JoinKind::Inner | JoinKind::Left => left_projection,
                 };
                 visible[left_position].1 = projection.clone();
+                // This flag tracks NATURAL candidacy, not wildcard output:
+                // USING can retain a hidden left projection while merging a
+                // visible right source column into the same equivalence group.
+                visible[left_position].2 &= right_hidden.contains(&right_name.to_ascii_lowercase());
                 projections.insert(right_name.to_ascii_lowercase(), projection);
             }
         }
@@ -88504,6 +88939,11 @@ impl Connection {
         source: &TableOrSubquery,
         visible_ctes: &[fsqlite_ast::Cte],
     ) -> Vec<String> {
+        if let TableOrSubquery::TableFunction { name, .. } = source {
+            return self
+                .table_function_result_column_names(name)
+                .unwrap_or_else(|| vec![name.clone()]);
+        }
         let mut active_ctes = Vec::new();
         self.table_or_subquery_result_column_names(source, visible_ctes, &mut active_ctes)
     }
@@ -95788,13 +96228,20 @@ impl Connection {
         // When JOINs are present, use build_join_col_map for all sources.
         let (col_map, expanded_columns) = if has_join {
             let cmap = self.build_join_col_map(select);
+            let hidden_columns = self.hidden_table_function_column_indices(&join_sources, &cmap);
+            let using_skip_indices = self.build_join_using_skip_indices(select);
             let expanded: Vec<ResultColumn> = columns
                 .iter()
                 .flat_map(|col| match col {
                     ResultColumn::Star => cmap
                         .iter()
-                        .filter(|(_, _, hidden)| !*hidden)
-                        .map(|(tbl, c, _)| ResultColumn::Expr {
+                        .enumerate()
+                        .filter(|(index, (_, _, hidden))| {
+                            !*hidden
+                                && !hidden_columns.contains(index)
+                                && !using_skip_indices.contains(index)
+                        })
+                        .map(|(_, (tbl, c, _))| ResultColumn::Expr {
                             expr: Expr::Column(
                                 ColumnRef::qualified(tbl.clone(), c.clone()),
                                 Span::new(0, 0),
@@ -100045,9 +100492,7 @@ impl Connection {
         }
         let column_names: Vec<Vec<String>> = sources
             .iter()
-            .map(|source| {
-                self.table_or_subquery_result_column_names(source, visible_ctes, &mut Vec::new())
-            })
+            .map(|source| self.source_column_names_for_join_layout(source, visible_ctes))
             .collect();
         if column_names.iter().any(Vec::is_empty) {
             return None;
@@ -100093,13 +100538,20 @@ impl Connection {
                     .iter()
                     .flatten()
                     .zip(&column_names)
-                    .flat_map(|(label, names)| {
-                        names.iter().map(|name| ResultColumn::Expr {
+                    .zip(&sources)
+                    .flat_map(|((label, names), source)| {
+                        let hidden = self.source_hidden_column_names(source);
+                        names.iter().filter_map(move |name| {
+                            if hidden.contains(&name.to_ascii_lowercase()) {
+                                return None;
+                            }
+                            Some(ResultColumn::Expr {
                             expr: Expr::Column(
                                 ColumnRef::qualified(label.as_str(), name.as_str()),
                                 Span::ZERO,
                             ),
                             alias: None,
+                            })
                         })
                     })
                     .collect(),
@@ -100201,6 +100653,7 @@ impl Connection {
                                 scan_cache_key: join_scan_cache_key(name),
                                 table_name: name.name.clone(),
                                 alias: alias.clone(),
+                                hidden_columns: HashSet::new(),
                                 hidden_rowid_projection: join_hidden_rowid_projection(
                                     &col_names,
                                     self.table_binding_supports_hidden_rowid_for_scan(name),
@@ -100222,6 +100675,7 @@ impl Connection {
                                 table_name: label,
                                 alias: alias.clone(),
                                 col_names,
+                                hidden_columns: HashSet::new(),
                                 hidden_rowid_projection: None,
                             },
                             // Rows will be loaded after dropping schema borrow.
@@ -100229,8 +100683,8 @@ impl Connection {
                         ))
                     }
                     TableOrSubquery::TableFunction { name, alias, .. } => {
-                        let col_names = self
-                            .table_function_result_column_names(name)
+                        let (col_names, hidden_columns) = self
+                            .table_function_column_metadata(name)
                             .ok_or_else(|| {
                                 FrankenError::NotImplemented(format!(
                                     "table-valued function {name} is not supported",
@@ -100247,6 +100701,7 @@ impl Connection {
                                 table_name: name.clone(),
                                 alias: alias.clone(),
                                 col_names,
+                                hidden_columns,
                                 hidden_rowid_projection,
                             },
                             Some(Vec::new()),
@@ -100417,6 +100872,7 @@ impl Connection {
                 registry: lock_unpoisoned(self.collation_registry.as_ref()).clone(),
             });
         let using_skip_indices = collect_join_using_skip_indices(&table_sources, &from.joins);
+        let hidden_column_indices = collect_join_hidden_column_indices(&table_sources);
         let coalesced_star_indices =
             collect_join_coalesced_star_indices(&table_sources, &from.joins);
         let using_skip: Option<&HashSet<usize>> = if using_skip_indices.is_empty() {
@@ -100818,12 +101274,11 @@ impl Connection {
             let effective_constraint = if join.join_type.natural {
                 let left_cols: Vec<&str> = table_sources[..=join_idx]
                     .iter()
-                    .flat_map(|s| s.col_names.iter().map(String::as_str))
+                    .flat_map(|s| s.visible_column_names().map(String::as_str))
                     .collect();
                 let right_src = &table_sources[join_idx + 1];
                 let shared: Vec<String> = right_src
-                    .col_names
-                    .iter()
+                    .visible_column_names()
                     .filter(|c| left_cols.iter().any(|l| l.eq_ignore_ascii_case(c.as_str())))
                     .cloned()
                     .collect();
@@ -100868,8 +101323,15 @@ impl Connection {
             // With a RIGHT/FULL join anywhere in the FROM, a USING term's left
             // operand coalesces every left source that has the column.
             let using_left_slots = match effective_constraint {
-                Some(JoinConstraint::Using(cols)) if primary_null_extendable => {
-                    join_using_left_coalesce_slots(&table_sources, join_idx, cols)
+                Some(JoinConstraint::Using(cols))
+                    if primary_null_extendable || join.join_type.natural => {
+                    join_using_left_coalesce_slots(
+                        &table_sources,
+                        join_idx,
+                        cols,
+                        join.join_type.natural,
+                        primary_null_extendable,
+                    )
                 }
                 _ => None,
             };
@@ -101025,7 +101487,11 @@ impl Connection {
                 ResultColumn::Star => col_map
                     .iter()
                     .enumerate()
-                    .filter(|(idx, (_, _, hidden))| !hidden && !using_skip_indices.contains(idx))
+                    .filter(|(idx, (_, _, hidden))| {
+                        !hidden
+                            && !hidden_column_indices.contains(idx)
+                            && !using_skip_indices.contains(idx)
+                    })
                     .map(|(idx, (tbl, c, _))| {
                         let column = if coalesced_star_indices.contains(&idx) {
                             ColumnRef::bare(c.clone())
@@ -114941,21 +115407,25 @@ fn table_function_column_names(name: &str) -> Option<&'static [&'static str]> {
 /// The columns `*` shows for a table-valued function that declares HIDDEN
 /// columns, which stock leaves out of `*` (bd-cpa8b). `None` means every
 /// column is visible.
-fn table_function_star_columns(name: &str) -> Option<&'static [&'static str]> {
-    // generate_series declares `value, start HIDDEN, stop HIDDEN, step HIDDEN`.
-    name.eq_ignore_ascii_case("generate_series")
-        .then_some(&GENERATE_SERIES_TABLE_COLUMN_NAMES[..1])
+fn table_function_star_columns(connection: &Connection, name: &str) -> Option<Vec<String>> {
+    let (columns, hidden) = connection.table_function_column_metadata(name)?;
+    (!hidden.is_empty()).then(|| {
+        columns
+            .into_iter()
+            .filter(|column| !hidden.contains(&column.to_ascii_lowercase()))
+            .collect()
+    })
 }
 
 /// A FROM source's label and, for a table-valued function with HIDDEN
 /// columns, the columns its `*` shows.
-type StarSource = (String, Option<&'static [&'static str]>);
+type StarSource = (String, Option<Vec<String>>);
 
 /// The label and `*` columns of each source of a FROM clause whose `*` can be
 /// rewritten source by source, or `None`. USING and NATURAL joins merge
 /// columns under `*`, and parenthesized joins and unaliased subqueries have
 /// no label to qualify with, so those clauses keep their `*`.
-fn from_star_sources(from: &FromClause) -> Option<Vec<StarSource>> {
+fn from_star_sources(connection: &Connection, from: &FromClause) -> Option<Vec<StarSource>> {
     if from.joins.iter().any(|join| {
         join.join_type.natural || matches!(join.constraint, Some(JoinConstraint::Using(_)))
     }) {
@@ -114972,7 +115442,7 @@ fn from_star_sources(from: &FromClause) -> Option<Vec<StarSource>> {
             } => Some((alias.clone(), None)),
             TableOrSubquery::TableFunction { name, alias, .. } => Some((
                 alias.clone().unwrap_or_else(|| name.clone()),
-                table_function_star_columns(name),
+                table_function_star_columns(connection, name),
             )),
             TableOrSubquery::Subquery { alias: None, .. } | TableOrSubquery::ParenJoin(_) => None,
         })
@@ -114980,8 +115450,8 @@ fn from_star_sources(from: &FromClause) -> Option<Vec<StarSource>> {
 }
 
 /// Whether [`expand_hidden_table_function_stars`] would change `select`.
-fn select_has_hidden_table_function_star(select: &SelectStatement) -> bool {
-    fn core_has(core: &SelectCore) -> bool {
+fn select_has_hidden_table_function_star(connection: &Connection, select: &SelectStatement) -> bool {
+    fn core_has(connection: &Connection, core: &SelectCore) -> bool {
         let SelectCore::Select {
             columns,
             from: Some(from),
@@ -114994,30 +115464,28 @@ fn select_has_hidden_table_function_star(select: &SelectStatement) -> bool {
             .chain(from.joins.iter().map(|join| &join.table))
             .any(|source| {
                 matches!(source, TableOrSubquery::Subquery { query, .. }
-                    if select_has_hidden_table_function_star(query))
+                    if select_has_hidden_table_function_star(connection, query))
             });
         nested
-            || from_star_sources(from).is_some_and(|sources| {
-                sources.iter().any(|(_, visible)| visible.is_some())
-                    && columns.iter().any(|column| {
-                        matches!(column, ResultColumn::Star | ResultColumn::TableStar(_))
-                    })
-            })
+            || (columns.iter().any(|column| {
+                matches!(column, ResultColumn::Star | ResultColumn::TableStar(_))
+            }) && from_star_sources(connection, from)
+                .is_some_and(|sources| sources.iter().any(|(_, visible)| visible.is_some())))
     }
     select.with.as_ref().is_some_and(|with| {
         with.ctes
             .iter()
-            .any(|cte| select_has_hidden_table_function_star(&cte.query))
-    }) || core_has(&select.body.select)
-        || select.body.compounds.iter().any(|(_, core)| core_has(core))
+            .any(|cte| select_has_hidden_table_function_star(connection, &cte.query))
+    }) || core_has(connection, &select.body.select)
+        || select.body.compounds.iter().any(|(_, core)| core_has(connection, core))
 }
 
 /// bd-cpa8b: expand `*` and `<alias>.*` over a table-valued function with
 /// HIDDEN columns into its visible columns, as stock does. The other sources'
 /// share of `*` becomes `<source>.*`. It covers CTE bodies, compound arms and
 /// FROM subqueries, but not subqueries in expressions.
-fn expand_hidden_table_function_stars(select: &mut SelectStatement) {
-    fn expand_core(core: &mut SelectCore) {
+fn expand_hidden_table_function_stars(connection: &Connection, select: &mut SelectStatement) {
+    fn expand_core(connection: &Connection, core: &mut SelectCore) {
         let SelectCore::Select {
             columns,
             from: Some(from),
@@ -115030,20 +115498,20 @@ fn expand_hidden_table_function_stars(select: &mut SelectStatement) {
             .chain(from.joins.iter_mut().map(|join| &mut join.table))
         {
             if let TableOrSubquery::Subquery { query, .. } = source {
-                expand_hidden_table_function_stars(query);
+                expand_hidden_table_function_stars(connection, query);
             }
         }
-        let Some(sources) = from_star_sources(from) else {
+        let Some(sources) = from_star_sources(connection, from) else {
             return;
         };
         if sources.iter().all(|(_, visible)| visible.is_none()) {
             return;
         }
-        let visible_columns = |label: &str, visible: &[&str]| {
+        let visible_columns = |label: &str, visible: &[String]| {
             visible
                 .iter()
                 .map(|column| ResultColumn::Expr {
-                    expr: Expr::Column(ColumnRef::qualified(label, *column), Span::ZERO),
+                    expr: Expr::Column(ColumnRef::qualified(label, column.as_str()), Span::ZERO),
                     alias: None,
                 })
                 .collect::<Vec<_>>()
@@ -115063,7 +115531,7 @@ fn expand_hidden_table_function_stars(select: &mut SelectStatement) {
                 }
                 ResultColumn::TableStar(table) => {
                     let hidden_source = sources.iter().find_map(|(label, visible)| {
-                        visible.filter(|_| {
+                        visible.as_ref().filter(|_| {
                             table.schema.is_none() && label.eq_ignore_ascii_case(&table.name)
                         })
                         .map(|visible| (label, visible))
@@ -115081,22 +115549,25 @@ fn expand_hidden_table_function_stars(select: &mut SelectStatement) {
 
     if let Some(with) = &mut select.with {
         for cte in &mut with.ctes {
-            expand_hidden_table_function_stars(&mut cte.query);
+            expand_hidden_table_function_stars(connection, &mut cte.query);
         }
     }
-    expand_core(&mut select.body.select);
+    expand_core(connection, &mut select.body.select);
     for (_, core) in &mut select.body.compounds {
-        expand_core(core);
+        expand_core(connection, core);
     }
 }
 
 /// Apply [`expand_hidden_table_function_stars`] to the SELECT a statement
 /// runs, when it would change anything.
-fn expand_statement_hidden_table_function_stars(statement: &Statement) -> Option<Statement> {
+fn expand_statement_hidden_table_function_stars(
+    connection: &Connection,
+    statement: &Statement,
+) -> Option<Statement> {
     let expand = |select: &SelectStatement| {
-        select_has_hidden_table_function_star(select).then(|| {
+        select_has_hidden_table_function_star(connection, select).then(|| {
             let mut select = select.clone();
-            expand_hidden_table_function_stars(&mut select);
+            expand_hidden_table_function_stars(connection, &mut select);
             select
         })
     };
@@ -130063,20 +130534,10 @@ enum SimpleStreamingGroupByOutput {
 enum SimpleStreamingGroupByAccumulator {
     Plain,
     Count(i64),
-    Sum {
-        sum: f64,
-        err: f64,
-        int_sum: i64,
-        has_int: bool,
-        all_int: bool,
-        int_overflowed: bool,
-        saw_value: bool,
-    },
-    Avg {
-        sum: f64,
-        err: f64,
-        count: u64,
-    },
+    // Share exact integer prefixes, compensated real summation, NULL handling
+    // and overflow behavior with the registered built-in aggregates.
+    Sum(SumState),
+    Avg(AvgState),
     Min(Option<SqliteValue>),
     Max(Option<SqliteValue>),
 }
@@ -130182,20 +130643,12 @@ impl SimpleStreamingGroupByOutput {
             Self::CountStar | Self::CountValue { .. } => {
                 SimpleStreamingGroupByAccumulator::Count(0)
             }
-            Self::SumValue { .. } => SimpleStreamingGroupByAccumulator::Sum {
-                sum: 0.0,
-                err: 0.0,
-                int_sum: 0,
-                has_int: false,
-                all_int: true,
-                int_overflowed: false,
-                saw_value: false,
-            },
-            Self::AvgValue { .. } => SimpleStreamingGroupByAccumulator::Avg {
-                sum: 0.0,
-                err: 0.0,
-                count: 0,
-            },
+            Self::SumValue { .. } => {
+                SimpleStreamingGroupByAccumulator::Sum(SumFunc.initial_state())
+            }
+            Self::AvgValue { .. } => {
+                SimpleStreamingGroupByAccumulator::Avg(AvgFunc.initial_state())
+            }
             Self::MinValue { .. } => SimpleStreamingGroupByAccumulator::Min(None),
             Self::MaxValue { .. } => SimpleStreamingGroupByAccumulator::Max(None),
         }
@@ -130256,55 +130709,19 @@ fn update_simple_streaming_group_by_state(
             }
             (
                 SimpleStreamingGroupByOutput::SumValue { arg_col, arg_expr },
-                SimpleStreamingGroupByAccumulator::Sum {
-                    sum,
-                    err,
-                    int_sum,
-                    has_int,
-                    all_int,
-                    int_overflowed,
-                    saw_value,
-                },
+                SimpleStreamingGroupByAccumulator::Sum(sum),
             ) => {
                 let value =
                     simple_streaming_group_by_value(*arg_col, arg_expr.as_deref(), row, col_map)?;
-                if matches!(value, SqliteValue::Null) {
-                    continue;
-                }
-                *saw_value = true;
-                match value.to_sum_numeric_value() {
-                    SqliteValue::Integer(n) => {
-                        *has_int = true;
-                        if *all_int && !*int_overflowed {
-                            match int_sum.checked_add(n) {
-                                Some(next) => *int_sum = next,
-                                None => *int_overflowed = true,
-                            }
-                        }
-                        kbn_step(sum, err, n as f64);
-                    }
-                    SqliteValue::Float(f) => {
-                        *all_int = false;
-                        kbn_step(sum, err, f);
-                    }
-                    SqliteValue::Null | SqliteValue::Text(_) | SqliteValue::Blob(_) => {}
-                }
+                SumFunc.step(sum, std::slice::from_ref(&value))?;
             }
             (
                 SimpleStreamingGroupByOutput::AvgValue { arg_col, arg_expr },
-                SimpleStreamingGroupByAccumulator::Avg { sum, err, count },
+                SimpleStreamingGroupByAccumulator::Avg(avg),
             ) => {
                 let value =
                     simple_streaming_group_by_value(*arg_col, arg_expr.as_deref(), row, col_map)?;
-                if matches!(value, SqliteValue::Null) {
-                    continue;
-                }
-                match value {
-                    SqliteValue::Integer(n) => kbn_step(sum, err, n as f64),
-                    SqliteValue::Float(f) => kbn_step(sum, err, f),
-                    other => kbn_step(sum, err, other.to_float()),
-                }
-                *count += 1;
+                AvgFunc.step(avg, std::slice::from_ref(&value))?;
             }
             (
                 SimpleStreamingGroupByOutput::MinValue { arg_col, arg_expr },
@@ -130363,36 +130780,12 @@ fn finalize_simple_streaming_group_by_row(
             }
             (
                 SimpleStreamingGroupByOutput::SumValue { .. },
-                SimpleStreamingGroupByAccumulator::Sum {
-                    sum,
-                    err,
-                    int_sum,
-                    has_int,
-                    all_int,
-                    int_overflowed,
-                    saw_value,
-                },
-            ) => {
-                if !*saw_value {
-                    Ok(SqliteValue::Null)
-                } else if *all_int && *int_overflowed {
-                    Err(FrankenError::IntegerOverflow)
-                } else if *has_int && *all_int {
-                    Ok(SqliteValue::Integer(*int_sum))
-                } else {
-                    Ok(SqliteValue::Float(*sum + *err))
-                }
-            }
+                SimpleStreamingGroupByAccumulator::Sum(sum),
+            ) => SumFunc.finalize(sum.clone()),
             (
                 SimpleStreamingGroupByOutput::AvgValue { .. },
-                SimpleStreamingGroupByAccumulator::Avg { sum, err, count },
-            ) => {
-                if *count == 0 {
-                    Ok(SqliteValue::Null)
-                } else {
-                    Ok(SqliteValue::Float((*sum + *err) / *count as f64))
-                }
-            }
+                SimpleStreamingGroupByAccumulator::Avg(avg),
+            ) => AvgFunc.finalize(avg.clone()),
             (
                 _,
                 SimpleStreamingGroupByAccumulator::Min(value)
@@ -130426,27 +130819,27 @@ impl<'a> SimpleStreamingGroupBy<'a> {
         }
     }
 
-    fn push(&mut self, row_values: Vec<SqliteValue>) -> Result<()> {
+    fn push(&mut self, row_values: &[SqliteValue]) -> Result<()> {
         let key: Vec<SqliteValue> = self
             .group_by_exprs
             .iter()
-            .map(|expr| eval_join_expr(expr, &row_values, self.col_map))
+            .map(|expr| eval_join_expr(expr, row_values, self.col_map))
             .collect::<Result<_>>()?;
         match self.groups.entry(key) {
             std::collections::btree_map::Entry::Occupied(mut entry) => {
                 update_simple_streaming_group_by_state(
                     entry.get_mut(),
                     self.outputs,
-                    &row_values,
+                    row_values,
                     self.col_map,
                 )?;
             }
             std::collections::btree_map::Entry::Vacant(entry) => {
-                let mut state = SimpleStreamingGroupByState::new(row_values.clone(), self.outputs);
+                let mut state = SimpleStreamingGroupByState::new(row_values.to_vec(), self.outputs);
                 update_simple_streaming_group_by_state(
                     &mut state,
                     self.outputs,
-                    &row_values,
+                    row_values,
                     self.col_map,
                 )?;
                 entry.insert(state);
@@ -130506,7 +130899,7 @@ where
 {
     let mut grouping = SimpleStreamingGroupBy::new(group_by_exprs, outputs, col_map);
     for row in raw_rows {
-        grouping.push(row)?;
+        grouping.push(&row)?;
     }
     grouping.finish()
 }
@@ -147096,6 +147489,7 @@ struct SelectResultColumnMetadata {
 #[derive(Clone)]
 struct SelectVisibleColumnMetadata {
     name: String,
+    hidden: bool,
     col_map_index: Option<usize>,
     approximate: bool,
     expression_key: Option<String>,
@@ -147445,6 +147839,11 @@ impl SelectColumnReferenceScope {
             approximate_col_map,
             layout_width_is_exact,
         )?;
+        let mut natural_candidates = left_visible
+            .iter()
+            .filter(|column| !column.hidden)
+            .cloned()
+            .collect::<Vec<_>>();
         for join in &from.joins {
             let right_visible = Self::append_source_layout(
                 connection,
@@ -147459,8 +147858,10 @@ impl SelectColumnReferenceScope {
             )?;
             let using_columns = if join.join_type.natural {
                 if right_visible.iter().any(|right| {
-                    left_visible.iter().any(|left| {
-                        (left.approximate || right.approximate)
+                    natural_candidates.iter().any(|left| {
+                        !left.hidden
+                            && !right.hidden
+                            && (left.approximate || right.approximate)
                             && visible_source_names_may_match(left, right)
                     })
                 }) {
@@ -147469,9 +147870,12 @@ impl SelectColumnReferenceScope {
                 right_visible
                     .iter()
                     .filter(|right| {
-                        !right.approximate
-                            && left_visible.iter().any(|left| {
-                                !left.approximate && left.name.eq_ignore_ascii_case(&right.name)
+                        !right.hidden
+                            && !right.approximate
+                            && natural_candidates.iter().any(|left| {
+                                !left.hidden
+                                    && !left.approximate
+                                    && left.name.eq_ignore_ascii_case(&right.name)
                             })
                     })
                     .map(|column| column.name.clone())
@@ -147516,6 +147920,7 @@ impl SelectColumnReferenceScope {
                     using_skip.insert(index);
                 }
             }
+            natural_candidates.extend(right_visible.iter().filter(|column| !column.hidden).cloned());
             left_visible.extend(right_visible.into_iter().filter(|column| {
                 column.approximate
                     || !using_columns
@@ -147583,6 +147988,7 @@ impl SelectColumnReferenceScope {
             &mut approximate_names,
             &mut generated_suffix_upper_bounds,
         );
+        let hidden_columns = connection.source_hidden_column_names(source);
         let visible = names
             .into_iter()
             .zip(
@@ -147608,6 +148014,7 @@ impl SelectColumnReferenceScope {
                     Some(index)
                 };
                 SelectVisibleColumnMetadata {
+                    hidden: hidden_columns.contains(&name.to_ascii_lowercase()),
                     name,
                     col_map_index,
                     approximate,
@@ -148333,11 +148740,7 @@ impl<'connection, 'select> SelectColumnReferenceResolver<'connection, 'select> {
                 })
             }
             TableOrSubquery::TableFunction { .. } => {
-                let names = self.connection.table_or_subquery_result_column_names(
-                    source,
-                    &[],
-                    &mut Vec::new(),
-                );
+                let names = self.connection.source_column_names_for_join_layout(source, &[]);
                 Ok(SelectSourceColumnMetadata {
                     hidden_rowid: self
                         .connection
@@ -148790,6 +149193,10 @@ impl<'connection, 'select> SelectColumnReferenceResolver<'connection, 'select> {
             &mut approximate_col_map,
             &mut width_is_exact,
         )?;
+        let visible = visible
+            .into_iter()
+            .filter(|column| !column.hidden)
+            .collect::<Vec<_>>();
         Ok(SelectResultColumnMetadata {
             names: visible.iter().map(|column| column.name.clone()).collect(),
             approximate_names: visible.iter().map(|column| column.approximate).collect(),
@@ -148823,6 +149230,29 @@ impl<'connection, 'select> SelectColumnReferenceResolver<'connection, 'select> {
                     &mut approximate_names,
                     &mut generated_suffix_upper_bounds,
                 );
+                let hidden_columns = self.connection.source_hidden_column_names(source);
+                let mut index = 0;
+                let keep = names
+                    .iter()
+                    .map(|name| !hidden_columns.contains(&name.to_ascii_lowercase()))
+                    .collect::<Vec<_>>();
+                names.retain(|_| {
+                    let retain = keep[index];
+                    index += 1;
+                    retain
+                });
+                index = 0;
+                approximate_names.retain(|_| {
+                    let retain = keep[index];
+                    index += 1;
+                    retain
+                });
+                index = 0;
+                generated_suffix_upper_bounds.retain(|_| {
+                    let retain = keep[index];
+                    index += 1;
+                    retain
+                });
                 return Ok(Some(SelectResultColumnMetadata {
                     names,
                     approximate_names,
@@ -157219,10 +157649,17 @@ struct JoinTableSource {
     table_name: String,
     alias: Option<String>,
     col_names: Vec<String>,
+    hidden_columns: HashSet<String>,
     hidden_rowid_projection: Option<String>,
 }
 
 impl JoinTableSource {
+    fn visible_column_names(&self) -> impl Iterator<Item = &String> {
+        self.col_names
+            .iter()
+            .filter(|name| !self.hidden_columns.contains(&name.to_ascii_lowercase()))
+    }
+
     fn scan_width(&self) -> usize {
         self.col_names.len() + usize::from(self.hidden_rowid_projection.is_some())
     }
@@ -157232,6 +157669,20 @@ impl JoinTableSource {
             .as_ref()
             .filter(|name| name.schema.as_deref().is_none_or(is_builtin_schema))
     }
+}
+
+fn collect_join_hidden_column_indices(table_sources: &[JoinTableSource]) -> HashSet<usize> {
+    let mut hidden = HashSet::new();
+    let mut offset = 0;
+    for source in table_sources {
+        for (index, name) in source.col_names.iter().enumerate() {
+            if source.hidden_columns.contains(&name.to_ascii_lowercase()) {
+                hidden.insert(offset + index);
+            }
+        }
+        offset += source.scan_width();
+    }
+    hidden
 }
 
 /// The column names each FROM source's own join matches by USING, indexed like
@@ -157253,13 +157704,11 @@ fn join_source_using_columns<'a>(
         };
         let cols = if join.join_type.natural {
             right_src
-                .col_names
-                .iter()
+                .visible_column_names()
                 .filter(|right_col| {
                     table_sources[..=join_idx].iter().any(|source| {
                         source
-                            .col_names
-                            .iter()
+                            .visible_column_names()
                             .any(|left_col| left_col.eq_ignore_ascii_case(right_col))
                     })
                 })
@@ -157341,6 +157790,8 @@ fn join_using_left_coalesce_slots(
     table_sources: &[JoinTableSource],
     join_idx: usize,
     cols: &[String],
+    omit_hidden: bool,
+    coalesce_all: bool,
 ) -> Option<Vec<SmallVec<[usize; 4]>>> {
     let left_sources = table_sources.get(..=join_idx)?;
     let mut coalesced = false;
@@ -157350,12 +157801,16 @@ fn join_using_left_coalesce_slots(
             let mut group = SmallVec::new();
             let mut offset = 0;
             for source in left_sources {
-                if let Some(position) = source
+                if (!omit_hidden || !source.hidden_columns.contains(&col_name.to_ascii_lowercase()))
+                    && let Some(position) = source
                     .col_names
                     .iter()
                     .position(|name| name.eq_ignore_ascii_case(col_name))
                 {
                     group.push(offset + position);
+                    if !coalesce_all {
+                        break;
+                    }
                 }
                 offset += source.scan_width();
             }
@@ -157363,7 +157818,7 @@ fn join_using_left_coalesce_slots(
             group
         })
         .collect::<Vec<_>>();
-    coalesced.then_some(slots)
+    (coalesced || omit_hidden).then_some(slots)
 }
 
 fn join_table_supports_hidden_rowid(
@@ -161934,6 +162389,23 @@ pub(crate) fn eval_join_expr(
             let fts5_candidate = prepared
                 .as_ref()
                 .is_none_or(|prepared| prepared.fts5_aux_name);
+            // SQLite's builtin COALESCE/IFNULL evaluate only through the
+            // first non-NULL argument. In particular, a streamed aggregate
+            // must not observe errors in an unused fallback expression.
+            // Application replacements are ordinary eager scalar calls.
+            if application_kind_is_none
+                && let FunctionArgs::List(values) = args
+                && ((name.eq_ignore_ascii_case("coalesce") && values.len() >= 2)
+                    || (name.eq_ignore_ascii_case("ifnull") && values.len() == 2))
+            {
+                for value in values {
+                    let value = eval_join_expr(value, row, col_map)?;
+                    if !value.is_null() {
+                        return Ok(value);
+                    }
+                }
+                return Ok(SqliteValue::Null);
+            }
             if application_kind_is_none && fts5_candidate {
                 if let Some(result) = try_eval_fts5_aux_function(name, args, row, col_map) {
                     return result;

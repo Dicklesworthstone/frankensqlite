@@ -89,6 +89,7 @@ fn aggregate_float(value: f64) -> SqliteValue {
 // avg(X)
 // ═══════════════════════════════════════════════════════════════════════════
 
+#[derive(Debug, Clone)]
 pub struct AvgState {
     sum: SumState,
     count: i64,
@@ -360,6 +361,7 @@ impl AggregateFunction for AggMinFunc {
 /// State for `sum()`: tracks whether all values are integers, the running
 /// integer sum, and the float sum as fallback.  Uses Kahan compensated
 /// summation for the float path to match C SQLite's precision.
+#[derive(Debug, Clone)]
 pub struct SumState {
     int_sum: i64,
     float_sum: f64,
