@@ -26,11 +26,20 @@ candidate or before/after comparison. Inputs, EXPLAIN/EQP output, raw logs,
 binary hashes, and samples are kept.
 Each profile-*.sql repeats only setup and the named workload, without correctness
 queries or timers; whole-process profiles still include startup and setup.
+
+Use --memory for a separate Linux process-memory experiment instead of timings.
+Each fresh child pauses at a flushed stdout marker after setup and after each of
+--memory-queries workload executions (default 5). /proc VmRSS and VmHWM record
+resident memory and its high-water mark through that checkpoint. The first-query
+VmHWM includes executable startup and setup; later VmRSS checkpoints expose
+retention between queries, including allocator arenas and engine caches. These
+are approximate kernel process counters, not isolated query-heap measurements.
 """
 
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import itertools
 import json
@@ -38,11 +47,14 @@ import math
 import os
 import platform
 import re
+import selectors
 import shutil
 import statistics
 import subprocess
 import sys
 import tempfile
+import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -168,6 +180,171 @@ def summarize(samples: list[dict]) -> dict:
     return summary
 
 
+def parse_process_memory(status: str) -> dict:
+    """Require both Linux process counters; never substitute an absent value."""
+    counters = {}
+    for field, key in (("VmRSS", "rss_kib"), ("VmHWM", "hwm_kib")):
+        matches = re.findall(rf"^{field}:\s+([0-9]+)\s+kB\s*$", status, re.MULTILINE)
+        if len(matches) != 1 or int(matches[0]) <= 0:
+            raise ValueError(f"missing, malformed or nonpositive /proc {field} counter")
+        counters[key] = int(matches[0])
+    return counters
+
+
+def run_memory_cli(binary: dict, sql: str, expected: int, setup: list[str],
+                   queries: int, init: Path, directory: Path, timeout: float, stem: str) -> dict:
+    """Drive one fresh process, pausing between queries to sample retained RSS.
+
+    Only stdout uses a PTY, so the shells flush markers but still receive batch
+    input without prompts. Nonblocking pipes and one monotonic deadline bound
+    writes, reads and shutdown. Every result and all stderr are checked.
+    """
+    if not sys.platform.startswith("linux"):
+        raise ValueError("--memory requires Linux /proc VmRSS and VmHWM")
+    if queries < 1:
+        raise ValueError("memory query count must be positive")
+    import pty
+
+    command = [binary["path"], "-batch", "-init", str(init), ":memory:"]
+    marker_prefix = f"__issue530_{uuid.uuid4().hex}_"
+    scripts = ["\n".join([*PREFIX, *setup, f".print {marker_prefix}0", ""])]
+    scripts.extend(f"{sql}\n.print {marker_prefix}{index}\n" for index in range(1, queries + 1))
+    (directory / f"{stem}.sql").write_text("".join(scripts), encoding="utf-8")
+    captured = {"stdout": bytearray(), "stderr": bytearray()}
+    checkpoints = []
+    completed = False
+    process = None
+    master, slave = pty.openpty()
+    selector = selectors.DefaultSelector()
+    deadline = time.monotonic() + timeout
+    pending_input = b""
+    pending_output = b""
+    lines = []
+
+    def remaining() -> float:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise subprocess.TimeoutExpired(command, timeout,
+                                            output=bytes(captured["stdout"]),
+                                            stderr=bytes(captured["stderr"]))
+        return left
+
+    def pump(block: bool = True) -> None:
+        nonlocal pending_input, pending_output
+        left = remaining()
+        events = selector.select(left if block else 0)
+        if block and not events:
+            remaining()  # Raise the same timeout, retaining partial output.
+        for key, _ in events:
+            if key.data == "stdin":
+                written = os.write(key.fd, pending_input)
+                pending_input = pending_input[written:]
+                if not pending_input:
+                    selector.unregister(key.fileobj)
+                continue
+            try:
+                chunk = os.read(key.fd, 65536)
+            except OSError as error:
+                if key.data != "stdout" or error.errno != errno.EIO:
+                    raise
+                chunk = b""  # Linux PTY reports EIO when the slave closes.
+            if not chunk:
+                selector.unregister(key.fileobj)
+                continue
+            captured[key.data].extend(chunk)
+            if key.data == "stdout":
+                pending_output += chunk
+                while b"\n" in pending_output:
+                    line, pending_output = pending_output.split(b"\n", 1)
+                    text = line.decode("utf-8").strip()
+                    if text:
+                        lines.append(text)
+        if captured["stderr"].strip():
+            raise ValueError(f"memory CLI stderr: {captured['stderr'].decode('utf-8', errors='replace')}")
+
+    try:
+        process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=slave,
+                                   stderr=subprocess.PIPE, bufsize=0)
+        os.close(slave)
+        slave = None
+        assert process.stdin is not None and process.stderr is not None
+        os.set_blocking(process.stdin.fileno(), False)
+        selector.register(master, selectors.EVENT_READ, "stdout")
+        selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+        for index, script in enumerate(scripts):
+            marker = f"{marker_prefix}{index}"
+            first_line = len(lines)
+            pending_input = script.encode("utf-8")
+            selector.register(process.stdin, selectors.EVENT_WRITE, "stdin")
+            while marker not in lines[first_line:]:
+                pump()
+                if master not in selector.get_map() and marker not in lines[first_line:]:
+                    raise ValueError(f"memory CLI exited before checkpoint {index}")
+            # Drain already-available stderr and reject extra protocol output.
+            while selector.select(0):
+                pump(False)
+            expected_lines = ([] if index == 0 else [str(expected)]) + [marker]
+            if pending_input or pending_output or lines[first_line:] != expected_lines:
+                raise ValueError(f"wrong memory result/checkpoint {index}: {lines[first_line:]!r}")
+            counters = parse_process_memory(Path(f"/proc/{process.pid}/status").read_text(encoding="utf-8"))
+            checkpoints.append({"query_count": index, **counters})
+            # Persist checkpoints immediately, including before a later error.
+            (directory / f"{stem}.checkpoints.json").write_text(
+                json.dumps({"status": "running", "pid": process.pid,
+                            "checkpoints": checkpoints}, indent=2) + "\n", encoding="utf-8")
+        process.stdin.close()
+        final_line = len(lines)
+        while selector.get_map():
+            pump()
+        returncode = process.wait(timeout=remaining())
+        if returncode or pending_output or len(lines) != final_line:
+            raise ValueError(f"memory CLI exit {returncode} or unexpected output after final checkpoint")
+        completed = True
+        return {"pid": process.pid, "queries": queries, "checkpoints": checkpoints}
+    finally:
+        try:
+            if process is not None:
+                if process.poll() is None:
+                    process.kill()
+                process.wait(timeout=5)
+        finally:
+            if process is not None:
+                if process.stdin is not None:
+                    process.stdin.close()
+                if process.stderr is not None:
+                    process.stderr.close()
+            selector.close()
+            os.close(master)
+            if slave is not None:
+                os.close(slave)
+            for stream, data in captured.items():
+                (directory / f"{stem}.{stream}").write_text(
+                    data.decode("utf-8", errors="replace"), encoding="utf-8")
+            (directory / f"{stem}.checkpoints.json").write_text(
+                json.dumps({"status": "ok" if completed else "incomplete",
+                            "pid": process.pid if process else None,
+                            "checkpoints": checkpoints}, indent=2) + "\n", encoding="utf-8")
+
+
+def summarize_memory(samples: list[dict]) -> dict:
+    summary = {}
+    for engine in dict.fromkeys(sample["engine"] for sample in samples):
+        runs = [sample["checkpoints"] for sample in samples if sample["engine"] == engine]
+        summary[engine] = {
+            "runs": len(runs),
+            "median_setup_rss_kib": statistics.median(run[0]["rss_kib"] for run in runs),
+            "median_first_query_hwm_kib": statistics.median(run[1]["hwm_kib"] for run in runs),
+            "median_first_query_rss_kib": statistics.median(run[1]["rss_kib"] for run in runs),
+            "median_final_query_hwm_kib": statistics.median(run[-1]["hwm_kib"] for run in runs),
+            "median_final_query_rss_kib": statistics.median(run[-1]["rss_kib"] for run in runs),
+            "median_final_minus_setup_rss_kib": statistics.median(
+                run[-1]["rss_kib"] - run[0]["rss_kib"] for run in runs),
+            "median_final_minus_first_rss_kib": statistics.median(
+                run[-1]["rss_kib"] - run[1]["rss_kib"] for run in runs),
+        }
+    return summary
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     mode = parser.add_mutually_exclusive_group(required=True)
@@ -184,6 +361,10 @@ def main() -> int:
     parser.add_argument("--repeats", type=int, default=6)
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--profile-repeats", type=int, default=10)
+    parser.add_argument("--memory", action="store_true",
+                        help="Linux process-memory experiment; no native timing samples")
+    parser.add_argument("--memory-queries", type=int,
+                        help="workload executions per fresh process in --memory mode (default 5)")
     parser.add_argument("--timeout", type=float, default=300)
     parser.add_argument("--work-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -194,9 +375,15 @@ def main() -> int:
         parser.error("release mode does not accept baseline or candidate arguments")
     if args.fsqlite and args.release_revision:
         parser.error("--release-revision is only valid with --release-fsqlite")
-    if (args.repeats < 1 or args.warmups < 0 or args.profile_repeats < 1 or
+    if not args.memory and args.memory_queries is not None:
+        parser.error("--memory-queries requires --memory")
+    if args.memory_queries is None:
+        args.memory_queries = 5
+    if (args.repeats < 1 or args.warmups < 0 or args.profile_repeats < 1 or args.memory_queries < 1 or
             not math.isfinite(args.timeout) or args.timeout <= 0):
-        parser.error("positive repeats/profile-repeats/timeout and nonnegative warmups required")
+        parser.error("positive repeats/profile-repeats/memory-queries/timeout and nonnegative warmups required")
+    if args.memory and not sys.platform.startswith("linux"):
+        parser.error("--memory requires Linux /proc VmRSS and VmHWM")
     if args.case and len(args.case) != len(set(args.case)):
         parser.error("each --case may be specified only once")
     if args.output.resolve() == args.work_dir.resolve():
@@ -214,6 +401,7 @@ def main() -> int:
     engines.append(("stock", args.sqlite, args.stock_revision))
     rotations = tuple(itertools.permutations(engine for engine, _, _ in engines))
     report = {"schema": 1, "issue": 530, "status": "running",
+              "measurement_mode": "memory" if args.memory else "timing",
               "comparison_scope": ("published release versus stock; no candidate/before-after measurements"
                                    if args.release_fsqlite else "baseline and candidate versus live stock"),
               "started_utc": datetime.now(timezone.utc).isoformat(),
@@ -225,6 +413,14 @@ def main() -> int:
               "warmups_per_sample": args.warmups, "repeats": args.repeats,
               "settings": "engine defaults; empty explicit init file; in-memory databases",
               "engine_order": rotations, "results": {}}
+    if args.memory:
+        for key in ("timing_scope", "timing_resolution_note", "warmups_per_sample"):
+            report.pop(key)
+        report.update({
+            "memory_queries_per_process": args.memory_queries,
+            "memory_scope": "Linux /proc VmRSS and VmHWM while the same child awaits input after setup and each checked SELECT; fresh child for each repetition; no warmup",
+            "memory_interpretation": "Approximate whole-process resident counters, not query heap. First-query high-water includes executable startup and fixture setup, excludes later queries and shutdown. Later RSS includes allocator-retained pages, caches and other process state; a nonzero retained delta alone is not proof of a leak. Counters reset at exec, so no pre-exec Python-parent RSS floor is included.",
+        })
     try:
         report["binaries"] = {
             engine: binary_info(path, revision, args.timeout)
@@ -233,29 +429,41 @@ def main() -> int:
             sql, expected, setup = CASES[name]
             directory = work / name
             directory.mkdir()
-            script = "\n".join([*PREFIX, *setup, *([sql] * args.warmups),
-                                ".timer on", sql, ".timer off", ""])
-            (directory / "sample.sql").write_text(script, encoding="utf-8")
-            (work / f"profile-{name}.sql").write_text(
-                "\n".join([*PREFIX, *setup, *([sql] * args.profile_repeats), ""]), encoding="utf-8")
-            entry = {"sql": sql, "setup": setup, "expected": expected, "samples": [], "plans": {}}
+            entry = {"sql": sql, "setup": setup, "expected": expected, "samples": []}
             report["results"][name] = entry
-            for engine, binary in report["binaries"].items():
-                # Plans are separate from timing and retained even if a diagnostic
-                # is unsupported. Query success is required in every measured run.
-                plans = run_cli(binary, "\n".join([*PREFIX, *setup,
-                                "EXPLAIN QUERY PLAN " + sql, "EXPLAIN " + sql, ""]),
-                                init, directory, args.timeout, f"{engine}-plans")
-                entry["plans"][engine] = {"returncode": plans.returncode,
-                                           "stdout": plans.stdout, "stderr": plans.stderr}
-            for repetition in range(args.repeats):
-                for engine in rotations[repetition % len(rotations)]:
-                    result = run_cli(report["binaries"][engine], script, init, directory,
-                                     args.timeout, f"{engine}-{repetition}")
-                    measurement = validate_sample(result, expected, args.warmups)
-                    entry["samples"].append({"engine": engine, "repetition": repetition,
-                                              **measurement})
-            entry["summary"] = summarize(entry["samples"])
+            if args.memory:
+                for repetition in range(args.repeats):
+                    for engine in rotations[repetition % len(rotations)]:
+                        measurement = run_memory_cli(
+                            report["binaries"][engine], sql, expected, setup,
+                            args.memory_queries, init, directory, args.timeout,
+                            f"{engine}-{repetition}")
+                        entry["samples"].append({"engine": engine, "repetition": repetition,
+                                                  **measurement})
+                entry["summary"] = summarize_memory(entry["samples"])
+            else:
+                script = "\n".join([*PREFIX, *setup, *([sql] * args.warmups),
+                                    ".timer on", sql, ".timer off", ""])
+                (directory / "sample.sql").write_text(script, encoding="utf-8")
+                (work / f"profile-{name}.sql").write_text(
+                    "\n".join([*PREFIX, *setup, *([sql] * args.profile_repeats), ""]), encoding="utf-8")
+                entry["plans"] = {}
+                for engine, binary in report["binaries"].items():
+                    # Plans are separate from timing and retained even if a diagnostic
+                    # is unsupported. Query success is required in every measured run.
+                    plans = run_cli(binary, "\n".join([*PREFIX, *setup,
+                                    "EXPLAIN QUERY PLAN " + sql, "EXPLAIN " + sql, ""]),
+                                    init, directory, args.timeout, f"{engine}-plans")
+                    entry["plans"][engine] = {"returncode": plans.returncode,
+                                               "stdout": plans.stdout, "stderr": plans.stderr}
+                for repetition in range(args.repeats):
+                    for engine in rotations[repetition % len(rotations)]:
+                        result = run_cli(report["binaries"][engine], script, init, directory,
+                                         args.timeout, f"{engine}-{repetition}")
+                        measurement = validate_sample(result, expected, args.warmups)
+                        entry["samples"].append({"engine": engine, "repetition": repetition,
+                                                  **measurement})
+                entry["summary"] = summarize(entry["samples"])
             print(name, json.dumps(entry["summary"]), flush=True)
             args.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
         report["status"] = "ok"
