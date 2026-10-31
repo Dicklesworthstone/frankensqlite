@@ -70958,9 +70958,13 @@ impl Connection {
         };
         let restore_hydrated_rows = self.memdb_rows_loaded.get();
         // A receipt that reads through the WAL carries the main file's
-        // header, which the WAL may supersede; take the logical one.
+        // header, which the WAL may supersede; take the logical one. A
+        // read-only receipt never records a WAL horizon, so its empty horizon
+        // says nothing about the WAL another process holds.
         let source_header = match source_receipt.as_ref() {
-            Some(receipt) if receipt.wal_horizon().is_none() => receipt.header().clone(),
+            Some(receipt) if receipt.wal_horizon().is_none() && !self.pager.is_readonly() => {
+                receipt.header().clone()
+            }
             _ => self.current_database_header(&cx).await?,
         };
         #[cfg(test)]
