@@ -605,7 +605,7 @@ mod tests {
 
         run_migration_test(|| async {
             let (_directory, db, before, _) = orphaned_upgrade_fixture(true);
-            let conn = Connection::open_schema_only(&db).await.unwrap();
+            let conn = Connection::open_existing_schema_only(&db).await.unwrap();
             assert!(conn.is_concurrent_mode_default());
             let cx = conn.root_cx().create_child();
             let vfs = UnixVfs::new();
