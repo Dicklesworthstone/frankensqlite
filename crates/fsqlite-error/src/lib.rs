@@ -707,10 +707,10 @@ impl FrankenError {
     /// - `BusySnapshot` → 517 (SQLITE_BUSY_SNAPSHOT = 5 | (2 << 8))
     pub const fn extended_error_code(&self) -> i32 {
         match self {
-            Self::Busy => 5,                                             // SQLITE_BUSY
+            Self::Busy => 5,                                               // SQLITE_BUSY
             Self::BusyRecovery => 5 | (1 << 8), // SQLITE_BUSY_RECOVERY = 261
             Self::BusySnapshot { .. } => 5 | (2 << 8), // SQLITE_BUSY_SNAPSHOT = 517
-            Self::TriggerRaise(_) | Self::RaiseFail(_) => 19 | (7 << 8), // SQLITE_CONSTRAINT_TRIGGER = 1811
+            Self::TriggerRaise(_) | Self::RaiseFail(_) => 0x13 | (7 << 8), // SQLITE_CONSTRAINT_TRIGGER = 1811
             Self::DatatypeViolation { .. } => 3091, // SQLITE_CONSTRAINT_DATATYPE
             Self::NewerFormat { .. } => SQLITE_OPEN_NEWER_FORMAT, // 14 | (0x7F << 8) = 32526
             // 14 | (0x7E << 8) = 32270
