@@ -18,7 +18,7 @@ use fsqlite_vfs::{FileIdentity, host_fs};
 
 use super::{COPY_BYTES, FileDigest, checkpoint};
 use super::super::{
-    MAIN_FILE, MigrationBackup, RESTORE_PREFIX, WAL_FILE, invalid_backup,
+    MAIN_FILE, MigrationBackup, RESTORE_PREFIX, WAL_FILE, invalid_backup, private_directory,
     read_migration_backup_with_check, sync_directory,
 };
 
@@ -232,7 +232,7 @@ fn restore_owned(
     buffer.try_reserve_exact(COPY_BYTES).map_err(|_| FrankenError::OutOfMemory)?;
     buffer.resize(COPY_BYTES, 0);
     check()?;
-    let directory = tempfile::Builder::new().prefix(RESTORE_PREFIX).tempdir_in(parent)?.keep();
+    let directory = private_directory(RESTORE_PREFIX, parent)?;
     check()?;
     let main_path = directory.join(MAIN_FILE);
     let mut main = restore_file(

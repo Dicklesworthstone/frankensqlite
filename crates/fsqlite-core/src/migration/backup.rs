@@ -171,10 +171,7 @@ impl MigrationBackup {
         mut copy: impl FnMut(&Path, &Path) -> Result<bool>,
     ) -> Result<PathBuf> {
         self.verify()?;
-        let directory = tempfile::Builder::new()
-            .prefix(RESTORE_PREFIX)
-            .tempdir_in(parent)?
-            .keep();
+        let directory = private_directory(RESTORE_PREFIX, parent)?;
         let main = directory.join(MAIN_FILE);
         copy_verified(&self.main_path(), &main, &self.receipt.main, &mut copy)?;
         let wal = directory.join(WAL_FILE);
@@ -265,10 +262,7 @@ pub(super) fn capture_with(
     let previous = read_migration_backup(db_path)?;
     let parent = source_parent(db_path);
     // Keep immediately: every error below preserves the partial evidence.
-    let directory = tempfile::Builder::new()
-        .prefix(GENERATION_PREFIX)
-        .tempdir_in(parent)?
-        .keep();
+    let directory = private_directory(GENERATION_PREFIX, parent)?;
     let main_path = directory.join(MAIN_FILE);
     if !copy(Path::new(db_path), &main_path)? {
         return Err(FrankenError::DatabaseNotFound { path: PathBuf::from(db_path) });
@@ -411,6 +405,19 @@ fn require_absent(path: &Path) -> Result<()> {
 fn source_parent(db_path: &str) -> &Path {
     Path::new(db_path).parent().filter(|path| !path.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."))
+}
+
+/// A fresh child of `parent` only its owner can enter. `tempfile` leaves a
+/// directory at 0o777 less the umask, and these hold copies of the database.
+fn private_directory(prefix: &str, parent: &Path) -> Result<PathBuf> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(prefix);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    Ok(builder.tempdir_in(parent)?.keep())
 }
 
 fn source_name(db_path: &str) -> Result<&str> {
