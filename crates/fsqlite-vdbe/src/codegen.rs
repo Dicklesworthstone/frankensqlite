@@ -50996,8 +50996,9 @@ mod tests {
     #[test]
     fn test_codegen_select_index_range_with_numeric_affinity_uses_index() {
         // bd-u6tbr enabled the placeholder-bound numeric-affinity range seek: the bound is coerced
-        // to the column's affinity ('D') so the seek positions identically to the WHERE comparison,
-        // making the index-range fast path byte-exact (differential oracle: index_range_seek_oracle_e2e).
+        // to NUMERIC ('C'), the cap stock puts on an index probe (bd-xz5f4), so the seek positions
+        // identically to the WHERE comparison, making the index-range fast path byte-exact
+        // (differential oracle: index_range_seek_oracle_e2e).
         // (Was previously asserted to "fall back" to a full scan; bd-u6tbr made that assertion stale.)
         let stmt = simple_select(
             &["n"],
@@ -51027,7 +51028,7 @@ mod tests {
         assert!(
             ops.iter()
                 .any(|op| op.opcode == Opcode::Affinity
-                    && matches!(&op.p4, P4::Affinity(a) if a == "D")),
+                    && matches!(&op.p4, P4::Affinity(a) if a == "C")),
             "the placeholder bound should be coerced to the column's numeric affinity before the seek"
         );
     }
