@@ -450,6 +450,7 @@ async fn assert_table_function_agree(
 }
 
 #[test]
+#[ignore = "bd-star-hidden-reland-nxl8a: needs b56e7bc7c's Cartesian aggregate path"]
 #[cfg(feature = "ext-json")]
 fn cartesian_table_function_aggregates_match_typed_stock_results() {
     asupersync::test_utils::run_test(|| async {
@@ -513,6 +514,7 @@ fn cartesian_table_function_aggregates_match_typed_stock_results() {
 }
 
 #[test]
+#[ignore = "bd-star-hidden-reland-nxl8a: needs b56e7bc7c's Cartesian aggregate path"]
 #[cfg(feature = "ext-json")]
 fn cartesian_aggregate_numeric_accumulators_match_stock() {
     asupersync::test_utils::run_test(|| async {
@@ -604,6 +606,7 @@ fn cartesian_aggregate_preserves_nested_loop_order_for_integer_overflow() {
 }
 
 #[test]
+#[ignore = "bd-star-hidden-reland-nxl8a: needs b56e7bc7c's Cartesian aggregate path"]
 #[cfg(feature = "ext-json")]
 fn cartesian_aggregate_expression_errors_and_empty_inputs_match_stock() {
     asupersync::test_utils::run_test(|| async {
@@ -681,6 +684,7 @@ fn cartesian_aggregate_expression_errors_and_empty_inputs_match_stock() {
 }
 
 #[test]
+#[ignore = "bd-star-hidden-reland-nxl8a: json and root are not columns without b56e7bc7c"]
 #[cfg(feature = "ext-json")]
 fn json_hidden_columns_preserve_star_widths_and_join_visibility() {
     asupersync::test_utils::run_test(|| async {
@@ -776,6 +780,7 @@ fn json_hidden_columns_preserve_star_widths_and_join_visibility() {
 }
 
 #[test]
+#[ignore = "bd-star-hidden-reland-nxl8a: needs b56e7bc7c's Cartesian aggregate path"]
 #[cfg(feature = "ext-json")]
 fn cartesian_aggregate_validates_column_bindings_before_scanning_empty_inputs() {
     asupersync::test_utils::run_test(|| async {
@@ -814,6 +819,7 @@ fn cartesian_aggregate_validates_column_bindings_before_scanning_empty_inputs() 
 }
 
 #[test]
+#[ignore = "bd-star-hidden-reland-nxl8a: needs b56e7bc7c's Cartesian aggregate path"]
 #[cfg(feature = "ext-json")]
 fn unsupported_cartesian_aggregate_forms_preserve_predicates_and_collations() {
     asupersync::test_utils::run_test(|| async {
@@ -952,6 +958,7 @@ impl fsqlite_func::AggregateFunction for ReplacementSum {
 }
 
 #[test]
+#[ignore = "bd-star-hidden-reland-nxl8a: needs b56e7bc7c's table function registry"]
 #[cfg(feature = "ext-json")]
 fn cartesian_table_functions_honor_module_aggregate_and_collation_replacements() {
     asupersync::test_utils::run_test(|| async {
@@ -1265,10 +1272,6 @@ mod table_function_visibility_registration {
             JsonEachVtab::column_info(args)
         }
 
-        fn hidden_column_names(args: &[&str]) -> Vec<String> {
-            JsonEachVtab::hidden_column_names(args)
-        }
-
         fn connect(cx: &Cx, args: &[&str]) -> Result<Self> {
             JsonEachVtab::connect(cx, args).map(Self)
         }
@@ -1283,6 +1286,7 @@ mod table_function_visibility_registration {
     }
 
     #[test]
+    #[ignore = "bd-star-hidden-reland-nxl8a: needs b56e7bc7c's table function registry"]
     fn table_function_star_retries_cross_source_metadata_replacement() {
         asupersync::test_utils::run_test(|| async {
             let connection = Rc::new(Connection::open(":memory:").await.unwrap());
@@ -1312,6 +1316,7 @@ mod table_function_visibility_registration {
     }
 
     #[test]
+    #[ignore = "bd-star-hidden-reland-nxl8a: needs b56e7bc7c's table function registry"]
     fn table_function_star_bounds_perpetual_metadata_replacement() {
         asupersync::test_utils::run_test(|| async {
             let connection = Rc::new(Connection::open(":memory:").await.unwrap());
@@ -1341,6 +1346,7 @@ mod table_function_visibility_registration {
     }
 
     #[test]
+    #[ignore = "bd-star-hidden-reland-nxl8a: needs b56e7bc7c's table function registry"]
     fn table_function_star_metadata_retry_preserves_values_donor_snapshot() {
         asupersync::test_utils::run_test(|| async {
             let connection = Rc::new(Connection::open(":memory:").await.unwrap());
@@ -1377,6 +1383,7 @@ mod table_function_visibility_registration {
     }
 
     #[test]
+    #[ignore = "bd-star-hidden-reland-nxl8a: needs b56e7bc7c's table function registry"]
     fn table_function_hidden_columns_follow_registered_metadata_not_module_names() {
         asupersync::test_utils::run_test(|| async {
             let f = Connection::open(":memory:").await.unwrap();

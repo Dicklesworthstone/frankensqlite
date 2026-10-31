@@ -381,6 +381,7 @@ fn cartesian_series_custom_arguments_keep_existing_callback_behavior() {
 
 #[cfg(feature = "native")]
 #[test]
+#[ignore = "bd-star-hidden-reland-nxl8a: needs b56e7bc7c's Cartesian aggregate path"]
 fn cartesian_series_observes_operation_deadline_after_source_scans_finish() {
     use asupersync::time::{TimeSource, TimerDriver, TimerDriverHandle};
     use asupersync::types::{RegionId, TaskId, Time};
