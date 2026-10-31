@@ -357,7 +357,11 @@ fn both_sync_failures_have_indeterminate_not_rolled_back_outcomes() {
             // Private page writes must not consume a publication barrier.
             assert_eq!(vfs.sync_count(), 0);
             let token = txn.token();
-            vfs.inject_fault(FaultSpec::power_cut(path).after_nth_sync(sync_index).build());
+            vfs.inject_fault(
+                FaultSpec::power_cut(path)
+                    .after_nth_sync(sync_index)
+                    .build(),
+            );
             assert!(matches!(
                 db.commit(&cx, &mut txn, 100).await,
                 Err(FrankenError::Io(_))
@@ -368,13 +372,19 @@ fn both_sync_failures_have_indeterminate_not_rolled_back_outcomes() {
             assert_eq!(faults.len(), 1, "the intended barrier must actually fail");
             assert_eq!(faults[0].path, Path::new(path));
             assert_eq!(faults[0].kind, FaultKind::PowerCut);
-            assert_eq!(faults[0].detail, format!("operation=sync index={sync_index}"));
+            assert_eq!(
+                faults[0].detail,
+                format!("operation=sync index={sync_index}")
+            );
             assert!(db.needs_recovery());
             assert_eq!(txn.token(), token);
             assert_eq!(txn.state(), NativePageTransactionState::Indeterminate);
             assert!(txn.is_page_dirty(page(1)));
             assert!(txn.is_page_dirty(page(2)));
-            assert!(matches!(db.rollback(&mut txn), Err(FrankenError::BusyRecovery)));
+            assert!(matches!(
+                db.rollback(&mut txn),
+                Err(FrankenError::BusyRecovery)
+            ));
             assert_eq!(db.committed_tip(), CommitSeq::ZERO);
             vfs.power_on();
             assert!(matches!(

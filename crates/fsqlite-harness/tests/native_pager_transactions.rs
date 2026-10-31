@@ -309,7 +309,11 @@ fn failed_syncs_remain_in_doubt_and_recovery_never_invents_an_old_reply() {
             txn.write_page(&cx, page(2), &[9; 512]).await.unwrap();
             // GH#508: select the actual zero-based global barrier index.
             assert_eq!(vfs.sync_count(), 0);
-            vfs.inject_fault(FaultSpec::power_cut(path).after_nth_sync(sync_index).build());
+            vfs.inject_fault(
+                FaultSpec::power_cut(path)
+                    .after_nth_sync(sync_index)
+                    .build(),
+            );
             assert!(matches!(
                 txn.commit_at(&cx, 100).await,
                 Err(FrankenError::Io(_))
@@ -320,7 +324,10 @@ fn failed_syncs_remain_in_doubt_and_recovery_never_invents_an_old_reply() {
             assert_eq!(faults.len(), 1, "the intended barrier must actually fail");
             assert_eq!(faults[0].path, Path::new(path));
             assert_eq!(faults[0].kind, FaultKind::PowerCut);
-            assert_eq!(faults[0].detail, format!("operation=sync index={sync_index}"));
+            assert_eq!(
+                faults[0].detail,
+                format!("operation=sync index={sync_index}")
+            );
             assert_eq!(txn.pager_commit_state(), PagerCommitState::InDoubt);
             assert!(txn.acknowledgement().is_none());
             assert_eq!(txn.pending_commit_pages().unwrap(), vec![page(2)]);
@@ -329,7 +336,10 @@ fn failed_syncs_remain_in_doubt_and_recovery_never_invents_an_old_reply() {
                 Err(FrankenError::BusyRecovery)
             ));
             vfs.power_on();
-            assert!(matches!(txn.rollback(&cx).await, Err(FrankenError::BusyRecovery)));
+            assert!(matches!(
+                txn.rollback(&cx).await,
+                Err(FrankenError::BusyRecovery)
+            ));
             assert!(matches!(
                 txn.commit_at(&cx, 101).await,
                 Err(FrankenError::BusyRecovery)

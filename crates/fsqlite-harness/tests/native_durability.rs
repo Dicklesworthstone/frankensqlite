@@ -30,7 +30,10 @@ fn assert_power_cut<V: Vfs>(vfs: &FaultInjectingVfs<V>, path: &str, sync_index: 
     assert_eq!(faults.len(), 1, "the intended barrier must actually fail");
     assert_eq!(faults[0].path, Path::new(path));
     assert_eq!(faults[0].kind, FaultKind::PowerCut);
-    assert_eq!(faults[0].detail, format!("operation=sync index={sync_index}"));
+    assert_eq!(
+        faults[0].detail,
+        format!("operation=sync index={sync_index}")
+    );
 }
 
 #[test]
@@ -325,7 +328,11 @@ fn recovery_must_complete_both_resyncs_before_returning_a_log() {
                 .unwrap();
             markers.close(&cx).unwrap();
             assert_eq!(vfs.sync_count(), 0);
-            vfs.inject_fault(FaultSpec::power_cut(path).after_nth_sync(sync_index).build());
+            vfs.inject_fault(
+                FaultSpec::power_cut(path)
+                    .after_nth_sync(sync_index)
+                    .build(),
+            );
             assert!(matches!(
                 NativeDurabilityLog::recover(
                     &cx,

@@ -68,7 +68,10 @@ impl<T: TransactionHandle> Wake for ReplyAdmissionProbe<T> {
             Err(FrankenError::Busy) => "full",
             Err(_) => "unexpected error",
         };
-        self.admissions.lock().unwrap().push((self.index, admission));
+        self.admissions
+            .lock()
+            .unwrap()
+            .push((self.index, admission));
     }
 }
 
@@ -497,15 +500,32 @@ async fn check_subgroups(stop: SubgroupStop) {
         txn.write_page(&cx, page(number), &[u8::try_from(index + 2).unwrap(); 512])
             .await
             .unwrap();
-        tickets.push(sender.reserve(&native).await.unwrap().send(txn, 100).unwrap());
+        tickets.push(
+            sender
+                .reserve(&native)
+                .await
+                .unwrap()
+                .send(txn, 100)
+                .unwrap(),
+        );
     }
     let admissions = ReplyAdmissions::default();
-    let mut waits: Vec<_> = tickets.iter_mut().map(|ticket| Box::pin(ticket.wait(&native))).collect();
+    let mut waits: Vec<_> = tickets
+        .iter_mut()
+        .map(|ticket| Box::pin(ticket.wait(&native)))
+        .collect();
     for (index, wait) in waits.iter_mut().enumerate() {
         let waker = reply_admission_waker(&sender, index, &admissions);
-        assert!(wait.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+        assert!(
+            wait.as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
     }
-    let uncertain = matches!(stop, SubgroupStop::ObjectsError | SubgroupStop::MarkersError);
+    let uncertain = matches!(
+        stop,
+        SubgroupStop::ObjectsError | SubgroupStop::MarkersError
+    );
     let attempts = match stop {
         SubgroupStop::Drain => {
             sender.request_shutdown();
@@ -526,7 +546,9 @@ async fn check_subgroups(stop: SubgroupStop) {
     }
     assert_eq!(
         *admissions.lock().unwrap(),
-        (0..pages.len()).map(|index| (index, "closed")).collect::<Vec<_>>()
+        (0..pages.len())
+            .map(|index| (index, "closed"))
+            .collect::<Vec<_>>()
     );
     assert!(native.checkpoint().is_ok());
     assert_eq!(owner.needs_recovery().unwrap(), uncertain);
@@ -535,10 +557,16 @@ async fn check_subgroups(stop: SubgroupStop) {
         SubgroupStop::CancelAfterMarkers => vec![0, 2, 3],
         _ => vec![0],
     };
-    assert_eq!(owner.committed_tip().unwrap().get(), u64::try_from(committed.len()).unwrap());
+    assert_eq!(
+        owner.committed_tip().unwrap().get(),
+        u64::try_from(committed.len()).unwrap()
+    );
     let stopped = {
         let audit = trace.lock().unwrap();
-        assert_eq!(audit.attempts, attempts, "independent peers must share barriers");
+        assert_eq!(
+            audit.attempts, attempts,
+            "independent peers must share barriers"
+        );
         assert_eq!(audit.inner_successes, attempts);
         let expected_failures = match stop {
             SubgroupStop::ObjectsError => vec![("objects", 3)],
@@ -547,12 +575,20 @@ async fn check_subgroups(stop: SubgroupStop) {
         };
         assert_eq!(audit.failures, expected_failures);
         if uncertain {
-            let stream = if stop == SubgroupStop::ObjectsError { "objects" } else { "markers" };
+            let stream = if stop == SubgroupStop::ObjectsError {
+                "objects"
+            } else {
+                "markers"
+            };
             assert_eq!(audit.events.last(), Some(&(stream, "durable_sync")));
         }
         assert_eq!(
             audit.cancellations,
-            if stop == SubgroupStop::CancelAfterMarkers { vec![("markers", 4)] } else { vec![] }
+            if stop == SubgroupStop::CancelAfterMarkers {
+                vec![("markers", 4)]
+            } else {
+                vec![]
+            }
         );
         audit.events.clone()
     };
@@ -561,18 +597,27 @@ async fn check_subgroups(stop: SubgroupStop) {
         returned.push(wait.await.unwrap());
     }
     if uncertain {
-        assert!(Arc::ptr_eq(
-            returned[2].result.as_ref().unwrap_err(),
-            returned[3].result.as_ref().unwrap_err()
-        ), "both admitted members must retain the same original I/O error");
+        assert!(
+            Arc::ptr_eq(
+                returned[2].result.as_ref().unwrap_err(),
+                returned[3].result.as_ref().unwrap_err()
+            ),
+            "both admitted members must retain the same original I/O error"
+        );
     }
     for (index, completion) in returned.iter_mut().enumerate() {
         let txn = &mut completion.transaction;
-        assert_eq!(txn.published_visible_commit_seq_hint(), Some(CommitSeq::ZERO));
+        assert_eq!(
+            txn.published_visible_commit_seq_hint(),
+            Some(CommitSeq::ZERO)
+        );
         if let Some(sequence) = committed.iter().position(|&member| member == index) {
             completion.result.as_ref().unwrap();
             assert_eq!(txn.pager_commit_state(), PagerCommitState::Committed);
-            assert_eq!(txn.acknowledgement().unwrap().commit_seq.get(), u64::try_from(sequence + 1).unwrap());
+            assert_eq!(
+                txn.acknowledgement().unwrap().commit_seq.get(),
+                u64::try_from(sequence + 1).unwrap()
+            );
             assert!(!txn.has_pending_writes());
             continue;
         }
@@ -581,9 +626,18 @@ async fn check_subgroups(stop: SubgroupStop) {
         if uncertain && (2..4).contains(&index) {
             assert_reported_error(completion.result.as_ref().unwrap_err().as_ref());
             assert_eq!(txn.pager_commit_state(), PagerCommitState::InDoubt);
-            assert!(matches!(txn.settle_commit(&cx).await, Err(FrankenError::BusyRecovery)));
-            assert!(matches!(txn.commit_at(&cx, 101).await, Err(FrankenError::BusyRecovery)));
-            assert!(matches!(txn.rollback(&cx).await, Err(FrankenError::BusyRecovery)));
+            assert!(matches!(
+                txn.settle_commit(&cx).await,
+                Err(FrankenError::BusyRecovery)
+            ));
+            assert!(matches!(
+                txn.commit_at(&cx, 101).await,
+                Err(FrankenError::BusyRecovery)
+            ));
+            assert!(matches!(
+                txn.rollback(&cx).await,
+                Err(FrankenError::BusyRecovery)
+            ));
         } else {
             let error = completion.result.as_ref().unwrap_err().as_ref();
             if index == 1 {
@@ -600,25 +654,42 @@ async fn check_subgroups(stop: SubgroupStop) {
         }
     }
     if uncertain {
-        assert!(matches!(owner.begin(&cx, TransactionMode::Concurrent), Err(FrankenError::BusyRecovery)));
+        assert!(matches!(
+            owner.begin(&cx, TransactionMode::Concurrent),
+            Err(FrankenError::BusyRecovery)
+        ));
         assert!(matches!(owner.close(&cx), Err(FrankenError::Busy)));
     }
     drop(returned);
     owner.close(&cx).unwrap();
-    assert_eq!(trace.lock().unwrap().events, stopped, "no retry or cleanup I/O");
+    assert_eq!(
+        trace.lock().unwrap().events,
+        stopped,
+        "no retry or cleanup I/O"
+    );
 
     // MemoryVfs keeps already-written bytes; this checks authenticated replay,
     // not the number of markers that physical power loss would preserve.
-    let retained = if stop == SubgroupStop::MarkersError { vec![0, 2, 3] } else { committed };
+    let retained = if stop == SubgroupStop::MarkersError {
+        vec![0, 2, 3]
+    } else {
+        committed
+    };
     let (mut recovered, report) = recover(&vfs, &cx, &trace).await.unwrap();
     assert_eq!(trace.lock().unwrap().attempts, attempts + 2);
     assert_eq!(report.markers.len(), retained.len());
     let mut view = recovered.begin(&cx).unwrap();
     for &number in &pages {
         let actual = recovered.read_page(&cx, &mut view, page(number)).unwrap();
-        let expected = retained.iter().find(|&&index| pages[index] == number)
+        let expected = retained
+            .iter()
+            .find(|&&index| pages[index] == number)
             .map(|&index| vec![u8::try_from(index + 2).unwrap(); 512]);
-        assert_eq!(actual.as_deref(), expected.as_deref(), "never replay the rejected duplicate or unattempted tail");
+        assert_eq!(
+            actual.as_deref(),
+            expected.as_deref(),
+            "never replay the rejected duplicate or unattempted tail"
+        );
     }
     recovered.rollback(&mut view).unwrap();
     resume_service(&vfs, &cx, &native, &trace, recovered, retained.len()).await;
@@ -637,15 +708,25 @@ fn dropping_between_fallback_ranges_keeps_all_original_handles() {
         for (index, &number) in pages.iter().enumerate() {
             let mut txn = owner.begin(&cx, TransactionMode::Concurrent).unwrap();
             txn.savepoint(&cx, "private").unwrap();
-            txn.write_page(&cx, page(number), &[u8::try_from(index + 2).unwrap(); 512]).await.unwrap();
-            tickets.push(sender.reserve(&native).await.unwrap().send(txn, 100).unwrap());
+            txn.write_page(&cx, page(number), &[u8::try_from(index + 2).unwrap(); 512])
+                .await
+                .unwrap();
+            tickets.push(
+                sender
+                    .reserve(&native)
+                    .await
+                    .unwrap()
+                    .send(txn, 100)
+                    .unwrap(),
+            );
         }
         let mut running = Box::pin(worker.run(&cx));
         for _ in 0..2 {
             poll_fn(|task| {
                 assert!(running.as_mut().poll(task).is_pending());
                 Poll::Ready(())
-            }).await;
+            })
+            .await;
         }
         // The second poll must yield after the oldest singleton, before
         // attempting the remaining range. Drop is not an implicit drain/commit.
@@ -653,7 +734,10 @@ fn dropping_between_fallback_ranges_keeps_all_original_handles() {
         assert_eq!(owner.committed_tip().unwrap(), CommitSeq::new(1));
         let stopped = trace.lock().unwrap().events.clone();
         drop(running);
-        assert!(matches!(sender.try_reserve(&native), Err(FrankenError::Abort)));
+        assert!(matches!(
+            sender.try_reserve(&native),
+            Err(FrankenError::Abort)
+        ));
         assert!(!owner.needs_recovery().unwrap());
         for (index, mut ticket) in tickets.into_iter().enumerate() {
             let mut completion = ticket.wait(&native).await.unwrap();
@@ -662,10 +746,19 @@ fn dropping_between_fallback_ranges_keeps_all_original_handles() {
                 completion.result.as_ref().unwrap();
                 assert_eq!(txn.acknowledgement().unwrap().commit_seq, CommitSeq::new(1));
             } else {
-                assert!(matches!(completion.result.as_ref().unwrap_err().as_ref(), FrankenError::Abort));
+                assert!(matches!(
+                    completion.result.as_ref().unwrap_err().as_ref(),
+                    FrankenError::Abort
+                ));
                 assert_eq!(txn.pager_commit_state(), PagerCommitState::NotCommitted);
                 assert_eq!(txn.pending_commit_pages().unwrap(), [page(pages[index])]);
-                assert_eq!(txn.get_page(&cx, page(pages[index])).await.unwrap().as_bytes(), &[u8::try_from(index + 2).unwrap(); 512]);
+                assert_eq!(
+                    txn.get_page(&cx, page(pages[index]))
+                        .await
+                        .unwrap()
+                        .as_bytes(),
+                    &[u8::try_from(index + 2).unwrap(); 512]
+                );
                 txn.rollback_to_savepoint(&cx, "private").unwrap();
                 assert!(!txn.has_pending_writes());
                 txn.rollback(&cx).await.unwrap();
@@ -689,37 +782,88 @@ fn foreign_head_is_rejected_without_unbatching_the_independent_tail() {
         let (sender, worker) = NativeCommitService::new(&owner, 17, 17).unwrap();
         let mut foreign = other.begin(&cx, TransactionMode::Concurrent).unwrap();
         foreign.write_page(&cx, page(10), &[99; 512]).await.unwrap();
-        let mut rejected = sender.reserve(&native).await.unwrap().send(foreign, 100).unwrap();
+        let mut rejected = sender
+            .reserve(&native)
+            .await
+            .unwrap()
+            .send(foreign, 100)
+            .unwrap();
         let mut tickets = Vec::new();
         for number in 10..26 {
             let mut txn = owner.begin(&cx, TransactionMode::Concurrent).unwrap();
             txn.write_page(&cx, page(number), &[7; 512]).await.unwrap();
-            tickets.push(sender.reserve(&native).await.unwrap().send(txn, 100).unwrap());
+            tickets.push(
+                sender
+                    .reserve(&native)
+                    .await
+                    .unwrap()
+                    .send(txn, 100)
+                    .unwrap(),
+            );
         }
         sender.request_shutdown();
         worker.run(&cx).await.unwrap();
         let mut rejected = rejected.wait(&native).await.unwrap();
-        assert!(matches!(rejected.result.as_ref().unwrap_err().as_ref(), FrankenError::Abort));
-        assert_eq!(rejected.transaction.pager_commit_state(), PagerCommitState::NotCommitted);
-        assert_eq!(rejected.transaction.pending_commit_pages().unwrap(), [page(10)]);
-        assert_eq!(rejected.transaction.get_page(&cx, page(10)).await.unwrap().as_bytes(), &[99; 512]);
+        assert!(matches!(
+            rejected.result.as_ref().unwrap_err().as_ref(),
+            FrankenError::Abort
+        ));
+        assert_eq!(
+            rejected.transaction.pager_commit_state(),
+            PagerCommitState::NotCommitted
+        );
+        assert_eq!(
+            rejected.transaction.pending_commit_pages().unwrap(),
+            [page(10)]
+        );
+        assert_eq!(
+            rejected
+                .transaction
+                .get_page(&cx, page(10))
+                .await
+                .unwrap()
+                .as_bytes(),
+            &[99; 512]
+        );
         rejected.transaction.rollback(&cx).await.unwrap();
         assert_eq!(other.committed_tip().unwrap(), CommitSeq::ZERO);
-        assert_eq!(other_trace.lock().unwrap().attempts, 0, "never use the foreign publisher");
+        assert_eq!(
+            other_trace.lock().unwrap().attempts,
+            0,
+            "never use the foreign publisher"
+        );
         for (index, mut ticket) in tickets.into_iter().enumerate() {
             let completion = ticket.wait(&native).await.unwrap();
             completion.result.as_ref().unwrap();
-            assert_eq!(completion.transaction.acknowledgement().unwrap().commit_seq.get(), u64::try_from(index + 1).unwrap());
+            assert_eq!(
+                completion
+                    .transaction
+                    .acknowledgement()
+                    .unwrap()
+                    .commit_seq
+                    .get(),
+                u64::try_from(index + 1).unwrap()
+            );
         }
         assert_eq!(owner.committed_tip().unwrap(), CommitSeq::new(16));
-        assert_eq!(trace.lock().unwrap().attempts, 2, "the sixteen valid peers share one pair");
+        assert_eq!(
+            trace.lock().unwrap().attempts,
+            2,
+            "the sixteen valid peers share one pair"
+        );
         owner.close(&cx).unwrap();
         other.close(&cx).unwrap();
         let (mut recovered, report) = recover(&vfs, &cx, &trace).await.unwrap();
         assert_eq!(report.markers.len(), 16);
         let mut view = recovered.begin(&cx).unwrap();
         for number in 10..26 {
-            assert_eq!(recovered.read_page(&cx, &mut view, page(number)).unwrap().as_deref(), Some(&[7_u8; 512][..]));
+            assert_eq!(
+                recovered
+                    .read_page(&cx, &mut view, page(number))
+                    .unwrap()
+                    .as_deref(),
+                Some(&[7_u8; 512][..])
+            );
         }
         recovered.rollback(&mut view).unwrap();
         recovered.close(&cx).unwrap();
@@ -759,7 +903,14 @@ async fn check_cancelled_publication(split: bool) {
         txn.write_page(&cx, page(number), &[u8::try_from(index + 2).unwrap(); 512])
             .await
             .unwrap();
-        tickets.push(sender.reserve(&native).await.unwrap().send(txn, 100).unwrap());
+        tickets.push(
+            sender
+                .reserve(&native)
+                .await
+                .unwrap()
+                .send(txn, 100)
+                .unwrap(),
+        );
     }
     let admissions = ReplyAdmissions::default();
     let mut waits: Vec<_> = tickets
@@ -768,19 +919,29 @@ async fn check_cancelled_publication(split: bool) {
         .collect();
     for (index, waiting) in waits.iter_mut().enumerate() {
         let waker = reply_admission_waker(&sender, index, &admissions);
-        assert!(waiting.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+        assert!(
+            waiting
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
     }
     // Both actual syncs succeed. Only the worker context is cancelled, during
     // return from the final marker barrier, before any completion callback.
     trace.lock().unwrap().cancel_after_attempt = Some(2);
-    assert!(matches!(worker.run(&worker_cx).await, Err(FrankenError::Interrupt)));
+    assert!(matches!(
+        worker.run(&worker_cx).await,
+        Err(FrankenError::Interrupt)
+    ));
     assert!(worker_cx.checkpoint().is_err());
     assert!(worker_native.checkpoint().is_err());
     assert!(cx.checkpoint().is_ok());
     assert!(native.checkpoint().is_ok());
     assert_eq!(
         *admissions.lock().unwrap(),
-        (0..pages.len()).map(|index| (index, "closed")).collect::<Vec<_>>(),
+        (0..pages.len())
+            .map(|index| (index, "closed"))
+            .collect::<Vec<_>>(),
         "cancellation must seal admission before even successful replies"
     );
     let stopped = {
@@ -792,15 +953,27 @@ async fn check_cancelled_publication(split: bool) {
         assert_eq!(audit.events.last(), Some(&("markers", "durable_sync")));
         audit.events.clone()
     };
-    assert!(!owner.needs_recovery().unwrap(), "successful barriers are not uncertain");
-    assert_eq!(owner.committed_tip().unwrap().get(), u64::try_from(committed).unwrap());
-    assert!(matches!(sender.try_reserve(&native), Err(FrankenError::Abort)));
+    assert!(
+        !owner.needs_recovery().unwrap(),
+        "successful barriers are not uncertain"
+    );
+    assert_eq!(
+        owner.committed_tip().unwrap().get(),
+        u64::try_from(committed).unwrap()
+    );
+    assert!(matches!(
+        sender.try_reserve(&native),
+        Err(FrankenError::Abort)
+    ));
     assert!(matches!(owner.close(&cx), Err(FrankenError::Busy)));
     for (index, waiting) in waits.into_iter().enumerate() {
         let mut completion = waiting.await.unwrap();
         let txn = &mut completion.transaction;
         assert_eq!(txn.mode(), TransactionMode::Concurrent);
-        assert_eq!(txn.published_visible_commit_seq_hint(), Some(CommitSeq::ZERO));
+        assert_eq!(
+            txn.published_visible_commit_seq_hint(),
+            Some(CommitSeq::ZERO)
+        );
         if index < committed {
             completion.result.as_ref().unwrap();
             assert_eq!(txn.pager_commit_state(), PagerCommitState::Committed);
@@ -818,7 +991,10 @@ async fn check_cancelled_publication(split: bool) {
             assert!(txn.acknowledgement().is_none());
             assert_eq!(txn.pending_commit_pages().unwrap(), [page(pages[index])]);
             assert_eq!(
-                txn.get_page(&cx, page(pages[index])).await.unwrap().as_bytes(),
+                txn.get_page(&cx, page(pages[index]))
+                    .await
+                    .unwrap()
+                    .as_bytes(),
                 &[u8::try_from(index + 2).unwrap(); 512]
             );
             txn.rollback_to_savepoint(&cx, "private").unwrap();
@@ -826,20 +1002,34 @@ async fn check_cancelled_publication(split: bool) {
             txn.rollback(&cx).await.unwrap();
         }
     }
-    assert_eq!(trace.lock().unwrap().events, stopped, "cleanup must not retry storage");
+    assert_eq!(
+        trace.lock().unwrap().events,
+        stopped,
+        "cleanup must not retry storage"
+    );
 
     // The cancelled service is terminal, not the healthy pager. A new service
     // can commit on this SAME owner without recovery or replaying any old intent.
     let mut next = owner.begin(&cx, TransactionMode::Concurrent).unwrap();
     next.write_page(&cx, page(100), &[91; 512]).await.unwrap();
     let (fresh, worker) = NativeCommitService::new(&owner, 1, 1).unwrap();
-    let mut ticket = fresh.reserve(&native).await.unwrap().send(next, 1000).unwrap();
+    let mut ticket = fresh
+        .reserve(&native)
+        .await
+        .unwrap()
+        .send(next, 1000)
+        .unwrap();
     fresh.request_shutdown();
     worker.run(&cx).await.unwrap();
     let completed = ticket.wait(&native).await.unwrap();
     completed.result.unwrap();
     assert_eq!(
-        completed.transaction.acknowledgement().unwrap().commit_seq.get(),
+        completed
+            .transaction
+            .acknowledgement()
+            .unwrap()
+            .commit_seq
+            .get(),
         u64::try_from(committed + 1).unwrap()
     );
     assert_eq!(trace.lock().unwrap().attempts, 4);
@@ -857,7 +1047,10 @@ async fn check_cancelled_publication(split: bool) {
         assert_eq!(actual.as_deref(), expected.as_deref());
     }
     assert_eq!(
-        reopened.read_page(&cx, &mut view, page(100)).unwrap().as_deref(),
+        reopened
+            .read_page(&cx, &mut view, page(100))
+            .unwrap()
+            .as_deref(),
         Some(&[91_u8; 512][..])
     );
     reopened.rollback(&mut view).unwrap();
@@ -989,7 +1182,10 @@ async fn check_service_stop(case: Scenario, marker_barrier: bool, cancel_at_fail
             );
             continue;
         }
-        assert_eq!(txn.pending_commit_pages().unwrap(), [page(case.pages[index])]);
+        assert_eq!(
+            txn.pending_commit_pages().unwrap(),
+            [page(case.pages[index])]
+        );
         assert!(txn.acknowledgement().is_none());
         if index < attempted_end {
             assert_reported_error(completion.result.as_ref().unwrap_err().as_ref());
@@ -1036,12 +1232,7 @@ async fn check_service_stop(case: Scenario, marker_barrier: bool, cancel_at_fail
         "local cleanup must not retry I/O"
     );
 
-    let recovered_count = case.committed
-        + if marker_barrier {
-            case.uncertain
-        } else {
-            0
-        };
+    let recovered_count = case.committed + if marker_barrier { case.uncertain } else { 0 };
     let (mut recovered, report) = recover(&vfs, &cx, &trace).await.unwrap();
     assert_eq!(trace.lock().unwrap().attempts, target + 2);
     assert_eq!(report.markers.len(), recovered_count);
@@ -1124,7 +1315,10 @@ async fn resume_service(
     assert_eq!(reopened.committed_tip(), next_seq);
     let mut view = reopened.begin(cx).unwrap();
     assert_eq!(
-        reopened.read_page(cx, &mut view, page(100)).unwrap().as_deref(),
+        reopened
+            .read_page(cx, &mut view, page(100))
+            .unwrap()
+            .as_deref(),
         Some(&[91_u8; 512][..])
     );
     reopened.rollback(&mut view).unwrap();
@@ -1166,7 +1360,10 @@ async fn check_recovery(marker_barrier: bool) {
         assert!(
             audit.events[before..]
                 .iter()
-                .all(|(_, operation)| !matches!(*operation, "write" | "write_tracked" | "truncate"))
+                .all(|(_, operation)| !matches!(
+                    *operation,
+                    "write" | "write_tracked" | "truncate"
+                ))
         );
     }
     // A new recovery attempt verifies the retained streams again. It does not
@@ -1176,7 +1373,10 @@ async fn check_recovery(marker_barrier: bool) {
     assert_eq!(report.markers.len(), 1);
     let mut view = recovered.begin(&cx).unwrap();
     assert_eq!(
-        recovered.read_page(&cx, &mut view, page(2)).unwrap().as_deref(),
+        recovered
+            .read_page(&cx, &mut view, page(2))
+            .unwrap()
+            .as_deref(),
         Some(&[7_u8; 512][..])
     );
     recovered.rollback(&mut view).unwrap();

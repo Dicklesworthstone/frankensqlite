@@ -490,15 +490,25 @@ fn native_dispatch_does_not_turn_either_sync_failure_into_a_rollback_verdict() {
             // GH#508: the dispatcher must see an actual failed barrier, not
             // a fault scheduled beyond this transaction's publication pair.
             assert_eq!(vfs.sync_count(), 0);
-            vfs.inject_fault(FaultSpec::power_cut(path).after_nth_sync(sync_index).build());
-            assert!(matches!(transaction.commit(&cx).await, Err(FrankenError::Io(_))));
+            vfs.inject_fault(
+                FaultSpec::power_cut(path)
+                    .after_nth_sync(sync_index)
+                    .build(),
+            );
+            assert!(matches!(
+                transaction.commit(&cx).await,
+                Err(FrankenError::Io(_))
+            ));
             assert!(vfs.is_powered_off());
             assert_eq!(vfs.sync_count(), sync_index + 1);
             let faults = vfs.triggered_faults();
             assert_eq!(faults.len(), 1, "the intended barrier must actually fail");
             assert_eq!(faults[0].path, Path::new(path));
             assert_eq!(faults[0].kind, FaultKind::PowerCut);
-            assert_eq!(faults[0].detail, format!("operation=sync index={sync_index}"));
+            assert_eq!(
+                faults[0].detail,
+                format!("operation=sync index={sync_index}")
+            );
             assert_eq!(transaction.pager_commit_state(), PagerCommitState::InDoubt);
             assert_eq!(transaction.pending_commit_pages().unwrap(), vec![page(2)]);
             assert_eq!(pager.committed_tip().unwrap(), CommitSeq::ZERO);

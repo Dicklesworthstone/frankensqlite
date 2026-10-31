@@ -1701,8 +1701,15 @@ mod tests {
         run_io(file.write(&cx, b"retained crash bytes", 0)).unwrap();
         assert_eq!(file.file_size(&cx).unwrap(), 20);
 
-        vfs.inject_fault(FaultSpec::power_cut("retained.db").after_nth_sync(0).build());
-        assert!(matches!(file.sync(&cx, SyncFlags::FULL), Err(FrankenError::Io(_))));
+        vfs.inject_fault(
+            FaultSpec::power_cut("retained.db")
+                .after_nth_sync(0)
+                .build(),
+        );
+        assert!(matches!(
+            file.sync(&cx, SyncFlags::FULL),
+            Err(FrankenError::Io(_))
+        ));
         assert!(vfs.is_powered_off());
         assert_eq!(vfs.sync_count(), 1);
         assert_eq!(vfs.sync_attempt_count(), 1);
@@ -1739,8 +1746,15 @@ mod tests {
             .expect("memory VFS identity");
         assert_eq!(file.file_size(&cx).unwrap(), 17);
 
-        vfs.inject_fault(FaultSpec::power_cut("metadata.db").after_nth_sync(0).build());
-        assert!(matches!(file.sync(&cx, SyncFlags::FULL), Err(FrankenError::Io(_))));
+        vfs.inject_fault(
+            FaultSpec::power_cut("metadata.db")
+                .after_nth_sync(0)
+                .build(),
+        );
+        assert!(matches!(
+            file.sync(&cx, SyncFlags::FULL),
+            Err(FrankenError::Io(_))
+        ));
         assert!(vfs.is_powered_off());
 
         assert!(
