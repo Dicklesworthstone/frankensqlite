@@ -7059,9 +7059,13 @@ mod tests {
             } else {
                 acquisition.expect("waiter acquires after the RESERVED owner finishes");
             }
+            // Cancellation is observed during the main-lock wait, which
+            // restores the exact initial prefix: this waiter entered SHARED.
             assert_eq!(
                 file.lock_level,
-                if operation == "maintenance" {
+                if cancel_after_wait {
+                    LockLevel::Shared
+                } else if operation == "maintenance" {
                     LockLevel::Exclusive
                 } else {
                     LockLevel::Reserved
