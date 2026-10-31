@@ -300,6 +300,10 @@ async fn recover(log: Log, cx: &Cx) -> RecoveredNativeLog<File, File> {
         .unwrap();
     owner.finish().unwrap()
 }
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "replay.prepare takes this as its fallible validator"
+)]
 fn validate(candidate: &NativeCommitCandidate, _: &BTreeMap<ObjectId, Arc<[u8]>>) -> Result<()> {
     let seed = candidate.capsule[0];
     assert_eq!(candidate.capsule.as_ref(), &[seed; 8]);
