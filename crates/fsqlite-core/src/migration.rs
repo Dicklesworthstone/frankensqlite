@@ -744,7 +744,7 @@ mod tests {
             let db_path = directory.join("new.db").to_str().unwrap().to_owned();
             let marker_path = migration_marker_path(&db_path);
             host_fs::create_dir_all(&marker_path).unwrap();
-            let conn = Connection::open_schema_only(&db_path).await.unwrap();
+            let conn = Connection::open(&db_path).await.unwrap();
             assert!(matches!(
                 run_first_open_migration(&conn, true).await,
                 MigrationOutcome::Incomplete {
