@@ -264149,7 +264149,7 @@ mod pager_routing_tests {
                 );
                 assert_eq!(captured.db_size, full.db_size, "{statements:?}");
                 assert_eq!(
-                    image_bytes(&*captured),
+                    image_bytes(&captured),
                     image_bytes(&full),
                     "{statements:?}: commit capture differs from a full read"
                 );
