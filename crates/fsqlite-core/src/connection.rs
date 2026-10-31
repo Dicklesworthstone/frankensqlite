@@ -43708,8 +43708,7 @@ impl Connection {
             select_stmt.clone()
         };
         if self.skip_statement_memdb_refresh.get() && effective_select.with.is_none() {
-            return self
-                .execute_select_via_memdb_fallback(&effective_select, params)
+            return Box::pin(self.execute_select_via_memdb_fallback(&effective_select, params))
                 .await;
         }
         self.execute_statement(&Statement::Select(effective_select), params)
