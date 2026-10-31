@@ -718,7 +718,9 @@ mod tests {
             no_pool.set_native_cx(asupersync::Cx::current().unwrap().with_blocking_pool_handle(None));
             assert!(matches!(backup.restore_to_new_directory_async(&no_pool, &parent).await,
                 Err(FrankenError::BackgroundWorkerFailed(_))));
-            let cancelled = context();
+            // Shared, because cancelling an owned context would cancel this test's own task.
+            let cancelled = Cx::new();
+            cancelled.set_shared_native_cx(asupersync::Cx::current().unwrap());
             cancelled.cancel();
             assert!(matches!(backup.restore_to_new_directory_async(&cancelled, &parent).await,
                 Err(FrankenError::Interrupt)));
