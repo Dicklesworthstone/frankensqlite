@@ -54,6 +54,24 @@ fn checkpoint_or_abort(cx: &Cx) -> Result<()> {
     cx.checkpoint().map_err(|_| FrankenError::Abort)
 }
 
+/// Main-lock admission check for the points before any wait: `UnixFile::lock`
+/// entry, the first attempt, and each nonblocking `F_SETLK` probe.
+///
+/// The full checkpoint runs only when a cancellation is already published, on
+/// the local flag or on the native context's flag. A full checkpoint probes
+/// the attached native context, which reads the clock and checks its budget,
+/// and uncontended main-file locks are taken several times per statement.
+/// A deadline, budget or e-process decision that has not been published yet
+/// is still seen before the first wait: the lock loop takes a full checkpoint
+/// before every backoff sleep and at the top of every retry.
+fn checkpoint_or_abort_if_cancel_published(cx: &Cx) -> Result<()> {
+    if cx.published_cancel_requested() {
+        checkpoint_or_abort(cx)
+    } else {
+        Ok(())
+    }
+}
+
 // Keep the payload mmap offset valid on both 4-KiB and 16-KiB hosts. Hosts
 // with an incompatible page size refuse instead of mapping a different ABI.
 const MVCC_SHM_PAYLOAD_OFFSET: u64 = 64 * 1024;
@@ -704,7 +722,9 @@ fn try_posix_main_lock_styled(
     len: u64,
     native_contention: &mut Option<(u64, u64)>,
 ) -> Result<(bool, FileLockStyle)> {
-    checkpoint_or_abort(cx)?;
+    checkpoint_or_abort_if_cancel_published(cx)?;
+    #[cfg(test)]
+    tests::observe_main_lock_probe();
     let result = posix_lock_styled(file, lock_type, start, len)?;
     if !result.0 {
         *native_contention = Some((start, len));
@@ -4118,13 +4138,17 @@ impl VfsFile for UnixFile {
     }
 
     fn lock(&mut self, cx: &Cx, level: LockLevel) -> Result<()> {
-        checkpoint_or_abort(cx)?;
+        checkpoint_or_abort_if_cancel_published(cx)?;
         let timeout = Duration::from_millis(self.busy_timeout_ms);
         let prior_level = self.lock_level;
         let mut wait_started = None;
         let mut backoff = Duration::from_millis(1);
         loop {
             let mut native_contention = None;
+            // The first attempt follows the entry check with no wait between
+            // them. Every retry follows a backoff sleep and takes the full
+            // checkpoint.
+            let retrying = wait_started.is_some();
             // Publish each completed prefix under the inode mutex, but never
             // retain that mutex across a native wait. Keeping PENDING between
             // attempts blocks new readers while an EXCLUSIVE writer drains them.
@@ -4133,7 +4157,12 @@ impl VfsFile for UnixFile {
                 let mut info = inode_info
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if let Err(error) = checkpoint_or_abort(cx) {
+                let admission = if retrying {
+                    checkpoint_or_abort(cx)
+                } else {
+                    checkpoint_or_abort_if_cancel_published(cx)
+                };
+                if let Err(error) = admission {
                     return Self::return_after_main_lock_failure(
                         &mut info,
                         &mut self.lock_level,
@@ -4447,6 +4476,8 @@ impl VfsFile for UnixFile {
             if remaining.is_zero() {
                 return self.restore_failed_main_lock_wait(prior_level, FrankenError::Busy);
             }
+            #[cfg(test)]
+            tests::observe_main_lock_sleep();
             std::thread::sleep(backoff.min(remaining));
             backoff = (backoff * 2).min(Duration::from_millis(100));
         }
@@ -5564,6 +5595,233 @@ mod tests {
                 observer();
             }
         }
+    }
+
+    thread_local! {
+        static MAIN_LOCK_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        static MAIN_LOCK_SLEEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    pub(super) fn observe_main_lock_probe() {
+        MAIN_LOCK_PROBES.with(|probes| probes.set(probes.get() + 1));
+    }
+
+    pub(super) fn observe_main_lock_sleep() {
+        MAIN_LOCK_SLEEPS.with(|sleeps| sleeps.set(sleeps.get() + 1));
+    }
+
+    /// Return this thread's (nonblocking main-lock probes, backoff sleeps)
+    /// since the last call, and reset both counts.
+    fn take_main_lock_witness() -> (usize, usize) {
+        (
+            MAIN_LOCK_PROBES.with(|probes| probes.replace(0)),
+            MAIN_LOCK_SLEEPS.with(|sleeps| sleeps.replace(0)),
+        )
+    }
+
+    const MAIN_LOCK_HOLDER_PATH: &str = "FSQLITE_VFS_MAIN_LOCK_HOLDER_PATH";
+    const MAIN_LOCK_HOLDER_START: &str = "FSQLITE_VFS_MAIN_LOCK_HOLDER_START";
+    const MAIN_LOCK_HOLDER_LEN: &str = "FSQLITE_VFS_MAIN_LOCK_HOLDER_LEN";
+
+    /// Child side of [`spawn_main_lock_holder`]. Returns true when this process
+    /// is the holder; it has then held and released its lock.
+    fn run_main_lock_holder_child() -> bool {
+        let Some(path) = std::env::var_os(MAIN_LOCK_HOLDER_PATH) else {
+            return false;
+        };
+        let start: u64 = std::env::var(MAIN_LOCK_HOLDER_START)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let len: u64 = std::env::var(MAIN_LOCK_HOLDER_LEN)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        assert!(posix_lock(&file, libc::F_WRLCK, start, len).unwrap());
+        println!("main-lock-held");
+        std::io::stdout().flush().unwrap();
+        let mut line = String::new();
+        std::io::stdin().lock().read_line(&mut line).unwrap();
+        assert_eq!(line.trim(), "release");
+        posix_unlock(&file, start, len).unwrap();
+        true
+    }
+
+    /// Hold a write lock on `[start, start + len)` of `path` from a child
+    /// process, so the parent's nonblocking probe meets real native contention
+    /// (classic fcntl locks never conflict within one process). Keep the
+    /// returned reader alive until the child has exited.
+    fn spawn_main_lock_holder(
+        test: &str,
+        path: &Path,
+        start: u64,
+        len: u64,
+    ) -> (Child, BufReader<std::process::ChildStdout>) {
+        let mut holder = Command::new(std::env::current_exe().unwrap())
+            .args([test, "--exact", "--nocapture"])
+            .env(MAIN_LOCK_HOLDER_PATH, path)
+            .env(MAIN_LOCK_HOLDER_START, start.to_string())
+            .env(MAIN_LOCK_HOLDER_LEN, len.to_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut output = BufReader::new(holder.stdout.take().unwrap());
+        loop {
+            let mut line = String::new();
+            assert_ne!(
+                output.read_line(&mut line).unwrap(),
+                0,
+                "the holder exited before taking its lock"
+            );
+            if line.trim() == "main-lock-held" {
+                break;
+            }
+        }
+        (holder, output)
+    }
+
+    fn check_published_cancel_aborts_lock_at_entry_before_probe(cx: &Cx, name: &str) {
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path(name);
+        let clean_cx = Cx::new();
+        let (mut file, _) = vfs
+            .open(&clean_cx, Some(&path), open_flags_create())
+            .unwrap();
+        assert!(cx.published_cancel_requested());
+        let _ = take_main_lock_witness();
+        assert!(matches!(
+            file.lock(cx, LockLevel::Shared),
+            Err(FrankenError::Abort)
+        ));
+        assert_eq!(
+            take_main_lock_witness(),
+            (0, 0),
+            "a published cancellation aborts before any probe or sleep"
+        );
+        assert_eq!(file.lock_level, LockLevel::None);
+        file.lock(&clean_cx, LockLevel::Shared)
+            .expect("an uncancelled context still takes the lock");
+        assert!(
+            take_main_lock_witness().0 > 0,
+            "the witness counts real probes"
+        );
+        file.unlock(&clean_cx, LockLevel::None).unwrap();
+        file.close(&clean_cx).unwrap();
+    }
+
+    #[test]
+    fn published_local_cancel_aborts_lock_at_entry_before_probe() {
+        let cx = Cx::new();
+        cx.cancel();
+        check_published_cancel_aborts_lock_at_entry_before_probe(&cx, "lock-entry-local.db");
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn published_native_cancel_aborts_lock_at_entry_before_probe() {
+        let cx = Cx::new();
+        let native = asupersync::Cx::for_testing();
+        cx.set_native_cx(native.clone());
+        native.cancel_with(asupersync::types::CancelKind::User, None);
+        assert!(native.published_cancel_requested());
+        assert!(
+            !cx.is_cancel_requested(),
+            "the cancellation is native-only, so the local flag is still clear"
+        );
+        check_published_cancel_aborts_lock_at_entry_before_probe(&cx, "lock-entry-native.db");
+    }
+
+    /// An expired deadline is not a published cancellation, so the gated
+    /// admission checks pass it and the lock probes the kernel. On contention,
+    /// the full checkpoint before the first backoff sleep must still observe
+    /// the deadline and abort without sleeping.
+    #[cfg(feature = "native")]
+    fn check_expired_native_deadline_aborts_contended_lock_before_sleep(
+        test: &str,
+        name: &str,
+        reserved: bool,
+    ) {
+        if run_main_lock_holder_child() {
+            return;
+        }
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path(name);
+        let clean_cx = Cx::new();
+        let (mut file, _) = vfs
+            .open(&clean_cx, Some(&path), open_flags_create())
+            .unwrap();
+        // A permitted busy wait: without the pre-backoff checkpoint the lock
+        // would sleep before it noticed the deadline.
+        file.set_busy_timeout_ms(5_000);
+        let (prior, target, start, len) = if reserved {
+            file.lock(&clean_cx, LockLevel::Shared).unwrap();
+            (LockLevel::Shared, LockLevel::Reserved, RESERVED_BYTE, 1)
+        } else {
+            (
+                LockLevel::None,
+                LockLevel::Shared,
+                SHARED_FIRST,
+                SHARED_SIZE,
+            )
+        };
+        let (mut holder, _holder_output) = spawn_main_lock_holder(test, &path, start, len);
+
+        let cx = Cx::new();
+        let deadline = asupersync::time::wall_now();
+        let native = asupersync::Cx::for_testing_with_budget(
+            asupersync::Budget::new().with_deadline(deadline),
+        );
+        cx.set_native_cx(native);
+        assert!(
+            !cx.published_cancel_requested(),
+            "an expired deadline is not published until a full checkpoint sees it"
+        );
+        let _ = take_main_lock_witness();
+        assert!(matches!(file.lock(&cx, target), Err(FrankenError::Abort)));
+        let (probes, sleeps) = take_main_lock_witness();
+        assert!(probes > 0, "the lock reached a real contended probe");
+        assert_eq!(
+            sleeps, 0,
+            "an expired deadline aborts before the first backoff sleep"
+        );
+        assert!(
+            cx.is_cancel_requested(),
+            "the abort came from a full checkpoint observing the native deadline"
+        );
+        assert_eq!(file.lock_level, prior, "the abort restores the prior level");
+
+        writeln!(holder.stdin.as_mut().unwrap(), "release").unwrap();
+        assert!(holder.wait().unwrap().success());
+        file.lock(&clean_cx, target)
+            .expect("the restored prefix locks again once the holder is gone");
+        file.unlock(&clean_cx, LockLevel::None).unwrap();
+        file.close(&clean_cx).unwrap();
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn expired_native_deadline_aborts_contended_shared_lock_before_sleep() {
+        check_expired_native_deadline_aborts_contended_lock_before_sleep(
+            "unix::tests::expired_native_deadline_aborts_contended_shared_lock_before_sleep",
+            "deadline-shared.db",
+            false,
+        );
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn expired_native_deadline_aborts_contended_reserved_lock_before_sleep() {
+        check_expired_native_deadline_aborts_contended_lock_before_sleep(
+            "unix::tests::expired_native_deadline_aborts_contended_reserved_lock_before_sleep",
+            "deadline-reserved.db",
+            true,
+        );
     }
 
     fn admitted_mvcc_fixture(

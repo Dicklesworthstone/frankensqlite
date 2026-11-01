@@ -1435,6 +1435,40 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
         self.inner.cancel_requested.load(Ordering::Acquire)
     }
 
+    /// Whether a cancellation is already published, either on this context's
+    /// local flag or on the native context [`Self::checkpoint`] would probe
+    /// (the attached one, else the fallback).
+    ///
+    /// This is one atomic load each, plus the attachment mutex. It reads no
+    /// clock and makes no budget, deadline or e-process decision; only
+    /// [`Self::checkpoint`] does that. The native flag can lag a legacy direct
+    /// write, but it never reads true falsely. A caller that skips its full
+    /// checkpoint while this is false must still take a full checkpoint before
+    /// any wait, sleep or retry.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn published_cancel_requested(&self) -> bool {
+        if self.inner.cancel_requested.load(Ordering::Acquire) {
+            return true;
+        }
+        #[cfg(feature = "native")]
+        {
+            let attached = self
+                .inner
+                .attached_native_cx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(native) = attached.as_ref() {
+                return native.published_cancel_requested();
+            }
+            drop(attached);
+            if let Some(native) = self.inner.fallback_native_cx.get() {
+                return native.published_cancel_requested();
+            }
+        }
+        false
+    }
+
     /// Wait until local cancellation is observable at an unmasked boundary.
     ///
     /// The returned future borrows this context's existing cancellation node;
