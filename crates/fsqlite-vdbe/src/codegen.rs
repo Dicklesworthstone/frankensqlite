@@ -5533,7 +5533,8 @@ fn composite_equality_scan_extra_prefix<'e>(
             {
                 Some((
                     bound,
-                    matches!(column.affinity, 'B' | 'C' | 'D' | 'E').then_some(column.affinity),
+                    matches!(column.affinity, 'B' | 'C' | 'D' | 'E')
+                        .then_some(index_key_affinity(column.affinity)),
                 ))
             }
             _ => None,
@@ -6252,7 +6253,7 @@ fn codegen_select_index_in_const_scan(
             r_value,
             1,
             0,
-            P4::Affinity(target.affinity.to_string()),
+            P4::Affinity(index_key_affinity(target.affinity).to_string()),
             0,
         );
         b.emit_op(Opcode::MakeRecord, r_value, 1, r_key, P4::None, 0);
@@ -7117,7 +7118,7 @@ fn codegen_select_index_range_scan(
         .columns
         .first()
         .and_then(|name| table.column_index(name))
-        .map(|idx| table.columns[idx].affinity)
+        .map(|idx| index_key_affinity(table.columns[idx].affinity))
         .filter(|&aff| matches!(aff, 'C' | 'D' | 'E' | 'B'));
     let lower_probe = index_range.lower.as_ref().map(|bound| {
         let base = b.alloc_regs(2);
@@ -7345,7 +7346,7 @@ fn codegen_select_index_range_scan_desc(
         .columns
         .first()
         .and_then(|name| table.column_index(name))
-        .map(|idx| table.columns[idx].affinity)
+        .map(|idx| index_key_affinity(table.columns[idx].affinity))
         .filter(|&aff| matches!(aff, 'C' | 'D' | 'E' | 'B'));
 
     // Upper bound anchors the seek (position at the high end); rowid sentinel MAX so `SeekLE`
@@ -7543,7 +7544,7 @@ fn codegen_select_composite_index_prefix_range_scan(
                 .columns
                 .get(pos)
                 .and_then(|name| table.column_index(name))
-                .map(|i| table.columns[i].affinity)
+                .map(|i| index_key_affinity(table.columns[i].affinity))
                 .filter(|&a| matches!(a, 'C' | 'D' | 'E' | 'B'))
         })
         .collect();
@@ -7797,7 +7798,7 @@ fn codegen_select_composite_index_prefix_range_scan_desc(
                 .columns
                 .get(pos)
                 .and_then(|name| table.column_index(name))
-                .map(|i| table.columns[i].affinity)
+                .map(|i| index_key_affinity(table.columns[i].affinity))
                 .filter(|&a| matches!(a, 'C' | 'D' | 'E' | 'B'))
         })
         .collect();
@@ -9831,7 +9832,7 @@ fn codegen_select_index_ordered_scan(
                         reg,
                         1,
                         0,
-                        P4::Affinity(char::from(affinity).to_string()),
+                        P4::Affinity(index_key_affinity(char::from(affinity)).to_string()),
                         0,
                     );
                 }
@@ -16058,7 +16059,7 @@ fn minmax_prefix_seek_plan<'e>(
     let b_descending = idx.key_term_descending(1);
     let a_affinity = table
         .column_index(&a_col_name)
-        .map(|i| table.columns[i].affinity)
+        .map(|i| index_key_affinity(table.columns[i].affinity))
         .filter(|&aff| matches!(aff, 'C' | 'D' | 'E' | 'B'));
     let a_collation = idx
         .key_term_collation(0)
@@ -16672,7 +16673,7 @@ fn codegen_select_skip_scan(
         .columns
         .get(1)
         .and_then(|name| table.column_index(name))
-        .map(|i| table.columns[i].affinity)
+        .map(|i| index_key_affinity(table.columns[i].affinity))
         .filter(|&a| matches!(a, 'C' | 'D' | 'E' | 'B'));
     let const_reg = b.alloc_reg();
     emit_expr(b, const_expr, const_reg, None);
@@ -16910,7 +16911,7 @@ fn codegen_select_skip_scan_range(
         .columns
         .get(1)
         .and_then(|name| table.column_index(name))
-        .map(|i| table.columns[i].affinity)
+        .map(|i| index_key_affinity(table.columns[i].affinity))
         .filter(|&a| matches!(a, 'C' | 'D' | 'E' | 'B'));
     let coerce = |b: &mut ProgramBuilder, reg: i32, expr: &Expr| {
         if let Some(aff) = target_aff
@@ -20147,7 +20148,7 @@ fn codegen_select_aggregate(
             .columns
             .first()
             .and_then(|name| table.column_index(name))
-            .map(|i| table.columns[i].affinity)
+            .map(|i| index_key_affinity(table.columns[i].affinity))
             .filter(|&aff| matches!(aff, 'C' | 'D' | 'E' | 'B'));
 
         let lower_probe = index_range.lower.as_ref().map(|bound| {
@@ -20340,7 +20341,7 @@ fn codegen_select_aggregate(
                     .columns
                     .get(pos)
                     .and_then(|name| table.column_index(name))
-                    .map(|i| table.columns[i].affinity)
+                    .map(|i| index_key_affinity(table.columns[i].affinity))
                     .filter(|&a| matches!(a, 'C' | 'D' | 'E' | 'B'))
             })
             .collect();
@@ -27512,7 +27513,7 @@ fn emit_index_eq_rowset_collect(
                 probe_key_regs + offset,
                 1,
                 0,
-                P4::Affinity(affinity.to_string()),
+                P4::Affinity(index_key_affinity(*affinity).to_string()),
                 0,
             );
         }
@@ -40326,7 +40327,7 @@ fn index_term_probe_affinity(
         0 => Some(None),
         b'B' if column_affinity == b'B' => Some(Some('B')),
         b'C' if matches!(column_affinity, b'C' | b'D' | b'E') => {
-            Some(Some(char::from(column_affinity)))
+            Some(Some(index_key_affinity(char::from(column_affinity))))
         }
         _ => None,
     }
@@ -50995,8 +50996,9 @@ mod tests {
     #[test]
     fn test_codegen_select_index_range_with_numeric_affinity_uses_index() {
         // bd-u6tbr enabled the placeholder-bound numeric-affinity range seek: the bound is coerced
-        // to the column's affinity ('D') so the seek positions identically to the WHERE comparison,
-        // making the index-range fast path byte-exact (differential oracle: index_range_seek_oracle_e2e).
+        // to NUMERIC ('C'), the cap stock puts on an index probe (bd-xz5f4), so the seek positions
+        // identically to the WHERE comparison, making the index-range fast path byte-exact
+        // (differential oracle: index_range_seek_oracle_e2e).
         // (Was previously asserted to "fall back" to a full scan; bd-u6tbr made that assertion stale.)
         let stmt = simple_select(
             &["n"],
@@ -51026,7 +51028,7 @@ mod tests {
         assert!(
             ops.iter()
                 .any(|op| op.opcode == Opcode::Affinity
-                    && matches!(&op.p4, P4::Affinity(a) if a == "D")),
+                    && matches!(&op.p4, P4::Affinity(a) if a == "C")),
             "the placeholder bound should be coerced to the column's numeric affinity before the seek"
         );
     }

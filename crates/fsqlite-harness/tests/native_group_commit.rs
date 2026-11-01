@@ -133,7 +133,10 @@ fn assert_power_cut<V: Vfs>(vfs: &FaultInjectingVfs<V>, path: &str, sync_index: 
     assert_eq!(faults.len(), 1, "the intended barrier must actually fail");
     assert_eq!(faults[0].path, Path::new(path));
     assert_eq!(faults[0].kind, FaultKind::PowerCut);
-    assert_eq!(faults[0].detail, format!("operation=sync index={sync_index}"));
+    assert_eq!(
+        faults[0].detail,
+        format!("operation=sync index={sync_index}")
+    );
 }
 
 #[test]
@@ -473,7 +476,11 @@ fn both_sync_failures_leave_all_writers_indeterminate_until_actual_log_recovery(
             // not a one-based ordinal within the matching stream.
             assert_eq!(vfs.sync_count(), 0);
             let tokens = (a.token(), reader.token(), b.token());
-            vfs.inject_fault(FaultSpec::power_cut(path).after_nth_sync(ordinal - 1).build());
+            vfs.inject_fault(
+                FaultSpec::power_cut(path)
+                    .after_nth_sync(ordinal - 1)
+                    .build(),
+            );
             assert!(matches!(
                 db.commit_batch(&cx, &mut [&mut a, &mut reader, &mut b], 100)
                     .await,
@@ -851,9 +858,7 @@ fn sealed_pager_failed_group_keeps_every_write_in_doubt_and_can_be_closed_after_
         assert_eq!(vfs.sync_count(), 0);
         vfs.inject_fault(FaultSpec::power_cut("markers").after_nth_sync(1).build());
         assert!(matches!(
-            owner
-                .commit_batch_at(&cx, &mut [&mut a, &mut b], 100)
-                .await,
+            owner.commit_batch_at(&cx, &mut [&mut a, &mut b], 100).await,
             Err(FrankenError::Io(_))
         ));
         assert_power_cut(&vfs, "markers", 1);

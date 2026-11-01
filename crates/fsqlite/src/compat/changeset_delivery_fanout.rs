@@ -363,22 +363,15 @@ impl FanoutDelivery {
     ) -> DeliveryResult<Vec<OrderedMessage>> {
         let slot = self.receiver_slot(receiver)?;
         if max_messages == 0 || max_messages > 256 {
-            return Err(CaptureError::Input(
-                "delivery batch count must be in 1..=256",
-            )
-            .into());
+            return Err(CaptureError::Input("delivery batch count must be in 1..=256").into());
         }
         if max_batch_bytes == 0 || max_batch_bytes > super::super::MAX_PAYLOAD {
-            return Err(CaptureError::Input(
-                "delivery batch byte bound must be in 1..64 MiB",
-            )
-            .into());
+            return Err(
+                CaptureError::Input("delivery batch byte bound must be in 1..64 MiB").into(),
+            );
         }
         if max_message_bytes == 0 || max_message_bytes > super::super::MAX_PAYLOAD {
-            return Err(CaptureError::Input(
-                "delivery message bound must be in 1..64 MiB",
-            )
-            .into());
+            return Err(CaptureError::Input("delivery message bound must be in 1..64 MiB").into());
         }
         checkpoint(cx)?;
         let transaction = conn.transaction().await?;

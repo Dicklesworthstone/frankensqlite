@@ -3158,7 +3158,7 @@ mod tests {
         write_root_pointer_atomic(&layout.root_path(), pointer).expect("write root");
         must_err_contains(
             bootstrap_native_mode(&layout, false, None),
-            "marker_chain_gap",
+            "marker hash chain mismatch at commit_seq 2",
             "bootstrap_rejects_marker_chain_gap",
         );
     }

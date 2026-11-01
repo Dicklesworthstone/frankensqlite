@@ -19,7 +19,7 @@ addr  opcode           p1    p2    p3    p4                 p5
 4     OpenWrite        2     11    0     (tbl)idx_docs_title  0 
 5     Null             0     1     0                        0 
 6     Variable         1     3     0                        0 
-7     Affinity         3     1     0     (aff)D             0 
+7     Affinity         3     1     0     (aff)C             0 
 8     Int64            0     4     0     (i64)-9223372036854775808  0 
 9     MakeRecord       3     2     5                        0 
 10    OpenRead         3     10    0     (idx)idx_docs_category  0 

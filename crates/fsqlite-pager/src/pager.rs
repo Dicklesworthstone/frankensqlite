@@ -5505,7 +5505,7 @@ impl<F: VfsFile + 'static> WalIndexShmSource<F> {
             // The attempted slot is restored before this reversible wait.
             // Keep stock retry pacing, but let the explicit operation's local
             // relay interrupt even the longer late-attempt backoffs.
-            await_pager_admission(cx, wal_reader_retry_pause(attempt)).await?;
+            await_pager_admission(cx, None, wal_reader_retry_pause(attempt)).await?;
         }
     }
 
@@ -5720,7 +5720,7 @@ async fn async_rwlock_read<'a, T>(
     if cx.mask_depth() == 0
         && let Some(native_cx) = cx.attached_native_cx()
     {
-        return await_pager_admission(cx, lock.read(&native_cx))
+        return await_pager_admission(cx, Some(&native_cx), lock.read(&native_cx))
             .await?
             .map_err(|error| match error {
                 asupersync::sync::RwLockError::Cancelled => FrankenError::Abort,
@@ -5756,7 +5756,7 @@ async fn async_rwlock_write<'a, T>(
     if cx.mask_depth() == 0
         && let Some(native_cx) = cx.attached_native_cx()
     {
-        return await_pager_admission(cx, lock.write(&native_cx))
+        return await_pager_admission(cx, Some(&native_cx), lock.write(&native_cx))
             .await?
             .map_err(|error| match error {
                 asupersync::sync::RwLockError::Cancelled => FrankenError::Abort,
@@ -7110,6 +7110,7 @@ impl PagerMaintenanceLease {
             }
             await_pager_admission(
                 cx,
+                None,
                 asupersync::time::sleep(asupersync::time::wall_now(), pause),
             )
             .await?;
@@ -7274,6 +7275,7 @@ async fn begin_namespace_admission(
             let slice = remaining.min(Duration::from_millis(50));
             await_pager_admission(
                 cx,
+                None,
                 asupersync::time::sleep(asupersync::time::wall_now(), slice),
             )
             .await?;
@@ -15081,7 +15083,7 @@ where
                     memory_db_bump_alloc,
                     rolled_back_pages: HashSet::new(),
                     txn_read_cache: RefCell::new(PagePageMap::default()),
-                    txn_read_cache_page_budget: self.transaction_read_cache_page_budget(mode),
+                    txn_read_cache_page_budget: self.transaction_read_cache_page_budget(),
                     txn_read_cache_incomplete: Cell::new(false),
                     retained_memory_overlay_dirty_pages: BTreeSet::new(),
                     scratch_arena: bumpalo::Bump::new(),
@@ -15321,7 +15323,7 @@ where
                 memory_db_bump_alloc,
                 rolled_back_pages: HashSet::new(),
                 txn_read_cache: RefCell::new(PagePageMap::default()),
-                txn_read_cache_page_budget: self.transaction_read_cache_page_budget(mode),
+                txn_read_cache_page_budget: self.transaction_read_cache_page_budget(),
                 txn_read_cache_incomplete: Cell::new(false),
                 retained_memory_overlay_dirty_pages: BTreeSet::new(),
                 scratch_arena: bumpalo::Bump::new(),
@@ -18029,19 +18031,12 @@ where
     /// much larger allocation-pool ceiling (GH #525). Capture the bound at
     /// BEGIN: a later connection attachment or cache-size increase must not
     /// make previously unretained snapshot pages appear safe to reread.
-    fn transaction_read_cache_page_budget(&self, mode: TransactionMode) -> usize {
-        if mode == TransactionMode::ReadOnly
-            && self
-                .shared_connection_count
-                .get()
-                .is_some_and(|counter| counter.load(AtomicOrdering::Acquire) == 1)
-        {
-            // Keep the WAL read pin and all normal snapshot validation. A
-            // process-local connection count does not exclude external writers.
-            0
-        } else {
-            self.cache.cache_page_budget().min(self.pool.capacity())
-        }
+    ///
+    /// A read-only transaction on the only local connection gets the same
+    /// budget. With none, nothing holds a page between two reads of one
+    /// statement, and every repeat takes the whole WAL read path.
+    fn transaction_read_cache_page_budget(&self) -> usize {
+        self.cache.cache_page_budget().min(self.pool.capacity())
     }
 
     /// Number of page reads satisfied directly from the publication plane.
@@ -22143,13 +22138,7 @@ where
     /// A successful retained commit begins a new logical snapshot. Failed
     /// commits, savepoint rollback and cache invalidation must not call this.
     fn reset_transaction_read_cache_budget(&mut self) {
-        self.txn_read_cache_page_budget = if self.mode == TransactionMode::ReadOnly
-            && self.single_connection_fast_path_enabled()
-        {
-            0
-        } else {
-            self.cache.cache_page_budget().min(self.pool.capacity())
-        };
+        self.txn_read_cache_page_budget = self.cache.cache_page_budget().min(self.pool.capacity());
         self.txn_read_cache_incomplete.set(false);
     }
 
@@ -31227,7 +31216,7 @@ mod tests {
             assert!(relay.cancel_local(CancelReason::UserInterrupt));
             std::task::Poll::Ready(guard)
         });
-        let mut admission = Box::pin(await_pager_admission(&operation, wait));
+        let mut admission = Box::pin(await_pager_admission(&operation, None, wait));
         let mut task_cx = std::task::Context::from_waker(std::task::Waker::noop());
         assert!(matches!(
             admission.as_mut().poll(&mut task_cx),
@@ -33412,7 +33401,7 @@ mod tests {
     }
 
     #[test]
-    fn gh_525_single_reader_bypasses_copies_and_fails_closed_after_peer_attaches() {
+    fn gh_525_single_reader_bounds_copies_and_fails_closed_after_peer_attaches() {
         asupersync::test_utils::run_test(|| async {
             let cx = Cx::new();
             let (pager, _) = test_pager().await;
@@ -33421,16 +33410,18 @@ mod tests {
             let pages = gh525_seed_snapshot_pages(&pager, &cx).await;
             pager.set_cache_page_budget(4).unwrap();
             let mut reader = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
-            assert_eq!(reader.txn_read_cache_page_budget, 0);
+            assert_eq!(reader.txn_read_cache_page_budget, 4);
+            // Backwards, so the budget fills before pages[0] and it stays
+            // unretained for the peer commit below.
             for _ in 0..2 {
-                for &(page_no, marker) in &pages {
+                for &(page_no, marker) in pages.iter().rev() {
                     assert_eq!(
                         reader.get_page(&cx, page_no).await.unwrap().as_ref()[0],
                         marker
                     );
                 }
             }
-            assert!(reader.txn_read_cache.borrow().is_empty());
+            assert_eq!(reader.txn_read_cache.borrow().len(), 4);
             assert!(reader.txn_read_cache_incomplete.get());
 
             connection_count.store(2, AtomicOrdering::Release);
@@ -33441,7 +33432,7 @@ mod tests {
                 .await
                 .unwrap();
             writer.commit(&cx).await.unwrap();
-            assert_eq!(reader.txn_read_cache_page_budget, 0);
+            assert_eq!(reader.txn_read_cache_page_budget, 4);
             assert!(matches!(
                 reader.get_page(&cx, pages[0].0).await,
                 Err(FrankenError::BusySnapshot { .. })
@@ -33456,6 +33447,55 @@ mod tests {
                 0xEE
             );
             fresh.commit(&cx).await.unwrap();
+        });
+    }
+
+    /// The bound that replaces a zero budget. The second scan lifts the budget
+    /// and retains the whole table, so the first one is held down by the budget
+    /// and not by a scan too short to reach it.
+    #[test]
+    fn gh_525_single_reader_retains_at_most_its_cache_budget_on_a_long_scan() {
+        const PAGES: usize = 256;
+        const BUDGET: usize = 16;
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let (pager, _) = test_pager().await;
+            pager.bind_shared_connection_count(Arc::new(AtomicUsize::new(1)));
+            let mut seed = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
+            let mut pages = Vec::with_capacity(PAGES);
+            for index in 0..PAGES {
+                let marker = u8::try_from(index % 251).unwrap();
+                let page_no = seed.allocate_page(&cx).await.unwrap();
+                seed.write_page(&cx, page_no, &sample_page(marker))
+                    .await
+                    .unwrap();
+                pages.push((page_no, marker));
+            }
+            seed.commit(&cx).await.unwrap();
+            pager.set_cache_page_budget(BUDGET).unwrap();
+
+            let mut reader = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            assert_eq!(reader.txn_read_cache_page_budget, BUDGET);
+            for _ in 0..2 {
+                for &(page_no, marker) in &pages {
+                    assert_eq!(
+                        reader.get_page(&cx, page_no).await.unwrap().as_ref()[0],
+                        marker
+                    );
+                    assert!(reader.txn_read_cache.borrow().len() <= BUDGET);
+                }
+            }
+            assert_eq!(reader.txn_read_cache.borrow().len(), BUDGET);
+            assert!(reader.txn_read_cache_incomplete.get());
+            reader.commit(&cx).await.unwrap();
+
+            let mut unbounded = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            unbounded.txn_read_cache_page_budget = usize::MAX;
+            for &(page_no, _) in &pages {
+                unbounded.get_page(&cx, page_no).await.unwrap();
+            }
+            assert_eq!(unbounded.txn_read_cache.borrow().len(), PAGES);
+            unbounded.commit(&cx).await.unwrap();
         });
     }
 
@@ -33530,7 +33570,11 @@ mod tests {
                 seed.commit(&cx).await.unwrap();
                 page_no
             };
+            // The budget is captured at BEGIN. Zero keeps this reader uncached;
+            // the shared cache gets its budget back for the refill below.
+            pager.set_cache_page_budget(0).unwrap();
             let mut reader = pager.begin(&cx, TransactionMode::ReadOnly).await.unwrap();
+            pager.set_cache_page_budget(2).unwrap();
             assert_eq!(
                 reader.get_page(&cx, page_no).await.unwrap().as_ref()[0],
                 0x11

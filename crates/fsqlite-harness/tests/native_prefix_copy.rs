@@ -63,10 +63,11 @@ fn symbol(seed: u8) -> SymbolRecord {
 
 fn verify(id: ObjectId, symbols: Vec<SymbolRecord>) -> Ready<Result<()>> {
     ready((|| {
-        let payload = reconstruct_systematic_happy_path(&symbols)
-            .map_err(|error| FrankenError::WalCorrupt {
+        let payload = reconstruct_systematic_happy_path(&symbols).map_err(|error| {
+            FrankenError::WalCorrupt {
                 detail: error.to_string(),
-            })?;
+            }
+        })?;
         if ObjectId::derive_from_canonical_bytes(&payload) != id {
             return Err(FrankenError::WalCorrupt {
                 detail: "wrong test object identity".to_owned(),
@@ -139,8 +140,14 @@ fn torn_tail_copy_preserves_originals_and_resumes_the_exact_commit_chain() {
             )
             .await
             .unwrap();
-            assert_eq!(report.symbol_tail_bytes, u64::try_from(symbol_tail).unwrap());
-            assert_eq!(report.marker_tail_bytes, u64::try_from(marker_tail).unwrap());
+            assert_eq!(
+                report.symbol_tail_bytes,
+                u64::try_from(symbol_tail).unwrap()
+            );
+            assert_eq!(
+                report.marker_tail_bytes,
+                u64::try_from(marker_tail).unwrap()
+            );
             let mut destination = log(&vfs, &cx, "copy");
             let receipt = source
                 .copy_recovered_prefix_to(&cx, &mut destination, verify)
@@ -150,7 +157,10 @@ fn torn_tail_copy_preserves_originals_and_resumes_the_exact_commit_chain() {
             assert_eq!(receipt.last_seq, CommitSeq::new(1));
             assert_eq!(receipt.symbol_records, 4, "intact orphans must survive too");
             assert!(!destination.needs_recovery());
-            assert_eq!(source.needs_recovery(), symbol_tail != 0 || marker_tail != 0);
+            assert_eq!(
+                source.needs_recovery(),
+                symbol_tail != 0 || marker_tail != 0
+            );
             assert_eq!(bytes(&vfs, &cx, "source-objects").await, original_objects);
             assert_eq!(bytes(&vfs, &cx, "source-markers").await, original_markers);
             assert_eq!(
@@ -164,10 +174,7 @@ fn torn_tail_copy_preserves_originals_and_resumes_the_exact_commit_chain() {
                 .publish(&cx, &[marker(2, previous, 3, 4)], verify)
                 .await
                 .unwrap();
-            destination
-                .append_symbols(&cx, &[symbol(9)])
-                .await
-                .unwrap();
+            destination.append_symbols(&cx, &[symbol(9)]).await.unwrap();
             destination.close(&cx).unwrap();
             let (mut reopened, report) = NativeDurabilityLog::recover(
                 &cx,
@@ -183,7 +190,10 @@ fn torn_tail_copy_preserves_originals_and_resumes_the_exact_commit_chain() {
             assert_eq!(report.symbol_records, 5);
             verify(
                 symbol(9).object_id,
-                reopened.read_object(&cx, symbol(9).object_id).await.unwrap(),
+                reopened
+                    .read_object(&cx, symbol(9).object_id)
+                    .await
+                    .unwrap(),
             )
             .await
             .unwrap();
@@ -207,7 +217,9 @@ fn multi_batch_copy_keeps_every_marker_and_uses_bounded_publication_groups() {
         let mut previous = None;
         for seq in 1..=257 {
             let next = marker(seq, previous, 1, 2);
-            previous = Some(ObjectId::derive_from_canonical_bytes(&next.to_record_bytes()));
+            previous = Some(ObjectId::derive_from_canonical_bytes(
+                &next.to_record_bytes(),
+            ));
             chain.push(next);
         }
         source.publish(&cx, &chain, verify).await.unwrap();
@@ -283,7 +295,10 @@ fn preflight_refuses_all_cross_aliases_and_nonempty_destinations_without_mutatio
             )
             .unwrap();
             assert!(
-                source.copy_recovered_prefix_to(&cx, &mut destination, verify).await.is_err()
+                source
+                    .copy_recovered_prefix_to(&cx, &mut destination, verify)
+                    .await
+                    .is_err()
             );
             assert!(!source.needs_recovery());
             assert!(!destination.needs_recovery());
@@ -300,7 +315,10 @@ fn preflight_refuses_all_cross_aliases_and_nonempty_destinations_without_mutatio
         destination.append_symbols(&cx, &[symbol(9)]).await.unwrap();
         let before = bytes(&vfs, &cx, "copy-objects").await;
         assert!(
-            source.copy_recovered_prefix_to(&cx, &mut destination, verify).await.is_err()
+            source
+                .copy_recovered_prefix_to(&cx, &mut destination, verify)
+                .await
+                .is_err()
         );
         assert_eq!(bytes(&vfs, &cx, "copy-objects").await, before);
         assert!(!destination.needs_recovery());
@@ -317,9 +335,11 @@ fn dropped_verification_future_poisoned_the_destination_between_successful_write
         let mut source = log(&vfs, &cx, "source");
         populate(&cx, &mut source).await;
         let mut destination = log(&vfs, &cx, "copy");
-        let mut copying = Box::pin(source.copy_recovered_prefix_to(&cx, &mut destination, |_, _| {
-            pending::<Result<()>>()
-        }));
+        let mut copying = Box::pin(source.copy_recovered_prefix_to(
+            &cx,
+            &mut destination,
+            |_, _| pending::<Result<()>>(),
+        ));
         poll_fn(|task| {
             assert!(copying.as_mut().poll(task).is_pending());
             Poll::Ready(())
@@ -378,14 +398,20 @@ fn failed_destination_verification_cannot_publish_or_be_retried_as_success() {
         ));
         assert!(destination.needs_recovery());
         assert!(
-            source.copy_recovered_prefix_to(&cx, &mut destination, verify).await.is_err()
+            source
+                .copy_recovered_prefix_to(&cx, &mut destination, verify)
+                .await
+                .is_err()
         );
         assert_eq!(vfs.sync_count(), before);
         assert_eq!(destination.published_tip(), CommitSeq::ZERO);
         assert!(bytes(&vfs, &cx, "copy-markers").await.is_empty());
         assert_eq!(bytes(&vfs, &cx, "source-objects").await, original);
         let mut retry = log(&vfs, &cx, "retry");
-        source.copy_recovered_prefix_to(&cx, &mut retry, verify).await.unwrap();
+        source
+            .copy_recovered_prefix_to(&cx, &mut retry, verify)
+            .await
+            .unwrap();
         assert_eq!(retry.published_tip(), CommitSeq::new(1));
         retry.close(&cx).unwrap();
         destination.close(&cx).unwrap();
@@ -406,10 +432,15 @@ fn either_destination_barrier_failure_stops_without_touching_the_source() {
             let mut destination = log(&vfs, &cx, "copy");
             let before = vfs.sync_count();
             vfs.inject_fault(
-                FaultSpec::power_cut(path).after_nth_sync(before + index_delta).build(),
+                FaultSpec::power_cut(path)
+                    .after_nth_sync(before + index_delta)
+                    .build(),
             );
             assert!(
-                source.copy_recovered_prefix_to(&cx, &mut destination, verify).await.is_err()
+                source
+                    .copy_recovered_prefix_to(&cx, &mut destination, verify)
+                    .await
+                    .is_err()
             );
             assert!(vfs.is_powered_off());
             assert_eq!(vfs.sync_count(), before + index_delta + 1);
@@ -418,13 +449,19 @@ fn either_destination_barrier_failure_stops_without_touching_the_source() {
             assert_eq!(destination.published_tip(), CommitSeq::ZERO);
             vfs.power_on();
             assert!(
-                source.copy_recovered_prefix_to(&cx, &mut destination, verify).await.is_err()
+                source
+                    .copy_recovered_prefix_to(&cx, &mut destination, verify)
+                    .await
+                    .is_err()
             );
             assert_eq!(vfs.sync_count(), before + index_delta + 1);
             assert_eq!(bytes(&vfs, &cx, "source-objects").await, original_objects);
             assert_eq!(bytes(&vfs, &cx, "source-markers").await, original_markers);
             let mut retry = log(&vfs, &cx, "retry");
-            source.copy_recovered_prefix_to(&cx, &mut retry, verify).await.unwrap();
+            source
+                .copy_recovered_prefix_to(&cx, &mut retry, verify)
+                .await
+                .unwrap();
             assert!(!retry.needs_recovery());
             retry.close(&cx).unwrap();
             destination.close(&cx).unwrap();
@@ -452,7 +489,11 @@ fn repair_rebuilds_real_raptorq_symbols_and_preserves_authenticated_identity() {
             let proof_records = codec.encode(&cx, &proof).unwrap();
             let missing_esi = payload_records[0].esi;
             assert_eq!(missing_esi & (1 << 31), 0, "erase a source, not a repair");
-            assert!(payload_records.iter().any(|record| record.esi & (1 << 31) != 0));
+            assert!(
+                payload_records
+                    .iter()
+                    .any(|record| record.esi & (1 << 31) != 0)
+            );
             let symbol_count = payload_records.len() + proof_records.len();
             let mut source = log(&vfs, &cx, "source");
             source.append_symbols(&cx, &payload_records).await.unwrap();
@@ -467,7 +508,10 @@ fn repair_rebuilds_real_raptorq_symbols_and_preserves_authenticated_identity() {
             source.close(&cx).unwrap();
             let original = bytes(&vfs, &cx, "source-objects").await;
             let mut objects = file(&vfs, &cx, "source-objects");
-            objects.write(&cx, &[original[51] ^ 0x80], 51).await.unwrap();
+            objects
+                .write(&cx, &[original[51] ^ 0x80], 51)
+                .await
+                .unwrap();
             objects
                 .write(
                     &cx,
@@ -568,7 +612,10 @@ fn repair_refuses_missing_or_wrong_authentication_keys_before_destination_writes
             assert!(bytes(&vfs, &cx, "copy-markers").await.is_empty());
             assert_eq!(bytes(&vfs, &cx, "source-objects").await, original);
             let mut good = log(&vfs, &cx, "good");
-            source.repair_recovered_prefix_to(&cx, &mut good, &codec).await.unwrap();
+            source
+                .repair_recovered_prefix_to(&cx, &mut good, &codec)
+                .await
+                .unwrap();
             assert!(!good.needs_recovery());
             good.close(&cx).unwrap();
             destination.close(&cx).unwrap();
@@ -595,7 +642,13 @@ impl fsqlite_wal::native_commit::durable::NativeObjectCodec for BrokenRepairCode
         });
         Ok(vec![SymbolRecord::new(
             id,
-            Oti { f: 4, al: 1, t: 4, z: 1, n: 1 },
+            Oti {
+                f: 4,
+                al: 1,
+                t: 4,
+                z: 1,
+                n: 1,
+            },
             0,
             changed,
             SymbolRecordFlags::SYSTEMATIC_RUN_START,
@@ -627,7 +680,11 @@ fn repair_rejects_encoder_identity_and_roundtrip_mismatches_before_append() {
                 .await
                 .unwrap_err();
             assert!(matches!(error, FrankenError::WalCorrupt { .. }));
-            let expected = if preserve_identity { "decoded object" } else { "object identity" };
+            let expected = if preserve_identity {
+                "decoded object"
+            } else {
+                "object identity"
+            };
             assert!(error.to_string().contains(expected));
             assert!(destination.needs_recovery());
             assert!(bytes(&vfs, &cx, "copy-objects").await.is_empty());
@@ -653,23 +710,34 @@ fn repaired_native_page_history_reopens_and_resumes_conflict_checked_transaction
         let codec = || RaptorQNativeCodec::new(Some([7; 32]));
         let page = |n| PageNumber::new(n).unwrap();
         let mut db = NativePageStore::new(
-            log(&vfs, &cx, "source"), codec(), 512, NativePageLimits::default(),
+            log(&vfs, &cx, "source"),
+            codec(),
+            512,
+            NativePageLimits::default(),
         )
         .unwrap();
         let mut first = db.begin(&cx).unwrap();
         for (number, fill) in [(1, 0x11), (2, 0x22), (3, 0x33)] {
-            db.write_page(&cx, &mut first, page(number), Some(&[fill; 512])).unwrap();
+            db.write_page(&cx, &mut first, page(number), Some(&[fill; 512]))
+                .unwrap();
         }
         db.commit(&cx, &mut first, 100).await.unwrap();
         let mut second = db.begin(&cx).unwrap();
-        db.write_page(&cx, &mut second, page(1), Some(&[0x44; 512])).unwrap();
+        db.write_page(&cx, &mut second, page(1), Some(&[0x44; 512]))
+            .unwrap();
         db.write_page(&cx, &mut second, page(2), None).unwrap();
         db.commit(&cx, &mut second, 200).await.unwrap();
         db.close(&cx).unwrap();
         let original = bytes(&vfs, &cx, "source-objects").await;
         let mut objects = file(&vfs, &cx, "source-objects");
-        objects.write(&cx, &[original[51] ^ 0x80], 51).await.unwrap();
-        objects.write(&cx, b"torn", u64::try_from(original.len()).unwrap()).await.unwrap();
+        objects
+            .write(&cx, &[original[51] ^ 0x80], 51)
+            .await
+            .unwrap();
+        objects
+            .write(&cx, b"torn", u64::try_from(original.len()).unwrap())
+            .await
+            .unwrap();
         objects.close(&cx).unwrap();
         let damaged = bytes(&vfs, &cx, "source-objects").await;
         let (mut source, report) = NativeDurabilityLog::recover(
@@ -684,7 +752,10 @@ fn repaired_native_page_history_reopens_and_resumes_conflict_checked_transaction
         assert_eq!(report.erased_symbols, 1);
         assert_eq!(report.symbol_tail_bytes, 4);
         let mut repaired = log(&vfs, &cx, "repaired");
-        source.repair_recovered_prefix_to(&cx, &mut repaired, &codec()).await.unwrap();
+        source
+            .repair_recovered_prefix_to(&cx, &mut repaired, &codec())
+            .await
+            .unwrap();
         assert_eq!(repaired.published_tip(), CommitSeq::new(2));
         repaired.close(&cx).unwrap();
         let (mut db, report) = NativePageStore::recover(
@@ -701,13 +772,27 @@ fn repaired_native_page_history_reopens_and_resumes_conflict_checked_transaction
         assert_eq!(report.erased_symbols, 0);
         assert!(!report.append_blocked());
         let mut old = db.begin(&cx).unwrap();
-        assert_eq!(db.read_page(&cx, &mut old, page(1)).unwrap().unwrap().as_ref(), &[0x44; 512]);
+        assert_eq!(
+            db.read_page(&cx, &mut old, page(1))
+                .unwrap()
+                .unwrap()
+                .as_ref(),
+            &[0x44; 512]
+        );
         assert!(db.read_page(&cx, &mut old, page(2)).unwrap().is_none());
-        assert_eq!(db.read_page(&cx, &mut old, page(3)).unwrap().unwrap().as_ref(), &[0x33; 512]);
+        assert_eq!(
+            db.read_page(&cx, &mut old, page(3))
+                .unwrap()
+                .unwrap()
+                .as_ref(),
+            &[0x33; 512]
+        );
         let mut a = db.begin(&cx).unwrap();
         let mut b = db.begin(&cx).unwrap();
-        db.write_page(&cx, &mut a, page(1), Some(&[0x55; 512])).unwrap();
-        db.write_page(&cx, &mut b, page(1), Some(&[0x66; 512])).unwrap();
+        db.write_page(&cx, &mut a, page(1), Some(&[0x55; 512]))
+            .unwrap();
+        db.write_page(&cx, &mut b, page(1), Some(&[0x66; 512]))
+            .unwrap();
         let committed = db.commit(&cx, &mut a, 300).await.unwrap().unwrap();
         assert_eq!(committed.commit_seq, CommitSeq::new(3));
         assert!(matches!(
@@ -715,10 +800,22 @@ fn repaired_native_page_history_reopens_and_resumes_conflict_checked_transaction
             Err(FrankenError::BusySnapshot { .. })
         ));
         db.rollback(&mut b).unwrap();
-        assert_eq!(db.read_page(&cx, &mut old, page(1)).unwrap().unwrap().as_ref(), &[0x44; 512]);
+        assert_eq!(
+            db.read_page(&cx, &mut old, page(1))
+                .unwrap()
+                .unwrap()
+                .as_ref(),
+            &[0x44; 512]
+        );
         db.rollback(&mut old).unwrap();
         let mut fresh = db.begin(&cx).unwrap();
-        assert_eq!(db.read_page(&cx, &mut fresh, page(1)).unwrap().unwrap().as_ref(), &[0x55; 512]);
+        assert_eq!(
+            db.read_page(&cx, &mut fresh, page(1))
+                .unwrap()
+                .unwrap()
+                .as_ref(),
+            &[0x55; 512]
+        );
         db.rollback(&mut fresh).unwrap();
         db.close(&cx).unwrap();
         assert_eq!(bytes(&vfs, &cx, "source-objects").await, damaged);
@@ -747,7 +844,10 @@ fn repair_refuses_insufficient_rank_without_fabricating_redundancy() {
         for (index, record) in encoded.iter().enumerate() {
             let wire = record.to_bytes();
             if index != 0 {
-                objects.write(&cx, &[wire[51] ^ 0x80], offset + 51).await.unwrap();
+                objects
+                    .write(&cx, &[wire[51] ^ 0x80], offset + 51)
+                    .await
+                    .unwrap();
             }
             offset += u64::try_from(wire.len()).unwrap();
         }
@@ -757,7 +857,12 @@ fn repair_refuses_insufficient_rank_without_fabricating_redundancy() {
         assert!(codec.decode(&cx, id, &survivors).is_err());
         let before = bytes(&vfs, &cx, "source-objects").await;
         let mut destination = log(&vfs, &cx, "copy");
-        assert!(source.repair_recovered_prefix_to(&cx, &mut destination, &codec).await.is_err());
+        assert!(
+            source
+                .repair_recovered_prefix_to(&cx, &mut destination, &codec)
+                .await
+                .is_err()
+        );
         assert!(destination.needs_recovery());
         assert_eq!(destination.published_tip(), CommitSeq::ZERO);
         assert!(bytes(&vfs, &cx, "copy-objects").await.is_empty());
@@ -794,11 +899,16 @@ fn repair_enforces_destination_payload_and_symbol_budgets() {
                 }
             };
             let mut destination = NativeDurabilityLog::create(
-                &cx, file(&vfs, &cx, "copy-objects"), file(&vfs, &cx, "copy-markers"), limits,
+                &cx,
+                file(&vfs, &cx, "copy-objects"),
+                file(&vfs, &cx, "copy-markers"),
+                limits,
             )
             .unwrap();
             assert!(matches!(
-                source.repair_recovered_prefix_to(&cx, &mut destination, &codec).await,
+                source
+                    .repair_recovered_prefix_to(&cx, &mut destination, &codec)
+                    .await,
                 Err(FrankenError::TooBig)
             ));
             assert!(destination.needs_recovery());

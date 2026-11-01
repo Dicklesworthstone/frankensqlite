@@ -152,7 +152,10 @@ fn assert_power_cut<V: Vfs>(vfs: &FaultInjectingVfs<V>, path: &str, sync_index: 
     assert_eq!(faults.len(), 1, "the intended barrier must actually fail");
     assert_eq!(faults[0].path, Path::new(path));
     assert_eq!(faults[0].kind, FaultKind::PowerCut);
-    assert_eq!(faults[0].detail, format!("operation=sync index={sync_index}"));
+    assert_eq!(
+        faults[0].detail,
+        format!("operation=sync index={sync_index}")
+    );
 }
 
 #[test]
@@ -406,7 +409,11 @@ fn either_sync_failure_blocks_new_commits_but_preserves_earlier_replies() {
             let syncs_before = vfs.sync_count();
             assert_eq!(syncs_before, 2);
             let sync_index = syncs_before + barrier_offset;
-            vfs.inject_fault(FaultSpec::power_cut(path).after_nth_sync(sync_index).build());
+            vfs.inject_fault(
+                FaultSpec::power_cut(path)
+                    .after_nth_sync(sync_index)
+                    .build(),
+            );
             assert!(matches!(
                 coordinator.flush(&cx, validate).await,
                 Err(FrankenError::Io(_))
@@ -419,7 +426,10 @@ fn either_sync_failure_blocks_new_commits_but_preserves_earlier_replies() {
             let earlier = coordinator.take_committed(CommitSeq::new(1)).unwrap();
             assert_eq!(earlier.txn_token, submission(1, 1, 0).txn_token);
             assert_eq!(earlier.commit_seq, CommitSeq::new(1));
-            assert_eq!(earlier.capsule_object_id, submission(1, 1, 0).capsule_object_id);
+            assert_eq!(
+                earlier.capsule_object_id,
+                submission(1, 1, 0).capsule_object_id
+            );
             assert_eq!(coordinator.pending_count(), 1);
             vfs.power_on();
             assert!(matches!(

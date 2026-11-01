@@ -19,7 +19,8 @@ use crate::connection::Connection;
 
 use super::{
     FileDigest, GENERATION_PREFIX, MAIN_FILE, MigrationBackup, WAL_FILE, invalid_backup,
-    publish_generation, read_migration_backup_with_check, sidecar_path, source_parent,
+    private_directory, publish_generation, read_migration_backup_with_check, sidecar_path,
+    source_parent,
 };
 
 #[cfg(unix)]
@@ -282,10 +283,7 @@ async fn capture_with_probe(
     let parent = source_parent(db_path).to_path_buf();
     let directory = worker::run(cx, move |check| {
         check()?;
-        let directory = tempfile::Builder::new()
-            .prefix(GENERATION_PREFIX)
-            .tempdir_in(&parent)?
-            .keep();
+        let directory = private_directory(GENERATION_PREFIX, &parent)?;
         check()?;
         Ok(directory)
     }).await?;

@@ -15,36 +15,55 @@ use fsqlite_types::flags::VfsOpenFlags;
 use fsqlite_vfs::{MemoryVfs, Vfs, VfsFile};
 use fsqlite_wal::checkpoint_executor::CheckpointTargetFuture;
 use fsqlite_wal::{
-    CheckpointMode, CheckpointPostAction, CheckpointState, CheckpointTarget,
-    WAL_HEADER_SIZE, WalFile, WalHeader, WalSalts, execute_checkpoint,
+    CheckpointMode, CheckpointPostAction, CheckpointState, CheckpointTarget, WAL_HEADER_SIZE,
+    WalFile, WalHeader, WalSalts, execute_checkpoint,
 };
 
 type TestFile = <MemoryVfs as Vfs>::File;
 type TestWal = WalFile<TestFile>;
 const PAGE_SIZE: u32 = 512;
 const MODES: [CheckpointMode; 4] = [
-    CheckpointMode::Passive, CheckpointMode::Full,
-    CheckpointMode::Restart, CheckpointMode::Truncate,
+    CheckpointMode::Passive,
+    CheckpointMode::Full,
+    CheckpointMode::Restart,
+    CheckpointMode::Truncate,
 ];
 
 fn run(future: impl Future<Output = ()>) {
-    RuntimeBuilder::current_thread().blocking_threads(1, 2).build()
-        .expect("test runtime").block_on(future);
+    RuntimeBuilder::current_thread()
+        .blocking_threads(1, 2)
+        .build()
+        .expect("test runtime")
+        .block_on(future);
 }
 
 fn open_file(vfs: &MemoryVfs, cx: &Cx) -> TestFile {
     let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
-    vfs.open(cx, Some(Path::new("admission.db-wal")), flags).expect("open WAL").0
+    vfs.open(cx, Some(Path::new("admission.db-wal")), flags)
+        .expect("open WAL")
+        .0
 }
 
 async fn create(vfs: &MemoryVfs, cx: &Cx) -> TestWal {
-    WalFile::create(cx, open_file(vfs, cx), PAGE_SIZE, 0,
-        WalSalts { salt1: 123, salt2: 456 }).await.expect("create WAL")
+    WalFile::create(
+        cx,
+        open_file(vfs, cx),
+        PAGE_SIZE,
+        0,
+        WalSalts {
+            salt1: 123,
+            salt2: 456,
+        },
+    )
+    .await
+    .expect("create WAL")
 }
 
 async fn append(wal: &mut TestWal, cx: &Cx, seed: u8, committed: bool) {
     let page = vec![seed; usize::try_from(PAGE_SIZE).expect("page size")];
-    wal.append_frame(cx, 1, &page, u32::from(committed)).await.expect("append");
+    wal.append_frame(cx, 1, &page, u32::from(committed))
+        .await
+        .expect("append");
 }
 
 async fn bytes(cx: &Cx, file: &TestFile) -> Vec<u8> {
@@ -55,7 +74,11 @@ async fn bytes(cx: &Cx, file: &TestFile) -> Vec<u8> {
 }
 
 fn state(total_frames: u32, backfilled_frames: u32) -> CheckpointState {
-    CheckpointState { total_frames, backfilled_frames, oldest_reader_frame: None }
+    CheckpointState {
+        total_frames,
+        backfilled_frames,
+        oldest_reader_frame: None,
+    }
 }
 
 #[derive(Default)]
@@ -65,9 +88,12 @@ struct Target {
 }
 
 impl CheckpointTarget for Target {
-    fn write_page<'a>(&'a mut self, _: &'a Cx, page: PageNumber, data: &'a [u8])
-        -> CheckpointTargetFuture<'a, ()>
-    {
+    fn write_page<'a>(
+        &'a mut self,
+        _: &'a Cx,
+        page: PageNumber,
+        data: &'a [u8],
+    ) -> CheckpointTargetFuture<'a, ()> {
         Box::pin(async move {
             self.calls += 1;
             self.pages.insert(page.get(), data.to_vec());
@@ -84,12 +110,18 @@ impl CheckpointTarget for Target {
     }
 
     fn sync_db<'a>(&'a mut self, _: &'a Cx) -> CheckpointTargetFuture<'a, ()> {
-        Box::pin(async move { self.calls += 1; Ok(()) })
+        Box::pin(async move {
+            self.calls += 1;
+            Ok(())
+        })
     }
 
-    fn read_page_if_supported<'a>(&'a mut self, _: &'a Cx, page: PageNumber, buf: &'a mut [u8])
-        -> CheckpointTargetFuture<'a, Option<usize>>
-    {
+    fn read_page_if_supported<'a>(
+        &'a mut self,
+        _: &'a Cx,
+        page: PageNumber,
+        buf: &'a mut [u8],
+    ) -> CheckpointTargetFuture<'a, Option<usize>> {
         Box::pin(async move {
             self.calls += 1;
             let data = self.pages.get(&page.get()).expect("written page");
@@ -99,13 +131,22 @@ impl CheckpointTarget for Target {
     }
 
     fn acquire_wal_reset_gate<'a>(&'a mut self, _: &'a Cx) -> CheckpointTargetFuture<'a, bool> {
-        Box::pin(async move { self.calls += 1; Ok(true) })
+        Box::pin(async move {
+            self.calls += 1;
+            Ok(true)
+        })
     }
 
-    fn publish_backfill<'a>(&'a mut self, _: &'a Cx, _: &'a WalHeader, _: u32)
-        -> CheckpointTargetFuture<'a, ()>
-    {
-        Box::pin(async move { self.calls += 1; Ok(()) })
+    fn publish_backfill<'a>(
+        &'a mut self,
+        _: &'a Cx,
+        _: &'a WalHeader,
+        _: u32,
+    ) -> CheckpointTargetFuture<'a, ()> {
+        Box::pin(async move {
+            self.calls += 1;
+            Ok(())
+        })
     }
 }
 
@@ -116,11 +157,21 @@ async fn refused(cx: &Cx, wal: &mut TestWal, mode: CheckpointMode, snapshot: Che
     let generation = wal.generation_identity();
     let mut target = Target::default();
     let error = execute_checkpoint(cx, wal, mode, snapshot, &mut target)
-        .await.expect_err("stale or corrupt snapshot must be rejected");
-    assert!(matches!(error,
-        FrankenError::CheckpointFailed { .. } | FrankenError::WalCorrupt { .. }
-        | FrankenError::BusyRecovery), "{error:?}");
-    assert_eq!(target.calls, 0, "admission must precede EVERY target callback");
+        .await
+        .expect_err("stale or corrupt snapshot must be rejected");
+    assert!(
+        matches!(
+            error,
+            FrankenError::CheckpointFailed { .. }
+                | FrankenError::WalCorrupt { .. }
+                | FrankenError::BusyRecovery
+        ),
+        "{error:?}"
+    );
+    assert_eq!(
+        target.calls, 0,
+        "admission must precede EVERY target callback"
+    );
     assert_eq!(bytes(cx, wal.file()).await, original, "no WAL mutation");
     assert_eq!(wal.frame_count(), count, "no implicit refresh");
     assert_eq!(wal.running_checksum(), checksum);
@@ -135,8 +186,12 @@ fn cross_handle_commit_growth_is_rejected_even_with_zero_backfill() {
                 let cx = Cx::default();
                 let vfs = MemoryVfs::new();
                 let mut writer = create(&vfs, &cx).await;
-                if initial > 0 { append(&mut writer, &cx, 1, true).await; }
-                let mut stale = WalFile::open(&cx, open_file(&vfs, &cx)).await.expect("reader");
+                if initial > 0 {
+                    append(&mut writer, &cx, 1, true).await;
+                }
+                let mut stale = WalFile::open(&cx, open_file(&vfs, &cx))
+                    .await
+                    .expect("reader");
                 // Both counters still agree. Only the physical file grows.
                 append(&mut writer, &cx, 2, false).await;
                 append(&mut writer, &cx, 3, true).await;
@@ -146,9 +201,12 @@ fn cross_handle_commit_growth_is_rejected_even_with_zero_backfill() {
                 let total = u32::try_from(stale.frame_count()).expect("frame count");
                 let mut target = Target::default();
                 execute_checkpoint(&cx, &mut stale, mode, state(total, 0), &mut target)
-                    .await.expect("freshly planned checkpoint");
-                assert_eq!(target.pages.get(&1).expect("latest page"),
-                    &vec![3; usize::try_from(PAGE_SIZE).expect("page size")]);
+                    .await
+                    .expect("freshly planned checkpoint");
+                assert_eq!(
+                    target.pages.get(&1).expect("latest page"),
+                    &vec![3; usize::try_from(PAGE_SIZE).expect("page size")]
+                );
             }
         }
     });
@@ -162,9 +220,21 @@ fn zero_backfill_rejects_replaced_generation_at_same_file_length() {
             let vfs = MemoryVfs::new();
             let mut writer = create(&vfs, &cx).await;
             append(&mut writer, &cx, 1, true).await;
-            let mut stale = WalFile::open(&cx, open_file(&vfs, &cx)).await.expect("reader");
-            writer.reset(&cx, 1, WalSalts { salt1: 789, salt2: 321 }, false)
-                .await.expect("reset");
+            let mut stale = WalFile::open(&cx, open_file(&vfs, &cx))
+                .await
+                .expect("reader");
+            writer
+                .reset(
+                    &cx,
+                    1,
+                    WalSalts {
+                        salt1: 789,
+                        salt2: 321,
+                    },
+                    false,
+                )
+                .await
+                .expect("reset");
             append(&mut writer, &cx, 2, true).await;
             refused(&cx, &mut stale, mode, state(1, 1)).await;
         }
@@ -186,8 +256,13 @@ fn zero_backfill_rejects_torn_header_short_file_and_corrupt_terminal_payload() {
                     file.truncate(&cx, 32).expect("truncate accepted frame");
                 } else {
                     let offset = if damage == 0 { 24 } else { original.len() - 1 };
-                    file.write(&cx, &[original[offset] ^ 1], u64::try_from(offset).expect("offset"))
-                        .await.expect("damage");
+                    file.write(
+                        &cx,
+                        &[original[offset] ^ 1],
+                        u64::try_from(offset).expect("offset"),
+                    )
+                    .await
+                    .expect("damage");
                 }
                 refused(&cx, &mut wal, mode, state(1, 1)).await;
             }
@@ -213,18 +288,36 @@ fn recovery_residue_is_not_mistaken_for_another_commit() {
                     .expect("partial frame");
             } else if residue == 2 {
                 let offset = original.len() - 1;
-                file.write(&cx, &[original[offset] ^ 1], u64::try_from(offset).expect("offset"))
-                    .await.expect("invalid checksum");
+                file.write(
+                    &cx,
+                    &[original[offset] ^ 1],
+                    u64::try_from(offset).expect("offset"),
+                )
+                .await
+                .expect("invalid checksum");
             }
-            let mut recovered = WalFile::open(&cx, open_file(&vfs, &cx)).await.expect("recover");
+            let mut recovered = WalFile::open(&cx, open_file(&vfs, &cx))
+                .await
+                .expect("recover");
             assert_eq!(recovered.frame_count(), 1);
             let mut target = Target::default();
-            execute_checkpoint(&cx, &mut recovered, CheckpointMode::Truncate,
-                state(1, 0), &mut target).await.expect("checkpoint recovered prefix");
-            assert_eq!(target.pages.get(&1).expect("committed page"),
-                &vec![1; usize::try_from(PAGE_SIZE).expect("page size")]);
-            assert_eq!(recovered.file().file_size(&cx).expect("size"),
-                u64::try_from(WAL_HEADER_SIZE).expect("header size"));
+            execute_checkpoint(
+                &cx,
+                &mut recovered,
+                CheckpointMode::Truncate,
+                state(1, 0),
+                &mut target,
+            )
+            .await
+            .expect("checkpoint recovered prefix");
+            assert_eq!(
+                target.pages.get(&1).expect("committed page"),
+                &vec![1; usize::try_from(PAGE_SIZE).expect("page size")]
+            );
+            assert_eq!(
+                recovered.file().file_size(&cx).expect("size"),
+                u64::try_from(WAL_HEADER_SIZE).expect("header size")
+            );
         }
     });
 }
@@ -236,12 +329,29 @@ fn truncate_accepts_old_generation_residue_behind_an_empty_header() {
         let vfs = MemoryVfs::new();
         let mut wal = create(&vfs, &cx).await;
         append(&mut wal, &cx, 1, true).await;
-        wal.reset(&cx, 1, WalSalts { salt1: 789, salt2: 321 }, false).await.expect("reset");
+        wal.reset(
+            &cx,
+            1,
+            WalSalts {
+                salt1: 789,
+                salt2: 321,
+            },
+            false,
+        )
+        .await
+        .expect("reset");
         assert_eq!(wal.frame_count(), 0);
         assert!(wal.file().file_size(&cx).expect("size") > 32);
         let mut target = Target::default();
-        let result = execute_checkpoint(&cx, &mut wal, CheckpointMode::Truncate,
-            state(0, 0), &mut target).await.expect("truncate old bytes");
+        let result = execute_checkpoint(
+            &cx,
+            &mut wal,
+            CheckpointMode::Truncate,
+            state(0, 0),
+            &mut target,
+        )
+        .await
+        .expect("truncate old bytes");
         assert!(result.wal_was_reset);
         assert_eq!(wal.file().file_size(&cx).expect("size"), 32);
     });
@@ -257,7 +367,8 @@ fn already_empty_headerless_wal_is_a_true_noop_in_every_mode() {
             let generation = wal.generation_identity();
             let mut target = Target::default();
             let result = execute_checkpoint(&cx, &mut wal, mode, state(0, 0), &mut target)
-                .await.expect("empty no-op");
+                .await
+                .expect("empty no-op");
             assert_eq!(target.calls, 0);
             assert_eq!(result.frames_backfilled, 0);
             assert_eq!(result.plan.post_action, CheckpointPostAction::None);
@@ -334,21 +445,29 @@ fn committed_partial_checkpoint_can_resume_through_a_multiframe_transaction() {
             snapshot.oldest_reader_frame = Some(1);
             let mut target = Target::default();
             let partial = execute_checkpoint(&cx, &mut wal, mode, snapshot, &mut target)
-                .await.expect("committed reader horizon");
+                .await
+                .expect("committed reader horizon");
             assert_eq!(partial.frames_backfilled, 1);
             assert!(!partial.plan.completes_checkpoint());
             assert!(!partial.wal_was_reset);
-            assert_eq!(target.pages.get(&1).expect("old snapshot"),
-                &vec![1; usize::try_from(PAGE_SIZE).expect("page size")]);
+            assert_eq!(
+                target.pages.get(&1).expect("old snapshot"),
+                &vec![1; usize::try_from(PAGE_SIZE).expect("page size")]
+            );
 
             let complete = execute_checkpoint(&cx, &mut wal, mode, state(3, 1), &mut target)
-                .await.expect("resume from committed backfill receipt");
+                .await
+                .expect("resume from committed backfill receipt");
             assert_eq!(complete.frames_backfilled, 2);
             assert!(complete.plan.completes_checkpoint());
-            assert_eq!(complete.wal_was_reset,
-                matches!(mode, CheckpointMode::Restart | CheckpointMode::Truncate));
-            assert_eq!(target.pages.get(&1).expect("new snapshot"),
-                &vec![3; usize::try_from(PAGE_SIZE).expect("page size")]);
+            assert_eq!(
+                complete.wal_was_reset,
+                matches!(mode, CheckpointMode::Restart | CheckpointMode::Truncate)
+            );
+            assert_eq!(
+                target.pages.get(&1).expect("new snapshot"),
+                &vec![3; usize::try_from(PAGE_SIZE).expect("page size")]
+            );
         }
     });
 }
@@ -366,7 +485,9 @@ fn corrupt_backfill_seed_payload_cannot_authorize_a_later_window() {
             let file = open_file(&vfs, &cx);
             // Leave every stored checksum and the entire next transaction
             // intact. Header-only seed validation would miss this damage.
-            file.write(&cx, &[0xFF], 32 + 24).await.expect("damage first payload");
+            file.write(&cx, &[0xFF], 32 + 24)
+                .await
+                .expect("damage first payload");
             refused(&cx, &mut wal, mode, state(3, 1)).await;
         }
     });

@@ -6324,9 +6324,6 @@ PRAGMA integrity_check;
     fn test_reloaded_check_constraints_keep_name_and_source_text() {
         let sql = "CREATE TABLE t(a CONSTRAINT pos CHECK( a  <>  0 ), b, \
                    CONSTRAINT ordered CHECK(b <> a), CHECK(rowid <> 2), CHECK((a) AND (b)))";
-        let grouped = fsqlite_parser::expr::parse_expr("(a) AND (b)")
-            .expect("grouped CHECK parses")
-            .to_string();
         assert_eq!(
             extract_check_constraints_with_owners_from_sql(sql),
             vec![
@@ -6346,7 +6343,7 @@ PRAGMA integrity_check;
                     name: None,
                 },
                 CheckConstraint {
-                    expr: grouped,
+                    expr: "(a) AND (b)".to_owned(),
                     owner_column: None,
                     name: None,
                 },

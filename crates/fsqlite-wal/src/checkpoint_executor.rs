@@ -5,14 +5,12 @@
 //! callback. The caller still owns generation/append coordination throughout
 //! this operation; these read-only checks do not replace that coordination.
 
-#[path = "checkpoint_executor_impl.rs"]
-mod implementation;
 #[path = "checkpoint_admission.rs"]
 mod admission;
+#[path = "checkpoint_executor_impl.rs"]
+mod implementation;
 
-pub use implementation::{
-    CheckpointExecutionResult, CheckpointTarget, CheckpointTargetFuture,
-};
+pub use implementation::{CheckpointExecutionResult, CheckpointTarget, CheckpointTargetFuture};
 
 use fsqlite_error::Result;
 use fsqlite_types::cx::Cx;

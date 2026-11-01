@@ -17,13 +17,13 @@ fn header(page_size: u32, big_endian: bool, sequence: u32) -> [u8; 32] {
         0x9abc_def0,
     ];
     let mut bytes = [0_u8; 32];
-    for (field, slot) in fields.iter().zip(bytes.chunks_exact_mut(4)) {
+    for (field, slot) in fields.iter().zip(bytes.as_chunks_mut::<4>().0) {
         slot.copy_from_slice(&field.to_be_bytes());
     }
 
     let mut a = 0_u32;
     let mut b = 0_u32;
-    for pair in bytes[..24].chunks_exact(8) {
+    for pair in bytes[..24].as_chunks::<8>().0 {
         let decode = |slice: &[u8]| {
             let word: [u8; 4] = slice.try_into().expect("four-byte WAL word");
             if big_endian {

@@ -122,10 +122,17 @@ fn run_shape(backend: &str, workers: usize, rows: usize, busy_timeout_ms: u64) -
     }
     let started = Instant::now();
     std::fs::write(&go, b"go").expect("start writers");
+    // A writer logs more than a pipe holds, and one blocked on a full pipe can
+    // be holding the write lock. Waiting in worker order would then freeze the
+    // whole shape, so every writer's pipes are drained while they all run.
+    let draining: Vec<_> = children
+        .into_iter()
+        .map(|(worker, child)| (worker, std::thread::spawn(|| child.wait_with_output())))
+        .collect();
     let mut committed = 0;
     let mut errors = Vec::new();
-    for (worker, child) in children {
-        let output = child.wait_with_output().expect("writer output");
+    for (worker, drain) in draining {
+        let output = drain.join().expect("drain thread").expect("writer output");
         let stdout = String::from_utf8_lossy(&output.stdout);
         let report = parse_report(&stdout).unwrap_or_else(|| {
             panic!(
