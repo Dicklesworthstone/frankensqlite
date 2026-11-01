@@ -3123,7 +3123,11 @@ still serves as an authoritative reference.
   features such as `nightly-simd`) is built with. The published library crates
   are meant to build on stable as well: main removed the last default-on
   `#![feature]` gates from `fsqlite-pager`, `fsqlite-btree` and `fsqlite-vfs`
-  (GH#522), but releases up to and including v0.4.12 still need nightly on
+  (GH#522). In v0.4.13,
+  `cargo +stable check --locked -p fsqlite-pager -p fsqlite-btree -p fsqlite --lib`
+  passes on x86_64 Linux, with default features and with
+  `--no-default-features`. A stable build on Windows and macOS has not been
+  checked, and releases up to and including v0.4.12 still need nightly on
   x86_64 and Windows.
 - **Rust is still the primary supported surface.** An optional `fsqlite-c-api` crate exists for C/C++ embedding, but the main documented API and most verification effort are still centered on the Rust crates.
 - **No loadable extensions.** Extension support is configured at compile time via Cargo features; dynamic `dlopen`-based loading is not planned.
