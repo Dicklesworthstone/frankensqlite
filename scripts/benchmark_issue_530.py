@@ -191,13 +191,16 @@ def parse_process_memory(status: str) -> dict:
     return counters
 
 
-def run_memory_cli(binary: dict, sql: str, expected: int, setup: list[str],
-                   queries: int, init: Path, directory: Path, timeout: float, stem: str) -> dict:
+def run_memory_cli(binary: dict, sql: str, expected: int | list[str], setup: list[str],
+                   queries: int, init: Path, directory: Path, timeout: float, stem: str,
+                   *, database: Path | str = ":memory:", ordered: bool = True) -> dict:
     """Drive one fresh process, pausing between queries to sample retained RSS.
 
     Only stdout uses a PTY, so the shells flush markers but still receive batch
     input without prompts. Nonblocking pipes and one monotonic deadline bound
-    writes, reads and shutdown. Every result and all stderr are checked.
+    writes, reads and shutdown. Every result and all stderr are checked. An
+    existing file database may be supplied; it is never seeded by the collector.
+    List-valued expectations preserve row multiplicity and, by default, order.
     """
     if not sys.platform.startswith("linux"):
         raise ValueError("--memory requires Linux /proc VmRSS and VmHWM")
@@ -205,7 +208,9 @@ def run_memory_cli(binary: dict, sql: str, expected: int, setup: list[str],
         raise ValueError("memory query count must be positive")
     import pty
 
-    command = [binary["path"], "-batch", "-init", str(init), ":memory:"]
+    command = [binary["path"], "-batch", "-init", str(init), str(database)]
+    expected_rows = [str(expected)] if isinstance(expected, int) else expected
+    normalize = (lambda values: values) if ordered else sorted
     marker_prefix = f"__issue530_{uuid.uuid4().hex}_"
     scripts = ["\n".join([*PREFIX, *setup, f".print {marker_prefix}0", ""])]
     scripts.extend(f"{sql}\n.print {marker_prefix}{index}\n" for index in range(1, queries + 1))
@@ -283,8 +288,11 @@ def run_memory_cli(binary: dict, sql: str, expected: int, setup: list[str],
             # Drain already-available stderr and reject extra protocol output.
             while selector.select(0):
                 pump(False)
-            expected_lines = ([] if index == 0 else [str(expected)]) + [marker]
-            if pending_input or pending_output or lines[first_line:] != expected_lines:
+            result_rows = [] if index == 0 else expected_rows
+            checkpoint_lines = lines[first_line:]
+            if (pending_input or pending_output or not checkpoint_lines
+                    or checkpoint_lines[-1] != marker
+                    or normalize(checkpoint_lines[:-1]) != normalize(result_rows)):
                 raise ValueError(f"wrong memory result/checkpoint {index}: {lines[first_line:]!r}")
             counters = parse_process_memory(Path(f"/proc/{process.pid}/status").read_text(encoding="utf-8"))
             checkpoints.append({"query_count": index, **counters})

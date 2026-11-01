@@ -1,0 +1,470 @@
+{
+  "schema": "issue531-cli-v2",
+  "status": "passed",
+  "mode": "oracle_only",
+  "measurement_mode": "memory",
+  "created_utc": "2026-11-01T05:22:04.905145+00:00",
+  "platform": "Linux-6.18.57-x86_64-with-glibc2.39",
+  "artifact_directory": "/dev/issue531-oracle-review/evidence/issue531-vg6rwy0f",
+  "measurement": "Linux /proc VmRSS and VmHWM after opening the database and each checked query; fresh process per sample",
+  "fixture": {
+    "users": 10,
+    "posts": 100,
+    "attempted_likes": 400,
+    "expected_unique_likes": 400,
+    "likes_mode": "four-per-post",
+    "matches_reported_cli_scale": false,
+    "seed_journal_mode_outputs": [
+      "delete",
+      "wal"
+    ],
+    "seed_sha256": "1e79d58538e1b103eb53644590e423b36d11db7ae04e1d2511ac91d4c29e38c7",
+    "database_bytes": 53248
+  },
+  "trials": 1,
+  "cases": {
+    "group_eq": {
+      "sql": "SELECT post_id, count(*) FROM likes WHERE post_id = 80 GROUP BY post_id;",
+      "ordered_comparison": false,
+      "reported_shape": true,
+      "oracle_rows": [
+        "80,4"
+      ],
+      "query_plans": {
+        "stock": [
+          "QUERY PLAN",
+          "`--SEARCH likes USING COVERING INDEX likes_post_id_idx (post_id=?)"
+        ]
+      },
+      "samples": [
+        {
+          "engine": "stock",
+          "trial": 0,
+          "engine_order": 0,
+          "pid": 639289,
+          "queries": 2,
+          "checkpoints": [
+            {
+              "query_count": 0,
+              "rss_kib": 2524,
+              "hwm_kib": 2524
+            },
+            {
+              "query_count": 1,
+              "rss_kib": 2548,
+              "hwm_kib": 2548
+            },
+            {
+              "query_count": 2,
+              "rss_kib": 2548,
+              "hwm_kib": 2548
+            }
+          ],
+          "measured_results_checked": 2,
+          "rows_per_execution": 1
+        }
+      ],
+      "errors": [],
+      "summary": {
+        "engines": {
+          "stock": {
+            "runs": 1,
+            "median_setup_rss_kib": 2524,
+            "median_first_query_hwm_kib": 2548,
+            "median_first_query_rss_kib": 2548,
+            "median_final_query_hwm_kib": 2548,
+            "median_final_query_rss_kib": 2548,
+            "median_final_minus_setup_rss_kib": 24,
+            "median_final_minus_first_rss_kib": 0
+          }
+        }
+      }
+    },
+    "group_in20": {
+      "sql": "SELECT post_id, count(*) FROM likes WHERE post_id IN (4,9,14,19,23,28,33,38,42,47,52,57,61,66,71,76,80,85,90,95) GROUP BY post_id;",
+      "ordered_comparison": false,
+      "reported_shape": true,
+      "oracle_rows": [
+        "4,4",
+        "9,4",
+        "14,4",
+        "19,4",
+        "23,4",
+        "28,4",
+        "33,4",
+        "38,4",
+        "42,4",
+        "47,4",
+        "52,4",
+        "57,4",
+        "61,4",
+        "66,4",
+        "71,4",
+        "76,4",
+        "80,4",
+        "85,4",
+        "90,4",
+        "95,4"
+      ],
+      "query_plans": {
+        "stock": [
+          "QUERY PLAN",
+          "`--SEARCH likes USING COVERING INDEX likes_post_id_idx (post_id=?)"
+        ]
+      },
+      "samples": [
+        {
+          "engine": "stock",
+          "trial": 0,
+          "engine_order": 0,
+          "pid": 639292,
+          "queries": 2,
+          "checkpoints": [
+            {
+              "query_count": 0,
+              "rss_kib": 2536,
+              "hwm_kib": 2536
+            },
+            {
+              "query_count": 1,
+              "rss_kib": 2640,
+              "hwm_kib": 2640
+            },
+            {
+              "query_count": 2,
+              "rss_kib": 2640,
+              "hwm_kib": 2640
+            }
+          ],
+          "measured_results_checked": 2,
+          "rows_per_execution": 20
+        }
+      ],
+      "errors": [],
+      "summary": {
+        "engines": {
+          "stock": {
+            "runs": 1,
+            "median_setup_rss_kib": 2536,
+            "median_first_query_hwm_kib": 2640,
+            "median_first_query_rss_kib": 2640,
+            "median_final_query_hwm_kib": 2640,
+            "median_final_query_rss_kib": 2640,
+            "median_final_minus_setup_rss_kib": 104,
+            "median_final_minus_first_rss_kib": 0
+          }
+        }
+      }
+    },
+    "join_newest20": {
+      "sql": "SELECT p.id, u.username FROM posts p JOIN users u ON u.id = p.user_id ORDER BY p.created_at DESC, p.id DESC LIMIT 20;",
+      "ordered_comparison": true,
+      "reported_shape": true,
+      "oracle_rows": [
+        "83,'user4'",
+        "23,'user4'",
+        "47,'user8'",
+        "71,'user2'",
+        "95,'user6'",
+        "11,'user2'",
+        "35,'user6'",
+        "59,'user10'",
+        "82,'user3'",
+        "22,'user3'",
+        "46,'user7'",
+        "70,'user1'",
+        "94,'user5'",
+        "10,'user1'",
+        "34,'user5'",
+        "58,'user9'",
+        "81,'user2'",
+        "21,'user2'",
+        "45,'user6'",
+        "69,'user10'"
+      ],
+      "query_plans": {
+        "stock": [
+          "QUERY PLAN",
+          "|--SCAN p USING INDEX posts_created_at_id_idx",
+          "`--SEARCH u USING INTEGER PRIMARY KEY (rowid=?)"
+        ]
+      },
+      "samples": [
+        {
+          "engine": "stock",
+          "trial": 0,
+          "engine_order": 0,
+          "pid": 639295,
+          "queries": 2,
+          "checkpoints": [
+            {
+              "query_count": 0,
+              "rss_kib": 2524,
+              "hwm_kib": 2524
+            },
+            {
+              "query_count": 1,
+              "rss_kib": 2548,
+              "hwm_kib": 2548
+            },
+            {
+              "query_count": 2,
+              "rss_kib": 2548,
+              "hwm_kib": 2548
+            }
+          ],
+          "measured_results_checked": 2,
+          "rows_per_execution": 20
+        }
+      ],
+      "errors": [],
+      "summary": {
+        "engines": {
+          "stock": {
+            "runs": 1,
+            "median_setup_rss_kib": 2524,
+            "median_first_query_hwm_kib": 2548,
+            "median_first_query_rss_kib": 2548,
+            "median_final_query_hwm_kib": 2548,
+            "median_final_query_rss_kib": 2548,
+            "median_final_minus_setup_rss_kib": 24,
+            "median_final_minus_first_rss_kib": 0
+          }
+        }
+      }
+    },
+    "correlated_newest20": {
+      "sql": "SELECT p.id, (SELECT count(*) FROM likes l WHERE l.post_id = p.id) FROM posts p ORDER BY p.created_at DESC, p.id DESC LIMIT 20;",
+      "ordered_comparison": true,
+      "reported_shape": true,
+      "oracle_rows": [
+        "83,4",
+        "23,4",
+        "47,4",
+        "71,4",
+        "95,4",
+        "11,4",
+        "35,4",
+        "59,4",
+        "82,4",
+        "22,4",
+        "46,4",
+        "70,4",
+        "94,4",
+        "10,4",
+        "34,4",
+        "58,4",
+        "81,4",
+        "21,4",
+        "45,4",
+        "69,4"
+      ],
+      "query_plans": {
+        "stock": [
+          "QUERY PLAN",
+          "|--SCAN p USING COVERING INDEX posts_created_at_id_idx",
+          "`--CORRELATED SCALAR SUBQUERY 1",
+          "   `--SEARCH l USING COVERING INDEX likes_post_id_idx (post_id=?)"
+        ]
+      },
+      "samples": [
+        {
+          "engine": "stock",
+          "trial": 0,
+          "engine_order": 0,
+          "pid": 639298,
+          "queries": 2,
+          "checkpoints": [
+            {
+              "query_count": 0,
+              "rss_kib": 2616,
+              "hwm_kib": 2616
+            },
+            {
+              "query_count": 1,
+              "rss_kib": 2640,
+              "hwm_kib": 2640
+            },
+            {
+              "query_count": 2,
+              "rss_kib": 2640,
+              "hwm_kib": 2640
+            }
+          ],
+          "measured_results_checked": 2,
+          "rows_per_execution": 20
+        }
+      ],
+      "errors": [],
+      "summary": {
+        "engines": {
+          "stock": {
+            "runs": 1,
+            "median_setup_rss_kib": 2616,
+            "median_first_query_hwm_kib": 2640,
+            "median_first_query_rss_kib": 2640,
+            "median_final_query_hwm_kib": 2640,
+            "median_final_query_rss_kib": 2640,
+            "median_final_minus_setup_rss_kib": 24,
+            "median_final_minus_first_rss_kib": 0
+          }
+        }
+      }
+    },
+    "join_correlated_by_id": {
+      "sql": "SELECT p.id, p.body, p.created_at, u.username, (SELECT count(*) FROM likes l WHERE l.post_id = p.id) AS like_count FROM posts p JOIN users u ON u.id = p.user_id WHERE p.id = 80;",
+      "ordered_comparison": false,
+      "reported_shape": true,
+      "oracle_rows": [
+        "80,'post body 80','2025-09-25T08:20:11.080Z','user1',4"
+      ],
+      "query_plans": {
+        "stock": [
+          "QUERY PLAN",
+          "|--SEARCH p USING INTEGER PRIMARY KEY (rowid=?)",
+          "|--SEARCH u USING INTEGER PRIMARY KEY (rowid=?)",
+          "`--CORRELATED SCALAR SUBQUERY 1",
+          "   `--SEARCH l USING COVERING INDEX likes_post_id_idx (post_id=?)"
+        ]
+      },
+      "samples": [
+        {
+          "engine": "stock",
+          "trial": 0,
+          "engine_order": 0,
+          "pid": 639301,
+          "queries": 2,
+          "checkpoints": [
+            {
+              "query_count": 0,
+              "rss_kib": 2508,
+              "hwm_kib": 2508
+            },
+            {
+              "query_count": 1,
+              "rss_kib": 2532,
+              "hwm_kib": 2532
+            },
+            {
+              "query_count": 2,
+              "rss_kib": 2532,
+              "hwm_kib": 2532
+            }
+          ],
+          "measured_results_checked": 2,
+          "rows_per_execution": 1
+        }
+      ],
+      "errors": [],
+      "summary": {
+        "engines": {
+          "stock": {
+            "runs": 1,
+            "median_setup_rss_kib": 2508,
+            "median_first_query_hwm_kib": 2532,
+            "median_first_query_rss_kib": 2532,
+            "median_final_query_hwm_kib": 2532,
+            "median_final_query_rss_kib": 2532,
+            "median_final_minus_setup_rss_kib": 24,
+            "median_final_minus_first_rss_kib": 0
+          }
+        }
+      }
+    },
+    "join_correlated_newest20": {
+      "sql": "SELECT p.id, p.body, p.created_at, u.username, (SELECT count(*) FROM likes l WHERE l.post_id = p.id) AS like_count FROM posts p JOIN users u ON u.id = p.user_id ORDER BY p.created_at DESC, p.id DESC LIMIT 20;",
+      "ordered_comparison": true,
+      "reported_shape": true,
+      "oracle_rows": [
+        "83,'post body 83','2025-12-28T11:23:11.083Z','user4',4",
+        "23,'post body 23','2025-12-24T23:23:03.023Z','user4',4",
+        "47,'post body 47','2025-12-20T23:47:06.047Z','user8',4",
+        "71,'post body 71','2025-12-16T23:11:10.071Z','user2',4",
+        "95,'post body 95','2025-12-12T23:35:13.095Z','user6',4",
+        "11,'post body 11','2025-12-12T11:11:01.011Z','user2',4",
+        "35,'post body 35','2025-12-08T11:35:05.035Z','user6',4",
+        "59,'post body 59','2025-12-04T11:59:08.059Z','user10',4",
+        "82,'post body 82','2025-11-27T10:22:11.082Z','user3',4",
+        "22,'post body 22','2025-11-23T22:22:03.022Z','user3',4",
+        "46,'post body 46','2025-11-19T22:46:06.046Z','user7',4",
+        "70,'post body 70','2025-11-15T22:10:10.070Z','user1',4",
+        "94,'post body 94','2025-11-11T22:34:13.094Z','user5',4",
+        "10,'post body 10','2025-11-11T10:10:01.010Z','user1',4",
+        "34,'post body 34','2025-11-07T10:34:04.034Z','user5',4",
+        "58,'post body 58','2025-11-03T10:58:08.058Z','user9',4",
+        "81,'post body 81','2025-10-26T09:21:11.081Z','user2',4",
+        "21,'post body 21','2025-10-22T21:21:03.021Z','user2',4",
+        "45,'post body 45','2025-10-18T21:45:06.045Z','user6',4",
+        "69,'post body 69','2025-10-14T21:09:09.069Z','user10',4"
+      ],
+      "query_plans": {
+        "stock": [
+          "QUERY PLAN",
+          "|--SCAN p USING INDEX posts_created_at_id_idx",
+          "|--SEARCH u USING INTEGER PRIMARY KEY (rowid=?)",
+          "`--CORRELATED SCALAR SUBQUERY 1",
+          "   `--SEARCH l USING COVERING INDEX likes_post_id_idx (post_id=?)"
+        ]
+      },
+      "samples": [
+        {
+          "engine": "stock",
+          "trial": 0,
+          "engine_order": 0,
+          "pid": 639304,
+          "queries": 2,
+          "checkpoints": [
+            {
+              "query_count": 0,
+              "rss_kib": 2508,
+              "hwm_kib": 2508
+            },
+            {
+              "query_count": 1,
+              "rss_kib": 2532,
+              "hwm_kib": 2532
+            },
+            {
+              "query_count": 2,
+              "rss_kib": 2532,
+              "hwm_kib": 2532
+            }
+          ],
+          "measured_results_checked": 2,
+          "rows_per_execution": 20
+        }
+      ],
+      "errors": [],
+      "summary": {
+        "engines": {
+          "stock": {
+            "runs": 1,
+            "median_setup_rss_kib": 2508,
+            "median_first_query_hwm_kib": 2532,
+            "median_first_query_rss_kib": 2532,
+            "median_final_query_hwm_kib": 2532,
+            "median_final_query_rss_kib": 2532,
+            "median_final_minus_setup_rss_kib": 24,
+            "median_final_minus_first_rss_kib": 0
+          }
+        }
+      }
+    }
+  },
+  "errors": [],
+  "memory_queries_per_process": 2,
+  "memory_interpretation": "Approximate whole-process resident counters, not query heap. First-query high water includes process startup, database opening and setup, but excludes later queries and shutdown. Post-query RSS includes caches and allocator-retained storage; retained growth alone is not proof of a leak. No rows-examined metric is inferred from memory or result cardinality.",
+  "binaries": {
+    "stock": {
+      "path": "/dev/shm/frankensqlite-531-validation/sqlite3",
+      "sha256": "d4ca8b992b4334fe8362123b8a6f4024662a7f51ed547d86e2a47ed149b0ab3c",
+      "bytes": 1766056,
+      "version": "3.53.2 2026-06-03 19:12:13 d6e03d8c777cfa2d35e3b60d8ec3e0187f3e9f99d8e2ee9cac695fd6fcdf1a24 (64-bit)",
+      "source_revision_supplied": null
+    }
+  },
+  "supplied_build_provenance": {},
+  "stock_identity": [
+    "'3.53.2','2026-06-03 19:12:13 d6e03d8c777cfa2d35e3b60d8ec3e0187f3e9f99d8e2ee9cac695fd6fcdf1a24'"
+  ]
+}
