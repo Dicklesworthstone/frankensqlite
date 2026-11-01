@@ -5505,7 +5505,7 @@ impl<F: VfsFile + 'static> WalIndexShmSource<F> {
             // The attempted slot is restored before this reversible wait.
             // Keep stock retry pacing, but let the explicit operation's local
             // relay interrupt even the longer late-attempt backoffs.
-            await_pager_admission(cx, wal_reader_retry_pause(attempt)).await?;
+            await_pager_admission(cx, None, wal_reader_retry_pause(attempt)).await?;
         }
     }
 
@@ -5720,7 +5720,7 @@ async fn async_rwlock_read<'a, T>(
     if cx.mask_depth() == 0
         && let Some(native_cx) = cx.attached_native_cx()
     {
-        return await_pager_admission(cx, lock.read(&native_cx))
+        return await_pager_admission(cx, Some(&native_cx), lock.read(&native_cx))
             .await?
             .map_err(|error| match error {
                 asupersync::sync::RwLockError::Cancelled => FrankenError::Abort,
@@ -5756,7 +5756,7 @@ async fn async_rwlock_write<'a, T>(
     if cx.mask_depth() == 0
         && let Some(native_cx) = cx.attached_native_cx()
     {
-        return await_pager_admission(cx, lock.write(&native_cx))
+        return await_pager_admission(cx, Some(&native_cx), lock.write(&native_cx))
             .await?
             .map_err(|error| match error {
                 asupersync::sync::RwLockError::Cancelled => FrankenError::Abort,
@@ -7110,6 +7110,7 @@ impl PagerMaintenanceLease {
             }
             await_pager_admission(
                 cx,
+                None,
                 asupersync::time::sleep(asupersync::time::wall_now(), pause),
             )
             .await?;
@@ -7274,6 +7275,7 @@ async fn begin_namespace_admission(
             let slice = remaining.min(Duration::from_millis(50));
             await_pager_admission(
                 cx,
+                None,
                 asupersync::time::sleep(asupersync::time::wall_now(), slice),
             )
             .await?;
@@ -31214,7 +31216,7 @@ mod tests {
             assert!(relay.cancel_local(CancelReason::UserInterrupt));
             std::task::Poll::Ready(guard)
         });
-        let mut admission = Box::pin(await_pager_admission(&operation, wait));
+        let mut admission = Box::pin(await_pager_admission(&operation, None, wait));
         let mut task_cx = std::task::Context::from_waker(std::task::Waker::noop());
         assert!(matches!(
             admission.as_mut().poll(&mut task_cx),

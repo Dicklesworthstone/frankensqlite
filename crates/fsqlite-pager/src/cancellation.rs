@@ -8,20 +8,43 @@ use fsqlite_types::cx::Cx;
 /// Race a reversible admission wait against the explicit operation's local
 /// cancellation. Dropping a pending native lock future retires its waiter;
 /// mandatory settlement and physical writes must not use this helper.
-pub async fn await_pager_admission<F: Future>(cx: &Cx, wait: F) -> Result<F::Output> {
+///
+/// `native` is the native context the wait runs under, when the caller already
+/// holds it (the native rwlock fast paths). Callers without one pass `None`.
+pub async fn await_pager_admission<F: Future>(
+    cx: &Cx,
+    native: Option<&asupersync::Cx>,
+    wait: F,
+) -> Result<F::Output> {
     let mut cancellation = std::pin::pin!(cx.wait_for_local_cancellation());
     let mut wait = std::pin::pin!(wait);
+    // Until the wait first suspends, the full checkpoint runs only when a
+    // cancellation is already published: the local flag, or the native
+    // context's flag when the caller passed it (one atomic load each). A full
+    // checkpoint probes the attached native context, which reads the clock, and
+    // uncontended pager locks are taken many times per statement. The native
+    // flag can lag a legacy direct write but never reads true falsely; any such
+    // lag is caught by the full checkpoint once the wait suspends. After a
+    // suspension, every poll takes the full checkpoint.
+    let cancel_published = || {
+        cx.is_cancel_requested() || native.is_some_and(asupersync::Cx::published_cancel_requested)
+    };
+    let mut suspended = false;
     std::future::poll_fn(|task_cx| {
-        if cx.checkpoint().is_err() {
+        if (suspended || cancel_published()) && cx.checkpoint().is_err() {
             return std::task::Poll::Ready(Err(FrankenError::Abort));
         }
         if let std::task::Poll::Ready(output) = wait.as_mut().poll(task_cx) {
+            if !suspended && !cancel_published() {
+                return std::task::Poll::Ready(Ok(output));
+            }
             return std::task::Poll::Ready(
                 cx.checkpoint()
                     .map(|()| output)
                     .map_err(|_| FrankenError::Abort),
             );
         }
+        suspended = true;
         // Uncontended locks need no local waiter registration. Once the
         // native future suspends, register the operation's local relay and
         // recheck: cancellation between its poll and registration cannot be
@@ -109,7 +132,7 @@ mod tests {
         let wakes = Arc::new(WakeCount::default());
         let waker = Waker::from(Arc::clone(&wakes));
         let mut task_cx = Context::from_waker(&waker);
-        let mut admission = Box::pin(await_pager_admission(&cx, GatedWait(Arc::clone(&gate))));
+        let mut admission = Box::pin(await_pager_admission(&cx, None, GatedWait(Arc::clone(&gate))));
 
         assert!(admission.as_mut().poll(&mut task_cx).is_pending());
         assert_eq!(gate.polls.load(Ordering::Relaxed), 1);
@@ -136,7 +159,7 @@ mod tests {
             polls.fetch_add(1, Ordering::Relaxed);
             Poll::Ready(())
         });
-        let mut admission = Box::pin(await_pager_admission(&cx, wait));
+        let mut admission = Box::pin(await_pager_admission(&cx, None, wait));
         let mut task_cx = Context::from_waker(Waker::noop());
 
         assert!(matches!(
@@ -151,7 +174,7 @@ mod tests {
         let cx = Cx::new();
         let mask = cx.masked();
         let gate = Arc::new(Gate::default());
-        let mut admission = Box::pin(await_pager_admission(&cx, GatedWait(Arc::clone(&gate))));
+        let mut admission = Box::pin(await_pager_admission(&cx, None, GatedWait(Arc::clone(&gate))));
         let mut task_cx = Context::from_waker(Waker::noop());
 
         assert!(admission.as_mut().poll(&mut task_cx).is_pending());
@@ -172,7 +195,7 @@ mod tests {
     fn uncancelled_admission_preserves_wait_and_output() {
         let cx = Cx::new();
         let gate = Arc::new(Gate::default());
-        let mut admission = Box::pin(await_pager_admission(&cx, GatedWait(Arc::clone(&gate))));
+        let mut admission = Box::pin(await_pager_admission(&cx, None, GatedWait(Arc::clone(&gate))));
         let mut task_cx = Context::from_waker(Waker::noop());
 
         assert!(admission.as_mut().poll(&mut task_cx).is_pending());
@@ -195,7 +218,7 @@ mod tests {
             assert!(relay.cancel_local(CancelReason::UserInterrupt));
             Poll::Ready(AcquiredGuard(Arc::clone(&drops)))
         });
-        let mut admission = Box::pin(await_pager_admission(&cx, wait));
+        let mut admission = Box::pin(await_pager_admission(&cx, None, wait));
         let mut task_cx = Context::from_waker(Waker::noop());
 
         assert!(matches!(
@@ -215,12 +238,71 @@ mod tests {
             assert!(relay.cancel_local(CancelReason::UserInterrupt));
             Poll::<()>::Pending
         });
-        let mut admission = Box::pin(await_pager_admission(&cx, wait));
+        let mut admission = Box::pin(await_pager_admission(&cx, None, wait));
         let mut task_cx = Context::from_waker(Waker::noop());
 
         assert!(matches!(
             admission.as_mut().poll(&mut task_cx),
             Poll::Ready(Err(FrankenError::Abort))
         ));
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn native_cancellation_aborts_suspended_admission_before_repolling_wait() {
+        let cx = Cx::new();
+        let native = asupersync::Cx::for_testing();
+        cx.set_native_cx(native.clone());
+        let gate = Arc::new(Gate::default());
+        let mut admission = Box::pin(await_pager_admission(&cx, None, GatedWait(Arc::clone(&gate))));
+        let mut task_cx = Context::from_waker(Waker::noop());
+
+        assert!(admission.as_mut().poll(&mut task_cx).is_pending());
+        assert_eq!(gate.polls.load(Ordering::Relaxed), 1);
+        native.cancel_with(asupersync::types::CancelKind::User, None);
+        assert!(
+            !cx.is_cancel_requested(),
+            "the cancellation is native-only, so the local fast flag is still clear"
+        );
+        assert!(matches!(
+            admission.as_mut().poll(&mut task_cx),
+            Poll::Ready(Err(FrankenError::Abort))
+        ));
+        assert_eq!(
+            gate.polls.load(Ordering::Relaxed),
+            1,
+            "a suspended admission takes the full checkpoint before polling its wait again"
+        );
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn published_native_cancellation_aborts_before_first_poll() {
+        let cx = Cx::new();
+        let native = asupersync::Cx::for_testing();
+        cx.set_native_cx(native.clone());
+        native.cancel_with(asupersync::types::CancelKind::User, None);
+        assert!(native.published_cancel_requested());
+        assert!(
+            !cx.is_cancel_requested(),
+            "the cancellation is native-only, so the local fast flag is still clear"
+        );
+        let polls = AtomicUsize::new(0);
+        let wait = std::future::poll_fn(|_| {
+            polls.fetch_add(1, Ordering::Relaxed);
+            Poll::Ready(())
+        });
+        let mut admission = Box::pin(await_pager_admission(&cx, Some(&native), wait));
+        let mut task_cx = Context::from_waker(Waker::noop());
+
+        assert!(matches!(
+            admission.as_mut().poll(&mut task_cx),
+            Poll::Ready(Err(FrankenError::Abort))
+        ));
+        assert_eq!(
+            polls.load(Ordering::Relaxed),
+            0,
+            "a published native cancellation is seen before the wait is polled"
+        );
     }
 }
