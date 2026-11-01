@@ -23,7 +23,7 @@ Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releas
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| [Unreleased](https://github.com/Dicklesworthstone/frankensqlite/compare/v0.4.12...main) | HEAD | 2026-10-27 | Development on `main` after v0.4.12, with **data-integrity fixes**: an unparenthesized column `DEFAULT` swallowed a following NOT NULL or COLLATE, also on stock-created schemas; an FTS5 external-content `rebuild` after a content-table rename erased the index, and such a table lost its postings on its first write after a reopen (GH#211); concurrent writers could commit duplicate implicit rowids (bd-ujp0h, bd-2ym3z); triggers fired by a cascade skipped FK checks, and an FK action skipped by `RAISE(IGNORE)` left orphan rows (bd-vcvn0); R-tree tables were not written in stock's file format. Plus GH#509, GH#511, GH#512, GH#448, GH#521, GH#523, GH#526 (measured), GH#528 and GH#529 fixes, `json_each` over NULL input and table-valued functions listed before the table they read, stock's JSON error texts, `json_array_insert` and the jsonb_ aggregates, the JSON aggregates as window functions and with `->` arguments, contended checkpoints that failed with BusyRecovery, read-only opens of a header-less WAL without `-shm` (GH#515) and of unwritable files, WAL resets by the autocheckpoint (GH#385), join memory bounds (GH#527), candidate fixes for GH#510, GH#519 and GH#506 (macOS) that were not run when committed and for GH#524 and GH#525 that were not fully built or run, large-commit memory bounds (GH#518), stable-Rust build work (GH#522; releases through v0.4.12 still need nightly), the source-incompatible `MigrationOutcome::Incomplete` and geopoly return types, and ordered batch replication in the TypeScript SDK. Many commits record no compile or test run |
+| [v0.4.13](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.4.13) | Release | 2026-11-01 | Uniform release of all 26 public crates, with **data-integrity fixes**: an unparenthesized column `DEFAULT` swallowed a following NOT NULL or COLLATE, also on stock-created schemas; an FTS5 external-content `rebuild` after a content-table rename erased the index, and such a table lost its postings on its first write after a reopen (GH#211); concurrent writers could commit duplicate implicit rowids (bd-ujp0h, bd-2ym3z); triggers fired by a cascade skipped FK checks, and an FK action skipped by `RAISE(IGNORE)` left orphan rows (bd-vcvn0); R-tree tables were not written in stock's file format; a WITHOUT ROWID UPDATE or any upsert `DO UPDATE` read SET values the same SET had already assigned (bd-bymr0); UPDATE and DELETE with a correlated subquery over a join, view, derived table or OFFSET changed the wrong rows or stored wrong values (bd-h7hox), and such subqueries in RETURNING returned wrong values (bd-hga35, partly fixed). Plus GH#509, GH#511, GH#512, GH#448, GH#521, GH#523, GH#526 (measured), GH#528 and GH#529 fixes, `random()`/`randomblob()` seeded per process instead of repeating one sequence (bd-w2sd6), seeks for correlated subqueries, simple views, join `LIMIT`, constant-expression keys and bare-column aggregates (one tied `min()` shape now differs from stock, bd-5kdea), `INSERT ... SELECT` that no longer loads a whole table or `generate_series` source (GH#491 still open), `json_each` over NULL input and table-valued functions listed before the table they read, stock's JSON error texts, `json_array_insert` and the jsonb_ aggregates, the JSON aggregates as window functions and with `->` arguments, contended checkpoints that failed with BusyRecovery, read-only opens of a header-less WAL without `-shm` (GH#515) and of unwritable files, WAL resets by the autocheckpoint (GH#385), join memory bounds (GH#527), candidate fixes for GH#510, GH#519 and GH#506 (macOS) that were not run when committed and for GH#524 and GH#525 that were not fully built or run, large-commit memory bounds (GH#518), stable-Rust build work (GH#522; releases through v0.4.12 still need nightly), the source-incompatible `MigrationOutcome::Incomplete`, geopoly return types and `JSON_TABLE_COLUMN_NAMES`, and ordered batch replication in the TypeScript SDK. Many commits record no compile or test run, and most from 2026-10-28 on record runs on macOS arm64 only; the release gate is under Qualification. The GH#530 streaming of table-function Cartesian aggregates was backed out before release, and GH#530 stays open |
 | [v0.4.12](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.4.12) | Release | 2026-10-13 | Uniform release of all 26 public crates, with an **upgrade advisory for 0.4.10**: a join whose outer table was read through an index with a `DESC` column returned no rows (GH#502); `:memory:` with `autocommit_retain = OFF` could lose every row of a table (GH#503); `DELETE ... WHERE EXISTS` over the same table deleted the wrong rows (bd-ntt2b). Plus FROM-less row-value comparisons (GH#450), attached-database DML and name resolution, conflict-clause and constraint parity, a full filesystem during WAL-index growth reported as an I/O error instead of a SIGBUS on Linux (GH#506), WAL-FEC attach/close fixes, and index seeks for `IN` lists and `WHERE k = ? ORDER BY id` |
 | [0.4.11](https://crates.io/crates/fsqlite-vfs/0.4.11) | crates.io only | 2026-10-09 | `fsqlite-vfs` alone: on macOS and other non-Linux Unix, a redundant main-DB descriptor opened while WAL lifetime locks were held is reused instead of parked forever, so long-running processes stop leaking about 2 fds per fresh connection (bd-l0rbc). Tag `fsqlite-vfs-v0.4.11`; no GitHub Release. The next uniform release must be >= 0.4.12 |
 | [v0.4.10](https://github.com/Dicklesworthstone/frankensqlite/releases/tag/v0.4.10) | Release | 2026-10-07 | Uniform release of all 26 public crates, with a **data-integrity advisory**: inserts inside a transaction could silently corrupt a table b-tree (bd-obwsy); UPDATE ... FROM lost or repeated updates (bd-b5j26); non-integer rowid / INTEGER PRIMARY KEY values left malformed index entries (REINDEX); a REPLACE constraint could delete a row an IGNORE constraint then kept out; a retried fsync after a failed WAL sync could vouch for unwritten frames (bd-alyrn). Plus checkpoint source validation, max-rowid and rowid-reuse parity, `:memory:` freelist reuse, stock empty-schema opens, and DML/join/trigger performance work |
@@ -57,9 +57,9 @@ Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releas
 
 ---
 
-## [Unreleased] -- development on `main` after v0.4.12
+## [0.4.13] -- 2026-11-01 (GitHub Release)
 
-Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.4.12...main>
+Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.4.12...v0.4.13>
 
 **Verification status.** GitHub Actions is off, and many commits in this range state in their own
 messages that Cargo was unavailable or that their Rust tests were not run; the entries below repeat
@@ -71,7 +71,9 @@ on 2026-10-22, and the tracker records no full-workspace test run of `main` sinc
 (bd-reality-check-1022-llk6g.12). From 2026-10-23 most commits record their own runs: unless an
 entry says otherwise, each commit from that date that it cites records a keeper that failed before
 the change and passes with it on Linux x86_64 build hosts (trj, mostly through rch). Entries name
-the runs made on macOS arm64 and the commits that record no run or only part of one.
+the runs made on macOS arm64 and the commits that record no run or only part of one. Most commits
+of 2026-10-28 to 2026-10-30 record their keeper runs on macOS arm64 only; their entries name the
+Linux runs that the tracker records afterwards, or say that none is recorded.
 
 ### Data integrity
 
@@ -141,6 +143,64 @@ the runs made on macOS arm64 and the commits that record no run or only part of 
   duplicate id now fails with stock's `UNIQUE constraint failed: rt.id`, and `CREATE VIRTUAL TABLE`
   passes module arguments as their source text, so an auxiliary column `+tag0` no longer reaches
   the module as `+ tag0`, which stock read back as a syntax error.
+- **An UPDATE on a WITHOUT ROWID table, and an upsert's `DO UPDATE` on any table, computed each SET
+  term from values the same SET list had already assigned
+  ([51088f4cb](https://github.com/Dicklesworthstone/frankensqlite/commit/51088f4cb), bd-bymr0).**
+  `UPDATE w SET a = b, b = a` left `y|y` where stock gives `y|x`, `SET a = 'z' || a` read its own
+  partial result, and on a WITHOUT ROWID table a correlated subquery that read an assigned column
+  saw NULL, so `UPDATE w SET n = (SELECT count(*) FROM s WHERE s.n <= w.n)` counted nothing. The
+  statements succeeded and stored the wrong values. The SET terms, the DO UPDATE WHERE and the
+  INTEGER PRIMARY KEY now read a copy of the old row; UPDATEs of rowid tables and WITHOUT ROWID
+  `UPDATE ... FROM` were already right. The commit's keeper (18 statements on four table shapes,
+  against rusqlite) diverged in 172 of 288 runs before the change and passes with it, on macOS
+  arm64; the tracker records it and the changed upsert bytecode snapshot passing on Linux at
+  fd584a613 ([b15de7a99](https://github.com/Dicklesworthstone/frankensqlite/commit/b15de7a99)).
+  The bead reproduces the bug on `main` at d6636363b. No run against v0.4.12 is recorded, but the
+  register reads the fix replaces date from before v0.4.12.
+- **UPDATE and DELETE with a correlated subquery that is not a scan of one base table changed the
+  wrong rows or stored wrong values, without an error
+  ([d074283b5](https://github.com/Dicklesworthstone/frankensqlite/commit/d074283b5), bd-h7hox).**
+  The DML path compiled every correlated subquery in SET and WHERE as a scan of one base table, so
+  a subquery over a join, view, derived table, CTE, compound or table-valued function read as empty
+  or NULL, and GROUP BY, HAVING, `LIMIT 0`, an OFFSET, the WHERE of a FROM-less subquery and a
+  correlated IN in SET were ignored: `DELETE FROM u WHERE EXISTS (SELECT 1 FROM vt WHERE vt.id =
+  u.id)` over a view deleted nothing, and `EXISTS (... LIMIT 1 OFFSET 50)` deleted every row. With
+  UPDATE triggers or foreign keys on, any correlated SET subquery failed with
+  `eval_join_expr: unsupported expression type: Subquery`. Such WHERE subqueries are now resolved
+  to rows through the SELECT path before any row is removed, and such an UPDATE runs row by row,
+  reading each row's SET values just before the row changes, as stock's progressive SET does. The
+  same one-table scan gave a wrong 0 or 1 for a correlated EXISTS of those shapes in a SELECT's
+  result columns, under NOT or CASE, in ORDER BY and in INSERT ... SELECT, and ignored its OFFSET
+  ([4c8ee6e6f](https://github.com/Dicklesworthstone/frankensqlite/commit/4c8ee6e6f), bd-jf4s4,
+  bd-zje20; d074283b5 also fixes a FROM-less `EXISTS (SELECT 1 WHERE ...)` that 4c8ee6e6f still
+  answered wrongly), and a correlated subquery in UPDATE or DELETE RETURNING returned 0 or NULL
+  ([5f43df428](https://github.com/Dicklesworthstone/frankensqlite/commit/5f43df428), bd-hga35).
+  Before the changes the keepers diverged in 892 of 1,100 runs (bd-h7hox), 276 of 320 statements
+  (bd-jf4s4, bd-zje20) and 300 of 420 runs (bd-hga35) on macOS arm64, and they pass with them
+  there; the tracker records them passing on Linux at fd584a613 and 9090854e1
+  ([b15de7a99](https://github.com/Dicklesworthstone/frankensqlite/commit/b15de7a99),
+  [66f373cb5](https://github.com/Dicklesworthstone/frankensqlite/commit/66f373cb5)). The commits
+  and beads reproduce these bugs on `main`; no run against v0.4.12 is recorded, but v0.4.12
+  already has that one-table scan and none of the routing these commits add. Still wrong:
+  RETURNING with such a subquery when the UPDATE has AFTER UPDATE triggers or assigns the row key,
+  or the DELETE has DELETE triggers; a DELETE RETURNING subquery that reads the target or a
+  cascaded child, because RETURNING runs before the row is removed where stock runs it after the
+  delete and its FK actions (bd-7ovcv); and a SET subquery that reads the target through a rowid
+  probe, which sees pre-update values (bd-ew10g). bd-h7hox and bd-hga35 stay open. The row-by-row
+  path made these statements slow;
+  [6e86ab155](https://github.com/Dicklesworthstone/frankensqlite/commit/6e86ab155) (bd-kef4m, see
+  Performance) lets their per-row probes seek, and in its single runs under load at 20,000 rows a
+  DELETE ... WHERE EXISTS over a view went from 127.1 s to 0.42 s and an UPDATE SET over a view
+  from 366.8 s to 1.80 s, against 0.055 s and 0.056 s in stock. UPDATE still reads each row's SET
+  values with its own SELECT (bd-p5k2i).
+- **A read-only `VACUUM INTO` of a database with a live WAL wrote the wrong header
+  ([7b695c9d9](https://github.com/Dicklesworthstone/frankensqlite/commit/7b695c9d9)).** The copy
+  took `user_version` and `application_id` from the main file while its rows came through the WAL.
+  With a stock writer holding the WAL the source read 231 and the copy read 0, on v0.4.12 as well;
+  stock's read-only `VACUUM INTO` and fsqlite's writable one both give 231 and 4242. Read-only
+  sources now take the logical header. The three new tests run a stock writer in its own process
+  and compare the copy with stock's own copy: without the fix the fresh and uncheckpointed shapes
+  fail and the checkpointed control passes.
 
 ### Fixed
 
@@ -280,6 +340,71 @@ SQL results and schema:
   (`table t has 2 columns but 1 values were supplied`) instead of an internal error
   ([4f37506fc](https://github.com/Dicklesworthstone/frankensqlite/commit/4f37506fc),
   bd-reality-check-1022-llk6g.28).
+- `random()` and `randomblob()` drew the same sequence in every process, so `hex(randomblob(16))`
+  keys made by two processes collided and three runs of `SELECT hex(randomblob(8)), random()`
+  printed the same line; the generator now takes a per-process seed from the `rand` crate on first
+  use, as stock seeds its generator once per process from the VFS
+  ([c59c33fc9](https://github.com/Dicklesworthstone/frankensqlite/commit/c59c33fc9), bd-w2sd6).
+  The v0.4.12 source has the same constant seed. WebAssembly builds keep it, and the generator is
+  still the non-cryptographic splitmix64. The keeper re-runs its test binary in three processes;
+  it passes, and fails with the old seed planted back (macOS arm64); the tracker records it
+  passing on Linux at fd1ae5055
+  ([6d15a0cc6](https://github.com/Dicklesworthstone/frankensqlite/commit/6d15a0cc6)).
+- A compiled correlated EXISTS or scalar subquery that probed the rowid with a key that is not an
+  integer still matched a row: `t.id = 5.5` and `t.id = x'35'` found row 5 and `t.id = 1e300` the
+  largest rowid, so `SELECT p.id FROM p WHERE EXISTS (SELECT 1 FROM t WHERE t.id = p.val)` kept 4
+  rows that stock drops
+  ([66cb7efab](https://github.com/Dicklesworthstone/frankensqlite/commit/66cb7efab), bd-rl7ak).
+  The `SeekRowid` key now takes NUMERIC affinity and matches no row unless that makes it an
+  integer, as in stock. The fix is in the opcode, so it also covers these subqueries in UPDATE
+  SET, DML WHERE and RETURNING, though the commit's repro is a SELECT; the truncating code it
+  replaces dates from before v0.4.12. The commit's keeper found 8 such divergences before the
+  change on macOS arm64; the tracker records it passing on Linux at d9d535408
+  ([cd2257443](https://github.com/Dicklesworthstone/frankensqlite/commit/cd2257443)).
+- An aggregate with a bare column, such as `SELECT b, count(*) FROM t WHERE a = 5`, scanned the
+  whole table in rowid order and could take the bare value from another row than stock: 6 of the
+  commit's 10 probes at 300,000 rows returned other values (`5|300` where stock gives `0|300`).
+  These aggregates now use the same nine seeks as other aggregates and visit rows in stock's order
+  ([a566f425f](https://github.com/Dicklesworthstone/frankensqlite/commit/a566f425f), bd-d4rbi);
+  the probes went from 28-71 ms to 0-3 ms on macOS arm64. The gates it removes date from before
+  v0.4.12. One shape now differs from stock where the old scan matched it only by its tie-break:
+  with indexes on `b` and `c`, `SELECT id, min(b) FROM t WHERE c > 'v20'` returns id 340 where
+  stock, whose min/max optimization walks the index on `b`, returns 34 (bd-5kdea); a lone `max()`
+  with a bare column still differs from stock, as before. The keeper (1,832 runs against rusqlite)
+  had 560 divergences before and none after, on macOS arm64; no Linux run is recorded.
+- `INSERT INTO t(a, b) VALUES(1)`, and other INSERTs whose column list names every column, failed
+  with `table t has 2 columns but 1 values were supplied` instead of stock's
+  `1 values for 2 columns`, since
+  [4a60d9f71](https://github.com/Dicklesworthstone/frankensqlite/commit/4a60d9f71) and its
+  byte-identical sibling c8ae7a47b (both after v0.4.12), and a WITHOUT ROWID table wrapped the
+  error in `not implemented: ...`; both now give stock's texts
+  ([7169cd1dc](https://github.com/Dicklesworthstone/frankensqlite/commit/7169cd1dc), bd-893ru).
+  The keeper's 11-shape rusqlite comparison failed on 6 shapes before the fix and passes with it
+  (macOS arm64); the tracker records it passing on Linux at a137b7490
+  ([fd1ae5055](https://github.com/Dicklesworthstone/frankensqlite/commit/fd1ae5055)).
+- STRICT errors use stock's wording
+  ([7d3b7e1af](https://github.com/Dicklesworthstone/frankensqlite/commit/7d3b7e1af), bd-8djon): a
+  column declared `INT` is named `INT` rather than `INTEGER`
+  (`cannot store TEXT value in INT column s2.a`), an integer value is called `INT`, and an INTEGER
+  PRIMARY KEY of a STRICT table gets only the rowid check, so `'abc'`, `1.5` or a blob fail with
+  plain `datatype mismatch`, also through INSERT ... SELECT and bound parameters. 21 of the
+  keeper's 40 statements differed from rusqlite's bundled SQLite before and none after (macOS
+  arm64); the tracker records it passing on Linux at fd584a613
+  ([b15de7a99](https://github.com/Dicklesworthstone/frankensqlite/commit/b15de7a99)).
+- `changes()` after an `INSERT ... SELECT` of more than 10,000 rows from a filtered or computed
+  source reported only the last 10,000-row chunk (2727 instead of 22727); it is now the
+  statement's total
+  ([20a13232f](https://github.com/Dicklesworthstone/frankensqlite/commit/20a13232f), bd-qdve2).
+  The commit says the bug predates it.
+- A seek on a REAL index column gave a wrong result for an integer past 2^53: the probe took REAL
+  affinity, so the integer rounded and the seek started at the wrong key. Probes now take NUMERIC
+  affinity, as stock does, which keeps the integer exact
+  ([b636f91a9](https://github.com/Dicklesworthstone/frankensqlite/commit/b636f91a9), bd-xz5f4).
+  An `UPDATE` on such a column already changed a row on v0.4.12, and constant-expression seek keys
+  ([7f8dd93e4](https://github.com/Dicklesworthstone/frankensqlite/commit/7f8dd93e4)) made
+  `c >= '9007199254740993' || ''` return a row that v0.4.12 and stock exclude. The keeper compares
+  REAL, INTEGER and NUMERIC columns near 2^53 and the i64 limits with rusqlite, with a planted
+  negative.
 
 Constraints, foreign keys and triggers:
 
@@ -374,7 +499,9 @@ Extensions and virtual tables:
   result NULL, `json_group_object(1, 2)` is `{"1":2}`, and an array subscript too large for any
   array finds nothing. Three unit tests that asserted the old behavior now assert stock's. The
   keeper compares 91 statements with rusqlite's bundled SQLite: 83 differed before, none after,
-  on macOS arm64; the Linux run is pending.
+  on macOS arm64. The tracker records this keeper and those of the four JSON entries below
+  passing on Linux x86_64 at f821500c1
+  ([ccef36e0c](https://github.com/Dicklesworthstone/frankensqlite/commit/ccef36e0c)).
 - `json_set`, `json_insert` and their jsonb_ forms no longer build the rest of a PATH through a
   JSON null in its middle: `json_set('{"a":null}', '$.a.b.c', 1)` leaves the document unchanged,
   as in stock, where it gave `{"a":{"b":{"c":1}}}`
@@ -402,8 +529,10 @@ Extensions and virtual tables:
   `json_array()` or `json_object()` is quoted (bd-0pj4x).
 - The JSON aggregates embed the JSON that `x -> path` returns, and a `json_extract()` result
   that is an array or object, as stock does; `json_group_array(doc -> '$.tags')` gave an array
-  of quoted strings, and `doc -> '$.n'` gave `["2"]` for 2 (bd-ikehc). This holds for plain and
-  GROUP BY aggregates and in windows. The keeper compares 65 statements with rusqlite's bundled
+  of quoted strings, and `doc -> '$.n'` gave `["2"]` for 2
+  ([4dd200e08](https://github.com/Dicklesworthstone/frankensqlite/commit/4dd200e08), bd-ikehc).
+  This holds for plain and GROUP BY aggregates and in windows. The keeper compares 65 statements
+  with rusqlite's bundled
   SQLite: 41 differed before, none after (macOS arm64). A GROUP BY whose JSON aggregate takes a
   json_extract() argument now runs on the slower grouped evaluator, as one with a `json()`
   argument already did; other aggregates over json_extract(), such as `sum()`, are not
@@ -518,6 +647,10 @@ Files, WAL and durability:
   compiled, and the `-wal`, `-shm` and WAL-certificate sidecars used the ambient umask until
   [97f4ae1b5](https://github.com/Dicklesworthstone/frankensqlite/commit/97f4ae1b5) (below;
   bd-reality-check-1022-llk6g.29).
+- Migration backup generation and restore directories are private from creation. They came from
+  `tempfile` with no explicit mode, so they were 0o775 at umask 002 while the files inside were
+  private, and three existing tests failed on any umask but 077
+  ([08b1744a3](https://github.com/Dicklesworthstone/frankensqlite/commit/08b1744a3)).
 - First-open migration repair requires its main and WAL backups and stops before any repair if they
   fail, repairs only on an explicit corruption verdict, reports a new `Incomplete` outcome instead
   of success when a stage fails, keeps checksummed (BLAKE3) backup generations across retries, and
@@ -586,8 +719,10 @@ Connections, busy handling and cancellation:
   SQLITE_BUSY_RECOVERY
   ([3716efbb2](https://github.com/Dicklesworthstone/frankensqlite/commit/3716efbb2), bd-s4lco).
   The cross-process churn keeper failed 4 and 3 of 10 runs at 46192f4be on macOS arm64; with the
-  change it passed 20 of 20 there and 7 of 7 completed runs on Linux x86_64. No deterministic test
-  drives the busy row.
+  change it passed 20 of 20 there and 7 of 7 completed runs on Linux x86_64, and the tracker later
+  records 10 of 10 completed Linux runs on its tree
+  ([a137b7490](https://github.com/Dicklesworthstone/frankensqlite/commit/a137b7490)). No
+  deterministic test drives the busy row.
 - `Connection::query`, which the CLI uses, did not retry an autocommit INSERT, UPDATE or DELETE
   that conflicted with a writer in another process, so with `busy_timeout=5000` it failed in about
   90 ms with `database is busy (snapshot conflict on pages: 2)` (265 of 400 inserts from four
@@ -660,8 +795,40 @@ Build and platforms:
   tests passed and the Windows GNU target cross-compiled, but Windows tests were not executed and
   the full test matrix was not built.
 
+Tests:
+
+- Tests that were red or vacuous on `main` now assert stock's behavior
+  ([2bf980746](https://github.com/Dicklesworthstone/frankensqlite/commit/2bf980746), bd-893ru):
+  two generated-column codegen tests inserted one value too many, two RETURNING tests expected
+  `RETURNING u.a` to resolve through the target alias where stock fails with
+  `no such column: u.a`, the two GH#526 composite-prefix EXISTS tests from
+  [14c7f7a19](https://github.com/Dicklesworthstone/frankensqlite/commit/14c7f7a19) never reached
+  the code they cover (one failed, one passed vacuously), and an INSERT ... SELECT test expected
+  `last_insert_rowid()` 1 where stock gives 11. The commit asks reviewers to treat these as gate
+  changes. `fsqlite-vdbe --lib codegen` went from 346 passed / 5 failed to 351 / 0 on macOS arm64,
+  and the tracker records 351 / 0 on Linux at a137b7490
+  ([fd1ae5055](https://github.com/Dicklesworthstone/frankensqlite/commit/fd1ae5055)). Also:
+  [2b27f82e6](https://github.com/Dicklesworthstone/frankensqlite/commit/2b27f82e6) updates a
+  LIKE-override test for the `SQLITE_CONSTRAINT_TRIGGER` code that
+  [f62448b87](https://github.com/Dicklesworthstone/frankensqlite/commit/f62448b87) introduced;
+  [2552cda26](https://github.com/Dicklesworthstone/frankensqlite/commit/2552cda26) adds the
+  fallback reasons of 4c8ee6e6f and d074283b5 to `docs/contracts/fallback_boundary_inventory.toml`,
+  whose contract test had failed on `main` since 4c8ee6e6f; and
+  [afd1a147e](https://github.com/Dicklesworthstone/frankensqlite/commit/afd1a147e) makes three
+  keepers clippy-clean without changing assertions. Expectations changed with the code elsewhere:
+  [6e86ab155](https://github.com/Dicklesworthstone/frankensqlite/commit/6e86ab155) narrows a
+  GH#527 join-fallback assertion that every case reads all 600 rows and moves a strict-mode
+  scenario to a GROUP BY view, and
+  [7f8dd93e4](https://github.com/Dicklesworthstone/frankensqlite/commit/7f8dd93e4) changes a unit
+  test that asserted a scan for `id = -5` to assert the seek.
+
 ### Performance
 
+- Point lookups (bound, warm) cost +3.2% instructions and +5.5% cycles compared with 0.4.12 (perf
+  stat, one quiet x86-64 host, 3 rounds; a same-binary control is within ±1%). About 40% of the
+  added instructions pay for cancellation and deadline checks at statement entry and at lock
+  entry. The rest is a new per-statement in-memory hydration check, extra io_uring latency
+  sampling, and the shared read path.
 - Composite index equality scans with bound parameters, such as `a = ?1 AND k = ?2 AND v > 0` on
   `(a, k)`, seek the whole pinned prefix and stop at its end
   ([72b0806c3](https://github.com/Dicklesworthstone/frankensqlite/commit/72b0806c3), bd-gtjlv
@@ -684,7 +851,15 @@ Build and platforms:
   ([#492](https://github.com/Dicklesworthstone/frankensqlite/issues/492),
   [91df8b6b9](https://github.com/Dicklesworthstone/frankensqlite/commit/91df8b6b9)). 91df8b6b9 was
   not compiled when committed; the tracker records the GH#492 keeper (5 passed) and the GH#493
-  targets passing afterwards (bd-w7qsf, bd-dy2h3).
+  targets passing afterwards (bd-w7qsf, bd-dy2h3). b729ccf1d, which is not in v0.4.12, also made
+  every read after a write inside an explicit transaction on a `:memory:` database load every row
+  into the mirror again, bringing back the quadratic ingestion cost that bd-qteu2 had removed;
+  [2b27f82e6](https://github.com/Dicklesworthstone/frankensqlite/commit/2b27f82e6) fixes that
+  (bd-gjrct): an insert-then-select loop after 80,000 seed rows took 8.87 s before and 0.17 s
+  after, against 0.02 s for stock, on macOS arm64. Autocommit read-after-write on `:memory:` still
+  reloads the mirror (about 9 s at 80,000 rows). The two lazy-mirror unit tests pass at
+  b729ccf1d's parent, fail at b729ccf1d and pass with the fix (macOS arm64); no Linux run after the
+  fix is recorded.
 - `PageData::clone` no longer copies through an intermediate `Vec`, and the in-memory page store
   shares cached page snapshots
   ([#520](https://github.com/Dicklesworthstone/frankensqlite/issues/520),
@@ -755,15 +930,22 @@ Build and platforms:
 - Read transactions kept copies of the pages they read up to the default 262,144-page allocation
   pool rather than the cache budget, so read-only connections held page buffers far above
   `cache_size` (GH#525 reports 676 MiB for four 64 MiB readers); retention is now capped at the
-  smaller of the cache budget and the page-buffer capacity, and a read-only transaction on a lone
-  connection retains none
+  smaller of the cache budget and the page-buffer capacity
   ([#525](https://github.com/Dicklesworthstone/frankensqlite/issues/525),
-  [d39a460b6](https://github.com/Dicklesworthstone/frankensqlite/commit/d39a460b6)). Not compiled
-  when committed; no run of its five pager regressions or of the GH#525 oracles and memory
-  profiles added in
-  [82dcce30f](https://github.com/Dicklesworthstone/frankensqlite/commit/82dcce30f) and
-  [29e1c3090](https://github.com/Dicklesworthstone/frankensqlite/commit/29e1c3090) is recorded,
-  so there is no measured RSS change, and GH#525 stays open.
+  [d39a460b6](https://github.com/Dicklesworthstone/frankensqlite/commit/d39a460b6)). That commit
+  also gave a read-only transaction on a lone connection no retained pages at all, which made
+  `join_100k` take 2.2× the CPU, or 3.5× at the default cache size, so a lone read-only
+  transaction now keeps pages up to its cache budget, and it stops as soon as a peer attaches
+  ([ee26108e3](https://github.com/Dicklesworthstone/frankensqlite/commit/ee26108e3)). The cost is
+  at most one cache per reader, about 2 MB at the default `cache_size` of -2000 and 66 MB at
+  -65536. On the GH#525 shape, one reader streaming 1.1 GB at `cache_size=-65536`, peak RSS on
+  one quiet x86-64 host (median of 3 runs, identical output in every run) was 1,361 MB on v0.4.12,
+  163 MB with no retention and 248 MB with this change, measured at
+  [8e2f65456](https://github.com/Dicklesworthstone/frankensqlite/commit/8e2f65456). The cost on
+  the same host: `join_100k` takes 2.17 times as long as on v0.4.12 at the default `cache_size` of
+  -2000 and 1.03 times at -128000 (see the known issues). On the static musl CLI one map site
+  differs from v0.4.12, the `txn_read_cache` insert at about 1 map per statement: likely this
+  change, not proven. GH#525 stays open.
 - A BEFORE UPDATE trigger whose `WHEN` holds a correlated multi-column `EXISTS` no longer walks
   the duplicates of the composite index's first column on every UPDATE
   ([#526](https://github.com/Dicklesworthstone/frankensqlite/issues/526)). The fix is the
@@ -772,12 +954,135 @@ Build and platforms:
   `WHEN`'s numbered OLD/NEW parameters already reach. The `gh526_trigger_when_composite_exists`
   keeper counts 9,309 opcodes per UPDATE at 2,048 rows at 72b0806c3's parent and 260 at
   72b0806c3. [14c7f7a19](https://github.com/Dicklesworthstone/frankensqlite/commit/14c7f7a19),
-  committed for #526 without a build, is not needed for the issue's shape: its keepers pass at
-  its parent too. Measured 2026-10-27 on macOS arm64 (release, stock 3.53.2 in the same run;
+  committed for #526 without a build, is not needed for the issue's shape: its integration
+  keepers pass at its parent too, and its two codegen unit tests never reached the code they
+  cover until [2bf980746](https://github.com/Dicklesworthstone/frankensqlite/commit/2bf980746)
+  (see Fixed, Tests). Measured 2026-10-27 on macOS arm64 (release, stock 3.53.2 in the same run;
   median of 3), the `WHEN` arm's milliseconds per UPDATE at 2k / 8k / 32k rows were 2.31 / 11.20
   / 45.50 on v0.4.12 and 0.114 / 0.147 / 0.305 on `main` (46192f4be), against stock's
   0.006 / 0.006 / 0.012. FrankenSQLite is still 19-26x slower than stock per UPDATE here, and
   7-16x without the trigger.
+- `INSERT ... SELECT` that the VDBE does not compile replays its source rows 32 at a time through
+  one multi-row `INSERT ... VALUES` (at most 1,024 bound values) where that behaves like single-row
+  inserts: no RETURNING, UPSERT, `OR FAIL` or `OR ROLLBACK`, foreign keys off, and a main-schema
+  base table without INSERT triggers that is not a view, virtual, temp or `sqlite_*` table or
+  shadowed by a temp table
+  ([958b8ace9](https://github.com/Dicklesworthstone/frankensqlite/commit/958b8ace9), bd-i3csr,
+  [#491](https://github.com/Dicklesworthstone/frankensqlite/issues/491)). A failure still lands on
+  the same row with the same error. B-tree balancing borrows unchanged cells from the sibling page
+  images instead of copying them, and produces the same page layout as before on seven workloads
+  ([4264b9a78](https://github.com/Dicklesworthstone/frankensqlite/commit/4264b9a78)). On macOS
+  arm64 with release CLIs at 1M rows from `generate_series`, the int-PRIMARY-KEY shape went from
+  3.64 s to 2.54 s with batching, and in a separate run from 2.43 s to 2.03 s with the balancing
+  change (stock 0.18-0.19 s); after both, the six GH#491 shapes are still 8-12x slower than stock,
+  and GH#491 (reported against 0.4.9) stays open. Both commits record runs on macOS only. The
+  batching keeper (174 statements against rusqlite) passes before and after, a planted negative
+  fails it, and the tracker records it and `issue_491_bulk_insert` passing on Linux at fd1ae5055
+  ([6d15a0cc6](https://github.com/Dicklesworthstone/frankensqlite/commit/6d15a0cc6)).
+- `INSERT ... SELECT` no longer loads a whole single-table or `generate_series` source, or re-reads
+  it for every chunk (bd-qdve2). A plain copy (`SELECT a, b FROM s`) reads the source in rowid
+  order, 10,000 rows at a time, when the INSERT cannot write the source (no trigger on the target,
+  foreign keys off, target not a source); a filtered or computed single-table source pages by
+  rowid instead of `LIMIT 10000 OFFSET n`, which was quadratic
+  ([20a13232f](https://github.com/Dicklesworthstone/frankensqlite/commit/20a13232f)); and
+  `generate_series` with integer or bound arguments, step >= 1, only `value` named and no
+  ORDER BY, LIMIT, DISTINCT, grouping, window or subquery is inserted one 10,000-value sub-range at
+  a time ([d79d947c2](https://github.com/Dicklesworthstone/frankensqlite/commit/d79d947c2)). On
+  macOS arm64 (release CLIs, stock in the same runs) the 3M-row plain copy went from 802 to 149 MiB
+  peak RSS at 2-3% more time (stock 66 MiB), `WHERE b LIKE '%7%'` from 30.93 s to 2.21 s, and the
+  1M-row GH#491 `generate_series` insert from 643 to 172 MiB (stock 41 MiB). Contents match stock
+  in every run, and for the series the insertion order too. Both build on
+  [c861dfa71](https://github.com/Dicklesworthstone/frankensqlite/commit/c861dfa71), which lets the
+  residual rowid-range walk seek under an integer-literal LIMIT/OFFSET or a second bound on the
+  same side, so keyset pagination such as `WHERE rowid > 900000 AND b > '' LIMIT 10` no longer
+  reads from the first row (0.10 s to 0.01 s at 1M rows). Within a chunk the source is still read
+  before its rows are inserted, so a later source error can still mask an earlier row's constraint
+  error, and the transaction's dirty pages still grow with the target; bd-qdve2 stays open. The
+  three commits record macOS runs only; the tracker records the chunked-source keeper passing on
+  Linux at fd1ae5055
+  ([6d15a0cc6](https://github.com/Dicklesworthstone/frankensqlite/commit/6d15a0cc6)) and names no
+  Linux run of c861dfa71's oracle.
+- A two-table join with a `LIMIT` and no `ORDER BY` whose inner table is reached by a rowid or
+  index seek runs in the VDBE and stops at the limit, where it built every joined row first
+  ([d6636363b](https://github.com/Dicklesworthstone/frankensqlite/commit/d6636363b), bd-9gl3w):
+  on macOS arm64, 50 statements of `SELECT t.v, k.label FROM t JOIN k ON t.g = k.g LIMIT 5` over
+  80,000 rows went from 2.37-2.44 s to 0.37-0.47 s, of which the seed takes 0.32-0.36 s (stock
+  0.08 s for the whole file). Nested-loop joins, `ORDER BY ... LIMIT` and aggregates over joins
+  keep the materializing executor, and `LIMIT ?, ?` still binds its two parameters in the wrong
+  order (bd-s9i69). The keeper's opcode bound failed before the change; the tracker records the
+  keeper passing on Linux at fd584a613
+  ([b15de7a99](https://github.com/Dicklesworthstone/frankensqlite/commit/b15de7a99)).
+- A compiled correlated scalar subquery, as in UPDATE SET, DML WHERE, RETURNING and compiled
+  SELECTs, seeks instead of scanning its table for every outer row (bd-rl7ak): for a rowid
+  equality, an equality on a single-column index and integer-literal rowid bounds
+  ([66cb7efab](https://github.com/Dicklesworthstone/frankensqlite/commit/66cb7efab)), and for
+  bounds on a single-column index and equalities on the leading columns of a multi-column index
+  with bounds on the next column
+  ([d9d535408](https://github.com/Dicklesworthstone/frankensqlite/commit/d9d535408)). At 20,000
+  rows on macOS arm64, `UPDATE u SET n = (SELECT count(*) FROM t WHERE t.g = u.g AND t.id < 10)`
+  went from 117.2 s to 0.22 s (stock 0.058 s), and a two-column index equality that ran over 60 s
+  takes 0.53 s (stock 0.13 s). An index slice is visited in index order, as in stock, so a
+  correlated `group_concat` over an index range in UPDATE SET now concatenates in stock's order;
+  the SELECT-list form still uses rowid order (bd-c6b16). A lone `max()` or `min()` over a slice
+  still walks the whole slice (3.91 s against stock's 0.19 s), and WITHOUT ROWID inner tables still
+  scan. The tracker records the fsqlite-vdbe tests and 58 subquery and seek core targets, the
+  keeper among them, passing on Linux at d9d535408, 1,394 tests in all
+  ([cd2257443](https://github.com/Dicklesworthstone/frankensqlite/commit/cd2257443)).
+- A constant expression is a seek key or range bound wherever a bind parameter is: `id = -5`,
+  `a = 4 + 1`, `a = ?1 + 1`, `a = abs(-5)` and `id > 300000 - 5` scanned the whole table and now
+  seek ([7f8dd93e4](https://github.com/Dicklesworthstone/frankensqlite/commit/7f8dd93e4),
+  bd-aavtp). The expression may use literals, numbered parameters, operators, CASTs below the root
+  and deterministic functions; a CAST at the root, any COLLATE and non-deterministic calls still
+  scan. An aggregate index-equality seek that finds nothing no longer rescans the table. At
+  300,000 rows on macOS arm64 the probed queries went from 4-48 ms to under 1 ms (stock:
+  microseconds). A NULL key, an unbound parameter, text against a numeric index column (bd-zq74b)
+  and UPDATE or DELETE on a multi-column index prefix (bd-j9gub) still scan. On a REAL index
+  column such a seek, like a literal or bound key, converts an integer key past 2^53 to a rounded
+  REAL and can return rows stock excludes (bd-xz5f4, open, filed as pre-existing); whether these
+  shapes answered correctly while they scanned is not recorded. The keeper compares 19,200 runs
+  with rusqlite, and its opcode bound failed before the change, on macOS arm64; no Linux run is
+  recorded.
+- A SELECT whose only FROM item is a simple view (one table, columns or plain expressions and an
+  optional WHERE; views of such views up to 16 levels) reads the view's table directly instead of
+  materializing the view first, so 200 statements of `SELECT g FROM vt WHERE id = ?` at 20,000
+  rows went from 13.4 s to 1.18 s (stock 0.085 s), in single runs under load on macOS arm64
+  ([6e86ab155](https://github.com/Dicklesworthstone/frankensqlite/commit/6e86ab155), bd-kef4m;
+  its effect on correlated subqueries is under Data integrity). A per-row subquery over a view,
+  derived table or join now seeks, a rowid equality with a LIMIT seeks, and the join fallback reads
+  one pinned row instead of the whole primary table. Views under a join, GROUP BY or compound are
+  still materialized, and `SELECT rowid FROM <view>` still returns a row number where stock fails
+  (bd-0iiyn). The keeper's two cost tests failed before the change; the tracker records the keeper
+  passing on Linux at 9c6de01aa and 9090854e1
+  ([66f373cb5](https://github.com/Dicklesworthstone/frankensqlite/commit/66f373cb5)).
+- **The GH#530 speedup is not in this release, and GH#530 stays open.** An aggregate over an
+  independent Cartesian product of the built-in `generate_series`, `json_each` and `json_tree`
+  functions, such as `SELECT count(*) FROM generate_series(1,1000) a, generate_series(1,1000) b`,
+  builds every joined row, as v0.4.12 does. A streaming path for these queries and stock's hidden
+  `json` and `root` columns landed in
+  [b56e7bc7c](https://github.com/Dicklesworthstone/frankensqlite/commit/b56e7bc7c) and were
+  backed out of production in
+  [ef756e774](https://github.com/Dicklesworthstone/frankensqlite/commit/ef756e774) before this
+  release: the hidden-column filter disagreed across join, CTE, view, CTAS, INSERT ... SELECT and
+  FROM subquery, and per-site fixes added a silent wrong result, a filter on a subquery over such
+  a join returning no row where stock and v0.4.12 do. The test files stay, with the 14 tests that
+  need the backed-out code ignored under bd-star-hidden-reland-nxl8a, which tracks a reland.
+  `USING(json)` on these functions is a loud error again. For reference, on a Linux x86_64 worker
+  the published v0.4.12 binary took 1.71 s for the query above against 0.015 s for stock SQLite
+  3.53.2 and peaked at about 1.3 GiB RSS, or about 2.5 GiB for a `json_each` product; a later run
+  of three queries per process found the peak transient, with resident memory back at about 16 MiB
+  after the third query
+  ([9e90cd3b6](https://github.com/Dicklesworthstone/frankensqlite/commit/9e90cd3b6),
+  [f5cf83b28](https://github.com/Dicklesworthstone/frankensqlite/commit/f5cf83b28)).
+- A plain statement no longer pays for a memdb fallback it does not take. An inline await added in
+  [77b6544f9](https://github.com/Dicklesworthstone/frankensqlite/commit/77b6544f9) grew the box
+  that every SQL text statement allocates from 13,272 to 33,112 bytes; the await is now boxed and
+  the branch behaves the same
+  ([8e2f65456](https://github.com/Dicklesworthstone/frankensqlite/commit/8e2f65456)). On the static
+  musl release CLI that allocation falls in a class mallocng maps and unmaps per statement. With
+  LTO off on one Linux worker, on a 200,000-row seed over 3,000 rowid lookups in three runs each,
+  maps per statement went from 8.44 to 6.44-6.48. The 4 KiB row stays near 2 per statement, so
+  this does not fully restore the v0.4.12 shape. The first entry of this section gives the
+  release's point-lookup cost against 0.4.12.
 
 ### TypeScript SDK and worker
 
@@ -950,6 +1255,11 @@ Added:
   `ResultBudgetError` and `captureResultLimitsAcknowledgement`, and `WorkerConnectionHost` takes an
   optional fourth constructor argument
   ([0aa03a7e9](https://github.com/Dicklesworthstone/frankensqlite/commit/0aa03a7e9)).
+- New Rust items: `StrictColumnType::declared_name` and `StrictTypeError::actual_name` in
+  `fsqlite-types`
+  ([7d3b7e1af](https://github.com/Dicklesworthstone/frankensqlite/commit/7d3b7e1af)). On targets
+  other than wasm32, `fsqlite-func` now depends on `rand`
+  ([c59c33fc9](https://github.com/Dicklesworthstone/frankensqlite/commit/c59c33fc9)).
 
 ### Experimental (not reachable from `Connection`)
 
@@ -999,6 +1309,19 @@ tests were corrected to target the real sync barriers, also without being run.
   oracle, stops claiming the SQLite test corpus is run, lists the companion files a database uses,
   and says `main` aims to build on stable while releases through v0.4.12 need nightly
   ([652c76cff](https://github.com/Dicklesworthstone/frankensqlite/commit/652c76cff)).
+- GH#530: `docs/progress/issue-530-cartesian-aggregate-investigation.md`,
+  `docs/progress/issue-530-streaming-qualification.md` and `docs/progress/perf-negative-results.md`
+  record the v0.4.12 and stock SQLite 3.53.2 timings, memory and profiles, the source route that
+  materializes the product, the native build attempts that blocked validation, what was and was
+  not executed for b56e7bc7c, and the commands for the remaining qualification.
+  `scripts/benchmark_issue_530.py` runs the 16-case benchmark, with a Linux `--memory` mode that
+  samples VmRSS and VmHWM between checked queries; raw logs, profiles and the original candidate
+  patch are kept under `tests/artifacts/perf/`
+  ([9e90cd3b6](https://github.com/Dicklesworthstone/frankensqlite/commit/9e90cd3b6),
+  [b4155a069](https://github.com/Dicklesworthstone/frankensqlite/commit/b4155a069),
+  [f5cf83b28](https://github.com/Dicklesworthstone/frankensqlite/commit/f5cf83b28),
+  [67478c6cc](https://github.com/Dicklesworthstone/frankensqlite/commit/67478c6cc)). The code these
+  records qualify was backed out before this release (see Performance).
 
 ### Committed as unapplied candidates
 
@@ -1015,6 +1338,185 @@ tests were corrected to target the real sync barriers, also without being run.
   under `artifacts/gh494` stays unapplied, and
   [bf490d0f3](https://github.com/Dicklesworthstone/frankensqlite/commit/bf490d0f3) addressed the
   `:memory:` COMMIT cost instead.
+- The GH#530 streaming candidate that
+  [f5cf83b28](https://github.com/Dicklesworthstone/frankensqlite/commit/f5cf83b28) stored as
+  `tests/artifacts/perf/issue-530-streaming-candidate/candidate.patch` was applied, with further
+  changes, by [b56e7bc7c](https://github.com/Dicklesworthstone/frankensqlite/commit/b56e7bc7c) and
+  backed out by [ef756e774](https://github.com/Dicklesworthstone/frankensqlite/commit/ef756e774)
+  (see Performance); the patch file stays as a record.
+
+### Not in this release (known issues)
+
+**The GH#530 streaming speedup for aggregates over Cartesian joins of table-valued functions is not
+in 0.4.13, and GH#530 stays open.** It was taken back out before release because it changed results
+on queries v0.4.12 answers correctly. Re-landing it is tracked in bd-star-hidden-reland-nxl8a.
+
+These queries return wrong results. None is new: v0.4.12 behaves the same.
+
+- **`SELECT *` over `generate_series` in a join, a view or `CREATE TABLE AS` also returns the hidden
+  `start`, `stop` and `step` columns.**
+- **`SELECT *` over a `USING` or `NATURAL` join with `GROUP BY`, `HAVING` or a window function returns
+  the join column twice.**
+- **A view or CTE with an aggregate or window over such a join can return another column's value.**
+  A query that stock SQLite answers `1|one` answers `one|1` here, with no error. This is the most
+  serious of the group, because the output has the right shape. Until it is fixed, name the columns
+  instead of using `*` in such a view or CTE.
+- **`row_number() OVER ()` over any join gives every row the last number**
+  (bd-row-number-join-kmqdn).
+- **`pragma_table_info` of a view over a join reports an empty type.**
+- **A bare column beside `max()` over a Cartesian table-function join loses its type**: `1` where
+  stock returns `1.0` (bd-bare-column-max-type-mdx87).
+- **A literal beside `*` is named `_c1`** where stock uses its text (bd-literal-star-name-qzqb4).
+
+These `UPDATE` and `DELETE` shapes still return wrong results after this release's
+correlated-subquery fixes:
+
+- **`RETURNING` with a correlated subquery that is not a scan of one base table**, when the UPDATE
+  has AFTER UPDATE triggers or assigns the row key, or the DELETE has DELETE triggers.
+- **A `DELETE ... RETURNING` subquery that reads the target or a cascaded child**, because RETURNING
+  runs before the row is removed, where stock runs it after the delete and its foreign-key actions
+  (bd-7ovcv).
+- **A SET subquery that reads the target through a rowid probe**, which sees pre-update values
+  (bd-ew10g).
+
+These queries fail with an error where stock SQLite answers them, as in v0.4.12:
+
+- A window `ORDER BY` on an unqualified `USING` column fails with
+  `internal error: column not found: key` (bd-window-using-column-guy4l).
+- A nested parenthesised join with `USING` fails with `not implemented`
+  (bd-nested-paren-join-using-qe8hc).
+- `USING(root)` or `USING(json)` on a table-valued JSON function's hidden column fails with
+  `cannot join using column root - column not present in both tables`, and `a.json` on such a
+  column fails too.
+
+This crash is not new either. It was found on fsqlite-vfs 0.4.11, and this release doesn't change
+that code path:
+
+- **Opening a connection can crash with SIGBUS if the `-shm` file was truncated in place while
+  another connection in the same process still mapped it** (bd-7do1d). The open reuses the cached
+  32 KiB mapping without checking the file's length, and the first write to the WAL index past the
+  file's end faults. Stock SQLite checks the size of the `-shm` file every time it maps a region.
+  mcp_agent_mail's test that writes a damaged sidecar on purpose hit this in 1 of 30 runs. Don't
+  truncate or rewrite a `-shm` file while a connection to that database is open.
+
+Performance and limits:
+
+- **A read-only join can be much slower than v0.4.12 under the default cache.** This release obeys
+  the configured page cache on read-only transactions, where v0.4.12 held the whole table: a 1.1 GB
+  read at a 64 MiB cache now peaks at 248 MB instead of 1,361 MB (GH#525). The cost is that
+  `join_100k` takes 2.17 times as long as v0.4.12 at the default `-2000` cache, and 1.03 times as
+  long at `-128000`. A page miss costs about 27 µs against stock's 0.95 µs
+  (bd-read-miss-path-cost-w8msq). Until that is fixed, raise `cache_size` for join-heavy reads.
+- **An `=` filter on an indexed column with a literal of the other type scans the table**, such as
+  `t = 7920` on a TEXT column or `c = '7920'` on a REAL or INTEGER column. The rows are right, but
+  on a 200,000-row table `t = 7920` takes 0.136 s per query, against 0.170 s on v0.4.12 and under
+  0.1 ms on SQLite 3.46.1, and the cost grows with the table (bd-text-probe-numeric-index-qk7vd).
+  Writing the literal in the column's own type avoids it.
+- **`IN` and `OR` on an indexed non-integer column scan the table**: about 120-180 ms per query on
+  200,000 rows, against under 1 ms on stock, the same as on v0.4.12 (bd-in-or-index-scan-fs7nd).
+  `=` on those columns, and `IN` on an INTEGER column or the rowid, still use the index.
+- **Many short-lived connections writing at once are slow.** Four processes opening a fresh
+  connection for every one of their 100 inserts take about 18 s on ext4 and about 22 s on xfs here,
+  against about 0.44 s and 0.21 s for the same shape on SQLite 3.46.1 through Python, which is
+  about 41 and 100 times as long even with Python's overhead on SQLite's side. With the database in
+  tmpfs on a quiet host, the test of this shape took 14.3-17.2 s over 10 rounds; its stock SQLite
+  arm keeps one connection per process, so it gives no ratio. All 400 commit, where v0.4.12 lost a
+  third or more, and the test checks that every row commits but not how long it takes
+  (bd-36jpj). A writer that blocks while holding the write lock, for example on a full stdout
+  pipe, still blocks every other writer until it resumes.
+- **Eight processes writing 50 rows each in autocommit run close to, and sometimes over, the time
+  bar of their own test.** `cross_process_autocommit_writers_honor_busy_timeout` requires each
+  FrankenSQLite arm to finish within three times stock SQLite's time plus one second. On a quiet
+  host the 8x50 arm used 58–100% of that bar over 3 rounds and 61–129% over 7 more, so the test
+  failed on time alone in 2 of those 10 rounds, with all 400 rows committed (bd-w1w6t). The
+  baseline commit 8e2f65456, which lacks this release's last four storage-file changes, behaves the
+  same way: over the same 7 rounds its 8x50 arm used 52–123% of the bar and the test failed on time
+  in 4.
+- **`count(*)` over a 1,000,000-row `generate_series` Cartesian join ignores an operation
+  deadline**, as on v0.4.12. The statement runs to completion and returns its count instead of
+  stopping at the deadline.
+- **One test in the default suite fails about 1 run in 3 on a quiet machine.**
+  `bd_3wop3_1_3_parallel_wal_publication_modes_are_semantically_equivalent` (fsqlite-e2e) also
+  asserts that parallel WAL publication is faster than conservative publication at 8 and 16 writer
+  threads, and run-to-run noise exceeds that margin (bd-uk9ob). Its correctness checks pass. Only
+  the `centralized_publication_cost_shrank` timing check fails, for example 646 µs against 688 µs
+  per commit at 8 threads. The bound is unchanged in this release.
+
+### Qualification
+
+GitHub Actions is off, so the gate is the set of runs below. Linux runs were native x86_64 with the
+pinned toolchain (nightly-2026-08-31, rustc 1.100.0-nightly 908501772), on 2026-11-01.
+
+- **Release gate, on [a71f26985](https://github.com/Dicklesworthstone/frankensqlite/commit/a71f26985)**
+  (the tag is on [e4137af30](https://github.com/Dicklesworthstone/frankensqlite/commit/e4137af30),
+  an empty commit on top of it with the identical tree), on one x86_64 host (AMD Threadripper PRO
+  5995WX; test files on btrfs) with 8 test threads:
+  - `cargo fmt --all --check`, `cargo check --workspace --all-targets --locked` and
+    `cargo clippy --workspace --all-targets --locked -- -D warnings` pass.
+  - GH#522: `cargo +stable check --locked -p fsqlite-pager -p fsqlite-btree -p fsqlite --lib` passes
+    with default features and with `--no-default-features`, on stable rustc 1.99.1 with
+    `RUSTC_BOOTSTRAP=-1`, which refuses nightly features.
+  - Tests: the complete suites of the storage, SQL and small crates, and for `fsqlite`,
+    `fsqlite-core`, `fsqlite-harness` and `fsqlite-e2e` the unit tests plus every integration
+    target added or changed since v0.4.12. "Ran" is "Passed" less the tests that returned early at
+    an environment check, which libtest also reports as passed; it is an upper bound, because the
+    early returns were found by scanning the source of every test.
+
+    | Scope | Passed | Ran | Returned early | Failed | Ignored |
+    |---|---|---|---|---|---|
+    | Storage crates (types, error, vfs, pager, wal, mvcc, btree): complete | 5750 | 5747 | 3, of which 2 are child entry points | 1 | 48 |
+    | SQL crates (ast, parser, planner, vdbe, func, the extensions, observability): complete | 4064 | 4063 | 1 | 0 | 20 |
+    | `fsqlite-cli`, `fsqlite-c-api`, `fsqlite-wasm`, `beads-doctor`: complete | 175 | 175 | 0 | 0 | 0 |
+    | `fsqlite`: unit tests and the 6 changed integration targets | 841 | 840 | 1, a child entry point | 0 | 2 |
+    | `fsqlite-core`: unit tests and the 79 changed integration targets | 4442 | 4434 | 8, of which 7 are child entry points | 0 | 22 |
+    | `fsqlite-harness`: unit tests and the 18 changed integration targets | 2030 | 2028 | 2, both child entry points | 0 | 1 |
+    | `fsqlite-e2e`: unit tests and the 19 changed integration targets | 824 | 821 | 3, all child entry points | 3 | 5 |
+
+  - Of the 18 early returns, 15 are child entry points run under their parent: a test re-executes
+    its own binary, and the entry point's body runs in that child, inside a parent test that
+    passed. The other 3 are opt-ins that the gate didn't set.
+    `utc_modifier_dst_transition_matches_stock_bd_tl6ly` (`TZ=America/New_York`) and
+    `opt_out_leaves_corrupt_database_untouched` (`FRANKENSQLITE_SKIP_MIGRATION=1`) were then run
+    from the gate's own test binaries with the variable set, and each passed.
+    `permissionless_mount_admits_fresh_and_existing_sidecars` was compiled, not run: it needs a
+    permissionless filesystem at `FSQLITE_PERMISSIONLESS_FS_DIR`.
+  - 13 tests that need the `sqlite3` CLI and 3 that need a `sleep` binary ran by host condition:
+    the gate host has `/usr/bin/sqlite3` 3.46.1 and `/usr/bin/sleep`. The gate ran without
+    `--nocapture`, so its log doesn't show this.
+  - `bd_3wop3_1_3_parallel_wal_publication_modes_are_semantically_equivalent` passed in this run.
+    It fails about 1 run in 3 on its timing check (see the known issues), and bd-uk9ob stays open.
+- **The 4 failures:**
+  - `unix_shm::tests::shm_dirty_file_proof_preserves_bytes_length_and_timestamps` (`fsqlite-vfs`):
+    the test's dirty-file proof counts extents that btrfs compression encodes as unproven, so it
+    fails on compressed btrfs (bd-h5lw8).
+  - 3 in `fsqlite-e2e`, with the host's load average at about 36 when the step started:
+    - `cross_process_autocommit_writers_honor_busy_timeout` and
+      `cross_process_fresh_connection_writers_honor_busy_timeout` failed in their stock SQLite
+      arm, the oracle that runs first: 396 of 400 autocommit INSERTs committed and 4 got
+      `database is locked`. No FrankenSQLite arm ran.
+    - `concurrent_scaling_ratio_does_not_degrade` measured 8.03 times the 1-thread wall time at 4
+      threads, against its bar of under 8 times.
+- **Rerun of those 3 tests on a quiet host.** The gate's own two test binaries (same sha256) ran
+  on a second x86_64 Linux host with a load average under 3, with the binaries, temp files and
+  databases in tmpfs. Each test ran by exact name, 3 rounds, and all 9 runs passed. Every arm
+  committed 400 of 400 rows and `integrity_check` returned `ok`.
+  - Autocommit writers, elapsed ms per round: stock 12 / 12 / 12 at 4x100 and 22 / 57 / 22 at
+    8x50; FrankenSQLite through `execute` 411 / 438 / 895 and 1067 / 675 / 915; through `query`
+    371 / 567 / 483 and 937 / 977 / 700.
+  - Fresh-connection writers, 4x100: FrankenSQLite, with a new connection for every INSERT, 14943 /
+    15821 / 16553 ms. The stock arm keeps one connection per process: 22 / 15 / 13 ms.
+  - Scaling: 1 thread 39.7 / 85.1 / 152.6 ms, 4 threads 134.3 / 132.4 / 135.1 ms, so 3.38, 1.56 and
+    0.89 times.
+- **A/B against [8e2f65456](https://github.com/Dicklesworthstone/frankensqlite/commit/8e2f65456)**,
+  the last commit before this release's final four storage-file changes, on the same host (tests in
+  tmpfs): 7 interleaved pairs, each round started at a load average of 1.5 or less, none censored.
+  a71f26985's median fresh-connection time was 4% lower (16,076 against 16,727 ms; slower in 2 of 7
+  pairs), and its 8x50 autocommit time was within 1% (771.5 against 766 ms over the 6 pairs where
+  both arms ran; slower in 4 of 6). An earlier set of 9 back-to-back pairs (3 uncensored) agreed.
+  Neither side's single-thread scaling time climbed across rounds.
+- **Not run:** the integration targets of `fsqlite`, `fsqlite-core`, `fsqlite-harness` and
+  `fsqlite-e2e` that are unchanged since v0.4.12, and the all-features matrix. The gate ran on
+  Linux x86_64 only.
 
 ---
 
