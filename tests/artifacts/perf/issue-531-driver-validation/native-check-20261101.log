@@ -1,0 +1,125 @@
+    Checking cfg-if v1.0.5
+    Checking hybrid-array v0.4.15
+    Checking getrandom v0.4.3
+    Checking zeroize v1.9.1
+    Checking crypto-common v0.2.2
+    Checking cpufeatures v0.3.1
+   Compiling syn v3.0.9
+   Compiling serde_derive v1.0.229
+    Checking block-buffer v0.12.1
+    Checking bitflags v2.13.2
+    Checking serde v1.0.229
+    Checking ctutils v0.4.7
+    Checking inout v0.2.5
+    Checking smallvec v1.16.4
+    Checking parking_lot_core v0.9.12
+   Compiling thiserror-impl v2.0.21
+    Checking thiserror v2.0.21
+   Compiling blake3 v1.8.7
+    Checking cipher v0.5.2
+    Checking parking_lot v0.12.5
+    Checking tracing-core v0.1.36
+   Compiling num-traits v0.2.19
+   Compiling tracing-attributes v0.1.31
+   Compiling zerocopy v0.8.63
+   Compiling crossbeam-utils v0.8.23
+    Checking tracing v0.1.44
+    Checking fsqlite-error v0.4.13 (/workspace/scratch/7ab47c98487b/frankensqlite/crates/fsqlite-error)
+    Checking universal-hash v0.6.1
+    Checking getrandom v0.2.17
+   Compiling rustix v1.1.6
+    Checking xxhash-rust v0.8.19
+    Checking der v0.7.10
+    Checking fsqlite-types v0.4.13 (/workspace/scratch/7ab47c98487b/frankensqlite/crates/fsqlite-types)
+    Checking fsqlite-types v0.4.13 (/workspace/scratch/7ab47c98487b/frankensqlite/crates/fsqlite-types)
+   Compiling rustix v1.1.6
+    Checking rand_core v0.6.4
+    Checking num-traits v0.2.19
+    Checking crossbeam-utils v0.8.23
+    Checking zerocopy v0.8.63
+   Compiling serde_json v1.0.154
+    Checking digest v0.11.3
+    Checking ppv-lite86 v0.2.21
+    Checking spki v0.7.3
+    Checking chacha20 v0.10.2
+   Compiling curve25519-dalek-derive v0.1.1
+   Compiling either v1.19.0
+   Compiling itertools v0.14.0
+    Checking curve25519-dalek v4.1.3
+    Checking pkcs8 v0.10.2
+    Checking rand_chacha v0.3.1
+    Checking sha2 v0.10.9
+    Checking polyval v0.7.3
+    Checking aead v0.6.1
+    Checking equivalent v1.0.3
+   Compiling crc32fast v1.5.3
+   Compiling io-uring v0.7.15
+    Checking hashbrown v0.17.1
+    Checking ed25519-dalek v2.2.0
+    Checking ghash v0.6.0
+    Checking nix v0.31.3
+   Compiling prost-derive v0.14.4
+    Checking rand v0.8.8
+    Checking signatory v0.27.1
+    Checking franken-evidence v0.5.0
+    Checking aes v0.9.3
+    Checking rmp v0.8.15
+    Checking poly1305 v0.9.1
+    Checking ctr v0.10.1
+    Checking franken-kernel v0.5.0
+   Compiling pin-project-internal v1.1.13
+    Checking futures-core v0.3.34
+    Checking bytes v1.12.1
+    Checking log v0.4.35
+    Checking tinyvec v1.13.3
+   Compiling asupersync v0.5.0
+    Checking unicode-normalization v0.1.26
+    Checking futures-lite v2.6.1
+    Checking nkeys v0.4.5
+    Checking bincode-next v3.1.1
+    Checking prost v0.14.4
+    Checking pin-project v1.1.13
+    Checking franken-decision v0.5.0
+    Checking aes-gcm v0.11.1
+    Checking chacha20poly1305 v0.11.0
+    Checking rmp-serde v1.3.1
+    Checking tempfile v3.27.0
+    Checking rand v0.10.3
+    Checking polling v3.11.0
+    Checking xattr v1.7.0
+    Checking sha1 v0.11.0
+    Checking hmac v0.13.0
+    Checking sha2 v0.11.1
+    Checking crossbeam-queue v0.3.14
+    Checking fsqlite-observability v0.4.13 (/workspace/scratch/7ab47c98487b/frankensqlite/crates/fsqlite-observability)
+memory allocation of 56885264 bytes failed
+stack backtrace:
+   0:     0x7ff3d8698876 - <unknown>
+   1:     0x7ff3d8e0b98f - <unknown>
+   2:     0x7ff3d86ad98c - <unknown>
+   3:     0x7ff3d868c948 - <unknown>
+   4:     0x7ff3d866b066 - <unknown>
+   5:     0x7ff3d8664049 - <unknown>
+   6:     0x7ff3d868c9ca - <unknown>
+   7:     0x7ff3d866cea3 - <unknown>
+   8:     0x7ff3d4ae102b - <unknown>
+   9:     0x7ff3dadf356a - <unknown>
+  10:     0x7ff3d988cfc3 - <unknown>
+  11:     0x7ff3d9899259 - <unknown>
+  12:     0x7ff3da701f4d - <unknown>
+  13:     0x7ff3da6f69c9 - <unknown>
+  14:     0x7ff3d95805eb - <unknown>
+  15:     0x7ff3d957fdb2 - <unknown>
+  16:     0x7ff3d9fce631 - <unknown>
+  17:     0x7ff3d9fce3e6 - <unknown>
+  18:     0x7ff3da1b271e - <unknown>
+  19:     0x7ff3da204202 - <unknown>
+  20:     0x7ff3da203fad - <unknown>
+  21:     0x7ff3da201c47 - <unknown>
+  22:     0x7ff3d348aaa4 - <unknown>
+  23:     0x7ff3d3517c6c - <unknown>
+  24:                0x0 - <unknown>
+error: could not compile `asupersync` (lib)
+
+Caused by:
+  process didn't exit successfully: `rustc --crate-name asupersync --edition=2024 /tmp/rch-cargo/registry/src/index.crates.io-1949cf8c6b5b557f/asupersync-0.5.0/src/lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type lib --emit=dep-info,metadata -C embed-bitcode=no --check-cfg 'cfg(docsrs,test)' --check-cfg 'cfg(feature, values("atp-cli", "atpd-daemon", "benchmark-adapters", "browser-io", "browser-trace", "cancel-correctness-oracle", "channel-mpsc-select-e2e", "ci-cross-platform", "cli", "compression", "config-file", "criterion-benches", "cross-subsystem-recovery-e2e", "debug-server", "default", "dependency-ledger", "deterministic-mode", "distributed-hash-snapshot-recovery-e2e", "fuzz", "h3-websocket-e2e", "http3", "io-uring", "kafka", "lab-stack-traces", "legacy-internal-test-harnesses", "lock-metrics", "loom-tests", "messaging-fabric", "metrics", "mysql", "native-runtime", "nightly-outcome-try", "obligation-cleanup-e2e", "obligation-leak-detection", "postgres", "proc-macros", "quic", "raptorq-roundtrip-e2e", "real-service-e2e", "remote-service", "runtime-metrics", "serialization-golden-harnesses", "simd-intrinsics", "sqlite", "tailscale-path-provider", "test-internals", "tls", "tls-native-roots", "tls-webpki-roots", "tokio-compat", "tower", "trace-compression", "tracing-integration", "waker-profiling", "wasm-browser-deterministic", "wasm-browser-dev", "wasm-browser-minimal", "wasm-browser-preview", "wasm-browser-prod", "wasm-runtime"))' -C metadata=a8c6a3c2948c85c8 -C extra-filename=-644e71104f5672fe --out-dir /tmp/rch-target-e6c5613756dc/debug/build/asupersync/644e71104f5672fe/out -C strip=debuginfo -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/aead/b187d7483287a233/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/aes/1184f4a525b66d9f/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/aes-gcm/6829072210132ca7/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/allocator-api2/4ef89e7d15df0d30/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/base64/32be761896ea5aad/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/base64ct/6de10954ac4d1eae/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/bincode-next/1291d15ec5c9ae91/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/bincode_derive-next/894fe4f0cd1c22c7/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/bitflags/efb5cae508ce6305/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/block-buffer/3064df3bc30f5a7c/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/block-buffer/c4d5b1b7566be540/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/bytes/7ada268ce46a4fea/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/cfg-if/89f9f7ab250b847a/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/chacha20/8b1209ed4c4d6374/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/chacha20poly1305/f0986c9380f11387/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/cipher/ba74eb0405031d70/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/cmov/9ba757011e3a926f/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/const-oid/74b0284be30146b6/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/const-oid/f68ef0aa2763d774/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/cpubits/1200caa7f9ce6c25/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/cpufeatures/ac8bc93ac05038c4/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/cpufeatures/b8943d391cdd6469/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/crc32fast/9695b6bc8833d237/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/crossbeam-queue/0113c980ed73c93d/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/crossbeam-utils/9767aed539fdc558/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/crypto-common/4a95f10d725f0717/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/crypto-common/9113d60f61f4e36d/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/ctr/ca3741d65c4ef401/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/ctutils/1831cb7d1b13c889/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/curve25519-dalek/3fd480d74ba605da/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/curve25519-dalek-derive/dd8b42f49a7bf1eb/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/data-encoding/9a3671723c387b8b/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/der/aba2414f21029370/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/digest/1282055782833c64/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/digest/fb1795a347fd887b/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/ed25519/36a3d9cb0e8614f0/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/ed25519-dalek/fa2ebe4ce245f072/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/equivalent/a555a8eeb5905437/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/errno/8d22943caacf965a/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/fastrand/a3f9963f6099611d/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/foldhash/1e92dae7a0d5b6df/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/franken-decision/c1ce09a86f0462fd/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/franken-evidence/caf0487783bf395c/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/franken-kernel/32ceb9a02d2a240a/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/futures-core/189a012cdedea9b4/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/futures-io/5287ab9671f4b4f6/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/futures-lite/687c75a492881cf5/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/generic-array/2b2034275c5e8b36/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/getrandom/449ccd3fca868f27/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/getrandom/8b0044d7a2f45bf9/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/ghash/b4af6ac7d3468016/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/hashbrown/c4f22854d7ac8041/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/hex/569b9e764bc231ed/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/hmac/e4af889eb3666443/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/hybrid-array/6ac357d5040a4893/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/inout/4545ff361ade824e/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/itoa/be74e1cb7b83758c/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/libc/89716dab33ccbc93/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/linux-raw-sys/c95cbca74c8247b6/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/lock_api/c184c02725987091/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/log/e73b8b3f1e7bfc09/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/memchr/1422230f397c4468/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/memoffset/9052391676e6cfbc/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/nix/5aa4b579677ba5b6/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/nkeys/cc5c500a92764ab1/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/num-traits/fd992ed1b3b01055/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/once_cell/55fccc0b796649cf/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/parking/9674b570c19831e7/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/parking_lot/3502ff2c95c2559e/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/parking_lot_core/2f1eefe2b9838b5e/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/pastey/b1140c8736311270/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/pem-rfc7468/7ec5e9e1f8a50fc8/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/pin-project/4518e1e4b0fd3b92/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/pin-project-internal/68e2452e6d204c14/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/pin-project-lite/e24e768a91777e83/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/pkcs8/8e2b562db2889281/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/polling/9bfd7c99a6e30030/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/poly1305/992a6043e8cdf81e/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/polyval/6a15cbe9feb97af6/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/ppv-lite86/ba0801893fc2141e/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/prost/33e8e30ec6034dff/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/prost-derive/26f962804b18a1b5/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/rand/e6a7c784dae24403/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/rand_chacha/bcf9ca0296cb7940/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/rand_core/97f979b0d8226d2c/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/rand_core/c3c2ad44cb5c308b/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/rapidhash/f1410666343b528f/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/rmp/64311ba755e25656/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/rmp-serde/a58df5e9bf2953dc/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/rustix/8ad4825853e7f21e/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/rustversion/7d461124d5a20f44/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/scopeguard/d7a279a012fe9c59/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/semver/afd77d214f11a9f1/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/serde/e15c8d0c512b1c70/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/serde_core/24eecf4b061d398b/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/serde_derive/709c29f99ec9214a/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/serde_json/54b6f46e717c6d4c/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/sha1/ac31ad0479e558e2/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/sha2/79e21b6132806cd0/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/sha2/acdfdaeaa9d05d42/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/signal-hook/696564b0bdc1e477/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/signal-hook-registry/57213453b66fbead/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/signatory/f977cd871098d1d7/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/signature/ff265214812300d4/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/slab/fd8c55b1e0c35f4e/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/smallvec/913aaf656acda4ab/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/socket2/256e0157f43c6437/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/spki/8ed145f88aa7bf2b/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/subtle/18c266a7362efcc5/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/sysinfo/c7c4155b3a25f6de/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/tempfile/0624aae00953926f/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/thiserror/34ddd2d934454735/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/thiserror-impl/8c1afd42f073b6c8/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/tinyvec/86c81a43f1e61e9a/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/typenum/7589feae8aef5ae3/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/unicode-normalization/3d5e0feaeab919df/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/universal-hash/a76f659cd3994a11/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/unty-next/bf32d0f0f6520885/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/xattr/f605e13d514325e1/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/zerocopy/a75a798b9d685804/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/zeroize/0c61507ea415f6fd/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/zeroize_derive/568929f2b9d33617/out -L dependency=/tmp/rch-target-e6c5613756dc/debug/build/zmij/a5d4d58affffb83e/out --extern aes_gcm=/tmp/rch-target-e6c5613756dc/debug/build/aes-gcm/6829072210132ca7/out/libaes_gcm-6829072210132ca7.rmeta --extern base64=/tmp/rch-target-e6c5613756dc/debug/build/base64/32be761896ea5aad/out/libbase64-32be761896ea5aad.rmeta --extern bincode=/tmp/rch-target-e6c5613756dc/debug/build/bincode-next/1291d15ec5c9ae91/out/libbincode_next-1291d15ec5c9ae91.rmeta --extern chacha20poly1305=/tmp/rch-target-e6c5613756dc/debug/build/chacha20poly1305/f0986c9380f11387/out/libchacha20poly1305-f0986c9380f11387.rmeta --extern crc32fast=/tmp/rch-target-e6c5613756dc/debug/build/crc32fast/9695b6bc8833d237/out/libcrc32fast-9695b6bc8833d237.rmeta --extern crossbeam_queue=/tmp/rch-target-e6c5613756dc/debug/build/crossbeam-queue/0113c980ed73c93d/out/libcrossbeam_queue-0113c980ed73c93d.rmeta --extern franken_decision=/tmp/rch-target-e6c5613756dc/debug/build/franken-decision/c1ce09a86f0462fd/out/libfranken_decision-c1ce09a86f0462fd.rmeta --extern franken_evidence=/tmp/rch-target-e6c5613756dc/debug/build/franken-evidence/caf0487783bf395c/out/libfranken_evidence-caf0487783bf395c.rmeta --extern franken_kernel=/tmp/rch-target-e6c5613756dc/debug/build/franken-kernel/32ceb9a02d2a240a/out/libfranken_kernel-32ceb9a02d2a240a.rmeta --extern futures_lite=/tmp/rch-target-e6c5613756dc/debug/build/futures-lite/687c75a492881cf5/out/libfutures_lite-687c75a492881cf5.rmeta --extern getrandom=/tmp/rch-target-e6c5613756dc/debug/build/getrandom/449ccd3fca868f27/out/libgetrandom-449ccd3fca868f27.rmeta --extern hashbrown=/tmp/rch-target-e6c5613756dc/debug/build/hashbrown/c4f22854d7ac8041/out/libhashbrown-c4f22854d7ac8041.rmeta --extern hex=/tmp/rch-target-e6c5613756dc/debug/build/hex/569b9e764bc231ed/out/libhex-569b9e764bc231ed.rmeta --extern hmac=/tmp/rch-target-e6c5613756dc/debug/build/hmac/e4af889eb3666443/out/libhmac-e4af889eb3666443.rmeta --extern libc=/tmp/rch-target-e6c5613756dc/debug/build/libc/89716dab33ccbc93/out/liblibc-89716dab33ccbc93.rmeta --extern memchr=/tmp/rch-target-e6c5613756dc/debug/build/memchr/1422230f397c4468/out/libmemchr-1422230f397c4468.rmeta --extern nix=/tmp/rch-target-e6c5613756dc/debug/build/nix/5aa4b579677ba5b6/out/libnix-5aa4b579677ba5b6.rmeta --extern nkeys=/tmp/rch-target-e6c5613756dc/debug/build/nkeys/cc5c500a92764ab1/out/libnkeys-cc5c500a92764ab1.rmeta --extern parking_lot=/tmp/rch-target-e6c5613756dc/debug/build/parking_lot/3502ff2c95c2559e/out/libparking_lot-3502ff2c95c2559e.rmeta --extern pin_project=/tmp/rch-target-e6c5613756dc/debug/build/pin-project/4518e1e4b0fd3b92/out/libpin_project-4518e1e4b0fd3b92.rmeta --extern polling=/tmp/rch-target-e6c5613756dc/debug/build/polling/9bfd7c99a6e30030/out/libpolling-9bfd7c99a6e30030.rmeta --extern prost=/tmp/rch-target-e6c5613756dc/debug/build/prost/33e8e30ec6034dff/out/libprost-33e8e30ec6034dff.rmeta --extern rmp_serde=/tmp/rch-target-e6c5613756dc/debug/build/rmp-serde/a58df5e9bf2953dc/out/librmp_serde-a58df5e9bf2953dc.rmeta --extern semver=/tmp/rch-target-e6c5613756dc/debug/build/semver/afd77d214f11a9f1/out/libsemver-afd77d214f11a9f1.rmeta --extern serde=/tmp/rch-target-e6c5613756dc/debug/build/serde/e15c8d0c512b1c70/out/libserde-e15c8d0c512b1c70.rmeta --extern serde_json=/tmp/rch-target-e6c5613756dc/debug/build/serde_json/54b6f46e717c6d4c/out/libserde_json-54b6f46e717c6d4c.rmeta --extern sha1=/tmp/rch-target-e6c5613756dc/debug/build/sha1/ac31ad0479e558e2/out/libsha1-ac31ad0479e558e2.rmeta --extern sha2=/tmp/rch-target-e6c5613756dc/debug/build/sha2/79e21b6132806cd0/out/libsha2-79e21b6132806cd0.rmeta --extern signal_hook=/tmp/rch-target-e6c5613756dc/debug/build/signal-hook/696564b0bdc1e477/out/libsignal_hook-696564b0bdc1e477.rmeta --extern slab=/tmp/rch-target-e6c5613756dc/debug/build/slab/fd8c55b1e0c35f4e/out/libslab-fd8c55b1e0c35f4e.rmeta --extern smallvec=/tmp/rch-target-e6c5613756dc/debug/build/smallvec/913aaf656acda4ab/out/libsmallvec-913aaf656acda4ab.rmeta --extern socket2=/tmp/rch-target-e6c5613756dc/debug/build/socket2/256e0157f43c6437/out/libsocket2-256e0157f43c6437.rmeta --extern subtle=/tmp/rch-target-e6c5613756dc/debug/build/subtle/18c266a7362efcc5/out/libsubtle-18c266a7362efcc5.rmeta --extern sysinfo=/tmp/rch-target-e6c5613756dc/debug/build/sysinfo/c7c4155b3a25f6de/out/libsysinfo-c7c4155b3a25f6de.rmeta --extern tempfile=/tmp/rch-target-e6c5613756dc/debug/build/tempfile/0624aae00953926f/out/libtempfile-0624aae00953926f.rmeta --extern thiserror=/tmp/rch-target-e6c5613756dc/debug/build/thiserror/34ddd2d934454735/out/libthiserror-34ddd2d934454735.rmeta --extern unicode_normalization=/tmp/rch-target-e6c5613756dc/debug/build/unicode-normalization/3d5e0feaeab919df/out/libunicode_normalization-3d5e0feaeab919df.rmeta --extern xattr=/tmp/rch-target-e6c5613756dc/debug/build/xattr/f605e13d514325e1/out/libxattr-f605e13d514325e1.rmeta --extern zeroize=/tmp/rch-target-e6c5613756dc/debug/build/zeroize/0c61507ea415f6fd/out/libzeroize-0c61507ea415f6fd.rmeta --cap-lints allow -Zthreads=1` (signal: 6, SIGABRT: process abort signal)
