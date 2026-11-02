@@ -347,10 +347,79 @@ fn numbered_binds_keep_slots_in_aggregate_having_and_limit() {
 }
 
 #[test]
-fn composite_anonymous_equalities_decline_reordered_prefix_binding() {
+fn composite_numbered_equalities_preserve_reordered_prefix_binding() {
     let schema = schema('D', &["post_id", "n"]);
-    let sql = "SELECT post_id, count(*) FROM likes WHERE n = ? AND post_id = ? GROUP BY post_id";
+    let sql = "SELECT post_id, count(*) FROM likes WHERE n = ?1 AND post_id = ?2 GROUP BY post_id";
     let program = compile(sql, &schema);
-    assert_table_scan(&program, sql);
+    assert_indexed_input(&program, sql, true);
     assert_eq!(bind_slots(&program), BTreeSet::from([1, 2]));
+    let probe_slots: Vec<_> = program
+        .ops()
+        .iter()
+        .filter_map(|op| (op.opcode == Opcode::Variable).then_some(op.p1))
+        .collect();
+    assert_eq!(
+        probe_slots,
+        [2, 1],
+        "index order is post_id,n; source bind order is n,post_id"
+    );
+}
+
+#[test]
+fn equality_prefix_with_residual_retains_filter_and_original_bind_slots() {
+    let schema = schema('D', &["post_id"]);
+    for sql in [
+        "SELECT post_id, count(*) FROM likes WHERE n > ?1 AND post_id = ?2 AND id > ?3 GROUP BY post_id",
+        "SELECT post_id, count(*) FROM likes WHERE n > ?1 AND ?2 = post_id AND id > ?3 GROUP BY post_id",
+    ] {
+        let program = compile(sql, &schema);
+        assert_indexed_input(&program, sql, false);
+        let slots: Vec<_> = program
+            .ops()
+            .iter()
+            .filter_map(|op| (op.opcode == Opcode::Variable).then_some(op.p1))
+            .collect();
+        assert_eq!(
+            slots,
+            [1, 2, 3, 2],
+            "the full WHERE keeps its binds and the index reuses the key's original slot: {sql}"
+        );
+    }
+}
+
+#[test]
+fn raw_placeholders_decline_reordered_or_repeated_prefix_emission() {
+    let schema = schema('D', &["post_id", "n"]);
+    for sql in [
+        "SELECT post_id,count(*) FROM likes WHERE n=? AND post_id=? GROUP BY post_id",
+        "SELECT post_id,count(*) FROM likes WHERE n=:n AND post_id=:post GROUP BY post_id",
+        "SELECT post_id,count(*) FROM likes WHERE n>:n AND post_id=:post GROUP BY post_id",
+    ] {
+        assert_table_scan(&compile(sql, &schema), sql);
+    }
+}
+
+#[test]
+fn equality_prefix_does_not_drop_duplicate_or_disjunctive_residuals() {
+    let schema = schema('D', &["post_id"]);
+    for sql in [
+        "SELECT post_id,count(*) FROM likes WHERE post_id=?1 AND post_id=?2 GROUP BY post_id",
+        "SELECT post_id,count(*) FROM likes WHERE post_id=?1 AND (n=?2 OR n=?3) GROUP BY post_id",
+    ] {
+        let program = compile(sql, &schema);
+        assert_indexed_input(&program, sql, false);
+    }
+    let sql = "SELECT post_id,count(*) FROM likes WHERE post_id=?1 OR n=?2 GROUP BY post_id";
+    assert_table_scan(&compile(sql, &schema), sql);
+}
+
+#[test]
+fn equality_prefix_residual_keeps_collation_and_index_hint_guards() {
+    let schema = schema('B', &["post_id"]);
+    for sql in [
+        "SELECT post_id,count(*) FROM likes WHERE post_id='a' COLLATE NOCASE AND n>0 GROUP BY post_id",
+        "SELECT post_id,count(*) FROM likes NOT INDEXED WHERE post_id=?1 AND n>?2 GROUP BY post_id",
+    ] {
+        assert_table_scan(&compile(sql, &schema), sql);
+    }
 }

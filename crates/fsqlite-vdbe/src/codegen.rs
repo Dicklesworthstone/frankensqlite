@@ -18304,6 +18304,78 @@ fn aggregate_index_eq_seek_target<'t, 'e>(
     None
 }
 
+/// An equality-prefix row source. A probe may cover only part of WHERE;
+/// consumers must evaluate the original predicate when `has_residual` is true.
+struct IndexEqualityPrefix<'t, 'e> {
+    index: &'t IndexSchema,
+    /// Probe expressions in index order. Multi-term predicates must have
+    /// canonical parameter slots before their expressions can be reordered.
+    values: Vec<&'e Expr>,
+    has_residual: bool,
+}
+
+fn index_equality_prefix_target<'t, 'e>(
+    where_clause: Option<&'e Expr>,
+    table: &'t TableSchema,
+    table_alias: Option<&str>,
+) -> Option<IndexEqualityPrefix<'t, 'e>> {
+    if table.without_rowid {
+        return None;
+    }
+    let where_expr = where_clause?;
+    let mut conjuncts = Vec::new();
+    collect_conjunctive_terms(where_expr, &mut conjuncts);
+    let mut best: Option<IndexEqualityPrefix<'t, 'e>> = None;
+    for index in &table.indexes {
+        if index.key_term_descending(0) || !index.supports_direct_column_lookup() {
+            continue;
+        }
+        let mut values = Vec::new();
+        let mut consumed = Vec::new();
+        for (key_pos, column) in index.columns.iter().enumerate() {
+            let Some((term_pos, value)) =
+                conjuncts.iter().enumerate().find_map(|(term_pos, term)| {
+                    let value =
+                        extract_index_column_equality_expr(term, table, table_alias, column)?;
+                    index_equality_term_uses_key_collation(term, table, table_alias, index, key_pos)
+                        .then_some((term_pos, value))
+                })
+            else {
+                break;
+            };
+            values.push(value);
+            if !consumed.contains(&term_pos) {
+                consumed.push(term_pos);
+            }
+        }
+        if values.is_empty() {
+            continue;
+        }
+        // The connection canonicalizes both named and anonymous placeholders
+        // to numbered slots. Direct codegen callers can pass raw ASTs; keep
+        // their existing scan when prefix emission could reorder or duplicate
+        // an emission-order placeholder relative to the full WHERE.
+        if (conjuncts.len() > 1 || values.len() > 1)
+            && expr_contains_non_numbered_placeholder(where_expr)
+        {
+            continue;
+        }
+        // Repeated index columns can consume one term several times, whereas
+        // contradictory equalities on one column leave a real residual.
+        let has_residual = consumed.len() < conjuncts.len();
+        if best.as_ref().is_none_or(|previous| {
+            (!has_residual, values.len()) > (!previous.has_residual, previous.values.len())
+        }) {
+            best = Some(IndexEqualityPrefix {
+                index,
+                values,
+                has_residual,
+            });
+        }
+    }
+    best
+}
+
 /// The index and distinct integer values a `WHERE <col> IN (<int list>)` aggregate can
 /// seek per value instead of full-scanning.
 ///
@@ -22979,14 +23051,8 @@ fn codegen_select_group_by_aggregate(
     // WHERE. Feed the existing grouping sorter from equality-prefix and
     // bind-time IN seeks instead of unrelated table rows (GH#531).
     let index_eq_seek = allow_index_seek
-        .then(|| aggregate_index_eq_seek_target(where_clause, table, table_alias))
-        .flatten()
-        // Prefix keys are emitted in index order. Multiple anonymous binds
-        // must retain SQL order; numbered/named binds are independent of it.
-        .filter(|(_, prefix)| {
-            prefix.len() == 1
-                || where_clause.is_none_or(|expr| count_anon_placeholders(expr) == 0)
-        });
+        .then(|| index_equality_prefix_target(where_clause, table, table_alias))
+        .flatten();
     let index_in_seek = if allow_index_seek && !table.without_rowid && index_eq_seek.is_none() {
         index_const_in_list_residual_target(where_clause, table, table_alias)
     } else {
@@ -22995,9 +23061,9 @@ fn codegen_select_group_by_aggregate(
     // The reported COUNT(*) shape needs only the grouping keys from each
     // index entry. Omit the table cursor only when the row source enforces
     // the complete WHERE and every payload value is stored in the index.
-    // Multiple equality terms deliberately retain the residual check: a
-    // repeated index key can otherwise make prefix length look like complete
-    // predicate coverage. Richer aggregates keep the ordinary table reader.
+    // Equality-prefix coverage counts distinct WHERE conjuncts, so repeated
+    // index keys cannot hide a residual. Richer aggregates keep the ordinary
+    // table reader.
     let covering_count_index = if num_nongrouped == 0
         && agg_columns.iter().all(|agg| {
             agg.name.eq_ignore_ascii_case("count")
@@ -23014,8 +23080,8 @@ fn codegen_select_group_by_aggregate(
         })
     {
         index_eq_seek.as_ref()
-            .filter(|(_, prefix)| prefix.len() == 1)
-            .map(|(index, _)| *index)
+            .filter(|target| !target.has_residual)
+            .map(|target| target.index)
             .or_else(|| index_in_seek.as_ref()
                 .filter(|target| !target.has_residual)
                 .map(|target| target.index))
@@ -23230,17 +23296,18 @@ fn codegen_select_group_by_aggregate(
             }
             b.emit_jump_to_label(Opcode::Gosub, return_reg, 0, input_row, P4::None, 0);
         };
-        if let Some((index, prefix)) = index_eq_seek {
+        if let Some(target) = index_eq_seek {
+            let index = target.index;
             b.emit_op(
                 Opcode::OpenRead, idx_cursor, index.root_page, 0,
                 P4::Index(index.name.clone()), 0,
             );
-            let prefix_len = i32::try_from(prefix.len()).map_err(|_| {
+            let prefix_len = i32::try_from(target.values.len()).map_err(|_| {
                 CodegenError::Unsupported("index equality prefix too wide".to_owned())
             })?;
             let keys = b.alloc_regs(prefix_len);
             b.set_next_anon_placeholder(where_placeholder_base);
-            for (offset, expr) in prefix.iter().enumerate() {
+            for (offset, expr) in target.values.iter().enumerate() {
                 let key = keys + i32::try_from(offset).expect("prefix width checked");
                 emit_expr(b, expr, key, None);
                 if let Some(affinity) = index.columns.get(offset)

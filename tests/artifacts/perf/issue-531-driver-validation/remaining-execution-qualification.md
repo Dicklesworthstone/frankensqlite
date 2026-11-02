@@ -1,5 +1,43 @@
 # Issue #531: remaining execution candidate and qualification
 
+## Current status: grouped planner improvement applied
+
+The grouped equality-prefix change is now applied to production code, together with its bytecode regressions and core differential/work-budget extensions. The ordered-join and deferred-scalar-projection changes remain in the archived candidate patch below.
+
+The production change selects an existing index equality prefix even when residual WHERE predicates remain. It rechecks the complete predicate on matching table rows, tracks distinct consumed conjuncts, and permits covering COUNT(*) input only when the full predicate is covered. It adds no opcode, storage behavior, transaction path, or aggregate accumulator.
+
+### Verification of the applied grouped change
+
+- Exact isolated production codegen SHA-256: `7a6d204483fc1f1d2aee0d8bb67a54726d6ec8d7a36414a04f580f9d1e714bfc`.
+- **Full native VDBE crate metadata compilation through clippy-driver passed**, using the pinned compiler, unchanged locked native dependency graph, the crate's actual lint settings, and `--deny warnings`. Exit 0; no diagnostics; 11.333 seconds; recorded peak child RSS 765,440 KiB. The 7,261,879-byte metadata output was completed.
+- **All fourteen grouped compiler/bytecode assertions passed on the preserved combined source.** Read-only comparison confirms that the grouped emitter in the applied subset is byte-identical to that tested source; its new selector differs only in a rustfmt whitespace adjustment. Four grouped assertions fail on baseline c5d0454.
+- A fresh executable build of the isolated compiler harness reached archive creation and failed with ENOSPC. It did not execute another fourteen-test run.
+- The new selector block and both changed test files pass focused rustfmt checks. Whole-file formatting aborted on both baseline and isolated codegen while attempting approximately 14 GB allocations. No workspace formatting pass is claimed.
+- The core differential and 20,000-row work-budget tests are included but remain unexecuted. Full native core checks were killed; no SQL-result, transaction, runtime-work, or performance pass is claimed.
+- Full workspace/all-target check and Clippy gates remain incomplete. The successful Clippy result is specifically the full native VDBE library target.
+
+Changed test identities:
+
+| File | SHA-256 |
+| --- | --- |
+| issue_531_grouped_index_input.rs | b9bd7d2dfb0964672d693f9fe4a97323d0b4c8b3b0fbf77f5bdc95d6b0c113a0 |
+| bd_group_by_depth_oracle_probe.rs | 8f284a98e91af7a78d543de367c1e9d74e5580df15c74ba520098a2aef19bb8a |
+
+Residual selectivity remains an unmeasured performance risk: probing a prefix matching nearly the entire table may cost more than a sequential scan. No statistics-based cost choice is added here. This is a planner improvement with compiler evidence, not a measured resolution of #531.
+
+### Remaining connection work
+
+Fresh review found a pre-existing binder defect inherited by the archived deferred-projection candidate: bound parameters wrapped in unary signs or COLLATE can be mistaken for ORDER BY output ordinals. An independently tested correction preserves original syntactic ordinal status. Ninety-five actual Rust binder transformations were compared with C SQLite 3.53.2: the existing binder had 23 mismatches and the correction had none. This proves the transformation for those cases, not native core execution. The deferred-projection candidate must incorporate that correction before application.
+
+The final combined VDBE source also passed a native metadata check during this follow-up (source b2fc70..., exit 0, no diagnostics), but the core retry was killed again. No end-to-end speedup has been measured, and issue #531 remains open.
+
+The patch below is still based on c5d0454 and includes the grouped changes now applied. Do not apply it wholesale to the updated main branch.
+
+---
+
+## Historical combined-candidate record at b689d276
+
+
 Date: 2026-11-02 UTC  
 Baseline: `c5d04545807faf2d135e2dd561e76aa16d5bb95d`  
 Status: **candidate preserved; production changes not applied; native qualification incomplete**

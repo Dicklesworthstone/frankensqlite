@@ -184,6 +184,11 @@ fn indexed_group_by_predicates_match_sqlite_without_table_scans() {
                 "SELECT post_id,count(*) FROM likes WHERE post_id='abc' GROUP BY post_id",
                 "SELECT post_id,count(*) FROM likes WHERE post_id=NULL GROUP BY post_id",
                 "SELECT post_id,count(*) FROM likes WHERE post_id=99 GROUP BY post_id",
+                "SELECT post_id,count(*) FROM likes WHERE post_id=2 AND n>5 GROUP BY post_id",
+                "SELECT post_id,count(*) FROM likes WHERE post_id=2 AND post_id=3 GROUP BY post_id",
+                "SELECT post_id,sum(n),max(n) FROM likes WHERE post_id='2' AND (n>20 OR n IS NULL) GROUP BY post_id",
+                "SELECT post_id,count(*) FROM likes WHERE post_id=NULL AND n>5 GROUP BY post_id",
+                "SELECT post_id,count(*) FROM likes WHERE post_id=99 AND n>5 GROUP BY post_id",
                 "SELECT post_id,count(*) FROM likes WHERE post_id IN (2,3,2,NULL,99) GROUP BY post_id",
                 "SELECT post_id,count(*),sum(n) FROM likes WHERE post_id IN (2,3,4) AND n>5 GROUP BY post_id HAVING sum(n)>10",
                 "SELECT post_id,count(*) FROM likes WHERE post_id IN (2,3,4) GROUP BY post_id LIMIT 1 OFFSET 1",
@@ -191,11 +196,15 @@ fn indexed_group_by_predicates_match_sqlite_without_table_scans() {
                 "SELECT k,count(*),sum(n) FROM composite WHERE k=2 GROUP BY k",
                 "SELECT k,count(*),sum(n) FROM composite WHERE k IN (2,3,2) GROUP BY k",
                 "SELECT k,suffix,count(*) FROM composite WHERE k=2 GROUP BY k,suffix",
+                "SELECT k,count(*) FROM composite WHERE suffix='a' AND k=2 GROUP BY k",
+                "SELECT k,sum(n) FROM composite WHERE suffix='a' AND k=2 AND n>5 GROUP BY k",
                 "SELECT k,suffix,count(*) FROM composite WHERE k IN (2,3,2) GROUP BY k,suffix",
                 // Repeated index columns must not hide the n=10 residual.
                 "SELECT k,count(*) FROM repeated WHERE k=2 AND n=10 GROUP BY k",
                 "SELECT k,count(*) FROM repeated WHERE k IN (2,3,2) AND n=10 GROUP BY k",
                 "SELECT k,count(*) FROM text_keys WHERE k=2 GROUP BY k",
+                "SELECT k,count(*) FROM text_keys WHERE k=2 AND n>10 GROUP BY k",
+                "SELECT k,count(*) FROM text_keys WHERE k='a' COLLATE NOCASE AND n>40 GROUP BY k",
                 "SELECT k,count(*) FROM text_keys WHERE k IN (2,'2','02',NULL) GROUP BY k",
                 // A constant singleton RHS COLLATE affects membership; a
                 // multi-element list uses only the column's BINARY collation.
@@ -237,6 +246,13 @@ fn indexed_group_by_predicates_match_sqlite_without_table_scans() {
                 (eq, vec![rusqlite::types::Value::Text("2".to_owned())]),
                 (eq, vec![rusqlite::types::Value::Integer(99)]),
                 (eq, vec![rusqlite::types::Value::Null]),
+                (
+                    "SELECT post_id,count(*) FROM likes WHERE n>? AND post_id=? AND id>? GROUP BY post_id",
+                    [15, 2, 1]
+                        .into_iter()
+                        .map(rusqlite::types::Value::Integer)
+                        .collect(),
+                ),
                 (
                     "SELECT k,count(*) FROM text_keys WHERE k IN (?1 COLLATE NOCASE) GROUP BY k",
                     vec![rusqlite::types::Value::Text("a".to_owned())],
@@ -349,6 +365,8 @@ fn indexed_group_by_predicates_match_sqlite_without_table_scans() {
             }
             for sql in [
                 "SELECT post_id,count(*) FROM likes WHERE post_id IN (2,3) AND n>5 GROUP BY post_id",
+                "SELECT post_id,count(*) FROM likes WHERE post_id=2 AND n>5 GROUP BY post_id",
+                "SELECT post_id,count(*) FROM likes WHERE post_id=?1 AND post_id=?2 GROUP BY post_id",
                 "SELECT post_id,count(n) FROM likes WHERE post_id=2 GROUP BY post_id",
                 "SELECT k,count(*) FROM repeated WHERE k=2 AND n=10 GROUP BY k",
             ] {
@@ -407,6 +425,16 @@ fn indexed_group_by_rebinds_all_clauses_and_observes_rollback() {
             (
                 "SELECT post_id,sum(n) FROM likes \
                  WHERE suffix=? AND post_id=? GROUP BY post_id",
+                vec![vec![1, 2], vec![2, 3]],
+            ),
+            (
+                "SELECT post_id,count(*) FROM likes \
+                 WHERE n>? AND post_id=? AND id>? GROUP BY post_id",
+                vec![vec![12, 2, 0], vec![5, 3, 0], vec![0, 99, 0]],
+            ),
+            (
+                "SELECT post_id,count(*) FROM likes \
+                 WHERE suffix=:suffix AND post_id=:post GROUP BY post_id",
                 vec![vec![1, 2], vec![2, 3]],
             ),
         ] {
@@ -470,26 +498,42 @@ fn indexed_group_by_work_tracks_matches_instead_of_table_size() {
         let f = Connection::open(path.to_str().unwrap()).await.unwrap();
         f.set_reject_mem_fallback(true);
         f.set_strict_mem_fallback_rejection(true);
-        for (sql, params, is_scan) in [
+        for (sql, params, is_scan, covering) in [
             (
                 "SELECT post_id,count(*) FROM likes WHERE post_id=?1 GROUP BY post_id",
                 vec![2374],
                 false,
+                true,
             ),
             (
                 "SELECT post_id,count(*) FROM likes WHERE post_id=?1 GROUP BY post_id",
                 vec![99_999],
                 false,
+                true,
             ),
             (
                 "SELECT post_id,count(*) FROM likes WHERE post_id IN (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20) GROUP BY post_id",
                 (1..=20).map(|n| n * 37).collect(),
+                false,
+                true,
+            ),
+            (
+                "SELECT post_id,count(*) FROM likes WHERE n>?1 AND post_id=?2 GROUP BY post_id",
+                vec![5, 2374],
+                false,
+                false,
+            ),
+            (
+                "SELECT post_id,count(*) FROM likes NOT INDEXED WHERE n>?1 AND post_id=?2 GROUP BY post_id",
+                vec![5, 2374],
+                true,
                 false,
             ),
             (
                 "SELECT post_id,count(*) FROM likes NOT INDEXED WHERE post_id=?1 GROUP BY post_id",
                 vec![2374],
                 true,
+                false,
             ),
         ] {
             let mut oracle = stock.prepare(sql).unwrap();
@@ -540,10 +584,17 @@ fn indexed_group_by_work_tracks_matches_instead_of_table_size() {
                     .filter(|entry| entry.opcode == "SeekRowid")
                     .map(|entry| entry.total)
                     .sum();
-                assert_eq!(
-                    table_lookups, 0,
-                    "covered grouping fetched source-table rows: {metrics:?}"
-                );
+                if covering {
+                    assert_eq!(
+                        table_lookups, 0,
+                        "covered grouping fetched source-table rows: {metrics:?}"
+                    );
+                } else {
+                    assert_eq!(
+                        table_lookups, 4,
+                        "residual evaluation must fetch only the four prefix matches: {metrics:?}"
+                    );
+                }
                 assert!(
                     steps < 1_000,
                     "selective grouping scanned the table: {metrics:?}"
