@@ -1,0 +1,1879 @@
+diff --git a/crates/fsqlite-core/src/connection.rs b/crates/fsqlite-core/src/connection.rs
+index a92060f..221a999 100644
+--- a/crates/fsqlite-core/src/connection.rs
++++ b/crates/fsqlite-core/src/connection.rs
+@@ -239,7 +239,8 @@ use fsqlite_vdbe::codegen::{
+     PlannerIndexRangeBound, PlannerIndexRangeTarget, PlannerSelectAccessKind,
+     SelectPlannerDirective, TableSchema, bind_explicit_index, codegen_delete, codegen_insert,
+     codegen_select, codegen_update, emit_backfill_column_read, emit_backfill_key_expr,
+-    emit_scan_filter, join_select_seeks_outer_table, join_select_uses_lookup,
++    emit_scan_filter, join_select_seeks_outer_table, join_select_streams_order_by,
++    join_select_uses_lookup,
+     without_rowid_index_appended_pk, without_rowid_pk_indices,
+ };
+ #[cfg(not(test))]
+@@ -50975,6 +50976,12 @@ impl Connection {
+         select: &SelectStatement,
+         params: Option<&[SqliteValue]>,
+     ) -> Result<Vec<Row>> {
++        if let Some(rows) = self
++            .try_execute_deferred_subquery_projection(select, params)
++            .await?
++        {
++            return Ok(rows);
++        }
+         let rewritten = self.rewrite_in_subqueries_select(select, params).await?;
+         let mut bound = bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
+         let limit_clause = bound.limit.take();
+@@ -50995,6 +51002,225 @@ impl Connection {
+         Ok(rows)
+     }
+ 
++    /// Keep the relational input of a scalar projection on its ordinary query
++    /// plan. A subquery used only in the result list cannot affect which rows
++    /// survive WHERE, JOIN, ORDER BY, LIMIT or OFFSET. Evaluating that result
++    /// list after the input finishes avoids both materializing unrelated source
++    /// rows and running a correlated probe for every discarded row (GH#531).
++    ///
++    /// This is projection deferral, not LIMIT pushdown into a join input: the
++    /// raw SELECT retains the complete FROM, ON and WHERE and counts joined
++    /// result rows. Expressions that affect cardinality or order keep the
++    /// general evaluator, as do sources with implicit/coalesced columns.
++    #[allow(clippy::too_many_lines)]
++    async fn try_execute_deferred_subquery_projection(
++        &self,
++        select: &SelectStatement,
++        params: Option<&[SqliteValue]>,
++    ) -> Result<Option<Vec<Row>>> {
++        let SelectCore::Select {
++            distinct: Distinctness::All,
++            columns,
++            from: Some(from),
++            where_clause,
++            group_by,
++            having: None,
++            windows,
++        } = &select.body.select
++        else {
++            return Ok(None);
++        };
++        if select.with.is_some()
++            || !select.body.compounds.is_empty()
++            || !group_by.is_empty()
++            || !windows.is_empty()
++            || self.time_travel_active.get()
++            || self.skip_statement_memdb_refresh.get()
++            || self.has_implicit_aggregation_with_registry(select)
++            || has_window_functions(select)
++            || select_contains_match_operator(select)
++            || (where_clause.is_none() && select.limit.is_none())
++            || !columns.iter().any(|column| {
++                matches!(column, ResultColumn::Expr { expr, .. } if expr_has_any_subquery(expr))
++            })
++            || columns.iter().any(|column| {
++                !matches!(column, ResultColumn::Expr { .. })
++            })
++            || where_clause.as_deref().is_some_and(expr_has_any_subquery)
++            || from.joins.iter().any(|join| {
++                join.join_type.natural
++                    || !matches!(join.join_type.kind, JoinKind::Inner | JoinKind::Left)
++                    || !matches!(&join.constraint, Some(JoinConstraint::On(expr))
++                        if !expr_has_any_subquery(expr))
++            })
++        {
++            return Ok(None);
++        }
++        {
++            let schema = self.schema.borrow();
++            for source in
++                std::iter::once(&from.source).chain(from.joins.iter().map(|join| &join.table))
++            {
++                let TableOrSubquery::Table {
++                    name,
++                    time_travel: None,
++                    ..
++                } = source
++                else {
++                    return Ok(None);
++                };
++                if name.schema.is_some()
++                    || self.has_live_vtab_instance(&name.name)
++                    || !schema
++                        .iter()
++                        .any(|table| table.name.eq_ignore_ascii_case(&name.name))
++                {
++                    return Ok(None);
++                }
++            }
++        }
++
++        // Moving projections must not renumber anonymous parameters, including
++        // ones inside subqueries and LIMIT. Bind the complete original tree
++        // once before constructing the input query.
++        let bound = bind_placeholders_in_select_for_fallback(select, params)?;
++        let SelectCore::Select {
++            columns,
++            from: Some(from),
++            where_clause,
++            ..
++        } = &bound.body.select
++        else {
++            unreachable!("binding preserves the SELECT shape");
++        };
++        let Some(from_columns) = self.select_from_column_names(&bound) else {
++            return Ok(None);
++        };
++        let aliases: Vec<(String, Expr)> = columns
++            .iter()
++            .filter_map(|column| match column {
++                ResultColumn::Expr {
++                    expr,
++                    alias: Some(alias),
++                } => Some((alias.clone(), expr.clone())),
++                _ => None,
++            })
++            .collect();
++        // SQLite permits output aliases in WHERE/ON. If one is used there,
++        // removing its projection would change name resolution. A real source
++        // column with the same name still takes precedence in those clauses.
++        for predicate in where_clause
++            .as_deref()
++            .into_iter()
++            .chain(from.joins.iter().filter_map(|join| match &join.constraint {
++                Some(JoinConstraint::On(expr)) => Some(expr),
++                _ => None,
++            }))
++        {
++            let mut predicate = predicate.clone();
++            if substitute_result_aliases_in_expr(&mut predicate, &aliases, &from_columns) {
++                return Ok(None);
++            }
++        }
++
++        // Resolve an output alias/ordinal exactly once. Re-resolving its
++        // resulting column as another alias changes `a AS b, b AS a`.
++        fn source_order_expr(expr: &Expr, columns: &[ResultColumn]) -> Option<Expr> {
++            if let Expr::Collate {
++                expr,
++                collation,
++                span,
++            } = expr
++            {
++                return Some(Expr::Collate {
++                    expr: Box::new(source_order_expr(expr, columns)?),
++                    collation: collation.clone(),
++                    span: *span,
++                });
++            }
++            let output = if let Some(ordinal) = connection_order_by_integer_ordinal(expr) {
++                let index = usize::try_from(ordinal).ok()?.checked_sub(1)?;
++                Some(columns.get(index)?)
++            } else if let Expr::Column(column, _) = expr {
++                if column.table.is_none() && column.schema.is_none() {
++                    columns.iter().find(|output| {
++                        matches!(output,
++                        ResultColumn::Expr { alias: Some(alias), .. }
++                            if alias.eq_ignore_ascii_case(&column.column))
++                    })
++                } else {
++                    None
++                }
++            } else {
++                return None;
++            };
++            let resolved = match output {
++                Some(ResultColumn::Expr { expr, .. }) => expr,
++                Some(_) => return None,
++                None => expr,
++            };
++            matches!(strip_collate_wrappers(resolved), Expr::Column(..)).then(|| resolved.clone())
++        }
++
++        let mut input = bound.clone();
++        for term in &mut input.order_by {
++            let Some(expr) = source_order_expr(&term.expr, columns) else {
++                return Ok(None);
++            };
++            term.expr = expr;
++        }
++        if input.limit.as_ref().is_some_and(|limit| {
++            expr_has_any_subquery(&limit.limit)
++                || expr_references_any_column(&limit.limit)
++                || limit.offset.as_ref().is_some_and(|offset| {
++                    expr_has_any_subquery(offset) || expr_references_any_column(offset)
++                })
++        }) {
++            return Ok(None);
++        }
++        let col_map = self.build_join_col_map(&bound);
++        if let SelectCore::Select { columns, .. } = &mut input.body.select {
++            *columns = join_raw_projection(&bound, &col_map);
++        }
++        // A join without a usable compiled input gains nothing from another
++        // materialization pass. Single-table input uses normal index planning.
++        if !from.joins.is_empty() && !self.select_join_runs_in_vdbe(&input) {
++            return Ok(None);
++        }
++        // Validate the original projection even for LIMIT 0 / an empty input:
++        // deferred execution must not hide unknown names, functions or a
++        // multi-column scalar subquery that SQLite rejects at prepare time.
++        self.validate_select_column_references(&bound)?;
++        let input_rows = self
++            .execute_statement(&Statement::Select(input), None)
++            .await?;
++        let column_collations = self.build_join_col_collations(&bound);
++        let column_affinities = self.build_join_col_affinities(&bound);
++        let _join_eval_collation_guard =
++            JoinEvalCollationContextGuard::push(JoinEvalCollationContext {
++                declared_json_keys: self.build_join_declared_blob_columns(&bound),
++                column_collations,
++                column_affinities,
++                using_column_projections: HashMap::new(),
++                registry: lock_unpoisoned(self.collation_registry.as_ref()).clone(),
++            });
++        let mut result = Vec::with_capacity(input_rows.len());
++        for row in input_rows {
++            let mut values = Vec::with_capacity(columns.len());
++            for column in columns {
++                let ResultColumn::Expr { expr, .. } = column else {
++                    unreachable!("deferred projection contains explicit expressions");
++                };
++                values.push(
++                    self.eval_expr_with_subqueries(expr, row.values(), &col_map, None)
++                        .await?,
++                );
++            }
++            result.push(Row { values });
++        }
++        Ok(Some(result))
++    }
++
+     fn select_correlated_exists_where_can_use_indexed_count_probe(
+         &self,
+         select: &SelectStatement,
+@@ -112452,15 +112678,19 @@ fn select_join_is_vdbe_eligible(select: &SelectStatement) -> bool {
+     select.limit.is_none() && select_join_shape_is_vdbe_eligible(select)
+ }
+ 
+-/// bd-9gl3w: a join with a LIMIT and no ORDER BY that the VDBE can stop early.
++/// A lookup join with a LIMIT that the VDBE can stop early.
+ ///
+ /// The join codegen compiles LIMIT/OFFSET where it emits each row, so a
+ /// lookup join (a rowid or index seek per outer row) ends after its last row.
+ /// A nested-loop join would rescan the inner table per outer row until then,
+ /// so it keeps the materializing executor, which hashes the inner table once.
+-/// ORDER BY + LIMIT keeps that executor and its GH#386 keyset lane too.
++/// An outer ordering index (or rowid order) also preserves ORDER BY through
++/// every inner lookup, so the same output counter can stop those joins.
++/// Selective outer seeks with ORDER BY sort only the reached candidates.
+ fn select_limited_join_is_vdbe_eligible(select: &SelectStatement, schema: &[TableSchema]) -> bool {
+-    select.order_by.is_empty()
++    (select.order_by.is_empty()
++        || join_select_streams_order_by(select, schema)
++        || join_select_seeks_outer_table(select, schema))
+         && select.limit.as_ref().is_some_and(|clause| {
+             !expr_has_any_subquery(&clause.limit)
+                 && clause
+diff --git a/crates/fsqlite-core/tests/bd_9gl3w_join_limit.rs b/crates/fsqlite-core/tests/bd_9gl3w_join_limit.rs
+index 73e9956..a72f182 100644
+--- a/crates/fsqlite-core/tests/bd_9gl3w_join_limit.rs
++++ b/crates/fsqlite-core/tests/bd_9gl3w_join_limit.rs
+@@ -377,3 +377,116 @@ fn join_limit_stops_after_its_last_row() {
+         }
+     });
+ }
++
++/// GH#531: ordering the outer source must not truncate it before the join.
++/// Missing INNER matches, duplicate index matches, LEFT null extension, and
++/// WHERE filtering all change how many outer rows satisfy LIMIT/OFFSET.
++#[test]
++fn ordered_lookup_join_limits_match_stock() {
++    let _serial = serial();
++    asupersync::test_utils::run_test(|| async {
++        for file_backed in [false, true] {
++            let dir = tempfile::tempdir().unwrap();
++            let (f, r) = open_pair(file_backed, &dir).await;
++            let indexes = "CREATE INDEX t_v_id ON t(v DESC, id DESC);\
++                           CREATE INDEX t_n_id ON t(n ASC, id DESC);";
++            f.execute_batch(indexes).await.unwrap();
++            r.execute_batch(indexes).unwrap();
++            let queries = [
++                "SELECT t.id, k.label FROM t JOIN k ON t.g = k.g ORDER BY t.v DESC, t.id DESC",
++                "SELECT t.id, k.label FROM t JOIN k ON t.g = k.g ORDER BY t.v ASC, t.id ASC",
++                "SELECT t.id, k.label FROM t LEFT JOIN k ON t.g = k.g ORDER BY t.v DESC, t.id DESC",
++                "SELECT t.id, k.label FROM t LEFT JOIN k ON t.g = k.g AND k.g > 2 \
++                 ORDER BY t.v DESC, t.id DESC",
++                "SELECT t.id, k.label FROM t JOIN k ON t.g = k.g \
++                 WHERE t.n > 1 AND k.label <> 'k3' ORDER BY t.v DESC, t.id DESC",
++                "SELECT a.id, b.label FROM t AS a LEFT JOIN k AS b ON b.g = a.g \
++                 WHERE b.label IS NULL ORDER BY a.n ASC, a.id DESC",
++                "SELECT a.id, b.label FROM t AS a JOIN k AS b ON b.g = a.g ORDER BY a.id DESC",
++                "SELECT t.id, u.w FROM t LEFT JOIN u ON u.tid = t.id ORDER BY t.id DESC",
++                "SELECT t.id, u.w FROM t JOIN u ON u.tid = t.id ORDER BY t.v DESC, t.id DESC",
++                "SELECT t.v AS sort_key, t.id, k.label FROM t JOIN k ON t.g = k.g \
++                 ORDER BY sort_key DESC, 2 DESC",
++                "SELECT t.id, k.label FROM t INDEXED BY t_v_id JOIN k ON t.g = k.g \
++                 ORDER BY t.v DESC, t.id DESC",
++                // These orderings cannot stream from the outer index and retain the sorter.
++                "SELECT t.id, k.label FROM t JOIN k ON t.g = k.g ORDER BY k.label, t.id DESC",
++                "SELECT t.id, k.label FROM t JOIN k ON t.g = k.g \
++                 ORDER BY t.v COLLATE NOCASE DESC, t.id DESC",
++                "SELECT t.id, k.label FROM t JOIN k ON t.g = k.g \
++                 ORDER BY t.v DESC NULLS FIRST, t.id DESC",
++                "SELECT t.id, k.label FROM t JOIN k ON t.g = k.g \
++                 WHERE t.id = 7 ORDER BY k.label, t.id DESC",
++            ];
++            for prefix in queries {
++                let sql = format!("{prefix} LIMIT ?1 OFFSET ?2");
++                let prepared = f.prepare(&sql).await.unwrap();
++                for params in [[1, 0], [5, 2], [0, 0], [-1, 30], [7, 100], [3, -2]] {
++                    let expected = rq(&r, &sql, &params).unwrap();
++                    let values = params.map(SqliteValue::Integer);
++                    let adhoc = f.query_with_params(&sql, &values).await.unwrap();
++                    let reused = prepared.query_with_params(&values).await.unwrap();
++                    assert_eq!(tag_rows(&adhoc), expected, "{sql} {params:?}, file={file_backed}");
++                    assert_eq!(tag_rows(&reused), expected, "prepared {sql} {params:?}, file={file_backed}");
++                }
++            }
++            // Both engines must see writes from their current transaction,
++            // and the prepared plan must continue to read correctly after rollback.
++            let sql = "SELECT t.id, k.label FROM t LEFT JOIN k ON t.g = k.g \
++                       ORDER BY t.v DESC, t.id DESC LIMIT ?1 OFFSET ?2";
++            let prepared = f.prepare(sql).await.unwrap();
++            for command in [
++                "BEGIN; UPDATE t SET v = 'zzz', g = 100 WHERE id = 2; DELETE FROM k WHERE g = 4;",
++                "ROLLBACK;",
++            ] {
++                f.execute_batch(command).await.unwrap();
++                r.execute_batch(command).unwrap();
++                let rows = prepared
++                    .query_with_params(&[SqliteValue::Integer(8), SqliteValue::Integer(0)])
++                    .await
++                    .unwrap();
++                assert_eq!(tag_rows(&rows), rq(&r, sql, &[8, 0]).unwrap(), "{command}");
++            }
++            f.close().await.unwrap();
++        }
++    });
++}
++
++#[test]
++fn ordered_lookup_join_limits_do_bounded_work() {
++    let _serial = serial();
++    asupersync::test_utils::run_test(|| async {
++        let dir = tempfile::tempdir().unwrap();
++        let path = dir.path().join("ordered.db");
++        // Seed with the live stock oracle so both engines read identical
++        // records/index pages, including descending index key metadata.
++        let oracle = rusqlite::Connection::open(&path).unwrap();
++        oracle.execute_batch(&format!(
++            "CREATE TABLE t(id INTEGER PRIMARY KEY, stamp INTEGER, owner INTEGER);\
++             CREATE TABLE k(id INTEGER PRIMARY KEY, name TEXT);\
++             CREATE INDEX t_stamp_id ON t(stamp DESC, id DESC);\
++             INSERT INTO k VALUES(1,'one'),(2,'two');\
++             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<{ROWS}) \
++             INSERT INTO t SELECT i, i % 101, i % 3 FROM n;"
++        )).unwrap();
++        let conn = Connection::open(path.to_str().unwrap()).await.unwrap();
++        for order in ["t.stamp DESC, t.id DESC", "t.stamp ASC, t.id ASC", "t.id DESC"] {
++            let sql = format!("SELECT t.id, k.name FROM t JOIN k ON k.id=t.owner \
++                               ORDER BY {order} LIMIT ?1 OFFSET ?2");
++            let prepared = conn.prepare(&sql).await.unwrap();
++            set_hot_path_profile_enabled(true);
++            reset_hot_path_profile();
++            let rows = prepared
++                .query_with_params(&[SqliteValue::Integer(20), SqliteValue::Integer(5)])
++                .await
++                .unwrap();
++            let opcodes = hot_path_profile_snapshot().vdbe.opcodes_executed_total;
++            set_hot_path_profile_enabled(false);
++            assert_eq!(tag_rows(&rows), rq(&oracle, &sql, &[20, 5]).unwrap(), "{sql}");
++            assert!(opcodes > 0 && opcodes <= MAX_LIMITED_OPCODES,
++                "{sql}: {opcodes} opcodes for 20 rows from {ROWS}; the ordering index and \
++                 joined-row LIMIT must prevent a full scan/sort");
++        }
++        conn.close().await.unwrap();
++    });
++}
+diff --git a/crates/fsqlite-core/tests/bd_group_by_depth_oracle_probe.rs b/crates/fsqlite-core/tests/bd_group_by_depth_oracle_probe.rs
+index c32e5ba..a7b9774 100644
+--- a/crates/fsqlite-core/tests/bd_group_by_depth_oracle_probe.rs
++++ b/crates/fsqlite-core/tests/bd_group_by_depth_oracle_probe.rs
+@@ -184,6 +184,11 @@ fn indexed_group_by_predicates_match_sqlite_without_table_scans() {
+                 "SELECT post_id,count(*) FROM likes WHERE post_id='abc' GROUP BY post_id",
+                 "SELECT post_id,count(*) FROM likes WHERE post_id=NULL GROUP BY post_id",
+                 "SELECT post_id,count(*) FROM likes WHERE post_id=99 GROUP BY post_id",
++                "SELECT post_id,count(*) FROM likes WHERE post_id=2 AND n>5 GROUP BY post_id",
++                "SELECT post_id,count(*) FROM likes WHERE post_id=2 AND post_id=3 GROUP BY post_id",
++                "SELECT post_id,sum(n),max(n) FROM likes WHERE post_id='2' AND (n>20 OR n IS NULL) GROUP BY post_id",
++                "SELECT post_id,count(*) FROM likes WHERE post_id=NULL AND n>5 GROUP BY post_id",
++                "SELECT post_id,count(*) FROM likes WHERE post_id=99 AND n>5 GROUP BY post_id",
+                 "SELECT post_id,count(*) FROM likes WHERE post_id IN (2,3,2,NULL,99) GROUP BY post_id",
+                 "SELECT post_id,count(*),sum(n) FROM likes WHERE post_id IN (2,3,4) AND n>5 GROUP BY post_id HAVING sum(n)>10",
+                 "SELECT post_id,count(*) FROM likes WHERE post_id IN (2,3,4) GROUP BY post_id LIMIT 1 OFFSET 1",
+@@ -191,11 +196,15 @@ fn indexed_group_by_predicates_match_sqlite_without_table_scans() {
+                 "SELECT k,count(*),sum(n) FROM composite WHERE k=2 GROUP BY k",
+                 "SELECT k,count(*),sum(n) FROM composite WHERE k IN (2,3,2) GROUP BY k",
+                 "SELECT k,suffix,count(*) FROM composite WHERE k=2 GROUP BY k,suffix",
++                "SELECT k,count(*) FROM composite WHERE suffix='a' AND k=2 GROUP BY k",
++                "SELECT k,sum(n) FROM composite WHERE suffix='a' AND k=2 AND n>5 GROUP BY k",
+                 "SELECT k,suffix,count(*) FROM composite WHERE k IN (2,3,2) GROUP BY k,suffix",
+                 // Repeated index columns must not hide the n=10 residual.
+                 "SELECT k,count(*) FROM repeated WHERE k=2 AND n=10 GROUP BY k",
+                 "SELECT k,count(*) FROM repeated WHERE k IN (2,3,2) AND n=10 GROUP BY k",
+                 "SELECT k,count(*) FROM text_keys WHERE k=2 GROUP BY k",
++                "SELECT k,count(*) FROM text_keys WHERE k=2 AND n>10 GROUP BY k",
++                "SELECT k,count(*) FROM text_keys WHERE k='a' COLLATE NOCASE AND n>40 GROUP BY k",
+                 "SELECT k,count(*) FROM text_keys WHERE k IN (2,'2','02',NULL) GROUP BY k",
+                 // A constant singleton RHS COLLATE affects membership; a
+                 // multi-element list uses only the column's BINARY collation.
+@@ -237,6 +246,13 @@ fn indexed_group_by_predicates_match_sqlite_without_table_scans() {
+                 (eq, vec![rusqlite::types::Value::Text("2".to_owned())]),
+                 (eq, vec![rusqlite::types::Value::Integer(99)]),
+                 (eq, vec![rusqlite::types::Value::Null]),
++                (
++                    "SELECT post_id,count(*) FROM likes WHERE n>? AND post_id=? AND id>? GROUP BY post_id",
++                    [15, 2, 1]
++                        .into_iter()
++                        .map(rusqlite::types::Value::Integer)
++                        .collect(),
++                ),
+                 (
+                     "SELECT k,count(*) FROM text_keys WHERE k IN (?1 COLLATE NOCASE) GROUP BY k",
+                     vec![rusqlite::types::Value::Text("a".to_owned())],
+@@ -349,6 +365,8 @@ fn indexed_group_by_predicates_match_sqlite_without_table_scans() {
+             }
+             for sql in [
+                 "SELECT post_id,count(*) FROM likes WHERE post_id IN (2,3) AND n>5 GROUP BY post_id",
++                "SELECT post_id,count(*) FROM likes WHERE post_id=2 AND n>5 GROUP BY post_id",
++                "SELECT post_id,count(*) FROM likes WHERE post_id=?1 AND post_id=?2 GROUP BY post_id",
+                 "SELECT post_id,count(n) FROM likes WHERE post_id=2 GROUP BY post_id",
+                 "SELECT k,count(*) FROM repeated WHERE k=2 AND n=10 GROUP BY k",
+             ] {
+@@ -409,6 +427,16 @@ fn indexed_group_by_rebinds_all_clauses_and_observes_rollback() {
+                  WHERE suffix=? AND post_id=? GROUP BY post_id",
+                 vec![vec![1, 2], vec![2, 3]],
+             ),
++            (
++                "SELECT post_id,count(*) FROM likes \
++                 WHERE n>? AND post_id=? AND id>? GROUP BY post_id",
++                vec![vec![12, 2, 0], vec![5, 3, 0], vec![0, 99, 0]],
++            ),
++            (
++                "SELECT post_id,count(*) FROM likes \
++                 WHERE suffix=:suffix AND post_id=:post GROUP BY post_id",
++                vec![vec![1, 2], vec![2, 3]],
++            ),
+         ] {
+             let prepared = f.prepare(sql).await.unwrap();
+             let mut stock = r.prepare(sql).unwrap();
+@@ -470,26 +498,42 @@ fn indexed_group_by_work_tracks_matches_instead_of_table_size() {
+         let f = Connection::open(path.to_str().unwrap()).await.unwrap();
+         f.set_reject_mem_fallback(true);
+         f.set_strict_mem_fallback_rejection(true);
+-        for (sql, params, is_scan) in [
++        for (sql, params, is_scan, covering) in [
+             (
+                 "SELECT post_id,count(*) FROM likes WHERE post_id=?1 GROUP BY post_id",
+                 vec![2374],
+                 false,
++                true,
+             ),
+             (
+                 "SELECT post_id,count(*) FROM likes WHERE post_id=?1 GROUP BY post_id",
+                 vec![99_999],
+                 false,
++                true,
+             ),
+             (
+                 "SELECT post_id,count(*) FROM likes WHERE post_id IN (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20) GROUP BY post_id",
+                 (1..=20).map(|n| n * 37).collect(),
+                 false,
++                true,
++            ),
++            (
++                "SELECT post_id,count(*) FROM likes WHERE n>?1 AND post_id=?2 GROUP BY post_id",
++                vec![5, 2374],
++                false,
++                false,
++            ),
++            (
++                "SELECT post_id,count(*) FROM likes NOT INDEXED WHERE n>?1 AND post_id=?2 GROUP BY post_id",
++                vec![5, 2374],
++                true,
++                false,
+             ),
+             (
+                 "SELECT post_id,count(*) FROM likes NOT INDEXED WHERE post_id=?1 GROUP BY post_id",
+                 vec![2374],
+                 true,
++                false,
+             ),
+         ] {
+             let mut oracle = stock.prepare(sql).unwrap();
+@@ -540,10 +584,17 @@ fn indexed_group_by_work_tracks_matches_instead_of_table_size() {
+                     .filter(|entry| entry.opcode == "SeekRowid")
+                     .map(|entry| entry.total)
+                     .sum();
+-                assert_eq!(
+-                    table_lookups, 0,
+-                    "covered grouping fetched source-table rows: {metrics:?}"
+-                );
++                if covering {
++                    assert_eq!(
++                        table_lookups, 0,
++                        "covered grouping fetched source-table rows: {metrics:?}"
++                    );
++                } else {
++                    assert_eq!(
++                        table_lookups, 4,
++                        "residual evaluation must fetch only the four prefix matches: {metrics:?}"
++                    );
++                }
+                 assert!(
+                     steps < 1_000,
+                     "selective grouping scanned the table: {metrics:?}"
+diff --git a/crates/fsqlite-core/tests/issue_531_query_performance.rs b/crates/fsqlite-core/tests/issue_531_query_performance.rs
+new file mode 100644
+index 0000000..81f35a4
+--- /dev/null
++++ b/crates/fsqlite-core/tests/issue_531_query_performance.rs
+@@ -0,0 +1,487 @@
++#![recursion_limit = "512"]
++
++//! GH#531: full native prepared queries against live bundled C SQLite.
++//! The ignored matrix measures all reported shapes; elapsed time is not a CI gate.
++
++use fsqlite_core::connection::{
++    Connection, hot_path_profile_snapshot, reset_hot_path_profile, set_hot_path_profile_enabled,
++};
++use fsqlite_types::value::SqliteValue;
++use std::time::Instant;
++
++static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
++fn serial() -> std::sync::MutexGuard<'static, ()> {
++    SERIAL
++        .lock()
++        .unwrap_or_else(std::sync::PoisonError::into_inner)
++}
++fn stock_value(value: rusqlite::types::Value) -> SqliteValue {
++    match value {
++        rusqlite::types::Value::Null => SqliteValue::Null,
++        rusqlite::types::Value::Integer(v) => SqliteValue::Integer(v),
++        rusqlite::types::Value::Real(v) => SqliteValue::Float(v),
++        rusqlite::types::Value::Text(v) => SqliteValue::Text(v.into()),
++        rusqlite::types::Value::Blob(v) => SqliteValue::Blob(v.into()),
++    }
++}
++fn stock_rows<P: rusqlite::ToSql>(
++    stmt: &mut rusqlite::Statement<'_>,
++    params: &[P],
++) -> Vec<Vec<SqliteValue>> {
++    let columns = stmt.column_count();
++    stmt.query_map(rusqlite::params_from_iter(params), |row| {
++        (0..columns)
++            .map(|column| row.get(column).map(stock_value))
++            .collect()
++    })
++    .expect("stock query")
++    .collect::<rusqlite::Result<_>>()
++    .expect("stock rows")
++}
++fn franken_rows(rows: &[fsqlite_core::connection::Row]) -> Vec<Vec<SqliteValue>> {
++    rows.iter().map(|row| row.values().to_vec()).collect()
++}
++
++fn typed_row(row: &[SqliteValue]) -> Vec<String> {
++    row.iter()
++        .map(|value| match value {
++            SqliteValue::Null => "null".to_owned(),
++            SqliteValue::Integer(value) => format!("integer:{value}"),
++            // Check storage class and the precise represented floating value.
++            SqliteValue::Float(value) => format!("real:{:016x}", value.to_bits()),
++            SqliteValue::Text(value) => format!("text:{value}"),
++            SqliteValue::Blob(value) => format!("blob:{value:?}"),
++        })
++        .collect()
++}
++
++fn assert_rows(
++    actual: Vec<Vec<SqliteValue>>,
++    expected: Vec<Vec<SqliteValue>>,
++    ordered: bool,
++    sql: &str,
++) {
++    // SqliteValue's equality is SQL numeric equality, so comparing it directly
++    // would miss an INTEGER/REAL result-type regression.
++    let mut actual: Vec<_> = actual.iter().map(|row| typed_row(row)).collect();
++    let mut expected: Vec<_> = expected.iter().map(|row| typed_row(row)).collect();
++    if !ordered {
++        actual.sort_unstable();
++        expected.sort_unstable();
++    }
++    assert_eq!(actual, expected, "{sql}");
++}
++const CORNER_SCHEMA: &str="
++CREATE TABLE users(id INTEGER PRIMARY KEY,username TEXT);
++CREATE TABLE posts(id INTEGER PRIMARY KEY,user_id INTEGER,body TEXT,created_at TEXT COLLATE NOCASE);
++CREATE INDEX posts_created_at_id_idx ON posts(created_at DESC,id DESC);
++CREATE TABLE likes(user_id INTEGER,post_id INTEGER);
++CREATE INDEX likes_post_id_idx ON likes(post_id);
++INSERT INTO users VALUES(1,'alice'),(2,'bob');
++INSERT INTO posts VALUES(1,1,'first','b'),(2,99,'missing','Z'),(3,2,'third','A'),(4,1,'fourth','a'),(5,NULL,'null',NULL),(6,2,'sixth','C');
++INSERT INTO likes VALUES(1,1),(2,1),(1,3),(2,3),(3,3),(2,4),(2,6),(NULL,6),(5,NULL);
++";
++
++#[test]
++fn deferred_scalar_projections_preserve_binding_order_and_rollback() {
++    let _serial = serial();
++    asupersync::test_utils::run_test(|| async {
++        for file_backed in [false, true] {
++            let directory = tempfile::tempdir().unwrap();
++            let path = directory.path().join("projection.db");
++            let f = Connection::open(if file_backed {
++                path.to_str().unwrap()
++            } else {
++                ":memory:"
++            })
++            .await
++            .unwrap();
++            let r = rusqlite::Connection::open_in_memory().unwrap();
++            f.execute_batch(CORNER_SCHEMA).await.unwrap();
++            r.execute_batch(CORNER_SCHEMA).unwrap();
++            for sql in [
++                "SELECT p.id,(SELECT count(*) FROM likes l WHERE l.post_id=p.id) FROM posts p ORDER BY p.created_at DESC,p.id DESC LIMIT ?1 OFFSET ?2",
++                "SELECT p.id,u.username,(SELECT count(*) FROM likes l WHERE l.post_id=p.id) FROM posts p JOIN users u ON u.id=p.user_id ORDER BY p.created_at DESC,p.id DESC LIMIT ?1 OFFSET ?2",
++                "SELECT p.id,u.username,(SELECT max(user_id) FROM likes l WHERE l.post_id=p.id) FROM posts p LEFT JOIN users u ON u.id=p.user_id ORDER BY p.created_at DESC,p.id DESC LIMIT ?1 OFFSET ?2",
++                "SELECT p.id,l.user_id,(SELECT count(*) FROM likes z WHERE z.post_id=p.id) FROM posts p JOIN likes l ON l.post_id=p.id ORDER BY p.created_at DESC,p.id DESC,l.user_id LIMIT ?1 OFFSET ?2",
++                "SELECT p.id,u.username,coalesce((SELECT max(l.user_id) FROM likes l WHERE l.post_id=p.id),-1)+1 FROM posts p LEFT JOIN users u ON u.id=p.user_id WHERE u.username IS NULL ORDER BY p.created_at DESC,p.id DESC LIMIT ?1 OFFSET ?2",
++                // ORDER BY output aliases take precedence, including swapped names.
++                "SELECT p.id AS created_at,p.created_at AS id,(SELECT count(*) FROM likes l WHERE l.post_id=p.id) FROM posts p ORDER BY created_at DESC,id DESC LIMIT ?1 OFFSET ?2",
++                "SELECT p.id AS key,(SELECT count(*) FROM likes l WHERE l.post_id=p.id) FROM posts p ORDER BY key DESC LIMIT ?1 OFFSET ?2",
++                "SELECT p.id,(SELECT count(*) FROM likes l WHERE l.post_id=p.id) FROM posts p ORDER BY 1 DESC LIMIT ?1 OFFSET ?2",
++                // Scalar-dependent sorting/filtering and DISTINCT must keep semantics.
++                "SELECT p.id,(SELECT count(*) FROM likes l WHERE l.post_id=p.id) AS n FROM posts p ORDER BY n DESC,p.id DESC LIMIT ?1 OFFSET ?2",
++                "SELECT p.id,(SELECT count(*) FROM likes l WHERE l.post_id=p.id) AS n FROM posts p ORDER BY 2 DESC,p.id DESC LIMIT ?1 OFFSET ?2",
++                "SELECT p.id,(SELECT count(*) FROM likes l WHERE l.post_id=p.id) AS n FROM posts p WHERE n>1 ORDER BY p.id DESC LIMIT ?1 OFFSET ?2",
++                "SELECT DISTINCT p.user_id,(SELECT count(*) FROM likes l WHERE l.user_id=p.user_id) FROM posts p ORDER BY p.user_id LIMIT ?1 OFFSET ?2",
++            ] {
++                let prepared = f.prepare(sql).await.unwrap();
++                let mut stock = r.prepare(sql).unwrap();
++                for command in [
++                    "SELECT 1",
++                    "BEGIN; INSERT INTO likes VALUES(7,2); UPDATE posts SET user_id=1,created_at='zzz' WHERE id=2;",
++                    "ROLLBACK",
++                ] {
++                    f.execute_batch(command).await.unwrap();
++                    r.execute_batch(command).unwrap();
++                    for params in [[2, 0], [1, 2], [0, 0], [-1, 0], [20, 2], [2, 0]] {
++                        let expected = stock_rows(&mut stock, &params);
++                        let actual = prepared
++                            .query_with_params(&params.map(SqliteValue::Integer))
++                            .await
++                            .unwrap();
++                        assert_rows(franken_rows(&actual), expected, true, sql);
++                    }
++                }
++            }
++            for (sql, bindings) in [
++                (
++                    "SELECT ?+(SELECT count(*)+? FROM likes l WHERE l.post_id=p.id AND l.user_id>?),p.id FROM posts p WHERE p.id>? ORDER BY p.created_at DESC,p.id DESC LIMIT ? OFFSET ?",
++                    vec![
++                        vec![7, 11, 0, 0, 3, 0],
++                        vec![2, 5, 1, 2, 2, 1],
++                        vec![7, 11, 0, 0, 3, 0],
++                    ],
++                ),
++                (
++                    "SELECT p.id,(SELECT count(*) FROM likes l WHERE l.post_id=p.id AND l.user_id>?3) FROM posts p JOIN users u ON u.id=p.user_id WHERE p.id>?1 ORDER BY p.created_at DESC,p.id DESC LIMIT ?2",
++                    vec![vec![0, 2, 0], vec![3, 1, 1], vec![0, 2, 0]],
++                ),
++                (
++                    "SELECT p.id,(SELECT count(*) FROM likes l WHERE l.post_id=p.id AND l.user_id>:cutoff) FROM posts p WHERE p.id>:cutoff ORDER BY p.id DESC LIMIT :amount",
++                    vec![vec![0, 2], vec![3, 1], vec![0, 2]],
++                ),
++            ] {
++                let prepared = f.prepare(sql).await.unwrap();
++                let mut stock = r.prepare(sql).unwrap();
++                for params in bindings {
++                    let expected = stock_rows(&mut stock, &params);
++                    let values: Vec<_> = params.into_iter().map(SqliteValue::Integer).collect();
++                    let actual = prepared.query_with_params(&values).await.unwrap();
++                    assert_rows(franken_rows(&actual), expected, true, sql);
++                }
++            }
++            for sql in [
++                "SELECT p.missing,(SELECT count(*) FROM likes l WHERE l.post_id=p.id) FROM posts p ORDER BY p.id LIMIT 0",
++                "SELECT p.id,(SELECT missing FROM likes l WHERE l.post_id=p.id) FROM posts p ORDER BY p.id LIMIT 0",
++                "SELECT p.id,(SELECT count(*) FROM likes l WHERE l.post_id=p.id) FROM posts p ORDER BY missing LIMIT 0",
++                "SELECT p.id,(SELECT l.user_id,l.post_id FROM likes l WHERE l.post_id=p.id) FROM posts p ORDER BY p.id LIMIT 0",
++                "SELECT p.id,missing_function((SELECT count(*) FROM likes l WHERE l.post_id=p.id)) FROM posts p ORDER BY p.id LIMIT 0",
++            ] {
++                assert!(r.prepare(sql).is_err(), "stock must reject {sql}");
++                assert!(
++                    f.query(sql).await.is_err(),
++                    "LIMIT 0 hid invalid names: {sql}"
++                );
++            }
++            let sql = "SELECT p.id,?1+(SELECT count(*) FROM likes l WHERE l.post_id=p.id) \
++                       FROM posts p WHERE p.id=?2 LIMIT ?3";
++            let prepared = f.prepare(sql).await.unwrap();
++            let mut stock = r.prepare(sql).unwrap();
++            for values in [
++                [
++                    SqliteValue::Float(0.5),
++                    SqliteValue::Text("3".into()),
++                    SqliteValue::Integer(1),
++                ],
++                [
++                    SqliteValue::Integer(7),
++                    SqliteValue::Null,
++                    SqliteValue::Integer(20),
++                ],
++                [
++                    SqliteValue::Integer(0),
++                    SqliteValue::Text("1".into()),
++                    SqliteValue::Integer(2),
++                ],
++                [
++                    SqliteValue::Integer(0),
++                    SqliteValue::Blob(vec![b'1'].into()),
++                    SqliteValue::Integer(2),
++                ],
++            ] {
++                let stock_params: Vec<_> = values
++                    .iter()
++                    .map(|value| match value {
++                        SqliteValue::Null => rusqlite::types::Value::Null,
++                        SqliteValue::Integer(value) => rusqlite::types::Value::Integer(*value),
++                        SqliteValue::Float(value) => rusqlite::types::Value::Real(*value),
++                        SqliteValue::Text(value) => rusqlite::types::Value::Text(value.to_string()),
++                        SqliteValue::Blob(value) => rusqlite::types::Value::Blob(value.to_vec()),
++                    })
++                    .collect();
++                let expected = stock_rows(&mut stock, &stock_params);
++                let actual = prepared.query_with_params(&values).await.unwrap();
++                assert_rows(franken_rows(&actual), expected, true, sql);
++            }
++            f.close().await.unwrap();
++        }
++    });
++}
++
++/// Published CLI seed, scaled by row counts. Attempted inserts repeat primary
++/// keys: the default fixture has 500,000 distinct likes, not two million.
++fn seed(path: &std::path::Path, posts: usize) {
++    assert!(posts >= 100 && posts.is_multiple_of(10));
++    let users = posts / 10;
++    let r = rusqlite::Connection::open(path).unwrap();
++    r.execute_batch(&format!(
++        "PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF;
++         CREATE TABLE users(id INTEGER PRIMARY KEY,username TEXT NOT NULL UNIQUE);
++         CREATE TABLE posts(id INTEGER PRIMARY KEY,user_id INTEGER NOT NULL,body TEXT NOT NULL,created_at TEXT NOT NULL);
++         CREATE TABLE likes(user_id INTEGER NOT NULL,post_id INTEGER NOT NULL,PRIMARY KEY(user_id,post_id));
++         CREATE INDEX posts_created_at_id_idx ON posts(created_at DESC,id DESC);
++         CREATE INDEX likes_post_id_idx ON likes(post_id);
++         WITH RECURSIVE n(i) AS(SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<{users}) INSERT INTO users SELECT i,'user'||i FROM n;
++         WITH RECURSIVE n(i) AS(SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<{posts}) INSERT INTO posts SELECT i,i*48271%{users}+1,'post body '||i,printf('2025-%02d-%02dT%02d:%02d:%02d.%03dZ',i%12+1,i%28+1,i%24,i%60,i/7%60,i%1000) FROM n;
++         WITH RECURSIVE n(i) AS(SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<{attempts}) INSERT OR IGNORE INTO likes SELECT i*48271%{users}+1,i*16807%{posts}+1 FROM n;
++         ANALYZE; VACUUM; PRAGMA journal_mode=WAL;",attempts=4*posts,
++    )).unwrap();
++}
++struct Case {
++    name: &'static str,
++    sql: String,
++    params: Vec<i64>,
++    ordered: bool,
++}
++fn cases(posts: usize) -> Vec<Case> {
++    let point = i64::try_from(posts * 4 / 5).unwrap();
++    let mut result = Vec::new();
++    for (name, sql, params, ordered) in [
++        (
++            "group_eq",
++            "SELECT post_id,count(*) FROM likes WHERE post_id=?1 GROUP BY post_id",
++            vec![point],
++            false,
++        ),
++        (
++            "group_eq_residual",
++            "SELECT post_id,count(*) FROM likes WHERE post_id=?1 AND user_id>?2 GROUP BY post_id",
++            vec![point, 0],
++            false,
++        ),
++        (
++            "count_eq_control",
++            "SELECT count(*) FROM likes WHERE post_id=?1",
++            vec![point],
++            false,
++        ),
++        (
++            "newest20_control",
++            "SELECT p.id FROM posts p ORDER BY p.created_at DESC,p.id DESC LIMIT 20",
++            vec![],
++            true,
++        ),
++        (
++            "join_newest20",
++            "SELECT p.id,u.username FROM posts p JOIN users u ON u.id=p.user_id ORDER BY p.created_at DESC,p.id DESC LIMIT 20",
++            vec![],
++            true,
++        ),
++        (
++            "correlated_newest20",
++            "SELECT p.id,(SELECT count(*) FROM likes l WHERE l.post_id=p.id) FROM posts p ORDER BY p.created_at DESC,p.id DESC LIMIT 20",
++            vec![],
++            true,
++        ),
++        (
++            "join_by_id_control",
++            "SELECT p.id,p.body,p.created_at,u.username FROM posts p JOIN users u ON u.id=p.user_id WHERE p.id=?1",
++            vec![point],
++            false,
++        ),
++        (
++            "correlated_by_id_control",
++            "SELECT p.id,(SELECT count(*) FROM likes l WHERE l.post_id=p.id) FROM posts p WHERE p.id=?1",
++            vec![point],
++            false,
++        ),
++        (
++            "join_correlated_by_id",
++            "SELECT p.id,p.body,p.created_at,u.username,(SELECT count(*) FROM likes l WHERE l.post_id=p.id) AS like_count FROM posts p JOIN users u ON u.id=p.user_id WHERE p.id=?1",
++            vec![point],
++            false,
++        ),
++        (
++            "join_correlated_newest20",
++            "SELECT p.id,p.body,p.created_at,u.username,(SELECT count(*) FROM likes l WHERE l.post_id=p.id) AS like_count FROM posts p JOIN users u ON u.id=p.user_id ORDER BY p.created_at DESC,p.id DESC LIMIT 20",
++            vec![],
++            true,
++        ),
++    ] {
++        result.push(Case {
++            name,
++            sql: sql.to_owned(),
++            params,
++            ordered,
++        });
++    }
++    result.push(Case {
++        name: "group_in20",
++        sql: format!(
++            "SELECT post_id,count(*) FROM likes WHERE post_id IN ({}) GROUP BY post_id",
++            (1..=20)
++                .map(|i| format!("?{i}"))
++                .collect::<Vec<_>>()
++                .join(",")
++        ),
++        params: (1..=20)
++            .map(|i| i64::try_from(posts * i / 21).unwrap())
++            .collect(),
++        ordered: false,
++    });
++    result
++}
++#[test]
++fn bounded_scalar_projection_work_matches_stock() {
++    let _serial = serial();
++    asupersync::test_utils::run_test(|| async {
++        let directory = tempfile::tempdir().unwrap();
++        let stock_path = directory.path().join("stock.db");
++        let franken_path = directory.path().join("franken.db");
++        seed(&stock_path, 20_000);
++        std::fs::copy(&stock_path, &franken_path).unwrap();
++        let r = rusqlite::Connection::open(&stock_path).unwrap();
++        let f = Connection::open(franken_path.to_str().unwrap())
++            .await
++            .unwrap();
++        for case in cases(20_000)
++            .into_iter()
++            .filter(|case| case.name.contains("correlated"))
++        {
++            let expected = stock_rows(&mut r.prepare(&case.sql).unwrap(), &case.params);
++            let statement = f.prepare(&case.sql).await.unwrap();
++            let params: Vec<_> = case
++                .params
++                .iter()
++                .copied()
++                .map(SqliteValue::Integer)
++                .collect();
++            set_hot_path_profile_enabled(true);
++            reset_hot_path_profile();
++            let actual = statement.query_with_params(&params).await.unwrap();
++            let work = hot_path_profile_snapshot().vdbe.opcodes_executed_total;
++            set_hot_path_profile_enabled(false);
++            assert_rows(franken_rows(&actual), expected, case.ordered, &case.sql);
++            assert!(
++                work > 0 && work < 10_000,
++                "{} executed excessive VM work: {work}",
++                case.name
++            );
++        }
++        let control = "SELECT p.id,(SELECT count(*) FROM likes l WHERE l.post_id=p.id) FROM posts p NOT INDEXED ORDER BY p.created_at DESC,p.id DESC LIMIT 20";
++        set_hot_path_profile_enabled(true);
++        reset_hot_path_profile();
++        let actual = f.query(control).await.unwrap();
++        let work = hot_path_profile_snapshot().vdbe.opcodes_executed_total;
++        set_hot_path_profile_enabled(false);
++        assert_rows(
++            franken_rows(&actual),
++            stock_rows(&mut r.prepare(control).unwrap(), &[] as &[i64]),
++            true,
++            control,
++        );
++        assert!(
++            work >= 20_000,
++            "full scan must make counter observe input work: {work}"
++        );
++        f.close().await.unwrap();
++    });
++}
++#[test]
++#[ignore = "live prepared matrix; default 500,000 posts, override FSQLITE_531_POSTS"]
++fn benchmark_prepared_issue_531() {
++    let _serial = serial();
++    let posts = std::env::var("FSQLITE_531_POSTS")
++        .map_or(500_000, |value| value.parse().expect("post count"));
++    let trial_ms = std::env::var("FSQLITE_531_TRIAL_MS").map_or(2_000, |value| {
++        value.parse::<u64>().expect("trial milliseconds")
++    });
++    assert!(trial_ms > 0);
++    let trial_window = std::time::Duration::from_millis(trial_ms);
++    asupersync::test_utils::run_test(|| async {
++        let directory = tempfile::tempdir().unwrap();
++        let stock_path = directory.path().join("stock.db");
++        let franken_path = directory.path().join("franken.db");
++        seed(&stock_path, posts);
++        std::fs::copy(&stock_path, &franken_path).unwrap();
++        assert_eq!(
++            std::fs::read(&stock_path).unwrap(),
++            std::fs::read(&franken_path).unwrap()
++        );
++        let r = rusqlite::Connection::open(&stock_path).unwrap();
++        let f = Connection::open(franken_path.to_str().unwrap())
++            .await
++            .unwrap();
++        r.execute_batch("PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;")
++            .unwrap();
++        f.execute_batch("PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;")
++            .await
++            .unwrap();
++        let likes: i64 = r
++            .query_row("SELECT count(*) FROM likes", [], |row| row.get(0))
++            .unwrap();
++        println!(
++            "{}",
++            serde_json::json!({"posts":posts,"users":posts/10,"likes":likes,"sqlite":rusqlite::version(),"fixture":"published CLI recipe","prepared":true})
++        );
++        for case in cases(posts) {
++            let mut stock = r.prepare(&case.sql).unwrap();
++            let prepared = f.prepare(&case.sql).await.unwrap();
++            let params: Vec<_> = case
++                .params
++                .iter()
++                .copied()
++                .map(SqliteValue::Integer)
++                .collect();
++            // One untimed live-oracle warmup per engine. Keep preparation and
++            // output validation outside every timed execution window.
++            let expected = stock_rows(&mut stock, &case.params);
++            let warmup = prepared.query_with_params(&params).await.unwrap();
++            assert_rows(
++                franken_rows(&warmup),
++                expected.clone(),
++                case.ordered,
++                &case.sql,
++            );
++            let mut samples = Vec::new();
++            for trial in 0..5 {
++                for run_franken in [trial % 2 == 0, trial % 2 != 0] {
++                    let mut elapsed = std::time::Duration::ZERO;
++                    let mut iterations = 0_u64;
++                    while iterations == 0 || elapsed < trial_window {
++                        let start = Instant::now();
++                        let actual = if run_franken {
++                            let rows = prepared.query_with_params(&params).await.unwrap();
++                            franken_rows(&rows)
++                        } else {
++                            stock_rows(&mut stock, &case.params)
++                        };
++                        elapsed += start.elapsed();
++                        iterations += 1;
++                        assert_rows(actual, expected.clone(), case.ordered, &case.sql);
++                    }
++                    samples.push(serde_json::json!({
++                        "trial":trial,
++                        "engine":if run_franken { "frankensqlite" } else { "sqlite" },
++                        "iterations":iterations,
++                        "total_us":elapsed.as_secs_f64()*1_000_000.0,
++                        "us_per_query":elapsed.as_secs_f64()*1_000_000.0/iterations as f64,
++                    }));
++                }
++            }
++            println!(
++                "{}",
++                serde_json::json!({"case":case.name,"sql":case.sql,"params":case.params,"samples":samples})
++            );
++        }
++        f.close().await.unwrap();
++        for path in [&stock_path, &franken_path] {
++            let check = rusqlite::Connection::open(path).unwrap();
++            let integrity: String = check
++                .query_row("PRAGMA integrity_check", [], |row| row.get(0))
++                .unwrap();
++            assert_eq!(integrity, "ok");
++        }
++    });
++}
+diff --git a/crates/fsqlite-vdbe/src/codegen.rs b/crates/fsqlite-vdbe/src/codegen.rs
+index 4bee531..e87764e 100644
+--- a/crates/fsqlite-vdbe/src/codegen.rs
++++ b/crates/fsqlite-vdbe/src/codegen.rs
+@@ -13116,6 +13116,210 @@ pub fn join_select_uses_lookup(stmt: &SelectStatement, schema: &[TableSchema]) -
+     single_join_lookup_select(stmt, schema).is_some()
+ }
+ 
++/// Whether a lookup join can emit rows in ORDER BY order directly from its
++/// outer table. LIMIT then counts joined rows, after ON and WHERE, instead
++/// of limiting the outer source before missing or duplicate matches are known.
++#[must_use]
++pub fn join_select_streams_order_by(stmt: &SelectStatement, schema: &[TableSchema]) -> bool {
++    let Some(join) = single_join_lookup_select(stmt, schema) else {
++        return false;
++    };
++    resolve_join_outer_order(
++        stmt,
++        join.left_table,
++        join.left_alias,
++        join.right_table,
++        join.right_alias,
++    )
++    .is_some()
++}
++
++enum JoinOuterOrder {
++    Rowid { descending: bool },
++    Index(OrderByIndexPlan),
++}
++
++/// Expand a result slot once before using it as an ordering expression.
++/// In particular, the resulting source-column name is not another alias.
++fn join_output_slot_expr(
++    slot: usize,
++    columns: &[ResultColumn],
++    tables: &[(&TableSchema, Option<&str>)],
++) -> Option<Expr> {
++    let mut start = 0;
++    for column in columns {
++        match column {
++            ResultColumn::Expr { expr, .. } => {
++                if start == slot {
++                    return Some(expr.clone());
++                }
++                start += 1;
++            }
++            ResultColumn::Star | ResultColumn::TableStar(_) => {
++                for (table, alias) in tables {
++                    if let ResultColumn::TableStar(name) = column
++                        && !join_qualifier_matches(Some(&name.name), table, *alias)
++                    {
++                        continue;
++                    }
++                    if let Some(relative) = slot.checked_sub(start)
++                        && let Some(info) = table.columns.get(relative)
++                    {
++                        return Some(Expr::Column(
++                            ColumnRef::qualified(alias.unwrap_or(&table.name), info.name.as_str()),
++                            Span::ZERO,
++                        ));
++                    }
++                    start += table.columns.len();
++                }
++            }
++        }
++    }
++    None
++}
++
++/// Reuse the single-table ORDER BY proof, but resolve bare names against
++/// both join sources first. Only the outer source may contribute ordering
++/// keys: the inner lookup can emit zero, one, or many rows for each outer row.
++fn resolve_join_outer_order(
++    stmt: &SelectStatement,
++    left_table: &TableSchema,
++    left_alias: Option<&str>,
++    right_table: &TableSchema,
++    right_alias: Option<&str>,
++) -> Option<JoinOuterOrder> {
++    let SelectCore::Select {
++        columns,
++        from: Some(from),
++        where_clause,
++        distinct: Distinctness::All,
++        ..
++    } = &stmt.body.select
++    else {
++        return None;
++    };
++    let TableOrSubquery::Table {
++        name,
++        alias,
++        index_hint,
++        time_travel: None,
++    } = &from.source
++    else {
++        return None;
++    };
++    if stmt.order_by.is_empty()
++        || left_table.without_rowid
++        || !name.name.eq_ignore_ascii_case(&left_table.name)
++        || alias.as_deref() != left_alias
++        || resolve_outer_equality_seek(
++            where_clause.as_deref(),
++            left_table,
++            left_alias,
++            Some((right_table, right_alias)),
++            None,
++        )
++        .is_some()
++    {
++        return None;
++    }
++    // Keep the existing selective swapped plan ahead of an ordered full
++    // scan. In particular, a numeric-to-typeless INNER join can drive from
++    // a single right-side row instead of building its numeric-text map and
++    // filtering the entire ordered left source.
++    if !columns.iter().any(|column| matches!(column, ResultColumn::Star))
++        && resolve_outer_equality_seek(
++            where_clause.as_deref(),
++            right_table,
++            right_alias,
++            Some((left_table, left_alias)),
++            None,
++        )
++        .is_some()
++        && let [join] = from.joins.as_slice()
++        && let Some(fsqlite_ast::JoinConstraint::On(on_expr)) = &join.constraint
++        && let Some(plan) = resolve_single_join_lookup_plan(
++            left_table,
++            left_alias,
++            right_table,
++            right_alias,
++            join.join_type.kind,
++            Some(on_expr),
++        )
++        && swapped_join_lookup_plan_avoiding_text_walk(
++            &plan,
++            left_table,
++            left_alias,
++            right_table,
++            right_alias,
++            Some(on_expr),
++        )
++        .is_some()
++    {
++        return None;
++    }
++    let tables = [(left_table, left_alias), (right_table, right_alias)];
++    let out_col_count = resolve_join_output_count(columns, &tables);
++    let mut resolved_order = Vec::with_capacity(stmt.order_by.len());
++    let mut includes_rowid = false;
++    for term in &stmt.order_by {
++        // An ordinal wrapped in COLLATE resolves to its result slot too;
++        // do not discard the explicit comparator while proving index order.
++        if extract_collation(&term.expr).is_some() {
++            return None;
++        }
++        let expr = join_order_output_slot(&term.expr, columns, out_col_count, &tables)
++            .map_or_else(
++                || Some(term.expr.clone()),
++                |slot| join_output_slot_expr(slot, columns, &tables),
++            )?;
++        let Expr::Column(column, _) = &expr else {
++            return None;
++        };
++        match resolve_join_column_ref(column.table.as_deref(), &column.column, &tables).ok()? {
++            JoinColumnResolution::HiddenRowid(0) => includes_rowid = true,
++            JoinColumnResolution::Column(0, column) => {
++                includes_rowid |= left_table.columns[column].is_ipk;
++            }
++            _ => return None,
++        }
++        resolved_order.push(OrderingTerm {
++            expr,
++            direction: term.direction,
++            nulls: term.nulls,
++        });
++    }
++    if !matches!(index_hint, Some(fsqlite_ast::IndexHint::IndexedBy(_)))
++        && let Some(direction) =
++            resolve_order_by_rowid_direction(left_table, left_alias, &[], &resolved_order)
++    {
++        return Some(JoinOuterOrder::Rowid {
++            descending: direction == SortDirection::Desc,
++        });
++    }
++    // No equality-prefix elimination here: a join's WHERE can reference both
++    // tables. Walk a complete ordering index and retain the full predicate.
++    let plan = resolve_order_by_index_plan(
++        left_table,
++        left_alias,
++        &[],
++        None,
++        &resolved_order,
++        Distinctness::All,
++        index_hint.as_ref(),
++        &[],
++    )?;
++    // Preserve tie behavior at the LIMIT boundary. A nullable UNIQUE key
++    // does not prove a unique outer order because multiple NULLs are legal.
++    let unique_order = plan.index.is_unique
++        && resolved_order.len() >= plan.index.key_term_count()
++        && plan.index.columns.iter().all(|name| {
++            left_table.column_index(name).is_some_and(|column| {
++                left_table.columns[column].notnull || left_table.columns[column].is_ipk
++            })
++        });
++    (includes_rowid || unique_order).then_some(JoinOuterOrder::Index(plan))
++}
++
+ /// bd-8c68u: whether `codegen_join_select` seeks the outer table of `stmt`.
+ ///
+ /// True when the two-table join compiles to the single-join lookup whose
+@@ -13282,6 +13486,8 @@ fn outer_index_equality_seek<'a>(
+ enum OuterLoop {
+     /// Rewind/Next over the outer table.
+     Scan,
++    /// Last/Prev over a rowid-ordered outer table.
++    ReverseScan,
+     /// The one row a rowid seek found.
+     RowidSeek,
+     /// The equal-key run of an index; with `by_index_reg`, a run-time check
+@@ -13292,6 +13498,77 @@ enum OuterLoop {
+         idx_row: crate::Label,
+         idx_advance: crate::Label,
+     },
++    /// A complete ordering index, with a table lookup for each outer row.
++    OrderedIndex {
++        idx_cursor: i32,
++        descending: bool,
++        idx_row: crate::Label,
++        idx_advance: crate::Label,
++    },
++}
++
++fn emit_ordered_join_outer_loop_start(
++    b: &mut ProgramBuilder,
++    order: &JoinOuterOrder,
++    left_cursor: i32,
++    done: Label,
++) -> OuterLoop {
++    match order {
++        JoinOuterOrder::Rowid { descending } => {
++            b.emit_jump_to_label(
++                if *descending { Opcode::Last } else { Opcode::Rewind },
++                left_cursor,
++                0,
++                done,
++                P4::None,
++                0,
++            );
++            if *descending { OuterLoop::ReverseScan } else { OuterLoop::Scan }
++        }
++        JoinOuterOrder::Index(plan) => {
++            // This emitter only serves the two-table lookup join: table
++            // cursors are 0/1, the inner index is 2, the sorter is 3, and the
++            // optional numeric-text map is 4. Keep the outer index dense;
++            // an auxiliary cursor starts at 16384 and expands CursorSlots
++            // by thousands of empty entries for each tiny LIMIT query.
++            let idx_cursor = 5_i32;
++            b.emit_op(
++                Opcode::OpenRead,
++                idx_cursor,
++                plan.index.root_page,
++                0,
++                P4::Index(plan.index.name.clone()),
++                0,
++            );
++            b.emit_jump_to_label(
++                if plan.descending { Opcode::Last } else { Opcode::Rewind },
++                idx_cursor,
++                0,
++                done,
++                P4::None,
++                0,
++            );
++            let idx_row = b.emit_label();
++            let idx_advance = b.emit_label();
++            b.resolve_label(idx_row);
++            let rowid_reg = b.alloc_reg();
++            b.emit_op(Opcode::IdxRowid, idx_cursor, rowid_reg, 0, P4::None, 0);
++            b.emit_jump_to_label(
++                Opcode::SeekRowid,
++                left_cursor,
++                rowid_reg,
++                idx_advance,
++                P4::None,
++                0,
++            );
++            OuterLoop::OrderedIndex {
++                idx_cursor,
++                descending: plan.descending,
++                idx_row,
++                idx_advance,
++            }
++        }
++    }
+ }
+ 
+ /// Open the outer loop of a single-join lookup: position `left_cursor` on its
+@@ -13420,6 +13697,9 @@ fn emit_outer_loop_advance(
+         OuterLoop::Scan => {
+             b.emit_jump_to_label(Opcode::Next, left_cursor, 0, next_left, P4::None, 0);
+         }
++        OuterLoop::ReverseScan => {
++            b.emit_jump_to_label(Opcode::Prev, left_cursor, 0, next_left, P4::None, 0);
++        }
+         OuterLoop::RowidSeek => {}
+         OuterLoop::IndexSeek {
+             idx_cursor,
+@@ -13435,6 +13715,22 @@ fn emit_outer_loop_advance(
+             b.resolve_label(*idx_advance);
+             b.emit_jump_to_label(Opcode::Next, *idx_cursor, 0, *idx_row, P4::None, 0);
+         }
++        OuterLoop::OrderedIndex {
++            idx_cursor,
++            descending,
++            idx_row,
++            idx_advance,
++        } => {
++            b.resolve_label(*idx_advance);
++            b.emit_jump_to_label(
++                if *descending { Opcode::Prev } else { Opcode::Next },
++                *idx_cursor,
++                0,
++                *idx_row,
++                P4::None,
++                0,
++            );
++        }
+     }
+ }
+ 
+@@ -13523,7 +13819,10 @@ fn codegen_single_join_lookup_select(
+         None
+     };
+ 
+-    let sorter = if !stmt.order_by.is_empty() {
++    let outer_order = (aggregates.is_empty() && ctx.index_ordered_scan_reliable)
++        .then(|| resolve_join_outer_order(stmt, left_table, left_alias, right_table, right_alias))
++        .flatten();
++    let sorter = if !stmt.order_by.is_empty() && outer_order.is_none() {
+         let sort_cursor = if index_cursor.is_some() { 3_i32 } else { 2_i32 };
+         let sort_key_count = stmt.order_by.len();
+         let total_sort_cols = sort_key_count + out_col_count;
+@@ -13637,15 +13936,19 @@ fn codegen_single_join_lookup_select(
+         Some((right_table, right_alias)),
+         None,
+     );
+-    let outer_loop = emit_outer_loop_start(
+-        b,
+-        outer_seek.as_ref(),
+-        left_cursor,
+-        next_left_label,
+-        done_label,
+-        &tables,
+-        ctx,
+-    )?;
++    let outer_loop = if let Some(order) = &outer_order {
++        emit_ordered_join_outer_loop_start(b, order, left_cursor, done_label)
++    } else {
++        emit_outer_loop_start(
++            b,
++            outer_seek.as_ref(),
++            left_cursor,
++            next_left_label,
++            done_label,
++            &tables,
++            ctx,
++        )?
++    };
+     b.resolve_label(next_left_label);
+     let left_join_match_reg = if matches!(plan.join_kind, fsqlite_ast::JoinKind::Left) {
+         let reg = b.alloc_temp();
+@@ -13956,7 +14259,9 @@ fn codegen_single_join_lookup_select(
+ 
+     emit_outer_loop_advance(b, &outer_loop, left_cursor, next_left_label, done_label);
+     b.resolve_label(done_label);
+-    if let OuterLoop::IndexSeek { idx_cursor, .. } = outer_loop {
++    if let OuterLoop::IndexSeek { idx_cursor, .. }
++        | OuterLoop::OrderedIndex { idx_cursor, .. } = outer_loop
++    {
+         b.emit_op(Opcode::Close, idx_cursor, 0, 0, P4::None, 0);
+     }
+ 
+@@ -14622,6 +14927,15 @@ fn codegen_join_select(
+     {
+         // `*` lists columns in cursor order, so it keeps the written order.
+         if !columns.iter().any(|column| matches!(column, ResultColumn::Star))
++            && !(ctx.index_ordered_scan_reliable
++                && resolve_join_outer_order(
++                    stmt,
++                    left_table,
++                    left_alias,
++                    right_table,
++                    right_alias.as_deref(),
++                )
++                .is_some())
+             && let Some(swapped) = swapped_join_lookup_plan_avoiding_text_walk(
+                 &plan,
+                 left_table,
+@@ -18304,6 +18618,80 @@ fn aggregate_index_eq_seek_target<'t, 'e>(
+     None
+ }
+ 
++/// An equality-prefix row source. A probe may cover only part of WHERE;
++/// consumers must evaluate the original predicate when `has_residual` is true.
++struct IndexEqualityPrefix<'t, 'e> {
++    index: &'t IndexSchema,
++    /// Probe expressions in index order. Multi-term predicates must have
++    /// canonical parameter slots before their expressions can be reordered.
++    values: Vec<&'e Expr>,
++    has_residual: bool,
++}
++
++fn index_equality_prefix_target<'t, 'e>(
++    where_clause: Option<&'e Expr>,
++    table: &'t TableSchema,
++    table_alias: Option<&str>,
++) -> Option<IndexEqualityPrefix<'t, 'e>> {
++    if table.without_rowid {
++        return None;
++    }
++    let where_expr = where_clause?;
++    let mut conjuncts = Vec::new();
++    collect_conjunctive_terms(where_expr, &mut conjuncts);
++    let mut best: Option<IndexEqualityPrefix<'t, 'e>> = None;
++    for index in &table.indexes {
++        if index.key_term_descending(0) || !index.supports_direct_column_lookup() {
++            continue;
++        }
++        let mut values = Vec::new();
++        let mut consumed = Vec::new();
++        for (key_pos, column) in index.columns.iter().enumerate() {
++            let Some((term_pos, value)) =
++                conjuncts.iter().enumerate().find_map(|(term_pos, term)| {
++                    let value =
++                        extract_index_column_equality_expr(term, table, table_alias, column)?;
++                    index_equality_term_uses_key_collation(
++                        term, table, table_alias, index, key_pos,
++                    )
++                    .then_some((term_pos, value))
++                })
++            else {
++                break;
++            };
++            values.push(value);
++            if !consumed.contains(&term_pos) {
++                consumed.push(term_pos);
++            }
++        }
++        if values.is_empty() {
++            continue;
++        }
++        // The connection canonicalizes both named and anonymous placeholders
++        // to numbered slots. Direct codegen callers can pass raw ASTs; keep
++        // their existing scan when prefix emission could reorder or duplicate
++        // an emission-order placeholder relative to the full WHERE.
++        if (conjuncts.len() > 1 || values.len() > 1)
++            && expr_contains_non_numbered_placeholder(where_expr)
++        {
++            continue;
++        }
++        // Repeated index columns can consume one term several times, whereas
++        // contradictory equalities on one column leave a real residual.
++        let has_residual = consumed.len() < conjuncts.len();
++        if best.as_ref().is_none_or(|previous| {
++            (!has_residual, values.len()) > (!previous.has_residual, previous.values.len())
++        }) {
++            best = Some(IndexEqualityPrefix {
++                index,
++                values,
++                has_residual,
++            });
++        }
++    }
++    best
++}
++
+ /// The index and distinct integer values a `WHERE <col> IN (<int list>)` aggregate can
+ /// seek per value instead of full-scanning.
+ ///
+@@ -22979,14 +23367,8 @@ fn codegen_select_group_by_aggregate(
+     // WHERE. Feed the existing grouping sorter from equality-prefix and
+     // bind-time IN seeks instead of unrelated table rows (GH#531).
+     let index_eq_seek = allow_index_seek
+-        .then(|| aggregate_index_eq_seek_target(where_clause, table, table_alias))
+-        .flatten()
+-        // Prefix keys are emitted in index order. Multiple anonymous binds
+-        // must retain SQL order; numbered/named binds are independent of it.
+-        .filter(|(_, prefix)| {
+-            prefix.len() == 1
+-                || where_clause.is_none_or(|expr| count_anon_placeholders(expr) == 0)
+-        });
++        .then(|| index_equality_prefix_target(where_clause, table, table_alias))
++        .flatten();
+     let index_in_seek = if allow_index_seek && !table.without_rowid && index_eq_seek.is_none() {
+         index_const_in_list_residual_target(where_clause, table, table_alias)
+     } else {
+@@ -22995,9 +23377,9 @@ fn codegen_select_group_by_aggregate(
+     // The reported COUNT(*) shape needs only the grouping keys from each
+     // index entry. Omit the table cursor only when the row source enforces
+     // the complete WHERE and every payload value is stored in the index.
+-    // Multiple equality terms deliberately retain the residual check: a
+-    // repeated index key can otherwise make prefix length look like complete
+-    // predicate coverage. Richer aggregates keep the ordinary table reader.
++    // Equality-prefix coverage counts distinct WHERE conjuncts, so repeated
++    // index keys cannot hide a residual. Richer aggregates keep the ordinary
++    // table reader.
+     let covering_count_index = if num_nongrouped == 0
+         && agg_columns.iter().all(|agg| {
+             agg.name.eq_ignore_ascii_case("count")
+@@ -23014,8 +23396,8 @@ fn codegen_select_group_by_aggregate(
+         })
+     {
+         index_eq_seek.as_ref()
+-            .filter(|(_, prefix)| prefix.len() == 1)
+-            .map(|(index, _)| *index)
++            .filter(|target| !target.has_residual)
++            .map(|target| target.index)
+             .or_else(|| index_in_seek.as_ref()
+                 .filter(|target| !target.has_residual)
+                 .map(|target| target.index))
+@@ -23230,17 +23612,18 @@ fn codegen_select_group_by_aggregate(
+             }
+             b.emit_jump_to_label(Opcode::Gosub, return_reg, 0, input_row, P4::None, 0);
+         };
+-        if let Some((index, prefix)) = index_eq_seek {
++        if let Some(target) = index_eq_seek {
++            let index = target.index;
+             b.emit_op(
+                 Opcode::OpenRead, idx_cursor, index.root_page, 0,
+                 P4::Index(index.name.clone()), 0,
+             );
+-            let prefix_len = i32::try_from(prefix.len()).map_err(|_| {
++            let prefix_len = i32::try_from(target.values.len()).map_err(|_| {
+                 CodegenError::Unsupported("index equality prefix too wide".to_owned())
+             })?;
+             let keys = b.alloc_regs(prefix_len);
+             b.set_next_anon_placeholder(where_placeholder_base);
+-            for (offset, expr) in prefix.iter().enumerate() {
++            for (offset, expr) in target.values.iter().enumerate() {
+                 let key = keys + i32::try_from(offset).expect("prefix width checked");
+                 emit_expr(b, expr, key, None);
+                 if let Some(affinity) = index.columns.get(offset)
+diff --git a/crates/fsqlite-vdbe/tests/golden_bytecode_snapshots.rs b/crates/fsqlite-vdbe/tests/golden_bytecode_snapshots.rs
+index 62622bd..c1fab43 100644
+--- a/crates/fsqlite-vdbe/tests/golden_bytecode_snapshots.rs
++++ b/crates/fsqlite-vdbe/tests/golden_bytecode_snapshots.rs
+@@ -116,6 +116,212 @@ fn snapshot_schema() -> Vec<TableSchema> {
+     ]
+ }
+ 
++/// GH#531: ordering an indexed lookup join must preserve the outer index
++/// walk and place LIMIT on the joined output, without a full-result sorter.
++#[test]
++fn ordered_lookup_join_uses_outer_index_and_joined_row_limit() {
++    use fsqlite_ast::SortDirection;
++    use fsqlite_types::opcode::{Opcode, P4};
++
++    let mut schema = snapshot_schema();
++    let mut ordered = index("docs_score_id", 14, &["score", "id"], false);
++    ordered.key_sort_directions = vec![SortDirection::Desc, SortDirection::Desc];
++    schema[0].indexes.push(ordered);
++    for (projection, ordering, reverse) in [
++        ("d.id,c.name", "d.score DESC,d.id DESC", false),
++        ("d.id,c.name", "d.score ASC,d.id ASC", true),
++        (
++            "d.score AS id,d.id AS score,c.name",
++            "id DESC,score DESC",
++            false,
++        ),
++        ("d.*,c.name", "5 DESC,1 DESC", false),
++    ] {
++        for join in ["JOIN", "LEFT JOIN"] {
++            let sql = format!(
++                "SELECT {projection} FROM docs d {join} categories c ON c.id=d.category_id \
++                 WHERE d.id>1 ORDER BY {ordering} LIMIT ?1 OFFSET ?2"
++            );
++            let stmt = parse_select(&sql).unwrap();
++            assert!(fsqlite_vdbe::codegen::join_select_streams_order_by(
++                &stmt, &schema
++            ));
++            let mut builder = ProgramBuilder::new();
++            codegen_select(
++                &mut builder,
++                &stmt,
++                &schema,
++                &CodegenContext {
++                    index_ordered_scan_reliable: true,
++                    ..CodegenContext::default()
++                },
++            )
++            .unwrap();
++            let program = builder.finish().unwrap();
++            let ops = program.ops();
++            let index_cursor = ops
++                .iter()
++                .find_map(|op| {
++                    (op.opcode == Opcode::OpenRead
++                        && matches!(&op.p4, P4::Index(name) if name == "docs_score_id"))
++                    .then_some(op.p1)
++                })
++                .expect("outer ordering index");
++            assert!(
++                index_cursor <= 5,
++                "{sql}: outer index cursor {index_cursor} must not grow the dense cursor table"
++            );
++            for opcode in [
++                if reverse {
++                    Opcode::Last
++                } else {
++                    Opcode::Rewind
++                },
++                if reverse { Opcode::Prev } else { Opcode::Next },
++                Opcode::IdxRowid,
++            ] {
++                assert!(
++                    ops.iter()
++                        .any(|op| op.opcode == opcode && op.p1 == index_cursor),
++                    "{sql}"
++                );
++            }
++            assert!(
++                !ops.iter().any(|op| op.opcode == Opcode::SorterOpen),
++                "{sql}"
++            );
++            let output = ops
++                .iter()
++                .position(|op| op.opcode == Opcode::ResultRow)
++                .unwrap();
++            assert_eq!(ops[output + 1].opcode, Opcode::DecrJumpZero, "{sql}");
++            assert_eq!(program.max_bind_parameter_index().unwrap(), 2);
++        }
++    }
++}
++
++#[test]
++fn ordered_lookup_join_retains_sorter_when_order_is_not_proven() {
++    use fsqlite_ast::SortDirection;
++    use fsqlite_types::opcode::Opcode;
++
++    let mut schema = snapshot_schema();
++    let mut ordered = index("docs_score_id", 14, &["score", "id"], false);
++    ordered.key_sort_directions = vec![SortDirection::Desc, SortDirection::Desc];
++    schema[0].indexes.push(ordered);
++    for suffix in [
++        "ORDER BY d.score DESC",
++        "ORDER BY c.name,d.id DESC",
++        "ORDER BY d.score DESC NULLS FIRST,d.id DESC",
++        "ORDER BY d.score DESC,d.id ASC",
++    ] {
++        let stmt = parse_select(&format!(
++            "SELECT d.id,c.name FROM docs d JOIN categories c ON c.id=d.category_id \
++             {suffix} LIMIT ?1"
++        ))
++        .unwrap();
++        assert!(!fsqlite_vdbe::codegen::join_select_streams_order_by(
++            &stmt, &schema
++        ));
++        let mut builder = ProgramBuilder::new();
++        codegen_select(
++            &mut builder,
++            &stmt,
++            &schema,
++            &CodegenContext {
++                index_ordered_scan_reliable: true,
++                ..CodegenContext::default()
++            },
++        )
++        .unwrap();
++        let program = builder.finish().unwrap();
++        assert!(
++            program
++                .ops()
++                .iter()
++                .any(|op| op.opcode == Opcode::SorterOpen),
++            "{suffix}"
++        );
++    }
++
++    // Explicit COLLATE already uses the connection's fallback because the
++    // lookup-join compiler does not emit this expression. It must not be
++    // admitted to the ordered index path merely because the columns match.
++    let stmt = parse_select(
++        "SELECT d.id,c.name FROM docs d JOIN categories c ON c.id=d.category_id \
++         ORDER BY d.score COLLATE NOCASE DESC,d.id DESC LIMIT ?1",
++    )
++    .unwrap();
++    assert!(!fsqlite_vdbe::codegen::join_select_streams_order_by(
++        &stmt, &schema
++    ));
++    let mut builder = ProgramBuilder::new();
++    assert!(matches!(
++        codegen_select(
++            &mut builder,
++            &stmt,
++            &schema,
++            &CodegenContext {
++                index_ordered_scan_reliable: true,
++                ..CodegenContext::default()
++            },
++        ),
++        Err(fsqlite_vdbe::codegen::CodegenError::Unsupported(_))
++    ));
++}
++
++#[test]
++fn ordered_lookup_join_preserves_selective_swapped_outer_seek() {
++    use fsqlite_ast::SortDirection;
++    use fsqlite_types::opcode::{Opcode, P4};
++
++    let mut schema = snapshot_schema();
++    let mut ordered = index("docs_score_id", 14, &["score", "id"], false);
++    ordered.key_sort_directions = vec![SortDirection::Desc, SortDirection::Desc];
++    schema[0].indexes.push(ordered);
++    schema[1].columns.push(column("k", 'A', false));
++    schema[1]
++        .indexes
++        .push(index("categories_k", 15, &["k"], false));
++    let stmt = parse_select(
++        "SELECT d.id,c.name FROM docs d JOIN categories c ON c.k=d.category_id \
++         WHERE c.id=?1 ORDER BY d.score DESC,d.id DESC LIMIT ?2",
++    )
++    .unwrap();
++    // The typeless-to-numeric swapped lookup can seek one category directly;
++    // an available ordering index must not replace that with a full docs scan.
++    assert!(!fsqlite_vdbe::codegen::join_select_streams_order_by(
++        &stmt, &schema
++    ));
++    assert!(fsqlite_vdbe::codegen::join_select_seeks_outer_table(
++        &stmt, &schema
++    ));
++    let mut builder = ProgramBuilder::new();
++    codegen_select(
++        &mut builder,
++        &stmt,
++        &schema,
++        &CodegenContext {
++            index_ordered_scan_reliable: true,
++            ..CodegenContext::default()
++        },
++    )
++    .unwrap();
++    let program = builder.finish().unwrap();
++    let ops = program.ops();
++    assert!(ops.iter().any(|op| op.opcode == Opcode::OpenRead
++        && op.p1 == 0
++        && matches!(&op.p4, P4::Table(name) if name == "categories")));
++    assert!(
++        ops.iter()
++            .any(|op| op.opcode == Opcode::SeekRowid && op.p1 == 0)
++    );
++    assert!(!ops.iter().any(|op| op.opcode == Opcode::OpenRead
++        && matches!(&op.p4, P4::Index(name) if name == "docs_score_id")));
++    assert!(!ops.iter().any(|op| op.opcode == Opcode::OpenAutoindex));
++    assert!(ops.iter().any(|op| op.opcode == Opcode::SorterOpen));
++}
++
+ fn render_bytecode_case(name: &str, sql: &str) -> Result<String, String> {
+     let select = parse_select(sql)?;
+     let schema = snapshot_schema();
+diff --git a/crates/fsqlite-vdbe/tests/issue_531_grouped_index_input.rs b/crates/fsqlite-vdbe/tests/issue_531_grouped_index_input.rs
+index 23d3924..e09304b 100644
+--- a/crates/fsqlite-vdbe/tests/issue_531_grouped_index_input.rs
++++ b/crates/fsqlite-vdbe/tests/issue_531_grouped_index_input.rs
+@@ -347,10 +347,79 @@ fn numbered_binds_keep_slots_in_aggregate_having_and_limit() {
+ }
+ 
+ #[test]
+-fn composite_anonymous_equalities_decline_reordered_prefix_binding() {
++fn composite_numbered_equalities_preserve_reordered_prefix_binding() {
+     let schema = schema('D', &["post_id", "n"]);
+-    let sql = "SELECT post_id, count(*) FROM likes WHERE n = ? AND post_id = ? GROUP BY post_id";
++    let sql = "SELECT post_id, count(*) FROM likes WHERE n = ?1 AND post_id = ?2 GROUP BY post_id";
+     let program = compile(sql, &schema);
+-    assert_table_scan(&program, sql);
++    assert_indexed_input(&program, sql, true);
+     assert_eq!(bind_slots(&program), BTreeSet::from([1, 2]));
++    let probe_slots: Vec<_> = program
++        .ops()
++        .iter()
++        .filter_map(|op| (op.opcode == Opcode::Variable).then_some(op.p1))
++        .collect();
++    assert_eq!(
++        probe_slots,
++        [2, 1],
++        "index order is post_id,n; source bind order is n,post_id"
++    );
++}
++
++#[test]
++fn equality_prefix_with_residual_retains_filter_and_original_bind_slots() {
++    let schema = schema('D', &["post_id"]);
++    for sql in [
++        "SELECT post_id, count(*) FROM likes WHERE n > ?1 AND post_id = ?2 AND id > ?3 GROUP BY post_id",
++        "SELECT post_id, count(*) FROM likes WHERE n > ?1 AND ?2 = post_id AND id > ?3 GROUP BY post_id",
++    ] {
++        let program = compile(sql, &schema);
++        assert_indexed_input(&program, sql, false);
++        let slots: Vec<_> = program
++            .ops()
++            .iter()
++            .filter_map(|op| (op.opcode == Opcode::Variable).then_some(op.p1))
++            .collect();
++        assert_eq!(
++            slots,
++            [1, 2, 3, 2],
++            "the full WHERE keeps its binds and the index reuses the key's original slot: {sql}"
++        );
++    }
++}
++
++#[test]
++fn raw_placeholders_decline_reordered_or_repeated_prefix_emission() {
++    let schema = schema('D', &["post_id", "n"]);
++    for sql in [
++        "SELECT post_id,count(*) FROM likes WHERE n=? AND post_id=? GROUP BY post_id",
++        "SELECT post_id,count(*) FROM likes WHERE n=:n AND post_id=:post GROUP BY post_id",
++        "SELECT post_id,count(*) FROM likes WHERE n>:n AND post_id=:post GROUP BY post_id",
++    ] {
++        assert_table_scan(&compile(sql, &schema), sql);
++    }
++}
++
++#[test]
++fn equality_prefix_does_not_drop_duplicate_or_disjunctive_residuals() {
++    let schema = schema('D', &["post_id"]);
++    for sql in [
++        "SELECT post_id,count(*) FROM likes WHERE post_id=?1 AND post_id=?2 GROUP BY post_id",
++        "SELECT post_id,count(*) FROM likes WHERE post_id=?1 AND (n=?2 OR n=?3) GROUP BY post_id",
++    ] {
++        let program = compile(sql, &schema);
++        assert_indexed_input(&program, sql, false);
++    }
++    let sql = "SELECT post_id,count(*) FROM likes WHERE post_id=?1 OR n=?2 GROUP BY post_id";
++    assert_table_scan(&compile(sql, &schema), sql);
++}
++
++#[test]
++fn equality_prefix_residual_keeps_collation_and_index_hint_guards() {
++    let schema = schema('B', &["post_id"]);
++    for sql in [
++        "SELECT post_id,count(*) FROM likes WHERE post_id='a' COLLATE NOCASE AND n>0 GROUP BY post_id",
++        "SELECT post_id,count(*) FROM likes NOT INDEXED WHERE post_id=?1 AND n>?2 GROUP BY post_id",
++    ] {
++        assert_table_scan(&compile(sql, &schema), sql);
++    }
+ }
