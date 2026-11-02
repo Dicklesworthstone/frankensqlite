@@ -1,0 +1,41 @@
+{
+  "schema": "issue531-preservation-snapshot-v1",
+  "created_utc": "2026-11-02T00:09:29.881150+00:00",
+  "source_base_revision": "bd569509d80427e11fb40d3654b70015a929c8d5",
+  "clean_baseline_revision": "770a812db0d494c46d900c5e5601768599d1bb34",
+  "source_status": "modified working-tree source; engine and prepared benchmark preserved as unapplied patches",
+  "candidate_compiled": false,
+  "candidate_sql_executed": false,
+  "performance_qualified": false,
+  "source_sha256": {
+    "Cargo.lock": "828b244f97320a944275e708eb28be1032debad72acbb649f10dc03327cca502",
+    "crates/fsqlite-core/src/connection.rs": "f64ba100fe6cfef4f7d63d3c9d2f38e822aa759172c5dcf8485bbbb92a76c4ca",
+    "crates/fsqlite-core/src/explain.rs": "5572dbdf84ca67a32dfbb01c5fb361c3788c0d05c6eed762de18a30db7ebf880",
+    "crates/fsqlite-core/tests/bd_9gl3w_join_limit.rs": "e3b3b740869001374ec9b87b98ca4b91944e7b7914ae7c00875c22cedc23ca3f",
+    "crates/fsqlite-core/tests/bd_group_by_depth_oracle_probe.rs": "185a946d09ab4daa67f0a5bbf437f075da9c9cbcec22e0e96c3c32aa7128438f",
+    "crates/fsqlite-core/tests/gh432_correlated_exists_index_probe.rs": "b03697888b60b85fc960fb1744a168160bed4f4cdfa5763d4594e85e9bb2559c",
+    "crates/fsqlite-vdbe/src/codegen.rs": "6839742304d1a7614d0195f9474a8c7c27e338534a682533ae9ac13ed1e348a8",
+    "crates/fsqlite-core/benches/prepared_cache_hot_paths.rs": "455dbe4c046af07e398c50e8a3528754fb2fe7c529d61395247ad40989ca5552"
+  },
+  "patch_sha256": {
+    "unqualified-engine-candidate.patch": "9a86244589da2f9af732a55327c2ac1021e0c30a00f87eec6cda72b137267d81",
+    "unqualified-prepared-benchmark.patch": "f9b7546ab17241ea97e6f9d21b72c07b313454acf6f4036d45104df641a6bb57"
+  },
+  "platform": "Linux-6.18.57-x86_64-with-glibc2.39",
+  "memory_limit_bytes": 8589934592,
+  "memory_current_bytes": 8589926400,
+  "disk_free_bytes": 11603345408,
+  "native_attempt_metadata": [
+    "native/candidate-tests-initial.json",
+    "native/candidate-vdbe-grouped.json",
+    "native/candidate-workspace-check.json",
+    "native/candidate-workspace-check-serial.json",
+    "native/candidate-vdbe-check-serial.json"
+  ],
+  "format_metadata": "native/candidate-fmt-final.json",
+  "protocol_tests_passed": 30,
+  "stock_only_bound_query_matches": {
+    "cli": 17,
+    "four-per-post": 17
+  }
+}

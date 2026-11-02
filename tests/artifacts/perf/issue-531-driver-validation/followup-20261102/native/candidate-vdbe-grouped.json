@@ -1,0 +1,29 @@
+{
+  "command": [
+    "cargo",
+    "test",
+    "--locked",
+    "-p",
+    "fsqlite-vdbe",
+    "--lib",
+    "codegen::tests::bd_2dgf5"
+  ],
+  "cwd": "/workspace/scratch/d1d8a2247ef3/frankensqlite",
+  "started_utc": "2026-11-01T23:41:46.518163+00:00",
+  "environment": {
+    "CARGO_HOME": "/workspace/scratch/d1d8a2247ef3/cargo-home",
+    "CARGO_TARGET_DIR": "/workspace/scratch/d1d8a2247ef3/target-531",
+    "CARGO_BUILD_JOBS": "1",
+    "CARGO_INCREMENTAL": "0",
+    "CARGO_PROFILE_DEV_DEBUG": "0",
+    "CARGO_PROFILE_TEST_DEBUG": "0",
+    "RUSTFLAGS": null,
+    "RUST_MIN_STACK": null
+  },
+  "lock_sha256": "828b244f97320a944275e708eb28be1032debad72acbb649f10dc03327cca502",
+  "cgroup_memory_limit": "8589934592",
+  "exit_code": 101,
+  "elapsed_seconds": 108.99396111499982,
+  "child_max_rss_kib": 2973196,
+  "cgroup_memory_events": "low 0\nhigh 0\nmax 1928574\noom 80\noom_kill 4\noom_group_kill 0\n"
+}

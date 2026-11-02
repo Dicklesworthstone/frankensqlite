@@ -1,0 +1,320 @@
+{
+  "purpose": "Read-only stock syntax and bound-vs-literal result check; no performance qualification",
+  "command": [
+    "/workspace/scratch/d1d8a2247ef3/qualification/sqlite-3.53.2/sqlite3",
+    "-readonly",
+    "-batch",
+    "-init",
+    "/dev/null",
+    "file:/workspace/scratch/d1d8a2247ef3/qualification/fixture-cli-full/seed.db?mode=ro&immutable=1"
+  ],
+  "source_seed_sha256": "4aa75af6088ce8d0bf2a0be3224f2fb3b21be67591a33d8b855d551a21a1c6a5",
+  "utc": "2026-11-01T23:53:15.052838+00:00",
+  "timeout_seconds": 10,
+  "elapsed_seconds": 0.2331890549999116,
+  "returncode": 0,
+  "status": "passed",
+  "cases": [
+    {
+      "name": "group_eq",
+      "ordered": false,
+      "rows": 1,
+      "matches_literal_reference": true,
+      "bound_rows": [
+        "400000,1"
+      ],
+      "literal_reference_sql": "SELECT post_id, count(*) FROM likes WHERE post_id = 400000 GROUP BY post_id;"
+    },
+    {
+      "name": "group_in20",
+      "ordered": false,
+      "rows": 20,
+      "matches_literal_reference": true,
+      "bound_rows": [
+        "23809,1",
+        "47619,1",
+        "71428,1",
+        "95238,1",
+        "119047,1",
+        "142857,1",
+        "166666,1",
+        "190476,1",
+        "214285,1",
+        "238095,1",
+        "261904,1",
+        "285714,1",
+        "309523,1",
+        "333333,1",
+        "357142,1",
+        "380952,1",
+        "404761,1",
+        "428571,1",
+        "452380,1",
+        "476190,1"
+      ],
+      "literal_reference_sql": "SELECT post_id, count(*) FROM likes WHERE post_id IN (23809,47619,71428,95238,119047,142857,166666,190476,214285,238095,261904,285714,309523,333333,357142,380952,404761,428571,452380,476190) GROUP BY post_id;"
+    },
+    {
+      "name": "count_eq_control",
+      "ordered": false,
+      "rows": 1,
+      "matches_literal_reference": true,
+      "bound_rows": [
+        "1"
+      ],
+      "literal_reference_sql": "SELECT count(*) FROM likes WHERE post_id = 400000;"
+    },
+    {
+      "name": "in20_control",
+      "ordered": false,
+      "rows": 20,
+      "matches_literal_reference": true,
+      "bound_rows": [
+        "23809",
+        "47619",
+        "71428",
+        "95238",
+        "119047",
+        "142857",
+        "166666",
+        "190476",
+        "214285",
+        "238095",
+        "261904",
+        "285714",
+        "309523",
+        "333333",
+        "357142",
+        "380952",
+        "404761",
+        "428571",
+        "452380",
+        "476190"
+      ],
+      "literal_reference_sql": "SELECT post_id FROM likes WHERE post_id IN (23809,47619,71428,95238,119047,142857,166666,190476,214285,238095,261904,285714,309523,333333,357142,380952,404761,428571,452380,476190);"
+    },
+    {
+      "name": "newest20_control",
+      "ordered": true,
+      "rows": 20,
+      "matches_literal_reference": true,
+      "bound_rows": [
+        "482999",
+        "461999",
+        "440999",
+        "419999",
+        "398999",
+        "377999",
+        "356999",
+        "335999",
+        "314999",
+        "293999",
+        "272999",
+        "251999",
+        "230999",
+        "209999",
+        "188999",
+        "167999",
+        "146999",
+        "125999",
+        "104999",
+        "83999"
+      ],
+      "literal_reference_sql": "SELECT p.id FROM posts p ORDER BY p.created_at DESC, p.id DESC LIMIT 20;"
+    },
+    {
+      "name": "join_newest20",
+      "ordered": true,
+      "rows": 20,
+      "matches_literal_reference": true,
+      "bound_rows": [
+        "482999,'user44730'",
+        "461999,'user3730'",
+        "440999,'user12730'",
+        "419999,'user21730'",
+        "398999,'user30730'",
+        "377999,'user39730'",
+        "356999,'user48730'",
+        "335999,'user7730'",
+        "314999,'user16730'",
+        "293999,'user25730'",
+        "272999,'user34730'",
+        "251999,'user43730'",
+        "230999,'user2730'",
+        "209999,'user11730'",
+        "188999,'user20730'",
+        "167999,'user29730'",
+        "146999,'user38730'",
+        "125999,'user47730'",
+        "104999,'user6730'",
+        "83999,'user15730'"
+      ],
+      "literal_reference_sql": "SELECT p.id, u.username FROM posts p JOIN users u ON u.id = p.user_id ORDER BY p.created_at DESC, p.id DESC LIMIT 20;"
+    },
+    {
+      "name": "newest20_count_wrapper",
+      "ordered": false,
+      "rows": 1,
+      "matches_literal_reference": true,
+      "bound_rows": [
+        "20"
+      ],
+      "literal_reference_sql": "SELECT count(*) FROM (SELECT p.id FROM posts p ORDER BY p.created_at DESC, p.id DESC LIMIT 20);"
+    },
+    {
+      "name": "join_newest20_count_wrapper",
+      "ordered": false,
+      "rows": 1,
+      "matches_literal_reference": true,
+      "bound_rows": [
+        "20"
+      ],
+      "literal_reference_sql": "SELECT count(*) FROM (SELECT p.id, u.username FROM posts p JOIN users u ON u.id = p.user_id ORDER BY p.created_at DESC, p.id DESC LIMIT 20);"
+    },
+    {
+      "name": "correlated_newest20",
+      "ordered": true,
+      "rows": 20,
+      "matches_literal_reference": true,
+      "bound_rows": [
+        "482999,1",
+        "461999,1",
+        "440999,1",
+        "419999,1",
+        "398999,1",
+        "377999,1",
+        "356999,1",
+        "335999,1",
+        "314999,1",
+        "293999,1",
+        "272999,1",
+        "251999,1",
+        "230999,1",
+        "209999,1",
+        "188999,1",
+        "167999,1",
+        "146999,1",
+        "125999,1",
+        "104999,1",
+        "83999,1"
+      ],
+      "literal_reference_sql": "SELECT p.id, (SELECT count(*) FROM likes l WHERE l.post_id = p.id) FROM posts p ORDER BY p.created_at DESC, p.id DESC LIMIT 20;"
+    },
+    {
+      "name": "join_by_id_control",
+      "ordered": false,
+      "rows": 1,
+      "matches_literal_reference": true,
+      "bound_rows": [
+        "400000,'post body 400000','2025-05-21T16:40:22.000Z','user1'"
+      ],
+      "literal_reference_sql": "SELECT p.id, p.body, p.created_at, u.username FROM posts p JOIN users u ON u.id = p.user_id WHERE p.id = 400000;"
+    },
+    {
+      "name": "correlated_by_id_control",
+      "ordered": false,
+      "rows": 1,
+      "matches_literal_reference": true,
+      "bound_rows": [
+        "400000,1"
+      ],
+      "literal_reference_sql": "SELECT p.id, (SELECT count(*) FROM likes l WHERE l.post_id = p.id) FROM posts p WHERE p.id = 400000;"
+    },
+    {
+      "name": "join_correlated_by_id",
+      "ordered": false,
+      "rows": 1,
+      "matches_literal_reference": true,
+      "bound_rows": [
+        "400000,'post body 400000','2025-05-21T16:40:22.000Z','user1',1"
+      ],
+      "literal_reference_sql": "SELECT p.id, p.body, p.created_at, u.username, (SELECT count(*) FROM likes l WHERE l.post_id = p.id) AS like_count FROM posts p JOIN users u ON u.id = p.user_id WHERE p.id = 400000;"
+    },
+    {
+      "name": "join_correlated_newest20",
+      "ordered": true,
+      "rows": 20,
+      "matches_literal_reference": true,
+      "bound_rows": [
+        "482999,'post body 482999','2025-12-28T23:59:59.999Z','user44730',1",
+        "461999,'post body 461999','2025-12-28T23:59:59.999Z','user3730',1",
+        "440999,'post body 440999','2025-12-28T23:59:59.999Z','user12730',1",
+        "419999,'post body 419999','2025-12-28T23:59:59.999Z','user21730',1",
+        "398999,'post body 398999','2025-12-28T23:59:59.999Z','user30730',1",
+        "377999,'post body 377999','2025-12-28T23:59:59.999Z','user39730',1",
+        "356999,'post body 356999','2025-12-28T23:59:59.999Z','user48730',1",
+        "335999,'post body 335999','2025-12-28T23:59:59.999Z','user7730',1",
+        "314999,'post body 314999','2025-12-28T23:59:59.999Z','user16730',1",
+        "293999,'post body 293999','2025-12-28T23:59:59.999Z','user25730',1",
+        "272999,'post body 272999','2025-12-28T23:59:59.999Z','user34730',1",
+        "251999,'post body 251999','2025-12-28T23:59:59.999Z','user43730',1",
+        "230999,'post body 230999','2025-12-28T23:59:59.999Z','user2730',1",
+        "209999,'post body 209999','2025-12-28T23:59:59.999Z','user11730',1",
+        "188999,'post body 188999','2025-12-28T23:59:59.999Z','user20730',1",
+        "167999,'post body 167999','2025-12-28T23:59:59.999Z','user29730',1",
+        "146999,'post body 146999','2025-12-28T23:59:59.999Z','user38730',1",
+        "125999,'post body 125999','2025-12-28T23:59:59.999Z','user47730',1",
+        "104999,'post body 104999','2025-12-28T23:59:59.999Z','user6730',1",
+        "83999,'post body 83999','2025-12-28T23:59:59.999Z','user15730',1"
+      ],
+      "literal_reference_sql": "SELECT p.id, p.body, p.created_at, u.username, (SELECT count(*) FROM likes l WHERE l.post_id = p.id) AS like_count FROM posts p JOIN users u ON u.id = p.user_id ORDER BY p.created_at DESC, p.id DESC LIMIT 20;"
+    },
+    {
+      "name": "join_filtered_offset_control",
+      "ordered": true,
+      "rows": 20,
+      "matches_literal_reference": true,
+      "bound_rows": [
+        "335999,'user7730'",
+        "314999,'user16730'",
+        "293999,'user25730'",
+        "272999,'user34730'",
+        "251999,'user43730'",
+        "230999,'user2730'",
+        "209999,'user11730'",
+        "188999,'user20730'",
+        "167999,'user29730'",
+        "146999,'user38730'",
+        "125999,'user47730'",
+        "104999,'user6730'",
+        "83999,'user15730'",
+        "62999,'user24730'",
+        "41999,'user33730'",
+        "20999,'user42730'",
+        "498959,'user49890'",
+        "477959,'user8890'",
+        "456959,'user17890'",
+        "435959,'user26890'"
+      ],
+      "literal_reference_sql": "SELECT p.id, u.username FROM posts p JOIN users u ON u.id = p.user_id WHERE u.id % 2 = 0 ORDER BY p.created_at DESC, p.id DESC LIMIT 20 OFFSET 7;"
+    },
+    {
+      "name": "group_eq_residual_user_id",
+      "ordered": false,
+      "rows": 1,
+      "matches_literal_reference": true,
+      "bound_rows": [
+        "400000,1"
+      ],
+      "literal_reference_sql": "SELECT post_id, count(*) FROM likes WHERE post_id = 400000 AND user_id > 0 GROUP BY post_id;"
+    },
+    {
+      "name": "group_eq_alternate_bind_control",
+      "ordered": false,
+      "rows": 1,
+      "matches_literal_reference": true,
+      "bound_rows": [
+        "400001,1"
+      ],
+      "literal_reference_sql": "SELECT post_id, count(*) FROM likes WHERE post_id = 400001 GROUP BY post_id;"
+    },
+    {
+      "name": "group_eq_null_bind_control",
+      "ordered": false,
+      "rows": 0,
+      "matches_literal_reference": true,
+      "bound_rows": [],
+      "literal_reference_sql": "SELECT post_id, count(*) FROM likes WHERE post_id = NULL GROUP BY post_id;"
+    }
+  ]
+}

@@ -1,0 +1,142 @@
+{
+  "schema": "issue531-prepared-jobs-v1",
+  "status": "jobs_ready_build_provenance_pending",
+  "fixture": {
+    "fixture": "issue-531-cli",
+    "users": 50000,
+    "posts": 500000,
+    "likes_attempted": 2000000,
+    "likes_distinct": 500000,
+    "seed_sha256": "4aa75af6088ce8d0bf2a0be3224f2fb3b21be67591a33d8b855d551a21a1c6a5",
+    "command": [
+      "/workspace/scratch/d1d8a2247ef3/qualification/sqlite-3.53.2/sqlite3",
+      "/workspace/scratch/d1d8a2247ef3/qualification/fixture-cli-full/seed.db"
+    ],
+    "elapsed_seconds": 62.07026079599973,
+    "verification": "50000|500000|500000\nok\n",
+    "label": "Full-scale issue #531 CLI recipe: 50,000 users / 500,000 posts / 500,000 distinct likes from 2,000,000 attempted inserts",
+    "likes_mode": "cli",
+    "source": "scripts/benchmark_issue_531.py::fixture_sql",
+    "source_sha256": "fbdc0390b012d8b6da44666b60b858a183dbe4d5d08d426dab5d4941eea3042b",
+    "seed_bytes": 68055040,
+    "prepared_harness_data_claim": "This is the published CLI recipe, not the reporter's unattached prepared Rust-harness data."
+  },
+  "case_count": 17,
+  "source_driver_case_count": 14,
+  "case_annotations": [
+    {
+      "name": "group_eq",
+      "source_case": "group_eq",
+      "source_reported_shape": true,
+      "purpose": "Prepared-parameter equivalent of the repository CLI case."
+    },
+    {
+      "name": "group_in20",
+      "source_case": "group_in20",
+      "source_reported_shape": true,
+      "purpose": "Prepared-parameter equivalent of the repository CLI case."
+    },
+    {
+      "name": "count_eq_control",
+      "source_case": "count_eq_control",
+      "source_reported_shape": true,
+      "purpose": "Prepared-parameter equivalent of the repository CLI case."
+    },
+    {
+      "name": "in20_control",
+      "source_case": "in20_control",
+      "source_reported_shape": false,
+      "purpose": "Prepared-parameter equivalent of the repository CLI case."
+    },
+    {
+      "name": "newest20_control",
+      "source_case": "newest20_control",
+      "source_reported_shape": true,
+      "purpose": "Prepared-parameter equivalent of the repository CLI case."
+    },
+    {
+      "name": "join_newest20",
+      "source_case": "join_newest20",
+      "source_reported_shape": true,
+      "purpose": "Prepared-parameter equivalent of the repository CLI case."
+    },
+    {
+      "name": "newest20_count_wrapper",
+      "source_case": "newest20_count_wrapper",
+      "source_reported_shape": true,
+      "purpose": "Prepared-parameter equivalent of the repository CLI case."
+    },
+    {
+      "name": "join_newest20_count_wrapper",
+      "source_case": "join_newest20_count_wrapper",
+      "source_reported_shape": true,
+      "purpose": "Prepared-parameter equivalent of the repository CLI case."
+    },
+    {
+      "name": "correlated_newest20",
+      "source_case": "correlated_newest20",
+      "source_reported_shape": true,
+      "purpose": "Prepared-parameter equivalent of the repository CLI case."
+    },
+    {
+      "name": "join_by_id_control",
+      "source_case": "join_by_id_control",
+      "source_reported_shape": true,
+      "purpose": "Prepared-parameter equivalent of the repository CLI case."
+    },
+    {
+      "name": "correlated_by_id_control",
+      "source_case": "correlated_by_id_control",
+      "source_reported_shape": true,
+      "purpose": "Prepared-parameter equivalent of the repository CLI case."
+    },
+    {
+      "name": "join_correlated_by_id",
+      "source_case": "join_correlated_by_id",
+      "source_reported_shape": true,
+      "purpose": "Prepared-parameter equivalent of the repository CLI case."
+    },
+    {
+      "name": "join_correlated_newest20",
+      "source_case": "join_correlated_newest20",
+      "source_reported_shape": true,
+      "purpose": "Prepared-parameter equivalent of the repository CLI case."
+    },
+    {
+      "name": "join_filtered_offset_control",
+      "source_case": "join_filtered_offset_control",
+      "source_reported_shape": false,
+      "purpose": "Prepared-parameter equivalent of the repository CLI case."
+    },
+    {
+      "name": "group_eq_residual_user_id",
+      "source_case": null,
+      "source_reported_shape": false,
+      "purpose": "Additional indexed equality GROUP BY with a residual on user_id, absent from likes_post_id_idx; verifies noncovering residual filtering. The seeded user IDs are positive, so this case returns the point group."
+    },
+    {
+      "name": "group_eq_alternate_bind_control",
+      "source_case": "group_eq",
+      "source_reported_shape": false,
+      "purpose": "Same SQL as group_eq with a different binding, requested as a separate prepared handle later in the same connection. Detects prepare-cache parameter contamination; does not prove in-loop rebinding of one retained handle."
+    },
+    {
+      "name": "group_eq_null_bind_control",
+      "source_case": "group_eq",
+      "source_reported_shape": false,
+      "purpose": "Same SQL as group_eq with a different binding, requested as a separate prepared handle later in the same connection. Detects prepare-cache parameter contamination; does not prove in-loop rebinding of one retained handle."
+    }
+  ],
+  "trials": 5,
+  "trial_seconds": 2.0,
+  "read_transaction": false,
+  "read_transaction_alternative": "For explicit-read-transaction qualification, create another job with read_transaction=true and a fresh work_directory; label it separately. Never reuse an existing work directory.",
+  "rebinding_scope": "Two additional same-SQL cases use different binding values with separately requested prepared handles; the job runner retains one handle per case with fixed parameters during its own trials. No claim of per-iteration bind rotation.",
+  "stock_check": "stock-bound-query-check.json",
+  "stock_check_elapsed_seconds": 0.2331890549999116,
+  "jobs": [
+    "baseline-job.json",
+    "candidate-job.json"
+  ],
+  "launch_status": "Neither Rust benchmark nor Cargo was launched."
+}

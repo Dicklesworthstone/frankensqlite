@@ -1,0 +1,27 @@
+{
+  "command": [
+    "cargo",
+    "check",
+    "--locked",
+    "--workspace",
+    "--all-targets"
+  ],
+  "cwd": "/workspace/scratch/d1d8a2247ef3/frankensqlite",
+  "started_utc": "2026-11-01T23:45:55.425084+00:00",
+  "environment": {
+    "CARGO_HOME": "/workspace/scratch/d1d8a2247ef3/cargo-home",
+    "CARGO_TARGET_DIR": "/workspace/scratch/d1d8a2247ef3/target-531-serial",
+    "CARGO_BUILD_JOBS": "1",
+    "CARGO_INCREMENTAL": "0",
+    "CARGO_PROFILE_DEV_DEBUG": "0",
+    "CARGO_PROFILE_TEST_DEBUG": "0",
+    "RUSTFLAGS": "-Zunstable-options --jobs-frontend=1 --jobs-backend=1 -Zmir-opt-level=0 -Zmir-strip-debuginfo=all-locals",
+    "RUST_MIN_STACK": null
+  },
+  "lock_sha256": "828b244f97320a944275e708eb28be1032debad72acbb649f10dc03327cca502",
+  "cgroup_memory_limit": "8589934592",
+  "exit_code": 101,
+  "elapsed_seconds": 440.14731242900007,
+  "child_max_rss_kib": 3443536,
+  "cgroup_memory_events": "low 0\nhigh 0\nmax 6471020\noom 190\noom_kill 13\noom_group_kill 0\n"
+}

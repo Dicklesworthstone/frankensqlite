@@ -1,0 +1,20 @@
+In function ‘hash_step’,
+    inlined from ‘sha1QueryFunc’ at /workspace/scratch/d1d8a2247ef3/qualification/sqlite-3.53.2/sqlite-amalgamation-3530200/shell.c:5560:7:
+/workspace/scratch/d1d8a2247ef3/qualification/sqlite-3.53.2/sqlite-amalgamation-3530200/shell.c:5395:7: warning: ‘SHA1Transform’ reading 64 bytes from a region of size 1 [-Wstringop-overread]
+ 5395 |       SHA1Transform(p->state, &data[i]);
+      |       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/workspace/scratch/d1d8a2247ef3/qualification/sqlite-3.53.2/sqlite-amalgamation-3530200/shell.c:5395:7: note: referencing argument 2 of type ‘const unsigned char[64]’
+/workspace/scratch/d1d8a2247ef3/qualification/sqlite-3.53.2/sqlite-amalgamation-3530200/shell.c: In function ‘sha1QueryFunc’:
+/workspace/scratch/d1d8a2247ef3/qualification/sqlite-3.53.2/sqlite-amalgamation-3530200/shell.c:5301:13: note: in a call to function ‘SHA1Transform’
+ 5301 | static void SHA1Transform(unsigned int state[5], const unsigned char buffer[64]){
+      |             ^~~~~~~~~~~~~
+In function ‘hash_step’,
+    inlined from ‘sha1QueryFunc’ at /workspace/scratch/d1d8a2247ef3/qualification/sqlite-3.53.2/sqlite-amalgamation-3530200/shell.c:5564:13:
+/workspace/scratch/d1d8a2247ef3/qualification/sqlite-3.53.2/sqlite-amalgamation-3530200/shell.c:5395:7: warning: ‘SHA1Transform’ reading 64 bytes from a region of size 1 [-Wstringop-overread]
+ 5395 |       SHA1Transform(p->state, &data[i]);
+      |       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/workspace/scratch/d1d8a2247ef3/qualification/sqlite-3.53.2/sqlite-amalgamation-3530200/shell.c:5395:7: note: referencing argument 2 of type ‘const unsigned char[64]’
+/workspace/scratch/d1d8a2247ef3/qualification/sqlite-3.53.2/sqlite-amalgamation-3530200/shell.c: In function ‘sha1QueryFunc’:
+/workspace/scratch/d1d8a2247ef3/qualification/sqlite-3.53.2/sqlite-amalgamation-3530200/shell.c:5301:13: note: in a call to function ‘SHA1Transform’
+ 5301 | static void SHA1Transform(unsigned int state[5], const unsigned char buffer[64]){
+      |             ^~~~~~~~~~~~~

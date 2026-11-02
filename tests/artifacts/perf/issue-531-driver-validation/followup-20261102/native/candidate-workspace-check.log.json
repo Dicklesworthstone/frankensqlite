@@ -1,0 +1,5 @@
+{
+  "encoding": "utf-8",
+  "original_sha256": "5dc5273d7a266f0da5ccdf53c1f47b6b4eac3fe9aa8b102a0f0665c7261b25cd",
+  "combined_output": "error: failed to run `rustc` to learn about target-specific information\n\nCaused by:\n  process didn't exit successfully: `rustc - --crate-name ___ --print=file-names -Zunstable-options --jobs-frontend=1 --jobs-backend=1 -Zmir-opt-level=0 -Zmir-strip-debuginfo=all --crate-type bin --crate-type rlib --crate-type dylib --crate-type cdylib --crate-type staticlib --crate-type proc-macro --print=split-debuginfo --print=crate-name --print=cfg -Wwarnings` (exit status: 1)\n  --- stderr\n  error: incorrect value `all` for unstable option `mir-strip-debuginfo` - one of `none`, `locals-in-tiny-functions`, or `all-locals` was expected\n\n"
+}

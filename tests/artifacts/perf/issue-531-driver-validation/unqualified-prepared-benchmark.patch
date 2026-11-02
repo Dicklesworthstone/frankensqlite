@@ -1,0 +1,596 @@
+diff --git a/crates/fsqlite-core/benches/prepared_cache_hot_paths.rs b/crates/fsqlite-core/benches/prepared_cache_hot_paths.rs
+index 8b45e8b..f6bb49a 100644
+--- a/crates/fsqlite-core/benches/prepared_cache_hot_paths.rs
++++ b/crates/fsqlite-core/benches/prepared_cache_hot_paths.rs
+@@ -4,3 +4,5 @@ use std::env;
+ use std::hint::black_box;
+-use std::time::Instant;
++use std::io::{Read, Write};
++use std::path::{Path, PathBuf};
++use std::time::{Duration, Instant};
+
+@@ -9,2 +11,4 @@ use fsqlite_core::connection::{Connection, hot_path_profile_snapshot, reset_hot_
+ use fsqlite_types::SqliteValue;
++use serde::{Deserialize, Serialize};
++use sha2::{Digest, Sha256};
+ use tempfile::NamedTempFile;
+@@ -471,2 +475,554 @@ async fn bench_prepared_param_null_predicate_mix(iterations: u64) -> (f64, u64)
+
++// GH#531's opt-in prepared-API experiment reuses this benchmark's single
++// current-thread runtime and existing dependencies. The ordinary cache probes
++// below keep their existing behavior. Invoke the built executable directly:
++//
++// prepared_cache_hot_paths --issue-531-job /absolute/path/job.json
++//
++// Job example (the work directory must not already exist):
++// {"database":"/absolute/path/seed.db","database_sha256":"<sha256>",
++//  "work_directory":"/absolute/path/new-run","fixture":{"likes_mode":"cli"},
++//  "provenance":{"source_revision":"<revision>","profile":"release-perf"},
++//  "cases":[{"name":"group_eq","sql":"SELECT post_id,count(*) FROM likes WHERE post_id=?1 GROUP BY post_id",
++//            "bindings":[{"type":"integer","value":400000}],"ordered":false}]}
++//
++// Optional trials/trial_seconds default to 5/2.0. The supplied provenance is
++// preserved as a declaration, not inferred from the executable. The runner
++// hashes the actual executable and both seeded copies, queries the live stock
++// identity, and writes raw paired samples and results to result.json, with
++// append-only progress.jsonl events preserving evidence if a run is interrupted. Timings
++// exclude prepare, warmup, typed-oracle comparisons, and JSON serialization;
++// they include binding, execution, and full row materialization on both arms.
++type Issue531Result<T> = Result<T, Box<dyn std::error::Error>>;
++
++#[derive(Debug, Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Issue531Job {
++    database: PathBuf,
++    database_sha256: String,
++    work_directory: PathBuf,
++    fixture: serde_json::Value,
++    provenance: serde_json::Value,
++    cases: Vec<Issue531Case>,
++    #[serde(default = "issue531_default_trials")]
++    trials: u32,
++    #[serde(default = "issue531_default_seconds")]
++    trial_seconds: f64,
++    #[serde(default)]
++    read_transaction: bool,
++}
++
++const fn issue531_default_trials() -> u32 {
++    5
++}
++
++const fn issue531_default_seconds() -> f64 {
++    2.0
++}
++
++#[derive(Debug, Deserialize, Serialize)]
++#[serde(deny_unknown_fields)]
++struct Issue531Case {
++    name: String,
++    sql: String,
++    #[serde(default)]
++    bindings: Vec<Issue531Binding>,
++    ordered: bool,
++}
++
++#[derive(Debug, Deserialize, Serialize)]
++#[serde(tag = "type", content = "value", rename_all = "snake_case")]
++enum Issue531Binding {
++    Null,
++    Integer(i64),
++    Real(f64),
++    Text(String),
++    Blob(Vec<u8>),
++}
++
++impl Issue531Binding {
++    fn fsqlite(&self) -> SqliteValue {
++        match self {
++            Self::Null => SqliteValue::Null,
++            Self::Integer(value) => SqliteValue::Integer(*value),
++            Self::Real(value) => SqliteValue::Float(*value),
++            Self::Text(value) => SqliteValue::Text(value.clone().into()),
++            Self::Blob(value) => SqliteValue::Blob(value.clone().into()),
++        }
++    }
++
++    fn stock(&self) -> rusqlite::types::Value {
++        match self {
++            Self::Null => rusqlite::types::Value::Null,
++            Self::Integer(value) => rusqlite::types::Value::Integer(*value),
++            Self::Real(value) => rusqlite::types::Value::Real(*value),
++            Self::Text(value) => rusqlite::types::Value::Text(value.clone()),
++            Self::Blob(value) => rusqlite::types::Value::Blob(value.clone()),
++        }
++    }
++}
++
++/// Preserve storage classes and exact bytes; floating-point bit patterns are
++/// serialized explicitly so JSON cannot erase negative zero or lose precision.
++#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
++#[serde(tag = "type", content = "value", rename_all = "snake_case")]
++enum Issue531Value {
++    Null,
++    Integer(i64),
++    RealBits(u64),
++    TextBytes(Vec<u8>),
++    Blob(Vec<u8>),
++}
++
++type Issue531Rows = Vec<Vec<Issue531Value>>;
++
++fn issue531_fsqlite_rows(rows: &[fsqlite_core::connection::Row]) -> Issue531Rows {
++    rows.iter()
++        .map(|row| {
++            row.values()
++                .iter()
++                .map(|value| match value {
++                    SqliteValue::Null => Issue531Value::Null,
++                    SqliteValue::Integer(value) => Issue531Value::Integer(*value),
++                    SqliteValue::Float(value) => Issue531Value::RealBits(value.to_bits()),
++                    SqliteValue::Text(value) => {
++                        Issue531Value::TextBytes(value.as_bytes_direct().to_vec())
++                    }
++                    SqliteValue::Blob(value) => Issue531Value::Blob(value.to_vec()),
++                })
++                .collect()
++        })
++        .collect()
++}
++
++enum Issue531StockValue {
++    Null,
++    Integer(i64),
++    Real(f64),
++    Text(Vec<u8>),
++    Blob(Vec<u8>),
++}
++
++fn issue531_stock_rows(rows: Vec<Vec<Issue531StockValue>>) -> Issue531Rows {
++    rows.into_iter()
++        .map(|row| {
++            row.into_iter()
++                .map(|value| match value {
++                    Issue531StockValue::Null => Issue531Value::Null,
++                    Issue531StockValue::Integer(value) => Issue531Value::Integer(value),
++                    Issue531StockValue::Real(value) => Issue531Value::RealBits(value.to_bits()),
++                    Issue531StockValue::Text(value) => Issue531Value::TextBytes(value),
++                    Issue531StockValue::Blob(value) => Issue531Value::Blob(value),
++                })
++                .collect()
++        })
++        .collect()
++}
++
++fn issue531_query_stock(
++    statement: &mut rusqlite::Statement<'_>,
++    params: &[rusqlite::types::Value],
++) -> rusqlite::Result<Vec<Vec<Issue531StockValue>>> {
++    let columns = statement.column_count();
++    statement
++        .query_map(rusqlite::params_from_iter(params), |row| {
++            // Materialize every value while the timer runs, just as the
++            // FrankenSQLite API does. TEXT may contain invalid UTF-8, so keep
++            // its exact bytes instead of decoding through String or a lossy
++            // SmallText display. Comparison tags and float bits are produced
++            // later, outside both engines' measured loops.
++            (0..columns)
++                .map(|column| {
++                    row.get_ref(column).map(|value| match value {
++                        rusqlite::types::ValueRef::Null => Issue531StockValue::Null,
++                        rusqlite::types::ValueRef::Integer(value) => {
++                            Issue531StockValue::Integer(value)
++                        }
++                        rusqlite::types::ValueRef::Real(value) => Issue531StockValue::Real(value),
++                        rusqlite::types::ValueRef::Text(value) => {
++                            Issue531StockValue::Text(value.to_vec())
++                        }
++                        rusqlite::types::ValueRef::Blob(value) => {
++                            Issue531StockValue::Blob(value.to_vec())
++                        }
++                    })
++                })
++                .collect()
++        })?
++        .collect()
++}
++
++fn issue531_check_rows(
++    mut actual: Issue531Rows,
++    expected: &Issue531Rows,
++    ordered: bool,
++) -> Issue531Result<()> {
++    if !ordered {
++        actual.sort();
++    }
++    if actual != *expected {
++        return Err(
++            format!("typed result mismatch: expected={expected:?}, actual={actual:?}").into(),
++        );
++    }
++    Ok(())
++}
++
++fn issue531_sha256(path: &Path) -> std::io::Result<String> {
++    let mut file = std::fs::File::open(path)?;
++    let mut digest = Sha256::new();
++    let mut buffer = vec![0_u8; 65_536];
++    loop {
++        let count = file.read(&mut buffer)?;
++        if count == 0 {
++            break;
++        }
++        digest.update(&buffer[..count]);
++    }
++    Ok(format!("{:x}", digest.finalize()))
++}
++
++fn issue531_progress(output: &mut std::fs::File, event: &serde_json::Value) -> Issue531Result<()> {
++    serde_json::to_writer(&mut *output, event)?;
++    writeln!(output)?;
++    output.flush()?;
++    Ok(())
++}
++
++#[derive(Serialize)]
++struct Issue531Sample {
++    engine: &'static str,
++    trial: u32,
++    engine_order: u32,
++    iterations: u64,
++    elapsed_ns: u64,
++    nanoseconds_per_operation: f64,
++    first_result: Issue531Rows,
++}
++
++#[allow(clippy::cast_precision_loss)]
++impl Issue531Sample {
++    fn new(
++        engine: &'static str,
++        trial: u32,
++        engine_order: u32,
++        iterations: u64,
++        elapsed: Duration,
++        first_result: Issue531Rows,
++    ) -> Issue531Result<Self> {
++        let elapsed_ns = u64::try_from(elapsed.as_nanos())?;
++        Ok(Self {
++            engine,
++            trial,
++            engine_order,
++            iterations,
++            elapsed_ns,
++            nanoseconds_per_operation: elapsed_ns as f64 / iterations as f64,
++            first_result,
++        })
++    }
++}
++
++async fn issue531_sample_fsqlite(
++    statement: &fsqlite_core::connection::PreparedStatement<'_>,
++    params: &[SqliteValue],
++    budget: Duration,
++    trial: u32,
++    order: u32,
++) -> Issue531Result<Issue531Sample> {
++    let mut iterations = 0_u64;
++    let mut first = None;
++    let started = Instant::now();
++    loop {
++        let rows = statement.query_with_params(params).await?;
++        iterations += 1;
++        if first.is_none() {
++            first = Some(rows);
++        } else {
++            black_box(rows);
++        }
++        if started.elapsed() >= budget {
++            break;
++        }
++    }
++    let elapsed = started.elapsed();
++    let rows = issue531_fsqlite_rows(&first.expect("sample always executes once"));
++    Issue531Sample::new("fsqlite", trial, order, iterations, elapsed, rows)
++}
++
++fn issue531_sample_stock(
++    statement: &mut rusqlite::Statement<'_>,
++    params: &[rusqlite::types::Value],
++    budget: Duration,
++    trial: u32,
++    order: u32,
++) -> Issue531Result<Issue531Sample> {
++    let mut iterations = 0_u64;
++    let mut first = None;
++    let started = Instant::now();
++    loop {
++        let rows = issue531_query_stock(statement, params)?;
++        iterations += 1;
++        if first.is_none() {
++            first = Some(rows);
++        } else {
++            black_box(rows);
++        }
++        if started.elapsed() >= budget {
++            break;
++        }
++    }
++    let elapsed = started.elapsed();
++    let rows = issue531_stock_rows(first.expect("sample always executes once"));
++    Issue531Sample::new("stock", trial, order, iterations, elapsed, rows)
++}
++
++fn issue531_fixture_counts(conn: &rusqlite::Connection) -> rusqlite::Result<[i64; 3]> {
++    conn.query_row(
++        "SELECT (SELECT count(*) FROM users), (SELECT count(*) FROM posts), \
++         (SELECT count(*) FROM likes)",
++        [],
++        |row| Ok([row.get(0)?, row.get(1)?, row.get(2)?]),
++    )
++}
++
++#[allow(clippy::too_many_lines)]
++async fn issue531_execute(
++    job: &Issue531Job,
++    report: &mut serde_json::Value,
++    progress: &mut std::fs::File,
++) -> Issue531Result<()> {
++    let actual_hash = issue531_sha256(&job.database)?;
++    if actual_hash != job.database_sha256 {
++        return Err("seed database does not match its supplied SHA256".into());
++    }
++    let mut wal = job.database.as_os_str().to_os_string();
++    wal.push("-wal");
++    if Path::new(&wal).exists() && std::fs::metadata(&wal)?.len() != 0 {
++        return Err("seed has a nonempty WAL; checkpoint and close it before copying".into());
++    }
++    let fsqlite_path = job.work_directory.join("fsqlite.db");
++    let stock_path = job.work_directory.join("stock.db");
++    for path in [&fsqlite_path, &stock_path] {
++        std::fs::copy(&job.database, path)?;
++        if issue531_sha256(path)? != actual_hash {
++            return Err("seeded database copies are not byte-identical".into());
++        }
++    }
++    report["initial_database_sha256"] = serde_json::json!({
++        "seed": actual_hash, "fsqlite": actual_hash, "stock": actual_hash,
++    });
++    let stock = rusqlite::Connection::open(&stock_path)?;
++    let counts = issue531_fixture_counts(&stock)?;
++    report["actual_fixture_counts"] = serde_json::json!({
++        "users": counts[0], "posts": counts[1], "likes": counts[2],
++    });
++    report["stock_identity"] = serde_json::json!({
++        "version": rusqlite::version(),
++        "source_id": stock.query_row("SELECT sqlite_source_id()", [], |row| row.get::<_, String>(0))?,
++        "compile_options": stock.prepare("PRAGMA compile_options")?
++            .query_map([], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?,
++    });
++    let fsqlite =
++        Connection::open(fsqlite_path.to_str().ok_or("database path is not UTF-8")?).await?;
++    for sql in ["PRAGMA synchronous=NORMAL", "PRAGMA foreign_keys=ON"] {
++        stock.execute_batch(sql)?;
++        fsqlite.execute(sql).await?;
++    }
++    report["settings"] = serde_json::json!({});
++    for (sql, value) in [
++        (
++            "PRAGMA journal_mode",
++            Issue531Value::TextBytes(b"wal".to_vec()),
++        ),
++        ("PRAGMA synchronous", Issue531Value::Integer(1)),
++        ("PRAGMA foreign_keys", Issue531Value::Integer(1)),
++    ] {
++        let expected = vec![vec![value]];
++        let stock_rows = issue531_stock_rows(issue531_query_stock(&mut stock.prepare(sql)?, &[])?);
++        let fsqlite_rows = issue531_fsqlite_rows(&fsqlite.query(sql).await?);
++        report["settings"][sql] = serde_json::json!({
++            "stock": stock_rows, "fsqlite": fsqlite_rows,
++        });
++        issue531_check_rows(stock_rows, &expected, true)?;
++        issue531_check_rows(fsqlite_rows, &expected, true)?;
++    }
++    issue531_progress(
++        progress,
++        &serde_json::json!({
++            "event": "fixture_checked",
++            "initial_database_sha256": report["initial_database_sha256"],
++            "actual_fixture_counts": report["actual_fixture_counts"],
++            "stock_identity": report["stock_identity"],
++            "settings": report["settings"],
++        }),
++    )?;
++    if job.read_transaction {
++        stock.execute_batch("BEGIN")?;
++        fsqlite.execute("BEGIN").await?;
++    }
++    let budget = Duration::from_secs_f64(job.trial_seconds);
++    for (case_number, case) in job.cases.iter().enumerate() {
++        report["cases"]
++            .as_array_mut()
++            .expect("cases array")
++            .push(serde_json::json!({
++                "case": case, "warmups_checked": 0, "samples": [], "query_plans": {},
++            }));
++        let item = &mut report["cases"][case_number];
++        let params: Vec<_> = case.bindings.iter().map(Issue531Binding::fsqlite).collect();
++        let stock_params: Vec<_> = case.bindings.iter().map(Issue531Binding::stock).collect();
++        let mut stock_statement = stock.prepare(&case.sql)?;
++        if !stock_statement.readonly() {
++            return Err(format!("case {} is not read-only", case.name).into());
++        }
++        let statement = fsqlite.prepare(&case.sql).await?;
++        let eqp = format!("EXPLAIN QUERY PLAN {}", case.sql);
++        item["query_plans"] = serde_json::json!({
++            "stock": issue531_stock_rows(issue531_query_stock(&mut stock.prepare(&eqp)?, &stock_params)?),
++            "fsqlite": issue531_fsqlite_rows(&fsqlite.query_with_params(&eqp, &params).await?),
++        });
++        issue531_progress(
++            progress,
++            &serde_json::json!({
++                "event": "case_prepared", "case": case, "query_plans": item["query_plans"],
++            }),
++        )?;
++        let mut expected =
++            issue531_stock_rows(issue531_query_stock(&mut stock_statement, &stock_params)?);
++        if !case.ordered {
++            expected.sort();
++        }
++        item["oracle_rows"] = serde_json::to_value(&expected)?;
++        issue531_check_rows(
++            issue531_fsqlite_rows(&statement.query_with_params(&params).await?),
++            &expected,
++            case.ordered,
++        )?;
++        item["warmups_checked"] = serde_json::json!({"stock": 1, "fsqlite": 1});
++        issue531_progress(
++            progress,
++            &serde_json::json!({
++                "event": "warmup_checked", "case": case.name,
++                "oracle_rows": expected, "warmups_checked": item["warmups_checked"],
++            }),
++        )?;
++        for trial in 0..job.trials {
++            for order in 0..2_u32 {
++                let sample = if (trial + order).is_multiple_of(2) {
++                    issue531_sample_fsqlite(&statement, &params, budget, trial, order).await?
++                } else {
++                    issue531_sample_stock(
++                        &mut stock_statement,
++                        &stock_params,
++                        budget,
++                        trial,
++                        order,
++                    )?
++                };
++                // Preserve the first divergent sample before checking it.
++                item["samples"]
++                    .as_array_mut()
++                    .expect("samples array")
++                    .push(serde_json::to_value(&sample)?);
++                let checked = issue531_check_rows(sample.first_result, &expected, case.ordered);
++                issue531_progress(
++                    progress,
++                    &serde_json::json!({
++                        "event": "sample_checked", "case": case.name,
++                        "sample": item["samples"].as_array().expect("samples array").last(),
++                        "matches_oracle": checked.is_ok(),
++                        "error": checked.as_ref().err().map(ToString::to_string),
++                    }),
++                )?;
++                checked?;
++            }
++        }
++    }
++    if job.read_transaction {
++        stock.execute_batch("ROLLBACK")?;
++        fsqlite.execute("ROLLBACK").await?;
++    }
++    drop(stock);
++    fsqlite.close().await?;
++    for (engine, path) in [("stock", stock_path), ("fsqlite", fsqlite_path)] {
++        let conn = rusqlite::Connection::open(path)?;
++        let integrity: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
++        let final_counts = issue531_fixture_counts(&conn)?;
++        report["final_verification"][engine] = serde_json::json!({
++            "integrity_check": integrity, "counts": final_counts,
++        });
++        if integrity != "ok" || final_counts != counts {
++            return Err(format!("{engine} final integrity or fixture counts changed").into());
++        }
++    }
++    Ok(())
++}
++
++async fn run_issue531_job(path: &Path) -> Issue531Result<()> {
++    let job: Issue531Job = serde_json::from_reader(std::fs::File::open(path)?)?;
++    if !job.database.is_absolute() || !job.work_directory.is_absolute() {
++        return Err("database and work_directory must be absolute paths".into());
++    }
++    if job.trials == 0
++        || !job.trial_seconds.is_finite()
++        || job.trial_seconds <= 0.0
++        || job.trial_seconds > 3600.0
++        || job.cases.is_empty()
++    {
++        return Err("need cases, positive trials, and trial_seconds in (0, 3600]".into());
++    }
++    let mut names = std::collections::HashSet::new();
++    if job
++        .cases
++        .iter()
++        .any(|case| case.name.is_empty() || !names.insert(&case.name))
++    {
++        return Err("case names must be nonempty and unique".into());
++    }
++    // create_dir refuses an existing destination, including one containing an
++    // earlier failed run. Evidence and databases are never overwritten.
++    std::fs::create_dir(&job.work_directory)?;
++    let mut report = serde_json::json!({
++        "schema": "issue531-prepared-v1", "status": "running",
++        "measurement": "prepared API: bind, execute, materialize; one current-thread runtime",
++        "comparison": "live fsqlite and bundled C SQLite in the same invocation",
++        "correctness": "one discarded warmup and first result of every trial; exact typed rows",
++        "fixture": job.fixture, "supplied_build_provenance": job.provenance,
++        "binary_sha256": issue531_sha256(&env::current_exe()?)?,
++        "job_sha256": issue531_sha256(path)?, "database": job.database,
++        "trials": job.trials, "trial_seconds": job.trial_seconds,
++        "read_transaction": job.read_transaction, "cases": [], "final_verification": {},
++    });
++    let mut progress = std::fs::OpenOptions::new()
++        .append(true)
++        .create_new(true)
++        .open(job.work_directory.join("progress.jsonl"))?;
++    issue531_progress(
++        &mut progress,
++        &serde_json::json!({"event": "started", "report": report}),
++    )?;
++    let outcome = issue531_execute(&job, &mut report, &mut progress).await;
++    report["status"] = serde_json::json!(if outcome.is_ok() { "passed" } else { "failed" });
++    if let Err(error) = &outcome {
++        report["error"] = serde_json::json!(error.to_string());
++    }
++    let result_path = job.work_directory.join("result.json");
++    let mut output = std::fs::OpenOptions::new()
++        .write(true)
++        .create_new(true)
++        .open(&result_path)?;
++    serde_json::to_writer_pretty(&mut output, &report)?;
++    writeln!(output)?;
++    issue531_progress(
++        &mut progress,
++        &serde_json::json!({
++            "event": "finished", "status": report["status"],
++            "error": report.get("error"), "result": result_path,
++        }),
++    )?;
++    println!("{}: {}", report["status"], result_path.display());
++    outcome
++}
++
+ async fn parse_iterations() -> u64 {
+@@ -567,4 +1123,24 @@ async fn parse_iterations() -> u64 {
+ fn main() {
++    let args: Vec<String> = env::args().collect();
++    if args.get(1).is_some_and(|arg| arg == "--version") && args.len() == 2 {
++        println!(
++            "prepared_cache_hot_paths {} (bundled SQLite {})",
++            env!("CARGO_PKG_VERSION"),
++            rusqlite::version()
++        );
++        return;
++    }
+     // ONE runtime for the entire benchmark, built before any measured region.
+     let runtime = benchmark_runtime();
++    if args.get(1).is_some_and(|arg| arg == "--issue-531-job") {
++        if args.len() != 3 {
++            eprintln!("usage: prepared_cache_hot_paths --issue-531-job /absolute/path/job.json");
++            std::process::exit(2);
++        }
++        if let Err(error) = runtime.block_on(run_issue531_job(Path::new(&args[2]))) {
++            eprintln!("issue #531 prepared benchmark failed: {error}");
++            std::process::exit(1);
++        }
++        return;
++    }
+     runtime.block_on(run());

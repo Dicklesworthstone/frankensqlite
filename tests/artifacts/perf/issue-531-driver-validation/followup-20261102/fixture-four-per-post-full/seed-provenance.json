@@ -1,0 +1,42 @@
+{
+  "fixture": "issue-531-four-per-post-synthetic",
+  "label": "Full-scale synthetic four-per-post fixture: 50,000 users / 500,000 posts / 2,000,000 distinct likes",
+  "likes_mode": "four-per-post",
+  "synthetic": true,
+  "users": 50000,
+  "posts": 500000,
+  "likes_attempted": 2000000,
+  "likes_distinct_expected": 2000000,
+  "source_generator": "scripts/benchmark_issue_531.py::fixture_sql(50000,500000,\"four-per-post\")",
+  "source_generator_sha256": "fbdc0390b012d8b6da44666b60b858a183dbe4d5d08d426dab5d4941eea3042b",
+  "seed_sql_sha256": "d249653d418e72efd0a8f7b5ed79497f6ce75f4f9d614f73095ec06ef70c5794",
+  "command": [
+    "/workspace/scratch/d1d8a2247ef3/qualification/sqlite-3.53.2/sqlite3",
+    "-batch",
+    "-init",
+    "/dev/null",
+    "/workspace/scratch/d1d8a2247ef3/qualification/fixture-four-per-post-full/seed.db"
+  ],
+  "started_utc": "2026-11-01T23:58:17.585755+00:00",
+  "oracle_version": "3.53.2 2026-06-03 19:12:13 d6e03d8c777cfa2d35e3b60d8ec3e0187f3e9f99d8e2ee9cac695fd6fcdf1a24 (64-bit)",
+  "oracle_binary_sha256": "d9d213b02e7e38e6cbb94888317a89cbf2f3fa8a08c7dbf1a9d0243702dfee4e",
+  "prepared_harness_data_claim": "This is an explicitly synthetic fixture; it is not the reporter's unattached prepared Rust-harness data.",
+  "elapsed_seconds": 467.6543097540002,
+  "create_returncode": 0,
+  "seeding_child_max_rss_kib": 12800,
+  "verification_command": [
+    "/workspace/scratch/d1d8a2247ef3/qualification/sqlite-3.53.2/sqlite3",
+    "-readonly",
+    "-batch",
+    "-init",
+    "/dev/null",
+    "file:/workspace/scratch/d1d8a2247ef3/qualification/fixture-four-per-post-full/seed.db?mode=ro&immutable=1"
+  ],
+  "verification_returncode": 0,
+  "verification": "50000|500000|2000000\nok\n",
+  "seed_sha256": "2f05531cc79b98e9957d1bf3009de3bc550282f34de665fcc29e4b726a4652e7",
+  "seed_bytes": 130617344,
+  "likes_distinct": 2000000,
+  "status": "stock_fixture_verified",
+  "finished_utc": "2026-11-02T00:06:09.788595+00:00"
+}

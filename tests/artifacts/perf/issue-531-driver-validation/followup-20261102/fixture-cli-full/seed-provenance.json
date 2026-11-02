@@ -1,0 +1,14 @@
+{
+  "fixture": "issue-531-cli",
+  "users": 50000,
+  "posts": 500000,
+  "likes_attempted": 2000000,
+  "likes_distinct": 500000,
+  "seed_sha256": "4aa75af6088ce8d0bf2a0be3224f2fb3b21be67591a33d8b855d551a21a1c6a5",
+  "command": [
+    "/workspace/scratch/d1d8a2247ef3/qualification/sqlite-3.53.2/sqlite3",
+    "/workspace/scratch/d1d8a2247ef3/qualification/fixture-cli-full/seed.db"
+  ],
+  "elapsed_seconds": 62.07026079599973,
+  "verification": "50000|500000|500000\nok\n"
+}

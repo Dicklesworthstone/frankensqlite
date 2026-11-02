@@ -1,0 +1,414 @@
+{
+  "database": "/workspace/scratch/d1d8a2247ef3/qualification/fixture-four-per-post-full/seed.db",
+  "database_sha256": "2f05531cc79b98e9957d1bf3009de3bc550282f34de665fcc29e4b726a4652e7",
+  "work_directory": "/workspace/scratch/d1d8a2247ef3/qualification/prepared-four-per-post-full-baseline",
+  "fixture": {
+    "fixture": "issue-531-four-per-post-synthetic",
+    "label": "Full-scale synthetic four-per-post fixture: 50,000 users / 500,000 posts / 2,000,000 distinct likes",
+    "likes_mode": "four-per-post",
+    "synthetic": true,
+    "users": 50000,
+    "posts": 500000,
+    "likes_attempted": 2000000,
+    "likes_distinct_expected": 2000000,
+    "source_generator": "scripts/benchmark_issue_531.py::fixture_sql(50000,500000,\"four-per-post\")",
+    "source_generator_sha256": "fbdc0390b012d8b6da44666b60b858a183dbe4d5d08d426dab5d4941eea3042b",
+    "seed_sql_sha256": "d249653d418e72efd0a8f7b5ed79497f6ce75f4f9d614f73095ec06ef70c5794",
+    "command": [
+      "/workspace/scratch/d1d8a2247ef3/qualification/sqlite-3.53.2/sqlite3",
+      "-batch",
+      "-init",
+      "/dev/null",
+      "/workspace/scratch/d1d8a2247ef3/qualification/fixture-four-per-post-full/seed.db"
+    ],
+    "started_utc": "2026-11-01T23:58:17.585755+00:00",
+    "oracle_version": "3.53.2 2026-06-03 19:12:13 d6e03d8c777cfa2d35e3b60d8ec3e0187f3e9f99d8e2ee9cac695fd6fcdf1a24 (64-bit)",
+    "oracle_binary_sha256": "d9d213b02e7e38e6cbb94888317a89cbf2f3fa8a08c7dbf1a9d0243702dfee4e",
+    "prepared_harness_data_claim": "This is an explicitly synthetic fixture; it is not the reporter's unattached prepared Rust-harness data.",
+    "elapsed_seconds": 467.6543097540002,
+    "create_returncode": 0,
+    "seeding_child_max_rss_kib": 12800,
+    "verification_command": [
+      "/workspace/scratch/d1d8a2247ef3/qualification/sqlite-3.53.2/sqlite3",
+      "-readonly",
+      "-batch",
+      "-init",
+      "/dev/null",
+      "file:/workspace/scratch/d1d8a2247ef3/qualification/fixture-four-per-post-full/seed.db?mode=ro&immutable=1"
+    ],
+    "verification_returncode": 0,
+    "verification": "50000|500000|2000000\nok\n",
+    "seed_sha256": "2f05531cc79b98e9957d1bf3009de3bc550282f34de665fcc29e4b726a4652e7",
+    "seed_bytes": 130617344,
+    "likes_distinct": 2000000,
+    "status": "stock_fixture_verified",
+    "finished_utc": "2026-11-02T00:06:09.788595+00:00",
+    "source": "scripts/benchmark_issue_531.py::fixture_sql"
+  },
+  "provenance": {
+    "status": "PENDING_BUILD",
+    "arm": "baseline",
+    "intended_source_revision": "770a812",
+    "source_revision": null,
+    "source_sha256": null,
+    "binary_sha256": null,
+    "command": null,
+    "toolchain": null,
+    "profile": null,
+    "features": null,
+    "rustflags": null,
+    "benchmark_overlay_sha256": null,
+    "instruction": "Fill verified build provenance before qualifying results; source/toolchain/profile/features/flags and dependency lock must be comparable between arms. Runtime independently records actual executable/job/seed hashes and live SQLite identity."
+  },
+  "cases": [
+    {
+      "name": "group_eq",
+      "sql": "SELECT post_id, count(*) FROM likes WHERE post_id = ?1 GROUP BY post_id;",
+      "bindings": [
+        {
+          "type": "integer",
+          "value": 400000
+        }
+      ],
+      "ordered": false
+    },
+    {
+      "name": "group_in20",
+      "sql": "SELECT post_id, count(*) FROM likes WHERE post_id IN (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20) GROUP BY post_id;",
+      "bindings": [
+        {
+          "type": "integer",
+          "value": 23809
+        },
+        {
+          "type": "integer",
+          "value": 47619
+        },
+        {
+          "type": "integer",
+          "value": 71428
+        },
+        {
+          "type": "integer",
+          "value": 95238
+        },
+        {
+          "type": "integer",
+          "value": 119047
+        },
+        {
+          "type": "integer",
+          "value": 142857
+        },
+        {
+          "type": "integer",
+          "value": 166666
+        },
+        {
+          "type": "integer",
+          "value": 190476
+        },
+        {
+          "type": "integer",
+          "value": 214285
+        },
+        {
+          "type": "integer",
+          "value": 238095
+        },
+        {
+          "type": "integer",
+          "value": 261904
+        },
+        {
+          "type": "integer",
+          "value": 285714
+        },
+        {
+          "type": "integer",
+          "value": 309523
+        },
+        {
+          "type": "integer",
+          "value": 333333
+        },
+        {
+          "type": "integer",
+          "value": 357142
+        },
+        {
+          "type": "integer",
+          "value": 380952
+        },
+        {
+          "type": "integer",
+          "value": 404761
+        },
+        {
+          "type": "integer",
+          "value": 428571
+        },
+        {
+          "type": "integer",
+          "value": 452380
+        },
+        {
+          "type": "integer",
+          "value": 476190
+        }
+      ],
+      "ordered": false
+    },
+    {
+      "name": "count_eq_control",
+      "sql": "SELECT count(*) FROM likes WHERE post_id = ?1;",
+      "bindings": [
+        {
+          "type": "integer",
+          "value": 400000
+        }
+      ],
+      "ordered": false
+    },
+    {
+      "name": "in20_control",
+      "sql": "SELECT post_id FROM likes WHERE post_id IN (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20);",
+      "bindings": [
+        {
+          "type": "integer",
+          "value": 23809
+        },
+        {
+          "type": "integer",
+          "value": 47619
+        },
+        {
+          "type": "integer",
+          "value": 71428
+        },
+        {
+          "type": "integer",
+          "value": 95238
+        },
+        {
+          "type": "integer",
+          "value": 119047
+        },
+        {
+          "type": "integer",
+          "value": 142857
+        },
+        {
+          "type": "integer",
+          "value": 166666
+        },
+        {
+          "type": "integer",
+          "value": 190476
+        },
+        {
+          "type": "integer",
+          "value": 214285
+        },
+        {
+          "type": "integer",
+          "value": 238095
+        },
+        {
+          "type": "integer",
+          "value": 261904
+        },
+        {
+          "type": "integer",
+          "value": 285714
+        },
+        {
+          "type": "integer",
+          "value": 309523
+        },
+        {
+          "type": "integer",
+          "value": 333333
+        },
+        {
+          "type": "integer",
+          "value": 357142
+        },
+        {
+          "type": "integer",
+          "value": 380952
+        },
+        {
+          "type": "integer",
+          "value": 404761
+        },
+        {
+          "type": "integer",
+          "value": 428571
+        },
+        {
+          "type": "integer",
+          "value": 452380
+        },
+        {
+          "type": "integer",
+          "value": 476190
+        }
+      ],
+      "ordered": false
+    },
+    {
+      "name": "newest20_control",
+      "sql": "SELECT p.id FROM posts p ORDER BY p.created_at DESC, p.id DESC LIMIT ?1;",
+      "bindings": [
+        {
+          "type": "integer",
+          "value": 20
+        }
+      ],
+      "ordered": true
+    },
+    {
+      "name": "join_newest20",
+      "sql": "SELECT p.id, u.username FROM posts p JOIN users u ON u.id = p.user_id ORDER BY p.created_at DESC, p.id DESC LIMIT ?1;",
+      "bindings": [
+        {
+          "type": "integer",
+          "value": 20
+        }
+      ],
+      "ordered": true
+    },
+    {
+      "name": "newest20_count_wrapper",
+      "sql": "SELECT count(*) FROM (SELECT p.id FROM posts p ORDER BY p.created_at DESC, p.id DESC LIMIT ?1);",
+      "bindings": [
+        {
+          "type": "integer",
+          "value": 20
+        }
+      ],
+      "ordered": false
+    },
+    {
+      "name": "join_newest20_count_wrapper",
+      "sql": "SELECT count(*) FROM (SELECT p.id, u.username FROM posts p JOIN users u ON u.id = p.user_id ORDER BY p.created_at DESC, p.id DESC LIMIT ?1);",
+      "bindings": [
+        {
+          "type": "integer",
+          "value": 20
+        }
+      ],
+      "ordered": false
+    },
+    {
+      "name": "correlated_newest20",
+      "sql": "SELECT p.id, (SELECT count(*) FROM likes l WHERE l.post_id = p.id) FROM posts p ORDER BY p.created_at DESC, p.id DESC LIMIT ?1;",
+      "bindings": [
+        {
+          "type": "integer",
+          "value": 20
+        }
+      ],
+      "ordered": true
+    },
+    {
+      "name": "join_by_id_control",
+      "sql": "SELECT p.id, p.body, p.created_at, u.username FROM posts p JOIN users u ON u.id = p.user_id WHERE p.id = ?1;",
+      "bindings": [
+        {
+          "type": "integer",
+          "value": 400000
+        }
+      ],
+      "ordered": false
+    },
+    {
+      "name": "correlated_by_id_control",
+      "sql": "SELECT p.id, (SELECT count(*) FROM likes l WHERE l.post_id = p.id) FROM posts p WHERE p.id = ?1;",
+      "bindings": [
+        {
+          "type": "integer",
+          "value": 400000
+        }
+      ],
+      "ordered": false
+    },
+    {
+      "name": "join_correlated_by_id",
+      "sql": "SELECT p.id, p.body, p.created_at, u.username, (SELECT count(*) FROM likes l WHERE l.post_id = p.id) AS like_count FROM posts p JOIN users u ON u.id = p.user_id WHERE p.id = ?1;",
+      "bindings": [
+        {
+          "type": "integer",
+          "value": 400000
+        }
+      ],
+      "ordered": false
+    },
+    {
+      "name": "join_correlated_newest20",
+      "sql": "SELECT p.id, p.body, p.created_at, u.username, (SELECT count(*) FROM likes l WHERE l.post_id = p.id) AS like_count FROM posts p JOIN users u ON u.id = p.user_id ORDER BY p.created_at DESC, p.id DESC LIMIT ?1;",
+      "bindings": [
+        {
+          "type": "integer",
+          "value": 20
+        }
+      ],
+      "ordered": true
+    },
+    {
+      "name": "join_filtered_offset_control",
+      "sql": "SELECT p.id, u.username FROM posts p JOIN users u ON u.id = p.user_id WHERE u.id % 2 = 0 ORDER BY p.created_at DESC, p.id DESC LIMIT ?1 OFFSET ?2;",
+      "bindings": [
+        {
+          "type": "integer",
+          "value": 20
+        },
+        {
+          "type": "integer",
+          "value": 7
+        }
+      ],
+      "ordered": true
+    },
+    {
+      "name": "group_eq_residual_user_id",
+      "sql": "SELECT post_id, count(*) FROM likes WHERE post_id = ?1 AND user_id > ?2 GROUP BY post_id;",
+      "bindings": [
+        {
+          "type": "integer",
+          "value": 400000
+        },
+        {
+          "type": "integer",
+          "value": 0
+        }
+      ],
+      "ordered": false
+    },
+    {
+      "name": "group_eq_alternate_bind_control",
+      "sql": "SELECT post_id, count(*) FROM likes WHERE post_id = ?1 GROUP BY post_id;",
+      "bindings": [
+        {
+          "type": "integer",
+          "value": 400001
+        }
+      ],
+      "ordered": false
+    },
+    {
+      "name": "group_eq_null_bind_control",
+      "sql": "SELECT post_id, count(*) FROM likes WHERE post_id = ?1 GROUP BY post_id;",
+      "bindings": [
+        {
+          "type": "null"
+        }
+      ],
+      "ordered": false
+    }
+  ],
+  "trials": 5,
+  "trial_seconds": 2.0,
+  "read_transaction": false
+}

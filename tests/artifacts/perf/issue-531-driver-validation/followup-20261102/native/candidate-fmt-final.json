@@ -1,0 +1,26 @@
+{
+  "command": [
+    "cargo",
+    "fmt",
+    "--all",
+    "--check"
+  ],
+  "cwd": "/workspace/scratch/d1d8a2247ef3/frankensqlite",
+  "started_utc": "2026-11-02T00:02:07.198548+00:00",
+  "environment": {
+    "CARGO_HOME": "/workspace/scratch/d1d8a2247ef3/cargo-home",
+    "CARGO_TARGET_DIR": null,
+    "CARGO_BUILD_JOBS": null,
+    "CARGO_INCREMENTAL": null,
+    "CARGO_PROFILE_DEV_DEBUG": null,
+    "CARGO_PROFILE_TEST_DEBUG": null,
+    "RUSTFLAGS": null,
+    "RUST_MIN_STACK": null
+  },
+  "lock_sha256": "828b244f97320a944275e708eb28be1032debad72acbb649f10dc03327cca502",
+  "cgroup_memory_limit": "8589934592",
+  "exit_code": 0,
+  "elapsed_seconds": 239.9043379740001,
+  "child_max_rss_kib": 319408,
+  "cgroup_memory_events": "low 0\nhigh 0\nmax 14516773\noom 215\noom_kill 19\noom_group_kill 0\n"
+}
