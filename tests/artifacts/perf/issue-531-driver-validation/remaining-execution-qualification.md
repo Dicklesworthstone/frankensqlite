@@ -1,4 +1,31 @@
-# Issue #531: remaining execution candidate and qualification
+# Issue #531: applied planner and binding changes, remaining qualification
+
+## Applied correction: bound ORDER BY values keep their expression meaning
+
+The parameter binder now records whether each original ORDER BY expression is syntactically an ordinal before substituting parameters. If binding turns a nonordinal expression into an ordinal-looking integer, it retains the complete bound expression inside the existing `0 + expression` form. This covers unary signs, nested COLLATE wrappers, and absorbing constant folds while preserving genuine literal ordinals and their invalid-range errors.
+
+The change is limited to `bind_placeholders_in_select_statement`. It does not apply the archived deferred projection or ordered join candidates. The existing scalar-subquery ORDER BY oracle test file now includes prepared-statement rebinding, ad hoc execution, seven wrapper forms, zero/negative/large bound values, genuine literal ordinals, and invalid literal ordinals under LIMIT 0. That public core regression has been reviewed and formatted but has not executed here.
+
+### Executed binder qualification
+
+The actual extracted Rust binder functions, complete parameter state, literal conversion and ordinal helpers were compiled and executed against the real locked AST, parser, types, error and function crates. No production function was mocked. Original parameterized SQL and the actual binder-serialized SQL were then compared in **C SQLite 3.53.2**.
+
+| Result | Existing binder | Corrected binder |
+| --- | ---: | ---: |
+| Oracle cases | 95 | 95 |
+| Original-versus-bound SQL mismatches | 23 | 0 |
+| Preserve original top-level ordinal classification | Fails for affected wrappers | All tested cases pass |
+
+Coverage includes mixed storage classes, unary signs and nested collations, anonymous/numbered/sparse/repeated named bindings, nested scalar SELECT and CTE ordering, LIMIT/OFFSET edge cases, and invalid literal ordinal errors. This is evidence for the Rust AST transformation and C SQLite semantics in those cases. It is not full native FrankenSQLite Connection/VDBE execution or a speed measurement.
+
+- [Reproducible binder harness, source/dependency manifests and complete oracle receipts](binder-order-qualification-20261102.tar.gz)
+- Archive SHA-256: `f7f1fa2f6113e10beb3dfc39cf2f2eae35083a740b9900805fc110fcf67939dc`.
+- Applied connection.rs SHA-256: `e0293ffe696d6650d120ead3ad4f357deac474143809d4cfcaece9370ad7b941`.
+- Applied scalar-subquery oracle test SHA-256: `b96e224f5e1e4a16ed91bf977c4686e284566aa9e75339ecf7e0da3e8b25bc33`.
+- The applied binder function is identical to the qualified source except for the recorded rustfmt-only brace placement. Both the final function and new regression pass focused formatting checks.
+
+The archived deferred-projection patch below predates this correction and must be reconciled with the applied source before further qualification. Full native core and realistic performance validation remain open.
+
 
 ## Current status: grouped planner improvement applied
 

@@ -150,3 +150,88 @@ fn scalar_subquery_no_order_unaffected_gh172() {
             "SELECT id,(SELECT max(v) FROM inner_t WHERE inner_t.oid=outer_t.id) FROM outer_t ORDER BY id").await;
     });
 }
+
+#[test]
+fn scalar_subquery_wrapped_order_parameters_remain_constants() {
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        seed(&f, &r).await;
+
+        for term in [
+            "?1",
+            "+?1",
+            "-?1",
+            "?1 COLLATE BINARY",
+            "(+?1 COLLATE NOCASE) COLLATE RTRIM",
+            "-(-(?1 COLLATE BINARY))",
+            "(?1 AND outer_t.id)",
+        ] {
+            // Both fixture ids are nonzero, so each term supplies a constant
+            // key. The following id DESC selects id 2; converting the bound
+            // parameter to ordinal 1 changes the order or causes an error.
+            let sql = format!(
+                "SELECT outer_t.id,\
+                 (SELECT count(*) FROM inner_t WHERE inner_t.oid=outer_t.id) \
+                 FROM outer_t ORDER BY {term},outer_t.id DESC LIMIT ?2 OFFSET ?3"
+            );
+            let prepared = f.prepare(&sql).await.unwrap();
+            let mut stock = r.prepare(&sql).unwrap();
+            let columns = stock.column_count();
+
+            // Rebind one prepared statement across ordinary, zero, negative
+            // and out-of-range ordinal-looking values, then repeat the first.
+            for key in [1, 0, -1, 7, i64::MIN, i64::MAX, 1] {
+                let params = [key, 1, 0];
+                let expected: Vec<Vec<String>> = stock
+                    .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                        Ok((0..columns)
+                            .map(|column| {
+                                tag_r(&row.get_unwrap::<_, rusqlite::types::Value>(column))
+                            })
+                            .collect())
+                    })
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                let values = params.map(SqliteValue::Integer);
+                for actual in [
+                    f.query_with_params(&sql, &values).await.unwrap(),
+                    prepared.query_with_params(&values).await.unwrap(),
+                ] {
+                    let actual: Vec<Vec<String>> = actual
+                        .iter()
+                        .map(|row| row.values().iter().map(tag_f).collect())
+                        .collect();
+                    assert_eq!(actual, expected, "{sql}; parameters={params:?}");
+                }
+            }
+        }
+
+        // Genuine literal ordinals keep their original meaning.
+        for term in ["1", "+1", "1 COLLATE BINARY", "-(-1) COLLATE BINARY"] {
+            let sql = format!(
+                "SELECT outer_t.id,\
+                 (SELECT count(*) FROM inner_t WHERE inner_t.oid=outer_t.id) \
+                 FROM outer_t ORDER BY {term} LIMIT 1"
+            );
+            assert_agree_ordered(&f, &r, &sql).await;
+        }
+
+        // Binding must not turn invalid literal ordinals into accepted
+        // constants, even when LIMIT 0 prevents row evaluation.
+        for term in ["0", "-1", "3", "+0 COLLATE BINARY", "-4 COLLATE NOCASE"] {
+            let sql = format!(
+                "SELECT outer_t.id,\
+                 (SELECT count(*) FROM inner_t WHERE inner_t.oid=outer_t.id) \
+                 FROM outer_t ORDER BY {term} LIMIT 0"
+            );
+            assert!(r.prepare(&sql).is_err(), "stock must reject {sql}");
+            assert!(
+                f.query(&sql).await.is_err(),
+                "invalid ordinal accepted: {sql}"
+            );
+        }
+        f.close().await.unwrap();
+    });
+}

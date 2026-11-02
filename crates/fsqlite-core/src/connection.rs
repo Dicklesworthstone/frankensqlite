@@ -155371,22 +155371,20 @@ fn bind_placeholders_in_select_statement(
     }
 
     for ordering in &mut select.order_by {
-        let was_bare_placeholder = matches!(ordering.expr, Expr::Placeholder(_, _));
+        let was_ordinal = connection_order_by_integer_ordinal(&ordering.expr).is_some();
         bind_placeholders_in_expr(&mut ordering.expr, bind_state, params)?;
-        // bd-2fong parity: stock SQLite resolves ORDER BY ordinals
-        // SYNTACTICALLY at parse time, so a BOUND parameter is always a
-        // constant expression, never a column ordinal (oracle 3.46.1:
-        // `... ORDER BY ?` bound to 2 preserves row order while a literal
-        // `ORDER BY 2` reorders). Binding just replaced a bare top-level
-        // placeholder with a literal; keep an integer result in expression
-        // form so the fallback sorters' ordinal classification cannot fire.
-        if was_bare_placeholder && let Expr::Literal(Literal::Integer(value), span) = &ordering.expr
-        {
-            let (value, span) = (*value, *span);
+        // SQLite resolves ORDER BY ordinals from the original syntax. Binding
+        // must not turn a parameter into an ordinal, including through unary
+        // signs or COLLATE wrappers. Keep genuine ordinals unchanged so zero,
+        // negative and out-of-range ones still receive their normal errors.
+        if !was_ordinal && connection_order_by_integer_ordinal(&ordering.expr).is_some() {
+            let span = ordering.expr.span();
+            let bound_expr =
+                std::mem::replace(&mut ordering.expr, Expr::Literal(Literal::Null, span));
             ordering.expr = Expr::BinaryOp {
                 left: Box::new(Expr::Literal(Literal::Integer(0), span)),
                 op: BinaryOp::Add,
-                right: Box::new(Expr::Literal(Literal::Integer(value), span)),
+                right: Box::new(bound_expr),
                 span,
             };
         }
