@@ -50,6 +50,13 @@ asupersync = { workspace = true }
 # `nix` keeps the FFI outside this workspace, which forbids `unsafe_code`.
 nix = { workspace = true, features = ["resource"] }
 
+[target.'cfg(windows)'.dependencies]
+# GH#532: a Windows console interprets the prompt's ANSI colours only after
+# the shell turns on virtual terminal processing. `winapi-util` wraps the
+# console-mode calls in a safe API, keeping that FFI outside this workspace,
+# which forbids `unsafe_code`.
+winapi-util = { workspace = true }
+
 [dev-dependencies]
 # The inline `#[cfg(test)]` module drives the async `run`/`run_with_shell_options`
 # entry points through `asupersync::test_utils::run_test`, which lives behind

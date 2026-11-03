@@ -1131,6 +1131,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "winapi-util",
 ]
 
 [[package]]

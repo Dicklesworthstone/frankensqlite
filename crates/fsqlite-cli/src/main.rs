@@ -12,7 +12,7 @@
 #![allow(clippy::large_futures)]
 
 use std::borrow::Cow;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::future::Future;
 use std::io::{self, BufRead, ErrorKind, IsTerminal, Write};
@@ -200,7 +200,11 @@ fn main() {
     let mut stderr = io::stderr();
     let shell_options = ShellOptions {
         show_prompts: interactive_input && interactive_output,
-        colorize_prompts: interactive_output,
+        colorize_prompts: ansi_colors_enabled(
+            interactive_output,
+            std::env::var_os("NO_COLOR").as_deref(),
+            enable_ansi_escape_processing,
+        ),
         fail_on_error: !interactive_input,
     };
 
@@ -225,6 +229,42 @@ fn main() {
     if exit_code != 0 {
         std::process::exit(exit_code);
     }
+}
+
+/// Whether the shell writes ANSI colour sequences (prompts, `.schema` and
+/// `.dump` highlighting) to stdout. That needs a terminal, no non-empty
+/// `NO_COLOR` (<https://no-color.org>), and a terminal that interprets the
+/// sequences: `enable_escapes` turns interpretation on where it is optional
+/// and reports whether it is in effect. It runs only when colour is otherwise
+/// wanted, so redirected output never changes a console's mode (GH#532).
+fn ansi_colors_enabled(
+    stdout_is_terminal: bool,
+    no_color: Option<&OsStr>,
+    enable_escapes: impl FnOnce() -> bool,
+) -> bool {
+    stdout_is_terminal && no_color.is_none_or(OsStr::is_empty) && enable_escapes()
+}
+
+/// A Windows console (cmd.exe, or the Windows PowerShell console host)
+/// prints ANSI sequences literally unless its output handle has
+/// `ENABLE_VIRTUAL_TERMINAL_PROCESSING`, which a program has to ask for:
+/// GH#532 showed `^[[1;36mfsqlite^[[0m>` on Windows 10. Windows Terminal
+/// already has the mode on, and a console that refuses it (Windows 10 before
+/// version 1511, or older) gets plain prompts. A terminal emulator that is not
+/// a console, such as mintty, hands the shell a pipe instead of a console
+/// handle and interprets the sequences itself; it says so through `TERM`.
+#[cfg(windows)]
+fn enable_ansi_escape_processing() -> bool {
+    match winapi_util::console::Console::stdout() {
+        Ok(mut console) => console.set_virtual_terminal_processing(true).is_ok(),
+        Err(_) => std::env::var_os("TERM").is_some_and(|term| !term.is_empty() && term != "dumb"),
+    }
+}
+
+/// Unix terminals interpret ANSI sequences without being asked.
+#[cfg(not(windows))]
+const fn enable_ansi_escape_processing() -> bool {
+    true
 }
 
 fn shell_runtime_builder() -> asupersync::runtime::RuntimeBuilder {
@@ -2765,7 +2805,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsString;
+    use std::ffi::{OsStr, OsString};
     use std::fs;
     use std::io::{self, BufRead, Cursor, Read};
     use std::path::PathBuf;
@@ -2779,9 +2819,9 @@ mod tests {
 
     use super::{
         ANSI_BOLD_BLUE, ANSI_DIM, ANSI_GREEN, ANSI_MAGENTA, ANSI_RESET, Connection, OutputMode,
-        OutputOptions, ShellOptions, format_row, highlight_sql, parse_args, render_display_value,
-        render_prompt, run, run_with_shell_options, statement_complete, write_delimited_rows,
-        write_query_plan_tree,
+        OutputOptions, ShellOptions, ansi_colors_enabled, format_row, highlight_sql, parse_args,
+        render_display_value, render_prompt, run, run_with_shell_options, statement_complete,
+        write_delimited_rows, write_query_plan_tree,
     };
 
     fn parse_from(args: &[&str]) -> Result<super::CliOptions, String> {
@@ -4919,6 +4959,34 @@ SELECT id FROM keep WHERE name = 'k3';\n"
         assert!(highlighted.contains(&format!("{ANSI_MAGENTA}7{ANSI_RESET}")));
         assert!(highlighted.contains(&format!("{ANSI_GREEN}'x'{ANSI_RESET}")));
         assert!(highlighted.contains(&format!("{ANSI_DIM}-- note{ANSI_RESET}")));
+    }
+
+    /// GH#532: a Windows 10 console that does not interpret escape sequences
+    /// printed `^[[1;36mfsqlite^[[0m>` because colour was decided by
+    /// "stdout is a terminal" alone.
+    #[test]
+    fn test_ansi_colors_need_a_terminal_that_interprets_them() {
+        assert!(
+            !ansi_colors_enabled(true, None, || false),
+            "a console that cannot interpret escape sequences must get plain prompts"
+        );
+        assert!(ansi_colors_enabled(true, None, || true));
+        assert!(
+            !ansi_colors_enabled(false, None, || panic!(
+                "redirected output must not change the console mode"
+            )),
+            "redirected output is never coloured"
+        );
+        assert!(
+            !ansi_colors_enabled(true, Some(OsStr::new("1")), || panic!(
+                "NO_COLOR must not change the console mode"
+            )),
+            "a non-empty NO_COLOR turns colour off"
+        );
+        assert!(
+            ansi_colors_enabled(true, Some(OsStr::new("")), || true),
+            "an empty NO_COLOR is ignored, as no-color.org specifies"
+        );
     }
 
     #[test]

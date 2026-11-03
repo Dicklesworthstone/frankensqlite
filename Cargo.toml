@@ -187,6 +187,8 @@ crossbeam-deque = "0.8"
 sha2 = "0.11"
 nix = { version = "0.31", default-features = false, features = ["fs", "process", "signal", "socket", "uio", "user"] }
 libc = "0.2"
+# Safe wrappers for Windows console calls (the shell's colour prompt, GH#532).
+winapi-util = "0.1.11"
 # GH#414: reports the running thread's remaining native stack so the trigger /
 # foreign-key recursion caps are measured against the stack that actually
 # exists rather than against this workspace's own `[profile.dev]` frame sizes.
