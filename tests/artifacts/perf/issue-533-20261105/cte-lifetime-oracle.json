@@ -1,0 +1,50 @@
+[
+  {
+    "case": "nested_shadow_distinct_roots",
+    "sql": "WITH c(x) AS MATERIALIZED (VALUES(1),(2),(3)) SELECT count(*) FROM generate_series(1,20) AS p WHERE EXISTS(SELECT 1 FROM c WHERE c.x=p.value) OR EXISTS(WITH c(x) AS MATERIALIZED (VALUES(5),(6),(7)) SELECT 1 FROM c WHERE c.x=p.value);",
+    "engines": {
+      "stock": {
+        "returncode": 0,
+        "stdout": "6\n",
+        "stderr": ""
+      },
+      "release412": {
+        "returncode": 0,
+        "stdout": "6\n",
+        "stderr": ""
+      }
+    }
+  },
+  {
+    "case": "correlated_nested_materialization",
+    "sql": "SELECT sum((WITH c(x) AS MATERIALIZED (SELECT o.value+value FROM generate_series(1,3)) SELECT count(*) FROM generate_series(1,12) AS p WHERE EXISTS(SELECT 1 FROM c WHERE c.x=p.value))) FROM generate_series(1,5) AS o;",
+    "engines": {
+      "stock": {
+        "returncode": 0,
+        "stdout": "15\n",
+        "stderr": ""
+      },
+      "release412": {
+        "returncode": 0,
+        "stdout": "15\n",
+        "stderr": ""
+      }
+    }
+  },
+  {
+    "case": "recursive_inner_probe_forbidden",
+    "sql": "WITH RECURSIVE c(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM c AS a WHERE x<3 AND EXISTS(SELECT 1 FROM c AS b WHERE b.x=a.x)) SELECT count(*) FROM c;",
+    "engines": {
+      "stock": {
+        "returncode": 1,
+        "stdout": "",
+        "stderr": "Parse error in 2nd command line argument: multiple recursive references: c\n"
+      },
+      "release412": {
+        "returncode": 0,
+        "stdout": "3\n",
+        "stderr": ""
+      }
+    }
+  }
+]

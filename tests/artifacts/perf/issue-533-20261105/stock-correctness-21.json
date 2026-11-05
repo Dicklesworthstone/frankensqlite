@@ -1,0 +1,203 @@
+{
+  "scope": "correctness only; no timing claims",
+  "harness_revision": "ffef921e803892d35acfa7f71a8860da8fef953b",
+  "harness_sha256": "18dc2c36c9ff78db4b328076aa8f647eab7d42161b4935f346483c4ff3d23a1f",
+  "started_utc": "2026-11-05T21:46:19.803939+00:00",
+  "binary": "/workspace/scratch/9d2af73a8e7b/native/stock/sqlite3",
+  "binary_sha256": "c9daa875c28379f0d61a833d47928c6e43b352d98638cd824ec405f23c99d870",
+  "version": "3.54.1 2026-10-16 14:45:20 555e07ef33f69a0957d24d8e555b702464a131d6f1607f4c3c1e4551e8e6ca76 (64-bit)",
+  "results": {
+    "cte_count": {
+      "sql": "WITH t AS (SELECT value FROM generate_series(1,1000000)) SELECT count(*) FROM t;",
+      "setup": [],
+      "expected": 1000000,
+      "returncode": 0,
+      "stdout": "1000000\n",
+      "stderr": "",
+      "passed": true
+    },
+    "single_count": {
+      "sql": "SELECT count(*) FROM generate_series(1,1000000);",
+      "setup": [],
+      "expected": 1000000,
+      "returncode": 0,
+      "stdout": "1000000\n",
+      "stderr": "",
+      "passed": true
+    },
+    "cte_correlated_exists": {
+      "sql": "WITH t AS (SELECT value FROM generate_series(1,10000)) SELECT count(*) FROM t WHERE EXISTS(SELECT 1 FROM t t1 WHERE t.value=t1.value);",
+      "setup": [],
+      "expected": 10000,
+      "returncode": 0,
+      "stdout": "10000\n",
+      "stderr": "",
+      "passed": true
+    },
+    "direct_correlated_exists": {
+      "sql": "SELECT count(*) FROM generate_series(1,10000)t WHERE EXISTS(SELECT 1 FROM generate_series(1,10000)t1 WHERE t.value=t1.value);",
+      "setup": [],
+      "expected": 10000,
+      "returncode": 0,
+      "stdout": "10000\n",
+      "stderr": "",
+      "passed": true
+    },
+    "cte_count_materialized": {
+      "sql": "WITH t AS MATERIALIZED (SELECT value FROM generate_series(1,1000000)) SELECT count(*) FROM t;",
+      "setup": [],
+      "expected": 1000000,
+      "returncode": 0,
+      "stdout": "1000000\n",
+      "stderr": "",
+      "passed": true
+    },
+    "cte_count_not_materialized": {
+      "sql": "WITH t AS NOT MATERIALIZED (SELECT value FROM generate_series(1,1000000)) SELECT count(*) FROM t;",
+      "setup": [],
+      "expected": 1000000,
+      "returncode": 0,
+      "stdout": "1000000\n",
+      "stderr": "",
+      "passed": true
+    },
+    "cte_body_filter_count": {
+      "sql": "WITH t AS (SELECT value FROM generate_series(1,1000000) WHERE value<=500000) SELECT count(*) FROM t;",
+      "setup": [],
+      "expected": 500000,
+      "returncode": 0,
+      "stdout": "500000\n",
+      "stderr": "",
+      "passed": true
+    },
+    "cte_outer_filter_count": {
+      "sql": "WITH t AS (SELECT value FROM generate_series(1,1000000)) SELECT count(*) FROM t WHERE value<=500000;",
+      "setup": [],
+      "expected": 500000,
+      "returncode": 0,
+      "stdout": "500000\n",
+      "stderr": "",
+      "passed": true
+    },
+    "cte_projected_sum": {
+      "sql": "WITH t AS (SELECT value*2+1 AS n FROM generate_series(1,1000000)) SELECT sum(n) FROM t;",
+      "setup": [],
+      "expected": 1000002000000,
+      "returncode": 0,
+      "stdout": "1000002000000\n",
+      "stderr": "",
+      "passed": true
+    },
+    "cte_named_column_sum": {
+      "sql": "WITH t(n) AS (SELECT value FROM generate_series(1,1000000)) SELECT sum(n) FROM t;",
+      "setup": [],
+      "expected": 500000500000,
+      "returncode": 0,
+      "stdout": "500000500000\n",
+      "stderr": "",
+      "passed": true
+    },
+    "cte_hidden_column_sum": {
+      "sql": "WITH t AS (SELECT value,start,stop,step FROM generate_series(1,1000000,2)) SELECT sum(start+step)+max(stop)-max(value) FROM t;",
+      "setup": [],
+      "expected": 1500001,
+      "returncode": 0,
+      "stdout": "1500001\n",
+      "stderr": "",
+      "passed": true
+    },
+    "cte_hidden_constraint_miss": {
+      "sql": "WITH t AS (SELECT value,step FROM generate_series(1,1000000,2)) SELECT count(*) FROM t WHERE step=3;",
+      "setup": [],
+      "expected": 0,
+      "returncode": 0,
+      "stdout": "0\n",
+      "stderr": "",
+      "passed": true
+    },
+    "cte_limited_sum": {
+      "sql": "WITH t AS (SELECT value FROM generate_series(1,1000000) LIMIT 100 OFFSET 10) SELECT sum(value) FROM t;",
+      "setup": [],
+      "expected": 6050,
+      "returncode": 0,
+      "stdout": "6050\n",
+      "stderr": "",
+      "passed": true
+    },
+    "cte_ordered_limit_sum": {
+      "sql": "WITH t AS (SELECT value FROM generate_series(1,1000000) ORDER BY value DESC LIMIT 3) SELECT sum(value) FROM t;",
+      "setup": [],
+      "expected": 2999997,
+      "returncode": 0,
+      "stdout": "2999997\n",
+      "stderr": "",
+      "passed": true
+    },
+    "cte_empty_count": {
+      "sql": "WITH t AS (SELECT value FROM generate_series(2,1)) SELECT count(*) FROM t;",
+      "setup": [],
+      "expected": 0,
+      "returncode": 0,
+      "stdout": "0\n",
+      "stderr": "",
+      "passed": true
+    },
+    "cte_multiple_reference_sum": {
+      "sql": "WITH t AS (SELECT value FROM generate_series(1,100000)) SELECT (SELECT sum(value) FROM t)+(SELECT count(*) FROM t);",
+      "setup": [],
+      "expected": 5000150000,
+      "returncode": 0,
+      "stdout": "5000150000\n",
+      "stderr": "",
+      "passed": true
+    },
+    "cte_correlated_exists_materialized": {
+      "sql": "WITH t AS MATERIALIZED (SELECT value FROM generate_series(1,1000)) SELECT count(*) FROM t WHERE EXISTS(SELECT 1 FROM t t1 WHERE t.value=t1.value);",
+      "setup": [],
+      "expected": 1000,
+      "returncode": 0,
+      "stdout": "1000\n",
+      "stderr": "",
+      "passed": true
+    },
+    "cte_correlated_exists_not_materialized": {
+      "sql": "WITH t AS NOT MATERIALIZED (SELECT value FROM generate_series(1,1000)) SELECT count(*) FROM t WHERE EXISTS(SELECT 1 FROM t t1 WHERE t.value=t1.value);",
+      "setup": [],
+      "expected": 1000,
+      "returncode": 0,
+      "stdout": "1000\n",
+      "stderr": "",
+      "passed": true
+    },
+    "cte_correlated_miss": {
+      "sql": "WITH t AS (SELECT value FROM generate_series(1,1000)) SELECT count(*) FROM t WHERE EXISTS(SELECT 1 FROM t t1 WHERE t.value=t1.value+1000);",
+      "setup": [],
+      "expected": 0,
+      "returncode": 0,
+      "stdout": "0\n",
+      "stderr": "",
+      "passed": true
+    },
+    "direct_correlated_miss": {
+      "sql": "SELECT count(*) FROM generate_series(1,1000)t WHERE EXISTS(SELECT 1 FROM generate_series(1,1000)t1 WHERE t.value=t1.value+1000);",
+      "setup": [],
+      "expected": 0,
+      "returncode": 0,
+      "stdout": "0\n",
+      "stderr": "",
+      "passed": true
+    },
+    "cte_correlated_offset": {
+      "sql": "WITH t AS (SELECT value FROM generate_series(1,1000)) SELECT count(*) FROM t WHERE EXISTS(SELECT 1 FROM t t1 WHERE t.value=t1.value+1);",
+      "setup": [],
+      "expected": 999,
+      "returncode": 0,
+      "stdout": "999\n",
+      "stderr": "",
+      "passed": true
+    }
+  },
+  "finished_utc": "2026-11-05T21:46:20.617759+00:00",
+  "passed": 21,
+  "failed": 0
+}

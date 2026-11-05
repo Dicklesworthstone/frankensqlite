@@ -1,0 +1,2222 @@
+diff --git a/crates/fsqlite-core/src/connection.rs b/crates/fsqlite-core/src/connection.rs
+index ce25a63..0510766 100644
+--- a/crates/fsqlite-core/src/connection.rs
++++ b/crates/fsqlite-core/src/connection.rs
+@@ -35,6 +35,7 @@ mod conformal_retry;
+ mod insert_batch;
+ mod pragma_maintenance;
+ mod qualified_column_binding;
++mod table_function_exists;
+ 
+ /// Required mirror refreshes and optional prepared-read acceleration have
+ /// different admission rules. Only the latter may decline row hydration.
+@@ -40965,7 +40966,17 @@ impl Connection {
+                     self.log_mem_execution_fallback("select", "time_travel_snapshot")?;
+                     return Box::pin(self.execute_time_travel_select(select, params, &target)).await;
+                 }
+-                // CTE (WITH clause): materialize as temporary tables.
++                // GH#533: a transparent, single-use table-function CTE can use
++                // the same strict flattening and execution lane as a derived
++                // table. Do this after lexical validation and before entering
++                // the materialization fallback (or changing its guards).
++                if let Some(flattened) = self.lower_single_use_table_function_cte(select) {
++                    return Box::pin(
++                        self.execute_statement(&Statement::Select(flattened), params),
++                    )
++                    .await;
++                }
++                // Remaining CTEs materialize as temporary tables.
+                 if select.with.is_some() {
+                     self.log_mem_execution_fallback("select", "with_clause_materialization")?;
+                     return Box::pin(self.execute_with_ctes(select, params)).await;
+@@ -90254,12 +90265,6 @@ impl Connection {
+         row: &[SqliteValue],
+         col_map: &[(String, String, bool)],
+     ) -> Option<Result<SqliteValue>> {
+-        // The direct probe reads MemDB rows. In parity-cert file-backed mode
+-        // that mirror may be intentionally unhydrated; fall through so the
+-        // nested SELECT uses the pager-backed path instead.
+-        if !self.join_mem_scan_safe() {
+-            return None;
+-        }
+         // Gate: no CTE, no compounds.
+         if subquery.with.is_some() || !subquery.body.compounds.is_empty() {
+             return None;
+@@ -90296,17 +90301,26 @@ impl Connection {
+         if !from.joins.is_empty() {
+             return None;
+         }
+-        let (table_name, inner_binding_name) = match &from.source {
+-            TableOrSubquery::Table { name, alias, .. } if name.schema.is_none() => {
+-                (&name.name, alias.as_deref().unwrap_or(&name.name))
+-            }
++        let (table_name, inner_binding_name, index_hint, time_travel) = match &from.source {
++            TableOrSubquery::Table {
++                name,
++                alias,
++                index_hint,
++                time_travel,
++            } if name.schema.is_none() => (
++                &name.name,
++                alias.as_deref().unwrap_or(&name.name),
++                index_hint,
++                time_travel,
++            ),
+             _ => return None,
+         };
+         let table_name_key = table_name.to_ascii_lowercase();
+         // TEMP relations and names participating in TEMP-over-main shadowing
+         // require namespace-aware binding and storage routing. The ordinary
+         // fallback already implements that resolver; this root-page memo does
+-        // not, so keep its admission surface to unshadowed MAIN tables.
++        // not, so keep its admission surface to unshadowed MAIN tables and
++        // statement-owned materialized CTEs.
+         if self.temp_table_names.borrow().contains(&table_name_key)
+             || self
+                 .shadowed_main_tables
+@@ -90315,12 +90329,29 @@ impl Connection {
+         {
+             return None;
+         }
+-        let table_entry = self
+-            .schema
+-            .borrow()
+-            .iter()
+-            .find(|table| table.name.eq_ignore_ascii_case(table_name))?
+-            .clone();
++        // A statement-owned materialized CTE lives entirely in MemDB. Its
++        // rows remain authoritative even when the persistent-table mirror is
++        // intentionally unhydrated. Keep pager-backed tables on their normal
++        // route unless that mirror is known to be current (GH#533).
++        let (table_entry, materialized_cte) = {
++            let schema = self.schema.borrow();
++            let table = schema
++                .iter()
++                .find(|table| table.name.eq_ignore_ascii_case(table_name))?;
++            let materialized_cte = self
++                .materialized_temp_root_pages
++                .borrow()
++                .contains(&table.root_page);
++            if !self.join_mem_scan_safe() && !materialized_cte {
++                return None;
++            }
++            // Retain source-decoration validation and execution on the ordinary
++            // route; the new CTE exception is only for an unadorned relation.
++            if materialized_cte && (index_hint.is_some() || time_travel.is_some()) {
++                return None;
++            }
++            (table.clone(), materialized_cte)
++        };
+         // Gate: WHERE clause must exist.
+         let where_expr = where_clause.as_ref()?;
+         // Decompose WHERE into AND terms.
+@@ -90358,6 +90389,16 @@ impl Connection {
+         let context = current_join_eval_collation_context_snapshot()?;
+         let outer_affinity = context.column_affinities.get(probe.outer_index).copied()?;
+         let inner_affinity = affinity_char_to_type(inner_column.affinity);
++        // Materialized CTE metadata currently represents both a declared BLOB
++        // column and a computed expression with no affinity as 'A'. This memo
++        // assumes declared columns. TEXT comparisons can distinguish those
++        // cases, so retain the ordinary route until metadata preserves that
++        // distinction end to end. Numeric/raw equality is unaffected (GH#533).
++        if materialized_cte
++            && (inner_affinity == TypeAffinity::Text || outer_affinity == TypeAffinity::Text)
++        {
++            return None;
++        }
+         let outer_collation = context
+             .column_collations
+             .get(probe.outer_index)
+@@ -91209,6 +91250,14 @@ impl Connection {
+                         let truth = if *not { !exists } else { exists };
+                         return Ok(SqliteValue::Integer(i64::from(truth)));
+                     }
++                    // GH#533: table-function sources otherwise materialize
++                    // every inner row before WHERE/LIMIT. Plan their bound
++                    // constraints and stop the cursor at the first match.
++                    if let Some(scanned) = self.try_table_function_exists_probe(&sub_clone) {
++                        let exists = scanned?;
++                        let truth = if *not { !exists } else { exists };
++                        return Ok(SqliteValue::Integer(i64::from(truth)));
++                    }
+                     // bd-nd2ju (#377, L3): relax collation/affinity-safe correlated
+                     // equalities (`inner_col = <bound outer value>`) to plain literals
+                     // so the nested statement compiles to an index / PRIMARY KEY seek
+@@ -97162,6 +97211,47 @@ impl Connection {
+         Ok(result)
+     }
+ 
++    /// Keep extension callbacks on the materializing path. A count over an
++    /// inlined projection need not fetch its projected columns; a replacement
++    /// module's xColumn may fail or change connection state. The unchanged
++    /// built-in integer series is the only source admitted here; other modules
++    /// retain their existing affinity, hidden-column and callback behavior.
++    fn lower_single_use_table_function_cte(
++        &self,
++        select: &SelectStatement,
++    ) -> Option<SelectStatement> {
++        let with = select.with.as_ref()?;
++        if with.recursive
++            || with.ctes.len() != 1
++            || self.scalar_function_overridden.get()
++            || self.custom_aggregate_registered.get()
++            || !lock_unpoisoned(self.collation_registry.as_ref())
++                .uses_builtin_implementation("BINARY")
++        {
++            return None;
++        }
++        let SelectCore::Select {
++            from: Some(from), ..
++        } = &with.ctes[0].query.body.select
++        else {
++            return None;
++        };
++        let TableOrSubquery::TableFunction { name, .. } = &from.source else {
++            return None;
++        };
++        let name = name.to_ascii_uppercase();
++        let modules = self.vtab_modules.borrow();
++        if name != "GENERATE_SERIES"
++            || !Arc::ptr_eq(
++                modules.get(&name)?,
++                shared_default_vtab_module_registry().get(&name)?,
++            )
++        {
++            return None;
++        }
++        flatten_single_use_table_function_cte(select)
++    }
++
+     /// Materialize CTEs as temporary in-memory tables, execute the main query
+     /// with `with` stripped, then clean up the temporary tables.
+     async fn execute_with_ctes(
+@@ -99096,13 +99186,16 @@ impl Connection {
+                 );
+                 self.rebuild_schema_indices();
+                 temp_tables.push((cte_name.clone(), root_page));
+-                for (i, row) in cte_rows.iter().enumerate() {
+-                    let vals: Vec<SqliteValue> = row.values().to_vec();
+-                    #[allow(clippy::cast_possible_wrap)]
+-                    let rowid = (i + 1) as i64;
+-                    let mut db = self.db.borrow_mut();
+-                    if let Some(table) = db.get_table_mut(root_page) {
+-                        table.insert_row(rowid, vals);
++                // The result rows are owned by this materialization. Transfer
++                // their values into the temporary table instead of retaining
++                // a second complete copy until every row has been inserted.
++                // This also preserves text/blob storage without cloning it.
++                let mut db = self.db.borrow_mut();
++                if let Some(table) = db.get_table_mut(root_page) {
++                    for (i, row) in cte_rows.into_iter().enumerate() {
++                        #[allow(clippy::cast_possible_wrap)]
++                        let rowid = (i + 1) as i64;
++                        table.insert_row(rowid, row.values);
+                     }
+                 }
+             }
+@@ -117152,6 +117245,182 @@ fn prune_unreferenced_ctes(select: &SelectStatement) -> Option<fsqlite_ast::With
+     Some(pruned)
+ }
+ 
++/// GH#533: lower a transparent, single-reference table-function CTE through
++/// the established derived-table flattener. Called only after the original
++/// statement's lexical preflight, so unused projected columns are validated
++/// before a consumer such as count(*) can eliminate them.
++fn flatten_single_use_table_function_cte(select: &SelectStatement) -> Option<SelectStatement> {
++    let with = select.with.as_ref()?;
++    if with.recursive || with.ctes.len() != 1 {
++        return None;
++    }
++    let cte = &with.ctes[0];
++    // Explicit hints retain their own execution policy. In particular the
++    // existing NOT MATERIALIZED rewriter owns repeated and chained references.
++    if cte.materialized.is_some()
++        || cte.query.with.is_some()
++        || !cte.query.body.compounds.is_empty()
++        || !cte.query.order_by.is_empty()
++        || cte.query.limit.is_some()
++    {
++        return None;
++    }
++    let SelectCore::Select {
++        distinct: Distinctness::All,
++        columns,
++        from: Some(body_from),
++        where_clause: body_filter,
++        group_by,
++        having: None,
++        windows,
++    } = &cte.query.body.select
++    else {
++        return None;
++    };
++    let TableOrSubquery::TableFunction { args, .. } = &body_from.source else {
++        return None;
++    };
++    // Copy only column projections: flattening must not omit or duplicate a
++    // volatile projected expression, or expose a hidden column through `*`.
++    // Stable source arguments exclude callbacks and correlated expressions.
++    if !body_from.joins.is_empty()
++        || !group_by.is_empty()
++        || !windows.is_empty()
++        || !columns.iter().all(|column| {
++            matches!(
++                column,
++                ResultColumn::Expr {
++                    expr: Expr::Column(..),
++                    ..
++                }
++            )
++        })
++        || !args.iter().all(|expr| transparent_cte_expr(expr, false))
++        || body_filter
++            .as_deref()
++            .is_some_and(|expr| !transparent_cte_expr(expr, true))
++    {
++        return None;
++    }
++
++    let mut derived = select.clone();
++    derived.with = None;
++    let mut references = 0usize;
++    visit_select_qualified_names(&derived, &mut |name| {
++        if name.schema.is_none() && name.name.eq_ignore_ascii_case(&cte.name) {
++            references += 1;
++        }
++        Ok(())
++    })
++    .ok()?;
++    if references != 1
++        || derived
++            .order_by
++            .iter()
++            .any(|term| !transparent_cte_expr(&term.expr, true))
++        || derived.limit.as_ref().is_some_and(|limit| {
++            !transparent_cte_expr(&limit.limit, false)
++                || limit
++                    .offset
++                    .as_ref()
++                    .is_some_and(|expr| !transparent_cte_expr(expr, false))
++        })
++    {
++        return None;
++    }
++    let SelectCore::Select {
++        columns,
++        from: Some(from),
++        where_clause,
++        ..
++    } = &mut derived.body.select
++    else {
++        return None;
++    };
++    if !columns.iter().all(transparent_cte_consumer_column)
++        || where_clause
++            .as_deref()
++            .is_some_and(|expr| !transparent_cte_expr(expr, true))
++    {
++        return None;
++    }
++    let TableOrSubquery::Table {
++        name,
++        alias,
++        index_hint: None,
++        time_travel: None,
++    } = &from.source
++    else {
++        return None;
++    };
++    if name.schema.is_some() || !name.name.eq_ignore_ascii_case(&cte.name) {
++        return None;
++    }
++    let alias = alias.clone().unwrap_or_else(|| name.name.clone());
++    from.source = TableOrSubquery::Subquery {
++        query: Box::new(cte_inline_body(cte)?),
++        alias: Some(alias),
++    };
++    // The established strict map preserves the CTE's exposed names and alias,
++    // declines ambiguous projections, and keeps all semantic barriers. It
++    // never resolves an unexposed name against the underlying virtual table.
++    flatten_from_subquery_select(&derived, true)
++}
++
++/// Expressions without callbacks or clock reads that can cross a transparent
++/// CTE projection. Functions, collations and subqueries also decline;
++/// table-function arguments additionally cannot read an outer column.
++fn transparent_cte_expr(expr: &Expr, allow_columns: bool) -> bool {
++    match expr {
++        Expr::Literal(
++            Literal::CurrentTime | Literal::CurrentDate | Literal::CurrentTimestamp,
++            _,
++        ) => false,
++        Expr::Literal(..) | Expr::Placeholder(..) => true,
++        Expr::Column(..) => allow_columns,
++        Expr::UnaryOp { expr, .. }
++        | Expr::Cast { expr, .. }
++        | Expr::IsNull { expr, .. } => transparent_cte_expr(expr, allow_columns),
++        Expr::BinaryOp { left, right, .. } => {
++            transparent_cte_expr(left, allow_columns) && transparent_cte_expr(right, allow_columns)
++        }
++        _ => false,
++    }
++}
++
++/// The connection gate proves no scalar/aggregate replacement is installed.
++/// Keep all other function calls, including volatile builtins, on the original
++/// execution path instead of moving them across the materialization boundary.
++fn transparent_cte_consumer_column(column: &ResultColumn) -> bool {
++    let ResultColumn::Expr { expr, .. } = column else {
++        return true;
++    };
++    if transparent_cte_expr(expr, true) {
++        return true;
++    }
++    let Expr::FunctionCall {
++        name,
++        args,
++        distinct: false,
++        order_by,
++        filter: None,
++        over: None,
++        ..
++    } = expr
++    else {
++        return false;
++    };
++    order_by.is_empty()
++        && matches!(
++            name.to_ascii_lowercase().as_str(),
++            "count" | "sum" | "avg" | "min" | "max"
++        )
++        && match args {
++            FunctionArgs::Star => name.eq_ignore_ascii_case("count"),
++            FunctionArgs::List(args) => args.len() == 1 && transparent_cte_expr(&args[0], true),
++        }
++}
++
+ /// bd-gh-cte-materialization-hints-sn0yh / GH#204: inline every reference to a
+ /// `NOT MATERIALIZED` non-recursive CTE as a derived subquery so its body
+ /// re-evaluates at each use, matching SQLite (a materialized CTE is computed
+diff --git a/crates/fsqlite-core/tests/bd_5ap77_from_subquery_aggregate_flattening.rs b/crates/fsqlite-core/tests/bd_5ap77_from_subquery_aggregate_flattening.rs
+index 4f39b6c..70683f0 100644
+--- a/crates/fsqlite-core/tests/bd_5ap77_from_subquery_aggregate_flattening.rs
++++ b/crates/fsqlite-core/tests/bd_5ap77_from_subquery_aggregate_flattening.rs
+@@ -12,6 +12,8 @@
+ use fsqlite_core::connection::Connection;
+ use fsqlite_types::SqliteValue;
+ use rusqlite::types::Value;
++use std::sync::Arc;
++use std::sync::atomic::{AtomicUsize, Ordering};
+ 
+ fn tag_f(v: &SqliteValue) -> String {
+     match v {
+@@ -198,9 +200,584 @@ fn from_subquery_over_table_function_matches_table_equivalent() {
+         }
+         // Hidden argument columns are not exposed through `*` (stock: no such column).
+         assert!(
+-            frank(&conn, "SELECT max(start) FROM (SELECT * FROM generate_series(1, 5))")
+-                .await
+-                .is_err()
++            frank(
++                &conn,
++                "SELECT max(start) FROM (SELECT * FROM generate_series(1, 5))"
++            )
++            .await
++            .is_err()
++        );
++    });
++}
++
++fn used_cte_materialization(conn: &Connection) -> bool {
++    conn.fallback_decision_snapshot()
++        .decisions
++        .iter()
++        .any(|decision| decision.decision_reason == "with_clause_materialization")
++}
++
++/// GH#533: the new lowering must preserve the CTE's exposed names and the
++/// stock results while removing the materialization boundary for simple reads.
++/// A typeless stock table has the same values and affinity as generate_series.
++#[test]
++fn single_use_table_function_ctes_match_stock_and_preserve_scope() {
++    asupersync::test_utils::run_test(|| async {
++        let oracle = rusqlite::Connection::open_in_memory().unwrap();
++        oracle
++            .execute_batch(
++                "CREATE TABLE g(value); \
++             WITH RECURSIVE s(value) AS (VALUES(1) UNION ALL SELECT value+1 FROM s WHERE value<32) \
++             INSERT INTO g SELECT value FROM s;",
++            )
++            .unwrap();
++        for file_backed in [false, true] {
++            let dir = tempfile::tempdir().unwrap();
++            let path = dir.path().join("gh533.db");
++            let target = if file_backed {
++                path.to_string_lossy().into_owned()
++            } else {
++                ":memory:".to_owned()
++            };
++            let conn = Connection::open(&target).await.unwrap();
++            for sql in [
++                "WITH t AS (SELECT value FROM generate_series(1,32)) SELECT count(*) FROM t",
++                "WITH t(v) AS (SELECT value FROM generate_series(1,32)) SELECT count(v),sum(v),avg(v),min(v),max(v) FROM t",
++                "WITH T(V) AS (SELECT s.value FROM generate_series(1,32) s) SELECT count(q.v),sum(q.v) FROM t q WHERE q.v>=10",
++                "WITH t(v) AS (SELECT s.value FROM generate_series(1,32) s WHERE s.value%3=0) SELECT sum(v) FROM t WHERE v>=9",
++            ] {
++                conn.reset_fallback_decision_evidence();
++                let expected = stock(&oracle, &sql.replace("generate_series(1,32)", "g"));
++                assert_eq!(
++                    frank(&conn, sql).await,
++                    expected,
++                    "file={file_backed}: {sql}"
++                );
++                assert!(
++                    !used_cte_materialization(&conn),
++                    "simple CTE still materialized: {sql}"
++                );
++            }
++            for sql in [
++                "WITH t AS (SELECT value AS v FROM generate_series(1,32)) SELECT q.v FROM t q WHERE q.v<4 ORDER BY q.v DESC",
++                "WITH t(a,b) AS (SELECT value,value FROM generate_series(1,32)) SELECT sum(a),sum(b) FROM t",
++                "WITH t AS (SELECT value AS v,value AS v FROM generate_series(1,32)) SELECT count(*) FROM t",
++                "WITH t AS (SELECT value FROM generate_series(1,32)) SELECT count(*) FROM t WHERE value='5'",
++                "WITH t AS MATERIALIZED (SELECT value FROM generate_series(1,32)) SELECT count(*) FROM t",
++                "WITH t AS NOT MATERIALIZED (SELECT value FROM generate_series(1,32)) SELECT count(*) FROM t",
++                "WITH RECURSIVE t AS (SELECT value FROM generate_series(1,32)) SELECT count(*) FROM t",
++                "WITH t AS (SELECT value FROM generate_series(1,32)) SELECT count(*) FROM t a,t b WHERE a.value=b.value",
++                "WITH t AS (SELECT value FROM generate_series(1,32)) SELECT count(*) FROM t WHERE EXISTS(SELECT 1 FROM t t1 WHERE t.value=t1.value)",
++                "WITH t AS (SELECT value FROM generate_series(1,32)) SELECT count(*) FROM t WHERE EXISTS(WITH t AS (SELECT 0 AS value) SELECT 1 FROM t WHERE t.value=0)",
++                "WITH t AS (SELECT value FROM generate_series(1,32)), u AS (SELECT value FROM t) SELECT count(*) FROM u",
++                "WITH t AS (SELECT value FROM generate_series(1,32) ORDER BY value DESC) SELECT group_concat(value) FROM t",
++                "WITH t AS (SELECT value FROM generate_series(1,32) LIMIT 4 OFFSET 2) SELECT sum(value) FROM t",
++                "WITH t AS (SELECT DISTINCT value FROM generate_series(1,32)) SELECT count(*) FROM t",
++                "WITH t AS (SELECT value FROM generate_series(1,32)) SELECT count(*) FROM t LIMIT 0",
++                "WITH t AS (SELECT value FROM generate_series(1,32)) SELECT count(*) FROM t LIMIT 1 OFFSET 1",
++                // Invalid source/exposed names must be resolved before count
++                // can discard the projection. Both engines must reject them.
++                "WITH t AS (SELECT missing FROM generate_series(1,32)) SELECT count(*) FROM t",
++                "WITH t AS (SELECT bad.value FROM generate_series(1,32)) SELECT count(*) FROM t",
++                "WITH t(v) AS (SELECT value FROM generate_series(1,32)) SELECT count(value) FROM t",
++                "WITH t(a,b) AS (SELECT value FROM generate_series(1,32)) SELECT count(*) FROM t",
++                "WITH t AS (SELECT value FROM generate_series(1,32)) SELECT count(t.start) FROM t",
++                "WITH t AS (SELECT value FROM generate_series(1,32)) SELECT count(t.rowid) FROM t",
++                "WITH t AS (SELECT value FROM generate_series(1,32)) SELECT count(generate_series.value) FROM t",
++            ] {
++                let actual = frank(&conn, sql).await;
++                let expected = stock(&oracle, &sql.replace("generate_series(1,32)", "g"));
++                match (&actual, &expected) {
++                    (Ok(actual), Ok(expected)) => {
++                        assert_eq!(actual, expected, "file={file_backed}: {sql}")
++                    }
++                    (Err(_), Err(_)) => {}
++                    _ => panic!("file={file_backed}: {sql}: frank {actual:?}, stock {expected:?}"),
++                }
++            }
++            for sql in [
++                "WITH t AS MATERIALIZED (SELECT value FROM generate_series(1,32)) SELECT count(*) FROM t",
++                "WITH t AS (SELECT value FROM generate_series(1,32)) SELECT count(*) FROM t WHERE EXISTS(SELECT 1 FROM t t1 WHERE t.value=t1.value)",
++                "WITH t AS (SELECT value FROM generate_series(1,32) ORDER BY value) SELECT count(*) FROM t",
++                "WITH t AS (SELECT value FROM generate_series(1,32) LIMIT 4) SELECT count(*) FROM t",
++                "WITH t AS (SELECT value+1 AS v FROM generate_series(1,32)) SELECT count(*) FROM t",
++                // Clock keywords are literal AST nodes but are evaluated at
++                // runtime. These assertions check the route, never the clock.
++                "WITH t AS (SELECT value FROM generate_series(1,32) WHERE CURRENT_TIME IS NOT NULL) SELECT count(*) FROM t",
++                "WITH t AS (SELECT value FROM generate_series(1,32) WHERE CURRENT_DATE IS NOT NULL) SELECT count(*) FROM t",
++                "WITH t AS (SELECT value FROM generate_series(1,32) WHERE CURRENT_TIMESTAMP IS NOT NULL) SELECT count(*) FROM t",
++                "WITH t AS (SELECT value FROM generate_series(1,1,CAST(CURRENT_TIME AS INTEGER))) SELECT count(*) FROM t",
++                "WITH t AS (SELECT value FROM generate_series(1,32)) SELECT count(*),CURRENT_TIMESTAMP FROM t",
++            ] {
++                conn.reset_fallback_decision_evidence();
++                frank(&conn, sql).await.unwrap();
++                assert!(
++                    used_cte_materialization(&conn),
++                    "CTE barrier was bypassed: {sql}"
++                );
++            }
++            conn.close().await.unwrap();
++        }
++    });
++}
++
++#[test]
++fn single_use_table_function_ctes_preserve_parameters_hidden_columns_and_insert_limits() {
++    asupersync::test_utils::run_test(|| async {
++        let conn = Connection::open(":memory:").await.unwrap();
++        let sql = "WITH t(v) AS (SELECT value FROM generate_series(?1,?2,?3)) \
++                   SELECT count(*),sum(v),min(v),max(v) FROM t WHERE v>=?4";
++        {
++            let prepared = conn.prepare(sql).await.unwrap();
++            for (bounds, expected) in [
++                ([1, 8, 2, 3], vec![3.into(), 15.into(), 3.into(), 7.into()]),
++                ([8, 1, -3, 2], vec![3.into(), 15.into(), 2.into(), 8.into()]),
++                (
++                    [5, 1, 1, 0],
++                    vec![
++                        0.into(),
++                        SqliteValue::Null,
++                        SqliteValue::Null,
++                        SqliteValue::Null,
++                    ],
++                ),
++                ([1, 3, 0, 0], vec![3.into(), 6.into(), 1.into(), 3.into()]),
++            ] {
++                let params = bounds.map(SqliteValue::Integer);
++                for prepared_api in [false, true] {
++                    conn.reset_fallback_decision_evidence();
++                    let rows = if prepared_api {
++                        prepared.query_with_params(&params).await.unwrap()
++                    } else {
++                        conn.query_with_params(sql, &params).await.unwrap()
++                    };
++                    assert_eq!(rows.len(), 1, "{bounds:?}");
++                    assert_eq!(
++                        rows[0].values(),
++                        expected,
++                        "prepared={prepared_api}, {bounds:?}"
++                    );
++                    assert!(
++                        !used_cte_materialization(&conn),
++                        "prepared={prepared_api}, {bounds:?}"
++                    );
++                }
++            }
++        }
++        assert_eq!(
++            frank(&conn, "WITH t(v,lo,hi,delta) AS (SELECT value,start,stop,step FROM generate_series(2,8,2)) SELECT count(v),min(lo),max(hi),sum(delta) FROM t").await.unwrap(),
++            vec![vec!["int:4".to_owned(), "int:2".to_owned(), "int:8".to_owned(), "int:8".to_owned()]],
++        );
++        {
++            let prepared = conn.prepare(
++                "WITH t(first,second) AS (SELECT value,value FROM generate_series(1,2)) SELECT t.* FROM t"
++            ).await.unwrap();
++            assert_eq!(
++                prepared.column_names(),
++                vec!["first".to_owned(), "second".to_owned()]
++            );
++            let rows = prepared.query().await.unwrap();
++            assert_eq!(rows[0].values(), &[1.into(), 1.into()]);
++            assert_eq!(rows[1].values(), &[2.into(), 2.into()]);
++        }
++        for sql in [
++            "WITH t AS (SELECT value FROM generate_series(1,5)) SELECT count(start) FROM t",
++            "WITH t AS (SELECT * FROM generate_series(1,5)) SELECT count(start) FROM t",
++        ] {
++            assert!(
++                frank(&conn, sql).await.is_err(),
++                "hidden column escaped its projection: {sql}"
++            );
++        }
++        for source in ["generate_series()", "generate_series(1,2,3,4)"] {
++            for hint in ["", "MATERIALIZED"] {
++                let sql =
++                    format!("WITH t AS {hint} (SELECT value FROM {source}) SELECT count(*) FROM t");
++                assert!(
++                    frank(&conn, &sql).await.is_err(),
++                    "invalid arguments accepted: {sql}"
++                );
++            }
++        }
++        conn.execute("CREATE TABLE out(n)").await.unwrap();
++        for sql in [
++            "INSERT INTO out WITH t AS (SELECT value FROM generate_series(1,8)) SELECT count(*) FROM t LIMIT 0",
++            "INSERT INTO out WITH t AS (SELECT value FROM generate_series(1,8)) SELECT count(*) FROM t LIMIT 1 OFFSET 1",
++            "WITH t AS (SELECT value FROM generate_series(1,8)) INSERT INTO out SELECT count(*) FROM t LIMIT 0",
++        ] {
++            assert_eq!(conn.execute(sql).await.unwrap(), 0, "{sql}");
++        }
++        assert_eq!(
++            frank(&conn, "SELECT count(*) FROM out").await.unwrap(),
++            vec![vec!["int:0".to_owned()]]
++        );
++        conn.execute("INSERT INTO out WITH t AS (SELECT value FROM generate_series(1,8)) SELECT count(*) FROM t").await.unwrap();
++        assert_eq!(
++            frank(&conn, "SELECT n FROM out").await.unwrap(),
++            vec![vec!["int:8".to_owned()]]
++        );
++        conn.close().await.unwrap();
++    });
++}
++
++#[test]
++#[cfg(feature = "ext-json")]
++fn table_function_cte_json_controls_preserve_storage_classes_and_filters() {
++    asupersync::test_utils::run_test(|| async {
++        let conn = Connection::open(":memory:").await.unwrap();
++        let oracle = rusqlite::Connection::open_in_memory().unwrap();
++        for sql in [
++            "WITH t AS (SELECT key,value FROM json_each('[null,1,1.5,\"2\",true,false]')) SELECT count(*),count(value),sum(value),avg(value) FROM t",
++            "WITH t(k,v) AS (SELECT key,value FROM json_each('[null,1,1.5,\"2\",true,false]')) SELECT k,v FROM t ORDER BY k",
++            "WITH t AS (SELECT key,value FROM json_each('[1,2,3,4]') WHERE key>=1) SELECT sum(value) FROM t WHERE key<3",
++            "WITH t AS (SELECT value FROM json_tree('[1,[2,3]]')) SELECT count(*) FROM t",
++            "WITH t AS (SELECT value FROM json_each('[]')) SELECT count(*),sum(value),avg(value),min(value),max(value) FROM t",
++        ] {
++            conn.reset_fallback_decision_evidence();
++            assert_eq!(frank(&conn, sql).await, stock(&oracle, sql), "{sql}");
++            assert!(
++                used_cte_materialization(&conn),
++                "JSON control changed its execution path: {sql}"
++            );
++        }
++        conn.close().await.unwrap();
++    });
++}
++
++struct CteCallCounter {
++    name: &'static str,
++    calls: Arc<AtomicUsize>,
++}
++
++impl fsqlite_func::ScalarFunction for CteCallCounter {
++    fn invoke(&self, args: &[SqliteValue]) -> fsqlite_error::Result<SqliteValue> {
++        self.calls.fetch_add(1, Ordering::SeqCst);
++        Ok(args[0].clone())
++    }
++
++    fn num_args(&self) -> i32 {
++        1
++    }
++
++    fn name(&self) -> &str {
++        self.name
++    }
++}
++
++struct CteReplacementSum;
++
++impl fsqlite_func::AggregateFunction for CteReplacementSum {
++    type State = i64;
++
++    fn initial_state(&self) -> Self::State {
++        1000
++    }
++
++    fn step(&self, state: &mut Self::State, _args: &[SqliteValue]) -> fsqlite_error::Result<()> {
++        *state += 1;
++        Ok(())
++    }
++
++    fn finalize(&self, state: Self::State) -> fsqlite_error::Result<SqliteValue> {
++        Ok(SqliteValue::Integer(state))
++    }
++
++    fn num_args(&self) -> i32 {
++        1
++    }
++
++    fn name(&self) -> &str {
++        "sum"
++    }
++}
++
++#[test]
++fn single_use_ctes_preserve_volatile_callbacks_and_function_replacements() {
++    asupersync::test_utils::run_test(|| async {
++        let conn = Connection::open(":memory:").await.unwrap();
++        let calls = Arc::new(AtomicUsize::new(0));
++        conn.register_nondeterministic_scalar_function(CteCallCounter {
++            name: "cte_probe",
++            calls: Arc::clone(&calls),
++        });
++        for hint in ["", "MATERIALIZED"] {
++            for (body, consumer, expected, expected_calls) in [
++                (
++                    "SELECT value FROM generate_series(1,cte_probe(4))",
++                    "SELECT count(*) FROM t",
++                    vec!["int:4".to_owned()],
++                    1,
++                ),
++                (
++                    "SELECT cte_probe(value) AS v FROM generate_series(1,4)",
++                    "SELECT sum(v),sum(v) FROM t",
++                    vec!["int:10".to_owned(), "int:10".to_owned()],
++                    4,
++                ),
++                (
++                    "SELECT cte_probe(value) AS v FROM generate_series(1,4)",
++                    "SELECT sum(a.v+b.v) FROM t a,t b",
++                    vec!["int:80".to_owned()],
++                    4,
++                ),
++                (
++                    "SELECT value FROM generate_series(1,4)",
++                    "SELECT count(*) FROM t WHERE cte_probe(value)>2",
++                    vec!["int:2".to_owned()],
++                    4,
++                ),
++            ] {
++                let sql = format!("WITH t AS {hint} ({body}) {consumer}");
++                calls.store(0, Ordering::SeqCst);
++                conn.reset_fallback_decision_evidence();
++                assert_eq!(frank(&conn, &sql).await.unwrap(), vec![expected], "{sql}");
++                assert_eq!(calls.load(Ordering::SeqCst), expected_calls, "{sql}");
++                assert!(used_cte_materialization(&conn), "{sql}");
++            }
++        }
++        conn.register_nondeterministic_scalar_function(CteCallCounter {
++            name: "abs",
++            calls: Arc::clone(&calls),
++        });
++        calls.store(0, Ordering::SeqCst);
++        assert_eq!(
++            frank(
++                &conn,
++                "WITH t AS (SELECT value FROM generate_series(1,4)) SELECT sum(abs(-value)) FROM t"
++            )
++            .await
++            .unwrap(),
++            vec![vec!["int:-10".to_owned()]],
++        );
++        assert_eq!(calls.load(Ordering::SeqCst), 4);
++        conn.register_aggregate_function(CteReplacementSum);
++        conn.reset_fallback_decision_evidence();
++        assert_eq!(
++            frank(
++                &conn,
++                "WITH t AS (SELECT value FROM generate_series(1,4)) SELECT sum(value) FROM t"
++            )
++            .await
++            .unwrap(),
++            vec![vec!["int:1004".to_owned()]],
++        );
++        assert!(used_cte_materialization(&conn));
++        conn.close().await.unwrap();
++    });
++}
++
++mod cte_module_callbacks {
++    use super::{Connection, SqliteValue, frank, used_cte_materialization};
++    use fsqlite_error::{FrankenError, Result};
++    use fsqlite_func::vtab::{
++        ColumnContext, ErasedVtabInstance, IndexInfo, VirtualTable, VirtualTableCursor,
++        VtabModuleFactory,
++    };
++    use fsqlite_types::cx::Cx;
++    use std::sync::{Arc, Mutex};
++
++    #[derive(Debug, PartialEq)]
++    enum Event {
++        Metadata,
++        Connect,
++        BestIndex,
++        Open,
++        Filter(Vec<SqliteValue>),
++        Eof,
++        Column(i32),
++        Next,
++        Rowid,
++        Disconnect,
++    }
++
++    type Events = Arc<Mutex<Vec<Event>>>;
++
++    struct ProbeFactory {
++        events: Events,
++        fail_column: bool,
++    }
++
++    struct ProbeTable {
++        events: Events,
++        fail_column: bool,
++    }
++
++    struct ProbeCursor {
++        events: Events,
++        fail_column: bool,
++        remaining: i64,
++    }
++
++    impl VtabModuleFactory for ProbeFactory {
++        fn column_info(&self, _args: &[&str]) -> Vec<(String, char)> {
++            self.events.lock().unwrap().push(Event::Metadata);
++            vec![("value".to_owned(), 'A')]
++        }
++
++        fn create(&self, _cx: &Cx, _args: &[&str]) -> Result<Box<dyn ErasedVtabInstance>> {
++            self.events.lock().unwrap().push(Event::Connect);
++            Ok(Box::new(ProbeTable {
++                events: Arc::clone(&self.events),
++                fail_column: self.fail_column,
++            }))
++        }
++    }
++
++    impl VirtualTable for ProbeTable {
++        type Cursor = ProbeCursor;
++
++        fn connect(_cx: &Cx, _args: &[&str]) -> Result<Self> {
++            Err(FrankenError::function_error(
++                "use the stateful probe factory",
++            ))
++        }
++
++        fn best_index(&self, _info: &mut IndexInfo) -> Result<()> {
++            self.events.lock().unwrap().push(Event::BestIndex);
++            Ok(())
++        }
++
++        fn open(&self) -> Result<Self::Cursor> {
++            self.events.lock().unwrap().push(Event::Open);
++            Ok(ProbeCursor {
++                events: Arc::clone(&self.events),
++                fail_column: self.fail_column,
++                remaining: 0,
++            })
++        }
++
++        fn disconnect(&mut self, _cx: &Cx) -> Result<()> {
++            self.events.lock().unwrap().push(Event::Disconnect);
++            Ok(())
++        }
++    }
++
++    impl VirtualTableCursor for ProbeCursor {
++        fn filter(
++            &mut self,
++            _cx: &Cx,
++            _idx_num: i32,
++            _idx_str: Option<&str>,
++            args: &[SqliteValue],
++        ) -> Result<()> {
++            self.events
++                .lock()
++                .unwrap()
++                .push(Event::Filter(args.to_vec()));
++            self.remaining = 2;
++            Ok(())
++        }
++
++        fn next(&mut self, _cx: &Cx) -> Result<()> {
++            self.events.lock().unwrap().push(Event::Next);
++            self.remaining -= 1;
++            Ok(())
++        }
++
++        fn eof(&self) -> bool {
++            self.events.lock().unwrap().push(Event::Eof);
++            self.remaining == 0
++        }
++
++        fn column(&self, ctx: &mut ColumnContext, col: i32) -> Result<()> {
++            self.events.lock().unwrap().push(Event::Column(col));
++            if self.fail_column {
++                return Err(FrankenError::function_error("projected column failure"));
++            }
++            ctx.set_value(SqliteValue::Integer(3 - self.remaining));
++            Ok(())
++        }
++
++        fn rowid(&self) -> Result<i64> {
++            self.events.lock().unwrap().push(Event::Rowid);
++            Ok(3 - self.remaining)
++        }
++    }
++
++    #[test]
++    fn single_use_ctes_preserve_custom_module_callbacks_and_column_errors() {
++        asupersync::test_utils::run_test(|| async {
++            // A built-in spelling must not impersonate the shared built-in
++            // factory. The other name also proves generic extension refusal.
++            for module in ["generate_series", "custom_rows"] {
++                for fail_column in [false, true] {
++                    let mut traces = Vec::new();
++                    for hint in ["", "MATERIALIZED"] {
++                        let conn = Connection::open(":memory:").await.unwrap();
++                        let events = Arc::new(Mutex::new(Vec::new()));
++                        conn.register_module(
++                            module,
++                            Box::new(ProbeFactory {
++                                events: Arc::clone(&events),
++                                fail_column,
++                            }),
++                        );
++                        let sql = format!(
++                            "WITH t AS {hint} (SELECT value FROM {module}(1,4)) SELECT count(*) FROM t"
++                        );
++                        let result = frank(&conn, &sql).await;
++                        if fail_column {
++                            let error = result
++                                .expect_err("count must still observe the projected xColumn error");
++                            assert!(error.contains("projected column failure"), "{sql}: {error}");
++                        } else {
++                            assert_eq!(result.unwrap(), vec![vec!["int:2".to_owned()]], "{sql}");
++                        }
++                        assert!(used_cte_materialization(&conn), "{sql}");
++                        let trace = std::mem::take(&mut *events.lock().unwrap());
++                        assert!(trace.contains(&Event::Metadata), "{sql}");
++                        assert!(
++                            trace.contains(&Event::Filter(vec![1.into(), 4.into()])),
++                            "{sql}"
++                        );
++                        assert_eq!(
++                            trace
++                                .iter()
++                                .filter(|event| **event == Event::Column(0))
++                                .count(),
++                            if fail_column { 1 } else { 2 },
++                            "{sql}",
++                        );
++                        traces.push(trace);
++                        conn.close().await.unwrap();
++                    }
++                    assert_eq!(
++                        traces[0], traces[1],
++                        "callback order/count changed for {module}, fail={fail_column}"
++                    );
++                }
++            }
++        });
++    }
++}
++
++struct CteReverseBinary;
++
++impl fsqlite_func::collation::CollationFunction for CteReverseBinary {
++    fn name(&self) -> &str {
++        "BINARY"
++    }
++
++    fn compare(&self, left: &[u8], right: &[u8]) -> std::cmp::Ordering {
++        right.cmp(left)
++    }
++}
++
++#[test]
++fn single_use_cte_respects_replacement_binary_collation() {
++    asupersync::test_utils::run_test(|| async {
++        let conn = Connection::open(":memory:").await.unwrap();
++        conn.register_collation_function(CteReverseBinary);
++        assert_eq!(
++            frank(
++                &conn,
++                "WITH t AS (SELECT value FROM generate_series(1,2)) SELECT min(CAST(value AS TEXT)) FROM t"
++            )
++            .await
++            .unwrap(),
++            vec![vec!["text:2".to_owned()]],
+         );
++        assert!(used_cte_materialization(&conn));
++        conn.close().await.unwrap();
+     });
+ }
+diff --git a/crates/fsqlite-core/tests/cte_not_materialized_gh204_oracle.rs b/crates/fsqlite-core/tests/cte_not_materialized_gh204_oracle.rs
+index 86f2e4b..c0738b9 100644
+--- a/crates/fsqlite-core/tests/cte_not_materialized_gh204_oracle.rs
++++ b/crates/fsqlite-core/tests/cte_not_materialized_gh204_oracle.rs
+@@ -177,6 +177,30 @@ fn default_hint_random_control_gh204() {
+     });
+ }
+ 
++/// GH#533: transferring owned rows into a materialized CTE must retain every
++/// storage class and make the same values available to each reference. Repeat
++/// the statement to exercise temporary-root cleanup and reuse as well.
++#[test]
++fn materialized_cte_owned_rows_preserve_types_and_references_gh533() {
++    asupersync::test_utils::run_test(|| async {
++        let f = Connection::open(":memory:").await.unwrap();
++        let r = rusqlite::Connection::open_in_memory().unwrap();
++        for hint in ["", "MATERIALIZED", "NOT MATERIALIZED"] {
++            let sql = format!(
++                "WITH c(i,r,s,b,n) AS {hint} \
++                 (VALUES (1,1.5,'two',x'0001',NULL), \
++                         (2,-2.25,'three',x'ff',NULL)) \
++                 SELECT a.i,typeof(a.i),a.r,typeof(a.r),a.s,typeof(a.s), \
++                        hex(a.b),typeof(a.b),a.n,typeof(a.n),b.i,b.s,hex(b.b) \
++                 FROM c AS a JOIN c AS b ON a.i+b.i=3 ORDER BY a.i"
++            );
++            for _ in 0..3 {
++                assert_agree(&f, &r, &sql).await;
++            }
++        }
++    });
++}
++
+ /// Column aliasing: `c(x)` renames the body's single output column; the inlined
+ /// derived table must carry that alias so `SELECT x` resolves.
+ #[test]
+diff --git a/crates/fsqlite-core/src/connection/table_function_exists.rs b/crates/fsqlite-core/src/connection/table_function_exists.rs
+new file mode 100644
+index 0000000..2e7e685
+--- /dev/null
++++ b/crates/fsqlite-core/src/connection/table_function_exists.rs
+@@ -0,0 +1,1181 @@
++//! GH#533: plan and stream a bound table-function EXISTS probe.
++//!
++//! The general join path materializes a table function before its WHERE and
++//! LIMIT. A correlated EXISTS must instead be able to pass constraints to the
++//! cursor and stop on its first qualifying row. The initial admission is the
++//! unchanged built-in `generate_series` factory: its hidden positional columns
++//! and `xBestIndex` protocol are known. Overrides retain the general path.
++
++#[allow(clippy::wildcard_imports)]
++use super::*;
++
++struct TableFunctionExistsFilter {
++    idx_num: i32,
++    idx_str: Option<String>,
++    args: Vec<SqliteValue>,
++}
++
++#[cfg(test)]
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++struct ExistsCursorWork {
++    filters: usize,
++    rows: usize,
++    nexts: usize,
++}
++
++#[cfg(test)]
++thread_local! {
++    static EXISTS_CURSOR_WORK: Cell<ExistsCursorWork> = const {
++        Cell::new(ExistsCursorWork { filters: 0, rows: 0, nexts: 0 })
++    };
++}
++
++impl Connection {
++    /// `subquery` has already had its outer references bound, retaining their
++    /// comparison metadata, and its irrelevant EXISTS projection stripped.
++    #[allow(clippy::too_many_lines)]
++    pub(super) fn try_table_function_exists_probe(
++        &self,
++        subquery: &SelectStatement,
++    ) -> Option<Result<bool>> {
++        if subquery.with.is_some()
++            || !subquery.body.compounds.is_empty()
++            || subquery.limit.is_some()
++            || !subquery.order_by.is_empty()
++            || select_contains_any_placeholder(subquery)
++        {
++            return None;
++        }
++        let SelectCore::Select {
++            columns,
++            from: Some(from),
++            where_clause,
++            group_by,
++            having,
++            windows,
++            distinct: Distinctness::All,
++            ..
++        } = &subquery.body.select
++        else {
++            return None;
++        };
++        if !from.joins.is_empty()
++            || !group_by.is_empty()
++            || having.is_some()
++            || !windows.is_empty()
++            || !columns.iter().all(|column| {
++                matches!(
++                    column,
++                    ResultColumn::Star
++                        | ResultColumn::Expr {
++                            expr: Expr::Literal(..),
++                            ..
++                        }
++                )
++            })
++        {
++            return None;
++        }
++        let TableOrSubquery::TableFunction { name, args, .. } = &from.source else {
++            return None;
++        };
++        if !name.eq_ignore_ascii_case("generate_series") || !(1..=3).contains(&args.len()) {
++            return None;
++        }
++        let key = name.to_ascii_uppercase();
++        let factory = self.vtab_modules.borrow().get(&key)?.clone();
++        if !Arc::ptr_eq(&factory, shared_default_vtab_module_registry().get(&key)?) {
++            return None;
++        }
++        let registry = lock_unpoisoned(self.collation_registry.as_ref()).clone();
++        if !["BINARY", "NOCASE", "RTRIM"]
++            .iter()
++            .all(|name| registry.uses_builtin_implementation(name))
++        {
++            return None;
++        }
++
++        // No expression with observable evaluation effects changes frequency
++        // when the scan stops early. Unknown names, functions, nested scopes
++        // and bind parameters retain their ordinary evaluator and diagnostics.
++        let col_map = self.build_join_col_map(subquery);
++        let predicate = where_clause.as_deref();
++        if predicate.is_some_and(|expr| {
++            !exists_cursor_expr_is_pure(expr) || !expr_references_only_col_map(expr, &col_map)
++        }) || !args
++            .iter()
++            .all(|expr| exists_cursor_expr_is_pure(expr) && expr_references_only_col_map(expr, &[]))
++        {
++            return None;
++        }
++        let arg_values = match args
++            .iter()
++            .map(|expr| eval_join_expr(expr, &[], &[]))
++            .collect::<Result<Vec<_>>>()
++        {
++            Ok(values) => values,
++            Err(error) => return Some(Err(error)),
++        };
++
++        // Use the same metadata and residual evaluator as the general join
++        // path. BoundOuterValue must keep its affinity/collation throughout.
++        let context = JoinEvalCollationContext {
++            declared_json_keys: self.build_join_declared_blob_columns(subquery),
++            column_collations: self.build_join_col_collations(subquery),
++            column_affinities: self.build_join_col_affinities(subquery),
++            using_column_projections: HashMap::new(),
++            registry,
++        };
++        let _context_guard = JoinEvalCollationContextGuard::push(context.clone());
++        let mut bindings = JoinExprBindings::default();
++        let mut needed_columns = vec![false; col_map.len()];
++        if let Some(predicate) = predicate {
++            bindings.bind_expr(predicate, &col_map, None);
++            bindings.bind_comparison_collations(predicate);
++            for_each_column_ref_in_expr(predicate, &mut |column| {
++                if let Ok(index) =
++                    find_col_in_map(&col_map, column.table.as_deref(), &column.column, None)
++                {
++                    needed_columns[index] = true;
++                }
++            });
++        }
++        let _bindings_guard = JoinExprBindingsGuard::push(bindings);
++        // These are column numbers, not tightened start/stop values. The
++        // module keeps the original hidden arguments and series alignment.
++        let argument_columns = &[1, 2, 3][..arg_values.len()];
++        Some(self.run_table_function_exists_probe(
++            name,
++            &factory,
++            &arg_values,
++            argument_columns,
++            predicate,
++            &col_map,
++            &context,
++            &needed_columns,
++        ))
++    }
++
++    fn run_table_function_exists_probe(
++        &self,
++        name: &str,
++        factory: &Arc<dyn VtabModuleFactory>,
++        arg_values: &[SqliteValue],
++        argument_columns: &[i32],
++        predicate: Option<&Expr>,
++        col_map: &[(String, String, bool)],
++        context: &JoinEvalCollationContext,
++        needed_columns: &[bool],
++    ) -> Result<bool> {
++        let cx = self.op_cx()?;
++        let factory_args = [name, "main", name];
++        let instance =
++            self.invoke_live_vtab_callback("xConnect", || factory.connect(&cx, &factory_args))?;
++        let pending = PendingLiveVtabGuard::connected(self, &cx, name, instance);
++        let scan_result = (|| {
++            let filter = self.plan_table_function_exists_filter(
++                pending.instance(),
++                name,
++                arg_values,
++                argument_columns,
++                predicate,
++                col_map,
++                context,
++            )?;
++            self.scan_table_function_exists_cursor(
++                pending.instance(),
++                &filter,
++                predicate,
++                col_map,
++                needed_columns,
++            )
++        })();
++        // The cursor is dropped before disconnect, including on an early
++        // match or an error; both guards retain the callback reentrancy rules.
++        let cleanup_result = pending.cleanup();
++        match (scan_result, cleanup_result) {
++            (Ok(found), Ok(())) => Ok(found),
++            (Err(scan_error), Ok(())) => Err(scan_error),
++            (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
++            (Err(scan_error), Err(cleanup_error)) => Err(FrankenError::Internal(format!(
++                "table-valued function {name} EXISTS scan failed: {scan_error}; disconnect failed: {cleanup_error}"
++            ))),
++        }
++    }
++
++    #[allow(clippy::too_many_lines)]
++    fn plan_table_function_exists_filter(
++        &self,
++        instance: &dyn ErasedVtabInstance,
++        name: &str,
++        arg_values: &[SqliteValue],
++        argument_columns: &[i32],
++        predicate: Option<&Expr>,
++        col_map: &[(String, String, bool)],
++        context: &JoinEvalCollationContext,
++    ) -> Result<TableFunctionExistsFilter> {
++        let mut constraints: Vec<_> = argument_columns
++            .iter()
++            .map(|&column| IndexConstraint {
++                column,
++                op: ConstraintOp::Eq,
++                usable: true,
++            })
++            .collect();
++        let mut values = arg_values.to_vec();
++        if let Some(predicate) = predicate {
++            let mut terms = Vec::new();
++            flatten_and_terms(predicate, &mut terms);
++            for term in terms {
++                let Some(mut candidate) =
++                    extract_live_vtab_constraint_candidate(term, col_map, name)
++                else {
++                    continue;
++                };
++                // Positional arguments alone define hidden input columns.
++                // Additional WHERE tests of them stay residual, including
++                // checks of coerced/defaulted/normalized argument values.
++                if !matches!(candidate.constraint.column, -1 | 0) {
++                    continue;
++                }
++                let Expr::BinaryOp { left, right, .. } = term else {
++                    continue;
++                };
++                // A bound outer TEXT column can hold a numeric runtime value
++                // (for example in a compound SELECT). Numeric range pruning
++                // is not a valid substitute for text comparison ordering.
++                if join_expr_affinity(left, col_map, context) == TypeAffinity::Text
++                    || join_expr_affinity(right, col_map, context) == TypeAffinity::Text
++                {
++                    continue;
++                }
++                let constant = if matches!(left.as_ref(), Expr::Column(..)) {
++                    right.as_ref()
++                } else {
++                    left.as_ref()
++                };
++                // In particular, use SQL's real result for negating MIN_I64;
++                // the general candidate extractor only recognizes the shape.
++                candidate.value = eval_join_expr(constant, &[], &[])?;
++                constraints.push(candidate.constraint);
++                values.push(candidate.value);
++            }
++        }
++        let mut info = IndexInfo::new(constraints, Vec::new());
++        let input_constraints = info.constraints.clone();
++        self.invoke_live_vtab_callback("xBestIndex", || instance.best_index(&mut info))?;
++        let malfunction = || FrankenError::FunctionError(format!("{name}.xBestIndex malfunction"));
++        if info.constraints != input_constraints
++            || !info.order_by.is_empty()
++            || info.constraint_usage.len() != values.len()
++        {
++            return Err(malfunction());
++        }
++        let mut ordered_args: Vec<_> = info
++            .constraint_usage
++            .iter()
++            .zip(values)
++            .filter_map(|(usage, value)| {
++                (usage.argv_index > 0).then_some((usage.argv_index, value))
++            })
++            .collect();
++        ordered_args.sort_by_key(|(index, _)| *index);
++        for (position, (actual, _)) in ordered_args.iter().enumerate() {
++            let expected = i32::try_from(position)
++                .ok()
++                .and_then(|index| index.checked_add(1))
++                .ok_or_else(malfunction)?;
++            if *actual != expected {
++                return Err(malfunction());
++            }
++        }
++        if info.constraint_usage[..arg_values.len()]
++            .iter()
++            .any(|usage| usage.argv_index <= 0)
++        {
++            // A module that did not consume every positional input must keep
++            // the original positional xFilter protocol. Never drop an input
++            // or mistake a visible WHERE bound for START/STOP/STEP.
++            return Ok(TableFunctionExistsFilter {
++                idx_num: 0,
++                idx_str: None,
++                args: arg_values.to_vec(),
++            });
++        }
++        // Keep the complete original predicate, regardless of omit flags.
++        // The cursor only narrows work; SQL owns affinity/collation comparison.
++        Ok(TableFunctionExistsFilter {
++            idx_num: info.idx_num,
++            idx_str: info.idx_str,
++            args: ordered_args.into_iter().map(|(_, value)| value).collect(),
++        })
++    }
++
++    fn scan_table_function_exists_cursor(
++        &self,
++        instance: &dyn ErasedVtabInstance,
++        filter: &TableFunctionExistsFilter,
++        predicate: Option<&Expr>,
++        col_map: &[(String, String, bool)],
++        needed_columns: &[bool],
++    ) -> Result<bool> {
++        let cx = self.op_cx()?;
++        let mut cursor = self.invoke_live_vtab_callback("xOpen", || {
++            instance
++                .open_cursor()
++                .map(|cursor| LiveVtabCursorGuard::new(&self.live_vtab_callback_depth, cursor))
++        })?;
++        self.invoke_live_vtab_callback("xFilter", || {
++            cursor.erased_filter(&cx, filter.idx_num, filter.idx_str.as_deref(), &filter.args)
++        })?;
++        #[cfg(test)]
++        EXISTS_CURSOR_WORK.with(|work| {
++            let mut value = work.get();
++            value.filters += 1;
++            work.set(value);
++        });
++        let mut row = vec![SqliteValue::Null; col_map.len()];
++        while !self.invoke_live_vtab_callback("xEof", || Ok(cursor.erased_eof()))? {
++            #[cfg(test)]
++            EXISTS_CURSOR_WORK.with(|work| {
++                let mut value = work.get();
++                value.rows += 1;
++                work.set(value);
++            });
++            for (index, (_, _, hidden_rowid)) in col_map.iter().enumerate() {
++                if !needed_columns[index] {
++                    continue;
++                }
++                row[index] = if *hidden_rowid {
++                    SqliteValue::Integer(
++                        self.invoke_live_vtab_callback("xRowid", || cursor.erased_rowid())?,
++                    )
++                } else {
++                    let column = i32::try_from(index).map_err(|_| FrankenError::TooBig)?;
++                    let mut ctx = ColumnContext::new();
++                    self.invoke_live_vtab_callback("xColumn", || {
++                        cursor.erased_column(&mut ctx, column)
++                    })?;
++                    ctx.take_value().unwrap_or(SqliteValue::Null)
++                };
++            }
++            let found = match predicate {
++                Some(predicate) => eval_join_predicate(predicate, &row, col_map)?,
++                None => true,
++            };
++            if found {
++                return Ok(true);
++            }
++            self.invoke_live_vtab_callback("xNext", || cursor.erased_next(&cx))?;
++            #[cfg(test)]
++            EXISTS_CURSOR_WORK.with(|work| {
++                let mut value = work.get();
++                value.nexts += 1;
++                work.set(value);
++            });
++        }
++        Ok(false)
++    }
++}
++
++/// Admission for expressions whose evaluation cannot call application code or
++/// change state. It also keeps every nested SELECT and parameter on its current
++/// route. Pure SQL arithmetic/casts and boolean short-circuiting use the normal
++/// join evaluator; no expressions are replaced by a result-specific shortcut.
++fn exists_cursor_expr_is_pure(expr: &Expr) -> bool {
++    match expr {
++        Expr::Literal(
++            Literal::CurrentTime | Literal::CurrentDate | Literal::CurrentTimestamp,
++            _,
++        ) => false,
++        Expr::Literal(..) | Expr::Column(..) => true,
++        Expr::BoundOuterValue { collation, .. } => collation
++            .as_name()
++            .is_none_or(exists_cursor_collation_is_builtin),
++        Expr::BinaryOp { left, right, .. } => {
++            exists_cursor_expr_is_pure(left) && exists_cursor_expr_is_pure(right)
++        }
++        Expr::UnaryOp { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
++            exists_cursor_expr_is_pure(expr)
++        }
++        Expr::Collate {
++            expr, collation, ..
++        } => exists_cursor_collation_is_builtin(collation) && exists_cursor_expr_is_pure(expr),
++        Expr::Between {
++            expr, low, high, ..
++        } => {
++            exists_cursor_expr_is_pure(expr)
++                && exists_cursor_expr_is_pure(low)
++                && exists_cursor_expr_is_pure(high)
++        }
++        Expr::In {
++            expr,
++            set: InSet::List(values),
++            ..
++        } => exists_cursor_expr_is_pure(expr) && values.iter().all(exists_cursor_expr_is_pure),
++        Expr::Case {
++            operand,
++            whens,
++            else_expr,
++            ..
++        } => {
++            operand.as_deref().is_none_or(exists_cursor_expr_is_pure)
++                && whens.iter().all(|(when, then)| {
++                    exists_cursor_expr_is_pure(when) && exists_cursor_expr_is_pure(then)
++                })
++                && else_expr.as_deref().is_none_or(exists_cursor_expr_is_pure)
++        }
++        _ => false,
++    }
++}
++
++fn exists_cursor_collation_is_builtin(name: &str) -> bool {
++    ["BINARY", "NOCASE", "RTRIM"]
++        .iter()
++        .any(|builtin| name.eq_ignore_ascii_case(builtin))
++}
++
++#[cfg(all(test, feature = "ext-misc"))]
++#[allow(clippy::disallowed_methods, clippy::wildcard_imports)]
++mod tests {
++    use super::*;
++    use fsqlite_ext_misc::GenerateSeriesCursor;
++
++    fn select(sql: &str) -> SelectStatement {
++        let Statement::Select(select) = parse_single_statement(sql).unwrap() else {
++            panic!("expected SELECT: {sql}");
++        };
++        select
++    }
++
++    fn reset_cursor_work() {
++        EXISTS_CURSOR_WORK.with(|work| work.set(ExistsCursorWork::default()));
++    }
++
++    async fn count(conn: &Connection, sql: &str) -> i64 {
++        let rows = conn
++            .query(sql)
++            .await
++            .unwrap_or_else(|error| panic!("{sql}: {error}"));
++        assert_eq!(rows.len(), 1, "{sql}");
++        rows[0].values()[0].to_integer()
++    }
++
++    #[test]
++    fn gh533_series_exists_bounds_each_probe_and_stops_before_next() {
++        asupersync::test_utils::run_test(|| async {
++            let conn = Connection::open(":memory:").await.unwrap();
++            for equality in ["t.value = t1.value", "t1.value = t.value"] {
++                reset_cursor_work();
++                let sql = format!(
++                    "SELECT count(*) FROM generate_series(1,128) t \
++                     WHERE EXISTS(SELECT 1 FROM generate_series(1,10000) t1 \
++                     WHERE {equality})"
++                );
++                assert_eq!(count(&conn, &sql).await, 128);
++                assert_eq!(
++                    EXISTS_CURSOR_WORK.with(Cell::get),
++                    ExistsCursorWork {
++                        filters: 128,
++                        rows: 128,
++                        nexts: 0
++                    },
++                    "each equality must visit only its bound inner row, then stop"
++                );
++            }
++            reset_cursor_work();
++            assert_eq!(
++                count(
++                    &conn,
++                    "SELECT count(*) FROM generate_series(-128,-1) t \
++                 WHERE EXISTS(SELECT 1 FROM generate_series(1,10000) t1 \
++                 WHERE t.value=t1.value)"
++                )
++                .await,
++                0
++            );
++            assert_eq!(
++                EXISTS_CURSOR_WORK.with(Cell::get),
++                ExistsCursorWork {
++                    filters: 128,
++                    rows: 0,
++                    nexts: 0
++                },
++                "a disjoint equality bound must not iterate the source"
++            );
++        });
++    }
++
++    #[test]
++    fn gh533_series_exists_without_a_pushable_bound_still_stops_early() {
++        asupersync::test_utils::run_test(|| async {
++            let conn = Connection::open(":memory:").await.unwrap();
++            reset_cursor_work();
++            assert_eq!(
++                count(
++                    &conn,
++                    "SELECT count(*) FROM generate_series(1,16) t \
++                 WHERE EXISTS(SELECT 1 FROM generate_series(1,10000) t1 \
++                 WHERE t1.value+0=t.value)"
++                )
++                .await,
++                16
++            );
++            assert_eq!(
++                EXISTS_CURSOR_WORK.with(Cell::get),
++                ExistsCursorWork {
++                    filters: 16,
++                    rows: 136,
++                    nexts: 120
++                },
++                "residual-only probes stop after 1..=16 rows, not 10000 rows each"
++            );
++        });
++    }
++
++    #[test]
++    fn gh533_series_exists_keeps_steps_hidden_arguments_and_residuals() {
++        asupersync::test_utils::run_test(|| async {
++            let conn = Connection::open(":memory:").await.unwrap();
++            for (args, predicate, expected) in [
++                ("20,1,-3", "t1.value=t.value", 7),
++                ("2,20,3", "t1.value=t.value", 7),
++                (
++                    "1,20,0",
++                    "t1.value=t.value AND t1.start=1 AND t1.stop=20 AND t1.step=1",
++                    20,
++                ),
++                ("1,20,0", "t1.value=t.value AND t1.step=0", 0),
++                ("1,20", "t1.value=t.value AND t1.start=2", 0),
++                ("NULL,20", "t1.value=t.value", 0),
++                ("1,NULL", "t1.value=t.value", 0),
++                ("1,20,NULL", "t1.value=t.value", 0),
++                ("20,1,1", "t1.value=t.value", 0),
++                ("1,20", "t1.value=t.value AND t1.value%3=0", 6),
++                ("1,20", "t1.value=t.value AND t1.value<t.value", 0),
++                ("1,20", "value=t.value", 20),
++                ("1,20", "t1.rowid=t.value", 20),
++                ("1,20", "t1.value=t.value AND t1.value=3.0", 1),
++                ("1,20", "t1.value=t.value AND t1.value=3.5", 0),
++                ("1,20", "t1.value=t.value AND t1.value='3'", 0),
++                ("1,20", "t1.value=t.value AND t1.value<X'33'", 20),
++            ] {
++                let sql = format!(
++                    "SELECT count(*) FROM generate_series(1,20) t \
++                     WHERE EXISTS(SELECT 1 FROM generate_series({args}) t1 WHERE {predicate})"
++                );
++                assert_eq!(count(&conn, &sql).await, expected, "{sql}");
++            }
++            assert_eq!(
++                count(
++                    &conn,
++                    "SELECT count(*) FROM generate_series(1,20) t \
++                 WHERE NOT EXISTS(SELECT 1 FROM generate_series(2,20,2) t1 WHERE t1.value=t.value)"
++                )
++                .await,
++                10
++            );
++            assert_eq!(
++                count(
++                    &conn,
++                    "SELECT count(*) FROM \
++                 (SELECT CAST(value AS TEXT) AS v FROM generate_series(1,16)) t \
++                 WHERE EXISTS(SELECT 1 FROM generate_series(1,100) s WHERE s.rowid=t.v)"
++                )
++                .await,
++                16,
++                "bound TEXT metadata must reach the ordinary numeric rowid comparison"
++            );
++            for args in [
++                "9223372036854775806,9223372036854775807",
++                "0,-9223372036854775808,-9223372036854775808",
++            ] {
++                let sql = format!(
++                    "SELECT count(*) FROM generate_series({args}) t \
++                     WHERE EXISTS(SELECT 1 FROM generate_series({args}) t1 WHERE t1.value=t.value)"
++                );
++                assert_eq!(count(&conn, &sql).await, 2, "{sql}");
++            }
++            // Exercise the omitted STOP without letting a failed admission
++            // accidentally materialize the default four-billion-row series.
++            reset_cursor_work();
++            let default_stop = select(
++                "SELECT 1 FROM generate_series(1) WHERE value=3 \
++                 AND start=1 AND stop=4294967295 AND step=1",
++            );
++            assert!(
++                conn.try_table_function_exists_probe(&default_stop)
++                    .unwrap()
++                    .unwrap()
++            );
++            assert_eq!(
++                EXISTS_CURSOR_WORK.with(Cell::get),
++                ExistsCursorWork {
++                    filters: 1,
++                    rows: 1,
++                    nexts: 0
++                }
++            );
++        });
++    }
++
++    #[test]
++    fn gh533_series_exists_matches_stock_for_numeric_and_storage_class_predicates() {
++        asupersync::test_utils::run_test(|| async {
++            let conn = Connection::open(":memory:").await.unwrap();
++            // Bundled rusqlite has no series extension. A typeless reference
++            // relation supplies the same visible/hidden values for these
++            // predicates; the native benchmark also runs the exact SQL with
++            // stock SQLite's generate_series extension.
++            let stock = rusqlite::Connection::open_in_memory().unwrap();
++            stock
++                .execute_batch(
++                    "CREATE TABLE source(value, start, stop, step); \
++                 INSERT INTO source VALUES (2,2,20,3),(5,2,20,3),(8,2,20,3), \
++                 (11,2,20,3),(14,2,20,3),(17,2,20,3),(20,2,20,3); \
++                 CREATE TABLE probes(value); \
++                 INSERT INTO probes VALUES (NULL),('5'),(5),(5.0),(8),(9),(20),(21),(X'35');",
++                )
++                .unwrap();
++            conn.execute(
++                "CREATE TABLE probes(value); \
++                 INSERT INTO probes VALUES (NULL),('5'),(5),(5.0),(8),(9),(20),(21),(X'35');",
++            )
++            .await
++            .unwrap();
++            for predicate in [
++                "s.value=p.value",
++                "p.value=s.value",
++                "s.value>=p.value AND s.value<=14",
++                "s.value=p.value AND s.start=2 AND s.stop=20 AND s.step=3",
++                "s.value=p.value AND s.value<>5",
++                "s.value=p.value AND s.value='5'",
++                "s.value=p.value AND s.value<CAST(20 AS REAL)",
++            ] {
++                let expected: i64 = stock.query_row(&format!(
++                    "SELECT count(*) FROM probes p WHERE EXISTS(SELECT 1 FROM source s WHERE {predicate})"
++                ), [], |row| row.get(0)).unwrap();
++                let sql = format!(
++                    "SELECT count(*) FROM probes p WHERE EXISTS(SELECT 1 \
++                     FROM generate_series(2,20,3) s WHERE {predicate})"
++                );
++                assert_eq!(count(&conn, &sql).await, expected, "{sql}");
++            }
++        });
++    }
++
++    #[test]
++    fn gh533_series_exists_preserves_fences_effects_and_unknown_column_errors() {
++        asupersync::test_utils::run_test(|| async {
++            let conn = Connection::open(":memory:").await.unwrap();
++            for sql in [
++                "SELECT 1 FROM generate_series(1,10) LIMIT 0",
++                "SELECT 1 FROM generate_series(1,10) LIMIT 1 OFFSET 1",
++                "SELECT count(*) FROM generate_series(1,10) WHERE 0",
++                "SELECT DISTINCT 1 FROM generate_series(1,10)",
++                "SELECT 1 FROM generate_series(1,10) GROUP BY value",
++                "SELECT 1 FROM generate_series(1,10) UNION SELECT 1",
++                "SELECT 1 FROM generate_series(1,10) WHERE EXISTS(SELECT 1)",
++                "SELECT 1 FROM generate_series(1,10) WHERE random()>0",
++                "SELECT 1 FROM generate_series(random(),10)",
++                "SELECT 1 FROM generate_series(CURRENT_TIME,10)",
++                "SELECT 1 FROM generate_series(CURRENT_DATE,10)",
++                "SELECT 1 FROM generate_series(CURRENT_TIMESTAMP,10)",
++                "SELECT 1 FROM generate_series(1,10) WHERE CURRENT_TIME <> ''",
++                "SELECT 1 FROM generate_series(1,10) WHERE CURRENT_DATE <> ''",
++                "SELECT 1 FROM generate_series(1,10) WHERE CURRENT_TIMESTAMP <> ''",
++                "SELECT 1 FROM generate_series(?1,10)",
++                "SELECT 1 FROM generate_series(1,10) WHERE missing=1",
++                "SELECT 1 FROM generate_series(1,10) WHERE value COLLATE custom=1",
++            ] {
++                assert!(
++                    conn.try_table_function_exists_probe(&select(sql)).is_none(),
++                    "{sql}"
++                );
++            }
++            for (tail, expected) in [
++                ("WHERE s.value=t.value LIMIT 0", 0),
++                ("WHERE s.value=t.value LIMIT 1 OFFSET 1", 0),
++                ("WHERE s.value>=t.value LIMIT 1 OFFSET 1", 3),
++            ] {
++                let sql = format!(
++                    "SELECT count(*) FROM generate_series(1,4) t WHERE EXISTS \
++                     (SELECT 1 FROM generate_series(1,4) s {tail})"
++                );
++                assert_eq!(count(&conn, &sql).await, expected, "{sql}");
++            }
++            for inner_args in ["1,4", "1,0"] {
++                let sql = format!(
++                    "SELECT count(*) FROM generate_series(1,4) t WHERE EXISTS \
++                     (SELECT 1 FROM generate_series({inner_args}) s WHERE s.missing=t.value)"
++                );
++                let error = conn.query(&sql).await.unwrap_err().to_string();
++                assert!(error.contains("missing"), "{error}");
++            }
++            assert_eq!(
++                count(
++                    &conn,
++                    "SELECT count(*) FROM generate_series(1,4) t WHERE EXISTS \
++                 (SELECT count(*) FROM generate_series(1,4) s WHERE s.value=t.value AND 0)"
++                )
++                .await,
++                4,
++                "an ungrouped aggregate produces a row even with an empty input"
++            );
++        });
++    }
++
++    #[test]
++    fn gh533_materialized_cte_exists_reuses_memo_without_persistent_hydration() {
++        asupersync::test_utils::run_test(|| async {
++            let dir = tempfile::tempdir().unwrap();
++            let path = dir.path().join("cte_exists.db");
++            {
++                let stock = rusqlite::Connection::open(&path).unwrap();
++                stock
++                    .execute_batch(
++                        "CREATE TABLE unrelated(v); INSERT INTO unrelated VALUES ('keep');",
++                    )
++                    .unwrap();
++            }
++            let conn = Connection::open_existing_schema_only(path.to_string_lossy().into_owned())
++                .await
++                .unwrap();
++            assert!(!conn.join_mem_scan_safe());
++            assert!(!conn.memdb_rows_loaded.get());
++            for (start, stop, hint) in [(1, 128, ""), (129, 256, "MATERIALIZED")] {
++                FSQLITE_EXISTS_PROBE_MEMO_BUILDS.with(|count| count.set(0));
++                FSQLITE_EXISTS_PROBE_MEMO_ROWS_INDEXED.with(|count| count.set(0));
++                FSQLITE_EXISTS_PROBE_MEMO_HITS.with(|count| count.set(0));
++                let sql = format!(
++                    "WITH t AS {hint} (SELECT value FROM generate_series({start},{stop})) \
++                     SELECT count(*) FROM t WHERE EXISTS(SELECT 1 FROM t t1 WHERE t.value=t1.value)"
++                );
++                assert_eq!(count(&conn, &sql).await, 128);
++                assert_eq!(FSQLITE_EXISTS_PROBE_MEMO_BUILDS.with(Cell::get), 1);
++                assert_eq!(FSQLITE_EXISTS_PROBE_MEMO_ROWS_INDEXED.with(Cell::get), 128);
++                assert!(FSQLITE_EXISTS_PROBE_MEMO_HITS.with(Cell::get) > 0);
++                assert!(
++                    !conn.memdb_rows_loaded.get(),
++                    "unrelated persistent rows stay unhydrated"
++                );
++                assert!(
++                    conn.materialized_temp_root_pages.borrow().is_empty(),
++                    "statement-owned roots are cleaned up"
++                );
++            }
++            assert_eq!(
++                count(
++                    &conn,
++                    "WITH t AS MATERIALIZED (SELECT value FROM generate_series(1,128)) \
++                 SELECT count(*) FROM t WHERE EXISTS(SELECT 1 FROM t t1 \
++                 WHERE t.value=t1.value AND t1.value%2=0)"
++                )
++                .await,
++                64,
++                "residual filters retain their ordinary execution route"
++            );
++            assert!(!conn.memdb_rows_loaded.get());
++            for (sql, expected) in [
++                (
++                    "WITH c(x) AS MATERIALIZED (VALUES(1),(2),(3)) \
++                     SELECT count(*) FROM generate_series(1,20) p \
++                     WHERE EXISTS(SELECT 1 FROM c WHERE c.x=p.value) \
++                     OR EXISTS(WITH c(x) AS MATERIALIZED (VALUES(5),(6),(7)) \
++                     SELECT 1 FROM c WHERE c.x=p.value)",
++                    6,
++                ),
++                (
++                    "SELECT sum((WITH c(x) AS MATERIALIZED \
++                     (SELECT o.value+value FROM generate_series(1,3)) \
++                     SELECT count(*) FROM generate_series(1,12) p \
++                     WHERE EXISTS(SELECT 1 FROM c WHERE c.x=p.value))) \
++                     FROM generate_series(1,5) o",
++                    15,
++                ),
++            ] {
++                assert_eq!(
++                    count(&conn, sql).await,
++                    expected,
++                    "CTE roots follow their lexical lifetimes: {sql}"
++                );
++                assert!(conn.materialized_temp_root_pages.borrow().is_empty());
++            }
++        });
++    }
++
++    #[test]
++    fn gh533_cte_memo_declines_ambiguous_text_and_keeps_numeric_blob_oracles() {
++        asupersync::test_utils::run_test(|| async {
++            let dir = tempfile::tempdir().unwrap();
++            let path = dir.path().join("cte_affinity.db");
++            let stock = rusqlite::Connection::open(&path).unwrap();
++            stock.execute_batch("CREATE TABLE unrelated(v);").unwrap();
++            let conn = Connection::open_existing_schema_only(path.to_string_lossy().into_owned())
++                .await
++                .unwrap();
++            for equality in ["c.x=p.y", "p.y=c.x", "c.x=p.y AND c.x>0"] {
++                FSQLITE_EXISTS_PROBE_MEMO_BUILDS.with(|count| count.set(0));
++                FSQLITE_EXISTS_PROBE_MEMO_HITS.with(|count| count.set(0));
++                let sql = format!(
++                    "WITH c(x) AS MATERIALIZED (VALUES(1)), \
++                     p(y) AS MATERIALIZED (SELECT CAST(value AS TEXT) FROM generate_series(1,4)) \
++                     SELECT count(*) FROM p WHERE EXISTS(SELECT 1 FROM c WHERE {equality})"
++                );
++                // This is an admission guard. Materialized expression/TEXT
++                // affinity already differs from stock on the old route; do
++                // not turn its known wrong result into a regression oracle.
++                conn.query(&sql).await.unwrap();
++                assert_eq!(FSQLITE_EXISTS_PROBE_MEMO_BUILDS.with(Cell::get), 0, "{sql}");
++                assert_eq!(FSQLITE_EXISTS_PROBE_MEMO_HITS.with(Cell::get), 0, "{sql}");
++            }
++            for sql in [
++                "WITH c(x) AS MATERIALIZED (SELECT CAST(1 AS NUMERIC)), \
++                 p(y) AS MATERIALIZED (VALUES(1),(2),(3),(4)) \
++                 SELECT count(*) FROM p WHERE EXISTS(SELECT 1 FROM c WHERE c.x=p.y)",
++                "WITH c(x) AS MATERIALIZED (VALUES(1)), \
++                 p(y) AS MATERIALIZED (VALUES(1),(1.0),('1'),(NULL)) \
++                 SELECT count(*) FROM p WHERE EXISTS(SELECT 1 FROM c WHERE p.y=c.x)",
++                "WITH c(x) AS MATERIALIZED (SELECT CAST(1 AS BLOB)), \
++                 p(y) AS MATERIALIZED (VALUES(X'31'),('1'),(1),(NULL)) \
++                 SELECT count(*) FROM p WHERE EXISTS(SELECT 1 FROM c WHERE c.x=p.y)",
++            ] {
++                let expected: i64 = stock.query_row(sql, [], |row| row.get(0)).unwrap();
++                assert_eq!(count(&conn, sql).await, expected, "{sql}");
++            }
++            assert!(!conn.memdb_rows_loaded.get());
++        });
++    }
++
++    #[test]
++    fn gh533_cte_direct_probe_keeps_source_decorations_on_the_normal_route() {
++        asupersync::test_utils::run_test(|| async {
++            let conn = Connection::open(":memory:").await.unwrap();
++            {
++                let mut outer = select(
++                    "WITH t AS MATERIALIZED (SELECT value FROM generate_series(1,4)) \
++                 SELECT value FROM t",
++                );
++                let mut materialized = MaterializedTablesCleanupGuard::new(&conn);
++                conn.materialize_with_clause(
++                    outer.with.as_ref(),
++                    None,
++                    &mut materialized.tables,
++                    None,
++                )
++                .await
++                .unwrap();
++                outer.with = None;
++                let col_map = conn.build_join_col_map(&outer);
++                let _context = JoinEvalCollationContextGuard::push(JoinEvalCollationContext {
++                    declared_json_keys: conn.build_join_declared_blob_columns(&outer),
++                    column_collations: conn.build_join_col_collations(&outer),
++                    column_affinities: conn.build_join_col_affinities(&outer),
++                    using_column_projections: HashMap::new(),
++                    registry: lock_unpoisoned(conn.collation_registry.as_ref()).clone(),
++                });
++                let row = [SqliteValue::Integer(1)];
++                assert_eq!(
++                    conn.try_direct_exists_probe(
++                        &select("SELECT 1 FROM t t1 WHERE t.value=t1.value"),
++                        false,
++                        &row,
++                        &col_map,
++                    )
++                    .unwrap()
++                    .unwrap(),
++                    SqliteValue::Integer(1),
++                    "the undecorated control must reach the existing direct equality probe",
++                );
++                for sql in [
++                    "SELECT 1 FROM t t1 NOT INDEXED WHERE t.value=t1.value",
++                    "SELECT 1 FROM t t1 INDEXED BY missing_index WHERE t.value=t1.value",
++                    "SELECT 1 FROM t t1 FOR SYSTEM_TIME AS OF COMMITSEQ 1 WHERE t.value=t1.value",
++                ] {
++                    assert!(
++                        conn.try_direct_exists_probe(&select(sql), false, &row, &col_map)
++                            .is_none(),
++                        "{sql}"
++                    );
++                }
++            }
++            assert_eq!(
++                count(
++                    &conn,
++                    "WITH t AS MATERIALIZED (SELECT value FROM generate_series(1,4)) \
++                 SELECT count(*) FROM t WHERE EXISTS(SELECT 1 FROM t t1 NOT INDEXED \
++                 WHERE t.value=t1.value)"
++                )
++                .await,
++                4
++            );
++            let error = conn
++                .query(
++                    "WITH t AS MATERIALIZED (SELECT value FROM generate_series(1,4)) \
++                 SELECT count(*) FROM t WHERE EXISTS(SELECT 1 FROM t t1 INDEXED BY missing_index \
++                 WHERE t.value=t1.value)",
++                )
++                .await
++                .unwrap_err()
++                .to_string();
++            assert!(error.contains("missing_index"), "{error}");
++        });
++    }
++
++    #[derive(Clone, Copy, Default)]
++    struct CallbackState {
++        connects: usize,
++        best_indexes: usize,
++        filters: usize,
++        nexts: usize,
++        cursor_drops: usize,
++        disconnects: usize,
++        value_offset: i64,
++        bad_index: bool,
++        fail_column: bool,
++        fail_disconnect: bool,
++        disconnect_before_cursor_drop: bool,
++    }
++
++    thread_local! {
++        static CALLBACKS: Cell<CallbackState> = Cell::new(CallbackState::default());
++    }
++
++    fn update_callbacks(update: impl FnOnce(&mut CallbackState)) {
++        CALLBACKS.with(|state| {
++            let mut value = state.get();
++            update(&mut value);
++            state.set(value);
++        });
++    }
++
++    struct CountingSeriesTable(GenerateSeriesTable);
++    struct CountingSeriesCursor(GenerateSeriesCursor);
++
++    impl VirtualTable for CountingSeriesTable {
++        type Cursor = CountingSeriesCursor;
++
++        fn column_info(args: &[&str]) -> Vec<(String, char)> {
++            GenerateSeriesTable::column_info(args)
++        }
++
++        fn connect(cx: &Cx, args: &[&str]) -> Result<Self> {
++            update_callbacks(|state| state.connects += 1);
++            GenerateSeriesTable::connect(cx, args).map(Self)
++        }
++
++        fn best_index(&self, info: &mut IndexInfo) -> Result<()> {
++            update_callbacks(|state| state.best_indexes += 1);
++            self.0.best_index(info)?;
++            if CALLBACKS.with(Cell::get).bad_index {
++                info.constraint_usage[0].argv_index = 99;
++            }
++            Ok(())
++        }
++
++        fn open(&self) -> Result<Self::Cursor> {
++            self.0.open().map(CountingSeriesCursor)
++        }
++
++        fn disconnect(&mut self, _cx: &Cx) -> Result<()> {
++            update_callbacks(|state| {
++                state.disconnect_before_cursor_drop |= state.cursor_drops < state.filters;
++                state.disconnects += 1;
++            });
++            if CALLBACKS.with(Cell::get).fail_disconnect {
++                return Err(FrankenError::FunctionError(
++                    "test disconnect failure".to_owned(),
++                ));
++            }
++            Ok(())
++        }
++    }
++
++    impl VirtualTableCursor for CountingSeriesCursor {
++        fn filter(
++            &mut self,
++            cx: &Cx,
++            index: i32,
++            name: Option<&str>,
++            args: &[SqliteValue],
++        ) -> Result<()> {
++            update_callbacks(|state| state.filters += 1);
++            self.0.filter(cx, index, name, args)
++        }
++
++        fn next(&mut self, cx: &Cx) -> Result<()> {
++            update_callbacks(|state| state.nexts += 1);
++            self.0.next(cx)
++        }
++
++        fn eof(&self) -> bool {
++            self.0.eof()
++        }
++
++        fn column(&self, ctx: &mut ColumnContext, column: i32) -> Result<()> {
++            let state = CALLBACKS.with(Cell::get);
++            if state.fail_column {
++                return Err(FrankenError::FunctionError(
++                    "test column failure".to_owned(),
++                ));
++            }
++            self.0.column(ctx, column)?;
++            if column == 0 && state.value_offset != 0 {
++                let value = ctx.take_value().unwrap().to_integer() + state.value_offset;
++                ctx.set_value(SqliteValue::Integer(value));
++            }
++            Ok(())
++        }
++
++        fn rowid(&self) -> Result<i64> {
++            self.0.rowid()
++        }
++    }
++
++    impl Drop for CountingSeriesCursor {
++        fn drop(&mut self) {
++            update_callbacks(|state| state.cursor_drops += 1);
++        }
++    }
++
++    #[test]
++    fn gh533_series_override_keeps_its_callbacks_and_values() {
++        asupersync::test_utils::run_test(|| async {
++            let conn = Connection::open(":memory:").await.unwrap();
++            CALLBACKS.with(|state| {
++                state.set(CallbackState {
++                    value_offset: 100,
++                    ..Default::default()
++                })
++            });
++            conn.register_module(
++                "generate_series",
++                Box::new(module_factory_from::<CountingSeriesTable>()),
++            );
++            assert!(
++                conn.try_table_function_exists_probe(&select(
++                    "SELECT 1 FROM generate_series(1,4) WHERE value=101"
++                ))
++                .is_none()
++            );
++            reset_cursor_work();
++            assert_eq!(
++                count(
++                    &conn,
++                    "SELECT count(*) FROM generate_series(1,4) t WHERE EXISTS \
++                 (SELECT 1 FROM generate_series(1,4) s WHERE s.value=t.value)"
++                )
++                .await,
++                4,
++                "both sources must use the override's 101..=104 values"
++            );
++            assert_eq!(
++                EXISTS_CURSOR_WORK.with(Cell::get),
++                ExistsCursorWork::default()
++            );
++            let callbacks = CALLBACKS.with(Cell::get);
++            assert!(callbacks.filters > 1);
++            assert_eq!(
++                callbacks.best_indexes, 0,
++                "override retains its positional table-function protocol"
++            );
++            assert_eq!(callbacks.connects, callbacks.disconnects);
++            assert_eq!(callbacks.filters, callbacks.cursor_drops);
++            assert!(!callbacks.disconnect_before_cursor_drop);
++
++            CALLBACKS.with(|state| {
++                state.set(CallbackState {
++                    fail_column: true,
++                    ..Default::default()
++                })
++            });
++            let error = conn
++                .query(
++                    "WITH t(v) AS (VALUES(1)) SELECT count(*) FROM t WHERE EXISTS \
++                 (SELECT 1 FROM generate_series(1,4) s WHERE s.value=t.v)",
++                )
++                .await
++                .unwrap_err()
++                .to_string();
++            assert!(error.contains("test column failure"), "{error}");
++            let callbacks = CALLBACKS.with(Cell::get);
++            assert_eq!(callbacks.connects, callbacks.disconnects);
++            assert_eq!(callbacks.filters, callbacks.cursor_drops);
++            assert!(!callbacks.disconnect_before_cursor_drop);
++        });
++    }
++
++    #[test]
++    fn gh533_planned_exists_cursor_closes_before_disconnect_on_match_and_errors() {
++        asupersync::test_utils::run_test(|| async {
++            let conn = Connection::open(":memory:").await.unwrap();
++            let query =
++                select("SELECT 1 FROM generate_series(1,100) s WHERE s.value>=50 AND s.value%2=0");
++            let SelectCore::Select { where_clause, .. } = &query.body.select else {
++                unreachable!()
++            };
++            let col_map = conn.build_join_col_map(&query);
++            let context = JoinEvalCollationContext {
++                declared_json_keys: conn.build_join_declared_blob_columns(&query),
++                column_collations: conn.build_join_col_collations(&query),
++                column_affinities: conn.build_join_col_affinities(&query),
++                using_column_projections: HashMap::new(),
++                registry: lock_unpoisoned(conn.collation_registry.as_ref()).clone(),
++            };
++            let _context_guard = JoinEvalCollationContextGuard::push(context.clone());
++            let factory: Arc<dyn VtabModuleFactory> =
++                Arc::new(module_factory_from::<CountingSeriesTable>());
++            for (fail_column, fail_disconnect, bad_index) in [
++                (false, false, false),
++                (true, false, false),
++                (false, true, false),
++                (true, true, false),
++                (false, false, true),
++            ] {
++                CALLBACKS.with(|state| {
++                    state.set(CallbackState {
++                        fail_column,
++                        fail_disconnect,
++                        bad_index,
++                        ..Default::default()
++                    })
++                });
++                let result = conn.run_table_function_exists_probe(
++                    "generate_series",
++                    &factory,
++                    &[SqliteValue::Integer(1), SqliteValue::Integer(100)],
++                    &[1, 2],
++                    where_clause.as_deref(),
++                    &col_map,
++                    &context,
++                    &vec![true; col_map.len()],
++                );
++                if fail_column || fail_disconnect || bad_index {
++                    let message = result.unwrap_err().to_string();
++                    if fail_column {
++                        assert!(message.contains("test column failure"), "{message}");
++                    }
++                    if fail_disconnect {
++                        assert!(message.contains("test disconnect failure"), "{message}");
++                    }
++                    if bad_index {
++                        assert!(message.contains("xBestIndex malfunction"), "{message}");
++                    }
++                } else {
++                    assert!(result.unwrap());
++                }
++                let callbacks = CALLBACKS.with(Cell::get);
++                assert_eq!(callbacks.connects, 1);
++                assert_eq!(callbacks.best_indexes, 1);
++                assert_eq!(
++                    callbacks.nexts, 0,
++                    "a match/error does not advance the cursor"
++                );
++                assert_eq!(callbacks.cursor_drops, usize::from(!bad_index));
++                assert_eq!(callbacks.disconnects, 1);
++                assert!(!callbacks.disconnect_before_cursor_drop);
++                assert_eq!(conn.live_vtab_callback_depth.get(), 0);
++            }
++        });
++    }
++}

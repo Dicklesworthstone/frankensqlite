@@ -1,0 +1,365 @@
+{
+  "schema": 1,
+  "issue": 533,
+  "status": "ok",
+  "measurement_mode": "memory",
+  "comparison_scope": "published release versus stock; no candidate/before-after measurements",
+  "started_utc": "2026-11-05T21:42:53.658775+00:00",
+  "platform": "Linux-6.18.57-x86_64-with-glibc2.39",
+  "machine": "x86_64",
+  "cpu_affinity": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8
+  ],
+  "build_note": "Official v0.4.12 Linux amd64 release and SQLite 3.54.1 tools; shared8GiB environment with external build contention; no own build active; process RSS/HWM checkpoint experiment, not query-heap isolation",
+  "work_directory": "/workspace/scratch/9d2af73a8e7b/evidence/release533-memory/issue533-97o2wmn3",
+  "repeats": 1,
+  "settings": "engine defaults; empty explicit init file; in-memory databases",
+  "engine_order": [
+    [
+      "released",
+      "stock"
+    ],
+    [
+      "stock",
+      "released"
+    ]
+  ],
+  "results": {
+    "cte_count": {
+      "sql": "WITH t AS (SELECT value FROM generate_series(1,1000000)) SELECT count(*) FROM t;",
+      "setup": [],
+      "expected": 1000000,
+      "samples": [
+        {
+          "engine": "released",
+          "repetition": 0,
+          "pid": 9,
+          "proc_pid": 361293,
+          "queries": 2,
+          "checkpoints": [
+            {
+              "query_count": 0,
+              "rss_kib": 9076,
+              "hwm_kib": 9076
+            },
+            {
+              "query_count": 1,
+              "rss_kib": 104796,
+              "hwm_kib": 588036
+            },
+            {
+              "query_count": 2,
+              "rss_kib": 206260,
+              "hwm_kib": 684804
+            }
+          ]
+        },
+        {
+          "engine": "stock",
+          "repetition": 0,
+          "pid": 12,
+          "proc_pid": 361786,
+          "queries": 2,
+          "checkpoints": [
+            {
+              "query_count": 0,
+              "rss_kib": 1708,
+              "hwm_kib": 1708
+            },
+            {
+              "query_count": 1,
+              "rss_kib": 2628,
+              "hwm_kib": 2628
+            },
+            {
+              "query_count": 2,
+              "rss_kib": 2628,
+              "hwm_kib": 2628
+            }
+          ]
+        }
+      ],
+      "summary": {
+        "released": {
+          "runs": 1,
+          "median_setup_rss_kib": 9076,
+          "median_first_query_hwm_kib": 588036,
+          "median_first_query_rss_kib": 104796,
+          "median_final_query_hwm_kib": 684804,
+          "median_final_query_rss_kib": 206260,
+          "median_final_minus_setup_rss_kib": 197184,
+          "median_final_minus_first_rss_kib": 101464
+        },
+        "stock": {
+          "runs": 1,
+          "median_setup_rss_kib": 1708,
+          "median_first_query_hwm_kib": 2628,
+          "median_first_query_rss_kib": 2628,
+          "median_final_query_hwm_kib": 2628,
+          "median_final_query_rss_kib": 2628,
+          "median_final_minus_setup_rss_kib": 920,
+          "median_final_minus_first_rss_kib": 0
+        }
+      }
+    },
+    "single_count": {
+      "sql": "SELECT count(*) FROM generate_series(1,1000000);",
+      "setup": [],
+      "expected": 1000000,
+      "samples": [
+        {
+          "engine": "released",
+          "repetition": 0,
+          "pid": 13,
+          "proc_pid": 361804,
+          "queries": 2,
+          "checkpoints": [
+            {
+              "query_count": 0,
+              "rss_kib": 8604,
+              "hwm_kib": 8604
+            },
+            {
+              "query_count": 1,
+              "rss_kib": 12864,
+              "hwm_kib": 12864
+            },
+            {
+              "query_count": 2,
+              "rss_kib": 12864,
+              "hwm_kib": 12864
+            }
+          ]
+        },
+        {
+          "engine": "stock",
+          "repetition": 0,
+          "pid": 16,
+          "proc_pid": 361884,
+          "queries": 2,
+          "checkpoints": [
+            {
+              "query_count": 0,
+              "rss_kib": 1732,
+              "hwm_kib": 1732
+            },
+            {
+              "query_count": 1,
+              "rss_kib": 2588,
+              "hwm_kib": 2588
+            },
+            {
+              "query_count": 2,
+              "rss_kib": 2588,
+              "hwm_kib": 2588
+            }
+          ]
+        }
+      ],
+      "summary": {
+        "released": {
+          "runs": 1,
+          "median_setup_rss_kib": 8604,
+          "median_first_query_hwm_kib": 12864,
+          "median_first_query_rss_kib": 12864,
+          "median_final_query_hwm_kib": 12864,
+          "median_final_query_rss_kib": 12864,
+          "median_final_minus_setup_rss_kib": 4260,
+          "median_final_minus_first_rss_kib": 0
+        },
+        "stock": {
+          "runs": 1,
+          "median_setup_rss_kib": 1732,
+          "median_first_query_hwm_kib": 2588,
+          "median_first_query_rss_kib": 2588,
+          "median_final_query_hwm_kib": 2588,
+          "median_final_query_rss_kib": 2588,
+          "median_final_minus_setup_rss_kib": 856,
+          "median_final_minus_first_rss_kib": 0
+        }
+      }
+    },
+    "cte_correlated_exists": {
+      "sql": "WITH t AS (SELECT value FROM generate_series(1,10000)) SELECT count(*) FROM t WHERE EXISTS(SELECT 1 FROM t t1 WHERE t.value=t1.value);",
+      "setup": [],
+      "expected": 10000,
+      "samples": [
+        {
+          "engine": "released",
+          "repetition": 0,
+          "pid": 17,
+          "proc_pid": 361888,
+          "queries": 2,
+          "checkpoints": [
+            {
+              "query_count": 0,
+              "rss_kib": 8664,
+              "hwm_kib": 8664
+            },
+            {
+              "query_count": 1,
+              "rss_kib": 7744,
+              "hwm_kib": 19460
+            },
+            {
+              "query_count": 2,
+              "rss_kib": 8776,
+              "hwm_kib": 19460
+            }
+          ]
+        },
+        {
+          "engine": "stock",
+          "repetition": 0,
+          "pid": 20,
+          "proc_pid": 363416,
+          "queries": 2,
+          "checkpoints": [
+            {
+              "query_count": 0,
+              "rss_kib": 1668,
+              "hwm_kib": 1668
+            },
+            {
+              "query_count": 1,
+              "rss_kib": 2488,
+              "hwm_kib": 2488
+            },
+            {
+              "query_count": 2,
+              "rss_kib": 2488,
+              "hwm_kib": 2488
+            }
+          ]
+        }
+      ],
+      "summary": {
+        "released": {
+          "runs": 1,
+          "median_setup_rss_kib": 8664,
+          "median_first_query_hwm_kib": 19460,
+          "median_first_query_rss_kib": 7744,
+          "median_final_query_hwm_kib": 19460,
+          "median_final_query_rss_kib": 8776,
+          "median_final_minus_setup_rss_kib": 112,
+          "median_final_minus_first_rss_kib": 1032
+        },
+        "stock": {
+          "runs": 1,
+          "median_setup_rss_kib": 1668,
+          "median_first_query_hwm_kib": 2488,
+          "median_first_query_rss_kib": 2488,
+          "median_final_query_hwm_kib": 2488,
+          "median_final_query_rss_kib": 2488,
+          "median_final_minus_setup_rss_kib": 820,
+          "median_final_minus_first_rss_kib": 0
+        }
+      }
+    },
+    "direct_correlated_exists": {
+      "sql": "SELECT count(*) FROM generate_series(1,10000)t WHERE EXISTS(SELECT 1 FROM generate_series(1,10000)t1 WHERE t.value=t1.value);",
+      "setup": [],
+      "expected": 10000,
+      "samples": [
+        {
+          "engine": "released",
+          "repetition": 0,
+          "pid": 21,
+          "proc_pid": 363418,
+          "queries": 2,
+          "checkpoints": [
+            {
+              "query_count": 0,
+              "rss_kib": 8616,
+              "hwm_kib": 8616
+            },
+            {
+              "query_count": 1,
+              "rss_kib": 5200,
+              "hwm_kib": 19972
+            },
+            {
+              "query_count": 2,
+              "rss_kib": 8640,
+              "hwm_kib": 19972
+            }
+          ]
+        },
+        {
+          "engine": "stock",
+          "repetition": 0,
+          "pid": 24,
+          "proc_pid": 384152,
+          "queries": 2,
+          "checkpoints": [
+            {
+              "query_count": 0,
+              "rss_kib": 1704,
+              "hwm_kib": 1704
+            },
+            {
+              "query_count": 1,
+              "rss_kib": 2624,
+              "hwm_kib": 2624
+            },
+            {
+              "query_count": 2,
+              "rss_kib": 2624,
+              "hwm_kib": 2624
+            }
+          ]
+        }
+      ],
+      "summary": {
+        "released": {
+          "runs": 1,
+          "median_setup_rss_kib": 8616,
+          "median_first_query_hwm_kib": 19972,
+          "median_first_query_rss_kib": 5200,
+          "median_final_query_hwm_kib": 19972,
+          "median_final_query_rss_kib": 8640,
+          "median_final_minus_setup_rss_kib": 24,
+          "median_final_minus_first_rss_kib": 3440
+        },
+        "stock": {
+          "runs": 1,
+          "median_setup_rss_kib": 1704,
+          "median_first_query_hwm_kib": 2624,
+          "median_first_query_rss_kib": 2624,
+          "median_final_query_hwm_kib": 2624,
+          "median_final_query_rss_kib": 2624,
+          "median_final_minus_setup_rss_kib": 920,
+          "median_final_minus_first_rss_kib": 0
+        }
+      }
+    }
+  },
+  "memory_queries_per_process": 2,
+  "memory_scope": "Linux /proc VmRSS and VmHWM while the same child awaits input after setup and each checked SELECT; fresh child for each repetition; no warmup. A shell-builtin PID handshake identifies the child in the /proc mount's namespace before exec; both local pid and proc_pid are retained.",
+  "memory_interpretation": "Approximate whole-process resident counters, not query heap. First-query high-water includes executable startup and fixture setup, excludes later queries and shutdown. Later RSS includes allocator-retained pages, caches and other process state; a nonzero retained delta alone is not proof of a leak. The small shell launcher is replaced by the CLI before any checkpoint. Counters reset at exec, so no pre-exec Python-parent or shell RSS floor is included.",
+  "binaries": {
+    "released": {
+      "path": "/workspace/scratch/9d2af73a8e7b/native/release412/fsqlite",
+      "sha256": "71259ce7c788fbf227f58dab7f6696c0c58d62b1637e1e789c86e696653c4543",
+      "bytes": 25038488,
+      "version": "fsqlite 0.4.12",
+      "source_revision_supplied": "v0.4.12"
+    },
+    "stock": {
+      "path": "/workspace/scratch/9d2af73a8e7b/native/stock/sqlite3",
+      "sha256": "c9daa875c28379f0d61a833d47928c6e43b352d98638cd824ec405f23c99d870",
+      "bytes": 2037360,
+      "version": "3.54.1 2026-10-16 14:45:20 555e07ef33f69a0957d24d8e555b702464a131d6f1607f4c3c1e4551e8e6ca76 (64-bit)",
+      "source_revision_supplied": "555e07ef33f69a0957d24d8e555b702464a131d6f1607f4c3c1e4551e8e6ca76"
+    }
+  },
+  "finished_utc": "2026-11-05T21:49:17.956067+00:00"
+}

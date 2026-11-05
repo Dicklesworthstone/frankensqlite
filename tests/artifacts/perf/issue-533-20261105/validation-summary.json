@@ -1,0 +1,203 @@
+{
+  "date": "2026-11-05",
+  "scope": "Investigation and harness verification; no current-main native baseline/candidate executable comparison",
+  "engine_candidate": "UNVERIFIED and unapplied; compiler qualification blocked",
+  "protocol_tests": {
+    "baseline": {
+      "tests": 14,
+      "failures": 1,
+      "errors": 2,
+      "skipped": 0,
+      "log": "baseline-benchmark-protocol-tests.log"
+    },
+    "updated": {
+      "tests": 20,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0,
+      "log": "benchmark-protocol-tests.log"
+    }
+  },
+  "stock_sql": {
+    "passed": 21,
+    "failed": 0,
+    "evidence": "stock-correctness-21.json"
+  },
+  "release_stock_timing": {
+    "cases": 4,
+    "samples_per_engine_per_case": 1,
+    "warmups": 0,
+    "evidence": "release-stock-timing.json",
+    "shared_host": true
+  },
+  "release_stock_memory": {
+    "status": "ok",
+    "cases": 4,
+    "processes_per_engine_per_case": 1,
+    "queries_per_process": 2,
+    "evidence": "release-stock-memory.json",
+    "scope": "Whole-process Linux VmRSS/VmHWM; no candidate/before-after measurements"
+  },
+  "native_build_attempts": [
+    {
+      "source_revision": "dbd27741cae17b596230a4a95b6f46dcc344fed9",
+      "cwd": "/workspace/scratch/9d2af73a8e7b/frankensqlite-baseline",
+      "command": [
+        "timeout",
+        "1800s",
+        "/root/.cargo/bin/cargo",
+        "build",
+        "--locked",
+        "-p",
+        "fsqlite-cli",
+        "--bin",
+        "fsqlite"
+      ],
+      "environment": {
+        "CARGO_BUILD_JOBS": "1",
+        "CARGO_INCREMENTAL": "0",
+        "CARGO_TARGET_DIR": "/workspace/scratch/9d2af73a8e7b/native-target",
+        "CARGO_PROFILE_DEV_DEBUG": "0",
+        "CARGO_PROFILE_DEV_CODEGEN_UNITS": "256",
+        "RUSTFLAGS": "-Zthreads=1 -Zunstable-options --jobs-backend=1 -Cembed-bitcode=no"
+      },
+      "outcome": "asupersync rustc terminated with signal 9 (SIGKILL), before fsqlite-core/CLI native executable",
+      "raw_log_in_archive": "baseline-build.log"
+    },
+    {
+      "source_revision": "dbd27741cae17b596230a4a95b6f46dcc344fed9",
+      "cwd": "/workspace/scratch/9d2af73a8e7b/frankensqlite-baseline",
+      "command": [
+        "timeout",
+        "2700s",
+        "/root/.cargo/bin/cargo",
+        "-Zcodegen-backend",
+        "build",
+        "--locked",
+        "-p",
+        "fsqlite-cli",
+        "--bin",
+        "fsqlite",
+        "--config",
+        "profile.dev.package.asupersync.codegen-backend=\"cranelift\"",
+        "--config",
+        "profile.dev.package.fsqlite-core.codegen-backend=\"cranelift\""
+      ],
+      "environment": {
+        "CARGO_BUILD_JOBS": "1",
+        "CARGO_INCREMENTAL": "0",
+        "CARGO_TARGET_DIR": "/workspace/scratch/9d2af73a8e7b/native-target",
+        "CARGO_PROFILE_DEV_DEBUG": "0",
+        "CARGO_PROFILE_DEV_CODEGEN_UNITS": "256",
+        "RUSTFLAGS": "-Zthreads=1 -Zunstable-options --jobs-backend=1 -Cembed-bitcode=no"
+      },
+      "outcome": "asupersync rustc terminated with signal 9 (SIGKILL), before fsqlite-core/CLI native executable",
+      "raw_log_in_archive": "baseline-cranelift-build.log"
+    },
+    {
+      "source_revision": "dbd27741cae17b596230a4a95b6f46dcc344fed9",
+      "cwd": "/workspace/scratch/9d2af73a8e7b/frankensqlite-baseline",
+      "command": [
+        "timeout",
+        "2700s",
+        "/root/.cargo/bin/cargo",
+        "-Zcodegen-backend",
+        "-Zprofile-hint-mostly-unused",
+        "build",
+        "--locked",
+        "-p",
+        "fsqlite-cli",
+        "--bin",
+        "fsqlite",
+        "--config",
+        "profile.dev.package.asupersync.hint-mostly-unused=true",
+        "--config",
+        "profile.dev.package.fsqlite-core.codegen-backend=\"cranelift\""
+      ],
+      "environment": {
+        "CARGO_BUILD_JOBS": "1",
+        "CARGO_INCREMENTAL": "0",
+        "CARGO_TARGET_DIR": "/workspace/scratch/9d2af73a8e7b/native-target",
+        "CARGO_PROFILE_DEV_DEBUG": "0",
+        "CARGO_PROFILE_DEV_CODEGEN_UNITS": "256",
+        "RUSTFLAGS": "-Zthreads=1 -Zunstable-options --jobs-backend=1 -Cembed-bitcode=no"
+      },
+      "outcome": "asupersync rustc terminated with signal 9 (SIGKILL), before fsqlite-core/CLI native executable",
+      "raw_log_in_archive": "baseline-hinted-build.log"
+    }
+  ],
+  "candidate_typecheck": {
+    "status": "BLOCKED: asupersync rustc SIGKILL before fsqlite-core",
+    "command": [
+      "timeout",
+      "900s",
+      "/root/.cargo/bin/cargo",
+      "check",
+      "--offline",
+      "--locked",
+      "-p",
+      "fsqlite-core",
+      "--lib"
+    ],
+    "scope": "Metadata-only compiler check; does not produce or execute a native CLI",
+    "environment": {
+      "CARGO_BUILD_JOBS": "1",
+      "CARGO_INCREMENTAL": "0",
+      "CARGO_TARGET_DIR": "/workspace/scratch/9d2af73a8e7b/native-target",
+      "CARGO_PROFILE_DEV_DEBUG": "0",
+      "CARGO_PROFILE_DEV_CODEGEN_UNITS": "256",
+      "RUSTFLAGS": "-Zthreads=1 -Zunstable-options --jobs-backend=1 -Cembed-bitcode=no"
+    },
+    "exit_code": 101,
+    "raw_log_in_archive": "candidate-core-check.log",
+    "changed_engine_code_typechecked": false
+  },
+  "prepared_stage_probe": {
+    "status": "UNBUILT and UNEXECUTED",
+    "source": "stage-probe/stage_probe.rs",
+    "source_sha256": "4f4e91d5728d08f8d699b52b7976a367bce2408ffad87f04621796e85dcb2bc5",
+    "audits": {
+      "baseline": {
+        "preparation": "stage-probe/baseline/preparation.json",
+        "registry_packages_audited": 215,
+        "registry_version_or_checksum_drift": [],
+        "engine_head": "dbd27741cae17b596230a4a95b6f46dcc344fed9"
+      },
+      "candidate": {
+        "preparation": "stage-probe/candidate/preparation.json",
+        "registry_packages_audited": 215,
+        "registry_version_or_checksum_drift": [],
+        "engine_head": "931a0dd6b31d70d7c5d9fc66c01ce9df9e17b64e"
+      }
+    },
+    "scope": "Public diagnostic API; stage timers overlap, no executed stage counts/timing or candidate speedups",
+    "portability": "Copy stage-probe beside sibling frankensqlite-baseline and frankensqlite checkouts as README describes; Cargo from CARGO/PATH; historical audit paths are not required inputs"
+  },
+  "candidate_worktree_base_revision": "931a0dd6b31d70d7c5d9fc66c01ce9df9e17b64e",
+  "baseline_candidate_base_drift": "Candidate base advanced after initial baseline snapshot; any eventual before/after attribution must account for unrelated upstream commits or use a matching baseline.",
+  "engine_candidate_patch": {
+    "receipt": "candidate-unverified.json",
+    "patch": "candidate-unverified.patch",
+    "base_commit": "931a0dd6b31d70d7c5d9fc66c01ce9df9e17b64e",
+    "status": "UNVERIFIED",
+    "read_only_applicability_checks_passed": 2
+  },
+  "retry_condition": "Use a worker able to compile default native dependencies, align baseline/candidate base revisions, execute deterministic engine tests, then collect repeated paired timing and memory measurements.",
+  "production_engine_changes_applied": false,
+  "formatter_checks": {
+    "receipt": "formatter-receipts.json",
+    "workspace": "timed out120s, exit124; existing exclusions preserved; no complete pass",
+    "gh204_file": "isolated check passed, exit0; source-only"
+  },
+  "resource_snapshot": {
+    "receipt": "resource-limits.json",
+    "scope": "Post-failure shared cgroup snapshot; aggregated OOM counters cannot attribute individual SIGKILL events"
+  },
+  "not_completed": [
+    "Clippy",
+    "Successful engine typecheck",
+    "Rust correctness execution",
+    "Native stage execution",
+    "Paired baseline/candidate timing and memory measurements"
+  ]
+}

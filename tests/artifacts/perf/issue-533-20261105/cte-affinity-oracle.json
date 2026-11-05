@@ -1,0 +1,83 @@
+{
+  "scope": "correctness only; tiny queries; not performance evidence",
+  "cases": {
+    "literal_inner_text_outer": {
+      "sql": "WITH c(x) AS MATERIALIZED (VALUES (1)), p(y) AS MATERIALIZED (SELECT CAST(value AS TEXT) FROM generate_series(1,4)) SELECT count(*) FROM p WHERE EXISTS (SELECT 1 FROM c WHERE c.x=p.y);",
+      "stock": {
+        "returncode": 0,
+        "stdout": "1\n",
+        "stderr": ""
+      },
+      "release412": {
+        "returncode": 0,
+        "stdout": "0\n",
+        "stderr": ""
+      }
+    },
+    "literal_inner_text_outer_reversed": {
+      "sql": "WITH c(x) AS MATERIALIZED (VALUES (1)), p(y) AS MATERIALIZED (SELECT CAST(value AS TEXT) FROM generate_series(1,4)) SELECT count(*) FROM p WHERE EXISTS (SELECT 1 FROM c WHERE p.y=c.x);",
+      "stock": {
+        "returncode": 0,
+        "stdout": "1\n",
+        "stderr": ""
+      },
+      "release412": {
+        "returncode": 0,
+        "stdout": "0\n",
+        "stderr": ""
+      }
+    },
+    "literal_inner_text_outer_residual": {
+      "sql": "WITH c(x) AS MATERIALIZED (VALUES (1)), p(y) AS MATERIALIZED (SELECT CAST(value AS TEXT) FROM generate_series(1,4)) SELECT count(*) FROM p WHERE EXISTS (SELECT 1 FROM c WHERE c.x=p.y AND c.x>0);",
+      "stock": {
+        "returncode": 0,
+        "stdout": "1\n",
+        "stderr": ""
+      },
+      "release412": {
+        "returncode": 0,
+        "stdout": "0\n",
+        "stderr": ""
+      }
+    },
+    "integer_affinity_inner_text_outer": {
+      "sql": "WITH c(x) AS MATERIALIZED (SELECT CAST(1 AS INTEGER)), p(y) AS MATERIALIZED (SELECT CAST(value AS TEXT) FROM generate_series(1,4)) SELECT count(*) FROM p WHERE EXISTS (SELECT 1 FROM c WHERE c.x=p.y);",
+      "stock": {
+        "returncode": 0,
+        "stdout": "1\n",
+        "stderr": ""
+      },
+      "release412": {
+        "returncode": 0,
+        "stdout": "1\n",
+        "stderr": ""
+      }
+    },
+    "blob_affinity_inner_text_outer": {
+      "sql": "WITH c(x) AS MATERIALIZED (SELECT CAST(1 AS BLOB)), p(y) AS MATERIALIZED (SELECT CAST(value AS TEXT) FROM generate_series(1,4)) SELECT count(*) FROM p WHERE EXISTS (SELECT 1 FROM c WHERE c.x=p.y);",
+      "stock": {
+        "returncode": 0,
+        "stdout": "0\n",
+        "stderr": ""
+      },
+      "release412": {
+        "returncode": 0,
+        "stdout": "0\n",
+        "stderr": ""
+      }
+    },
+    "text_inner_literal_outer": {
+      "sql": "WITH c(x) AS MATERIALIZED (SELECT CAST(1 AS TEXT)), p(y) AS MATERIALIZED (SELECT value+0 FROM generate_series(1,4)) SELECT count(*) FROM p WHERE EXISTS (SELECT 1 FROM c WHERE c.x=p.y);",
+      "stock": {
+        "returncode": 0,
+        "stdout": "1\n",
+        "stderr": ""
+      },
+      "release412": {
+        "returncode": 0,
+        "stdout": "0\n",
+        "stderr": ""
+      }
+    }
+  }
+}

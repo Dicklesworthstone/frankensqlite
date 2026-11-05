@@ -1,0 +1,265 @@
+{
+  "schema": 1,
+  "issue": 533,
+  "status": "ok",
+  "measurement_mode": "timing",
+  "comparison_scope": "published release versus stock; no candidate/before-after measurements",
+  "started_utc": "2026-11-05T21:32:32.388542+00:00",
+  "platform": "Linux-6.18.57-x86_64-with-glibc2.39",
+  "machine": "x86_64",
+  "cpu_affinity": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8
+  ],
+  "build_note": "Official v0.4.12 Linux amd64 release and SQLite 3.54.1 tools; shared 8 GiB environment under external build contention; no own build active; preliminary single observation, not a stable throughput estimate",
+  "work_directory": "/workspace/scratch/9d2af73a8e7b/evidence/release533/issue533-vqc7p467",
+  "timing_scope": "native CLI SELECT timer, scalar output; startup/setup/warmup excluded",
+  "timing_resolution_note": "FrankenSQLite real timers round to 1 ms (up to 0.5 ms error per sample); user+sys CPU fields print microseconds. Zero timers are below-resolution observations and suppress affected ratios. Do not interpret small differences below this precision.",
+  "warmups_per_sample": 0,
+  "repeats": 1,
+  "settings": "engine defaults; empty explicit init file; in-memory databases",
+  "engine_order": [
+    [
+      "released",
+      "stock"
+    ],
+    [
+      "stock",
+      "released"
+    ]
+  ],
+  "results": {
+    "cte_count": {
+      "sql": "WITH t AS (SELECT value FROM generate_series(1,1000000)) SELECT count(*) FROM t;",
+      "setup": [],
+      "expected": 1000000,
+      "samples": [
+        {
+          "engine": "released",
+          "repetition": 0,
+          "seconds": 7.296,
+          "cpu_seconds": 2.505219,
+          "timer_line": "Run Time: real 7.296 user 1.513390 sys 0.991829",
+          "below_timer_resolution": false
+        },
+        {
+          "engine": "stock",
+          "repetition": 0,
+          "seconds": 0.030047,
+          "cpu_seconds": 0.012474,
+          "timer_line": "Run Time: real 0.030047 user 0.012474 sys 0.000000",
+          "below_timer_resolution": false
+        }
+      ],
+      "plans": {
+        "released": {
+          "returncode": 1,
+          "stdout": "2|0|0|SCAN t\n",
+          "stderr": "error: not implemented: WITH clauses require connection-level CTE lowering or an explicit fallback boundary\n"
+        },
+        "stock": {
+          "returncode": 0,
+          "stdout": "QUERY PLAN\n`--SCAN generate_series VIRTUAL TABLE INDEX 0x3:\naddr  opcode         p1    p2    p3    p4             p5  comment      \n----  -------------  ----  ----  ----  -------------  --  -------------\n0     Init           0     14    0                    0   Start at 14\n1     Null           0     1     1                    0   r[1..1]=NULL\n2     VOpen          1     0     0     vtab:5634CAC0CF88 0   \n3     Integer        1     4     0                    0   r[4]=1\n4     Integer        1000000 5     0                    0   r[5]=1000000\n5     Integer        3     2     0                    0   r[2]=3\n6     Integer        2     3     0                    0   r[3]=2\n7     VFilter        1     10    2                    0   iplan=r[2] zplan=''\n8       AggStep        0     0     1     count(0)       0   accum=r[1] step(r[0])\n9     VNext          1     8     0                    0   \n10    AggFinal       1     0     0     count(0)       0   accum=r[1] N=0\n11    Copy           1     6     0                    0   r[6]=r[1]\n12    ResultRow      6     1     0                    0   output=r[6]\n13    Halt           0     0     0                    0   \n14    Transaction    0     0     0     0              1   usesStmtJournal=0\n15    Goto           0     1     0                    0   \n",
+          "stderr": ""
+        }
+      },
+      "summary": {
+        "released": {
+          "runs": 1,
+          "median_seconds": 7.296,
+          "min_seconds": 7.296,
+          "max_seconds": 7.296,
+          "median_cpu_seconds": 2.505219
+        },
+        "stock": {
+          "runs": 1,
+          "median_seconds": 0.030047,
+          "min_seconds": 0.030047,
+          "max_seconds": 0.030047,
+          "median_cpu_seconds": 0.012474
+        },
+        "released_over_stock": 242.8195826538423
+      }
+    },
+    "single_count": {
+      "sql": "SELECT count(*) FROM generate_series(1,1000000);",
+      "setup": [],
+      "expected": 1000000,
+      "samples": [
+        {
+          "engine": "released",
+          "repetition": 0,
+          "seconds": 0.339,
+          "cpu_seconds": 0.122417,
+          "timer_line": "Run Time: real 0.339 user 0.101945 sys 0.020472",
+          "below_timer_resolution": false
+        },
+        {
+          "engine": "stock",
+          "repetition": 0,
+          "seconds": 0.036059,
+          "cpu_seconds": 0.015343,
+          "timer_line": "Run Time: real 0.036059 user 0.015343 sys 0.000000",
+          "below_timer_resolution": false
+        }
+      ],
+      "plans": {
+        "released": {
+          "returncode": 1,
+          "stdout": "2|0|0|SCAN generate_series VIRTUAL TABLE INDEX 1:\n",
+          "stderr": "error: not implemented: non-table FROM source\n"
+        },
+        "stock": {
+          "returncode": 0,
+          "stdout": "QUERY PLAN\n`--SCAN generate_series VIRTUAL TABLE INDEX 0x3:\naddr  opcode         p1    p2    p3    p4             p5  comment      \n----  -------------  ----  ----  ----  -------------  --  -------------\n0     Init           0     14    0                    0   Start at 14\n1     Null           0     1     1                    0   r[1..1]=NULL\n2     VOpen          0     0     0     vtab:56013FB8AE98 0   \n3     Integer        1     4     0                    0   r[4]=1\n4     Integer        1000000 5     0                    0   r[5]=1000000\n5     Integer        3     2     0                    0   r[2]=3\n6     Integer        2     3     0                    0   r[3]=2\n7     VFilter        0     10    2                    0   iplan=r[2] zplan=''\n8       AggStep        0     0     1     count(0)       0   accum=r[1] step(r[0])\n9     VNext          0     8     0                    0   \n10    AggFinal       1     0     0     count(0)       0   accum=r[1] N=0\n11    Copy           1     6     0                    0   r[6]=r[1]\n12    ResultRow      6     1     0                    0   output=r[6]\n13    Halt           0     0     0                    0   \n14    Transaction    0     0     0     0              1   usesStmtJournal=0\n15    Goto           0     1     0                    0   \n",
+          "stderr": ""
+        }
+      },
+      "summary": {
+        "released": {
+          "runs": 1,
+          "median_seconds": 0.339,
+          "min_seconds": 0.339,
+          "max_seconds": 0.339,
+          "median_cpu_seconds": 0.122417
+        },
+        "stock": {
+          "runs": 1,
+          "median_seconds": 0.036059,
+          "min_seconds": 0.036059,
+          "max_seconds": 0.036059,
+          "median_cpu_seconds": 0.015343
+        },
+        "released_over_stock": 9.401259047671871
+      }
+    },
+    "cte_correlated_exists": {
+      "sql": "WITH t AS (SELECT value FROM generate_series(1,10000)) SELECT count(*) FROM t WHERE EXISTS(SELECT 1 FROM t t1 WHERE t.value=t1.value);",
+      "setup": [],
+      "expected": 10000,
+      "samples": [
+        {
+          "engine": "released",
+          "repetition": 0,
+          "seconds": 16.196,
+          "cpu_seconds": 8.119247,
+          "timer_line": "Run Time: real 16.196 user 7.923071 sys 0.196176",
+          "below_timer_resolution": false
+        },
+        {
+          "engine": "stock",
+          "repetition": 0,
+          "seconds": 0.004853,
+          "cpu_seconds": 0.001353,
+          "timer_line": "Run Time: real 0.004853 user 0.001353 sys 0.000000",
+          "below_timer_resolution": false
+        }
+      ],
+      "plans": {
+        "released": {
+          "returncode": 1,
+          "stdout": "2|0|0|SCAN t\n",
+          "stderr": "error: not implemented: WITH clauses require connection-level CTE lowering or an explicit fallback boundary\n"
+        },
+        "stock": {
+          "returncode": 0,
+          "stdout": "QUERY PLAN\n|--SCAN generate_series VIRTUAL TABLE INDEX 0x3:\n`--CORRELATED SCALAR SUBQUERY 2\n   `--SCAN generate_series VIRTUAL TABLE INDEX 0xa3:\naddr  opcode         p1    p2    p3    p4             p5  comment      \n----  -------------  ----  ----  ----  -------------  --  -------------\n0     Init           0     30    0                    0   Start at 30\n1     Null           0     1     1                    0   r[1..1]=NULL\n2     VOpen          1     0     0     vtab:55ACA4CDC558 0   \n3     Integer        1     4     0                    0   r[4]=1\n4     Integer        10000 5     0                    0   r[5]=10000\n5     Integer        3     2     0                    0   r[2]=3\n6     Integer        2     3     0                    0   r[3]=2\n7     VFilter        1     26    2                    0   iplan=r[2] zplan=''\n8       BeginSubrtn    0     7     0                    0   r[7]=NULL\n9         Integer        0     8     0                    0   r[8]=0; Init EXISTS result\n10        Integer        1     9     0                    0   r[9]=1; LIMIT counter\n11        VOpen          3     0     0     vtab:55ACA4CDC558 0   \n12        Integer        1     12    0                    0   r[12]=1\n13        Integer        10000 13    0                    0   r[13]=10000\n14        Integer        1     14    0                    0   r[14]=1\n15        VColumn        1     0     15                   0   r[15]=vcolumn(0)\n16        Integer        163   10    0                    0   r[10]=163\n17        Integer        4     11    0                    0   r[11]=4\n18        VFilter        3     22    10                   0   iplan=r[10] zplan=''\n19          Integer        1     8     0                    0   r[8]=1\n20          DecrJumpZero   9     22    0                    0   if (--r[9])==0 goto 22\n21        VNext          3     19    0                    0   \n22      Return         7     9     1                    0   \n23      IfNot          8     25    1                    0   \n24      AggStep        0     0     1     count(0)       0   accum=r[1] step(r[0])\n25    VNext          1     8     0                    0   \n26    AggFinal       1     0     0     count(0)       0   accum=r[1] N=0\n27    Copy           1     17    0                    0   r[17]=r[1]\n28    ResultRow      17    1     0                    0   output=r[17]\n29    Halt           0     0     0                    0   \n30    Transaction    0     0     0     0              1   usesStmtJournal=0\n31    Goto           0     1     0                    0   \n",
+          "stderr": ""
+        }
+      },
+      "summary": {
+        "released": {
+          "runs": 1,
+          "median_seconds": 16.196,
+          "min_seconds": 16.196,
+          "max_seconds": 16.196,
+          "median_cpu_seconds": 8.119247
+        },
+        "stock": {
+          "runs": 1,
+          "median_seconds": 0.004853,
+          "min_seconds": 0.004853,
+          "max_seconds": 0.004853,
+          "median_cpu_seconds": 0.001353
+        },
+        "released_over_stock": 3337.3171234288075
+      }
+    },
+    "direct_correlated_exists": {
+      "sql": "SELECT count(*) FROM generate_series(1,10000)t WHERE EXISTS(SELECT 1 FROM generate_series(1,10000)t1 WHERE t.value=t1.value);",
+      "setup": [],
+      "expected": 10000,
+      "samples": [
+        {
+          "engine": "released",
+          "repetition": 0,
+          "seconds": 96.699,
+          "cpu_seconds": 77.966582,
+          "timer_line": "Run Time: real 96.699 user 33.217553 sys 44.749029",
+          "below_timer_resolution": false
+        },
+        {
+          "engine": "stock",
+          "repetition": 0,
+          "seconds": 0.000922,
+          "cpu_seconds": 0.000928,
+          "timer_line": "Run Time: real 0.000922 user 0.000928 sys 0.000000",
+          "below_timer_resolution": false
+        }
+      ],
+      "plans": {
+        "released": {
+          "returncode": 1,
+          "stdout": "2|0|0|SCAN t VIRTUAL TABLE INDEX 1:\n",
+          "stderr": "error: not implemented: non-table FROM source\n"
+        },
+        "stock": {
+          "returncode": 0,
+          "stdout": "QUERY PLAN\n|--SCAN t VIRTUAL TABLE INDEX 0x3:\n`--SCAN t1 EXISTS VIRTUAL TABLE INDEX 0x83:\naddr  opcode         p1    p2    p3    p4             p5  comment      \n----  -------------  ----  ----  ----  -------------  --  -------------\n0     Init           0     24    0                    0   Start at 24\n1     Null           0     1     1                    0   r[1..1]=NULL\n2     IfNot          2     20    1                    0   \n3     VOpen          0     0     0     vtab:557DE82FF088 0   \n4     VOpen          2     0     0     vtab:557DE82FF088 0   \n5     Integer        1     5     0                    0   r[5]=1\n6     Integer        10000 6     0                    0   r[6]=10000\n7     Integer        3     3     0                    0   r[3]=3\n8     Integer        2     4     0                    0   r[4]=2\n9     VFilter        0     20    3                    0   iplan=r[3] zplan=''\n10      Integer        1     9     0                    0   r[9]=1\n11      Integer        10000 10    0                    0   r[10]=10000\n12      VColumn        0     0     11                   0   r[11]=vcolumn(0)\n13      Integer        131   7     0                    0   r[7]=131\n14      Integer        3     8     0                    0   r[8]=3\n15      VFilter        2     19    7                    0   iplan=r[7] zplan=''\n16        AggStep        0     0     1     count(0)       0   accum=r[1] step(r[0])\n17        Goto           0     19    0                    0   EXISTS break 1\n18      VNext          2     16    0                    0   \n19    VNext          0     10    0                    0   \n20    AggFinal       1     0     0     count(0)       0   accum=r[1] N=0\n21    Copy           1     12    0                    0   r[12]=r[1]\n22    ResultRow      12    1     0                    0   output=r[12]\n23    Halt           0     0     0                    0   \n24    Transaction    0     0     0     0              1   usesStmtJournal=0\n25    Integer        1     2     0                    0   r[2]=1\n26    Goto           0     1     0                    0   \n",
+          "stderr": ""
+        }
+      },
+      "summary": {
+        "released": {
+          "runs": 1,
+          "median_seconds": 96.699,
+          "min_seconds": 96.699,
+          "max_seconds": 96.699,
+          "median_cpu_seconds": 77.966582
+        },
+        "stock": {
+          "runs": 1,
+          "median_seconds": 0.000922,
+          "min_seconds": 0.000922,
+          "max_seconds": 0.000922,
+          "median_cpu_seconds": 0.000928
+        },
+        "released_over_stock": 104879.60954446855
+      }
+    }
+  },
+  "binaries": {
+    "released": {
+      "path": "/workspace/scratch/9d2af73a8e7b/native/release412/fsqlite",
+      "sha256": "71259ce7c788fbf227f58dab7f6696c0c58d62b1637e1e789c86e696653c4543",
+      "bytes": 25038488,
+      "version": "fsqlite 0.4.12",
+      "source_revision_supplied": "v0.4.12"
+    },
+    "stock": {
+      "path": "/workspace/scratch/9d2af73a8e7b/native/stock/sqlite3",
+      "sha256": "c9daa875c28379f0d61a833d47928c6e43b352d98638cd824ec405f23c99d870",
+      "bytes": 2037360,
+      "version": "3.54.1 2026-10-16 14:45:20 555e07ef33f69a0957d24d8e555b702464a131d6f1607f4c3c1e4551e8e6ca76 (64-bit)",
+      "source_revision_supplied": "555e07ef33f69a0957d24d8e555b702464a131d6f1607f4c3c1e4551e8e6ca76"
+    }
+  },
+  "finished_utc": "2026-11-05T21:34:37.337755+00:00"
+}

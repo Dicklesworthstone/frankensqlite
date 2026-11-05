@@ -1,0 +1,63 @@
+test_failed_memory_collection_writes_error_report (test_benchmark_issue_530.BenchmarkProtocolTests.test_failed_memory_collection_writes_error_report) ... ok
+test_invalid_cli_modes_and_duplicate_cases_reject_before_execution (test_benchmark_issue_530.BenchmarkProtocolTests.test_invalid_cli_modes_and_duplicate_cases_reject_before_execution) ... ok
+test_memory_mode_never_collects_or_claims_timing_samples (test_benchmark_issue_530.BenchmarkProtocolTests.test_memory_mode_never_collects_or_claims_timing_samples) ... ok
+test_memory_protocol_rejects_bad_results_stderr_and_early_exit (test_benchmark_issue_530.BenchmarkProtocolTests.test_memory_protocol_rejects_bad_results_stderr_and_early_exit) ... 
+  test_memory_protocol_rejects_bad_results_stderr_and_early_exit (test_benchmark_issue_530.BenchmarkProtocolTests.test_memory_protocol_rejects_bad_results_stderr_and_early_exit) (behavior='wrong') ... ERROR
+test_memory_protocol_rejects_bad_results_stderr_and_early_exit (test_benchmark_issue_530.BenchmarkProtocolTests.test_memory_protocol_rejects_bad_results_stderr_and_early_exit) ... FAIL
+test_memory_protocol_samples_same_live_child_and_checks_every_answer (test_benchmark_issue_530.BenchmarkProtocolTests.test_memory_protocol_samples_same_live_child_and_checks_every_answer) ... ok
+test_memory_summary_distinguishes_first_peak_from_retained_growth (test_benchmark_issue_530.BenchmarkProtocolTests.test_memory_summary_distinguishes_first_peak_from_retained_growth) ... ok
+test_memory_timeout_bounds_reads_and_writes_and_preserves_checkpoints (test_benchmark_issue_530.BenchmarkProtocolTests.test_memory_timeout_bounds_reads_and_writes_and_preserves_checkpoints) ... ok
+test_missing_nonpositive_nonfinite_or_extra_timers_fail_closed (test_benchmark_issue_530.BenchmarkProtocolTests.test_missing_nonpositive_nonfinite_or_extra_timers_fail_closed) ... ok
+test_missing_proc_counters_are_errors_with_retained_protocol_logs (test_benchmark_issue_530.BenchmarkProtocolTests.test_missing_proc_counters_are_errors_with_retained_protocol_logs) ... ERROR
+test_native_units_cpu_and_timer_streams (test_benchmark_issue_530.BenchmarkProtocolTests.test_native_units_cpu_and_timer_streams) ... ok
+test_process_memory_requires_positive_counters_with_linux_units (test_benchmark_issue_530.BenchmarkProtocolTests.test_process_memory_requires_positive_counters_with_linux_units) ... ok
+test_release_summary_cannot_claim_candidate_speedup (test_benchmark_issue_530.BenchmarkProtocolTests.test_release_summary_cannot_claim_candidate_speedup) ... ok
+test_timeout_preserves_partial_stdout_and_stderr (test_benchmark_issue_530.BenchmarkProtocolTests.test_timeout_preserves_partial_stdout_and_stderr) ... ok
+test_wrong_or_missing_answers_and_cli_errors_fail_closed (test_benchmark_issue_530.BenchmarkProtocolTests.test_wrong_or_missing_answers_and_cli_errors_fail_closed) ... ok
+
+======================================================================
+ERROR: test_memory_protocol_rejects_bad_results_stderr_and_early_exit (test_benchmark_issue_530.BenchmarkProtocolTests.test_memory_protocol_rejects_bad_results_stderr_and_early_exit) (behavior='wrong')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/scratch/9d2af73a8e7b/frankensqlite-baseline/scripts/tests/test_benchmark_issue_530.py", line 172, in test_memory_protocol_rejects_bad_results_stderr_and_early_exit
+    runner.run_memory_cli(memory_cli(work, behavior), "SELECT 42;", 42, [], 2,
+  File "/workspace/scratch/9d2af73a8e7b/frankensqlite-baseline/scripts/benchmark_issue_530.py", line 297, in run_memory_cli
+    counters = parse_process_memory(Path(f"/proc/{process.pid}/status").read_text(encoding="utf-8"))
+                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/pathlib.py", line 1027, in read_text
+    with self.open(mode='r', encoding=encoding, errors=errors) as f:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/pathlib.py", line 1013, in open
+    return io.open(self, mode, buffering, encoding, errors, newline)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: '/proc/5/status'
+
+======================================================================
+ERROR: test_missing_proc_counters_are_errors_with_retained_protocol_logs (test_benchmark_issue_530.BenchmarkProtocolTests.test_missing_proc_counters_are_errors_with_retained_protocol_logs)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/scratch/9d2af73a8e7b/frankensqlite-baseline/scripts/tests/test_benchmark_issue_530.py", line 201, in test_missing_proc_counters_are_errors_with_retained_protocol_logs
+    runner.run_memory_cli(memory_cli(work), "SELECT 42;", 42, [], 2,
+  File "/workspace/scratch/9d2af73a8e7b/frankensqlite-baseline/scripts/benchmark_issue_530.py", line 297, in run_memory_cli
+    counters = parse_process_memory(Path(f"/proc/{process.pid}/status").read_text(encoding="utf-8"))
+                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/pathlib.py", line 1027, in read_text
+    with self.open(mode='r', encoding=encoding, errors=errors) as f:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/codex/runtimes/codex-primary-runtime/dependencies/python/lib/python3.12/pathlib.py", line 1013, in open
+    return io.open(self, mode, buffering, encoding, errors, newline)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: '/proc/10/status'
+
+======================================================================
+FAIL: test_memory_protocol_rejects_bad_results_stderr_and_early_exit (test_benchmark_issue_530.BenchmarkProtocolTests.test_memory_protocol_rejects_bad_results_stderr_and_early_exit)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/scratch/9d2af73a8e7b/frankensqlite-baseline/scripts/tests/test_benchmark_issue_530.py", line 176, in test_memory_protocol_rejects_bad_results_stderr_and_early_exit
+    self.assertEqual(len(evidence["checkpoints"]), 1)
+AssertionError: 0 != 1
+
+----------------------------------------------------------------------
+Ran 14 tests in 1.085s
+
+FAILED (failures=1, errors=2)

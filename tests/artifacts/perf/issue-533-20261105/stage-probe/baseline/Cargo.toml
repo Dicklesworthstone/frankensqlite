@@ -1,0 +1,28 @@
+[package]
+name = "issue533-stage-probe-baseline"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "issue533-stage-probe-baseline"
+path = "../stage_probe.rs"
+
+[dependencies]
+# Match the default CLI's effective engine features, without test-internals.
+fsqlite-core = { path = "../../frankensqlite-baseline/crates/fsqlite-core", default-features = false, features = ["linux-asupersync-uring", "ext-json", "ext-fts5", "ext-rtree", "ext-icu", "ext-misc"] }
+fsqlite-parser = { path = "../../frankensqlite-baseline/crates/fsqlite-parser" }
+futures-lite = "=2.6.1"
+serde_json = "=1.0.154"
+
+[profile.dev]
+opt-level = 1
+debug = false
+incremental = false
+codegen-units = 256
+
+[profile.dev.package.asupersync]
+opt-level = 0
+debug = false

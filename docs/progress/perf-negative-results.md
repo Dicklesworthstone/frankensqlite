@@ -12,6 +12,38 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-11-05 - Unqualified: CTE and correlated EXISTS improvements; native compiler blocked (GH#533)
+
+- Target: issue #533's direct/CTE million-row COUNT and 10,000-row correlated
+  EXISTS queries. The published v0.4.12/stock screen reproduced the shape penalty;
+  those observations do not measure current main or a candidate improvement.
+- Proposal: narrow single-use built-in series CTE lowering, owned materialized
+  row transfer, planned first-match table-function EXISTS, and a guarded extension
+  of the existing equality memo to statement-owned roots. The four-file patch
+  covers `connection.rs`, `connection/table_function_exists.rs`, and the
+  `bd_5ap77_from_subquery_aggregate_flattening`/`cte_not_materialized_gh204_oracle`
+  tests. It is preserved **UNVERIFIED and unapplied**, not deployed.
+- Qualification: three pristine-baseline CLI builds at `dbd27741cae17b596230a4a95b6f46dcc344fed9`
+  ended with asupersync rustc SIGKILL (LLVM, Cranelift, and mostly-unused-hint
+  attempts). Candidate `cargo check --offline --locked -p fsqlite-core --lib`
+  also exited 101 with asupersync SIGKILL before checking fsqlite-core. No source
+  CLI, executed engine tests, stage profile, or before/after result was produced.
+  This is a resource-blocked qualification, not a correctness or speed rejection.
+  The post-failure 8 GiB cgroup snapshot was near its limit; shared OOM counters
+  do not identify individual compiler deaths. Workspace formatting timed out;
+  the isolated gh204 formatter pass does not substitute for compiler/runtime checks.
+- Evidence: [investigation](issue-533-cte-investigation.md),
+  [commands and outcomes](../../tests/artifacts/perf/issue-533-20261105/validation-summary.json),
+  [full logs](../../tests/artifacts/perf/issue-533-20261105/raw-logs.tar.gz), and
+  [portable proposal receipt](../../tests/artifacts/perf/issue-533-20261105/candidate-unverified.json).
+  The verified deliverable is the benchmark harness: 20 protocol tests pass and
+  all 21 CTE/control queries match stock. Those passes do not qualify the engine patch.
+- Retry condition: use a worker able to compile the default native dependencies;
+  align baseline/candidate bases (the preserved proposal is based on `931a0dd6b31d70d7c5d9fc66c01ce9df9e17b64e`),
+  execute deterministic engine tests, then collect repeated paired timing and memory
+  measurements. Preserve hint, reference-count, volatility, hidden-column, affinity,
+  correlation, override, and temporary-root lifetime guards; do not relax correctness gates.
+
 ## 2026-10-28 - Unvalidated: Cartesian aggregate streaming; broad admission rejected (GH#530)
 
 - Target: issue #530's four million-row COUNT/SUM queries and independent
