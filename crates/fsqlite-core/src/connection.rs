@@ -95337,6 +95337,16 @@ impl Connection {
                     )?);
                     continue;
                 }
+                if info.is_builtin && fname == "ROW_NUMBER" {
+                    // Numbering follows partition order even without ORDER BY;
+                    // frame bounds and exclusion never change the row number.
+                    for position in 0..partition_indices.len() {
+                        func_vals.push(SqliteValue::Integer(
+                            i64::try_from(position + 1).unwrap_or(i64::MAX),
+                        ));
+                    }
+                    continue;
+                }
                 let mut state = info.func.initial_state();
                 if info.is_builtin
                     && matches!(
@@ -96312,6 +96322,16 @@ impl Connection {
                         &collation_registry_snap,
                         frame.as_ref(),
                     )?);
+                    continue;
+                }
+                if is_builtin && fname == "ROW_NUMBER" {
+                    // Numbering follows partition order even without ORDER BY;
+                    // frame bounds and exclusion never change the row number.
+                    for position in 0..partition_indices.len() {
+                        func_vals.push(SqliteValue::Integer(
+                            i64::try_from(position + 1).unwrap_or(i64::MAX),
+                        ));
+                    }
                     continue;
                 }
                 let mut state = func.initial_state();
