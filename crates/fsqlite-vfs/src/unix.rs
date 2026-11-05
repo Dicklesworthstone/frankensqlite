@@ -1293,6 +1293,9 @@ struct ShmSlotState {
 struct ShmInfo {
     file: Arc<File>,
     regions: HashMap<u32, ShmRegion>,
+    /// A short backing or failed allocation must be rechecked before a cached
+    /// alias escapes. Failed allocation can extend EOF while leaving holes.
+    backing_check_required: bool,
     slots: Vec<ShmSlotState>,
     owner_refs: HashMap<u64, u32>,
     /// Mapping owners keep the descriptor/locks alive after normal unmap.
@@ -1311,6 +1314,7 @@ impl ShmInfo {
         Self {
             file,
             regions: HashMap::new(),
+            backing_check_required: false,
             slots: std::iter::repeat_with(ShmSlotState::default)
                 .take(slot_count)
                 .collect(),
@@ -1318,6 +1322,16 @@ impl ShmInfo {
             mapping_owners: HashSet::new(),
             namespace_unlinked: false,
         }
+    }
+
+    fn cached_mapping_extent(&self) -> u64 {
+        self.regions
+            .iter()
+            // Both the region number and each mapping's original size come
+            // from u32 shm_map arguments, so the product fits in u64.
+            .map(|(&region, mapping)| (u64::from(region) + 1) * mapping.len() as u64)
+            .max()
+            .unwrap_or(0)
     }
 
     /// Read `aReadMark[0..5]` from SHM segment 0 (native byte order).
@@ -2435,8 +2449,20 @@ impl UnixFile {
     /// preallocation must never fail an open, and a reader never takes the
     /// WAL WRITE lock or rewrites the live index to get it. Only a storage
     /// failure (ENOSPC, EDQUOT, EIO, EFBIG) is returned.
-    fn ensure_wal_shm_backing(info: &ShmInfo, target_len: u64) -> Result<()> {
+    fn ensure_wal_shm_backing(info: &mut ShmInfo, target_len: u64) -> Result<()> {
+        let target_len = if info.backing_check_required {
+            target_len.max(info.cached_mapping_extent())
+        } else {
+            target_len
+        };
+        // Keep this receipt in the shared state, including for callers that
+        // initialize the WAL header without going through shm_map. A failed
+        // allocator may have restored the length but not the backing. The
+        // existing sparse fallback remains valid where preallocation is not
+        // supported; only successful admission clears the retry obligation.
+        info.backing_check_required = true;
         crate::unix_shm::ensure_shm_backing_or_sparse(&info.file, target_len)?;
+        info.backing_check_required = false;
         Ok(())
     }
 
@@ -3396,10 +3422,10 @@ impl UnixFile {
         // grab WAL_WRITE_LOCK just to initialize `*-shm`.
         let shm_info = self.ensure_shm_info(cx)?;
         let shm_file = {
-            let info = shm_info
+            let mut info = shm_info
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            Self::ensure_wal_shm_backing(&info, SQLITE_WALINDEX_PGSZ)?;
+            Self::ensure_wal_shm_backing(&mut info, SQLITE_WALINDEX_PGSZ)?;
             Arc::clone(&info.file)
         };
 
@@ -5052,54 +5078,72 @@ impl VfsFile for UnixFile {
         })?;
 
         let shm_info = self.ensure_shm_info_with_create(cx, extend)?;
-        let info = shm_info
+        let mut info = shm_info
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        // Return cached region if it already exists and is large enough.
-        if let Some(existing) = info.regions.get(&region).cloned() {
-            if existing.len() >= map_size {
-                drop(info);
-                return Ok(existing);
+        let cached_region = info.regions.get(&region).cloned();
+        // A non-extending request cannot replace a smaller cached alias.
+        // Keep the cache entry until any extending replacement is mapped
+        // successfully, so refusal or mmap failure preserves live aliases.
+        if let Some(existing) = cached_region.as_ref()
+            && existing.len() < map_size
+            && !extend
+        {
+            drop(info);
+            return Err(FrankenError::LockFailed {
+                detail: format!(
+                    "shm region {region} is {} bytes, requested {map_size} bytes without extend",
+                    existing.len()
+                ),
+            });
+        }
+
+        // A cached mapping can outlive a truncation of its backing inode
+        // (bd-7do1d). Validate the complete alias before returning it, even
+        // when the caller requests fewer bytes than the cached mapping owns.
+        let region_count = u64::from(region) + 1;
+        let region_bytes = cached_region
+            .as_ref()
+            .map_or(map_size, |existing| map_size.max(existing.len()));
+        let mut target_len = region_count
+            .checked_mul(region_bytes as u64)
+            .ok_or_else(|| FrankenError::LockFailed {
+                detail: "shm_map file length overflow".to_string(),
+            })?;
+        let current_len = info.file.metadata().map_err(FrankenError::Io)?.len();
+        if target_len > current_len {
+            info.backing_check_required = true;
+        }
+        if info.backing_check_required {
+            target_len = target_len.max(info.cached_mapping_extent());
+        }
+        if target_len > current_len && !extend {
+            return Err(FrankenError::CannotOpen {
+                path: self.shm_path.clone(),
+            });
+        }
+        if let Some(existing) = cached_region
+            && existing.len() >= map_size
+        {
+            if info.backing_check_required {
+                Self::ensure_wal_shm_backing(&mut info, target_len)?;
             }
-            // A non-extending request cannot replace a smaller cached alias.
-            // Keep the cache entry until any extending replacement is mapped
-            // successfully, so refusal or mmap failure preserves live aliases.
-            if !extend {
-                drop(info);
-                return Err(FrankenError::LockFailed {
-                    detail: format!(
-                        "shm region {region} is {} bytes, requested {map_size} bytes without extend",
-                        existing.len()
-                    ),
-                });
-            }
+            drop(info);
+            return Ok(existing);
         }
 
         // A cold region may already exist on disk even when it has never
         // been mapped by this process. Non-extending requests never grow a
         // missing/short backing, but still must establish physical backing
         // for a sufficiently long sparse file before publishing an alias.
-        let region_count = u64::from(region) + 1;
-        let target_len =
-            region_count
-                .checked_mul(u64::from(size))
-                .ok_or_else(|| FrankenError::LockFailed {
-                    detail: "shm_map file length overflow".to_string(),
-                })?;
-        let current_len = info.file.metadata().map_err(FrankenError::Io)?.len();
-        if target_len > current_len && !extend {
-            return Err(FrankenError::CannotOpen {
-                path: self.shm_path.clone(),
-            });
-        }
         // Allocate the whole prefix, including skipped regions: stock SQLite
         // may map every preceding region after observing this file length.
         // Never truncate on failure. A peer or an older live alias may already
         // depend on the successful prefix; the next attempt repairs any holes.
         // Where preallocation is unavailable this is the sparse extension
         // that releases up to 0.4.10 performed here.
-        Self::ensure_wal_shm_backing(&info, target_len)?;
+        Self::ensure_wal_shm_backing(&mut info, target_len)?;
 
         // Map the region via mmap(MAP_SHARED).
         let offset = u64::from(region) * u64::from(size);
@@ -10992,6 +11036,186 @@ mod tests {
     }
 
     // -- mmap-backed SHM region tests --
+
+    #[test]
+    fn shm_cached_mapping_recovers_after_backing_is_truncated() {
+        if std::env::var_os("FSQLITE_SHM_ALLOCATION_CHILD").is_none() {
+            run_shm_allocation_child(
+                "unix::tests::shm_cached_mapping_recovers_after_backing_is_truncated",
+            );
+            return;
+        }
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        for (region, mapped_size, requested_size, truncated_len) in [
+            (0, SHM_SEGMENT_SIZE, SHM_SEGMENT_SIZE, 0),
+            (0, SHM_SEGMENT_SIZE, SHM_SEGMENT_SIZE, 12),
+            (1, SHM_SEGMENT_SIZE, SHM_SEGMENT_SIZE, 12),
+            (0, SHM_SEGMENT_SIZE * 2, SHM_SEGMENT_SIZE, 12),
+            (1, SHM_SEGMENT_SIZE * 2, SHM_SEGMENT_SIZE, 12),
+        ] {
+            let (_dir, path) = make_temp_path("shm-cached-truncated.db");
+            let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+            let original = file.shm_map(&cx, region, mapped_size, true).unwrap();
+            let info = Arc::clone(file.shm_info.as_ref().unwrap());
+            // Keep the original mapping registered, reproducing a new
+            // connection reusing the old process-global SHM entry. Use the
+            // canonical descriptor so the fixture does not drop POSIX locks.
+            info.lock().unwrap().file.set_len(truncated_len).unwrap();
+            let (mut peer, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+            let recovered = peer.shm_map(&cx, region, requested_size, true).unwrap();
+            let last_word = usize::try_from(mapped_size).unwrap() - 4;
+            // Touch the last page before checking metadata: the unfixed
+            // implementation must SIGBUS in the isolated child, not merely
+            // fail an assertion about the file's length.
+            recovered
+                .atomic_store_u32_ne(last_word, 0xCAFE_BABE, Ordering::Release)
+                .unwrap();
+            assert_eq!(
+                original
+                    .atomic_load_u32_ne(last_word, Ordering::Acquire)
+                    .unwrap(),
+                0xCAFE_BABE
+            );
+            assert_eq!(recovered.len(), usize::try_from(mapped_size).unwrap());
+            assert_eq!(
+                info.lock().unwrap().file.metadata().unwrap().len(),
+                (u64::from(region) + 1) * u64::from(mapped_size),
+                "the complete returned alias must have backing, even for a smaller request"
+            );
+            drop(recovered);
+            drop(original);
+            peer.close(&cx).unwrap();
+            file.close(&cx).unwrap();
+        }
+    }
+
+    #[test]
+    fn shm_cached_mapping_nonextend_refuses_truncated_backing() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        for truncated_len in [0, 12, u64::from(SHM_SEGMENT_SIZE)] {
+            let (_dir, path) = make_temp_path("shm-cached-truncated-nonextend.db");
+            let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+            let original = file.shm_map(&cx, 0, SHM_SEGMENT_SIZE * 2, true).unwrap();
+            let info = Arc::clone(file.shm_info.as_ref().unwrap());
+            info.lock().unwrap().file.set_len(truncated_len).unwrap();
+            let (mut peer, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+            assert!(matches!(
+                peer.shm_map(&cx, 0, SHM_SEGMENT_SIZE, false),
+                Err(FrankenError::CannotOpen { .. })
+            ));
+            assert_eq!(
+                info.lock().unwrap().file.metadata().unwrap().len(),
+                truncated_len,
+                "a non-extending request must leave the truncated file unchanged"
+            );
+            let recovered = peer.shm_map(&cx, 0, SHM_SEGMENT_SIZE, true).unwrap();
+            let last_word = original.len() - 4;
+            recovered.write_u32_le(last_word, 0x1234_ABCD).unwrap();
+            assert_eq!(original.read_u32_le(last_word).unwrap(), 0x1234_ABCD);
+            drop(recovered);
+            drop(original);
+            peer.close(&cx).unwrap();
+            file.close(&cx).unwrap();
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn shm_cached_mapping_truncation_allocation_failure_is_retryable() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        for (errno, allocated_prefix) in [
+            (libc::ENOSPC, None),
+            (libc::EDQUOT, None),
+            (libc::EIO, None),
+            (libc::EFBIG, None),
+            (libc::ENOSPC, Some(4096)),
+            (libc::EDQUOT, Some(4096)),
+            (libc::EIO, Some(4096)),
+            (libc::EFBIG, Some(4096)),
+        ] {
+            let (_dir, path) = make_temp_path("shm-cached-truncated-retry.db");
+            let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+            let original = file.shm_map(&cx, 0, SHM_SEGMENT_SIZE, true).unwrap();
+            let info = Arc::clone(file.shm_info.as_ref().unwrap());
+            info.lock().unwrap().file.set_len(12).unwrap();
+            {
+                let _fault = crate::unix_shm::fail_allocations(errno, allocated_prefix);
+                for _ in 0..2 {
+                    let error = file.shm_map(&cx, 0, SHM_SEGMENT_SIZE, true).unwrap_err();
+                    let FrankenError::Io(error) = error else {
+                        panic!("cached mapping must surface the allocation failure: {error:?}");
+                    };
+                    assert_eq!(error.raw_os_error(), Some(errno));
+                    assert_eq!(
+                        info.lock().unwrap().file.metadata().unwrap().len(),
+                        allocated_prefix.map_or(12, |_| u64::from(SHM_SEGMENT_SIZE)),
+                        "a failed repair may leave a full-length sparse file; retries still verify backing"
+                    );
+                }
+            }
+            let recovered = file.shm_map(&cx, 0, SHM_SEGMENT_SIZE, true).unwrap();
+            let last_word = original.len() - 4;
+            recovered.write_u32_le(last_word, 0x1234_ABCD).unwrap();
+            assert_eq!(original.read_u32_le(last_word).unwrap(), 0x1234_ABCD);
+            drop(recovered);
+            drop(original);
+            file.close(&cx).unwrap();
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn shm_cached_mapping_rechecks_after_header_allocation_failure() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("shm-cached-header-retry.db");
+        let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        let original = file.shm_map(&cx, 0, SHM_SEGMENT_SIZE, true).unwrap();
+        file.shm_lock(
+            &cx,
+            WAL_WRITE_LOCK,
+            1,
+            SQLITE_SHM_LOCK | SQLITE_SHM_EXCLUSIVE,
+        )
+        .unwrap();
+        let info = Arc::clone(file.shm_info.as_ref().unwrap());
+        info.lock().unwrap().file.set_len(12).unwrap();
+        {
+            let _fault = crate::unix_shm::fail_allocations(libc::ENOSPC, Some(4096));
+            for error in [
+                file.compat_writer_init_wal_shm_header_if_needed(&cx)
+                    .expect_err("header allocation must fail"),
+                file.shm_map(&cx, 0, SHM_SEGMENT_SIZE, true)
+                    .expect_err("cached map must recheck the failed header allocation"),
+            ] {
+                let FrankenError::Io(error) = error else {
+                    panic!("allocation failure must retain its I/O error: {error:?}");
+                };
+                assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
+            }
+            assert_eq!(
+                info.lock().unwrap().file.metadata().unwrap().len(),
+                u64::from(SHM_SEGMENT_SIZE)
+            );
+        }
+        let recovered = file.shm_map(&cx, 0, SHM_SEGMENT_SIZE, true).unwrap();
+        let last_word = original.len() - 4;
+        recovered.write_u32_le(last_word, 0x1234_ABCD).unwrap();
+        assert_eq!(original.read_u32_le(last_word).unwrap(), 0x1234_ABCD);
+        file.shm_lock(
+            &cx,
+            WAL_WRITE_LOCK,
+            1,
+            SQLITE_SHM_UNLOCK | SQLITE_SHM_EXCLUSIVE,
+        )
+        .unwrap();
+        drop(recovered);
+        drop(original);
+        file.close(&cx).unwrap();
+    }
 
     /// Keep a regression that could SIGBUS inside a bounded child process.
     fn run_shm_allocation_child(test_name: &str) {
