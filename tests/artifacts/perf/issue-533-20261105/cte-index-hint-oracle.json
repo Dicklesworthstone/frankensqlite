@@ -1,0 +1,31 @@
+{
+  "scope": "correctness only; no performance evidence",
+  "cases": {
+    "NOT INDEXED": {
+      "sql": "WITH t AS MATERIALIZED (SELECT value FROM generate_series(1,4)) SELECT count(*) FROM t WHERE EXISTS(SELECT 1 FROM t t1 NOT INDEXED WHERE t.value=t1.value);",
+      "stock": {
+        "returncode": 0,
+        "stdout": "4\n",
+        "stderr": ""
+      },
+      "release412": {
+        "returncode": 0,
+        "stdout": "4\n",
+        "stderr": ""
+      }
+    },
+    "INDEXED BY missing_index": {
+      "sql": "WITH t AS MATERIALIZED (SELECT value FROM generate_series(1,4)) SELECT count(*) FROM t WHERE EXISTS(SELECT 1 FROM t t1 INDEXED BY missing_index WHERE t.value=t1.value);",
+      "stock": {
+        "returncode": 1,
+        "stdout": "",
+        "stderr": "Parse error in 2nd command line argument: no such index: \"missing_index\"\n"
+      },
+      "release412": {
+        "returncode": 1,
+        "stdout": "",
+        "stderr": "error: no such index: missing_index\n"
+      }
+    }
+  }
+}

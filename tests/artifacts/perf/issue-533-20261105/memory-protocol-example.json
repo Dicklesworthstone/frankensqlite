@@ -1,0 +1,22 @@
+{
+  "status": "ok",
+  "pid": 4,
+  "proc_pid": 234457,
+  "checkpoints": [
+    {
+      "query_count": 0,
+      "rss_kib": 1744,
+      "hwm_kib": 1744
+    },
+    {
+      "query_count": 1,
+      "rss_kib": 2536,
+      "hwm_kib": 2536
+    },
+    {
+      "query_count": 2,
+      "rss_kib": 2536,
+      "hwm_kib": 2536
+    }
+  ]
+}

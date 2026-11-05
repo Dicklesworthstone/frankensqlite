@@ -1,0 +1,41 @@
+{
+  "arm": "candidate",
+  "engine": "/workspace/scratch/9d2af73a8e7b/frankensqlite",
+  "engine_head": "931a0dd6b31d70d7c5d9fc66c01ce9df9e17b64e",
+  "engine_worktree_status": "M crates/fsqlite-core/src/connection.rs\n M crates/fsqlite-core/tests/bd_5ap77_from_subquery_aggregate_flattening.rs\n M crates/fsqlite-core/tests/cte_not_materialized_gh204_oracle.rs\n?? .beads/.issues.jsonl.Vyzcit\n?? crates/fsqlite-core/src/connection/table_function_exists.rs\n?? docs/progress/issue-533-cte-investigation.md",
+  "engine_tracked_diff_sha256": "5533737d7a3a6ada69ff287cc0be26bdda5cb793ae6de70dc9f4eaed05f8ccf0",
+  "probe_source_sha256": "4f4e91d5728d08f8d699b52b7976a367bce2408ffad87f04621796e85dcb2bc5",
+  "manifest_sha256": "ed2ef261a7732c465fc40f0dc24cdef61f46335ab3cd1611605ab5b941dd7ad4",
+  "engine_lock_sha256": "8cdedfc85b1a049b624e0487227b8a685f95b849502bb779e7da4253e9ae2c61",
+  "probe_lock_sha256": "a567c2b92b628cfaeb5ea5e69a1e7588e418c1c9853a86cf14c27d177626581a",
+  "registry_packages_audited": 215,
+  "registry_version_or_checksum_drift": [],
+  "resolved_features": {
+    "asupersync": [],
+    "fsqlite-core": [
+      "diagnostic-pragmas",
+      "ext-fts5",
+      "ext-icu",
+      "ext-json",
+      "ext-misc",
+      "ext-rtree",
+      "linux-asupersync-uring",
+      "native"
+    ],
+    "fsqlite-parser": []
+  },
+  "metadata_command": [
+    "/root/.cargo/bin/cargo",
+    "metadata",
+    "--offline",
+    "--filter-platform",
+    "x86_64-unknown-linux-gnu",
+    "--format-version",
+    "1",
+    "--manifest-path",
+    "/workspace/scratch/9d2af73a8e7b/issue533-stage-probe/candidate/Cargo.toml"
+  ],
+  "toolchain": "nightly-2026-08-31",
+  "metadata_filter_platform": "x86_64-unknown-linux-gnu",
+  "native_compilation_performed_by_prepare": false
+}

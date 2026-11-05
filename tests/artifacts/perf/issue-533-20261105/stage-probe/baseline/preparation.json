@@ -1,0 +1,41 @@
+{
+  "arm": "baseline",
+  "engine": "/workspace/scratch/9d2af73a8e7b/frankensqlite-baseline",
+  "engine_head": "dbd27741cae17b596230a4a95b6f46dcc344fed9",
+  "engine_worktree_status": "",
+  "engine_tracked_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "probe_source_sha256": "4f4e91d5728d08f8d699b52b7976a367bce2408ffad87f04621796e85dcb2bc5",
+  "manifest_sha256": "024601421e4b08e624c4d7b7e78c8e3880b4ad19e1e0113303f03cc23640bf52",
+  "engine_lock_sha256": "8cdedfc85b1a049b624e0487227b8a685f95b849502bb779e7da4253e9ae2c61",
+  "probe_lock_sha256": "ed4f21f9662cde23a6872339ca224f5ecffd4be0e5cbb3948d3706419181cb09",
+  "registry_packages_audited": 215,
+  "registry_version_or_checksum_drift": [],
+  "resolved_features": {
+    "asupersync": [],
+    "fsqlite-core": [
+      "diagnostic-pragmas",
+      "ext-fts5",
+      "ext-icu",
+      "ext-json",
+      "ext-misc",
+      "ext-rtree",
+      "linux-asupersync-uring",
+      "native"
+    ],
+    "fsqlite-parser": []
+  },
+  "metadata_command": [
+    "/root/.cargo/bin/cargo",
+    "metadata",
+    "--offline",
+    "--filter-platform",
+    "x86_64-unknown-linux-gnu",
+    "--format-version",
+    "1",
+    "--manifest-path",
+    "/workspace/scratch/9d2af73a8e7b/issue533-stage-probe/baseline/Cargo.toml"
+  ],
+  "toolchain": "nightly-2026-08-31",
+  "metadata_filter_platform": "x86_64-unknown-linux-gnu",
+  "native_compilation_performed_by_prepare": false
+}

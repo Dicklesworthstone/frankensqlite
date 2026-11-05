@@ -1,0 +1,39 @@
+{
+  "scope": "Source-format checks only; no Rust typecheck or engine execution success",
+  "workspace": {
+    "command": [
+      "cargo",
+      "fmt",
+      "--all",
+      "--",
+      "--check"
+    ],
+    "timeout_seconds": 120,
+    "exit_code": 124,
+    "status": "TIMED_OUT; no completed workspace pass",
+    "repository_exclusions_preserved": true,
+    "raw_log_in_archive": "cargo-fmt-check.log",
+    "log_bytes": 0
+  },
+  "gh204_file": {
+    "command": [
+      "rustfmt",
+      "--edition",
+      "2024",
+      "--check",
+      "--config-path",
+      "/workspace/scratch/9d2af73a8e7b/issue533-rustfmt.toml",
+      "crates/fsqlite-core/tests/cte_not_materialized_gh204_oracle.rs"
+    ],
+    "exit_code": 0,
+    "status": "PASSED: isolated source formatting only",
+    "portable_config": "formatter-config.toml",
+    "configuration": {
+      "ignore": [],
+      "skip_children": true,
+      "edition": "2024"
+    },
+    "raw_log_in_archive": "gh204-rustfmt-check.log",
+    "log_bytes": 0
+  }
+}

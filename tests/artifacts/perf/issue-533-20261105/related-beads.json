@@ -1,0 +1,74 @@
+[
+  {
+    "id": "bd-1dp9.6.7.4",
+    "title": "T6.7.4 Pager-backed VDBE cutover for joins, CTEs, views, and derived tables",
+    "status": "open",
+    "close_reason": null
+  },
+  {
+    "id": "bd-5ap77",
+    "title": "PERF: materialized subqueries over 1M rows: ORDER BY subquery ~100s CPU; count(*) FROM (SELECT value FROM generate_series(1,1e6)) 8s vs 0.014s stock",
+    "status": "closed",
+    "close_reason": "Fixed a7101fa21: FROM subqueries under outer aggregates/expressions, over table functions, with aliased simple expressions, or ORDER BY under count/min/max flatten. 1M rows: 1-3.5s -> 0.02-0.34s. 8s/100s figures did not reproduce in isolation. Keeper bd_5ap77_from_subquery_aggregate_flattening. Combined-HEAD verify a31225e8b on trj (Linux x86_64, 2026-10-02): workspace check + clippy --no-deps on wal/pager/btree/vdbe/core/fsqlite/cli clean; keepers green"
+  },
+  {
+    "id": "bd-9tcne",
+    "title": "REVIEW2-P1: CTE pre-expansion ignores lexical shadowing (67ae0461d regression)",
+    "status": "closed",
+    "close_reason": "Fixed cb296ecf4 + verified. inline_not_materialized_ctes pre-expansion called raw subst_cte_refs_in_select, ignoring the chained body's own top-level WITH redeclaration; routed through subst_cte_refs_in_nested_select (already shadow-aware) so an outer CTE is not substituted where its name is redeclared. cte_not_materialized_gh204_oracle 10/10 (new shadowing keeper =2 + control =1 vs rusqlite, all M4 keepers unchanged)."
+  },
+  {
+    "id": "bd-czzlp",
+    "title": "BENCH-P0: comprehensive-bench subquery/CTE rows measure cache hits and discard fsqlite results (unvalidated, asymmetric)",
+    "status": "closed",
+    "close_reason": "FIXED at 1f0969b3 (+ earlier sessions' in-tree work). EXISTS/IN rows were already parameter-varying with oracle asserts; recursive CTE already split specialized-vs-general with value asserts. Remaining gap closed: assert_result_set_oracle() on the scalar-subquery and CTE+JOIN rows (one-shot cross-engine normalized-multiset compare outside timed loops). Functional receipt: comprehensive-bench --quick --filter subquery exit 0 with oracles active at 100/1k/10k rows, artifact tests/artifacts/perf/subq-oracle-receipt-20260727T2345Z-hz1/. The cache-defeat fix now measures the real general-subquery path \u2014 which exposed the ~26,000x correlated-EXISTS pathology, filed as bd-8sfs3 (P0); the IN sibling remains bd-2dgf5."
+  },
+  {
+    "id": "bd-gh-cte-compiled-cache-stale-root-pbz9q",
+    "title": "GH triage: cte-compiled-cache-stale-root (#255)",
+    "status": "closed",
+    "close_reason": "GH #255 already fixed (compiled-cache bypass); keepers green at HEAD"
+  },
+  {
+    "id": "bd-gh-cte-materialization-hints-sn0yh",
+    "title": "GH triage: cte-materialization-hints (#204)",
+    "status": "closed",
+    "close_reason": "NOT MATERIALIZED CTEs re-evaluate per reference (inline_not_materialized_ctes); keeper 7/7, reg 2/2, --lib baseline (5 known reds, 0 new). Landed in gh204 commit."
+  },
+  {
+    "id": "bd-iuz8e",
+    "title": "GH#420: sum(generate_series(1,1e6)) 150x slower than stock \u2014 table-function source fully materialized into Vec<Vec<SqliteValue>> before aggregation",
+    "status": "closed",
+    "close_reason": "Fixed in d8fbd0100: streaming TVF aggregate lane (count/sum/avg/min/max, plain WHERE and GROUP BY, column mask). sum over 1M: debug 13.7s->0.45s, release 1.21s->0.26s. Also fixed grouped-output key order. Remaining shapes (aggregate over expressions, HAVING, ORDER BY) keep the materializing path."
+  },
+  {
+    "id": "bd-k5isc",
+    "title": "Correlated EXISTS over a CTE inside CASE in a GROUP BY join: every probe executes per row (no CASE short-circuit), re-runs the CTE, and does a huge zeroed alloc + madvise (0.4.10)",
+    "status": "open",
+    "close_reason": null
+  },
+  {
+    "id": "bd-star-hidden-reland-nxl8a",
+    "title": "Re-land table-function hidden columns through one star pass",
+    "status": "open",
+    "close_reason": null
+  },
+  {
+    "id": "bd-wpiq6",
+    "title": "REVIEW-B-M4/M8 P1: CTE inlining/width bugs \u2014 chained NOT MATERIALIZED inlines stale clones; scalar-subquery width check has empty CTE scope",
+    "status": "closed",
+    "close_reason": "Fixed + verified (67ae0461d + ae5285d8c + a91d258b0). M4: inline_not_materialized_ctes now expands already-collected CTEs into each new body (dependency-order/fixpoint), so chained NOT MATERIALIZED (b reads a) inlines transitively and a's random() re-evaluates per reference (=0 not 1). M8: scalar-subquery/row-value width check no longer under-counts a SELECT * operand over an outer CTE \u2014 SelectStructureResolver threads self.visible_ctes() (precise), rewrite_in_expr fails open on wildcard operands (no CTE scope). False 'returns 2 columns - expected 1' gone. Keepers not_materialized_chained_random_reevaluates_wpiq6 + scalar_subquery_width_sees_outer_cte_wpiq6, no regression on gh204/row_value tests. NOTE: M8 query then hits a SEPARATE interpreted-evaluator gap (eval_join_expr can't execute row-value subquery comparisons) = bd-t7oeo (filed)."
+  },
+  {
+    "id": "bd-wwqen.2",
+    "title": "B2: Eliminate scan-per-row execution for IN and EXISTS subqueries",
+    "status": "closed",
+    "close_reason": "Scan-per-row catastrophe fully resolved. IN subquery: 2885x\u21922.34x at 100K rows (F=0.016ms). EXISTS: faster than C SQLite (0.35x). All 23 regression tests pass. Residual 2-4x gap is fixed-cost MVCC overhead (~8us), not algorithmic."
+  },
+  {
+    "id": "bd-ztgst",
+    "title": "PERF: every WITH statement reloads the whole MemDatabase image (O(total rows) per statement; CTE inserts quadratic, 80k rows = 7-21s vs stock <1s)",
+    "status": "closed",
+    "close_reason": "Fixed in 971d7115c for CTE-only WITH statements (no whole-image hydration; gate excludes any persistent relation, view, relation-named TVF, UPSERT/RETURNING, triggered INSERT target). Residual for WITH statements that read persistent tables: bd-yk032. CTE oracle suites + core_sql_rusqlite_conformance 71/71 green."
+  }
+]

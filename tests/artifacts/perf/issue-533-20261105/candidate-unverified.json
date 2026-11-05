@@ -1,0 +1,46 @@
+{
+  "status": "UNVERIFIED; portable proposal only, not a deployed engine fix",
+  "captured_utc": "2026-11-05T22:06:33.908646+00:00",
+  "base_commit": "931a0dd6b31d70d7c5d9fc66c01ce9df9e17b64e",
+  "patch": "candidate-unverified.patch",
+  "patch_bytes": 94633,
+  "patch_sha256": "fa6b729b794cf69ba16eefb8e93f11969abf2c501a4a0111dea5e09ee4f7a227",
+  "source_sha256": {
+    "crates/fsqlite-core/src/connection.rs": "747764a22d94fa9dd1c04a3c0555386102578c9ffcb2956dcec747784ded8cd2",
+    "crates/fsqlite-core/src/connection/table_function_exists.rs": "d60cf3bc870e0de07027c03922af3e3b5192412762c2cc755507914628fbfaef",
+    "crates/fsqlite-core/tests/bd_5ap77_from_subquery_aggregate_flattening.rs": "78b0e54bf7a52cfa34c426d6810cbfbbb714aef36c58715007573fa5638fd360",
+    "crates/fsqlite-core/tests/cte_not_materialized_gh204_oracle.rs": "18e6a300d9bc711c7af7836bbf4385f4e7dec778bc438945781e1ce47585e5a7"
+  },
+  "read_only_applicability_checks": [
+    {
+      "command": [
+        "git",
+        "apply",
+        "--check",
+        "--cached",
+        "/workspace/scratch/9d2af73a8e7b/frankensqlite/tests/artifacts/perf/issue-533-20261105/candidate-unverified.patch"
+      ],
+      "exit_code": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "git",
+        "apply",
+        "--reverse",
+        "--check",
+        "/workspace/scratch/9d2af73a8e7b/frankensqlite/tests/artifacts/perf/issue-533-20261105/candidate-unverified.patch"
+      ],
+      "exit_code": 0,
+      "stdout": "",
+      "stderr": ""
+    }
+  ],
+  "source_or_index_modified_by_checks": false,
+  "engine_compiler_status": "BLOCKED: candidate cargo check exited101 with asupersync rustc SIGKILL before fsqlite-core; no changed engine code compiler/runtime pass",
+  "native_runtime_tests_executed": false,
+  "baseline_candidate_measurements_available": false,
+  "caveat": "Applicability and source hashes establish reviewable patch contents, not type correctness, SQLite compatibility, or a performance improvement.",
+  "compiler_log_in_archive": "candidate-core-check.log"
+}

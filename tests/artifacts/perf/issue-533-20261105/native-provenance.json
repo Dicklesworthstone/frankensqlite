@@ -1,0 +1,33 @@
+{
+  "captured_utc": "2026-11-05T21:49:05.440563+00:00",
+  "baseline_source_revision": "dbd27741cae17b596230a4a95b6f46dcc344fed9",
+  "harness_commit": "ffef921e803892d35acfa7f71a8860da8fef953b",
+  "published_fsqlite_version": "0.4.12",
+  "published_fsqlite_source_commit_recorded_in_issue530_report": "26aa19afcbd5afdb01658a10bb33417ad0b513be",
+  "sqlite_version": "3.54.1",
+  "sqlite_source_id": "555e07ef33f69a0957d24d8e555b702464a131d6f1607f4c3c1e4551e8e6ca76",
+  "assets": {
+    "fsqlite_archive": {
+      "name": "fsqlite-0.4.12-linux_amd64.tar.gz",
+      "bytes": 10954518,
+      "sha256": "12dcedd3d8c15bbac7d67ea83a25926b96000cad82e04a224112202f4224242b",
+      "download_url": "https://github.com/Dicklesworthstone/frankensqlite/releases/download/v0.4.12/fsqlite-0.4.12-linux_amd64.tar.gz"
+    },
+    "sqlite_archive": {
+      "name": "sqlite-tools-linux-x64-3540100.zip",
+      "bytes": 4324601,
+      "sha256": "a21062b333c7d66d7d8c42054c0fab1c1899729185289ad14bd4f25f9f576d14",
+      "download_url": "https://sqlite.org/2026/sqlite-tools-linux-x64-3540100.zip"
+    },
+    "fsqlite_binary": {
+      "name": "release412/fsqlite",
+      "bytes": 25038488,
+      "sha256": "71259ce7c788fbf227f58dab7f6696c0c58d62b1637e1e789c86e696653c4543"
+    },
+    "sqlite_binary": {
+      "name": "stock/sqlite3",
+      "bytes": 2037360,
+      "sha256": "c9daa875c28379f0d61a833d47928c6e43b352d98638cd824ec405f23c99d870"
+    }
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "captured_utc": "2026-11-05T22:10:57.946107+00:00",
+  "note": "Post-failure resource snapshot, not per-process peak tracking. The cgroup and /proc are shared with other jobs.",
+  "platform": "Linux-6.18.57-x86_64-with-glibc2.39",
+  "cpu_affinity": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8
+  ],
+  "cgroup": {
+    "memory.max": "8589934592",
+    "memory.current": "8589795328",
+    "memory.events": "low 0\nhigh 0\nmax 26915665\noom 159\noom_kill 26\noom_group_kill 0",
+    "memory.swap.max": "max",
+    "cpu.max": "800000 100000"
+  },
+  "rustc": "rustc 1.100.0-nightly (908501772 2026-08-30)",
+  "cargo": "cargo 1.100.0-nightly (e8cb624d5 2026-08-22)"
+}
