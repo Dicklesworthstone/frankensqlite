@@ -1,4 +1,4 @@
-"""Guard GH#530 report integrity using synthetic CLI output, not performance data.
+"""Guard GH#530/533 report integrity using synthetic CLI output, not performance data.
 
 Run: python3 -m unittest discover -s scripts/tests -p 'test_benchmark_issue_530.py' -v
 Temporary evidence is retained rather than deleted.
@@ -9,6 +9,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -84,14 +85,43 @@ class BenchmarkProtocolTests(unittest.TestCase):
             with self.subTest(output=output), self.assertRaises(ValueError):
                 runner.validate_sample(output, expected=42, warmups=1)
 
-    def test_missing_nonpositive_nonfinite_or_extra_timers_fail_closed(self):
-        for timer in ("", "Run Time: real 0", "Run Time: -0.25 s", "Run Time: nan s",
+    def test_missing_negative_nonfinite_or_extra_timers_fail_closed(self):
+        for timer in ("", "Run Time: -0.25 s", "Run Time: nan s",
                       "Run Time: " + "9" * 309 + " s",
                       "Run Time: real 0.25\nRun Time: 250 ms"):
             with self.subTest(timer=timer), self.assertRaises(ValueError):
                 runner.validate_sample(result(stderr=timer), expected=42, warmups=0)
         with self.assertRaises(ValueError):
             runner.validate_sample(result("42\nRun Time: 0.25 s"), expected=42, warmups=0)
+
+    def test_zero_native_timer_is_censored_but_answers_remain_required(self):
+        # StatementTimer::report formats real seconds with {:.3}; a correctly
+        # executed empty CTE can therefore report 0.000. This is not zero work.
+        timer = "Run Time: real 0.000 user 0.000020 sys 0.000003"
+        sample = runner.validate_sample(result("0\n0\n", timer), expected=0, warmups=1)
+        self.assertEqual(sample["seconds"], 0)
+        self.assertAlmostEqual(sample["cpu_seconds"], 0.000023)
+        self.assertTrue(sample["below_timer_resolution"])
+        for output in (result("0\n", timer), result("1\n0\n", timer),
+                       result("0\n0\n", timer + "\nError: failed")):
+            with self.subTest(output=output), self.assertRaises(ValueError):
+                runner.validate_sample(output, expected=0, warmups=1)
+
+    def test_zero_samples_suppress_only_affected_ratios_even_with_nonzero_median(self):
+        samples = [{"engine": engine, "seconds": seconds, "cpu_seconds": None}
+                   for engine, times in (("baseline", (2, 2, 2)),
+                                         ("candidate", (0, 1, 1)), ("stock", (0.5, 0.5, 0.5)))
+                   for seconds in times]
+        summary = runner.summarize(samples)
+        self.assertEqual(summary["candidate"]["median_seconds"], 1)
+        self.assertEqual(summary["candidate"]["zero_timer_samples"], 1)
+        self.assertEqual(summary["baseline_over_stock"], 4)
+        self.assertIsNone(summary["candidate_over_stock"])
+        self.assertIsNone(summary["baseline_over_candidate"])
+        self.assertIn("below-resolution", summary["ratio_note"])
+        zeros = [{"engine": engine, "seconds": 0, "cpu_seconds": None}
+                 for engine in ("released", "stock")]
+        self.assertIsNone(runner.summarize(zeros)["released_over_stock"])
 
     def test_release_summary_cannot_claim_candidate_speedup(self):
         samples = [{"engine": engine, "seconds": seconds, "cpu_seconds": None}
@@ -114,7 +144,9 @@ class BenchmarkProtocolTests(unittest.TestCase):
                    ["--release-fsqlite", "release", "--case", "single_count",
                     "--case", "single_count"],
                    ["--release-fsqlite", "release", "--memory", "--memory-queries", "0"],
-                   ["--release-fsqlite", "release", "--memory-queries", "2"])
+                   ["--release-fsqlite", "release", "--memory-queries", "2"],
+                   ["--release-fsqlite", "release", "--issue", "533", "--case", "cartesian_count"],
+                   ["--release-fsqlite", "release", "--case", "cte_count"])
         for arguments in invalid:
             argv = ["benchmark", "--work-dir", str(work), "--output", str(work / "report.json"),
                     *arguments]
@@ -125,6 +157,47 @@ class BenchmarkProtocolTests(unittest.TestCase):
             self.assertEqual(error.exception.code, 2)
             execute.assert_not_called()
         self.assertFalse((work / "report.json").exists())
+
+    def test_cte_suite_selects_exact_reported_sql_and_retains_three_engine_evidence(self):
+        work = Path(tempfile.mkdtemp(prefix="issue533-timing-mode-"))
+        argv = ["benchmark", "--fsqlite", "candidate", "--baseline-fsqlite", "baseline",
+                "--sqlite", "stock", "--issue", "533", "--case", "cte_count",
+                "--case", "cte_empty_count", "--repeats", "2", "--warmups", "1",
+                "--work-dir", str(work), "--output", str(work / "report.json")]
+        measured = []
+
+        def native(binary, script, init, directory, timeout, stem):
+            if ".timer on" not in script:
+                return result("SCAN synthetic\n", "")
+            measured.append((binary["path"], script))
+            if "generate_series(2,1)" in script:
+                return result("0\n0\n", "Run Time: real 0.000")
+            return result("1000000\n1000000\n", "Run Time: real 0.25")
+
+        with mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(runner, "binary_info", side_effect=lambda path, *args: {"path": path}), \
+                mock.patch.object(runner, "run_cli", side_effect=native), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(runner.main(), 0)
+        report = json.loads((work / "report.json").read_text())
+        self.assertEqual(report["issue"], 533)
+        self.assertEqual(report["status"], "ok")
+        self.assertEqual(set(report["results"]), {"cte_count", "cte_empty_count"})
+        count = report["results"]["cte_count"]
+        self.assertEqual(count["sql"], "WITH t AS (SELECT value FROM generate_series(1,1000000)) "
+                                      "SELECT count(*) FROM t;")
+        self.assertEqual(set(count["plans"]), {"baseline", "candidate", "stock"})
+        self.assertEqual(len(count["samples"]), 6)
+        self.assertEqual(count["summary"]["baseline_over_candidate"], 1)
+        self.assertIsNone(report["results"]["cte_empty_count"]["summary"]["baseline_over_candidate"])
+        self.assertEqual([engine for engine, _ in measured[:6]],
+                         ["baseline", "candidate", "stock", "baseline", "stock", "candidate"])
+        for _, script in measured[:6]:
+            self.assertEqual(script.count(count["sql"]), 2)
+            self.assertEqual(script.count(".timer on"), 1)
+        profile = Path(report["work_directory"]) / "profile-cte_count.sql"
+        self.assertIn(count["sql"], profile.read_text())
+        self.assertNotIn(".timer on", profile.read_text())
 
     def test_timeout_preserves_partial_stdout_and_stderr(self):
         work = Path(tempfile.mkdtemp(prefix="issue530-timeout-test-"))
@@ -162,7 +235,60 @@ class BenchmarkProtocolTests(unittest.TestCase):
         evidence = json.loads((work / "success.checkpoints.json").read_text())
         self.assertEqual(evidence["status"], "ok")
         self.assertEqual(evidence["pid"], sample["pid"])
+        self.assertEqual(evidence["proc_pid"], sample["proc_pid"])
+        self.assertGreater(sample["proc_pid"], 0)
+        self.assertEqual((work / "success.proc_pid").read_text(), f"{sample['proc_pid']}\n")
         self.assertEqual(evidence["checkpoints"], sample["checkpoints"])
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux /proc memory protocol")
+    def test_pid_handshake_supports_high_descriptors_and_keeps_sql_output_separate(self):
+        work = Path(tempfile.mkdtemp(prefix="issue533-pid-fds-"))
+        held = []
+        try:
+            held.extend(os.open(os.devnull, os.O_RDONLY) for _ in range(16))
+            self.assertGreater(held[-1], 9)
+            sample = runner.run_memory_cli(memory_cli(work), "SELECT 42;", 42, [], 1,
+                                          work / "init", work, 5, "high-fds")
+        finally:
+            for descriptor in held:
+                os.close(descriptor)
+        output = (work / "high-fds.stdout").read_text().splitlines()
+        self.assertNotIn(str(sample["proc_pid"]), output)
+        self.assertEqual(output.count("42"), 1)
+        self.assertEqual(len(sample["checkpoints"]), 2)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux /proc memory protocol")
+    def test_malformed_or_missing_pid_handshake_fails_before_any_checkpoint(self):
+        work = Path(tempfile.mkdtemp(prefix="issue533-bad-pid-"))
+        for index, pid in enumerate(("0\\n", "-1\\n", "12x\\n", "\\n", "12\\n13\\n",
+                                     "2147483648\\n", "9" * 33, "12", "")):
+            launcher = f"printf '{pid}' >\"/proc/self/fd/$1\"; exit 0"
+            with self.subTest(pid=pid), mock.patch.object(runner, "PROC_PID_LAUNCHER", launcher), \
+                    self.assertRaises(ValueError):
+                runner.run_memory_cli(memory_cli(work), "SELECT 42;", 42, [], 1,
+                                      work / "init", work, 5, f"invalid-{index}")
+            evidence = json.loads((work / f"invalid-{index}.checkpoints.json").read_text())
+            self.assertEqual(evidence["status"], "incomplete")
+            self.assertEqual(evidence["checkpoints"], [])
+            self.assertEqual((work / f"invalid-{index}.stdout").read_text(), "")
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux /proc memory protocol")
+    def test_pid_handshake_uses_the_same_deadline_and_reaps_stalled_child(self):
+        work = Path(tempfile.mkdtemp(prefix="issue533-pid-timeout-"))
+        started = time.monotonic()
+        # A shell builtin waits for input. The collector must not submit SQL
+        # until it has a PID, and must kill/reap this child at the same deadline.
+        with mock.patch.object(runner, "PROC_PID_LAUNCHER", "read -r ignored"), \
+                self.assertRaises(subprocess.TimeoutExpired):
+            runner.run_memory_cli(memory_cli(work), "SELECT 42;", 42, [], 1,
+                                  work / "init", work, 0.3, "stalled")
+        self.assertLess(time.monotonic() - started, 5)
+        evidence = json.loads((work / "stalled.checkpoints.json").read_text())
+        self.assertEqual(evidence["status"], "incomplete")
+        self.assertIsNone(evidence["proc_pid"])
+        self.assertEqual(evidence["checkpoints"], [])
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(evidence["pid"], os.WNOHANG)
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "Linux /proc memory protocol")
     def test_memory_protocol_rejects_bad_results_stderr_and_early_exit(self):
@@ -239,6 +365,7 @@ class BenchmarkProtocolTests(unittest.TestCase):
         self.assertEqual(memory_run.call_count, 2)
         report = json.loads((work / "report.json").read_text())
         self.assertEqual(report["measurement_mode"], "memory")
+        self.assertEqual(report["issue"], 530)
         self.assertEqual(report["status"], "ok")
         self.assertNotIn("timing_scope", report)
         self.assertNotIn("warmups_per_sample", report)

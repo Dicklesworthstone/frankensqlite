@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reproduce GH#530 against baseline, candidate, and a live stock SQLite CLI.
+"""Reproduce GH#530 or GH#533 against baseline, candidate, and live stock SQLite.
 
 python3 scripts/benchmark_issue_530.py --baseline-fsqlite /path/to/old/fsqlite \
     --fsqlite /path/to/new/fsqlite --sqlite /path/to/sqlite3 \
@@ -11,8 +11,13 @@ python3 scripts/benchmark_issue_530.py --release-fsqlite /path/to/released/fsqli
     --release-revision RELEASE_SHA --sqlite /path/to/sqlite3 \
     --work-dir /path/to/measurements --output /path/to/release-stock.json
 
-The first four cases are the issue's exact SQL. Controls vary expression work,
-join shape, and FROM source. Stock SQLite must have its native generate_series
+The default --issue 530 retains the original Cartesian aggregate suite. Select
+--issue 533 for the four reported CTE/direct queries and controls for hints,
+projection, filtering, limits, empty inputs and correlated matches/misses. The
+correlated 10,000-row cases can require --timeout 900 on an unoptimized binary;
+the timeout covers setup, warmups and the measured query in each fresh process.
+Both suites' first four cases are the respective issue's exact SQL. Stock
+SQLite must have its native generate_series
 extension; no recursive-CTE or Python-generator substitute is used.
 single_count_having_fallback deliberately bypasses the existing lone-TVF
 streaming path; it diagnoses materialization cost, not optimized candidate coverage.
@@ -24,6 +29,10 @@ All answers, including warmups, are checked. Three-engine order rotates each
 round; two-engine release/stock order alternates. Release mode reports no
 candidate or before/after comparison. Inputs, EXPLAIN/EQP output, raw logs,
 binary hashes, and samples are kept.
+Zero timers are retained as below-resolution observations, never converted into
+a speedup ratio. In particular, empty/limited controls can round to 0.000 in
+FrankenSQLite's millisecond-resolution wall timer. Such samples are still
+required to have exactly one valid timer and correct answers for every run.
 Each profile-*.sql repeats only setup and the named workload, without correctness
 queries or timers; whole-process profiles still include startup and setup.
 
@@ -34,6 +43,10 @@ resident memory and its high-water mark through that checkpoint. The first-query
 VmHWM includes executable startup and setup; later VmRSS checkpoints expose
 retention between queries, including allocator arenas and engine caches. These
 are approximate kernel process counters, not isolated query-heap measurements.
+For containers whose /proc mount uses an ancestor PID namespace, a small shell
+reports its /proc-visible PID on a separate pipe before replacing itself with
+the CLI. No Python bootstrap runs in the measured child. Checkpoints start
+after the CLI's setup marker; the shell is no longer running at that point.
 """
 
 from __future__ import annotations
@@ -63,6 +76,15 @@ TIMER = re.compile(
     r"(?:\s+user\s+([0-9.]+)\s+sys\s+([0-9.]+))?\s*$"
 )
 PREFIX = [".mode list", ".headers off"]
+# Use only shell builtins before exec. Opening the inherited pipe through /proc
+# also supports descriptor numbers above 9 on POSIX shells such as dash. The
+# original write descriptor lives until CLI exit; the parent closes its reader
+# immediately after the one-line handshake and never mixes it with SQL output.
+PROC_PID_LAUNCHER = (
+    'read -r proc_pid rest < /proc/self/stat && '
+    'printf \'%s\\n\' "$proc_pid" >"/proc/self/fd/$1" && '
+    'shift && exec "$@"'
+)
 TABLE_SETUP = ["CREATE TABLE src(value INTEGER);",
                "INSERT INTO src SELECT value FROM generate_series(1,1000);"]
 JSON_VALUES = json.dumps(list(range(1, 1001)), separators=(",", ":"))
@@ -102,6 +124,78 @@ CASES = {
     "json_sum": (f"SELECT sum((a.value-1)*1000+b.value) FROM json_each('{JSON_VALUES}')a,"
                  f"json_each('{JSON_VALUES}')b;", 500_000_500_000, []),
 }
+
+# The repeated reference in the reported EXISTS case must remain repeated; do
+# not replace it with two independently evaluated CTEs or a closed-form count.
+# The smaller EXISTS controls keep a full miss and both hint forms practical
+# even on the materializing interpreter. Every answer is independently known.
+CTE_CASES = {
+    "cte_count": ("WITH t AS (SELECT value FROM generate_series(1,1000000)) "
+                  "SELECT count(*) FROM t;", 1_000_000, []),
+    "single_count": CASES["single_count"],
+    "cte_correlated_exists": (
+        "WITH t AS (SELECT value FROM generate_series(1,10000)) SELECT count(*) FROM t "
+        "WHERE EXISTS(SELECT 1 FROM t t1 WHERE t.value=t1.value);", 10_000, []),
+    "direct_correlated_exists": (
+        "SELECT count(*) FROM generate_series(1,10000)t "
+        "WHERE EXISTS(SELECT 1 FROM generate_series(1,10000)t1 WHERE t.value=t1.value);",
+        10_000, []),
+    "cte_count_materialized": (
+        "WITH t AS MATERIALIZED (SELECT value FROM generate_series(1,1000000)) "
+        "SELECT count(*) FROM t;", 1_000_000, []),
+    "cte_count_not_materialized": (
+        "WITH t AS NOT MATERIALIZED (SELECT value FROM generate_series(1,1000000)) "
+        "SELECT count(*) FROM t;", 1_000_000, []),
+    "cte_body_filter_count": (
+        "WITH t AS (SELECT value FROM generate_series(1,1000000) WHERE value<=500000) "
+        "SELECT count(*) FROM t;", 500_000, []),
+    "cte_outer_filter_count": (
+        "WITH t AS (SELECT value FROM generate_series(1,1000000)) "
+        "SELECT count(*) FROM t WHERE value<=500000;", 500_000, []),
+    "cte_projected_sum": (
+        "WITH t AS (SELECT value*2+1 AS n FROM generate_series(1,1000000)) "
+        "SELECT sum(n) FROM t;", 1_000_002_000_000, []),
+    "cte_named_column_sum": (
+        "WITH t(n) AS (SELECT value FROM generate_series(1,1000000)) "
+        "SELECT sum(n) FROM t;", 500_000_500_000, []),
+    "cte_hidden_column_sum": (
+        "WITH t AS (SELECT value,start,stop,step FROM generate_series(1,1000000,2)) "
+        "SELECT sum(start+step)+max(stop)-max(value) FROM t;", 1_500_001, []),
+    "cte_hidden_constraint_miss": (
+        "WITH t AS (SELECT value,step FROM generate_series(1,1000000,2)) "
+        "SELECT count(*) FROM t WHERE step=3;", 0, []),
+    "cte_limited_sum": (
+        "WITH t AS (SELECT value FROM generate_series(1,1000000) LIMIT 100 OFFSET 10) "
+        "SELECT sum(value) FROM t;", 6_050, []),
+    "cte_ordered_limit_sum": (
+        "WITH t AS (SELECT value FROM generate_series(1,1000000) ORDER BY value DESC LIMIT 3) "
+        "SELECT sum(value) FROM t;", 2_999_997, []),
+    "cte_empty_count": (
+        "WITH t AS (SELECT value FROM generate_series(2,1)) SELECT count(*) FROM t;", 0, []),
+    "cte_multiple_reference_sum": (
+        "WITH t AS (SELECT value FROM generate_series(1,100000)) "
+        "SELECT (SELECT sum(value) FROM t)+(SELECT count(*) FROM t);", 5_000_150_000, []),
+    "cte_correlated_exists_materialized": (
+        "WITH t AS MATERIALIZED (SELECT value FROM generate_series(1,1000)) "
+        "SELECT count(*) FROM t WHERE EXISTS(SELECT 1 FROM t t1 WHERE t.value=t1.value);",
+        1_000, []),
+    "cte_correlated_exists_not_materialized": (
+        "WITH t AS NOT MATERIALIZED (SELECT value FROM generate_series(1,1000)) "
+        "SELECT count(*) FROM t WHERE EXISTS(SELECT 1 FROM t t1 WHERE t.value=t1.value);",
+        1_000, []),
+    "cte_correlated_miss": (
+        "WITH t AS (SELECT value FROM generate_series(1,1000)) "
+        "SELECT count(*) FROM t WHERE EXISTS(SELECT 1 FROM t t1 WHERE t.value=t1.value+1000);",
+        0, []),
+    "direct_correlated_miss": (
+        "SELECT count(*) FROM generate_series(1,1000)t WHERE EXISTS(SELECT 1 "
+        "FROM generate_series(1,1000)t1 WHERE t.value=t1.value+1000);", 0, []),
+    "cte_correlated_offset": (
+        "WITH t AS (SELECT value FROM generate_series(1,1000)) "
+        "SELECT count(*) FROM t WHERE EXISTS(SELECT 1 FROM t t1 WHERE t.value=t1.value+1);",
+        999, []),
+}
+SUITES = {530: CASES, 533: CTE_CASES}
 
 
 def timer_seconds(line: str) -> float | None:
@@ -146,8 +240,8 @@ def validate_sample(result: subprocess.CompletedProcess, expected: int, warmups:
         raise ValueError(f"CLI exit {result.returncode}: {result.stderr}")
     timings = [seconds for line in (result.stdout + "\n" + result.stderr).splitlines()
                if (seconds := timer_seconds(line)) is not None]
-    if len(timings) != 1 or not math.isfinite(timings[0]) or timings[0] <= 0:
-        raise ValueError(f"expected one positive native statement timer, got {timings}")
+    if len(timings) != 1 or not math.isfinite(timings[0]) or timings[0] < 0:
+        raise ValueError(f"expected one nonnegative native statement timer, got {timings}")
     errors = [line for line in result.stderr.splitlines()
               if line.strip() and timer_seconds(line) is None]
     values = [line.strip() for line in result.stdout.splitlines()
@@ -158,7 +252,8 @@ def validate_sample(result: subprocess.CompletedProcess, expected: int, warmups:
                       if timer_seconds(line) is not None)
     match = TIMER.fullmatch(timer_line.strip())
     cpu = float(match[3]) + float(match[4]) if match[3] is not None else None
-    return {"seconds": timings[0], "cpu_seconds": cpu, "timer_line": timer_line}
+    return {"seconds": timings[0], "cpu_seconds": cpu, "timer_line": timer_line,
+            "below_timer_resolution": timings[0] == 0}
 
 
 def summarize(samples: list[dict]) -> dict:
@@ -170,12 +265,20 @@ def summarize(samples: list[dict]) -> dict:
         cpu = [sample["cpu_seconds"] for sample in samples if sample["engine"] == engine]
         if all(value is not None for value in cpu):
             summary[engine]["median_cpu_seconds"] = statistics.median(cpu)
+        if any(value == 0 for value in times):
+            summary[engine]["zero_timer_samples"] = sum(value == 0 for value in times)
     stock = summary["stock"]["median_seconds"]
-    comparisons = {f"{engine}_over_stock": result["median_seconds"] / stock
+    comparisons = {f"{engine}_over_stock": (result["median_seconds"] / stock
+                    if stock > 0 and "zero_timer_samples" not in result and
+                    "zero_timer_samples" not in summary["stock"] else None)
                    for engine, result in summary.items() if engine != "stock"}
     if "baseline" in summary and "candidate" in summary:
         comparisons["baseline_over_candidate"] = (summary["baseline"]["median_seconds"] /
-                                                   summary["candidate"]["median_seconds"])
+            summary["candidate"]["median_seconds"]
+            if "zero_timer_samples" not in summary["baseline"] and
+            "zero_timer_samples" not in summary["candidate"] else None)
+    if any(value is None for value in comparisons.values()):
+        summary["ratio_note"] = "null ratios involve a below-resolution zero timer; no speedup inferred"
     summary.update(comparisons)
     return summary
 
@@ -198,8 +301,8 @@ def run_memory_cli(binary: dict, sql: str, expected: int | list[str], setup: lis
 
     Only stdout uses a PTY, so the shells flush markers but still receive batch
     input without prompts. Nonblocking pipes and one monotonic deadline bound
-    writes, reads and shutdown. Every result and all stderr are checked. An
-    existing file database may be supplied; it is never seeded by the collector.
+    the PID handshake, writes, reads and shutdown. Every result and all stderr
+    are checked. An existing file database may be supplied; it is never seeded by the collector.
     List-valued expectations preserve row multiplicity and, by default, order.
     """
     if not sys.platform.startswith("linux"):
@@ -215,12 +318,14 @@ def run_memory_cli(binary: dict, sql: str, expected: int | list[str], setup: lis
     scripts = ["\n".join([*PREFIX, *setup, f".print {marker_prefix}0", ""])]
     scripts.extend(f"{sql}\n.print {marker_prefix}{index}\n" for index in range(1, queries + 1))
     (directory / f"{stem}.sql").write_text("".join(scripts), encoding="utf-8")
-    captured = {"stdout": bytearray(), "stderr": bytearray()}
+    captured = {"stdout": bytearray(), "stderr": bytearray(), "proc_pid": bytearray()}
     checkpoints = []
     completed = False
     process = None
+    proc_pid = None
     master, slave = pty.openpty()
     selector = selectors.DefaultSelector()
+    pid_read, pid_write = os.pipe()
     deadline = time.monotonic() + timeout
     pending_input = b""
     pending_output = b""
@@ -235,7 +340,7 @@ def run_memory_cli(binary: dict, sql: str, expected: int | list[str], setup: lis
         return left
 
     def pump(block: bool = True) -> None:
-        nonlocal pending_input, pending_output
+        nonlocal pending_input, pending_output, proc_pid, pid_read
         left = remaining()
         events = selector.select(left if block else 0)
         if block and not events:
@@ -255,8 +360,23 @@ def run_memory_cli(binary: dict, sql: str, expected: int | list[str], setup: lis
                 chunk = b""  # Linux PTY reports EIO when the slave closes.
             if not chunk:
                 selector.unregister(key.fileobj)
+                if key.data == "proc_pid":
+                    raise ValueError("memory CLI closed its PID pipe without a complete handshake")
                 continue
             captured[key.data].extend(chunk)
+            if key.data == "proc_pid":
+                handshake = bytes(captured["proc_pid"])
+                if len(handshake) > 32 or (b"\n" in handshake and
+                                          re.fullmatch(rb"[1-9][0-9]*\n", handshake) is None):
+                    raise ValueError(f"malformed memory CLI PID handshake: {handshake!r}")
+                if b"\n" in handshake:
+                    proc_pid = int(handshake)
+                    if proc_pid > 2**31 - 1:
+                        raise ValueError(f"memory CLI PID exceeds Linux pid_t: {proc_pid}")
+                    selector.unregister(key.fileobj)
+                    os.close(pid_read)
+                    pid_read = None
+                continue
             if key.data == "stdout":
                 pending_output += chunk
                 while b"\n" in pending_output:
@@ -268,14 +388,21 @@ def run_memory_cli(binary: dict, sql: str, expected: int | list[str], setup: lis
             raise ValueError(f"memory CLI stderr: {captured['stderr'].decode('utf-8', errors='replace')}")
 
     try:
-        process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=slave,
-                                   stderr=subprocess.PIPE, bufsize=0)
+        process = subprocess.Popen(
+            ["/bin/sh", "-c", PROC_PID_LAUNCHER, "memory-cli", str(pid_write), *command],
+            stdin=subprocess.PIPE, stdout=slave, stderr=subprocess.PIPE,
+            pass_fds=(pid_write,), bufsize=0)
+        os.close(pid_write)
+        pid_write = None
         os.close(slave)
         slave = None
         assert process.stdin is not None and process.stderr is not None
         os.set_blocking(process.stdin.fileno(), False)
         selector.register(master, selectors.EVENT_READ, "stdout")
         selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+        selector.register(pid_read, selectors.EVENT_READ, "proc_pid")
+        while proc_pid is None:
+            pump()
         for index, script in enumerate(scripts):
             marker = f"{marker_prefix}{index}"
             first_line = len(lines)
@@ -294,11 +421,14 @@ def run_memory_cli(binary: dict, sql: str, expected: int | list[str], setup: lis
                     or checkpoint_lines[-1] != marker
                     or normalize(checkpoint_lines[:-1]) != normalize(result_rows)):
                 raise ValueError(f"wrong memory result/checkpoint {index}: {lines[first_line:]!r}")
-            counters = parse_process_memory(Path(f"/proc/{process.pid}/status").read_text(encoding="utf-8"))
+            status = Path(f"/proc/{proc_pid}/status").read_text(encoding="utf-8")
+            if re.findall(r"^Pid:\s+([0-9]+)\s*$", status, re.MULTILINE) != [str(proc_pid)]:
+                raise ValueError("memory CLI /proc status does not match its PID handshake")
+            counters = parse_process_memory(status)
             checkpoints.append({"query_count": index, **counters})
             # Persist checkpoints immediately, including before a later error.
             (directory / f"{stem}.checkpoints.json").write_text(
-                json.dumps({"status": "running", "pid": process.pid,
+                json.dumps({"status": "running", "pid": process.pid, "proc_pid": proc_pid,
                             "checkpoints": checkpoints}, indent=2) + "\n", encoding="utf-8")
         process.stdin.close()
         final_line = len(lines)
@@ -308,7 +438,8 @@ def run_memory_cli(binary: dict, sql: str, expected: int | list[str], setup: lis
         if returncode or pending_output or len(lines) != final_line:
             raise ValueError(f"memory CLI exit {returncode} or unexpected output after final checkpoint")
         completed = True
-        return {"pid": process.pid, "queries": queries, "checkpoints": checkpoints}
+        return {"pid": process.pid, "proc_pid": proc_pid, "queries": queries,
+                "checkpoints": checkpoints}
     finally:
         try:
             if process is not None:
@@ -325,12 +456,17 @@ def run_memory_cli(binary: dict, sql: str, expected: int | list[str], setup: lis
             os.close(master)
             if slave is not None:
                 os.close(slave)
+            if pid_read is not None:
+                os.close(pid_read)
+            if pid_write is not None:
+                os.close(pid_write)
             for stream, data in captured.items():
                 (directory / f"{stem}.{stream}").write_text(
                     data.decode("utf-8", errors="replace"), encoding="utf-8")
             (directory / f"{stem}.checkpoints.json").write_text(
                 json.dumps({"status": "ok" if completed else "incomplete",
                             "pid": process.pid if process else None,
+                            "proc_pid": proc_pid,
                             "checkpoints": checkpoints}, indent=2) + "\n", encoding="utf-8")
 
 
@@ -365,7 +501,9 @@ def main() -> int:
     parser.add_argument("--release-revision")
     parser.add_argument("--stock-revision")
     parser.add_argument("--build-note", default="unspecified; binary hashes identify executables")
-    parser.add_argument("--case", choices=tuple(CASES), action="append")
+    parser.add_argument("--issue", type=int, choices=tuple(SUITES), default=530,
+                        help="workload suite (default: 530); 533 includes CTE controls")
+    parser.add_argument("--case", choices=tuple(dict.fromkeys((*CASES, *CTE_CASES))), action="append")
     parser.add_argument("--repeats", type=int, default=6)
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--profile-repeats", type=int, default=10)
@@ -394,13 +532,16 @@ def main() -> int:
         parser.error("--memory requires Linux /proc VmRSS and VmHWM")
     if args.case and len(args.case) != len(set(args.case)):
         parser.error("each --case may be specified only once")
+    cases = SUITES[args.issue]
+    if args.case and any(name not in cases for name in args.case):
+        parser.error(f"all --case values must belong to --issue {args.issue}")
     if args.output.resolve() == args.work_dir.resolve():
         parser.error("--output must name a file distinct from --work-dir")
     if args.output.exists():
         parser.error("output already exists; choose a new result path")
     args.work_dir.mkdir(parents=True, exist_ok=True)
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    work = Path(tempfile.mkdtemp(prefix="issue530-", dir=args.work_dir.resolve()))
+    work = Path(tempfile.mkdtemp(prefix=f"issue{args.issue}-", dir=args.work_dir.resolve()))
     init = work / "empty-init.sql"
     init.write_text("", encoding="utf-8")
     engines = ([("released", args.release_fsqlite, args.release_revision)] if args.release_fsqlite else
@@ -408,7 +549,7 @@ def main() -> int:
                 ("candidate", args.fsqlite, args.candidate_revision)])
     engines.append(("stock", args.sqlite, args.stock_revision))
     rotations = tuple(itertools.permutations(engine for engine, _, _ in engines))
-    report = {"schema": 1, "issue": 530, "status": "running",
+    report = {"schema": 1, "issue": args.issue, "status": "running",
               "measurement_mode": "memory" if args.memory else "timing",
               "comparison_scope": ("published release versus stock; no candidate/before-after measurements"
                                    if args.release_fsqlite else "baseline and candidate versus live stock"),
@@ -417,7 +558,7 @@ def main() -> int:
               "cpu_affinity": sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else None,
               "build_note": args.build_note, "work_directory": str(work),
               "timing_scope": "native CLI SELECT timer, scalar output; startup/setup/warmup excluded",
-              "timing_resolution_note": "FrankenSQLite real timers round to 1 ms (up to 0.5 ms error per sample); user+sys CPU fields print microseconds. Do not interpret small differences below this precision.",
+              "timing_resolution_note": "FrankenSQLite real timers round to 1 ms (up to 0.5 ms error per sample); user+sys CPU fields print microseconds. Zero timers are below-resolution observations and suppress affected ratios. Do not interpret small differences below this precision.",
               "warmups_per_sample": args.warmups, "repeats": args.repeats,
               "settings": "engine defaults; empty explicit init file; in-memory databases",
               "engine_order": rotations, "results": {}}
@@ -426,15 +567,15 @@ def main() -> int:
             report.pop(key)
         report.update({
             "memory_queries_per_process": args.memory_queries,
-            "memory_scope": "Linux /proc VmRSS and VmHWM while the same child awaits input after setup and each checked SELECT; fresh child for each repetition; no warmup",
-            "memory_interpretation": "Approximate whole-process resident counters, not query heap. First-query high-water includes executable startup and fixture setup, excludes later queries and shutdown. Later RSS includes allocator-retained pages, caches and other process state; a nonzero retained delta alone is not proof of a leak. Counters reset at exec, so no pre-exec Python-parent RSS floor is included.",
+            "memory_scope": "Linux /proc VmRSS and VmHWM while the same child awaits input after setup and each checked SELECT; fresh child for each repetition; no warmup. A shell-builtin PID handshake identifies the child in the /proc mount's namespace before exec; both local pid and proc_pid are retained.",
+            "memory_interpretation": "Approximate whole-process resident counters, not query heap. First-query high-water includes executable startup and fixture setup, excludes later queries and shutdown. Later RSS includes allocator-retained pages, caches and other process state; a nonzero retained delta alone is not proof of a leak. The small shell launcher is replaced by the CLI before any checkpoint. Counters reset at exec, so no pre-exec Python-parent or shell RSS floor is included.",
         })
     try:
         report["binaries"] = {
             engine: binary_info(path, revision, args.timeout)
             for engine, path, revision in engines}
-        for name in args.case or CASES:
-            sql, expected, setup = CASES[name]
+        for name in args.case or cases:
+            sql, expected, setup = cases[name]
             directory = work / name
             directory.mkdir()
             entry = {"sql": sql, "setup": setup, "expected": expected, "samples": []}
