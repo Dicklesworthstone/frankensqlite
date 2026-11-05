@@ -103,3 +103,113 @@ fn bd_yoa57_journal_size_limit_caps_the_wal() {
         );
     });
 }
+
+#[cfg(feature = "diagnostic-pragmas")]
+#[test]
+fn bd_5lw60_journal_size_limit_reclaims_wal_during_write_pressure() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("write-pressure.db");
+        let path = path.to_str().expect("UTF-8 path");
+        let conn = Connection::open(path).await.expect("open");
+        conn.execute("PRAGMA journal_mode=WAL").await.expect("wal");
+        conn.execute("PRAGMA wal_autocheckpoint=0")
+            .await
+            .expect("disable autocheckpoint during setup");
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, payload BLOB)")
+            .await
+            .expect("create");
+        conn.execute("PRAGMA checkpoint_write_pressure_fps=1")
+            .await
+            .expect("low write-pressure threshold");
+        conn.execute("PRAGMA checkpoint_urgent_wal_frames=1000000")
+            .await
+            .expect("keep generic emergency threshold out of the fixture");
+        conn.execute("PRAGMA wal_autocheckpoint=1")
+            .await
+            .expect("enable autocheckpoint");
+
+        // One large commit supplies hundreds of frames to the pressure sample,
+        // rather than depending on a fast loop of tiny host-timed commits.
+        conn.execute("INSERT INTO t VALUES (1, zeroblob(1048576))")
+            .await
+            .expect("large write");
+        let wal_path = format!("{path}-wal");
+        let pressure_wal = std::fs::metadata(&wal_path).expect("WAL").len();
+        assert!(
+            pressure_wal > 1024 * 1024,
+            "pressure fixture WAL was {pressure_wal}"
+        );
+        let stats = conn.query("PRAGMA checkpoint_stats").await.expect("stats");
+        let local_checkpoints = stats
+            .iter()
+            .find(|row| {
+                row.values().first() == Some(&SqliteValue::Text("local_checkpoint_count".into()))
+            })
+            .and_then(|row| row.values().get(1));
+        assert_eq!(
+            local_checkpoints,
+            Some(&SqliteValue::Integer(0)),
+            "the unlimited control must exercise write-pressure deferral"
+        );
+
+        conn.execute("PRAGMA journal_size_limit=16384")
+            .await
+            .expect("set cap");
+        // Another multi-page commit keeps the pressure branch active even
+        // when the host is slow, while the cap now requires reclamation.
+        conn.execute("INSERT INTO t VALUES (2, zeroblob(1048576))")
+            .await
+            .expect("capped write");
+        let capped_wal = std::fs::metadata(&wal_path).expect("WAL after cap").len();
+        assert!(
+            capped_wal <= 16 * 1024,
+            "write-pressure deferral must not override journal_size_limit: {capped_wal} bytes"
+        );
+        conn.execute("INSERT INTO t VALUES (3, X'00')")
+            .await
+            .expect("reuse WAL");
+        let reused_wal = std::fs::metadata(&wal_path).expect("reused WAL").len();
+        assert!(
+            reused_wal <= 16 * 1024,
+            "reused WAL retained {reused_wal} bytes"
+        );
+
+        // A size cap promotes a scheduled checkpoint; it does not re-enable
+        // checkpoints the caller explicitly disabled.
+        conn.execute("PRAGMA wal_autocheckpoint=0")
+            .await
+            .expect("disable autocheckpoint again");
+        conn.execute("INSERT INTO t VALUES (4, zeroblob(1048576))")
+            .await
+            .expect("disabled write");
+        assert!(
+            std::fs::metadata(&wal_path).expect("disabled WAL").len() > 1024 * 1024,
+            "wal_autocheckpoint=0 must remain disabled with a size cap"
+        );
+        assert_eq!(scalar_int(&conn, "SELECT count(*) FROM t").await, 4);
+        conn.close().await.expect("close");
+
+        // Stock applies the size cap when it reuses a fully checkpointed WAL.
+        // Inspect it while open: stock removes its WAL on last-close.
+        let stock_path = dir.path().join("stock-size-limit.db");
+        let stock = rusqlite::Connection::open(&stock_path).expect("stock open");
+        stock
+            .execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=1; \
+                 CREATE TABLE t(id INTEGER PRIMARY KEY, payload BLOB); \
+                 INSERT INTO t VALUES (1, zeroblob(1048576)); \
+                 PRAGMA journal_size_limit=16384; \
+                 INSERT INTO t VALUES (2, zeroblob(1048576)); \
+                 INSERT INTO t VALUES (3, X'00');",
+            )
+            .expect("stock workload");
+        let stock_wal = std::fs::metadata(format!("{}-wal", stock_path.display()))
+            .expect("stock WAL")
+            .len();
+        assert!(stock_wal <= 16 * 1024, "stock retained {stock_wal} bytes");
+        eprintln!(
+            "bd-5lw60: pressure_wal={pressure_wal}, capped_wal={capped_wal}, reused_wal={reused_wal}, stock_capped_wal={stock_wal}"
+        );
+    });
+}

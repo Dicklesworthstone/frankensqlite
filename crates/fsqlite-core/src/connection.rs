@@ -61325,11 +61325,14 @@ impl Connection {
             );
         }
 
-        if snapshot.wal_autocheckpoint_pages > 0
-            && snapshot.wal_frames_estimate >= normal_checkpoint_target
-            && snapshot.write_rate_frames_per_sec >= snapshot.write_pressure_frames_per_sec
-            && snapshot.wal_frames_estimate < snapshot.urgent_wal_frames_threshold
-        {
+        if Self::checkpoint_should_delay_for_write_pressure(
+            &snapshot,
+            Self::checkpoint_journal_size_limit_exceeded(
+                snapshot.wal_frames_estimate,
+                self.pager.page_size(),
+                self.pragma_state.borrow().journal_size_limit,
+            ),
+        ) {
             push_row(
                 "delay_for_write_burst",
                 "info",
@@ -61345,12 +61348,42 @@ impl Connection {
         rows
     }
 
-    fn checkpoint_should_delay_for_write_pressure(snapshot: &CheckpointRuntimeSnapshot) -> bool {
+    fn checkpoint_journal_size_limit_exceeded(
+        wal_frames: u64,
+        page_size: PageSize,
+        journal_size_limit: i64,
+    ) -> bool {
+        let Ok(limit) = u64::try_from(journal_size_limit) else {
+            return false;
+        };
+        let frame_bytes = u64::from(page_size.get())
+            .saturating_add(fsqlite_wal::WAL_FRAME_HEADER_SIZE as u64);
+        let wal_bytes = (fsqlite_wal::WAL_HEADER_SIZE as u64)
+            .saturating_add(wal_frames.saturating_mul(frame_bytes));
+        wal_bytes > limit
+    }
+
+    fn checkpoint_retry_pending(snapshot: &CheckpointRuntimeSnapshot) -> bool {
+        snapshot.wal_frames_estimate >= snapshot.last_checkpoint_total_frames
+            && snapshot.wal_frames_estimate
+                < snapshot.last_checkpoint_total_frames.saturating_add(
+                    snapshot.adaptive_autocheckpoint_target_pages.max(1),
+                )
+    }
+
+    fn checkpoint_should_delay_for_write_pressure(
+        snapshot: &CheckpointRuntimeSnapshot,
+        journal_size_limit_exceeded: bool,
+    ) -> bool {
         snapshot.wal_autocheckpoint_pages > 0
             && snapshot.wal_unbackfilled_frames_estimate
                 >= snapshot.adaptive_autocheckpoint_target_pages.max(1)
             && snapshot.write_rate_frames_per_sec >= snapshot.write_pressure_frames_per_sec
             && snapshot.wal_frames_estimate < snapshot.urgent_wal_frames_threshold
+            // A pinned reader may leave an over-limit WAL after a partial
+            // checkpoint. Keep the frame-based retry cadence instead of
+            // scanning that same WAL again after every commit.
+            && (!journal_size_limit_exceeded || Self::checkpoint_retry_pending(snapshot))
     }
 
     fn checkpoint_pick_auto_mode(snapshot: &CheckpointRuntimeSnapshot) -> CheckpointMode {
@@ -61501,12 +61534,7 @@ impl Connection {
         // retry after another `adaptive_target` frames rather than re-copying
         // the whole WAL on every commit: that per-commit pass was the cliff past
         // the urgent threshold (~10 ms per autocommit at 4,000 frames).
-        let urgent_retry_pending = snapshot.wal_frames_estimate
-            >= snapshot.last_checkpoint_total_frames
-            && snapshot.wal_frames_estimate
-                < snapshot
-                    .last_checkpoint_total_frames
-                    .saturating_add(adaptive_target);
+        let urgent_retry_pending = Self::checkpoint_retry_pending(&snapshot);
         if backfill_below_target
             && (snapshot.wal_frames_estimate < snapshot.urgent_wal_frames_threshold.max(1)
                 || urgent_retry_pending)
@@ -61518,7 +61546,17 @@ impl Connection {
             return;
         }
 
-        if Self::checkpoint_should_delay_for_write_pressure(&snapshot) {
+        // bd-5lw60: a caller's WAL byte limit takes precedence over burst
+        // deferral. Checking it only after the pressure return let sustained
+        // writes grow the WAL to the generic urgent threshold regardless of
+        // a much smaller configured cap. The scheduled-checkpoint threshold
+        // above and the no-wait reader/writer fences still apply.
+        let journal_size_limit_exceeded = Self::checkpoint_journal_size_limit_exceeded(
+            snapshot.wal_frames_estimate,
+            self.pager.page_size(),
+            self.pragma_state.borrow().journal_size_limit,
+        );
+        if Self::checkpoint_should_delay_for_write_pressure(&snapshot, journal_size_limit_exceeded) {
             tracing::debug!(
                 trace_id = next_trace_id(),
                 run_id = "auto-checkpoint",
@@ -61546,16 +61584,8 @@ impl Connection {
         // SQLite, which applies journal_size_limit when a checkpoint would
         // otherwise leave the WAL/journal file large. The estimate is
         // WAL_HEADER + frames * (page_size + WAL_FRAME_HEADER).
-        let journal_size_limit = self.pragma_state.borrow().journal_size_limit;
-        if journal_size_limit >= 0 {
-            let frame_bytes = u64::from(self.pager.page_size().get())
-                .saturating_add(fsqlite_wal::WAL_FRAME_HEADER_SIZE as u64);
-            let wal_bytes = (fsqlite_wal::WAL_HEADER_SIZE as u64)
-                .saturating_add(snapshot.wal_frames_estimate.saturating_mul(frame_bytes));
-            #[allow(clippy::cast_sign_loss)]
-            if wal_bytes > journal_size_limit as u64 {
-                mode = CheckpointMode::Truncate;
-            }
+        if journal_size_limit_exceeded {
+            mode = CheckpointMode::Truncate;
         }
         let cx = match self.op_cx() {
             // Like stock's PASSIVE autocheckpoint, this pass runs on the commit
@@ -216992,6 +217022,99 @@ mod tests {
                 backfilled
             );
         });
+    }
+
+    #[test]
+    fn test_checkpoint_journal_size_limit_byte_boundaries() {
+        let page_size = PageSize::DEFAULT;
+        assert_eq!(page_size.get(), 4096);
+        // Eight SQLite WAL frames occupy 32 + 8 * (24 + 4096) bytes.
+        for (limit, exceeded) in [
+            (i64::MIN, false),
+            (-1, false),
+            (0, true),
+            (32_991, true),
+            (32_992, false),
+            (32_993, false),
+        ] {
+            assert_eq!(
+                Connection::checkpoint_journal_size_limit_exceeded(8, page_size, limit),
+                exceeded,
+                "journal_size_limit={limit}"
+            );
+        }
+        assert!(Connection::checkpoint_journal_size_limit_exceeded(
+            u64::MAX,
+            page_size,
+            i64::MAX,
+        ));
+    }
+
+    #[test]
+    fn test_checkpoint_journal_size_limit_pressure_retry_cadence() {
+        let mut snapshot = super::CheckpointRuntimeSnapshot {
+            active_txn_count: 0,
+            wal_autocheckpoint_pages: 4,
+            adaptive_autocheckpoint_target_pages: 6,
+            wal_frames_estimate: 8,
+            wal_unbackfilled_frames_estimate: 8,
+            frames_written_total: 8,
+            bytes_written_total: 32_992,
+            write_rate_frames_per_sec: 1024,
+            checkpoint_count: 1,
+            local_checkpoint_count: 1,
+            checkpoint_frames_backfilled_total: 0,
+            checkpoint_avg_duration_us: 0,
+            last_checkpoint_mode: None,
+            last_checkpoint_total_frames: 8,
+            last_checkpoint_frames_backfilled: 0,
+            last_checkpoint_duration_us: 0,
+            last_checkpoint_throughput_frames_per_sec: 0,
+            last_checkpoint_age_ms: 0,
+            urgent_wal_frames_threshold: 4000,
+            low_activity_txn_threshold: 0,
+            write_pressure_frames_per_sec: 512,
+        };
+        // A reader pinned the previous attempt. The cap permits another try
+        // exactly one adaptive interval later, not after every intervening
+        // commit; without a cap the ordinary pressure policy still defers.
+        for (frames, delayed) in [(8, true), (13, true), (14, false)] {
+            snapshot.wal_frames_estimate = frames;
+            snapshot.wal_unbackfilled_frames_estimate = frames;
+            assert_eq!(
+                Connection::checkpoint_should_delay_for_write_pressure(&snapshot, true),
+                delayed,
+                "frames={frames}"
+            );
+            assert!(Connection::checkpoint_should_delay_for_write_pressure(
+                &snapshot,
+                false,
+            ));
+        }
+
+        // A reset WAL must not inherit the previous generation's watermark.
+        snapshot.wal_frames_estimate = 6;
+        snapshot.wal_unbackfilled_frames_estimate = 6;
+        assert!(!Connection::checkpoint_should_delay_for_write_pressure(
+            &snapshot,
+            true,
+        ));
+
+        snapshot.last_checkpoint_total_frames = 3999;
+        snapshot.wal_frames_estimate = 3999;
+        snapshot.wal_unbackfilled_frames_estimate = 3999;
+        assert!(Connection::checkpoint_should_delay_for_write_pressure(
+            &snapshot,
+            true,
+        ));
+        snapshot.wal_frames_estimate = 4000;
+        snapshot.wal_unbackfilled_frames_estimate = 4000;
+        for exceeded in [false, true] {
+            assert!(!Connection::checkpoint_should_delay_for_write_pressure(
+                &snapshot,
+                exceeded,
+            ));
+        }
     }
 
     #[test]

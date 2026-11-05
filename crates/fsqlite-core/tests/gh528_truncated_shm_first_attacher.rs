@@ -320,6 +320,32 @@ fn writable_open_rebuilds_a_truncated_shm_and_keeps_committing() {
     });
 }
 
+/// bd-7do1d: a second connection must never access a cached mapping past
+/// the new EOF. Keep the first connection alive in a child so the cache is
+/// definitely populated, and so a SIGBUS is a bounded test failure.
+#[test]
+fn reopen_with_a_live_cached_mapping_survives_shm_truncation() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("cached-truncated.db");
+        let wal = stage_wal_frames(&db).await;
+        let mut reader = ChildProcess::spawn("frank-cached-truncated", &db);
+        assert_eq!(reader.witness("cached"), ROWS.to_string());
+        // Truncate from another process: opening and closing a second SHM
+        // descriptor in the child would release its process-wide POSIX locks.
+        std::fs::write(sidecar(&db, "-shm"), b"live-sidecar").expect("truncate cached -shm");
+        reader.signal("reopen");
+        reader.witness("survived");
+        reader.wait_success();
+        assert_eq!(
+            std::fs::read(sidecar(&db, "-wal")).expect("read WAL"),
+            wal,
+            "recovering the index must not alter committed WAL bytes"
+        );
+        assert_read_only_recovers(&db, &wal, "cached mapping after truncation").await;
+    });
+}
+
 #[test]
 fn plain_read_only_open_rebuilds_an_interrupted_reconstruction() {
     asupersync::test_utils::run_test(|| async {
@@ -591,6 +617,36 @@ fn gh528_child_process() {
                 let rows = read_with_busy_retry(&db).await;
                 assert_eq!(rows, expected_rows());
                 witness("rows", &rows.len().to_string());
+            });
+        }
+        "frank-cached-truncated" => {
+            asupersync::test_utils::run_test(|| async {
+                let first = Connection::open(db.to_str().expect("utf-8 path"))
+                    .await
+                    .expect("open first connection");
+                assert_eq!(
+                    read_rows(&first).await.expect("cache index"),
+                    expected_rows()
+                );
+                witness("cached", &ROWS.to_string());
+                expect_line("reopen");
+                match Connection::open(db.to_str().expect("utf-8 path")).await {
+                    Ok(second) => {
+                        assert_eq!(
+                            read_rows(&second).await.expect("reopened rows"),
+                            expected_rows()
+                        );
+                        second
+                            .close_without_checkpoint()
+                            .await
+                            .expect("close second");
+                    }
+                    // Recovery can be fenced by the still-attached owner.
+                    // A retryable refusal is valid; a crashed process is not.
+                    Err(error) => assert!(error.is_transient(), "reopen failed: {error:?}"),
+                }
+                first.close_without_checkpoint().await.expect("close first");
+                witness("survived", "");
             });
         }
         other => panic!("unknown child role {other}"),
