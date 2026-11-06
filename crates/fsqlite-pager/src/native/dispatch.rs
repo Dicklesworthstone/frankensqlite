@@ -53,6 +53,7 @@ trait ErasedNativeTransaction: Send {
     fn pending_conflict_pages(&self) -> Result<Vec<PageNumber>>;
     fn pending_conflict_pages_conservative(&self) -> Vec<PageNumber>;
     fn write_set_page_numbers(&self) -> Vec<PageNumber>;
+    fn is_page_dirty(&self, page: PageNumber) -> bool;
     fn page_one_in_pending_commit_surface(&self) -> Result<bool>;
     fn page_size(&self) -> PageSize;
     fn allocate_page_requires_page_one_conflict_tracking(&self) -> Result<bool>;
@@ -133,6 +134,7 @@ where
         TransactionHandle::pending_conflict_pages_conservative(self)
     }
     fn write_set_page_numbers(&self) -> Vec<PageNumber> { TransactionHandle::write_set_page_numbers(self) }
+    fn is_page_dirty(&self, page: PageNumber) -> bool { TransactionHandle::is_page_dirty(self, page) }
     fn page_one_in_pending_commit_surface(&self) -> Result<bool> {
         TransactionHandle::page_one_in_pending_commit_surface(self)
     }
@@ -288,6 +290,7 @@ impl TransactionHandle for NativeTransactionDispatch {
         self.inner.pending_conflict_pages_conservative()
     }
     fn write_set_page_numbers(&self) -> Vec<PageNumber> { self.inner.write_set_page_numbers() }
+    fn is_page_dirty(&self, page: PageNumber) -> bool { self.inner.is_page_dirty(page) }
     fn page_one_in_pending_commit_surface(&self) -> Result<bool> {
         self.inner.page_one_in_pending_commit_surface()
     }

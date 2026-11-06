@@ -521,3 +521,108 @@ fn only_uncompiled_set_subqueries_run_row_by_row() {
         assert!(wrong.is_empty(), "routing:\n{}", wrong.join("\n"));
     });
 }
+
+/// bd-ew10g: a SET probe must observe earlier writes by the UPDATE's other
+/// cursor, including when the probe lands on the same physical row again.
+#[test]
+fn update_self_read_probes_see_preceding_writes() {
+    const SETUP: &str = "DROP TABLE IF EXISTS c; \
+        CREATE TABLE c(id INTEGER PRIMARY KEY, k INTEGER, x); \
+        CREATE INDEX c_k ON c(k); \
+        INSERT INTO c VALUES (1, 1, 1), (2, 2, 2), (3, 3, 3), (4, 4, 4);";
+    const UPDATES: &[&str] = &[
+        "UPDATE c SET x = 10 + EXISTS (SELECT 1 FROM c AS c2 \
+         WHERE c2.id = c.id - 1 AND c2.x >= 10)",
+        "UPDATE c SET x = 10 + (SELECT c2.x FROM c AS c2 WHERE c2.id = c.id - 1)",
+        "UPDATE c SET x = 10 + EXISTS (SELECT 1 FROM c AS c2 \
+         WHERE c2.id < c.id AND c2.x >= 10)",
+        "UPDATE c SET x = 10 + EXISTS (SELECT 1 FROM c AS c2 \
+         WHERE c2.k = c.k - 1 AND c2.x >= 10)",
+        "UPDATE c SET x = 10 + (SELECT c2.x FROM c AS c2 WHERE c2.k = c.k - 1)",
+        "UPDATE c SET x = 10 + EXISTS (SELECT 1 FROM c AS c2 \
+         WHERE c2.id = c.id - 1 AND c2.x >= 10) WHERE id > 1",
+        "UPDATE c SET x = 10 + (SELECT c2.x FROM c AS c2 \
+         WHERE c2.id = c.id - c.id + 1)",
+    ];
+    asupersync::test_utils::run_test(|| async {
+        let mut diffs = Vec::new();
+        for file_backed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (f, r) = open_pair(file_backed, &dir).await;
+            f.set_fallback_capture_enabled(true);
+            for explicit_transaction in [false, true] {
+                for prepared in [false, true] {
+                    for sql in UPDATES {
+                        f.execute_batch(SETUP).await.unwrap();
+                        r.execute_batch(SETUP).unwrap();
+                        if explicit_transaction {
+                            f.execute("BEGIN IMMEDIATE").await.unwrap();
+                            r.execute("BEGIN IMMEDIATE", []).unwrap();
+                        }
+                        f.reset_fallback_decision_evidence();
+                        let frank = if prepared {
+                            f.prepare(sql).await.unwrap().execute().await.unwrap()
+                        } else {
+                            f.execute(sql).await.unwrap()
+                        };
+                        let stock = r.execute(sql, []).unwrap();
+                        let query = "SELECT id, k, x FROM c ORDER BY id";
+                        let actual = fq(&f, query).await;
+                        let expected = rq(&r, query);
+                        if frank != stock || actual != expected {
+                            diffs.push(format!(
+                                "[file={file_backed}, transaction={explicit_transaction}, \
+                                 prepared={prepared}] `{sql}`: changes {frank}/{stock}, \
+                                 fsqlite={actual:?}, stock={expected:?}"
+                            ));
+                        }
+                        assert!(
+                            !f.fallback_decision_snapshot()
+                                .decisions
+                                .iter()
+                                .any(|decision| {
+                                    decision.decision_reason
+                                        == "update_row_by_row_correlated_set_fallback"
+                                }),
+                            "supported self-read must retain its compiled UPDATE: {sql}"
+                        );
+                        if explicit_transaction {
+                            f.execute("COMMIT").await.unwrap();
+                            r.execute("COMMIT", []).unwrap();
+                        }
+                    }
+                }
+            }
+            f.close().await.unwrap();
+        }
+        assert!(
+            diffs.is_empty(),
+            "self-read divergence(s):\n{}",
+            diffs.join("\n")
+        );
+    });
+}
+
+#[test]
+fn update_trigger_probe_sees_preceding_writes() {
+    const SETUP: &str = "CREATE TABLE c(id INTEGER PRIMARY KEY, x); \
+        INSERT INTO c VALUES (1, 1), (2, 2), (3, 3), (4, 4); \
+        CREATE TABLE seen(id, preceding_x); \
+        CREATE TRIGGER c_au AFTER UPDATE ON c BEGIN \
+          INSERT INTO seen VALUES (new.id, \
+            (SELECT c2.x FROM c AS c2 WHERE c2.id = new.id - 1)); \
+        END;";
+    asupersync::test_utils::run_test(|| async {
+        for file_backed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (f, r) = open_pair(file_backed, &dir).await;
+            f.execute_batch(SETUP).await.unwrap();
+            r.execute_batch(SETUP).unwrap();
+            let sql = "UPDATE c SET x = x + 10";
+            assert_eq!(f.execute(sql).await.unwrap(), r.execute(sql, []).unwrap());
+            let query = "SELECT id, preceding_x FROM seen ORDER BY id";
+            assert_eq!(fq(&f, query).await, rq(&r, query), "file={file_backed}");
+            f.close().await.unwrap();
+        }
+    });
+}

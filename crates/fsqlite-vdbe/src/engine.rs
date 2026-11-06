@@ -3702,10 +3702,10 @@ impl PageReader for SharedTxnPageIo {
     }
 
     fn is_dirty(&self, page_no: PageNumber) -> bool {
-        if let Some(ctx) = self.concurrent_context() {
-            return ctx.handle.lock().tracks_write_conflict_page(page_no);
-        }
-        false
+        // bd-ew10g: every cursor shares the pager's staged writes, even in
+        // transactions without a concurrent context. Conflict membership is
+        // not a dirty-page oracle (metadata writes can also be exempt).
+        self.txn.borrow().is_page_dirty(page_no)
     }
 }
 
@@ -24262,6 +24262,105 @@ mod tests {
         assert_eq!(thread_decode_cache_misses(), 2);
 
         set_vdbe_metrics_enabled(prev_metrics_enabled);
+    }
+
+    #[test]
+    fn test_storage_cursor_probe_observes_other_cursor_same_slot_write() {
+        use std::path::Path;
+
+        use fsqlite_pager::{MvccPager as _, SimplePager, TransactionMode};
+        use fsqlite_vfs::MemoryVfs;
+
+        let cx = Cx::new();
+        let pager = run_async(SimplePager::open_with_cx(
+            &cx,
+            MemoryVfs::new(),
+            Path::new("/peer_cursor_self_read.db"),
+            PageSize::DEFAULT,
+        ))
+        .unwrap();
+        let mut seed = run_async(pager.begin(&cx, TransactionMode::Immediate)).unwrap();
+        let root_page = run_async(seed.allocate_page(&cx)).unwrap();
+        let root = i32::try_from(root_page.get()).unwrap();
+        let mut engine = VdbeEngine::new(2);
+        engine.set_transaction(seed);
+        assert!(run_async(engine.open_storage_cursor(0, root, true)).unwrap());
+        {
+            let writer = engine.storage_cursors.get_mut(&0).unwrap();
+            for (rowid, value) in [(1, "alpha"), (2, "bravo")] {
+                let payload = encode_record(&[SqliteValue::Text(value.into())]);
+                run_async(writer.cursor.table_insert(&writer.cx, rowid, &payload)).unwrap();
+            }
+        }
+        let mut seed = engine.take_transaction().unwrap().unwrap();
+        run_async(seed.commit(&cx)).unwrap();
+
+        // Start with a committed page so rolling back the later rewrite
+        // removes it from the write set instead of restoring a staged image.
+        let mut txn = run_async(pager.begin(&cx, TransactionMode::Immediate)).unwrap();
+        txn.savepoint(&cx, "before_write").unwrap();
+        assert!(txn.write_set_page_numbers().is_empty());
+        engine.set_transaction(txn);
+        assert!(run_async(engine.open_storage_cursor(0, root, true)).unwrap());
+        assert!(run_async(engine.open_storage_cursor(1, root, false)).unwrap());
+        {
+            let reader = engine.storage_cursors.get_mut(&1).unwrap();
+            assert!(run_async(reader.cursor.table_move_to(&reader.cx, 1)).unwrap().is_found());
+        }
+        assert_eq!(
+            run_async(engine.cursor_column(1, 0)).unwrap(),
+            SqliteValue::Text("alpha".into())
+        );
+
+        // Change the bytes without moving the reader or the row's physical
+        // cell. Its B-tree page image and its decoded column cache both need
+        // to follow the shared transaction's new image on the next probe.
+        {
+            let writer = engine.storage_cursors.get_mut(&0).unwrap();
+            assert!(run_async(writer.cursor.table_move_to(&writer.cx, 1)).unwrap().is_found());
+            let payload = encode_record(&[SqliteValue::Text("omega".into())]);
+            assert!(
+                run_async(writer.cursor.table_overwrite_current_payload_same_size_no_overflow(
+                    &writer.cx,
+                    1,
+                    &payload,
+                ))
+                .unwrap()
+            );
+        }
+        {
+            let reader = engine.storage_cursors.get_mut(&1).unwrap();
+            assert!(run_async(reader.cursor.table_move_to(&reader.cx, 1)).unwrap().is_found());
+            assert_eq!(
+                parse_record(&run_async(reader.cursor.payload(&reader.cx)).unwrap()).unwrap(),
+                vec![SqliteValue::Text("omega".into())],
+                "the B-tree probe must discard its old page image"
+            );
+        }
+        assert_eq!(
+            run_async(engine.cursor_column(1, 0)).unwrap(),
+            SqliteValue::Text("omega".into()),
+            "a fresh image in the same cell must invalidate decoded values"
+        );
+
+        {
+            let page_io = engine.txn_page_io.as_ref().unwrap();
+            let mut txn = page_io.txn.borrow_mut();
+            txn.rollback_to_savepoint(&cx, "before_write").unwrap();
+            assert!(txn.write_set_page_numbers().is_empty());
+            txn.release_savepoint(&cx, "before_write").unwrap();
+        }
+        {
+            let reader = engine.storage_cursors.get_mut(&1).unwrap();
+            assert!(run_async(reader.cursor.table_move_to(&reader.cx, 1)).unwrap().is_found());
+        }
+        assert_eq!(
+            run_async(engine.cursor_column(1, 0)).unwrap(),
+            SqliteValue::Text("alpha".into()),
+            "a reader retained across rollback must discard the uncommitted row image"
+        );
+        let mut txn = engine.take_transaction().unwrap().unwrap();
+        run_async(txn.rollback(&cx)).unwrap();
     }
 
     #[test]

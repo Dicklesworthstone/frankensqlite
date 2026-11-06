@@ -15073,6 +15073,7 @@ where
                     is_writer: eager_writer,
                     committed: false,
                     finished: false,
+                    cursor_cache_reuse_disabled: false,
                     original_db_size,
                     savepoint_stack: Vec::new(),
                     savepoint_journal: SavepointJournal::default(),
@@ -15313,6 +15314,7 @@ where
                 is_writer: eager_writer,
                 committed: false,
                 finished: false,
+                cursor_cache_reuse_disabled: false,
                 original_db_size,
                 savepoint_stack: Vec::new(),
                 savepoint_journal: SavepointJournal::default(),
@@ -21475,6 +21477,11 @@ where
     is_writer: bool,
     committed: bool,
     finished: bool,
+    /// A savepoint rollback can restore a page to clean while live cursors
+    /// still cache its discarded image. Keep this fence for the handle's
+    /// lifetime, including retained commits: the pager cannot retire those
+    /// cursor images itself.
+    cursor_cache_reuse_disabled: bool,
     original_db_size: u32,
     /// Stack of savepoints, pushed on SAVEPOINT and popped on RELEASE.
     savepoint_stack: Vec<SavepointEntry>,
@@ -29053,6 +29060,14 @@ where
         self.write_pages_sorted.clone()
     }
 
+    fn is_page_dirty(&self, page_no: PageNumber) -> bool {
+        self.finished
+            || self.cursor_cache_reuse_disabled
+            || self.has_pending_recovery_barrier()
+            || self.write_set.contains_key(&page_no)
+            || self.contains_freed_page(page_no)
+    }
+
     fn page_size(&self) -> PageSize {
         PageSize::new(u32::try_from(self.pool.page_size()).expect("pool page size fits u32"))
             .expect("pool page size invariant")
@@ -29492,6 +29507,7 @@ where
         // writes_observed should stay consistent with that.
         self.write_set = new_write_set;
         self.write_pages_sorted = restored_sorted;
+        self.cursor_cache_reuse_disabled = true;
         self.accounted_write_pages = snapshot.accounted_write_pages;
         self.write_set_current_pages
             .store(self.accounted_write_pages.len(), AtomicOrdering::Relaxed);

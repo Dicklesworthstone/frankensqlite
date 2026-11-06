@@ -1367,6 +1367,17 @@ pub trait TransactionHandle: sealed::Sealed + Send {
         Vec::new()
     }
 
+    /// Whether a cached page image may be stale because of transaction-local
+    /// writes, frees, savepoint rollback, or a pending recovery barrier.
+    ///
+    /// This is a page-visibility query, independent of MVCC conflict tracking.
+    /// A `false` result permits a B-tree cursor to reuse its cached image
+    /// without calling `get_page`. Implementations without precise dirty-page
+    /// information must retain the conservative default.
+    fn is_page_dirty(&self, _page_no: PageNumber) -> bool {
+        true
+    }
+
     /// Whether page 1 is currently part of this transaction's pending commit
     /// surface, including commit-time allocator/header synthesis.
     fn page_one_in_pending_commit_surface(&self) -> Result<bool> {
@@ -2257,6 +2268,10 @@ impl TransactionHandle for TransactionKind {
 
     fn write_set_page_numbers(&self) -> Vec<PageNumber> {
         dispatch_transaction_kind!(self, txn => txn.write_set_page_numbers())
+    }
+
+    fn is_page_dirty(&self, page_no: PageNumber) -> bool {
+        dispatch_transaction_kind!(self, txn => txn.is_page_dirty(page_no))
     }
 
     fn page_one_in_pending_commit_surface(&self) -> Result<bool> {

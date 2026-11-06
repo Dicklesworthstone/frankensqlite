@@ -505,6 +505,10 @@ impl<T: TransactionHandle + ?Sized> PageReader for TransactionPageIo<'_, T> {
     fn prefetch_page_hint(&self, cx: &Cx, page_no: PageNumber) {
         self.txn.prefetch_page_hint(cx, page_no);
     }
+
+    fn is_dirty(&self, page_no: PageNumber) -> bool {
+        self.txn.is_page_dirty(page_no)
+    }
 }
 
 impl<T: TransactionHandle + ?Sized> PageWriter for TransactionPageIo<'_, T> {
@@ -1334,6 +1338,7 @@ pub struct CursorPositionStamp {
     page_no: u32,
     cell_idx: u16,
     row_image_epoch: u64,
+    page_image_token: u64,
 }
 
 impl CursorPositionStamp {
@@ -2393,10 +2398,11 @@ impl<P> BtCursor<P> {
         self.root_page
     }
 
-    /// Lightweight identity for the cursor's current logical position.
+    /// Lightweight identity for the cursor's current row image.
     ///
     /// Used by the VDBE to cache decoded row state while the cursor remains
-    /// on the same leaf cell.
+    /// on the same leaf cell and page image. Another cursor can replace that
+    /// image without moving this cursor or advancing its own mutation epoch.
     #[must_use]
     pub fn position_stamp(&self) -> Option<CursorPositionStamp> {
         if self.at_eof {
@@ -2407,6 +2413,7 @@ impl<P> BtCursor<P> {
             page_no: entry.page_no.get(),
             cell_idx: entry.cell_idx,
             row_image_epoch: self.row_image_epoch,
+            page_image_token: entry.page_data.image_token(),
         })
     }
 

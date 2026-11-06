@@ -507,6 +507,10 @@ impl TransactionHandle for MemorySnapshotTransaction<'_> {
         self.inner.write_set_page_numbers()
     }
 
+    fn is_page_dirty(&self, page_no: PageNumber) -> bool {
+        self.ensure_editable().is_err() || self.inner.is_page_dirty(page_no)
+    }
+
     fn page_one_in_pending_commit_surface(&self) -> Result<bool> {
         self.ensure_editable()?;
         self.inner.page_one_in_pending_commit_surface()

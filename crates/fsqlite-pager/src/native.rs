@@ -109,6 +109,7 @@ impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativePager<S, M, C> {
             shared: Arc::clone(&self.shared), transaction: RefCell::new(transaction),
             mode, snapshot, dirty: Vec::new(), savepoints: Vec::new(),
             was_writer: false, owns_slot: true, acknowledgement: None,
+            cursor_cache_reuse_disabled: false,
         })
     }
 
@@ -293,6 +294,10 @@ pub struct NativeTransaction<S: VfsFile, M: VfsFile, C: NativeObjectCodec> {
     was_writer: bool,
     owns_slot: bool,
     acknowledgement: Option<DurableCommitAcknowledgement>,
+    /// Restored clean pages can still have discarded images in live cursors.
+    /// Once a savepoint rolls back, keep cache reuse fenced until this handle
+    /// retires; releasing the savepoint does not retire those cursor images.
+    cursor_cache_reuse_disabled: bool,
 }
 
 impl<S: VfsFile, M: VfsFile, C: NativeObjectCodec> NativeTransaction<S, M, C> {
@@ -470,6 +475,11 @@ where
     fn published_visible_commit_seq_hint(&self) -> Option<CommitSeq> { Some(self.snapshot) }
     fn pending_commit_pages(&self) -> Result<Vec<PageNumber>> { Ok(self.dirty.clone()) }
     fn write_set_page_numbers(&self) -> Vec<PageNumber> { self.dirty.clone() }
+    fn is_page_dirty(&self, page_no: PageNumber) -> bool {
+        self.active().is_err()
+            || self.cursor_cache_reuse_disabled
+            || self.dirty.binary_search(&page_no).is_ok()
+    }
     fn page_size(&self) -> PageSize { self.shared.page_size }
 
     fn allocate_page_requires_page_one_conflict_tracking(&self) -> Result<bool> {
@@ -526,6 +536,7 @@ where
         let store = self.shared.read()?;
         store.rollback_to(self.transaction.get_mut(), &self.savepoints[index].marker)?;
         self.dirty = dirty;
+        self.cursor_cache_reuse_disabled = true;
         self.savepoints.truncate(index + 1);
         Ok(())
     }
@@ -639,6 +650,7 @@ mod tests {
         run(async {
             let cx = Cx::new(); let vfs = MemoryVfs::new(); let owner = pager(&vfs, &cx);
             let mut txn = owner.begin(&cx, TransactionMode::Concurrent).unwrap();
+            assert!(!txn.is_page_dirty(page(2)));
             txn.savepoint(&cx, "point").unwrap();
             txn.write_page(&cx, page(3), &[3; 512]).await.unwrap();
             txn.savepoint(&cx, "point").unwrap(); // Shadowing resolves the inner marker.
@@ -651,6 +663,11 @@ mod tests {
             txn.release_savepoint(&cx, "point").unwrap();
             txn.rollback_to_savepoint(&cx, "point").unwrap();
             assert!(!txn.has_pending_writes()); assert!(txn.is_writer());
+            assert!(txn.get_page(&cx, page(3)).await.is_err());
+            assert!(
+                txn.is_page_dirty(page(3)),
+                "a cursor must not reuse the discarded page after dirty membership is restored"
+            );
             let mut peer = owner.begin(&cx, TransactionMode::Concurrent).unwrap();
             peer.write_page(&cx, page(2), &[9; 512]).await.unwrap();
             peer.commit_at(&cx, 100).await.unwrap();

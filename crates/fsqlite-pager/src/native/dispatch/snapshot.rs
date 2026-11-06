@@ -202,6 +202,7 @@ impl TransactionHandle for NativeSnapshotTransaction {
     fn published_visible_commit_seq_hint(&self) -> Option<CommitSeq> { Some(self.snapshot.commit_seq()) }
     fn pending_commit_pages(&self) -> Result<Vec<PageNumber>> { Ok(Vec::new()) }
     fn write_set_page_numbers(&self) -> Vec<PageNumber> { Vec::new() }
+    fn is_page_dirty(&self, _page: PageNumber) -> bool { self.active().is_err() }
     fn page_size(&self) -> PageSize { self.page_size }
     fn allocate_page_requires_page_one_conflict_tracking(&self) -> Result<bool> { self.refuse_write() }
     fn free_page_requires_page_one_conflict_tracking(&self, _page: PageNumber) -> Result<bool> { self.refuse_write() }
@@ -296,6 +297,7 @@ impl ErasedNativeTransaction for NativeSnapshotTransaction {
         TransactionHandle::pending_conflict_pages_conservative(self)
     }
     fn write_set_page_numbers(&self) -> Vec<PageNumber> { TransactionHandle::write_set_page_numbers(self) }
+    fn is_page_dirty(&self, page: PageNumber) -> bool { TransactionHandle::is_page_dirty(self, page) }
     fn page_one_in_pending_commit_surface(&self) -> Result<bool> {
         TransactionHandle::page_one_in_pending_commit_surface(self)
     }
