@@ -4,10 +4,9 @@
 //! RETURNING with `emit_scalar_subquery` / `emit_exists_subquery`, which scan
 //! one base table, so a subquery over a join, a view, an OFFSET and the other
 //! bd-h7hox shapes returned 0 or NULL. Such a statement now runs row by row
-//! and reads each row's RETURNING through the SELECT path: an UPDATE once the
-//! row has changed, where stock evaluates RETURNING (so a subquery sees the
-//! rows changed so far, this one included), a DELETE just before the row is
-//! removed.
+//! and evaluates RETURNING against a frozen affected-row image after the
+//! mutation and FK actions, before AFTER triggers. Subqueries see rows
+//! changed so far; a DELETE's column image remains available after removal.
 //!
 //! Every statement runs alone on a fresh target and is compared with
 //! rusqlite's bundled SQLite: the RETURNING rows in order, `changes()`, the
@@ -16,10 +15,8 @@
 //! BEFORE UPDATE trigger, and a parent with a cascading child under foreign
 //! keys. In memory and in a file, ad hoc and prepared.
 //!
-//! Not covered (the statement keeps the compiled lane, still wrong for these
-//! subqueries): an UPDATE with AFTER UPDATE triggers, whose RETURNING stock
-//! evaluates before them; a DELETE with DELETE triggers; an UPDATE that
-//! assigns the row key.
+//! The timing matrix also covers AFTER UPDATE triggers, DELETE triggers,
+//! changed row keys, DELETE self-reads, and cascaded children (bd-7ovcv).
 
 use fsqlite_core::connection::Connection;
 use fsqlite_types::value::SqliteValue;
@@ -291,14 +288,18 @@ async fn open_pair(
     (f, r)
 }
 
-async fn compare(file_backed: bool) -> (Vec<String>, usize) {
+async fn compare(
+    file_backed: bool,
+    targets: &[(&str, &str, &str)],
+    statements: &[(&str, &[i64])],
+) -> (Vec<String>, usize) {
     let dir = tempfile::tempdir().unwrap();
     let (f, r) = open_pair(file_backed, &dir).await;
     let db = if file_backed { "file" } else { "memory" };
     let mut diffs = Vec::new();
     let mut runs = 0usize;
-    for (target, ddl, after_fill) in TARGETS {
-        for (sql, params) in STATEMENTS {
+    for (target, ddl, after_fill) in targets {
+        for (sql, params) in statements {
             for prepared in [false, true] {
                 runs += 1;
                 for setup in [RESET, *ddl, FILL, *after_fill] {
@@ -336,8 +337,8 @@ async fn compare(file_backed: bool) -> (Vec<String>, usize) {
 #[test]
 fn returning_correlated_subqueries_match_stock() {
     asupersync::test_utils::run_test(|| async {
-        let (mut diffs, mut runs) = compare(false).await;
-        let (file_diffs, file_runs) = compare(true).await;
+        let (mut diffs, mut runs) = compare(false, TARGETS, STATEMENTS).await;
+        let (file_diffs, file_runs) = compare(true, TARGETS, STATEMENTS).await;
         diffs.extend(file_diffs);
         runs += file_runs;
         assert!(
@@ -349,7 +350,82 @@ fn returning_correlated_subqueries_match_stock() {
     });
 }
 
-/// Only RETURNING the compiled scan cannot answer runs row by row.
+/// RETURNING keeps the affected row's column image while its subqueries see
+/// the mutation and foreign-key actions, before that row's AFTER triggers.
+#[test]
+fn returning_observes_mutation_before_after_triggers() {
+    let targets = [
+        TARGETS[0],
+        TARGETS[1],
+        TARGETS[2],
+        TARGETS[3],
+        TARGETS[4],
+        (
+            "after update trigger",
+            "CREATE TABLE u(id INTEGER PRIMARY KEY, v TEXT, g INTEGER, n INTEGER);\
+             CREATE TRIGGER u_au AFTER UPDATE ON u BEGIN \
+               INSERT INTO log VALUES (new.id, old.n, new.n); END;",
+            PLAIN_CHILD,
+        ),
+        (
+            "delete triggers",
+            "CREATE TABLE u(id INTEGER PRIMARY KEY, v TEXT, g INTEGER, n INTEGER);\
+             CREATE TRIGGER u_bd BEFORE DELETE ON u BEGIN \
+               INSERT INTO log VALUES (-old.id, old.n, NULL); END;\
+             CREATE TRIGGER u_ad AFTER DELETE ON u BEGIN \
+               INSERT INTO log VALUES (old.id, old.n, NULL); END;",
+            PLAIN_CHILD,
+        ),
+    ];
+    let statements: &[(&str, &[i64])] = &[
+        (
+            "UPDATE u SET n = n + 100 WHERE id IN (2,3,4) RETURNING *, \
+             EXISTS (SELECT 1 FROM vu WHERE vu.id = u.id AND vu.n >= 100), \
+             (SELECT count(*) FROM log WHERE log.id <= u.id)",
+            &[],
+        ),
+        (
+            "UPDATE u SET id = id + ?1 WHERE id BETWEEN ?2 AND ?3 RETURNING id, n, \
+             EXISTS (SELECT 1 FROM vu WHERE vu.id = u.id), \
+             (SELECT count(*) FROM uc WHERE uc.uid = u.id)",
+            &[100, 2, 4],
+        ),
+        (
+            "DELETE FROM u WHERE id IN (4,8,12) RETURNING id, n, \
+             (SELECT count(*) FROM u AS z WHERE z.id = u.id), \
+             (SELECT count(*) FROM uc WHERE uc.uid = u.id), \
+             (SELECT count(*) FROM log WHERE log.id <= u.id), \
+             (SELECT count(*) FROM vu WHERE vu.id >= u.id)",
+            &[],
+        ),
+        (
+            "DELETE FROM u WHERE id BETWEEN ?1 AND ?2 RETURNING *, \
+             (SELECT count(*) FROM u AS z WHERE z.id = u.id), \
+             (SELECT count(*) FROM uc WHERE uc.uid = u.id)",
+            &[3, 5],
+        ),
+        (
+            "DELETE FROM u WHERE id = 4 RETURNING id, \
+             EXISTS (SELECT 1 FROM vu WHERE vu.id = u.id), \
+             (SELECT count(*) FROM log WHERE log.id = u.id OR log.id = -u.id)",
+            &[],
+        ),
+    ];
+    asupersync::test_utils::run_test(|| async {
+        let (mut diffs, mut runs) = compare(false, &targets, statements).await;
+        let (file_diffs, file_runs) = compare(true, &targets, statements).await;
+        diffs.extend(file_diffs);
+        runs += file_runs;
+        assert!(
+            diffs.is_empty(),
+            "{} divergence(s) over {runs} statement run(s) from rusqlite:\n{}",
+            diffs.len(),
+            diffs.join("\n")
+        );
+    });
+}
+
+/// Unaffected supported probes retain their compiled RETURNING path.
 #[test]
 fn only_uncompiled_returning_subqueries_run_row_by_row() {
     const ROW_BY_ROW: [&str; 2] = [
@@ -366,6 +442,8 @@ fn only_uncompiled_returning_subqueries_run_row_by_row() {
         "UPDATE u SET n = n + 1 WHERE id < 4 RETURNING id, n, \
          (SELECT count(*) FROM t AS x WHERE x.g = u.g)",
         "DELETE FROM u WHERE id < 4 RETURNING id",
+        "DELETE FROM u WHERE id < 4 RETURNING id, \
+         (SELECT count(*) FROM t AS x WHERE x.g = u.g)",
         "UPDATE u SET n = 0 WHERE id < 4 RETURNING id, (SELECT count(*) FROM vt)",
     ];
     asupersync::test_utils::run_test(|| async {

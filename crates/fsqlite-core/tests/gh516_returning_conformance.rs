@@ -5,6 +5,10 @@
 //! ignored dispatch probe is an acceptance test for the compiled-row candidate,
 //! not a requirement that the unmodified main branch already has that candidate.
 //! All SQLite oracle connections use separate databases from FrankenSQLite.
+//!
+//! The correlated UPDATE/DELETE cases also cover the frozen RETURNING row:
+//! hidden rowids, declared comparison metadata, changed primary keys, and
+//! statement rollback when evaluating the projection fails.
 
 use std::sync::{Arc, Mutex};
 
@@ -33,6 +37,26 @@ fn stock_rows(db: &rusqlite::Connection, sql: &str) -> rusqlite::Result<Vec<Vec<
             (0..width).map(|i| row.get_ref(i).map(stock_value)).collect()
         })?
         .collect()
+}
+
+fn stock_unbound_rows(
+    db: &rusqlite::Connection,
+    sql: &str,
+) -> rusqlite::Result<Vec<Vec<SqliteValue>>> {
+    let mut statement = db.prepare(sql)?;
+    let width = statement.column_count();
+    // raw_query leaves placeholders unbound, matching native query()'s NULL
+    // bindings. query_map([]) would reject a parameterized statement itself.
+    let mut rows = statement.raw_query();
+    let mut result = Vec::new();
+    while let Some(row) = rows.next()? {
+        result.push(
+            (0..width)
+                .map(|i| row.get_ref(i).map(stock_value))
+                .collect::<rusqlite::Result<_>>()?,
+        );
+    }
+    Ok(result)
 }
 
 fn assert_rows(actual: &[Row], expected: &[Vec<SqliteValue>], label: &str) {
@@ -230,5 +254,282 @@ fn returning_compiled_candidate_avoids_row_redispatch() {
                 native.close().await.unwrap();
             }
         }
+    });
+}
+
+async fn compare_correlated_dml_returning(
+    label: &str,
+    setup: &str,
+    sql: &str,
+    succeeds: bool,
+    checks: &[&str],
+) {
+    for file_backed in [false, true] {
+        for prepared in [false, true] {
+            let directory = tempfile::tempdir().expect("separate RETURNING databases");
+            let native_path = if file_backed {
+                directory
+                    .path()
+                    .join("native.db")
+                    .to_str()
+                    .unwrap()
+                    .to_owned()
+            } else {
+                ":memory:".to_owned()
+            };
+            let native = Connection::open(&native_path).await.unwrap();
+            let stock = if file_backed {
+                rusqlite::Connection::open(directory.path().join("stock.db")).unwrap()
+            } else {
+                rusqlite::Connection::open_in_memory().unwrap()
+            };
+            if file_backed {
+                native.execute("PRAGMA journal_mode=WAL").await.unwrap();
+                stock.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+            }
+            let context = format!("{label}, file_backed={file_backed}, prepared={prepared}");
+            native.execute_batch(setup).await.unwrap_or_else(|error| {
+                panic!("native setup: {context}: {error}");
+            });
+            stock.execute_batch(setup).unwrap_or_else(|error| {
+                panic!("stock setup: {context}: {error}");
+            });
+
+            let expected = stock_unbound_rows(&stock, sql);
+            let actual = if prepared {
+                match native.prepare(sql).await {
+                    Ok(statement) => statement.query().await,
+                    Err(error) => Err(error),
+                }
+            } else {
+                native.query(sql).await
+            };
+            assert_eq!(
+                expected.is_ok(),
+                succeeds,
+                "invalid fixture: {context}: {expected:?}"
+            );
+            assert_eq!(
+                actual.is_ok(),
+                expected.is_ok(),
+                "{context}: native={actual:?}, stock={expected:?}",
+            );
+            if let (Ok(actual), Ok(expected)) = (actual, expected) {
+                assert_rows(&actual, &expected, &context);
+            }
+            for check in checks {
+                let actual = native.query(check).await.unwrap_or_else(|error| {
+                    panic!("native snapshot: {context}: {check}: {error}");
+                });
+                let expected = stock_rows(&stock, check).unwrap_or_else(|error| {
+                    panic!("stock snapshot: {context}: {check}: {error}");
+                });
+                assert_rows(&actual, &expected, &format!("{context}: {check}"));
+            }
+            native.close().await.unwrap();
+        }
+    }
+}
+
+#[test]
+fn correlated_returning_frozen_rowid_aliases_match_stock() {
+    asupersync::test_utils::run_test(|| async {
+        compare_correlated_dml_returning(
+            "unshadowed hidden rowid aliases",
+            "CREATE TABLE t(v TEXT);\
+             INSERT INTO t(rowid,v) VALUES(11,'a'),(23,'b'),(37,'c');\
+             CREATE TABLE ids(id INTEGER);\
+             INSERT INTO ids VALUES(11),(23),(37);\
+             CREATE VIEW id_view AS SELECT id FROM ids;",
+            "DELETE FROM t WHERE rowid < 30 RETURNING *,rowid,_rowid_,oid,\
+               (SELECT count(*) FROM id_view WHERE id_view.id=t.oid)",
+            true,
+            &["SELECT changes()", "SELECT rowid,* FROM t ORDER BY rowid"],
+        )
+        .await;
+        compare_correlated_dml_returning(
+            "declared rowid and _rowid_ shadow only their own names",
+            "CREATE TABLE t(rowid TEXT,_rowid_ TEXT,v TEXT);\
+             INSERT INTO t(oid,rowid,_rowid_,v) VALUES\
+               (11,'declared-a','other-a','a'),(23,'declared-b','other-b','b');\
+             CREATE TABLE ids(id INTEGER,label TEXT);\
+             INSERT INTO ids VALUES(11,'declared-a'),(23,'declared-b');\
+             CREATE VIEW id_view AS SELECT id,label FROM ids;",
+            "DELETE FROM t RETURNING *,rowid,_rowid_,oid,\
+               (SELECT count(*) FROM id_view WHERE id_view.id=t.oid \
+                  AND id_view.label=t.rowid)",
+            true,
+            &["SELECT changes()", "SELECT oid,* FROM t ORDER BY oid"],
+        )
+        .await;
+    });
+}
+
+#[test]
+fn correlated_returning_preserves_outer_column_metadata() {
+    asupersync::test_utils::run_test(|| async {
+        compare_correlated_dml_returning(
+            "frozen columns retain affinity and collation",
+            "CREATE TABLE t(id INTEGER PRIMARY KEY,word TEXT COLLATE NOCASE,\
+               number INTEGER,text_number TEXT,padded TEXT COLLATE RTRIM);\
+             INSERT INTO t VALUES(1,'Alpha',7,'5','tail '),(2,'bETA',9,'10','tail  ');\
+             CREATE TABLE keys(word TEXT COLLATE BINARY,number_text TEXT,raw_number);\
+             INSERT INTO keys VALUES('ALPHA','8',5),('BETA','10',10);\
+             CREATE VIEW key_view AS SELECT word,number_text,raw_number FROM keys;",
+            "UPDATE t SET number=number+1 RETURNING id,word='ALPHA',number='8',\
+               text_number=5,padded='tail',\
+               (SELECT count(*) FROM key_view AS k WHERE t.word=k.word),\
+               (SELECT count(*) FROM key_view AS k WHERE t.number=k.number_text),\
+               (SELECT count(*) FROM key_view AS k WHERE t.text_number=k.raw_number)",
+            true,
+            &["SELECT changes()", "SELECT * FROM t ORDER BY id"],
+        )
+        .await;
+    });
+}
+
+#[test]
+fn correlated_returning_uses_new_primary_keys() {
+    asupersync::test_utils::run_test(|| async {
+        compare_correlated_dml_returning(
+            "changed INTEGER PRIMARY KEY supplies every rowid alias",
+            "CREATE TABLE t(id INTEGER PRIMARY KEY,v TEXT);\
+             INSERT INTO t VALUES(1,'a'),(2,'b');\
+             CREATE TABLE ids(id INTEGER);\
+             INSERT INTO ids VALUES(11),(12);\
+             CREATE VIEW id_view AS SELECT id FROM ids;",
+            "UPDATE t SET id=id+10,v=v||'!' WHERE id<3 \
+             RETURNING *,rowid,_rowid_,oid,\
+               (SELECT count(*) FROM id_view WHERE id_view.id=t.id)",
+            true,
+            &["SELECT changes()", "SELECT * FROM t ORDER BY id"],
+        )
+        .await;
+        compare_correlated_dml_returning(
+            "changed WITHOUT ROWID composite key precedes AFTER trigger",
+            "CREATE TABLE t(a TEXT,b INTEGER,v TEXT,PRIMARY KEY(a,b)) WITHOUT ROWID;\
+             INSERT INTO t VALUES('a',1,'x'),('b',2,'y');\
+             CREATE TABLE ids(a TEXT,b INTEGER);\
+             INSERT INTO ids VALUES('a!',11),('b!',12);\
+             CREATE VIEW id_view AS SELECT a,b FROM ids;\
+             CREATE TABLE audit(a TEXT,b INTEGER);\
+             CREATE VIEW audit_view AS SELECT a,b FROM audit;\
+             CREATE TRIGGER au AFTER UPDATE ON t BEGIN \
+               INSERT INTO audit VALUES(NEW.a,NEW.b); END;",
+            "UPDATE t SET a=a||'!',b=b+10 WHERE b<3 RETURNING *,\
+               (SELECT count(*) FROM id_view AS k WHERE k.a=t.a AND k.b=t.b),\
+               (SELECT count(*) FROM audit_view AS l WHERE l.b<=t.b)",
+            true,
+            &[
+                "SELECT changes()",
+                "SELECT * FROM t ORDER BY a,b",
+                "SELECT * FROM audit ORDER BY rowid",
+            ],
+        )
+        .await;
+    });
+}
+
+#[test]
+fn correlated_returning_projection_error_rolls_back_statement() {
+    asupersync::test_utils::run_test(|| async {
+        compare_correlated_dml_returning(
+            "second projection error rolls back earlier rows and AFTER triggers",
+            "CREATE TABLE t(id INTEGER PRIMARY KEY,v INTEGER);\
+             INSERT INTO t VALUES(1,10),(2,20),(3,30);\
+             CREATE TABLE docs(id INTEGER,payload TEXT);\
+             INSERT INTO docs VALUES(1,'{\"n\":1}'),(2,'broken'),(3,'{\"n\":3}');\
+             CREATE VIEW doc_view AS SELECT id,payload FROM docs;\
+             CREATE TABLE audit(id INTEGER,v INTEGER);\
+             CREATE TRIGGER au AFTER UPDATE ON t BEGIN \
+               INSERT INTO audit VALUES(NEW.id,NEW.v); END;",
+            "UPDATE t SET v=v+1 RETURNING id,\
+               (SELECT json_extract(d.payload,'$.n') FROM doc_view AS d WHERE d.id=t.id)",
+            false,
+            &[
+                "SELECT changes()",
+                "SELECT * FROM t ORDER BY id",
+                "SELECT * FROM audit ORDER BY rowid",
+            ],
+        )
+        .await;
+    });
+}
+
+#[test]
+fn correlated_returning_ignore_skips_projection_and_after_trigger() {
+    asupersync::test_utils::run_test(|| async {
+        compare_correlated_dml_returning(
+            "ignored UNIQUE conflict cannot evaluate an invalid projection",
+            "CREATE TABLE t(id INTEGER PRIMARY KEY,v TEXT UNIQUE);\
+             INSERT INTO t VALUES(1,'free'),(2,'keep'),(3,'taken');\
+             CREATE TABLE docs(id INTEGER,payload TEXT);\
+             INSERT INTO docs VALUES(1,'{\"n\":1}'),(2,'broken');\
+             CREATE VIEW doc_view AS SELECT id,payload FROM docs;\
+             CREATE TABLE audit(phase TEXT,id INTEGER);\
+             CREATE TRIGGER bu BEFORE UPDATE ON t BEGIN \
+               INSERT INTO audit VALUES('before',OLD.id); END;\
+             CREATE TRIGGER au AFTER UPDATE ON t BEGIN \
+               INSERT INTO audit VALUES('after',NEW.id); END;",
+            "UPDATE OR IGNORE t SET v=CASE id WHEN 1 THEN 'changed' ELSE 'taken' END \
+             WHERE id<3 RETURNING id,v,\
+               (SELECT json_extract(d.payload,'$.n') FROM doc_view AS d WHERE d.id=t.id)",
+            true,
+            &[
+                "SELECT changes()",
+                "SELECT * FROM t ORDER BY id",
+                "SELECT * FROM audit ORDER BY rowid",
+            ],
+        )
+        .await;
+    });
+}
+
+#[test]
+fn correlated_returning_unbound_parameters_do_not_alias_frozen_assignments() {
+    asupersync::test_utils::run_test(|| async {
+        compare_correlated_dml_returning(
+            "BEFORE-trigger SET freezing cannot occupy original RETURNING slots",
+            "CREATE TABLE t(id INTEGER PRIMARY KEY,v INTEGER);\
+             INSERT INTO t VALUES(1,10);\
+             CREATE TABLE ids(id INTEGER);\
+             INSERT INTO ids VALUES(1);\
+             CREATE VIEW id_view AS SELECT id FROM ids;\
+             CREATE TABLE audit(phase TEXT,v INTEGER);\
+             CREATE TRIGGER bu BEFORE UPDATE ON t BEGIN \
+               INSERT INTO audit VALUES('before',NEW.v); END;\
+             CREATE TRIGGER au AFTER UPDATE ON t BEGIN \
+               INSERT INTO audit VALUES('after',NEW.v); END;",
+            // The unique locator bypasses replay, so no replay-generated
+            // padding masks a collision with the unbound RETURNING slots.
+            "UPDATE t SET v=v+1 WHERE id=1 RETURNING ?1,?4,?,\
+               (SELECT count(*) FROM id_view WHERE id_view.id=t.id)",
+            true,
+            &[
+                "SELECT changes()",
+                "SELECT * FROM t ORDER BY id",
+                "SELECT * FROM audit ORDER BY rowid",
+            ],
+        )
+        .await;
+    });
+}
+
+#[test]
+fn correlated_returning_external_probe_with_all_rowid_aliases_shadowed() {
+    asupersync::test_utils::run_test(|| async {
+        compare_correlated_dml_returning(
+            "an unaffected external probe does not require a SQL-visible rowid",
+            "PRAGMA foreign_keys=OFF;\
+             CREATE TABLE t(rowid INTEGER,_rowid_ TEXT,oid TEXT,v TEXT);\
+             INSERT INTO t VALUES(1,'a','oa','va'),(2,'b','ob','vb'),(3,'c','oc','vc');\
+             CREATE TABLE external_keys(id INTEGER PRIMARY KEY,label TEXT);\
+             INSERT INTO external_keys VALUES(1,'first'),(2,'second'),(3,'third');",
+            "DELETE FROM t WHERE rowid<3 RETURNING *,\
+               (SELECT k.label FROM external_keys AS k WHERE k.id=t.rowid)",
+            true,
+            &["SELECT changes()", "SELECT * FROM t ORDER BY rowid"],
+        )
+        .await;
     });
 }

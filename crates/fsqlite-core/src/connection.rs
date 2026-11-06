@@ -41854,24 +41854,29 @@ impl Connection {
                                     && expr_has_correlated_subquery_deep(value, self))
                         })
                     });
-                // bd-hga35: a RETURNING subquery the codegen cannot answer is
-                // compiled to a wrong value too, so such an UPDATE also runs row
-                // by row, reading each row's RETURNING with a SELECT once the row
-                // has changed. Stock evaluates RETURNING before the row's AFTER
-                // triggers, which a statement per row cannot, and a SET of the
-                // row key loses the row: both keep the old lane.
-                let returning_needs_select_path = !has_after_update
-                    && self
-                        .returning_has_uncompiled_correlated_subquery(&effective_update.returning)
-                    && !self.update_assigns_row_key(&effective_update)?;
-                let needs_row_by_row_replay = set_needs_select_path
-                    || returning_needs_select_path
+                // RETURNING subqueries observe each mutation and its FK actions,
+                // before AFTER triggers. Capture the NEW row in the VDBE so a
+                // changed primary key does not require looking up its old key.
+                let returning_needs_select_path = self
+                    .returning_has_uncompiled_correlated_subquery(&effective_update.returning)
                     || (computes_new_images
-                        && (effective_update.from.is_some()
-                            || !self.dml_where_pins_one_row(
-                                &effective_update.table,
-                                effective_update.where_clause.as_ref(),
-                            )));
+                        && self.returning_has_correlated_subquery(&effective_update.returning));
+                let returning_projection = if returning_needs_select_path {
+                    Some(self.prepare_dml_returning_projection(
+                        &effective_update.table,
+                        &effective_update.returning,
+                    )?)
+                } else {
+                    None
+                };
+                let pins_one_row = (returning_needs_select_path || computes_new_images)
+                    && self.dml_where_pins_one_row(
+                        &effective_update.table,
+                        effective_update.where_clause.as_ref(),
+                    );
+                let needs_row_by_row_replay = set_needs_select_path
+                    || (returning_needs_select_path && !pins_one_row)
+                    || (computes_new_images && (effective_update.from.is_some() || !pins_one_row));
                 let replay_locators = if !needs_row_by_row_replay {
                     None
                 } else if effective_update.from.is_some() {
@@ -41887,6 +41892,11 @@ impl Connection {
                     .await?
                     .map(|(columns, rows)| (columns, None, rows))
                 };
+                if returning_needs_select_path && !pins_one_row && replay_locators.is_none() {
+                    return Err(FrankenError::NotImplemented(
+                        "correlated UPDATE RETURNING requires an addressable row key".to_owned(),
+                    ));
+                }
                 if let Some((locator_columns, set_columns, locator_rows)) = replay_locators
                     && (locator_rows.len() > 1
                         || set_needs_select_path
@@ -41925,9 +41935,14 @@ impl Connection {
                         params,
                         &locator_columns,
                         &locator_rows,
-                        returning_needs_select_path,
                     ))
                     .await;
+                }
+                if returning_projection.is_some() {
+                    self.log_mem_execution_fallback(
+                        "update",
+                        "update_row_by_row_correlated_returning_fallback",
+                    )?;
                 }
                 // Trigger rows carry the matched rowid so OLD.rowid/NEW.rowid
                 // resolve on tables without an INTEGER PRIMARY KEY column. An
@@ -42094,10 +42109,18 @@ impl Connection {
                     self.ensure_trigger_program_admission_available()?;
                 }
 
+                // Keep the original RETURNING placeholders visible while
+                // freezing BEFORE-trigger SET values; those internal bindings
+                // must be allocated after every caller parameter slot.
+                if let Some(projection) = &returning_projection {
+                    effective_update.returning = projection.snapshot_columns.clone();
+                }
                 let arc_prog;
-                let program: &VdbeProgram = if let Some(p) = precompiled
-                    .filter(|_| !froze_before_update_assignments && !update_where_rewritten)
-                {
+                let program: &VdbeProgram = if let Some(p) = precompiled.filter(|_| {
+                    !froze_before_update_assignments
+                        && !update_where_rewritten
+                        && returning_projection.is_none()
+                }) {
                     p
                 } else {
                     let plan_span = tracing::span!(
@@ -42148,6 +42171,12 @@ impl Connection {
                 for action in &pending_fk_actions {
                     Box::pin(self.execute_fk_update_action(action)).await?;
                 }
+
+                let rows = if let Some(projection) = &returning_projection {
+                    Box::pin(self.project_dml_returning(projection, rows, params)).await?
+                } else {
+                    rows
+                };
 
                 // Phase 5G.3: Fire AFTER UPDATE triggers.
                 if has_after_update && !no_row_updated {
@@ -42290,24 +42319,49 @@ impl Connection {
                     fsqlite_ast::TriggerTiming::After,
                     &delete_event,
                 );
-                // bd-hga35: a RETURNING subquery the codegen cannot answer is
-                // compiled to a wrong value, so such a DELETE runs row by row,
-                // reading each row's RETURNING with a SELECT just before the row
-                // goes. Stock reads it just after, before the row's AFTER
-                // triggers; with DELETE triggers the old lane stays.
-                if !has_before_delete
-                    && !has_after_delete
-                    && !self.has_live_vtab_instance(table_name)
-                    && self
+                // A self-read, or a subquery affected by triggers/FK actions,
+                // must run after the delete. Unaffected external-table probes
+                // keep their compiled path. Preserve the deleted row's column
+                // image separately from the live tables those subqueries read.
+                let returning_needs_select_path = !self.has_live_vtab_instance(table_name)
+                    && (self
                         .returning_has_uncompiled_correlated_subquery(&effective_delete.returning)
-                    && let Some((locator_columns, locator_rows)) = self
+                        || self.returning_has_correlated_target_subquery(
+                            &effective_delete.returning,
+                            table_name,
+                        )
+                        || ((has_before_delete
+                            || has_after_delete
+                            || self.fk_cascade_propagation_enabled())
+                            && self
+                                .returning_has_correlated_subquery(&effective_delete.returning)));
+                let returning_projection = if returning_needs_select_path {
+                    Some(self.prepare_dml_returning_projection(
+                        &effective_delete.table,
+                        &effective_delete.returning,
+                    )?)
+                } else {
+                    None
+                };
+                if returning_needs_select_path
+                    && !self.dml_where_pins_one_row(
+                        &effective_delete.table,
+                        effective_delete.where_clause.as_ref(),
+                    )
+                {
+                    let Some((locator_columns, locator_rows)) = self
                         .materialize_dml_replay_locators(
                             &effective_delete.table,
                             effective_delete.where_clause.as_ref(),
                             params,
                         )
                         .await?
-                {
+                    else {
+                        return Err(FrankenError::NotImplemented(
+                            "correlated DELETE RETURNING requires an addressable row key"
+                                .to_owned(),
+                        ));
+                    };
                     self.log_mem_execution_fallback(
                         "delete",
                         "delete_row_by_row_correlated_returning_fallback",
@@ -42317,7 +42371,6 @@ impl Connection {
                         params,
                         &locator_columns,
                         &locator_rows,
-                        true,
                     ))
                     .await;
                 }
@@ -42355,9 +42408,15 @@ impl Connection {
                         params,
                         &locator_columns,
                         &locator_rows,
-                        false,
                     ))
                     .await;
+                }
+                if let Some(projection) = &returning_projection {
+                    self.log_mem_execution_fallback(
+                        "delete",
+                        "delete_row_by_row_correlated_returning_fallback",
+                    )?;
+                    effective_delete.returning = projection.snapshot_columns.clone();
                 }
                 let mut trigger_old_rows = if has_before_delete || has_after_delete {
                     self.collect_delete_trigger_rows(&effective_delete, params)
@@ -42531,27 +42590,28 @@ impl Connection {
                 }
 
                 let arc_prog;
-                let program: &VdbeProgram =
-                    if let Some(p) = precompiled.filter(|_| !delete_where_rewritten) {
-                        p
-                    } else {
-                        let plan_span = tracing::span!(
-                            target: "fsqlite.plan",
-                            tracing::Level::TRACE,
-                            "plan",
-                            stage = "compile_table_delete"
-                        );
-                        record_trace_span_created();
-                        let _plan_guard = plan_span.enter();
-                        let sql_text = effective_delete.to_string();
-                        let sql_key = Self::sql_hash(&sql_text);
-                        arc_prog = self
-                            .compile_with_cache(sql_key, &sql_text, async |conn| {
-                                conn.compile_table_delete(&effective_delete)
-                            })
-                            .await?;
-                        &arc_prog
-                    };
+                let program: &VdbeProgram = if let Some(p) = precompiled
+                    .filter(|_| !delete_where_rewritten && returning_projection.is_none())
+                {
+                    p
+                } else {
+                    let plan_span = tracing::span!(
+                        target: "fsqlite.plan",
+                        tracing::Level::TRACE,
+                        "plan",
+                        stage = "compile_table_delete"
+                    );
+                    record_trace_span_created();
+                    let _plan_guard = plan_span.enter();
+                    let sql_text = effective_delete.to_string();
+                    let sql_key = Self::sql_hash(&sql_text);
+                    arc_prog = self
+                        .compile_with_cache(sql_key, &sql_text, async |conn| {
+                            conn.compile_table_delete(&effective_delete)
+                        })
+                        .await?;
+                    &arc_prog
+                };
                 let (rows, affected, _) = self
                     .execute_table_program_with_cx(
                         program,
@@ -42566,6 +42626,12 @@ impl Connection {
                 for action in &pending_fk_actions {
                     Box::pin(self.execute_fk_delete_action(action)).await?;
                 }
+
+                let rows = if let Some(projection) = &returning_projection {
+                    Box::pin(self.project_dml_returning(projection, rows, params)).await?
+                } else {
+                    rows
+                };
 
                 // Phase 5G.3: Fire AFTER DELETE triggers. A lone target row that
                 // its own BEFORE trigger already removed is not deleted again
@@ -54973,30 +55039,30 @@ impl Connection {
         })
     }
 
-    /// bd-hga35: whether an UPDATE assigns the key a row replay finds its rows
-    /// by: the rowid under any of its names, an INTEGER PRIMARY KEY, or a
-    /// WITHOUT ROWID primary key column. A SET list that does not flatten
-    /// counts as assigning it.
-    fn update_assigns_row_key(&self, update: &fsqlite_ast::UpdateStatement) -> Result<bool> {
-        let Some(locator_columns) = self.dml_replay_locator_columns(&update.table)? else {
-            return Ok(false);
-        };
-        let Ok(set_pairs) = Self::update_set_pairs(update) else {
-            return Ok(true);
-        };
-        self.with_dml_target_table(&update.table, |table| {
-            let declared = |name: &str| {
-                table
-                    .columns
-                    .iter()
-                    .find(|column| column.name.eq_ignore_ascii_case(name))
+    fn returning_has_correlated_subquery(&self, returning: &[ResultColumn]) -> bool {
+        returning.iter().any(|column| {
+            matches!(column, ResultColumn::Expr { expr, .. }
+                if expr_has_correlated_subquery_deep(expr, self))
+        })
+    }
+
+    fn returning_has_correlated_target_subquery(
+        &self,
+        returning: &[ResultColumn],
+        table_name: &str,
+    ) -> bool {
+        returning.iter().any(|column| {
+            let ResultColumn::Expr { expr, .. } = column else {
+                return false;
             };
-            Ok(set_pairs.iter().any(|(column, _)| {
-                locator_columns.iter().any(|key| key.eq_ignore_ascii_case(column))
-                    || declared(column)
-                        .map_or_else(|| is_rowid_alias(column), |declared| declared.is_ipk)
-            }))
-        })?
+            expr_contains_subquery_matching_deep(expr, self, &|subquery, conn| {
+                let (SubqueryExprRef::Scalar(inner)
+                | SubqueryExprRef::Exists(inner)
+                | SubqueryExprRef::In(inner)) = subquery;
+                subquery_references_table(inner, table_name)
+                    && is_correlated_subquery_with_schema(inner, &conn.schema.borrow())
+            })
+        })
     }
 
     /// An UPDATE's SET list flattened to (target column, value) pairs in order;
@@ -55243,59 +55309,133 @@ impl Connection {
         Ok(rows.into_iter().next().map(|row| row.values().to_vec()))
     }
 
-    /// bd-hga35: `SELECT <RETURNING> FROM <target> WHERE <locator>`, which
-    /// reads one row's RETURNING values for a replay whose RETURNING the
-    /// codegen cannot compute. The target is named without its alias, which
-    /// RETURNING cannot name (bd-xrzce), and without an index hint.
-    fn build_returning_row_select(
-        table_ref: &fsqlite_ast::QualifiedTableRef,
-        returning: &[ResultColumn],
-        locator_columns: &[String],
-        locator_values: Vec<Expr>,
-    ) -> Result<Statement> {
-        let mut target = table_ref.clone();
-        target.alias = None;
-        target.index_hint = None;
-        let locator =
-            Self::build_update_replay_locator_filter(&target, locator_columns, locator_values)?;
-        Ok(Statement::Select(Self::build_single_table_select(
-            &target,
-            returning.to_vec(),
-            Some(&locator),
-            &[],
-            None,
-        )))
-    }
-
-    /// bd-hga35: one row's RETURNING rows (none once the row is gone), read
-    /// by `returning_select` with the row statement's parameter layout, or
-    /// past the variable limit by a SELECT naming the locator as literals.
-    #[allow(clippy::too_many_arguments)]
-    async fn read_returning_row(
+    /// Capture the affected row in the VDBE, but evaluate its RETURNING
+    /// expressions after the mutation and FK actions, before AFTER triggers.
+    /// A deleted row or a changed primary key cannot be read back by its old
+    /// locator. The snapshot also keeps BEFORE/AFTER trigger changes from
+    /// replacing the OLD/NEW column image that RETURNING must expose.
+    fn prepare_dml_returning_projection(
         &self,
         table_ref: &fsqlite_ast::QualifiedTableRef,
         returning: &[ResultColumn],
-        returning_select: Option<&Statement>,
-        locator_columns: &[String],
-        locator_values: &[SqliteValue],
-        params: Option<&[SqliteValue]>,
-        parameter_base: usize,
-    ) -> Result<Vec<Row>> {
-        if let Some(returning_select) = returning_select {
-            let mut select_params = params.unwrap_or(&[]).to_vec();
-            select_params.resize(parameter_base, SqliteValue::Null);
-            select_params.extend_from_slice(locator_values);
-            return self
-                .execute_statement(returning_select, Some(&select_params))
-                .await;
+    ) -> Result<DmlReturningProjection> {
+        let table = self.with_dml_target_table(table_ref, Clone::clone)?;
+        let mut target = table_ref.clone();
+        target.alias = None;
+        target.index_hint = None;
+        let mut select =
+            Self::build_single_table_select(&target, returning.to_vec(), None, &[], None);
+        // Validate against the real target before any mutation. In particular,
+        // RETURNING cannot name the UPDATE/DELETE target's alias.
+        self.validate_select_column_references(&select)?;
+        let mut snapshot_columns = table
+            .columns
+            .iter()
+            .map(|column| ResultColumn::Expr {
+                expr: Expr::Column(ColumnRef::bare(column.name.clone()), Span::ZERO),
+                alias: None,
+            })
+            .collect::<Vec<_>>();
+        if let SelectCore::Select { columns, from, .. } = &mut select.body.select {
+            let mut expanded = Vec::new();
+            for column in columns.iter() {
+                if matches!(column, ResultColumn::Star) {
+                    expanded.extend(snapshot_columns.iter().cloned());
+                } else {
+                    expanded.push(column.clone());
+                }
+            }
+            *columns = expanded;
+            *from = None;
         }
-        let literal_select = Self::build_returning_row_select(
-            table_ref,
-            returning,
-            locator_columns,
-            locator_values.iter().cloned().map(value_to_literal_expr).collect(),
-        )?;
-        self.execute_statement(&literal_select, params).await
+        let hidden_rowid = if table.without_rowid {
+            None
+        } else {
+            unshadowed_hidden_rowid_alias(&table)
+        };
+        if let Some(alias) = hidden_rowid {
+            snapshot_columns.push(ResultColumn::Expr {
+                expr: Expr::Column(ColumnRef::bare(alias), Span::ZERO),
+                alias: None,
+            });
+        }
+        Ok(DmlReturningProjection {
+            table,
+            select,
+            snapshot_columns,
+            hidden_rowid,
+        })
+    }
+
+    async fn project_dml_returning(
+        &self,
+        projection: &DmlReturningProjection,
+        snapshots: Vec<Row>,
+        params: Option<&[SqliteValue]>,
+    ) -> Result<Vec<Row>> {
+        let table = &projection.table;
+        let mut col_map = table
+            .columns
+            .iter()
+            .map(|column| (table.name.clone(), column.name.clone(), false))
+            .collect::<Vec<_>>();
+        let mut collations = table
+            .columns
+            .iter()
+            .map(|column| column.collation.clone())
+            .collect::<Vec<_>>();
+        let mut affinities = table
+            .columns
+            .iter()
+            .map(|column| affinity_char_to_type(column.affinity))
+            .collect::<Vec<_>>();
+        let declared_blob_columns = affinities
+            .iter()
+            .enumerate()
+            .filter_map(|(index, affinity)| (*affinity == TypeAffinity::Blob).then_some(index))
+            .collect::<HashSet<_>>();
+        if let Some(alias) = projection.hidden_rowid {
+            col_map.push((table.name.clone(), alias.to_owned(), true));
+            collations.push(None);
+            affinities.push(TypeAffinity::Integer);
+        }
+        let mut output = Vec::with_capacity(snapshots.len());
+        for snapshot in snapshots {
+            if snapshot.values().len() != col_map.len() {
+                return Err(FrankenError::Internal(
+                    "RETURNING row snapshot does not match its target schema".to_owned(),
+                ));
+            }
+            let mut select = projection.select.clone();
+            {
+                let schema = self.schema.borrow();
+                let shadowed_main_tables = self.shadowed_main_tables.borrow();
+                let temp_table_names = self.temp_table_names.borrow();
+                // Bind only outer references. Inner FROM scopes still read the
+                // current database, and BoundOuterValue preserves the target
+                // column's comparison affinity and declared collation.
+                substitute_outer_refs_in_select_with_schema_context(
+                    &mut select,
+                    snapshot.values(),
+                    &col_map,
+                    None,
+                    Some(&collations),
+                    Some(&affinities),
+                    Some(&declared_blob_columns),
+                    &schema,
+                    Some(&shadowed_main_tables),
+                    Some(&temp_table_names),
+                );
+            }
+            // BoundOuterValue's SQL display omits its affinity/collation, so
+            // text alone cannot identify a reusable compiled program.
+            let _cache_guard = BoolCellRestoreGuard::new(&self.bypass_compiled_cache, true);
+            output.extend(
+                self.execute_statement(&Statement::Select(select), params)
+                    .await?,
+            );
+        }
+        Ok(output)
     }
 
     /// The highest bind-parameter slot `statement` itself can read: every
@@ -55329,18 +55469,15 @@ impl Connection {
     /// bound value both compare and assign without affinity, so the per-row
     /// statement means the same thing either way.
     ///
-    /// bd-hga35: with `returning_via_select`, the per-row statements carry no
-    /// RETURNING; a SELECT of the row reads it instead, after an UPDATE changes
-    /// the row (where stock evaluates RETURNING) or just before a DELETE
-    /// removes it. The caller keeps AFTER triggers and changed row keys off
-    /// this lane.
+    /// RETURNING stays on each row statement. Its dispatcher captures the
+    /// affected row and evaluates subqueries at the mutation/FK boundary,
+    /// before AFTER triggers; the replay must not re-read the old locator.
     async fn execute_dml_row_by_row(
         &self,
         statement: DmlRowReplay<'_>,
         params: Option<&[SqliteValue]>,
         locator_columns: &[String],
         locator_rows: &[Vec<SqliteValue>],
-        returning_via_select: bool,
     ) -> Result<Vec<Row>> {
         let (table_ref, preserve_constraint_failure_rows, kind) = match statement {
             DmlRowReplay::Update(update)
@@ -55372,18 +55509,7 @@ impl Connection {
                 None
             }
         };
-        // The RETURNING list read per row, and whether after the row changes.
-        let returning_read = match statement {
-            _ if !returning_via_select => None,
-            DmlRowReplay::Update(update)
-            | DmlRowReplay::UpdateFrom { update, .. }
-            | DmlRowReplay::UpdateEvaluated { update, .. } => {
-                Some((update.returning.as_slice(), true))
-            }
-            DmlRowReplay::Delete(delete) => Some((delete.returning.as_slice(), false)),
-        };
         let mut parameterized_set_select = None;
-        let mut parameterized_returning_select = None;
         let row_value_count = locator_columns.len() + set_count;
         let caller_params = params.unwrap_or(&[]);
         let parameter_base = Self::dml_replay_statement_parameter_slots(statement)?
@@ -55408,23 +55534,12 @@ impl Connection {
                     locator_slots.clone(),
                 )?);
             }
-            if let Some((returning, _)) = returning_read {
-                parameterized_returning_select = Some(Self::build_returning_row_select(
-                    table_ref,
-                    returning,
-                    locator_columns,
-                    locator_slots.clone(),
-                )?);
-            }
-            let mut row_statement = Self::build_dml_replay_row_statement(
+            let row_statement = Self::build_dml_replay_row_statement(
                 statement,
                 locator_columns,
                 locator_slots,
                 set_slots,
             )?;
-            if returning_read.is_some() {
-                strip_dml_returning(&mut row_statement);
-            }
             Some(row_statement)
         } else {
             None
@@ -55469,44 +55584,18 @@ impl Connection {
                     row_params.extend_from_slice(locator_row);
                     (parameterized, Some(row_params.as_slice()))
                 } else {
-                    let mut built = Self::build_dml_replay_row_statement(
+                    let built = Self::build_dml_replay_row_statement(
                         statement,
                         locator_columns,
                         locator_values.iter().cloned().map(value_to_literal_expr).collect(),
                         set_values.iter().cloned().map(value_to_literal_expr).collect(),
                     )?;
-                    if returning_read.is_some() {
-                        strip_dml_returning(&mut built);
-                    }
                     literal_statement = built;
                     (&literal_statement, params)
                 };
 
-                // bd-hga35: a DELETE reads the row's RETURNING before removing it.
-                let mut returning_error = None;
-                let returning_before = match returning_read {
-                    Some((returning, false)) if evaluation_error.is_none() => match self
-                        .read_returning_row(
-                            table_ref,
-                            returning,
-                            parameterized_returning_select.as_ref(),
-                            locator_columns,
-                            locator_values,
-                            params,
-                            parameter_base,
-                        )
-                        .await
-                    {
-                        Ok(rows) => rows,
-                        Err(error) => {
-                            returning_error = Some(error);
-                            Vec::new()
-                        }
-                    },
-                    _ => Vec::new(),
-                };
                 self.set_statement_change_count(previous_changes);
-                let row_result = match evaluation_error.or(returning_error) {
+                let row_result = match evaluation_error {
                     Some(error) => Err(error),
                     None => {
                         self.execute_statement_impl_after_background_status(
@@ -55517,32 +55606,6 @@ impl Connection {
                         )
                         .await
                     }
-                };
-                // bd-hga35: an UPDATE reads it once the row has changed. A row
-                // the statement did not change returns nothing.
-                let row_result = match (row_result, returning_read) {
-                    (Ok(_), Some((returning, read_after))) => {
-                        let row_changes = self.last_changes.get();
-                        let returned = if row_changes == 0 {
-                            Ok(Vec::new())
-                        } else if read_after {
-                            self.read_returning_row(
-                                table_ref,
-                                returning,
-                                parameterized_returning_select.as_ref(),
-                                locator_columns,
-                                locator_values,
-                                params,
-                                parameter_base,
-                            )
-                            .await
-                        } else {
-                            Ok(returning_before)
-                        };
-                        self.set_statement_change_count(row_changes);
-                        returned
-                    }
-                    (result, _) => result,
                 };
                 match row_result {
                     Ok(rows) => {
@@ -158693,13 +158756,13 @@ enum DmlRowReplay<'a> {
     Delete(&'a fsqlite_ast::DeleteStatement),
 }
 
-/// bd-hga35: drop a row-replay statement's RETURNING; the replay reads it.
-fn strip_dml_returning(statement: &mut Statement) {
-    match statement {
-        Statement::Update(update) => update.returning.clear(),
-        Statement::Delete(delete) => delete.returning.clear(),
-        _ => {}
-    }
+/// The VDBE's OLD/NEW row image and the projection evaluated at the DML/FK
+/// boundary. Hidden rowid aliases participate in binding but never in `*`.
+struct DmlReturningProjection {
+    table: TableSchema,
+    select: SelectStatement,
+    snapshot_columns: Vec<ResultColumn>,
+    hidden_rowid: Option<&'static str>,
 }
 
 #[derive(Default)]
