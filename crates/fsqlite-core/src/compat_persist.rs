@@ -811,14 +811,28 @@ pub(crate) fn bind_implicit_autoindex_catalog(
             CreateTableBody::Columns {
                 columns,
                 constraints,
-            } => implicit_autoindex_layout(columns, constraints, create.without_rowid).map_err(
-                |error| {
-                    sqlite_master_corrupt(format!(
-                        "invalid implicit autoindex layout for table `{}`: {error}",
-                        entry.name
-                    ))
-                },
-            )?,
+            } => {
+                // CREATE TABLE checks this on direct DDL, but a stored AST is
+                // reconstructed without executing DDL. Reject ambiguous column
+                // bindings before any row decoding or schema publication.
+                let mut column_names = HashSet::with_capacity(columns.len());
+                for column in columns {
+                    if !column_names.insert(column.name.to_ascii_lowercase()) {
+                        return Err(sqlite_master_corrupt(format!(
+                            "table `{}` has duplicate column name: {}",
+                            entry.name, column.name
+                        )));
+                    }
+                }
+                implicit_autoindex_layout(columns, constraints, create.without_rowid).map_err(
+                    |error| {
+                        sqlite_master_corrupt(format!(
+                            "invalid implicit autoindex layout for table `{}`: {error}",
+                            entry.name
+                        ))
+                    },
+                )?
+            }
             CreateTableBody::AsSelect(_) => {
                 return Err(sqlite_master_corrupt(format!(
                     "sqlite_master table `{}` stores CREATE TABLE AS SELECT instead of a normalized column definition",
@@ -854,12 +868,11 @@ pub(crate) fn bind_implicit_autoindex_catalog(
         let target = schema_names.get(&table_name.to_ascii_lowercase());
         let target_is_view =
             target.is_some_and(|owner| owner.kind == SqliteMasterSchemaNameKind::View);
-        let target_is_table = target.is_some_and(|owner| {
-            matches!(
-                owner.kind,
-                SqliteMasterSchemaNameKind::Table | SqliteMasterSchemaNameKind::VirtualTable
-            )
-        });
+        // SQLite forbids triggers on virtual tables. Treating them as ordinary
+        // tables here allowed writable_schema corruption to bypass direct DDL
+        // validation and install callbacks on an unsupported target.
+        let target_is_table =
+            target.is_some_and(|owner| owner.kind == SqliteMasterSchemaNameKind::Table);
         if (!requires_view && !target_is_table) || (requires_view && !target_is_view) {
             let expected_kind = if requires_view { "view" } else { "table" };
             return Err(sqlite_master_corrupt(format!(
@@ -1964,8 +1977,13 @@ pub async fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
     };
 
     let free_pages = txn.live_freelist_pages().into_iter().collect();
-    let bound_implicit_autoindexes =
-        bind_implicit_autoindex_catalog(&master_entries, max_root_page, &header, &free_pages, false)?;
+    let bound_implicit_autoindexes = bind_implicit_autoindex_catalog(
+        &master_entries,
+        max_root_page,
+        &header,
+        &free_pages,
+        false,
+    )?;
 
     // Parse each sqlite_master row.
     // Columns: type(0), name(1), tbl_name(2), rootpage(3), sql(4)
@@ -6637,8 +6655,9 @@ PRAGMA integrity_check;
         free_pages: &HashSet<PageNumber>,
         detail_needle: &str,
     ) {
-        let error = bind_implicit_autoindex_catalog(entries, max_root_page, header, free_pages, false)
-            .unwrap_err();
+        let error =
+            bind_implicit_autoindex_catalog(entries, max_root_page, header, free_pages, false)
+                .unwrap_err();
         let FrankenError::DatabaseCorrupt { detail } = error else {
             panic!("{case_name}: expected DatabaseCorrupt, found {error:?}");
         };
@@ -6921,6 +6940,93 @@ PRAGMA integrity_check;
         .unwrap();
         assert!(catalog.table("PLAIN").is_some());
         assert!(catalog.table("docs").is_none());
+    }
+
+    #[test]
+    fn implicit_autoindex_catalog_rejects_duplicate_column_names() {
+        for sql in [
+            "CREATE TABLE t(a, a)",
+            "CREATE TABLE t(a INTEGER, A TEXT)",
+            "CREATE TABLE t(\"a b\", [A B])",
+            "CREATE TABLE t(a INTEGER PRIMARY KEY, A)",
+            "CREATE TABLE t(a, A, PRIMARY KEY(a)) WITHOUT ROWID",
+        ] {
+            let entries = vec![implicit_autoindex_catalog_row(
+                "table",
+                "t",
+                "t",
+                2,
+                Some(sql),
+            )];
+            for allow_repair in [false, true] {
+                let error = bind_implicit_autoindex_catalog(
+                    &entries,
+                    2,
+                    &DatabaseHeader::default(),
+                    &HashSet::new(),
+                    allow_repair,
+                )
+                .unwrap_err();
+                assert!(
+                    matches!(error, FrankenError::DatabaseCorrupt { ref detail }
+                        if detail.contains("duplicate column name")),
+                    "{sql}, repair={allow_repair}: {error}"
+                );
+            }
+        }
+
+        // Identifier matching folds ASCII only; Unicode case folding would
+        // reject a schema accepted by stock SQLite.
+        let valid = vec![implicit_autoindex_catalog_row(
+            "table",
+            "t",
+            "t",
+            2,
+            Some("CREATE TABLE t(\"ä\", \"Ä\", a)"),
+        )];
+        bind_implicit_autoindex_catalog(
+            &valid,
+            2,
+            &DatabaseHeader::default(),
+            &HashSet::new(),
+            false,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn implicit_autoindex_catalog_rejects_triggers_on_virtual_tables() {
+        for timing in ["BEFORE", "AFTER", "INSTEAD OF"] {
+            let sql = format!("CREATE TRIGGER tr {timing} INSERT ON vt BEGIN SELECT 1; END");
+            let mut entries = vec![
+                implicit_autoindex_catalog_row(
+                    "table",
+                    "vt",
+                    "vt",
+                    0,
+                    Some("CREATE VIRTUAL TABLE vt USING fts5(body)"),
+                ),
+                implicit_autoindex_catalog_row("trigger", "tr", "vt", 0, Some(&sql)),
+            ];
+            for allow_repair in [false, true] {
+                for _ in 0..2 {
+                    let error = bind_implicit_autoindex_catalog(
+                        &entries,
+                        1,
+                        &DatabaseHeader::default(),
+                        &HashSet::new(),
+                        allow_repair,
+                    )
+                    .unwrap_err();
+                    assert!(
+                        matches!(error, FrankenError::DatabaseCorrupt { ref detail }
+                            if detail.contains("missing or incompatible")),
+                        "{timing}, repair={allow_repair}: {error}"
+                    );
+                    entries.reverse();
+                }
+            }
+        }
     }
 
     #[test]

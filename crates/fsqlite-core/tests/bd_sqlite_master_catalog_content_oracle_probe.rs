@@ -11,6 +11,7 @@
 //! (version/whitespace-specific); only type/name/tbl_name. Pass = keeper.
 
 use fsqlite_core::connection::Connection;
+use fsqlite_error::ErrorCode;
 use fsqlite_types::value::SqliteValue;
 
 fn tag_f(v: &SqliteValue) -> String {
@@ -60,6 +61,137 @@ fn rq(conn: &rusqlite::Connection, sql: &str) -> Vec<Vec<String>> {
 async fn ex(f: &Connection, r: &rusqlite::Connection, sql: &str) {
     let _ = f.execute(sql).await;
     let _ = r.execute(sql, []);
+}
+
+/// bd-2dtww: catalog SQL is untrusted persisted input, even when it parses.
+/// Build the corruptions through stock's writable_schema so the table pages
+/// remain valid and only the schema semantics differ from a healthy file.
+#[test]
+fn malformed_catalogs_are_rejected_before_schema_publication() {
+    asupersync::test_utils::run_test(|| async {
+        for (name, setup, corruption) in [
+            (
+                "duplicate_columns",
+                "CREATE TABLE t(a INTEGER, b TEXT); INSERT INTO t VALUES(1, 'kept')",
+                "UPDATE sqlite_schema SET sql='CREATE TABLE t(a INTEGER, A TEXT)' WHERE name='t'",
+            ),
+            (
+                "quoted_duplicate_columns",
+                "CREATE TABLE t(\"a b\" INTEGER, c TEXT)",
+                "UPDATE sqlite_schema SET sql='CREATE TABLE t(\"a b\" INTEGER, [A B] TEXT)' WHERE name='t'",
+            ),
+            (
+                "before_trigger_on_virtual_table",
+                "CREATE VIRTUAL TABLE ft USING fts5(body)",
+                "INSERT INTO sqlite_schema VALUES('trigger', 'tr', 'ft', 0, \
+                 'CREATE TRIGGER tr BEFORE INSERT ON ft BEGIN SELECT 1; END')",
+            ),
+            (
+                "after_trigger_on_virtual_table",
+                "CREATE VIRTUAL TABLE ft USING fts5(body)",
+                "INSERT INTO sqlite_schema VALUES('trigger', 'tr', 'ft', 0, \
+                 'CREATE TRIGGER tr AFTER DELETE ON ft BEGIN SELECT 1; END')",
+            ),
+            (
+                "instead_of_trigger_on_virtual_table",
+                "CREATE VIRTUAL TABLE ft USING fts5(body)",
+                "INSERT INTO sqlite_schema VALUES('trigger', 'tr', 'ft', 0, \
+                 'CREATE TRIGGER tr INSTEAD OF UPDATE ON ft BEGIN SELECT 1; END')",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(format!("{name}.db"));
+            {
+                let stock = rusqlite::Connection::open(&path).unwrap();
+                stock.execute_batch(setup).unwrap();
+                stock.execute_batch("PRAGMA writable_schema=ON").unwrap();
+                stock.execute_batch(corruption).unwrap();
+            }
+            let original = std::fs::read(&path).unwrap();
+            {
+                // SQLite loads its catalog lazily, so force the read before
+                // comparing its error class with FrankenSQLite's eager open.
+                let stock = rusqlite::Connection::open(&path).unwrap();
+                let error = stock
+                    .prepare("SELECT name FROM sqlite_schema")
+                    .expect_err("stock must reject the malformed catalog");
+                assert_eq!(
+                    error.sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::DatabaseCorrupt),
+                    "{name}: {error}"
+                );
+            }
+            for mode in ["existing", "schema_only", "import"] {
+                let result = match mode {
+                    "existing" => Connection::open_existing(path.to_str().unwrap()).await,
+                    "schema_only" => Connection::open_schema_only(path.to_str().unwrap()).await,
+                    "import" => Connection::import_bytes(&original).await,
+                    _ => unreachable!(),
+                };
+                match result {
+                    Ok(conn) => {
+                        conn.close().await.unwrap();
+                        panic!("{name}/{mode}: malformed catalog was accepted");
+                    }
+                    Err(error) => assert_eq!(
+                        error.error_code(),
+                        ErrorCode::Corrupt,
+                        "{name}/{mode}: {error}"
+                    ),
+                }
+                assert_eq!(
+                    std::fs::read(&path).unwrap(),
+                    original,
+                    "{name}/{mode}: rejecting a malformed catalog must preserve its bytes"
+                );
+            }
+        }
+    });
+}
+
+#[test]
+fn valid_catalog_semantics_remain_available() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("valid.db");
+        {
+            let stock = rusqlite::Connection::open(&path).unwrap();
+            stock
+                .execute_batch(
+                    "CREATE TABLE t(\"ä\" INTEGER, \"Ä\" TEXT); \
+                     INSERT INTO t VALUES(1, 'kept'); \
+                     CREATE VIEW v AS SELECT * FROM t; \
+                     CREATE TRIGGER t AFTER INSERT ON t BEGIN SELECT 1; END; \
+                     CREATE TRIGGER v INSTEAD OF INSERT ON v BEGIN SELECT 1; END;",
+                )
+                .unwrap();
+            #[cfg(feature = "ext-fts5")]
+            stock
+                .execute_batch(
+                    "CREATE VIRTUAL TABLE ft USING fts5(body); \
+                     INSERT INTO ft VALUES('preserved document');",
+                )
+                .unwrap();
+        }
+        let original = std::fs::read(&path).unwrap();
+        let conn = Connection::open_schema_only(path.to_str().unwrap())
+            .await
+            .expect("valid tables, views, triggers and FTS5 must still open");
+        assert_eq!(
+            conn.query("SELECT * FROM t").await.unwrap()[0].values(),
+            &[SqliteValue::Integer(1), SqliteValue::Text("kept".into())]
+        );
+        #[cfg(feature = "ext-fts5")]
+        assert_eq!(
+            conn.query("SELECT body FROM ft WHERE ft MATCH 'preserved'")
+                .await
+                .unwrap()[0]
+                .values(),
+            &[SqliteValue::Text("preserved document".into())]
+        );
+        conn.close().await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    });
 }
 
 #[test]
