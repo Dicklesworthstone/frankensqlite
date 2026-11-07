@@ -77,5 +77,10 @@ name = "page_cache_saturated_reclaim"
 harness = false
 required-features = ["bench-internals"]
 
+[[bench]]
+name = "fast_page_array_sparse_ab"
+harness = false
+required-features = ["bench-internals"]
+
 [lints]
 workspace = true

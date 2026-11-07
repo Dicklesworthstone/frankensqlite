@@ -1755,21 +1755,264 @@ fn snapshot_cached_page(page_no: PageNumber, entry: &CachedPageEntry) -> PageCac
 // FastPageArray (bd-fzr07)
 // ---------------------------------------------------------------------------
 
+/// Slots per lazily allocated block of [`FastPageSlots`]. One
+/// `touched_slot_bits` word covers exactly one block.
+const FAST_ARRAY_BLOCK_SLOTS: usize = 64;
+
+/// Leading slots [`FastPageSlots`] keeps inline, as the flat vector kept every
+/// slot.
+///
+/// A database of at most this many pages (64 MiB of 4 KiB pages) never leaves
+/// the inline head, so its index costs and performs as it did before the
+/// block table; only slots past the head are block-allocated. Fully grown, the
+/// head is 1.4 MB.
+const FAST_ARRAY_HEAD_SLOTS: usize = 16 * 1024;
+
+const _: () = assert!(FAST_ARRAY_HEAD_SLOTS.is_multiple_of(FAST_ARRAY_BLOCK_SLOTS));
+
+/// Emptied blocks kept for reuse rather than returned to the allocator.
+///
+/// A transaction-scoped `clear` followed by re-admission of the same pages
+/// past the inline head recycles their blocks instead of freeing and
+/// reallocating them every transaction; the cap bounds what an eviction-heavy
+/// scan over a large file can leave allocated.
+const FAST_ARRAY_SPARE_BLOCKS: usize = 64;
+
+/// One allocated run of [`FAST_ARRAY_BLOCK_SLOTS`] consecutive slots.
+struct FastPageBlock {
+    /// Bit `i` is set iff `slots[i]` holds an entry.
+    occupied: u64,
+    slots: [Option<CachedPageEntry>; FAST_ARRAY_BLOCK_SLOTS],
+}
+
+impl FastPageBlock {
+    fn empty() -> Box<Self> {
+        Box::new(Self {
+            occupied: 0,
+            slots: [const { None }; FAST_ARRAY_BLOCK_SLOTS],
+        })
+    }
+}
+
+/// `(pgno - 1)`-indexed slot table behind [`FastPageArray`].
+///
+/// Observably this is a `Vec<Option<CachedPageEntry>>` whose length
+/// [`Self::len`] grows exactly as that vector's did. The first
+/// [`FAST_ARRAY_HEAD_SLOTS`] slots are stored inline like that vector's; past
+/// them, a block of [`FAST_ARRAY_BLOCK_SLOTS`] slots is allocated only while
+/// one of its slots holds a page. The flat vector stored every slot inline
+/// (88 bytes each) and wrote all of them on growth, so the first read of page
+/// N of a large file made N * 88 bytes resident however few pages were
+/// cached: 4.75 GB per read-only connection on a 54M-page (221 GB) database.
+/// Here an empty block costs one null directory pointer, 8 bytes per 64 slots.
+struct FastPageSlots {
+    /// Logical slot count (the flat vector's `len()`).
+    len: usize,
+    /// Slots `0 .. min(len, FAST_ARRAY_HEAD_SLOTS)`, inline.
+    head: Vec<Option<CachedPageEntry>>,
+    /// Block `b` holds slots `HEAD + b * 64 .. HEAD + (b + 1) * 64`, where
+    /// `HEAD` is [`FAST_ARRAY_HEAD_SLOTS`]; `None` while all are empty.
+    blocks: Vec<Option<Box<FastPageBlock>>>,
+    /// Empty blocks awaiting reuse, at most [`FAST_ARRAY_SPARE_BLOCKS`].
+    spare: Vec<Box<FastPageBlock>>,
+}
+
+impl FastPageSlots {
+    const fn new() -> Self {
+        Self {
+            len: 0,
+            head: Vec::new(),
+            blocks: Vec::new(),
+            spare: Vec::new(),
+        }
+    }
+
+    #[inline]
+    const fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// `(block, slot)` of the post-head slot `idx`; `None` inside the head.
+    #[inline]
+    fn split(idx: usize) -> Option<(usize, usize)> {
+        let rel = idx.checked_sub(FAST_ARRAY_HEAD_SLOTS)?;
+        Some((rel / FAST_ARRAY_BLOCK_SLOTS, rel % FAST_ARRAY_BLOCK_SLOTS))
+    }
+
+    /// Extend the logical length to `new_len` empty slots.
+    fn grow_to(&mut self, new_len: usize) {
+        debug_assert!(new_len >= self.len);
+        self.len = new_len;
+        self.head
+            .resize_with(new_len.min(FAST_ARRAY_HEAD_SLOTS), || None);
+        self.blocks.resize_with(
+            new_len
+                .saturating_sub(FAST_ARRAY_HEAD_SLOTS)
+                .div_ceil(FAST_ARRAY_BLOCK_SLOTS),
+            || None,
+        );
+    }
+
+    #[inline]
+    fn get(&self, idx: usize) -> Option<&CachedPageEntry> {
+        if let Some(slot) = self.head.get(idx) {
+            return slot.as_ref();
+        }
+        let (block, slot) = Self::split(idx)?;
+        self.blocks.get(block)?.as_deref()?.slots[slot].as_ref()
+    }
+
+    /// Software-prefetch the slot at `idx` (when it is inline or its block is
+    /// allocated) and the page bytes of any entry it holds.
+    fn prefetch_hint(&self, idx: usize) {
+        let slot = if let Some(slot) = self.head.get(idx) {
+            slot
+        } else {
+            let Some((block, slot)) = Self::split(idx) else {
+                return;
+            };
+            let Some(Some(block)) = self.blocks.get(block) else {
+                return;
+            };
+            &block.slots[slot]
+        };
+        prefetch_l1_read(std::ptr::from_ref(slot));
+        if let Some(entry) = slot.as_ref() {
+            entry.prefetch_hint();
+        }
+    }
+
+    #[inline]
+    fn get_mut(&mut self, idx: usize) -> Option<&mut CachedPageEntry> {
+        if let Some(slot) = self.head.get_mut(idx) {
+            return slot.as_mut();
+        }
+        let (block, slot) = Self::split(idx)?;
+        self.blocks.get_mut(block)?.as_deref_mut()?.slots[slot].as_mut()
+    }
+
+    /// Store `entry` at `idx` (which must be below [`Self::len`]), dropping
+    /// any entry it replaces. Returns whether the slot was empty.
+    #[inline]
+    fn put(&mut self, idx: usize, entry: CachedPageEntry) -> bool {
+        debug_assert!(idx < self.len);
+        if let Some(slot) = self.head.get_mut(idx) {
+            let was_empty = slot.is_none();
+            *slot = Some(entry);
+            return was_empty;
+        }
+        let (block, slot) =
+            Self::split(idx).expect("a slot past the inline head has a block position");
+        let spare = &mut self.spare;
+        let block = self.blocks[block]
+            .get_or_insert_with(|| spare.pop().unwrap_or_else(FastPageBlock::empty));
+        let bit = 1_u64 << slot;
+        let was_empty = block.occupied & bit == 0;
+        block.occupied |= bit;
+        block.slots[slot] = Some(entry);
+        was_empty
+    }
+
+    /// Remove and return the entry at `idx`, recycling its block once the
+    /// block is empty.
+    #[inline]
+    fn take(&mut self, idx: usize) -> Option<CachedPageEntry> {
+        if let Some(slot) = self.head.get_mut(idx) {
+            return slot.take();
+        }
+        let (block_idx, slot) = Self::split(idx)?;
+        let block_ref = self.blocks.get_mut(block_idx)?;
+        let block = block_ref.as_deref_mut()?;
+        let entry = block.slots[slot].take()?;
+        block.occupied &= !(1_u64 << slot);
+        if block.occupied == 0
+            && let Some(block) = block_ref.take()
+            && self.spare.len() < FAST_ARRAY_SPARE_BLOCKS
+        {
+            self.spare.push(block);
+        }
+        Some(entry)
+    }
+
+    /// Occupied slot indices at or after `start`, ascending.
+    fn occupied_from(&self, start: usize) -> impl Iterator<Item = usize> + '_ {
+        let head = self
+            .head
+            .iter()
+            .enumerate()
+            .skip(start)
+            .filter(|(_, slot)| slot.is_some())
+            .map(|(idx, _)| idx);
+        let (first_block, first_slot) = Self::split(start).unwrap_or((0, 0));
+        let blocks =
+            self.blocks
+                .iter()
+                .enumerate()
+                .skip(first_block)
+                .flat_map(move |(block_idx, block)| {
+                    let mut bits = block.as_deref().map_or(0, |block| block.occupied);
+                    if block_idx == first_block {
+                        bits &= u64::MAX << first_slot;
+                    }
+                    let base = FAST_ARRAY_HEAD_SLOTS + block_idx * FAST_ARRAY_BLOCK_SLOTS;
+                    std::iter::from_fn(move || {
+                        if bits == 0 {
+                            return None;
+                        }
+                        let slot = bits.trailing_zeros() as usize;
+                        bits &= bits - 1;
+                        Some(base + slot)
+                    })
+                });
+        head.chain(blocks)
+    }
+
+    /// Occupied slots with their entries, ascending by index.
+    fn entries(&self) -> impl Iterator<Item = (usize, &CachedPageEntry)> + '_ {
+        self.occupied_from(0)
+            .filter_map(|idx| Some((idx, self.get(idx)?)))
+    }
+
+    /// Allocated blocks (holding at least one entry) and spare blocks.
+    #[cfg(any(test, feature = "bench-internals"))]
+    fn block_counts(&self) -> (usize, usize) {
+        (self.blocks.iter().flatten().count(), self.spare.len())
+    }
+
+    /// Bytes held by the inline head, the directory and every allocated or
+    /// spare block.
+    #[cfg(any(test, feature = "bench-internals"))]
+    fn index_bytes(&self) -> usize {
+        let (allocated, spare) = self.block_counts();
+        self.head.capacity() * std::mem::size_of::<Option<CachedPageEntry>>()
+            + self.blocks.capacity() * std::mem::size_of::<Option<Box<FastPageBlock>>>()
+            + self.spare.capacity() * std::mem::size_of::<Box<FastPageBlock>>()
+            + (allocated + spare) * std::mem::size_of::<FastPageBlock>()
+    }
+}
+
 /// Flat page array for single-connection :memory: mode (bd-fzr07).
 ///
 /// For single-connection workloads, this provides O(1) page access via direct
-/// Vec indexing, avoiding the hash computation and shard selection overhead
+/// slot indexing, avoiding the hash computation and shard selection overhead
 /// of [`ShardedPageCache`]. Pages are indexed by `(pgno - 1)` since SQLite
 /// page numbers are 1-based.
 ///
 /// # Performance
 ///
 /// - **Read latency**: ~5-10ns (Vec index + bounds check) vs 50-150ns (sharded)
-/// - **Memory**: Sparse array may waste space for databases with many gaps
+/// - **Memory**: 88 bytes per slot for the first 16Ki slots; past them, the
+///   resident pages' 64-slot blocks plus 16 bytes per 64 slots of index range
+///   ([`FastPageSlots`])
 /// - **Best for**: Sequential B-tree scans, single-writer :memory: workloads
 struct FastPageArray {
-    /// Pages indexed by `(pgno - 1)`. `None` = page not cached.
-    pages: Vec<Option<CachedPageEntry>>,
+    /// Pages indexed by `(pgno - 1)`. An empty slot = page not cached.
+    pages: FastPageSlots,
     /// Packed record of slots touched since the last clear.
     ///
     /// A removed page deliberately leaves its bit set. Re-inserting the same
@@ -1794,10 +2037,10 @@ struct FastPageArray {
 }
 
 impl FastPageArray {
-    /// Create a new fast page array with default initial capacity.
+    /// Create a new, empty fast page array.
     fn new() -> Self {
         Self {
-            pages: Vec::with_capacity(FAST_ARRAY_INITIAL_CAPACITY),
+            pages: FastPageSlots::new(),
             touched_slot_bits: Vec::new(),
             touched_words: Vec::new(),
             count: 0,
@@ -1824,7 +2067,7 @@ impl FastPageArray {
             let new_len = (idx + 1)
                 .max(self.pages.len() * 2)
                 .max(FAST_ARRAY_INITIAL_CAPACITY);
-            self.pages.resize_with(new_len, || None);
+            self.pages.grow_to(new_len);
             self.touched_slot_bits.resize(new_len.div_ceil(64), 0);
         }
     }
@@ -1844,7 +2087,7 @@ impl FastPageArray {
     #[inline]
     fn get(&mut self, page_no: PageNumber) -> Option<&[u8]> {
         let idx = Self::pgno_to_idx(page_no);
-        if let Some(Some(entry)) = self.pages.get(idx) {
+        if let Some(entry) = self.pages.get(idx) {
             self.hits = self.hits.saturating_add(1);
             Some(entry.as_slice())
         } else {
@@ -1856,7 +2099,7 @@ impl FastPageArray {
     #[inline]
     fn get_shared(&mut self, page_no: PageNumber) -> Option<PageData> {
         let idx = Self::pgno_to_idx(page_no);
-        if let Some(Some(entry)) = self.pages.get_mut(idx) {
+        if let Some(entry) = self.pages.get_mut(idx) {
             self.hits = self.hits.saturating_add(1);
             Some(entry.shared_page())
         } else {
@@ -1869,7 +2112,7 @@ impl FastPageArray {
     #[inline]
     fn get_mut(&mut self, page_no: PageNumber) -> Option<&mut [u8]> {
         let idx = Self::pgno_to_idx(page_no);
-        if let Some(Some(entry)) = self.pages.get_mut(idx) {
+        if let Some(entry) = self.pages.get_mut(idx) {
             self.hits = self.hits.saturating_add(1);
             Some(entry.as_mut_slice())
         } else {
@@ -1882,15 +2125,14 @@ impl FastPageArray {
     #[inline]
     fn contains(&self, page_no: PageNumber) -> bool {
         let idx = Self::pgno_to_idx(page_no);
-        self.pages.get(idx).is_some_and(Option::is_some)
+        self.pages.get(idx).is_some()
     }
 
     /// Insert a page buffer.
     fn insert(&mut self, page_no: PageNumber, buf: PageBuf) -> bool {
         self.ensure_capacity(page_no);
         let idx = Self::pgno_to_idx(page_no);
-        let is_new = self.pages[idx].is_none();
-        self.pages[idx] = Some(CachedPageEntry::new(buf));
+        let is_new = self.pages.put(idx, CachedPageEntry::new(buf));
         if is_new {
             self.note_touched_slot(idx);
             if self.count == 0 {
@@ -1910,9 +2152,7 @@ impl FastPageArray {
     /// Remove and return a page entry.
     fn take(&mut self, page_no: PageNumber) -> Option<CachedPageEntry> {
         let idx = Self::pgno_to_idx(page_no);
-        if let Some(slot) = self.pages.get_mut(idx)
-            && let Some(entry) = slot.take()
-        {
+        if let Some(entry) = self.pages.take(idx) {
             self.count = self.count.saturating_sub(1);
             if self.count == 0 {
                 self.next_eviction_scan_start = 0;
@@ -1932,38 +2172,31 @@ impl FastPageArray {
 
         let len = self.pages.len();
         let start = self.next_eviction_scan_start.min(len);
-        for idx in start..len {
-            if self.pages[idx].take().is_some() {
-                self.count = self.count.saturating_sub(1);
-                self.next_eviction_scan_start = if self.count == 0 || idx + 1 >= len {
-                    0
-                } else {
-                    idx + 1
-                };
-                self.evictions = self.evictions.saturating_add(1);
-                // Convert idx back to page number (1-based).
-                // idx is bounded by pages.len() which fits in usize, and we only
-                // store pages with valid PageNumber so idx+1 fits in u32.
-                #[allow(clippy::cast_possible_truncation)]
-                return PageNumber::new((idx + 1) as u32);
-            }
-        }
-        for idx in 0..start {
-            if self.pages[idx].take().is_some() {
-                self.count = self.count.saturating_sub(1);
-                self.next_eviction_scan_start = if self.count == 0 || idx + 1 >= len {
-                    0
-                } else {
-                    idx + 1
-                };
-                self.evictions = self.evictions.saturating_add(1);
-                #[allow(clippy::cast_possible_truncation)]
-                return PageNumber::new((idx + 1) as u32);
-            }
-        }
-
-        self.next_eviction_scan_start = 0;
-        None
+        // The first resident slot of `start..len`, else of `0..start`.
+        let victim = self
+            .pages
+            .occupied_from(start)
+            .take_while(|&idx| idx < len)
+            .chain(self.pages.occupied_from(0).take_while(|&idx| idx < start))
+            .next();
+        let Some(idx) = victim else {
+            self.next_eviction_scan_start = 0;
+            return None;
+        };
+        let _ = self.pages.take(idx);
+        self.count = self.count.saturating_sub(1);
+        self.next_eviction_scan_start = if self.count == 0 || idx + 1 >= len {
+            0
+        } else {
+            idx + 1
+        };
+        self.evictions = self.evictions.saturating_add(1);
+        // Convert idx back to page number (1-based).
+        // idx is bounded by pages.len() which fits in usize, and we only
+        // store pages with valid PageNumber so idx+1 fits in u32.
+        #[allow(clippy::cast_possible_truncation)]
+        let raw_page_no = (idx + 1) as u32;
+        PageNumber::new(raw_page_no)
     }
 
     /// Remove and return the next clean buffer owned by `pool`.
@@ -1978,32 +2211,34 @@ impl FastPageArray {
 
         let len = self.pages.len();
         let start = self.next_eviction_scan_start.min(len);
-        for idx in (start..len).chain(0..start) {
-            let reclaimable = self.pages[idx]
-                .as_ref()
-                .is_some_and(|entry| !entry.is_dirty() && entry.buf.returns_to_pool(pool));
-            if !reclaimable {
-                continue;
-            }
+        // Resident slots of `start..len`, then of `0..start`.
+        let pages = &self.pages;
+        let idx = pages
+            .occupied_from(start)
+            .take_while(|&idx| idx < len)
+            .chain(pages.occupied_from(0).take_while(|&idx| idx < start))
+            .find(|&idx| {
+                pages
+                    .get(idx)
+                    .is_some_and(|entry| !entry.is_dirty() && entry.buf.returns_to_pool(pool))
+            })?;
 
-            let entry = self.pages[idx]
-                .take()
-                .expect("reclaimable fast-array entry must still be present");
-            self.count = self.count.saturating_sub(1);
-            self.next_eviction_scan_start = if self.count == 0 || idx + 1 >= len {
-                0
-            } else {
-                idx + 1
-            };
-            self.evictions = self.evictions.saturating_add(1);
-            let raw_page_no = u32::try_from(idx + 1)
-                .expect("resident fast-array index must fit in a page number");
-            let page_no = PageNumber::new(raw_page_no)
-                .expect("resident fast-array index must be a valid page number");
-            return Some((page_no, entry.buf));
-        }
-
-        None
+        let entry = self
+            .pages
+            .take(idx)
+            .expect("reclaimable fast-array entry must still be present");
+        self.count = self.count.saturating_sub(1);
+        self.next_eviction_scan_start = if self.count == 0 || idx + 1 >= len {
+            0
+        } else {
+            idx + 1
+        };
+        self.evictions = self.evictions.saturating_add(1);
+        let raw_page_no =
+            u32::try_from(idx + 1).expect("resident fast-array index must fit in a page number");
+        let page_no = PageNumber::new(raw_page_no)
+            .expect("resident fast-array index must be a valid page number");
+        Some((page_no, entry.buf))
     }
 
     /// Clear all pages.
@@ -2017,7 +2252,7 @@ impl FastPageArray {
             while word != 0 {
                 let bit_idx = word.trailing_zeros() as usize;
                 let slot_idx = word_idx * 64 + bit_idx;
-                let _ = self.pages[slot_idx].take();
+                let _ = self.pages.take(slot_idx);
                 word &= word - 1;
             }
         }
@@ -2031,7 +2266,7 @@ impl FastPageArray {
         let removed = self.count;
         self.count = 0;
         self.next_eviction_scan_start = 0;
-        self.pages = Vec::with_capacity(FAST_ARRAY_INITIAL_CAPACITY);
+        self.pages = FastPageSlots::new();
         self.touched_slot_bits = Vec::new();
         self.touched_words = Vec::new();
         self.evictions = self.evictions.saturating_add(removed as u64);
@@ -2046,10 +2281,8 @@ impl FastPageArray {
 
     fn resident_pages(&self) -> Vec<PageNumber> {
         self.pages
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, slot)| {
-                slot.as_ref()?;
+            .occupied_from(0)
+            .filter_map(|idx| {
                 let pgno = u32::try_from(idx.saturating_add(1)).ok()?;
                 PageNumber::new(pgno)
             })
@@ -2066,14 +2299,436 @@ impl FastPageArray {
 
     /// Best-effort software prefetch for an imminent page lookup.
     fn prefetch_page_hint(&self, page_no: PageNumber) {
-        let idx = Self::pgno_to_idx(page_no);
-        let Some(slot) = self.pages.get(idx) else {
-            return;
-        };
+        self.pages.prefetch_hint(Self::pgno_to_idx(page_no));
+    }
+}
 
-        prefetch_l1_read(std::ptr::from_ref(slot));
-        if let Some(entry) = slot.as_ref() {
-            entry.prefetch_hint();
+/// Equivalence oracle and same-invocation A/B for [`FastPageSlots`].
+///
+/// [`LegacyFlatFastPageArray`] is the fast array as it was before the sparse
+/// slot table: a flat `Vec<Option<CachedPageEntry>>`, its methods copied
+/// verbatim (only those the oracle and bench call). Both arms sit behind
+/// [`FastPageArrayArm`] so a test or bench drives them through identical
+/// operation sequences.
+#[cfg(any(test, feature = "bench-internals"))]
+#[doc(hidden)]
+pub mod fast_page_array_ab {
+    use fsqlite_types::PageNumber;
+
+    use super::{CachedPageEntry, FAST_ARRAY_INITIAL_CAPACITY, FastPageArray};
+    use crate::page_buf::{PageBuf, PageBufPool};
+
+    /// One fast-array implementation, as the oracle and the bench drive it.
+    pub trait FastPageArrayArm {
+        fn new_empty() -> Self;
+        fn insert(&mut self, page_no: PageNumber, buf: PageBuf) -> bool;
+        /// `get`, returning the page's first byte.
+        fn read_first_byte(&mut self, page_no: PageNumber) -> Option<u8>;
+        /// `get_mut` (which marks the page dirty), then overwrite its first byte.
+        fn write_first_byte(&mut self, page_no: PageNumber, byte: u8) -> bool;
+        fn contains(&self, page_no: PageNumber) -> bool;
+        fn remove(&mut self, page_no: PageNumber) -> bool;
+        fn remove_any(&mut self) -> Option<PageNumber>;
+        fn take_any_clean_from_pool(&mut self, pool: &PageBufPool)
+        -> Option<(PageNumber, PageBuf)>;
+        fn clear(&mut self) -> usize;
+        fn cold_reset(&mut self) -> usize;
+        fn resident_count(&self) -> usize;
+        /// Logical slot count: the flat vector's `len()`.
+        fn index_len(&self) -> usize;
+        fn eviction_cursor(&self) -> usize;
+        fn resident_pages(&self) -> Vec<PageNumber>;
+        /// `(hits, misses, admits, evictions)`.
+        fn metrics(&self) -> (u64, u64, u64, u64);
+        /// Bytes held by the slot index itself (page buffers excluded).
+        fn index_bytes(&self) -> usize;
+    }
+
+    /// The production fast array (sparse slot table).
+    pub struct Sparse(FastPageArray);
+
+    impl Sparse {
+        /// `(allocated, spare)` slot blocks.
+        #[must_use]
+        pub fn block_counts(&self) -> (usize, usize) {
+            self.0.pages.block_counts()
+        }
+    }
+
+    impl FastPageArrayArm for Sparse {
+        fn new_empty() -> Self {
+            Self(FastPageArray::new())
+        }
+
+        fn insert(&mut self, page_no: PageNumber, buf: PageBuf) -> bool {
+            self.0.insert(page_no, buf)
+        }
+
+        fn read_first_byte(&mut self, page_no: PageNumber) -> Option<u8> {
+            self.0.get(page_no).map(|bytes| bytes[0])
+        }
+
+        fn write_first_byte(&mut self, page_no: PageNumber, byte: u8) -> bool {
+            let Some(bytes) = self.0.get_mut(page_no) else {
+                return false;
+            };
+            bytes[0] = byte;
+            true
+        }
+
+        fn contains(&self, page_no: PageNumber) -> bool {
+            self.0.contains(page_no)
+        }
+
+        fn remove(&mut self, page_no: PageNumber) -> bool {
+            self.0.remove(page_no)
+        }
+
+        fn remove_any(&mut self) -> Option<PageNumber> {
+            self.0.remove_any()
+        }
+
+        fn take_any_clean_from_pool(
+            &mut self,
+            pool: &PageBufPool,
+        ) -> Option<(PageNumber, PageBuf)> {
+            self.0.take_any_clean_from_pool(pool)
+        }
+
+        fn clear(&mut self) -> usize {
+            self.0.clear()
+        }
+
+        fn cold_reset(&mut self) -> usize {
+            self.0.cold_reset()
+        }
+
+        fn resident_count(&self) -> usize {
+            self.0.len()
+        }
+
+        fn index_len(&self) -> usize {
+            self.0.pages.len()
+        }
+
+        fn eviction_cursor(&self) -> usize {
+            self.0.next_eviction_scan_start
+        }
+
+        fn resident_pages(&self) -> Vec<PageNumber> {
+            self.0.resident_pages()
+        }
+
+        fn metrics(&self) -> (u64, u64, u64, u64) {
+            (self.0.hits, self.0.misses, self.0.admits, self.0.evictions)
+        }
+
+        fn index_bytes(&self) -> usize {
+            self.0.pages.index_bytes()
+                + self.0.touched_slot_bits.capacity() * std::mem::size_of::<u64>()
+                + self.0.touched_words.capacity() * std::mem::size_of::<usize>()
+        }
+    }
+
+    /// The fast array before the sparse slot table (verbatim, flat storage).
+    pub struct LegacyFlatFastPageArray {
+        pages: Vec<Option<CachedPageEntry>>,
+        touched_slot_bits: Vec<u64>,
+        touched_words: Vec<usize>,
+        count: usize,
+        next_eviction_scan_start: usize,
+        hits: u64,
+        misses: u64,
+        admits: u64,
+        evictions: u64,
+    }
+
+    impl LegacyFlatFastPageArray {
+        fn new() -> Self {
+            Self {
+                pages: Vec::with_capacity(FAST_ARRAY_INITIAL_CAPACITY),
+                touched_slot_bits: Vec::new(),
+                touched_words: Vec::new(),
+                count: 0,
+                next_eviction_scan_start: 0,
+                hits: 0,
+                misses: 0,
+                admits: 0,
+                evictions: 0,
+            }
+        }
+
+        fn ensure_capacity(&mut self, page_no: PageNumber) {
+            let idx = FastPageArray::pgno_to_idx(page_no);
+            if idx >= self.pages.len() {
+                // Grow to at least idx + 1, but prefer doubling for amortized O(1)
+                let new_len = (idx + 1)
+                    .max(self.pages.len() * 2)
+                    .max(FAST_ARRAY_INITIAL_CAPACITY);
+                self.pages.resize_with(new_len, || None);
+                self.touched_slot_bits.resize(new_len.div_ceil(64), 0);
+            }
+        }
+
+        fn note_touched_slot(&mut self, idx: usize) {
+            let word_idx = idx / 64;
+            let bit = 1_u64 << (idx % 64);
+            let word = &mut self.touched_slot_bits[word_idx];
+            if *word == 0 {
+                self.touched_words.push(word_idx);
+            }
+            *word |= bit;
+        }
+
+        fn get(&mut self, page_no: PageNumber) -> Option<&[u8]> {
+            let idx = FastPageArray::pgno_to_idx(page_no);
+            if let Some(Some(entry)) = self.pages.get(idx) {
+                self.hits = self.hits.saturating_add(1);
+                Some(entry.as_slice())
+            } else {
+                self.misses = self.misses.saturating_add(1);
+                None
+            }
+        }
+
+        fn get_mut(&mut self, page_no: PageNumber) -> Option<&mut [u8]> {
+            let idx = FastPageArray::pgno_to_idx(page_no);
+            if let Some(Some(entry)) = self.pages.get_mut(idx) {
+                self.hits = self.hits.saturating_add(1);
+                Some(entry.as_mut_slice())
+            } else {
+                self.misses = self.misses.saturating_add(1);
+                None
+            }
+        }
+
+        fn contains(&self, page_no: PageNumber) -> bool {
+            let idx = FastPageArray::pgno_to_idx(page_no);
+            self.pages.get(idx).is_some_and(Option::is_some)
+        }
+
+        fn insert(&mut self, page_no: PageNumber, buf: PageBuf) -> bool {
+            self.ensure_capacity(page_no);
+            let idx = FastPageArray::pgno_to_idx(page_no);
+            let is_new = self.pages[idx].is_none();
+            self.pages[idx] = Some(CachedPageEntry::new(buf));
+            if is_new {
+                self.note_touched_slot(idx);
+                if self.count == 0 {
+                    self.next_eviction_scan_start = idx;
+                }
+                self.count += 1;
+                self.admits = self.admits.saturating_add(1);
+            }
+            is_new
+        }
+
+        fn take(&mut self, page_no: PageNumber) -> Option<CachedPageEntry> {
+            let idx = FastPageArray::pgno_to_idx(page_no);
+            if let Some(slot) = self.pages.get_mut(idx)
+                && let Some(entry) = slot.take()
+            {
+                self.count = self.count.saturating_sub(1);
+                if self.count == 0 {
+                    self.next_eviction_scan_start = 0;
+                }
+                self.evictions = self.evictions.saturating_add(1);
+                return Some(entry);
+            }
+            None
+        }
+
+        fn remove_any(&mut self) -> Option<PageNumber> {
+            if self.count == 0 || self.pages.is_empty() {
+                self.next_eviction_scan_start = 0;
+                return None;
+            }
+
+            let len = self.pages.len();
+            let start = self.next_eviction_scan_start.min(len);
+            for idx in start..len {
+                if self.pages[idx].take().is_some() {
+                    self.count = self.count.saturating_sub(1);
+                    self.next_eviction_scan_start = if self.count == 0 || idx + 1 >= len {
+                        0
+                    } else {
+                        idx + 1
+                    };
+                    self.evictions = self.evictions.saturating_add(1);
+                    return PageNumber::new((idx + 1) as u32);
+                }
+            }
+            for idx in 0..start {
+                if self.pages[idx].take().is_some() {
+                    self.count = self.count.saturating_sub(1);
+                    self.next_eviction_scan_start = if self.count == 0 || idx + 1 >= len {
+                        0
+                    } else {
+                        idx + 1
+                    };
+                    self.evictions = self.evictions.saturating_add(1);
+                    return PageNumber::new((idx + 1) as u32);
+                }
+            }
+
+            self.next_eviction_scan_start = 0;
+            None
+        }
+
+        fn take_any_clean_from_pool(
+            &mut self,
+            pool: &PageBufPool,
+        ) -> Option<(PageNumber, PageBuf)> {
+            if self.count == 0 || self.pages.is_empty() {
+                self.next_eviction_scan_start = 0;
+                return None;
+            }
+
+            let len = self.pages.len();
+            let start = self.next_eviction_scan_start.min(len);
+            for idx in (start..len).chain(0..start) {
+                let reclaimable = self.pages[idx]
+                    .as_ref()
+                    .is_some_and(|entry| !entry.is_dirty() && entry.buf.returns_to_pool(pool));
+                if !reclaimable {
+                    continue;
+                }
+
+                let entry = self.pages[idx]
+                    .take()
+                    .expect("reclaimable fast-array entry must still be present");
+                self.count = self.count.saturating_sub(1);
+                self.next_eviction_scan_start = if self.count == 0 || idx + 1 >= len {
+                    0
+                } else {
+                    idx + 1
+                };
+                self.evictions = self.evictions.saturating_add(1);
+                let raw_page_no = u32::try_from(idx + 1)
+                    .expect("resident fast-array index must fit in a page number");
+                let page_no = PageNumber::new(raw_page_no)
+                    .expect("resident fast-array index must be a valid page number");
+                return Some((page_no, entry.buf));
+            }
+
+            None
+        }
+
+        fn clear(&mut self) -> usize {
+            let removed = self.count;
+            self.count = 0;
+            self.next_eviction_scan_start = 0;
+            for active_idx in 0..self.touched_words.len() {
+                let word_idx = self.touched_words[active_idx];
+                let mut word = std::mem::take(&mut self.touched_slot_bits[word_idx]);
+                while word != 0 {
+                    let bit_idx = word.trailing_zeros() as usize;
+                    let slot_idx = word_idx * 64 + bit_idx;
+                    let _ = self.pages[slot_idx].take();
+                    word &= word - 1;
+                }
+            }
+            self.touched_words.clear();
+            self.evictions = self.evictions.saturating_add(removed as u64);
+            removed
+        }
+
+        fn cold_reset(&mut self) -> usize {
+            let removed = self.count;
+            self.count = 0;
+            self.next_eviction_scan_start = 0;
+            self.pages = Vec::with_capacity(FAST_ARRAY_INITIAL_CAPACITY);
+            self.touched_slot_bits = Vec::new();
+            self.touched_words = Vec::new();
+            self.evictions = self.evictions.saturating_add(removed as u64);
+            removed
+        }
+
+        fn resident_pages(&self) -> Vec<PageNumber> {
+            self.pages
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, slot)| {
+                    slot.as_ref()?;
+                    let pgno = u32::try_from(idx.saturating_add(1)).ok()?;
+                    PageNumber::new(pgno)
+                })
+                .collect()
+        }
+    }
+
+    impl FastPageArrayArm for LegacyFlatFastPageArray {
+        fn new_empty() -> Self {
+            Self::new()
+        }
+
+        fn insert(&mut self, page_no: PageNumber, buf: PageBuf) -> bool {
+            Self::insert(self, page_no, buf)
+        }
+
+        fn read_first_byte(&mut self, page_no: PageNumber) -> Option<u8> {
+            self.get(page_no).map(|bytes| bytes[0])
+        }
+
+        fn write_first_byte(&mut self, page_no: PageNumber, byte: u8) -> bool {
+            let Some(bytes) = self.get_mut(page_no) else {
+                return false;
+            };
+            bytes[0] = byte;
+            true
+        }
+
+        fn contains(&self, page_no: PageNumber) -> bool {
+            Self::contains(self, page_no)
+        }
+
+        fn remove(&mut self, page_no: PageNumber) -> bool {
+            self.take(page_no).is_some()
+        }
+
+        fn remove_any(&mut self) -> Option<PageNumber> {
+            Self::remove_any(self)
+        }
+
+        fn take_any_clean_from_pool(
+            &mut self,
+            pool: &PageBufPool,
+        ) -> Option<(PageNumber, PageBuf)> {
+            Self::take_any_clean_from_pool(self, pool)
+        }
+
+        fn clear(&mut self) -> usize {
+            Self::clear(self)
+        }
+
+        fn cold_reset(&mut self) -> usize {
+            Self::cold_reset(self)
+        }
+
+        fn resident_count(&self) -> usize {
+            self.count
+        }
+
+        fn index_len(&self) -> usize {
+            self.pages.len()
+        }
+
+        fn eviction_cursor(&self) -> usize {
+            self.next_eviction_scan_start
+        }
+
+        fn resident_pages(&self) -> Vec<PageNumber> {
+            Self::resident_pages(self)
+        }
+
+        fn metrics(&self) -> (u64, u64, u64, u64) {
+            (self.hits, self.misses, self.admits, self.evictions)
+        }
+
+        fn index_bytes(&self) -> usize {
+            self.pages.capacity() * std::mem::size_of::<Option<CachedPageEntry>>()
+                + self.touched_slot_bits.capacity() * std::mem::size_of::<u64>()
+                + self.touched_words.capacity() * std::mem::size_of::<usize>()
         }
     }
 }
@@ -3343,7 +3998,7 @@ impl ShardedPageCache {
             && let Some(ref fast) = self.fast_array
         {
             let idx = FastPageArray::pgno_to_idx(page_no);
-            if let Some(Some(entry)) = fast.lock().pages.get(idx) {
+            if let Some(entry) = fast.lock().pages.get(idx) {
                 entry.record_access();
             }
             return;
@@ -3370,7 +4025,7 @@ impl ShardedPageCache {
             && let Some(ref fast) = self.fast_array
         {
             let idx = FastPageArray::pgno_to_idx(page_no);
-            if let Some(Some(entry)) = fast.lock().pages.get(idx)
+            if let Some(entry) = fast.lock().pages.get(idx)
                 && entry.matches_write_snapshot(snapshot)
             {
                 entry.mark_clean();
@@ -3406,10 +4061,7 @@ impl ShardedPageCache {
             && let Some(ref fast) = self.fast_array
         {
             let mut fast = fast.lock();
-            let entry = fast
-                .pages
-                .get_mut(FastPageArray::pgno_to_idx(page_no))?
-                .as_mut()?;
+            let entry = fast.pages.get_mut(FastPageArray::pgno_to_idx(page_no))?;
             return Some(entry.page_write_snapshot());
         }
 
@@ -3907,7 +4559,7 @@ impl ShardedPageCache {
             buf.as_mut_slice().fill(0);
             let result = f(buf.as_mut_slice());
             let admitted_new = arr.insert(page_no, buf);
-            if let Some(Some(entry)) = arr.pages.get_mut(FastPageArray::pgno_to_idx(page_no)) {
+            if let Some(entry) = arr.pages.get_mut(FastPageArray::pgno_to_idx(page_no)) {
                 entry.mark_dirty();
                 entry.record_access();
             }
@@ -4036,7 +4688,6 @@ impl ShardedPageCache {
             let clean = fast
                 .pages
                 .get(idx)
-                .and_then(Option::as_ref)
                 .is_some_and(|entry| !entry.is_dirty() && entry.buf.returns_to_pool(&self.pool));
             let entry = clean.then(|| fast.take(page_no)).flatten();
             drop(fast);
@@ -4466,8 +5117,8 @@ impl ShardedPageCache {
             let arr = fast.lock();
             let dirty_pages = arr
                 .pages
-                .iter()
-                .filter(|slot| slot.as_ref().is_some_and(CachedPageEntry::is_dirty))
+                .entries()
+                .filter(|(_, entry)| entry.is_dirty())
                 .count();
             let queue_snapshot = {
                 let tracker = self.eviction_policy.lock();
@@ -4603,10 +5254,7 @@ impl ShardedPageCache {
         if self.use_fast_path.load(Ordering::Relaxed) {
             if let Some(ref fast) = self.fast_array {
                 let arr = fast.lock();
-                for (idx, slot) in arr.pages.iter().enumerate() {
-                    let Some(entry) = slot.as_ref() else {
-                        continue;
-                    };
+                for (idx, entry) in arr.pages.entries() {
                     let Some(pgno) = u32::try_from(idx.saturating_add(1))
                         .ok()
                         .and_then(PageNumber::new)
@@ -10197,6 +10845,239 @@ mod tests {
         // Verify sparse pages are None
         assert!(!arr.contains(PageNumber::new(1000).unwrap()));
         assert!(!arr.contains(PageNumber::new(1999).unwrap()));
+    }
+
+    /// xorshift64* for the fast-array oracle's operation streams.
+    struct FastArrayOracleRng(u64);
+
+    impl FastArrayOracleRng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+    }
+
+    /// Drive the production fast array and the verbatim pre-sparse flat array
+    /// through one seeded operation stream over pages
+    /// `first_page .. first_page + page_space`, requiring identical results,
+    /// resident sets, eviction victims, cursors, logical lengths and metrics
+    /// after every step (resident sets every `resident_check_every` steps and
+    /// at the end).
+    fn run_fast_array_oracle(
+        seed: u64,
+        first_page: u32,
+        page_space: u32,
+        steps: usize,
+        resident_check_every: usize,
+    ) {
+        use super::fast_page_array_ab::{FastPageArrayArm, LegacyFlatFastPageArray, Sparse};
+
+        const MAX_RESIDENT: usize = 256;
+        let last_page = first_page + (page_space - 1);
+        let legacy_pool = PageBufPool::new(PageSize::DEFAULT, 2 * MAX_RESIDENT);
+        let sparse_pool = PageBufPool::new(PageSize::DEFAULT, 2 * MAX_RESIDENT);
+        let mut legacy = LegacyFlatFastPageArray::new_empty();
+        let mut sparse = Sparse::new_empty();
+        let mut rng = FastArrayOracleRng(seed | 1);
+        let mut hot_base = first_page;
+        for step in 0..steps {
+            if step % 512 == 0 {
+                hot_base = first_page + (rng.next() % u64::from(page_space)) as u32;
+            }
+            let pick = rng.next();
+            let raw_page = if pick.is_multiple_of(4) {
+                first_page + ((pick >> 8) % u64::from(page_space)) as u32
+            } else {
+                (hot_base + ((pick >> 8) % 96) as u32).min(last_page)
+            };
+            let page_no = PageNumber::new(raw_page).unwrap();
+            let case = format!("seed={seed} space={page_space} step={step} page={raw_page}");
+            match rng.next() % 16 {
+                0..=5 => {
+                    if legacy.resident_count() >= MAX_RESIDENT {
+                        assert_eq!(legacy.remove_any(), sparse.remove_any(), "{case} cap");
+                    }
+                    let mut legacy_buf = legacy_pool.acquire().unwrap();
+                    let mut sparse_buf = sparse_pool.acquire().unwrap();
+                    legacy_buf.as_mut_slice()[0] = step as u8;
+                    sparse_buf.as_mut_slice()[0] = step as u8;
+                    assert_eq!(
+                        legacy.insert(page_no, legacy_buf),
+                        sparse.insert(page_no, sparse_buf),
+                        "{case} insert"
+                    );
+                }
+                6..=8 => assert_eq!(
+                    legacy.read_first_byte(page_no),
+                    sparse.read_first_byte(page_no),
+                    "{case} get"
+                ),
+                9 => assert_eq!(
+                    legacy.write_first_byte(page_no, !(step as u8)),
+                    sparse.write_first_byte(page_no, !(step as u8)),
+                    "{case} get_mut"
+                ),
+                10 => assert_eq!(
+                    legacy.contains(page_no),
+                    sparse.contains(page_no),
+                    "{case} contains"
+                ),
+                11 => assert_eq!(
+                    legacy.remove(page_no),
+                    sparse.remove(page_no),
+                    "{case} remove"
+                ),
+                12 => assert_eq!(
+                    legacy.remove_any(),
+                    sparse.remove_any(),
+                    "{case} remove_any"
+                ),
+                13 => {
+                    let legacy_victim = legacy
+                        .take_any_clean_from_pool(&legacy_pool)
+                        .map(|(page, buf)| (page, buf.as_slice()[0]));
+                    let sparse_victim = sparse
+                        .take_any_clean_from_pool(&sparse_pool)
+                        .map(|(page, buf)| (page, buf.as_slice()[0]));
+                    assert_eq!(legacy_victim, sparse_victim, "{case} take_any_clean");
+                }
+                14 if rng.next().is_multiple_of(8) => {
+                    assert_eq!(legacy.clear(), sparse.clear(), "{case} clear");
+                }
+                15 if rng.next().is_multiple_of(32) => {
+                    assert_eq!(
+                        legacy.cold_reset(),
+                        sparse.cold_reset(),
+                        "{case} cold_reset"
+                    );
+                }
+                _ => {}
+            }
+            assert_eq!(
+                legacy.resident_count(),
+                sparse.resident_count(),
+                "{case} len"
+            );
+            assert_eq!(legacy.index_len(), sparse.index_len(), "{case} index_len");
+            assert_eq!(
+                legacy.eviction_cursor(),
+                sparse.eviction_cursor(),
+                "{case} cursor"
+            );
+            assert_eq!(legacy.metrics(), sparse.metrics(), "{case} metrics");
+            if step % resident_check_every == 0 {
+                assert_eq!(
+                    legacy.resident_pages(),
+                    sparse.resident_pages(),
+                    "{case} residents"
+                );
+            }
+        }
+        assert_eq!(legacy.resident_pages(), sparse.resident_pages());
+        assert_eq!(legacy.clear(), sparse.clear());
+        let (allocated, spare) = sparse.block_counts();
+        assert_eq!(allocated, 0, "clear leaves no allocated block");
+        assert!(spare <= super::FAST_ARRAY_SPARE_BLOCKS);
+    }
+
+    #[test]
+    fn test_fast_page_array_sparse_slots_match_legacy_flat_array() {
+        // Pages 1..=HEAD sit in the inline head; later pages are in blocks.
+        let head_pages = FAST_ARRAY_HEAD_SLOTS as u32;
+        for seed in [1, 0x9E37_79B9_7F4A_7C15, 0xDEAD_BEEF] {
+            // Dense: the :memory: shape, every page inside the inline head.
+            run_fast_array_oracle(seed, 1, 300, 20_000, 64);
+            // Dense across the head's end and the first few blocks.
+            run_fast_array_oracle(seed, head_pages - 150, 300, 20_000, 64);
+            // Sparse: resident pages scattered over a few thousand blocks.
+            run_fast_array_oracle(seed, 1, 200_000, 20_000, 64);
+        }
+        // Wide: a large file's page range, where the flat array's length (and
+        // its cursor wrap point) is set by the highest page ever touched.
+        run_fast_array_oracle(7, 1, 1_500_000, 6_000, 256);
+    }
+
+    #[test]
+    fn test_fast_page_array_high_page_keeps_index_sparse() {
+        // The canonical cass archive: 54,020,823 pages (221 GB). One read of
+        // its last page made the flat array 54,020,823 inline 88-byte slots,
+        // 4.75 GB resident per read-only connection.
+        const LAST_PAGE: u32 = 54_020_823;
+        let mut arr = FastPageArray::new();
+        let pool = PageBufPool::new(PageSize::DEFAULT, 4);
+        let high = PageNumber::new(LAST_PAGE).unwrap();
+
+        assert!(arr.insert(high, pool.acquire().unwrap()));
+        assert_eq!(
+            arr.pages.len(),
+            LAST_PAGE as usize,
+            "bead_id={BEAD_FZR07} case=logical_length_grows_as_before"
+        );
+        assert_eq!(arr.pages.block_counts(), (1, 0));
+        // Inline head (1.4 MB) + directory (6.8 MB) + one block, against
+        // 4.75 GB for the flat array.
+        assert!(
+            arr.pages.index_bytes() < 9 << 20,
+            "bead_id={BEAD_FZR07} case=high_page_index_stays_sparse bytes={}",
+            arr.pages.index_bytes()
+        );
+        assert_eq!(arr.get(high).map(<[u8]>::len), Some(4096));
+        assert!(!arr.contains(PageNumber::new(LAST_PAGE - 1).unwrap()));
+
+        assert!(arr.remove(high));
+        assert_eq!(
+            arr.pages.block_counts(),
+            (0, 1),
+            "bead_id={BEAD_FZR07} case=empty_block_is_recycled"
+        );
+        assert!(arr.insert(PageNumber::ONE, pool.acquire().unwrap()));
+        assert_eq!(
+            arr.pages.block_counts(),
+            (0, 1),
+            "bead_id={BEAD_FZR07} case=head_page_needs_no_block"
+        );
+        let other_block = PageNumber::new(LAST_PAGE - 64).unwrap();
+        assert!(arr.insert(other_block, pool.acquire().unwrap()));
+        assert_eq!(
+            arr.pages.block_counts(),
+            (1, 0),
+            "bead_id={BEAD_FZR07} case=spare_block_is_reused"
+        );
+        assert_eq!(arr.resident_pages(), vec![PageNumber::ONE, other_block]);
+    }
+
+    #[test]
+    fn test_fast_page_array_spare_blocks_are_bounded() {
+        let blocks = FAST_ARRAY_SPARE_BLOCKS + 6;
+        let mut arr = FastPageArray::new();
+        let pool = PageBufPool::new(PageSize::DEFAULT, blocks);
+        // One page in each of the first `blocks` blocks past the inline head.
+        let pages: Vec<PageNumber> = (0..blocks)
+            .map(|block| {
+                let idx = FAST_ARRAY_HEAD_SLOTS + block * FAST_ARRAY_BLOCK_SLOTS;
+                PageNumber::new((idx + 1) as u32).unwrap()
+            })
+            .collect();
+        for &page_no in &pages {
+            arr.insert(page_no, pool.acquire().unwrap());
+        }
+        assert_eq!(arr.pages.block_counts(), (blocks, 0));
+
+        assert_eq!(arr.clear(), blocks);
+        assert_eq!(
+            arr.pages.block_counts(),
+            (0, FAST_ARRAY_SPARE_BLOCKS),
+            "bead_id={BEAD_FZR07} case=clear_keeps_at_most_the_spare_cap"
+        );
+        for &page_no in &pages {
+            assert!(!arr.contains(page_no));
+        }
+        for &page_no in &pages[..3] {
+            arr.insert(page_no, pool.acquire().unwrap());
+        }
+        assert_eq!(arr.pages.block_counts(), (3, FAST_ARRAY_SPARE_BLOCKS - 3));
     }
 
     #[test]
