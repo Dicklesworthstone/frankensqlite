@@ -8605,6 +8605,73 @@ impl<F: VfsFile> Drop for DisownedPageReclaimAttempt<F> {
     }
 }
 
+/// Keeps commit-preparation candidates owned while `PagerInner` stays locked.
+///
+/// Unlike [`DisownedPageReclaimAttempt`], this guard borrows the pool directly:
+/// cancellation must restore unchecked pages without trying to lock the mutex
+/// the commit already holds. The current page remains in `candidates` until
+/// its WAL read finishes and ownership transfers or the page is proven live.
+struct CommitAbandonmentCandidates<'a> {
+    pool: &'a mut Vec<PageNumber>,
+    candidates: Vec<PageNumber>,
+    classified: usize,
+}
+
+impl<'a> CommitAbandonmentCandidates<'a> {
+    fn take_eligible(
+        pool: &'a mut Vec<PageNumber>,
+        mut eligible: impl FnMut(&PageNumber) -> bool,
+    ) -> Self {
+        let mut candidates = Vec::new();
+        // `retain` preserves the pool's allocation. Together with the exclusive
+        // borrow, that guarantees enough spare capacity to restore every
+        // extracted candidate, including the one awaiting a WAL read.
+        pool.retain(|page| {
+            if eligible(page) {
+                candidates.push(*page);
+                false
+            } else {
+                true
+            }
+        });
+        Self {
+            pool,
+            candidates,
+            classified: 0,
+        }
+    }
+
+    fn current(&self) -> Option<PageNumber> {
+        self.candidates.get(self.classified).copied()
+    }
+
+    fn finish_classified(&mut self) {
+        debug_assert!(self.classified < self.candidates.len());
+        self.classified += 1;
+    }
+
+    fn finish_retained(&mut self) {
+        let page = self.current().expect("a retained candidate must be current");
+        self.pool.push(page);
+        self.finish_classified();
+    }
+
+    fn discard_remaining(&mut self) {
+        self.classified = self.candidates.len();
+    }
+}
+
+impl Drop for CommitAbandonmentCandidates<'_> {
+    fn drop(&mut self) {
+        // No allocation, locking, or I/O is allowed on cancellation. Every
+        // slot restored here was removed by `take_eligible`, and no caller can
+        // consume its reserved capacity while this guard borrows the pool.
+        let unchecked = &self.candidates[self.classified..];
+        debug_assert!(self.pool.capacity() - self.pool.len() >= unchecked.len());
+        self.pool.extend_from_slice(unchecked);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CommittedStateRefresh {
     wal_snapshot_initialized: bool,
@@ -27434,31 +27501,34 @@ where
                 inner
                     .abandoned_eof_reservations
                     .append(&mut self.reclaimed_abandoned_reservations);
-                let mut abandoned_candidates: Vec<PageNumber> = Vec::new();
+                let pool_generation = inner.committed_wal_generation;
                 let mut dw8oe_above = 0_usize;
-                inner.abandoned_eof_reservations.retain(|page| {
-                    let eligible = page.get() <= committed_db_size
-                        && !pending_free_pages.contains(page)
-                        && !self.write_set.contains_key(page);
-                    if !eligible && page.get() > committed_db_size {
-                        dw8oe_above += 1;
-                    }
-                    if eligible {
-                        abandoned_candidates.push(*page);
-                    }
-                    !eligible
-                });
+                // bd-ioq6x.1: WAL acquisition, refresh, and page reads may
+                // fail or suspend. Keep every unchecked candidate owned by a
+                // borrowed-pool guard until its classification is complete.
+                let mut abandoned_candidates = CommitAbandonmentCandidates::take_eligible(
+                    &mut inner.abandoned_eof_reservations,
+                    |page| {
+                        let eligible = page.get() <= committed_db_size
+                            && !pending_free_pages.contains(page)
+                            && !self.write_set.contains_key(page);
+                        if !eligible && page.get() > committed_db_size {
+                            dw8oe_above += 1;
+                        }
+                        eligible
+                    },
+                );
                 if std::env::var_os("DW8OE_TRACE").is_some()
-                    && (!inner.abandoned_eof_reservations.is_empty()
-                        || !abandoned_candidates.is_empty())
+                    && (!abandoned_candidates.pool.is_empty()
+                        || !abandoned_candidates.candidates.is_empty())
                 {
                     eprintln!(
                         "DW8OE FOLD pool_retained={} eligible={} above_committed={dw8oe_above} committed_db={committed_db_size}",
-                        inner.abandoned_eof_reservations.len(),
-                        abandoned_candidates.len(),
+                        abandoned_candidates.pool.len(),
+                        abandoned_candidates.candidates.len(),
                     );
                 }
-                if !abandoned_candidates.is_empty() {
+                if abandoned_candidates.current().is_some() {
                     let backend = wal_backend_handle(&self.wal_backend)?;
                     let mut wal_guard = async_rwlock_write(&backend, cx, "WAL backend").await?;
                     let wal = wal_guard.as_mut();
@@ -27500,9 +27570,8 @@ where
                     // the boundary itself: an unreferenced page is repairable,
                     // a double grant is not.
                     let fold_generation = wal.published_snapshot().map(|s| s.generation);
-                    if fold_generation.is_some() && inner.committed_wal_generation != fold_generation
-                    {
-                        abandoned_candidates.clear();
+                    if fold_generation.is_some() && pool_generation != fold_generation {
+                        abandoned_candidates.discard_remaining();
                     }
                     let mut dw8oe_reclaimed = 0_usize;
                     let mut dw8oe_framed = 0_usize;
@@ -27513,18 +27582,20 @@ where
                     // frame for this page would be invisible and the page
                     // wrongly reclaimed while live. The backend write lock is
                     // held, so the tail is stable.
-                    for page in abandoned_candidates {
+                    while let Some(page) = abandoned_candidates.current() {
                         match wal.read_page_at_appended_tail(cx, page.get()).await {
                             Ok(None) => {
                                 self.reclaimed_abandoned_reservations.push(page);
                                 pending_free_pages.push(page);
+                                abandoned_candidates.finish_classified();
                                 dw8oe_reclaimed += 1;
                             }
                             Ok(Some(_)) => {
+                                abandoned_candidates.finish_classified();
                                 dw8oe_framed += 1;
                             }
                             Err(_) => {
-                                inner.abandoned_eof_reservations.push(page);
+                                abandoned_candidates.finish_retained();
                                 dw8oe_errs += 1;
                             }
                         }
@@ -32565,6 +32636,174 @@ mod tests {
                 );
             });
         }
+    }
+
+    #[test]
+    fn test_ioq6x_commit_abandonment_guard_restores_without_reallocation() {
+        let pages: Vec<PageNumber> = (2..=6).map(|page| PageNumber::new(page).unwrap()).collect();
+        let mut pool = pages.clone();
+        let allocation = pool.as_ptr();
+        let capacity = pool.capacity();
+        {
+            let mut candidates =
+                CommitAbandonmentCandidates::take_eligible(&mut pool, |page| {
+                    (3..=5).contains(&page.get())
+                });
+            assert_eq!(candidates.current(), Some(pages[1]));
+            candidates.finish_classified();
+            assert_eq!(candidates.current(), Some(pages[2]));
+            candidates.finish_retained();
+            assert_eq!(candidates.current(), Some(pages[3]));
+            // Cancel before classifying page 5, with page 4 already returned.
+        }
+        assert_eq!(pool, vec![pages[0], pages[4], pages[2], pages[3]]);
+        assert_eq!(pool.as_ptr(), allocation);
+        assert_eq!(pool.capacity(), capacity);
+    }
+
+    async fn commit_abandonment_probe_transaction(
+        cx: &Cx,
+        probe: DisownedReclaimProbeWalBackend,
+        abandoned: &[PageNumber],
+    ) -> (SimplePager<MemoryVfs>, SimpleTransaction<MemoryVfs>) {
+        let (pager, _) = wal_pager().await;
+        let mut txn = pager.begin(cx, TransactionMode::Concurrent).await.unwrap();
+        txn.write_page(cx, PageNumber::new(2).unwrap(), &sample_page(0x51))
+            .await
+            .unwrap();
+        {
+            let mut inner = pager.inner.lock().unwrap();
+            inner.db_size = 64;
+            assert!(inner.abandoned_eof_reservations.is_empty());
+            inner.abandoned_eof_reservations.extend_from_slice(abandoned);
+        }
+        // Install the fault after begin/write preparation, so the injected
+        // refresh/read can only hit the commit's abandonment fold. No mock
+        // frames have been committed and no other task owns this backend.
+        let backend = wal_backend_handle(&pager.wal_backend).unwrap();
+        *async_rwlock_write(&backend, cx, "commit abandonment test")
+            .await
+            .unwrap() = Box::new(probe);
+        (pager, txn)
+    }
+
+    #[test]
+    fn test_ioq6x_commit_refresh_failure_restores_abandonment_candidates() {
+        asupersync::test_utils::run_test(|| async {
+            let cx = Cx::new();
+            let (probe, _) =
+                DisownedReclaimProbeWalBackend::new(DisownedReclaimProbeMode::FailRefresh);
+            let page_reads = Arc::clone(&probe.page_reads);
+            let pages: Vec<PageNumber> = [57, 58, 65]
+                .into_iter()
+                .map(|page| PageNumber::new(page).unwrap())
+                .collect();
+            let (pager, mut txn) = commit_abandonment_probe_transaction(&cx, probe, &pages).await;
+
+            let error = txn.commit(&cx).await.unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("forced disowned-page publication refresh failure"),
+                "the commit must reach the injected fold refresh: {error}"
+            );
+            assert!(page_reads.lock().unwrap().is_empty());
+            assert!(txn.reclaimed_abandoned_reservations.is_empty());
+            assert!(!txn.finished);
+            {
+                let inner = pager.inner.lock().unwrap();
+                let mut retained = inner.abandoned_eof_reservations.clone();
+                retained.sort_unstable();
+                assert_eq!(
+                    retained, pages,
+                    "an early commit error must restore every candidate before transaction rollback/drop"
+                );
+                assert!(pages.iter().all(|page| !inner.freelist.contains(page)));
+            }
+            txn.rollback(&cx).await.unwrap();
+        });
+    }
+
+    #[test]
+    fn test_ioq6x_cancelled_commit_read_preserves_abandonment_ownership() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(1, 1)
+            .build()
+            .expect("cancelled commit abandonment test runtime should build");
+        runtime.block_on(async {
+            for partial_progress in [false, true] {
+                let cx = Cx::new();
+                let mode = if partial_progress {
+                    DisownedReclaimProbeMode::PendPageReadAfterProgress {
+                        framed: 53,
+                        frameless: 54,
+                        retryable: 55,
+                    }
+                } else {
+                    DisownedReclaimProbeMode::PendPageRead
+                };
+                let (probe, page_read_entered) = DisownedReclaimProbeWalBackend::new(mode);
+                let page_reads = Arc::clone(&probe.page_reads);
+                let pages: Vec<PageNumber> = if partial_progress {
+                    vec![53, 54, 55, 56, 57, 65]
+                } else {
+                    vec![57, 58, 65]
+                }
+                .into_iter()
+                .map(|page| PageNumber::new(page).unwrap())
+                .collect();
+                let (pager, mut txn) =
+                    commit_abandonment_probe_transaction(&cx, probe, &pages).await;
+
+                let mut commit = Box::pin(txn.commit(&cx));
+                std::future::poll_fn(|poll_cx| match commit.as_mut().poll(poll_cx) {
+                    std::task::Poll::Pending if page_read_entered.load(AtomicOrdering::Acquire) => {
+                        std::task::Poll::Ready(())
+                    }
+                    std::task::Poll::Pending => {
+                        poll_cx.waker().wake_by_ref();
+                        std::task::Poll::Pending
+                    }
+                    std::task::Poll::Ready(result) => {
+                        panic!("commit abandonment probe unexpectedly completed: {result:?}")
+                    }
+                })
+                .await;
+                drop(commit);
+
+                let (expected_reads, expected_pool, expected_reclaimed) = if partial_progress {
+                    (vec![53, 54, 55, 56], vec![55, 56, 57, 65], vec![54])
+                } else {
+                    (vec![57], vec![57, 58, 65], Vec::new())
+                };
+                assert_eq!(*page_reads.lock().unwrap(), expected_reads);
+                assert_eq!(
+                    txn.reclaimed_abandoned_reservations
+                        .iter()
+                        .map(|page| page.get())
+                        .collect::<Vec<_>>(),
+                    expected_reclaimed,
+                    "only verified frameless pages may transfer to the still-live transaction"
+                );
+                assert!(!txn.finished);
+                assert!(txn.pending_group_commit_attempt.is_none());
+                {
+                    let inner = pager.inner.lock().unwrap();
+                    let mut retained: Vec<u32> = inner
+                        .abandoned_eof_reservations
+                        .iter()
+                        .map(|page| page.get())
+                        .collect();
+                    retained.sort_unstable();
+                    assert_eq!(
+                        retained, expected_pool,
+                        "cancellation must retain failed, in-flight, unchecked, and ineligible pages before transaction drop"
+                    );
+                    assert!(pages.iter().all(|page| !inner.freelist.contains(page)));
+                }
+                txn.rollback(&cx).await.unwrap();
+            }
+        });
     }
 
     #[test]
@@ -41549,11 +41788,17 @@ mod tests {
     enum DisownedReclaimProbeMode {
         FailRefresh,
         PendPageRead,
+        PendPageReadAfterProgress {
+            framed: u32,
+            frameless: u32,
+            retryable: u32,
+        },
     }
 
     struct DisownedReclaimProbeWalBackend {
         mode: DisownedReclaimProbeMode,
         page_read_entered: Arc<AtomicBool>,
+        page_reads: Arc<Mutex<Vec<u32>>>,
     }
 
     impl DisownedReclaimProbeWalBackend {
@@ -41563,6 +41808,7 @@ mod tests {
                 Self {
                     mode,
                     page_read_entered: Arc::clone(&page_read_entered),
+                    page_reads: Arc::new(Mutex::new(Vec::new())),
                 },
                 page_read_entered,
             )
@@ -42897,7 +43143,8 @@ mod tests {
                     DisownedReclaimProbeMode::FailRefresh => Err(FrankenError::internal(
                         "forced disowned-page publication refresh failure",
                     )),
-                    DisownedReclaimProbeMode::PendPageRead => Ok(None),
+                    DisownedReclaimProbeMode::PendPageRead
+                    | DisownedReclaimProbeMode::PendPageReadAfterProgress { .. } => Ok(None),
                 }
             })
         }
@@ -42915,11 +43162,29 @@ mod tests {
         fn read_page<'a>(
             &'a mut self,
             _cx: &'a Cx,
-            _page_number: u32,
+            page_number: u32,
         ) -> WalFuture<'a, Option<Vec<u8>>> {
+            self.page_reads.lock().unwrap().push(page_number);
+            if let DisownedReclaimProbeMode::PendPageReadAfterProgress {
+                framed,
+                frameless,
+                retryable,
+            } = self.mode
+            {
+                if page_number == framed {
+                    return Box::pin(async { Ok(Some(sample_page(0xA7))) });
+                }
+                if page_number == frameless {
+                    return Box::pin(async { Ok(None) });
+                }
+                if page_number == retryable {
+                    return Box::pin(async { Err(FrankenError::Busy) });
+                }
+            }
             match self.mode {
                 DisownedReclaimProbeMode::FailRefresh => Box::pin(async { Ok(None) }),
-                DisownedReclaimProbeMode::PendPageRead => {
+                DisownedReclaimProbeMode::PendPageRead
+                | DisownedReclaimProbeMode::PendPageReadAfterProgress { .. } => {
                     let page_read_entered = Arc::clone(&self.page_read_entered);
                     Box::pin(std::future::poll_fn(move |_| {
                         page_read_entered.store(true, AtomicOrdering::Release);
