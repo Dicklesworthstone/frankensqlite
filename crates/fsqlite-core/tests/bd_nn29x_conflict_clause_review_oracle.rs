@@ -30,9 +30,8 @@
 //! after it.
 //!
 //! Left out, each a pre-existing divergence tracked by its own bead: a column
-//! `ON CONFLICT` on a WITHOUT ROWID PRIMARY KEY, or on an INTEGER PRIMARY KEY
-//! that an UPDATE changes, and a WITHOUT ROWID `NOT NULL ON CONFLICT IGNORE`
-//! on INSERT (all three resolve with the statement clause only); TEMP tables;
+//! `ON CONFLICT` on a WITHOUT ROWID PRIMARY KEY (it resolves with the statement
+//! clause only); TEMP tables;
 //! the RAISE() result code and RAISE(ROLLBACK)'s autocommit error; DELETE
 //! triggers fired by a REPLACE that the constraint's own clause chose; and
 //! `OR REPLACE` into a NOT NULL column with a DEFAULT (bd-m3jt4).
@@ -729,23 +728,19 @@ fn review_column_and_table_level_conflict_clauses() {
             let own_clause_decides = mode.is_empty() && algorithm != "ABORT";
             for txn in TXNS {
                 let tag = format!("{algorithm}, `{mode}`, {txn:?}");
-                // Pre-existing: a WITHOUT ROWID NOT NULL ON CONFLICT IGNORE
-                // column does not skip an INSERT row.
-                if !(own_clause_decides && algorithm == "IGNORE") {
-                    cases.push(Case {
-                        name: format!("WITHOUT ROWID NOT NULL ON CONFLICT {tag}, INSERT"),
-                        setup: vec![format!(
-                            "CREATE TABLE w(id INTEGER PRIMARY KEY, \
-                             v INTEGER NOT NULL ON CONFLICT {algorithm}) WITHOUT ROWID"
-                        )],
-                        steps: in_txn(
-                            txn,
-                            "INSERT INTO w VALUES (1, 1)",
-                            format!("INSERT {mode} INTO w VALUES (2, 2), (3, NULL), (4, 4)"),
-                        ),
-                        queries: strs(&["SELECT id, v FROM w ORDER BY id"]),
-                    });
-                }
+                cases.push(Case {
+                    name: format!("WITHOUT ROWID NOT NULL ON CONFLICT {tag}, INSERT"),
+                    setup: vec![format!(
+                        "CREATE TABLE w(id INTEGER PRIMARY KEY, \
+                         v INTEGER NOT NULL ON CONFLICT {algorithm}) WITHOUT ROWID"
+                    )],
+                    steps: in_txn(
+                        txn,
+                        "INSERT INTO w VALUES (1, 1)",
+                        format!("INSERT {mode} INTO w VALUES (2, 2), (3, NULL), (4, 4)"),
+                    ),
+                    queries: strs(&["SELECT id, v FROM w ORDER BY id"]),
+                });
                 cases.push(Case {
                     name: format!("WITHOUT ROWID NOT NULL ON CONFLICT {tag}, UPDATE"),
                     setup: vec![
@@ -847,11 +842,23 @@ fn review_column_and_table_level_conflict_clauses() {
                     ),
                     queries: strs(&["SELECT id, v FROM u ORDER BY id"]),
                 });
-                // Pre-existing: an UPDATE that moves an INTEGER PRIMARY KEY
-                // ignores the key's own clause.
-                if !own_clause_decides {
+                for (operation, statement) in [
+                    (
+                        "UPDATE",
+                        format!("UPDATE {mode} k SET id = id + 10 WHERE id BETWEEN 2 AND 4"),
+                    ),
+                    (
+                        "UPDATE FROM",
+                        format!(
+                            "UPDATE {mode} k SET id = moves.new_id FROM moves \
+                             WHERE k.id = moves.old_id"
+                        ),
+                    ),
+                ] {
                     cases.push(Case {
-                        name: format!("rowid INTEGER PRIMARY KEY ON CONFLICT {tag}, UPDATE"),
+                        name: format!(
+                            "rowid INTEGER PRIMARY KEY ON CONFLICT {tag}, {operation}"
+                        ),
                         setup: vec![
                             format!(
                                 "CREATE TABLE k(id INTEGER PRIMARY KEY ON CONFLICT {algorithm}, \
@@ -859,12 +866,11 @@ fn review_column_and_table_level_conflict_clauses() {
                             ),
                             "INSERT INTO k VALUES (2, 'b'), (3, 'c'), (4, 'd'), (13, 'x')"
                                 .to_owned(),
+                            "CREATE TABLE moves(old_id INTEGER PRIMARY KEY, new_id INTEGER)"
+                                .to_owned(),
+                            "INSERT INTO moves VALUES (2, 12), (3, 13), (4, 14)".to_owned(),
                         ],
-                        steps: in_txn(
-                            txn,
-                            "INSERT INTO k VALUES (1, 'a')",
-                            format!("UPDATE {mode} k SET id = id + 10 WHERE id BETWEEN 2 AND 4"),
-                        ),
+                        steps: in_txn(txn, "INSERT INTO k VALUES (1, 'a')", statement),
                         queries: strs(&["SELECT id, v FROM k ORDER BY id"]),
                     });
                 }
@@ -888,6 +894,152 @@ fn review_column_and_table_level_conflict_clauses() {
     }
     assert_matches_stock(
         "column / table level ON CONFLICT",
+        &cases,
+        &BASIC_LANES,
+        no_normalize,
+    );
+}
+
+/// bd-q51j8: RETURNING exposes only writes that survive the chosen schema or
+/// statement action, including an untargeted constraint after an UPSERT probe.
+#[test]
+fn review_schema_ignore_returning_rows() {
+    let primary_key_statements = [
+        "INSERT INTO k DEFAULT VALUES RETURNING id, v",
+        "INSERT INTO k VALUES (12, 'new12'), (13, 'new13'), (14, 'new14') RETURNING id, v",
+        "INSERT INTO k SELECT id, v FROM src RETURNING id, v",
+        "INSERT INTO k SELECT 13, 'new13' RETURNING id, v",
+        "INSERT INTO k SELECT 12, 'new12' RETURNING id, v",
+        "INSERT INTO k VALUES (12, 'new12'), (13, 'new13'), (14, 'new14') \
+         ON CONFLICT(v) DO NOTHING RETURNING id, v",
+        "INSERT INTO k VALUES (13, 'skip'), (100, 'x'), (14, 'new14') \
+         ON CONFLICT(v) DO UPDATE SET v = excluded.v RETURNING id, v",
+        "INSERT OR REPLACE INTO k VALUES (12, 'new12'), (13, 'new13'), (14, 'new14') \
+         RETURNING id, v",
+        "UPDATE k SET id = id + 10 WHERE id BETWEEN 2 AND 4 RETURNING id, v",
+        "UPDATE k SET id = moves.new_id FROM moves WHERE k.id = moves.old_id RETURNING id, v",
+    ];
+    let unique_statements = [
+        "INSERT INTO k DEFAULT VALUES RETURNING id, v",
+        "INSERT INTO k VALUES (12, 'new12'), (14, 'x'), (15, 'new15') RETURNING id, v",
+        "UPDATE k SET v = 'x' WHERE id IN (2, 3) RETURNING id, v",
+        "UPDATE k SET v = 'x' FROM moves WHERE k.id = moves.old_id RETURNING id, v",
+    ];
+    asupersync::test_utils::run_test(|| async {
+        for (schema, statements) in [
+            (
+                "CREATE TABLE k(id INTEGER PRIMARY KEY ON CONFLICT IGNORE DEFAULT 13, v TEXT UNIQUE)",
+                primary_key_statements.as_slice(),
+            ),
+            (
+                "CREATE TABLE k(id INTEGER DEFAULT 13, v TEXT UNIQUE, \
+                 PRIMARY KEY(id) ON CONFLICT IGNORE)",
+                primary_key_statements.as_slice(),
+            ),
+            (
+                "CREATE TABLE k(id INTEGER PRIMARY KEY, v TEXT UNIQUE ON CONFLICT IGNORE DEFAULT 'x')",
+                unique_statements.as_slice(),
+            ),
+        ] {
+            for sql in statements {
+                for persistent in [false, true] {
+                    for prepared in [false, true] {
+                        let stock = rusqlite::Connection::open_in_memory().expect("stock");
+                        let dir = tempfile::tempdir().expect("tempdir");
+                        let path = if persistent {
+                            dir.path().join("returning.db").to_string_lossy().into_owned()
+                        } else {
+                            ":memory:".to_owned()
+                        };
+                        let conn = Connection::open(path).await.expect("fsqlite");
+                        for setup in [
+                            schema,
+                            "INSERT INTO k VALUES (2, 'b'), (3, 'c'), (4, 'd'), (13, 'x')",
+                            "CREATE TABLE src(id INTEGER, v TEXT)",
+                            "INSERT INTO src VALUES (12, 'new12'), (13, 'new13'), (14, 'new14')",
+                            "CREATE TABLE moves(old_id INTEGER PRIMARY KEY, new_id INTEGER)",
+                            "INSERT INTO moves VALUES (2, 12), (3, 13), (4, 14)",
+                        ] {
+                            stock.execute_batch(setup).expect("stock setup");
+                            conn.execute(setup).await.expect("fsqlite setup");
+                        }
+
+                        let expected = stock_rows(&stock, sql);
+                        let returned = if prepared {
+                            let statement = conn.prepare(sql).await.expect("prepare RETURNING");
+                            statement.query().await
+                        } else {
+                            conn.query(sql).await
+                        }
+                        .unwrap_or_else(|error| panic!("{schema}; {sql}: {error}"));
+                        let observed: Rows = returned
+                            .iter()
+                            .map(|row| row.values().iter().map(tag_f).collect())
+                            .collect();
+                        assert_eq!(
+                            observed, expected,
+                            "{schema}; {sql}; persistent={persistent}, prepared={prepared}"
+                        );
+                        for query in [
+                            "SELECT changes()",
+                            "SELECT id, v FROM k ORDER BY id",
+                            "SELECT id, v FROM k WHERE v >= 'new' ORDER BY v",
+                            "PRAGMA integrity_check",
+                        ] {
+                            assert_eq!(
+                                frank_rows(&conn, query).await,
+                                stock_rows(&stock, query),
+                                "{schema}; {sql}; {query}; persistent={persistent}, prepared={prepared}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// bd-1rkcr: a NULL column with its own IGNORE skips the candidate before
+/// CHECK; a non-NULL row violating CHECK must still use the statement action.
+#[test]
+fn review_without_rowid_not_null_ignore_and_check_order() {
+    let mut cases = Vec::new();
+    for mode in MODES {
+        for txn in TXNS {
+            for nullable in ["NULL", "3"] {
+                let source_rows = format!("(2, 2, 1), (3, {nullable}, -1), (4, 4, 1)");
+                for source in [
+                    format!("VALUES {source_rows}"),
+                    "SELECT id, nn, checked FROM src".to_owned(),
+                ] {
+                    cases.push(Case {
+                        name: format!(
+                            "WITHOUT ROWID NOT NULL IGNORE, CHECK, `{mode}`, {txn:?}, {source}"
+                        ),
+                        setup: vec![
+                            "CREATE TABLE w(id INTEGER PRIMARY KEY, \
+                             nn INTEGER NOT NULL ON CONFLICT IGNORE, \
+                             checked INTEGER CHECK(checked > 0)) WITHOUT ROWID"
+                                .to_owned(),
+                            "CREATE TABLE src(id INTEGER, nn INTEGER, checked INTEGER)".to_owned(),
+                            format!("INSERT INTO src VALUES {source_rows}"),
+                        ],
+                        steps: in_txn(
+                            txn,
+                            "INSERT INTO w VALUES (1, 1, 1)",
+                            format!("INSERT {mode} INTO w {source}"),
+                        ),
+                        queries: strs(&[
+                            "SELECT id, nn, checked FROM w ORDER BY id",
+                            "PRAGMA integrity_check",
+                        ]),
+                    });
+                }
+            }
+        }
+    }
+    assert_matches_stock(
+        "WITHOUT ROWID NOT NULL IGNORE and CHECK precedence",
         &cases,
         &BASIC_LANES,
         no_normalize,

@@ -263,6 +263,20 @@ fn effective_oe(
     conflict_action_to_oe(stmt_level.or(constraint_level).as_ref())
 }
 
+/// Resolve the rowid constraint separately from NOT NULL, CHECK and UNIQUE.
+/// An INTEGER PRIMARY KEY's declared action also applies when UPDATE moves
+/// that key; an explicit statement clause takes precedence.
+fn effective_rowid_oe(table: &TableSchema, stmt_level: Option<ConflictAction>) -> u16 {
+    effective_oe(
+        stmt_level,
+        table
+            .columns
+            .iter()
+            .find(|column| column.is_ipk)
+            .and_then(|column| column.conflict_action),
+    )
+}
+
 /// bd-nn29x: the `OE_*` algorithm a failing constraint `Halt` carries in P2,
 /// which tells the statement boundary to keep the statement's rows (FAIL),
 /// undo them (ABORT) or end the transaction (ROLLBACK), as stock's
@@ -24056,6 +24070,8 @@ pub fn codegen_insert(
             emit_index_inserts(b, table, table_cursor, col_regs, rowid_reg, stmt_level);
 
             if !stmt.returning.is_empty() {
+                let returning_done = b.emit_label();
+                b.emit_jump_to_label(Opcode::IfConflictSkip, 0, 0, returning_done, P4::None, 0);
                 emit_returning(
                     b,
                     table_cursor,
@@ -24065,6 +24081,7 @@ pub fn codegen_insert(
                     schema,
                     rowid_reg,
                 )?;
+                b.resolve_label(returning_done);
             }
         }
     }
@@ -24634,12 +24651,7 @@ fn codegen_insert_values(
     // Conflict action for the table (rowid/INTEGER PRIMARY KEY) row: a
     // statement-level `INSERT OR <algo>` overrides the IPK column's declared
     // `PRIMARY KEY ON CONFLICT <algo>`.
-    let ipk_conflict = table
-        .columns
-        .iter()
-        .find(|c| c.is_ipk)
-        .and_then(|c| c.conflict_action);
-    let pk_oe = effective_oe(stmt_level, ipk_conflict);
+    let pk_oe = effective_rowid_oe(table, stmt_level);
     let n_source_cols = rows
         .first()
         .ok_or_else(|| CodegenError::Unsupported("empty VALUES".to_owned()))?
@@ -24962,6 +24974,9 @@ fn codegen_insert_values(
             b.emit_op(Opcode::Insert, cursor, rec_reg, rowid_reg, insert_p4, pk_oe);
             emit_index_inserts(b, table, cursor, val_regs, rowid_reg, stmt_level);
             if !returning.is_empty() {
+                // A non-target constraint may choose IGNORE even though no
+                // UPSERT clause matched. Return only rows actually written.
+                b.emit_jump_to_label(Opcode::IfConflictSkip, 0, 0, done_label, P4::None, 0);
                 emit_returning(b, cursor, table, returning, table_alias, schema, rowid_reg)?;
             }
             b.resolve_label(done_label);
@@ -24995,7 +25010,12 @@ fn codegen_insert_values(
             b.emit_op(Opcode::Insert, cursor, rec_reg, rowid_reg, insert_p4, pk_oe);
             emit_index_inserts(b, table, cursor, val_regs, rowid_reg, stmt_level);
             if !returning.is_empty() {
+                // Schema-level IGNORE can be selected by the rowid or a
+                // secondary UNIQUE constraint, independently of the statement.
+                let returning_done = b.emit_label();
+                b.emit_jump_to_label(Opcode::IfConflictSkip, 0, 0, returning_done, P4::None, 0);
                 emit_returning(b, cursor, table, returning, table_alias, schema, rowid_reg)?;
+                b.resolve_label(returning_done);
             }
         }
 
@@ -25406,14 +25426,7 @@ fn codegen_insert_select(
         check_ignore,
     );
     emit_not_null_constraints(b, target_table, final_regs, stmt_level, ignore_target);
-    let pk_oe = effective_oe(
-        stmt_level,
-        target_table
-            .columns
-            .iter()
-            .find(|c| c.is_ipk)
-            .and_then(|c| c.conflict_action),
-    );
+    let pk_oe = effective_rowid_oe(target_table, stmt_level);
 
     let aff_str = target_table.affinity_string();
     b.emit_op(
@@ -25457,6 +25470,7 @@ fn codegen_insert_select(
 
     // RETURNING clause: position cursor on inserted row and read columns.
     if !returning.is_empty() {
+        b.emit_jump_to_label(Opcode::IfConflictSkip, 0, 0, skip_label, P4::None, 0);
         emit_returning(
             b,
             write_cursor,
@@ -25637,14 +25651,7 @@ fn codegen_insert_select_without_from(
     } else {
         None
     };
-    let pk_oe = effective_oe(
-        stmt_level,
-        target_table
-            .columns
-            .iter()
-            .find(|c| c.is_ipk)
-            .and_then(|c| c.conflict_action),
-    );
+    let pk_oe = effective_rowid_oe(target_table, stmt_level);
 
     // STRICT type check before affinity.
     emit_strict_type_check(b, target_table, final_regs);
@@ -25707,6 +25714,7 @@ fn codegen_insert_select_without_from(
     );
 
     if !returning.is_empty() {
+        b.emit_jump_to_label(Opcode::IfConflictSkip, 0, 0, done_label, P4::None, 0);
         emit_returning(
             b,
             write_cursor,
@@ -26394,10 +26402,9 @@ pub fn codegen_update(
         0,
     );
 
-    // Conflict resolution for UPDATE: use explicit OR clause if present,
-    // otherwise default to OE_ABORT (standard UPDATE raises constraint error
-    // on PK/UNIQUE conflicts rather than silently replacing).
-    let oe_flag = conflict_action_to_oe(stmt.or_conflict.as_ref());
+    // Moving an INTEGER PRIMARY KEY uses that constraint's own algorithm
+    // unless the statement overrides it. Other constraints resolve separately.
+    let oe_flag = effective_rowid_oe(table, stmt.or_conflict);
     // bd-5bq6u: OR FAIL keeps the rows already written when a later row fails a
     // constraint, so the MemDatabase statement boundary must not unwind them.
     b.set_preserves_rows_on_constraint(oe_flag == OE_FAIL);
@@ -26424,16 +26431,17 @@ pub fn codegen_update(
 
     // RETURNING clause: position cursor on updated row and read columns.
     if !stmt.returning.is_empty() {
-        // GH #159: UPDATE OR IGNORE ... RETURNING must NOT emit a row whose
-        // insert the engine suppressed on a rowid/UNIQUE conflict — it already
-        // rolled the write back, so re-seeking `rowid_reg` here would wrongly
-        // emit either the un-updated row (same rowid) or the CONFLICTING row's
-        // data (new rowid). `constraint_ignore_label` is `Some` iff this is an
-        // OR IGNORE update; jump past RETURNING to the row-skip label when the
-        // engine's own conflict decision (`conflict_skip_idx`) is set.
-        if let Some(skip) = constraint_ignore_label {
-            b.emit_jump_to_label(Opcode::IfConflictSkip, 0, 0, skip, P4::None, 0);
-        }
+        // An ignored rowid/UNIQUE conflict has already restored the old row.
+        // This applies to both statement and schema conflict clauses; seeking
+        // the destination key must not return the unchanged/conflicting row.
+        b.emit_jump_to_label(
+            Opcode::IfConflictSkip,
+            0,
+            0,
+            apply_seek_miss_label.unwrap_or(apply_done_label),
+            P4::None,
+            0,
+        );
         // RETURNING appears after WHERE in SQL textual order; restore the
         // post-WHERE placeholder index so RETURNING placeholders don't collide
         // with SET placeholder numbering.
@@ -27465,8 +27473,8 @@ fn codegen_update_from(
         0,
     );
 
-    // Insert updated row.
-    let oe_flag = conflict_action_to_oe(stmt.or_conflict.as_ref());
+    // UPDATE FROM resolves a moved rowid like the plain UPDATE lane.
+    let oe_flag = effective_rowid_oe(target, stmt.or_conflict);
     // bd-5bq6u: OR FAIL keeps the rows already written when a later row fails a
     // constraint, so the MemDatabase statement boundary must not unwind them.
     b.set_preserves_rows_on_constraint(oe_flag == OE_FAIL);
@@ -27492,12 +27500,9 @@ fn codegen_update_from(
 
     // RETURNING clause (numbered after SET + ON + WHERE placeholders).
     if !stmt.returning.is_empty() {
-        // GH #159: as in the plain UPDATE path, an OR IGNORE row whose insert
-        // the engine suppressed on a rowid/UNIQUE conflict must not emit a
-        // RETURNING row.
-        if matches!(stmt.or_conflict.as_ref(), Some(ConflictAction::Ignore)) {
-            b.emit_jump_to_label(Opcode::IfConflictSkip, 0, 0, row_done, P4::None, 0);
-        }
+        // As in plain UPDATE, a statement or schema IGNORE must suppress the
+        // RETURNING row when the engine did not apply the change.
+        b.emit_jump_to_label(Opcode::IfConflictSkip, 0, 0, row_done, P4::None, 0);
         b.set_next_anon_placeholder(
             set_placeholder_count + on_placeholder_count + where_placeholder_count + 1,
         );
@@ -29189,10 +29194,10 @@ fn emit_without_rowid_row_insert(
     // Candidate-row validation runs for EVERY row BEFORE conflict routing
     // (mirrors the rowid path): STORED generated columns, STRICT type check,
     // affinity coercion (GH #169 — so CHECK/NOT NULL see the coerced value and
-    // the conflict probe keys match stored format), then CHECK / NOT NULL. Stock
+    // the conflict probe keys match stored format), then NOT NULL / CHECK. Stock
     // enforces these on the candidate even for a row that will conflict and
     // DO UPDATE, so they must precede the ON CONFLICT chain (bd-xa2qv). Under a
-    // statement-level IGNORE the candidate is abandoned via `candidate_skip`.
+    // statement or NOT NULL schema IGNORE, `candidate_skip` abandons the row.
     emit_stored_generated_columns(b, table, val_regs);
     emit_strict_type_check(b, table, val_regs);
     b.emit_op(
@@ -29203,19 +29208,27 @@ fn emit_without_rowid_row_insert(
         P4::Affinity(table.affinity_string()),
         0,
     );
-    let candidate_skip = if oe_flag == OE_IGNORE {
+    let nn_ignore = table.columns.iter().enumerate().any(|(index, column)| {
+        (column.notnull || pk_indices.contains(&index))
+            && !column.is_ipk
+            && effective_oe(stmt_level, column.conflict_action) == OE_IGNORE
+    });
+    let candidate_skip = if oe_flag == OE_IGNORE || nn_ignore {
         Some(b.emit_label())
     } else {
         None
     };
+    // NOT NULL runs first: its schema-level IGNORE skips the entire candidate.
+    // A non-NULL candidate still has to pass CHECK, whose only IGNORE action
+    // comes from the statement clause.
+    emit_not_null_constraints(b, table, val_regs, stmt_level, candidate_skip);
     emit_check_constraints(
         b,
         table,
         RegisterRow::columns(val_regs),
         stmt_level,
-        candidate_skip,
+        candidate_skip.filter(|_| oe_flag == OE_IGNORE),
     );
-    emit_not_null_constraints(b, table, val_regs, stmt_level, candidate_skip);
 
     // UPSERT: a chain of ON CONFLICT clauses (SQLite 3.35+). Each clause probes
     // its own conflict target in written order; the first clause whose target is
@@ -29519,8 +29532,8 @@ fn emit_without_rowid_row_insert(
     if let Some(done_label) = upsert_done_label {
         b.resolve_label(done_label);
     }
-    // A candidate CHECK/NOT NULL violation under a statement-level IGNORE
-    // abandons the whole row here (skipping conflict routing and the insert).
+    // A candidate constraint resolved with IGNORE abandons the whole row here
+    // (skipping conflict routing and the insert).
     if let Some(label) = candidate_skip {
         b.resolve_label(label);
     }
