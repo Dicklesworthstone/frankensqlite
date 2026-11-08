@@ -73678,6 +73678,16 @@ impl Connection {
             )
         };
         if fire_victim_delete_triggers {
+            // A victim is deleted under the resolved REPLACE algorithm even
+            // when that algorithm came from the violated constraint rather
+            // than the outer statement's OR clause. Its DELETE triggers must
+            // inherit REPLACE, just as they do for an explicit OR REPLACE.
+            // Limit the override to these programs: FK actions and the
+            // causing statement's own triggers keep their original clauses.
+            let _replace_clause = DmlConflictClauseGuard::new(
+                &self.dml_conflict_clause,
+                Some(fsqlite_ast::ConflictAction::Replace),
+            );
             let delete_event = fsqlite_ast::TriggerEvent::Delete;
             for victim in &victims {
                 // The victim row is already removed from storage, so a BEFORE

@@ -22,6 +22,8 @@
 //! - The recorded per-failure algorithm is never applied to a later error
 //!   with the same message, across `execute`, `prepare` + `execute` (fresh
 //!   and reused handles) and `Connection::query`; savepoints.
+//! - Implicit REPLACE victim DELETE triggers inherit REPLACE even when a
+//!   primary-key or UNIQUE constraint chose it, for body INSERT and UPDATE.
 //!
 //! Every expectation is a live stock-SQLite oracle (bundled rusqlite): each
 //! case runs the same statements in stock and in FrankenSQLite and compares,
@@ -32,8 +34,8 @@
 //! Left out, each a pre-existing divergence tracked by its own bead: a column
 //! `ON CONFLICT` on a WITHOUT ROWID PRIMARY KEY (it resolves with the statement
 //! clause only); TEMP tables;
-//! the RAISE() result code and RAISE(ROLLBACK)'s autocommit error; DELETE
-//! triggers fired by a REPLACE that the constraint's own clause chose; and
+//! the RAISE() result code and RAISE(ROLLBACK)'s autocommit error; the timing
+//! of REPLACE victim deletion relative to FK actions; and
 //! `OR REPLACE` into a NOT NULL column with a DEFAULT (bd-m3jt4).
 
 use std::collections::HashMap;
@@ -588,6 +590,118 @@ fn review_nested_trigger_clause_inheritance() {
         "nested trigger clause inheritance",
         &cases,
         &BASIC_LANES,
+        no_normalize,
+    );
+}
+
+/// bd-ygcuj: the implicit DELETE uses REPLACE whether the statement or the
+/// violated constraint selected it. Both INSERT and UPDATE statements in
+/// its trigger body inherit that algorithm, overriding their own clauses.
+#[test]
+fn review_replace_victim_trigger_inherits_constraint_algorithm() {
+    let mut cases = Vec::new();
+    for (constraint, schema, replacement) in [
+        (
+            "primary key",
+            "CREATE TABLE t(id INTEGER PRIMARY KEY ON CONFLICT REPLACE, k INTEGER, v TEXT)",
+            "INSERT INTO t VALUES (1, 11, 'new-a'), (2, 22, 'new-b')",
+        ),
+        (
+            "unique",
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER UNIQUE ON CONFLICT REPLACE, v TEXT)",
+            "INSERT INTO t VALUES (4, 11, 'new-a'), (5, 22, 'new-b')",
+        ),
+    ] {
+        for timing in ["BEFORE", "AFTER"] {
+            for inner in INNER {
+                for body_is_update in [false, true] {
+                    let body = if body_is_update {
+                        format!(
+                            "UPDATE {inner} log SET x = OLD.id, marker = OLD.v WHERE id = 0"
+                        )
+                    } else {
+                        format!(
+                            "INSERT {inner} INTO log VALUES (OLD.id, OLD.id, OLD.v)"
+                        )
+                    };
+                    for txn in TXNS {
+                        cases.push(Case {
+                            name: format!(
+                                "{constraint} REPLACE, {timing} DELETE `{body}`, {txn:?}"
+                            ),
+                            setup: vec![
+                                "PRAGMA recursive_triggers = ON".to_owned(),
+                                schema.to_owned(),
+                                "CREATE TABLE log(id INTEGER PRIMARY KEY, x INTEGER UNIQUE, \
+                                 marker TEXT)"
+                                    .to_owned(),
+                                "INSERT INTO log VALUES (0, 0, 'zero'), (2, 2, 'original')"
+                                    .to_owned(),
+                                "INSERT INTO t VALUES (1, 11, 'a'), (2, 22, 'b'), (3, 33, 'c')"
+                                    .to_owned(),
+                                format!(
+                                    "CREATE TRIGGER td {timing} DELETE ON t BEGIN {body}; END"
+                                ),
+                            ],
+                            steps: in_txn(
+                                txn,
+                                "INSERT INTO t VALUES (9, 99, 'prior')",
+                                replacement.to_owned(),
+                            ),
+                            queries: strs(&[
+                                "SELECT id, k, v FROM t ORDER BY id",
+                                "SELECT id, x, marker FROM log ORDER BY id",
+                                "PRAGMA integrity_check",
+                            ]),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    assert_matches_stock(
+        "REPLACE victim DELETE trigger conflict inheritance",
+        &cases,
+        &ALL_LANES,
+        no_normalize,
+    );
+}
+
+/// The victim's clause ends when its DELETE triggers return. The outer
+/// INSERT's own AFTER trigger and later statements retain their clauses.
+#[test]
+fn review_replace_victim_conflict_override_stays_local() {
+    let cases = TXNS.map(|txn| Case {
+        name: format!("REPLACE victim override is local, {txn:?}"),
+        setup: strs(&[
+            "PRAGMA recursive_triggers = ON",
+            "CREATE TABLE t(id INTEGER PRIMARY KEY ON CONFLICT REPLACE, v TEXT)",
+            "CREATE TABLE deleted(id INTEGER UNIQUE, v TEXT)",
+            "CREATE TABLE inserted(id INTEGER UNIQUE)",
+            "INSERT INTO t VALUES (1, 'old')",
+            "INSERT INTO deleted VALUES (1, 'before')",
+            "INSERT INTO inserted VALUES (1)",
+            "CREATE TRIGGER td AFTER DELETE ON t BEGIN \
+             INSERT OR ABORT INTO deleted VALUES (OLD.id, OLD.v); END",
+            "CREATE TRIGGER ti AFTER INSERT ON t BEGIN \
+             INSERT INTO inserted VALUES (NEW.id); END",
+        ]),
+        steps: in_txn(
+            txn,
+            "INSERT INTO t VALUES (2, 'prior')",
+            "INSERT INTO t VALUES (1, 'new')".to_owned(),
+        ),
+        queries: strs(&[
+            "SELECT id, v FROM t ORDER BY id",
+            "SELECT id, v FROM deleted ORDER BY id",
+            "SELECT id FROM inserted ORDER BY id",
+            "PRAGMA integrity_check",
+        ]),
+    });
+    assert_matches_stock(
+        "REPLACE victim clause does not escape into the outer INSERT trigger",
+        &cases,
+        &ALL_LANES,
         no_normalize,
     );
 }
