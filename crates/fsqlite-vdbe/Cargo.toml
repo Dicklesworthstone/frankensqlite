@@ -8,6 +8,8 @@ repository.workspace = true
 
 [features]
 default = ["native"]
+# Bench-only A/B switches (never enabled by a production build).
+bench-internals = []
 native = [
     "fsqlite-pager/native",
     "fsqlite-btree/native",

@@ -311,3 +311,126 @@ fn bound_param_substr_prefix_matches_stock_across_lengths() {
         );
     });
 }
+
+/// Cells whose stored length straddles N: a TEXT cell stored in at most N
+/// bytes is its own prefix unless it carries an embedded NUL (where `substr`
+/// stops); longer cells, multi-byte text, BLOBs and integers are cut exactly.
+const SMALL_CELLS: [(i64, &str); 9] = [
+    (1, ""),
+    (2, "abc"),
+    (3, "a\0bc"),
+    (4, "\0"),
+    (5, "caf\u{e9}"),
+    (6, "\u{1D518}\u{1D518}"),
+    (7, "abcdefgh"),
+    (8, "trailing\0"),
+    (9, "\u{e9}\0\u{e9}\u{e9}"),
+];
+
+/// Reference `substr(value, 1, n)`: TEXT stops at its first NUL and keeps `n`
+/// characters; BLOB keeps `n` bytes; INTEGER is cut as its decimal text.
+fn reference_prefix(value: &SqliteValue, n: usize) -> SqliteValue {
+    match value {
+        SqliteValue::Text(text) => {
+            let text = text.as_str().split('\0').next().unwrap_or_default();
+            SqliteValue::Text(text.chars().take(n).collect::<String>().into())
+        }
+        SqliteValue::Blob(bytes) => SqliteValue::Blob(bytes[..n.min(bytes.len())].to_vec().into()),
+        SqliteValue::Integer(v) => {
+            SqliteValue::Text(v.to_string().chars().take(n).collect::<String>().into())
+        }
+        other => other.clone(),
+    }
+}
+
+#[test]
+fn small_cell_substr_prefix_matches_stock_around_whole_value_fit() {
+    asupersync::test_utils::run_test(|| async {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("substr-small-cells.db");
+        let conn = Connection::open(db.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        // Untyped column so BLOB and INTEGER cells keep their storage class.
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, content);")
+            .await
+            .unwrap();
+        let mut cells: Vec<(i64, SqliteValue)> = SMALL_CELLS
+            .iter()
+            .map(|(id, text)| (*id, SqliteValue::Text((*text).into())))
+            .collect();
+        cells.push((10, SqliteValue::Blob(vec![0_u8, 1, 0, 3].into())));
+        cells.push((11, SqliteValue::Integer(12345)));
+        for (id, value) in &cells {
+            conn.execute_with_params(
+                "INSERT INTO t (id, content) VALUES (?1, ?2);",
+                &[SqliteValue::Integer(*id), value.clone()],
+            )
+            .await
+            .unwrap();
+        }
+
+        let plan = conn
+            .query("EXPLAIN SELECT id, substr(content, 1, 4) FROM t;")
+            .await
+            .unwrap();
+        assert!(
+            plan.iter().any(|row| row
+                .values()
+                .iter()
+                .any(|value| value == &SqliteValue::Text("ColumnSubstrPrefix".into()))),
+            "the literal prefix must run through ColumnSubstrPrefix"
+        );
+
+        let sweep: Vec<usize> = (0..=10).chain([100]).collect();
+        for &n in &sweep {
+            let literal = conn
+                .query(&format!("SELECT id, substr(content, 1, {n}) FROM t;"))
+                .await
+                .unwrap();
+            let bound = conn
+                .query_with_params(
+                    "SELECT id, substr(content, 1, ?1) FROM t;",
+                    &[SqliteValue::Integer(i64::try_from(n).unwrap())],
+                )
+                .await
+                .unwrap();
+            for rows in [&literal, &bound] {
+                assert_eq!(rows.len(), cells.len());
+                for (row, (id, value)) in rows.iter().zip(&cells) {
+                    assert_eq!(row.values()[0], SqliteValue::Integer(*id));
+                    assert_eq!(
+                        row.values()[1],
+                        reference_prefix(value, n),
+                        "substr(cell {id}, 1, {n})"
+                    );
+                }
+            }
+        }
+        drop(conn);
+
+        let sqlite = rusqlite::Connection::open(&db).expect("stock sqlite open");
+        for &n in &sweep {
+            let mut stmt = sqlite
+                .prepare(&format!(
+                    "SELECT substr(content, 1, {n}) FROM t ORDER BY id"
+                ))
+                .unwrap();
+            let stock: Vec<rusqlite::types::Value> = stmt
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            for (stock, (id, value)) in stock.iter().zip(&cells) {
+                let expected = match reference_prefix(value, n) {
+                    SqliteValue::Text(text) => {
+                        rusqlite::types::Value::Text(text.as_str().to_owned())
+                    }
+                    SqliteValue::Blob(bytes) => rusqlite::types::Value::Blob(bytes.to_vec()),
+                    other => panic!("unexpected reference {other:?}"),
+                };
+                assert_eq!(stock, &expected, "stock substr(cell {id}, 1, {n})");
+            }
+        }
+    });
+}

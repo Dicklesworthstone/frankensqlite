@@ -8,7 +8,7 @@ repository.workspace = true
 
 [features]
 default = ["native", "linux-asupersync-uring", "extensions"]
-bench-internals = []
+bench-internals = ["fsqlite-vdbe/bench-internals"]
 # Explicit opt-in for causal WAL adapter fault regressions.
 fault-injection = ["fsqlite-wal/fault-injection"]
 # `native` deliberately does NOT imply `extensions` (fsqlite#356): downstream
@@ -126,3 +126,8 @@ harness = false
 [[bench]]
 name = "rowid_eq_aggregate_bench"
 harness = false
+
+[[bench]]
+name = "column_substr_prefix_whole_value_ab"
+harness = false
+required-features = ["bench-internals"]

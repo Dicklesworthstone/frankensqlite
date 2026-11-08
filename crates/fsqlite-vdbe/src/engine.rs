@@ -7444,6 +7444,49 @@ fn sqlite_substr_prefix_value(value: &SqliteValue, prefix_len: usize) -> SqliteV
     }
 }
 
+/// Whether `substr(value, 1, prefix_len)` is `value` itself: valid-UTF-8 TEXT
+/// with no embedded NUL and at most `prefix_len` bytes (so at most
+/// `prefix_len` characters), or a BLOB of at most `prefix_len` bytes. On these
+/// inputs [`sqlite_substr_prefix_value`] returns an equal value.
+fn sqlite_substr_prefix_is_identity(value: &SqliteValue, prefix_len: usize) -> bool {
+    match value {
+        SqliteValue::Text(text) => {
+            text.is_valid_utf8() && text.len() <= prefix_len && !text.as_bytes_direct().contains(&0)
+        }
+        SqliteValue::Blob(bytes) => bytes.len() <= prefix_len,
+        SqliteValue::Null | SqliteValue::Integer(_) | SqliteValue::Float(_) => false,
+    }
+}
+
+/// What `ColumnSubstrPrefix` learned from the record header alone.
+enum ColumnSubstrPrefixDirect {
+    /// The prefix, read from at most the bytes it needs.
+    Value(SqliteValue),
+    /// TEXT stored in at most `prefix_len` bytes: decode the whole cell and
+    /// check whether it is already its own prefix.
+    FitsPrefix,
+    /// Take the generic `cursor_column` + scalar `substr` path.
+    Generic,
+}
+
+/// Bench-only switch: when set, `ColumnSubstrPrefix` treats `FitsPrefix` as
+/// `Generic`, so one binary can time both paths
+/// (`fsqlite-core/benches/column_substr_prefix_whole_value_ab.rs`).
+#[cfg(feature = "bench-internals")]
+pub static COLUMN_SUBSTR_PREFIX_WHOLE_VALUE_DISABLED_FOR_BENCH: AtomicBool = AtomicBool::new(false);
+
+#[inline]
+fn column_substr_prefix_whole_value_enabled() -> bool {
+    #[cfg(feature = "bench-internals")]
+    {
+        !COLUMN_SUBSTR_PREFIX_WHOLE_VALUE_DISABLED_FOR_BENCH.load(AtomicOrdering::Relaxed)
+    }
+    #[cfg(not(feature = "bench-internals"))]
+    {
+        true
+    }
+}
+
 fn sqlite_octet_length_value(value: &SqliteValue) -> SqliteValue {
     if value.is_null() {
         return SqliteValue::Null;
@@ -16087,12 +16130,35 @@ impl VdbeEngine {
             prefix_len
         };
 
-        if let Some(value) = self
+        match self
             .column_substr_prefix_direct(op.p1, col_idx, prefix_len)
             .await?
         {
-            self.set_reg_fast(op.p3, value);
-            return Ok(());
+            ColumnSubstrPrefixDirect::Value(value) => {
+                self.set_reg_fast(op.p3, value);
+                return Ok(());
+            }
+            // A TEXT cell no longer than `prefix_len` bytes usually IS its own
+            // prefix. Decode it like `Column` does (one shared allocation, also
+            // cached for the row) instead of `cursor_column` (an owned copy plus
+            // a cache clone) followed by a third copy in the scalar substr.
+            ColumnSubstrPrefixDirect::FitsPrefix
+                if column_substr_prefix_whole_value_enabled()
+                    && self.column_to_reg_direct(op.p1, col_idx, op.p3).await? =>
+            {
+                let column = self.get_reg(op.p3);
+                if sqlite_substr_prefix_is_identity(column, prefix_len) {
+                    return Ok(());
+                }
+                // TEXT and BLOB decode the same on both column paths, so the
+                // scalar prefix of the register equals the generic path's.
+                if matches!(column, SqliteValue::Text(_) | SqliteValue::Blob(_)) {
+                    let value = sqlite_substr_prefix_value(column, prefix_len);
+                    self.set_reg_fast(op.p3, value);
+                    return Ok(());
+                }
+            }
+            ColumnSubstrPrefixDirect::FitsPrefix | ColumnSubstrPrefixDirect::Generic => {}
         }
 
         let value = self.cursor_column(op.p1, col_idx).await?;
@@ -17421,13 +17487,13 @@ impl VdbeEngine {
         cursor_id: i32,
         col_idx: usize,
         prefix_len: usize,
-    ) -> Result<Option<SqliteValue>> {
+    ) -> Result<ColumnSubstrPrefixDirect> {
         let collect_vdbe_metrics = self.collect_vdbe_metrics;
         let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) else {
-            return Ok(None);
+            return Ok(ColumnSubstrPrefixDirect::Generic);
         };
         if cursor.cursor.eof() {
-            return Ok(Some(SqliteValue::Null));
+            return Ok(ColumnSubstrPrefixDirect::Value(SqliteValue::Null));
         }
 
         ensure_storage_cursor_row_layout(cursor, 0, collect_vdbe_metrics).await?;
@@ -17441,7 +17507,7 @@ impl VdbeEngine {
 
         let payload_idx = if let Some(ipk) = ipk_col_idx {
             if col_idx == ipk {
-                return Ok(None);
+                return Ok(ColumnSubstrPrefixDirect::Generic);
             }
             if col_idx > ipk && !payload_includes {
                 col_idx - 1
@@ -17453,7 +17519,7 @@ impl VdbeEngine {
         };
 
         let Some(col) = cursor.row_decode.column_offset(payload_idx).copied() else {
-            return Ok(None);
+            return Ok(ColumnSubstrPrefixDirect::Generic);
         };
         let Some(col_end) = column_payload_end(&col) else {
             return Err(FrankenError::DatabaseCorrupt {
@@ -17488,7 +17554,11 @@ impl VdbeEngine {
                     // Small value: no memory concern. Defer to the generic
                     // scalar path, which preserves every embedded-NUL and
                     // invalid-UTF-8 edge exactly.
-                    return Ok(None);
+                    return Ok(if col_len <= prefix_len {
+                        ColumnSubstrPrefixDirect::FitsPrefix
+                    } else {
+                        ColumnSubstrPrefixDirect::Generic
+                    });
                 }
                 let window_end = start.saturating_add(budget);
                 ensure_storage_cursor_row_layout(cursor, window_end, collect_vdbe_metrics).await?;
@@ -17530,7 +17600,10 @@ impl VdbeEngine {
             FSQLITE_VDBE_COLUMN_READS_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
             record_decoded_value_metrics(value);
         }
-        Ok(value)
+        Ok(value.map_or(
+            ColumnSubstrPrefixDirect::Generic,
+            ColumnSubstrPrefixDirect::Value,
+        ))
     }
 
     /// Return `octet_length(column)` from record-header metadata when the
@@ -21381,6 +21454,55 @@ mod tests {
     use proptest::test_runner::{Config as ProptestConfig, TestCaseError, TestRunner};
     use rusqlite::params_from_iter;
     use rusqlite::types::Value as RusqliteValue;
+
+    /// `ColumnSubstrPrefix` keeps a decoded cell instead of copying it exactly
+    /// when `sqlite_substr_prefix_is_identity` says so; that must only happen
+    /// where the scalar prefix returns an equal value.
+    #[test]
+    fn test_substr_prefix_identity_only_where_scalar_prefix_is_unchanged() {
+        let raw = SmallText::from_record_text_bytes(b"ab\xffcd", TextEncoding::Utf8);
+        assert!(!raw.is_valid_utf8(), "fixture must be the raw TEXT form");
+        let values = [
+            SqliteValue::Null,
+            SqliteValue::Integer(12345),
+            SqliteValue::Float(1.5),
+            SqliteValue::Text("".into()),
+            SqliteValue::Text("abc".into()),
+            SqliteValue::Text("a\0bc".into()),
+            SqliteValue::Text("trailing\0".into()),
+            SqliteValue::Text("caf\u{e9}".into()),
+            SqliteValue::Text("\u{1D518}\u{1D518}".into()),
+            SqliteValue::Text("x".repeat(40).into()),
+            SqliteValue::Text(raw),
+            SqliteValue::Blob(Arc::from(&b""[..])),
+            SqliteValue::Blob(Arc::from(&b"\0\x01\0\x03"[..])),
+        ];
+        let mut kept = 0;
+        for value in &values {
+            for prefix_len in (0..=12).chain([39, 40, 41, 100]) {
+                let scalar = sqlite_substr_prefix_value(value, prefix_len);
+                if sqlite_substr_prefix_is_identity(value, prefix_len) {
+                    kept += 1;
+                    assert_eq!(&scalar, value, "kept {value:?} at {prefix_len}");
+                }
+                let changes = match value {
+                    SqliteValue::Text(text) => {
+                        !text.is_valid_utf8()
+                            || text.as_bytes_direct().contains(&0)
+                            || text.len() > prefix_len
+                    }
+                    SqliteValue::Blob(bytes) => bytes.len() > prefix_len,
+                    _ => true,
+                };
+                assert_eq!(
+                    sqlite_substr_prefix_is_identity(value, prefix_len),
+                    !changes,
+                    "identity predicate for {value:?} at {prefix_len}"
+                );
+            }
+        }
+        assert!(kept > 0, "the sweep must exercise kept values");
+    }
 
     #[test]
     fn test_table_seek_target_follows_stock_intkey_seek_rules() {
