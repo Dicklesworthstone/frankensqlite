@@ -49,6 +49,72 @@ use crate::checksum::{
 /// Keep whole frames together and reuse this storage across large transactions.
 const WAL_APPEND_BUFFER_BYTES: usize = 1024 * 1024;
 
+/// Keep replay reads within the VFS inline-read limit. A 64 KiB page requires
+/// one indivisible frame (page plus header) larger than this budget.
+const WAL_REPLAY_READ_BYTES: usize = 64 * 1024;
+
+/// Sequential, bounded reads of a previously sampled frame range.
+///
+/// This only amortizes I/O. Callers still validate every frame's salt and
+/// cumulative payload checksum before admitting a commit. Never extend the
+/// sampled horizon when a peer appends during a read, and preserve all complete
+/// frames returned before a short/torn tail inside one batch.
+struct WalFrameReader {
+    frame_size: usize,
+    next_frame: usize,
+    end_frame: usize,
+    buffer: Vec<u8>,
+    position: usize,
+    available: usize,
+}
+
+impl WalFrameReader {
+    fn new(frame_size: usize, start: usize, end: usize) -> Self {
+        let frames_per_read = (WAL_REPLAY_READ_BYTES / frame_size)
+            .max(1)
+            .min(end.saturating_sub(start).max(1));
+        Self {
+            frame_size,
+            next_frame: start,
+            end_frame: end,
+            buffer: vec![0; frame_size * frames_per_read],
+            position: 0,
+            available: 0,
+        }
+    }
+
+    async fn next<F: VfsFile>(&mut self, cx: &Cx, file: &F) -> Result<Option<&[u8]>> {
+        if self.next_frame >= self.end_frame {
+            return Ok(None);
+        }
+        if self.position + self.frame_size > self.available {
+            // A VFS may cap a read without reaching EOF. Consume every complete
+            // frame first, then resume at the next frame boundary. Any partial
+            // fragment is reread; only a read shorter than one frame has the
+            // same stopping meaning as the original one-frame replay loop.
+            let frames =
+                (self.buffer.len() / self.frame_size).min(self.end_frame - self.next_frame);
+            let wanted = frames * self.frame_size;
+            let offset = u64::try_from(WAL_HEADER_SIZE)
+                .expect("WAL header size fits u64")
+                .saturating_add(
+                    u64::try_from(self.next_frame)
+                        .unwrap_or(u64::MAX)
+                        .saturating_mul(u64::try_from(self.frame_size).unwrap_or(u64::MAX)),
+                );
+            self.available = file.read(cx, &mut self.buffer[..wanted], offset).await?;
+            self.position = 0;
+            if self.available < self.frame_size {
+                return Ok(None);
+            }
+        }
+        let start = self.position;
+        self.position += self.frame_size;
+        self.next_frame += 1;
+        Ok(Some(&self.buffer[start..self.position]))
+    }
+}
+
 #[inline]
 fn log_replay_decision(
     replay_cursor: &'static str,
@@ -336,9 +402,9 @@ impl<F: VfsFile> WalFile<F> {
         // - the new valid prefix length (`frame_count`)
         // - the checksum seed for the next append (`running_checksum`)
         //
-        // SQLite WAL frame headers already carry the post-frame rolling
-        // checksum, so we can ingest appended frames by reading headers only.
-        // Full checksum-chain verification is still performed on open/rebuild.
+        // Validate every new frame's payload against the rolling checksum
+        // captured at the accepted prefix. A stored checksum alone is not
+        // evidence that an appended payload was fully written.
         let frame_size_u64 = u64::try_from(frame_size).unwrap_or(u64::MAX);
         let available_frames = usize::try_from(
             file_size.saturating_sub(u64::try_from(WAL_HEADER_SIZE).unwrap_or(0)) / frame_size_u64,
@@ -355,12 +421,10 @@ impl<F: VfsFile> WalFile<F> {
         let mut last_commit_checksum =
             last_commit.map_or(disk_header_checksum, |(_, header)| header.checksum);
 
-        let mut frame_buf = vec![0u8; frame_size];
+        let mut frames = WalFrameReader::new(frame_size, self.frame_count, available_frames);
         for frame_index in self.frame_count..available_frames {
             let frame_no = frame_index.saturating_add(1);
-            let offset = self.frame_offset(frame_index);
-            let bytes_read = self.file.read(cx, &mut frame_buf, offset).await?;
-            if bytes_read < frame_size {
+            let Some(frame_buf) = frames.next(cx, &self.file).await? else {
                 log_replay_decision(
                     "refresh_incremental",
                     frame_no,
@@ -368,7 +432,7 @@ impl<F: VfsFile> WalFile<F> {
                     "truncated_tail_stop",
                 );
                 break; // Partial/torn tail frame; keep prior valid prefix.
-            }
+            };
 
             let frame_header = WalFrameHeader::from_bytes(&frame_buf[..WAL_FRAME_HEADER_SIZE])?;
             if frame_header.salts != self.header.salts {
@@ -382,7 +446,7 @@ impl<F: VfsFile> WalFile<F> {
             }
 
             let expected = compute_wal_frame_checksum(
-                &frame_buf,
+                frame_buf,
                 self.page_size,
                 new_running_checksum,
                 self.big_endian_checksum,
@@ -483,23 +547,19 @@ impl<F: VfsFile> WalFile<F> {
         let mut accepted_checksum = header_checksum;
         let mut accepted_count = 0;
         let mut last_commit = None;
-        let mut frame_buf = vec![0; frame_size];
+        let mut frames = WalFrameReader::new(frame_size, 0, available_frames);
         for index in 0..available_frames {
-            let read = self
-                .file
-                .read(cx, &mut frame_buf, self.frame_offset(index))
-                .await?;
-            if read != frame_size {
+            let Some(frame_buf) = frames.next(cx, &self.file).await? else {
                 if index < prefix_frame_count {
                     return Err(FrankenError::WalCorrupt {
                         detail: "short read inside the retained append prefix".to_owned(),
                     });
                 }
                 break;
-            }
+            };
             let header = WalFrameHeader::from_bytes(&frame_buf[..WAL_FRAME_HEADER_SIZE])?;
             let expected = compute_wal_frame_checksum(
-                &frame_buf,
+                frame_buf,
                 self.page_size,
                 running_checksum,
                 self.big_endian_checksum,
@@ -588,12 +648,10 @@ impl<F: VfsFile> WalFile<F> {
         )
         .unwrap_or(usize::MAX);
 
-        let mut frame_buf = vec![0u8; frame_size];
+        let mut frames = WalFrameReader::new(frame_size, 0, max_frames);
         for frame_index in 0..max_frames {
             let frame_no = frame_index.saturating_add(1);
-            let offset = self.frame_offset(frame_index);
-            let bytes_read = self.file.read(cx, &mut frame_buf, offset).await?;
-            if bytes_read < frame_size {
+            let Some(frame_buf) = frames.next(cx, &self.file).await? else {
                 log_replay_decision(
                     "rebuild",
                     frame_no,
@@ -601,7 +659,7 @@ impl<F: VfsFile> WalFile<F> {
                     "truncated_tail_stop",
                 );
                 break;
-            }
+            };
 
             let frame_header = WalFrameHeader::from_bytes(&frame_buf[..WAL_FRAME_HEADER_SIZE])?;
             if frame_header.page_number == 0 {
@@ -614,7 +672,7 @@ impl<F: VfsFile> WalFile<F> {
             }
 
             let expected = compute_wal_frame_checksum(
-                &frame_buf,
+                frame_buf,
                 self.page_size,
                 new_running_checksum,
                 self.big_endian_checksum,
@@ -888,21 +946,11 @@ impl<F: VfsFile> WalFile<F> {
         let mut last_commit_frames = 0_usize;
         let mut last_commit_checksum = header_checksum;
         let mut last_commit = None;
-        let mut frame_buf = vec![0u8; frame_size];
+        let mut frames = WalFrameReader::new(frame_size, 0, max_frames);
 
         for frame_index in 0..max_frames {
             let frame_no = frame_index.saturating_add(1);
-            // Compute in u64 to prevent usize overflow on 32-bit targets.
-            // Use the helper method which is guaranteed safe.
-            // Note: we can't call self.frame_offset because we don't have self yet.
-            // Replicate the logic here: header + index * frame_size.
-            let header_size = WAL_HEADER_SIZE as u64;
-            let idx = frame_index as u64;
-            let frame_sz = frame_size as u64;
-            let file_offset = header_size.saturating_add(idx.saturating_mul(frame_sz));
-
-            let bytes_read = file.read(cx, &mut frame_buf, file_offset).await?;
-            if bytes_read < frame_size {
+            let Some(frame_buf) = frames.next(cx, &file).await? else {
                 log_replay_decision(
                     "startup_open",
                     frame_no,
@@ -910,7 +958,7 @@ impl<F: VfsFile> WalFile<F> {
                     "truncated_tail_stop",
                 );
                 break; // truncated frame
-            }
+            };
 
             // Verify salt match.
             let frame_header = WalFrameHeader::from_bytes(&frame_buf[..WAL_FRAME_HEADER_SIZE])?;
@@ -927,7 +975,7 @@ impl<F: VfsFile> WalFile<F> {
 
             // Verify checksum chain.
             let expected = compute_wal_frame_checksum(
-                &frame_buf,
+                frame_buf,
                 page_size,
                 running_checksum,
                 big_endian_checksum,

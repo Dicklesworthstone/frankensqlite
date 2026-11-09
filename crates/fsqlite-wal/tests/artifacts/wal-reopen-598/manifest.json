@@ -1,0 +1,211 @@
+{
+  "schema": "frankensqlite.wal-reopen-598.validation.v1",
+  "date_utc": "2026-11-09",
+  "repository": "Dicklesworthstone/frankensqlite",
+  "base_commit": "074c2033b4dd5212bf2f6c6aa80480ff711dfd9f",
+  "related_beads_commit": "8f627089545aa5b245833bb76bca27fbda67674d",
+  "current_source_hashes": {
+    "crates/fsqlite-wal/src/wal.rs": "c4af4277529d42d4c32c393412886f48dd054c302712a16fc27dab1f713ff0ba",
+    "crates/fsqlite-wal/tests/wal_reopen.rs": "9d149b421fff322e2c2f1881ec03eacf8080cdc2d9f592907a1032055db42d9b",
+    "crates/fsqlite-core/examples/wal_reopen_probe.rs": "6275a11a5114f59ed2857cf3372c0ac44a9862e3581b461b20707a353d97a1f6",
+    "scripts/bench_wal_reopen.py": "e983ab37a22ceb0f1e7969b58474cf745dd9f2785a5fde1216ccf45e5a3b2bac"
+  },
+  "validation_status": "Rust compilation and execution blocked in unchanged Asupersync dependency; source/static checks passed.",
+  "no_claims": [
+    "No new Rust regression passed or failed at runtime.",
+    "The changed WAL crate and native component example have not compiled successfully.",
+    "No candidate native or br show CPU/latency speedup has been measured.",
+    "No release qualification or dependency integration is claimed."
+  ],
+  "completed_static_checks": [
+    {
+      "command": [
+        "cargo",
+        "fmt",
+        "--check"
+      ],
+      "exit_code": 0,
+      "log": "artifacts/frankensqlite-fmt-final-2.log"
+    },
+    {
+      "command": [
+        "rustfmt",
+        "--check",
+        "--config-path",
+        "/workspace/scratch/e1a71523531b/artifacts/rustfmt-probe.toml",
+        "crates/fsqlite-core/examples/wal_reopen_probe.rs"
+      ],
+      "exit_code": 0,
+      "log": "artifacts/frankensqlite-probe-fmt-final-2.log"
+    },
+    {
+      "command": [
+        "git",
+        "diff",
+        "--check"
+      ],
+      "exit_code": 0
+    },
+    {
+      "check": "Python compile() syntax check for scripts/bench_wal_reopen.py",
+      "exit_code": 0
+    }
+  ],
+  "source_review": "Reviewed all four recovery callers and VFS contracts; corrected non-EOF short-read assumption before this source snapshot; capped-read regression added.",
+  "attempts": [
+    {
+      "label": "wal-reopen-integration-1",
+      "status": "not_launched",
+      "reason": "Preflight available memory below 5.5 GiB; no compiler launched"
+    },
+    {
+      "label": "wal-reopen-integration-2",
+      "status": "interrupted_unknown",
+      "reason": "unknown; not classified as OOM, compiler failure, or test failure",
+      "source_is_final": false
+    },
+    {
+      "label": "wal-reopen-integration-3",
+      "status": "dependency_rustc_sigkill",
+      "cargo_exit_code": 101,
+      "elapsed_seconds": 955.5452991719994,
+      "max_rss_kib": 4073404,
+      "oom_kills_before": 8,
+      "oom_kills_after": 9,
+      "source_changed_during_build": false,
+      "source_is_final": true
+    }
+  ],
+  "remaining_gates": [
+    "wal_reopen integration regressions",
+    "WalFile unit recovery controls",
+    "bd_xfn30_3_fault_injection_matrix",
+    "bd_db300_7_2_3_recovery_invariants with fault-injection",
+    "Relevant native recovery keepers",
+    "all-target Rust check and Clippy",
+    "matched component and end-to-end br show CPU/latency measurements, including 130/700 MB workloads and concurrent readers/writers",
+    "compatible published engine family and Beads engine-upgrade qualification before dependency adoption"
+  ],
+  "archive": {
+    "file": "validation.tar.gz",
+    "bytes": 215595,
+    "sha256": "7c92b75ebeeb27d962a876c4100f6858495307f8152cb64c3b1057920bf03eeb"
+  },
+  "members": [
+    {
+      "path": "artifacts/wal-reopen-integration-1-receipt.json",
+      "bytes": 3785,
+      "sha256": "e7c17d96979d97f9a557f526fe6f74092f0889f545001ef5dbb9aab80525c4cc"
+    },
+    {
+      "path": "artifacts/wal-reopen-integration-2-receipt.json",
+      "bytes": 4539,
+      "sha256": "efef3877d1f43a91a2cf208a5106314ad0a135d5a141c5752afd99a5deda1c5b"
+    },
+    {
+      "path": "artifacts/wal-reopen-integration-2-lock-observation.json",
+      "bytes": 339,
+      "sha256": "6b4c59fa536ccd50d96039096ef7a672cb0959670a16ea701047c1e918e0d0c8"
+    },
+    {
+      "path": "artifacts/wal-reopen-integration-2.log",
+      "bytes": 4504673,
+      "sha256": "8fb0d03fd60a8d62fee3410aaacb3248c8b92e7af58dcda78c4d757db9b22c85"
+    },
+    {
+      "path": "artifacts/wal-reopen-integration-2.patch",
+      "bytes": 9787,
+      "sha256": "0e61f048a52b27c7edb9be7b4e8221a65ffafacc6e4934ad6930e581fafdd32a"
+    },
+    {
+      "path": "artifacts/wal-reopen-integration-2-test.rs",
+      "bytes": 22243,
+      "sha256": "ead1985e576fee24f1718aa25948ea71a893288e18b66d6ca73575b7f5cf5614"
+    },
+    {
+      "path": "artifacts/wal-reopen-integration-3-receipt.json",
+      "bytes": 3937,
+      "sha256": "b961492d8421c2a9ea2cb5c758c3934f4dd7197f00a5ecdc8775b3a869a63547"
+    },
+    {
+      "path": "artifacts/wal-reopen-integration-3.log",
+      "bytes": 4526054,
+      "sha256": "8746cd7e7c8d62084f580ee6ce5e959a7fbbeacd77ce0c830e730872f0a0f7d1"
+    },
+    {
+      "path": "artifacts/wal-reopen-integration-3.patch",
+      "bytes": 9912,
+      "sha256": "783cfe944d3c64d7e8dfb385bf3aba87019ba49ece68ccb64863790008c1b4d8"
+    },
+    {
+      "path": "artifacts/wal-reopen-integration-3-test.rs",
+      "bytes": 23615,
+      "sha256": "9d149b421fff322e2c2f1881ec03eacf8080cdc2d9f592907a1032055db42d9b"
+    },
+    {
+      "path": "artifacts/wal-low-memory.toml",
+      "bytes": 425,
+      "sha256": "dd98c781c9de327752fefde51e3cb96aee61c952ff95fdea33f280f0a8462936"
+    },
+    {
+      "path": "artifacts/wal-build-env.sh",
+      "bytes": 469,
+      "sha256": "66e0b4b5e20c9bb851381638aed3b588d36f1c28e81bf50e8f811b8352335d54"
+    },
+    {
+      "path": "artifacts/run_wal_tests.py",
+      "bytes": 4891,
+      "sha256": "4fddfd38159f2fc281d292ad29faf5f614b6ee368a71d68ad915c054028f6f21"
+    },
+    {
+      "path": "artifacts/run_wal_keeper.py",
+      "bytes": 3793,
+      "sha256": "cfcd68f9dd1f0903a5b0b2d74a47b55aa80b56834bacee24904819a8e1f30fa5"
+    },
+    {
+      "path": "artifacts/rustfmt-probe.toml",
+      "bytes": 38,
+      "sha256": "e9cdc17c00c3fbfc1e4b61db803b696beab2c9fdcb52bbd59a5a65e26ce95bd1"
+    },
+    {
+      "path": "artifacts/wal-reopen-final-static-checks.json",
+      "bytes": 1438,
+      "sha256": "517d030278476812756a800fd0baf2d84790c893351ac63defec114462652112"
+    },
+    {
+      "path": "artifacts/frankensqlite-fmt-final-2.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "artifacts/frankensqlite-probe-fmt-final-2.log",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "frankensqlite/Cargo.toml",
+      "bytes": 12063,
+      "sha256": "b4abb5ec78c3f2972bdb557cfb28bbbc37e277808827dc6a941a1e9b5305e359"
+    },
+    {
+      "path": "frankensqlite/Cargo.lock",
+      "bytes": 102757,
+      "sha256": "2bddc326f7bb9a15807f2c0a594bd244d7fc1ef514fb78e1e7b03e77ab65c969"
+    },
+    {
+      "path": "frankensqlite/rust-toolchain.toml",
+      "bytes": 98,
+      "sha256": "81ea4fcf72ea5d9b345769eceda5711cc2a662cd7c6bc6949f850a4a53831c47"
+    },
+    {
+      "path": "frankensqlite/.cargo/config.toml",
+      "bytes": 1784,
+      "sha256": "767217080422b626cd20de14bb08e86eef00e9caffbe1ceba0891ab23f5bcdaa"
+    },
+    {
+      "path": "frankensqlite/crates/fsqlite-wal/Cargo.toml",
+      "bytes": 1572,
+      "sha256": "57cb0072e1c842c740dc8ba6f10683973b09abdbeff2d366210a4556c83d2561"
+    }
+  ]
+}
