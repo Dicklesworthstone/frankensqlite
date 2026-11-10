@@ -15,6 +15,7 @@
 
 #![allow(clippy::cast_precision_loss)]
 
+use std::fmt::Write as _;
 use std::hint::black_box;
 use std::path::Path;
 use std::time::Instant;
@@ -137,7 +138,12 @@ const WORKLOADS: &[&str] = &[
 fn elf_sha256() -> String {
     let exe = std::env::current_exe().expect("current_exe");
     let bytes = std::fs::read(exe).expect("read own ELF");
-    format!("{:x}", Sha256::digest(bytes))
+    Sha256::digest(bytes)
+        .iter()
+        .fold(String::new(), |mut hex, byte| {
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        })
 }
 
 fn median(values: &mut [f64]) -> f64 {

@@ -712,6 +712,13 @@ impl FrankenError {
             Self::BusySnapshot { .. } => 5 | (2 << 8), // SQLITE_BUSY_SNAPSHOT = 517
             Self::TriggerRaise(_) | Self::RaiseFail(_) => 0x13 | (7 << 8), // SQLITE_CONSTRAINT_TRIGGER = 1811
             Self::DatatypeViolation { .. } => 3091, // SQLITE_CONSTRAINT_DATATYPE
+            // Applications match these (rusqlite's `extended_code`), e.g.
+            // SQLITE_CONSTRAINT_UNIQUE to detect a duplicate insert.
+            Self::CheckViolation { .. } => 0x13 | (1 << 8), // SQLITE_CONSTRAINT_CHECK = 275
+            Self::ForeignKeyViolation => 0x13 | (3 << 8), // SQLITE_CONSTRAINT_FOREIGNKEY = 787
+            Self::NotNullViolation { .. } => 0x13 | (5 << 8), // SQLITE_CONSTRAINT_NOTNULL = 1299
+            Self::PrimaryKeyViolation => 0x13 | (6 << 8), // SQLITE_CONSTRAINT_PRIMARYKEY = 1555
+            Self::UniqueViolation { .. } => 0x13 | (8 << 8), // SQLITE_CONSTRAINT_UNIQUE = 2067
             Self::NewerFormat { .. } => SQLITE_OPEN_NEWER_FORMAT, // 14 | (0x7F << 8) = 32526
             // 14 | (0x7E << 8) = 32270
             Self::IncompatiblePeerEngine { .. } => SQLITE_OPEN_INCOMPATIBLE_PEER,
@@ -1787,6 +1794,39 @@ mod tests {
         );
         assert_eq!(err.error_code(), ErrorCode::Constraint);
         assert_eq!(err.extended_error_code(), 3091);
+    }
+
+    /// The constraint kinds carry SQLite's extended codes, which applications
+    /// match to tell a duplicate key from a NULL in a NOT NULL column.
+    #[test]
+    fn constraint_violations_report_sqlite_extended_codes() {
+        let cases = [
+            (
+                FrankenError::UniqueViolation {
+                    columns: "t.a".to_owned(),
+                },
+                2067,
+            ),
+            (
+                FrankenError::NotNullViolation {
+                    column: "t.a".to_owned(),
+                },
+                1299,
+            ),
+            (
+                FrankenError::CheckViolation {
+                    name: "positive".to_owned(),
+                },
+                275,
+            ),
+            (FrankenError::ForeignKeyViolation, 787),
+            (FrankenError::PrimaryKeyViolation, 1555),
+        ];
+        for (err, extended) in cases {
+            assert_eq!(err.error_code(), ErrorCode::Constraint, "{err}");
+            assert_eq!(err.extended_error_code(), extended, "{err}");
+            assert_eq!(err.extended_error_code() & 0xff, 19, "{err}");
+        }
     }
 
     #[test]

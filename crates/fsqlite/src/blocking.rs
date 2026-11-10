@@ -1181,7 +1181,8 @@ const PARAMETER_CACHE_LIMIT: usize = 512;
 
 /// A connection to a database file or an in-memory database.
 pub struct Connection {
-    inner: Option<crate::Connection>,
+    /// Boxed: the engine connection is kilobytes, and this handle is moved.
+    inner: Option<Box<crate::Connection>>,
     parameter_slots: RefCell<HashMap<Box<str>, Rc<BindParameterSlots>>>,
     no_parameters: Rc<BindParameterSlots>,
 }
@@ -1197,7 +1198,7 @@ impl fmt::Debug for Connection {
 impl Connection {
     fn wrap(inner: crate::Connection) -> Self {
         Self {
-            inner: Some(inner),
+            inner: Some(Box::new(inner)),
             parameter_slots: RefCell::new(HashMap::new()),
             no_parameters: Rc::new(BindParameterSlots::default()),
         }
@@ -1239,7 +1240,7 @@ impl Connection {
     #[must_use]
     pub fn as_async(&self) -> &crate::Connection {
         self.inner
-            .as_ref()
+            .as_deref()
             .expect("connection is open until dropped")
     }
 
@@ -1352,7 +1353,7 @@ impl Connection {
     /// The database file path (`":memory:"` for an in-memory database).
     #[must_use]
     pub fn path(&self) -> Option<&str> {
-        self.inner.as_ref().map(crate::Connection::path)
+        self.inner.as_deref().map(crate::Connection::path)
     }
 
     /// Begin a DEFERRED transaction (FrankenSQLite runs it as a concurrent
@@ -1377,7 +1378,7 @@ impl Connection {
 
     /// Set the busy timeout (`PRAGMA busy_timeout`).
     pub fn busy_timeout(&self, timeout: Duration) -> Result<()> {
-        let millis = i64::try_from(timeout.as_millis()).unwrap_or(i64::from(i32::MAX));
+        let millis = timeout.as_millis().min(i32::MAX as u128);
         self.execute_batch(&format!("PRAGMA busy_timeout = {millis}"))
     }
 
@@ -1497,7 +1498,7 @@ impl fmt::Debug for Statement<'_> {
     }
 }
 
-impl<'conn> Statement<'conn> {
+impl Statement<'_> {
     /// Run the statement with `params`; returns the number of rows changed.
     pub fn execute<P: Params>(&mut self, params: P) -> Result<usize> {
         let values = params.bind_to(&self.slots)?;
@@ -1518,7 +1519,7 @@ impl<'conn> Statement<'conn> {
         let rows = block_on(self.stmt.query_with_params(&values))?;
         Ok(Rows {
             names: &self.names,
-            rows: rows.into_iter(),
+            pending: rows.into_iter(),
             current: None,
         })
     }
@@ -1570,9 +1571,9 @@ impl<'conn> Statement<'conn> {
         self.names.len()
     }
 
-    #[must_use]
-    pub fn column_names(&self) -> Vec<&str> {
-        self.names.iter().map(String::as_str).collect()
+    /// The result column names, in order (an iterator, as in rusqlite 0.41).
+    pub fn column_names(&self) -> impl DoubleEndedIterator<Item = &str> + ExactSizeIterator {
+        self.names.iter().map(String::as_str)
     }
 
     pub fn column_name(&self, index: usize) -> Result<&str> {
@@ -1619,7 +1620,7 @@ fn column_index(names: &[String], name: &str) -> Result<usize> {
 /// The rows of a query, stepped with [`Rows::next`].
 pub struct Rows<'stmt> {
     names: &'stmt [String],
-    rows: std::vec::IntoIter<crate::Row>,
+    pending: std::vec::IntoIter<crate::Row>,
     current: Option<Row<'stmt>>,
 }
 
@@ -1627,7 +1628,7 @@ impl<'stmt> Rows<'stmt> {
     /// The next row, or `None` after the last one.
     #[allow(clippy::should_implement_trait)] // rusqlite's lending `next`
     pub fn next(&mut self) -> Result<Option<&Row<'stmt>>> {
-        self.current = self.rows.next().map(|values| Row {
+        self.current = self.pending.next().map(|values| Row {
             names: self.names,
             values,
         });
@@ -1856,6 +1857,8 @@ impl<'conn> Transaction<'conn> {
                 .or_else(|_| self.conn.execute_batch("ROLLBACK")),
             DropBehavior::Rollback => self.conn.execute_batch("ROLLBACK"),
             DropBehavior::Ignore => Ok(()),
+            // The caller opted into this with set_drop_behavior, as in
+            // rusqlite: an unfinished transaction is a bug they want loud.
             DropBehavior::Panic => panic!("Transaction dropped unexpectedly."),
         }
     }
@@ -2038,7 +2041,10 @@ mod tests {
                               ON n.person = p.id GROUP BY p.id ORDER BY p.id",
                     )
                     .unwrap();
-                trace.push(format!("columns {:?}", stmt.column_names()));
+                trace.push(format!(
+                    "columns {:?}",
+                    stmt.column_names().collect::<Vec<_>>()
+                ));
                 let named: $m::Result<Vec<(String, i64)>> = stmt
                     .query_map([], |row| Ok((row.get(0)?, row.get("notes")?)))
                     .unwrap()
@@ -2075,7 +2081,7 @@ mod tests {
                 conn.query_row("SELECT 300", [], |row| row.get::<_, u8>(0)),
             ));
             trace.push(show(
-                conn.query_row("SELECT -1", [], |row| row.get::<_, u64>(0)),
+                conn.query_row("SELECT -1", [], |row| row.get::<_, u32>(0)),
             ));
             trace.push(show(
                 conn.query_row("SELECT 1", [], |row| row.get::<_, i64>(1)),
@@ -2088,7 +2094,6 @@ mod tests {
                 "UPDATE person SET age = :age WHERE id = 1",
                 named_params! { ":wrong": 1 },
             )));
-            trace.push(show(conn.execute("SELECT ?1", [u64::MAX])));
             trace.push(show(
                 conn.prepare("INSERT INTO note(person) SELECT id FROM person WHERE 0")
                     .unwrap()
@@ -2235,7 +2240,8 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(by_index, 799 % 7 * 10);
+        // item-799 is id 800: 799 % 7 = 1, multiplied by 10 (id % 50 == 0).
+        assert_eq!(by_index, 10);
     }
 
     #[test]
@@ -2255,5 +2261,28 @@ mod tests {
             .query_row("SELECT count(*) FROM t", [], |row| row.get(0))
             .unwrap();
         assert_eq!(rows, 1, "the uncommitted row must not survive the drop");
+    }
+
+    /// `u64`/`usize` convert with range checks (rusqlite has them only behind
+    /// its `fallible_uint` feature, so there is no stock oracle here).
+    #[test]
+    fn unsigned_conversions_are_range_checked() {
+        let conn = Connection::open_in_memory().unwrap();
+        let big: u64 = conn
+            .query_row("SELECT ?1", [i64::MAX as u64], |row| row.get(0))
+            .unwrap();
+        assert_eq!(big, i64::MAX as u64);
+        assert!(matches!(
+            conn.query_row("SELECT ?1", [u64::MAX], |row| row.get::<_, u64>(0)),
+            Err(Error::ToSqlConversionFailure(_))
+        ));
+        assert!(matches!(
+            conn.query_row("SELECT -1", [], |row| row.get::<_, u64>(0)),
+            Err(Error::IntegralValueOutOfRange(0, -1))
+        ));
+        assert!(matches!(
+            conn.query_row("SELECT -1", [], |row| row.get::<_, usize>(0)),
+            Err(Error::IntegralValueOutOfRange(0, -1))
+        ));
     }
 }

@@ -73,6 +73,55 @@ not available on this platform").
    expression (bd-w4pr1.19). The per-statement file-identity and refresh
    syscalls are another (bd-ih8ak).
 
+## Per-statement shapes across all 15 releases
+
+A second probe ran every shipped Linux CLI on literal SQL scripts, one
+statement per line. HEAD is a glibc build of 4a75f6636. Each release got a
+fresh WAL database. The host was shared with other runs, so read the columns
+as orders of magnitude.
+
+Workloads:
+- **setup 100k**: 100k single-row INSERTs in one transaction, plus an index.
+- **10k point lookups**: `SELECT b FROM t WHERE id = N`.
+- **20k INSERTs in one txn**: 20k single-row INSERTs inside one transaction.
+
+Times are seconds; T/O is the 300 s limit.
+
+| release | setup 100k | 10k point lookups | 20k INSERTs in one txn |
+|---|---:|---:|---:|
+| stock 3.46.1 | 0.25 | 0.17 | 0.04 |
+| v0.1.14 | 25.8 | 1.9 (wrong output) | 0.93 |
+| v0.1.16 | 72.0 | 3.7 (wrong output) | 1.75 |
+| v0.1.17 | 71.7 | 3.8 (wrong output) | 1.79 |
+| v0.3.0 | 84.4 | T/O | 3.72 |
+| v0.3.4 | 13.7 | T/O | 1.12 |
+| v0.3.8 | cannot open a file database | | |
+| v0.3.11 | 30.6 | T/O | 2.60 |
+| v0.3.14 | 33.9 | T/O | 2.63 |
+| v0.3.18 | 18.5 | T/O | 3.41 |
+| v0.4.4 | T/O | T/O | T/O |
+| v0.4.7 | 19.9 | 52.0 | 52.0 |
+| v0.4.9 | 18.1 | 2.62 | 1.77 |
+| v0.4.10 | 14.0 | 2.80 | 1.72 |
+| v0.4.12 | 13.3 | 2.35 | 2.02 |
+| v0.4.13 | 10.5 | 2.47 | 1.71 |
+| HEAD (glibc) | 5.0 | 1.74 | 0.70 |
+
+No release made these shapes worse beyond noise. Every release from v0.4.9
+on beats all the earlier ones. They are still 7-20x behind stock, because of
+fixed per-statement costs:
+- The parser copied about 15 KB of empty stack frames per parsed expression.
+  This is fixed in 1f1815f30 (bd-w4pr1.19), which cut literal INSERTs by 17%.
+- Every autocommit statement makes about 12 `statx` calls plus a `-journal`
+  probe (bd-ih8ak).
+- Every autocommit statement makes about 14 page-sized allocations
+  (bd-w4pr1.11).
+
+The B3 follow-up (bd-w4pr1.6) built glibc CLIs from tags v0.4.12 and v0.4.13.
+On that pair the bulk-insert window is +11% (4.31 s to 4.79 s), against +54%
+between the musl release builds. Most of that jump is therefore the musl
+allocator, not the engine.
+
 ## Confound
 
 - v0.1.14 and v0.3.4 Linux assets are dynamically linked glibc builds. The
