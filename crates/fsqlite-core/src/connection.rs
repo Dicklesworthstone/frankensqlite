@@ -95886,10 +95886,16 @@ impl Connection {
         // `time_travel_active` pins reads to `self.db` (a historical snapshot),
         // a compiled program would read the live pager instead, so a window
         // query over a single `FOR SYSTEM_TIME` table takes the materializer
-        // too, as the GROUP BY phase one does.
+        // too, as the GROUP BY phase one does. Mixed-schema queries also
+        // need the materializer: the table compiler cannot resolve attached
+        // tables or their surviving WHERE probes (bd-3oyv2). Filtering must
+        // finish before the window partitions are formed.
         let has_join = self.time_travel_active.get()
+            || self.attached_select_requires_local_fallback(select)?
             || from.as_ref().is_some_and(|f| {
-                !f.joins.is_empty() || !matches!(&f.source, TableOrSubquery::Table { .. })
+                !f.joins.is_empty()
+                    || !matches!(&f.source, TableOrSubquery::Table { name, .. }
+                        if name.schema.as_deref().is_none_or(is_builtin_schema))
             });
         let join_sources: Vec<&TableOrSubquery> = from
             .as_ref()
@@ -96220,11 +96226,11 @@ impl Connection {
             rows
         };
 
-        // The remaining window phase has no suspension points. Its shared
+        // The window computation below has no suspension points. Its shared
         // helpers evaluate arguments, PARTITION BY, ORDER BY, and frame
         // expressions through `eval_join_expr`, so expose the immutable
         // registry snapshot for that synchronous region only.
-        let _function_registry_guard = (self.scalar_function_overridden.get()
+        let function_registry_guard = (self.scalar_function_overridden.get()
             || self.custom_aggregate_registered.get()
             || self.connection_registry_differs_from_base.get())
         .then(|| {
@@ -96250,7 +96256,40 @@ impl Connection {
         let collation_schema_snap = self.schema.borrow().clone();
         let collation_from_lookup = from
             .as_ref()
-            .map(|f| build_from_clause_collation_lookup(f, &collation_schema_snap));
+            .map(|from_clause| {
+                build_from_clause_collation_lookup_with_resolver(from_clause, |source| {
+                    if let TableOrSubquery::Table { name, .. } = source
+                        && let Some(schema_name) = name.schema.as_deref()
+                        && !is_builtin_schema(schema_name)
+                    {
+                        // The parent can have a different same-named table.
+                        // Resolve the attached source's metadata in its owner,
+                        // just as its rows were resolved by the materializer.
+                        return self.with_attached_connection(schema_name, |attached| {
+                            let mut local_source = source.clone();
+                            if let TableOrSubquery::Table { name, .. } = &mut local_source {
+                                name.schema = Some("main".to_owned());
+                            }
+                            let schemas = attached.schema.borrow().clone();
+                            let metadata = CteResultMetadataResolver::new(attached, &schemas)
+                                .resolve_source_metadata(&local_source, None);
+                            Ok((
+                                metadata.names,
+                                metadata
+                                    .columns
+                                    .into_iter()
+                                    .map(|column| column.collation)
+                                    .collect(),
+                            ))
+                        });
+                    }
+                    Ok((
+                        expand_table_or_subquery_column_names(source, &collation_schema_snap),
+                        table_or_subquery_result_collations(source, &collation_schema_snap),
+                    ))
+                })
+            })
+            .transpose()?;
         let collation_registry_snap = lock_unpoisoned(self.collation_registry.as_ref()).clone();
         let resolve_expr_collation = |expr: &Expr| -> Option<String> {
             select_expr_effective_collation(
@@ -96853,6 +96892,11 @@ impl Connection {
             }
         }
 
+        // Result expressions can execute nested SELECTs. Never leave the
+        // thread-local registry installed across their suspension points;
+        // each connection-aware expression evaluation scopes its own guard.
+        drop(function_registry_guard);
+
         // Build result rows sorted by the first window spec's partition/order
         // (matches SQLite's implicit output ordering for window queries).
         let first_ob = &win_order_by[0];
@@ -96899,7 +96943,10 @@ impl Connection {
             for kind in &col_kinds {
                 match kind {
                     ColKind::Plain(expr) => {
-                        values.push(self.eval_join_expr_with_registry(expr, row, &col_map)?);
+                        values.push(
+                            self.eval_row_expr_allowing_subqueries(expr, row, &col_map)
+                                .await?,
+                        );
                     }
                     ColKind::Window(wi) => {
                         values.push(std::mem::replace(
@@ -96917,11 +96964,10 @@ impl Connection {
                             })
                             .collect();
                         let substituted = substitute_placeholder_values(outer_expr, &win_vals);
-                        values.push(self.eval_join_expr_with_registry(
-                            &substituted,
-                            row,
-                            &col_map,
-                        )?);
+                        values.push(
+                            self.eval_row_expr_allowing_subqueries(&substituted, row, &col_map)
+                                .await?,
+                        );
                     }
                 }
             }
@@ -96965,7 +97011,9 @@ impl Connection {
                 for (row_idx, row) in result.iter_mut().enumerate() {
                     let raw_row = &row_values[result_raw_indices[row_idx]];
                     for (_term_idx, expr) in &extra_order_terms {
-                        let val = self.eval_join_expr_with_registry(expr, raw_row, &col_map)?;
+                        let val = self
+                            .eval_row_expr_allowing_subqueries(expr, raw_row, &col_map)
+                            .await?;
                         row.values.push(val);
                     }
                 }
@@ -107536,19 +107584,42 @@ fn build_from_clause_collation_lookup(
     from: &FromClause,
     schemas: &[TableSchema],
 ) -> FromClauseCollationLookup {
-    let mut lookup = FromClauseCollationLookup::default();
-    collect_from_clause_collation_lookup(from, schemas, &mut lookup);
-    lookup
+    build_from_clause_collation_lookup_with_resolver(from, |source| {
+        Ok::<_, std::convert::Infallible>((
+            expand_table_or_subquery_column_names(source, schemas),
+            table_or_subquery_result_collations(source, schemas),
+        ))
+    })
+    .unwrap_or_else(|never| match never {})
 }
 
-fn collect_from_clause_collation_lookup(
+type SourceCollationMetadata = (Vec<String>, Vec<Option<String>>);
+
+fn build_from_clause_collation_lookup_with_resolver<E, F>(
     from: &FromClause,
-    schemas: &[TableSchema],
+    mut resolve_source: F,
+) -> std::result::Result<FromClauseCollationLookup, E>
+where
+    F: FnMut(&TableOrSubquery) -> std::result::Result<SourceCollationMetadata, E>,
+{
+    let mut lookup = FromClauseCollationLookup::default();
+    collect_from_clause_collation_lookup(from, &mut resolve_source, &mut lookup)?;
+    Ok(lookup)
+}
+
+fn collect_from_clause_collation_lookup<E, F>(
+    from: &FromClause,
+    resolve_source: &mut F,
     lookup: &mut FromClauseCollationLookup,
-) -> SourceProjectionMeta {
-    let mut left_meta = collect_table_or_subquery_collation_lookup(&from.source, schemas, lookup);
+) -> std::result::Result<SourceProjectionMeta, E>
+where
+    F: FnMut(&TableOrSubquery) -> std::result::Result<SourceCollationMetadata, E>,
+{
+    let mut left_meta =
+        collect_table_or_subquery_collation_lookup(&from.source, resolve_source, lookup)?;
     for join in &from.joins {
-        let right_meta = collect_table_or_subquery_collation_lookup(&join.table, schemas, lookup);
+        let right_meta =
+            collect_table_or_subquery_collation_lookup(&join.table, resolve_source, lookup)?;
         let using_cols = if join.join_type.natural {
             right_meta
                 .visible_names
@@ -107606,20 +107677,22 @@ fn collect_from_clause_collation_lookup(
             }
         }
     }
-    left_meta
+    Ok(left_meta)
 }
 
-fn collect_table_or_subquery_collation_lookup(
+fn collect_table_or_subquery_collation_lookup<E, F>(
     source: &TableOrSubquery,
-    schemas: &[TableSchema],
+    resolve_source: &mut F,
     lookup: &mut FromClauseCollationLookup,
-) -> SourceProjectionMeta {
+) -> std::result::Result<SourceProjectionMeta, E>
+where
+    F: FnMut(&TableOrSubquery) -> std::result::Result<SourceCollationMetadata, E>,
+{
     if let TableOrSubquery::ParenJoin(from) = source {
-        return collect_from_clause_collation_lookup(from, schemas, lookup);
+        return collect_from_clause_collation_lookup(from, resolve_source, lookup);
     }
 
-    let column_names = expand_table_or_subquery_column_names(source, schemas);
-    let mut collations = table_or_subquery_result_collations(source, schemas);
+    let (column_names, mut collations) = resolve_source(source)?;
     collations.resize(column_names.len(), None);
     collations.truncate(column_names.len());
 
@@ -107632,12 +107705,12 @@ fn collect_table_or_subquery_collation_lookup(
         lookup.collations.push(collation.clone());
     }
 
-    SourceProjectionMeta {
+    Ok(SourceProjectionMeta {
         visible_names: column_names,
         visible_indices: (0..collations.len())
             .map(|offset| base_idx + offset)
             .collect(),
-    }
+    })
 }
 
 fn select_expr_effective_collation(

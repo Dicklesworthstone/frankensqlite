@@ -11,6 +11,8 @@
 //! The bd-row-number-join-kmqdn cases also cover unordered numbering and frame
 //! clauses through the join and grouped-window fallbacks, in memory and on
 //! disk, through both direct and prepared queries.
+//! bd-3oyv2 covers subqueries over attached tables in window query filters,
+//! projections, wrapped window expressions, and the final ordering.
 
 use fsqlite_core::connection::Connection;
 use fsqlite_types::value::SqliteValue;
@@ -384,5 +386,133 @@ fn partition_named_and_over_group() {
             "window over grouped aggregate",
         )
         .await;
+    });
+}
+
+#[test]
+fn attached_subqueries_with_windows_match_stock() {
+    asupersync::test_utils::run_test(|| async {
+        let mut differences = Vec::new();
+        for file_backed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (f, r) = if file_backed {
+                (
+                    Connection::open(dir.path().join("frank.db").to_str().unwrap())
+                        .await
+                        .unwrap(),
+                    rusqlite::Connection::open(dir.path().join("stock.db")).unwrap(),
+                )
+            } else {
+                (
+                    Connection::open(":memory:").await.unwrap(),
+                    rusqlite::Connection::open_in_memory().unwrap(),
+                )
+            };
+            let frank_aux = if file_backed {
+                dir.path().join("frank_aux.db").to_str().unwrap().to_owned()
+            } else {
+                ":memory:".to_owned()
+            };
+            let stock_aux = if file_backed {
+                dir.path().join("stock_aux.db").to_str().unwrap().to_owned()
+            } else {
+                ":memory:".to_owned()
+            };
+            f.execute_with_params("ATTACH ?1 AS aux", &[SqliteValue::Text(frank_aux.into())])
+                .await
+                .unwrap();
+            r.execute("ATTACH ?1 AS aux", [stock_aux]).unwrap();
+            for sql in SETUP.iter().copied().chain([
+                "CREATE TABLE aux.u(z INTEGER)",
+                "INSERT INTO aux.u VALUES (10),(20),(NULL)",
+                "CREATE TABLE main.u(z INTEGER)",
+                "INSERT INTO main.u VALUES (999)",
+            ]) {
+                f.execute(sql).await.unwrap();
+                r.execute_batch(sql).unwrap();
+            }
+            for sql in [
+                "SELECT id, row_number() OVER (ORDER BY id) FROM s WHERE v IN (SELECT z FROM aux.u) ORDER BY id",
+                "SELECT id, row_number() OVER (ORDER BY id) FROM s WHERE v IN (SELECT z FROM aux.u WHERE z = s.v) ORDER BY id",
+                "SELECT id, (SELECT max(z) FROM aux.u), row_number() OVER (ORDER BY id) FROM s ORDER BY id",
+                "SELECT id, (SELECT max(z) FROM aux.u WHERE z <= s.v), row_number() OVER (ORDER BY id) FROM s ORDER BY id",
+                "SELECT id, EXISTS (SELECT 1 FROM aux.u WHERE z = s.v), row_number() OVER (ORDER BY id) FROM s ORDER BY id",
+                "SELECT id, v NOT IN (SELECT z FROM aux.u), row_number() OVER (ORDER BY id) FROM s ORDER BY id",
+                "SELECT id, row_number() OVER (ORDER BY id) + (SELECT max(z) FROM aux.u WHERE z <= s.v) FROM s ORDER BY id",
+                "SELECT id, row_number() OVER (ORDER BY id) FROM s ORDER BY (SELECT max(z) FROM aux.u WHERE z <= s.v), id",
+                "SELECT id, row_number() OVER (ORDER BY id) FROM s WHERE EXISTS (SELECT 1 FROM aux.u WHERE z = s.v) ORDER BY id",
+                "SELECT id, (SELECT max(z) FROM aux.u WHERE z > 1000), row_number() OVER (ORDER BY id) FROM s ORDER BY id",
+                "SELECT u.z, (SELECT count(*) FROM main.s WHERE s.v = u.z), row_number() OVER (ORDER BY u.z) FROM aux.u AS u ORDER BY u.z",
+                "SELECT u.z, row_number() OVER (ORDER BY u.z) FROM aux.u AS u WHERE EXISTS (SELECT 1 FROM main.s WHERE s.v = u.z) ORDER BY u.z",
+            ] {
+                let expected = rq(&r, sql);
+                for prepared in [false, true] {
+                    let result = if prepared {
+                        match f.prepare(sql).await {
+                            Ok(statement) => statement.query().await,
+                            Err(error) => Err(error),
+                        }
+                    } else {
+                        f.query(sql).await
+                    };
+                    match result {
+                        Ok(rows) => {
+                            let actual = rows
+                                .iter()
+                                .map(|row| row.values().iter().map(tag_f).collect::<Vec<_>>())
+                                .collect::<Vec<_>>();
+                            if actual != expected {
+                                differences.push(format!(
+                                    "file_backed={file_backed} prepared={prepared}: {sql}\nfrank={actual:?}\nstock={expected:?}"
+                                ));
+                            }
+                        }
+                        Err(error) => differences.push(format!(
+                            "file_backed={file_backed} prepared={prepared}: {sql}\n{error}"
+                        )),
+                    }
+                }
+            }
+            f.close().await.unwrap();
+        }
+        assert!(differences.is_empty(), "{}", differences.join("\n"));
+    });
+}
+
+#[test]
+fn attached_window_collations_use_the_source_schema() {
+    asupersync::test_utils::run_test(|| async {
+        let frank = Connection::open(":memory:").await.unwrap();
+        let stock = rusqlite::Connection::open_in_memory().unwrap();
+        for sql in [
+            "ATTACH ':memory:' AS aux;",
+            "CREATE TABLE main.u(z TEXT COLLATE BINARY);",
+            "INSERT INTO main.u VALUES('unrelated');",
+            "CREATE TABLE aux.u(z TEXT COLLATE NOCASE);",
+            "INSERT INTO aux.u VALUES('b'),('a'),('A'),('c');",
+        ] {
+            frank.execute(sql).await.unwrap();
+            stock.execute_batch(sql).unwrap();
+        }
+        // The scalar probe keeps execution on the mixed-schema path. The
+        // attached column's NOCASE must win over same-named main.u metadata
+        // for window peers, partitions, and the final ORDER BY.
+        for sql in [
+            "SELECT u.z,dense_rank() OVER(ORDER BY u.z),(SELECT count(*) FROM main.u) FROM aux.u AS u ORDER BY u.z COLLATE BINARY;",
+            "SELECT u.z,count(*) OVER(PARTITION BY u.z),(SELECT count(*) FROM main.u) FROM aux.u AS u ORDER BY u.z COLLATE BINARY;",
+            "SELECT u.z,rank() OVER(),(SELECT count(*) FROM main.u) FROM aux.u AS u ORDER BY u.z,u.rowid;",
+        ] {
+            let expected = rq(&stock, sql);
+            assert_eq!(fq(&frank, sql).await, expected, "direct: {sql}");
+            let prepared = frank.prepare(sql).await.unwrap();
+            let actual = prepared
+                .query()
+                .await
+                .unwrap()
+                .iter()
+                .map(|row| row.values().iter().map(tag_f).collect::<Vec<_>>())
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "prepared: {sql}");
+        }
     });
 }
