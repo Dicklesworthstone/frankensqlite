@@ -173,6 +173,111 @@ fn conjunctive_join_keys_seek_the_composite_index_like_sqlite() {
     }
 }
 
+/// bd-w4pr1.10: an equi-join with no index on either join column ran as a
+/// nested loop that rescanned the right table per left row on a file-backed
+/// database (4k x 4k rows: 3.65 s, stock 2 ms). It now builds a transient
+/// `(key, rowid)` index over the right join column once, like stock's
+/// AUTOMATIC COVERING INDEX, and probes it. `q` and `u` have no indexes; the
+/// rows hold NULL and duplicate keys, mixed affinities and case variants.
+#[test]
+fn unindexed_equi_join_builds_an_automatic_index_like_sqlite() {
+    const ORDERED: &[&str] = &[
+        "SELECT q.id, u.id FROM q JOIN u ON u.k = q.k ORDER BY q.id, u.id",
+        "SELECT q.id, u.id FROM q JOIN u ON q.k = u.k ORDER BY q.id, u.id",
+        "SELECT q.id, u.id FROM q LEFT JOIN u ON u.k = q.k ORDER BY q.id, u.id",
+        "SELECT q.id, u.id FROM q JOIN u ON u.a = q.a ORDER BY q.id, u.id",
+        "SELECT u.id, q.id FROM u LEFT JOIN q ON q.a = u.a ORDER BY u.id, q.id",
+        "SELECT u.id, q.id FROM u JOIN q ON q.k = u.k ORDER BY u.id, q.id",
+        "SELECT q.id, u.id FROM q JOIN u ON u.k = q.k COLLATE NOCASE ORDER BY q.id, u.id",
+        "SELECT q.id, u.id FROM q LEFT JOIN u ON u.w = q.w * 1 ORDER BY q.id, u.id",
+        "SELECT q.id, u.id FROM q JOIN u ON u.k = q.k AND u.w = 1 ORDER BY q.id, u.id",
+        "SELECT q.id, u.id FROM q LEFT JOIN u ON u.k = q.k AND q.w = 1 ORDER BY q.id, u.id",
+        "SELECT q.id, u.id FROM q JOIN u ON u.k = q.k WHERE q.w = 1 ORDER BY u.id DESC, q.id",
+        "SELECT q.id, u.id FROM q JOIN u ON u.k = q.k ORDER BY q.id, u.id LIMIT 3 OFFSET 2",
+        "SELECT a.id, b.id FROM q AS a JOIN q AS b ON b.k = a.k ORDER BY a.id, b.id",
+        "SELECT count(*), sum(u.w), count(u.id) FROM q LEFT JOIN u ON u.k = q.k",
+        "SELECT count(*), max(q.id) FROM q JOIN u ON u.a = q.a",
+        "SELECT q.k, count(u.id) FROM q LEFT JOIN u ON u.k = q.k GROUP BY q.k ORDER BY 1",
+    ];
+    // Row order without ORDER BY is unspecified; compare these as multisets.
+    const UNORDERED: &[&str] = &[
+        "SELECT q.id, u.id, u.k FROM q JOIN u ON u.k = q.k",
+        "SELECT q.id, u.id FROM q LEFT JOIN u ON u.a = q.a",
+        "SELECT * FROM q JOIN u ON u.k = q.k COLLATE NOCASE",
+    ];
+    for file_backed in [false, true] {
+        asupersync::test_utils::run_test(|| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let target = if file_backed {
+                dir.path()
+                    .join("join_autoindex.db")
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                ":memory:".to_owned()
+            };
+            let f = Connection::open(&target).await.unwrap();
+            let r = rusqlite::Connection::open_in_memory().unwrap();
+            for sql in SETUP {
+                f.execute(sql).await.unwrap();
+                r.execute(sql, []).unwrap();
+            }
+            for sql in ORDERED {
+                let stock = rows_r(&r, sql);
+                assert!(!stock.is_empty(), "fixture must give `{sql}` rows");
+                assert_eq!(rows_f(&f, sql).await, stock, "query `{sql}`");
+                assert_eq!(rows_prepared(&f, sql).await, stock, "prepared `{sql}`");
+            }
+            for sql in UNORDERED {
+                let mut stock = rows_r(&r, sql);
+                stock.sort();
+                let mut ours = rows_f(&f, sql).await;
+                ours.sort();
+                assert_eq!(ours, stock, "query `{sql}`");
+            }
+
+            // Many duplicate keys on both sides.
+            let rows = |table: &str, n: i64, modulus: i64| {
+                let values: Vec<String> = (1..=n).map(|i| format!("({i}, {})", i % modulus)).collect();
+                format!("INSERT INTO {table} VALUES {}", values.join(", "))
+            };
+            for sql in [
+                "CREATE TABLE bl(id INTEGER PRIMARY KEY, k INTEGER)".to_owned(),
+                "CREATE TABLE br(id INTEGER PRIMARY KEY, k INTEGER)".to_owned(),
+                rows("bl", 3000, 211),
+                rows("br", 3000, 307),
+            ] {
+                f.execute(&sql).await.unwrap();
+                r.execute(&sql, []).unwrap();
+            }
+            for sql in [
+                "SELECT count(*), sum(bl.id), sum(br.id) FROM bl JOIN br ON br.k = bl.k",
+                "SELECT count(*), count(br.id) FROM bl LEFT JOIN br ON br.k = bl.k + 250",
+            ] {
+                assert_eq!(rows_f(&f, sql).await, rows_r(&r, sql), "query `{sql}`");
+            }
+
+            if file_backed {
+                // u is read once to build the index and q once to drive the
+                // probes; nothing rescans u per q row.
+                for sql in [
+                    "SELECT q.id, u.id FROM q JOIN u ON u.k = q.k",
+                    "SELECT q.id, u.id FROM q LEFT JOIN u ON u.k = q.k ORDER BY q.id",
+                    "SELECT count(*), sum(u.w) FROM q JOIN u ON u.k = q.k",
+                ] {
+                    let ops = opcodes(&f, sql).await;
+                    assert!(
+                        ops.iter().any(|op| op == "OpenAutoindex")
+                            && ops.iter().filter(|op| *op == "Rewind").count() == 2
+                            && ops.iter().any(|op| op == "SeekGE"),
+                        "`{sql}` must index u once and probe it: {ops:?}"
+                    );
+                }
+            }
+        });
+    }
+}
+
 /// GH#502: v0.4.10 returned no rows for a join whose OUTER table is filtered
 /// through an index with a DESC column (`c(a, s DESC)`) while the inner table
 /// is looked up through its own index. Inner and LEFT joins, with or without

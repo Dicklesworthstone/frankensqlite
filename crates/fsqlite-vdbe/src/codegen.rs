@@ -11524,6 +11524,12 @@ fn codegen_grouped_inner_join_count_sum_select(
     b.resolve_label(next_left_label);
 
     match &plan.join_lookup.lookup_target {
+        // This lane resolves its plan without automatic indexes.
+        SingleJoinLookupTarget::Auto { .. } => {
+            return Err(CodegenError::Unsupported(
+                "grouped join count/sum lane has no automatic index".to_owned(),
+            ));
+        }
         SingleJoinLookupTarget::Rowid => {
             let probe_reg = b.alloc_reg();
             emit_join_probe_source(
@@ -11793,6 +11799,14 @@ fn codegen_grouped_inner_join_count_sum_select(
 enum SingleJoinLookupTarget<'a> {
     Rowid,
     Index(&'a IndexSchema),
+    /// No index serves the right join column: build a transient `(key,
+    /// rowid)` index over it before the outer loop (stock's AUTOMATIC
+    /// COVERING INDEX) and probe that, instead of a nested loop (bd-w4pr1.10).
+    /// `column` is the right table's join column; `collation` the comparison's.
+    Auto {
+        column: usize,
+        collation: Option<&'a str>,
+    },
 }
 
 struct SingleJoinLookupPlan<'a> {
@@ -12118,6 +12132,31 @@ fn codegen_join_aggregate_select(
             aggregates,
         );
     }
+    // bd-w4pr1.10: neither side has a usable index on its join column; index
+    // the right side's column on the fly instead of a quadratic nested loop.
+    if let Some(plan) = resolve_single_eq_join_lookup_plan(
+        left_table,
+        left_alias,
+        right_table,
+        right_alias,
+        kind,
+        Some(on_expr),
+        true,
+    ) {
+        return codegen_single_join_lookup_select(
+            b,
+            stmt,
+            columns,
+            where_clause,
+            left_table,
+            left_alias,
+            right_table,
+            right_alias,
+            &plan,
+            ctx,
+            aggregates,
+        );
+    }
     Err(unsupported())
 }
 
@@ -12185,6 +12224,7 @@ fn resolve_single_join_lookup_plan<'a>(
         right_alias,
         join_kind,
         on_expr,
+        false,
     )
     .or_else(|| {
         resolve_conjunctive_join_lookup_plan(
@@ -12198,8 +12238,42 @@ fn resolve_single_join_lookup_plan<'a>(
     })
 }
 
+/// [`resolve_single_join_lookup_plan`], falling back to an automatic index on
+/// the right join column when no rowid or index lookup applies to a single
+/// equality ON clause (bd-w4pr1.10). Only for callers whose codegen
+/// ([`codegen_single_join_lookup_select`]) builds that index.
+fn resolve_single_join_lookup_plan_or_autoindex<'a>(
+    left_table: &'a TableSchema,
+    left_alias: Option<&'a str>,
+    right_table: &'a TableSchema,
+    right_alias: Option<&'a str>,
+    join_kind: fsqlite_ast::JoinKind,
+    on_expr: Option<&'a Expr>,
+) -> Option<SingleJoinLookupPlan<'a>> {
+    resolve_single_join_lookup_plan(
+        left_table,
+        left_alias,
+        right_table,
+        right_alias,
+        join_kind,
+        on_expr,
+    )
+    .or_else(|| {
+        resolve_single_eq_join_lookup_plan(
+            left_table,
+            left_alias,
+            right_table,
+            right_alias,
+            join_kind,
+            on_expr,
+            true,
+        )
+    })
+}
+
 /// The lookup plan for an ON clause that is one equality with a rowid or a
-/// single-column index lookup on the right table.
+/// single-column index lookup on the right table, or (when `allow_autoindex`)
+/// an automatic index on the right join column.
 fn resolve_single_eq_join_lookup_plan<'a>(
     left_table: &'a TableSchema,
     left_alias: Option<&'a str>,
@@ -12207,6 +12281,7 @@ fn resolve_single_eq_join_lookup_plan<'a>(
     right_alias: Option<&'a str>,
     join_kind: fsqlite_ast::JoinKind,
     on_expr: Option<&'a Expr>,
+    allow_autoindex: bool,
 ) -> Option<SingleJoinLookupPlan<'a>> {
     // The lookup lane fetches rows via IdxRowid + SeekRowid, which assumes
     // rowid-table index format; WITHOUT ROWID index entries carry a PK suffix
@@ -12283,9 +12358,25 @@ fn resolve_single_eq_join_lookup_plan<'a>(
             // The single-join direct-lookup path only materializes the join key
             // plus a rowid sentinel. Composite indexes need values for their
             // trailing key terms, so reusing them here can skip valid rows.
-            let index = right_table
-                .single_column_index_for_column_with_collation(column_name, comparison_collation)?;
-            SingleJoinLookupTarget::Index(index)
+            match right_table
+                .single_column_index_for_column_with_collation(column_name, comparison_collation)
+            {
+                Some(index) => SingleJoinLookupTarget::Index(index),
+                // bd-w4pr1.10: no usable index, so index the column on the fly
+                // rather than rescanning the right table per left row. Not for
+                // a typeless column probed by a number (that TEXT-key walk
+                // reads a real index) or a generated column (no stored value).
+                None if allow_autoindex
+                    && !numeric_text_walk
+                    && right_table.columns.get(col_idx)?.generated_expr.is_none() =>
+                {
+                    SingleJoinLookupTarget::Auto {
+                        column: col_idx,
+                        collation: comparison_collation,
+                    }
+                }
+                None => return None,
+            }
         }
         SortKeySource::Expression(_) => return None,
     };
@@ -13100,7 +13191,7 @@ fn single_join_lookup_select<'a>(
         return None;
     };
     let (left_alias, right_alias) = (left_alias.as_deref(), right_alias.as_deref());
-    let plan = resolve_single_join_lookup_plan(
+    let plan = resolve_single_join_lookup_plan_or_autoindex(
         left_table,
         left_alias,
         right_table,
@@ -13452,6 +13543,62 @@ fn emit_outer_loop_advance(
     }
 }
 
+/// The comparison P4 for key term `term` of a lookup join's index: the real
+/// index's term collation, or the join comparison's collation for an
+/// automatic index (BINARY needs none).
+fn lookup_term_comparison_p4(target: &SingleJoinLookupTarget<'_>, term: usize) -> P4 {
+    match target {
+        SingleJoinLookupTarget::Index(index) => index_term_comparison_p4(index, term),
+        SingleJoinLookupTarget::Auto { collation, .. } => collation
+            .filter(|name| !name.eq_ignore_ascii_case("BINARY"))
+            .map_or(P4::None, |name| P4::Collation(name.to_owned())),
+        SingleJoinLookupTarget::Rowid => P4::None,
+    }
+}
+
+/// Build the automatic index of a [`SingleJoinLookupTarget::Auto`] lookup on
+/// cursor 2: a transient index under the join comparison's collation with one
+/// `(key, rowid)` entry per right row whose join column is not NULL (a NULL
+/// key never equals a probe). It runs once, before the outer loop; the probe
+/// loop then reads it exactly like a one-column index (bd-w4pr1.10).
+fn emit_join_autoindex(
+    b: &mut ProgramBuilder,
+    right_cursor: i32,
+    right_table: &TableSchema,
+    right_alias: Option<&str>,
+    column: usize,
+    collation: Option<&str>,
+) -> i32 {
+    let cursor = 2_i32;
+    let collation_p4 = collation
+        .filter(|name| !name.eq_ignore_ascii_case("BINARY"))
+        .map_or(P4::None, |name| P4::Collation(name.to_owned()));
+    b.emit_op(Opcode::OpenAutoindex, cursor, 2, 0, collation_p4, 0);
+    let entry = b.alloc_regs(2);
+    let record = b.alloc_reg();
+    let built = b.emit_label();
+    let next_row = b.emit_label();
+    b.emit_jump_to_label(Opcode::Rewind, right_cursor, 0, built, P4::None, 0);
+    let loop_top = b.current_addr();
+    emit_join_probe_source(
+        b,
+        right_cursor,
+        right_table,
+        right_alias,
+        &SortKeySource::Column(column),
+        entry,
+    );
+    b.emit_jump_to_label(Opcode::IsNull, entry, 0, next_row, P4::None, 0);
+    b.emit_op(Opcode::Rowid, right_cursor, entry + 1, 0, P4::None, 0);
+    b.emit_op(Opcode::MakeRecord, entry, 2, record, P4::None, 0);
+    b.emit_op(Opcode::IdxInsert, cursor, record, 0, P4::None, 0);
+    b.resolve_label(next_row);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    b.emit_op(Opcode::Next, right_cursor, loop_top as i32, 0, P4::None, 0);
+    b.resolve_label(built);
+    cursor
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn codegen_single_join_lookup_select(
     b: &mut ProgramBuilder,
@@ -13522,19 +13669,28 @@ fn codegen_single_join_lookup_select(
         P4::Table(right_table.name.clone()),
         0,
     );
-    let index_cursor = if let SingleJoinLookupTarget::Index(index) = &plan.lookup_target {
-        let cursor = 2_i32;
-        b.emit_op(
-            Opcode::OpenRead,
-            cursor,
-            index.root_page,
-            0,
-            P4::Index(index.name.clone()),
-            0,
-        );
-        Some(cursor)
-    } else {
-        None
+    let index_cursor = match &plan.lookup_target {
+        SingleJoinLookupTarget::Index(index) => {
+            let cursor = 2_i32;
+            b.emit_op(
+                Opcode::OpenRead,
+                cursor,
+                index.root_page,
+                0,
+                P4::Index(index.name.clone()),
+                0,
+            );
+            Some(cursor)
+        }
+        SingleJoinLookupTarget::Auto { column, collation } => Some(emit_join_autoindex(
+            b,
+            right_cursor,
+            right_table,
+            right_alias,
+            *column,
+            *collation,
+        )),
+        SingleJoinLookupTarget::Rowid => None,
     };
 
     let sorter = if !stmt.order_by.is_empty() {
@@ -13723,7 +13879,7 @@ fn codegen_single_join_lookup_select(
             b.resolve_label(matched_skip);
             b.resolve_label(no_match);
         }
-        SingleJoinLookupTarget::Index(_index) => {
+        SingleJoinLookupTarget::Index(_) | SingleJoinLookupTarget::Auto { .. } => {
             let idx_cursor = index_cursor.expect("index lookup join must open index cursor");
             // The pinned key terms; a single-key probe of a one-term index
             // also carries a rowid floor.
@@ -13736,7 +13892,7 @@ fn codegen_single_join_lookup_select(
             };
             let probe_base = b.alloc_regs(probe_fields);
             let probe_reg = probe_base;
-            let comparison_p4 = direct_lookup_index_comparison_p4(_index);
+            let comparison_p4 = lookup_term_comparison_p4(&plan.lookup_target, 0);
             if let Some(key) = plan.probe_expr {
                 emit_join_expr(b, key, probe_reg, &tables, ctx)?;
             } else {
@@ -13860,7 +14016,7 @@ fn codegen_single_join_lookup_select(
                     probe_base + term as i32,
                     term_reg,
                     duplicate_run_done,
-                    index_term_comparison_p4(_index, term),
+                    lookup_term_comparison_p4(&plan.lookup_target, term),
                     0,
                 );
             }
@@ -14393,6 +14549,12 @@ fn codegen_multi_join_lookup_select(
         b.emit_jump_to_label(Opcode::IsNull, probe_base, 0, miss_label, P4::None, 0);
 
         match &step.lookup_target {
+            // Multi-join steps resolve their plans without automatic indexes.
+            SingleJoinLookupTarget::Auto { .. } => {
+                return Err(CodegenError::Unsupported(
+                    "multi-join lookup step has no automatic index".to_owned(),
+                ));
+            }
             SingleJoinLookupTarget::Rowid => {
                 // 2.5 or 'abc' names no rowid; '2' names rowid 2 (SQLite's seek).
                 b.emit_jump_to_label(Opcode::MustBeInt, probe_base, 0, miss_label, P4::None, 0);
