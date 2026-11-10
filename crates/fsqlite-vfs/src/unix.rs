@@ -11118,6 +11118,12 @@ mod tests {
 
     #[test]
     fn shm_cached_mapping_nonextend_refuses_truncated_backing() {
+        if std::env::var_os("FSQLITE_SHM_ALLOCATION_CHILD").is_none() {
+            run_shm_allocation_child(
+                "unix::tests::shm_cached_mapping_nonextend_refuses_truncated_backing",
+            );
+            return;
+        }
         let cx = Cx::new();
         let vfs = UnixVfs::new();
         for truncated_len in [0, 12, u64::from(SHM_SEGMENT_SIZE)] {
@@ -11150,6 +11156,12 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn shm_cached_mapping_truncation_allocation_failure_is_retryable() {
+        if std::env::var_os("FSQLITE_SHM_ALLOCATION_CHILD").is_none() {
+            run_shm_allocation_child(
+                "unix::tests::shm_cached_mapping_truncation_allocation_failure_is_retryable",
+            );
+            return;
+        }
         let cx = Cx::new();
         let vfs = UnixVfs::new();
         for (errno, allocated_prefix) in [
@@ -11195,6 +11207,12 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn shm_cached_mapping_rechecks_after_header_allocation_failure() {
+        if std::env::var_os("FSQLITE_SHM_ALLOCATION_CHILD").is_none() {
+            run_shm_allocation_child(
+                "unix::tests::shm_cached_mapping_rechecks_after_header_allocation_failure",
+            );
+            return;
+        }
         let cx = Cx::new();
         let vfs = UnixVfs::new();
         let (_dir, path) = make_temp_path("shm-cached-header-retry.db");
