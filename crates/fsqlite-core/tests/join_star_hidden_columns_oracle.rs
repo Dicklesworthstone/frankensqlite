@@ -147,8 +147,7 @@ fn stock_table(conn: &rusqlite::Connection, sql: &str) -> Result<Table, String> 
     let mut statement = conn.prepare(sql).map_err(|error| error.to_string())?;
     let names: Vec<String> = statement
         .column_names()
-        .iter()
-        .map(|name| (*name).to_owned())
+        .map(str::to_owned)
         .collect();
     let width = names.len();
     let rows = statement

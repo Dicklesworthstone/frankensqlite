@@ -1,5 +1,48 @@
 # Dependency Upgrade Log
 
+## November 10, 2026 — latest-stable sweep (bd-w4pr1.3)
+
+asupersync was already at the latest release, 0.6.2 (1f65f6898), with the franken-* crates at
+0.6.0. This sweep moves everything else to its latest stable release except where noted.
+
+- **Compatible-range lock refresh (39 lock entries):** aes 0.9.4, arc-swap 1.9.5, cc 1.11.1,
+  crc32c 0.6.9, crc32fast 1.5.4, ctutils 0.4.8, flate2 1.1.11, generator 0.8.12, inout 0.2.6,
+  io-uring 0.7.16, itoa 1.0.19, json5 1.3.7, loom 0.7.3, proptest 1.12.0 (rand_xorshift 0.5; drops
+  rand 0.9), serde_spanned 1.1.3, signal-hook 0.4.6, smallvec 1.16.5, syn 3.0.10, toml 1.2.1,
+  toml_datetime 1.1.3, toml_writer 1.2.0, winnow 1.0.5.
+- **parking_lot 0.12 → 0.13:** removes `const_*` constructors, `RwLock` recursive reads, the
+  `hardware-lock-elision` feature, and automatic eventual fairness; defers waking parked threads
+  until after unlock (better under contention). None of the removed APIs were used. asupersync
+  0.6.2 still uses 0.12, so both versions are in the build. The harness's `SchedulerLockExt`
+  named our `parking_lot` guard type for asupersync's lab scheduler lock, which stopped matching;
+  it was a shim over std vs parking_lot guards and is removed (call sites call
+  `LabScheduler::schedule` through `Deref`, as the harness tests already did).
+- **lru 0.18 → 0.19:** only requires `Sync` for shared iterators; no code change.
+- **ftui 0.7 → 0.10** (e2e dashboard behind the `tui` feature) and **jsonschema 0.56 → 0.61**
+  (e2e schema checks): see the verification below.
+- **rusqlite 0.40 → 0.41.1:** the bundled SQLite (`libsqlite3-sys` 0.39.1) moves from 3.53.2 to
+  3.54.1. This is the differential oracle for the stock-parity tests, so a test that newly fails
+  may be a 3.54 behavior change rather than an engine regression; check the SQLite 3.54 release
+  notes before changing the engine. README updated.
+- **Held back — wasm-bindgen family** (wasm-bindgen 0.2.128, wasm-bindgen-futures 0.4.78,
+  wasm-bindgen-test 0.3.78, js-sys/web-sys 0.3.105): wasm-bindgen-futures 0.4.80 declares `tokio`
+  for target emscripten under `cfg(wasm_bindgen_unstable_tokio)`. It would never compile here, but
+  it puts `tokio` in `Cargo.lock`, which AGENTS.md forbids. Recheck with
+  `cargo update --dry-run` then `cargo tree -i tokio --target all -e all` on the next release.
+- **Not ours to bump:** generic-array 0.14.9 and minicov 0.3.9 are held by their dependents.
+
+API changes absorbed: rusqlite 0.41's `Statement::column_names()` returns an iterator (six
+fsqlite-core oracle tests drop `.iter()` / `.into_iter()`), and `Connection::backup`'s progress
+callback is generic (realdb-e2e passes `None::<fn(Progress)>`).
+
+Verification (RCH, 2026-11-10, this tree plus the same-batch fixes): warnings-denied keep-going
+workspace clippy over all targets clean; `fsqlite-e2e --features tui` clippy clean; fsqlite-planner
+lib 457 passed; fsqlite-mvcc lib 1,669 passed / 15 ignored; fsqlite-harness fslab + fault_vfs 27
+passed; fsqlite-func lib 523 passed; blob_oracle_e2e 8 passed against SQLite 3.54.1. fsqlite-pager
+lib: 1,101 passed, 1 failed, `page_cache::bd_2jpu6_2_dirty_eviction_runs_in_parent_asupersync_region`
+(observed poll_quota 96, expected 97). The same test fails identically on unmodified e272210d3
+(clean clone, same day), so it predates this sweep; it is tracked as its own bead.
+
 ## September 12 — remote integration correction; final qualification pending
 
 A rejected push revealed that the local checkout was behind remote main by

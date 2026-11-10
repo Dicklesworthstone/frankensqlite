@@ -7480,7 +7480,7 @@ fn backup_sqlite_file(src: &Path, dst: &Path) -> Result<(), String> {
 
     // Uses SQLite backup API (same semantics as `sqlite3 "$SRC" ".backup '$DST'"`).
     src_conn
-        .backup(MAIN_DB, dst, None)
+        .backup(MAIN_DB, dst, None::<fn(rusqlite::backup::Progress)>)
         .map_err(|e| format!("sqlite backup API failed: {e}"))
 }
 

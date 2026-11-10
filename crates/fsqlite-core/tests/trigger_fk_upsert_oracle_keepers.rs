@@ -2034,7 +2034,6 @@ fn test_bd_073qp_and_bd_84b60_duplicate_relation_column_names_renamed() {
             let oracle_stmt = oracle.prepare(sql).unwrap();
             let oracle_cols: Vec<String> = oracle_stmt
                 .column_names()
-                .into_iter()
                 .map(str::to_owned)
                 .collect();
             assert_eq!(frank_stmt.column_names(), oracle_cols.as_slice(), "column names mismatch on {sql}");

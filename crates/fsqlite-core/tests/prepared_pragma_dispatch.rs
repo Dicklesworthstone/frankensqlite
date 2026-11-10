@@ -83,7 +83,6 @@ async fn assert_prepared_pragma_query_parity(
             rstmt.column_count(),
             rstmt
                 .column_names()
-                .into_iter()
                 .map(str::to_owned)
                 .collect::<Vec<_>>(),
         )
@@ -130,7 +129,6 @@ async fn assert_prepared_pragma_shape_parity(
         fstmt.column_names(),
         rstmt
             .column_names()
-            .into_iter()
             .map(str::to_owned)
             .collect::<Vec<_>>(),
         "column names mismatch for {sql}"
@@ -162,7 +160,6 @@ async fn assert_prepared_pragma_unordered_query_parity(
         fstmt.column_names(),
         rstmt
             .column_names()
-            .into_iter()
             .map(str::to_owned)
             .collect::<Vec<_>>(),
         "column names mismatch for {sql}"
@@ -195,7 +192,6 @@ async fn assert_prepared_pragma_execute_only_parity(
             rstmt.column_count(),
             rstmt
                 .column_names()
-                .into_iter()
                 .map(str::to_owned)
                 .collect::<Vec<_>>(),
         )
@@ -759,7 +755,6 @@ fn prepared_file_pragmas_cover_mmap_and_wal_frames() -> TestResult {
                 fstmt.column_names(),
                 rstmt
                     .column_names()
-                    .into_iter()
                     .map(str::to_owned)
                     .collect::<Vec<_>>()
             );

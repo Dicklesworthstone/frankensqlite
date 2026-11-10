@@ -148,8 +148,7 @@ fn table_function_before_the_source_it_reads_matches_stock() {
             .prepare(star)
             .unwrap()
             .column_names()
-            .iter()
-            .map(|name| (*name).to_owned())
+            .map(str::to_owned)
             .collect();
         assert_eq!(frank_names, stock_names, "{star} column names");
     });

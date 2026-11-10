@@ -16,39 +16,14 @@
 //! assert!(report.oracle_report.all_passed());
 //! ```
 
-use asupersync::lab::runtime::{LabRunReport, LabScheduler};
+use asupersync::lab::runtime::LabRunReport;
 use asupersync::lab::{LabConfig, LabRuntime};
 use asupersync::types::{Budget, RegionId, TaskId};
-use parking_lot::RawMutex;
 use std::future::Future;
 use tracing::info;
 
 /// Bead identifier for tracing and log correlation.
 const BEAD_ID: &str = "bd-3go.2";
-
-pub(crate) trait SchedulerLockExt {
-    fn schedule_task(&mut self, task_id: TaskId, priority: u8);
-}
-
-impl SchedulerLockExt for std::sync::LockResult<std::sync::MutexGuard<'_, LabScheduler>> {
-    fn schedule_task(&mut self, task_id: TaskId, priority: u8) {
-        self.as_mut()
-            .expect("FsLab: scheduler lock poisoned")
-            .schedule(task_id, priority);
-    }
-}
-
-impl SchedulerLockExt for std::sync::MutexGuard<'_, LabScheduler> {
-    fn schedule_task(&mut self, task_id: TaskId, priority: u8) {
-        self.schedule(task_id, priority);
-    }
-}
-
-impl SchedulerLockExt for parking_lot::lock_api::MutexGuard<'_, RawMutex, LabScheduler> {
-    fn schedule_task(&mut self, task_id: TaskId, priority: u8) {
-        self.schedule(task_id, priority);
-    }
-}
 
 /// Ergonomic wrapper around [`LabRuntime`] for FrankenSQLite deterministic testing.
 ///
@@ -141,7 +116,7 @@ impl FsLab {
     ///     let mut scheduler = runtime
     ///         .scheduler
     ///         .lock();
-    ///     scheduler.schedule_task(tid, 0);
+    ///     scheduler.schedule(tid, 0);
     /// });
     /// assert!(report.oracle_report.all_passed());
     /// ```
@@ -195,7 +170,7 @@ impl FsLab {
                 .expect("FsLab: failed to create task");
 
             let mut scheduler = runtime.scheduler.lock();
-            scheduler.schedule_task(tid, 0);
+            scheduler.schedule(tid, 0);
         })
     }
 
@@ -314,7 +289,7 @@ mod tests {
                 .expect("create task");
 
             let mut scheduler = runtime.scheduler.lock();
-            scheduler.schedule_task(tid, 0);
+            scheduler.schedule(tid, 0);
         });
 
         assert!(
@@ -343,8 +318,8 @@ mod tests {
             let (t2, _h2) = FsLab::spawn_named(runtime, root, "writer", async { "write_done" });
 
             let mut sched = runtime.scheduler.lock();
-            sched.schedule_task(t1, 0);
-            sched.schedule_task(t2, 1);
+            sched.schedule(t1, 0);
+            sched.schedule(t2, 1);
         });
 
         assert!(
@@ -384,7 +359,7 @@ mod tests {
                 .expect("create task");
 
             let mut scheduler = runtime.scheduler.lock();
-            scheduler.schedule_task(tid, 0);
+            scheduler.schedule(tid, 0);
         });
 
         // Key property: no obligation leaks or task leaks under chaos injection.
@@ -411,8 +386,8 @@ mod tests {
                 .expect("task 2");
 
             let mut sched = runtime.scheduler.lock();
-            sched.schedule_task(t1, 0);
-            sched.schedule_task(t2, 1);
+            sched.schedule(t1, 0);
+            sched.schedule(t2, 1);
         });
     }
 

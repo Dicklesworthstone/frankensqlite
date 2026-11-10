@@ -241,7 +241,6 @@ fn unaliased_result_expressions_are_named_by_their_source_text() {
             let stmt = r.prepare(sql).expect("rusqlite prepare");
             let stock: Vec<String> = stmt
                 .column_names()
-                .into_iter()
                 .map(str::to_owned)
                 .collect();
             assert_eq!(franken, stock, "column names of `{sql}`");
