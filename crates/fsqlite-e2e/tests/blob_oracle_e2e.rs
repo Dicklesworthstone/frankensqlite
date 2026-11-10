@@ -241,6 +241,29 @@ fn blob_concatenation() {
 }
 
 #[test]
+fn string_functions_keep_raw_bytes() {
+    // bd-w4pr1.18: functions stock treats as byte-transparent must not turn a
+    // BLOB or non-UTF-8 TEXT byte into EF BF BD.
+    asupersync::test_utils::run_test(|| async {
+        assert_scalar(
+            &[
+                "SELECT hex(replace(X'41FF42', 'A', 'Z')), hex(replace(CAST(X'41FF' AS TEXT), X'FF', 'q'))",
+                "SELECT hex(trim(X'20FF20')), hex(ltrim(X'FFFE41', 'A')), hex(rtrim(CAST(X'41FF20' AS TEXT)))",
+                "SELECT hex(trim(CAST(X'C3FFC3A9' AS TEXT), 'é'))",
+                "SELECT hex(upper(X'61FF')), hex(lower(X'41FF'))",
+                "SELECT hex(concat(X'FF', 'a')), hex(concat_ws('-', X'FF', X'FE')), hex(concat(X'FF', NULL, 'z'))",
+                "SELECT hex(quote(CAST(X'FF' AS TEXT))), hex(quote(CAST(X'6127FF' AS TEXT)))",
+                "SELECT hex(group_concat(v)) FROM (SELECT X'FF' AS v UNION ALL SELECT X'FE')",
+                "SELECT hex(string_agg(v, X'00')) FROM (SELECT X'C0' AS v UNION ALL SELECT X'C1')",
+                "SELECT hex(upper('abc')), trim('  x  '), replace('aXa', 'X', 'y')",
+            ],
+            "string_functions_keep_raw_bytes",
+        )
+        .await;
+    });
+}
+
+#[test]
 fn blob_concatenation_stored_value_keeps_bytes() {
     // The concatenated TEXT is written to a table and read back.
     asupersync::test_utils::run_test(|| async {

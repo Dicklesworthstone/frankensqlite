@@ -27,7 +27,7 @@ use std::cmp::Ordering;
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::SqliteValue;
 
-use crate::builtins::statement_text_encoding;
+use crate::builtins::{statement_text_encoding, text_from_bytes};
 use crate::{AggregateFunction, FunctionRegistry};
 
 // ─── Kahan compensated summation ──────────────────────────────────────────
@@ -197,22 +197,20 @@ impl AggregateFunction for CountFunc {
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub struct GroupConcatState {
-    /// Incrementally built result string.  C SQLite appends
+    /// Incrementally built result.  C SQLite appends
     /// `separator + value` at each step (separator only before 2nd+ value),
     /// using the separator from *that row's* argument, not a single global one.
-    result: String,
+    /// Kept as bytes so a BLOB or non-UTF-8 TEXT argument contributes its
+    /// exact bytes, as in stock (bd-w4pr1.18).
+    result: Vec<u8>,
     has_value: bool,
 }
 
 pub struct GroupConcatFunc;
 
 #[inline]
-fn push_group_concat_text(result: &mut String, value: &SqliteValue) {
-    if let Some(text) = value.as_text_str() {
-        result.push_str(text);
-    } else {
-        result.push_str(&value.to_text());
-    }
+fn push_group_concat_text(result: &mut Vec<u8>, value: &SqliteValue) {
+    result.extend_from_slice(&value.text_bytes());
 }
 
 impl AggregateFunction for GroupConcatFunc {
@@ -220,7 +218,7 @@ impl AggregateFunction for GroupConcatFunc {
 
     fn initial_state(&self) -> Self::State {
         GroupConcatState {
-            result: String::new(),
+            result: Vec::new(),
             has_value: false,
         }
     }
@@ -235,7 +233,7 @@ impl AggregateFunction for GroupConcatFunc {
                     push_group_concat_text(&mut state.result, separator);
                 }
                 Some(_) => {}
-                None => state.result.push(','),
+                None => state.result.push(b','),
             }
         }
         push_group_concat_text(&mut state.result, &args[0]);
@@ -245,7 +243,7 @@ impl AggregateFunction for GroupConcatFunc {
 
     fn finalize(&self, state: Self::State) -> Result<SqliteValue> {
         if state.has_value {
-            Ok(SqliteValue::Text(state.result.into()))
+            Ok(text_from_bytes(state.result))
         } else {
             Ok(SqliteValue::Null)
         }
@@ -757,7 +755,7 @@ pub fn register_aggregate_builtins(registry: &mut FunctionRegistry) {
 
         fn initial_state(&self) -> Self::State {
             GroupConcatState {
-                result: String::new(),
+                result: Vec::new(),
                 has_value: false,
             }
         }
@@ -868,6 +866,19 @@ mod tests {
             run_agg(&GroupConcatFunc, &[int(1), int(2), int(3)]),
             text("1,2,3")
         );
+        // bd-w4pr1.18: BLOB values keep their exact bytes (stock: FF 2C FE),
+        // where the old lossy path produced EF BF BD 2C EF BF BD.
+        let joined = run_agg(
+            &GroupConcatFunc,
+            &[
+                SqliteValue::Blob(vec![0xFF].into()),
+                SqliteValue::Blob(vec![0xFE].into()),
+            ],
+        );
+        let SqliteValue::Text(joined) = joined else {
+            panic!("group_concat must return TEXT");
+        };
+        assert_eq!(joined.as_bytes_direct(), &[0xFF, b',', 0xFE]);
 
         // sum() of all-integer input ERRORS on i64 overflow rather than wrapping
         // or promoting to real (C SQLite raises "integer overflow" while stepping;

@@ -35,6 +35,7 @@ use std::collections::VecDeque;
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::SqliteValue;
 
+use crate::builtins::text_from_bytes;
 use crate::{FunctionRegistry, WindowFunction};
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1314,7 +1315,9 @@ impl WindowFunction for WindowAvgFunc {
 }
 
 pub struct WindowGroupConcatState {
-    result: String,
+    /// Bytes, so a BLOB or non-UTF-8 TEXT argument keeps its exact bytes
+    /// (bd-w4pr1.18).
+    result: Vec<u8>,
     has_value: bool,
 }
 
@@ -1325,27 +1328,19 @@ fn window_group_concat_step(state: &mut WindowGroupConcatState, args: &[SqliteVa
     if state.has_value {
         match args.get(1) {
             Some(separator) if !separator.is_null() => {
-                if let Some(text) = separator.as_text_str() {
-                    state.result.push_str(text);
-                } else {
-                    state.result.push_str(&separator.to_text());
-                }
+                state.result.extend_from_slice(&separator.text_bytes());
             }
             Some(_) => {}
-            None => state.result.push(','),
+            None => state.result.push(b','),
         }
     }
-    if let Some(text) = args[0].as_text_str() {
-        state.result.push_str(text);
-    } else {
-        state.result.push_str(&args[0].to_text());
-    }
+    state.result.extend_from_slice(&args[0].text_bytes());
     state.has_value = true;
 }
 
 fn window_group_concat_value(state: &WindowGroupConcatState) -> SqliteValue {
     if state.has_value {
-        SqliteValue::Text(state.result.clone().into())
+        text_from_bytes(state.result.clone())
     } else {
         SqliteValue::Null
     }
@@ -1358,7 +1353,7 @@ impl WindowFunction for WindowGroupConcatFunc {
 
     fn initial_state(&self) -> Self::State {
         WindowGroupConcatState {
-            result: String::new(),
+            result: Vec::new(),
             has_value: false,
         }
     }
@@ -1406,7 +1401,7 @@ impl WindowFunction for WindowStringAggFunc {
 
     fn initial_state(&self) -> Self::State {
         WindowGroupConcatState {
-            result: String::new(),
+            result: Vec::new(),
             has_value: false,
         }
     }

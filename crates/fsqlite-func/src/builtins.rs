@@ -357,6 +357,13 @@ pub struct ConcatFunc;
 
 impl ScalarFunction for ConcatFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        if args.iter().any(text_needs_bytes) {
+            let mut bytes = Vec::new();
+            for arg in args {
+                bytes.extend_from_slice(&arg.text_bytes());
+            }
+            return Ok(text_from_bytes(bytes));
+        }
         let mut result = String::new();
         for arg in args {
             // concat treats NULL as empty string (unlike ||)
@@ -392,6 +399,19 @@ impl ScalarFunction for ConcatWsFunc {
         // C SQLite: concat_ws(NULL, ...) returns NULL when separator is NULL.
         if args[0].is_null() {
             return Ok(SqliteValue::Null);
+        }
+        if args.iter().any(text_needs_bytes) {
+            let sep = args[0].text_bytes();
+            let mut bytes = Vec::new();
+            let mut has_part = false;
+            for arg in args[1..].iter().filter(|arg| !arg.is_null()) {
+                if has_part {
+                    bytes.extend_from_slice(&sep);
+                }
+                bytes.extend_from_slice(&arg.text_bytes());
+                has_part = true;
+            }
+            return Ok(text_from_bytes(bytes));
         }
         let sep = text_arg(&args[0]);
         let mut result = String::new();
@@ -675,6 +695,12 @@ impl ScalarFunction for LowerFunc {
         if args[0].is_null() {
             return Ok(SqliteValue::Null);
         }
+        if text_needs_bytes(&args[0]) {
+            // Stock folds ASCII only, so a byte-wise fold is exact.
+            let mut bytes = args[0].text_bytes().into_owned();
+            bytes.make_ascii_lowercase();
+            return Ok(text_from_bytes(bytes));
+        }
         let lowered = text_arg(&args[0]).as_ref().to_ascii_lowercase();
         Ok(SqliteValue::Text(SmallText::from_string(lowered)))
     }
@@ -694,6 +720,12 @@ impl ScalarFunction for UpperFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
         if args[0].is_null() {
             return Ok(SqliteValue::Null);
+        }
+        if text_needs_bytes(&args[0]) {
+            // Stock folds ASCII only, so a byte-wise fold is exact.
+            let mut bytes = args[0].text_bytes().into_owned();
+            bytes.make_ascii_uppercase();
+            return Ok(text_from_bytes(bytes));
         }
         let upper = text_arg(&args[0]).as_ref().to_ascii_uppercase();
         Ok(SqliteValue::Text(SmallText::from_string(upper)))
@@ -729,10 +761,52 @@ fn rtrim_chars<'a>(s: &'a str, chars: &str) -> &'a str {
     s.trim_end_matches(|c: char| char_set.contains(&c))
 }
 
+/// trim/ltrim/rtrim when the input or the character set holds raw bytes (a
+/// BLOB or non-UTF-8 TEXT). Mirrors stock's `trimFunc`: the set is split into
+/// characters the way `SQLITE_SKIP_UTF8` does (a lead byte >= 0xC0 takes the
+/// continuation bytes after it, so invalid bytes still form characters), and
+/// whole character byte sequences are stripped from the chosen ends. Returns
+/// `None` when both are ordinary UTF-8, so the `str` path stays in charge.
+fn trim_raw_bytes(args: &[SqliteValue], left: bool, right: bool) -> Option<SqliteValue> {
+    let set_arg = args.get(1).filter(|set| !set.is_null());
+    if !text_needs_bytes(&args[0]) && !set_arg.is_some_and(text_needs_bytes) {
+        return None;
+    }
+    let input = args[0].text_bytes();
+    let set_bytes = set_arg.map_or(Cow::Borrowed(&b" "[..]), SqliteValue::text_bytes);
+    let mut set: Vec<&[u8]> = Vec::new();
+    let mut i = 0;
+    while i < set_bytes.len() {
+        let start = i;
+        i += 1;
+        if set_bytes[start] >= 0xC0 {
+            while i < set_bytes.len() && set_bytes[i] & 0xC0 == 0x80 {
+                i += 1;
+            }
+        }
+        set.push(&set_bytes[start..i]);
+    }
+    let mut kept: &[u8] = &input;
+    if left {
+        while let Some(ch) = set.iter().find(|ch| kept.starts_with(ch)) {
+            kept = &kept[ch.len()..];
+        }
+    }
+    if right {
+        while let Some(ch) = set.iter().find(|ch| kept.ends_with(ch)) {
+            kept = &kept[..kept.len() - ch.len()];
+        }
+    }
+    Some(text_from_bytes(kept.to_vec()))
+}
+
 impl ScalarFunction for TrimFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
         if args[0].is_null() {
             return Ok(SqliteValue::Null);
+        }
+        if let Some(trimmed) = trim_raw_bytes(args, true, true) {
+            return Ok(trimmed);
         }
         let s = text_arg(&args[0]);
         let chars = if args.len() > 1 && !args[1].is_null() {
@@ -768,6 +842,9 @@ impl ScalarFunction for LtrimFunc {
         if args[0].is_null() {
             return Ok(SqliteValue::Null);
         }
+        if let Some(trimmed) = trim_raw_bytes(args, true, false) {
+            return Ok(trimmed);
+        }
         let s = text_arg(&args[0]);
         let chars = if args.len() > 1 && !args[1].is_null() {
             text_arg(&args[1])
@@ -801,6 +878,9 @@ impl ScalarFunction for RtrimFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
         if args[0].is_null() {
             return Ok(SqliteValue::Null);
+        }
+        if let Some(trimmed) = trim_raw_bytes(args, false, true) {
+            return Ok(trimmed);
         }
         let s = text_arg(&args[0]);
         let chars = if args.len() > 1 && !args[1].is_null() {
@@ -920,10 +1000,41 @@ impl ScalarFunction for SubtypeFunc {
 
 pub struct ReplaceFunc;
 
+/// replace() over exact bytes, as stock's `replaceFunc` does (a `memcmp`
+/// search), for a BLOB or non-UTF-8 TEXT argument.
+fn replace_raw_bytes(x: &[u8], y: &[u8], z: &[u8]) -> Result<SqliteValue> {
+    if y.is_empty() {
+        return Ok(text_from_bytes(x.to_vec()));
+    }
+    let mut out = Vec::with_capacity(x.len());
+    let mut i = 0;
+    while i < x.len() {
+        if x[i..].starts_with(y) {
+            out.extend_from_slice(z);
+            i += y.len();
+        } else {
+            out.push(x[i]);
+            i += 1;
+        }
+        // Same expansion bound as the `str` path.
+        if out.len() > 1_000_000_000 {
+            return Err(FrankenError::TooBig);
+        }
+    }
+    Ok(text_from_bytes(out))
+}
+
 impl ScalarFunction for ReplaceFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
         if let Some(null) = null_propagate(args) {
             return Ok(null);
+        }
+        if args.iter().any(text_needs_bytes) {
+            return replace_raw_bytes(
+                &args[0].text_bytes(),
+                &args[1].text_bytes(),
+                &args[2].text_bytes(),
+            );
         }
         let x = text_arg(&args[0]);
         let y = text_arg(&args[1]);
@@ -1228,6 +1339,24 @@ pub struct QuoteFunc;
 
 impl ScalarFunction for QuoteFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        if let SqliteValue::Text(text) = &args[0]
+            && !text.is_valid_utf8()
+        {
+            // Non-UTF-8 TEXT keeps its bytes: '...' with quotes doubled, up to
+            // the first NUL, as for ordinary text.
+            let bytes = text.as_bytes_direct();
+            let body = bytes.split(|&b| b == 0).next().unwrap_or(bytes);
+            let mut quoted = Vec::with_capacity(body.len() + 2);
+            quoted.push(b'\'');
+            for &b in body {
+                if b == b'\'' {
+                    quoted.push(b'\'');
+                }
+                quoted.push(b);
+            }
+            quoted.push(b'\'');
+            return Ok(text_from_bytes(quoted));
+        }
         let result = quote_sql_value(&args[0], false);
         Ok(SqliteValue::Text(SmallText::from_string(result)))
     }
@@ -2096,6 +2225,26 @@ fn text_arg(value: &SqliteValue) -> Cow<'_, str> {
     match value.as_text_str() {
         Some(text) => Cow::Borrowed(text),
         None => Cow::Owned(value.to_text()),
+    }
+}
+
+/// True when SQLite's TEXT view of `value` must be handled as raw bytes: a
+/// BLOB, or TEXT that is not valid UTF-8. Stock SQLite's string functions pass
+/// such bytes through unchanged, where a `str` path would rewrite every invalid
+/// byte as U+FFFD (bd-w4pr1.18).
+pub(crate) fn text_needs_bytes(value: &SqliteValue) -> bool {
+    match value {
+        SqliteValue::Blob(_) => true,
+        SqliteValue::Text(text) => !text.is_valid_utf8(),
+        _ => false,
+    }
+}
+
+/// TEXT holding `bytes` exactly, reusing the buffer when it is valid UTF-8.
+pub(crate) fn text_from_bytes(bytes: Vec<u8>) -> SqliteValue {
+    match String::from_utf8(bytes) {
+        Ok(text) => SqliteValue::Text(SmallText::from_string(text)),
+        Err(raw) => SqliteValue::Text(SmallText::from_bytes(raw.as_bytes())),
     }
 }
 
@@ -4919,6 +5068,107 @@ mod tests {
             .unwrap(),
             SqliteValue::Text(SmallText::from_string("hello"))
         );
+    }
+
+    // bd-w4pr1.18: string functions keep BLOB / non-UTF-8 TEXT bytes. Expected
+    // bytes are what sqlite3 3.46.1 returned for the same calls; the old lossy
+    // path produced EF BF BD for every invalid byte and fails each of these.
+    fn raw_blob(bytes: &[u8]) -> SqliteValue {
+        SqliteValue::Blob(bytes.to_vec().into())
+    }
+
+    fn raw_text(bytes: &[u8]) -> SqliteValue {
+        SqliteValue::Text(SmallText::from_bytes(bytes))
+    }
+
+    fn out_bytes(value: &SqliteValue) -> Vec<u8> {
+        match value {
+            SqliteValue::Text(text) => text.as_bytes_direct().to_vec(),
+            other => panic!("expected TEXT, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_string_functions_keep_raw_bytes_bd_w4pr1_18() {
+        let t = |s: &str| SqliteValue::Text(SmallText::new(s));
+        let cases: Vec<(&str, Result<SqliteValue>, &[u8])> = vec![
+            (
+                "replace(x'41FF42','A','Z')",
+                ReplaceFunc.invoke(&[raw_blob(b"A\xFFB"), t("A"), t("Z")]),
+                b"Z\xFFB",
+            ),
+            (
+                "trim(x'20FF20')",
+                TrimFunc.invoke(&[raw_blob(b" \xFF ")]),
+                b"\xFF",
+            ),
+            (
+                "ltrim(x'FFFE41','A')",
+                LtrimFunc.invoke(&[raw_blob(b"\xFF\xFEA"), t("A")]),
+                b"\xFF\xFEA",
+            ),
+            (
+                "rtrim(CAST(x'41FF20' AS TEXT))",
+                RtrimFunc.invoke(&[raw_text(b"A\xFF ")]),
+                b"A\xFF",
+            ),
+            (
+                "upper(x'61FF')",
+                UpperFunc.invoke(&[raw_blob(b"a\xFF")]),
+                b"A\xFF",
+            ),
+            (
+                "lower(x'41FF')",
+                LowerFunc.invoke(&[raw_blob(b"A\xFF")]),
+                b"a\xFF",
+            ),
+            (
+                "concat(x'FF','a')",
+                ConcatFunc.invoke(&[raw_blob(b"\xFF"), t("a")]),
+                b"\xFFa",
+            ),
+            (
+                "concat_ws('-',x'FF',x'FE')",
+                ConcatWsFunc.invoke(&[t("-"), raw_blob(b"\xFF"), raw_blob(b"\xFE")]),
+                b"\xFF-\xFE",
+            ),
+            (
+                "quote(CAST(x'FF' AS TEXT))",
+                QuoteFunc.invoke(&[raw_text(b"\xFF")]),
+                b"'\xFF'",
+            ),
+        ];
+        for (sql, got, want) in cases {
+            let got = got.unwrap_or_else(|e| panic!("{sql}: {e}"));
+            assert_eq!(out_bytes(&got), want, "{sql}");
+        }
+    }
+
+    #[test]
+    fn test_raw_byte_paths_keep_stock_edge_semantics() {
+        let t = |s: &str| SqliteValue::Text(SmallText::new(s));
+        // An empty search string returns X unchanged.
+        let same = ReplaceFunc
+            .invoke(&[raw_blob(b"\xFFx"), t(""), t("q")])
+            .unwrap();
+        assert_eq!(out_bytes(&same), b"\xFFx");
+        // A trim set character is a whole UTF-8 sequence: trimming 'é' (C3 A9)
+        // must not strip a lone C3 byte.
+        let kept = TrimFunc
+            .invoke(&[raw_text(b"\xC3\xFF\xC3\xA9"), t("\u{e9}")])
+            .unwrap();
+        assert_eq!(out_bytes(&kept), b"\xC3\xFF");
+        // quote() stops at the first NUL and doubles single quotes.
+        let quoted = QuoteFunc.invoke(&[raw_text(b"a'\xFF\0tail")]).unwrap();
+        assert_eq!(out_bytes(&quoted), b"'a''\xFF'");
+        // Valid UTF-8 still takes the ordinary path and stays valid text.
+        let ascii = ConcatFunc.invoke(&[raw_blob(b"ok"), t("!")]).unwrap();
+        assert_eq!(ascii, t("ok!"));
+        // NULL arguments of concat are skipped on the byte path too.
+        let skipped = ConcatFunc
+            .invoke(&[raw_blob(b"\xFF"), SqliteValue::Null, t("z")])
+            .unwrap();
+        assert_eq!(out_bytes(&skipped), b"\xFFz");
     }
 
     #[test]
