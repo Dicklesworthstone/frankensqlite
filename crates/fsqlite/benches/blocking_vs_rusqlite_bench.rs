@@ -103,7 +103,14 @@ macro_rules! workload {
                     }
                 }
                 conn.execute_batch("COMMIT").expect("commit");
-                (20_000_u64, conn.last_insert_rowid() as u64)
+                // Rows, not last_insert_rowid(): after the table is emptied
+                // fsqlite does not restart rowids at 1 (bd-mkon7).
+                let rows: i64 = conn
+                    .query_row("SELECT count(*), sum(a) FROM u", [], |row| {
+                        Ok(row.get::<_, i64>(0)? * 1_000_003 + row.get::<_, i64>(1)?)
+                    })
+                    .expect("count");
+                (20_000_u64, rows as u64)
             }
             "insert_autocommit" => {
                 let mut stmt = conn
