@@ -1,0 +1,1174 @@
+{
+ "sqlite3": {
+  "bulk_insert_1M_one_txn": {
+   "median_s": 0.4277,
+   "all_s": [
+    0.432,
+    0.424
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "1000000|499500000",
+   "err": ""
+  },
+  "scan_filter_agg": {
+   "median_s": 0.0561,
+   "all_s": [
+    0.06,
+    0.052
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "499000|374250000",
+   "err": ""
+  },
+  "group_by_1000_groups": {
+   "median_s": 0.2061,
+   "all_s": [
+    0.201,
+    0.211
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "1000|1000000",
+   "err": ""
+  },
+  "rowid_lookups_200k": {
+   "median_s": 0.3746,
+   "all_s": [
+    0.364,
+    0.385
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "200000|99900000",
+   "err": ""
+  },
+  "join_1M_to_pk_1000": {
+   "median_s": 0.1975,
+   "all_s": [
+    0.194,
+    0.201
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "1000000|7890000",
+   "err": ""
+  },
+  "order_by_text_limit10": {
+   "median_s": 0.0706,
+   "all_s": [
+    0.068,
+    0.073
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "10|9999945",
+   "err": ""
+  },
+  "window_row_number": {
+   "median_s": 0.7281,
+   "all_s": [
+    0.76,
+    0.696
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "500500000",
+   "err": ""
+  },
+  "join_no_index_5k_x_5k": {
+   "median_s": 0.006,
+   "all_s": [
+    0.006,
+    0.006
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "5000",
+   "err": ""
+  },
+  "count_star": {
+   "median_s": 0.0157,
+   "all_s": [
+    0.015,
+    0.017
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "1000000",
+   "err": ""
+  },
+  "create_index_int_300k": {
+   "median_s": 0.0862,
+   "all_s": [
+    0.086,
+    0.087
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "300000",
+   "err": ""
+  },
+  "update_10pct_300k": {
+   "median_s": 0.0468,
+   "all_s": [
+    0.049,
+    0.045
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "149880000",
+   "err": ""
+  },
+  "delete_14pct_300k": {
+   "median_s": 0.0332,
+   "all_s": [
+    0.032,
+    0.035
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "257143",
+   "err": ""
+  },
+  "autocommit_5k_inserts": {
+   "median_s": 0.0652,
+   "all_s": [
+    0.064,
+    0.066
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "5000",
+   "err": ""
+  },
+  "txn_1000x10_rows": {
+   "median_s": 0.0349,
+   "all_s": [
+    0.034,
+    0.036
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "10000",
+   "err": ""
+  },
+  "memory_script_200k": {
+   "median_s": 0.1811,
+   "all_s": [
+    0.184,
+    0.178
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "171429|85646645",
+   "err": ""
+  },
+  "multiproc_8x500": {
+   "median_s": 0.1676,
+   "all_s": [
+    0.155,
+    0.18
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "4000of4000errs0",
+   "err": ""
+  },
+  "_elapsed_s": 6.2
+ },
+ "v0.4.13": {
+  "bulk_insert_1M_one_txn": {
+   "median_s": 4.7284,
+   "all_s": [
+    4.869,
+    4.588
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "1000000|499500000",
+   "err": ""
+  },
+  "scan_filter_agg": {
+   "median_s": 0.3878,
+   "all_s": [
+    0.366,
+    0.409
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "499000|374250000",
+   "err": ""
+  },
+  "group_by_1000_groups": {
+   "median_s": 1.7055,
+   "all_s": [
+    1.678,
+    1.733
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "1000|1000000",
+   "err": ""
+  },
+  "rowid_lookups_200k": {
+   "median_s": 4.3554,
+   "all_s": [
+    5.562,
+    3.149
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "200000|99900000",
+   "err": ""
+  },
+  "join_1M_to_pk_1000": {
+   "median_s": 2.6395,
+   "all_s": [
+    2.648,
+    2.631
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "1000000|7890000",
+   "err": ""
+  },
+  "order_by_text_limit10": {
+   "median_s": 0.4752,
+   "all_s": [
+    0.454,
+    0.496
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "10|9999945",
+   "err": ""
+  },
+  "window_row_number": {
+   "median_s": 7.3397,
+   "all_s": [
+    7.272,
+    7.407
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "500500000",
+   "err": ""
+  },
+  "join_no_index_5k_x_5k": {
+   "median_s": 5.4064,
+   "all_s": [
+    5.436,
+    5.377
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "5000",
+   "err": ""
+  },
+  "count_star": {
+   "median_s": 0.0819,
+   "all_s": [
+    0.089,
+    0.074
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "1000000",
+   "err": ""
+  },
+  "create_index_int_300k": {
+   "median_s": 2.0388,
+   "all_s": [
+    1.98,
+    2.097
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "300000",
+   "err": ""
+  },
+  "update_10pct_300k": {
+   "median_s": 0.4315,
+   "all_s": [
+    0.466,
+    0.397
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "149880000",
+   "err": ""
+  },
+  "delete_14pct_300k": {
+   "median_s": 0.3909,
+   "all_s": [
+    0.348,
+    0.434
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "257143",
+   "err": ""
+  },
+  "autocommit_5k_inserts": {
+   "median_s": 1.5662,
+   "all_s": [
+    1.565,
+    1.568
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "5000",
+   "err": ""
+  },
+  "txn_1000x10_rows": {
+   "median_s": 0.9255,
+   "all_s": [
+    0.928,
+    0.923
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "10000",
+   "err": ""
+  },
+  "memory_script_200k": {
+   "median_s": 1.945,
+   "all_s": [
+    1.952,
+    1.938
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "171429|85646645",
+   "err": ""
+  },
+  "multiproc_8x500": {
+   "median_s": 1.6628,
+   "all_s": [
+    1.626,
+    1.7
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "4000of4000errs0",
+   "err": ""
+  },
+  "_elapsed_s": 80.8
+ },
+ "v0.4.12": {
+  "bulk_insert_1M_one_txn": {
+   "median_s": 3.0797,
+   "all_s": [
+    3.158,
+    3.001
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "1000000|499500000",
+   "err": ""
+  },
+  "scan_filter_agg": {
+   "median_s": 0.4144,
+   "all_s": [
+    0.414,
+    0.415
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "499000|374250000",
+   "err": ""
+  },
+  "group_by_1000_groups": {
+   "median_s": 1.8086,
+   "all_s": [
+    1.828,
+    1.789
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "1000|1000000",
+   "err": ""
+  },
+  "rowid_lookups_200k": {
+   "median_s": 5.799,
+   "all_s": [
+    5.78,
+    5.818
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "200000|99900000",
+   "err": ""
+  },
+  "join_1M_to_pk_1000": {
+   "median_s": 2.7278,
+   "all_s": [
+    2.778,
+    2.678
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "1000000|7890000",
+   "err": ""
+  },
+  "order_by_text_limit10": {
+   "median_s": 0.4643,
+   "all_s": [
+    0.469,
+    0.46
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "10|9999945",
+   "err": ""
+  },
+  "window_row_number": {
+   "median_s": 7.8321,
+   "all_s": [
+    8.073,
+    7.591
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "500500000",
+   "err": ""
+  },
+  "join_no_index_5k_x_5k": {
+   "median_s": 5.5411,
+   "all_s": [
+    5.625,
+    5.458
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "5000",
+   "err": ""
+  },
+  "count_star": {
+   "median_s": 0.0936,
+   "all_s": [
+    0.106,
+    0.081
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "1000000",
+   "err": ""
+  },
+  "create_index_int_300k": {
+   "median_s": 7.468,
+   "all_s": [
+    7.767,
+    7.169
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "300000",
+   "err": ""
+  },
+  "update_10pct_300k": {
+   "median_s": 0.4503,
+   "all_s": [
+    0.455,
+    0.445
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "149880000",
+   "err": ""
+  },
+  "delete_14pct_300k": {
+   "median_s": 0.4174,
+   "all_s": [
+    0.367,
+    0.468
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "257143",
+   "err": ""
+  },
+  "autocommit_5k_inserts": {
+   "median_s": 1.7336,
+   "all_s": [
+    1.728,
+    1.739
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "5000",
+   "err": ""
+  },
+  "txn_1000x10_rows": {
+   "median_s": 0.9493,
+   "all_s": [
+    0.936,
+    0.963
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "10000",
+   "err": ""
+  },
+  "memory_script_200k": {
+   "median_s": 1.7952,
+   "all_s": [
+    1.814,
+    1.777
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "171429|85646645",
+   "err": ""
+  },
+  "multiproc_8x500": {
+   "median_s": 0.4468,
+   "all_s": [
+    0.331,
+    0.562
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "1470of4000errs2530",
+   "err": ""
+  },
+  "_elapsed_s": 88.4
+ },
+ "v0.4.9": {
+  "bulk_insert_1M_one_txn": {
+   "median_s": 3.0995,
+   "all_s": [
+    3.173,
+    3.026
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "1000000|499500000",
+   "err": ""
+  },
+  "_base_extra_error": "timeout",
+  "scan_filter_agg": {
+   "median_s": 0.4024,
+   "all_s": [
+    0.402,
+    0.403
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "499000|374250000",
+   "err": ""
+  },
+  "group_by_1000_groups": {
+   "median_s": 1.9471,
+   "all_s": [
+    1.932,
+    1.962
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "1000|1000000",
+   "err": ""
+  },
+  "rowid_lookups_200k": {
+   "median_s": 3.4377,
+   "all_s": [
+    3.277,
+    3.598
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "200000|99900000",
+   "err": ""
+  },
+  "join_1M_to_pk_1000": {
+   "median_s": 2.8804,
+   "all_s": [
+    2.904,
+    2.857
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "1000000|7890000",
+   "err": ""
+  },
+  "order_by_text_limit10": {
+   "median_s": 0.5506,
+   "all_s": [
+    0.586,
+    0.516
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "10|9999945",
+   "err": ""
+  },
+  "window_row_number": {
+   "median_s": 7.621,
+   "all_s": [
+    7.524,
+    7.718
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "500500000",
+   "err": ""
+  },
+  "join_no_index_5k_x_5k": {
+   "median_s": 5.7365,
+   "all_s": [
+    5.685,
+    5.788
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "5000",
+   "err": ""
+  },
+  "count_star": {
+   "median_s": 0.1324,
+   "all_s": [
+    0.176,
+    0.089
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "1000000",
+   "err": ""
+  },
+  "create_index_int_300k": {
+   "median_s": 22.6635,
+   "all_s": [
+    22.347,
+    22.98
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "300000",
+   "err": ""
+  },
+  "update_10pct_300k": {
+   "median_s": 5.7577,
+   "all_s": [
+    5.633,
+    5.883
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "149880000",
+   "err": ""
+  },
+  "delete_14pct_300k": {
+   "median_s": 5.8604,
+   "all_s": [
+    5.91,
+    5.811
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "257143",
+   "err": ""
+  },
+  "autocommit_5k_inserts": {
+   "median_s": 1.7618,
+   "all_s": [
+    1.752,
+    1.772
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "5000",
+   "err": ""
+  },
+  "txn_1000x10_rows": {
+   "median_s": 0.9479,
+   "all_s": [
+    0.941,
+    0.955
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "10000",
+   "err": ""
+  },
+  "memory_script_200k": {
+   "median_s": 2.1798,
+   "all_s": [
+    2.221,
+    2.138
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "171429|85646645",
+   "err": ""
+  },
+  "multiproc_8x500": {
+   "median_s": 0.3333,
+   "all_s": [
+    0.332,
+    0.334
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "785of4000errs2716",
+   "err": ""
+  },
+  "_elapsed_s": 287.5
+ },
+ "v0.4.4": {
+  "bulk_insert_1M_one_txn": {
+   "median_s": null,
+   "all_s": [
+    150.141,
+    150.149
+   ],
+   "timeouts": 2,
+   "errors": 0,
+   "answer": "wal",
+   "err": ""
+  },
+  "create_index_int_300k": {
+   "median_s": null,
+   "all_s": [
+    0,
+    0
+   ],
+   "timeouts": 2,
+   "errors": 0,
+   "answer": "",
+   "err": "setup "
+  },
+  "update_10pct_300k": {
+   "median_s": null,
+   "all_s": [
+    0,
+    0
+   ],
+   "timeouts": 2,
+   "errors": 0,
+   "answer": "",
+   "err": "setup "
+  },
+  "delete_14pct_300k": {
+   "median_s": null,
+   "all_s": [
+    0,
+    0
+   ],
+   "timeouts": 2,
+   "errors": 0,
+   "answer": "",
+   "err": "setup "
+  },
+  "autocommit_5k_inserts": {
+   "median_s": null,
+   "all_s": [
+    150.105,
+    150.102
+   ],
+   "timeouts": 2,
+   "errors": 0,
+   "answer": "5000",
+   "err": ""
+  },
+  "txn_1000x10_rows": {
+   "median_s": null,
+   "all_s": [
+    150.105,
+    150.106
+   ],
+   "timeouts": 2,
+   "errors": 0,
+   "answer": "10000",
+   "err": ""
+  },
+  "memory_script_200k": {
+   "median_s": 19.4925,
+   "all_s": [
+    19.892,
+    19.093
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "171429|85646645",
+   "err": ""
+  },
+  "multiproc_8x500": {
+   "median_s": null,
+   "all_s": [
+    0,
+    0
+   ],
+   "timeouts": 0,
+   "errors": 2,
+   "answer": "",
+   "err": "setup: "
+  },
+  "_elapsed_s": 2140.4
+ },
+ "v0.3.14": {
+  "bulk_insert_1M_one_txn": {
+   "median_s": null,
+   "all_s": [
+    150.163,
+    150.197
+   ],
+   "timeouts": 2,
+   "errors": 0,
+   "answer": "wal",
+   "err": ""
+  },
+  "create_index_int_300k": {
+   "median_s": 28.2955,
+   "all_s": [
+    27.223,
+    29.368
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "300000",
+   "err": ""
+  },
+  "update_10pct_300k": {
+   "median_s": 2.0664,
+   "all_s": [
+    2.113,
+    2.02
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "149880000",
+   "err": ""
+  },
+  "delete_14pct_300k": {
+   "median_s": 1.9123,
+   "all_s": [
+    2.085,
+    1.74
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "257143",
+   "err": ""
+  },
+  "autocommit_5k_inserts": {
+   "median_s": 18.0959,
+   "all_s": [
+    17.422,
+    18.77
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "5000",
+   "err": ""
+  },
+  "txn_1000x10_rows": {
+   "median_s": 4.0589,
+   "all_s": [
+    4.087,
+    4.031
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "10000",
+   "err": ""
+  },
+  "memory_script_200k": {
+   "median_s": 21.9364,
+   "all_s": [
+    22.931,
+    20.942
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "171429|85646645",
+   "err": ""
+  },
+  "multiproc_8x500": {
+   "median_s": null,
+   "all_s": [
+    157.018,
+    157.018
+   ],
+   "timeouts": 2,
+   "errors": 0,
+   "answer": "1038of4000errs627",
+   "err": ""
+  },
+  "_elapsed_s": 976.9
+ },
+ "v0.3.8": {
+  "bulk_insert_1M_one_txn": {
+   "median_s": null,
+   "all_s": [
+    0.004,
+    0.004
+   ],
+   "timeouts": 0,
+   "errors": 2,
+   "answer": "",
+   "err": "error: not implemented: file-backed pager not available on this platform"
+  },
+  "create_index_int_300k": {
+   "median_s": null,
+   "all_s": [
+    0,
+    0
+   ],
+   "timeouts": 0,
+   "errors": 2,
+   "answer": "",
+   "err": "setup error: not implemented: file-backed pager not available on this platform"
+  },
+  "update_10pct_300k": {
+   "median_s": null,
+   "all_s": [
+    0,
+    0
+   ],
+   "timeouts": 0,
+   "errors": 2,
+   "answer": "",
+   "err": "setup error: not implemented: file-backed pager not available on this platform"
+  },
+  "delete_14pct_300k": {
+   "median_s": null,
+   "all_s": [
+    0,
+    0
+   ],
+   "timeouts": 0,
+   "errors": 2,
+   "answer": "",
+   "err": "setup error: not implemented: file-backed pager not available on this platform"
+  },
+  "autocommit_5k_inserts": {
+   "median_s": null,
+   "all_s": [
+    0.004,
+    0.004
+   ],
+   "timeouts": 0,
+   "errors": 2,
+   "answer": "",
+   "err": "error: not implemented: file-backed pager not available on this platform"
+  },
+  "txn_1000x10_rows": {
+   "median_s": null,
+   "all_s": [
+    0.005,
+    0.004
+   ],
+   "timeouts": 0,
+   "errors": 2,
+   "answer": "",
+   "err": "error: not implemented: file-backed pager not available on this platform"
+  },
+  "memory_script_200k": {
+   "median_s": 19.9925,
+   "all_s": [
+    18.672,
+    21.313
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "171429|85646645",
+   "err": ""
+  },
+  "multiproc_8x500": {
+   "median_s": null,
+   "all_s": [
+    0,
+    0
+   ],
+   "timeouts": 0,
+   "errors": 2,
+   "answer": "",
+   "err": "setup: error: not implemented: file-backed pager not available on this platform"
+  },
+  "_elapsed_s": 40.1
+ },
+ "v0.3.0": {
+  "bulk_insert_1M_one_txn": {
+   "median_s": null,
+   "all_s": [
+    150.265,
+    150.162
+   ],
+   "timeouts": 2,
+   "errors": 0,
+   "answer": "wal",
+   "err": ""
+  },
+  "create_index_int_300k": {
+   "median_s": 15.469,
+   "all_s": [
+    14.038,
+    16.9
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "300000",
+   "err": ""
+  },
+  "update_10pct_300k": {
+   "median_s": 2.247,
+   "all_s": [
+    1.821,
+    2.673
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "149880000",
+   "err": ""
+  },
+  "delete_14pct_300k": {
+   "median_s": 1.5653,
+   "all_s": [
+    1.665,
+    1.466
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "257143",
+   "err": ""
+  },
+  "autocommit_5k_inserts": {
+   "median_s": 45.5949,
+   "all_s": [
+    49.522,
+    41.668
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "5000",
+   "err": ""
+  },
+  "txn_1000x10_rows": {
+   "median_s": 7.2803,
+   "all_s": [
+    6.695,
+    7.865
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "10000",
+   "err": ""
+  },
+  "memory_script_200k": {
+   "median_s": 20.4738,
+   "all_s": [
+    20.576,
+    20.371
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "171429|85646645",
+   "err": ""
+  },
+  "multiproc_8x500": {
+   "median_s": null,
+   "all_s": [
+    157.02,
+    157.016
+   ],
+   "timeouts": 2,
+   "errors": 0,
+   "answer": "930of4000errs525",
+   "err": ""
+  },
+  "_elapsed_s": 1008.8
+ },
+ "v0.1.17": {
+  "bulk_insert_1M_one_txn": {
+   "median_s": null,
+   "all_s": [
+    150.305,
+    150.276
+   ],
+   "timeouts": 2,
+   "errors": 0,
+   "answer": "NORMAL",
+   "err": ""
+  },
+  "create_index_int_300k": {
+   "median_s": 24.4908,
+   "all_s": [
+    25.013,
+    23.969
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "300000",
+   "err": ""
+  },
+  "update_10pct_300k": {
+   "median_s": 1.0131,
+   "all_s": [
+    1.042,
+    0.984
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "149880000",
+   "err": ""
+  },
+  "delete_14pct_300k": {
+   "median_s": 0.8743,
+   "all_s": [
+    0.898,
+    0.85
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "257143",
+   "err": ""
+  },
+  "autocommit_5k_inserts": {
+   "median_s": 9.1438,
+   "all_s": [
+    8.064,
+    10.224
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "5000",
+   "err": ""
+  },
+  "txn_1000x10_rows": {
+   "median_s": 1.2877,
+   "all_s": [
+    1.278,
+    1.298
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "10000",
+   "err": ""
+  },
+  "memory_script_200k": {
+   "median_s": 14.7332,
+   "all_s": [
+    14.64,
+    14.826
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "171429|85646645",
+   "err": ""
+  },
+  "multiproc_8x500": {
+   "median_s": 0.5237,
+   "all_s": [
+    0.649,
+    0.399
+   ],
+   "timeouts": 0,
+   "errors": 0,
+   "answer": "434of4000errs1702",
+   "err": ""
+  },
+  "_elapsed_s": 542.7
+ }
+}
