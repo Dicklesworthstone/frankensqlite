@@ -7725,6 +7725,29 @@ impl WalCommitSyncPolicy {
     }
 }
 
+/// Whether the database keeps auto-vacuum pointer-map pages, i.e. its header's
+/// largest-root-page field (bytes 52..56) is nonzero.
+///
+/// This pager does not maintain pointer maps (bd-1q134). Writing such a file
+/// would leave them stale, which stock SQLite reports as corruption, so every
+/// writer upgrade is refused while the state is `AutoVacuum`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PointerMapState {
+    Absent,
+    AutoVacuum,
+}
+
+impl PointerMapState {
+    #[must_use]
+    const fn from_largest_root_page(largest_root_page: u32) -> Self {
+        if largest_root_page == 0 {
+            Self::Absent
+        } else {
+            Self::AutoVacuum
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PagerAccessMode {
     Writable,
@@ -8257,6 +8280,8 @@ pub(crate) struct PagerInner<F: VfsFile> {
     /// Freelist trunk capacity derives from the usable size, not the page
     /// size, or trunks overflow into the reserved trailer.
     reserved_per_page: u8,
+    /// Whether the committed header declares auto-vacuum pointer-map pages.
+    pointer_map: PointerMapState,
     /// Current database size in pages.
     db_size: u32,
     /// Next page to allocate (1-based).
@@ -10486,10 +10511,16 @@ impl<F: VfsFile> PagerInner<F> {
             // names them so the next commit republishes a clean chain.
             let dropped = u32::try_from(freelist.len())
                 .map_or(0, |loaded| header.freelist_count.saturating_sub(loaded));
-            Ok((db_size, freelist, dropped, header.reserved_per_page))
+            Ok((
+                db_size,
+                freelist,
+                dropped,
+                header.reserved_per_page,
+                PointerMapState::from_largest_root_page(header.largest_root_page),
+            ))
         })
         .await;
-        let (db_size, freelist, freelist_entries_dropped, reserved_per_page) =
+        let (db_size, freelist, freelist_entries_dropped, reserved_per_page, pointer_map) =
             match full_refresh_result {
                 Ok(refreshed) => refreshed,
                 Err(err) => return Err(err),
@@ -10497,6 +10528,7 @@ impl<F: VfsFile> PagerInner<F> {
         // The committed page 1 is authoritative for the reserved-byte count;
         // an open that bootstrapped from a stale main-file stub learns it here.
         self.reserved_per_page = reserved_per_page;
+        self.pointer_map = pointer_map;
         if freelist_entries_dropped > 0 && !self.access_mode.is_readonly() {
             self.freelist_repair_pending = true;
             self.freelist_repair_dropped = freelist_entries_dropped;
@@ -14640,6 +14672,20 @@ fn map_database_header_error(error: &DatabaseHeaderError, context: &str) -> Fran
     }
 }
 
+/// The error for a write to an auto-vacuum database (bd-1q134).
+///
+/// Writing such a file without maintaining its pointer-map pages leaves the
+/// map stale; stock SQLite then reports "Failed to read ptrmap key" from
+/// `PRAGMA integrity_check`. Reads stay available.
+fn auto_vacuum_write_refused() -> FrankenError {
+    FrankenError::NotImplemented(
+        "writing to a database with auto_vacuum enabled (pointer-map pages) is not \
+         supported yet; reads work. To make it writable, run \
+         `PRAGMA auto_vacuum = NONE; VACUUM;` on it with stock sqlite3"
+            .to_owned(),
+    )
+}
+
 /// Does this main-file header carry stock's empty-schema stamp (schema format
 /// 0 or text encoding 0)?
 ///
@@ -15121,6 +15167,7 @@ where
                     rollback_recovery_pending: Arc::clone(&inner.rollback_recovery_pending),
                     recovery_fence: Arc::clone(&self.recovery_fence),
                     read_only_pager: inner.access_mode.is_readonly(),
+                    pointer_map: inner.pointer_map,
                     wal_conflict_snapshot,
                     published_visible_commit_seq: Cell::new(bound_visible_commit_seq),
                     published_db_size: Cell::new(bound_db_size),
@@ -15331,6 +15378,7 @@ where
             let memory_db_bump_alloc =
                 self.vfs.is_memory() && self.db_path == Path::new("/:memory:");
             let read_only_pager = inner.access_mode.is_readonly();
+            let pointer_map = inner.pointer_map;
             let db_file = Arc::clone(&inner.db_file);
             let rollback_recovery_pending = Arc::clone(&inner.rollback_recovery_pending);
             let maintenance_lease = admission.complete(&mut inner)?;
@@ -15362,6 +15410,7 @@ where
                 rollback_recovery_pending,
                 recovery_fence: Arc::clone(&self.recovery_fence),
                 read_only_pager,
+                pointer_map,
                 wal_conflict_snapshot,
                 published_visible_commit_seq: Cell::new(bound_visible_commit_seq),
                 published_db_size: Cell::new(bound_db_size),
@@ -19954,6 +20003,7 @@ where
 
         let initial_commit_seq = CommitSeq::new(u64::from(header.change_counter));
         let reserved_per_page = header.reserved_per_page;
+        let pointer_map = PointerMapState::from_largest_root_page(header.largest_root_page);
         let initial_journal_mode = Self::journal_mode_from_database_header(&header)?;
         let freelist_count = freelist.len();
         let open_freelist_entries_dropped = u32::try_from(freelist_count)
@@ -19983,6 +20033,7 @@ where
                 namespace_binding: inner_namespace_binding,
                 page_size,
                 reserved_per_page,
+                pointer_map,
                 db_size,
                 next_page,
                 writer_active: false,
@@ -20397,6 +20448,12 @@ where
         // Raw header byte 20 also covers the stale-stub bootstrap (no parsed
         // header); the first committed-state refresh replaces it regardless.
         let reserved_per_page = header_bytes[20];
+        let pointer_map = PointerMapState::from_largest_root_page(u32::from_be_bytes([
+            header_bytes[52],
+            header_bytes[53],
+            header_bytes[54],
+            header_bytes[55],
+        ]));
         let resolved_max = crate::page_cache::resolve_page_buffer_max(page_buffer_max);
         let cache =
             ShardedPageCache::with_max_buffers_for_initial_pages(page_size, resolved_max, db_size);
@@ -20422,6 +20479,7 @@ where
                 namespace_binding: inner_namespace_binding,
                 page_size,
                 reserved_per_page,
+                pointer_map,
                 db_size,
                 next_page,
                 writer_active: false,
@@ -21477,6 +21535,9 @@ where
     /// The physical pager was opened read-only. This is stronger than a
     /// read-only transaction mode and must reject every later writer upgrade.
     read_only_pager: bool,
+    /// Pointer-map state of the database at BEGIN; `AutoVacuum` refuses every
+    /// writer upgrade (bd-1q134).
+    pointer_map: PointerMapState,
     /// WAL visibility horizon captured for this exact transaction at BEGIN.
     /// The backend's shared pinned snapshot can be replaced when a sibling
     /// transaction begins, so commit-time FCW validation must not reread it.
@@ -25898,6 +25959,9 @@ where
     async fn ensure_writer(&mut self, cx: &Cx) -> Result<()> {
         if self.read_only_pager {
             return Err(FrankenError::ReadOnly);
+        }
+        if self.pointer_map == PointerMapState::AutoVacuum {
+            return Err(auto_vacuum_write_refused());
         }
         self.ensure_no_pending_group_commit_attempt()?;
         if self.is_writer {
