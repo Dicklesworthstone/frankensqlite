@@ -157,27 +157,115 @@ pub struct IoUringLatencySnapshot {
     pub write_conformal_upper_bound_us: u64,
 }
 
+/// A bounded first-in-first-out window of samples that also keeps them in
+/// ascending order, so a nearest-rank quantile is an index, not a sort.
+///
+/// Every io_uring read and write records a sample and reads three quantiles
+/// while holding the process-wide metrics lock. Sorting a copy of the window
+/// for each quantile dominated statements that do little else (bd-w4pr1.13.2).
+/// Here a push is two binary searches and two short moves, and each quantile
+/// is the value the full sort would produce, because `sorted` holds exactly
+/// the samples of `fifo`.
+#[derive(Default)]
+struct SortedWindow {
+    /// Samples in arrival order; the front is the next one evicted.
+    fifo: VecDeque<u64>,
+    /// The same samples in ascending order.
+    sorted: Vec<u64>,
+}
+
+impl SortedWindow {
+    const fn new() -> Self {
+        Self {
+            fifo: VecDeque::new(),
+            sorted: Vec::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.fifo.len()
+    }
+
+    /// Append `value`, evicting the oldest sample once `capacity` are held.
+    fn push(&mut self, value: u64, capacity: usize) {
+        if capacity == 0 {
+            return;
+        }
+        if self.fifo.len() == capacity
+            && let Some(evicted) = self.fifo.pop_front()
+        {
+            let at = self.sorted.partition_point(|&held| held < evicted);
+            debug_assert_eq!(self.sorted.get(at), Some(&evicted));
+            self.sorted.remove(at);
+        }
+        self.fifo.push_back(value);
+        let at = self.sorted.partition_point(|&held| held <= value);
+        self.sorted.insert(at, value);
+    }
+
+    /// The sample at 1-based nearest rank `ceil(numerator * population / denominator)`,
+    /// clamped to the window, where `population` is the window length plus
+    /// `extra_population`. `None` for an empty window.
+    fn nearest_rank(
+        &self,
+        numerator: usize,
+        denominator: usize,
+        extra_population: usize,
+    ) -> Option<u64> {
+        let n = self.sorted.len();
+        if n == 0 || denominator == 0 {
+            return None;
+        }
+        let rank = numerator
+            .saturating_mul(n.saturating_add(extra_population))
+            .div_ceil(denominator)
+            .saturating_sub(1)
+            .min(n - 1);
+        self.sorted.get(rank).copied()
+    }
+
+    fn clear(&mut self) {
+        self.fifo.clear();
+        self.sorted.clear();
+    }
+}
+
 #[derive(Default)]
 struct IoLatencySeries {
-    latencies_ns: VecDeque<u64>,
-    nonconformity_ns: VecDeque<u64>,
+    latencies_ns: SortedWindow,
+    nonconformity_ns: SortedWindow,
 }
 
 impl IoLatencySeries {
+    const fn new() -> Self {
+        Self {
+            latencies_ns: SortedWindow::new(),
+            nonconformity_ns: SortedWindow::new(),
+        }
+    }
+
     fn push(&mut self, sample_ns: u64, sample_capacity: usize) {
         let baseline = self.p99_latency_ns().unwrap_or(sample_ns);
         let score = sample_ns.saturating_sub(baseline);
-        push_bounded(&mut self.latencies_ns, sample_ns, sample_capacity);
-        push_bounded(&mut self.nonconformity_ns, score, sample_capacity);
+        self.latencies_ns.push(sample_ns, sample_capacity);
+        self.nonconformity_ns.push(score, sample_capacity);
     }
 
     fn p99_latency_ns(&self) -> Option<u64> {
-        quantile_from_deque(&self.latencies_ns, P99_NUMERATOR, P99_DENOMINATOR)
+        self.latencies_ns
+            .nearest_rank(P99_NUMERATOR, P99_DENOMINATOR, 0)
+    }
+
+    /// Split-conformal quantile of the nonconformity scores: nearest rank over
+    /// a population one larger than the window.
+    fn conformal_quantile_ns(&self) -> Option<u64> {
+        self.nonconformity_ns
+            .nearest_rank(P99_NUMERATOR, P99_DENOMINATOR, 1)
     }
 
     fn conformal_upper_bound_ns(&self) -> Option<u64> {
         let baseline = self.p99_latency_ns()?;
-        let q = conformal_quantile(&self.nonconformity_ns)?;
+        let q = self.conformal_quantile_ns()?;
         Some(baseline.saturating_add(q))
     }
 
@@ -218,14 +306,8 @@ impl IoUringLatencyMetrics {
             write_tail_violations_total: AtomicU64::new(0),
             sample_capacity,
             window: Mutex::new(IoUringLatencyWindow {
-                read: IoLatencySeries {
-                    latencies_ns: VecDeque::new(),
-                    nonconformity_ns: VecDeque::new(),
-                },
-                write: IoLatencySeries {
-                    latencies_ns: VecDeque::new(),
-                    nonconformity_ns: VecDeque::new(),
-                },
+                read: IoLatencySeries::new(),
+                write: IoLatencySeries::new(),
             }),
         }
     }
@@ -349,54 +431,6 @@ pub fn io_uring_latency_snapshot() -> IoUringLatencySnapshot {
 
 pub fn reset_io_uring_latency_metrics() {
     GLOBAL_IO_URING_LATENCY_METRICS.reset();
-}
-
-fn push_bounded(buffer: &mut VecDeque<u64>, value: u64, sample_capacity: usize) {
-    if sample_capacity == 0 {
-        return;
-    }
-    if buffer.len() == sample_capacity {
-        let _ = buffer.pop_front();
-    }
-    buffer.push_back(value);
-}
-
-fn quantile_from_deque(
-    values: &VecDeque<u64>,
-    numerator: usize,
-    denominator: usize,
-) -> Option<u64> {
-    if values.is_empty() || denominator == 0 {
-        return None;
-    }
-
-    let mut sorted: Vec<u64> = values.iter().copied().collect();
-    sorted.sort_unstable();
-
-    let n = sorted.len();
-    let rank = numerator
-        .saturating_mul(n)
-        .div_ceil(denominator)
-        .saturating_sub(1)
-        .min(n.saturating_sub(1));
-    sorted.get(rank).copied()
-}
-
-fn conformal_quantile(nonconformity: &VecDeque<u64>) -> Option<u64> {
-    if nonconformity.is_empty() {
-        return None;
-    }
-
-    let mut sorted: Vec<u64> = nonconformity.iter().copied().collect();
-    sorted.sort_unstable();
-
-    let n = sorted.len();
-    let rank = P99_NUMERATOR
-        .saturating_mul(n.saturating_add(1))
-        .div_ceil(P99_DENOMINATOR)
-        .saturating_sub(1)
-        .min(n.saturating_sub(1));
-    sorted.get(rank).copied()
 }
 
 fn nanos_to_micros(nanos: u64) -> u64 {
