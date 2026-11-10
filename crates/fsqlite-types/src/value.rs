@@ -1246,6 +1246,73 @@ impl SqliteValue {
         }
     }
 
+    /// The exact bytes SQLite uses when it treats this value as TEXT.
+    ///
+    /// SQLite reinterprets a BLOB as TEXT without validating or rewriting its
+    /// bytes, and a TEXT value may already hold invalid UTF-8. Unlike
+    /// [`Self::to_text`], this never substitutes U+FFFD. NULL yields no bytes.
+    #[must_use]
+    pub fn text_bytes(&self) -> Cow<'_, [u8]> {
+        match self {
+            Self::Null => Cow::Borrowed(&[]),
+            Self::Integer(i) => Cow::Owned(i.to_string().into_bytes()),
+            Self::Float(f) => Cow::Owned(format_sqlite_float(*f).into_bytes()),
+            Self::Text(s) => Cow::Borrowed(s.as_bytes_direct()),
+            Self::Blob(b) => Cow::Borrowed(b),
+        }
+    }
+
+    /// SQL `self || rhs`.
+    ///
+    /// NULL if either operand is NULL; otherwise TEXT holding the text bytes of
+    /// `self` followed by those of `rhs`. A BLOB operand contributes its raw
+    /// bytes, so `x'00ff' || x'aa'` is the three bytes `00 FF AA`, as in SQLite.
+    #[must_use]
+    pub fn sql_concat(&self, rhs: &Self) -> Self {
+        if self.is_null() || rhs.is_null() {
+            return Self::Null;
+        }
+        let byte_exact = |v: &Self| match v {
+            Self::Blob(_) => true,
+            Self::Text(t) => !t.is_valid_utf8(),
+            _ => false,
+        };
+        if byte_exact(self) || byte_exact(rhs) {
+            let left = self.text_bytes();
+            let right = rhs.text_bytes();
+            let mut bytes = Vec::with_capacity(left.len() + right.len());
+            bytes.extend_from_slice(&left);
+            bytes.extend_from_slice(&right);
+            return Self::Text(SmallText::from_bytes(&bytes));
+        }
+        // Both operands render as valid UTF-8: concatenate as `str`.
+        match (self, rhs) {
+            (Self::Text(l), Self::Text(r)) => {
+                let mut s = String::with_capacity(l.len() + r.len());
+                s.push_str(l);
+                s.push_str(r);
+                Self::Text(s.into())
+            }
+            (Self::Text(l), r) => {
+                let r = r.to_text();
+                let mut s = String::with_capacity(l.len() + r.len());
+                s.push_str(l);
+                s.push_str(&r);
+                Self::Text(s.into())
+            }
+            (l, Self::Text(r)) => {
+                let mut s = l.to_text();
+                s.push_str(r);
+                Self::Text(s.into())
+            }
+            (l, r) => {
+                let mut s = l.to_text();
+                s.push_str(&r.to_text());
+                Self::Text(s.into())
+            }
+        }
+    }
+
     /// Convert to NUMERIC using SQLite CAST semantics rather than affinity.
     ///
     /// Unlike NUMERIC affinity, CAST always produces a numeric storage class for
@@ -3281,6 +3348,58 @@ mod tests {
             error.to_string().contains("invalid UTF-8"),
             "serialization failure must explain the unsupported Rust-string boundary: {error}"
         );
+    }
+
+    #[test]
+    fn test_sql_concat_blob_operands_keep_exact_bytes() {
+        let blob = |b: &[u8]| SqliteValue::Blob(b.to_vec().into());
+        let joined = blob(&[0x00, 0xFF]).sql_concat(&blob(&[0xAA]));
+        let SqliteValue::Text(text) = &joined else {
+            panic!("blob || blob must be TEXT, got {joined:?}");
+        };
+        // The lossy path produced 00 EF BF BD EF BF BD; SQLite keeps 00 FF AA.
+        assert_eq!(text.as_bytes_direct(), &[0x00, 0xFF, 0xAA]);
+        assert!(!text.is_valid_utf8());
+
+        let mixed = blob(&[0xC0, 0xFF, 0xEE]).sql_concat(&SqliteValue::Text("x".into()));
+        let SqliteValue::Text(text) = &mixed else {
+            panic!("blob || text must be TEXT");
+        };
+        assert_eq!(text.as_bytes_direct(), &[0xC0, 0xFF, 0xEE, b'x']);
+
+        // Valid UTF-8 blob bytes become ordinary text.
+        let ascii = blob(b"ab").sql_concat(&SqliteValue::Integer(7));
+        assert_eq!(ascii, SqliteValue::Text("ab7".into()));
+    }
+
+    #[test]
+    fn test_sql_concat_text_numbers_and_null() {
+        let t = |s: &str| SqliteValue::Text(s.into());
+        assert_eq!(t("a").sql_concat(&t("b")), t("ab"));
+        assert_eq!(
+            SqliteValue::Integer(1).sql_concat(&SqliteValue::Float(2.5)),
+            t("12.5")
+        );
+        assert_eq!(t("x").sql_concat(&SqliteValue::Null), SqliteValue::Null);
+        assert_eq!(SqliteValue::Null.sql_concat(&t("x")), SqliteValue::Null);
+        assert_eq!(t("").sql_concat(&t("")), t(""));
+
+        // Invalid UTF-8 TEXT stays byte-exact through concatenation.
+        let raw = SqliteValue::Text(SmallText::from_bytes(&[0x80, 0x81]));
+        let SqliteValue::Text(out) = raw.sql_concat(&t("z")) else {
+            panic!("text || text must be TEXT");
+        };
+        assert_eq!(out.as_bytes_direct(), &[0x80, 0x81, b'z']);
+    }
+
+    #[test]
+    fn test_text_bytes_never_substitutes_replacement_characters() {
+        assert_eq!(
+            SqliteValue::Blob(vec![0xFF].into()).text_bytes().as_ref(),
+            &[0xFF]
+        );
+        assert_eq!(SqliteValue::Integer(-3).text_bytes().as_ref(), b"-3");
+        assert!(SqliteValue::Null.text_bytes().is_empty());
     }
 
     #[test]

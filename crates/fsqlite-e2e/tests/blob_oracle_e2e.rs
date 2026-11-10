@@ -226,8 +226,34 @@ fn blob_concatenation() {
                 "SELECT X'41' || X'42'",
                 "SELECT 'pre' || X'4142'",
                 "SELECT typeof(X'00' || 'x')",
+                // Bytes that are not valid UTF-8 must survive `||` unchanged
+                // (a lossy decode yields EFBFBD replacement sequences).
+                "SELECT hex(X'00FF' || X'AA'), typeof(X'00FF' || X'AA')",
+                "SELECT hex(X'C0FFEE' || 'x'), hex('a' || X'FF' || 'b')",
+                "SELECT hex(X'80' || 1), hex(2.5 || X'FE')",
+                "SELECT hex(CAST(X'FF' AS TEXT) || CAST(X'FE' AS TEXT))",
+                "SELECT X'FF' || NULL IS NULL",
             ],
             "blob_concatenation",
+        )
+        .await;
+    });
+}
+
+#[test]
+fn blob_concatenation_stored_value_keeps_bytes() {
+    // The concatenated TEXT is written to a table and read back.
+    asupersync::test_utils::run_test(|| async {
+        let (f, r) = setup(&[
+            "CREATE TABLE b(v)",
+            "INSERT INTO b VALUES (X'C0FFEE' || X'00'), ('k' || X'FF')",
+        ])
+        .await;
+        check(
+            &f,
+            &r,
+            &["SELECT hex(v), typeof(v) FROM b ORDER BY rowid"],
+            "blob_concatenation_stored_value_keeps_bytes",
         )
         .await;
     });

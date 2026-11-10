@@ -138124,13 +138124,7 @@ fn evaluate_having_value(
                 fsqlite_ast::BinaryOp::Multiply => lv.sql_mul(&rv),
                 fsqlite_ast::BinaryOp::Divide => numeric_div(&lv, &rv),
                 fsqlite_ast::BinaryOp::Modulo => numeric_mod(&lv, &rv),
-                fsqlite_ast::BinaryOp::Concat => {
-                    if is_null_op {
-                        SqliteValue::Null
-                    } else {
-                        SqliteValue::Text(format!("{}{}", lv.to_text(), rv.to_text()).into())
-                    }
-                }
+                fsqlite_ast::BinaryOp::Concat => lv.sql_concat(&rv),
                 fsqlite_ast::BinaryOp::BitAnd => {
                     if is_null_op {
                         SqliteValue::Null
@@ -162805,15 +162799,7 @@ fn eval_binary_op(left: &SqliteValue, op: BinaryOp, right: &SqliteValue) -> Sqli
         BinaryOp::Multiply => left.sql_mul(right),
         BinaryOp::Divide => numeric_div(left, right),
         BinaryOp::Modulo => numeric_mod(left, right),
-        BinaryOp::Concat => {
-            if left.is_null() || right.is_null() {
-                SqliteValue::Null
-            } else {
-                let l = sqlite_value_to_text(left);
-                let r = sqlite_value_to_text(right);
-                SqliteValue::Text(format!("{l}{r}").into())
-            }
-        }
+        BinaryOp::Concat => left.sql_concat(right),
         BinaryOp::Is => {
             let eq = match (left.is_null(), right.is_null()) {
                 (true, true) => true,

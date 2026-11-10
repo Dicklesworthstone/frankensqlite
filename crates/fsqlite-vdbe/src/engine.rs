@@ -10121,39 +10121,10 @@ impl VdbeEngine {
                 Opcode::Concat => {
                     // Concatenate p1 and p2 into p3.
                     // SQLite concat order: result = b || a  (p2 first, then p1).
+                    // BLOB operands contribute their raw bytes (no U+FFFD).
                     let a = self.get_reg(op.p1);
                     let b = self.get_reg(op.p2);
-                    let result = if a.is_null() || b.is_null() {
-                        SqliteValue::Null
-                    } else {
-                        // Fast path: when both are already Text, avoid the
-                        // to_text() clone+allocation on the second operand.
-                        match (b, a) {
-                            (SqliteValue::Text(bs), SqliteValue::Text(as_)) => {
-                                let mut s = String::with_capacity(bs.len() + as_.len());
-                                s.push_str(bs);
-                                s.push_str(as_);
-                                SqliteValue::Text(s.into())
-                            }
-                            (SqliteValue::Text(bs), a_val) => {
-                                let a_text = a_val.to_text();
-                                let mut s = String::with_capacity(bs.len() + a_text.len());
-                                s.push_str(bs);
-                                s.push_str(&a_text);
-                                SqliteValue::Text(s.into())
-                            }
-                            (b_val, SqliteValue::Text(as_)) => {
-                                let mut s = b_val.to_text();
-                                s.push_str(as_);
-                                SqliteValue::Text(s.into())
-                            }
-                            _ => {
-                                let mut s = b.to_text();
-                                s.push_str(&a.to_text());
-                                SqliteValue::Text(s.into())
-                            }
-                        }
-                    };
+                    let result = b.sql_concat(a);
                     self.set_reg_fast(op.p3, result);
                     pc += 1;
                 }
