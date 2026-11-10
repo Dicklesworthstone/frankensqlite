@@ -1976,6 +1976,66 @@ impl SorterCursor {
         Ok(())
     }
 
+    /// Sort `rows` when the sort key is a single column holding an INTEGER in
+    /// every row. Returns `false`, with `rows` untouched, for any other key.
+    ///
+    /// This is the order the general stable sort produces for such a key.
+    /// Integers compare numerically under every collation; with no NULL
+    /// present the NULLS FIRST/LAST variants are plain ASC and DESC; and equal
+    /// keys keep their insertion order. Sorting `(key, position)` pairs gives
+    /// that order with integer compares and no comparator call: the position
+    /// breaks ties, and a DESC key is sorted as its bitwise complement, which
+    /// reverses integer order without overflow. GROUP BY and ORDER BY on an
+    /// integer column spent most of their sort in the comparator
+    /// (bd-w4pr1.13.3).
+    ///
+    /// Takes the fields it needs rather than `&mut self` so `sort` can call it
+    /// while it holds the collation registry guard.
+    fn sort_rows_by_single_integer_key(
+        key_columns: usize,
+        sort_key_orders: &[SortKeyOrder],
+        rows: &mut [SorterRow],
+    ) -> bool {
+        if key_columns != 1 || rows.len() < 2 {
+            return false;
+        }
+        if u32::try_from(rows.len()).is_err() {
+            return false;
+        }
+        let descending = matches!(
+            sort_key_orders.first(),
+            Some(SortKeyOrder::Desc | SortKeyOrder::DescNullsFirst)
+        );
+        let mut keyed: Vec<(i64, u32)> = Vec::with_capacity(rows.len());
+        for (position, row) in rows.iter().enumerate() {
+            let Some(SqliteValue::Integer(key)) = row.values.first() else {
+                return false;
+            };
+            #[allow(clippy::cast_possible_truncation)]
+            keyed.push((if descending { !*key } else { *key }, position as u32));
+        }
+        keyed.sort_unstable();
+
+        // `keyed[i].1` is the row that belongs at `i`. Move the rows there in
+        // place, one cycle of the permutation at a time.
+        for start in 0..keyed.len() {
+            let mut current = start;
+            loop {
+                let source = keyed[current].1 as usize;
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    keyed[current].1 = current as u32;
+                }
+                if source == start {
+                    break;
+                }
+                rows.swap(current, source);
+                current = source;
+            }
+        }
+        true
+    }
+
     /// Sort the sorter, merging any spilled runs with in-memory rows.
     ///
     /// After this call, `self.rows` contains the fully sorted result and
@@ -2015,21 +2075,27 @@ impl SorterCursor {
             }
 
             // Pure in-memory sort — fast path.
-            let key_columns = self.key_columns;
-            let orders = self.sort_key_orders.clone();
-            let colls = self.collations.clone();
-            let text_encoding = self.text_encoding;
-            self.rows.sort_by(|lhs, rhs| {
-                compare_sorter_rows(
-                    &lhs.values,
-                    &rhs.values,
-                    key_columns,
-                    &orders,
-                    &colls,
-                    &coll_guard,
-                    text_encoding,
-                )
-            });
+            if !Self::sort_rows_by_single_integer_key(
+                self.key_columns,
+                &self.sort_key_orders,
+                &mut self.rows,
+            ) {
+                let key_columns = self.key_columns;
+                let orders = self.sort_key_orders.clone();
+                let colls = self.collations.clone();
+                let text_encoding = self.text_encoding;
+                self.rows.sort_by(|lhs, rhs| {
+                    compare_sorter_rows(
+                        &lhs.values,
+                        &rhs.values,
+                        key_columns,
+                        &orders,
+                        &colls,
+                        &coll_guard,
+                        text_encoding,
+                    )
+                });
+            }
             self.rows_sorted_total += self.rows.len() as u64;
             return Ok(());
         }
@@ -36716,6 +36782,124 @@ mod tests {
             u8s, expect_codepoint,
             "UTF-8 BINARY == code-point order (unchanged hot path)"
         );
+    }
+
+    /// The single-integer-key sort must give the order of a stable sort by
+    /// key: duplicates stay in insertion order in both directions, and the
+    /// extreme values sort at the ends. A blob that records the insertion
+    /// sequence tells equal keys apart.
+    #[test]
+    fn test_sorter_single_integer_key_sort_matches_stable_key_order() {
+        for order in [
+            SortKeyOrder::Asc,
+            SortKeyOrder::Desc,
+            SortKeyOrder::AscNullsLast,
+            SortKeyOrder::DescNullsFirst,
+        ] {
+            let mut sorter = SorterCursor::new(1, vec![order], Vec::new());
+            let mut expected: Vec<(i64, u64)> = Vec::new();
+            let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+            for sequence in 0..5_000_u64 {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let key = match sequence % 7 {
+                    0 => i64::MIN,
+                    1 => i64::MAX,
+                    2 => 0,
+                    _ => i64::try_from((state >> 40) % 23).unwrap() - 11,
+                };
+                sorter
+                    .insert_row(
+                        vec![SqliteValue::Integer(key)],
+                        sequence.to_be_bytes().to_vec(),
+                    )
+                    .expect("insert should succeed");
+                expected.push((key, sequence));
+            }
+            let descending = matches!(order, SortKeyOrder::Desc | SortKeyOrder::DescNullsFirst);
+            // `sort_by` is stable, so this is the reference order.
+            expected.sort_by(|lhs, rhs| {
+                if descending {
+                    rhs.0.cmp(&lhs.0)
+                } else {
+                    lhs.0.cmp(&rhs.0)
+                }
+            });
+
+            sorter.sort().expect("sort should succeed");
+
+            let sorted: Vec<(i64, u64)> = sorter
+                .rows
+                .iter()
+                .map(|row| {
+                    (
+                        row.values[0].to_integer(),
+                        u64::from_be_bytes(row.blob[..8].try_into().unwrap()),
+                    )
+                })
+                .collect();
+            assert_eq!(sorted, expected, "order {order:?}");
+        }
+    }
+
+    /// A key column holding anything but integers is not the fast path's to
+    /// sort: it must decline without moving a row, and `sort` must still give
+    /// the comparator's order (NULL first, 1.0 and 1 tied in insertion order,
+    /// text after numbers).
+    #[test]
+    fn test_sorter_single_integer_key_sort_declines_other_keys() {
+        let keys = [
+            SqliteValue::Integer(3),
+            SqliteValue::Null,
+            SqliteValue::Float(1.0),
+            SqliteValue::Integer(1),
+            SqliteValue::from("a"),
+            SqliteValue::Integer(-5),
+            SqliteValue::Float(2.5),
+        ];
+        let filled = || {
+            let mut sorter = SorterCursor::new(1, vec![SortKeyOrder::Asc], Vec::new());
+            for (index, key) in keys.iter().enumerate() {
+                sorter
+                    .insert_row(vec![key.clone()], vec![u8::try_from(index).unwrap()])
+                    .expect("insert should succeed");
+            }
+            sorter
+        };
+        let insertion_order =
+            |sorter: &SorterCursor| -> Vec<u8> { sorter.rows.iter().map(|row| row.blob[0]).collect() };
+
+        let mut declined = filled();
+        assert!(!SorterCursor::sort_rows_by_single_integer_key(
+            declined.key_columns,
+            &declined.sort_key_orders,
+            &mut declined.rows,
+        ));
+        assert_eq!(insertion_order(&declined), vec![0, 1, 2, 3, 4, 5, 6]);
+
+        let mut sorter = filled();
+        sorter.sort().expect("sort should succeed");
+        assert_eq!(insertion_order(&sorter), vec![1, 5, 2, 3, 6, 0, 4]);
+
+        // Two key columns are outside the fast path even when both are integers.
+        let mut two_keys =
+            SorterCursor::new(2, vec![SortKeyOrder::Asc, SortKeyOrder::Asc], Vec::new());
+        for (index, key) in [(2_i64, 1_i64), (1, 2), (1, 1)].into_iter().enumerate() {
+            two_keys
+                .insert_row(
+                    vec![SqliteValue::Integer(key.0), SqliteValue::Integer(key.1)],
+                    vec![u8::try_from(index).unwrap()],
+                )
+                .expect("insert should succeed");
+        }
+        assert!(!SorterCursor::sort_rows_by_single_integer_key(
+            two_keys.key_columns,
+            &two_keys.sort_key_orders,
+            &mut two_keys.rows,
+        ));
+        two_keys.sort().expect("sort should succeed");
+        assert_eq!(insertion_order(&two_keys), vec![2, 1, 0]);
     }
 
     #[test]
