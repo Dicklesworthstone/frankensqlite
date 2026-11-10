@@ -660,7 +660,7 @@ Each cursor maintains a stack of `(page_number, cell_index)` pairs representing 
 
 Deleted pages go onto a freelist rather than being returned to the OS. The freelist is structured as trunk pages, each containing up to `(usable_page_size / 4) - 2` leaf page numbers. In the current non-concurrent allocation path, when no other local transaction is active, allocation draws from the committed freelist first. In default file-backed concurrent transactions, when the transaction is the sole active local transaction and its snapshot is current, allocation reuses committed free pages at or below the current database size. Freelist reuse under sustained concurrent overlap is regression-kept: `page_count` growth stays bounded under racing writer churn (the unbounded-EOF-growth defect tracked in [#302](https://github.com/Dicklesworthstone/frankensqlite/issues/302) is fixed). `VACUUM` rebuilds the database and can reclaim space, but the current insertion-based builder can retain pages freed during its own construction or leave trailing pages, and page 1 of the rebuilt image may report a zero `freelist_count` that disagrees with the freelist actually present. The result is a valid, integrity-checkable database; the current builder does not promise a zero-freelist, header-consistent, or fixed-point compact image ([#301](https://github.com/Dicklesworthstone/frankensqlite/issues/301)).
 
-`PRAGMA auto_vacuum=FULL` and `INCREMENTAL` are not supported as durable settings. The mode currently changes connection-local readback only and returns to `NONE` after reopen; FrankenSQLite does not yet write the pointer-map pages required to enable either mode safely ([#265](https://github.com/Dicklesworthstone/frankensqlite/issues/265)).
+`PRAGMA auto_vacuum=FULL` and `INCREMENTAL` are not supported as durable settings. The mode currently changes connection-local readback only and returns to `NONE` after reopen; FrankenSQLite does not yet write the pointer-map pages required to enable either mode safely ([#265](https://github.com/Dicklesworthstone/frankensqlite/issues/265)). An existing database that stock SQLite created with auto-vacuum enabled opens and reads normally, but every write to it fails with a "not implemented" error naming `auto_vacuum`: writing it without maintaining its pointer map would corrupt it for stock SQLite (bd-1q134, bd-w4pr1.1). To make such a file writable, run `PRAGMA auto_vacuum = NONE; VACUUM;` on it with stock `sqlite3`.
 
 ---
 
@@ -1493,7 +1493,7 @@ bounded backoff appropriate to their runtime between transient retries.
 surface. Any intentional divergence MUST be explicitly documented and
 annotated in the harness with rationale. In practice the differential oracle
 used throughout the test suite is the SQLite bundled with `rusqlite`
-(`libsqlite3-sys` 0.38.2, SQLite 3.53.2), and where 3.52 and 3.53 behave
+(`libsqlite3-sys` 0.39.1, SQLite 3.54.1 since 2026-11-10; 3.53.2 before), and where 3.52 and 3.53 behave
 differently the engine follows 3.53 (for example 5e1d39431, subquery `ORDER BY`
 resolving outer columns). Most parity evidence lives in the integration tests
 under `crates/fsqlite-core/tests/`, `crates/fsqlite-e2e/tests/` and
@@ -3242,7 +3242,7 @@ A: SQLite's C codebase is well-engineered but carries 24 years of accumulated co
 **Q: What's the conformance target?**
 A: **100% behavioral parity target** with C SQLite 3.52.0 for the supported
 surface, measured by differential integration tests that run the same SQL
-against FrankenSQLite and the SQLite 3.53.2 bundled with `rusqlite` (see
+against FrankenSQLite and the SQLite 3.54.1 bundled with `rusqlite` (see
 Conformance Target). Any intentional divergence is documented and annotated
 with rationale. The canonical contract file is `docs/contracts/sqlite_version_contract.toml`,
 and the corresponding scope document is `docs/canonical_parity_contract.md`.

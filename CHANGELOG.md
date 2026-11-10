@@ -57,6 +57,32 @@ Scope window: [v0.3.7](https://github.com/Dicklesworthstone/frankensqlite/releas
 
 ---
 
+## [Unreleased]
+
+### Data integrity
+
+- Writing to a database that stock SQLite created with `auto_vacuum` FULL or INCREMENTAL corrupted
+  its pointer-map pages: FrankenSQLite's own `integrity_check` said `ok`, stock SQLite reported
+  `Failed to read ptrmap key`. Every write to such a file now fails with a "not implemented"
+  error naming `auto_vacuum` (reads are unaffected) until pointer maps are maintained (bd-1q134).
+  To make such a file writable, run `PRAGMA auto_vacuum = NONE; VACUUM;` on it with stock
+  `sqlite3` (bd-w4pr1.1).
+- `||` with a BLOB operand replaced the BLOB's non-UTF-8 bytes with U+FFFD: `x'00ff' || x'aa'`
+  produced `00 EF BF BD EF BF BD` instead of `00 FF AA`, and such values were stored that way.
+  Concatenation now keeps every byte, as stock does (bd-w4pr1.2).
+- The same lossy conversion affected `replace`, `trim`/`ltrim`/`rtrim`, `upper`/`lower`,
+  `concat`, `concat_ws`, `quote`, `group_concat`/`string_agg` and the window `group_concat`:
+  `replace(x'41FF42', 'A', 'Z')` returned `5A EF BF BD 42` instead of `5A FF 42`. They now
+  keep BLOB and non-UTF-8 TEXT bytes. `printf`/`format` `%s` still decode lossily
+  (bd-w4pr1.18).
+
+### Dependencies
+
+- The differential oracle moved to the SQLite 3.54.1 bundled with `rusqlite` 0.41.1
+  (`libsqlite3-sys` 0.39.1; previously 3.53.2). Also `parking_lot` 0.13, `lru` 0.19, `ftui` 0.10,
+  `jsonschema` 0.61 and a compatible-range lockfile refresh. The `wasm-bindgen` family stays at
+  0.2.128: 0.4.80 of `wasm-bindgen-futures` would add `tokio` to `Cargo.lock` (bd-w4pr1.3).
+
 ## [0.4.13] -- 2026-11-01 (GitHub Release)
 
 Compare: <https://github.com/Dicklesworthstone/frankensqlite/compare/v0.4.12...v0.4.13>
