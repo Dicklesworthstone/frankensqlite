@@ -12162,6 +12162,10 @@ struct Stat1Row {
 struct SavepointEntry {
     name: String,
     snapshot: DbSnapshot,
+    /// Pending FK obligations belong to the saved row image. Keep the full
+    /// queue: a successful FK recheck can drain it before a retriable pager
+    /// COMMIT failure, so its length alone cannot restore the earlier state.
+    deferred_fk_checks: Vec<(String, Vec<SqliteValue>)>,
     /// Concurrent savepoint state (MVCC mode only).
     concurrent_snapshot: Option<ConcurrentSavepoint>,
     /// bd-gh-147 (GH #147): the shared rowid allocator's per-session state at
@@ -78652,7 +78656,7 @@ impl Connection {
         self.discard_cached_vdbe_engine();
         self.clear_prepared_direct_insert_append_hint();
         if let Some(ref sp_name) = rb.to_savepoint {
-            let (idx, snap, canonical_name, concurrent_snap, rowid_alloc_mark) = {
+            let (idx, snap, deferred_fk_checks, canonical_name, concurrent_snap, rowid_alloc_mark) = {
                 let savepoints = self.savepoints.borrow();
                 let idx = savepoints
                     .iter()
@@ -78664,6 +78668,7 @@ impl Connection {
                 (
                     idx,
                     entry.snapshot.clone(),
+                    entry.deferred_fk_checks.clone(),
                     entry.name.clone(),
                     entry.concurrent_snapshot.clone(),
                     entry.rowid_alloc_mark.clone(),
@@ -78801,6 +78806,11 @@ impl Connection {
                     )
                     .await);
             }
+            // Restore the obligations with the row image. Keeping checks for
+            // rolled-back inserts poisons a later COMMIT when the child has
+            // no declared key, while clearing the entire queue would discard
+            // genuine violations that predate this savepoint.
+            *self.deferred_fk_checks.borrow_mut() = deferred_fk_checks;
             // bd-gh-147 (GH #147): reclaim this session's contiguous rowid
             // reservations made after the savepoint so AUTOINCREMENT restarts at
             // the pre-rollback value (matching stock), while any range a
@@ -79182,6 +79192,7 @@ impl Connection {
         self.savepoints.borrow_mut().push(SavepointEntry {
             name: name.to_owned(),
             snapshot: self.snapshot(),
+            deferred_fk_checks: self.deferred_fk_checks.borrow().clone(),
             concurrent_snapshot,
             rowid_alloc_mark,
         });

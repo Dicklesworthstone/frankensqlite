@@ -25,10 +25,11 @@
 //! `exists`, column and parameter metadata), `Rows`/`Row` with [`FromSql`]
 //! by index or column name, positional and named parameters ([`params!`],
 //! [`named_params!`], arrays, tuples, slices, [`params_from_iter`]),
-//! transactions with [`TransactionBehavior`] and [`DropBehavior`], pragmas,
+//! transactions and nested [`Savepoint`]s with [`TransactionBehavior`] and
+//! [`DropBehavior`], pragmas,
 //! `busy_timeout`, `changes`, `last_insert_rowid`, [`OptionalExtension`], and
 //! an [`Error`] whose variants and [`ErrorCode`]s match rusqlite's. Not yet:
-//! user-defined functions, savepoint objects, online backup, blob I/O, hooks,
+//! user-defined functions, online backup, blob I/O, hooks,
 //! and the `chrono`/`uuid`/`serde_json` conversions.
 
 use std::cell::RefCell;
@@ -1376,6 +1377,17 @@ impl Connection {
         Transaction::new_unchecked(self, TransactionBehavior::Deferred)
     }
 
+    /// Begin a savepoint, opening a transaction if necessary. Dropping it
+    /// rolls back its changes; [`Savepoint::commit`] releases it instead.
+    pub fn savepoint(&mut self) -> Result<Savepoint<'_>> {
+        Savepoint::new(self)
+    }
+
+    /// Begin a savepoint with a safely quoted, caller-provided name.
+    pub fn savepoint_with_name<T: Into<String>>(&mut self, name: T) -> Result<Savepoint<'_>> {
+        Savepoint::with_name(self, name)
+    }
+
     /// Set the busy timeout (`PRAGMA busy_timeout`).
     pub fn busy_timeout(&self, timeout: Duration) -> Result<()> {
         let millis = timeout.as_millis().min(i32::MAX as u128);
@@ -1776,7 +1788,7 @@ pub enum TransactionBehavior {
     Exclusive,
 }
 
-/// What an unfinished [`Transaction`] does when dropped.
+/// What an unfinished [`Transaction`] or [`Savepoint`] does when dropped.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DropBehavior {
@@ -1822,6 +1834,16 @@ impl<'conn> Transaction<'conn> {
         })
     }
 
+    /// Begin a nested scope that rolls back independently of this transaction.
+    pub fn savepoint(&mut self) -> Result<Savepoint<'_>> {
+        Savepoint::begin(self.conn, "_fsqlite_sp".to_owned())
+    }
+
+    /// Begin a nested scope with a caller-provided savepoint name.
+    pub fn savepoint_with_name<T: Into<String>>(&mut self, name: T) -> Result<Savepoint<'_>> {
+        Savepoint::begin(self.conn, name.into())
+    }
+
     #[must_use]
     pub const fn drop_behavior(&self) -> DropBehavior {
         self.drop_behavior
@@ -1832,13 +1854,18 @@ impl<'conn> Transaction<'conn> {
     }
 
     pub fn commit(mut self) -> Result<()> {
+        // A failed COMMIT (for example, a deferred foreign-key violation)
+        // leaves the SQL transaction open. Keep its drop policy armed until
+        // the engine accepts the commit, as rusqlite does.
+        self.conn.execute_batch("COMMIT")?;
         self.finished = true;
-        self.conn.execute_batch("COMMIT")
+        Ok(())
     }
 
     pub fn rollback(mut self) -> Result<()> {
+        self.conn.execute_batch("ROLLBACK")?;
         self.finished = true;
-        self.conn.execute_batch("ROLLBACK")
+        Ok(())
     }
 
     /// End the transaction the way dropping it would, reporting a failure.
@@ -1873,6 +1900,137 @@ impl Deref for Transaction<'_> {
 }
 
 impl Drop for Transaction<'_> {
+    fn drop(&mut self) {
+        let _ = self.finish_by_drop_behavior();
+    }
+}
+
+/// A nested transaction scope that dereferences to its [`Connection`].
+///
+/// Dropping a savepoint rolls back its work and releases the savepoint, leaving
+/// an enclosing transaction intact. [`commit`](Self::commit) releases the
+/// scope without undoing its changes. Only releasing the outermost savepoint
+/// that opened a transaction commits that transaction to the database.
+///
+/// Unlike [`Transaction::rollback`], [`rollback`](Self::rollback) borrows the
+/// savepoint and leaves it active, so callers can retry work within the scope.
+pub struct Savepoint<'conn> {
+    conn: &'conn Connection,
+    name: String,
+    drop_behavior: DropBehavior,
+    finished: bool,
+}
+
+impl fmt::Debug for Savepoint<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Savepoint")
+            .field("name", &self.name)
+            .field("drop_behavior", &self.drop_behavior)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'conn> Savepoint<'conn> {
+    fn begin(conn: &'conn Connection, name: String) -> Result<Self> {
+        conn.execute_batch(&format!("SAVEPOINT {}", quote_identifier(&name)))?;
+        Ok(Self {
+            conn,
+            name,
+            drop_behavior: DropBehavior::Rollback,
+            finished: false,
+        })
+    }
+
+    /// Begin a savepoint on `conn`. The mutable borrow prevents its parent
+    /// from being ended while this scope is still in use.
+    pub fn new(conn: &'conn mut Connection) -> Result<Self> {
+        Self::begin(conn, "_fsqlite_sp".to_owned())
+    }
+
+    /// Begin a savepoint with a safely quoted, caller-provided name.
+    pub fn with_name<T: Into<String>>(conn: &'conn mut Connection, name: T) -> Result<Self> {
+        Self::begin(conn, name.into())
+    }
+
+    /// Begin another savepoint inside this one.
+    pub fn savepoint(&mut self) -> Result<Savepoint<'_>> {
+        Self::begin(self.conn, "_fsqlite_sp".to_owned())
+    }
+
+    /// Begin a named savepoint inside this one.
+    pub fn savepoint_with_name<T: Into<String>>(&mut self, name: T) -> Result<Savepoint<'_>> {
+        Self::begin(self.conn, name.into())
+    }
+
+    #[must_use]
+    pub const fn drop_behavior(&self) -> DropBehavior {
+        self.drop_behavior
+    }
+
+    pub const fn set_drop_behavior(&mut self, drop_behavior: DropBehavior) {
+        self.drop_behavior = drop_behavior;
+    }
+
+    /// Release this savepoint, preserving its changes in the parent scope.
+    /// On failure its configured drop policy still applies.
+    pub fn commit(mut self) -> Result<()> {
+        self.release()
+    }
+
+    fn release(&mut self) -> Result<()> {
+        self.conn
+            .execute_batch(&format!("RELEASE {}", quote_identifier(&self.name)))?;
+        self.finished = true;
+        Ok(())
+    }
+
+    /// Undo work since this savepoint began without releasing it. Further
+    /// statements, repeated rollbacks, and a later commit remain valid.
+    pub fn rollback(&mut self) -> Result<()> {
+        self.conn
+            .execute_batch(&format!("ROLLBACK TO {}", quote_identifier(&self.name)))
+    }
+
+    /// Apply the drop policy now, reporting any cleanup failure.
+    pub fn finish(mut self) -> Result<()> {
+        self.finish_by_drop_behavior()
+    }
+
+    fn finish_by_drop_behavior(&mut self) -> Result<()> {
+        if self.finished {
+            return Ok(());
+        }
+        match self.drop_behavior {
+            DropBehavior::Commit => self.release().or_else(|_| {
+                self.rollback()?;
+                self.release()
+            }),
+            DropBehavior::Rollback => {
+                self.rollback()?;
+                self.release()
+            }
+            DropBehavior::Ignore => {
+                self.finished = true;
+                Ok(())
+            }
+            DropBehavior::Panic => {
+                // finish() also runs Drop during unwinding; do not panic twice.
+                self.finished = true;
+                panic!("Savepoint dropped unexpectedly.")
+            }
+        }
+    }
+}
+
+impl Deref for Savepoint<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        self.conn
+    }
+}
+
+impl Drop for Savepoint<'_> {
     fn drop(&mut self) {
         let _ = self.finish_by_drop_behavior();
     }
@@ -2261,6 +2419,293 @@ mod tests {
             .query_row("SELECT count(*) FROM t", [], |row| row.get(0))
             .unwrap();
         assert_eq!(rows, 1, "the uncommitted row must not survive the drop");
+    }
+
+    /// Compile the same nesting and migration-style rollback code against
+    /// both APIs, then compare all intermediate rows and transaction states.
+    #[test]
+    fn savepoint_scopes_match_rusqlite() {
+        macro_rules! savepoint_scenario {
+            ($m:ident, $path:expr) => {{
+                fn snapshot(conn: &$m::Connection) -> (bool, Vec<i64>) {
+                    let values = conn
+                        .prepare("SELECT id FROM item ORDER BY id")
+                        .unwrap()
+                        .query_map([], |row| row.get(0))
+                        .unwrap()
+                        .collect::<$m::Result<Vec<_>>>()
+                        .unwrap();
+                    (conn.is_autocommit(), values)
+                }
+                let mut conn = $m::Connection::open($path).unwrap();
+                conn.execute_batch(
+                    "CREATE TABLE item(id INTEGER PRIMARY KEY); INSERT INTO item VALUES (0);",
+                )
+                .unwrap();
+                let mut trace = Vec::new();
+                {
+                    let mut tx = conn.transaction().unwrap();
+                    tx.execute("INSERT INTO item VALUES (1)", []).unwrap();
+                    {
+                        let mut outer = tx.savepoint().unwrap();
+                        assert_eq!(outer.drop_behavior(), $m::DropBehavior::Rollback);
+                        outer.execute("INSERT INTO item VALUES (2)", []).unwrap();
+                        {
+                            let inner = outer.savepoint().unwrap();
+                            inner.execute("INSERT INTO item VALUES (3)", []).unwrap();
+                            inner.commit().unwrap();
+                        }
+                        trace.push(snapshot(&outer));
+                        outer.rollback().unwrap();
+                        trace.push(snapshot(&outer));
+                        outer.execute("INSERT INTO item VALUES (4)", []).unwrap();
+                        outer.rollback().unwrap();
+                        trace.push(snapshot(&outer));
+                        outer.execute("INSERT INTO item VALUES (5)", []).unwrap();
+                        {
+                            let mut named = outer.savepoint_with_name("same name").unwrap();
+                            named.execute("INSERT INTO item VALUES (6)", []).unwrap();
+                            {
+                                let nested = named.savepoint_with_name("same name").unwrap();
+                                nested.execute("INSERT INTO item VALUES (7)", []).unwrap();
+                                // Only the most recent savepoint with this name rolls back.
+                            }
+                            trace.push(snapshot(&named));
+                            named.commit().unwrap();
+                        }
+                        outer.commit().unwrap();
+                    }
+                    trace.push(snapshot(&tx));
+                    tx.rollback().unwrap();
+                }
+                trace.push(snapshot(&conn));
+                {
+                    let sp = conn
+                        .savepoint_with_name("migration\"; DROP TABLE item; --")
+                        .unwrap();
+                    sp.execute("INSERT INTO item VALUES (10)", []).unwrap();
+                    sp.commit().unwrap();
+                }
+                trace.push(snapshot(&conn));
+                {
+                    let sp = conn.savepoint().unwrap();
+                    sp.execute("INSERT INTO item VALUES (11)", []).unwrap();
+                }
+                trace.push(snapshot(&conn));
+                {
+                    let mut sp = $m::Savepoint::new(&mut conn).unwrap();
+                    sp.execute("INSERT INTO item VALUES (12)", []).unwrap();
+                    sp.set_drop_behavior($m::DropBehavior::Commit);
+                    sp.finish().unwrap();
+                }
+                trace.push(snapshot(&conn));
+                {
+                    let mut sp = $m::Savepoint::with_name(&mut conn, "manual").unwrap();
+                    sp.execute("INSERT INTO item VALUES (13)", []).unwrap();
+                    sp.set_drop_behavior($m::DropBehavior::Ignore);
+                    sp.finish().unwrap();
+                }
+                trace.push(snapshot(&conn));
+                conn.execute_batch("ROLLBACK TO manual; RELEASE manual")
+                    .unwrap();
+                trace.push(snapshot(&conn));
+                {
+                    let mut outer = conn.savepoint().unwrap();
+                    outer.execute("INSERT INTO item VALUES (14)", []).unwrap();
+                    let inner = outer.savepoint().unwrap();
+                    inner.execute("INSERT INTO item VALUES (15)", []).unwrap();
+                    inner.commit().unwrap();
+                    // A released child is still undone when its parent rolls back.
+                }
+                trace.push(snapshot(&conn));
+                {
+                    let mut tx = conn.transaction().unwrap();
+                    let sp = tx.savepoint_with_name("migration step").unwrap();
+                    sp.execute("INSERT INTO item VALUES (16)", []).unwrap();
+                    sp.finish().unwrap();
+                    tx.commit().unwrap();
+                }
+                trace.push(snapshot(&conn));
+                conn.close().map_err(|(_, error)| error).unwrap();
+                trace
+            }};
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        for file_backed in [false, true] {
+            let theirs = savepoint_scenario!(
+                stock,
+                if file_backed {
+                    temp_path(&dir, "savepoints-stock.db")
+                } else {
+                    ":memory:".to_owned()
+                }
+            );
+            let mine = savepoint_scenario!(
+                ours,
+                if file_backed {
+                    temp_path(&dir, "savepoints-fsqlite.db")
+                } else {
+                    ":memory:".to_owned()
+                }
+            );
+            assert_eq!(mine, theirs, "file_backed={file_backed}");
+            assert_eq!(mine.last(), Some(&(true, vec![0, 10, 12])));
+        }
+        // Reopen through stock SQLite to verify that outer releases persist
+        // only the surviving rows and leave a usable, valid database file.
+        let conn = rusqlite::Connection::open(temp_path(&dir, "savepoints-fsqlite.db")).unwrap();
+        let rows: Vec<i64> = conn
+            .prepare("SELECT id FROM item ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(rows, [0, 10, 12]);
+        assert_eq!(
+            conn.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+    }
+
+    #[test]
+    fn failed_savepoint_release_cleans_up_like_rusqlite() {
+        macro_rules! failed_release {
+            ($m:ident, $path:expr) => {{
+                let mut conn = $m::Connection::open($path).unwrap();
+                conn.execute_batch(
+                    "PRAGMA foreign_keys = ON;
+                     CREATE TABLE parent(id INTEGER PRIMARY KEY);
+                     CREATE TABLE child(pid REFERENCES parent(id)
+                         DEFERRABLE INITIALLY DEFERRED);",
+                )
+                .unwrap();
+                let sp = conn.savepoint().unwrap();
+                sp.execute("INSERT INTO child VALUES (99)", []).unwrap();
+                let error = sp.commit().unwrap_err();
+                let after_error = (
+                    error.sqlite_error().unwrap().extended_code,
+                    conn.is_autocommit(),
+                    conn.query_row("SELECT count(*) FROM child", [], |row| row.get::<_, i64>(0))
+                        .unwrap(),
+                );
+                // Releasing a nested savepoint must defer the FK check until
+                // the enclosing transaction commits, allowing it to repair it.
+                let mut tx = conn.transaction().unwrap();
+                let sp = tx.savepoint().unwrap();
+                sp.execute("INSERT INTO child VALUES (1)", []).unwrap();
+                sp.commit().unwrap();
+                tx.execute("INSERT INTO parent VALUES (1)", []).unwrap();
+                tx.commit().unwrap();
+                (
+                    after_error,
+                    conn.query_row("SELECT count(*) FROM child", [], |row| row.get::<_, i64>(0))
+                        .unwrap(),
+                )
+            }};
+        }
+        let dir = tempfile::tempdir().unwrap();
+        for file_backed in [false, true] {
+            let theirs = failed_release!(
+                stock,
+                if file_backed {
+                    temp_path(&dir, "failed-release-stock.db")
+                } else {
+                    ":memory:".to_owned()
+                }
+            );
+            let mine = failed_release!(
+                ours,
+                if file_backed {
+                    temp_path(&dir, "failed-release-fsqlite.db")
+                } else {
+                    ":memory:".to_owned()
+                }
+            );
+            assert_eq!(theirs, ((787, true, 0), 1));
+            assert_eq!(mine, theirs, "file_backed={file_backed}");
+        }
+    }
+
+    /// A failed COMMIT consumes the Rust transaction, but SQLite leaves the
+    /// SQL transaction open. Its drop policy must still clean up that work.
+    #[test]
+    fn failed_transaction_commit_obeys_drop_policy() {
+        macro_rules! failed_commit {
+            ($m:ident, $path:expr) => {{
+                let mut conn = $m::Connection::open($path).unwrap();
+                conn.execute_batch(
+                    "PRAGMA foreign_keys = ON;
+                     CREATE TABLE parent(id INTEGER PRIMARY KEY);
+                     CREATE TABLE child(pid REFERENCES parent(id)
+                         DEFERRABLE INITIALLY DEFERRED);
+                     INSERT INTO parent VALUES (1);
+                     INSERT INTO child VALUES (1);",
+                )
+                .unwrap();
+                let mut trace = Vec::new();
+                for behavior in [
+                    $m::DropBehavior::Rollback,
+                    $m::DropBehavior::Commit,
+                    $m::DropBehavior::Ignore,
+                ] {
+                    let mut tx = conn.transaction().unwrap();
+                    tx.set_drop_behavior(behavior);
+                    tx.execute("INSERT INTO child VALUES (99)", []).unwrap();
+                    let error = tx.commit().unwrap_err();
+                    let rows: i64 = conn
+                        .query_row("SELECT count(*) FROM child", [], |row| row.get(0))
+                        .unwrap();
+                    trace.push((
+                        error.sqlite_error().unwrap().extended_code,
+                        conn.is_autocommit(),
+                        rows,
+                    ));
+                    if !conn.is_autocommit() {
+                        conn.execute_batch("ROLLBACK").unwrap();
+                    }
+                    // A failed commit must not strand the connection: the
+                    // next valid transaction can both begin and commit.
+                    let tx = conn.transaction().unwrap();
+                    tx.execute("INSERT INTO parent VALUES (2)", []).unwrap();
+                    tx.execute("INSERT INTO child VALUES (2)", []).unwrap();
+                    tx.commit().unwrap();
+                    conn.execute_batch(
+                        "DELETE FROM child WHERE pid = 2; DELETE FROM parent WHERE id = 2;",
+                    )
+                    .unwrap();
+                }
+                trace
+            }};
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        for file_backed in [false, true] {
+            let theirs = failed_commit!(
+                stock,
+                if file_backed {
+                    temp_path(&dir, "failed-commit-stock.db")
+                } else {
+                    ":memory:".to_owned()
+                }
+            );
+            let mine = failed_commit!(
+                ours,
+                if file_backed {
+                    temp_path(&dir, "failed-commit-fsqlite.db")
+                } else {
+                    ":memory:".to_owned()
+                }
+            );
+            assert_eq!(
+                theirs,
+                [(787, true, 1), (787, true, 1), (787, false, 2)],
+                "stock must distinguish cleanup from an explicit Ignore policy"
+            );
+            assert_eq!(mine, theirs, "file_backed={file_backed}");
+        }
     }
 
     /// `u64`/`usize` convert with range checks (rusqlite has them only behind

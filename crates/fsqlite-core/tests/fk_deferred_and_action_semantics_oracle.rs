@@ -314,6 +314,76 @@ fn deferred_no_action_parent_update_rechecks_after_failed_commit_and_child_repai
 }
 
 #[test]
+fn deferred_fk_savepoint_rollback_preserves_only_surviving_obligations() {
+    asupersync::test_utils::run_test(|| async {
+        for file_backed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("deferred-savepoint.db");
+            let conn = Connection::open(if file_backed {
+                path.to_str().unwrap()
+            } else {
+                ":memory:"
+            })
+            .await
+            .unwrap();
+            let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+            // This child deliberately has no declared primary key: commit
+            // validation cannot infer that a queued row was rolled back by
+            // looking it up through a named identity.
+            for sql in [
+                "PRAGMA foreign_keys = ON",
+                "CREATE TABLE parent(id INTEGER PRIMARY KEY)",
+                "CREATE TABLE child(pid INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED)",
+                "BEGIN",
+                "INSERT INTO child VALUES (1)",
+                "SAVEPOINT repeated",
+                "INSERT INTO child VALUES (2)",
+                "SAVEPOINT repeated",
+                "INSERT INTO child VALUES (3)",
+                "ROLLBACK TO repeated",
+                "RELEASE repeated",
+                "ROLLBACK TO repeated",
+                "INSERT INTO child VALUES (4)",
+                "ROLLBACK TO repeated",
+                "RELEASE repeated",
+            ] {
+                conn.execute(sql)
+                    .await
+                    .unwrap_or_else(|error| panic!("file_backed={file_backed}: {sql}: {error}"));
+                sqlite.execute_batch(sql).unwrap();
+            }
+            let expected = sqlite.execute_batch("COMMIT").unwrap_err();
+            let actual = conn
+                .execute("COMMIT")
+                .await
+                .expect_err("the obligation predating the savepoint must survive rollback");
+            assert_eq!(
+                actual.extended_error_code(),
+                expected.sqlite_error().unwrap().extended_code,
+                "file_backed={file_backed}"
+            );
+            assert!(conn.in_transaction());
+            assert!(!sqlite.is_autocommit());
+            for sql in ["INSERT INTO parent VALUES (1)", "COMMIT"] {
+                conn.execute(sql)
+                    .await
+                    .unwrap_or_else(|error| panic!("file_backed={file_backed}: {sql}: {error}"));
+                sqlite.execute_batch(sql).unwrap();
+            }
+            assert!(!conn.in_transaction());
+            let expected: i64 = sqlite
+                .query_row("SELECT pid FROM child", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                rows_as_values(&conn.query("SELECT pid FROM child").await.unwrap()),
+                vec![vec![SqliteValue::Integer(expected)]]
+            );
+            conn.close().await.unwrap();
+        }
+    });
+}
+
+#[test]
 fn deferred_parent_action_obligation_rolls_back_with_named_and_statement_savepoints() {
     asupersync::test_utils::run_test(|| async {
         let conn = Connection::open(":memory:").await.unwrap();
