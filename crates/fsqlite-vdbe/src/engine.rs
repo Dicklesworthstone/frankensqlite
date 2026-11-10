@@ -4353,6 +4353,17 @@ impl CursorBackend {
         }
     }
 
+    /// [`Self::next`] without waiting, for a step that stays on the current
+    /// leaf page. `None` means the cursor is untouched and `next` must run.
+    #[inline]
+    fn try_next_within_leaf(&mut self, cx: &Cx) -> Result<Option<bool>> {
+        match self {
+            Self::Mem(c) => c.try_advance_next_within_leaf(cx),
+            Self::Txn(c) => c.try_advance_next_within_leaf(cx),
+            Self::TimeTravel(c) => c.try_advance_next_within_leaf(cx),
+        }
+    }
+
     /// bd-wwqen.1: Count all rows by walking leaf page headers without
     /// decoding cell payloads. Much cheaper than first()/while next().
     async fn count_all_rows(&mut self, cx: &Cx) -> Result<i64> {
@@ -9900,15 +9911,17 @@ impl VdbeEngine {
             if self.trace_opcodes {
                 self.trace_opcode(pc, op);
             }
-            if self
-                .try_execute_hot_opcode(
-                    op,
-                    &mut pc,
-                    collect_vdbe_metrics,
-                    &mut row_handler,
-                    borrowed_bindings,
-                )
-                .await?
+            if self.try_execute_hot_opcode_sync(
+                op,
+                &mut pc,
+                collect_vdbe_metrics,
+                &mut row_handler,
+                borrowed_bindings,
+            )? {
+                continue;
+            }
+            if Self::hot_opcode_has_async_lane(op.opcode)
+                && self.try_execute_hot_opcode_async(op, &mut pc).await?
             {
                 continue;
             }
@@ -15236,8 +15249,20 @@ impl VdbeEngine {
     /// function-pointer dispatch because indirect branches inhibit inlining
     /// and usually lose to the compiler's jump-table lowering for a dense
     /// opcode enum.
-    #[inline(always)]
-    async fn try_execute_hot_opcode(
+    ///
+    /// This is a plain function on purpose. An `async fn` here costs every
+    /// opcode a future to build, poll and drop, and keeps the handlers out of
+    /// the loop's registers; on a table scan that protocol was roughly a third
+    /// of the run time. Opcodes that may wait for page I/O take their
+    /// synchronous step here when the data is already at hand and otherwise
+    /// return `Ok(false)` unchanged, so the loop can run them through
+    /// [`Self::try_execute_hot_opcode_async`].
+    ///
+    /// It is kept out of line: the caller is the statement future's poll
+    /// function, already the largest function in the engine, and a separate
+    /// frame keeps this match's operands in registers.
+    #[inline(never)]
+    fn try_execute_hot_opcode_sync(
         &mut self,
         op: &VdbeOp,
         pc: &mut usize,
@@ -15246,21 +15271,6 @@ impl VdbeEngine {
         borrowed_bindings: Option<&[SqliteValue]>,
     ) -> Result<bool> {
         match op.opcode {
-            Opcode::Column => {
-                self.execute_column_hot(op).await?;
-                *pc += 1;
-                Ok(true)
-            }
-            Opcode::ColumnSubstrPrefix => {
-                self.execute_column_substr_prefix_hot(op).await?;
-                *pc += 1;
-                Ok(true)
-            }
-            Opcode::ColumnOctetLength => {
-                self.execute_column_octet_length_hot(op).await?;
-                *pc += 1;
-                Ok(true)
-            }
             Opcode::ResultRow => {
                 self.execute_result_row_hot(op, collect_vdbe_metrics, row_handler)?;
                 *pc += 1;
@@ -15649,6 +15659,151 @@ impl VdbeEngine {
                 *pc += 1;
                 Ok(true)
             }
+            // IMPL-13: Fused `Integer(p1=lit, p2=reg) + ResultRow(p1=reg, p2=1)`.
+            // Emits a single-column result row whose only value is the literal
+            // integer `p1`, then clears the source register to mirror the
+            // drain semantics of `ResultRow` (`take_reg_range`).
+            //
+            // Correctness: byte-equivalent to the unfused sequence. The
+            // codegen-side peephole pass is responsible for verifying that
+            // the `ResultRow` consumes exactly the register written by the
+            // preceding `Integer` and emits exactly one column.
+            Opcode::FusedLiteralResultRow => {
+                let lit = i64::from(op.p1);
+                let reg = op.p2;
+                // Preserve Integer's write-then-ResultRow-drain side effects:
+                // the register ends up cleared after `take_reg_range`.
+                self.set_reg_int(reg, lit);
+
+                let should_retain_row = self.collect_result_rows
+                    && match self.max_collected_result_rows {
+                        Some(limit) => self.results.len() < limit,
+                        None => true,
+                    };
+                if row_handler.is_some() || should_retain_row {
+                    let materialize_start = collect_vdbe_metrics.then(Instant::now);
+                    // Single-column row: drain the register just like
+                    // `take_reg_range(reg, 1)` would.
+                    let mut row: smallvec::SmallVec<[SqliteValue; 16]> =
+                        smallvec::SmallVec::with_capacity(1);
+                    row.push(self.take_reg(reg));
+                    if collect_vdbe_metrics {
+                        if let Some(materialize_start) = materialize_start {
+                            FSQLITE_VDBE_RESULT_ROW_MATERIALIZATION_TIME_NS_TOTAL.fetch_add(
+                                u64::try_from(materialize_start.elapsed().as_nanos())
+                                    .unwrap_or(u64::MAX),
+                                AtomicOrdering::Relaxed,
+                            );
+                        }
+                        record_result_row_metrics(&row);
+                    }
+                    if let Some(handler) = row_handler.as_mut() {
+                        (*handler)(row)?;
+                    } else {
+                        self.results.push(retained_result_row(row));
+                    }
+                } else {
+                    // No retention: still drain the register to match the
+                    // unfused ResultRow's `discard_reg_range` behavior.
+                    let _ = self.take_reg(reg);
+                }
+                *pc += 1;
+                Ok(true)
+            }
+            Opcode::String8 => {
+                match &op.p4 {
+                    P4::Str(s) => self.write_text_to_reg(op.p2, s),
+                    _ => self.set_reg_fast(op.p2, SqliteValue::Text(SmallText::new(""))),
+                }
+                *pc += 1;
+                Ok(true)
+            }
+            Opcode::String => {
+                match &op.p4 {
+                    P4::Str(s) => self.write_text_to_reg(op.p2, s),
+                    _ => self.set_reg_fast(op.p2, SqliteValue::Text(SmallText::new(""))),
+                }
+                *pc += 1;
+                Ok(true)
+            }
+            Opcode::Real => {
+                let val = match &op.p4 {
+                    P4::Real(v) => *v,
+                    _ => 0.0,
+                };
+                self.set_reg_real(op.p2, val);
+                *pc += 1;
+                Ok(true)
+            }
+            Opcode::If => {
+                let val = self.get_reg(op.p1);
+                let should_jump = if val.is_null() {
+                    op.p3 != 0
+                } else {
+                    vdbe_real_is_truthy(val)
+                };
+                if should_jump {
+                    #[allow(clippy::cast_sign_loss)]
+                    {
+                        *pc = op.p2 as usize;
+                    }
+                } else {
+                    *pc += 1;
+                }
+                Ok(true)
+            }
+            Opcode::Next | Opcode::SorterNext => match self.next_hot_step(op.p1)? {
+                Some(has_next) => {
+                    Self::apply_next_jump(op, pc, has_next);
+                    Ok(true)
+                }
+                None => Ok(false),
+            },
+            _ => Ok(false),
+        }
+    }
+
+    /// Whether [`Self::try_execute_hot_opcode_async`] has an arm for `opcode`.
+    ///
+    /// The interpreter loop consults this before paying for the async call, so
+    /// the list must name exactly the arms of that function; its debug
+    /// assertions fail any test run where the two drift apart.
+    #[inline(always)]
+    const fn hot_opcode_has_async_lane(opcode: Opcode) -> bool {
+        matches!(
+            opcode,
+            Opcode::Column
+                | Opcode::ColumnSubstrPrefix
+                | Opcode::ColumnOctetLength
+                | Opcode::Rowid
+                | Opcode::IdxRowid
+                | Opcode::FusedAppendInsert
+                | Opcode::Next
+                | Opcode::SorterNext
+        )
+    }
+
+    /// Hot opcodes that can wait for page I/O, for the cases
+    /// [`Self::try_execute_hot_opcode_sync`] declined.
+    #[inline(always)]
+    async fn try_execute_hot_opcode_async(&mut self, op: &VdbeOp, pc: &mut usize) -> Result<bool> {
+        debug_assert!(Self::hot_opcode_has_async_lane(op.opcode));
+        match op.opcode {
+            Opcode::Column => {
+                self.execute_column_hot(op).await?;
+                *pc += 1;
+                Ok(true)
+            }
+            Opcode::ColumnSubstrPrefix => {
+                self.execute_column_substr_prefix_hot(op).await?;
+                *pc += 1;
+                Ok(true)
+            }
+            Opcode::ColumnOctetLength => {
+                self.execute_column_octet_length_hot(op).await?;
+                *pc += 1;
+                Ok(true)
+            }
             // Rowid extracts the rowid of the currently-positioned row on
             // cursor p1 into register p2.  Emitted at ~51 codegen sites
             // across fsqlite-vdbe/-planner/-core, driving every JOIN
@@ -15865,110 +16020,55 @@ impl VdbeEngine {
                 *pc += 1;
                 Ok(true)
             }
-            // IMPL-13: Fused `Integer(p1=lit, p2=reg) + ResultRow(p1=reg, p2=1)`.
-            // Emits a single-column result row whose only value is the literal
-            // integer `p1`, then clears the source register to mirror the
-            // drain semantics of `ResultRow` (`take_reg_range`).
-            //
-            // Correctness: byte-equivalent to the unfused sequence. The
-            // codegen-side peephole pass is responsible for verifying that
-            // the `ResultRow` consumes exactly the register written by the
-            // preceding `Integer` and emits exactly one column.
-            Opcode::FusedLiteralResultRow => {
-                let lit = i64::from(op.p1);
-                let reg = op.p2;
-                // Preserve Integer's write-then-ResultRow-drain side effects:
-                // the register ends up cleared after `take_reg_range`.
-                self.set_reg_int(reg, lit);
-
-                let should_retain_row = self.collect_result_rows
-                    && match self.max_collected_result_rows {
-                        Some(limit) => self.results.len() < limit,
-                        None => true,
-                    };
-                if row_handler.is_some() || should_retain_row {
-                    let materialize_start = collect_vdbe_metrics.then(Instant::now);
-                    // Single-column row: drain the register just like
-                    // `take_reg_range(reg, 1)` would.
-                    let mut row: smallvec::SmallVec<[SqliteValue; 16]> =
-                        smallvec::SmallVec::with_capacity(1);
-                    row.push(self.take_reg(reg));
-                    if collect_vdbe_metrics {
-                        if let Some(materialize_start) = materialize_start {
-                            FSQLITE_VDBE_RESULT_ROW_MATERIALIZATION_TIME_NS_TOTAL.fetch_add(
-                                u64::try_from(materialize_start.elapsed().as_nanos())
-                                    .unwrap_or(u64::MAX),
-                                AtomicOrdering::Relaxed,
-                            );
-                        }
-                        record_result_row_metrics(&row);
-                    }
-                    if let Some(handler) = row_handler.as_mut() {
-                        (*handler)(row)?;
-                    } else {
-                        self.results.push(retained_result_row(row));
-                    }
-                } else {
-                    // No retention: still drain the register to match the
-                    // unfused ResultRow's `discard_reg_range` behavior.
-                    let _ = self.take_reg(reg);
-                }
-                *pc += 1;
-                Ok(true)
-            }
-            Opcode::String8 => {
-                match &op.p4 {
-                    P4::Str(s) => self.write_text_to_reg(op.p2, s),
-                    _ => self.set_reg_fast(op.p2, SqliteValue::Text(SmallText::new(""))),
-                }
-                *pc += 1;
-                Ok(true)
-            }
-            Opcode::String => {
-                match &op.p4 {
-                    P4::Str(s) => self.write_text_to_reg(op.p2, s),
-                    _ => self.set_reg_fast(op.p2, SqliteValue::Text(SmallText::new(""))),
-                }
-                *pc += 1;
-                Ok(true)
-            }
-            Opcode::Real => {
-                let val = match &op.p4 {
-                    P4::Real(v) => *v,
-                    _ => 0.0,
-                };
-                self.set_reg_real(op.p2, val);
-                *pc += 1;
-                Ok(true)
-            }
-            Opcode::If => {
-                let val = self.get_reg(op.p1);
-                let should_jump = if val.is_null() {
-                    op.p3 != 0
-                } else {
-                    vdbe_real_is_truthy(val)
-                };
-                if should_jump {
-                    #[allow(clippy::cast_sign_loss)]
-                    {
-                        *pc = op.p2 as usize;
-                    }
-                } else {
-                    *pc += 1;
-                }
-                Ok(true)
-            }
             Opcode::Next | Opcode::SorterNext => {
                 self.execute_next_hot(op, pc).await?;
                 Ok(true)
             }
-            _ => Ok(false),
+            _ => {
+                debug_assert!(!Self::hot_opcode_has_async_lane(op.opcode));
+                Ok(false)
+            }
         }
     }
 
+    /// The jump half of `Next`: back to the loop top at `p2` while rows remain.
+    #[inline(always)]
+    fn apply_next_jump(op: &VdbeOp, pc: &mut usize, has_next: bool) {
+        if has_next {
+            #[allow(clippy::cast_sign_loss)]
+            {
+                *pc = op.p2 as usize;
+            }
+        } else {
+            *pc += 1;
+        }
+    }
+
+    /// `Next`/`SorterNext` once the synchronous step has declined: the
+    /// storage cursor is leaving its leaf page, which can wait for page I/O.
     #[inline(always)]
     async fn execute_next_hot(&mut self, op: &VdbeOp, pc: &mut usize) -> Result<()> {
         let cursor_id = op.p1;
+        let has_next = match self.next_hot_step(cursor_id)? {
+            Some(has_next) => has_next,
+            None => match self.storage_cursors.get_mut(&cursor_id) {
+                Some(cursor) => cursor.cursor.next(&cursor.cx).await?,
+                None => false,
+            },
+        };
+        Self::apply_next_jump(op, pc, has_next);
+        Ok(())
+    }
+
+    /// Advance cursor `cursor_id` by one row without waiting.
+    ///
+    /// Returns `Some(has_next)` for everything `Next`/`SorterNext` can do
+    /// without page I/O: a pending delete's implicit advance, sorters,
+    /// in-memory cursors, and a storage cursor stepping inside its current
+    /// leaf page. Returns `None`, having changed nothing, when a storage
+    /// cursor has to leave its leaf.
+    #[inline(always)]
+    fn next_hot_step(&mut self, cursor_id: i32) -> Result<Option<bool>> {
         let has_next = if !self.pending_next_after_delete.is_empty()
             && self.pending_next_after_delete.remove(&cursor_id)
         {
@@ -15999,7 +16099,10 @@ impl VdbeEngine {
                 false
             }
         } else if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
-            cursor.cursor.next(&cursor.cx).await?
+            match cursor.cursor.try_next_within_leaf(&cursor.cx)? {
+                Some(has_next) => has_next,
+                None => return Ok(None),
+            }
         } else if let Some(sorter) = self.sorters.get_mut(&cursor_id) {
             if let Some(pos) = sorter.position {
                 let next = pos + 1;
@@ -16039,15 +16142,7 @@ impl VdbeEngine {
         } else {
             false
         };
-        if has_next {
-            #[allow(clippy::cast_sign_loss)]
-            {
-                *pc = op.p2 as usize;
-            }
-        } else {
-            *pc += 1;
-        }
-        Ok(())
+        Ok(Some(has_next))
     }
 
     #[inline(always)]
@@ -27507,7 +27602,7 @@ mod tests {
 
     #[test]
     fn test_scopy_register_via_hot_path() {
-        // SCopy (shallow copy) lives in `try_execute_hot_opcode`: this test
+        // SCopy (shallow copy) lives in `try_execute_hot_opcode_sync`: this test
         // pins the hot-path arm to the same single-register `clone + write`
         // semantics as the main-match arm. Uses a heap-carrying Text so a
         // subsequent mutation of the destination can't alias the source.

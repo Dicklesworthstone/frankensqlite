@@ -5500,6 +5500,34 @@ impl<P: PageReader> BtCursor<P> {
         self.advance_next_impl(cx, true).await
     }
 
+    /// Synchronous fast path of [`BtreeCursorOps::next`]: step to the next
+    /// cell when it lives on the current leaf page.
+    ///
+    /// Returns `Ok(Some(true))` after advancing, and `Ok(None)` with the
+    /// cursor untouched whenever the general path is needed: end of the leaf,
+    /// end of the scan, or the before-first state. An in-leaf step does
+    /// exactly what `advance_next_impl` does for it — observe cancellation,
+    /// then bump the cell index. It enters no page, so there is no leaf
+    /// witness to record and no I/O to wait for.
+    pub fn try_advance_next_within_leaf(&mut self, cx: &Cx) -> Result<Option<bool>> {
+        if self.at_eof {
+            return Ok(None);
+        }
+        let Some(top) = self.stack.last_mut() else {
+            return Ok(None);
+        };
+        if !top.header.page_type.is_leaf() {
+            return Ok(None);
+        }
+        let next_idx = top.cell_idx + 1;
+        if next_idx >= top.header.cell_count {
+            return Ok(None);
+        }
+        observe_cursor_cancellation(cx)?;
+        top.cell_idx = next_idx;
+        Ok(Some(true))
+    }
+
     /// Move to the previous entry. Returns false if at the beginning.
     ///
     /// Forward-progress fix (frankensqlite#95, symmetric to `advance_next_impl`):
@@ -20080,6 +20108,75 @@ mod tests {
                     .all(|key| matches!(key, WitnessKey::Cell { .. })),
                 "advance_to must remain a point probe and avoid page witnesses"
             );
+        });
+    }
+
+    #[test]
+    fn test_try_advance_next_within_leaf_matches_next_and_declines_at_leaf_end() {
+        fn three_leaf_tree() -> MemPageStore {
+            let mut store = MemPageStore::new(USABLE);
+            store
+                .pages
+                .insert(2, build_interior_table(&[(pn(3), 7), (pn(4), 20)], pn(5)));
+            store
+                .pages
+                .insert(3, build_leaf_table(&[(1, b"a"), (4, b"b"), (7, b"c")]));
+            store.pages.insert(4, build_leaf_table(&[(20, b"d")]));
+            store
+                .pages
+                .insert(5, build_leaf_table(&[(30, b"e"), (31, b"f")]));
+            store
+        }
+
+        run_async(async {
+            let cx = Cx::new();
+            let mut reference = BtCursor::new(three_leaf_tree(), pn(2), USABLE, true);
+            let mut stepped = BtCursor::new(three_leaf_tree(), pn(2), USABLE, true);
+
+            // Before the first row there is no leaf to step within.
+            assert_eq!(stepped.try_advance_next_within_leaf(&cx).unwrap(), None);
+            assert!(stepped.position_stamp().is_none());
+
+            assert!(reference.first(&cx).await.unwrap());
+            assert!(stepped.first(&cx).await.unwrap());
+
+            let mut in_leaf_steps = 0;
+            let mut declined = 0;
+            loop {
+                assert_eq!(
+                    stepped.rowid(&cx).await.unwrap(),
+                    reference.rowid(&cx).await.unwrap()
+                );
+                assert_eq!(stepped.current_page(), reference.current_page());
+
+                let expected = reference.next(&cx).await.unwrap();
+                let before = stepped.position_stamp();
+                let has_next = match stepped.try_advance_next_within_leaf(&cx).unwrap() {
+                    Some(has_next) => {
+                        in_leaf_steps += 1;
+                        has_next
+                    }
+                    None => {
+                        // Declining must leave the cursor exactly where it was.
+                        assert_eq!(stepped.position_stamp(), before);
+                        assert!(!stepped.eof());
+                        declined += 1;
+                        stepped.next(&cx).await.unwrap()
+                    }
+                };
+                assert_eq!(has_next, expected);
+                if !has_next {
+                    break;
+                }
+            }
+
+            // Rows 1->4->7 and 30->31 stay on a leaf; every leaf end, and the
+            // end of the scan, goes back to `next`.
+            assert_eq!(in_leaf_steps, 3);
+            assert_eq!(declined, 3);
+            assert!(stepped.eof() && reference.eof());
+            assert_eq!(stepped.try_advance_next_within_leaf(&cx).unwrap(), None);
+            assert_eq!(stepped.witness_keys(), reference.witness_keys());
         });
     }
 
