@@ -1448,24 +1448,32 @@ impl<Caps: cap::SubsetOf<cap::All>> Cx<Caps> {
     #[doc(hidden)]
     #[must_use]
     pub fn published_cancel_requested(&self) -> bool {
-        if self.inner.cancel_requested.load(Ordering::Acquire) {
-            return true;
+        self.inner.cancel_requested.load(Ordering::Acquire)
+            || self.native_published_cancel_requested()
+    }
+
+    /// The attached (or else fallback) native context's published cancellation.
+    #[cfg(feature = "native")]
+    fn native_published_cancel_requested(&self) -> bool {
+        let attached = self
+            .inner
+            .attached_native_cx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(native) = attached.as_ref() {
+            return native.published_cancel_requested();
         }
-        #[cfg(feature = "native")]
-        {
-            let attached = self
-                .inner
-                .attached_native_cx
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(native) = attached.as_ref() {
-                return native.published_cancel_requested();
-            }
-            drop(attached);
-            if let Some(native) = self.inner.fallback_native_cx.get() {
-                return native.published_cancel_requested();
-            }
-        }
+        drop(attached);
+        self.inner
+            .fallback_native_cx
+            .get()
+            .is_some_and(|native| native.published_cancel_requested())
+    }
+
+    /// Without the native runtime there is no native context to consult.
+    #[cfg(not(feature = "native"))]
+    #[allow(clippy::unused_self)]
+    const fn native_published_cancel_requested(&self) -> bool {
         false
     }
 
