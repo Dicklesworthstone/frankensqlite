@@ -61637,9 +61637,6 @@ impl Connection {
             return;
         }
 
-        let mut mode = self
-            .checkpoint_schedule_override_mode()
-            .unwrap_or_else(|| Self::checkpoint_pick_auto_mode(&snapshot));
         // bd-2rsuf / bd-yoa57: enforce `PRAGMA journal_size_limit`. If the WAL
         // is already larger than the configured byte cap, promote this
         // checkpoint to `Truncate` so the WAL is reclaimed rather than left
@@ -61647,9 +61644,12 @@ impl Connection {
         // SQLite, which applies journal_size_limit when a checkpoint would
         // otherwise leave the WAL/journal file large. The estimate is
         // WAL_HEADER + frames * (page_size + WAL_FRAME_HEADER).
-        if journal_size_limit_exceeded {
-            mode = CheckpointMode::Truncate;
-        }
+        let mode = if journal_size_limit_exceeded {
+            CheckpointMode::Truncate
+        } else {
+            self.checkpoint_schedule_override_mode()
+                .unwrap_or_else(|| Self::checkpoint_pick_auto_mode(&snapshot))
+        };
         let cx = match self.op_cx() {
             // Like stock's PASSIVE autocheckpoint, this pass runs on the commit
             // path and must never wait on readers or writers: a busy or pinned

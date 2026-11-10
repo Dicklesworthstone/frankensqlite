@@ -334,7 +334,10 @@ impl Fixture {
         assert_eq!(reader.last_commit_frame_header(), expected_commit);
         assert_eq!(
             reader.running_checksum(),
-            expected_commit.map_or(self.writer.header().checksum, |(_, header)| header.checksum)
+            expected_commit.map_or_else(
+                || self.writer.header().checksum,
+                |(_, header)| header.checksum
+            )
         );
         assert_eq!(self.audit.mutations.load(Ordering::SeqCst), 0);
     }
