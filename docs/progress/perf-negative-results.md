@@ -12,6 +12,81 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-11-10 - INDEX: lever families for the scoreboard ladder (bd-w4pr1.25 / .26 / .27): what this ledger settles, and four verdicts that do not cover the file-backed rows
+
+This ledger has more than 650 entries. A lever on the ladder starts by grepping it; this entry is
+the map for that grep, made on 2026-11-10 by reading the 81 entries that bear on the scoreboard rows
+(`scripts/user_shape_scorecard.py`, `blocking_vs_rusqlite_bench`, `mt-mvcc-bench`). Line numbers
+drift, so entries are cited by date and title or bead id. It indexes; it does not replace the
+entries. Read the entry before relying on a line here.
+
+### Verdicts whose scope is narrower than their wording
+
+Do not cite these against file-backed, 1M-row or bytecode-loop work. They stay in the ledger as
+written; this is where their scope is recorded.
+
+- 2026-07-16 "MAP: accessible one-turn perf-lever space is EXHAUSTED", 2026-07-11 "CONVERGENCE
+  (storage lane): the per-statement execution hot paths are ALSO mature", 2026-07-11 "CONVERGENCE:
+  the ad-hoc query FRONT-END clean-lever search is harvested", and the "inherent per-row engine
+  cost" of the 2026-08-17 bd-hggxz NO-GO: built from code reading and phase timers. A sample profile
+  with line attribution (`perf annotate -l`) found about a quarter of a table scan in the per-opcode
+  async call protocol (WIN bd-w4pr1.13.1, below), and on text statements ~24k instructions of
+  semantic validation per SELECT that no phase timer had split out (bd-5310l). The bd-hggxz finding
+  that the facade crossing is 3.2 ns stands. From here on, a "nothing left" verdict names the sample
+  profile it rests on and the workload it was taken on.
+- 2026-07-23 "CONVERGENCE (no clean lever): ... irreducible MVCC transaction tax": measured on
+  `:memory:` small-N, where begin + commit cost 2.1 + 3.2 us. A file-backed autocommit INSERT costs
+  73 syscalls and ~560k user instructions against stock's 8 and ~22k (bd-ih8ak, 2026-11-10). That is
+  revalidation at transaction boundaries, which the 2026-07-23 bd-smxhz and bd-6hgad entries
+  themselves describe as overhead stock does not have.
+- 2026-07-24 "REJECT (frontier, code screen, no A/B needed): bulk-INSERT per-row path already
+  optimized; residual is inherent MVCC/COW": a code read of the prepared direct-insert lane, with no
+  profile. `INSERT ... SELECT` from a table-valued function does not run on that lane (23.9k
+  instructions per row against stock's 4.2k; bd-i3csr).
+- The May 2026 DML series and the "mutation operator" blockers (2026-05-10, 05-13, 05-15, 07-22):
+  prepared direct lanes at 5-500 rows (`direct_delete=500`, `vdbe_opcodes=0`). UPDATE / DELETE with
+  a non-key predicate over 300k rows runs in the bytecode row loop; evidence for those rows is a
+  profile of those rows (bd-52acl). The retry conditions on the direct-lane micro-levers stand.
+
+### Settled families and the retry condition that governs each
+
+| Family | Entries | Verdict | Retry condition (see the entry for the exact words) |
+|---|---|---|---|
+| Removing or adding single arms of `try_execute_hot_opcode` | 2026-05-23..25 (55 entries), 2026-07-16 `NotNull` | removal slower every time; one promotion mixed | a bytecode-executing workload, profile-attributed self time, original and candidate interleaved in one invocation (2026-07-10 LEDGER-INTEGRITY CORRECTION) |
+| Shrinking the statement future by boxing cold branches | 2026-08-11 bd-uzq54 | rejected | allocation-count and CPU-sample evidence that generator size is on the hot path |
+| Register file without Arc | 2026-08-17 bd-i9sov | NO-GO: atomics ~24 ns per row; infeasible in safe Rust | atomics above 10% of execute_body on a new shape and a safe design |
+| `block_on` batching, per-statement runtime entry | 2026-08-17 bd-hggxz, 2026-07-26, 2026-07-27 | crossing is 3.2 ns; 620-750 ns only for callers that enter a runtime per statement | none for batching; `fsqlite::blocking` stopped paying it 2026-11-10, the C API shim still does |
+| B-tree cell-parse micro-levers | 2026-05-20 | 4-6 ns per cell, no lever | not from a cold read; whole-workload attribution |
+| Narrow aggregate lanes (FastSumState, direct REAL accumulator, IntDivide) | 2026-05-05, 2026-05-06 | rejected, each helped one group size and hurt another | aggregate dispatch dominates a row and every group size improves; hash aggregation (bd-w4pr1.13.8) is a different change |
+| Thinning sorter rows | 2026-10-27 GH#504, 2026-05-06 | no measurable change (2026-10-27); the 2026-05-06 sweep was abandoned unmeasured | together with a change that removes per-row dispatch or decode cost |
+| GROUP BY by walking an index | 2026-07-13 | flat against the sorter in memory | a large on-disk table with a cold cache |
+| Widening the table page-run / bulk builders | 2026-05-06 (two), 2026-05-10, 2026-07-22 | rejected | each entry's own; none as a standalone patch |
+| DELETE / UPDATE direct-lane micro-levers | May 2026 series, 2026-07-22 BLOCKER | rejected | only as a transaction-level mutation set with the live cell-delta adapter |
+| One-entry prepared caches, exact BEGIN/COMMIT fast paths | 2026-05-05, 2026-05-07, 2026-05-09 (two) | rejected, absolute medians worse | with a broader prepare / transaction lifecycle change |
+| Planner-directive cache bypass | 2026-07-11 REJECT | correctness blocker | none without redesigning the cache-key contract |
+| Group commit | 2026-07-23 bd-6hgad | exists, never coalesces at `synchronous=NORMAL` | `FULL`/`EXTRA`, many small overlapping transactions, null-controlled A/B with CV under 5% |
+| Lock, wakeup and counter micro-levers on the commit path | 2026-05-06 (two), 2026-05-12 (two), 2026-08-17 bd-8euyp | rejected | each entry's own; none is the fixed per-commit cost |
+| Page I/O submission | 2026-08-12 bd-q8501.1, 2026-07-27 bd-trfah | multi-SQE io_uring 1.93x slower; a pool hop is ~14 us per single page | registered or borrowed buffers with batch completion; inline I/O only under the dedicated-thread marker |
+| S3-FIFO membership map | 2026-09-09 | rejected on a noisy matrix | after isolating statistics reconstruction from runtime eviction |
+| Path-identity probes | 2026-07-23 bd-smxhz | deliberate defence; one statx each since bd-qduu1 | probing less often needs the owner's sign-off |
+| Skipping the first-open migration pass | 2026-10-05 bd-6jf9o | reverted | a signal that proves no fsqlite build wrote the file, or a cheaper pass |
+| SIMD record encoding, `target-cpu` | 2026-07-10 (two) | blocked under `forbid(unsafe_code)`; comparison is fair at baseline ISA | a scope decision; a serialize-heavy row with profiled self time |
+| Dormant vectorized kernels | 2026-11-10 | not wireable as they stand | a new executor built stock-oracle first (bd-w4pr1.13.11) |
+| Join helpers in the fallback executor | 2026-05-04, 2026-09-06 bd-0pkki, 2026-10-28 GH#530 | widening rejected; four semantic exclusions recorded | replace the shape in bytecode (bd-w4pr1.13.6, .13.9) with those exclusions as oracle cases |
+
+### Measurement traps recorded here
+
+valgrind changes the I/O path (2026-11-10); a remote build can return a stale binary (2026-07-13,
+2026-08-02 bd-8wumh); the old concurrent section ran C at `FULL` against fsqlite at `NORMAL`
+(2026-07-23); VDBE metrics are process-global (2026-07-10); counters can be observer-dominated
+(2026-08-02 bd-he3ua); `ResultRow` drains its source registers (2026-07-22).
+
+### New entries
+
+Every entry from here on ends with a retry condition a later agent can grep and test: a profile
+share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
+"not as a standalone patch". A kept lever is entered too, with stock live in the same run.
+
 ## 2026-11-10 - WIN: synchronous hot-opcode lanes; the per-opcode async call protocol was ~a quarter of a table scan (bd-w4pr1.13.1)
 
 - Target: every native VDBE row loop. `SELECT count(*), sum(a) FROM t WHERE a > 500` over 1M
