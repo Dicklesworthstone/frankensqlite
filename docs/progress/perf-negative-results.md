@@ -87,6 +87,40 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-10 - WIN: the shell prepares a statement for its column names only when the output mode can show one (bd-5310l)
+
+- Target: text statements through the CLI. A point `SELECT` by rowid inside a transaction cost
+  202k user instructions against stock's 19k (10.4x). Touched: `crates/fsqlite-cli/src/main.rs`
+  (`execute_sql`, new `output_uses_column_names`).
+- Evidence before: callgrind inclusive on 1,000 text point SELECTs in one transaction (a CPU-only
+  path, so valgrind's I/O distortion does not apply): 112k of 206k instructions per statement were
+  `Connection::prepare`, which the shell called before `query` only to learn column names: a parse,
+  `validate_statement_select_semantics` (42k) and a compile (49k). List, CSV, tabs and quote modes
+  print names only as a header row, and headers are off by default.
+- Change: the shell asks for names only when `write_rows` can use them: headers on, or column or
+  line mode, and never for a query-plan tree. The unit test checks both directions for every mode
+  and header setting (names change the output exactly when the predicate is true; column mode with
+  headers off is the case a headers-only rule gets wrong, because the name sets the column width).
+- Result, stock sqlite3 3.46.1 live in the same run, user instructions per statement (`perf stat`,
+  batch of N minus batch of N/2 so start-up cancels; two runs per arm, base 58d05bff3 sha256
+  c8ee3e79..., candidate sha256 f682cda2...): rowid point SELECT in a transaction 202.5k / 200.5k
+  -> 143.8k / 144.0k (10.4x -> 7.4x stock's 19.4k); indexed-column point SELECT 239.7k / 236.8k ->
+  176.2k / 177.1k (10.2x -> 7.6x stock's 23.4k); autocommit point SELECT 272k -> 203k and 18.9 ->
+  14.8 syscalls per statement (stock 21.5k and 5.0). Base and candidate print identical stdout,
+  stderr and exit status over 24 configurations (six modes, headers on and off, `:memory:` and a
+  file) of a 19-statement script with PRAGMA, RETURNING, EXPLAIN QUERY PLAN, an empty result and
+  an error. CPU time moved the same way, but the host was at load 28-36 and the stock arm itself
+  ranged 3.8-11 us per statement, so no time ratio is claimed.
+- The saving is 59k, not the 112k the prepare cost: `query` now compiles the statement itself
+  instead of hitting the cache the prepare had filled.
+- Still a loss at 7.4x. No scorecard row moves (each runs one large statement); this is the
+  per-statement text budget of GATE 1 (bd-w4pr1.25). What is left per text point SELECT by the same
+  profile: two parses (the shell's statement splitter, 12k, and the engine's), the compile, about
+  70k of dispatch and VDBE, and whole-struct memcpy at 16% of the run.
+- Retry condition for the next shell-side cut (hand the shell's parsed statement to the engine
+  instead of parsing twice): only when a profile shows the second parse at 10% or more of a text
+  statement after bd-5310l's compile and dispatch cuts.
+
 ## 2026-11-10 - WIN: synchronous hot-opcode lanes; the per-opcode async call protocol was ~a quarter of a table scan (bd-w4pr1.13.1)
 
 - Target: every native VDBE row loop. `SELECT count(*), sum(a) FROM t WHERE a > 500` over 1M

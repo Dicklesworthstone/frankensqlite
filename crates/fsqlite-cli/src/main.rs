@@ -1010,14 +1010,6 @@ where
             }
         };
         let statement_sql = sql[statement_start..tail_offset].trim_start();
-        // Preparing only to learn column names costs a full snapshot refresh;
-        // statements that cannot return rows have none to learn.
-        let column_names = if statement_may_return_rows(&statement) {
-            infer_result_column_names(connection, statement_sql).await
-        } else {
-            None
-        };
-        let timer = output_options.timer.then(StatementTimer::start);
         let is_query_plan = matches!(
             statement,
             fsqlite_ast::Statement::Explain {
@@ -1025,6 +1017,18 @@ where
                 ..
             }
         );
+        // Learning the column names costs a whole prepare: a parse, semantic
+        // validation, a compile and a snapshot refresh, which is more than a
+        // point query costs to run. Ask only when the statement can return
+        // rows and this output configuration can show or measure a name.
+        let column_names = if statement_may_return_rows(&statement)
+            && output_uses_column_names(output_options, is_query_plan)
+        {
+            infer_result_column_names(connection, statement_sql).await
+        } else {
+            None
+        };
+        let timer = output_options.timer.then(StatementTimer::start);
         match connection.query(statement_sql).await {
             Ok(rows) => {
                 let written = if is_query_plan {
@@ -1499,6 +1503,23 @@ fn statement_may_return_rows(statement: &fsqlite_ast::Statement) -> bool {
         Statement::Update(update) => !update.returning.is_empty(),
         Statement::Delete(delete) => !delete.returning.is_empty(),
         _ => false,
+    }
+}
+
+/// Whether [`write_rows`] can show or measure a column name under these options.
+///
+/// The delimited modes print names only as a header row. Column mode sizes
+/// every column to its name even with headers off, and line mode prints a name
+/// on every line, so both always need them. A query-plan tree has no columns.
+const fn output_uses_column_names(output_options: OutputOptions, is_query_plan: bool) -> bool {
+    if is_query_plan {
+        return false;
+    }
+    match output_options.mode {
+        OutputMode::Column | OutputMode::Line => true,
+        OutputMode::List | OutputMode::Csv | OutputMode::Tabs | OutputMode::Quote => {
+            output_options.headers
+        }
     }
 }
 
@@ -2819,9 +2840,10 @@ mod tests {
 
     use super::{
         ANSI_BOLD_BLUE, ANSI_DIM, ANSI_GREEN, ANSI_MAGENTA, ANSI_RESET, Connection, OutputMode,
-        OutputOptions, ShellOptions, ansi_colors_enabled, format_row, highlight_sql, parse_args,
-        render_display_value, render_prompt, run, run_with_shell_options, statement_complete,
-        write_delimited_rows, write_query_plan_tree,
+        OutputOptions, ShellOptions, ansi_colors_enabled, format_row, highlight_sql,
+        output_uses_column_names, parse_args, render_display_value, render_prompt, run,
+        run_with_shell_options, statement_complete, write_delimited_rows, write_query_plan_tree,
+        write_rows,
     };
 
     fn parse_from(args: &[&str]) -> Result<super::CliOptions, String> {
@@ -4890,6 +4912,63 @@ SELECT id FROM keep WHERE name = 'k3';\n"
             let rendered = format_row(&row);
             // sqlite3 list mode: `|` separator, bare text, NULL empty (bd-zy4es).
             assert_eq!(rendered, "10|abc|");
+        });
+    }
+
+    /// bd-5310l: the shell skips the prepare that learns column names exactly
+    /// when [`write_rows`] cannot use them. Both directions are checked for
+    /// every mode and header setting: where the predicate says "unused", real
+    /// names and no names print the same bytes; where it says "used", a name
+    /// changes the output (column mode with headers off is the case a
+    /// headers-only rule gets wrong: the name still sets the column width).
+    #[test]
+    fn test_column_names_are_skipped_exactly_when_the_output_cannot_use_them() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = fsqlite::Connection::open(":memory:")
+                .await
+                .expect("connection should open");
+            let rows = conn
+                .query("SELECT 1, 'x', NULL, x'00ff'")
+                .await
+                .expect("query rows");
+            let names = vec![
+                "a_long_column_name".to_owned(),
+                "b".to_owned(),
+                "c".to_owned(),
+                "d".to_owned(),
+            ];
+            let render = |options: OutputOptions, column_names: Option<&[String]>| {
+                let mut out = Vec::new();
+                write_rows(&rows, column_names, options, &mut out).expect("write rows");
+                out
+            };
+            for mode in [
+                OutputMode::List,
+                OutputMode::Column,
+                OutputMode::Csv,
+                OutputMode::Tabs,
+                OutputMode::Line,
+                OutputMode::Quote,
+            ] {
+                for headers in [false, true] {
+                    let options = OutputOptions {
+                        mode,
+                        headers,
+                        ..OutputOptions::default()
+                    };
+                    let with_names = render(options, Some(&names));
+                    let without_names = render(options, None);
+                    assert_eq!(
+                        output_uses_column_names(options, false),
+                        with_names != without_names,
+                        "mode {mode:?}, headers {headers}: names change the output iff they are used"
+                    );
+                    assert!(
+                        !output_uses_column_names(options, true),
+                        "a query-plan tree never prints column names"
+                    );
+                }
+            }
         });
     }
 
