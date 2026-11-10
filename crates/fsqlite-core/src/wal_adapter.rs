@@ -141,6 +141,21 @@ impl Drop for WalWriteCompletionPreflight<'_> {
 /// to exercise the bounded fallback path.
 const PAGE_INDEX_MAX_ENTRIES: usize = usize::MAX;
 
+/// `BusySnapshot` detail for a commit that finds a dead writer's durable
+/// commit beyond the shared index (GH#534).
+pub const UNPUBLISHED_WAL_TAIL_DETAIL: &str =
+    "a committed WAL tail is missing from the shared index; retry the transaction";
+
+/// GH#534: the committing transaction's snapshot predates a durable commit
+/// whose writer died before publishing it, so it cannot commit as prepared.
+/// Waiting cannot help: answer at once with the first-committer-wins error.
+/// The recovery request stays set, so the retry's begin rebuilds the index.
+fn unpublished_wal_tail_conflict() -> FrankenError {
+    FrankenError::BusySnapshot {
+        conflicting_pages: UNPUBLISHED_WAL_TAIL_DETAIL.to_owned(),
+    }
+}
+
 fn sqlite_database_header_page_size(page_one: &[u8]) -> Option<u32> {
     if page_one.len() < 18 || !page_one.starts_with(b"SQLite format 3\0") {
         return None;
@@ -1381,12 +1396,18 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             committed_frame = committed_count,
             "fresh native append owner observed an unadvertised committed WAL tail"
         );
-        Err(FrankenError::BusyRecovery)
+        Err(unpublished_wal_tail_conflict())
     }
 
     /// Inspect the live native prefix before conflict checks or candidate staging.
     async fn native_append_baseline(&mut self, cx: &Cx) -> Result<fsqlite_wal::wal_index::WalIndexHdr> {
-        if self.has_pending_publication() || self.native_recovery_requested.is_some() {
+        if self.has_pending_publication() {
+            return Err(FrankenError::BusyRecovery);
+        }
+        if self.native_recovery_requested == Some(WalNativeRecoveryReason::UnpublishedWalTail) {
+            return Err(unpublished_wal_tail_conflict());
+        }
+        if self.native_recovery_requested.is_some() {
             return Err(FrankenError::BusyRecovery);
         }
         let source = self.wal_index_shm_source.clone().ok_or(FrankenError::Unsupported)?;
@@ -2328,11 +2349,40 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
                         WalNativeRecoveryReason::WalTerminalMismatch,
                     ));
                 }
-                self.native_read_proof = Some(NativeReadProof {
-                    header,
-                    frame_count: self.wal.frame_count(),
-                    salts: self.wal.header().salts,
-                });
+                // GH#534: `frame_count()` counts through the WAL's last valid
+                // commit frame, so a count above the shared header's is a
+                // committed tail the index does not list. A writer holds
+                // WRITE from its first appended frame until it has published,
+                // so with WRITE free that tail's writer died between its WAL
+                // sync and its publication: rebuild the index under the
+                // recovery fences before any snapshot is bound, as stock's
+                // first attacher does. With WRITE held the publisher is alive;
+                // bind the published prefix and leave the proof unset, so the
+                // next begin looks again. A read-only pager may not rebuild
+                // and always binds the published prefix.
+                if self.wal.frame_count() > frame_count {
+                    let source = Arc::clone(
+                        self.wal_index_shm_source.as_ref().ok_or(FrankenError::Unsupported)?,
+                    );
+                    if source.may_rebuild_shared_index() && source.wal_write_lock_is_free(cx).await?
+                    {
+                        tracing::debug!(
+                            target: "fsqlite.wal.recovery",
+                            shared_frame = header.mx_frame,
+                            committed_frame = self.wal.frame_count(),
+                            "native reader found a committed WAL tail with no live publisher"
+                        );
+                        return Ok(WalNativeReadOutcome::RecoveryRequired(
+                            WalNativeRecoveryReason::UnpublishedWalTail,
+                        ));
+                    }
+                } else {
+                    self.native_read_proof = Some(NativeReadProof {
+                        header,
+                        frame_count: self.wal.frame_count(),
+                        salts: self.wal.header().salts,
+                    });
+                }
             }
             self.publish_visible_snapshot(cx, frame_count.checked_sub(1), "begin_native_read").await?;
             self.read_snapshot = Some(self.published_snapshot.clone());

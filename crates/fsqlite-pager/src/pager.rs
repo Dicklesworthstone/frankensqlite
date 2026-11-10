@@ -5331,6 +5331,23 @@ impl<F: VfsFile> WalIndexShmSource<F> {
         shared_db_file_read(&self.db_file, cx).await?.owns_external_wal_append_write(cx)
     }
 
+    /// GH#534: whether no connection in any process holds WAL WRITE now.
+    /// Never waits and leaves no claim; `Unsupported` backends answer `false`,
+    /// so a caller never starts a recovery it cannot justify.
+    pub async fn wal_write_lock_is_free(&self, cx: &Cx) -> Result<bool> {
+        match shared_db_file_read(&self.db_file, cx).await?.wal_write_lock_is_free(cx) {
+            Err(FrankenError::Unsupported) => Ok(false),
+            other => other,
+        }
+    }
+
+    /// Whether this source belongs to a pager that may rebuild the shared
+    /// index (it publishes reader marks only when it is not read-only).
+    #[must_use]
+    pub const fn may_rebuild_shared_index(&self) -> bool {
+        self.can_publish_reader_marks
+    }
+
     /// Map a 32 KiB WAL-index region and release the file guard before returning.
     ///
     /// The returned region aliases the VFS mapping. Acquisition preserves the

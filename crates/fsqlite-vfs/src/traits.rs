@@ -1447,6 +1447,20 @@ pub trait VfsFile: Send + Sync {
     /// Unsupported backends must explicitly refuse this native capability.
     fn owns_external_wal_append_write(&self, cx: &Cx) -> Result<bool>;
 
+    /// Whether no connection, in this process or any other, holds the WAL
+    /// WRITE lock of this file's mapped `-shm` right now (GH#534).
+    ///
+    /// Takes WRITE without waiting and releases it before returning; it never
+    /// leaves a claim behind. A writer holds WRITE from its first appended
+    /// frame until it has published the shared index, so a committed WAL tail
+    /// that the index does not list while WRITE is free was left by a writer
+    /// that died between its WAL sync and its publication. Backends that
+    /// cannot answer refuse with `Unsupported`; callers then treat WRITE as
+    /// held and never start a recovery on its account.
+    fn wal_write_lock_is_free(&self, _cx: &Cx) -> Result<bool> {
+        Err(FrankenError::Unsupported)
+    }
+
     /// Restore an append attempt without releasing its enclosing snapshot.
     ///
     /// This must be idempotent before acquisition and after success or failure.

@@ -175,8 +175,10 @@ pub enum WalNativeRecoveryReason {
     SharedHeaderInvalid,
     WalGenerationMismatch,
     WalTerminalMismatch,
-    /// A complete unadvertised tail observed under a fresh native WRITE owner.
-    /// This survives unwind and requests canonical recovery at later admission.
+    /// A complete unadvertised tail observed under a fresh native WRITE owner,
+    /// or by a reader that found WRITE free (GH#534): its writer died between
+    /// its WAL sync and its index publication. From a WRITE owner this
+    /// survives unwind and requests canonical recovery at later admission.
     UnpublishedWalTail,
     /// Every in-use reader mark sits above the header's mxFrame: the header is
     /// older than the WAL it describes, and a reader that cannot publish a

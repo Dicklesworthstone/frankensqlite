@@ -4632,6 +4632,33 @@ impl VfsFile for UnixFile {
                 .any(|(owner, count)| *owner != self.shm_owner_id && *count != 0))
     }
 
+    fn wal_write_lock_is_free(&self, cx: &Cx) -> Result<bool> {
+        checkpoint_or_abort(cx)?;
+        let Some(shm) = &self.shm_info else {
+            return Err(FrankenError::Unsupported);
+        };
+        // One critical section: no handle of this process can take or drop
+        // WRITE between the in-process check, the raw probe and its release.
+        let mut info = shm
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let slot = &info.slots[usize::try_from(WAL_WRITE_LOCK).expect("WRITE slot fits")];
+        if slot.exclusive_owner.is_some() || slot.shared_holders.values().any(|count| *count != 0)
+        {
+            return Ok(false);
+        }
+        match self.acquire_shm_exclusive_slot(&mut info, WAL_WRITE_LOCK) {
+            Ok(_) => {}
+            // Another process holds it (fcntl refused without waiting).
+            Err(FrankenError::Busy) => return Ok(false),
+            Err(error) => return Err(error),
+        }
+        // A failed release keeps this handle named as the owner, so its close
+        // or unmap still releases the lock.
+        self.release_shm_exclusive_slot(&mut info, WAL_WRITE_LOCK)?;
+        Ok(true)
+    }
+
     fn restore_external_wal_append_attempt(&mut self, _cx: &Cx) -> Result<()> {
         let Some(attempt) = self.external_append_attempt.as_mut() else {
             return Ok(());

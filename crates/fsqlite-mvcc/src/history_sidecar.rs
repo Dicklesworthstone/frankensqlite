@@ -2115,6 +2115,10 @@ mod tests {
             self.inner.owns_external_wal_append_write(cx)
         }
 
+        fn wal_write_lock_is_free(&self, cx: &Cx) -> Result<bool, FrankenError> {
+            self.inner.wal_write_lock_is_free(cx)
+        }
+
         fn lock_external_wal_append(&mut self, cx: &Cx) -> Result<(), FrankenError> {
             self.inner.lock_external_wal_append(cx)
         }
