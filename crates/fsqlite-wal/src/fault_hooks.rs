@@ -489,6 +489,64 @@ pub fn clear_crash_boundary() {
     *state = CrashBoundaryState::default();
 }
 
+/// Environment variable naming the [`process_crash_point`] to arm.
+pub const PROCESS_CRASH_POINT_ENV: &str = "FSQLITE_CRASH_POINT";
+/// Environment variable: fire on the n-th pass through the point (default 1).
+pub const PROCESS_CRASH_AFTER_ENV: &str = "FSQLITE_CRASH_AFTER";
+/// Environment variable: `pause` stops at the point instead of aborting.
+pub const PROCESS_CRASH_ACTION_ENV: &str = "FSQLITE_CRASH_ACTION";
+/// Stdout prefix of the line a paused point prints before it waits.
+pub const PROCESS_CRASH_PAUSED_WITNESS: &str = "fsqlite-crash-point-paused:";
+
+/// A real process death at a named commit or recovery step (GH#534).
+///
+/// Unlike [`maybe_inject_crash_at`], which returns an error and lets the
+/// caller unwind, this ends the process with `abort`: no destructor, unlock,
+/// or flush runs, exactly as after SIGKILL. It is armed only through the
+/// environment ([`PROCESS_CRASH_POINT_ENV`], [`PROCESS_CRASH_AFTER_ENV`]), so
+/// a crash test's child process arms it before opening anything. With
+/// [`PROCESS_CRASH_ACTION_ENV`]` = pause` the n-th pass prints
+/// [`PROCESS_CRASH_PAUSED_WITNESS`] and the point name on stdout and blocks
+/// until a line arrives on stdin, so a parent can observe a live process
+/// stopped at that step and then let it finish.
+pub fn process_crash_point(name: &str) {
+    struct Armed {
+        point: String,
+        after: u64,
+        pause: bool,
+    }
+    static ARMED: LazyLock<Option<Armed>> = LazyLock::new(|| {
+        let point = std::env::var(PROCESS_CRASH_POINT_ENV).ok()?;
+        let after = std::env::var(PROCESS_CRASH_AFTER_ENV)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1);
+        let pause = std::env::var(PROCESS_CRASH_ACTION_ENV).is_ok_and(|action| action == "pause");
+        Some(Armed { point, after, pause })
+    });
+    static PASSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    let Some(armed) = ARMED.as_ref() else {
+        return;
+    };
+    if armed.point != name
+        || PASSES.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 != armed.after
+    {
+        return;
+    }
+    if armed.pause {
+        use std::io::{BufRead as _, Write as _};
+        let mut stdout = std::io::stdout().lock();
+        let _ = writeln!(stdout, "{PROCESS_CRASH_PAUSED_WITNESS}{name}");
+        let _ = stdout.flush();
+        drop(stdout);
+        let mut line = String::new();
+        let _ = std::io::stdin().lock().read_line(&mut line);
+        return;
+    }
+    std::process::abort();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

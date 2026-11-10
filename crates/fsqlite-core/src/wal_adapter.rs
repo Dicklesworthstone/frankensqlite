@@ -1794,6 +1794,10 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             };
             replace_shared_wal_index_region(&region, number, &scratch)?;
         }
+        // Entries rewritten, header still invalidated: a recovery that dies
+        // here must leave the next opener a full recovery to redo (GH#534).
+        #[cfg(feature = "fault-injection")]
+        fsqlite_wal::fault_hooks::process_crash_point("index_recovery_before_header_publish");
         reset_shared_wal_index_recovery_marks(&region_zero, maximum_frame)?;
         publish_shared_wal_index_header(&region_zero, &target)?;
         self.native_recovery_requested = None;
@@ -3278,6 +3282,9 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
         // publish-before-fsync hazard this guard exists to prevent. Leaving it
         // clear keeps the staged batch intact for a later retry.
         self.wal.sync(cx, SyncFlags::NORMAL)?;
+        // GH#534's window: the commit is durable, the shared index not yet.
+        #[cfg(feature = "fault-injection")]
+        fsqlite_wal::fault_hooks::process_crash_point("commit_after_wal_sync_before_publish");
         self.publish_pending_after_sync(cx)?;
         // Re-arm the pre-append resynchronization only when nothing is staged.
         //
@@ -9655,10 +9662,19 @@ mod tests {
         let wal = WalFile::open(&cx, file).expect("open validated orphan WAL");
         let mut adapter = WalBackendAdapter::new(wal);
         adapter.attach_wal_index_shm_source(Arc::clone(&source)).unwrap();
+        // GH#534: while another handle holds WRITE, a reader that finds the
+        // tail treats it as a live publisher's and binds the published prefix.
+        let (mut live_writer, _) = UnixVfs::new().open(&cx, Some(&path), VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB).unwrap();
+        live_writer.lock_external_wal_append(&cx).expect("a live publisher owns WRITE");
+        assert!(!source.wal_write_lock_is_free(&cx).expect("probe sees the in-process WRITE owner"));
         let mut lease = source.acquire_reader(&cx).expect("capture still-valid older shared horizon");
         let binding = lease.binding().unwrap();
         let token = binding.token().clone();
         assert_eq!(adapter.begin_native_read(&cx, binding).expect("older reader remains valid"), WalNativeReadOutcome::Ready);
+        assert!(adapter.native_read_proof.is_none(), "a live publisher's tail is looked at again by the next begin");
+        assert!(live_writer.owns_external_wal_append_write(&cx).unwrap(), "the probe left the live owner's WRITE alone");
+        live_writer.restore_external_wal_append_attempt(&cx).unwrap();
+        live_writer.close(&cx).unwrap();
         let pinned = adapter.pinned_read_snapshot().unwrap();
         let old_page = adapter.read_page_pinned(&cx, 2).expect("read old table page");
         assert_eq!(adapter.native_recovery_required(), None, "a newer physical tail alone does not widen a reader");
@@ -9681,6 +9697,21 @@ mod tests {
         unrelated.close(&cx).unwrap();
         adapter.end_native_read(&token).unwrap();
         lease.release().expect("release exact old reader");
+
+        // With WRITE free the same tail can only be a dead writer's: the next
+        // reader asks for recovery, and the observation changes nothing.
+        assert!(source.wal_write_lock_is_free(&cx).expect("nobody holds WRITE"));
+        let mut lease = source.acquire_reader(&cx).expect("reacquire the older horizon");
+        let binding = lease.binding().unwrap();
+        assert_eq!(
+            adapter.begin_native_read(&cx, binding).expect("classify the orphaned tail"),
+            WalNativeReadOutcome::RecoveryRequired(WalNativeRecoveryReason::UnpublishedWalTail)
+        );
+        assert!(adapter.native_read_binding().is_none(), "no snapshot is bound before recovery");
+        assert!(source.wal_write_lock_is_free(&cx).expect("the probe left no WRITE claim"));
+        assert_eq!(read_shared_wal_index_header(&region).unwrap(), Some(baseline));
+        assert_eq!(std::fs::read(&wal_path).unwrap(), wal_bytes);
+        lease.release().expect("release the classifying reader");
     }
 
     #[cfg(all(feature = "native", unix))]
@@ -9689,8 +9720,7 @@ mod tests {
         use fsqlite_pager::{MvccPager, SimplePager, TransactionHandle, TransactionMode};
         use fsqlite_vfs::UnixVfs;
 
-        const CHILD_ENV: &str = "FSQLITE_NATIVE_ORPHAN_TAIL_STOCK_CHILD";
-        if let Some(path) = std::env::var_os(CHILD_ENV) {
+        if let Some(path) = std::env::var_os(NATIVE_ORPHAN_TAIL_STOCK_CHILD_ENV) {
             let stock = rusqlite::Connection::open_with_flags(Path::new(&path), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
                 .expect("stock opens recovered and newly published index");
             stock.busy_timeout(std::time::Duration::from_secs(1)).unwrap();
@@ -9719,11 +9749,22 @@ mod tests {
         backend.attach_wal_index_shm_source(Arc::clone(&source)).unwrap();
         assert!(pager.set_wal_backend_owned(backend).is_ok());
         let table_page = PageNumber::new(2).unwrap();
+        // GH#534 race: the first transaction binds while a live publisher
+        // holds WRITE, and that publisher then goes away without publishing.
+        let (mut live_writer, _) = UnixVfs::new().open(&cx, Some(&path), VfsOpenFlags::READWRITE | VfsOpenFlags::MAIN_DB).unwrap();
+        live_writer.lock_external_wal_append(&cx).expect("a live publisher owns WRITE");
         let mut first = pager.begin(&cx, TransactionMode::Concurrent).expect("old published prefix remains readable");
         let old_page = first.get_page(&cx, table_page).expect("old table page").into_vec();
+        live_writer.restore_external_wal_append_attempt(&cx).unwrap();
+        live_writer.close(&cx).unwrap();
         first.write_page(&cx, table_page, &old_page).expect("same page touched by the unadvertised commit");
-        let error = first.commit(&cx).expect_err("fresh WRITE owner requests recovery before stale-page conflicts");
-        assert!(matches!(error, FrankenError::BusyRecovery), "unexpected first append error: {error}");
+        let refused_at = std::time::Instant::now();
+        let error = first.commit(&cx).expect_err("fresh WRITE owner refuses the stale snapshot before stale-page conflicts");
+        assert!(
+            matches!(&error, FrankenError::BusySnapshot { conflicting_pages } if conflicting_pages == UNPUBLISHED_WAL_TAIL_DETAIL),
+            "unexpected first append error: {error}"
+        );
+        assert!(refused_at.elapsed() < std::time::Duration::from_secs(1), "waiting cannot help, so the refusal spends no busy budget");
         let region = source.map_region(&cx, 0, false).expect("same native index");
         assert_eq!(read_shared_wal_index_header(&region).unwrap(), Some(baseline));
         assert_eq!(std::fs::read(&wal_path).unwrap(), wal_bytes, "classification has no physical append side effect");
@@ -9759,9 +9800,19 @@ mod tests {
         assert_eq!(published.i_change, recovered.i_change.wrapping_add(1));
         assert!(!source.owns_external_wal_append_write(&cx).expect("successful append authority retired"));
 
+        assert_stock_reads_recovered_orphan_tail(&path);
+        }
+    }
+
+    /// Have stock SQLite, in a child process, read the orphan-tail fixture's
+    /// rows after recovery and a later native commit: 50 only if the orphaned
+    /// stock UPDATE survived. A child, because closing an in-process stock
+    /// handle would drop this process's POSIX locks.
+    #[cfg(all(feature = "native", unix))]
+    fn assert_stock_reads_recovered_orphan_tail(path: &Path) {
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "wal_adapter::tests::test_native_orphan_tail_requests_recovery_before_conflicts_and_fresh_writer_progress", "--nocapture"])
-            .env(CHILD_ENV, &path).stdin(std::process::Stdio::null())
+            .env(NATIVE_ORPHAN_TAIL_STOCK_CHILD_ENV, path).stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped())
             .spawn().expect("independent stock reader of recovered and newly published WAL");
         let started = std::time::Instant::now();
@@ -9777,6 +9828,59 @@ mod tests {
         let output = child.wait_with_output().unwrap();
         assert!(output.status.success(), "stock child failed: stdout={} stderr={}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
         assert!(String::from_utf8_lossy(&output.stdout).contains("native-orphan-tail-stock-row-sum=50"));
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    const NATIVE_ORPHAN_TAIL_STOCK_CHILD_ENV: &str = "FSQLITE_NATIVE_ORPHAN_TAIL_STOCK_CHILD";
+
+    /// GH#534: a writer killed between its WAL sync and its index publication
+    /// leaves a committed tail that no live connection will ever publish. The
+    /// next writable opener's FIRST begin rebuilds the index (nobody holds
+    /// WRITE), sees that commit, and commits on top of it at once; stock then
+    /// reads both. Before the fix that begin bound the stale index and every
+    /// commit on it failed with BusyRecovery after the whole busy budget.
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn test_native_orphan_tail_first_begin_recovers_dead_writer_commit() {
+        use fsqlite_pager::{MvccPager, SimplePager, TransactionHandle, TransactionMode};
+        use fsqlite_vfs::UnixVfs;
+
+        let cx = test_cx();
+        for trailing_noncommit in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let (path, wal_bytes, baseline) = native_orphan_tail_database(directory.path(), trailing_noncommit);
+            let main_bytes = std::fs::read(&path).unwrap();
+            let wal_path = directory.path().join("orphan.db-wal");
+            let pager = SimplePager::open_with_cx(&cx, UnixVfs::new(), &path, fsqlite_types::PageSize::DEFAULT)
+                .expect("open native orphan fixture");
+            let source = pager.wal_index_shm_source().unwrap();
+            let (file, _) = UnixVfs::new().open(&cx, Some(&wal_path), VfsOpenFlags::READWRITE | VfsOpenFlags::WAL).unwrap();
+            let wal = WalFile::open(&cx, file).expect("open validated orphan WAL");
+            let complete_frames = u32::try_from(wal.frame_count()).unwrap();
+            let (_, last_marker) = wal.last_commit_frame_header().expect("last committed marker excludes noncommit suffix");
+            assert!(complete_frames > baseline.mx_frame, "the fixture's index omits the stock UPDATE");
+            let mut backend = PathRefreshingWalBackend::new(UnixVfs::new(), &path, &wal_path, PAGE_SIZE, wal, false, None);
+            backend.attach_wal_index_shm_source(Arc::clone(&source)).unwrap();
+            assert!(pager.set_wal_backend_owned(backend).is_ok());
+            let region = source.map_region(&cx, 0, false).expect("existing index");
+            assert_eq!(read_shared_wal_index_header(&region).unwrap(), Some(baseline));
+
+            let table_page = PageNumber::new(2).unwrap();
+            let mut txn = pager.begin(&cx, TransactionMode::Concurrent).expect("first begin recovers the dead writer's commit");
+            let page = txn.get_page(&cx, table_page).expect("recovered table page").into_vec();
+            let recovered = read_shared_wal_index_header(&region).unwrap().unwrap();
+            assert_eq!(recovered.mx_frame, complete_frames, "the index now lists the orphaned commit");
+            assert_eq!((recovered.n_page, recovered.a_frame_cksum), (last_marker.db_size, [last_marker.checksum.s1, last_marker.checksum.s2]));
+            assert_eq!(std::fs::read(&wal_path).unwrap(), wal_bytes, "index recovery preserves every WAL byte");
+            assert_eq!(std::fs::read(&path).unwrap(), main_bytes, "index recovery preserves every main-file byte");
+            txn.write_page(&cx, table_page, &page).expect("rewrite the recovered page");
+            let committed_at = std::time::Instant::now();
+            txn.commit(&cx).expect("the first commit after the crash succeeds");
+            assert!(committed_at.elapsed() < std::time::Duration::from_secs(1));
+            let published = read_shared_wal_index_header(&region).unwrap().unwrap();
+            assert!(published.mx_frame > complete_frames);
+            assert!(source.wal_write_lock_is_free(&cx).expect("no WRITE claim left behind"));
+            assert_stock_reads_recovered_orphan_tail(&path);
         }
     }
 

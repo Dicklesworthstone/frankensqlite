@@ -25369,6 +25369,10 @@ where
                                     }
                                     Err(error) => return Err(error),
                                 }
+                                #[cfg(feature = "fault-injection")]
+                                fsqlite_wal::fault_hooks::process_crash_point(
+                                    "commit_after_certificate",
+                                );
 
                                 let frame_completion = VfsWriteCompletion::new();
                                 *wal_completion
@@ -25396,6 +25400,10 @@ where
                                 append_frames_us =
                                     elapsed_profile_us(t_append_frames_start);
                                 wal_append_us = append_frames_us;
+                                #[cfg(feature = "fault-injection")]
+                                fsqlite_wal::fault_hooks::process_crash_point(
+                                    "commit_after_frame_append",
+                                );
                                 let actual_frames_written_end =
                                     u64::try_from(wal.frame_count()).unwrap_or(u64::MAX);
                                 if actual_frames_written_end != frames_written_end {
@@ -25462,6 +25470,12 @@ where
                             return flush_io_result;
                         }
 
+                        #[cfg(feature = "fault-injection")]
+                        if flush_io_result.is_ok() {
+                            fsqlite_wal::fault_hooks::process_crash_point(
+                                "commit_after_publish_before_unlock",
+                            );
+                        }
                         // Lock restoration is mandatory even when the caller
                         // was cancelled. In particular, once the flush is
                         // durable, cancellation must not strand RESERVED or
