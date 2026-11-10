@@ -10,7 +10,7 @@ pub mod semantic;
 pub mod token;
 
 pub use lexer::{
-    Lexer, TokenizeDurationSecondsHistogram, TokenizeMetricsSnapshot, reset_tokenize_metrics,
+    BindParameterSlots, Lexer, TokenizeDurationSecondsHistogram, bind_parameter_slots, TokenizeMetricsSnapshot, reset_tokenize_metrics,
     set_force_interner_scan_bench, set_tokenize_metrics_enabled, tokenize_metrics_enabled,
     tokenize_metrics_snapshot,
 };

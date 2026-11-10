@@ -97,43 +97,79 @@ enum DeepExprFrame {
     },
 }
 
-struct InlineStack<T, const N: usize> {
-    inline: [Option<T>; N],
-    inline_len: usize,
-    spill: Vec<T>,
+/// A stack of a [`ParseMachine`] whose buffer comes from, and returns to, a
+/// per-thread pool, so one statement's expressions (and later statements)
+/// reuse it. The stack itself is three words: building and moving a machine
+/// copies no frames. (Inline `[Option<T>; 8]` arrays avoided the allocation
+/// but made every expression parse copy ~15 KB of empty frames as the
+/// machine was built, moved into place and moved into `run_*`.)
+struct MachineStack<T: PooledFrame> {
+    items: Vec<T>,
 }
 
-impl<T, const N: usize> InlineStack<T, N> {
+/// A frame type with its own per-thread pool of stack buffers.
+trait PooledFrame: Sized + 'static {
+    fn with_pool<R>(f: impl FnOnce(&mut Vec<Vec<Self>>) -> R) -> Option<R>;
+}
+
+/// Buffers kept per frame type and thread; a machine nested inside another
+/// (a subquery in an expression) takes a second one.
+const MACHINE_STACK_POOL_DEPTH: usize = 4;
+/// A buffer that grew past this many frames (a pathologically deep
+/// expression) shrinks back to it before it is pooled.
+const MACHINE_STACK_RETAINED_FRAMES: usize = 64;
+
+macro_rules! pooled_frame {
+    ($frame:ty) => {
+        impl PooledFrame for $frame {
+            fn with_pool<R>(f: impl FnOnce(&mut Vec<Vec<Self>>) -> R) -> Option<R> {
+                thread_local! {
+                    static POOL: std::cell::RefCell<Vec<Vec<$frame>>> =
+                        const { std::cell::RefCell::new(Vec::new()) };
+                }
+                POOL.try_with(|pool| f(&mut pool.borrow_mut())).ok()
+            }
+        }
+    };
+}
+
+pooled_frame!(ParseControl);
+pooled_frame!(MachineValue);
+
+impl<T: PooledFrame> MachineStack<T> {
     fn new() -> Self {
         Self {
-            inline: [const { None }; N],
-            inline_len: 0,
-            spill: Vec::new(),
+            items: T::with_pool(Vec::pop).flatten().unwrap_or_default(),
         }
     }
 
     fn push(&mut self, value: T) {
-        if self.inline_len < N && self.spill.is_empty() {
-            self.inline[self.inline_len] = Some(value);
-            self.inline_len += 1;
-        } else {
-            #[cfg(test)]
-            if self.spill.is_empty() {
-                PARSE_MACHINE_STACK_SPILLS.set(PARSE_MACHINE_STACK_SPILLS.get().saturating_add(1));
-            }
-            self.spill.push(value);
+        #[cfg(test)]
+        if self.items.len() == self.items.capacity() {
+            PARSE_MACHINE_STACK_SPILLS.set(PARSE_MACHINE_STACK_SPILLS.get().saturating_add(1));
         }
+        self.items.push(value);
     }
 
     fn pop(&mut self) -> Option<T> {
-        if let Some(value) = self.spill.pop() {
-            return Some(value);
+        self.items.pop()
+    }
+}
+
+impl<T: PooledFrame> Drop for MachineStack<T> {
+    fn drop(&mut self) {
+        let mut items = std::mem::take(&mut self.items);
+        if items.capacity() == 0 {
+            return;
         }
-        if self.inline_len == 0 {
-            return None;
-        }
-        self.inline_len -= 1;
-        self.inline[self.inline_len].take()
+        // A machine that stopped on a parse error may still hold frames.
+        items.clear();
+        items.shrink_to(MACHINE_STACK_RETAINED_FRAMES);
+        T::with_pool(|pool| {
+            if pool.len() < MACHINE_STACK_POOL_DEPTH {
+                pool.push(items);
+            }
+        });
     }
 }
 
@@ -1103,8 +1139,8 @@ mod bp {
 
 struct ParseMachine<'a> {
     parser: &'a mut Parser,
-    controls: InlineStack<ParseControl, 8>,
-    values: InlineStack<MachineValue, 8>,
+    controls: MachineStack<ParseControl>,
+    values: MachineStack<MachineValue>,
 }
 
 impl<'a> ParseMachine<'a> {
@@ -1112,44 +1148,30 @@ impl<'a> ParseMachine<'a> {
         Self::for_expr_with_min_bp(parser, 0)
     }
 
-    fn for_expr_with_min_bp(parser: &'a mut Parser, min_bp: u8) -> Self {
-        let mut controls = InlineStack::new();
-        controls.push(ParseControl::ExprStart { min_bp });
+    fn starting_with(parser: &'a mut Parser, start: ParseControl) -> Self {
+        let mut controls = MachineStack::new();
+        controls.push(start);
         Self {
             parser,
             controls,
-            values: InlineStack::new(),
+            values: MachineStack::new(),
         }
+    }
+
+    fn for_expr_with_min_bp(parser: &'a mut Parser, min_bp: u8) -> Self {
+        Self::starting_with(parser, ParseControl::ExprStart { min_bp })
     }
 
     fn for_select(parser: &'a mut Parser, with: Option<WithClause>) -> Self {
-        let mut controls = InlineStack::new();
-        controls.push(ParseControl::SelectStart { with });
-        Self {
-            parser,
-            controls,
-            values: InlineStack::new(),
-        }
+        Self::starting_with(parser, ParseControl::SelectStart { with })
     }
 
     fn for_with(parser: &'a mut Parser) -> Self {
-        let mut controls = InlineStack::new();
-        controls.push(ParseControl::WithStart);
-        Self {
-            parser,
-            controls,
-            values: InlineStack::new(),
-        }
+        Self::starting_with(parser, ParseControl::WithStart)
     }
 
     fn for_from(parser: &'a mut Parser) -> Self {
-        let mut controls = InlineStack::new();
-        controls.push(ParseControl::FromStart);
-        Self {
-            parser,
-            controls,
-            values: InlineStack::new(),
-        }
+        Self::starting_with(parser, ParseControl::FromStart)
     }
 
     fn run_expr(mut self) -> Result<ParsedExpr, ParseError> {
@@ -5616,15 +5638,41 @@ mod tests {
     }
 
     #[test]
-    fn test_shallow_machine_uses_only_inline_control_and_value_storage() {
+    fn test_shallow_machine_reuses_pooled_control_and_value_storage() {
+        // The first parse on a thread fills the pool; later ones reuse it.
+        parse_expr("a + b * 2").expect("warm-up expression must parse");
         PARSE_MACHINE_STACK_SPILLS.set(0);
-        let expr = parse_expr("a + b * 2").expect("shallow expression must parse");
-        assert_eq!(expr.to_string(), "a + b * 2");
+        for _ in 0..3 {
+            let expr = parse_expr("a + b * 2").expect("shallow expression must parse");
+            assert_eq!(expr.to_string(), "a + b * 2");
+        }
         assert_eq!(
             PARSE_MACHINE_STACK_SPILLS.get(),
             0,
-            "representative shallow parsing must not allocate parser stack spill storage"
+            "representative shallow parsing must not allocate parser stack storage"
         );
+        // A deep expression grows the stacks; the buffer shrinks back before
+        // it is pooled, so a later shallow parse still finds one.
+        let deep = format!("{}1{}", "(".repeat(200), ")".repeat(200));
+        parse_expr(&deep).expect("deep parentheses must parse");
+        PARSE_MACHINE_STACK_SPILLS.set(0);
+        parse_expr("a + b * 2").expect("shallow expression must parse");
+        assert_eq!(PARSE_MACHINE_STACK_SPILLS.get(), 0);
+    }
+
+    #[test]
+    fn test_machine_stack_survives_parse_errors_and_nesting() {
+        // A machine that stops on an error returns its buffer cleared: the
+        // next parse sees no leftover frames.
+        assert!(parse_expr("a + (b *").is_err());
+        assert!(parse_expr("CASE WHEN").is_err());
+        let expr = parse_expr("x IN (SELECT y FROM t WHERE y > (SELECT 1)) AND z")
+            .expect("nested machines must parse");
+        assert_eq!(
+            expr.to_string(),
+            "x IN (SELECT y FROM t WHERE y > (SELECT 1)) AND z"
+        );
+        assert_eq!(parse_expr("1 + 2").expect("parses").to_string(), "1 + 2");
     }
 
     #[test]

@@ -44,7 +44,7 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
     }
     RUNTIME.with(|runtime| runtime.block_on(future))
 }
-use fsqlite_parser::{Lexer, Parser, TokenKind, parse_first_statement_with_tail};
+use fsqlite_parser::{Parser, parse_first_statement_with_tail};
 use fsqlite_types::SmallText;
 use fsqlite_types::value::SqliteValue;
 
@@ -425,86 +425,18 @@ struct PreparedParamInfo {
     param_names: Vec<Option<CString>>,
 }
 
-/// Assign (or reuse) a 1-based index for a named parameter, mirroring SQLite's
-/// numbering: a repeated name reuses its first-assigned index. bd-w2i2w.
-fn assign_named_param_index(
-    full: String,
-    next: &mut u32,
-    named: &mut std::collections::HashMap<String, u32>,
-    names_by_index: &mut Vec<(u32, String)>,
-) -> u32 {
-    if let Some(&index) = named.get(&full) {
-        return index;
-    }
-    let index = *next;
-    *next = next.saturating_add(1);
-    named.insert(full.clone(), index);
-    names_by_index.push((index, full));
-    index
-}
-
-/// Enumerate a statement's bind parameters and their SQLite-canonical indices.
-///
-/// Mirrors `sqlite3_bind_parameter_count`/`_index`/`_name` semantics:
-///   - `?`            → the next sequential index.
-///   - `?NNN`         → index NNN; the running counter jumps past it.
-///   - `:x`/`@x`/`$x` → next sequential index, deduplicated by full name.
-///
-/// Reuses the engine lexer so string/comment/blob contexts never yield false
-/// placeholders. The returned `bindings` is sized to the largest index seen
+/// Enumerate a statement's bind parameters and their SQLite-canonical indices
+/// ([`fsqlite_parser::bind_parameter_slots`]), as `sqlite3_bind_parameter_count`
+/// / `_index` / `_name` report them. `bindings` is sized to the largest index
 /// (all NULL); `param_names[i - 1]` is the sigil-prefixed name of index `i`, or
 /// `None` for the nameless `?` / `?NNN` forms. bd-w2i2w.
 fn compute_prepared_param_info(sql: &str) -> PreparedParamInfo {
-    use std::collections::HashMap;
-
-    let tokens = Lexer::tokenize(sql);
-    let mut next: u32 = 1;
-    let mut max_index: u32 = 0;
-    let mut named: HashMap<String, u32> = HashMap::new();
-    let mut names_by_index: Vec<(u32, String)> = Vec::new();
-
-    for token in &tokens {
-        let index = match &token.kind {
-            TokenKind::Question => {
-                let index = next;
-                next = next.saturating_add(1);
-                index
-            }
-            TokenKind::QuestionNum(n) => {
-                if *n >= next {
-                    next = n.saturating_add(1);
-                }
-                *n
-            }
-            TokenKind::ColonParam(name) => assign_named_param_index(
-                format!(":{name}"),
-                &mut next,
-                &mut named,
-                &mut names_by_index,
-            ),
-            TokenKind::AtParam(name) => assign_named_param_index(
-                format!("@{name}"),
-                &mut next,
-                &mut named,
-                &mut names_by_index,
-            ),
-            TokenKind::DollarParam(name) => assign_named_param_index(
-                format!("${name}"),
-                &mut next,
-                &mut named,
-                &mut names_by_index,
-            ),
-            _ => continue,
-        };
-        max_index = max_index.max(index);
-    }
-
-    let count = max_index as usize;
+    let slots = fsqlite_parser::bind_parameter_slots(sql);
+    let count = slots.count;
     let mut param_names: Vec<Option<CString>> = vec![None; count];
-    for (index, full) in names_by_index {
-        let slot = index as usize;
-        if slot >= 1 && slot <= count {
-            param_names[slot - 1] = CString::new(full).ok();
+    for (index, full) in slots.names {
+        if index >= 1 && index <= count {
+            param_names[index - 1] = CString::new(full).ok();
         }
     }
 

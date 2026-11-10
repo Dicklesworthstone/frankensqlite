@@ -1178,9 +1178,97 @@ const fn hex_digit(b: u8) -> Option<u8> {
     }
 }
 
+/// The bind parameters of a SQL text, numbered as SQLite numbers them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BindParameterSlots {
+    /// The largest parameter index (`sqlite3_bind_parameter_count`).
+    pub count: usize,
+    /// `(index, name)` for each named parameter, the name with its sigil
+    /// (`":id"`, `"@x"`, `"$y"`), in first-occurrence order.
+    pub names: Vec<(usize, String)>,
+}
+
+impl BindParameterSlots {
+    /// The 1-based index of the named parameter `name` (sigil included).
+    #[must_use]
+    pub fn index_of(&self, name: &str) -> Option<usize> {
+        self.names
+            .iter()
+            .find_map(|(index, candidate)| (candidate == name).then_some(*index))
+    }
+
+    /// The name (with sigil) of parameter `index`, or `None` for `?`/`?NNN`.
+    #[must_use]
+    pub fn name_of(&self, index: usize) -> Option<&str> {
+        self.names
+            .iter()
+            .find_map(|(slot, name)| (*slot == index).then_some(name.as_str()))
+    }
+}
+
+/// Number the bind parameters in `sql` as `sqlite3_bind_parameter_index` does.
+///
+/// `?` takes the next index, `?NNN` takes NNN and moves the counter past it,
+/// and `:x`/`@x`/`$x` take the next index on first use and reuse it after.
+/// Tokenizing first means placeholders inside strings, comments or blobs are
+/// not counted.
+#[must_use]
+pub fn bind_parameter_slots(sql: &str) -> BindParameterSlots {
+    let mut next = 1_usize;
+    let mut slots = BindParameterSlots::default();
+    for token in Lexer::tokenize(sql) {
+        let named = match token.kind {
+            TokenKind::Question => {
+                slots.count = slots.count.max(next);
+                next += 1;
+                continue;
+            }
+            TokenKind::QuestionNum(n) => {
+                let n = n as usize;
+                if n >= next {
+                    next = n + 1;
+                }
+                slots.count = slots.count.max(n);
+                continue;
+            }
+            TokenKind::ColonParam(name) => format!(":{name}"),
+            TokenKind::AtParam(name) => format!("@{name}"),
+            TokenKind::DollarParam(name) => format!("${name}"),
+            _ => continue,
+        };
+        if slots.index_of(&named).is_none() {
+            slots.count = slots.count.max(next);
+            slots.names.push((next, named));
+            next += 1;
+        }
+    }
+    slots
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bind_parameter_slots_number_like_sqlite() {
+        let slots =
+            bind_parameter_slots("SELECT ?, :a, ?5, @b, :a, ?, $c, '?:x', /* ?9 */ x'3f' -- ?:z\n");
+        assert_eq!(slots.count, 8);
+        assert_eq!(
+            slots.names,
+            vec![
+                (2, ":a".to_owned()),
+                (6, "@b".to_owned()),
+                (8, "$c".to_owned())
+            ]
+        );
+        assert_eq!(slots.index_of(":a"), Some(2));
+        assert_eq!(slots.index_of("a"), None, "the sigil is part of the name");
+        assert_eq!(slots.name_of(6), Some("@b"));
+        assert_eq!(slots.name_of(1), None);
+        assert_eq!(bind_parameter_slots("SELECT 1").count, 0);
+        assert_eq!(bind_parameter_slots("SELECT ?3, ?").count, 4);
+    }
 
     #[test]
     fn interner_incremental_bytes_equals_fold() {
