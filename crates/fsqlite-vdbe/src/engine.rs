@@ -4398,6 +4398,43 @@ impl CursorBackend {
         }
     }
 
+    /// [`Self::rowid`] without waiting; `None` unless the cursor is on a
+    /// table-leaf cell.
+    #[inline]
+    fn try_table_leaf_rowid(&self) -> Result<Option<i64>> {
+        match self {
+            Self::Mem(c) => c.try_table_leaf_rowid(),
+            Self::Txn(c) => c.try_table_leaf_rowid(),
+            Self::TimeTravel(c) => c.try_table_leaf_rowid(),
+        }
+    }
+
+    /// Whether the current row's payload can be read without page I/O: a
+    /// table-leaf cell stored entirely on its leaf page.
+    #[inline]
+    fn current_row_has_local_table_payload(&self) -> Result<bool> {
+        match self {
+            Self::Mem(c) => c.current_row_has_local_table_payload(),
+            Self::Txn(c) => c.current_row_has_local_table_payload(),
+            Self::TimeTravel(c) => c.current_row_has_local_table_payload(),
+        }
+    }
+
+    /// [`Self::payload_prefix_into`] without waiting, for a row with a local
+    /// table payload. `Ok(false)` leaves `buf` untouched.
+    #[inline]
+    fn try_local_table_payload_prefix_into(
+        &self,
+        max_prefix_bytes: usize,
+        buf: &mut Vec<u8>,
+    ) -> Result<bool> {
+        match self {
+            Self::Mem(c) => c.try_local_table_payload_prefix_into(max_prefix_bytes, buf),
+            Self::Txn(c) => c.try_local_table_payload_prefix_into(max_prefix_bytes, buf),
+            Self::TimeTravel(c) => c.try_local_table_payload_prefix_into(max_prefix_bytes, buf),
+        }
+    }
+
     async fn payload(&self, cx: &Cx) -> Result<Vec<u8>> {
         match self {
             Self::Mem(c) => c.payload(cx).await,
@@ -15271,6 +15308,18 @@ impl VdbeEngine {
         borrowed_bindings: Option<&[SqliteValue]>,
     ) -> Result<bool> {
         match op.opcode {
+            Opcode::Column => {
+                // A row whose payload is on the cursor's leaf page is read
+                // here; anything else is left for `execute_column_hot`.
+                #[allow(clippy::cast_sign_loss)]
+                let col_idx = op.p2 as usize;
+                if self.try_column_to_reg_direct_local(op.p1, col_idx, op.p3)? {
+                    *pc += 1;
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            }
             Opcode::ResultRow => {
                 self.execute_result_row_hot(op, collect_vdbe_metrics, row_handler)?;
                 *pc += 1;
@@ -17751,7 +17800,6 @@ impl VdbeEngine {
         col_idx: usize,
         target: i32,
     ) -> Result<bool> {
-        let text_encoding = self.text_encoding;
         // bd-v6pjf: WITHOUT ROWID non-leading-PK column remap. Only clone the map
         // Arc when a non-leading-PK table is actually registered; the common case
         // (empty map) keeps this general column-read path allocation-free. Cloning
@@ -17778,41 +17826,134 @@ impl VdbeEngine {
             false
         };
 
-        let payload_idx = if let Some(ipk) = ipk_col_idx {
-            if col_idx == ipk {
-                let rowid = storage_cursor_cached_rowid(cursor).await?;
-                self.set_reg_fast(target, SqliteValue::Integer(rowid));
-                return Ok(true);
-            }
-            if col_idx > ipk && !payload_includes {
-                col_idx - 1
-            } else {
-                col_idx
-            }
-        } else {
-            col_idx
-        };
-        // bd-v6pjf: declared column -> physical record slot for a non-leading-PK
-        // WITHOUT ROWID table (identity when the map is empty or the root page is
-        // absent from it).
-        let payload_idx = wr_storage_order
-            .as_ref()
-            .and_then(|map| map.get(&cursor.root_page))
-            .and_then(|inv| inv.get(payload_idx).copied())
-            .unwrap_or(payload_idx);
+        if ipk_col_idx == Some(col_idx) {
+            let rowid = storage_cursor_cached_rowid(cursor).await?;
+            self.set_reg_fast(target, SqliteValue::Integer(rowid));
+            return Ok(true);
+        }
+        let payload_idx = storage_payload_column_index(
+            col_idx,
+            ipk_col_idx,
+            payload_includes,
+            wr_storage_order.as_deref(),
+            cursor.root_page,
+        );
 
-        // ── Lazy decode + zero-clone register write ────────────────
+        // ── Load the payload through the end of the requested column ──
+        if payload_idx < cursor.row_decode.column_count()
+            && let Some(col) = cursor.row_decode.column_offset(payload_idx).copied()
+            && let Some(col_end) = column_payload_end(&col)
+        {
+            let col_refresh =
+                ensure_storage_cursor_row_layout(cursor, col_end, self.collect_vdbe_metrics)
+                    .await?;
+            refresh_state.refreshed |= col_refresh.refreshed;
+            refresh_state.eager_values_ready |= col_refresh.eager_values_ready;
+        }
+        self.column_to_reg_direct_finish(cursor_id, col_idx, payload_idx, target, refresh_state)
+    }
+
+    /// [`Self::column_to_reg_direct`] for a row that needs no page I/O.
+    ///
+    /// Returns `Ok(false)` when the read has to go through the async
+    /// function: the cursor is not a storage cursor, or the row's payload or
+    /// rowid is not at hand. A `false` never follows a change the async
+    /// function would not make itself. A row-layout pass declines before it
+    /// touches the cursor, or else completes for a row with a local table
+    /// payload, and for such a row no later step can decline. The one value
+    /// cached before a later decline, the rowid-alias verdict, is a pure
+    /// function of the row that the async function would cache as well.
+    fn try_column_to_reg_direct_local(
+        &mut self,
+        cursor_id: i32,
+        col_idx: usize,
+        target: i32,
+    ) -> Result<bool> {
+        let wr_storage_order = (!self.wr_storage_order_by_root_page.is_empty())
+            .then(|| Arc::clone(&self.wr_storage_order_by_root_page));
+        let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) else {
+            return Ok(false);
+        };
+        if cursor.cursor.eof() {
+            self.set_reg(target, SqliteValue::Null);
+            return Ok(true);
+        }
+
+        let Some(mut refresh_state) =
+            try_ensure_storage_cursor_row_layout_local(cursor, 0, self.collect_vdbe_metrics)?
+        else {
+            return Ok(false);
+        };
+
+        let ipk_col_idx = cursor.ipk_col_idx;
+        let payload_includes = if let Some(ipk) = ipk_col_idx {
+            let Some(includes) = try_storage_cursor_payload_includes_rowid_alias_local(
+                cursor,
+                ipk,
+                self.collect_vdbe_metrics,
+            )?
+            else {
+                return Ok(false);
+            };
+            includes
+        } else {
+            false
+        };
+
+        if ipk_col_idx == Some(col_idx) {
+            let Some(rowid) = try_storage_cursor_cached_rowid_local(cursor)? else {
+                return Ok(false);
+            };
+            self.set_reg_fast(target, SqliteValue::Integer(rowid));
+            return Ok(true);
+        }
+        let payload_idx = storage_payload_column_index(
+            col_idx,
+            ipk_col_idx,
+            payload_includes,
+            wr_storage_order.as_deref(),
+            cursor.root_page,
+        );
+
+        if payload_idx < cursor.row_decode.column_count()
+            && let Some(col) = cursor.row_decode.column_offset(payload_idx).copied()
+            && let Some(col_end) = column_payload_end(&col)
+        {
+            let Some(col_refresh) = try_ensure_storage_cursor_row_layout_local(
+                cursor,
+                col_end,
+                self.collect_vdbe_metrics,
+            )?
+            else {
+                return Ok(false);
+            };
+            refresh_state.refreshed |= col_refresh.refreshed;
+            refresh_state.eager_values_ready |= col_refresh.eager_values_ready;
+        }
+        self.column_to_reg_direct_finish(cursor_id, col_idx, payload_idx, target, refresh_state)
+    }
+
+    /// Second half of a direct column read: decode record slot `payload_idx`
+    /// of the current row, whose layout already covers it, and write it to
+    /// register `target`.
+    #[allow(clippy::too_many_lines, clippy::cast_sign_loss)]
+    fn column_to_reg_direct_finish(
+        &mut self,
+        cursor_id: i32,
+        col_idx: usize,
+        payload_idx: usize,
+        target: i32,
+        refresh_state: DecodeCacheRefreshState,
+    ) -> Result<bool> {
+        let text_encoding = self.text_encoding;
         let collect_vdbe_metrics = self.collect_vdbe_metrics;
+        let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) else {
+            return Err(FrankenError::internal(
+                "storage cursor closed during a column read",
+            ));
+        };
 
         if payload_idx < cursor.row_decode.column_count() {
-            if let Some(col) = cursor.row_decode.column_offset(payload_idx).copied()
-                && let Some(col_end) = column_payload_end(&col)
-            {
-                let col_refresh =
-                    ensure_storage_cursor_row_layout(cursor, col_end, collect_vdbe_metrics).await?;
-                refresh_state.refreshed |= col_refresh.refreshed;
-                refresh_state.eager_values_ready |= col_refresh.eager_values_ready;
-            }
             // Already decoded? Write from cache to register with buffer reuse.
             let cached_value_ready = cursor.row_decode.cached_value_ready(payload_idx);
             if cached_value_ready {
@@ -19717,6 +19858,24 @@ async fn storage_cursor_cached_rowid(cursor: &mut StorageCursor) -> Result<i64> 
     Ok(rowid)
 }
 
+/// [`storage_cursor_cached_rowid`] without waiting.
+///
+/// `None` means the rowid is neither cached nor readable from a table-leaf
+/// cell. Callers reach this only after a row-layout pass on the same row, so
+/// the first-key refresh above the cache check has nothing left to drop and a
+/// `None` leaves the cursor as it was.
+fn try_storage_cursor_cached_rowid_local(cursor: &mut StorageCursor) -> Result<Option<i64>> {
+    refresh_storage_cursor_first_key_state(cursor, false);
+    if let Some(rowid) = cursor.cached_rowid {
+        return Ok(Some(rowid));
+    }
+    let Some(rowid) = cursor.cursor.try_table_leaf_rowid()? else {
+        return Ok(None);
+    };
+    cursor.cached_rowid = Some(rowid);
+    Ok(Some(rowid))
+}
+
 /// Whether the current row's payload stores the INTEGER PRIMARY KEY slot,
 /// cached per row. Call after `ensure_storage_cursor_row_layout`.
 ///
@@ -19732,7 +19891,56 @@ async fn storage_cursor_payload_includes_rowid_alias(
     if let Some(cached) = cursor.payload_includes_rowid_alias {
         return Ok(cached);
     }
-    let mut includes = payload_includes_rowid_alias_without_rowid(
+    let (mut includes, rowid_slot) = payload_rowid_alias_header_verdict(cursor, ipk_col_idx);
+    if let Some(slot) = rowid_slot {
+        let slot_end = rowid_alias_slot_end(&slot, ipk_col_idx)?;
+        ensure_storage_cursor_row_layout(cursor, slot_end, collect_vdbe_metrics).await?;
+        let rowid = storage_cursor_cached_rowid(cursor).await?;
+        includes = payload_slot_holds_rowid(cursor, &slot, rowid);
+    }
+    cursor.payload_includes_rowid_alias = Some(includes);
+    Ok(includes)
+}
+
+/// [`storage_cursor_payload_includes_rowid_alias`] without waiting.
+///
+/// `None` means the short-payload rowid comparison needs payload bytes or a
+/// rowid that are not at hand; nothing is cached in that case.
+fn try_storage_cursor_payload_includes_rowid_alias_local(
+    cursor: &mut StorageCursor,
+    ipk_col_idx: usize,
+    collect_vdbe_metrics: bool,
+) -> Result<Option<bool>> {
+    if let Some(cached) = cursor.payload_includes_rowid_alias {
+        return Ok(Some(cached));
+    }
+    let (mut includes, rowid_slot) = payload_rowid_alias_header_verdict(cursor, ipk_col_idx);
+    if let Some(slot) = rowid_slot {
+        let slot_end = rowid_alias_slot_end(&slot, ipk_col_idx)?;
+        if try_ensure_storage_cursor_row_layout_local(cursor, slot_end, collect_vdbe_metrics)?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let Some(rowid) = try_storage_cursor_cached_rowid_local(cursor)? else {
+            return Ok(None);
+        };
+        includes = payload_slot_holds_rowid(cursor, &slot, rowid);
+    }
+    cursor.payload_includes_rowid_alias = Some(includes);
+    Ok(Some(includes))
+}
+
+/// What the record header alone says about the INTEGER PRIMARY KEY slot.
+///
+/// Returns the header-only verdict and, when that verdict is "absent" on a
+/// short payload whose slot holds an integer, the slot to compare with the
+/// row's rowid.
+fn payload_rowid_alias_header_verdict(
+    cursor: &StorageCursor,
+    ipk_col_idx: usize,
+) -> (bool, Option<ColumnOffset>) {
+    let includes = payload_includes_rowid_alias_without_rowid(
         &cursor.row_decode,
         ipk_col_idx,
         cursor.table_column_count,
@@ -19748,18 +19956,23 @@ async fn storage_cursor_payload_includes_rowid_alias(
             SerialTypeClass::Integer | SerialTypeClass::Zero | SerialTypeClass::One
         )
     {
-        let slot_end = column_payload_end(&slot).ok_or_else(|| FrankenError::DatabaseCorrupt {
-            detail: format!("malformed column {ipk_col_idx} payload length"),
-        })?;
-        ensure_storage_cursor_row_layout(cursor, slot_end, collect_vdbe_metrics).await?;
-        let rowid = storage_cursor_cached_rowid(cursor).await?;
-        includes = matches!(
-            fsqlite_types::record::decode_numeric_column_from_offset(&cursor.payload_buf, &slot),
-            Some(fsqlite_types::record::NumericColumnValue::Integer(v)) if v == rowid
-        );
+        return (includes, Some(slot));
     }
-    cursor.payload_includes_rowid_alias = Some(includes);
-    Ok(includes)
+    (includes, None)
+}
+
+fn rowid_alias_slot_end(slot: &ColumnOffset, ipk_col_idx: usize) -> Result<usize> {
+    column_payload_end(slot).ok_or_else(|| FrankenError::DatabaseCorrupt {
+        detail: format!("malformed column {ipk_col_idx} payload length"),
+    })
+}
+
+/// Whether the loaded payload stores `rowid` in the INTEGER PRIMARY KEY slot.
+fn payload_slot_holds_rowid(cursor: &StorageCursor, slot: &ColumnOffset, rowid: i64) -> bool {
+    matches!(
+        fsqlite_types::record::decode_numeric_column_from_offset(&cursor.payload_buf, slot),
+        Some(fsqlite_types::record::NumericColumnValue::Integer(v)) if v == rowid
+    )
 }
 
 async fn storage_cursor_first_index_key_column_offset(
@@ -20579,6 +20792,30 @@ fn column_payload_end(col: &ColumnOffset) -> Option<usize> {
     start.checked_add(len)
 }
 
+/// Record slot that stores declared column `col_idx` of a storage cursor's
+/// row, for a column other than the INTEGER PRIMARY KEY alias itself.
+///
+/// Columns after the alias sit one slot earlier when the payload omits it.
+/// A non-leading-PK WITHOUT ROWID table then maps the declared position to
+/// its physical slot (bd-v6pjf); the mapping is the identity when the table
+/// has no entry in `wr_storage_order`.
+fn storage_payload_column_index(
+    col_idx: usize,
+    ipk_col_idx: Option<usize>,
+    payload_includes_rowid_alias: bool,
+    wr_storage_order: Option<&HashMap<i32, Vec<usize>>>,
+    root_page: i32,
+) -> usize {
+    let payload_idx = match ipk_col_idx {
+        Some(ipk) if col_idx > ipk && !payload_includes_rowid_alias => col_idx - 1,
+        _ => col_idx,
+    };
+    wr_storage_order
+        .and_then(|map| map.get(&root_page))
+        .and_then(|inv| inv.get(payload_idx).copied())
+        .unwrap_or(payload_idx)
+}
+
 fn row_decode_payload_end(row_decode: &RowDecodeScratch) -> Option<usize> {
     let mut end = 0_usize;
     for idx in 0..row_decode.column_count() {
@@ -20617,11 +20854,104 @@ async fn ensure_storage_cursor_payload_prefix(
         .await
 }
 
+/// Make the current row's record layout cover `min_payload_bytes`.
+///
+/// The work is three steps: [`begin_storage_cursor_row_layout`], a payload
+/// prefix load, and [`finish_storage_cursor_row_layout`], repeating the last
+/// two while the header or the requested column needs more bytes. Only the
+/// load can wait for page I/O, and only when the payload spills to overflow
+/// pages; [`try_ensure_storage_cursor_row_layout_local`] is the same pass for
+/// a payload that does not.
 async fn ensure_storage_cursor_row_layout(
     cursor: &mut StorageCursor,
     min_payload_bytes: usize,
     collect_vdbe_metrics: bool,
 ) -> Result<DecodeCacheRefreshState> {
+    let refreshed =
+        match begin_storage_cursor_row_layout(cursor, min_payload_bytes, collect_vdbe_metrics) {
+            RowLayoutStart::Ready(state) => return Ok(state),
+            RowLayoutStart::Load { refreshed } => refreshed,
+        };
+    let mut requested_bytes = min_payload_bytes.max(STORAGE_CURSOR_LAYOUT_PREFIX_BYTES);
+    loop {
+        ensure_storage_cursor_payload_prefix(cursor, requested_bytes).await?;
+        if let Some(state) = finish_storage_cursor_row_layout(
+            cursor,
+            min_payload_bytes,
+            &mut requested_bytes,
+            refreshed,
+        )? {
+            return Ok(state);
+        }
+    }
+}
+
+/// [`ensure_storage_cursor_row_layout`] without waiting, for a row whose
+/// payload is local to its table leaf.
+///
+/// Returns `None`, having changed nothing, when the payload would have to be
+/// read through the async path. Otherwise it runs the same three steps and
+/// leaves the cursor in the state the async function would.
+fn try_ensure_storage_cursor_row_layout_local(
+    cursor: &mut StorageCursor,
+    min_payload_bytes: usize,
+    collect_vdbe_metrics: bool,
+) -> Result<Option<DecodeCacheRefreshState>> {
+    // The cached layout already covers the request: `begin` would report
+    // `Ready` without touching the cursor, whatever kind of row this is.
+    if cursor.last_position_stamp == cursor.cursor.position_stamp()
+        && !cursor.row_decode.is_empty()
+        && cursor.payload_buf.len() >= min_payload_bytes
+    {
+        return Ok(Some(DecodeCacheRefreshState::default()));
+    }
+    if !cursor.cursor.current_row_has_local_table_payload()? {
+        return Ok(None);
+    }
+    let refreshed =
+        match begin_storage_cursor_row_layout(cursor, min_payload_bytes, collect_vdbe_metrics) {
+            RowLayoutStart::Ready(state) => return Ok(Some(state)),
+            RowLayoutStart::Load { refreshed } => refreshed,
+        };
+    let mut requested_bytes = min_payload_bytes.max(STORAGE_CURSOR_LAYOUT_PREFIX_BYTES);
+    loop {
+        if cursor.payload_buf.len() < requested_bytes
+            && !cursor
+                .cursor
+                .try_local_table_payload_prefix_into(requested_bytes, &mut cursor.payload_buf)?
+        {
+            return Err(FrankenError::internal(
+                "row payload stopped being local during a row-layout pass",
+            ));
+        }
+        if let Some(state) = finish_storage_cursor_row_layout(
+            cursor,
+            min_payload_bytes,
+            &mut requested_bytes,
+            refreshed,
+        )? {
+            return Ok(Some(state));
+        }
+    }
+}
+
+/// How a row-layout pass starts.
+enum RowLayoutStart {
+    /// The cached layout already covers the request.
+    Ready(DecodeCacheRefreshState),
+    /// Payload bytes must be loaded; `refreshed` records whether this pass
+    /// dropped the decode cache because the cursor moved.
+    Load { refreshed: bool },
+}
+
+/// Start a row-layout pass: drop the decode cache if the cursor is on a
+/// different row image than the cache describes, then report whether the
+/// cached layout already covers `min_payload_bytes`.
+fn begin_storage_cursor_row_layout(
+    cursor: &mut StorageCursor,
+    min_payload_bytes: usize,
+    collect_vdbe_metrics: bool,
+) -> RowLayoutStart {
     let position_stamp = cursor.cursor.position_stamp();
     let mut refreshed = false;
     if cursor.last_position_stamp != position_stamp {
@@ -20648,70 +20978,75 @@ async fn ensure_storage_cursor_row_layout(
 
     if !refreshed && !cursor.row_decode.is_empty() && cursor.payload_buf.len() >= min_payload_bytes
     {
-        return Ok(DecodeCacheRefreshState {
+        return RowLayoutStart::Ready(DecodeCacheRefreshState {
             refreshed: false,
             eager_values_ready: false,
         });
     }
+    RowLayoutStart::Load { refreshed }
+}
 
-    let required_bytes = min_payload_bytes;
-    let mut requested_bytes = min_payload_bytes.max(STORAGE_CURSOR_LAYOUT_PREFIX_BYTES);
-
-    loop {
-        ensure_storage_cursor_payload_prefix(cursor, requested_bytes).await?;
-
-        if cursor.row_decode.is_empty() {
-            if cursor
-                .row_decode
-                .prepare_for_record_prefix(&cursor.payload_buf)
-                .is_none()
-            {
-                let loaded = cursor.payload_buf.len();
-                if loaded < requested_bytes {
-                    return Err(FrankenError::DatabaseCorrupt {
-                        detail: "malformed record header or payload in cursor payload".to_owned(),
-                    });
-                }
-                requested_bytes = requested_bytes
-                    .saturating_mul(2)
-                    .max(loaded.saturating_add(1));
-                continue;
-            }
-        }
-
-        if cursor.payload_buf.len() < required_bytes {
+/// Finish a row-layout pass after a payload-prefix load of `*requested_bytes`.
+///
+/// Returns `Ok(None)` when the record header or the required column needs
+/// more payload, with `*requested_bytes` grown for the next load.
+fn finish_storage_cursor_row_layout(
+    cursor: &mut StorageCursor,
+    required_bytes: usize,
+    requested_bytes: &mut usize,
+    refreshed: bool,
+) -> Result<Option<DecodeCacheRefreshState>> {
+    if cursor.row_decode.is_empty() {
+        if cursor
+            .row_decode
+            .prepare_for_record_prefix(&cursor.payload_buf)
+            .is_none()
+        {
             let loaded = cursor.payload_buf.len();
-            if loaded < requested_bytes {
+            if loaded < *requested_bytes {
                 return Err(FrankenError::DatabaseCorrupt {
-                    detail: format!(
-                        "cursor payload shorter than required prefix: need {required_bytes}, have {loaded}"
-                    ),
+                    detail: "malformed record header or payload in cursor payload".to_owned(),
                 });
             }
-            requested_bytes = required_bytes.max(loaded.saturating_mul(2));
-            continue;
+            *requested_bytes = requested_bytes
+                .saturating_mul(2)
+                .max(loaded.saturating_add(1));
+            return Ok(None);
         }
-
-        let eager_values_ready = if cursor.row_decode.column_count() > 64
-            && !cursor.row_decode.cached_value_ready(64)
-            && row_decode_payload_end(&cursor.row_decode)
-                .is_some_and(|record_len| cursor.payload_buf.len() >= record_len)
-        {
-            cursor
-                .row_decode
-                .prepare_for_record_with_encoding(&cursor.payload_buf, cursor.text_encoding)
-                .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                    detail: "malformed wide record in cursor payload".to_owned(),
-                })?
-        } else {
-            false
-        };
-
-        return Ok(DecodeCacheRefreshState {
-            refreshed,
-            eager_values_ready,
-        });
     }
+
+    if cursor.payload_buf.len() < required_bytes {
+        let loaded = cursor.payload_buf.len();
+        if loaded < *requested_bytes {
+            return Err(FrankenError::DatabaseCorrupt {
+                detail: format!(
+                    "cursor payload shorter than required prefix: need {required_bytes}, have {loaded}"
+                ),
+            });
+        }
+        *requested_bytes = required_bytes.max(loaded.saturating_mul(2));
+        return Ok(None);
+    }
+
+    let eager_values_ready = if cursor.row_decode.column_count() > 64
+        && !cursor.row_decode.cached_value_ready(64)
+        && row_decode_payload_end(&cursor.row_decode)
+            .is_some_and(|record_len| cursor.payload_buf.len() >= record_len)
+    {
+        cursor
+            .row_decode
+            .prepare_for_record_with_encoding(&cursor.payload_buf, cursor.text_encoding)
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: "malformed wide record in cursor payload".to_owned(),
+            })?
+    } else {
+        false
+    };
+
+    Ok(Some(DecodeCacheRefreshState {
+        refreshed,
+        eager_values_ready,
+    }))
 }
 
 fn ensure_sorter_row_cache(

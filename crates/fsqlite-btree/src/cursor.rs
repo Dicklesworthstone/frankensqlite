@@ -11418,6 +11418,55 @@ impl<P: PageWriter> BtCursor<P> {
         }
         Ok(true)
     }
+
+    /// Whether the current row is a table-leaf cell whose whole payload is
+    /// stored on the leaf page, so it can be read without page I/O.
+    ///
+    /// `false` covers everything else: an index cursor, a payload that
+    /// spills to overflow pages, EOF, and an unpositioned cursor.
+    pub fn current_row_has_local_table_payload(&self) -> Result<bool> {
+        if self.at_eof {
+            return Ok(false);
+        }
+        let Some(top) = self.stack.last() else {
+            return Ok(false);
+        };
+        Ok(self.local_leaf_table_cell(top, top.cell_idx)?.is_some())
+    }
+
+    /// Synchronous fast path of [`BtreeCursorOps::payload_prefix_into`] for a
+    /// row with a local table payload.
+    ///
+    /// Returns `Ok(false)` with `buf` untouched when the general path is
+    /// needed (see [`Self::current_row_has_local_table_payload`]).
+    pub fn try_local_table_payload_prefix_into(
+        &self,
+        max_prefix_bytes: usize,
+        buf: &mut Vec<u8>,
+    ) -> Result<bool> {
+        if self.at_eof {
+            return Ok(false);
+        }
+        let Some(top) = self.stack.last() else {
+            return Ok(false);
+        };
+        self.local_leaf_table_payload_prefix_into(top, top.cell_idx, max_prefix_bytes, buf)
+    }
+
+    /// Synchronous fast path of [`BtreeCursorOps::rowid`]: the rowid of the
+    /// current table-leaf cell, or `None` when the cursor is not on one.
+    pub fn try_table_leaf_rowid(&self) -> Result<Option<i64>> {
+        if self.at_eof {
+            return Ok(None);
+        }
+        let Some(top) = self.stack.last() else {
+            return Ok(None);
+        };
+        if top.header.page_type.is_leaf() && top.header.page_type.is_table() {
+            return Self::table_leaf_rowid_at(top, top.cell_idx).map(Some);
+        }
+        Ok(None)
+    }
 }
 
 #[allow(clippy::missing_errors_doc)]
