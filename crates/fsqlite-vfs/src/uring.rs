@@ -62,6 +62,12 @@ const IO_URING_QUEUE_ENTRIES: u32 = 256;
 const IO_URING_CANCEL_TAG: u64 = 1_u64 << 63;
 #[cfg(feature = "linux-asupersync-uring")]
 const IO_URING_DRIVER_WAIT: Duration = Duration::from_millis(1);
+/// Read buffers kept for reuse: enough for the reads a statement keeps in
+/// flight, each no larger than one read chunk.
+#[cfg(feature = "linux-asupersync-uring")]
+const READ_BUFFER_POOL_MAX_BUFFERS: usize = 32;
+#[cfg(feature = "linux-asupersync-uring")]
+const READ_BUFFER_POOL_MAX_BYTES: usize = IO_URING_MAX_RW_CHUNK_BYTES;
 #[cfg(all(test, feature = "linux-asupersync-uring"))]
 static FORCE_ASUPERSYNC_INIT_FAIL: AtomicBool = AtomicBool::new(false);
 #[cfg(all(test, feature = "linux-asupersync-uring"))]
@@ -385,6 +391,11 @@ struct IoUringRuntime {
     first_cancel_submitted_at: OnceLock<Instant>,
     #[cfg(feature = "linux-asupersync-uring")]
     largest_submission_batch: AtomicU64,
+    /// Completed read buffers kept for the next read (bd-w4pr1.11). A fresh
+    /// zeroed `Vec` per page read was a malloc + free + memset each time,
+    /// and under musl's allocator an mmap + munmap pair.
+    #[cfg(feature = "linux-asupersync-uring")]
+    read_buffers: Mutex<Vec<Vec<u8>>>,
     #[cfg(test)]
     driver_wait: Duration,
     /// io-wq worker limits registered on `ring`; `None` when uncapped.
@@ -509,6 +520,7 @@ impl IoUringRuntime {
                 #[cfg(test)]
                 first_cancel_submitted_at: OnceLock::new(),
                 largest_submission_batch: AtomicU64::new(0),
+                read_buffers: Mutex::new(Vec::new()),
                 #[cfg(test)]
                 driver_wait: IO_URING_DRIVER_WAIT,
                 iowq_max_workers,
@@ -595,9 +607,44 @@ impl IoUringRuntime {
             native_cx,
             file,
             offset,
-            DriverRequestKind::Read(vec![0_u8; len]),
+            DriverRequestKind::Read(self.take_read_buffer(len)),
             None,
         )
+    }
+
+    /// A `len`-byte read target, reused from an earlier read when one is
+    /// pooled. Bytes past what the kernel transfers may be stale: consumers
+    /// copy only the transferred prefix.
+    #[cfg(feature = "linux-asupersync-uring")]
+    fn take_read_buffer(&self, len: usize) -> Vec<u8> {
+        let pooled = self
+            .read_buffers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop();
+        match pooled {
+            Some(mut buffer) => {
+                buffer.resize(len, 0);
+                buffer
+            }
+            None => vec![0_u8; len],
+        }
+    }
+
+    /// Return a completed read target for reuse; large or surplus buffers are
+    /// dropped so the pool stays bounded.
+    #[cfg(feature = "linux-asupersync-uring")]
+    fn recycle_read_buffer(&self, buffer: Vec<u8>) {
+        if buffer.capacity() > READ_BUFFER_POOL_MAX_BYTES {
+            return;
+        }
+        let mut pool = self
+            .read_buffers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pool.len() < READ_BUFFER_POOL_MAX_BUFFERS {
+            pool.push(buffer);
+        }
     }
 
     #[cfg(feature = "linux-asupersync-uring")]
@@ -1598,7 +1645,11 @@ impl IoUringFile {
             cancel_guard.disarm();
             let bytes_read = match completion {
                 DriverCompletion::Read { data, bytes_read } => {
-                    buf[total..chunk_end].copy_from_slice(&data);
+                    // Only the transferred prefix is file data (a pooled
+                    // buffer may hold stale bytes past it). The loop reads on
+                    // from `total`, and any final shortfall is zero-filled.
+                    buf[total..total + bytes_read].copy_from_slice(&data[..bytes_read]);
+                    self.runtime.recycle_read_buffer(data);
                     bytes_read
                 }
                 DriverCompletion::Cancelled => return Err(FrankenError::Abort),
@@ -2556,6 +2607,63 @@ mod tests {
         assert_eq!(n, 14);
         assert_eq!(&buf, b"hello io_uring");
         file.close(&cx).expect("close should succeed");
+    }
+
+    /// bd-w4pr1.11: read targets are pooled. A recycled buffer is longer than
+    /// a later, smaller request and still holds the previous read's bytes:
+    /// it must be cut to the request (or the kernel transfers past it), and a
+    /// short read must still come back zero-filled past EOF.
+    #[cfg(feature = "linux-asupersync-uring")]
+    #[test]
+    fn test_io_uring_recycled_read_buffer_is_sized_to_each_request() {
+        let _guard = io_uring_test_guard();
+        let cx = Cx::new();
+        let vfs = IoUringVfs::new();
+        assert!(vfs.is_available(), "requires io_uring: {}", vfs.status());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut full, _) = vfs
+            .open(
+                &cx,
+                Some(&dir.path().join("full.db")),
+                open_flags_create_unlocked(),
+            )
+            .expect("open full");
+        let (mut short, _) = vfs
+            .open(
+                &cx,
+                Some(&dir.path().join("short.db")),
+                open_flags_create_unlocked(),
+            )
+            .expect("open short");
+        block_on_test(&cx, full.write(&cx, &[0xAB; 4096], 0)).expect("write full");
+        block_on_test(&cx, short.write(&cx, &[0x11; 100], 0)).expect("write short");
+
+        let mut page = [0_u8; 4096];
+        let n = block_on_test(&cx, full.read(&cx, &mut page, 0)).expect("read full");
+        assert_eq!(n, 4096);
+        assert!(page.iter().all(|byte| *byte == 0xAB));
+        assert!(
+            !full.runtime.read_buffers.lock().unwrap().is_empty(),
+            "a completed io_uring read must return its buffer to the pool"
+        );
+
+        // The pooled 4096-byte buffer serves a 14-byte request: an uncut
+        // buffer would let the kernel transfer 4096 bytes into a 14-byte slot.
+        let mut small = [0_u8; 14];
+        let n = block_on_test(&cx, full.read(&cx, &mut small, 10)).expect("small read");
+        assert_eq!(n, 14);
+        assert_eq!(small, [0xAB; 14]);
+
+        let mut short_page = [0xEE_u8; 4096];
+        let n = block_on_test(&cx, short.read(&cx, &mut short_page, 0)).expect("read short");
+        assert_eq!(n, 100);
+        assert!(short_page[..100].iter().all(|byte| *byte == 0x11));
+        assert!(
+            short_page[100..].iter().all(|byte| *byte == 0),
+            "bytes past EOF must be zero, not a recycled buffer's stale 0xAB"
+        );
+        full.close(&cx).expect("close full");
+        short.close(&cx).expect("close short");
     }
 
     #[test]
