@@ -38,7 +38,12 @@ use std::fmt;
 use std::future::Future;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
+use std::pin::pin;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, Poll, Wake, Waker};
+use std::thread::{self, Thread};
 use std::time::Duration;
 
 use fsqlite_error::FrankenError;
@@ -50,21 +55,65 @@ pub use crate::compat::OpenFlags;
 pub use ffi::ErrorCode;
 pub use types::{FromSql, ToSql};
 
-/// Drive an engine future to completion on this thread's runtime.
+/// Drive an engine future to completion on the calling thread.
+///
+/// A blocking connection never leaves its thread and is opened with
+/// [`dedicated_thread_env`], so its futures run their page I/O inline and
+/// almost always finish on the first poll. Polling them here, and parking only
+/// when one really is pending, costs a few nanoseconds per call. Entering an
+/// async runtime for every call cost about 25 µs, several times the statement
+/// itself (bd-w4pr1.23). The `AsyncConnection` worker thread drives the same
+/// futures the same way.
+///
+/// This uses no thread-local state that can already be gone, so it also works
+/// for a connection dropped from another thread-local's destructor.
 fn block_on<F: Future>(future: F) -> F::Output {
-    try_block_on(future).expect("fsqlite::blocking used during thread teardown")
+    /// Wakes the thread that is driving the future.
+    struct Unpark {
+        thread: Thread,
+        notified: AtomicBool,
+    }
+
+    impl Wake for Unpark {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.notified.store(true, Ordering::Release);
+            self.thread.unpark();
+        }
+    }
+
+    let unpark = Arc::new(Unpark {
+        thread: thread::current(),
+        notified: AtomicBool::new(false),
+    });
+    let waker = Waker::from(Arc::clone(&unpark));
+    let mut context = Context::from_waker(&waker);
+    let mut future = pin!(future);
+    loop {
+        if let Poll::Ready(output) = future.as_mut().poll(&mut context) {
+            return output;
+        }
+        // `park` can return spuriously, and a wake can arrive before it is
+        // reached; the flag makes both cases correct.
+        while !unpark.notified.swap(false, Ordering::Acquire) {
+            thread::park();
+        }
+    }
 }
 
-/// [`block_on`], or `None` once the thread's runtime has been torn down (a
-/// connection dropped from another thread-local's destructor).
-fn try_block_on<F: Future>(future: F) -> Option<F::Output> {
-    thread_local! {
-        static RUNTIME: asupersync::runtime::Runtime =
-            asupersync::runtime::RuntimeBuilder::current_thread()
-                .build()
-                .expect("build the fsqlite::blocking runtime");
-    }
-    RUNTIME.try_with(|runtime| runtime.block_on(future)).ok()
+/// The environment of a blocking connection: one whose whole life, open to
+/// close, is spent on the thread that opened it.
+///
+/// The type guarantees that (a [`Connection`] is not `Send`), which is the
+/// condition under which the engine may run bounded page reads and writes
+/// inline instead of handing each one to another thread.
+fn dedicated_thread_env() -> crate::ConnectionEnv {
+    let mut env = crate::ConnectionEnv::default();
+    env.mark_blocking_io_inline_safe();
+    env
 }
 
 /// SQLite result codes, as rusqlite's `ffi` module names them.
@@ -1214,7 +1263,10 @@ impl Connection {
     /// opens a private in-memory database.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = Self::path_text(path.as_ref())?;
-        Ok(Self::wrap(block_on(crate::Connection::open(path))?))
+        Ok(Self::wrap(block_on(crate::Connection::open_with_env(
+            path,
+            dedicated_thread_env(),
+        ))?))
     }
 
     /// Open a private in-memory database.
@@ -1226,9 +1278,9 @@ impl Connection {
     /// read-write without create, URI filenames).
     pub fn open_with_flags<P: AsRef<Path>>(path: P, flags: OpenFlags) -> Result<Self> {
         let path = Self::path_text(path.as_ref())?;
-        Ok(Self::wrap(block_on(crate::compat::open_with_flags(
-            path, flags,
-        ))?))
+        Ok(Self::wrap(block_on(
+            crate::compat::open_with_flags_with_env(path, flags, dedicated_thread_env()),
+        )?))
     }
 
     /// Open a private in-memory database with `flags`.
@@ -1488,7 +1540,7 @@ impl Connection {
 impl Drop for Connection {
     fn drop(&mut self) {
         if let Some(mut inner) = self.inner.take() {
-            let _ = try_block_on(inner.close_in_place());
+            let _ = block_on(inner.close_in_place());
         }
     }
 }
@@ -2706,6 +2758,151 @@ mod tests {
             );
             assert_eq!(mine, theirs, "file_backed={file_backed}");
         }
+    }
+
+    /// A future that is pending until another thread wakes it must resume: a
+    /// driver that polled once, or lost a wake that arrived before it parked,
+    /// would hang or return early here.
+    #[test]
+    fn block_on_resumes_a_future_woken_from_another_thread() {
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct Shared {
+            ready: bool,
+            waker: Option<Waker>,
+        }
+
+        struct WaitForSignal(Arc<Mutex<Shared>>);
+
+        impl Future for WaitForSignal {
+            type Output = u32;
+
+            fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<u32> {
+                let mut shared = self.0.lock().unwrap();
+                if shared.ready {
+                    Poll::Ready(7)
+                } else {
+                    shared.waker = Some(cx.waker().clone());
+                    Poll::Pending
+                }
+            }
+        }
+
+        for delay_ms in [0_u64, 1, 20] {
+            let shared = Arc::new(Mutex::new(Shared::default()));
+            let signal = Arc::clone(&shared);
+            let waker_thread = thread::spawn(move || {
+                thread::sleep(Duration::from_millis(delay_ms));
+                loop {
+                    let mut shared = signal.lock().unwrap();
+                    if let Some(waker) = shared.waker.take() {
+                        shared.ready = true;
+                        drop(shared);
+                        waker.wake();
+                        return;
+                    }
+                    drop(shared);
+                    thread::yield_now();
+                }
+            });
+            assert_eq!(block_on(WaitForSignal(shared)), 7);
+            waker_thread.join().unwrap();
+        }
+    }
+
+    /// Two connections on two threads: a writer that waits for the lock gets
+    /// it once the holder commits, and a wait longer than `busy_timeout`
+    /// fails with SQLITE_BUSY, as rusqlite's does. Both depend on the engine
+    /// waking, or timing out, a call that is parked in `block_on`.
+    #[test]
+    fn a_blocked_writer_waits_for_the_lock_and_honours_busy_timeout() {
+        use std::sync::mpsc;
+        use std::time::Instant;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_path(&dir, "busy.db");
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("CREATE TABLE t(x);")
+            .unwrap();
+
+        // `hold` is how long the first writer keeps its transaction open after
+        // the second one has been told to start.
+        let run = |hold: Duration, timeout: Duration| {
+            let (locked_tx, locked_rx) = mpsc::channel();
+            let holder_path = path.clone();
+            let holder = thread::spawn(move || {
+                let conn = Connection::open(&holder_path).unwrap();
+                conn.execute_batch("BEGIN IMMEDIATE; INSERT INTO t VALUES (1);")
+                    .unwrap();
+                locked_tx.send(()).unwrap();
+                thread::sleep(hold);
+                conn.execute_batch("COMMIT;").unwrap();
+            });
+            locked_rx.recv().unwrap();
+            let conn = Connection::open(&path).unwrap();
+            conn.busy_timeout(timeout).unwrap();
+            let started = Instant::now();
+            let outcome = conn.execute_batch("BEGIN IMMEDIATE; INSERT INTO t VALUES (2); COMMIT;");
+            let waited = started.elapsed();
+            holder.join().unwrap();
+            (outcome, waited)
+        };
+
+        let (outcome, waited) = run(Duration::from_millis(300), Duration::from_secs(20));
+        outcome.expect("the waiting writer gets the lock once the holder commits");
+        assert!(
+            waited < Duration::from_secs(10),
+            "waited {waited:?} for a lock held for 300 ms"
+        );
+
+        let (outcome, waited) = run(Duration::from_millis(1500), Duration::from_millis(100));
+        match outcome {
+            Err(Error::SqliteFailure(error, _)) => {
+                assert_eq!(error.code, ErrorCode::DatabaseBusy);
+            }
+            other => panic!("expected SQLITE_BUSY after the timeout, got {other:?}"),
+        }
+        assert!(
+            waited < Duration::from_millis(1400),
+            "busy_timeout of 100 ms returned after {waited:?}, not before the holder released"
+        );
+    }
+
+    /// A connection owned by a thread-local is dropped while the thread shuts
+    /// down. The drop still closes it: the open transaction is rolled back
+    /// and the file opens cleanly afterwards.
+    #[test]
+    fn a_connection_dropped_during_thread_teardown_still_closes() {
+        thread_local! {
+            static HELD: RefCell<Option<Connection>> = const { RefCell::new(None) };
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_path(&dir, "teardown.db");
+        let worker_path = path.clone();
+        thread::spawn(move || {
+            let conn = Connection::open(&worker_path).unwrap();
+            conn.execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (1);")
+                .unwrap();
+            conn.execute_batch("BEGIN; INSERT INTO t VALUES (2);")
+                .unwrap();
+            HELD.with(|held| *held.borrow_mut() = Some(conn));
+        })
+        .join()
+        .unwrap();
+
+        let conn = Connection::open(&path).unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT count(*) FROM t", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "the uncommitted row must not survive the thread");
+        conn.execute("INSERT INTO t VALUES (3)", []).unwrap();
+        let check: String = conn
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(check, "ok");
     }
 
     /// `u64`/`usize` convert with range checks (rusqlite has them only behind
