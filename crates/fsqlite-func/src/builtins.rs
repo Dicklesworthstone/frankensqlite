@@ -1344,17 +1344,8 @@ impl ScalarFunction for QuoteFunc {
         {
             // Non-UTF-8 TEXT keeps its bytes: '...' with quotes doubled, up to
             // the first NUL, as for ordinary text.
-            let bytes = text.as_bytes_direct();
-            let body = bytes.split(|&b| b == 0).next().unwrap_or(bytes);
-            let mut quoted = Vec::with_capacity(body.len() + 2);
-            quoted.push(b'\'');
-            for &b in body {
-                if b == b'\'' {
-                    quoted.push(b'\'');
-                }
-                quoted.push(b);
-            }
-            quoted.push(b'\'');
+            let body = text_bytes_until_nul(text.as_bytes_direct());
+            let quoted = quote_sql_bytes(body, b'\'', true, false).ok_or(FrankenError::TooBig)?;
             return Ok(text_from_bytes(quoted));
         }
         let result = quote_sql_value(&args[0], false);
@@ -1376,6 +1367,15 @@ pub struct UnistrQuoteFunc;
 
 impl ScalarFunction for UnistrQuoteFunc {
     fn invoke(&self, args: &[SqliteValue]) -> Result<SqliteValue> {
+        if let SqliteValue::Text(text) = &args[0]
+            && !text.is_valid_utf8()
+        {
+            let body = text_bytes_until_nul(text.as_bytes_direct());
+            let escape_controls = body.iter().any(|&byte| matches!(byte, 1..=31));
+            let quoted =
+                quote_sql_bytes(body, b'\'', true, escape_controls).ok_or(FrankenError::TooBig)?;
+            return Ok(text_from_bytes(quoted));
+        }
         let result = quote_sql_value(&args[0], true);
         Ok(SqliteValue::Text(SmallText::from_string(result)))
     }
@@ -1462,6 +1462,63 @@ fn append_sql_string_literal_body(out: &mut String, text: &str) {
 
 fn is_unistr_control_char(ch: char) -> bool {
     matches!(ch, '\u{0001}'..='\u{001F}')
+}
+
+/// Escape SQL literal/identifier bytes without a lossy UTF-8 conversion.
+/// The caller decides whether control escaping is required: %#q always uses
+/// it, whereas %#Q and unistr_quote only do so when a retained control byte
+/// needs a unistr('...') wrapper. Count the expansion before allocating.
+fn quote_sql_bytes(
+    bytes: &[u8],
+    quote: u8,
+    surround: bool,
+    escape_controls: bool,
+) -> Option<Vec<u8>> {
+    let wrapper_len = if surround {
+        if escape_controls { 10_usize } else { 2 }
+    } else {
+        0
+    };
+    let output_len = bytes.iter().try_fold(wrapper_len, |len, &byte| {
+        let extra = if byte == quote || (escape_controls && byte == b'\\') {
+            2
+        } else if escape_controls && matches!(byte, 1..=31) {
+            6
+        } else {
+            1
+        };
+        len.checked_add(extra)
+    })?;
+    if output_len >= PRINTF_MAX_LENGTH {
+        return None;
+    }
+    let mut out = Vec::with_capacity(output_len);
+    if surround {
+        if escape_controls {
+            out.extend_from_slice(b"unistr('");
+        } else {
+            out.push(quote);
+        }
+    }
+    for &byte in bytes {
+        if byte == quote || (escape_controls && byte == b'\\') {
+            out.extend_from_slice(&[byte, byte]);
+        } else if escape_controls && matches!(byte, 1..=31) {
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            out.extend_from_slice(b"\\u00");
+            out.push(HEX[usize::from(byte >> 4)]);
+            out.push(HEX[usize::from(byte & 0x0F)]);
+        } else {
+            out.push(byte);
+        }
+    }
+    if surround {
+        out.push(quote);
+        if escape_controls {
+            out.push(b')');
+        }
+    }
+    Some(out)
 }
 
 // ── unhex(X [, Y]) ──────────────────────────────────────────────────────
@@ -2632,21 +2689,22 @@ impl ScalarFunction for FormatFunc {
         if args.is_empty() || args[0].is_null() {
             return Ok(SqliteValue::Null);
         }
-        let fmt_str = args[0].to_text();
+        let format_bytes = args[0].text_bytes();
+        let fmt = text_bytes_until_nul(&format_bytes);
         // SQLite returns NULL (not empty text) when the format string is empty:
         // an empty format never appends to the StrAccum, so its result buffer
         // stays NULL. A non-empty format that renders to nothing (e.g.
         // printf('%s', NULL)) still yields empty TEXT, so only gate on the
         // format string being empty here.
-        if fmt_str.is_empty() {
+        if fmt.is_empty() {
             return Ok(SqliteValue::Null);
         }
         let params = &args[1..];
-        let Some(result) = sqlite_format(&fmt_str, params)? else {
+        let Some(result) = sqlite_format(fmt, params)? else {
             // bd-mcgdb: a too-big printf result renders as SQL NULL, not an error.
             return Ok(SqliteValue::Null);
         };
-        Ok(SqliteValue::Text(SmallText::from_string(result)))
+        Ok(text_from_bytes(result))
     }
 
     fn num_args(&self) -> i32 {
@@ -2672,14 +2730,16 @@ const PRINTF_FLOAT_PRECISION_CAP: usize = 100_000_000;
 ///
 /// Returns `Ok(None)` when the formatted result would reach `PRINTF_MAX_LENGTH`
 /// bytes; the caller renders that as SQL NULL (bd-mcgdb).
-fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<Option<String>> {
-    let mut result = String::new();
-    let chars: Vec<char> = fmt.chars().collect();
+fn sqlite_format(fmt: &[u8], params: &[SqliteValue]) -> Result<Option<Vec<u8>>> {
+    // SQLite TEXT need not be valid UTF-8. Both the format and the output are
+    // byte sequences; parsing ASCII directives must not decode literal bytes.
+    let mut result = Vec::new();
+    let chars = fmt;
     let mut i = 0;
     let mut param_idx = 0;
 
     while i < chars.len() {
-        if chars[i] != '%' {
+        if chars[i] != b'%' {
             result.push(chars[i]);
             i += 1;
             continue;
@@ -2689,7 +2749,7 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<Option<String>> {
             // A trailing bare `%` at the end of the format string stays literal
             // in stock SQLite: printf('abc%') == 'abc%', printf('%') == '%'
             // (bd-printf-incomplete-conversion-edge).
-            result.push('%');
+            result.push(b'%');
             break;
         }
 
@@ -2706,19 +2766,19 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<Option<String>> {
                 break;
             }
             match chars[i] {
-                '-' => left_align = true,
-                '+' => show_sign = true,
-                ' ' => space_sign = true,
-                '0' => zero_pad = true,
-                '#' => alt_form = true,
-                // SQLite's alternate-form-2 flag. For non-float conversions it has
-                // no effect; for %f/%g it selects the shortest round-trip form.
-                '!' => alt_form2 = true,
+                b'-' => left_align = true,
+                b'+' => show_sign = true,
+                b' ' => space_sign = true,
+                b'0' => zero_pad = true,
+                b'#' => alt_form = true,
+                // Alternate-form-2 counts string width/precision in UTF-8
+                // characters and selects the extended float representation.
+                b'!' => alt_form2 = true,
                 // SQLite's comma flag: group the integer digits into
                 // thousands separated by commas. Applies to the decimal
                 // conversions %d/%i/%u and the integer part of %f; it is
                 // accepted-but-inert for %e/%g/%x/%o (matches C SQLite).
-                ',' => comma_group = true,
+                b',' => comma_group = true,
                 _ => break,
             }
             i += 1;
@@ -2728,7 +2788,7 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<Option<String>> {
         // argument (bd-jvnwt). A negative dynamic width means left-justify with
         // its absolute value, matching C printf.
         let width: usize;
-        if i < chars.len() && chars[i] == '*' {
+        if i < chars.len() && chars[i] == b'*' {
             i += 1;
             let w = params.get(param_idx).map_or(0, SqliteValue::to_integer);
             param_idx += 1;
@@ -2755,16 +2815,16 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<Option<String>> {
             // %2147483648d -> width 0 (0x80000000 & 0x7fffffff), %3000000000d ->
             // 852516352, %4294967295d -> 2147483647. A width that reaches
             // PRINTF_MAX_LENGTH later NULLs the whole result.
-            width = parse_printf_field(&chars, &mut i);
+            width = parse_printf_field(chars, &mut i);
         }
 
         // Parse precision: a literal number, or `*` to take the precision from
         // the next argument (like width above). A negative dynamic precision
         // means "no precision", matching C printf.
         let mut precision = None;
-        if i < chars.len() && chars[i] == '.' {
+        if i < chars.len() && chars[i] == b'.' {
             i += 1;
-            if i < chars.len() && chars[i] == '*' {
+            if i < chars.len() && chars[i] == b'*' {
                 i += 1;
                 let p = params.get(param_idx).map_or(0, SqliteValue::to_integer);
                 param_idx += 1;
@@ -2789,16 +2849,16 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<Option<String>> {
                 // bd-mcgdb: same 32-bit-wrapping-then-low-31-bits fold as width.
                 // Integer/char conversions NULL the result past PRINTF_MAX_LENGTH;
                 // float conversions clamp instead (handled below at the spec).
-                precision = Some(parse_printf_field(&chars, &mut i));
+                precision = Some(parse_printf_field(chars, &mut i));
             }
         }
 
         // Length modifier: stock accepts `l` or `ll` before the conversion
         // (printf.c `case 'l'`). It only selects the C varargs width there; SQL
         // arguments are already 64-bit, so `%lld` formats exactly like `%d`.
-        if i < chars.len() && chars[i] == 'l' {
+        if i < chars.len() && chars[i] == b'l' {
             i += 1;
-            if i < chars.len() && chars[i] == 'l' {
+            if i < chars.len() && chars[i] == b'l' {
                 i += 1;
             }
         }
@@ -2818,7 +2878,7 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<Option<String>> {
             break;
         }
 
-        let spec = chars[i];
+        let spec = char::from(chars[i]);
         i += 1;
 
         // bd-mcgdb: enforce SQLite's SQLITE_MAX_LENGTH before materializing.
@@ -2850,7 +2910,7 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<Option<String>> {
             // (space-padded, right/left-justified): `%5%` -> "    %", `%-5%` ->
             // "%    ". The `0` flag pads with spaces (`%` is not numeric), so
             // pad_string is correct (bd-g27fn).
-            '%' => result.push_str(&pad_string("%", width, left_align)),
+            '%' => result.extend_from_slice(pad_string("%", width, left_align).as_bytes()),
             'n' => {} // no-op (security: never writes to memory)
             'd' | 'i' => {
                 let val = params.get(param_idx).map_or(0, SqliteValue::to_integer);
@@ -2865,7 +2925,7 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<Option<String>> {
                     comma_group,
                     precision,
                 );
-                result.push_str(&formatted);
+                result.extend_from_slice(formatted.as_bytes());
             }
             'u' => {
                 // Unsigned decimal (bd-jvnwt): reinterpret the i64 bit pattern as
@@ -2893,7 +2953,7 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<Option<String>> {
                 } else {
                     pad_string(&digits, width, left_align)
                 };
-                result.push_str(&padded);
+                result.extend_from_slice(padded.as_bytes());
             }
             'f' => {
                 let val = params.get(param_idx).map_or(0.0, SqliteValue::to_float);
@@ -2949,7 +3009,7 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<Option<String>> {
                     };
                     finish_float_padding(&body, width, left_align, show_sign, space_sign, zero_pad)
                 };
-                result.push_str(&formatted);
+                result.extend_from_slice(formatted.as_bytes());
             }
             'e' | 'E' => {
                 let val = params.get(param_idx).map_or(0.0, SqliteValue::to_float);
@@ -2959,7 +3019,7 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<Option<String>> {
                 let prec = precision.unwrap_or(6);
                 if let Some(s) = nonfinite_float_str(val, width, left_align, show_sign, space_sign)
                 {
-                    result.push_str(&s);
+                    result.extend_from_slice(s.as_bytes());
                 } else if alt_form2 {
                     // Share the shell's binary-to-decimal conversion; %e
                     // precision excludes its one leading significant digit.
@@ -2971,9 +3031,12 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<Option<String>> {
                     if val.is_sign_negative() {
                         formatted = format!("-{formatted}");
                     }
-                    result.push_str(&finish_float_padding(
-                        &formatted, width, left_align, show_sign, space_sign, zero_pad,
-                    ));
+                    result.extend_from_slice(
+                        finish_float_padding(
+                            &formatted, width, left_align, show_sign, space_sign, zero_pad,
+                        )
+                        .as_bytes(),
+                    );
                 } else {
                     // Round the mantissa's exact ties away from zero (C SQLite)
                     // instead of Rust's round-half-to-even, e.g.
@@ -2998,9 +3061,12 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<Option<String>> {
                             formatted = format!("{mantissa}.{exp_part}");
                         }
                     }
-                    result.push_str(&finish_float_padding(
-                        &formatted, width, left_align, show_sign, space_sign, zero_pad,
-                    ));
+                    result.extend_from_slice(
+                        finish_float_padding(
+                            &formatted, width, left_align, show_sign, space_sign, zero_pad,
+                        )
+                        .as_bytes(),
+                    );
                 }
             }
             'g' | 'G' => {
@@ -3018,7 +3084,7 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<Option<String>> {
                 let max_sig = FLOAT_SIG_DIGITS;
                 if let Some(s) = nonfinite_float_str(val, width, left_align, show_sign, space_sign)
                 {
-                    result.push_str(&s);
+                    result.extend_from_slice(s.as_bytes());
                 } else if alt_form2 {
                     let (digits, exp) =
                         sqlite_float_altform2_digits(val, SqliteFloatRounding::Significant(sig));
@@ -3032,9 +3098,12 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<Option<String>> {
                     if val.is_sign_negative() {
                         alt = format!("-{alt}");
                     }
-                    result.push_str(&finish_float_padding(
-                        &alt, width, left_align, show_sign, space_sign, zero_pad,
-                    ));
+                    result.extend_from_slice(
+                        finish_float_padding(
+                            &alt, width, left_align, show_sign, space_sign, zero_pad,
+                        )
+                        .as_bytes(),
+                    );
                 } else {
                     let mut formatted = format_float_g(val, sig, spec == 'G', alt_form, max_sig);
                     // The `,` flag groups the integer part only when %g renders in
@@ -3044,88 +3113,47 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<Option<String>> {
                     if comma_group && !formatted.contains(['e', 'E']) {
                         formatted = group_signed_decimal_integer_part(&formatted);
                     }
-                    result.push_str(&finish_float_padding(
-                        &formatted, width, left_align, show_sign, space_sign, zero_pad,
-                    ));
+                    result.extend_from_slice(
+                        finish_float_padding(
+                            &formatted, width, left_align, show_sign, space_sign, zero_pad,
+                        )
+                        .as_bytes(),
+                    );
                 }
             }
             's' | 'z' => {
                 let param = params.get(param_idx);
                 param_idx += 1;
-                let val = match param {
-                    // SQLite: printf('%s', NULL) returns empty string
-                    Some(SqliteValue::Null) | None => String::new(),
-                    Some(v) => v.to_text(),
-                };
-                // C SQLite counts %s precision in BYTES. It will emit a bare
-                // partial code point; we floor to the previous char boundary
-                // instead (Rust strings must stay valid UTF-8), which matches
-                // C SQLite whenever the cut lands on a boundary.
-                let truncated = if let Some(prec) = precision {
-                    if val.len() > prec {
-                        let mut end = prec;
-                        while end > 0 && !val.is_char_boundary(end) {
-                            end -= 1;
-                        }
-                        val[..end].to_owned()
-                    } else {
-                        val
-                    }
-                } else {
-                    val
-                };
-                result.push_str(&pad_string(&truncated, width, left_align));
+                let bytes = param.map_or(Cow::Borrowed(&b""[..]), SqliteValue::text_bytes);
+                let truncated = printf_text_prefix(&bytes, precision, alt_form2);
+                if !append_printf_text(&mut result, truncated, width, left_align, alt_form2) {
+                    return Ok(None);
+                }
             }
-            'q' => {
-                // Single-quote escaping; C SQLite emits "(NULL)" for %q with NULL.
-                // Field width applies (byte-counted, like %s), space-padded and
-                // right/left-justified, including the "(NULL)" case (bd-8959m).
+            'q' | 'Q' | 'w' => {
+                // Precision applies before escaping, including to the NULL
+                // placeholders. Only a non-NULL %Q argument gets outer quotes.
                 let param = params.get(param_idx);
                 param_idx += 1;
-                // bd-9zzr0 L3: precision truncates the raw text BEFORE escaping.
-                let escaped = match param {
-                    // SQLite: printf('%q', NULL) returns literal "(NULL)"
-                    Some(SqliteValue::Null) | None => "(NULL)".to_owned(),
-                    Some(v) => {
-                        let text = v.to_text();
-                        truncate_str_precision(&text, precision).replace('\'', "''")
-                    }
+                let is_null = param.is_none_or(SqliteValue::is_null);
+                let bytes = match param {
+                    Some(value) if !value.is_null() => value.text_bytes(),
+                    _ if spec == 'Q' => Cow::Borrowed(&b"NULL"[..]),
+                    _ => Cow::Borrowed(&b"(NULL)"[..]),
                 };
-                result.push_str(&pad_string(&escaped, width, left_align));
-            }
-            'Q' => {
-                // Like %q but wrapped in quotes, NULL -> "NULL". Field width
-                // applies to the whole rendered token (bd-8959m). Precision
-                // truncates the raw text before escaping (bd-9zzr0 L3).
-                let param = params.get(param_idx);
-                param_idx += 1;
-                let rendered = match param {
-                    Some(SqliteValue::Null) | None => "NULL".to_owned(),
-                    Some(v) => {
-                        let text = v.to_text();
-                        format!(
-                            "'{}'",
-                            truncate_str_precision(&text, precision).replace('\'', "''")
-                        )
-                    }
+                let truncated = printf_text_prefix(&bytes, precision, alt_form2);
+                let surround = spec == 'Q' && !is_null;
+                let escape_controls = alt_form
+                    && (spec == 'q'
+                        || (surround && truncated.iter().any(|&byte| matches!(byte, 1..=31))));
+                let quote = if spec == 'w' { b'"' } else { b'\'' };
+                let Some(rendered) = quote_sql_bytes(truncated, quote, surround, escape_controls)
+                else {
+                    return Ok(None);
                 };
-                result.push_str(&pad_string(&rendered, width, left_align));
-            }
-            'w' => {
-                // Double-quote escaping for identifiers. bd-9zzr0 L2: C SQLite
-                // renders NULL as the literal "(NULL)" (not empty). bd-9zzr0 L3:
-                // precision truncates the raw text before escaping. Field width
-                // applies to the whole rendered token (bd-8959m).
-                let param = params.get(param_idx);
-                param_idx += 1;
-                let rendered = match param {
-                    Some(SqliteValue::Null) | None => "(NULL)".to_owned(),
-                    Some(v) => {
-                        let text = v.to_text();
-                        truncate_str_precision(&text, precision).replace('"', "\"\"")
-                    }
-                };
-                result.push_str(&pad_string(&rendered, width, left_align));
+                if !append_printf_text(&mut result, &rendered, width, left_align, alt_form2) {
+                    return Ok(None);
+                }
             }
             // %p (pointer) renders identically to %X in SQLite's SQL printf:
             // uppercase hex of the value's u64 bit pattern (255 -> "FF", -1 ->
@@ -3161,7 +3189,7 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<Option<String>> {
                 } else {
                     pad_string(&format!("{prefix}{digits}"), width, left_align)
                 };
-                result.push_str(&padded);
+                result.extend_from_slice(padded.as_bytes());
             }
             'o' => {
                 let val = params.get(param_idx).map_or(0, SqliteValue::to_integer);
@@ -3178,43 +3206,53 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<Option<String>> {
                 } else {
                     pad_string(&format!("{prefix}{digits}"), width, left_align)
                 };
-                result.push_str(&padded);
+                result.extend_from_slice(padded.as_bytes());
             }
             'c' => {
                 let param = params.get(param_idx);
                 param_idx += 1;
-                // SQLite's printf %c renders the argument to its text form and
-                // emits the first character — it does NOT interpret an integer
-                // as a Unicode codepoint like C printf does (bd-47mu0). So
-                // printf('%c', 65) yields '6' (first char of "65"), not 'A'.
-                let text = match param {
-                    Some(SqliteValue::Null) | None => String::new(),
-                    Some(v) => v.to_text(),
-                };
-                // bd-9zzr0 M9: %c precision is a REPEAT count for the emitted
-                // char — printf('%.5c', 'A') == "AAAAA". Without precision the
-                // char is emitted once; an empty argument emits none. bd-77dkj:
-                // precision 0 (and 1) still emits the char ONCE — stock clamps
-                // the repeat count to a minimum of 1 (printf('%.0c','A') == 'A'),
-                // it does NOT drop the char like a naive repeat(0) would.
-                // Field width applies, counted in CHARACTERS (the '0' flag is
-                // ignored — padding is always spaces, right- or left-justified;
-                // bd-ul4c0/bd-47mu0).
-                let content = match text.chars().next() {
-                    Some(c) => c.to_string().repeat(precision.map_or(1, |p| p.max(1))),
-                    None => String::new(),
-                };
-                let pad = width.saturating_sub(content.chars().count());
-                if !left_align {
-                    for _ in 0..pad {
-                        result.push(' ');
+                // %c takes the first text character (65 becomes '6'), keeping
+                // malformed bytes. Its UTF-8 buffer holds at most four bytes;
+                // empty and NULL arguments emit a NUL byte, not empty text.
+                let bytes = param.map_or(Cow::Borrowed(&b""[..]), SqliteValue::text_bytes);
+                let character = if bytes.is_empty() {
+                    &b"\0"[..]
+                } else {
+                    let mut end = 1;
+                    if bytes[0] >= 0xC0 {
+                        while end < bytes.len().min(4) && bytes[end] & 0xC0 == 0x80 {
+                            end += 1;
+                        }
                     }
+                    &bytes[..end]
+                };
+                let repeats = precision.unwrap_or(1).max(1);
+                let mut final_width = width.saturating_sub(repeats - 1);
+                let leading_pad = if repeats > 1 && !left_align && final_width > 1 {
+                    let pad = final_width - 1;
+                    final_width = 0;
+                    pad
+                } else {
+                    0
+                };
+                let final_pad = final_width.saturating_sub(printf_text_width(character, true));
+                let output_len = character
+                    .len()
+                    .checked_mul(repeats)
+                    .and_then(|len| len.checked_add(leading_pad))
+                    .and_then(|len| len.checked_add(final_pad))
+                    .and_then(|len| len.checked_add(result.len()));
+                if output_len.is_none_or(|len| len >= PRINTF_MAX_LENGTH) {
+                    return Ok(None);
                 }
-                result.push_str(&content);
-                if left_align {
-                    for _ in 0..pad {
-                        result.push(' ');
-                    }
+                // Stock emits the repeated prefix before padding the final
+                // character. That order matters for lone continuation bytes.
+                result.resize(result.len() + leading_pad, b' ');
+                for _ in 1..repeats {
+                    result.extend_from_slice(character);
+                }
+                if !append_printf_text(&mut result, character, final_width, left_align, true) {
+                    return Ok(None);
                 }
             }
             'r' => {
@@ -3233,7 +3271,7 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<Option<String>> {
                     _ => "th",
                 };
                 let body = format!("{val}{suffix}");
-                result.push_str(&pad_string(&body, width, left_align));
+                result.extend_from_slice(pad_string(&body, width, left_align).as_bytes());
             }
             _ => {
                 // Unsupported/unknown conversion specifier (e.g. `%a` hex-float,
@@ -3267,31 +3305,84 @@ fn sqlite_format(fmt: &str, params: &[SqliteValue]) -> Result<Option<String>> {
 /// value is the low 31 bits. Reproduces SQLite's behavior at and beyond the
 /// INT_MAX boundary — e.g. "2147483648" -> 0, "3000000000" -> 852516352,
 /// "4294967295" -> 2147483647 (bd-mcgdb). Advances `*i` past the digits.
-fn parse_printf_field(chars: &[char], i: &mut usize) -> usize {
+fn parse_printf_field(chars: &[u8], i: &mut usize) -> usize {
     let mut acc: u32 = 0;
     while *i < chars.len() && chars[*i].is_ascii_digit() {
         acc = acc
             .wrapping_mul(10)
-            .wrapping_add(chars[*i] as u32 - '0' as u32);
+            .wrapping_add(u32::from(chars[*i] - b'0'));
         *i += 1;
     }
     (acc & 0x7FFF_FFFF) as usize
 }
 
-/// Truncate `val` to `precision` BYTES, flooring to the previous char boundary
-/// so the slice stays valid UTF-8 — matching C SQLite's byte-counted string
-/// precision. Shared by %s/%z and (bd-9zzr0 L3) the pre-escape text of %q/%Q/%w.
-fn truncate_str_precision(val: &str, precision: Option<usize>) -> &str {
-    match precision {
-        Some(prec) if val.len() > prec => {
-            let mut end = prec;
-            while end > 0 && !val.is_char_boundary(end) {
-                end -= 1;
-            }
-            &val[..end]
-        }
-        _ => val,
+fn text_bytes_until_nul(bytes: &[u8]) -> &[u8] {
+    &bytes[..bytes
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(bytes.len())]
+}
+
+/// Ordinary precision counts bytes, including partial UTF-8 characters. The
+/// `!` flag uses SQLite's permissive character boundaries: a lead >= 0xC0
+/// consumes all following continuation bytes, even for malformed sequences.
+fn printf_text_prefix(bytes: &[u8], precision: Option<usize>, characters: bool) -> &[u8] {
+    let bytes = text_bytes_until_nul(bytes);
+    let Some(precision) = precision else {
+        return bytes;
+    };
+    if !characters {
+        return &bytes[..bytes.len().min(precision)];
     }
+    let mut end = 0;
+    for _ in 0..precision {
+        if end == bytes.len() {
+            break;
+        }
+        let first = bytes[end];
+        end += 1;
+        if first >= 0xC0 {
+            while end < bytes.len() && bytes[end] & 0xC0 == 0x80 {
+                end += 1;
+            }
+        }
+    }
+    &bytes[..end]
+}
+
+fn printf_text_width(bytes: &[u8], characters: bool) -> usize {
+    if characters {
+        // SQLite corrects byte width by subtracting continuation bytes, even
+        // when they occur without a lead byte.
+        bytes.iter().filter(|&&byte| byte & 0xC0 != 0x80).count()
+    } else {
+        bytes.len()
+    }
+}
+
+fn append_printf_text(
+    out: &mut Vec<u8>,
+    bytes: &[u8],
+    width: usize,
+    left_align: bool,
+    characters: bool,
+) -> bool {
+    let pad = width.saturating_sub(printf_text_width(bytes, characters));
+    let output_len = out
+        .len()
+        .checked_add(bytes.len())
+        .and_then(|len| len.checked_add(pad));
+    if output_len.is_none_or(|len| len >= PRINTF_MAX_LENGTH) {
+        return false;
+    }
+    if !left_align {
+        out.resize(out.len() + pad, b' ');
+    }
+    out.extend_from_slice(bytes);
+    if left_align {
+        out.resize(out.len() + pad, b' ');
+    }
+    true
 }
 
 // A printf integer conversion carries several independent, non-groupable flags
@@ -5141,6 +5232,97 @@ mod tests {
         for (sql, got, want) in cases {
             let got = got.unwrap_or_else(|e| panic!("{sql}: {e}"));
             assert_eq!(out_bytes(&got), want, "{sql}");
+        }
+    }
+
+    #[test]
+    fn test_format_preserves_raw_text_and_byte_precision() {
+        // Stock SQLite keeps these bytes even when a precision splits UTF-8.
+        // Exercise both BLOB coercion and already-stored invalid UTF-8 TEXT.
+        let cases: &[(&str, &[u8], &[u8])] = &[
+            ("%s", b"\xFF\0tail", b"\xFF"),
+            ("%z", b"\xFE\0tail", b"\xFE"),
+            ("[%4s]", b"\xFFx", b"[  \xFFx]"),
+            ("[%-4s]", b"\xFFx", b"[\xFFx  ]"),
+            ("%.1s", b"\xC3\xA9", b"\xC3"),
+            ("%!.1s", b"\xC3\xA9", b"\xC3\xA9"),
+            ("[%!3s]", b"\xC3\xA9", b"[  \xC3\xA9]"),
+            ("[%!3s]", b"\x80", b"[   \x80]"),
+            ("%q", b"\xFF'\0tail", b"\xFF''"),
+            ("%Q", b"\xFF'\0tail", b"'\xFF'''"),
+            ("%w", b"\xFF\"\0tail", b"\xFF\"\""),
+            ("%.1Q", b"\xC3\xA9", b"'\xC3'"),
+            ("%!.1Q", b"\xC3\xA9", b"'\xC3\xA9'"),
+            ("%c", b"\xFFx", b"\xFF"),
+            ("[%5.3c]", b"\xC0\x80\xFF", b"[  \xC0\x80\xC0\x80\xC0\x80]"),
+            ("%c", b"\xF8\x88\x80\x80\x80x", b"\xF8\x88\x80\x80"),
+            ("%!.1s", b"\xF8\x88\x80\x80\x80x", b"\xF8\x88\x80\x80\x80"),
+            ("%c", b"", b"\0"),
+            ("%.3c", b"", b"\0\0\0"),
+        ];
+        for &(format, input, expected) in cases {
+            for value in [raw_blob(input), raw_text(input)] {
+                let result = FormatFunc
+                    .invoke(&[raw_text(format.as_bytes()), value])
+                    .unwrap();
+                assert_eq!(
+                    out_bytes(&result),
+                    expected,
+                    "format={format:?} input={input:?}"
+                );
+            }
+        }
+        assert_eq!(
+            out_bytes(
+                &FormatFunc
+                    .invoke(&[raw_text(b"%c"), SqliteValue::Null])
+                    .unwrap()
+            ),
+            b"\0"
+        );
+    }
+
+    #[test]
+    fn test_format_preserves_raw_format_bytes_and_stops_at_nul() {
+        for format in [raw_blob(b"\xFF%s\0%d"), raw_text(b"\xFF%s\0%d")] {
+            let result = FormatFunc
+                .invoke(&[format, raw_blob(b"\xFE"), SqliteValue::Integer(7)])
+                .unwrap();
+            assert_eq!(out_bytes(&result), b"\xFF\xFE");
+        }
+        assert_eq!(
+            FormatFunc.invoke(&[raw_text(b"\0ignored")]).unwrap(),
+            SqliteValue::Null
+        );
+        assert_eq!(
+            out_bytes(
+                &FormatFunc
+                    .invoke(&[raw_text(b"%s"), SqliteValue::Null])
+                    .unwrap()
+            ),
+            b""
+        );
+    }
+
+    #[test]
+    fn test_format_repeated_character_checks_expanded_byte_length() {
+        // The repeat count alone fits under SQLite's result limit, but the
+        // four-byte character would expand to 2 GB. Reject before allocating.
+        let result = FormatFunc
+            .invoke(&[raw_text(b"%.500000000c"), raw_blob(b"\xF8\x88\x80\x80")])
+            .unwrap();
+        assert_eq!(result, SqliteValue::Null);
+    }
+
+    #[test]
+    fn test_unistr_quote_preserves_raw_text_bytes() {
+        for (input, expected) in [
+            (&b"\xFF'\\"[..], &b"'\xFF''\\'"[..]),
+            (&b"\xFF\x01'\\"[..], &b"unistr('\xFF\\u0001''\\\\')"[..]),
+            (&b"\xFF\0\x01"[..], &b"'\xFF'"[..]),
+        ] {
+            let result = UnistrQuoteFunc.invoke(&[raw_text(input)]).unwrap();
+            assert_eq!(out_bytes(&result), expected);
         }
     }
 
