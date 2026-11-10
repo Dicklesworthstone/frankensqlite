@@ -389,6 +389,14 @@ async fn open_read_only_connection_with_env(
     Connection::open_schema_only_with_env(path, env).await
 }
 
+/// `SQLITE_OPEN_READ_WRITE | SQLITE_OPEN_CREATE`, as `OpenFlags::default()`
+/// opens in rusqlite.
+impl Default for OpenFlags {
+    fn default() -> Self {
+        Self::default_flags()
+    }
+}
+
 impl std::ops::BitOr for OpenFlags {
     type Output = Self;
 

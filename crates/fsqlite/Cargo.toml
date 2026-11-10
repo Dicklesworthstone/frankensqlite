@@ -77,6 +77,11 @@ name = "async_drop_skips_detached_checkpoint"
 required-features = ["async-api"]
 
 [[bench]]
+name = "blocking_vs_rusqlite_bench"
+path = "benches/blocking_vs_rusqlite_bench.rs"
+harness = false
+
+[[bench]]
 name = "minmax_prefix_contract_bench"
 path = "benches/minmax_prefix_contract_bench.rs"
 harness = false

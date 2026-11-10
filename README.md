@@ -1412,6 +1412,39 @@ polls their futures. `Connection::open` uses a lazily initialized process-global
 `RuntimeContext` by default. To root the connection's `Cx` lineage in a
 caller-supplied `Cx`, open with a `ConnectionEnv::new_with_root_cx` environment.
 
+### Coming from rusqlite
+
+`fsqlite::blocking` is a synchronous API with rusqlite's names and signatures,
+so code written for rusqlite usually needs only its `use` lines changed, and it
+opens the same database files:
+
+```rust
+use fsqlite::blocking::{Connection, OptionalExtension, Result, params};
+
+fn main() -> Result<()> {
+    let mut conn = Connection::open("app.db")?; // an existing SQLite file works
+    conn.execute("INSERT INTO person (name, age) VALUES (?1, ?2)", params!["Ada", 36])?;
+    let age: Option<i64> = conn
+        .query_row("SELECT age FROM person WHERE name = ?1", ["Ada"], |row| row.get(0))
+        .optional()?;
+    let tx = conn.transaction()?;
+    tx.execute("UPDATE person SET age = age + 1", [])?;
+    tx.commit()
+}
+```
+
+It covers `Connection` (`open`, `open_in_memory`, `open_with_flags`, `execute`,
+`execute_batch`, `prepare`, `query_row`, transactions, pragmas, `busy_timeout`,
+`changes`, `last_insert_rowid`), `Statement`, `Rows`, `Row::get` by index or
+name with `FromSql`/`ToSql`, positional and named parameters (`params!`,
+`named_params!`, arrays, tuples, `params_from_iter`), `OptionalExtension`, and an
+`Error` with rusqlite's variants and `ErrorCode`s. A unit test runs the same
+rusqlite-style code against rusqlite and against `fsqlite::blocking` and
+requires identical results, and another moves a database file between the two.
+Differences: a `Connection` is not `Send` (give each thread its own), and
+user-defined functions, savepoint objects, online backup, blob I/O, hooks and the
+`chrono`/`uuid`/`serde_json` conversions are not there yet.
+
 ### Transaction API
 
 ```rust

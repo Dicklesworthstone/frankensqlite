@@ -93,6 +93,8 @@ pub mod async_api;
 #[cfg(feature = "async-api")]
 pub use async_api::AsyncConnection;
 
+#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+pub mod blocking;
 pub mod compat;
 pub mod migrate;
 
