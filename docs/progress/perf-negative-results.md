@@ -12,6 +12,105 @@ Each entry should include:
 - Result and reason for rejection.
 - Conditions under which the idea is worth retrying.
 
+## 2026-11-10 - WIN: synchronous hot-opcode lanes; the per-opcode async call protocol was ~a quarter of a table scan (bd-w4pr1.13.1)
+
+- Target: every native VDBE row loop. `SELECT count(*), sum(a) FROM t WHERE a > 500` over 1M
+  file-backed rows was 6.0-6.4x stock sqlite3. Touched: `crates/fsqlite-vdbe/src/engine.rs`
+  (hot dispatcher, `Next`, `Column`, row-layout helpers), `crates/fsqlite-btree/src/cursor.rs`
+  (synchronous in-leaf step and local-payload readers).
+- Evidence before: `perf annotate -l` on a symbolized release-perf shell. About 59% of
+  `execute_program_body`'s self time sat on the lines that build and await the hot-opcode future,
+  about 39% of `try_execute_hot_opcode`'s on async entry and state glue, 35-45% of
+  `column_to_reg_direct` and `ensure_storage_cursor_row_layout` on the awaits between them. This is
+  the CPU-sample evidence the 2026-08-11 bd-uzq54 entry asked for, and the mechanism behind the
+  2026-08-17 bd-hggxz verdict ("the cost of the engine being written async").
+- Change: the hot dispatcher is a plain function; opcodes that can wait for page I/O finish
+  synchronously when the row is at hand and otherwise decline before changing anything, and the
+  loop runs their original arms. `Next` steps inside a leaf without awaiting; `Column` reads a
+  row whose payload is local to its table leaf without awaiting.
+- Result, scorecard workloads (`scripts/user_shape_scorecard.py`), stock live in the same run, 5
+  interleaved reps, A/A 0.91-1.11, base 14d763984, load 11-16; cells are fsqlite/stock:
+  scan_filter_agg 5.98x -> 4.55x (repetition ranges do not overlap), order_by_text_limit10
+  5.47x -> 4.73x, rowid_lookups_200k 5.59x -> 4.80x, update_10pct 6.63x -> 5.77x, count_star
+  5.30x -> 4.45x. No row beyond its A/A spread got slower. User-space instructions (perf stat,
+  load-independent): scan -24%, ORDER BY -15%, UPDATE -17%, DELETE -14%.
+- These rows are still losses against stock. What remains per row, by self time after the change:
+  the dispatcher 20%, the statement future 12%, row-layout parse 8%, a second parse of the cell
+  (locality probe, then load) 6%, the aggregate step's map lookup + dyn call 4%.
+- Next on this seam, each its own lever: read the row from the page instead of copying a prefix
+  into `payload_buf` (bd-w4pr1.13.4); typed count/sum accumulators (bd-w4pr1.13.5);
+  `Rowid`/`IdxRowid` and `FusedAppendInsert` lanes. Do not retry "box the cold branches of the
+  statement future" (bd-uzq54): the cost was the per-opcode call protocol, not the future's size.
+
+## 2026-11-10 - WIN: single integer sort key sorted as (key, position) pairs (bd-w4pr1.13.3)
+
+- Target: GROUP BY / ORDER BY on an integer column; `group_by_1000_groups` (1M rows, 1,000 groups)
+  was 7.5-8.6x stock with 26% of samples in `stable::quicksort::<SorterRow>` through
+  `compare_sorter_rows`. Touched: `SorterCursor::sort` in `crates/fsqlite-vdbe/src/engine.rs`.
+- Result: user-space instructions 7,587M -> 5,983M (-21%) on that workload with nothing else
+  moving; wall 7.49x -> 5.45x of stock in a run on a saturated host (load 30-100, A/A 0.96), so
+  the wall figure is indicative only.
+- Still open on this path: three heap allocations per sorter row (key Vec, record blob, the Arc
+  copy in `SorterData`, ~22% in `free`), and there is no hash aggregation. Group output order must
+  stay the sorter's.
+
+## 2026-11-10 - WIN, and a measurement correction: the I/O latency window is kept sorted (bd-w4pr1.13.2; supersedes the 2026-09-06 bd-cea9i WITHHELD entry)
+
+- Target: `record_io_uring_{read,write}_latency` in `crates/fsqlite-observability/src/lib.rs`
+  sorted a copy of a 1,024-sample window three times per recorded sample, under the process-wide
+  metrics lock. Now the window is kept in sorted order (`SortedWindow`); the independent full-sort
+  oracle `io_uring_latency_window_matches_sorted_reference` passes unmodified, so every quantile,
+  tail verdict and snapshot is unchanged.
+- Result, native: user-space instructions for 5,000 autocommit INSERTs through the shell
+  2,838M -> 2,809M together with the sorter lever (-1%; -3.5% against the lane base). No change on
+  autocommit point SELECTs. The shell opens with dedicated-thread inline I/O, so few of its reads
+  take the path that records a sample.
+- Correction: callgrind showed these sorts as 32% of an autocommit point-SELECT script and 26% of
+  autocommit INSERTs, and removing them cut those totals by 25%. That does not transfer: under
+  valgrind far more I/O takes the recorded path than natively. LESSON: attribution of I/O-path code
+  taken under valgrind must be confirmed with a native count (`perf stat -e instructions:u`) before
+  it is used to size a lever.
+- Kept because it is strictly less work with proven-identical output. Not measured: a connection
+  opened without inline I/O under an asupersync runtime (the C API shim), where every page I/O is
+  recorded; measure there before claiming more.
+
+## 2026-11-10 - WIN: the rusqlite-shaped blocking API no longer enters an async runtime per call (bd-w4pr1.23)
+
+- Target: `fsqlite::blocking` (`crates/fsqlite/src/blocking.rs`). Each call ran
+  `Runtime::block_on` on a thread-local asupersync current-thread runtime (~25 us), and the
+  connection was opened without dedicated-thread inline I/O.
+- Change: open with `ConnectionEnv::mark_blocking_io_inline_safe` (the `!Send` connection is that
+  flag's contract) and drive futures with a park-based `block_on` on the calling thread, as the
+  `AsyncConnection` worker does.
+- Result, `blocking_vs_rusqlite_bench`, release-perf, rusqlite live in process, ELF
+  081c47a4d0c0..., A/A 0.97-1.09; the async column (same engine inside one `block_on`) is the
+  control: point_rowid 5,393 ns = 2.57x stock (blocking/async 1.17; was 3.70 and 8.3x), insert_txn
+  11,799 ns = 28.2x (blocking/async 1.19; was 3.40 and 67.7x), point_index 44,837 ns = 26.5x.
+  insert_autocommit and adhoc_update had A/A 0.84 and 0.91 and the earlier run used another
+  worker: no before/after claim for them.
+- What is left on these rows is the engine: ~9.9 us per prepared INSERT and ~43 us per prepared
+  index equality lookup inside one `block_on` (bd-w4pr1.24).
+- The C API shim (`fsqlite-c-api`) still uses the per-call runtime pattern.
+
+## 2026-11-10 - ASSESSED, not a shortcut: wiring the dormant vectorized kernels (`fsqlite-vdbe/src/vectorized*.rs`) into live queries
+
+- Question: can the benchmarked-but-unwired batch kernels give a fast scan/filter/aggregate path
+  for file-backed tables? Read-only assessment of the nine modules, their callers and tests.
+- Finding: no live call site exists and the library cannot produce SQLite-identical answers as it
+  stands. Columns are single-typed (an Int64 column rejects a REAL or TEXT value); `sum` wraps on
+  overflow where SQLite raises; MIN/MAX on TEXT return NULL; integer-vs-real comparison errors;
+  text compares BINARY only; the scan decodes every record into `Vec<SqliteValue>` through the same
+  per-row async cursor calls, omits the rowid alias and fails on rows shorter than the table;
+  aggregation is per batch with no way to merge accumulators; morsels are page-number ranges, so
+  each worker walks the whole table, and the engine's page I/O type is not `Send`. No test compares
+  any of it with stock.
+- Reusable: the batch/bitmap/selection containers, the typed filter loops, the Kahan float sum,
+  the work-stealing skeleton.
+- Retry condition: only as a new executor built stock-oracle first (mixed-type columns, SQLite
+  comparison and overflow rules, rowid alias, short rows, mergeable accumulators), after the row
+  loop reads rows from the page without copying; parallel morsels only after a `Send` snapshot page
+  reader and rowid-range splitting exist. Do not wire the current kernels behind a pragma.
+
 ## 2026-11-05 - Unqualified: CTE and correlated EXISTS improvements; native compiler blocked (GH#533)
 
 - Target: issue #533's direct/CTE million-row COUNT and 10,000-row correlated
