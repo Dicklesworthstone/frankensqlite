@@ -1359,6 +1359,33 @@ impl ShmInfo {
     }
 }
 
+/// The read marks for a lock log line, or `None` when the `-shm` file does not
+/// currently back them.
+///
+/// Lock acquisition and release only log the marks. A peer can truncate the
+/// file beneath a live mapping (bd-7do1d), and dereferencing an unbacked page
+/// raises SIGBUS, so a lock call must never read the mapping just to describe
+/// itself: callers evaluate this only when a log line is emitted, and it
+/// checks the file length before touching the mapping.
+fn diagnostic_read_marks(
+    regions: &HashMap<u32, ShmRegion>,
+    file: &File,
+) -> Option<[u32; WAL_NREADER_USIZE]> {
+    let marks_end = SHM_READ_MARK_OFFSET + WAL_NREADER_USIZE * 4;
+    let region_0 = regions.get(&0)?;
+    let backed_len = file.metadata().ok()?.len();
+    if region_0.len() < marks_end || backed_len < u64::try_from(marks_end).ok()? {
+        return None;
+    }
+    let mut marks = [0u32; WAL_NREADER_USIZE];
+    for (i, mark) in marks.iter_mut().enumerate() {
+        *mark = region_0
+            .atomic_load_u32_ne(SHM_READ_MARK_OFFSET + i * 4, Ordering::Acquire)
+            .ok()?;
+    }
+    Some(marks)
+}
+
 struct ShmTable {
     map: Mutex<HashMap<PathBuf, Arc<Mutex<ShmInfo>>>>,
 }
@@ -2864,14 +2891,15 @@ impl UnixFile {
         slot: u32,
         requested_mode: &'static str,
         observed_mode: &'static str,
-        read_marks: [u32; WAL_NREADER_USIZE],
+        regions: &HashMap<u32, ShmRegion>,
+        file: &File,
     ) {
         warn!(
             slot,
             lock_byte = wal_lock_byte(slot),
             requested_mode,
             observed_mode,
-            ?read_marks,
+            read_marks = ?diagnostic_read_marks(regions, file),
             "legacy shm lock protocol conflict"
         );
     }
@@ -2879,7 +2907,6 @@ impl UnixFile {
     fn acquire_shm_dms_shared(&self, info: &mut ShmInfo) -> Result<()> {
         let lock_byte = sqlite_shm_dms_lock_byte();
         let slot_idx = usize::try_from(SQLITE_SHM_DMS_SLOT).expect("DMS slot fits usize");
-        let read_marks = info.read_marks();
         let slot_state = &mut info.slots[slot_idx];
 
         if let Some(owner) = slot_state.exclusive_owner {
@@ -2888,7 +2915,8 @@ impl UnixFile {
                     SQLITE_SHM_DMS_SLOT,
                     "shared",
                     Self::observed_mode(slot_state),
-                    read_marks,
+                    &info.regions,
+                    &info.file,
                 );
                 return Err(FrankenError::Busy);
             }
@@ -2909,7 +2937,8 @@ impl UnixFile {
                 SQLITE_SHM_DMS_SLOT,
                 "shared",
                 Self::observed_mode(slot_state),
-                read_marks,
+                &info.regions,
+                &info.file,
             );
             return Err(FrankenError::Busy);
         }
@@ -2922,7 +2951,7 @@ impl UnixFile {
             lock_byte,
             requested_mode = "shared",
             observed_mode = Self::observed_mode(slot_state),
-            ?read_marks,
+            read_marks = ?diagnostic_read_marks(&info.regions, &info.file),
             "acquired shm DMS shared lock"
         );
         Ok(())
@@ -2931,14 +2960,14 @@ impl UnixFile {
     fn release_shm_dms_shared(&self, info: &mut ShmInfo) -> Result<()> {
         let lock_byte = sqlite_shm_dms_lock_byte();
         let slot_idx = usize::try_from(SQLITE_SHM_DMS_SLOT).expect("DMS slot fits usize");
-        let read_marks = info.read_marks();
         let slot_state = &mut info.slots[slot_idx];
         let Some(holder_count) = slot_state.shared_holders.get(&self.shm_owner_id).copied() else {
             Self::log_lock_conflict(
                 SQLITE_SHM_DMS_SLOT,
                 "unlock-shared",
                 Self::observed_mode(slot_state),
-                read_marks,
+                &info.regions,
+                &info.file,
             );
             return Err(FrankenError::LockFailed {
                 detail: format!("owner {} does not hold shared DMS slot", self.shm_owner_id),
@@ -2966,7 +2995,7 @@ impl UnixFile {
             lock_byte,
             requested_mode = "unlock-shared",
             observed_mode = Self::observed_mode(slot_state),
-            ?read_marks,
+            read_marks = ?diagnostic_read_marks(&info.regions, &info.file),
             "released shm DMS shared lock"
         );
         Ok(())
@@ -2982,7 +3011,6 @@ impl UnixFile {
             });
         };
         let slot_idx = usize::try_from(slot).expect("slot index must fit usize");
-        let read_marks = info.read_marks();
         let slot_state = &mut info.slots[slot_idx];
 
         if let Some(owner) = slot_state.exclusive_owner {
@@ -2991,7 +3019,8 @@ impl UnixFile {
                     slot,
                     "shared",
                     Self::observed_mode(slot_state),
-                    read_marks,
+                    &info.regions,
+                    &info.file,
                 );
                 return Err(FrankenError::Busy);
             }
@@ -3008,7 +3037,13 @@ impl UnixFile {
             .ok_or_else(|| FrankenError::internal("Unix SHM shared-owner count overflow"))?;
         let total_shared = slot_state.shared_holders.values().copied().sum::<u32>();
         if total_shared == 0 && !posix_lock(&*info.file, libc::F_RDLCK, lock_byte, 1)? {
-            Self::log_lock_conflict(slot, "shared", Self::observed_mode(slot_state), read_marks);
+            Self::log_lock_conflict(
+                slot,
+                "shared",
+                Self::observed_mode(slot_state),
+                &info.regions,
+                &info.file,
+            );
             return Err(FrankenError::Busy);
         }
 
@@ -3020,7 +3055,7 @@ impl UnixFile {
             lock_byte,
             requested_mode = "shared",
             observed_mode = Self::observed_mode(slot_state),
-            ?read_marks,
+            read_marks = ?diagnostic_read_marks(&info.regions, &info.file),
             "acquired shm shared lock"
         );
         Ok(true)
@@ -3035,7 +3070,6 @@ impl UnixFile {
             });
         };
         let slot_idx = usize::try_from(slot).expect("slot index must fit usize");
-        let read_marks = info.read_marks();
         let slot_state = &mut info.slots[slot_idx];
 
         if slot_state.exclusive_owner == Some(self.shm_owner_id) {
@@ -3049,7 +3083,8 @@ impl UnixFile {
                 slot,
                 "exclusive",
                 Self::observed_mode(slot_state),
-                read_marks,
+                &info.regions,
+                &info.file,
             );
             return Err(FrankenError::Busy);
         }
@@ -3063,7 +3098,8 @@ impl UnixFile {
                 slot,
                 "exclusive",
                 Self::observed_mode(slot_state),
-                read_marks,
+                &info.regions,
+                &info.file,
             );
             return Err(FrankenError::Busy);
         }
@@ -3073,7 +3109,8 @@ impl UnixFile {
                 slot,
                 "exclusive",
                 Self::observed_mode(slot_state),
-                read_marks,
+                &info.regions,
+                &info.file,
             );
             return Err(FrankenError::Busy);
         }
@@ -3087,7 +3124,7 @@ impl UnixFile {
             lock_byte,
             requested_mode = "exclusive",
             observed_mode = Self::observed_mode(slot_state),
-            ?read_marks,
+            read_marks = ?diagnostic_read_marks(&info.regions, &info.file),
             "acquired shm exclusive lock"
         );
         Ok(true)
@@ -3101,14 +3138,14 @@ impl UnixFile {
             });
         };
         let slot_idx = usize::try_from(slot).expect("slot index must fit usize");
-        let read_marks = info.read_marks();
         let slot_state = &mut info.slots[slot_idx];
         let Some(holder_count) = slot_state.shared_holders.get(&self.shm_owner_id).copied() else {
             Self::log_lock_conflict(
                 slot,
                 "unlock-shared",
                 Self::observed_mode(slot_state),
-                read_marks,
+                &info.regions,
+                &info.file,
             );
             return Err(FrankenError::LockFailed {
                 detail: format!(
@@ -3139,7 +3176,7 @@ impl UnixFile {
             lock_byte,
             requested_mode = "unlock-shared",
             observed_mode = Self::observed_mode(slot_state),
-            ?read_marks,
+            read_marks = ?diagnostic_read_marks(&info.regions, &info.file),
             "released shm shared lock"
         );
         Ok(())
@@ -3153,14 +3190,14 @@ impl UnixFile {
             });
         };
         let slot_idx = usize::try_from(slot).expect("slot index must fit usize");
-        let read_marks = info.read_marks();
         let slot_state = &mut info.slots[slot_idx];
         if slot_state.exclusive_owner != Some(self.shm_owner_id) {
             Self::log_lock_conflict(
                 slot,
                 "unlock-exclusive",
                 Self::observed_mode(slot_state),
-                read_marks,
+                &info.regions,
+                &info.file,
             );
             return Err(FrankenError::LockFailed {
                 detail: format!(
@@ -3179,7 +3216,8 @@ impl UnixFile {
                 slot,
                 "unlock-exclusive",
                 Self::observed_mode(slot_state),
-                read_marks,
+                &info.regions,
+                &info.file,
             );
             return Err(FrankenError::Busy);
         }
@@ -3190,7 +3228,7 @@ impl UnixFile {
             lock_byte,
             requested_mode = "unlock-exclusive",
             observed_mode = Self::observed_mode(slot_state),
-            ?read_marks,
+            read_marks = ?diagnostic_read_marks(&info.regions, &info.file),
             "released shm exclusive lock"
         );
         Ok(())
