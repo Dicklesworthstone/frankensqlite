@@ -4643,8 +4643,7 @@ impl VfsFile for UnixFile {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let slot = &info.slots[usize::try_from(WAL_WRITE_LOCK).expect("WRITE slot fits")];
-        if slot.exclusive_owner.is_some() || slot.shared_holders.values().any(|count| *count != 0)
-        {
+        if slot.exclusive_owner.is_some() || slot.shared_holders.values().any(|count| *count != 0) {
             return Ok(false);
         }
         match self.acquire_shm_exclusive_slot(&mut info, WAL_WRITE_LOCK) {

@@ -504,8 +504,8 @@ pub const PROCESS_CRASH_PAUSED_WITNESS: &str = "fsqlite-crash-point-paused:";
 /// caller unwind, this ends the process with `abort`: no destructor, unlock,
 /// or flush runs, exactly as after SIGKILL. It is armed only through the
 /// environment ([`PROCESS_CRASH_POINT_ENV`], [`PROCESS_CRASH_AFTER_ENV`]), so
-/// a crash test's child process arms it before opening anything. With
-/// [`PROCESS_CRASH_ACTION_ENV`]` = pause` the n-th pass prints
+/// a crash test's child process arms it before opening anything. When
+/// [`PROCESS_CRASH_ACTION_ENV`] is `pause`, the n-th pass prints
 /// [`PROCESS_CRASH_PAUSED_WITNESS`] and the point name on stdout and blocks
 /// until a line arrives on stdin, so a parent can observe a live process
 /// stopped at that step and then let it finish.
@@ -522,7 +522,11 @@ pub fn process_crash_point(name: &str) {
             .and_then(|value| value.parse().ok())
             .unwrap_or(1);
         let pause = std::env::var(PROCESS_CRASH_ACTION_ENV).is_ok_and(|action| action == "pause");
-        Some(Armed { point, after, pause })
+        Some(Armed {
+            point,
+            after,
+            pause,
+        })
     });
     static PASSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 

@@ -139,18 +139,18 @@ macro_rules! workload {
 /// `conn`, inside ONE `block_on`: the engine calls `fsqlite::blocking` makes,
 /// without its per-call `block_on` or parameter binding. Comparing this column
 /// with the blocking one splits facade overhead from engine cost (bd-w4pr1.23).
-/// Only the workloads in [`ASYNC_WORKLOADS`], which are loops of prepared calls.
+/// `None` for workloads that are not loops of prepared calls.
 fn workload_async(
     runtime: &asupersync::runtime::Runtime,
     conn: &ours::Connection,
     name: &str,
     round: usize,
-) -> (u64, u64) {
+) -> Option<(u64, u64)> {
     use fsqlite::SqliteValue;
     let conn = conn.as_async();
     let round = round as i64;
     let key = |i: i64| (i * 104_729 + round * 31) % ROWS + 1;
-    match name {
+    Some(match name {
         "point_rowid" => runtime.block_on(async {
             let stmt = conn
                 .prepare("SELECT b FROM t WHERE id = ?1")
@@ -213,12 +213,9 @@ fn workload_async(
             };
             (20_000_u64, (value(0) * 1_000_003 + value(1)) as u64)
         }),
-        other => panic!("no async variant of {other}"),
-    }
+        _ => return None,
+    })
 }
-
-/// Workloads [`workload_async`] runs.
-const ASYNC_WORKLOADS: &[&str] = &["point_rowid", "point_index", "insert_txn"];
 
 const WORKLOADS: &[&str] = &[
     "point_rowid",
@@ -250,6 +247,13 @@ fn time<T>(f: impl FnOnce() -> (u64, T)) -> (f64, T) {
     (start.elapsed().as_nanos() as f64 / ops as f64, check)
 }
 
+/// [`time`] for a workload that may not exist (`None` returns at once).
+fn time_if<T>(f: impl FnOnce() -> Option<(u64, T)>) -> Option<(f64, T)> {
+    let start = Instant::now();
+    let (ops, check) = f()?;
+    Some((start.elapsed().as_nanos() as f64 / ops as f64, check))
+}
+
 fn db(dir: &Path, name: &str) -> String {
     dir.join(name).to_string_lossy().into_owned()
 }
@@ -265,7 +269,8 @@ fn main() {
         .iter()
         .find(|name| !WORKLOADS.contains(&name.as_str()))
     {
-        panic!("unknown workload {unknown}; known: {WORKLOADS:?}");
+        eprintln!("unknown workload {unknown}; known: {WORKLOADS:?}");
+        std::process::exit(2);
     }
     let dir = tempfile::tempdir().expect("tempdir");
     let ours_conn = open_loaded!(ours, db(dir.path(), "fsqlite.db"));
@@ -290,18 +295,14 @@ fn main() {
             // Alternate which engine goes first.
             let (f, a, c, twin) = if round % 2 == 0 {
                 let f = time(|| workload!(ours, &ours_conn, *name, round));
-                let a = ASYNC_WORKLOADS
-                    .contains(name)
-                    .then(|| time(|| workload_async(&runtime, &ours_conn, name, round)));
+                let a = time_if(|| workload_async(&runtime, &ours_conn, name, round));
                 let c = time(|| workload!(stock, &stock_conn, *name, round));
                 let twin = time(|| workload!(stock, &stock_twin, *name, round));
                 (f, a, c, twin)
             } else {
                 let twin = time(|| workload!(stock, &stock_twin, *name, round));
                 let c = time(|| workload!(stock, &stock_conn, *name, round));
-                let a = ASYNC_WORKLOADS
-                    .contains(name)
-                    .then(|| time(|| workload_async(&runtime, &ours_conn, name, round)));
+                let a = time_if(|| workload_async(&runtime, &ours_conn, name, round));
                 let f = time(|| workload!(ours, &ours_conn, *name, round));
                 (f, a, c, twin)
             };
