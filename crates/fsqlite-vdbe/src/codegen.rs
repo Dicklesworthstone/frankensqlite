@@ -14786,8 +14786,11 @@ fn codegen_join_select(
         return Err(CodegenError::Unsupported("empty join list".to_owned()));
     }
 
+    // bd-w4pr1.10: with no usable index on the join column this builds an
+    // automatic index rather than falling to the nested loop below (the
+    // same plan `join_select_uses_lookup` routes here on).
     if let [(right_table, right_alias, join_kind, on_expr)] = join_tables.as_slice()
-        && let Some(plan) = resolve_single_join_lookup_plan(
+        && let Some(plan) = resolve_single_join_lookup_plan_or_autoindex(
             left_table,
             left_alias,
             right_table,
@@ -60888,12 +60891,22 @@ mod tests {
         codegen_select(&mut b, &stmt, &schema, &ctx).unwrap();
         let prog = b.finish().unwrap();
 
-        let join_cmp = prog
+        // Neither column is indexed, so the join probes an automatic index on
+        // `w.word` (bd-w4pr1.10): NOCASE must order that index and decide the
+        // end of each run of equal keys.
+        let nocase = P4::Collation("NOCASE".to_owned());
+        let autoindex = prog
             .ops()
             .iter()
-            .find(|op| op.opcode == Opcode::Eq && op.p5 == 0x20)
-            .expect("JOIN ON equality should emit an Eq STOREP2 opcode");
-        assert_eq!(join_cmp.p4, P4::Collation("NOCASE".to_owned()));
+            .find(|op| op.opcode == Opcode::OpenAutoindex)
+            .expect("an unindexed JOIN ON equality should build an automatic index");
+        assert_eq!(autoindex.p4, nocase, "the automatic index orders keys under NOCASE");
+        assert!(
+            prog.ops()
+                .iter()
+                .any(|op| op.opcode == Opcode::Ne && op.p4 == nocase),
+            "the probe's key comparison should use NOCASE"
+        );
     }
 
     #[test]
