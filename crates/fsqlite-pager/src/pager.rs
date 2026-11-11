@@ -8171,12 +8171,19 @@ struct WalRefreshSignature {
 /// commit, checkpoint reset and recovery from any connection or process
 /// rewrites the header, so while it is identical the floor is the remembered
 /// one and the WAL and certificate sidecar need not be read again to learn it.
-/// The append gate still derives the floor from the files before any frame is
-/// written.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// The same holds for the certificate that seeds the next one: the newest
+/// authorized certificate at the published horizon is this flush's own, as
+/// long as the frames it appended are byte for byte the frames it digested
+/// (`certificate` is `None` when that was not established, and the gate then
+/// reads the sidecar and re-hashes the covered frames as before). Under the
+/// append gate both are reused only after the preflight has validated the
+/// WAL path and tail, so a writer that died after appending is still found.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct DurableDbSizeFloor {
     shm_header: fsqlite_wal::wal_index::WalIndexHdr,
     db_size: u32,
+    certificate: Option<ParallelWalCommitCertificate>,
 }
 
 /// The WAL-index header and `-wal` file of a WAL-mode database as they stand
@@ -8244,6 +8251,16 @@ async fn observe_vouched_wal_index_header<F: VfsFile>(
             return Ok(None);
         }
     }
+    vouched_wal_index_header_of_file(cx, db_file).await
+}
+
+/// The file half of [`observe_vouched_wal_index_header`], for a caller that
+/// has already checked its WAL backend (or holds it exclusively and cannot
+/// lock it again): a native reader is required and no recovery is pending.
+async fn vouched_wal_index_header_of_file<F: VfsFile>(
+    cx: &Cx,
+    db_file: &SharedDbFile<F>,
+) -> Result<Option<fsqlite_wal::wal_index::WalIndexHdr>> {
     let mut file = shared_db_file_write(db_file, cx).await?;
     if !file.holds_main_wal_lifetime_read_lock() {
         return Ok(None);
@@ -8278,6 +8295,7 @@ async fn carry_refresh_state_past_own_flush<F: VfsFile>(
     own_single_commit: Option<(WalRefreshSignature, CommitSeq)>,
     last_frame_written: u64,
     certified_db_size: u32,
+    seed_certificate: Option<ParallelWalCommitCertificate>,
 ) {
     let Ok(Some(header)) = observe_vouched_wal_index_header(cx, wal_backend, db_file).await
     else {
@@ -8290,6 +8308,7 @@ async fn carry_refresh_state_past_own_flush<F: VfsFile>(
         DurableDbSizeFloor {
             shm_header: header,
             db_size: certified_db_size,
+            certificate: seed_certificate,
         },
     );
     if let Some((previous, committed_seq)) = own_single_commit
@@ -24679,7 +24698,7 @@ where
                         .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
                     (
                         inner.db_size,
-                        inner.durable_db_size_floor,
+                        inner.durable_db_size_floor.clone(),
                         Arc::clone(&inner.db_file),
                     )
                 };
@@ -24709,6 +24728,7 @@ where
                     None => None,
                 };
                 let durable_certified_db_size = if let Some(remembered) = remembered_floor
+                    .as_ref()
                     .filter(|remembered| Some(remembered.shm_header) == published_header)
                 {
                     remembered.db_size
@@ -24855,6 +24875,7 @@ where
                     None
                 };
                 let mut shadow_verdict = ParallelWalShadowVerdict::NotRun;
+                let mut prepared_is_digested_frames = false;
 
                 let mut prepared_batch = if fallback_reason.is_none() {
                     match queue.take_prepared_batches_for_flush(&batches) {
@@ -24894,6 +24915,7 @@ where
                                                     ) {
                                                         shadow_verdict =
                                                             ParallelWalShadowVerdict::Clean;
+                                                        prepared_is_digested_frames = true;
                                                         Some(merged)
                                                     } else {
                                                         shadow_verdict =
@@ -24965,7 +24987,16 @@ where
                     }
                     drop(wal);
                     prepared_batch = prepared;
+                    prepared_is_digested_frames = true;
                 }
+                // Whether the bytes about to be appended are the frames the
+                // certificate's payload digest was computed over: appended
+                // straight from `frame_refs`, prepared from them just above,
+                // or lane-staged and compared equal to them. Only then is this
+                // flush's certificate known to authorize its own WAL interval
+                // without reading the frames back (see `DurableDbSizeFloor`).
+                let appended_frames_are_digested =
+                    prepared_batch.is_none() || prepared_is_digested_frames;
                 let flush_frame_prep_us = elapsed_profile_us(t_flush_frame_prep_start);
                 GLOBAL_CONSOLIDATION_METRICS.transactions_batched.fetch_add(
                     u64::try_from(batch_count).unwrap_or(u64::MAX),
@@ -25227,11 +25258,40 @@ where
                                 if let Some(us) = race_amplify_window_us() {
                                     std::thread::sleep(std::time::Duration::from_micros(us));
                                 }
-                                let durable_db_size_floor =
-                                    wal.current_parallel_wal_db_size_floor(cx).await?;
-                                let authorized_seed = wal
-                                    .latest_authorized_parallel_wal_commit_certificate(cx)
-                                    .await?;
+                                // The preflight above validated the WAL path
+                                // and tail under this gate. When the header
+                                // it left published is still this flusher's
+                                // own last publication, the floor and the
+                                // seed certificate are the ones that flush
+                                // wrote (see `DurableDbSizeFloor`); otherwise
+                                // both come from the files.
+                                let gate_header = if remembered_floor.is_some()
+                                    && wal.native_reader_required()
+                                    && wal.native_recovery_required().is_none()
+                                {
+                                    vouched_wal_index_header_of_file(cx, &db_file)
+                                        .await
+                                        .ok()
+                                        .flatten()
+                                } else {
+                                    None
+                                };
+                                let own_publication = remembered_floor.as_ref().filter(
+                                    |remembered| Some(remembered.shm_header) == gate_header,
+                                );
+                                let durable_db_size_floor = match own_publication {
+                                    Some(own) => Some(own.db_size),
+                                    None => wal.current_parallel_wal_db_size_floor(cx).await?,
+                                };
+                                let authorized_seed = match own_publication
+                                    .and_then(|own| own.certificate.clone())
+                                {
+                                    Some(certificate) => Some(certificate),
+                                    None => {
+                                        wal.latest_authorized_parallel_wal_commit_certificate(cx)
+                                            .await?
+                                    }
+                                };
                                 // bd-9inpb: EOF-growth anti-alias gate. This runs
                                 // under the RESERVED append lock, so the floor
                                 // read above already reflects every peer commit
@@ -25379,6 +25439,7 @@ where
                                 let _durability_mask = durability_cx.masked();
 
                                 let certificate = publication.certificate()?;
+                                let mut certificate_is_in_sidecar = false;
                                 let certificate_completion = VfsWriteCompletion::new();
                                 *sidecar_completion
                                     .lock()
@@ -25395,7 +25456,7 @@ where
                                     )
                                     .await
                                 {
-                                    Ok(()) => {}
+                                    Ok(()) => certificate_is_in_sidecar = true,
                                     Err(FrankenError::Unsupported) => {
                                         // Unsupported is the backend DECLARING
                                         // it has no certificate-sidecar
@@ -25500,6 +25561,8 @@ where
                                     own_single_commit,
                                     frames_written_end,
                                     final_db_size,
+                                    (certificate_is_in_sidecar && appended_frames_are_digested)
+                                        .then_some(certificate),
                                 )
                                 .await;
                                 #[cfg(any(test, feature = "fault-injection"))]
