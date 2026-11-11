@@ -9990,6 +9990,9 @@ impl VdbeEngine {
         }
 
         let mut pc: usize = 0;
+        // Opcode metrics and opcode tracing are recorded by this loop once per
+        // opcode, so with either on the hot lane hands back after each one.
+        let hot_lane_single_step = collect_vdbe_metrics || self.trace_opcodes;
         // "once" flags: one bit per instruction address (stack-backed for small programs).
         let n_ops = ops.len();
         let mut once_stack = [0u64; 4]; // covers up to 256 opcodes on the stack
@@ -10034,15 +10037,21 @@ impl VdbeEngine {
             if self.trace_opcodes {
                 self.trace_opcode(pc, op);
             }
-            if self.try_execute_hot_opcode_sync(
-                op,
+            if self.run_hot_opcodes_sync(
+                ops,
                 &mut pc,
+                &mut opcode_count,
+                hot_lane_single_step,
                 collect_vdbe_metrics,
                 &mut row_handler,
                 borrowed_bindings,
             )? {
                 continue;
             }
+            // The hot lane stopped at an opcode it does not run. It has already
+            // counted that opcode and made its cancellation check, so the rest
+            // of this iteration treats it as the opcode fetched above.
+            let op = &ops[pc];
             if Self::hot_opcode_has_async_lane(op.opcode)
                 && lean_future(|| self.try_execute_hot_opcode_async(op, &mut pc)).await?
             {
@@ -15385,6 +15394,60 @@ impl VdbeEngine {
         self.get_reg(r).clone()
     }
 
+    /// Run the opcode at `*pc` and the hot opcodes that follow it, without
+    /// returning to the statement future between them.
+    ///
+    /// The statement loop's per-opcode work is a cancellation check every
+    /// [`VDBE_EXECUTION_CHECKPOINT_INTERVAL`] opcodes and the opcode count;
+    /// this loop does both for each opcode it moves on to, at the same counts
+    /// the statement loop would. On entry the caller has done them for the
+    /// opcode at `*pc`.
+    ///
+    /// Returns `Ok(false)` with `*pc` at an opcode that
+    /// [`Self::try_execute_hot_opcode_sync`] declined: that opcode is counted
+    /// and checked, and nothing of it has run. With `single_step` it returns
+    /// `Ok(true)` after one opcode, for callers that record something per
+    /// opcode themselves.
+    ///
+    /// It is kept out of line: the caller is the statement future's poll
+    /// function, already the largest function in the engine, and a separate
+    /// frame keeps the program counter and this match's operands in
+    /// registers. Returning to the future after every opcode cost a table
+    /// scan the call protocol and the future's state traffic once per opcode.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn run_hot_opcodes_sync(
+        &mut self,
+        ops: &[VdbeOp],
+        pc: &mut usize,
+        opcode_count: &mut u64,
+        single_step: bool,
+        collect_vdbe_metrics: bool,
+        row_handler: &mut Option<&mut ResultRowCallback<'_>>,
+        borrowed_bindings: Option<&[SqliteValue]>,
+    ) -> Result<bool> {
+        let mut at = *pc;
+        let mut count = *opcode_count;
+        loop {
+            let ran = self.try_execute_hot_opcode_sync(
+                &ops[at],
+                &mut at,
+                collect_vdbe_metrics,
+                row_handler,
+                borrowed_bindings,
+            )?;
+            if !ran || single_step {
+                *pc = at;
+                *opcode_count = count;
+                return Ok(ran);
+            }
+            if count & (VDBE_EXECUTION_CHECKPOINT_INTERVAL - 1) == 0 {
+                observe_execution_cancellation(&self.execution_cx)?;
+            }
+            count += 1;
+        }
+    }
+
     /// Explicit hot-opcode fast lane for the main interpreter loop.
     ///
     /// We keep direct enum dispatch instead of switching to indexed
@@ -15400,10 +15463,10 @@ impl VdbeEngine {
     /// return `Ok(false)` unchanged, so the loop can run them through
     /// [`Self::try_execute_hot_opcode_async`].
     ///
-    /// It is kept out of line: the caller is the statement future's poll
-    /// function, already the largest function in the engine, and a separate
-    /// frame keeps this match's operands in registers.
-    #[inline(never)]
+    /// Its one caller is [`Self::run_hot_opcodes_sync`], which it is inlined
+    /// into so the match sits inside that function's loop.
+    #[inline(always)]
+    #[allow(clippy::inline_always)]
     fn try_execute_hot_opcode_sync(
         &mut self,
         op: &VdbeOp,
@@ -25011,6 +25074,104 @@ mod tests {
         assert!(
             engine.results().is_empty(),
             "cancelled execute should not emit rows"
+        );
+    }
+
+    /// Run an endless loop of four opcodes per row whose row handler cancels
+    /// the statement at its tenth row, and return how many rows the handler
+    /// received before the statement stopped with `Abort`.
+    ///
+    /// `loop_tail` closes the loop: `Goto` keeps every opcode on the hot
+    /// lane, `NotNull` is an opcode the hot lane declines once per row.
+    fn rows_delivered_before_cancellation_is_observed(
+        loop_tail: Opcode,
+        metrics_enabled: bool,
+    ) -> usize {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_metrics_enabled = vdbe_metrics_enabled();
+        set_vdbe_metrics_enabled(metrics_enabled);
+
+        let mut builder = ProgramBuilder::new();
+        let r_counter = builder.alloc_reg();
+        let r_row = builder.alloc_reg();
+        builder.emit_op(Opcode::Integer, 0, r_counter, 0, P4::None, 0);
+        let loop_top = builder.emit_op(Opcode::AddImm, r_counter, 1, 0, P4::None, 0);
+        builder.emit_op(Opcode::Integer, 7, r_row, 0, P4::None, 0);
+        builder.emit_op(Opcode::ResultRow, r_row, 1, 0, P4::None, 0);
+        let loop_top = i32::try_from(loop_top).expect("loop address fits i32");
+        match loop_tail {
+            Opcode::Goto => builder.emit_op(Opcode::Goto, 0, loop_top, 0, P4::None, 0),
+            Opcode::NotNull => builder.emit_op(Opcode::NotNull, r_counter, loop_top, 0, P4::None, 0),
+            other => panic!("unsupported loop tail {other:?}"),
+        };
+        builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let program = builder.finish().expect("program should build");
+
+        let cx = Cx::new();
+        cx.transition_to_running();
+        let mut engine =
+            VdbeEngine::new_with_execution_cx(program.register_count(), &cx, PageSize::DEFAULT);
+
+        let mut rows = 0_usize;
+        let mut handler = |_row: smallvec::SmallVec<[SqliteValue; 16]>| -> Result<()> {
+            rows += 1;
+            if rows == 10 {
+                cx.cancel_with_reason(fsqlite_types::cx::CancelReason::UserInterrupt);
+            }
+            // A statement that never looks at the cancellation would spin
+            // forever; fail it instead, well past the next checkpoint.
+            if rows > 4 * usize::try_from(VDBE_EXECUTION_CHECKPOINT_INTERVAL).unwrap() {
+                return Err(FrankenError::internal(
+                    "cancellation was not observed at a checkpoint",
+                ));
+            }
+            Ok(())
+        };
+        let outcome = run_async(engine.execute_with_borrowed_bindings_and_row_handler(
+            &program,
+            None,
+            &mut handler,
+        ));
+        set_vdbe_metrics_enabled(prev_metrics_enabled);
+        let err = outcome.expect_err("a cancelled statement stops with an error");
+        assert!(matches!(err, FrankenError::Abort), "unexpected error: {err:?}");
+        rows
+    }
+
+    #[test]
+    fn test_hot_opcode_run_checks_cancellation_at_the_statement_loop_cadence() {
+        // Opcode 0 is the counter's `Integer`; each row is then four opcodes
+        // with `ResultRow` third, so row `j` is opcode `4j - 1`. The
+        // statement checks for cancellation before every opcode whose index
+        // is a multiple of the interval. The handler cancels at row 10, the
+        // next such opcode is index 4096, and rows 1..=1024 come before it.
+        let expected = usize::try_from(VDBE_EXECUTION_CHECKPOINT_INTERVAL / 4).unwrap();
+
+        // Every opcode of the loop runs on the hot lane without returning to
+        // the statement loop. A run that does not check for cancellation
+        // itself never stops; one that checks at another cadence stops at a
+        // different row.
+        assert_eq!(
+            rows_delivered_before_cancellation_is_observed(Opcode::Goto, false),
+            expected
+        );
+        // The hot lane declines `NotNull` once per row. Counting the declined
+        // opcode twice, or not at all, moves the checkpoint.
+        assert_eq!(
+            rows_delivered_before_cancellation_is_observed(Opcode::NotNull, false),
+            expected
+        );
+        // With metrics on the hot lane hands back after every opcode; the
+        // cadence is the same.
+        assert_eq!(
+            rows_delivered_before_cancellation_is_observed(Opcode::Goto, true),
+            expected
+        );
+        assert_eq!(
+            rows_delivered_before_cancellation_is_observed(Opcode::NotNull, true),
+            expected
         );
     }
 
