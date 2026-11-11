@@ -54,15 +54,46 @@ const QUERIES: &[&str] = &[
 /// GH#497's impact case: `key IN (?1, ?2, ...)`, a batched key lookup. Each member takes the
 /// column's affinity; NULLs and duplicates are dropped.
 const PARAM_QUERIES: &[(&str, &[SqliteValue])] = &[
-    ("SELECT v FROM r9_t WHERE k IN (?1)", &[SqliteValue::Integer(5)]),
-    ("SELECT v FROM r9_t WHERE k IN (?1, ?2)", &[SqliteValue::Integer(5), SqliteValue::Float(5.0)]),
-    ("SELECT v FROM r9_t WHERE k IN (?1, ?2)", &[SqliteValue::Null, SqliteValue::Integer(5)]),
-    ("SELECT v FROM r9_t WHERE k IN (?1, ?1, ?2)", &[SqliteValue::Null, SqliteValue::Null]),
-    ("SELECT id, v FROM r9_t WHERE k IN ('k3', ?1) AND v LIKE 'v1%'", &[SqliteValue::Integer(5)]),
-    ("SELECT v FROM r9_t WHERE v <> ?1 AND k IN (?2, ?3)", &[SqliteValue::Integer(0), SqliteValue::Integer(5), SqliteValue::Float(5.0)]),
-    ("SELECT v FROM c WHERE a IN (?1, ?2)", &[SqliteValue::Integer(1), SqliteValue::Integer(3)]),
-    ("SELECT v FROM c WHERE a IN (?1, ?2)", &[SqliteValue::Float(1.0), SqliteValue::Float(2.5)]),
-    ("SELECT v FROM c WHERE a IN (?1) AND b IS NULL", &[SqliteValue::Integer(1)]),
+    (
+        "SELECT v FROM r9_t WHERE k IN (?1)",
+        &[SqliteValue::Integer(5)],
+    ),
+    (
+        "SELECT v FROM r9_t WHERE k IN (?1, ?2)",
+        &[SqliteValue::Integer(5), SqliteValue::Float(5.0)],
+    ),
+    (
+        "SELECT v FROM r9_t WHERE k IN (?1, ?2)",
+        &[SqliteValue::Null, SqliteValue::Integer(5)],
+    ),
+    (
+        "SELECT v FROM r9_t WHERE k IN (?1, ?1, ?2)",
+        &[SqliteValue::Null, SqliteValue::Null],
+    ),
+    (
+        "SELECT id, v FROM r9_t WHERE k IN ('k3', ?1) AND v LIKE 'v1%'",
+        &[SqliteValue::Integer(5)],
+    ),
+    (
+        "SELECT v FROM r9_t WHERE v <> ?1 AND k IN (?2, ?3)",
+        &[
+            SqliteValue::Integer(0),
+            SqliteValue::Integer(5),
+            SqliteValue::Float(5.0),
+        ],
+    ),
+    (
+        "SELECT v FROM c WHERE a IN (?1, ?2)",
+        &[SqliteValue::Integer(1), SqliteValue::Integer(3)],
+    ),
+    (
+        "SELECT v FROM c WHERE a IN (?1, ?2)",
+        &[SqliteValue::Float(1.0), SqliteValue::Float(2.5)],
+    ),
+    (
+        "SELECT v FROM c WHERE a IN (?1) AND b IS NULL",
+        &[SqliteValue::Integer(1)],
+    ),
     ("SELECT v FROM nc WHERE k IN (?1)", &[SqliteValue::Null]),
 ];
 
@@ -127,7 +158,11 @@ fn frank_rows(rows: &[fsqlite_core::connection::Row]) -> Vec<Vec<String>> {
 async fn run(file_backed: bool) -> Vec<String> {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = if file_backed {
-        dir.path().join("gh497.db").to_str().expect("utf-8 path").to_owned()
+        dir.path()
+            .join("gh497.db")
+            .to_str()
+            .expect("utf-8 path")
+            .to_owned()
     } else {
         ":memory:".to_owned()
     };
@@ -228,5 +263,228 @@ fn text_in_list_seeks_the_index_and_matches_stock() {
             failures.len(),
             failures.join("\n")
         );
+    });
+}
+
+/// bd-in-or-index-scan-fs7nd: selective IN/OR predicates must seek REAL,
+/// NUMERIC and TEXT indexes for both row-producing and aggregate queries.
+/// Mixed storage classes, numeric aliases and NULLs exercise the probe set's
+/// affinity and deduplication semantics against stock, not just its plan.
+#[test]
+fn typed_index_membership_seeks_and_matches_stock() {
+    asupersync::test_utils::run_test(|| async {
+        for file_backed in [false, true] {
+            let dir = tempfile::tempdir().expect("typed membership temp dir");
+            let path = if file_backed {
+                dir.path().join("typed.db").to_str().unwrap().to_owned()
+            } else {
+                ":memory:".to_owned()
+            };
+            let frank = Connection::open(&path).await.unwrap();
+            let stock = rusqlite::Connection::open_in_memory().unwrap();
+            for sql in [
+                "CREATE TABLE typed_keys(id INTEGER PRIMARY KEY, r REAL, n NUMERIC, t TEXT, suffix, payload TEXT)",
+                "CREATE INDEX typed_r ON typed_keys(r)",
+                "CREATE INDEX typed_n ON typed_keys(n, suffix DESC)",
+                "CREATE INDEX typed_t ON typed_keys(t)",
+                "INSERT INTO typed_keys VALUES \
+                 (1,1,1,'1',NULL,'one'), \
+                 (2,1.0,1.0,'01',4,'duplicate'), \
+                 (3,2.5,2.5,'2.5',NULL,'fraction'), \
+                 (4,-1,-1,'-1',8,'negative'), \
+                 (5,NULL,NULL,NULL,NULL,'null'), \
+                 (6,'word','word','word',2,'text'), \
+                 (7,X'3132',X'3132',X'3132',NULL,'blob'), \
+                 (8,9007199254740992,9007199254740992,'9007199254740992',NULL,'even'), \
+                 (9,9007199254740993,9007199254740993,'9007199254740993',7,'odd'), \
+                 (10,0,0,'',NULL,'zero')",
+                "CREATE TABLE collated(k TEXT COLLATE NOCASE, v INTEGER)",
+                "CREATE INDEX collated_k ON collated(k)",
+                "INSERT INTO collated VALUES('A',1),('a',2),('b',3)",
+                "CREATE INDEX typed_t_nocase ON typed_keys(t COLLATE NOCASE)",
+                "CREATE TABLE untyped(k, payload TEXT)",
+                "CREATE INDEX untyped_k ON untyped(k)",
+                "INSERT INTO untyped VALUES(1,'integer'),(1.0,'real'),('1','text'),('01','leading'),(X'31','blob'),(NULL,'null')",
+                "CREATE TABLE partial_only(k NUMERIC)",
+                "CREATE INDEX partial_positive ON partial_only(k) WHERE k > 0",
+                "INSERT INTO partial_only VALUES(-1),(1.5),(4),(NULL)",
+                "CREATE TABLE mismatched(k TEXT)",
+                "CREATE INDEX mismatched_nocase ON mismatched(k COLLATE NOCASE)",
+                "INSERT INTO mismatched VALUES('A'),('a'),('b')",
+            ] {
+                frank.execute(sql).await.unwrap();
+                stock.execute_batch(sql).unwrap();
+            }
+
+            let mut queries = Vec::new();
+            for column in ["r", "n", "t"] {
+                for predicate in [
+                    format!("{column} IN (1, 2.5, 'word')"),
+                    format!("{column} IN (1, 1.0, '1', NULL, 1)"),
+                    format!("{column} IN (NULL, NULL)"),
+                    format!("{column} IN (-1, X'3132', 'absent')"),
+                    format!("{column} IN (9007199254740993)"),
+                    format!("{column} IN (9007199254740992, 9007199254740993)"),
+                    format!("{column} = 1 OR {column} = 2.5 OR 'word' = {column}"),
+                    format!("{column} = 1 OR {column} = 1.0 OR {column} = '1'"),
+                ] {
+                    for projection in ["id, payload", "count(*)", "count(id), sum(id)"] {
+                        queries.push(format!(
+                            "SELECT {projection} FROM typed_keys WHERE {predicate}"
+                        ));
+                    }
+                }
+                queries.push(format!(
+                    "SELECT count(*), min({column}), max({column}) FROM typed_keys \
+                     WHERE {column} IN (1, 1.0, '1', 2.5)"
+                ));
+                queries.push(format!(
+                    "SELECT count(*), sum(id) FROM typed_keys \
+                     WHERE id > 1 AND {column} IN (1, 2.5, 'word') AND suffix IS NULL"
+                ));
+                queries.push(format!(
+                    "SELECT {column}, count(*) FROM typed_keys \
+                     WHERE {column} IN (1, 1.0, '1', 2.5) GROUP BY {column}"
+                ));
+            }
+            queries.extend([
+                "SELECT typeof(sum(r)), sum(r), min(r), max(r) FROM typed_keys WHERE r IN (1, 2.5)".to_owned(),
+                "SELECT count(DISTINCT r), sum(DISTINCT r) FROM typed_keys WHERE r IN (1,1.0,2.5)".to_owned(),
+                "SELECT count(*) FILTER (WHERE id > 1), sum(id) FILTER (WHERE suffix IS NULL) FROM typed_keys WHERE n IN (1,2.5,'word')".to_owned(),
+                "SELECT payload, min(r) FROM typed_keys WHERE r IN (1,2.5)".to_owned(),
+                "SELECT group_concat(id) FROM typed_keys WHERE t IN ('word','1','2.5')".to_owned(),
+                "SELECT count(*) FROM typed_keys WHERE t IN ('WORD' COLLATE NOCASE)".to_owned(),
+                "SELECT count(*) FROM typed_keys WHERE t IN ('WORD' COLLATE NOCASE,'absent')".to_owned(),
+                "SELECT count(*) FROM typed_keys WHERE t = 'WORD' COLLATE NOCASE OR t = 'word'".to_owned(),
+                "SELECT count(*) FROM collated WHERE k IN ('A','a','B',NULL)".to_owned(),
+                "SELECT count(*) FROM typed_keys NOT INDEXED WHERE r IN (1,2.5)".to_owned(),
+                "SELECT count(*) FROM typed_keys WHERE r NOT IN (1,NULL)".to_owned(),
+                "SELECT count(*) FROM typed_keys WHERE r = 1 OR t = 'word'".to_owned(),
+                "SELECT id FROM typed_keys WHERE t = CAST(1 AS NUMERIC) OR t = 'word'".to_owned(),
+                "SELECT id FROM typed_keys WHERE t IN (CAST(1 AS NUMERIC),'word')".to_owned(),
+                "SELECT count(*) FROM typed_keys WHERE n = CAST('1' AS TEXT) OR n = 2.5".to_owned(),
+                "SELECT payload FROM untyped WHERE k IN (1,1.0,'1',NULL,X'31')".to_owned(),
+                "SELECT count(*), sum(rowid) FROM untyped WHERE k = 1 OR k = 1.0 OR k = '1'".to_owned(),
+                "SELECT payload FROM untyped WHERE k = CAST(1 AS NUMERIC) OR k = 'missing'".to_owned(),
+                "SELECT count(*) FROM partial_only WHERE k IN (-1,1.5)".to_owned(),
+                "SELECT count(*) FROM partial_only WHERE k = -1 OR k = 1.5".to_owned(),
+                "SELECT k FROM mismatched WHERE k IN ('A','b')".to_owned(),
+                "SELECT count(*) FROM mismatched WHERE k = 'A' OR k = 'b'".to_owned(),
+            ]);
+            for sql in &queries {
+                let expected = stock_rows(&stock, sql, &[]);
+                assert_eq!(
+                    frank_rows(&frank.query(sql).await.unwrap()),
+                    expected,
+                    "direct file_backed={file_backed}: {sql}"
+                );
+                assert_eq!(
+                    frank_rows(&frank.prepare(sql).await.unwrap().query().await.unwrap()),
+                    expected,
+                    "prepared file_backed={file_backed}: {sql}"
+                );
+            }
+
+            for (sql, params) in [
+                (
+                    "SELECT count(*), sum(id) FROM typed_keys WHERE r IN (?1,?2,?3)",
+                    vec![
+                        SqliteValue::Integer(1),
+                        SqliteValue::Float(1.0),
+                        SqliteValue::Null,
+                    ],
+                ),
+                (
+                    "SELECT count(*), sum(id) FROM typed_keys WHERE r IN (?1,?2)",
+                    vec![
+                        SqliteValue::Integer(9_007_199_254_740_993),
+                        SqliteValue::Text("9007199254740993".into()),
+                    ],
+                ),
+                (
+                    "SELECT count(*), sum(id) FROM typed_keys WHERE id > ?1 AND n IN (?2,?3)",
+                    vec![
+                        SqliteValue::Integer(1),
+                        SqliteValue::Text("1".into()),
+                        SqliteValue::Float(2.5),
+                    ],
+                ),
+                (
+                    "SELECT sum(id + ?1) FROM typed_keys WHERE r IN (?2,?3)",
+                    vec![
+                        SqliteValue::Integer(10),
+                        SqliteValue::Integer(1),
+                        SqliteValue::Float(2.5),
+                    ],
+                ),
+                (
+                    "SELECT id FROM typed_keys WHERE ?1 = t OR t = ?2 OR t = ?3",
+                    vec![
+                        SqliteValue::Integer(1),
+                        SqliteValue::Text("1".into()),
+                        SqliteValue::Null,
+                    ],
+                ),
+                (
+                    "SELECT count(*), sum(id) FROM typed_keys WHERE payload <> ? AND n IN (?,?) AND payload <> ?",
+                    vec![
+                        SqliteValue::Text("duplicate".into()),
+                        SqliteValue::Integer(1),
+                        SqliteValue::Float(2.5),
+                        SqliteValue::Text("absent".into()),
+                    ],
+                ),
+            ] {
+                let expected = stock_rows(&stock, sql, &params);
+                assert_eq!(
+                    frank_rows(&frank.query_with_params(sql, &params).await.unwrap()),
+                    expected,
+                    "direct parameters file_backed={file_backed}: {sql}"
+                );
+                assert_eq!(
+                    frank_rows(
+                        &frank
+                            .prepare(sql)
+                            .await
+                            .unwrap()
+                            .query_with_params(&params)
+                            .await
+                            .unwrap()
+                    ),
+                    expected,
+                    "prepared parameters file_backed={file_backed}: {sql}"
+                );
+            }
+
+            for column in ["r", "n", "t"] {
+                for predicate in [
+                    format!("{column} IN (1,2.5)"),
+                    format!("{column} IN (?1,?2)"),
+                    format!("{column} = 1 OR {column} = 2.5"),
+                ] {
+                    for projection in ["id", "count(*)", "sum(id)"] {
+                        let sql = format!(
+                            "EXPLAIN SELECT {projection} FROM typed_keys WHERE {predicate}"
+                        );
+                        let rows = frank.query(&sql).await.unwrap();
+                        let operations: Vec<_> = rows.iter().map(|row| row.values()).collect();
+                        assert!(
+                            operations
+                                .iter()
+                                .any(|op| op[1] == SqliteValue::Text("SeekGE".into())),
+                            "must seek the membership index, file_backed={file_backed}: {sql}"
+                        );
+                        assert!(
+                            !operations.iter().any(|op| {
+                                op[1] == SqliteValue::Text("Rewind".into())
+                                    && op[2] == SqliteValue::Integer(0)
+                            }),
+                            "must not scan the table, file_backed={file_backed}: {sql}"
+                        );
+                    }
+                }
+            }
+            frank.close().await.unwrap();
+        }
     });
 }
