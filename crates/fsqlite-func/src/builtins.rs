@@ -2691,18 +2691,17 @@ impl ScalarFunction for FormatFunc {
         }
         let format_bytes = args[0].text_bytes();
         let fmt = text_bytes_until_nul(&format_bytes);
-        // SQLite returns NULL (not empty text) when the format string is empty:
-        // an empty format never appends to the StrAccum, so its result buffer
-        // stays NULL. A non-empty format that renders to nothing (e.g.
-        // printf('%s', NULL)) still yields empty TEXT, so only gate on the
-        // format string being empty here.
-        if fmt.is_empty() {
-            return Ok(SqliteValue::Null);
-        }
+        // Since SQLite 3.54 printf() hands its accumulator to
+        // `sqlite3_result_str`, which returns empty TEXT for an empty result, so
+        // an empty format (or one whose first byte is NUL) yields '' like any
+        // format that renders nothing; only a NULL format or no arguments is
+        // NULL. Through 3.53 those were NULL (bd-13ivh).
         let params = &args[1..];
         let Some(result) = sqlite_format(fmt, params)? else {
-            // bd-mcgdb: a too-big printf result renders as SQL NULL, not an error.
-            return Ok(SqliteValue::Null);
+            // A result that would reach SQLITE_MAX_LENGTH is SQLITE_TOOBIG: an
+            // error since 3.54 (`sqlite3_result_str`), NULL through 3.53
+            // (bd-mcgdb). The width/precision folds that decide it are unchanged.
+            return Err(FrankenError::TooBig);
         };
         Ok(text_from_bytes(result))
     }
@@ -2718,8 +2717,9 @@ impl ScalarFunction for FormatFunc {
 
 /// SQLite's maximum result length for the printf()/format() SQL functions
 /// (SQLITE_MAX_LENGTH default). A field whose width, or integer/char precision,
-/// would grow the result to this many bytes makes printf() return NULL — matching
-/// C SQLite, which reports SQLITE_TOOBIG and yields a NULL result (bd-mcgdb).
+/// would grow the result to this many bytes makes printf() fail with
+/// SQLITE_TOOBIG, as C SQLite 3.54 does (3.53 and earlier returned NULL,
+/// bd-mcgdb).
 const PRINTF_MAX_LENGTH: usize = 1_000_000_000;
 /// C SQLite caps the fractional/significant digit count of a float conversion
 /// (%f/%e/%g) at this many digits rather than erroring (bd-mcgdb).
@@ -2729,7 +2729,7 @@ const PRINTF_FLOAT_PRECISION_CAP: usize = 100_000_000;
 /// Supports: %d, %f, %e, %g, %s, %q, %Q, %w, %%, %n (no-op).
 ///
 /// Returns `Ok(None)` when the formatted result would reach `PRINTF_MAX_LENGTH`
-/// bytes; the caller renders that as SQL NULL (bd-mcgdb).
+/// bytes; the caller reports that as SQLITE_TOOBIG (bd-mcgdb).
 fn sqlite_format(fmt: &[u8], params: &[SqliteValue]) -> Result<Option<Vec<u8>>> {
     // SQLite TEXT need not be valid UTF-8. Both the format and the output are
     // byte sequences; parsing ASCII directives must not decode literal bytes.
@@ -2796,7 +2796,7 @@ fn sqlite_format(fmt: &[u8], params: &[SqliteValue]) -> Result<Option<Vec<u8>>> 
             // `va_arg(int)` — it CASTS the i64 to i32 first, then a negative value
             // means left-justify with its magnitude, with INT_MIN (no positive
             // counterpart) collapsing to 0. No 1e8 pre-clamp: a width that reaches
-            // PRINTF_MAX_LENGTH is NULLed by the guard at the conversion, exactly
+            // PRINTF_MAX_LENGTH is refused by the guard at the conversion, exactly
             // like the literal `%2147483648d`/`%1000000000d` fold (bd-mcgdb).
             let w32 = w as i32;
             if w32 < 0 {
@@ -2814,7 +2814,7 @@ fn sqlite_format(fmt: &[u8], params: &[SqliteValue]) -> Result<Option<Vec<u8>>> 
             // digit run with 32-bit wrapping, then take the low 31 bits. So
             // %2147483648d -> width 0 (0x80000000 & 0x7fffffff), %3000000000d ->
             // 852516352, %4294967295d -> 2147483647. A width that reaches
-            // PRINTF_MAX_LENGTH later NULLs the whole result.
+            // PRINTF_MAX_LENGTH later makes the whole call SQLITE_TOOBIG.
             width = parse_printf_field(chars, &mut i);
         }
 
@@ -2840,14 +2840,14 @@ fn sqlite_format(fmt: &[u8], params: &[SqliteValue]) -> Result<Option<Vec<u8>>> 
                     None
                 } else {
                     // bd-printf-dynamic-width-i32-3fpd4: no 1e8 pre-clamp — the
-                    // per-spec guard NULLs an integer/char conversion past
+                    // per-spec guard refuses an integer/char conversion past
                     // PRINTF_MAX_LENGTH and caps a float conversion, exactly like a
                     // literal precision (bd-mcgdb).
                     Some(usize::try_from(p32.unsigned_abs()).unwrap_or(usize::MAX))
                 };
             } else {
                 // bd-mcgdb: same 32-bit-wrapping-then-low-31-bits fold as width.
-                // Integer/char conversions NULL the result past PRINTF_MAX_LENGTH;
+                // Integer/char conversions refuse the result past PRINTF_MAX_LENGTH;
                 // float conversions clamp instead (handled below at the spec).
                 precision = Some(parse_printf_field(chars, &mut i));
             }
@@ -7150,18 +7150,20 @@ mod tests {
 
     #[test]
     fn test_printf_int_max_width_precision_overflow_bd_mcgdb() {
-        // bd-mcgdb. Oracle: sqlite3 3.46.1. A literal width/precision digit run
+        // bd-mcgdb. Oracle: SQLite 3.54.1 (the bundled rusqlite), every case
+        // checked against it on 2026-11-11. A literal width/precision digit run
         // is accumulated with 32-bit wrapping then masked to its low 31 bits;
         // if the resulting field would pad the result to >= SQLITE_MAX_LENGTH
-        // (1e9) bytes, printf() returns NULL (not an error, not a 100MB string).
-        // Float precision instead caps its digit count and never NULLs.
+        // (1e9) bytes, printf() fails with SQLITE_TOOBIG (3.53 and earlier
+        // returned NULL), never building a giant string. Float precision
+        // instead caps its digit count and always succeeds.
         let f = FormatFunc;
-        // Some(text) for a TEXT result, None for SQL NULL.
+        // Some(text) for a TEXT result, None for SQLITE_TOOBIG.
         let run = |args: &[SqliteValue]| -> Option<String> {
-            match f.invoke(args).unwrap() {
-                SqliteValue::Text(s) => Some(s.as_str().to_owned()),
-                SqliteValue::Null => None,
-                other => panic!("expected text or null, got {other:?}"),
+            match f.invoke(args) {
+                Ok(SqliteValue::Text(s)) => Some(s.as_str().to_owned()),
+                Err(FrankenError::TooBig) => None,
+                other => panic!("expected text or TooBig, got {other:?}"),
             }
         };
         let txt = |s: &str| SqliteValue::Text(SmallText::from_string(s));
@@ -7180,7 +7182,7 @@ mod tests {
         assert_eq!(run(&[txt("%8589934592d"), int(5)]), some("5"));
         assert_eq!(run(&[txt("%8589934597d"), int(5)]), some("    5"));
 
-        // --- Width that folds to >= 1e9 -> NULL (never a giant string). ---
+        // --- Width that folds to >= 1e9 -> TooBig (never a giant string). ---
         assert_eq!(run(&[txt("%1000000000d"), int(5)]), None);
         assert_eq!(run(&[txt("%2147483647d"), int(5)]), None); // INT_MAX
         assert_eq!(run(&[txt("%4294967295d"), int(5)]), None); // masks to INT_MAX
@@ -7190,16 +7192,16 @@ mod tests {
         assert_eq!(run(&[txt("%2147483648s"), txt("ab")]), some("ab")); // width 0
         assert_eq!(run(&[txt("%4294967301s"), txt("ab")]), some("   ab")); // width 5
 
-        // --- Integer precision folds the same way; >= 1e9 zero-pad -> NULL. ---
+        // --- Integer precision folds the same way; >= 1e9 zero-pad -> TooBig. ---
         assert_eq!(run(&[txt("%.2147483648d"), int(5)]), some("5")); // precision 0
         assert_eq!(run(&[txt("%.4294967301d"), int(5)]), some("00005")); // precision 5
         assert_eq!(run(&[txt("%.1000000000d"), int(5)]), None);
-        // %c precision is a repeat count and folds/NULLs identically.
+        // %c precision is a repeat count and folds/refuses identically.
         assert_eq!(run(&[txt("%.2147483648c"), txt("A")]), some("A")); // min repeat 1
         assert_eq!(run(&[txt("%.4294967301c"), txt("A")]), some("AAAAA"));
         assert_eq!(run(&[txt("%.1000000000c"), txt("A")]), None);
 
-        // --- Float precision folds then CAPS (dtoa limit) — never NULL. ---
+        // --- Float precision folds then CAPS (dtoa limit) — never TooBig. ---
         // 2147483648 -> 0 fractional digits, 2147483649 -> 1, 4294967296 -> 0.
         assert_eq!(run(&[txt("%.2147483648f"), int(5)]), some("5"));
         assert_eq!(run(&[txt("%.2147483649f"), int(5)]), some("5.0"));
@@ -7556,16 +7558,33 @@ mod tests {
     }
 
     #[test]
-    fn test_format_empty_string_is_null() {
-        // bd-13ivh: an empty format string yields NULL (the StrAccum is never
-        // touched), while a non-empty format that renders to nothing still
-        // yields empty TEXT.
+    fn test_format_empty_string_is_empty_text() {
+        // SQLite 3.54 (`sqlite3_result_str`): an empty format, or one whose
+        // first byte is NUL, yields empty TEXT like any format that renders
+        // nothing (through 3.53 it was NULL, bd-13ivh). Only a NULL format or no
+        // arguments is NULL.
         let f = FormatFunc;
+        let empty = SqliteValue::Text(SmallText::from_string(String::new()));
         assert_eq!(
             f.invoke(&[SqliteValue::Text(SmallText::from_string(""))])
                 .unwrap(),
-            SqliteValue::Null
+            empty
         );
+        assert_eq!(
+            f.invoke(&[
+                SqliteValue::Text(SmallText::from_string("")),
+                SqliteValue::Integer(1),
+            ])
+            .unwrap(),
+            empty
+        );
+        assert_eq!(
+            f.invoke(&[SqliteValue::Blob(vec![0x00, 0x25, 0x73].into())])
+                .unwrap(),
+            empty
+        );
+        assert_eq!(f.invoke(&[SqliteValue::Null]).unwrap(), SqliteValue::Null);
+        assert_eq!(f.invoke(&[]).unwrap(), SqliteValue::Null);
         // Non-empty format rendering to empty output is still TEXT, not NULL.
         assert_eq!(
             f.invoke(&[

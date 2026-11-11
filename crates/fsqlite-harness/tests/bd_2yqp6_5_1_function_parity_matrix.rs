@@ -556,7 +556,8 @@ fn test_format_printf_functions() {
             name: "printf_null_q",
             sql: "SELECT printf('%q', NULL)",
         },
-        // bd-13ivh: an empty format string yields NULL (not empty text).
+        // An empty format string yields empty text since SQLite 3.54 (NULL
+        // through 3.53, bd-13ivh); compared live against the bundled oracle.
         CompatTest {
             name: "printf_empty_format",
             sql: "SELECT printf('')",

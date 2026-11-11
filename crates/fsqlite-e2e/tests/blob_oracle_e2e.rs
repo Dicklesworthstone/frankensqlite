@@ -367,14 +367,22 @@ fn format_raw_format_strings_and_nul_termination() {
                     assert_text_bytes(&f, &r, &expression, expected).await;
                 }
             }
-            for format in ["X''", "X'002573'", "CAST(X'002573' AS TEXT)", "NULL"] {
-                let sql = format!("SELECT {name}({format}, 'unused') IS NULL");
-                let expected = vec![vec!["1".to_owned()]];
+            // Since SQLite 3.54 an empty format, or one whose first byte is NUL,
+            // renders empty TEXT like any format that produces nothing; only a
+            // NULL format is NULL (through 3.53 all four were NULL).
+            for (format, expected) in [
+                ("X''", "''"),
+                ("X'002573'", "''"),
+                ("CAST(X'002573' AS TEXT)", "''"),
+                ("NULL", "NULL"),
+            ] {
+                let sql = format!("SELECT quote({name}({format}, 'unused'))");
+                let expected = vec![vec![expected.to_owned()]];
                 assert_eq!(sqlite_rows(&r, &sql).expect("stock empty format"), expected);
                 assert_eq!(
                     frank_rows(&f, &sql).await.expect("frank empty format"),
                     expected,
-                    "empty format must produce NULL: {sql}"
+                    "empty format result must match stock: {sql}"
                 );
             }
             assert_text_bytes(&f, &r, &format!("{name}('%s', NULL)"), "").await;

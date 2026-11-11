@@ -107,15 +107,13 @@ fn printf_null_format_is_null() {
     });
 }
 
+/// An empty format is empty text since SQLite 3.54 (NULL through 3.53).
 #[test]
-fn printf_empty_format_is_null() {
+fn printf_empty_format_matches_stock() {
     asupersync::test_utils::run_test(|| async {
         assert_scalar(
-            &[
-                "SELECT printf('')",      // SQLite: NULL   frank: ''
-                "SELECT printf('', 'x')", // SQLite: NULL   frank: ''
-            ],
-            "printf_empty_format_is_null",
+            &["SELECT printf('')", "SELECT printf('', 'x')"],
+            "printf_empty_format_matches_stock",
         )
         .await;
     });
