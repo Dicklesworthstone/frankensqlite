@@ -238,11 +238,29 @@ pub const PARALLEL_WAL_MAX_DURABLE_CERTIFICATE_RECORD_SIZE: usize =
 /// page number, the `u32` commit database size, the `u64` payload length, and
 /// the payload bytes, all in little-endian field order. BLAKE3 derive-key mode
 /// domain-separates this digest from every other hash protocol.
+///
+/// The digest is a function of that byte stream alone, not of how it is cut
+/// into hasher calls. The builder hands the stream to BLAKE3 in whole
+/// [`FRAME_PAYLOAD_DIGEST_BLOCK`]s (bd-w4pr1.13.17): BLAKE3 hashes 1 KiB
+/// chunks and takes its multi-chunk SIMD path only for a call that starts on
+/// a chunk boundary, and the 24 bytes of fields before every page otherwise
+/// leave a partial chunk that the page's first bytes finish one 64-byte
+/// block at a time.
 #[derive(Debug, Clone)]
 pub struct ParallelWalFramePayloadDigestBuilder {
     hasher: blake3::Hasher,
     next_ordinal: u64,
+    /// Stream bytes not yet handed to the hasher: always less than one
+    /// block, so the hasher has always received a whole number of blocks.
+    pending: Vec<u8>,
 }
+
+/// Bytes the frame-payload digest hands to BLAKE3 per call: 16 of its chunks,
+/// a power of two, so every call is one complete subtree.
+const FRAME_PAYLOAD_DIGEST_BLOCK: usize = 16 * 1024;
+
+/// Bytes of fields hashed before each frame's payload.
+const FRAME_PAYLOAD_DIGEST_FIELD_BYTES: usize = 8 + 4 + 4 + 8;
 
 impl ParallelWalFramePayloadDigestBuilder {
     #[must_use]
@@ -250,6 +268,7 @@ impl ParallelWalFramePayloadDigestBuilder {
         Self {
             hasher: blake3::Hasher::new_derive_key(PARALLEL_WAL_FRAME_PAYLOAD_DIGEST_DOMAIN),
             next_ordinal: 0,
+            pending: Vec::new(),
         }
     }
 
@@ -262,17 +281,46 @@ impl ParallelWalFramePayloadDigestBuilder {
         let payload_len =
             u64::try_from(payload.len()).expect("parallel WAL frame payload length exceeds u64");
 
-        self.hasher.update(&ordinal.to_le_bytes());
-        self.hasher.update(&page_number.get().to_le_bytes());
-        self.hasher.update(&db_size_if_commit.to_le_bytes());
-        self.hasher.update(&payload_len.to_le_bytes());
-        self.hasher.update(payload);
+        let mut fields = [0_u8; FRAME_PAYLOAD_DIGEST_FIELD_BYTES];
+        fields[..8].copy_from_slice(&ordinal.to_le_bytes());
+        fields[8..12].copy_from_slice(&page_number.get().to_le_bytes());
+        fields[12..16].copy_from_slice(&db_size_if_commit.to_le_bytes());
+        fields[16..].copy_from_slice(&payload_len.to_le_bytes());
+
+        // Room for this frame, up to the one block the buffer ever holds.
+        let room = FRAME_PAYLOAD_DIGEST_BLOCK - self.pending.len();
+        self.pending
+            .reserve(room.min(fields.len().saturating_add(payload.len())));
+        self.absorb(&fields);
+        self.absorb(payload);
+    }
+
+    /// Append `bytes` to the hashed stream, handing the hasher every whole
+    /// block as soon as it is complete.
+    fn absorb(&mut self, mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            if self.pending.is_empty() && bytes.len() >= FRAME_PAYLOAD_DIGEST_BLOCK {
+                // Whole blocks go to the hasher from where they are.
+                let whole = bytes.len() - bytes.len() % FRAME_PAYLOAD_DIGEST_BLOCK;
+                self.hasher.update(&bytes[..whole]);
+                bytes = &bytes[whole..];
+            } else {
+                let take = (FRAME_PAYLOAD_DIGEST_BLOCK - self.pending.len()).min(bytes.len());
+                self.pending.extend_from_slice(&bytes[..take]);
+                bytes = &bytes[take..];
+                if self.pending.len() == FRAME_PAYLOAD_DIGEST_BLOCK {
+                    self.hasher.update(&self.pending);
+                    self.pending.clear();
+                }
+            }
+        }
     }
 
     /// Finish the ordered-frame digest, consuming the builder so a completed
     /// certificate cannot accidentally be extended with later frames.
     #[must_use]
-    pub fn finalize(self) -> [u8; 32] {
+    pub fn finalize(mut self) -> [u8; 32] {
+        self.hasher.update(&self.pending);
         *self.hasher.finalize().as_bytes()
     }
 }
@@ -5502,6 +5550,79 @@ mod tests {
             baseline,
             frame_payload_digest(&[(2, 0, b"abc"), (3, 17, b"defg\0")]),
             "payload length must affect the digest"
+        );
+    }
+
+    /// bd-w4pr1.13.17: the builder hands BLAKE3 whole blocks, and the digest
+    /// must stay the digest of the documented byte stream fed field by
+    /// field, which is what every certificate on disk holds. Payload sizes
+    /// sit at, below and above the block size and the chunk size; frame
+    /// counts leave the buffer empty, part full and exactly full at finalize.
+    #[test]
+    fn frame_payload_digest_builder_matches_the_piecewise_stream() {
+        let block = FRAME_PAYLOAD_DIGEST_BLOCK;
+        let fields = FRAME_PAYLOAD_DIGEST_FIELD_BYTES;
+        let payload_lens = [
+            0,
+            1,
+            7,
+            512,
+            1_000,
+            1_024,
+            4_096,
+            block - fields - 1,
+            block - fields,
+            block - fields + 1,
+            block,
+            block + 1,
+            65_536,
+        ];
+        let mut exact_fills = 0_usize;
+        for payload_len in payload_lens {
+            for frame_count in [1_usize, 2, 3, 4, 5, 17, 40] {
+                let mut builder = ParallelWalFramePayloadDigestBuilder::new();
+                let mut piecewise =
+                    blake3::Hasher::new_derive_key(PARALLEL_WAL_FRAME_PAYLOAD_DIGEST_DOMAIN);
+                for frame in 0..frame_count {
+                    let page_number = u32::try_from(frame + 2).unwrap();
+                    let db_size_if_commit = if frame + 1 == frame_count { 99 } else { 0 };
+                    let payload: Vec<u8> = (0..payload_len)
+                        .map(|byte| {
+                            u8::try_from((byte * 31 + frame * 7 + payload_len) % 251).unwrap()
+                        })
+                        .collect();
+                    builder.update(
+                        PageNumber::new(page_number).unwrap(),
+                        db_size_if_commit,
+                        &payload,
+                    );
+                    piecewise.update(&u64::try_from(frame).unwrap().to_le_bytes());
+                    piecewise.update(&page_number.to_le_bytes());
+                    piecewise.update(&db_size_if_commit.to_le_bytes());
+                    piecewise.update(&u64::try_from(payload_len).unwrap().to_le_bytes());
+                    piecewise.update(&payload);
+                    assert!(builder.pending.len() < block);
+                }
+                exact_fills += usize::from(
+                    builder.pending.is_empty() && (fields + payload_len) * frame_count >= block,
+                );
+                assert_eq!(
+                    builder.finalize(),
+                    *piecewise.finalize().as_bytes(),
+                    "{frame_count} frames of {payload_len} payload bytes"
+                );
+            }
+        }
+        assert!(
+            exact_fills > 0,
+            "a case must end exactly on a block boundary"
+        );
+        // No frames: the digest of the empty stream.
+        assert_eq!(
+            ParallelWalFramePayloadDigestBuilder::new().finalize(),
+            *blake3::Hasher::new_derive_key(PARALLEL_WAL_FRAME_PAYLOAD_DIGEST_DOMAIN)
+                .finalize()
+                .as_bytes()
         );
     }
 
