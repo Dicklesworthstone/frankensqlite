@@ -581,6 +581,113 @@ pub mod s3_fifo_reconstruction_diagnostics {
 const S3_FIFO_RECONSTRUCTED_EVICTION_MAX_RESIDENTS: usize = 4_096;
 const S3_FIFO_RECONSTRUCTED_EVICTION_MAX_TRACE_ENTRIES: usize = 8_192;
 
+/// Entries tested per step when an access trace is searched for one page.
+const ACCESS_TRACE_SEARCH_BLOCK: usize = 32;
+
+/// Index of the first `page_no` in `entries`.
+///
+/// A whole block is tested without an early exit, which compiles to wide
+/// compares; only the block that holds the page is searched entry by entry.
+/// Every eviction searches the whole trace (bd-w4pr1.13.12), and an evicted
+/// page is usually in it once.
+fn first_access_trace_position(entries: &[PageNumber], page_no: PageNumber) -> Option<usize> {
+    let mut searched = 0;
+    let (blocks, _) = entries.as_chunks::<ACCESS_TRACE_SEARCH_BLOCK>();
+    for block in blocks {
+        let hits = block.iter().fold(0_u32, |hits, candidate| {
+            hits | u32::from(*candidate == page_no)
+        });
+        if hits != 0 {
+            break;
+        }
+        searched += ACCESS_TRACE_SEARCH_BLOCK;
+    }
+    entries[searched..]
+        .iter()
+        .position(|candidate| *candidate == page_no)
+        .map(|offset| searched + offset)
+}
+
+/// Position of the first `page_no` at or after `from` in a trace held as the
+/// two halves of a ring (`front`, then `back`); the trace length when there is
+/// none.
+fn next_access_trace_position(
+    front: &[PageNumber],
+    back: &[PageNumber],
+    page_no: PageNumber,
+    from: usize,
+) -> usize {
+    if from < front.len()
+        && let Some(offset) = first_access_trace_position(&front[from..], page_no)
+    {
+        return from + offset;
+    }
+    let back_from = from.max(front.len()) - front.len();
+    first_access_trace_position(&back[back_from..], page_no).map_or_else(
+        || front.len() + back.len(),
+        |offset| front.len() + back_from + offset,
+    )
+}
+
+/// Move the ring entries `run` down so that they start at `to`, where
+/// `to < run.start`. Entries are copied in ring order, so a destination never
+/// covers an entry that has not been moved yet.
+fn move_access_trace_run(
+    front: &mut [PageNumber],
+    back: &mut [PageNumber],
+    run: std::ops::Range<usize>,
+    to: usize,
+) {
+    let front_len = front.len();
+    let shift = run.start - to;
+    // Entries that start in `front` stay in `front`.
+    let front_end = run.end.min(front_len);
+    if run.start < front_end {
+        front.copy_within(run.start..front_end, to);
+    }
+    // Entries that start in `back` fill the last `shift` slots of `front`
+    // first and move down inside `back` after that.
+    let back_start = run.start.max(front_len);
+    if back_start < run.end {
+        let source = back_start - front_len;
+        let source_end = run.end - front_len;
+        let into_front = front_len
+            .saturating_sub(back_start - shift)
+            .min(run.end - back_start);
+        if into_front > 0 {
+            let target = back_start - shift;
+            front[target..target + into_front]
+                .copy_from_slice(&back[source..source + into_front]);
+        }
+        if source + into_front < source_end {
+            back.copy_within(
+                source + into_front..source_end,
+                back_start + into_front - shift - front_len,
+            );
+        }
+    }
+}
+
+/// Remove every `page_no` from an access trace held as the two halves of a
+/// ring, keeping the other entries in their order, and return how many entries
+/// remain. The kept entries occupy the first positions of the ring.
+fn compact_access_trace_without(
+    front: &mut [PageNumber],
+    back: &mut [PageNumber],
+    page_no: PageNumber,
+) -> usize {
+    let len = front.len() + back.len();
+    let mut write = next_access_trace_position(front, back, page_no, 0);
+    let mut read = write + 1;
+    while read < len {
+        let hit = next_access_trace_position(front, back, page_no, read);
+        move_access_trace_run(front, back, read..hit, write);
+        write += hit - read;
+        read = hit + 1;
+    }
+    write
+}
+
 #[derive(Debug, Clone)]
 struct S3FifoEvictionTracker {
     config: S3FifoConfig,
@@ -621,24 +728,12 @@ impl S3FifoEvictionTracker {
         if self.access_trace.len() > S3_FIFO_RECONSTRUCTED_EVICTION_MAX_RESIDENTS {
             return;
         }
-        let Some(mut write) = self
-            .access_trace
-            .iter()
-            .position(|candidate| *candidate == page_no)
-        else {
-            return;
-        };
-        // PageNumber is Copy: fill each hole directly rather than swapping a
-        // discarded entry through the entire remaining history. Preserve the
-        // exact retained order, including when the deque wraps around.
-        for read in write + 1..self.access_trace.len() {
-            let candidate = self.access_trace[read];
-            if candidate != page_no {
-                self.access_trace[write] = candidate;
-                write += 1;
-            }
-        }
-        self.access_trace.truncate(write);
+        // Keep the exact retained order, including when the deque wraps
+        // around: the runs between occurrences of the page move down as
+        // blocks, in ring order.
+        let (front, back) = self.access_trace.as_mut_slices();
+        let kept = compact_access_trace_without(front, back, page_no);
+        self.access_trace.truncate(kept);
     }
 
     fn clear_history(&mut self) {
@@ -8427,6 +8522,108 @@ mod tests {
                 if len <= 4096 { 0 } else { len }
             );
         }
+    }
+
+    /// bd-w4pr1.13.12: `forget` searches the trace a block at a time and moves
+    /// the runs between occurrences as blocks. The oracle is a plain filter of
+    /// the trace as it was. The cases put the forgotten page at block edges,
+    /// next to the ring seam and several entries apart, on traces longer than
+    /// one search block, for every position of the seam.
+    #[test]
+    fn test_s3_fifo_forget_matches_filter_across_blocks_and_ring_seam() {
+        let forgotten = PageNumber::new(1_000_000).unwrap();
+        let block = ACCESS_TRACE_SEARCH_BLOCK;
+        let mut wrapped_cases = 0_usize;
+        let mut cases_with_a_run_across_the_seam = 0_usize;
+        for len in [
+            0,
+            1,
+            2,
+            block - 1,
+            block,
+            block + 1,
+            2 * block - 1,
+            2 * block,
+            2 * block + 1,
+            3 * block + 7,
+            4 * block,
+        ] {
+            let positions: Vec<usize> = [
+                0,
+                1,
+                block - 1,
+                block,
+                block + 1,
+                len / 2,
+                len.saturating_sub(2),
+                len.saturating_sub(1),
+            ]
+            .into_iter()
+            .filter(|position| *position < len)
+            .collect();
+            // No occurrence, each single occurrence, and each pair of them.
+            let mut occurrence_sets: Vec<Vec<usize>> = vec![Vec::new()];
+            for (i, first) in positions.iter().enumerate() {
+                occurrence_sets.push(vec![*first]);
+                for second in &positions[i + 1..] {
+                    if second != first {
+                        occurrence_sets.push(vec![*first, *second]);
+                    }
+                }
+            }
+            // And a dense one: every third entry.
+            occurrence_sets.push((0..len).step_by(3).collect());
+
+            for rotation in 0..4 * block {
+                for occurrences in &occurrence_sets {
+                    let mut tracker = S3FifoEvictionTracker::new(S3FifoConfig::new(block / 2));
+                    let capacity = tracker.access_trace.capacity();
+                    assert!(capacity >= 4 * block);
+                    tracker
+                        .access_trace
+                        .extend((0..capacity).map(|_| forgotten));
+                    for _ in 0..rotation {
+                        tracker.access_trace.pop_front();
+                        tracker.access_trace.push_back(forgotten);
+                    }
+                    tracker.access_trace.truncate(len);
+                    for (i, page) in tracker.access_trace.iter_mut().enumerate() {
+                        *page = if occurrences.contains(&i) {
+                            forgotten
+                        } else {
+                            PageNumber::new(u32::try_from(i + 1).unwrap()).unwrap()
+                        };
+                    }
+                    let front_len = tracker.access_trace.as_slices().0.len();
+                    wrapped_cases += usize::from(front_len < len);
+                    cases_with_a_run_across_the_seam += usize::from(
+                        occurrences
+                            .first()
+                            .is_some_and(|first| *first + 1 < front_len && front_len < len),
+                    );
+                    let expected: Vec<_> = tracker
+                        .access_trace
+                        .iter()
+                        .copied()
+                        .filter(|page| *page != forgotten)
+                        .collect();
+
+                    tracker.forget(forgotten);
+
+                    assert_eq!(
+                        tracker.access_trace.iter().copied().collect::<Vec<_>>(),
+                        expected,
+                        "len {len}, rotation {rotation}, occurrences {occurrences:?}"
+                    );
+                    assert_eq!(tracker.access_trace.capacity(), capacity);
+                }
+            }
+        }
+        assert!(wrapped_cases > 0, "split deque storage must be exercised");
+        assert!(
+            cases_with_a_run_across_the_seam > 0,
+            "a kept run must cross from the back half into the front half"
+        );
     }
 
     #[test]
