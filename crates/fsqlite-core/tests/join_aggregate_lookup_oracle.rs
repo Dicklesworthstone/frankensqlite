@@ -194,6 +194,98 @@ fn join_aggregates_over_lookups_match_sqlite() {
     }
 }
 
+/// bd-w4pr1.13.6: an inner or cross join written without a constraint is
+/// joined by its WHERE clause. These compile to the lookup loop.
+const JOINED_BY_WHERE_QUERIES: &[&str] = &[
+    "SELECT count(*), sum(t.c) FROM u, t WHERE t.id = u.a",
+    "SELECT count(*), sum(t.c) FROM u CROSS JOIN t WHERE t.id = u.a",
+    "SELECT count(*), sum(t.c) FROM u JOIN t WHERE t.id = u.a",
+    "SELECT count(*), sum(t.c) FROM u INNER JOIN t WHERE u.a = t.id",
+    "SELECT count(*), sum(u.r) FROM u, t WHERE t.a = u.a",
+    "SELECT count(*), min(t.b), max(u.b) FROM t, u WHERE t.a = u.a",
+    "SELECT count(*), sum(u.r) FROM t, u WHERE u.a = t.id",
+    "SELECT count(*), sum(u.r), sum(t.c) FROM u, t WHERE u.a = t.a AND t.c > 2 AND u.r < 3",
+    "SELECT count(*) FROM u, t WHERE t.id = u.a AND u.b IS NOT NULL",
+    "SELECT count(*), sum(t.c) FROM u, t WHERE t.id = u.id AND t.a = u.a",
+    "SELECT count(*), total(t.c) FROM u, t WHERE u.id = t.id AND t.id > 2",
+    "SELECT count(*), sum(t.c) FROM u, t WHERE t.id = u.id + 1",
+    "SELECT count(*) FROM u, t WHERE t.b = u.b",
+    "SELECT count(*) FROM u, t WHERE t.d = u.d",
+    "SELECT count(*), min(t.n), max(t.n) FROM u, t WHERE t.n = u.b",
+    "SELECT count(*), sum(y.c) FROM u AS x, t AS y WHERE y.id = x.a",
+    "SELECT count(*) FROM t a, t b WHERE b.a = a.id",
+    "SELECT count(*), sum(e.a) FROM u, e WHERE e.a = u.a",
+    "SELECT count(*), sum(u.a) FROM e, u WHERE e.a = u.a",
+];
+
+/// Shapes a lookup must not be taken from, or that are not this lane's. A
+/// join condition read as "seek the equality" would drop the rows the OR arm
+/// or the missing equality admits.
+const NOT_JOINED_BY_A_LOOKUP_QUERIES: &[&str] = &[
+    "SELECT count(*) FROM u, t WHERE t.id = u.a OR u.a IS NULL",
+    "SELECT count(*), sum(t.c) FROM u, t WHERE u.r > 1",
+    "SELECT count(*), sum(t.c) FROM u, t",
+    "SELECT count(*), sum(t.c) FROM u CROSS JOIN t",
+    "SELECT count(*) FROM u, t WHERE NOT (t.id = u.a)",
+    "SELECT count(*) FROM u, t WHERE t.id <> u.a",
+    "SELECT count(*), count(t.id) FROM u LEFT JOIN t WHERE t.id = u.a",
+    "SELECT count(*), count(t.id) FROM u LEFT JOIN t WHERE t.id IS NULL",
+    "SELECT count(*) FROM u NATURAL JOIN t",
+    "SELECT count(*) FROM u, t, e WHERE t.id = u.a AND e.a = u.a",
+];
+
+#[test]
+fn join_aggregates_joined_by_where_match_sqlite() {
+    for indexed in [false, true] {
+        asupersync::test_utils::run_test(|| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("join_aggregate_joined_by_where.db");
+            let f = Connection::open(path.to_str().unwrap()).await.unwrap();
+            let r = rusqlite::Connection::open_in_memory().unwrap();
+            let indexes: &[&str] = if indexed { INDEXES } else { &[] };
+            for sql in SETUP.iter().chain(indexes) {
+                f.execute(sql).await.unwrap();
+                r.execute(sql, []).unwrap();
+            }
+            for sql in JOINED_BY_WHERE_QUERIES
+                .iter()
+                .chain(NOT_JOINED_BY_A_LOOKUP_QUERIES)
+            {
+                assert_agree(&f, &r, sql, &[], &[]).await;
+            }
+            assert_agree(
+                &f,
+                &r,
+                "SELECT count(*), sum(t.c) FROM u, t WHERE t.id = u.a AND t.c > ?1",
+                &[SqliteValue::Float(2.0)],
+                &[&2.0_f64],
+            )
+            .await;
+
+            // The rowid equality in WHERE is the lookup, in each spelling.
+            for sql in [
+                "SELECT count(*), sum(t.c) FROM u, t WHERE t.id = u.a",
+                "SELECT count(*), sum(t.c) FROM u CROSS JOIN t WHERE t.id = u.a",
+                "SELECT count(*), sum(t.c) FROM u JOIN t WHERE t.id = u.a",
+            ] {
+                let ops = opcodes(&f, sql).await;
+                assert!(
+                    ops.iter().any(|op| op == "AggStep") && ops.iter().any(|op| op == "SeekRowid"),
+                    "`{sql}` must run as a rowid lookup loop: {ops:?}"
+                );
+            }
+            // A comma join keeps its written order: `t` drives and `u.a`,
+            // which has no index, is looked up through an automatic index
+            // rather than `u` driving lookups into `t`.
+            let ops = opcodes(&f, "SELECT count(*), sum(u.r) FROM t, u WHERE u.a = t.id").await;
+            assert!(
+                ops.iter().any(|op| op == "AggStep") && ops.iter().any(|op| op == "OpenAutoindex"),
+                "a cross join must not be reordered into a rowid lookup: {ops:?}"
+            );
+        });
+    }
+}
+
 const MULTI_SETUP: &str = "
     CREATE TABLE driver(id INTEGER PRIMARY KEY, sid INTEGER, sk INTEGER, amount REAL);
     CREATE TABLE middle(id INTEGER PRIMARY KEY, k INTEGER UNIQUE, lid INTEGER, lk INTEGER);

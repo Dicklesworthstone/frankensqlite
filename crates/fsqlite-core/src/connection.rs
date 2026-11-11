@@ -51048,12 +51048,23 @@ impl Connection {
                 if !self.table_name_is_virtual(&name.name))
                 && !table_or_subquery_in_attached_schema(source)
         };
+        // A lone inner or cross join written without a constraint is joined
+        // by its WHERE clause (`FROM p, t WHERE t.id = p.k`).
+        let joined_by_where = |join: &fsqlite_ast::JoinClause| {
+            from.joins.len() == 1
+                && join.constraint.is_none()
+                && matches!(join.join_type.kind, JoinKind::Inner | JoinKind::Cross)
+                && where_clause.is_some()
+        };
+        let joined_by_on = |join: &fsqlite_ast::JoinClause| {
+            matches!(join.join_type.kind, JoinKind::Inner | JoinKind::Left)
+                && matches!(&join.constraint, Some(JoinConstraint::On(on)) if vdbe_expr(on))
+        };
         if !base_table(&from.source)
             || from.joins.iter().any(|join| {
                 !base_table(&join.table)
-                    || !matches!(join.join_type.kind, JoinKind::Inner | JoinKind::Left)
                     || join.join_type.natural
-                    || !matches!(&join.constraint, Some(JoinConstraint::On(on)) if vdbe_expr(on))
+                    || !(joined_by_on(join) || joined_by_where(join))
             })
             || where_clause.as_ref().is_some_and(|expr| !vdbe_expr(expr))
         {

@@ -12038,12 +12038,32 @@ fn codegen_join_aggregate_select(
     else {
         return Err(unsupported());
     };
-    let (Some(JoinConstraint::On(on_expr)), false, JoinKind::Inner | JoinKind::Left) = (
+    // An inner or cross join written without a constraint (`FROM p, t WHERE
+    // t.id = p.k`, `p CROSS JOIN t WHERE ...`) is joined by its WHERE clause,
+    // which is then the whole join condition: the lookup is planned from it
+    // and the conjuncts the lookup does not consume are checked for every row
+    // it reaches (bd-w4pr1.13.6). `Cross` covers both a comma and CROSS JOIN,
+    // and stock never reorders a CROSS JOIN, so such a join keeps its written
+    // order.
+    let (on_expr, where_clause, kind, keeps_written_order) = match (
         join.constraint.as_ref(),
         join.join_type.natural,
         join.join_type.kind,
-    ) else {
-        return Err(unsupported());
+        where_clause,
+    ) {
+        (
+            Some(JoinConstraint::On(on_expr)),
+            false,
+            kind @ (JoinKind::Inner | JoinKind::Left),
+            where_clause,
+        ) => (on_expr, where_clause, kind, false),
+        (None, false, kind @ (JoinKind::Inner | JoinKind::Cross), Some(join_condition)) => (
+            join_condition,
+            None,
+            JoinKind::Inner,
+            kind == JoinKind::Cross,
+        ),
+        _ => return Err(unsupported()),
     };
     let right_table = find_table(schema, &right_name.name)?;
     let right_alias = right_alias.as_deref();
@@ -12056,7 +12076,6 @@ fn codegen_join_aggregate_select(
         return Err(unsupported());
     }
 
-    let kind = join.join_type.kind;
     if let Some(plan) = resolve_single_join_lookup_plan(
         left_table,
         left_alias,
@@ -12065,14 +12084,16 @@ fn codegen_join_aggregate_select(
         kind,
         Some(on_expr),
     ) {
-        if let Some(swapped) = swapped_join_lookup_plan_avoiding_text_walk(
-            &plan,
-            left_table,
-            left_alias,
-            right_table,
-            right_alias,
-            Some(on_expr),
-        ) {
+        if !keeps_written_order
+            && let Some(swapped) = swapped_join_lookup_plan_avoiding_text_walk(
+                &plan,
+                left_table,
+                left_alias,
+                right_table,
+                right_alias,
+                Some(on_expr),
+            )
+        {
             return codegen_single_join_lookup_select(
                 b,
                 stmt,
@@ -12104,6 +12125,7 @@ fn codegen_join_aggregate_select(
     // An inner join may drive from either side. SQLite also drives from the
     // side that lets the other be looked up.
     if kind == JoinKind::Inner
+        && !keeps_written_order
         && let Some(plan) = resolve_single_join_lookup_plan(
             right_table,
             right_alias,
