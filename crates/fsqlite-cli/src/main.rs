@@ -192,11 +192,94 @@ enum DotCommandResult {
     Exit,
 }
 
+/// Bytes of result text held before they are written when standard output is
+/// not a terminal.
+const STDOUT_BLOCK_BYTES: usize = 64 * 1024;
+
+/// The shell's output stream while standard output is block-buffered.
+///
+/// Rust's standard output is line-buffered whatever it is connected to, so a
+/// result of a million rows was a million `write` calls. Away from a terminal
+/// the shell now collects output in blocks, as the stock shell's C stdio does.
+/// The buffer is shared with [`InputThatFlushes`] and [`ErrorsAfterOutput`],
+/// which write it out at the two moments someone could be waiting to see it.
+struct BlockBufferedOutput<'a, W: Write>(&'a std::cell::RefCell<io::BufWriter<W>>);
+
+impl<W: Write> Write for BlockBufferedOutput<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.borrow_mut().write(buf)
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.0.borrow_mut().write_all(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.borrow_mut().flush()
+    }
+}
+
+/// Standard input that writes pending output out before it waits for more.
+///
+/// A peer that sends a statement and then reads the answer with the pipe
+/// still open must see that answer: once the input already read is used up,
+/// the next read may block, so everything printed so far goes out first. A
+/// script piped in whole is read in blocks, and flushes once per block.
+struct InputThatFlushes<'a, R: io::Read, W: Write> {
+    input: io::BufReader<R>,
+    pending: &'a std::cell::RefCell<io::BufWriter<W>>,
+}
+
+impl<R: io::Read, W: Write> InputThatFlushes<'_, R, W> {
+    fn flush_before_waiting(&self) {
+        if self.input.buffer().is_empty() {
+            // A failed flush keeps its bytes; the next write reports it.
+            let _ = self.pending.borrow_mut().flush();
+        }
+    }
+}
+
+impl<R: io::Read, W: Write> io::Read for InputThatFlushes<'_, R, W> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.flush_before_waiting();
+        self.input.read(buf)
+    }
+}
+
+impl<R: io::Read, W: Write> BufRead for InputThatFlushes<'_, R, W> {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        self.flush_before_waiting();
+        self.input.fill_buf()
+    }
+
+    fn consume(&mut self, amount: usize) {
+        self.input.consume(amount);
+    }
+}
+
+/// The error stream while standard output is block-buffered: output printed
+/// before an error is written out before the error, so the two keep their
+/// order when they share a destination.
+struct ErrorsAfterOutput<'a, E: Write, W: Write> {
+    errors: E,
+    pending: &'a std::cell::RefCell<io::BufWriter<W>>,
+}
+
+impl<E: Write, W: Write> Write for ErrorsAfterOutput<'_, E, W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let _ = self.pending.borrow_mut().flush();
+        self.errors.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.errors.flush()
+    }
+}
+
 fn main() {
     let stdin = io::stdin();
     let interactive_input = stdin.is_terminal();
-    let mut input = stdin.lock();
-    let mut stdout = io::stdout();
+    let stdout = io::stdout();
     let interactive_output = stdout.is_terminal();
     let mut stderr = io::stderr();
     let shell_options = ShellOptions {
@@ -219,14 +302,47 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let exit_code = runtime.block_on(run_with_shell_options(
-        std::env::args_os(),
-        &mut input,
-        &mut stdout,
-        &mut stderr,
-        shell_options,
-    ));
-    drop(input);
+    let exit_code = if interactive_output {
+        // A terminal keeps line buffering: each row shows as it is printed.
+        let mut input = stdin.lock();
+        let mut stdout = stdout;
+        runtime.block_on(run_with_shell_options(
+            std::env::args_os(),
+            &mut input,
+            &mut stdout,
+            &mut stderr,
+            shell_options,
+        ))
+    } else {
+        let pending = std::cell::RefCell::new(io::BufWriter::with_capacity(
+            STDOUT_BLOCK_BYTES,
+            stdout.lock(),
+        ));
+        let mut input = InputThatFlushes {
+            input: io::BufReader::with_capacity(STDOUT_BLOCK_BYTES, stdin.lock()),
+            pending: &pending,
+        };
+        let mut out = BlockBufferedOutput(&pending);
+        let mut errors = ErrorsAfterOutput {
+            errors: &mut stderr,
+            pending: &pending,
+        };
+        let exit_code = runtime.block_on(run_with_shell_options(
+            std::env::args_os(),
+            &mut input,
+            &mut out,
+            &mut errors,
+            shell_options,
+        ));
+        // `process::exit` below runs no destructors, so nothing else would
+        // write the last block out.
+        if pending.borrow_mut().flush().is_err() {
+            let _ = writeln!(stderr, "error: failed writing query results");
+            if exit_code == 0 { 1 } else { exit_code }
+        } else {
+            exit_code
+        }
+    };
     if exit_code != 0 {
         std::process::exit(exit_code);
     }
@@ -3003,9 +3119,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ANSI_BOLD_BLUE, ANSI_DIM, ANSI_GREEN, ANSI_MAGENTA, ANSI_RESET, Connection, OutputMode,
-        OutputOptions, Parser, ShellOptions, ansi_colors_enabled, bytes_alone_delimit_statements,
-        format_row, highlight_sql, lone_plain_statement, lone_plain_statement_by_bytes,
+        ANSI_BOLD_BLUE, ANSI_DIM, ANSI_GREEN, ANSI_MAGENTA, ANSI_RESET, BlockBufferedOutput,
+        Connection, ErrorsAfterOutput, InputThatFlushes, OutputMode, OutputOptions, Parser,
+        ShellOptions, ansi_colors_enabled, bytes_alone_delimit_statements, format_row,
+        highlight_sql, lone_plain_statement, lone_plain_statement_by_bytes,
         lone_plain_statement_by_tokens, output_uses_column_names, parse_args, render_display_value,
         render_prompt, run, run_with_shell_options, statement_complete, write_delimited_rows,
         write_query_plan_tree, write_rows,
@@ -5135,6 +5252,106 @@ SELECT id FROM keep WHERE name = 'k3';\n"
                 }
             }
         });
+    }
+
+    /// Every `write` two streams received, in order, each tagged with its stream.
+    type WriteLog = std::rc::Rc<std::cell::RefCell<Vec<(char, Vec<u8>)>>>;
+
+    /// A writer that records each `write` it receives, tagged, in a shared log.
+    struct Logged(WriteLog, char);
+
+    impl std::io::Write for Logged {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().push((self.1, buf.to_vec()));
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_block_buffered_output_goes_out_before_a_wait_for_input_and_before_an_error() {
+        use std::io::{BufRead as _, Write as _};
+
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let pending = std::cell::RefCell::new(std::io::BufWriter::with_capacity(
+            1024,
+            Logged(std::rc::Rc::clone(&log), 'o'),
+        ));
+        let mut out = BlockBufferedOutput(&pending);
+        let mut errors = ErrorsAfterOutput {
+            errors: Logged(std::rc::Rc::clone(&log), 'e'),
+            pending: &pending,
+        };
+        // Three lines that arrive in one read, as a piped script does.
+        let mut input = InputThatFlushes {
+            input: std::io::BufReader::new(std::io::Cursor::new(b"one\ntwo\nthree\n".to_vec())),
+            pending: &pending,
+        };
+        // What the destination received, with adjacent writes of one stream joined.
+        let received = || {
+            let mut joined: Vec<(char, String)> = Vec::new();
+            for (stream, bytes) in log.borrow().iter() {
+                let text = String::from_utf8(bytes.clone()).expect("utf-8");
+                match joined.last_mut() {
+                    Some((last, so_far)) if last == stream => so_far.push_str(&text),
+                    _ => joined.push((*stream, text)),
+                }
+            }
+            joined
+        };
+        let writes_of_output = || {
+            log.borrow()
+                .iter()
+                .filter(|(stream, _)| *stream == 'o')
+                .count()
+        };
+
+        let mut line = String::new();
+        input.read_line(&mut line).expect("read");
+        writeln!(out, "row 1").expect("write");
+        writeln!(out, "row 2").expect("write");
+        assert!(received().is_empty(), "rows wait in the block");
+
+        // The second line was read along with the first: nothing can be
+        // waiting on the output yet, so it stays buffered.
+        line.clear();
+        input.read_line(&mut line).expect("read");
+        assert_eq!(line, "two\n");
+        assert!(received().is_empty(), "input already read forces no write");
+
+        writeln!(out, "row 3").expect("write");
+        writeln!(errors, "error: boom").expect("write");
+        assert_eq!(
+            received(),
+            vec![
+                ('o', "row 1\nrow 2\nrow 3\n".to_owned()),
+                ('e', "error: boom\n".to_owned()),
+            ],
+            "output printed before an error reaches its destination first"
+        );
+        assert_eq!(writes_of_output(), 1, "three rows went out as one write");
+
+        writeln!(out, "row 4").expect("write");
+        line.clear();
+        input.read_line(&mut line).expect("read");
+        assert_eq!(line, "three\n");
+        assert_eq!(
+            writes_of_output(),
+            1,
+            "row 4 waits while input is still buffered"
+        );
+
+        // Nothing read is left, so the next read may block: row 4 goes first.
+        line.clear();
+        assert_eq!(input.read_line(&mut line).expect("read"), 0);
+        assert_eq!(
+            received().last(),
+            Some(&('o', "row 4\n".to_owned())),
+            "pending output is written before waiting for more input"
+        );
     }
 
     #[test]

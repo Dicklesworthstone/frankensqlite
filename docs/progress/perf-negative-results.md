@@ -87,6 +87,42 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-11 - WIN: the shell block-buffers standard output when it is not a terminal (bd-5310l)
+
+- Target: every query whose result goes to a pipe or a file. Touched: `crates/fsqlite-cli/src/main.rs`
+  (`main`; new `BlockBufferedOutput`, `InputThatFlushes`, `ErrorsAfterOutput`).
+- Evidence before: Rust's standard output is line-buffered whatever it is connected to. Frame-pointer
+  profile of 30,000 autocommit point SELECTs: `write_delimited_rows -> write_all -> flush_buf ->
+  __libc_write` was 4.7% of the statement. `strace -c`, one SELECT of 100,000 rows to a pipe: 100,026
+  `write` calls against stock's 553.
+- Change: away from a terminal, output is collected in 64 KiB blocks, as stock's C stdio does. It is
+  written out before the shell waits for more input (once the input already read is used up, so a
+  peer that sends a statement and reads the answer with the pipe still open sees it), before anything
+  goes to the error stream (rows and errors keep their order when they share a destination), and
+  before exit. A terminal keeps line buffering.
+- Result (stock live in the same run, 100,000-row SELECT to a pipe): `write` calls 100,026 -> 635
+  (stock 553); CPU 177-190 ms -> 98 ms (stock 26 ms); user instructions 734M -> 640M (stock 261M);
+  output sha256 equal to stock's in every arm. The per-statement instruction probe of the entries
+  below does not move, as expected: the saving per one-row result is one system call.
+- Behaviour: the 768-run comparison of the entry below is identical, including the merged-stream runs
+  that pin the order of rows and errors. Unit test of the three wrappers (rows wait in the block;
+  input already read forces no write; an error flushes the rows first; an empty input buffer flushes
+  before the read). `gh442_vacuum_into_idle_peer`, where a peer shell must show its rows while its
+  stdin stays open, passes.
+- Series as landed (this entry and the three below, rebased onto main 7e486c4c2; base sha256
+  80138b0381db61cd, series 87e4950547b58388; the probe of the entries below, three runs per arm, stock
+  live): distinct-literal INSERT 88-92k -> 48-49k (6.5x -> 3.5x stock's 13.9k), point SELECT 144-146k
+  -> 61-66k (6.6x -> 2.7-3.0x stock's 22.1k), UPDATE 113-117k -> 60-62k (6.3x -> 3.3x stock's 18.3k).
+  `txn_1000x10_rows` 1,298M -> 861M user instructions (8.4x -> 5.6x stock's 153.9M), CPU best 388 ->
+  299 ms against stock's 35 ms. `autocommit_5k_inserts` 1,845M -> 1,624M (16.4x -> 14.5x). 100,000-row
+  SELECT to a pipe: `write` calls 100,135 -> 94 (stock 553), CPU 183 -> 68 ms (stock 29 ms). Shell
+  output of base and series identical over the 768 runs. bd-5310l asks for 3x on each of the three
+  statements and on `txn_1000x10_rows`: only the point SELECT is there.
+- Still a loss: 1.9x stock's instructions to print 100,000 rows (497M against 261M as landed), and
+  2.3x to 3.8x its CPU time across the two measurements.
+- Retry condition for a larger block or vectored writes: `write` above 2% of a result-printing
+  profile.
+
 ## 2026-11-11 - WIN: the shell runs a lone INSERT, UPDATE, DELETE or SELECT without parsing it first (bd-5310l)
 
 - Target: every statement typed or piped into the CLI one at a time (all the scorecard's statement
