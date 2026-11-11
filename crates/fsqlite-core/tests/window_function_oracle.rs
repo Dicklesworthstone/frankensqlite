@@ -358,6 +358,72 @@ fn navigation_functions() {
     });
 }
 
+/// bd-w4pr1.12: partitions are the runs of rows whose PARTITION BY keys
+/// compare equal after the sort. The rows arrive with their partitions
+/// interleaved; the keys mix storage classes (1 and 1.0 are one partition,
+/// '1' and x'31' are two more, NULLs are one), a NOCASE column folds case,
+/// and an explicit COLLATE BINARY splits what NOCASE joined. A partition
+/// builder that only looked at neighbouring input rows, or that compared keys
+/// byte for byte, would number these differently from stock.
+const PARTITION_KEY_SETUP: &[&str] = &[
+    "CREATE TABLE p(id INTEGER PRIMARY KEY, k, n TEXT COLLATE NOCASE, o INT, v INT)",
+    "INSERT INTO p VALUES \
+     (1, 1, 'Alice', 5, 10), (2, 'a', 'bob', 4, 20), (3, 1.0, 'alice', 3, 30), \
+     (4, NULL, NULL, 2, 40), (5, '1', 'ALICE', 1, 50), (6, x'31', 'Bob', 9, 60), \
+     (7, 2, 'carol', 8, 70), (8, 'A', NULL, 7, 80), (9, 2.5, 'alice', 6, 90), \
+     (10, NULL, 'BOB', 5, 100), (11, 1, 'Carol', 4, 110), (12, 2.0, 'alice ', 3, 120), \
+     (13, 'a', 'bob', 2, 130), (14, 1.0, 'dave', 1, 140), (15, x'31', 'Dave', 0, 150)",
+    "CREATE TABLE q(id INTEGER PRIMARY KEY, a INT, b INT)",
+    "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 3000) \
+     INSERT INTO q SELECT x, (x * 7919) % 1000, x % 7 FROM c",
+];
+
+const PARTITION_KEY_QUERIES: &[&str] = &[
+    "SELECT id, row_number() OVER (PARTITION BY k ORDER BY o, id), count(*) OVER (PARTITION BY k) \
+     FROM p ORDER BY id",
+    "SELECT id, row_number() OVER (PARTITION BY n ORDER BY o, id), sum(v) OVER (PARTITION BY n) \
+     FROM p ORDER BY id",
+    "SELECT id, rank() OVER (PARTITION BY n COLLATE BINARY ORDER BY o), \
+     dense_rank() OVER (PARTITION BY k, n ORDER BY o DESC) FROM p ORDER BY id",
+    "SELECT id, sum(v) OVER (PARTITION BY k ORDER BY o, id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW), \
+     first_value(id) OVER (PARTITION BY n ORDER BY o, id), \
+     last_value(id) OVER (PARTITION BY k ORDER BY o, id \
+       ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM p ORDER BY id",
+    "SELECT id, lag(id) OVER (PARTITION BY k ORDER BY o, id), \
+     lead(v, 1, -1) OVER (PARTITION BY n ORDER BY o, id), \
+     ntile(2) OVER (PARTITION BY k ORDER BY id) FROM p ORDER BY id",
+    "SELECT id, row_number() OVER (PARTITION BY o % 3, k IS NULL ORDER BY id), \
+     count(*) OVER (PARTITION BY typeof(k)) FROM p ORDER BY id",
+    "SELECT id, row_number() OVER (PARTITION BY k ORDER BY id) FROM p WHERE k IS NOT NULL ORDER BY id",
+    "SELECT id, count(*) OVER (PARTITION BY k) FROM p WHERE id > 100 ORDER BY id",
+    // 1,000 partitions of three rows each.
+    "SELECT count(*), sum(rn), max(rn), sum(rn * a) FROM \
+     (SELECT a, row_number() OVER (PARTITION BY a ORDER BY b, id) rn FROM q)",
+    "SELECT a, id, rank() OVER (PARTITION BY a ORDER BY b), sum(b) OVER (PARTITION BY a) \
+     FROM q WHERE a IN (0, 1, 499, 998, 999) ORDER BY id",
+    // Every row its own partition, and one partition for all.
+    "SELECT sum(rn), sum(c) FROM \
+     (SELECT row_number() OVER (PARTITION BY id ORDER BY a) rn, count(*) OVER (PARTITION BY 1) c FROM q)",
+];
+
+#[test]
+fn partitions_follow_key_comparison_not_input_order() {
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        for sql in PARTITION_KEY_SETUP {
+            f.execute(sql).await.unwrap();
+            r.execute_batch(sql).unwrap();
+        }
+        for sql in PARTITION_KEY_QUERIES {
+            let fr = fq(&f, sql).await;
+            let rr = rq(&r, sql);
+            assert!(!rr.is_empty() || sql.contains("id > 100"), "stock returned no rows: {sql}");
+            assert_eq!(fr, rr, "sql   ={sql}\n  frank ={fr:?}\n  sqlite={rr:?}");
+        }
+    });
+}
+
 #[test]
 fn partition_named_and_over_group() {
     asupersync::test_utils::run_test(|| async {

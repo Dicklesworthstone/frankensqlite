@@ -96994,18 +96994,29 @@ impl Connection {
             } else if pb.is_empty() {
                 vec![sorted_indices.clone()]
             } else {
-                let mut parts: Vec<(Vec<SqliteValue>, Vec<usize>)> = Vec::new();
+                // bd-w4pr1.12: the rows were just sorted by the PARTITION BY
+                // keys under the comparison that defines a partition, so the
+                // rows of one partition are consecutive and a row starts a new
+                // partition exactly when its keys differ from the first row of
+                // the current one. Searching every earlier partition for each
+                // row cost rows x partitions comparisons and a key clone.
+                let mut parts: Vec<Vec<usize>> = Vec::new();
                 for &ri in &sorted_indices {
-                    let key = partition_keys[ri].clone();
-                    if let Some(part) = parts.iter_mut().find(|(k, _)| {
-                        group_keys_equal_collated(k, &key, pb_coll, &collation_registry_snap)
-                    }) {
-                        part.1.push(ri);
-                    } else {
-                        parts.push((key, vec![ri]));
+                    match parts.last_mut() {
+                        Some(part)
+                            if group_keys_equal_collated(
+                                &partition_keys[part[0]],
+                                &partition_keys[ri],
+                                pb_coll,
+                                &collation_registry_snap,
+                            ) =>
+                        {
+                            part.push(ri);
+                        }
+                        _ => parts.push(vec![ri]),
                     }
                 }
-                parts.into_iter().map(|(_, indices)| indices).collect()
+                parts
             };
             let row_passes_filter = |row_index: usize| filter_matches[row_index];
             let partition_count = u64::try_from(partitions.len()).unwrap_or(u64::MAX);
