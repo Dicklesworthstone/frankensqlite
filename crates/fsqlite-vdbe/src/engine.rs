@@ -258,6 +258,11 @@ const OPFLAG_REPLACE_VICTIM: u16 = 0x20;
 /// Counts a successful clustered-table `IdxInsert` as one logical row change.
 /// This is reserved for WITHOUT ROWID table roots, never secondary indexes.
 const OPFLAG_IDX_NCHANGE: u16 = 0x40;
+/// On `Found`: the probe only asks whether an equal key exists. Its cursor is
+/// an ephemeral index private to the probe site (and the `IdxInsert` that
+/// fills it), and no opcode reads the cursor's position after the probe, so
+/// the engine may answer from the cursor's `MembershipMemo` without seeking.
+const OPFLAG_PROBE_MEMBERSHIP_ONLY: u16 = 0x01;
 /// Marks the `Delete`/`Insert` pair of an UPDATE whose rowid cannot change
 /// (no rowid or INTEGER PRIMARY KEY assignment). The `Delete` only records the
 /// row; the paired `Insert` then rewrites it in place, overwriting the cell
@@ -4898,6 +4903,103 @@ impl CursorBackend {
             Self::TimeTravel(c) => c.position_stamp(),
         }
     }
+
+    /// See [`BtCursor::row_image_epoch`].
+    #[must_use]
+    fn row_image_epoch(&self) -> u64 {
+        match self {
+            Self::Mem(c) => c.row_image_epoch(),
+            Self::Txn(c) => c.row_image_epoch(),
+            Self::TimeTravel(c) => c.row_image_epoch(),
+        }
+    }
+}
+
+/// Most probe records one [`MembershipMemo`] set remembers.
+const MEMBERSHIP_MEMO_MAX_KEYS: usize = 8_192;
+/// Longest probe record a [`MembershipMemo`] remembers.
+const MEMBERSHIP_MEMO_MAX_KEY_BYTES: usize = 256;
+/// Probes after which a [`MembershipMemo`] checks whether it is paying off.
+const MEMBERSHIP_MEMO_WINDOW: u32 = 4_096;
+/// Probes a [`MembershipMemo`] sits out after a window with too few hits.
+const MEMBERSHIP_MEMO_PAUSE: u32 = 32_768;
+
+/// Answers already given by membership-only probes of one private ephemeral
+/// index (`Found` with [`OPFLAG_PROBE_MEMBERSHIP_ONLY`], bd-w4pr1.13.15).
+///
+/// A probe asks whether the index holds a key equal to a record. The answer
+/// is a function of the record's bytes and the index's content, so while the
+/// cursor's mutation stamp is unchanged a record with the same bytes gets the
+/// same answer and the b-tree seek can be skipped. DISTINCT over a column with
+/// few values and `x IN (...)` repeat the same few records for every row.
+///
+/// Any mutation through the cursor advances the stamp and empties both sets.
+/// The memo is bounded: a set stops growing at [`MEMBERSHIP_MEMO_MAX_KEYS`],
+/// long records are not remembered, and after a window in which fewer than
+/// one probe in eight was answered (a DISTINCT that keeps inserting) it sits
+/// out [`MEMBERSHIP_MEMO_PAUSE`] probes, which then cost one counter step.
+#[derive(Debug, Default)]
+struct MembershipMemo {
+    epoch: u64,
+    present: HashSet<Box<[u8]>>,
+    absent: HashSet<Box<[u8]>>,
+    window_probes: u32,
+    window_hits: u32,
+    paused_probes: u32,
+}
+
+impl MembershipMemo {
+    /// The remembered answer for `key` at mutation stamp `epoch`, if any.
+    fn lookup(&mut self, epoch: u64, key: &[u8]) -> Option<bool> {
+        if self.paused_probes > 0 {
+            self.paused_probes -= 1;
+            return None;
+        }
+        if self.epoch != epoch {
+            if !self.present.is_empty() {
+                self.present.clear();
+            }
+            if !self.absent.is_empty() {
+                self.absent.clear();
+            }
+            self.epoch = epoch;
+        }
+        let answer = if self.present.contains(key) {
+            Some(true)
+        } else if self.absent.contains(key) {
+            Some(false)
+        } else {
+            None
+        };
+        self.window_probes += 1;
+        self.window_hits += u32::from(answer.is_some());
+        if self.window_probes >= MEMBERSHIP_MEMO_WINDOW {
+            if self.window_hits < self.window_probes / 8 {
+                self.paused_probes = MEMBERSHIP_MEMO_PAUSE;
+            }
+            self.window_probes = 0;
+            self.window_hits = 0;
+        }
+        answer
+    }
+
+    /// Remember that a seek at mutation stamp `epoch` answered `exists`.
+    fn record(&mut self, epoch: u64, key: &[u8], exists: bool) {
+        if self.paused_probes > 0
+            || self.epoch != epoch
+            || key.len() > MEMBERSHIP_MEMO_MAX_KEY_BYTES
+        {
+            return;
+        }
+        let set = if exists {
+            &mut self.present
+        } else {
+            &mut self.absent
+        };
+        if set.len() < MEMBERSHIP_MEMO_MAX_KEYS {
+            set.insert(key.into());
+        }
+    }
 }
 
 /// Storage-backed table cursor used by `OpenRead` and `OpenWrite`.
@@ -4974,6 +5076,9 @@ struct StorageCursor {
     page_row: PageRowView,
     /// Cache the cursor's physical position to avoid redundant payload reads.
     last_position_stamp: Option<CursorPositionStamp>,
+    /// Answers of membership-only probes on this cursor; created by the
+    /// first such probe and dropped with the cursor.
+    membership_memo: Option<Box<MembershipMemo>>,
     /// Last rowid known to have been inserted on the right edge via this cursor.
     ///
     /// This is intentionally stricter than "last inserted rowid". We only keep
@@ -8787,6 +8892,42 @@ impl VdbeEngine {
         Ok(true)
     }
 
+    /// [`Self::storage_cursor_find_exact_index_key`] for a `Found` carrying
+    /// [`OPFLAG_PROBE_MEMBERSHIP_ONLY`]: a probe record the cursor's
+    /// [`MembershipMemo`] already answered at the current mutation stamp is
+    /// not looked up again. The cursor is left where it was in that case,
+    /// which the flag says nothing depends on.
+    async fn storage_cursor_probe_membership(
+        &mut self,
+        cursor_id: i32,
+        key_bytes: &[u8],
+    ) -> Result<bool> {
+        if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
+            let epoch = cursor.cursor.row_image_epoch();
+            if let Some(answer) = cursor
+                .membership_memo
+                .get_or_insert_default()
+                .lookup(epoch, key_bytes)
+            {
+                return Ok(answer);
+            }
+        }
+        let exists = self
+            .storage_cursor_find_exact_index_key(
+                cursor_id,
+                key_bytes,
+                "Found: missing collation registry for collated probe",
+            )
+            .await?;
+        if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
+            let epoch = cursor.cursor.row_image_epoch();
+            if let Some(memo) = cursor.membership_memo.as_mut() {
+                memo.record(epoch, key_bytes, exists);
+            }
+        }
+        Ok(exists)
+    }
+
     async fn storage_cursor_find_exact_index_key(
         &mut self,
         cursor_id: i32,
@@ -11108,6 +11249,7 @@ impl VdbeEngine {
                                 row_decode: RowDecodeScratch::default(),
                                 page_row: PageRowView::default(),
                                 last_position_stamp: None,
+                membership_memo: None,
                                 last_successful_insert_rowid: None,
                                 last_rightmost_unique_index_prefix: None,
                                 last_rightmost_unique_index_position: None,
@@ -11920,14 +12062,21 @@ impl VdbeEngine {
                     }
                     let exists = if matches!(key_val, SqliteValue::Blob(_)) {
                         let key_bytes = record_blob_bytes(&key_val);
-                        lean_future(|| {
-                            self.storage_cursor_find_exact_index_key(
-                                cursor_id,
-                                key_bytes,
-                                "Found: missing collation registry for collated probe",
-                            )
-                        })
-                        .await?
+                        if (op.p5 & OPFLAG_PROBE_MEMBERSHIP_ONLY) != 0 {
+                            lean_future(|| {
+                                self.storage_cursor_probe_membership(cursor_id, key_bytes)
+                            })
+                            .await?
+                        } else {
+                            lean_future(|| {
+                                self.storage_cursor_find_exact_index_key(
+                                    cursor_id,
+                                    key_bytes,
+                                    "Found: missing collation registry for collated probe",
+                                )
+                            })
+                            .await?
+                        }
                     } else {
                         let rowid_val = key_val.to_integer();
                         if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
@@ -17662,6 +17811,7 @@ impl VdbeEngine {
                 row_decode: RowDecodeScratch::default(),
                 page_row: PageRowView::default(),
                 last_position_stamp: None,
+                membership_memo: None,
                 cached_rowid: None,
                 payload_includes_rowid_alias: None,
                 last_successful_insert_rowid: None,
@@ -19231,6 +19381,7 @@ impl VdbeEngine {
                             row_decode: RowDecodeScratch::default(),
                             page_row: PageRowView::default(),
                             last_position_stamp: None,
+                membership_memo: None,
                             cached_rowid: None,
                             payload_includes_rowid_alias: None,
                             ipk_col_idx,
@@ -19397,6 +19548,7 @@ impl VdbeEngine {
                             row_decode: RowDecodeScratch::default(),
                             page_row: PageRowView::default(),
                             last_position_stamp: None,
+                membership_memo: None,
                             cached_rowid: None,
                             payload_includes_rowid_alias: None,
                             ipk_col_idx,
@@ -19599,6 +19751,7 @@ impl VdbeEngine {
                 row_decode: RowDecodeScratch::default(),
                 page_row: PageRowView::default(),
                 last_position_stamp: None,
+                membership_memo: None,
                 cached_rowid: None,
                 payload_includes_rowid_alias: None,
                 ipk_col_idx,

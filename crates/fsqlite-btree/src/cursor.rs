@@ -2560,6 +2560,16 @@ impl<P> BtCursor<P> {
         })
     }
 
+    /// A stamp that advances whenever this cursor mutates its B-tree (insert,
+    /// delete, bulk load, in-place patch) or is invalidated. Seeks and moves
+    /// leave it unchanged, so an answer derived from the tree's content stays
+    /// valid for this cursor while the stamp is the same. Another cursor on
+    /// the same tree does not advance it.
+    #[must_use]
+    pub fn row_image_epoch(&self) -> u64 {
+        self.row_image_epoch
+    }
+
     /// The usable page size for this cursor's B-tree.
     #[must_use]
     pub fn usable_size(&self) -> u32 {

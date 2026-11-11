@@ -234,6 +234,11 @@ const OPFLAG_REPLACE_VICTIM: u16 = 0x20;
 /// Counts a successful clustered-table `IdxInsert` as one logical row change.
 /// Secondary-index maintenance must never carry this flag.
 const OPFLAG_IDX_NCHANGE: u16 = 0x40;
+/// On `Found`: the probe only asks whether an equal key exists in an ephemeral
+/// index that no other cursor writes, and nothing reads the cursor's position
+/// after it, so the engine may answer a repeated probe record without seeking
+/// (bd-w4pr1.13.15).
+const OPFLAG_PROBE_MEMBERSHIP_ONLY: u16 = 0x01;
 /// Marks the `Delete`/`Insert` pair of an UPDATE whose rowid cannot change; the
 /// engine then rewrites the row in place instead of deleting and re-inserting.
 const OPFLAG_UPDATE_KEEPS_ROWID: u16 = 0x80;
@@ -10058,13 +10063,15 @@ fn codegen_select_distinct_scan(
         P4::None,
         0,
     );
+    // Only this probe and the insert below touch `distinct_cursor`, and a row
+    // already seen jumps straight to the next one.
     b.emit_jump_to_label(
         Opcode::Found,
         distinct_cursor,
         distinct_record,
         skip_label,
         P4::None,
-        0,
+        OPFLAG_PROBE_MEMBERSHIP_ONLY,
     );
     b.emit_op(
         Opcode::IdxInsert,
@@ -40629,13 +40636,15 @@ fn emit_once_materialized_in_list(
         );
     }
     b.emit_op(Opcode::MakeRecord, r_operand, 1, r_probe_key, P4::None, 0);
+    // The set was built once above and only this probe reads it; both
+    // outcomes store a constant and never look at the cursor.
     b.emit_jump_to_label(
         Opcode::Found,
         autoindex_cursor,
         r_probe_key,
         found_label,
         P4::None,
-        0,
+        OPFLAG_PROBE_MEMBERSHIP_ONLY,
     );
     b.free_temp(r_probe_key);
 
@@ -40790,13 +40799,15 @@ fn emit_once_materialized_in_probe_source(
         );
     }
     b.emit_op(Opcode::MakeRecord, r_operand, 1, r_probe_key, P4::None, 0);
+    // As for a literal list: the set is filled once from the probe source and
+    // only this probe reads it.
     b.emit_jump_to_label(
         Opcode::Found,
         autoindex_cursor,
         r_probe_key,
         found_label,
         P4::None,
-        0,
+        OPFLAG_PROBE_MEMBERSHIP_ONLY,
     );
     b.free_temp(r_probe_key);
 
