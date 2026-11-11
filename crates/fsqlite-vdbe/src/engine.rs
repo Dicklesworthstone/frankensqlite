@@ -30,6 +30,25 @@ use fsqlite_btree::swiss_index::SwissIndex;
 use fsqlite_types::{PageSize, TxnId};
 use std::rc::Rc;
 
+/// Construct an awaited future outside the interpreter's debug stack frame.
+///
+/// At opt-level zero, every awaited cursor operation otherwise contributes
+/// its own temporary to this large dispatcher's poll frame. Their combined
+/// size can exhaust a downstream application's default thread stack before
+/// any recursion occurs (bd-w4pr1.28). Release builds keep the original
+/// inline future and do not allocate on the opcode path.
+#[cfg(debug_assertions)]
+#[inline(never)]
+fn lean_future<F: std::future::Future>(make: impl FnOnce() -> F) -> std::pin::Pin<Box<F>> {
+    Box::pin(make())
+}
+
+#[cfg(not(debug_assertions))]
+#[inline]
+fn lean_future<F: std::future::Future>(make: impl FnOnce() -> F) -> F {
+    make()
+}
+
 /// bd-perf (V1.6): Flat array replacing HashMap for cursor storage.
 /// Cursor IDs are small non-negative integers (0-15 typical). Direct array
 /// indexing is ~10-20x faster than HashMap probing for every cursor access.
@@ -9897,14 +9916,15 @@ impl VdbeEngine {
         }
 
         if let Some(compiled_program) = compiled_program {
-            let outcome = self
-                .execute_compiled_program(
+            let outcome = lean_future(|| {
+                self.execute_compiled_program(
                     compiled_program.as_ref(),
                     borrowed_bindings,
                     collect_vdbe_metrics,
                     &mut row_handler,
                 )
-                .await?;
+            })
+            .await?;
 
             if !needs_statement_timing {
                 return Ok(outcome);
@@ -10024,7 +10044,7 @@ impl VdbeEngine {
                 continue;
             }
             if Self::hot_opcode_has_async_lane(op.opcode)
-                && self.try_execute_hot_opcode_async(op, &mut pc).await?
+                && lean_future(|| self.try_execute_hot_opcode_async(op, &mut pc)).await?
             {
                 continue;
             }
@@ -10703,7 +10723,7 @@ impl VdbeEngine {
                         pc += 1;
                         continue;
                     }
-                    if !self.open_storage_cursor(cursor_id, root_page, false).await? {
+                    if !lean_future(|| self.open_storage_cursor(cursor_id, root_page, false)).await? {
                         return Err(FrankenError::Internal(format!(
                             "OpenRead failed: could not open storage cursor on root page {root_page}"
                         )));
@@ -10748,7 +10768,7 @@ impl VdbeEngine {
                         pc += 1;
                         continue;
                     }
-                    if !self.open_storage_cursor(cursor_id, root_page, true).await? {
+                    if !lean_future(|| self.open_storage_cursor(cursor_id, root_page, true)).await? {
                         return Err(FrankenError::Internal(format!(
                             "OpenWrite failed: could not open storage cursor on root page {root_page}"
                         )));
@@ -11028,7 +11048,7 @@ impl VdbeEngine {
                             true
                         }
                     } else if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
-                        !cursor.cursor.first(&cursor.cx).await?
+                        !lean_future(|| cursor.cursor.first(&cursor.cx)).await?
                     } else {
                         true
                     };
@@ -11045,7 +11065,7 @@ impl VdbeEngine {
                     // Last repositions the cursor, so clear any pending delete state.
                     self.pending_next_after_delete.remove(&cursor_id);
                     let is_empty = if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
-                        !cursor.cursor.last(&cursor.cx).await?
+                        !lean_future(|| cursor.cursor.last(&cursor.cx)).await?
                     } else if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
                         if cursor.is_pseudo {
                             cursor.pseudo_row.is_none()
@@ -11106,7 +11126,7 @@ impl VdbeEngine {
                             false
                         }
                     } else if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
-                        cursor.cursor.next(&cursor.cx).await?
+                        lean_future(|| cursor.cursor.next(&cursor.cx)).await?
                     } else if let Some(sorter) = self.sorters.get_mut(&cursor_id) {
                         if let Some(pos) = sorter.position {
                             let next = pos + 1;
@@ -11162,7 +11182,7 @@ impl VdbeEngine {
                         self.pending_next_after_delete.remove(&cursor_id);
                     }
                     let has_prev = if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
-                        cursor.cursor.prev(&cursor.cx).await?
+                        lean_future(|| cursor.cursor.prev(&cursor.cx)).await?
                     } else if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
                         if let Some(pos) = cursor.position {
                             if pos > 0 {
@@ -11197,11 +11217,9 @@ impl VdbeEngine {
                     let cursor_id = op.p1;
                     let col_idx = op.p2 as usize;
                     let target = op.p3;
-                    if !self
-                        .column_to_reg_direct(cursor_id, col_idx, target)
-                        .await?
+                    if !lean_future(|| self.column_to_reg_direct(cursor_id, col_idx, target)).await?
                     {
-                        let val = self.cursor_column(cursor_id, col_idx).await?;
+                        let val = lean_future(|| self.cursor_column(cursor_id, col_idx)).await?;
                         self.set_reg_fast(target, val);
                     }
                     pc += 1;
@@ -11211,7 +11229,7 @@ impl VdbeEngine {
                     // Get rowid from cursor p1 into register p2.
                     let cursor_id = op.p1;
                     let target = op.p2;
-                    let val = self.cursor_rowid(cursor_id).await?;
+                    let val = lean_future(|| self.cursor_rowid(cursor_id)).await?;
                     self.set_reg_fast(target, val);
                     pc += 1;
                 }
@@ -11224,7 +11242,7 @@ impl VdbeEngine {
                         if cursor.cursor.eof() {
                             self.set_reg_fast(target, SqliteValue::Null);
                         } else {
-                            let payload = cursor.cursor.payload(&cursor.cx).await?;
+                            let payload = lean_future(|| cursor.cursor.payload(&cursor.cx)).await?;
                             self.set_reg_fast(target, SqliteValue::Blob(payload.into()));
                         }
                     } else if let Some(cursor) = self.cursors.get(&cursor_id) {
@@ -11300,12 +11318,11 @@ impl VdbeEngine {
                         });
                     let found = if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
                         let seek_result = if use_rowset_advance {
-                            cursor
-                                .cursor
-                                .table_advance_to(&cursor.cx, rowid_val)
+                            lean_future(|| cursor.cursor.table_advance_to(&cursor.cx, rowid_val))
                                 .await?
                         } else {
-                            cursor.cursor.table_move_to(&cursor.cx, rowid_val).await?
+                            lean_future(|| cursor.cursor.table_move_to(&cursor.cx, rowid_val))
+                                .await?
                         };
                         seek_result.is_found()
                     } else if let Some(cursor) = self.cursors.get_mut(&cursor_id) {
@@ -11367,7 +11384,7 @@ impl VdbeEngine {
                                     continue;
                                 }
                                 TableSeekTarget::Last => {
-                                    if cursor.cursor.last(&cursor.cx).await? {
+                                    if lean_future(|| cursor.cursor.last(&cursor.cx)).await? {
                                         pc += 1;
                                     } else {
                                         pc = op.p2 as usize;
@@ -11375,7 +11392,8 @@ impl VdbeEngine {
                                     continue;
                                 }
                             };
-                            let seek_result = cursor.cursor.table_move_to(&cursor.cx, key).await?;
+                            let seek_result =
+                                lean_future(|| cursor.cursor.table_move_to(&cursor.cx, key)).await?;
 
                             match seek_opcode {
                                 Opcode::SeekGE => {
@@ -11389,7 +11407,7 @@ impl VdbeEngine {
                                     // If Found (at exact key), advance past it.
                                     // If NotFound, already past key.
                                     if seek_result.is_found() {
-                                        cursor.cursor.next(&cursor.cx).await?
+                                        lean_future(|| cursor.cursor.next(&cursor.cx)).await?
                                     } else {
                                         !cursor.cursor.eof()
                                     }
@@ -11402,10 +11420,10 @@ impl VdbeEngine {
                                         true
                                     } else if cursor.cursor.eof() {
                                         // All entries < key, position at last.
-                                        cursor.cursor.last(&cursor.cx).await?
+                                        lean_future(|| cursor.cursor.last(&cursor.cx)).await?
                                     } else {
                                         // Cursor at entry > key, move to previous.
-                                        cursor.cursor.prev(&cursor.cx).await?
+                                        lean_future(|| cursor.cursor.prev(&cursor.cx)).await?
                                     }
                                 }
                                 Opcode::SeekLT => {
@@ -11414,10 +11432,10 @@ impl VdbeEngine {
                                     // Either way, we need to go to the previous entry.
                                     if cursor.cursor.eof() {
                                         // All entries < key, position at last.
-                                        cursor.cursor.last(&cursor.cx).await?
+                                        lean_future(|| cursor.cursor.last(&cursor.cx)).await?
                                     } else {
                                         // Go to previous entry (which will be < key).
-                                        cursor.cursor.prev(&cursor.cx).await?
+                                        lean_future(|| cursor.cursor.prev(&cursor.cx)).await?
                                     }
                                 }
                                 _ => unreachable!(),
@@ -11427,33 +11445,35 @@ impl VdbeEngine {
                             let key_bytes = record_blob_bytes(&key_val);
                             match op.opcode {
                                 Opcode::SeekGE => {
-                                    cursor.cursor.index_move_to(&cursor.cx, key_bytes).await?;
+                                    lean_future(|| cursor.cursor.index_move_to(&cursor.cx, key_bytes))
+                                        .await?;
                                     !cursor.cursor.eof()
                                 }
                                 Opcode::SeekGT => {
-                                    cursor
-                                        .cursor
-                                        .index_move_to_upper_bound(&cursor.cx, key_bytes)
-                                        .await?;
+                                    lean_future(|| {
+                                        cursor.cursor.index_move_to_upper_bound(&cursor.cx, key_bytes)
+                                    })
+                                    .await?;
                                     !cursor.cursor.eof()
                                 }
                                 Opcode::SeekLE => {
-                                    cursor
-                                        .cursor
-                                        .index_move_to_upper_bound(&cursor.cx, key_bytes)
-                                        .await?;
+                                    lean_future(|| {
+                                        cursor.cursor.index_move_to_upper_bound(&cursor.cx, key_bytes)
+                                    })
+                                    .await?;
                                     if cursor.cursor.eof() {
-                                        cursor.cursor.last(&cursor.cx).await?
+                                        lean_future(|| cursor.cursor.last(&cursor.cx)).await?
                                     } else {
-                                        cursor.cursor.prev(&cursor.cx).await?
+                                        lean_future(|| cursor.cursor.prev(&cursor.cx)).await?
                                     }
                                 }
                                 Opcode::SeekLT => {
-                                    cursor.cursor.index_move_to(&cursor.cx, key_bytes).await?;
+                                    lean_future(|| cursor.cursor.index_move_to(&cursor.cx, key_bytes))
+                                        .await?;
                                     if cursor.cursor.eof() {
-                                        cursor.cursor.last(&cursor.cx).await?
+                                        lean_future(|| cursor.cursor.last(&cursor.cx)).await?
                                     } else {
-                                        cursor.cursor.prev(&cursor.cx).await?
+                                        lean_future(|| cursor.cursor.prev(&cursor.cx)).await?
                                     }
                                 }
                                 _ => unreachable!(),
@@ -11571,19 +11591,19 @@ impl VdbeEngine {
                         // Index seek path: P3 contains a packed record blob
                         // (from MakeRecord). Use index_move_to to find the key.
                         let key_bytes = record_blob_bytes(&key_val);
-                        self.storage_cursor_find_exact_index_key(
-                            cursor_id,
-                            key_bytes,
-                            "NotFound: missing collation registry for collated probe",
-                        )
+                        lean_future(|| {
+                            self.storage_cursor_find_exact_index_key(
+                                cursor_id,
+                                key_bytes,
+                                "NotFound: missing collation registry for collated probe",
+                            )
+                        })
                         .await?
                     } else {
                         // Table seek path: P3 contains an integer rowid.
                         let rowid_val = key_val.to_integer();
                         if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
-                            cursor
-                                .cursor
-                                .table_move_to(&cursor.cx, rowid_val)
+                            lean_future(|| cursor.cursor.table_move_to(&cursor.cx, rowid_val))
                                 .await?
                                 .is_found()
                         } else if let Some(root_page) =
@@ -11632,18 +11652,18 @@ impl VdbeEngine {
                     }
                     let exists = if matches!(key_val, SqliteValue::Blob(_)) {
                         let key_bytes = record_blob_bytes(&key_val);
-                        self.storage_cursor_find_exact_index_key(
-                            cursor_id,
-                            key_bytes,
-                            "Found: missing collation registry for collated probe",
-                        )
+                        lean_future(|| {
+                            self.storage_cursor_find_exact_index_key(
+                                cursor_id,
+                                key_bytes,
+                                "Found: missing collation registry for collated probe",
+                            )
+                        })
                         .await?
                     } else {
                         let rowid_val = key_val.to_integer();
                         if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
-                            cursor
-                                .cursor
-                                .table_move_to(&cursor.cx, rowid_val)
+                            lean_future(|| cursor.cursor.table_move_to(&cursor.cx, rowid_val))
                                 .await?
                                 .is_found()
                         } else if let Some(root_page) =
@@ -11749,18 +11769,22 @@ impl VdbeEngine {
                                         "NoConflict: missing collation registry for collated probe",
                                     ));
                                 };
-                                storage_cursor_no_conflict_prefix_match_collated(
-                                    cursor_id,
-                                    cursor,
-                                    bytes,
-                                    &index_desc_flags,
-                                    &index_collations,
-                                    collation_registry,
-                                )
+                                lean_future(|| {
+                                    storage_cursor_no_conflict_prefix_match_collated(
+                                        cursor_id,
+                                        cursor,
+                                        bytes,
+                                        &index_desc_flags,
+                                        &index_collations,
+                                        collation_registry,
+                                    )
+                                })
                                 .await?
                             } else {
-                                storage_cursor_no_conflict_prefix_match(cursor_id, cursor, bytes)
-                                    .await?
+                                lean_future(|| {
+                                    storage_cursor_no_conflict_prefix_match(cursor_id, cursor, bytes)
+                                })
+                                .await?
                             }
                         } else {
                             false
@@ -11792,8 +11816,10 @@ impl VdbeEngine {
                     if let Some((deferred_cursor, deferred_rowid)) =
                         self.take_deferred_update_delete()
                     {
-                        self.materialize_deferred_update_delete(deferred_cursor, deferred_rowid)
-                            .await?;
+                        lean_future(|| {
+                            self.materialize_deferred_update_delete(deferred_cursor, deferred_rowid)
+                        })
+                        .await?;
                     }
                     let concurrent_allocator = if concurrent_mode {
                         self.concurrent_rowid_allocator.clone()
@@ -11832,23 +11858,27 @@ impl VdbeEngine {
                         self.pending_next_after_delete.remove(&cursor_id);
                         if concurrent_mode {
                             if let Some(allocator) = concurrent_allocator.as_ref() {
-                                Self::allocate_concurrent_storage_rowid(
-                                    allocator,
-                                    concurrent_schema_epoch,
-                                    concurrent_rowid_session_id,
-                                    concurrent_rowid_statement,
-                                    root_page,
-                                    rowid_mode,
-                                    autoinc_max,
-                                    sc,
-                                    "rowid overflow: maximum rowid reached",
-                                )
+                                lean_future(|| {
+                                    Self::allocate_concurrent_storage_rowid(
+                                        allocator,
+                                        concurrent_schema_epoch,
+                                        concurrent_rowid_session_id,
+                                        concurrent_rowid_statement,
+                                        root_page,
+                                        rowid_mode,
+                                        autoinc_max,
+                                        sc,
+                                        "rowid overflow: maximum rowid reached",
+                                    )
+                                })
                                 .await?
                             } else {
-                                Self::allocate_serialized_storage_rowid(sc, autoinc_max).await?
+                                lean_future(|| Self::allocate_serialized_storage_rowid(sc, autoinc_max))
+                                    .await?
                             }
                         } else {
-                            Self::allocate_serialized_storage_rowid(sc, autoinc_max).await?
+                            lean_future(|| Self::allocate_serialized_storage_rowid(sc, autoinc_max))
+                                .await?
                         }
                     } else {
                         // MemDatabase fallback (Phase 4 in-memory cursors).
@@ -11899,10 +11929,12 @@ impl VdbeEngine {
                         if is_update && deferred_cursor == cursor_id && deferred_rowid == rowid {
                             overwrite_in_place = true;
                         } else {
-                            self.materialize_deferred_update_delete(
-                                deferred_cursor,
-                                deferred_rowid,
-                            )
+                            lean_future(|| {
+                                self.materialize_deferred_update_delete(
+                                    deferred_cursor,
+                                    deferred_rowid,
+                                )
+                            })
                             .await?;
                         }
                     }
@@ -11969,24 +12001,25 @@ impl VdbeEngine {
                                     // The cursor is still on the old row: overwrite
                                     // a same-size cell, else replace it at the same
                                     // position (delete, then insert into the gap).
-                                    if !sc
-                                        .cursor
-                                        .table_overwrite_current_payload_same_size_no_overflow(
+                                    if !lean_future(|| {
+                                        sc.cursor.table_overwrite_current_payload_same_size_no_overflow(
                                             &sc.cx, rowid, blob,
                                         )
-                                        .await?
+                                    })
+                                    .await?
                                     {
                                         let positioned = !sc.cursor.eof()
-                                            && sc.cursor.rowid(&sc.cx).await? == rowid;
+                                            && lean_future(|| sc.cursor.rowid(&sc.cx)).await? == rowid;
                                         if positioned
-                                            || sc.cursor.table_move_to(&sc.cx, rowid).await?.is_found()
+                                            || lean_future(|| sc.cursor.table_move_to(&sc.cx, rowid)).await?.is_found()
                                         {
-                                            sc.cursor.delete(&sc.cx).await?;
-                                            sc.cursor
-                                                .table_insert_prechecked_absent(&sc.cx, rowid, blob)
-                                                .await?;
+                                            lean_future(|| sc.cursor.delete(&sc.cx)).await?;
+                                            lean_future(|| {
+                                                sc.cursor.table_insert_prechecked_absent(&sc.cx, rowid, blob)
+                                            })
+                                            .await?;
                                         } else {
-                                            sc.cursor.table_insert(&sc.cx, rowid, blob).await?;
+                                            lean_future(|| sc.cursor.table_insert(&sc.cx, rowid, blob)).await?;
                                         }
                                     }
                                     if rowid == sc.last_alloc_rowid {
@@ -12033,7 +12066,7 @@ impl VdbeEngine {
                                     FSQLITE_VDBE_INSERT_SEEK_COUNT
                                         .fetch_add(1, AtomicOrdering::Relaxed);
                                     let seek_result =
-                                        sc.cursor.table_move_to(&sc.cx, rowid).await?;
+                                        lean_future(|| sc.cursor.table_move_to(&sc.cx, rowid)).await?;
                                     insert_seek_result = Some(seek_result);
                                     seek_result.is_found()
                                 };
@@ -12049,7 +12082,7 @@ impl VdbeEngine {
                                     // bit above the conflict-mode nibble.
                                     if oe_flag == 5 {
                                         // OE_REPLACE: Delete old, insert new
-                                        self.native_replace_row(cursor_id, rowid).await?;
+                                        lean_future(|| self.native_replace_row(cursor_id, rowid)).await?;
                                         let sc2 = self
                                             .storage_cursors
                                             .get_mut(&cursor_id)
@@ -12058,22 +12091,24 @@ impl VdbeEngine {
                                                     "cursor disappeared during REPLACE",
                                                 )
                                             })?;
-                                        sc2.cursor.table_insert(&sc2.cx, rowid, blob).await?;
+                                        lean_future(|| sc2.cursor.table_insert(&sc2.cx, rowid, blob)).await?;
                                         invalidate_storage_cursor_row_cache_with_reason(
                                             sc2,
                                             self.collect_vdbe_metrics,
                                             DecodeCacheInvalidationReason::WriteMutation,
                                         );
                                         if let Some(allocator) = concurrent_allocator.as_ref() {
-                                            Self::bump_concurrent_storage_rowid_floor(
-                                                allocator,
-                                                concurrent_schema_epoch,
-                                                root_page,
-                                                rowid_mode,
-                                                autoinc_max,
-                                                sc2,
-                                                rowid,
-                                            )
+                                            lean_future(|| {
+                                                Self::bump_concurrent_storage_rowid_floor(
+                                                    allocator,
+                                                    concurrent_schema_epoch,
+                                                    root_page,
+                                                    rowid_mode,
+                                                    autoinc_max,
+                                                    sc2,
+                                                    rowid,
+                                                )
+                                            })
                                             .await?;
                                         }
                                         inserted_via_storage = true;
@@ -12083,18 +12118,14 @@ impl VdbeEngine {
                                         // OE_IGNORE: Skip insert for conflicting row
                                         if let Some(update_restore) = pending_update_restore.clone()
                                         {
-                                            self.restore_pending_update_after_conflict(
-                                                update_restore,
-                                            )
+                                            lean_future(|| self.restore_pending_update_after_conflict(update_restore))
                                             .await?;
                                         }
                                     } else {
                                         // Default (ABORT/FAIL/ROLLBACK): constraint error.
                                         if let Some(update_restore) = pending_update_restore.clone()
                                         {
-                                            self.restore_pending_update_after_conflict(
-                                                update_restore,
-                                            )
+                                            lean_future(|| self.restore_pending_update_after_conflict(update_restore))
                                             .await?;
                                         }
                                         // bd-977wx: a rowid/IPK collision is a
@@ -12119,22 +12150,22 @@ impl VdbeEngine {
                                     // existence probe when it already proved the row is absent.
                                     if insert_seek_result == Some(SeekResult::NotFound) {
                                         let rightmost_insert = sc.cursor.eof();
-                                        sc.cursor
-                                            .table_insert_prechecked_absent(&sc.cx, rowid, blob)
+                                        lean_future(|| sc.cursor.table_insert_prechecked_absent(&sc.cx, rowid, blob))
                                             .await?;
                                         if rightmost_insert {
-                                            sc.cursor
-                                                .table_refresh_rightmost_leaf_cache_after_insert(
+                                            lean_future(|| {
+                                                sc.cursor.table_refresh_rightmost_leaf_cache_after_insert(
                                                     &sc.cx, rowid,
                                                 )
-                                                .await?;
+                                            })
+                                            .await?;
                                             sc.last_successful_insert_rowid = Some(rowid);
                                         } else if sc.last_successful_insert_rowid.take().is_some() {
                                             FSQLITE_VDBE_INSERT_APPEND_HINT_CLEAR_COUNT
                                                 .fetch_add(1, AtomicOrdering::Relaxed);
                                         }
                                     } else {
-                                        sc.cursor.table_insert(&sc.cx, rowid, blob).await?;
+                                        lean_future(|| sc.cursor.table_insert(&sc.cx, rowid, blob)).await?;
                                         if append_eligible {
                                             sc.last_successful_insert_rowid = Some(rowid);
                                         } else if sc.last_successful_insert_rowid.take().is_some() {
@@ -12151,15 +12182,17 @@ impl VdbeEngine {
                                         DecodeCacheInvalidationReason::WriteMutation,
                                     );
                                     if let Some(allocator) = concurrent_allocator.as_ref() {
-                                        Self::bump_concurrent_storage_rowid_floor(
-                                            allocator,
-                                            concurrent_schema_epoch,
-                                            root_page,
-                                            rowid_mode,
-                                            autoinc_max,
-                                            sc,
-                                            rowid,
-                                        )
+                                        lean_future(|| {
+                                            Self::bump_concurrent_storage_rowid_floor(
+                                                allocator,
+                                                concurrent_schema_epoch,
+                                                root_page,
+                                                rowid_mode,
+                                                autoinc_max,
+                                                sc,
+                                                rowid,
+                                            )
+                                        })
                                         .await?;
                                     }
                                     inserted_via_storage = true;
@@ -12238,9 +12271,7 @@ impl VdbeEngine {
                                             if let Some(update_restore) =
                                                 pending_update_restore.clone()
                                             {
-                                                self.restore_pending_update_after_conflict(
-                                                    update_restore,
-                                                )
+                                                lean_future(|| self.restore_pending_update_after_conflict(update_restore))
                                                 .await?;
                                             }
                                         }
@@ -12280,9 +12311,7 @@ impl VdbeEngine {
                                             if let Some(update_restore) =
                                                 pending_update_restore.clone()
                                             {
-                                                self.restore_pending_update_after_conflict(
-                                                    update_restore,
-                                                )
+                                                lean_future(|| self.restore_pending_update_after_conflict(update_restore))
                                                 .await?;
                                             }
                                             // bd-977wx: name the IPK column so a
@@ -12417,12 +12446,12 @@ impl VdbeEngine {
                     // only for legacy Phase 4 cursors.
                     if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
                         if sc.writable && !sc.cursor.eof() {
-                            let current_rowid = sc.cursor.rowid(&sc.cx).await?;
+                            let current_rowid = lean_future(|| sc.cursor.rowid(&sc.cx)).await?;
                             if is_update {
                                 update_restore = Some(PendingUpdateRestore::Storage {
                                     cursor_id,
                                     rowid: current_rowid,
-                                    payload: sc.cursor.payload(&sc.cx).await?,
+                                    payload: lean_future(|| sc.cursor.payload(&sc.cx)).await?,
                                     index_entries: Vec::new(),
                                 });
                             }
@@ -12431,7 +12460,7 @@ impl VdbeEngine {
                                 // for the paired Insert to rewrite in place.
                                 deferred_rowid = Some(current_rowid);
                             } else {
-                                sc.cursor.delete(&sc.cx).await?;
+                                lean_future(|| sc.cursor.delete(&sc.cx)).await?;
                                 invalidate_storage_cursor_row_cache_with_reason(
                                     sc,
                                     self.collect_vdbe_metrics,
@@ -12580,14 +12609,16 @@ impl VdbeEngine {
                                     if let Some(collation_registry) =
                                         collated_unique_registry.as_ref()
                                     {
-                                        match find_conflicting_rowid_in_index_collated(
-                                            sc,
-                                            key_bytes,
-                                            n_idx_cols,
-                                            &index_desc_flags,
-                                            &index_collations,
-                                            collation_registry,
-                                        )
+                                        match lean_future(|| {
+                                            find_conflicting_rowid_in_index_collated(
+                                                sc,
+                                                key_bytes,
+                                                n_idx_cols,
+                                                &index_desc_flags,
+                                                &index_collations,
+                                                collation_registry,
+                                            )
+                                        })
                                         .await
                                         {
                                             Ok(Some(conflict_rowid)) => Err((
@@ -12597,9 +12628,7 @@ impl VdbeEngine {
                                                 Some(conflict_rowid),
                                             )),
                                             Ok(None) => {
-                                                match sc
-                                                    .cursor
-                                                    .index_insert(&sc.cx, key_bytes)
+                                                match lean_future(|| sc.cursor.index_insert(&sc.cx, key_bytes))
                                                     .await
                                                 {
                                                     Ok(()) => Ok(()),
@@ -12658,27 +12687,27 @@ impl VdbeEngine {
                                             None
                                         };
                                     if let Some(prefix) = fast_append_prefix {
-                                        match sc
-                                            .cursor
-                                            .index_append_after_current_rightmost_position(
+                                        match lean_future(|| {
+                                            sc.cursor.index_append_after_current_rightmost_position(
                                                 &sc.cx, key_bytes,
                                             )
-                                            .await
+                                        })
+                                        .await
                                         {
                                             Ok(true) => {
                                                 rightmost_prefix_after_insert = Some(prefix);
                                                 Ok(())
                                             }
                                             Ok(false) => {
-                                                match sc
-                                                    .cursor
-                                                    .index_insert_unique_with_rightmost_report(
+                                                match lean_future(|| {
+                                                    sc.cursor.index_insert_unique_with_rightmost_report(
                                                         &sc.cx,
                                                         key_bytes,
                                                         n_idx_cols,
                                                         columns_label,
                                                     )
-                                                    .await
+                                                })
+                                                .await
                                                 {
                                                     Ok(inserted_after_rightmost) => {
                                                         if inserted_after_rightmost {
@@ -12699,15 +12728,15 @@ impl VdbeEngine {
                                             Err(err) => Err((err, None)),
                                         }
                                     } else {
-                                        match sc
-                                            .cursor
-                                            .index_insert_unique_with_rightmost_report(
+                                        match lean_future(|| {
+                                            sc.cursor.index_insert_unique_with_rightmost_report(
                                                 &sc.cx,
                                                 key_bytes,
                                                 n_idx_cols,
                                                 columns_label,
                                             )
-                                            .await
+                                        })
+                                        .await
                                         {
                                             Ok(inserted_after_rightmost) => {
                                                 if inserted_after_rightmost {
@@ -12754,11 +12783,12 @@ impl VdbeEngine {
                                             // insert, roll back any already-inserted
                                             // index entries, and skip remaining indexes.
                                             4 => {
-                                                if let Err(error) = self
-                                                    .rollback_pending_insert_after_index_conflict(
+                                                if let Err(error) = lean_future(|| {
+                                                    self.rollback_pending_insert_after_index_conflict(
                                                         true,
                                                     )
-                                                    .await
+                                                })
+                                                .await
                                                 {
                                                     if sideband_active {
                                                         self.make_record_lookaside
@@ -12784,9 +12814,11 @@ impl VdbeEngine {
                                                 let conflict_rowid = if uses_collated_unique_probe {
                                                     conflict_rowid
                                                 } else {
-                                                    match find_conflicting_rowid_in_index(
-                                                        sc, key_bytes, n_idx_cols,
-                                                    )
+                                                    match lean_future(|| {
+                                                        find_conflicting_rowid_in_index(
+                                                            sc, key_bytes, n_idx_cols,
+                                                        )
+                                                    })
                                                     .await
                                                     {
                                                         Ok(rowid) => rowid,
@@ -12804,8 +12836,9 @@ impl VdbeEngine {
                                                     if let Some(tbl_cid) =
                                                         self.last_insert_cursor_id
                                                     {
-                                                        if let Err(error) = self
-                                                            .native_replace_row(tbl_cid, old_rowid)
+                                                        if let Err(error) = lean_future(|| {
+                                                            self.native_replace_row(tbl_cid, old_rowid)
+                                                        })
                                                             .await
                                                         {
                                                             if sideband_active {
@@ -12834,9 +12867,7 @@ impl VdbeEngine {
                                                 };
                                                 sc2.last_rightmost_unique_index_prefix = None;
                                                 sc2.last_rightmost_unique_index_position = None;
-                                                if let Err(error) = sc2
-                                                    .cursor
-                                                    .index_insert(&sc2.cx, key_bytes)
+                                                if let Err(error) = lean_future(|| sc2.cursor.index_insert(&sc2.cx, key_bytes))
                                                     .await
                                                 {
                                                     if sideband_active {
@@ -12859,11 +12890,12 @@ impl VdbeEngine {
                                             // Default: propagate the error
                                             // (ABORT/FAIL/ROLLBACK).
                                             _ => {
-                                                if let Err(error) = self
-                                                    .rollback_pending_insert_after_index_conflict(
+                                                if let Err(error) = lean_future(|| {
+                                                    self.rollback_pending_insert_after_index_conflict(
                                                         false,
                                                     )
-                                                    .await
+                                                })
+                                                .await
                                                 {
                                                     if sideband_active {
                                                         self.make_record_lookaside
@@ -12919,18 +12951,19 @@ impl VdbeEngine {
                                     _ => None,
                                 };
                                 let appended = if fast_append_key.is_some() {
-                                    sc.cursor
-                                        .index_append_after_current_rightmost_position(
+                                    lean_future(|| {
+                                        sc.cursor.index_append_after_current_rightmost_position(
                                             &sc.cx, key_bytes,
                                         )
-                                        .await
+                                    })
+                                    .await
                                 } else {
                                     Ok(false)
                                 };
                                 let rightmost_key = match appended {
                                     Ok(true) => Ok(fast_append_key),
                                     Ok(false) => {
-                                        sc.cursor.index_insert(&sc.cx, key_bytes).await.map(|()| {
+                                        lean_future(|| sc.cursor.index_insert(&sc.cx, key_bytes)).await.map(|()| {
                                             if binary_key_order
                                                 && sc.cursor.last_index_insert_was_past_rightmost()
                                             {
@@ -13064,7 +13097,7 @@ impl VdbeEngine {
                                     )
                                 })?;
                             let root_page = cursor.root_page;
-                            let payload = cursor.cursor.payload(&cursor.cx).await?;
+                            let payload = lean_future(|| cursor.cursor.payload(&cursor.cx)).await?;
                             (root_page, payload)
                         };
                         // Decode in the DB text encoding: the captured victim's
@@ -13108,11 +13141,13 @@ impl VdbeEngine {
                             .map(|sc| sc.writable)
                             .unwrap_or(false);
                         if writable
-                            && self.storage_cursor_find_exact_index_key(
-                                cursor_id,
-                                key,
-                                "IdxDelete: missing collation registry for collated exact probe",
-                            )
+                            && lean_future(|| {
+                                self.storage_cursor_find_exact_index_key(
+                                    cursor_id,
+                                    key,
+                                    "IdxDelete: missing collation registry for collated exact probe",
+                                )
+                            })
                             .await?
                         {
                             let mut removed_entry = None;
@@ -13122,9 +13157,9 @@ impl VdbeEngine {
                                 // bd-c1vth: record the exact stored entry an
                                 // UPDATE row removes, for its conflict restore.
                                 if op.p5 & OPFLAG_ISUPDATE != 0 {
-                                    removed_entry = Some(sc.cursor.payload(&sc.cx).await?);
+                                    removed_entry = Some(lean_future(|| sc.cursor.payload(&sc.cx)).await?);
                                 }
-                                sc.cursor.delete(&sc.cx).await?;
+                                lean_future(|| sc.cursor.delete(&sc.cx)).await?;
                                 deleted = true;
                                 invalidate_storage_cursor_row_cache_with_reason(
                                     sc,
@@ -13143,7 +13178,7 @@ impl VdbeEngine {
                             // Delete at current position.
                             sc.last_rightmost_unique_index_prefix = None;
                             sc.last_rightmost_unique_index_position = None;
-                            sc.cursor.delete(&sc.cx).await?;
+                            lean_future(|| sc.cursor.delete(&sc.cx)).await?;
                             deleted = true;
                             invalidate_storage_cursor_row_cache_with_reason(
                                 sc,
@@ -13393,7 +13428,7 @@ impl VdbeEngine {
                         // cursor's own storage view, not a connection-local
                         // MemDatabase mirror that may lag retained same-connection
                         // writes.
-                        sc.cursor.count_all_rows(&sc.cx).await?
+                        lean_future(|| sc.cursor.count_all_rows(&sc.cx)).await?
                     } else {
                         0
                     };
@@ -13416,11 +13451,13 @@ impl VdbeEngine {
                                 "CountIndexEqRun requires an index cursor",
                             ));
                         }
-                        storage_cursor_count_equal_first_key_run(
-                            cursor,
-                            &probe_value,
-                            self.collect_vdbe_metrics,
-                        )
+                        lean_future(|| {
+                            storage_cursor_count_equal_first_key_run(
+                                cursor,
+                                &probe_value,
+                                self.collect_vdbe_metrics,
+                            )
+                        })
                         .await?
                     };
                     let next_count = self.get_reg(op.p2).to_integer().wrapping_add(matched);
@@ -13695,7 +13732,7 @@ impl VdbeEngine {
                     let val = if op.p1 < 0 {
                         self.get_reg(op.p3)
                     } else {
-                        val_ref = self.cursor_column(op.p1, op.p3 as usize).await?;
+                        val_ref = lean_future(|| self.cursor_column(op.p1, op.p3 as usize)).await?;
                         &val_ref
                     };
                     let type_bit: u16 = match val {
@@ -13722,7 +13759,7 @@ impl VdbeEngine {
                     let cursor_id = op.p1;
                     let empty = if let Some(sc) = self.storage_cursors.get_mut(&cursor_id) {
                         // Try moving to first; false means empty.
-                        let had_row = sc.cursor.first(&sc.cx).await?;
+                        let had_row = lean_future(|| sc.cursor.first(&sc.cx)).await?;
                         !had_row
                     } else if let Some(cursor) = self.cursors.get(&cursor_id) {
                         if let Some(db) = self.db.as_ref()
@@ -13787,7 +13824,7 @@ impl VdbeEngine {
                     // index key record.
                     let cursor_id = op.p1;
                     let target = op.p2;
-                    let val = self.cursor_rowid(cursor_id).await?;
+                    let val = lean_future(|| self.cursor_rowid(cursor_id)).await?;
                     self.set_reg_fast(target, val);
                     pc += 1;
                 }
@@ -13853,17 +13890,19 @@ impl VdbeEngine {
                             let coll_arc = Arc::clone(&self.collation_registry);
                             let coll_registry =
                                 coll_arc.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                            let cmp = storage_cursor_current_first_index_key_compare(
-                                sc,
-                                &probe_first,
-                                self.collect_vdbe_metrics,
-                                "IdxCmp: malformed index record at cursor position",
-                                desc_flags.first().copied().unwrap_or(false),
-                                collations
-                                    .first()
-                                    .and_then(|collation| collation.as_deref()),
-                                &coll_registry,
-                            )
+                            let cmp = lean_future(|| {
+                                storage_cursor_current_first_index_key_compare(
+                                    sc,
+                                    &probe_first,
+                                    self.collect_vdbe_metrics,
+                                    "IdxCmp: malformed index record at cursor position",
+                                    desc_flags.first().copied().unwrap_or(false),
+                                    collations
+                                        .first()
+                                        .and_then(|collation| collation.as_deref()),
+                                    &coll_registry,
+                                )
+                            })
                             .await?;
 
                             if idx_compare_condition_met(op.opcode, cmp) {
@@ -13874,7 +13913,7 @@ impl VdbeEngine {
                             continue;
                         }
 
-                        if !try_decode_storage_cursor_current_index_record(cursor_id, sc).await? {
+                        if !lean_future(|| try_decode_storage_cursor_current_index_record(cursor_id, sc)).await? {
                             return Err(FrankenError::internal(
                                 "IdxCmp: malformed index record at cursor position",
                             ));

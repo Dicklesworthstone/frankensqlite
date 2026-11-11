@@ -3463,3 +3463,146 @@ fn read_only_snapshot_integrity_check_counts_the_durable_freelist() {
         reader.close().await.unwrap();
     });
 }
+
+/// bd-w4pr1.28: downstream applications do not inherit this workspace's
+/// RUST_MIN_STACK setting. A stack overflow aborts the process, so isolate
+/// the real blocking-API workload and explicitly request Rust's usual 2 MiB
+/// thread stack. Run at opt-level=0 as well as the workspace's dev profile.
+#[cfg(all(feature = "native", any(unix, windows)))]
+#[test]
+fn blocking_api_fits_default_thread_stack() {
+    const CHILD_ENV: &str = "FSQLITE_DEFAULT_STACK_PROBE_CHILD";
+    if std::env::var_os(CHILD_ENV).is_some() {
+        std::thread::Builder::new()
+            .name("blocking-default-stack".to_owned())
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                exercise_blocking_api_on_default_stack(std::path::Path::new(":memory:"));
+                let directory = tempfile::tempdir().unwrap();
+                let database = directory.path().join("default-stack.db");
+                exercise_blocking_api_on_default_stack(&database);
+
+                let reader = fsqlite::blocking::Connection::open_with_flags(
+                    &database,
+                    OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )
+                .unwrap();
+                assert_eq!(
+                    reader
+                        .query_row("SELECT count(*) FROM items", [], |row| row.get::<_, i64>(0))
+                        .unwrap(),
+                    19
+                );
+                assert!(
+                    reader
+                        .prepare("SELECT id FROM items WHERE label = ?1")
+                        .unwrap()
+                        .exists(["item-7"])
+                        .unwrap()
+                );
+                reader.close().unwrap();
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        return;
+    }
+
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "blocking_api_fits_default_thread_stack",
+            "--nocapture",
+        ])
+        .env(CHILD_ENV, "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "blocking API failed on a 2 MiB thread: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(all(feature = "native", any(unix, windows)))]
+fn exercise_blocking_api_on_default_stack(path: &std::path::Path) {
+    use fsqlite::blocking::Connection as BlockingConnection;
+
+    eprintln!("default-stack probe: open {}", path.display());
+    let mut connection = BlockingConnection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+    )
+    .unwrap();
+    connection
+        .busy_timeout(std::time::Duration::from_millis(250))
+        .unwrap();
+    eprintln!("default-stack probe: create table and index");
+    connection
+        .execute_batch(
+            "CREATE TABLE items(id INTEGER PRIMARY KEY, label TEXT, amount INTEGER);
+             CREATE INDEX items_label ON items(label);",
+        )
+        .unwrap();
+    {
+        let mut insert = connection
+            .prepare("INSERT INTO items VALUES (?1, ?2, ?3)")
+            .unwrap();
+        for id in 1..=20_i64 {
+            assert_eq!(
+                insert
+                    .execute(fsqlite::blocking::params![id, format!("item-{id}"), id * 2])
+                    .unwrap(),
+                1
+            );
+        }
+    }
+    let selected: Vec<(i64, String)> = connection
+        .prepare("SELECT id, label FROM items WHERE amount >= ?1 ORDER BY id")
+        .unwrap()
+        .query_map([36_i64], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        selected,
+        vec![
+            (18, "item-18".to_owned()),
+            (19, "item-19".to_owned()),
+            (20, "item-20".to_owned())
+        ]
+    );
+    eprintln!("default-stack probe: transaction and savepoint");
+    {
+        let mut transaction = connection.transaction().unwrap();
+        transaction
+            .execute(
+                "UPDATE items SET amount = amount + 1 WHERE id <= ?1",
+                [10_i64],
+            )
+            .unwrap();
+        {
+            let savepoint = transaction.savepoint().unwrap();
+            savepoint.execute("DELETE FROM items", []).unwrap();
+            // Dropping the savepoint must roll back only its own DELETE.
+        }
+        assert_eq!(
+            transaction
+                .execute("DELETE FROM items WHERE id = 20", [])
+                .unwrap(),
+            1
+        );
+        transaction.commit().unwrap();
+    }
+    assert_eq!(
+        connection
+            .query_row("SELECT count(*), sum(amount) FROM items", [], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })
+            .unwrap(),
+        (19, 390)
+    );
+    connection.close().unwrap();
+}
