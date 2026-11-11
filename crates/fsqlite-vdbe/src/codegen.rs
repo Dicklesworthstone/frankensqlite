@@ -13208,8 +13208,10 @@ enum OuterEqualitySeek<'a> {
     },
 }
 
-/// The two tables of `stmt`'s two-table `ON` join and the single-join lookup
-/// `codegen_join_select` compiles it to.
+/// The two tables of `stmt`'s two-table join and the single-join lookup
+/// `codegen_join_select` compiles it to. The join condition is the `ON`
+/// clause, or for an inner or cross join written without a constraint the
+/// WHERE clause (`joined_by_where`, bd-w4pr1.13.16).
 struct SingleJoinLookupSelect<'a> {
     left_table: &'a TableSchema,
     left_alias: Option<&'a str>,
@@ -13217,6 +13219,7 @@ struct SingleJoinLookupSelect<'a> {
     right_alias: Option<&'a str>,
     on_expr: &'a Expr,
     plan: SingleJoinLookupPlan<'a>,
+    joined_by_where: bool,
 }
 
 fn single_join_lookup_select<'a>(
@@ -13224,7 +13227,9 @@ fn single_join_lookup_select<'a>(
     schema: &'a [TableSchema],
 ) -> Option<SingleJoinLookupSelect<'a>> {
     let SelectCore::Select {
-        from: Some(from), ..
+        from: Some(from),
+        where_clause,
+        ..
     } = &stmt.body.select
     else {
         return None;
@@ -13253,16 +13258,23 @@ fn single_join_lookup_select<'a>(
     ) else {
         return None;
     };
-    let Some(fsqlite_ast::JoinConstraint::On(on_expr)) = &join.constraint else {
-        return None;
-    };
+    let (on_expr, join_kind, joined_by_where) =
+        match (&join.constraint, join.join_type.kind, where_clause.as_deref()) {
+            (Some(fsqlite_ast::JoinConstraint::On(on_expr)), kind, _) => (on_expr, kind, false),
+            (
+                None,
+                fsqlite_ast::JoinKind::Inner | fsqlite_ast::JoinKind::Cross,
+                Some(join_condition),
+            ) if !join.join_type.natural => (join_condition, fsqlite_ast::JoinKind::Inner, true),
+            _ => return None,
+        };
     let (left_alias, right_alias) = (left_alias.as_deref(), right_alias.as_deref());
     let plan = resolve_single_join_lookup_plan_or_autoindex(
         left_table,
         left_alias,
         right_table,
         right_alias,
-        join.join_type.kind,
+        join_kind,
         Some(on_expr),
     )?;
     Some(SingleJoinLookupSelect {
@@ -13272,6 +13284,7 @@ fn single_join_lookup_select<'a>(
         right_alias,
         on_expr,
         plan,
+        joined_by_where,
     })
 }
 
@@ -13310,10 +13323,16 @@ pub fn join_select_seeks_outer_table(stmt: &SelectStatement, schema: &[TableSche
         right_alias,
         on_expr,
         plan,
+        joined_by_where,
     }) = single_join_lookup_select(stmt, schema)
     else {
         return false;
     };
+    // A join joined by its WHERE clause hands that clause to the lookup as
+    // the join condition and scans its outer table.
+    if joined_by_where {
+        return false;
+    }
     let where_clause = where_clause.as_deref();
     // Mirror codegen_join_select's choice of the driving table.
     if !columns
@@ -14928,6 +14947,41 @@ fn codegen_join_select(
 
     if join_tables.is_empty() {
         return Err(CodegenError::Unsupported("empty join list".to_owned()));
+    }
+
+    // bd-w4pr1.13.16: an inner or cross join written without a constraint
+    // (`FROM t, u WHERE u.a = t.a`) is joined by its WHERE clause, which is
+    // then the whole join condition: the lookup is planned from it, and the
+    // conjuncts the lookup does not consume are checked for every row it
+    // reaches, as ON residuals are. The tables keep their written order
+    // (stock never reorders a CROSS JOIN, and the parser does not tell a
+    // comma from one). This is the plan `join_select_uses_lookup` reports.
+    if let [(right_table, right_alias, JoinKind::Inner | JoinKind::Cross, None)] =
+        join_tables.as_slice()
+        && !from.joins[0].join_type.natural
+        && let Some(join_condition) = where_clause
+        && let Some(plan) = resolve_single_join_lookup_plan_or_autoindex(
+            left_table,
+            left_alias,
+            right_table,
+            right_alias.as_deref(),
+            JoinKind::Inner,
+            Some(join_condition),
+        )
+    {
+        return codegen_single_join_lookup_select(
+            b,
+            stmt,
+            columns,
+            None,
+            left_table,
+            left_alias,
+            right_table,
+            right_alias.as_deref(),
+            &plan,
+            ctx,
+            &[],
+        );
     }
 
     // bd-w4pr1.10: with no usable index on the join column this builds an

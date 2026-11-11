@@ -25628,8 +25628,11 @@ impl Connection {
     /// join's LIMIT (bd-9gl3w).
     #[must_use]
     fn select_join_runs_in_vdbe(&self, select: &SelectStatement) -> bool {
-        select_join_is_vdbe_eligible(select)
-            || select_limited_join_is_vdbe_eligible(select, &self.schema.borrow())
+        select_join_is_vdbe_eligible(select) || {
+            let schema = self.schema.borrow();
+            select_limited_join_is_vdbe_eligible(select, &schema)
+                || select_where_joined_lookup_is_vdbe_eligible(select, &schema)
+        }
     }
 
     #[must_use]
@@ -113303,6 +113306,35 @@ fn select_limited_join_is_vdbe_eligible(select: &SelectStatement, schema: &[Tabl
 }
 
 fn select_join_shape_is_vdbe_eligible(select: &SelectStatement) -> bool {
+    select_join_shape_is_vdbe_eligible_as(select, false)
+}
+
+/// bd-w4pr1.13.16: a two-table inner or cross join written without a
+/// constraint (`FROM t, u WHERE u.a = t.a`, `t CROSS JOIN u WHERE ...`) whose
+/// WHERE clause gives the VDBE join codegen a lookup into the second table.
+/// The WHERE is then the join condition of the same lookup loop an ON clause
+/// gets. Without a lookup the join keeps the materializing executor, which
+/// hashes the inner table once where a nested loop would rescan it. A LIMIT
+/// is taken as for an ON join (bd-9gl3w): only without ORDER BY.
+fn select_where_joined_lookup_is_vdbe_eligible(
+    select: &SelectStatement,
+    schema: &[TableSchema],
+) -> bool {
+    select.limit.as_ref().is_none_or(|clause| {
+        select.order_by.is_empty()
+            && !expr_has_any_subquery(&clause.limit)
+            && clause
+                .offset
+                .as_ref()
+                .is_none_or(|offset| !expr_has_any_subquery(offset))
+    }) && select_join_shape_is_vdbe_eligible_as(select, true)
+        && join_select_uses_lookup(select, schema)
+}
+
+/// The shape test of the VDBE join lanes for a join that is `joined_by_where`
+/// (no constraint; inner or cross; a WHERE clause) or joined by ON (inner or
+/// left).
+fn select_join_shape_is_vdbe_eligible_as(select: &SelectStatement, joined_by_where: bool) -> bool {
     let SelectCore::Select {
         columns,
         from: Some(from),
@@ -113356,11 +113388,18 @@ fn select_join_shape_is_vdbe_eligible(select: &SelectStatement) -> bool {
     }
 
     let join = &from.joins[0];
-    if !matches!(
-        join.join_type.kind,
-        fsqlite_ast::JoinKind::Inner | fsqlite_ast::JoinKind::Left
-    ) || join.join_type.natural
-    {
+    let kind_is_eligible = if joined_by_where {
+        matches!(
+            join.join_type.kind,
+            fsqlite_ast::JoinKind::Inner | fsqlite_ast::JoinKind::Cross
+        )
+    } else {
+        matches!(
+            join.join_type.kind,
+            fsqlite_ast::JoinKind::Inner | fsqlite_ast::JoinKind::Left
+        )
+    };
+    if !kind_is_eligible || join.join_type.natural {
         return false;
     }
     if !matches!(&join.table, TableOrSubquery::Table { .. }) {
@@ -113372,9 +113411,11 @@ fn select_join_shape_is_vdbe_eligible(select: &SelectStatement) -> bool {
 
     match &join.constraint {
         Some(fsqlite_ast::JoinConstraint::On(expr)) => {
-            !expr_has_any_subquery(expr) && join_expr_is_vdbe_eligible(expr)
+            !joined_by_where && !expr_has_any_subquery(expr) && join_expr_is_vdbe_eligible(expr)
         }
-        Some(fsqlite_ast::JoinConstraint::Using(_)) | None => false,
+        Some(fsqlite_ast::JoinConstraint::Using(_)) => false,
+        // The WHERE clause was checked above.
+        None => joined_by_where && where_clause.is_some(),
     }
 }
 

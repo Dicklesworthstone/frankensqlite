@@ -698,6 +698,114 @@ fn join_lanes_compile_between_and_match_sqlite() {
     }
 }
 
+/// bd-w4pr1.13.16: an inner or cross join written without a constraint and
+/// joined by its WHERE clause returns rows through the lookup loop. Every
+/// query is ordered, so the comparison does not depend on which table a plan
+/// drives from.
+const ROWS_JOINED_BY_WHERE_QUERIES: &[&str] = &[
+    "SELECT u.id, t.id, t.c FROM u, t WHERE t.id = u.a ORDER BY u.id",
+    "SELECT u.id, t.id, t.c FROM u CROSS JOIN t WHERE t.id = u.a ORDER BY u.id",
+    "SELECT u.id, t.id, t.c FROM u JOIN t WHERE u.a = t.id ORDER BY u.id",
+    "SELECT u.id, t.id FROM u, t WHERE t.a = u.a ORDER BY u.id, t.id",
+    "SELECT t.id, u.id FROM t, u WHERE u.a = t.id ORDER BY t.id, u.id",
+    "SELECT u.id, t.id FROM u, t WHERE t.a = u.a AND t.c > 2 AND u.r < 3 ORDER BY u.id, t.id",
+    "SELECT u.id, t.id FROM u, t WHERE t.id = u.id AND t.a = u.a ORDER BY u.id",
+    "SELECT u.id, t.id FROM u, t WHERE t.id = u.id + 1 ORDER BY u.id",
+    "SELECT u.id, t.id FROM u, t WHERE t.b = u.b ORDER BY u.id, t.id",
+    "SELECT u.id, t.id FROM u, t WHERE t.d = u.d ORDER BY u.id, t.id",
+    "SELECT u.id, t.id FROM u, t WHERE t.n = u.b ORDER BY u.id, t.id",
+    "SELECT x.id, y.c FROM u AS x, t AS y WHERE y.id = x.a ORDER BY x.id",
+    "SELECT a.id, b.id FROM t a, t b WHERE b.a = a.id ORDER BY a.id, b.id",
+    "SELECT * FROM u, t WHERE t.id = u.a ORDER BY u.id",
+    "SELECT u.*, t.c FROM u, t WHERE t.id = u.a ORDER BY u.id",
+    "SELECT u.id, t.id FROM u, t WHERE t.id = u.a AND u.id BETWEEN 2 AND 5 ORDER BY u.id",
+    "SELECT u.id, t.id FROM u, t WHERE t.id = u.a ORDER BY t.c DESC, u.id",
+    "SELECT u.id, e.id FROM u, e WHERE e.a = u.a ORDER BY u.id",
+    // A cross join is never reordered, so these row orders are the plan's.
+    "SELECT u.id, t.id, t.c FROM u CROSS JOIN t WHERE t.id = u.a",
+    "SELECT u.id, t.id, t.c FROM u CROSS JOIN t WHERE t.id = u.a LIMIT 3",
+    "SELECT u.id, t.id, t.c FROM u CROSS JOIN t WHERE t.id = u.a LIMIT 2 OFFSET 2",
+];
+
+/// Joined by WHERE with no equality the lookup can take: these stay on the
+/// materializing executor and must still match.
+const ROWS_NOT_JOINED_BY_A_LOOKUP_QUERIES: &[&str] = &[
+    "SELECT u.id, t.id FROM u, t WHERE t.id <> u.a AND t.id < 3 ORDER BY u.id, t.id",
+    "SELECT u.id, t.id FROM u, t WHERE t.id = u.a OR u.a IS NULL ORDER BY u.id, t.id",
+    "SELECT u.id, t.id FROM u, t WHERE u.r > 2.9 AND t.c > 9 ORDER BY u.id, t.id",
+    "SELECT count(*) FROM (SELECT u.id FROM u, t)",
+    "SELECT u.id, t.id FROM u LEFT JOIN t WHERE t.id = u.a ORDER BY u.id, t.id",
+    "SELECT u.id, t.id, e.id FROM u, t, e WHERE t.id = u.a AND e.a = u.a ORDER BY u.id",
+];
+
+#[test]
+fn join_rows_joined_by_where_match_sqlite() {
+    for indexed in [false, true] {
+        asupersync::test_utils::run_test(|| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("join_rows_joined_by_where.db");
+            let f = Connection::open(path.to_str().unwrap()).await.unwrap();
+            let r = rusqlite::Connection::open_in_memory().unwrap();
+            let indexes: &[&str] = if indexed { INDEXES } else { &[] };
+            for sql in SETUP.iter().chain(indexes) {
+                f.execute(sql).await.unwrap();
+                r.execute(sql, []).unwrap();
+            }
+            for sql in ROWS_JOINED_BY_WHERE_QUERIES
+                .iter()
+                .chain(ROWS_NOT_JOINED_BY_A_LOOKUP_QUERIES)
+            {
+                assert_agree(&f, &r, sql, &[], &[]).await;
+            }
+            assert_agree(
+                &f,
+                &r,
+                "SELECT u.id, t.c FROM u, t WHERE t.id = u.a AND t.c > ?1 ORDER BY u.id",
+                &[SqliteValue::Float(2.0)],
+                &[&2.0_f64],
+            )
+            .await;
+        });
+    }
+}
+
+/// The routing itself: on an in-memory database with the interpreted
+/// fallbacks refused, a join joined by WHERE through a lookup still answers
+/// (it runs as bytecode), and one with no lookup is refused (it would have
+/// taken the materializing executor).
+#[test]
+fn join_rows_joined_by_where_run_as_bytecode() {
+    asupersync::test_utils::run_test(|| async {
+        let f = Connection::open(":memory:").await.unwrap();
+        let r = rusqlite::Connection::open_in_memory().unwrap();
+        for sql in SETUP.iter().chain(INDEXES) {
+            f.execute(sql).await.unwrap();
+            r.execute(sql, []).unwrap();
+        }
+        f.set_reject_mem_fallback(true);
+        f.set_strict_mem_fallback_rejection(true);
+        for sql in [
+            "SELECT u.id, t.id, t.c FROM u, t WHERE t.id = u.a ORDER BY u.id",
+            "SELECT u.id, t.id, t.c FROM u CROSS JOIN t WHERE t.id = u.a ORDER BY u.id",
+            "SELECT u.id, t.id FROM u, t WHERE t.a = u.a AND t.c > 2 ORDER BY u.id, t.id",
+            "SELECT u.id, t.id, t.c FROM u CROSS JOIN t WHERE t.id = u.a LIMIT 3",
+        ] {
+            assert_agree(&f, &r, sql, &[], &[]).await;
+        }
+        for sql in [
+            "SELECT u.id, t.id FROM u, t WHERE t.id <> u.a AND t.id < 3 ORDER BY u.id, t.id",
+            "SELECT u.id, t.id FROM u, t WHERE u.r > 2.9 AND t.c > 9 ORDER BY u.id, t.id",
+        ] {
+            assert!(
+                f.query(sql).await.is_err(),
+                "`{sql}` has no lookup and must be refused with fallbacks off"
+            );
+        }
+        f.set_strict_mem_fallback_rejection(false);
+        f.set_reject_mem_fallback(false);
+    });
+}
+
 /// A replacement for the builtin `length`: every value is 7 long.
 struct SevenLong;
 
