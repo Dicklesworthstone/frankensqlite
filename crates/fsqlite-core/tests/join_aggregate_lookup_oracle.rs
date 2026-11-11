@@ -368,6 +368,89 @@ fn join_aggregates_over_operator_conditions_match_sqlite() {
     }
 }
 
+/// bd-w4pr1.13.16: a WHERE term that reads only the outer table is tested
+/// before the lookup, and so is such an ON term of an inner join. An ON term
+/// of a LEFT JOIN must not be: the outer row it fails still comes out, with
+/// NULLs for the inner table. Terms joined by OR, and terms that read the
+/// inner table, stay after the lookup.
+const OUTER_ROW_FILTER_QUERIES: &[&str] = &[
+    "SELECT u.id, t.id FROM u JOIN t ON t.a = u.a WHERE u.r > 1 ORDER BY u.id, t.id",
+    "SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE u.r > 1 AND u.id <> 5 ORDER BY u.id",
+    "SELECT u.id, t.id FROM u LEFT JOIN t ON t.a = u.a WHERE u.r > 1 ORDER BY u.id, t.id",
+    "SELECT u.id, t.id FROM u LEFT JOIN t ON t.a = u.a AND u.r > 1 ORDER BY u.id, t.id",
+    "SELECT u.id, t.id FROM u JOIN t ON t.a = u.a AND u.r > 1 ORDER BY u.id, t.id",
+    "SELECT u.id, t.id FROM u LEFT JOIN t ON t.a = u.a WHERE u.b IS NULL ORDER BY u.id",
+    "SELECT u.id, t.id FROM u LEFT JOIN t ON t.a = u.a WHERE u.a IS NULL OR t.id IS NULL \
+     ORDER BY u.id",
+    "SELECT u.id, t.id FROM u JOIN t ON t.a = u.a WHERE u.r > 1 AND t.c > 2 AND u.id <> 5 \
+     ORDER BY u.id, t.id",
+    "SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE NULL ORDER BY u.id",
+    "SELECT u.id, t.id FROM u LEFT JOIN t ON t.id = u.id WHERE 0 ORDER BY u.id",
+    "SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE 1 ORDER BY u.id",
+    "SELECT a.id, b.id FROM t a JOIN t b ON b.id = a.a WHERE a.c > 2 AND b.c < 10 ORDER BY a.id",
+    "SELECT count(*), sum(t.c) FROM u JOIN t ON t.a = u.a WHERE u.r > 1",
+    "SELECT count(*), count(t.id) FROM u LEFT JOIN t ON t.a = u.a WHERE u.r < 3",
+    "SELECT count(*), sum(t.c) FROM u, t WHERE t.id = u.a AND u.r > 1 AND u.id < 6",
+];
+
+/// `(address, opcode, p1, p2)` of each instruction of `sql`'s program.
+async fn program(conn: &Connection, sql: &str) -> Vec<(i64, String, i64, i64)> {
+    let integer = |value: Option<&SqliteValue>| match value {
+        Some(SqliteValue::Integer(n)) => *n,
+        _ => -1,
+    };
+    conn.query(&format!("EXPLAIN {sql}"))
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| {
+            let values = row.values();
+            let opcode = match values.get(1) {
+                Some(SqliteValue::Text(op)) => op.to_string(),
+                _ => String::new(),
+            };
+            (integer(values.first()), opcode, integer(values.get(2)), integer(values.get(3)))
+        })
+        .collect()
+}
+
+#[test]
+fn join_lookups_test_outer_row_terms_first_and_match_sqlite() {
+    for indexed in [false, true] {
+        asupersync::test_utils::run_test(|| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("join_outer_row_filter.db");
+            let f = Connection::open(path.to_str().unwrap()).await.unwrap();
+            let r = rusqlite::Connection::open_in_memory().unwrap();
+            let indexes: &[&str] = if indexed { INDEXES } else { &[] };
+            for sql in SETUP.iter().chain(indexes) {
+                f.execute(sql).await.unwrap();
+                r.execute(sql, []).unwrap();
+            }
+            for sql in OUTER_ROW_FILTER_QUERIES {
+                assert_agree(&f, &r, sql, &[], &[]).await;
+            }
+            assert_agree(
+                &f,
+                &r,
+                "SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE u.r > ?1 ORDER BY u.id",
+                &[SqliteValue::Float(1.0)],
+                &[&1.0_f64],
+            )
+            .await;
+
+            // The outer-only term is decided before the inner table is sought.
+            let ops =
+                program(&f, "SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE u.r > 1").await;
+            let first = |name: &str| ops.iter().position(|(_, op, _, _)| op == name);
+            assert!(
+                matches!((first("IfNot"), first("SeekRowid")), (Some(test), Some(seek)) if test < seek),
+                "the outer row must be tested before the lookup: {ops:?}"
+            );
+        });
+    }
+}
+
 /// A replacement for the builtin `length`: every value is 7 long.
 struct SevenLong;
 

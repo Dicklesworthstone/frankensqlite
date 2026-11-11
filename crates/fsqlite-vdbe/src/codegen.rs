@@ -13882,6 +13882,28 @@ fn codegen_single_join_lookup_select(
         ctx,
     )?;
     b.resolve_label(next_left_label);
+    // bd-w4pr1.13.16: a WHERE term that reads only the outer table decides the
+    // outer row before the lookup. A row that fails it produces no output
+    // whether or not the join matches (a LEFT JOIN's null-extended row carries
+    // the same outer values), so its lookup is skipped. For an inner join the
+    // same holds for an ON term the lookup did not consume. The terms are
+    // tested again with the whole WHERE after the lookup, as before.
+    let outer_row_rejected = b.emit_label();
+    let mut outer_row_terms = Vec::new();
+    if let Some(where_expr) = where_clause {
+        collect_conjunctive_terms(where_expr, &mut outer_row_terms);
+    }
+    if matches!(plan.join_kind, fsqlite_ast::JoinKind::Inner) {
+        outer_row_terms.extend(plan.on_residual.iter().copied());
+    }
+    for term in outer_row_terms {
+        if expr_references_scan(term, right_table, right_alias) {
+            continue;
+        }
+        let cond_reg = b.alloc_reg();
+        emit_join_expr(b, term, cond_reg, &tables, ctx)?;
+        b.emit_jump_to_label(Opcode::IfNot, cond_reg, 1, outer_row_rejected, P4::None, 0);
+    }
     let left_join_match_reg = if matches!(plan.join_kind, fsqlite_ast::JoinKind::Left) {
         let reg = b.alloc_temp();
         b.emit_op(Opcode::Integer, 0, reg, 0, P4::None, 0);
@@ -14189,6 +14211,7 @@ fn codegen_single_join_lookup_select(
         b.resolve_label(skip_left_join_null_row);
     }
 
+    b.resolve_label(outer_row_rejected);
     emit_outer_loop_advance(b, &outer_loop, left_cursor, next_left_label, done_label);
     b.resolve_label(done_label);
     if let OuterLoop::IndexSeek { idx_cursor, .. } = outer_loop {
