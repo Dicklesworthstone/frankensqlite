@@ -795,6 +795,74 @@ impl ShmRegion {
         Ok(())
     }
 
+    /// Index of the first zero native-endian `u16` word among the `count`
+    /// words starting at `offset`, holding the local backing mutex once;
+    /// `None` when every word is nonzero.
+    ///
+    /// Words are read in ascending order with fixed-width loads at `ordering`
+    /// and no word after the first zero is read, so the answer is the one a
+    /// loop of [`Self::atomic_load_u16_ne`] calls gives when nothing stores to
+    /// the range meanwhile. This is not an atomic snapshot across words or
+    /// independent mappings.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrankenError::OutOfRange`] if the offset is not 2-byte
+    /// aligned or the range exceeds the visible or backing length. Empty
+    /// aligned ranges are allowed.
+    ///
+    /// # Panics
+    ///
+    /// Nonempty mmap ranges panic for `Release` or `AcqRel` ordering.
+    pub fn atomic_first_zero_u16_ne(
+        &self,
+        offset: usize,
+        count: usize,
+        ordering: Ordering,
+    ) -> Result<Option<usize>> {
+        #[cfg(not(unix))]
+        let _ = ordering;
+        if !offset.is_multiple_of(2) {
+            return Err(FrankenError::OutOfRange {
+                what: "SHM atomic u16 scan".to_owned(),
+                value: format!("unaligned offset={offset}"),
+            });
+        }
+        let width = count
+            .checked_mul(2)
+            .ok_or_else(|| FrankenError::OutOfRange {
+                what: "SHM atomic u16 scan".to_owned(),
+                value: format!("count={count}"),
+            })?;
+        match &self.backing {
+            ShmRegionBacking::Heap(data) => {
+                let guard = data
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let range =
+                    self.checked_range(offset, width, guard.len(), "SHM atomic u16 scan")?;
+                Ok(guard[range]
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .position(|word| *word == [0, 0]))
+            }
+            #[cfg(unix)]
+            ShmRegionBacking::Mmap(m) => {
+                self.checked_range(offset, width, m.len, "SHM atomic u16 scan")?;
+                let _guard = m
+                    .mutex
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // SAFETY: The complete aligned range was checked; the mapping
+                // and backing mutex span every load.
+                Ok((0..count).position(|index| {
+                    unsafe { atomic_u16_at(m, offset + index * 2) }.load(ordering) == 0
+                }))
+            }
+        }
+    }
+
     /// Atomically store a native-endian `u16` at the given byte offset.
     ///
     /// Uses the same backing and access protocol as [`Self::atomic_load_u16_ne`].
@@ -1492,10 +1560,69 @@ mod tests {
             .unwrap();
     }
 
+    /// The first-zero scan must answer what a loop of single loads answers,
+    /// for every start and length of a range with zeros at known places.
+    fn assert_atomic_first_zero_slot(region: &ShmRegion) {
+        let slots = [9_u16, 0, u16::MAX, 3, 0, 1, 2, 4];
+        for (index, value) in slots.into_iter().enumerate() {
+            region
+                .atomic_store_u16_ne(index * 2, value, Ordering::Release)
+                .unwrap();
+        }
+        for start in 0..=slots.len() {
+            for count in 0..=slots.len() - start {
+                let by_single_loads = (0..count).find(|&index| {
+                    region
+                        .atomic_load_u16_ne((start + index) * 2, Ordering::Acquire)
+                        .unwrap()
+                        == 0
+                });
+                assert_eq!(
+                    region
+                        .atomic_first_zero_u16_ne(start * 2, count, Ordering::Acquire)
+                        .unwrap(),
+                    by_single_loads,
+                    "start={start} count={count}"
+                );
+            }
+        }
+        // Spot checks a wrong scan direction or an off-by-one would fail.
+        let first_zero = |start: usize, count: usize| {
+            region
+                .atomic_first_zero_u16_ne(start * 2, count, Ordering::Acquire)
+                .unwrap()
+        };
+        assert_eq!(first_zero(0, 8), Some(1), "the first zero, not the last");
+        assert_eq!(first_zero(2, 6), Some(2), "an index within the range");
+        assert_eq!(first_zero(2, 2), None, "a zero past the range is not seen");
+        assert_eq!(first_zero(5, 3), None);
+        assert_eq!(first_zero(4, 0), None, "an empty range holds no zero");
+
+        for (offset, count) in [(1, 1), (region.len() - 2, 2), (0, usize::MAX)] {
+            assert!(matches!(
+                region.atomic_first_zero_u16_ne(offset, count, Ordering::Acquire),
+                Err(FrankenError::OutOfRange { .. })
+            ));
+        }
+        assert_eq!(
+            region
+                .atomic_first_zero_u16_ne(region.len(), 0, Ordering::Acquire)
+                .unwrap(),
+            None
+        );
+        // Leave the words as the other helpers expect to find them.
+        for index in 0..slots.len() {
+            region
+                .atomic_store_u16_ne(index * 2, 0, Ordering::Release)
+                .unwrap();
+        }
+    }
+
     #[test]
     fn test_shm_region_atomic_copy_words_and_bounds() {
         assert_atomic_copy_words_and_bounds(&ShmRegion::new(16));
         assert_atomic_clear_nonzero_words(&ShmRegion::new(16));
+        assert_atomic_first_zero_slot(&ShmRegion::new(16));
         let empty = ShmRegion::new(0);
         empty
             .atomic_copy_u32_ne(0, &mut [], Ordering::Acquire)
@@ -1616,6 +1743,7 @@ mod tests {
         assert!(region.is_mmap_backed());
         assert_atomic_copy_words_and_bounds(&region);
         assert_atomic_clear_nonzero_words(&region);
+        assert_atomic_first_zero_slot(&region);
         let shared = region.share();
         let cloned = region.clone();
         let end = region.len();

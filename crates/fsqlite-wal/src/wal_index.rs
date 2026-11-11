@@ -1004,28 +1004,56 @@ fn validate_clean_tail_append(segment: &ShmRegion, entries: &[(u32, u32, bool)])
                 detail: "WAL-index append would leave a frame gap".to_owned(),
             });
         }
-        let mut slot = usize::try_from(wal_index_hash_slot(page_number))
-            .map_err(|_| FrankenError::internal("WAL-index hash slot exceeds usize"))?;
-        let mut found = false;
-        for _ in 0..WAL_INDEX_HASH_SLOTS {
-            if !claimed.contains(&slot)
-                && segment
-                    .atomic_load_u16_ne(WAL_SHM_PAGE_ARRAY_BYTES + slot * 2, Ordering::Acquire)?
-                    == 0
-            {
-                claimed.push(slot);
-                found = true;
-                break;
-            }
-            slot = (slot + 1) % WAL_INDEX_HASH_SLOTS;
-        }
-        if !found {
+        let Some(slot) = first_empty_shared_hash_slot(segment, page_number, &claimed)? else {
             return Err(FrankenError::WalCorrupt {
                 detail: "WAL-index hash table has no empty slot".to_owned(),
             });
-        }
+        };
+        claimed.push(slot);
     }
     Ok(())
+}
+
+/// The slot a new mapping of `page_number` takes in a live region: the first
+/// empty hash slot at or after the page's own slot, wrapping once around the
+/// table, that is not in `claimed`. `None` when the table has no such slot.
+///
+/// Each stretch of the table is searched under one hold of the region mutex.
+/// Every mapping of one page chains from that page's slot, so the probe walks
+/// as many slots as the region holds frames of the page: about 80 on average
+/// for an insert load that commits each row, where loading each slot under
+/// its own hold cost 7,000 instructions per probe and a commit probes twice.
+/// The caller holds the WAL write lock, so no other writer changes a hash
+/// slot while the probe runs or before its answer is used.
+fn first_empty_shared_hash_slot(
+    segment: &ShmRegion,
+    page_number: u32,
+    claimed: &[usize],
+) -> Result<Option<usize>> {
+    let mut from = usize::try_from(wal_index_hash_slot(page_number))
+        .map_err(|_| FrankenError::internal("WAL-index hash slot exceeds usize"))?
+        % WAL_INDEX_HASH_SLOTS;
+    let mut remaining = WAL_INDEX_HASH_SLOTS;
+    while remaining > 0 {
+        let stretch = remaining.min(WAL_INDEX_HASH_SLOTS - from);
+        let Some(index) = segment.atomic_first_zero_u16_ne(
+            WAL_SHM_PAGE_ARRAY_BYTES + from * 2,
+            stretch,
+            Ordering::Acquire,
+        )?
+        else {
+            remaining -= stretch;
+            from = (from + stretch) % WAL_INDEX_HASH_SLOTS;
+            continue;
+        };
+        let slot = from + index;
+        if !claimed.contains(&slot) {
+            return Ok(Some(slot));
+        }
+        remaining -= index + 1;
+        from = (slot + 1) % WAL_INDEX_HASH_SLOTS;
+    }
+    Ok(None)
 }
 
 /// Clear unpublished mappings in a live region using fixed-width atomics.
@@ -1102,20 +1130,18 @@ pub fn append_shared_wal_index_entry(
             detail: "WAL-index append would leave a frame gap".to_owned(),
         });
     }
-    let mut slot = usize::try_from(wal_index_hash_slot(page_number))
-        .map_err(|_| FrankenError::internal("WAL-index hash slot exceeds usize"))?;
-    for _ in 0..WAL_INDEX_HASH_SLOTS {
-        let hash_offset = WAL_SHM_PAGE_ARRAY_BYTES + slot * 2;
-        if segment.atomic_load_u16_ne(hash_offset, Ordering::Acquire)? == 0 {
-            segment.atomic_store_u32_ne(page_offset, page_number, Ordering::Release)?;
-            segment.atomic_store_u16_ne(hash_offset, location.entry, Ordering::Release)?;
-            return Ok(());
-        }
-        slot = (slot + 1) % WAL_INDEX_HASH_SLOTS;
-    }
-    Err(FrankenError::WalCorrupt {
-        detail: "WAL-index hash table has no empty slot".to_owned(),
-    })
+    let Some(slot) = first_empty_shared_hash_slot(segment, page_number, &[])? else {
+        return Err(FrankenError::WalCorrupt {
+            detail: "WAL-index hash table has no empty slot".to_owned(),
+        });
+    };
+    segment.atomic_store_u32_ne(page_offset, page_number, Ordering::Release)?;
+    segment.atomic_store_u16_ne(
+        WAL_SHM_PAGE_ARRAY_BYTES + slot * 2,
+        location.entry,
+        Ordering::Release,
+    )?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3950,6 +3976,66 @@ mod tests {
             verdict(validate_append_on_captured_segment(&region, 0, 4, &one))
         );
         assert!(probed.contains("no empty slot"), "{probed}");
+    }
+
+    #[test]
+    fn test_first_empty_shared_hash_slot_probes_the_table_in_slot_order_once_around() {
+        // A page whose own slot is the table's last, so its probe wraps at
+        // once. 14 holds no slot the cases below touch.
+        let last = WAL_INDEX_HASH_SLOTS - 1;
+        let page = (1..=u32::try_from(WAL_INDEX_HASH_SLOTS).unwrap())
+            .find(|&page| usize::try_from(wal_index_hash_slot(page)).unwrap() == last)
+            .unwrap();
+        let region = region_with_prefix(&[11, 12, 13, 14]);
+        let fill = |slot: usize| {
+            region
+                .atomic_store_u16_ne(WAL_SHM_PAGE_ARRAY_BYTES + slot * 2, 1, Ordering::Release)
+                .unwrap();
+        };
+        // What loading one slot at a time from the page's own slot answers.
+        let by_single_loads = |claimed: &[usize]| {
+            (0..WAL_INDEX_HASH_SLOTS)
+                .map(|step| (last + step) % WAL_INDEX_HASH_SLOTS)
+                .find(|slot| {
+                    !claimed.contains(slot)
+                        && region
+                            .atomic_load_u16_ne(
+                                WAL_SHM_PAGE_ARRAY_BYTES + slot * 2,
+                                Ordering::Acquire,
+                            )
+                            .unwrap()
+                            == 0
+                })
+        };
+        let probe = |claimed: &[usize]| {
+            let answer = first_empty_shared_hash_slot(&region, page, claimed).unwrap();
+            assert_eq!(answer, by_single_loads(claimed), "claimed {claimed:?}");
+            answer
+        };
+
+        assert_eq!(probe(&[]), Some(last), "the page's own slot when empty");
+        assert_eq!(probe(&[last]), Some(0), "a claimed last slot wraps");
+        fill(last);
+        assert_eq!(probe(&[]), Some(0), "a taken last slot wraps to slot 0");
+        assert_eq!(probe(&[0]), Some(1));
+        fill(0);
+        fill(1);
+        assert_eq!(probe(&[]), Some(2));
+        assert_eq!(probe(&[2]), Some(3), "a claimed slot is passed over");
+        assert_eq!(probe(&[3, 2]), Some(4));
+
+        // Only the slot the probe reaches last stays empty: it is found, and
+        // claiming it leaves none. A probe that stops at the table's end, or
+        // goes around short of where it began, answers `None` to the first.
+        for slot in 2..last - 1 {
+            fill(slot);
+        }
+        assert_eq!(probe(&[]), Some(last - 1), "the slot before the page's own");
+        assert_eq!(probe(&[last - 1]), None);
+        fill(last - 1);
+        assert_eq!(probe(&[]), None, "a full table has no slot");
+        let full = append_shared_wal_index_entry(&region, 5, page).unwrap_err();
+        assert!(full.to_string().contains("no empty slot"), "{full}");
     }
 
     #[test]
