@@ -14121,112 +14121,10 @@ impl VdbeEngine {
                 // AggStep/AggFinal. Aggregate state is stored out-of-band and keyed
                 // by the accumulator register.
                 // AggStep1 is a single-argument fast-path with identical semantics.
+                // The hot lane runs these; this arm keeps the statement loop's
+                // match complete.
                 Opcode::AggStep | Opcode::AggStep1 => {
-                    let (func_name, agg_collation): (&str, Option<&str>) = match &op.p4 {
-                        P4::FuncName(name) => (name.as_str(), None),
-                        P4::FuncNameCollated(name, coll) => (name.as_str(), Some(coll.as_str())),
-                        _ => {
-                            return Err(FrankenError::Internal(
-                                "AggStep opcode missing P4::FuncName".to_owned(),
-                            ));
-                        }
-                    };
-
-                    let arg_count = i32::from(op.p5);
-                    let func_pc = pc;
-                    let func = if let Some(func) = self.aggregate_function_cache.get(&func_pc) {
-                        Arc::clone(func)
-                    } else {
-                        let registry = self.func_registry.as_ref().ok_or_else(|| {
-                            FrankenError::Internal(
-                                "AggStep opcode executed without function registry".to_owned(),
-                            )
-                        })?;
-                        let func =
-                            registry
-                                .find_aggregate(func_name, arg_count)
-                                .ok_or_else(|| {
-                                    FrankenError::Internal(format!(
-                                        "no such aggregate function: {func_name}/{arg_count}",
-                                    ))
-                                })?;
-                        self.aggregate_function_cache
-                            .insert(func_pc, Arc::clone(&func));
-                        func
-                    };
-
-                    let accum_reg = op.p3;
-                    let is_distinct = op.p1 != 0;
-                    let arg_count = usize::from(op.p5);
-                    // bd-6hoc8: an OP_CollSeq directly before this AggStep names
-                    // the register a builtin min()/max() sets when this row is not
-                    // its new extremum (SQLite's sqlite3SkipAccumulatorLoad), so
-                    // bare columns load only from the extremum row.
-                    let minmax_skip_reg = pc
-                        .checked_sub(1)
-                        .map(|prev| &ops[prev])
-                        .filter(|prev| prev.opcode == Opcode::CollSeq && prev.p1 != 0)
-                        .map(|prev| prev.p1);
-                    // Gather per-argument subtypes (parallel to args) so
-                    // subtype-aware aggregates embed a JSON-subtyped argument
-                    // rather than quoting it (bd-76x57). Cheap: `register_subtype`
-                    // short-circuits when no register carries a subtype.
-                    let arg_subtypes: smallvec::SmallVec<[u32; 4]> = (0..arg_count)
-                        .map(|offset| {
-                            Self::reg_with_offset(op.p2, offset)
-                                .and_then(|reg| self.register_subtype(reg))
-                                .unwrap_or(0)
-                        })
-                        .collect();
-                    let skipped = if op.p2 >= 0
-                        && (op.p2 as usize).saturating_add(arg_count) <= self.registers.len()
-                    {
-                        for offset in 0..arg_count {
-                            if let Some(reg) = Self::reg_with_offset(op.p2, offset) {
-                                self.materialize_make_record_sideband(reg);
-                            }
-                        }
-                        let start_idx = op.p2 as usize;
-                        let args = &self.registers[start_idx..start_idx + arg_count];
-                        Self::agg_step_with_args(
-                            &mut self.cold_state,
-                            &mut self.statement_cold_state,
-                            AggStepCall {
-                                accum_reg,
-                                is_distinct,
-                                func: &func,
-                                func_name,
-                                agg_collation,
-                                execution_cx: &self.execution_cx,
-                                args,
-                                arg_subtypes: &arg_subtypes,
-                                text_encoding: self.text_encoding,
-                                track_minmax_skip: minmax_skip_reg.is_some(),
-                            },
-                        )?
-                    } else {
-                        let args = self.collect_reg_range(op.p2, arg_count);
-                        let text_encoding = self.text_encoding;
-                        Self::agg_step_with_args(
-                            &mut self.cold_state,
-                            &mut self.statement_cold_state,
-                            AggStepCall {
-                                accum_reg,
-                                is_distinct,
-                                func: &func,
-                                func_name,
-                                agg_collation,
-                                execution_cx: &self.execution_cx,
-                                args: &args,
-                                arg_subtypes: &arg_subtypes,
-                                text_encoding,
-                                track_minmax_skip: minmax_skip_reg.is_some(),
-                            },
-                        )?
-                    };
-                    if skipped && let Some(skip_reg) = minmax_skip_reg {
-                        self.set_reg(skip_reg, SqliteValue::Integer(1));
-                    }
+                    self.execute_agg_step(ops, pc)?;
                     pc += 1;
                 }
 
@@ -15394,6 +15292,118 @@ impl VdbeEngine {
         self.get_reg(r).clone()
     }
 
+    /// `AggStep`/`AggStep1` at `ops[pc]`: fold the argument registers into the
+    /// aggregate whose accumulator is register `p3`.
+    #[allow(clippy::cast_sign_loss)]
+    fn execute_agg_step(&mut self, ops: &[VdbeOp], pc: usize) -> Result<()> {
+        let op = &ops[pc];
+        let (func_name, agg_collation): (&str, Option<&str>) = match &op.p4 {
+            P4::FuncName(name) => (name.as_str(), None),
+            P4::FuncNameCollated(name, coll) => (name.as_str(), Some(coll.as_str())),
+            _ => {
+                return Err(FrankenError::Internal(
+                    "AggStep opcode missing P4::FuncName".to_owned(),
+                ));
+            }
+        };
+
+        let arg_count = i32::from(op.p5);
+        let func_pc = pc;
+        let func = if let Some(func) = self.aggregate_function_cache.get(&func_pc) {
+            Arc::clone(func)
+        } else {
+            let registry = self.func_registry.as_ref().ok_or_else(|| {
+                FrankenError::Internal(
+                    "AggStep opcode executed without function registry".to_owned(),
+                )
+            })?;
+            let func = registry
+                .find_aggregate(func_name, arg_count)
+                .ok_or_else(|| {
+                    FrankenError::Internal(format!(
+                        "no such aggregate function: {func_name}/{arg_count}",
+                    ))
+                })?;
+            self.aggregate_function_cache
+                .insert(func_pc, Arc::clone(&func));
+            func
+        };
+
+        let accum_reg = op.p3;
+        let is_distinct = op.p1 != 0;
+        let arg_count = usize::from(op.p5);
+        // bd-6hoc8: an OP_CollSeq directly before this AggStep names
+        // the register a builtin min()/max() sets when this row is not
+        // its new extremum (SQLite's sqlite3SkipAccumulatorLoad), so
+        // bare columns load only from the extremum row.
+        let minmax_skip_reg = pc
+            .checked_sub(1)
+            .map(|prev| &ops[prev])
+            .filter(|prev| prev.opcode == Opcode::CollSeq && prev.p1 != 0)
+            .map(|prev| prev.p1);
+        // Gather per-argument subtypes (parallel to args) so
+        // subtype-aware aggregates embed a JSON-subtyped argument
+        // rather than quoting it (bd-76x57). Cheap: `register_subtype`
+        // short-circuits when no register carries a subtype.
+        let arg_subtypes: smallvec::SmallVec<[u32; 4]> = (0..arg_count)
+            .map(|offset| {
+                Self::reg_with_offset(op.p2, offset)
+                    .and_then(|reg| self.register_subtype(reg))
+                    .unwrap_or(0)
+            })
+            .collect();
+        let skipped = if op.p2 >= 0
+            && (op.p2 as usize).saturating_add(arg_count) <= self.registers.len()
+        {
+            for offset in 0..arg_count {
+                if let Some(reg) = Self::reg_with_offset(op.p2, offset) {
+                    self.materialize_make_record_sideband(reg);
+                }
+            }
+            let start_idx = op.p2 as usize;
+            let args = &self.registers[start_idx..start_idx + arg_count];
+            Self::agg_step_with_args(
+                &mut self.cold_state,
+                &mut self.statement_cold_state,
+                AggStepCall {
+                    accum_reg,
+                    is_distinct,
+                    func: &func,
+                    func_name,
+                    agg_collation,
+                    execution_cx: &self.execution_cx,
+                    args,
+                    arg_subtypes: &arg_subtypes,
+                    text_encoding: self.text_encoding,
+                    track_minmax_skip: minmax_skip_reg.is_some(),
+                },
+            )?
+        } else {
+            let args = self.collect_reg_range(op.p2, arg_count);
+            let text_encoding = self.text_encoding;
+            Self::agg_step_with_args(
+                &mut self.cold_state,
+                &mut self.statement_cold_state,
+                AggStepCall {
+                    accum_reg,
+                    is_distinct,
+                    func: &func,
+                    func_name,
+                    agg_collation,
+                    execution_cx: &self.execution_cx,
+                    args: &args,
+                    arg_subtypes: &arg_subtypes,
+                    text_encoding,
+                    track_minmax_skip: minmax_skip_reg.is_some(),
+                },
+            )?
+        };
+        if skipped && let Some(skip_reg) = minmax_skip_reg {
+            self.set_reg(skip_reg, SqliteValue::Integer(1));
+        }
+        Ok(())
+    }
+
     /// Run the opcode at `*pc` and the hot opcodes that follow it, without
     /// returning to the statement future between them.
     ///
@@ -15430,7 +15440,7 @@ impl VdbeEngine {
         let mut count = *opcode_count;
         loop {
             let ran = self.try_execute_hot_opcode_sync(
-                &ops[at],
+                ops,
                 &mut at,
                 collect_vdbe_metrics,
                 row_handler,
@@ -15469,12 +15479,13 @@ impl VdbeEngine {
     #[allow(clippy::inline_always)]
     fn try_execute_hot_opcode_sync(
         &mut self,
-        op: &VdbeOp,
+        ops: &[VdbeOp],
         pc: &mut usize,
         collect_vdbe_metrics: bool,
         row_handler: &mut Option<&mut ResultRowCallback<'_>>,
         borrowed_bindings: Option<&[SqliteValue]>,
     ) -> Result<bool> {
+        let op = &ops[*pc];
         match op.opcode {
             Opcode::Column => {
                 // A row whose payload is on the cursor's leaf page is read
@@ -15976,6 +15987,32 @@ impl VdbeEngine {
                 }
                 None => Ok(false),
             },
+            // The rowid of a storage cursor on a table leaf is in the cell the
+            // cursor stands on. Everything else `Rowid` serves (an index
+            // cursor, a virtual table, an in-memory cursor, a cursor at EOF)
+            // keeps its arm in `try_execute_hot_opcode_async`. A decline
+            // follows at most the stale-row refresh that arm starts with.
+            Opcode::Rowid => {
+                let Some(cursor) = self.storage_cursors.get_mut(&op.p1) else {
+                    return Ok(false);
+                };
+                if cursor.cursor.eof() {
+                    return Ok(false);
+                }
+                let Some(rowid) = try_storage_cursor_cached_rowid_local(cursor)? else {
+                    return Ok(false);
+                };
+                self.set_reg_fast(op.p2, SqliteValue::Integer(rowid));
+                *pc += 1;
+                Ok(true)
+            }
+            // An aggregate step never waits. Keeping it on this lane lets an
+            // aggregating scan run its whole row loop here.
+            Opcode::AggStep | Opcode::AggStep1 => {
+                self.execute_agg_step(ops, *pc)?;
+                *pc += 1;
+                Ok(true)
+            }
             _ => Ok(false),
         }
     }
