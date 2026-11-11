@@ -472,6 +472,53 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
   on path-identity probes; a single user-side term at 5% or more of a native profile of this
   commit's binary reopens it.
 
+## 2026-11-11 - WIN: a sorter row holds a short record and a one-column key inside itself (bd-reality-check-1022-llk6g.8)
+
+- Target: `create_index_int_300k` after the sorted bulk build (4.97x stock in this run) and every
+  sort of short records. Touched: `crates/fsqlite-vdbe/src/engine.rs` (`SorterRow`,
+  `SorterInsert`, `SorterData`, the run reader).
+- Ledger preflight: 2026-10-27 GH#504 (shared `Arc` sorter blobs measured nothing on GROUP BY;
+  retry only together with lower per-row dispatch cost, when the sorter copy is a visible share
+  of the profile) and 2026-05-06 "VDBE SorterRow and cursor-cache broad sweep" (narrow patches
+  only). Both conditions hold: the synchronous hot-opcode lanes landed on 2026-11-10, and the
+  profile in the entry below put 23% of the index build in `free` and as much again on first
+  touches of per-row heap blocks. The change is confined to the sorter row.
+- Change: a row's record is a `SmallVec<[u8; 23]>` and its decoded sort key a
+  `SmallVec<[SqliteValue; 1]>`, so a row with one key column and a record of at most 23 bytes
+  owns no heap block (it owned two). `SorterInsert` copies such a record into the row and hands
+  `MakeRecord` its buffer back, instead of keeping the buffer and making `MakeRecord` allocate
+  the next one; a longer record takes the buffer over as before. A one-column key is decoded
+  without an intermediate `Vec`.
+- Result, stock sqlite3 3.46.1 live, base 4c975163a, previous = the entry below (sha256
+  b6959f9f...), candidate sha256 e52e6de8...; 7 interleaved repetitions, A/A 0.95-1.04, load 14:
+  - `create_index_int_300k`: 0.456 s -> 0.265 s (4.97x -> 2.89x stock's 0.092 s); repetition
+    ranges 0.32-0.64 -> 0.24-0.31, no overlap. Base 1.525 s (16.6x).
+  - `group_by_1000_groups`: 1.214 s -> 0.666 s (5.50x -> 3.02x stock's 0.221 s); ranges 0.98-1.60
+    -> 0.61-0.76, no overlap. Base 1.148 s (5.20x).
+  - `order_by_text_limit10` 4.55x -> 4.61x and `window_row_number` 9.14x -> 8.99x: inside their
+    repetition ranges (a top-N heap, and a two-column key that still goes to the heap).
+  - the CREATE INDEX statement alone (`perf stat`, 300k rows, best of 2, stock's A/A 1.00):
+    1,000 distinct integers 1,677M -> 1,452M instructions (1.94x -> 1.68x stock), CPU 407 ->
+    199 ms (stock 74), peak RSS 86 -> 68 MB; unique scattered integers 1.79x -> 1.55x, CPU 387
+    -> 195 ms; text keys 2.69x -> 2.58x, CPU 455 -> 320 ms, RSS 92 -> 71 MB; `(a DESC, b)`
+    2.55x -> 2.51x, CPU 563 -> 513 ms.
+  - 3M rows, one run: 26.0G -> 23.5G instructions, 6.27 s -> 3.35 s, RSS 585 -> 414 MB for 1,000
+    distinct integers; 6.69 s -> 2.79 s for unique scattered integers (stock 0.94-1.35 s).
+- Tests: two engine unit tests (records of 5 to 45 bytes through an in-memory sort, and through
+  a spill of every row plus the merge, come back identical and in order, inline exactly when
+  they fit; `SorterInsert` leaves `MakeRecord`'s buffer in place for a short record and takes it
+  for a long one), the sorter's existing unit tests, and the stock-oracle ORDER BY, GROUP BY,
+  DISTINCT, compound-select and UTF-16 suites.
+- Still a loss: `create_index_int_300k` at 2.89x and `group_by_1000_groups` at 3.02x. A sample
+  profile of the 300k-row index build (taken with the entry above applied as well; it does not
+  change this path): 16% in the single-integer sort's in-place row permutation (a row is 96
+  bytes and each move is a random access), 2% in the pair sort itself, about 25% in the table
+  scan's opcodes, 25% in the kernel and 4% in WAL frame checksums; `free` is under 1%.
+- Retry conditions. Two key columns inline: when a two-key sort (a window's PARTITION BY plus
+  ORDER BY, a multi-column index build) is the row being worked and its profile shows the key
+  vector's allocation. A cheaper permutation in the single-integer sort (move rows in
+  destination-ordered blocks, or do not move them): met now, by the 16% above.
+
 ## 2026-11-11 - WIN: CREATE INDEX and REINDEX sort the index records and lay the pages out left to right (bd-reality-check-1022-llk6g.8)
 
 - Target: scorecard row `create_index_int_300k` (`CREATE INDEX m_a ON m(a)` over 300k rows, 1,000

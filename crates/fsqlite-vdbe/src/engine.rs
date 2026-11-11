@@ -1501,11 +1501,32 @@ impl MemCursor {
 #[derive(Debug, Clone)]
 struct SorterRow {
     /// Decoded sort-key columns (first `key_columns` values only).
-    values: Vec<SqliteValue>,
+    values: SorterKeyValues,
     /// Raw serialized record for output via `SorterData`.
-    blob: Vec<u8>,
+    blob: SorterBlob,
     /// Source-row order, used only to make bounded-heap ties stable.
     source_sequence: u64,
+}
+
+/// The longest record a sorter row holds inline.
+const SORTER_BLOB_INLINE_LEN: usize = 23;
+
+/// A sorter row's record. An index entry, a GROUP BY key or a DISTINCT value
+/// is usually a few bytes; those stay inside the row. A sorter of a million
+/// rows used to own a million small heap blocks for them, read and released in
+/// sorted (so random) order (bd-reality-check-1022-llk6g.8).
+type SorterBlob = smallvec::SmallVec<[u8; SORTER_BLOB_INLINE_LEN]>;
+
+/// A sorter row's decoded sort key. A one-column key stays inside the row.
+type SorterKeyValues = smallvec::SmallVec<[SqliteValue; 1]>;
+
+/// Copy a short record into the row, or take over a long one's allocation.
+fn sorter_blob_from_vec(record: Vec<u8>) -> SorterBlob {
+    if record.len() <= SORTER_BLOB_INLINE_LEN {
+        SorterBlob::from_slice(&record)
+    } else {
+        SorterBlob::from_vec(record)
+    }
 }
 
 /// Cursor state for sorter opcodes (`SorterOpen`, `SorterInsert`, ...).
@@ -1799,8 +1820,16 @@ impl SorterCursor {
 
     /// Estimate the memory footprint of a sorter row.
     fn estimate_row_size(values: &[SqliteValue], blob: &[u8]) -> usize {
-        // Base overhead per Vec element + per-value overhead + blob size
-        let mut size = std::mem::size_of::<SorterRow>() + values.len() * 24 + blob.len();
+        // The row itself, then whatever it keeps outside itself: a key of
+        // more than one column, a record too long to hold inline, and the
+        // bytes of TEXT and BLOB keys.
+        let mut size = std::mem::size_of::<SorterRow>();
+        if values.len() > 1 {
+            size += std::mem::size_of_val(values);
+        }
+        if blob.len() > SORTER_BLOB_INLINE_LEN {
+            size += blob.len();
+        }
         for val in values {
             match val {
                 SqliteValue::Text(s) => size += s.len(),
@@ -1811,8 +1840,17 @@ impl SorterCursor {
         size
     }
 
-    /// Insert a row and spill to disk if memory exceeds the threshold.
+    /// Insert a row given as plain vectors. See [`Self::insert_record`].
+    #[cfg(test)]
     fn insert_row(&mut self, values: Vec<SqliteValue>, blob: Vec<u8>) -> Result<()> {
+        self.insert_record(
+            SorterKeyValues::from_vec(values),
+            sorter_blob_from_vec(blob),
+        )
+    }
+
+    /// Insert a row and spill to disk if memory exceeds the threshold.
+    fn insert_record(&mut self, values: SorterKeyValues, blob: SorterBlob) -> Result<()> {
         if self.top_n_limit == Some(0) {
             return Ok(());
         }
@@ -2267,10 +2305,10 @@ impl RunIterator {
         }
     }
 
-    fn current_values(&self) -> Option<&Vec<SqliteValue>> {
+    fn current_values(&self) -> Option<&[SqliteValue]> {
         match self {
             Self::File { current, .. } | Self::Memory { current, .. } => {
-                current.as_ref().map(|r| &r.values)
+                current.as_ref().map(|r| r.values.as_slice())
             }
         }
     }
@@ -2308,8 +2346,8 @@ impl RunIterator {
                         )
                         .ok_or_else(|| FrankenError::internal("sorter run: malformed record"))?;
                         *current = Some(SorterRow {
-                            values,
-                            blob: buf,
+                            values: SorterKeyValues::from_vec(values),
+                            blob: sorter_blob_from_vec(buf),
                             source_sequence: 0,
                         });
                     }
@@ -15376,13 +15414,22 @@ impl VdbeEngine {
         let sideband_active = self.make_record_lookaside.sideband_is_armed_for(record_reg);
         let blob = if sideband_active {
             self.make_record_lookaside.disarm();
-            self.make_record_lookaside.take_buf()
+            let record = self.make_record_lookaside.take_buf();
+            if record.len() <= SORTER_BLOB_INLINE_LEN {
+                // A short record is copied into the row, and MakeRecord gets
+                // its buffer back for the next row.
+                let blob = SorterBlob::from_slice(&record);
+                self.make_record_lookaside.replace_cleared_buf(record);
+                blob
+            } else {
+                SorterBlob::from_vec(record)
+            }
         } else {
             // Move the record value out of the register instead of
             // cloning it; MakeRecord sideband consumers above avoid
             // this path because take_reg would materialize the blob.
             let record = self.take_reg(record_reg);
-            record_blob_bytes(&record).to_vec()
+            SorterBlob::from_slice(record_blob_bytes(&record))
         };
         if let Some(sorter) = self.sorters.get_mut(&cursor_id) {
             // bd-9pi70: sort keys must be decoded in the DB storage
@@ -15397,7 +15444,19 @@ impl VdbeEngine {
             // decode the full record and retain the sort-key prefix.
             #[allow(clippy::disallowed_methods)] // UTF-8 branch only
             let key_values = if matches!(sorter.text_encoding, TextEncoding::Utf8) {
-                fsqlite_types::record::parse_record_prefix(&blob, sorter.key_columns)
+                // A one-column key is decoded straight into the row. A record
+                // with no column at all has no first column and takes the
+                // prefix decode, as before.
+                let single_key = if sorter.key_columns == 1 {
+                    fsqlite_types::record::parse_record_column(&blob, 0)
+                } else {
+                    None
+                };
+                match single_key {
+                    Some(key) => Some(smallvec::smallvec![key]),
+                    None => fsqlite_types::record::parse_record_prefix(&blob, sorter.key_columns)
+                        .map(SorterKeyValues::from_vec),
+                }
             } else {
                 let mut all_values = Vec::new();
                 fsqlite_types::record::parse_record_into_with_encoding(
@@ -15407,13 +15466,13 @@ impl VdbeEngine {
                 )
                 .map(|()| {
                     all_values.truncate(sorter.key_columns);
-                    all_values
+                    SorterKeyValues::from_vec(all_values)
                 })
             }
             .ok_or_else(|| FrankenError::DatabaseCorrupt {
                 detail: "malformed record in SorterInsert".to_owned(),
             })?;
-            sorter.insert_row(key_values, blob)?;
+            sorter.insert_record(key_values, blob)?;
         }
         Ok(())
     }
@@ -15547,7 +15606,7 @@ impl VdbeEngine {
         let value = if let Some(sorter) = self.sorters.get(&cursor_id) {
             if let Some(pos) = sorter.position {
                 if let Some(row) = sorter.rows.get(pos) {
-                    SqliteValue::Blob(row.blob.clone().into())
+                    SqliteValue::Blob(Arc::from(row.blob.as_slice()))
                 } else {
                     SqliteValue::Null
                 }
@@ -37918,6 +37977,108 @@ mod tests {
             .map(|r| r.values[0].to_integer())
             .collect();
         assert_eq!(values, vec![50, 40, 30, 20, 10]);
+    }
+
+    /// A sorter row keeps a record of up to `SORTER_BLOB_INLINE_LEN` bytes and
+    /// a one-column key inside itself; a longer record stays on the heap.
+    /// Sorting in memory, and spilling every row to a run file and merging,
+    /// have to hand back the same records in the same order at every record
+    /// length around that boundary.
+    #[test]
+    fn test_sorter_rows_keep_short_records_inline_through_sort_spill_and_merge() {
+        // Records of 5 to 45 bytes. The key falls as the record grows, so the
+        // sorted order is the reverse of the insertion order.
+        let inputs: Vec<(i64, Vec<u8>)> = (0..=40_usize)
+            .map(|padding| {
+                let key = 1_000 - i64::try_from(padding).unwrap();
+                let record = serialize_record(&[
+                    SqliteValue::Integer(key),
+                    SqliteValue::Text("p".repeat(padding).into()),
+                ]);
+                (key, record)
+            })
+            .collect();
+        assert!(inputs.first().unwrap().1.len() < SORTER_BLOB_INLINE_LEN);
+        assert!(inputs.last().unwrap().1.len() > SORTER_BLOB_INLINE_LEN);
+        let expected: Vec<Vec<u8>> = inputs.iter().rev().map(|(_, r)| r.clone()).collect();
+
+        for spill_every_row in [false, true] {
+            let mut sorter = SorterCursor::new(1, vec![SortKeyOrder::Asc], Vec::new());
+            if spill_every_row {
+                sorter.spill_threshold = 1;
+            }
+            for (key, record) in &inputs {
+                sorter
+                    .insert_row(vec![SqliteValue::Integer(*key)], record.clone())
+                    .expect("insert should succeed");
+            }
+            sorter.sort().expect("sort should succeed");
+
+            let sorted: Vec<Vec<u8>> = sorter.rows.iter().map(|row| row.blob.to_vec()).collect();
+            assert_eq!(sorted, expected, "spill_every_row {spill_every_row}");
+            for row in &sorter.rows {
+                assert_eq!(
+                    row.blob.spilled(),
+                    row.blob.len() > SORTER_BLOB_INLINE_LEN,
+                    "a {}-byte record, spill_every_row {spill_every_row}",
+                    row.blob.len()
+                );
+                assert!(
+                    !row.values.spilled(),
+                    "a one-column key belongs inside the row"
+                );
+            }
+        }
+    }
+
+    /// `SorterInsert` copies a short record into the sorter row and gives
+    /// `MakeRecord` its buffer back, so a scan that feeds a sorter does not
+    /// allocate a record buffer for every row. A record too long for the row
+    /// takes the buffer over instead.
+    #[test]
+    fn test_sorter_insert_returns_the_record_buffer_for_a_short_record() {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        for (payload_len, buffer_returned) in [(4_usize, true), (64, false)] {
+            let payload = "x".repeat(payload_len);
+            let mut b = ProgramBuilder::new();
+            let end = b.emit_label();
+            let empty = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let r_value = b.alloc_reg();
+            let r_record = b.alloc_reg();
+            let r_sorted = b.alloc_reg();
+            b.emit_op(Opcode::SorterOpen, 0, 1, 0, P4::None, 0);
+            b.emit_op(Opcode::String8, 0, r_value, 0, P4::Str(payload.clone()), 0);
+            b.emit_op(Opcode::MakeRecord, r_value, 1, r_record, P4::None, 0);
+            b.emit_op(Opcode::SorterInsert, 0, r_record, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::SorterSort, 0, 0, empty, P4::None, 0);
+            b.emit_op(Opcode::SorterData, 0, r_sorted, 0, P4::None, 0);
+            b.emit_op(Opcode::ResultRow, r_sorted, 1, 0, P4::None, 0);
+            b.resolve_label(empty);
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+            let program = b.finish().expect("program should build");
+
+            let mut engine = VdbeEngine::new(program.register_count());
+            let rows = execute_program_with_engine(&mut engine, &program);
+            assert_eq!(rows.len(), 1, "payload of {payload_len} bytes");
+            assert_eq!(
+                decode_record(&rows[0][0]).expect("sorted record should decode"),
+                vec![SqliteValue::Text(payload.into())]
+            );
+            assert!(
+                engine.make_record_lookaside.is_empty(),
+                "SorterInsert consumes the record either way"
+            );
+            assert_eq!(
+                engine.make_record_lookaside.capacity() > 0,
+                buffer_returned,
+                "payload of {payload_len} bytes"
+            );
+        }
     }
 
     #[test]
