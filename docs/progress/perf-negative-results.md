@@ -87,6 +87,53 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-11 - WIN: Column decodes heap-free values from the leaf page instead of a copied prefix (bd-w4pr1.13.4)
+
+- Target: every scan that reads integer, real, NULL or short-text columns of a rowid table.
+  `SELECT count(*), sum(a) FROM t WHERE a > 500` over 1M file-backed rows cost 2,577 user
+  instructions per row with the hot-lane loop and its `AggStep` / `Rowid` lanes in place
+  (bd-w4pr1.13.7, same date), against stock's 500. Touched: `crates/fsqlite-vdbe/src/engine.rs`
+  (`PageRowView`, `try_read_column_in_place`, `try_column_to_reg_in_place`) and
+  `crates/fsqlite-btree/src/cursor.rs` (`current_local_table_row_span`, `current_page_span`).
+- Evidence before (frame-pointer profile of that scan, self time): `column_to_reg_direct_finish`
+  7.6%, `try_ensure_storage_cursor_row_layout_local` 7.2%, `finish_storage_cursor_row_layout` 5.8%,
+  `local_leaf_table_cell` 5.2%, `begin_storage_cursor_row_layout` 4.0%, `pool_return_reusable`
+  2.2%. Per row the lane parsed the cell to test that the payload was local, parsed it again to
+  copy up to 256 bytes into `payload_buf`, dropped and rebuilt the decode scratch, decoded the
+  column and cloned it into a per-row cache.
+- Change: for a table-leaf cell stored whole on its leaf, a second lane keeps where the payload
+  lies on the page and the record header's column table under the cursor's position stamp, and
+  decodes NULL, integers, reals and UTF-8 text of at most 23 bytes straight into the register.
+  Longer text, blobs, columns past the record's width and every read while metrics are collected
+  stay on the copying lane, whose decode cache makes a second read of the column a reference-count
+  bump. The two lanes share no state, so a decline costs the copying lane nothing it had.
+- Result, user instructions in millions per statement (`perf stat`), stock sqlite3 3.46.1 live in
+  the same run, every answer equal to stock's; before sha256 8734e227..., after 3768e624...:
+  scan_filter_agg 2,577 -> 1,984 (-23%; 5.15x -> 3.97x stock's 500), order_by_text_limit10
+  3,399 -> 2,840 (-16%), group_by_1000_groups 5,670 -> 5,150 (-9%), rowid_lookups_200k
+  9,863 -> 8,843 (-10%), update_10pct 1,826 -> 1,641 (-10%), join_1M_to_pk_1000 16,133 -> 15,063
+  (-7%). The bead predicted -8% or more on scan with a kill line at 3%. Wall time for the whole
+  stack is in the bd-w4pr1.13.7 entry.
+- Keepers: the lane-boundary oracle now also runs text on both sides of the 23-byte limit with
+  every column read twice per row, a file written by stock SQLite (NULL in the rowid-alias slot)
+  read and then mutated, and rows one column short of the table that hold their rowid in the alias
+  slot; a unit test pins which reads the lane takes and declines, and that a decline leaves the
+  register and the copying lane's buffers untouched.
+- What the position stamp has to cover, checked before relying on it: a move (page and cell), a
+  write through the cursor (`row_image_epoch`), and any change to the cursor's page image
+  (`PageData::as_bytes_mut` issues a new image token on every mutable access).
+- Found while building the stock-written fixture, not caused by this change and present at
+  58d05bff3: a REAL column whose value stock stored as an integer reads back as an integer
+  (`c / 2` on `291.0` gives 145, `typeof(c)` gives `integer`). The keeper leaves that column out of
+  its stock-written case and says why.
+- Still open on this seam: the view parses every serial type of the header for each row
+  (`prepare_for_record_prefix`, 7% of the scan after this change) where stock stops at the column
+  it needs, and the cell is located from scratch for each row (`local_leaf_table_cell_span`, 5%).
+- Retry condition for widening the lane to long text and blobs: only with a profile of a workload
+  that reads such a column once per row showing the copying lane's `payload_buf` copy plus decode
+  cache above 10% of the row; a second read of the same column on the same row must not allocate
+  twice.
+
 ## 2026-11-11 - WIN (series): an autocommit statement stops re-deriving what its own last commit wrote (bd-ih8ak, eleven cuts and one fix; one cut on bd-5310l)
 
 - Target: every statement that is its own transaction on a file database (scorecard

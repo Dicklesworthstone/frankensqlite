@@ -264,6 +264,9 @@ impl Clone for SmallTextRepr {
 }
 
 impl SmallText {
+    /// Longest text, in bytes, that is stored inline without a heap allocation.
+    pub const INLINE_CAPACITY: usize = SMALL_TEXT_INLINE_CAP;
+
     /// Create a new SmallText from a string slice.
     #[inline]
     pub fn new(s: &str) -> Self {

@@ -4520,6 +4520,27 @@ impl CursorBackend {
         }
     }
 
+    /// The current row's rowid and where its payload lies on the leaf page,
+    /// for a table-leaf cell stored whole on its leaf; `None` otherwise.
+    #[inline]
+    fn current_local_table_row_span(&self) -> Result<Option<(i64, std::ops::Range<usize>)>> {
+        match self {
+            Self::Mem(c) => c.current_local_table_row_span(),
+            Self::Txn(c) => c.current_local_table_row_span(),
+            Self::TimeTravel(c) => c.current_local_table_row_span(),
+        }
+    }
+
+    /// Bytes `span` of the page the cursor stands on.
+    #[inline]
+    fn current_page_span(&self, span: std::ops::Range<usize>) -> Option<&[u8]> {
+        match self {
+            Self::Mem(c) => c.current_page_span(span),
+            Self::Txn(c) => c.current_page_span(span),
+            Self::TimeTravel(c) => c.current_page_span(span),
+        }
+    }
+
     async fn payload(&self, cx: &Cx) -> Result<Vec<u8>> {
         match self {
             Self::Mem(c) => c.payload(cx).await,
@@ -4830,6 +4851,29 @@ impl CursorBackend {
 /// across cursors, statements, or transactions.
 type RowDecodeScratch = fsqlite_types::record::RecordDecodeScratch;
 
+/// A table row read where it lies on its leaf page, for the `Column` hot lane.
+///
+/// The copying lane keeps a prefix of the row in `payload_buf`, its layout and
+/// its decoded values in `row_decode`. For a row stored whole on its leaf this
+/// view keeps only where the payload is on the page and the record header's
+/// column table; values are decoded from the page each time they are read.
+///
+/// It describes the row image `stamp` names and is rebuilt whenever the
+/// cursor's position stamp differs, which covers a move, a write through the
+/// cursor and a replaced page image. It shares nothing with the copying
+/// lane's state, which checks its own stamp the same way, so either lane can
+/// serve any read of a row.
+#[derive(Debug, Default)]
+struct PageRowView {
+    stamp: Option<CursorPositionStamp>,
+    rowid: i64,
+    payload: std::ops::Range<usize>,
+    /// Column table of the record header; no decoded values are kept in it.
+    layout: RowDecodeScratch,
+    /// Whether the record stores the INTEGER PRIMARY KEY slot, once asked.
+    includes_rowid_alias: Option<bool>,
+}
+
 #[derive(Debug)]
 struct StorageCursor {
     cursor: CursorBackend,
@@ -4865,6 +4909,8 @@ struct StorageCursor {
     cur_vals_buf: Vec<SqliteValue>,
     /// Cursor-owned decode/materialization scratch for the current row image.
     row_decode: RowDecodeScratch,
+    /// The current row as the in-place `Column` lane last read it.
+    page_row: PageRowView,
     /// Cache the cursor's physical position to avoid redundant payload reads.
     last_position_stamp: Option<CursorPositionStamp>,
     /// Last rowid known to have been inserted on the right edge via this cursor.
@@ -10849,6 +10895,7 @@ impl VdbeEngine {
                                 target_vals_buf: Vec::new(),
                                 cur_vals_buf: Vec::new(),
                                 row_decode: RowDecodeScratch::default(),
+                                page_row: PageRowView::default(),
                                 last_position_stamp: None,
                                 last_successful_insert_rowid: None,
                                 last_rightmost_unique_index_prefix: None,
@@ -15489,10 +15536,14 @@ impl VdbeEngine {
         match op.opcode {
             Opcode::Column => {
                 // A row whose payload is on the cursor's leaf page is read
-                // here; anything else is left for `execute_column_hot`.
+                // here, from the page when the value needs no heap and
+                // through the copying lane otherwise; anything else is left
+                // for `execute_column_hot`.
                 #[allow(clippy::cast_sign_loss)]
                 let col_idx = op.p2 as usize;
-                if self.try_column_to_reg_direct_local(op.p1, col_idx, op.p3)? {
+                if self.try_column_to_reg_in_place(op.p1, col_idx, op.p3)?
+                    || self.try_column_to_reg_direct_local(op.p1, col_idx, op.p3)?
+                {
                     *pc += 1;
                     Ok(true)
                 } else {
@@ -17310,6 +17361,7 @@ impl VdbeEngine {
                 target_vals_buf: Vec::new(),
                 cur_vals_buf: Vec::new(),
                 row_decode: RowDecodeScratch::default(),
+                page_row: PageRowView::default(),
                 last_position_stamp: None,
                 cached_rowid: None,
                 payload_includes_rowid_alias: None,
@@ -18138,6 +18190,45 @@ impl VdbeEngine {
         self.column_to_reg_direct_finish(cursor_id, col_idx, payload_idx, target, refresh_state)
     }
 
+    /// A column read served from the leaf page the row lies on
+    /// ([`try_read_column_in_place`]). `Ok(false)` leaves the read, and the
+    /// cursor state the other lanes use, untouched.
+    ///
+    /// The copying lane's decode-cache counters describe that lane, so with
+    /// metrics on every read stays there.
+    #[allow(clippy::cast_sign_loss)]
+    fn try_column_to_reg_in_place(
+        &mut self,
+        cursor_id: i32,
+        col_idx: usize,
+        target: i32,
+    ) -> Result<bool> {
+        if self.collect_vdbe_metrics {
+            return Ok(false);
+        }
+        let wr_storage_order = (!self.wr_storage_order_by_root_page.is_empty())
+            .then(|| Arc::clone(&self.wr_storage_order_by_root_page));
+        let text_encoding = self.text_encoding;
+        let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) else {
+            return Ok(false);
+        };
+        let Some(value) =
+            try_read_column_in_place(cursor, col_idx, wr_storage_order.as_deref(), text_encoding)?
+        else {
+            return Ok(false);
+        };
+        match value {
+            // An integer over an integer is written in place; the register
+            // file is sized for the program, and anything outside it takes
+            // the growing write.
+            SqliteValue::Integer(v) if target >= 0 && (target as usize) < self.registers.len() => {
+                self.set_reg_int(target, v);
+            }
+            other => self.set_reg_fast(target, other),
+        }
+        Ok(true)
+    }
+
     /// Second half of a direct column read: decode record slot `payload_idx`
     /// of the current row, whose layout already covers it, and write it to
     /// register `target`.
@@ -18876,6 +18967,7 @@ impl VdbeEngine {
                             target_vals_buf: Vec::new(),
                             cur_vals_buf: Vec::new(),
                             row_decode: RowDecodeScratch::default(),
+                            page_row: PageRowView::default(),
                             last_position_stamp: None,
                             cached_rowid: None,
                             payload_includes_rowid_alias: None,
@@ -19039,6 +19131,7 @@ impl VdbeEngine {
                             target_vals_buf: Vec::new(),
                             cur_vals_buf: Vec::new(),
                             row_decode: RowDecodeScratch::default(),
+                            page_row: PageRowView::default(),
                             last_position_stamp: None,
                             cached_rowid: None,
                             payload_includes_rowid_alias: None,
@@ -19239,6 +19332,7 @@ impl VdbeEngine {
                 target_vals_buf: Vec::new(),
                 cur_vals_buf: Vec::new(),
                 row_decode: RowDecodeScratch::default(),
+                page_row: PageRowView::default(),
                 last_position_stamp: None,
                 cached_rowid: None,
                 payload_includes_rowid_alias: None,
@@ -20096,7 +20190,12 @@ async fn storage_cursor_payload_includes_rowid_alias(
     if let Some(cached) = cursor.payload_includes_rowid_alias {
         return Ok(cached);
     }
-    let (mut includes, rowid_slot) = payload_rowid_alias_header_verdict(cursor, ipk_col_idx);
+    let (mut includes, rowid_slot) = payload_rowid_alias_header_verdict(
+        &cursor.row_decode,
+        ipk_col_idx,
+        cursor.table_column_count,
+        cursor.first_not_null_non_ipk_col,
+    );
     if let Some(slot) = rowid_slot {
         let slot_end = rowid_alias_slot_end(&slot, ipk_col_idx)?;
         ensure_storage_cursor_row_layout(cursor, slot_end, collect_vdbe_metrics).await?;
@@ -20119,7 +20218,12 @@ fn try_storage_cursor_payload_includes_rowid_alias_local(
     if let Some(cached) = cursor.payload_includes_rowid_alias {
         return Ok(Some(cached));
     }
-    let (mut includes, rowid_slot) = payload_rowid_alias_header_verdict(cursor, ipk_col_idx);
+    let (mut includes, rowid_slot) = payload_rowid_alias_header_verdict(
+        &cursor.row_decode,
+        ipk_col_idx,
+        cursor.table_column_count,
+        cursor.first_not_null_non_ipk_col,
+    );
     if let Some(slot) = rowid_slot {
         let slot_end = rowid_alias_slot_end(&slot, ipk_col_idx)?;
         if try_ensure_storage_cursor_row_layout_local(cursor, slot_end, collect_vdbe_metrics)?
@@ -20142,20 +20246,20 @@ fn try_storage_cursor_payload_includes_rowid_alias_local(
 /// short payload whose slot holds an integer, the slot to compare with the
 /// row's rowid.
 fn payload_rowid_alias_header_verdict(
-    cursor: &StorageCursor,
+    row_decode: &RowDecodeScratch,
     ipk_col_idx: usize,
+    table_column_count: Option<usize>,
+    first_not_null_non_ipk_col: Option<usize>,
 ) -> (bool, Option<ColumnOffset>) {
     let includes = payload_includes_rowid_alias_without_rowid(
-        &cursor.row_decode,
+        row_decode,
         ipk_col_idx,
-        cursor.table_column_count,
-        cursor.first_not_null_non_ipk_col,
+        table_column_count,
+        first_not_null_non_ipk_col,
     );
     if !includes
-        && cursor
-            .table_column_count
-            .is_some_and(|table_cols| cursor.row_decode.column_count() < table_cols)
-        && let Some(slot) = cursor.row_decode.column_offset(ipk_col_idx).copied()
+        && table_column_count.is_some_and(|table_cols| row_decode.column_count() < table_cols)
+        && let Some(slot) = row_decode.column_offset(ipk_col_idx).copied()
         && matches!(
             classify_serial_type(slot.serial_type),
             SerialTypeClass::Integer | SerialTypeClass::Zero | SerialTypeClass::One
@@ -21138,6 +21242,117 @@ fn try_ensure_storage_cursor_row_layout_local(
             return Ok(Some(state));
         }
     }
+}
+
+/// Read declared column `col_idx` of the current row from where the row lies
+/// on its leaf page, without copying the payload.
+///
+/// `None` leaves the read to the copying lane: the row is not a table-leaf
+/// cell stored whole on its leaf, the column is past the record's width, the
+/// decoded value would live on the heap, or the record is malformed in a way
+/// that lane reports. Values kept on the heap stay with the copying lane
+/// because its decode cache turns a second read of the column on the same row
+/// into a reference-count bump instead of a second allocation.
+///
+/// Only `cursor.page_row` is written. The copying lane's state is neither
+/// read nor changed, so a `None` hands that lane the cursor as it would have
+/// found it.
+fn try_read_column_in_place(
+    cursor: &mut StorageCursor,
+    col_idx: usize,
+    wr_storage_order: Option<&HashMap<i32, Vec<usize>>>,
+    text_encoding: TextEncoding,
+) -> Result<Option<SqliteValue>> {
+    let Some(stamp) = cursor.cursor.position_stamp() else {
+        return Ok(None);
+    };
+    let view = &mut cursor.page_row;
+    if view.stamp != Some(stamp) {
+        view.stamp = None;
+        let Some((rowid, payload)) = cursor.cursor.current_local_table_row_span()? else {
+            return Ok(None);
+        };
+        let Some(bytes) = cursor.cursor.current_page_span(payload.clone()) else {
+            return Ok(None);
+        };
+        if view.layout.prepare_for_record_prefix(bytes).is_none() {
+            return Ok(None);
+        }
+        view.rowid = rowid;
+        view.payload = payload;
+        view.includes_rowid_alias = None;
+        view.stamp = Some(stamp);
+    }
+
+    let ipk_col_idx = cursor.ipk_col_idx;
+    let includes_rowid_alias = match (ipk_col_idx, view.includes_rowid_alias) {
+        (None, _) => false,
+        (Some(_), Some(includes)) => includes,
+        (Some(ipk), None) => {
+            let (mut includes, rowid_slot) = payload_rowid_alias_header_verdict(
+                &view.layout,
+                ipk,
+                cursor.table_column_count,
+                cursor.first_not_null_non_ipk_col,
+            );
+            if let Some(slot) = rowid_slot {
+                // A short record whose slot holds an integer stores the alias
+                // exactly when that integer is the row's rowid.
+                let Some(bytes) = cursor.cursor.current_page_span(view.payload.clone()) else {
+                    return Ok(None);
+                };
+                if column_payload_end(&slot).is_none_or(|end| end > bytes.len()) {
+                    return Ok(None);
+                }
+                includes = matches!(
+                    fsqlite_types::record::decode_numeric_column_from_offset(bytes, &slot),
+                    Some(fsqlite_types::record::NumericColumnValue::Integer(v)) if v == view.rowid
+                );
+            }
+            view.includes_rowid_alias = Some(includes);
+            includes
+        }
+    };
+
+    if ipk_col_idx == Some(col_idx) {
+        return Ok(Some(SqliteValue::Integer(view.rowid)));
+    }
+    let payload_idx = storage_payload_column_index(
+        col_idx,
+        ipk_col_idx,
+        includes_rowid_alias,
+        wr_storage_order,
+        cursor.root_page,
+    );
+    let Some(col) = view.layout.column_offset(payload_idx) else {
+        return Ok(None);
+    };
+    match classify_serial_type(col.serial_type) {
+        SerialTypeClass::Null
+        | SerialTypeClass::Zero
+        | SerialTypeClass::One
+        | SerialTypeClass::Integer
+        | SerialTypeClass::Float => {}
+        SerialTypeClass::Text
+            if text_encoding == TextEncoding::Utf8
+                && usize::try_from(col.value_len)
+                    .is_ok_and(|len| len <= SmallText::INLINE_CAPACITY) => {}
+        SerialTypeClass::Text | SerialTypeClass::Blob | SerialTypeClass::Reserved => {
+            return Ok(None);
+        }
+    }
+    let Some(bytes) = cursor.cursor.current_page_span(view.payload.clone()) else {
+        return Ok(None);
+    };
+    Ok(
+        fsqlite_types::record::decode_column_from_offset_reuse_with_encoding_shared(
+            bytes,
+            col,
+            None,
+            text_encoding,
+            false,
+        ),
+    )
 }
 
 /// How a row-layout pass starts.
@@ -24529,6 +24744,105 @@ mod tests {
         assert_eq!(write_invalidations, 0);
 
         set_vdbe_metrics_enabled(prev_metrics_enabled);
+    }
+
+    #[test]
+    fn test_in_place_column_lane_serves_heap_free_values_and_leaves_the_rest() {
+        let wide = "wide text that is longer than the inline limit";
+        let mut db = MemDatabase::new();
+        let root = db.create_table(5);
+        {
+            let table = db.get_table_mut(root).expect("table should exist");
+            table.insert(
+                1,
+                vec![
+                    SqliteValue::Integer(41),
+                    SqliteValue::Text("short".into()),
+                    SqliteValue::Text(wide.into()),
+                    SqliteValue::Float(1.5),
+                    SqliteValue::Null,
+                ],
+            );
+            table.insert(
+                2,
+                vec![
+                    SqliteValue::Integer(-7),
+                    SqliteValue::Text("other".into()),
+                    SqliteValue::Text(wide.into()),
+                    SqliteValue::Float(2.5),
+                    SqliteValue::Blob(vec![0, 255].into()),
+                ],
+            );
+        }
+
+        let mut engine = VdbeEngine::new(4);
+        engine.enable_storage_cursors(true);
+        engine.set_database(db);
+        engine.set_reject_mem_fallback(false);
+        assert!(
+            run_async(engine.open_storage_cursor(0, root, false))
+                .expect("storage cursor open should not error")
+        );
+        engine.cursor_root_pages.insert(0, root);
+        {
+            let sc = engine.storage_cursors.get_mut(&0).unwrap();
+            assert!(run_async(sc.cursor.first(&sc.cx)).expect("cursor should rewind"));
+        }
+
+        // Integer, short text, real and NULL are decoded from the page. The
+        // copying lane's buffers stay as they were: empty.
+        assert!(engine.try_column_to_reg_in_place(0, 0, 1).unwrap());
+        assert_eq!(engine.get_reg(1), &SqliteValue::Integer(41));
+        assert!(engine.try_column_to_reg_in_place(0, 1, 2).unwrap());
+        assert_eq!(engine.get_reg(2), &SqliteValue::Text("short".into()));
+        assert!(engine.try_column_to_reg_in_place(0, 3, 2).unwrap());
+        assert_eq!(engine.get_reg(2), &SqliteValue::Float(1.5));
+        assert!(engine.try_column_to_reg_in_place(0, 4, 2).unwrap());
+        assert_eq!(engine.get_reg(2), &SqliteValue::Null);
+        {
+            let sc = engine.storage_cursors.get(&0).unwrap();
+            assert!(sc.page_row.stamp.is_some());
+            assert!(sc.payload_buf.is_empty());
+            assert!(sc.row_decode.is_empty());
+            assert!(sc.last_position_stamp.is_none());
+        }
+
+        // Text past the inline limit and a column past the record's width are
+        // declined with the target register untouched; the copying lane then
+        // serves the text, and the in-place lane still serves its columns.
+        engine.set_reg_int(3, 99);
+        assert!(!engine.try_column_to_reg_in_place(0, 2, 3).unwrap());
+        assert!(!engine.try_column_to_reg_in_place(0, 9, 3).unwrap());
+        assert_eq!(engine.get_reg(3), &SqliteValue::Integer(99));
+        assert!(engine.try_column_to_reg_direct_local(0, 2, 3).unwrap());
+        assert_eq!(engine.get_reg(3), &SqliteValue::Text(wide.into()));
+        assert!(engine.try_column_to_reg_in_place(0, 0, 1).unwrap());
+        assert_eq!(engine.get_reg(1), &SqliteValue::Integer(41));
+
+        // A move to the next row is seen through the position stamp.
+        {
+            let sc = engine.storage_cursors.get_mut(&0).unwrap();
+            assert!(run_async(sc.cursor.next(&sc.cx)).expect("cursor should advance"));
+        }
+        assert!(engine.try_column_to_reg_in_place(0, 0, 1).unwrap());
+        assert_eq!(engine.get_reg(1), &SqliteValue::Integer(-7));
+        assert!(engine.try_column_to_reg_in_place(0, 1, 2).unwrap());
+        assert_eq!(engine.get_reg(2), &SqliteValue::Text("other".into()));
+        // A blob is the copying lane's.
+        assert!(!engine.try_column_to_reg_in_place(0, 4, 3).unwrap());
+
+        // With metrics on, the decode-cache counters describe every read, so
+        // every read stays on the copying lane.
+        engine.collect_vdbe_metrics = true;
+        assert!(!engine.try_column_to_reg_in_place(0, 0, 1).unwrap());
+        engine.collect_vdbe_metrics = false;
+
+        // At EOF there is no row to read in place.
+        {
+            let sc = engine.storage_cursors.get_mut(&0).unwrap();
+            assert!(!run_async(sc.cursor.next(&sc.cx)).expect("cursor should reach EOF"));
+        }
+        assert!(!engine.try_column_to_reg_in_place(0, 0, 1).unwrap());
     }
 
     #[test]

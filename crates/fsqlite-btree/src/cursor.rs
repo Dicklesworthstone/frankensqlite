@@ -11297,6 +11297,19 @@ impl<P: PageWriter> BtCursor<P> {
         entry: &'a StackEntry,
         idx: u16,
     ) -> Result<Option<(i64, &'a [u8])>> {
+        Ok(self
+            .local_leaf_table_cell_span(entry, idx)?
+            .map(|(rowid, payload)| (rowid, &entry.usable_bytes()[payload])))
+    }
+
+    /// Where table-leaf cell `idx` keeps its payload on `entry`'s page, with
+    /// the cell's rowid. `None` when the page is not a table leaf or the
+    /// payload spills to overflow pages. The range is within the usable page.
+    fn local_leaf_table_cell_span(
+        &self,
+        entry: &StackEntry,
+        idx: u16,
+    ) -> Result<Option<(i64, std::ops::Range<usize>)>> {
         if entry.header.page_type != BtreePageType::LeafTable {
             return Ok(None);
         }
@@ -11372,7 +11385,7 @@ impl<P: PageWriter> BtCursor<P> {
 
         #[allow(clippy::cast_possible_wrap)]
         let rowid = rowid_raw as i64;
-        Ok(Some((rowid, &page[payload_offset..local_end])))
+        Ok(Some((rowid, payload_offset..local_end)))
     }
 
     fn local_leaf_table_rowid_and_payload<'a>(
@@ -11451,6 +11464,33 @@ impl<P: PageWriter> BtCursor<P> {
             return Ok(false);
         };
         self.local_leaf_table_payload_prefix_into(top, top.cell_idx, max_prefix_bytes, buf)
+    }
+
+    /// The current row when it is a table-leaf cell stored whole on its leaf
+    /// page: its rowid and where its payload lies on that page.
+    ///
+    /// `None` covers everything
+    /// [`Self::current_row_has_local_table_payload`] reports as `false`. The
+    /// range is for [`Self::current_page_span`] and holds for as long as
+    /// [`Self::position_stamp`] returns the stamp it had at this call.
+    pub fn current_local_table_row_span(&self) -> Result<Option<(i64, std::ops::Range<usize>)>> {
+        if self.at_eof {
+            return Ok(None);
+        }
+        let Some(top) = self.stack.last() else {
+            return Ok(None);
+        };
+        self.local_leaf_table_cell_span(top, top.cell_idx)
+    }
+
+    /// Bytes `span` of the page the cursor stands on, or `None` when the
+    /// cursor is not on a page or the page is shorter than that.
+    #[must_use]
+    pub fn current_page_span(&self, span: std::ops::Range<usize>) -> Option<&[u8]> {
+        if self.at_eof {
+            return None;
+        }
+        self.stack.last()?.usable_bytes().get(span)
     }
 
     /// Synchronous fast path of [`BtreeCursorOps::rowid`]: the rowid of the

@@ -14,6 +14,17 @@
 //! - index cursors, WITHOUT ROWID tables and records wider than 64 columns;
 //! - rows that change between local and overflow storage.
 //!
+//! bd-w4pr1.13.4 added a `Column` lane that decodes a value from the leaf
+//! page when it needs no heap, and leaves the rest to the copying lane. Its
+//! boundaries are covered here as well:
+//!
+//! - text on both sides of the inline limit, with every column read twice
+//!   per row, beside NULL, 0, 1, each integer width, reals and blobs;
+//! - a file written by stock SQLite, whose records store a NULL in the
+//!   rowid-alias slot, read and then mutated;
+//! - rows one column short of the table that hold their own rowid in the
+//!   alias slot (the shape old FrankenSQLite files have).
+//!
 //! A lane that skipped or repeated a cell at a page boundary, read a stale
 //! row image, or mis-mapped a column past the rowid alias fails here.
 
@@ -266,14 +277,145 @@ async fn run_case(file_backed: bool, failures: &mut Vec<String>) {
     let setup = setup_sql();
     frank.execute_batch(&setup).await.expect("frank setup");
     stock.execute_batch(&setup).expect("stock setup");
+    let edge_setup = inline_edge_setup();
+    frank.execute_batch(&edge_setup).await.expect("frank edge setup");
+    stock.execute_batch(&edge_setup).expect("stock edge setup");
 
     compare(&format!("[{mode}] loaded"), &frank, &stock, &T1_QUERIES, failures).await;
     compare(&format!("[{mode}] loaded"), &frank, &stock, &OTHER_QUERIES, failures).await;
+    compare(&format!("[{mode}] loaded"), &frank, &stock, &INLINE_EDGE_QUERIES, failures).await;
     for (step, mutation) in mutations().iter().enumerate() {
         frank.execute_batch(mutation).await.expect("frank mutation");
         stock.execute_batch(mutation).expect("stock mutation");
         let label = format!("[{mode}] after mutation {step}");
         compare(&label, &frank, &stock, &T1_QUERIES, failures).await;
+        compare(&label, &frank, &stock, &OTHER_QUERIES[..4], failures).await;
+    }
+    frank.close().await.expect("close");
+}
+
+/// Text on both sides of the 23-byte inline limit, each column read twice per
+/// row, next to values of every class the in-place lane decodes.
+const INLINE_EDGE_QUERIES: [&str; 4] = [
+    "SELECT id, s, length(s), s || '|', n, r, n + 0, typeof(z) FROM edge ORDER BY id",
+    "SELECT s, s, id, id, n, n FROM edge WHERE length(s) BETWEEN 22 AND 25 ORDER BY id",
+    "SELECT count(*), sum(n), sum(r), sum(length(s)), count(z) FROM edge WHERE s >= 'a'",
+    "SELECT z, r, n, s, id FROM edge WHERE id % 7 = 3 ORDER BY id DESC",
+];
+
+fn inline_edge_setup() -> String {
+    let rows: Vec<String> = (1..=600_i64)
+        .map(|i| {
+            // Lengths 0..=40 cycle through the inline limit; `n` cycles
+            // through NULL, 0, 1 and every integer width, both signs. The
+            // 8-byte values stay small enough that `sum(n)` does not overflow.
+            let len = usize::try_from(i % 41).unwrap();
+            let n = match i % 9 {
+                0 => "NULL".to_owned(),
+                1 => "0".to_owned(),
+                2 => "1".to_owned(),
+                3 => "-1".to_owned(),
+                4 => (i * 100).to_string(),
+                5 => (-i * 40_000).to_string(),
+                6 => (i * 3_000_000).to_string(),
+                7 => (-i * 5_000_000_000).to_string(),
+                _ => (150_000_000_000_000 + i).to_string(),
+            };
+            let z = if i % 5 == 0 { "X'00FF'" } else { "NULL" };
+            format!(
+                "({i}, '{}', {n}, {}.25, {z})",
+                "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ"[..len].to_owned(),
+                i - 300
+            )
+        })
+        .collect();
+    format!(
+        "CREATE TABLE edge(id INTEGER PRIMARY KEY, s TEXT, n INTEGER, r REAL, z);BEGIN;{}COMMIT;",
+        inserts("edge", &rows)
+    )
+}
+
+/// Rows of a rowid-alias table that are one column short of the table and
+/// hold their own rowid in the alias slot: the shape old FrankenSQLite files
+/// have after ALTER TABLE ADD COLUMN. Built with stock through
+/// `writable_schema`, since no current writer produces it.
+const LEGACY_QUERIES: [&str; 4] = [
+    "SELECT a, id, b, c FROM legacy ORDER BY id",
+    "SELECT b, a FROM legacy WHERE id IN (1, 7, 200) ORDER BY id",
+    "SELECT count(*), sum(id), sum(a), count(b), count(c) FROM legacy",
+    "SELECT id, b FROM legacy WHERE a % 5 = 2 ORDER BY id DESC",
+];
+
+fn legacy_setup(stock: &rusqlite::Connection) {
+    let rows: Vec<String> = (1..=200_i64)
+        .map(|i| format!("({}, {i}, 'b-{i}')", i * 3))
+        .collect();
+    stock
+        .execute_batch(&format!(
+            "CREATE TABLE legacy(a INTEGER, id INTEGER, b TEXT);BEGIN;{}COMMIT;\
+             PRAGMA writable_schema=ON;\
+             UPDATE sqlite_master \
+                SET sql='CREATE TABLE legacy(a INTEGER, id INTEGER PRIMARY KEY, b TEXT, c TEXT)' \
+              WHERE name='legacy';\
+             PRAGMA writable_schema=OFF;",
+            inserts("legacy", &rows)
+        ))
+        .expect("legacy setup");
+}
+
+/// [`T1_QUERIES`] without the REAL column `c`.
+///
+/// Stock stores an integral value of a REAL column as an integer and turns
+/// it back into a real when it is read. FrankenSQLite does not do that
+/// conversion yet, so on a stock-written file `c` reads back as an integer
+/// whichever lane serves it. That difference is not a lane boundary, and
+/// leaving `c` out keeps it from masking one here.
+const STOCK_FILE_T1_QUERIES: [&str; 9] = [
+    "SELECT count(*), sum(a), sum(length(b)), count(d) FROM t1",
+    "SELECT id, a, length(b), substr(b, 1, 8), typeof(d), hex(d) FROM t1 WHERE a > 900 ORDER BY id",
+    "SELECT b, a, id FROM t1 WHERE id IN (1, 5, 10, 97, 194, 970, 2910, 3000) ORDER BY id",
+    "SELECT id, length(b), d FROM t1 ORDER BY id LIMIT 400 OFFSET 2000",
+    "SELECT a, count(*), min(id), max(id), sum(length(b)) FROM t1 GROUP BY a ORDER BY a",
+    "SELECT id FROM t1 WHERE b LIKE 'row-12%' ORDER BY id",
+    "SELECT rowid, id, a, d FROM t1 WHERE id BETWEEN 90 AND 100 ORDER BY rowid DESC",
+    "SELECT d, id FROM t1 WHERE a = 77 ORDER BY id",
+    "SELECT count(*), sum(t1.a), sum(length(t1.b)) FROM t3 JOIN t1 ON t1.id = t3.a",
+];
+
+/// A file written by stock SQLite, which stores a NULL in the rowid-alias
+/// slot of every record, read and then mutated by FrankenSQLite. Stock runs
+/// the same statements on its own copy of the file.
+async fn run_stock_written_case(failures: &mut Vec<String>) {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let seed = dir.path().join("seed.db");
+    {
+        let writer = rusqlite::Connection::open(&seed).expect("stock seed open");
+        writer.execute_batch(&setup_sql()).expect("stock seed setup");
+        writer
+            .execute_batch(&inline_edge_setup())
+            .expect("stock seed edge setup");
+        legacy_setup(&writer);
+    }
+    let frank_path = dir.path().join("frank.db");
+    let stock_path = dir.path().join("stock.db");
+    std::fs::copy(&seed, &frank_path).expect("copy seed for frank");
+    std::fs::copy(&seed, &stock_path).expect("copy seed for stock");
+
+    let frank = Connection::open(frank_path.to_str().expect("utf-8 path"))
+        .await
+        .expect("open stock-written file");
+    let stock = rusqlite::Connection::open(&stock_path).expect("stock open");
+
+    let label = "[stock-written file] loaded";
+    compare(label, &frank, &stock, &STOCK_FILE_T1_QUERIES, failures).await;
+    compare(label, &frank, &stock, &OTHER_QUERIES, failures).await;
+    compare(label, &frank, &stock, &INLINE_EDGE_QUERIES, failures).await;
+    compare(label, &frank, &stock, &LEGACY_QUERIES, failures).await;
+    for (step, mutation) in mutations().iter().enumerate() {
+        frank.execute_batch(mutation).await.expect("frank mutation");
+        stock.execute_batch(mutation).expect("stock mutation");
+        let label = format!("[stock-written file] after mutation {step}");
+        compare(&label, &frank, &stock, &STOCK_FILE_T1_QUERIES, failures).await;
         compare(&label, &frank, &stock, &OTHER_QUERIES[..4], failures).await;
     }
     frank.close().await.expect("close");
@@ -286,6 +428,7 @@ fn scans_and_column_reads_match_sqlite_on_both_sides_of_every_sync_lane_boundary
         for file_backed in [true, false] {
             run_case(file_backed, &mut failures).await;
         }
+        run_stock_written_case(&mut failures).await;
         assert!(
             failures.is_empty(),
             "{} queries differ from SQLite:\n{}",
