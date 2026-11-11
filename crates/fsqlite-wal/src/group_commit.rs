@@ -35,6 +35,7 @@
 //!   flushing (default: 1ms). Bounded to ensure tail latency.
 
 use crate::WalGenerationIdentity;
+use fsqlite_types::PageData;
 use fsqlite_types::sync_primitives::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -174,7 +175,7 @@ pub struct TransactionFrameBatch {
     /// horizon, the batch must fail with BUSY_SNAPSHOT instead of appending a
     /// stale page image that could hide the other writer's committed rows.
     pub conflict_snapshot: Option<TransactionConflictSnapshot>,
-    /// Full-page hashes captured from the submitting transaction's pinned
+    /// Full-page images captured from the submitting transaction's pinned
     /// snapshot, keyed by exact page number.
     ///
     /// These are used only when an external checkpoint replaces/resets the WAL
@@ -182,7 +183,7 @@ pub struct TransactionFrameBatch {
     /// does not prove a write conflict: a stock SQLite reader can checkpoint
     /// an otherwise unchanged WAL. The eventual flusher may admit that benign
     /// transition only when every conflict candidate has a baseline and the
-    /// latest committed full-page image hashes identically.
+    /// latest committed full-page image is identical to it.
     pub conflict_page_baselines: Vec<TransactionConflictPageBaseline>,
     /// Lane-local staging context captured before group-commit submission.
     pub context: TransactionFrameBatchContext,
@@ -233,13 +234,18 @@ pub struct TransactionConflictSnapshot {
     pub snapshot_db_size: u32,
 }
 
-/// Snapshot-bound full-page hash for one cross-process conflict candidate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Snapshot-bound full-page image for one cross-process conflict candidate.
+///
+/// The image is kept, not a hash of it: its one consumer runs only when the
+/// WAL generation changed under the transaction, and hashing every candidate
+/// at every commit cost 16,000 instructions per 4 KiB page to prepare for a
+/// comparison that almost never happens. A shared page is kept by reference.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransactionConflictPageBaseline {
-    /// Exact 1-based database page number associated with `page_hash`.
+    /// Exact 1-based database page number associated with `page`.
     pub page_number: u32,
-    /// BLAKE3 hash of the complete page image visible to the transaction.
-    pub page_hash: [u8; 32],
+    /// The complete page image visible to the transaction.
+    pub page: PageData,
 }
 
 /// Lane-local staging context attached to a transaction batch.
@@ -304,7 +310,7 @@ impl TransactionFrameBatch {
         self
     }
 
-    /// Attach snapshot-bound full-page hashes for WAL-generation transitions.
+    /// Attach snapshot-bound full-page images for WAL-generation transitions.
     #[must_use]
     pub fn with_conflict_page_baselines(
         mut self,

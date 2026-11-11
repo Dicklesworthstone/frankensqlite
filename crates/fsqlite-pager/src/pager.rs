@@ -23209,12 +23209,17 @@ where
         pages
     }
 
-    /// Capture exact, snapshot-bound full-page hashes for conflict candidates.
+    /// Capture exact, snapshot-bound full-page images for conflict candidates.
     ///
     /// The transaction read cache is the only safe source here: it is pinned
     /// to this handle's begin-time visibility and is never refreshed in place.
     /// A candidate absent from that cache deliberately has no baseline; the
     /// cross-generation validator must then fail closed with `BusySnapshot`.
+    ///
+    /// Each baseline is a clone of the cached page, taken here: an immutable
+    /// snapshot of its bytes as they are now (a reference to them when the
+    /// page is already shared), so nothing the transaction does afterwards
+    /// changes what the validator compares against.
     fn conflict_page_baselines(
         &self,
         conflict_pages: &[PageNumber],
@@ -23223,13 +23228,12 @@ where
         conflict_pages
             .iter()
             .filter_map(|page_no| {
-                txn_read_cache.get(page_no).map(|page| {
-                    let page_hash = *blake3::hash(page.as_bytes()).as_bytes();
-                    TransactionConflictPageBaseline {
+                txn_read_cache
+                    .get(page_no)
+                    .map(|page| TransactionConflictPageBaseline {
                         page_number: page_no.get(),
-                        page_hash,
-                    }
-                })
+                        page: page.clone(),
+                    })
             })
             .collect()
     }

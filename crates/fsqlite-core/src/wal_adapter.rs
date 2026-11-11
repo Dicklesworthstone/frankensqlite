@@ -4331,14 +4331,18 @@ where
             return Vec::new();
         }
 
-        let mut baselines = HashMap::<u32, [u8; 32]>::new();
+        // Images are compared byte for byte: this is the only place a
+        // baseline is consulted, so nothing is hashed on the commits that
+        // never get here.
+        let mut baselines = HashMap::<u32, &[u8]>::new();
         let mut ambiguous_baselines = HashSet::<u32>::new();
         for baseline in page_baselines {
             if baseline.page_number == 0 {
                 continue;
             }
-            if let Some(previous) = baselines.insert(baseline.page_number, baseline.page_hash)
-                && previous != baseline.page_hash
+            let image = baseline.page.as_bytes();
+            if let Some(previous) = baselines.insert(baseline.page_number, image)
+                && previous != image
             {
                 ambiguous_baselines.insert(baseline.page_number);
             }
@@ -4399,7 +4403,7 @@ where
 
         let mut conflicts = Vec::new();
         for &page_number in &candidates {
-            let Some(expected_hash) = baselines.get(&page_number).copied() else {
+            let Some(expected_image) = baselines.get(&page_number).copied() else {
                 if committed_page_count > 0 && page_number > committed_page_count {
                     continue;
                 }
@@ -4430,8 +4434,7 @@ where
                     }
                 }
             };
-            let current_hash = *blake3::hash(&current_page).as_bytes();
-            if current_hash != expected_hash {
+            if current_page.as_slice() != expected_image {
                 conflicts.push(page_number);
             }
         }
@@ -7704,6 +7707,15 @@ mod tests {
         page
     }
 
+    /// The baseline a transaction that saw `image` as page `page_number`
+    /// submits with its commit.
+    fn conflict_baseline(page_number: u32, image: &[u8]) -> TransactionConflictPageBaseline {
+        TransactionConflictPageBaseline {
+            page_number,
+            page: fsqlite_types::PageData::from_vec(image.to_vec()),
+        }
+    }
+
     fn test_frame_payload_digest(
         page_number: u32,
         page_data: &[u8],
@@ -10912,10 +10924,7 @@ mod tests {
         let cx = test_cx();
         let vfs = MemoryVfs::new();
         let (mut backend, snapshot, page_two) = make_generation_transition_backend(&vfs, &cx);
-        let baseline = TransactionConflictPageBaseline {
-            page_number: 2,
-            page_hash: *blake3::hash(&page_two).as_bytes(),
-        };
+        let baseline = conflict_baseline(2, &page_two);
 
         let conflicts = backend
             .conflicting_pages_since_snapshot(&cx, snapshot, &[2], &[baseline])
@@ -10937,15 +10946,12 @@ mod tests {
         let cx = test_cx();
         let vfs = MemoryVfs::new();
         let (mut backend, snapshot, page_two) = make_generation_transition_backend(&vfs, &cx);
-        let baseline = TransactionConflictPageBaseline {
-            page_number: 2,
-            page_hash: *blake3::hash(&page_two).as_bytes(),
-        };
+        let baseline = conflict_baseline(2, &page_two);
 
         // First check populates the cached verification descriptor: main-db
         // page 2 still matches the baseline, so there is no conflict.
         let first = backend
-            .conflicting_pages_since_snapshot(&cx, snapshot, &[2], &[baseline])
+            .conflicting_pages_since_snapshot(&cx, snapshot, &[2], &[baseline.clone()])
             .expect("first (cache-populating) generation-change verification");
         assert!(
             first.is_empty(),
@@ -10988,10 +10994,7 @@ mod tests {
                 changed_page_two,
             ],
         );
-        let baseline = TransactionConflictPageBaseline {
-            page_number: 2,
-            page_hash: *blake3::hash(&page_two).as_bytes(),
-        };
+        let baseline = conflict_baseline(2, &page_two);
 
         let conflicts = backend
             .conflicting_pages_since_snapshot(&cx, snapshot, &[2], &[baseline])
@@ -11005,15 +11008,47 @@ mod tests {
         let vfs = MemoryVfs::new();
         let (mut backend, snapshot, page_two) = make_generation_transition_backend(&vfs, &cx);
         append_replacement_wal_page(&vfs, &cx, 2, &sample_page(0x44), 2);
-        let baseline = TransactionConflictPageBaseline {
-            page_number: 2,
-            page_hash: *blake3::hash(&page_two).as_bytes(),
-        };
+        let baseline = conflict_baseline(2, &page_two);
 
         let conflicts = backend
             .conflicting_pages_since_snapshot(&cx, snapshot, &[2], &[baseline])
             .expect("replacement WAL page must take precedence over identical main page");
         assert_eq!(conflicts, vec![2]);
+    }
+
+    #[test]
+    fn test_generation_change_rejects_a_baseline_that_differs_in_one_byte() {
+        // The whole image is compared: a transaction whose view of page 2
+        // differed from the committed page in its first or its last byte
+        // only must conflict, where an image that is equal passes.
+        let last = usize::try_from(PAGE_SIZE).expect("page size fits usize") - 1;
+        for changed_byte in [0, last] {
+            let cx = test_cx();
+            let vfs = MemoryVfs::new();
+            let (mut backend, snapshot, page_two) = make_generation_transition_backend(&vfs, &cx);
+            let mut seen = page_two.clone();
+            seen[changed_byte] ^= 0x01;
+
+            let conflicts = backend
+                .conflicting_pages_since_snapshot(
+                    &cx,
+                    snapshot,
+                    &[2],
+                    &[conflict_baseline(2, &seen)],
+                )
+                .expect("validate a one-byte difference");
+            assert_eq!(conflicts, vec![2], "byte {changed_byte}");
+
+            let conflicts = backend
+                .conflicting_pages_since_snapshot(
+                    &cx,
+                    snapshot,
+                    &[2],
+                    &[conflict_baseline(2, &page_two)],
+                )
+                .expect("validate the equal image");
+            assert!(conflicts.is_empty(), "byte {changed_byte}: equal image");
+        }
     }
 
     #[test]
@@ -11034,14 +11069,8 @@ mod tests {
         let vfs = MemoryVfs::new();
         let (mut backend, snapshot, page_two) = make_generation_transition_backend(&vfs, &cx);
         let baselines = [
-            TransactionConflictPageBaseline {
-                page_number: 2,
-                page_hash: *blake3::hash(&page_two).as_bytes(),
-            },
-            TransactionConflictPageBaseline {
-                page_number: 2,
-                page_hash: *blake3::hash(&sample_page(0x55)).as_bytes(),
-            },
+            conflict_baseline(2, &page_two),
+            conflict_baseline(2, &sample_page(0x55)),
         ];
 
         let conflicts = backend
@@ -11062,10 +11091,7 @@ mod tests {
                 u16::try_from(PAGE_SIZE).expect("page size fits u16"),
             )],
         );
-        let baseline = TransactionConflictPageBaseline {
-            page_number: 2,
-            page_hash: *blake3::hash(&page_two).as_bytes(),
-        };
+        let baseline = conflict_baseline(2, &page_two);
 
         let conflicts = backend
             .conflicting_pages_since_snapshot(&cx, snapshot, &[2], &[baseline])
@@ -11079,10 +11105,7 @@ mod tests {
         let vfs = MemoryVfs::new();
         let (mut backend, snapshot, page_two) = make_generation_transition_backend(&vfs, &cx);
         write_main_db_pages(&vfs, &cx, &[sqlite_page_one(8192), page_two.clone()]);
-        let baseline = TransactionConflictPageBaseline {
-            page_number: 2,
-            page_hash: *blake3::hash(&page_two).as_bytes(),
-        };
+        let baseline = conflict_baseline(2, &page_two);
 
         let conflicts = backend
             .conflicting_pages_since_snapshot(&cx, snapshot, &[2], &[baseline])
