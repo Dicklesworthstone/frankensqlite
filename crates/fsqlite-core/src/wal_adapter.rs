@@ -4465,8 +4465,17 @@ where
     }
 
     /// An append moves the WAL tail, so the next preflight re-derives it.
+    ///
+    /// The append about to run starts from the baseline this gate already
+    /// proved: no other writer can append under the gate and this backend has
+    /// not since, so the inner adapter's own refresh before staging would
+    /// repeat [`WalBackend::preflight_native_append`] against an unchanged
+    /// WAL. Without a proven baseline the inner adapter refreshes as before.
     fn forget_append_gate_baseline(&mut self) {
         if let Some(proof) = &mut self.append_gate_proof {
+            if proof.baseline {
+                self.inner.refresh_before_append = false;
+            }
             proof.baseline = false;
         }
     }
