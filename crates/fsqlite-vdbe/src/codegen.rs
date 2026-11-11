@@ -11932,8 +11932,49 @@ fn join_aggregate_arg_supported(
             expr,
             ..
         } => join_aggregate_arg_supported(expr, tables, min_or_max),
+        Expr::FunctionCall {
+            name,
+            args,
+            distinct: false,
+            order_by,
+            filter: None,
+            over: None,
+            ..
+        } if order_by.is_empty() => join_scalar_call_args(name, args).is_some_and(|args| {
+            args.iter()
+                .all(|arg| join_aggregate_arg_supported(arg, tables, min_or_max))
+        }),
         _ => false,
     }
+}
+
+/// The arguments of `name(args)` when the join loop can emit the call as one
+/// `PureFunc` (`sum(length(u.name))`, bd-w4pr1.13.6): a scalar function
+/// registered at this arity, deterministic, and not one whose result depends
+/// on its arguments' collations, which the join emitter does not pass to the
+/// call. The engine resolves the name in the same registry when it runs the
+/// call, so an application's replacement of a builtin is what executes.
+fn join_scalar_call_args<'a>(name: &str, args: &'a fsqlite_ast::FunctionArgs) -> Option<&'a [Expr]> {
+    let fsqlite_ast::FunctionArgs::List(list) = args else {
+        return None;
+    };
+    let arity = i32::try_from(list.len()).ok()?;
+    u16::try_from(list.len()).ok()?;
+    if is_aggregate_function_call(name, args)
+        || scalar_consumes_argument_collation_for_codegen(&name.to_ascii_uppercase(), arity)
+    {
+        return None;
+    }
+    FUNCTION_REGISTRY
+        .with(|registry| {
+            registry.borrow().as_ref().is_some_and(|registry| {
+                registry.resolve_scalar(name, arity).is_some_and(|resolved| {
+                    resolved.query_constancy() == ScalarQueryConstancy::Constant
+                        && !resolved.consumes_argument_collation()
+                })
+            })
+        })
+        .then_some(list.as_slice())
 }
 
 /// Compile an implicit aggregate over a lookup join or a chain of unique
@@ -15357,6 +15398,36 @@ fn emit_join_expr(
             b.emit_jump_to_label(Opcode::IsNull, inner_reg, 0, skip, P4::None, 0);
             b.emit_op(Opcode::Integer, val_if_not_null, target, 0, P4::None, 0);
             b.resolve_label(skip);
+            Ok(())
+        }
+        // A plain scalar call: its arguments, then one PureFunc, as the
+        // single-table emitter compiles it. Reached only for an aggregate
+        // argument that `join_aggregate_arg_supported` admitted.
+        Expr::FunctionCall {
+            name,
+            args,
+            distinct: false,
+            order_by,
+            filter: None,
+            over: None,
+            ..
+        } if order_by.is_empty() => {
+            let unsupported =
+                || CodegenError::Unsupported(format!("{name}() call in JOIN codegen"));
+            let arg_list = join_scalar_call_args(name, args).ok_or_else(unsupported)?;
+            let nargs = u16::try_from(arg_list.len()).map_err(|_| unsupported())?;
+            let arg_base = b.alloc_regs(i32::from(nargs));
+            for (arg_reg, arg) in (arg_base..).zip(arg_list) {
+                emit_join_expr(b, arg, arg_reg, tables, _ctx)?;
+            }
+            b.emit_op(
+                Opcode::PureFunc,
+                0,
+                arg_base,
+                target,
+                P4::FuncName(name.to_ascii_uppercase()),
+                nargs,
+            );
             Ok(())
         }
         _ => Err(CodegenError::Unsupported(format!(

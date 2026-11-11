@@ -51083,7 +51083,9 @@ impl Connection {
                     .is_none()
                 && match args {
                     FunctionArgs::Star => true,
-                    FunctionArgs::List(args) => args.iter().all(vdbe_expr),
+                    FunctionArgs::List(args) => {
+                        args.iter().all(join_aggregate_arg_is_vdbe_candidate)
+                    }
                 }
         })
     }
@@ -113494,6 +113496,34 @@ fn is_syntactic_join_key_expr(expr: &Expr) -> bool {
             ..
         } => operand(expr),
         _ => false,
+    }
+}
+
+/// Whether an aggregate argument over a join is one VDBE codegen may compile:
+/// what [`join_expr_is_vdbe_eligible`] accepts, and plain scalar function
+/// calls over such arguments (`sum(length(u.name))`), alone or under `+`, `-`
+/// and `*`. Codegen checks the function itself and declines what the join
+/// loop cannot run, which sends the statement to the general path.
+fn join_aggregate_arg_is_vdbe_candidate(expr: &Expr) -> bool {
+    match expr {
+        Expr::FunctionCall {
+            args: fsqlite_ast::FunctionArgs::List(args),
+            distinct: false,
+            order_by,
+            filter: None,
+            over: None,
+            ..
+        } if order_by.is_empty() => args.iter().all(join_aggregate_arg_is_vdbe_candidate),
+        Expr::BinaryOp {
+            left,
+            op: BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply,
+            right,
+            ..
+        } => {
+            join_aggregate_arg_is_vdbe_candidate(left)
+                && join_aggregate_arg_is_vdbe_candidate(right)
+        }
+        _ => !expr_has_any_subquery(expr) && join_expr_is_vdbe_eligible(expr),
     }
 }
 

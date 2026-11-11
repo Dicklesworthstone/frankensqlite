@@ -286,6 +286,127 @@ fn join_aggregates_joined_by_where_match_sqlite() {
     }
 }
 
+/// bd-w4pr1.13.6: plain scalar function calls in the aggregate arguments
+/// compile into the lookup loop.
+const SCALAR_CALL_ARGUMENT_QUERIES: &[&str] = &[
+    "SELECT count(*), sum(length(t.b)) FROM u JOIN t ON t.a = u.a",
+    "SELECT sum(length(u.b)), sum(length(t.b) + length(u.b)), sum(length(t.b) * 2 - 1) \
+     FROM u JOIN t ON t.a = u.a",
+    "SELECT sum(abs(t.c - u.r)), max(abs(t.a)), min(length(t.b)) FROM u JOIN t ON t.a = u.a",
+    "SELECT count(length(t.b)), total(length(t.d)), sum(coalesce(t.c, 0.5)) \
+     FROM u LEFT JOIN t ON t.a = u.a",
+    "SELECT sum(length(substr(t.b, 1, 1))), sum(instr(t.b, '0')), max(upper(t.b)) \
+     FROM u JOIN t ON t.a = u.a",
+    "SELECT max(typeof(t.d)), min(typeof(u.d)), sum(length(t.d)) FROM u JOIN t ON t.id = u.id",
+    "SELECT sum(round(t.c * u.r, 1)), sum(ifnull(u.a, 0)) FROM u JOIN t ON t.id = u.id",
+    "SELECT sum(length(t.rowid)), sum(abs(u.rowid - t.rowid)) FROM u JOIN t ON t.a = u.a",
+    "SELECT sum(length(t.b)) FROM u, t WHERE t.id = u.a",
+    "SELECT count(*), sum(length(e.a)) FROM u JOIN e ON e.a = u.a",
+];
+
+/// Calls the join loop must leave to the general path: a scalar min/max
+/// compares under its arguments' collations, a NOCASE column under an
+/// aggregate min/max needs that collation, `random()` is volatile, and a
+/// comparison or a call in ON is not an aggregate argument.
+const SCALAR_CALL_GENERAL_PATH_QUERIES: &[&str] = &[
+    "SELECT max(max(t.a, u.a)), min(min(t.c, u.r)) FROM u JOIN t ON t.a = u.a",
+    "SELECT min(max(t.n, u.b)), max(min(t.n, u.b)) FROM u JOIN t ON t.a = u.a",
+    "SELECT min(lower(t.n)), max(upper(t.n)) FROM u JOIN t ON t.a = u.a",
+    "SELECT count(random()), count(abs(random())) FROM u JOIN t ON t.a = u.a",
+    "SELECT sum(nullif(t.a, u.a)), count(nullif(t.b, u.b)) FROM u JOIN t ON t.id = u.id",
+    "SELECT sum(iif(t.a > 2, 1, 0)), sum(typeof(t.d) = 'integer') FROM u JOIN t ON t.a = u.a",
+    "SELECT sum(length(t.b)) FROM u JOIN t ON length(t.b) = u.a",
+];
+
+/// A replacement for the builtin `length`: every value is 7 long.
+struct SevenLong;
+
+impl fsqlite_func::ScalarFunction for SevenLong {
+    fn name(&self) -> &str {
+        "length"
+    }
+
+    fn num_args(&self) -> i32 {
+        1
+    }
+
+    fn invoke(&self, _args: &[SqliteValue]) -> fsqlite_error::Result<SqliteValue> {
+        Ok(SqliteValue::Integer(7))
+    }
+}
+
+#[test]
+fn join_aggregates_over_scalar_calls_match_sqlite() {
+    for indexed in [false, true] {
+        asupersync::test_utils::run_test(|| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("join_aggregate_scalar_calls.db");
+            let f = Connection::open(path.to_str().unwrap()).await.unwrap();
+            let r = rusqlite::Connection::open_in_memory().unwrap();
+            let indexes: &[&str] = if indexed { INDEXES } else { &[] };
+            for sql in SETUP.iter().chain(indexes) {
+                f.execute(sql).await.unwrap();
+                r.execute(sql, []).unwrap();
+            }
+            for sql in SCALAR_CALL_ARGUMENT_QUERIES
+                .iter()
+                .chain(SCALAR_CALL_GENERAL_PATH_QUERIES)
+            {
+                assert_agree(&f, &r, sql, &[], &[]).await;
+            }
+
+            let lookup_sql = "SELECT count(*), sum(length(t.b)) FROM u JOIN t ON t.a = u.a";
+            let ops = opcodes(&f, lookup_sql).await;
+            assert!(
+                ops.iter().any(|op| op == "AggStep") && ops.iter().any(|op| op == "PureFunc"),
+                "`{lookup_sql}` must run the call inside the lookup loop: {ops:?}"
+            );
+
+            // An unknown function and a wrong argument count are errors in
+            // both engines, not a row.
+            for sql in [
+                "SELECT sum(nosuchfn(t.a)) FROM u JOIN t ON t.a = u.a",
+                "SELECT sum(length(t.a, t.b)) FROM u JOIN t ON t.a = u.a",
+            ] {
+                assert!(f.query(sql).await.is_err(), "franken `{sql}` must fail");
+                assert!(r.prepare(sql).is_err(), "rusqlite `{sql}` must fail");
+            }
+            let err = f
+                .query("SELECT sum(nosuchfn(t.a)) FROM u JOIN t ON t.a = u.a")
+                .await
+                .expect_err("unknown function")
+                .to_string();
+            assert!(err.contains("no such function"), "{err}");
+
+            // The call resolves in the connection's registry when it runs: a
+            // replacement of the builtin is what the loop executes, whether
+            // it is registered as deterministic (the loop) or not (the
+            // general path).
+            let rows = f.query(lookup_sql).await.unwrap();
+            let SqliteValue::Integer(matches) = rows[0].values()[0] else {
+                panic!("count(*) is an integer: {:?}", rows[0].values());
+            };
+            assert!(matches > 0);
+            f.register_deterministic_scalar_function(SevenLong);
+            let rows = f.query(lookup_sql).await.unwrap();
+            assert_eq!(
+                rows[0].values(),
+                &[SqliteValue::Integer(matches), SqliteValue::Integer(7 * matches)],
+                "a deterministic replacement of length() must be the one called"
+            );
+            let ops = opcodes(&f, lookup_sql).await;
+            assert!(ops.iter().any(|op| op == "PureFunc"), "{ops:?}");
+            f.register_nondeterministic_scalar_function(SevenLong);
+            let rows = f.query(lookup_sql).await.unwrap();
+            assert_eq!(
+                rows[0].values(),
+                &[SqliteValue::Integer(matches), SqliteValue::Integer(7 * matches)],
+                "a volatile replacement of length() must be the one called"
+            );
+        });
+    }
+}
+
 const MULTI_SETUP: &str = "
     CREATE TABLE driver(id INTEGER PRIMARY KEY, sid INTEGER, sk INTEGER, amount REAL);
     CREATE TABLE middle(id INTEGER PRIMARY KEY, k INTEGER UNIQUE, lid INTEGER, lk INTEGER);
