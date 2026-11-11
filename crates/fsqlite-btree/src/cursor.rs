@@ -3926,8 +3926,11 @@ impl<P: PageReader> BtCursor<P> {
     /// Parse a cell without updating the cursor-local cell-slot cache.
     ///
     /// This is for single-consumer sequential scans where the caller needs
-    /// rowid and payload exactly once before advancing. Binary-search and
-    /// repeated-probe paths should keep using [`Self::parse_cell_at`].
+    /// rowid and payload exactly once before advancing, and for the binary
+    /// search of an index page: there a cached slot saves one cell parse (76
+    /// instructions measured) at the price of a lookup and, on a miss, a
+    /// store (about 180 per comparison, bd-w4pr1.13.15). Table binary
+    /// searches and repeated-probe paths keep using [`Self::parse_cell_at`].
     fn parse_cell_at_uncached(&self, entry: &StackEntry, idx: u16) -> Result<CellRef> {
         if idx >= entry.header.cell_count {
             return Err(FrankenError::DatabaseCorrupt {
@@ -5171,7 +5174,8 @@ impl<P: PageReader> BtCursor<P> {
         while lo < hi {
             observe_cursor_cancellation(cx)?;
             let mid = lo + (hi - lo) / 2;
-            let cell = self.parse_cell_at(entry, mid)?;
+            // Parsed directly: see `parse_cell_at_uncached`.
+            let cell = self.parse_cell_at_uncached(entry, mid)?;
             let key = self.read_cell_payload(cx, entry, &cell).await?;
             let ord = {
                 let _record_profile_scope =
@@ -5231,7 +5235,8 @@ impl<P: PageReader> BtCursor<P> {
         while lo < hi {
             observe_cursor_cancellation(cx)?;
             let mid = lo + (hi - lo) / 2;
-            let cell = self.parse_cell_at(entry, mid)?;
+            // Parsed directly: see `parse_cell_at_uncached`.
+            let cell = self.parse_cell_at_uncached(entry, mid)?;
             let key = self.read_cell_payload(cx, entry, &cell).await?;
             let ord = {
                 let _record_profile_scope =
