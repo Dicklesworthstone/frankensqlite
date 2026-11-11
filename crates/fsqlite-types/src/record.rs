@@ -2844,6 +2844,34 @@ pub fn decode_value_with_encoding(
     Some(slot)
 }
 
+/// Decode a column that needs no heap and no text encoding: NULL, an integer
+/// of any width, a real, or one of the two integer constants, from that
+/// column's own bytes.
+///
+/// Returns `None` for text, blobs and the reserved serial types, and for a
+/// real that is not eight bytes long. Where it returns a value, the value is
+/// the one [`decode_value_with_encoding`] returns; it does not count toward
+/// the decode profile.
+#[inline]
+#[must_use]
+pub fn decode_scalar_value(serial_type: u64, bytes: &[u8]) -> Option<SqliteValue> {
+    match serial_type {
+        0 => Some(SqliteValue::Null),
+        1..=6 => Some(SqliteValue::Integer(decode_big_endian_signed(bytes))),
+        7 => {
+            let value = f64::from_bits(u64::from_be_bytes(bytes.try_into().ok()?));
+            Some(if value.is_nan() {
+                SqliteValue::Null
+            } else {
+                SqliteValue::Float(value)
+            })
+        }
+        8 => Some(SqliteValue::Integer(0)),
+        9 => Some(SqliteValue::Integer(1)),
+        _ => None,
+    }
+}
+
 #[inline]
 fn profile_decoded_value(value: SqliteValue, profile_enabled: bool) -> SqliteValue {
     if profile_enabled {
@@ -4179,6 +4207,58 @@ mod tests {
                 parsed[0].as_integer(),
                 Some(val),
                 "roundtrip failed for {val}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_scalar_value_agrees_with_the_general_decoder() {
+        // Every scalar serial type, with bytes of its own length: all zero,
+        // all ones, sign bit only, and a mixed pattern.
+        for serial_type in 0..=9_u64 {
+            let len = usize::try_from(serial_type_len(serial_type).unwrap()).unwrap();
+            let patterns: [Vec<u8>; 4] = [
+                vec![0x00; len],
+                vec![0xFF; len],
+                (0..len).map(|i| if i == 0 { 0x80 } else { 0x00 }).collect(),
+                (0..len)
+                    .map(|i| 0x12_u8.wrapping_add(u8::try_from(i * 37 % 251).unwrap()))
+                    .collect(),
+            ];
+            for bytes in &patterns {
+                let expected =
+                    decode_value_with_encoding(serial_type, bytes, TextEncoding::Utf8, false);
+                assert!(expected.is_some(), "serial type {serial_type}");
+                assert_eq!(
+                    decode_scalar_value(serial_type, bytes),
+                    expected,
+                    "serial type {serial_type}, bytes {bytes:02x?}"
+                );
+            }
+        }
+        // A NaN bit pattern reads as NULL, as it does in the general decoder.
+        let nan = f64::NAN.to_bits().to_be_bytes();
+        assert_eq!(decode_scalar_value(7, &nan), Some(SqliteValue::Null));
+        assert_eq!(
+            decode_scalar_value(7, &1.5_f64.to_bits().to_be_bytes()),
+            Some(SqliteValue::Float(1.5))
+        );
+        assert_eq!(
+            decode_scalar_value(6, &i64::MIN.to_be_bytes()),
+            Some(SqliteValue::Integer(i64::MIN))
+        );
+        assert_eq!(
+            decode_scalar_value(3, &[0xFF, 0xFF, 0xFE]),
+            Some(SqliteValue::Integer(-2))
+        );
+        // A real of the wrong length, the reserved types, blobs and text are
+        // not this function's to decode.
+        assert_eq!(decode_scalar_value(7, &[0; 7]), None);
+        for serial_type in [10_u64, 11, 12, 13, 14, 15, 128, 129, 1_000_001] {
+            assert_eq!(
+                decode_scalar_value(serial_type, b""),
+                None,
+                "serial type {serial_type}"
             );
         }
     }

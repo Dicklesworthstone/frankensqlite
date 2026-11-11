@@ -22014,32 +22014,33 @@ fn try_read_column_in_place(
     let Some(col) = view.layout.column_offset(payload_idx) else {
         return Ok(None);
     };
-    match classify_serial_type(col.serial_type) {
-        SerialTypeClass::Null
-        | SerialTypeClass::Zero
-        | SerialTypeClass::One
-        | SerialTypeClass::Integer
-        | SerialTypeClass::Float => {}
-        SerialTypeClass::Text
-            if text_encoding == TextEncoding::Utf8
-                && usize::try_from(col.value_len)
-                    .is_ok_and(|len| len <= SmallText::INLINE_CAPACITY) => {}
-        SerialTypeClass::Text | SerialTypeClass::Blob | SerialTypeClass::Reserved => {
-            return Ok(None);
-        }
-    }
-    let Some(bytes) = cursor.cursor.current_page_span(view.payload.clone()) else {
+    let Some(record) = cursor.cursor.current_page_span(view.payload.clone()) else {
         return Ok(None);
     };
-    Ok(
-        fsqlite_types::record::decode_column_from_offset_reuse_with_encoding_shared(
-            bytes,
-            col,
-            None,
-            text_encoding,
-            false,
-        ),
-    )
+    // The column's own bytes. A record cut short of them is malformed, which
+    // the copying lane reports.
+    let Some(value_bytes) = usize::try_from(col.body_offset)
+        .ok()
+        .zip(column_payload_end(col))
+        .and_then(|(start, end)| record.get(start..end))
+    else {
+        return Ok(None);
+    };
+    // NULL, integers and reals are decoded here, without the general column
+    // decoder's hint, profile and text-encoding handling.
+    if let Some(value) = fsqlite_types::record::decode_scalar_value(col.serial_type, value_bytes) {
+        return Ok(Some(value));
+    }
+    if classify_serial_type(col.serial_type) == SerialTypeClass::Text
+        && text_encoding == TextEncoding::Utf8
+        && value_bytes.len() <= SmallText::INLINE_CAPACITY
+    {
+        return Ok(Some(SqliteValue::Text(
+            SmallText::from_record_text_bytes_shared(value_bytes, text_encoding),
+        )));
+    }
+    // Longer text, text in another encoding, blobs and the reserved types.
+    Ok(None)
 }
 
 /// How a row-layout pass starts.

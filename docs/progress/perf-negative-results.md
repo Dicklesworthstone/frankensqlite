@@ -87,6 +87,48 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-11 - WIN: the in-place Column lane parses the record header itself and decodes scalars itself (bd-w4pr1.13.4)
+
+- Target: every scan that reads integer, real, NULL or short-text columns. An exact instruction
+  profile (callgrind, line level) of `SELECT count(*), sum(a) FROM t WHERE a > 500` at 7e486c4c2:
+  `RecordDecodeScratch::prepare_for_record_prefix` 181 instructions per row (45 per column of a
+  four-column record), and 80 per integer column read through
+  `decode_column_from_offset_reuse_with_encoding_shared` and `decode_value_with_encoding`. Touched:
+  `crates/fsqlite-vdbe/src/engine.rs` (`RecordColumnTable`, `RecordColumns`,
+  `try_read_column_in_place`), `crates/fsqlite-types/src/record.rs` (`decode_scalar_value`).
+- Change, two commits. (1) The lane keeps a column table of its own: serial type and byte range
+  per column, no value slots. Its loop covers a header shorter than 128 bytes with one-byte serial
+  types, where offsets cannot overflow, and carries no checks; any other header goes to a checked
+  loop. It accepts exactly what `parse_record_header_prefix_into` accepts and builds the same
+  table. (2) NULL, integers, reals and the two integer constants are decoded from the column's own
+  bytes by `decode_scalar_value`; inline text keeps the text decoder.
+- Result, user instructions in millions per statement on the 1M-row scorecard table, stock sqlite3
+  3.46.1 live in the same run, io_uring reads refused in every arm so that the counts repeat to the
+  instruction (`perf stat -e instructions:u` in a transient unit with `io_uring_setup` filtered;
+  three runs each, identical), every answer equal to stock's; base 05e4fd8f8 sha256 25b7fe4e...,
+  after (1) 9614b9d3... (0fcaf9b0f), after (2) a1da24c2... (8496d5cbe): scan_filter_agg 1,767.8
+  -> 1,675.8 -> 1,587.9 (-92 and -88 per row; 3.54x -> 3.18x stock's 498.7),
+  order_by_text_limit10 2,485.1 -> 2,392.1 -> 2,359.1 (3.19x -> 3.03x), group_by_1000_groups
+  3,690.7 -> 3,597.7 -> 3,536.7, `count(*), sum(length(b)), sum(c)` 3,674.8 -> 3,583.8 -> 3,505.8,
+  `min(c), max(c), avg(c)` 3,348.9 -> 3,259.9 -> 3,117.9.
+  Predictions: (1) -110 per row with a kill line at -58, (2) -60 with a kill line at -30.
+  `RecordColumnTable::parse` costs 91 instructions per four-column row where the decode scratch's
+  pass cost 181.
+- The first cut of (1) missed its kill line and never landed: a checked loop inlined into the hot
+  lane measured -29 instructions per row on scan_filter_agg against a kill line of -58. Its exact
+  profile showed why: `prepare_for_record_prefix` was gone and `run_hot_opcodes_sync` had grown by
+  160 per row, 33 per column (three fallible conversions, a bounds-checked slot write, loop state
+  on the stack of the engine's largest function). The landed loop is out of line and unchecked.
+- Keepers: unit tests hold the parser to the decode scratch on every prefix of generated records
+  (serial types and header sizes on both sides of the one-byte limit, 126 / 127 / 200 columns,
+  malformed headers) and `decode_scalar_value` to the general decoder for every scalar serial type
+  and bit-pattern class including NaN; the lane-boundary oracle.
+- Still open on this seam: the cell is located from scratch for every row
+  (`local_leaf_table_cell_span`, 88 per row), the position stamp is rebuilt and compared for every
+  column read, and a header with any long text or blob takes the checked loop.
+- Retry condition for a lazy header walk (stop at the requested column, as stock does): a profile
+  of a table with more than eight columns showing `RecordColumnTable::parse` above 5% of a scan.
+
 ## 2026-11-11 - WIN: the shell's statement_complete() keeps no copy of the words it reads (bd-5310l)
 
 - Target: every line the CLI reads (all the scorecard's statement rows). Touched:
