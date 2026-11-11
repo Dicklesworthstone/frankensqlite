@@ -87,6 +87,68 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-11 - WIN: the hot lane runs consecutive opcodes itself, and AggStep, table-leaf Rowid and the sorter opcodes stay on it (bd-w4pr1.13.7)
+
+- Target: every bytecode row loop. After bd-w4pr1.13.1 the statement loop still called the hot
+  dispatcher once per opcode: `try_execute_hot_opcode_sync` 19.4% and the statement future 11.2% of
+  a 1M-row filtered aggregate (frame-pointer profile, main 58d05bff3), a third of the dispatcher's
+  samples on its entry, its exit and the `Ok(true)` it returned. Touched:
+  `crates/fsqlite-vdbe/src/engine.rs` (`run_hot_opcodes_sync`, `execute_agg_step`,
+  `execute_sorter_insert` / `_compare` / `_data`, the `Rowid` arm of the hot dispatcher).
+- Change, three commits: (1) `run_hot_opcodes_sync` keeps the program counter and the opcode count
+  in locals and loops over hot opcodes until one declines, making the statement loop's cancellation
+  check and opcode count at the same counts; with opcode metrics or opcode tracing on it hands back
+  after each opcode, so those paths are as before. (2) `AggStep` and a `Rowid` on a table leaf run
+  on that lane instead of ending the run once or twice per row. (3) So do `SorterInsert`,
+  `SorterCompare` and `SorterData`. The moved arm bodies are unchanged.
+- Result, user instructions in millions per statement (`perf stat`, load-independent; scorecard
+  workloads, stock sqlite3 3.46.1 live in the same run, every answer equal to stock's; base
+  3ce2feef2 sha256 59cb80cf..., then one binary per commit: e6f95ac3..., 8734e227..., 3768e624...,
+  fe779fb0...). The in-place column is the `Column` lane of the bd-w4pr1.13.4 entry below, which
+  sits between (2) and (3) in the history:
+
+  | workload | stock | base | (1) loop | (2) AggStep, Rowid | in-place Column | (3) sorter |
+  |---|---|---|---|---|---|---|
+  | scan_filter_agg | 500 | 2,985 | 2,738 | 2,577 | 1,984 | 1,944 |
+  | order_by_text_limit10 | 779 | 3,511 | 3,399 | 3,399 | 2,840 | 2,680 |
+  | group_by_1000_groups | 2,878 | 5,984 | 5,824 | 5,670 | 5,150 | 4,818 |
+  | rowid_lookups_200k | 556 | 10,805 | 10,711 | 9,863 | 8,843 | 8,701 |
+  | join_1M_to_pk_1000 | 1,723 | 17,485 | 17,303 | 16,133 | 15,063 | 14,959 |
+  | update_10pct_300k | 273 | 2,195 | 2,042 | 1,826 | 1,641 | 1,610 |
+  | delete_14pct_300k | 121 | 1,594 | 1,490 | 1,331 | 1,342 | 1,324 |
+
+  The statement-bound rows did not move beyond their run-to-run spread (four runs per arm, base
+  against the stack without the sorter commit: txn_1000x10_rows 1,518-1,525 and 1,521-1,527,
+  autocommit_5k_inserts 2,871-2,893 and 2,885-2,907, 2,000 autocommit point SELECTs 472-476 and
+  475-477). The stack was then rebased onto 4c975163a; in one more run with stock live the rebased
+  binary (sha256 9098facb...) and the pre-rebase one agree within 0.3% on every row of the table
+  except delete_14pct (1.6%).
+- Wall time, whole stack (this entry and bd-w4pr1.13.4) against base, 7 interleaved repetitions,
+  A/A 1.00-1.11, load 14; cells are fsqlite/stock: scan_filter_agg 5.31x -> 3.56x,
+  order_by_text_limit10 5.13x -> 3.50x, update_10pct 6.47x -> 5.17x, delete_14pct 7.36x -> 6.32x,
+  join_1M_to_pk_1000 10.74x -> 9.52x, group_by_1000_groups 5.49x -> 4.93x, rowid_lookups_200k
+  5.92x -> 5.47x, window_row_number 8.52x -> 8.07x. count_star, bulk_insert_1M, create_index and
+  join_no_index stayed inside the A/A spread.
+- Against the bead's prediction (scan -15% in instructions, order_by / update / delete -8% each;
+  kill under 5% on scan): the three commits of this entry give scan -13.7% (2,985 -> 2,577; the
+  sorter commit does not touch it), order_by -8.6% (3,511 -> 3,399, then 2,840 -> 2,680), update
+  -16.8%, delete -16.5%. Scan fell short of the prediction and cleared the kill line.
+- Keeper: `test_hot_opcode_run_checks_cancellation_at_the_statement_loop_cadence` (a loop made
+  only of hot opcodes, and one with an opcode the lane declines each row, both stop at the row the
+  checkpoint cadence predicts after a mid-run cancellation, metrics off and on). A run that does
+  not check for cancellation itself never stops in the first case; one that counts a declined
+  opcode twice, or not at all, stops at another row in the second.
+- These rows are still losses. What a scan row costs now, by self time on the stack's binary:
+  the hot lane with its inlined handlers 34%, the aggregate step 11% (a hash lookup of the function
+  by program counter, an `Arc` clone and drop, and the accumulator lookup, per row), the row
+  view's header parse 7% and cell location 5% (bd-w4pr1.13.4 entry), S3-FIFO `forget` 4%. Four of
+  the ten opcodes a matching row runs are ones stock does not emit: the literal is reloaded for
+  every row, two `IsNull` guards stand in front of a comparison that could skip NULL operands
+  itself, and a flag register is rewritten.
+- Retry condition for more lanes: an opcode goes on the hot lane only when it never waits and a
+  row loop of a scorecard workload is shown returning to the statement future once per row because
+  of it (`execute_program_body` above 3% of that workload's samples).
+
 ## 2026-11-11 - WIN: Column decodes heap-free values from the leaf page instead of a copied prefix (bd-w4pr1.13.4)
 
 - Target: every scan that reads integer, real, NULL or short-text columns of a rowid table.

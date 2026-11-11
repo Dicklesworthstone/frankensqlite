@@ -13079,55 +13079,10 @@ impl VdbeEngine {
                     pc += 1;
                 }
 
+                // The hot lane runs the three sorter opcodes below; these arms
+                // keep the statement loop's match complete.
                 Opcode::SorterInsert => {
-                    // Lazy key decode: only decode the first `key_columns`
-                    // values (the sort key) instead of all columns.  The
-                    // raw blob is retained for output via `SorterData`.
-                    let cursor_id = op.p1;
-                    let record_reg = op.p2;
-                    let sideband_active =
-                        self.make_record_lookaside.sideband_is_armed_for(record_reg);
-                    let blob = if sideband_active {
-                        self.make_record_lookaside.disarm();
-                        self.make_record_lookaside.take_buf()
-                    } else {
-                        // Move the record value out of the register instead of
-                        // cloning it; MakeRecord sideband consumers above avoid
-                        // this path because take_reg would materialize the blob.
-                        let record = self.take_reg(record_reg);
-                        record_blob_bytes(&record).to_vec()
-                    };
-                    if let Some(sorter) = self.sorters.get_mut(&cursor_id) {
-                        // bd-9pi70: sort keys must be decoded in the DB storage
-                        // encoding so NOCASE/RTRIM order the canonical UTF-8 form on
-                        // a UTF-16 database, matching stock. BINARY is unaffected — it
-                        // re-encodes to the storage encoding inside the comparator
-                        // (bd-bld9w.4), but NOCASE/RTRIM fold/trim the operand bytes
-                        // directly, so a Utf8-hardcoded prefix decode fed them the raw
-                        // UTF-16 code units and mis-ordered non-ASCII BMP rows. The
-                        // UTF-8 hot path keeps the lazy prefix decode (only the first
-                        // `key_columns` values); UTF-16 databases are rare, so they
-                        // decode the full record and retain the sort-key prefix.
-                        #[allow(clippy::disallowed_methods)] // UTF-8 branch only
-                        let key_values = if matches!(sorter.text_encoding, TextEncoding::Utf8) {
-                            fsqlite_types::record::parse_record_prefix(&blob, sorter.key_columns)
-                        } else {
-                            let mut all_values = Vec::new();
-                            fsqlite_types::record::parse_record_into_with_encoding(
-                                &blob,
-                                &mut all_values,
-                                sorter.text_encoding,
-                            )
-                            .map(|()| {
-                                all_values.truncate(sorter.key_columns);
-                                all_values
-                            })
-                        }
-                        .ok_or_else(|| FrankenError::DatabaseCorrupt {
-                            detail: "malformed record in SorterInsert".to_owned(),
-                        })?;
-                        sorter.insert_row(key_values, blob)?;
-                    }
+                    self.execute_sorter_insert(op)?;
                     pc += 1;
                 }
 
@@ -13267,142 +13222,11 @@ impl VdbeEngine {
                 }
 
                 Opcode::SorterCompare => {
-                    // In preflight mode, compare a candidate key with the
-                    // bounded sorter's current worst key and jump when the
-                    // candidate cannot survive. Otherwise compare the current
-                    // sorter key with P3 and jump when the keys differ.
-                    let cursor_id = op.p1;
-                    let is_top_n_preflight = (op.p5 & SORTER_COMPARE_TOP_N_PREFLIGHT) != 0;
-                    let preflight_sorter_exists =
-                        !is_top_n_preflight || self.sorters.get(&cursor_id).is_some();
-                    let preflight_needs_compare = is_top_n_preflight
-                        && self.sorters.get(&cursor_id).is_some_and(|sorter| {
-                            sorter
-                                .top_n_limit
-                                .is_some_and(|limit| sorter.rows.len() >= limit)
-                        });
-                    let preflight_probe = if is_top_n_preflight {
-                        if self.make_record_lookaside.sideband_is_armed_for(op.p3) {
-                            // Consume MakeRecord's sideband directly, then
-                            // return its allocation to the lookaside pool.
-                            // Materializing an Arc-backed register blob here
-                            // would add an allocation to every source row.
-                            self.make_record_lookaside.disarm();
-                            let probe_buf = self.make_record_lookaside.take_buf();
-                            let decoded = preflight_needs_compare
-                                .then(|| {
-                                    decode_record_bytes_with_metrics(
-                                        &probe_buf,
-                                        self.text_encoding,
-                                        self.collect_vdbe_metrics,
-                                    )
-                                })
-                                .transpose();
-                            self.make_record_lookaside.replace_cleared_buf(probe_buf);
-                            decoded?
-                        } else if preflight_needs_compare {
-                            Some(decode_record_with_metrics(
-                                self.get_reg(op.p3),
-                                self.text_encoding,
-                                self.collect_vdbe_metrics,
-                            )?)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-                    let ordinary_needs_compare = !is_top_n_preflight
-                        && self.sorters.get(&cursor_id).is_some_and(|sorter| {
-                            sorter
-                                .position
-                                .is_some_and(|position| sorter.rows.get(position).is_some())
-                        });
-                    let ordinary_probe = if ordinary_needs_compare {
-                        if self.make_record_lookaside.sideband_is_armed_for(op.p3) {
-                            // Decode the logical P3 value without consuming
-                            // MakeRecord's sideband. Ordinary SorterCompare is
-                            // a read operation, so a later opcode must still
-                            // observe the packed record in P3.
-                            Some(decode_record_bytes_with_metrics(
-                                self.make_record_lookaside.as_slice(),
-                                self.text_encoding,
-                                self.collect_vdbe_metrics,
-                            )?)
-                        } else {
-                            Some(decode_record_with_metrics(
-                                self.get_reg(op.p3),
-                                self.text_encoding,
-                                self.collect_vdbe_metrics,
-                            )?)
-                        }
-                    } else {
-                        None
-                    };
-                    let coll = self.lock_collation();
-                    let should_jump = if is_top_n_preflight {
-                        if !preflight_sorter_exists {
-                            true
-                        } else if !preflight_needs_compare {
-                            false
-                        } else if let Some(sorter) = self.sorters.get(&cursor_id) {
-                            !sorter.would_retain_top_n(
-                                preflight_probe
-                                    .as_deref()
-                                    .expect("preflight probe should be decoded"),
-                                &coll,
-                            )
-                        } else {
-                            true
-                        }
-                    } else if let Some(sorter) = self.sorters.get(&cursor_id) {
-                        if let Some(pos) = sorter.position {
-                            if let Some(current) = sorter.rows.get(pos) {
-                                let probe = ordinary_probe
-                                    .as_deref()
-                                    .expect("positioned sorter probe should be decoded");
-                                !sorter_keys_equal(
-                                    &current.values,
-                                    probe,
-                                    sorter.key_columns,
-                                    &sorter.collations,
-                                    &coll,
-                                    sorter.text_encoding,
-                                )
-                            } else {
-                                true
-                            }
-                        } else {
-                            true
-                        }
-                    } else {
-                        true
-                    };
-                    if should_jump {
-                        pc = op.p2 as usize;
-                    } else {
-                        pc += 1;
-                    }
+                    self.execute_sorter_compare(op, &mut pc)?;
                 }
 
                 Opcode::SorterData => {
-                    // Encode current sorter row into register p2.
-                    let cursor_id = op.p1;
-                    let target = op.p2;
-                    let value = if let Some(sorter) = self.sorters.get(&cursor_id) {
-                        if let Some(pos) = sorter.position {
-                            if let Some(row) = sorter.rows.get(pos) {
-                                SqliteValue::Blob(row.blob.clone().into())
-                            } else {
-                                SqliteValue::Null
-                            }
-                        } else {
-                            SqliteValue::Null
-                        }
-                    } else {
-                        SqliteValue::Null
-                    };
-                    self.set_reg(target, value);
+                    self.execute_sorter_data(op);
                     pc += 1;
                 }
 
@@ -15339,6 +15163,200 @@ impl VdbeEngine {
         self.get_reg(r).clone()
     }
 
+    /// `SorterInsert`: hand the record in register `p2` to sorter `p1`.
+    fn execute_sorter_insert(&mut self, op: &VdbeOp) -> Result<()> {
+        // Lazy key decode: only decode the first `key_columns`
+        // values (the sort key) instead of all columns.  The
+        // raw blob is retained for output via `SorterData`.
+        let cursor_id = op.p1;
+        let record_reg = op.p2;
+        let sideband_active = self.make_record_lookaside.sideband_is_armed_for(record_reg);
+        let blob = if sideband_active {
+            self.make_record_lookaside.disarm();
+            self.make_record_lookaside.take_buf()
+        } else {
+            // Move the record value out of the register instead of
+            // cloning it; MakeRecord sideband consumers above avoid
+            // this path because take_reg would materialize the blob.
+            let record = self.take_reg(record_reg);
+            record_blob_bytes(&record).to_vec()
+        };
+        if let Some(sorter) = self.sorters.get_mut(&cursor_id) {
+            // bd-9pi70: sort keys must be decoded in the DB storage
+            // encoding so NOCASE/RTRIM order the canonical UTF-8 form on
+            // a UTF-16 database, matching stock. BINARY is unaffected — it
+            // re-encodes to the storage encoding inside the comparator
+            // (bd-bld9w.4), but NOCASE/RTRIM fold/trim the operand bytes
+            // directly, so a Utf8-hardcoded prefix decode fed them the raw
+            // UTF-16 code units and mis-ordered non-ASCII BMP rows. The
+            // UTF-8 hot path keeps the lazy prefix decode (only the first
+            // `key_columns` values); UTF-16 databases are rare, so they
+            // decode the full record and retain the sort-key prefix.
+            #[allow(clippy::disallowed_methods)] // UTF-8 branch only
+            let key_values = if matches!(sorter.text_encoding, TextEncoding::Utf8) {
+                fsqlite_types::record::parse_record_prefix(&blob, sorter.key_columns)
+            } else {
+                let mut all_values = Vec::new();
+                fsqlite_types::record::parse_record_into_with_encoding(
+                    &blob,
+                    &mut all_values,
+                    sorter.text_encoding,
+                )
+                .map(|()| {
+                    all_values.truncate(sorter.key_columns);
+                    all_values
+                })
+            }
+            .ok_or_else(|| FrankenError::DatabaseCorrupt {
+                detail: "malformed record in SorterInsert".to_owned(),
+            })?;
+            sorter.insert_row(key_values, blob)?;
+        }
+        Ok(())
+    }
+
+    /// `SorterCompare`, including its jump.
+    ///
+    /// In preflight mode, compare a candidate key with the bounded sorter's
+    /// current worst key and jump when the candidate cannot survive.
+    /// Otherwise compare the current sorter key with P3 and jump when the
+    /// keys differ.
+    #[allow(clippy::cast_sign_loss)]
+    fn execute_sorter_compare(&mut self, op: &VdbeOp, pc: &mut usize) -> Result<()> {
+        let cursor_id = op.p1;
+        let is_top_n_preflight = (op.p5 & SORTER_COMPARE_TOP_N_PREFLIGHT) != 0;
+        let preflight_sorter_exists = !is_top_n_preflight || self.sorters.get(&cursor_id).is_some();
+        let preflight_needs_compare = is_top_n_preflight
+            && self.sorters.get(&cursor_id).is_some_and(|sorter| {
+                sorter
+                    .top_n_limit
+                    .is_some_and(|limit| sorter.rows.len() >= limit)
+            });
+        let preflight_probe = if is_top_n_preflight {
+            if self.make_record_lookaside.sideband_is_armed_for(op.p3) {
+                // Consume MakeRecord's sideband directly, then
+                // return its allocation to the lookaside pool.
+                // Materializing an Arc-backed register blob here
+                // would add an allocation to every source row.
+                self.make_record_lookaside.disarm();
+                let probe_buf = self.make_record_lookaside.take_buf();
+                let decoded = preflight_needs_compare
+                    .then(|| {
+                        decode_record_bytes_with_metrics(
+                            &probe_buf,
+                            self.text_encoding,
+                            self.collect_vdbe_metrics,
+                        )
+                    })
+                    .transpose();
+                self.make_record_lookaside.replace_cleared_buf(probe_buf);
+                decoded?
+            } else if preflight_needs_compare {
+                Some(decode_record_with_metrics(
+                    self.get_reg(op.p3),
+                    self.text_encoding,
+                    self.collect_vdbe_metrics,
+                )?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let ordinary_needs_compare = !is_top_n_preflight
+            && self.sorters.get(&cursor_id).is_some_and(|sorter| {
+                sorter
+                    .position
+                    .is_some_and(|position| sorter.rows.get(position).is_some())
+            });
+        let ordinary_probe = if ordinary_needs_compare {
+            if self.make_record_lookaside.sideband_is_armed_for(op.p3) {
+                // Decode the logical P3 value without consuming
+                // MakeRecord's sideband. Ordinary SorterCompare is
+                // a read operation, so a later opcode must still
+                // observe the packed record in P3.
+                Some(decode_record_bytes_with_metrics(
+                    self.make_record_lookaside.as_slice(),
+                    self.text_encoding,
+                    self.collect_vdbe_metrics,
+                )?)
+            } else {
+                Some(decode_record_with_metrics(
+                    self.get_reg(op.p3),
+                    self.text_encoding,
+                    self.collect_vdbe_metrics,
+                )?)
+            }
+        } else {
+            None
+        };
+        let coll = self.lock_collation();
+        let should_jump = if is_top_n_preflight {
+            if !preflight_sorter_exists {
+                true
+            } else if !preflight_needs_compare {
+                false
+            } else if let Some(sorter) = self.sorters.get(&cursor_id) {
+                !sorter.would_retain_top_n(
+                    preflight_probe
+                        .as_deref()
+                        .expect("preflight probe should be decoded"),
+                    &coll,
+                )
+            } else {
+                true
+            }
+        } else if let Some(sorter) = self.sorters.get(&cursor_id) {
+            if let Some(pos) = sorter.position {
+                if let Some(current) = sorter.rows.get(pos) {
+                    let probe = ordinary_probe
+                        .as_deref()
+                        .expect("positioned sorter probe should be decoded");
+                    !sorter_keys_equal(
+                        &current.values,
+                        probe,
+                        sorter.key_columns,
+                        &sorter.collations,
+                        &coll,
+                        sorter.text_encoding,
+                    )
+                } else {
+                    true
+                }
+            } else {
+                true
+            }
+        } else {
+            true
+        };
+        if should_jump {
+            *pc = op.p2 as usize;
+        } else {
+            *pc += 1;
+        }
+        Ok(())
+    }
+
+    /// `SorterData`: encode the current row of sorter `p1` into register `p2`.
+    fn execute_sorter_data(&mut self, op: &VdbeOp) {
+        let cursor_id = op.p1;
+        let target = op.p2;
+        let value = if let Some(sorter) = self.sorters.get(&cursor_id) {
+            if let Some(pos) = sorter.position {
+                if let Some(row) = sorter.rows.get(pos) {
+                    SqliteValue::Blob(row.blob.clone().into())
+                } else {
+                    SqliteValue::Null
+                }
+            } else {
+                SqliteValue::Null
+            }
+        } else {
+            SqliteValue::Null
+        };
+        self.set_reg(target, value);
+    }
+
     /// `AggStep`/`AggStep1` at `ops[pc]`: fold the argument registers into the
     /// aggregate whose accumulator is register `p3`.
     #[allow(clippy::cast_sign_loss)]
@@ -16061,6 +16079,23 @@ impl VdbeEngine {
             // aggregating scan run its whole row loop here.
             Opcode::AggStep | Opcode::AggStep1 => {
                 self.execute_agg_step(ops, *pc)?;
+                *pc += 1;
+                Ok(true)
+            }
+            // The sorter opcodes of a sorting or grouping scan never wait
+            // either: one of them per row is what ended the run in ORDER BY
+            // and GROUP BY loops.
+            Opcode::SorterInsert => {
+                self.execute_sorter_insert(op)?;
+                *pc += 1;
+                Ok(true)
+            }
+            Opcode::SorterCompare => {
+                self.execute_sorter_compare(op, pc)?;
+                Ok(true)
+            }
+            Opcode::SorterData => {
+                self.execute_sorter_data(op);
                 *pc += 1;
                 Ok(true)
             }
