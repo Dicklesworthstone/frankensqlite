@@ -27,10 +27,11 @@
 //! [`named_params!`], arrays, tuples, slices, [`params_from_iter`]),
 //! transactions and nested [`Savepoint`]s with [`TransactionBehavior`] and
 //! [`DropBehavior`], pragmas,
-//! `busy_timeout`, `changes`, `last_insert_rowid`, [`OptionalExtension`], and
-//! an [`Error`] whose variants and [`ErrorCode`]s match rusqlite's. Not yet:
-//! user-defined functions, online backup, blob I/O, hooks,
-//! and the `chrono`/`uuid`/`serde_json` conversions.
+//! `busy_timeout`, `changes`, `last_insert_rowid`, [`OptionalExtension`],
+//! user-defined scalar functions ([`Connection::create_scalar_function`]),
+//! and an [`Error`] whose variants and [`ErrorCode`]s match rusqlite's. Not
+//! yet: aggregate and window functions, online backup, blob I/O, hooks, and
+//! the `chrono`/`uuid`/`serde_json` conversions.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -278,6 +279,13 @@ pub enum Error {
     MultipleStatement,
     /// The number of parameters given, then the number the statement has.
     InvalidParameterCount(usize, usize),
+    /// A user-defined function's argument has a type its requested Rust type
+    /// does not accept ([`functions::Context::get`]).
+    InvalidFunctionParameterType(usize, types::Type),
+    /// An error a user-defined function returns for its own reasons.
+    UserFunctionError(Box<dyn std::error::Error + Send + Sync + 'static>),
+    /// A user-defined function panicked.
+    UnwindingPanic,
 }
 
 /// `std::result::Result` with this module's [`Error`].
@@ -384,6 +392,11 @@ impl fmt::Display for Error {
                 f,
                 "Wrong number of parameters passed to query. Got {given}, needed {needed}"
             ),
+            Self::InvalidFunctionParameterType(index, ty) => {
+                write!(f, "Invalid function parameter type {ty} at index {index}")
+            }
+            Self::UserFunctionError(error) => error.fmt(f),
+            Self::UnwindingPanic => f.write_str("unwinding panic"),
         }
     }
 }
@@ -393,9 +406,9 @@ impl std::error::Error for Error {
         match self {
             Self::SqliteFailure(error, _) => Some(error),
             Self::Utf8Error(error) => Some(error),
-            Self::FromSqlConversionFailure(_, _, error) | Self::ToSqlConversionFailure(error) => {
-                Some(&**error)
-            }
+            Self::FromSqlConversionFailure(_, _, error)
+            | Self::ToSqlConversionFailure(error)
+            | Self::UserFunctionError(error) => Some(&**error),
             _ => None,
         }
     }
@@ -1005,6 +1018,153 @@ fn value_ref(value: &SqliteValue) -> ValueRef<'_> {
     }
 }
 
+/// User-defined SQL functions, as rusqlite's `functions` module: register a
+/// closure with [`Connection::create_scalar_function`].
+pub mod functions {
+    use std::marker::PhantomData;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::{Mutex, PoisonError};
+
+    use fsqlite_error::FrankenError;
+    use fsqlite_types::value::SqliteValue;
+
+    use super::types::{FromSql, FromSqlError, ToSql, ValueRef};
+    use super::{Error, Result, engine_value, value_ref};
+
+    bitflags::bitflags! {
+        /// SQLite's function flags, with their `SQLITE_*` names and values.
+        /// Text always reaches a function as UTF-8, and of the rest only
+        /// [`FunctionFlags::SQLITE_DETERMINISTIC`] changes anything here:
+        /// without it the function cannot appear in an index expression.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+        pub struct FunctionFlags: i32 {
+            const SQLITE_UTF8 = 1;
+            const SQLITE_UTF16LE = 2;
+            const SQLITE_UTF16BE = 3;
+            const SQLITE_UTF16 = 4;
+            const SQLITE_DETERMINISTIC = 0x0000_0800;
+            const SQLITE_DIRECTONLY = 0x0008_0000;
+            const SQLITE_SUBTYPE = 0x0010_0000;
+            const SQLITE_INNOCUOUS = 0x0020_0000;
+            const SQLITE_RESULT_SUBTYPE = 0x0100_0000;
+            const SQLITE_SELFORDER1 = 0x0200_0000;
+        }
+    }
+
+    impl Default for FunctionFlags {
+        fn default() -> Self {
+            Self::SQLITE_UTF8
+        }
+    }
+
+    /// The arguments of one call of a user-defined function.
+    pub struct Context<'a> {
+        args: &'a [SqliteValue],
+    }
+
+    impl Context<'_> {
+        /// The number of arguments.
+        #[must_use]
+        pub const fn len(&self) -> usize {
+            self.args.len()
+        }
+
+        /// Whether the call has no arguments.
+        #[must_use]
+        pub const fn is_empty(&self) -> bool {
+            self.args.is_empty()
+        }
+
+        /// Argument `idx` as a `T`.
+        ///
+        /// # Panics
+        ///
+        /// If `idx` is not below [`Context::len`], as in rusqlite.
+        pub fn get<T: FromSql>(&self, idx: usize) -> Result<T> {
+            let value = self.get_raw(idx);
+            T::column_result(value).map_err(|error| match error {
+                FromSqlError::InvalidType => {
+                    Error::InvalidFunctionParameterType(idx, value.data_type())
+                }
+                FromSqlError::OutOfRange(wide) => Error::IntegralValueOutOfRange(idx, wide),
+                FromSqlError::Other(source) => {
+                    Error::FromSqlConversionFailure(idx, value.data_type(), source)
+                }
+                other => Error::FromSqlConversionFailure(idx, value.data_type(), Box::new(other)),
+            })
+        }
+
+        /// Argument `idx` as it is.
+        ///
+        /// # Panics
+        ///
+        /// If `idx` is not below [`Context::len`], as in rusqlite.
+        #[must_use]
+        pub fn get_raw(&self, idx: usize) -> ValueRef<'_> {
+            value_ref(&self.args[idx])
+        }
+    }
+
+    /// A closure registered as a scalar SQL function.
+    pub(super) struct ScalarClosure<F, T> {
+        name: String,
+        n_arg: i32,
+        deterministic: bool,
+        /// The engine calls functions through `&self` from a `Sync` registry;
+        /// the closure is `FnMut + Send`, so it is called under a lock. Only
+        /// the connection's own thread ever takes it.
+        func: Mutex<F>,
+        output: PhantomData<fn() -> T>,
+    }
+
+    impl<F, T> ScalarClosure<F, T> {
+        pub(super) fn new(name: &str, n_arg: i32, flags: FunctionFlags, func: F) -> Self {
+            Self {
+                name: name.to_owned(),
+                n_arg,
+                deterministic: flags.contains(FunctionFlags::SQLITE_DETERMINISTIC),
+                func: Mutex::new(func),
+                output: PhantomData,
+            }
+        }
+
+        pub(super) const fn deterministic(&self) -> bool {
+            self.deterministic
+        }
+    }
+
+    impl<F, T> fsqlite_func::ScalarFunction for ScalarClosure<F, T>
+    where
+        F: FnMut(&Context<'_>) -> Result<T> + Send,
+        T: ToSql,
+    {
+        fn invoke(&self, args: &[SqliteValue]) -> fsqlite_error::Result<SqliteValue> {
+            let context = Context { args };
+            // A panic in an earlier call poisons the lock; the closure stays
+            // callable, as it does in rusqlite after an `UnwindingPanic`.
+            let mut func = self.func.lock().unwrap_or_else(PoisonError::into_inner);
+            catch_unwind(AssertUnwindSafe(|| (*func)(&context)))
+                .unwrap_or(Err(Error::UnwindingPanic))
+                .and_then(|value| value.to_sql().map(engine_value))
+                // SQLite reports a function's error as SQLITE_ERROR with the
+                // error's text (`sqlite3_result_error`), and so does rusqlite.
+                .map_err(|error| FrankenError::FunctionError(error.to_string()))
+        }
+
+        fn is_deterministic(&self) -> bool {
+            self.deterministic
+        }
+
+        fn num_args(&self) -> i32 {
+            self.n_arg
+        }
+
+        fn name(&self) -> &str {
+            &self.name
+        }
+    }
+}
+
 /// Parameters for a statement, positional or named.
 ///
 /// Positional: `[]`, arrays, tuples, slices of `&dyn ToSql`, [`params!`],
@@ -1335,7 +1495,7 @@ impl Connection {
         let names = stmt.column_names();
         Ok(Statement {
             conn: self,
-            stmt,
+            stmt: Box::new(stmt),
             slots,
             names,
         })
@@ -1521,6 +1681,44 @@ impl Connection {
         Ok(())
     }
 
+    /// Register `x_func` as the SQL function `fn_name` taking `n_arg`
+    /// arguments (`-1`: any number), replacing a function with the same name
+    /// and argument count, built-in or not. A function named `regexp` with
+    /// two arguments also implements the `REGEXP` operator.
+    ///
+    /// An error `x_func` returns, and a panic in it ([`Error::UnwindingPanic`]),
+    /// fails the statement with SQLITE_ERROR and the error's text, as in
+    /// SQLite. Statements prepared before the call must be prepared again.
+    pub fn create_scalar_function<F, T>(
+        &self,
+        fn_name: &str,
+        n_arg: i32,
+        flags: functions::FunctionFlags,
+        x_func: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&functions::Context<'_>) -> Result<T> + Send + 'static,
+        T: ToSql + 'static,
+    {
+        // The arguments `sqlite3_create_function` refuses as misuse.
+        let max_args = i32::from(fsqlite_types::limits::MAX_FUNCTION_ARG);
+        if !(-1..=max_args).contains(&n_arg) || fn_name.is_empty() || fn_name.len() > 255 {
+            return Err(Error::SqliteFailure(
+                ffi::Error::new(ffi::SQLITE_MISUSE),
+                Some("bad parameter or other API misuse".to_owned()),
+            ));
+        }
+        let function = functions::ScalarClosure::new(fn_name, n_arg, flags, x_func);
+        if function.deterministic() {
+            self.as_async()
+                .register_deterministic_scalar_function(function);
+        } else {
+            self.as_async()
+                .register_nondeterministic_scalar_function(function);
+        }
+        Ok(())
+    }
+
     /// Close the connection: roll back an open transaction and checkpoint.
     /// Dropping it does the same; `close` reports a failure.
     pub fn close(mut self) -> Result<(), (Self, Error)> {
@@ -1545,10 +1743,31 @@ impl Drop for Connection {
     }
 }
 
+/// The engine statement behind a [`Statement`].
+///
+/// Held as a trait object because `dyn EngineStatement + 'conn` is covariant
+/// in `'conn` and the engine's `PreparedStatement<'conn>` is not. That lets a
+/// [`Row`] hold `&'stmt Statement<'stmt>` and lend it out through `AsRef`,
+/// as rusqlite's does (`row.as_ref().column_index(name)`).
+trait EngineStatement {
+    fn execute(&self, values: &[SqliteValue]) -> Result<usize>;
+    fn query(&self, values: &[SqliteValue]) -> Result<Vec<crate::Row>>;
+}
+
+impl EngineStatement for crate::PreparedStatement<'_> {
+    fn execute(&self, values: &[SqliteValue]) -> Result<usize> {
+        Ok(block_on(self.execute_with_params(values))?)
+    }
+
+    fn query(&self, values: &[SqliteValue]) -> Result<Vec<crate::Row>> {
+        Ok(block_on(self.query_with_params(values))?)
+    }
+}
+
 /// A compiled statement.
 pub struct Statement<'conn> {
     conn: &'conn Connection,
-    stmt: crate::PreparedStatement<'conn>,
+    stmt: Box<dyn EngineStatement + 'conn>,
     slots: Rc<BindParameterSlots>,
     names: Vec<String>,
 }
@@ -1566,7 +1785,7 @@ impl Statement<'_> {
     /// Run the statement with `params`; returns the number of rows changed.
     pub fn execute<P: Params>(&mut self, params: P) -> Result<usize> {
         let values = params.bind_to(&self.slots)?;
-        Ok(block_on(self.stmt.execute_with_params(&values))?)
+        self.stmt.execute(&values)
     }
 
     /// Run an INSERT that must insert exactly one row; returns its rowid.
@@ -1580,9 +1799,9 @@ impl Statement<'_> {
     /// Run the query; step through its rows with [`Rows::next`].
     pub fn query<P: Params>(&mut self, params: P) -> Result<Rows<'_>> {
         let values = params.bind_to(&self.slots)?;
-        let rows = block_on(self.stmt.query_with_params(&values))?;
+        let rows = self.stmt.query(&values)?;
         Ok(Rows {
-            names: &self.names,
+            stmt: self,
             pending: rows.into_iter(),
             current: None,
         })
@@ -1683,7 +1902,7 @@ fn column_index(names: &[String], name: &str) -> Result<usize> {
 
 /// The rows of a query, stepped with [`Rows::next`].
 pub struct Rows<'stmt> {
-    names: &'stmt [String],
+    stmt: &'stmt Statement<'stmt>,
     pending: std::vec::IntoIter<crate::Row>,
     current: Option<Row<'stmt>>,
 }
@@ -1693,10 +1912,17 @@ impl<'stmt> Rows<'stmt> {
     #[allow(clippy::should_implement_trait)] // rusqlite's lending `next`
     pub fn next(&mut self) -> Result<Option<&Row<'stmt>>> {
         self.current = self.pending.next().map(|values| Row {
-            names: self.names,
+            stmt: self.stmt,
             values,
         });
         Ok(self.current.as_ref())
+    }
+
+    /// The statement these rows come from (rusqlite's `Rows::as_ref`).
+    #[allow(clippy::should_implement_trait)] // rusqlite's inherent `as_ref`
+    #[must_use]
+    pub const fn as_ref(&self) -> Option<&Statement<'stmt>> {
+        Some(self.stmt)
     }
 
     /// Map each remaining row with `f`.
@@ -1780,26 +2006,35 @@ impl RowIndex for &str {
 
 /// One row of a query.
 pub struct Row<'stmt> {
-    names: &'stmt [String],
+    stmt: &'stmt Statement<'stmt>,
     values: crate::Row,
 }
 
 impl fmt::Debug for Row<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_map()
-            .entries(self.names.iter().zip(self.values.values()))
+            .entries(self.stmt.names.iter().zip(self.values.values()))
             .finish()
+    }
+}
+
+/// The statement a row comes from, for its column metadata
+/// (`row.as_ref().column_index(name)`), as in rusqlite.
+impl<'stmt> AsRef<Statement<'stmt>> for Row<'stmt> {
+    fn as_ref(&self) -> &Statement<'stmt> {
+        self.stmt
     }
 }
 
 impl Row<'_> {
     /// Column `index` (a position or a column name) as `T`.
     pub fn get<I: RowIndex, T: FromSql>(&self, index: I) -> Result<T> {
-        let index = index.index_in(self.names)?;
+        let names = &self.stmt.names;
+        let index = index.index_in(names)?;
         let value = self.value_at(index);
         T::column_result(value).map_err(|error| match error {
             types::FromSqlError::InvalidType => {
-                Error::InvalidColumnType(index, self.names[index].clone(), value.data_type())
+                Error::InvalidColumnType(index, names[index].clone(), value.data_type())
             }
             types::FromSqlError::OutOfRange(wide) => Error::IntegralValueOutOfRange(index, wide),
             types::FromSqlError::Other(source) => {
@@ -1818,7 +2053,7 @@ impl Row<'_> {
 
     /// Column `index` as a borrowed value.
     pub fn get_ref<I: RowIndex>(&self, index: I) -> Result<ValueRef<'_>> {
-        Ok(self.value_at(index.index_in(self.names)?))
+        Ok(self.value_at(index.index_in(&self.stmt.names)?))
     }
 
     /// [`Row::get_ref`], panicking on error.
@@ -2277,6 +2512,21 @@ mod tests {
                     .unwrap()
                     .exists(["COBOL"]),
             ));
+            // A row lends out its statement's column metadata (casr's
+            // tolerant column lookup: `row.as_ref().column_index(name)`).
+            trace.push(show(conn.query_row(
+                "SELECT 1 AS one, 2 AS Two",
+                [],
+                |row| {
+                    let stmt = row.as_ref();
+                    Ok((
+                        stmt.column_count(),
+                        stmt.column_index("two")?,
+                        stmt.column_name(0)?.to_owned(),
+                        stmt.column_index("three").is_err(),
+                    ))
+                },
+            )));
             // Errors applications match on.
             trace.push(show(
                 conn.execute("INSERT INTO person(name) VALUES (?1)", ["Ada"]),
@@ -2372,6 +2622,197 @@ mod tests {
                 .any(|line| line.contains("ConstraintViolation")),
             "the scenario must exercise a constraint error: {theirs:?}"
         );
+    }
+
+    /// rusqlite code that registers scalar functions, compiled against module
+    /// `$m`. A function's own error text is what the application sees in both
+    /// engines, so those errors keep their message; errors the engine words
+    /// itself (arity, index rules) keep only their codes.
+    macro_rules! udf_scenario {
+        ($m:ident) => {{
+            use std::sync::Arc;
+            use std::sync::atomic::{AtomicI64, Ordering};
+            use $m::Connection;
+            use $m::functions::FunctionFlags;
+            use $m::types::Value;
+            fn show<T: std::fmt::Debug>(result: $m::Result<T>) -> String {
+                match result {
+                    Ok(value) => format!("ok {value:?}"),
+                    Err($m::Error::SqliteFailure(error, message)) => {
+                        format!("err {:?} {} {message:?}", error.code, error.extended_code)
+                    }
+                    Err(other) => format!("err other {other}"),
+                }
+            }
+            // Errors the engine words itself at prepare (arity, index rules):
+            // rusqlite reports those as `SqlInputError`, which this module does
+            // not have yet, so compare only that the statement fails.
+            fn fails<T: std::fmt::Debug>(result: $m::Result<T>) -> String {
+                match result {
+                    Ok(value) => format!("ok {value:?}"),
+                    Err(_) => "err".to_owned(),
+                }
+            }
+            let mut trace: Vec<String> = Vec::new();
+            let conn = Connection::open_in_memory().unwrap();
+            let pure = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC;
+            // NULL in, NULL out (rano's `rano_report_utc` shape).
+            conn.create_scalar_function("shout", 1, pure, |ctx| {
+                let value: Option<String> = ctx.get(0)?;
+                Ok(value.map(|value| value.to_uppercase()))
+            })
+            .unwrap();
+            conn.create_scalar_function("halve", 1, pure, |ctx| {
+                let value: f64 = ctx.get(0)?;
+                Ok(value / 2.0)
+            })
+            .unwrap();
+            // The function's own error (rano's `rano_utc` shape).
+            conn.create_scalar_function("checked", 1, pure, |ctx| {
+                let value: i64 = ctx.get(0)?;
+                if value < 0 {
+                    return Err($m::Error::UserFunctionError(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("negative input {value}"),
+                    ))));
+                }
+                Ok(value * 10)
+            })
+            .unwrap();
+            conn.create_scalar_function("nargs", -1, pure, |ctx| {
+                Ok(i64::try_from(ctx.len()).unwrap())
+            })
+            .unwrap();
+            // Not deterministic: every call must run.
+            let calls = Arc::new(AtomicI64::new(0));
+            {
+                let calls = Arc::clone(&calls);
+                conn.create_scalar_function("tick", 0, FunctionFlags::SQLITE_UTF8, move |_ctx| {
+                    Ok(calls.fetch_add(1, Ordering::SeqCst) + 1)
+                })
+                .unwrap();
+            }
+            // `X REGEXP Y` calls regexp(Y, X).
+            conn.create_scalar_function("regexp", 2, pure, |ctx| {
+                let pattern: String = ctx.get(0)?;
+                let text: Option<String> = ctx.get(1)?;
+                Ok(text.is_some_and(|text| text.contains(&pattern)))
+            })
+            .unwrap();
+            conn.create_scalar_function("kind", 1, pure, |ctx| {
+                Ok(format!("{:?}", ctx.get_raw(0).data_type()))
+            })
+            .unwrap();
+            conn.create_scalar_function("boom", 0, pure, |_ctx| -> $m::Result<i64> {
+                panic!("a user function panicked on purpose")
+            })
+            .unwrap();
+            let value = |sql: &str| show(conn.query_row(sql, [], |row| row.get::<_, Value>(0)));
+            trace.push(value("SELECT shout('ada')"));
+            trace.push(value("SELECT shout(NULL)"));
+            trace.push(value("SELECT halve(9)"));
+            trace.push(value("SELECT halve('nine')"));
+            trace.push(value("SELECT checked(4)"));
+            trace.push(value("SELECT checked(-2)"));
+            trace.push(value("SELECT checked(1.5)"));
+            trace.push(value("SELECT nargs()"));
+            trace.push(value("SELECT nargs(1, 'a', NULL, x'00')"));
+            trace.push(value("SELECT tick()"));
+            trace.push(value("SELECT tick()"));
+            trace.push(value("SELECT boom()"));
+            trace.push(value("SELECT checked(3)"));
+            trace.push(fails(
+                conn.query_row("SELECT halve(1, 2)", [], |row| row.get::<_, Value>(0)),
+            ));
+            trace.push(show(conn.query_row(
+                "SELECT kind(1), kind(1.5), kind('t'), kind(x'00'), kind(NULL)",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )));
+            trace.push(show(conn.query_row(
+                "SELECT 'banana' REGEXP 'nan', 'banana' REGEXP 'x', NULL REGEXP 'x'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )));
+            // In statements over a table, with parameters and an index.
+            conn.execute_batch("CREATE TABLE t(name TEXT)").unwrap();
+            for name in ["grace", "ada", "linus"] {
+                trace.push(show(
+                    conn.execute("INSERT INTO t(name) VALUES (shout(?1))", [name]),
+                ));
+            }
+            trace.push(show(conn.execute(
+                "UPDATE t SET name = name || halve(5) WHERE name REGEXP 'AD'",
+                [],
+            )));
+            trace.push(fails(conn.execute("CREATE INDEX t_tick ON t(tick())", [])));
+            trace.push(show(
+                conn.execute("CREATE INDEX t_shout ON t(shout(name))", []),
+            ));
+            trace.push(show(
+                conn.prepare("SELECT name FROM t WHERE shout(name) = ?1 ORDER BY name")
+                    .and_then(|mut stmt| {
+                        stmt.query_map(["LINUS"], |row| row.get::<_, String>(0))?
+                            .collect::<$m::Result<Vec<_>>>()
+                    }),
+            ));
+            trace.push(show(conn.query_row(
+                "SELECT count(*), sum(tick() > 0) FROM t WHERE name REGEXP 'A'",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )));
+            trace.push(format!("calls {}", calls.load(Ordering::SeqCst)));
+            // Replacing a built-in, and the arguments SQLite refuses.
+            conn.create_scalar_function("upper", 1, pure, |_ctx| Ok("replaced"))
+                .unwrap();
+            trace.push(value("SELECT upper('a')"));
+            // SQLite leaves the message of a misuse to earlier calls; compare the code.
+            trace.push(format!(
+                "misuse {:?}",
+                conn.create_scalar_function("bad", -2, pure, |_ctx| Ok(0_i64))
+                    .err()
+                    .and_then(|error| error.sqlite_error_code())
+            ));
+            trace
+        }};
+    }
+
+    #[test]
+    fn user_functions_behave_like_rusqlite() {
+        let theirs = udf_scenario!(stock);
+        let mine = udf_scenario!(ours);
+        for (index, (expected, actual)) in theirs.iter().zip(&mine).enumerate() {
+            assert_eq!(actual, expected, "trace step {index}");
+        }
+        assert_eq!(mine.len(), theirs.len());
+        // The scenario must reach a function's own error, a type error, a
+        // panic, and per-call evaluation of a non-deterministic function.
+        for needle in [
+            "negative input -2",
+            "Invalid function parameter type Text at index 0",
+            "unwinding panic",
+            "ok Integer(2)",
+            "misuse Some(ApiMisuse)",
+        ] {
+            assert!(
+                theirs.iter().any(|line| line.contains(needle)),
+                "the scenario must reach {needle:?}: {theirs:?}"
+            );
+        }
     }
 
     /// The drop-in promise: a file rusqlite wrote opens here, takes writes,

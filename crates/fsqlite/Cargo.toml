@@ -8,10 +8,14 @@ repository.workspace = true
 
 [dependencies]
 asupersync = { workspace = true, optional = true }
+# `blocking::functions::FunctionFlags`, with rusqlite's bitflags API.
+bitflags = { workspace = true }
 futures-lite = { workspace = true, optional = true }
 fsqlite-types = { workspace = true }
 fsqlite-error = { workspace = true }
 fsqlite-core = { workspace = true, default-features = false }
+# `blocking::functions` adapts closures to the engine's function trait.
+fsqlite-func = { workspace = true }
 fsqlite-vfs = { workspace = true, default-features = false }
 # Reuse the existing guarded repair implementation; no subprocess or private runtime.
 fsqlite-wal = { workspace = true, default-features = false, optional = true }

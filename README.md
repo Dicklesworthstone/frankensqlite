@@ -1437,13 +1437,29 @@ It covers `Connection` (`open`, `open_in_memory`, `open_with_flags`, `execute`,
 `execute_batch`, `prepare`, `query_row`, transactions, pragmas, `busy_timeout`,
 `changes`, `last_insert_rowid`), `Statement`, `Rows`, `Row::get` by index or
 name with `FromSql`/`ToSql`, positional and named parameters (`params!`,
-`named_params!`, arrays, tuples, `params_from_iter`), `OptionalExtension`, and an
-`Error` with rusqlite's variants and `ErrorCode`s. A unit test runs the same
-rusqlite-style code against rusqlite and against `fsqlite::blocking` and
-requires identical results, and another moves a database file between the two.
-Differences: a `Connection` is not `Send` (give each thread its own), and
-user-defined functions, savepoint objects, online backup, blob I/O, hooks and the
+`named_params!`, arrays, tuples, `params_from_iter`), `OptionalExtension`, nested
+savepoints, scalar user-defined functions (`create_scalar_function`, which also
+serves the `REGEXP` operator), and an `Error` with rusqlite's variants and
+`ErrorCode`s. Unit tests run the same rusqlite-style code, including user-defined
+functions, against rusqlite and against `fsqlite::blocking` and require identical
+results, and another moves a database file between the two. Differences: a
+`Connection` is not `Send` (give each thread its own), and aggregate and window
+user-defined functions, online backup, blob I/O, hooks and the
 `chrono`/`uuid`/`serde_json` conversions are not there yet.
+
+Debug builds need a bigger thread stack than rusqlite. Unoptimized, the engine
+uses 3-4 MiB of stack for ordinary statements, more than the 2 MiB Rust gives
+spawned and test threads, so `cargo test` aborts with "has overflowed its
+stack". Release builds run the same code in under 1 MiB. Until that is fixed
+(bd-w4pr1.28), raise the default in the application's `.cargo/config.toml`:
+
+```toml
+[env]
+RUST_MIN_STACK = "8388608"
+```
+
+A thread created with an explicit `stack_size` needs at least 4 MiB in a debug
+build.
 
 ### Transaction API
 
