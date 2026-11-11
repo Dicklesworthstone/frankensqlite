@@ -51042,7 +51042,7 @@ impl Connection {
         {
             return false;
         }
-        let vdbe_expr = |expr: &Expr| !expr_has_any_subquery(expr) && join_expr_is_vdbe_eligible(expr);
+        let vdbe_expr = join_aggregate_condition_is_vdbe_candidate;
         let base_table = |source: &TableOrSubquery| {
             matches!(source, TableOrSubquery::Table { name, .. }
                 if !self.table_name_is_virtual(&name.name))
@@ -113530,13 +113530,57 @@ fn join_aggregate_arg_is_vdbe_candidate(expr: &Expr) -> bool {
         } if order_by.is_empty() => args.iter().all(join_aggregate_arg_is_vdbe_candidate),
         Expr::BinaryOp {
             left,
-            op: BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply,
+            op:
+                BinaryOp::Add
+                | BinaryOp::Subtract
+                | BinaryOp::Multiply
+                | BinaryOp::Divide
+                | BinaryOp::Modulo
+                | BinaryOp::Concat,
             right,
             ..
         } => {
             join_aggregate_arg_is_vdbe_candidate(left)
                 && join_aggregate_arg_is_vdbe_candidate(right)
         }
+        _ => !expr_has_any_subquery(expr) && join_expr_is_vdbe_eligible(expr),
+    }
+}
+
+/// Whether an ON or WHERE expression of an aggregate over a join is one VDBE
+/// codegen may compile: what [`join_expr_is_vdbe_eligible`] accepts, with the
+/// other binary operators the join emitter compiles (`/`, `%`, `||`, `&`,
+/// `|`, `<<`, `>>`) at any depth. `ON u.a = p.k % 2000` then reaches the
+/// lookup planner, which already takes such an expression as a key.
+fn join_aggregate_condition_is_vdbe_candidate(expr: &Expr) -> bool {
+    match expr {
+        Expr::BinaryOp {
+            left, op, right, ..
+        } => {
+            matches!(
+                op,
+                BinaryOp::Eq
+                    | BinaryOp::Ne
+                    | BinaryOp::Lt
+                    | BinaryOp::Le
+                    | BinaryOp::Gt
+                    | BinaryOp::Ge
+                    | BinaryOp::Add
+                    | BinaryOp::Subtract
+                    | BinaryOp::Multiply
+                    | BinaryOp::Divide
+                    | BinaryOp::Modulo
+                    | BinaryOp::Concat
+                    | BinaryOp::BitAnd
+                    | BinaryOp::BitOr
+                    | BinaryOp::ShiftLeft
+                    | BinaryOp::ShiftRight
+                    | BinaryOp::And
+                    | BinaryOp::Or
+            ) && join_aggregate_condition_is_vdbe_candidate(left)
+                && join_aggregate_condition_is_vdbe_candidate(right)
+        }
+        Expr::IsNull { expr, .. } => join_aggregate_condition_is_vdbe_candidate(expr),
         _ => !expr_has_any_subquery(expr) && join_expr_is_vdbe_eligible(expr),
     }
 }

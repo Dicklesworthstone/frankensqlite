@@ -318,6 +318,56 @@ const SCALAR_CALL_GENERAL_PATH_QUERIES: &[&str] = &[
     "SELECT sum(length(t.b)) FROM u JOIN t ON length(t.b) = u.a",
 ];
 
+/// bd-w4pr1.13.6: ON, WHERE and aggregate arguments may use every binary
+/// operator the join emitter compiles. Division and modulo by zero are NULL
+/// (a NULL key matches nothing; a LEFT JOIN still returns its row), `%` on a
+/// real truncates its operands, and `||` makes a text key.
+const OPERATOR_CONDITION_QUERIES: &[&str] = &[
+    "SELECT count(*), count(t.id) FROM u LEFT JOIN t ON t.id = u.id % 4",
+    "SELECT count(*), sum(t.c) FROM u JOIN t ON t.id = u.id * 10 / 5",
+    "SELECT count(*) FROM u JOIN t ON t.b = u.a || ''",
+    "SELECT count(*) FROM u JOIN t ON t.d = u.d || ''",
+    "SELECT count(*), sum(t.a) FROM u JOIN t ON t.id = (u.id & 7) | 1",
+    "SELECT count(*), sum(t.id) FROM u JOIN t ON t.id = u.id << 1",
+    "SELECT count(*), sum(t.id) FROM u JOIN t ON t.id = u.id >> 1",
+    "SELECT count(*) FROM u JOIN t ON t.id = u.r % 3",
+    "SELECT count(*) FROM u JOIN t ON t.id = u.id / 0",
+    "SELECT count(*), count(t.id) FROM u LEFT JOIN t ON t.id = u.id / 0",
+    "SELECT count(*), count(t.id) FROM u LEFT JOIN t ON t.id = u.id % 0",
+    "SELECT count(*) FROM u JOIN t ON t.a = u.a WHERE t.c / 2 > 1 AND u.id % 2 = 1",
+    "SELECT count(*), sum(u.r) FROM u JOIN t ON t.a = u.a WHERE (t.id % 0) IS NULL",
+    "SELECT count(*), sum(u.r) FROM u JOIN t ON t.a = u.a WHERE t.b || u.b <> '11'",
+    "SELECT sum(t.c / u.r), sum(t.id % 3), max(t.b || '-' || u.b) FROM u JOIN t ON t.a = u.a",
+    "SELECT sum(t.a / 0), total(t.a % 0), count(t.b || NULL) FROM u JOIN t ON t.a = u.a",
+    "SELECT count(*), sum(t.c) FROM u, t WHERE t.id = u.id % 5 AND t.a | 1 = t.a",
+];
+
+#[test]
+fn join_aggregates_over_operator_conditions_match_sqlite() {
+    for indexed in [false, true] {
+        asupersync::test_utils::run_test(|| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("join_aggregate_operators.db");
+            let f = Connection::open(path.to_str().unwrap()).await.unwrap();
+            let r = rusqlite::Connection::open_in_memory().unwrap();
+            let indexes: &[&str] = if indexed { INDEXES } else { &[] };
+            for sql in SETUP.iter().chain(indexes) {
+                f.execute(sql).await.unwrap();
+                r.execute(sql, []).unwrap();
+            }
+            for sql in OPERATOR_CONDITION_QUERIES {
+                assert_agree(&f, &r, sql, &[], &[]).await;
+            }
+            let lookup_sql = "SELECT count(*), count(t.id) FROM u LEFT JOIN t ON t.id = u.id % 4";
+            let ops = opcodes(&f, lookup_sql).await;
+            assert!(
+                ops.iter().any(|op| op == "AggStep") && ops.iter().any(|op| op == "SeekRowid"),
+                "`{lookup_sql}` must run as a rowid lookup loop: {ops:?}"
+            );
+        });
+    }
+}
+
 /// A replacement for the builtin `length`: every value is 7 long.
 struct SevenLong;
 
