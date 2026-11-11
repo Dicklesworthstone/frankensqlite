@@ -2760,8 +2760,12 @@ mod tests {
                 [],
             )));
             trace.push(fails(conn.execute("CREATE INDEX t_tick ON t(tick())", [])));
+            // rusqlite's `execute` of DDL returns `sqlite3_changes()`, which
+            // still holds the count of the last INSERT/UPDATE/DELETE; this
+            // module returns the statement's own 0. Compare only success.
             trace.push(show(
-                conn.execute("CREATE INDEX t_shout ON t(shout(name))", []),
+                conn.execute("CREATE INDEX t_shout ON t(shout(name))", [])
+                    .map(|_| ()),
             ));
             trace.push(show(
                 conn.prepare("SELECT name FROM t WHERE shout(name) = ?1 ORDER BY name")
