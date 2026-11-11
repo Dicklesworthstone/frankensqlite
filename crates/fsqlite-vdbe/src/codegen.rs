@@ -10467,6 +10467,7 @@ fn codegen_select_ordered_scan(
             scan_done,
             &[(table, table_alias)],
             ctx,
+            None,
         )?;
         b.resolve_label(seek_row);
         (Some((outer_loop, seek_row)), 0)
@@ -13477,10 +13478,28 @@ fn emit_outer_loop_start(
     done: crate::Label,
     tables: &[(&TableSchema, Option<&str>)],
     ctx: &CodegenContext,
+    scan_floor: Option<(i64, bool)>,
 ) -> Result<OuterLoop, CodegenError> {
     match seek {
         None => {
-            b.emit_jump_to_label(Opcode::Rewind, left_cursor, 0, done, P4::None, 0);
+            // A scan the WHERE bounds from below starts at the bound: the
+            // first rowid at or after it (inclusive) or after it.
+            if let Some((floor, inclusive)) = scan_floor {
+                let floor_reg = b.alloc_reg();
+                if let Ok(small) = i32::try_from(floor) {
+                    b.emit_op(Opcode::Integer, small, floor_reg, 0, P4::None, 0);
+                } else {
+                    b.emit_op(Opcode::Int64, 0, floor_reg, 0, P4::Int64(floor), 0);
+                }
+                let seek_opcode = if inclusive {
+                    Opcode::SeekGE
+                } else {
+                    Opcode::SeekGT
+                };
+                b.emit_jump_to_label(seek_opcode, left_cursor, floor_reg, done, P4::None, 0);
+            } else {
+                b.emit_jump_to_label(Opcode::Rewind, left_cursor, 0, done, P4::None, 0);
+            }
             Ok(OuterLoop::Scan)
         }
         Some(OuterEqualitySeek::Rowid { probe }) => {
@@ -13872,6 +13891,26 @@ fn codegen_single_join_lookup_select(
         Some((right_table, right_alias)),
         None,
     );
+    // bd-w4pr1.13.16: a WHERE term that reads only the outer table decides the
+    // outer row before the lookup. A row that fails it produces no output
+    // whether or not the join matches (a LEFT JOIN's null-extended row carries
+    // the same outer values), so its lookup is skipped. For an inner join the
+    // same holds for an ON term the lookup did not consume. The terms are
+    // tested again with the whole WHERE after the lookup, as before.
+    let mut outer_row_terms = Vec::new();
+    if let Some(where_expr) = where_clause {
+        collect_conjunctive_terms(where_expr, &mut outer_row_terms);
+    }
+    if matches!(plan.join_kind, fsqlite_ast::JoinKind::Inner) {
+        outer_row_terms.extend(plan.on_residual.iter().copied());
+    }
+    outer_row_terms.retain(|term| !expr_references_scan(term, right_table, right_alias));
+    // The tightest integer lower bound those terms put on the outer rowid:
+    // the larger bound, and of two equal ones the exclusive.
+    let scan_floor = outer_row_terms
+        .iter()
+        .filter_map(|term| outer_rowid_integer_floor(term, &tables))
+        .max_by_key(|(bound, inclusive)| (*bound, !*inclusive));
     let outer_loop = emit_outer_loop_start(
         b,
         outer_seek.as_ref(),
@@ -13880,26 +13919,11 @@ fn codegen_single_join_lookup_select(
         done_label,
         &tables,
         ctx,
+        scan_floor,
     )?;
     b.resolve_label(next_left_label);
-    // bd-w4pr1.13.16: a WHERE term that reads only the outer table decides the
-    // outer row before the lookup. A row that fails it produces no output
-    // whether or not the join matches (a LEFT JOIN's null-extended row carries
-    // the same outer values), so its lookup is skipped. For an inner join the
-    // same holds for an ON term the lookup did not consume. The terms are
-    // tested again with the whole WHERE after the lookup, as before.
     let outer_row_rejected = b.emit_label();
-    let mut outer_row_terms = Vec::new();
-    if let Some(where_expr) = where_clause {
-        collect_conjunctive_terms(where_expr, &mut outer_row_terms);
-    }
-    if matches!(plan.join_kind, fsqlite_ast::JoinKind::Inner) {
-        outer_row_terms.extend(plan.on_residual.iter().copied());
-    }
     for term in outer_row_terms {
-        if expr_references_scan(term, right_table, right_alias) {
-            continue;
-        }
         // A table scan hands out rowids in ascending order, so a term that
         // bounds the outer rowid from above by a value fixed for the
         // statement ends the scan the first time it fails.
@@ -15525,21 +15549,53 @@ fn is_outer_rowid_upper_bound(term: &Expr, tables: &[(&TableSchema, Option<&str>
             Expr::Literal(..) | Expr::Placeholder(PlaceholderType::Numbered(_), _)
         )
     };
-    let outer_rowid = |expr: &Expr| {
-        let Expr::Column(col_ref, _) = expr else {
-            return false;
-        };
-        match resolve_join_column_ref(col_ref.table.as_deref(), &col_ref.column, tables) {
-            Ok(JoinColumnResolution::HiddenRowid(0)) => true,
-            Ok(JoinColumnResolution::Column(0, column)) => tables[0].0.columns[column].is_ipk,
-            _ => false,
-        }
-    };
     match op {
-        BinaryOp::Lt | BinaryOp::Le => outer_rowid(left) && fixed(right),
-        BinaryOp::Gt | BinaryOp::Ge => fixed(left) && outer_rowid(right),
+        BinaryOp::Lt | BinaryOp::Le => is_outer_rowid_column(left, tables) && fixed(right),
+        BinaryOp::Gt | BinaryOp::Ge => fixed(left) && is_outer_rowid_column(right, tables),
         _ => false,
     }
+}
+
+/// Whether `expr` names the rowid of the outer table (`tables[0]`): its
+/// INTEGER PRIMARY KEY column or a hidden rowid alias.
+fn is_outer_rowid_column(expr: &Expr, tables: &[(&TableSchema, Option<&str>)]) -> bool {
+    let Expr::Column(col_ref, _) = expr else {
+        return false;
+    };
+    match resolve_join_column_ref(col_ref.table.as_deref(), &col_ref.column, tables) {
+        Ok(JoinColumnResolution::HiddenRowid(0)) => true,
+        Ok(JoinColumnResolution::Column(0, column)) => tables[0].0.columns[column].is_ipk,
+        _ => false,
+    }
+}
+
+/// The integer literal `term` bounds the outer table's rowid from below by,
+/// and whether the bound is inclusive: `t.id > 5`, `t.id >= 5`, `5 < t.id`,
+/// `5 <= t.id` (bd-w4pr1.13.16). The outer scan can start there.
+fn outer_rowid_integer_floor(
+    term: &Expr,
+    tables: &[(&TableSchema, Option<&str>)],
+) -> Option<(i64, bool)> {
+    use fsqlite_ast::BinaryOp;
+
+    let Expr::BinaryOp {
+        left, op, right, ..
+    } = term
+    else {
+        return None;
+    };
+    let integer = |expr: &Expr| match expr {
+        Expr::Literal(Literal::Integer(value), _) => Some(*value),
+        _ => None,
+    };
+    let (bound, rowid, inclusive) = match op {
+        BinaryOp::Gt => (integer(right)?, left, false),
+        BinaryOp::Ge => (integer(right)?, left, true),
+        BinaryOp::Lt => (integer(left)?, right, false),
+        BinaryOp::Le => (integer(left)?, right, true),
+        _ => return None,
+    };
+    is_outer_rowid_column(rowid, tables).then_some((bound, inclusive))
 }
 
 fn resolve_join_column_ref(

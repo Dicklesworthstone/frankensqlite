@@ -535,6 +535,73 @@ fn join_lookups_stop_at_an_outer_rowid_bound_and_match_sqlite() {
     }
 }
 
+/// bd-w4pr1.13.16: an integer lower bound on the outer table's rowid starts
+/// the outer scan with a seek. Of several bounds the tightest starts it; a
+/// bound on another column, a bound that is not an integer literal, and a
+/// bound under OR start it at the first row.
+const OUTER_ROWID_FLOOR_QUERIES: &[&str] = &[
+    "SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE u.id > 2 ORDER BY u.id",
+    "SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE u.id >= 3 ORDER BY u.id",
+    "SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE 2 < u.id ORDER BY u.id",
+    "SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE 3 <= u.rowid ORDER BY u.id",
+    "SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE u.id > 2 AND u.id >= 5 ORDER BY u.id",
+    "SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE u.id >= 5 AND u.id > 5 ORDER BY u.id",
+    "SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE u.id > 100 ORDER BY u.id",
+    "SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE u.id > 0 ORDER BY u.id",
+    "SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE u.id > 9223372036854775807 ORDER BY u.id",
+    "SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE u.id > 2 AND u.id <= 5 ORDER BY u.id",
+    "SELECT u.id, t.id FROM u LEFT JOIN t ON t.a = u.a WHERE u.id >= 4 ORDER BY u.id, t.id",
+    "SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE u.id > 2.5 ORDER BY u.id",
+    "SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE u.id > '2' ORDER BY u.id",
+    "SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE u.id > 5 OR u.r < 1 ORDER BY u.id",
+    "SELECT u.id, t.id FROM u JOIN t ON t.id = u.id AND u.id > 2 ORDER BY u.id",
+    "SELECT u.id, t.id FROM u LEFT JOIN t ON t.id = u.id AND u.id > 2 ORDER BY u.id",
+    "SELECT t.id, u.id FROM t LEFT JOIN u ON u.id = t.id WHERE t.a >= 5 ORDER BY t.id",
+    "SELECT count(*), sum(t.c) FROM u JOIN t ON t.a = u.a WHERE u.id > 2",
+    "SELECT count(*), count(t.id) FROM u LEFT JOIN t ON t.a = u.a WHERE u.id >= 6",
+    "SELECT count(*), sum(t.c) FROM u, t WHERE t.id = u.a AND u.id > 1 AND u.id < 6",
+];
+
+#[test]
+fn join_lookups_start_at_an_outer_rowid_floor_and_match_sqlite() {
+    for indexed in [false, true] {
+        asupersync::test_utils::run_test(|| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("join_outer_rowid_floor.db");
+            let f = Connection::open(path.to_str().unwrap()).await.unwrap();
+            let r = rusqlite::Connection::open_in_memory().unwrap();
+            let indexes: &[&str] = if indexed { INDEXES } else { &[] };
+            for sql in SETUP.iter().chain(indexes) {
+                f.execute(sql).await.unwrap();
+                r.execute(sql, []).unwrap();
+            }
+            for sql in OUTER_ROWID_FLOOR_QUERIES {
+                assert_agree(&f, &r, sql, &[], &[]).await;
+            }
+
+            // How the outer cursor (0) is first positioned.
+            let outer_start = |ops: &[(i64, String, i64, i64)]| {
+                ops.iter()
+                    .find(|(_, op, cursor, _)| {
+                        *cursor == 0 && matches!(op.as_str(), "Rewind" | "SeekGE" | "SeekGT")
+                    })
+                    .map(|(_, op, _, _)| op.clone())
+            };
+            for (sql, start) in [
+                ("SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE u.id > 2", "SeekGT"),
+                ("SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE 3 <= u.id", "SeekGE"),
+                ("SELECT u.id, t.id FROM u LEFT JOIN t ON t.id = u.id AND u.id > 2", "Rewind"),
+                ("SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE u.r > 2", "Rewind"),
+                ("SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE u.id > 2.5", "Rewind"),
+                ("SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE u.id > 5 OR u.r < 1", "Rewind"),
+            ] {
+                let ops = program(&f, sql).await;
+                assert_eq!(outer_start(&ops).as_deref(), Some(start), "`{sql}`: {ops:?}");
+            }
+        });
+    }
+}
+
 /// A replacement for the builtin `length`: every value is 7 long.
 struct SevenLong;
 
