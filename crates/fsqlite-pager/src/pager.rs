@@ -8154,12 +8154,29 @@ impl PagerCommittedSnapshot {
 /// our locks, may still unlink it) and no local commit since therefore mean
 /// the refresh would find exactly what it found last time. A transaction's
 /// own commit may carry it forward only when that commit is provably the only
-/// change since (see `advance_refresh_signature_past_own_commit`).
+/// change since (see `carry_refresh_state_past_own_flush`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WalRefreshSignature {
     shm_header: fsqlite_wal::wal_index::WalIndexHdr,
     wal_identity: FileIdentity,
     commit_seq: CommitSeq,
+}
+
+/// The durable certified database size at one published WAL-index header.
+///
+/// A flusher floors its base size with the size the latest durable commit
+/// certified (bd-vnxjd). That floor is a function of the published WAL
+/// horizon alone: the commit marker at the shared header's last frame and the
+/// certificate covering it, both immutable within their WAL generation. Every
+/// commit, checkpoint reset and recovery from any connection or process
+/// rewrites the header, so while it is identical the floor is the remembered
+/// one and the WAL and certificate sidecar need not be read again to learn it.
+/// The append gate still derives the floor from the files before any frame is
+/// written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DurableDbSizeFloor {
+    shm_header: fsqlite_wal::wal_index::WalIndexHdr,
+    db_size: u32,
 }
 
 /// The WAL-index header and `-wal` file of a WAL-mode database as they stand
@@ -8247,27 +8264,40 @@ async fn observe_vouched_wal_index_header<F: VfsFile>(
 /// re-reads the path and falls back to a full refresh if it changed.
 /// Best-effort: the commit is durable, so any failure leaves the signature
 /// unchanged and the next boundary refreshes.
-async fn advance_refresh_signature_past_own_commit<F: VfsFile>(
+///
+/// The same observation records the size floor of that flush (see
+/// [`DurableDbSizeFloor`]): a header whose last frame is the flush's own
+/// commit marker is the flush's own publication, and the size that marker and
+/// its certificate carry is `certified_db_size`. This holds for a flush of any
+/// number of batches, with or without a prior signature.
+async fn carry_refresh_state_past_own_flush<F: VfsFile>(
     cx: &Cx,
     wal_backend: &SharedWalBackend,
     db_file: &SharedDbFile<F>,
     inner_arc: &Arc<Mutex<PagerInner<F>>>,
-    previous: WalRefreshSignature,
-    committed_seq: CommitSeq,
+    own_single_commit: Option<(WalRefreshSignature, CommitSeq)>,
+    last_frame_written: u64,
+    certified_db_size: u32,
 ) {
     let Ok(Some(header)) = observe_vouched_wal_index_header(cx, wal_backend, db_file).await
     else {
         return;
     };
-    if header.a_salt != previous.shm_header.a_salt
-        || header.i_change != previous.shm_header.i_change.wrapping_add(1)
-    {
-        return;
-    }
     let Ok(mut inner) = inner_arc.lock() else {
         return;
     };
-    if inner.commit_seq == committed_seq && inner.wal_refresh_signature == Some(previous) {
+    inner.durable_db_size_floor = (u64::from(header.mx_frame) == last_frame_written).then_some(
+        DurableDbSizeFloor {
+            shm_header: header,
+            db_size: certified_db_size,
+        },
+    );
+    if let Some((previous, committed_seq)) = own_single_commit
+        && header.a_salt == previous.shm_header.a_salt
+        && header.i_change == previous.shm_header.i_change.wrapping_add(1)
+        && inner.commit_seq == committed_seq
+        && inner.wal_refresh_signature == Some(previous)
+    {
         inner.wal_refresh_signature = Some(WalRefreshSignature {
             shm_header: header,
             wal_identity: previous.wal_identity,
@@ -8421,6 +8451,9 @@ pub(crate) struct PagerInner<F: VfsFile> {
     /// unchanged one can be recognized without repeating it (see
     /// [`WalRefreshSignature`]).
     wal_refresh_signature: Option<WalRefreshSignature>,
+    /// The flusher's size floor as last derived, and the WAL-index header it
+    /// was derived at (see [`DurableDbSizeFloor`]).
+    durable_db_size_floor: Option<DurableDbSizeFloor>,
     /// Visible WAL commit count paired with the cached base counter. External
     /// checkpoints can move commits from WAL into the main database while the
     /// summed visible commit sequence stays the same; this keeps that physical
@@ -20078,6 +20111,7 @@ where
                 committed_db_change_counter: u64::from(header.change_counter),
                 committed_wal_generation: None,
                 wal_refresh_signature: None,
+                durable_db_size_floor: None,
                 committed_wal_visible_commit_count: 0,
             })),
             writer_idle: Arc::new(Condvar::new()),
@@ -20525,6 +20559,7 @@ where
                     .map_or(0, |header| u64::from(header.change_counter)),
                 committed_wal_generation: None,
                 wal_refresh_signature: None,
+                durable_db_size_floor: None,
                 committed_wal_visible_commit_count: 0,
             })),
             writer_idle: Arc::new(Condvar::new()),
@@ -24636,13 +24671,17 @@ where
                 // refs so synthetic Page 1 headers can be promoted to the same
                 // db_size carried by the final WAL commit marker.
                 let batch_count = batches.len();
-                let flush_base_db_size = {
+                let (flush_base_db_size, remembered_floor, floor_db_file) = {
                     #[cfg(test)]
                     record_commit_fast_path_lock(CommitFastPathLockClass::PagerInner);
                     let inner = inner_arc
                         .lock()
                         .map_err(|_| FrankenError::internal("SimpleTransaction lock poisoned"))?;
-                    inner.db_size
+                    (
+                        inner.db_size,
+                        inner.durable_db_size_floor,
+                        Arc::clone(&inner.db_file),
+                    )
                 };
                 // bd-vnxjd: the flusher connection's `inner.db_size` lags the
                 // durable image whenever PEER connections grew the file since
@@ -24656,7 +24695,24 @@ where
                 // base with the latest durable certificate's size. Advisory
                 // here (errors and cert-less backends fall back to 0); the
                 // append gate below fail-closes the residual race.
-                let durable_certified_db_size = {
+                //
+                // The floor this flusher's own last flush certified is still
+                // the floor while the WAL-index header that flush published is
+                // the published one (see `DurableDbSizeFloor`), so only a
+                // header some other publisher has moved sends this back to the
+                // WAL and the certificate sidecar.
+                let published_header = match remembered_floor {
+                    Some(_) => observe_vouched_wal_index_header(cx, wal_backend, &floor_db_file)
+                        .await
+                        .ok()
+                        .flatten(),
+                    None => None,
+                };
+                let durable_certified_db_size = if let Some(remembered) = remembered_floor
+                    .filter(|remembered| Some(remembered.shm_header) == published_header)
+                {
+                    remembered.db_size
+                } else {
                     match wal_backend_handle(wal_backend) {
                         Ok(backend) => {
                             match async_rwlock_write(&backend, cx, "WAL backend").await {
@@ -25429,20 +25485,23 @@ where
                                     },
                                 );
                                 let receipt = recovery.complete_authorized(&durability_cx)?;
-                                if let Some(previous) = signature_before_publish
-                                    && receipt.batch_size == 1
-                                    && receipt.certificate.commit_seq_hi == previous.commit_seq.next()
-                                {
-                                    advance_refresh_signature_past_own_commit(
-                                        &durability_cx,
-                                        wal_backend,
-                                        &db_file,
-                                        inner_arc,
-                                        previous,
-                                        receipt.certificate.commit_seq_hi,
-                                    )
-                                    .await;
-                                }
+                                let own_single_commit = signature_before_publish
+                                    .filter(|previous| {
+                                        receipt.batch_size == 1
+                                            && receipt.certificate.commit_seq_hi
+                                                == previous.commit_seq.next()
+                                    })
+                                    .map(|previous| (previous, receipt.certificate.commit_seq_hi));
+                                carry_refresh_state_past_own_flush(
+                                    &durability_cx,
+                                    wal_backend,
+                                    &db_file,
+                                    inner_arc,
+                                    own_single_commit,
+                                    frames_written_end,
+                                    final_db_size,
+                                )
+                                .await;
                                 #[cfg(any(test, feature = "fault-injection"))]
                                 crate::fault_hooks::maybe_inject_after_flush_before_publish(
                                     flush_epoch,
