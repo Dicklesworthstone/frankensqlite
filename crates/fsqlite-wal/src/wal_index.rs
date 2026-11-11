@@ -882,13 +882,9 @@ pub fn append_native_wal_index_entry(
     })
 }
 
-/// Clear unpublished mappings in a live region using fixed-width atomics.
-///
-/// The write-lock and generation/reader-gate requirements are the same as
-/// [`clear_native_wal_index_tail`]. Published page and hash entries are not
-/// rewritten, so readers retaining that prefix continue to use it.
-pub fn clear_shared_wal_index_tail(segment: &ShmRegion, region: u32, mx_frame: u32) -> Result<()> {
-    validate_shared_segment(segment)?;
+/// Byte offset of a region's page array, its capacity in entries, and how
+/// many of them the published prefix `mx_frame` retains.
+fn shared_wal_index_tail_bounds(region: u32, mx_frame: u32) -> Result<(usize, usize, usize)> {
     let (offset, capacity) = if region == 0 {
         (
             WAL_SHM_FIRST_HEADER_BYTES,
@@ -901,6 +897,116 @@ pub fn clear_shared_wal_index_tail(segment: &ShmRegion, region: u32, mx_frame: u
     let retained = usize::try_from(retained)
         .map_err(|_| FrankenError::internal("WAL-index prefix exceeds usize"))?
         .min(capacity);
+    Ok((offset, capacity, retained))
+}
+
+/// Whether a live region holds no page entry past the published prefix. By
+/// the install and clear orders [`clear_shared_wal_index_tail`] describes, it
+/// then holds no hash slot past it either.
+fn shared_wal_index_tail_is_clean(segment: &ShmRegion, region: u32, mx_frame: u32) -> Result<bool> {
+    let (offset, capacity, retained) = shared_wal_index_tail_bounds(region, mx_frame)?;
+    Ok(!segment.atomic_any_nonzero_u32_ne(
+        offset + retained * 4,
+        capacity - retained,
+        Ordering::Acquire,
+    )?)
+}
+
+/// Validate appending `entries` (contiguous frames of region `number`) by
+/// simulating it on a private capture of the live region: the page words and
+/// hash slots are copied at their protocol widths, the unpublished tail is
+/// cleared in the copy and each mapping is installed there. The live region
+/// is only read.
+fn validate_append_on_captured_segment(
+    region: &ShmRegion,
+    number: u32,
+    mx_frame: u32,
+    entries: &[(u32, u32, bool)],
+) -> Result<()> {
+    let mut scratch = vec![0_u8; WAL_SHM_SEGMENT_BYTES];
+    let page_start = if number == 0 {
+        WAL_SHM_FIRST_HEADER_BYTES
+    } else {
+        0
+    };
+    region.atomic_copy_u32_ne(
+        page_start,
+        &mut scratch[page_start..WAL_SHM_PAGE_ARRAY_BYTES],
+        Ordering::Acquire,
+    )?;
+    region.atomic_copy_u16_ne(
+        WAL_SHM_PAGE_ARRAY_BYTES,
+        &mut scratch[WAL_SHM_PAGE_ARRAY_BYTES..WAL_SHM_SEGMENT_BYTES],
+        Ordering::Acquire,
+    )?;
+    clear_native_wal_index_tail(&mut scratch, number, mx_frame)?;
+    for &(frame, page, _) in entries {
+        append_native_wal_index_entry(&mut scratch, frame, page)?;
+    }
+    Ok(())
+}
+
+/// Most frames one region may gain through [`validate_clean_tail_append`].
+/// Its claimed-slot list is searched linearly, so a larger batch takes the
+/// captured-segment simulation, whose cost does not grow with the batch.
+const CLEAN_TAIL_APPEND_MAX_ENTRIES: usize = 64;
+
+/// Validate appending `entries` (contiguous frames of one region) to a live
+/// region whose tail is clean, without capturing the segment.
+///
+/// This answers exactly what simulating the append on a captured copy
+/// answers. With a clean tail the copy's cleanup changes nothing, each new
+/// frame's own page slot is zero, and every frame after the first follows one
+/// the batch itself adds, so only two things can refuse the batch: the page
+/// slot before the first frame is empty (a frame gap), or the hash table has
+/// no empty slot left for one of the pages. Both are read from the live
+/// region, and slots the batch's earlier frames would take count as taken.
+/// The caller holds the WAL write lock, so no other writer changes the table
+/// between this validation and the installation.
+fn validate_clean_tail_append(segment: &ShmRegion, entries: &[(u32, u32, bool)]) -> Result<()> {
+    let mut claimed = Vec::<usize>::with_capacity(entries.len());
+    for (position, &(frame, page_number, _)) in entries.iter().enumerate() {
+        let location = WalIndexFrameLocation::new(frame)?;
+        if position == 0
+            && location.entry > 1
+            && segment.atomic_load_u32_ne(location.page_offset() - 4, Ordering::Acquire)? == 0
+        {
+            return Err(FrankenError::WalCorrupt {
+                detail: "WAL-index append would leave a frame gap".to_owned(),
+            });
+        }
+        let mut slot = usize::try_from(wal_index_hash_slot(page_number))
+            .map_err(|_| FrankenError::internal("WAL-index hash slot exceeds usize"))?;
+        let mut found = false;
+        for _ in 0..WAL_INDEX_HASH_SLOTS {
+            if !claimed.contains(&slot)
+                && segment
+                    .atomic_load_u16_ne(WAL_SHM_PAGE_ARRAY_BYTES + slot * 2, Ordering::Acquire)?
+                    == 0
+            {
+                claimed.push(slot);
+                found = true;
+                break;
+            }
+            slot = (slot + 1) % WAL_INDEX_HASH_SLOTS;
+        }
+        if !found {
+            return Err(FrankenError::WalCorrupt {
+                detail: "WAL-index hash table has no empty slot".to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Clear unpublished mappings in a live region using fixed-width atomics.
+///
+/// The write-lock and generation/reader-gate requirements are the same as
+/// [`clear_native_wal_index_tail`]. Published page and hash entries are not
+/// rewritten, so readers retaining that prefix continue to use it.
+pub fn clear_shared_wal_index_tail(segment: &ShmRegion, region: u32, mx_frame: u32) -> Result<()> {
+    validate_shared_segment(segment)?;
+    let (offset, capacity, retained) = shared_wal_index_tail_bounds(region, mx_frame)?;
     // Every writer installs a page entry before its hash slot and clears hash
     // slots before page entries (as stock SQLite's walIndexAppend and
     // walCleanupHash do), so at any crash point a hash slot naming an entry
@@ -1204,30 +1310,33 @@ impl SharedWalIndexAppendPlan {
         let mut entry_cursor = 0;
         for (number, region) in &regions {
             validate_shared_segment(region)?;
-            let mut scratch = vec![0_u8; WAL_SHM_SEGMENT_BYTES];
-            let page_start = if *number == 0 {
-                WAL_SHM_FIRST_HEADER_BYTES
+            let region_entries = entries[entry_cursor..]
+                .iter()
+                .take_while(|&&(frame, _, _)| {
+                    WalIndexFrameLocation::new(frame)
+                        .is_ok_and(|location| location.region == *number)
+                })
+                .count();
+            // The common append: nothing unpublished is left in this region
+            // and only a few frames are added. Simulating it on a captured
+            // copy would copy the whole segment to learn what a few probes of
+            // the live table answer (see `validate_clean_tail_append`).
+            if region_entries <= CLEAN_TAIL_APPEND_MAX_ENTRIES
+                && shared_wal_index_tail_is_clean(region, *number, baseline.mx_frame)?
+            {
+                validate_clean_tail_append(
+                    region,
+                    &entries[entry_cursor..entry_cursor + region_entries],
+                )?;
             } else {
-                0
-            };
-            region.atomic_copy_u32_ne(
-                page_start,
-                &mut scratch[page_start..WAL_SHM_PAGE_ARRAY_BYTES],
-                Ordering::Acquire,
-            )?;
-            region.atomic_copy_u16_ne(
-                WAL_SHM_PAGE_ARRAY_BYTES,
-                &mut scratch[WAL_SHM_PAGE_ARRAY_BYTES..WAL_SHM_SEGMENT_BYTES],
-                Ordering::Acquire,
-            )?;
-            clear_native_wal_index_tail(&mut scratch, *number, baseline.mx_frame)?;
-            while let Some(&(frame, page, _)) = entries.get(entry_cursor) {
-                if WalIndexFrameLocation::new(frame)?.region != *number {
-                    break;
-                }
-                append_native_wal_index_entry(&mut scratch, frame, page)?;
-                entry_cursor += 1;
+                validate_append_on_captured_segment(
+                    region,
+                    *number,
+                    baseline.mx_frame,
+                    &entries[entry_cursor..entry_cursor + region_entries],
+                )?;
             }
+            entry_cursor += region_entries;
         }
         if read_shared_wal_index_header(&regions[0].1)? != Some(baseline) {
             return Err(FrankenError::BusyRecovery);
@@ -3639,5 +3748,201 @@ mod tests {
 
         let dbg = format!("{a:?}");
         assert!(dbg.contains("WalHashLookup"));
+    }
+
+    /// A first region whose frames `1..=pages.len()` map to `pages`.
+    fn region_with_prefix(pages: &[u32]) -> ShmRegion {
+        let region = ShmRegion::new(WAL_SHM_SEGMENT_BYTES);
+        for (index, &page) in pages.iter().enumerate() {
+            append_shared_wal_index_entry(&region, u32::try_from(index + 1).unwrap(), page)
+                .unwrap();
+        }
+        region
+    }
+
+    fn verdict(result: Result<()>) -> String {
+        match result {
+            Ok(()) => "ok".to_owned(),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_clean_tail_append_validation_agrees_with_the_captured_segment_simulation() {
+        let mut state = 0x9e37_79b9_u32;
+        let mut next = move || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            state >> 8
+        };
+        for prefix_len in [
+            0_usize,
+            1,
+            2,
+            63,
+            500,
+            WAL_SHM_FIRST_USABLE_PAGE_ENTRIES - CLEAN_TAIL_APPEND_MAX_ENTRIES,
+        ] {
+            // Every third page lands in page 1's hash chain (pages 8192 apart
+            // share a slot), so the prefix has long probe sequences.
+            let prefix: Vec<u32> = (0..prefix_len)
+                .map(|index| {
+                    if index % 3 == 0 {
+                        1 + 8192 * (1 + u32::try_from(index / 3).unwrap())
+                    } else {
+                        1 + next() % 100_000
+                    }
+                })
+                .collect();
+            let region = region_with_prefix(&prefix);
+            let mx_frame = u32::try_from(prefix_len).unwrap();
+            assert!(shared_wal_index_tail_is_clean(&region, 0, mx_frame).unwrap());
+            for batch_len in [1_usize, 2, 7, CLEAN_TAIL_APPEND_MAX_ENTRIES] {
+                let entries: Vec<(u32, u32, bool)> = (0..batch_len)
+                    .map(|index| {
+                        let page = if index % 2 == 0 {
+                            1 + 8192 * (next() % 50)
+                        } else {
+                            1 + next() % 100_000
+                        };
+                        (
+                            mx_frame + 1 + u32::try_from(index).unwrap(),
+                            page,
+                            index + 1 == batch_len,
+                        )
+                    })
+                    .collect();
+                let before = region.lock().to_vec();
+                let probed = verdict(validate_clean_tail_append(&region, &entries));
+                let simulated = verdict(validate_append_on_captured_segment(
+                    &region, 0, mx_frame, &entries,
+                ));
+                assert_eq!(
+                    probed, simulated,
+                    "prefix {prefix_len}, batch {batch_len}: both validations give one verdict"
+                );
+                assert_eq!(probed, "ok", "prefix {prefix_len}, batch {batch_len}");
+                assert_eq!(
+                    region.lock().to_vec(),
+                    before,
+                    "prefix {prefix_len}, batch {batch_len}: validation only reads the live region"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_clean_tail_append_validation_refuses_what_the_simulation_refuses() {
+        // A frame gap: five frames are claimed published, four are mapped.
+        let region = region_with_prefix(&[11, 12, 13, 14]);
+        let gap = [(6_u32, 21_u32, true)];
+        assert!(shared_wal_index_tail_is_clean(&region, 0, 5).unwrap());
+        let probed = verdict(validate_clean_tail_append(&region, &gap));
+        assert_eq!(
+            probed,
+            verdict(validate_append_on_captured_segment(&region, 0, 5, &gap))
+        );
+        assert!(probed.contains("frame gap"), "{probed}");
+
+        // A hash table with one empty slot takes one new mapping, not two.
+        // Every other empty slot is filled with a value naming a published
+        // entry, which the simulation's tail cleanup keeps. Counting only the
+        // live table, and not the slot the batch's first frame takes, would
+        // accept the second frame.
+        let region = region_with_prefix(&[11, 12, 13, 14]);
+        let empty_slots: Vec<usize> = (0..WAL_INDEX_HASH_SLOTS)
+            .filter(|slot| {
+                region
+                    .atomic_load_u16_ne(WAL_SHM_PAGE_ARRAY_BYTES + slot * 2, Ordering::Acquire)
+                    .unwrap()
+                    == 0
+            })
+            .collect();
+        let (&last_empty, filled) = empty_slots.split_last().unwrap();
+        for slot in filled {
+            region
+                .atomic_store_u16_ne(WAL_SHM_PAGE_ARRAY_BYTES + slot * 2, 1, Ordering::Release)
+                .unwrap();
+        }
+        let one = [(5_u32, 21_u32, true)];
+        let two = [(5_u32, 21_u32, false), (6_u32, 22_u32, true)];
+        assert!(shared_wal_index_tail_is_clean(&region, 0, 4).unwrap());
+        assert_eq!(verdict(validate_clean_tail_append(&region, &one)), "ok");
+        assert_eq!(
+            verdict(validate_append_on_captured_segment(&region, 0, 4, &one)),
+            "ok"
+        );
+        let probed = verdict(validate_clean_tail_append(&region, &two));
+        assert_eq!(
+            probed,
+            verdict(validate_append_on_captured_segment(&region, 0, 4, &two))
+        );
+        assert!(probed.contains("no empty slot"), "{probed}");
+
+        // A full table refuses even one.
+        region
+            .atomic_store_u16_ne(
+                WAL_SHM_PAGE_ARRAY_BYTES + last_empty * 2,
+                1,
+                Ordering::Release,
+            )
+            .unwrap();
+        let probed = verdict(validate_clean_tail_append(&region, &one));
+        assert_eq!(
+            probed,
+            verdict(validate_append_on_captured_segment(&region, 0, 4, &one))
+        );
+        assert!(probed.contains("no empty slot"), "{probed}");
+    }
+
+    #[test]
+    fn test_shared_append_plan_publishes_one_index_over_a_clean_and_a_leftover_tail() {
+        // 8203 shares a hash slot with 11, 8213 with 21 and 8291 with 99.
+        let pages = [11_u32, 12, 13, 8203];
+        let clean = region_with_prefix(&pages);
+        let leftover = region_with_prefix(&pages);
+        // What a writer that died before publishing leaves past the prefix.
+        append_shared_wal_index_entry(&leftover, 5, 99).unwrap();
+        append_shared_wal_index_entry(&leftover, 6, 8291).unwrap();
+        let mut baseline = shared_header_fixture(4096, 0);
+        baseline.mx_frame = 4;
+        baseline.update_checksum().unwrap();
+        for region in [&clean, &leftover] {
+            publish_shared_wal_index_header(region, &baseline).unwrap();
+        }
+        assert!(shared_wal_index_tail_is_clean(&clean, 0, 4).unwrap());
+        assert!(
+            !shared_wal_index_tail_is_clean(&leftover, 0, 4).unwrap(),
+            "the leftover tail takes the captured-segment simulation"
+        );
+        let generation = WalGenerationIdentity {
+            checkpoint_seq: 3,
+            salts: crate::WalSalts {
+                salt1: baseline.a_salt[0],
+                salt2: baseline.a_salt[1],
+            },
+        };
+        let entries = vec![(5_u32, 21_u32, false), (6_u32, 8213_u32, true)];
+        let mut published = Vec::new();
+        for region in [&clean, &leftover] {
+            let mut plan = SharedWalIndexAppendPlan::prepare(
+                baseline,
+                generation,
+                vec![(0, region.share())],
+                entries.clone(),
+            )
+            .unwrap();
+            let mut target = baseline;
+            target.mx_frame = 6;
+            target.i_change = plan.publication_change(6).unwrap();
+            target.n_page = 30;
+            target.a_frame_cksum = [5, 6];
+            target.update_checksum().unwrap();
+            plan.publish(target).unwrap();
+            published.push(region.lock().to_vec());
+        }
+        assert_eq!(
+            published[0], published[1],
+            "both routes publish byte-identical index segments"
+        );
     }
 }
