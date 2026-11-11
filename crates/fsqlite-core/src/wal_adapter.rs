@@ -2364,11 +2364,28 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
                 // bind the published prefix and leave the proof unset, so the
                 // next begin looks again. A read-only pager may not rebuild
                 // and always binds the published prefix.
+                //
+                // WRITE is also free when the tail's writer published and
+                // left after this reader captured `header`: the commit is in
+                // the index and nothing is orphaned. The shared header is
+                // therefore read again after the probe. A writer keeps WRITE
+                // until it has published, so only a header that is still the
+                // captured one, with WRITE free, means the tail was never
+                // published. A header that moved on leaves this reader on its
+                // older, still pinned prefix, with the proof unset; a tail a
+                // second, dead writer left behind the publication is then
+                // found by the next begin. Without the second read a reader
+                // asked for a recovery it could not get whenever a commit
+                // finished inside its admission, and returned BusyRecovery
+                // from an ordinary SELECT (GH#457's steady state).
                 if self.wal.frame_count() > frame_count {
                     let source = Arc::clone(
                         self.wal_index_shm_source.as_ref().ok_or(FrankenError::Unsupported)?,
                     );
-                    if source.may_rebuild_shared_index() && source.wal_write_lock_is_free(cx).await?
+                    if source.may_rebuild_shared_index()
+                        && source.wal_write_lock_is_free(cx).await?
+                        && read_shared_wal_index_header(&source.map_region(cx, 0, false).await?)?
+                            == Some(header)
                     {
                         tracing::debug!(
                             target: "fsqlite.wal.recovery",
@@ -9712,6 +9729,41 @@ mod tests {
         assert_eq!(read_shared_wal_index_header(&region).unwrap(), Some(baseline));
         assert_eq!(std::fs::read(&wal_path).unwrap(), wal_bytes);
         lease.release().expect("release the classifying reader");
+
+        // A writer that published and left is not a dead one. This reader
+        // captures the older header, then the index comes to list the tail
+        // (what its writer's publication does), and WRITE is free again. The
+        // same tail and the same free WRITE as above must not ask for
+        // recovery: the reader keeps its older prefix and looks again at its
+        // next begin.
+        let mut lease = source.acquire_reader(&cx).expect("capture the older horizon once more");
+        let binding = lease.binding().unwrap();
+        let token = binding.token().clone();
+        let (terminal_index, terminal) = adapter.wal.last_commit_frame_header().expect("the tail's commit marker");
+        let mut published = baseline;
+        published.mx_frame = u32::try_from(terminal_index + 1).unwrap();
+        published.n_page = terminal.db_size;
+        published.a_frame_cksum = [terminal.checksum.s1, terminal.checksum.s2];
+        published.i_change = baseline.i_change.wrapping_add(1);
+        published.update_checksum().unwrap();
+        assert!(published.mx_frame > baseline.mx_frame);
+        fsqlite_wal::wal_index::publish_shared_wal_index_header(&region, &published).unwrap();
+        assert!(source.wal_write_lock_is_free(&cx).expect("the publisher left"));
+        assert_eq!(
+            adapter.begin_native_read(&cx, binding).expect("the older horizon stays readable"),
+            WalNativeReadOutcome::Ready,
+            "a writer that published and left is not a dead writer"
+        );
+        assert_eq!(adapter.native_recovery_required(), None);
+        assert!(adapter.native_read_proof.is_none(), "the next begin looks again");
+        assert_eq!(
+            adapter.pinned_read_snapshot().unwrap().last_commit_frame,
+            usize::try_from(baseline.mx_frame).unwrap().checked_sub(1),
+            "the reader is bound to the prefix it captured"
+        );
+        assert_eq!(std::fs::read(&wal_path).unwrap(), wal_bytes);
+        adapter.end_native_read(&token).unwrap();
+        lease.release().expect("release the older reader");
     }
 
     #[cfg(all(feature = "native", unix))]
