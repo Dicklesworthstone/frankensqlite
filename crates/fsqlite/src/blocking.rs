@@ -2899,6 +2899,45 @@ mod tests {
         assert_eq!(by_index, 10);
     }
 
+    /// bd-w4pr1.21: resetting a database the SQLite way (deleting the file
+    /// and its -wal, -shm and -journal) must let the path be used again, even
+    /// though FrankenSQLite's own sidecars stay behind.
+    #[test]
+    fn a_database_deleted_the_sqlite_way_can_be_created_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_path(&dir, "reset.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE old(x); INSERT INTO old VALUES (1), (2), (3);")
+                .unwrap();
+        }
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let file = format!("{path}{suffix}");
+            if std::path::Path::new(&file).exists() {
+                std::fs::remove_file(&file).unwrap();
+            }
+        }
+        {
+            let conn = Connection::open(&path).expect("a deleted database is created again");
+            let tables: i64 = conn
+                .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(tables, 0, "the recreated database starts empty");
+            conn.execute_batch("CREATE TABLE fresh(y); INSERT INTO fresh VALUES ('new');")
+                .unwrap();
+        }
+        let conn = Connection::open(&path).expect("the recreated database opens again");
+        let value: String = conn
+            .query_row("SELECT y FROM fresh", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, "new");
+        assert!(
+            conn.query_row("SELECT count(*) FROM old", [], |row| row.get::<_, i64>(0))
+                .is_err(),
+            "nothing of the deleted database comes back"
+        );
+    }
+
     #[test]
     fn dropping_a_connection_rolls_back_its_open_transaction() {
         let dir = tempfile::tempdir().unwrap();
