@@ -304,6 +304,16 @@ pub trait WalBackend: Send + Sync {
     /// call. Leaving must discard anything proven inside.
     fn note_append_gate_held(&mut self, _held: bool) {}
 
+    /// The shared WAL-index header this backend last read as its append
+    /// baseline, or last published, inside the append gate it currently holds
+    /// (see [`Self::note_append_gate_held`]). No other writer can change the
+    /// header while the gate is held, so it is the published one. `None`
+    /// outside a held gate, before the first preflight inside one, and for a
+    /// backend without a native WAL index.
+    fn native_header_under_append_gate(&self) -> Option<fsqlite_wal::wal_index::WalIndexHdr> {
+        None
+    }
+
     /// Refresh the conflict horizon inside the already acquired append window.
     ///
     /// Native adapters prove their current shared baseline before conflicts

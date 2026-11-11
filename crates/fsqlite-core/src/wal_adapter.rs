@@ -349,6 +349,11 @@ pub struct WalBackendAdapter<F: VfsFile> {
     /// append under the gate and this handle has not since. A native append
     /// preflight made in that state would re-derive the same baseline.
     append_baseline_proven_under_gate: bool,
+    /// The shared header the last append baseline read, or the last
+    /// publication wrote. [`PathRefreshingWalBackend`] clears it on entering
+    /// and leaving the append gate and reports it only inside one, where
+    /// nothing else can change the header.
+    header_under_append_gate: Option<fsqlite_wal::wal_index::WalIndexHdr>,
     /// Active commit-published visibility plane for the current WAL generation.
     published_snapshot: WalPublishedSnapshot,
     /// Monotonic publication sequence assigned to the next published snapshot.
@@ -536,6 +541,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             native_read_proof: None,
             refresh_before_append:true,
             append_baseline_proven_under_gate: false,
+            header_under_append_gate: None,
             published_snapshot: WalPublishedSnapshot::empty(0, generation),
             next_publication_seq: 1,
             read_snapshot: None,
@@ -573,6 +579,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             native_read_proof: None,
             refresh_before_append:true,
             append_baseline_proven_under_gate: false,
+            header_under_append_gate: None,
             published_snapshot: WalPublishedSnapshot::empty(0, generation),
             next_publication_seq: 1,
             read_snapshot: None,
@@ -1441,6 +1448,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
         };
         validate_shared_wal_index_wal_binding(&baseline, self.wal.header(), terminal)?;
         self.classify_unpublished_native_tail(cx, baseline, start).await?;
+        self.header_under_append_gate = Some(baseline);
         Ok(baseline)
     }
 
@@ -1576,6 +1584,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             frame_count: self.wal.frame_count(),
             salts: self.wal.header().salts,
         });
+        self.header_under_append_gate = Some(target);
         Ok(())
     }
 
@@ -6130,6 +6139,13 @@ where
     fn note_append_gate_held(&mut self, held: bool) {
         self.append_gate_proof = held.then(AppendGateProof::default);
         self.inner.append_baseline_proven_under_gate = false;
+        // A header read or published outside this gate says nothing inside it.
+        self.inner.header_under_append_gate = None;
+    }
+
+    fn native_header_under_append_gate(&self) -> Option<fsqlite_wal::wal_index::WalIndexHdr> {
+        self.append_gate_proof
+            .and(self.inner.header_under_append_gate)
     }
 
     fn native_reader_required(&self) -> bool {

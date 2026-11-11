@@ -8254,6 +8254,31 @@ async fn observe_vouched_wal_index_header<F: VfsFile>(
     vouched_wal_index_header_of_file(cx, db_file).await
 }
 
+/// Whether this process can vouch for a WAL-index header it already holds,
+/// on the terms of [`observe_vouched_wal_index_header`]: a native WAL reader
+/// is attached, no recovery is pending, and the main-file SHARED claim is
+/// held. Nothing is mapped or read.
+async fn can_vouch_for_wal_index_header<F: VfsFile>(
+    cx: &Cx,
+    wal_backend: &SharedWalBackend,
+    db_file: &SharedDbFile<F>,
+) -> bool {
+    {
+        let Ok(backend) = wal_backend_handle(wal_backend) else {
+            return false;
+        };
+        let Ok(wal) = async_rwlock_read(&backend, cx, "refresh signature").await else {
+            return false;
+        };
+        if !wal.native_reader_required() || wal.native_recovery_required().is_some() {
+            return false;
+        }
+    }
+    shared_db_file_write(db_file, cx)
+        .await
+        .is_ok_and(|file| file.holds_main_wal_lifetime_read_lock())
+}
+
 /// The file half of [`observe_vouched_wal_index_header`], for a caller that
 /// has already checked its WAL backend (or holds it exclusively and cannot
 /// lock it again): a native reader is required and no recovery is pending.
@@ -8269,6 +8294,22 @@ async fn vouched_wal_index_header_of_file<F: VfsFile>(
         return Ok(None);
     };
     fsqlite_wal::wal_index::read_shared_wal_index_header(&region)
+}
+
+/// What a flush knows about its own publication once it has landed (see
+/// [`carry_refresh_state_past_own_flush`]).
+struct OwnFlushPublication {
+    /// The refresh signature this flush's single commit followed, with that
+    /// commit's sequence; `None` when the flush was not exactly that.
+    own_single_commit: Option<(WalRefreshSignature, CommitSeq)>,
+    /// The WAL-index header the backend reported right after publishing.
+    published_header: Option<fsqlite_wal::wal_index::WalIndexHdr>,
+    /// The flush's final frame, its commit marker.
+    last_frame_written: u64,
+    /// The database size that marker and its certificate carry.
+    certified_db_size: u32,
+    /// The flush's certificate, when it is known to authorize its interval.
+    seed_certificate: Option<ParallelWalCommitCertificate>,
 }
 
 /// Carry a pager's refresh signature past a flush that published exactly one
@@ -8292,26 +8333,28 @@ async fn carry_refresh_state_past_own_flush<F: VfsFile>(
     wal_backend: &SharedWalBackend,
     db_file: &SharedDbFile<F>,
     inner_arc: &Arc<Mutex<PagerInner<F>>>,
-    own_single_commit: Option<(WalRefreshSignature, CommitSeq)>,
-    last_frame_written: u64,
-    certified_db_size: u32,
-    seed_certificate: Option<ParallelWalCommitCertificate>,
+    flush: OwnFlushPublication,
 ) {
-    let Ok(Some(header)) = observe_vouched_wal_index_header(cx, wal_backend, db_file).await
-    else {
+    // `published_header` is what the backend reported while the flush still
+    // held the append gate, right after publishing: the header this flush
+    // wrote. It is used on the terms a fresh observation would be (see
+    // `observe_vouched_wal_index_header`), without mapping the index again.
+    let Some(header) = flush.published_header else {
         return;
     };
+    if !can_vouch_for_wal_index_header(cx, wal_backend, db_file).await {
+        return;
+    }
     let Ok(mut inner) = inner_arc.lock() else {
         return;
     };
-    inner.durable_db_size_floor = (u64::from(header.mx_frame) == last_frame_written).then_some(
-        DurableDbSizeFloor {
+    inner.durable_db_size_floor = (u64::from(header.mx_frame) == flush.last_frame_written)
+        .then_some(DurableDbSizeFloor {
             shm_header: header,
-            db_size: certified_db_size,
-            certificate: seed_certificate,
-        },
-    );
-    if let Some((previous, committed_seq)) = own_single_commit
+            db_size: flush.certified_db_size,
+            certificate: flush.seed_certificate,
+        });
+    if let Some((previous, committed_seq)) = flush.own_single_commit
         && header.a_salt == previous.shm_header.a_salt
         && header.i_change == previous.shm_header.i_change.wrapping_add(1)
         && inner.commit_seq == committed_seq
@@ -25265,17 +25308,12 @@ where
                                 // seed certificate are the ones that flush
                                 // wrote (see `DurableDbSizeFloor`); otherwise
                                 // both come from the files.
-                                let gate_header = if remembered_floor.is_some()
-                                    && wal.native_reader_required()
-                                    && wal.native_recovery_required().is_none()
-                                {
-                                    vouched_wal_index_header_of_file(cx, &db_file)
-                                        .await
-                                        .ok()
-                                        .flatten()
-                                } else {
-                                    None
-                                };
+                                // The preflight read that header as its
+                                // baseline; the backend reports it, so the
+                                // WAL index is not mapped again to learn it.
+                                let gate_header = remembered_floor
+                                    .as_ref()
+                                    .and_then(|_| wal.native_header_under_append_gate());
                                 let own_publication = remembered_floor.as_ref().filter(
                                     |remembered| Some(remembered.shm_header) == gate_header,
                                 );
@@ -25534,6 +25572,10 @@ where
                                     wal.publish_authorized_deferred_commit(&durability_cx)
                                         .await?;
                                 }
+                                // The header this flush just published, taken
+                                // while the gate still excludes every other
+                                // publisher.
+                                let published_header = wal.native_header_under_append_gate();
                                 drop(append_gate);
                                 drop(wal_guard);
                                 // The refresh signature, if it still described the
@@ -25558,11 +25600,15 @@ where
                                     wal_backend,
                                     &db_file,
                                     inner_arc,
-                                    own_single_commit,
-                                    frames_written_end,
-                                    final_db_size,
-                                    (certificate_is_in_sidecar && appended_frames_are_digested)
-                                        .then_some(certificate),
+                                    OwnFlushPublication {
+                                        own_single_commit,
+                                        published_header,
+                                        last_frame_written: frames_written_end,
+                                        certified_db_size: final_db_size,
+                                        seed_certificate: (certificate_is_in_sidecar
+                                            && appended_frames_are_digested)
+                                            .then_some(certificate),
+                                    },
                                 )
                                 .await;
                                 #[cfg(any(test, feature = "fault-injection"))]
