@@ -68876,6 +68876,38 @@ impl Connection {
                 | AlterTableAction::AddColumn(_)
                 | AlterTableAction::DropColumn(_) => {}
             }
+            // SQLite 3.54 (alter.c isRowidAlias): on a table with a rowid,
+            // ALTER TABLE refuses to add, drop, or rename a column to or from a
+            // rowid alias name (rowid, _rowid_, oid), naming the operation and
+            // the name as written. WITHOUT ROWID tables have no such alias.
+            if !table.without_rowid {
+                let refused = |operation: &str, name: &str| {
+                    FrankenError::FunctionError(format!(
+                        "cannot {operation} rowid alias: {name}"
+                    ))
+                };
+                match &alter.action {
+                    AlterTableAction::AddColumn(column)
+                        if is_hidden_rowid_alias_name(&column.name) =>
+                    {
+                        return Err(refused("add", &column.name));
+                    }
+                    AlterTableAction::DropColumn(name) if is_hidden_rowid_alias_name(name) => {
+                        return Err(refused("drop", name));
+                    }
+                    AlterTableAction::RenameColumn { old, new } => {
+                        if is_hidden_rowid_alias_name(old) {
+                            return Err(refused("rename from", old));
+                        }
+                        if is_hidden_rowid_alias_name(new) {
+                            return Err(refused("rename to", new));
+                        }
+                    }
+                    AlterTableAction::RenameTo(_)
+                    | AlterTableAction::AddColumn(_)
+                    | AlterTableAction::DropColumn(_) => {}
+                }
+            }
         }
 
         // Preserve the parsed CREATE TABLE constraint vectors instead of

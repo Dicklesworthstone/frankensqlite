@@ -98,6 +98,67 @@ fn strict_type_errors() {
     });
 }
 
+/// SQLite 3.54: ALTER TABLE refuses to add, drop, or rename a column to or from
+/// a rowid alias name on a table with a rowid. Messages run on the bundled
+/// 3.54.1 (2026-11-11); the name is reported as written.
+#[test]
+fn alter_table_refuses_rowid_alias_column_names() {
+    asupersync::test_utils::run_test(|| async {
+        let legacy = ["CREATE TABLE t(a INT, b INT, rowid INT, OID INT)"];
+        err_is(
+            &legacy,
+            "ALTER TABLE t ADD COLUMN _ROWID_ INT",
+            "cannot add rowid alias: _ROWID_",
+        )
+        .await;
+        err_is(
+            &legacy,
+            "ALTER TABLE t RENAME COLUMN b TO Rowid",
+            "cannot rename to rowid alias: Rowid",
+        )
+        .await;
+        err_is(
+            &legacy,
+            "ALTER TABLE t RENAME COLUMN rowid TO r2",
+            "cannot rename from rowid alias: rowid",
+        )
+        .await;
+        err_is(
+            &legacy,
+            "ALTER TABLE t DROP COLUMN OID",
+            "cannot drop rowid alias: OID",
+        )
+        .await;
+        // An unknown column is still reported as such first.
+        err_is(
+            &legacy,
+            "ALTER TABLE t DROP COLUMN nosuch",
+            "no such column: \"nosuch\"",
+        )
+        .await;
+
+        // Ordinary names still work, and a WITHOUT ROWID table has no rowid
+        // alias to protect.
+        let f = Connection::open(":memory:").await.unwrap();
+        for sql in [
+            "CREATE TABLE t(a INT, b INT)",
+            "ALTER TABLE t ADD COLUMN c INT",
+            "CREATE TABLE w(k PRIMARY KEY, x) WITHOUT ROWID",
+            "ALTER TABLE w ADD COLUMN rowid INT",
+            "ALTER TABLE w RENAME COLUMN x TO oid",
+        ] {
+            f.execute(sql)
+                .await
+                .unwrap_or_else(|error| panic!("`{sql}` must succeed: {error}"));
+        }
+        let rows = f
+            .query("SELECT group_concat(name) FROM pragma_table_info('w')")
+            .await
+            .unwrap();
+        assert_eq!(rows[0].values()[0].to_text(), "k,oid,rowid");
+    });
+}
+
 #[test]
 fn ddl_and_ordinal_errors() {
     asupersync::test_utils::run_test(|| async {
