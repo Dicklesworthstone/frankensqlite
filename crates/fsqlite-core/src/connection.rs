@@ -48711,24 +48711,51 @@ impl Connection {
             return Ok(None);
         };
 
-        // bd-wwqen.3 B3: Support explicit column-list INSERT when ALL columns
-        // are specified (just reordered). Partial column lists fall through.
+        // bd-wwqen.3 B3: an explicit column list may name the columns in any
+        // order. bd-w4pr1.23: it may also leave out the rowid alias (assigned
+        // on insert, as for an explicit NULL) and nullable columns without a
+        // DEFAULT (NULL). That is the usual application INSERT,
+        // `INSERT INTO t(a, b) VALUES (?1, ?2)`, which otherwise ran the
+        // general program with a statement savepoint per row (4x slower).
+        // A name that is not a column (`rowid`), a repeated name, and any other
+        // omitted column (one with a DEFAULT, NOT NULL, or generated) keep the
+        // general path.
         if !resolved_insert.columns.is_empty() {
-            if resolved_insert.columns.len() != table.columns.len()
-                || resolved_insert.columns.len() != row_values.len()
+            if resolved_insert.columns.len() != row_values.len()
+                || resolved_insert.columns.len() > table.columns.len()
             {
                 return Ok(None);
             }
-            let mut reordered = Vec::with_capacity(table.columns.len());
-            for table_col in &table.columns {
-                let Some(idx) = resolved_insert
+            let mut listed_at = vec![None; table.columns.len()];
+            for (position, name) in resolved_insert.columns.iter().enumerate() {
+                let Some(col_idx) = table
                     .columns
                     .iter()
-                    .position(|c| c.eq_ignore_ascii_case(&table_col.name))
+                    .position(|column| column.name.eq_ignore_ascii_case(name))
                 else {
                     return Ok(None);
                 };
-                reordered.push(row_values[idx].clone());
+                if listed_at[col_idx].replace(position).is_some() {
+                    return Ok(None);
+                }
+            }
+            let rowid_alias_col_idx = self
+                .rowid_alias_columns
+                .borrow()
+                .get(&table_name.to_ascii_lowercase())
+                .copied();
+            let mut reordered = Vec::with_capacity(table.columns.len());
+            for (col_idx, column) in table.columns.iter().enumerate() {
+                if let Some(position) = listed_at[col_idx] {
+                    reordered.push(row_values[position].clone());
+                } else if column.default_value.is_none()
+                    && column.generated_expr.is_none()
+                    && (column.is_ipk || rowid_alias_col_idx == Some(col_idx) || !column.notnull)
+                {
+                    reordered.push(Expr::Literal(Literal::Null, Span::ZERO));
+                } else {
+                    return Ok(None);
+                }
             }
             row_values = reordered;
         }
@@ -249565,6 +249592,130 @@ mod pager_routing_tests {
                         _ => false,
                     })),
                 "benchmark-style direct insert should flatten concat-heavy expressions into one-pass chains"
+            );
+        });
+    }
+
+    /// bd-w4pr1.23: the usual application INSERT names its columns and leaves
+    /// out the INTEGER PRIMARY KEY. It takes the direct lane when every
+    /// omitted column is the rowid alias or a nullable column without a
+    /// DEFAULT, and stores what the general path stores. Leaving out a column
+    /// with a DEFAULT or a NOT NULL one keeps the general path: a NULL there
+    /// would lose the DEFAULT or the constraint error.
+    #[test]
+    fn test_prepared_insert_omitting_rowid_and_nullable_columns_takes_direct_lane() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute(
+                "CREATE TABLE partial_direct (id INTEGER PRIMARY KEY, a INTEGER, b TEXT, \
+                 c REAL, d TEXT DEFAULT 'dflt', e TEXT NOT NULL DEFAULT 'x');",
+            )
+            .await
+            .unwrap();
+            conn.execute("CREATE TABLE partial_not_null (id INTEGER PRIMARY KEY, a TEXT NOT NULL, b TEXT);")
+                .await
+                .unwrap();
+            let direct_lane = |stmt: &PreparedStatement<'_>| {
+                matches!(
+                    stmt.precompiled_dml(),
+                    Some(PreparedPrecompiledDml {
+                        direct_simple_insert: Some(_),
+                        ..
+                    })
+                )
+            };
+            let text = |value: &str| SqliteValue::Text(value.into());
+
+            // id (the rowid alias) and c (nullable, no DEFAULT) left out.
+            let partial = conn
+                .prepare("INSERT INTO partial_direct(a, b, d, e) VALUES (?1, ?2, ?3, ?4)")
+                .await
+                .unwrap();
+            let reordered = conn
+                .prepare("INSERT INTO partial_direct(e, d, b, a) VALUES (?1, ?2, ?3, ?4)")
+                .await
+                .unwrap();
+            let explicit_id = conn
+                .prepare("INSERT INTO partial_direct(id, a, d, e) VALUES (?1, ?2, ?3, ?4)")
+                .await
+                .unwrap();
+            // d has a DEFAULT; e is NOT NULL with a DEFAULT; `rowid` is not a
+            // declared column; partial_not_null.a is NOT NULL without one.
+            let omits_d = conn
+                .prepare("INSERT INTO partial_direct(a, e) VALUES (?1, ?2)")
+                .await
+                .unwrap();
+            let omits_e = conn
+                .prepare("INSERT INTO partial_direct(a, d) VALUES (?1, ?2)")
+                .await
+                .unwrap();
+            let rowid_name = conn
+                .prepare("INSERT INTO partial_direct(rowid, a, d, e) VALUES (?1, ?2, ?3, ?4)")
+                .await
+                .unwrap();
+            let omits_not_null = conn
+                .prepare("INSERT INTO partial_not_null(b) VALUES (?1)")
+                .await
+                .unwrap();
+            assert!(direct_lane(&partial));
+            assert!(direct_lane(&reordered));
+            assert!(direct_lane(&explicit_id));
+            assert!(!direct_lane(&omits_d));
+            assert!(!direct_lane(&omits_e));
+            assert!(!direct_lane(&rowid_name));
+            assert!(!direct_lane(&omits_not_null));
+
+            conn.execute("BEGIN").await.unwrap();
+            for (stmt, params) in [
+                (&partial, vec![SqliteValue::Integer(1), text("one"), text("d1"), text("e1")]),
+                (&reordered, vec![text("e2"), text("d2"), text("two"), SqliteValue::Integer(2)]),
+                (&explicit_id, vec![SqliteValue::Integer(10), SqliteValue::Integer(3), text("d3"), text("e3")]),
+                (&partial, vec![SqliteValue::Integer(4), SqliteValue::Null, text("d4"), text("e4")]),
+                (&omits_d, vec![SqliteValue::Integer(5), text("e5")]),
+                (&omits_e, vec![SqliteValue::Integer(6), text("d6")]),
+                (&rowid_name, vec![SqliteValue::Integer(20), SqliteValue::Integer(7), text("d7"), text("e7")]),
+            ] {
+                assert_eq!(stmt.execute_with_params(&params).await.unwrap(), 1);
+            }
+            conn.execute("COMMIT").await.unwrap();
+
+            let rows: Vec<Vec<SqliteValue>> = conn
+                .query("SELECT id, a, b, c, d, e FROM partial_direct ORDER BY id")
+                .await
+                .unwrap()
+                .iter()
+                .map(|row| row.values().to_vec())
+                .collect();
+            let row = |id: i64, a: i64, b: Option<&str>, d: &str, e: &str| {
+                vec![
+                    SqliteValue::Integer(id),
+                    SqliteValue::Integer(a),
+                    b.map_or(SqliteValue::Null, text),
+                    SqliteValue::Null,
+                    text(d),
+                    text(e),
+                ]
+            };
+            assert_eq!(
+                rows,
+                vec![
+                    row(1, 1, Some("one"), "d1", "e1"),
+                    row(2, 2, Some("two"), "d2", "e2"),
+                    row(10, 3, None, "d3", "e3"),
+                    row(11, 4, None, "d4", "e4"),
+                    row(12, 5, None, "dflt", "e5"),
+                    row(13, 6, None, "d6", "x"),
+                    row(20, 7, None, "d7", "e7"),
+                ]
+            );
+
+            let error = omits_not_null
+                .execute_with_params(&[text("b")])
+                .await
+                .expect_err("a NOT NULL column without a DEFAULT cannot be left out");
+            assert!(
+                error.to_string().contains("NOT NULL constraint failed: partial_not_null.a"),
+                "unexpected error: {error}"
             );
         });
     }
