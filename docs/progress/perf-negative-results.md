@@ -23656,3 +23656,34 @@ bead) — likely the interior descent must propagate the UpperBound bias, or the
   dispatch or column-decode cost, when the sorter copy becomes a visible
   share of the profile. See also the 2026-05-06 SorterRow entry (narrow
   patches only).
+
+## 2026-11-10 — Boxing the cached VdbeEngine and heap-allocating VdbeProgram ops (bd-w4pr1.13)
+
+- Workload: `blocking_vs_rusqlite_bench` rows point_rowid, point_index,
+  insert_txn and adhoc_update, release-perf, stock rusqlite live in the same
+  invocation, all three runs on one pinned rch worker (vmi1227854, `-j 3`),
+  order patched / base / patched.
+- Lead: gdb on a symbolized CLI (memmove calls of 1 KB or more on a
+  same-text INSERT) counted about 33 KB of memmove per statement. 61% was the
+  cached `VdbeEngine` (2,904 bytes) moved by value about 7 times: taken from
+  `cached_vdbe_engine`, passed into `execute_table_program*_with_db` and
+  returned. A literal-text statement also moved `VdbeProgram` (inline
+  `SmallVec<[VdbeOp; 64]>`, about 4.6 KB) about 8 times between
+  `ProgramBuilder::finish` and the compiled-statement cache.
+- Candidate (local branch only, never on main):
+  `crates/fsqlite-vdbe/src/lib.rs` (`ops: Vec<VdbeOp>` with capacity 64) and
+  `crates/fsqlite-core/src/connection.rs` (`cached_vdbe_engine` holds
+  `Option<Box<VdbeEngine>>`; the execute helpers take and return the box).
+- Result: no measurable change. F/C patched / base / patched:
+  point_rowid 2.31 / 2.34 / 2.33, point_index 18.24 / 19.80 / 19.45,
+  insert_txn 25.15 / 21.27 / 23.42, adhoc_update 15.48 / 14.55 / 13.81.
+  The bench's A/A null ranged 0.84-1.11 across the three runs, so a 1-2 us
+  per-statement saving is below what this bench resolves, and the base run
+  sits inside the patched runs on every row. ELF sha256 patched f3cfc419...,
+  base c53b9ce2... (both self-reported by the bench).
+- Retry condition: when per-statement engine cost on these rows is near
+  stock (insert_txn under about 1 us, so 2.9 KB moves are a visible share),
+  or measured by instruction count on a single-statement probe rather than
+  wall time. Do not retry as a standalone lever while point_index and
+  insert_txn are 18-25x stock: the gap is elsewhere (bd-w4pr1.24 read
+  boundary and seek, bd-w4pr1.23).
