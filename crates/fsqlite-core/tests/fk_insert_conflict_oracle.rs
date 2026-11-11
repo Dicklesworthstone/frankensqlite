@@ -34,7 +34,7 @@ fn classify_franken(r: Result<usize, FrankenError>) -> Outcome {
     match r {
         Ok(n) => Outcome::Ok(n),
         Err(FrankenError::ForeignKeyViolation) => Outcome::FkViolation,
-        Err(FrankenError::PrimaryKeyViolation | FrankenError::UniqueViolation { .. }) => {
+        Err(FrankenError::PrimaryKeyViolation { .. } | FrankenError::UniqueViolation { .. }) => {
             Outcome::PkOrUnique
         }
         Err(_) => Outcome::OtherErr,

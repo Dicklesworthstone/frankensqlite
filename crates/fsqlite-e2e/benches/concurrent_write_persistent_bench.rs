@@ -136,7 +136,7 @@ fn is_duplicate_insert_after_retry(error: &FrankenError) -> bool {
     // Check for proper constraint errors
     if matches!(
         error,
-        FrankenError::PrimaryKeyViolation | FrankenError::UniqueViolation { .. }
+        FrankenError::PrimaryKeyViolation { .. } | FrankenError::UniqueViolation { .. }
     ) {
         return true;
     }

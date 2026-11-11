@@ -1046,7 +1046,7 @@ async fn beads_insert_relations(
                     Some(comment.id)
                 }
                 Err(
-                    fsqlite_error::FrankenError::PrimaryKeyViolation
+                    fsqlite_error::FrankenError::PrimaryKeyViolation { .. }
                     | fsqlite_error::FrankenError::UniqueViolation { .. },
                 ) => None,
                 Err(error) => {
@@ -1149,7 +1149,7 @@ async fn beads_import_transaction(
                     true
                 }
                 Err(
-                    fsqlite_error::FrankenError::PrimaryKeyViolation
+                    fsqlite_error::FrankenError::PrimaryKeyViolation { .. }
                     | fsqlite_error::FrankenError::UniqueViolation { .. },
                 ) => false,
                 Err(error) => panic!("fresh issue insert {row} ({}) failed: {error:?}", issue.id),
@@ -1186,7 +1186,7 @@ async fn beads_import_transaction(
                 assert!(
                     matches!(
                         collided,
-                        Err(fsqlite_error::FrankenError::PrimaryKeyViolation
+                        Err(fsqlite_error::FrankenError::PrimaryKeyViolation { .. }
                             | fsqlite_error::FrankenError::UniqueViolation { .. })
                     ),
                     "duplicate id {} must fail its INSERT with a key violation, got {collided:?}",
