@@ -344,6 +344,11 @@ pub struct WalBackendAdapter<F: VfsFile> {
     native_read_proof: Option<NativeReadProof>,
     /// Guard so commit-time append refresh runs only once per commit batch.
     refresh_before_append: bool,
+    /// Set by [`PathRefreshingWalBackend`] while the baseline it preflighted
+    /// inside the pager's held append gate is still exact: no other writer can
+    /// append under the gate and this handle has not since. A native append
+    /// preflight made in that state would re-derive the same baseline.
+    append_baseline_proven_under_gate: bool,
     /// Active commit-published visibility plane for the current WAL generation.
     published_snapshot: WalPublishedSnapshot,
     /// Monotonic publication sequence assigned to the next published snapshot.
@@ -530,6 +535,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             wal,
             native_read_proof: None,
             refresh_before_append:true,
+            append_baseline_proven_under_gate: false,
             published_snapshot: WalPublishedSnapshot::empty(0, generation),
             next_publication_seq: 1,
             read_snapshot: None,
@@ -566,6 +572,7 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             wal,
             native_read_proof: None,
             refresh_before_append:true,
+            append_baseline_proven_under_gate: false,
             published_snapshot: WalPublishedSnapshot::empty(0, generation),
             next_publication_seq: 1,
             read_snapshot: None,
@@ -2268,6 +2275,14 @@ impl<F: VfsFile> WalBackend for WalBackendAdapter<F> {
         Box::pin(async move {
             if self.wal_index_shm_source.is_none() {
                 return self.refresh_published_snapshot(cx).await.map(|_| ());
+            }
+            // The states `native_append_baseline` refuses are left to it, so
+            // their errors stay exactly what they were.
+            if self.append_baseline_proven_under_gate
+                && !self.has_pending_publication()
+                && self.native_recovery_requested.is_none()
+            {
+                return Ok(());
             }
             let baseline = self.native_append_baseline(cx).await?;
             let horizon = usize::try_from(baseline.mx_frame).map_err(|_| FrankenError::DatabaseFull)?
@@ -4523,6 +4538,7 @@ where
             }
             proof.baseline = false;
         }
+        self.inner.append_baseline_proven_under_gate = false;
     }
 
     async fn validate_current_native_wal_path_uncached(
@@ -6065,6 +6081,9 @@ where
             self.inner.preflight_native_append(cx).await?;
             if let Some(proof) = &mut self.append_gate_proof {
                 proof.baseline = true;
+                // The inner adapter's own preflights (its conflict check makes
+                // one) would repeat this one against an unchanged WAL.
+                self.inner.append_baseline_proven_under_gate = true;
             }
             Ok(())
         })
@@ -6072,6 +6091,7 @@ where
 
     fn note_append_gate_held(&mut self, held: bool) {
         self.append_gate_proof = held.then(AppendGateProof::default);
+        self.inner.append_baseline_proven_under_gate = false;
     }
 
     fn native_reader_required(&self) -> bool {
