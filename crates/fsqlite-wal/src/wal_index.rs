@@ -900,16 +900,45 @@ fn shared_wal_index_tail_bounds(region: u32, mx_frame: u32) -> Result<(usize, us
     Ok((offset, capacity, retained))
 }
 
-/// Whether a live region holds no page entry past the published prefix. By
-/// the install and clear orders [`clear_shared_wal_index_tail`] describes, it
-/// then holds no hash slot past it either.
-fn shared_wal_index_tail_is_clean(segment: &ShmRegion, region: u32, mx_frame: u32) -> Result<bool> {
-    let (offset, capacity, retained) = shared_wal_index_tail_bounds(region, mx_frame)?;
-    Ok(!segment.atomic_any_nonzero_u32_ne(
-        offset + retained * 4,
-        capacity - retained,
-        Ordering::Acquire,
-    )?)
+/// Whether the page slots of `entries` are all empty in a live region and
+/// none of them is the region's first slot. `entries` are the frames a batch
+/// adds to this one region, in order, the first of them the region's first
+/// unpublished frame.
+///
+/// Empty slots prove more than that the batch overwrites nothing: they prove
+/// the region holds no hash slot past the published prefix, so the batch can
+/// be installed without the tail cleanup. Every writer installs mappings in
+/// frame order, page entry before hash slot, and every cleanup clears a
+/// region's hash slots before any of its page entries (the orders
+/// [`clear_shared_wal_index_tail`] describes). A hash slot past the prefix can
+/// therefore only belong to a run of mappings that still starts at the
+/// region's first unpublished frame: either its installer died before
+/// publishing, or a cleanup died before finishing the hash slots, and in both
+/// cases that first page entry is still set. Page entries a dead cleanup left
+/// further up, with their hash slots already cleared, are reached by no
+/// lookup; the batch whose own slots include one takes the cleanup then, as
+/// stock SQLite's `walIndexAppend` does when it finds its slot occupied.
+///
+/// Scanning the whole unpublished tail instead cost about ten instructions
+/// per empty slot, close to 40,000 per commit on a fresh segment.
+fn shared_wal_index_append_slots_are_empty(
+    segment: &ShmRegion,
+    entries: &[(u32, u32, bool)],
+) -> Result<bool> {
+    for &(frame, _, _) in entries {
+        let location = WalIndexFrameLocation::new(frame)?;
+        // A region's first frame always takes the cleanup, as stock SQLite
+        // zeroes the whole table there. Stock does that with one `memset`
+        // over the page array and then the hash table, so a stock writer
+        // killed inside it leaves an empty first slot under stale hash slots:
+        // the one state in which an empty slot proves nothing.
+        if location.entry == 1
+            || segment.atomic_load_u32_ne(location.page_offset(), Ordering::Acquire)? != 0
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Validate appending `entries` (contiguous frames of region `number`) by
@@ -952,12 +981,14 @@ fn validate_append_on_captured_segment(
 const CLEAN_TAIL_APPEND_MAX_ENTRIES: usize = 64;
 
 /// Validate appending `entries` (contiguous frames of one region) to a live
-/// region whose tail is clean, without capturing the segment.
+/// region in which their page slots are empty (see
+/// [`shared_wal_index_append_slots_are_empty`]), without capturing the segment.
 ///
 /// This answers exactly what simulating the append on a captured copy
-/// answers. With a clean tail the copy's cleanup changes nothing, each new
-/// frame's own page slot is zero, and every frame after the first follows one
-/// the batch itself adds, so only two things can refuse the batch: the page
+/// answers. The region then has no hash slot past the published prefix, so
+/// the copy's cleanup changes nothing a probe reads; each new frame's own
+/// page slot is zero, and every frame after the first follows one the batch
+/// itself adds. So only two things can refuse the batch: the page
 /// slot before the first frame is empty (a frame gap), or the hash table has
 /// no empty slot left for one of the pages. Both are read from the live
 /// region, and slots the batch's earlier frames would take count as taken.
@@ -1317,12 +1348,15 @@ impl SharedWalIndexAppendPlan {
                         .is_ok_and(|location| location.region == *number)
                 })
                 .count();
-            // The common append: nothing unpublished is left in this region
-            // and only a few frames are added. Simulating it on a captured
-            // copy would copy the whole segment to learn what a few probes of
-            // the live table answer (see `validate_clean_tail_append`).
+            // The common append: the slots it fills are empty and only a few
+            // frames are added. Simulating it on a captured copy would copy
+            // the whole segment to learn what a few probes of the live table
+            // answer (see `validate_clean_tail_append`).
             if region_entries <= CLEAN_TAIL_APPEND_MAX_ENTRIES
-                && shared_wal_index_tail_is_clean(region, *number, baseline.mx_frame)?
+                && shared_wal_index_append_slots_are_empty(
+                    region,
+                    &entries[entry_cursor..entry_cursor + region_entries],
+                )?
             {
                 validate_clean_tail_append(
                     region,
@@ -1428,8 +1462,30 @@ impl SharedWalIndexAppendPlan {
                     return Err(FrankenError::BusyRecovery);
                 }
                 self.phase = SharedWalPublicationPhase::InstallingMappings;
+                // A region whose slots for this publication are all empty
+                // has nothing to clear (see
+                // `shared_wal_index_append_slots_are_empty`). A retry after a
+                // partial installation finds its own mappings there and
+                // clears them, as before.
+                let installed = self
+                    .entries
+                    .partition_point(|&(frame, _, _)| frame <= target.mx_frame);
+                let mut cursor = 0;
                 for (number, region) in &self.regions {
-                    clear_shared_wal_index_tail(region, *number, self.baseline.mx_frame)?;
+                    let in_region = self.entries[cursor..installed]
+                        .iter()
+                        .take_while(|&&(frame, _, _)| {
+                            WalIndexFrameLocation::new(frame)
+                                .is_ok_and(|location| location.region == *number)
+                        })
+                        .count();
+                    if !shared_wal_index_append_slots_are_empty(
+                        region,
+                        &self.entries[cursor..cursor + in_region],
+                    )? {
+                        clear_shared_wal_index_tail(region, *number, self.baseline.mx_frame)?;
+                    }
+                    cursor += in_region;
                 }
                 for &(frame, page, _) in &self.entries {
                     if frame > target.mx_frame {
@@ -3795,7 +3851,6 @@ mod tests {
                 .collect();
             let region = region_with_prefix(&prefix);
             let mx_frame = u32::try_from(prefix_len).unwrap();
-            assert!(shared_wal_index_tail_is_clean(&region, 0, mx_frame).unwrap());
             for batch_len in [1_usize, 2, 7, CLEAN_TAIL_APPEND_MAX_ENTRIES] {
                 let entries: Vec<(u32, u32, bool)> = (0..batch_len)
                     .map(|index| {
@@ -3811,6 +3866,11 @@ mod tests {
                         )
                     })
                     .collect();
+                assert_eq!(
+                    shared_wal_index_append_slots_are_empty(&region, &entries).unwrap(),
+                    prefix_len != 0,
+                    "prefix {prefix_len}: only a region's first frame is refused on empty slots"
+                );
                 let before = region.lock().to_vec();
                 let probed = verdict(validate_clean_tail_append(&region, &entries));
                 let simulated = verdict(validate_append_on_captured_segment(
@@ -3835,7 +3895,7 @@ mod tests {
         // A frame gap: five frames are claimed published, four are mapped.
         let region = region_with_prefix(&[11, 12, 13, 14]);
         let gap = [(6_u32, 21_u32, true)];
-        assert!(shared_wal_index_tail_is_clean(&region, 0, 5).unwrap());
+        assert!(shared_wal_index_append_slots_are_empty(&region, &gap).unwrap());
         let probed = verdict(validate_clean_tail_append(&region, &gap));
         assert_eq!(
             probed,
@@ -3865,7 +3925,7 @@ mod tests {
         }
         let one = [(5_u32, 21_u32, true)];
         let two = [(5_u32, 21_u32, false), (6_u32, 22_u32, true)];
-        assert!(shared_wal_index_tail_is_clean(&region, 0, 4).unwrap());
+        assert!(shared_wal_index_append_slots_are_empty(&region, &two).unwrap());
         assert_eq!(verdict(validate_clean_tail_append(&region, &one)), "ok");
         assert_eq!(
             verdict(validate_append_on_captured_segment(&region, 0, 4, &one)),
@@ -3909,11 +3969,6 @@ mod tests {
         for region in [&clean, &leftover] {
             publish_shared_wal_index_header(region, &baseline).unwrap();
         }
-        assert!(shared_wal_index_tail_is_clean(&clean, 0, 4).unwrap());
-        assert!(
-            !shared_wal_index_tail_is_clean(&leftover, 0, 4).unwrap(),
-            "the leftover tail takes the captured-segment simulation"
-        );
         let generation = WalGenerationIdentity {
             checkpoint_seq: 3,
             salts: crate::WalSalts {
@@ -3922,6 +3977,11 @@ mod tests {
             },
         };
         let entries = vec![(5_u32, 21_u32, false), (6_u32, 8213_u32, true)];
+        assert!(shared_wal_index_append_slots_are_empty(&clean, &entries).unwrap());
+        assert!(
+            !shared_wal_index_append_slots_are_empty(&leftover, &entries).unwrap(),
+            "the leftover mappings take the captured-segment simulation and the cleanup"
+        );
         let mut published = Vec::new();
         for region in [&clean, &leftover] {
             let mut plan = SharedWalIndexAppendPlan::prepare(
@@ -3943,6 +4003,92 @@ mod tests {
         assert_eq!(
             published[0], published[1],
             "both routes publish byte-identical index segments"
+        );
+    }
+
+    #[test]
+    fn test_shared_append_plan_cleans_a_half_cleared_tail_when_a_batch_reaches_it() {
+        // What a cleanup that died after the hash slots and the first page
+        // entries leaves: frames 7 and 8 keep their page entries, and nothing
+        // hashes to them. The twin never had a leftover.
+        let pages = [11_u32, 12, 13, 8203];
+        let half_cleared = region_with_prefix(&pages);
+        let twin = region_with_prefix(&pages);
+        for (frame, page) in [(7_u32, 99_u32), (8, 8291)] {
+            half_cleared
+                .atomic_store_u32_ne(
+                    WalIndexFrameLocation::new(frame).unwrap().page_offset(),
+                    page,
+                    Ordering::Release,
+                )
+                .unwrap();
+        }
+        let mut header = shared_header_fixture(4096, 0);
+        header.mx_frame = 4;
+        header.update_checksum().unwrap();
+        for region in [&half_cleared, &twin] {
+            publish_shared_wal_index_header(region, &header).unwrap();
+        }
+        let generation = WalGenerationIdentity {
+            checkpoint_seq: 3,
+            salts: crate::WalSalts {
+                salt1: header.a_salt[0],
+                salt2: header.a_salt[1],
+            },
+        };
+        let hash_table = |region: &ShmRegion| {
+            region.lock()[WAL_SHM_PAGE_ARRAY_BYTES..WAL_SHM_SEGMENT_BYTES].to_vec()
+        };
+        let published_pages = |region: &ShmRegion, mx_frame: u32| {
+            let end = WAL_SHM_FIRST_HEADER_BYTES + usize::try_from(mx_frame).unwrap() * 4;
+            region.lock()[WAL_SHM_FIRST_HEADER_BYTES..end].to_vec()
+        };
+
+        // The first batch fills empty slots below the leftover and clears
+        // nothing; the second reaches the leftover and takes the cleanup.
+        let batches = [
+            vec![(5_u32, 21_u32, false), (6_u32, 8213_u32, true)],
+            vec![(7_u32, 31_u32, false), (8_u32, 32_u32, true)],
+        ];
+        for (round, batch) in batches.iter().enumerate() {
+            assert_eq!(
+                shared_wal_index_append_slots_are_empty(&half_cleared, batch).unwrap(),
+                round == 0,
+                "round {round}: only the second batch's slots hold a leftover"
+            );
+            let mut target = header;
+            for region in [&half_cleared, &twin] {
+                let mut plan = SharedWalIndexAppendPlan::prepare(
+                    header,
+                    generation,
+                    vec![(0, region.share())],
+                    batch.clone(),
+                )
+                .unwrap();
+                target = header;
+                target.mx_frame = batch.last().unwrap().0;
+                target.i_change = plan.publication_change(target.mx_frame).unwrap();
+                target.n_page = 30;
+                target.a_frame_cksum = [target.mx_frame, 6];
+                target.update_checksum().unwrap();
+                plan.publish(target).unwrap();
+            }
+            header = target;
+            assert_eq!(
+                hash_table(&half_cleared),
+                hash_table(&twin),
+                "round {round}: every lookup walks the same hash table"
+            );
+            assert_eq!(
+                published_pages(&half_cleared, header.mx_frame),
+                published_pages(&twin, header.mx_frame),
+                "round {round}: every published frame maps to the same page"
+            );
+        }
+        assert_eq!(
+            half_cleared.lock().to_vec(),
+            twin.lock().to_vec(),
+            "once a batch has reached the leftover the segments are identical"
         );
     }
 }
