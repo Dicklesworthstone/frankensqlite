@@ -87,6 +87,130 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-11 - WIN (series): an autocommit statement stops re-deriving what its own last commit wrote (bd-ih8ak, eleven cuts and one fix; one cut on bd-5310l)
+
+- Target: every statement that is its own transaction on a file database (scorecard
+  `autocommit_5k_inserts`, `txn_1000x10_rows`; the read-transaction bracket of `point_index`).
+  Baseline at main 3ce2feef2, stock sqlite3 3.46.1 live in the same run: an autocommit INSERT is
+  74 system calls and 566k user instructions against stock's 8 and 22.4k. Touched:
+  `crates/fsqlite-pager/src/pager.rs`, `crates/fsqlite-pager/src/traits.rs`,
+  `crates/fsqlite-core/src/wal_adapter.rs`, `crates/fsqlite-wal/src/wal_index.rs`, one hunk of
+  `crates/fsqlite-core/src/connection.rs`.
+- Evidence before: per-syscall user stacks (`strace -f -k`) and a frame-pointer profile put 52 of
+  the ~75 calls inside the pager's commit. The same four-call "has the WAL changed" unit (map the
+  index, stat the WAL, read its header, read the terminal frame header) ran five times per
+  statement, the certificate sidecar was read four times and reopened once, and the flusher read
+  the durable size floor from the files before taking the gate and again under it. callgrind on
+  the user side: `SharedWalIndexAppendPlan::prepare` 142k instructions and `publish` 39k per
+  commit, both proportional to the 32 KiB segment, not to the one frame appended.
+- Principle of every cut: a fact this connection wrote or validated itself is reused while the
+  shared WAL-index header is the one it was established under, or while the append gate it was
+  established inside is still held. Every publication, checkpoint reset and recovery by any
+  connection or process rewrites that header, so any peer activity sends the code back to the
+  files exactly as before. No check a peer's change depends on was removed; the append gate still
+  validates the WAL path and tail once per commit before anything is written.
+- Cuts in commit order, one binary per cut, autocommit INSERT on a 10k-row table. System calls
+  are `strace -f` counts (batch of 400 minus batch of 200); user instructions are `perf stat`
+  (batch of 3,000 minus 1,500, mean of two repetitions):
+
+  | after | what stops being repeated | statx | pread | all calls | user instructions |
+  |---|---|---|---|---|---|
+  | base 3ce2feef2 | | 33.0 | 25.8 | 74 | 571.5k |
+  | 1 | the size floor read before the gate, when the header is still this flusher's own | 29.0 | 20.9 | 64 | 548.6k |
+  | 2 | a second WAL refresh before the first append under a proven gate baseline | 27.0 | 18.5 | 60 | 537.9k |
+  | 3 | the floor and the seed certificate read under the gate (and the frame re-hash) | 26.0 | 11.6 | 52 | 489.6k |
+  | 4 | reopening the certificate sidecar and scanning for its append boundary | 23.0 | 9.6 | 44 | 484.1k |
+  | 5 | copying the 32 KiB index segment to validate a small append | 23.0 | 9.6 | 44 | 425.6k |
+  | 6 | (bd-5310l) join maps built for a SELECT with no ORDER BY | 23.0 | 9.6 | 44 | 422.5k |
+  | 7 | re-reading the WAL header and terminal frame at the first read after an own commit | 22.0 | 7.6 | 41 | 420.6k |
+  | 8 | a third preflight inside the conflict check | 20.0 | 5.6 | 37 | 411.1k |
+  | 9 | scanning the whole unpublished index tail, twice per commit | 20.0 | 5.5 | 37 | 385.7k |
+  | 10-12 | a terminal-frame read, a WAL-header read at begin, two index mappings | 18.0 | 4.2 | 33 | 370.6k |
+
+  The binaries for 4 and 9 predate two changes folded in before landing (4 compares its last
+  record byte for byte, two `pread` where it had one `fstat`; 9 always cleans at a region's
+  first frame). The landing tree's own binary is in the next table.
+- Result against stock in the same run, landing tree on 4c975163a (sha256 b9b94e01...), base
+  sha256 2ff004d6..., two interleaved repetitions per arm, answers equal in every arm:
+
+  | autocommit | arm | system calls | user instructions |
+  |---|---|---|---|
+  | INSERT | stock | 8 | 22.4k |
+  | INSERT | base | 74 | 565.6k (25.2x) |
+  | INSERT | landing tree | 34 | 360.8k (16.1x) |
+  | UPDATE | stock | 8 | 26.0k |
+  | UPDATE | base | 72 | 613.3k (23.6x) |
+  | UPDATE | landing tree | 33 | 367.4k (14.2x) |
+  | SELECT | stock | 4 | 24.3k |
+  | SELECT | base | 11 | 205.8k (8.5x) |
+  | SELECT | landing tree | 11 | 194.4k (8.0x) |
+
+  The host was at load 24-37 for that run, so its time columns are not cited. On a quieter run
+  (load 15) of the twelve-cut binary before the folds (sha256 cd5cd4c2...): CPU per autocommit
+  INSERT 244-250 us -> 162-165 us (stock 9-14 us), kernel cycles 417-449k -> 230-234k.
+  Scorecard (`scripts/user_shape_scorecard.py` rows, five interleaved repetitions, A/A
+  0.94-1.07, load 70 falling to 20): `autocommit_5k_inserts` 19.3x -> 13.7x stock,
+  `txn_1000x10_rows` 14.5x -> 11.8x. No other row moved beyond the A/A spread in a direction
+  this series explains.
+- Keepers: `bd_ih8ak_flush_floor_after_peer_growth` (a writer with a remembered floor begins, a
+  peer grows the file and commits, the writer commits a write to an existing page: must succeed,
+  with stock's `integrity_check` and counts on the final file; fails with `BusySnapshot` when the
+  header comparison is removed) and `bd_ih8ak_certificate_append_tail` (two connections alternate
+  commits; the sidecar must hold one record per commit, back to back; fails with a missing record
+  when the tail check is removed). Five unit tests in `wal_index.rs` compare the live-table
+  validation with the captured-segment simulation, including a frame gap, one free hash slot for
+  two frames, a full table, a leftover tail at the batch and a half-cleared tail above it.
+- A fix found by the gate, landed first in the series: `gh457_autocommit_select_no_busy_snapshot`
+  is red on the base (BUSY reads in 3 of 3 runs at 3ce2feef2: 6, 10 and 11 of ~40,000). A read
+  admission that found WAL frames past its captured header with WRITE free took the tail's
+  writer for dead (GH#534) when that writer had published and left, asked for a recovery it
+  could not get beside open peers, and returned `BusyRecovery`. The shared header is now read
+  again after the probe. With the fix the test passes 5 of 5 (4 before the rebase, 1 after).
+- Gate, full run at 8e2afd06b (the twelve cuts before the fixes were folded): fsqlite-wal 1,163
+  unit tests pass; fsqlite-pager 1,100 pass and 2 fail (`bd_2jpu6_2_dirty_eviction_runs_in_parent
+  _asupersync_region`, red on main, bd-5lvnd; `page_buf::tests::test_reset_global_pool_metrics`,
+  a process-global counter read while other tests run, green in the two earlier runs of the same
+  suite); 230 fsqlite-core integration binaries: 381 tests pass, 3 fail, all three red or flaky
+  without this series (`gh457` above; `gh19_public_native_full_commits_grow_shared_segments
+  _before_stock_refresh`, bd-mcpbv, red on base in the same session; the cross-process
+  truncate-checkpoint churn keeper with GH#399's recorded signature, green 2 of 2 on base and
+  red in the one run here, so its rate under this series is not established); 18 fsqlite-e2e
+  binaries: 129 pass, 1 fails (`centralized_publication_cost_shrank`, a timing assertion,
+  bd-uk9ob); the harness churn family passes; clippy `-D warnings` clean on fsqlite-wal,
+  fsqlite-pager and fsqlite-core. Two adapter unit tests failed in that run and are what the
+  folded changes answer: an in-place corruption of the sidecar's last record must still be
+  refused at append (hence the byte comparison), and the read-binding test now drops the
+  own-publication proof before the admission it is about. With the fixes folded, on the
+  4c975163a rebase: the fsqlite-wal unit suite, the 119 adapter unit tests, both keepers, gh534,
+  the sidecar compaction and crash-image suites and gh457 pass. On the final base bd7d3f7b8:
+  compile check and clippy `-D warnings` clean for fsqlite-wal, fsqlite-pager and fsqlite-core.
+- Still a loss, 16x stock on an autocommit INSERT. What the 34 calls left are: 8 lock calls and 2
+  writes (stock: 6 and 2); 5 path-identity probes; 4 stats of the `-wal` path; 6 `fstat` of
+  `-shm`, one per index mapping; one `fstat` each of the WAL and the database; 2 reads of the WAL
+  header and 2 of the certificate tail; one `access` for a rollback journal. A native
+  frame-pointer profile of the twelve-cut binary is flat: commit 49% (the once-per-commit
+  validation under the gate 13%), begin 20%, the INSERT itself 15%; path-identity probes 7.7%,
+  no user function above 2.8% of self time.
+- One behaviour moves: a connection's first read after its own commit no longer re-reads the WAL
+  header and terminal frame, so a commit a *later* writer left unpublished by dying is found by
+  the next append preflight or the next admission after the header moves, as was already the case
+  for every read after the first. The gh534 suite passes unchanged.
+- Not done here, and why: the path-identity probes are a deliberate TOCTOU defence and need the
+  owner's decision; the `fstat` inside every `shm_map` is the bd-7do1d truncation defence; the
+  four stats of the `-wal` path per statement (two refresh signatures, the adapter's path check
+  at begin and under the gate) need one owner for "the path still names my file" per statement
+  boundary, which is a design change, not a cut; the WAL-header read in the adapter's path check
+  under the gate cannot simply go, because a generation reset there answers `BusyRecovery`
+  where the refresh that follows would rebuild and continue.
+- Measurement trap found on the way: under callgrind the statement future is polled about ten
+  times per statement on both the base and the cut binary (about once natively), so callgrind
+  inclusive totals on this path carry roughly 100k instructions of scheduler and re-entry per
+  statement that a native run does not execute. Use it for which subtree, not for how much.
+- Retry condition for the next cut on this path: none of the remaining system calls is repeated
+  work inside one gate hold, so the next step is the design change above or the owner's decision
+  on path-identity probes; a single user-side term at 5% or more of a native profile of this
+  commit's binary reopens it.
+
 ## 2026-11-10 - WIN: the shell prepares a statement for its column names only when the output mode can show one (bd-5310l)
 
 - Target: text statements through the CLI. A point `SELECT` by rowid inside a transaction cost
