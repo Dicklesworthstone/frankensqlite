@@ -1331,6 +1331,13 @@ struct TableSeekCacheEntry {
     rowid: i64,
     page_no: PageNumber,
     cell_idx: u16,
+    /// The first and last rowid the leaf held when the seek landed on it
+    /// (bd-w4pr1.13.13). A later target outside them cannot land on this
+    /// leaf, so the slot is skipped without loading the page. The bounds are
+    /// a filter only: one that has gone stale skips a slot the descent from
+    /// the root then finds, and a slot that passes is still searched.
+    first_rowid: i64,
+    last_rowid: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2650,12 +2657,8 @@ impl<P> BtCursor<P> {
         self.last_index_insert_past_rightmost
     }
 
-    fn remember_table_seek(&mut self, rowid: i64, page_no: PageNumber, cell_idx: u16) {
-        let entry = TableSeekCacheEntry {
-            rowid,
-            page_no,
-            cell_idx,
-        };
+    fn remember_table_seek(&mut self, entry: TableSeekCacheEntry) {
+        let page_no = entry.page_no;
 
         #[cfg(feature = "bench-internals")]
         if TABLE_SEEK_MRU_SHORT_CIRCUIT_FOR_BENCH.load(std::sync::atomic::Ordering::Relaxed)
@@ -4392,7 +4395,7 @@ impl<P: PageReader> BtCursor<P> {
                         entry.cell_idx = idx;
                         self.stack.push(entry);
                         self.at_eof = false;
-                        self.remember_table_seek(target_rowid, current_page, idx);
+                        self.remember_table_landing(target_rowid, current_page, idx);
                         self.record_point_witness(
                             cx,
                             WitnessKey::Cell {
@@ -4413,12 +4416,16 @@ impl<P: PageReader> BtCursor<P> {
                             entry.cell_idx = landed_cell_idx;
                             self.stack.push(entry);
                             self.at_eof = true;
-                            self.remember_table_seek(target_rowid, current_page, landed_cell_idx);
+                            self.remember_table_landing(
+                                target_rowid,
+                                current_page,
+                                landed_cell_idx,
+                            );
                         } else {
                             entry.cell_idx = idx;
                             self.stack.push(entry);
                             self.at_eof = false;
-                            self.remember_table_seek(target_rowid, current_page, idx);
+                            self.remember_table_landing(target_rowid, current_page, idx);
                         }
                         self.record_point_witness(
                             cx,
@@ -4459,6 +4466,12 @@ impl<P: PageReader> BtCursor<P> {
             // If the cached landing point was the first cell on this leaf,
             // any smaller rowid must belong to an earlier leaf.
             if target_rowid < cached.rowid && cached.cell_idx == 0 {
+                continue;
+            }
+            // A landing below is an exact match or a gap strictly inside the
+            // leaf, so a target outside the rowids the leaf held cannot land
+            // here: skip the slot instead of loading its page to find out.
+            if target_rowid < cached.first_rowid || target_rowid > cached.last_rowid {
                 continue;
             }
 
@@ -4527,7 +4540,7 @@ impl<P: PageReader> BtCursor<P> {
             entry.cell_idx = idx;
             self.stack.push(entry);
             self.at_eof = false;
-            self.remember_table_seek(target_rowid, cached.page_no, idx);
+            self.remember_table_landing(target_rowid, cached.page_no, idx);
             self.record_point_witness(
                 cx,
                 WitnessKey::Cell {
@@ -4558,6 +4571,25 @@ impl<P: PageReader> BtCursor<P> {
             return Ok(None);
         }
         Ok(Some(entry))
+    }
+
+    /// Remember the table leaf a seek landed on, with the rowids it holds.
+    /// The leaf is the top of the stack; when it is not, or its bounds do not
+    /// decode, the slot is remembered without a filter.
+    fn remember_table_landing(&mut self, rowid: i64, page_no: PageNumber, cell_idx: u16) {
+        let (first_rowid, last_rowid) = self
+            .stack
+            .last()
+            .filter(|leaf| leaf.page_no == page_no)
+            .and_then(|leaf| Self::table_leaf_rowid_bounds(leaf).ok().flatten())
+            .unwrap_or((i64::MIN, i64::MAX));
+        self.remember_table_seek(TableSeekCacheEntry {
+            rowid,
+            page_no,
+            cell_idx,
+            first_rowid,
+            last_rowid,
+        });
     }
 
     fn table_leaf_rowid_bounds(entry: &StackEntry) -> Result<Option<(i64, i64)>> {
@@ -4599,7 +4631,7 @@ impl<P: PageReader> BtCursor<P> {
             .last()
             .ok_or_else(|| FrankenError::internal("cursor stack empty"))?
             .cell_idx;
-        self.remember_table_seek(target_rowid, page_no, positioned_cell_idx);
+        self.remember_table_landing(target_rowid, page_no, positioned_cell_idx);
         self.record_point_witness(
             cx,
             WitnessKey::Cell {
@@ -15047,10 +15079,9 @@ mod tests {
 
             cursor.pager.clear_reads();
             assert!(cursor.table_move_to(&cx, 90).await.unwrap().is_found());
-            assert_eq!(
-                cursor.pager.read_pages(),
-                vec![pn(6), pn(5), pn(4), pn(2), pn(7)]
-            );
+            // bd-w4pr1.13.13: none of the four cached leaves can hold 90, so
+            // none is loaded on the way to the root (was 6, 5, 4, 2, 7).
+            assert_eq!(cursor.pager.read_pages(), vec![pn(2), pn(7)]);
             let cache_pages: Vec<PageNumber> = cursor
                 .seek_cache
                 .iter()
@@ -15062,7 +15093,8 @@ mod tests {
             cursor.pager.clear_reads();
             let result = cursor.table_move_to(&cx, 35).await.unwrap();
             assert!(!result.is_found());
-            assert_eq!(cursor.pager.read_pages(), vec![pn(3), pn(2), pn(4)]);
+            // Leaf 3 holds 10..=20 and is not loaded for 35 (was 3, 2, 4).
+            assert_eq!(cursor.pager.read_pages(), vec![pn(2), pn(4)]);
             let cache_pages: Vec<PageNumber> = cursor
                 .seek_cache
                 .iter()
@@ -15075,6 +15107,93 @@ mod tests {
             let result = cursor.table_move_to(&cx, 12).await.unwrap();
             assert!(!result.is_found());
             assert_eq!(cursor.pager.read_pages(), vec![pn(3)]);
+        });
+    }
+
+    /// bd-w4pr1.13.13: a cached leaf is loaded only when the target can be on
+    /// it. Random probes over more leaves than the cache has slots used to
+    /// load every cached leaf before descending from the root.
+    #[test]
+    fn test_table_seek_cache_loads_only_a_leaf_that_can_hold_the_target() {
+        run_async(async {
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(
+                2,
+                build_interior_table(
+                    &[
+                        (pn(3), 20),
+                        (pn(4), 40),
+                        (pn(5), 60),
+                        (pn(6), 80),
+                        (pn(7), 100),
+                    ],
+                    pn(8),
+                ),
+            );
+            for (page, first) in [
+                (3_u32, 10_i64),
+                (4, 30),
+                (5, 50),
+                (6, 70),
+                (7, 90),
+                (8, 110),
+            ] {
+                store.pages.insert(
+                    page,
+                    build_leaf_table(&[(first, b"a"), (first + 5, b"b"), (first + 10, b"c")]),
+                );
+            }
+
+            let cx = Cx::new();
+            let mut cursor = BtCursor::new(SeekProbeStore::new(store), pn(2), USABLE, true);
+            // Leaves 3, 4, 5 and 6 fill the four slots; 6 is the most recent.
+            for rowid in [10_i64, 30, 50, 70] {
+                assert!(cursor.table_move_to(&cx, rowid).await.unwrap().is_found());
+            }
+
+            // (target, found, pages read). A cached leaf is the only page read
+            // for a key or a gap inside it, whichever slot it is in and
+            // wherever in the leaf the earlier seek landed.
+            for (target, found, reads) in [
+                (20_i64, true, vec![pn(3)]),
+                (40, true, vec![pn(4)]),
+                (12, false, vec![pn(3)]),
+                (55, true, vec![pn(5)]),
+                (79, false, vec![pn(6)]),
+                (35, true, vec![pn(4)]),
+            ] {
+                cursor.pager.clear_reads();
+                let result = cursor.table_move_to(&cx, target).await.unwrap();
+                assert_eq!(result.is_found(), found, "target {target}");
+                assert_eq!(cursor.pager.read_pages(), reads, "target {target}");
+            }
+
+            // A target on no cached leaf reads the root and its own leaf, and
+            // nothing else: below every cached leaf, between two of them, on
+            // a leaf that is not cached, and past the last one.
+            for (target, found, leaf) in [
+                (5_i64, false, pn(3)),
+                (25, false, pn(4)),
+                (100, true, pn(7)),
+                (95, true, pn(7)),
+                (110, true, pn(8)),
+                (500, false, pn(8)),
+            ] {
+                // Refill the slots with leaves 3 to 6 so the target's own
+                // leaf is not among them (25 lands on leaf 4 through the
+                // root: the gap before its first key is not a landing).
+                for rowid in [10_i64, 30, 50, 70] {
+                    assert!(cursor.table_move_to(&cx, rowid).await.unwrap().is_found());
+                }
+                cursor.pager.clear_reads();
+                let result = cursor.table_move_to(&cx, target).await.unwrap();
+                assert_eq!(result.is_found(), found, "target {target}");
+                assert_eq!(
+                    cursor.pager.read_pages(),
+                    vec![pn(2), leaf],
+                    "target {target}"
+                );
+            }
         });
     }
 
