@@ -87,6 +87,410 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-11 - WIN (series): a lookup join tests outer-row terms first, bounds its outer scan by rowid, compiles BETWEEN, and serves the comma spelling for rows (bd-w4pr1.13.16)
+
+- Target: row-returning two-table joins with a filter on the outer table, e.g.
+  `SELECT t.id, u.name FROM t JOIN u ON u.a = t.a WHERE t.id <= 100000` (21.5x stock on main
+  8b04bef28; 54x written with a comma). Touched: `crates/fsqlite-vdbe/src/codegen.rs`
+  (`codegen_single_join_lookup_select`, `emit_outer_loop_start`, `emit_join_expr`,
+  `single_join_lookup_select`, `codegen_join_select`), `crates/fsqlite-core/src/connection.rs`
+  (`join_expr_is_vdbe_eligible`, `select_where_joined_lookup_is_vdbe_eligible`).
+- Evidence before: the program did Rewind t; per row Column, MustBeInt, SeekRowid u; only then
+  the WHERE test on t; Next over all 1M rows. BETWEEN anywhere in the statement and a join
+  written without ON sent the whole statement to the materializing executor.
+- Five commits: (1) WHERE conjuncts (and, for an inner join, ON residual conjuncts) that read
+  only the outer table are tested before the inner seek; (2) such a term that bounds the outer
+  rowid from above ends a rowid-ordered scan instead of advancing it; (3) an integer lower bound
+  on the outer rowid starts the scan with a seek; (4) the join lanes compile BETWEEN as its two
+  comparisons, and a top-level BETWEEN conjunct takes part in (1) to (3); (5) a two-table inner
+  or cross join without a constraint takes its lookup from WHERE and keeps its written order,
+  as its aggregate twin does.
+- Result, stock sqlite3 3.46.1 live (user instructions of the statement, x stock; binaries
+  5fc2608a... -> 2359373d... for commits 1 to 3, differing by those only; 2359373d... ->
+  9f652f5a... for 4 and 5, which also crosses main's four bd-5310l commits, worth at most 7% on
+  a control statement):
+
+  | statement (FROM t JOIN u ON u.a = t.a unless shown) | stock M | before | after |
+  |---|---|---|---|
+  | WHERE t.id <= 100000 | 294.4 | 4,710.6 (16.0x) | 887.6 (3.0x) |
+  | WHERE t.id > 900000 | 284.7 | 4,704.2 (16.5x) | 890.3 (3.1x) |
+  | WHERE t.a < 100 (commit 1 only) | 631.1 | 4,701.9 (7.5x) | 1,872.4 (3.0x) |
+  | WHERE t.id BETWEEN 400000 AND 500000 | 295.9 | 8,780.4 (29.7x) | 948.7 (3.2x) |
+  | FROM t, u WHERE u.a = t.a AND t.id <= 100000 | 294.2 | 16,330.1 (55.5x) | 845.6 (2.9x) |
+  | count(*), sum(t.a) FROM p JOIN t ON t.id = p.k WHERE p.k <= 500000 | 322.4 | 3,382.6 (10.5x) | 1,860.0 (5.8x) |
+  | same, WHERE p.k BETWEEN 100000 AND 600000 | 328.7 | 8,219.6 (25.0x) | 2,071.9 (6.3x) |
+
+  CPU on the first, fourth and fifth rows at the stack tip: 4.5x, 3.5x, 4.35x stock. Kill
+  criteria: (1) under 40% removed: 60% on the non-rowid filter; (2) and (3) under 50% of the
+  remainder: 53%, taking that same-output-size statement as the reference, so narrowly.
+- Oracle, all in `crates/fsqlite-core/tests/join_aggregate_lookup_oracle.rs` against rusqlite:
+  `join_lookups_test_outer_row_terms_first_and_match_sqlite` (LEFT JOIN ON terms keep unmatched
+  rows, OR is not split, EXPLAIN order), `join_lookups_stop_at_an_outer_rowid_bound_and_match_sqlite`
+  (a bound on a non-rowid column, a real or text bound, a bound under OR or on the inner table
+  must not stop the scan), `join_lookups_start_at_an_outer_rowid_floor_and_match_sqlite`,
+  `join_lanes_compile_between_and_match_sqlite` (NOT BETWEEN, NULL bounds, text bounds,
+  reversed bounds), `join_rows_joined_by_where_match_sqlite` and
+  `join_rows_joined_by_where_run_as_bytecode` (written order kept, three tables and NATURAL
+  stay out).
+- Gate for this entry and the ten below it (the read stack, 16 commits and one golden commit),
+  rch, 2026-11-11, on the stack over main 4af710d0d (tip f34bf3296): clippy `-D warnings
+  --all-targets` on fsqlite-wal, -pager, -btree, -vdbe and -core clean. Unit suites: btree 544
+  pass; wal 1,164 pass; pager 1,103 pass and 1 red before the stack (`bd_2jpu6_2`, bd-5lvnd);
+  vdbe 1,217 pass and 2 red before the stack (IN-list codegen shapes, bd-bhalc); core, filtered
+  to the touched areas, 459 pass and 2 red before the stack (bd-nouem). For each red test the
+  CLI of main without the stack emits the same program or the same answer. 35 core oracle
+  binaries: 34 pass (101 tests); `gh497 typed_index_membership_seeks_and_matches_stock` is red
+  on main too (`SELECT count(*) ... WHERE r IN (9007199254740993)` returns 2, repro on
+  bd-xz5f4). Plan-pinning tests the first list did not name: the three fsqlite-vdbe
+  integration tests and 24 fsqlite-crate tests (56 tests) pass on that stack; 21 of 22
+  fsqlite-core tests (117 tests) pass on the rebased tree, and
+  `bd_group_by_depth_oracle_probe` is red on main too (GROUP BY over a DESC index column,
+  bd-gazf2). Bytecode goldens: two snapshots change with this entry and the membership entry
+  (GOLDEN-CHANGE commit); all 8 golden families pass with it. The push is one rebase later,
+  over the CREATE INDEX series (main 8a376af69, one textual conflict where both sides added a
+  function): on that exact tree clippy on the same crates plus fsqlite-types is clean, the vdbe
+  unit suite is 1,222 pass with the same 2 red, the goldens pass, 7 oracle binaries pass (35
+  tests, the CREATE INDEX keeper among them) and btree is 546 pass.
+- Not done: a lower bound that is a parameter or an expression; the same placement for the
+  hash-join fallback; three or more tables. A term tested before the lookup is evaluated again
+  with the full WHERE after it (four opcodes per surviving row, visible in the
+  `select_join_lookup` bytecode golden); dropping the repeat is a follow-up.
+- Retry condition: none.
+
+## 2026-11-11 - WIN: a repeated membership probe of a DISTINCT or IN set is answered without a seek (bd-w4pr1.13.15)
+
+- Target: `SELECT DISTINCT a FROM t` (1M rows, 1,000 values), `a IN (50 literals)`,
+  `a IN (SELECT ...)`: every row probed an in-memory index b-tree at about 8.5k instructions.
+  Touched: `crates/fsqlite-vdbe/src/engine.rs` (`MembershipMemo`,
+  `storage_cursor_probe_membership`, `Found`), `crates/fsqlite-vdbe/src/codegen.rs` (the three
+  sites set `OPFLAG_PROBE_MEMBERSHIP_ONLY` on `Found`), `crates/fsqlite-btree/src/cursor.rs`
+  (`row_image_epoch`).
+- Change: a `Found` whose two outcomes never read the cursor carries a P5 flag. For such a probe
+  the cursor remembers, per probe record bytes, the answer the b-tree gave, valid until the
+  index changes ("present" survives inserts, "absent" does not). The memo is bounded (8,192
+  keys, 256-byte records) and sits out 32,768 probes after a window with too few hits, so a set
+  of all-distinct keys pays one counter step per probe.
+- Result, stock sqlite3 3.46.1 live, binaries that differ by this commit only (sha256
+  0568f906... -> 5fc2608a..., each engine on its own 1M-row database, load 16):
+
+  | statement | stock M instr | before | after |
+  |---|---|---|---|
+  | SELECT DISTINCT a | 1,068.7 | 11,337.6 (10.6x) | 2,231.2 (2.1x) |
+  | a IN (50 literals) | 914.5 | 7,777.8 (8.5x) | 3,088.6 (3.4x) |
+  | a IN (SELECT a FROM u WHERE a < 100) | 680.6 | 7,726.3 (11.4x) | 2,704.7 (4.0x) |
+  | SELECT DISTINCT b, 200k distinct texts | 1,340.7 | 13,452.8 (10.0x) | 13,482.0 (10.1x) |
+
+  CPU on the first three: 9.5x -> 1.7x, 9.0x -> 3.1x, 11.1x -> 3.4x. Kill criteria (under 40%
+  removed on the repeated-value shapes, or over 3% added on the all-distinct shape): not met.
+- Oracle: `repeated_membership_probes_match_rusqlite_oracle` in
+  `crates/fsqlite-core/tests/bd_select_distinct_semantics_oracle_probe.rs` (repeats across the
+  pause window, 1 / 1.0 / '1' / x'31' / NULL keys, NOCASE keys, inserts between probes of the
+  same key). Gate: the stack gate in this date's lookup-join series entry.
+- Still a loss: the all-distinct shape, 10x. A profile of it and of the unindexed 5k x 5k join
+  puts 67% to 73% of the statement in the in-memory index: about 11k instructions per seek (two
+  page loads that copy the whole cell-pointer array, about thirteen comparisons that each go
+  through the cell-slot cache and a record decode) and about 260k per balance (162 balances for
+  5,000 inserts). Next under the same bead: a hash set for cursors that are only asked "is this
+  key present".
+- Retry condition: none.
+
+## 2026-11-11 - WIN: the frame-payload digest hands BLAKE3 whole 16 KiB blocks (bd-w4pr1.13.17)
+
+- Target: UPDATE and DELETE statements that rewrite many pages, and opening a database whose WAL
+  still holds frames. Touched: `crates/fsqlite-wal/src/parallel_wal.rs`
+  (`ParallelWalFramePayloadDigestBuilder`).
+- Evidence before: the commit certificate's digest fed BLAKE3 five small field updates and one
+  page per frame; the hasher took its buffered (one-chunk-at-a-time) path for all of it. The open
+  re-hashes the frames the newest certificate covers.
+- Change: the 24 field bytes and the payload go through a 16 KiB staging buffer and reach the
+  hasher as whole blocks, so it runs its multi-chunk SIMD path. The byte stream, and so every
+  digest value, is unchanged.
+- Result, stock live, binaries that differ on these statements by this commit only (sha256
+  2359373d... -> 490c8424..., 3 repetitions, fresh copy of a 300k-row table per run, load 15):
+  `UPDATE m SET a = a + 1 WHERE id % 10 = 0` 1,137.7M -> 1,034.7M instructions (8.27x -> 7.52x
+  stock); `DELETE FROM m WHERE id % 7 = 0` 1,283.5M -> 1,179.6M (10.75x -> 9.88x); opening the
+  database with the 9.1 MB WAL its build left 89.9M -> 55.9M instructions, 37.6 -> 32.2 ms. CPU
+  on the two statements is inside the noise at that load. Kill criterion (under 5% on both
+  statements): not met.
+- Tests: `frame_payload_digest_builder_matches_the_piecewise_stream` (13 payload sizes, 1 to 40
+  frames, against the field-by-field stream). Gate: the stack gate in this date's lookup-join series entry.
+- Still a loss: both statements are 7.5x to 10x stock in instructions; the digest was one tenth.
+- Retry condition: none.
+
+## 2026-11-11 - WIN: a page read takes its free locks without a native checkpoint (bd-w4pr1.13.14)
+
+- Target: every page read that reaches the pager in WAL mode; measured on `rowid_lookups_200k`.
+  Touched: `crates/fsqlite-pager/src/pager.rs` (`async_rwlock_read_for_page`,
+  `read_page_from_wal_backend`, `read_page_copy`).
+- Evidence before (instruction profile, frame-pointer build): 10.3% of
+  `SELECT count(*), sum(t.a) FROM p JOIN t ON t.id = p.k` inside `read_page_from_wal_backend`,
+  65% of that taking the WAL backend's read lock: the asupersync read future runs a full native
+  checkpoint (clock read, budget snapshot, progress record) on its first poll, and the lock is
+  free on essentially every read. The lookup also boxed a callback per page.
+- Change: when the section is not masked and neither cancellation flag is published, the two
+  locks a page read takes (WAL backend, database file) are taken with `try_read`, which admits
+  under the same rule as the future's first poll (no active writer, none waiting). Anything else
+  takes the old path. A deadline, a budget exhaustion or a native cancellation not yet published
+  is seen at the cursor's next throttled checkpoint (within 64 cursor operations) instead of at
+  this acquisition.
+- Result, stock live, binaries that differ by this commit only (sha256 024925be... -> 0568f906...,
+  3 repetitions, medians, load 20): `rowid_lookups_200k` 18,481 -> 16,889 instructions per lookup
+  (6.67x -> 6.09x stock), CPU 862 -> 814 ms (2.35x -> 2.22x); the JOIN..ON spelling 18,500 ->
+  16,855, 843 -> 795 ms. At most three page reads per lookup on this tree, so at least 530
+  instructions per page read (kill criterion: under 300). Rows that read few pages through the
+  pager did not move (scan_filter_agg 1,804 -> 1,793 per row, inside the instruction A/A spread).
+- Tests: `page_read_lock_keeps_cancellation_and_writer_preference` (a published cancellation
+  still aborts at the acquisition; a waiting writer still blocks the reader; a masked section
+  takes the old path). Gate: the stack gate in this date's lookup-join series entry.
+- Retry condition: none. Not tried: the same shortcut for locks outside the page-read path; the
+  2026-05-06 / 2026-05-12 / 2026-08-17 commit-path lock entries stand.
+
+## 2026-11-11 - REJECTED: numeric window sort keys, in two forms; WIN: the duplicate output sort they were hiding (bd-w4pr1.12)
+
+- Target: scorecard `window_row_number` after the partition fix (4.6x stock CPU). Touched:
+  `crates/fsqlite-core/src/connection.rs` (`execute_window_select`).
+- Rejected, form 1 (numeric PARTITION BY / ORDER BY keys decoded into one flat array, compared
+  through the index sort): 17.03G -> 14.24G instructions but CPU 3,180 -> 3,223 ms. The index sort
+  still makes two random reads per comparison into a 16 MB array.
+- Rejected, form 2 (order-preserving u64 keys plus the row number sorted in place, unstable):
+  CPU 3,924 -> 3,477 ms (-11%) on `window_row_number` over five repetitions, instructions 14,096
+  -> 13,508 per row; `rank()` over 50 partitions inside the noise. Kill criterion was under 15%
+  on the target row: both forms are out of the tree (form 2 is commit d06d8f5e7 on branch
+  `final2` of the perf lane's clone, not pushed).
+- Why the prediction failed: most of the comparator time attributed to the window's sort belonged
+  to a second sort. The executor sorted the row indices by the first window's keys once per window
+  function and then again to order the output, with the same keys, collations, starting order and
+  stable sort.
+- Kept: the output order is the first window's sorted index vector; the second sort is gone. It
+  applies to every window query whatever its key types. Result on `window_row_number`, stock
+  live, 5 repetitions, load 22 (the three fsqlite binaries sit on main 8b04bef28, 7e486c4c2 and
+  4af710d0d, so base drift is inside the deltas; unrelated rows moved under 1% in instructions):
+  partition fix only 17,025 instructions per row and 5,208 ms (7.23x stock CPU); with numeric
+  keys form 1 14,077 and 3,991 ms; this tree 13,319 and 3,486 ms (4.84x, 1.62x in instructions).
+  CPU -33% against the partition-fix-only tree; kill criterion (under 10%) not met. The row is
+  still a loss at 4.84x CPU: memory (max RSS 1.18 GB against stock's 8 MB), bd-w4pr1.12.
+- Oracle: the ten window suites plus `partitions_follow_key_comparison_not_input_order` (three
+  added queries whose output order is not otherwise fixed). Gate: the stack gate in this date's lookup-join series entry.
+- Retry condition for the packed sort: on the tree without the duplicate sort, a call-graph
+  profile that puts the first window's sort at 15% or more of `window_row_number`'s CPU.
+
+## 2026-11-11 - WIN: window partitions are the runs of equal keys after the sort (bd-w4pr1.12)
+
+- Target: scorecard `window_row_number`, `SELECT sum(rn) FROM (SELECT row_number() OVER
+  (PARTITION BY a ORDER BY c) rn FROM t)` on 1M rows in 1,000 partitions, and any window with
+  many partitions. Touched: `crates/fsqlite-core/src/connection.rs` (`execute_window_select`,
+  `execute_group_by_window_select`).
+- Evidence before: 62.5G user instructions against stock's 8.2G; 94% inside
+  `execute_window_select`, of which `cmp_sqlite_values` 35%, the function's own code 32%,
+  `cmp_sqlite_values_collated_snapshot` 11%. After sorting the rows by the PARTITION BY keys the
+  executor found each row's partition by searching every partition found so far
+  (`parts.iter_mut().find(group_keys_equal_collated)`), cloning the row's key first: rows x
+  partitions / 2 comparisons.
+- Change: the sort and the partition test use the same per-key comparison under the same
+  collations, so the rows of a partition are consecutive after the sort; a row starts a new
+  partition exactly when its keys differ from the first row of the current one. One comparison
+  per row, no key clone. Partitions, their order and the row order inside them are unchanged for
+  any comparison that is a strict weak order (every built-in comparison and collation is).
+- Result, stock sqlite3 3.46.1 live in the same run (host load 12-18, 3 repetitions, medians;
+  all arms on the same database image; base sha256 631d02a6..., candidate b8535d44...):
+
+  | query | stock | main 8b04bef28 | this change |
+  |---|---|---|---|
+  | window_row_number, instructions per row | 8,224 | 60,614 (7.37x) | 17,026 (2.07x) |
+  | window_row_number, CPU ms | 701 | 6,616 (9.44x) | 4,663 (6.65x) |
+  | row_number, 100k rows in 20,000 partitions, M instructions | 708 | 88,162 (124.5x) | 1,160 (1.6x) |
+  | same, CPU ms | 61 | 5,454 (88.8x) | 308 (5.0x) |
+
+  An unaffected row (scan_filter_agg) moved 0.5% in instructions.
+- Oracle: `partitions_follow_key_comparison_not_input_order` in
+  `crates/fsqlite-core/tests/window_function_oracle.rs`: interleaved partitions whose keys mix
+  storage classes (1 and 1.0, '1', x'31', NULL), a NOCASE column, COLLATE BINARY, expression
+  keys, 1,000 partitions, one partition per row, one for all, and windows over grouped rows,
+  against rusqlite. Gate: the stack gate in this date's lookup-join series entry.
+- Still a loss: 6.65x CPU. What is left is memory, not instructions: user 3.42 s, sys 0.86 s,
+  max RSS 1,177 MB and 306k minor faults against stock's 0.66 s, 0.04 s, 8 MB, 1.3k. The
+  window-sort entry of this date takes the next step; the materialization of every row and key
+  as its own vector is bd-w4pr1.12's remaining work.
+- Retry condition: none for this entry.
+
+## 2026-11-11 - WIN: a join aggregate's ON and WHERE may use every operator the join emitter compiles (bd-w4pr1.13.6)
+
+- Target: aggregates over a two-table join whose key or filter uses `/ % || & | << >>`, e.g.
+  `SELECT count(*), sum(u.a) FROM p LEFT JOIN u ON u.a = p.k % 2000`. Touched:
+  `crates/fsqlite-core/src/connection.rs` (`select_join_aggregate_is_vdbe_candidate`, new
+  `join_aggregate_condition_is_vdbe_candidate`, `join_aggregate_arg_is_vdbe_candidate`).
+- Evidence before: the routing predicate admitted comparisons, `+ - *`, AND, OR and IS NULL, so
+  these statements went to the materializing executor although the lookup planner takes such an
+  expression as a key and `emit_join_expr` compiles it.
+- Result, stock sqlite3 3.46.1 live in the same run (3 repetitions, medians, same database
+  image): `LEFT JOIN u ON u.a = p.k % 2000` 2,123M -> 1,158M user instructions (7.0x -> 3.8x
+  stock); `JOIN u ON u.a = p.k / 1000` 8.2x -> 2.9x; a WHERE term with a division 11.3x -> 4.6x.
+  Answers equal.
+- Oracle: `join_aggregates_over_operator_conditions_match_sqlite` (17 queries against rusqlite,
+  indexed and not: each operator as a key, division and modulo by zero as keys and in WHERE, `%`
+  on a real, `||` as a text key, the operators inside aggregate arguments, plus an EXPLAIN check
+  that the modulo key runs as a rowid lookup loop). Gate: the stack gate in this date's lookup-join series entry.
+- Retry condition: none.
+
+## 2026-11-11 - WIN: scalar function calls in a join aggregate's arguments run inside the lookup loop (bd-w4pr1.13.6)
+
+- Target: scorecard `join_1M_to_pk_1000`, `SELECT count(*), sum(length(u.name)) FROM t JOIN u ON
+  u.a = t.a` (1M outer rows, rowid lookups into a 1,000-row table). Touched:
+  `crates/fsqlite-vdbe/src/codegen.rs` (`join_aggregate_arg_supported`, `emit_join_expr`),
+  `crates/fsqlite-core/src/connection.rs` (`join_aggregate_arg_is_vdbe_candidate`).
+- Evidence before: the statement ran `execute_group_by_join_select_inner` (the materializing
+  join-aggregate executor) because the join expression emitter had no function-call case; the
+  same query with `sum(u.a)` already compiled to the lookup loop at about half the cost.
+- Change: a plain call (no DISTINCT, FILTER, ORDER BY or OVER) of a scalar function that is
+  registered at that arity, constant for identical arguments
+  (`ScalarQueryConstancy::Constant`) and does not consume its arguments' collations compiles to
+  its arguments and one `PureFunc`. The engine resolves the name in the connection's registry
+  when the call runs, so an application's replacement of a builtin is what executes. Scalar
+  `min`/`max`, `random()` and anything collation-consuming keep the general path.
+- Result, stock sqlite3 3.46.1 live in the same run (load 11-18, 3 repetitions, medians, one
+  database image; binaries joinwhere 0411d0c3..., joinfn f924cabe...):
+
+  | query | stock | before | after |
+  |---|---|---|---|
+  | join_1M_to_pk_1000, instructions per outer row | 1,721 | 14,935 (8.68x) | 7,781 (4.52x) |
+  | join_1M_to_pk_1000, CPU ms | 199 | 1,854 (9.31x) | 797 (4.01x) |
+  | count(*), sum(length(u.name)), max(upper(u.name)), M instructions | 2,736 | 20,002 (7.3x) | 10,024 (3.7x) |
+  | sum(length(u.name) + abs(t.a)), M instructions | 1,862 | 18,925 (10.2x) | 8,417 (4.5x) |
+
+  The lane's own `sum(u.a)` form and scan_filter_agg are unchanged.
+- Oracle: `join_aggregates_over_scalar_calls_match_sqlite` (10 call shapes and 7 that must stay
+  on the general path against rusqlite, indexed and not; PureFunc in the loop through EXPLAIN;
+  unknown-function and wrong-arity errors; a deterministic and a volatile replacement of
+  `length()` must be the ones called). Gate: the stack gate in this date's lookup-join series entry.
+- Retry condition: none for this entry.
+
+## 2026-11-11 - WIN: an aggregate over a join written without a constraint takes its lookup from WHERE (bd-w4pr1.13.6)
+
+- Target: scorecard `rowid_lookups_200k`, `SELECT count(*), sum(t.a) FROM p CROSS JOIN t WHERE
+  t.id = p.k` (200k rows probing a 1M-row table by rowid), and the comma and bare-JOIN spellings
+  of the same join. Touched: `crates/fsqlite-vdbe/src/codegen.rs`
+  (`codegen_join_aggregate_select`), `crates/fsqlite-core/src/connection.rs`
+  (`select_join_aggregate_is_vdbe_candidate`).
+- Evidence before: the statement ran `execute_hash_join` over the materialized inner table
+  (malloc 10.6% and free about 9% of time, `execute_hash_join` 3.6%), because the join-aggregate
+  lookup lane (bd-41o3t) required an ON clause. The same query written `p JOIN t ON t.id = p.k`
+  already compiled to the lookup loop.
+- Change: for a lone inner or cross join with no constraint, the WHERE clause is the whole join
+  condition: the lookup is planned from it and the conjuncts the lookup does not consume are
+  checked for every row reached, as ON residuals are. `JoinKind::Cross` covers both a comma and
+  CROSS JOIN, and stock never reorders a CROSS JOIN, so such a join keeps its written order (no
+  driving-side swap; an automatic index on the right table when only the left is indexed).
+- Result, stock sqlite3 3.46.1 live in the same run (load 12-18, 3 repetitions, medians;
+  statement cost is the process minus an open + SELECT 1; all arms read the same database image,
+  WAL truncated; base sha256 631d02a6..., candidate 0411d0c3...):
+
+  | rowid_lookups_200k | CPU ms | x stock CPU | instructions per outer row | x stock |
+  |---|---|---|---|---|
+  | stock | 457 | 1.00 | 2,772 | 1.00 |
+  | main 8b04bef28 | 3,091 | 6.77 | 43,790 | 15.8 |
+  | this change | 1,872 | 4.10 | 71,982 | 26.0 |
+
+  CPU falls 39%; the instruction count rises 64%. The hash join was bound by memory (it
+  materializes 1M rows to probe 200k), the lookup loop is bound by the page-miss path, which the
+  seek-cache, eviction-scan and page-read-lock entries of this date cut. The A/A spread on an unaffected row in the same run was 12%
+  (scan_filter_agg 208 vs 183 ms on identical code), so the CPU ratio is good to about that.
+- Oracle: `join_aggregates_joined_by_where_match_sqlite` in
+  `crates/fsqlite-core/tests/join_aggregate_lookup_oracle.rs`: 19 lookup shapes and 10 that must
+  not become a lookup (an OR arm that admits every row, no equality, LEFT JOIN without ON,
+  NATURAL, three tables) against rusqlite, with and without indexes, plus EXPLAIN assertions for
+  the rowid lookup loop in the three spellings and for the kept order of a comma join. Gate at
+  ca937656f on rch: 12 join oracle binaries, 32 tests pass; then the stack gate in this date's lookup-join series entry.
+- Not done: three or more comma-joined tables; plain row output from a WHERE-joined pair (the row
+  lane has its own admission predicate, `select_join_shape_is_vdbe_eligible`); pinning an outer
+  column from WHERE (bd-8c68u's outer seek) for the WHERE-joined form.
+- Retry condition: none needed for this entry. The row's remaining gap is the page-miss path.
+
+## 2026-11-11 - WIN: a rowid seek loads a cached leaf only when the target can be on it (bd-w4pr1.13.13)
+
+- Target: every rowid seek that does not land on a leaf the cursor just used: lookup joins,
+  correlated subqueries, `IN` probes of a rowid, random point reads. Touched:
+  `crates/fsqlite-btree/src/cursor.rs` (`TableSeekCacheEntry`, `try_table_seek_cache`,
+  `remember_table_landing`).
+- Evidence before: `try_table_seek_cache` tested each of its four remembered leaves by loading
+  the page (pager read, header parse, cell-pointer decode) and searching it, then descended from
+  the root anyway. The existing unit test pinned the reads of one uncached seek as pages
+  6, 5, 4, 2, 7. On a table larger than the page cache each of those leaf loads was a page miss.
+- Change: a slot remembers the first and last rowid its leaf held when the seek landed. A landing
+  is an exact match or a gap strictly inside the leaf, so a target outside those rowids is
+  skipped without a page load. The bounds are a filter only: a stale bound skips a slot and the
+  descent finds the leaf; a slot that passes is searched exactly as before.
+- Result, stock live in the same run (load 11, 3 repetitions, one database image; before = the
+  binary one commit below, f924cabe...; after f6934f49...):
+
+  | query | stock | before | after |
+  |---|---|---|---|
+  | rowid_lookups_200k, instructions per lookup | 2,772 | 71,940 (25.9x) | 33,029 (11.9x) |
+  | rowid_lookups_200k, CPU ms | 449 | 1,556 (3.47x) | 973 (2.17x) |
+  | join_1M_to_pk_1000, instructions per row | 1,721 | 7,780 (4.52x) | 6,281 (3.65x) |
+  | join_1M_to_pk_1000, CPU ms | 212 | 830 (3.91x) | 644 (3.04x) |
+  | correlated EXISTS over 200k rows, M instructions | 648 | 14,448 (22.3x) | 6,678 (10.3x) |
+  | scalar subquery per row over 200k rows, M instructions | 665 | 14,376 (21.6x) | 6,589 (9.9x) |
+
+  scan_filter_agg is unchanged (1,918 per row).
+- The prediction for the rowid-lookup row (about 4k instructions per lookup) was low by a factor
+  of ten: it priced a skipped leaf as a cache hit, and on a table larger than the cache it is a
+  page read with its eviction.
+- GOLDEN-CHANGE: `test_table_seek_cache_uses_four_slot_lru` pins the pages read per seek. Two
+  lists shrink, [6,5,4,2,7] to [2,7] and [3,2,4] to [2,4]; the landing leaves, results and LRU
+  order it asserts are unchanged. New: `test_table_seek_cache_loads_only_a_leaf_that_can_hold_the_target`.
+  `prop_table_seek_cache_matches_forced_full_descent` passes. Gate: the stack gate in this date's lookup-join series entry.
+- This is not the ground of the 2026-07-12/13 entries (slot-0 MRU refresh, adjacent-rowid
+  probe): those were measured on 32 ascending probes of one leaf, where every probe hits slot 0.
+  This lever only acts on probes that miss.
+- Retry condition for the next cut on this path: a seek that does descend reloads and re-parses
+  the root and interior pages every time (`load_page` and `read_cell_pointers_into` are still
+  the top two symbols of join_1M_to_pk_1000); the ledger's "root-descent reuse variants are
+  already rejected" was measured at a 0.9% share on a DELETE workload, so a share above 10% on
+  a seek-bound read reopens it. Measured the same day on the stack tip (callgrind, 20,000 rowid
+  lookups): the root and the interior page of a descent are served by the transaction's page
+  map at about 150 instructions each, plus 334 for the cell-pointer copy, about 6% of a lookup;
+  the leaf miss is 9.4k. Not reopened; the miss is bd-w4pr1.13.18.
+
+## 2026-11-11 - WIN: an eviction searches the access trace in blocks (bd-w4pr1.13.12)
+
+- Target: every page eviction, which is every page miss once the cache is full: any read of a
+  table larger than the page cache (default `cache_size=-2000`, 500 pages). Touched:
+  `crates/fsqlite-pager/src/page_cache.rs` (`S3FifoEvictionTracker::forget` and three helpers).
+- Evidence before: `forget` was 31.8% of the user instructions of a rowid-lookup join on the
+  1M-row scorecard table (about 23k per eviction): it walked the 4,000-entry access trace entry
+  by entry to find the page and again to close the holes. The budget trim that calls it does
+  not use the tracker to choose its victim.
+- Change: same trace, same order, same bounds. The two ring halves are searched in 32-entry
+  blocks with no early exit inside a block (wide compares), and the runs between occurrences of
+  the page move down with block copies in ring order.
+- Result, stock live in the same run (load 18, one database image; base 631d02a6..., after
+  9493c125...):
+
+  | query | stock | main 8b04bef28 | this change |
+  |---|---|---|---|
+  | p JOIN t ON t.id = p.k, M instructions | 554 | 14,376 (25.9x) | 7,100 (12.8x) |
+  | same, CPU ms | 382 | 1,557 (4.08x) | 1,229 (3.22x) |
+  | correlated EXISTS over 200k rows, CPU ms | 399 | 1,603 (4.02x) | 1,254 (3.15x) |
+  | scan_filter_agg, M instructions | 499 | 1,975 (3.96x) | 1,837 (3.68x) |
+  | scan_filter_agg, CPU ms | 55 | 254 (4.62x) | 200 (3.63x) |
+  | count(*) over 1M rows, M instructions | 4.7 | 242.8 | 105.5 |
+  | count(*) over 1M rows, CPU ms | 12.1 | 105 (8.65x) | 52 (4.31x) |
+
+- Oracle: `test_s3_fifo_forget_matches_filter_across_blocks_and_ring_seam` compares with a plain
+  filter of the trace for occurrences at block edges, beside the ring seam, several apart and
+  every third entry, for every seam position; the earlier wrapped-history test still passes.
+  Gate: the stack gate in this date's lookup-join series entry.
+- Not the ground of the 2026-09-09 entry: that replaced the model's membership map during
+  statistics reconstruction and was rejected on a noisy matrix; it did not touch `forget`.
+- Still open on this path: the trace exists to reconstruct an S3-FIFO model for `evict_any` and
+  for statistics, and the trim path that runs on every miss never consults it. Not recording
+  accesses while only the trim path evicts would remove the search and the per-access push; it
+  changes what the statistics report, so it needs its own bead and a decision on those numbers.
+- Retry condition: `forget` above 5% of user instructions on any scorecard row reopens this.
+  Met the same day: an exact profile (callgrind) of the stack tip puts `forget` at 7.2% of the
+  rowid-lookup join, about 1.4k instructions per eviction. Reopened as bd-w4pr1.13.18, lever 2
+  (forget without a scan).
+
 ## 2026-11-11 - WIN: the shell block-buffers standard output when it is not a terminal (bd-5310l)
 
 - Target: every query whose result goes to a pipe or a file. Touched: `crates/fsqlite-cli/src/main.rs`
