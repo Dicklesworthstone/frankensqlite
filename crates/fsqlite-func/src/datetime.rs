@@ -214,6 +214,8 @@ fn ymdhms_to_jdn(y: i64, mo: i64, d: i64, h: i64, mi: i64, s: i64, frac: f64) ->
 
 /// Unix epoch as JDN.
 const UNIX_EPOCH_JDN: f64 = 2_440_587.5;
+/// 23:59:59.999 as a fraction of a day: the time 'end of ...' sets.
+const END_OF_DAY_DAYS: f64 = 86_399_999.0 / 86_400_000.0;
 /// Upper bound for values interpreted as Julian day by the `auto` modifier.
 const AUTO_JDN_MAX: f64 = 5_373_484.499_999;
 /// date.c validJulianDay: the last representable instant,
@@ -620,12 +622,17 @@ fn apply_modifier(jdn: f64, modifier: &str, written_ymd: Option<(i64, i64, i64)>
         return Some(jdn);
     }
 
-    // 'weekday N' — advance to the next day that is weekday N (0=Sunday).
+    // 'weekday N' advances to the next day that is weekday N (0=Sunday);
+    // 'weekday -N' (SQLite 3.54) goes back to the previous one, and '-0' is
+    // Sunday backwards. Either is a no-op on a date already on that weekday.
     if let Some(rest) = m.strip_prefix("weekday ") {
-        let wd = rest.trim().parse::<i64>().ok()?;
-        if !(0..=6).contains(&wd) {
+        let rest = rest.trim();
+        let wd = rest.parse::<i64>().ok()?;
+        if !(-6..=6).contains(&wd) {
             return None;
         }
+        let backwards = rest.starts_with('-');
+        let wd = wd.abs();
         // Current day of week: 0=Monday in JDN, but SQLite uses 0=Sunday.
         let current_jdn_int = (jdn + 0.5).floor() as i64;
         let current_wd = (current_jdn_int + 1) % 7; // 0=Sunday
@@ -633,8 +640,26 @@ fn apply_modifier(jdn: f64, modifier: &str, written_ymd: Option<(i64, i64, i64)>
         if diff < 0 {
             diff += 7;
         }
-        // If already the target weekday, this is a no-op (SQLite behavior).
+        if backwards && diff != 0 {
+            diff -= 7;
+        }
         return Some(jdn + diff as f64);
+    }
+
+    // 'end of day' / 'end of month' / 'end of year' (SQLite 3.54): the last
+    // millisecond, 23:59:59.999, of the current day, month or year. Y-M-D
+    // come from the written fields like 'start of' (date.c computeYMD).
+    if let Some(unit) = m.strip_prefix("end of ") {
+        let (y, mo, d) = written_ymd.unwrap_or_else(|| jdn_to_ymd(jdn));
+        let midnight = match unit {
+            "day" => ymd_to_jdn(y, mo, d),
+            // The first of next month, one day back (date.c computeFloor path).
+            "month" if mo == 12 => ymd_to_jdn(y + 1, 1, 1) - 1.0,
+            "month" => ymd_to_jdn(y, mo + 1, 1) - 1.0,
+            "year" => ymd_to_jdn(y, 12, 31),
+            _ => return None,
+        };
+        return Some(midnight + END_OF_DAY_DAYS);
     }
 
     // Arithmetic: '+NNN days', '-NNN hours', etc.
@@ -3909,5 +3934,85 @@ mod tests {
             let got = DateFunc.invoke(&args).expect("date() should succeed");
             assert_eq!(got, text(expected), "failed for args={raw_args:?}");
         }
+    }
+
+    /// SQLite 3.54 'weekday -N' and 'end of ...' modifiers. Every expectation
+    /// was run on the bundled SQLite 3.54.1 (2026-11-11). 2026-11-11 is a
+    /// Wednesday.
+    #[test]
+    fn test_sqlite_354_weekday_back_and_end_of_modifiers() {
+        let run = |func: &dyn ScalarFunction, raw_args: &[&str]| -> SqliteValue {
+            let args: Vec<SqliteValue> = raw_args.iter().copied().map(text).collect();
+            func.invoke(&args).expect("date function should not error")
+        };
+        // Backwards to the previous weekday N; a no-op when already on it.
+        assert_eq!(
+            run(&DateFunc, &["2026-11-11", "weekday -1"]),
+            text("2026-11-09")
+        );
+        assert_eq!(
+            run(&DateFunc, &["2026-11-11", "weekday -3"]),
+            text("2026-11-11")
+        );
+        assert_eq!(
+            run(&DateFunc, &["2026-11-11", "weekday -0"]),
+            text("2026-11-08")
+        );
+        // Forward is unchanged, and |N| > 6 is invalid in either direction.
+        assert_eq!(
+            run(&DateFunc, &["2026-11-11", "weekday 1"]),
+            text("2026-11-16")
+        );
+        assert_eq!(
+            run(&DateFunc, &["2026-11-11", "weekday -7"]),
+            SqliteValue::Null
+        );
+        assert_eq!(
+            run(&DateFunc, &["2026-11-11", "weekday 7"]),
+            SqliteValue::Null
+        );
+
+        // The last millisecond of the day, month or year.
+        let f = "%Y-%m-%d %H:%M:%f";
+        assert_eq!(
+            run(&StrftimeFunc, &[f, "2026-02-10", "end of month"]),
+            text("2026-02-28 23:59:59.999")
+        );
+        assert_eq!(
+            run(&StrftimeFunc, &[f, "2024-02-10 05:06:07", "end of month"]),
+            text("2024-02-29 23:59:59.999")
+        );
+        assert_eq!(
+            run(
+                &StrftimeFunc,
+                &["%H:%M:%f", "2026-11-11 10:00:00", "end of day"]
+            ),
+            text("23:59:59.999")
+        );
+        assert_eq!(
+            run(&DateTimeFunc, &["2026-12-05", "end of month"]),
+            text("2026-12-31 23:59:59")
+        );
+        assert_eq!(
+            run(&DateTimeFunc, &["2026-11-11 10:00:00", "end of year"]),
+            text("2026-12-31 23:59:59")
+        );
+        // Later modifiers start from the new instant.
+        assert_eq!(
+            run(&DateTimeFunc, &["2026-01-31", "end of month", "+1 day"]),
+            text("2026-02-01 23:59:59")
+        );
+        assert_eq!(
+            run(
+                &DateTimeFunc,
+                &["2026-03-15", "end of month", "start of day"]
+            ),
+            text("2026-03-31 00:00:00")
+        );
+        // Only day, month and year are units.
+        assert_eq!(
+            run(&DateTimeFunc, &["2026-11-11", "end of week"]),
+            SqliteValue::Null
+        );
     }
 }
