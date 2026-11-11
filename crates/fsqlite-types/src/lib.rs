@@ -47,9 +47,44 @@ pub use glossary::{
 pub use value::{SmallText, SqliteValue};
 
 use std::fmt;
+use std::future::Future;
 use std::num::NonZeroU32;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
+
+/// Box a future, building it in this function's stack frame.
+///
+/// In an unoptimized build every temporary gets its own stack slot, so
+/// `Box::pin(self.execute_x(..)).await` written in a large `async fn` reserves
+/// the full size of every future it boxes, summed over all of them: the
+/// statement dispatcher reserved 2 MiB that way, more than the default thread
+/// stack (bd-w4pr1.28). Built here, a future's temporary lives only while this
+/// call runs. Optimized builds inline this to `Box::pin`.
+pub fn boxed_future<F: Future>(make: impl FnOnce() -> F) -> Pin<Box<F>> {
+    Box::pin(make())
+}
+
+/// [`boxed_future`] in builds with debug assertions; elsewhere `make()` as is.
+///
+/// With debug assertions it keeps an awaited future out of a large caller's
+/// stack frame; elsewhere the future is awaited inline exactly as
+/// `make().await`, with no allocation, so hot paths keep their release code.
+/// For futures a hot path awaits directly: the VDBE interpreter's cursor
+/// operations and the statement paths in fsqlite-core. Never inlined in debug
+/// builds, so the future is built in this frame, not the caller's.
+#[cfg(debug_assertions)]
+#[inline(never)]
+pub fn lean_future<F: Future>(make: impl FnOnce() -> F) -> Pin<Box<F>> {
+    Box::pin(make())
+}
+
+/// Release form of [`lean_future`]: the future itself, awaited inline.
+#[cfg(not(debug_assertions))]
+#[inline]
+pub fn lean_future<F: Future>(make: impl FnOnce() -> F) -> F {
+    make()
+}
 
 /// A page number in the database file.
 ///

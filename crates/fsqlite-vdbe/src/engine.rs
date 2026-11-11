@@ -27,27 +27,11 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use fsqlite_btree::swiss_index::SwissIndex;
+// At opt-level zero every awaited cursor operation would otherwise leave its
+// own temporary in the interpreter's poll frame (bd-w4pr1.28).
+use fsqlite_types::lean_future;
 use fsqlite_types::{PageSize, TxnId};
 use std::rc::Rc;
-
-/// Construct an awaited future outside the interpreter's debug stack frame.
-///
-/// At opt-level zero, every awaited cursor operation otherwise contributes
-/// its own temporary to this large dispatcher's poll frame. Their combined
-/// size can exhaust a downstream application's default thread stack before
-/// any recursion occurs (bd-w4pr1.28). Release builds keep the original
-/// inline future and do not allocate on the opcode path.
-#[cfg(debug_assertions)]
-#[inline(never)]
-fn lean_future<F: std::future::Future>(make: impl FnOnce() -> F) -> std::pin::Pin<Box<F>> {
-    Box::pin(make())
-}
-
-#[cfg(not(debug_assertions))]
-#[inline]
-fn lean_future<F: std::future::Future>(make: impl FnOnce() -> F) -> F {
-    make()
-}
 
 /// bd-perf (V1.6): Flat array replacing HashMap for cursor storage.
 /// Cursor IDs are small non-negative integers (0-15 typical). Direct array

@@ -134,33 +134,9 @@ pub use fsqlite_pager::page_cache::PageCachePeakSnapshot;
 pub use fsqlite_pager::pager::DatabaseImageReceipt;
 pub use fsqlite_pager::pager::WriteSetStats;
 use fsqlite_pager::traits::{MvccPager, TransactionHandle, TransactionMode};
-
-/// Box a future, building it in this function's stack frame.
-///
-/// In an unoptimized build every temporary gets its own stack slot, so
-/// `Box::pin(self.execute_x(..)).await` written in a large `async fn` reserves
-/// the full size of every future it boxes, summed over all of them:
-/// `execute_statement_dispatch_impl` reserved 2 MiB that way, more than the
-/// default thread stack (bd-w4pr1.28). Built here, a future's temporary lives
-/// only while this call runs. Optimized builds inline this to `Box::pin`.
-fn boxed_future<F: Future>(make: impl FnOnce() -> F) -> Pin<Box<F>> {
-    Box::pin(make())
-}
-
-/// [`boxed_future`] in builds with debug assertions, where it keeps an awaited
-/// future out of a large caller's stack frame; elsewhere the future is awaited
-/// inline exactly as `make().await`, with no allocation, so hot paths keep
-/// their release code. For futures a hot path awaits directly.
-#[cfg(debug_assertions)]
-fn lean_future<F: Future>(make: impl FnOnce() -> F) -> Pin<Box<F>> {
-    boxed_future(make)
-}
-
-#[cfg(not(debug_assertions))]
-#[inline]
-fn lean_future<F: Future>(make: impl FnOnce() -> F) -> F {
-    make()
-}
+// Keep large awaited futures out of this file's big async frames in debug
+// builds (bd-w4pr1.28).
+use fsqlite_types::{boxed_future, lean_future};
 
 /// GH#303: structured result of [`Connection::backup_exact_to`] — a byte-exact
 /// copy whose integrity has been verified against the source image receipt.
@@ -30499,12 +30475,12 @@ impl Connection {
                         self.sync_change_tracking_context();
                     }
                     let op_cx = self.op_cx_after_background_status();
-                    stmt.ensure_schema_unchanged(&op_cx).await?;
+                    lean_future(|| stmt.ensure_schema_unchanged(&op_cx)).await?;
                     let dml = stmt
                         .deferred_dml_statement()
                         .expect("checked RETURNING DML statement above");
-                    let rows_result = self
-                        .execute_statement_impl_after_background_status(
+                    let rows_result = lean_future(|| {
+                        self.execute_statement_impl_after_background_status(
                             dml,
                             if params.is_empty() {
                                 None
@@ -30514,7 +30490,8 @@ impl Connection {
                             stmt.dispatch_precompiled_program(),
                             false,
                         )
-                        .await;
+                    })
+                    .await;
                     if rows_result.is_ok() {
                         self.note_connection_statement_execution_count(1);
                     }
@@ -30535,10 +30512,11 @@ impl Connection {
                 // A PRAGMA can have zero result columns and still carry a side
                 // effect. Dispatch it through the generic statement path rather
                 // than establishing the read-only snapshot used by SELECTs.
-                stmt.ensure_schema_unchanged(&op_cx).await?;
-                let rows_result = self
-                    .execute_statement_after_background_status(statement, Some(params))
-                    .await;
+                lean_future(|| stmt.ensure_schema_unchanged(&op_cx)).await?;
+                let rows_result = lean_future(|| {
+                    self.execute_statement_after_background_status(statement, Some(params))
+                })
+                .await;
                 if rows_result.is_ok() {
                     self.note_connection_statement_execution_count(1);
                 }
@@ -30548,12 +30526,13 @@ impl Connection {
                 .retained_autocommit_overlay_dirty_fast_path(stmt)
                 .is_some()
             {
-                let _overlay_entry_proof = stmt
-                    .ensure_schema_unchanged_with_prebound_publication(&op_cx)
-                    .await?;
-                if let Some(mut rows) = self
-                    .try_execute_retained_autocommit_query_fast_path(stmt, params, &op_cx)
-                    .await?
+                let _overlay_entry_proof =
+                    lean_future(|| stmt.ensure_schema_unchanged_with_prebound_publication(&op_cx))
+                        .await?;
+                if let Some(mut rows) = lean_future(|| {
+                    self.try_execute_retained_autocommit_query_fast_path(stmt, params, &op_cx)
+                })
+                .await?
                 {
                     let fast_path =
                         stmt.prepared_query_fast_path_metadata("retained overlay query fast path")?;
@@ -30576,8 +30555,7 @@ impl Connection {
                     return Ok(rows);
                 }
             }
-            if self
-                .prepare_clean_memory_prepared_memdb_fast_path(stmt, &op_cx)
+            if lean_future(|| self.prepare_clean_memory_prepared_memdb_fast_path(stmt, &op_cx))
                 .await?
                 && let Some(mut rows) = self.try_execute_prepared_query_fast_path(stmt, params)?
             {
@@ -30602,8 +30580,7 @@ impl Connection {
                 self.note_connection_statement_execution_count(1);
                 return Ok(rows);
             }
-            if self
-                .prepare_clean_file_backed_prepared_memdb_fast_path(stmt, &op_cx)
+            if lean_future(|| self.prepare_clean_file_backed_prepared_memdb_fast_path(stmt, &op_cx))
                 .await?
                 && let Some(mut rows) = self.try_execute_prepared_query_fast_path(stmt, params)?
             {
@@ -30628,17 +30605,18 @@ impl Connection {
                 self.note_connection_statement_execution_count(1);
                 return Ok(rows);
             }
-            let (prepared_auto_read, entry_proof) = self
-                .prepare_connection_for_prepared_read(stmt, &op_cx)
-                .await?;
+            let (prepared_auto_read, entry_proof) =
+                lean_future(|| self.prepare_connection_for_prepared_read(stmt, &op_cx)).await?;
             if let Some(mut rows) = self.try_execute_prepared_query_fast_path(stmt, params)? {
                 let fast_path = match stmt
                     .prepared_query_fast_path_metadata("prepared query fast path outcome")
                 {
                     Ok(fast_path) => fast_path,
                     Err(err) => {
-                        self.finish_prepared_read_autocommit(prepared_auto_read, false, &op_cx)
-                            .await?;
+                        lean_future(|| {
+                            self.finish_prepared_read_autocommit(prepared_auto_read, false, &op_cx)
+                        })
+                        .await?;
                         return Err(err);
                     }
                 };
@@ -30657,8 +30635,10 @@ impl Connection {
                     let coll_snap = lock_unpoisoned(self.collation_registry.as_ref()).clone();
                     dedup_rows_collated(&mut rows, &stmt.distinct_collations, &coll_snap);
                 }
-                self.finish_prepared_read_autocommit(prepared_auto_read, true, &op_cx)
-                    .await?;
+                lean_future(|| {
+                    self.finish_prepared_read_autocommit(prepared_auto_read, true, &op_cx)
+                })
+                .await?;
                 self.note_connection_statement_execution_count(1);
                 return Ok(rows);
             }
@@ -30669,8 +30649,10 @@ impl Connection {
                 if hot_path_profile_enabled() {
                     FSQLITE_FAST_PATH_EXECUTIONS.fetch_add(1, AtomicOrdering::Relaxed);
                 }
-                self.finish_prepared_read_autocommit(prepared_auto_read, true, &op_cx)
-                    .await?;
+                lean_future(|| {
+                    self.finish_prepared_read_autocommit(prepared_auto_read, true, &op_cx)
+                })
+                .await?;
                 self.note_connection_statement_execution_count(1);
                 return Ok(rows);
             }
@@ -30712,11 +30694,13 @@ impl Connection {
                         // fallback the deferred dispatch would have taken.
                         let log_result =
                             self.log_mem_execution_fallback("select", "group_by_fallback");
-                        self.finish_prepared_read_autocommit(
-                            prepared_auto_read,
-                            log_result.is_ok(),
-                            &op_cx,
-                        )
+                        lean_future(|| {
+                            self.finish_prepared_read_autocommit(
+                                prepared_auto_read,
+                                log_result.is_ok(),
+                                &op_cx,
+                            )
+                        })
                         .await?;
                         log_result?;
                         if hot_path_profile_enabled() {
@@ -30727,8 +30711,10 @@ impl Connection {
                     }
                     Ok(None) => {}
                     Err(err) => {
-                        self.finish_prepared_read_autocommit(prepared_auto_read, false, &op_cx)
-                            .await?;
+                        lean_future(|| {
+                            self.finish_prepared_read_autocommit(prepared_auto_read, false, &op_cx)
+                        })
+                        .await?;
                         return Err(err);
                     }
                 }
@@ -30744,14 +30730,20 @@ impl Connection {
                         reason = "deferred_query_statement",
                     );
                 }
-                let rows_result = self
-                    .execute_statement_after_background_status(statement.as_ref(), Some(params))
-                    .await;
-                self.finish_prepared_read_autocommit(
-                    prepared_auto_read,
-                    rows_result.is_ok(),
-                    &op_cx,
-                )
+                let rows_result = lean_future(|| {
+                    self.execute_statement_after_background_status(
+                        statement.as_ref(),
+                        Some(params),
+                    )
+                })
+                .await;
+                lean_future(|| {
+                    self.finish_prepared_read_autocommit(
+                        prepared_auto_read,
+                        rows_result.is_ok(),
+                        &op_cx,
+                    )
+                })
                 .await?;
                 if rows_result.is_ok() {
                     self.note_connection_statement_execution_count(1);
@@ -30770,24 +30762,34 @@ impl Connection {
             }
             let execute_body_start = hot_path_profile_enabled().then(Instant::now);
             let rows_result = if stmt.db.is_some() {
-                stmt.execute_table_query(&op_cx, Some(params), entry_proof.publication)
-                    .await
+                lean_future(|| {
+                    stmt.execute_table_query(&op_cx, Some(params), entry_proof.publication)
+                })
+                .await
             } else {
                 let page_size = page_size_from_pragma_state(self.pragma_state.borrow().page_size)?;
-                execute_program_with_postprocess(
-                    stmt.program.as_ref(),
-                    Some(params),
-                    stmt.func_registry.as_ref(),
-                    Some(&self.collation_registry),
-                    &op_cx,
-                    stmt.expression_postprocess.as_ref(),
-                    page_size,
-                )
+                lean_future(|| {
+                    execute_program_with_postprocess(
+                        stmt.program.as_ref(),
+                        Some(params),
+                        stmt.func_registry.as_ref(),
+                        Some(&self.collation_registry),
+                        &op_cx,
+                        stmt.expression_postprocess.as_ref(),
+                        page_size,
+                    )
+                })
                 .await
             };
             record_hot_path_duration(&FSQLITE_EXECUTE_BODY_TIME_NS, execute_body_start);
-            self.finish_prepared_read_autocommit(prepared_auto_read, rows_result.is_ok(), &op_cx)
-                .await?;
+            lean_future(|| {
+                self.finish_prepared_read_autocommit(
+                    prepared_auto_read,
+                    rows_result.is_ok(),
+                    &op_cx,
+                )
+            })
+            .await?;
             let mut rows = rows_result?;
             if stmt.distinct {
                 let coll_snap = lock_unpoisoned(self.collation_registry.as_ref()).clone();
@@ -40784,27 +40786,32 @@ impl Connection {
         ) {
             let preserve_constraint_failure_rows =
                 statement_preserves_prior_changes_on_constraint(statement);
-            return self
-                .with_statement_fk_validation_scope(preserve_constraint_failure_rows, async || {
-                    self.execute_statement_dispatch_impl(
-                        cx,
-                        statement,
-                        params,
-                        precompiled,
-                        derived_storage_log_select,
-                    )
+            return lean_future(|| {
+                self.with_statement_fk_validation_scope(preserve_constraint_failure_rows, async || {
+                    lean_future(|| {
+                        self.execute_statement_dispatch_impl(
+                            cx,
+                            statement,
+                            params,
+                            precompiled,
+                            derived_storage_log_select,
+                        )
+                    })
                     .await
                 })
-                .await;
+            })
+            .await;
         }
 
-        self.execute_statement_dispatch_impl(
-            cx,
-            statement,
-            params,
-            precompiled,
-            derived_storage_log_select,
-        )
+        lean_future(|| {
+            self.execute_statement_dispatch_impl(
+                cx,
+                statement,
+                params,
+                precompiled,
+                derived_storage_log_select,
+            )
+        })
         .await
     }
 
@@ -76299,12 +76306,11 @@ impl Connection {
             "select",
             "sqlite_schema_virtual_materialization",
         )?;
-        let result = async {
+        let result = lean_future(|| async {
             let referenced = self.collect_sqlite_schema_references(select);
             if referenced.is_empty() {
-                return self
-                    .execute_statement(&Statement::Select(select.clone()), params)
-                    .await;
+                let statement = Statement::Select(select.clone());
+                return lean_future(|| self.execute_statement(&statement, params)).await;
             }
 
             let main_rows = self.build_sqlite_master_rows();
@@ -76316,8 +76322,7 @@ impl Connection {
             let virtual_columns = sqlite_master_column_infos();
             let mut materialized = MaterializedTablesCleanupGuard::new(self);
 
-            self.reserve_clean_memdb_root_pages(referenced.len())
-                .await?;
+            lean_future(|| self.reserve_clean_memdb_root_pages(referenced.len())).await?;
 
             for (table_name, is_temp) in referenced {
                 let virtual_rows = if is_temp { &temp_rows } else { &main_rows };
@@ -76357,7 +76362,7 @@ impl Connection {
             // current root_page.
             self.clear_compilation_reuse_caches();
 
-            let exec_result = async {
+            let exec_result = lean_future(|| async {
                 // Route through connection-level interpreted paths that read from
                 // MemDatabase rather than the full dispatch chain (which reaches
                 // VDBE StorageCursor → pager B-tree where a recycled page may
@@ -76369,19 +76374,21 @@ impl Connection {
                 // rather than calling through the pager and potentially seeing
                 // stale recycled pages.
                 let _time_travel_guard = BoolCellRestoreGuard::new(&self.time_travel_active, true);
-                async {
+                lean_future(|| async {
                     let rewritten = lean_future(|| self.rewrite_in_subqueries_select(select, params)).await?;
                     let bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
-                    self.execute_interpreted_select_by_shape(&cx, rewritten.as_ref(), &bound)
-                        .await
-                }
+                    lean_future(|| {
+                        self.execute_interpreted_select_by_shape(&cx, rewritten.as_ref(), &bound)
+                    })
+                    .await
+                })
                 .await
-            }
+            })
             .await;
 
             exec_result
-        }
+        })
         .await;
         result
     }
@@ -76759,34 +76766,32 @@ impl Connection {
     ) -> Result<Vec<Row>> {
         if matches!(&shape.body.select, SelectCore::Select { from: None, .. }) {
             if expression_only_has_window_functions(shape) {
-                self.execute_fromless_window_select(bound, None).await
+                lean_future(|| self.execute_fromless_window_select(bound, None)).await
             } else if self.has_implicit_aggregation_with_registry(shape) || has_group_by(shape) {
-                self.execute_fromless_aggregate(bound, None).await
+                lean_future(|| self.execute_fromless_aggregate(bound, None)).await
             } else {
-                self.execute_expression_only_with_subqueries(bound, None)
-                    .await
+                lean_future(|| self.execute_expression_only_with_subqueries(bound, None)).await
             }
         } else if matches!(&shape.body.select, SelectCore::Values(_)) {
             // VALUES may contain the same scalar subqueries as a FROM-less
             // SELECT, but preserves one output row per VALUES tuple rather
             // than the SELECT path's single row.
             if expression_only_has_window_functions(shape) {
-                self.execute_fromless_window_select(bound, None).await
+                lean_future(|| self.execute_fromless_window_select(bound, None)).await
             } else {
-                self.execute_expression_only_with_subqueries(bound, None)
-                    .await
+                lean_future(|| self.execute_expression_only_with_subqueries(bound, None)).await
             }
         } else if self.select_requires_grouped_window_pipeline(shape) {
-            self.execute_group_by_window_select(cx, bound, None).await
+            lean_future(|| self.execute_group_by_window_select(cx, bound, None)).await
         } else if has_group_by(shape)
             || self.has_implicit_aggregation_with_registry(shape)
             || has_ordered_aggregate(shape)
         {
-            self.execute_group_by_join_select(cx, bound, None).await
+            lean_future(|| self.execute_group_by_join_select(cx, bound, None)).await
         } else if has_window_functions(shape) {
-            self.execute_window_select(bound, None).await
+            lean_future(|| self.execute_window_select(bound, None)).await
         } else {
-            self.execute_join_select(bound, None).await
+            lean_future(|| self.execute_join_select(bound, None)).await
         }
     }
 
@@ -100630,9 +100635,10 @@ impl Connection {
             if pre.is_some() {
                 match all_sources[i] {
                     TableOrSubquery::Subquery { query, .. } => {
-                        let rows = self
-                            .execute_statement(&Statement::Select(query.as_ref().clone()), params)
-                            .await?;
+                        let subquery_statement = Statement::Select(query.as_ref().clone());
+                        let rows =
+                            lean_future(|| self.execute_statement(&subquery_statement, params))
+                                .await?;
                         let row_data: Vec<Vec<SqliteValue>> =
                             rows.iter().map(|r| r.values().to_vec()).collect();
                         let resolved = Self::deduplicate_relation_column_names(
@@ -100659,12 +100665,14 @@ impl Connection {
                         let include_hidden_rowid =
                             table_sources[i].hidden_rowid_projection.is_some();
                         *pre = Some(
-                            self.execute_table_function_rows(
-                                name,
-                                args,
-                                params,
-                                include_hidden_rowid,
-                            )
+                            lean_future(|| {
+                                self.execute_table_function_rows(
+                                    name,
+                                    args,
+                                    params,
+                                    include_hidden_rowid,
+                                )
+                            })
                             .await?,
                         );
                     }
@@ -100852,9 +100860,10 @@ impl Connection {
                             .iter()
                             .find_map(|term| fts5_rank_directive_weights(term, &fts5_source_names))
                     });
-                    if let Some(aux_table) = self
-                        .build_fts5_aux_context_for_source(src, &queries, rank_weights)
-                        .await?
+                    if let Some(aux_table) = lean_future(|| {
+                        self.build_fts5_aux_context_for_source(src, &queries, rank_weights)
+                    })
+                    .await?
                     {
                         context.insert(src.table_name.clone(), aux_table);
                     }
@@ -100892,8 +100901,10 @@ impl Connection {
         // in place so the lane (and, on refusal, the shared tail LIMIT
         // application) can see it.
         let keyset_streamed = if select.limit.is_some() && preloaded.iter().all(Option::is_none) {
-            self.try_stream_keyset_limited_join_combined(select, from, &table_sources, &col_map)
-                .await?
+            lean_future(|| {
+                self.try_stream_keyset_limited_join_combined(select, from, &table_sources, &col_map)
+            })
+            .await?
         } else {
             None
         };
@@ -100953,7 +100964,7 @@ impl Connection {
                 )?);
             } else {
                 if let Some(plan) = live_vtab_scan_plans[i].as_ref() {
-                    let row_data = self.scan_live_vtab_rows(src, plan).await?;
+                    let row_data = lean_future(|| self.scan_live_vtab_rows(src, plan)).await?;
                     scanned_cache.insert(src.scan_cache_key.clone(), row_data.clone());
                     table_rows.push(maybe_filter_primary_join_rows(
                         row_data,
@@ -100974,23 +100985,26 @@ impl Connection {
                         join_primary_rowid_point(expr, &col_map[..primary_width], rowid_aliases[0])
                     });
                 let point_rows = match rowid_point {
-                    Some(rowid) => self.try_scan_join_source_rowid_point(src, rowid).await,
+                    Some(rowid) => {
+                        lean_future(|| self.try_scan_join_source_rowid_point(src, rowid)).await
+                    }
                     None => None,
                 };
                 let mut row_data = if let Some(result) = point_rows {
                     result?
                 } else if let Some(row_data) = self.try_scan_join_source_from_memdb(src) {
                     row_data
-                } else if let Some(result) = self
-                    .try_scan_join_source_from_pager(src, keep_masks[i].as_deref())
-                    .await
+                } else if let Some(result) = lean_future(|| {
+                    self.try_scan_join_source_from_pager(src, keep_masks[i].as_deref())
+                })
+                .await
                 {
                     result?
                 } else {
                     let scan_sql = build_join_scan_sql(src);
                     let _tt_guard = (!self.memdb_rows_loaded.get())
                         .then(|| BoolCellRestoreGuard::new(&self.time_travel_active, false));
-                    let rows = self.query(&scan_sql).await?;
+                    let rows = lean_future(|| self.query(&scan_sql)).await?;
                     rows.iter().map(|r| r.values().to_vec()).collect()
                 };
                 // Normalize every scanned row to the source's logical scan
@@ -101130,9 +101144,10 @@ impl Connection {
                 Some(&natural_constraint)
             } else if let Some(JoinConstraint::On(on_expr)) = &join.constraint {
                 if expr_has_any_subquery(on_expr) {
-                    let resolved = self
-                        .pre_resolve_non_correlated_subqueries_in_expr(on_expr, params)
-                        .await?;
+                    let resolved = lean_future(|| {
+                        self.pre_resolve_non_correlated_subqueries_in_expr(on_expr, params)
+                    })
+                    .await?;
                     resolved_on_constraint = JoinConstraint::On(resolved);
                     Some(&resolved_on_constraint)
                 } else {
@@ -101188,8 +101203,8 @@ impl Connection {
                 let include_hidden_rowid = table_sources[join_idx + 1]
                     .hidden_rowid_projection
                     .is_some();
-                combined = self
-                    .execute_lateral_table_function_join(
+                combined = lean_future(|| {
+                    self.execute_lateral_table_function_join(
                         &combined,
                         tvf_name,
                         tvf_args,
@@ -101201,7 +101216,8 @@ impl Connection {
                         &col_map,
                         using_left_slots.as_deref(),
                     )
-                    .await?;
+                })
+                .await?;
                 continue;
             }
 
@@ -101219,8 +101235,8 @@ impl Connection {
                     Some(JoinConstraint::On(e)) => e.clone(),
                     _ => unreachable!("on_has_correlated_subquery implies On constraint"),
                 };
-                combined = self
-                    .execute_single_join_with_correlated_subqueries(
+                combined = lean_future(|| {
+                    self.execute_single_join_with_correlated_subqueries(
                         &combined,
                         right_rows,
                         right_width,
@@ -101229,7 +101245,8 @@ impl Connection {
                         &on_expr,
                         &col_map,
                     )
-                    .await?;
+                })
+                .await?;
             } else {
                 combined = self.with_fallback_function_registry(|| {
                     execute_single_join(
@@ -101288,10 +101305,11 @@ impl Connection {
                             // keep/filter decision on non-erroring rows (both map operand
                             // truth through `is_sqlite_truthy` under the same three-valued
                             // logic). bd-and-or-short-circuit-value-jump-gaps-dkswh.
-                            let keep = self
-                                .eval_expr_truthiness(where_expr, true, &row, &col_map, params)
-                                .await?
-                                .unwrap_or(false);
+                            let keep = lean_future(|| {
+                                self.eval_expr_truthiness(where_expr, true, &row, &col_map, params)
+                            })
+                            .await?
+                            .unwrap_or(false);
                             if keep {
                                 filtered.push(row);
                             }
@@ -101495,11 +101513,12 @@ impl Connection {
                     }
                     ResultColumn::Expr { expr, .. } => {
                         if has_subqueries && expr_has_any_subquery(expr) {
-                            let inlined = self
-                                .inline_subqueries_in_expr_with_using(
+                            let inlined = lean_future(|| {
+                                self.inline_subqueries_in_expr_with_using(
                                     expr, row, &col_map, using_skip,
                                 )
-                                .await?;
+                            })
+                            .await?;
                             values.push(self.eval_join_expr_with_using_registry(
                                 &inlined, row, &col_map, using_skip,
                             )?);
@@ -101513,9 +101532,10 @@ impl Connection {
             }
             for expr in &extra_order_exprs {
                 if has_subqueries && expr_has_any_subquery(expr) {
-                    let inlined = self
-                        .inline_subqueries_in_expr_with_using(expr, row, &col_map, using_skip)
-                        .await?;
+                    let inlined = lean_future(|| {
+                        self.inline_subqueries_in_expr_with_using(expr, row, &col_map, using_skip)
+                    })
+                    .await?;
                     values.push(
                         self.eval_join_expr_with_using_registry(
                             &inlined, row, &col_map, using_skip,
