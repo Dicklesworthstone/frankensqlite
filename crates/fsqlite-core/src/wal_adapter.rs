@@ -1544,7 +1544,22 @@ impl<F: VfsFile> WalBackendAdapter<F> {
         validate_shared_wal_index_wal_binding(
             &target, self.wal.header(), Some((target.mx_frame, marker)),
         )?;
-        plan.publish(target)
+        plan.publish(target)?;
+        // The header just published was validated against this WAL's own
+        // header and terminal commit marker, the same binding a read admission
+        // proves from the file. While that header, this handle's frame count
+        // and its salts stay as they are now, the next read admission need not
+        // read the WAL header and terminal frame back (see `NativeReadProof`).
+        // Before this, every statement after a commit of its own re-read both.
+        // A WAL tail a later writer leaves unpublished is found, as for any
+        // proven admission, by the next append preflight or the next admission
+        // after the header moves.
+        self.native_read_proof = (self.wal.frame_count() == index + 1).then_some(NativeReadProof {
+            header: target,
+            frame_count: self.wal.frame_count(),
+            salts: self.wal.header().salts,
+        });
+        Ok(())
     }
 
     fn finish_native_publication(&mut self) {
@@ -10459,6 +10474,22 @@ mod tests {
         fixture.adapter.append_frame(&cx, 1, &old_page, 1).expect("old commit");
         fixture.adapter.sync(&cx).expect("publish old commit");
         let old_header = read_shared_wal_index_header(&fixture.region).unwrap().unwrap();
+        // A publication of its own proves this handle's next read binding
+        // (bd-ih8ak), and a proven admission does not look at the file. The
+        // rest of this test is about an admission that has to, as the reader
+        // of a header some other connection published does, so the proof is
+        // dropped here. The admission of the newer publication at the end
+        // runs with whatever proof the handle then holds.
+        assert_eq!(
+            fixture.adapter.native_read_proof,
+            Some(NativeReadProof {
+                header: old_header,
+                frame_count: 1,
+                salts: fixture.adapter.wal.header().salts,
+            }),
+            "the handle's own publication is its read proof"
+        );
+        fixture.adapter.native_read_proof = None;
         // Seed a usable reader mark: this heap fixture tests binding metadata,
         // not native lock acquisition or interprocess exclusion.
         fixture.region.atomic_store_u32_ne(96, 0, Ordering::Release).unwrap();
