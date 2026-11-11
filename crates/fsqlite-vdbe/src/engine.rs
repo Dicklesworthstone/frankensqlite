@@ -4791,6 +4791,43 @@ impl CursorBackend {
         }
     }
 
+    /// Whether the index b-tree under this cursor is one empty leaf.
+    async fn index_root_is_empty_leaf(&mut self, cx: &Cx) -> Result<bool> {
+        match self {
+            Self::Mem(c) => c.index_root_is_empty_leaf(cx).await,
+            Self::Txn(c) => c.index_root_is_empty_leaf(cx).await,
+            Self::TimeTravel(_) => Ok(false),
+        }
+    }
+
+    /// Build the empty index b-tree under this cursor from keys in index order.
+    async fn index_bulk_load_sorted_keys<'k, I>(&mut self, cx: &Cx, keys: I) -> Result<u64>
+    where
+        I: Iterator<Item = &'k [u8]>,
+    {
+        match self {
+            Self::Mem(c) => c.index_bulk_load_sorted_keys(cx, keys).await,
+            Self::Txn(c) => c.index_bulk_load_sorted_keys(cx, keys).await,
+            Self::TimeTravel(_) => Err(FrankenError::Internal(
+                "time-travel cursors are read-only: index bulk load not permitted".to_owned(),
+            )),
+        }
+    }
+
+    /// Order two decoded index key prefixes as this cursor's index does.
+    #[must_use]
+    fn compare_index_key_prefixes(
+        &self,
+        lhs: &[SqliteValue],
+        rhs: &[SqliteValue],
+    ) -> Option<Ordering> {
+        match self {
+            Self::Mem(c) => c.compare_index_key_prefixes(lhs, rhs),
+            Self::Txn(c) => c.compare_index_key_prefixes(lhs, rhs),
+            Self::TimeTravel(c) => c.compare_index_key_prefixes(lhs, rhs),
+        }
+    }
+
     /// Whether the last `index_insert` put its key after every stored key.
     #[must_use]
     fn last_index_insert_was_past_rightmost(&self) -> bool {
@@ -8580,6 +8617,134 @@ impl VdbeEngine {
             .copied()
             .unwrap_or_default();
         self.index_collations_for_root(root_page)
+    }
+
+    /// `IdxBulkLoad`: build the empty index under `index_cursor_id` from the
+    /// sorted rows of `sorter_cursor_id`.
+    ///
+    /// `Ok(false)` means the bulk build does not apply and nothing was
+    /// written; the program then inserts the rows one at a time. Before any
+    /// page is written, every row is compared with the one before it using the
+    /// index's own key order. A row that does not sort after its predecessor
+    /// declines the build, so a sorter that disagreed with the index could
+    /// cost time but never produce a misordered index. Two rows that share a
+    /// UNIQUE key with no NULL in it fail the statement, as `IdxInsert` would.
+    async fn bulk_load_index_from_sorter(
+        &mut self,
+        index_cursor_id: i32,
+        sorter_cursor_id: i32,
+        unique_key_columns: usize,
+        columns_label: &str,
+    ) -> Result<bool> {
+        // The sorter and the index decode key text differently on a UTF-16
+        // database; those take the per-row path.
+        if !matches!(self.text_encoding, TextEncoding::Utf8) {
+            return Ok(false);
+        }
+        let collect_vdbe_metrics = self.collect_vdbe_metrics;
+        let Some(sorter) = self.sorters.get(&sorter_cursor_id) else {
+            return Ok(false);
+        };
+        let Some(sc) = self.storage_cursors.get_mut(&index_cursor_id) else {
+            return Ok(false);
+        };
+        let key_columns = sorter.key_columns;
+        if !sc.writable
+            || sorter.rows.is_empty()
+            || unique_key_columns > key_columns
+            || !sc.cursor.index_root_is_empty_leaf(&sc.cx).await?
+        {
+            return Ok(false);
+        }
+
+        // The field after the sort keys, when it is an integer: the rowid of a
+        // rowid table's index record. An integer-only read behind the UTF-8
+        // gate above.
+        #[allow(clippy::disallowed_methods)]
+        let rowid_of = |row: &SorterRow| match fsqlite_types::record::parse_record_column(
+            &row.blob,
+            key_columns,
+        ) {
+            Some(SqliteValue::Integer(rowid)) => Some(rowid),
+            _ => None,
+        };
+        let mut previous: Option<&SorterRow> = None;
+        // The previous row's rowid, when the pair before this one needed it.
+        let mut previous_rowid: Option<i64> = None;
+        for row in &sorter.rows {
+            if row.values.len() != key_columns {
+                return Ok(false);
+            }
+            let mut rowid = None;
+            if let Some(previous) = previous {
+                let unique_key_is_null_free = || {
+                    !previous.values[..unique_key_columns]
+                        .iter()
+                        .any(SqliteValue::is_null)
+                };
+                match sc
+                    .cursor
+                    .compare_index_key_prefixes(&previous.values, &row.values)
+                {
+                    Some(Ordering::Less) => {
+                        // The sort key can be longer than the UNIQUE key (a
+                        // WITHOUT ROWID index sorts on its PRIMARY KEY suffix
+                        // too), so rows in order may still share that key.
+                        if unique_key_columns > 0
+                            && unique_key_columns < key_columns
+                            && sc.cursor.compare_index_key_prefixes(
+                                &previous.values[..unique_key_columns],
+                                &row.values[..unique_key_columns],
+                            ) == Some(Ordering::Equal)
+                            && unique_key_is_null_free()
+                        {
+                            return Err(FrankenError::UniqueViolation {
+                                columns: columns_label.to_owned(),
+                            });
+                        }
+                    }
+                    Some(Ordering::Equal) => {
+                        if unique_key_columns > 0 && unique_key_is_null_free() {
+                            return Err(FrankenError::UniqueViolation {
+                                columns: columns_label.to_owned(),
+                            });
+                        }
+                        // Equal on every sort key: the field after them, the
+                        // rowid, has to rise.
+                        rowid = rowid_of(row);
+                        let before = previous_rowid.or_else(|| rowid_of(previous));
+                        if !matches!((before, rowid), (Some(before), Some(after)) if before < after)
+                        {
+                            return Ok(false);
+                        }
+                    }
+                    _ => return Ok(false),
+                }
+            }
+            previous = Some(row);
+            previous_rowid = rowid;
+        }
+
+        let stored = sc
+            .cursor
+            .index_bulk_load_sorted_keys(&sc.cx, sorter.rows.iter().map(|row| row.blob.as_slice()))
+            .await?;
+        if usize::try_from(stored).ok() != Some(sorter.rows.len()) {
+            return Err(FrankenError::internal(
+                "index bulk load stored a different number of keys than the sorter holds",
+            ));
+        }
+        sc.last_rightmost_unique_index_prefix = None;
+        sc.last_rightmost_unique_index_position = None;
+        invalidate_storage_cursor_row_cache_with_reason(
+            sc,
+            collect_vdbe_metrics,
+            DecodeCacheInvalidationReason::WriteMutation,
+        );
+        if self.storage_cursor_memdb_count_shortcuts_safe {
+            self.mark_storage_table_dirty(index_cursor_id);
+        }
+        Ok(true)
     }
 
     async fn storage_cursor_find_exact_index_key(
@@ -14468,6 +14633,37 @@ impl VdbeEngine {
                         }
                     } else {
                         pc += 1;
+                    }
+                }
+
+                // Build the empty index under cursor P1 from the sorted rows
+                // of sorter P3, or jump to P2 so the program inserts them one
+                // at a time. P5 = number of UNIQUE key columns, P4 = the
+                // label a UNIQUE violation names.
+                Opcode::IdxBulkLoad => {
+                    let unique_key_columns = usize::from(op.p5);
+                    if unique_key_columns > 0 {
+                        self.constraint_failure_action = ConstraintFailureAction::from_oe(0);
+                    }
+                    let columns_label = match &op.p4 {
+                        P4::Table(label) => label.as_str(),
+                        _ => "",
+                    };
+                    if self
+                        .bulk_load_index_from_sorter(
+                            op.p1,
+                            op.p3,
+                            unique_key_columns,
+                            columns_label,
+                        )
+                        .await?
+                    {
+                        pc += 1;
+                    } else {
+                        #[allow(clippy::cast_sign_loss)]
+                        {
+                            pc = op.p2 as usize;
+                        }
                     }
                 }
 
@@ -23384,6 +23580,202 @@ mod tests {
             .expect("index seek should succeed")
             .is_found(),
             "IdxInsert should still insert the key while recycling the sideband buffer"
+        );
+    }
+
+    /// Run `SorterOpen` (one key column, `sorter_order`) over `(key, rowid)`
+    /// records, `SorterSort`, then `IdxBulkLoad` into an empty index. Returns
+    /// which way the opcode went (1: built the index, 2: jumped) and the
+    /// index's records in scan order. With `insert_per_row` the jump target
+    /// inserts the sorted records through `IdxInsert`, as CREATE INDEX does;
+    /// without it the target does nothing, which shows what the opcode itself
+    /// left behind.
+    fn run_idx_bulk_load(
+        rows: &[(Option<i32>, i32)],
+        sorter_order: &str,
+        unique_key_columns: u16,
+        insert_per_row: bool,
+    ) -> Result<(i64, Vec<Vec<u8>>)> {
+        let mut engine = VdbeEngine::new(16);
+        let mut db = MemDatabase::new();
+        let index_root = db.allocate_root_page();
+        engine.enable_storage_cursors(true);
+        engine.set_database(db);
+        engine.set_reject_mem_fallback(false);
+        assert!(
+            run_async(engine.open_storage_cursor(0, index_root, true))
+                .expect("storage cursor open should not error"),
+            "index storage cursor should open"
+        );
+
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        let per_row = b.emit_label();
+        let per_row_loop = b.emit_label();
+        let done = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        let r_key = b.alloc_regs(2);
+        let r_record = b.alloc_reg();
+        let r_path = b.alloc_reg();
+        b.emit_op(
+            Opcode::SorterOpen,
+            1,
+            1,
+            0,
+            P4::Str(sorter_order.to_owned()),
+            0,
+        );
+        for (key, rowid) in rows {
+            match key {
+                Some(key) => b.emit_op(Opcode::Integer, *key, r_key, 0, P4::None, 0),
+                None => b.emit_op(Opcode::Null, 0, r_key, 0, P4::None, 0),
+            };
+            b.emit_op(Opcode::Integer, *rowid, r_key + 1, 0, P4::None, 0);
+            b.emit_op(Opcode::MakeRecord, r_key, 2, r_record, P4::None, 0);
+            b.emit_op(Opcode::SorterInsert, 1, r_record, 0, P4::None, 0);
+        }
+        b.emit_op(Opcode::Integer, 0, r_path, 0, P4::None, 0);
+        b.emit_jump_to_label(Opcode::SorterSort, 1, 0, done, P4::None, 0);
+        b.emit_op(Opcode::Integer, 1, r_path, 0, P4::None, 0);
+        b.emit_jump_to_label(
+            Opcode::IdxBulkLoad,
+            0,
+            1,
+            per_row,
+            P4::Table("t.k".to_owned()),
+            unique_key_columns,
+        );
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, done, P4::None, 0);
+        b.resolve_label(per_row);
+        b.emit_op(Opcode::Integer, 2, r_path, 0, P4::None, 0);
+        b.resolve_label(per_row_loop);
+        if insert_per_row {
+            b.emit_op(Opcode::SorterData, 1, r_record, 0, P4::None, 0);
+            b.emit_op(Opcode::IdxInsert, 0, r_record, 0, P4::None, 0);
+            b.emit_jump_to_label(Opcode::SorterNext, 1, 0, per_row_loop, P4::None, 0);
+        }
+        b.resolve_label(done);
+        b.emit_op(Opcode::ResultRow, r_path, 1, 0, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+        let program = b.finish().expect("program should build");
+
+        run_async(engine.execute(&program))?;
+        let path = engine
+            .take_results()
+            .into_iter()
+            .next()
+            .map(|row| row.into_vec()[0].to_integer())
+            .expect("the program should report which way IdxBulkLoad went");
+        let cursor = engine
+            .storage_cursors
+            .get_mut(&0)
+            .expect("index cursor should remain available");
+        let mut stored = Vec::new();
+        if run_async(cursor.cursor.first(&cursor.cx)).expect("index scan should start") {
+            loop {
+                stored.push(run_async(cursor.cursor.payload(&cursor.cx)).expect("index payload"));
+                if !run_async(cursor.cursor.next(&cursor.cx)).expect("index scan should advance") {
+                    break;
+                }
+            }
+        }
+        Ok((path, stored))
+    }
+
+    fn idx_bulk_load_records(rows: &[(Option<i32>, i32)]) -> Vec<Vec<u8>> {
+        rows.iter()
+            .map(|(key, rowid)| {
+                encode_record(&[
+                    key.map_or(SqliteValue::Null, |key| SqliteValue::Integer(i64::from(key))),
+                    SqliteValue::Integer(i64::from(*rowid)),
+                ])
+            })
+            .collect()
+    }
+
+    /// `IdxBulkLoad` builds the index when the sorted rows are in the index's
+    /// own order. When they are not, it has to notice before it writes a page,
+    /// leave the index empty and jump: a loader that trusted its input would
+    /// write a misordered b-tree in the two declined cases below.
+    #[test]
+    fn test_idx_bulk_load_builds_in_index_order_and_declines_any_other_order() {
+        // The helper reads index payloads back, which the b-tree copy profile
+        // counts; tests that measure that profile hold this lock.
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let rows = [
+            (Some(50), 1),
+            (Some(30), 2),
+            (None, 3),
+            (Some(90), 4),
+            (Some(30), 5),
+            (Some(10), 6),
+            (None, 7),
+        ];
+        let in_index_order = idx_bulk_load_records(&[
+            (None, 3),
+            (None, 7),
+            (Some(10), 6),
+            (Some(30), 2),
+            (Some(30), 5),
+            (Some(50), 1),
+            (Some(90), 4),
+        ]);
+
+        // Ascending keys, equal keys in rowid order: the index's order.
+        let (path, stored) = run_idx_bulk_load(&rows, "+", 0, false).expect("bulk build");
+        assert_eq!(path, 1, "rows in index order should be bulk loaded");
+        assert_eq!(stored, in_index_order);
+
+        // The sorter was told DESC but the index is ASC.
+        let (path, stored) = run_idx_bulk_load(&rows, "-", 0, false).expect("declined build");
+        assert_eq!(path, 2, "rows out of index order must not be bulk loaded");
+        assert!(
+            stored.is_empty(),
+            "a declined bulk load must not have written any key"
+        );
+        let (path, stored) = run_idx_bulk_load(&rows, "-", 0, true).expect("per-row build");
+        assert_eq!(path, 2);
+        assert_eq!(
+            stored, in_index_order,
+            "the per-row path must build the same index"
+        );
+
+        // Equal keys whose rowids do not rise: not index order either.
+        let rowids_falling = [(Some(30), 9), (Some(10), 1), (Some(30), 4)];
+        let (path, stored) =
+            run_idx_bulk_load(&rowids_falling, "+", 0, false).expect("declined build");
+        assert_eq!(path, 2, "equal keys must be in rowid order to be bulk loaded");
+        assert!(stored.is_empty());
+
+        // No rows: SorterSort jumps past the opcode.
+        let (path, stored) = run_idx_bulk_load(&[], "+", 0, false).expect("empty build");
+        assert_eq!(path, 0);
+        assert!(stored.is_empty());
+    }
+
+    /// A UNIQUE bulk build fails on two rows that share a non-NULL key before
+    /// it writes anything, names the constraint's label, and treats NULL keys
+    /// as distinct.
+    #[test]
+    fn test_idx_bulk_load_unique_rejects_equal_keys_but_not_null_keys() {
+        let _guard = VDBE_OBSERVABILITY_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let duplicate = [(Some(7), 1), (Some(3), 2), (Some(7), 300)];
+        match run_idx_bulk_load(&duplicate, "+", 1, false) {
+            Err(FrankenError::UniqueViolation { columns }) => assert_eq!(columns, "t.k"),
+            other => panic!("expected a UNIQUE violation, got {other:?}"),
+        }
+
+        let nulls = [(None, 1), (Some(3), 2), (None, 3), (Some(4), 4)];
+        let (path, stored) = run_idx_bulk_load(&nulls, "+", 1, false).expect("NULLs are distinct");
+        assert_eq!(path, 1);
+        assert_eq!(
+            stored,
+            idx_bulk_load_records(&[(None, 1), (None, 3), (Some(3), 2), (Some(4), 4)])
         );
     }
 

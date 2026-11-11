@@ -1151,6 +1151,7 @@ fn compute_attached_memdb_requirement_reason(ops: &[VdbeOp]) -> Option<&'static 
             | Opcode::SetSnapshot
             | Opcode::CountIndexEqRun
             | Opcode::FusedAppendInsert
+            | Opcode::IdxBulkLoad
                 if !storage_cursor_ids.contains(&op.p1) && !sorter_cursor_ids.contains(&op.p1) =>
             {
                 return Some("cursor_opcode_without_storage_or_sorter_open");
@@ -1344,7 +1345,8 @@ impl VdbeProgram {
                 | Opcode::IncrVacuum
                 | Opcode::Filter
                 | Opcode::VFilter
-                | Opcode::VNext => verify_jump_target_operand(
+                | Opcode::VNext
+                | Opcode::IdxBulkLoad => verify_jump_target_operand(
                     pc,
                     op.opcode,
                     "p2",

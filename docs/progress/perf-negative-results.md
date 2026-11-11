@@ -472,6 +472,81 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
   on path-identity probes; a single user-side term at 5% or more of a native profile of this
   commit's binary reopens it.
 
+## 2026-11-11 - WIN: CREATE INDEX and REINDEX sort the index records and lay the pages out left to right (bd-reality-check-1022-llk6g.8)
+
+- Target: scorecard row `create_index_int_300k` (`CREATE INDEX m_a ON m(a)` over 300k rows, 1,000
+  distinct keys unrelated to rowid order), 15-17x stock on wall time. Touched:
+  `crates/fsqlite-core/src/connection.rs` (`compile_index_backfill`),
+  `crates/fsqlite-vdbe/src/engine.rs` (`Opcode::IdxBulkLoad`, `bulk_load_index_from_sorter`),
+  `crates/fsqlite-btree/src/cursor.rs` (`index_bulk_load_sorted_keys`,
+  `compare_index_key_prefixes`), `crates/fsqlite-types/src/opcode.rs`.
+- Evidence before: 41.4k user instructions per key against stock's 2.9k, with
+  `index_seek_for_insert` and `balance_nonroot` on top: the backfill program ran `IdxInsert` per
+  row in table order. Keys already in order (the right-edge append lane of 2026-10-23) still cost
+  17.2k per key, so sorting without a loader would not have been enough.
+- Change: the program scans the table into the VDBE sorter. A rowid table sorts on the key terms
+  only (the scan is in rowid order and the sort is stable, so equal keys stay in rowid order); a
+  WITHOUT ROWID table sorts on the whole record. `IdxBulkLoad` then compares every sorted row
+  with the one before it using the index cursor's own key order and, only if each sorts after its
+  predecessor, writes the leaves left to right and full, with the key that does not fit a leaf as
+  the divider above it, and the interior levels the same way. No seek, no balance. A UNIQUE build
+  fails on two adjacent rows that share a key with no NULL in it, before any page is written.
+  When the opcode declines (rows not in index order, index not an empty leaf, UTF-16 database) it
+  writes nothing and the program inserts the same sorted rows through `IdxInsert`.
+- Result, stock sqlite3 3.46.1 live in every run, base 4c975163a (sha256 e2e9cee9...), candidate
+  sha256 b6959f9f... (this change on that base):
+  - scorecard row, wall time, 9 interleaved repetitions, A/A 1.00, load 20-21: base 1.529 s
+    (16.18x stock's 0.095 s), candidate 0.529 s (5.60x); the repetition ranges do not overlap
+    (1.38-1.63 against 0.44-0.60). A second run at load 14 (7 repetitions, in the entry above):
+    16.63x -> 4.97x.
+  - user instructions for the statement alone (`perf stat`, the run minus a count-only run on a
+    copy of the same table; 300k rows, best of 2, stock's A/A exactly 1.00), base -> candidate,
+    as multiples of stock: 1,000 distinct integers 12,409M -> 1,722M (14.33x -> 1.99x); unique
+    scattered integers 13.14x -> 1.80x; keys rising with rowid 4.98x -> 1.59x; text 10.89x ->
+    2.68x; `(a DESC, b)` 10.03x -> 2.52x; UNIQUE 12.56x -> 2.60x; expression 13.54x -> 2.25x;
+    partial index over a tenth of the rows 9.99x -> 5.24x (the scan and its filter are what is
+    left there).
+  - 1M rows, one run (the same change on base 3ce2feef2): 45,656M -> 5,619M instructions
+    (14.99x -> 1.85x), 5.60 s -> 1.10 s (stock 0.28 s).
+  - 3M rows, one run (same binaries as the 1M run), where the sorter is past its 100 MiB limit
+    and spills runs: 1,000 distinct integers 144.3G -> 26.0G instructions (13.2x -> 2.38x),
+    17.9 s -> 5.3 s (stock 0.99 s); unique scattered integers 134.1G -> 29.6G (11.9x -> 2.63x),
+    17.4 s -> 8.25 s (stock 1.01 s).
+  - An integer-key index takes exactly stock's page count (793 pages at 300k rows, 2,660 at 1M,
+    7,992 at 3M; base 866, 2,976 and 9,033). Stock's `integrity_check` accepted every
+    fsqlite-written file and queries through each index returned stock's rows.
+  - Peak RSS, candidate / base / stock: 84 / 75 / 17 MB at 300k rows, 211 / 186 / 17 MB at 1M,
+    580 / 496 / 17 MB at 3M. The build's memory grew with the table before this change and
+    still does; the sorter adds about a sixth.
+- Keeper: `crates/fsqlite-core/tests/create_index_sorted_bulk_build_oracle.rs` (stock oracle:
+  eight scenarios and a UNIQUE pass/fail table), two btree unit tests (every key count across
+  leaf boundaries, three levels, overflowing keys, cells under four bytes, inserts after the
+  load) and two engine unit tests (the opcode declines DESC-sorted rows and equal keys with
+  falling rowids without writing a page).
+- Still a loss: 5.0-5.6x on the row's wall time. The shell's own timer puts 390 ms of the
+  candidate's process in the statement (stock 80 ms); opening the database costs about 40 ms
+  more than stock's and closing it about 20 ms. Instructions are within 2x but cycles are not:
+  the statement runs at about 1.0 instructions per cycle against stock's 3.3. A sample profile
+  shows 23% in `free` (two heap blocks per sorter row, released in sorted and therefore random
+  order), 15% and 8% on the first touch of each row's record in the cell encoder and the order
+  check, and 8% in the sort's row permutation; 17% is kernel time. `strace -k` attributes the
+  statement's 18.9k reads: the scan reads each of the table's 3,123 WAL frames once, with a
+  24-byte header probe before it; the commit then reads every frame header in the WAL (3,125)
+  in the append preflight and every frame in full (3,917), and a checkpoint pass reads and
+  writes each of the 794 new pages again. Those commit-path reads are pager and WAL-adapter work
+  (bd-ih8ak), not index-build work.
+- Two stock differences the keeper found that the old path has as well, left as they were: an
+  index on a WITHOUT ROWID table orders the appended PRIMARY KEY columns ascending where stock
+  uses the PRIMARY KEY's own direction, so with `PRIMARY KEY DESC` and a repeated index key
+  stock's `integrity_check` rejects the file (six rows reproduce it, whether the index is
+  created before or after the rows); and a UNIQUE violation on an expression index names the
+  expression (`t.u % 2`) where stock names the index (`index 'ux_expr'`).
+- Retry conditions. Sorter rows without a heap block each: met now, by the profile above on
+  `create_index_int_300k`. Spilled runs sorted and merged as cheaply as in-memory rows, and a
+  merge that streams into the loader instead of back into memory: met by the 3M-row numbers
+  above (2.4-2.6x stock's instructions against 1.85x at 1M, 5-8x on wall time). A faster generic
+  comparison for text and multi-column keys: when one of those shapes is a gate row.
+
 ## 2026-11-10 - WIN: the shell prepares a statement for its column names only when the output mode can show one (bd-5310l)
 
 - Target: text statements through the CLI. A point `SELECT` by rowid inside a transaction cost

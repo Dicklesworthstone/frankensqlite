@@ -2195,6 +2195,142 @@ struct BulkTableGroup {
     end: usize,
 }
 
+/// A page the index bulk loader has written, and the key that divides it from
+/// the page to its right. Only the last page of a level has no divider.
+///
+/// The divider is a cell body: payload-size varint, local payload and, for a
+/// key that overflows, the first overflow page. Index leaf and interior cells
+/// share that body, so a key moves between the two levels unchanged.
+#[derive(Debug)]
+struct BulkIndexChild {
+    page_no: PageNumber,
+    divider_after: Option<Vec<u8>>,
+}
+
+/// One index b-tree page being filled left to right by the bulk loader.
+///
+/// Cells are laid down from the end of the usable area, so the cell area is
+/// compact and the page has no freeblock and no fragment.
+struct BulkIndexPage {
+    page_type: BtreePageType,
+    page_size: usize,
+    usable_size: usize,
+    image: Vec<u8>,
+    cell_offsets: Vec<u16>,
+    content_offset: usize,
+    /// Encoded length of the cell appended last (its allocation may be longer).
+    last_cell_len: usize,
+}
+
+impl BulkIndexPage {
+    fn new(page_size: u32, usable_size: u32, page_type: BtreePageType) -> Self {
+        let page_size = page_size as usize;
+        let usable_size = usable_size as usize;
+        Self {
+            page_type,
+            page_size,
+            usable_size,
+            image: vec![0u8; page_size],
+            cell_offsets: Vec::new(),
+            content_offset: usable_size,
+            last_cell_len: 0,
+        }
+    }
+
+    fn cell_count(&self) -> usize {
+        self.cell_offsets.len()
+    }
+
+    /// Where the cell area would start after one more cell of `cell_len`
+    /// encoded bytes on a page of `page_type` that holds `cell_count` cells
+    /// above `content_offset`, or `None` if the cell does not fit. An index
+    /// root is never page 1, so the page header starts at byte 0.
+    fn content_offset_after(
+        page_type: BtreePageType,
+        cell_count: usize,
+        content_offset: usize,
+        cell_len: usize,
+    ) -> Option<usize> {
+        // Stock allocates at least MIN_CELL_ALLOCATION bytes per cell.
+        let new_content_offset =
+            content_offset.checked_sub(cell_len.max(cell::MIN_CELL_ALLOCATION))?;
+        let pointer_array_end = usize::from(page_type.header_size())
+            + (cell_count + 1) * usize::from(fsqlite_types::limits::CELL_POINTER_SIZE);
+        (pointer_array_end <= new_content_offset).then_some(new_content_offset)
+    }
+
+    /// Whether one more cell of `cell_len` encoded bytes fits.
+    fn can_append(&self, cell_len: usize) -> bool {
+        Self::content_offset_after(
+            self.page_type,
+            self.cell_offsets.len(),
+            self.content_offset,
+            cell_len,
+        )
+        .is_some()
+    }
+
+    /// Append one cell given as up to two byte runs (an interior cell is its
+    /// left child pointer followed by the key's cell body).
+    fn append(&mut self, head: &[u8], body: &[u8]) -> Result<()> {
+        let cell_len = head.len() + body.len();
+        let Some(offset) = Self::content_offset_after(
+            self.page_type,
+            self.cell_offsets.len(),
+            self.content_offset,
+            cell_len,
+        ) else {
+            return Err(FrankenError::internal(
+                "index bulk load: cell does not fit the page it was planned for",
+            ));
+        };
+        // Any allocation padding stays zero because the image starts zeroed.
+        self.content_offset = offset;
+        self.image[offset..offset + head.len()].copy_from_slice(head);
+        self.image[offset + head.len()..offset + cell_len].copy_from_slice(body);
+        self.cell_offsets
+            .push(u16::try_from(offset).map_err(|_| FrankenError::TooBig)?);
+        self.last_cell_len = cell_len;
+        Ok(())
+    }
+
+    /// Remove the cell appended last and return its encoded bytes.
+    fn pop_last(&mut self) -> Result<Vec<u8>> {
+        let offset = self.cell_offsets.pop().ok_or_else(|| {
+            FrankenError::internal("index bulk load: no cell to take back from the page")
+        })?;
+        let offset = usize::from(offset);
+        let cell_len = self.last_cell_len;
+        let allocation = cell_len.max(cell::MIN_CELL_ALLOCATION);
+        let body = self.image[offset..offset + cell_len].to_vec();
+        self.image[offset..offset + allocation].fill(0);
+        self.content_offset = offset + allocation;
+        self.last_cell_len = 0;
+        Ok(body)
+    }
+
+    /// Write the header and the cell pointer array, hand back the finished
+    /// image and leave this builder empty for the next page of its level.
+    fn finish(&mut self, right_child: Option<PageNumber>) -> Result<PageData> {
+        let header = BtreePageHeader {
+            page_type: self.page_type,
+            first_freeblock: 0,
+            cell_count: u16::try_from(self.cell_offsets.len()).map_err(|_| FrankenError::TooBig)?,
+            cell_content_offset: u32::try_from(self.content_offset)
+                .map_err(|_| FrankenError::TooBig)?,
+            fragmented_free_bytes: 0,
+            right_child,
+        };
+        header.write(&mut self.image, 0);
+        cell::write_cell_pointers(&mut self.image, 0, &header, &self.cell_offsets);
+        let image = std::mem::replace(&mut self.image, vec![0u8; self.page_size]);
+        self.cell_offsets.clear();
+        self.content_offset = self.usable_size;
+        self.last_cell_len = 0;
+        Ok(PageData::from_vec(image))
+    }
+}
+
 #[derive(Debug)]
 enum MutationPathTarget {
     TableInsert(i64),
@@ -5162,6 +5298,39 @@ impl<P: PageReader> BtCursor<P> {
         }
     }
 
+    /// Order two decoded index key prefixes as this index orders them: each
+    /// key term under its direction and collation, any further field
+    /// ascending, and a shorter prefix before a longer one it begins.
+    ///
+    /// The bulk index build proves with this that its input is in index order
+    /// before it writes a page, so it has to decide exactly as a seek does.
+    /// Two INTEGER terms order the same under every collation and are decided
+    /// here without the registry lock; any other pair of terms goes through
+    /// [`Self::compare_index_key_values`]. `None` when two terms have no order.
+    #[must_use]
+    pub fn compare_index_key_prefixes(
+        &self,
+        lhs: &[SqliteValue],
+        rhs: &[SqliteValue],
+    ) -> Option<std::cmp::Ordering> {
+        for (idx, (left, right)) in lhs.iter().zip(rhs).enumerate() {
+            let (SqliteValue::Integer(left), SqliteValue::Integer(right)) = (left, right) else {
+                return self.compare_index_key_values(lhs, rhs, IndexSeekBias::LowerBound);
+            };
+            let ord = left.cmp(right);
+            if ord != std::cmp::Ordering::Equal {
+                return Some(
+                    if self.index_desc_flags.get(idx).copied().unwrap_or(false) {
+                        ord.reverse()
+                    } else {
+                        ord
+                    },
+                );
+            }
+        }
+        Some(lhs.len().cmp(&rhs.len()))
+    }
+
     /// Order two decoded key terms. TEXT compares its exact bytes (never the
     /// lossy `&str` view, which made distinct non-UTF-8 keys — e.g. raw
     /// UTF-16 — compare equal and misplaced index entries): built-in BINARY
@@ -6513,6 +6682,213 @@ impl<P: PageWriter> BtCursor<P> {
                 });
             }
             current_level = next_level;
+            depth += 1;
+        }
+    }
+
+    /// Whether this cursor's index b-tree is one empty leaf, the only tree
+    /// [`Self::index_bulk_load_sorted_keys`] builds into.
+    pub async fn index_root_is_empty_leaf(&mut self, cx: &Cx) -> Result<bool> {
+        // An index root is never page 1; the loader lays pages out from byte 0.
+        if self.is_table || self.root_page.get() == 1 {
+            return Ok(false);
+        }
+        let root_data = self.pager.read_btree_page_data(cx, self.root_page).await?;
+        let root_header = cell::parse_page_header(root_data.as_bytes(), self.root_page)?;
+        Ok(root_header.page_type == BtreePageType::LeafIndex && root_header.cell_count == 0)
+    }
+
+    /// Build this empty index b-tree from keys that are already in index
+    /// order, and return how many it stored.
+    ///
+    /// Leaves are filled left to right and written once each. The key that
+    /// does not fit a full leaf becomes the divider above it, and the interior
+    /// levels are laid out the same way from those dividers, so no key is
+    /// sought from the root and no page is balanced. Pages are filled as far
+    /// as their cells allow, which is what stock's index build leaves behind.
+    ///
+    /// The caller proves the order, and uniqueness for a UNIQUE index: this
+    /// function never compares two keys. It writes nothing and returns an
+    /// error unless [`Self::index_root_is_empty_leaf`] holds.
+    pub async fn index_bulk_load_sorted_keys<'k, I>(&mut self, cx: &Cx, keys: I) -> Result<u64>
+    where
+        I: Iterator<Item = &'k [u8]>,
+    {
+        if !self.index_root_is_empty_leaf(cx).await? {
+            return Err(FrankenError::internal(
+                "index bulk load needs an index whose root is an empty leaf",
+            ));
+        }
+
+        let mut leaf =
+            BulkIndexPage::new(self.page_size, self.usable_size, BtreePageType::LeafIndex);
+        let mut children: Vec<BulkIndexChild> = Vec::new();
+        // The key that did not fit the leaf being filled. It becomes that
+        // leaf's divider once a later key shows the leaf has a right sibling.
+        let mut held_divider: Option<Vec<u8>> = None;
+        let mut cell_body = Vec::new();
+        let mut stored = 0u64;
+
+        for key in keys {
+            // Overflow pages, if the key needs any, are written here; the cell
+            // body then names the first of them wherever the key ends up.
+            self.encode_index_leaf_cell_into(cx, key, &mut cell_body)
+                .await?;
+            stored += 1;
+            if let Some(divider) = held_divider.take() {
+                cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+                let page_no = self.pager.allocate_page(cx).await?;
+                let image = leaf.finish(None)?;
+                self.pager.write_page_data(cx, page_no, image).await?;
+                children.push(BulkIndexChild {
+                    page_no,
+                    divider_after: Some(divider),
+                });
+            } else if !leaf.can_append(cell_body.len()) {
+                if leaf.cell_count() == 0 {
+                    return Err(FrankenError::TooBig);
+                }
+                held_divider = Some(cell_body.clone());
+                continue;
+            }
+            leaf.append(&[], &cell_body)?;
+        }
+
+        if stored == 0 {
+            return Ok(0);
+        }
+        if let Some(last_key) = held_divider.take() {
+            // The keys ended on the held one. A divider needs a leaf to its
+            // right, so the full leaf gives up its last cell as the divider
+            // and the held key becomes the last leaf.
+            if leaf.cell_count() < 2 {
+                return Err(FrankenError::internal(
+                    "index bulk load: a full leaf holds fewer than two cells",
+                ));
+            }
+            let divider = leaf.pop_last()?;
+            let page_no = self.pager.allocate_page(cx).await?;
+            let image = leaf.finish(None)?;
+            self.pager.write_page_data(cx, page_no, image).await?;
+            children.push(BulkIndexChild {
+                page_no,
+                divider_after: Some(divider),
+            });
+            leaf.append(&[], &last_key)?;
+        }
+
+        let depth = if children.is_empty() {
+            let image = leaf.finish(None)?;
+            self.pager
+                .write_page_data(cx, self.root_page, image)
+                .await?;
+            1
+        } else {
+            let page_no = self.pager.allocate_page(cx).await?;
+            let image = leaf.finish(None)?;
+            self.pager.write_page_data(cx, page_no, image).await?;
+            children.push(BulkIndexChild {
+                page_no,
+                divider_after: None,
+            });
+            self.index_bulk_build_interior_levels(cx, children).await?
+        };
+
+        self.stack.clear();
+        self.at_eof = true;
+        self.last_index_insert_past_rightmost = false;
+        self.clear_rightmost_leaf_cache();
+        self.clear_seek_cache();
+        self.clear_cell_slot_caches();
+        self.last_known_depth = Some(depth);
+        self.bump_row_image_epoch();
+        Ok(stored)
+    }
+
+    /// Split one level of bulk-loaded index pages into the interior pages
+    /// above it: each `(start, end)` is the run of children one interior page
+    /// points at. The divider after a run's last child moves up a level.
+    fn bulk_index_interior_groups(&self, level: &[BulkIndexChild]) -> Result<Vec<(usize, usize)>> {
+        let mut groups = Vec::new();
+        let mut start = 0usize;
+        while start < level.len() {
+            let mut cells = 0usize;
+            let mut content_offset = self.usable_size as usize;
+            let mut end = start + 1;
+            while end < level.len() {
+                let divider = level[end - 1].divider_after.as_ref().ok_or_else(|| {
+                    FrankenError::internal("index bulk load: an inner page has no divider")
+                })?;
+                let Some(next_offset) = BulkIndexPage::content_offset_after(
+                    BtreePageType::InteriorIndex,
+                    cells,
+                    content_offset,
+                    4 + divider.len(),
+                ) else {
+                    break;
+                };
+                content_offset = next_offset;
+                cells += 1;
+                end += 1;
+            }
+            // An interior page needs two children. Leave two for the last page
+            // rather than one.
+            if level.len() - end == 1 {
+                end -= 1;
+                cells = cells.saturating_sub(1);
+            }
+            if cells == 0 {
+                return Err(FrankenError::internal(
+                    "index bulk load: an interior page cannot hold two children",
+                ));
+            }
+            groups.push((start, end));
+            start = end;
+        }
+        Ok(groups)
+    }
+
+    /// Build the interior levels over bulk-loaded index pages, ending with the
+    /// page that takes the root's page number. Returns the tree's depth.
+    async fn index_bulk_build_interior_levels(
+        &mut self,
+        cx: &Cx,
+        mut level: Vec<BulkIndexChild>,
+    ) -> Result<usize> {
+        let mut depth = 2usize;
+        loop {
+            let groups = self.bulk_index_interior_groups(&level)?;
+            let is_root = groups.len() == 1;
+            let mut next_level = Vec::with_capacity(groups.len());
+            let mut page = BulkIndexPage::new(
+                self.page_size,
+                self.usable_size,
+                BtreePageType::InteriorIndex,
+            );
+            for (start, end) in groups {
+                cx.checkpoint().map_err(|_| FrankenError::Abort)?;
+                for child in &level[start..end - 1] {
+                    let divider = child.divider_after.as_deref().ok_or_else(|| {
+                        FrankenError::internal("index bulk load: an inner page has no divider")
+                    })?;
+                    page.append(&child.page_no.get().to_be_bytes(), divider)?;
+                }
+                let image = page.finish(Some(level[end - 1].page_no))?;
+                let page_no = if is_root {
+                    self.root_page
+                } else {
+                    self.pager.allocate_page(cx).await?
+                };
+                self.pager.write_page_data(cx, page_no, image).await?;
+                next_level.push(BulkIndexChild {
+                    page_no,
+                    divider_after: level[end - 1].divider_after.take(),
+                });
+            }
+            if is_root {
+                return Ok(depth);
+            }
+            level = next_level;
             depth += 1;
         }
     }
@@ -15592,6 +15968,149 @@ mod tests {
             let seek = cursor.index_move_to(&cx, &last_key).await.unwrap();
             assert_eq!(seek, SeekResult::Found);
             assert_eq!(cursor.payload(&cx).await.unwrap(), last_key);
+        });
+    }
+
+    /// Scan an index from its first entry and return every key in order.
+    async fn scan_index_keys(cursor: &mut BtCursor<MemPageStore>, cx: &Cx) -> Vec<Vec<u8>> {
+        let mut keys = Vec::new();
+        if cursor.first(cx).await.unwrap() {
+            loop {
+                keys.push(cursor.payload(cx).await.unwrap());
+                if !cursor.next(cx).await.unwrap() {
+                    break;
+                }
+            }
+        }
+        keys
+    }
+
+    /// The bulk loader has to leave the tree the per-key path would: every key
+    /// reachable by scan and by seek, at every key count around a leaf
+    /// boundary (one of them ends on the key that did not fit a full leaf) and
+    /// with two interior levels. Keys inserted afterwards go through the
+    /// ordinary balancer, which has to accept the pages the loader wrote.
+    #[test]
+    fn test_index_bulk_load_sorted_keys_builds_the_tree_at_every_size() {
+        run_async(async {
+            const SMALL: u32 = 512;
+            let cx = Cx::new();
+            let key = |(n, rowid): (i64, i64)| {
+                serialize_record(&[
+                    SqliteValue::Text(format!("k{n:07}").into()),
+                    SqliteValue::Integer(rowid),
+                ])
+            };
+            let mut deepest = 0usize;
+            for count in (0_i64..=200).chain([1_000, 20_000]) {
+                let store = MemPageStore::with_empty_index(pn(2), SMALL);
+                let mut cursor = BtCursor::new(store, pn(2), SMALL, false);
+                let mut terms: Vec<(i64, i64)> = (0..count).map(|n| (n, n * 2)).collect();
+                let keys: Vec<Vec<u8>> = terms.iter().copied().map(key).collect();
+                assert!(cursor.index_root_is_empty_leaf(&cx).await.unwrap());
+                let stored = cursor
+                    .index_bulk_load_sorted_keys(&cx, keys.iter().map(Vec::as_slice))
+                    .await
+                    .unwrap();
+                assert_eq!(stored, u64::try_from(count).unwrap(), "count {count}");
+                assert_eq!(cursor.count_all_rows(&cx).await.unwrap(), count);
+                assert_eq!(
+                    scan_index_keys(&mut cursor, &cx).await,
+                    keys,
+                    "count {count}"
+                );
+                let stride = if count > 1_000 { 37 } else { 1 };
+                for wanted in keys.iter().step_by(stride) {
+                    assert_eq!(
+                        cursor.index_move_to(&cx, wanted).await.unwrap(),
+                        SeekResult::Found,
+                        "count {count}"
+                    );
+                    assert_eq!(&cursor.payload(&cx).await.unwrap(), wanted);
+                }
+                deepest = deepest.max(measure_tree_depth(&cursor.pager, pn(2), SMALL).await);
+
+                if count == 0 {
+                    assert!(cursor.index_root_is_empty_leaf(&cx).await.unwrap());
+                    continue;
+                }
+                assert!(!cursor.index_root_is_empty_leaf(&cx).await.unwrap());
+                assert!(
+                    cursor
+                        .index_bulk_load_sorted_keys(&cx, keys.iter().map(Vec::as_slice))
+                        .await
+                        .is_err(),
+                    "a second bulk load must not overwrite an index that holds keys"
+                );
+                assert_eq!(cursor.count_all_rows(&cx).await.unwrap(), count);
+
+                // Keys with odd rowids land between the loaded ones, and one
+                // lands after the last.
+                for n in (0..count).step_by(7).chain([count]) {
+                    cursor
+                        .index_insert(&cx, &key((n, n * 2 + 1)))
+                        .await
+                        .unwrap();
+                    terms.push((n, n * 2 + 1));
+                }
+                terms.sort_unstable();
+                let expected: Vec<Vec<u8>> = terms.iter().copied().map(key).collect();
+                assert_eq!(
+                    scan_index_keys(&mut cursor, &cx).await,
+                    expected,
+                    "count {count}"
+                );
+            }
+            assert!(
+                deepest >= 3,
+                "20,000 keys on 512-byte pages should need two interior levels, got depth {deepest}"
+            );
+        });
+    }
+
+    /// Keys too long for a leaf cell keep their overflow chain whether they
+    /// land in a leaf or become a divider, and keys shorter than the minimum
+    /// cell allocation are padded.
+    #[test]
+    fn test_index_bulk_load_sorted_keys_handles_overflow_and_tiny_keys() {
+        run_async(async {
+            let cx = Cx::new();
+            let long_keys: Vec<Vec<u8>> = (0..60_i64)
+                .map(|n| {
+                    serialize_record(&[
+                        SqliteValue::Text(format!("{n:04}{}", "x".repeat(3_000)).into()),
+                        SqliteValue::Integer(n),
+                    ])
+                })
+                .collect();
+            let store = MemPageStore::with_empty_index(pn(2), USABLE);
+            let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
+            cursor
+                .index_bulk_load_sorted_keys(&cx, long_keys.iter().map(Vec::as_slice))
+                .await
+                .unwrap();
+            assert!(
+                measure_tree_depth(&cursor.pager, pn(2), USABLE).await >= 2,
+                "sixty overflowing keys should not fit one leaf"
+            );
+            assert_eq!(scan_index_keys(&mut cursor, &cx).await, long_keys);
+            for wanted in &long_keys {
+                assert_eq!(
+                    cursor.index_move_to(&cx, wanted).await.unwrap(),
+                    SeekResult::Found
+                );
+            }
+
+            // A one-NULL record is two bytes; its leaf cell is three.
+            let tiny = serialize_record(&[SqliteValue::Null]);
+            let tiny_keys: Vec<Vec<u8>> = vec![tiny; 3_000];
+            let store = MemPageStore::with_empty_index(pn(2), USABLE);
+            let mut cursor = BtCursor::new(store, pn(2), USABLE, false);
+            cursor
+                .index_bulk_load_sorted_keys(&cx, tiny_keys.iter().map(Vec::as_slice))
+                .await
+                .unwrap();
+            assert_eq!(scan_index_keys(&mut cursor, &cx).await, tiny_keys);
         });
     }
 

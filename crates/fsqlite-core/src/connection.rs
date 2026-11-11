@@ -72259,8 +72259,9 @@ impl Connection {
         Ok(())
     }
 
-    /// Compile a VDBE program that scans a table and inserts index keys for
-    /// every existing row.  Used by `execute_create_index` to backfill.
+    /// Compile a VDBE program that builds an index from the rows its table
+    /// already holds: it scans the table into a sorter, then builds the index
+    /// from the sorted records. Used by `execute_create_index` and REINDEX.
     ///
     /// For plain column indexes, `idx_col_positions` holds column indices and
     /// `key_exprs` is empty.  For expression indexes, `idx_col_positions` is
@@ -72302,6 +72303,8 @@ impl Connection {
         let halt_label = b.emit_label();
         let loop_label = b.emit_label();
         let next_label = b.emit_label();
+        let sort_label = b.emit_label();
+        let insert_loop_label = b.emit_label();
         let end_label = b.emit_label();
 
         // Init → end_label (past-the-end, so Init falls through).
@@ -72316,8 +72319,51 @@ impl Connection {
         // OpenWrite for the index (cursor 1).
         b.emit_op(Opcode::OpenWrite, 1, index.root_page, 0, P4::None, 0);
 
-        // Rewind: position at first row, jump to halt if empty.
-        b.emit_jump_to_label(Opcode::Rewind, 0, 0, halt_label, P4::None, 0);
+        // The index is built from its records in index order, as stock's
+        // sqlite3RefillIndex does: inserting them in table order sought a leaf
+        // from the root and rebalanced for every row (cursor 2 is the sorter).
+        //
+        // A rowid table is scanned in rowid order and the sort is stable, so
+        // sorting on the key terms alone leaves equal keys in rowid order,
+        // which is index order. A WITHOUT ROWID table is scanned in PRIMARY
+        // KEY order, which need not be the order of the PRIMARY KEY columns
+        // appended to the index record, so there the whole record is the sort
+        // key. Fields after the key terms sort ascending under BINARY, as the
+        // index compares them.
+        let sort_key_cols = if without_rowid_pk.is_some() {
+            n_record_cols
+        } else {
+            n_idx_cols
+        };
+        let sort_orders: String = (0..sort_key_cols)
+            .map(|key_pos| {
+                if key_pos < n_idx_cols && index.key_term_descending(key_pos) {
+                    '-'
+                } else {
+                    '+'
+                }
+            })
+            .collect();
+        let sort_collations: Vec<&str> = (0..sort_key_cols)
+            .map(|key_pos| {
+                index
+                    .key_term_collation(key_pos)
+                    .filter(|collation| {
+                        key_pos < n_idx_cols && !collation.eq_ignore_ascii_case("BINARY")
+                    })
+                    .unwrap_or("")
+            })
+            .collect();
+        let sorter_p4 = if sort_collations.iter().all(|collation| collation.is_empty()) {
+            P4::Str(sort_orders)
+        } else {
+            P4::Str(format!("{sort_orders}|{}", sort_collations.join(",")))
+        };
+        b.emit_op(Opcode::SorterOpen, 2, sort_key_cols as i32, 0, sorter_p4, 0);
+
+        // Rewind: position at first row; an empty table goes straight to the
+        // (empty) sort.
+        b.emit_jump_to_label(Opcode::Rewind, 0, 0, sort_label, P4::None, 0);
 
         // Loop label.
         b.resolve_label(loop_label);
@@ -72381,27 +72427,60 @@ impl Connection {
             0,
         );
 
-        // IdxInsert with uniqueness check if required.
-        let (p3, p5) = if is_unique {
-            (n_idx_cols as i32, 1_u16)
-        } else {
-            (0, 0)
-        };
-        let p4 = if is_unique {
-            P4::Table(columns_label.to_owned())
-        } else {
-            P4::None
-        };
-        b.emit_op(Opcode::IdxInsert, 1, rec_reg, p3, p4, p5);
+        b.emit_op(Opcode::SorterInsert, 2, rec_reg, 0, P4::None, 0);
 
         // next_label: WHERE-clause skip target — rows that fail the partial
-        // index predicate jump here, bypassing IdxInsert.
+        // index predicate jump here, bypassing the sorter.
         b.resolve_label(next_label);
 
         // Next → loop back.
         b.emit_jump_to_label(Opcode::Next, 0, 0, loop_label, P4::None, 0);
 
-        // Halt (Rewind jumps here when table is empty).
+        // Sort; nothing to build when no row qualified.
+        b.resolve_label(sort_label);
+        b.emit_jump_to_label(Opcode::SorterSort, 2, 0, halt_label, P4::None, 0);
+
+        // Uniqueness is checked on the key terms only, never the row locator.
+        let unique_label = || {
+            if is_unique {
+                P4::Table(columns_label.to_owned())
+            } else {
+                P4::None
+            }
+        };
+
+        // Lay the sorted records out as leaf and interior pages in one pass.
+        // The opcode writes nothing and jumps when it cannot (see
+        // `Opcode::IdxBulkLoad`); the loop below then inserts the same sorted
+        // records one at a time.
+        let bulk_unique_cols = if is_unique {
+            u16::try_from(n_idx_cols).map_err(|_| FrankenError::TooBig)?
+        } else {
+            0
+        };
+        b.emit_jump_to_label(
+            Opcode::IdxBulkLoad,
+            1,
+            2,
+            insert_loop_label,
+            unique_label(),
+            bulk_unique_cols,
+        );
+        b.emit_jump_to_label(Opcode::Goto, 0, 0, halt_label, P4::None, 0);
+
+        // Per-record insertion in sorted order, with IdxInsert's own
+        // uniqueness check.
+        b.resolve_label(insert_loop_label);
+        let (p3, p5) = if is_unique {
+            (n_idx_cols as i32, 1_u16)
+        } else {
+            (0, 0)
+        };
+        b.emit_op(Opcode::SorterData, 2, rec_reg, 0, P4::None, 0);
+        b.emit_op(Opcode::IdxInsert, 1, rec_reg, p3, unique_label(), p5);
+        b.emit_jump_to_label(Opcode::SorterNext, 2, 0, insert_loop_label, P4::None, 0);
+
+        // Halt (also the target of an empty sort).
         b.resolve_label(halt_label);
         b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
 

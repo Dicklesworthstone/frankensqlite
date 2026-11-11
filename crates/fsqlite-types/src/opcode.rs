@@ -609,14 +609,30 @@ pub enum Opcode {
     /// that was ignored (GH #159), reusing the engine's exact conflict decision
     /// rather than re-deriving uniqueness in codegen.
     IfConflictSkip = 199,
+
+    /// Build the empty index under cursor P1 from the sorted rows of sorter P3.
+    ///
+    /// P1 = writable index cursor, P2 = jump target, P3 = sorter cursor already
+    /// sorted by `SorterSort`, P4 = the label a UNIQUE violation names, P5 =
+    /// how many leading key columns are UNIQUE (0 for a non-UNIQUE index).
+    ///
+    /// The engine checks, with the index's own key order, that every row sorts
+    /// after the one before it, and for a UNIQUE index that no two rows share
+    /// a key without a NULL. It then writes the leaf and interior pages left
+    /// to right without seeking or balancing, and falls through. When it
+    /// cannot (the index is not an empty leaf, the database is not UTF-8, or
+    /// the rows are not in index order) it writes nothing and jumps to P2,
+    /// where the program inserts the rows with `IdxInsert`
+    /// (bd-reality-check-1022-llk6g.8).
+    IdxBulkLoad = 200,
 }
 
 impl Opcode {
     /// Exclusive upper bound on valid opcode discriminants.
     ///
-    /// Discriminants run `1..=199` (there is no zero opcode), so valid bytes
+    /// Discriminants run `1..=200` (there is no zero opcode), so valid bytes
     /// are exactly `1..COUNT` and the number of opcodes defined is `COUNT - 1`.
-    pub const COUNT: usize = 200;
+    pub const COUNT: usize = 201;
 
     /// Get the opcode name as a static string slice.
     #[allow(clippy::too_many_lines)]
@@ -821,6 +837,7 @@ impl Opcode {
             Self::ColumnSubstrPrefix => "ColumnSubstrPrefix",
             Self::ColumnOctetLength => "ColumnOctetLength",
             Self::IfConflictSkip => "IfConflictSkip",
+            Self::IdxBulkLoad => "IdxBulkLoad",
         }
     }
 
@@ -1035,6 +1052,7 @@ impl Opcode {
             197 => Some(Self::ColumnSubstrPrefix),
             198 => Some(Self::ColumnOctetLength),
             199 => Some(Self::IfConflictSkip),
+            200 => Some(Self::IdxBulkLoad),
             _ => None,
         }
     }
@@ -1100,6 +1118,7 @@ impl Opcode {
                 | Self::Filter
                 | Self::Init
                 | Self::IfConflictSkip
+                | Self::IdxBulkLoad
         )
     }
 }
@@ -1644,8 +1663,8 @@ mod tests {
     fn opcode_count() {
         // COUNT is the exclusive upper bound on discriminants (1..COUNT), so the
         // number of opcodes actually defined is COUNT - 1.
-        assert_eq!(Opcode::COUNT, 200);
-        assert_eq!(Opcode::COUNT - 1, 199);
+        assert_eq!(Opcode::COUNT, 201);
+        assert_eq!(Opcode::COUNT - 1, 200);
     }
 
     #[test]
@@ -1671,7 +1690,8 @@ mod tests {
         assert_eq!(Opcode::from_byte(197), Some(Opcode::ColumnSubstrPrefix));
         assert_eq!(Opcode::from_byte(198), Some(Opcode::ColumnOctetLength));
         assert_eq!(Opcode::from_byte(199), Some(Opcode::IfConflictSkip));
-        assert_eq!(Opcode::from_byte(200), None);
+        assert_eq!(Opcode::from_byte(200), Some(Opcode::IdxBulkLoad));
+        assert_eq!(Opcode::from_byte(201), None);
         assert_eq!(Opcode::from_byte(255), None);
     }
 
