@@ -451,6 +451,90 @@ fn join_lookups_test_outer_row_terms_first_and_match_sqlite() {
     }
 }
 
+/// bd-w4pr1.13.16: an upper bound on the outer table's rowid ends the outer
+/// scan the first time it fails. The bound may be a number, text that
+/// converts, text that does not (every integer sorts before it: always true),
+/// a blob (always true) or NULL (no rows). A bound on any other column, a
+/// lower bound, and a bound under OR must not end the scan: `t.a <= 2` holds
+/// again at t.id 12 after failing from t.id 4 on.
+const OUTER_ROWID_BOUND_QUERIES: &[&str] = &[
+    "SELECT u.id, t.id FROM u JOIN t ON t.a = u.a WHERE u.id <= 3 ORDER BY u.id, t.id",
+    "SELECT u.id, t.id FROM u JOIN t ON t.a = u.a WHERE u.id < 3 ORDER BY u.id, t.id",
+    "SELECT u.id, t.id FROM u JOIN t ON t.a = u.a WHERE 3 >= u.id ORDER BY u.id, t.id",
+    "SELECT u.id, t.id FROM u JOIN t ON t.a = u.a WHERE 3 > u.rowid ORDER BY u.id, t.id",
+    "SELECT u.id, t.id FROM u LEFT JOIN t ON t.a = u.a WHERE u.id <= 4 ORDER BY u.id, t.id",
+    "SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE u.id <= 3.5 ORDER BY u.id",
+    "SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE u.id <= '3' ORDER BY u.id",
+    "SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE u.id <= 'abc' ORDER BY u.id",
+    "SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE u.id < x'00' ORDER BY u.id",
+    "SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE u.id <= NULL ORDER BY u.id",
+    "SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE u.id <= 0 ORDER BY u.id",
+    "SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE u.id <= 3 AND u.r > 0.5 ORDER BY u.id",
+    "SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE u.id <= 3 OR u.r > 2.9 ORDER BY u.id",
+    "SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE u.id >= 3 ORDER BY u.id",
+    "SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE u.id > 2 AND u.id <= 5 ORDER BY u.id",
+    "SELECT t.id, u.id FROM t LEFT JOIN u ON u.id = t.id WHERE t.a <= 2 ORDER BY t.id",
+    "SELECT t.id, u.id FROM t JOIN u ON u.id = t.a WHERE t.a <= 2 ORDER BY t.id",
+    "SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE u.id <= 5 ORDER BY u.id DESC LIMIT 2",
+    "SELECT count(*), sum(t.c) FROM u JOIN t ON t.a = u.a WHERE u.id <= 3",
+    "SELECT count(*), count(t.id) FROM u LEFT JOIN t ON t.a = u.a WHERE u.id < 5",
+    "SELECT count(*), sum(t.c) FROM u, t WHERE t.id = u.a AND u.id <= 5",
+];
+
+#[test]
+fn join_lookups_stop_at_an_outer_rowid_bound_and_match_sqlite() {
+    for indexed in [false, true] {
+        asupersync::test_utils::run_test(|| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("join_outer_rowid_bound.db");
+            let f = Connection::open(path.to_str().unwrap()).await.unwrap();
+            let r = rusqlite::Connection::open_in_memory().unwrap();
+            let indexes: &[&str] = if indexed { INDEXES } else { &[] };
+            for sql in SETUP.iter().chain(indexes) {
+                f.execute(sql).await.unwrap();
+                r.execute(sql, []).unwrap();
+            }
+            for sql in OUTER_ROWID_BOUND_QUERIES {
+                assert_agree(&f, &r, sql, &[], &[]).await;
+            }
+            for bound in [0_i64, 3, 100] {
+                assert_agree(
+                    &f,
+                    &r,
+                    "SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE u.id <= ?1 ORDER BY u.id",
+                    &[SqliteValue::Integer(bound)],
+                    &[&bound],
+                )
+                .await;
+            }
+
+            // The failing bound leaves the outer loop: its jump lands past
+            // the `Next` that advances the outer cursor. A bound on another
+            // column only skips the row.
+            let leaves_the_loop = |ops: &[(i64, String, i64, i64)]| {
+                let seek = ops.iter().position(|(_, op, _, _)| op == "SeekRowid").unwrap();
+                let advance = ops
+                    .iter()
+                    .find(|(_, op, cursor, _)| op == "Next" && *cursor == 0)
+                    .map(|(address, _, _, _)| *address)
+                    .unwrap();
+                ops[..seek]
+                    .iter()
+                    .any(|(_, op, _, target)| op == "IfNot" && *target > advance)
+            };
+            let bounded =
+                program(&f, "SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE u.id <= 3").await;
+            assert!(leaves_the_loop(&bounded), "{bounded:?}");
+            let other_column =
+                program(&f, "SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE u.r <= 3").await;
+            assert!(!leaves_the_loop(&other_column), "{other_column:?}");
+            let lower_bound =
+                program(&f, "SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE u.id >= 3").await;
+            assert!(!leaves_the_loop(&lower_bound), "{lower_bound:?}");
+        });
+    }
+}
+
 /// A replacement for the builtin `length`: every value is 7 long.
 struct SevenLong;
 

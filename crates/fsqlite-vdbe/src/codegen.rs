@@ -13900,9 +13900,19 @@ fn codegen_single_join_lookup_select(
         if expr_references_scan(term, right_table, right_alias) {
             continue;
         }
+        // A table scan hands out rowids in ascending order, so a term that
+        // bounds the outer rowid from above by a value fixed for the
+        // statement ends the scan the first time it fails.
+        let failed = if matches!(outer_loop, OuterLoop::Scan)
+            && is_outer_rowid_upper_bound(term, &tables)
+        {
+            done_label
+        } else {
+            outer_row_rejected
+        };
         let cond_reg = b.alloc_reg();
         emit_join_expr(b, term, cond_reg, &tables, ctx)?;
-        b.emit_jump_to_label(Opcode::IfNot, cond_reg, 1, outer_row_rejected, P4::None, 0);
+        b.emit_jump_to_label(Opcode::IfNot, cond_reg, 1, failed, P4::None, 0);
     }
     let left_join_match_reg = if matches!(plan.join_kind, fsqlite_ast::JoinKind::Left) {
         let reg = b.alloc_temp();
@@ -15490,6 +15500,46 @@ fn join_qualifier_matches(
             |a| a.eq_ignore_ascii_case(q),
         )
     })
+}
+
+/// Whether `term` bounds the rowid of the outer table (`tables[0]`) from above
+/// by a value fixed for the statement: `t.id <= 100000`, `?1 > t.rowid`
+/// (bd-w4pr1.13.16).
+///
+/// For a fixed right-hand value the comparison is monotone in the rowid: a
+/// number orders the integers, every integer sorts before any text or blob
+/// (always true), and NULL makes it NULL for every row. So once the term is
+/// false or NULL for one rowid it is for every larger one.
+fn is_outer_rowid_upper_bound(term: &Expr, tables: &[(&TableSchema, Option<&str>)]) -> bool {
+    use fsqlite_ast::{BinaryOp, PlaceholderType};
+
+    let Expr::BinaryOp {
+        left, op, right, ..
+    } = term
+    else {
+        return false;
+    };
+    let fixed = |expr: &Expr| {
+        matches!(
+            expr,
+            Expr::Literal(..) | Expr::Placeholder(PlaceholderType::Numbered(_), _)
+        )
+    };
+    let outer_rowid = |expr: &Expr| {
+        let Expr::Column(col_ref, _) = expr else {
+            return false;
+        };
+        match resolve_join_column_ref(col_ref.table.as_deref(), &col_ref.column, tables) {
+            Ok(JoinColumnResolution::HiddenRowid(0)) => true,
+            Ok(JoinColumnResolution::Column(0, column)) => tables[0].0.columns[column].is_ipk,
+            _ => false,
+        }
+    };
+    match op {
+        BinaryOp::Lt | BinaryOp::Le => outer_rowid(left) && fixed(right),
+        BinaryOp::Gt | BinaryOp::Ge => fixed(left) && outer_rowid(right),
+        _ => false,
+    }
 }
 
 fn resolve_join_column_ref(
