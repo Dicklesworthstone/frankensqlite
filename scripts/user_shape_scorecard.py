@@ -198,8 +198,11 @@ def multiproc(binp, work, tag, timeout, nproc=8, nrows=500):
         errs += p.stderr.read().decode(errors="replace").count("rror")
     wall = time.perf_counter() - t0
     count = run(binp, db, "SELECT count(*) FROM e0;\n", timeout)
+    # `summarize` fails a run whose `err` mentions an error, so a clean run reports nothing:
+    # "0 error lines" marked every arm of this row as failed, stock included.
     return {"s": wall, "rc": 0 if errs == 0 else 1, "timeout": timed_out, "rss_kib": rss,
-            "out": f"{last_line(count['out'])}of{nproc * nrows}", "err": f"{errs} error lines"}
+            "out": f"{last_line(count['out'])}of{nproc * nrows}",
+            "err": f"{errs} error lines" if errs else ""}
 
 
 def provenance(binp):
