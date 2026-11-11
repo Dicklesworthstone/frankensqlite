@@ -777,8 +777,8 @@ impl Connection {
             );
             record_trace_span_created();
             let _plan_guard = plan_span.enter();
-            let sql_text = statement.to_string();
-            let sql_key = Self::sql_hash(&sql_text);
+            let (sql_text, sql_key) =
+                self.dispatch_statement_text(params, statement, |seen| &mut seen.inserts);
             // A program built from resolved VALUES subqueries holds
             // their results for this execution: never reuse it.
             let _values_subquery_cache_bypass = insert_values_have_subquery(insert)

@@ -87,6 +87,35 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-11 - WIN: a statement dispatched with bound parameters shares the text its tree last rendered to (bd-5310l)
+
+- Target: every statement that reaches the dispatcher with parameters bound: the literal statements
+  of the entry below, and prepared statements that defer to the dispatcher. Touched:
+  `crates/fsqlite-core/src/connection.rs` (`RenderedStatements`, `dispatch_statement_text`, the
+  SELECT / UPDATE / DELETE compile sites), `crates/fsqlite-core/src/connection/insert_batch.rs`.
+- Evidence before: the dispatcher keys the compiled-program cache on the text a statement renders to
+  after its per-execution rewrites, so every execution rendered the whole tree to look its program
+  up, on a cache hit too. callgrind, 1,000 statements in one transaction: `to_string` at the dispatch
+  site cost 6.4k instructions per INSERT, 7.7k per point SELECT and 8.9k per UPDATE.
+- Change: with parameters bound, the last four trees of each statement kind are kept with their text
+  and key, and a tree equal to one of them shares its text. Equal trees render to equal text, so the
+  key and the collision check are the ones rendering would have produced. Without parameters the tree
+  is rendered as before and nothing is kept: a literal statement's tree differs every time, and a kept
+  copy would cost a clone for a lookup that never hits.
+- Result (callgrind, per statement, the binary without the memo 73e683828 against the binary with it
+  b99eb86bb, same statements): INSERT dispatch 33.9k -> 27.7k (`to_string` 6.4k -> lookup 0.4k);
+  SELECT dispatcher 44.9k -> 37.9k; UPDATE dispatcher 49.2k -> 40.0k. That is 8-11% of a literal
+  statement. `perf stat` with stock live is in the entry below, where the two commits are one binary.
+- Behaviour: unit test `remembered_text_is_the_text_the_tree_renders_to` (six trees that differ only
+  in a literal, a column, a table or a parameter number, cycled past the capacity in two orders: text
+  and key always equal a fresh rendering, and nothing is kept for a statement without parameters).
+  The oracle suites of the entry below ran with this commit applied.
+- No effect on a statement run from its own text without parameters; the same text repeated still
+  renders its tree on every execution.
+- Retry condition for that case: a profile showing the rendering at 5% or more of a statement whose
+  text repeats. The shape to try is the rendered text stored beside the parsed statement in the parse
+  cache, not a tree comparison.
+
 ## 2026-11-11 - WIN: a literal INSERT or rowid-keyed SELECT, UPDATE or DELETE runs with its literals bound, so statements that differ only in literals share one parse and one program (bd-5310l)
 
 - Target: ad-hoc statements whose literals change every time (scorecard `txn_1000x10_rows`; any caller

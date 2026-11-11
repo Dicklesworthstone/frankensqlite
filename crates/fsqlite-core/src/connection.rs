@@ -12700,6 +12700,124 @@ struct CompiledCacheEntry {
     reverse_unordered_selects: bool,
 }
 
+/// How many statement trees of each kind [`RenderedStatements`] keeps.
+const RENDERED_STATEMENTS_PER_KIND: usize = 4;
+
+/// One statement tree and the canonical text it renders to.
+struct RenderedStatement<T> {
+    tree: T,
+    text: Rc<str>,
+    key: u64,
+}
+
+/// Canonical text of the statements last compiled through the dispatcher
+/// with parameters bound (bd-5310l).
+///
+/// The dispatcher keys the compiled-program cache on the text a statement
+/// renders to after its per-execution rewrites, so every execution rendered
+/// the whole tree again just to look its program up: about 6,500 instructions
+/// for a two-column INSERT. A statement run with bound parameters usually
+/// runs again with an identical tree, and identical trees render to identical
+/// text, so the last few trees of each kind are kept with theirs. A statement
+/// run from literal text is not kept: its tree differs with every literal,
+/// and holding a copy of it would cost a clone for a lookup that never hits.
+#[derive(Default)]
+struct RenderedStatements {
+    inserts: Vec<RenderedStatement<Statement>>,
+    selects: Vec<RenderedStatement<SelectStatement>>,
+    updates: Vec<RenderedStatement<fsqlite_ast::UpdateStatement>>,
+    deletes: Vec<RenderedStatement<fsqlite_ast::DeleteStatement>>,
+}
+
+/// The canonical text of a dispatched statement: rendered for this execution,
+/// or shared with an earlier one of the same tree.
+enum DispatchStatementText {
+    Rendered(String),
+    Remembered(Rc<str>),
+}
+
+impl std::ops::Deref for DispatchStatementText {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        match self {
+            Self::Rendered(text) => text,
+            Self::Remembered(text) => text,
+        }
+    }
+}
+
+#[cfg(test)]
+mod rendered_statement_tests {
+    use super::*;
+
+    fn parsed(sql: &str) -> Statement {
+        Parser::from_sql(sql)
+            .parse_next_statement_with_tail()
+            .expect("parses")
+            .expect("one statement")
+            .0
+    }
+
+    #[test]
+    fn remembered_text_is_the_text_the_tree_renders_to() {
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.expect("open");
+            let bound: &[SqliteValue] = &[SqliteValue::Integer(1)];
+            // Trees that differ only deep inside: a literal, a column, the
+            // parameter number. Sharing text between any two of them would
+            // hand one statement another's compiled program.
+            let sources = [
+                "INSERT INTO t(a, b) VALUES (?1, ?2)",
+                "INSERT INTO t(a, b) VALUES (?1, ?1)",
+                "INSERT INTO t(a, b) VALUES (?1, 2)",
+                "INSERT INTO t(a, b) VALUES (?1, 3)",
+                "INSERT INTO t(a, c) VALUES (?1, ?2)",
+                "INSERT INTO u(a, b) VALUES (?1, ?2)",
+            ];
+            let trees: Vec<Statement> = sources.iter().map(|sql| parsed(sql)).collect();
+            // More trees than are kept, visited three times in two orders, so
+            // every entry is hit, evicted and rendered again.
+            for round in 0..3 {
+                let order: Vec<usize> = if round == 1 {
+                    (0..trees.len()).rev().collect()
+                } else {
+                    (0..trees.len()).collect()
+                };
+                for index in order {
+                    let tree = &trees[index];
+                    let (text, key) =
+                        conn.dispatch_statement_text(Some(bound), tree, |seen| &mut seen.inserts);
+                    assert_eq!(&*text, tree.to_string(), "round {round}: {}", sources[index]);
+                    assert_eq!(key, Connection::sql_hash(&tree.to_string()));
+                    // Asked again at once, the same tree shares its text.
+                    let (again, again_key) =
+                        conn.dispatch_statement_text(Some(bound), tree, |seen| &mut seen.inserts);
+                    match (&text, &again) {
+                        (
+                            DispatchStatementText::Remembered(first),
+                            DispatchStatementText::Remembered(second),
+                        ) => assert!(Rc::ptr_eq(first, second), "one text, not two renderings"),
+                        _ => panic!("a statement with bound parameters is remembered"),
+                    }
+                    assert_eq!(key, again_key);
+                }
+                assert!(
+                    conn.rendered_statements.borrow().inserts.len() <= RENDERED_STATEMENTS_PER_KIND
+                );
+            }
+            // Without parameters the tree is rendered and nothing is kept.
+            let kept_before = conn.rendered_statements.borrow().inserts.len();
+            let literal = parsed("INSERT INTO t(a, b) VALUES (10, 'x')");
+            let (text, key) = conn.dispatch_statement_text(None, &literal, |seen| &mut seen.inserts);
+            assert!(matches!(text, DispatchStatementText::Rendered(_)));
+            assert_eq!(&*text, literal.to_string());
+            assert_eq!(key, Connection::sql_hash(&literal.to_string()));
+            assert_eq!(conn.rendered_statements.borrow().inserts.len(), kept_before);
+        });
+    }
+}
+
 #[derive(Clone)]
 struct PlannerDirectiveCacheEntry {
     sql: String,
@@ -14421,6 +14539,9 @@ pub struct Connection {
     /// repeated `execute()`/`execute_with_params()` calls skip compilation.
     /// Invalidated alongside parse_cache when schema_cookie changes.
     compiled_cache: RefCell<LruCache<u64, Arc<CompiledCacheEntry>>>,
+    /// Text of the statement trees last dispatched with bound parameters, so
+    /// an identical tree is not rendered again to find its compiled program.
+    rendered_statements: RefCell<RenderedStatements>,
     /// Temporary escape hatch for execution paths whose compiled programs must
     /// not be cached globally, such as CTE temp-table runs with dynamic root pages.
     bypass_compiled_cache: Cell<bool>,
@@ -16037,6 +16158,7 @@ impl Connection {
             parse_cache: RefCell::new(LruCache::new(default_statement_cache_capacity())),
             parse_cache_cookie: RefCell::new(0),
             compiled_cache: RefCell::new(LruCache::new(default_statement_cache_capacity())),
+            rendered_statements: RefCell::new(RenderedStatements::default()),
             bypass_compiled_cache: Cell::new(false),
             scalar_subquery_row_value_context: Cell::new(false),
             prepared_cache: RefCell::new(LruCache::new(default_statement_cache_capacity())),
@@ -16637,6 +16759,7 @@ impl Connection {
             parse_cache_cookie: RefCell::new(0),
             // Compiled bytecode cache (bd-1dp9.6.7.2.2)
             compiled_cache: RefCell::new(LruCache::new(default_statement_cache_capacity())),
+            rendered_statements: RefCell::new(RenderedStatements::default()),
             bypass_compiled_cache: Cell::new(false),
             scalar_subquery_row_value_context: Cell::new(false),
             prepared_cache: RefCell::new(LruCache::new(default_statement_cache_capacity())),
@@ -38841,6 +38964,52 @@ impl Connection {
         entry
     }
 
+    /// The canonical text of a statement the dispatcher is about to compile,
+    /// with that text's compiled-cache key.
+    ///
+    /// With parameters bound, a tree equal to one of the last few of its
+    /// kind shares that one's text instead of being rendered again (see
+    /// [`RenderedStatements`]); `kind` picks the list. Equal trees render to
+    /// equal text, so the key and the collision check are what rendering
+    /// would have produced.
+    fn dispatch_statement_text<T>(
+        &self,
+        params: Option<&[SqliteValue]>,
+        tree: &T,
+        kind: impl FnOnce(&mut RenderedStatements) -> &mut Vec<RenderedStatement<T>>,
+    ) -> (DispatchStatementText, u64)
+    where
+        T: Clone + PartialEq + std::fmt::Display,
+    {
+        if params.is_none() {
+            let text = tree.to_string();
+            let key = Self::sql_hash(&text);
+            return (DispatchStatementText::Rendered(text), key);
+        }
+        let mut rendered = self.rendered_statements.borrow_mut();
+        let seen = kind(&mut rendered);
+        if let Some(position) = seen.iter().position(|entry| entry.tree == *tree) {
+            seen[..=position].rotate_right(1);
+            let entry = &seen[0];
+            return (
+                DispatchStatementText::Remembered(Rc::clone(&entry.text)),
+                entry.key,
+            );
+        }
+        let text: Rc<str> = Rc::from(tree.to_string());
+        let key = Self::sql_hash(&text);
+        seen.truncate(RENDERED_STATEMENTS_PER_KIND - 1);
+        seen.insert(
+            0,
+            RenderedStatement {
+                tree: tree.clone(),
+                text: Rc::clone(&text),
+                key,
+            },
+        );
+        (DispatchStatementText::Remembered(text), key)
+    }
+
     /// Compile a statement, using the compiled cache when possible.
     /// The `sql_key` is the hash of the canonical SQL text; `sql` is the
     /// canonical SQL text for collision safety.
@@ -41773,8 +41942,10 @@ impl Connection {
                         // parameter-sensitive literal lists before codegen.
                         // Use SelectStatement::to_string() directly to avoid
                         // cloning the entire AST into a Statement wrapper.
-                        let sql_text = rewritten.to_string();
-                        let sql_key = Self::sql_hash(&sql_text);
+                        let (sql_text, sql_key) =
+                            self.dispatch_statement_text(params, &rewritten, |seen| {
+                                &mut seen.selects
+                            });
                         arc_prog = lean_future(|| {
                             self.compile_with_cache(sql_key, &sql_text, async |conn| {
                                 conn.compile_table_select(&rewritten).await
@@ -42325,8 +42496,10 @@ impl Connection {
                     );
                     record_trace_span_created();
                     let _plan_guard = plan_span.enter();
-                    let sql_text = effective_update.to_string();
-                    let sql_key = Self::sql_hash(&sql_text);
+                    let (sql_text, sql_key) =
+                        self.dispatch_statement_text(params, &effective_update, |seen| {
+                            &mut seen.updates
+                        });
                     arc_prog = lean_future(|| {
                         self.compile_with_cache(sql_key, &sql_text, async |conn| {
                             conn.compile_table_update(&effective_update)
@@ -42817,8 +42990,10 @@ impl Connection {
                     );
                     record_trace_span_created();
                     let _plan_guard = plan_span.enter();
-                    let sql_text = effective_delete.to_string();
-                    let sql_key = Self::sql_hash(&sql_text);
+                    let (sql_text, sql_key) =
+                        self.dispatch_statement_text(params, &effective_delete, |seen| {
+                            &mut seen.deletes
+                        });
                     arc_prog = lean_future(|| {
                         self.compile_with_cache(sql_key, &sql_text, async |conn| {
                             conn.compile_table_delete(&effective_delete)
