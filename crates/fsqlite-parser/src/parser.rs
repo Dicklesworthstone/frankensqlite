@@ -3996,6 +3996,73 @@ mod tests {
         }
     }
 
+    /// bd-w4pr1.14: stock reads these keywords as column names at the start of
+    /// an expression (caut's `switch_log` table has a `rollback` column). It
+    /// does not for CAST or RAISE, which begin expressions; LIKE, GLOB and
+    /// REGEXP stay operators after an operand, and `(WITH ...)` a subquery.
+    #[test]
+    fn test_keywords_stock_reads_as_columns_at_expression_start() {
+        for name in [
+            "attach", "begin", "by", "detach", "explain", "for", "glob", "like", "regexp",
+            "rollback", "with",
+        ] {
+            let sql = format!("SELECT {name}, {name} + 1 FROM t WHERE {name} = 1");
+            let select = parse_full_select(&sql);
+            let SelectCore::Select { columns, .. } = &select.body.select else {
+                panic!("`{sql}` must parse as a plain SELECT");
+            };
+            assert!(
+                matches!(
+                    &columns[0],
+                    ResultColumn::Expr { expr: Expr::Column(column, _), alias: None }
+                        if column.table.is_none() && &*column.column == name
+                ),
+                "`{sql}` must read `{name}` as a column: {columns:?}"
+            );
+        }
+        for sql in ["SELECT cast FROM t", "SELECT raise FROM t"] {
+            parse_first_statement_with_tail(sql)
+                .expect_err("CAST and RAISE begin expressions, as in stock");
+        }
+        let operators = parse_full_select("SELECT a LIKE b, a GLOB b, a REGEXP b FROM t");
+        let SelectCore::Select { columns, .. } = &operators.body.select else {
+            panic!("operator SELECT must parse as a plain SELECT");
+        };
+        let ops: Vec<_> = columns
+            .iter()
+            .map(|column| match column {
+                ResultColumn::Expr {
+                    expr: Expr::Like { op, .. },
+                    ..
+                } => Some(*op),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ops,
+            vec![
+                Some(fsqlite_ast::LikeOp::Like),
+                Some(fsqlite_ast::LikeOp::Glob),
+                Some(fsqlite_ast::LikeOp::Regexp)
+            ],
+            "LIKE, GLOB and REGEXP after an operand stay operators: {columns:?}"
+        );
+        let subquery = parse_full_select("SELECT (WITH x AS (SELECT 1) SELECT * FROM x)");
+        let SelectCore::Select { columns, .. } = &subquery.body.select else {
+            panic!("scalar subquery must parse as a plain SELECT");
+        };
+        assert!(
+            matches!(
+                &columns[0],
+                ResultColumn::Expr {
+                    expr: Expr::Subquery(..),
+                    ..
+                }
+            ),
+            "`(WITH ...)` must stay a subquery: {columns:?}"
+        );
+    }
+
     #[test]
     fn test_hard_reserved_column_names_require_quoting_in_ddl() {
         for name in ["index", "nothing", "returning", "table", "transaction"] {

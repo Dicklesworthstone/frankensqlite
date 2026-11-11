@@ -2246,6 +2246,25 @@ impl<'a> ParseMachine<'a> {
             TokenKind::KwMatch if self.parser.at_kind(&TokenKind::LeftParen) => {
                 return self.start_function("match".to_owned(), token_span, min_bp);
             }
+            // Stock's grammar also falls back to an identifier for these
+            // keywords at the start of an expression, where nothing else can
+            // begin with them: `SELECT rollback FROM t` reads a column named
+            // `rollback`, which real schemas have (bd-w4pr1.14). CAST and RAISE
+            // do begin expressions and stay keywords, as in stock.
+            kind @ (TokenKind::KwAttach
+            | TokenKind::KwBegin
+            | TokenKind::KwBy
+            | TokenKind::KwDetach
+            | TokenKind::KwExplain
+            | TokenKind::KwFor
+            | TokenKind::KwGlob
+            | TokenKind::KwLike
+            | TokenKind::KwRegexp
+            | TokenKind::KwRollback
+            | TokenKind::KwWith) => {
+                let name = Arc::<str>::from(kw_to_str(&kind));
+                return self.identifier_or_function(name, token_span, min_bp);
+            }
             kind if is_nonreserved_kw(&kind) => {
                 let name = Arc::<str>::from(kw_to_str(&kind));
                 return self.identifier_or_function(name, token_span, min_bp);
