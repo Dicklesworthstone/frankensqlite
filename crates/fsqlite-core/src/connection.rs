@@ -135,6 +135,33 @@ pub use fsqlite_pager::pager::DatabaseImageReceipt;
 pub use fsqlite_pager::pager::WriteSetStats;
 use fsqlite_pager::traits::{MvccPager, TransactionHandle, TransactionMode};
 
+/// Box a future, building it in this function's stack frame.
+///
+/// In an unoptimized build every temporary gets its own stack slot, so
+/// `Box::pin(self.execute_x(..)).await` written in a large `async fn` reserves
+/// the full size of every future it boxes, summed over all of them:
+/// `execute_statement_dispatch_impl` reserved 2 MiB that way, more than the
+/// default thread stack (bd-w4pr1.28). Built here, a future's temporary lives
+/// only while this call runs. Optimized builds inline this to `Box::pin`.
+fn boxed_future<F: Future>(make: impl FnOnce() -> F) -> Pin<Box<F>> {
+    Box::pin(make())
+}
+
+/// [`boxed_future`] in builds with debug assertions, where it keeps an awaited
+/// future out of a large caller's stack frame; elsewhere the future is awaited
+/// inline exactly as `make().await`, with no allocation, so hot paths keep
+/// their release code. For futures a hot path awaits directly.
+#[cfg(debug_assertions)]
+fn lean_future<F: Future>(make: impl FnOnce() -> F) -> Pin<Box<F>> {
+    boxed_future(make)
+}
+
+#[cfg(not(debug_assertions))]
+#[inline]
+fn lean_future<F: Future>(make: impl FnOnce() -> F) -> F {
+    make()
+}
+
 /// GH#303: structured result of [`Connection::backup_exact_to`] — a byte-exact
 /// copy whose integrity has been verified against the source image receipt.
 ///
@@ -40792,10 +40819,15 @@ impl Connection {
     ) -> Result<Vec<Row>> {
         // Rare statement kinds await futures of 9-58 KB; boxing them keeps this
         // dispatcher (and every wrapper that embeds it) near its hot-path size.
-        if let Some(rows) = self
-            .maybe_execute_attached_target_statement(statement, params)
-            .await
-            .map_err(|error| self.remap_unknown_attached_schema_for_statement(error, statement))?
+        // They are built through `boxed_future` and hot-path futures through
+        // `lean_future`, so an unoptimized build does not reserve every one of
+        // them in this frame (bd-w4pr1.28).
+        if let Some(rows) =
+            lean_future(|| self.maybe_execute_attached_target_statement(statement, params))
+                .await
+                .map_err(|error| {
+                    self.remap_unknown_attached_schema_for_statement(error, statement)
+                })?
         {
             return Ok(rows);
         }
@@ -40856,7 +40888,7 @@ impl Connection {
         // normal table DML (which would fail "no such table" — a view has no
         // B-tree). bd-ffkpv.
         if let Some(rows) =
-            Box::pin(self.maybe_execute_instead_of_view_dml(statement, params)).await?
+            boxed_future(|| self.maybe_execute_instead_of_view_dml(statement, params)).await?
         {
             return Ok(rows);
         }
@@ -40894,12 +40926,12 @@ impl Connection {
         }
         match statement {
             Statement::CreateTable(create) => {
-                Box::pin(self.execute_create_table(create)).await?;
+                boxed_future(|| self.execute_create_table(create)).await?;
                 // 5D.4: Persistence now handled by pager WAL, not compat_persist.
                 Ok(Vec::new())
             }
             Statement::CreateVirtualTable(create_virtual) => {
-                Box::pin(self.execute_create_virtual_table(create_virtual)).await?;
+                boxed_future(|| self.execute_create_virtual_table(create_virtual)).await?;
                 // 5D.4: Persistence now handled by pager WAL, not compat_persist.
                 Ok(Vec::new())
             }
@@ -40967,26 +40999,28 @@ impl Connection {
                 // execute against a historical MemDatabase snapshot (#23).
                 if let Some(target) = extract_temporal_clause(select) {
                     self.log_mem_execution_fallback("select", "time_travel_snapshot")?;
-                    return Box::pin(self.execute_time_travel_select(select, params, &target)).await;
+                    return boxed_future(|| {
+                        self.execute_time_travel_select(select, params, &target)
+                    })
+                    .await;
                 }
                 // CTE (WITH clause): materialize as temporary tables.
                 if select.with.is_some() {
                     self.log_mem_execution_fallback("select", "with_clause_materialization")?;
-                    return Box::pin(self.execute_with_ctes(select, params)).await;
+                    return boxed_future(|| self.execute_with_ctes(select, params)).await;
                 }
                 // View expansion: materialize referenced views as temp tables.
                 if self.has_view_references(select) {
                     if let Some(flattened) = self.flatten_simple_view_select(select) {
-                        return Box::pin(
-                            self.execute_statement(&Statement::Select(flattened), params),
-                        )
-                        .await;
+                        let flattened = Statement::Select(flattened);
+                        return boxed_future(|| self.execute_statement(&flattened, params)).await;
                     }
                     self.log_mem_execution_fallback("select", "view_materialization")?;
-                    return Box::pin(self.execute_with_materialized_views(select, params)).await;
+                    return boxed_future(|| self.execute_with_materialized_views(select, params))
+                        .await;
                 }
                 if let Some(rows) =
-                    Box::pin(self.maybe_execute_attached_select(select, params)).await?
+                    boxed_future(|| self.maybe_execute_attached_select(select, params)).await?
                 {
                     return Ok(rows);
                 }
@@ -40995,11 +41029,11 @@ impl Connection {
                 // mixed fallback. The fallback executes a single SELECT body
                 // and would otherwise ignore the right-hand compound arms.
                 if !select.body.compounds.is_empty() {
-                    return self.execute_compound_select(select, params).await;
+                    return lean_future(|| self.execute_compound_select(select, params)).await;
                 }
                 if self.attached_select_requires_local_fallback(select)? {
                     self.log_mem_execution_fallback("select", "attached_mixed_select_fallback")?;
-                    let rewritten = self.rewrite_in_subqueries_select(select, params).await?;
+                    let rewritten = lean_future(|| self.rewrite_in_subqueries_select(select, params)).await?;
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
                     let limit_clause = bound.limit.take();
@@ -41008,11 +41042,9 @@ impl Connection {
                     // aggregates as scalars (NULL per row), and rejects a
                     // FROM-less body ("JOIN on non-SELECT core"), so only a
                     // join used to get the aggregate path.
-                    let mut rows = Box::pin(self.execute_interpreted_select_by_shape(
-                        cx,
-                        rewritten.as_ref(),
-                        &bound,
-                    ))
+                    let mut rows = boxed_future(|| {
+                        self.execute_interpreted_select_by_shape(cx, rewritten.as_ref(), &bound)
+                    })
                     .await?;
                     if let Some(limit) = limit_clause {
                         self.apply_limit_clause(&mut rows, &limit, None)?;
@@ -41025,8 +41057,10 @@ impl Connection {
                         "select",
                         "sqlite_schema_virtual_materialization",
                     )?;
-                    return Box::pin(self.execute_with_materialized_sqlite_schema(select, params))
-                        .await;
+                    return boxed_future(|| {
+                        self.execute_with_materialized_sqlite_schema(select, params)
+                    })
+                    .await;
                 }
                 // bd-z22mq: dispatch-cascade short-circuit. When the incoming
                 // statement is structurally identical to the memoized
@@ -41084,7 +41118,8 @@ impl Connection {
                 // by the outer ORDER BY, and VALUES-window expressions before
                 // the aggregate and generic expression-only fallbacks.
                 if expression_only_has_window_functions(select) {
-                    return self.execute_fromless_window_select(select, params).await;
+                    return lean_future(|| self.execute_fromless_window_select(select, params))
+                        .await;
                 }
                 // Stock rejects HAVING on a non-aggregate query at prepare time
                 // ("HAVING clause on a non-aggregate query"). A FROM-less SELECT
@@ -41115,7 +41150,7 @@ impl Connection {
                 // codegen cannot lower aggregate functions or GROUP BY.
                 if is_expression_only_select(select) && (implicit_aggregate || has_group_by(select))
                 {
-                    return self.execute_fromless_aggregate(select, params).await;
+                    return lean_future(|| self.execute_fromless_aggregate(select, params)).await;
                 }
                 // Expression-only SELECTs with WHERE, ORDER BY, scalar
                 // subqueries, or a LIMIT/OFFSET that requires runtime
@@ -41144,16 +41179,17 @@ impl Connection {
                 if implicit_aggregate
                     && !custom_implicit_aggregate
                     && self.select_join_aggregate_is_vdbe_candidate(select)
-                    && let Some(rows) =
-                        Box::pin(self.try_execute_join_aggregate_program(cx, select, params))
-                            .await?
+                    && let Some(rows) = boxed_future(|| {
+                        self.try_execute_join_aggregate_program(cx, select, params)
+                    })
+                    .await?
                 {
                     return Ok(rows);
                 }
                 // Check if this is an expression-only SELECT (no FROM clause).
                 if is_expression_only_select(select) {
                     // Fallback codegen: eagerly rewrite IN subqueries.
-                    let rewritten = self.rewrite_in_subqueries_select(select, params).await?;
+                    let rewritten = lean_future(|| self.rewrite_in_subqueries_select(select, params)).await?;
                     let plan_span = tracing::span!(
                         target: "fsqlite.plan",
                         tracing::Level::TRACE,
@@ -41167,15 +41203,18 @@ impl Connection {
                         compile_expression_select(rewritten.as_ref(), Arc::clone(&registry))?;
                     let op_cx = self.op_cx()?;
                     let page_size = page_size_from_pragma_state(self.pragma_state.borrow().page_size)?;
-                    let mut rows = execute_program_with_postprocess(
-                        &program,
-                        params,
-                        Some(&registry),
-                        Some(&self.collation_registry),
-                        &op_cx,
-                        Some(&build_expression_postprocess(rewritten.as_ref())),
-                        page_size,
-                    )
+                    let postprocess = build_expression_postprocess(rewritten.as_ref());
+                    let mut rows = lean_future(|| {
+                        execute_program_with_postprocess(
+                            &program,
+                            params,
+                            Some(&registry),
+                            Some(&self.collation_registry),
+                            &op_cx,
+                            Some(&postprocess),
+                            page_size,
+                        )
+                    })
                     .await?;
                     if distinct {
                         dedup_rows_collated(&mut rows, &distinct_collations, &distinct_coll_snap);
@@ -41186,8 +41225,10 @@ impl Connection {
                     // per-row evaluation of outer column refs unless the exact
                     // validated indexed COUNT(*) semijoin fast path applies.
                     self.log_mem_execution_fallback("select", "correlated_exists_fallback")?;
-                    Box::pin(self.execute_correlated_subquery_where_fallback(cx, select, params))
-                        .await
+                    boxed_future(|| {
+                        self.execute_correlated_subquery_where_fallback(cx, select, params)
+                    })
+                    .await
                 } else if select_has_unsupported_correlated_scalar_subquery(select, self)
                     && self
                         .select_uses_builtin_minmax_bare_tracking(select)
@@ -41212,8 +41253,10 @@ impl Connection {
                         "select",
                         "correlated_scalar_subquery_fallback",
                     )?;
-                    Box::pin(self.execute_correlated_subquery_where_fallback(cx, select, params))
-                        .await
+                    boxed_future(|| {
+                        self.execute_correlated_subquery_where_fallback(cx, select, params)
+                    })
+                    .await
                 } else if select_has_unsupported_correlated_exists_subquery(select, self)
                     && self
                         .select_uses_builtin_minmax_bare_tracking(select)
@@ -41229,8 +41272,10 @@ impl Connection {
                         "select",
                         "correlated_exists_subquery_fallback",
                     )?;
-                    Box::pin(self.execute_correlated_subquery_where_fallback(cx, select, params))
-                        .await
+                    boxed_future(|| {
+                        self.execute_correlated_subquery_where_fallback(cx, select, params)
+                    })
+                    .await
                 } else if select_has_in_subquery_operand_requiring_semantic_fallback(select, self) {
                     // Keep connection dispatch aligned with the native
                     // IN-probe admission boundary. A scalar subquery on the
@@ -41241,8 +41286,10 @@ impl Connection {
                         "select",
                         "in_subquery_operand_semantic_fallback",
                     )?;
-                    Box::pin(self.execute_correlated_subquery_where_fallback(cx, select, params))
-                        .await
+                    boxed_future(|| {
+                        self.execute_correlated_subquery_where_fallback(cx, select, params)
+                    })
+                    .await
                 } else if select_has_correlated_in_subquery(select, &self.schema.borrow()) {
                     // bd-zvk68: a correlated `x IN (SELECT ...)` predicate in the
                     // WHERE clause references outer columns and must be evaluated
@@ -41253,8 +41300,10 @@ impl Connection {
                     // (the InSet::Subquery arm). The correlated scalar `=` form is
                     // already handled in VDBE via emit_scalar_subquery.
                     self.log_mem_execution_fallback("select", "correlated_in_subquery_fallback")?;
-                    Box::pin(self.execute_correlated_subquery_where_fallback(cx, select, params))
-                        .await
+                    boxed_future(|| {
+                        self.execute_correlated_subquery_where_fallback(cx, select, params)
+                    })
+                    .await
                 } else if self.select_requires_grouped_window_pipeline(select) {
                     // Aggregation must finish before windows run, including
                     // JOIN/non-table/live-vtab and implicit-aggregate shapes.
@@ -41268,12 +41317,13 @@ impl Connection {
                     } else {
                         self.log_mem_execution_fallback("select", "group_by_window_fallback")?;
                     }
-                    let rewritten = self.rewrite_in_subqueries_select(select, params).await?;
+                    let rewritten = lean_future(|| self.rewrite_in_subqueries_select(select, params)).await?;
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
                     let limit_clause = bound.limit.take();
                     let mut rows =
-                        Box::pin(self.execute_group_by_window_select(cx, &bound, None)).await?;
+                        boxed_future(|| self.execute_group_by_window_select(cx, &bound, None))
+                            .await?;
                     if distinct {
                         dedup_rows_collated(&mut rows, &distinct_collations, &distinct_coll_snap);
                     }
@@ -41291,12 +41341,13 @@ impl Connection {
                     // GROUP BY (or implicit aggregation) + JOIN/non-table source/live vtab:
                     // materialize the join as a temp table, then GROUP BY on that.
                     self.log_mem_execution_fallback("select", "group_by_join_fallback")?;
-                    let rewritten = self.rewrite_in_subqueries_select(select, params).await?;
+                    let rewritten = lean_future(|| self.rewrite_in_subqueries_select(select, params)).await?;
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
                     let limit_clause = bound.limit.take();
                     let mut rows =
-                        Box::pin(self.execute_group_by_join_select(cx, &bound, None)).await?;
+                        boxed_future(|| self.execute_group_by_join_select(cx, &bound, None))
+                            .await?;
                     if distinct {
                         dedup_rows_collated(&mut rows, &distinct_collations, &distinct_coll_snap);
                     }
@@ -41306,11 +41357,12 @@ impl Connection {
                     Ok(rows)
                 } else if custom_implicit_aggregate {
                     self.log_mem_execution_fallback("select", "custom_aggregate_fallback")?;
-                    let rewritten = self.rewrite_in_subqueries_select(select, params).await?;
+                    let rewritten = lean_future(|| self.rewrite_in_subqueries_select(select, params)).await?;
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
                     let limit_clause = bound.limit.take();
-                    let mut rows = Box::pin(self.execute_group_by_select(&bound, None)).await?;
+                    let mut rows =
+                        boxed_future(|| self.execute_group_by_select(&bound, None)).await?;
                     if distinct {
                         dedup_rows_collated(&mut rows, &distinct_collations, &distinct_coll_snap);
                     }
@@ -41331,11 +41383,12 @@ impl Connection {
                     // (bd-6hoc8); route the rest to the grouped interpreter,
                     // which sources bare columns from that row.
                     self.log_mem_execution_fallback("select", "minmax_bare_tracking_fallback")?;
-                    let rewritten = self.rewrite_in_subqueries_select(select, params).await?;
+                    let rewritten = lean_future(|| self.rewrite_in_subqueries_select(select, params)).await?;
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
                     let limit_clause = bound.limit.take();
-                    let mut rows = Box::pin(self.execute_group_by_select(&bound, None)).await?;
+                    let mut rows =
+                        boxed_future(|| self.execute_group_by_select(&bound, None)).await?;
                     if distinct {
                         dedup_rows_collated(&mut rows, &distinct_collations, &distinct_coll_snap);
                     }
@@ -41348,15 +41401,17 @@ impl Connection {
                 {
                     // Eagerly rewrite IN subqueries before choosing the storage-compatible
                     // grouped-aggregate substrate or the connection-level fallback.
-                    let rewritten = self.rewrite_in_subqueries_select(select, params).await?;
+                    let rewritten = lean_future(|| self.rewrite_in_subqueries_select(select, params)).await?;
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
-                    if let Some(mut rows) = Box::pin(self.try_execute_group_by_storage_substrate(
-                        cx,
-                        &bound,
-                        None,
-                        "group_by_storage_substrate",
-                    ))
+                    if let Some(mut rows) = boxed_future(|| {
+                        self.try_execute_group_by_storage_substrate(
+                            cx,
+                            &bound,
+                            None,
+                            "group_by_storage_substrate",
+                        )
+                    })
                     .await?
                     {
                         if distinct {
@@ -41370,7 +41425,8 @@ impl Connection {
                     }
                     self.log_mem_execution_fallback("select", "group_by_fallback")?;
                     let limit_clause = bound.limit.take();
-                    let mut rows = Box::pin(self.execute_group_by_select(&bound, None)).await?;
+                    let mut rows =
+                        boxed_future(|| self.execute_group_by_select(&bound, None)).await?;
                     if distinct {
                         dedup_rows_collated(&mut rows, &distinct_collations, &distinct_coll_snap);
                     }
@@ -41389,11 +41445,11 @@ impl Connection {
                     } else {
                         self.log_mem_execution_fallback("select", "window_function_fallback")?;
                     }
-                    let rewritten = self.rewrite_in_subqueries_select(select, params).await?;
+                    let rewritten = lean_future(|| self.rewrite_in_subqueries_select(select, params)).await?;
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
                     let limit_clause = bound.limit.take();
-                    let mut rows = Box::pin(self.execute_window_select(&bound, None)).await?;
+                    let mut rows = boxed_future(|| self.execute_window_select(&bound, None)).await?;
                     if distinct {
                         dedup_rows_collated(&mut rows, &distinct_collations, &distinct_coll_snap);
                     }
@@ -41407,7 +41463,7 @@ impl Connection {
                     // scans through the connection fallback, which can drive
                     // the registered vtab instance directly.
                     self.log_mem_execution_fallback("select", "live_vtab_select_fallback")?;
-                    let rewritten = self.rewrite_in_subqueries_select(select, params).await?;
+                    let rewritten = lean_future(|| self.rewrite_in_subqueries_select(select, params)).await?;
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
                     let limit_clause = bound.limit.take();
@@ -41417,7 +41473,7 @@ impl Connection {
                     {
                         return Ok(Vec::new());
                     }
-                    let mut rows = Box::pin(self.execute_join_select(&bound, None)).await?;
+                    let mut rows = boxed_future(|| self.execute_join_select(&bound, None)).await?;
                     if let Some(limit) = limit_clause {
                         self.apply_limit_clause(&mut rows, &limit, None)?;
                     }
@@ -41444,7 +41500,7 @@ impl Connection {
 
                     // Fallback path: eagerly rewrite IN subqueries.
                     // Also handles derived tables even without explicit JOINs.
-                    let rewritten = self.rewrite_in_subqueries_select(select, params).await?;
+                    let rewritten = lean_future(|| self.rewrite_in_subqueries_select(select, params)).await?;
                     let native_join_dispatch =
                         self.can_execute_join_select_on_real_backend(rewritten.as_ref());
                     if !native_join_dispatch {
@@ -41470,7 +41526,7 @@ impl Connection {
                         return Ok(Vec::new());
                     }
                     let started = Instant::now();
-                    let mut rows = Box::pin(self.execute_join_select(&bound, None)).await?;
+                    let mut rows = boxed_future(|| self.execute_join_select(&bound, None)).await?;
                     if native_join_dispatch {
                         let elapsed_ns =
                             u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -41482,7 +41538,7 @@ impl Connection {
                     Ok(rows)
                 } else if has_table_function_source(select) {
                     self.log_mem_execution_fallback("select", "join_or_subquery_fallback")?;
-                    let rewritten = self.rewrite_in_subqueries_select(select, params).await?;
+                    let rewritten = lean_future(|| self.rewrite_in_subqueries_select(select, params)).await?;
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
                     let limit_clause = bound.limit.take();
@@ -41492,7 +41548,7 @@ impl Connection {
                     {
                         return Ok(Vec::new());
                     }
-                    let mut rows = Box::pin(self.execute_join_select(&bound, None)).await?;
+                    let mut rows = boxed_future(|| self.execute_join_select(&bound, None)).await?;
                     if let Some(limit) = limit_clause {
                         self.apply_limit_clause(&mut rows, &limit, None)?;
                     }
@@ -41503,7 +41559,7 @@ impl Connection {
                     // (which only opens one table cursor). Route through the
                     // connection-level fallback which can inline-evaluate them.
                     self.log_mem_execution_fallback("select", "correlated_join_subquery_fallback")?;
-                    let rewritten = self.rewrite_in_subqueries_select(select, params).await?;
+                    let rewritten = lean_future(|| self.rewrite_in_subqueries_select(select, params)).await?;
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
                     let limit_clause = bound.limit.take();
@@ -41513,7 +41569,7 @@ impl Connection {
                     {
                         return Ok(Vec::new());
                     }
-                    let mut rows = Box::pin(self.execute_join_select(&bound, None)).await?;
+                    let mut rows = boxed_future(|| self.execute_join_select(&bound, None)).await?;
                     if let Some(limit) = limit_clause {
                         self.apply_limit_clause(&mut rows, &limit, None)?;
                     }
@@ -41558,9 +41614,9 @@ impl Connection {
                         || self.has_implicit_aggregation_with_registry(&bound)
                         || has_ordered_aggregate(&bound)
                     {
-                        Box::pin(self.execute_group_by_join_select(cx, &bound, None)).await?
+                        boxed_future(|| self.execute_group_by_join_select(cx, &bound, None)).await?
                     } else {
-                        Box::pin(self.execute_join_select(&bound, None)).await?
+                        boxed_future(|| self.execute_join_select(&bound, None)).await?
                     };
                     if let Some(limit) = limit_clause {
                         self.apply_limit_clause(&mut rows, &limit, None)?;
@@ -41575,7 +41631,8 @@ impl Connection {
                         // cannot handle. Supported probes must retain their
                         // AST so ORDER/LIMIT staging, volatile projections,
                         // and RHS collation metadata reach codegen intact.
-                        let rewritten = self.rewrite_subqueries(select, params).await?;
+                        let rewritten =
+                            lean_future(|| self.rewrite_subqueries(select, params)).await?;
                         if let Some(rows) = self.try_direct_count_star_in_list(&rewritten)? {
                             return Ok(rows);
                         }
@@ -41594,11 +41651,12 @@ impl Connection {
                         // cloning the entire AST into a Statement wrapper.
                         let sql_text = rewritten.to_string();
                         let sql_key = Self::sql_hash(&sql_text);
-                        arc_prog = self
-                            .compile_with_cache(sql_key, &sql_text, async |conn| {
+                        arc_prog = lean_future(|| {
+                            self.compile_with_cache(sql_key, &sql_text, async |conn| {
                                 conn.compile_table_select(&rewritten).await
                             })
-                            .await?;
+                        })
+                        .await?;
                         &arc_prog
                     };
 
@@ -41609,8 +41667,8 @@ impl Connection {
                             .map(|source| (source, "derived_source_flattened_vdbe_storage_cursors"))
                     };
                     let vdbe_storage_started = vdbe_storage_log_select.is_some().then(Instant::now);
-                    let (mut rows, _, _) = self
-                        .execute_table_program_with_cx(
+                    let (mut rows, _, _) = lean_future(|| {
+                        self.execute_table_program_with_cx(
                             program,
                             params,
                             false,
@@ -41618,7 +41676,8 @@ impl Connection {
                             cx,
                             false,
                         )
-                        .await?;
+                    })
+                    .await?;
                     if let (Some((log_select, decision_reason)), Some(started)) =
                         (vdbe_storage_log_select, vdbe_storage_started)
                     {
@@ -41707,14 +41766,9 @@ impl Connection {
                 }
             }
             Statement::Insert(insert) => {
-                Box::pin(self.execute_insert_dispatch(
-                    cx,
-                    statement,
-                    insert,
-                    params,
-                    precompiled,
-                    None,
-                ))
+                boxed_future(|| {
+                    self.execute_insert_dispatch(cx, statement, insert, params, precompiled, None)
+                })
                 .await
             }
             Statement::Update(update) => {
@@ -41722,7 +41776,8 @@ impl Connection {
                     && is_sqlite_schema_name(&update.table.name.name)
                 {
                     let affected =
-                        Box::pin(self.execute_writable_schema_update(update, params)).await?;
+                        boxed_future(|| self.execute_writable_schema_update(update, params))
+                            .await?;
                     self.record_statement_changes(affected);
                     return Ok(Vec::new());
                 }
@@ -41740,12 +41795,12 @@ impl Connection {
                 // then execute the UPDATE with the WITH clause stripped.
                 if update.with.is_some() {
                     self.log_mem_execution_fallback("update", "with_clause_materialization")?;
-                    return Box::pin(self.execute_update_with_ctes(update, params)).await;
+                    return boxed_future(|| self.execute_update_with_ctes(update, params)).await;
                 }
                 let canonical_update = canonicalize_update_placeholders(update)?;
-                let (mut effective_update, _limited_row_count_hint) = self
-                    .materialize_update_limit_scope(&canonical_update, params)
-                    .await?;
+                let (mut effective_update, _limited_row_count_hint) =
+                    lean_future(|| self.materialize_update_limit_scope(&canonical_update, params))
+                        .await?;
                 // A correlated subquery inside `IN (...)` in the WHERE cannot be
                 // lowered by VDBE codegen; resolve the matching rowids via the
                 // interpreted SELECT path and rewrite to `rowid IN (...)` so the
@@ -41755,13 +41810,15 @@ impl Connection {
                     if self.has_live_vtab_instance(&effective_update.table.name.name) {
                         None
                     } else {
-                        self.rewrite_correlated_in_where_to_rowids(
-                            &effective_update.table,
-                            effective_update.where_clause.as_ref(),
-                            &effective_update.order_by,
-                            effective_update.limit.as_ref(),
-                            params,
-                        )
+                        lean_future(|| {
+                            self.rewrite_correlated_in_where_to_rowids(
+                                &effective_update.table,
+                                effective_update.where_clause.as_ref(),
+                                &effective_update.order_by,
+                                effective_update.limit.as_ref(),
+                                params,
+                            )
+                        })
                         .await?
                     };
                 if let Some(rewritten) = corr_in_rewrite {
@@ -41798,7 +41855,8 @@ impl Connection {
                         ));
                     }
                     let affected =
-                        Box::pin(self.execute_live_vtab_update(&effective_update, params)).await?;
+                        boxed_future(|| self.execute_live_vtab_update(&effective_update, params))
+                            .await?;
                     self.record_statement_changes(affected);
                     return Ok(Vec::new());
                 }
@@ -41884,15 +41942,19 @@ impl Connection {
                 let replay_locators = if !needs_row_by_row_replay {
                     None
                 } else if effective_update.from.is_some() {
-                    self.materialize_update_from_replay_locators(&effective_update, params)
-                        .await?
-                        .map(|(columns, set_columns, rows)| (columns, Some(set_columns), rows))
+                    lean_future(|| {
+                        self.materialize_update_from_replay_locators(&effective_update, params)
+                    })
+                    .await?
+                    .map(|(columns, set_columns, rows)| (columns, Some(set_columns), rows))
                 } else {
-                    self.materialize_dml_replay_locators(
-                        &effective_update.table,
-                        effective_update.where_clause.as_ref(),
-                        params,
-                    )
+                    lean_future(|| {
+                        self.materialize_dml_replay_locators(
+                            &effective_update.table,
+                            effective_update.where_clause.as_ref(),
+                            params,
+                        )
+                    })
                     .await?
                     .map(|(columns, rows)| (columns, None, rows))
                 };
@@ -41934,12 +41996,9 @@ impl Connection {
                         }
                         None => DmlRowReplay::Update(&effective_update),
                     };
-                    return Box::pin(self.execute_dml_row_by_row(
-                        replay,
-                        params,
-                        &locator_columns,
-                        &locator_rows,
-                    ))
+                    return boxed_future(|| {
+                        self.execute_dml_row_by_row(replay, params, &locator_columns, &locator_rows)
+                    })
                     .await;
                 }
                 if returning_projection.is_some() {
@@ -41953,8 +42012,10 @@ impl Connection {
                 // ordinary UPDATE leaves the rowid unchanged, so the same rowid is
                 // passed as both OLD and NEW. (GH #205)
                 let mut trigger_rows = if has_before_update || has_after_update {
-                    self.collect_update_trigger_rows_with_rowids(&effective_update, params)
-                        .await?
+                    lean_future(|| {
+                        self.collect_update_trigger_rows_with_rowids(&effective_update, params)
+                    })
+                    .await?
                 } else {
                     Vec::new()
                 };
@@ -41979,14 +42040,16 @@ impl Connection {
                     let mut non_ignored_rows = Vec::with_capacity(trigger_rows.len());
                     let mut ignored_any = false;
                     for (row_rowid, old_values, new_values) in &trigger_rows {
-                        if Box::pin(self.fire_before_triggers(
-                            table_name,
-                            &update_event,
-                            Some(old_values),
-                            Some(new_values),
-                            *row_rowid,
-                            *row_rowid,
-                        ))
+                        if boxed_future(|| {
+                            self.fire_before_triggers(
+                                table_name,
+                                &update_event,
+                                Some(old_values),
+                                Some(new_values),
+                                *row_rowid,
+                                *row_rowid,
+                            )
+                        })
                         .await?
                         {
                             ignored_any = true;
@@ -42079,7 +42142,7 @@ impl Connection {
                             .map(|(_rowid, old, new)| (old.clone(), new.clone()))
                             .collect::<Vec<_>>()
                     } else {
-                        self.collect_update_trigger_rows(&effective_update, params)
+                        lean_future(|| self.collect_update_trigger_rows(&effective_update, params))
                             .await?
                     };
                     let modified_child_keys =
@@ -42088,20 +42151,23 @@ impl Connection {
                         // Parent-side: if this table is referenced by children,
                         // check that changing FK-referenced values doesn't orphan them.
                         // Use ON UPDATE actions (not ON DELETE) for UPDATE statements.
-                        let fk_actions =
-                            Box::pin(self.check_fk_on_update(table_name, old_values, new_values))
-                                .await?;
+                        let fk_actions = boxed_future(|| {
+                            self.check_fk_on_update(table_name, old_values, new_values)
+                        })
+                        .await?;
                         pending_fk_actions.extend(fk_actions);
                         // Child-side: validate new FK values against parent tables,
                         // for the keys whose child columns this UPDATE assigns.
                         // Only check when NOT inside a cascade action, because
                         // the cascade itself is modifying parent data.
                         if self.fk_enforcement_enabled() && !modified_child_keys.is_empty() {
-                            Box::pin(self.check_fk_parent_exists_for_keys(
-                                table_name,
-                                new_values,
-                                Some(&modified_child_keys),
-                            ))
+                            boxed_future(|| {
+                                self.check_fk_parent_exists_for_keys(
+                                    table_name,
+                                    new_values,
+                                    Some(&modified_child_keys),
+                                )
+                            })
                             .await?;
                         }
                     }
@@ -42137,15 +42203,16 @@ impl Connection {
                     let _plan_guard = plan_span.enter();
                     let sql_text = effective_update.to_string();
                     let sql_key = Self::sql_hash(&sql_text);
-                    arc_prog = self
-                        .compile_with_cache(sql_key, &sql_text, async |conn| {
+                    arc_prog = lean_future(|| {
+                        self.compile_with_cache(sql_key, &sql_text, async |conn| {
                             conn.compile_table_update(&effective_update)
                         })
-                        .await?;
+                    })
+                    .await?;
                     &arc_prog
                 };
-                let (rows, affected, _) = self
-                    .execute_table_program_with_cx(
+                let (rows, affected, _) = lean_future(|| {
+                    self.execute_table_program_with_cx(
                         program,
                         params,
                         false,
@@ -42153,12 +42220,13 @@ impl Connection {
                         cx,
                         true,
                     )
-                    .await?;
+                })
+                .await?;
 
                 // UPDATE OR REPLACE may implicitly delete a different row.
                 // Apply inbound FK effects for that exact victim before the
                 // existing parent UPDATE actions and AFTER UPDATE processing.
-                Box::pin(self.enforce_fk_on_replace_victims(table_name)).await?;
+                boxed_future(|| self.enforce_fk_on_replace_victims(table_name)).await?;
 
                 // bd-c1vth: when the program updated no row (UPDATE OR IGNORE
                 // skipped it on a conflict, or a BEFORE trigger removed it), no
@@ -42173,11 +42241,11 @@ impl Connection {
                 // SQLite's FK programs observe the updated parent row and run
                 // before the parent's AFTER UPDATE triggers.
                 for action in &pending_fk_actions {
-                    Box::pin(self.execute_fk_update_action(action)).await?;
+                    boxed_future(|| self.execute_fk_update_action(action)).await?;
                 }
 
                 let rows = if let Some(projection) = &returning_projection {
-                    Box::pin(self.project_dml_returning(projection, rows, params)).await?
+                    boxed_future(|| self.project_dml_returning(projection, rows, params)).await?
                 } else {
                     rows
                 };
@@ -42185,14 +42253,16 @@ impl Connection {
                 // Phase 5G.3: Fire AFTER UPDATE triggers.
                 if has_after_update && !no_row_updated {
                     for (row_rowid, old_values, new_values) in &trigger_rows {
-                        if let Err(error) = Box::pin(self.fire_after_triggers(
-                            table_name,
-                            &update_event,
-                            Some(old_values),
-                            Some(new_values),
-                            *row_rowid,
-                            *row_rowid,
-                        ))
+                        if let Err(error) = boxed_future(|| {
+                            self.fire_after_triggers(
+                                table_name,
+                                &update_event,
+                                Some(old_values),
+                                Some(new_values),
+                                *row_rowid,
+                                *row_rowid,
+                            )
+                        })
                         .await
                         {
                             self.record_after_trigger_error_state(affected, None);
@@ -42214,7 +42284,8 @@ impl Connection {
                     && is_sqlite_schema_name(&delete.table.name.name)
                 {
                     let affected =
-                        Box::pin(self.execute_writable_schema_delete(delete, params)).await?;
+                        boxed_future(|| self.execute_writable_schema_delete(delete, params))
+                            .await?;
                     self.record_statement_changes(affected);
                     return Ok(Vec::new());
                 }
@@ -42232,10 +42303,10 @@ impl Connection {
                 // then execute the DELETE with the WITH clause stripped.
                 if delete.with.is_some() {
                     self.log_mem_execution_fallback("delete", "with_clause_materialization")?;
-                    return Box::pin(self.execute_delete_with_ctes(delete, params)).await;
+                    return boxed_future(|| self.execute_delete_with_ctes(delete, params)).await;
                 }
                 let (mut effective_delete, _limited_row_count_hint) =
-                    self.materialize_delete_limit_scope(delete, params).await?;
+                    lean_future(|| self.materialize_delete_limit_scope(delete, params)).await?;
                 // If the DELETE's WHERE contains a correlated EXISTS subquery,
                 // collect matching rowids via connection-level evaluation (which
                 // correctly substitutes outer refs per row) and rewrite the WHERE
@@ -42266,13 +42337,14 @@ impl Connection {
                         &effective_delete.table.name.name,
                         &self.schema.borrow(),
                     )
-                }) && let Some((locator_columns, locator_rows)) = self
-                    .materialize_dml_replay_locators(
+                }) && let Some((locator_columns, locator_rows)) = lean_future(|| {
+                    self.materialize_dml_replay_locators(
                         &effective_delete.table,
                         effective_delete.where_clause.as_ref(),
                         params,
                     )
-                    .await?
+                })
+                .await?
                 {
                     // bd-ntt2b: freeze each matching row by its locator (the
                     // rowid or INTEGER PRIMARY KEY, or the full WITHOUT ROWID
@@ -42297,13 +42369,15 @@ impl Connection {
                     if self.has_live_vtab_instance(&effective_delete.table.name.name) {
                         None
                     } else {
-                        self.rewrite_correlated_in_where_to_rowids(
-                            &effective_delete.table,
-                            effective_delete.where_clause.as_ref(),
-                            &effective_delete.order_by,
-                            effective_delete.limit.as_ref(),
-                            params,
-                        )
+                        lean_future(|| {
+                            self.rewrite_correlated_in_where_to_rowids(
+                                &effective_delete.table,
+                                effective_delete.where_clause.as_ref(),
+                                &effective_delete.order_by,
+                                effective_delete.limit.as_ref(),
+                                params,
+                            )
+                        })
                         .await?
                     };
                 if let Some(rewritten) = corr_in_rewrite {
@@ -42353,13 +42427,14 @@ impl Connection {
                         effective_delete.where_clause.as_ref(),
                     )
                 {
-                    let Some((locator_columns, locator_rows)) = self
-                        .materialize_dml_replay_locators(
+                    let Some((locator_columns, locator_rows)) = lean_future(|| {
+                        self.materialize_dml_replay_locators(
                             &effective_delete.table,
                             effective_delete.where_clause.as_ref(),
                             params,
                         )
-                        .await?
+                    })
+                    .await?
                     else {
                         return Err(FrankenError::NotImplemented(
                             "correlated DELETE RETURNING requires an addressable row key"
@@ -42370,12 +42445,14 @@ impl Connection {
                         "delete",
                         "delete_row_by_row_correlated_returning_fallback",
                     )?;
-                    return Box::pin(self.execute_dml_row_by_row(
-                        DmlRowReplay::Delete(&effective_delete),
-                        params,
-                        &locator_columns,
-                        &locator_rows,
-                    ))
+                    return boxed_future(|| {
+                        self.execute_dml_row_by_row(
+                            DmlRowReplay::Delete(&effective_delete),
+                            params,
+                            &locator_columns,
+                            &locator_rows,
+                        )
+                    })
                     .await;
                 }
                 // bd-5pt42: stock SQLite deletes a multi-row target one row at a
@@ -42394,25 +42471,28 @@ impl Connection {
                         has_before_delete,
                         has_after_delete,
                     )
-                    && let Some((locator_columns, locator_rows)) = self
-                        .materialize_dml_replay_locators(
+                    && let Some((locator_columns, locator_rows)) = lean_future(|| {
+                        self.materialize_dml_replay_locators(
                             &effective_delete.table,
                             effective_delete.where_clause.as_ref(),
                             params,
                         )
-                        .await?
+                    })
+                    .await?
                     && locator_rows.len() > 1
                 {
                     self.log_mem_execution_fallback(
                         "delete",
                         "delete_row_by_row_trigger_fallback",
                     )?;
-                    return Box::pin(self.execute_dml_row_by_row(
-                        DmlRowReplay::Delete(&effective_delete),
-                        params,
-                        &locator_columns,
-                        &locator_rows,
-                    ))
+                    return boxed_future(|| {
+                        self.execute_dml_row_by_row(
+                            DmlRowReplay::Delete(&effective_delete),
+                            params,
+                            &locator_columns,
+                            &locator_rows,
+                        )
+                    })
                     .await;
                 }
                 if let Some(projection) = &returning_projection {
@@ -42423,7 +42503,7 @@ impl Connection {
                     effective_delete.returning = projection.snapshot_columns.clone();
                 }
                 let mut trigger_old_rows = if has_before_delete || has_after_delete {
-                    self.collect_delete_trigger_rows(&effective_delete, params)
+                    lean_future(|| self.collect_delete_trigger_rows(&effective_delete, params))
                         .await?
                 } else {
                     Vec::new()
@@ -42464,14 +42544,16 @@ impl Connection {
                     let mut non_ignored_rows = Vec::with_capacity(trigger_old_rows.len());
                     let mut ignored_any = false;
                     for (old_rowid, old_values) in &trigger_old_rows {
-                        if Box::pin(self.fire_before_triggers(
-                            table_name,
-                            &delete_event,
-                            Some(old_values),
-                            None,
-                            *old_rowid,
-                            None,
-                        ))
+                        if boxed_future(|| {
+                            self.fire_before_triggers(
+                                table_name,
+                                &delete_event,
+                                Some(old_values),
+                                None,
+                                *old_rowid,
+                                None,
+                            )
+                        })
                         .await?
                         {
                             ignored_any = true;
@@ -42531,13 +42613,14 @@ impl Connection {
                     let rows_to_check = if !trigger_old_rows.is_empty() {
                         trigger_old_rows.clone()
                     } else {
-                        self.collect_delete_trigger_rows(&effective_delete, params)
+                        lean_future(|| self.collect_delete_trigger_rows(&effective_delete, params))
                             .await?
                     };
                     let mut actions = Vec::new();
                     for (_rowid, row_values) in &rows_to_check {
                         actions.extend(
-                            Box::pin(self.check_fk_on_delete(table_name, row_values)).await?,
+                            boxed_future(|| self.check_fk_on_delete(table_name, row_values))
+                                .await?,
                         );
                     }
                     actions
@@ -42564,23 +42647,26 @@ impl Connection {
                         ));
                     }
                     let affected =
-                        Box::pin(self.execute_live_vtab_delete(&effective_delete, params)).await?;
+                        boxed_future(|| self.execute_live_vtab_delete(&effective_delete, params))
+                            .await?;
 
                     for action in &pending_fk_actions {
-                        Box::pin(self.execute_fk_delete_action(action)).await?;
+                        boxed_future(|| self.execute_fk_delete_action(action)).await?;
                     }
 
                     // Phase 5G.3: Fire AFTER DELETE triggers.
                     if has_after_delete {
                         for (old_rowid, old_values) in &trigger_old_rows {
-                            if let Err(error) = Box::pin(self.fire_after_triggers(
-                                table_name,
-                                &delete_event,
-                                Some(old_values),
-                                None,
-                                *old_rowid,
-                                None,
-                            ))
+                            if let Err(error) = boxed_future(|| {
+                                self.fire_after_triggers(
+                                    table_name,
+                                    &delete_event,
+                                    Some(old_values),
+                                    None,
+                                    *old_rowid,
+                                    None,
+                                )
+                            })
                             .await
                             {
                                 self.record_after_trigger_error_state(affected, None);
@@ -42609,15 +42695,16 @@ impl Connection {
                     let _plan_guard = plan_span.enter();
                     let sql_text = effective_delete.to_string();
                     let sql_key = Self::sql_hash(&sql_text);
-                    arc_prog = self
-                        .compile_with_cache(sql_key, &sql_text, async |conn| {
+                    arc_prog = lean_future(|| {
+                        self.compile_with_cache(sql_key, &sql_text, async |conn| {
                             conn.compile_table_delete(&effective_delete)
                         })
-                        .await?;
+                    })
+                    .await?;
                     &arc_prog
                 };
-                let (rows, affected, _) = self
-                    .execute_table_program_with_cx(
+                let (rows, affected, _) = lean_future(|| {
+                    self.execute_table_program_with_cx(
                         program,
                         params,
                         false,
@@ -42625,14 +42712,15 @@ impl Connection {
                         cx,
                         true,
                     )
-                    .await?;
+                })
+                .await?;
 
                 for action in &pending_fk_actions {
-                    Box::pin(self.execute_fk_delete_action(action)).await?;
+                    boxed_future(|| self.execute_fk_delete_action(action)).await?;
                 }
 
                 let rows = if let Some(projection) = &returning_projection {
-                    Box::pin(self.project_dml_returning(projection, rows, params)).await?
+                    boxed_future(|| self.project_dml_returning(projection, rows, params)).await?
                 } else {
                     rows
                 };
@@ -42642,14 +42730,16 @@ impl Connection {
                 // and, as in stock, fires no AFTER trigger.
                 if has_after_delete && !(affected == 0 && trigger_old_rows.len() == 1) {
                     for (old_rowid, old_values) in &trigger_old_rows {
-                        if let Err(error) = Box::pin(self.fire_after_triggers(
-                            table_name,
-                            &delete_event,
-                            Some(old_values),
-                            None,
-                            *old_rowid,
-                            None,
-                        ))
+                        if let Err(error) = boxed_future(|| {
+                            self.fire_after_triggers(
+                                table_name,
+                                &delete_event,
+                                Some(old_values),
+                                None,
+                                *old_rowid,
+                                None,
+                            )
+                        })
                         .await
                         {
                             self.record_after_trigger_error_state(affected, None);
@@ -42667,64 +42757,64 @@ impl Connection {
                 }
             }
             Statement::Begin(begin) => {
-                Box::pin(self.execute_begin(*begin)).await?;
+                boxed_future(|| self.execute_begin(*begin)).await?;
                 Ok(Vec::new())
             }
             Statement::Commit => {
-                Box::pin(self.execute_commit_with_attached_participants(cx)).await?;
+                boxed_future(|| self.execute_commit_with_attached_participants(cx)).await?;
                 Ok(Vec::new())
             }
             Statement::Rollback(rb) => {
-                Box::pin(self.execute_rollback_with_cx(cx, rb)).await?;
+                boxed_future(|| self.execute_rollback_with_cx(cx, rb)).await?;
                 // 5D.4: Persistence now handled by pager WAL, not compat_persist.
                 Ok(Vec::new())
             }
             Statement::Savepoint(name) => {
-                Box::pin(self.execute_savepoint_with_cx(cx, name)).await?;
+                boxed_future(|| self.execute_savepoint_with_cx(cx, name)).await?;
                 Ok(Vec::new())
             }
             Statement::Release(name) => {
-                Box::pin(self.execute_release_with_cx(cx, name)).await?;
+                boxed_future(|| self.execute_release_with_cx(cx, name)).await?;
                 Ok(Vec::new())
             }
-            Statement::Pragma(pragma) => Box::pin(self.execute_pragma(pragma)).await,
+            Statement::Pragma(pragma) => boxed_future(|| self.execute_pragma(pragma)).await,
             Statement::Drop(drop_stmt) => {
-                Box::pin(self.execute_drop(drop_stmt)).await?;
+                boxed_future(|| self.execute_drop(drop_stmt)).await?;
                 // 5D.4: Persistence now handled by pager WAL, not compat_persist.
                 Ok(Vec::new())
             }
             Statement::AlterTable(alter) => {
-                Box::pin(self.execute_alter_table(alter)).await?;
+                boxed_future(|| self.execute_alter_table(alter)).await?;
                 // 5D.4: Persistence now handled by pager WAL, not compat_persist.
                 Ok(Vec::new())
             }
             Statement::CreateIndex(create_idx) => {
-                Box::pin(self.execute_create_index(create_idx)).await?;
+                boxed_future(|| self.execute_create_index(create_idx)).await?;
                 // 5D.4: Persistence now handled by pager WAL, not compat_persist.
                 Ok(Vec::new())
             }
             Statement::CreateView(create_view) => {
-                Box::pin(self.execute_create_view(create_view)).await?;
+                boxed_future(|| self.execute_create_view(create_view)).await?;
                 Ok(Vec::new())
             }
             Statement::CreateTrigger(create_trigger) => {
-                Box::pin(self.execute_create_trigger(create_trigger)).await?;
+                boxed_future(|| self.execute_create_trigger(create_trigger)).await?;
                 Ok(Vec::new())
             }
             Statement::Vacuum(vacuum_stmt) => {
-                Box::pin(self.execute_vacuum(vacuum_stmt, params)).await?;
+                boxed_future(|| self.execute_vacuum(vacuum_stmt, params)).await?;
                 Ok(Vec::new())
             }
             Statement::Analyze(target) => {
-                Box::pin(self.execute_analyze(target.as_ref())).await?;
+                boxed_future(|| self.execute_analyze(target.as_ref())).await?;
                 Ok(Vec::new())
             }
             Statement::Reindex(target) => {
-                Box::pin(self.execute_reindex(target.as_ref())).await?;
+                boxed_future(|| self.execute_reindex(target.as_ref())).await?;
                 Ok(Vec::new())
             }
             Statement::Explain { query_plan, stmt } => {
-                Box::pin(self.execute_explain(stmt, *query_plan, params)).await
+                boxed_future(|| self.execute_explain(stmt, *query_plan, params)).await
             }
             Statement::Attach(attach) => {
                 // bd-wymdl.3: never mutate the attached-database registry while
@@ -42781,15 +42871,12 @@ impl Connection {
                 let attach_env = self.attach_env.clone().with_bootstrap_cx(self.op_cx()?);
                 let attached_connection = if self.pager.is_readonly() {
                     Box::new(
-                        Box::pin(Self::open_schema_only_with_env(
-                            path.clone(),
-                            attach_env,
-                        ))
-                        .await?,
+                        boxed_future(|| Self::open_schema_only_with_env(path.clone(), attach_env))
+                            .await?,
                     )
                 } else {
                     Box::new(
-                        Box::pin(Self::open_with_env(path.clone(), attach_env)).await?,
+                        boxed_future(|| Self::open_with_env(path.clone(), attach_env)).await?,
                     )
                 };
                 // bd-6n5cy stock-fidelity: SQLite refuses to attach a database
@@ -51072,7 +51159,7 @@ impl Connection {
         select: &SelectStatement,
         params: Option<&[SqliteValue]>,
     ) -> Result<Vec<Row>> {
-        let rewritten = self.rewrite_in_subqueries_select(select, params).await?;
+        let rewritten = lean_future(|| self.rewrite_in_subqueries_select(select, params)).await?;
         let mut bound = bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
         let limit_clause = bound.limit.take();
         let mut rows = if self.select_requires_grouped_window_pipeline(&bound) {
@@ -76283,7 +76370,7 @@ impl Connection {
                 // stale recycled pages.
                 let _time_travel_guard = BoolCellRestoreGuard::new(&self.time_travel_active, true);
                 async {
-                    let rewritten = self.rewrite_in_subqueries_select(select, params).await?;
+                    let rewritten = lean_future(|| self.rewrite_in_subqueries_select(select, params)).await?;
                     let bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
                     self.execute_interpreted_select_by_shape(&cx, rewritten.as_ref(), &bound)

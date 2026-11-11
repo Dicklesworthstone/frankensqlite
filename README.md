@@ -1448,18 +1448,25 @@ user-defined functions, online backup, blob I/O, hooks and the
 `chrono`/`uuid`/`serde_json` conversions are not there yet.
 
 Debug builds need a bigger thread stack than rusqlite. Unoptimized, the engine
-uses 3-4 MiB of stack for ordinary statements, more than the 2 MiB Rust gives
-spawned and test threads, so `cargo test` aborts with "has overflowed its
+uses up to 3 MiB of stack for ordinary statements, more than the 2 MiB Rust
+gives spawned and test threads, so `cargo test` aborts with "has overflowed its
 stack". Release builds run the same code in under 1 MiB. Until that is fixed
-(bd-w4pr1.28), raise the default in the application's `.cargo/config.toml`:
+(bd-w4pr1.28), either optimize dependencies in the application's dev profile:
+
+```toml
+[profile.dev.package."*"]
+opt-level = 2
+```
+
+or raise the default thread stack in the application's `.cargo/config.toml`:
 
 ```toml
 [env]
 RUST_MIN_STACK = "8388608"
 ```
 
-A thread created with an explicit `stack_size` needs at least 4 MiB in a debug
-build.
+With the second, a thread created with an explicit `stack_size` needs at least
+3 MiB in a debug build.
 
 ### Transaction API
 
