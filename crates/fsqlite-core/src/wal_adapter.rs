@@ -1427,7 +1427,17 @@ impl<F: VfsFile> WalBackendAdapter<F> {
             None
         } else {
             let index = usize::try_from(baseline.mx_frame - 1).map_err(|_| FrankenError::DatabaseFull)?;
-            Some((baseline.mx_frame, self.wal.read_frame_header(cx, index).await?))
+            // The refresh above has just confirmed this handle's generation
+            // and length against the file, and a generation's frames never
+            // change, so the commit marker this handle holds for that index is
+            // the one on disk: `prepare_native_publication` binds the same
+            // header to it for the append that follows. Any other index is
+            // read from the file.
+            let header = match self.wal.last_commit_frame_header() {
+                Some((cached_index, header)) if cached_index == index => header,
+                _ => self.wal.read_frame_header(cx, index).await?,
+            };
+            Some((baseline.mx_frame, header))
         };
         validate_shared_wal_index_wal_binding(&baseline, self.wal.header(), terminal)?;
         self.classify_unpublished_native_tail(cx, baseline, start).await?;
