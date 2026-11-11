@@ -2726,7 +2726,7 @@ const PRINTF_MAX_LENGTH: usize = 1_000_000_000;
 const PRINTF_FLOAT_PRECISION_CAP: usize = 100_000_000;
 
 /// Simplified SQLite format/printf implementation.
-/// Supports: %d, %f, %e, %g, %s, %q, %Q, %w, %%, %n (no-op).
+/// Supports: %d, %f, %e, %g, %s, %q, %Q, %w, %j, %J, %%, %n (no-op).
 ///
 /// Returns `Ok(None)` when the formatted result would reach `PRINTF_MAX_LENGTH`
 /// bytes; the caller reports that as SQLITE_TOOBIG (bd-mcgdb).
@@ -2869,12 +2869,9 @@ fn sqlite_format(fmt: &[u8], params: &[SqliteValue]) -> Result<Option<Vec<u8>>> 
             // an incomplete conversion. Stock SQLite STOPS here and returns the
             // output accumulated SO FAR — printf('x%5') == 'x', printf('ab%d%5', 0)
             // == 'ab0', printf(' %5') == ' ' — it does NOT NULL the whole call.
-            // Only when nothing was accumulated (printf('%5'), printf('%-')) does
-            // the empty result render as SQL NULL, matching how an empty StrAccum
-            // finishes (bd-printf-incomplete-conversion-edge).
-            if result.is_empty() {
-                return Ok(None);
-            }
+            // With nothing accumulated (printf('%5'), printf('%-')) the result is
+            // empty TEXT since 3.54, like any empty result; through 3.53 an empty
+            // StrAccum finished as NULL (bd-printf-incomplete-conversion-edge).
             break;
         }
 
@@ -3155,6 +3152,35 @@ fn sqlite_format(fmt: &[u8], params: &[SqliteValue]) -> Result<Option<Vec<u8>>> 
                     return Ok(None);
                 }
             }
+            // SQLite 3.54 %J / %j: the argument's text as a JSON string literal,
+            // with surrounding double quotes for %J and without for %j. A NULL
+            // or missing argument is `null` for %J and nothing for %j.
+            // Precision limits the input bytes (code points with `!`) before
+            // escaping, and width pads the rendered literal; other flags are
+            // ignored (printf.c etESCAPE_J).
+            'j' | 'J' => {
+                let param = params.get(param_idx);
+                param_idx += 1;
+                let mut rendered = Vec::new();
+                match param {
+                    Some(value) if !value.is_null() => {
+                        let bytes = value.text_bytes();
+                        let truncated = printf_text_prefix(&bytes, precision, alt_form2);
+                        if spec == 'J' {
+                            rendered.push(b'"');
+                        }
+                        push_json_string_bytes(&mut rendered, truncated);
+                        if spec == 'J' {
+                            rendered.push(b'"');
+                        }
+                    }
+                    _ if spec == 'J' => rendered.extend_from_slice(b"null"),
+                    _ => {}
+                }
+                if !append_printf_text(&mut result, &rendered, width, left_align, alt_form2) {
+                    return Ok(None);
+                }
+            }
             // %p (pointer) renders identically to %X in SQLite's SQL printf:
             // uppercase hex of the value's u64 bit pattern (255 -> "FF", -1 ->
             // "FFFFFFFFFFFFFFFF", non-integers coerced via to_integer).
@@ -3279,12 +3305,11 @@ fn sqlite_format(fmt: &[u8], params: &[SqliteValue]) -> Result<Option<Vec<u8>>> 
                 // as the field width): stock's sqlite3_str_vappendf stops at it
                 // and keeps the text accumulated so far (printf('x%a', 1) == 'x'),
                 // never emitting the raw `%<spec>`. Like an incomplete conversion,
-                // an empty accumulation finishes as SQL NULL. The supported set
-                // above is exactly SQLite's documented conversions
-                // (% n d i u f e E g G s z q Q w x X o c). bd-printf-unsupported-spec-null.
-                if result.is_empty() {
-                    return Ok(None);
-                }
+                // an empty accumulation is empty TEXT since 3.54 (NULL through
+                // 3.53). The supported set above is exactly SQLite's documented
+                // conversions (% n d i u f e E g G s z q Q w x X o c, and j J
+                // since 3.54).
+                // bd-printf-unsupported-spec-null.
                 break;
             }
         }
@@ -3348,6 +3373,34 @@ fn printf_text_prefix(bytes: &[u8], precision: Option<usize>, characters: bool) 
         }
     }
     &bytes[..end]
+}
+
+/// Append `bytes` escaped for the inside of a JSON string literal, as
+/// SQLite's printf %j/%J does: `"` and `\` get a backslash, the control bytes
+/// with short escapes use them (`\b \t \n \f \r`), the remaining bytes below
+/// 0x20 become `\u00xx` with lowercase hex, and every other byte, `/` and
+/// non-ASCII included, is copied as is.
+fn push_json_string_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for &byte in bytes {
+        match byte {
+            b'"' | b'\\' => out.extend_from_slice(&[b'\\', byte]),
+            0x08 => out.extend_from_slice(b"\\b"),
+            b'\t' => out.extend_from_slice(b"\\t"),
+            b'\n' => out.extend_from_slice(b"\\n"),
+            0x0C => out.extend_from_slice(b"\\f"),
+            b'\r' => out.extend_from_slice(b"\\r"),
+            0x00..=0x1F => out.extend_from_slice(&[
+                b'\\',
+                b'u',
+                b'0',
+                b'0',
+                HEX[usize::from(byte >> 4)],
+                HEX[usize::from(byte & 0x0F)],
+            ]),
+            _ => out.push(byte),
+        }
+    }
 }
 
 fn printf_text_width(bytes: &[u8], characters: bool) -> usize {
@@ -5290,9 +5343,11 @@ mod tests {
                 .unwrap();
             assert_eq!(out_bytes(&result), b"\xFF\xFE");
         }
+        // A format whose first byte is NUL renders nothing: empty TEXT since
+        // SQLite 3.54 (NULL through 3.53).
         assert_eq!(
             FormatFunc.invoke(&[raw_text(b"\0ignored")]).unwrap(),
-            SqliteValue::Null
+            SqliteValue::Text(SmallText::from_string(String::new()))
         );
         assert_eq!(
             out_bytes(
@@ -5307,11 +5362,10 @@ mod tests {
     #[test]
     fn test_format_repeated_character_checks_expanded_byte_length() {
         // The repeat count alone fits under SQLite's result limit, but the
-        // four-byte character would expand to 2 GB. Reject before allocating.
-        let result = FormatFunc
-            .invoke(&[raw_text(b"%.500000000c"), raw_blob(b"\xF8\x88\x80\x80")])
-            .unwrap();
-        assert_eq!(result, SqliteValue::Null);
+        // four-byte character would expand to 2 GB. Reject before allocating:
+        // SQLITE_TOOBIG, as SQLite 3.54.1 reports it.
+        let result = FormatFunc.invoke(&[raw_text(b"%.500000000c"), raw_blob(b"\xF8\x88\x80\x80")]);
+        assert!(matches!(result, Err(FrankenError::TooBig)), "{result:?}");
     }
 
     #[test]
@@ -7217,11 +7271,11 @@ mod tests {
 
     #[test]
     fn test_printf_incomplete_conversion_edges_bd_ybftw() {
-        // bd-printf-incomplete-conversion-edge. Oracle: sqlite3 3.46.1.
-        // Two EOF edges of a `%` conversion diverge in opposite directions:
+        // bd-printf-incomplete-conversion-edge. Oracle: SQLite 3.54.1 (checked
+        // 2026-11-11). Two EOF edges of a `%` conversion diverge:
         //  (1) a trailing BARE `%` (nothing consumed after it) stays LITERAL;
         //  (2) a `%` that consumed flags/width/precision but then hit EOF with
-        //      no conversion char is incomplete and NULLs the whole call.
+        //      no conversion char is incomplete: formatting stops there.
         let f = FormatFunc;
         let run = |args: &[SqliteValue]| -> Option<String> {
             match f.invoke(args).unwrap() {
@@ -7242,12 +7296,12 @@ mod tests {
         assert_eq!(run(&[txt("%%")]), some("%"));
         assert_eq!(run(&[txt("abc%%def")]), some("abc%def"));
 
-        // (2) An incomplete `%` with NOTHING accumulated before it -> NULL
-        // (the empty result renders as SQL NULL, like an empty StrAccum).
+        // (2) An incomplete `%` with NOTHING accumulated before it -> empty
+        // TEXT since 3.54 (an empty StrAccum finished as NULL through 3.53).
         for bad in [
             "%5", "%-", "%.", "%+", "%#", "% ", "%05", "%-5", "%.3", "%5.3",
         ] {
-            assert_eq!(run(&[txt(bad)]), None, "printf('{bad}') must be NULL");
+            assert_eq!(run(&[txt(bad)]), some(""), "printf('{bad}') must be ''");
         }
         // (3) The SAME incomplete conversion, once ANY output exists, returns the
         // accumulated output so far — it does NOT null the whole call.
@@ -7302,16 +7356,18 @@ mod tests {
 
     #[test]
     fn test_printf_dynamic_width_precision_bd_3fpd4() {
-        // bd-printf-dynamic-width-i32-3fpd4. Oracle: sqlite3 3.46.1. A `*` width/
-        // precision is read as va_arg(int) — the i64 arg is CAST to i32 — then a
-        // negative width left-justifies (INT_MIN -> 0 pad) and a width reaching
-        // 1e9 NULLs, matching the literal fold (bd-mcgdb). Some(text) / None(NULL).
+        // bd-printf-dynamic-width-i32-3fpd4. Oracle: SQLite 3.54.1 (the too-big
+        // cases checked 2026-11-11). A `*` width/precision is read as
+        // va_arg(int) — the i64 arg is CAST to i32 — then a negative width
+        // left-justifies (INT_MIN -> 0 pad) and a width reaching 1e9 is
+        // SQLITE_TOOBIG, matching the literal fold (bd-mcgdb). Some(text) /
+        // None(TooBig).
         let f = FormatFunc;
         let run = |args: &[SqliteValue]| -> Option<String> {
-            match f.invoke(args).unwrap() {
-                SqliteValue::Text(s) => Some(s.as_str().to_owned()),
-                SqliteValue::Null => None,
-                other => panic!("expected text or null, got {other:?}"),
+            match f.invoke(args) {
+                Ok(SqliteValue::Text(s)) => Some(s.as_str().to_owned()),
+                Err(FrankenError::TooBig) => None,
+                other => panic!("expected text or TooBig, got {other:?}"),
             }
         };
         let txt = |s: &str| SqliteValue::Text(SmallText::from_string(s));
@@ -7329,11 +7385,11 @@ mod tests {
             some("    7")
         );
         assert_eq!(run(&[txt("%*d"), int(-2_147_483_648), int(7)]), some("7"));
-        // width reaching 1e9 -> NULL (not a giant string).
+        // width reaching 1e9 -> TooBig (not a giant string).
         assert_eq!(run(&[txt("%*d"), int(1_000_000_000), int(7)]), None);
         assert_eq!(run(&[txt("%*d"), int(-2_147_483_647), int(7)]), None);
         // dynamic precision: normal, negative-abs (bd-9zzr0 preserved),
-        // INT_MIN -> default precision, and >= 1e9 -> NULL for %d.
+        // INT_MIN -> default precision, and >= 1e9 -> TooBig for %d.
         assert_eq!(run(&[txt("%.*f"), int(2), flt(3.14159)]), some("3.14"));
         assert_eq!(run(&[txt("%.*d"), int(-3), int(42)]), some("042"));
         assert_eq!(
@@ -7393,9 +7449,9 @@ mod tests {
         assert_eq!(run(&[txt("x%a"), int(1)]), some("x"));
         assert_eq!(run(&[txt("ab%d|%y|tail"), int(5)]), some("ab5|"));
         assert_eq!(run(&[txt("a%2$s"), int(1), int(2)]), some("a"));
-        // Nothing accumulated: NULL, as before (3.52/3.53 finish an empty
-        // accumulator as NULL).
-        assert_eq!(run(&[txt("%a"), int(1)]), None);
+        // Nothing accumulated: empty TEXT in 3.54.1 (checked 2026-11-11);
+        // 3.52/3.53 finished an empty accumulator as NULL.
+        assert_eq!(run(&[txt("%a"), int(1)]), some(""));
     }
 
     #[test]
@@ -7555,6 +7611,59 @@ mod tests {
                 "format({fmt:?}, {arg})"
             );
         }
+    }
+
+    /// SQLite 3.54 %j / %J, every expectation run on the bundled 3.54.1
+    /// (2026-11-11).
+    #[test]
+    fn test_printf_json_string_conversions() {
+        let f = FormatFunc;
+        let txt = |s: &str| SqliteValue::Text(SmallText::from_string(s));
+        let run = |args: &[SqliteValue]| -> Vec<u8> { out_bytes(&f.invoke(args).unwrap()) };
+        // Short escapes, lowercase \u00xx for the rest, `"` and `\` escaped;
+        // `/` and DEL are not.
+        let controls = SqliteValue::Text(SmallText::from_bytes(b"\x01\x08\t\n\x0B\x0C\r\x1F\x1B"));
+        assert_eq!(
+            run(&[txt("%j"), controls]),
+            b"\\u0001\\b\\t\\n\\u000b\\f\\r\\u001f\\u001b".to_vec()
+        );
+        assert_eq!(
+            run(&[txt("%J"), txt("\"\\/\x7F")]),
+            b"\"\\\"\\\\/\x7F\"".to_vec()
+        );
+        // Width pads the literal, precision cuts the input (bytes, or code
+        // points with `!`), and the #, 0 and + flags change nothing.
+        assert_eq!(
+            run(&[
+                txt("[%8J][%-8J][%.2J][%!.2J]"),
+                txt("ab"),
+                txt("ab"),
+                txt("abcd"),
+                txt("éèx")
+            ]),
+            "[    \"ab\"][\"ab\"    ][\"ab\"][\"éè\"]"
+                .as_bytes()
+                .to_vec()
+        );
+        assert_eq!(
+            run(&[txt("%#J|%0J|%+5J"), txt("x"), txt("y"), txt("z")]),
+            b"\"x\"|\"y\"|  \"z\"".to_vec()
+        );
+        // Non-text arguments use their text; the input stops at a NUL.
+        assert_eq!(
+            run(&[
+                txt("[%J][%J][%J][%J]"),
+                SqliteValue::Integer(255),
+                SqliteValue::Float(1.5),
+                SqliteValue::Blob(b"A".to_vec().into()),
+                SqliteValue::Text(SmallText::from_bytes(b"a\0b")),
+            ]),
+            b"[\"255\"][\"1.5\"][\"A\"][\"a\"]".to_vec()
+        );
+        // NULL: nothing for %j, `null` for %J (also for a missing argument).
+        assert_eq!(run(&[txt("[%j]"), SqliteValue::Null]), b"[]".to_vec());
+        assert_eq!(run(&[txt("%J")]), b"null".to_vec());
+        assert_eq!(run(&[txt("%J"), SqliteValue::Null]), b"null".to_vec());
     }
 
     #[test]

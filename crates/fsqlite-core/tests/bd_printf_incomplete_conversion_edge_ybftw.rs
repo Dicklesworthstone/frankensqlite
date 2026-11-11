@@ -1,13 +1,15 @@
 #![recursion_limit = "512"]
 
 //! bd-printf-incomplete-conversion-edge-ybftw: printf()/format() incomplete
-//! conversions must match stock SQLite. Differential vs rusqlite (SQLite 3.53).
+//! conversions must match stock SQLite. Differential vs the bundled rusqlite
+//! oracle (SQLite 3.54.1 since 2026-11-10).
 //!
 //! * A trailing bare `%` at end-of-format stays LITERAL: printf('abc%')=='abc%',
 //!   printf('%')=='%', printf('%d%',7)=='7%'.
 //! * A `%` that consumed flags/width/precision but then hit EOF with no
 //!   conversion char (printf('%5'), '%-', '%.', '%.3', '% ', '%05', '%+', '%#',
-//!   '%*', '%.*') NULLs the whole call.
+//!   '%*', '%.*') stops formatting: the result is what was accumulated before
+//!   it, so '' here (3.54; through 3.53 an empty result was NULL).
 
 use fsqlite_core::connection::Connection;
 use fsqlite_types::value::SqliteValue;
@@ -50,7 +52,7 @@ async fn assert_all_agree(sqls: &[String]) {
     }
     assert!(
         diverged.is_empty(),
-        "{} incomplete-% divergence(s) vs rusqlite 3.53:\n{}",
+        "{} incomplete-% divergence(s) vs the rusqlite oracle:\n{}",
         diverged.len(),
         diverged.join("\n")
     );
@@ -68,7 +70,7 @@ fn printf_trailing_bare_percent_stays_literal() {
 }
 
 #[test]
-fn printf_incomplete_conversion_nulls() {
+fn printf_incomplete_conversion_matches_stock() {
     asupersync::test_utils::run_test(|| async {
         let sqls: Vec<String> = [
             "%5", "%-", "%.", "%.3", "% ", "%05", "%+", "%#", "%*", "%.*", "%,", "%!",

@@ -2,17 +2,17 @@
 
 //! bd-printf-unsupported-spec-null-f46wo: printf()/format() must match stock
 //! SQLite's conversion-specifier partition exactly. Differential vs rusqlite
-//! (bundled SQLite 3.53, the authoritative oracle — the sqlite3 CLI 3.46.1 is a
-//! known float-text outlier, but the specifier partition is stable across both).
+//! (the bundled SQLite, 3.54.1 since 2026-11-10, is the authoritative oracle —
+//! the sqlite3 CLI 3.46.1 is a known float-text outlier).
 //!
 //! Four contracts:
-//!   1. Supported specifiers (% n d i u f e E g G s z q Q w x X o c p r) format
-//!      identically to stock — INCLUDING the two frank previously emitted as raw
-//!      literals: `%p` (== `%X`, uppercase hex) and `%r` (ordinal, 255->'255th').
-//!   2. Unsupported/unknown specifiers (a, b, h, j, k, m, t, v, y and the
+//!   1. Supported specifiers (% n d i u f e E g G s z q Q w x X o c p r, and the
+//!      JSON-string j J added in 3.54) format identically to stock — INCLUDING
+//!      `%p` (== `%X`, uppercase hex) and `%r` (ordinal, 255->'255th').
+//!   2. Unsupported/unknown specifiers (a, b, h, k, m, t, v, y and the
 //!      unsupported uppercase set) stop formatting: stock keeps the text
-//!      accumulated before them, and an empty accumulation is NULL — frank
-//!      previously emitted a raw `%<spec>` literal, then NULLed even a prefix.
+//!      accumulated before them, and an empty accumulation is '' since 3.54
+//!      (NULL through 3.53).
 //!   3. Positional args (`%2$s`) behave the same way (the `$` reaches the
 //!      conversion slot after the digits parse as field width).
 //!   4. `l` and `ll` are length modifiers (`%lld` == `%d`), not conversions.
@@ -63,7 +63,7 @@ async fn assert_all_agree(sqls: &[String]) {
     }
     assert!(
         diverged.is_empty(),
-        "{} printf specifier divergence(s) vs rusqlite 3.53:\n{}",
+        "{} printf specifier divergence(s) vs the rusqlite oracle:\n{}",
         diverged.len(),
         diverged.join("\n")
     );
@@ -74,11 +74,11 @@ fn printf_specifier_partition_matches_stock() {
     asupersync::test_utils::run_test(|| async {
         let mut sqls = Vec::new();
         // (1)+(2): every ascii-letter specifier with an integer arg — supported
-        // ones format, unsupported ones NULL; the oracle decides which is which.
+        // ones format, unsupported ones stop it; the oracle decides which is which.
         for c in ('a'..='z').chain('A'..='Z') {
             sqls.push(format!("SELECT quote(printf('%{c}', 255))"));
         }
-        // (3): positional args NULL the whole call.
+        // (3): positional args stop formatting at the `$`.
         for p in ["%2$s %1$s", "%3$d", "%5$s", "%1$d"] {
             sqls.push(format!("SELECT quote(printf('{p}', 1, 2, 3))"));
         }

@@ -376,7 +376,8 @@ fn format_raw_format_strings_and_nul_termination() {
                 ("CAST(X'002573' AS TEXT)", "''"),
                 ("NULL", "NULL"),
             ] {
-                let sql = format!("SELECT quote({name}({format}, 'unused'))");
+                // Rendered by type: empty TEXT shows as '' and NULL as NULL.
+                let sql = format!("SELECT {name}({format}, 'unused')");
                 let expected = vec![vec![expected.to_owned()]];
                 assert_eq!(sqlite_rows(&r, &sql).expect("stock empty format"), expected);
                 assert_eq!(
