@@ -2819,6 +2819,167 @@ mod tests {
         }
     }
 
+    /// rusqlite code that hits PRIMARY KEY and UNIQUE conflicts, compiled
+    /// against module `$m`, on connection `$conn`. Stock words both "UNIQUE
+    /// constraint failed: ..."; applications tell them apart only by the
+    /// extended code (SQLITE_CONSTRAINT_PRIMARYKEY 1555, _UNIQUE 2067), so
+    /// errors keep their code, extended code and message (bd-w4pr1.22). The
+    /// conflict resolutions that must still treat a PRIMARY KEY conflict as a
+    /// uniqueness conflict (OR IGNORE, OR REPLACE, UPSERT) are traced with the
+    /// rows they leave.
+    macro_rules! key_conflict_scenario {
+        ($m:ident, $conn:expr) => {{
+            use $m::params;
+            fn show<T: std::fmt::Debug>(result: $m::Result<T>) -> String {
+                match result {
+                    Ok(value) => format!("ok {value:?}"),
+                    Err($m::Error::SqliteFailure(error, message)) => {
+                        format!("err {:?} {} {message:?}", error.code, error.extended_code)
+                    }
+                    Err(other) => format!("err other {other}"),
+                }
+            }
+            let conn: $m::Connection = $conn;
+            let mut trace: Vec<String> = Vec::new();
+            let run = |sql: &str| show(conn.execute(sql, []));
+            let rows = |sql: &str| {
+                show(conn.prepare(sql).and_then(|mut stmt| {
+                    stmt.query_map([], |row| row.get::<_, String>(0))?
+                        .collect::<$m::Result<Vec<_>>>()
+                }))
+            };
+            conn.execute_batch(
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT UNIQUE);
+                 CREATE TABLE tpk(id TEXT PRIMARY KEY, v INTEGER UNIQUE);
+                 CREATE TABLE cpk(a INTEGER, b TEXT, v TEXT UNIQUE, PRIMARY KEY(a, b));
+                 CREATE TABLE wr(a INTEGER, b TEXT, v TEXT UNIQUE, PRIMARY KEY(a, b))
+                     WITHOUT ROWID;
+                 CREATE TABLE upk(k TEXT PRIMARY KEY);
+                 CREATE UNIQUE INDEX upk_k ON upk(k);
+                 CREATE TEMP TABLE tmp(id TEXT PRIMARY KEY, v TEXT UNIQUE);
+                 CREATE TEMP TABLE tmpi(id INTEGER PRIMARY KEY, v TEXT);
+                 INSERT INTO t VALUES (1, 'one'), (2, 'two');
+                 INSERT INTO tpk VALUES ('a', 1), ('b', 2);
+                 INSERT INTO cpk VALUES (1, 'x', 'p'), (1, 'y', 'q');
+                 INSERT INTO wr VALUES (1, 'x', 'p'), (1, 'y', 'q');
+                 INSERT INTO upk VALUES ('k');
+                 INSERT INTO tmp VALUES ('a', 'p');
+                 INSERT INTO tmpi VALUES (1, 'p');",
+            )
+            .unwrap();
+            // INTEGER PRIMARY KEY: the rowid is the key.
+            trace.push(run("INSERT INTO t VALUES (1, 'dup')"));
+            trace.push(show(
+                conn.prepare("INSERT INTO t(id, v) VALUES (?1, ?2)")
+                    .and_then(|mut stmt| stmt.execute(params![2, "dup"])),
+            ));
+            trace.push(run("UPDATE t SET id = 1 WHERE id = 2"));
+            // Negative: a UNIQUE column of the same table stays _UNIQUE.
+            trace.push(run("INSERT INTO t VALUES (3, 'one')"));
+            trace.push(run("UPDATE t SET v = 'one' WHERE id = 2"));
+            trace.push(run("INSERT OR IGNORE INTO t VALUES (1, 'ignored')"));
+            trace.push(run("INSERT OR REPLACE INTO t VALUES (1, 'replaced')"));
+            trace.push(run(
+                "INSERT INTO t VALUES (2, 'upsert') ON CONFLICT(id) DO UPDATE SET v = excluded.v",
+            ));
+            trace.push(run(
+                "INSERT INTO t VALUES (2, 'nothing') ON CONFLICT(id) DO NOTHING",
+            ));
+            trace.push(rows(
+                "SELECT quote(id) || '|' || quote(v) FROM t ORDER BY id",
+            ));
+            // A non-integer PRIMARY KEY of a rowid table is an index.
+            trace.push(run("INSERT INTO tpk VALUES ('a', 9)"));
+            trace.push(show(
+                conn.prepare("INSERT INTO tpk VALUES (?1, ?2)")
+                    .and_then(|mut stmt| stmt.execute(params!["b", 9])),
+            ));
+            trace.push(run("UPDATE tpk SET id = 'a' WHERE id = 'b'"));
+            trace.push(run("INSERT INTO tpk VALUES ('c', 1)"));
+            trace.push(run("INSERT OR IGNORE INTO tpk VALUES ('a', 7)"));
+            trace.push(run("INSERT OR REPLACE INTO tpk VALUES ('a', 7)"));
+            trace.push(run(
+                "INSERT INTO tpk VALUES ('b', 8) ON CONFLICT(id) DO UPDATE SET v = excluded.v",
+            ));
+            trace.push(rows(
+                "SELECT quote(id) || '|' || quote(v) FROM tpk ORDER BY id",
+            ));
+            // A composite PRIMARY KEY names every key column.
+            trace.push(run("INSERT INTO cpk VALUES (1, 'x', 'r')"));
+            trace.push(run("INSERT INTO cpk VALUES (2, 'x', 'p')"));
+            trace.push(run("INSERT INTO cpk VALUES (1, 'y', 's') \
+                 ON CONFLICT(a, b) DO UPDATE SET v = excluded.v"));
+            trace.push(rows(
+                "SELECT quote(a) || '|' || quote(b) || '|' || quote(v) FROM cpk ORDER BY a, b",
+            ));
+            // A WITHOUT ROWID table's PRIMARY KEY is the table itself.
+            trace.push(run("INSERT INTO wr VALUES (1, 'x', 'r')"));
+            trace.push(run("UPDATE wr SET b = 'x' WHERE b = 'y'"));
+            trace.push(run("INSERT INTO wr VALUES (2, 'x', 'p')"));
+            trace.push(run("INSERT OR IGNORE INTO wr VALUES (1, 'x', 'z')"));
+            trace.push(run("INSERT OR REPLACE INTO wr VALUES (1, 'x', 'z')"));
+            trace.push(run("INSERT INTO wr VALUES (1, 'y', 'w') \
+                 ON CONFLICT(a, b) DO UPDATE SET v = excluded.v"));
+            trace.push(rows(
+                "SELECT quote(a) || '|' || quote(b) || '|' || quote(v) FROM wr ORDER BY a, b",
+            ));
+            // Negative: a user's UNIQUE index over the PRIMARY KEY column is
+            // newer, so stock checks it first and reports _UNIQUE.
+            trace.push(run("INSERT INTO upk VALUES ('k')"));
+            // TEMP tables keep their constraints in the in-memory store.
+            trace.push(run("INSERT INTO tmp VALUES ('a', 'q')"));
+            trace.push(run("INSERT INTO tmp VALUES ('b', 'p')"));
+            trace.push(run("INSERT INTO tmpi VALUES (1, 'q')"));
+            trace
+        }};
+    }
+
+    #[test]
+    fn primary_key_conflicts_report_constraint_primarykey_like_rusqlite() {
+        let dir = tempfile::tempdir().unwrap();
+        let runs = [
+            (
+                key_conflict_scenario!(stock, stock::Connection::open_in_memory().unwrap()),
+                key_conflict_scenario!(ours, ours::Connection::open_in_memory().unwrap()),
+            ),
+            (
+                key_conflict_scenario!(
+                    stock,
+                    stock::Connection::open(temp_path(&dir, "keys-stock.db")).unwrap()
+                ),
+                key_conflict_scenario!(
+                    ours,
+                    ours::Connection::open(temp_path(&dir, "keys-fsqlite.db")).unwrap()
+                ),
+            ),
+        ];
+        for (run, (theirs, mine)) in runs.iter().enumerate() {
+            for (index, (expected, actual)) in theirs.iter().zip(mine).enumerate() {
+                assert_eq!(actual, expected, "run {run} trace step {index}");
+            }
+            assert_eq!(mine.len(), theirs.len(), "run {run}");
+            // The scenario must reach a PRIMARY KEY conflict of every kind and
+            // the UNIQUE conflicts that must not turn into one.
+            for needle in [
+                r#"err ConstraintViolation 1555 Some("UNIQUE constraint failed: t.id")"#,
+                r#"err ConstraintViolation 2067 Some("UNIQUE constraint failed: t.v")"#,
+                r#"err ConstraintViolation 1555 Some("UNIQUE constraint failed: tpk.id")"#,
+                r#"err ConstraintViolation 2067 Some("UNIQUE constraint failed: tpk.v")"#,
+                r#"err ConstraintViolation 1555 Some("UNIQUE constraint failed: cpk.a, cpk.b")"#,
+                r#"err ConstraintViolation 1555 Some("UNIQUE constraint failed: wr.a, wr.b")"#,
+                r#"err ConstraintViolation 2067 Some("UNIQUE constraint failed: wr.v")"#,
+                r#"err ConstraintViolation 2067 Some("UNIQUE constraint failed: upk.k")"#,
+                r#"err ConstraintViolation 1555 Some("UNIQUE constraint failed: tmp.id")"#,
+                r#"err ConstraintViolation 1555 Some("UNIQUE constraint failed: tmpi.id")"#,
+            ] {
+                assert!(
+                    theirs.iter().any(|line| line == needle),
+                    "run {run}: the scenario must reach {needle}: {theirs:?}"
+                );
+            }
+        }
+    }
+
     /// The drop-in promise: a file rusqlite wrote opens here, takes writes,
     /// and opens again in rusqlite with every row and a clean integrity check.
     #[test]

@@ -80,10 +80,7 @@ fn account(report: &mut SqlChangesetApplyReport, outcome: RowOutcome) -> ApplyRe
 /// existing semantics. In particular, a failed rollback never reaches here.
 fn is_unique_dependency(conflict: &SqlChangesetConflict<'_>) -> bool {
     conflict.kind == ConflictType::Constraint
-        && matches!(
-            conflict.error,
-            Some(FrankenError::UniqueViolation { .. } | FrankenError::PrimaryKeyViolation)
-        )
+        && conflict.error.is_some_and(FrankenError::is_unique_conflict)
 }
 
 async fn try_row<F>(

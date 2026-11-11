@@ -575,7 +575,7 @@ const fn is_row_constraint(error: &FrankenError) -> bool {
     matches!(
         error,
         FrankenError::UniqueViolation { .. }
-            | FrankenError::PrimaryKeyViolation
+            | FrankenError::PrimaryKeyViolation { .. }
             | FrankenError::NotNullViolation { .. }
             | FrankenError::CheckViolation { .. }
             | FrankenError::ForeignKeyViolation
