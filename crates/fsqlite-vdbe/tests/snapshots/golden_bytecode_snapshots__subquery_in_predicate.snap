@@ -38,7 +38,7 @@ addr  opcode           p1    p2    p3    p4                 p5
 23    Close            8197  0     0                        0 
 24    Column           0     1     4                        0 
 25    MakeRecord       4     1     7                        0 
-26    Found            12293  33    7                        0 
+26    Found            12293  33    7                        1 
 27    If               5     35    0                        0 
 28    IsNull           4     30    0                        0 
 29    Goto             0     31    0                        0 
