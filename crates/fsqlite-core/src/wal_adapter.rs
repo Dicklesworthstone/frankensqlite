@@ -3739,6 +3739,16 @@ struct AppendGateProof {
     baseline: bool,
 }
 
+/// The certificate sidecar descriptor an append left open, with the record
+/// that append wrote: its WAL generation, its bytes and the offset just past
+/// it.
+struct CertificateAppendHandle<F> {
+    file: F,
+    generation: WalGenerationIdentity,
+    record_bytes: Vec<u8>,
+    end_offset: u64,
+}
+
 pub struct PathRefreshingWalBackend<V: Vfs>
 where
     V::File: Send + Sync + 'static,
@@ -3789,6 +3799,24 @@ where
     /// because the read path is `&self` (a `WalBackend` read-snapshot method);
     /// the lock is held only for the sync take/put-back, never across `.await`.
     cached_certificate_read: std::sync::Mutex<Option<V::File>>,
+    /// Held read-write descriptor for certificate appends (bd-ih8ak).
+    ///
+    /// Every commit opened the sidecar, read its newest record back to find a
+    /// safe append boundary, wrote one record and closed it: eleven system
+    /// calls to append 156 bytes. The descriptor is now kept, for the reasons
+    /// [`Self::cached_certificate_read`] gives: the sidecar is only ever
+    /// appended or truncated in place, and a generation change drops the
+    /// descriptor. The boundary scan is skipped only when the sidecar still
+    /// ends with the very record this descriptor last wrote, byte for byte,
+    /// and that record belongs to the generation being appended to: one read
+    /// of the record's length plus one byte, from where the record began,
+    /// must return exactly the record. Anything appended after it makes the
+    /// read one byte longer, a truncation makes it shorter, and a record
+    /// changed in place (which the scan's strict decode exists to refuse)
+    /// compares unequal; each takes the full scan. Interior mutable because
+    /// the append is `&self`; the lock is held only for the take and
+    /// put-back, never across `.await`.
+    cached_certificate_append: std::sync::Mutex<Option<CertificateAppendHandle<V::File>>>,
     /// The newest sidecar record already proven to authorize its WAL boundary.
     /// Its verdict depends only on the record itself, its WAL generation, the
     /// commit marker and the payload digest of the committed frames it covers,
@@ -3865,6 +3893,7 @@ where
             namespace_binding,
             cached_verification_db: None,
             cached_certificate_read: std::sync::Mutex::new(None),
+            cached_certificate_append: std::sync::Mutex::new(None),
             authorized_certificate_record: std::sync::Mutex::new(None),
             append_gate_proof: None,
             db_file_identity: None,
@@ -4021,6 +4050,7 @@ where
         {
             let _ = stale.close(cx);
         }
+        self.drop_cached_certificate_append(cx);
         // The pre-replacement guard above proved this adapter has no pending
         // owner; no suspension occurs between that guard and the swap.
         let old_wal = old.wal;
@@ -5125,12 +5155,51 @@ where
                 ),
             });
         }
-        let certificate_path = self.certificate_sidecar_path();
-        let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
-        let (mut file, _) = self.vfs.open(cx, Some(&certificate_path), flags)?;
-        let append_offset =
-            Self::prepare_certificate_sidecar_for_append(&mut file, cx, record.wal_generation)
-                .await?;
+        let held = self
+            .cached_certificate_append
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let (mut file, known_tail) = match held {
+            Some(held) => (
+                held.file,
+                Some((held.generation, held.record_bytes, held.end_offset)),
+            ),
+            None => {
+                let certificate_path = self.certificate_sidecar_path();
+                let flags = VfsOpenFlags::READWRITE | VfsOpenFlags::CREATE | VfsOpenFlags::WAL;
+                let (file, _) = self.vfs.open(cx, Some(&certificate_path), flags)?;
+                (file, None)
+            }
+        };
+        // The sidecar still ends with the record this descriptor last wrote
+        // when a read of one byte more than that record, from where it began,
+        // returns exactly its bytes. That record was complete and valid when
+        // written, so its end is the boundary the scan would return. A read
+        // error, like every difference, takes the scan.
+        let mut known_boundary = None;
+        if let Some((generation, previous_bytes, end_offset)) = known_tail
+            && generation == record.wal_generation
+            && let Some(record_start) =
+                end_offset.checked_sub(u64::try_from(previous_bytes.len()).unwrap_or(u64::MAX))
+        {
+            let mut tail = vec![0_u8; previous_bytes.len() + 1];
+            if file
+                .read(cx, &mut tail, record_start)
+                .await
+                .is_ok_and(|read| read == previous_bytes.len())
+                && tail[..previous_bytes.len()] == previous_bytes[..]
+            {
+                known_boundary = Some(end_offset);
+            }
+        }
+        let append_offset = match known_boundary {
+            Some(end_offset) => end_offset,
+            None => {
+                Self::prepare_certificate_sidecar_for_append(&mut file, cx, record.wal_generation)
+                    .await?
+            }
+        };
         preflight.hand_off();
         drop(preflight);
         let write_result = if let Some(completion) = completion {
@@ -5158,9 +5227,35 @@ where
             );
         }
 
-        let finalization_cx = cx.create_child();
-        let _finalization_mask = finalization_cx.masked();
-        file.close(&finalization_cx)
+        // Keep the descriptor for the next commit instead of closing it. The
+        // record is unsynced either way (the WAL fsync is the only durability
+        // barrier), so deferring the close to a generation change or to Drop
+        // changes nothing a crash can observe.
+        let end_offset =
+            append_offset.saturating_add(u64::try_from(record_bytes.len()).unwrap_or(u64::MAX));
+        *self
+            .cached_certificate_append
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(CertificateAppendHandle {
+            file,
+            generation: record.wal_generation,
+            record_bytes,
+            end_offset,
+        });
+        Ok(())
+    }
+
+    /// Close the held certificate append descriptor, so the next append
+    /// reopens the sidecar and scans for its boundary.
+    fn drop_cached_certificate_append(&mut self, cx: &Cx) {
+        if let Some(mut stale) = self
+            .cached_certificate_append
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            let _ = stale.file.close(cx);
+        }
     }
 
     async fn reconcile_absent_append(
@@ -5931,6 +6026,7 @@ where
             if let Some(mut stale) = self.cached_certificate_read.get_mut()
                 .unwrap_or_else(std::sync::PoisonError::into_inner).take()
             { let _ = stale.close(&cleanup_cx); }
+            self.drop_cached_certificate_append(&cleanup_cx);
             Ok(())
         })
     }
@@ -6700,6 +6796,11 @@ where
                 let cleanup_cx = cx.create_child();
                 let _cleanup_mask = cleanup_cx.masked();
                 let _ = stale.close(&cleanup_cx);
+            }
+            {
+                let cleanup_cx = cx.create_child();
+                let _cleanup_mask = cleanup_cx.masked();
+                self.drop_cached_certificate_append(&cleanup_cx);
             }
             Ok(result)
         })
