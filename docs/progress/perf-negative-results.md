@@ -472,6 +472,33 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
   on path-identity probes; a single user-side term at 5% or more of a native profile of this
   commit's binary reopens it.
 
+## 2026-11-11 - REJECT: moving sorter rows to their sorted positions a block at a time (bd-reality-check-1022-llk6g.8)
+
+- Target: the 16% of `create_index_int_300k` that a sample profile put in
+  `SorterCursor::sort_rows_by_single_integer_key` after the three entries below. That function
+  reads every row's key into the pair array, sorts the pairs, and moves the 96-byte rows into
+  sorted order by following the permutation's cycles.
+- Candidate (`crates/fsqlite-vdbe/src/engine.rs` only, with a unit test over block boundaries; not
+  committed, kept on a local branch): move the rows in two passes, first each row into the
+  2,048-row block it belongs to, filling blocks front to back, then each block by itself, so
+  that every move stays near the last one made for the same block.
+- Result, previous = the three entries below (sha256 cd25f840...), candidate sha256 89e5c523...,
+  whole-process `perf stat`, arms alternating: 300k rows, 24 runs each: user cycles median
+  1,033M -> 1,057M, minimum 734M -> 750M, CPU 372 -> 363 ms; 1M rows, 12 runs each: user cycles
+  median 2,968M -> 3,041M, minimum 2,293M -> 2,350M, CPU 922 -> 947 ms; instructions +1% in
+  both. Scorecard, stock live, 11 interleaved repetitions, A/A 0.97: `create_index_int_300k`
+  1.06 and `group_by_1000_groups` 1.02 of the previous build, ranges overlapping. Nothing moved,
+  and the candidate moves each row twice.
+- Why the profile misled: in the cycle walk the next row's address comes from the pair array,
+  not from the row just moved, so its row misses already overlap. Grouping the moves removes no
+  stall.
+- Measurement note: the host was at load 17-19 and the same binary's user cycles ranged from
+  734M to 1,774M over those 24 runs, so medians and minima are what is reported.
+- Retry condition: not as another ordering of the same moves. Only as a change that makes what
+  is moved smaller (56 of a row's 96 bytes are the decoded key) or leaves the rows where they
+  are (consumers read through the sorted pair array), and with a profile of that workload on a
+  host whose same-binary spread is under 5%.
+
 ## 2026-11-11 - WIN (CPU time; wall time inside noise): a spilled sorter run is sorted by the single-integer pair sort and read back into the row (bd-reality-check-1022-llk6g.8)
 
 - Target: a sort past the sorter's 100 MiB limit, measured as CREATE INDEX over 3M rows, where
@@ -554,8 +581,9 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
   scan's opcodes, 25% in the kernel and 4% in WAL frame checksums; `free` is under 1%.
 - Retry conditions. Two key columns inline: when a two-key sort (a window's PARTITION BY plus
   ORDER BY, a multi-column index build) is the row being worked and its profile shows the key
-  vector's allocation. A cheaper permutation in the single-integer sort (move rows in
-  destination-ordered blocks, or do not move them): met now, by the 16% above.
+  vector's allocation. A cheaper permutation in the single-integer sort: moving rows in
+  destination-ordered blocks was tried next and rejected (the REJECT entry above); not moving
+  them, or moving something smaller, is what stays open, on that entry's condition.
 
 ## 2026-11-11 - WIN: CREATE INDEX and REINDEX sort the index records and lay the pages out left to right (bd-reality-check-1022-llk6g.8)
 
@@ -603,13 +631,40 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
   - Peak RSS, candidate / base / stock: 84 / 75 / 17 MB at 300k rows, 211 / 186 / 17 MB at 1M,
     580 / 496 / 17 MB at 3M. The build's memory grew with the table before this change and
     still does; the sorter adds about a sixth.
+- Where the series stands on the base it landed on. The per-commit numbers in these three
+  entries were measured before two rebases, on base 4c975163a. Main then gained the hot-lane and
+  autocommit series and the stock row layout. The numbers here are the three commits together
+  against main 7e486c4c2 (sha256 6d3e2924...; the three commits sha256 86f0ab50...), stock live:
+  - scorecard, 11 interleaved repetitions, A/A 1.01 on both rows, load 30:
+    `create_index_int_300k` 1.408 s -> 0.211 s (15.27x -> 2.29x stock's 0.092 s; ranges
+    1.37-2.00 and 0.19-0.26); `group_by_1000_groups` 0.960 s -> 0.528 s (4.09x -> 2.25x stock's
+    0.235 s; ranges 0.89-1.31 and 0.49-0.87). The same three commits one rebase earlier, on
+    8b04bef28 at load 10-12 (9 repetitions, A/A 0.99-1.01): 14.91x -> 2.17x and 3.96x -> 2.36x.
+  - `window_row_number` and `order_by_text_limit10` did not move: 7.96x -> 8.16x and 3.65x ->
+    4.09x in that earlier run, ranges overlapping, and their user instructions are the same
+    with and without the series (60.59G and 60.58G; 2,663M and 2,665M).
+  - statement instructions at 300k rows, as multiples of stock: 1,000 distinct integers 13.92x
+    -> 1.20x; unique scattered integers 12.76x -> 1.11x; keys rising with rowid 4.66x -> 0.98x;
+    text 10.55x -> 2.19x; `(a DESC, b)` 9.70x -> 2.13x; UNIQUE 12.16x -> 2.16x; expression
+    13.02x -> 1.40x; partial 8.05x -> 3.09x. `group_by_1000_groups` as a whole process: 4,741M
+    -> 3,831M (1.65x -> 1.33x stock's 2,878M).
+  - 1M rows: 14.59x -> 1.13x stock's instructions, 4.85 s -> 0.40 s (stock 0.24 s), peak RSS
+    188 -> 157 MB. 3M rows, one run: 12.92x -> 1.19x and 11.60x -> 1.17x, 19.6 s -> 2.32 s and
+    15.8 s -> 1.88 s (stock 1.04-1.09 s), peak RSS about 500 -> 438 MB.
+  - Index page counts equal stock's in seven of the eight shapes. The index on the REAL column
+    takes 1,245 pages against stock's 1,060 (base 1,427): stock stores a whole-number REAL key
+    as an integer and fsqlite stores eight bytes, which is how the old path wrote it too.
+  - With the stock row layout in main, indexes on VIRTUAL and STORED generated columns and on
+    WITHOUT ROWID tables (20k rows, six indexes, REINDEX, then UPDATE and DELETE) pass stock's
+    `integrity_check`, return stock's rows and take stock's page counts.
 - Keeper: `crates/fsqlite-core/tests/create_index_sorted_bulk_build_oracle.rs` (stock oracle:
   eight scenarios and a UNIQUE pass/fail table), two btree unit tests (every key count across
   leaf boundaries, three levels, overflowing keys, cells under four bytes, inserts after the
   load) and two engine unit tests (the opcode declines DESC-sorted rows and equal keys with
   falling rowids without writing a page).
-- Still a loss: 5.0-5.6x on the row's wall time. The shell's own timer puts 390 ms of the
-  candidate's process in the statement (stock 80 ms); opening the database costs about 40 ms
+- Still a loss: 5.0-5.6x on the row's wall time with this commit alone, 2.2-2.3x with the two
+  above it. At this commit the shell's own timer puts 390 ms of the candidate's process in the
+  statement (stock 80 ms); opening the database costs about 40 ms
   more than stock's and closing it about 20 ms. Instructions are within 2x but cycles are not:
   the statement runs at about 1.0 instructions per cycle against stock's 3.3. A sample profile
   shows 23% in `free` (two heap blocks per sorter row, released in sorted and therefore random
