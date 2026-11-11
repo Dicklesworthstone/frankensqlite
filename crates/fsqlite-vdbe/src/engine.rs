@@ -186,7 +186,7 @@ use fsqlite_types::record::{
     serialize_record_iter_with_precomputed_header_into_slice, simd_serialize_integer_record,
 };
 use fsqlite_types::serial_type::{
-    SerialTypeClass, classify_serial_type, read_varint, serial_type_len,
+    SerialTypeClass, classify_serial_type, read_varint, serial_type_for_integer, serial_type_len,
 };
 use fsqlite_types::value::{
     SmallText, SqlLikeFastPathKind, SqliteValue, pool_return_reusable,
@@ -263,6 +263,11 @@ const OPFLAG_IDX_NCHANGE: u16 = 0x40;
 /// fills it), and no opcode reads the cursor's position after the probe, so
 /// the engine may answer from the cursor's `MembershipMemo` without seeking.
 const OPFLAG_PROBE_MEMBERSHIP_ONLY: u16 = 0x01;
+/// On `OpenAutoindex`: the ephemeral index is a membership set. The program
+/// only fills it with `IdxInsert` and asks it with `Found` carrying
+/// [`OPFLAG_PROBE_MEMBERSHIP_ONLY`]; no opcode positions the cursor or reads
+/// through it, so the engine may keep its keys in a `MembershipSet`.
+const OPFLAG_MEMBERSHIP_SET: u16 = 0x01;
 /// Marks the `Delete`/`Insert` pair of an UPDATE whose rowid cannot change
 /// (no rowid or INTEGER PRIMARY KEY assignment). The `Delete` only records the
 /// row; the paired `Insert` then rewrites it in place, overwriting the cell
@@ -5022,6 +5027,111 @@ impl MembershipMemo {
     }
 }
 
+/// The keys of an ephemeral index opened with [`OPFLAG_MEMBERSHIP_SET`]
+/// (bd-w4pr1.13.15), held in a hash set instead of the cursor's b-tree.
+///
+/// Such an index is only asked whether it holds a key equal to a record
+/// (DISTINCT, `IN`). The set holds each key's canonical record
+/// ([`membership_set_key`]), for which byte equality is the index's equality,
+/// so a probe is one hash lookup and an insert one hash insert: no seek, no
+/// page split, and the b-tree stays empty.
+///
+/// A record with no canonical form ends set mode for the cursor:
+/// `VdbeEngine::spill_membership_set` inserts the keys held so far into the
+/// b-tree and the cursor continues as an ordinary index.
+#[derive(Debug)]
+struct MembershipSet {
+    keys: HashSet<Box<[u8]>>,
+    /// Whether TEXT key fields compare by their stored bytes: every key
+    /// column uses built-in BINARY and the database is UTF-8.
+    text_is_bytewise: bool,
+}
+
+/// Whether some INTEGER equals `real` under the index's numeric comparison
+/// ([`fsqlite_types::value::int_float_cmp`], which is exact).
+// The fractional part of a real with none is exactly zero; this is a test
+// for that, not a tolerance comparison.
+#[allow(clippy::float_cmp)]
+fn real_equals_an_integer(real: f64) -> bool {
+    // 2^63 is exactly representable; every finite real below it in magnitude
+    // with no fractional part is an i64 (and -2^63 itself is `i64::MIN`).
+    const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
+    real.fract() == 0.0 && (-TWO_POW_63..TWO_POW_63).contains(&real)
+}
+
+/// The canonical form of an index key record for a [`MembershipSet`]: two
+/// canonical records have the same bytes exactly when the index compares the
+/// two keys equal.
+///
+/// The index compares field by field: NULLs are equal, INTEGER and REAL
+/// compare by exact numeric value (1 = 1.0), TEXT by the column's collation,
+/// BLOBs by their bytes, and values of different storage classes differ. So a
+/// record of NULLs, minimally encoded INTEGERs, BLOBs, bytewise-compared TEXT
+/// and REALs that no INTEGER equals is canonical as written. A REAL that an
+/// INTEGER equals (which includes -0.0) is rewritten as that INTEGER, and an
+/// INTEGER in a wider encoding than it needs is re-encoded.
+///
+/// `None` means the record has no canonical form here: TEXT that does not
+/// compare bytewise, a NaN, a reserved serial type or a malformed record.
+// The UTF-8 record codecs re-encode a record that reached the rewrite: its
+// TEXT fields, if any, compare bytewise, which requires a UTF-8 database, and
+// the codecs carry TEXT bytes through unchanged.
+#[allow(clippy::cast_possible_truncation, clippy::disallowed_methods)]
+fn membership_set_key(record: &[u8], text_is_bytewise: bool) -> Option<Cow<'_, [u8]>> {
+    let (header_len, mut at) = read_varint(record)?;
+    let header_len = usize::try_from(header_len).ok()?;
+    if header_len < at || header_len > record.len() {
+        return None;
+    }
+    let mut body = header_len;
+    let mut rewrite = false;
+    while at < header_len {
+        let (serial_type, used) = read_varint(&record[at..header_len])?;
+        at += used;
+        let len = usize::try_from(serial_type_len(serial_type)?).ok()?;
+        let end = body.checked_add(len)?;
+        let field = record.get(body..end)?;
+        match serial_type {
+            1..=6 => {
+                // Sign-extend the big-endian integer and compare the encoding
+                // it arrived in with the one the serializer would choose.
+                let mut value = i64::from(i8::from_be_bytes([field[0]]));
+                for byte in &field[1..] {
+                    value = (value << 8) | i64::from(*byte);
+                }
+                rewrite |= serial_type_for_integer(value) != serial_type;
+            }
+            7 => {
+                let real = f64::from_be_bytes(field.try_into().ok()?);
+                if real.is_nan() {
+                    return None;
+                }
+                rewrite |= real_equals_an_integer(real);
+            }
+            10 | 11 => return None,
+            text if text >= 13 && text % 2 == 1 && !text_is_bytewise => return None,
+            // NULL, the constants 0 and 1, BLOB, and TEXT compared bytewise.
+            _ => {}
+        }
+        body = end;
+    }
+    if body != record.len() {
+        return None;
+    }
+    if !rewrite {
+        return Some(Cow::Borrowed(record));
+    }
+    let mut values = parse_record(record)?;
+    for value in &mut values {
+        if let SqliteValue::Float(real) = *value
+            && real_equals_an_integer(real)
+        {
+            *value = SqliteValue::Integer(real as i64);
+        }
+    }
+    Some(Cow::Owned(fsqlite_types::record::serialize_record(&values)))
+}
+
 /// Storage-backed table cursor used by `OpenRead` and `OpenWrite`.
 ///
 /// In Phase 5, `cursor` may be backed by either an in-memory [`MemPageStore`]
@@ -5289,6 +5399,9 @@ struct StorageCursor {
     /// Answers of membership-only probes on this cursor; created by the
     /// first such probe and dropped with the cursor.
     membership_memo: Option<Box<MembershipMemo>>,
+    /// The keys of an ephemeral index opened as a membership set, while they
+    /// are held outside its b-tree; see [`MembershipSet`].
+    membership_set: Option<Box<MembershipSet>>,
     /// Last rowid known to have been inserted on the right edge via this cursor.
     ///
     /// This is intentionally stricter than "last inserted rowid". We only keep
@@ -9141,6 +9254,16 @@ impl VdbeEngine {
         cursor_id: i32,
         key_bytes: &[u8],
     ) -> Result<bool> {
+        if let Some(set) = self
+            .storage_cursors
+            .get(&cursor_id)
+            .and_then(|cursor| cursor.membership_set.as_deref())
+        {
+            if let Some(key) = membership_set_key(key_bytes, set.text_is_bytewise) {
+                return Ok(set.keys.contains(key.as_ref()));
+            }
+            self.spill_membership_set(cursor_id).await?;
+        }
         if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
             let epoch = cursor.cursor.row_image_epoch();
             if let Some(answer) = cursor
@@ -9165,6 +9288,24 @@ impl VdbeEngine {
             }
         }
         Ok(exists)
+    }
+
+    /// End set mode for a cursor opened as a [`MembershipSet`]: insert the
+    /// keys held so far into its b-tree, which was empty until now, so that
+    /// every later insert and probe takes the ordinary index path. Canonical
+    /// keys compare equal to the records they stand for, so the b-tree
+    /// answers every probe as it would have had it been filled directly.
+    async fn spill_membership_set(&mut self, cursor_id: i32) -> Result<()> {
+        let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) else {
+            return Ok(());
+        };
+        let Some(set) = cursor.membership_set.take() else {
+            return Ok(());
+        };
+        for key in &set.keys {
+            lean_future(|| cursor.cursor.index_insert(&cursor.cx, key)).await?;
+        }
+        Ok(())
     }
 
     async fn storage_cursor_find_exact_index_key(
@@ -11465,6 +11606,21 @@ impl VdbeEngine {
                             BtCursor::new(store, root_pgno, autoindex_page_size, false);
                         cursor.set_retain_read_witnesses(false);
                         let autoindex_collations = extract_collation_names_owned(&op.p4);
+                        let membership_set = if (op.p5 & OPFLAG_MEMBERSHIP_SET) == 0 {
+                            None
+                        } else {
+                            let text_is_bytewise = matches!(self.text_encoding, TextEncoding::Utf8)
+                                && !self.builtin_collations_overridden()
+                                && autoindex_collations.iter().all(|collation| {
+                                    collation
+                                        .as_deref()
+                                        .is_none_or(|name| name.eq_ignore_ascii_case("BINARY"))
+                                });
+                            Some(Box::new(MembershipSet {
+                                keys: HashSet::new(),
+                                text_is_bytewise,
+                            }))
+                        };
                         if !autoindex_collations.is_empty() {
                             cursor.set_index_collation_context(
                                 autoindex_collations,
@@ -11493,7 +11649,8 @@ impl VdbeEngine {
                                 row_decode: RowDecodeScratch::default(),
                                 page_row: PageRowView::default(),
                                 last_position_stamp: None,
-                membership_memo: None,
+                                membership_memo: None,
+                                membership_set,
                                 last_successful_insert_rowid: None,
                                 last_rightmost_unique_index_prefix: None,
                                 last_rightmost_unique_index_position: None,
@@ -13255,6 +13412,33 @@ impl VdbeEngine {
                     } else {
                         record_blob_bytes(&key_val).to_vec()
                     };
+
+                    // bd-w4pr1.13.15: a membership set takes the key into
+                    // its hash set and leaves its b-tree empty. A key with no
+                    // canonical form, or an insert with index semantics the
+                    // set does not model, ends set mode first.
+                    if let Some(set) = self
+                        .storage_cursors
+                        .get_mut(&cursor_id)
+                        .and_then(|sc| sc.membership_set.as_deref_mut())
+                    {
+                        if op.p5 == 0
+                            && let Some(key) = membership_set_key(&key_blob, set.text_is_bytewise)
+                        {
+                            set.keys.insert(key.into_owned().into_boxed_slice());
+                            if sideband_active {
+                                self.make_record_lookaside.replace_cleared_buf(key_blob);
+                            }
+                            pc += 1;
+                            continue;
+                        }
+                        if let Err(error) = self.spill_membership_set(cursor_id).await {
+                            if sideband_active {
+                                self.make_record_lookaside.replace_cleared_buf(key_blob);
+                            }
+                            return Err(error);
+                        }
+                    }
 
                     let index_desc_flags = self.index_desc_flags_for_cursor(cursor_id);
                     let index_collations = self.index_collations_for_cursor(cursor_id);
@@ -18190,6 +18374,7 @@ impl VdbeEngine {
                 page_row: PageRowView::default(),
                 last_position_stamp: None,
                 membership_memo: None,
+                membership_set: None,
                 cached_rowid: None,
                 payload_includes_rowid_alias: None,
                 last_successful_insert_rowid: None,
@@ -19759,7 +19944,8 @@ impl VdbeEngine {
                             row_decode: RowDecodeScratch::default(),
                             page_row: PageRowView::default(),
                             last_position_stamp: None,
-                membership_memo: None,
+                            membership_memo: None,
+                            membership_set: None,
                             cached_rowid: None,
                             payload_includes_rowid_alias: None,
                             ipk_col_idx,
@@ -19926,7 +20112,8 @@ impl VdbeEngine {
                             row_decode: RowDecodeScratch::default(),
                             page_row: PageRowView::default(),
                             last_position_stamp: None,
-                membership_memo: None,
+                            membership_memo: None,
+                            membership_set: None,
                             cached_rowid: None,
                             payload_includes_rowid_alias: None,
                             ipk_col_idx,
@@ -20130,6 +20317,7 @@ impl VdbeEngine {
                 page_row: PageRowView::default(),
                 last_position_stamp: None,
                 membership_memo: None,
+                membership_set: None,
                 cached_rowid: None,
                 payload_includes_rowid_alias: None,
                 ipk_col_idx,
@@ -30857,6 +31045,295 @@ mod tests {
             b.resolve_label(end);
         });
         assert_eq!(rows, vec![vec![SqliteValue::Integer(1)]]);
+    }
+
+    /// One value to put into a membership-set program's key register.
+    enum SetKey {
+        Null,
+        Int(i64),
+        Real(f64),
+        Text(&'static str),
+        Blob(&'static [u8]),
+    }
+
+    fn emit_set_key(b: &mut ProgramBuilder, key: &SetKey, reg: i32) {
+        match key {
+            SetKey::Null => b.emit_op(Opcode::Null, 0, reg, 0, P4::None, 0),
+            SetKey::Int(value) => b.emit_op(Opcode::Int64, 0, reg, 0, P4::Int64(*value), 0),
+            SetKey::Real(value) => b.emit_op(Opcode::Real, 0, reg, 0, P4::Real(*value), 0),
+            SetKey::Text(value) => {
+                b.emit_op(Opcode::String8, 0, reg, 0, P4::Str((*value).to_owned()), 0)
+            }
+            SetKey::Blob(value) => b.emit_op(Opcode::Blob, 0, reg, 0, P4::Blob(value.to_vec()), 0),
+        };
+    }
+
+    /// Fill an ephemeral index opened with `open_p5` and `collation` from
+    /// `inserts`, then probe it with each of `probes` (membership-only
+    /// `Found`); one result row of 1 or 0 per probe.
+    fn run_membership_program(
+        open_p5: u16,
+        collation: &P4,
+        inserts: &[SetKey],
+        probes: &[SetKey],
+    ) -> Vec<i64> {
+        let rows = run_program(|b| {
+            let end = b.emit_label();
+            b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+            let cursor_id = 1;
+            let r_val = b.alloc_reg();
+            let r_key = b.alloc_reg();
+            let r_out = b.alloc_reg();
+            b.emit_op(Opcode::OpenAutoindex, cursor_id, 1, 0, collation.clone(), open_p5);
+            for key in inserts {
+                emit_set_key(b, key, r_val);
+                b.emit_op(Opcode::MakeRecord, r_val, 1, r_key, P4::None, 0);
+                b.emit_op(Opcode::IdxInsert, cursor_id, r_key, 0, P4::None, 0);
+            }
+            for key in probes {
+                let found = b.emit_label();
+                let done = b.emit_label();
+                emit_set_key(b, key, r_val);
+                b.emit_op(Opcode::MakeRecord, r_val, 1, r_key, P4::None, 0);
+                b.emit_op(Opcode::Integer, 0, r_out, 0, P4::None, 0);
+                b.emit_jump_to_label(
+                    Opcode::Found,
+                    cursor_id,
+                    r_key,
+                    found,
+                    P4::None,
+                    OPFLAG_PROBE_MEMBERSHIP_ONLY,
+                );
+                b.emit_jump_to_label(Opcode::Goto, 0, 0, done, P4::None, 0);
+                b.resolve_label(found);
+                b.emit_op(Opcode::Integer, 1, r_out, 0, P4::None, 0);
+                b.resolve_label(done);
+                b.emit_op(Opcode::ResultRow, r_out, 1, 0, P4::None, 0);
+            }
+            b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+            b.resolve_label(end);
+        });
+        rows.into_iter()
+            .map(|row| match row.as_slice() {
+                [SqliteValue::Integer(answer)] => *answer,
+                other => panic!("unexpected probe row {other:?}"),
+            })
+            .collect()
+    }
+
+    /// bd-w4pr1.13.15: a membership set answers exactly as the index b-tree
+    /// does. The b-tree arm (flag clear) is the reference in the same test, so
+    /// a set that compared raw record bytes (1 vs 1.0, 3.0 stored and 3
+    /// probed, -0.0 vs 0) or rounded integers past 2^53 fails here.
+    #[test]
+    fn test_membership_set_matches_the_index_btree_for_binary_keys() {
+        let inserts = [
+            SetKey::Int(1),
+            SetKey::Real(2.5),
+            SetKey::Text("a"),
+            SetKey::Real(3.0),
+            SetKey::Int(9_007_199_254_740_993),
+            SetKey::Real(-0.0),
+            SetKey::Real(1e300),
+            SetKey::Blob(b"a"),
+            SetKey::Int(-129),
+            SetKey::Null,
+        ];
+        let probes = [
+            SetKey::Real(1.0),
+            SetKey::Int(1),
+            SetKey::Int(2),
+            SetKey::Real(2.5),
+            SetKey::Real(2.500_000_1),
+            SetKey::Text("a"),
+            SetKey::Text("A"),
+            SetKey::Text("a "),
+            SetKey::Int(3),
+            SetKey::Real(3.0),
+            SetKey::Real(9_007_199_254_740_992.0),
+            SetKey::Int(9_007_199_254_740_992),
+            SetKey::Int(9_007_199_254_740_993),
+            SetKey::Int(0),
+            SetKey::Real(0.0),
+            SetKey::Real(1e300),
+            SetKey::Real(-1e300),
+            SetKey::Text("1"),
+            SetKey::Blob(b"a"),
+            SetKey::Blob(b"1"),
+            SetKey::Int(-129),
+            SetKey::Real(-129.0),
+            SetKey::Int(-128),
+            SetKey::Null,
+        ];
+        let reference = run_membership_program(0, &P4::None, &inserts, &probes);
+        assert_eq!(
+            reference,
+            vec![
+                1, 1, 0, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 1, 1, 1, 0, 0, 1, 0, 1, 1, 0, 1
+            ],
+            "the index b-tree's own answers"
+        );
+        assert_eq!(
+            run_membership_program(OPFLAG_MEMBERSHIP_SET, &P4::None, &inserts, &probes),
+            reference
+        );
+        assert_eq!(
+            run_membership_program(
+                OPFLAG_MEMBERSHIP_SET,
+                &P4::Collation("BINARY".to_owned()),
+                &inserts,
+                &probes,
+            ),
+            reference
+        );
+    }
+
+    /// bd-w4pr1.13.15: TEXT under a collation other than BINARY has no
+    /// canonical bytes, so the first such key moves the set into the b-tree,
+    /// keys already held included. A set that stayed a byte set would miss
+    /// 'ALPHA' and 'beta  '; one that dropped its earlier keys would miss 5.
+    #[test]
+    fn test_membership_set_falls_back_to_the_index_for_collated_text() {
+        for collation in ["NOCASE", "RTRIM"] {
+            let inserts = [
+                SetKey::Int(5),
+                SetKey::Real(7.0),
+                SetKey::Text("alpha"),
+                SetKey::Text("beta"),
+                SetKey::Int(11),
+            ];
+            let probes = [
+                SetKey::Text("ALPHA"),
+                SetKey::Text("alpha"),
+                SetKey::Text("beta  "),
+                SetKey::Int(5),
+                SetKey::Real(5.0),
+                SetKey::Int(7),
+                SetKey::Int(11),
+                SetKey::Text("gamma"),
+                SetKey::Int(6),
+            ];
+            let collation_p4 = P4::Collation(collation.to_owned());
+            let reference = run_membership_program(0, &collation_p4, &inserts, &probes);
+            let expected = if collation == "NOCASE" {
+                vec![1, 1, 0, 1, 1, 1, 1, 0, 0]
+            } else {
+                vec![0, 1, 1, 1, 1, 1, 1, 0, 0]
+            };
+            assert_eq!(reference, expected, "{collation}: the index b-tree's own answers");
+            assert_eq!(
+                run_membership_program(OPFLAG_MEMBERSHIP_SET, &collation_p4, &inserts, &probes),
+                reference,
+                "{collation}"
+            );
+            // A collated text key that arrives first as a probe ends set mode
+            // too, before anything is inserted.
+            assert_eq!(
+                run_membership_program(OPFLAG_MEMBERSHIP_SET, &collation_p4, &[], &probes),
+                vec![0; probes.len()],
+                "{collation}: empty set"
+            );
+        }
+    }
+
+    #[test]
+    fn test_membership_set_key_is_canonical_exactly_when_the_index_compares_equal() {
+        let record = |values: &[SqliteValue]| fsqlite_types::record::serialize_record(values);
+        let key = |values: &[SqliteValue]| {
+            membership_set_key(&record(values), true).map(std::borrow::Cow::into_owned)
+        };
+        let int = SqliteValue::Integer;
+        let real = SqliteValue::Float;
+
+        // Canonical as written: no copy.
+        for values in [
+            vec![int(0)],
+            vec![int(1), int(-1), int(i64::MIN), int(i64::MAX)],
+            vec![SqliteValue::Null, real(2.5), real(f64::INFINITY)],
+            vec![real(9.3e18), real(-9.3e18), real(1e-300)],
+            vec![SqliteValue::Text("abc".into()), SqliteValue::Blob(vec![0, 255].into())],
+        ] {
+            let bytes = record(&values);
+            assert!(
+                matches!(membership_set_key(&bytes, true), Some(Cow::Borrowed(same)) if same == bytes),
+                "{values:?}"
+            );
+        }
+
+        // A REAL that an INTEGER equals becomes that INTEGER.
+        assert_eq!(key(&[real(1.0)]), Some(record(&[int(1)])));
+        assert_eq!(key(&[real(-0.0)]), Some(record(&[int(0)])));
+        assert_eq!(key(&[real(0.0)]), Some(record(&[int(0)])));
+        assert_eq!(
+            key(&[real(9_007_199_254_740_992.0)]),
+            Some(record(&[int(9_007_199_254_740_992)]))
+        );
+        assert_eq!(
+            key(&[real(-9_223_372_036_854_775_808.0)]),
+            Some(record(&[int(i64::MIN)]))
+        );
+        assert_ne!(
+            key(&[real(9_007_199_254_740_992.0)]),
+            Some(record(&[int(9_007_199_254_740_993)]))
+        );
+        // 2^63 is not an INTEGER: it stays a REAL.
+        assert_eq!(
+            key(&[real(9_223_372_036_854_775_808.0)]),
+            Some(record(&[real(9_223_372_036_854_775_808.0)]))
+        );
+        // Other fields ride through a rewrite unchanged, TEXT bytes included.
+        assert_eq!(
+            key(&[
+                SqliteValue::Text("é".into()),
+                real(4.0),
+                SqliteValue::Null,
+                SqliteValue::Blob(vec![7].into()),
+            ]),
+            Some(record(&[
+                SqliteValue::Text("é".into()),
+                int(4),
+                SqliteValue::Null,
+                SqliteValue::Blob(vec![7].into()),
+            ]))
+        );
+
+        // An INTEGER in a wider encoding than it needs is re-encoded: header
+        // length 2, serial type 4 (32-bit), value 5.
+        assert_eq!(
+            membership_set_key(&[2, 4, 0, 0, 0, 5], true).map(Cow::into_owned),
+            Some(record(&[int(5)]))
+        );
+        // ...including a negative one, and 1, whose canonical encoding has no
+        // body.
+        assert_eq!(
+            membership_set_key(&[2, 4, 0xff, 0xff, 0xff, 0x7f], true).map(Cow::into_owned),
+            Some(record(&[int(-129)]))
+        );
+        assert!(matches!(
+            membership_set_key(&[2, 2, 0xff, 0x7f], true),
+            Some(Cow::Borrowed(_))
+        ));
+        assert_eq!(
+            membership_set_key(&[2, 1, 1], true).map(Cow::into_owned),
+            Some(record(&[int(1)]))
+        );
+
+        // No canonical form.
+        let text = record(&[int(1), SqliteValue::Text("abc".into())]);
+        assert_eq!(membership_set_key(&text, false), None, "TEXT under a collation");
+        assert!(
+            membership_set_key(&record(&[int(1), SqliteValue::Blob(vec![1].into())]), false)
+                .is_some(),
+            "a record without TEXT does not depend on the collation"
+        );
+        let mut nan = vec![2, 7];
+        nan.extend_from_slice(&f64::NAN.to_be_bytes());
+        assert_eq!(membership_set_key(&nan, true), None, "NaN");
+        assert_eq!(membership_set_key(&[], true), None, "empty");
+        assert_eq!(membership_set_key(&[2, 1], true), None, "body shorter than the header says");
+        assert_eq!(membership_set_key(&[2, 1, 5, 9], true), None, "bytes after the last field");
+        assert_eq!(membership_set_key(&[9, 1, 5], true), None, "header longer than the record");
+        assert_eq!(membership_set_key(&[2, 10], true), None, "reserved serial type");
     }
 
     #[test]

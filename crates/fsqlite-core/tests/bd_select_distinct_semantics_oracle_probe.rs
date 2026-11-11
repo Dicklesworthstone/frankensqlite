@@ -209,3 +209,117 @@ fn repeated_membership_probes_match_rusqlite_oracle() {
         );
     });
 }
+
+/// bd-w4pr1.13.15: DISTINCT and IN keep their keys in a hash set of canonical
+/// record bytes while every key has a canonical form, and in the index
+/// b-tree from the first key that has none. Both must give stock's answers,
+/// so the keys here are the ones for which record bytes and index equality
+/// disagree: an integer and the real of the same value (in either arrival
+/// order, including 0 / -0.0 and values on both sides of 2^53 and 2^63),
+/// text that a collation folds (NOCASE, RTRIM) arriving after keys the set
+/// already holds, text and blobs with the same bytes, NULLs, a multi-column
+/// key mixing all of them, and the same statements in a UTF-16 database,
+/// where text never compares bytewise. A set that compared raw bytes would
+/// return 1 and 1.0 as two rows; one that kept collated text would return
+/// 'Ann' and 'ann' as two.
+#[test]
+fn membership_sets_match_rusqlite_oracle() {
+    asupersync::test_utils::run_test(|| async {
+        for encoding in ["UTF-8", "UTF-16le"] {
+            let f = Connection::open(":memory:").await.unwrap();
+            let r = rusqlite::Connection::open_in_memory().unwrap();
+            let pragma = format!("PRAGMA encoding = '{encoding}'");
+            f.execute(&pragma).await.unwrap();
+            r.execute_batch(&pragma).unwrap();
+            for s in [
+                "CREATE TABLE v(id INTEGER PRIMARY KEY, k, n TEXT COLLATE NOCASE, \
+                 t TEXT COLLATE RTRIM, b TEXT)",
+                "INSERT INTO v(k, n, t, b) VALUES \
+                 (1.0, 'Ann', 'x', 'p'), (1, 'ann', 'x  ', 'p'), ('1', 'ANN', 'x', 'P'), \
+                 (0, 'bob', 'y ', 'p '), (-0.0, 'Bob', 'y', 'p'), (0.0, 'bob ', ' y', 'q'), \
+                 (9007199254740992, NULL, NULL, NULL), (9007199254740993, NULL, NULL, NULL), \
+                 (9007199254740992.0, 'c', 'z', 'r'), (9223372036854775807, 'c', 'z', 'r'), \
+                 (9223372036854775808.0, 'C', 'z ', 'r'), (-9223372036854775808, 'd', 'w', 's'), \
+                 (-9223372036854775808.0, 'D', 'w', 's'), (2.5, 'e', 'v', 't'), \
+                 (2.5, 'E', 'v ', 't'), (x'31', 'f', 'u', 'u'), ('', '', '', ''), \
+                 (x'', ' ', ' ', ' '), (NULL, NULL, NULL, NULL), (3, 'g', 'g', 'g'), \
+                 (3.0, 'g', 'g', 'g'), (1e300, 'h', 'h', 'h'), (-1e300, 'h', 'h', 'h')",
+                // Integer keys first, then the reals equal to them, then
+                // reals with a fraction: 3,000 rows, 1,500 distinct values.
+                "CREATE TABLE w(id INTEGER PRIMARY KEY, x, s TEXT)",
+                "WITH RECURSIVE c(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM c WHERE i < 2999) \
+                 INSERT INTO w SELECT i + 1, \
+                   CASE WHEN i < 1000 THEN i WHEN i < 2000 THEN CAST(i - 1000 AS REAL) \
+                     ELSE (i - 2000) / 2 + 0.5 END, \
+                   'key-' || (i * 7919 % 2500) FROM c",
+                "CREATE TABLE lst(y)",
+                "INSERT INTO lst VALUES (1.0), (0), (2.5), ('1'), (9007199254740993), (3.0), \
+                 (x'31'), (-9223372036854775808.0)",
+                "CREATE TABLE lstn(y TEXT COLLATE NOCASE)",
+                "INSERT INTO lstn VALUES ('ANN'), ('bob'), ('zz')",
+            ] {
+                f.execute(s).await.unwrap();
+                r.execute(s, []).unwrap();
+            }
+
+            let queries = [
+                "SELECT DISTINCT k FROM v",
+                "SELECT DISTINCT n FROM v",
+                "SELECT DISTINCT t FROM v",
+                "SELECT DISTINCT b FROM v",
+                "SELECT DISTINCT k, n FROM v",
+                "SELECT DISTINCT n, k FROM v",
+                "SELECT DISTINCT b, k FROM v",
+                "SELECT DISTINCT k, t, b FROM v",
+                "SELECT DISTINCT typeof(k), k = 0, n FROM v",
+                "SELECT count(*) FROM (SELECT DISTINCT k FROM v)",
+                "SELECT count(*) FROM (SELECT DISTINCT n COLLATE BINARY FROM v)",
+                "SELECT count(*) FROM (SELECT DISTINCT b COLLATE NOCASE FROM v)",
+                "SELECT count(*), sum(x), min(x), max(x) FROM (SELECT DISTINCT x FROM w)",
+                "SELECT count(*), min(s), max(s) FROM (SELECT DISTINCT s FROM w)",
+                "SELECT count(*) FROM (SELECT DISTINCT x, s FROM w)",
+                "SELECT DISTINCT x FROM w WHERE id BETWEEN 995 AND 1005 OR id BETWEEN 1995 AND 2005",
+                "SELECT id, k FROM v WHERE k IN (1, 0.0, 2.5, '1', 9007199254740992, 3, \
+                 -9223372036854775808, x'31', 1e300, 77) ORDER BY id",
+                "SELECT id FROM v WHERE k NOT IN (1, 0.0, 2.5, '1', 9007199254740992, 3, \
+                 -9223372036854775808, x'31', 1e300, 77) ORDER BY id",
+                "SELECT id FROM v WHERE k IN (1.0, 0, 9007199254740993.0, 9223372036854775807, \
+                 9223372036854775808.0, '', x'', 4, 5, 6) ORDER BY id",
+                "SELECT id FROM v WHERE n IN ('ANN', 'BOB', 'c', 'x1', 'x2', 'x3', 'x4', 'x5', 'x6') \
+                 ORDER BY id",
+                "SELECT id FROM v WHERE t IN ('x', 'y', 'z   ', 'x1', 'x2', 'x3', 'x4', 'x5', 'x6') \
+                 ORDER BY id",
+                "SELECT id FROM v WHERE b IN ('p', 'P ', 'q', 'x1', 'x2', 'x3', 'x4', 'x5', 'x6') \
+                 ORDER BY id",
+                "SELECT id FROM v WHERE k IN (SELECT y FROM lst) ORDER BY id",
+                "SELECT id FROM v WHERE k NOT IN (SELECT y FROM lst) ORDER BY id",
+                "SELECT id FROM v WHERE n IN (SELECT y FROM lstn) ORDER BY id",
+                "SELECT id FROM v WHERE b IN (SELECT y FROM lstn) ORDER BY id",
+                "SELECT count(*), sum(id) FROM w WHERE x IN (SELECT y FROM lst)",
+                "SELECT count(*), sum(id) FROM w WHERE x IN (0.0, 1, 2.0, 2.5, 999, 999.5, 1000, \
+                 '3', 4.0, 5)",
+            ];
+
+            let mut diffs = Vec::new();
+            for q in queries {
+                let fr = fq(&f, q).await;
+                let rr = rq(&r, q);
+                assert_ne!(rr, vec![vec!["ERR".to_owned()]], "{encoding}: stock rejects `{q}`");
+                if fr != rr {
+                    let shown = |rows: &[Vec<String>]| format!("{:?}", &rows[..rows.len().min(14)]);
+                    diffs.push(format!(
+                        "  `{q}`\n     frank= {}\n     stock= {}",
+                        shown(&fr),
+                        shown(&rr)
+                    ));
+                }
+            }
+            assert!(
+                diffs.is_empty(),
+                "{encoding}: {} membership-set divergence(s) vs rusqlite:\n{}",
+                diffs.len(),
+                diffs.join("\n")
+            );
+        }
+    });
+}

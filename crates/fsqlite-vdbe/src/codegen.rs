@@ -239,6 +239,11 @@ const OPFLAG_IDX_NCHANGE: u16 = 0x40;
 /// after it, so the engine may answer a repeated probe record without seeking
 /// (bd-w4pr1.13.15).
 const OPFLAG_PROBE_MEMBERSHIP_ONLY: u16 = 0x01;
+/// On `OpenAutoindex`: the ephemeral index is a membership set. The site emits
+/// only `IdxInsert` and `Found` with [`OPFLAG_PROBE_MEMBERSHIP_ONLY`] on the
+/// cursor (and `Close`), so the engine may hold its keys in a hash set
+/// instead of a b-tree (bd-w4pr1.13.15).
+const OPFLAG_MEMBERSHIP_SET: u16 = 0x01;
 /// Marks the `Delete`/`Insert` pair of an UPDATE whose rowid cannot change; the
 /// engine then rewrites the row in place instead of deleting and re-inserting.
 const OPFLAG_UPDATE_KEEPS_ROWID: u16 = 0x80;
@@ -10062,7 +10067,7 @@ fn codegen_select_distinct_scan(
         out_col_count,
         0,
         P4::Str(distinct_collations),
-        0,
+        OPFLAG_MEMBERSHIP_SET,
     );
 
     // Open table for reading.
@@ -40882,7 +40887,7 @@ fn emit_once_materialized_in_list(
         1,
         0,
         autoindex_collation,
-        0,
+        OPFLAG_MEMBERSHIP_SET,
     );
     let r_value = b.alloc_temp();
     let r_key = b.alloc_temp();
@@ -40991,7 +40996,7 @@ fn emit_once_materialized_in_probe_source(
         1,
         0,
         autoindex_collation,
-        0,
+        OPFLAG_MEMBERSHIP_SET,
     );
     b.emit_op(
         Opcode::OpenRead,
