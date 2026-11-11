@@ -5761,6 +5761,38 @@ async fn async_rwlock_read<'a, T>(
     }
 }
 
+/// [`async_rwlock_read`] for the lock a page read takes: free on almost every
+/// call and taken once per page (bd-w4pr1.13.14).
+///
+/// When the section is not masked, no cancellation is published and the lock
+/// is free, take it with `try_read` instead of building the native read
+/// future. That future's first poll runs a full native checkpoint (a clock
+/// read and a budget snapshot) before it looks at the lock. The cursor that
+/// asked for the page already runs that checkpoint on its own schedule
+/// (`observe_cursor_cancellation`), and this path checks the same two
+/// published flags [`await_pager_admission`] checks before an uncontended
+/// acquisition. `try_read` admits a reader under the rule of the future's
+/// first poll: no active writer and none waiting. Everything else (a
+/// published cancellation, a masked section, no native context, a held or
+/// poisoned lock) takes [`async_rwlock_read`] unchanged.
+async fn async_rwlock_read_for_page<'a, T>(
+    lock: &'a AsyncRwLock<T>,
+    cx: &Cx,
+    label: &str,
+) -> Result<asupersync::sync::RwLockReadGuard<'a, T>> {
+    #[cfg(feature = "native")]
+    if cx.mask_depth() == 0
+        && !cx.is_cancel_requested()
+        && cx
+            .attached_native_cx()
+            .is_some_and(|native_cx| !native_cx.published_cancel_requested())
+        && let Ok(guard) = lock.try_read()
+    {
+        return Ok(guard);
+    }
+    async_rwlock_read(lock, cx, label).await
+}
+
 async fn async_rwlock_write<'a, T>(
     lock: &'a AsyncRwLock<T>,
     cx: &Cx,
@@ -5934,19 +5966,20 @@ async fn read_page_from_wal_backend(
     cx: &Cx,
     page_no: PageNumber,
 ) -> Result<Option<Vec<u8>>> {
-    match with_wal_backend_read(wal_backend, cx, |wal, cx| {
-        Box::pin(async move {
-            if wal.supports_pinned_reads() {
-                wal.read_page_pinned(cx, page_no.get())
-                    .await
-                    .map(WalReadLookup::Ready)
-            } else {
-                Ok(WalReadLookup::NeedsWriteFallback)
-            }
-        })
-    })
-    .await?
-    {
+    // [`with_wal_backend_read`] without its boxed callback: this runs once
+    // per page read, so the lookup borrows the guard directly.
+    let lookup = {
+        let backend = wal_backend_handle(wal_backend)?;
+        #[cfg(test)]
+        record_commit_fast_path_lock(CommitFastPathLockClass::WalBackendRead);
+        let guard = async_rwlock_read_for_page(&backend, cx, "WAL backend").await?;
+        if guard.supports_pinned_reads() {
+            WalReadLookup::Ready(guard.read_page_pinned(cx, page_no.get()).await?)
+        } else {
+            WalReadLookup::NeedsWriteFallback
+        }
+    };
+    match lookup {
         WalReadLookup::Ready(data) => Ok(data),
         WalReadLookup::NeedsWriteFallback => {
             with_wal_backend(wal_backend, cx, |wal, cx| wal.read_page(cx, page_no.get())).await
@@ -10108,7 +10141,7 @@ impl<F: VfsFile> PagerInner<F> {
         }
 
         let first_read = {
-            let db_file = shared_db_file_read(&self.db_file, cx).await?;
+            let db_file = async_rwlock_read_for_page(&self.db_file, cx, "database-file").await?;
             cache.read_page_copy(cx, &*db_file, page_no).await
         };
         match first_read {
@@ -31615,6 +31648,106 @@ mod tests {
                     }
                 }
             }
+        });
+    }
+
+    /// bd-w4pr1.13.14: the page-read acquisition takes a free lock without
+    /// the native read future and keeps every other outcome of
+    /// `async_rwlock_read`. A cancellation published before the call aborts
+    /// although the lock is free; a held write lock makes the read wait, and
+    /// a cancellation during the wait aborts it; a waiting writer is not
+    /// overtaken; a masked section completes under a cancelled context.
+    #[cfg(feature = "native")]
+    #[test]
+    fn page_read_lock_keeps_cancellation_and_writer_preference() {
+        asupersync::test_utils::run_test(|| async {
+            let lock = AsyncRwLock::new(0_u8);
+            let mut task_cx = std::task::Context::from_waker(std::task::Waker::noop());
+            let live_cx = || {
+                let cx = Cx::new();
+                cx.set_native_cx(asupersync::Cx::for_testing());
+                cx
+            };
+
+            // A free lock is taken at once, and readers share it.
+            let cx = live_cx();
+            let first = async_rwlock_read_for_page(&lock, &cx, "free")
+                .await
+                .unwrap();
+            let second = async_rwlock_read_for_page(&lock, &cx, "shared")
+                .await
+                .unwrap();
+            assert!(lock.try_write().is_err());
+            drop((first, second));
+            assert!(lock.try_write().is_ok());
+
+            // A published cancellation aborts even though the lock is free.
+            let cancelled = live_cx();
+            cancelled.cancel();
+            assert!(matches!(
+                async_rwlock_read_for_page(&lock, &cancelled, "cancelled").await,
+                Err(FrankenError::Abort)
+            ));
+            assert!(lock.try_write().is_ok(), "an aborted read holds nothing");
+
+            // A held write lock makes the read wait; cancelling the wait
+            // aborts it and retires the waiter.
+            let cx = live_cx();
+            let blocker = lock.try_write().unwrap();
+            let mut acquire = Box::pin(async {
+                async_rwlock_read_for_page(&lock, &cx, "blocked")
+                    .await
+                    .map(drop)
+            });
+            assert!(acquire.as_mut().poll(&mut task_cx).is_pending());
+            cx.cancel();
+            assert!(matches!(
+                acquire.as_mut().poll(&mut task_cx),
+                std::task::Poll::Ready(Err(FrankenError::Abort))
+            ));
+            drop(acquire);
+            drop(blocker);
+            assert!(lock.try_write().is_ok(), "the cancelled waiter must retire");
+
+            // A page read does not overtake a writer that is already waiting.
+            let (reader_cx, writer_cx, late_cx) = (live_cx(), live_cx(), live_cx());
+            let reader = async_rwlock_read_for_page(&lock, &reader_cx, "reader")
+                .await
+                .unwrap();
+            let mut writer = Box::pin(async {
+                async_rwlock_write(&lock, &writer_cx, "writer")
+                    .await
+                    .map(drop)
+            });
+            assert!(writer.as_mut().poll(&mut task_cx).is_pending());
+            let mut late_reader = Box::pin(async {
+                async_rwlock_read_for_page(&lock, &late_cx, "late reader")
+                    .await
+                    .map(drop)
+            });
+            assert!(
+                late_reader.as_mut().poll(&mut task_cx).is_pending(),
+                "a page read must queue behind a waiting writer"
+            );
+            drop(reader);
+            assert!(matches!(
+                writer.as_mut().poll(&mut task_cx),
+                std::task::Poll::Ready(Ok(()))
+            ));
+            assert!(matches!(
+                late_reader.as_mut().poll(&mut task_cx),
+                std::task::Poll::Ready(Ok(()))
+            ));
+
+            // A masked section completes under a cancelled context.
+            let masked_cx = live_cx();
+            masked_cx.cancel();
+            let _mask = masked_cx.masked();
+            assert!(
+                async_rwlock_read_for_page(&lock, &masked_cx, "masked")
+                    .await
+                    .is_ok()
+            );
         });
     }
 
