@@ -149844,6 +149844,15 @@ impl<'a> SelectStructureResolver<'a> {
         named_windows: &'a [fsqlite_ast::WindowDef],
         outer_ctes: &[fsqlite_ast::Cte],
     ) -> Result<()> {
+        // Everything below serves the ORDER BY terms. The output width, the
+        // join column map, the USING skip set and the alias set are read only
+        // while a term is resolved, and building them cannot fail and changes
+        // nothing, so a SELECT without ORDER BY has nothing to validate here.
+        // Building them anyway cost a point query about 9,000 instructions on
+        // every validation, and a statement is validated more than once.
+        if select.order_by.is_empty() {
+            return Ok(());
+        }
         let output_width =
             self.connection
                 .select_result_column_count(select, outer_ctes, &mut Vec::new());
