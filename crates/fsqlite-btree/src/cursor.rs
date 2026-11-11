@@ -11140,7 +11140,9 @@ impl<P: PageWriter> BtCursor<P> {
                             cursor.clear_rightmost_leaf_cache();
                             let seek = cursor.table_seek_for_insert(cx, rowid).await?;
                             if seek.is_found() {
-                                return Err(FrankenError::PrimaryKeyViolation);
+                                return Err(FrankenError::PrimaryKeyViolation {
+                                    columns: String::new(),
+                                });
                             }
                             return cursor
                                 .table_insert_from_current_position(cx, rowid, data)
@@ -11252,7 +11254,9 @@ impl<P: PageWriter> BtCursor<P> {
                         cursor.clear_rightmost_leaf_cache();
                         let seek = cursor.table_seek_for_insert(cx, rowid).await?;
                         if seek.is_found() {
-                            return Err(FrankenError::PrimaryKeyViolation);
+                            return Err(FrankenError::PrimaryKeyViolation {
+                                columns: String::new(),
+                            });
                         }
                         return cursor
                             .table_insert_from_current_position(cx, rowid, data)
@@ -11304,7 +11308,9 @@ impl<P: PageWriter> BtCursor<P> {
                         cursor.clear_rightmost_leaf_cache();
                         let seek = cursor.table_seek_for_insert(cx, rowid).await?;
                         if seek.is_found() {
-                            return Err(FrankenError::PrimaryKeyViolation);
+                            return Err(FrankenError::PrimaryKeyViolation {
+                                columns: String::new(),
+                            });
                         }
                         return cursor
                             .table_insert_from_current_position(cx, rowid, data)
@@ -12276,7 +12282,11 @@ impl<P: PageWriter> BtreeCursorOps for BtCursor<P> {
 
                 let seek = cursor.table_seek_for_insert(cx, rowid).await?;
                 if seek.is_found() {
-                    return Err(FrankenError::PrimaryKeyViolation);
+                    // The B-tree has no schema to name the rowid column; the
+                    // SQL layer that does labels the conflict.
+                    return Err(FrankenError::PrimaryKeyViolation {
+                        columns: String::new(),
+                    });
                 }
                 let rightmost_insert = cursor.at_eof;
                 cursor
@@ -15478,7 +15488,7 @@ mod tests {
             let cx = Cx::new();
             let mut cursor = BtCursor::new(PrefetchProbeStore::new(store), pn(2), USABLE, true);
             let err = cursor.table_insert(&cx, 7, b"dupe").await.unwrap_err();
-            assert!(matches!(err, FrankenError::PrimaryKeyViolation));
+            assert!(matches!(err, FrankenError::PrimaryKeyViolation { .. }));
         });
     }
 
@@ -22151,7 +22161,7 @@ mod tests {
                             // Duplicate: inserting an existing rowid must fail.
                             let result = cursor.table_insert(&cx, *rowid, payload).await;
                             proptest::prop_assert!(
-                                matches!(result, Err(FrankenError::PrimaryKeyViolation)),
+                                matches!(result, Err(FrankenError::PrimaryKeyViolation { .. })),
                                 "duplicate rowid {} should produce PrimaryKeyViolation, got {:?}",
                                 rowid,
                                 result,
@@ -22215,7 +22225,7 @@ mod tests {
                         if reference.contains_key(rowid) {
                             let result = cursor.table_insert(&cx, *rowid, payload).await;
                             proptest::prop_assert!(
-                                matches!(result, Err(FrankenError::PrimaryKeyViolation)),
+                                matches!(result, Err(FrankenError::PrimaryKeyViolation { .. })),
                                 "duplicate rowid {} at step {} should produce PrimaryKeyViolation, got {:?}",
                                 rowid,
                                 step,
@@ -22558,7 +22568,7 @@ mod tests {
                             // Duplicate: must produce PrimaryKeyViolation.
                             let result = cursor.table_insert(&cx, *rowid, payload).await;
                             proptest::prop_assert!(
-                                matches!(result, Err(FrankenError::PrimaryKeyViolation)),
+                                matches!(result, Err(FrankenError::PrimaryKeyViolation { .. })),
                                 "duplicate rowid {} should produce PrimaryKeyViolation, got {:?}",
                                 rowid,
                                 result,

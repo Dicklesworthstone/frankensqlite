@@ -152,7 +152,7 @@ use fsqlite_btree::{
     BtCursor, BtreeCursorOps, BtreePageHeader, BtreePageType, MemPageStore, PageReader, PageWriter,
     SeekResult, header_offset_for_page,
 };
-use fsqlite_error::{ErrorCode, FrankenError, Result};
+use fsqlite_error::{ErrorCode, FrankenError, Result, SQLITE_CONSTRAINT_PRIMARYKEY};
 use fsqlite_func::collation::CollationRegistry;
 use fsqlite_func::vtab::ColumnContext;
 use fsqlite_func::{
@@ -272,6 +272,13 @@ const OPFLAG_UPDATE_KEEPS_ROWID: u16 = 0x80;
 /// Marks a `Halt(SQLITE_CONSTRAINT)` emitted after a non-mutating UNIQUE
 /// preflight. P4 contains the constraint's column label.
 const OPFLAG_HALT_UNIQUE: u16 = 0x01;
+/// As [`OPFLAG_HALT_UNIQUE`], for a PRIMARY KEY conflict: raises
+/// `PrimaryKeyViolation` (SQLITE_CONSTRAINT_PRIMARYKEY).
+const OPFLAG_HALT_PRIMARY_KEY: u16 = 0x02;
+/// Marks a UNIQUE `IdxInsert` into the index (or WITHOUT ROWID table) that
+/// implements a PRIMARY KEY: its conflict raises `PrimaryKeyViolation`
+/// (SQLITE_CONSTRAINT_PRIMARYKEY) instead of `UniqueViolation`.
+const OPFLAG_IDX_PRIMARY_KEY: u16 = 0x100;
 const STORAGE_CURSOR_LAYOUT_PREFIX_BYTES: usize = 256;
 #[cfg(test)]
 const VDBE_ENGINE_INLINE_SIZE_BUDGET_BYTES: usize = 3 * 1024;
@@ -672,6 +679,10 @@ struct UniqueConstraintState {
     /// caller that does have the schema. `None` keeps the previous behaviour
     /// (the caller falls back to whatever it reported before).
     label: Option<String>,
+    /// Whether this constraint is the table's PRIMARY KEY (a non-INTEGER
+    /// PRIMARY KEY, or a WITHOUT ROWID table's), so a violation reports
+    /// SQLITE_CONSTRAINT_PRIMARYKEY rather than _UNIQUE.
+    primary_key: bool,
 }
 
 fn unique_constraint_collation_is_indexable(collation: Option<&str>) -> bool {
@@ -786,6 +797,7 @@ impl UniqueConstraintState {
             collations,
             index,
             label,
+            primary_key: false,
         }
     }
 }
@@ -856,7 +868,7 @@ impl MemTable {
         cols: Vec<usize>,
         collations: Vec<Option<String>>,
     ) {
-        self.add_unique_column_group_labeled(cols, collations, None);
+        self.add_unique_column_group_labeled(cols, collations, None, false);
     }
 
     /// As [`Self::add_unique_column_group_with_collations`], plus the qualified
@@ -864,13 +876,17 @@ impl MemTable {
     /// (bd-towj6). Callers that know the table and column names should use this
     /// form; without a label the violation falls back to naming the IPK column,
     /// which is wrong for any constraint that is not the rowid alias.
+    /// `primary_key` marks the table's (non-INTEGER) PRIMARY KEY, whose
+    /// violation is SQLITE_CONSTRAINT_PRIMARYKEY rather than _UNIQUE.
     pub fn add_unique_column_group_labeled(
         &mut self,
         cols: Vec<usize>,
         collations: Vec<Option<String>>,
         label: Option<String>,
+        primary_key: bool,
     ) {
         let mut constraint = UniqueConstraintState::new(cols, collations, label);
+        constraint.primary_key = primary_key;
         if let Some(index) = constraint.index.as_mut() {
             for row in self.rows.iter() {
                 if let Some(key) = Self::unique_key_for_constraint(
@@ -1009,9 +1025,9 @@ impl MemTable {
     /// already reporting a violation, so the second pass costs nothing on the
     /// success path. Returns `None` when the conflicting constraint was
     /// registered without a label, leaving the caller's previous wording in
-    /// place.
+    /// place. The flag is whether that constraint is the table's PRIMARY KEY.
     #[must_use]
-    pub fn find_unique_conflict_label(&self, new_values: &[SqliteValue]) -> Option<&str> {
+    pub fn find_unique_conflict_label(&self, new_values: &[SqliteValue]) -> Option<(&str, bool)> {
         let mut collations = None;
         for constraint in self.unique_constraints.iter() {
             let violated = if let Some(index) = &constraint.index {
@@ -1038,7 +1054,10 @@ impl MemTable {
                 })
             };
             if violated {
-                return constraint.label.as_deref();
+                return constraint
+                    .label
+                    .as_deref()
+                    .map(|label| (label, constraint.primary_key));
             }
         }
         None
@@ -1157,6 +1176,7 @@ impl MemTable {
                         collations: constraint.collations.clone(),
                         index: constraint.index.as_ref().map(|_| BTreeMap::new()),
                         label: constraint.label.clone(),
+                        primary_key: constraint.primary_key,
                     })
                     .collect(),
             );
@@ -8740,6 +8760,19 @@ impl VdbeEngine {
             .unwrap_or_default()
     }
 
+    /// Halt code for a rowid collision in the table at `root_page`. On a table
+    /// with an INTEGER PRIMARY KEY the rowid *is* the PRIMARY KEY, so stock
+    /// raises SQLITE_CONSTRAINT_PRIMARYKEY (bd-w4pr1.22). A hidden rowid keeps
+    /// the plain constraint code: stock's SQLITE_CONSTRAINT_ROWID has no
+    /// `FrankenError` variant yet, and it is not a PRIMARY KEY.
+    fn rowid_conflict_halt_code(&self, root_page: i32) -> i32 {
+        if self.rowid_alias_col_by_root_page.contains_key(&root_page) {
+            SQLITE_CONSTRAINT_PRIMARYKEY
+        } else {
+            ErrorCode::Constraint as i32
+        }
+    }
+
     fn index_desc_flags_for_cursor(&self, cursor_id: i32) -> Vec<bool> {
         if let Some(cursor) = self.storage_cursors.get(&cursor_id) {
             return cursor.cursor.index_desc_flags().to_vec();
@@ -10482,11 +10515,16 @@ impl VdbeEngine {
                         self.constraint_failure_action = u16::try_from(op.p2)
                             .ok()
                             .and_then(ConstraintFailureAction::from_oe);
-                        if op.p1 == ErrorCode::Constraint as i32 && op.p5 == OPFLAG_HALT_UNIQUE {
+                        if op.p1 == ErrorCode::Constraint as i32
+                            && matches!(op.p5, OPFLAG_HALT_UNIQUE | OPFLAG_HALT_PRIMARY_KEY)
+                        {
                             let columns = match &op.p4 {
                                 P4::Str(columns) => columns.clone(),
                                 _ => String::new(),
                             };
+                            if op.p5 == OPFLAG_HALT_PRIMARY_KEY {
+                                return Err(FrankenError::PrimaryKeyViolation { columns });
+                            }
                             return Err(FrankenError::UniqueViolation { columns });
                         }
                         let msg = match &op.p4 {
@@ -12558,7 +12596,7 @@ impl VdbeEngine {
                                                 },
                                             );
                                         return Ok(Some(ExecOutcome::Error {
-                                            code: ErrorCode::Constraint as i32,
+                                            code: self.rowid_conflict_halt_code(root_page),
                                             message,
                                         }));
                                     }
@@ -12743,19 +12781,33 @@ impl VdbeEngine {
                                             // reported against the IPK column
                                             // too. Prefer that constraint's own
                                             // label when it is the one violated.
+                                            //
+                                            // bd-w4pr1.22: an IPK collision, or
+                                            // a violated PRIMARY KEY constraint,
+                                            // halts with SQLITE_CONSTRAINT_PRIMARYKEY.
                                             let unique_label = (!rowid_conflict)
                                                 .then(|| {
                                                     self.db.as_ref().and_then(|db| {
                                                         db.get_table(root).and_then(|table| {
                                                             table
                                                                 .find_unique_conflict_label(&values)
-                                                                .map(str::to_owned)
+                                                                .map(|(label, primary_key)| {
+                                                                    (label.to_owned(), primary_key)
+                                                                })
                                                         })
                                                     })
                                                 })
                                                 .flatten();
-                                            let message = unique_label.map_or_else(
-                                                || {
+                                            let (message, code) = match unique_label {
+                                                Some((label, primary_key)) => (
+                                                    format!("UNIQUE constraint failed: {label}"),
+                                                    if primary_key {
+                                                        SQLITE_CONSTRAINT_PRIMARYKEY
+                                                    } else {
+                                                        ErrorCode::Constraint as i32
+                                                    },
+                                                ),
+                                                None => (
                                                     self.ipk_label_by_root_page
                                                         .get(&root)
                                                         .map_or_else(
@@ -12768,12 +12820,16 @@ impl VdbeEngine {
                                                                     "UNIQUE constraint failed: {label}"
                                                                 )
                                                             },
-                                                        )
-                                                },
-                                                |label| format!("UNIQUE constraint failed: {label}"),
-                                            );
+                                                        ),
+                                                    if rowid_conflict {
+                                                        self.rowid_conflict_halt_code(root)
+                                                    } else {
+                                                        ErrorCode::Constraint as i32
+                                                    },
+                                                ),
+                                            };
                                             return Ok(Some(ExecOutcome::Error {
-                                                code: ErrorCode::Constraint as i32,
+                                                code,
                                                 message,
                                             }));
                                         }
@@ -12972,6 +13028,7 @@ impl VdbeEngine {
                     }
                     let n_idx_cols = op.p3 as usize;
                     let count_logical_change = (op.p5 & OPFLAG_IDX_NCHANGE) != 0;
+                    let is_primary_key = (op.p5 & OPFLAG_IDX_PRIMARY_KEY) != 0;
                     let mut inserted = false;
 
                     // If a previous IdxInsert for the same row triggered IGNORE,
@@ -13324,8 +13381,16 @@ impl VdbeEngine {
                                                     self.make_record_lookaside
                                                         .replace_cleared_buf(key_blob);
                                                 }
+                                                let columns = columns_label.to_owned();
+                                                if is_primary_key {
+                                                    return Err(
+                                                        FrankenError::PrimaryKeyViolation {
+                                                            columns,
+                                                        },
+                                                    );
+                                                }
                                                 return Err(FrankenError::UniqueViolation {
-                                                    columns: columns_label.to_owned(),
+                                                    columns,
                                                 });
                                             }
                                         }
@@ -16732,17 +16797,20 @@ impl VdbeEngine {
                         // conflicted rather than a placeholder. The other TEMP
                         // insert path names the IPK column here, so without this
                         // the two paths report differently for the same defect.
-                        let columns = self
+                        let (columns, primary_key) = self
                             .db
                             .as_ref()
                             .and_then(|db| db.get_table(root_page))
                             .and_then(|table| table.find_unique_conflict_label(&values))
                             .map_or_else(
-                                || "TEMP table unique constraint".to_owned(),
-                                str::to_owned,
+                                || ("TEMP table unique constraint".to_owned(), false),
+                                |(label, primary_key)| (label.to_owned(), primary_key),
                             );
                         self.constraint_failure_action =
                             ConstraintFailureAction::from_oe(op.p5 & 0x0F);
+                        if primary_key {
+                            return Err(FrankenError::PrimaryKeyViolation { columns });
+                        }
                         return Err(FrankenError::UniqueViolation { columns });
                     }
                     let db = self.db.as_mut().ok_or_else(|| {

@@ -11314,7 +11314,9 @@ impl VirtualTable for Fts5Table {
                 r
             };
             if self.has_document_or_shadow_rowid(rowid) {
-                return Err(FrankenError::PrimaryKeyViolation);
+                return Err(FrankenError::PrimaryKeyViolation {
+                    columns: String::new(),
+                });
             }
             self.ensure_shadow_rows_materializable_for_mutation()?;
 
@@ -11350,7 +11352,9 @@ impl VirtualTable for Fts5Table {
             old_rowid
         };
         if old_rowid != new_rowid && self.has_document_or_shadow_rowid(new_rowid) {
-            return Err(FrankenError::PrimaryKeyViolation);
+            return Err(FrankenError::PrimaryKeyViolation {
+                columns: String::new(),
+            });
         }
         if !self.has_document_or_shadow_rowid(old_rowid) {
             return Err(FrankenError::Internal(
@@ -23050,7 +23054,7 @@ mod tests {
                 ],
             )
             .unwrap_err();
-        assert!(matches!(err, FrankenError::PrimaryKeyViolation));
+        assert!(matches!(err, FrankenError::PrimaryKeyViolation { .. }));
 
         assert_eq!(vtab.get_document(1).unwrap(), &["alpha original"]);
         assert_eq!(vtab.search("alpha").unwrap()[0].0, 1);
@@ -23084,7 +23088,7 @@ mod tests {
                 ],
             )
             .unwrap_err();
-        assert!(matches!(err, FrankenError::PrimaryKeyViolation));
+        assert!(matches!(err, FrankenError::PrimaryKeyViolation { .. }));
 
         assert_eq!(vtab.get_document(1).unwrap(), &["alpha one"]);
         assert_eq!(vtab.get_document(2).unwrap(), &["beta two"]);

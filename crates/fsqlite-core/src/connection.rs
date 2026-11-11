@@ -94,7 +94,7 @@ use fsqlite_btree::{
 };
 #[cfg(not(test))]
 use fsqlite_btree::{set_btree_copy_profile_enabled, set_btree_metrics_enabled};
-use fsqlite_error::{ErrorCode, FrankenError, Result};
+use fsqlite_error::{ErrorCode, FrankenError, Result, SQLITE_CONSTRAINT_PRIMARYKEY};
 #[cfg(feature = "ext-fts5")]
 use fsqlite_ext_fts5::{
     FTS5_AVERAGES_ROWID, FTS5_STRUCTURE_ROWID, Fts5AveragesRecord, Fts5DataRowid, Fts5DeletedDoc,
@@ -35395,7 +35395,7 @@ impl Connection {
                         }
                     }
                 }
-                Err(FrankenError::PrimaryKeyViolation) => match conflict_action {
+                Err(error @ FrankenError::PrimaryKeyViolation { .. }) => match conflict_action {
                     fsqlite_ast::ConflictAction::Ignore => {
                         self.clear_prepared_direct_insert_append_hint_after_path_miss(
                             prepared_append_hint.as_ref(),
@@ -35407,7 +35407,7 @@ impl Connection {
                             prepared_append_hint.as_ref(),
                         );
                         if !cursor.table_move_to(execution_cx, rowid).await?.is_found() {
-                            return Err(FrankenError::PrimaryKeyViolation);
+                            return Err(error);
                         }
                         cursor.delete(execution_cx).await?;
                         cursor
@@ -35420,7 +35420,7 @@ impl Connection {
                         self.clear_prepared_direct_insert_append_hint_after_path_miss(
                             prepared_append_hint.as_ref(),
                         );
-                        return Err(FrankenError::PrimaryKeyViolation);
+                        return Err(error);
                     }
                 },
                 Err(error) => {
@@ -35623,16 +35623,18 @@ impl Connection {
             || can_use_prebuilt_constant_record
     }
 
-    /// Convert a `PrimaryKeyViolation` (raised by the regular-table direct
-    /// insert path on an INTEGER PRIMARY KEY / rowid duplicate) into SQLite's
-    /// user-facing "UNIQUE constraint failed: <table>.<ipk_col>" message. Any
-    /// other error passes through unchanged. bd-s9irk #1.
-    fn direct_insert_pk_violation_as_unique(
+    /// Name the column of a `PrimaryKeyViolation` (raised unlabeled by the
+    /// B-tree on the regular-table direct insert path's INTEGER PRIMARY KEY /
+    /// rowid duplicate) so it reads as stock's "UNIQUE constraint failed:
+    /// <table>.<ipk_col>" (bd-s9irk #1) and keeps stock's
+    /// SQLITE_CONSTRAINT_PRIMARYKEY code (bd-w4pr1.22). Any other error passes
+    /// through unchanged.
+    fn label_direct_insert_pk_violation(
         &self,
         error: FrankenError,
         table_name: &str,
     ) -> FrankenError {
-        if !matches!(error, FrankenError::PrimaryKeyViolation) {
+        if !matches!(error, FrankenError::PrimaryKeyViolation { .. }) {
             return error;
         }
         let ipk_column = self
@@ -35648,10 +35650,10 @@ impl Connection {
                     .map(|column| column.name.clone())
             });
         match ipk_column {
-            Some(column) => FrankenError::UniqueViolation {
+            Some(column) => FrankenError::PrimaryKeyViolation {
                 columns: format!("{table_name}.{column}"),
             },
-            None => FrankenError::PrimaryKeyViolation,
+            None => error,
         }
     }
 
@@ -36037,12 +36039,13 @@ impl Connection {
             result
         };
         // bd-s9irk #1: an INTEGER PRIMARY KEY (rowid) duplicate reaches this
-        // regular-table direct path as PrimaryKeyViolation; SQLite reports it as
-        // a UNIQUE violation naming the IPK column ("UNIQUE constraint failed:
-        // t.a"). FTS5/virtual tables use a different path, so this never
-        // rewrites their (generic) constraint errors.
+        // regular-table direct path as an unlabeled PrimaryKeyViolation; SQLite
+        // words it like a UNIQUE violation naming the IPK column ("UNIQUE
+        // constraint failed: t.a") under SQLITE_CONSTRAINT_PRIMARYKEY.
+        // FTS5/virtual tables use a different path, so this never rewrites
+        // their (generic) constraint errors.
         let result =
-            result.map_err(|error| self.direct_insert_pk_violation_as_unique(error, table_name));
+            result.map_err(|error| self.label_direct_insert_pk_violation(error, table_name));
         if matches!(result.as_ref(), Ok(Some(_))) {
             self.discard_cached_vdbe_engine();
             self.sync_memory_concurrent_pending_write_pages(direct.root_page)?;
@@ -57076,7 +57079,9 @@ impl Connection {
                     // wins), so the primary-key pre-checks are skipped. Non-replace
                     // inserts keep the strict PrimaryKeyViolation behavior. (GH #214)
                     if !rowids.insert(rowid) && !replace {
-                        return Err(FrankenError::PrimaryKeyViolation);
+                        return Err(FrankenError::PrimaryKeyViolation {
+                            columns: String::new(),
+                        });
                     }
                     let exists = self
                         .with_lazy_fts5_reader(table_name, async |reader| {
@@ -57084,7 +57089,9 @@ impl Connection {
                         })
                         .await?;
                     if exists && !replace {
-                        return Err(FrankenError::PrimaryKeyViolation);
+                        return Err(FrankenError::PrimaryKeyViolation {
+                            columns: String::new(),
+                        });
                     }
                 }
             }
@@ -67906,6 +67913,7 @@ impl Connection {
                                     &table_name,
                                     slot.definition.columns.iter().map(String::as_str),
                                 ),
+                                slot.is_primary_key(),
                             );
                         }
                     }
@@ -72211,6 +72219,7 @@ impl Connection {
                     name: table_name.clone(),
                 })?;
             if let Some(table) = self.db.borrow_mut().get_table_mut(table_root) {
+                // A `CREATE UNIQUE INDEX` never implements a PRIMARY KEY.
                 table.add_unique_column_group_labeled(
                     columns,
                     key_collations.clone(),
@@ -72218,6 +72227,7 @@ impl Connection {
                         table_name,
                         col_names.iter().map(String::as_str),
                     ),
+                    false,
                 );
             }
         }
@@ -86564,6 +86574,7 @@ impl Connection {
                                 &temp_schema.name,
                                 index.columns.iter().map(String::as_str),
                             ),
+                            temp_schema.index_is_primary_key(index),
                         );
                     }
                 }
@@ -106972,6 +106983,7 @@ impl Connection {
                                         name.as_str(),
                                         slot.columns().iter().map(String::as_str),
                                     ),
+                                    slot.is_primary_key(),
                                 );
                             }
                         }
@@ -116835,9 +116847,19 @@ fn frankenerror_from_vdbe_halt(code: i32, message: String) -> FrankenError {
             column: column.to_owned(),
         };
     }
+    // bd-w4pr1.22: a PRIMARY KEY conflict reads like a UNIQUE one; the halt's
+    // extended code (SQLITE_CONSTRAINT_PRIMARYKEY, as stock's OP_Halt P1 carries
+    // it) is what tells them apart.
     if let Some(columns) = message.strip_prefix("UNIQUE constraint failed: ") {
-        return FrankenError::UniqueViolation {
-            columns: columns.to_owned(),
+        let columns = columns.to_owned();
+        if code == SQLITE_CONSTRAINT_PRIMARYKEY {
+            return FrankenError::PrimaryKeyViolation { columns };
+        }
+        return FrankenError::UniqueViolation { columns };
+    }
+    if message == "PRIMARY KEY constraint failed" {
+        return FrankenError::PrimaryKeyViolation {
+            columns: String::new(),
         };
     }
     if message == "FOREIGN KEY constraint failed" {
@@ -131578,6 +131600,14 @@ impl ImplicitAutoindexSlot {
     #[must_use]
     pub(crate) const fn is_hidden_without_rowid_primary_key(&self) -> bool {
         self.hidden_without_rowid_primary_key
+    }
+
+    /// Whether this slot is the table's PRIMARY KEY (possibly merged with a
+    /// UNIQUE constraint over the same key), whose conflict is
+    /// SQLITE_CONSTRAINT_PRIMARYKEY rather than _UNIQUE.
+    #[must_use]
+    pub(crate) const fn is_primary_key(&self) -> bool {
+        self.primary_key
     }
 
     #[must_use]
@@ -183591,9 +183621,14 @@ mod tests {
                 .execute("INSERT INTO u VALUES (1, 2);")
                 .await
                 .expect_err("duplicate PK must fail");
+            // bd-w4pr1.22: a composite PRIMARY KEY's index reports stock's
+            // SQLITE_CONSTRAINT_PRIMARYKEY, naming every key column.
             assert!(
-                matches!(err, FrankenError::UniqueViolation { .. }),
-                "UNIQUE must surface as the clean variant, got {err}"
+                matches!(
+                    &err,
+                    FrankenError::PrimaryKeyViolation { columns } if columns == "u.a, u.b"
+                ),
+                "a PRIMARY KEY conflict must surface as the clean variant, got {err}"
             );
             assert!(
                 !err.to_string().contains("internal error"),
@@ -201277,11 +201312,13 @@ mod tests {
                 .execute("INSERT INTO dst SELECT id, name FROM src ORDER BY id DESC;")
                 .await
                 .expect_err("duplicate primary key should fail INSERT ... SELECT");
+            // bd-w4pr1.22: an INTEGER PRIMARY KEY duplicate is a PRIMARY KEY
+            // violation (SQLITE_CONSTRAINT_PRIMARYKEY) in stock's wording.
             let err_text = err.to_string();
             assert!(
-                matches!(&err, FrankenError::UniqueViolation { .. })
-                    || err_text.contains("PRIMARY KEY constraint failed"),
-                "expected unique/primary-key violation, got {err}"
+                matches!(&err, FrankenError::PrimaryKeyViolation { .. })
+                    && err_text.starts_with("UNIQUE constraint failed: "),
+                "expected a labeled primary-key violation, got {err}"
             );
 
             // Statement-level ABORT semantics: the successful row before the
@@ -201328,11 +201365,13 @@ mod tests {
                 .execute("INSERT INTO dst SELECT id, name FROM src ORDER BY id DESC;")
                 .await
                 .expect_err("duplicate primary key should fail INSERT ... SELECT");
+            // bd-w4pr1.22: an INTEGER PRIMARY KEY duplicate is a PRIMARY KEY
+            // violation (SQLITE_CONSTRAINT_PRIMARYKEY) in stock's wording.
             let err_text = err.to_string();
             assert!(
-                matches!(&err, FrankenError::UniqueViolation { .. })
-                    || err_text.contains("PRIMARY KEY constraint failed"),
-                "expected unique/primary-key violation, got {err}"
+                matches!(&err, FrankenError::PrimaryKeyViolation { .. })
+                    && err_text.starts_with("UNIQUE constraint failed: "),
+                "expected a labeled primary-key violation, got {err}"
             );
 
             assert!(
@@ -201382,11 +201421,13 @@ mod tests {
                 .execute("INSERT OR ROLLBACK INTO dst SELECT id, name FROM src ORDER BY id DESC;")
                 .await
                 .expect_err("duplicate primary key should fail INSERT OR ROLLBACK ... SELECT");
+            // bd-w4pr1.22: an INTEGER PRIMARY KEY duplicate is a PRIMARY KEY
+            // violation (SQLITE_CONSTRAINT_PRIMARYKEY) in stock's wording.
             let err_text = err.to_string();
             assert!(
-                matches!(&err, FrankenError::UniqueViolation { .. })
-                    || err_text.contains("PRIMARY KEY constraint failed"),
-                "expected unique/primary-key violation, got {err}"
+                matches!(&err, FrankenError::PrimaryKeyViolation { .. })
+                    && err_text.starts_with("UNIQUE constraint failed: "),
+                "expected a labeled primary-key violation, got {err}"
             );
 
             assert!(
@@ -201423,11 +201464,13 @@ mod tests {
                 .execute("INSERT OR FAIL INTO dst VALUES (2, 'beta'), (1, 'dup');")
                 .await
                 .expect_err("duplicate primary key should fail INSERT OR FAIL");
+            // bd-w4pr1.22: an INTEGER PRIMARY KEY duplicate is a PRIMARY KEY
+            // violation (SQLITE_CONSTRAINT_PRIMARYKEY) in stock's wording.
             let err_text = err.to_string();
             assert!(
-                matches!(&err, FrankenError::UniqueViolation { .. })
-                    || err_text.contains("PRIMARY KEY constraint failed"),
-                "expected unique/primary-key violation, got {err}"
+                matches!(&err, FrankenError::PrimaryKeyViolation { .. })
+                    && err_text.starts_with("UNIQUE constraint failed: "),
+                "expected a labeled primary-key violation, got {err}"
             );
 
             assert!(
@@ -201487,11 +201530,13 @@ mod tests {
                 .execute("INSERT OR FAIL INTO dst SELECT id, name FROM src ORDER BY id DESC;")
                 .await
                 .expect_err("duplicate primary key should fail INSERT OR FAIL ... SELECT");
+            // bd-w4pr1.22: an INTEGER PRIMARY KEY duplicate is a PRIMARY KEY
+            // violation (SQLITE_CONSTRAINT_PRIMARYKEY) in stock's wording.
             let err_text = err.to_string();
             assert!(
-                matches!(&err, FrankenError::UniqueViolation { .. })
-                    || err_text.contains("PRIMARY KEY constraint failed"),
-                "expected unique/primary-key violation, got {err}"
+                matches!(&err, FrankenError::PrimaryKeyViolation { .. })
+                    && err_text.starts_with("UNIQUE constraint failed: "),
+                "expected a labeled primary-key violation, got {err}"
             );
 
             assert!(
@@ -201754,11 +201799,13 @@ mod tests {
                 )
                 .await
                 .expect_err("duplicate primary key should fail prepared INSERT OR ROLLBACK");
+            // bd-w4pr1.22: an INTEGER PRIMARY KEY duplicate is a PRIMARY KEY
+            // violation (SQLITE_CONSTRAINT_PRIMARYKEY) in stock's wording.
             let err_text = err.to_string();
             assert!(
-                matches!(&err, FrankenError::UniqueViolation { .. })
-                    || err_text.contains("PRIMARY KEY constraint failed"),
-                "expected unique/primary-key violation, got {err}"
+                matches!(&err, FrankenError::PrimaryKeyViolation { .. })
+                    && err_text.starts_with("UNIQUE constraint failed: "),
+                "expected a labeled primary-key violation, got {err}"
             );
 
             assert!(
@@ -201806,11 +201853,13 @@ mod tests {
                 )
                 .await
                 .expect_err("duplicate primary key should fail prepared INSERT OR FAIL");
+            // bd-w4pr1.22: an INTEGER PRIMARY KEY duplicate is a PRIMARY KEY
+            // violation (SQLITE_CONSTRAINT_PRIMARYKEY) in stock's wording.
             let err_text = err.to_string();
             assert!(
-                matches!(&err, FrankenError::UniqueViolation { .. })
-                    || err_text.contains("PRIMARY KEY constraint failed"),
-                "expected unique/primary-key violation, got {err}"
+                matches!(&err, FrankenError::PrimaryKeyViolation { .. })
+                    && err_text.starts_with("UNIQUE constraint failed: "),
+                "expected a labeled primary-key violation, got {err}"
             );
 
             assert!(
@@ -201873,11 +201922,13 @@ mod tests {
                 )
                 .await
                 .expect_err("duplicate primary key should fail default prepared INSERT");
+            // bd-w4pr1.22: an INTEGER PRIMARY KEY duplicate is a PRIMARY KEY
+            // violation (SQLITE_CONSTRAINT_PRIMARYKEY) in stock's wording.
             let err_text = err.to_string();
             assert!(
-                matches!(&err, FrankenError::UniqueViolation { .. })
-                    || err_text.contains("PRIMARY KEY constraint failed"),
-                "expected unique/primary-key violation, got {err}"
+                matches!(&err, FrankenError::PrimaryKeyViolation { .. })
+                    && err_text.starts_with("UNIQUE constraint failed: "),
+                "expected a labeled primary-key violation, got {err}"
             );
             assert!(
                 conn.in_transaction(),
@@ -224634,7 +224685,7 @@ mod without_rowid_runtime_tests {
                 .await
                 .unwrap_err();
             assert!(
-                matches!(err, FrankenError::UniqueViolation { .. }),
+                matches!(&err, FrankenError::PrimaryKeyViolation { columns } if columns == "wr.k"),
                 "duplicate WITHOUT ROWID primary key must conflict: {err:?}"
             );
 
@@ -226285,11 +226336,13 @@ mod autocommit_txn_tests {
                 .execute("INSERT INTO t VALUES (1)")
                 .await
                 .expect_err("duplicate insert should fail");
+            // bd-w4pr1.22: an INTEGER PRIMARY KEY duplicate is a PRIMARY KEY
+            // violation (SQLITE_CONSTRAINT_PRIMARYKEY) in stock's wording.
             let err_text = err.to_string();
             assert!(
-                matches!(&err, FrankenError::UniqueViolation { .. })
-                    || err_text.contains("PRIMARY KEY constraint failed"),
-                "expected unique/primary-key violation, got {err}"
+                matches!(&err, FrankenError::PrimaryKeyViolation { .. })
+                    && err_text.starts_with("UNIQUE constraint failed: "),
+                "expected a labeled primary-key violation, got {err}"
             );
             assert!(
                 conn.retained_autocommit_txn.borrow().is_none(),
@@ -229863,7 +229916,7 @@ SELECT x FROM t;
                 .execute("INSERT INTO messages_fts(rowid, body) VALUES (4, 'duplicate');")
                 .await
                 .expect_err("lazy append must reject an existing persisted rowid");
-            assert!(matches!(duplicate, FrankenError::PrimaryKeyViolation));
+            assert!(matches!(duplicate, FrankenError::PrimaryKeyViolation { .. }));
             drop(conn);
 
             let sqlite = rusqlite::Connection::open(&db_path).unwrap();

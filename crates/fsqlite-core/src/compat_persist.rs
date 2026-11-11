@@ -2169,6 +2169,7 @@ pub async fn load_from_sqlite(cx: &Cx, path: &Path) -> Result<LoadedState> {
                             &table_name_for_err,
                             slot.columns().iter().map(String::as_str),
                         ),
+                        slot.is_primary_key(),
                     );
                 }
             }

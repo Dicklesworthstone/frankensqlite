@@ -171,9 +171,19 @@ pub enum FrankenError {
     #[error("FOREIGN KEY constraint failed")]
     ForeignKeyViolation,
 
-    /// PRIMARY KEY constraint violation.
-    #[error("PRIMARY KEY constraint failed")]
-    PrimaryKeyViolation,
+    /// PRIMARY KEY constraint violation: a duplicate rowid / INTEGER PRIMARY
+    /// KEY, or a conflict in the index that implements a PRIMARY KEY (a
+    /// non-INTEGER PRIMARY KEY of a rowid table, or any WITHOUT ROWID table's
+    /// PRIMARY KEY).
+    ///
+    /// Stock SQLite words this exactly like a UNIQUE violation ("UNIQUE
+    /// constraint failed: t.a, t.b") and tells the two apart only by the
+    /// extended code, SQLITE_CONSTRAINT_PRIMARYKEY (1555). `columns` is that
+    /// qualified label. It is empty when the layer that raised the conflict
+    /// has no schema (the B-tree, an FTS5 table); the message is then the bare
+    /// "PRIMARY KEY constraint failed".
+    #[error("{}", primary_key_violation_message(.columns))]
+    PrimaryKeyViolation { columns: String },
 
     /// STRICT table datatype constraint violation (SQLITE_CONSTRAINT_DATATYPE).
     #[error("cannot store {actual} value in {column_type} column {column}")]
@@ -502,7 +512,40 @@ pub const SQLITE_OPEN_NEWER_FORMAT: i32 = 0x0E | (0x7F << 8);
 /// [`FrankenError::IncompatiblePeerEngine`].
 pub const SQLITE_OPEN_INCOMPATIBLE_PEER: i32 = 0x0E | (0x7E << 8);
 
+/// `SQLITE_CONSTRAINT_PRIMARYKEY`: `19 | (6 << 8) = 1555`.
+///
+/// The extended code of [`FrankenError::PrimaryKeyViolation`]. A VDBE
+/// constraint halt that carries it is a PRIMARY KEY conflict, as stock's
+/// `OP_Halt` P1 does.
+pub const SQLITE_CONSTRAINT_PRIMARYKEY: i32 = 0x13 | (6 << 8);
+
+/// `SQLITE_CONSTRAINT_UNIQUE`: `19 | (8 << 8) = 2067`.
+pub const SQLITE_CONSTRAINT_UNIQUE: i32 = 0x13 | (8 << 8);
+
+/// The message of [`FrankenError::PrimaryKeyViolation`]: stock's "UNIQUE
+/// constraint failed: <columns>", or the bare "PRIMARY KEY constraint failed"
+/// when the raising layer could not name the columns.
+fn primary_key_violation_message(columns: &str) -> String {
+    if columns.is_empty() {
+        "PRIMARY KEY constraint failed".to_owned()
+    } else {
+        format!("UNIQUE constraint failed: {columns}")
+    }
+}
+
 impl FrankenError {
+    /// Whether this is a uniqueness conflict: a UNIQUE or a PRIMARY KEY
+    /// violation. Conflict resolution (OR IGNORE / OR REPLACE, UPSERT,
+    /// changeset conflict handlers) treats the two alike; only the extended
+    /// code tells them apart.
+    #[must_use]
+    pub const fn is_unique_conflict(&self) -> bool {
+        matches!(
+            self,
+            Self::UniqueViolation { .. } | Self::PrimaryKeyViolation { .. }
+        )
+    }
+
     /// Map this error to a SQLite error code for compatibility.
     #[allow(clippy::match_same_arms)]
     pub const fn error_code(&self) -> ErrorCode {
@@ -553,7 +596,7 @@ impl FrankenError {
             | Self::NotNullViolation { .. }
             | Self::CheckViolation { .. }
             | Self::ForeignKeyViolation
-            | Self::PrimaryKeyViolation
+            | Self::PrimaryKeyViolation { .. }
             | Self::DatatypeViolation { .. }
             | Self::RtreeConstraint { .. }
             | Self::TriggerRaise(_)
@@ -715,10 +758,10 @@ impl FrankenError {
             // Applications match these (rusqlite's `extended_code`), e.g.
             // SQLITE_CONSTRAINT_UNIQUE to detect a duplicate insert.
             Self::CheckViolation { .. } => 0x13 | (1 << 8), // SQLITE_CONSTRAINT_CHECK = 275
-            Self::ForeignKeyViolation => 0x13 | (3 << 8), // SQLITE_CONSTRAINT_FOREIGNKEY = 787
+            Self::ForeignKeyViolation => 0x13 | (3 << 8),   // SQLITE_CONSTRAINT_FOREIGNKEY = 787
             Self::NotNullViolation { .. } => 0x13 | (5 << 8), // SQLITE_CONSTRAINT_NOTNULL = 1299
-            Self::PrimaryKeyViolation => 0x13 | (6 << 8), // SQLITE_CONSTRAINT_PRIMARYKEY = 1555
-            Self::UniqueViolation { .. } => 0x13 | (8 << 8), // SQLITE_CONSTRAINT_UNIQUE = 2067
+            Self::PrimaryKeyViolation { .. } => SQLITE_CONSTRAINT_PRIMARYKEY, // 1555
+            Self::UniqueViolation { .. } => SQLITE_CONSTRAINT_UNIQUE, // 2067
             Self::NewerFormat { .. } => SQLITE_OPEN_NEWER_FORMAT, // 14 | (0x7F << 8) = 32526
             // 14 | (0x7E << 8) = 32270
             Self::IncompatiblePeerEngine { .. } => SQLITE_OPEN_INCOMPATIBLE_PEER,
@@ -1768,7 +1811,10 @@ mod tests {
             ErrorCode::Constraint
         );
         assert_eq!(
-            FrankenError::PrimaryKeyViolation.error_code(),
+            FrankenError::PrimaryKeyViolation {
+                columns: "t.id".to_owned()
+            }
+            .error_code(),
             ErrorCode::Constraint
         );
         assert_eq!(
@@ -1778,8 +1824,20 @@ mod tests {
             .to_string(),
             "CHECK constraint failed: ck1"
         );
+        // Stock words a PRIMARY KEY conflict exactly like a UNIQUE one.
         assert_eq!(
-            FrankenError::PrimaryKeyViolation.to_string(),
+            FrankenError::PrimaryKeyViolation {
+                columns: "t.a, t.b".to_owned()
+            }
+            .to_string(),
+            "UNIQUE constraint failed: t.a, t.b"
+        );
+        // A layer without a schema (B-tree, FTS5) cannot name the columns.
+        assert_eq!(
+            FrankenError::PrimaryKeyViolation {
+                columns: String::new()
+            }
+            .to_string(),
             "PRIMARY KEY constraint failed"
         );
 
@@ -1820,12 +1878,53 @@ mod tests {
                 275,
             ),
             (FrankenError::ForeignKeyViolation, 787),
-            (FrankenError::PrimaryKeyViolation, 1555),
+            (
+                FrankenError::PrimaryKeyViolation {
+                    columns: "t.id".to_owned(),
+                },
+                1555,
+            ),
         ];
         for (err, extended) in cases {
             assert_eq!(err.error_code(), ErrorCode::Constraint, "{err}");
             assert_eq!(err.extended_error_code(), extended, "{err}");
             assert_eq!(err.extended_error_code() & 0xff, 19, "{err}");
+        }
+        assert_eq!(SQLITE_CONSTRAINT_PRIMARYKEY, 1555);
+        assert_eq!(SQLITE_CONSTRAINT_UNIQUE, 2067);
+    }
+
+    /// A PRIMARY KEY and a UNIQUE conflict read the same and resolve the same
+    /// (OR IGNORE, OR REPLACE, UPSERT); only the extended code differs.
+    #[test]
+    fn primary_key_and_unique_conflicts_differ_only_in_extended_code() {
+        let unique = FrankenError::UniqueViolation {
+            columns: "t.id".to_owned(),
+        };
+        let primary_key = FrankenError::PrimaryKeyViolation {
+            columns: "t.id".to_owned(),
+        };
+        assert_eq!(unique.to_string(), primary_key.to_string());
+        assert_eq!(unique.error_code(), primary_key.error_code());
+        assert_ne!(
+            unique.extended_error_code(),
+            primary_key.extended_error_code()
+        );
+        assert!(unique.is_unique_conflict());
+        assert!(primary_key.is_unique_conflict());
+        for other in [
+            FrankenError::NotNullViolation {
+                column: "t.id".to_owned(),
+            },
+            FrankenError::CheckViolation {
+                name: "t.id".to_owned(),
+            },
+            FrankenError::ForeignKeyViolation,
+            FrankenError::RtreeConstraint {
+                constraint: "t.(x0<=x1)".to_owned(),
+            },
+        ] {
+            assert!(!other.is_unique_conflict(), "{other}");
         }
     }
 

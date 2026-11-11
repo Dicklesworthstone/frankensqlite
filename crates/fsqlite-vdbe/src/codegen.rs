@@ -244,6 +244,13 @@ const OPFLAG_PROBE_MEMBERSHIP_ONLY: u16 = 0x01;
 const OPFLAG_UPDATE_KEEPS_ROWID: u16 = 0x80;
 /// Marks a non-mutating UNIQUE constraint halt. P4 carries the column label.
 const OPFLAG_HALT_UNIQUE: u16 = 0x01;
+/// As [`OPFLAG_HALT_UNIQUE`], for a conflict in a PRIMARY KEY: the engine
+/// raises SQLITE_CONSTRAINT_PRIMARYKEY instead of _UNIQUE.
+const OPFLAG_HALT_PRIMARY_KEY: u16 = 0x02;
+/// Marks a UNIQUE `IdxInsert` into the index (or WITHOUT ROWID table) that
+/// implements a PRIMARY KEY, so its conflict is SQLITE_CONSTRAINT_PRIMARYKEY
+/// (stock `IsPrimaryKeyIndex`). Above every other `IdxInsert` P5 bit.
+const OPFLAG_IDX_PRIMARY_KEY: u16 = 0x100;
 
 /// Convert AST `ConflictAction` to p5 OE_* flag value.
 fn conflict_action_to_oe(action: Option<&ConflictAction>) -> u16 {
@@ -760,6 +767,38 @@ impl TableSchema {
                 }
             })
             .collect()
+    }
+
+    /// Whether `index` implements this rowid table's PRIMARY KEY (stock
+    /// `IsPrimaryKeyIndex`), so a conflict in it is SQLITE_CONSTRAINT_PRIMARYKEY
+    /// rather than _UNIQUE. An INTEGER PRIMARY KEY is the rowid and a WITHOUT
+    /// ROWID PRIMARY KEY is the table B-tree itself, so neither has such an
+    /// index. Only an automatic index implements a PRIMARY KEY: a later
+    /// `CREATE UNIQUE INDEX` over the same columns is still a UNIQUE index, and
+    /// stock reports its conflict as one.
+    #[must_use]
+    pub fn index_is_primary_key(&self, index: &IndexSchema) -> bool {
+        const AUTOINDEX_PREFIX: &str = "sqlite_autoindex_";
+        if self.without_rowid
+            || !index.is_unique
+            || index.where_clause.is_some()
+            || self.columns.iter().any(|column| column.is_ipk)
+        {
+            return false;
+        }
+        let is_autoindex = index
+            .name
+            .get(..AUTOINDEX_PREFIX.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(AUTOINDEX_PREFIX));
+        is_autoindex
+            && index.key_expressions.is_empty()
+            && self.primary_key_constraints.first().is_some_and(|pk| {
+                pk.len() == index.columns.len()
+                    && pk
+                        .iter()
+                        .zip(&index.columns)
+                        .all(|(pk_column, column)| pk_column.eq_ignore_ascii_case(column))
+            })
     }
 
     /// Find a column's 0-based index by name (case-insensitive).
@@ -29510,9 +29549,10 @@ fn emit_without_rowid_update_rewrite(
         // Abandon the row with OLD still intact.
         b.emit_jump_to_label(Opcode::Goto, 0, 0, row_done, P4::None, 0);
     } else {
-        // ABORT / FAIL / ROLLBACK: raise the UNIQUE violation now, while OLD is
-        // still present, so the statement cannot lose the OLD row on the way
-        // out. `NoConflict` fell through, so a conflicting row provably exists.
+        // ABORT / FAIL / ROLLBACK: raise the PRIMARY KEY violation now, while
+        // OLD is still present, so the statement cannot lose the OLD row on the
+        // way out. `NoConflict` fell through, so a conflicting row provably
+        // exists.
         // Raise it with a constraint `Halt`, as the WITHOUT ROWID INSERT path
         // does, not with a conflicting `IdxInsert`: the engine answers an
         // `IdxInsert` conflict by deleting every index entry it inserted since
@@ -29525,7 +29565,7 @@ fn emit_without_rowid_update_rewrite(
             halt_conflict_oe(oe_flag),
             0,
             P4::Str(pk_label.clone()),
-            OPFLAG_HALT_UNIQUE,
+            OPFLAG_HALT_PRIMARY_KEY,
         );
     }
     b.resolve_label(no_victim);
@@ -29761,7 +29801,7 @@ fn emit_without_rowid_update_rewrite(
         rec_reg,
         n_pk as i32,
         P4::Table(pk_label.clone()),
-        1u16 | (OE_ABORT << 1) | OPFLAG_IDX_NCHANGE,
+        1u16 | (OE_ABORT << 1) | OPFLAG_IDX_NCHANGE | OPFLAG_IDX_PRIMARY_KEY,
     );
     emit_without_rowid_index_inserts(
         b,
@@ -29978,7 +30018,7 @@ fn emit_without_rowid_row_insert(
             halt_conflict_oe(oe_flag),
             0,
             P4::Str(pk_label.clone()),
-            OPFLAG_HALT_UNIQUE,
+            OPFLAG_HALT_PRIMARY_KEY,
         );
     }
     b.resolve_label(pk_clear);
@@ -30113,7 +30153,7 @@ fn emit_without_rowid_row_insert(
         rec_reg,
         n_pk as i32,
         P4::Table(pk_label.clone()),
-        1u16 | (OE_ABORT << 1) | OPFLAG_IDX_NCHANGE,
+        1u16 | (OE_ABORT << 1) | OPFLAG_IDX_NCHANGE | OPFLAG_IDX_PRIMARY_KEY,
     );
 
     // Secondary-index maintenance (skipped by the IGNORE conflict path, which
@@ -30513,7 +30553,7 @@ fn emit_without_rowid_upsert_do_update_apply(
         rec_reg,
         n_pk as i32,
         P4::Table(without_rowid_pk_label(table, pk_indices)),
-        1u16 | (OE_ABORT << 1) | OPFLAG_IDX_NCHANGE,
+        1u16 | (OE_ABORT << 1) | OPFLAG_IDX_NCHANGE | OPFLAG_IDX_PRIMARY_KEY,
     );
     emit_without_rowid_index_inserts(
         b,
@@ -32672,9 +32712,15 @@ fn emit_index_inserts_filtered(
         // Insert into the index.
         // For UNIQUE indexes, set P5=1 and P3=number of indexed columns
         // (excluding the trailing rowid) so the engine can enforce the
-        // uniqueness constraint while allowing multiple NULLs.
+        // uniqueness constraint while allowing multiple NULLs. The index of a
+        // non-INTEGER PRIMARY KEY reports its conflict as a PRIMARY KEY one.
         let (p3_unique, p5_unique) = if index.is_unique {
-            (n_idx_cols as i32, 1 | (oe_flag << 1))
+            let primary_key = if table.index_is_primary_key(index) {
+                OPFLAG_IDX_PRIMARY_KEY
+            } else {
+                0
+            };
+            (n_idx_cols as i32, 1 | (oe_flag << 1) | primary_key)
         } else {
             (0, 0)
         };
