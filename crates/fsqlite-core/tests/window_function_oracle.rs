@@ -404,6 +404,12 @@ const PARTITION_KEY_QUERIES: &[&str] = &[
     // Every row its own partition, and one partition for all.
     "SELECT sum(rn), sum(c) FROM \
      (SELECT row_number() OVER (PARTITION BY id ORDER BY a) rn, count(*) OVER (PARTITION BY 1) c FROM q)",
+    // No outer ORDER BY: the rows come out in the window's own partition and
+    // order (bd-w4pr1.12 takes that order from the window's sort). The keys
+    // are unique within a partition, so the order has no ties to decide.
+    "SELECT id, row_number() OVER (PARTITION BY o % 3 ORDER BY v DESC) FROM p",
+    "SELECT a, id, rank() OVER (PARTITION BY a ORDER BY id DESC) FROM q WHERE a < 20",
+    "SELECT id, n, row_number() OVER (PARTITION BY n ORDER BY id) FROM p",
     // Windows over grouped rows: 1,000 groups in 10 partitions, and the
     // mixed-class and NOCASE keys again, now as keys of groups.
     "SELECT a, count(*), row_number() OVER (PARTITION BY a % 10 ORDER BY sum(b) DESC, a), \

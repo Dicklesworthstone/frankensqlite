@@ -96921,8 +96921,7 @@ impl Connection {
                     .collect()
             })
             .collect();
-        let mut first_window_partition_keys: Option<Vec<Vec<SqliteValue>>> = None;
-        let mut first_window_order_keys: Option<Vec<Vec<SqliteValue>>> = None;
+        let mut first_window_row_order: Option<Vec<usize>> = None;
 
         for (wi, func) in win_funcs.iter().enumerate() {
             // Build sorted row indices for this window function's spec.
@@ -97509,8 +97508,7 @@ impl Connection {
                 window_results[wi][ri] = std::mem::replace(&mut func_vals[i], SqliteValue::Null);
             }
             if wi == 0 {
-                first_window_partition_keys = Some(partition_keys);
-                first_window_order_keys = Some(order_keys);
+                first_window_row_order = Some(sorted_indices);
             }
         }
 
@@ -97519,43 +97517,15 @@ impl Connection {
         // each connection-aware expression evaluation scopes its own guard.
         drop(function_registry_guard);
 
-        // Build result rows sorted by the first window spec's partition/order
-        // (matches SQLite's implicit output ordering for window queries).
-        let first_ob = &win_order_by[0];
-        let first_pb_coll = &win_partition_by_collations[0];
-        let first_ob_coll = &win_order_by_collations[0];
-        let first_partition_keys = first_window_partition_keys.as_deref().ok_or_else(|| {
-            FrankenError::Internal("window SELECT has no partition-key matrix".to_owned())
+        // Result rows come out in the first window spec's partition/order
+        // (SQLite's implicit output ordering for window queries). That is the
+        // order the first window function's rows were sorted into above: the
+        // same keys and collations, from the same starting order, with a
+        // stable sort. Sorting every row a second time here gave the same
+        // permutation (bd-w4pr1.12).
+        let output_order = first_window_row_order.ok_or_else(|| {
+            FrankenError::Internal("window SELECT has no first-window row order".to_owned())
         })?;
-        let first_order_keys = first_window_order_keys.as_deref().ok_or_else(|| {
-            FrankenError::Internal("window SELECT has no order-key matrix".to_owned())
-        })?;
-        let mut output_order: Vec<usize> = (0..total_rows).collect();
-        output_order.sort_by(|&a, &b| {
-            for (k, (va, vb)) in first_partition_keys[a]
-                .iter()
-                .zip(&first_partition_keys[b])
-                .enumerate()
-            {
-                let coll = first_pb_coll.get(k).and_then(|c| c.as_deref());
-                let ord =
-                    cmp_sqlite_values_collated_snapshot(va, vb, coll, &collation_registry_snap);
-                if ord != std::cmp::Ordering::Equal {
-                    return ord;
-                }
-            }
-            let order = cmp_in_aggregate_order_keys(
-                first_ob,
-                first_ob_coll,
-                &first_order_keys[a],
-                &first_order_keys[b],
-                &collation_registry_snap,
-            );
-            if order != std::cmp::Ordering::Equal {
-                return order;
-            }
-            std::cmp::Ordering::Equal
-        });
         // window_results is indexed by [func][raw_row_index].
         let mut result = Vec::with_capacity(total_rows);
         let mut result_raw_indices: Vec<usize> = Vec::with_capacity(total_rows);
