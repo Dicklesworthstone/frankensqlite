@@ -87,6 +87,42 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-11 - WIN: the shell's statement_complete() keeps no copy of the words it reads (bd-5310l)
+
+- Target: every line the CLI reads (all the scorecard's statement rows). Touched:
+  `crates/fsqlite-cli/src/main.rs` (`statement_complete`; new `StatementHead`).
+- Evidence before: the shell asks `statement_complete` about its input after every line. It
+  upper-cased every word into a new String, to compare the first three with CREATE / TEMP / TEMPORARY
+  / TRIGGER and each one with END. callgrind on main 05e4fd8f8 (binary sha256 25b7fe4e9a92616a), 1,000
+  statements in one transaction: 3.2k instructions per literal INSERT, 3.1k per point SELECT, 3.4k per
+  UPDATE, of which the scan itself is about half.
+- Change: the first words of a statement drive a five-state tracker (start, CREATE, CREATE TEMP,
+  trigger, other) and words are compared where they stand, ignoring case. Nothing is copied.
+- Result (callgrind, same statements, base against this change built at fbe9730df, sha256
+  fee83f2d49635673):
+  the function 3.2k -> 1.6k, 3.1k -> 1.4k, 3.4k -> 1.6k; the whole run 66.03M -> 64.31M (INSERT),
+  73.27M -> 71.67M (SELECT), 80.48M -> 78.23M (UPDATE), so 1.7k, 1.6k and 2.3k fewer instructions per
+  statement: 3.5%, 2.6% and 3.8% of what the stock-live probe measures for one statement. That probe
+  (`perf stat`, three runs per arm, stock 3.46.1 live): distinct-literal INSERT 49.5-49.7k ->
+  43.9-48.6k (stock 13.9k), point SELECT 62.0-62.8k -> 56.7-61.0k (stock 22.1k), UPDATE 57.7-62.0k ->
+  55.1-56.5k (stock 18.3k). Its run-to-run spread is about 3k, as large as this lever, so the
+  callgrind difference is the measurement and the probe is the ratio to stock: 3.6x -> about 3.4x,
+  2.8x -> about 2.7x, 3.3x -> about 3.1x. `txn_1000x10_rows`, three interleaved reps: 846.8M ->
+  831.6M user instructions (5.50x -> 5.40x stock's 153.9M). `autocommit_5k_inserts` does not move
+  outside its spread (1,564M in both arms, 13.9x).
+- Behaviour: a unit test keeps the previous implementation and compares the two over 1,118,480
+  generated texts (every sequence of up to five of 16 pieces: the trigger-head words in several
+  cases, look-alikes, END, semicolons, strings, quoted names, comments), and names cases a
+  case-sensitive reader or one that looked for TRIGGER anywhere in the first three words gets wrong.
+  Shell output of base and candidate is byte-identical over the 768-run comparison of the entries
+  below.
+- Still a loss: the scan is 1.4-1.6k instructions for a 40-byte statement, and the same bytes are
+  read twice more, by the shell's lone-statement reader (1.2k) and by the engine's literal scan
+  (2.7k).
+- Retry condition for a faster scan (table-driven or vectorized): `statement_complete` above 3% of a
+  statement shape once `lone_plain_statement` takes its answer from this scan and stops reading the
+  text again.
+
 ## 2026-11-11 - WIN (series): a lookup join tests outer-row terms first, bounds its outer scan by rowid, compiles BETWEEN, and serves the comma spelling for rows (bd-w4pr1.13.16)
 
 - Target: row-returning two-table joins with a filter on the outer table, e.g.

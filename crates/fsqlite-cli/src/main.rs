@@ -1855,6 +1855,45 @@ impl StatementScanState {
     }
 }
 
+/// How far the statement [`statement_complete`] is reading has got into
+/// `CREATE [TEMP|TEMPORARY] TRIGGER`.
+///
+/// `sqlite3_complete()` looks at no other words, so the words themselves are
+/// never stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatementHead {
+    /// No word of the statement has been read.
+    Start,
+    /// `CREATE`.
+    Create,
+    /// `CREATE TEMP` or `CREATE TEMPORARY`.
+    CreateTemp,
+    /// A trigger: its body's semicolons do not end the statement.
+    Trigger,
+    /// Any other statement.
+    Other,
+}
+
+impl StatementHead {
+    /// The head once `word` has been read after it.
+    const fn after(self, word: &[u8]) -> Self {
+        match self {
+            Self::Start if word.eq_ignore_ascii_case(b"CREATE") => Self::Create,
+            Self::Create
+                if word.eq_ignore_ascii_case(b"TEMP")
+                    || word.eq_ignore_ascii_case(b"TEMPORARY") =>
+            {
+                Self::CreateTemp
+            }
+            Self::Create | Self::CreateTemp if word.eq_ignore_ascii_case(b"TRIGGER") => {
+                Self::Trigger
+            }
+            Self::Trigger => Self::Trigger,
+            Self::Start | Self::Create | Self::CreateTemp | Self::Other => Self::Other,
+        }
+    }
+}
+
 fn is_line_comment_start(bytes: &[u8], i: usize) -> bool {
     if bytes.get(i) != Some(&b'-') {
         return false;
@@ -2893,10 +2932,9 @@ fn statement_complete(buffer: &str) -> bool {
     // Trigger awareness (like sqlite3_complete()): a statement starting with
     // CREATE [TEMP|TEMPORARY] TRIGGER contains `;`-terminated body statements
     // and is only complete when its final `;` follows the closing END keyword.
-    // `head_words` tracks the first tokens of the CURRENT statement (reset at
-    // each top-level `;`), mirroring sqlite3_complete()'s per-statement state.
-    let mut head_words: Vec<String> = Vec::with_capacity(3);
-    let mut in_trigger = false;
+    // `head` follows the first words of the CURRENT statement (reset at each
+    // top-level `;`), mirroring sqlite3_complete()'s per-statement state.
+    let mut head = StatementHead::Start;
     // sqlite3_complete()'s `;END;` rule: inside a trigger only an END that
     // directly follows a `;` (whitespace and comments aside) can close the
     // body, so the END of a `CASE ... END;` body statement does not.
@@ -2932,37 +2970,29 @@ fn statement_complete(buffer: &str) -> bool {
                     }
                     let previous_significant = last_significant;
                     last_significant = Some(bytes[i - 1]);
-                    let word = buffer[start..i].to_ascii_uppercase();
-                    if !in_trigger && head_words.len() < 3 {
-                        head_words.push(word.clone());
-                        in_trigger = head_words.first().is_some_and(|w| w == "CREATE")
-                            && (head_words.get(1).is_some_and(|w| w == "TRIGGER")
-                                || (head_words
-                                    .get(1)
-                                    .is_some_and(|w| w == "TEMP" || w == "TEMPORARY")
-                                    && head_words.get(2).is_some_and(|w| w == "TRIGGER")));
-                    }
-                    end_follows_semi =
-                        in_trigger && word == "END" && previous_significant == Some(b';');
+                    let word = &bytes[start..i];
+                    head = head.after(word);
+                    end_follows_semi = head == StatementHead::Trigger
+                        && word.eq_ignore_ascii_case(b"END")
+                        && previous_significant == Some(b';');
                     continue;
                 }
 
                 last_significant = Some(b);
 
                 if b == b';' {
-                    if in_trigger {
+                    if head == StatementHead::Trigger {
                         // Only `; END ;` closes the trigger body; inner
                         // `;`-terminated body statements do not.
                         if end_follows_semi {
-                            in_trigger = false;
-                            head_words.clear();
+                            head = StatementHead::Start;
                         }
                     } else {
                         // Statement boundary: restart head tracking so a
                         // trailing CREATE TRIGGER in a multi-statement buffer
                         // is detected (sqlite3_complete() resets its state
                         // machine at each semicolon the same way).
-                        head_words.clear();
+                        head = StatementHead::Start;
                     }
                 }
                 end_follows_semi = false;
@@ -3046,7 +3076,7 @@ fn statement_complete(buffer: &str) -> bool {
         return false;
     }
 
-    last_significant == Some(b';') && !in_trigger
+    last_significant == Some(b';') && head != StatementHead::Trigger
 }
 
 fn write_usage<W>(out: &mut W) -> io::Result<()>
@@ -3121,8 +3151,9 @@ mod tests {
     use super::{
         ANSI_BOLD_BLUE, ANSI_DIM, ANSI_GREEN, ANSI_MAGENTA, ANSI_RESET, BlockBufferedOutput,
         Connection, ErrorsAfterOutput, InputThatFlushes, OutputMode, OutputOptions, Parser,
-        ShellOptions, ansi_colors_enabled, bytes_alone_delimit_statements, format_row,
-        highlight_sql, lone_plain_statement, lone_plain_statement_by_bytes,
+        ShellOptions, StatementScanState, ansi_colors_enabled, bytes_alone_delimit_statements,
+        format_row, highlight_sql, is_block_comment_end, is_block_comment_start,
+        is_line_comment_start, lone_plain_statement, lone_plain_statement_by_bytes,
         lone_plain_statement_by_tokens, output_uses_column_names, parse_args, render_display_value,
         render_prompt, run, run_with_shell_options, statement_complete, write_delimited_rows,
         write_query_plan_tree, write_rows,
@@ -3549,6 +3580,248 @@ INSERT INTO r VALUES(9e999), (-9e999), (1.5);\n\
         // SQLite treats `--` as a comment regardless of whitespace.
         assert!(!statement_complete("SELECT 1--2;")); // semicolon is part of the comment
         assert!(statement_complete("SELECT 1--2;\n;")); // semicolon on next line completes it
+    }
+
+    /// `statement_complete` as it was while it kept an upper-cased copy of
+    /// every word: the reference its word-free successor must agree with.
+    fn statement_complete_keeping_words(buffer: &str) -> bool {
+        let bytes = buffer.as_bytes();
+        let mut state = StatementScanState::Normal;
+        let mut last_significant: Option<u8> = None;
+        let mut head_words: Vec<String> = Vec::with_capacity(3);
+        let mut in_trigger = false;
+        let mut end_follows_semi = false;
+
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let b = bytes[i];
+            match state {
+                StatementScanState::Normal => {
+                    if b.is_ascii_whitespace() {
+                        i += 1;
+                        continue;
+                    }
+
+                    if is_line_comment_start(bytes, i) {
+                        state = StatementScanState::LineComment;
+                        i += 2;
+                        continue;
+                    }
+
+                    if is_block_comment_start(bytes, i) {
+                        state = StatementScanState::BlockComment;
+                        i += 2;
+                        continue;
+                    }
+
+                    if b.is_ascii_alphanumeric() || b == b'_' {
+                        let start = i;
+                        while i < bytes.len()
+                            && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
+                        {
+                            i += 1;
+                        }
+                        let previous_significant = last_significant;
+                        last_significant = Some(bytes[i - 1]);
+                        let word = buffer[start..i].to_ascii_uppercase();
+                        if !in_trigger && head_words.len() < 3 {
+                            head_words.push(word.clone());
+                            in_trigger = head_words.first().is_some_and(|w| w == "CREATE")
+                                && (head_words.get(1).is_some_and(|w| w == "TRIGGER")
+                                    || (head_words
+                                        .get(1)
+                                        .is_some_and(|w| w == "TEMP" || w == "TEMPORARY")
+                                        && head_words.get(2).is_some_and(|w| w == "TRIGGER")));
+                        }
+                        end_follows_semi =
+                            in_trigger && word == "END" && previous_significant == Some(b';');
+                        continue;
+                    }
+
+                    last_significant = Some(b);
+
+                    if b == b';' {
+                        if in_trigger {
+                            if end_follows_semi {
+                                in_trigger = false;
+                                head_words.clear();
+                            }
+                        } else {
+                            head_words.clear();
+                        }
+                    }
+                    end_follows_semi = false;
+
+                    match b {
+                        b'\'' => state = StatementScanState::SingleQuote,
+                        b'"' => state = StatementScanState::DoubleQuote,
+                        b'`' => state = StatementScanState::Backtick,
+                        b'[' => state = StatementScanState::BracketIdent,
+                        _ => {}
+                    }
+
+                    i += 1;
+                }
+                StatementScanState::SingleQuote => {
+                    if b == b'\'' {
+                        if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                            i += 2;
+                        } else {
+                            state = StatementScanState::Normal;
+                            i += 1;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+                StatementScanState::DoubleQuote => {
+                    if b == b'"' {
+                        if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                            i += 2;
+                        } else {
+                            state = StatementScanState::Normal;
+                            i += 1;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+                StatementScanState::Backtick => {
+                    if b == b'`' {
+                        if i + 1 < bytes.len() && bytes[i + 1] == b'`' {
+                            i += 2;
+                        } else {
+                            state = StatementScanState::Normal;
+                            i += 1;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+                StatementScanState::BracketIdent => {
+                    if b == b']' {
+                        if i + 1 < bytes.len() && bytes[i + 1] == b']' {
+                            i += 2;
+                        } else {
+                            state = StatementScanState::Normal;
+                            i += 1;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+                StatementScanState::LineComment => {
+                    if b == b'\n' || b == b'\r' {
+                        state = StatementScanState::Normal;
+                    }
+                    i += 1;
+                }
+                StatementScanState::BlockComment => {
+                    if is_block_comment_end(bytes, i) {
+                        state = StatementScanState::Normal;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+        }
+
+        if state.is_unterminated() {
+            return false;
+        }
+
+        last_significant == Some(b';') && !in_trigger
+    }
+
+    #[test]
+    fn test_statement_complete_answers_as_it_did_when_it_kept_every_word() {
+        // Every sequence of up to five of these pieces, joined by spaces: the
+        // words a trigger head is made of in several cases, look-alikes, END
+        // with and without a semicolon before it, and the places a semicolon
+        // or a word does not count (strings, quoted names, comments).
+        const PIECES: [&str; 16] = [
+            "CREATE",
+            "create",
+            "TEMP",
+            "Temporary",
+            "TRIGGER",
+            "trigger",
+            "TABLE",
+            "END",
+            "end",
+            "ENDX",
+            ";",
+            "'a;b'",
+            "\"END\"",
+            "-- END;\n",
+            "/* ; */",
+            "x1",
+        ];
+        let mut compared = 0_u32;
+        let mut complete = 0_u32;
+        let mut open_trigger_with_last_semicolon = 0_u32;
+        let mut indices = Vec::new();
+        for length in 1..=5 {
+            indices.clear();
+            indices.resize(length, 0_usize);
+            loop {
+                let text = indices
+                    .iter()
+                    .map(|&index| PIECES[index])
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let expected = statement_complete_keeping_words(&text);
+                assert_eq!(statement_complete(&text), expected, "{text:?}");
+                compared += 1;
+                complete += u32::from(expected);
+                // What a reader that ignored triggers would have got wrong:
+                // the text ends in a semicolon that counts, inside a trigger.
+                open_trigger_with_last_semicolon +=
+                    u32::from(!expected && indices.last().is_some_and(|&last| PIECES[last] == ";"));
+                let Some(position) = indices.iter().rposition(|&index| index + 1 < PIECES.len())
+                else {
+                    break;
+                };
+                indices[position] += 1;
+                for index in &mut indices[position + 1..] {
+                    *index = 0;
+                }
+            }
+        }
+        assert_eq!(compared, 16 + 16 * 16 + 16 * 16 * 16 + 65_536 + 1_048_576);
+        assert!(complete > 50_000, "{complete}");
+        assert!(
+            open_trigger_with_last_semicolon > 1_000,
+            "{open_trigger_with_last_semicolon}"
+        );
+
+        // The trigger head in any case, and only in the first words.
+        for open in [
+            "create trigger t after insert on x begin select 1;",
+            "Create Temporary Trigger t after insert on x begin select 1;",
+            "CREATE TEMP TRIGGER t AFTER INSERT ON x BEGIN SELECT 1;",
+            "select 1; create trigger t after insert on x begin select 1;",
+            "CREATE TRIGGER t AFTER INSERT ON x BEGIN SELECT 1; ENDX;",
+            "CREATE TRIGGER t AFTER INSERT ON x BEGIN SELECT 1; \"END\";",
+        ] {
+            assert!(!statement_complete(open), "{open}");
+            assert!(!statement_complete_keeping_words(open), "{open}");
+        }
+        for closed in [
+            "create trigger t after insert on x begin select 1; end;",
+            "Create Temporary Trigger t after insert on x begin select 1; End ;",
+            "CREATE TABLE trigger(a);",
+            "CREATE TEMP TABLE trigger(a);",
+            "CREATE TEMP TEMP TRIGGER;",
+            "CREATE UNIQUE INDEX trigger ON t(a);",
+            "CREATE TEMPX TRIGGER t;",
+            "SELECT create, trigger FROM t;",
+            "CREATE /* TEMP */ VIEW trigger AS SELECT 1;",
+        ] {
+            assert!(statement_complete(closed), "{closed}");
+            assert!(statement_complete_keeping_words(closed), "{closed}");
+        }
     }
 
     #[test]
