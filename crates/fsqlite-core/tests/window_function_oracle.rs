@@ -404,6 +404,14 @@ const PARTITION_KEY_QUERIES: &[&str] = &[
     // Every row its own partition, and one partition for all.
     "SELECT sum(rn), sum(c) FROM \
      (SELECT row_number() OVER (PARTITION BY id ORDER BY a) rn, count(*) OVER (PARTITION BY 1) c FROM q)",
+    // Windows over grouped rows: 1,000 groups in 10 partitions, and the
+    // mixed-class and NOCASE keys again, now as keys of groups.
+    "SELECT a, count(*), row_number() OVER (PARTITION BY a % 10 ORDER BY sum(b) DESC, a), \
+     sum(count(*)) OVER (PARTITION BY a % 10) FROM q GROUP BY a ORDER BY a LIMIT 40",
+    "SELECT min(id), count(*), rank() OVER (PARTITION BY k IS NULL ORDER BY count(*) DESC), \
+     sum(count(*)) OVER (PARTITION BY count(*)) FROM p GROUP BY k ORDER BY count(*), min(id)",
+    "SELECT min(id), sum(v), row_number() OVER (PARTITION BY count(*) ORDER BY sum(v), min(id)) \
+     FROM p GROUP BY n ORDER BY sum(v), min(id)",
 ];
 
 #[test]

@@ -95970,23 +95970,26 @@ impl Connection {
             } else if rewritten_pb.is_empty() {
                 vec![sorted_indices.clone()]
             } else {
-                let mut parts: Vec<(Vec<SqliteValue>, Vec<usize>)> = Vec::new();
+                // bd-w4pr1.12: as in `execute_window_select`, the rows were
+                // just sorted by the PARTITION BY keys under this comparison,
+                // so a partition is a run of consecutive rows.
+                let mut parts: Vec<Vec<usize>> = Vec::new();
                 for &ri in &sorted_indices {
-                    let key = partition_keys[ri].clone();
-                    if let Some(part) = parts.iter_mut().find(|(k, _)| {
-                        group_keys_equal_collated(
-                            k,
-                            &key,
-                            &rewritten_pb_collations,
-                            &collation_registry_snap,
-                        )
-                    }) {
-                        part.1.push(ri);
-                    } else {
-                        parts.push((key, vec![ri]));
+                    match parts.last_mut() {
+                        Some(part)
+                            if group_keys_equal_collated(
+                                &partition_keys[part[0]],
+                                &partition_keys[ri],
+                                &rewritten_pb_collations,
+                                &collation_registry_snap,
+                            ) =>
+                        {
+                            part.push(ri);
+                        }
+                        _ => parts.push(vec![ri]),
                     }
                 }
-                parts.into_iter().map(|(_, indices)| indices).collect()
+                parts
             };
 
             // SQLite materializes each window row in SQL expression order:
