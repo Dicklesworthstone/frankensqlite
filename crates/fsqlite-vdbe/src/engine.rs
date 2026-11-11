@@ -5954,6 +5954,8 @@ static FSQLITE_VDBE_MAKE_RECORD_BLOB_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
 thread_local! {
     /// Test-only per-thread count of sideband MakeRecord values that had to become Arc-backed blobs.
     static FSQLITE_VDBE_MAKE_RECORD_SIDEBAND_MATERIALIZATIONS_TOTAL: Cell<u64> = const { Cell::new(0) };
+    /// Test-only per-thread count of `AggStep`s served by `plain_agg_step`.
+    static FSQLITE_VDBE_PLAIN_AGG_STEPS_TOTAL: Cell<u64> = const { Cell::new(0) };
 }
 /// bd-7vkes: Count times the BTREE_APPEND fast path was taken (skip seek).
 static FSQLITE_VDBE_INSERT_APPEND_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -7454,7 +7456,7 @@ pub struct VdbeEngine {
     /// Resolved scalar functions keyed by opcode address.
     scalar_function_cache: HashMap<usize, ResolvedScalarFunction>,
     /// Resolved aggregate functions keyed by opcode address.
-    aggregate_function_cache: HashMap<usize, Arc<ErasedAggregateFunction>>,
+    aggregate_function_cache: HashMap<usize, ResolvedAggregate>,
     /// Collation registry for compare, sort, DISTINCT, and grouping semantics.
     collation_registry: Arc<Mutex<CollationRegistry>>,
     /// bd-4nuqo: lazily cached answer to "is any built-in collation name
@@ -7781,6 +7783,20 @@ struct AggregateContext {
     /// When DISTINCT is active, tracks seen argument byte-keys to skip duplicates.
     distinct_seen: Option<std::collections::HashSet<DistinctKeyBuf>>,
 }
+
+/// The aggregate function resolved for the `AggStep` or `AggFinal` at one
+/// opcode address.
+struct ResolvedAggregate {
+    func: Arc<ErasedAggregateFunction>,
+    /// For an `AggStep`: the step is a bare call of the function on its
+    /// argument registers. It is not DISTINCT, names no collation, is not
+    /// `min` or `max` (which have collated and extremum-tracking steps), and
+    /// takes no more arguments than [`NO_ARG_SUBTYPES`] covers.
+    plain_step: bool,
+}
+
+/// Subtype tags of arguments that carry none.
+const NO_ARG_SUBTYPES: [u32; 8] = [0; 8];
 
 struct AggStepCall<'a> {
     accum_reg: i32,
@@ -14627,8 +14643,9 @@ impl VdbeEngine {
 
                     let arg_count = op.p2;
                     let func_pc = pc;
-                    let func = if let Some(func) = self.aggregate_function_cache.get(&func_pc) {
-                        Arc::clone(func)
+                    let func = if let Some(resolved) = self.aggregate_function_cache.get(&func_pc)
+                    {
+                        Arc::clone(&resolved.func)
                     } else {
                         let registry = self.func_registry.as_ref().ok_or_else(|| {
                             FrankenError::Internal(
@@ -14643,8 +14660,13 @@ impl VdbeEngine {
                                         "no such aggregate function: {func_name}/{arg_count}",
                                     ))
                                 })?;
-                        self.aggregate_function_cache
-                            .insert(func_pc, Arc::clone(&func));
+                        self.aggregate_function_cache.insert(
+                            func_pc,
+                            ResolvedAggregate {
+                                func: Arc::clone(&func),
+                                plain_step: false,
+                            },
+                        );
                         func
                     };
 
@@ -16025,11 +16047,99 @@ impl VdbeEngine {
         self.set_reg(target, value);
     }
 
+    /// An `AggStep` whose site was resolved as plain
+    /// ([`ResolvedAggregate::plain_step`]) the first time it ran: call the
+    /// aggregate's step on the argument registers.
+    ///
+    /// The first `AggStep` at an address goes through the rest of
+    /// [`Self::execute_agg_step`], which resolves the function and creates
+    /// the accumulator. For a plain site that path does nothing per row
+    /// beyond what is done here: the same two cancellation observes around
+    /// the same call.
+    ///
+    /// Returns `Ok(false)`, having changed nothing, when there is no
+    /// accumulator yet (the first row, or the first row of a group after
+    /// `AggFinal` took the last one), when the accumulator belongs to another
+    /// function or has DISTINCT state, when an argument is outside the
+    /// register file or is a `MakeRecord` result still held outside its
+    /// register, and when any register carries a subtype.
+    ///
+    /// It takes the engine's fields one by one so that the caller can keep
+    /// `site` borrowed from the function cache.
+    #[inline]
+    #[allow(clippy::cast_sign_loss)]
+    fn plain_agg_step(
+        site: &ResolvedAggregate,
+        op: &VdbeOp,
+        registers: &[SqliteValue],
+        make_record_lookaside: &MakeRecordStatementLookaside,
+        cold_state: &mut Option<Box<ColdVdbeState>>,
+        execution_cx: &Cx,
+    ) -> Result<bool> {
+        if op.p2 < 0 {
+            return Ok(false);
+        }
+        let arg_count = usize::from(op.p5);
+        let first_arg = op.p2 as usize;
+        let Some(args) = registers.get(first_arg..first_arg.saturating_add(arg_count)) else {
+            return Ok(false);
+        };
+        for offset in 0..arg_count {
+            if Self::reg_with_offset(op.p2, offset)
+                .is_none_or(|reg| make_record_lookaside.sideband_is_armed_for(reg))
+            {
+                return Ok(false);
+            }
+        }
+        let Some(cold_state) = cold_state.as_deref_mut() else {
+            return Ok(false);
+        };
+        if cold_state.has_subtypes {
+            return Ok(false);
+        }
+        let Some(ctx) = cold_state.aggregates.get_mut(&op.p3) else {
+            return Ok(false);
+        };
+        if ctx.distinct_seen.is_some() || !Arc::ptr_eq(&ctx.func, &site.func) {
+            return Ok(false);
+        }
+        observe_requested_execution_cancellation(execution_cx)?;
+        ctx.func
+            .step_with_arg_subtypes(&mut ctx.state, args, &NO_ARG_SUBTYPES[..arg_count])?;
+        observe_requested_execution_cancellation(execution_cx)?;
+        #[cfg(test)]
+        FSQLITE_VDBE_PLAIN_AGG_STEPS_TOTAL.with(|counter| {
+            counter.set(counter.get().saturating_add(1));
+        });
+        Ok(true)
+    }
+
     /// `AggStep`/`AggStep1` at `ops[pc]`: fold the argument registers into the
     /// aggregate whose accumulator is register `p3`.
     #[allow(clippy::cast_sign_loss)]
     fn execute_agg_step(&mut self, ops: &[VdbeOp], pc: usize) -> Result<()> {
         let op = &ops[pc];
+        // One lookup of the site serves both routes: a plain site steps
+        // here, and any resolved site that does not hands its function to
+        // the general path below.
+        let resolved_func = match self.aggregate_function_cache.get(&pc) {
+            Some(site) => {
+                if site.plain_step
+                    && Self::plain_agg_step(
+                        site,
+                        op,
+                        &self.registers,
+                        &self.make_record_lookaside,
+                        &mut self.cold_state,
+                        &self.execution_cx,
+                    )?
+                {
+                    return Ok(());
+                }
+                Some(Arc::clone(&site.func))
+            }
+            None => None,
+        };
         let (func_name, agg_collation): (&str, Option<&str>) = match &op.p4 {
             P4::FuncName(name) => (name.as_str(), None),
             P4::FuncNameCollated(name, coll) => (name.as_str(), Some(coll.as_str())),
@@ -16042,8 +16152,8 @@ impl VdbeEngine {
 
         let arg_count = i32::from(op.p5);
         let func_pc = pc;
-        let func = if let Some(func) = self.aggregate_function_cache.get(&func_pc) {
-            Arc::clone(func)
+        let func = if let Some(func) = resolved_func {
+            func
         } else {
             let registry = self.func_registry.as_ref().ok_or_else(|| {
                 FrankenError::Internal(
@@ -16057,8 +16167,18 @@ impl VdbeEngine {
                         "no such aggregate function: {func_name}/{arg_count}",
                     ))
                 })?;
-            self.aggregate_function_cache
-                .insert(func_pc, Arc::clone(&func));
+            let plain_step = op.p1 == 0
+                && agg_collation.is_none()
+                && !func_name.eq_ignore_ascii_case("min")
+                && !func_name.eq_ignore_ascii_case("max")
+                && usize::from(op.p5) <= NO_ARG_SUBTYPES.len();
+            self.aggregate_function_cache.insert(
+                func_pc,
+                ResolvedAggregate {
+                    func: Arc::clone(&func),
+                    plain_step,
+                },
+            );
             func
         };
 
@@ -42908,6 +43028,177 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![vec![SqliteValue::Integer(7)]]
         );
+    }
+
+    fn plain_agg_steps() -> u64 {
+        FSQLITE_VDBE_PLAIN_AGG_STEPS_TOTAL.with(Cell::get)
+    }
+
+    /// Finalize and remove the accumulator in register `accum_reg`.
+    fn finalize_accumulator(engine: &mut VdbeEngine, accum_reg: i32) -> SqliteValue {
+        let ctx = engine
+            .cold_state_mut()
+            .and_then(|cold_state| cold_state.aggregates.remove(&accum_reg))
+            .expect("accumulator should exist");
+        ctx.func.finalize(ctx.state).expect("finalize")
+    }
+
+    #[test]
+    fn test_plain_agg_step_lane_takes_only_what_the_general_path_would_do_the_same() {
+        let agg_step = |p1: i32, accum: i32, p4: P4| VdbeOp {
+            opcode: Opcode::AggStep,
+            p1,
+            p2: 1,
+            p3: accum,
+            p4,
+            p5: 1,
+        };
+        let name = |text: &str| P4::FuncName(text.to_owned());
+        let ops = vec![
+            // 0: sum(r1) into r2.
+            agg_step(0, 2, name("sum")),
+            // 1: count(r1) into r3.
+            agg_step(0, 3, name("count")),
+            // 2: sum(DISTINCT r1) into r4.
+            agg_step(1, 4, name("sum")),
+            // 3: min(r1) into r5.
+            agg_step(0, 5, name("min")),
+            // 4: sum(r1) under a collation into r6.
+            agg_step(
+                0,
+                6,
+                P4::FuncNameCollated("sum".to_owned(), "NOCASE".to_owned()),
+            ),
+            // 5: total(r1) into r2, the accumulator `sum` at address 0 owns.
+            agg_step(0, 2, name("total")),
+        ];
+        let mut engine = VdbeEngine::new(12);
+        let mut registry = FunctionRegistry::new();
+        register_builtins(&mut registry);
+        engine.set_function_registry(Arc::new(registry));
+        let before = plain_agg_steps();
+        let plain = || plain_agg_steps() - before;
+
+        // The first step at an address resolves the site and creates the
+        // accumulator; the lane serves the ones after it.
+        engine.set_reg_int(1, 10);
+        engine.execute_agg_step(&ops, 0).unwrap();
+        assert_eq!(plain(), 0);
+        engine.set_reg_int(1, 20);
+        engine.execute_agg_step(&ops, 0).unwrap();
+        assert_eq!(plain(), 1);
+
+        // A subtype on any register sends the step down the general path,
+        // which gathers argument subtypes; without one the lane resumes.
+        engine.set_register_subtype(9, 74);
+        engine.set_reg_int(1, 30);
+        engine.execute_agg_step(&ops, 0).unwrap();
+        assert_eq!(plain(), 1);
+        engine.clear_register_subtype(9);
+        engine.set_reg_int(1, 40);
+        engine.execute_agg_step(&ops, 0).unwrap();
+        assert_eq!(plain(), 2);
+
+        // Another function stepping into the same accumulator is the general
+        // path's error, both before and after its site is resolved.
+        for _ in 0..2 {
+            let err = engine.execute_agg_step(&ops, 5).unwrap_err();
+            assert!(
+                err.to_string().contains("different aggregate"),
+                "unexpected error: {err}"
+            );
+        }
+        assert_eq!(plain(), 2);
+        assert_eq!(finalize_accumulator(&mut engine, 2), SqliteValue::Integer(100));
+
+        // A `MakeRecord` result that is still in the lookaside is not in its
+        // register, which reads NULL until the general path moves it there.
+        // A lane that read the register as it stands would not count it.
+        engine.set_reg_int(1, 1);
+        engine.execute_agg_step(&ops, 1).unwrap();
+        engine.execute_agg_step(&ops, 1).unwrap();
+        assert_eq!(plain(), 3);
+        engine.set_reg_int(8, 7);
+        let make_record = VdbeOp {
+            opcode: Opcode::MakeRecord,
+            p1: 8,
+            p2: 1,
+            p3: 1,
+            p4: P4::None,
+            p5: 0,
+        };
+        engine.execute_make_record_hot(&make_record, false);
+        assert_eq!(engine.get_reg(1), &SqliteValue::Null);
+        engine.execute_agg_step(&ops, 1).unwrap();
+        assert_eq!(plain(), 3);
+        assert_eq!(finalize_accumulator(&mut engine, 3), SqliteValue::Integer(3));
+
+        // DISTINCT, min/max and a collated step never take the lane.
+        for value in [5, 5, 6] {
+            engine.set_reg_int(1, value);
+            engine.execute_agg_step(&ops, 2).unwrap();
+            engine.execute_agg_step(&ops, 3).unwrap();
+            engine.execute_agg_step(&ops, 4).unwrap();
+        }
+        assert_eq!(plain(), 3);
+        assert_eq!(finalize_accumulator(&mut engine, 4), SqliteValue::Integer(11));
+        assert_eq!(finalize_accumulator(&mut engine, 5), SqliteValue::Integer(5));
+        assert_eq!(finalize_accumulator(&mut engine, 6), SqliteValue::Integer(16));
+
+        // After `AggFinal` took an accumulator, the next step starts a new one
+        // on the general path and the lane serves the rest.
+        engine.set_reg_int(1, 2);
+        engine.execute_agg_step(&ops, 0).unwrap();
+        assert_eq!(plain(), 3);
+        engine.execute_agg_step(&ops, 0).unwrap();
+        assert_eq!(plain(), 4);
+        assert_eq!(finalize_accumulator(&mut engine, 2), SqliteValue::Integer(4));
+    }
+
+    #[test]
+    fn test_plain_agg_step_lane_serves_an_interpreted_aggregate_loop() {
+        // sum(x) and count(*) over x = 1..=5, twice on one engine.
+        let mut builder = ProgramBuilder::new();
+        let r_left = builder.alloc_reg();
+        let r_x = builder.alloc_reg();
+        let r_sum = builder.alloc_reg();
+        let r_count = builder.alloc_reg();
+        builder.emit_op(Opcode::Integer, 5, r_left, 0, P4::None, 0);
+        builder.emit_op(Opcode::Integer, 0, r_x, 0, P4::None, 0);
+        let loop_top = builder.emit_op(Opcode::AddImm, r_x, 1, 0, P4::None, 0);
+        builder.emit_op(Opcode::AggStep, 0, r_x, r_sum, P4::FuncName("sum".to_owned()), 1);
+        builder.emit_op(Opcode::AggStep, 0, 0, r_count, P4::FuncName("count".to_owned()), 0);
+        let after_loop = i32::try_from(loop_top).unwrap() + 5;
+        builder.emit_op(Opcode::DecrJumpZero, r_left, after_loop, 0, P4::None, 0);
+        builder.emit_op(Opcode::Goto, 0, i32::try_from(loop_top).unwrap(), 0, P4::None, 0);
+        builder.emit_op(Opcode::AggFinal, r_sum, 1, 0, P4::FuncName("sum".to_owned()), 0);
+        builder.emit_op(Opcode::AggFinal, r_count, 0, 0, P4::FuncName("count".to_owned()), 0);
+        builder.emit_op(Opcode::ResultRow, r_sum, 2, 0, P4::None, 0);
+        builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let program = builder.finish().expect("program should build");
+
+        let mut engine = VdbeEngine::new(program.register_count());
+        let mut registry = FunctionRegistry::new();
+        register_builtins(&mut registry);
+        engine.set_function_registry(Arc::new(registry));
+        for _ in 0..2 {
+            let before = plain_agg_steps();
+            assert_eq!(
+                run_async(engine.execute(&program)).expect("aggregate execution should succeed"),
+                ExecOutcome::Done
+            );
+            assert_eq!(
+                engine
+                    .results()
+                    .iter()
+                    .map(|row| row.clone().into_vec())
+                    .collect::<Vec<_>>(),
+                vec![vec![SqliteValue::Integer(15), SqliteValue::Integer(5)]]
+            );
+            // Each aggregate's first step builds its accumulator; the other
+            // four of each take the lane.
+            assert_eq!(plain_agg_steps() - before, 8);
+        }
     }
 
     #[test]

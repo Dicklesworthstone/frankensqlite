@@ -87,6 +87,67 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-11 - WIN: a plain AggStep calls its aggregate directly once its site is resolved (bd-w4pr1.13)
+
+- Target: every scanning aggregate. An exact instruction profile (callgrind, line level) of
+  `SELECT count(*), sum(a) FROM t WHERE a > 500` at 7e486c4c2 put an `AggStep` at about 390
+  instructions (`execute_agg_step` 200, `agg_step_with_args` 122, the aggregate function about 65)
+  out of about 1,910 per row; stock's whole row is 500. Touched: `crates/fsqlite-vdbe/src/engine.rs`
+  (`ResolvedAggregate`, `plain_agg_step`, `execute_agg_step`).
+- Change: the first `AggStep` at an address resolves the function as before and records with it
+  whether the site is plain (not DISTINCT, no collation, not `min`/`max`, at most eight arguments).
+  Later steps at a plain site whose accumulator exists call the function's step on the argument
+  registers, between the same two cancellation observes. A step takes the old path, having changed
+  nothing, when its accumulator is missing or belongs to another function, when an argument is
+  outside the register file or is a `MakeRecord` result still held in the lookaside, or when any
+  register carries a subtype. The registry's function is still what runs, so a replaced `sum()`
+  behaves as before.
+- Result, same method and run as the bd-w4pr1.13.4 entry below; before sha256 a1da24c2...,
+  after 2b8c8f82... (846e00c2c on 05e4fd8f8): scan_filter_agg 1,587.9 -> 1,409.8 (-178
+  per row; 3.18x -> 2.83x stock's 498.7), `count(*), sum(length(b)), sum(c)` 3,505.8 -> 2,946.8
+  (-559, three steps per row; 3.48x -> 2.92x), group_by_1000_groups 3,536.7 -> 3,381.9 (1.23x ->
+  1.18x), `min(c), max(c), avg(c)` 3,117.9 -> 2,915.9 (only `avg` takes the lane),
+  order_by_text_limit10 2,359.1 -> 2,359.1, `count(DISTINCT a), group_concat(DISTINCT a % 3)`
+  2,888.0 -> 2,887.9. CPU time of scan_filter_agg in the same runs: 2.53x -> 2.25x stock.
+  Predicted -200 per row on scan_filter_agg with a kill line at -100.
+- `join_1M_to_pk_1000` does not move: on main that aggregate over a join runs in the fallback
+  executor ("aggregate over this JOIN shape in VDBE codegen" is not implemented), not through
+  `AggStep`.
+- A first version looked the site up once in the lane and again in the general path; DISTINCT
+  and `min`/`max` steps paid for the extra lookup (`count(DISTINCT a), group_concat(DISTINCT ..)`
+  +72 instructions per row). The landed version looks it up once for both routes.
+- Keepers: a unit test drives each decline and checks the general path's result (a lane that read
+  a sideband-armed register as it stands would not count it; one that ignored DISTINCT would add a
+  repeated value twice); another runs an interpreted aggregate loop twice on one engine; the
+  aggregate oracle targets of the row-loop gate.
+- What is left in an `AggStep`, same profile on the landed binary: about 217 instructions per
+  step, 152 in `execute_agg_step` with the lane inlined (the site lookup by address and the
+  accumulator lookup by register are both hash probes) and 65 in the function behind the registry
+  adapter, against stock's 40.
+- Retry condition for the two hash probes: a slot per site and per accumulator resolved once per
+  statement, only with a profile showing `execute_agg_step` still above 8% of scan_filter_agg (it
+  is 10.8% on the landed binary, so this is open). For typed accumulators (`count`, `sum` without
+  the adapter) the 2026-05-06 `FastSumState` entry governs.
+
+## 2026-11-11 - REJECTED: AggStep borrowing its function from a vector indexed by opcode address (bd-w4pr1.13)
+
+- Target: the aggregate step of a scanning aggregate. Perf self time put `execute_agg_step` and
+  `agg_step_with_args` at 11% of `SELECT count(*), sum(a) FROM t WHERE a > 500` over 1M rows.
+- Candidate (local branch `rowloop-aggsite` of the perf3 clone, 8a0a54d72 on 8b04bef28,
+  `crates/fsqlite-vdbe/src/engine.rs` only): `aggregate_function_cache` became a vector indexed
+  by opcode address; `AggStep` resolved its function once and then borrowed it from the cache
+  instead of cloning the `Arc`; while no register carried a subtype the argument subtypes were a
+  shared slice of zeros.
+- Result, stock sqlite3 3.46.1 live, base sha256 ac4fe21f..., candidate 036e21de..., median of 5
+  interleaved runs, user instructions and user cycles in millions: scan_filter_agg 1,927.5 -> 1,936.7
+  and 578 -> 622 (stock 499.9 and 170); `count(*), sum(length(b)), sum(c)` 3,845 -> 3,840 and
+  1,219 -> 1,283; `min(c), max(c), avg(c)` 3,534 -> 3,521 and 959 -> 1,019; group_by_1000_groups
+  4,810 -> 4,819. Every answer equal to stock's. No instruction moved and cycles rose 5-8%.
+- Why, from an exact profile (callgrind, 200k rows): `execute_agg_step` fell from 200 to 166
+  instructions per call, and the out-of-line "is it resolved" check the borrow needed cost 32.
+- Retry condition: not as a patch to individual lookups; as one resolved per-site record, which
+  is the WIN entry above.
+
 ## 2026-11-11 - WIN: the in-place Column lane parses the record header itself and decodes scalars itself (bd-w4pr1.13.4)
 
 - Target: every scan that reads integer, real, NULL or short-text columns. An exact instruction
