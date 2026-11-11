@@ -472,6 +472,44 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
   on path-identity probes; a single user-side term at 5% or more of a native profile of this
   commit's binary reopens it.
 
+## 2026-11-11 - WIN (CPU time; wall time inside noise): a spilled sorter run is sorted by the single-integer pair sort and read back into the row (bd-reality-check-1022-llk6g.8)
+
+- Target: a sort past the sorter's 100 MiB limit, measured as CREATE INDEX over 3M rows, where
+  the two entries below left 2.15-2.4x stock's instructions against 1.55-1.7x at 300k rows.
+  Touched: `crates/fsqlite-vdbe/src/engine.rs` (`SorterCursor::spill_to_disk`, the remainder
+  sort in `SorterCursor::sort`, `RunIterator::advance`).
+- Evidence before: the in-memory sort of a single INTEGER key uses the `(key, position)` pair
+  sort (bd-w4pr1.13.3), but each spilled run and the rows still in memory at merge time were
+  sorted by the generic comparator, about 20 calls a row; the run reader allocated a `Vec` per
+  row and copied it into the row.
+- Change: a run, and the in-memory remainder, try the pair sort first (the same stable order, as
+  that function's contract states) and fall back to the comparator. The run reader reads each
+  record straight into the row's `SmallVec`.
+- Result, stock sqlite3 3.46.1 live, 3M rows, previous = the entry below (sha256 e52e6de8...),
+  candidate sha256 cd25f840...:
+  - user instructions, CREATE INDEX alone: 1,000 distinct integers 23.4G -> 17.1G (2.15x ->
+    1.57x stock's 10.9G); unique scattered integers 26.9G -> 17.3G (2.39x -> 1.53x stock's
+    11.3G).
+  - whole-process `perf stat`, unique scattered integers, six runs per arm alternating: CPU
+    3.05-3.40 s -> 2.68-2.90 s (medians 3.10 -> 2.69 s, -13%), user cycles 9.8-11.1G ->
+    8.7-9.3G; the ranges do not overlap. Page faults 168.5k -> 138.0k.
+  - wall time of the statement, 5 interleaved repetitions, load 13-28: 2.74 -> 2.60 s and 2.97
+    -> 2.72 s (medians); the ranges overlap, and stock's own A/A spread in that run was 3% and
+    19%, so no wall-time claim is made. Stock 0.90-1.19 s: these builds are still 2.3-2.9x on
+    wall time.
+  - peak RSS 416 -> 440 MB and 425 -> 438 MB: the pair vector of the run being sorted.
+  - `create_index_int_300k` and `group_by_1000_groups` do not spill and are unchanged.
+- Test: an engine unit test with a single integer key, 100 rows over ten distinct keys, seven
+  rows to a run and two left in memory, ASC and DESC; the merged order has to be the order one
+  stable sort of all the rows gives.
+- Still a loss at this size. What the 3M-row build does that the 300k-row build does not: it
+  writes the runs to temp files, reads them back with a prefix decode per row, compares the
+  heads of the runs with the generic comparator and collects every row into one vector again.
+- Retry condition for the merge (stream it into the consumer, or at least compare run heads as
+  integers): a build or sort past the spill limit is the row being worked; the numbers above are
+  its baseline. Bounding the build's memory needs that streaming merge and also the table-side
+  growth recorded in the first entry of this series (496 MB at 3M rows before any of it).
+
 ## 2026-11-11 - WIN: a sorter row holds a short record and a one-column key inside itself (bd-reality-check-1022-llk6g.8)
 
 - Target: `create_index_int_300k` after the sorted bulk build (4.97x stock in this run) and every

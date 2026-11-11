@@ -1520,15 +1520,6 @@ type SorterBlob = smallvec::SmallVec<[u8; SORTER_BLOB_INLINE_LEN]>;
 /// A sorter row's decoded sort key. A one-column key stays inside the row.
 type SorterKeyValues = smallvec::SmallVec<[SqliteValue; 1]>;
 
-/// Copy a short record into the row, or take over a long one's allocation.
-fn sorter_blob_from_vec(record: Vec<u8>) -> SorterBlob {
-    if record.len() <= SORTER_BLOB_INLINE_LEN {
-        SorterBlob::from_slice(&record)
-    } else {
-        SorterBlob::from_vec(record)
-    }
-}
-
 /// Cursor state for sorter opcodes (`SorterOpen`, `SorterInsert`, ...).
 ///
 /// Supports external merge sort: when in-memory rows exceed `spill_threshold`
@@ -1843,10 +1834,12 @@ impl SorterCursor {
     /// Insert a row given as plain vectors. See [`Self::insert_record`].
     #[cfg(test)]
     fn insert_row(&mut self, values: Vec<SqliteValue>, blob: Vec<u8>) -> Result<()> {
-        self.insert_record(
-            SorterKeyValues::from_vec(values),
-            sorter_blob_from_vec(blob),
-        )
+        let blob = if blob.len() <= SORTER_BLOB_INLINE_LEN {
+            SorterBlob::from_slice(&blob)
+        } else {
+            SorterBlob::from_vec(blob)
+        };
+        self.insert_record(SorterKeyValues::from_vec(values), blob)
     }
 
     /// Insert a row and spill to disk if memory exceeds the threshold.
@@ -1927,6 +1920,9 @@ impl SorterCursor {
         }
 
         // Sort current batch — lock collation registry once for entire sort.
+        // A run is sorted the way an in-memory sort is: a single INTEGER key
+        // takes the pair sort, which gives the same stable order without a
+        // comparator call per comparison.
         let key_columns = self.key_columns;
         let orders = self.sort_key_orders.clone();
         let colls = self.collations.clone();
@@ -1935,17 +1931,19 @@ impl SorterCursor {
             .collation_registry
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        self.rows.sort_by(|lhs, rhs| {
-            compare_sorter_rows(
-                &lhs.values,
-                &rhs.values,
-                key_columns,
-                &orders,
-                &colls,
-                &coll_guard,
-                text_encoding,
-            )
-        });
+        if !Self::sort_rows_by_single_integer_key(key_columns, &orders, &mut self.rows) {
+            self.rows.sort_by(|lhs, rhs| {
+                compare_sorter_rows(
+                    &lhs.values,
+                    &rhs.values,
+                    key_columns,
+                    &orders,
+                    &colls,
+                    &coll_guard,
+                    text_encoding,
+                )
+            });
+        }
         drop(coll_guard);
 
         // Write to temp file.  We use `keep()` to detach the auto-delete
@@ -2146,17 +2144,19 @@ impl SorterCursor {
         let orders = self.sort_key_orders.clone();
         let colls = self.collations.clone();
         let text_encoding = self.text_encoding;
-        self.rows.sort_by(|lhs, rhs| {
-            compare_sorter_rows(
-                &lhs.values,
-                &rhs.values,
-                key_columns,
-                &orders,
-                &colls,
-                &coll_guard,
-                text_encoding,
-            )
-        });
+        if !Self::sort_rows_by_single_integer_key(key_columns, &orders, &mut self.rows) {
+            self.rows.sort_by(|lhs, rhs| {
+                compare_sorter_rows(
+                    &lhs.values,
+                    &rhs.values,
+                    key_columns,
+                    &orders,
+                    &colls,
+                    &coll_guard,
+                    text_encoding,
+                )
+            });
+        }
 
         // Collect all runs: disk runs first, then in-memory remainder.
         let mut run_iters: Vec<RunIterator> = Vec::with_capacity(self.spill_runs.len() + 1);
@@ -2332,22 +2332,24 @@ impl RunIterator {
                 match reader.read_exact(&mut len_buf) {
                     Ok(()) => {
                         let len = u32::from_le_bytes(len_buf) as usize;
-                        let mut buf = vec![0u8; len];
+                        // Read the record straight into the row: a short one
+                        // needs no heap block of its own.
+                        let mut blob = SorterBlob::from_elem(0, len);
                         reader
-                            .read_exact(&mut buf)
+                            .read_exact(&mut blob)
                             .map_err(|e| FrankenError::internal(format!("sorter run read: {e}")))?;
                         // Decode only the sort-key prefix — not all columns — and
                         // under the DB encoding so a spilled UTF-16 key sorts the
                         // same as the in-memory path (bd-7c6g7 #5).
                         let values = fsqlite_types::record::parse_record_prefix_with_encoding(
-                            &buf,
+                            &blob,
                             *key_columns,
                             *text_encoding,
                         )
                         .ok_or_else(|| FrankenError::internal("sorter run: malformed record"))?;
                         *current = Some(SorterRow {
                             values: SorterKeyValues::from_vec(values),
-                            blob: sorter_blob_from_vec(buf),
+                            blob,
                             source_sequence: 0,
                         });
                     }
@@ -38028,6 +38030,59 @@ mod tests {
                     "a one-column key belongs inside the row"
                 );
             }
+        }
+    }
+
+    /// A run spilled to disk is sorted the way an in-memory sort is. With a
+    /// single INTEGER key that is the pair sort, and it has to keep rows with
+    /// equal keys in insertion order inside every run: the merge takes ties
+    /// from the earliest run, so only then is the result the order one stable
+    /// sort of all the rows gives.
+    #[test]
+    fn test_sorter_integer_key_runs_merge_into_the_stable_order() {
+        let input = |sequence: i64| {
+            let key = (sequence * 37) % 10;
+            let record = serialize_record(&[
+                SqliteValue::Integer(key),
+                SqliteValue::Integer(sequence),
+            ]);
+            (key, record)
+        };
+        for order in [SortKeyOrder::Asc, SortKeyOrder::Desc] {
+            let mut sorter = SorterCursor::new(1, vec![order], Vec::new());
+            // Seven rows to a run, so a run holds rows with equal keys, and
+            // the last two rows are still in memory when the sort starts.
+            let (probe_key, probe_record) = input(0);
+            sorter.spill_threshold =
+                SorterCursor::estimate_row_size(&[SqliteValue::Integer(probe_key)], &probe_record)
+                    * 7;
+            let mut expected: Vec<(i64, i64)> = Vec::new();
+            for sequence in 0..100_i64 {
+                let (key, record) = input(sequence);
+                sorter
+                    .insert_row(vec![SqliteValue::Integer(key)], record)
+                    .expect("insert should succeed");
+                expected.push((key, sequence));
+            }
+            assert_eq!(sorter.spill_runs.len(), 14, "{order:?}");
+            assert_eq!(sorter.rows.len(), 2, "{order:?}");
+            sorter.sort().expect("sort should succeed");
+
+            // `sort_by_key` is stable: equal keys stay in insertion order.
+            if order == SortKeyOrder::Asc {
+                expected.sort_by_key(|&(key, _)| key);
+            } else {
+                expected.sort_by_key(|&(key, _)| std::cmp::Reverse(key));
+            }
+            let sorted: Vec<(i64, i64)> = sorter
+                .rows
+                .iter()
+                .map(|row| {
+                    let record = parse_record(&row.blob).expect("sorted row should decode");
+                    (record[0].to_integer(), record[1].to_integer())
+                })
+                .collect();
+            assert_eq!(sorted, expected, "{order:?}");
         }
     }
 
