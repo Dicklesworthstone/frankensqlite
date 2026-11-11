@@ -24,8 +24,8 @@ use fsqlite_types::flags::{AccessFlags, SyncFlags, VfsOpenFlags};
 use fsqlite_types::sync_primitives::Instant;
 use fsqlite_types::{
     BTreePageHeader, CommitSeq, DATABASE_HEADER_MAGIC, DATABASE_HEADER_SIZE, DatabaseHeader,
-    DatabaseHeaderError, FRANKENSQLITE_SQLITE_VERSION_NUMBER, LockLevel, PageData, PageNumber,
-    PageNumberBuildHasher, PageSize,
+    FRANKENSQLITE_SQLITE_VERSION_NUMBER, LockLevel, PageData, PageNumber, PageNumberBuildHasher,
+    PageSize,
 };
 #[cfg(all(feature = "native", any(unix, windows)))]
 use fsqlite_vfs::{
@@ -10255,19 +10255,13 @@ impl<F: VfsFile> PagerInner<F> {
                 // so its change counter is read like any stale main header.
                 DatabaseHeader::from_bytes(&base_header_bytes)
                     .map_err(|error| {
-                        map_database_header_error(
-                            &error,
-                            "invalid database-file header during WAL refresh",
-                        )
+                        error.to_franken_error("invalid database-file header during WAL refresh")
                     })?
                     .change_counter
             } else {
                 DatabaseHeader::from_bytes(&base_header_bytes)
                     .map_err(|error| {
-                        map_database_header_error(
-                            &error,
-                            "invalid database header during pager refresh",
-                        )
+                        error.to_franken_error("invalid database header during pager refresh")
                     })?
                     .change_counter
             };
@@ -10480,7 +10474,7 @@ impl<F: VfsFile> PagerInner<F> {
             let mut header_bytes = [0_u8; DATABASE_HEADER_SIZE];
             header_bytes.copy_from_slice(&page1[..DATABASE_HEADER_SIZE]);
             let header = DatabaseHeader::from_bytes(&header_bytes).map_err(|error| {
-                map_database_header_error(&error, "invalid database header during pager refresh")
+                error.to_franken_error("invalid database header during pager refresh")
             })?;
             if header.page_size != self.page_size {
                 return Err(FrankenError::DatabaseCorrupt {
@@ -14496,7 +14490,7 @@ async fn database_image_receipt_for_open_file_with_extent<F: VfsFile>(
         });
     }
     let header = DatabaseHeader::from_bytes(&header_bytes)
-        .map_err(|err| map_database_header_error(&err, "invalid database image header"))?;
+        .map_err(|err| err.to_franken_error("invalid database image header"))?;
     if let Some(expected_page_size) = expected_page_size
         && header.page_size != expected_page_size
     {
@@ -14664,30 +14658,6 @@ fn page_size_from_header_bytes(header_bytes: &[u8; DATABASE_HEADER_SIZE]) -> Opt
     PageSize::new(page_size)
 }
 
-/// Map a database-header parse error from an open/refresh/recovery read path to
-/// the caller-facing [`FrankenError`] (bd-3j2c5).
-///
-/// A newer on-disk format is a dedicated, non-corruption condition
-/// ([`FrankenError::NewerFormat`] → `SQLITE_OPEN_NEWER_FORMAT`): the header
-/// parsed cleanly but was written by a newer FrankenSQLite than this build
-/// supports, so opening is refused while staying distinguishable from a
-/// genuinely damaged header. Every other header error is corruption, reported
-/// with the caller's `context` for provenance (`"{context}: {error}"`).
-///
-/// Stale live-WAL bootstrap stubs parse cleanly (bd-25au0) and are recognized
-/// from their bytes (see [`stale_main_header_can_be_recovered_from_live_wal`]),
-/// so every header error at an open/refresh site reaches this mapping.
-fn map_database_header_error(error: &DatabaseHeaderError, context: &str) -> FrankenError {
-    match error {
-        DatabaseHeaderError::NewerFormat { on_disk, supported } => FrankenError::NewerFormat {
-            on_disk: *on_disk,
-            supported: *supported,
-        },
-        other => FrankenError::DatabaseCorrupt {
-            detail: format!("{context}: {other}"),
-        },
-    }
-}
 
 /// The error for a write to an auto-vacuum database (bd-1q134).
 ///
@@ -18232,6 +18202,30 @@ where
         PathBuf::from(jp)
     }
 
+    /// Whether nothing of a database survives at `db_path`: no main file, no
+    /// WAL and no rollback journal. Only then may a quiescent, stale
+    /// namespace record give way to creating a new database there, as stock
+    /// SQLite does after `rm db db-wal db-shm` (bd-w4pr1.21). A surviving WAL
+    /// or journal may hold committed data, so it keeps the open refused, and
+    /// so does any error other than "not found".
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    fn no_database_state_survives(db_path: &Path) -> bool {
+        let mut wal_path = db_path.as_os_str().to_owned();
+        wal_path.push("-wal");
+        [
+            db_path.to_path_buf(),
+            PathBuf::from(wal_path),
+            Self::journal_path(db_path),
+        ]
+        .iter()
+        .all(|path| {
+            matches!(
+                std::fs::symlink_metadata(path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            )
+        })
+    }
+
     fn ensure_reserved_recovery_artifacts_absent(cx: &Cx, vfs: &V, db_path: &Path) -> Result<()> {
         for suffix in ["-journal", "-wal", "-wal-fec", "-shm"] {
             let mut artifact_path = db_path.as_os_str().to_owned();
@@ -18329,10 +18323,7 @@ where
             });
         }
         let header = DatabaseHeader::from_bytes(&header_bytes).map_err(|error| {
-            map_database_header_error(
-                &error,
-                "invalid database header during recovery-mode detection",
-            )
+            error.to_franken_error("invalid database header during recovery-mode detection")
         })?;
         Self::journal_mode_from_database_header(&header)
     }
@@ -18613,8 +18604,7 @@ where
                     }
                     let restored_header =
                         DatabaseHeader::from_bytes(&header_bytes).map_err(|error| {
-                            map_database_header_error(
-                                &error,
+                            error.to_franken_error(
                                 "rollback recovery restored an invalid database header",
                             )
                         })?;
@@ -19439,9 +19429,13 @@ where
             flags |= VfsOpenFlags::CREATE;
         }
         #[cfg(all(feature = "native", any(unix, windows)))]
-        if replace_quiescent_namespace_record {
+        if replace_quiescent_namespace_record && !Self::no_database_state_survives(&db_path) {
             // A stale nonempty namespace record must never turn a missing
-            // main database into a silently created empty replacement.
+            // main database into a silently created empty replacement while
+            // committed state could survive beside it (a -wal or -journal).
+            // With the main file, WAL and journal all gone there is nothing
+            // to lose, and the record is quiescent (no live holder): create
+            // the database, as stock SQLite does (bd-w4pr1.21).
             flags.remove(VfsOpenFlags::CREATE);
         }
         // bd-dd24l (GH#376): snapshot which Windows advisory-lock sidecars
@@ -19755,7 +19749,7 @@ where
             match DatabaseHeader::from_bytes(header_bytes) {
                 Ok(header) => header.page_size,
                 Err(error) if disposition == ReadWriteOpenDisposition::ExistingOnly => {
-                    return Err(map_database_header_error(&error, "invalid database header"));
+                    return Err(error.to_franken_error("invalid database header"));
                 }
                 Err(_) => requested_page_size,
             }
@@ -19916,7 +19910,7 @@ where
                                 path: db_path.clone(),
                             });
                         }
-                        return Err(map_database_header_error(&error, "invalid database header"));
+                        return Err(error.to_franken_error("invalid database header"));
                     }
                 };
             if header.page_size != page_size {
@@ -20436,7 +20430,7 @@ where
                 (Some(header), page_size)
             }
             Err(error) => {
-                return Err(map_database_header_error(&error, "invalid database header"));
+                return Err(error.to_franken_error("invalid database header"));
             }
         };
 
@@ -33361,14 +33355,34 @@ mod tests {
                 std::fs::copy(sidecar(&source, suffix), sidecar(&missing, suffix))
                     .expect("copy orphan namespace sidecar");
             }
+            // A WAL (or journal) beside the missing main file may hold
+            // committed data: stale sidecars must not create a replacement.
+            std::fs::write(sidecar(&missing, "-wal"), b"surviving wal bytes")
+                .expect("write surviving WAL");
             assert!(matches!(
                 SimplePager::open_with_cx(&cx, UnixVfs::new(), &missing, PageSize::DEFAULT,).await,
                 Err(FrankenError::CannotOpen { .. })
             ));
             assert!(
                 !missing.exists(),
-                "stale sidecars must not create a replacement for a missing main database"
+                "stale sidecars must not create a replacement while a WAL survives"
             );
+            // bd-w4pr1.21: with main, WAL and journal all gone (`rm db db-wal
+            // db-shm`, as SQLite users reset a database) nothing can be lost,
+            // so the quiescent record gives way and the database is created,
+            // as stock SQLite does. A second open joins the rebound record.
+            std::fs::remove_file(sidecar(&missing, "-wal")).expect("remove surviving WAL");
+            let created =
+                SimplePager::open_with_cx(&cx, UnixVfs::new(), &missing, PageSize::DEFAULT)
+                    .await
+                    .expect("a deleted database is created again beside stale sidecars");
+            drop(created);
+            assert!(missing.exists(), "the main database is created");
+            let reopened =
+                SimplePager::open_with_cx(&cx, UnixVfs::new(), &missing, PageSize::DEFAULT)
+                    .await
+                    .expect("the recreated database opens again");
+            drop(reopened);
         });
     }
 

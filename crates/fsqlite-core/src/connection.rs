@@ -45179,7 +45179,7 @@ impl DatabaseBuilderReservation {
                 }
             })?;
             let header = DatabaseHeader::from_bytes(&header_bytes)
-                .map_err(|error| map_database_header_error(&error, "invalid database header"))?;
+                .map_err(|error| error.to_franken_error("invalid database header"))?;
             match (header.write_version, header.read_version) {
                 // bd-h5oaj / GH#355 (live Windows measurement,
                 // hfdt-win0117-fsqlite-handle-collision-fw8gk): this ran with
@@ -153605,32 +153605,7 @@ fn parse_database_header_checked(page1_bytes: &[u8]) -> Result<DatabaseHeader> {
     let mut header_bytes = [0_u8; DATABASE_HEADER_SIZE];
     header_bytes.copy_from_slice(&page1_bytes[..DATABASE_HEADER_SIZE]);
     DatabaseHeader::from_bytes(&header_bytes)
-        .map_err(|err| map_database_header_error(&err, "database header invalid"))
-}
-
-/// Map a database-header parse error to the caller-facing [`FrankenError`],
-/// surfacing a newer on-disk format as the dedicated
-/// [`FrankenError::NewerFormat`] (`SQLITE_OPEN_NEWER_FORMAT`) rather than
-/// corruption (bd-3j2c5). A newer format means the header parsed cleanly but was
-/// written by a newer FrankenSQLite than this build supports: refuse the open
-/// while keeping it distinguishable from a genuinely damaged header. Every other
-/// header error is corruption, reported with `context` for provenance. Mirrors
-/// the pager-side `map_database_header_error` and the earlier bd-e9hws mapping.
-fn map_database_header_error(
-    error: &fsqlite_types::DatabaseHeaderError,
-    context: &str,
-) -> FrankenError {
-    match error {
-        fsqlite_types::DatabaseHeaderError::NewerFormat { on_disk, supported } => {
-            FrankenError::NewerFormat {
-                on_disk: *on_disk,
-                supported: *supported,
-            }
-        }
-        other => FrankenError::DatabaseCorrupt {
-            detail: format!("{context}: {other}"),
-        },
-    }
+        .map_err(|err| err.to_franken_error("database header invalid"))
 }
 
 fn sqlite_master_signature(row: &[SqliteValue]) -> Result<(String, String, String, i64)> {

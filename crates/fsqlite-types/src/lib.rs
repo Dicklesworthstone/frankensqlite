@@ -1182,6 +1182,37 @@ impl fmt::Display for DatabaseHeaderError {
 
 impl std::error::Error for DatabaseHeaderError {}
 
+impl DatabaseHeaderError {
+    /// The caller-facing error for a header that failed to parse.
+    ///
+    /// A newer FrankenSQLite format is [`fsqlite_error::FrankenError::NewerFormat`]
+    /// (`SQLITE_OPEN_NEWER_FORMAT`, bd-3j2c5): the header parsed cleanly but a
+    /// newer build wrote it. A legacy schema format (1..=3) is a valid stock
+    /// file that this project deliberately does not open; the refusal names
+    /// stock's one-step upgrade instead of calling the file malformed. Every
+    /// other header error is corruption, reported with `context` for provenance.
+    #[must_use]
+    pub fn to_franken_error(&self, context: &str) -> fsqlite_error::FrankenError {
+        match self {
+            Self::NewerFormat { on_disk, supported } => fsqlite_error::FrankenError::NewerFormat {
+                on_disk: *on_disk,
+                supported: *supported,
+            },
+            Self::InvalidSchemaFormat { raw: raw @ 1..=3 } => {
+                fsqlite_error::FrankenError::NotImplemented(format!(
+                    "this database uses SQLite's legacy schema format {raw} (written by SQLite \
+                     before 3.7.10, or with legacy_file_format on), which FrankenSQLite does not \
+                     open; run VACUUM on it once with stock sqlite3 to upgrade it to schema \
+                     format 4"
+                ))
+            }
+            other => fsqlite_error::FrankenError::DatabaseCorrupt {
+                detail: format!("{context}: {other}"),
+            },
+        }
+    }
+}
+
 impl DatabaseHeader {
     /// Parse and validate a 100-byte database header.
     pub fn from_bytes(buf: &[u8; DATABASE_HEADER_SIZE]) -> Result<Self, DatabaseHeaderError> {
@@ -2928,6 +2959,46 @@ mod tests {
                 DatabaseHeaderError::InvalidSchemaFormat { raw } if raw == legacy
             ));
         }
+    }
+
+    /// A legacy schema format is a valid stock file: refused with the upgrade
+    /// path, never reported as malformed. An impossible format value is still
+    /// corruption, and a newer FrankenSQLite format keeps its dedicated error.
+    #[test]
+    fn test_header_error_caller_mapping() {
+        for legacy in 1u32..=3 {
+            let error = DatabaseHeaderError::InvalidSchemaFormat { raw: legacy }
+                .to_franken_error("database header invalid");
+            let fsqlite_error::FrankenError::NotImplemented(message) = &error else {
+                panic!("legacy format {legacy} must be a refusal, got {error:?}");
+            };
+            assert!(message.contains(&format!("legacy schema format {legacy}")));
+            assert!(message.contains("VACUUM"), "{message}");
+        }
+        for impossible in [5u32, 7, u32::MAX] {
+            let error = DatabaseHeaderError::InvalidSchemaFormat { raw: impossible }
+                .to_franken_error("database header invalid");
+            assert!(
+                matches!(&error, fsqlite_error::FrankenError::DatabaseCorrupt { detail }
+                    if detail == &format!("database header invalid: invalid schema format: {impossible}")),
+                "{error:?}"
+            );
+        }
+        assert!(matches!(
+            DatabaseHeaderError::InvalidMagic.to_franken_error("ctx"),
+            fsqlite_error::FrankenError::DatabaseCorrupt { .. }
+        ));
+        assert!(matches!(
+            DatabaseHeaderError::NewerFormat {
+                on_disk: 9,
+                supported: 2
+            }
+            .to_franken_error("ctx"),
+            fsqlite_error::FrankenError::NewerFormat {
+                on_disk: 9,
+                supported: 2
+            }
+        ));
     }
 
     #[test]
