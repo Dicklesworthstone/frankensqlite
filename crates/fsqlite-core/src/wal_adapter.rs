@@ -4143,7 +4143,14 @@ where
     /// `None` when either identity is unknown or they differ; callers then take
     /// their open-and-inspect path, which also handles missing and replaced
     /// companions.
-    async fn current_handle_names_wal_path(&self, cx: &Cx) -> Result<Option<bool>> {
+    /// `generation_proven`: the caller already knows this handle's WAL
+    /// generation is the published one, so the WAL header is not read back to
+    /// compare it. The path is still checked against the handle.
+    async fn current_handle_names_wal_path(
+        &self,
+        cx: &Cx,
+        generation_proven: bool,
+    ) -> Result<Option<bool>> {
         let current = self.inner.wal.file();
         let (Some(path_identity), Some(current_identity)) = (
             self.vfs.path_file_identity(cx, &self.wal_path)?,
@@ -4153,6 +4160,9 @@ where
         };
         if path_identity != current_identity {
             return Ok(None);
+        }
+        if generation_proven {
+            return Ok(Some(true));
         }
         self.path_header_matches_current_handle(cx, current).await.map(Some)
     }
@@ -4428,8 +4438,12 @@ where
     }
 
     /// Read admission never creates or truncates a WAL to satisfy its binding.
+    /// `bound_header`: the shared WAL-index header the read admission about
+    /// to follow is bound to, when there is one.
     async fn ensure_current_wal_path_for_native_read(
-        &mut self, cx: &Cx,
+        &mut self,
+        cx: &Cx,
+        bound_header: Option<fsqlite_wal::wal_index::WalIndexHdr>,
     ) -> Result<WalNativeReadOutcome> {
         if self.inner.has_pending_publication() || self.inner.native_read_binding.is_some() {
             return Err(FrankenError::BusyRecovery);
@@ -4439,7 +4453,21 @@ where
             binding.validate_path_identity()?;
         }
         self.ensure_db_file_identity_captured(cx).await;
-        if self.current_handle_names_wal_path(cx).await? == Some(true) {
+        // Reading the WAL header back through this handle detects a
+        // generation another connection reset in place. Every reset rewrites
+        // the shared header's salts, so an admission bound to the header this
+        // handle last proved its WAL binding against (see `NativeReadProof`)
+        // is on the same generation, and the admission itself will take the
+        // proof for the rest. Any other header is compared with the file.
+        let generation_proven = bound_header.is_some_and(|header| {
+            self.inner.native_read_proof
+                == Some(NativeReadProof {
+                    header,
+                    frame_count: self.inner.wal.frame_count(),
+                    salts: self.inner.wal.header().salts,
+                })
+        });
+        if self.current_handle_names_wal_path(cx, generation_proven).await? == Some(true) {
             return Ok(WalNativeReadOutcome::Ready);
         }
         let opened = self.vfs.open(cx, Some(&self.wal_path), VfsOpenFlags::READWRITE | VfsOpenFlags::WAL);
@@ -4578,7 +4606,7 @@ where
         // Cross-process stock DOES see it and leaves them alone (measured on
         // bd-1nq3j), so this is tolerance for a configuration stock itself
         // documents as unsupported, not cover for an interop defect.
-        match self.current_handle_names_wal_path(cx).await? {
+        match self.current_handle_names_wal_path(cx, false).await? {
             Some(true) => return Ok(()),
             Some(false) => return Err(FrankenError::BusyRecovery),
             None => {}
@@ -6116,7 +6144,10 @@ where
         &'a mut self, cx: &'a Cx, binding: WalNativeReadBinding,
     ) -> WalFuture<'a, WalNativeReadOutcome> {
         Box::pin(async move {
-            match self.ensure_current_wal_path_for_native_read(cx).await? {
+            match self
+                .ensure_current_wal_path_for_native_read(cx, Some(binding.header()))
+                .await?
+            {
                 WalNativeReadOutcome::Ready => self.inner.begin_native_read(cx, binding).await,
                 outcome => Ok(outcome),
             }
@@ -6136,7 +6167,7 @@ where
             if self.inner.has_pending_publication() || self.inner.native_read_binding.is_some() {
                 return Err(FrankenError::BusyRecovery);
             }
-            match self.ensure_current_wal_path_for_native_read(cx).await? {
+            match self.ensure_current_wal_path_for_native_read(cx, None).await? {
                 fsqlite_pager::traits::WalNativeReadOutcome::Ready => {}
                 fsqlite_pager::traits::WalNativeReadOutcome::RecoveryRequired(_) => {
                     // Creating/resetting the physical WAL requires its own
