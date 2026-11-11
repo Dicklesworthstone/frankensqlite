@@ -33,6 +33,7 @@
 
 mod conformal_retry;
 mod insert_batch;
+mod literal_params;
 mod pragma_maintenance;
 mod qualified_column_binding;
 
@@ -29170,6 +29171,9 @@ impl Connection {
         clear_error_byte_offset();
         self.background_status()?;
         self.settle_pending_transaction_cleanup().await?;
+        if let Some(rows) = self.query_literal_statement_parameterized(sql).await? {
+            return Ok(rows);
+        }
         let statements = {
             let parse_span = tracing::enabled!(target: "fsqlite.parse", tracing::Level::TRACE)
                 .then(|| {
@@ -29221,6 +29225,101 @@ impl Connection {
         self.pending_ddl_source.borrow_mut().take();
         self.pending_alter_source.borrow_mut().take();
         result
+    }
+
+    /// Run a literal statement through its parameterized form (bd-5310l).
+    ///
+    /// The parse cache and the compiled-program cache are keyed on SQL text,
+    /// so statements that differ only in their literals parse and compile
+    /// from scratch every time. For the shapes [`literal_params`] recognizes
+    /// the literals become numbered parameters, every statement of the shape
+    /// presents one text to both caches, and the statement runs down the
+    /// same dispatcher path as before with the values bound.
+    ///
+    /// `None` sends the caller down the text path: the statement is not one
+    /// of those shapes, or the schema does not let it run parameterized. A
+    /// statement that ran here and failed is not run again; its error is
+    /// returned, with any recorded byte offset moved back to the text the
+    /// caller wrote.
+    async fn query_literal_statement_parameterized(&self, sql: &str) -> Result<Option<Vec<Row>>> {
+        // Text this connection has parsed before is served by the caches as
+        // it stands: the same statement run again, or one already written
+        // with `?` parameters. Only text seen for the first time is worth
+        // the token pass.
+        if self.parse_cache_holds(sql) {
+            return Ok(None);
+        }
+        let Some(parameterized) = literal_params::parameterize_literal_statement(sql) else {
+            return Ok(None);
+        };
+        if !self.literal_statement_may_run_parameterized(&parameterized) {
+            return Ok(None);
+        }
+        let Ok(statements) = self.cached_parse_multi(&parameterized.sql) else {
+            return Ok(None);
+        };
+        let [statement] = statements.as_slice() else {
+            return Ok(None);
+        };
+        match self
+            .execute_statement_after_background_status(
+                statement.as_ref(),
+                Some(&parameterized.params),
+            )
+            .await
+        {
+            Ok(rows) => {
+                self.note_connection_statement_execution_count(1);
+                Ok(Some(rows))
+            }
+            Err(error) => {
+                // A resolution site records where in the statement its error
+                // lies. It measured that in the rewritten text; hand back
+                // the place in the text the caller wrote.
+                if let Some(offset) = take_error_byte_offset() {
+                    set_error_byte_offset(parameterized.original_offset(offset));
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Whether the current schema lets a recognized literal statement run
+    /// with its literals bound as parameters.
+    ///
+    /// The target must be an ordinary table this connection knows: a virtual
+    /// table can give a literal a meaning of its own (an FTS5 command row),
+    /// a view is rewritten through its triggers, and the schema tables have
+    /// their own rules. A statement that filters on a key must name the
+    /// table's rowid alias, so its plan is a rowid seek whatever the value
+    /// and cannot depend on what the planner would have read from a literal.
+    fn literal_statement_may_run_parameterized(
+        &self,
+        statement: &literal_params::ParameterizedLiteralStatement,
+    ) -> bool {
+        let table = statement.table.as_str();
+        if table
+            .as_bytes()
+            .get(..7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"sqlite_"))
+            || self.table_name_is_virtual(table)
+            || self.view_index_of(table).is_some()
+        {
+            return false;
+        }
+        let schema = self.schema.borrow();
+        let Some(table_schema) = schema
+            .iter()
+            .find(|candidate| candidate.name.eq_ignore_ascii_case(table))
+        else {
+            return false;
+        };
+        statement.key_column.as_deref().is_none_or(|key| {
+            table_schema
+                .columns
+                .iter()
+                .any(|column| column.is_ipk && column.name.eq_ignore_ascii_case(key))
+        })
     }
 
     /// Prepare and execute SQL as a query with bound SQL parameters.
@@ -38187,6 +38286,15 @@ impl Connection {
         } else {
             None
         }
+    }
+
+    /// Whether this connection's parse cache holds exactly `sql`, without
+    /// counting as a use of the entry.
+    fn parse_cache_holds(&self, sql: &str) -> bool {
+        self.parse_cache
+            .borrow()
+            .peek(&Self::sql_hash(sql))
+            .is_some_and(|entry| entry.sql == sql)
     }
 
     fn insert_parse_cache(

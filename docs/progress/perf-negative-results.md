@@ -87,6 +87,62 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-11 - WIN: a literal INSERT or rowid-keyed SELECT, UPDATE or DELETE runs with its literals bound, so statements that differ only in literals share one parse and one program (bd-5310l)
+
+- Target: ad-hoc statements whose literals change every time (scorecard `txn_1000x10_rows`; any caller
+  that formats values into SQL). Touched: `crates/fsqlite-core/src/connection.rs` (`query_impl`; new
+  `query_literal_statement_parameterized`, `literal_statement_may_run_parameterized`,
+  `parse_cache_holds`), new `crates/fsqlite-core/src/connection/literal_params.rs`.
+- Evidence before (3ce2feef2; `perf stat` user instructions per statement inside one transaction
+  through the CLI, batch of 4,000 minus batch of 2,000, three runs; stock sqlite3 3.46.1 live in each
+  run): the parse, compiled-program and prepared caches are keyed on exact SQL text. One INSERT text
+  repeated cost 62-67k; the same INSERT with a new literal each time 91-96k (stock 13.9k). Point SELECT
+  by rowid 98-101k against 152-156k (stock 22.1k). UPDATE by rowid 76-77k against 114-115k (stock
+  18.3k). A third of a distinct-literal statement was a parse and a compile nothing reused.
+- Change: `Connection::query` recognizes four shapes from the bytes of the text: a one-row
+  `INSERT INTO t [(cols)] VALUES (...)`, `SELECT cols | * FROM t WHERE k = int`,
+  `UPDATE t SET c = v | c2 | c2 +/- num, ... WHERE k = int`, `DELETE FROM t WHERE k = int`. Decimal
+  integers, `digits.digits` floats and strings become `?N` and the statement runs down the same
+  dispatcher path with the values bound; `NULL` stays text. It applies only when the target is an
+  ordinary table of this connection (not virtual, not a view, not `sqlite_*`) and, for the keyed
+  shapes, `k` is its rowid alias, so the plan is a rowid seek whatever the value. Everything else
+  takes the text path unchanged: hex, exponents, blobs, an integer past i64 (a REAL to SQLite, and
+  `-9223372036854775808` an integer), comments, quoted names, keywords used as names, multi-row
+  VALUES, any further clause. Text the connection has already parsed skips the scan. A statement that
+  fails is not run again; a byte offset its error recorded is moved back to the text as written.
+  Nothing adaptive.
+- The scan costs 2.6k instructions per statement (callgrind). A first cut built on the SQL lexer cost
+  6.7k; a unit test holds the scan to that lexer-built matcher over 7,379 generated statements
+  (wherever the scan accepts, both give the same text, values and names, and every offset maps back
+  to the byte it was copied from).
+- Result (same probe; this commit and the next were measured as one binary, b99eb86bb on 3ce2feef2,
+  sha256 8c04a3d955b630cd; the next entry separates them by callgrind): distinct-literal INSERT 91-96k
+  -> 62-66k (6.7x -> 4.6x stock), SELECT 152-156k -> 91-99k (7.0x -> 4.3x), UPDATE 114-115k -> 68-76k
+  (6.3x -> 4.0x). The lexer-based first cut alone (73e683828, one run): INSERT 94.2k -> 74.2k, SELECT
+  158.0k -> 109.0k, UPDATE 112.1k -> 82.8k. Scorecard `txn_1000x10_rows`, three interleaved reps:
+  1,525M -> 1,199M user instructions (9.9x -> 7.8x stock's 153.9M). CPU best 471 -> 400 ms against
+  stock's 34 ms, but stock's own reps spread 1.20x on CPU at load 15, so no time ratio is claimed.
+- Behaviour: `crates/fsqlite-core/tests/bd_5310l_literal_parameterization_oracle.rs` runs every
+  statement three ways (as written; with the table written `main.t`, which the scan refuses, so it
+  takes the text path; and on stock through rusqlite): 33 literal spellings into INTEGER, REAL,
+  NUMERIC, TEXT, BLOB and untyped columns compared by stored type and value, explicit rowids, keyed
+  SELECT / UPDATE / DELETE, `changes()` and `last_insert_rowid()` after each, constraint, arity and
+  unknown-name failures, a DROP and re-CREATE with the affinities swapped between two uses of one
+  statement text, tables with triggers, AUTOINCREMENT, defaults, a generated column, STRICT typing,
+  WITHOUT ROWID and foreign keys, and a non-rowid key. It also asserts the mechanism: 120 distinct
+  literal statements of two shapes parse at most four times as written and 120 times on the text
+  path. Shell output of base and candidate is byte-identical over 768 runs (six modes, headers on and
+  off, 16 script tails, `:memory:` and a file, streams separate and merged).
+- Still a loss: 4.0-4.6x stock in instructions on these shapes after this entry and the next.
+  `txn_1000x10_rows` is 7.8x because each of its 1,000 transactions still pays about 590k
+  instructions for BEGIN and COMMIT (bd-ih8ak).
+- Not covered: `execute` and `prepare`. A single literal DML statement through `execute` takes the
+  prepared lane, whose text-keyed cache misses the same way.
+- Retry condition for widening (multi-row VALUES, non-rowid keys, expressions, `execute`): only
+  with `EXPLAIN QUERY PLAN` equal between the literal and the parameter form of the added shape on
+  tables with partial and expression indexes, and a profile showing that shape's parse plus compile
+  at 10% or more of a scorecard or `blocking_vs_rusqlite_bench` row.
+
 ## 2026-11-11 - WIN: the hot lane runs consecutive opcodes itself, and AggStep, table-leaf Rowid and the sorter opcodes stay on it (bd-w4pr1.13.7)
 
 - Target: every bytecode row loop. After bd-w4pr1.13.1 the statement loop still called the hot
