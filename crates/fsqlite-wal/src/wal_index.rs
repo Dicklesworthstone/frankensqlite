@@ -702,13 +702,11 @@ fn validate_shared_segment(region: &ShmRegion) -> Result<()> {
 
 fn read_shared_header_copy(region: &ShmRegion, offset: usize) -> Result<[u8; WAL_INDEX_HDR_BYTES]> {
     let mut bytes = [0_u8; WAL_INDEX_HDR_BYTES];
-    for (index, word) in bytes.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-        word.copy_from_slice(
-            &region
-                .atomic_load_u32_ne(offset + index * 4, Ordering::Acquire)?
-                .to_ne_bytes(),
-        );
-    }
+    // One range check and one hold of the region's local mutex for the twelve
+    // words. Each word is still its own aligned atomic load, in ascending
+    // order, as when they were loaded one call at a time (bd-w4pr1.7: an
+    // autocommit statement reads the header ten times).
+    region.atomic_copy_u32_ne(offset, &mut bytes, Ordering::Acquire)?;
     Ok(bytes)
 }
 
