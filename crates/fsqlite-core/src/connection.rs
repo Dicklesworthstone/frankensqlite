@@ -113613,6 +113613,15 @@ fn join_expr_is_vdbe_eligible(expr: &Expr) -> bool {
                 && join_expr_is_vdbe_eligible(right)
         }
         Expr::IsNull { expr, .. } => join_expr_is_vdbe_eligible(expr),
+        // bd-w4pr1.13.16: JOIN codegen compiles BETWEEN as its two
+        // comparisons.
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            join_expr_is_vdbe_eligible(expr)
+                && join_expr_is_vdbe_eligible(low)
+                && join_expr_is_vdbe_eligible(high)
+        }
         _ => false,
     }
 }

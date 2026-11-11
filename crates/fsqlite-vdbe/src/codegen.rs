@@ -13897,12 +13897,34 @@ fn codegen_single_join_lookup_select(
     // the same outer values), so its lookup is skipped. For an inner join the
     // same holds for an ON term the lookup did not consume. The terms are
     // tested again with the whole WHERE after the lookup, as before.
-    let mut outer_row_terms = Vec::new();
+    let mut conjuncts = Vec::new();
     if let Some(where_expr) = where_clause {
-        collect_conjunctive_terms(where_expr, &mut outer_row_terms);
+        collect_conjunctive_terms(where_expr, &mut conjuncts);
     }
     if matches!(plan.join_kind, fsqlite_ast::JoinKind::Inner) {
-        outer_row_terms.extend(plan.on_residual.iter().copied());
+        conjuncts.extend(plan.on_residual.iter().copied());
+    }
+    // A BETWEEN term stands for a lower and an upper comparison; taken apart,
+    // each can bound the outer rowid.
+    let between_comparisons: Vec<Expr> = conjuncts
+        .iter()
+        .filter_map(|term| match term {
+            Expr::Between {
+                expr: operand,
+                low,
+                high,
+                not: false,
+                span,
+            } => Some(between_as_comparisons(operand, low, high, false, *span)),
+            _ => None,
+        })
+        .collect();
+    let mut outer_row_terms: Vec<&Expr> = conjuncts
+        .into_iter()
+        .filter(|term| !matches!(term, Expr::Between { not: false, .. }))
+        .collect();
+    for comparisons in &between_comparisons {
+        collect_conjunctive_terms(comparisons, &mut outer_row_terms);
     }
     outer_row_terms.retain(|term| !expr_references_scan(term, right_table, right_alias));
     // The tightest integer lower bound those terms put on the outer rowid:
@@ -15464,6 +15486,18 @@ fn emit_join_expr(
             b.resolve_label(skip);
             Ok(())
         }
+        // `x [NOT] BETWEEN low AND high` is the two comparisons it stands
+        // for, so each gets the affinity and collation of a comparison.
+        Expr::Between {
+            expr: operand,
+            low,
+            high,
+            not,
+            span,
+        } => {
+            let comparisons = between_as_comparisons(operand, low, high, *not, *span);
+            emit_join_expr(b, &comparisons, target, tables, _ctx)
+        }
         // A plain scalar call: its arguments, then one PureFunc, as the
         // single-table emitter compiles it. Reached only for an aggregate
         // argument that `join_aggregate_arg_supported` admitted.
@@ -15524,6 +15558,31 @@ fn join_qualifier_matches(
             |a| a.eq_ignore_ascii_case(q),
         )
     })
+}
+
+/// `operand [NOT] BETWEEN low AND high` as the comparisons it stands for:
+/// `operand >= low AND operand <= high`, or `operand < low OR operand > high`
+/// (bd-w4pr1.13.16). The operand appears twice; the join lanes admit only
+/// columns, literals, numbered parameters and arithmetic over them there, so
+/// both evaluations give one value.
+fn between_as_comparisons(operand: &Expr, low: &Expr, high: &Expr, not: bool, span: Span) -> Expr {
+    let (lower, upper, both) = if not {
+        (BinaryOp::Lt, BinaryOp::Gt, BinaryOp::Or)
+    } else {
+        (BinaryOp::Ge, BinaryOp::Le, BinaryOp::And)
+    };
+    let compare = |op, bound: &Expr| Expr::BinaryOp {
+        left: Box::new(operand.clone()),
+        op,
+        right: Box::new(bound.clone()),
+        span,
+    };
+    Expr::BinaryOp {
+        left: Box::new(compare(lower, low)),
+        op: both,
+        right: Box::new(compare(upper, high)),
+        span,
+    }
 }
 
 /// Whether `term` bounds the rowid of the outer table (`tables[0]`) from above

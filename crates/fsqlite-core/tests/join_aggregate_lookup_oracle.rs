@@ -602,6 +602,102 @@ fn join_lookups_start_at_an_outer_rowid_floor_and_match_sqlite() {
     }
 }
 
+/// bd-w4pr1.13.16: `[NOT] BETWEEN` in a join's WHERE or ON compiles as the two
+/// comparisons it stands for, in the row lane and the aggregate lane. On the
+/// outer rowid its lower bound starts the scan and its upper bound ends it.
+/// The cases include a NULL bound (no rows; NOT BETWEEN keeps only rows the
+/// other bound decides), bounds in the wrong order, a text bound against an
+/// integer column, a NOCASE column, a real column, an inner-table operand, a
+/// LEFT JOIN ON term (which must keep its unmatched rows) and a bound that
+/// is another column.
+const BETWEEN_QUERIES: &[&str] = &[
+    "SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE u.id BETWEEN 2 AND 5 ORDER BY u.id",
+    "SELECT u.id, t.id FROM u JOIN t ON t.a = u.a WHERE u.id BETWEEN 2 AND 5 ORDER BY u.id, t.id",
+    "SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE u.id NOT BETWEEN 2 AND 5 ORDER BY u.id",
+    "SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE u.id BETWEEN 5 AND 2 ORDER BY u.id",
+    "SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE u.id BETWEEN NULL AND 5 ORDER BY u.id",
+    "SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE u.id NOT BETWEEN NULL AND 5 ORDER BY u.id",
+    "SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE u.id NOT BETWEEN 3 AND NULL ORDER BY u.id",
+    "SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE u.id BETWEEN '2' AND 5.5 ORDER BY u.id",
+    "SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE u.id BETWEEN 2 AND 'x' ORDER BY u.id",
+    "SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE u.r BETWEEN 1 AND 2.5 ORDER BY u.id",
+    "SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE u.b BETWEEN '2' AND '6' ORDER BY u.id",
+    "SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE t.n BETWEEN 'B' AND 'd' ORDER BY u.id",
+    "SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE t.c BETWEEN u.r AND u.r * 4 ORDER BY u.id",
+    "SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE u.id BETWEEN 2 AND 6 AND t.c NOT BETWEEN 3 AND 5 \
+     ORDER BY u.id",
+    "SELECT u.id, t.id FROM u LEFT JOIN t ON t.id = u.id AND u.id BETWEEN 3 AND 5 ORDER BY u.id",
+    "SELECT u.id, t.id FROM u LEFT JOIN t ON t.id = u.id WHERE u.id BETWEEN 3 AND 100 ORDER BY u.id",
+    "SELECT u.id, t.id FROM u LEFT JOIN t ON t.a = u.a WHERE t.c BETWEEN 2 AND 5 ORDER BY u.id, t.id",
+    "SELECT u.id, t.id FROM u JOIN t ON t.id = u.id AND t.c BETWEEN 2 AND 5 ORDER BY u.id",
+    "SELECT u.id, u.id BETWEEN 2 AND 4, t.c NOT BETWEEN 2 AND 4 FROM u JOIN t ON t.id = u.id ORDER BY u.id",
+    "SELECT u.id, t.id FROM u JOIN t ON t.id = u.id WHERE u.id BETWEEN 2 AND 5 OR u.r BETWEEN 2.9 AND 3.1 \
+     ORDER BY u.id",
+    "SELECT count(*), sum(t.c) FROM u JOIN t ON t.a = u.a WHERE u.id BETWEEN 2 AND 5",
+    "SELECT count(*), sum(length(t.b)) FROM u JOIN t ON t.id = u.id WHERE u.id BETWEEN 3 AND 6",
+    "SELECT count(*), count(t.id) FROM u LEFT JOIN t ON t.a = u.a WHERE u.id NOT BETWEEN 2 AND 5",
+    "SELECT count(*), sum(t.c) FROM u, t WHERE t.id = u.a AND u.id BETWEEN 2 AND 6",
+    "SELECT count(*), sum(u.r) FROM u JOIN t ON t.a = u.a WHERE t.c BETWEEN 2 AND 10",
+];
+
+#[test]
+fn join_lanes_compile_between_and_match_sqlite() {
+    for indexed in [false, true] {
+        asupersync::test_utils::run_test(|| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("join_between.db");
+            let f = Connection::open(path.to_str().unwrap()).await.unwrap();
+            let r = rusqlite::Connection::open_in_memory().unwrap();
+            let indexes: &[&str] = if indexed { INDEXES } else { &[] };
+            for sql in SETUP.iter().chain(indexes) {
+                f.execute(sql).await.unwrap();
+                r.execute(sql, []).unwrap();
+            }
+            for sql in BETWEEN_QUERIES {
+                assert_agree(&f, &r, sql, &[], &[]).await;
+            }
+            for (low, high) in [(2_i64, 5_i64), (0, 0), (6, 100), (5, 2)] {
+                assert_agree(
+                    &f,
+                    &r,
+                    "SELECT count(*), sum(t.c) FROM u JOIN t ON t.id = u.id WHERE u.id BETWEEN ?1 AND ?2",
+                    &[SqliteValue::Integer(low), SqliteValue::Integer(high)],
+                    &[&low, &high],
+                )
+                .await;
+            }
+
+            // Both lanes run the lookup loop for BETWEEN, and a rowid range
+            // starts the outer scan with a seek and ends it at its upper bound.
+            for sql in [
+                "SELECT count(*), sum(t.c) FROM u JOIN t ON t.id = u.id WHERE u.id BETWEEN 2 AND 5",
+                "SELECT u.id, t.c FROM u JOIN t ON t.id = u.id WHERE u.id BETWEEN 2 AND 5",
+            ] {
+                let ops = program(&f, sql).await;
+                let outer_start = ops
+                    .iter()
+                    .find(|(_, op, cursor, _)| {
+                        *cursor == 0 && matches!(op.as_str(), "Rewind" | "SeekGE" | "SeekGT")
+                    })
+                    .map(|(_, op, _, _)| op.as_str());
+                assert_eq!(outer_start, Some("SeekGE"), "`{sql}`: {ops:?}");
+                let seek = ops.iter().position(|(_, op, _, _)| op == "SeekRowid").unwrap();
+                let advance = ops
+                    .iter()
+                    .find(|(_, op, cursor, _)| op == "Next" && *cursor == 0)
+                    .map(|(address, _, _, _)| *address)
+                    .unwrap();
+                assert!(
+                    ops[..seek]
+                        .iter()
+                        .any(|(_, op, _, target)| op == "IfNot" && *target > advance),
+                    "`{sql}` must leave the outer loop at the upper bound: {ops:?}"
+                );
+            }
+        });
+    }
+}
+
 /// A replacement for the builtin `length`: every value is 7 long.
 struct SevenLong;
 
