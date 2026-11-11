@@ -55,7 +55,8 @@ fn checkpoint_or_abort(cx: &Cx) -> Result<()> {
 }
 
 /// Main-lock admission check for the points before any wait: `UnixFile::lock`
-/// entry, the first attempt, and each nonblocking `F_SETLK` probe.
+/// entry, the first attempt, and each nonblocking `F_SETLK` probe. Also the
+/// check after an inline `pread`, which a full checkpoint precedes.
 ///
 /// The full checkpoint runs only when a cancellation is already published, on
 /// the local flag or on the native context's flag. A full checkpoint probes
@@ -3962,7 +3963,11 @@ impl VfsFile for UnixFile {
         if buf.len() <= INLINE_IO_MAX_BYTES {
             let total = read_full_at(|chunk, off| file.read_at(chunk, off), buf, offset, "read")?;
             buf[total..].fill(0);
-            checkpoint_or_abort(cx)?;
+            // bd-w4pr1.13.18: the full checkpoint above ran a pread ago, and
+            // nothing waited since. Only a cancellation published meanwhile
+            // can be new; a deadline or budget that ran out during the pread
+            // is seen at the caller's next checkpoint.
+            checkpoint_or_abort_if_cancel_published(cx)?;
             return Ok(total);
         }
         let requested = buf.len();
@@ -9194,6 +9199,36 @@ mod tests {
             buf[2..].iter().all(|&b| b == 0),
             "short read must zero-fill"
         );
+        file.close(&cx).unwrap();
+    }
+
+    /// bd-w4pr1.13.18: an inline read takes its one full checkpoint before
+    /// the pread. A cancelled context aborts the read before it touches the
+    /// buffer, and the file still serves a live context afterwards.
+    #[test]
+    fn test_unix_vfs_read_aborts_on_a_cancelled_context_before_reading() {
+        let cx = Cx::new();
+        let vfs = UnixVfs::new();
+        let (_dir, path) = make_temp_path("cancelled_read.db");
+
+        let (mut file, _) = vfs.open(&cx, Some(&path), open_flags_create()).unwrap();
+        file.write(&cx, b"hello", 0).unwrap();
+
+        let cancelled = Cx::new();
+        cancelled.cancel();
+        let mut buf = [0xEE_u8; 5];
+        assert!(matches!(
+            file.read(&cancelled, &mut buf, 0),
+            Err(FrankenError::Abort)
+        ));
+        assert_eq!(
+            buf, [0xEE_u8; 5],
+            "an aborted read must not have run the pread"
+        );
+
+        let n = file.read(&cx, &mut buf, 0).unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(&buf, b"hello");
         file.close(&cx).unwrap();
     }
 

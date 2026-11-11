@@ -1552,10 +1552,13 @@ impl VfsFile for IoUringFile {
 #[cfg(feature = "linux-asupersync-uring")]
 impl IoUringFile {
     async fn read_data_path(&self, cx: &Cx, buf: &mut [u8], offset: u64) -> Result<usize> {
-        checkpoint_or_abort(cx)?;
         if buf.is_empty() {
+            checkpoint_or_abort(cx)?;
             return Ok(0);
         }
+        // bd-w4pr1.13.18: each Unix fallback below starts with
+        // `UnixFile::read`'s own full checkpoint, so this function takes its
+        // checkpoint only on the path that stays here.
         if !self.runtime.is_available() {
             record_io_uring_read_unix_fallback();
             return self.inner.read(cx, buf, offset).await;
@@ -1586,6 +1589,7 @@ impl IoUringFile {
             record_io_uring_read_unix_fallback();
             return self.inner.read(cx, buf, offset).await;
         };
+        checkpoint_or_abort(cx)?;
         let file = self.inner.canonical_file()?;
 
         let start = Instant::now();
