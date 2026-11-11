@@ -4932,6 +4932,14 @@ impl<P: PageReader> BtCursor<P> {
         observe_cursor_cancellation(cx)?;
         self.stack.clear();
         let mut current_page = self.root_page;
+        // The probe key is decoded once for the whole descent; every level's
+        // binary search compares against the same values (bd-w4pr1.13.15).
+        // bd-dk9ra: the decode is btree work and charges the BtreeCursor
+        // profile bucket, not the caller's ambient scope.
+        let parsed_target = {
+            let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::BtreeCursor);
+            self.decode_index_key_for_compare(target_key)
+        };
 
         loop {
             observe_cursor_cancellation(cx)?;
@@ -4958,7 +4966,13 @@ impl<P: PageReader> BtCursor<P> {
 
             if entry.header.page_type.is_leaf() {
                 let result = self
-                    .binary_search_index_leaf_with_bias(cx, &entry, target_key, bias)
+                    .binary_search_index_leaf_with_bias(
+                        cx,
+                        &entry,
+                        target_key,
+                        parsed_target.as_deref(),
+                        bias,
+                    )
                     .await?;
                 match result {
                     BinarySearchResult::Found(idx) => {
@@ -5005,7 +5019,13 @@ impl<P: PageReader> BtCursor<P> {
 
             // Interior index page: binary search to find which child to descend.
             let search_result = self
-                .binary_search_index_interior_with_bias(cx, &entry, target_key, bias)
+                .binary_search_index_interior_with_bias(
+                    cx,
+                    &entry,
+                    target_key,
+                    parsed_target.as_deref(),
+                    bias,
+                )
                 .await?;
             match search_result {
                 BinarySearchResult::Found(idx) => {
@@ -5130,11 +5150,14 @@ impl<P: PageReader> BtCursor<P> {
         ))
     }
 
+    /// Binary search an index leaf for `target`, whose decoded form (if it
+    /// decodes) the caller passes as `parsed_target`.
     async fn binary_search_index_leaf_with_bias(
         &self,
         cx: &Cx,
         entry: &StackEntry,
         target: &[u8],
+        parsed_target: Option<&[SqliteValue]>,
         bias: IndexSeekBias,
     ) -> Result<BinarySearchResult> {
         let count = entry.header.cell_count;
@@ -5144,15 +5167,6 @@ impl<P: PageReader> BtCursor<P> {
 
         let mut lo = 0u16;
         let mut hi = count;
-        // bd-dk9ra: the hoisted once-per-seek target parse is btree work and
-        // must charge the BtreeCursor profile bucket; outside this guard it
-        // bled into the caller's ambient scope (VdbeEngine), breaking the
-        // storage-cursor scratch countermetric (one phantom full parse per
-        // probe) without any real scratch regression.
-        let parsed_target = {
-            let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::BtreeCursor);
-            self.decode_index_key_for_compare(target)
-        };
 
         while lo < hi {
             observe_cursor_cancellation(cx)?;
@@ -5162,12 +5176,7 @@ impl<P: PageReader> BtCursor<P> {
             let ord = {
                 let _record_profile_scope =
                     enter_record_profile_scope(RecordProfileScope::BtreeCursor);
-                self.compare_index_key_bytes_with_bias(
-                    key.as_ref(),
-                    target,
-                    parsed_target.as_deref(),
-                    bias,
-                )
+                self.compare_index_key_bytes_with_bias(key.as_ref(), target, parsed_target, bias)
             };
 
             match ord {
@@ -5187,15 +5196,28 @@ impl<P: PageReader> BtCursor<P> {
         entry: &StackEntry,
         target: &[u8],
     ) -> Result<BinarySearchResult> {
-        self.binary_search_index_interior_with_bias(cx, entry, target, IndexSeekBias::LowerBound)
-            .await
+        let parsed_target = {
+            let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::BtreeCursor);
+            self.decode_index_key_for_compare(target)
+        };
+        self.binary_search_index_interior_with_bias(
+            cx,
+            entry,
+            target,
+            parsed_target.as_deref(),
+            IndexSeekBias::LowerBound,
+        )
+        .await
     }
 
+    /// Binary search an interior index page for `target`, whose decoded form
+    /// (if it decodes) the caller passes as `parsed_target`.
     async fn binary_search_index_interior_with_bias(
         &self,
         cx: &Cx,
         entry: &StackEntry,
         target: &[u8],
+        parsed_target: Option<&[SqliteValue]>,
         bias: IndexSeekBias,
     ) -> Result<BinarySearchResult> {
         let count = entry.header.cell_count;
@@ -5205,15 +5227,6 @@ impl<P: PageReader> BtCursor<P> {
 
         let mut lo = 0u16;
         let mut hi = count;
-        // bd-dk9ra: the hoisted once-per-seek target parse is btree work and
-        // must charge the BtreeCursor profile bucket; outside this guard it
-        // bled into the caller's ambient scope (VdbeEngine), breaking the
-        // storage-cursor scratch countermetric (one phantom full parse per
-        // probe) without any real scratch regression.
-        let parsed_target = {
-            let _record_profile_scope = enter_record_profile_scope(RecordProfileScope::BtreeCursor);
-            self.decode_index_key_for_compare(target)
-        };
 
         while lo < hi {
             observe_cursor_cancellation(cx)?;
@@ -5223,12 +5236,7 @@ impl<P: PageReader> BtCursor<P> {
             let ord = {
                 let _record_profile_scope =
                     enter_record_profile_scope(RecordProfileScope::BtreeCursor);
-                self.compare_index_key_bytes_with_bias(
-                    key.as_ref(),
-                    target,
-                    parsed_target.as_deref(),
-                    bias,
-                )
+                self.compare_index_key_bytes_with_bias(key.as_ref(), target, parsed_target, bias)
             };
 
             // Note: target vs key comparison direction
