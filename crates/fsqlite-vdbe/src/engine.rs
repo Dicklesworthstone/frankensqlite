@@ -5051,10 +5051,200 @@ struct PageRowView {
     stamp: Option<CursorPositionStamp>,
     rowid: i64,
     payload: std::ops::Range<usize>,
-    /// Column table of the record header; no decoded values are kept in it.
-    layout: RowDecodeScratch,
+    /// Column table of the record header.
+    layout: RecordColumnTable,
     /// Whether the record stores the INTEGER PRIMARY KEY slot, once asked.
     includes_rowid_alias: Option<bool>,
+}
+
+/// What the rowid-alias rules read from a record header.
+trait RecordColumns {
+    /// Number of columns the record stores.
+    fn column_count(&self) -> usize;
+    /// Serial type and byte range of stored column `idx`.
+    fn column_offset(&self, idx: usize) -> Option<&ColumnOffset>;
+}
+
+impl RecordColumns for RowDecodeScratch {
+    fn column_count(&self) -> usize {
+        Self::column_count(self)
+    }
+
+    fn column_offset(&self, idx: usize) -> Option<&ColumnOffset> {
+        Self::column_offset(self, idx)
+    }
+}
+
+/// The column table of one record header: the serial type and byte range of
+/// each column, and nothing else.
+///
+/// [`RowDecodeScratch`] parses the same table and beside it keeps a value
+/// slot per column, which it sizes and clears for every record. The in-place
+/// `Column` lane decodes straight into a register and has no use for the
+/// slots; on a scan their upkeep and the general varint reader were most of
+/// what a header parse cost.
+#[derive(Debug, Default)]
+struct RecordColumnTable {
+    /// `columns[..count]` describes the current record; the rest is spare
+    /// room kept from earlier records.
+    columns: Vec<ColumnOffset>,
+    count: usize,
+}
+
+/// Value length of every serial type that fits in one header byte.
+#[allow(clippy::cast_possible_truncation)]
+const ONE_BYTE_SERIAL_TYPE_LEN: [u8; 128] = {
+    let mut lens = [0_u8; 128];
+    let mut serial_type = 0_usize;
+    while serial_type < 128 {
+        // The longest is serial type 127, a text of 57 bytes.
+        lens[serial_type] = match serial_type_len(serial_type as u64) {
+            Some(len) => len as u8,
+            None => 0,
+        };
+        serial_type += 1;
+    }
+    lens
+};
+
+impl RecordColumnTable {
+    /// An entry of spare room.
+    const NO_COLUMN: ColumnOffset = ColumnOffset {
+        serial_type: 0,
+        body_offset: 0,
+        value_len: 0,
+    };
+
+    /// Read the header of `record`, which may be cut short anywhere after
+    /// its header.
+    ///
+    /// Returns `false`, leaving the table empty, for a header
+    /// `parse_record_header_prefix_into` rejects; for every other record the
+    /// table is the one that function builds.
+    ///
+    /// The loop here covers the usual record: a header shorter than 128
+    /// bytes, so that its size is one byte, holding only one-byte serial
+    /// types. Its offsets cannot overflow (at most 126 columns of at most 57
+    /// bytes each), so it carries no checks; anything else goes to
+    /// [`Self::parse_general`].
+    ///
+    /// Kept out of line: inlined into the interpreter's hot lane, with its
+    /// loop state on that function's stack, a parse cost about as much as
+    /// the decode scratch's.
+    #[inline(never)]
+    fn parse(&mut self, record: &[u8]) -> bool {
+        self.count = 0;
+        let Some(&size_byte) = record.first() else {
+            return false;
+        };
+        if size_byte >= 0x80 {
+            return self.parse_general(record);
+        }
+        let header_size = usize::from(size_byte);
+        if header_size == 0 || header_size > record.len() {
+            return false;
+        }
+        let header = &record[1..header_size];
+        if self.columns.len() < header.len() {
+            self.columns.resize(header.len(), Self::NO_COLUMN);
+        }
+        let mut body = u32::from(size_byte);
+        let mut one_byte_serial_types = true;
+        for (column, &serial_type) in self.columns.iter_mut().zip(header) {
+            if serial_type >= 0x80 {
+                one_byte_serial_types = false;
+                break;
+            }
+            let value_len = u32::from(ONE_BYTE_SERIAL_TYPE_LEN[usize::from(serial_type)]);
+            *column = ColumnOffset {
+                serial_type: u64::from(serial_type),
+                body_offset: body,
+                value_len,
+            };
+            body += value_len;
+        }
+        if !one_byte_serial_types {
+            return self.parse_general(record);
+        }
+        self.count = header.len();
+        true
+    }
+
+    /// [`Self::parse`] for any header: one with a multi-byte size, or with a
+    /// multi-byte serial type (a text or blob longer than 57 bytes).
+    #[inline(never)]
+    fn parse_general(&mut self, record: &[u8]) -> bool {
+        self.count = 0;
+        let Some((header_size, size_len)) = read_varint(record) else {
+            return false;
+        };
+        let Ok(header_size) = usize::try_from(header_size) else {
+            return false;
+        };
+        if header_size > record.len() || header_size < size_len {
+            return false;
+        }
+        // Every column takes at least one header byte.
+        let header = &record[size_len..header_size];
+        if self.columns.len() < header.len() {
+            self.columns.resize(header.len(), Self::NO_COLUMN);
+        }
+
+        let mut body = header_size;
+        let mut at = 0;
+        let mut count = 0;
+        while at < header.len() {
+            let first = header[at];
+            let (serial_type, value_len) = if first < 0x80 {
+                at += 1;
+                (
+                    u64::from(first),
+                    usize::from(ONE_BYTE_SERIAL_TYPE_LEN[usize::from(first)]),
+                )
+            } else {
+                let Some((serial_type, used)) = read_varint(&header[at..]) else {
+                    return false;
+                };
+                at += used;
+                let Some(value_len) =
+                    serial_type_len(serial_type).and_then(|len| usize::try_from(len).ok())
+                else {
+                    return false;
+                };
+                (serial_type, value_len)
+            };
+            let (Ok(body_offset), Ok(value_len_u32), Some(next_body)) = (
+                u32::try_from(body),
+                u32::try_from(value_len),
+                body.checked_add(value_len),
+            ) else {
+                return false;
+            };
+            self.columns[count] = ColumnOffset {
+                serial_type,
+                body_offset,
+                value_len: value_len_u32,
+            };
+            count += 1;
+            body = next_body;
+        }
+        self.count = count;
+        true
+    }
+}
+
+impl RecordColumns for RecordColumnTable {
+    fn column_count(&self) -> usize {
+        self.count
+    }
+
+    fn column_offset(&self, idx: usize) -> Option<&ColumnOffset> {
+        if idx < self.count {
+            self.columns.get(idx)
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -20742,8 +20932,8 @@ fn try_storage_cursor_payload_includes_rowid_alias_local(
 /// Returns the header-only verdict and, when that verdict is "absent" on a
 /// short payload whose slot holds an integer, the slot to compare with the
 /// row's rowid.
-fn payload_rowid_alias_header_verdict(
-    row_decode: &RowDecodeScratch,
+fn payload_rowid_alias_header_verdict<C: RecordColumns>(
+    row_decode: &C,
     ipk_col_idx: usize,
     table_column_count: Option<usize>,
     first_not_null_non_ipk_col: Option<usize>,
@@ -21542,8 +21732,8 @@ fn payload_includes_rowid_alias_lazy(
 /// This stays conservative for non-NULL IPK-position values: a shifted user
 /// column can coincidentally equal the physical rowid, so equality is not
 /// evidence that the IPK alias slot is present.
-fn payload_includes_rowid_alias_without_rowid(
-    row_decode: &RowDecodeScratch,
+fn payload_includes_rowid_alias_without_rowid<C: RecordColumns>(
+    row_decode: &C,
     ipk_col_idx: usize,
     table_column_count: Option<usize>,
     first_not_null_non_ipk_col_idx: Option<usize>,
@@ -21771,7 +21961,7 @@ fn try_read_column_in_place(
         let Some(bytes) = cursor.cursor.current_page_span(payload.clone()) else {
             return Ok(None);
         };
-        if view.layout.prepare_for_record_prefix(bytes).is_none() {
+        if !view.layout.parse(bytes) {
             return Ok(None);
         }
         view.rowid = rowid;
@@ -25567,6 +25757,144 @@ mod tests {
             assert!(!run_async(sc.cursor.next(&sc.cx)).expect("cursor should reach EOF"));
         }
         assert!(!engine.try_column_to_reg_in_place(0, 0, 1).unwrap());
+    }
+
+    /// Hold [`RecordColumnTable::parse`] to the decode scratch's header
+    /// parse on `record`: the same verdict, and the same table when the
+    /// header is accepted. Returns whether it was accepted.
+    fn assert_column_table_matches_decode_scratch(
+        table: &mut RecordColumnTable,
+        scratch: &mut RowDecodeScratch,
+        record: &[u8],
+    ) -> bool {
+        let expected = scratch.prepare_for_record_prefix(record);
+        let accepted = table.parse(record);
+        assert_eq!(
+            accepted,
+            expected.is_some(),
+            "verdict differs for record {record:02x?}"
+        );
+        if let Some(column_count) = expected {
+            assert_eq!(
+                RecordColumns::column_count(table),
+                column_count,
+                "column count differs for record {record:02x?}"
+            );
+            for idx in 0..=column_count {
+                assert_eq!(
+                    RecordColumns::column_offset(table, idx),
+                    scratch.column_offset(idx),
+                    "column {idx} differs for record {record:02x?}"
+                );
+            }
+        } else {
+            assert_eq!(RecordColumns::column_count(table), 0);
+            assert_eq!(RecordColumns::column_offset(table, 0), None);
+        }
+        accepted
+    }
+
+    #[test]
+    fn test_record_column_table_agrees_with_the_decode_scratch_header_parse() {
+        // Serial types on both sides of the one-byte limit: a text of 57
+        // bytes is type 127, of 58 bytes type 129; a blob of 58 bytes is 128.
+        let values = [
+            SqliteValue::Null,
+            SqliteValue::Integer(0),
+            SqliteValue::Integer(1),
+            SqliteValue::Integer(-1),
+            SqliteValue::Integer(300),
+            SqliteValue::Integer(-70_000),
+            SqliteValue::Integer(5_000_000_000),
+            SqliteValue::Integer(-140_000_000_000_000),
+            SqliteValue::Integer(i64::MAX),
+            SqliteValue::Float(1.5),
+            SqliteValue::Text("".into()),
+            SqliteValue::Text("x".into()),
+            SqliteValue::Text("a".repeat(57).into()),
+            SqliteValue::Text("b".repeat(58).into()),
+            SqliteValue::Text("c".repeat(9_000).into()),
+            SqliteValue::Blob(Vec::new().into()),
+            SqliteValue::Blob(vec![1_u8; 57].into()),
+            SqliteValue::Blob(vec![2_u8; 58].into()),
+            SqliteValue::Blob(vec![3_u8; 70_000].into()),
+        ];
+        let mut table = RecordColumnTable::default();
+        let mut scratch = RowDecodeScratch::default();
+        let mut accepted = 0_usize;
+        let mut rejected = 0_usize;
+
+        // Every value alone, every rotation of all of them together, and
+        // every prefix of each record up to a little past its header: a
+        // record cut inside its header is rejected, one cut in its body is
+        // not.
+        let mut records: Vec<Vec<u8>> = values
+            .iter()
+            .map(|value| encode_record(std::slice::from_ref(value)))
+            .collect();
+        records.push(encode_record(&[]));
+        for start in 0..values.len() {
+            let mut rotated = values[start..].to_vec();
+            rotated.extend_from_slice(&values[..start]);
+            records.push(encode_record(&rotated));
+        }
+        // 126 one-byte columns make the longest header whose size is one
+        // byte (127); one more column and the size takes two.
+        for columns in [126_i64, 127, 200] {
+            let wide: Vec<SqliteValue> = (0..columns).map(SqliteValue::Integer).collect();
+            let record = encode_record(&wide);
+            assert_eq!(record[0] < 0x80, columns == 126);
+            records.push(record);
+        }
+        for record in &records {
+            let (header_size, _) = read_varint(record).expect("record has a header size");
+            let header_size = usize::try_from(header_size).unwrap();
+            for cut in (0..=(header_size + 3).min(record.len())).chain([record.len()]) {
+                if assert_column_table_matches_decode_scratch(
+                    &mut table,
+                    &mut scratch,
+                    &record[..cut],
+                ) {
+                    accepted += 1;
+                } else {
+                    rejected += 1;
+                }
+            }
+        }
+
+        // Headers no record writer produces.
+        let malformed: [&[u8]; 8] = [
+            // Header size smaller than its own varint.
+            &[0x00],
+            // Header size past the end of the record.
+            &[0x05, 0x01, 0x01],
+            // A serial type cut off by the end of the header.
+            &[0x02, 0x81, 0x00, 0x00],
+            &[0x03, 0x01, 0xff, 0x00],
+            // A nine-byte serial type whose value length fits no record.
+            &[0x0a, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+            // A two-byte header size.
+            &[0x81, 0x00],
+            // The reserved serial types, which take no bytes.
+            &[0x03, 0x0a, 0x0b],
+            // A two-byte encoding of a one-byte serial type.
+            &[0x03, 0x80, 0x01, 0x07],
+        ];
+        for record in malformed {
+            if assert_column_table_matches_decode_scratch(&mut table, &mut scratch, record) {
+                accepted += 1;
+            } else {
+                rejected += 1;
+            }
+        }
+
+        // Both outcomes were exercised, and a table left over from a long
+        // record does not leak into a short one.
+        assert!(accepted > 100, "accepted {accepted}");
+        assert!(rejected > 100, "rejected {rejected}");
+        assert!(table.parse(&encode_record(&[SqliteValue::Integer(7)])));
+        assert_eq!(RecordColumns::column_count(&table), 1);
+        assert_eq!(RecordColumns::column_offset(&table, 1), None);
     }
 
     #[test]
