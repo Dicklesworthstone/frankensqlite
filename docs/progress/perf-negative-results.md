@@ -87,6 +87,37 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-11 - WIN: the shell runs a lone INSERT, UPDATE, DELETE or SELECT without parsing it first (bd-5310l)
+
+- Target: every statement typed or piped into the CLI one at a time (all the scorecard's statement
+  rows). Touched: `crates/fsqlite-cli/src/main.rs` (`execute_sql`; new `run_statement`,
+  `lone_plain_statement` and its byte and token readers).
+- Evidence before: the shell parsed each chunk of input to split it into statements, to recognize
+  `EXPLAIN QUERY PLAN` and to decide whether to ask for column names, then handed the text to the
+  engine, which parsed it again. callgrind: 11.7k instructions per literal INSERT in the shell's parse
+  (`Parser::from_sql` 6.4k, `parse_next_statement_with_tail` 5.3k) of 58k. This is the cut the
+  2026-11-10 entry below deferred until the second parse was 10% of a text statement; it was 18-20%.
+- Change: when the output shows no column names and the text has no double quote, a chunk that is by
+  its bytes exactly one INSERT, UPDATE, DELETE or SELECT (that first word, and no semicolon outside a
+  string other than an optional last one) goes straight to the engine. Text with a quoted name or a
+  comment is decided from the lexer's tokens; everything else takes the batch loop as before. If the
+  statement fails, the shell parses it after all, so a syntax error is still reported in the shell
+  parser's words and any other error in the engine's.
+- Result (probe of the entries below, three runs per arm, stock live; base is the binary of those
+  entries): distinct-literal INSERT 62-66k -> 47-49k (4.6x -> 3.5x stock), SELECT 91-99k -> 70-72k
+  (4.3x -> 3.2x), UPDATE 68-76k -> 59-62k (4.0x -> 3.3x). The same text repeated: INSERT 60-65k ->
+  49-52k, SELECT 94-95k -> 70-73k, UPDATE 73-75k -> 55-56k. `txn_1000x10_rows` 1,199M -> 1,096M
+  instructions (7.8x -> 7.1x stock).
+- Behaviour: base and candidate print identical stdout, stderr and exit status over 768 runs (six
+  modes, headers on and off, 16 script tails ending in different errors and statement layouts,
+  `:memory:` and a file, streams captured separately and merged). Unit tests: the slice handed to the
+  engine equals the batch loop's for every recognized text; the byte reader agrees with the token
+  reader wherever it applies; 13 failing statements report exactly what the batch loop reports and
+  change nothing.
+- Retry condition for statements whose output shows column names (headers on, column and line
+  modes): when `Connection::query` returns the names with its rows, so the shell needs neither a
+  prepare nor a parse for them.
+
 ## 2026-11-11 - WIN: a statement dispatched with bound parameters shares the text its tree last rendered to (bd-5310l)
 
 - Target: every statement that reaches the dispatcher with parameters bound: the literal statements

@@ -19,12 +19,13 @@ use std::io::{self, BufRead, ErrorKind, IsTerminal, Write};
 use std::path::Path;
 use std::pin::Pin;
 
-use fsqlite::{Connection, Row, SqliteValue};
+use fsqlite::{Connection, FrankenError, Row, SqliteValue};
 use fsqlite_core::decode_proofs::{
     DECODE_PROOF_SCHEMA_VERSION_V1, DEFAULT_DECODE_PROOF_POLICY_ID, DEFAULT_DECODE_PROOF_SLACK,
     DecodeProofVerificationConfig, EcsDecodeProof, RejectedSymbol, SymbolDigest,
 };
-use fsqlite_parser::Parser;
+use fsqlite_parser::lexer::Lexer;
+use fsqlite_parser::{Parser, TokenKind};
 use fsqlite_types::value::format_sqlite_float_g;
 use serde::Deserialize;
 
@@ -994,6 +995,41 @@ where
     W: Write,
     E: Write,
 {
+    // The engine parses whatever it is handed, so parsing here as well is
+    // only needed to split a batch, to recognize a query plan and to decide
+    // whether to ask for column names. A lone INSERT, UPDATE, DELETE or
+    // SELECT whose output shows no names needs none of that. If it fails,
+    // the full parse runs after all, so a syntax error is still reported in
+    // this parser's words and any other error in the engine's. Text with a
+    // double quote is left to the batch loop: the engine may rewrite
+    // double-quoted strings before it parses, so only without one is the text
+    // it parses certain to be the text this parser would have checked first.
+    if !output_uses_column_names(output_options, false)
+        && !sql.contains('"')
+        && let Some(statement_sql) = lone_plain_statement(sql)
+    {
+        return match run_statement(
+            connection,
+            statement_sql,
+            false,
+            None,
+            output_options,
+            out,
+            err,
+        )
+        .await
+        {
+            Ok(printed) => printed,
+            Err(error) => {
+                let error = match Parser::from_sql(sql).parse_next_statement_with_tail() {
+                    Err(parse_error) => Connection::parse_error_to_franken_error(sql, parse_error),
+                    Ok(_) => error,
+                };
+                let _ = writeln!(err, "error: {error}");
+                false
+            }
+        };
+    }
     let mut parser = Parser::from_sql(sql);
     let mut statement_start = 0;
     loop {
@@ -1028,31 +1064,159 @@ where
         } else {
             None
         };
-        let timer = output_options.timer.then(StatementTimer::start);
-        match connection.query(statement_sql).await {
-            Ok(rows) => {
-                let written = if is_query_plan {
-                    write_query_plan_tree(&rows, out)
-                } else {
-                    write_rows(&rows, column_names.as_deref(), output_options, out)
-                };
-                if written.is_err() {
-                    let _ = writeln!(err, "error: failed writing query results");
-                    return false;
-                }
-                if let Some(timer) = timer
-                    && writeln!(out, "{}", timer.report()).is_err()
-                {
-                    let _ = writeln!(err, "error: failed writing query results");
-                    return false;
-                }
-            }
+        match run_statement(
+            connection,
+            statement_sql,
+            is_query_plan,
+            column_names.as_deref(),
+            output_options,
+            out,
+            err,
+        )
+        .await
+        {
+            Ok(true) => {}
+            Ok(false) => return false,
             Err(error) => {
                 let _ = writeln!(err, "error: {error}");
                 return false;
             }
         }
         statement_start = tail_offset;
+    }
+}
+
+/// Run one statement and print its rows, then its timer line if asked.
+///
+/// `Ok(false)` means writing the output failed and that has been reported.
+/// `Err` is the engine's error, left for the caller to report.
+async fn run_statement<W, E>(
+    connection: &Connection,
+    statement_sql: &str,
+    is_query_plan: bool,
+    column_names: Option<&[String]>,
+    output_options: OutputOptions,
+    out: &mut W,
+    err: &mut E,
+) -> Result<bool, FrankenError>
+where
+    W: Write,
+    E: Write,
+{
+    let timer = output_options.timer.then(StatementTimer::start);
+    let rows = connection.query(statement_sql).await?;
+    let written = if is_query_plan {
+        write_query_plan_tree(&rows, out)
+    } else {
+        write_rows(&rows, column_names, output_options, out)
+    };
+    if written.is_err() {
+        let _ = writeln!(err, "error: failed writing query results");
+        return Ok(false);
+    }
+    if let Some(timer) = timer
+        && writeln!(out, "{}", timer.report()).is_err()
+    {
+        let _ = writeln!(err, "error: failed writing query results");
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// The text of `sql` up to and including its semicolon, when `sql` is by its
+/// tokens exactly one INSERT, UPDATE, DELETE or SELECT statement: it starts
+/// with that keyword and holds no semicolon other than an optional last one.
+///
+/// This is the same slice the batch loop in [`execute_sql`] hands the engine
+/// for such input (statement start to the end of its terminating semicolon,
+/// leading whitespace trimmed), found without building a syntax tree. None of
+/// these four statements can contain a semicolon, so one that is followed by
+/// more tokens starts another statement and the batch loop takes over, as it
+/// does for every other kind of statement and for text that does not lex.
+fn lone_plain_statement(sql: &str) -> Option<&str> {
+    if bytes_alone_delimit_statements(sql) {
+        lone_plain_statement_by_bytes(sql)
+    } else {
+        lone_plain_statement_by_tokens(sql)
+    }
+}
+
+/// Whether only a single-quoted string or blob can hide a semicolon in `sql`:
+/// it has no double quote, backtick or bracket (the quoted names) and no
+/// comment opener anywhere.
+fn bytes_alone_delimit_statements(sql: &str) -> bool {
+    !(sql.bytes().any(|byte| matches!(byte, b'"' | b'`' | b'['))
+        || sql.contains("--")
+        || sql.contains("/*"))
+}
+
+/// [`lone_plain_statement`] read off the bytes, for text that
+/// [`bytes_alone_delimit_statements`] accepts.
+///
+/// The answer is the lexer's, with one exception that changes nothing: text
+/// the lexer cannot tokenize outside a string is taken as a statement here,
+/// fails in the engine, and is then reported by the batch loop's parser
+/// exactly as it would have been.
+fn lone_plain_statement_by_bytes(sql: &str) -> Option<&str> {
+    let bytes = sql.as_bytes();
+    let start = bytes.iter().position(|byte| !byte.is_ascii_whitespace())?;
+    // The lexer's first token: a word runs through letters, digits,
+    // underscores and non-ASCII bytes.
+    let word_end = bytes[start..]
+        .iter()
+        .position(|byte| !(byte.is_ascii_alphanumeric() || *byte == b'_' || *byte >= 0x80))
+        .map_or(bytes.len(), |length| start + length);
+    let verb = &bytes[start..word_end];
+    if ![&b"select"[..], b"insert", b"update", b"delete"]
+        .iter()
+        .any(|keyword| verb.eq_ignore_ascii_case(keyword))
+    {
+        return None;
+    }
+    let mut in_string = false;
+    for (offset, byte) in bytes.iter().enumerate().skip(word_end) {
+        match byte {
+            b'\'' => in_string = !in_string,
+            b';' if !in_string => {
+                if !bytes[offset + 1..].iter().all(u8::is_ascii_whitespace) {
+                    return None;
+                }
+                return sql.get(..=offset).map(str::trim_start);
+            }
+            _ => {}
+        }
+    }
+    // An unterminated string does not lex.
+    if in_string {
+        return None;
+    }
+    Some(sql.trim_start())
+}
+
+/// [`lone_plain_statement`] by the lexer's tokens, for text with quoted names
+/// or comments.
+fn lone_plain_statement_by_tokens(sql: &str) -> Option<&str> {
+    let mut lexer = Lexer::new(sql);
+    let first = lexer.next_token();
+    if !matches!(
+        first.kind,
+        TokenKind::KwInsert | TokenKind::KwUpdate | TokenKind::KwDelete | TokenKind::KwSelect
+    ) {
+        return None;
+    }
+    loop {
+        let token = lexer.next_token();
+        match token.kind {
+            TokenKind::Eof => return Some(sql.get(..token.span.end as usize)?.trim_start()),
+            TokenKind::Semicolon => {
+                return matches!(lexer.next_token().kind, TokenKind::Eof)
+                    .then(|| sql.get(..token.span.end as usize))
+                    .flatten()
+                    .map(str::trim_start);
+            }
+            TokenKind::Error(_) => return None,
+            _ => {}
+        }
     }
 }
 
@@ -2840,10 +3004,11 @@ mod tests {
 
     use super::{
         ANSI_BOLD_BLUE, ANSI_DIM, ANSI_GREEN, ANSI_MAGENTA, ANSI_RESET, Connection, OutputMode,
-        OutputOptions, ShellOptions, ansi_colors_enabled, format_row, highlight_sql,
-        output_uses_column_names, parse_args, render_display_value, render_prompt, run,
-        run_with_shell_options, statement_complete, write_delimited_rows, write_query_plan_tree,
-        write_rows,
+        OutputOptions, Parser, ShellOptions, ansi_colors_enabled, bytes_alone_delimit_statements,
+        format_row, highlight_sql, lone_plain_statement, lone_plain_statement_by_bytes,
+        lone_plain_statement_by_tokens, output_uses_column_names, parse_args, render_display_value,
+        render_prompt, run, run_with_shell_options, statement_complete, write_delimited_rows,
+        write_query_plan_tree, write_rows,
     };
 
     fn parse_from(args: &[&str]) -> Result<super::CliOptions, String> {
@@ -4968,6 +5133,207 @@ SELECT id FROM keep WHERE name = 'k3';\n"
                         "a query-plan tree never prints column names"
                     );
                 }
+            }
+        });
+    }
+
+    #[test]
+    fn test_lone_plain_statement_is_the_slice_the_batch_loop_would_run() {
+        // Whenever a lone statement is recognized without parsing, the batch
+        // loop's parser must agree: it finds exactly one statement there, and
+        // the text it would hand the engine is the same slice.
+        let recognized = [
+            "SELECT 1",
+            "SELECT 1;",
+            "SELECT a, b FROM t WHERE id = 5;",
+            "SELECT ';' AS semi, 'it''s; fine';",
+            "SELECT 1 -- trailing; comment\n;",
+            "SELECT 1; -- nothing after it but a comment",
+            "SELECT 1 /* ; */ ;  \n ",
+            "INSERT INTO t(a, b) VALUES (1, 'x;y');",
+            "INSERT INTO t VALUES (1) RETURNING a",
+            "UPDATE t SET a = a + 1 WHERE id = 3;",
+            "DELETE FROM t WHERE id = 3;",
+            "  \n  SELECT 1;",
+            "select 1 union all select 2 order by 1;",
+        ];
+        for sql in recognized {
+            let lone = lone_plain_statement(sql)
+                .unwrap_or_else(|| panic!("expected a lone statement: {sql:?}"));
+            let mut parser = Parser::from_sql(sql);
+            let (_, tail_offset) = parser
+                .parse_next_statement_with_tail()
+                .expect("parses")
+                .expect("one statement");
+            assert_eq!(lone, sql[..tail_offset].trim_start(), "slice for {sql:?}");
+            assert!(
+                parser
+                    .parse_next_statement_with_tail()
+                    .expect("no second statement")
+                    .is_none(),
+                "the batch loop finds nothing after {sql:?}"
+            );
+        }
+
+        // Everything else goes to the batch loop. The first group is what a
+        // rule like "ends with one semicolon" would wrongly take.
+        let left_to_the_batch_loop = [
+            "SELECT 1; SELECT 2;",
+            "SELECT 1; SELECT 2",
+            "INSERT INTO t VALUES (1); INSERT INTO t VALUES (2);",
+            "SELECT 1;;",
+            ";SELECT 1;",
+            // Other statement kinds, including ones that hold semicolons.
+            "CREATE TABLE t(a);",
+            "CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END;",
+            "EXPLAIN QUERY PLAN SELECT 1;",
+            "EXPLAIN SELECT 1;",
+            "WITH c AS (SELECT 1) SELECT * FROM c;",
+            "VALUES (1);",
+            "REPLACE INTO t VALUES (1);",
+            "PRAGMA user_version;",
+            "BEGIN;",
+            "",
+            "   ",
+            "-- only a comment",
+            // Text that does not lex is reported by the batch loop's parser.
+            "SELECT 'unterminated",
+        ];
+        for sql in left_to_the_batch_loop {
+            assert_eq!(lone_plain_statement(sql), None, "{sql:?}");
+        }
+
+        // The answer read off the bytes is the answer by tokens wherever the
+        // bytes alone decide, and text with a quoted name or a comment is not
+        // decided from the bytes.
+        let more = [
+            "SELECT 'a''b;c' FROM t WHERE id = 1;",
+            "SELECT ''''';' ;",
+            "SELECT x'3b' FROM t",
+            "INSERT INTO t VALUES ('one;', 'two'';') ;  ",
+            "INSERT INTO t VALUES ('a;');  SELECT 1;",
+            "selectx 1;",
+            "SELECT\u{e9} 1;",
+            "delete from t where id = 1 ;\n\t ",
+            "UPDATE t SET a = ';' WHERE id = 1; x",
+        ];
+        let mut decided_from_bytes = 0;
+        for sql in recognized
+            .iter()
+            .chain(&left_to_the_batch_loop)
+            .chain(&more)
+        {
+            if bytes_alone_delimit_statements(sql) {
+                decided_from_bytes += 1;
+                assert_eq!(
+                    lone_plain_statement_by_bytes(sql),
+                    lone_plain_statement_by_tokens(sql),
+                    "{sql:?}"
+                );
+            } else {
+                assert!(
+                    sql.contains(['"', '`', '[']) || sql.contains("--") || sql.contains("/*"),
+                    "only quoted names and comments need the lexer: {sql:?}"
+                );
+            }
+        }
+        assert!(
+            decided_from_bytes > 30,
+            "most text is decided from the bytes"
+        );
+
+        // The one difference: text the lexer rejects outside a string (a blob
+        // that is not hex) is a statement by its bytes. It fails in the engine
+        // and the batch loop's parser then reports it; the error test below
+        // runs this very statement.
+        let unlexable = "SELECT x';' FROM t;";
+        assert!(bytes_alone_delimit_statements(unlexable));
+        assert_eq!(lone_plain_statement_by_bytes(unlexable), Some(unlexable));
+        assert_eq!(lone_plain_statement_by_tokens(unlexable), None);
+    }
+
+    #[test]
+    fn test_lone_statement_errors_read_as_the_batch_loop_reports_them() {
+        asupersync::test_utils::run_test(|| async {
+            // The batch loop parses a statement before running it: a syntax
+            // error is reported in the shell parser's words and nothing runs,
+            // any other error in the engine's. A lone statement skips that
+            // parse, and must still report exactly what the loop would have.
+            let scripts = [
+                "SELECT nosuch FROM t WHERE id = 1;",
+                "SELECT * FROM nosuch;",
+                "SELECT 1 +;",
+                "SELECT FROM;",
+                "INSERT INTO t VALUES (1, 2, 3, 4);",
+                "INSERT INTO t(id) VALUES (1);",
+                "INSERT INTO t VALUES (1,;",
+                "UPDATE t SET nosuch = 1 WHERE id = 1;",
+                "UPDATE t SET WHERE id = 1;",
+                "DELETE FROM nosuch WHERE id = 1;",
+                "DELETE FROM t WHERE;",
+                "SELECT 1 2;",
+                "SELECT x';' FROM t;",
+            ];
+            for script in scripts {
+                assert!(
+                    lone_plain_statement(script).is_some(),
+                    "{script} is a lone statement by its tokens"
+                );
+                let seeded = || async {
+                    let connection = Connection::open(":memory:").await.expect("open");
+                    connection
+                        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a)")
+                        .await
+                        .expect("ddl");
+                    connection
+                        .execute("INSERT INTO t VALUES (1, 'one')")
+                        .await
+                        .expect("seed");
+                    connection
+                };
+                let expected = match Parser::from_sql(script).parse_next_statement_with_tail() {
+                    Err(parse_error) => {
+                        Connection::parse_error_to_franken_error(script, parse_error).to_string()
+                    }
+                    Ok(_) => seeded()
+                        .await
+                        .query(script)
+                        .await
+                        .expect_err("the statement fails in the engine")
+                        .to_string(),
+                };
+                let connection = seeded().await;
+                let mut out = Vec::new();
+                let mut err = Vec::new();
+                let ok = super::execute_sql(
+                    &connection,
+                    script,
+                    OutputOptions::default(),
+                    &mut out,
+                    &mut err,
+                )
+                .await;
+                assert!(!ok, "{script} fails");
+                assert!(out.is_empty(), "{script} prints no rows");
+                assert_eq!(
+                    String::from_utf8(err).expect("utf-8"),
+                    format!("error: {expected}\n"),
+                    "error text for {script}"
+                );
+                assert_eq!(
+                    connection
+                        .query("SELECT count(*), max(a) FROM t")
+                        .await
+                        .expect("state")[0]
+                        .values(),
+                    seeded()
+                        .await
+                        .query("SELECT count(*), max(a) FROM t")
+                        .await
+                        .expect("state")[0]
+                        .values(),
+                    "{script} changed nothing"
+                );
             }
         });
     }
