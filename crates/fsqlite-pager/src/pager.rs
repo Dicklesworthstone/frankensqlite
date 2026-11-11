@@ -8586,7 +8586,7 @@ impl<F: VfsFile> Drop for PagerInner<F> {
             });
             let pool_is_current = self.committed_wal_generation.is_some()
                 && current_generation == Some(self.committed_wal_generation);
-            if std::env::var_os("IOQ6X_TRACE").is_some() {
+            if ioq6x_trace_enabled() {
                 eprintln!(
                     "IOQ6X DISOWN pool={} current={pool_is_current} -> shared ledger",
                     self.abandoned_eof_reservations.len(),
@@ -8743,7 +8743,7 @@ impl<F: VfsFile> DisownedPageReclaimAttempt<F> {
         let restorable = self.take_restorable_pages();
         Self::restore_pages(&mut inner, restorable);
         if !promoted.is_empty() && promote_to_freelist {
-            if std::env::var_os("IOQ6X_TRACE").is_some() {
+            if ioq6x_trace_enabled() {
                 eprintln!(
                     "IOQ6X CKPT-FOLD reconciled={} pool_remaining={}",
                     promoted.len(),
@@ -10205,7 +10205,7 @@ impl<F: VfsFile> PagerInner<F> {
             // (bd-dk9ra counter-stats ruling, option a). Metrics-only: bytes
             // returned unchanged.
             cache.record_external_read();
-            if std::env::var_os("DK9RA_O81OV").is_some()
+            if dk9ra_trace_enabled()
                 && page_no.get() > 1
                 && data.iter().all(|&b| b == 0)
             {
@@ -10219,7 +10219,7 @@ impl<F: VfsFile> PagerInner<F> {
         let db_file = shared_db_file_read(&self.db_file, cx).await?;
         let file_size = db_file.file_size(cx)?;
         if offset >= file_size {
-            if std::env::var_os("DK9RA_O81OV").is_some() && page_no.get() > 1 {
+            if dk9ra_trace_enabled() && page_no.get() > 1 {
                 eprintln!(
                     "DK9RA_O81OV RCPC_SHORT_MAINDB page={} offset={} file_size={}",
                     page_no.get(),
@@ -10733,7 +10733,7 @@ impl<F: VfsFile> PagerInner<F> {
                     reparked += 1;
                 }
             }
-            if reparked > 0 && std::env::var_os("IOQ6X_TRACE").is_some() {
+            if reparked > 0 && ioq6x_trace_enabled() {
                 eprintln!(
                     "IOQ6X REFRESH-REPARK reparked={reparked} pool={} durable={}",
                     self.abandoned_eof_reservations.len(),
@@ -10961,6 +10961,41 @@ fn ioq6x_ledger_disabled() -> bool {
     *DISABLED.get_or_init(|| std::env::var_os("FSQLITE_IOQ6X_LEDGER_OFF").is_some())
 }
 
+/// Whether the environment names a diagnostic trace switch, asked once per
+/// process and remembered in `enabled`.
+///
+/// The commit path consults these switches eight times per transaction, and
+/// a `getenv` walks the whole environment: about 5,800 instructions of every
+/// commit went to learning that no trace was asked for. A switch is set in
+/// the environment a repro run starts with, never inside a running process.
+fn trace_switch_enabled(enabled: &OnceLock<bool>, name: &str) -> bool {
+    *enabled.get_or_init(|| std::env::var_os(name).is_some())
+}
+
+/// Whether `DK9RA_O81OV` asks for its `eprintln!` trace.
+fn dk9ra_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    trace_switch_enabled(&ENABLED, "DK9RA_O81OV")
+}
+
+/// Whether `IOQ6X_TRACE` asks for its `eprintln!` trace.
+fn ioq6x_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    trace_switch_enabled(&ENABLED, "IOQ6X_TRACE")
+}
+
+/// Whether `RH4_TRACE` asks for its `eprintln!` trace.
+fn rh4_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    trace_switch_enabled(&ENABLED, "RH4_TRACE")
+}
+
+/// Whether `DW8OE_TRACE` asks for its `eprintln!` trace.
+fn dw8oe_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    trace_switch_enabled(&ENABLED, "DW8OE_TRACE")
+}
+
 /// bd-9inpb allocator-race hunt: env-gated microsecond delay injected into the
 /// commit guard→append TOCTOU window (`FSQLITE_RACE_AMPLIFY_US`). The freelist
 /// resurrection/erasure/double-consumption guards validate against the physical
@@ -11059,7 +11094,7 @@ fn adopt_in_range_disowned_pages<F: VfsFile>(inner: &mut PagerInner<F>, ceiling:
         }
         drop(guard);
         drop(cguard);
-        if re_shared > 0 && std::env::var_os("IOQ6X_TRACE").is_some() {
+        if re_shared > 0 && ioq6x_trace_enabled() {
             eprintln!("IOQ6X RECLAIM-AMPLIFY re_shared={re_shared}");
         }
     }
@@ -11081,7 +11116,7 @@ fn adopt_in_range_disowned_pages<F: VfsFile>(inner: &mut PagerInner<F>, ceiling:
         inner.abandoned_eof_reservations.push(page);
         adopted_count += 1;
     }
-    if adopted_count > 0 && std::env::var_os("IOQ6X_TRACE").is_some() {
+    if adopted_count > 0 && ioq6x_trace_enabled() {
         eprintln!(
             "IOQ6X ADOPT adopted={adopted_count} pool={}",
             inner.abandoned_eof_reservations.len(),
@@ -11185,7 +11220,7 @@ fn preserve_above_extent_at_generation_boundary<F: VfsFile>(inner: &mut PagerInn
             }
         }
     }
-    if carried > 0 && std::env::var_os("IOQ6X_TRACE").is_some() {
+    if carried > 0 && ioq6x_trace_enabled() {
         eprintln!("IOQ6X CKPT-PRESERVE carried_above_extent={carried} db_size={db_size}");
     }
 }
@@ -11330,7 +11365,7 @@ async fn load_freelist_from_committed_state<F: VfsFile>(
     if first_trunk == 0 || freelist_count == 0 {
         return Ok(Vec::new());
     }
-    if std::env::var_os("DK9RA_O81OV").is_some() {
+    if dk9ra_trace_enabled() {
         eprintln!(
             "DK9RA_O81OV FREELIST_LOAD first_trunk={first_trunk} count={freelist_count} db_size={db_size}"
         );
@@ -11373,7 +11408,7 @@ async fn load_freelist_from_committed_state<F: VfsFile>(
 
         let next_trunk = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
         let leaf_count = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
-        if std::env::var_os("DK9RA_O81OV").is_some() {
+        if dk9ra_trace_enabled() {
             let all_zero = buf.iter().all(|&b| b == 0);
             eprintln!(
                 "DK9RA_O81OV FREELIST_TRUNK trunk={trunk} next={next_trunk} leaf_count={leaf_count} all_zero={all_zero}"
@@ -11799,7 +11834,7 @@ async fn conflicting_pages_since_batch_snapshots(
     let mut conflicts = Vec::<u32>::new();
     for batch in batches {
         let Some(snapshot) = batch.conflict_snapshot else {
-            if std::env::var_os("DK9RA_O81OV").is_some() {
+            if dk9ra_trace_enabled() {
                 let maxp = batch
                     .frames
                     .iter()
@@ -11813,7 +11848,7 @@ async fn conflicting_pages_since_batch_snapshots(
             }
             continue;
         };
-        if std::env::var_os("DK9RA_O81OV").is_some() {
+        if dk9ra_trace_enabled() {
             let maxc = batch.conflict_pages.iter().copied().max().unwrap_or(0);
             let maxf = batch
                 .frames
@@ -11911,7 +11946,7 @@ async fn resurrected_or_erased_freelist_pages<F: VfsFile>(
             .map(|list| (list, batch))
     });
     let Some((published, batch)) = publications.next() else {
-        if std::env::var_os("RH4_TRACE").is_some() {
+        if rh4_trace_enabled() {
             let consumed: Vec<u32> = batches
                 .iter()
                 .flat_map(|b| b.consumed_durable_freelist_pages.iter().copied())
@@ -12045,7 +12080,7 @@ async fn resurrected_or_erased_freelist_pages<F: VfsFile>(
                 }),
         )
         .collect();
-    if std::env::var_os("RH4_TRACE").is_some() {
+    if rh4_trace_enabled() {
         let begin_committed = batch
             .conflict_snapshot
             .map(|snapshot| snapshot.snapshot_db_size)
@@ -24655,7 +24690,7 @@ where
 
                 let t_flush_frame_prep_start = detailed_metrics.then(Instant::now);
                 let conflicting_pages = conflicting_pages_across_group_commit_batches(&batches);
-                if std::env::var_os("DK9RA_O81OV").is_some() && !batches.is_empty() {
+                if dk9ra_trace_enabled() && !batches.is_empty() {
                     let per_batch: Vec<(u32, u32)> = batches
                         .iter()
                         .map(|b| {
@@ -24874,7 +24909,7 @@ where
                                 head,
                                 count,
                             );
-                            if std::env::var_os("DW8OE_TRACE").is_some() {
+                            if dw8oe_trace_enabled() {
                                 eprintln!(
                                     "DW8OE PROMOTE in_group_head={head} in_group_count={count} changed={changed}"
                                 );
@@ -24913,12 +24948,12 @@ where
                                     head,
                                     count,
                                 );
-                                if std::env::var_os("DW8OE_TRACE").is_some() {
+                                if dw8oe_trace_enabled() {
                                     eprintln!(
                                         "DW8OE PROMOTE durable_head={head} durable_count={count} changed={changed}"
                                     );
                                 }
-                            } else if std::env::var_os("DW8OE_TRACE").is_some() {
+                            } else if dw8oe_trace_enabled() {
                                 eprintln!("DW8OE PROMOTE no-durable-page1");
                             }
                         }
@@ -25220,7 +25255,7 @@ where
                                                 .iter()
                                                 .any(|frame| frame.page_number == 1)
                                     });
-                                    if std::env::var_os("DW8OE_TRACE").is_some() {
+                                    if dw8oe_trace_enabled() {
                                         for batch in batches.iter() {
                                             for frame in &batch.frames {
                                                 if frame.page_number == 1
@@ -25251,7 +25286,7 @@ where
                                         let stale = if let Some(header) =
                                             group_publication_page_one_freelist_header(&batches)
                                         {
-                                            if std::env::var_os("DW8OE_TRACE").is_some() {
+                                            if dw8oe_trace_enabled() {
                                                 eprintln!(
                                                     "DW8OE GATE in_group32_40={}",
                                                     hex_bytes(&header),
@@ -25269,7 +25304,7 @@ where
                                                 1,
                                             )
                                             .await?;
-                                            if std::env::var_os("DW8OE_TRACE").is_some() {
+                                            if dw8oe_trace_enabled() {
                                                 eprintln!(
                                                     "DW8OE GATE durable32_40={}",
                                                     durable_page_one.as_deref().map_or_else(
@@ -26959,7 +26994,7 @@ where
                 && let Some(data) =
                     read_page_from_wal_backend(&self.wal_backend, cx, page_no).await?
             {
-                if std::env::var_os("DK9RA_O81OV").is_some()
+                if dk9ra_trace_enabled()
                     && page_no.get() > 1
                     && data.iter().all(|&b| b == 0)
                 {
@@ -27350,7 +27385,7 @@ where
                     if durable_origin {
                         self.allocated_from_durable_freelist.insert(page.get());
                     }
-                    if std::env::var_os("RH4_TRACE").is_some() {
+                    if rh4_trace_enabled() {
                         eprintln!(
                             "RH4POP ptr={:x} page={} arm=gated durable={durable_origin} committed_db={}",
                             std::ptr::from_ref(self) as usize,
@@ -27437,7 +27472,7 @@ where
                 what: "allocated page number".to_owned(),
                 value: "0".to_owned(),
             })?;
-            if std::env::var_os("DK9RA_O81OV").is_some() {
+            if dk9ra_trace_enabled() {
                 eprintln!(
                     "DK9RA_O81OV ALLOC_EOF thread={:?} mode={:?} page={} db_size={}",
                     std::thread::current().id(),
@@ -27489,7 +27524,7 @@ where
                 self.freed_pages.push(page_no);
                 self.freed_pages_index.insert(page_no);
                 self.note_freed_page_bound(page_no);
-            } else if std::env::var_os("RH4_TRACE").is_some()
+            } else if rh4_trace_enabled()
                 && !self.freed_pages.contains(&page_no)
             {
                 // bd-84rh4 free-tracking probe: the dedup guard skipped this
@@ -27808,7 +27843,7 @@ where
                         eligible
                     },
                 );
-                if std::env::var_os("DW8OE_TRACE").is_some()
+                if dw8oe_trace_enabled()
                     && (!abandoned_candidates.pool.is_empty()
                         || !abandoned_candidates.candidates.is_empty())
                 {
@@ -27890,7 +27925,7 @@ where
                             }
                         }
                     }
-                    if std::env::var_os("DW8OE_TRACE").is_some() {
+                    if dw8oe_trace_enabled() {
                         eprintln!(
                             "DW8OE FOLD2 reclaimed={dw8oe_reclaimed} framed_dropped={dw8oe_framed} read_errs={dw8oe_errs}"
                         );
@@ -27970,7 +28005,7 @@ where
                     self.pending_group_commit_attempt = Some(Arc::clone(&attempt));
                     wal_attempt = Some(attempt);
                 }
-                if std::env::var_os("DW8OE_TRACE").is_some() {
+                if dw8oe_trace_enabled() {
                     let inrange = pending_free_pages
                         .iter()
                         .filter(|page| page.get() <= committed_db_size)
@@ -27987,7 +28022,7 @@ where
                 // durably free, it can leak as "page N is never used". Gated on the
                 // hunt's existing RH4_TRACE so a stochastic churn leak is captured
                 // in one pass; inert in production and CI.
-                if !freelist_dirty && std::env::var_os("RH4_TRACE").is_some() {
+                if !freelist_dirty && rh4_trace_enabled() {
                     let inrange_freed: Vec<u32> = pending_free_pages
                         .iter()
                         .copied()
@@ -28033,7 +28068,7 @@ where
                             // yet pages still leak, the loss is a post-publish
                             // page-1 overwrite, not a serialize drop. Gated on
                             // RH4_TRACE; inert in prod/CI.
-                            if std::env::var_os("RH4_TRACE").is_some() {
+                            if rh4_trace_enabled() {
                                 let published_set: std::collections::HashSet<u32> =
                                     published.iter().copied().map(PageNumber::get).collect();
                                 let dropped: Vec<u32> = pending_free_pages
@@ -28863,7 +28898,7 @@ where
                     self.pending_group_commit_attempt = Some(Arc::clone(&attempt));
                     wal_attempt = Some(attempt);
                 }
-                if std::env::var_os("DW8OE_TRACE").is_some() {
+                if dw8oe_trace_enabled() {
                     let inrange = pending_free_pages
                         .iter()
                         .filter(|page| page.get() <= committed_db_size)
@@ -28880,7 +28915,7 @@ where
                 // durably free, it can leak as "page N is never used". Gated on the
                 // hunt's existing RH4_TRACE so a stochastic churn leak is captured
                 // in one pass; inert in production and CI.
-                if !freelist_dirty && std::env::var_os("RH4_TRACE").is_some() {
+                if !freelist_dirty && rh4_trace_enabled() {
                     let inrange_freed: Vec<u32> = pending_free_pages
                         .iter()
                         .copied()
@@ -28926,7 +28961,7 @@ where
                             // yet pages still leak, the loss is a post-publish
                             // page-1 overwrite, not a serialize drop. Gated on
                             // RH4_TRACE; inert in prod/CI.
-                            if std::env::var_os("RH4_TRACE").is_some() {
+                            if rh4_trace_enabled() {
                                 let published_set: std::collections::HashSet<u32> =
                                     published.iter().copied().map(PageNumber::get).collect();
                                 let dropped: Vec<u32> = pending_free_pages
@@ -31420,6 +31455,23 @@ mod tests {
 
     static FAULT_HOOK_TEST_GUARD: crate::fault_hooks::FaultInjectionSessionLock =
         crate::fault_hooks::FaultInjectionSessionLock::new();
+
+    #[test]
+    fn test_trace_switch_is_read_from_the_environment_once() {
+        const UNSET: &str = "FSQLITE_TEST_TRACE_SWITCH_NOBODY_SETS";
+        let off = OnceLock::new();
+        assert!(!trace_switch_enabled(&off, UNSET));
+        assert_eq!(off.get(), Some(&false));
+        let on = OnceLock::new();
+        assert!(
+            trace_switch_enabled(&on, "PATH"),
+            "a variable every test process has"
+        );
+        // Each switch keeps its first answer: a later question about another
+        // name does not go back to the environment.
+        assert!(trace_switch_enabled(&on, UNSET));
+        assert!(!trace_switch_enabled(&off, "PATH"));
+    }
 
     const BEAD_ID: &str = "bd-bca.1";
     const DB300_E3_3_BEAD_ID: &str = "bd-db300.5.3.3";
