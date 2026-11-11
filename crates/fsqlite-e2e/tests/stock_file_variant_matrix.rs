@@ -167,6 +167,51 @@ fn stock_contents(path: &Path) -> Vec<(String, Vec<String>)> {
     contents
 }
 
+/// A FrankenSQLite value in the form [`sorted_rows`] renders stock's.
+fn stock_value(value: &fsqlite::SqliteValue) -> Value {
+    match value {
+        fsqlite::SqliteValue::Null => Value::Null,
+        fsqlite::SqliteValue::Integer(v) => Value::Integer(*v),
+        fsqlite::SqliteValue::Float(v) => Value::Real(*v),
+        fsqlite::SqliteValue::Text(v) => Value::Text(v.as_str().to_owned()),
+        fsqlite::SqliteValue::Blob(v) => Value::Blob(v.to_vec()),
+    }
+}
+
+async fn fsqlite_query(path: &Path, sql: &str) -> Result<Vec<Vec<Value>>, String> {
+    let conn = fsqlite::Connection::open(path.to_str().unwrap())
+        .await
+        .map_err(|error| format!("open: {error}"))?;
+    let rows = conn
+        .query(sql)
+        .await
+        .map_err(|error| format!("query: {error}"))?;
+    conn.close()
+        .await
+        .map_err(|error| format!("close: {error}"))?;
+    Ok(rows
+        .iter()
+        .map(|row| row.values().iter().map(stock_value).collect())
+        .collect())
+}
+
+/// Every row FrankenSQLite reads for `sql`, rendered and sorted as
+/// [`sorted_rows`] renders stock's.
+fn fsqlite_rows(path: &Path, sql: &str) -> Vec<String> {
+    let mut outcome = Err("the runtime did not run the query".to_owned());
+    let slot = &mut outcome;
+    asupersync::test_utils::run_test(|| async move {
+        *slot = fsqlite_query(path, sql).await;
+    });
+    let mut rendered: Vec<String> = outcome
+        .unwrap_or_else(|error| panic!("FrankenSQLite `{sql}`: {error}"))
+        .iter()
+        .map(|values| format!("{values:?}"))
+        .collect();
+    rendered.sort();
+    rendered
+}
+
 fn stock_integrity(path: &Path) -> String {
     let conn = rusqlite::Connection::open(path).expect("stock opens the database");
     conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))
@@ -472,6 +517,188 @@ DELETE FROM t WHERE id % 11 = 0;",
                 rows(300)
             ),
             DML,
+        ),
+    ];
+    for case in &cases {
+        run_case(case);
+    }
+}
+
+/// bd-w4pr1.31: a VIRTUAL generated column before ordinary and STORED
+/// columns. Stock's record leaves the VIRTUAL column out, so every later
+/// column sits one field earlier than its declared position.
+fn virtual_before_stored_table(n: u32) -> String {
+    format!(
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT,
+           v INTEGER GENERATED ALWAYS AS (length(a)) VIRTUAL,
+           c TEXT, s TEXT GENERATED ALWAYS AS (a || c) STORED, d TEXT UNIQUE);
+         CREATE INDEX t_c ON t(c);
+         CREATE INDEX t_v ON t(v);
+         {}INSERT INTO t(a, c, d) SELECT printf('v%d', x), printf('c%d', x % 9), printf('d%05d', x)
+           FROM c;",
+        rows(n)
+    )
+}
+
+/// A WITHOUT ROWID table with a non-leading PRIMARY KEY and a VIRTUAL column:
+/// stock stores `[k, a, d, s]`.
+fn without_rowid_virtual_table(n: u32) -> String {
+    format!(
+        "CREATE TABLE w(a TEXT, v GENERATED ALWAYS AS (length(a)) VIRTUAL, k TEXT PRIMARY KEY,
+           d TEXT, s GENERATED ALWAYS AS (a || d) STORED) WITHOUT ROWID;
+         CREATE INDEX w_d ON w(d);
+         {}INSERT INTO w(a, k, d) SELECT printf('a%d', x), printf('k%05d', x), printf('d%d', x % 7)
+           FROM c;",
+        rows(n)
+    )
+}
+
+/// The INTEGER PRIMARY KEY after a VIRTUAL column: stock stores `[NULL, b]`.
+fn ipk_after_virtual_table(n: u32) -> String {
+    format!(
+        "CREATE TABLE p(v INTEGER GENERATED ALWAYS AS (id * 2) VIRTUAL, id INTEGER PRIMARY KEY,
+           b TEXT);
+         {}INSERT INTO p(b) SELECT printf('b%d', x) FROM c;",
+        rows(n)
+    )
+}
+
+/// Stock adds a column after the VIRTUAL one, so the older records are short.
+/// The CREATE text is one line: DROP COLUMN rewrites it, and FrankenSQLite's
+/// rewrite does not keep a newline between column definitions the way stock's
+/// text edit does, which is a schema-text matter apart from the record layout.
+fn alter_after_virtual_table(n: u32) -> String {
+    format!(
+        "CREATE TABLE q(id INTEGER PRIMARY KEY, a TEXT, \
+           v INTEGER GENERATED ALWAYS AS (length(a)) VIRTUAL, b TEXT, c TEXT);
+         {}INSERT INTO q(a, b, c) SELECT printf('v%d', x), printf('b%d', x), printf('c%d', x)
+           FROM c;
+         ALTER TABLE q ADD COLUMN e TEXT DEFAULT 'e0';
+         INSERT INTO q(a, b, c, e) VALUES ('late', 'lb', 'lc', 'le');",
+        rows(n)
+    )
+}
+
+/// bd-w4pr1.31, the read side: FrankenSQLite reads every stock-written row
+/// of a table whose VIRTUAL generated column comes before stored ones exactly
+/// as stock does. Reading record field i as declared column i (the defect)
+/// returns the following column's value for `c`, `s`, `d`, `k` and `b`.
+#[test]
+fn frankensqlite_reads_stock_rows_past_virtual_generated_columns() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("stock.db");
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch(&format!(
+            "{}{}{}{}",
+            virtual_before_stored_table(300),
+            without_rowid_virtual_table(300),
+            ipk_after_virtual_table(300),
+            alter_after_virtual_table(300)
+        ))
+        .unwrap();
+    assert_eq!(stock_integrity(&path), "ok");
+    let stock = rusqlite::Connection::open(&path).unwrap();
+    for sql in [
+        "SELECT id, a, v, c, s, d FROM t",
+        "SELECT id, a, v, c, s, d FROM t WHERE c = 'c3'",
+        "SELECT id, c, s FROM t WHERE v = 3",
+        "SELECT a, v, c, s, d FROM t WHERE id = 42",
+        "SELECT x.id, y.id, x.s, y.d FROM t AS x JOIN t AS y ON x.c = y.c
+         WHERE x.id < 15 AND y.id < 40",
+        "SELECT a, v, k, d, s FROM w",
+        "SELECT a, v, k, d, s FROM w WHERE k = 'k00042'",
+        "SELECT k, s FROM w WHERE d = 'd3'",
+        "SELECT v, id, b FROM p",
+        "SELECT v, b FROM p WHERE id = 42",
+        "SELECT id, a, v, b, c, e FROM q",
+    ] {
+        assert_eq!(
+            fsqlite_rows(&path, sql),
+            sorted_rows(&stock, sql),
+            "FrankenSQLite must read `{sql}` from the stock-built file as stock does"
+        );
+    }
+    assert_eq!(
+        fsqlite_rows(&path, "PRAGMA integrity_check"),
+        vec![format!("{:?}", vec![Value::Text("ok".to_owned())])],
+        "FrankenSQLite's own integrity_check of the stock-built file"
+    );
+}
+
+/// bd-w4pr1.31, the write side: FrankenSQLite's rows in tables with VIRTUAL
+/// generated columns read back exactly by stock, through every row writer.
+#[test]
+fn virtual_generated_column_record_layouts() {
+    let cases = [
+        Case::new(
+            "virtual_before_stored",
+            "",
+            virtual_before_stored_table(300),
+            "INSERT INTO t(a, c, d) VALUES ('new-1', 'c1', 'd-new-1'), ('new-22', 'c2', 'd-new-2');
+INSERT INTO t(a, c, d) SELECT a || '-s', c, d || '-s' FROM t WHERE id % 13 = 0;
+UPDATE t SET c = c || '-u', d = c || d WHERE id % 7 = 0;
+DELETE FROM t WHERE id % 11 = 0;
+INSERT OR REPLACE INTO t(id, a, c, d)
+  VALUES (5, 'rep-5', 'rc', 'rd-5'), (1000, 'rep-new', 'rc2', 'd00003');
+INSERT INTO t(a, c, d) VALUES ('up', 'uc', 'd00004')
+  ON CONFLICT(d) DO UPDATE SET a = excluded.a || '-x', c = c || '-x';
+ALTER TABLE t ADD COLUMN e TEXT DEFAULT 'e0';
+UPDATE t SET e = 'e-' || id WHERE id % 5 = 0;
+INSERT INTO t(a, c, d, e) VALUES ('after', 'ac', 'd-after', 'ee');
+VACUUM;",
+        ),
+        Case::new(
+            "without_rowid_virtual",
+            "",
+            without_rowid_virtual_table(300),
+            "INSERT INTO w(a, k, d) VALUES ('n1', 'kn1', 'dn1'), ('n22', 'kn2', 'dn2');
+UPDATE w SET d = d || '-u', a = a || 'u' WHERE k < 'k00050';
+DELETE FROM w WHERE k > 'k00280';
+INSERT OR REPLACE INTO w(a, k, d) VALUES ('rep', 'k00010', 'drep');
+INSERT INTO w(a, k, d) VALUES ('ups', 'k00020', 'dups')
+  ON CONFLICT(k) DO UPDATE SET d = excluded.d, a = a || '-x';",
+        ),
+        Case::new(
+            "ipk_after_virtual",
+            "",
+            ipk_after_virtual_table(300),
+            "INSERT INTO p(id, b) VALUES (1000, 'explicit');
+INSERT INTO p(b) VALUES ('auto');
+UPDATE p SET b = b || '-u' WHERE id % 7 = 0;
+UPDATE p SET id = id + 2000 WHERE id % 50 = 0;
+DELETE FROM p WHERE id % 11 = 0;",
+        ),
+        Case::new(
+            "alter_drop_stored_after_virtual",
+            "",
+            alter_after_virtual_table(300),
+            "ALTER TABLE q DROP COLUMN b;
+INSERT INTO q(a, c, e) VALUES ('x', 'xc', 'xe');
+UPDATE q SET c = c || '-u' WHERE id % 7 = 0;",
+        ),
+        Case::new(
+            "alter_drop_virtual",
+            "",
+            alter_after_virtual_table(300),
+            "ALTER TABLE q DROP COLUMN v;
+INSERT INTO q(a, b, c, e) VALUES ('y', 'yb', 'yc', 'ye');
+UPDATE q SET b = b || '-u' WHERE id % 7 = 0;",
+        ),
+        Case::new(
+            "trailing_virtual",
+            "",
+            format!(
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT, b TEXT,
+                   v TEXT GENERATED ALWAYS AS (a || b) VIRTUAL);
+                 CREATE INDEX t_v ON t(v);
+                 {}INSERT INTO t(a, b) SELECT printf('a%d', x), printf('b%d', x) FROM c;",
+                rows(300)
+            ),
+            "INSERT INTO t(a, b) VALUES ('new-1', 'x'), ('new-2', 'y');
+UPDATE t SET b = b || '-u' WHERE id % 7 = 0;
+DELETE FROM t WHERE id % 11 = 0;
+INSERT OR REPLACE INTO t(id, a, b) VALUES (3, 'rep', 'r');",
         ),
     ];
     for case in &cases {

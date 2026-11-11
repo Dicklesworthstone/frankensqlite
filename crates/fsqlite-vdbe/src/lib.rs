@@ -587,7 +587,7 @@ pub struct ProgramBuilder {
     /// rows already written when a later row violates a constraint.
     preserves_rows_on_constraint: bool,
     /// bd-01uq7: MemDatabase-backed (TEMP) table roots whose written rows carry
-    /// computed VIRTUAL generated values instead of the NULL record placeholder.
+    /// computed VIRTUAL generated values instead of leaving those columns out.
     materialized_virtual_generated_roots: Vec<i32>,
 }
 
@@ -616,9 +616,9 @@ impl ProgramBuilder {
 
     /// bd-01uq7: a `MemTable` enforces UNIQUE over its stored cells and has no
     /// index B-tree to hold a computed key, so rows written to these roots keep
-    /// the computed value of each VIRTUAL generated column in its placeholder.
-    /// Reads still recompute the column; the on-disk record format of every
-    /// other table is unchanged.
+    /// every declared column, with the computed value of each VIRTUAL
+    /// generated column. Reads still recompute the column. Every other table's
+    /// record leaves VIRTUAL columns out, as stock does (bd-w4pr1.31).
     pub fn set_materialized_virtual_generated_roots(&mut self, roots: impl IntoIterator<Item = i32>) {
         self.materialized_virtual_generated_roots = roots.into_iter().collect();
     }

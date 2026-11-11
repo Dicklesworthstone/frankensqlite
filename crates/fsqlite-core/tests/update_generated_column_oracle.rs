@@ -111,7 +111,7 @@ fn update_generated_column_matches_rusqlite_oracle() {
 }
 
 // bd-fjieg.5: NOT NULL must inspect the computed VIRTUAL value, while
-// the physical row continues to carry its ordinary virtual placeholder.
+// the physical row continues to leave the VIRTUAL column out (bd-w4pr1.31).
 #[test]
 fn virtual_generated_not_null_writes_match_stock_sqlite() {
     asupersync::test_utils::run_test(|| async {

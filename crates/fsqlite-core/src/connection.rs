@@ -233,9 +233,8 @@ use fsqlite_types::value::{
 };
 use fsqlite_types::{
     BTreePageHeader, ComparisonAffinity, DatabaseHeader, EProcessConfig, EProcessOracle,
-    ExprAffinity, PageData, PageNumber, PageSize, Region,
-    StrictColumnType, TextEncoding, TypeAffinity, without_rowid_declared_to_physical,
-    without_rowid_pk_is_leading, without_rowid_storage_order,
+    ExprAffinity, PageData, PageNumber, PageSize, Region, StrictColumnType, TextEncoding,
+    TypeAffinity,
 };
 use fsqlite_vdbe::codegen::{
     CheckConstraint, CodegenContext, CodegenError, ColumnInfo, FkActionType, FkDef, IndexSchema,
@@ -9707,7 +9706,7 @@ impl PreparedStatement<'_> {
             runtime_inputs.column_defaults_by_root_page,
             runtime_inputs.index_desc_flags_by_root_page,
             runtime_inputs.index_collations_by_root_page,
-            runtime_inputs.wr_storage_order_by_root_page,
+            runtime_inputs.record_slots_by_root_page,
             reject_mem,
             self.conn.memdb_rows_loaded.get(),
             self.conn.memdb_storage_count_shortcuts_safe.get(),
@@ -9888,7 +9887,7 @@ impl PreparedStatement<'_> {
                 runtime_inputs.column_defaults_by_root_page,
                 runtime_inputs.index_desc_flags_by_root_page,
                 runtime_inputs.index_collations_by_root_page,
-                runtime_inputs.wr_storage_order_by_root_page,
+                runtime_inputs.record_slots_by_root_page,
                 reject_mem,
                 self.conn.memdb_rows_loaded.get(),
                 self.conn.memdb_storage_count_shortcuts_safe.get(),
@@ -9942,7 +9941,7 @@ impl PreparedStatement<'_> {
                 runtime_inputs.column_defaults_by_root_page,
                 runtime_inputs.index_desc_flags_by_root_page,
                 runtime_inputs.index_collations_by_root_page,
-                runtime_inputs.wr_storage_order_by_root_page,
+                runtime_inputs.record_slots_by_root_page,
                 reject_mem,
                 self.conn.memdb_rows_loaded.get(),
                 self.conn.memdb_storage_count_shortcuts_safe.get(),
@@ -10077,7 +10076,7 @@ impl PreparedStatement<'_> {
                 runtime_inputs.column_defaults_by_root_page,
                 runtime_inputs.index_desc_flags_by_root_page,
                 runtime_inputs.index_collations_by_root_page,
-                runtime_inputs.wr_storage_order_by_root_page,
+                runtime_inputs.record_slots_by_root_page,
                 reject_mem,
                 self.conn.memdb_rows_loaded.get(),
                 self.conn.memdb_storage_count_shortcuts_safe.get(),
@@ -10134,7 +10133,7 @@ impl PreparedStatement<'_> {
                 runtime_inputs.column_defaults_by_root_page,
                 runtime_inputs.index_desc_flags_by_root_page,
                 runtime_inputs.index_collations_by_root_page,
-                runtime_inputs.wr_storage_order_by_root_page,
+                runtime_inputs.record_slots_by_root_page,
                 reject_mem,
                 self.conn.memdb_rows_loaded.get(),
                 self.conn.memdb_storage_count_shortcuts_safe.get(),
@@ -12741,10 +12740,12 @@ struct TableExecutionMetadataCacheEntry {
     column_defaults_by_root_page: Arc<HbHashMap<i32, Vec<Option<SqliteValue>>>>,
     index_desc_flags_by_root_page: Arc<HbHashMap<i32, Vec<bool>>>,
     index_collations_by_root_page: Arc<HbHashMap<i32, Vec<Option<String>>>>,
-    /// Declared->physical column permutation for WITHOUT ROWID tables whose
-    /// PRIMARY KEY is non-leading/reordered (keyed by table root page). Absent
-    /// for leading-PK tables (identity permutation). See `without_rowid_*`.
-    wr_storage_order_by_root_page: Arc<HbHashMap<i32, Vec<usize>>>,
+    /// Declared column -> table-record slot (`usize::MAX` for a column the
+    /// record leaves out), keyed by table root page, for tables whose record
+    /// does not hold their columns at their declared positions: a VIRTUAL
+    /// generated column before a stored one (bd-w4pr1.31) or a non-leading
+    /// WITHOUT ROWID PRIMARY KEY (bd-v6pjf). See `TableSchema::record_slot_map`.
+    record_slots_by_root_page: Arc<HbHashMap<i32, Arc<[usize]>>>,
     cached_read_runtime_inputs: TableExecutionRuntimeInputs,
 }
 
@@ -12760,7 +12761,7 @@ struct TableExecutionRuntimeInputs {
     column_defaults_by_root_page: Arc<HbHashMap<i32, Vec<Option<SqliteValue>>>>,
     index_desc_flags_by_root_page: Arc<HbHashMap<i32, Vec<bool>>>,
     index_collations_by_root_page: Arc<HbHashMap<i32, Vec<Option<String>>>>,
-    wr_storage_order_by_root_page: Arc<HbHashMap<i32, Vec<usize>>>,
+    record_slots_by_root_page: Arc<HbHashMap<i32, Arc<[usize]>>>,
 }
 
 // ── Time-travel snapshots ──────────────────────────────────────────────────
@@ -31507,13 +31508,21 @@ impl Connection {
             return None;
         }
         let overlay = Self::retained_autocommit_overlay_fast_path(stmt)?;
-        let root_page_dirty = self
-            .table_schema_by_root_page(overlay.root_page())
-            .is_some_and(|table| {
-                self.retained_autocommit_dirty_tables
-                    .borrow()
-                    .contains(&table.name.to_lowercase())
-            });
+        let table = self.table_schema_by_root_page(overlay.root_page());
+        // bd-w4pr1.31: the overlay's projected readers decode a record by
+        // declared column position, and a record leaves VIRTUAL generated
+        // columns out. Such tables take the ordinary path.
+        if table
+            .as_ref()
+            .is_some_and(|table| table.columns.iter().any(ColumnInfo::is_virtual_generated))
+        {
+            return None;
+        }
+        let root_page_dirty = table.is_some_and(|table| {
+            self.retained_autocommit_dirty_tables
+                .borrow()
+                .contains(&table.name.to_lowercase())
+        });
         let parsed_read_overlap = if root_page_dirty {
             true
         } else if let Some(statement) = &stmt.deferred_query_statement {
@@ -50458,7 +50467,7 @@ impl Connection {
             column_defaults_by_root_page: empty_column_defaults_arc(),
             index_desc_flags_by_root_page: Arc::clone(&metadata.index_desc_flags_by_root_page),
             index_collations_by_root_page: Arc::clone(&metadata.index_collations_by_root_page),
-            wr_storage_order_by_root_page: Arc::clone(&metadata.wr_storage_order_by_root_page),
+            record_slots_by_root_page: Arc::clone(&metadata.record_slots_by_root_page),
         })
     }
 
@@ -66767,7 +66776,7 @@ impl Connection {
             column_defaults_by_root_page,
             index_desc_flags_by_root_page: Arc::clone(&metadata.index_desc_flags_by_root_page),
             index_collations_by_root_page: Arc::clone(&metadata.index_collations_by_root_page),
-            wr_storage_order_by_root_page: Arc::clone(&metadata.wr_storage_order_by_root_page),
+            record_slots_by_root_page: Arc::clone(&metadata.record_slots_by_root_page),
         }
     }
 
@@ -66802,10 +66811,21 @@ impl Connection {
         let index_count: usize = schema.iter().map(|table| table.indexes.len()).sum();
         let mut index_desc_flags_by_root_page = HbHashMap::with_capacity(index_count);
         let mut index_collations_by_root_page = HbHashMap::with_capacity(index_count);
-        let mut wr_storage_order_by_root_page: HbHashMap<i32, Vec<usize>> = HbHashMap::new();
+        let mut record_slots_by_root_page: HbHashMap<i32, Arc<[usize]>> = HbHashMap::new();
 
         for table in schema.iter() {
             let table_name_key = table.name.to_ascii_lowercase();
+            // bd-w4pr1.31 / bd-v6pjf: a table record leaves VIRTUAL generated
+            // columns out and leads a WITHOUT ROWID row with its PRIMARY KEY, as
+            // stock's does, so the table cursor maps a declared column to its
+            // record slot. A TEMP (MemDatabase) row keeps every declared column
+            // (bd-01uq7). Tables whose stored columns sit at their declared
+            // positions stay out of the map and read for free.
+            if let Some(slots) =
+                table.record_slot_map(!temp_names.contains(&table_name_key))
+            {
+                record_slots_by_root_page.insert(table.root_page, Arc::from(slots));
+            }
             // Inspect the original AST, not column names alone: table-level PK
             // terms can override column collation and direction. Cache this
             // once per schema generation, not once per trigger invocation.
@@ -66958,28 +66978,6 @@ impl Connection {
                     .collect();
                 index_desc_flags_by_root_page.insert(table.root_page, desc_flags);
                 index_collations_by_root_page.insert(table.root_page, collations);
-                // bd-v6pjf/bd-0ntuc: a non-leading or reordered PRIMARY KEY is
-                // stored physically PK-leading (PK columns in PK order, then the
-                // remaining columns in declared order) to match C SQLite's
-                // on-disk layout. Register the declared->physical permutation so
-                // the table cursor remaps reads back to declared order. Leading-PK
-                // tables are the identity permutation and stay out of the map, so
-                // the read path pays nothing for the common shape.
-                let pk_indices: Vec<usize> = pk_cols
-                    .iter()
-                    .filter_map(|name| {
-                        table
-                            .columns
-                            .iter()
-                            .position(|column| column.name.eq_ignore_ascii_case(name))
-                    })
-                    .collect();
-                if !without_rowid_pk_is_leading(&pk_indices, table.columns.len()) {
-                    wr_storage_order_by_root_page.insert(
-                        table.root_page,
-                        without_rowid_declared_to_physical(&pk_indices, table.columns.len()),
-                    );
-                }
             }
         }
 
@@ -66996,7 +66994,7 @@ impl Connection {
         };
         let index_desc_flags_by_root_page = Arc::new(index_desc_flags_by_root_page);
         let index_collations_by_root_page = Arc::new(index_collations_by_root_page);
-        let wr_storage_order_by_root_page = Arc::new(wr_storage_order_by_root_page);
+        let record_slots_by_root_page = Arc::new(record_slots_by_root_page);
         let cached_read_runtime_inputs = TableExecutionRuntimeInputs {
             autoincrement_seq_by_root_page: HbHashMap::new(),
             rowid_alias_col_by_root_page: Arc::clone(&rowid_alias_col_by_root_page),
@@ -67008,7 +67006,7 @@ impl Connection {
             column_defaults_by_root_page: Arc::clone(&column_defaults_by_root_page),
             index_desc_flags_by_root_page: Arc::clone(&index_desc_flags_by_root_page),
             index_collations_by_root_page: Arc::clone(&index_collations_by_root_page),
-            wr_storage_order_by_root_page: Arc::clone(&wr_storage_order_by_root_page),
+            record_slots_by_root_page: Arc::clone(&record_slots_by_root_page),
         };
 
         let entry = Arc::new(TableExecutionMetadataCacheEntry {
@@ -67022,7 +67020,7 @@ impl Connection {
             column_defaults_by_root_page,
             index_desc_flags_by_root_page,
             index_collations_by_root_page,
-            wr_storage_order_by_root_page,
+            record_slots_by_root_page,
             cached_read_runtime_inputs,
         });
         *self.table_execution_metadata_cache.borrow_mut() = Some(Arc::clone(&entry));
@@ -69754,6 +69752,21 @@ impl Connection {
                     .ok_or_else(|| {
                         FrankenError::FunctionError(format!("no such column: \"{col_name}\""))
                     })?;
+                // bd-w4pr1.31: the dropped column's record slot, taken before the
+                // column leaves the schema. A record holds no VIRTUAL column, so
+                // stock rewrites no record for one; a TEMP (MemDatabase) row keeps
+                // every declared column (bd-01uq7).
+                let removed_slot = if alters_temp_table {
+                    Some(col_idx)
+                } else if table.columns[col_idx].is_virtual_generated() {
+                    None
+                } else {
+                    Some(
+                        table
+                            .record_slot_map(true)
+                            .map_or(col_idx, |slots| slots[col_idx]),
+                    )
+                };
                 table.columns.remove(col_idx);
                 table.check_constraints.retain(|check| {
                     !check
@@ -69810,11 +69823,15 @@ impl Connection {
                 }
                 // Physically rewrite stored rows to drop the column's record slot
                 // so trailing columns realign on read (the read path decodes by
-                // physical slot index). `col_idx` is the dropped column's position
-                // in the pre-drop schema, which equals its physical record slot.
-                // bd-nb2j9 / bd-w50nr.
-                self.rewrite_table_records_remove_slot(table_name, col_idx)
-                    .await?;
+                // physical slot index). bd-nb2j9 / bd-w50nr.
+                if let Some(removed_slot) = removed_slot {
+                    self.rewrite_table_records_remove_slot(table_name, removed_slot)
+                        .await?;
+                } else {
+                    // No record holds the VIRTUAL column, but the MemDatabase
+                    // mirror's rows still carry its slot.
+                    self.abandon_exact_memdb_row_mirror();
+                }
                 table_clone
             }
         };
@@ -79921,14 +79938,18 @@ impl Connection {
         // NULL placeholder in their slot and silently drop rows whose join or
         // filter predicate references the generated column
         // (bd-gh-virtual-generated-columns-5e0u1 / GH#227).
+        let has_virtual = table.columns.iter().any(ColumnInfo::is_virtual_generated);
         let mut values = Self::inflate_physical_row_values_from_payload_values(
             table,
             rowid,
             payload_values,
             rowid_alias_col_idx,
+            has_virtual,
             default_value_at,
         )?;
-        Self::fill_generated_columns(table, rowid, rowid_alias_col_idx, &mut values, false)?;
+        if has_virtual {
+            Self::fill_generated_columns(table, rowid, rowid_alias_col_idx, &mut values, false)?;
+        }
         Ok(values)
     }
 
@@ -80017,31 +80038,47 @@ impl Connection {
         rowid: i64,
         payload_values: &[SqliteValue],
         rowid_alias_col_idx: Option<usize>,
+        has_virtual: bool,
         mut default_value_at: impl FnMut(usize) -> Result<Option<SqliteValue>>,
     ) -> Result<Vec<SqliteValue>> {
-        // bd-v6pjf/bd-0ntuc: a WITHOUT ROWID table with a non-leading or
-        // reordered PRIMARY KEY stores its record physically PK-leading (the PK
-        // columns in PK order, then the remaining columns in declared order).
-        // Reorder a full-width physical payload back to declared column order
-        // before it is consumed positionally below. Identity (skipped) for rowid
-        // tables and leading-PK WITHOUT ROWID tables. A short payload (an ALTER
-        // TABLE ADD COLUMN back-fill) is left untouched; that non-leading-PK
-        // reopen edge is tracked as a follow-up (bd-xe3nb).
-        let reordered_payload: Vec<SqliteValue>;
+        // bd-w4pr1.31 / bd-v6pjf / bd-0ntuc: a table record holds the stored
+        // columns in storage order, as stock's does. VIRTUAL generated columns
+        // are left out, and a WITHOUT ROWID record leads with its PRIMARY KEY
+        // columns in PK order, then the rest in declared order. A rowid table's
+        // stored columns keep declared order, so the walk below skips its
+        // VIRTUAL columns (`has_virtual`). A WITHOUT ROWID payload is scattered
+        // back to declared order here, NULL in each VIRTUAL slot: a full payload
+        // into a full row (trailing extra fields, an older FrankenSQLite's
+        // VIRTUAL placeholders, are ignored), and a short payload (ALTER TABLE
+        // ADD COLUMN) into a declared prefix when the storage order is
+        // monotonic, so the back-fill below still applies. A short payload in a
+        // reordered storage order is left untouched; that reopen edge is
+        // tracked as a follow-up (bd-xe3nb).
+        let scattered_payload: Vec<SqliteValue>;
         let payload_values: &[SqliteValue] = if table.without_rowid
-            && payload_values.len() == table.columns.len()
-            && let Ok(pk_indices) = without_rowid_pk_indices(table)
-            && !without_rowid_pk_is_leading(&pk_indices, table.columns.len())
+            && let Some(order) = table.record_column_order(true)
         {
-            let storage_order = without_rowid_storage_order(&pk_indices, table.columns.len());
-            let mut declared = vec![SqliteValue::Null; table.columns.len()];
-            for (physical_slot, value) in payload_values.iter().enumerate() {
-                if let Some(&declared_idx) = storage_order.get(physical_slot) {
+            if let Some(stored) = payload_values.get(..order.len()) {
+                let mut declared = vec![SqliteValue::Null; table.columns.len()];
+                for (&declared_idx, value) in order.iter().zip(stored) {
                     declared[declared_idx] = value.clone();
                 }
+                scattered_payload = declared;
+                &scattered_payload
+            } else if order.windows(2).all(|pair| pair[0] < pair[1]) {
+                let covered = payload_values
+                    .len()
+                    .checked_sub(1)
+                    .map_or(0, |last| order[last] + 1);
+                let mut declared = vec![SqliteValue::Null; covered];
+                for (&declared_idx, value) in order.iter().zip(payload_values) {
+                    declared[declared_idx] = value.clone();
+                }
+                scattered_payload = declared;
+                &scattered_payload
+            } else {
+                payload_values
             }
-            reordered_payload = declared;
-            &reordered_payload
         } else {
             payload_values
         };
@@ -80076,12 +80113,28 @@ impl Connection {
             Ok(default_cache[col_idx].clone())
         };
 
+        if has_virtual && !table.without_rowid {
+            // Stock's layout, which always stores the alias slot. The legacy
+            // omitted-slot alignment below counts declared columns, and this
+            // record leaves the VIRTUAL ones out.
+            return Self::inflate_table_row_values_with_alias_alignment(
+                table,
+                rowid,
+                payload_values,
+                rowid_alias_col_idx,
+                true,
+                true,
+                &mut cached_default_value_at,
+            );
+        }
+
         let Some(ipk_idx) = rowid_alias_col_idx else {
             return Self::inflate_table_row_values_with_alias_alignment(
                 table,
                 rowid,
                 payload_values,
                 None,
+                false,
                 false,
                 &mut cached_default_value_at,
             );
@@ -80094,6 +80147,7 @@ impl Connection {
                 payload_values,
                 Some(ipk_idx),
                 true,
+                false,
                 &mut cached_default_value_at,
             );
         }
@@ -80104,6 +80158,7 @@ impl Connection {
                 rowid,
                 payload_values,
                 Some(ipk_idx),
+                false,
                 false,
                 &mut cached_default_value_at,
             );
@@ -80121,6 +80176,7 @@ impl Connection {
                 payload_values,
                 Some(ipk_idx),
                 false,
+                false,
                 &mut cached_default_value_at,
             );
         }
@@ -80131,6 +80187,7 @@ impl Connection {
             payload_values,
             Some(ipk_idx),
             true,
+            false,
             &mut cached_default_value_at,
         )?;
         let without_alias = Self::inflate_table_row_values_with_alias_alignment(
@@ -80138,6 +80195,7 @@ impl Connection {
             rowid,
             payload_values,
             Some(ipk_idx),
+            false,
             false,
             &mut cached_default_value_at,
         )?;
@@ -80170,14 +80228,21 @@ impl Connection {
         payload_values: &[SqliteValue],
         rowid_alias_col_idx: Option<usize>,
         payload_includes_rowid_alias: bool,
+        skip_virtual: bool,
         default_value_at: &mut impl FnMut(usize) -> Result<Option<SqliteValue>>,
     ) -> Result<Vec<SqliteValue>> {
         let mut values = Vec::with_capacity(table.columns.len());
         let mut payload_idx = 0_usize;
 
-        for col_idx in 0..table.columns.len() {
+        for (col_idx, column) in table.columns.iter().enumerate() {
             if rowid_alias_col_idx == Some(col_idx) && !payload_includes_rowid_alias {
                 values.push(SqliteValue::Integer(rowid));
+                continue;
+            }
+            // bd-w4pr1.31: the record leaves a VIRTUAL column out; the caller
+            // computes it into this slot.
+            if skip_virtual && column.is_virtual_generated() {
+                values.push(SqliteValue::Null);
                 continue;
             }
 
@@ -80220,7 +80285,10 @@ impl Connection {
             values.push(value);
         }
 
-        if payload_idx != payload_values.len() {
+        // Trailing fields past the stored columns of a table with VIRTUAL
+        // columns are an older FrankenSQLite's VIRTUAL placeholders, which a
+        // reader ignores, as stock's does.
+        if payload_idx != payload_values.len() && !skip_virtual {
             return Err(FrankenError::DatabaseCorrupt {
                 detail: format!(
                     "table `{}` rowid {rowid} left {} payload columns unconsumed after rowid-alias inflation",
@@ -103841,7 +103909,7 @@ impl Connection {
             runtime_inputs.column_defaults_by_root_page,
             runtime_inputs.index_desc_flags_by_root_page,
             runtime_inputs.index_collations_by_root_page,
-            runtime_inputs.wr_storage_order_by_root_page,
+            runtime_inputs.record_slots_by_root_page,
             reject_mem,
             self.memdb_rows_loaded.get(),
             self.memdb_storage_count_shortcuts_safe.get(),
@@ -142503,7 +142571,7 @@ async fn execute_table_program_with_db(
     column_defaults_by_root_page: Arc<HbHashMap<i32, Vec<Option<SqliteValue>>>>,
     index_desc_flags_by_root_page: Arc<HbHashMap<i32, Vec<bool>>>,
     index_collations_by_root_page: Arc<HbHashMap<i32, Vec<Option<String>>>>,
-    wr_storage_order_by_root_page: Arc<HbHashMap<i32, Vec<usize>>>,
+    record_slots_by_root_page: Arc<HbHashMap<i32, Arc<[usize]>>>,
     reject_mem_fallback: bool,
     memdb_rows_loaded: bool,
     storage_cursor_memdb_count_shortcuts_safe: bool,
@@ -142605,12 +142673,11 @@ async fn execute_table_program_with_db(
         text_encoding,
     });
 
-    // bd-v6pjf: hand the engine the declared->physical permutation so the
-    // table cursor remaps reads of non-leading-PK WITHOUT ROWID rows. Empty
-    // for leading-PK schemas (the map only holds reordered tables), and the
-    // engine's cursor remap is gated on a non-empty map, so this is a no-op
-    // for the common shape.
-    engine.set_shared_wr_storage_order_by_root_page(wr_storage_order_by_root_page);
+    // bd-w4pr1.31 / bd-v6pjf: hand the engine the declared column -> record
+    // slot map so a table cursor reads a VIRTUAL-before-stored or
+    // non-leading-PK WITHOUT ROWID record in stock's layout. Only such tables
+    // have an entry; every other cursor opens with no map.
+    engine.set_shared_record_slots_by_root_page(record_slots_by_root_page);
 
     // Phase 5 (bd-2a3y): if a transaction handle is available, lend it to
     // the engine so storage cursors route through the real pager/WAL stack.
@@ -142802,7 +142869,7 @@ async fn execute_table_program_exactly_one_row_with_db(
     column_defaults_by_root_page: Arc<HbHashMap<i32, Vec<Option<SqliteValue>>>>,
     index_desc_flags_by_root_page: Arc<HbHashMap<i32, Vec<bool>>>,
     index_collations_by_root_page: Arc<HbHashMap<i32, Vec<Option<String>>>>,
-    wr_storage_order_by_root_page: Arc<HbHashMap<i32, Vec<usize>>>,
+    record_slots_by_root_page: Arc<HbHashMap<i32, Arc<[usize]>>>,
     reject_mem_fallback: bool,
     memdb_rows_loaded: bool,
     storage_cursor_memdb_count_shortcuts_safe: bool,
@@ -142891,9 +142958,8 @@ async fn execute_table_program_exactly_one_row_with_db(
         text_encoding,
     });
 
-    // bd-v6pjf: see execute_table_program_with_db — remap non-leading-PK
-    // WITHOUT ROWID reads; no-op for leading-PK schemas.
-    engine.set_shared_wr_storage_order_by_root_page(wr_storage_order_by_root_page);
+    // bd-w4pr1.31 / bd-v6pjf: see execute_table_program_with_db.
+    engine.set_shared_record_slots_by_root_page(record_slots_by_root_page);
 
     if let Some(txn) = txn {
         if let Some(ctx) = concurrent_ctx {
@@ -232904,6 +232970,175 @@ fts5(title, body, content=docs, content_rowid=id)'
         assert_eq!(values[1], SqliteValue::Text("alpha".into()));
         assert_eq!(values[2], SqliteValue::Integer(9));
         assert_eq!(values[3], SqliteValue::Text("fallback".into()));
+    }
+
+    fn generated_inflater_table(
+        columns: Vec<ColumnInfo>,
+        primary_key: Option<&str>,
+    ) -> TableSchema {
+        TableSchema {
+            name: "t".to_owned(),
+            root_page: 2,
+            columns,
+            indexes: Vec::new(),
+            strict: false,
+            without_rowid: primary_key.is_some(),
+            primary_key_constraints: primary_key
+                .map(|name| vec![vec![name.to_owned()]])
+                .unwrap_or_default(),
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+        }
+    }
+
+    fn generated_inflater_column(name: &str, expr: &str, stored: bool) -> ColumnInfo {
+        let mut column = ColumnInfo::basic(name, 'B', false);
+        column.generated_expr = Some(expr.to_owned());
+        column.generated_stored = Some(stored);
+        column
+    }
+
+    /// bd-w4pr1.31: a stock record leaves VIRTUAL generated columns out. The
+    /// inflater walks the stored fields past each VIRTUAL column, computes the
+    /// VIRTUAL value, back-fills a column a short (ALTER-added) record lacks,
+    /// and ignores the trailing VIRTUAL placeholder an older FrankenSQLite
+    /// wrote.
+    #[test]
+    fn test_virtual_generated_inflater_scatters_full_short_and_legacy_payloads() {
+        let text = |value: &str| SqliteValue::Text(value.into());
+        let inflate = |table: &TableSchema, rowid: i64, payload: &[SqliteValue]| {
+            Connection::inflate_table_row_values_for_storage_reload_for_test(
+                table,
+                rowid,
+                payload,
+                Some(0),
+            )
+            .unwrap()
+        };
+        let mut ipk = ColumnInfo::basic("id", 'D', true);
+        ipk.type_name = Some("INTEGER".to_owned());
+        let mut added = ColumnInfo::basic("e", 'B', false);
+        added.default_value = Some("'e0'".to_owned());
+
+        // t(id INTEGER PRIMARY KEY, a, v AS (a || '!') VIRTUAL, c,
+        //   s AS (a || c) STORED, e DEFAULT 'e0'): stock stores [id, a, c, s, e].
+        let wide = generated_inflater_table(
+            vec![
+                ipk.clone(),
+                ColumnInfo::basic("a", 'B', false),
+                generated_inflater_column("v", "a || '!'", false),
+                ColumnInfo::basic("c", 'B', false),
+                generated_inflater_column("s", "a || c", true),
+                added,
+            ],
+            None,
+        );
+        assert_eq!(
+            inflate(
+                &wide,
+                4,
+                &[SqliteValue::Null, text("aa"), text("cc"), text("aacc"), text("ee")]
+            ),
+            vec![
+                SqliteValue::Integer(4),
+                text("aa"),
+                text("aa!"),
+                text("cc"),
+                text("aacc"),
+                text("ee"),
+            ]
+        );
+        // A record written before `e` was added.
+        assert_eq!(
+            inflate(&wide, 5, &[SqliteValue::Null, text("bb"), text("dd"), text("bbdd")]),
+            vec![
+                SqliteValue::Integer(5),
+                text("bb"),
+                text("bb!"),
+                text("dd"),
+                text("bbdd"),
+                text("e0"),
+            ]
+        );
+
+        // t(id INTEGER PRIMARY KEY, a, c, v AS (a || '!') VIRTUAL): stock's
+        // record has no field for v; an older FrankenSQLite's has a NULL one.
+        let trailing = generated_inflater_table(
+            vec![
+                ipk,
+                ColumnInfo::basic("a", 'B', false),
+                ColumnInfo::basic("c", 'B', false),
+                generated_inflater_column("v", "a || '!'", false),
+            ],
+            None,
+        );
+        let expected = vec![SqliteValue::Integer(6), text("xx"), text("yy"), text("xx!")];
+        assert_eq!(
+            inflate(&trailing, 6, &[SqliteValue::Null, text("xx"), text("yy")]),
+            expected
+        );
+        assert_eq!(
+            inflate(
+                &trailing,
+                6,
+                &[SqliteValue::Null, text("xx"), text("yy"), SqliteValue::Null]
+            ),
+            expected
+        );
+    }
+
+    /// bd-w4pr1.31 / bd-v6pjf: a WITHOUT ROWID record leads with its PRIMARY
+    /// KEY and leaves VIRTUAL columns out. The inflater scatters a full record
+    /// back to declared order, and a short record of a leading-PK table into a
+    /// declared prefix, so the ALTER-added column takes its default.
+    #[test]
+    fn test_without_rowid_virtual_generated_inflater_scatters_payload() {
+        let text = |value: &str| SqliteValue::Text(value.into());
+        let inflate = |table: &TableSchema, payload: &[SqliteValue]| {
+            Connection::inflate_table_row_values_for_storage_reload_for_test(
+                table, 1, payload, None,
+            )
+            .unwrap()
+        };
+
+        // t(a, v AS (a || '!') VIRTUAL, k PRIMARY KEY, d, s AS (a || d) STORED)
+        // WITHOUT ROWID: stock stores [k, a, d, s].
+        let reordered = generated_inflater_table(
+            vec![
+                ColumnInfo::basic("a", 'B', false),
+                generated_inflater_column("v", "a || '!'", false),
+                ColumnInfo::basic("k", 'B', false),
+                ColumnInfo::basic("d", 'B', false),
+                generated_inflater_column("s", "a || d", true),
+            ],
+            Some("k"),
+        );
+        assert_eq!(
+            inflate(&reordered, &[text("k1"), text("aa"), text("dd"), text("aadd")]),
+            vec![text("aa"), text("aa!"), text("k1"), text("dd"), text("aadd")]
+        );
+
+        // t(k PRIMARY KEY, v AS (k || '!') VIRTUAL, d, e DEFAULT 'e0') WITHOUT
+        // ROWID: a record from before `e` was added is [k, d].
+        let mut added = ColumnInfo::basic("e", 'B', false);
+        added.default_value = Some("'e0'".to_owned());
+        let leading = generated_inflater_table(
+            vec![
+                ColumnInfo::basic("k", 'B', false),
+                generated_inflater_column("v", "k || '!'", false),
+                ColumnInfo::basic("d", 'B', false),
+                added,
+            ],
+            Some("k"),
+        );
+        assert_eq!(
+            inflate(&leading, &[text("k2"), text("dd")]),
+            vec![text("k2"), text("k2!"), text("dd"), text("e0")]
+        );
+        assert_eq!(
+            inflate(&leading, &[text("k3"), text("ff"), text("ee")]),
+            vec![text("k3"), text("k3!"), text("ff"), text("ee")]
+        );
     }
 
     #[test]

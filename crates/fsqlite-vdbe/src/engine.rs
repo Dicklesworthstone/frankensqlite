@@ -4922,6 +4922,10 @@ struct StorageCursor {
     table_column_count: Option<usize>,
     /// Schema-derived first NOT NULL non-IPK column for this root page.
     first_not_null_non_ipk_col: Option<usize>,
+    /// Declared column -> record slot for a table whose record does not hold
+    /// its columns at their declared positions (bd-w4pr1.31, bd-v6pjf); `None`
+    /// for every other cursor, so its reads pay one `None` check.
+    record_slots: Option<Arc<[usize]>>,
 }
 
 /// Lightweight version token for `MemDatabase` undo/rollback (bd-g6eo).
@@ -7135,12 +7139,14 @@ pub struct VdbeEngine {
     index_desc_flags_by_root_page: Arc<HashMap<i32, Vec<bool>>>,
     /// Per-index collation sequences keyed by index root page number.
     index_collations_by_root_page: Arc<HashMap<i32, Vec<Option<String>>>>,
-    /// WITHOUT ROWID declared->physical column order (inverse permutation)
-    /// keyed by *table* root page. Present only for non-leading-PK tables;
-    /// absent (empty) for leading-PK / rowid tables, so the column-read remap
-    /// in `cursor_column` / `column_to_reg_direct` is a zero-cost identity for
-    /// the common shape (bd-v6pjf).
-    wr_storage_order_by_root_page: Arc<HashMap<i32, Vec<usize>>>,
+    /// Declared column -> table-record slot (`usize::MAX` for a column the
+    /// record leaves out), keyed by *table* root page. Present only for tables
+    /// whose record does not hold their columns at their declared positions: a
+    /// VIRTUAL generated column before a stored one (bd-w4pr1.31) or a
+    /// non-leading WITHOUT ROWID PRIMARY KEY (bd-v6pjf). A storage cursor takes
+    /// its table's entry at open (`StorageCursor::record_slots`), so every
+    /// other table reads by declared position at the cost of one `None` check.
+    record_slots_by_root_page: Arc<HashMap<i32, Arc<[usize]>>>,
     /// Mapping from cursor_id to root_page for default value lookup.
     cursor_root_pages: HashMap<i32, i32>,
     /// Virtual table instances keyed by cursor number (for transaction ops).
@@ -7761,7 +7767,7 @@ impl VdbeEngine {
             column_defaults_by_root_page: Arc::new(HashMap::new()),
             index_desc_flags_by_root_page: Arc::new(HashMap::new()),
             index_collations_by_root_page: Arc::new(HashMap::new()),
-            wr_storage_order_by_root_page: Arc::new(HashMap::new()),
+            record_slots_by_root_page: Arc::new(HashMap::new()),
             cursor_root_pages: HashMap::new(),
             vtab_instances: SwissIndex::new(),
             time_travel_cursors: HashMap::new(),
@@ -8644,32 +8650,32 @@ impl VdbeEngine {
             return SqliteValue::Integer(rowid);
         }
 
-        let payload_includes_rowid_alias = rowid_alias_col_idx.is_some_and(|ipk_idx| {
-            payload_includes_rowid_alias(
-                payload_values,
-                rowid,
-                ipk_idx,
-                table_root_page.and_then(|root_page| {
-                    self.table_column_count_by_root_page
-                        .get(&root_page)
-                        .copied()
-                }),
-                table_root_page.and_then(|root_page| {
-                    self.first_not_null_non_ipk_col_by_root_page
-                        .get(&root_page)
-                        .copied()
-                }),
-            )
-        });
-
-        let payload_index = if let Some(ipk_idx) = rowid_alias_col_idx
-            && column_index > ipk_idx
-            && !payload_includes_rowid_alias
-        {
-            column_index - 1
-        } else {
-            column_index
-        };
+        let record_slots =
+            table_root_page.and_then(|root_page| self.record_slots_for_root(root_page));
+        let payload_includes_rowid_alias = record_slots.is_some()
+            || rowid_alias_col_idx.is_some_and(|ipk_idx| {
+                payload_includes_rowid_alias(
+                    payload_values,
+                    rowid,
+                    ipk_idx,
+                    table_root_page.and_then(|root_page| {
+                        self.table_column_count_by_root_page
+                            .get(&root_page)
+                            .copied()
+                    }),
+                    table_root_page.and_then(|root_page| {
+                        self.first_not_null_non_ipk_col_by_root_page
+                            .get(&root_page)
+                            .copied()
+                    }),
+                )
+            });
+        let payload_index = storage_payload_column_index(
+            column_index,
+            rowid_alias_col_idx,
+            payload_includes_rowid_alias,
+            record_slots.as_deref(),
+        );
 
         payload_values
             .get(payload_index)
@@ -8759,12 +8765,20 @@ impl VdbeEngine {
             .get(&root_page)
             .copied()
             .unwrap_or(stored_values.len());
+        // A WITHOUT ROWID record is in its storage order (bd-v6pjf, bd-w4pr1.31).
+        let record_slots = self.record_slots_for_root(root_page);
         let values = (0..column_count)
             .map(|column_index| {
                 rowid.map_or_else(
                     || {
+                        let slot = storage_payload_column_index(
+                            column_index,
+                            None,
+                            true,
+                            record_slots.as_deref(),
+                        );
                         stored_values
-                            .get(column_index)
+                            .get(slot)
                             .cloned()
                             .or_else(|| {
                                 self.column_defaults_by_root_page
@@ -9662,16 +9676,24 @@ impl VdbeEngine {
         self.index_desc_flags_by_root_page = map;
     }
 
-    /// Provide the WITHOUT ROWID declared->physical column order keyed by table
-    /// root page (bd-v6pjf). Non-leading-PK tables only; leading-PK tables are
-    /// left out so the read remap stays identity.
-    pub fn set_wr_storage_order_by_root_page(&mut self, map: HashMap<i32, Vec<usize>>) {
-        self.wr_storage_order_by_root_page = Arc::new(map);
+    /// Provide the declared column -> record slot map keyed by table root page
+    /// (bd-w4pr1.31, bd-v6pjf). Only tables whose record does not hold their
+    /// columns at their declared positions have an entry.
+    pub fn set_record_slots_by_root_page(&mut self, map: HashMap<i32, Arc<[usize]>>) {
+        self.record_slots_by_root_page = Arc::new(map);
     }
 
-    /// Reuse a shared WITHOUT ROWID declared->physical column-order map.
-    pub fn set_shared_wr_storage_order_by_root_page(&mut self, map: Arc<HashMap<i32, Vec<usize>>>) {
-        self.wr_storage_order_by_root_page = map;
+    /// Reuse a shared declared column -> record slot map.
+    pub fn set_shared_record_slots_by_root_page(&mut self, map: Arc<HashMap<i32, Arc<[usize]>>>) {
+        self.record_slots_by_root_page = map;
+    }
+
+    /// The record slot map a storage cursor on `root_page` reads through.
+    fn record_slots_for_root(&self, root_page: i32) -> Option<Arc<[usize]>> {
+        if self.record_slots_by_root_page.is_empty() {
+            return None;
+        }
+        self.record_slots_by_root_page.get(&root_page).cloned()
     }
 
     /// Provide per-index collation sequences keyed by index root page.
@@ -10889,6 +10911,7 @@ impl VdbeEngine {
                                 ipk_col_idx: None,
                                 table_column_count: None,
                                 first_not_null_non_ipk_col: None,
+                                record_slots: None,
                             },
                         );
                     }
@@ -17390,6 +17413,7 @@ impl VdbeEngine {
                 ipk_col_idx: old_sc.ipk_col_idx,
                 table_column_count: old_sc.table_column_count,
                 first_not_null_non_ipk_col: old_sc.first_not_null_non_ipk_col,
+                record_slots: old_sc.record_slots,
             },
         );
         tracing::info!(
@@ -17890,24 +17914,20 @@ impl VdbeEngine {
         ensure_storage_cursor_row_layout(cursor, 0, collect_vdbe_metrics).await?;
 
         let ipk_col_idx = cursor.ipk_col_idx;
+        if ipk_col_idx == Some(col_idx) {
+            return Ok(ColumnSubstrPrefixDirect::Generic);
+        }
         let payload_includes = if let Some(ipk) = ipk_col_idx {
             storage_cursor_payload_includes_rowid_alias(cursor, ipk, collect_vdbe_metrics).await?
         } else {
             false
         };
-
-        let payload_idx = if let Some(ipk) = ipk_col_idx {
-            if col_idx == ipk {
-                return Ok(ColumnSubstrPrefixDirect::Generic);
-            }
-            if col_idx > ipk && !payload_includes {
-                col_idx - 1
-            } else {
-                col_idx
-            }
-        } else {
-            col_idx
-        };
+        let payload_idx = storage_payload_column_index(
+            col_idx,
+            ipk_col_idx,
+            payload_includes,
+            cursor.record_slots.as_deref(),
+        );
 
         let Some(col) = cursor.row_decode.column_offset(payload_idx).copied() else {
             return Ok(ColumnSubstrPrefixDirect::Generic);
@@ -18019,24 +18039,20 @@ impl VdbeEngine {
         ensure_storage_cursor_row_layout(cursor, 0, collect_vdbe_metrics).await?;
 
         let ipk_col_idx = cursor.ipk_col_idx;
+        if ipk_col_idx == Some(col_idx) {
+            return Ok(None);
+        }
         let payload_includes = if let Some(ipk) = ipk_col_idx {
             storage_cursor_payload_includes_rowid_alias(cursor, ipk, collect_vdbe_metrics).await?
         } else {
             false
         };
-
-        let payload_idx = if let Some(ipk) = ipk_col_idx {
-            if col_idx == ipk {
-                return Ok(None);
-            }
-            if col_idx > ipk && !payload_includes {
-                col_idx - 1
-            } else {
-                col_idx
-            }
-        } else {
-            col_idx
-        };
+        let payload_idx = storage_payload_column_index(
+            col_idx,
+            ipk_col_idx,
+            payload_includes,
+            cursor.record_slots.as_deref(),
+        );
 
         let Some(col) = cursor.row_decode.column_offset(payload_idx) else {
             return Ok(None);
@@ -18076,12 +18092,6 @@ impl VdbeEngine {
         col_idx: usize,
         target: i32,
     ) -> Result<bool> {
-        // bd-v6pjf: WITHOUT ROWID non-leading-PK column remap. Only clone the map
-        // Arc when a non-leading-PK table is actually registered; the common case
-        // (empty map) keeps this general column-read path allocation-free. Cloning
-        // up front also avoids re-borrowing `self` while `cursor` is held.
-        let wr_storage_order = (!self.wr_storage_order_by_root_page.is_empty())
-            .then(|| Arc::clone(&self.wr_storage_order_by_root_page));
         let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) else {
             return Ok(false);
         };
@@ -18111,8 +18121,7 @@ impl VdbeEngine {
             col_idx,
             ipk_col_idx,
             payload_includes,
-            wr_storage_order.as_deref(),
-            cursor.root_page,
+            cursor.record_slots.as_deref(),
         );
 
         // ── Load the payload through the end of the requested column ──
@@ -18145,8 +18154,6 @@ impl VdbeEngine {
         col_idx: usize,
         target: i32,
     ) -> Result<bool> {
-        let wr_storage_order = (!self.wr_storage_order_by_root_page.is_empty())
-            .then(|| Arc::clone(&self.wr_storage_order_by_root_page));
         let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) else {
             return Ok(false);
         };
@@ -18187,8 +18194,7 @@ impl VdbeEngine {
             col_idx,
             ipk_col_idx,
             payload_includes,
-            wr_storage_order.as_deref(),
-            cursor.root_page,
+            cursor.record_slots.as_deref(),
         );
 
         if payload_idx < cursor.row_decode.column_count()
@@ -18225,15 +18231,11 @@ impl VdbeEngine {
         if self.collect_vdbe_metrics {
             return Ok(false);
         }
-        let wr_storage_order = (!self.wr_storage_order_by_root_page.is_empty())
-            .then(|| Arc::clone(&self.wr_storage_order_by_root_page));
         let text_encoding = self.text_encoding;
         let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) else {
             return Ok(false);
         };
-        let Some(value) =
-            try_read_column_in_place(cursor, col_idx, wr_storage_order.as_deref(), text_encoding)?
-        else {
+        let Some(value) = try_read_column_in_place(cursor, col_idx, text_encoding)? else {
             return Ok(false);
         };
         match value {
@@ -18389,12 +18391,6 @@ impl VdbeEngine {
     async fn cursor_column(&mut self, cursor_id: i32, col_idx: usize) -> Result<SqliteValue> {
         let collect_vdbe_metrics = self.collect_vdbe_metrics;
         let text_encoding = self.text_encoding;
-        // bd-v6pjf: WITHOUT ROWID non-leading-PK column remap. Only clone the map
-        // Arc when a non-leading-PK table is actually registered; the common case
-        // (empty map) keeps this general column-read path allocation-free. Cloning
-        // up front also avoids re-borrowing `self` while `cursor` is held.
-        let wr_storage_order = (!self.wr_storage_order_by_root_page.is_empty())
-            .then(|| Arc::clone(&self.wr_storage_order_by_root_page));
         if let Some(cursor) = self.storage_cursors.get_mut(&cursor_id) {
             if cursor.cursor.eof() {
                 return Ok(SqliteValue::Null);
@@ -18413,27 +18409,16 @@ impl VdbeEngine {
             } else {
                 false
             };
-            let payload_idx = if let Some(ipk) = ipk_col_idx {
-                if col_idx == ipk {
-                    let rowid = storage_cursor_cached_rowid(cursor).await?;
-                    return Ok(SqliteValue::Integer(rowid));
-                }
-                if col_idx > ipk && !payload_includes_rowid_alias {
-                    col_idx - 1
-                } else {
-                    col_idx
-                }
-            } else {
-                col_idx
-            };
-            // bd-v6pjf: declared column -> physical record slot for a
-            // non-leading-PK WITHOUT ROWID table (identity when the map is empty
-            // or the root page is absent from it).
-            let payload_idx = wr_storage_order
-                .as_ref()
-                .and_then(|map| map.get(&cursor.root_page))
-                .and_then(|inv| inv.get(payload_idx).copied())
-                .unwrap_or(payload_idx);
+            if ipk_col_idx == Some(col_idx) {
+                let rowid = storage_cursor_cached_rowid(cursor).await?;
+                return Ok(SqliteValue::Integer(rowid));
+            }
+            let payload_idx = storage_payload_column_index(
+                col_idx,
+                ipk_col_idx,
+                payload_includes_rowid_alias,
+                cursor.record_slots.as_deref(),
+            );
 
             // ── Lazy column decode: decode on demand ─────────────────
             if payload_idx < cursor.row_decode.column_count() {
@@ -18967,6 +18952,7 @@ impl VdbeEngine {
                         .first_not_null_non_ipk_col_by_root_page
                         .get(&root_page)
                         .copied();
+                    let record_slots = self.record_slots_for_root(root_page);
                     self.storage_cursors.insert(
                         cursor_id,
                         StorageCursor {
@@ -18993,6 +18979,7 @@ impl VdbeEngine {
                             ipk_col_idx,
                             table_column_count,
                             first_not_null_non_ipk_col,
+                            record_slots,
                         },
                     );
                     self.cursor_root_pages.insert(cursor_id, root_page);
@@ -19131,6 +19118,7 @@ impl VdbeEngine {
                         .first_not_null_non_ipk_col_by_root_page
                         .get(&root_page)
                         .copied();
+                    let record_slots = self.record_slots_for_root(root_page);
                     self.storage_cursors.insert(
                         cursor_id,
                         StorageCursor {
@@ -19157,6 +19145,7 @@ impl VdbeEngine {
                             ipk_col_idx,
                             table_column_count,
                             first_not_null_non_ipk_col,
+                            record_slots,
                         },
                     );
                     self.cursor_root_pages.insert(cursor_id, root_page);
@@ -19358,6 +19347,9 @@ impl VdbeEngine {
                 ipk_col_idx,
                 table_column_count,
                 first_not_null_non_ipk_col,
+                // The rows above were encoded from MemDatabase rows, which
+                // hold every declared column in declared order.
+                record_slots: None,
             },
         );
         self.cursor_root_pages.insert(cursor_id, root_page);
@@ -20209,6 +20201,11 @@ async fn storage_cursor_payload_includes_rowid_alias(
     if let Some(cached) = cursor.payload_includes_rowid_alias {
         return Ok(cached);
     }
+    // A record slot map positions columns in stock's layout, which always
+    // stores the alias slot; the width heuristic below counts declared columns.
+    if cursor.record_slots.is_some() {
+        return Ok(true);
+    }
     let (mut includes, rowid_slot) = payload_rowid_alias_header_verdict(
         &cursor.row_decode,
         ipk_col_idx,
@@ -20236,6 +20233,9 @@ fn try_storage_cursor_payload_includes_rowid_alias_local(
 ) -> Result<Option<bool>> {
     if let Some(cached) = cursor.payload_includes_rowid_alias {
         return Ok(Some(cached));
+    }
+    if cursor.record_slots.is_some() {
+        return Ok(Some(true));
     }
     let (mut includes, rowid_slot) = payload_rowid_alias_header_verdict(
         &cursor.row_decode,
@@ -21123,25 +21123,25 @@ fn column_payload_end(col: &ColumnOffset) -> Option<usize> {
 /// Record slot that stores declared column `col_idx` of a storage cursor's
 /// row, for a column other than the INTEGER PRIMARY KEY alias itself.
 ///
-/// Columns after the alias sit one slot earlier when the payload omits it.
-/// A non-leading-PK WITHOUT ROWID table then maps the declared position to
-/// its physical slot (bd-v6pjf); the mapping is the identity when the table
-/// has no entry in `wr_storage_order`.
+/// A table with a record slot map (`StorageCursor::record_slots`: a VIRTUAL
+/// generated column before a stored one, bd-w4pr1.31, or a non-leading
+/// WITHOUT ROWID PRIMARY KEY, bd-v6pjf) reads the mapped slot; `usize::MAX`
+/// marks a column the record leaves out, which reads past the record end.
+/// Such a record always stores the alias slot, as stock's does. Otherwise
+/// columns after the alias sit one slot earlier when the payload omits it.
 fn storage_payload_column_index(
     col_idx: usize,
     ipk_col_idx: Option<usize>,
     payload_includes_rowid_alias: bool,
-    wr_storage_order: Option<&HashMap<i32, Vec<usize>>>,
-    root_page: i32,
+    record_slots: Option<&[usize]>,
 ) -> usize {
-    let payload_idx = match ipk_col_idx {
+    if let Some(slots) = record_slots {
+        return slots.get(col_idx).copied().unwrap_or(col_idx);
+    }
+    match ipk_col_idx {
         Some(ipk) if col_idx > ipk && !payload_includes_rowid_alias => col_idx - 1,
         _ => col_idx,
-    };
-    wr_storage_order
-        .and_then(|map| map.get(&root_page))
-        .and_then(|inv| inv.get(payload_idx).copied())
-        .unwrap_or(payload_idx)
+    }
 }
 
 fn row_decode_payload_end(row_decode: &RowDecodeScratch) -> Option<usize> {
@@ -21279,7 +21279,6 @@ fn try_ensure_storage_cursor_row_layout_local(
 fn try_read_column_in_place(
     cursor: &mut StorageCursor,
     col_idx: usize,
-    wr_storage_order: Option<&HashMap<i32, Vec<usize>>>,
     text_encoding: TextEncoding,
 ) -> Result<Option<SqliteValue>> {
     let Some(stamp) = cursor.cursor.position_stamp() else {
@@ -21336,12 +21335,13 @@ fn try_read_column_in_place(
     if ipk_col_idx == Some(col_idx) {
         return Ok(Some(SqliteValue::Integer(view.rowid)));
     }
+    // The record slot map (bd-w4pr1.31, bd-v6pjf) positions the column in
+    // stock's storage layout; the cursor carries it from open.
     let payload_idx = storage_payload_column_index(
         col_idx,
         ipk_col_idx,
         includes_rowid_alias,
-        wr_storage_order,
-        cursor.root_page,
+        cursor.record_slots.as_deref(),
     );
     let Some(col) = view.layout.column_offset(payload_idx) else {
         return Ok(None);
@@ -22568,6 +22568,37 @@ mod tests {
                 "unexpected diagnostic: {error}"
             );
         }
+    }
+
+    /// bd-w4pr1.31: a record slot map decides the slot. For
+    /// `t(v AS (id * 2) VIRTUAL, id INTEGER PRIMARY KEY, b)` stock's record is
+    /// `[NULL, b]`, so `b` (declared 2) is slot 1 and `v` reads past the end,
+    /// whatever the legacy omitted-alias verdict says.
+    #[test]
+    fn test_storage_payload_column_index_record_slots_decide_the_slot() {
+        let slots = [usize::MAX, 0, 1];
+        for includes in [true, false] {
+            assert_eq!(
+                storage_payload_column_index(2, Some(1), includes, Some(&slots)),
+                1
+            );
+            assert_eq!(
+                storage_payload_column_index(0, Some(1), includes, Some(&slots)),
+                usize::MAX
+            );
+        }
+        // Without a map the declared position is the slot, one earlier after
+        // an alias the payload omits (older FrankenSQLite rows).
+        assert_eq!(storage_payload_column_index(2, Some(1), true, None), 2);
+        assert_eq!(storage_payload_column_index(2, Some(1), false, None), 1);
+        assert_eq!(storage_payload_column_index(0, Some(1), false, None), 0);
+        // A non-leading WITHOUT ROWID PRIMARY KEY with a VIRTUAL column:
+        // `(a, v VIRTUAL, k PRIMARY KEY, d)` is stored `[k, a, d]`.
+        let slots = [1, usize::MAX, 0, 2];
+        let read: Vec<usize> = (0..4)
+            .map(|column| storage_payload_column_index(column, None, false, Some(&slots)))
+            .collect();
+        assert_eq!(read, vec![1, usize::MAX, 0, 2]);
     }
 
     #[test]

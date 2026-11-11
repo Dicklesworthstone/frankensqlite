@@ -411,6 +411,13 @@ impl ColumnInfo {
             conflict_action: None,
         }
     }
+
+    /// Whether this is a VIRTUAL generated column. Stock SQLite leaves such a
+    /// column out of the table record (bd-w4pr1.31).
+    #[must_use]
+    pub fn is_virtual_generated(&self) -> bool {
+        self.generated_stored == Some(false) && self.generated_expr.is_some()
+    }
 }
 
 /// Index metadata needed for codegen (index-scan SELECT).
@@ -841,6 +848,55 @@ impl TableSchema {
 
     fn resolves_to_hidden_rowid(&self, name: &str) -> bool {
         !self.without_rowid && self.column_index(name).is_none() && is_hidden_rowid_alias_name(name)
+    }
+
+    /// Declared column indices in table-record order, or `None` when the
+    /// record holds every declared column in declared order (bd-w4pr1.31).
+    ///
+    /// Stock SQLite leaves VIRTUAL generated columns out of a table record
+    /// (`sqlite3TableColumnToStorage`), and a WITHOUT ROWID record leads with
+    /// its PRIMARY KEY columns (bd-v6pjf). `omit_virtual` is false only for
+    /// MemDatabase (TEMP) rows, which keep every declared column (bd-01uq7).
+    #[must_use]
+    pub fn record_column_order(&self, omit_virtual: bool) -> Option<Vec<usize>> {
+        let n_cols = self.columns.len();
+        let omits_virtual =
+            omit_virtual && self.columns.iter().any(ColumnInfo::is_virtual_generated);
+        let mut order = if self.without_rowid {
+            let pk_indices = without_rowid_pk_indices(self).unwrap_or_default();
+            if !omits_virtual && without_rowid_pk_is_leading(&pk_indices, n_cols) {
+                return None;
+            }
+            without_rowid_storage_order(&pk_indices, n_cols)
+        } else if omits_virtual {
+            (0..n_cols).collect()
+        } else {
+            return None;
+        };
+        if omits_virtual {
+            order.retain(|&declared| !self.columns[declared].is_virtual_generated());
+        }
+        let identity =
+            order.len() == n_cols && order.iter().enumerate().all(|(slot, &d)| slot == d);
+        (!identity).then_some(order)
+    }
+
+    /// Record slot of each declared column, `usize::MAX` for a column the
+    /// record leaves out. `None` when every stored column sits at its declared
+    /// position, i.e. the record order is a prefix of declared order: reads by
+    /// declared position are then already correct, and a trailing omitted
+    /// column reads past the record end.
+    #[must_use]
+    pub fn record_slot_map(&self, omit_virtual: bool) -> Option<Vec<usize>> {
+        let order = self.record_column_order(omit_virtual)?;
+        if order.iter().enumerate().all(|(slot, &d)| slot == d) {
+            return None;
+        }
+        let mut slots = vec![usize::MAX; self.columns.len()];
+        for (slot, &declared) in order.iter().enumerate() {
+            slots[declared] = slot;
+        }
+        Some(slots)
     }
 }
 
@@ -5289,7 +5345,7 @@ fn codegen_select_without_rowid_pk_lookup(
 ///    re-applied per row so the residual stays enforced.
 ///
 /// The probe record is built in [`without_rowid_pk_indices`] order (PRIMARY KEY
-/// declared order), matching the physical key `emit_wr_record` stores and the
+/// declared order), matching the physical key `emit_table_row_record` stores and the
 /// `NoConflict` probe `emit_without_rowid_index_to_table_seek` already uses on
 /// the WR upsert / index-to-table paths. Each field takes its PK column's
 /// affinity so an integer key probed by text `'5'` (or the reverse) still hits.
@@ -24275,14 +24331,9 @@ pub fn codegen_insert(
                 P4::Affinity(aff_str.clone()),
                 0,
             );
-            b.emit_op(
-                Opcode::MakeRecord,
-                col_regs,
-                n_cols,
-                rec_reg,
-                make_insert_record_p4(table, &aff_str),
-                0,
-            );
+            emit_table_row_record(b, table, col_regs, rec_reg, &aff_str, || {
+                make_insert_record_p4(table, &aff_str)
+            });
             b.emit_op(
                 Opcode::Insert,
                 table_cursor,
@@ -24802,14 +24853,9 @@ fn emit_upsert_do_update_apply(
     }
 
     let update_rec = b.alloc_reg();
-    b.emit_op(
-        Opcode::MakeRecord,
-        existing_regs,
-        n_cols_i32,
-        update_rec,
-        make_insert_record_p4(table, aff_str),
-        0,
-    );
+    emit_table_row_record(b, table, existing_regs, update_rec, aff_str, || {
+        make_insert_record_p4(table, aff_str)
+    });
     // bd-sque1: the DO UPDATE apply is semantically an UPDATE, so its re-insert
     // must ABORT — not REPLACE — on a uniqueness conflict. The conflict victim
     // was already deleted above, so a same-key upsert never collides; ABORT
@@ -25191,7 +25237,6 @@ fn codegen_insert_values(
             let insert_p4 = emit_table_insert_record(
                 b,
                 val_regs,
-                n_cols_i32,
                 rec_reg,
                 table,
                 &aff_str,
@@ -25227,7 +25272,6 @@ fn codegen_insert_values(
             let insert_p4 = emit_table_insert_record(
                 b,
                 val_regs,
-                n_cols_i32,
                 rec_reg,
                 table,
                 &aff_str,
@@ -25257,7 +25301,6 @@ fn codegen_insert_values(
 fn emit_table_insert_record(
     b: &mut ProgramBuilder,
     source_regs: i32,
-    column_count: i32,
     target_reg: i32,
     table: &TableSchema,
     affinity: &str,
@@ -25268,14 +25311,9 @@ fn emit_table_insert_record(
         // INSERT can consume the baked row image directly from P4.
         P4::Blob(record.to_vec())
     } else {
-        b.emit_op(
-            Opcode::MakeRecord,
-            source_regs,
-            column_count,
-            target_reg,
-            make_insert_record_p4(table, affinity),
-            0,
-        );
+        emit_table_row_record(b, table, source_regs, target_reg, affinity, || {
+            make_insert_record_p4(table, affinity)
+        });
         P4::Table(table.name.clone())
     }
 }
@@ -25665,14 +25703,9 @@ fn codegen_insert_select(
     );
 
     // MakeRecord from the read column values.
-    b.emit_op(
-        Opcode::MakeRecord,
-        final_regs,
-        final_n_cols,
-        rec_reg,
-        make_insert_record_p4(target_table, &aff_str),
-        0,
-    );
+    emit_table_row_record(b, target_table, final_regs, rec_reg, &aff_str, || {
+        make_insert_record_p4(target_table, &aff_str)
+    });
 
     // Insert into target table.
     b.emit_op(
@@ -25912,14 +25945,9 @@ fn codegen_insert_select_without_from(
         0,
     );
 
-    b.emit_op(
-        Opcode::MakeRecord,
-        final_regs,
-        final_n_cols,
-        rec_reg,
-        make_insert_record_p4(target_table, &aff_str),
-        0,
-    );
+    emit_table_row_record(b, target_table, final_regs, rec_reg, &aff_str, || {
+        make_insert_record_p4(target_table, &aff_str)
+    });
 
     b.emit_op(
         Opcode::Insert,
@@ -26619,14 +26647,7 @@ pub fn codegen_update(
         P4::Affinity(aff_str.clone()),
         0,
     );
-    b.emit_op(
-        Opcode::MakeRecord,
-        col_regs,
-        n_cols_i32,
-        rec_reg,
-        P4::Affinity(aff_str),
-        0,
-    );
+    emit_table_row_record(b, table, col_regs, rec_reg, &aff_str, || P4::Affinity(aff_str.clone()));
 
     // Moving an INTEGER PRIMARY KEY uses that constraint's own algorithm
     // unless the statement overrides it. Other constraints resolve separately.
@@ -27690,14 +27711,7 @@ fn codegen_update_from(
         P4::Affinity(aff_str.clone()),
         0,
     );
-    b.emit_op(
-        Opcode::MakeRecord,
-        col_regs,
-        n_cols_i32,
-        rec_reg,
-        P4::Affinity(aff_str),
-        0,
-    );
+    emit_table_row_record(b, target, col_regs, rec_reg, &aff_str, || P4::Affinity(aff_str.clone()));
 
     // UPDATE FROM resolves a moved rowid like the plain UPDATE lane.
     let oe_flag = effective_rowid_oe(target, stmt.or_conflict);
@@ -28753,8 +28767,9 @@ fn emit_without_rowid_index_to_table_seek(
 ///
 /// Returns the declared table-column index of each PK column. Errors only if
 /// the table has no PRIMARY KEY. Non-leading / reordered PRIMARY KEYs are
-/// supported: the record is stored physically PK-leading (see `emit_wr_record`)
-/// and the table cursor remaps reads back to declared order.
+/// supported: the record is stored physically PK-leading (see
+/// `emit_table_row_record`) and the table cursor remaps reads back to declared
+/// order.
 pub fn without_rowid_pk_indices(table: &TableSchema) -> Result<Vec<usize>, CodegenError> {
     let pk_group = table.primary_key_constraints.first().ok_or_else(|| {
         CodegenError::Unsupported(format!(
@@ -28778,67 +28793,90 @@ pub fn without_rowid_pk_indices(table: &TableSchema) -> Result<Vec<usize>, Codeg
             })?;
         indices.push(idx);
     }
-    // Storage is physically PK-leading (emit_wr_record reorders on write, the
-    // table cursor remaps on read), so a non-leading / reordered PRIMARY KEY is
+    // Storage is physically PK-leading (emit_table_row_record reorders on write,
+    // the table cursor remaps on read), so a non-leading / reordered PRIMARY KEY is
     // fully representable — no ordering restriction here.
     Ok(indices)
 }
 
-/// Emit the WITHOUT ROWID row record for `val_regs..val_regs+n_cols` (declared
-/// order), physically reordered PK-leading — the PRIMARY KEY columns in PK
-/// order, then the remaining columns in declared order — to match C SQLite's
-/// on-disk WITHOUT ROWID record layout. Returns the record register.
+/// Emit the table-row record for the declared-order value registers
+/// `val_regs..val_regs+n_cols` into `rec_reg`, in stock SQLite's storage
+/// layout (bd-w4pr1.31): VIRTUAL generated columns are left out, and a WITHOUT
+/// ROWID record leads with its PRIMARY KEY columns in PK order, then the rest
+/// in declared order (bd-v6pjf). MemDatabase (TEMP) rows keep every declared
+/// column, with the VIRTUAL values materialized (bd-01uq7).
 ///
-/// For a leading-PK table the permutation is the identity, so this emits a
-/// plain `MakeRecord` with no extra ops — byte-identical to the pre-reorder
-/// path, keeping golden bytecode snapshots unchanged for the common shape.
+/// `declared_p4` is the `MakeRecord` P4 for a record holding every column in
+/// declared order. That shape (every ordinary table, every leading-PK WITHOUT
+/// ROWID table) emits exactly that one `MakeRecord`, so its bytecode is
+/// unchanged. A record that leaves a column out re-applies the stored columns'
+/// affinity on the record's own register range just before `MakeRecord`, where
+/// the insert JIT (`jit::find_affinity`) looks for it.
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-fn emit_wr_record(
+fn emit_table_row_record(
     b: &mut ProgramBuilder,
-    pk_indices: &[usize],
+    table: &TableSchema,
     val_regs: i32,
-    n_cols: usize,
+    rec_reg: i32,
     aff_str: &str,
-) -> i32 {
-    let rec_reg = b.alloc_reg();
-    if without_rowid_pk_is_leading(pk_indices, n_cols) {
+    declared_p4: impl FnOnce() -> P4,
+) {
+    let n_cols = table.columns.len();
+    let omit_virtual = !b.materializes_virtual_generated(table.root_page);
+    let Some(order) = table.record_column_order(omit_virtual) else {
         b.emit_op(
             Opcode::MakeRecord,
             val_regs,
             n_cols as i32,
             rec_reg,
-            P4::Affinity(aff_str.to_owned()),
+            declared_p4(),
             0,
         );
-        return rec_reg;
-    }
-    // Non-leading PK: copy the declared-order value registers into a fresh
-    // contiguous block in physical (PK-leading) order, and reorder the
-    // per-column affinity string to match, before serializing.
-    let perm = without_rowid_storage_order(pk_indices, n_cols);
-    let phys_regs = b.alloc_regs(n_cols as i32);
+        return;
+    };
+    let n_stored = order.len() as i32;
     let aff_bytes = aff_str.as_bytes();
-    let mut phys_aff = String::with_capacity(n_cols);
-    for (phys_slot, &decl_col) in perm.iter().enumerate() {
+    let record_aff: String = order
+        .iter()
+        .map(|&declared| aff_bytes.get(declared).map_or('A', |&c| c as char))
+        .collect();
+    let record_regs = if order.iter().enumerate().all(|(slot, &d)| slot == d) {
+        // Only trailing columns are left out: the record is a register prefix.
+        val_regs
+    } else {
+        // Copy the declared-order registers into a contiguous block in record
+        // order before serializing.
+        let record_regs = b.alloc_regs(n_stored);
+        for (slot, &declared) in order.iter().enumerate() {
+            b.emit_op(
+                Opcode::Copy,
+                val_regs + declared as i32,
+                record_regs + slot as i32,
+                0,
+                P4::None,
+                0,
+            );
+        }
+        record_regs
+    };
+    if order.len() < n_cols {
         b.emit_op(
-            Opcode::Copy,
-            val_regs + decl_col as i32,
-            phys_regs + phys_slot as i32,
+            Opcode::Affinity,
+            record_regs,
+            n_stored,
             0,
-            P4::None,
+            P4::Affinity(record_aff.clone()),
             0,
         );
-        phys_aff.push(aff_bytes.get(decl_col).map_or('A', |&c| c as char));
     }
     b.emit_op(
         Opcode::MakeRecord,
-        phys_regs,
-        n_cols as i32,
+        record_regs,
+        n_stored,
         rec_reg,
-        P4::Affinity(phys_aff),
+        P4::Affinity(record_aff),
         0,
     );
-    rec_reg
 }
 
 /// Human-readable PK label for UNIQUE-violation error messages.
@@ -29043,7 +29081,6 @@ fn emit_without_rowid_update_rewrite(
     stmt_level: Option<ConflictAction>,
     row_done: Label,
 ) {
-    let n_cols = table.columns.len();
     let n_pk = pk_indices.len();
     let pk_label = without_rowid_pk_label(table, pk_indices);
     let aff_str = table.affinity_string();
@@ -29374,7 +29411,8 @@ fn emit_without_rowid_update_rewrite(
 
     // PHASE C: insert NEW. Every conflicting row has been resolved above, so
     // this insert must not itself REPLACE.
-    let rec_reg = emit_wr_record(b, pk_indices, new_regs, n_cols, &aff_str);
+    let rec_reg = b.alloc_reg();
+    emit_table_row_record(b, table, new_regs, rec_reg, &aff_str, || P4::Affinity(aff_str.clone()));
     b.emit_op(
         Opcode::IdxInsert,
         table_cursor,
@@ -29725,7 +29763,8 @@ fn emit_without_rowid_row_insert(
         emit_victim_delete(b, victim_flag, victim_pk_regs);
     }
 
-    let rec_reg = emit_wr_record(b, pk_indices, val_regs, n_cols, &aff_str);
+    let rec_reg = b.alloc_reg();
+    emit_table_row_record(b, table, val_regs, rec_reg, &aff_str, || P4::Affinity(aff_str.clone()));
     b.emit_op(
         Opcode::IdxInsert,
         table_cursor,
@@ -30122,7 +30161,10 @@ fn emit_without_rowid_upsert_do_update_apply(
         P4::Affinity(aff_str.clone()),
         0,
     );
-    let rec_reg = emit_wr_record(b, pk_indices, existing_regs, n_cols, &aff_str);
+    let rec_reg = b.alloc_reg();
+    emit_table_row_record(b, table, existing_regs, rec_reg, &aff_str, || {
+        P4::Affinity(aff_str.clone())
+    });
     b.emit_op(
         Opcode::IdxInsert,
         table_cursor,
@@ -31777,16 +31819,18 @@ fn emit_stored_generated_columns(b: &mut ProgramBuilder, table: &TableSchema, va
                 b.emit_op(Opcode::Null, 0, dest_reg, 0, P4::None, 0);
             }
         } else {
-            // VIRTUAL: not stored in the record; set NULL as placeholder.
-            // The real value is computed on read (bd-r3303,
+            // VIRTUAL: left out of the table record, as stock does
+            // (bd-w4pr1.31, emit_table_row_record), so its register only holds
+            // NULL. The real value is computed on read (bd-r3303,
             // virtual_generated_column_expr).
             b.emit_op(Opcode::Null, 0, dest_reg, 0, P4::None, 0);
         }
     }
-    // bd-01uq7: a MemDatabase row is also its own UNIQUE index, so fill its
-    // VIRTUAL placeholders with the computed values. Register-context reads of
-    // a VIRTUAL column always re-expand its expression, so the order of these
-    // writes cannot change any value computed above or below.
+    // bd-01uq7: a MemDatabase row is also its own UNIQUE index and keeps every
+    // declared column, so fill its VIRTUAL slots with the computed values.
+    // Register-context reads of a VIRTUAL column always re-expand its
+    // expression, so the order of these writes cannot change any value
+    // computed above or below.
     if b.materializes_virtual_generated(table.root_page) {
         let gen_ctx = ScanCtx {
             cursor: 0,
@@ -32074,9 +32118,10 @@ fn emit_not_null_constraints(
     for (col_idx, col) in table.columns.iter().enumerate() {
         if (col.notnull || wr_pk.contains(&col_idx)) && !col.is_ipk {
             let reg = if let Some(expr) = virtual_generated_column_expr(col) {
-                // VIRTUAL columns retain a NULL record placeholder. Evaluate
-                // their value in scratch storage for the constraint, just as
-                // CHECK and index expressions resolve virtual column reads.
+                // A VIRTUAL column's register holds NULL (the record leaves
+                // it out). Evaluate its value in scratch storage for the
+                // constraint, just as CHECK and index expressions resolve
+                // virtual column reads.
                 let scratch = b.alloc_reg();
                 let gen_ctx = ScanCtx {
                     cursor: 0,
@@ -32406,9 +32451,11 @@ fn register_table_index_meta(b: &mut ProgramBuilder, table: &TableSchema, table_
             let cursor_id = table_cursor + 1 + idx_offset as i32;
             // Direct, non-partial column indexes can reconstruct their exact
             // key from the victim table payload. Partial and expression
-            // indexes cannot: an empty list tells the engine to locate the
-            // victim entry by its trailing rowid instead.
-            let column_indices = if index.supports_replace_cleanup_meta() {
+            // indexes cannot, and neither can a key over a VIRTUAL generated
+            // column, which the payload leaves out (bd-w4pr1.31): an empty
+            // list tells the engine to locate the victim entry by its trailing
+            // rowid instead.
+            let column_indices: Vec<usize> = if index.supports_replace_cleanup_meta() {
                 index
                     .columns
                     .iter()
@@ -32416,6 +32463,14 @@ fn register_table_index_meta(b: &mut ProgramBuilder, table: &TableSchema, table_
                     .collect()
             } else {
                 Vec::new()
+            };
+            let column_indices = if column_indices
+                .iter()
+                .any(|&column| table.columns[column].is_virtual_generated())
+            {
+                Vec::new()
+            } else {
+                column_indices
             };
             IndexCursorMeta {
                 cursor_id,
@@ -63786,6 +63841,276 @@ mod tests {
         assert!(
             !ops.contains(&Opcode::Multiply),
             "VIRTUAL generated column should not evaluate expression during INSERT"
+        );
+        // bd-w4pr1.31: the trailing VIRTUAL column is left out of the record,
+        // as stock's `MakeRecord(regData, pTab->nNVCol)` leaves it out.
+        let record = table_row_make_record(prog.ops());
+        assert_eq!(record.p2, 2, "the record holds only a and b: {:?}", prog.ops());
+        assert_eq!(record.p4, P4::Affinity("dd".to_owned()));
+    }
+
+    /// The `MakeRecord` that builds the row the `Insert` into table `t` writes.
+    fn table_row_make_record(ops: &[VdbeOp]) -> &VdbeOp {
+        let insert = ops
+            .iter()
+            .find(|op| op.opcode == Opcode::Insert && op.p4 == P4::Table("t".to_owned()))
+            .unwrap_or_else(|| panic!("program must insert a row into t: {ops:?}"));
+        ops.iter()
+            .find(|op| op.opcode == Opcode::MakeRecord && op.p3 == insert.p2)
+            .unwrap_or_else(|| panic!("the inserted record must come from MakeRecord: {ops:?}"))
+    }
+
+    fn generated_test_column(name: &str, affinity: char, expr: &str, stored: bool) -> ColumnInfo {
+        let mut column = ColumnInfo::basic(name, affinity, false);
+        column.generated_expr = Some(expr.to_owned());
+        column.generated_stored = Some(stored);
+        column
+    }
+
+    fn generated_test_table(columns: Vec<ColumnInfo>, primary_key: Option<&str>) -> TableSchema {
+        TableSchema {
+            name: "t".to_owned(),
+            root_page: 2,
+            columns,
+            indexes: vec![],
+            strict: false,
+            without_rowid: primary_key.is_some(),
+            primary_key_constraints: primary_key
+                .map(|name| vec![vec![name.to_owned()]])
+                .unwrap_or_default(),
+            foreign_keys: Vec::new(),
+            check_constraints: Vec::new(),
+        }
+    }
+
+    /// `t(id INTEGER PRIMARY KEY, a TEXT, v INTEGER AS (length(a)) VIRTUAL,
+    /// c TEXT, s TEXT AS (a || c) STORED, d TEXT)`: stock's record is
+    /// `[id, a, c, s, d]`.
+    fn virtual_before_stored_test_table() -> TableSchema {
+        generated_test_table(
+            vec![
+                ColumnInfo::basic("id", 'D', true),
+                ColumnInfo::basic("a", 'B', false),
+                generated_test_column("v", 'D', "length(a)", false),
+                ColumnInfo::basic("c", 'B', false),
+                generated_test_column("s", 'B', "a || c", true),
+                ColumnInfo::basic("d", 'B', false),
+            ],
+            None,
+        )
+    }
+
+    /// bd-w4pr1.31: the record order and slot map for every table shape.
+    #[test]
+    fn test_record_column_order_and_record_slot_map_per_table_shape() {
+        const OUT: usize = usize::MAX;
+
+        // Every column in declared order: no order, no map, for main and TEMP.
+        let plain = test_schema().remove(0);
+        for omit_virtual in [true, false] {
+            assert_eq!(plain.record_column_order(omit_virtual), None);
+            assert_eq!(plain.record_slot_map(omit_virtual), None);
+        }
+        // A STORED generated column is part of the record.
+        let stored = test_schema_with_stored_generated().remove(0);
+        assert_eq!(stored.record_column_order(true), None);
+        assert_eq!(stored.record_slot_map(true), None);
+
+        // Only a trailing VIRTUAL column: the record is a declared prefix, so
+        // reads by declared position need no map.
+        let trailing = test_schema_with_virtual_generated().remove(0);
+        assert_eq!(trailing.record_column_order(true), Some(vec![0, 1]));
+        assert_eq!(trailing.record_slot_map(true), None);
+        assert_eq!(trailing.record_column_order(false), None);
+
+        // A VIRTUAL column before stored ones shifts every later slot; a TEMP
+        // (MemDatabase) row keeps every declared column.
+        let table = virtual_before_stored_test_table();
+        assert_eq!(table.record_column_order(true), Some(vec![0, 1, 3, 4, 5]));
+        assert_eq!(table.record_slot_map(true), Some(vec![0, 1, OUT, 2, 3, 4]));
+        assert_eq!(table.record_column_order(false), None);
+        assert_eq!(table.record_slot_map(false), None);
+
+        // The rowid alias after a VIRTUAL column keeps its NULL slot.
+        let mut ipk = ColumnInfo::basic("id", 'D', true);
+        ipk.type_name = Some("INTEGER".to_owned());
+        let ipk_after = generated_test_table(
+            vec![
+                generated_test_column("v", 'D', "id * 2", false),
+                ipk,
+                ColumnInfo::basic("b", 'B', false),
+            ],
+            None,
+        );
+        assert_eq!(ipk_after.record_column_order(true), Some(vec![1, 2]));
+        assert_eq!(ipk_after.record_slot_map(true), Some(vec![OUT, 0, 1]));
+
+        // WITHOUT ROWID: the PRIMARY KEY first, then the rest in declared
+        // order, VIRTUAL columns left out.
+        let without_rowid = generated_test_table(
+            vec![
+                ColumnInfo::basic("a", 'B', false),
+                generated_test_column("v", 'D', "length(a)", false),
+                ColumnInfo::basic("k", 'B', false),
+                ColumnInfo::basic("d", 'B', false),
+                generated_test_column("s", 'B', "a || d", true),
+            ],
+            Some("k"),
+        );
+        assert_eq!(without_rowid.record_column_order(true), Some(vec![2, 0, 3, 4]));
+        assert_eq!(without_rowid.record_slot_map(true), Some(vec![1, OUT, 0, 2, 3]));
+        assert_eq!(without_rowid.record_column_order(false), Some(vec![2, 0, 1, 3, 4]));
+        assert_eq!(without_rowid.record_slot_map(false), Some(vec![1, 2, 0, 3, 4]));
+
+        // A leading PRIMARY KEY with no VIRTUAL column is the identity; with a
+        // trailing VIRTUAL column the record is a declared prefix.
+        let leading = generated_test_table(
+            vec![
+                ColumnInfo::basic("k", 'B', false),
+                ColumnInfo::basic("d", 'B', false),
+            ],
+            Some("k"),
+        );
+        assert_eq!(leading.record_column_order(true), None);
+        let leading_trailing = generated_test_table(
+            vec![
+                ColumnInfo::basic("k", 'B', false),
+                ColumnInfo::basic("d", 'B', false),
+                generated_test_column("v", 'D', "length(d)", false),
+            ],
+            Some("k"),
+        );
+        assert_eq!(leading_trailing.record_column_order(true), Some(vec![0, 1]));
+        assert_eq!(leading_trailing.record_slot_map(true), None);
+    }
+
+    /// An ordinary table keeps exactly the one declared `MakeRecord`, so its
+    /// bytecode is unchanged by bd-w4pr1.31.
+    #[test]
+    fn test_record_column_order_none_emits_only_the_declared_make_record() {
+        let table = test_schema().remove(0);
+        let mut b = ProgramBuilder::new();
+        let rec_reg = b.alloc_reg();
+        let val_regs = b.alloc_regs(2);
+        emit_table_row_record(&mut b, &table, val_regs, rec_reg, "dC", || {
+            P4::Affinity("declared".to_owned())
+        });
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let prog = b.finish().unwrap();
+        assert_eq!(
+            prog.ops()[..prog.ops().len() - 1],
+            [VdbeOp {
+                opcode: Opcode::MakeRecord,
+                p1: val_regs,
+                p2: 2,
+                p3: rec_reg,
+                p4: P4::Affinity("declared".to_owned()),
+                p5: 0,
+            }]
+        );
+    }
+
+    /// bd-w4pr1.31: INSERT, UPDATE and REPLACE build stock's record for a
+    /// VIRTUAL column before stored ones: the stored columns, copied into a
+    /// contiguous block in record order, their affinity applied on that block
+    /// just before `MakeRecord`. A TEMP (MemDatabase) table keeps every
+    /// declared column.
+    #[test]
+    fn test_codegen_virtual_before_stored_record_leaves_virtual_out() {
+        let mut source = test_schema().remove(0);
+        source.name = "src".to_owned();
+        source.root_page = 3;
+        source.columns.push(ColumnInfo::basic("c", 'B', false));
+        let schema = vec![virtual_before_stored_test_table(), source];
+        for sql in [
+            "INSERT INTO t(a, c, d) VALUES (?1, ?2, ?3)",
+            "INSERT INTO t(a, c, d) SELECT a, b, c FROM src",
+            "INSERT INTO t(a, c, d) SELECT 'a', 'c', 'd'",
+            "REPLACE INTO t(id, a, c, d) VALUES (5, 'a', 'c', 'd')",
+            "UPDATE t SET c = c || 'x'",
+        ] {
+            for temp in [false, true] {
+                let Some((statement, _)) =
+                    parse_first_statement_with_tail(sql).expect("test SQL should parse")
+                else {
+                    unreachable!("expected parsed statement");
+                };
+                let mut b = ProgramBuilder::new();
+                if temp {
+                    b.set_materialized_virtual_generated_roots([2]);
+                }
+                let ctx = CodegenContext::default();
+                match statement {
+                    Statement::Insert(stmt) => codegen_insert(&mut b, &stmt, &schema, &ctx),
+                    Statement::Update(stmt) => codegen_update(&mut b, &stmt, &schema, &ctx),
+                    other => panic!("unexpected statement {other:?}"),
+                }
+                .unwrap_or_else(|e| panic!("`{sql}` should compile: {e}"));
+                let prog = b.finish().unwrap();
+                let ops = prog.ops();
+                let record = table_row_make_record(ops);
+                if temp {
+                    assert_eq!(record.p2, 6, "`{sql}` TEMP row keeps every column: {ops:?}");
+                    continue;
+                }
+                assert_eq!(record.p2, 5, "`{sql}` record is [id, a, c, s, d]: {ops:?}");
+                assert_eq!(record.p4, P4::Affinity("XBBBB".to_owned()));
+                let at = ops.iter().position(|op| std::ptr::eq(op, record)).unwrap();
+                let affinity = &ops[at - 1];
+                assert_eq!(
+                    (affinity.opcode, affinity.p1, affinity.p2, &affinity.p4),
+                    (Opcode::Affinity, record.p1, 5, &P4::Affinity("XBBBB".to_owned())),
+                    "`{sql}` re-applies the stored affinity on the record block: {ops:?}"
+                );
+                // Each record slot is copied from its declared column's register.
+                let sources: Vec<i32> = (0..5)
+                    .map(|slot| {
+                        ops[..at]
+                            .iter()
+                            .rev()
+                            .find(|op| op.opcode == Opcode::Copy && op.p2 == record.p1 + slot)
+                            .unwrap_or_else(|| panic!("`{sql}` copies slot {slot}: {ops:?}"))
+                            .p1
+                    })
+                    .collect();
+                let declared: Vec<i32> = sources.iter().map(|src| src - sources[0]).collect();
+                assert_eq!(declared, vec![0, 1, 3, 4, 5], "`{sql}`: {ops:?}");
+            }
+        }
+    }
+
+    /// bd-w4pr1.31: the insert JIT still finds the record's affinity once the
+    /// record leaves a VIRTUAL column out, so a bound '5' for the INTEGER
+    /// column after it is still stored as an integer.
+    #[test]
+    fn test_codegen_insert_virtual_before_stored_jit_template_keeps_affinity() {
+        let schema = vec![generated_test_table(
+            vec![
+                ColumnInfo::basic("a", 'B', false),
+                generated_test_column("v", 'D', "length(a)", false),
+                ColumnInfo::basic("n", 'D', false),
+            ],
+            None,
+        )];
+        let sql = "INSERT INTO t(a, n) VALUES (?1, ?2)";
+        let Some((Statement::Insert(stmt), _)) =
+            parse_first_statement_with_tail(sql).expect("test SQL should parse")
+        else {
+            unreachable!("expected an INSERT");
+        };
+        let mut b = ProgramBuilder::new();
+        codegen_insert(&mut b, &stmt, &schema, &CodegenContext::default()).unwrap();
+        let prog = b.finish().unwrap();
+        let template = crate::jit::try_compile_insert(prog.ops())
+            .unwrap_or_else(|| panic!("the INSERT should compile: {:?}", prog.ops()));
+        assert_eq!(template.num_cols, 2, "the record is [a, n]");
+        assert_eq!(template.affinity.as_deref(), Some("BD"));
+        assert_eq!(
+            template.value_sources,
+            [
+                crate::jit::InsertValueSource::Binding(0),
+                crate::jit::InsertValueSource::Binding(1),
+            ]
         );
     }
 

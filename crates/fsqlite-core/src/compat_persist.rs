@@ -1366,8 +1366,11 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
             // `MemDatabase` holds the row in DECLARED order, so reorder each row
             // to physical order before it becomes the b-tree key and the
             // serialized record. Leading-PK tables give the identity permutation
-            // (physical == declared), so this is a no-op for them.
-            let storage_order = without_rowid_storage_order(&pk.indices, table.columns.len());
+            // (physical == declared), so this is a no-op for them. bd-w4pr1.31:
+            // the record leaves VIRTUAL generated columns out, as stock's does.
+            let mut storage_order = without_rowid_storage_order(&pk.indices, table.columns.len());
+            storage_order
+                .retain(|&declared_idx| !table.columns[declared_idx].is_virtual_generated());
             let mut pk_rows: Vec<Vec<SqliteValue>> = mem_table
                 .iter_rows()
                 .map(|(_synthetic_rowid, values)| {
@@ -1417,8 +1420,27 @@ async fn persist_to_sqlite_with_header_and_master_entries_impl<S: BuildHasher>(
                 true,
             );
             configure_btree_cursor_page_size(&mut cursor, usable_size, full_page_size);
+            // bd-w4pr1.31: the record leaves VIRTUAL generated columns out, as
+            // stock's does. `MemDatabase` holds every declared column.
+            let has_virtual = table.columns.iter().any(ColumnInfo::is_virtual_generated);
+            let mut stored_values = Vec::new();
             for (rowid, values) in mem_table.iter_rows() {
-                let payload = serialize_record_with_encoding(values, header_template.text_encoding);
+                let record_values = if has_virtual {
+                    stored_values.clear();
+                    stored_values.extend(
+                        table
+                            .columns
+                            .iter()
+                            .zip(values)
+                            .filter(|(column, _)| !column.is_virtual_generated())
+                            .map(|(_, value)| value.clone()),
+                    );
+                    stored_values.as_slice()
+                } else {
+                    values
+                };
+                let payload =
+                    serialize_record_with_encoding(record_values, header_template.text_encoding);
                 cursor.table_insert(cx, rowid, &payload).await?;
             }
         }
