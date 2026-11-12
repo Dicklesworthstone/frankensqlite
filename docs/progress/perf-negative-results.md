@@ -211,6 +211,71 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
   needs its own bead and statement-atomicity keepers (a failing row of a multi-row INSERT, a
   constraint failure under OR FAIL / OR ABORT / OR ROLLBACK, a trigger that fails after the row).
 
+## 2026-11-12 - WIN: a join's automatic index stages its entries and is built from them in one pass (bd-w4pr1.13.15)
+
+- Target: the automatic index of an unindexed equi-join (`emit_join_autoindex`). Touched:
+  `crates/fsqlite-vdbe/src/codegen.rs` (`emit_join_autoindex`, `OPFLAG_STAGED_BUILD`),
+  `crates/fsqlite-vdbe/src/engine.rs` (`StagedIndexBuild`, `build_staged_index`, IdxInsert,
+  IdxBulkLoad with P3 = P1), `crates/fsqlite-btree/src/cursor.rs` (`compare_index_records`,
+  `record_leading_integer`).
+- Evidence before: building the index was 107.8M of the 5k x 5k join's 203.5M (callgrind, main
+  9fb65c851): inserts in table order each sought from the root, 162 three-sibling balances. The
+  sorter-built version (entry below) removed that cost but held about 160 bytes per entry.
+- Change: OpenAutoindex P5 0x02 opens the index for a staged build. A plain IdxInsert appends the
+  record to one arena (bytes plus an end offset). IdxBulkLoad with P3 = P1, emitted once the right
+  table is read, sorts record indices with `BtCursor::compare_index_records` (the index's own
+  comparator; differing INTEGER leading terms compare as i64, DESC reversed). Strictly ascending
+  records go to `index_bulk_load_sorted_keys`; otherwise they are inserted one at a time in sorted
+  order. The build never declines or jumps; an insert with other index semantics builds first.
+- Result, stock sqlite3 3.46.1 live (ring refused, 3 runs, repeatable to the instruction; binaries
+  49c79cdb... main 9ca28495e, 2d4d0fd9... lever a12d6e804; answers equal):
+
+  | statement | stock | main | lever |
+  |---|---|---|---|
+  | `count(*) FROM v1 JOIN v2 ON v1.k = v2.k` (5k x 5k) | 26.0M | 180.1M (6.94x) | 110.8M (4.27x) |
+  | `count(*) FROM u JOIN u AS u2 ON u.name = u2.name` (TEXT, 1k) | 7.0M | 30.0M | 29.0M |
+  | `count(*), sum(p.k) FROM v1 JOIN p ON p.k = v1.x` (200k-entry index) | 890.4M | 5,710.0M (6.41x) | 2,089.2M (2.35x) |
+  | scan_filter_agg | 498.7M | 1,355.5M | 1,355.5M |
+
+  CPU on the 200k-entry join 491.8 -> 137.7 ms against stock's 177.4 (0.78x stock); on the 5k join
+  17.9 -> 10.9 ms. Peak RSS on the 200k-entry join (3 runs, `/usr/bin/time -f %M`): main 44.8-46.8 MB,
+  lever 39.6-40.4 MB (the bulk layout fills its pages). Prediction: 5k join 85-105M (missed,
+  110.8M), 200k index 1,300-1,700M (missed, 2,089M), TEXT control 18-23M (missed: TEXT keys
+  still decode on every sort comparison); kill under -60M on the 5k join or RSS over 1.5x: not met.
+- Tests: `test_compare_index_records_sorts_keys_into_the_order_inserts_build` (600 keys of every
+  storage class: the comparator's sort equals the scan of an index built by inserting them,
+  ASC/DESC x BINARY/NOCASE, antisymmetric);
+  `test_codegen_join_autoindex_is_staged_and_built_in_one_pass`;
+  `unindexed_equi_join_index_built_in_one_pass_matches_sqlite` (400 x 900 mixed keys under BINARY
+  and NOCASE, an empty and a one-row right table, an INSERT OR IGNORE ... SELECT over the join
+  with UNIQUE conflicts; UTF-8 and UTF-16le, memory and file, ad hoc and prepared). Gate on the
+  uncommitted tree (main 9ca28495e + lever): clippy -D warnings with all targets on fsqlite-btree,
+  -vdbe and -core clean; fsqlite-btree lib 550 pass; fsqlite-vdbe lib 1,235 pass and 2 fail (bd-bhalc,
+  red on main), goldens 8 pass; 21 fsqlite-core join / DISTINCT / IN / index targets pass but
+  gh497's typed membership test (red on main, bd-xz5f4); the 22 plan-pinning targets pass but
+  `bd_group_by_depth_oracle_probe` (red on main, bd-gazf2). Again on the lever rebased onto main
+  f2cfaaba4 (with the one-pass UPDATE): clippy -D warnings on fsqlite-vdbe and -core clean;
+  fsqlite-vdbe lib 1,236 pass and the 2 bd-bhalc fails, goldens 8 pass;
+  `join_composite_index_lookup_oracle`, `join_aggregate_lookup_oracle`, `one_pass_delete_oracle`,
+  `join_typeless_affinity_oracle` pass.
+- Retry condition: none. Still open: TEXT and REAL keys pay a full record decode per sort
+  comparison (a leading-text fast compare would take the TEXT control's build from about 11M to
+  under 3M); the probes are 9.3k each against stock's 1k (page load 828, cell parse 105, loop 126).
+
+## 2026-11-12 - REJECTED: a join's automatic index built by the general sorter and IdxBulkLoad (bd-w4pr1.13.15)
+
+- Target: as above. Touched (reverted): `crates/fsqlite-vdbe/src/codegen.rs`.
+- Candidate (1733bc66b, reverted on its clone branch; never on main): each `(key, rowid)` entry
+  into a sorter on both terms, then SorterSort and IdxBulkLoad (the CREATE INDEX build), with a
+  SorterData / IdxInsert loop when the bulk build declines.
+- Result, stock sqlite3 3.46.1 live against main 9fb65c851: 5k x 5k join 200.7M -> 101.7M; TEXT
+  self-join 29.9M -> 18.6M; 200k-entry index 6,359M -> 1,351M (CPU 570 -> 179 ms, stock 170).
+  Peak RSS on the 200k-entry index 45.3-46.7 MB -> 78.0-79.1 MB (1.69x) against a kill line of
+  1.5x: rejected. A `SorterRow` keeps the record plus a decoded copy of its key; the two-term key
+  spills out of the row's one inline value, about 160 bytes per entry.
+- Retry condition: taken by the WIN above (records in one arena, offsets sorted with the index's
+  comparator). Not through the general sorter unless its rows stop holding a decoded key copy.
+
 ## 2026-11-12 - WIN: an implicit aggregate over a lookup join takes the VDBE lookup loop on :memory: too (bd-w4pr1.13.23)
 
 - Target: `SELECT <aggregates> FROM a JOIN b ON <lookup>` on `:memory:` (the scorecard's
