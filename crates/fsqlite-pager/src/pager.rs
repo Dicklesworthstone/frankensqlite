@@ -27026,8 +27026,7 @@ where
             }
 
             // WAL mode fast path: try shared-lock read first (bd-db300.3.8.7).
-            let mut pinned_wal_miss = false;
-            if self.journal_mode == JournalMode::Wal {
+            let pinned_wal_miss = if self.journal_mode == JournalMode::Wal {
                 let lookup = lookup_page_in_wal_backend(&self.wal_backend, cx, page_no).await?;
                 if let Some(data) = lookup.data {
                     if dk9ra_trace_enabled()
@@ -27044,8 +27043,10 @@ where
                     self.cache_transaction_read_page(page_no, &page);
                     return Ok(page);
                 }
-                pinned_wal_miss = lookup.pinned;
-            }
+                lookup.pinned
+            } else {
+                false
+            };
 
             let inner = self
                 .inner
@@ -66605,20 +66606,32 @@ mod tests {
                 }
             }
 
-            let (pager, _) = test_pager().await;
+            let vfs = MemoryVfs::new();
+            let path = PathBuf::from("/pinned_wal_miss.db");
             let cx = Cx::new();
             let page_size = PageSize::DEFAULT.as_usize();
-            // Two pages in the database file, written before WAL mode.
-            let mut txn = pager.begin(&cx, TransactionMode::Immediate).await.unwrap();
-            let file_page = txn.allocate_page(&cx).await.unwrap();
-            txn.write_page(&cx, file_page, &vec![0x11; page_size])
+            // Two pages in the database file, written before WAL mode by a
+            // pager that is then dropped, so the reader below holds none of
+            // them in a cache or in its published page set.
+            let (file_page, wal_page) = {
+                let writer = SimplePager::open(vfs.clone(), &path, PageSize::DEFAULT)
+                    .await
+                    .unwrap();
+                let mut txn = writer.begin(&cx, TransactionMode::Immediate).await.unwrap();
+                let file_page = txn.allocate_page(&cx).await.unwrap();
+                txn.write_page(&cx, file_page, &vec![0x11; page_size])
+                    .await
+                    .unwrap();
+                let wal_page = txn.allocate_page(&cx).await.unwrap();
+                txn.write_page(&cx, wal_page, &vec![0x22; page_size])
+                    .await
+                    .unwrap();
+                txn.commit(&cx).await.unwrap();
+                (file_page, wal_page)
+            };
+            let pager = SimplePager::open(vfs, &path, PageSize::DEFAULT)
                 .await
                 .unwrap();
-            let wal_page = txn.allocate_page(&cx).await.unwrap();
-            txn.write_page(&cx, wal_page, &vec![0x22; page_size])
-                .await
-                .unwrap();
-            txn.commit(&cx).await.unwrap();
 
             let pinned_calls = Arc::new(Mutex::new(0_usize));
             let fallback_calls = Arc::new(Mutex::new(0_usize));
