@@ -87,6 +87,44 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-12 - WIN: a WHERE comparison's literal operand is loaded once in an Init prologue (bd-w4pr1.13.31)
+
+- Target: every scan whose WHERE compares against a literal (the scorecard's scan_filter_agg,
+  UPDATE and DELETE rows, and any SELECT through `emit_where_filter_with_ctx`). Touched:
+  `crates/fsqlite-vdbe/src/lib.rs` (`ProgramBuilder::hoisted_literal`,
+  `append_hoisted_literal_prologue`), `crates/fsqlite-vdbe/src/codegen.rs` (the comparison
+  paths of `emit_where_filter_with_ctx`, `emit_where_comparison_jump`, `hoisted_where_literal`).
+- Evidence before: `SELECT count(*) FROM t WHERE a > 500` ran Column, Integer 500, IsNull, IsNull,
+  Le per row; stock codes such constants once after Init's jump to the program end.
+- Change: integer, real and text literal operands get a dedicated register loaded in a prologue
+  that `finish()` appends (loads, Goto to Init's old target, unreachable Halt; Init points at the
+  loads; a later past-end Init keeps pointing past the end, whose absence hung 16 core tests in the
+  first gate) and lose their NULL check. Comparison opcodes never write their operands.
+- Result (stock sqlite3 3.46.1 live, ring refused, 3 reps, repeatable; binaries 1fda495c... base
+  00f603c25, 84d8103a... candidate 3cd93dfdc, on main as c1076d876): scan_filter_agg 1,312.0M ->
+  1,214.8M (-7.4%; 2.63x -> 2.44x stock); `WHERE a % 7 = 0` 1,279.7M -> 1,184.4M (2.94x -> 2.72x);
+  `WHERE c >= 7.5 AND b <> 'row-9'` 2,824.3M -> 2,477.9M (-12.3%, CPU 235.9 -> 198.6 ms); DELETE
+  725.7M -> 697.1M (CPU 145.3 -> 138.3 ms); UPDATE 1,067.1M -> 1,037.8M (CPU 172.3 -> 159.6 ms).
+  Predictions met (scan 1,200-1,250M, a%7=0 1,130-1,200M). Kill (scan_filter_agg down less than
+  30M): not met. Every answer equals stock's.
+- Gate: clippy -D warnings clean; fsqlite-vdbe lib green apart from the bd-bhalc pair; goldens 8
+  pass after GOLDEN-CHANGE on four snapshots (hoisting-only diffs, reviewed one by one); fsqlite-core
+  lib 492 pass (where/update/delete/correlated/subquery filters); 81 EXPLAIN-reading integration
+  targets green apart from two reds already red on main.
+- Landing note: c1076d876 reached main by a cherry-pick in the shared checkout at 15:52:48 -0500,
+  before this measurement; the measurement above is of the same patch.
+- Retry condition: none. Next on the shape: literals in HAVING and in other per-row expressions
+  (projection, ORDER BY keys) are still loaded per row.
+
+## 2026-11-12 - NOTE: lever D is on main without a keep decision (bd-w4pr1.13.20)
+
+- f4a003491 ("a connection's own published commit authorizes its certificate without re-reading
+  its frames") is the path-identity lane's b6f4cd892, which its own kill line rejected (entry
+  3e5946f67: -30.3M instructions against 40M). It reached main through a cherry-pick in the shared
+  checkout at 15:27:20 -0500 by a process that neither the coordinator nor the peer session
+  frankensqlite-b9 ran. Its correctness gate passed on the lane's tree. Whether it stays is the
+  owner's decision; until then the measured effect is the one in 3e5946f67.
+
 ## 2026-11-12 - WIN: a :memory: GROUP BY without loaded mirror rows runs the storage substrate instead of rebuilding the mirror (bd-w4pr1.13.23)
 
 - Target: single-table GROUP BY on `:memory:` after a write, and an aggregate over such a GROUP BY
