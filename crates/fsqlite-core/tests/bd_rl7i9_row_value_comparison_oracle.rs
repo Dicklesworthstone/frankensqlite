@@ -5,9 +5,9 @@
 //!
 //! * **(c) DONE**: `IS` / `IS NOT` over row values (NULL-safe element-wise
 //!   equality), e.g. `(SELECT 1,2) IS (1,2)`.
-//! * **(a) DONE**: per-position collation (declared column collation + an
-//!   explicit `COLLATE` wrapper) is dropped — the comparator's no-context
-//!   fallback (`compare_join_expr_values`) compares BINARY.
+//! * **(a) DONE**: per-position collation. Since bd-9sp6f this follows the
+//!   bundled 3.54.1: a subquery operand's fields carry their affinity but no
+//!   collation; the other operand's explicit `COLLATE` still applies.
 //! * **(b) DONE**: a `RowValue` whose *element* is a subquery, e.g.
 //!   `(1,(SELECT 2)) = (1,2)`, falls through to the scalar arm because the
 //!   dispatch only routes a *top-level* subquery operand.
@@ -114,18 +114,65 @@ fn row_value_is_null_safe() {
     });
 }
 
-// ---- (a) per-position collation (implemented) ----
+// ---- (a) per-position collation ----
+//
+// bd-9sp6f: SQLite 3.54 compares the fields of a subquery operand without
+// their own collation (the declared column collation and a `COLLATE` in the
+// subquery's select list are both ignored), for a row value as for a scalar;
+// 3.46 used it for a row value. The other operand's explicit collation still
+// applies, the subquery's affinity still applies, and `IN` still uses the
+// left subquery's collation. All run on the bundled 3.54.1.
+
+const NOCASE_T: &[&str] = &[
+    "CREATE TABLE t(a TEXT COLLATE NOCASE, n INTEGER)",
+    "INSERT INTO t VALUES('A', 5)",
+];
 
 #[test]
 fn row_value_element_collation_nocase() {
     asupersync::test_utils::run_test(|| async {
         agree(
-            &[
-                "CREATE TABLE t(a TEXT COLLATE NOCASE)",
-                "INSERT INTO t VALUES('A')",
-            ],
+            NOCASE_T,
             "SELECT (SELECT a,1 FROM t)=('a',1)",
-            "(a) declared NOCASE must drive the row-value element comparison",
+            "(a) a subquery field's declared NOCASE does not drive the comparison",
+        )
+        .await;
+        agree(
+            NOCASE_T,
+            "SELECT ('a',1)=(SELECT a,1 FROM t)",
+            "(a) nor on the right-hand side",
+        )
+        .await;
+        agree(
+            NOCASE_T,
+            "SELECT (SELECT a COLLATE NOCASE,1 FROM t)=('a',1)",
+            "(a) nor a COLLATE inside the subquery",
+        )
+        .await;
+    });
+}
+
+/// The negatives a naive "drop every collation" or "drop the metadata" change
+/// would get wrong.
+#[test]
+fn row_value_subquery_keeps_affinity_and_outer_collation() {
+    asupersync::test_utils::run_test(|| async {
+        agree(
+            NOCASE_T,
+            "SELECT (SELECT a,1 FROM t)=('a' COLLATE NOCASE,1)",
+            "(a) the other operand's explicit COLLATE still applies",
+        )
+        .await;
+        agree(
+            NOCASE_T,
+            "SELECT (SELECT n,1 FROM t)=('5',1)",
+            "(a) the subquery field's INTEGER affinity still applies",
+        )
+        .await;
+        agree(
+            NOCASE_T,
+            "SELECT (SELECT a,1 FROM t) IN (SELECT 'a',1)",
+            "(a) IN still uses the left subquery's collation",
         )
         .await;
     });

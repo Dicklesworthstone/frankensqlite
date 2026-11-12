@@ -54749,11 +54749,15 @@ impl Connection {
             .collect()
     }
 
-    /// Materialize the first row of a scalar subquery without erasing vector
-    /// width or comparison affinity when the subquery is an operand of `IN`.
-    /// A one-column scalar subquery keeps its projected collation opaque;
-    /// multi-column scalar subqueries act as vectors and expose each field's
-    /// comparison metadata just like the direct vector execution path.
+    /// Materialize the first row of a subquery that is an operand of a
+    /// comparison, keeping its vector width and each field's comparison
+    /// affinity. No field carries a collation, neither the column's declared
+    /// one nor a `COLLATE` in the select list: SQLite 3.54 compares a
+    /// subquery operand's fields with the other operand's collation or
+    /// BINARY, for a row value as for a scalar
+    /// (`(SELECT a,1 FROM t)=('a',1)` is 0 for a NOCASE `a`; 3.46 used it).
+    /// The direct vector execution path already compared that way
+    /// (bd-9sp6f).
     fn materialize_scalar_subquery_in_operand(
         &self,
         subquery: &SelectStatement,
@@ -54777,7 +54781,6 @@ impl Connection {
         }
 
         let schemas = self.schema.borrow();
-        let explicit_collations = in_rhs_donor_explicit_collations(subquery, &schemas);
         // bd-2fong red 2: the IN-RHS donor metadata models table-backed
         // donors only; the scalar comparison shapes (no-FROM CAST
         // projections, star projections, compound final cores, VALUES
@@ -54791,34 +54794,16 @@ impl Connection {
         drop(schemas);
         let mut fields = Vec::with_capacity(expected);
         for (index, value) in values.into_iter().enumerate() {
-            let mut field = Expr::BoundOuterValue {
+            fields.push(Expr::BoundOuterValue {
                 value,
-                collation: if expected > 1 {
-                    donor_metadata
-                        .columns
-                        .get(index)
-                        .and_then(|column| column.collation.clone())
-                        .map_or(BoundCollation::Unspecified, BoundCollation::Named)
-                } else {
-                    BoundCollation::Unspecified
-                },
+                collation: BoundCollation::Unspecified,
                 affinity: donor_metadata
                     .columns
                     .get(index)
                     .and_then(|column| column.affinity)
                     .or(scalar_fallback_affinity),
                 span,
-            };
-            if expected > 1
-                && let Some(collation) = explicit_collations.get(index).and_then(Clone::clone)
-            {
-                field = Expr::Collate {
-                    expr: Box::new(field),
-                    collation,
-                    span,
-                };
-            }
-            fields.push(field);
+            });
         }
         if expected > 1 {
             Ok(Expr::RowValue(fields, span))
