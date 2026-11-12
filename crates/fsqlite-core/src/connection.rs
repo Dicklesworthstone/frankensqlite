@@ -48688,6 +48688,52 @@ impl Connection {
     }
 
     /// Compile and wrap a statement into a `PreparedStatement`.
+    /// A prepared SELECT that runs through the statement dispatcher on every
+    /// execution instead of a program compiled at prepare time.
+    #[allow(clippy::too_many_arguments)]
+    fn deferred_prepared_select(
+        &self,
+        sql: &str,
+        original_sql: &str,
+        statement: &Statement,
+        registry: Option<Arc<FunctionRegistry>>,
+        function_registry_generation: u64,
+        column_names: Vec<String>,
+        prepared_query_fast_path: Option<PreparedQueryFastPath>,
+        may_observe_change_tracking: bool,
+    ) -> Result<PreparedStatement<'_>> {
+        // The prepared names already carry the deferred SELECT result width.
+        // Asking for the count separately would call user vtab metadata a
+        // second time, allowing a stateful or self-replacing factory to return
+        // names and a width from different registry snapshots.
+        let column_count = column_names.len();
+        Ok(PreparedStatement {
+            sql: Rc::<str>::from(sql),
+            original_sql: Rc::<str>::from(original_sql),
+            program: build_placeholder_program()?,
+            func_registry: registry,
+            expression_postprocess: None,
+            distinct: false,
+            distinct_collations: Vec::new(),
+            db: prepared_query_fast_path
+                .as_ref()
+                .map(|_| Rc::clone(&self.db)),
+            schema_cookie: self.schema_cookie(),
+            local_ddl_epoch: self.local_ddl_epoch(),
+            schema_generation: self.schema_generation(),
+            function_registry_generation,
+            dml_dispatch: None,
+            prepared_update_delete_fast_path: None,
+            deferred_query_statement: Some(Arc::new(statement.clone())),
+            deferred_query_column_count: Some(column_count),
+            column_names,
+            prepared_query_fast_path,
+            may_observe_change_tracking,
+            reprepared: RefCell::new(None),
+            conn: self,
+        })
+    }
+
     async fn compile_and_wrap(
         &self,
         sql: &str,
@@ -48704,11 +48750,6 @@ impl Connection {
             original_statement,
             original_sql,
         );
-        // The prepared names already carry the deferred SELECT result width.
-        // Asking for the count separately would call user vtab metadata a
-        // second time, allowing a stateful or self-replacing factory to return
-        // names and a width from different registry snapshots.
-        let prepared_column_count = prepared_column_names.len();
         let prepared_query_fast_path = self.prepared_query_fast_path(statement);
         let may_observe_change_tracking = self.statement_may_observe_change_tracking(statement);
         let registry = Some(Arc::clone(&*self.func_registry.borrow()));
@@ -48746,33 +48787,17 @@ impl Connection {
             );
         }
         match statement {
-            Statement::Select(_) if self.prepared_select_requires_dispatch(statement) => {
-                Ok(PreparedStatement {
-                    sql: Rc::<str>::from(sql),
-                    original_sql: Rc::<str>::from(original_sql),
-                    program: build_placeholder_program()?,
-                    func_registry: registry,
-                    expression_postprocess: None,
-                    distinct: false,
-                    distinct_collations: Vec::new(),
-                    db: prepared_query_fast_path
-                        .as_ref()
-                        .map(|_| Rc::clone(&self.db)),
-                    schema_cookie: self.schema_cookie(),
-                    local_ddl_epoch: self.local_ddl_epoch(),
-                    schema_generation: self.schema_generation(),
+            Statement::Select(_) if self.prepared_select_requires_dispatch(statement) => self
+                .deferred_prepared_select(
+                    sql,
+                    original_sql,
+                    statement,
+                    registry,
                     function_registry_generation,
-                    dml_dispatch: None,
-                    prepared_update_delete_fast_path: None,
-                    deferred_query_statement: Some(Arc::new(statement.clone())),
-                    deferred_query_column_count: Some(prepared_column_count),
-                    column_names: prepared_column_names,
+                    prepared_column_names,
                     prepared_query_fast_path,
                     may_observe_change_tracking,
-                    reprepared: RefCell::new(None),
-                    conn: self,
-                })
-            }
+                ),
             Statement::Select(select) if is_expression_only_select(select) => {
                 let compile_registry = registry
                     .as_ref()
@@ -48823,11 +48848,36 @@ impl Connection {
                     Vec::new()
                 };
                 let sql_key = Self::sql_hash(sql);
-                let program = self
+                let program = match self
                     .compile_with_cache(sql_key, sql, async |conn| {
                         conn.compile_table_select(&canonical_select).await
                     })
-                    .await?;
+                    .await
+                {
+                    Ok(program) => program,
+                    // bd-w4pr1.34: a shape the code generator cannot express
+                    // (a GROUP BY result column that wraps a key or an
+                    // aggregate, `quote(a) || ':' || count(*)`) runs through
+                    // the dispatcher, whose fallbacks answer it, as the same
+                    // statement already does unprepared and on `:memory:`.
+                    // The generator may refuse the shape before it resolves
+                    // every name, so resolve them here: an unknown column
+                    // still fails at prepare, as in stock.
+                    Err(FrankenError::NotImplemented(_)) => {
+                        self.validate_select_column_references(select)?;
+                        return self.deferred_prepared_select(
+                            sql,
+                            original_sql,
+                            statement,
+                            registry,
+                            function_registry_generation,
+                            prepared_column_names,
+                            prepared_query_fast_path,
+                            may_observe_change_tracking,
+                        );
+                    }
+                    Err(error) => return Err(error),
+                };
                 Ok(PreparedStatement {
                     sql: Rc::<str>::from(sql),
                     original_sql: Rc::<str>::from(original_sql),

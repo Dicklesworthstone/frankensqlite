@@ -3164,6 +3164,103 @@ mod tests {
         }};
     }
 
+    /// rusqlite code whose prepared GROUP BY result columns are expressions
+    /// over a group key or an aggregate (bd-w4pr1.34): on a file database the
+    /// code generator refused these at prepare ("not implemented"), so the
+    /// statement now runs through the dispatcher. A real error in a GROUP BY
+    /// statement must still fail at prepare, exactly as stock reports it.
+    macro_rules! group_by_expression_scenario {
+        ($m:ident, $conn:expr) => {{
+            use $m::params;
+            fn show<T: std::fmt::Debug>(result: $m::Result<T>) -> String {
+                match result {
+                    Ok(value) => format!("ok {value:?}"),
+                    Err($m::Error::SqliteFailure(error, message)) => {
+                        format!("err {:?} {} {message:?}", error.code, error.extended_code)
+                    }
+                    Err(other) => format!("err other {other}"),
+                }
+            }
+            let conn: $m::Connection = $conn;
+            conn.execute_batch(
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT, n INTEGER);",
+            )
+            .unwrap();
+            {
+                let mut insert = conn
+                    .prepare("INSERT INTO t VALUES (?1, ?2, ?3, ?4)")
+                    .unwrap();
+                for id in 1..=40_i64 {
+                    insert
+                        .execute(params![id, id % 4, format!("k{}", id % 3), id * 10])
+                        .unwrap();
+                }
+            }
+            let mut trace: Vec<String> = Vec::new();
+            for sql in [
+                "SELECT quote(a) || '|' || quote(count(*)) FROM t GROUP BY a ORDER BY a",
+                "SELECT a || ':' || count(*) FROM t GROUP BY a",
+                "SELECT quote(count(*)) FROM t GROUP BY a ORDER BY a",
+                "SELECT upper(b) FROM t GROUP BY b ORDER BY b",
+                "SELECT quote(a) || '|' || quote(count(*)) FROM t WHERE 0 GROUP BY a",
+                "SELECT (a + 1) || '/' || (sum(n) * 2) || '/' || max(b) FROM t \
+                 WHERE id > 5 GROUP BY a ORDER BY a",
+                "SELECT b || '=' || total(n) FROM t GROUP BY b HAVING count(*) > 13 ORDER BY b",
+            ] {
+                trace.push(show(conn.prepare(sql).and_then(|mut stmt| {
+                    stmt.query_map([], |row| row.get::<_, String>(0))?
+                        .collect::<$m::Result<Vec<_>>>()
+                })));
+            }
+            trace
+        }};
+    }
+
+    #[test]
+    fn group_by_result_expressions_match_rusqlite() {
+        let dir = tempfile::tempdir().unwrap();
+        let runs = [
+            (
+                group_by_expression_scenario!(stock, stock::Connection::open_in_memory().unwrap()),
+                group_by_expression_scenario!(ours, ours::Connection::open_in_memory().unwrap()),
+            ),
+            (
+                group_by_expression_scenario!(
+                    stock,
+                    stock::Connection::open(temp_path(&dir, "group-expr-stock.db")).unwrap()
+                ),
+                group_by_expression_scenario!(
+                    ours,
+                    ours::Connection::open(temp_path(&dir, "group-expr-fsqlite.db")).unwrap()
+                ),
+            ),
+        ];
+        for (run, (theirs, mine)) in runs.iter().enumerate() {
+            for (index, (expected, actual)) in theirs.iter().zip(mine).enumerate() {
+                assert_eq!(actual, expected, "run {run} trace step {index}");
+            }
+            assert_eq!(mine.len(), theirs.len(), "run {run}");
+            // Non-vacuity: the grouped answers are real rows.
+            assert!(
+                theirs[0].starts_with("ok [\"0|10\""),
+                "run {run}: unexpected stock rows {theirs:?}"
+            );
+        }
+
+        // Negative: on a file, where an uncompilable GROUP BY now falls back
+        // to the dispatcher, a real error is still a prepare-time error.
+        let conn = ours::Connection::open(temp_path(&dir, "group-expr-negative.db")).unwrap();
+        conn.execute_batch("CREATE TABLE t(a INTEGER, b TEXT);")
+            .unwrap();
+        let Err(error) = conn.prepare("SELECT quote(nosuch) || count(*) FROM t GROUP BY a") else {
+            panic!("an unknown column must fail at prepare");
+        };
+        assert!(
+            error.to_string().contains("no such column: nosuch"),
+            "unexpected prepare error: {error}"
+        );
+    }
+
     #[test]
     fn constant_where_terms_match_rusqlite() {
         let dir = tempfile::tempdir().unwrap();
