@@ -87,6 +87,31 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-12 - WIN: length() counts the characters of valid TEXT on its stored bytes (bd-w4pr1.13.28)
+
+- Target: `length()` on TEXT. `LengthFunc::invoke` took `s.as_str()`, which for an inline
+  `SmallText` re-runs UTF-8 validation on every call (safe Rust cannot borrow the inline buffer as
+  `&str` without it): about 120 instructions a call in the callgrind profile of the 1M-probe
+  lookup join that sums `length(u.name)`. Touched: `crates/fsqlite-func/src/builtins.rs`.
+- Ledger preflight: no entry on `length()` or on `SmallText::as_str` revalidation.
+- Change: a value that is not Raw is valid UTF-8, so it is counted on `as_bytes_direct()`: up to
+  the first NUL, the byte length when ASCII, else the bytes that do not continue a UTF-8 sequence.
+  A Raw (invalid UTF-8) value keeps its old path.
+- Result: CLI release-perf, scorecard database, stock sqlite3 3.46.1 live in the same script, best
+  of 3 user instructions (`stable_probe.py`, io_uring refused). Before main f8de08a2e, after
+  503de6a5d. Answers equal stock's.
+
+  | statement | stock | before | after |
+  |---|---|---|---|
+  | `count(*), sum(length(u.name)) FROM t JOIN u ON u.a = t.a` | 1,721.4M | 4,451.1M | 4,313.9M |
+  | `sum(length(b)) FROM t` (1M rows) | 640.3M | 1,971.6M | 1,823.2M |
+  | `count(*), sum(a) FROM t WHERE a > 500` (control) | 498.7M | 1,312.0M | 1,312.0M |
+
+  Prediction -90 to -130M on the join; measured -137.2M.
+- Retry / widen: other built-ins that only need character counts or bytes (`substr`, `instr`,
+  `upper`/`lower` on ASCII) still go through `as_str`. Widen to one of them when a profile shows
+  its `from_utf8` above 2% of a measured statement.
+
 ## 2026-11-12 - WIN: a rowid seek served by the seek cache moves its slot to the front in place (bd-w4pr1.13.27)
 
 - Target: lookup joins that probe a small table by rowid. Callgrind of `SELECT count(*),
