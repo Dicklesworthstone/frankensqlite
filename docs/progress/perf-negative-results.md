@@ -87,6 +87,41 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-12 - WIN: a table window SELECT scans only the columns it names and sizes its keys exactly (bd-w4pr1.12)
+
+- Target: the connection-level window fallback (`execute_window_select` in
+  `crates/fsqlite-core/src/connection.rs`), which holds every scanned row until the statement ends.
+  Heap profile (massif, frame-pointer CLI 92b3469bc) of `row_number() OVER (PARTITION BY a ORDER BY
+  c)` over 1M rows at its 1.14 GB peak: 240 MB of scanned rows (every table column plus the hidden
+  rowid, 48 bytes a value), 192 MB each for the PARTITION BY and ORDER BY key vectors, which hold
+  one value but reserve four (`collect::<Result<Vec<_>>>` gives `Vec` no size hint).
+- Ledger preflight: the GH#527 join-fallback entry prunes join sources by the same text rule; no
+  entry on the window path.
+- Change: the single-table window scan keeps only the column-map entries the statement can name
+  (`window_scan_named_columns`, the GH#527 rule: a name that appears anywhere is kept; `*`,
+  `tbl.*` and virtual tables keep every column; the hidden rowid stays when a rowid alias appears;
+  a statement naming none keeps one column). Column resolution errors on a missing name, so a miss
+  cannot read as NULL. The key vectors are allocated at their exact length.
+- Result: CLI release-perf, scorecard database (1M-row `t` built by stock), stock sqlite3 3.46.1
+  live in the same script, 3 runs, min user instructions, median CPU and peak RSS (`rss_probe.py`,
+  io_uring refused, load 28). Before main a3b9ab033, after f12db2f60 (the change on it; landed as
+  bc91a8c47). Answers equal stock's in every row.
+
+  | statement (summed in an outer SELECT) | stock | before | after |
+  |---|---|---|---|
+  | `row_number() OVER (PARTITION BY a ORDER BY c)` | 8,225.1M, 689.8 ms, 16.2 MB | 11,905.0M, 1,853.3 ms, 851.9 MB | 10,682.2M, 1,598.2 ms, 441.4 MB |
+  | `rank() OVER (ORDER BY b)` | 8,534.9M, 704.4 ms, 16.3 MB | 8,410.2M, 1,015.9 ms, 707.0 MB | 6,908.8M, 813.7 ms, 403.0 MB |
+  | `sum(c) OVER (PARTITION BY a)` | 6,588.5M, 513.3 ms, 16.5 MB | 9,382.7M, 1,443.9 ms, 654.0 MB | 8,174.0M, 1,211.7 ms, 403.1 MB |
+  | `SELECT *, row_number() OVER (PARTITION BY a)` (control, keeps every column) | 9,568.3M, 835.1 ms, 16.7 MB | 12,620.2M, 1,985.3 ms, 698.4 MB | 12,655.5M, 1,938.5 ms, 699.5 MB |
+
+  Prediction (bead comment before the measurement): RSS 852 to 380-500 MB, CPU -3 to -10%.
+  Measured 441 MB and -14% CPU; the other two shapes moved alike, the `*` control did not.
+- Still a loss: 25-27x stock's peak RSS and 1.2-2.3x its CPU. The rows are still materialized; the
+  next cut reads a one-column PARTITION BY / ORDER BY key from the scanned row instead of copying
+  it, and the bead's acceptance (RSS within 2x) needs a sorter-backed streaming window.
+- Retry / widen: the join and GROUP BY window paths keep their own scans. Widen there when a
+  measured window statement over a join or GROUP BY holds more than 2x its named columns.
+
 ## 2026-11-12 - WIN: the materializing fallbacks move rows instead of copying every value (bd-w4pr1.12)
 
 - Target: the window, GROUP BY window, compound, recursive-CTE and join fallbacks in
