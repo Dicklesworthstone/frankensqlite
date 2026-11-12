@@ -14813,6 +14813,12 @@ pub struct Connection {
     /// point. Deferring it keeps commit-only workloads free of it while the
     /// first read after a write burst still gets the MemDatabase fast paths.
     memdb_hydrate_at_next_read: Cell<bool>,
+    /// Set when a `:memory:` read boundary reloaded only the schema and left
+    /// the row rebuild to the first statement that reads mirror rows
+    /// (bd-w4pr1.13.23): a SELECT taking an in-memory fallback pays it (see
+    /// [`Connection::pay_owed_memdb_rows`]); a statement that runs in the VDBE
+    /// reads the pager and never pays. Dropped by writes and by BEGIN.
+    memdb_rows_owed: Cell<bool>,
     /// When true, `execute_join_select` reads table data directly from
     /// `self.db` (the MemDatabase) instead of calling `self.query()` which
     /// would go through the pager and return current data.
@@ -16372,6 +16378,7 @@ impl Connection {
             time_travel_snapshots: RefCell::new(Vec::new()),
             time_travel_materialized: RefCell::new(None),
             memdb_hydrate_at_next_read: Cell::new(false),
+            memdb_rows_owed: Cell::new(false),
             time_travel_active: Cell::new(false),
             time_travel_capture_enabled: Cell::new(true),
             time_travel_commit_delta: RefCell::new(None),
@@ -16975,6 +16982,7 @@ impl Connection {
             time_travel_snapshots: RefCell::new(Vec::new()),
             time_travel_materialized: RefCell::new(None),
             memdb_hydrate_at_next_read: Cell::new(false),
+            memdb_rows_owed: Cell::new(false),
             time_travel_active: Cell::new(false),
             time_travel_capture_enabled: Cell::new(true),
             time_travel_commit_delta: RefCell::new(None),
@@ -23511,11 +23519,7 @@ impl Connection {
     /// 100K-row scan, build a `HashSet` of the IN values and count
     /// matching rows directly against MemDB.
     fn try_direct_count_star_in_list(&self, select: &SelectStatement) -> Result<Option<Vec<Row>>> {
-        if self.application_function_replaces_builtin("count", 0)
-            || !self.memdb_rows_loaded.get()
-            || self.memdb_requires_active_txn_reload.get()
-            || !self.pending_memdb_direct_upserts.borrow().is_empty()
-        {
+        if self.application_function_replaces_builtin("count", 0) {
             return Ok(None);
         }
         if select.with.is_some()
@@ -23599,14 +23603,30 @@ impl Connection {
                 // single un-joined table, a non-matching qualifier is
                 // definitively unresolvable, so surface the typed column error
                 // directly instead of deferring to a fallback that would report
-                // a generic internal error.
-                if table_alias.is_some() {
+                // a generic internal error. Checked before the mirror's state
+                // gates the fast path, so the error is the same whether or not
+                // the mirror is loaded (bd-w4pr1.13.23 left it unloaded after
+                // most writes on :memory:), and only for an existing table
+                // (stock reports "no such table" first).
+                if table_alias.is_some()
+                    && self
+                        .schema
+                        .borrow()
+                        .iter()
+                        .any(|table| table.name.eq_ignore_ascii_case(&table_name.name))
+                {
                     return Err(FrankenError::NoSuchColumn {
                         name: format!("{qualifier}.{}", col_ref.column),
                     });
                 }
                 return Ok(None);
             }
+        }
+        if !self.memdb_rows_loaded.get()
+            || self.memdb_requires_active_txn_reload.get()
+            || !self.pending_memdb_direct_upserts.borrow().is_empty()
+        {
+            return Ok(None);
         }
         let (root_page, col_idx, rowid_alias_column_index, column_affinity) = {
             let schema = self.schema.borrow();
@@ -26609,9 +26629,11 @@ impl Connection {
         *self.time_travel_commit_delta.borrow_mut() = delta;
     }
 
-    /// Rebuild the `:memory:` row mirror once if a time-travel capture point
-    /// left it stale (bd-jdjee). Called at read statements only; inside a
-    /// transaction the request stays armed for the first read after it.
+    /// Realign the `:memory:` mirror once if a time-travel capture point left
+    /// it stale (bd-jdjee). Called at read statements only; inside a
+    /// transaction the request stays armed for the first read after it. The
+    /// row rebuild itself is owed to the first reader of mirror rows
+    /// (bd-w4pr1.13.23, [`Self::reload_memdb_from_pager_owing_rows`]).
     ///
     /// It also stays armed while a retained autocommit batch is parked: the
     /// rebuild reads the published pager image, which does not hold that
@@ -26633,7 +26655,141 @@ impl Connection {
         {
             return Ok(());
         }
+        self.reload_memdb_from_pager_owing_rows(cx).await
+    }
+
+    /// Whether a read boundary may leave the mirror's rows owed instead of
+    /// rebuilding them (bd-w4pr1.13.23). Only on a private `:memory:`
+    /// connection in parity-cert mode (`reject_mem_fallback`, the default;
+    /// with it off the caller has made the MemDatabase the row source of
+    /// record and refreshes keep it hydrated, bd-gjrct), and with no live
+    /// virtual-table instance, whose rebuild a later payment would repeat in
+    /// the middle of a statement.
+    fn memdb_read_boundary_may_owe_rows(&self) -> bool {
+        self.path == ":memory:"
+            && *self.reject_mem_fallback.borrow()
+            && self.vtab_instances.borrow().is_empty()
+    }
+
+    /// The reload a read boundary makes after a commit. On a private
+    /// `:memory:` connection it reloads the schema and the visibility state
+    /// only and leaves the row rebuild owed: a statement that runs in the VDBE
+    /// reads the pager and never needs the rows, and one that reads them
+    /// through an in-memory fallback pays the rebuild first
+    /// ([`Self::pay_owed_memdb_rows`]). Rebuilding here cost about 2.5k
+    /// instructions per table row before every read that followed a write.
+    async fn reload_memdb_from_pager_owing_rows(&self, cx: &Cx) -> Result<()> {
+        if !self.memdb_read_boundary_may_owe_rows() {
+            return self.reload_memdb_from_pager(cx).await;
+        }
+        self.reload_memdb_from_pager_with_mode(cx, false).await?;
+        self.memdb_rows_owed.set(!self.memdb_rows_loaded.get());
+        Ok(())
+    }
+
+    /// Rebuild owed mirror rows before a SELECT reads them through an
+    /// in-memory fallback. This is the rebuild the read boundary used to make
+    /// (`reload_memdb_from_pager`, a read transaction of its own), made later.
+    ///
+    /// It runs only where the committed pager image is exactly what the
+    /// statement reads and replacing the mirror disturbs nothing in flight:
+    /// the top-level statement, outside any transaction or savepoint, with no
+    /// retained batch, no pending mirror upserts, no materialized CTE or view
+    /// table, no live virtual table, and no write in the statement's own read
+    /// transaction (on a private `:memory:` connection nothing else commits).
+    /// Anywhere else the rows stay owed and the reader takes the path it takes
+    /// on an unloaded mirror (as inside BEGIN).
+    async fn pay_owed_memdb_rows(&self, cx: &Cx) -> Result<()> {
+        if !self.memdb_rows_owed.get() {
+            return Ok(());
+        }
+        if self.memdb_rows_loaded.get() {
+            self.memdb_rows_owed.set(false);
+            return Ok(());
+        }
+        let statement_reads_committed_image = self.statement_exec_depth.get() <= 1
+            && !self.in_transaction.get()
+            && !self.savepoints_are_open_or_borrowed()
+            && self.internal_statement_savepoint_depth.get() == 0
+            && !self.skip_statement_memdb_refresh.get()
+            && self.memdb_row_hydration_suppressed.get() == 0
+            && !self.memdb_requires_active_txn_reload.get()
+            && self
+                .retained_autocommit_txn
+                .try_borrow()
+                .is_ok_and(|txn| txn.is_none())
+            && self
+                .pending_memdb_direct_upserts
+                .try_borrow()
+                .is_ok_and(|upserts| upserts.is_empty())
+            && self
+                .materialized_temp_root_pages
+                .try_borrow()
+                .is_ok_and(|roots| roots.is_empty())
+            && self
+                .vtab_instances
+                .try_borrow()
+                .is_ok_and(|instances| instances.is_empty())
+            && self
+                .active_txn
+                .try_borrow()
+                .is_ok_and(|txn| txn.as_ref().is_none_or(|txn| !txn.has_pending_writes()));
+        if !statement_reads_committed_image {
+            return Ok(());
+        }
+        self.memdb_rows_owed.set(false);
         self.reload_memdb_from_pager(cx).await
+    }
+
+    /// A SELECT the dispatch sends to an in-memory fallback: log the decision,
+    /// then pay any owed mirror rebuild before the fallback reads the mirror.
+    /// The payment is boxed so the dispatcher, which awaits this at every
+    /// fallback, does not carry the reload's future (bd-w4pr1.28).
+    async fn admit_select_mem_fallback(
+        &self,
+        cx: &Cx,
+        decision_reason: &'static str,
+    ) -> Result<()> {
+        self.log_mem_execution_fallback("select", decision_reason)?;
+        if self.memdb_rows_owed.get() {
+            boxed_future(|| self.pay_owed_memdb_rows(cx)).await?;
+        }
+        Ok(())
+    }
+
+    /// Owed-row bookkeeping at a statement boundary, before the statement
+    /// opens its transaction. A write or a BEGIN / SAVEPOINT (`drops_debt`)
+    /// drops the debt: the next read boundary owes it again for the state it
+    /// leaves. If the caller has since made the MemDatabase the row source of
+    /// record (`reject_mem_fallback` turned off, the mode in which refreshes
+    /// keep the mirror hydrated, bd-gjrct), the rows are rebuilt now, while no
+    /// transaction is open.
+    async fn settle_owed_memdb_rows_at_statement_boundary(
+        &self,
+        drops_debt: bool,
+        cx: &Cx,
+    ) -> Result<()> {
+        if !self.memdb_rows_owed.get() {
+            return Ok(());
+        }
+        if self.memdb_rows_loaded.get() {
+            self.memdb_rows_owed.set(false);
+            return Ok(());
+        }
+        if !*self.reject_mem_fallback.borrow() {
+            if self.in_transaction.get()
+                || self.active_txn_is_open_or_borrowed()
+                || self.retained_autocommit_txn.borrow().is_some()
+            {
+                return Ok(());
+            }
+            self.memdb_rows_owed.set(false);
+            return self.reload_memdb_from_pager(cx).await;
+        }
+        if drops_debt {
+            self.memdb_rows_owed.set(false);
+        }
+        Ok(())
     }
 
     /// Read the committed page image and the mirror-only state for a snapshot.
@@ -40765,6 +40921,12 @@ impl Connection {
         {
             self.flush_retained_autocommit_txn_for_read(&op_cx).await?;
         }
+        if self.memdb_rows_owed.get() {
+            let drops_debt =
+                is_write || matches!(statement, Statement::Begin(_) | Statement::Savepoint(_));
+            boxed_future(|| self.settle_owed_memdb_rows_at_statement_boundary(drops_debt, &op_cx))
+                .await?;
+        }
         // bd-jdjee's deferred mirror rebuild runs only after the retained batch
         // and the cached writer have been settled above, against the state they
         // leave; it stays armed while a retained batch is still parked.
@@ -41502,16 +41664,24 @@ impl Connection {
                 }
                 // CTE (WITH clause): materialize as temporary tables.
                 if select.with.is_some() {
-                    self.log_mem_execution_fallback("select", "with_clause_materialization")?;
+                    self.admit_select_mem_fallback(cx, "with_clause_materialization")
+                        .await?;
                     return boxed_future(|| self.execute_with_ctes(select, params)).await;
                 }
                 // View expansion: materialize referenced views as temp tables.
                 if self.has_view_references(select) {
                     if let Some(flattened) = self.flatten_simple_view_select(select) {
+                        // The flattened statement runs nested, where owed
+                        // mirror rows are not paid; pay them here as the read
+                        // boundary used to (bd-w4pr1.13.23).
+                        if self.memdb_rows_owed.get() {
+                            boxed_future(|| self.pay_owed_memdb_rows(cx)).await?;
+                        }
                         let flattened = Statement::Select(flattened);
                         return boxed_future(|| self.execute_statement(&flattened, params)).await;
                     }
-                    self.log_mem_execution_fallback("select", "view_materialization")?;
+                    self.admit_select_mem_fallback(cx, "view_materialization")
+                        .await?;
                     return boxed_future(|| self.execute_with_materialized_views(select, params))
                         .await;
                 }
@@ -41525,10 +41695,17 @@ impl Connection {
                 // mixed fallback. The fallback executes a single SELECT body
                 // and would otherwise ignore the right-hand compound arms.
                 if !select.body.compounds.is_empty() {
+                    // Each arm runs nested, where owed mirror rows are not
+                    // paid; pay them here as the read boundary used to
+                    // (bd-w4pr1.13.23).
+                    if self.memdb_rows_owed.get() {
+                        boxed_future(|| self.pay_owed_memdb_rows(cx)).await?;
+                    }
                     return lean_future(|| self.execute_compound_select(select, params)).await;
                 }
                 if self.attached_select_requires_local_fallback(select)? {
-                    self.log_mem_execution_fallback("select", "attached_mixed_select_fallback")?;
+                    self.admit_select_mem_fallback(cx, "attached_mixed_select_fallback")
+                        .await?;
                     let rewritten = lean_future(|| self.rewrite_in_subqueries_select(select, params)).await?;
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
@@ -41549,10 +41726,8 @@ impl Connection {
                 }
                 // 5G.4 (bd-3ly4): sqlite_master/sqlite_schema virtual table support.
                 if self.has_sqlite_schema_references(select) {
-                    self.log_mem_execution_fallback(
-                        "select",
-                        "sqlite_schema_virtual_materialization",
-                    )?;
+                    self.admit_select_mem_fallback(cx, "sqlite_schema_virtual_materialization")
+                        .await?;
                     return boxed_future(|| {
                         self.execute_with_materialized_sqlite_schema(select, params)
                     })
@@ -41720,7 +41895,8 @@ impl Connection {
                     // Correlated EXISTS subqueries in the WHERE clause require
                     // per-row evaluation of outer column refs unless the exact
                     // validated indexed COUNT(*) semijoin fast path applies.
-                    self.log_mem_execution_fallback("select", "correlated_exists_fallback")?;
+                    self.admit_select_mem_fallback(cx, "correlated_exists_fallback")
+                        .await?;
                     boxed_future(|| {
                         self.execute_correlated_subquery_where_fallback(cx, select, params)
                     })
@@ -41745,10 +41921,8 @@ impl Connection {
                     // row instead, so let those queries fall through to the
                     // min/max extremum-row path below, which inlines the
                     // subquery against the representative (extremum) row.
-                    self.log_mem_execution_fallback(
-                        "select",
-                        "correlated_scalar_subquery_fallback",
-                    )?;
+                    self.admit_select_mem_fallback(cx, "correlated_scalar_subquery_fallback")
+                        .await?;
                     boxed_future(|| {
                         self.execute_correlated_subquery_where_fallback(cx, select, params)
                     })
@@ -41764,10 +41938,8 @@ impl Connection {
                     // HAVING, an OFFSET) answers per outer row here. One in
                     // the WHERE clause was routed earlier
                     // (select_correlated_exists_where_requires_fallback).
-                    self.log_mem_execution_fallback(
-                        "select",
-                        "correlated_exists_subquery_fallback",
-                    )?;
+                    self.admit_select_mem_fallback(cx, "correlated_exists_subquery_fallback")
+                        .await?;
                     boxed_future(|| {
                         self.execute_correlated_subquery_where_fallback(cx, select, params)
                     })
@@ -41778,10 +41950,8 @@ impl Connection {
                     // left normally requires semantic fallback; the one
                     // complex ORDER/LIMIT RHS carve-out admitted below is
                     // independently proven to preserve its affinity.
-                    self.log_mem_execution_fallback(
-                        "select",
-                        "in_subquery_operand_semantic_fallback",
-                    )?;
+                    self.admit_select_mem_fallback(cx, "in_subquery_operand_semantic_fallback")
+                        .await?;
                     boxed_future(|| {
                         self.execute_correlated_subquery_where_fallback(cx, select, params)
                     })
@@ -41795,7 +41965,8 @@ impl Connection {
                     // eval_expr_with_subqueries substitutes outer refs per row
                     // (the InSet::Subquery arm). The correlated scalar `=` form is
                     // already handled in VDBE via emit_scalar_subquery.
-                    self.log_mem_execution_fallback("select", "correlated_in_subquery_fallback")?;
+                    self.admit_select_mem_fallback(cx, "correlated_in_subquery_fallback")
+                        .await?;
                     boxed_future(|| {
                         self.execute_correlated_subquery_where_fallback(cx, select, params)
                     })
@@ -41811,7 +41982,8 @@ impl Connection {
                             "group_by_window_storage_substrate",
                         );
                     } else {
-                        self.log_mem_execution_fallback("select", "group_by_window_fallback")?;
+                        self.admit_select_mem_fallback(cx, "group_by_window_fallback")
+                            .await?;
                     }
                     let rewritten = lean_future(|| self.rewrite_in_subqueries_select(select, params)).await?;
                     let mut bound =
@@ -41836,7 +42008,8 @@ impl Connection {
                 {
                     // GROUP BY (or implicit aggregation) + JOIN/non-table source/live vtab:
                     // materialize the join as a temp table, then GROUP BY on that.
-                    self.log_mem_execution_fallback("select", "group_by_join_fallback")?;
+                    self.admit_select_mem_fallback(cx, "group_by_join_fallback")
+                        .await?;
                     let rewritten = lean_future(|| self.rewrite_in_subqueries_select(select, params)).await?;
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
@@ -41852,7 +42025,8 @@ impl Connection {
                     }
                     Ok(rows)
                 } else if custom_implicit_aggregate {
-                    self.log_mem_execution_fallback("select", "custom_aggregate_fallback")?;
+                    self.admit_select_mem_fallback(cx, "custom_aggregate_fallback")
+                        .await?;
                     let rewritten = lean_future(|| self.rewrite_in_subqueries_select(select, params)).await?;
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
@@ -41878,7 +42052,8 @@ impl Connection {
                     // tracks that row for the plain single-table shapes
                     // (bd-6hoc8); route the rest to the grouped interpreter,
                     // which sources bare columns from that row.
-                    self.log_mem_execution_fallback("select", "minmax_bare_tracking_fallback")?;
+                    self.admit_select_mem_fallback(cx, "minmax_bare_tracking_fallback")
+                        .await?;
                     let rewritten = lean_future(|| self.rewrite_in_subqueries_select(select, params)).await?;
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
@@ -41919,7 +42094,8 @@ impl Connection {
                         }
                         return Ok(rows);
                     }
-                    self.log_mem_execution_fallback("select", "group_by_fallback")?;
+                    self.admit_select_mem_fallback(cx, "group_by_fallback")
+                        .await?;
                     let limit_clause = bound.limit.take();
                     let mut rows =
                         boxed_future(|| self.execute_group_by_select(&bound, None)).await?;
@@ -41939,7 +42115,8 @@ impl Connection {
                             "window_function_storage_substrate",
                         );
                     } else {
-                        self.log_mem_execution_fallback("select", "window_function_fallback")?;
+                        self.admit_select_mem_fallback(cx, "window_function_fallback")
+                            .await?;
                     }
                     let rewritten = lean_future(|| self.rewrite_in_subqueries_select(select, params)).await?;
                     let mut bound =
@@ -41958,7 +42135,8 @@ impl Connection {
                     // the table-only VDBE codegen path. Route single-source
                     // scans through the connection fallback, which can drive
                     // the registered vtab instance directly.
-                    self.log_mem_execution_fallback("select", "live_vtab_select_fallback")?;
+                    self.admit_select_mem_fallback(cx, "live_vtab_select_fallback")
+                        .await?;
                     let rewritten = lean_future(|| self.rewrite_in_subqueries_select(select, params)).await?;
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
@@ -42000,7 +42178,8 @@ impl Connection {
                     let native_join_dispatch =
                         self.can_execute_join_select_on_real_backend(rewritten.as_ref());
                     if !native_join_dispatch {
-                        self.log_mem_execution_fallback("select", "join_or_subquery_fallback")?;
+                        self.admit_select_mem_fallback(cx, "join_or_subquery_fallback")
+                            .await?;
                     }
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
@@ -42033,7 +42212,8 @@ impl Connection {
                     }
                     Ok(rows)
                 } else if has_table_function_source(select) {
-                    self.log_mem_execution_fallback("select", "join_or_subquery_fallback")?;
+                    self.admit_select_mem_fallback(cx, "join_or_subquery_fallback")
+                        .await?;
                     let rewritten = lean_future(|| self.rewrite_in_subqueries_select(select, params)).await?;
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
@@ -42054,7 +42234,8 @@ impl Connection {
                     // clause cannot be handled by the VDBE emit_scalar_subquery
                     // (which only opens one table cursor). Route through the
                     // connection-level fallback which can inline-evaluate them.
-                    self.log_mem_execution_fallback("select", "correlated_join_subquery_fallback")?;
+                    self.admit_select_mem_fallback(cx, "correlated_join_subquery_fallback")
+                        .await?;
                     let rewritten = lean_future(|| self.rewrite_in_subqueries_select(select, params)).await?;
                     let mut bound =
                         bind_placeholders_in_select_for_fallback(rewritten.as_ref(), params)?;
@@ -42082,10 +42263,8 @@ impl Connection {
                     // short-circuits with correct polarity. CRITICAL: bind
                     // placeholders only — do NOT call rewrite_in_subqueries_select
                     // here (it would re-trigger the eager execution we are avoiding).
-                    self.log_mem_execution_fallback(
-                        "select",
-                        "where_shortcircuit_subquery_fallback",
-                    )?;
+                    self.admit_select_mem_fallback(cx, "where_shortcircuit_subquery_fallback")
+                        .await?;
                     let mut bound = bind_placeholders_in_select_for_fallback(select, params)?;
                     let limit_clause = bound.limit.take();
                     if limit_clause
@@ -63027,10 +63206,12 @@ impl Connection {
                 .fetch_add(1, AtomicOrdering::Relaxed);
         }
         self.flush_retained_autocommit_txn(cx).await?;
-        // A read is about to execute against this connection, so eagerly
-        // realign the local execution image with the freshly committed pager
-        // state instead of depending on a later begin-time staleness check.
-        self.reload_memdb_from_pager(cx).await
+        // A read is about to execute against this connection, so realign the
+        // local execution image with the freshly committed pager state instead
+        // of depending on a later begin-time staleness check. On `:memory:` the
+        // row rebuild is left to the first reader of the mirror's rows
+        // (bd-w4pr1.13.23).
+        self.reload_memdb_from_pager_owing_rows(cx).await
     }
 
     /// Check if any tables in the read set overlap with the retained dirty set.
@@ -63100,7 +63281,16 @@ impl Connection {
         }
         // As in statement dispatch: the deferred mirror rebuild runs against
         // the state the refreshes and the retained-batch flush above leave.
+        if self.memdb_rows_owed.get() {
+            boxed_future(|| self.settle_owed_memdb_rows_at_statement_boundary(false, cx)).await?;
+        }
         self.hydrate_memdb_armed_by_capture(cx).await?;
+        // A prepared fast path answers from the mirror's rows, so it is their
+        // first reader: it pays a rebuild the read boundary left owed, as the
+        // boundary itself used to (bd-w4pr1.13.23).
+        if self.memdb_rows_owed.get() && stmt.prepared_query_fast_path.is_some() {
+            boxed_future(|| self.pay_owed_memdb_rows(cx)).await?;
+        }
 
         if self.committed_pager_refresh_allowed() {
             // PR#401 / GH#492: schema-only and large ordinary file connections
@@ -83317,6 +83507,13 @@ impl Connection {
                     if !enabled && self.path != ":memory:" && !self.memdb_rows_loaded.get() {
                         let cx = self.op_cx()?;
                         self.reload_memdb_from_pager_with_mode(&cx, true).await?;
+                    } else if !enabled {
+                        // The mirror is the row source of record again:
+                        // rebuild any rows a read boundary left owed
+                        // (bd-w4pr1.13.23).
+                        let cx = self.op_cx()?;
+                        self.settle_owed_memdb_rows_at_statement_boundary(false, &cx)
+                            .await?;
                     }
                     Ok(vec![Row {
                         values: vec![SqliteValue::Integer(i64::from(enabled))],
@@ -181523,12 +181720,16 @@ mod tests {
             .await
             .unwrap();
             // bd-jdjee: COMMIT and CREATE INDEX leave the :memory: row mirror
-            // stale; the first read after them (this scan) rebuilds it once.
+            // stale. The first read after them (this scan, a VDBE program)
+            // leaves its rebuild owed (bd-w4pr1.13.23); this test is about a
+            // loaded mirror, so load it.
             let scan_rows = conn
                 .query("SELECT * FROM prep_idx_eq_after_scan")
                 .await
                 .unwrap();
             assert_eq!(scan_rows.len(), 128);
+            let reload_cx = conn.op_cx().unwrap();
+            conn.reload_memdb_from_pager(&reload_cx).await.unwrap();
             conn.memdb_storage_count_shortcuts_safe.set(false);
             assert!(conn.memdb_rows_loaded.get());
             assert!(
@@ -211509,6 +211710,11 @@ mod tests {
                 .query("SELECT payload FROM cache_probe;")
                 .await
                 .unwrap();
+            // That read leaves the mirror's rebuild owed (bd-w4pr1.13.23), and
+            // the table-function read below would pay it, touching page 1
+            // after the snapshot it is compared with. Pay it first.
+            let reload_cx = conn.op_cx().unwrap();
+            conn.reload_memdb_from_pager(&reload_cx).await.unwrap();
 
             let cx = Cx::new();
             let mut txn = conn
@@ -228014,6 +228220,237 @@ mod autocommit_txn_tests {
                 profile.retained_autocommit_read_after_write_flushes, 0,
                 "file-backed reads never flush a retained batch (none is parked): {profile:?}"
             );
+        });
+    }
+
+    /// bd-w4pr1.13.23: on `:memory:` a read after a write leaves the row
+    /// mirror's rebuild owed. A VDBE read never pays it; the first in-memory
+    /// fallback does, and it must read every write since the mirror was last
+    /// loaded (a mirror marked current without the rebuild returns the old
+    /// sums). Every read matches stock across UPDATE, DELETE, INSERT, ROLLBACK,
+    /// ROLLBACK TO and a prepared re-run; turning parity cert off (PRAGMA or
+    /// setter) makes the mirror the row source of record again and pays.
+    #[test]
+    fn test_memory_mirror_rows_owed_until_a_fallback_reads_them_match_rusqlite() {
+        const VDBE_READ: &str = "SELECT count(*), sum(a), sum(c) FROM t WHERE a > 1";
+        const VDBE_READ_U: &str = "SELECT count(*), sum(length(name)) FROM u";
+        const JOIN_GROUP: &str = "SELECT u.name, count(*), sum(t.c), max(t.id) FROM t \
+                                  JOIN u ON u.a = t.a GROUP BY u.name ORDER BY u.name";
+
+        fn render(values: &[SqliteValue]) -> String {
+            values
+                .iter()
+                .map(|value| match value {
+                    SqliteValue::Null => "NULL".to_owned(),
+                    SqliteValue::Integer(n) => n.to_string(),
+                    SqliteValue::Float(f) => format!("{f:?}"),
+                    SqliteValue::Text(text) => format!("'{text}'"),
+                    other => format!("{other:?}"),
+                })
+                .collect::<Vec<_>>()
+                .join("|")
+        }
+
+        fn oracle_rows(oracle: &rusqlite::Connection, sql: &str) -> Vec<String> {
+            let mut stmt = oracle.prepare(sql).unwrap();
+            let width = stmt.column_count();
+            stmt.query_map([], |row| {
+                Ok((0..width)
+                    .map(|i| match row.get_unwrap::<_, rusqlite::types::Value>(i) {
+                        rusqlite::types::Value::Null => "NULL".to_owned(),
+                        rusqlite::types::Value::Integer(n) => n.to_string(),
+                        rusqlite::types::Value::Real(f) => format!("{f:?}"),
+                        rusqlite::types::Value::Text(text) => format!("'{text}'"),
+                        rusqlite::types::Value::Blob(bytes) => format!("{bytes:?}"),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("|"))
+            })
+            .unwrap()
+            .map(std::result::Result::unwrap)
+            .collect()
+        }
+
+        async fn check(conn: &Connection, oracle: &rusqlite::Connection, sql: &str) {
+            let rows: Vec<String> = conn
+                .query(sql)
+                .await
+                .unwrap_or_else(|error| panic!("`{sql}`: {error}"))
+                .iter()
+                .map(|row| render(row.values()))
+                .collect();
+            assert_eq!(rows, oracle_rows(oracle, sql), "`{sql}`");
+        }
+
+        async fn both(conn: &Connection, oracle: &rusqlite::Connection, sql: &str) {
+            conn.execute(sql)
+                .await
+                .unwrap_or_else(|error| panic!("`{sql}`: {error}"));
+            oracle.execute_batch(sql).unwrap();
+        }
+
+        async fn setup(conn: &Connection, oracle: &rusqlite::Connection) {
+            for sql in [
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, c REAL)",
+                "CREATE TABLE u(a INTEGER PRIMARY KEY, name TEXT)",
+            ] {
+                both(conn, oracle, sql).await;
+            }
+            // The scorecard's shape on our side; a recursive CTE for stock,
+            // whose bundled build has no generate_series.
+            conn.execute(
+                "INSERT INTO t SELECT value, value % 7, value * 1.5 \
+                 FROM generate_series(1, 300)",
+            )
+            .await
+            .unwrap();
+            conn.execute("INSERT INTO u SELECT value, 'n' || value FROM generate_series(0, 6)")
+                .await
+                .unwrap();
+            oracle
+                .execute_batch(
+                    "WITH RECURSIVE s(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM s \
+                     WHERE value < 300) INSERT INTO t SELECT value, value % 7, value * 1.5 FROM s;
+                     WITH RECURSIVE s(value) AS (SELECT 0 UNION ALL SELECT value + 1 FROM s \
+                     WHERE value < 6) INSERT INTO u SELECT value, 'n' || value FROM s;",
+                )
+                .unwrap();
+        }
+
+        fn assert_owed(conn: &Connection, after: &str) {
+            assert!(
+                !conn.memdb_rows_loaded.get() && conn.memdb_rows_owed.get(),
+                "after {after}, a VDBE read must leave the mirror's rows owed, not rebuilt \
+                 (loaded={}, owed={})",
+                conn.memdb_rows_loaded.get(),
+                conn.memdb_rows_owed.get()
+            );
+        }
+
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            let oracle = rusqlite::Connection::open_in_memory().unwrap();
+            setup(&conn, &oracle).await;
+
+            // A VDBE read after the writes rebuilds nothing.
+            check(&conn, &oracle, VDBE_READ_U).await;
+            check(&conn, &oracle, VDBE_READ).await;
+            assert_owed(&conn, "the setup writes");
+
+            // The join's GROUP BY runs in the evaluator, which pays first.
+            conn.set_fallback_capture_enabled(true);
+            check(&conn, &oracle, JOIN_GROUP).await;
+            assert!(
+                conn.fallback_decision_snapshot()
+                    .decisions
+                    .iter()
+                    .any(|decision| decision.decision_reason == "group_by_join_fallback"),
+                "the join GROUP BY must take the in-memory fallback for this test to mean anything"
+            );
+            conn.set_fallback_capture_enabled(false);
+            assert!(
+                conn.memdb_rows_loaded.get() && !conn.memdb_rows_owed.get(),
+                "the in-memory fallback must rebuild the owed rows before reading them"
+            );
+
+            // A loaded mirror goes stale under each write; the next fallback
+            // must read the write, not the rows it loaded before it. (A write
+            // whose batch is flushed outside a read leaves the rows unloaded
+            // and not owed, as before this change; the fallback then reads
+            // without the mirror.)
+            for (index, write) in [
+                "UPDATE t SET c = c + 1000 WHERE a = 2",
+                "DELETE FROM t WHERE id % 5 = 0",
+                "INSERT INTO t VALUES (1001, 3, 7.25)",
+                "UPDATE u SET name = 'renamed' WHERE a = 4",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                both(&conn, &oracle, write).await;
+                check(&conn, &oracle, VDBE_READ).await;
+                check(&conn, &oracle, VDBE_READ_U).await;
+                assert!(
+                    !conn.memdb_rows_loaded.get(),
+                    "a VDBE read after `{write}` must not rebuild the mirror's rows"
+                );
+                if index == 0 {
+                    assert_owed(&conn, write);
+                }
+                check(&conn, &oracle, JOIN_GROUP).await;
+                check(&conn, &oracle, JOIN_GROUP).await;
+            }
+
+            // ROLLBACK, inside and after the transaction.
+            both(&conn, &oracle, "BEGIN").await;
+            both(&conn, &oracle, "UPDATE t SET a = (a + 1) % 7 WHERE id <= 50").await;
+            check(&conn, &oracle, JOIN_GROUP).await;
+            check(&conn, &oracle, VDBE_READ).await;
+            both(&conn, &oracle, "ROLLBACK").await;
+            check(&conn, &oracle, VDBE_READ).await;
+            check(&conn, &oracle, JOIN_GROUP).await;
+
+            // ROLLBACK TO a savepoint, then RELEASE.
+            both(&conn, &oracle, "SAVEPOINT s1").await;
+            both(&conn, &oracle, "DELETE FROM u WHERE a = 3").await;
+            check(&conn, &oracle, JOIN_GROUP).await;
+            both(&conn, &oracle, "ROLLBACK TO s1").await;
+            check(&conn, &oracle, JOIN_GROUP).await;
+            both(&conn, &oracle, "RELEASE s1").await;
+            check(&conn, &oracle, VDBE_READ).await;
+            check(&conn, &oracle, JOIN_GROUP).await;
+
+            // A prepared fallback re-run after a write and a VDBE read.
+            let prepared = conn.prepare(JOIN_GROUP).await.unwrap();
+            let rerun = |rows: Vec<Row>| -> Vec<String> {
+                rows.iter().map(|row| render(row.values())).collect()
+            };
+            assert_eq!(
+                rerun(prepared.query().await.unwrap()),
+                oracle_rows(&oracle, JOIN_GROUP)
+            );
+            // An explicit COMMIT is a capture point: the next read owes.
+            both(&conn, &oracle, "BEGIN").await;
+            both(&conn, &oracle, "INSERT INTO t VALUES (1002, 5, 0.5)").await;
+            both(&conn, &oracle, "COMMIT").await;
+            check(&conn, &oracle, VDBE_READ).await;
+            assert_owed(&conn, "a committed INSERT before a prepared re-run");
+            assert_eq!(
+                rerun(prepared.query().await.unwrap()),
+                oracle_rows(&oracle, JOIN_GROUP),
+                "a prepared fallback must read the INSERT made after its last run"
+            );
+            drop(prepared);
+
+            // Parity cert off makes the mirror the row source of record
+            // again: owed rows are rebuilt from the committed image.
+            both(&conn, &oracle, "BEGIN").await;
+            both(&conn, &oracle, "UPDATE t SET a = 6 WHERE id = 7").await;
+            both(&conn, &oracle, "COMMIT").await;
+            check(&conn, &oracle, VDBE_READ).await;
+            assert_owed(&conn, "an UPDATE before PRAGMA parity_cert = OFF");
+            conn.execute("PRAGMA fsqlite.parity_cert = OFF").await.unwrap();
+            assert!(
+                conn.memdb_rows_loaded.get() && !conn.memdb_rows_owed.get(),
+                "PRAGMA parity_cert = OFF must rebuild the owed rows"
+            );
+            check(&conn, &oracle, VDBE_READ).await;
+            check(&conn, &oracle, "SELECT id, a, c FROM t WHERE id IN (7, 1001, 1002)").await;
+            check(&conn, &oracle, JOIN_GROUP).await;
+
+            let conn = Connection::open(":memory:").await.unwrap();
+            let oracle = rusqlite::Connection::open_in_memory().unwrap();
+            setup(&conn, &oracle).await;
+            check(&conn, &oracle, VDBE_READ_U).await;
+            check(&conn, &oracle, VDBE_READ).await;
+            assert_owed(&conn, "the setup writes of a second connection");
+            conn.set_reject_mem_fallback(false);
+            check(&conn, &oracle, VDBE_READ).await;
+            assert!(
+                conn.memdb_rows_loaded.get() && !conn.memdb_rows_owed.get(),
+                "the statement after set_reject_mem_fallback(false) must rebuild the owed rows"
+            );
+            check(&conn, &oracle, "SELECT id, a, c FROM t WHERE id IN (1, 150, 300)").await;
         });
     }
 
@@ -250747,6 +251184,10 @@ mod pager_routing_tests {
                     vec![SqliteValue::Integer(2), SqliteValue::Text("b".into()),],
                 ]
             );
+            // That read runs in the VDBE and leaves the mirror's rebuild owed
+            // (bd-w4pr1.13.23); this test starts from a loaded mirror.
+            let reload_cx = conn.op_cx().unwrap();
+            conn.reload_memdb_from_pager(&reload_cx).await.unwrap();
 
             let memdb_values = |conn: &Connection| -> Vec<(i64, SqliteValue)> {
                 let db = conn.db.borrow();
@@ -253239,6 +253680,10 @@ mod pager_routing_tests {
                 .await
                 .unwrap();
             assert_eq!(hydrated_rows.len(), 2);
+            // That read runs in the VDBE and leaves the mirror's rebuild owed
+            // (bd-w4pr1.13.23); this test needs the mirror loaded.
+            let reload_cx = conn.op_cx().unwrap();
+            conn.reload_memdb_from_pager(&reload_cx).await.unwrap();
 
             {
                 let mut db = conn.db.borrow_mut();
