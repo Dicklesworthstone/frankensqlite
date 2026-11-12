@@ -87,6 +87,33 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-12 - WIN: a WHERE comparison on expressions jumps on the inverse operator instead of testing a 0/1/NULL value (bd-w4pr1.13.20)
+
+- Target: scans whose WHERE compares expressions rather than a column of the scanned table
+  (`id % 7 = 0`, `length(b) >= 2`): the scorecard UPDATE and DELETE, and any SELECT through the
+  same filter emitter. Touched: `crates/fsqlite-vdbe/src/codegen.rs`
+  (`emit_where_filter_with_ctx`, new `emit_where_comparison_jump`).
+- Evidence before: `EXPLAIN DELETE FROM m WHERE id % 7 = 0` ran 11 opcodes per scanned row
+  (Rowid, Integer, Remainder, Integer, IsNull, IsNull, Eq, Integer, Goto, IfNot, Next) against
+  stock's 4: the comparison was emitted as a 0/1/NULL value and then tested with IfNot.
+- Change: the same operands in the same order, the same two NULL checks, collation
+  (`comparison_collation_ctx`) and affinity (`comparison_affinity_p5`) as `emit_comparison`, and
+  one jump on the inverse operator to the skip label. Column comparisons keep their paths.
+- Result (stock sqlite3 3.46.1 live, ring refused, 3 reps, repeatable; binaries 814e895d... main
+  76c797eeb, 5f102828... candidate 1ed5494ae = 3b5bdc3d9 rebased): `DELETE FROM m WHERE id % 7
+  = 0` 801.7M -> 756.5M (-5.6%; 6.64x -> 6.27x stock), CPU 160.3 -> 145.2 ms; `UPDATE m SET a =
+  a + 1 WHERE id % 10 = 0` 1,143.8M -> 1,098.0M (-4.0%); `SELECT count(*) FROM t WHERE a % 7 = 0`
+  over 1M rows 1,430.2M -> 1,279.7M (3.28x -> 2.94x); control `WHERE a > 500` 1,312.0M both.
+  Predicted DELETE -70M to -110M; measured -45.2M (the dropped opcodes cost about 50 instructions
+  each, not 100). Kill (DELETE down less than 30M): not met.
+- Gate: clippy -D warnings on fsqlite-vdbe and fsqlite-core clean; bytecode goldens 8 pass
+  unchanged; fsqlite-core lib 353 pass (where/update/delete filters), new
+  `test_where_expression_comparisons_match_rusqlite` (504 SELECTs and 5 UPDATE/DELETE against
+  rusqlite); 81 EXPLAIN-reading integration targets green except five reds already red on main
+  (bd-bhalc and four others with failing histories in earlier gates).
+- Retry condition: the constants (`Integer 7`, `Integer 0`) are still reloaded every row; hoisting
+  loop-invariant constants into the prologue is the next lever on this shape.
+
 ## 2026-11-12 - WIN: a page read whose bytes the kernel holds is read inline, not through the shared io_uring ring (bd-w4pr1.13.19)
 
 - Target: every page read of a caller that attaches a native context, the shell among them, on
