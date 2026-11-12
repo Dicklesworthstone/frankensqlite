@@ -87,6 +87,36 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-12 - WIN: a page read whose bytes the kernel holds is read inline, not through the shared io_uring ring (bd-w4pr1.13.19)
+
+- Target: every page read of a caller that attaches a native context, the shell among them, on
+  the scorecard read rows as the scorecard runs them (io_uring allowed). Touched:
+  `crates/fsqlite-vfs/src/uring.rs` (`read_data_path`, `read_hot_inline`, `pread_nowait`,
+  `file_is_memory_backed`), `crates/fsqlite-vfs/src/unix.rs` (crate visibility of three helpers).
+- Evidence before (main 76c797eeb, stock live, ring allowed, 5 reps, load 2.5): count(*) over the
+  1M-row table 60.4M/92.9M/116.9M user instructions (min/med/max), 79.8 ms CPU, 6.13x stock;
+  57.4M and 22-27 ms with io_uring refused. Each read through the ring paid two scheduler
+  passes, the driver thread and about seven syscalls until the latency policy tripped.
+- Change: per file, probed at its first read, a read of at most 64 KiB is done on the calling
+  thread when no byte of it waits on a device: always on tmpfs/ramfs, else when
+  `preadv2(RWF_NOWAIT)` returns the whole buffer; EAGAIN or a short transfer goes to the ring,
+  EOPNOTSUPP/EINVAL/ENOSYS keeps the file on the ring. Writes and larger reads unchanged.
+- Result (stock sqlite3 3.46.1 live, same invocation, ring allowed, binaries 814e895d... main,
+  6d8cd280... candidate cf94d66bd = df77d4248 rebased; CPU median):
+  count(*) 10 reps, load 7.0: 72.7M/91.6M/111.2M -> 57.7M every run; 74.8 -> 21.9 ms (5.99x ->
+  1.76x stock). scan_filter_agg 10 reps: 138.4 -> 105.4 ms (2.58x -> 1.96x), 1,312.3M every run.
+  3 reps, load 6.1: rowid lookups 774.1 -> 709.7 ms (2.05x -> 1.88x); join_1M 522.0 -> 414.9 ms
+  (2.68x -> 2.13x); order_by_text_limit10 187.5 -> 132.7 ms (2.80x -> 1.98x); group_by
+  440.1 -> 393.1 ms (2.10x -> 1.88x). Every answer equals stock's. Kill (count(*) CPU not
+  within 15% of the ring-refused figure over 10 runs): not met.
+- Gate: clippy -D warnings on fsqlite-vfs clean; fsqlite-vfs lib passes except
+  `test_io_uring_recycled_read_buffer_is_sized_to_each_request`, which also flakes on main
+  (1 of 3 runs of the uring filter on f12f2d0a3; bd-w4pr1.13.30); fsqlite-pager and
+  fsqlite-core uring lib tests 11 and 13 pass. The module's ring tests keep their reads on the
+  ring under their guard (test-only `FORCE_RING_READS`).
+- Retry condition: none. If a host shows inline hot reads stalling the executor (tmpfs pages
+  swapped out), route tmpfs through RWF_NOWAIT too, which tmpfs answers EOPNOTSUPP today.
+
 ## 2026-11-12 - REJECTED: a connection's own published commit authorizes its certificate without re-reading its frames (bd-w4pr1.13.20, lever D)
 
 - Target: the autocheckpoint after a large own commit, scorecard table `m` (300k rows):
