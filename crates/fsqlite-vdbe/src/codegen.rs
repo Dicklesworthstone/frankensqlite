@@ -33876,11 +33876,14 @@ fn emit_where_filter_with_ctx(
                 b.free_temp(col_reg);
             } else {
                 // Neither side is a column ref (e.g. WHERE 1 = 0, WHERE length(name) = 5).
-                // Fall through to generic boolean evaluation.
-                let cond_reg = b.alloc_temp();
-                emit_expr(b, where_expr, cond_reg, Some(scan));
-                b.emit_jump_to_label(Opcode::IfNot, cond_reg, 1, skip_label, P4::None, 0);
-                b.free_temp(cond_reg);
+                emit_where_comparison_jump(
+                    b,
+                    left,
+                    fsqlite_ast::BinaryOp::Eq,
+                    right,
+                    scan,
+                    skip_label,
+                );
             }
         }
         // Inequality comparisons: Ne, Lt, Le, Gt, Ge.
@@ -33958,10 +33961,7 @@ fn emit_where_filter_with_ctx(
                 b.free_temp(val_reg);
                 b.free_temp(col_reg);
             } else {
-                let cond_reg = b.alloc_temp();
-                emit_expr(b, where_expr, cond_reg, Some(scan));
-                b.emit_jump_to_label(Opcode::IfNot, cond_reg, 1, skip_label, P4::None, 0);
-                b.free_temp(cond_reg);
+                emit_where_comparison_jump(b, left, *op, right, scan, skip_label);
             }
         }
         Expr::BinaryOp {
@@ -34001,6 +34001,47 @@ fn emit_where_filter_with_ctx(
             b.free_temp(cond_reg);
         }
     }
+}
+
+/// Jump to `skip_label` unless `left op right` is true, for a comparison
+/// operator (`=`, `<>`, `<`, `<=`, `>`, `>=`).
+///
+/// This is [`emit_comparison`]'s test (the same operands, evaluated in the
+/// same order, the same two NULL checks, collation and affinity) as one jump
+/// on the inverse operator, where the value form stored 0, 1 or NULL and then
+/// tested it with `IfNot` (bd-w4pr1.13.20). For non-NULL operands under one
+/// collation and affinity, each operator and its inverse are complements, so
+/// the rows that pass are the same.
+fn emit_where_comparison_jump(
+    b: &mut ProgramBuilder,
+    left: &Expr,
+    op: fsqlite_ast::BinaryOp,
+    right: &Expr,
+    scan: &ScanCtx<'_>,
+    skip_label: crate::Label,
+) {
+    let skip_opcode = match op {
+        fsqlite_ast::BinaryOp::Eq => Opcode::Ne,
+        fsqlite_ast::BinaryOp::Ne => Opcode::Eq,
+        fsqlite_ast::BinaryOp::Lt => Opcode::Ge,
+        fsqlite_ast::BinaryOp::Le => Opcode::Gt,
+        fsqlite_ast::BinaryOp::Gt => Opcode::Le,
+        fsqlite_ast::BinaryOp::Ge => Opcode::Lt,
+        _ => unreachable!("emit_where_comparison_jump takes a comparison operator"),
+    };
+    let ctx = Some(scan);
+    let r_left = b.alloc_temp();
+    let r_right = b.alloc_temp();
+    emit_expr(b, left, r_left, ctx);
+    emit_expr(b, right, r_right, ctx);
+    let p4 = comparison_collation_ctx(left, right, ctx).map_or(P4::None, P4::Collation);
+    b.emit_jump_to_label(Opcode::IsNull, r_left, 0, skip_label, P4::None, 0);
+    b.emit_jump_to_label(Opcode::IsNull, r_right, 0, skip_label, P4::None, 0);
+    let cmp_aff = comparison_affinity_p5(left, right, ctx);
+    // Comparison: p1=rhs_reg, p2=jump_target (label), p3=lhs_reg
+    b.emit_jump_to_label(skip_opcode, r_right, r_left, skip_label, p4, cmp_aff);
+    b.free_temp(r_right);
+    b.free_temp(r_left);
 }
 
 struct ResolvedComparisonInfo {

@@ -207861,6 +207861,113 @@ mod tests {
         assert!(empty.key(5).is_empty());
     }
 
+    /// bd-w4pr1.13.20: a WHERE comparison neither side of which is a column of
+    /// the scanned table jumps on the inverse operator instead of testing a
+    /// 0/1/NULL value. Every operator, NULL on either side, TEXT against
+    /// numbers with and without affinity, and a COLLATE, through SELECT,
+    /// UPDATE and DELETE on a file-backed table, against stock.
+    #[test]
+    fn test_where_expression_comparisons_match_rusqlite() {
+        fn render(values: &[SqliteValue]) -> String {
+            values
+                .iter()
+                .map(|value| match value {
+                    SqliteValue::Null => "NULL".to_owned(),
+                    SqliteValue::Integer(n) => n.to_string(),
+                    SqliteValue::Float(f) => format!("{f:?}"),
+                    SqliteValue::Text(text) => format!("'{text}'"),
+                    other => format!("{other:?}"),
+                })
+                .collect::<Vec<_>>()
+                .join("|")
+        }
+
+        fn oracle_rows(oracle: &rusqlite::Connection, sql: &str) -> Vec<String> {
+            let mut stmt = oracle.prepare(sql).unwrap();
+            let width = stmt.column_count();
+            stmt.query_map([], |row| {
+                Ok((0..width)
+                    .map(|i| match row.get_unwrap::<_, rusqlite::types::Value>(i) {
+                        rusqlite::types::Value::Null => "NULL".to_owned(),
+                        rusqlite::types::Value::Integer(n) => n.to_string(),
+                        rusqlite::types::Value::Real(f) => format!("{f:?}"),
+                        rusqlite::types::Value::Text(text) => format!("'{text}'"),
+                        rusqlite::types::Value::Blob(bytes) => format!("{bytes:?}"),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("|"))
+            })
+            .unwrap()
+            .map(std::result::Result::unwrap)
+            .collect()
+        }
+
+        async fn check(conn: &Connection, oracle: &rusqlite::Connection, sql: &str) {
+            let rows: Vec<String> = conn
+                .query(sql)
+                .await
+                .unwrap_or_else(|error| panic!("`{sql}`: {error}"))
+                .iter()
+                .map(|row| render(row.values()))
+                .collect();
+            assert_eq!(rows, oracle_rows(oracle, sql), "`{sql}`");
+        }
+
+        async fn both(conn: &Connection, oracle: &rusqlite::Connection, sql: &str) {
+            conn.execute(sql)
+                .await
+                .unwrap_or_else(|error| panic!("`{sql}`: {error}"));
+            oracle.execute_batch(sql).unwrap();
+        }
+
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("where_comparison_jump.db");
+            let conn = Connection::open(path.to_str().unwrap()).await.unwrap();
+            let oracle = rusqlite::Connection::open_in_memory().unwrap();
+            for sql in [
+                "CREATE TABLE w(id INTEGER PRIMARY KEY, a INTEGER, b TEXT, c REAL, d)",
+                "INSERT INTO w VALUES (1, 1, '1', 1.0, 'x')",
+                "INSERT INTO w VALUES (2, 2, '10', 2.5, 'X')",
+                "INSERT INTO w VALUES (3, NULL, 'abc', NULL, NULL)",
+                "INSERT INTO w VALUES (4, 7, '7', 7.0, 7)",
+                "INSERT INTO w VALUES (5, 14, NULL, -3.5, '14')",
+                "INSERT INTO w VALUES (6, -7, 'ABC', 0.0, 'abc')",
+                "INSERT INTO w VALUES (7, 0, '', 1e100, 7.0)",
+            ] {
+                both(&conn, &oracle, sql).await;
+            }
+            // No side is a plain column of `w`, so each takes the jump.
+            let lefts = [
+                "a % 7", "id % 7", "+a", "b || ''", "c * 2", "lower(b)", "+d", "a % NULL",
+                "abs(c)",
+            ];
+            let rights = [
+                "0", "'7'", "NULL", "id % 3", "'abc' COLLATE NOCASE", "7.0", "'1'", "+b",
+            ];
+            for op in ["=", "<>", "<", "<=", ">", ">=", "=="] {
+                for left in lefts {
+                    for right in rights {
+                        let sql = format!(
+                            "SELECT count(*), sum(id), sum(id * id) FROM w WHERE {left} {op} {right}"
+                        );
+                        check(&conn, &oracle, &sql).await;
+                    }
+                }
+            }
+            for sql in [
+                "UPDATE w SET c = c + 1 WHERE id % 2 = 1",
+                "UPDATE w SET b = 'u' WHERE length(b) >= 2",
+                "UPDATE w SET d = 'y' WHERE +d <> 'x' COLLATE NOCASE",
+                "DELETE FROM w WHERE a % 7 = 0",
+                "DELETE FROM w WHERE lower(b) < 'v'",
+            ] {
+                both(&conn, &oracle, sql).await;
+                check(&conn, &oracle, "SELECT * FROM w ORDER BY id").await;
+            }
+        });
+    }
+
     #[test]
     fn test_window_scan_named_columns_drops_only_unnamed_columns() {
         let entry = |column: &str, hidden: bool| ("w".to_owned(), column.to_owned(), hidden);
