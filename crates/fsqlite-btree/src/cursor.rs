@@ -927,6 +927,80 @@ fn recycle_cell_pointers(mut buf: Vec<u16>) {
     });
 }
 
+/// Pages a cursor decoded recently, by page number and exact image
+/// (bd-w4pr1.13.26).
+///
+/// Loading a page parses its header and decodes and range-checks its whole
+/// cell-pointer array. A cursor that seeks again and again (a join's lookups,
+/// an index probe per row) loads the same unchanged root and interior pages
+/// each time. A [`PageData::image_token`] names one exact immutable image (a
+/// clone keeps it, every mutable access assigns a fresh one), so a page whose
+/// image this memo decoded has the same header and the same checked pointers,
+/// and the load takes them from here. Direct-mapped on the page number.
+#[derive(Debug, Default)]
+struct DecodedPageMemo {
+    slots: [Option<DecodedPage>; DECODED_PAGE_MEMO_SLOTS],
+    #[cfg(test)]
+    hits: std::cell::Cell<u64>,
+}
+
+const DECODED_PAGE_MEMO_SLOTS: usize = 8;
+
+#[derive(Debug)]
+struct DecodedPage {
+    page_no: PageNumber,
+    image_token: u64,
+    header: BtreePageHeader,
+    cell_pointers: Vec<u16>,
+}
+
+impl DecodedPageMemo {
+    fn slot(page_no: PageNumber) -> usize {
+        usize::try_from(page_no.get()).unwrap_or(0) % DECODED_PAGE_MEMO_SLOTS
+    }
+
+    /// The header and a copy of the checked cell pointers of `page_no`'s image
+    /// `image_token`, when this memo decoded that image.
+    fn lookup(&self, page_no: PageNumber, image_token: u64) -> Option<(BtreePageHeader, Vec<u16>)> {
+        let decoded = self.slots[Self::slot(page_no)].as_ref()?;
+        if decoded.page_no != page_no || decoded.image_token != image_token {
+            return None;
+        }
+        let mut cell_pointers = take_pooled_cell_pointers();
+        cell_pointers.clear();
+        cell_pointers.extend_from_slice(&decoded.cell_pointers);
+        #[cfg(test)]
+        self.hits.set(self.hits.get() + 1);
+        Some((decoded.header, cell_pointers))
+    }
+
+    /// Remember the header and checked cell pointers of `page_no`'s image
+    /// `image_token`, in place of whatever that slot held.
+    fn remember(
+        &mut self,
+        page_no: PageNumber,
+        image_token: u64,
+        header: BtreePageHeader,
+        cell_pointers: &[u16],
+    ) {
+        let slot = &mut self.slots[Self::slot(page_no)];
+        if let Some(decoded) = slot {
+            decoded.page_no = page_no;
+            decoded.image_token = image_token;
+            decoded.header = header;
+            decoded.cell_pointers.clear();
+            decoded.cell_pointers.extend_from_slice(cell_pointers);
+        } else {
+            *slot = Some(DecodedPage {
+                page_no,
+                image_token,
+                header,
+                cell_pointers: cell_pointers.to_vec(),
+            });
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Cursor stack entry
 // ---------------------------------------------------------------------------
@@ -2484,6 +2558,8 @@ pub struct BtCursor<P> {
     /// Best-known depth for this tree, even when a hot append helper leaves
     /// the cursor stack empty on purpose.
     last_known_depth: Option<usize>,
+    /// Headers and checked cell pointers of page images this cursor loaded.
+    decoded_pages: DecodedPageMemo,
     /// Whether the last `index_insert` seek ran past the last cell of the
     /// rightmost leaf, i.e. the key sorts after every key already stored.
     last_index_insert_past_rightmost: bool,
@@ -3069,6 +3145,7 @@ impl<P: PageReader> BtCursor<P> {
             last_insert_rowid: None,
             rightmost_leaf_cache: None,
             last_known_depth: None,
+            decoded_pages: DecodedPageMemo::default(),
             last_index_insert_past_rightmost: false,
             seek_cache: [None; TABLE_SEEK_CACHE_SLOTS],
             row_image_epoch: 0,
@@ -3795,16 +3872,26 @@ impl<P: PageReader> BtCursor<P> {
 
         self.note_page_visit(page_no);
         let page_data = self.pager.read_btree_page_data(cx, page_no).await?;
-        let header_offset = cell::header_offset_for_page(page_no);
-        let header = cell::parse_page_header(page_data.as_bytes(), page_no)?;
-        let mut cell_pointers = take_pooled_cell_pointers();
-        cell::read_cell_pointers_into(
-            cell::usable_prefix(page_data.as_bytes(), self.usable_size),
-            &header,
-            header_offset,
-            &mut cell_pointers,
-        )?;
         let mutation_counter = Self::page_mutation_counter(&page_data);
+        // The same image decodes to the same header and the same checked
+        // pointers; see `DecodedPageMemo`.
+        let (header, cell_pointers) =
+            if let Some(decoded) = self.decoded_pages.lookup(page_no, mutation_counter) {
+                decoded
+            } else {
+                let header_offset = cell::header_offset_for_page(page_no);
+                let header = cell::parse_page_header(page_data.as_bytes(), page_no)?;
+                let mut cell_pointers = take_pooled_cell_pointers();
+                cell::read_cell_pointers_into(
+                    cell::usable_prefix(page_data.as_bytes(), self.usable_size),
+                    &header,
+                    header_offset,
+                    &mut cell_pointers,
+                )?;
+                self.decoded_pages
+                    .remember(page_no, mutation_counter, header, &cell_pointers);
+                (header, cell_pointers)
+            };
 
         Ok(StackEntry {
             page_no,
@@ -17265,6 +17352,69 @@ mod tests {
 
             let err = cursor.rowid(&cx).await.unwrap_err();
             assert!(matches!(err, FrankenError::DatabaseCorrupt { .. }));
+        });
+    }
+
+    #[test]
+    fn test_load_page_reuses_a_decoded_image_and_never_a_changed_one() {
+        // bd-w4pr1.13.26: seeks that load an unchanged page again take its
+        // decoded header and pointers from the cursor's memo. Inserting rows
+        // between the existing ones changes the leaves and splits them (new
+        // images, new interior cells); every later seek must still land on
+        // exactly the rows the table holds. A memo keyed on the page number
+        // alone would hand back the old pointer arrays here.
+        run_async(async {
+            let cx = Cx::new();
+            let mut store = MemPageStore::new(USABLE);
+            store.pages.insert(2, build_leaf_table(&[]));
+            let mut cursor = BtCursor::new(store, pn(2), USABLE, true);
+            let payload = |rowid: i64| {
+                serialize_record(&[
+                    SqliteValue::Integer(rowid),
+                    SqliteValue::Text(format!("row-{rowid}").as_str().into()),
+                ])
+            };
+            for rowid in (2..=4_000_i64).step_by(2) {
+                cursor
+                    .table_insert(&cx, rowid, &payload(rowid))
+                    .await
+                    .unwrap();
+            }
+            assert!(cursor.pager.pages.len() > 3, "the table has interior pages");
+
+            let hits_before = cursor.decoded_pages.hits.get();
+            for rowid in (2..=4_000_i64).step_by(74) {
+                assert!(cursor.table_move_to(&cx, rowid).await.unwrap().is_found());
+                assert_eq!(cursor.payload(&cx).await.unwrap(), payload(rowid));
+            }
+            assert!(
+                cursor.decoded_pages.hits.get() > hits_before,
+                "repeated seeks take the decoded root from the memo"
+            );
+
+            for rowid in (1..=3_999_i64).step_by(2) {
+                cursor
+                    .table_insert(&cx, rowid, &payload(rowid))
+                    .await
+                    .unwrap();
+                if rowid % 401 == 0 {
+                    for probe in [rowid - 1, rowid, rowid + 1, 2, 4_000] {
+                        assert!(
+                            cursor.table_move_to(&cx, probe).await.unwrap().is_found(),
+                            "row {probe} after inserting {rowid}"
+                        );
+                        assert_eq!(cursor.payload(&cx).await.unwrap(), payload(probe));
+                    }
+                }
+            }
+            for rowid in 1..=4_000_i64 {
+                assert!(
+                    cursor.table_move_to(&cx, rowid).await.unwrap().is_found(),
+                    "row {rowid}"
+                );
+                assert_eq!(cursor.payload(&cx).await.unwrap(), payload(rowid));
+            }
+            assert!(!cursor.table_move_to(&cx, 4_001).await.unwrap().is_found());
         });
     }
 
