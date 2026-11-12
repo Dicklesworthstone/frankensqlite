@@ -87,6 +87,39 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-12 - WIN: the materializing fallbacks move rows instead of copying every value (bd-w4pr1.12)
+
+- Target: the window, GROUP BY window, compound, recursive-CTE and join fallbacks in
+  `crates/fsqlite-core/src/connection.rs` built their working rows with
+  `rows.iter().map(|r| r.values().to_vec())`, a second full copy of every scanned value held next to
+  the first until the statement ended. In `row_number() OVER (PARTITION BY a ORDER BY c)` over 1M
+  rows that doubled the row set (RSS 1.1 GB; stock 16.6 MB).
+- Ledger preflight: no entry on these copies. The vectorized-kernel entry (2026-11-10, ASSESSED)
+  is about the evaluation path, not the row hand-off.
+- Change: nine sites take the rows by value (`into_iter().map(|r| r.values)`); none of them reads
+  the source rows again.
+- Result: CLI release-perf, scorecard databases built by stock, stock sqlite3 3.46.1 live in the
+  same script, 3 runs, min user instructions, median CPU and peak RSS (`rss_probe.py`, io_uring
+  refused). Before main 9619f5245, after 840c423c1 (the change on 92b3469bc; the two commits
+  between the bases touch constant WHERE terms and an error code, neither of which these statements
+  use). Answers equal stock's in all rows.
+
+  | statement | stock | before | after |
+  |---|---|---|---|
+  | `sum(rn)` over `row_number() OVER (PARTITION BY a ORDER BY c)`, 1M rows | 8,225.1M, 701.8 ms, 16.6 MB | 13,083.8M, 2,085.7 ms, 1,118.4 MB | 11,940.1M, 1,925.4 ms, 852.3 MB |
+  | `sum(count(*)) OVER (ORDER BY a)` after `GROUP BY a` | 2,883.0M, 214.8 ms | 3,759.5M, 366.2 ms, 126.2 MB | 3,770.6M, 362.7 ms, 127.2 MB |
+  | `count(*)` of `t INTERSECT t WHERE id % 2 = 0` on (a, c) | 11,241.8M, 5,754.2 ms | 13,190.6M, 1,963.1 ms, 309.0 MB | 12,762.2M, 1,932.8 ms, 267.3 MB |
+
+  The bead predicted RSS -150 to -250 MB and CPU -5 to -10% on the window statement. Measured
+  -266 MB and -7.7% CPU (-8.7% instructions). The GROUP BY window statement holds only 1,000
+  grouped rows, so it does not move. A 300k-step counting recursive CTE never reaches the changed
+  site (10M instructions in both arms).
+- Retry / widen: the window statement still holds 852 MB against stock's 16.6 MB, because
+  `execute_window_select` materializes every row with every column before partitioning. The next
+  levers are column pruning to what the window and outer query read, then a streaming partition
+  pass. Retry a copy-removal of this kind only where a profile shows `to_vec` of row values above
+  2% of a statement's instructions.
+
 ## 2026-11-12 - WIN: a cursor remembers the decoded header and pointer array of page images it loaded (bd-w4pr1.13.26)
 
 - Target: `load_page` parsed the page header and decoded and range-checked the whole cell-pointer
