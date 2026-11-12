@@ -87,6 +87,103 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-12 - WIN: a :memory: read after a write leaves the row mirror's rebuild to the first statement that reads it (bd-w4pr1.13.23)
+
+- Target: every `:memory:` read that follows a write (the scorecard's memory_script_200k, and
+  read-after-write generally). Touched: `crates/fsqlite-core/src/connection.rs`
+  (`flush_retained_autocommit_txn_for_read`, `hydrate_memdb_armed_by_capture`, the SELECT
+  dispatch's in-memory fallback decisions, `prepare_connection_for_prepared_read`, the parity-cert
+  PRAGMA, `try_direct_count_star_in_list`).
+- Evidence before (callgrind, main 9ca28495e, the memory script at 20k rows): two whole-mirror
+  rebuilds (`reload_memdb_from_pager`, 2.5k instructions per table row) were 103.4M of 712.9M
+  (14.5%). One followed the retained batch's flush before statement 10 (`SELECT count(*), sum(a)
+  FROM t`, a VDBE program that never reads the mirror); the other was armed by the CREATE TABLE
+  capture point and paid at statement 6. bd-gjrct (2b27f82e6) made in-transaction read
+  boundaries lazy and left this autocommit reload as "a separate cost". Measured before choosing
+  the design: leaving the mirror unloaded, as file connections do, costs more than the rebuild on
+  the evaluator's paths (20k rows, a GROUP BY over a join: 185.7M per read with the mirror, 249.5M
+  without, the reload 59M; a single-table GROUP BY: +2k per row per read), so a second fallback
+  read after a write would have lost.
+- Change: those two read boundaries reload schema and visibility only and mark the rows owed
+  (`memdb_rows_owed`), on a private `:memory:` connection in parity-cert mode with no live
+  virtual table. The first reader pays the same `reload_memdb_from_pager`: a SELECT the dispatch
+  sends to an in-memory fallback (every decision but time travel, and before a flattened view or
+  a compound, whose arms run nested) and a prepared statement with a mirror fast path. It pays
+  only at the top-level statement, outside any transaction or savepoint, with no retained batch,
+  pending mirror upserts, materialized CTE table, live vtab or write in its read transaction;
+  elsewhere the reader keeps its unloaded-mirror path, as inside BEGIN. A write, BEGIN or
+  SAVEPOINT drops the debt; parity cert turned off (PRAGMA or setter) pays it, keeping bd-gjrct's
+  rule that a row source of record stays hydrated. `try_direct_count_star_in_list` now checks an
+  aliased table's stale qualifier before the mirror's state gates it, so that error is
+  NoSuchColumn whether or not the mirror is loaded (codegen reported the same message as a
+  FunctionError when it was not; `fast_path_separation` pins the variant).
+- Result, stock sqlite3 3.46.1 live, io_uring refused, 3 runs per arm, min instructions:u and
+  median CPU (base `fsqlite-ckptbase-03fa8747f` = main 03fa8747f, sha256 af3925e8...; lever
+  18db9dfba, 5a83f819...; both copied fresh to tmpfs so their page-cache state matches; every
+  answer equal to stock's; `scratchpad/mirror_whole.py`, `mirror_probe.py`, `memjoin_probe.py`):
+
+  | workload | stock | before | after |
+  |---|---|---|---|
+  | memory_script_200k, whole | 1,914.0M | 6,980.2M (3.65x), 709.6 ms | 6,487.6M (3.39x), 636.6 ms |
+  | same at 20k rows | 172.6M | 689.6M | 639.6M |
+  | same at 100 rows | 4.6M | 26.2M | 23.6M |
+  | its statement 10 alone, 200k | 87.3M | 655.8M | 167.3M |
+  | `count, sum(t.c) FROM u JOIN t ON t.id = u.a + 1` after the setup, 200k | 0.9M | 567.6M | 2.4M |
+  | `count, sum(length(u.name)) FROM t JOIN u ON u.a = t.a` after the setup, 200k | 337.2M | 1,594.1M | 1,026.0M |
+  | UPDATE then SELECT, 200k | 185.4M | 1,032.2M | 466.3M |
+  | SAVEPOINT / ROLLBACK TO / RELEASE then SELECT, 200k | 258.2M | 2,285.3M | 1,720.2M |
+  | a VDBE read then INSERT ... SELECT ... GROUP BY, 200k | 541.5M | 1,532.1M | 792.9M |
+  | an INSERT then 20 point reads, 200k | 0.4M | 567.6M | 4.3M |
+
+  Unchanged within 0.4% at 20k and 200k rows: statements 6-9 of the script, an evaluator GROUP BY
+  over a join once and three times after a write, a single-table GROUP BY once and three times,
+  ROLLBACK then SELECT or GROUP BY, UPDATE then a join GROUP BY. Statement 5 reads +0.5% / +1.3%,
+  inside the noise of subtracting a 3,000M setup; at 100 rows, absolute totals over 9 runs put
+  statement 5, a single-table GROUP BY and a join GROUP BY at -12k, -32k and -2k instructions.
+  Peak RSS of the 200k script 129.9 -> 102.7 MB; 100 rows 23.2 -> 22.7 MB (median of 11; a
+  binary whose file pages sat longer in the page cache read up to 2 MB higher even on `SELECT 1`,
+  so both arms run from fresh copies). Prediction -450 to -510M on the 200k script: met
+  (-492.6M); kill under -400M: not met. The same lever on main 9ca28495e measured -489.6M.
+- Tests: `test_memory_mirror_rows_owed_until_a_fallback_reads_them_match_rusqlite` (lib): after
+  writes a VDBE read leaves the rows owed and unloaded; the join GROUP BY takes
+  `group_by_join_fallback` and pays; after each later write the fallback reads the write (a
+  mirror marked current without the rebuild returns the old sums); ROLLBACK, ROLLBACK TO, a
+  prepared re-run, and parity cert off by PRAGMA and by setter, every read compared with
+  rusqlite. Four white-box lib tests that loaded the mirror with a VDBE read now load it
+  explicitly. Differential: `memory_mirror_snapshot_differential`'s two ignored random-history
+  variants, 150 seeds x 500 operations each with `MEMDIFF_STOP_AT_FIRST_DIVERGENCE`, on base
+  03fa8747f and on the lever: identical per-seed summaries and no divergence on either (67,454
+  live reads and 37,615 held-prepared rounds against stock).
+- Gate (rch): on 9ca28495e plus the change: clippy -D warnings with all targets on fsqlite-core
+  clean; fsqlite-core lib 4,149 pass and 2 fail (the t6741 pair, red on main, bd-nouem); 36
+  fsqlite-core targets on :memory:, savepoint, rollback, time travel, retained batches, prepared
+  reads and joins pass, after the count IN-list fix above (`join_aggregate_lookup_oracle`,
+  `memory_deferred_rebuild_retained_batch_oracle`, `memory_mirror_snapshot_differential`,
+  `bd_jdjee_time_travel_page_snapshots`, `bd_zjocc_time_travel_history_semantics`,
+  `bd_qteu2_memdb_reload_row_rehydration_scaling`, `bulk_insert_values_memdb_reload_scaling`,
+  `cache_staleness_cross_txn_regression`, `bd_savepoint_semantics_oracle_probe`,
+  `bd_elcjy_fresh_table_savepoint_rewind`, `bd_pxn52_memory_dml_nested_select_oracle`,
+  `temp_transaction_rollback_oracle`, `savepoint_implicit_begin_schema_change_oracle`,
+  `hfdt_gbou9l_batch_savepoints`, `gh494_memory_commit_scaling`, `gh409_read_after_commit_scaling`,
+  `bd_pfxzd_reload_amplification`, `gh525_snapshot_read_cache`, `statement_cache_invalidation`,
+  `core_sql_rusqlite_conformance`, `conformance_oracle_ext`,
+  `prepared_statement_peer_changes_stock_oracle`, `virtual_generated_column_join_gh227_oracle`,
+  `in_exists_regression`, `fast_path_separation`, `b4_query_row_indexed_equality`,
+  `bd_xml0z_prepared_read_reload_and_eqp`, `temp_statement_atomicity_constraints_oracle`,
+  `temp_table_upsert_rowid_conflict_oracle`, `bd_8a8pr_rowid_reuse_after_statement_rollback_oracle`,
+  `union_view_root_page_collision`, `bd_54sjx_grouped_join_scan_order_oracle`,
+  `bd_5ap77_from_subquery_aggregate_flattening`, `gh439_create_table_as_select`,
+  `bd_6i9c5_memory_exists_typeless_affinity_oracle`,
+  `memory_page_reuse_and_attached_release_oracle`). Rebased on 03fa8747f (18db9dfba): clippy
+  clean, lib 4,151 pass and the same 2 fail, the 36 targets 1,252 pass and 0 fail. Rebased again on 5a522660b
+  (9859cd87d, which landed): clippy clean, lib 4,155 pass and the same 2 fail.
+- Retry condition: none for this deferral. Still open on this bead: statement 6
+  (`SELECT count(*), sum(n) FROM (SELECT a, count(*) n FROM t GROUP BY a)`) reads the mirror
+  through the evaluator and pays the rebuild (about 500M at 200k); the next lever is that GROUP BY
+  subquery in the VDBE. Not done here: ROLLBACK on `:memory:` still rebuilds the whole mirror
+  (`execute_rollback_with_cx`; rollback then SELECT is 6.7x stock); CTE-only WITH statements
+  still pay at their fallback decision although they read no table.
+
 ## 2026-11-12 - REJECTED: a table window SELECT frees its scanned rows before building output that does not read them (bd-w4pr1.12)
 
 - Target: peak RSS of a window SELECT whose output holds only window columns (massif of the
