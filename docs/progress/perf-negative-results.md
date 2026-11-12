@@ -87,6 +87,37 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-12 - WIN: a rowid seek served by the seek cache moves its slot to the front in place (bd-w4pr1.13.27)
+
+- Target: lookup joins that probe a small table by rowid. Callgrind of `SELECT count(*),
+  sum(length(u.name)) FROM t JOIN u ON u.a = t.a` (1M probes into a 1,000-row table, main
+  0948f7c69): `table_seek_for_insert` 1,187 instructions a probe, 263 of them
+  `remember_table_landing`, which decoded the landing leaf's first and last rowid and rebuilt the
+  four-slot seek cache even when a slot had just served the seek. Touched:
+  `crates/fsqlite-btree/src/cursor.rs` (`remember_table_cache_hit`).
+- Ledger preflight: the 2026-11-12 decoded-page memo (bd-w4pr1.13.26) cut `load_page`'s decode, a
+  different cost; bd-w4pr1.13.13 added the bounds filter this keeps. No entry on the landing.
+- Change: a seek served by slot k takes the new landing into slot k and rotates it to the front;
+  its bounds are kept. They are a filter only (a hit still binary-searches the current page image
+  and accepts only an exact match or a gap strictly inside the leaf), and a landing by descent
+  still reads them afresh, so stale bounds are replaced the next time the root is used.
+- Result: CLI release-perf, scorecard database, stock sqlite3 3.46.1 live in the same script, best
+  of 3 user instructions (`stable_probe.py`, io_uring refused). Before main 5a522660b, after
+  c3b5c0b40 (landed as 06abdceec). Answers equal stock's in every row.
+
+  | statement | stock | before | after |
+  |---|---|---|---|
+  | `count(*), sum(length(u.name)) FROM t JOIN u ON u.a = t.a` (1M probes) | 1,721.4M, 192.2 ms | 4,688.7M, 460.0 ms | 4,451.1M, 436.9 ms |
+  | `count(*), sum(t.a) FROM p CROSS JOIN t WHERE t.id = p.k` (200k probes into 1M rows) | 554.4M | 2,911.5M | 2,911.5M |
+  | `count(*) FROM v1 JOIN v2 ON v1.k = v2.k` | 26.0M | 107.2M | 107.2M |
+  | `count(*), sum(a) FROM t WHERE a > 500` (control) | 498.7M | 1,312.0M | 1,312.0M |
+
+  Prediction -120 to -200M on the 1M-probe join, rowid lookups within 1% (their probes into a
+  million rows rarely hit the cache). Measured -237.6M and 0.0%.
+- Still a loss: 2.59x stock on the join. Per probe the seek is still about 950 instructions.
+- Retry / widen: none needed for this function. The next item on this statement is the seek's own
+  body (382 a probe) and the loop's opcode dispatch.
+
 ## 2026-11-12 - WIN: a :memory: read after a write leaves the row mirror's rebuild to the first statement that reads it (bd-w4pr1.13.23)
 
 - Target: every `:memory:` read that follows a write (the scorecard's memory_script_200k, and
