@@ -92,6 +92,17 @@ impl<V> CursorSlots<V> {
         self.slots[id as usize].replace(value)
     }
 
+    /// The value at `id`, made by `default` when the slot is empty. `None`
+    /// for a negative `id`, which has no slot.
+    #[inline]
+    pub fn get_or_insert_with(&mut self, id: i32, default: impl FnOnce() -> V) -> Option<&mut V> {
+        if id < 0 {
+            return None;
+        }
+        self.ensure_slot(id);
+        Some(self.slots[id as usize].get_or_insert_with(default))
+    }
+
     #[inline]
     pub fn remove(&mut self, id: &i32) -> Option<V> {
         if *id < 0 {
@@ -7573,8 +7584,8 @@ pub struct VdbeEngine {
     func_registry: Option<Arc<FunctionRegistry>>,
     /// Resolved scalar functions keyed by opcode address.
     scalar_function_cache: HashMap<usize, ResolvedScalarFunction>,
-    /// Resolved aggregate functions keyed by opcode address.
-    aggregate_function_cache: HashMap<usize, ResolvedAggregate>,
+    /// Resolved aggregate functions by opcode address.
+    aggregate_function_cache: AggregateSites,
     /// Collation registry for compare, sort, DISTINCT, and grouping semantics.
     collation_registry: Arc<Mutex<CollationRegistry>>,
     /// bd-4nuqo: lazily cached answer to "is any built-in collation name
@@ -7913,6 +7924,32 @@ struct ResolvedAggregate {
     plain_step: bool,
 }
 
+/// The resolved aggregate of each `AggStep` and `AggFinal`, in a slot per
+/// opcode address, so a step finds its site by index instead of a hash probe
+/// (bd-w4pr1.13).
+#[derive(Default)]
+struct AggregateSites {
+    slots: Vec<Option<ResolvedAggregate>>,
+}
+
+impl AggregateSites {
+    #[inline]
+    fn get(&self, pc: usize) -> Option<&ResolvedAggregate> {
+        self.slots.get(pc).and_then(Option::as_ref)
+    }
+
+    fn insert(&mut self, pc: usize, site: ResolvedAggregate) {
+        if self.slots.len() <= pc {
+            self.slots.resize_with(pc + 1, || None);
+        }
+        self.slots[pc] = Some(site);
+    }
+
+    fn clear(&mut self) {
+        self.slots.clear();
+    }
+}
+
 /// Subtype tags of arguments that carry none.
 const NO_ARG_SUBTYPES: [u32; 8] = [0; 8];
 
@@ -7989,8 +8026,8 @@ struct WindowContext {
 }
 
 struct ColdVdbeState {
-    /// Aggregate accumulators keyed by accumulator register.
-    aggregates: SwissIndex<i32, AggregateContext>,
+    /// Aggregate accumulators, in a slot per accumulator register.
+    aggregates: CursorSlots<AggregateContext>,
     /// Deleted-row state for UPDATE's delete+insert rewrite. When the
     /// replacement row later conflicts, we must restore the original row.
     pending_update_restore: Option<PendingUpdateRestore>,
@@ -8036,7 +8073,7 @@ struct ColdVdbeState {
 impl ColdVdbeState {
     fn new() -> Self {
         Self {
-            aggregates: SwissIndex::new(),
+            aggregates: CursorSlots::new(),
             pending_update_restore: None,
             deferred_update_delete: None,
             pending_insert_rollback: None,
@@ -8267,7 +8304,7 @@ impl VdbeEngine {
             storage_cursor_memdb_count_shortcuts_safe: false,
             func_registry: None,
             scalar_function_cache: HashMap::new(),
-            aggregate_function_cache: HashMap::new(),
+            aggregate_function_cache: AggregateSites::default(),
             collation_registry: Arc::new(Mutex::new(CollationRegistry::new())),
             builtin_collations_overridden_cache: None,
             cold_state: None,
@@ -14846,8 +14883,7 @@ impl VdbeEngine {
 
                     let arg_count = op.p2;
                     let func_pc = pc;
-                    let func = if let Some(resolved) = self.aggregate_function_cache.get(&func_pc)
-                    {
+                    let func = if let Some(resolved) = self.aggregate_function_cache.get(func_pc) {
                         Arc::clone(&resolved.func)
                     } else {
                         let registry = self.func_registry.as_ref().ok_or_else(|| {
@@ -16392,7 +16428,7 @@ impl VdbeEngine {
         // One lookup of the site serves both routes: a plain site steps
         // here, and any resolved site that does not hands its function to
         // the general path below.
-        let resolved_func = match self.aggregate_function_cache.get(&pc) {
+        let resolved_func = match self.aggregate_function_cache.get(pc) {
             Some(site) => {
                 if site.plain_step
                     && Self::plain_agg_step(
@@ -18657,7 +18693,7 @@ impl VdbeEngine {
         let ctx = cold_state
             .get_or_insert_with(|| Box::new(ColdVdbeState::new()))
             .aggregates
-            .entry_or_insert_with(step.accum_reg, || {
+            .get_or_insert_with(step.accum_reg, || {
                 let state = step.func.initial_state();
                 AggregateContext {
                     func: step.func.clone(),
@@ -18668,7 +18704,13 @@ impl VdbeEngine {
                         None
                     },
                 }
-            });
+            })
+            .ok_or_else(|| {
+                FrankenError::Internal(format!(
+                    "AggStep accumulator register {} is negative",
+                    step.accum_reg
+                ))
+            })?;
 
         if !Arc::ptr_eq(&ctx.func, step.func) {
             return Err(FrankenError::Internal(
@@ -38322,7 +38364,7 @@ mod tests {
     #[test]
     fn test_swiss_index_replaces_hashmap_in_engine() {
         // Smoke test: run a simple expression program to exercise the engine's
-        // SwissIndex-based internal maps (sorters, cursors, aggregates).
+        // internal maps (sorters, cursors).
         use fsqlite_btree::instrumentation::reset_btree_metrics;
 
         reset_btree_metrics();
@@ -38342,8 +38384,8 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][0], SqliteValue::Integer(42));
 
-        // The engine's internal SwissIndex maps (cursors, sorters, aggregates,
-        // storage_cursors) are all SwissIndex now. If we got here without
+        // The engine's internal maps (cursors, sorters, storage_cursors)
+        // are SwissIndex or flat slots now. If we got here without
         // panics, the drop-in replacement works.
     }
 
@@ -44288,6 +44330,107 @@ mod tests {
             // four of each take the lane.
             assert_eq!(plain_agg_steps() - before, 8);
         }
+    }
+
+    /// Run `program` on a fresh engine with the built-in functions.
+    fn run_aggregate_program(program: &VdbeProgram) -> Result<Vec<Vec<SqliteValue>>> {
+        let mut engine = VdbeEngine::new(program.register_count());
+        let mut registry = FunctionRegistry::new();
+        register_builtins(&mut registry);
+        engine.set_function_registry(Arc::new(registry));
+        run_async(engine.execute(program))?;
+        Ok(engine
+            .results()
+            .iter()
+            .map(|row| row.clone().into_vec())
+            .collect())
+    }
+
+    #[test]
+    fn test_aggregate_slots_restart_per_group_and_refuse_a_negative_or_shared_accumulator() {
+        // Two groups through one accumulator register: AggFinal empties the
+        // slot, so the second group's first step starts a new sum.
+        let mut builder = ProgramBuilder::new();
+        let r_x = builder.alloc_reg();
+        let r_acc = builder.alloc_reg();
+        let sum = || P4::FuncName("sum".to_owned());
+        builder.emit_op(Opcode::Integer, 2, r_x, 0, P4::None, 0);
+        builder.emit_op(Opcode::AggStep, 0, r_x, r_acc, sum(), 1);
+        builder.emit_op(Opcode::AggStep, 0, r_x, r_acc, sum(), 1);
+        builder.emit_op(Opcode::AggFinal, r_acc, 1, 0, sum(), 0);
+        builder.emit_op(Opcode::ResultRow, r_acc, 1, 0, P4::None, 0);
+        builder.emit_op(Opcode::Integer, 5, r_x, 0, P4::None, 0);
+        builder.emit_op(Opcode::AggStep, 0, r_x, r_acc, sum(), 1);
+        builder.emit_op(Opcode::AggFinal, r_acc, 1, 0, sum(), 0);
+        builder.emit_op(Opcode::ResultRow, r_acc, 1, 0, P4::None, 0);
+        builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let groups = builder.finish().expect("program should build");
+        assert_eq!(
+            run_aggregate_program(&groups).expect("two groups should run"),
+            vec![vec![SqliteValue::Integer(4)], vec![SqliteValue::Integer(5)]]
+        );
+
+        // A second aggregate stepping into a live accumulator is an error.
+        let mut builder = ProgramBuilder::new();
+        let r_x = builder.alloc_reg();
+        let r_acc = builder.alloc_reg();
+        builder.emit_op(Opcode::Integer, 2, r_x, 0, P4::None, 0);
+        builder.emit_op(Opcode::AggStep, 0, r_x, r_acc, sum(), 1);
+        builder.emit_op(Opcode::AggStep, 0, 0, r_acc, P4::FuncName("count".to_owned()), 0);
+        builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let shared = builder.finish().expect("program should build");
+        let error = run_aggregate_program(&shared).expect_err("a shared accumulator should fail");
+        assert!(
+            error.to_string().contains("reused for a different aggregate"),
+            "{error}"
+        );
+
+        // A negative accumulator register has no slot and is refused, not
+        // dropped.
+        let mut builder = ProgramBuilder::new();
+        let r_x = builder.alloc_reg();
+        builder.emit_op(Opcode::Integer, 2, r_x, 0, P4::None, 0);
+        builder.emit_op(Opcode::AggStep, 0, r_x, -1, sum(), 1);
+        builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let negative = builder.finish().expect("program should build");
+        let error = run_aggregate_program(&negative).expect_err("a negative register should fail");
+        assert!(error.to_string().contains("is negative"), "{error}");
+    }
+
+    #[test]
+    fn test_aggregate_sites_hold_one_slot_per_opcode_address() {
+        let mut registry = FunctionRegistry::new();
+        register_builtins(&mut registry);
+        let func = registry.find_aggregate("sum", 1).expect("sum is built in");
+        let mut sites = AggregateSites::default();
+        assert!(sites.get(5).is_none());
+        sites.insert(
+            5,
+            ResolvedAggregate {
+                func: Arc::clone(&func),
+                plain_step: true,
+            },
+        );
+        sites.insert(
+            2,
+            ResolvedAggregate {
+                func,
+                plain_step: false,
+            },
+        );
+        assert!(sites.get(5).is_some_and(|site| site.plain_step));
+        assert!(sites.get(2).is_some_and(|site| !site.plain_step));
+        assert!(sites.get(3).is_none());
+        assert!(sites.get(6).is_none());
+        sites.clear();
+        assert!(sites.get(5).is_none());
+
+        let mut slots: CursorSlots<i64> = CursorSlots::new();
+        assert!(slots.get_or_insert_with(-1, || 7).is_none());
+        assert_eq!(slots.get_or_insert_with(3, || 7).copied(), Some(7));
+        assert_eq!(slots.get_or_insert_with(3, || 9).copied(), Some(7));
+        assert_eq!(slots.remove(&3), Some(7));
+        assert_eq!(slots.get_or_insert_with(3, || 9).copied(), Some(9));
     }
 
     #[test]

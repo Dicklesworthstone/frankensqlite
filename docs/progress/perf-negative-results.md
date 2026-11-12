@@ -87,6 +87,40 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-12 - WIN: AggStep finds its site and its accumulator by index, not by hash probe (bd-w4pr1.13)
+
+- Target: every aggregate step. Exact profile (callgrind) of scan_filter_agg (`SELECT count(*),
+  sum(a) FROM t WHERE a > 500`, 1M rows, ~998k steps) on the binary of the plain AggStep lane:
+  `execute_agg_step` 151.7M self, 10.3% of 1,473.8M, about 50 of its 152 instructions per step in
+  two hashbrown probes (`aggregate_function_cache` by opcode address, `ColdVdbeState.aggregates`
+  by accumulator register). Touched: `crates/fsqlite-vdbe/src/engine.rs` (`AggregateSites`,
+  `CursorSlots::get_or_insert_with`, `ColdVdbeState`, `agg_step_with_args`).
+- Ledger preflight: the 2026-11-11 plain-AggStep WIN entry set the retry condition this meets ("a
+  slot per site and per accumulator ... only with a profile showing `execute_agg_step` still above
+  8% of scan_filter_agg"). The 2026-11-11 REJECT of the vector cache is not what this retries: that
+  candidate kept the accumulator probe and added an out-of-line resolved check for an `Arc` borrow.
+- Change: the resolved functions sit in a slot per opcode address and the accumulators in a slot
+  per register (the engine's `CursorSlots`); `AggFinal` empties the slot as it removed the entry;
+  a negative accumulator register, which has no slot, is refused with an error.
+- Result, same method as the top-N entry below, one run, stock live; before sha256 c588e630...
+  (the top-N commit on 025a26070), after adf7c8b5...: scan_filter_agg 1,403.4 -> 1,360.0 (-43.5
+  per step; 2.81x -> 2.73x stock's 498.7), `count(*), sum(length(b)), sum(c)` 2,937.4 -> 2,807.4
+  (-43 per step; 2.91x -> 2.79x stock's 1,007.8), `min(c), max(c), avg(c)` 2,909.5 -> 2,797.5
+  (2.72x -> 2.62x stock's 1,068.4), group_by_1000_groups 3,379.5 -> 3,335.4 (1.17x -> 1.16x),
+  `count(DISTINCT a), group_concat(DISTINCT a % 3)` 2,880.8 -> 2,804.8 (2.05x -> 1.99x),
+  order_by_text_limit10 1,718.2 -> 1,718.2. Every answer equal to stock's. CPU time of
+  scan_filter_agg 2.10x -> 1.98x stock in the same run.
+  Predicted -35 per step, scan_filter_agg -35M, with a kill line at -15M.
+- Keepers: two groups through one accumulator register, another aggregate stepping into a live
+  accumulator (an error), a negative accumulator register (an error), the slot contracts; the
+  aggregate oracle targets of the row-loop gate.
+- What is left in an `AggStep` (callgrind, after, scan_filter_agg): `execute_agg_step` 108.5
+  instructions per step of its own (151.7 before), `sum` behind the registry adapter 124 per call,
+  `count(*)` 25; stock's whole step is about 40.
+- Retry condition for the aggregate behind the adapter (a typed `sum`/`count` accumulator): the
+  2026-05-06 `FastSumState` entry governs; its condition, aggregate dispatch above 10% of a large
+  file-backed row, holds after this change (`execute_agg_step` 12.8% of scan_filter_agg inclusive).
+
 ## 2026-11-12 - WIN: a top-N preflight compares the packed key with the heap's worst row without decoding it (bd-w4pr1.13)
 
 - Target: every `ORDER BY ... LIMIT` over a scan, scorecard row order_by_text_limit10. An exact
