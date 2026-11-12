@@ -371,34 +371,51 @@ impl SumState {
     /// Return whether a non-NULL input was accumulated. SUM, TOTAL and AVG
     /// share both numeric coercion and the exact-integer prefix; AVG alone
     /// counts inputs, and SUM alone reports an all-integer overflow.
+    ///
+    /// INTEGER and REAL are taken as they are (`to_sum_numeric_value` returns
+    /// them unchanged); only TEXT and BLOB go through that coercion, which
+    /// builds an owned value.
+    #[inline]
     fn add_value(&mut self, value: &SqliteValue) -> bool {
-        let value = value.to_sum_numeric_value();
-        if value.is_null() || matches!(value, SqliteValue::Float(v) if v.is_nan()) {
+        match *value {
+            SqliteValue::Integer(value) => self.add_integer(value),
+            SqliteValue::Float(value) => self.add_float(value),
+            SqliteValue::Null => false,
+            SqliteValue::Text(_) | SqliteValue::Blob(_) => match value.to_sum_numeric_value() {
+                SqliteValue::Integer(value) => self.add_integer(value),
+                SqliteValue::Float(value) => self.add_float(value),
+                // The coercion yields only INTEGER or REAL for TEXT and BLOB.
+                SqliteValue::Null | SqliteValue::Text(_) | SqliteValue::Blob(_) => false,
+            },
+        }
+    }
+
+    #[inline]
+    fn add_integer(&mut self, value: i64) -> bool {
+        self.has_values = true;
+        if self.all_integer && !self.overflowed {
+            if let Some(total) = self.int_sum.checked_add(value) {
+                self.int_sum = total;
+                return true;
+            }
+            (self.float_sum, self.float_compensation) = split_sum_integer(self.int_sum);
+            self.overflowed = true;
+        }
+        kahan_add_integer(&mut self.float_sum, &mut self.float_compensation, value);
+        true
+    }
+
+    #[inline]
+    fn add_float(&mut self, value: f64) -> bool {
+        if value.is_nan() {
             return false;
         }
         self.has_values = true;
-        let exact = self.all_integer && !self.overflowed;
-        match value {
-            SqliteValue::Integer(value) => {
-                if exact {
-                    if let Some(total) = self.int_sum.checked_add(value) {
-                        self.int_sum = total;
-                        return true;
-                    }
-                    (self.float_sum, self.float_compensation) = split_sum_integer(self.int_sum);
-                    self.overflowed = true;
-                }
-                kahan_add_integer(&mut self.float_sum, &mut self.float_compensation, value);
-            }
-            SqliteValue::Float(value) => {
-                if exact {
-                    (self.float_sum, self.float_compensation) = split_sum_integer(self.int_sum);
-                }
-                self.all_integer = false;
-                kahan_add(&mut self.float_sum, &mut self.float_compensation, value);
-            }
-            SqliteValue::Null | SqliteValue::Text(_) | SqliteValue::Blob(_) => {}
+        if self.all_integer && !self.overflowed {
+            (self.float_sum, self.float_compensation) = split_sum_integer(self.int_sum);
         }
+        self.all_integer = false;
+        kahan_add(&mut self.float_sum, &mut self.float_compensation, value);
         true
     }
 
@@ -901,6 +918,103 @@ mod tests {
             matches!(sum.finalize(st2), Ok(SqliteValue::Float(_))),
             "sum() with a real present returns the float sum, not an overflow error"
         );
+    }
+
+    /// `SumState::add_value` as it was before INTEGER and REAL skipped the
+    /// coercion: every value through `to_sum_numeric_value`.
+    fn add_value_through_coercion(state: &mut SumState, value: &SqliteValue) -> bool {
+        let value = value.to_sum_numeric_value();
+        if value.is_null() || matches!(value, SqliteValue::Float(v) if v.is_nan()) {
+            return false;
+        }
+        state.has_values = true;
+        let exact = state.all_integer && !state.overflowed;
+        match value {
+            SqliteValue::Integer(value) => {
+                if exact {
+                    if let Some(total) = state.int_sum.checked_add(value) {
+                        state.int_sum = total;
+                        return true;
+                    }
+                    (state.float_sum, state.float_compensation) = split_sum_integer(state.int_sum);
+                    state.overflowed = true;
+                }
+                kahan_add_integer(&mut state.float_sum, &mut state.float_compensation, value);
+            }
+            SqliteValue::Float(value) => {
+                if exact {
+                    (state.float_sum, state.float_compensation) = split_sum_integer(state.int_sum);
+                }
+                state.all_integer = false;
+                kahan_add(&mut state.float_sum, &mut state.float_compensation, value);
+            }
+            SqliteValue::Null | SqliteValue::Text(_) | SqliteValue::Blob(_) => {}
+        }
+        true
+    }
+
+    fn sum_state_fields(state: &SumState) -> (i64, u64, u64, bool, bool, bool) {
+        (
+            state.int_sum,
+            state.float_sum.to_bits(),
+            state.float_compensation.to_bits(),
+            state.all_integer,
+            state.has_values,
+            state.overflowed,
+        )
+    }
+
+    #[test]
+    fn test_sum_state_takes_integers_and_reals_as_the_coercion_would() {
+        let values = [
+            int(0),
+            int(1),
+            int(-7),
+            int(i64::MAX),
+            int(i64::MIN),
+            int(1 << 53),
+            float(0.5),
+            float(-0.0),
+            float(1e300),
+            float(f64::INFINITY),
+            float(f64::NEG_INFINITY),
+            float(f64::NAN),
+            null(),
+            text(" 7 "),
+            text("12"),
+            text("1e3"),
+            text("abc"),
+            text("9223372036854775808"),
+            SqliteValue::Blob(vec![b'4', b'2'].into()),
+        ];
+        // Every ordered pair and triple of values, from a fresh state, so the
+        // integer prefix, its overflow and the switch to REAL are each reached
+        // from every earlier state.
+        let mut sequences: Vec<Vec<&SqliteValue>> = Vec::new();
+        for a in &values {
+            for b in &values {
+                sequences.push(vec![a, b]);
+                for c in &values {
+                    sequences.push(vec![a, b, c]);
+                }
+            }
+        }
+        for sequence in sequences {
+            let mut fast = SumFunc.initial_state();
+            let mut reference = SumFunc.initial_state();
+            for value in &sequence {
+                assert_eq!(
+                    fast.add_value(value),
+                    add_value_through_coercion(&mut reference, value),
+                    "{sequence:?}"
+                );
+                assert_eq!(
+                    sum_state_fields(&fast),
+                    sum_state_fields(&reference),
+                    "{sequence:?}"
+                );
+            }
+        }
     }
 
     // ── avg ───────────────────────────────────────────────────────────

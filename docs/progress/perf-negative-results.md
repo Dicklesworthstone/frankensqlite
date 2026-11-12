@@ -87,6 +87,37 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-12 - WIN: sum, total and avg take an INTEGER or REAL argument without coercing it (bd-w4pr1.13)
+
+- Target: every `sum`, `total` and `avg` over a numeric column. Exact profile (callgrind) of
+  `SELECT count(*), sum(length(b)), sum(c) FROM t` over 1M rows at 9e7afd9cf: the built-in `sum`
+  behind the registry adapter cost 133.5 instructions per call, `SumState::add_value` 98.5 of
+  them, `to_sum_numeric_value` 32.5 of those building an owned copy of an INTEGER or REAL it
+  returns unchanged. Touched: `crates/fsqlite-func/src/agg_builtins.rs` (`SumState`).
+- Ledger preflight: 2026-05-06 "VDBE uppercase SUM aggregate sidecar" (FastSumState) and
+  2026-05-05 "Direct REAL accumulator for rowid-bucket SUM GROUP BY", both rejected for helping one
+  group size and hurting another on 100-row-scale wall-time rows; the INDEX row "Narrow aggregate
+  lanes" asks for aggregate dispatch dominating a row and every group size improving. This change
+  is neither a sidecar nor a codegen substitution: the shared accumulator of all three functions
+  stops copying its argument, on every path that calls them.
+- Change: `add_value` takes INTEGER and REAL directly to the integer prefix or the compensated REAL
+  sum; only TEXT and BLOB go through `to_sum_numeric_value`. The accumulator does exactly what it
+  did, NaN still ignored.
+- Result, user instructions in millions per statement on the 1M-row scorecard table, stock sqlite3
+  3.46.1 live in the same run, io_uring reads refused in every arm (three runs each, identical),
+  every answer equal to stock's; base 9ca28495e sha256 b8d1770b..., after f84ea0c6...:
+  scan_filter_agg 1,355.5 -> 1,329.0 (2.72x -> 2.66x stock's 498.7), `count(*), sum(length(b)),
+  sum(c)` 2,803.0 -> 2,698.0 (-52 per `sum` call; 2.78x -> 2.68x stock's 1,007.8), `min(c),
+  max(c), avg(c)` 2,793.0 -> 2,741.1 (2.61x -> 2.57x), `total(a), total(c), count(b)` 2,310.2 ->
+  2,205.2 (2.44x -> 2.33x stock's 946.0); `count(*), sum(c)` grouped by `a % 10`, by `a` and by
+  `id % 100000` (10, 1,000 and 100,000 groups) 5,315.9 -> 5,263.9, 5,043.1 -> 4,991.1 and
+  6,263.4 -> 6,210.0, every group size lower. count_star, group_by_1000_groups (count only) and
+  `count(DISTINCT a), group_concat(DISTINCT a % 3)` unchanged.
+- Keepers: a unit test holds the new `add_value` to the old coercion-based one field by field
+  (floats bitwise) after every step of every ordered pair and triple of 19 values: both ends of
+  i64, reals with -0.0, infinities and NaN, NULL, numeric and non-numeric text, a blob.
+- Retry condition: none needed for this one; the rest of a `sum` step is the next entry's.
+
 ## 2026-11-12 - WIN: the shell's completeness scan also says whether the input is one plain statement (bd-5310l)
 
 - Target: every statement the CLI reads one per line (all the scorecard's statement rows). Touched:
