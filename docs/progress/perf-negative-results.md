@@ -215,6 +215,114 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
   (`execute_rollback_with_cx`; rollback then SELECT is 6.7x stock); CTE-only WITH statements
   still pay at their fallback decision although they read no table.
 
+## 2026-11-12 - WIN: path-identity probes run once per transaction, at its begin and its commit (bd-ih8ak)
+
+- Target: the per-statement path probes of an autocommit statement on a WAL database (the
+  scorecard's autocommit INSERT shape on a fresh database, and a point SELECT by rowid). Touched:
+  `crates/fsqlite-vfs/src/namespace.rs` (`TransactionPathProof`,
+  `validate_path_identity_within_transaction`, GH#416 provisional flag), `crates/fsqlite-vfs/src/lib.rs`,
+  `crates/fsqlite-pager/src/pager.rs` (begin proof, commit-entry probe, begin `-wal` observation),
+  `crates/fsqlite-pager/src/traits.rs` (`note_begin_wal_path_identity`),
+  `crates/fsqlite-core/src/wal_adapter.rs`.
+- Ledger preflight: the 2026-07-23 bd-smxhz entry said reducing path-identity probe frequency needs
+  the owner's sign-off. The owner decided on bd-ih8ak (2026-11-12): once at a transaction's begin and
+  once at its commit; stock's close-only form would need a new decision.
+- Evidence before (strace -f -k on the frame-pointer CLI at 229f72bed, N=40 minus N=20): an autocommit
+  INSERT made 18 stat-family calls, 5 `lstat` of the database path (pager begin, WAL adapter at
+  begin, commit entry, adapter under the append gate, post-commit refresh) and 4 `stat` of the `-wal`
+  (refresh signature at begin, adapter at begin, adapter under the gate, post-commit signature); a
+  point SELECT made 7, 2 database and 2 `-wal`, all in begin.
+- Change: the begin probe takes a `TransactionPathProof` the transaction owns, so commit, rollback,
+  failure and cancellation drop it. While one is held the adapter's begin binding and a WAL commit's
+  entry rely on it; the probe under the append gate before any frame is written, the post-commit
+  refresh and a rollback-journal commit stay full. The adapter's begin `-wal` check takes the identity
+  the pager's refresh signature stated in the same begin.
+- Result, stock sqlite3 3.46.1 live in the same invocation (binaries main a3b9ab033 d9948fef...,
+  lever 2c513c8de 341f2bbc...; N=4000 minus N=2000; io_uring refused; `scratchpad/commit_probe2.py
+  --no-ring --user-env`, `sel_probe.sh`, exact counts from `cg_commit.sh` under callgrind at N=400
+  minus N=200):
+
+  | per statement | stock | main | lever |
+  |---|---|---|---|
+  | INSERT statx (strace -c, fresh database) | 0 | 17.06 | 14.01 |
+  | INSERT syscalls, all | 8.1 | 34.4 | 30.5 |
+  | INSERT user instructions, exact (callgrind) | 22.2k (perf stat) | 213,207 | 212,313 |
+  | INSERT CPU, median of 4 runs | 9.1-13.5 us | 136.0 us | 134.9 us |
+  | point SELECT stat-family calls | - | 7 | 5 |
+  | point SELECT user instructions, median of 5 | 19,456 | 84,055 | 83,894 |
+  | point SELECT CPU, median of 5 | 7.20 us | 44.91 us | 42.54 us |
+
+  Prediction: path probes per INSERT 9 -> 4 to 6: met (6); per SELECT 4 -> 2: met. User
+  instructions -5k to -9k per INSERT: missed (-0.9k; the user side of one stat is about 150
+  instructions, the rest of its cost is kernel time). System CPU -4 to -10 us per commit: not
+  resolved, per-commit system time moves +-10 us between runs here; the N=4000 runs' total CPU
+  medians are 561.5 -> 544 ms. Kill (fewer than 3 probes removed, a keeper or the negative tests
+  failing): not met.
+- Found on the way, both fixed before landing: (1) a first version built an owned `<db>-wal` path and
+  compared `Path` components on every begin; callgrind put it at +1.1k instructions per commit, more
+  than the three stats saved. The adapter now decides once, at construction, whether its `-wal` is the
+  pager's. (2) GH#416: on a filesystem whose inode never moves, a database created zero-length by its
+  own connection stayed provisional for the connection's life (only the mismatch path cleared the
+  flag), so none of the in-transaction skips applied to a fresh database: strace -c showed one probe
+  removed instead of three. A plain match against a non-empty file now clears it, as
+  `validate_path_identity_with_descriptor` already did and the field's doc said.
+- Tests and gate, on the exact two-lever tree c12ee2aa6: clippy -D warnings with all targets on
+  fsqlite-vfs, fsqlite-pager and fsqlite-core clean; fsqlite-vfs `namespace` units 65 pass (3 new: the
+  proof's lifetime, the provisional exception, an empty-file binding turning durable only once a
+  match sees the file non-empty); the new negative tests
+  `bd_ih8ak_path_identity_once_per_transaction` (a database replaced between autocommit statements
+  fails the next SELECT and INSERT as replaced; one replaced inside a transaction fails COMMIT with
+  the WAL untouched) pass; the GH#534 crash-window tests (`gh534_sigkill_unpublished_wal_tail`), the
+  cross-process battery (`bulk_import_upsert_text_pk_phantom_pk`), `gh416`'s placeholder-inode test,
+  `gh528_truncated_shm_first_attacher` and eleven more WAL/namespace keepers pass; fsqlite-core lib
+  `wal_adapter` 120 pass. Red on main too, not from this change: pager
+  `bd_2jpu6_2_dirty_eviction_runs_in_parent_asupersync_region`; compat
+  `gh294_read_only_namespace_recovery_changes_only_ns_use` (bd-13m32, same line 1431); and
+  `gh416_placeholder_inode_and_cert_suffix::corrupt_certificate_suffix_fails_closed_without_wedging_the_writer`,
+  whose first write after the corrupted certificate tail exceeds its 120 s watchdog at main a3b9ab033
+  and at lever 1 alike. One fsqlite-wal lib run on that tree had 22 failures (a `native_commit` test
+  counted two FSYNC_1 for one batch and poisoned the shared metrics test lock); after the rebase onto
+  5a522660b, clippy is clean and fsqlite-wal lib 1,168, fsqlite-vfs lib 528 and the new negative tests
+  all pass.
+- Retry condition for the probes that remain (under the append gate, post-commit refresh, begin): only
+  under a new owner decision on bd-ih8ak (for example stock's close-only form).
+
+## 2026-11-12 - WIN: a begin maps the shared WAL index once, not twice (bd-ih8ak)
+
+- Target: the same two statements. Touched: `crates/fsqlite-pager/src/pager.rs`
+  (`observe_wal_refresh_signature`, `vouched_wal_index_header_of_file`, `BeginSignatureObservation`,
+  `acquire_reader_into`).
+- Evidence before (cp2 trace, a 32 KiB fd is the `-shm`): an autocommit INSERT made 6 `fstat` of the
+  `-shm`, each the bd-7do1d truncated-mapping check inside `UnixFile::shm_map`: two in begin (the
+  refresh signature, then reader admission), three in the WAL commit, one in the post-commit refresh.
+  A point SELECT made the begin two.
+- Change: the begin's refresh signature keeps the region it mapped and checked; that begin's first
+  reader-admission attempt reads through it. A retried attempt, a recovery rebind, the read-only begin
+  and every other caller map and check as before, and a signature whose map fails its check offers
+  nothing, so the check still runs before each transaction's first access of the index.
+- Result, same invocations (binary c12ee2aa6 c48f85c7..., against lever 1 2c513c8de):
+
+  | per statement | lever 1 | lever 2 |
+  |---|---|---|
+  | INSERT statx (strace -c, fresh database) | 14.01 | 13.01 |
+  | INSERT user instructions, exact (callgrind) | 212,313 | 210,290 |
+  | INSERT CPU, median of 4 runs | 134.9 us | 132.6 us |
+  | point SELECT fd -shm stats | 2 | 1 |
+  | point SELECT user instructions, median of 5 | 83,894 | 83,589 |
+  | point SELECT CPU, median of 5 | 42.54 us | 37.20 us |
+
+  Both levers together, stock live: point SELECT 6.2x -> 5.2x stock CPU (44.91 -> 37.20 us against
+  7.20), 4.32x -> 4.30x its instructions; autocommit INSERT statx 17 -> 13 per commit against stock's
+  none. Prediction: fstat(-shm) per INSERT 6 -> 5 and per SELECT 2 -> 1: met; user instructions -0.5k
+  to -2k per statement: INSERT -2.0k (top of the range), SELECT -0.3k (below it). Kill (begin still
+  mapping twice, the bd-7do1d keepers changing outcome, instructions not lower than lever 1's): not
+  met.
+- Tests and gate: the two-lever gate above; `gh528_truncated_shm_first_attacher` (the bd-7do1d
+  keepers, including a reopen beside a live cached mapping after the `-shm` was truncated) passes.
+- Retry condition for the three `-shm` checks left in an INSERT (two in the WAL commit, one in the
+  post-commit refresh): only as one change that hands a commit's checked region through its append
+  and publication path, not as another per-site patch.
+
 ## 2026-11-12 - REJECTED: a table window SELECT frees its scanned rows before building output that does not read them (bd-w4pr1.12)
 
 - Target: peak RSS of a window SELECT whose output holds only window columns (massif of the
