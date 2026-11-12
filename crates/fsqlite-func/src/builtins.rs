@@ -622,6 +622,19 @@ impl ScalarFunction for LengthFunc {
             return Ok(SqliteValue::Null);
         }
         let len = match &args[0] {
+            // bd-w4pr1.13.28: a value that is not Raw is valid UTF-8 already,
+            // and `as_str` on an inline value would validate it again. Count
+            // its stored bytes: up to the first NUL, every byte that does not
+            // continue a UTF-8 sequence starts a character.
+            SqliteValue::Text(s) if s.is_valid_utf8() => {
+                let bytes = s.as_bytes_direct();
+                let text = &bytes[..bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len())];
+                if text.is_ascii() {
+                    text.len()
+                } else {
+                    text.iter().filter(|&&b| b & 0xC0 != 0x80).count()
+                }
+            }
             SqliteValue::Text(s) => {
                 let text = sqlite_text_until_nul(s.as_str());
                 if text.is_ascii() {
@@ -4874,6 +4887,27 @@ mod tests {
             .unwrap(),
             SqliteValue::Integer(0)
         );
+    }
+
+    #[test]
+    fn test_length_counts_characters_on_stored_bytes() {
+        // bd-w4pr1.13.28: valid UTF-8 is counted on its stored bytes, inline
+        // or on the heap; a byte count, or a count without the NUL cut, fails.
+        let length = |text: SmallText| invoke1(&LengthFunc, SqliteValue::Text(text)).unwrap();
+        let long = "żółć ".repeat(8);
+        let cases = [
+            (SmallText::from_string("a\u{1F600}b"), 3),
+            (SmallText::from_string("日本語\0abc"), 3),
+            (SmallText::from_string(long.as_str()), 40),
+            (SmallText::from_bytes("é\0é".as_bytes()), 1),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(length(text), SqliteValue::Integer(expected));
+        }
+        // Invalid UTF-8 keeps its own path: the lossy text it already counted.
+        let raw = SmallText::from_bytes(&[0xFF, b'a', b'b']);
+        assert!(!raw.is_valid_utf8());
+        assert_eq!(length(raw), SqliteValue::Integer(3));
     }
 
     #[test]
