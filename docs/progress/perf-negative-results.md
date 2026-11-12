@@ -167,6 +167,60 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
   connections; the max()/min() tie order against stock; a GROUP BY with the mirror loaded still
   reads the mirror, which is cheaper than the substrate on `:memory:` (37.9M against ~44M at 20k).
 
+## 2026-11-12 - WIN: INSERT ... SELECT from one base table runs as the INSERT program's own scan instead of materialize-then-replay (bd-i3csr.1)
+
+- Target: `INSERT INTO m2 SELECT * FROM m` (300k rows; both tables
+  `(id INTEGER PRIMARY KEY, a INTEGER, b TEXT, c REAL)`; WAL file; autocommit). Touched:
+  `crates/fsqlite-core/src/connection/insert_batch.rs` (`insert_select_runs_as_one_program` and the
+  route in `execute_insert_dispatch`), `crates/fsqlite-core/src/connection.rs`
+  (`compile_table_insert` numbers an INSERT ... SELECT's placeholders in text order),
+  `crates/fsqlite-vdbe/src/codegen.rs` (`codegen_insert_select` checks every column reference
+  before emitting).
+- Evidence before: since 52d3e9103 (2026-02-26) every INSERT ... SELECT whose body is not a plain
+  VALUES list went to `insert_select_row_by_row_fallback`: the source is materialized and replayed
+  32 rows at a time through a prepared INSERT ... VALUES (958b8ace9). `codegen_insert_select`
+  (scan one table, insert each row) was reached only by EXPLAIN.
+- Change: the route admits `INSERT INTO t [(cols)] SELECT <exprs> FROM s [WHERE ...]` where `s` is
+  one local rowid table scanned in rowid order (`insert_select_keyset_rowid`: no join, compound,
+  DISTINCT, grouping, aggregate, window, ORDER BY, LIMIT or WITH, no WHERE on a column an index
+  leads with), unqualified, not the target, no index hint, no index on `s` that covers every
+  column read (stock scans a covering index in index order, fsqlite does not yet: bd-1bs3h) and no
+  expression or partial index; no subquery, MATCH or change-counter read; the target an
+  unqualified rowid table with no DELETE trigger, no TEMP table in the connection, no UPSERT or
+  RETURNING, no INSERT trigger, FK enforcement off. Everything else keeps the replay, including a
+  table-valued-function source (the scorecard's `bulk_insert_1M_one_txn`, step 2).
+- Result, stock sqlite3 3.46.1 live, io_uring refused, 3 runs, fresh database per run, the
+  statement alone (base df65b45b3 sha256 555265c7..., the same tree with the change ea54da31...):
+  4,565.6M -> 3,323.1M user instructions (-27.2%; stock 855.9M: 5.33x -> 3.88x); CPU 500.7 ->
+  406.5 ms (stock 89.0 ms). Prediction -50% to -63%: missed; kill line -25%: passed. The
+  generate_series setup (not admitted) is unchanged: 5,061.9M -> 5,063.2M. Scorecard (2 runs,
+  wall): no row moved beyond its own run-to-run spread; the five rows that read slower in wall time
+  (update_10pct, delete_14pct, autocommit_5k, memory_script, order_by_text_limit10) measure the
+  same user instructions within 0.3% and equal or lower CPU, 3 interleaved runs, stock live.
+- Where the remaining 10.7k instructions per row go (callgrind of the route): the Insert opcode
+  4.5k (B-tree `table_insert` 3.66k, `bump_concurrent_storage_rowid_floor` 0.63k), the synchronous
+  hot opcodes 3.25k (four Column, Next), and ~2.9k on the async opcode path (two `Affinity`
+  passes, 9 `apply_affinity` calls per row, `set_reg`). Stock: 2.85k per row in all.
+- Correctness: keeper `bd_i3csr_1_insert_select_one_program` (rusqlite 3.54.1, in memory and in a
+  file, ad hoc and prepared with numbered, named and anonymous parameters, and the routing of each
+  admitted and declined shape through fallback capture). Its first run found three route
+  defects, fixed before landing: placeholders numbered in emission order (WHERE first) on the
+  prepared path, an unknown column in the WHERE clause or inside an expression read as NULL
+  instead of failing, and a routing expectation. Pre-existing divergences it found, the same with
+  the replay, filed and left out of the keeper: bd-kqb76 (-0.0 in a REAL column), bd-u65rh
+  (explicit rowids of a failed statement raise the next automatic rowid), bd-jlbrk (IPK ON
+  CONFLICT REPLACE and UNIQUE ON CONFLICT IGNORE on one row), bd-ulgsj (`changes()` after a failed
+  prepare). A runtime error part way through the source now leaves `last_insert_rowid()` where
+  stock does (the replay left it unchanged, bd-qdve2).
+- Gate, on 7dc103b9f with the change: clippy -D warnings with all targets on fsqlite-vdbe and
+  fsqlite-core clean; fsqlite-vdbe lib 1,240 pass and 2 fail (the IN-list pair red on main,
+  bd-bhalc), bytecode goldens 8 pass (no bytecode change); the 24 fsqlite-core INSERT targets
+  (`ls tests | grep -i -E "insert|bulk_import|491"`, the new keeper among them) 86 pass, 0 fail;
+  fsqlite-core lib 4,159 pass and 2 fail (the t6741 pair red on main, bd-nouem).
+- Retry condition: none for this step. Next: a `generate_series` source through VOpen/VFilter
+  (bd-i3csr step 2, the bulk row); then the Affinity pair and the per-row rowid-floor bump, which
+  every INSERT program pays.
+
 ## 2026-11-12 - WIN: a standalone refresh with an unchanged shared header returns before its path probes (bd-ih8ak, lever 3)
 
 - Target: the refresh a connection runs after its own autocommit flush
