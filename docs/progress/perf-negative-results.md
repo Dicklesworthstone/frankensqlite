@@ -87,6 +87,46 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-12 - REJECTED: the publication scan reads a peer's new frame headers in batched runs (bd-w4pr1.8, lever 1)
+
+- Target: the scorecard's multiproc row (8 processes x 500 autocommit INSERTs, one WAL database).
+  Touched (not landed; the diff is `scratchpad/lever1_walhdrs_4aff2cd9b.patch` of the coordinator
+  session, sha256 4ccb96f4..., on 4aff2cd9b): `crates/fsqlite-core/src/wal_adapter.rs`
+  (`scan_publication_delta` calls the existing `WalFile::read_frame_headers` for `start..=end`
+  instead of one `read_frame_header` per frame; the test fault injector counts a batched read; new
+  test `test_publication_scan_failure_in_a_later_header_batch_preserves_prior_snapshot`).
+- Evidence before: strace of one contended writer showed 10.6-18.1 24-byte `-wal` preads per
+  INSERT, attributed to the publication scan.
+- Result (stock sqlite3 3.46.1 live; binaries e8522700... base 4aff2cd9b, cf81499e... candidate;
+  `mp_ab.sh` 3 interleaved traced runs, `mp_probe.py --reps 5`): 24-byte preads per INSERT
+  18.02/15.22/11.98 -> 11.04/10.94/11.45 (-3.9 mean); all `-wal` preads 24.1/21.0/17.9 ->
+  17.7/17.9/17.8, bytes read up in two runs of three (whole frames per batch). Kill (recorded
+  before code on bd-w4pr1.8: fewer than 10 removed per INSERT): met, rejected. Row: wall 955.4 ->
+  926.0 ms, CPU 1,199 -> 1,121 ms, one 5-rep run, inside this row's +-6% run-to-run spread (stock
+  144.3 ms).
+- Why it fell short: the same new peer frames are read three times per adoption. `WalFile::refresh`
+  reads them whole and checks their checksums, the publication scan read their headers (batched
+  here), and the appended-tail index fold (`wal_adapter.rs`, `TailIndexPlan::Fold`, one
+  `read_frame_header` per frame) reads the headers again: about 11 single-header reads per INSERT
+  remain.
+- Gate (on the candidate): clippy -D warnings clean; fsqlite-core lib 187 pass (wal_adapter,
+  page_index, refresh, publication, partial_index, cross_handle filters); integration targets green.
+- Retry condition: not as a standalone patch. Retry as one change that hands the headers
+  `WalFile::refresh` already read to both the publication scan and the tail-index fold (TODO M6),
+  and predict at least 10 single-header reads removed per INSERT on `mp_ab.sh`.
+
+## 2026-11-12 - NOTE: WAL-FEC's default repair budget costs nothing measurable on the write rows
+
+- Candidate considered: default `raptorq_repair_symbols` to 0 for speed. Measured the current
+  default (2) against `PRAGMA raptorq_repair_symbols=0` persisted in an identical untimed setup,
+  stock live, binary main abe603039 (`fec_cost_probe.py`, `fec_autocommit_probe.py`): autocommit
+  5k CPU 669.4 vs 680.1 ms, txn 1000x10 300.7 vs 312.5 ms (7 reps); UPDATE 10% 209.6 vs 221.0 ms
+  and DELETE 14% 185.4 vs 163.5 ms (5 reps), an earlier 3-rep run of the same two gave -13% for
+  both. Signs disagree between runs: inside the noise. A first txn probe that created the database
+  inside the timed run of one arm only showed -23%; that was the asymmetry, not WAL-FEC.
+- Retry condition: a profile where the WAL-FEC worker or its sidecar writes exceed 5% of a row's
+  CPU, or a host whose sidecar writes hit a real disk.
+
 ## 2026-11-12 - SMALL WIN: a certificate record lookup reads footer and record in one tail read (bd-w4pr1.8)
 
 - Target: the scorecard's multiproc row (8 processes x 500 autocommit INSERTs, one WAL database).
