@@ -40,7 +40,7 @@ use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use advisory_lock::{AdvisoryFileLock, FileLockError, FileLockMode};
@@ -395,6 +395,7 @@ impl PendingNamespaceOpen {
             stable_path: self.stable_path.clone(),
             identity: Mutex::new(identity),
             provisional_identity: AtomicBool::new(false),
+            transaction_proofs: AtomicUsize::new(0),
             lease: Mutex::new(BindingLease::Shared { use_file }),
         }))
     }
@@ -525,6 +526,7 @@ impl PendingNamespaceOpen {
             stable_path: std::mem::take(&mut self.stable_path),
             identity: Mutex::new(identity),
             provisional_identity: AtomicBool::new(provisional_identity),
+            transaction_proofs: AtomicUsize::new(0),
             lease: Mutex::new(state),
         }))
     }
@@ -588,7 +590,33 @@ pub struct DatabaseNamespaceBinding {
     /// when the materialized identity is adopted, or as soon as a plain
     /// validation proves the identity did not move.
     provisional_identity: AtomicBool,
+    /// bd-ih8ak (owner decision 2026-11-12): open transactions of this
+    /// connection that validated the path identity in full at their begin.
+    /// While any is open, an operation inside a transaction relies on that
+    /// validation instead of probing the path again; see
+    /// [`DatabaseNamespaceBinding::validate_path_identity_within_transaction`].
+    transaction_proofs: AtomicUsize,
     lease: Mutex<BindingLease>,
+}
+
+/// One open transaction's proof that its binding's path identity held when it
+/// began.
+///
+/// bd-ih8ak: path-identity probes run once per transaction, at its begin and
+/// at its commit. The proof is dropped with the transaction on every path
+/// (commit, rollback, failure, cancellation); with none held, every probe
+/// runs in full again.
+#[derive(Debug)]
+pub struct TransactionPathProof {
+    binding: Arc<DatabaseNamespaceBinding>,
+}
+
+impl Drop for TransactionPathProof {
+    fn drop(&mut self) {
+        self.binding
+            .transaction_proofs
+            .fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// GH#416: whether the main file at `path` is currently a zero-length regular
@@ -640,6 +668,36 @@ impl DatabaseNamespaceBinding {
     #[must_use]
     pub fn identity_is_provisional(&self) -> bool {
         self.provisional_identity.load(Ordering::Acquire)
+    }
+
+    /// Record that a transaction beginning now has just validated this
+    /// binding's path identity in full, and keep that proof until the
+    /// returned guard is dropped with the transaction. Call it only right
+    /// after a successful full validation ([`Self::validate_path_identity`]
+    /// or its GH#416 adoption): every transaction's begin probes in full, so a
+    /// file replaced between transactions is found at the next begin.
+    #[must_use]
+    pub fn hold_transaction_proof(self: &Arc<Self>) -> TransactionPathProof {
+        self.transaction_proofs.fetch_add(1, Ordering::AcqRel);
+        TransactionPathProof {
+            binding: Arc::clone(self),
+        }
+    }
+
+    /// The path-identity probe of an operation inside a transaction
+    /// (bd-ih8ak). While a transaction that validated the identity at its
+    /// begin is still open, this returns at once: a file replaced inside a
+    /// transaction is found no later than its commit, whose probe under the
+    /// WAL append gate runs in full before anything is written. With no proof
+    /// held, or while the bound identity is still provisional (GH#416, whose
+    /// adoption needs the full probe), it probes in full.
+    pub fn validate_path_identity_within_transaction(&self) -> Result<()> {
+        if self.transaction_proofs.load(Ordering::Acquire) > 0
+            && !self.provisional_identity.load(Ordering::Acquire)
+        {
+            return Ok(());
+        }
+        self.validate_path_identity()
     }
 
     /// Side-effect-free identity validation for operation boundaries.  The
@@ -793,7 +851,18 @@ impl DatabaseNamespaceBinding {
             self.validate_identity(Some(FileIdentity::from_unix_parts(
                 metadata.dev(),
                 metadata.ino(),
-            )))
+            )))?;
+            // GH#416: a match against a NON-EMPTY file proves the identity
+            // did not move on first allocation (or already moved and was
+            // adopted), so it is durable from here on; this stat already
+            // carries the size. A match while the file is still empty proves
+            // nothing. Without this, a database its own connection created
+            // stays provisional for the connection's life, and every
+            // in-transaction probe runs in full (bd-ih8ak).
+            if metadata.len() > 0 && self.provisional_identity.load(Ordering::Acquire) {
+                self.provisional_identity.store(false, Ordering::Release);
+            }
+            Ok(())
         }
 
         // Windows closes do not release byte-range locks held on other
@@ -5478,6 +5547,112 @@ mod tests {
             .expect("read-only re-open")
             .bind(identity)
             .expect("bind read-only");
+    }
+
+    /// bd-ih8ak: a transaction's proof lets in-transaction probes skip the
+    /// path stat only while the transaction is open; the full probe always
+    /// sees a replaced file, and so does the in-transaction one again once the
+    /// last proof is dropped.
+    #[cfg(unix)]
+    #[test]
+    fn transaction_proof_skips_in_transaction_probes_only_while_held() {
+        let dir = tempdir().expect("tempdir");
+        let database = dir.path().join("proof.db");
+        let identity = create_database(&database, b"live");
+        let binding = PendingNamespaceOpen::begin(&database, NamespaceOpenIntent::Shared)
+            .expect("admit fresh namespace")
+            .bind(identity)
+            .expect("bind");
+        assert!(!binding.identity_is_provisional());
+        binding
+            .validate_path_identity_within_transaction()
+            .expect("no proof held: the full probe passes on the bound file");
+
+        let first = binding.hold_transaction_proof();
+        let second = binding.hold_transaction_proof();
+        // Replace the file at the path with a different inode.
+        std::fs::rename(&database, dir.path().join("aside.db")).expect("move aside");
+        create_database(&database, b"stranger");
+
+        assert!(
+            binding.validate_path_identity().is_err(),
+            "the full probe (begin, commit) still sees the replacement"
+        );
+        binding
+            .validate_path_identity_within_transaction()
+            .expect("inside an open transaction the begin's probe stands");
+        drop(first);
+        binding
+            .validate_path_identity_within_transaction()
+            .expect("one transaction is still open");
+        drop(second);
+        assert!(
+            binding.validate_path_identity_within_transaction().is_err(),
+            "with no transaction open the probe runs in full again"
+        );
+    }
+
+    /// bd-ih8ak with GH#416: while the bound identity is provisional the
+    /// in-transaction probe never skips, so the adoption path still runs.
+    #[cfg(unix)]
+    #[test]
+    fn transaction_proof_never_skips_a_provisional_identity() {
+        let dir = tempdir().expect("tempdir");
+        let database = dir.path().join("proof_placeholder.db");
+        let _real = create_database(&database, b"");
+        let placeholder = FileIdentity::from_unix_parts(0x5EED, 999_999_998);
+        let binding = PendingNamespaceOpen::begin(&database, NamespaceOpenIntent::Shared)
+            .expect("admit fresh namespace")
+            .bind(placeholder)
+            .expect("bind placeholder identity");
+        assert!(binding.identity_is_provisional());
+        let _proof = binding.hold_transaction_proof();
+        assert!(
+            binding.validate_path_identity_within_transaction().is_err(),
+            "a provisional identity is probed in full even inside a transaction"
+        );
+    }
+
+    /// GH#416 / bd-ih8ak: a binding made over a zero-length file (the
+    /// connection that creates the database) stays provisional only until a
+    /// plain validation matches it against the materialized file; from then
+    /// on in-transaction probes rely on the transaction's proof. A match
+    /// while the file is still empty keeps it provisional.
+    #[cfg(unix)]
+    #[test]
+    fn plain_validation_of_the_materialized_file_makes_the_identity_durable() {
+        let dir = tempdir().expect("tempdir");
+        let database = dir.path().join("created_here.db");
+        let real = create_database(&database, b"");
+        let binding = PendingNamespaceOpen::begin(&database, NamespaceOpenIntent::Shared)
+            .expect("admit fresh namespace")
+            .bind(real)
+            .expect("bind the empty file's identity");
+        assert!(binding.identity_is_provisional());
+        binding
+            .validate_path_identity()
+            .expect("the path still names the bound file");
+        assert!(
+            binding.identity_is_provisional(),
+            "a match against an empty file proves nothing"
+        );
+
+        fs::write(&database, b"page one").expect("materialize the file in place");
+        binding
+            .validate_path_identity()
+            .expect("same file, now non-empty");
+        assert!(!binding.identity_is_provisional());
+
+        let _proof = binding.hold_transaction_proof();
+        fs::rename(&database, dir.path().join("aside.db")).expect("move the database aside");
+        fs::write(&database, b"a stranger").expect("put a stranger at the path");
+        assert!(
+            binding.validate_path_identity().is_err(),
+            "the full probe sees the swap"
+        );
+        binding
+            .validate_path_identity_within_transaction()
+            .expect("inside the transaction the begin proof stands");
     }
 
     /// GH#416: an identity captured from a zero-length main file is

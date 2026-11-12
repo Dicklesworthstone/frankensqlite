@@ -347,6 +347,16 @@ pub trait WalBackend: Send + Sync {
         Box::pin(async { Err(FrankenError::Unsupported) })
     }
 
+    /// The identity of the file at the pager's `<database path>-wal` as the
+    /// pager stated it during the begin now in progress, for the next
+    /// [`Self::begin_native_read`] to use instead of stating the path again
+    /// (bd-ih8ak: one `-wal` probe per transaction begin). The pager calls
+    /// this before every `begin_native_read`, `None` when it has no fresh
+    /// observation, so no earlier begin's observation survives into a later
+    /// one. A backend adopts it only when its own `-wal` path is that path;
+    /// backends that do not check the path ignore it.
+    fn note_begin_wal_path_identity(&mut self, _identity: Option<fsqlite_vfs::FileIdentity>) {}
+
     /// Retire exactly this pin before the caller releases its physical claim.
     fn end_native_read(&mut self, _token: &WalNativeReadToken) -> Result<()> {
         Err(FrankenError::Unsupported)

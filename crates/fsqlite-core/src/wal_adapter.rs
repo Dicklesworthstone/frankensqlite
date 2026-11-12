@@ -3809,6 +3809,15 @@ where
     create_missing: bool,
     #[cfg(all(feature = "native", any(unix, windows)))]
     namespace_binding: Option<Arc<DatabaseNamespaceBinding>>,
+    /// Whether `wal_path` is `<db_path>-wal`, the path a pager states for its
+    /// refresh signature, so that pager's observation of it may stand in for
+    /// this backend's own (bd-ih8ak). Decided once here, not per begin.
+    wal_path_is_db_path_wal: bool,
+    /// bd-ih8ak: the `-wal` path's file identity as the pager observed it at
+    /// the begin now in progress, just before it binds the native reader.
+    /// That begin's [`WalBackend::begin_native_read`] takes it instead of
+    /// stating the path again; any other check stats the path as before.
+    begin_wal_path_identity: Option<fsqlite_vfs::FileIdentity>,
     /// Cached read-only descriptor for the per-commit FCW page-baseline
     /// verification in [`Self::conflicts_after_generation_change`] (bd-smxhz).
     ///
@@ -3932,6 +3941,9 @@ where
             Arc<DatabaseNamespaceBinding>,
         >,
     ) -> Self {
+        let mut db_path_wal = db_path.as_ref().as_os_str().to_owned();
+        db_path_wal.push("-wal");
+        let wal_path_is_db_path_wal = Path::new(&db_path_wal) == wal_path.as_ref();
         Self {
             vfs,
             db_path: db_path.as_ref().to_path_buf(),
@@ -3940,6 +3952,8 @@ where
             create_missing,
             #[cfg(all(feature = "native", any(unix, windows)))]
             namespace_binding,
+            wal_path_is_db_path_wal,
+            begin_wal_path_identity: None,
             cached_verification_db: None,
             cached_certificate_read: std::sync::Mutex::new(None),
             cached_certificate_append: std::sync::Mutex::new(None),
@@ -4155,16 +4169,23 @@ where
     /// `generation_proven`: the caller already knows this handle's WAL
     /// generation is the published one, so the WAL header is not read back to
     /// compare it. The path is still checked against the handle.
+    /// `observed_path_identity`: the `-wal` path's identity as the pager
+    /// stated it moments ago in the same begin (bd-ih8ak: one `-wal` probe per
+    /// transaction begin); `None` states the path here.
     async fn current_handle_names_wal_path(
         &self,
         cx: &Cx,
         generation_proven: bool,
+        observed_path_identity: Option<fsqlite_vfs::FileIdentity>,
     ) -> Result<Option<bool>> {
         let current = self.inner.wal.file();
-        let (Some(path_identity), Some(current_identity)) = (
-            self.vfs.path_file_identity(cx, &self.wal_path)?,
-            current.file_identity()?,
-        ) else {
+        let path_identity = match observed_path_identity {
+            Some(identity) => Some(identity),
+            None => self.vfs.path_file_identity(cx, &self.wal_path)?,
+        };
+        let (Some(path_identity), Some(current_identity)) =
+            (path_identity, current.file_identity()?)
+        else {
             return Ok(None);
         };
         if path_identity != current_identity {
@@ -4452,17 +4473,27 @@ where
     /// Read admission never creates or truncates a WAL to satisfy its binding.
     /// `bound_header`: the shared WAL-index header the read admission about
     /// to follow is bound to, when there is one.
+    /// `at_begin`: called from the begin of a transaction whose pager has just
+    /// validated the database path in full and stated the `-wal` path
+    /// (bd-ih8ak): the database probe then relies on the transaction's proof
+    /// and the `-wal` check uses the identity the pager observed, if any.
     async fn ensure_current_wal_path_for_native_read(
         &mut self,
         cx: &Cx,
         bound_header: Option<fsqlite_wal::wal_index::WalIndexHdr>,
+        at_begin: bool,
     ) -> Result<WalNativeReadOutcome> {
+        let observed_wal_path_identity = self.begin_wal_path_identity.take().filter(|_| at_begin);
         if self.inner.has_pending_publication() || self.inner.native_read_binding.is_some() {
             return Err(FrankenError::BusyRecovery);
         }
         #[cfg(all(feature = "native", any(unix, windows)))]
         if let Some(binding) = &self.namespace_binding {
-            binding.validate_path_identity()?;
+            if at_begin {
+                binding.validate_path_identity_within_transaction()?;
+            } else {
+                binding.validate_path_identity()?;
+            }
         }
         self.ensure_db_file_identity_captured(cx).await;
         // Reading the WAL header back through this handle detects a
@@ -4479,7 +4510,11 @@ where
                     salts: self.inner.wal.header().salts,
                 })
         });
-        if self.current_handle_names_wal_path(cx, generation_proven).await? == Some(true) {
+        if self
+            .current_handle_names_wal_path(cx, generation_proven, observed_wal_path_identity)
+            .await?
+            == Some(true)
+        {
             return Ok(WalNativeReadOutcome::Ready);
         }
         let opened = self.vfs.open(cx, Some(&self.wal_path), VfsOpenFlags::READWRITE | VfsOpenFlags::WAL);
@@ -4618,7 +4653,7 @@ where
         // Cross-process stock DOES see it and leaves them alone (measured on
         // bd-1nq3j), so this is tolerance for a configuration stock itself
         // documents as unsupported, not cover for an interop defect.
-        match self.current_handle_names_wal_path(cx, false).await? {
+        match self.current_handle_names_wal_path(cx, false, None).await? {
             Some(true) => return Ok(()),
             Some(false) => return Err(FrankenError::BusyRecovery),
             None => {}
@@ -6164,13 +6199,17 @@ where
     ) -> WalFuture<'a, WalNativeReadOutcome> {
         Box::pin(async move {
             match self
-                .ensure_current_wal_path_for_native_read(cx, Some(binding.header()))
+                .ensure_current_wal_path_for_native_read(cx, Some(binding.header()), true)
                 .await?
             {
                 WalNativeReadOutcome::Ready => self.inner.begin_native_read(cx, binding).await,
                 outcome => Ok(outcome),
             }
         })
+    }
+
+    fn note_begin_wal_path_identity(&mut self, identity: Option<fsqlite_vfs::FileIdentity>) {
+        self.begin_wal_path_identity = identity.filter(|_| self.wal_path_is_db_path_wal);
     }
 
     fn end_native_read(&mut self, token: &WalNativeReadToken) -> Result<()> {
@@ -6186,7 +6225,10 @@ where
             if self.inner.has_pending_publication() || self.inner.native_read_binding.is_some() {
                 return Err(FrankenError::BusyRecovery);
             }
-            match self.ensure_current_wal_path_for_native_read(cx, None).await? {
+            match self
+                .ensure_current_wal_path_for_native_read(cx, None, false)
+                .await?
+            {
                 fsqlite_pager::traits::WalNativeReadOutcome::Ready => {}
                 fsqlite_pager::traits::WalNativeReadOutcome::RecoveryRequired(_) => {
                     // Creating/resetting the physical WAL requires its own

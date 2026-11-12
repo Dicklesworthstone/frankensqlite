@@ -30,7 +30,7 @@ use fsqlite_types::{
 #[cfg(all(feature = "native", any(unix, windows)))]
 use fsqlite_vfs::{
     DatabaseNamespaceBinding, NamespaceOpenIntent, PendingNamespaceOpen, PreOpenLockSidecars,
-    WindowsLockSidecarPolicy, validate_reserved_database_artifacts,
+    TransactionPathProof, WindowsLockSidecarPolicy, validate_reserved_database_artifacts,
 };
 use fsqlite_vfs::{
     FileIdentity, SyncKind, Vfs, VfsFile, VfsWriteCompletion, VfsWriteCompletionState,
@@ -15165,6 +15165,14 @@ where
             // orphan receipt that another valid alias needs to recover.
             // (`inner` is held here, so validate through it — GH#416.)
             self.validate_namespace_binding_locked(&mut inner)?;
+            // bd-ih8ak: this full probe is the transaction's begin probe.
+            // Operations inside the transaction rely on it until its commit
+            // probes in full again; the proof leaves with the transaction.
+            #[cfg(all(feature = "native", any(unix, windows)))]
+            let mut path_proof = self
+                .namespace_binding
+                .as_ref()
+                .map(DatabaseNamespaceBinding::hold_transaction_proof);
             inner.adopt_orphaned_rollback_journal_recovery()?;
             // Derive and admit the exact takeover owner while PagerInner is
             // still locked. No await or local-state ABA can occur between this
@@ -15328,6 +15336,8 @@ where
                     journal_path: Self::journal_path(&self.db_path),
                     #[cfg(all(feature = "native", any(unix, windows)))]
                     namespace_binding: self.namespace_binding.clone(),
+                    #[cfg(all(feature = "native", any(unix, windows)))]
+                    path_proof: path_proof.take(),
                     group_commit_queue: Arc::clone(&self.group_commit_queue),
                     inner: Arc::clone(&self.inner),
                     write_set_page_limit: Arc::clone(&self.write_set_page_limit),
@@ -15571,6 +15581,8 @@ where
                 journal_path: Self::journal_path(&self.db_path),
                 #[cfg(all(feature = "native", any(unix, windows)))]
                 namespace_binding: self.namespace_binding.clone(),
+                #[cfg(all(feature = "native", any(unix, windows)))]
+                path_proof: path_proof.take(),
                 group_commit_queue: Arc::clone(&self.group_commit_queue),
                 inner: Arc::clone(&self.inner),
                 write_set_page_limit: Arc::clone(&self.write_set_page_limit),
@@ -18930,11 +18942,15 @@ where
     }
 
     /// Native acquisition and backend binding share the caller's cleanup owner.
+    /// `observed_wal_identity`: the `-wal` path's identity this begin stated
+    /// for its refresh signature, which the backend's path check may use
+    /// instead of stating the path again (bd-ih8ak).
     async fn try_bind_runtime_native_reader(
         &self,
         cx: &Cx,
         inner: &PagerInner<V::File>,
         external_lock: &mut BeginExternalLockState<V::File>,
+        observed_wal_identity: Option<FileIdentity>,
     ) -> Result<traits::WalNativeReadOutcome> {
         use traits::WalNativeReadOutcome;
         if inner.journal_mode != JournalMode::Wal {
@@ -18978,6 +18994,10 @@ where
             backend: Arc::clone(&backend),
             token: binding.token().clone(),
         });
+        // Always set, `None` included, so no other begin's observation
+        // reaches this one's path check. It names `<db_path>-wal`, the path
+        // `current_wal_refresh_signature` states.
+        wal.note_begin_wal_path_identity(observed_wal_identity);
         let outcome = wal.begin_native_read(cx, binding).await?;
         if outcome == WalNativeReadOutcome::Ready
             && !wal.native_read_binding().is_some_and(|bound| bound.token().matches(&expected_token))
@@ -19030,6 +19050,8 @@ where
     }
 
     /// Retire the whole reader attempt before a separately classified recovery.
+    /// `observed_wal_identity` (bd-ih8ak) is offered to the first binding
+    /// attempt only; one after a recovery states the `-wal` path itself.
     async fn prepare_runtime_native_reader(
         &self,
         cx: &Cx,
@@ -19037,6 +19059,7 @@ where
         inner: &mut PagerInner<V::File>,
         external_lock: &mut BeginExternalLockState<V::File>,
         reserve_writer: bool,
+        mut observed_wal_identity: Option<FileIdentity>,
     ) -> Result<()> {
         let mut recovered_once = false;
         loop {
@@ -19050,7 +19073,10 @@ where
             if reserve_writer {
                 shared_db_lock(&inner.db_file, cx, LockLevel::Reserved).await?;
             }
-            let reason = match self.try_bind_runtime_native_reader(cx, inner, external_lock).await? {
+            let reason = match self
+                .try_bind_runtime_native_reader(cx, inner, external_lock, observed_wal_identity.take())
+                .await?
+            {
                 traits::WalNativeReadOutcome::Ready => return Ok(()),
                 traits::WalNativeReadOutcome::RecoveryRequired(reason) => reason,
             };
@@ -19205,7 +19231,7 @@ where
                 drop(db_file);
                 match journal_state {
                     Ok(()) => {
-                        self.prepare_runtime_native_reader(cx, maintenance_lease, inner, external_lock, false).await?;
+                        self.prepare_runtime_native_reader(cx, maintenance_lease, inner, external_lock, false, None).await?;
                         inner
                             .refresh_committed_state(cx, &self.cache, &self.wal_backend, true)
                             .await
@@ -19292,7 +19318,7 @@ where
             }
 
             let refresh_result = match self.prepare_runtime_native_reader(
-                cx, maintenance_lease, inner, external_lock, reserve_writer,
+                cx, maintenance_lease, inner, external_lock, reserve_writer, None,
             ).await {
                 Ok(()) => inner
                     .refresh_committed_state_after_recovery(cx, &self.cache, &self.wal_backend, true)
@@ -19331,7 +19357,12 @@ where
         // bound header, which can only be this one or newer.
         let pre_refresh_signature = self.current_wal_refresh_signature(cx, inner).await?;
         let refresh_result = match self.prepare_runtime_native_reader(
-            cx, maintenance_lease, inner, external_lock, reserve_writer,
+            cx,
+            maintenance_lease,
+            inner,
+            external_lock,
+            reserve_writer,
+            pre_refresh_signature.map(|signature| signature.wal_identity),
         ).await {
             Ok(()) => {
                 self.refresh_committed_state_unless_unchanged(cx, inner, pre_refresh_signature)
@@ -21693,6 +21724,11 @@ where
     journal_path: PathBuf,
     #[cfg(all(feature = "native", any(unix, windows)))]
     namespace_binding: Option<Arc<DatabaseNamespaceBinding>>,
+    /// bd-ih8ak: this transaction's begin validated the path identity in
+    /// full; in-transaction probes rely on it until the commit's full probe.
+    /// Dropped with the transaction on every path.
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    path_proof: Option<TransactionPathProof>,
     group_commit_queue: GroupCommitQueueRef,
     inner: Arc<Mutex<PagerInner<V::File>>>,
     /// Exact stable handle used for lock-transition coordination. Distinct
@@ -21933,6 +21969,33 @@ where
 
     #[cfg(not(all(feature = "native", any(unix, windows))))]
     fn validate_namespace_binding(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// The commit entry's path-identity probe (bd-ih8ak). A WAL commit
+    /// validates the database path in full under the append gate, before any
+    /// frame is written, so here it relies on this transaction's begin probe.
+    /// That later probe is the WAL backend's: every read-write native WAL
+    /// install is a path-refreshing backend bound to this pager's namespace
+    /// binding (only read-only connections, which never reach a writing
+    /// commit, get a bare one), and a group-commit leader that appends this
+    /// transaction's frames shares its queue, so its file identity. A
+    /// rollback-journal commit has no such later probe: this one is its
+    /// commit probe and runs in full.
+    #[cfg(all(feature = "native", any(unix, windows)))]
+    fn validate_namespace_binding_at_commit_entry(&self) -> Result<()> {
+        if let Some(binding) = &self.namespace_binding {
+            if self.journal_mode == JournalMode::Wal && self.path_proof.is_some() {
+                binding.validate_path_identity_within_transaction()?;
+            } else {
+                binding.validate_path_identity()?;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(all(feature = "native", any(unix, windows))))]
+    fn validate_namespace_binding_at_commit_entry(&self) -> Result<()> {
         Ok(())
     }
 
@@ -27699,7 +27762,7 @@ where
                 self.scratch_arena.reset();
                 return Ok(());
             }
-            self.validate_namespace_binding()?;
+            self.validate_namespace_binding_at_commit_entry()?;
             if self.vfs.is_memory()
                 && self.memory_db_bump_alloc
                 && !self.retained_memory_overlay_dirty_pages.is_empty()
