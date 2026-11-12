@@ -152,7 +152,9 @@ use fsqlite_btree::{
     BtCursor, BtreeCursorOps, BtreePageHeader, BtreePageType, MemPageStore, PageReader, PageWriter,
     SeekResult, header_offset_for_page,
 };
-use fsqlite_error::{ErrorCode, FrankenError, Result, SQLITE_CONSTRAINT_PRIMARYKEY};
+use fsqlite_error::{
+    ErrorCode, FrankenError, Result, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_ROWID,
+};
 use fsqlite_func::collation::CollationRegistry;
 use fsqlite_func::vtab::ColumnContext;
 use fsqlite_func::{
@@ -9081,14 +9083,14 @@ impl VdbeEngine {
 
     /// Halt code for a rowid collision in the table at `root_page`. On a table
     /// with an INTEGER PRIMARY KEY the rowid *is* the PRIMARY KEY, so stock
-    /// raises SQLITE_CONSTRAINT_PRIMARYKEY (bd-w4pr1.22). A hidden rowid keeps
-    /// the plain constraint code: stock's SQLITE_CONSTRAINT_ROWID has no
-    /// `FrankenError` variant yet, and it is not a PRIMARY KEY.
+    /// raises SQLITE_CONSTRAINT_PRIMARYKEY (bd-w4pr1.22). A hidden rowid is
+    /// not a PRIMARY KEY: stock raises SQLITE_CONSTRAINT_ROWID with the label
+    /// "<table>.rowid" (bd-w4pr1.32).
     fn rowid_conflict_halt_code(&self, root_page: i32) -> i32 {
         if self.rowid_alias_col_by_root_page.contains_key(&root_page) {
             SQLITE_CONSTRAINT_PRIMARYKEY
         } else {
-            ErrorCode::Constraint as i32
+            SQLITE_CONSTRAINT_ROWID
         }
     }
 

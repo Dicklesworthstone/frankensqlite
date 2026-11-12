@@ -94,7 +94,9 @@ use fsqlite_btree::{
 };
 #[cfg(not(test))]
 use fsqlite_btree::{set_btree_copy_profile_enabled, set_btree_metrics_enabled};
-use fsqlite_error::{ErrorCode, FrankenError, Result, SQLITE_CONSTRAINT_PRIMARYKEY};
+use fsqlite_error::{
+    ErrorCode, FrankenError, Result, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_ROWID,
+};
 #[cfg(feature = "ext-fts5")]
 use fsqlite_ext_fts5::{
     FTS5_AVERAGES_ROWID, FTS5_STRUCTURE_ROWID, Fts5AveragesRecord, Fts5DataRowid, Fts5DeletedDoc,
@@ -35627,8 +35629,10 @@ impl Connection {
     /// B-tree on the regular-table direct insert path's INTEGER PRIMARY KEY /
     /// rowid duplicate) so it reads as stock's "UNIQUE constraint failed:
     /// <table>.<ipk_col>" (bd-s9irk #1) and keeps stock's
-    /// SQLITE_CONSTRAINT_PRIMARYKEY code (bd-w4pr1.22). Any other error passes
-    /// through unchanged.
+    /// SQLITE_CONSTRAINT_PRIMARYKEY code (bd-w4pr1.22). On a table without an
+    /// INTEGER PRIMARY KEY the duplicate is the hidden rowid's: stock's
+    /// "<table>.rowid" under SQLITE_CONSTRAINT_ROWID (bd-w4pr1.32). Any other
+    /// error passes through unchanged.
     fn label_direct_insert_pk_violation(
         &self,
         error: FrankenError,
@@ -35637,21 +35641,22 @@ impl Connection {
         if !matches!(error, FrankenError::PrimaryKeyViolation { .. }) {
             return error;
         }
-        let ipk_column = self
-            .schema
-            .borrow()
+        // Stock names the table as declared, whatever case the statement used,
+        // and a hidden rowid as `rowid` under SQLITE_CONSTRAINT_ROWID
+        // (bd-w4pr1.32): it is not a PRIMARY KEY.
+        let schema = self.schema.borrow();
+        let Some(table) = schema
             .iter()
             .find(|table| table.name.eq_ignore_ascii_case(table_name))
-            .and_then(|table| {
-                table
-                    .columns
-                    .iter()
-                    .find(|column| column.is_ipk)
-                    .map(|column| column.name.clone())
-            });
-        match ipk_column {
+        else {
+            return error;
+        };
+        match table.columns.iter().find(|column| column.is_ipk) {
             Some(column) => FrankenError::PrimaryKeyViolation {
-                columns: format!("{table_name}.{column}"),
+                columns: format!("{}.{}", table.name, column.name),
+            },
+            None if !table.without_rowid => FrankenError::RowidViolation {
+                table: table.name.clone(),
             },
             None => error,
         }
@@ -116851,6 +116856,15 @@ fn frankenerror_from_vdbe_halt(code: i32, message: String) -> FrankenError {
     // extended code (SQLITE_CONSTRAINT_PRIMARYKEY, as stock's OP_Halt P1 carries
     // it) is what tells them apart.
     if let Some(columns) = message.strip_prefix("UNIQUE constraint failed: ") {
+        // bd-w4pr1.32: a hidden rowid's collision halts with
+        // SQLITE_CONSTRAINT_ROWID and the label "<table>.rowid".
+        if code == SQLITE_CONSTRAINT_ROWID
+            && let Some(table) = columns.strip_suffix(".rowid")
+        {
+            return FrankenError::RowidViolation {
+                table: table.to_owned(),
+            };
+        }
         let columns = columns.to_owned();
         if code == SQLITE_CONSTRAINT_PRIMARYKEY {
             return FrankenError::PrimaryKeyViolation { columns };

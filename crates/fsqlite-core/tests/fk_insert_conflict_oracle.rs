@@ -34,9 +34,8 @@ fn classify_franken(r: Result<usize, FrankenError>) -> Outcome {
     match r {
         Ok(n) => Outcome::Ok(n),
         Err(FrankenError::ForeignKeyViolation) => Outcome::FkViolation,
-        Err(FrankenError::PrimaryKeyViolation { .. } | FrankenError::UniqueViolation { .. }) => {
-            Outcome::PkOrUnique
-        }
+        // A UNIQUE, PRIMARY KEY or hidden-rowid conflict (bd-w4pr1.32).
+        Err(error) if error.is_unique_conflict() => Outcome::PkOrUnique,
         Err(_) => Outcome::OtherErr,
     }
 }

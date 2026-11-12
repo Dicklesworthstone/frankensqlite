@@ -134,10 +134,7 @@ fn is_retryable_fsqlite_error(error: &FrankenError) -> bool {
 
 fn is_duplicate_insert_after_retry(error: &FrankenError) -> bool {
     // Check for proper constraint errors
-    if matches!(
-        error,
-        FrankenError::PrimaryKeyViolation { .. } | FrankenError::UniqueViolation { .. }
-    ) {
+    if error.is_unique_conflict() {
         return true;
     }
     // Also check for VDBE constraint errors (code 19) wrapped as Internal

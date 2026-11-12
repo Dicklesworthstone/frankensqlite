@@ -185,6 +185,14 @@ pub enum FrankenError {
     #[error("{}", primary_key_violation_message(.columns))]
     PrimaryKeyViolation { columns: String },
 
+    /// A duplicate rowid in a table whose rowid is hidden (no INTEGER PRIMARY
+    /// KEY), e.g. `INSERT INTO t(rowid, a)` onto an existing rowid. Stock
+    /// words it "UNIQUE constraint failed: t.rowid" under
+    /// SQLITE_CONSTRAINT_ROWID (2579). The rowid is not a PRIMARY KEY there,
+    /// so this is not [`Self::PrimaryKeyViolation`]. `table` is the table name.
+    #[error("UNIQUE constraint failed: {table}.rowid")]
+    RowidViolation { table: String },
+
     /// STRICT table datatype constraint violation (SQLITE_CONSTRAINT_DATATYPE).
     #[error("cannot store {actual} value in {column_type} column {column}")]
     DatatypeViolation {
@@ -522,6 +530,12 @@ pub const SQLITE_CONSTRAINT_PRIMARYKEY: i32 = 0x13 | (6 << 8);
 /// `SQLITE_CONSTRAINT_UNIQUE`: `19 | (8 << 8) = 2067`.
 pub const SQLITE_CONSTRAINT_UNIQUE: i32 = 0x13 | (8 << 8);
 
+/// `SQLITE_CONSTRAINT_ROWID`: `19 | (10 << 8) = 2579`.
+///
+/// The extended code of [`FrankenError::RowidViolation`], a duplicate hidden
+/// rowid. A VDBE constraint halt that carries it is such a conflict.
+pub const SQLITE_CONSTRAINT_ROWID: i32 = 0x13 | (10 << 8);
+
 /// The message of [`FrankenError::PrimaryKeyViolation`]: stock's "UNIQUE
 /// constraint failed: <columns>", or the bare "PRIMARY KEY constraint failed"
 /// when the raising layer could not name the columns.
@@ -534,15 +548,17 @@ fn primary_key_violation_message(columns: &str) -> String {
 }
 
 impl FrankenError {
-    /// Whether this is a uniqueness conflict: a UNIQUE or a PRIMARY KEY
+    /// Whether this is a uniqueness conflict: a UNIQUE, PRIMARY KEY or rowid
     /// violation. Conflict resolution (OR IGNORE / OR REPLACE, UPSERT,
-    /// changeset conflict handlers) treats the two alike; only the extended
-    /// code tells them apart.
+    /// changeset conflict handlers) treats them alike; only the extended code
+    /// tells them apart.
     #[must_use]
     pub const fn is_unique_conflict(&self) -> bool {
         matches!(
             self,
-            Self::UniqueViolation { .. } | Self::PrimaryKeyViolation { .. }
+            Self::UniqueViolation { .. }
+                | Self::PrimaryKeyViolation { .. }
+                | Self::RowidViolation { .. }
         )
     }
 
@@ -597,6 +613,7 @@ impl FrankenError {
             | Self::CheckViolation { .. }
             | Self::ForeignKeyViolation
             | Self::PrimaryKeyViolation { .. }
+            | Self::RowidViolation { .. }
             | Self::DatatypeViolation { .. }
             | Self::RtreeConstraint { .. }
             | Self::TriggerRaise(_)
@@ -762,6 +779,7 @@ impl FrankenError {
             Self::NotNullViolation { .. } => 0x13 | (5 << 8), // SQLITE_CONSTRAINT_NOTNULL = 1299
             Self::PrimaryKeyViolation { .. } => SQLITE_CONSTRAINT_PRIMARYKEY, // 1555
             Self::UniqueViolation { .. } => SQLITE_CONSTRAINT_UNIQUE, // 2067
+            Self::RowidViolation { .. } => SQLITE_CONSTRAINT_ROWID, // 2579
             Self::NewerFormat { .. } => SQLITE_OPEN_NEWER_FORMAT, // 14 | (0x7F << 8) = 32526
             // 14 | (0x7E << 8) = 32270
             Self::IncompatiblePeerEngine { .. } => SQLITE_OPEN_INCOMPATIBLE_PEER,
@@ -1884,6 +1902,12 @@ mod tests {
                 },
                 1555,
             ),
+            (
+                FrankenError::RowidViolation {
+                    table: "t".to_owned(),
+                },
+                2579,
+            ),
         ];
         for (err, extended) in cases {
             assert_eq!(err.error_code(), ErrorCode::Constraint, "{err}");
@@ -1892,6 +1916,21 @@ mod tests {
         }
         assert_eq!(SQLITE_CONSTRAINT_PRIMARYKEY, 1555);
         assert_eq!(SQLITE_CONSTRAINT_UNIQUE, 2067);
+        assert_eq!(SQLITE_CONSTRAINT_ROWID, 2579);
+        // Stock names the hidden rowid "rowid" whatever alias the statement used.
+        assert_eq!(
+            FrankenError::RowidViolation {
+                table: "h".to_owned()
+            }
+            .to_string(),
+            "UNIQUE constraint failed: h.rowid"
+        );
+        assert!(
+            FrankenError::RowidViolation {
+                table: "h".to_owned()
+            }
+            .is_unique_conflict()
+        );
     }
 
     /// A PRIMARY KEY and a UNIQUE conflict read the same and resolve the same

@@ -2822,8 +2822,9 @@ mod tests {
     /// rusqlite code that hits PRIMARY KEY and UNIQUE conflicts, compiled
     /// against module `$m`, on connection `$conn`. Stock words both "UNIQUE
     /// constraint failed: ..."; applications tell them apart only by the
-    /// extended code (SQLITE_CONSTRAINT_PRIMARYKEY 1555, _UNIQUE 2067), so
-    /// errors keep their code, extended code and message (bd-w4pr1.22). The
+    /// extended code (SQLITE_CONSTRAINT_PRIMARYKEY 1555, _UNIQUE 2067, and
+    /// _ROWID 2579 for a hidden rowid), so errors keep their code, extended
+    /// code and message (bd-w4pr1.22, bd-w4pr1.32). The
     /// conflict resolutions that must still treat a PRIMARY KEY conflict as a
     /// uniqueness conflict (OR IGNORE, OR REPLACE, UPSERT) are traced with the
     /// rows they leave.
@@ -2856,6 +2857,10 @@ mod tests {
                      WITHOUT ROWID;
                  CREATE TABLE upk(k TEXT PRIMARY KEY);
                  CREATE UNIQUE INDEX upk_k ON upk(k);
+                 CREATE TABLE Hr(a TEXT);
+                 CREATE TABLE Ti(id INTEGER PRIMARY KEY, v TEXT);
+                 INSERT INTO Hr(rowid, a) VALUES (1, 'x'), (2, 'y');
+                 INSERT INTO Ti VALUES (1, 'x');
                  CREATE TEMP TABLE tmp(id TEXT PRIMARY KEY, v TEXT UNIQUE);
                  CREATE TEMP TABLE tmpi(id INTEGER PRIMARY KEY, v TEXT);
                  INSERT INTO t VALUES (1, 'one'), (2, 'two');
@@ -2930,6 +2935,32 @@ mod tests {
             trace.push(run("INSERT INTO tmp VALUES ('a', 'q')"));
             trace.push(run("INSERT INTO tmp VALUES ('b', 'p')"));
             trace.push(run("INSERT INTO tmpi VALUES (1, 'q')"));
+            // A hidden rowid is not a PRIMARY KEY: stock reports
+            // SQLITE_CONSTRAINT_ROWID and names it `<declared table>.rowid`,
+            // whichever alias or case the statement used (bd-w4pr1.32).
+            trace.push(run("INSERT INTO Hr(rowid, a) VALUES (1, 'dup')"));
+            trace.push(run("INSERT INTO hr(_ROWID_, a) VALUES (2, 'dup')"));
+            trace.push(show(
+                conn.prepare("INSERT INTO HR(oid, a) VALUES (?1, ?2)")
+                    .and_then(|mut stmt| stmt.execute(params![1, "dup"])),
+            ));
+            trace.push(run("UPDATE Hr SET rowid = 1 WHERE rowid = 2"));
+            trace.push(run(
+                "INSERT OR IGNORE INTO Hr(rowid, a) VALUES (1, 'ignored')",
+            ));
+            trace.push(run(
+                "INSERT OR REPLACE INTO Hr(rowid, a) VALUES (2, 'replaced')",
+            ));
+            trace.push(rows(
+                "SELECT rowid || '|' || quote(a) FROM Hr ORDER BY rowid",
+            ));
+            // Negative: an INTEGER PRIMARY KEY is the rowid and stays a PRIMARY
+            // KEY conflict, named after the declared table.
+            trace.push(run("INSERT INTO ti VALUES (1, 'dup')"));
+            trace.push(show(
+                conn.prepare("INSERT INTO TI(id, v) VALUES (?1, ?2)")
+                    .and_then(|mut stmt| stmt.execute(params![1, "dup"])),
+            ));
             trace
         }};
     }
@@ -2971,6 +3002,8 @@ mod tests {
                 r#"err ConstraintViolation 2067 Some("UNIQUE constraint failed: upk.k")"#,
                 r#"err ConstraintViolation 1555 Some("UNIQUE constraint failed: tmp.id")"#,
                 r#"err ConstraintViolation 1555 Some("UNIQUE constraint failed: tmpi.id")"#,
+                r#"err ConstraintViolation 2579 Some("UNIQUE constraint failed: Hr.rowid")"#,
+                r#"err ConstraintViolation 1555 Some("UNIQUE constraint failed: Ti.id")"#,
             ] {
                 assert!(
                     theirs.iter().any(|line| line == needle),
