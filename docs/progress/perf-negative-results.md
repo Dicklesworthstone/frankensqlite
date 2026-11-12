@@ -87,6 +87,33 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-12 - REJECTED: a scan WHERE comparing two expressions jumps on the comparison instead of testing its 0/1/NULL value (bd-w4pr1.13.24)
+
+- Target: a scan WHERE such as `id % 7 = 0`, where neither side is a bare column: per scanned row it
+  ran Rowid, Integer 7, Remainder, Integer 0, IsNull, IsNull, Eq, Integer, Goto, Integer|Null, IfNot
+  (stock: Rowid, Remainder, Ne). Candidate: `crates/fsqlite-vdbe/src/codegen.rs`, a new
+  `emit_where_comparison_jump` used by the two non-column arms of `emit_where_filter_with_ctx`: the
+  operands, then the named comparison jumping over a `Goto skip` (same affinity and collation as
+  `emit_comparison`; NULL and incomparable pairs fall through to the skip as the value form's
+  NULL / 0 did).
+- Result, stock sqlite3 3.46.1 live (base main f2cfaaba4 sha256 ea338924..., candidate 335cefdd...,
+  user instructions of the process, minimum of 5 runs): `delete_14pct_300k` 822.9M -> 757.0M
+  (-65.9M, 6.82x -> 6.27x); `update_10pct_300k` 1,184.2M -> 1,120.4M (-63.8M). Prediction was 120M
+  to 160M; the kill line, under 80M on `delete_14pct_300k`, was met. Not landed.
+- Why short: the opcodes removed cost about 44 instructions each in the hot loop (220 per row).
+  Most of the 1.1k per row the profile charged to the WHERE is Rowid, Remainder and Next, which any
+  shape keeps. Correctness was fine (a new oracle of 27 expression comparisons on `:memory:` and a
+  file, DML, an operand that raises on an empty and a populated table; the NULL, affinity and
+  DELETE oracles); the diff and the oracle are kept in stash `bd-w4pr1.13.24 A1 rejected` of the
+  perf7 clone and in `scratchpad/dml_edit/where_a1_rejected.patch`.
+- Not started, with their ceilings at the measured cost per opcode: folding the column arms'
+  `IsNull` guards into the inverse comparison's JUMPIFNULL (about 88M of `scan_filter_agg`'s
+  1,761M, nothing on the DML rows), and loading literal operands once in a constants block after
+  `Halt` (about 18M on `delete_14pct_300k`, 44M on `scan_filter_agg`).
+- Retry condition: the three together as one measured unit when a profile shows WHERE dispatch
+  above 15% of a scorecard row, or a scan WHERE whose operands cost more per row than an integer
+  literal.
+
 ## 2026-11-12 - WIN: a plain AggStep of the built-in sum or count steps its own state (bd-w4pr1.13)
 
 - Target: the call from a plain `AggStep` into the built-in `sum`, `count(*)` and `count(X)`: a
