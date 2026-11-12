@@ -87,6 +87,86 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-12 - WIN: a :memory: GROUP BY without loaded mirror rows runs the storage substrate instead of rebuilding the mirror (bd-w4pr1.13.23)
+
+- Target: single-table GROUP BY on `:memory:` after a write, and an aggregate over such a GROUP BY
+  in a derived table (statement 6 of the scorecard's memory script, `SELECT count(*), sum(n) FROM
+  (SELECT a, count(*) n FROM t GROUP BY a)`). Touched: `crates/fsqlite-core/src/connection.rs`
+  (`try_execute_group_by_storage_substrate`, `group_by_substrate_replaces_unloaded_memory_mirror`,
+  `select_group_by_storage_substrate_shape_fits`, the `group_by_join_fallback` decision,
+  `select_reads_one_single_table_derived_source`).
+- Evidence before (callgrind, lever-2 build, setup at 20k rows): statement 6 cost 85.5M on
+  `:memory:`, 52M of it the owed mirror rebuild paid at the outer `group_by_join_fallback` before
+  the subquery ran; on a file 70.4M, the subquery taking the GROUP BY storage substrate (67.3M). A
+  single-table GROUP BY on `:memory:` cost 82.5M when the rebuild could not be paid (a raw-scan
+  program into rows, then the evaluator), 91M when it was paid (52.9M rebuild + 37.9M mirror
+  scan), 69.4M on a file. The substrate's gate, `can_execute_aggregate_window_storage_substrate` =
+  `is_file_backed()`, came with 8adc7a4b4 (bd-1dp9.6.7.5.1), which records no reason for leaving
+  `:memory:` out.
+- Change: the substrate also runs on a private `:memory:` connection whose mirror rows are not
+  loaded, for a main-database table and a statement with no HAVING; with the rows loaded the
+  mirror scan stays (it is cheaper still). Prepare-time routing stays file-only. An aggregate over
+  one derived table whose body reads one base table (no join, compound, WITH, window, table
+  function or subquery) no longer pays the owed rebuild: the body runs as a nested statement on
+  the VDBE or the substrate, and the outer reads only its rows.
+- Found by the gate, pre-existing on file connections, reported on bd-w4pr1.13.23 (not filed;
+  needs a bug bead): the substrate answers HAVING wrongly. An aggregate inside an expression
+  drops every group (`HAVING count(*) * 2 > 3` returns no rows; also `+ 0`, unary minus, abs(),
+  BETWEEN, IN, `max(v) - min(v)`); one outside the result columns keeps failing groups (`SELECT
+  max(id) FROM h GROUP BY a HAVING count(*) > 1`; through a `DELETE ... WHERE id IN (...)` it
+  deleted the wrong rows in `memory_mirror_snapshot_differential`, seed 1, on the first cut of
+  this lever). `:memory:` therefore keeps HAVING off the substrate.
+- Result, stock sqlite3 3.46.1 live, io_uring refused, min instructions (3-5 runs) and median CPU
+  (base `fsqlite-gbbase-6ef1fe656` = main 6ef1fe656, faadd5cd...; lever = this change on
+  6ef1fe656, 00f8a9a5..., byte-identical to the build of the landed commit before its rebase;
+  both run from fresh tmpfs copies; every answer equal to stock's; `scratchpad/mirror_whole.py`,
+  `mirror_probe.py`, statement = setup + statement minus setup + SELECT 1):
+
+  | workload | stock | before | after |
+  |---|---|---|---|
+  | memory_script_200k, whole | 1,914.0M | 6,489.5M (3.39x), 623.5 ms, 102.1 MB | 6,215.7M (3.25x), 591.7 ms, 64.5 MB |
+  | same at 20k / 100 rows | 172.6M / 4.6M | 639.5M / 23.6M | 611.8M / 21.2M |
+  | its statement 6, 200k | 540.1M | 926.7M | 658.0M |
+  | `SELECT a, count(*), sum(c) FROM t GROUP BY a LIMIT 3` after the setup, 200k | 404.4M | 874.5M | 463.5M |
+  | the same three times | 1,213.1M | 2,250.7M | 1,380.0M |
+  | statement 6's shape after a read of u (rebuild payable), 200k | 540.1M | 930.1M | 662.5M |
+  | UPDATE then statement 6's shape, 200k | 605.3M | 1,190.7M | 926.2M |
+  | a VDBE read then INSERT ... SELECT ... GROUP BY, 200k | 541.5M | 791.8M | 695.8M |
+
+  Within 0.3% at 20k and 200k: a join GROUP BY once and three times, the ORDER BY-count GROUP BY
+  (not a substrate shape), HAVING after a write, ROLLBACK / SAVEPOINT then a read, a GROUP BY over
+  a derived join, a window after a write; statements 5, 7, 8 and 10 within 1%. Statement 9 (the
+  DELETE, run with the mirror now unloaded where statement 6 used to load it) +1.8% at 20k and
+  +1.1% at 200k, inside the 2% kill line. Prediction for statement 6 at 200k 650-760M: met
+  (658.0M); for the script -140 to -340M: met (-273.8M); kill lines (under -100M, statement 6 not
+  under 800M, any shape slower by more than 2%) not met.
+- Tests: `test_memory_group_by_without_loaded_mirror_runs_substrate_match_rusqlite` (lib; after
+  UPDATE, DELETE and INSERT a single-table GROUP BY records no fallback and an aggregate over it,
+  with min()/max(), only the outer `group_by_join_fallback`, and nothing is rebuilt; the two
+  HAVING shapes above take `group_by_fallback` and match stock; with the mirror loaded both take
+  `group_by_fallback`; a NOCASE key stays on the collation-aware path; inside BEGIN and after
+  ROLLBACK; every result equal to rusqlite). `test_group_by_simple_streaming_fast_path_handles_
+  count_and_avg` tests the mirror's streaming path, so it now loads the mirror first.
+  Differential: `memory_mirror_snapshot_differential`'s two ignored random-history variants, 150
+  seeds x 500 operations each with `MEMDIFF_STOP_AT_FIRST_DIVERGENCE`, on 6ef1fe656 and on this
+  change: identical per-seed summaries, no divergence on either (67,454 live reads, 37,615
+  held-prepared rounds against stock).
+- Gate (rch, on 6ef1fe656 plus this change): clippy -D warnings with all targets on fsqlite-core
+  clean; fsqlite-core lib 4,156 pass and 2 fail (the t6741 pair, bd-nouem); the 36 :memory: /
+  savepoint / rollback / time-travel / retained / prepared / join targets of the previous entry
+  and 26 GROUP BY, HAVING, DISTINCT, JSON-aggregate and min/max targets pass (on the cut before
+  the last, which also kept min()/max() off the derived-table route; 14 of them, the differential,
+  conformance and min/max ones among them, rerun on the final commit), except
+  `bare_extremum_storage_class_stock_oracle::bare_extremum_numeric_ties_preserve_stock_storage_
+  classes`, which fails the same way on 6ef1fe656 and on 5a522660b (before lever 2): fsqlite's
+  max() keeps the last of two equal values (1 against 1.0) where stock keeps the first. Rebased
+  on 7dc103b9f (1dbe95855, which landed): clippy clean, lib 4,160 pass and the same 2 fail, seven
+  of the targets (the differential, both conformance suites, derived-table flattening, aggregate
+  edges, join aggregates, the retained-batch rebuild) 1,098 pass.
+- Retry condition: none for this routing. Open: the substrate's HAVING answers on file
+  connections; the max()/min() tie order against stock; a GROUP BY with the mirror loaded still
+  reads the mirror, which is cheaper than the substrate on `:memory:` (37.9M against ~44M at 20k).
+
 ## 2026-11-12 - WIN: a standalone refresh with an unchanged shared header returns before its path probes (bd-ih8ak, lever 3)
 
 - Target: the refresh a connection runs after its own autocommit flush
