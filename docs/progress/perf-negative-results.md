@@ -87,6 +87,29 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-12 - REJECTED: a DML statement names its internal savepoint without format! and checks virtual tables without allocating (bd-w4pr1.13.29)
+
+- Target: per-statement overhead of single-row INSERTs inside one transaction (the scorecard txn
+  row; also autocommit). Touched (not landed): `crates/fsqlite-core/src/connection.rs`
+  (`next_internal_savepoint_name`, `has_live_vtab_instance`, `is_virtual_table_sql`).
+- Evidence before (callgrind, main 76c797eeb, ring refused, N=2000 minus N=1000 INSERTs in one
+  transaction): 42.9k user instructions per INSERT against stock's 13.7k (perf stat agrees,
+  43.1k). Inclusive: `next_internal_savepoint_name` 1,851 (`format!` with three arguments),
+  `table_name_is_virtual` 1,018 (`is_virtual_table_sql` 474 uppercases the whole stored DDL),
+  `has_live_vtab_instance` 438 (uppercased key with no live virtual table).
+- Candidate (affd8bf24 on perf7 branch `stmtsp`, never on main): the same name built with
+  `push_str` and `itoa`; an early `false` when no virtual table is live; the DDL prefix compared in
+  place. Gate: clippy -D warnings clean; fsqlite-core lib 201 pass (savepoint, vtab, virtual,
+  fts and rtree filters plus the two new tests).
+- Result (callgrind, same harness, binaries 814e895d... base, 1a28cac1... candidate): 42,893 ->
+  41,890 per INSERT (-1,003, -2.3%) against a prediction of -2.0k to -2.7k and a kill line of
+  -1.2k: killed. The self-cost diff is the fmt machinery (about -480) and malloc/free (about
+  -180); the larger inclusive drops of the touched functions were shared with work the new code
+  still does (the String allocation, the savepoint scan).
+- Retry condition: not as a standalone patch. Fold into a per-statement change that removes the
+  internal savepoint for statements that cannot fail part-way (stock opens no statement journal
+  for a single-row INSERT without constraints), worth about 5k of the 42.9k.
+
 ## 2026-11-12 - WIN: length() counts the characters of valid TEXT on its stored bytes (bd-w4pr1.13.28)
 
 - Target: `length()` on TEXT. `LengthFunc::invoke` took `s.as_str()`, which for an inline
