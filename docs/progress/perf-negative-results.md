@@ -87,6 +87,30 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-12 - SMALL WIN: a certificate record lookup reads footer and record in one tail read (bd-w4pr1.8)
+
+- Target: the scorecard's multiproc row (8 processes x 500 autocommit INSERTs, one WAL database).
+  Touched: `crates/fsqlite-core/src/wal_adapter.rs` (`read_certificate_tail`,
+  `certificate_record_from_tail`, `CERTIFICATE_TAIL_READ_BYTES`; used by
+  `read_certificate_record_ending_at` and `read_latest_authorized_certificate`).
+- Evidence before: strace of one contended writer showed each `-wal-cert` record lookup as a
+  4-byte length-footer pread followed by a 156/157-byte record pread, about three lookups per
+  INSERT (7.9-9.3 sidecar reads per INSERT in all).
+- Change: one pread of the last min(end, 512) bytes holds the footer and, for any record up to
+  512 bytes, the whole record; a longer record is still read on its own. Nothing is cached across
+  reads (peers truncate and re-append the sidecar in place).
+- Result (stock sqlite3 3.46.1 live; binaries 1fda495c... base 00f603c25, 9fdbff47... candidate
+  00f603c25 plus this diff): sidecar reads per INSERT 7.92/8.66/9.27 -> 5.05/5.50/5.51 over three
+  interleaved traced runs (-3.26 mean; kill was fewer than 2.5 removed: not met). Row, 7 reps,
+  medians, two runs with the arm order swapped: wall 1,009.5 -> 987.6 ms and 954.3 -> 939.2 ms
+  (-2.2%, -1.6%; stock 145.3 ms, so 6.95x/6.57x -> 6.80x/6.46x); child CPU +6.1% and -5.3%, i.e.
+  noise. 4,000 rows and 0 errors in every arm.
+- Gate: clippy -D warnings clean; a filtered fsqlite-core lib run, 136 pass; integration targets
+  bd_ih8ak_certificate_append_tail, gh416_placeholder_inode_and_cert_suffix,
+  self_connection_read_your_own_write_peer_races and strict_multi_process green.
+- Retry condition: none. The row's syscall mass is elsewhere: 24-byte WAL frame-header preads
+  (10-18 per INSERT, bd-w4pr1.8 lever 1), `-shm` fcntl (9.6) and path statx (~15).
+
 ## 2026-11-12 - WIN: a WHERE comparison's literal operand is loaded once in an Init prologue (bd-w4pr1.13.31)
 
 - Target: every scan whose WHERE compares against a literal (the scorecard's scan_filter_agg,

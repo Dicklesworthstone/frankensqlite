@@ -3585,6 +3585,10 @@ const MAX_ORPHAN_CERTIFICATE_LOOKBACK: usize = 64;
 /// read: a peer's append-boundary repair or generation compaction truncates
 /// it in place while this read-only descriptor is mid-walk.
 const CERTIFICATE_READ_RESIZE_RETRIES: u32 = 3;
+/// Bytes read from the end of a certificate record in one read: its length
+/// footer and, for records up to this size (one lane's is 156 or 157 bytes),
+/// the whole record (bd-w4pr1.8).
+const CERTIFICATE_TAIL_READ_BYTES: u64 = 512;
 
 fn durable_certificate_declared_len(bytes: &[u8]) -> Option<usize> {
     let length_bytes = bytes.get(10..DURABLE_CERTIFICATE_RECORD_HEADER_SIZE)?;
@@ -4916,6 +4920,40 @@ where
         Ok(bytes)
     }
 
+    /// The bytes before `end` in one read: the last
+    /// `min(end, CERTIFICATE_TAIL_READ_BYTES)` of them, which hold the length
+    /// footer of the record ending there and, for any record up to that size,
+    /// the whole record (bd-w4pr1.8). A record lookup was a 4-byte footer read
+    /// and then a record read; under contention a writer made three lookups
+    /// per statement.
+    async fn read_certificate_tail(
+        file: &V::File,
+        cx: &Cx,
+        end: u64,
+        location: &str,
+    ) -> Result<Vec<u8>> {
+        let tail_len = end.min(CERTIFICATE_TAIL_READ_BYTES);
+        let tail_len_usize =
+            usize::try_from(tail_len).expect("certificate tail read length fits usize");
+        Self::read_certificate_sidecar_exact(file, cx, end - tail_len, tail_len_usize, location).await
+    }
+
+    /// The record of `record_len` bytes ending where `tail` ends: sliced from
+    /// `tail` when it holds the whole record, else read on its own.
+    async fn certificate_record_from_tail(
+        file: &V::File,
+        cx: &Cx,
+        tail: &[u8],
+        record_start: u64,
+        record_len: usize,
+        location: &str,
+    ) -> Result<Vec<u8>> {
+        if record_len <= tail.len() {
+            return Ok(tail[tail.len() - record_len..].to_vec());
+        }
+        Self::read_certificate_sidecar_exact(file, cx, record_start, record_len, location).await
+    }
+
     async fn read_certificate_record_ending_at(
         file: &V::File,
         cx: &Cx,
@@ -4923,21 +4961,15 @@ where
     ) -> Result<Option<(u64, ParallelWalDurableCertificateRecord)>> {
         let footer_size =
             u64::try_from(ParallelWalDurableCertificateRecord::LENGTH_FOOTER_SIZE).unwrap_or(4);
-        let footer_offset = record_end.checked_sub(footer_size).ok_or_else(|| {
-            FrankenError::WalCorrupt {
+        if record_end < footer_size {
+            return Err(FrankenError::WalCorrupt {
                 detail: format!(
                     "parallel WAL certificate record ending at {record_end} has no length footer"
                 ),
-            }
-        })?;
-        let footer = Self::read_certificate_sidecar_exact(
-            file,
-            cx,
-            footer_offset,
-            ParallelWalDurableCertificateRecord::LENGTH_FOOTER_SIZE,
-            "length footer",
-        )
-        .await?;
+            });
+        }
+        let tail = Self::read_certificate_tail(file, cx, record_end, "length footer").await?;
+        let footer = &tail[tail.len() - ParallelWalDurableCertificateRecord::LENGTH_FOOTER_SIZE..];
         let record_len = usize::try_from(u32::from_le_bytes([
             footer[0], footer[1], footer[2], footer[3],
         ]))
@@ -4976,7 +5008,7 @@ where
             });
         };
         let bytes =
-            Self::read_certificate_sidecar_exact(file, cx, record_start, record_len, "record")
+            Self::certificate_record_from_tail(file, cx, &tail, record_start, record_len, "record")
                 .await?;
         if durable_certificate_is_complete_legacy_envelope(&bytes, record_len) {
             // A legacy record — and, because the sidecar is append-only and
@@ -5845,15 +5877,10 @@ where
             u64::try_from(ParallelWalDurableCertificateRecord::LENGTH_FOOTER_SIZE).unwrap_or(4);
         let mut newest = None;
         if file_size >= footer_size {
-            let footer_offset = file_size - footer_size;
-            let footer = Self::read_certificate_sidecar_exact(
-                file,
-                cx,
-                footer_offset,
-                ParallelWalDurableCertificateRecord::LENGTH_FOOTER_SIZE,
-                "newest length footer",
-            )
-            .await?;
+            let tail =
+                Self::read_certificate_tail(file, cx, file_size, "newest length footer").await?;
+            let footer =
+                &tail[tail.len() - ParallelWalDurableCertificateRecord::LENGTH_FOOTER_SIZE..];
             let record_len = usize::try_from(u32::from_le_bytes([
                 footer[0], footer[1], footer[2], footer[3],
             ]))
@@ -5870,9 +5897,10 @@ where
                 && record_len_u64 <= file_size
             {
                 let record_start = file_size - record_len_u64;
-                let bytes = Self::read_certificate_sidecar_exact(
+                let bytes = Self::certificate_record_from_tail(
                     file,
                     cx,
+                    &tail,
                     record_start,
                     record_len,
                     "newest record",
