@@ -87,6 +87,50 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-12 - WIN: a standalone refresh with an unchanged shared header returns before its path probes (bd-ih8ak, lever 3)
+
+- Target: the refresh a connection runs after its own autocommit flush
+  (`refresh_published_snapshot` from `flush_retained_autocommit_txn`), on the scorecard's autocommit
+  INSERT shape. Touched: `crates/fsqlite-pager/src/pager.rs` (`refresh_published_snapshot`),
+  `crates/fsqlite-core/src/connection.rs` (test).
+- Evidence before (frame-pointer CLI of main 3e5946f67, strace -f -k -y, N=40 minus N=20, fresh
+  database): an INSERT made 13 statx: 3 at begin, 7 at commit, and 3 in this refresh (database
+  lstat, a `-shm` map and a `-wal` stat for its signature), which then returned early because the
+  signature was the one its own flush carried forward.
+- Change: when the carried signature is current and the vouched shared header still equals it, the
+  refresh returns before the database probe and the `-wal` stat; nothing path-based happens there.
+  Another publisher moves the header and takes the full path, which reuses the header just read and
+  states only the `-wal`; a swap after the connection's last commit is caught at its next begin
+  (owner decision on bd-ih8ak).
+- Result, stock sqlite3 3.46.1 live in the same runs (binaries base 947613f27 sha256 83e833ad...,
+  code-identical to the parent 3e5946f67; lever 54e1363b9 sha256 cb835143...;
+  `scratchpad/commit_probe2.py --no-ring --user-env --n 4000`, exact counts from `cg_commit.sh`):
+
+  | per autocommit INSERT | stock | base | lever |
+  |---|---|---|---|
+  | statx (strace -c, fresh database) | 0 | 13.06 | 11.08 |
+  | database lstat / `-wal` stat (path-attributed) | - | 3 / 3 | 2 / 2 |
+  | user instructions, exact (callgrind) | 22.2k (perf stat) | 212,410 | 210,456 |
+  | CPU per commit, median of 4 runs | 11.7-12.8 us | 131.5 us | 125.7 us |
+  | CPU of the N=4000 run, median of 4 | 54-60 ms | 540 ms | 519.5 ms |
+
+  Prediction: statx 13 -> 11: met; user instructions -0.3k to -1k: beaten (-1.95k, the fast path
+  also skips the rest of the refresh's setup); CPU within noise: per commit -5.8 us median, the
+  N=4000 totals -3.8%. Kill (statx not reduced by 2, a keeper or the negative test failing): not met.
+- Tests and gate, on 54e1363b9: clippy -D warnings with all targets on fsqlite-pager and fsqlite-core
+  clean; the new `test_standalone_refresh_skips_only_while_the_shared_header_is_unchanged` passes
+  (two refreshes with nothing published in between return one snapshot generation; after a peer's
+  commit the refresh adopts it, which a version skipping the header read would miss);
+  `bd_ih8ak_path_identity_once_per_transaction`, `gh525_snapshot_read_cache`,
+  `self_connection_read_your_own_write_peer_races`, `gh457_autocommit_select_no_busy_snapshot`,
+  `busy_snapshot_self_conflict_gh338`, `bd_ih8ak_certificate_append_tail`,
+  `bulk_import_upsert_text_pk_phantom_pk`, `bd_ih8ak_flush_floor_after_peer_growth`,
+  `gh534_sigkill_unpublished_wal_tail`, `gh385_autocheckpoint_wal_restart`,
+  `gh384_wal_checkpoint_truncate_change_counter` and `gh416_placeholder_inode_and_cert_suffix` pass;
+  fsqlite-core lib `filebacked` 4 pass. Rebased onto 46be03bdd and clippy re-run there before the push.
+- Retry condition for the probes that remain: the begin's and the commit's are the owner decision's
+  floor; the remaining `-shm` maps (one at begin, three at commit, one here) are lever 4 on bd-ih8ak.
+
 ## 2026-11-12 - WIN: a WHERE comparison on expressions jumps on the inverse operator instead of testing a 0/1/NULL value (bd-w4pr1.13.20)
 
 - Target: scans whose WHERE compares expressions rather than a column of the scanned table
