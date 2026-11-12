@@ -368,6 +368,16 @@ pub trait WalBackend: Send + Sync {
     /// backends that do not check the path ignore it.
     fn note_begin_wal_path_identity(&mut self, _identity: Option<fsqlite_vfs::FileIdentity>) {}
 
+    /// The commit the pager just published through this backend covered WAL
+    /// frames `wal_frame_start..=wal_frame_end`, its certificate reached the
+    /// sidecar, and the bytes appended for those frames are exactly the bytes
+    /// the certificate's payload digest was computed over (bd-w4pr1.13.20
+    /// lever D). A backend that appended that certificate's record may treat
+    /// it as authorizing its interval without reading the frames back; the
+    /// pager never calls this for a failed, partial or unpublished commit.
+    /// Backends without a certificate sidecar ignore it.
+    fn note_own_certificate_published(&mut self, _wal_frame_start: u64, _wal_frame_end: u64) {}
+
     /// Retire exactly this pin before the caller releases its physical claim.
     fn end_native_read(&mut self, _token: &WalNativeReadToken) -> Result<()> {
         Err(FrankenError::Unsupported)

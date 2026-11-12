@@ -25833,6 +25833,16 @@ where
                                     wal.publish_authorized_deferred_commit(&durability_cx)
                                         .await?;
                                 }
+                                // Published: the certificate this flush appended
+                                // covers exactly the bytes its digest was
+                                // computed over, so the backend need not read
+                                // them back to authorize it (bd-w4pr1.13.20).
+                                if certificate_is_in_sidecar && appended_frames_are_digested {
+                                    wal.note_own_certificate_published(
+                                        frames_written_start,
+                                        frames_written_end,
+                                    );
+                                }
                                 // The header this flush just published, taken
                                 // while the gate still excludes every other
                                 // publisher.

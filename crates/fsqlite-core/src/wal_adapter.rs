@@ -3899,6 +3899,14 @@ where
     /// each read statement (which made a read O(frames in the last commit)).
     authorized_certificate_record:
         std::sync::Mutex<Option<ParallelWalDurableCertificateRecord>>,
+    /// The record this backend last appended for a commit it has not yet
+    /// published (bd-w4pr1.13.20 lever D). It is never authorized by being
+    /// written: the pager appends the certificate before the frames it covers.
+    /// [`WalBackend::note_own_certificate_published`] promotes it to
+    /// [`Self::authorized_certificate_record`] once that commit is published
+    /// with exactly the frames its digest was computed over; any other append
+    /// replaces it, and a failed one clears it.
+    own_certificate_record: std::sync::Mutex<Option<ParallelWalDurableCertificateRecord>>,
     /// What this backend already proved inside the pager's current held
     /// append gate (see [`WalBackend::note_append_gate_held`]); `None` outside
     /// one. A commit validated the WAL path and refreshed its append baseline
@@ -3975,6 +3983,7 @@ where
             cached_certificate_append: std::sync::Mutex::new(None),
             prepared_certificate_append: std::sync::Mutex::new(None),
             authorized_certificate_record: std::sync::Mutex::new(None),
+            own_certificate_record: std::sync::Mutex::new(None),
             append_gate_proof: None,
             db_file_identity: None,
             #[cfg(all(not(target_arch = "wasm32"), feature = "native"))]
@@ -5255,6 +5264,11 @@ where
         completion: Option<&VfsWriteCompletion>,
     ) -> Result<()> {
         let mut preflight = WalWriteCompletionPreflight::new(completion);
+        // A failed append below leaves no record of this backend to promote.
+        *self
+            .own_certificate_record
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         let expected_frame_start = u64::try_from(self.inner.frame_count())
             .unwrap_or(u64::MAX)
             .saturating_add(1);
@@ -5343,6 +5357,10 @@ where
             record_bytes,
             end_offset,
         });
+        *self
+            .own_certificate_record
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(record);
         Ok(())
     }
 
@@ -6270,6 +6288,39 @@ where
 
     fn note_begin_wal_path_identity(&mut self, identity: Option<fsqlite_vfs::FileIdentity>) {
         self.begin_wal_path_identity = identity.filter(|_| self.wal_path_is_db_path_wal);
+    }
+
+    fn note_own_certificate_published(&mut self, wal_frame_start: u64, wal_frame_end: u64) {
+        let Some(record) = self
+            .own_certificate_record
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        else {
+            return;
+        };
+        // Promote only the record this backend appended for exactly the
+        // published interval, in the WAL generation it names, and only when
+        // this backend's own published horizon now ends at that commit
+        // marker: a record whose frames were not written, or not published,
+        // or were published in another generation, stays unauthorized and is
+        // digested by the next read as before.
+        let published = &self.inner.published_snapshot;
+        let published_end = published
+            .last_commit_frame
+            .and_then(|frame_index| u64::try_from(frame_index).ok())
+            .map(|frame_index| frame_index.saturating_add(1));
+        if record.wal_frame_start == wal_frame_start
+            && record.wal_frame_end == wal_frame_end
+            && published_end == Some(wal_frame_end)
+            && published.generation == record.wal_generation
+            && self.inner.inner().generation_identity() == record.wal_generation
+        {
+            *self
+                .authorized_certificate_record
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(record);
+        }
     }
 
     fn end_native_read(&mut self, token: &WalNativeReadToken) -> Result<()> {
@@ -8496,6 +8547,80 @@ mod tests {
             read_certificate_sidecar(&vfs, &cx),
             corrupted,
             "nothing is written over the corrupt suffix"
+        );
+    }
+
+    /// bd-w4pr1.13.20 lever D: the pager appends a commit's certificate
+    /// before the frames it covers, so the record this backend wrote is
+    /// authorized without a read-back only once its own commit is published.
+    /// A version that authorized the record when the pager vouched for it
+    /// (or when it was written) would authorize frames that were never
+    /// written; one that ignored the published interval would authorize a
+    /// commit it did not publish.
+    #[test]
+    fn own_certificate_is_authorized_only_once_its_frames_are_published() {
+        let cx = test_cx();
+        let vfs = MemoryVfs::new();
+        let page = sample_page(0x5D);
+        let mut backend = make_path_refreshing_backend(&vfs, &cx);
+        let mut certificate = sample_certificate(1, 1, vec![1]);
+        certificate.wal_frame_payload_digest = test_frame_payload_digest(1, &page, 1);
+        certificate.certificate_crc32c = certificate.computed_crc32c();
+        let authorized = |backend: &PathRefreshingWalBackend<MemoryVfs>| {
+            backend
+                .authorized_certificate_record
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        };
+
+        // The record is in the sidecar, its frame is not in the WAL.
+        backend
+            .persist_parallel_wal_commit_certificate(&cx, &certificate, 1, 1)
+            .expect("persist certificate before its frame");
+        backend.note_own_certificate_published(1, 1);
+        assert!(
+            authorized(&backend).is_none(),
+            "a record whose frame was never written must not be authorized"
+        );
+
+        // Written and published, but the pager reports another interval.
+        backend
+            .persist_parallel_wal_commit_certificate(&cx, &certificate, 1, 1)
+            .expect("persist certificate again");
+        backend
+            .append_frame(&cx, 1, &page, 1)
+            .expect("append the certified commit frame");
+        backend.sync(&cx).expect("publish the commit");
+        backend.note_own_certificate_published(1, 2);
+        assert!(
+            authorized(&backend).is_none(),
+            "a record is promoted only for the interval that was published"
+        );
+
+        // Its own published commit: authorized without a read-back, and the
+        // read answers with that certificate.
+        let mut next = sample_certificate(2, 2, vec![1]);
+        let next_page = sample_page(0x5E);
+        next.wal_frame_payload_digest = test_frame_payload_digest(1, &next_page, 1);
+        next.certificate_crc32c = next.computed_crc32c();
+        backend
+            .persist_parallel_wal_commit_certificate(&cx, &next, 2, 2)
+            .expect("persist the next commit's certificate");
+        backend
+            .append_frame(&cx, 1, &next_page, 1)
+            .expect("append the next commit frame");
+        backend.sync(&cx).expect("publish the next commit");
+        backend.note_own_certificate_published(2, 2);
+        let promoted = authorized(&backend).expect("its own published commit is authorized");
+        assert_eq!((promoted.wal_frame_start, promoted.wal_frame_end), (2, 2));
+        assert_eq!(
+            backend
+                .latest_authorized_parallel_wal_commit_certificate(&cx)
+                .wait()
+                .expect("read the authorized certificate"),
+            Some(next),
+            "the promoted record is the one the sidecar's newest record authorizes"
         );
     }
 
