@@ -96,7 +96,7 @@ pub mod window;
 pub mod window_builtins;
 
 pub use agg_builtins::register_aggregate_builtins;
-pub use aggregate::{AggregateAdapter, AggregateFunction};
+pub use aggregate::{AggregateAdapter, AggregateFunction, TypedAggregateStep};
 pub use authorizer::{AuthAction, AuthResult, Authorizer, AuthorizerAction, AuthorizerDecision};
 pub use builtins::{
     ChangeTrackingState, case_sensitive_like_active, get_last_changes, get_last_insert_rowid,

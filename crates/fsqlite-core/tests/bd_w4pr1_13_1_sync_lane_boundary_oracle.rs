@@ -290,6 +290,7 @@ async fn run_case(file_backed: bool, failures: &mut Vec<String>) {
     compare(&format!("[{mode}] loaded"), &frank, &stock, &OTHER_QUERIES, failures).await;
     compare(&format!("[{mode}] loaded"), &frank, &stock, &INLINE_EDGE_QUERIES, failures).await;
     compare(&format!("[{mode}] loaded"), &frank, &stock, &TOP_N_QUERIES, failures).await;
+    compare(&format!("[{mode}] loaded"), &frank, &stock, &TYPED_AGG_QUERIES, failures).await;
     for (step, mutation) in mutations().iter().enumerate() {
         frank.execute_batch(mutation).await.expect("frank mutation");
         stock.execute_batch(mutation).expect("stock mutation");
@@ -329,6 +330,24 @@ const TOP_N_QUERIES: [&str; 13] = [
     "SELECT id FROM edge ORDER BY coalesce(z, s, n) DESC LIMIT 8",
     "SELECT id, s, n FROM edge ORDER BY length(s) DESC, n, id DESC LIMIT 10",
     "SELECT id, s FROM edge ORDER BY s, r DESC LIMIT 12",
+];
+
+/// `sum`, `total`, `count` and `avg` over `edge`: a plain `AggStep` of the
+/// built-in `sum`, `count(*)` or `count(X)` steps its accumulator's typed state
+/// itself (bd-w4pr1.13). Integers of every width with NULLs, reals, numeric and
+/// non-numeric text, blobs, an all-NULL input (`sum` NULL, `total` 0.0) and a
+/// column that mixes classes from row to row, grouped and not.
+const TYPED_AGG_QUERIES: [&str; 8] = [
+    "SELECT sum(n), total(n), count(n), count(*), avg(n) FROM edge",
+    "SELECT sum(r), total(r), sum(n + r), count(r) FROM edge",
+    "SELECT sum(s), total(s), sum(z), count(z), count(s) FROM edge",
+    "SELECT sum(CASE WHEN id % 3 = 0 THEN NULL END), total(CASE WHEN id < 0 THEN 1 END), \
+     count(CASE WHEN id < 0 THEN 1 END) FROM edge",
+    "SELECT id % 7, count(*), count(n), sum(n), sum(r), total(n) FROM edge GROUP BY 1 ORDER BY 1",
+    "SELECT sum(id), count(*), sum(length(s)) FROM edge WHERE n IS NULL",
+    "SELECT sum('12' || id), sum(' 7 '), sum('1e3'), sum(id || 'x') FROM edge",
+    "SELECT sum(CASE WHEN id % 2 THEN n ELSE r END), sum(CASE WHEN id % 5 = 0 THEN z ELSE id END) \
+     FROM edge",
 ];
 
 fn inline_edge_setup() -> String {
@@ -439,6 +458,7 @@ async fn run_stock_written_case(failures: &mut Vec<String>) {
     compare(label, &frank, &stock, &OTHER_QUERIES, failures).await;
     compare(label, &frank, &stock, &INLINE_EDGE_QUERIES, failures).await;
     compare(label, &frank, &stock, &TOP_N_QUERIES, failures).await;
+    compare(label, &frank, &stock, &TYPED_AGG_QUERIES, failures).await;
     compare(label, &frank, &stock, &LEGACY_QUERIES, failures).await;
     for (step, mutation) in mutations().iter().enumerate() {
         frank.execute_batch(mutation).await.expect("frank mutation");

@@ -87,6 +87,45 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-12 - WIN: a plain AggStep of the built-in sum or count steps its own state (bd-w4pr1.13)
+
+- Target: the call from a plain `AggStep` into the built-in `sum`, `count(*)` and `count(X)`: a
+  dynamic call into `AggregateAdapter`, a downcast of the boxed state, then the function's step.
+  Touched: `crates/fsqlite-func/src/aggregate.rs` (`TypedAggregateStep`,
+  `AggregateFunction::typed_step`), `crates/fsqlite-func/src/agg_builtins.rs`,
+  `crates/fsqlite-vdbe/src/engine.rs` (`ResolvedAggregate`, `plain_agg_step`).
+- Ledger preflight: as the entry below. The function itself says whether it is a built-in with a
+  typed step (a defaulted trait method only the three built-ins override); nothing matches a name,
+  so an aggregate registered under `sum`'s name is called on every row.
+- Change: when a plain site's function reports a typed step, the engine runs it on the
+  accumulator's state; it changes nothing and the function is called when the state is not the
+  built-in's or an argument is missing.
+- Result, same method and run as the entry below; before f84ea0c6..., after aa20479f...:
+  scan_filter_agg 1,329.0 -> 1,318.1 (-11 per step; 2.66x -> 2.64x), `count(*), sum(length(b)),
+  sum(c)` 2,698.0 -> 2,657.0 (-14 per step; 2.68x -> 2.64x), group_by_1000_groups 3,330.9 ->
+  3,327.9 (-3 per `count(*)` step), the 10/1,000/100,000-group sums -22, -22 and -20, `total(a),
+  total(c), count(b)` 2,205.2 -> 2,199.2; count_star, the DISTINCT row unchanged.
+- Prediction for this entry and the one below together: scan_filter_agg -58 with a kill line at
+  -25, `count(*), sum(length(b)), sum(c)` -215. Measured together -37.4 and -146: past the kill
+  line, short of the prediction. The trait-object call was a smaller share than the profile's
+  attribution to `AggregateAdapter` suggested, and the typed step keeps the state's downcast (12
+  instructions per step).
+- Grouped rows written `GROUP BY 1` over an expression run outside the VDBE ("result column not in
+  GROUP BY clause" in codegen) and do not move with either change; the same queries written with
+  the expression compile to VDBE and cost 1.3x the fallback (10 groups: 5,315.9 against 4,029.4).
+- Keepers: each typed step against calling the function over every contiguous run of ten values
+  (finalized results equal, all-integer overflow an error, a REAL after it REAL, all-NULL NULL);
+  only the three built-ins report a typed step, and a mismatched state or missing argument changes
+  nothing; an engine test with an application `sum()` registered over the built-in (called on
+  every row, `count(*)` beside it typed); eight `sum`/`total`/`count`/`avg` queries over every value
+  class in the lane-boundary oracle.
+- What is left in a step, callgrind after, same row: 159 instructions per step inclusive, the plain
+  lane's own checks and two cancellation observes 100, the typed step 58 (the REAL sum's
+  compensated add the most, the downcast 12); stock's whole step is about 40.
+- Retry condition for the lane's own 100: an accumulator held unboxed in its register slot
+  (no downcast, no `Arc::ptr_eq` per step), only with a profile showing the lane above 10% of
+  scan_filter_agg after the typed step.
+
 ## 2026-11-12 - WIN: sum, total and avg take an INTEGER or REAL argument without coercing it (bd-w4pr1.13)
 
 - Target: every `sum`, `total` and `avg` over a numeric column. Exact profile (callgrind) of

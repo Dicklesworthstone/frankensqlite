@@ -22,13 +22,51 @@
     clippy::suboptimal_flops
 )]
 
+use std::any::Any;
 use std::cmp::Ordering;
 
 use fsqlite_error::{FrankenError, Result};
 use fsqlite_types::SqliteValue;
 
 use crate::builtins::{statement_text_encoding, text_from_bytes};
-use crate::{AggregateFunction, FunctionRegistry};
+use crate::{AggregateFunction, FunctionRegistry, TypedAggregateStep};
+
+impl TypedAggregateStep {
+    /// Run one step of this built-in on its type-erased state, doing what the
+    /// built-in's [`AggregateFunction::step`] does with `args`.
+    ///
+    /// Returns `false`, having changed nothing, when `state` is not this
+    /// built-in's state or a one-argument step is given no argument; the
+    /// caller then calls the function.
+    #[inline]
+    pub fn step(self, state: &mut (dyn Any + Send), args: &[SqliteValue]) -> bool {
+        match self {
+            Self::CountStar => match state.downcast_mut::<i64>() {
+                Some(count) => {
+                    *count += 1;
+                    true
+                }
+                None => false,
+            },
+            Self::Count => match (state.downcast_mut::<i64>(), args.first()) {
+                (Some(count), Some(value)) => {
+                    if !value.is_null() {
+                        *count += 1;
+                    }
+                    true
+                }
+                _ => false,
+            },
+            Self::Sum => match (state.downcast_mut::<SumState>(), args.first()) {
+                (Some(sum), Some(value)) => {
+                    sum.add_value(value);
+                    true
+                }
+                _ => false,
+            },
+        }
+    }
+}
 
 // ─── Kahan compensated summation ──────────────────────────────────────────
 
@@ -149,6 +187,10 @@ impl AggregateFunction for CountStarFunc {
         Ok(())
     }
 
+    fn typed_step(&self) -> Option<TypedAggregateStep> {
+        Some(TypedAggregateStep::CountStar)
+    }
+
     fn finalize(&self, state: Self::State) -> Result<SqliteValue> {
         Ok(SqliteValue::Integer(state))
     }
@@ -177,6 +219,10 @@ impl AggregateFunction for CountFunc {
             *state += 1;
         }
         Ok(())
+    }
+
+    fn typed_step(&self) -> Option<TypedAggregateStep> {
+        Some(TypedAggregateStep::Count)
     }
 
     fn finalize(&self, state: Self::State) -> Result<SqliteValue> {
@@ -447,6 +493,10 @@ impl AggregateFunction for SumFunc {
     fn step(&self, state: &mut Self::State, args: &[SqliteValue]) -> Result<()> {
         state.add_value(&args[0]);
         Ok(())
+    }
+
+    fn typed_step(&self) -> Option<TypedAggregateStep> {
+        Some(TypedAggregateStep::Sum)
     }
 
     fn finalize(&self, state: Self::State) -> Result<SqliteValue> {
@@ -1015,6 +1065,139 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Run `values` through `function` once by its typed step and once by
+    /// calling it through the adapter; both finalized results.
+    fn typed_and_called<F>(
+        function: F,
+        values: &[SqliteValue],
+        arg_count: usize,
+    ) -> (
+        std::result::Result<SqliteValue, String>,
+        std::result::Result<SqliteValue, String>,
+    )
+    where
+        F: AggregateFunction,
+        F::State: 'static,
+    {
+        let adapter = crate::AggregateAdapter::new(function);
+        let typed = adapter.typed_step().expect("a built-in with a typed step");
+        let mut typed_state = adapter.initial_state();
+        let mut called_state = adapter.initial_state();
+        for value in values {
+            let args = &std::slice::from_ref(value)[..arg_count];
+            assert!(typed.step(&mut *typed_state, args));
+            adapter.step(&mut called_state, args).unwrap();
+        }
+        (
+            adapter.finalize(typed_state).map_err(|e| e.to_string()),
+            adapter.finalize(called_state).map_err(|e| e.to_string()),
+        )
+    }
+
+    #[test]
+    fn test_typed_steps_finalize_to_what_calling_the_function_gives() {
+        let values = [
+            int(3),
+            int(i64::MAX),
+            int(1),
+            float(0.25),
+            float(f64::NAN),
+            null(),
+            text(" 7 "),
+            text("abc"),
+            SqliteValue::Blob(vec![b'9'].into()),
+            int(i64::MIN),
+        ];
+        for start in 0..values.len() {
+            for end in start..=values.len() {
+                let run = &values[start..end];
+                let (typed, called) = typed_and_called(SumFunc, run, 1);
+                assert_eq!(
+                    typed.as_ref().map(|value| format!("{value:?}")),
+                    called.as_ref().map(|value| format!("{value:?}")),
+                    "sum over {run:?}"
+                );
+                let (typed, called) = typed_and_called(CountFunc, run, 1);
+                assert_eq!(typed, called, "count over {run:?}");
+                let (typed, called) = typed_and_called(CountStarFunc, run, 0);
+                assert_eq!(typed, called, "count(*) over {run:?}");
+            }
+        }
+        // The cases the planner cares about, spelled out: an all-integer
+        // overflow is an error, a REAL after it makes the sum REAL, and the
+        // sum of nothing but NULL is NULL.
+        assert!(
+            typed_and_called(SumFunc, &[int(i64::MAX), int(1)], 1)
+                .0
+                .is_err()
+        );
+        assert!(matches!(
+            typed_and_called(SumFunc, &[int(i64::MAX), int(1), float(0.5)], 1).0,
+            Ok(SqliteValue::Float(_))
+        ));
+        assert_eq!(
+            typed_and_called(SumFunc, &[null(), null()], 1).0,
+            Ok(SqliteValue::Null)
+        );
+    }
+
+    #[test]
+    fn test_only_the_built_in_sum_and_counts_report_a_typed_step() {
+        struct ApplicationSum;
+        impl AggregateFunction for ApplicationSum {
+            type State = i64;
+            fn initial_state(&self) -> i64 {
+                0
+            }
+            fn step(&self, state: &mut i64, _args: &[SqliteValue]) -> Result<()> {
+                *state += 100;
+                Ok(())
+            }
+            fn finalize(&self, state: i64) -> Result<SqliteValue> {
+                Ok(SqliteValue::Integer(state))
+            }
+            fn num_args(&self) -> i32 {
+                1
+            }
+            fn name(&self) -> &str {
+                "sum"
+            }
+        }
+
+        assert_eq!(SumFunc.typed_step(), Some(TypedAggregateStep::Sum));
+        assert_eq!(CountFunc.typed_step(), Some(TypedAggregateStep::Count));
+        assert_eq!(
+            CountStarFunc.typed_step(),
+            Some(TypedAggregateStep::CountStar)
+        );
+        assert_eq!(
+            crate::AggregateAdapter::new(SumFunc).typed_step(),
+            Some(TypedAggregateStep::Sum)
+        );
+        assert_eq!(TotalFunc.typed_step(), None);
+        assert_eq!(AvgFunc.typed_step(), None);
+        assert_eq!(ApplicationSum.typed_step(), None);
+        assert_eq!(
+            crate::AggregateAdapter::new(ApplicationSum).typed_step(),
+            None
+        );
+
+        // A typed step handed another function's state, or no argument,
+        // changes nothing and says so.
+        let mut count: Box<dyn Any + Send> = Box::new(5_i64);
+        assert!(!TypedAggregateStep::Sum.step(&mut *count, &[int(1)]));
+        assert_eq!(count.downcast_ref::<i64>(), Some(&5));
+        let mut sum: Box<dyn Any + Send> = Box::new(SumFunc.initial_state());
+        assert!(!TypedAggregateStep::CountStar.step(&mut *sum, &[]));
+        assert!(!TypedAggregateStep::Sum.step(&mut *sum, &[]));
+        assert!(!TypedAggregateStep::Count.step(&mut *count, &[]));
+        assert_eq!(count.downcast_ref::<i64>(), Some(&5));
+        assert!(TypedAggregateStep::Count.step(&mut *count, &[null()]));
+        assert_eq!(count.downcast_ref::<i64>(), Some(&5));
+        assert!(TypedAggregateStep::Count.step(&mut *count, &[int(0)]));
+        assert_eq!(count.downcast_ref::<i64>(), Some(&6));
     }
 
     // ── avg ───────────────────────────────────────────────────────────

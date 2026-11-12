@@ -170,7 +170,7 @@ use fsqlite_func::collation::CollationRegistry;
 use fsqlite_func::vtab::ColumnContext;
 use fsqlite_func::{
     ApplicationFunctionKind, ErasedAggregateFunction, ErasedWindowFunction, FunctionRegistry,
-    ResolvedScalarFunction, set_statement_text_encoding,
+    ResolvedScalarFunction, TypedAggregateStep, set_statement_text_encoding,
 };
 use fsqlite_mvcc::ConcurrentPageState;
 use fsqlite_mvcc::{
@@ -6129,6 +6129,8 @@ thread_local! {
     static FSQLITE_VDBE_MAKE_RECORD_SIDEBAND_MATERIALIZATIONS_TOTAL: Cell<u64> = const { Cell::new(0) };
     /// Test-only per-thread count of `AggStep`s served by `plain_agg_step`.
     static FSQLITE_VDBE_PLAIN_AGG_STEPS_TOTAL: Cell<u64> = const { Cell::new(0) };
+    /// Test-only per-thread count of those that ran a built-in's typed step.
+    static FSQLITE_VDBE_TYPED_AGG_STEPS_TOTAL: Cell<u64> = const { Cell::new(0) };
     /// Test-only per-thread count of top-N preflights decided from the packed
     /// key by `top_n_preflight_packed_verdict`.
     static FSQLITE_VDBE_PACKED_TOP_N_VERDICTS_TOTAL: Cell<u64> = const { Cell::new(0) };
@@ -7969,6 +7971,10 @@ struct ResolvedAggregate {
     /// `min` or `max` (which have collated and extremum-tracking steps), and
     /// takes no more arguments than [`NO_ARG_SUBTYPES`] covers.
     plain_step: bool,
+    /// For a plain step whose function is the built-in `sum` or `count`: the
+    /// step to run on the accumulator's state instead of calling the function
+    /// ([`AggregateFunction::typed_step`](fsqlite_func::AggregateFunction::typed_step)).
+    typed_step: Option<TypedAggregateStep>,
 }
 
 /// The resolved aggregate of each `AggStep` and `AggFinal`, in a slot per
@@ -15046,6 +15052,7 @@ impl VdbeEngine {
                             ResolvedAggregate {
                                 func: Arc::clone(&func),
                                 plain_step: false,
+                                typed_step: None,
                             },
                         );
                         func
@@ -16560,13 +16567,27 @@ impl VdbeEngine {
             return Ok(false);
         }
         observe_requested_execution_cancellation(execution_cx)?;
-        ctx.func
-            .step_with_arg_subtypes(&mut ctx.state, args, &NO_ARG_SUBTYPES[..arg_count])?;
+        // A built-in `sum` or `count` steps its own state; the function is
+        // called when there is no typed step or it declines.
+        let typed = site
+            .typed_step
+            .is_some_and(|typed| typed.step(&mut *ctx.state, args));
+        if !typed {
+            ctx.func
+                .step_with_arg_subtypes(&mut ctx.state, args, &NO_ARG_SUBTYPES[..arg_count])?;
+        }
         observe_requested_execution_cancellation(execution_cx)?;
         #[cfg(test)]
-        FSQLITE_VDBE_PLAIN_AGG_STEPS_TOTAL.with(|counter| {
-            counter.set(counter.get().saturating_add(1));
-        });
+        {
+            FSQLITE_VDBE_PLAIN_AGG_STEPS_TOTAL.with(|counter| {
+                counter.set(counter.get().saturating_add(1));
+            });
+            if typed {
+                FSQLITE_VDBE_TYPED_AGG_STEPS_TOTAL.with(|counter| {
+                    counter.set(counter.get().saturating_add(1));
+                });
+            }
+        }
         Ok(true)
     }
 
@@ -16633,6 +16654,11 @@ impl VdbeEngine {
                 ResolvedAggregate {
                     func: Arc::clone(&func),
                     plain_step,
+                    typed_step: if plain_step {
+                        func.typed_step()
+                    } else {
+                        None
+                    },
                 },
             );
             func
@@ -44319,6 +44345,10 @@ mod tests {
         FSQLITE_VDBE_PLAIN_AGG_STEPS_TOTAL.with(Cell::get)
     }
 
+    fn typed_agg_steps() -> u64 {
+        FSQLITE_VDBE_TYPED_AGG_STEPS_TOTAL.with(Cell::get)
+    }
+
     /// Finalize and remove the accumulator in register `accum_reg`.
     fn finalize_accumulator(engine: &mut VdbeEngine, accum_reg: i32) -> SqliteValue {
         let ctx = engine
@@ -44486,6 +44516,96 @@ mod tests {
         }
     }
 
+    /// An application aggregate registered as `sum(X)`: adds 100 per row.
+    struct ApplicationSum;
+
+    impl fsqlite_func::AggregateFunction for ApplicationSum {
+        type State = i64;
+
+        fn initial_state(&self) -> i64 {
+            0
+        }
+
+        fn step(&self, state: &mut i64, _args: &[SqliteValue]) -> Result<()> {
+            *state += 100;
+            Ok(())
+        }
+
+        fn finalize(&self, state: i64) -> Result<SqliteValue> {
+            Ok(SqliteValue::Integer(state))
+        }
+
+        fn num_args(&self) -> i32 {
+            1
+        }
+
+        fn name(&self) -> &str {
+            "sum"
+        }
+    }
+
+    #[test]
+    fn test_typed_agg_step_serves_the_built_in_sum_and_count_and_never_an_application_sum() {
+        // sum(x) and count(*) over x = 1..=5.
+        let mut builder = ProgramBuilder::new();
+        let r_left = builder.alloc_reg();
+        let r_x = builder.alloc_reg();
+        let r_sum = builder.alloc_reg();
+        let r_count = builder.alloc_reg();
+        builder.emit_op(Opcode::Integer, 5, r_left, 0, P4::None, 0);
+        builder.emit_op(Opcode::Integer, 0, r_x, 0, P4::None, 0);
+        let loop_top = builder.emit_op(Opcode::AddImm, r_x, 1, 0, P4::None, 0);
+        builder.emit_op(Opcode::AggStep, 0, r_x, r_sum, P4::FuncName("sum".to_owned()), 1);
+        builder.emit_op(Opcode::AggStep, 0, 0, r_count, P4::FuncName("count".to_owned()), 0);
+        let after_loop = i32::try_from(loop_top).unwrap() + 5;
+        builder.emit_op(Opcode::DecrJumpZero, r_left, after_loop, 0, P4::None, 0);
+        builder.emit_op(Opcode::Goto, 0, i32::try_from(loop_top).unwrap(), 0, P4::None, 0);
+        builder.emit_op(Opcode::AggFinal, r_sum, 1, 0, P4::FuncName("sum".to_owned()), 0);
+        builder.emit_op(Opcode::AggFinal, r_count, 0, 0, P4::FuncName("count".to_owned()), 0);
+        builder.emit_op(Opcode::ResultRow, r_sum, 2, 0, P4::None, 0);
+        builder.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        let program = builder.finish().expect("program should build");
+
+        let run = |application_sum: bool| {
+            let mut engine = VdbeEngine::new(program.register_count());
+            let mut registry = FunctionRegistry::new();
+            register_builtins(&mut registry);
+            if application_sum {
+                registry.register_aggregate(ApplicationSum);
+            }
+            engine.set_function_registry(Arc::new(registry));
+            let (plain, typed) = (plain_agg_steps(), typed_agg_steps());
+            run_async(engine.execute(&program)).expect("aggregate execution should succeed");
+            let rows: Vec<Vec<SqliteValue>> = engine
+                .results()
+                .iter()
+                .map(|row| row.clone().into_vec())
+                .collect();
+            (rows, plain_agg_steps() - plain, typed_agg_steps() - typed)
+        };
+
+        // The built-ins: each aggregate's first step builds its accumulator
+        // through the general path; the other four of each step their state.
+        assert_eq!(
+            run(false),
+            (
+                vec![vec![SqliteValue::Integer(15), SqliteValue::Integer(5)]],
+                8,
+                8
+            )
+        );
+        // An application sum() is called on every row; only the built-in
+        // count(*) beside it steps its own state.
+        assert_eq!(
+            run(true),
+            (
+                vec![vec![SqliteValue::Integer(500), SqliteValue::Integer(5)]],
+                8,
+                4
+            )
+        );
+    }
+
     /// Run `program` on a fresh engine with the built-in functions.
     fn run_aggregate_program(program: &VdbeProgram) -> Result<Vec<Vec<SqliteValue>>> {
         let mut engine = VdbeEngine::new(program.register_count());
@@ -44563,6 +44683,7 @@ mod tests {
             ResolvedAggregate {
                 func: Arc::clone(&func),
                 plain_step: true,
+                typed_step: Some(TypedAggregateStep::Sum),
             },
         );
         sites.insert(
@@ -44570,6 +44691,7 @@ mod tests {
             ResolvedAggregate {
                 func,
                 plain_step: false,
+                typed_step: None,
             },
         );
         assert!(sites.get(5).is_some_and(|site| site.plain_step));

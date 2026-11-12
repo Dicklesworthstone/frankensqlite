@@ -17,6 +17,19 @@ use fsqlite_types::SqliteValue;
 
 use crate::FunctionArity;
 
+/// A built-in aggregate whose per-row step a caller may run on its
+/// type-erased state directly ([`AggregateFunction::typed_step`]), without a
+/// call through the trait object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypedAggregateStep {
+    /// The built-in `count(*)`.
+    CountStar,
+    /// The built-in `count(X)`.
+    Count,
+    /// The built-in `sum(X)`.
+    Sum,
+}
+
 /// An aggregate SQL function (e.g. `SUM`, `COUNT`, `AVG`).
 ///
 /// This trait is **open** (user-implementable). Extension authors implement
@@ -56,6 +69,17 @@ pub trait AggregateFunction: Send + Sync {
         _arg_subtypes: &[u32],
     ) -> Result<()> {
         self.step(state, args)
+    }
+
+    /// The built-in step a caller may run on this function's state directly
+    /// ([`TypedAggregateStep::step`]) instead of calling it. Only the built-in
+    /// `count(*)`, `count(X)` and `sum(X)` report one; any other
+    /// implementation, one registered under a built-in's name included, keeps
+    /// the default `None` and is always called. A typed step handed a state
+    /// of another type changes nothing and reports it, so the caller calls
+    /// the function after all.
+    fn typed_step(&self) -> Option<TypedAggregateStep> {
+        None
     }
 
     /// Consume the accumulator and produce the final result.
@@ -146,6 +170,10 @@ where
             .expect("aggregate state type mismatch");
         self.inner
             .step_with_arg_subtypes(concrete, args, arg_subtypes)
+    }
+
+    fn typed_step(&self) -> Option<TypedAggregateStep> {
+        self.inner.typed_step()
     }
 
     fn finalize(&self, state: Self::State) -> Result<SqliteValue> {
