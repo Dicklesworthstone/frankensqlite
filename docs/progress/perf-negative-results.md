@@ -87,6 +87,61 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-12 - WIN: a checkpoint reads its pages back once, right before it publishes (bd-w4pr1.13.20, lever E1)
+
+- Target: the read-back verification of the WAL checkpoint in
+  `crates/fsqlite-wal/src/checkpoint_executor_impl.rs` (`execute_checkpoint`,
+  `apply_checkpoint_post_action`, `replace_wal_generation`). A RESTART/TRUNCATE checkpoint, which
+  every autocheckpoint after a commit is, compared every page it wrote with its WAL source twice:
+  right after the backfill, then again after the reset fence's fsync. Between the two it only took
+  the reader reset gate, which publishes nothing and admits no database-only reader. Each pass is
+  one WAL frame read and one database page read per page.
+- Ledger preflight: no entry on the checkpoint's verification passes. The 2026-11-11 inline-read
+  entry (bd-w4pr1.13.18) is about the native cancellation checkpoint of a read, not the WAL one.
+- Change: each publication path verifies exactly once, right before it publishes and after its
+  last database write and sync. The no-reset and deferred-reset (gate refused) paths verify in
+  `apply_checkpoint_post_action`; the reset path verifies only after its final fsync. The invariant
+  is written on `apply_checkpoint_post_action`: nothing is published and no WAL generation is reset
+  until every page this checkpoint wrote has been read back and matched after the last database
+  write and sync. New tests: a corruption injected at any of the three syncs after the backfill
+  still refuses the reset, and a refused-gate checkpoint does not publish a corrupted page. A
+  mutation run turned 12 executor tests red, these among them: once with the deferred path's
+  read-back dropped (the corrupted page was published), and once with the reset path's read-back
+  moved before the fence (a page corrupted at the fence's sync was reset away).
+- Result: CLI release-perf with stock sqlite3 3.46.1 live in the same script. Base is main
+  03fa8747f (sha256 af3925e8...), after is the change d013bf862 on that base (sha256 cd42266f...).
+  It landed rebased onto 935f9feda; the main commits in between touch window SELECTs only. Reads are
+  `pread64` calls per file from `strace -f -y` (`mut_strace.py`, `bulk_strace.py`). CPU is the
+  median task-clock and instructions the min `instructions:u` of the whole process. The UPDATE ran
+  in `mut_ckpt_probe.py` (7 runs, io_uring refused, /dev/shm). The bulk load ran in
+  `bulk_cpu_probe.py` (3 runs on disk, because the per-user /dev/shm quota refused writes with
+  EDQUOT by then). Answers equal stock's (count and sum after the UPDATE and after the load), and
+  stock's `integrity_check` is ok on the UPDATE files both fsqlite arms wrote.
+
+  | workload | stock | before | after |
+  |---|---|---|---|
+  | `UPDATE m SET a = a + 1 WHERE id % 10 = 0` (300k rows, 2,250 pages): WAL / db reads | 2,250 / 2,264 | 9,186 / 8,712 | 6,931 / 6,096 |
+  | same: CPU, instructions | 38.5 ms, 153.4M | 152.1 ms, 827.8M | 144.6 ms, 814.4M |
+  | 1M-row bulk load (`BASE_SETUP`): WAL / db reads | 6,931 / 6,933 | 30,952 / 37,216 | 23,368 / 29,560 |
+  | same: CPU, instructions | 443.9 ms, 4,177.5M | 1,986.6 ms, 18,014.9M | 1,958.4 ms, 17,964.5M |
+
+  The bead predicted -2,250 WAL and -2,250 db reads on the UPDATE, about -8k of each on the bulk
+  load, and -2% to -4% CPU on the UPDATE. Measured: -2,255 WAL and -2,616 db reads on the UPDATE,
+  -7,584 WAL and -7,656 db reads on the bulk load. UPDATE CPU fell 4.9% here and 7.7% in an
+  earlier 5-run probe (155.3 -> 143.3 ms). Base db reads vary between runs (8,352 and 8,712).
+  Bulk load CPU fell 1.4%. With `wal_autocheckpoint=0` the close-time PASSIVE checkpoint already
+  verified once, so that arm does not move (814.4M -> 814.3M).
+- Retry / widen: the UPDATE still reads 6,931 WAL and 6,096 db pages against stock's 2,250 and
+  2,264. That is the up-front frame validation, the backfill, this one verification, the
+  certificate re-hash (lever D, `wal_adapter.rs`, another lane's file today), and the GH #294
+  compare-before-write read of `SimplePagerCheckpointWriter::write_page`. Lever E2 (skip that read
+  for frames past the backfilled prefix) is not sound today. Index recovery zeroes nBackfill and
+  nBackfillAttempted, and nBackfillAttempted is raised only at publication, so frames past the
+  prefix can be revisits. Retry E2 once nBackfillAttempted follows stock's discipline (recovery sets
+  it to mxFrame; every checkpoint raises it before its first database write) and `wal_adapter.rs`
+  can forward the bit to the writer. Retry another verification cut only if a path is found that
+  publishes without reading back after its last write and sync; then fix that path, do not cut it.
+
 ## 2026-11-12 - WIN on CPU, RSS prediction missed: a table window SELECT reads a one-column key from the scanned row (bd-w4pr1.12)
 
 - Target: `execute_window_select` built a PARTITION BY and an ORDER BY key vector per row (a heap
