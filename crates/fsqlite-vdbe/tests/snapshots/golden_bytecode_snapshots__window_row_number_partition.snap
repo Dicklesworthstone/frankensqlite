@@ -12,28 +12,29 @@ requires_version_store: false
 
 addr  opcode           p1    p2    p3    p4                 p5
 ----  ---------------  ----  ----  ----  -----------------  --
-0     Init             0     25    0                        0 
+0     Init             0     23    0                        0 
 1     Transaction      0     0     0                        0 
 2     SorterOpen       1     1     0     (str)+             0 
 3     OpenRead         0     4     0     (tbl)events        0 
-4     Rewind           0     16    0                        0 
+4     Rewind           0     14    0                        0 
 5     Column           0     2     3                        0 
-6     Integer          10    4     0                        0 
-7     IsNull           4     15    0                        0 
-8     IsNull           3     15    0                        0 
-9     Le               4     15    3                        195
-10    Column           0     1     6                        0 
-11    Copy             6     5     0                        0 
-12    PureFunc         0     8     7     (func)ROW_NUMBER   0 
-13    MakeRecord       5     3     8                        0 
-14    SorterInsert     1     8     0                        0 
-15    Next             0     5     0                        0 
-16    Close            0     0     0                        0 
-17    SorterSort       1     23    0                        0 
-18    SorterData       1     9     0                        0 
-19    Column           1     1     1                        0 
-20    Column           1     2     2                        0 
-21    ResultRow        1     2     0                        0 
-22    SorterNext       1     18    0                        0 
-23    Close            1     0     0                        0 
-24    Halt             0     0     0                        0
+6     IsNull           3     13    0                        0 
+7     Le               4     13    3                        195
+8     Column           0     1     6                        0 
+9     Copy             6     5     0                        0 
+10    PureFunc         0     8     7     (func)ROW_NUMBER   0 
+11    MakeRecord       5     3     8                        0 
+12    SorterInsert     1     8     0                        0 
+13    Next             0     5     0                        0 
+14    Close            0     0     0                        0 
+15    SorterSort       1     21    0                        0 
+16    SorterData       1     9     0                        0 
+17    Column           1     1     1                        0 
+18    Column           1     2     2                        0 
+19    ResultRow        1     2     0                        0 
+20    SorterNext       1     16    0                        0 
+21    Close            1     0     0                        0 
+22    Halt             0     0     0                        0 
+23    Integer          10    4     0                        0 
+24    Goto             0     1     0                        0 
+25    Halt             0     0     0                        0

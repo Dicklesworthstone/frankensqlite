@@ -208222,7 +208222,31 @@ mod tests {
                     }
                 }
             }
+            // bd-w4pr1.13.31: a column against a literal, the literal on either
+            // side; the literal is loaded once in the program prologue. Each
+            // query runs twice, so the cached program's prologue runs again.
+            let columns = ["id", "a", "b", "c", "d"];
+            let literals = ["0", "7", "'7'", "7.0", "2.5", "'abc'", "''", "3000000000"];
+            for op in ["=", "<>", "<", "<=", ">", ">=", "=="] {
+                for column in columns {
+                    for literal in literals {
+                        for sql in [
+                            format!(
+                                "SELECT count(*), sum(id), sum(id * id) FROM w WHERE {column} {op} {literal}"
+                            ),
+                            format!(
+                                "SELECT count(*), sum(id), sum(id * id) FROM w WHERE {literal} {op} {column}"
+                            ),
+                        ] {
+                            check(&conn, &oracle, &sql).await;
+                            check(&conn, &oracle, &sql).await;
+                        }
+                    }
+                }
+            }
             for sql in [
+                "UPDATE w SET d = 'z' WHERE c >= 2.5",
+                "DELETE FROM w WHERE 7 = a",
                 "UPDATE w SET c = c + 1 WHERE id % 2 = 1",
                 "UPDATE w SET b = 'u' WHERE length(b) >= 2",
                 "UPDATE w SET d = 'y' WHERE +d <> 'x' COLLATE NOCASE",

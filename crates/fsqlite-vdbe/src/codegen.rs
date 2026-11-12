@@ -8,7 +8,7 @@ use std::cell::{Cell, RefCell};
 use std::env;
 use std::sync::Arc;
 
-use crate::{Label, ProgramBuilder, SchemaEvaluationContext};
+use crate::{HoistedLiteral, Label, ProgramBuilder, SchemaEvaluationContext};
 use fsqlite_ast::{
     AssignmentTarget, BinaryOp, ColumnRef, ConflictAction, CreateIndexStatement, DeleteStatement,
     Distinctness, Expr, FromClause, FunctionArgs, InSet, IndexedColumn, InsertSource,
@@ -33840,12 +33840,15 @@ fn emit_where_filter_with_ctx(
             let comparison = ResolvedComparisonInfo::new(left, right, scan);
             if let Some(resolved) = comparison.left_resolved.as_ref() {
                 let col_reg = b.alloc_temp();
-                let val_reg = b.alloc_temp();
+                let hoisted = hoisted_where_literal(b, right);
+                let val_reg = hoisted.unwrap_or_else(|| b.alloc_temp());
                 emit_resolved_column(b, resolved, scan.cursor, col_reg, scan);
-                emit_expr(b, right, val_reg, Some(scan));
-                // SQL semantics: `col = NULL` is UNKNOWN (false in WHERE). If the
-                // value expression evaluates to NULL, skip the row unconditionally.
-                b.emit_jump_to_label(Opcode::IsNull, val_reg, 0, skip_label, P4::None, 0);
+                if hoisted.is_none() {
+                    emit_expr(b, right, val_reg, Some(scan));
+                    // SQL semantics: `col = NULL` is UNKNOWN (false in WHERE). If the
+                    // value expression evaluates to NULL, skip the row unconditionally.
+                    b.emit_jump_to_label(Opcode::IsNull, val_reg, 0, skip_label, P4::None, 0);
+                }
                 // NULLEQ (0x80) | comparison affinity so the engine coerces correctly.
                 b.emit_jump_to_label(
                     Opcode::Ne,
@@ -33855,15 +33858,20 @@ fn emit_where_filter_with_ctx(
                     comparison.collation_p4.clone(),
                     comparison.cmp_p5,
                 );
-                b.free_temp(val_reg);
+                if hoisted.is_none() {
+                    b.free_temp(val_reg);
+                }
                 b.free_temp(col_reg);
             } else if let Some(resolved) = comparison.right_resolved.as_ref() {
                 let col_reg = b.alloc_temp();
-                let val_reg = b.alloc_temp();
+                let hoisted = hoisted_where_literal(b, left);
+                let val_reg = hoisted.unwrap_or_else(|| b.alloc_temp());
                 emit_resolved_column(b, resolved, scan.cursor, col_reg, scan);
-                emit_expr(b, left, val_reg, Some(scan));
-                // SQL semantics: `NULL = col` is UNKNOWN (false in WHERE).
-                b.emit_jump_to_label(Opcode::IsNull, val_reg, 0, skip_label, P4::None, 0);
+                if hoisted.is_none() {
+                    emit_expr(b, left, val_reg, Some(scan));
+                    // SQL semantics: `NULL = col` is UNKNOWN (false in WHERE).
+                    b.emit_jump_to_label(Opcode::IsNull, val_reg, 0, skip_label, P4::None, 0);
+                }
                 b.emit_jump_to_label(
                     Opcode::Ne,
                     val_reg,
@@ -33872,7 +33880,9 @@ fn emit_where_filter_with_ctx(
                     comparison.collation_p4.clone(),
                     comparison.cmp_p5,
                 );
-                b.free_temp(val_reg);
+                if hoisted.is_none() {
+                    b.free_temp(val_reg);
+                }
                 b.free_temp(col_reg);
             } else {
                 // Neither side is a column ref (e.g. WHERE 1 = 0, WHERE length(name) = 5).
@@ -33915,10 +33925,13 @@ fn emit_where_filter_with_ctx(
 
             if let Some(resolved) = comparison.left_resolved.as_ref() {
                 let col_reg = b.alloc_temp();
-                let val_reg = b.alloc_temp();
+                let hoisted = hoisted_where_literal(b, right);
+                let val_reg = hoisted.unwrap_or_else(|| b.alloc_temp());
                 emit_resolved_column(b, resolved, scan.cursor, col_reg, scan);
-                emit_expr(b, right, val_reg, Some(scan));
-                b.emit_jump_to_label(Opcode::IsNull, val_reg, 0, skip_label, P4::None, 0);
+                if hoisted.is_none() {
+                    emit_expr(b, right, val_reg, Some(scan));
+                    b.emit_jump_to_label(Opcode::IsNull, val_reg, 0, skip_label, P4::None, 0);
+                }
                 b.emit_jump_to_label(Opcode::IsNull, col_reg, 0, skip_label, P4::None, 0);
                 b.emit_jump_to_label(
                     skip_opcode,
@@ -33928,7 +33941,9 @@ fn emit_where_filter_with_ctx(
                     comparison.collation_p4.clone(),
                     comparison.cmp_p5,
                 );
-                b.free_temp(val_reg);
+                if hoisted.is_none() {
+                    b.free_temp(val_reg);
+                }
                 b.free_temp(col_reg);
             } else if let Some(resolved) = comparison.right_resolved.as_ref() {
                 // col is on the right: `val op col` → swap operand order.
@@ -33943,10 +33958,13 @@ fn emit_where_filter_with_ctx(
                     _ => unreachable!(),
                 };
                 let col_reg = b.alloc_temp();
-                let val_reg = b.alloc_temp();
+                let hoisted = hoisted_where_literal(b, left);
+                let val_reg = hoisted.unwrap_or_else(|| b.alloc_temp());
                 emit_resolved_column(b, resolved, scan.cursor, col_reg, scan);
-                emit_expr(b, left, val_reg, Some(scan));
-                b.emit_jump_to_label(Opcode::IsNull, val_reg, 0, skip_label, P4::None, 0);
+                if hoisted.is_none() {
+                    emit_expr(b, left, val_reg, Some(scan));
+                    b.emit_jump_to_label(Opcode::IsNull, val_reg, 0, skip_label, P4::None, 0);
+                }
                 b.emit_jump_to_label(Opcode::IsNull, col_reg, 0, skip_label, P4::None, 0);
                 // VDBE comparison: opcode P1=rhs P2=lhs. For `val < col` skip
                 // when NOT(val < col), i.e. val >= col → Ge(val_reg, col_reg).
@@ -33958,7 +33976,9 @@ fn emit_where_filter_with_ctx(
                     comparison.collation_p4.clone(),
                     comparison.cmp_p5,
                 );
-                b.free_temp(val_reg);
+                if hoisted.is_none() {
+                    b.free_temp(val_reg);
+                }
                 b.free_temp(col_reg);
             } else {
                 emit_where_comparison_jump(b, left, *op, right, scan, skip_label);
@@ -34030,18 +34050,48 @@ fn emit_where_comparison_jump(
         _ => unreachable!("emit_where_comparison_jump takes a comparison operator"),
     };
     let ctx = Some(scan);
-    let r_left = b.alloc_temp();
-    let r_right = b.alloc_temp();
-    emit_expr(b, left, r_left, ctx);
-    emit_expr(b, right, r_right, ctx);
+    // A literal operand lives in the program prologue (bd-w4pr1.13.31): it is
+    // neither reloaded nor NULL-checked per row.
+    let left_hoisted = hoisted_where_literal(b, left);
+    let r_left = left_hoisted.unwrap_or_else(|| b.alloc_temp());
+    let right_hoisted = hoisted_where_literal(b, right);
+    let r_right = right_hoisted.unwrap_or_else(|| b.alloc_temp());
+    if left_hoisted.is_none() {
+        emit_expr(b, left, r_left, ctx);
+    }
+    if right_hoisted.is_none() {
+        emit_expr(b, right, r_right, ctx);
+    }
     let p4 = comparison_collation_ctx(left, right, ctx).map_or(P4::None, P4::Collation);
-    b.emit_jump_to_label(Opcode::IsNull, r_left, 0, skip_label, P4::None, 0);
-    b.emit_jump_to_label(Opcode::IsNull, r_right, 0, skip_label, P4::None, 0);
+    if left_hoisted.is_none() {
+        b.emit_jump_to_label(Opcode::IsNull, r_left, 0, skip_label, P4::None, 0);
+    }
+    if right_hoisted.is_none() {
+        b.emit_jump_to_label(Opcode::IsNull, r_right, 0, skip_label, P4::None, 0);
+    }
     let cmp_aff = comparison_affinity_p5(left, right, ctx);
     // Comparison: p1=rhs_reg, p2=jump_target (label), p3=lhs_reg
     b.emit_jump_to_label(skip_opcode, r_right, r_left, skip_label, p4, cmp_aff);
-    b.free_temp(r_right);
-    b.free_temp(r_left);
+    if right_hoisted.is_none() {
+        b.free_temp(r_right);
+    }
+    if left_hoisted.is_none() {
+        b.free_temp(r_left);
+    }
+}
+
+/// The prologue register of a WHERE comparison operand that is an integer,
+/// real or text literal, loaded once per execution instead of per scanned row
+/// (bd-w4pr1.13.31); such a literal is never NULL, so the caller drops its
+/// NULL check. `None` for any other operand, or a program without a prologue.
+fn hoisted_where_literal(b: &mut ProgramBuilder, expr: &Expr) -> Option<i32> {
+    let literal = match expr {
+        Expr::Literal(Literal::Integer(value), _) => HoistedLiteral::Integer(*value),
+        Expr::Literal(Literal::Float(value), _) => HoistedLiteral::Real(value.to_bits()),
+        Expr::Literal(Literal::String(text), _) => HoistedLiteral::Text(text.clone()),
+        _ => return None,
+    };
+    b.hoisted_literal(literal)
 }
 
 struct ResolvedComparisonInfo {

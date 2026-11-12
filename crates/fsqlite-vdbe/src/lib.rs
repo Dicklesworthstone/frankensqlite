@@ -589,6 +589,19 @@ pub struct ProgramBuilder {
     /// bd-01uq7: MemDatabase-backed (TEMP) table roots whose written rows carry
     /// computed VIRTUAL generated values instead of leaving those columns out.
     materialized_virtual_generated_roots: Vec<i32>,
+    /// bd-w4pr1.13.31: literals loaded once, in the prologue `Init` jumps to,
+    /// with the register each one lives in (see [`Self::hoisted_literal`]).
+    hoisted_literals: Vec<(HoistedLiteral, i32)>,
+}
+
+/// A literal a program loads once, before its first instruction after
+/// `Init`, instead of at each use (bd-w4pr1.13.31).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HoistedLiteral {
+    Integer(i64),
+    /// The value's bits: equal literals share one register.
+    Real(u64),
+    Text(String),
 }
 
 impl ProgramBuilder {
@@ -605,7 +618,30 @@ impl ProgramBuilder {
             generated_column_emission: None,
             preserves_rows_on_constraint: false,
             materialized_virtual_generated_roots: Vec::new(),
+            hoisted_literals: Vec::new(),
         }
+    }
+
+    /// A register holding `literal` for the whole run of the program, loaded
+    /// once in the prologue [`Self::finish`] appends and the leading `Init`
+    /// jumps to (bd-w4pr1.13.31); `None` when the program does not start with
+    /// `Init`, which then has no prologue to load it in. Equal literals share
+    /// a register. Nothing may write the register: it is read-only for every
+    /// instruction after the prologue, as a comparison operand is.
+    pub fn hoisted_literal(&mut self, literal: HoistedLiteral) -> Option<i32> {
+        if self.ops.first().is_none_or(|op| op.opcode != Opcode::Init) {
+            return None;
+        }
+        if let Some((_, reg)) = self
+            .hoisted_literals
+            .iter()
+            .find(|(hoisted, _)| *hoisted == literal)
+        {
+            return Some(*reg);
+        }
+        let reg = self.alloc_reg();
+        self.hoisted_literals.push((literal, reg));
+        Some(reg)
     }
 
     /// bd-5bq6u: record that this statement preserves prior rows on a constraint
@@ -940,20 +976,21 @@ impl ProgramBuilder {
                 )));
             }
         }
-        let bind_parameter_requirement = compute_bind_parameter_requirement(&self.ops);
+        let mut ops = self.ops;
+        append_hoisted_literal_prologue(&mut ops, &self.hoisted_literals);
+        let bind_parameter_requirement = compute_bind_parameter_requirement(&ops);
         let table_index_meta = self
             .table_index_meta
             .into_iter()
             .map(|(table_cursor, indexes)| (table_cursor, indexes.into_boxed_slice()))
             .collect();
 
-        let inferred_register_count = self.ops.iter().fold(0, |max_register, op| {
+        let inferred_register_count = ops.iter().fold(0, |max_register, op| {
             max_register.max(opcode_register_spans(op).max_touched_register())
         });
-        let has_insert = self.ops.iter().any(|op| op.opcode == Opcode::Insert);
+        let has_insert = ops.iter().any(|op| op.opcode == Opcode::Insert);
         // bd-perf (V2.1): Peephole pass — fuse NewRowid+MakeRecord+Insert
         // into FusedAppendInsert for simple sequential append patterns.
-        let mut ops = self.ops;
         peephole_fuse_append_insert(&mut ops);
         // SAFETY: The VDBE dispatch loop relies on every non-empty program
         // terminating via OP_Halt (bounds check was removed in V2.3).
@@ -989,6 +1026,67 @@ impl ProgramBuilder {
 impl Default for ProgramBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// bd-w4pr1.13.31: append the loads of the hoisted literals after the last
+/// instruction and route the leading `Init` through them. `Init` jumps to the
+/// loads; they end with a jump to where `Init` went before (its own target
+/// when that named an instruction, else the next instruction), and an
+/// unreachable `Halt` keeps the program ending in `Halt`. Only the leading
+/// `Init` reaches the loads, so they run once per execution, before any
+/// instruction that reads their registers.
+fn append_hoisted_literal_prologue(
+    ops: &mut smallvec::SmallVec<[VdbeOp; 64]>,
+    hoisted: &[(HoistedLiteral, i32)],
+) {
+    if hoisted.is_empty() {
+        return;
+    }
+    let Some(init) = ops.first() else {
+        return;
+    };
+    debug_assert_eq!(
+        init.opcode,
+        Opcode::Init,
+        "hoisted literals need a leading Init"
+    );
+    let len = ops.len();
+    let resume = usize::try_from(init.p2)
+        .ok()
+        .filter(|target| *target > 0 && *target < len)
+        .unwrap_or(1);
+    let op = |opcode, p1, p2, p4| VdbeOp {
+        opcode,
+        p1,
+        p2,
+        p3: 0,
+        p4,
+        p5: 0,
+    };
+    for (literal, reg) in hoisted {
+        ops.push(match literal {
+            HoistedLiteral::Integer(value) => match i32::try_from(*value) {
+                Ok(small) => op(Opcode::Integer, small, *reg, P4::None),
+                Err(_) => op(Opcode::Int64, 0, *reg, P4::Int64(*value)),
+            },
+            HoistedLiteral::Real(bits) => op(Opcode::Real, 0, *reg, P4::Real(f64::from_bits(*bits))),
+            HoistedLiteral::Text(text) => op(Opcode::String8, 0, *reg, P4::Str(text.clone())),
+        });
+    }
+    let resume = i32::try_from(resume).expect("instruction address fits i32");
+    let start = i32::try_from(len).expect("instruction address fits i32");
+    ops.push(op(Opcode::Goto, 0, resume, P4::None));
+    ops.push(op(Opcode::Halt, 0, 0, P4::None));
+    ops[0].p2 = start;
+    // Any later Init that pointed past the old end fell through; past the new
+    // end it still does. Left alone it would now enter the loads, whose jump
+    // back would bring it round again.
+    let new_end = i32::try_from(ops.len()).expect("instruction address fits i32");
+    for later in ops.iter_mut().take(len).skip(1) {
+        if later.opcode == Opcode::Init && later.p2 >= start {
+            later.p2 = new_end;
+        }
     }
 }
 
@@ -3051,6 +3149,90 @@ mod tests {
             variants[10],
             P4::PrecomputedHeader(ref header) if header.template == vec![3, 0, 0]
         ));
+    }
+
+    // ── test_hoisted_literals_load_once_in_the_init_prologue ────────────
+    #[test]
+    fn test_hoisted_literals_load_once_in_the_init_prologue() {
+        // bd-w4pr1.13.31: the usual shape, Init's target past the end.
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        let seven = b.hoisted_literal(HoistedLiteral::Integer(7)).unwrap();
+        let big = b
+            .hoisted_literal(HoistedLiteral::Integer(i64::from(i32::MAX) + 1))
+            .unwrap();
+        let half = b.hoisted_literal(HoistedLiteral::Real(0.5_f64.to_bits())).unwrap();
+        let text = b.hoisted_literal(HoistedLiteral::Text("x".to_owned())).unwrap();
+        assert_eq!(
+            b.hoisted_literal(HoistedLiteral::Integer(7)),
+            Some(seven),
+            "equal literals share a register"
+        );
+        assert_eq!(
+            [seven, big, half, text]
+                .iter()
+                .collect::<HashSet<_>>()
+                .len(),
+            4
+        );
+        b.emit_op(Opcode::Integer, 1, 9, 0, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+        let prog = b.finish().unwrap();
+        let ops = prog.ops();
+        // Init, Integer, Halt, then four loads, the jump back to 1 and a Halt.
+        assert_eq!(ops.len(), 3 + 4 + 2);
+        assert_eq!(ops[0].opcode, Opcode::Init);
+        assert_eq!(ops[0].p2, 3, "Init jumps to the loads");
+        assert_eq!((ops[3].opcode, ops[3].p1, ops[3].p2), (Opcode::Integer, 7, seven));
+        assert_eq!(
+            (ops[4].opcode, &ops[4].p4, ops[4].p2),
+            (Opcode::Int64, &P4::Int64(i64::from(i32::MAX) + 1), big)
+        );
+        assert_eq!((ops[5].opcode, &ops[5].p4, ops[5].p2), (Opcode::Real, &P4::Real(0.5), half));
+        assert_eq!(
+            (ops[6].opcode, &ops[6].p4, ops[6].p2),
+            (Opcode::String8, &P4::Str("x".to_owned()), text)
+        );
+        assert_eq!((ops[7].opcode, ops[7].p2), (Opcode::Goto, 1));
+        assert_eq!(ops[8].opcode, Opcode::Halt);
+        assert!(prog.register_count() >= text);
+
+        // An Init that already named an instruction resumes there.
+        let mut b = ProgramBuilder::new();
+        let target = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, target, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(target);
+        b.emit_op(Opcode::Goto, 0, 0, 0, P4::None, 0);
+        b.hoisted_literal(HoistedLiteral::Integer(1)).unwrap();
+        let ops = b.finish().unwrap().ops().to_vec();
+        assert_eq!(ops[0].p2, 3);
+        assert_eq!((ops[4].opcode, ops[4].p2), (Opcode::Goto, 2));
+
+        // A later Init that fell through past the end still falls through: it
+        // must not enter the loads, whose jump back to 1 would reach it again.
+        let mut b = ProgramBuilder::new();
+        let end = b.emit_label();
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        b.emit_op(Opcode::Transaction, 0, 0, 0, P4::None, 0);
+        b.emit_jump_to_label(Opcode::Init, 0, 0, end, P4::None, 0);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        b.resolve_label(end);
+        b.hoisted_literal(HoistedLiteral::Integer(1)).unwrap();
+        let ops = b.finish().unwrap().ops().to_vec();
+        assert_eq!(ops.len(), 4 + 3);
+        assert_eq!(ops[0].p2, 4, "the leading Init enters the loads");
+        assert_eq!(ops[2].opcode, Opcode::Init);
+        assert_eq!(ops[2].p2, 7, "a later Init still points past the end");
+
+        // No leading Init: nothing to load the literal in, so no register.
+        let mut b = ProgramBuilder::new();
+        b.emit_op(Opcode::Integer, 1, 1, 0, P4::None, 0);
+        assert_eq!(b.hoisted_literal(HoistedLiteral::Integer(1)), None);
+        b.emit_op(Opcode::Halt, 0, 0, 0, P4::None, 0);
+        assert_eq!(b.finish().unwrap().ops().len(), 2);
     }
 
     // ── test_label_emit_and_resolve ─────────────────────────────────────
