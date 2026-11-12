@@ -129,6 +129,58 @@ share on a named workload, a named redesign or bead it waits for, a gate value t
   table runs before the statement on `:memory:` (probably the row mirror's reload); that is the next
   lever here.
 
+## 2026-11-12 - WIN: an UPDATE that scans its table rewrites each matching row in the scan (one pass) when nothing can observe it (bd-w4pr1.13.20)
+
+- Target: `UPDATE ... WHERE <predicate>` that full-scans its table. Touched:
+  `crates/fsqlite-vdbe/src/codegen.rs` (`codegen_update`, new `update_scan_can_run_in_one_pass`),
+  `crates/fsqlite-vdbe/src/engine.rs` (`Insert`, same-rowid rewrite whose cell size changed).
+- Evidence before (callgrind `cg_update.out`, `UPDATE m SET a = a + 1 WHERE id % 10 = 0`, 30,000
+  of 300k rows): pass 2 re-found every collected row, `table_advance_to` 108.4M (3.6k per updated
+  row), plus the RowSetAdd / RowSetRead / SeekRowid / Goto dispatch.
+- Change: the full-scan branch runs the rewrite where the scan stands and emits the Next after it
+  when the statement has no RETURNING; no subquery, EXISTS, IN (SELECT) or window call in its
+  WHERE or any SET value; assigns neither the hidden rowid nor its INTEGER PRIMARY KEY alias (a
+  row that keeps its key cannot be met again: the Halloween case); and no IGNORE or REPLACE from
+  the statement, a column, the IPK or an index. A same-key rewrite whose cell size changed is
+  deleted and re-inserted under the same rowid; the Insert now leaves the cursor on that rowid
+  (re-seeking only when the insert or its split left it elsewhere) so the Next continues from it.
+  Every seek shape and every other statement keep the two passes. Triggers and FK work run
+  around the program in this engine, as for the one-pass DELETE.
+- Result, stock sqlite3 3.46.1 live (base main 3fe901b76 sha256 05..., candidate a89193f6...,
+  user instructions of the process, minimum of 5 runs): `update_10pct_300k` stock 273.4M, base
+  1,319.9M (4.83x), candidate 1,192.8M (4.36x): -127.1M (prediction 100M to 130M; kill under 70M:
+  not met). CPU median 229.1 -> 192.7 ms (stock 47.3). Answers equal stock's; stock's
+  `PRAGMA integrity_check` passes on every file written.
+- Tests: `one_pass_delete_oracle::scan_update_matches_stock_in_one_pass_and_two` (19 UPDATEs
+  against rusqlite on `:memory:` and a file, direct and prepared: rows growing across page splits
+  while the scan continues, shrinking rows, an indexed and a UNIQUE indexed column, OR IGNORE / OR
+  REPLACE, a moved rowid alias, SET and WHERE reading the target, RETURNING, UPDATE triggers
+  reading the table, FK parent and child, WITHOUT ROWID) and its EXPLAIN shape test;
+  `test_codegen_scan_update_is_one_pass_only_when_nothing_observes_it`. The UPDATE also passes its
+  table alias to the rowid-target extractor: `test_codegen_update_where_qualified_rowid_alias`
+  had seen a SeekRowid only because pass 2 emitted one.
+- Gate, on main a010ce5cb plus this change (chain R in the perf7 clone): clippy -D warnings on
+  fsqlite-vdbe, fsqlite-core and fsqlite `--all-targets` clean; fsqlite-vdbe lib 1,235 pass and 2
+  fail (red on main, bd-bhalc), goldens 8/8; fsqlite-core `one_pass_delete_oracle` 4/4 and the
+  UPDATE oracles (bd_9ag5r, bd_c1vth, set semantics, bd_2jbl5) pass; fsqlite DML plan and oracle
+  tests (6 targets) pass. On 3fe901b76 plus the same change the fsqlite-core plan-pinning list
+  passed 117 of 118, the one red being bd-gazf2 (red on main).
+- Retry condition: none.
+
+## 2026-11-12 - NOT STARTED: the rest of the table-leaf delete (bd-w4pr1.13.20)
+
+- Profile after the two DELETE levers (callgrind of `delete_14pct_300k` on the one-pass binary):
+  the delete is 5.3k per removed row. 1.4k is `write_page_data` on a page the transaction already
+  owns (the concurrent-writer bookkeeping in `SharedTxnPageIo::write_page_internal`), about 700 the
+  copy-on-write of the 4 KiB leaf the cursor's stack entry shares (`PageData::as_bytes_mut`, 2.1
+  calls per delete), 200 the stack entry drop. At most about 2k per row, 85M of the statement's 857M.
+- Not started: the copy-on-write needs the cursor to hand the pager its only reference to the leaf
+  (an ownership change between the stack entry and the pager), and the write bookkeeping is the
+  MVCC page-write path, whose cut needs that path's owner's proof. The same profile ranks the scan's
+  WHERE first (334.6M, 11 opcodes per scanned row where stock runs 4).
+- Retry condition: after the WHERE codegen lever, or when a page-ownership API lets a cursor write
+  a page it holds without a copy.
+
 ## 2026-11-12 - WIN: an index search orders a cell by an INTEGER leading probe term straight from the stored record (bd-w4pr1.13.15)
 
 - Target: every index binary search whose probe starts with an INTEGER (seeks and inserts);
