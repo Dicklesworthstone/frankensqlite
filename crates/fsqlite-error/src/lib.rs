@@ -607,7 +607,11 @@ impl FrankenError {
             | Self::NotImplemented(_)
             | Self::FunctionError(_)
             | Self::BackgroundWorkerFailed(_)
-            | Self::ConcurrentUnavailable => ErrorCode::Error,
+            | Self::ConcurrentUnavailable
+            // Stock raises "integer overflow" (abs, sum, window sum) through
+            // sqlite3_result_error: SQLITE_ERROR, not SQLITE_RANGE, which it
+            // keeps for a bind index out of range (bd-w4pr1.33).
+            | Self::IntegerOverflow => ErrorCode::Error,
             Self::UniqueViolation { .. }
             | Self::NotNullViolation { .. }
             | Self::CheckViolation { .. }
@@ -626,7 +630,7 @@ impl FrankenError {
             | Self::SnapshotTooOld { .. }
             | Self::LockFailed { .. } => ErrorCode::Busy,
             Self::TypeMismatch { .. } | Self::DatatypeMismatch => ErrorCode::Mismatch,
-            Self::IntegerOverflow | Self::OutOfRange { .. } => ErrorCode::Range,
+            Self::OutOfRange { .. } => ErrorCode::Range,
             Self::TooBig => ErrorCode::TooBig,
             Self::Internal(_) | Self::DatabaseImagePublicationOutcomeIndeterminate { .. } => {
                 ErrorCode::Internal
@@ -1491,7 +1495,9 @@ mod tests {
             .error_code(),
             ErrorCode::Mismatch
         );
-        assert_eq!(FrankenError::IntegerOverflow.error_code(), ErrorCode::Range);
+        // bd-w4pr1.33: stock reports "integer overflow" as SQLITE_ERROR.
+        assert_eq!(FrankenError::IntegerOverflow.error_code(), ErrorCode::Error);
+        assert_eq!(FrankenError::IntegerOverflow.extended_error_code(), 1);
         assert_eq!(
             FrankenError::OutOfRange {
                 what: String::new(),
