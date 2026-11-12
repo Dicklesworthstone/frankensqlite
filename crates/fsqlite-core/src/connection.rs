@@ -96861,6 +96861,18 @@ impl Connection {
                         .map(|column_name| (effective_label.to_owned(), column_name, true)),
                 )
                 .collect();
+            // bd-w4pr1.12: every scanned row holds one value per map entry
+            // until the statement ends, so scan only the columns the
+            // statement can name, by the join fallback's coarse SQL-text rule
+            // (GH#527). A `*` or `tbl.*` result column keeps every column
+            // (the text is then `None`), and so does a virtual table, whose
+            // `MATCH` shorthand and `rank` read columns the text never names.
+            let cmap = match join_statement_column_text(select) {
+                Some(sql) if !self.table_name_is_virtual(&table_name) => {
+                    window_scan_named_columns(cmap, &sql)
+                }
+                _ => cmap,
+            };
             let expanded: Vec<ResultColumn> = columns
                 .iter()
                 .flat_map(|col| match col {
@@ -97222,16 +97234,20 @@ impl Connection {
                     true
                 };
                 filter_matches.push(filter_match);
-                partition_keys.push(
-                    pb.iter()
-                        .map(|expr| self.eval_join_expr_with_registry(expr, row, &col_map))
-                        .collect::<Result<Vec<_>>>()?,
-                );
-                order_keys.push(
-                    ob.iter()
-                        .map(|term| self.eval_join_expr_with_registry(&term.expr, row, &col_map))
-                        .collect::<Result<Vec<_>>>()?,
-                );
+                // Exact-length key vectors (bd-w4pr1.12): collecting through
+                // `Result` gives the iterator no size hint, so `Vec` reserved
+                // four values for a one-term key, 192 bytes per row each for
+                // PARTITION BY and ORDER BY.
+                let mut partition_key = Vec::with_capacity(pb.len());
+                for expr in pb {
+                    partition_key.push(self.eval_join_expr_with_registry(expr, row, &col_map)?);
+                }
+                partition_keys.push(partition_key);
+                let mut order_key = Vec::with_capacity(ob.len());
+                for term in ob {
+                    order_key.push(self.eval_join_expr_with_registry(&term.expr, row, &col_map)?);
+                }
+                order_keys.push(order_key);
             }
             let mut sorted_indices: Vec<usize> = (0..total_rows).collect();
             sorted_indices.sort_by(|&a, &b| {
@@ -158836,6 +158852,41 @@ fn join_raw_projection(
         .collect()
 }
 
+/// The entries of a single-table window scan's column map that `sql` (from
+/// [`join_statement_column_text`]) can name (bd-w4pr1.12). A declared column
+/// stays when [`join_column_is_named`]; the hidden rowid stays when any rowid
+/// alias is mentioned, since [`find_col_in_map`] resolves every alias to it.
+/// The scan needs at least one column, so a statement that names none (a bare
+/// `count(*) OVER ()`) keeps the hidden rowid, or else the first column.
+fn window_scan_named_columns(
+    col_map: Vec<(String, String, bool)>,
+    sql: &str,
+) -> Vec<(String, String, bool)> {
+    let rowid_named = ["rowid", "_rowid_", "oid"]
+        .into_iter()
+        .any(|alias| sql_mentions_word(sql, alias));
+    let fallback = col_map
+        .iter()
+        .find(|(_, _, hidden)| *hidden)
+        .or_else(|| col_map.first())
+        .cloned();
+    let named: Vec<(String, String, bool)> = col_map
+        .into_iter()
+        .filter(|(_, column, hidden)| {
+            if *hidden {
+                rowid_named
+            } else {
+                join_column_is_named(sql, column)
+            }
+        })
+        .collect();
+    if named.is_empty() {
+        fallback.into_iter().collect()
+    } else {
+        named
+    }
+}
+
 /// Whether `word` occurs in `sql` delimited by non-identifier characters.
 fn sql_mentions_word(sql: &str, word: &str) -> bool {
     let bytes = sql.as_bytes();
@@ -165983,6 +166034,7 @@ mod tests {
         substitute_outer_refs_in_select, take_trigger_stack_probe, trigger_depth_limit,
         trigger_program_depth_limit, validate_named_window_definitions,
         visit_select_qualified_names, wal_file_present_with_vfs, wal_path_for_db_path,
+        window_scan_named_columns,
     };
     use crate::region::RegionKind;
     use fsqlite_ast::{
@@ -207334,6 +207386,90 @@ mod tests {
                 ],
             );
         });
+    }
+
+    #[test]
+    fn test_table_window_select_answers_through_named_column_scan() {
+        // bd-w4pr1.12: the single-table window scan holds only the columns the
+        // statement names. Every name below appears in exactly one place the
+        // pruning has to see: an OVER clause, a WINDOW clause, the outer ORDER
+        // BY, a rowid alias, a double-quoted identifier.
+        asupersync::test_utils::run_test(|| async {
+            let conn = Connection::open(":memory:").await.unwrap();
+            conn.execute(
+                "CREATE TABLE w (id INTEGER PRIMARY KEY, a INTEGER, b TEXT, c REAL, \"odd col\" TEXT, d BLOB);",
+            )
+            .await
+            .unwrap();
+            conn.execute("INSERT INTO w VALUES (1, 1, 'x', 3.0, 'p', x'00');")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO w VALUES (2, 1, 'y', 1.0, 'q', x'01');")
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO w VALUES (3, 2, 'z', 2.0, 'r', x'02');")
+                .await
+                .unwrap();
+            let int = SqliteValue::Integer;
+            let cases: [(&str, Vec<Vec<SqliteValue>>); 4] = [
+                (
+                    "SELECT a, row_number() OVER (PARTITION BY a ORDER BY c) FROM w ORDER BY b;",
+                    vec![vec![int(1), int(2)], vec![int(1), int(1)], vec![int(2), int(1)]],
+                ),
+                (
+                    "SELECT oid, count(*) OVER () FROM w ORDER BY oid;",
+                    vec![vec![int(1), int(3)], vec![int(2), int(3)], vec![int(3), int(3)]],
+                ),
+                (
+                    "SELECT count(*) OVER () FROM w;",
+                    vec![vec![int(3)], vec![int(3)], vec![int(3)]],
+                ),
+                (
+                    "SELECT row_number() OVER win, \"a\" FROM w WINDOW win AS (ORDER BY c DESC) ORDER BY 1;",
+                    vec![vec![int(1), int(1)], vec![int(2), int(2)], vec![int(3), int(1)]],
+                ),
+            ];
+            for (sql, expected) in cases {
+                let rows = conn.query(sql).await.unwrap();
+                assert_eq!(rows.iter().map(row_values).collect::<Vec<_>>(), expected, "{sql}");
+            }
+        });
+    }
+
+    #[test]
+    fn test_window_scan_named_columns_drops_only_unnamed_columns() {
+        let entry = |column: &str, hidden: bool| ("w".to_owned(), column.to_owned(), hidden);
+        let map = vec![
+            entry("id", false),
+            entry("a", false),
+            entry("b", false),
+            entry("odd col", false),
+            entry("rowid", true),
+        ];
+        // `a` occurs only inside `abc`, which does not name it; `odd col` is
+        // not a plain identifier and is always kept.
+        assert_eq!(
+            window_scan_named_columns(
+                map.clone(),
+                "select abc, row_number() over (order by b) from w"
+            ),
+            vec![entry("b", false), entry("odd col", false)],
+        );
+        assert_eq!(
+            window_scan_named_columns(map.clone(), "select _rowid_, id from w"),
+            vec![entry("id", false), entry("odd col", false), entry("rowid", true)],
+        );
+        // Nothing named: the scan keeps one column, the hidden rowid first.
+        let plain = vec![entry("a", false), entry("b", false)];
+        assert_eq!(
+            window_scan_named_columns(plain, "select count(*) over () from w"),
+            vec![entry("a", false)],
+        );
+        let with_rowid = vec![entry("a", false), entry("rowid", true)];
+        assert_eq!(
+            window_scan_named_columns(with_rowid, "select count(*) over () from w"),
+            vec![entry("rowid", true)],
+        );
     }
 
     #[test]
