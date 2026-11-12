@@ -87,6 +87,40 @@ Every entry from here on ends with a retry condition a later agent can grep and 
 share on a named workload, a named redesign or bead it waits for, a gate value that has to move, or
 "not as a standalone patch". A kept lever is entered too, with stock live in the same run.
 
+## 2026-11-12 - WIN on CPU, RSS prediction missed: a table window SELECT reads a one-column key from the scanned row (bd-w4pr1.12)
+
+- Target: `execute_window_select` built a PARTITION BY and an ORDER BY key vector per row (a heap
+  allocation, a 24-byte header and a clone of each value). Touched:
+  `crates/fsqlite-core/src/connection.rs` (`WindowKeys`, `WindowKeyRows`, `window_key_row_column`;
+  the shared peer and frame helpers now take any `WindowKeyRows`, so the GROUP BY and FROM-less
+  window paths are unchanged).
+- Ledger preflight: the named-column window scan entry below (same bead) is the only window entry.
+- Change: a key that is one plain column, resolved exactly as `eval_join_expr` resolves it, is read
+  from the scanned row in place; any other key is evaluated into one flat vector, `width` values a
+  row.
+- Result: CLI release-perf, scorecard database, stock sqlite3 3.46.1 live in the same script, 3
+  runs, min user instructions, median CPU and peak RSS (`rss_probe.py`, io_uring refused, load 4).
+  Before main 0948f7c69, after f572c5312 (landed as the same commit). Answers equal stock's in
+  every row.
+
+  | statement (summed in an outer SELECT) | stock | before | after |
+  |---|---|---|---|
+  | `row_number() OVER (PARTITION BY a ORDER BY c)` | 8,225.1M, 661.2 ms, 16.6 MB | 10,682.3M, 1,443.3 ms, 437.0 MB | 9,503.5M, 1,286.9 ms, 380.2 MB |
+  | `rank() OVER (ORDER BY b)` | 8,534.9M, 717.4 ms, 16.5 MB | 6,909.8M, 862.9 ms, 396.9 MB | 6,139.0M, 769.3 ms, 403.9 MB |
+  | `sum(c) OVER (PARTITION BY a)` | 6,588.5M, 514.2 ms, 16.2 MB | 8,174.1M, 1,248.5 ms, 398.2 MB | 7,550.4M, 1,195.8 ms, 380.5 MB |
+  | `row_number() OVER (PARTITION BY a % 7 ORDER BY c * 2)` (flat keys) | 8,673.7M, 694.5 ms, 16.6 MB | 12,416.1M, 1,860.3 ms, 441.1 MB | 12,328.0M, 1,625.7 ms, 380.1 MB |
+
+- Prediction (bead comment before the measurement): RSS -170 to -230 MB and CPU -4 to -10% on the
+  first statement; kill if under 100 MB of RSS was removed. Measured -57 MB, so the kill line as
+  written was crossed; the CPU arm was met (-11% instructions, -11% CPU, and -7 to -11% on the
+  other shapes). Kept on the CPU arm, and the RSS miss is explained: massif of the new binary puts
+  the peak (396 MB of heap, 112 MB of it allocator overhead) at output assembly, where the result
+  slots, the output rows and the scanned rows are all alive and the keys are already freed; the
+  key-building phase was only slightly higher, so removing the keys lowered the peak to the output
+  phase.
+- Retry / widen: peak RSS now follows the output phase. Next cut there: drop the scanned rows
+  before output assembly when no output column or extra ORDER BY term reads them.
+
 ## 2026-11-12 - WIN: a table window SELECT scans only the columns it names and sizes its keys exactly (bd-w4pr1.12)
 
 - Target: the connection-level window fallback (`execute_window_select` in
